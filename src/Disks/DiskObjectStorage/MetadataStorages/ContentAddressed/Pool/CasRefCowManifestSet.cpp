@@ -1,4 +1,13 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCowManifestSet.h>
+#include <Common/Exception.h>
+
+namespace DB
+{
+namespace ErrorCodes
+{
+    extern const int CORRUPTED_DATA;
+}
+}
 
 namespace DB::Cas
 {
@@ -13,7 +22,16 @@ bool RefCowManifestSet::contains(const ManifestRef & m) const
 
 void RefCowManifestSet::insert(const ManifestRef & m)
 {
-    chassert(!contains(m));
+    /// Unconditional membership guard, in EVERY build (not a `chassert`): a duplicate insert means the
+    /// index has drifted from `committed`/`precommits`, and if it silently bumped `net_delta` the index
+    /// would report a manifest present that a single `erase` could then hide while another owner still
+    /// names it -- corrupting the add-precommit uniqueness invariant and GC's `+1/-1` edge accounting.
+    /// Fail closed instead. The caller's own uniqueness check is what enforces the invariant; this is the
+    /// last line that turns a maintaining-code bug into a caught exception rather than silent drift.
+    if (contains(m))
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "RefCowManifestSet: inserting a manifest that already has an owner -- the owned-manifest "
+            "index has drifted from committed/precommits (a bug in the maintaining code)");
     const auto it = overlay.find(m);
     if (it != overlay.end())
         it->second = true;   /// was a tombstone shadowing a base member -- revive it
@@ -24,7 +42,12 @@ void RefCowManifestSet::insert(const ManifestRef & m)
 
 void RefCowManifestSet::erase(const ManifestRef & m)
 {
-    chassert(contains(m));
+    /// Same fail-closed rationale as `insert`: erasing an absent manifest would drift `net_delta` and,
+    /// worse, could shadow a still-live owner. Throw in every build rather than silently corrupting.
+    if (!contains(m))
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "RefCowManifestSet: erasing a manifest with no current owner -- the owned-manifest index "
+            "has drifted from committed/precommits (a bug in the maintaining code)");
     const auto it = overlay.find(m);
     if (it != overlay.end())
     {

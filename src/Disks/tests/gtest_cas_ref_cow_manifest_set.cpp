@@ -1,7 +1,15 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCowManifestSet.h>
+#include <Disks/tests/cas_test_helpers.h>
+#include <Common/Exception.h>
+
+namespace DB::ErrorCodes
+{
+extern const int CORRUPTED_DATA;
+}
 
 using namespace DB::Cas;
+using DB::Cas::tests::expectThrowsCode;
 
 namespace
 {
@@ -206,41 +214,40 @@ TEST(CasRefCowManifestSet, SizeTracksNetDeltaAcrossMixedOps)
 }
 
 /// ===================================================================================
-/// Chasserted misuse (debug/sanitizer builds only): `insert` requires absence, `erase` requires
-/// presence -- the uniqueness invariant the ref table enforces before ever calling either, so a
-/// violation here means the index has drifted, not that a legitimate caller can trigger it.
+/// Drift-detection misuse (throws `CORRUPTED_DATA` in EVERY build, post-consult -- previously a
+/// debug-only `chassert`): `insert` requires absence, `erase` requires presence. The ref table's own
+/// uniqueness invariant guarantees both before either is ever called, so a violation here means the
+/// index has drifted, not that a legitimate caller can trigger it. Failing closed (rather than a silent
+/// release-build `net_delta` drift) is what keeps a corrupted history from later hiding a still-live
+/// owner.
 /// ===================================================================================
 
-#if defined(DEBUG_OR_SANITIZER_BUILD)
-
-TEST(CasRefCowManifestSetDeathTest, InsertAbortsWhenAlreadyPresentInOverlay)
+TEST(CasRefCowManifestSet, InsertThrowsWhenAlreadyPresentInOverlay)
 {
     RefCowManifestSet s;
     s.insert(mref(1, 1, 1));
-    EXPECT_DEATH({ s.insert(mref(1, 1, 1)); }, "");
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { s.insert(mref(1, 1, 1)); });
 }
 
-TEST(CasRefCowManifestSetDeathTest, InsertAbortsWhenAlreadyPresentInBase)
+TEST(CasRefCowManifestSet, InsertThrowsWhenAlreadyPresentInBase)
 {
     RefCowManifestSet s;
     s.insert(mref(1, 1, 1));
     s.materialize();
-    EXPECT_DEATH({ s.insert(mref(1, 1, 1)); }, "");
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { s.insert(mref(1, 1, 1)); });
 }
 
-TEST(CasRefCowManifestSetDeathTest, EraseAbortsWhenAbsent)
+TEST(CasRefCowManifestSet, EraseThrowsWhenAbsent)
 {
     RefCowManifestSet s;
-    EXPECT_DEATH({ s.erase(mref(1, 1, 1)); }, "");
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { s.erase(mref(1, 1, 1)); });
 }
 
-TEST(CasRefCowManifestSetDeathTest, EraseAbortsWhenAlreadyTombstoned)
+TEST(CasRefCowManifestSet, EraseThrowsWhenAlreadyTombstoned)
 {
     RefCowManifestSet s;
     s.insert(mref(1, 1, 1));
     s.materialize();
     s.erase(mref(1, 1, 1));
-    EXPECT_DEATH({ s.erase(mref(1, 1, 1)); }, "");
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { s.erase(mref(1, 1, 1)); });
 }
-
-#endif

@@ -139,28 +139,6 @@ struct RefLedgerConfig
     uint64_t ref_table_cache_bytes = 256ULL << 20;
 };
 
-/// How `applyRefLogTxn` treats a call: how much admission re-checking it performs, AND -- welded to
-/// that, not a separate axis -- what it does to `state` on a mid-transaction throw. The two concerns
-/// always co-occur because both are derived from one caller intent. `LiveAppend` means "this is the
-/// FIRST time this transaction is being validated, against a state that must survive a rejection": the
-/// writer's append-time contract and every trial/shape-check preview. It re-checks every precondition,
-/// including the cross-owner uniqueness check (O(1) via `owned_manifests` since E2), and applies
-/// two-phase against a scratch copy so
-/// `state` is byte-for-byte unchanged on any throw. `TrustedReplay` means "I am replaying
-/// already-committed, already-validated history into a local state I own and discard on any error":
-/// `replay`'s tail, and only `replay`'s tail (recovery, GC fold, fsck, protection views all inherit it
-/// through `replay`). Because the transaction already passed `LiveAppend` validation when it was
-/// durably appended, the cross-owner re-check is elided in release builds and kept as a `chassert` in
-/// debug/sanitizer builds (same policy as `debugAssertBodyCounters`) -- every exact-binding
-/// precondition (cheap, keyed) is still enforced in BOTH modes, so a corrupted log object still fails
-/// closed either way. And because the state is thrown away on any error, `TrustedReplay` applies IN
-/// PLACE with no scratch copy (E3 -- eliminates the per-transaction deep-copy of the replay tail's
-/// unbounded COW overlays); a throw leaves `state` PARTIALLY APPLIED ("poisoned"), which is sound only
-/// because its sole caller discards it on any throw. Welding the two axes into one enum keeps the
-/// dangerous fourth combination -- trusted validation applied to a state that must survive a throw --
-/// inexpressible. Do not pass `TrustedReplay` for a state that must survive a rejection.
-enum class ApplyMode : uint8_t { LiveAppend, TrustedReplay };
-
 /// The in-memory table state: `TableState = Replay(S_X.state, tail(X))`. This class, `applyRefLogTxn`, `snapshotOf`, and
 /// `replay` are the ONE shared implementation of that equation -- used verbatim by the writer, its
 /// own recovery path, `fsck`, and snapshot construction, so every consumer agrees on what a
@@ -217,19 +195,32 @@ private:
 
     /// One operation's local preconditions and effect, shared by `applyRefLogTxn`'s per-op loop and by
     /// `admits`'s single-op preview. `txn_id` is only read by `RemoveNamespace` (it becomes the
-    /// resulting `remove_txn_id`). `mode` is threaded down to `applyOwnerTransition`, the only
-    /// arm that consults it. Was free `applyOpInPlace`.
-    void applyOp(const RefOp & op, const RefTxnId & txn_id, ApplyMode mode);
+    /// resulting `remove_txn_id`). Validation is identical no matter which apply strategy reaches here
+    /// (see `applyTxnInPlace`), so this takes no mode. Was free `applyOpInPlace`.
+    void applyOp(const RefOp & op, const RefTxnId & txn_id);
 
     /// The `owner_transition` op kind: dispatches on the `(old_binding, new_binding)` shape to one of
     /// the four legal transitions (add precommit / remove precommit / remove committed / promote). Any
-    /// other shape is not a recognized transition. `mode` is consulted only by the add-precommit
-    /// arm's cross-owner uniqueness check. Was free.
-    void applyOwnerTransition(const RefOp & op, ApplyMode mode);
+    /// other shape is not a recognized transition. The add-precommit arm's cross-owner uniqueness check
+    /// runs unconditionally (it is O(1) via `owned_manifests`). Was free.
+    void applyOwnerTransition(const RefOp & op);
 
     /// The `set_payload` op kind: the committed ref must still name `expected_manifest_ref`; replaces
     /// the opaque `payload` blob and `published_at_ms` without touching the manifest edge. Was free.
     void applySetPayload(const RefOp & op);
+
+    /// Applies the COMPLETE transaction to `*this` IN PLACE (the two txn-wide preconditions first, then
+    /// every op in array order), or throws `CORRUPTED_DATA` -- leaving `*this` PARTIALLY APPLIED
+    /// ("poisoned") on any throw. This is the poisoning apply strategy: it is sound ONLY on a state the
+    /// caller discards on any throw. It is deliberately private and reachable from OUTSIDE this
+    /// translation unit at exactly ONE place -- `replay`, its `friend`, which builds its `RefTableState`
+    /// locally and returns it only after the WHOLE tail succeeds (any throw destroys that local state
+    /// during unwinding, so no consumer ever observes a poisoned state). The public
+    /// `applyRefLogTxn` reaches it too, but only through a scratch copy that turns it into the strong
+    /// guarantee "throw => the caller's `state` is byte-for-byte unchanged". No caller can express the
+    /// dangerous combination -- poison a live state that must survive a throw -- because the poisoning
+    /// path is structurally unreachable except via `replay`.
+    void applyTxnInPlace(const RefLogTxn & txn);
 
     /// True iff `manifest_ref` already names an existing committed row or precommit binding under ANY
     /// ref_name (the add-precommit rule: "no conflicting owner may name the same manifest"). Was free.
@@ -241,8 +232,9 @@ private:
     void debugAssertBodyCounters() const;
 #endif
 
-    friend void applyRefLogTxn(RefTableState & state, const RefLogTxn & txn, ApplyMode mode);
+    friend void applyRefLogTxn(RefTableState & state, const RefLogTxn & txn);
     friend RefTableState stateFromSnapshot(const RefTableSnapshot & snapshot);
+    friend RefTableState replay(const std::optional<RefTableSnapshot> & snapshot, std::span<const RefLogTxn> tail);
     friend bool admits(const RefTableState & state, const RefOp & op,
                        uint64_t snapshot_budget, uint64_t removal_budget);
 };
@@ -258,27 +250,36 @@ private:
 /// class of bug as a promote's silent displacement (see `applyOwnerTransition` above), just reached
 /// through snapshot loading instead of a transaction.
 ///
+/// One check this does that the codec does NOT: cross-owner manifest uniqueness. `CasRefSnapshotCodec`
+/// only enforces sortedness and no-duplicate `ref_name` (committed) / `(ref_name, manifest_ref)`
+/// (precommits); it never checks that a `ManifestRef` has at most one owner across committed rows and
+/// precommits. A snapshot naming one manifest under two owners is semantically corrupt (it would
+/// double-count GC's `+1/-1` edges and violate the add-precommit uniqueness invariant `applyRefLogTxn`
+/// enforces), so as each row is loaded this throws `CORRUPTED_DATA` if the manifest already has an
+/// owner. This is the one place that enforces it; `owned_manifests.insert` would also throw, but the
+/// explicit check here reports "corrupt snapshot data" rather than the container's "index drifted =
+/// code bug" framing, which is the accurate diagnosis for a malformed persisted snapshot.
+///
 /// Promoted from `CasRefProtocol.cpp`'s anonymous namespace to the public protocol API: the ONE
 /// validated way to construct a state from rows -- tests and benchmarks use it instead of poking
 /// fields.
 RefTableState stateFromSnapshot(const RefTableSnapshot & snapshot);
 
 /// Applies the COMPLETE transaction to `state`, or throws `CORRUPTED_DATA` (each transition shape
-/// below has exactly one precondition enforced here). The two txn-wide preconditions
-/// (strictly-increasing `txn_id`, `remove_namespace` ordering) are checked before any mutation, so
-/// they never leave `state` half-applied under either strategy below.
+/// below has exactly one precondition enforced here) -- with the STRONG exception guarantee: a throw
+/// anywhere leaves `state` byte-for-byte unchanged. The two txn-wide preconditions
+/// (strictly-increasing `txn_id`, `remove_namespace` ordering) are checked before any mutation, and the
+/// whole apply runs two-phase against a scratch copy that replaces `state` only once the WHOLE
+/// transaction has succeeded, so no intra-transaction intermediate state (e.g. a manifest with its
+/// precommit already gone but its committed binding not yet installed) is ever observable to a caller
+/// -- matching the promote rule: "There is no moment at which the manifest has no owner." This is the
+/// only public apply entry point, and it is always the strong guarantee: the writer's append-time
+/// contract and every trial/shape-check preview use it as-is.
 ///
-/// Apply strategy is selected by `mode` (see `ApplyMode`):
-///  - `LiveAppend` (writer append-time + previews): two-phase against a scratch copy; every op is validated
-///    and applied, in array order, to the scratch first, and `state` is replaced by it only once the
-///    WHOLE transaction has succeeded. A throw anywhere leaves `state` byte-for-byte unchanged, and no
-///    intra-transaction intermediate state (e.g. a manifest with its precommit already gone but its
-///    committed binding not yet installed) is ever observable to a caller -- matching the promote
-///    rule: "There is no moment at which the manifest has no owner."
-///  - `TrustedReplay` (replay only): applies IN PLACE with no scratch copy (E3 -- eliminates the
-///    per-transaction deep-copy of the replay tail's unbounded COW overlays). A throw leaves `state`
-///    PARTIALLY APPLIED; this is sound only because `replay`, its sole caller, discards the state on
-///    any throw (its result reaches a caller only on full success). See `ApplyMode`'s doc.
+/// The poisoning in-place apply strategy (E3 -- no scratch copy, `state` partially applied on throw)
+/// is NOT reachable here: it is `RefTableState::applyTxnInPlace`, private, used only by `replay` (which
+/// discards its local state on any throw). There is no mode argument and no way for an external caller
+/// to select the poisoning path.
 ///
 /// Enforced preconditions:
 ///  - `txn.txn_id` must be strictly greater than `state.greatest_applied`
@@ -327,14 +328,7 @@ RefTableState stateFromSnapshot(const RefTableSnapshot & snapshot);
 /// and `fsck` -- the primary callers replaying persisted logs -- want exactly that fail-closed
 /// framing; a writer that wants a friendlier user-facing rejection for an ordinary attempted mutation
 /// (e.g. "ref already exists") checks its own business state before ever building the op.
-///
-/// `mode` (default `ApplyMode::LiveAppend`, the writer's append-time contract): pass
-/// `ApplyMode::TrustedReplay` only when `txn` already passed `LiveAppend` validation at the time it was
-/// durably appended -- `replay`'s tail is the one caller that does. Every OTHER caller (the writer's
-/// own trial/shape-check previews and its post-PUT state install, all in `CasRefLedger.cpp`) keeps the
-/// default `LiveAppend`, because those calls are the FIRST time the transaction is validated, not a replay of
-/// already-validated history.
-void applyRefLogTxn(RefTableState & state, const RefLogTxn & txn, ApplyMode mode = ApplyMode::LiveAppend);
+void applyRefLogTxn(RefTableState & state, const RefLogTxn & txn);
 
 /// The canonical snapshot of `state` under `ns`: `committed` sorted by
 /// bytewise `ref_name` (guaranteed by `RefCowMap`'s sorted merge-iteration order,
@@ -428,6 +422,13 @@ struct RefManifestEdge
 ///   - `owner_transition` with only an old binding (remove owner)        => `-1` for `old.manifest_ref`
 ///   - `owner_transition` old+new naming the SAME manifest (promote)     => no edge (net zero)
 ///   - `owner_transition` old+new naming DIFFERENT manifests (replace)   => `-1` old then `+1` new
+///     -- DEAD SURFACE, defensive-only: `applyOwnerTransition` recognizes an old+new `owner_transition`
+///     ONLY as a promote (which REQUIRES `old.manifest_ref == new.manifest_ref`); an old+new pair
+///     naming DIFFERENT manifests matches no legal transition shape and is rejected there, and the
+///     writer never emits it (an atomic replace is expressed as TWO ops -- an explicit
+///     `owner_transition(old=Committed, new=None)` then a same-manifest promote). This branch exists so
+///     the edge function stays a total function over op shapes; do NOT "fix" the state machine to
+///     accept this shape to match it.
 ///   - `owner_transition` with neither binding                          => no edge (degenerate; a
 ///     transition shape the writer never produces and `applyRefLogTxn` rejects at replay)
 ///   - `namespace_birth` / `set_payload` / `remove_namespace`           => no edge

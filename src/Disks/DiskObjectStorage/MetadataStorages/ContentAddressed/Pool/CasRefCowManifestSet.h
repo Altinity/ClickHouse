@@ -35,11 +35,15 @@ namespace DB::Cas
 /// keeps the added cost of `owned_manifests` on `BM_ScratchCopy` to roughly one more `shared_ptr`
 /// copy, not one more `shared_ptr` copy plus a hidden allocation.
 ///
-/// `insert`/`erase` chassert their precondition (absence / presence, respectively) rather than
-/// silently tolerating a violation: the ref table's own uniqueness invariant already guarantees
-/// both, so a violation here means the index itself has drifted from `committed`/`precommits`, not
-/// that the invariant failed -- exactly the class of bug `RefTableState::debugAssertBodyCounters`
-/// exists to catch, and this set's chasserts extend that same cross-check to manifest ownership.
+/// `insert`/`erase` throw `CORRUPTED_DATA` on a violated precondition (absence / presence,
+/// respectively) in EVERY build rather than merely `chassert`-ing it: the ref table's own uniqueness
+/// invariant already guarantees both, so a violation here means the index itself has drifted from
+/// `committed`/`precommits`. A `chassert` would let that drift through silently in a release build,
+/// after which a single `erase` could report a manifest absent while another owner still names it --
+/// corrupting the add-precommit uniqueness invariant and GC's `+1/-1` manifest-edge accounting
+/// downstream. Failing closed keeps `net_delta` from ever drifting. This is the same class of bug
+/// `RefTableState::debugAssertBodyCounters` cross-checks in debug/sanitizer builds; the throw extends
+/// the guarantee to release builds too.
 class RefCowManifestSet
 {
 public:
@@ -55,13 +59,13 @@ public:
     /// tombstone reports absent even when `base` still has `m`.
     bool contains(const ManifestRef & m) const;
 
-    /// Records `m` as owned. `m` must be absent from the merged view (chassert) -- the caller's own
-    /// uniqueness check is what actually enforces the invariant; this only guards against the index
-    /// drifting away from it.
+    /// Records `m` as owned. `m` must be absent from the merged view or this throws `CORRUPTED_DATA`
+    /// (in every build) -- the caller's own uniqueness check is what actually enforces the invariant;
+    /// this only guards against the index drifting away from it, failing closed rather than silently.
     void insert(const ManifestRef & m);
 
-    /// Records `m` as no longer owned. `m` must be present in the merged view (chassert), same
-    /// rationale as `insert`.
+    /// Records `m` as no longer owned. `m` must be present in the merged view or this throws
+    /// `CORRUPTED_DATA` (in every build), same rationale as `insert`.
     void erase(const ManifestRef & m);
 
     /// `base->size() + net_delta`, O(1).

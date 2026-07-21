@@ -131,9 +131,9 @@ RefLogTxn buildRemovalTxnForTest(const RefTableState & state, const String & ns,
 
 constexpr const char * kNs = "srv1/db/table@cas@";
 
-/// Task 3 (E1): a validated state with "a" committed to manifest (1,1,1) -- the base every
-/// TrustedReplay-relaxed-replay test below reuses to build a tail whose add-precommit op would
-/// collide cross-owner (name the SAME manifest under a DIFFERENT ref_name).
+/// A validated state with "a" committed to manifest (1,1,1) -- the base the fail-closed replay/append
+/// tests below reuse to build a tail whose add-precommit op would collide cross-owner (name the SAME
+/// manifest under a DIFFERENT ref_name).
 RefTableSnapshot buildCollidingBaseSnapshotForTest()
 {
     RefTableState state;
@@ -846,58 +846,102 @@ TEST(CasRefStateMachine, ReplayEquationPropertyTest)
 }
 
 /// ===================================================================================
-/// E1: TrustedReplay relaxed replay -- `replay`'s tail already passed `LiveAppend` validation when it
-/// was durably appended, so the O(N) `manifestAlreadyOwned` cross-owner scan is redundant on that path
-/// and becomes debug-only (a `chassert`) instead of a release-mode throw.
+/// Fail-closed replay + snapshot validation: a corrupted history or snapshot naming one manifest under
+/// two owners must be REJECTED in EVERY build (post-consult). The cross-owner uniqueness check is O(1)
+/// via `owned_manifests`, so it runs unconditionally -- on the writer's append path AND on replay --
+/// rather than being elided into a debug-only assertion. `stateFromSnapshot` enforces the same
+/// invariant across snapshot rows (the codec never did).
 /// ===================================================================================
 
-TEST(CasRefStateMachine, TrustedReplaySkipsCrossOwnerScanInRelease)
+/// (Add path, committed collision) The writer's append-time contract rejects a fresh precommit that
+/// names a manifest already committed under a DIFFERENT ref_name, and leaves the state unchanged.
+TEST(CasRefStateMachine, LiveAppendRejectsAddPrecommitCollidingWithCommitted)
 {
-    const RefTableSnapshot snap = buildCollidingBaseSnapshotForTest();
-    const RefLogTxn colliding_txn = makeTxn(kNs, RefTxnId{1, 2}, {addPrecommitOp("b", manifestRef(1, 1, 1))});
-
-    /// LiveAppend (the default, unspecified argument): the writer's append-time contract still rejects
-    /// the cross-owner collision, unchanged from before E1. Applied directly rather than through
-    /// `replay`, since `replay` now uses TrustedReplay for its whole tail.
-    {
-        RefTableState full_state = stateFromSnapshot(snap);
-        const RefTableState before = full_state;
-        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-            [&] { applyRefLogTxn(full_state, colliding_txn); });
-        expectStatesEqual(before, full_state);
-    }
-
-#ifndef DEBUG_OR_SANITIZER_BUILD
-    /// TrustedReplay, release build: the chassert re-proving `manifestAlreadyOwned` is compiled out,
-    /// so the same op that LiveAppend rejects is instead applied -- proving the O(N) scan really is
-    /// elided on this path, not merely downgraded to a silent no-op.
-    {
-        RefTableState trusted_state = stateFromSnapshot(snap);
-        EXPECT_NO_THROW(applyRefLogTxn(trusted_state, colliding_txn, ApplyMode::TrustedReplay));
-        EXPECT_TRUE(trusted_state.getPrecommits().contains({"b", manifestRef(1, 1, 1)}));
-        EXPECT_TRUE(trusted_state.getCommitted().contains("a"));
-        EXPECT_EQ(trusted_state.getGreatestApplied(), (RefTxnId{1, 2}));
-    }
-#endif
+    RefTableState state = stateFromSnapshot(buildCollidingBaseSnapshotForTest());
+    const RefTableState before = state;
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 2}, {addPrecommitOp("b", manifestRef(1, 1, 1))})); });
+    expectStatesEqual(before, state);
 }
 
-#if defined(DEBUG_OR_SANITIZER_BUILD)
-/// Debug/sanitizer-build counterpart: the chassert in TrustedReplay's add-precommit arm is active
-/// there, so the same cross-owner collision aborts the process instead of returning a catchable
-/// exception -- same pattern as CasWiringOpsDeathTest.MoveDirectoryMutableCollisionPolicyAborts in
-/// gtest_ca_wiring.cpp.
-TEST(CasRefStateMachineDeathTest, TrustedReplayAbortsOnCrossOwnerCollision)
+/// (Replay path, committed collision) A tail whose add-precommit collides cross-owner with an existing
+/// committed owner makes `replay` THROW -- it must NOT be silently accepted. This is the exact behavior
+/// the deleted `TrustedReplaySkipsCrossOwnerScanInRelease` test pinned as *desired*; post-consult it is
+/// the opposite: fail closed.
+TEST(CasRefStateMachine, ReplayRejectsTailAddPrecommitCollidingWithCommitted)
 {
     const RefTableSnapshot snap = buildCollidingBaseSnapshotForTest();
-    const RefLogTxn colliding_txn = makeTxn(kNs, RefTxnId{1, 2}, {addPrecommitOp("b", manifestRef(1, 1, 1))});
-    RefTableState trusted_state = stateFromSnapshot(snap);
-    EXPECT_DEATH({ applyRefLogTxn(trusted_state, colliding_txn, ApplyMode::TrustedReplay); }, "");
+    const std::vector<RefLogTxn> tail{makeTxn(kNs, RefTxnId{1, 2}, {addPrecommitOp("b", manifestRef(1, 1, 1))})};
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { replay(snap, tail); });
 }
-#endif
 
-/// Positive equivalence: a VALID tail replayed via `replay` (TrustedReplay) produces a state
-/// byte-identical (getters + encoded snapshot) to the same tail applied via `LiveAppend` -- TrustedReplay
-/// changes only what gets re-checked, never what a legal transaction produces.
+/// (Replay path, precommit collision) The same, but the base already holds a PRECOMMIT for the manifest
+/// and the tail adds a second precommit for it under another ref_name (precommit/precommit collision).
+TEST(CasRefStateMachine, ReplayRejectsTailAddPrecommitCollidingWithPrecommit)
+{
+    const std::vector<RefLogTxn> tail{
+        makeTxn(kNs, RefTxnId{1, 1}, {birthOp(), addPrecommitOp("a", manifestRef(1, 1, 1))}),
+        makeTxn(kNs, RefTxnId{1, 2}, {addPrecommitOp("b", manifestRef(1, 1, 1))}),   // collides cross-owner
+    };
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { replay(std::nullopt, tail); });
+}
+
+/// (Snapshot validation, committed/committed) A hand-built snapshot with two committed rows naming ONE
+/// manifest passes the codec (it checks only sortedness + no-duplicate ref_name) but must be rejected by
+/// `stateFromSnapshot`/`replay` as semantically corrupt.
+TEST(CasRefStateMachine, ReplayRejectsSnapshotWithTwoCommittedRowsNamingOneManifest)
+{
+    RefTableSnapshot snap;
+    snap.ns = kNs;
+    snap.snapshot_id = RefTxnId{1, 1};
+    snap.lifecycle = RefLifecycle::Live;
+    RefCommittedRow row1;
+    row1.ref_name = "a";
+    row1.manifest_ref = manifestRef(1, 1, 1);
+    RefCommittedRow row2;
+    row2.ref_name = "b";                       // distinct ref_name (codec-legal)...
+    row2.manifest_ref = manifestRef(1, 1, 1);  // ...but the SAME manifest (corrupt)
+    snap.committed.push_back(row1);
+    snap.committed.push_back(row2);
+
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { replay(snap, {}); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { (void)stateFromSnapshot(snap); });
+}
+
+/// (Snapshot validation, committed/precommit) A committed row and a precommit binding sharing one
+/// manifest -- also codec-legal (different owner kinds, sorted independently) but corrupt.
+TEST(CasRefStateMachine, ReplayRejectsSnapshotWithCommittedAndPrecommitSharingManifest)
+{
+    RefTableSnapshot snap;
+    snap.ns = kNs;
+    snap.snapshot_id = RefTxnId{1, 1};
+    snap.lifecycle = RefLifecycle::Live;
+    RefCommittedRow row;
+    row.ref_name = "a";
+    row.manifest_ref = manifestRef(1, 1, 1);
+    snap.committed.push_back(row);
+    snap.precommits.push_back(RefOwnerBinding{RefOwnerKind::Precommit, "b", manifestRef(1, 1, 1)});
+
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { replay(snap, {}); });
+}
+
+/// (Snapshot validation, precommit/precommit) Two precommit bindings under different ref_names naming
+/// one manifest -- sorted by (ref_name, manifest_ref), so codec-legal, but corrupt.
+TEST(CasRefStateMachine, ReplayRejectsSnapshotWithTwoPrecommitsSharingManifest)
+{
+    RefTableSnapshot snap;
+    snap.ns = kNs;
+    snap.snapshot_id = RefTxnId{1, 1};
+    snap.lifecycle = RefLifecycle::Live;
+    snap.precommits.push_back(RefOwnerBinding{RefOwnerKind::Precommit, "a", manifestRef(1, 1, 1)});
+    snap.precommits.push_back(RefOwnerBinding{RefOwnerKind::Precommit, "b", manifestRef(1, 1, 1)});
+
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { replay(snap, {}); });
+}
+
+/// Positive equivalence: a VALID tail replayed via `replay` (the in-place trusted path) produces a state
+/// byte-identical (getters + encoded snapshot) to the same tail applied via the public strong-guarantee
+/// `applyRefLogTxn` -- the apply strategy changes nothing a legal transaction produces.
 TEST(CasRefStateMachine, TrustedReplayEquivalentToLiveAppendOnValidTail)
 {
     const std::vector<RefLogTxn> tail{
@@ -912,7 +956,7 @@ TEST(CasRefStateMachine, TrustedReplayEquivalentToLiveAppendOnValidTail)
     for (const RefLogTxn & txn : tail)
         applyRefLogTxn(full_state, txn);   // LiveAppend (default)
 
-    const RefTableState trusted_state = replay(std::nullopt, tail);   // replay uses TrustedReplay internally
+    const RefTableState trusted_state = replay(std::nullopt, tail);   // replay uses the in-place trusted path internally
 
     expectStatesEqual(full_state, trusted_state);
     EXPECT_EQ(encodeRefTableSnapshot(snapshotOf(full_state, kNs)),
