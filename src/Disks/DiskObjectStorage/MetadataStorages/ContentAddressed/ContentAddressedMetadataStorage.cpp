@@ -720,7 +720,7 @@ void ContentAddressedMetadataStorage::unmountSynchronously(uint64_t drain_timeou
             break;
         if (std::chrono::steady_clock::now() >= deadline)
             throw Exception(ErrorCodes::TIMEOUT_EXCEEDED,
-                "content-addressed disk unmount: {} pool reference(s) still live after {} ms -- "
+                "content-addressed disk unmount: {} pool reference(s) still live after {} ms — "
                 "disk stays in Unmounting (new operations refused); retry UNMOUNT to resume",
                 holders, drain_timeout_ms);
         sleepForMilliseconds(50);
@@ -751,7 +751,7 @@ void ContentAddressedMetadataStorage::mountExplicitly()
             return;                                        /// idempotent no-op
         if (mount_state == MountState::Unmounting)
             throw Exception(ErrorCodes::INVALID_STATE,
-                "content-addressed disk mount: an unmount is in progress/incomplete -- "
+                "content-addressed disk mount: an unmount is in progress/incomplete — "
                 "retry SYSTEM CONTENT ADDRESSED UNMOUNT to finish it first");
     }
     /// `startup()` does not consult `shutdown_called` -- only `shutdown()` sets that latch and only

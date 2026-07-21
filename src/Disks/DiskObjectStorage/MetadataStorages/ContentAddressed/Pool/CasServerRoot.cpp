@@ -870,9 +870,9 @@ void MountLeaseKeeper::onRenewMismatch(const String & mismatched_key)
         /// LOGICAL_ERROR here aborts debug/ASan builds at exception construction.
         ProfileEvents::increment(ProfileEvents::CasMountLeaseLost);
         emitMountEvent(event_sink, CasEventType::MountConflict, srid, "vanished", nullptr,
-            "mount slot object vanished (backing store deleted under a live mount) -- stopping renewal, fail-closed");
+            "mount slot object vanished (backing store deleted under a live mount) — stopping renewal, fail-closed");
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
-            "CAS mount-lease: key '{}' vanished (backing store deleted under a live mount) -- "
+            "CAS mount-lease: key '{}' vanished (backing store deleted under a live mount) — "
             "stopping renewal, fail-closed (never re-minting)", mismatched_key);
     }
 
@@ -922,7 +922,7 @@ void MountLeaseKeeper::terminate()
         /// this is a clean no-op release, never a LOGICAL_ERROR (which aborts debug/ASan builds).
         ProfileEvents::increment(ProfileEvents::CasMountLeaseLost);
         emitMountEvent(event_sink, CasEventType::MountRelease, srid, "vanished", nullptr,
-            "mount slot object already gone at release (backing store deleted) -- no-op release");
+            "mount slot object already gone at release (backing store deleted) — no-op release");
         LOG_INFO(getLogger("CasMountLeaseKeeper"),
             "CAS mount-lease: '{}' is already gone at release (backing store deleted); release is a no-op", key);
         return;

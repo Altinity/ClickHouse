@@ -126,7 +126,7 @@ def run_fsck(container: str, disk: str = "ca_ro", detail: bool = True,
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
     except subprocess.TimeoutExpired:
-        raise FsckTimeout(f"fsck (detail={detail}) exceeded {timeout_s}s on {container}")
+        raise FsckTimeout(f"ca-fsck (detail={detail}) exceeded {timeout_s}s on {container}")
 
     # The summary line starts with "reachable="; find the first such line.
     summary_line = next(

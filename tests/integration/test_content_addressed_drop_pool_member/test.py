@@ -59,7 +59,7 @@ def _count(prefix):
 
 
 def _disks(node, query):
-    # Run a clickhouse-disks command against the read-only CA window over the same pool -- fsck refuses
+    # Run a clickhouse-disks command against the read-only CA window over the same pool — ca-fsck refuses
     # a writable pool, so it must go through disk_ca_ro (the ref-snaplog integration test's idiom).
     return node.exec_in_container(
         [
