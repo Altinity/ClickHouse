@@ -68,10 +68,11 @@ from soak.pool import pool_size
 from soak.schedule import stage_plan, stage_at, chaos_window, StageKind
 
 TABLE = "ca_stress"
-# Dedicated Atomic database with lazy_load_tables=1 so a transient S3 error at CAS table load is
-# retried on next access instead of stranding the table (see
-# docs/superpowers/specs/2026-07-20-cas-table-load-stuck-asyncloader-design.md). The table name stays
-# bare; the workload connection's default database is set to DB.
+# Dedicated Atomic database, created EAGERLY (lazy_load_tables OFF) by the single shared
+# `setup_cluster_and_table` helper. lazy_load_tables was deliberately turned off (2026-07-22): the
+# StorageTableProxy wrapper is under a quarantine decision after several unforwarded-virtual product
+# bugs (see docs/superpowers/reports/2026-07-21-storageproxy-forwarding-audit.md and the CAS backlog's
+# lazy_load_tables item). The table name stays bare; the workload connection's default database is DB.
 DB = "ca_soak"
 FSCK_CONTAINER = "ca-soak-ch1-1"
 
@@ -727,12 +728,10 @@ def wait_for_healthy(cluster, *, timeout_s: float = 180.0, settle_s: float = 2.0
     not something to swallow."""
     deadline = monotonic_fn() + timeout_s
     def tables_loaded(node) -> bool:
-        # /ping turns 200 BEFORE async table load completes. The `ca_soak` database is created
-        # with `lazy_load_tables = 1`, so a freshly (re)started node keeps `ca_stress` wrapped in
-        # an unmaterialized StorageTableProxy until first access: the `system.tables` engine
-        # column never flips to `Replicated%` on its own, so gating on it here would spin until
-        # the timeout even on a perfectly healthy node. A real read both materializes the proxy
-        # (by design) and proves the table is actually functional, so use that as the gate instead.
+        # /ping turns 200 BEFORE async table load completes. A real read is the robust gate: it proves
+        # `ca_stress` is actually loaded and functional on this node, independent of how the engine
+        # column reports (and it stays correct if lazy_load_tables is ever re-enabled -- it does not
+        # rely on the engine column flipping on its own).
         try:
             node.query("SELECT count() >= 0 FROM ca_soak.ca_stress", timeout=5.0)
             return True
@@ -1118,40 +1117,49 @@ def _last_fault_dict(chaos):
 
 
 def setup_cluster_and_table(seed, phase, ops, workers, checkpoint_every):
-    """Shared bring-up for all phases: connect, capture base_time, recreate the CA table on both
-    replicas, return (cluster, model, base_time)."""
+    """THE single shared bring-up for EVERY phase (1/2/3): deterministically (re)create the dedicated
+    soak database as an EAGER Atomic DB, recreate the CA table on both replicas, capture base_time,
+    return (cluster, model, base_time).
+
+    lazy_load_tables is DELIBERATELY OFF (2026-07-22): the StorageTableProxy wrapper is under a
+    quarantine decision after several unforwarded-virtual product bugs (SYSTEM verbs, mutations, TTL
+    metadata, rename -- see docs/superpowers/reports/2026-07-21-storageproxy-forwarding-audit.md and the
+    CAS backlog's lazy_load_tables item). Cost of turning it off: a transient S3 error during CAS table
+    load once again strands the table in a permanently-FAILED AsyncLoader job until restart (the property
+    lazy_load_tables=1 was added for) -- outage-at-load scenarios lose that coverage until the feature
+    decision lands."""
     cluster = Cluster(database=DB)
-    # CREATE DATABASE must run against the default database (DB does not exist yet on a fresh stand);
-    # a DB-scoped connection would fail UNKNOWN_DATABASE first. Use a throwaway default-scoped cluster
-    # just for the CREATE DATABASE.
-    #
-    # lazy_load_tables is DELIBERATELY OFF (2026-07-22): the StorageTableProxy wrapper is under a
-    # quarantine decision after three unforwarded-virtual product bugs (SYSTEM verbs, mutations,
-    # TTL metadata -- see docs/superpowers/reports/2026-07-21-storageproxy-forwarding-audit.md and
-    # the CAS backlog's lazy_load_tables item). Cost of turning it off: a transient S3 error during
-    # CAS table load once again strands the table in a permanently-FAILED AsyncLoader job until
-    # restart (the property lazy_load_tables=1 was added for) -- outage-at-load scenarios lose that
-    # coverage until the feature decision lands.
+    # DB lifecycle runs against the DEFAULT database (DB may not exist yet on a fresh stand; a DB-scoped
+    # connection would fail UNKNOWN_DATABASE). Each command is a stateless HTTP POST that resolves the
+    # database by name per call, so dropping and recreating DB underneath the scoped `cluster` is safe.
     bootstrap = Cluster()
+    # Ensure DB exists so the scoped DROP TABLE below can run, then tear the table down explicitly: a
+    # pre-existing large CA-over-S3 table's object teardown can take far longer than the default query
+    # timeout, so give it a generous one and warn if it is actually slow. (Dropping it before the DB drop
+    # keeps the DROP DATABASE that follows trivial -- an empty database.)
     for node in bootstrap.nodes():
         node.command(f"CREATE DATABASE IF NOT EXISTS {DB} ENGINE = Atomic")
-    base_time = int(cluster.node1.scalar("SELECT toUnixTimestamp(now())")) - 60
-    log(f"base_time={base_time} (needed for replay) seed={seed} phase={phase} "
-        f"ops={ops} workers={workers} checkpoint_every={checkpoint_every}")
-    model = Model(seed, base_time=base_time)
-    ddl = DDL_TEMPLATE.format(table=TABLE)
-    # A pre-existing large CA-over-S3 table can take a long time to DROP ... SYNC (object teardown
-    # over slow S3), well past the default query timeout. Give the setup DROP a generous explicit
-    # timeout so a leftover table never times out the whole bring-up; warn if it is actually slow.
     for node in cluster.nodes():
         t0 = time.monotonic()
         node.command(f"DROP TABLE IF EXISTS {TABLE} SYNC", timeout=900)
         dt = time.monotonic() - t0
         if dt > 30:
             log(f"setup DROP {TABLE} SYNC on {node.container} took {dt:.1f}s (large CA/S3 table)")
+    # DETERMINISM: drop and recreate the (now-empty) database so its lazy_load_tables setting is ALWAYS
+    # exactly what we specify here. A plain `CREATE DATABASE IF NOT EXISTS` is a silent no-op on a reused
+    # stand and would inherit a prior run's lazy database, re-exposing the quarantined proxy path -- the
+    # exact non-determinism that made a reused soak environment keep running the lazy code path.
+    for node in bootstrap.nodes():
+        node.command(f"DROP DATABASE IF EXISTS {DB} SYNC", timeout=900)
+        node.command(f"CREATE DATABASE {DB} ENGINE = Atomic")
+    base_time = int(cluster.node1.scalar("SELECT toUnixTimestamp(now())")) - 60
+    log(f"base_time={base_time} (needed for replay) seed={seed} phase={phase} "
+        f"ops={ops} workers={workers} checkpoint_every={checkpoint_every}")
+    model = Model(seed, base_time=base_time)
+    ddl = DDL_TEMPLATE.format(table=TABLE)
     for node in cluster.nodes():
         node.command(ddl)
-    log(f"created {DB}.{TABLE} on both replicas (lazy_load_tables=1)")
+    log(f"created {DB}.{TABLE} on both replicas (lazy_load_tables OFF, eager Atomic DB)")
     return cluster, model, base_time
 
 
@@ -1543,28 +1551,9 @@ def main(argv=None):
     if args.ops is None or args.checkpoint_every is None:
         ap.error("--ops and --checkpoint-every are required for phase 1/2")
 
-    cluster = Cluster(database=DB)
-    # CREATE DATABASE against the default database first (DB does not exist yet on a fresh stand);
-    # lazy_load_tables=1 => a transient S3 error at CAS table startup is retried on next access
-    # instead of stranding the table in a permanently-FAILED AsyncLoader job (see setup_cluster_and_table).
-    bootstrap = Cluster()
-    for node in bootstrap.nodes():
-        node.command(f"CREATE DATABASE IF NOT EXISTS {DB} ENGINE = Atomic SETTINGS lazy_load_tables = 1")
-
-    # Capture base_time ONCE, 60s in the past, so freshly-inserted rows are NOT born expired.
-    base_time = int(cluster.node1.scalar("SELECT toUnixTimestamp(now())")) - 60
-    log(f"base_time={base_time} (needed for replay) seed={args.seed} phase={args.phase} "
-        f"ops={args.ops} workers={args.workers} checkpoint_every={args.checkpoint_every}")
-
-    model = Model(args.seed, base_time=base_time)
-
-    # Fresh table on BOTH replicas.
-    ddl = DDL_TEMPLATE.format(table=TABLE)
-    for node in cluster.nodes():
-        node.command(f"DROP TABLE IF EXISTS {TABLE} SYNC")
-    for node in cluster.nodes():
-        node.command(ddl)
-    log(f"created {DB}.{TABLE} on both replicas (lazy_load_tables=1)")
+    # Single shared, deterministic bring-up (same helper phase 3 uses): eager Atomic DB, no lazy setting.
+    cluster, model, base_time = setup_cluster_and_table(
+        args.seed, args.phase, args.ops, args.workers, args.checkpoint_every)
 
     ledger = generate_ledger(args.seed, args.ops)
     min_gap = args.min_ops_between_cliffs if args.min_ops_between_cliffs is not None else max(1, args.ops // 4)

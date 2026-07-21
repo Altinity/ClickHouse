@@ -252,8 +252,7 @@ class Node:
         used to align the SERVER-side bound (`receive_timeout`/`max_execution_time`) with the client
         socket timeout for blocking admin ops so a slow-but-progressing large-pool op is not tripped by
         a server-side HTTP-408 `TIMEOUT_EXCEEDED`. `self.database` is always sent as the default
-        database so bare table names resolve there (used to host the CAS table in a lazy_load_tables
-        database)."""
+        database so bare table names resolve there (the dedicated CAS soak database)."""
         params = {"database": self.database}
         if settings:
             params.update(settings)
