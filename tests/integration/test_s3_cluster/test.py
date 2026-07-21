@@ -487,6 +487,42 @@ def test_object_storage_cluster_fallback_to_local_if_empty(started_cluster):
     )
     assert "not found" in error or "CLUSTER_DOESNT_EXIST" in error or "doesn't exist" in error.lower()
 
+    # Empty OSC + RI without RI-cluster must keep BAD_ARGUMENTS even with fallback enabled.
+    error = node.query_and_get_error(
+        f"""
+        SELECT count(*) from s3(
+            'http://minio1:9001/root/data/{{clickhouse,database}}/*',
+            'minio', '{minio_secret_key}', 'CSV',
+            'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))')
+        SETTINGS
+            object_storage_remote_initiator=1,
+            object_storage_cluster_fallback_to_local_if_empty=1
+        """
+    )
+    assert "BAD_ARGUMENTS" in error or "object_storage_remote_initiator" in error
+
+    # Case 1 for ENGINE: unknown OSC in table SETTINGS + fallback -> local.
+    node.query("DROP TABLE IF EXISTS engine_osc_fallback")
+    node.query(
+        f"""
+        CREATE TABLE engine_osc_fallback
+            (name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64))))
+            ENGINE=S3('http://minio1:9001/root/data/{{clickhouse,database}}/*', 'minio', '{minio_secret_key}', 'CSV')
+            SETTINGS object_storage_cluster='non_existing_cluster'
+        """
+    )
+    error = node.query_and_get_error("SELECT count(*) FROM engine_osc_fallback")
+    assert "not found" in error or "CLUSTER_DOESNT_EXIST" in error or "doesn't exist" in error.lower()
+
+    engine_fallback_count = node.query(
+        """
+        SELECT count(*) FROM engine_osc_fallback
+        SETTINGS object_storage_cluster_fallback_to_local_if_empty=1
+        """
+    )
+    assert TSV(pure_count) == TSV(engine_fallback_count)
+    node.query("DROP TABLE IF EXISTS engine_osc_fallback")
+
 
 def test_ambiguous_join(started_cluster):
     node = started_cluster.instances["s0_0_0"]

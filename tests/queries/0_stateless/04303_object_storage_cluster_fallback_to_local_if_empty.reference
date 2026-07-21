@@ -1,18 +1,21 @@
 pure
 10	45
-unknown cluster without fallback
-unknown cluster with fallback
+case1 unknown OSC without fallback still errors
+case1 unknown OSC with fallback runs locally
 10	45
-valid cluster with fallback
+valid OSC with fallback unchanged
 10	45
-explicit cluster function with fallback
-explicit cluster function overrides setting
-explicit cluster function overrides setting with valid cluster
+s3Cluster ignores fallback
+s3Cluster ignores fallback even with OSC setting
+s3Cluster with valid argument unchanged
 10	45
-remote initiator unresolved with fallback
+case2 unknown OSC + RI without RI-cluster with fallback runs locally
 10	45
-remote initiator with non-existent cluster
+empty OSC + RI without RI-cluster with fallback still BAD_ARGUMENTS
+empty OSC + RI without RI-cluster without fallback still BAD_ARGUMENTS
+case3-like unknown OSC + RI-cluster with fallback (pure send, remote local)
 10	45
+missing RI-cluster is not masked by OSC fallback
 aggregate with fallback
 285
 pure aggregate

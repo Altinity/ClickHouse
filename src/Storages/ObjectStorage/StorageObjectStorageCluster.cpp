@@ -746,9 +746,9 @@ bool StorageObjectStorageCluster::allowsLocalFallbackOnEmptyObjectStorageCluster
     if (cluster_name_from_function_argument)
         return false;
 
-    return cluster_name_in_settings
-        || !getOriginalClusterName().empty()
-        || !context->getSettingsRef()[Setting::object_storage_cluster].value.empty();
+    /// Only when a non-empty object_storage_cluster was requested (query setting or table engine).
+    /// Empty OSC + remote_initiator without remote_initiator_cluster must keep BAD_ARGUMENTS.
+    return !getClusterName(context).empty();
 }
 
 QueryProcessingStage::Enum StorageObjectStorageCluster::getQueryProcessingStage(
