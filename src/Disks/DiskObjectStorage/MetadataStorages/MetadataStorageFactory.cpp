@@ -232,6 +232,7 @@ static void registerContentAddressedMetadataStorage(MetadataStorageFactory & fac
         ContentAddressedSettings settings;
         settings.loadFromConfig(
             config, config_prefix,
+            /*scratch_path_anchor_if_relative=*/ global_context->getPath(),
             /*default_scratch_path=*/ fs::path(global_context->getPath()) / "disks" / name / "cas_scratch" / "",
             [&](const std::string & s) { return global_context->getMacros()->expand(s); });
         fs::create_directories(settings[ContentAddressedSetting::scratch_path].value);

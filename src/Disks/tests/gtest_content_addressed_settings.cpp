@@ -39,10 +39,11 @@ TEST(ContentAddressedSettings, DefaultsAndOverridesLand)
 {
     auto cfg = makeConfig("<server_root_id>srv1</server_root_id><gc_shards>4</gc_shards>");
     ContentAddressedSettings s;
-    s.loadFromConfig(*cfg, "disk", "/data/default_scratch", identity_macros);
+    s.loadFromConfig(*cfg, "disk", "/data", "/data/default_scratch", identity_macros);
     EXPECT_EQ(s[ContentAddressedSetting::gc_shards].value, 4u);
     EXPECT_EQ(s[ContentAddressedSetting::gc_interval_sec].value, 60u);          /// table default
     EXPECT_EQ(s[ContentAddressedSetting::dedup_cache_bytes].value, 64ULL << 20); /// table default
+    /// Absent key -> the verbatim default (never touches the anchor).
     EXPECT_EQ(s[ContentAddressedSetting::scratch_path].value, "/data/default_scratch");
 }
 
@@ -50,7 +51,7 @@ TEST(ContentAddressedSettings, UnknownKeyRejected)
 {
     auto cfg = makeConfig("<server_root_id>srv1</server_root_id><gc_shardz>4</gc_shardz>");
     ContentAddressedSettings s;
-    EXPECT_THROW(s.loadFromConfig(*cfg, "disk", "/scratch", identity_macros), Exception);
+    EXPECT_THROW(s.loadFromConfig(*cfg, "disk", "/scratch", "/scratch", identity_macros), Exception);
 }
 
 TEST(ContentAddressedSettings, ObjectStorageKeysSkipped)
@@ -61,7 +62,7 @@ TEST(ContentAddressedSettings, ObjectStorageKeysSkipped)
         "<access_key_id>k</access_key_id><secret_access_key>s</secret_access_key>"
         "<server_root_id>srv1</server_root_id>");
     ContentAddressedSettings s;
-    EXPECT_NO_THROW(s.loadFromConfig(*cfg, "disk", "/scratch", identity_macros));
+    EXPECT_NO_THROW(s.loadFromConfig(*cfg, "disk", "/scratch", "/scratch", identity_macros));
 }
 
 TEST(ContentAddressedSettings, ValidateFailsClosed)
@@ -72,7 +73,7 @@ TEST(ContentAddressedSettings, ValidateFailsClosed)
         ContentAddressedSettings s;
         try
         {
-            s.loadFromConfig(*cfg, "disk", "/scratch", identity_macros);
+            s.loadFromConfig(*cfg, "disk", "/scratch", "/scratch", identity_macros);
             FAIL() << "expected an exception";
         }
         catch (const Exception & e)
@@ -86,7 +87,7 @@ TEST(ContentAddressedSettings, ValidateFailsClosed)
         ContentAddressedSettings s;
         try
         {
-            s.loadFromConfig(*cfg, "disk", "/scratch", identity_macros);
+            s.loadFromConfig(*cfg, "disk", "/scratch", "/scratch", identity_macros);
             FAIL() << "expected an exception";
         }
         catch (const Exception & e)
@@ -97,20 +98,33 @@ TEST(ContentAddressedSettings, ValidateFailsClosed)
     {   /// zero gc_shards
         auto cfg = makeConfig("<server_root_id>srv1</server_root_id><gc_shards>0</gc_shards>");
         ContentAddressedSettings s;
-        EXPECT_THROW(s.loadFromConfig(*cfg, "disk", "/scratch", identity_macros), Exception);
+        EXPECT_THROW(s.loadFromConfig(*cfg, "disk", "/scratch", "/scratch", identity_macros), Exception);
     }
     {   /// unknown blob_hash spelling
         auto cfg = makeConfig("<server_root_id>srv1</server_root_id><blob_hash>md5</blob_hash>");
         ContentAddressedSettings s;
-        EXPECT_THROW(s.loadFromConfig(*cfg, "disk", "/scratch", identity_macros), Exception);
+        EXPECT_THROW(s.loadFromConfig(*cfg, "disk", "/scratch", "/scratch", identity_macros), Exception);
     }
 }
 
 TEST(ContentAddressedSettings, RelativeScratchPathAnchored)
 {
+    /// Reproduces the pre-F4b factory's anchor behavior (review finding, Critical): a relative
+    /// `scratch_path` override is anchored to the SERVER DATA PATH (`scratch_path_anchor_if_relative`)
+    /// -- NOT to `default_scratch_path`, which is itself a per-disk subdirectory
+    /// (`.../disks/<name>/cas_scratch`) that must never leak into an override's resolved path.
     auto cfg = makeConfig("<server_root_id>srv1</server_root_id><scratch_path>rel/dir</scratch_path>");
     ContentAddressedSettings s;
-    s.loadFromConfig(*cfg, "disk", "/data/default_scratch", identity_macros);
-    /// Relative override anchored to the server data path prefix passed by the caller, never CWD.
-    EXPECT_TRUE(s[ContentAddressedSetting::scratch_path].value.starts_with("/"));
+    s.loadFromConfig(*cfg, "disk", "/data", "/data/disks/x/cas_scratch", identity_macros);
+    EXPECT_EQ(s[ContentAddressedSetting::scratch_path].value, "/data/rel/dir");
+}
+
+TEST(ContentAddressedSettings, AbsentScratchPathUsesDefaultVerbatim)
+{
+    /// Absent key -> `default_scratch_path` verbatim, unaffected by the anchor (the per-disk default
+    /// already lives under the server data path; only an explicit relative OVERRIDE needs anchoring).
+    auto cfg = makeConfig("<server_root_id>srv1</server_root_id>");
+    ContentAddressedSettings s;
+    s.loadFromConfig(*cfg, "disk", "/data", "/data/disks/x/cas_scratch", identity_macros);
+    EXPECT_EQ(s[ContentAddressedSetting::scratch_path].value, "/data/disks/x/cas_scratch");
 }

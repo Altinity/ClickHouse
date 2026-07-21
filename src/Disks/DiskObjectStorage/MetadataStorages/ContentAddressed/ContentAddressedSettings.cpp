@@ -103,6 +103,7 @@ ContentAddressedSettings::ContentAddressedSettings(const ContentAddressedSetting
 void ContentAddressedSettings::loadFromConfig(
     const Poco::Util::AbstractConfiguration & config,
     const std::string & config_prefix,
+    const std::string & scratch_path_anchor_if_relative,
     const std::string & default_scratch_path,
     const MacroExpander & expand_macros)
 {
@@ -120,15 +121,18 @@ void ContentAddressedSettings::loadFromConfig(
 
     /// Server-local scratch dir for the write-buffer spill. Mirrors how other metadata storages
     /// compute their local working dir: a real filesystem path, NEVER the object-storage key
-    /// prefix. A configured RELATIVE scratch path is anchored to `default_scratch_path` (the
-    /// caller-provided server data path), NOT the process CWD (which varies by launch method) --
-    /// otherwise the write-buffer spill lands in an unpredictable directory and orphans across
-    /// restarts. The default is already absolute; only an explicit relative override needs
-    /// anchoring.
+    /// prefix. A configured RELATIVE scratch path is anchored to `scratch_path_anchor_if_relative`
+    /// (the caller-provided server data path), NOT the process CWD (which varies by launch method)
+    /// and NOT `default_scratch_path` -- that default is itself a per-disk subdirectory of the
+    /// server data path (`.../disks/<name>/cas_scratch/`), so anchoring a relative override to it
+    /// instead of to the server data path directly would silently nest the override two levels
+    /// deeper than intended (review finding: this is exactly the pre-existing factory's anchor,
+    /// which callers already depend on in shipped configs). The default is already absolute; only
+    /// an explicit relative override needs anchoring, and only to the server-data-path anchor.
     if (settings[ContentAddressedSetting::scratch_path].changed)
     {
         if (fs::path(settings[ContentAddressedSetting::scratch_path].value).is_relative())
-            settings[ContentAddressedSetting::scratch_path] = (fs::path(default_scratch_path) / settings[ContentAddressedSetting::scratch_path].value).string();
+            settings[ContentAddressedSetting::scratch_path] = (fs::path(scratch_path_anchor_if_relative) / settings[ContentAddressedSetting::scratch_path].value).string();
     }
     else
     {

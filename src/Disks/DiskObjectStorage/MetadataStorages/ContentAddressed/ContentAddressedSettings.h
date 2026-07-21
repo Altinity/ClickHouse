@@ -53,12 +53,18 @@ struct ContentAddressedSettings
 
     /// Loads every key under `config_prefix`, rejecting unknown non-object-storage keys (fail
     /// closed, mirrors `FileCacheSettings::loadFromConfig`'s `non_cache_keys` skip-set). A missing
-    /// `scratch_path` defaults to `default_scratch_path`; a relative override is anchored to it
-    /// (never the process CWD). `server_root_id` is passed through `expand_macros` before
+    /// `scratch_path` defaults to `default_scratch_path`; a relative OVERRIDE is anchored to
+    /// `scratch_path_anchor_if_relative` instead (never the process CWD, and never
+    /// `default_scratch_path` -- that default is a per-disk subdirectory, e.g.
+    /// `<server-data-path>/disks/<name>/cas_scratch/`, and anchoring a relative override to it would
+    /// silently nest the override two levels deeper than the server data path the operator meant;
+    /// mirrors `FileCacheSettings::loadFromConfig`'s `cache_path_prefix_if_relative` /
+    /// `default_cache_path` split). `server_root_id` is passed through `expand_macros` before
     /// `validate` runs. Ends by calling `validate`.
     void loadFromConfig(
         const Poco::Util::AbstractConfiguration & config,
         const std::string & config_prefix,
+        const std::string & scratch_path_anchor_if_relative,
         const std::string & default_scratch_path,
         const MacroExpander & expand_macros);
 
