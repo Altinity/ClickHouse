@@ -166,6 +166,22 @@ public:
     /// synchronized with the accessors and synchronous GC entry points.
     void shutdown() override;
 
+    /// Idempotent, resumable quiescence barrier for the `SYSTEM CONTENT ADDRESSED UNMOUNT` handler
+    /// (Task 6): moves `Mounted -> Unmounting -> Dormant`. Gates new operations immediately (the
+    /// `Unmounting` flip happens before anything else), stops the GC scheduler, then waits for
+    /// outstanding `store()`/`partAccess()` snapshots to drop their references before releasing the
+    /// pool. A no-op when already `Dormant`. Throws `TIMEOUT_EXCEEDED` if snapshots are still live
+    /// after `drain_timeout_ms` -- the disk then stays `Unmounting` (new operations stay refused) and
+    /// a retried call resumes the drain from where it left off, rather than restarting the whole
+    /// unmount. Does not consult `shutdown_called`; unlike `shutdown()`, this is not a terminal path.
+    void unmountSynchronously(uint64_t drain_timeout_ms = 30000) TSA_NO_THREAD_SAFETY_ANALYSIS;
+    /// Idempotent explicit mount for the `SYSTEM CONTENT ADDRESSED MOUNT` handler (Task 6):
+    /// `Dormant -> Mounted` via `startup()`. A no-op when already `Mounted`. Throws `INVALID_STATE`
+    /// when called during an incomplete `Unmounting` -- mounting on top of an unfinished unmount could
+    /// let two live pool snapshots exist under different mount generations at once; the caller must
+    /// finish (or retry) `unmountSynchronously` first.
+    void mountExplicitly() TSA_NO_THREAD_SAFETY_ANALYSIS;
+
     /// Test-only fault-injection hook. When set, `startup` invokes it right before it publishes
     /// `cas_store`/`part_access`/`gc_scheduler`/`pool_uuid`/`conditional_copy_supported` -- everything
     /// up to that point (opening the pool, building the part-folder facade, running the capability

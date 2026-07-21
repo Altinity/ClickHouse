@@ -18,6 +18,7 @@ namespace DB::ErrorCodes
 {
 extern const int NOT_IMPLEMENTED;
 extern const int INVALID_STATE;
+extern const int TIMEOUT_EXCEEDED;
 }
 
 /// [TXN-ONE-PIPELINE] CA publish-at-commit lock-scope tests.
@@ -719,4 +720,62 @@ TEST(CaWiring, OperationsRefuseWhenNotMounted)
     {
         EXPECT_EQ(e.code(), DB::ErrorCodes::INVALID_STATE) << e.message();
     }
+}
+
+/// [Task 5] `unmountSynchronously` is a resumable quiescence barrier: `Mounted -> Unmounting ->
+/// Dormant`. With no outstanding pool references the drain completes immediately, `store()` then
+/// refuses (Dormant), a repeated `unmountSynchronously()` is a no-op, `mountExplicitly()` remounts
+/// (Dormant -> Mounted via `startup()`), and a repeated `mountExplicitly()` is a no-op too.
+TEST(CaLifecycle, UnmountDrainsAndIsIdempotent)
+{
+    auto storage = openTxStorage();
+    storage->unmountSynchronously();
+    EXPECT_ANY_THROW(storage->store());                    /// gated
+    EXPECT_NO_THROW(storage->unmountSynchronously());      /// Dormant -> no-op
+    EXPECT_NO_THROW(storage->mountExplicitly());           /// Dormant -> Mounted
+    EXPECT_NO_THROW(storage->store());
+    EXPECT_NO_THROW(storage->mountExplicitly());           /// Mounted -> no-op
+}
+
+/// [Task 5] `unmountSynchronously` refuses to complete while a snapshot (an outstanding `Cas::PoolPtr`
+/// from `store()`) is still live -- the drain deadline elapses and the disk stays `Unmounting`, which
+/// refuses both new pool access AND a mount attempt (mounting on top of an incomplete unmount would
+/// let two live pool snapshots for the same pool exist under different mount generations). Releasing
+/// the held snapshot lets a retried `unmountSynchronously()` finish the drain and settle to `Dormant`.
+TEST(CaLifecycle, UnmountTimesOutWhileSnapshotHeldThenResumes)
+{
+    auto storage = openTxStorage();
+    auto held = storage->store();                          /// outstanding PoolPtr
+    try
+    {
+        storage->unmountSynchronously(/*drain_timeout_ms=*/100);
+        FAIL() << "must time out";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::TIMEOUT_EXCEEDED) << e.message();
+    }
+    EXPECT_ANY_THROW(storage->store());                    /// state stays Unmounting: new ops refused
+    EXPECT_ANY_THROW(storage->mountExplicitly());          /// MOUNT from Unmounting refused
+    held.reset();
+    EXPECT_NO_THROW(storage->unmountSynchronously());      /// resume completes
+    EXPECT_NO_THROW(storage->mountExplicitly());
+}
+
+/// [Task 5] The clean-reuse contract: `UNMOUNT` then wiping the backing store entirely (the on-disk
+/// equivalent of `rm -rf` the pool root) then `MOUNT` must open a FRESH pool -- a brand-new
+/// `pool_uuid`, not a stale identity carried over from the wiped generation. `LocalObjectStorage`
+/// treats a missing root as an empty listing (see `listObjects`), so `Pool::open` mints a new pool
+/// exactly as it would against a never-used root.
+TEST(CaLifecycle, RemountAfterBackingWipeMintsFreshPool)
+{
+    auto storage = openTxStorage();
+    const String uuid_before = storage->getPoolUUID();     /// real accessor: getPoolUUID(), not poolUuid()
+    storage->unmountSynchronously();
+
+    const auto root = storage->objectStorage()->getCommonKeyPrefix();
+    std::filesystem::remove_all(root);
+
+    EXPECT_NO_THROW(storage->mountExplicitly());
+    EXPECT_NE(storage->getPoolUUID(), uuid_before) << "a wiped backing store must remount as a brand-new pool";
 }

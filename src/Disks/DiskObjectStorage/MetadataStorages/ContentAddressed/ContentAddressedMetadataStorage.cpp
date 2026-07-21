@@ -22,6 +22,7 @@
 #include <Common/logger_useful.h>
 #include <Common/thread_local_rng.h>
 #include <Poco/Util/AbstractConfiguration.h>
+#include <base/sleep.h>
 #include <charconv>
 #include <chrono>
 #include <filesystem>
@@ -44,6 +45,7 @@ namespace ErrorCodes
     extern const int NETWORK_ERROR;
     extern const int NOT_IMPLEMENTED;
     extern const int INVALID_STATE;
+    extern const int TIMEOUT_EXCEEDED;
 }
 
 namespace ContentAddressedSetting
@@ -656,6 +658,89 @@ void ContentAddressedMetadataStorage::shutdown()
     /// old_scheduler keeps the object alive regardless.
     if (old_scheduler)
         old_scheduler->stop();
+}
+
+void ContentAddressedMetadataStorage::unmountSynchronously(uint64_t drain_timeout_ms)
+{
+    std::lock_guard lifecycle(lifecycle_mutex);
+    {
+        std::lock_guard lock(pointer_mutex);
+        if (mount_state == MountState::Dormant)
+            return;                                        /// idempotent no-op
+        mount_state = MountState::Unmounting;              /// gate: new operations now refuse
+    }
+    /// Stop the GC scheduler first (waits for an in-flight synchronous round, same as shutdown()).
+    {
+        std::lock_guard round_lock(gc_scheduler_mutex);
+        std::shared_ptr<Cas::CasGcScheduler> old_scheduler;
+        {
+            std::lock_guard lock(pointer_mutex);
+            old_scheduler = std::move(gc_scheduler);
+            gc_scheduler.reset();
+            part_access.reset();
+        }
+        if (old_scheduler)
+            old_scheduler->stop();
+    }
+    /// Drain: wait for outstanding store() snapshots to die. In-flight part writes pin the pool via
+    /// shared_from_this, so this naturally waits them out. Bounded slice-poll of use_count() -- a
+    /// deliberate wait for an EXTERNAL condition (snapshot holders finishing), not a race-fix sleep;
+    /// under the Unmounting gate the count is monotonically non-increasing.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(drain_timeout_ms);
+    for (;;)
+    {
+        long holders = 0;
+        {
+            std::lock_guard lock(pointer_mutex);
+            if (!cas_store)
+                break;                                     /// resumed after a prior successful reset
+            holders = cas_store.use_count() - 1;           /// -1: our own member reference
+        }
+        if (holders <= 0)
+            break;
+        if (std::chrono::steady_clock::now() >= deadline)
+            throw Exception(ErrorCodes::TIMEOUT_EXCEEDED,
+                "content-addressed disk unmount: {} pool reference(s) still live after {} ms -- "
+                "disk stays in Unmounting (new operations refused); retry UNMOUNT to resume",
+                holders, drain_timeout_ms);
+        sleepForMilliseconds(50);
+    }
+    /// Sole owner: this reset runs ~Pool synchronously (lease clean-release -- hardened in part 1b --
+    /// write-lane drain, background thread joins, farewell).
+    {
+        Cas::PoolPtr last;
+        {
+            std::lock_guard lock(pointer_mutex);
+            last = std::move(cas_store);
+            cas_store.reset();
+        }
+        last.reset();                                      /// ~Pool outside pointer_mutex
+    }
+    {
+        std::lock_guard lock(pointer_mutex);
+        mount_state = MountState::Dormant;
+    }
+}
+
+void ContentAddressedMetadataStorage::mountExplicitly()
+{
+    std::lock_guard lifecycle(lifecycle_mutex);
+    {
+        std::lock_guard lock(pointer_mutex);
+        if (mount_state == MountState::Mounted)
+            return;                                        /// idempotent no-op
+        if (mount_state == MountState::Unmounting)
+            throw Exception(ErrorCodes::INVALID_STATE,
+                "content-addressed disk mount: an unmount is in progress/incomplete -- "
+                "retry SYSTEM CONTENT ADDRESSED UNMOUNT to finish it first");
+    }
+    /// `startup()` does not consult `shutdown_called` -- only `shutdown()` sets that latch and only
+    /// the synchronous GC round entry points read it (`runOneGcRoundForTest`/
+    /// `runGarbageCollectionRoundNow`/`runGcRebuildNow` above). That latch is the terminal
+    /// server-shutdown path and is untouched here, exactly as `unmountSynchronously` above leaves it
+    /// alone -- an explicit remount is a normal, repeatable lifecycle transition, not a server
+    /// restart.
+    startup();                                             /// atomic publish (Task 3) sets Mounted
 }
 
 ContentAddressedMetadataStorage::PoolAccessSnapshot ContentAddressedMetadataStorage::poolAccess() const
