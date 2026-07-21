@@ -1258,7 +1258,11 @@ def run_phase3(args):
         log(f"{label}")
         checkpoint_active.set()
         try:
-            wait_for_healthy(cluster)
+            # 900s, not the default 180s: a killed node's CA table load after a high-churn stage
+            # takes minutes (observed 2026-07-21 f1f11 attempt-2: >180s, completed within ~15 min —
+            # ref-LIST recovery cost; tracked as a product finding in docs/superpowers/cas/BACKLOG.md).
+            # The bound still FAILS LOUDLY on a genuinely stuck load (AsyncLoader terminal-FAILED class).
+            wait_for_healthy(cluster, timeout_s=900.0)
             # Entry gate only needs dangling/exit_code -> cheap summary fsck (detail=False).
             # Each poll is bounded at 180s; FsckTimeout degrades to a logged skip (B146/B154).
             try:
