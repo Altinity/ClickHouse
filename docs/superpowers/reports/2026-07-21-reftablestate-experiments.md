@@ -586,3 +586,152 @@ New tests (`gtest_cas_ref_statemachine.cpp`):
   `E3TrustedReplayPoisonOnBadTailIsInternal`) -- a tail whose last txn is illegal makes `replay` throw
   `CORRUPTED_DATA`; an independent replay of the valid prefix is unaffected, pinning that the in-place
   poison never escapes the failed call.
+
+## E4 flat-vector base (t6) {#e4-flat-vector-base-t6}
+
+Attacks `RefCowMap`'s internal `base` representation directly: `Base` changes from
+`std::map<String, RefCommittedRow>` to a sorted `std::vector<std::pair<String, RefCommittedRow>>`
+behind the same `shared_ptr<const Base>`. Keyed lookups against `base` (`find`/`contains`-equivalent
+checks inside `RefCowMap::find`/`insertLive`/`erase`) switch from the tree's own `find`/`contains`/
+`lower_bound` members to three small free functions in an anonymous namespace
+(`baseLowerBound`/`baseFind`/`baseContains`, `Pool/CasRefCowMap.cpp`) built on `std::lower_bound`
+comparing only `.first` -- same bytewise `String` order `std::map`'s default comparator uses, so no
+behavior change, only representation. `materialize()` changes from "copy `*base` into a fresh
+`std::map`, then replay each overlay entry through `operator[]`/`erase`" to a genuine single-pass
+two-sorted-range merge into a freshly `reserve`d vector -- the same shape the read-only merged
+iterator's `normalize`/`operator++` already use, just building output instead of skipping over it.
+`overlay` is untouched (`std::map<String, std::optional<RefCommittedRow>>`, per the brief -- E2's own
+investigation already established why a tree, not a hash map, is the right choice for a
+small/mutation-heavy, frequently-copied container). The `const_iterator`'s `base_it`/`base_end` fields
+change type from `std::map<...>::const_iterator` to the vector's `const_iterator` automatically (both
+are aliases of `Base::const_iterator`); no other iterator code changed line-for-line.
+
+**Files:** `Pool/CasRefCowMap.h` (`Base` alias + doc), `Pool/CasRefCowMap.cpp` (`find`/`insertLive`/
+`erase`/`materialize`, three new static helpers).
+
+### Step 1: pin-suite gate
+
+A dedicated suite already existed at `src/Disks/tests/gtest_cas_ref_cow_map.cpp` (landed earlier,
+commit `f327210151b`, prior to this round) -- not created fresh for this task. It already covers every
+scenario the brief's gate lists: keyed ops (`emplace` no-overwrite + flags, `insert_or_assign` flags,
+`erase(key)` return values across base-backed/overlay-only/absent, `at` throw, `find`/`contains`/
+`count`), merged iteration (base-only sorted order; tombstones/overrides interleaved with a live
+base -- including a tombstone as the *last* live element, `MergedIterationAppliesTombstonesAndOverrides`;
+an overlay-only key sandwiched between two base keys, `FindOverlayOnlyKeyIteratesIntoBase`),
+`erase(pos)` (mid-sequence and last-element/`end()`-producing), equality across different base/overlay
+representations of the same content, `materialize` (folds, empties overlay, no-op on an already-empty
+overlay, preserves values, leaves an earlier copy untouched), copy-shares-base `use_count`, and a
+50-trial x 200-step randomized property test cross-checking every operation against a `std::map`
+oracle -- which exercises tombstones/overrides at essentially every position (including sequence
+start/end) across many random shapes, a broader net than a handful of hand-picked positions. Given
+this already satisfies the brief's list, no new suite was created; ran it standalone first
+(`--gtest_filter='CasRefCowMap.*'`, part of the full gate below) against the *unmodified* `std::map`
+base to confirm green before swapping internals, then re-ran unchanged after the swap as the
+semantic gate -- exactly the brief's Step 1/Step 3 sequencing.
+
+### Step 3: build + gate
+
+- `flock ... ninja -C build unit_tests_dbms benchmark_cas_ref_protocol` -- clean both before
+  (`build/build_t6.log`, baseline confirmation) and after the swap (same log, rebuilt).
+- Gate (`build/test_gate_t6.log`), same filter as every prior round: **1096 tests, 0 failures**,
+  identical count to the t5 baseline (no new tests added this round; `CasRefCowMap`'s existing 17
+  tests are within the `Cas*` filter and passed against both representations). `CasEncodingPins*`
+  (the ordering canary) passed unchanged -- confirms the vector base's `<`-only comparator and the
+  merge-iteration order produce byte-identical encoded snapshots to the `std::map` base.
+
+### Benchmarks (`build/bench_t6_before.log` / `build/bench_t6_e4.log`, `--benchmark_repetitions=3
+--benchmark_report_aggregates_only=true`, medians; "before" is a fresh same-session re-run of the
+unmodified t5 code, not the t5 section's numbers verbatim, to control for cross-session machine noise)
+
+| Benchmark | N | Before (median) | t6/E4 (median) | Delta |
+|---|---|---|---|---|
+| `BM_Materialize` | 100 | 12,140 ns | 7,950 ns | **-34.5%** |
+| `BM_Materialize` | 1,000 | 127,202 ns | 83,627 ns | **-34.3%** |
+| `BM_Materialize` | 10,000 | 1,303,959 ns | 843,585 ns | **-35.3%** |
+| `BM_Materialize` | 100,000 | 18,081,268 ns | 8,549,055 ns | **-52.7%** (2.12x) |
+| `BM_Materialize` complexity fit | — | 10.90 NlgN, RMS 2% | **85.38 N, RMS 0%** | **O(N log N) → O(N)** |
+| `BM_MergedIteration` | 100 | 765 ns | 679 ns | -11.2% |
+| `BM_MergedIteration` | 1,000 | 7,669 ns | 6,795 ns | -11.4% |
+| `BM_MergedIteration` | 10,000 | 80,388 ns | 68,371 ns | -14.9% |
+| `BM_MergedIteration` | 100,000 | 906,842 ns | 706,784 ns | -22.1% (1.28x) |
+| `BM_MergedIteration` complexity fit | — | 0.55 NlgN, RMS 5% | **7.06 N, RMS 1%** | fit label O(NlgN) → O(N) |
+| `BM_SnapshotEncode` | 100 | 14,860 ns | 14,916 ns | +0.4% |
+| `BM_SnapshotEncode` | 1,000 | 153,390 ns | 147,848 ns | -3.6% |
+| `BM_SnapshotEncode` | 10,000 | 1,520,322 ns | 1,524,110 ns | +0.2% |
+| `BM_SnapshotEncode` | 100,000 | 15,934,998 ns | 15,772,256 ns | -1.0% |
+| `BM_SnapshotEncode` complexity fit | — | 159.36 N, RMS 1% | 157.50 N, RMS 1% | -1.2% |
+| `BM_ApplyRefLogTxn` | 100–100,000 | 761–829 ns | 768–814 ns | -1.8%..+1.6% (noise) |
+| `BM_Admits` | 100–100,000 | 1,000–1,069 ns | 1,012–1,056 ns | -1.2%..+1.4% (noise) |
+| `BM_AdmitsAddPrecommit` | 100–100,000 | 698–706 ns | 700–709 ns | +0.3%..+0.4% (noise) |
+| `BM_ScratchCopy` | 100–100,000 | 58.4–59.3 ns | 57.3–59.3 ns | -2.1%..+1.5% (noise) |
+| `BM_ReplayHistory` | 100–100,000 | 435,177 ns–172,348,258 ns | 436,382 ns–173,913,006 ns | -0.9%..+0.9% (noise) |
+| `BM_ReplayHistory` complexity fit | — | 1,725.47 N, RMS 2% | 1,737.06 N, RMS 2% | +0.7% (noise) |
+
+Every write-path benchmark (`BM_ApplyRefLogTxn`, `BM_Admits`, `BM_AdmitsAddPrecommit`,
+`BM_ScratchCopy`, `BM_ReplayHistory`) landed inside ±2% -- confirming the brief's own prediction: the
+write path only ever touches `overlay` (`std::map`, unchanged type and unchanged code), never reads or
+writes `base` except through the same-complexity-class `baseContains`/`baseFind` lookups, so there was
+never a mechanism by which the swap could move these numbers, and it didn't.
+
+### Reading the wins
+
+- **`BM_Materialize`** is the clean win: a genuine complexity-class change (the old code copied
+  `*base` wholesale into a new `std::map` -- O(N) allocations plus O(log N) per overlay entry via
+  `operator[]`/`erase`, i.e. O(N + K log N) -- the new code does one linear merge pass, O(N + K)).
+  The measured ratio *grows with N* (1.53x, 1.52x, 1.55x, 2.12x at N=100/1,000/10,000/100,000) exactly
+  as an O(N log N) vs O(N) comparison predicts, and only clears the round's 2x bar at the largest N
+  tested -- the trend says it would clear it decisively at any N beyond that, but the literal
+  measured numbers at the tested range are what they are.
+- **`BM_MergedIteration`** shows the same growing-ratio shape (1.11x, 1.13x, 1.17x, 1.28x) from
+  walking contiguous vector memory instead of chasing red-black-tree node pointers, but never reaches
+  2x within the tested range -- `->Complexity()`'s auto-fit relabels it from `0.55 NlgN` to a cleaner
+  `7.06 N`, but the *magnitude* of the win at any single N is a real, modest constant-factor
+  improvement, not a complexity-class jump the way `BM_Materialize`'s is (`RefCowMap`'s merged
+  iteration was already doing O(N) tree-iterator increments before; the vector only cuts the constant
+  per increment, it doesn't remove log-factor work the old iterator wasn't paying either).
+- **`BM_SnapshotEncode`** is within noise (-3.6%..+0.4%). This tracks the t5-baseline write-up's own
+  prediction: `BM_SnapshotEncode`'s ~159 ns/row is dominated by the encoder's own per-row
+  serialization cost (`encodeRefTableSnapshot`), not by the container's per-step iteration overhead
+  (`BM_MergedIteration`'s own ~8 ns/row baseline was already an order of magnitude smaller than the
+  encode cost it sits inside) -- shrinking an already-minor component by ~15-20% (extrapolating
+  `BM_MergedIteration`'s own delta) is invisible against the dominant cost, exactly as observed.
+
+### Elegance self-assessment
+
+The change is internals-only and small: one type alias, three small free functions replacing three
+tree-member-function call sites (`.find`/`.contains`/`.lower_bound` → `baseFind`/`baseContains`/
+`baseLowerBound`), and `materialize()` rewritten from copy-then-replay to a direct merge -- the same
+shape the read-only iterator already uses elsewhere in this file, so it isn't a new pattern in the
+codebase, just the second occurrence of an existing one. No new types, no public API change, no new
+test surface needed (the existing suite is the semantic gate, unchanged). The cost is that keyed base
+lookups no longer get member-function ergonomics (`base->find`/`base->contains`) and instead go
+through three lines of top-of-file helpers -- a minor readability tax, not a real complexity increase.
+Iterator-stability reasoning is unchanged: `base` is still never mutated in place, only ever replaced
+wholesale by `materialize()` via `shared_ptr` swap (`MaterializeDoesNotAffectACopyTakenBeforeIt`
+already pins this), so a vector's weaker general-purpose invalidation rules (any mutating op can
+reallocate) never actually apply here -- the only "mutation" `base` ever undergoes is being replaced,
+not appended/erased/inserted into.
+
+### Verdict
+
+**Mixed against the round's literal 2x-at-tested-N bar.** `BM_Materialize` (a target benchmark) clears
+2x only at N=100,000; `BM_MergedIteration` and `BM_SnapshotEncode` (the other two target benchmarks,
+and the two the plan's own default-revert wording names explicitly -- "iteration/encode benchmarks")
+never reach 2x anywhere in the tested range (max 1.28x and ~1.0x respectively). Per the plan's stated
+default ("REVERT if <2x win on the iteration/encode benchmarks"), this experiment does not clear the
+bar as written. The mitigating case for KEEP: `BM_Materialize`'s win is a genuine, provable
+complexity-class change (O(N log N) → O(N), not just a constant-factor tweak) with a ratio that
+provably grows without bound as N grows past the tested range, and it is the only one of the three
+targets with such a clean asymptotic argument backing an eventual real win at production table sizes
+(`gc_meta_pool_size` and typical table row counts documented elsewhere in this codebase run well past
+100,000). `BM_MergedIteration`'s growing-but-sub-2x trend supports the same argument more weakly.
+Against that, `BM_SnapshotEncode` -- the benchmark closest to the actual per-flush cold-scan production
+cost this experiment was meant to speed up -- shows no meaningful improvement at all, because the
+container change only ever touches a component that was already a minor fraction of that operation's
+total cost. Recommendation left to the controller per the round's own delegation; this writeup leans
+towards REVERT on the letter of the round's rule (2 of 3 named targets miss the bar at every tested
+N), while flagging that the asymptotic argument for `BM_Materialize` specifically is stronger than a
+flat percentage table alone conveys.
+
+Gate: 1,096 tests, 0 failures (unchanged from t5 -- no new tests this round; the "2 DISABLED TESTS"
+footer is the same pre-existing pair E2/E3 already noted).

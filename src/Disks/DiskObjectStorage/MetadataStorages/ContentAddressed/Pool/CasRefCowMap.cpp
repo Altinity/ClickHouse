@@ -1,8 +1,37 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCowMap.h>
+#include <algorithm>
 #include <stdexcept>
 
 namespace DB::Cas
 {
+
+namespace
+{
+
+/// First `base` entry whose key is >= `key` (mirrors `std::map::lower_bound`'s contract). `Base`
+/// is sorted by `.first`, so this is a plain `std::lower_bound` over the flat vector -- comparing
+/// only `.first` against `key`, `<`, the same bytewise `String` order `std::map<String, ...>`'s
+/// default comparator uses.
+RefCowMap::Base::const_iterator baseLowerBound(const RefCowMap::Base & base, const String & key)
+{
+    return std::lower_bound(
+        base.begin(), base.end(), key,
+        [](const std::pair<String, RefCommittedRow> & entry, const String & k) { return entry.first < k; });
+}
+
+/// `base`'s entry for `key`, or `base.end()` when absent (mirrors `std::map::find`).
+RefCowMap::Base::const_iterator baseFind(const RefCowMap::Base & base, const String & key)
+{
+    const auto it = baseLowerBound(base, key);
+    return (it != base.end() && it->first == key) ? it : base.end();
+}
+
+bool baseContains(const RefCowMap::Base & base, const String & key)
+{
+    return baseFind(base, key) != base.end();
+}
+
+}
 
 std::pair<const String &, const RefCommittedRow &> RefCowMap::const_iterator::operator*() const
 {
@@ -77,14 +106,14 @@ RefCowMap::const_iterator RefCowMap::find(const String & key) const
         if (!ov->second.has_value())
             return end();   /// tombstoned: not present
         const_iterator it;
-        it.base_it = base->lower_bound(key);   /// first base key >= this one: keeps the iterator mergeable
+        it.base_it = baseLowerBound(*base, key);   /// first base key >= this one: keeps the iterator mergeable
         it.base_end = base->end();
         it.overlay_it = ov;
         it.overlay_end = overlay.end();
         it.at_overlay = true;
         return it;
     }
-    const auto b = base->find(key);
+    const auto b = baseFind(*base, key);
     if (b == base->end())
         return end();
     const_iterator it;
@@ -115,7 +144,7 @@ void RefCowMap::insertLive(const String & key, RefCommittedRow row)
     }
     else
     {
-        if (!base->contains(key))
+        if (!baseContains(*base, key))
             ++net_delta;   /// brand new key, absent from base too
         overlay.emplace(key, std::move(row));
     }
@@ -143,14 +172,14 @@ size_t RefCowMap::erase(const String & key)
     {
         if (!ov->second.has_value())
             return 0;   /// already tombstoned: no-op
-        if (base->contains(key))
+        if (baseContains(*base, key))
             ov->second.reset();   /// keep shadowing the base row
         else
             overlay.erase(ov);    /// pure-overlay key: nothing left to shadow
         --net_delta;
         return 1;
     }
-    if (!base->contains(key))
+    if (!baseContains(*base, key))
         return 0;
     overlay.emplace(key, std::nullopt);   /// tombstone a base-only row
     --net_delta;
@@ -183,13 +212,36 @@ void RefCowMap::materialize()
 {
     if (overlay.empty())
         return;
-    auto merged = std::make_shared<Base>(*base);
-    for (const auto & [key, maybe_row] : overlay)
+    /// Two-sorted-range merge, same shape as the read-only iterator's `normalize`/`operator++`:
+    /// both `base` and `overlay` are already key-sorted, so a single linear pass produces the new
+    /// base without ever re-sorting or doing per-key tree operations. `size()` (still valid via the
+    /// old `base`/`net_delta` pair until the swap below) bounds the reservation exactly.
+    auto merged = std::make_shared<Base>();
+    merged->reserve(size());
+    auto base_it = base->begin();
+    const auto base_end = base->end();
+    auto overlay_it = overlay.begin();
+    const auto overlay_end = overlay.end();
+    while (base_it != base_end || overlay_it != overlay_end)
     {
-        if (maybe_row)
-            (*merged)[key] = *maybe_row;
-        else
-            merged->erase(key);
+        if (overlay_it == overlay_end || (base_it != base_end && base_it->first < overlay_it->first))
+        {
+            merged->emplace_back(*base_it);
+            ++base_it;
+        }
+        else if (base_it == base_end || overlay_it->first < base_it->first)
+        {
+            if (overlay_it->second)   /// a tombstone for a key absent from base is a no-op, as before
+                merged->emplace_back(overlay_it->first, *overlay_it->second);
+            ++overlay_it;
+        }
+        else   /// same key in both sources: overlay wins (override, or tombstone drops the base row)
+        {
+            if (overlay_it->second)
+                merged->emplace_back(overlay_it->first, *overlay_it->second);
+            ++base_it;
+            ++overlay_it;
+        }
     }
     base = std::move(merged);
     overlay.clear();
