@@ -322,10 +322,11 @@ An initial Phase-1 reproduction with unfaithful producers (marker-retaining stri
 
 ## Area 6 — Build watermark and resurrect liveness (B167) {#area-watermark-resurrect}
 
-These three models are now **stale against shipped code** — they model a per-candidate blob-guard
+These three models were **stale against shipped code** — they modeled a per-candidate blob-guard
 (`protectedByLiveBuild`) that B171 removed and a condemn-time `HeartbeatGuard` never implemented
-(deferred M-F Full GC). Their safety role fully migrated into `CaBuildRootPrecommit.tla`. They are
-kept as a record of the investigation and as documentation of the B167 livelock shape.
+(deferred M-F Full GC). Their safety role fully migrated into `CaBuildRootPrecommit.tla`. All three
+were **removed on 2026-07-21**; these sections stay as the record of the investigation and as
+documentation of the B167 livelock shape.
 
 ### `CaResurrectLiveness.tla` — abstract resurrect-liveness (B167) {#caresurrectliveness}
 
@@ -363,11 +364,12 @@ guard ON → `<>published` holds (4 states); guard OFF → livelock lasso (7 sta
 ### `CaBuildWatermarkNum.tla` — numeric watermark validation {#cabuildwatermarknum}
 
 **Files:** `CaBuildWatermarkNum.tla`, `CaBuildWatermarkNum_correct.cfg`,
-`CaBuildWatermarkNum_confused.cfg`, `CaBuildWatermarkNum_nonmonotonic.cfg`
+`CaBuildWatermarkNum_confused.cfg`, `CaBuildWatermarkNum_nonmonotonic.cfg` — **removed 2026-07-21**
+(full text in git history).
 
 **What it proves.** Safety (`Inv_ProtectedNeverCondemned`, `Inv_NoDangle`) of the concrete numeric floor with two servers, real `epoch` watermarks, and real `build_seq` allocation. Key finding: monotone `build_seq` allocation is load-bearing — uniqueness alone is insufficient; a non-monotone allocation lets `min_active` be pulled back below a finished build's seq, re-protecting a condemned blob (a leak). The `_confused` config (wrong server's watermark) violates `Inv_ProtectedNeverCondemned`.
 
-**Code currency:** STALE vs shipped (same as `CaBuildWatermark.tla`). The monotone-`build_seq` floor lemma survives for precommit-ref reclaim.
+**Code currency:** STALE vs shipped (same as `CaBuildWatermark.tla`); files removed 2026-07-21. The monotone-`build_seq` floor lemma survives for precommit-ref reclaim.
 
 ---
 
@@ -745,7 +747,7 @@ counterexamples found during EBR model development encoded the four load-bearing
 | `CaB140Dangle.tla` | B140 history | **REMOVED 2026-07-21** (unfaithful producers) | — | — | Phase-1 investigation record |
 | `CaResurrectLiveness.tla` | Resurrect/B167 | **REMOVED 2026-07-21** (stale, deferred M-F guard) | `<>published` | 1 | upload→publish span not atomic; heartbeat guard load-bearing |
 | `CaBuildWatermark.tla` | Watermark/B167 | **REMOVED 2026-07-21** (blob-guard removed by B171) | `Inv_ProtectedNeverCondemned`, `Inv_NoDangle`, liveness | 3 | monotone `build_seq`, exact min active set, sound crash detection |
-| `CaBuildWatermarkNum.tla` | Watermark numeric | **STALE** (blob-guard removed by B171) | `Inv_ProtectedNeverCondemned`, `Inv_NoDangle` | 2 | monotone `build_seq` (not just unique), per-server scoping |
+| `CaBuildWatermarkNum.tla` | Watermark numeric | **REMOVED 2026-07-21** (blob-guard removed by B171) | `Inv_ProtectedNeverCondemned`, `Inv_NoDangle` | 2 | monotone `build_seq` (not just unique), per-server scoping |
 | `CaGcRootLocalPartManifestCore.tla` | Part-manifest GC R0 | **CURRENT** (fold/manifest/attempt-scoping); fence/recheck phases SUPERSEDED by Area 11 | `INV_NO_DANGLE/LOSS/RETURN`, 10 more; liveness | 28 | all-shard fresh fence (superseded), single coordinator fence (superseded), scatter deltas, stale-token-no-over-delete, attempt-scoped visibility |
 | `CaGcIndegRefoldCore.tla` | Indeg re-fold | **CURRENT** | `INV_INDEG_NONNEG` | 1 | seal cursor at `max(foldCursor, fenceVersion)`, not `foldCursor` |
 | `CaGcShardIncarnationCore.tla` | Registry removal D1 | **CURRENT** | `INV_NO_DANGLING`, `INV_NO_ORPHAN_EDGE` | 4 | two-coordinate replacement (incarnation + round self-floor) for registry; per-shard monotonicity |
