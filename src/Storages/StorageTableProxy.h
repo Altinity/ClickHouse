@@ -54,6 +54,14 @@ public:
     StoragePolicyPtr getStoragePolicy() const override { return nullptr; }
     bool isView() const override { return false; }
 
+    /// `IStorage`'s default is a silent no-op, but nested engines override it to REJECT (e.g.
+    /// `StorageReplicatedMergeTree`, `StorageKeeperMap`) -- without this forward a lazy table's
+    /// rename silently bypasses the nested engine's restriction. Deliberately on this class and
+    /// NOT on the generic `StorageProxy`: `StorageTableFunctionProxy` must not instantiate its
+    /// underlying storage for a metadata-only rename. Materializing a lazy table here is the
+    /// point -- an authoritative check outweighs laziness.
+    void checkTableCanBeRenamed(const StorageID & new_name) const override { getNested()->checkTableCanBeRenamed(new_name); }
+
     /// Startup is deferred until first access via `getNested`.
     void startup() override { }
 

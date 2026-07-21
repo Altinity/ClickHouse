@@ -588,6 +588,12 @@ implemented is net-negative — disable/quarantine rather than fix one virtual a
 - [ ] **USER DECISION**: quarantine/disable `lazy_load_tables` vs fund the full remediation
   (complete forwarding sweep + Clang-AST CI guard + backup regression test) vs catalog-entry
   laziness refactor. Until decided: treat every new lazy-table symptom as this class first.
+- [ ] THIRD bug of the class found while validating the mutation fix (2026-07-22): `MATERIALIZE
+  TTL` through a lazy proxy fails with `INCORRECT_QUERY` "no TTL set" even after the
+  `checkMutationIsPossible` forward — the proxy's cached in-memory metadata carries columns only
+  (no TTL/ORDER BY), and `getInMemoryMetadataPtr` deliberately does not forward (audit class C).
+  Candidate rule if the feature stays: forward metadata to nested ONCE MATERIALIZED (no laziness
+  left to preserve at that point); needs its own consult.
 - [ ] If the feature stays: forward at least `backupData`/`restoreDataFromBackup`/
   `supportsBackupPartition`/`finalizeRestoreFromBackup`, `onActionLockRemove`,
   `supportsOptimizationToSubcolumns` (the audit's three most-urgent), then the rest of class B.
