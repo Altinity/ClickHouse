@@ -119,13 +119,22 @@ eliminate the retire-404-HEAD storm. Frame argument: no safety invariant reads `
 `GForget` preserves all invariants independent of scope. Re-verified at stages 1–3 (clean). Liveness
 lasso unchanged.
 
-**Code currency:** CURRENT (minor drift). Three discrepancies:
-(1) heartbeat/debris/full-GC-cut actions (`WHb*`, `GDebrisRetire`, `FGRead`, `FGCommit`) are fully
-specified in the model but deferred in code (Milestone-F Full GC, `CasGc.h:121` "API slot reserved");
-(2) `CaBuildRootPrecommit.tla` is the live safety mechanism for B171/B140 — only obliquely modeled
-here (no first-class precommit-root edge);
-(3) the `EnableReval=FALSE` dead-token-oracle gate (`deadTok`/`CondemnedAtView`) has no production
-code path.
+**Code currency:** CURRENT as the **architecture-independent safety spine**; its concrete structure
+is superseded (audited 2026-07-22). Every proven guard maps to a faithful code counterpart —
+incarnation token + exact-token delete + `INV_NO_RETURN` (`CasGc.cpp:419,507-512`), fold → retire →
+fence → recheck → delete → cascade → trim, no destructive decision on a not-fully-folded snapshot
+(realized by `suppress_destructive`), retired entries drop only on a confirmed outcome — so no proven
+invariant is at risk. **But its concrete representation is superseded by the `cas-gc-rebuild`
+architecture**: the model embeds the journal *inside the manifest* (`man[s].log`) and appends the
+fence as a *record in that journal* gating writers on `man[s].fence`, whereas the shipped code uses
+separate ref-log objects (`RefTxnId`), source-edge runs, write-once fold seals, and heartbeat-floor
+fencing — there is no manifest-embedded journal or manifest fence record. So read this model as the
+canonical *invariant* proof, not a structural mirror of the code (the concrete layer is tracked by
+`CaGcRootLocalPartManifestCore.tla` + the ack-floor/round-defer models). Other standing discrepancies:
+(1) heartbeat/debris/full-GC-cut actions (`WHb*`, `GDebrisRetire`, `FGRead`, `FGCommit`) are specified
+in the model but deferred in code; (2) `CaBuildRootPrecommit.tla` is the live precommit safety
+mechanism, only obliquely modeled here; (3) the `EnableReval=FALSE` dead-token-oracle gate has no
+production code path.
 
 ---
 
@@ -204,8 +213,32 @@ inline-closure liveness fix (`InlineClosure`).
 - The precommit must record its closure **inline at precommit time** — not lazily from a tree-object
   read at GC fold time (which can 404 if the tree is already condemned/deleted).
 
-**Code currency:** CURRENT. This is the live B171/B140 fix model. The flat (one-level) model does not
-cover nested subtrees; that recursion fix is validated by the C++ gtest in
+**Code currency:** CURRENT for the safety conclusion; two named mechanisms have DRIFTED (audited
+2026-07-22) — the model's proven conclusion (build-root reachability + fail-closed commit jointly
+close the adopted-blob dangle) still holds, but the code realizes it differently than the two
+bullets above describe:
+
+- The "record its closure **inline at precommit time**" bullet is **not** how the shipped writer
+  works. `precommitAdd` carries only the manifest ref, never a blob list
+  (`CasPartWriteTxn.cpp:879-890`); GC learns the closure by reading the manifest body **lazily at
+  fold time** (`foldManifestEdges`, `CasGc.cpp:789-796`). Shipped closes the same leak by a
+  different, unmodeled discipline: a missing-body `+1` fold **clamps** the per-table cursor (a
+  barrier that re-reads next round) instead of recording an empty closure, and GC is the **sole
+  deleter** of the manifest body, deferring its exact-token delete until after the `-1` edges fold
+  (`mf_cleanup`, `CasGc.cpp:815-816`). So `InlineClosure=TRUE` models a mechanism the code does not
+  use; the lazy path it labels the S2 leak is the shipped path, made safe by the clamp barrier.
+- "Fail-closed commit (presence re-check on the whole closure)" is realized as an
+  **owner-liveness** fail-close, not a per-blob presence HEAD: `promote` aborts unless the precommit
+  is still the live owner (`CasPartWriteTxn.cpp:963-968`); tokened leaves are skipped as
+  edge-protected and tokenless leaves trusted. This is *stronger* (live owner ⇒ in-degree ≥ 1 ⇒
+  present, GC being the sole in-degree-respecting deleter), so it is sound — but it is not the
+  model's `∀c: present[c]` gate.
+
+Not a CODE-RISK — the safety conclusion holds via these stronger/different mechanisms. The model
+should be re-annotated (or its `InlineClosure`/presence-gate arms recast to the lazy-fold +
+clamp-barrier + GC-owned-deletion + owner-liveness discipline) so it structurally mirrors the code;
+that recast is a scoped follow-up, not done in this pass. The flat (one-level) model does not cover
+nested subtrees; that recursion fix is validated by the C++ gtest in
 `src/Disks/tests/gtest_cas_gc_leak.cpp`.
 
 ---
@@ -485,6 +518,13 @@ Full table in `CaGcRootLocalPartManifestCore_RESULTS.md`.
 > deleted; the live round protocol and its proofs are `CaGcAckFloorCore.tla` +
 > `CaGcAckFloorZombie.tla` (Area 11). The fold, manifest-cleanup, orphan-sweep, source-edge, and
 > attempt-scoping results above are unaffected by the redesign and stay CURRENT.
+>
+> **Audit note (2026-07-22): two of these fence-era sabotage configs no longer run** —
+> `sab_reducerownsfence` (#26) and `sab_crosssharddisplacement` (#27) now throw a TLC
+> `RuntimeException` (`CHOOSE m ∈ {}` at `TheM`, `.tla:113`) in the `EnableSharding` reducer arm
+> instead of cleanly violating their invariant. They are part of the fence/recheck half a future
+> realignment should excise (see §area-ackfloor); until then they are broken, not merely superseded.
+> The conclusions they once demonstrated for the fence mechanism stand in git history.
 
 **Code currency:** CURRENT for the fold/manifest/attempt-scoping machinery the ack-floor round reuses;
 the fence/recheck phases it models are SUPERSEDED by Area 11 (controls kept as historical evidence).
@@ -710,11 +750,24 @@ clamped pass occurred).
 - Rebuild must discard the old retired list and mint a round above every surviving mount ack (see
   §area-clamp-suppression for the clamp/rebuild/copy-forward extension detail).
 
-**Code currency:** CURRENT (minor drift; partially superseded — v3 freshness-meta, see the note above).
-The GC-side round pipeline (`GBegin`/`GFold`/`GComplete`, `graduationDue`, `GRebuild`, clamp suppression)
-matches shipped code (`cas-gc-ack-floor-fence`); honest stage-1 clean at 83.9M distinct states. The
-writer-heartbeat/`min_ack` graduation floor this model also proves is SUPERSEDED: shipped graduation now
-paces on `condemn_round < current_round` alone, with no writer ack input.
+**Code currency:** MIXED — the graduation gate this model checks is SUPERSEDED; the rebuild and
+clamp-suppression parts still MATCH (audited 2026-07-22, deeper than the "minor drift" this note used
+to claim). The model's `GComplete` graduation predicate is `e.r < minAckL`, a **writer-ack floor**
+(`MinAck` over `wAck` of the live/expired `FloorSet`) — but the shipped `Gc::graduationDue` paces on
+`condemn_round < current_round` alone, with **no** writer-ack input (`CasGc.cpp:1867`; the merge gate
+is `!suppress_destructive && e.condemn_round < current_round`, `CasBlobInDegree.cpp:431`). So the
+model's entire writer-heartbeat apparatus — `WOpen`/`WBeat` advertising a round into `wAck`,
+`FloorSet`/`MinAck`/`minAckL`, and the `sab_sleeperrearm` / `sab_ackbeforedrain` / `sab_ackwithoutread`
+sabotages and `INV_ACK_LE_VIEW` that test it — models a graduation input the code no longer has. What
+still MATCHES and gives the model its unique current value: clamp suppression (`~clampedL` guarding
+graduation ↔ `suppress_destructive`, `CasGc.cpp:1360`), disaster-recovery `GRebuild` (↔
+`Gc::rebuildBaseline`, `CasGc.cpp:1909`: empty retired list, over-protect unowned-alive, round minted
+above surviving numbers), the three-step cut + two-step commit window, and exact-token delete. Not a
+CODE-RISK: round-pacing is a stricter safety condition than the ack floor, and the current graduation
+is independently proven by `CaGcRoundDeferCore` + `CaGcCondemnMarkerGate` + the two-phase
+`CaGcAckFloorZombie`. To realign, trim the ack apparatus and re-base graduation on the latched round,
+keeping the `GFenceOut`/`WExpire` fence-out only as *liveness*; this is a scoped proof-model rewrite
+(false-green risk — kept for a careful pass with adversarial review), not done here.
 
 ---
 
@@ -784,9 +837,9 @@ counterexamples found during EBR model development encoded the four load-bearing
 
 | Model | Area | Status | Key invariant(s) | Sabotages | Design decisions |
 |---|---|---|---|---|---|
-| `CaIncarnationCore.tla` | GC core | **CURRENT** (minor drift) | `INV_NO_DANGLE`, `INV_NO_LOSS`, `INV_NO_RETURN`, `INV_JOURNAL_COVERAGE` | 11 | fence, recheck, exact-token delete, atomic cascade, registry fence-time universe, evidence re-observation |
+| `CaIncarnationCore.tla` | GC core | **CURRENT as safety spine**; concrete structure superseded (manifest-embedded journal/fence vs ref-log/source-edge-run) | `INV_NO_DANGLE`, `INV_NO_LOSS`, `INV_NO_RETURN`, `INV_JOURNAL_COVERAGE` | 11 | fence, recheck, exact-token delete, atomic cascade, registry fence-time universe, evidence re-observation |
 | `CaIncarnationProofCore.tla` | GC core (Apalache) | **REMOVED 2026-07-22** (stale pre-B91; unverifiable — no Apalache) | `IndInv` (19 conjuncts) inductive at fixed bounds | 5 negative controls | `W-REVALIDATE` is load-bearing (F1 machine-checked); `InflightCurrentUnreferenced` is irredundant |
-| `CaBuildRootPrecommit.tla` | Precommit/B140/B199-S2 | **CURRENT** | `INV_NO_DANGLE_COMMITTED`, `INV_BUILDROOT_PROTECTS`, `INV_COMMIT_FAILCLOSED`, `INV_NO_LEAK` | 2 + 1 liveness | build-root + fail-closed commit jointly necessary; inline closure at precommit time |
+| `CaBuildRootPrecommit.tla` | Precommit/B140/B199-S2 | **CURRENT conclusion**; 2 mechanisms drifted (inline-closure → lazy-fold+clamp-barrier; presence-gate → owner-liveness) | `INV_NO_DANGLE_COMMITTED`, `INV_BUILDROOT_PROTECTS`, `INV_COMMIT_FAILCLOSED`, `INV_NO_LEAK` | 2 + 1 liveness | build-root + fail-closed commit jointly necessary; inline closure at precommit time |
 | `CaGcLeaseCore.tla` | Lease/B160 | **CURRENT** | `NoEpochCollision`, `NoFalseSteal` | 1 | advisory heartbeat eliminates false steals; safety independent of heartbeat |
 | `CaCasMountCore.tla` | Mount | **CURRENT** (rev.6 observation-reclaim; audited 2026-07-22) | `NoTwoServerUuids…`, `ForeignUuid…`, `WriterEpochMonotoneUnique`, `GlobalSupersededWriter…` | 5 (incl. `sab_wallclockreclaim`) | sticky owner, monotone epoch, observation-based reclaim on own clock (not foreign wall clock), pure-local per-write guard |
 | `CaB140DangleMerge.tla` | B140 fix proof | **CURRENT** (history record) | `INV_NO_LOSS` | 2×2 matrix | trim-gate + cursor-in-snap jointly necessary |
@@ -798,11 +851,11 @@ counterexamples found during EBR model development encoded the four load-bearing
 | `CaGcRootLocalPartManifestCore.tla` | Part-manifest GC R0 | **CURRENT** (fold/manifest/attempt-scoping); fence/recheck phases SUPERSEDED by Area 11 | `INV_NO_DANGLE/LOSS/RETURN`, 10 more; liveness | 28 | all-shard fresh fence (superseded), single coordinator fence (superseded), scatter deltas, stale-token-no-over-delete, attempt-scoped visibility |
 | `CaGcIndegRefoldCore.tla` | Indeg re-fold | **REMOVED 2026-07-22** (superseded integer-delta design) | `INV_INDEG_NONNEG` | 1 | seal cursor at `max(foldCursor, fenceVersion)`, not `foldCursor` |
 | `CaGcShardIncarnationCore.tla` | Registry removal D1 | **CURRENT** | `INV_NO_DANGLING`, `INV_NO_ORPHAN_EDGE` | 4 | two-coordinate replacement (incarnation + round self-floor) for registry; per-shard monotonicity |
-| `CaGcAckFloorCore.tla` | Ack-floor round core | **CURRENT** (minor drift; writer-heartbeat half superseded — v3) | `INV_NO_DANGLE`, `INV_NO_RETURN`, `INV_ACK_LE_VIEW` | 11 | causal floor gates graduation; ack after drain + view load; expired ⇒ fence-out; recreate not adopt; rebuild discards retired list + mints round above all acks; clamp suppression gates graduation |
+| `CaGcAckFloorCore.tla` | Ack-floor round core | **MIXED**: graduation gate (writer-ack floor) SUPERSEDED by round-only pacing; `GRebuild` + clamp-suppression still MATCH | `INV_NO_DANGLE`, `INV_NO_RETURN`, `INV_ACK_LE_VIEW` | 11 | causal floor gates graduation; ack after drain + view load; expired ⇒ fence-out; recreate not adopt; rebuild discards retired list + mints round above all acks; clamp suppression gates graduation |
 | `CaGcAckFloorZombie.tla` | Ack-floor two-leader | **CURRENT** (minor drift; writer-heartbeat half superseded — v3) | `INV_NO_DANGLE`, `INV_NO_RETURN` | 1 | `delete_pending` two-phase graduation load-bearing; floor latched ≤ fold cut (order invariant) |
 | `CaGcCore.tla` | EBR GC core | **REMOVED 2026-07-21** (superseded) | `INV_NO_LOSS`, `INV_NO_DANGLE`, `INV_NO_ABA` | 4 CEs during dev | EBR design record; replaced by incarnation-token |
 | `CaGcRoundDeferCore.tla` | GC round DEFER/skip-unchanged | **CURRENT** | `NoOverDelete`, `NoDangle`; `EventuallyFolded` | 2 | a due graduation force-folds first (no destructive decision on a not-fully-folded snapshot); deferral bounded (`deferCount < MaxDefer`) |
-| `CaEdgeBeforeObserve.tla` | Writer/GC simplification Gate A | **CURRENT** | `NoOverDelete`-shaped safety (implicit) | 4 | with EDGE-BEFORE-OBSERVE + same-pass decided-delete, promote-time revalidation of TOKENED leaves is redundant; K1/K3Head/K3AdoptCheck + the order itself stay load-bearing |
+| `CaEdgeBeforeObserve.tla` | Writer/GC simplification Gate A | **CURRENT** for no-tokened-reval + order + K1; **K3Head/K3AdoptCheck DRIFTED** (tokenless leaf now manifest-trusted, no promote probe) | `NoOverDelete`-shaped safety (implicit) | 4 | with EDGE-BEFORE-OBSERVE + same-pass decided-delete, promote-time revalidation of TOKENED leaves is redundant; K1/K3Head/K3AdoptCheck + the order itself stay load-bearing |
 | `CaMetaDescriptor.tla` | Writer/GC simplification Gate B (meta descriptor, v1) | **REMOVED 2026-07-22** (`INV-META-BODY` linearizer framing false vs shipped advisory meta) | `INV-META-BODY` | 7 | create bottom-up (body, then meta); delete top-down (meta at captured etag, then body at condemn-time token) |
 | `CaMetaDescriptorRaw.tla` | Gate B raw-body / terminal-tombstone | **REMOVED 2026-07-21** (rejected by v3) | `INV_NO_LOSS`, `INV_NO_DANGLE`, `INV_META_BODY` | 5 | raw immutable bodies force a terminal tombstone + writer-waits-on-GC coupling; rejected in favor of keeping the in-body incarnation tag |
 | `CaMetaIncarnationKey.tla` | Gate B Option B (per-incarnation body keys) | **REMOVED 2026-07-21** (rejected) | `INV_NO_DANGLE` (implicit) | 1 | removes the tombstone/wait but reintroduces the already-rejected generation-in-key design (404→LIST, manifest carries incarnation) |
@@ -989,8 +1042,21 @@ dangle: `sab_late_edge` (adoption allowed before the durable closure — the pre
 `sab_no_adopt_check` (K1 removed), `sab_no_k3_head` (absent tokenless leaf published blind),
 `sab_no_k3_adopt_check` (condemned tokenless leaf adopted at promote).
 
-**Code currency:** CURRENT (Gate A for the landed writer/GC simplification Phase A deletions,
-`docs/superpowers/plans/2026-07-09-cas-writer-gc-simplification-phase-a.md`).
+**Code currency:** CURRENT for the load-bearing half; the tokenless-leaf half has DRIFTED (audited
+2026-07-22). The parts that still match the code: no promote-time revalidation of tokened leaves
+(`CasPartWriteTxn.cpp:985-986` skips them as edge-protected), the edge-before-observe order
+(fail-closed at `CasPartWriteTxn.cpp:331-336`), and K1 (the adopt path point-reads the per-hash
+meta; `Condemned` ⇒ `ABORTED` ⇒ re-upload a fresh incarnation, `CasPartWriteTxn.cpp:298-320`). But
+**K3Head and K3AdoptCheck no longer describe shipped code**: a tokenless (`adoptEvidence`) leaf is
+now **trusted via its durable manifest edge** — no promote-time presence HEAD, no `loadMeta`, no
+copy-forward (`CasPartWriteTxn.cpp:926,987-1004`); only a no-dep / pending-upload leaf fails closed.
+The model's leaf `he` (a pre-existing unowned blob GC can condemn, so promote must HEAD +
+condemned-check it) is superseded by an in-degree-pinned source (in-degree ≥ 1, not condemnable),
+with fsck as the genuinely-absent backstop. So `sab_no_k3_head` / `sab_no_k3_adopt_check` are valid
+negative controls for the MODEL's logic but gate a promote-time probe the code no longer performs.
+Not a CODE-RISK — the safety argument moved to the in-degree invariant + manifest-trust + fsck.
+Recast the tokenless leaf as source-pinned (trusted, no promote probe): scoped follow-up, not done
+in this pass.
 
 ---
 
