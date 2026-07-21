@@ -1,5 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCowManifestSet.h>
 #include <Common/Exception.h>
+#include <Common/ProfileEvents.h>
 
 namespace DB
 {
@@ -7,6 +8,12 @@ namespace ErrorCodes
 {
     extern const int CORRUPTED_DATA;
 }
+}
+
+namespace ProfileEvents
+{
+    extern const Event CasRefMaterializeInPlace;
+    extern const Event CasRefMaterializeCopy;
 }
 
 namespace DB::Cas
@@ -67,20 +74,44 @@ void RefCowManifestSet::materialize()
 {
     if (overlay.empty())
         return;
-    /// Uniquely-owned base (the production flush case): fold into it in place -- O(overlay), no O(N)
-    /// `unordered_set` copy. Otherwise a copy still shares this base, so fold into a fresh one and
-    /// swap, leaving the shared holder untouched. `target = base` in the sole-owner branch is a
-    /// `shared_ptr` bump, not a `Base` copy; the `std::move` below hands it straight back. See the
-    /// header for the full safety argument.
-    std::shared_ptr<Base> target = (base.use_count() == 1) ? base : std::make_shared<Base>(*base);
+    /// Same two-path shape and exception-coherence contract as `RefCowMap::materialize` (see its
+    /// comment for the full argument). Uniquely-owned base: fold each overlay entry into `*base` IN
+    /// PLACE -- O(overlay), no O(N) `unordered_set` copy. Incrementally coherent: the base mutation (the
+    /// only throw point -- an `unordered_set` insert's alloc/rehash, which is strong) runs first, then
+    /// the non-throwing `net_delta` adjustment and `overlay.erase` commit the entry. Any escape leaves
+    /// (base, overlay, net_delta) exactly coherent and a later `materialize` resumable.
+    if (base.use_count() == 1)
+    {
+        ProfileEvents::increment(ProfileEvents::CasRefMaterializeInPlace);
+        for (auto it = overlay.begin(); it != overlay.end(); )
+        {
+            if (it->second)
+            {
+                const bool inserted = base->insert(it->first).second;   /// throw point (alloc/rehash, strong)
+                if (inserted)
+                    --net_delta;   /// a member absent from base counted +1 in net_delta; now it lives in base
+            }
+            else
+            {
+                base->erase(it->first);   /// a tombstone only ever shadows a base member: non-throwing erase
+                ++net_delta;              /// counted -1 in net_delta; now actually removed from base
+            }
+            it = overlay.erase(it);       /// non-throwing: retire this entry only after its base mutation stuck
+        }
+        return;   /// net_delta arithmetic above lands it back at 0 (base now holds the whole merged view)
+    }
+    /// A copy still shares this base, so fold into a FRESH one and swap -- strong guarantee, the shared
+    /// holder stays byte-unchanged.
+    ProfileEvents::increment(ProfileEvents::CasRefMaterializeCopy);
+    auto fresh = std::make_shared<Base>(*base);
     for (const auto & [m, present] : overlay)
     {
         if (present)
-            target->insert(m);
+            fresh->insert(m);
         else
-            target->erase(m);
+            fresh->erase(m);
     }
-    base = std::move(target);
+    base = std::move(fresh);
     overlay.clear();
     net_delta = 0;
 }

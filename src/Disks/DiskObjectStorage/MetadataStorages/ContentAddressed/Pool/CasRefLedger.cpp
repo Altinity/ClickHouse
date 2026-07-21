@@ -1135,26 +1135,44 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
             }
             if (resolved == CasWriteOutcome::Committed)
             {
-                std::lock_guard lock(rt->state_mutex);
-                /// Apply BEFORE unwedging ("a wedged append later observed durable is applied to
-                /// cache before unwedging"). Guard against a re-entrant double-apply: only if this is
-                /// still the SAME wedge (single leader per table makes a mismatch impossible, but the
-                /// check costs nothing and documents the invariant).
-                if (rt->wedge && rt->wedge->txn_id == wedge_copy->txn_id)
                 {
-                    const RefLogTxn wedged_txn = decodeRefLogTxn(openObject(FormatId::RefLog, wedge_copy->bytes), ns.string(), wedge_copy->txn_id);
-                    applyRefLogTxn(rt->state, wedged_txn);
-                    /// A wedge-resolved transaction is a commit like any other: it must join the
-                    /// applied-above-newest-snapshot tail counters exactly as the ordinary Committed
-                    /// arm's does, or the snapshot-publish threshold and the resident-weight estimate
-                    /// undercount by one transaction per resolved wedge until the next recovery
-                    /// reseeds (the invariant stated at the publish check: "maintained by every
-                    /// commit and every adoption").
-                    rt->tail_count_since_snapshot.fetch_add(1, std::memory_order_relaxed);
-                    rt->tail_bytes_since_snapshot.fetch_add(wedge_copy->bytes.size(), std::memory_order_relaxed);
-                    rt->wedge.reset();
+                    std::lock_guard lock(rt->state_mutex);
+                    /// Apply BEFORE unwedging ("a wedged append later observed durable is applied to
+                    /// cache before unwedging"). Guard against a re-entrant double-apply: only if this is
+                    /// still the SAME wedge (single leader per table makes a mismatch impossible, but the
+                    /// check costs nothing and documents the invariant).
+                    if (rt->wedge && rt->wedge->txn_id == wedge_copy->txn_id)
+                    {
+                        const RefLogTxn wedged_txn = decodeRefLogTxn(openObject(FormatId::RefLog, wedge_copy->bytes), ns.string(), wedge_copy->txn_id);
+                        applyRefLogTxn(rt->state, wedged_txn);
+                        /// A wedge-resolved transaction is a commit like any other: it must join the
+                        /// applied-above-newest-snapshot tail counters exactly as the ordinary Committed
+                        /// arm's does, or the snapshot-publish threshold and the resident-weight estimate
+                        /// undercount by one transaction per resolved wedge until the next recovery
+                        /// reseeds (the invariant stated at the publish check: "maintained by every
+                        /// commit and every adoption").
+                        rt->tail_count_since_snapshot.fetch_add(1, std::memory_order_relaxed);
+                        rt->tail_bytes_since_snapshot.fetch_add(wedge_copy->bytes.size(), std::memory_order_relaxed);
+                        /// Fold the just-applied overlay back into the base right here, exactly as the
+                        /// ordinary Committed arm does at its install point, so `rt->state` returns to
+                        /// "base + empty overlay" and the next flush's trial copies stay cheap. Cheap: no
+                        /// scratch copy shares the base at this point in the flush (`working` is not taken
+                        /// until below), so this is the O(overlay) in-place fold. Coherent-on-throw (see
+                        /// `CasRefCowMap.cpp`); the counters above are already bumped, so a deferred fold
+                        /// never loses the resolved transaction.
+                        rt->state.materializeCommitted();
+                        rt->wedge.reset();
+                    }
+                    ProfileEvents::increment(ProfileEvents::CasRefAppendUnwedged);
                 }
-                ProfileEvents::increment(ProfileEvents::CasRefAppendUnwedged);
+                /// The wedge's tail bump above may have crossed the snapshot-publish threshold. This flush
+                /// can still return early below WITHOUT reaching the post-commit scheduler -- an empty
+                /// carve, or an all-no-op survivor batch (every survivor's `build_ops` contributes zero
+                /// ops), both of which return before `maybeScheduleSnapshotPublish`. Trigger it HERE so a
+                /// resolved wedge never leaves the table over-threshold until some later unrelated
+                /// mutation happens to arrive. Idempotent with the post-commit call below (single-in-flight
+                /// gate), and off-lock as that call requires.
+                maybeScheduleSnapshotPublish(ns, rt);
             }
             else
             {
@@ -1309,6 +1327,18 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
         return;
     }
 
+    /// E5 fast-path reachability: `working` is a scratch copy whose `committed`/`owned_manifests` bases
+    /// SHARE the live `rt->state`'s bases (a `shared_ptr` refcount bump taken at `working = rt->state`
+    /// above). It is dead from here on -- the no-op path above already returned, and the PUT path below
+    /// never reads it again -- so release it NOW, BEFORE the post-PUT `materializeCommitted()` under
+    /// `state_mutex`. Kept alive to function scope it would pin a second reference to each base, so that
+    /// fold would always observe `use_count() == 2` and copy every row (O(N)); released here, the fold
+    /// sees `use_count() == 1` and folds the overlay in place (O(overlay)) -- the whole point of E5. This
+    /// release runs on the SAME thread as that fold, so its refcount decrement is program-order-before
+    /// the fold's `use_count()` load; no lock is needed (unlike the cross-thread `candidate_state` in
+    /// `trySnapshotPublishOnce`, which must reset under `state_mutex`).
+    working = RefTableState{};
+
     /// Self-remount re-check BEFORE allocating an id: the top-of-flush gate
     /// is passed once, but a leader can stall between it and here -- in `build_ops`' caller I/O -- across
     /// the whole fence-loss + remount window, then resume after `armMountFence`. Allocating {new_epoch,
@@ -1391,38 +1421,62 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
             {
                 std::lock_guard lock(rt->state_mutex);
                 applyRefLogTxn(rt->state, final_txn);
-                /// COW-map materialization: fold this flush's overlay into a fresh immutable base HERE,
-                /// under the SAME state_mutex critical section as the install above, so
-                /// `rt->state.getCommitted()` is back to "base + empty overlay" before the next flush's
-                /// trial copies (`working = rt->state`, CasRefLedger.cpp:1006) begin -- an O(n) fold
-                /// once per flush, replacing what used to be an implicit O(n) copy on every trial
-                /// anyway.
-                rt->state.materializeCommitted();
-                /// This commit's own transaction joins the
-                /// applied-above-newest-snapshot tail counters -- the live `rt->state` just mutated
-                /// above IS the next publish candidate's body, so there is no per-entry log to retain.
+                /// This commit's own transaction joins the applied-above-newest-snapshot tail counters --
+                /// the live `rt->state` just mutated above IS the next publish candidate's body, so there
+                /// is no per-entry log to retain. Bumped HERE, right after the apply and BEFORE the fold
+                /// below, so a fold that fails can never skip them: the transaction is durable and applied
+                /// regardless of whether the overlay was folded.
                 rt->tail_count_since_snapshot.fetch_add(1, std::memory_order_relaxed);
                 rt->tail_bytes_since_snapshot.fetch_add(bytes.size(), std::memory_order_relaxed);
+                /// COW-map materialization: fold this flush's overlay into the base HERE, under the SAME
+                /// state_mutex critical section as the install above, so `rt->state.getCommitted()` is
+                /// back to "base + empty overlay" before the next flush's trial copies (`working =
+                /// rt->state`) begin. With `working` already released just above, `rt->state`'s bases are
+                /// uniquely owned here (barring a concurrent publisher holding a copy, in which case the
+                /// fold correctly falls back to build-fresh-and-swap), so this is an O(overlay) IN-PLACE
+                /// fold, not the O(n) base copy it once was.
+                ///
+                /// This fold is an OPTIMIZATION, NOT part of the commit: it runs after the txn is durable
+                /// AND applied, and each container's fold is coherent at every intermediate throw point
+                /// (see `CasRefCowMap.cpp`). So a mid-fold allocation failure (the tracked allocator can
+                /// throw `MEMORY_LIMIT_EXCEEDED`) leaves `rt->state` EXACTLY coherent -- only with a
+                /// non-empty overlay the next flush re-folds. Swallow it: the commit succeeded, the
+                /// survivors below must be told so, and nothing is bricked. This is why the outer catch's
+                /// "provably unreachable / every recovery re-hits" framing does NOT cover it -- a durable,
+                /// correctly-applied txn whose fold merely deferred is not a bricked lane.
+                try
+                {
+                    rt->state.materializeCommitted();
+                }
+                catch (...)
+                {
+                    tryLogCurrentException(getLogger("CasPool"), fmt::format(
+                        "CAS ref-log append for namespace '{}': committed txn {}-{} was applied durably, but "
+                        "the post-commit overlay fold failed and was retained coherently for the next flush",
+                        ns.string(), id.writer_epoch, id.ref_sequence));
+                }
             }
             catch (...)
             {
-                /// Provably unreachable given the whole-item shape validation above (every item's
-                /// COMPLETE ops array is already validated as one combined transaction before this
-                /// point) -- but `final_txn` is now durably PUT regardless, so if this line throws
-                /// anyway (a bug the pre-check did not anticipate), every future recovery would replay
-                /// and re-throw on it, bricking this table forever. Fail every waiting survivor's own
-                /// caller with a clear diagnostic instead of leaving them hung on an `item->done` that
-                /// would otherwise never be set, then rethrow: `appendRefOps`'s own catch is the SOLE
-                /// authority that resets `leader_active` on an exceptional exit from the leader loop, so
-                /// this path must NOT reset it too (a double reset would open a two-leader window -- a
-                /// waiter woken by the first reset could become leader before this frame unwinds).
+                /// Reached ONLY if `applyRefLogTxn` itself threw (a materialize failure is swallowed
+                /// above, since the txn is already durable and the state stays coherent). The whole-item
+                /// shape validation makes a SHAPE/logic failure here provably unreachable (every item's
+                /// COMPLETE ops array is validated as one combined transaction before any object is
+                /// created) -- and `final_txn` is now durably PUT, so a logic-level apply failure would
+                /// re-throw on every future recovery replay, bricking this table forever. Fail every
+                /// waiting survivor's own caller with a clear diagnostic instead of leaving them hung on
+                /// an `item->done` that would otherwise never be set, then rethrow: `appendRefOps`'s own
+                /// catch is the SOLE authority that resets `leader_active` on an exceptional exit from the
+                /// leader loop, so this path must NOT reset it too (a double reset would open a two-leader
+                /// window -- a waiter woken by the first reset could become leader before this frame
+                /// unwinds).
                 const String detail = getCurrentExceptionMessage(false);
                 Exception rethrown(ErrorCodes::LOGICAL_ERROR,
                     "CAS ref-log append for namespace '{}': the durably-committed transaction {}-{} "
                     "failed to apply to the in-memory table state -- this should be provably "
-                    "unreachable (every item's ops are validated as one combined transaction before any "
-                    "object is created); the object is already durable and every future recovery will "
-                    "hit the same failure: {}",
+                    "unreachable for any shape-legal transaction (every item's ops are validated as one "
+                    "combined transaction before any object is created); the object is already durable, "
+                    "so a logic-level apply failure would re-throw on every future recovery: {}",
                     ns.string(), id.writer_epoch, id.ref_sequence, detail);
                 complete_error(survivors, std::make_exception_ptr(rethrown));
                 throw rethrown; /// NOLINT(cert-err09-cpp,cert-err61-cpp,misc-throw-by-value-catch-by-reference) -- reused above via make_exception_ptr, cannot be an anonymous temporary
@@ -1672,6 +1726,23 @@ bool CasRefLedger::trySnapshotPublishOnce(const RootNamespace & ns)
     }
 
     const RefTableSnapshot snap = snapshotOf(candidate_state, ns.string());
+
+    /// `candidate_state` is a COW copy that SHARES `rt->state`'s committed/owned-manifest bases. It is
+    /// dead past `snapshotOf`. Destroy it HERE, under `state_mutex` -- not at function return outside any
+    /// lock. Its destruction is a `shared_ptr` release-DECREMENT of those shared bases; the flush thread's
+    /// in-place `materializeCommitted()` reads their `use_count()` (relaxed) under this same mutex. Doing
+    /// the release off-lock would leave that load racing this atomic decrement with no happens-before
+    /// (TSan-reportable) and could momentarily let a flush observe a `use_count()` of 1 while this
+    /// decrement is in flight. Under the lock the two are serialized. Every subsequent exit path (encode
+    /// failure, non-Committed PUT, the monotonic-guard early return, success) then destroys an already
+    /// empty `candidate_state`, which touches no shared base. See both COW headers' materialize safety
+    /// argument, which relies on exactly this: every cross-thread copy is created AND destroyed under the
+    /// state lock.
+    {
+        std::lock_guard lock(rt->state_mutex);
+        candidate_state = RefTableState{};
+    }
+
     String bytes;
     try
     {

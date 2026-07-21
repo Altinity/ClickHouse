@@ -3,6 +3,9 @@
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
 
+#include <random>
+#include <vector>
+
 namespace DB::ErrorCodes
 {
 extern const int CORRUPTED_DATA;
@@ -311,4 +314,80 @@ TEST(CasRefCowManifestSet, EraseThrowsWhenAlreadyTombstoned)
     s.materialize();
     s.erase(mref(1, 1, 1));
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { s.erase(mref(1, 1, 1)); });
+}
+
+/// ===================================================================================
+/// Fast-vs-forced-slow materialize parity (E5 xhigh review): the in-place fold (uniquely-owned base)
+/// and the build-fresh-and-swap fold (a copy still shares the base) must agree on membership and size
+/// across randomized op sequences. No iteration surface here, so membership is probed over a fixed
+/// keyspace. insert/erase preconditions are respected (guarded by the shared membership) so the two
+/// sets never drift and never trip the fail-closed CORRUPTED_DATA guards.
+/// ===================================================================================
+
+TEST(CasRefCowManifestSet, FastAndForcedSlowMaterializeAgreeOverRandomOps)
+{
+    std::mt19937 rng(20260722); // NOLINT(cert-msc32-c,cert-msc51-cpp): deterministic seed for reproducible coverage.
+
+    std::vector<ManifestRef> keyspace;
+    for (uint64_t k = 0; k < 10; ++k)
+        keyspace.push_back(mref(1, k, 1));
+
+    for (int trial = 0; trial < 60; ++trial)
+    {
+        RefCowManifestSet fast;   /// never copied -> in-place (uniquely-owned) materialize
+        RefCowManifestSet slow;   /// a live copy is held across each materialize -> forced fresh-base path
+
+        for (int step = 0; step < 150; ++step)
+        {
+            const ManifestRef m = keyspace[rng() % keyspace.size()];
+            const bool present = fast.contains(m);   /// identical in both sets by construction
+            switch (rng() % 5)
+            {
+                case 0:
+                    if (!present)   /// respect the insert precondition (absent)
+                    {
+                        fast.insert(m);
+                        slow.insert(m);
+                    }
+                    break;
+                case 1:
+                    if (present)    /// respect the erase precondition (present)
+                    {
+                        fast.erase(m);
+                        slow.erase(m);
+                    }
+                    break;
+                case 2:   /// materialize both, each via its intended path
+                {
+                    ASSERT_EQ(fast.baseUseCountForTest(), 1) << "fast set must be uniquely owned";
+                    fast.materialize();   /// in-place fast path
+                    {
+                        RefCowManifestSet pin = slow;   /// shares slow's base
+                        ASSERT_EQ(slow.baseUseCountForTest(), 2) << "slow set must be forced onto the copy path";
+                        slow.materialize();             /// build-fresh-and-swap slow path
+                    }
+                    EXPECT_EQ(fast.overlayEntriesForTest(), 0u) << "trial " << trial << " step " << step;
+                    EXPECT_EQ(slow.overlayEntriesForTest(), 0u) << "trial " << trial << " step " << step;
+                    break;
+                }
+                default:
+                    break;   /// accumulate overlay without materializing
+            }
+
+            ASSERT_EQ(fast.size(), slow.size()) << "trial " << trial << " step " << step;
+            for (const auto & probe : keyspace)
+                ASSERT_EQ(fast.contains(probe), slow.contains(probe)) << "trial " << trial << " step " << step;
+        }
+
+        fast.materialize();
+        {
+            RefCowManifestSet pin = slow;
+            slow.materialize();
+        }
+        EXPECT_EQ(fast.overlayEntriesForTest(), 0u) << "trial " << trial;
+        EXPECT_EQ(slow.overlayEntriesForTest(), 0u) << "trial " << trial;
+        EXPECT_EQ(fast.size(), slow.size()) << "trial " << trial;
+        for (const auto & probe : keyspace)
+            EXPECT_EQ(fast.contains(probe), slow.contains(probe)) << "trial " << trial;
+    }
 }

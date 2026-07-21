@@ -353,9 +353,11 @@ BENCHMARK(BM_FlushInstall)->RangeMultiplier(10)->Range(100, 100000)->Complexity(
 /// Same flush-install as `BM_FlushInstall`, but exercising the E5 uniquely-owned-base fast path that
 /// production actually hits. `BM_FlushInstall` copies a shared fixture (`working = table`), so at
 /// `materializeCommitted()` the base still has `use_count() == 2` and the fold must build a fresh
-/// base -- O(N). Production's live table has NO outstanding scratch copy at the install point (the
-/// trial copies are dropped before the commit critical section), so its base is uniquely owned and
-/// the fold happens in place -- O(overlay). This variant models that by rebuilding a private,
+/// base -- O(N). Production's live table has NO outstanding scratch copy at the install point:
+/// `CasRefLedger::flushRefBatch` EXPLICITLY releases its trial-validation copy (`working = RefTableState{}`)
+/// before allocating the id and doing the post-PUT install, so at `materializeCommitted()` the live
+/// base is uniquely owned and the fold happens in place -- O(overlay). This variant models that by
+/// rebuilding a private,
 /// materialized state each iteration (its base `use_count()` is 1), timing only the apply + in-place
 /// materialize. The per-iteration rebuild AND the prior iteration's O(N) teardown are excluded from
 /// the measurement by hoisting `working` out of the loop and rebuilding it via move-assignment under

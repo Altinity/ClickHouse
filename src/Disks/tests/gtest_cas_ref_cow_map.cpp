@@ -432,3 +432,86 @@ TEST(CasRefCowMap, PropertyMatchesStdMapOverRandomOps)
         }
     }
 }
+
+/// ===================================================================================
+/// Fast-vs-forced-slow materialize parity (E5 xhigh review): the in-place fold (uniquely-owned base)
+/// and the build-fresh-and-swap fold (a copy still shares the base) must produce IDENTICAL merged
+/// content, size, and empty overlay across randomized op sequences. This pins that the two code paths
+/// -- which handle `net_delta`, tombstones, and overrides differently -- never diverge.
+/// ===================================================================================
+
+TEST(CasRefCowMap, FastAndForcedSlowMaterializeAgreeOverRandomOps)
+{
+    std::mt19937 rng(20260722); // NOLINT(cert-msc32-c,cert-msc51-cpp): deterministic seed for reproducible coverage.
+
+    for (int trial = 0; trial < 60; ++trial)
+    {
+        RefCowMap fast;   /// never copied -> `materialize` always takes the in-place (uniquely-owned) path
+        RefCowMap slow;   /// a live copy is held across each `materialize` -> forced fresh-base path
+
+        for (int step = 0; step < 150; ++step)
+        {
+            const String key = "ref" + std::to_string(rng() % 10);
+            switch (rng() % 5)
+            {
+                case 0:
+                {
+                    RefCommittedRow r = row(1, static_cast<uint64_t>(step) + 1, 1);
+                    fast.emplace(key, r);
+                    slow.emplace(key, r);
+                    break;
+                }
+                case 1:
+                {
+                    RefCommittedRow r = row(2, static_cast<uint64_t>(step) + 1, 2);
+                    fast.insert_or_assign(key, r);
+                    slow.insert_or_assign(key, r);
+                    break;
+                }
+                case 2:
+                {
+                    fast.erase(key);
+                    slow.erase(key);
+                    break;
+                }
+                case 3:   /// materialize both, each via its intended path
+                {
+                    ASSERT_EQ(fast.baseUseCountForTest(), 1) << "fast map must be uniquely owned";
+                    fast.materialize();   /// in-place fast path
+                    {
+                        RefCowMap pin = slow;   /// shares slow's base
+                        ASSERT_EQ(slow.baseUseCountForTest(), 2) << "slow map must be forced onto the copy path";
+                        slow.materialize();     /// build-fresh-and-swap slow path
+                    }
+                    EXPECT_EQ(fast.overlayEntriesForTest(), 0u) << "trial " << trial << " step " << step;
+                    EXPECT_EQ(slow.overlayEntriesForTest(), 0u) << "trial " << trial << " step " << step;
+                    break;
+                }
+                default:
+                    break;   /// accumulate overlay without materializing
+            }
+
+            /// Content + size parity holds at EVERY step, materialized or not.
+            ASSERT_EQ(fast.size(), slow.size()) << "trial " << trial << " step " << step;
+            auto fi = fast.begin();
+            auto si = slow.begin();
+            for (; fi != fast.end() && si != slow.end(); ++fi, ++si)
+            {
+                ASSERT_EQ(fi->first, si->first) << "trial " << trial << " step " << step;
+                ASSERT_EQ(fi->second, si->second) << "trial " << trial << " step " << step;
+            }
+            ASSERT_TRUE(fi == fast.end() && si == slow.end()) << "trial " << trial << " step " << step;
+        }
+
+        /// A final materialize of both via their two paths must leave identical, fully-folded state.
+        fast.materialize();
+        {
+            RefCowMap pin = slow;
+            slow.materialize();
+        }
+        EXPECT_EQ(fast.overlayEntriesForTest(), 0u) << "trial " << trial;
+        EXPECT_EQ(slow.overlayEntriesForTest(), 0u) << "trial " << trial;
+        EXPECT_TRUE(fast == slow) << "trial " << trial;
+        EXPECT_EQ(fast.size(), slow.size()) << "trial " << trial;
+    }
+}

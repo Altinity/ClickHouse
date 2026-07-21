@@ -79,11 +79,11 @@ public:
     /// When `base` is uniquely owned (`use_count() == 1`, the production flush case), the overlay is
     /// folded into `*base` IN PLACE -- O(overlay), no O(N) `unordered_set` copy. When a copy still
     /// shares `base`, a fresh merged base is built and swapped in, so the shared holder's view stays
-    /// byte-unchanged. The safety argument is the same as `RefCowMap::materialize` -- this container is
-    /// not thread-safe by contract; a `use_count()` of 1 seen by the sole owner cannot concurrently
-    /// rise, so the in-place fold has no other observer to disturb, and `base` is a non-const
-    /// `shared_ptr` so the fold needs no `const_cast`. Both paths leave an empty overlay and
-    /// `net_delta == 0`.
+    /// byte-unchanged. The full ownership-and-coherence safety argument is `RefCowMap::materialize`'s
+    /// (the `use_count()` of 1 is stable against both a concurrent increment and any cross-thread
+    /// release, every such release being lock-ordered under `state_mutex`; the in-place fold is coherent
+    /// at every throw point; `base` is a non-const `shared_ptr` so no `const_cast` is needed). Both paths
+    /// leave an empty overlay and `net_delta == 0`.
     void materialize();
 
     /// Test-only: current overlay entry count (0 right after `materialize()`).

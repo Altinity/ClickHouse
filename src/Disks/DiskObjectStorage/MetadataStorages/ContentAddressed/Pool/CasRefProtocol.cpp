@@ -486,6 +486,7 @@ bool admits(const RefTableState & state, const RefOp & op, uint64_t snapshot_bud
 std::vector<RefManifestEdge> manifestEdgesOfTxn(const RefLogTxn & txn)
 {
     std::vector<RefManifestEdge> edges;
+    edges.reserve(txn.ops.size());   /// every recognized op contributes at most one edge
     const RootNamespace ns{txn.ns};
 
     for (uint32_t op_ordinal = 0; op_ordinal < txn.ops.size(); ++op_ordinal)

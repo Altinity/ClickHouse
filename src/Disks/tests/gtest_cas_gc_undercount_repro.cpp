@@ -378,6 +378,14 @@ TEST(CasGcUndercount, UnrecognizedOwnerTransitionShapeAbortsRoundNeverDeletes)
 
     const uint64_t cursor_before = foldCursorOf(*backend, store->layout(), ns, /*shard*/0);
 
+    /// A LEGAL, foldable log in `ns` ITSELF, staged AFTER capturing `cursor_before`. Without it, `ns`
+    /// has nothing new to fold, so the "ns cursor did not advance" assertion below is vacuous -- it
+    /// would pass even if the abort were per-table rather than round-wide. A duplicate remove-committed
+    /// of r1 is shape-legal and foldable (idempotent on the source-edge set, so it does not disturb blob
+    /// 9's already-condemned state), so absent the round-wide abort, folding `ns` WOULD advance its
+    /// cursor past this log -- making the pin below load-bearing.
+    appendOwnerEvent(*backend, store->layout(), ns, 0, committed("tbl", r1), std::nullopt);
+
     /// A decodable but SHAPE-illegal owner_transition (neither binding) in an UNRELATED table.
     appendRefLogSeed(*backend, store->layout(), corrupt_ns, {ownerTransitionOp(std::nullopt, std::nullopt)});
 

@@ -1,5 +1,12 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCowMap.h>
+#include <Common/ProfileEvents.h>
 #include <stdexcept>
+
+namespace ProfileEvents
+{
+    extern const Event CasRefMaterializeInPlace;
+    extern const Event CasRefMaterializeCopy;
+}
 
 namespace DB::Cas
 {
@@ -183,20 +190,54 @@ void RefCowMap::materialize()
 {
     if (overlay.empty())
         return;
-    /// Uniquely-owned base (the production flush case): fold into it in place -- O(overlay), no O(N)
-    /// copy. Otherwise a copy still shares this base, so fold into a fresh one and swap, leaving the
-    /// shared holder untouched. `target = base` in the sole-owner branch is a `shared_ptr` bump, not a
-    /// `Base` copy; the `std::move` below hands it straight back. See the header for the full safety
-    /// argument.
-    std::shared_ptr<Base> target = (base.use_count() == 1) ? base : std::make_shared<Base>(*base);
+    /// See the header for the full ownership-safety argument. The exception-coherence argument for the
+    /// in-place path is here, next to the code it governs.
+    ///
+    /// Uniquely-owned base (the production flush case): fold each overlay entry into `*base` IN PLACE --
+    /// O(overlay), no O(N) copy. The fold is INCREMENTALLY COHERENT: for every entry the base mutation
+    /// (its ONLY throw point -- a `std::map` node insert or a `RefCommittedRow` copy under memory
+    /// pressure) runs FIRST, and the matching `net_delta` adjustment and `overlay.erase` are both
+    /// non-throwing and run only AFTER it succeeds. So at every point an exception can escape, the
+    /// (base, overlay, net_delta) triple is exactly coherent: the merged view is unchanged, `size()` is
+    /// exact, and a later `materialize` resumes cleanly from the un-erased overlay tail. This is a
+    /// STRONGER guarantee than the copy path's (which only had to be strong for the shared holder): the
+    /// state is coherent even mid-fold, which matters because `materialize` runs AFTER the transaction is
+    /// durably PUT and applied -- an allocation throw here must never leave live bookkeeping wrong. (A
+    /// throwing key-assign can leave a partially-updated base row, but its still-present overlay entry
+    /// shadows that key in the merged view, so the partial row stays invisible until it is re-folded.)
+    if (base.use_count() == 1)
+    {
+        ProfileEvents::increment(ProfileEvents::CasRefMaterializeInPlace);
+        for (auto it = overlay.begin(); it != overlay.end(); )
+        {
+            if (it->second)
+            {
+                const bool inserted = base->insert_or_assign(it->first, *it->second).second;   /// throw point
+                if (inserted)
+                    --net_delta;   /// a key absent from base counted +1 in net_delta; now it lives in base
+            }
+            else
+            {
+                base->erase(it->first);   /// a tombstone only ever shadows a base member: non-throwing erase
+                ++net_delta;              /// counted -1 in net_delta; now actually removed from base
+            }
+            it = overlay.erase(it);       /// non-throwing: retire this entry only after its base mutation stuck
+        }
+        return;   /// net_delta arithmetic above lands it back at 0 (base now holds the whole merged view)
+    }
+    /// A copy still shares this base, so fold into a FRESH one and swap -- the shared holder must stay
+    /// byte-unchanged. Strong guarantee: a mid-fold throw discards `fresh` and leaves this container (and
+    /// every sharer) exactly as it was.
+    ProfileEvents::increment(ProfileEvents::CasRefMaterializeCopy);
+    auto fresh = std::make_shared<Base>(*base);
     for (const auto & [key, maybe_row] : overlay)
     {
         if (maybe_row)
-            (*target)[key] = *maybe_row;
+            (*fresh)[key] = *maybe_row;
         else
-            target->erase(key);
+            fresh->erase(key);
     }
-    base = std::move(target);
+    base = std::move(fresh);
     overlay.clear();
     net_delta = 0;
 }

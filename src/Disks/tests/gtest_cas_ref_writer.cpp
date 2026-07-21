@@ -785,6 +785,52 @@ TEST(RefWriterAppendLane, WedgedAppendObservedDurableAppliesBeforeNextId)
     EXPECT_FALSE(store->resolveRef(ns, "y").has_value()) << "the next mutation committed normally afterward";
 }
 
+/// Wedge tail-counter accounting across the three states (xhigh review, item F): an UNRESOLVED wedge
+/// applied nothing, so it must NOT bump the applied-above-snapshot tail counters; a RESOLVED wedge is a
+/// commit like any other and MUST bump them (exactly once) alongside the ordinary commit that resolves
+/// it; and the resolution must fold its applied overlay in place (no residual committed overlay). Under
+/// the default 256-log / 1 MiB snapshot thresholds this handful of txns never triggers a publish, so the
+/// tail counter is a stable running count.
+TEST(RefWriterAppendLane, WedgeResolutionJoinsTailCountersAndFoldsOverlay)
+{
+    CasRequestBudget budget;
+    budget.max_attempts = 1;
+    budget.attempt_timeout_ms = 100;
+    budget.operation_deadline_ms = 100;
+    budget.lease_safety_margin_ms = 100;
+
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend, budget);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/wedge_tail"};
+    publishEmptyPart(store, ns, "x");
+    publishEmptyPart(store, ns, "y");
+
+    const size_t tail_after_setup = store->tailSinceSnapshotCountForTest(ns);
+
+    /// Wedge the lane: the single-attempt budget turns the ambiguous log PUT into an Unresolved outcome.
+    backend->fault_key_substr = layout.refsNamespacePrefix(ns) + "_log/";
+    backend->fault_count = 1;
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
+    ASSERT_TRUE(store->refLaneWedgedForTest(ns));
+    ASSERT_TRUE(store->resolveRef(ns, "x").has_value()) << "not applied while merely wedged";
+    EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), tail_after_setup)
+        << "an UNRESOLVED wedge applied nothing and must not join the tail counters";
+
+    /// The wedged PUT actually landed server-side; a later mutation resolves the wedge (applying drop x)
+    /// before committing its own drop y.
+    backend->materializePendingDelayedWrite();
+    EXPECT_NO_THROW(store->dropRef(ns, "y"));
+
+    EXPECT_FALSE(store->refLaneWedgedForTest(ns));
+    EXPECT_FALSE(store->resolveRef(ns, "x").has_value()) << "the wedged drop was applied on resolution";
+    EXPECT_FALSE(store->resolveRef(ns, "y").has_value());
+    EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), tail_after_setup + 2)
+        << "the RESOLVED wedge (drop x) and the ordinary commit (drop y) must each bump the tail once";
+    EXPECT_EQ(store->committedOverlayEntriesForTest(ns), 0u)
+        << "both the wedge resolution and the ordinary commit fold their overlay in place at install";
+}
+
 /// B3: `Pool::wedgedRefLaneCount()` (the accessor `CasGcScheduler::gcHealth()` reads for
 /// `system.content_addressed_mounts.wedged_namespace_count`) must count EXACTLY the tables with a live
 /// wedge -- neither a cached-but-healthy table nor an unrelated table's own successful mutation may move

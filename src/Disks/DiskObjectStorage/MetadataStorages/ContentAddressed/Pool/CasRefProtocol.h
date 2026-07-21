@@ -168,7 +168,9 @@ public:
     uint64_t getRemovalBodyBytes() const { return removal_body_bytes; }
 
     /// State-install point only (once per ref-log flush, never per batch item): folds the committed
-    /// map's and the owned-manifest index's COW overlays into a fresh shared base each.
+    /// map's and the owned-manifest index's COW overlays into their bases -- in place when the base is
+    /// uniquely owned (the production flush case), else into a fresh base (see each container's
+    /// `materialize`).
     void materializeCommitted() { committed.materialize(); owned_manifests.materialize(); }
 
 private:

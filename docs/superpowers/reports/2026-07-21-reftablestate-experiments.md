@@ -858,3 +858,50 @@ cursor-aligned-witness fix infeasible (snapshots publish ahead of the GC cursor)
 rolling-upgrade-skew milestones); the round's false "dead surface" annotation on
 `manifestEdgesOfTxn`'s replace rule corrected in place. Soak validity retained — the attack
 requires forged durable traffic no soak component can produce.
+
+## E5 follow-up: reachability fix + race close + coherence rework (double xhigh review) {#e5-followup-xhigh}
+
+A double maximum-effort review (Fable subagent + `gpt-5.6-sol` xhigh) of the E5 in-place-materialize
+change (`d38d8b873fc`) found the win was not actually being realized, plus two hardening items. All fixed
+in this batch (`build/build_xfix.log` `NINJA_EXIT=0`; gate **1116/1116**, `build/test_gate_xfix.log`).
+
+**Reachability (both reviews' top finding).** E5's in-place fold was UNREACHABLE from the production flush:
+`flushRefBatch`'s trial-validation copy `working` stayed alive to function scope, pinning a second
+reference to the live base across the post-PUT install, so `materializeCommitted()` always saw
+`use_count() == 2` and took the O(N) copy path. Fix: explicitly release `working = RefTableState{}` after
+its last read and before id allocation — the live base is then uniquely owned at the install point.
+`BM_FlushInstallUniqueOwner` was already the correct model; it just was not the path production took.
+
+**Race close (Fable F2).** With the fast path now live, the relaxed `use_count()` load races a cross-thread
+`shared_ptr` release: `trySnapshotPublishOnce`'s `candidate_state = rt->state` (a shared-base copy) was
+destroyed at function return outside the lock. Fix: reset `candidate_state` under `state_mutex` right after
+`snapshotOf` (covers every exit path). Invariant now documented in both COW headers: every cross-thread
+copy of a live state is created AND destroyed under the state lock, so a `use_count()` of 1 seen under that
+lock is stable against both increment and decrement.
+
+**Coherence rework (both; codex hardest).** The in-place fold is now incrementally coherent — per overlay
+entry the base mutation (its only throw point) runs first, then the non-throwing `net_delta` adjust and
+`overlay.erase`. At every escape point `(base, overlay, net_delta)` is exactly coherent (`size()` exact,
+merged view unchanged, resumable) — stronger than the old copy path, and load-bearing because materialize
+runs after a durable PUT (a tracked-allocator OOM must not corrupt live bookkeeping). The Committed-arm
+catch was split: a materialize failure is swallowed (durable, applied, coherent — not a bricked lane) and
+the "recovery re-hits" framing is scoped to `applyRefLogTxn`. New randomized fast-vs-forced-slow parity
+tests pin both containers.
+
+**Benchmarks (`build/bench_xfix.log`, 3 reps, quiet machine).** Fast path intact and strongly sublinear:
+
+| N | `BM_FlushInstall` (slow) | `BM_FlushInstallUniqueOwner` (fast) | speedup |
+|---|--------------------------|-------------------------------------|---------|
+| 100 | 16,774 ns | 1,654 ns | ~10× |
+| 1,000 | 169,734 ns | 2,101 ns | ~81× |
+| 10,000 | 1,729,798 ns | 5,431 ns | ~318× |
+| 100,000 | 23,066,663 ns | 13,355 ns | ~1727× |
+
+Writer-path benches unchanged within noise: `BM_ScratchCopy` 60.3 ns O(1), `BM_AdmitsAddPrecommit`
+701–708 ns flat, `BM_Admits` ~1,020–1,082 ns, `BM_ApplyRefLogTxn` 800–864 ns, `BM_ReplayHistory`
+~1,763 ns/row (≈ the t5/E3 1,725 ns/row). New `CasRefMaterializeInPlace` / `CasRefMaterializeCopy`
+ProfileEvents let a soak prove the fast path fires in production.
+
+The rename-forward (`7ab1fc15f4c`) was REVERTED (codex deadlock: materializing a lazy `Buffer` under
+`DatabaseAtomic`'s mutex self-deadlocks) — see the backlog lazy_load_tables item. Soak-driver
+determinism (single eager-DB helper for every phase) fixed in `utils/ca-soak/soak/run.py`.
