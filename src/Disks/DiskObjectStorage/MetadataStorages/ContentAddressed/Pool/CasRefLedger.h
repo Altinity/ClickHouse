@@ -414,12 +414,29 @@ private:
 
     /// Runs the append queue leader for `ns`, completing its own item and any compatible items carved
     /// into the same batch. Exceptions are stored for waiters and do not leave the leader flag latched.
+    /// Every item this leader becomes responsible for -- its own `own` plus each item a flush removes
+    /// from `pending` to form a batch -- is recorded into `owned_items`, so the caller's leadership guard
+    /// can complete + de-pend any that a flush leaves unfinished on an exceptional exit.
     void runRefQueueLeader(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt,
-                           const std::shared_ptr<RefMutationItem> & own);
+                           const std::shared_ptr<RefMutationItem> & own,
+                           std::vector<std::shared_ptr<RefMutationItem>> & owned_items);
 
     /// Validates, durably appends, and applies one compatible batch while preserving copy-before-commit
-    /// and apply-after-commit ordering.
-    void flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt);
+    /// and apply-after-commit ordering. Every item it carves out of `pending` is appended to
+    /// `owned_items` (the leader's responsibility set) at the moment it is carved.
+    void flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt,
+                       std::vector<std::shared_ptr<RefMutationItem>> & owned_items);
+
+    /// Leadership-exit guard for `appendRefOps`: under `ref_queue_mutex`, completes every still-unfinished
+    /// item this leader owned (with `flush_exception` when unwinding, or a fail-closed `LOGICAL_ERROR`
+    /// otherwise), removes each owned item from `pending` so no future leader can carve it, and releases
+    /// leadership (`leader_active = false` + `cv.notify_all`). On the normal path every owned item is
+    /// already `done`, so only the leadership release has effect. This is the single authority that
+    /// resets `leader_active` on any exit from the leader loop.
+    void completeOwnedItemsAndReleaseLeadership(
+        const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt,
+        const std::vector<std::shared_ptr<RefMutationItem>> & owned_items,
+        std::exception_ptr flush_exception);
 
     /// Schedules best-effort background publication when tail thresholds and backoff permit. The
     /// dispatch is fenced and the detached task retains the owner pin until it finishes.

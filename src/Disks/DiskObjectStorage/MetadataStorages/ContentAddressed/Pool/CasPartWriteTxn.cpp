@@ -843,7 +843,11 @@ void PartWriteTxn::precommitAdd(const RootNamespace & target_ns, const String & 
     /// `namespace_birth` in the SAME transaction (the birth transaction
     /// normally also adds the first precommit").
     store->appendRefOps(target_ns, MutationScope::ref(final_ref_name),
-        [&](const RefTableState & state) -> std::vector<RefOp>
+        /// Capture everything the closure reads BY VALUE (the `store` handle, target namespace, ref name,
+        /// and manifest id) rather than `[&]`: defense-in-depth so a closure that ever outlives this
+        /// stack frame (e.g. if the append lane stranded its item) never dereferences a dead stack. The
+        /// ref-lane leadership guard is the real fix; this makes the closure self-contained regardless.
+        [pool = store, target_ns, final_ref_name, id](const RefTableState & state) -> std::vector<RefOp>
         {
             /// Idempotent re-add: the target ref is ALREADY committed to this EXACT manifest_ref (a
             /// legitimate re-drive calling precommitAdd+promote again for content that is already
@@ -868,7 +872,7 @@ void PartWriteTxn::precommitAdd(const RootNamespace & target_ns, const String & 
                 /// already rerouted -- leaving this one ABORTED would let it defeat the merge backoff
                 /// mid-sequence, exactly the Fix-2 defect.
                 if (state.getRemoveTxnId().has_value()
-                    && !store->observedNamespaceCleanupMarker(target_ns, *state.getRemoveTxnId()))
+                    && !pool->observedNamespaceCleanupMarker(target_ns, *state.getRemoveTxnId()))
                     throwCasWriteRetryLater(fmt::format(
                         "namespace '{}' recreation pending GC cleanup-marker (remove_txn_id {}-{})",
                         target_ns.string(), state.getRemoveTxnId()->writer_epoch, state.getRemoveTxnId()->ref_sequence));
@@ -936,7 +940,15 @@ void PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
     /// whether the `RefRepoint` audit event fires.
     std::optional<ManifestRef> repoint_old;
     store->appendRefOps(target_ns, MutationScope::ref(final_ref_name),
-        [&](const RefTableState & state) -> std::vector<RefOp>
+        /// Capture the closure's INPUTS by value (ref name, manifest id, promote build id, repoint flag,
+        /// and the manifest `body` it revalidates) rather than `[&]`, as defense-in-depth against a
+        /// closure outliving this stack. Unlike `precommitAdd`, this closure cannot be made fully
+        /// self-contained: `depIsTokened`/`isTrustedAdopt` read this build's `deps` member (so it must
+        /// keep `this`), and `repoint_old` is an OUTPUT read after the call returns (so it stays a
+        /// reference). The ref-lane leadership guard is the real fix; both residual by-reference captures
+        /// are safe because the guard guarantees the closure is never invoked after this frame unwinds.
+        [this, final_ref_name, id, promote_build_id, allow_repoint, body, &repoint_old]
+        (const RefTableState & state) -> std::vector<RefOp>
         {
             /// Idempotent re-promote: the target ref is ALREADY committed to this EXACT manifest_ref --
             /// a legitimate re-drive (a crash/retry between a prior promote and its caller's own
@@ -1178,11 +1190,14 @@ void PartWriteTxn::abandon()
     if (precommitted)
     {
         store->appendRefOps(precommit_target_ns, MutationScope::ref(precommit_final_ref),
-            [&](const RefTableState &) -> std::vector<RefOp>
+            /// By-value capture of the two values the closure reads (ref name + manifest) rather than
+            /// `[&]`: defense-in-depth so the closure is self-contained if it ever outlives this stack.
+            [ref_name = precommit_final_ref, manifest = precommit_manifest]
+            (const RefTableState &) -> std::vector<RefOp>
             {
                 RefOp op;
                 op.kind = RefOpKind::OwnerTransition;
-                op.old_binding = RefOwnerBinding{RefOwnerKind::Precommit, precommit_final_ref, precommit_manifest};
+                op.old_binding = RefOwnerBinding{RefOwnerKind::Precommit, ref_name, manifest};
                 return {op};
             },
             RootMutationOrigin::Writer, RootMutationKind::Abandon);

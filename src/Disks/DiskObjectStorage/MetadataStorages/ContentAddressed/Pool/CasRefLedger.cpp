@@ -977,25 +977,29 @@ RefTxnId CasRefLedger::appendRefOps(const RootNamespace & ns, MutationScope scop
         {
             rt->leader_active = true;
             lk.unlock();
+            /// The set of items THIS leader is responsible for: its own enqueued `item` plus every item a
+            /// flush carves out of `pending` (recorded by `flushRefBatch` as it carves). Whatever the
+            /// leader loop does below -- return normally, or throw at ANY point including BEFORE it ever
+            /// carves -- every one of these items must leave here `done` (its waiter woken), never left
+            /// stranded in `pending` for a future leader to carve after this caller's stack (and its
+            /// `build_ops` closure) is gone: a use-after-free that concurrent per-part commit makes
+            /// immediate. `completeOwnedItemsAndReleaseLeadership` enforces that on EVERY exit and folds in
+            /// the `leader_active` release the old catch used to own. Items NOT owned by this leader (other
+            /// callers' still-queued items) are untouched -- they stay validly owned by their blocked
+            /// callers.
+            std::vector<std::shared_ptr<RefMutationItem>> owned_items;
+            owned_items.push_back(item);
             try
             {
-                runRefQueueLeader(ns, rt, item);
+                runRefQueueLeader(ns, rt, item, owned_items);
             }
             catch (...)
             {
-                /// Any exceptional exit from the leader loop (e.g. an unhandled CORRUPTED_DATA the flush's
-                /// controller sites now surface loudly) must restore `leader_active`, or every queued and
-                /// future `appendRefOps` caller for this table blocks forever in `cv.wait` -- a silent hang
-                /// instead of a fail-closed error. Idempotent with the flush's own resets; rethrow so the
-                /// corruption surfaces to this caller rather than being swallowed.
-                lk.lock();
-                rt->leader_active = false;
-                rt->cv.notify_all();
+                completeOwnedItemsAndReleaseLeadership(ns, rt, owned_items, std::current_exception());
                 throw;
             }
+            completeOwnedItemsAndReleaseLeadership(ns, rt, owned_items, nullptr);
             lk.lock();
-            rt->leader_active = false;
-            rt->cv.notify_all();
         }
         else
         {
@@ -1014,7 +1018,8 @@ RefTxnId CasRefLedger::appendRefOps(const RootNamespace & ns, MutationScope scop
 
 
 void CasRefLedger::runRefQueueLeader(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt,
-                              const std::shared_ptr<RefMutationItem> & own)
+                              const std::shared_ptr<RefMutationItem> & own,
+                              std::vector<std::shared_ptr<RefMutationItem>> & owned_items)
 {
     /// Fairness baton pass: serve flushes only until the caller's OWN item is done, then hand off to a
     /// woken waiter.
@@ -1025,11 +1030,40 @@ void CasRefLedger::runRefQueueLeader(const RootNamespace & ns, const std::shared
             if (own->done)
                 return;
         }
-        flushRefBatch(ns, rt);
+        flushRefBatch(ns, rt, owned_items);
     }
 }
 
-void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt)
+void CasRefLedger::completeOwnedItemsAndReleaseLeadership(
+    const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt,
+    const std::vector<std::shared_ptr<RefMutationItem>> & owned_items,
+    std::exception_ptr flush_exception)
+{
+    std::lock_guard<std::mutex> g(ref_queue_mutex);
+    for (const auto & owned : owned_items)
+    {
+        if (!owned->done)
+        {
+            owned->error = flush_exception
+                ? flush_exception
+                : std::make_exception_ptr(Exception(ErrorCodes::LOGICAL_ERROR,
+                    "CAS ref-log append for namespace '{}': the append-lane leader exited without "
+                    "completing an owned queue item -- failing it closed rather than leaving it stranded "
+                    "in the pending queue for a future leader to carve", ns.string()));
+            owned->done = true;
+        }
+        /// Never leave an owned item in `pending`: a stranded item would be carved by a future leader
+        /// which would then invoke its (now dangling) `build_ops` closure -- the use-after-free this
+        /// guard exists to prevent. Carved items were already popped during the carve, so this is a
+        /// no-op for them; it only matters for an item the leader owned but never got to carve.
+        std::erase(rt->pending, owned);
+    }
+    rt->leader_active = false;
+    rt->cv.notify_all();
+}
+
+void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt,
+                                 std::vector<std::shared_ptr<RefMutationItem>> & owned_items)
 {
     /// One flush = one carved batch through one attempted append. Contract: every ORDINARY outcome
     /// (validation reject, DefiniteFailure, Unresolved/wedge, Committed) lands in the affected items so
@@ -1228,6 +1262,11 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
             rt->pending.pop_front();
         }
     }
+    /// Record everything this flush just carved into the leader's responsibility set BEFORE any further
+    /// step can throw: the leadership-exit guard (`completeOwnedItemsAndReleaseLeadership`) must be able to
+    /// complete + de-pend each carved item on ANY exceptional exit below, so none is ever left half-carved
+    /// (removed from `pending` yet never completed) with a waiter blocked forever.
+    owned_items.insert(owned_items.end(), batch.begin(), batch.end());
     if (batch.empty())
         return;   /// raced: everything was carved by a previous flush of this leader
 
