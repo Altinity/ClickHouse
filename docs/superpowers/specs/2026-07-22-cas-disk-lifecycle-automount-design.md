@@ -1,3 +1,5 @@
+> **SUPERSEDED (2026-07-22)** by `2026-07-22-cas-disk-self-quiesce-simplification-design.md`. This eject/auto-mount exploration produced no code; the runtime mount/unmount reuse lifecycle was dropped entirely.
+
 # CAS disk lifecycle: self-healing auto-mount, full-quiesce UNMOUNT, mount-without-table, GC control, live FSCK
 
 ## Motivation

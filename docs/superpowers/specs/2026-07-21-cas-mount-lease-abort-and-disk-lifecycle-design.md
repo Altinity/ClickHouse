@@ -1,3 +1,5 @@
+> **PARTIALLY SUPERSEDED (2026-07-22)** by `2026-07-22-cas-disk-self-quiesce-simplification-design.md`: Part 1 (abort-hardening) and Part 6 (benign-absent probes) stand; the Dormant state and the SYSTEM CONTENT ADDRESSED MOUNT/UNMOUNT *reuse* lifecycle (Parts 2-4) are rolled back.
+
 # CAS mount-lease abort hardening + explicit disk lifecycle (MOUNT / UNMOUNT / FSCK) design
 
 Status: user-approved direction (2026-07-21), rev.2. Rev.1 was adversarially reviewed (codex
