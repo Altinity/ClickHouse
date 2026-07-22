@@ -26,7 +26,7 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
 . "$CUR_DIR"/../shell_config.sh
 
-POOL_DIR="${CLICKHOUSE_USER_FILES_UNIQUE}/04290_content_addressed_pool"
+POOL_DIR="${CLICKHOUSE_USER_FILES_UNIQUE}_04290_${RANDOM}"
 
 # Fresh pool dir for this run.
 rm -rf "${POOL_DIR:?}"
@@ -40,7 +40,7 @@ count_pool_objects() {
     echo $(( n_blobs + n_parts ))
 }
 
-DISK_NAME='04290_content_addressed'
+DISK_NAME="ca_04290_${CLICKHOUSE_TEST_UNIQUE_NAME}_${RANDOM}"
 DISK_DEF="disk(
     type = object_storage,
     object_storage_type = local,
