@@ -63,6 +63,17 @@ bool DataTypeDateTime64::equals(const IDataType & rhs) const
 
 SerializationPtr DataTypeDateTime64::doGetDefaultSerialization() const
 {
+    if (!has_explicit_time_zone)
+    {
+        /// When no explicit timezone, resolve the effective timezone (respects session_timezone).
+        /// This is called once per formatter (not per row), so the cost of DateLUT::instance() is negligible.
+        const auto & effective_tz = DateLUT::instance();
+        if (&effective_tz != &time_zone)
+        {
+            TimezoneMixin overridden(effective_tz.getTimeZone());
+            return std::make_shared<SerializationDateTime64>(scale, overridden);
+        }
+    }
     return std::make_shared<SerializationDateTime64>(scale, *this);
 }
 
