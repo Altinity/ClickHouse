@@ -5,6 +5,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/tests/cas_test_helpers.h>
+#include <IO/ReadHelpers.h>
 #include <IO/SharedThreadPools.h>
 #include <Common/ThreadPool.h>
 #include <fmt/format.h>
@@ -76,7 +77,7 @@ struct CaWiringFixture
 
     /// Stages a fresh build (manifest + precommit) for `key` over `blobs` inline entries, WITHOUT
     /// promoting it -- the caller drives `promoteBuild` itself so it can observe the exact
-    /// `CommitOutcome` the promote primitive derives.
+    /// `CommitResult` the promote primitive derives.
     Staged stageSimplePart(const Cas::PartRefKey & key, int blobs)
     {
         std::vector<Cas::ManifestEntry> entries;
@@ -89,8 +90,8 @@ struct CaWiringFixture
         return {std::move(build), id};
     }
 
-    /// Stages and promotes one simple part end-to-end, returning the exact `CommitOutcome`.
-    Cas::CommitOutcome commitSimplePart(const Cas::PartRefKey & key, int blobs)
+    /// Stages and promotes one simple part end-to-end, returning the exact `CommitResult`.
+    Cas::CommitResult commitSimplePart(const Cas::PartRefKey & key, int blobs)
     {
         auto staged = stageSimplePart(key, blobs);
         return access.promoteBuild(*staged.build, key, staged.build->buildId(), staged.id);
@@ -99,7 +100,7 @@ struct CaWiringFixture
     /// Repoints an already-committed `key` onto a fresh manifest (different content), through the
     /// public `repointRef` primitive -- models "another writer" rebinding the ref after this
     /// fixture's own `commitSimplePart`.
-    Cas::CommitOutcome repointToFreshManifest(const Cas::PartRefKey & key)
+    Cas::CommitResult repointToFreshManifest(const Cas::PartRefKey & key)
     {
         return access.repointRef(key, {inlineEntry("f0", fmt::format("repoint-{}", ++content_counter))},
             Cas::ProvenanceOp::Other);
@@ -114,11 +115,11 @@ TEST(CasCommitOutcome, PromoteReportsCreatedAndManifest)
     const Cas::PartRefKey key{fx.ns(), "20260101_1_1_0"};
     auto staged = fx.stageSimplePart(key, /*blobs=*/1);
 
-    const Cas::CommitOutcome oc = fx.partAccess().promoteBuild(*staged.build, key, staged.build->buildId(), staged.id);
+    const Cas::CommitResult oc = fx.partAccess().promoteBuild(*staged.build, key, staged.build->buildId(), staged.id);
 
+    /// `promoteBuild` now returns the allocation-free `CommitResult` (Fix 2): the two fields derived
+    /// INSIDE the durable `appendRefOps` builder, no identity strings (the caller already knows `key`).
     EXPECT_TRUE(oc.created);
-    EXPECT_EQ(oc.ns.string(), key.ns.string());
-    EXPECT_EQ(oc.ref, key.ref);
     EXPECT_EQ(oc.manifest_ref, staged.id.ref);
 }
 
@@ -126,11 +127,11 @@ TEST(CasCommitOutcome, DropRefIfMatchesRemovesOnlyExact)
 {
     CaWiringFixture fx;
     const Cas::PartRefKey key{fx.ns(), "20260101_2_2_0"};
-    const Cas::CommitOutcome oc1 = fx.commitSimplePart(key, /*blobs=*/1);
+    const Cas::CommitResult oc1 = fx.commitSimplePart(key, /*blobs=*/1);
     EXPECT_TRUE(oc1.created);
 
     /// Rebind key -> M2 (a legitimate repoint by "another writer").
-    const Cas::CommitOutcome oc2 = fx.repointToFreshManifest(key);
+    const Cas::CommitResult oc2 = fx.repointToFreshManifest(key);
     EXPECT_FALSE(oc2.created);
     ASSERT_NE(oc1.manifest_ref, oc2.manifest_ref);
 
@@ -153,15 +154,15 @@ TEST(CasCommitOutcome, DropRefIfMatchesOnAbsentRefIsANoOp)
 }
 
 /// `repointRef`'s byte-equal candidate is a documented ZERO-pool-mutation no-op (it must not mint a
-/// fresh manifest just to compare it). The returned `CommitOutcome` must still describe reality: the
+/// fresh manifest just to compare it). The returned `CommitResult` must still describe reality: the
 /// CURRENTLY committed manifest, unchanged, `created=false`.
 TEST(CasCommitOutcome, RepointRefByteEqualNoOpReportsCurrentManifestNotCreated)
 {
     CaWiringFixture fx;
     const Cas::PartRefKey key{fx.ns(), "20260101_4_4_0"};
-    const Cas::CommitOutcome oc1 = fx.commitSimplePart(key, /*blobs=*/1);
+    const Cas::CommitResult oc1 = fx.commitSimplePart(key, /*blobs=*/1);
 
-    const Cas::CommitOutcome oc_noop = fx.partAccess().repointRef(
+    const Cas::CommitResult oc_noop = fx.partAccess().repointRef(
         key, {CaWiringFixture::inlineEntry("f0", fmt::format("payload-{}-0", key.ref))}, Cas::ProvenanceOp::Other);
     EXPECT_FALSE(oc_noop.created);
     EXPECT_EQ(oc_noop.manifest_ref, oc1.manifest_ref);
@@ -264,23 +265,26 @@ struct CaTxnRollbackFixture
 
     /// Rendezvous for the join-before-rollback test. The "slow" part's before-promote hook blocks
     /// until the "poison" part's before-promote hook releases it -- a real handshake, NO sleep -- so the
-    /// slow commit worker is provably still in-flight when the poison worker throws. `on_slow_finish`
-    /// fires the instant the slow worker is released (its publish effectively done); the rollback hook
-    /// then asserts that flag was already set, i.e. the drain completed before rollback began.
+    /// slow commit worker is provably still in-flight when the poison worker throws. `slow_released_by_poison`
+    /// records whether the bounded wait woke on the poison signal (genuine concurrency) rather than on the
+    /// timeout (a serial regression). The slow part's COMPLETION marker is set from the separate
+    /// after-publish seam (see the test), which fires only once `publishStaging` has FULLY returned.
     struct SlowRendezvous
     {
         std::mutex m;
         std::condition_variable cv;
         bool poison_failed = false;
-        std::function<void()> on_slow_finish;
+        std::atomic<bool> slow_released_by_poison{false};
     };
     std::shared_ptr<SlowRendezvous> rendezvous = std::make_shared<SlowRendezvous>();
 
-    void onSlowUploadFinish(std::function<void()> cb) { rendezvous->on_slow_finish = std::move(cb); }
     void onFirstDropRefIfMatches(std::function<void()> cb)
     {
         storage->setBeforeDropRefIfMatchesHookForTest(std::move(cb));
     }
+    /// True iff the slow worker's bounded wait was released by the poison worker's signal (proving the two
+    /// ran on different workers at once), not by the wait timing out (which a serial regression would hit).
+    bool slowReleasedByPoison() const { return rendezvous->slow_released_by_poison.load(); }
 
     /// Arm `slow` to block mid-`publishStaging` until `poison`'s promote fails, and `poison` to release
     /// `slow` and then fail its promote. With commit concurrency >= 2 they land on different workers.
@@ -289,14 +293,12 @@ struct CaTxnRollbackFixture
         auto rv = rendezvous;
         storage->setBeforePromoteHookForTest(slow, [rv]
         {
-            {
-                std::unique_lock lk(rv->m);
-                /// Bounded wait: a safety net only -- `poison_failed` is always signalled by the poison
-                /// worker under commit concurrency >= 2. Never a fixed sleep to sequence threads.
-                rv->cv.wait_for(lk, std::chrono::seconds(60), [&] { return rv->poison_failed; });
-            }
-            if (rv->on_slow_finish)
-                rv->on_slow_finish();
+            std::unique_lock lk(rv->m);
+            /// Bounded wait: a safety net only -- `poison_failed` is signalled by the poison worker under
+            /// commit concurrency >= 2. Never a fixed sleep to sequence threads. Record whether the wake
+            /// was the poison signal (true) or the timeout (false) so the test can assert real overlap.
+            const bool released = rv->cv.wait_for(lk, std::chrono::seconds(60), [&] { return rv->poison_failed; });
+            rv->slow_released_by_poison.store(released);
         });
         storage->setBeforePromoteHookForTest(poison, [rv]
         {
@@ -307,6 +309,51 @@ struct CaTxnRollbackFixture
             rv->cv.notify_all();
         });
         storage->armPromoteFailureForTest(poison);
+    }
+
+    /// Two-party rendezvous for the hardlink-shared-blob test: both parts' before-upload hooks arrive
+    /// here and neither proceeds into the shared-blob upload until BOTH have arrived, so their uploads
+    /// provably overlap (exercising the concurrent putIfAbsent / 412-adopt path on one content key).
+    struct UploadBarrier
+    {
+        std::mutex m;
+        std::condition_variable cv;
+        size_t arrived = 0;
+        std::atomic<bool> both_arrived{false};
+    };
+    std::shared_ptr<UploadBarrier> upload_barrier = std::make_shared<UploadBarrier>();
+
+    void forceUploadsToOverlap(const Cas::PartRefKey & a, const Cas::PartRefKey & b)
+    {
+        auto bar = upload_barrier;
+        auto hook = [bar]
+        {
+            std::unique_lock lk(bar->m);
+            ++bar->arrived;
+            bar->cv.notify_all();
+            /// Bounded safety net; both parts always arrive under commit concurrency >= 2.
+            if (bar->cv.wait_for(lk, std::chrono::seconds(30), [&] { return bar->arrived >= 2; }))
+                bar->both_arrived.store(true);
+        };
+        storage->setBeforeUploadHookForTest(a, hook);
+        storage->setBeforeUploadHookForTest(b, hook);
+    }
+    bool bothUploadsOverlapped() const { return upload_barrier->both_arrived.load(); }
+
+    /// Reads back one committed part file's blob payload (excluding the envelope) through the same
+    /// locate + `readBlobPayload` pipeline production reads use -- proving the shared blob is durable
+    /// and its bytes are intact, not merely that the ref exists.
+    std::string readCommittedBlob(const Cas::PartRefKey & key, const std::string & file)
+    {
+        auto view = partAccess().getView(key, Cas::Freshness::ForceFresh);
+        const auto * entry = view ? view->findFile(file) : nullptr;
+        if (!entry)
+            return "<absent>";
+        const auto location = storage->store()->locate(*entry);
+        auto buf = storage->readBlobPayload(location, file, {});
+        std::string out;
+        DB::readStringUntilEOF(out, *buf);
+        return out;
     }
 
     /// Stage TWO parts that share ONE pending blob: write the blob into part A, then `createHardLink`
@@ -422,6 +469,28 @@ TEST(CasCommitRollback, RepointByOtherWriterSurvivesRollback)
     EXPECT_EQ(fx.currentManifest(key), fx.lastRepointManifest());
 }
 
+/// Fix 2: the per-part outcome slot is engaged with the IDENTITY before the durable promote and
+/// finalized with no-throw POD (`CommitResult`) assignments AFTER it, so a throw in the POST-promote
+/// path can never lose the just-created ref. This injects a throw in the after-promote hook -- which
+/// runs AFTER the durable append and AFTER the slot is fully written -- and asserts the created ref is
+/// still rolled back. Before the fix, the outcome was COPIED into the slot after the durable commit
+/// (`out_slot = oc`, a `bad_alloc`-capable string copy); had that copy thrown, the slot would stay
+/// disengaged and rollback could not drop the ref. Here the throw is deterministic, standing in for
+/// that allocation failure, and proves the slot is engaged+written before any post-promote work.
+TEST(CasCommitRollback, OutcomeSlotSurvivesPostPromoteThrow)
+{
+    auto fx = makeCaWiringFixture();
+    fx.setCommitConcurrency(1);
+    const Cas::PartRefKey key{fx.ns(), "post_promote_throw_1_1_0"};
+    auto txn = fx.beginTxn();
+    fx.stageInto(txn, key, 1);
+    fx.armAfterPromoteHook(key, [] { throw std::runtime_error("injected post-promote failure"); });
+    EXPECT_ANY_THROW(txn->commit({}));
+    EXPECT_FALSE(fx.partAccess().existsRef(key, Cas::Freshness::ForceFresh))
+        << "the ref created just before the post-promote throw must have been rolled back "
+           "(outcome slot was engaged + written before the throw)";
+}
+
 /// Task 4 of the CAS parallel-write-path plan: `cas_commit_concurrency` (a `PoolConfig` tunable) +
 /// `DB::Cas::getCasCommitThreadPool()` (a dedicated, process-wide pool for Task 5's per-part commit
 /// dispatch). No behavior change yet -- this test only proves the two pieces exist and that the pool
@@ -467,68 +536,122 @@ TEST(CasCommitPool, DistinctFromWriterPoolAndBounded)
     EXPECT_EQ(DB::Cas::PoolConfig{}.cas_commit_concurrency, 16u);
 }
 
+/// Fix 1: a zero-size commit pool is a MISCONFIGURATION, not a valid state -- a pool with no threads can
+/// never run a scheduled callback, so `commit()`'s `waitForAllToFinish` would block forever on every
+/// nonempty commit. `initializeCasCommitThreadPool(0, ...)` must throw (fail-closed, no silent clamp).
+/// The zero-size check runs BEFORE the double-init check, so this assertion exercises the validation
+/// path WITHOUT poisoning the process-wide singleton the other tests share: the throw leaves the
+/// already-initialized pool untouched, verified by fetching it again afterward.
+TEST(CasCommitPool, RejectsZeroSize)
+{
+    EXPECT_THROW(DB::Cas::initializeCasCommitThreadPool(0, 0, 10000), DB::Exception);
+    /// The shared pool the unit-test main initialized is still intact (the throw did not touch it).
+    EXPECT_NO_THROW((void)DB::Cas::getCasCommitThreadPool());
+}
+
 /// Task 5 -- the payoff. `commit()` now dispatches per-part `publishStaging` onto the dedicated CAS
 /// commit pool at a bounded fan-out (`cas_commit_concurrency`), with the join structurally ordered
 /// before rollback. These tests exercise the four hazards that concurrency introduces.
 
-/// SATURATION / no self-wait deadlock: a commit-pool bound of N with > N parts must still complete.
-/// Each worker-loop pulls the next part until the snapshot is exhausted; nothing waits on its own pool.
-/// A self-wait deadlock (e.g. one-task-per-part on a pool smaller than the part count, each task
-/// blocking on the pool) would hang here -- the whole run is wrapped in `timeout 180` by the harness.
+/// SATURATION / no self-wait deadlock AND a bounded, non-serial dispatch. A commit-pool bound of N with
+/// > N parts must complete, schedule exactly `min(N, parts)` worker callbacks, keep exactly that many
+/// simultaneously active (a rendezvous barrier in the probe proves they overlap), and process every part
+/// index exactly once. This gates BOTH regressions the design forbids: a one-task-per-part impl would
+/// schedule `parts` callbacks (not N), and a serial impl would peak at 1 active worker (not N).
+///
+/// The probe's per-worker barrier waits (bounded) until all `min(N, parts)` workers are simultaneously
+/// active, so `peak_active` reaching N is real overlap, not a fluke of scheduling. A serial regression
+/// never reaches the rendezvous and falls through on the timeout with `peak_active == 1`, failing the
+/// EXPECT rather than hanging. The whole run is additionally wrapped in `timeout` by the harness.
 TEST(CasParallelCommit, SaturationBoundedCompletion)
 {
     auto fx = makeCaWiringFixture();
-    fx.setCommitConcurrency(2);                       // N = 2 worker-loops
+    fx.setCommitConcurrency(2);                       // N = 2 worker-loops (< the 5 parts below)
+    DB::ContentAddressedMetadataStorage::CommitWorkerProbeForTest probe;
+    fx.storage->setCommitWorkerProbeForTest(&probe);
     auto txn = fx.beginTxn();
     for (int i = 0; i < 5; ++i)                       // N + 3 parts, one blob each
         fx.stageInto(txn, {fx.ns(), fmt::format("p_{}_1_1_0", i)}, 1);
     ASSERT_NO_THROW(txn->commit({}));                 // must return; a self-wait deadlock would hang
+    fx.storage->setCommitWorkerProbeForTest(nullptr); // detach before the stack probe dies
+
+    EXPECT_EQ(probe.callbacks_started.load(), 2u)
+        << "exactly min(concurrency, parts) worker callbacks -- a one-task-per-part regression schedules 5";
+    EXPECT_EQ(probe.peak_active.load(), 2u)
+        << "peak simultaneous-active workers must equal the bound -- a serial regression peaks at 1";
+    EXPECT_EQ(probe.parts_processed.load(), 5u)
+        << "every part index pulled from the cursor exactly once";
     for (int i = 0; i < 5; ++i)
         EXPECT_TRUE(fx.partAccess().existsRef({fx.ns(), fmt::format("p_{}_1_1_0", i)}, Cas::Freshness::ForceFresh));
 }
 
 /// JOIN BEFORE ROLLBACK: a slow worker is held mid-`publishStaging` while a second (poison) part's
-/// promote fails. The rollback's first `dropRefIfMatches` must observe the slow worker already joined,
-/// proving the drain (runner destructor / `waitForAllToFinish`) completed before the catch's rollback.
+/// promote fails. The rollback's first `dropRefIfMatches` must observe the slow part's publish already
+/// FULLY returned, proving the drain (runner destructor / `waitForAllToFinish`) completed before the
+/// catch's rollback.
+///
+/// Two things make this regression-sensitive rather than a trivial pass:
+///   * The completion marker (`slow_done`) is set from the POST-PUBLISH seam -- it fires only once the
+///     slow part's `publishStaging` has FULLY returned, so a broken impl that set a marker mid-publish
+///     (as the old before-promote-hook version did) could no longer satisfy it early.
+///   * The slow part is named to sort FIRST (`a_slow` < `z_poison`), so a serial / single-worker
+///     regression pulls slow first and blocks in its before-promote hook waiting for poison, which that
+///     same worker never gets to -> the bounded wait TIMES OUT. `slowReleasedByPoison()` asserts the
+///     wake was the poison signal (genuine two-worker overlap), so a timeout (serial) fails the test
+///     instead of quietly passing after 60s.
 TEST(CasParallelCommit, JoinPrecedesRollbackUnderSlowWorker)
 {
     auto fx = makeCaWiringFixture();
     fx.setCommitConcurrency(4);
     auto txn = fx.beginTxn();
-    const Cas::PartRefKey slow{fx.ns(), "slow_1_1_0"};
-    const Cas::PartRefKey poison{fx.ns(), "poison_1_1_0"};
+    const Cas::PartRefKey slow{fx.ns(), "a_slow_1_1_0"};      // sorts BEFORE poison -> processed first
+    const Cas::PartRefKey poison{fx.ns(), "z_poison_1_1_0"};
     fx.stageInto(txn, slow, 1);
     fx.stageInto(txn, poison, 1);
     fx.holdSlowWorkerUntilPoisonFails(slow, poison);
 
     std::atomic<bool> slow_done{false};
     std::atomic<bool> rollback_ran{false};
-    fx.onSlowUploadFinish([&] { slow_done = true; });
+    // Completion marker from the POST-PUBLISH seam: set only once slow's publishStaging fully returned.
+    fx.storage->setAfterPublishHookForTest(slow, [&] { slow_done = true; });
     fx.onFirstDropRefIfMatches([&]
     {
         rollback_ran = true;
-        EXPECT_TRUE(slow_done.load()) << "rollback ran before the slow worker joined";
+        EXPECT_TRUE(slow_done.load()) << "rollback ran before the slow worker's publish fully returned (no drain)";
     });
 
     EXPECT_ANY_THROW(txn->commit({}));
     EXPECT_TRUE(rollback_ran.load()) << "the created 'slow' ref must have been rolled back";
+    EXPECT_TRUE(fx.slowReleasedByPoison())
+        << "slow was released by the poison worker's signal, not by the wait timeout -- proves genuine "
+           "two-worker overlap (a serial regression would time out here)";
     // The slow ref was created then rolled back; the poison ref never committed.
     EXPECT_FALSE(fx.partAccess().existsRef(slow, Cas::Freshness::ForceFresh));
     EXPECT_FALSE(fx.partAccess().existsRef(poison, Cas::Freshness::ForceFresh));
 }
 
 /// HARDLINK-SHARED PENDING BLOB: two parts share ONE pending blob (createHardLink), committed in
-/// parallel. Both upload the SAME content key concurrently -- one wins putIfAbsent, the other takes the
-/// 412/adopt path. Both refs must commit and the shared blob must resolve for both.
+/// parallel. A before-upload barrier forces both workers to reach the shared-blob upload before either
+/// proceeds, so both upload the SAME content key CONCURRENTLY -- one wins putIfAbsent, the other takes
+/// the 412/adopt path (without the barrier the two uploads could serialize and never exercise that
+/// race). Both refs must commit, and reading BACK both hardlinked payloads (not just `existsRef`) proves
+/// the shared blob is durable and byte-consistent for both parts.
 TEST(CasParallelCommit, HardlinkSharedPendingBlobParallel)
 {
     auto fx = makeCaWiringFixture();
     fx.setCommitConcurrency(4);
+    const Cas::PartRefKey a{fx.ns(), "h_a_1_1_0"};
+    const Cas::PartRefKey b{fx.ns(), "h_b_1_1_0"};
     auto txn = fx.beginTxn();
-    fx.stageSharedBlobIntoTwoParts(txn, {fx.ns(), "h_a_1_1_0"}, {fx.ns(), "h_b_1_1_0"});
+    fx.stageSharedBlobIntoTwoParts(txn, a, b);
+    fx.forceUploadsToOverlap(a, b);                  // both reach the shared-blob upload before either proceeds
     ASSERT_NO_THROW(txn->commit({}));
-    EXPECT_TRUE(fx.partAccess().existsRef({fx.ns(), "h_a_1_1_0"}, Cas::Freshness::ForceFresh));
-    EXPECT_TRUE(fx.partAccess().existsRef({fx.ns(), "h_b_1_1_0"}, Cas::Freshness::ForceFresh));
+    EXPECT_TRUE(fx.bothUploadsOverlapped()) << "the two shared-blob uploads must have genuinely overlapped";
+    EXPECT_TRUE(fx.partAccess().existsRef(a, Cas::Freshness::ForceFresh));
+    EXPECT_TRUE(fx.partAccess().existsRef(b, Cas::Freshness::ForceFresh));
+    // Read back BOTH hardlinked payloads: the shared blob must be durable and identical for both parts.
+    EXPECT_EQ(fx.readCommittedBlob(a, "data.bin"), "shared-blob-payload");
+    EXPECT_EQ(fx.readCommittedBlob(b, "data.bin"), "shared-blob-payload");
 }
 
 /// SEMANTIC DETERMINISM: a forced-sequential commit (concurrency 1) and a parallel commit

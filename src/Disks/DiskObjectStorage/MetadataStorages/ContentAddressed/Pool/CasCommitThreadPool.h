@@ -27,7 +27,10 @@ namespace DB::Cas
 ThreadPool & getCasCommitThreadPool();
 
 /// Called once from server startup to size the pool from `cas_commit_pool_size`. Throws `LOGICAL_ERROR`
-/// if called a second time -- mirrors `StaticThreadPool::initialize()` (`IO/SharedThreadPools.cpp`).
+/// if called a second time -- mirrors `StaticThreadPool::initialize()` (`IO/SharedThreadPools.cpp`) --
+/// and throws `LOGICAL_ERROR` if `max_threads == 0`: a zero-thread pool can never run a scheduled commit
+/// callback, so `commit()`'s `waitForAllToFinish` would block forever on every nonempty commit. The
+/// zero check runs before the double-init check so it stays testable without poisoning the singleton.
 void initializeCasCommitThreadPool(size_t max_threads, size_t max_free_threads, size_t queue_size);
 
 /// Called once from server teardown (right next to `StaticThreadPool::shutdownAll()`, before

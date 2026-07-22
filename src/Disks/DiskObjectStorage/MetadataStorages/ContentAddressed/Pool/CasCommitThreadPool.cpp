@@ -50,6 +50,17 @@ public:
     void initialize(size_t max_threads, size_t max_free_threads, size_t queue_size)
     {
         std::lock_guard lock(mutex);
+        /// Argument validation runs BEFORE the double-init check on purpose: a zero-thread pool is a
+        /// misconfiguration regardless of init state, and validating first keeps this check testable
+        /// (a unit test can assert the throw without first poisoning the already-initialized
+        /// process-wide singleton -- the throw here leaves `instance` untouched). A zero-thread pool
+        /// constructs fine but can never run a scheduled callback, so `commit()`'s
+        /// `waitForAllToFinish` would block FOREVER on every nonempty commit. Fail-closed (CLAUDE.md:
+        /// no silent fallback) -- reject rather than clamp, so the misconfiguration surfaces at startup.
+        if (max_threads == 0)
+            throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR,
+                "CAS commit thread pool size must be at least 1 (got 0); a zero-thread pool can never "
+                "run a scheduled commit callback and would deadlock every commit");
         if (instance)
             throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "CAS commit thread pool is initialized twice");
 

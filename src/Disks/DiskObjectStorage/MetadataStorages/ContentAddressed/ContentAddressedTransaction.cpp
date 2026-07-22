@@ -333,6 +333,9 @@ void ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
                 /// gets promoted. A marks-only removal never enters this sub-block (`st.build` is null).
                 const Cas::ManifestId scratch_id = st.build->stageManifest(st.entries);
                 st.build->precommitAdd(ns, ref, scratch_id);
+                /// Test-only seam (no-op in production): a barrier point so two parts sharing one
+                /// pending blob can be forced to overlap their uploads.
+                metadata_storage.runBeforeUploadHookForTest({ns, ref});
                 uploadPendingBlobs(st);
             }
 
@@ -353,12 +356,19 @@ void ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
                 throw Exception(ErrorCodes::ABORTED,
                     "ContentAddressedTransaction: test-injected promote failure for {}/{}", ns.string(), ref);
 
-            /// Capture the exact `CommitOutcome` IMMEDIATELY -- into the caller-provided slot, before
-            /// the scratch-build `abandon()` below (which can itself throw), and before the test-only
-            /// after-promote hook (which can run arbitrary test code) -- so a later throw in either
-            /// cannot lose it (Task 2/3's publish-before-any-throwable-post-commit-work ordering).
-            const Cas::CommitOutcome oc = metadata_storage.partAccess()->repointRef({ns, ref}, std::move(merged), Cas::ProvenanceOp::Other);
-            out_slot = oc;   /// always created=false here: this block only runs once `view` already resolved
+            /// PRE-ENGAGE the outcome slot with the IDENTITY (`ns`/`ref`) BEFORE the durable repoint
+            /// (Fix 2). This construction may allocate the two identity strings, but it happens
+            /// pre-durably -- if it throws (`bad_alloc`) nothing durable has run yet, so an engaged
+            /// created=false slot is harmless (rollback skips created=false) and a disengaged slot is
+            /// equally harmless (nothing to roll back). AFTER the durable append returns, the slot is
+            /// finalized with two trivially-copyable (provably no-throw, no-allocation) field
+            /// assignments from the allocation-free `CommitResult` -- so a `bad_alloc` can never strike
+            /// in the window between the durable commit and the slot being recorded, which would
+            /// otherwise leak a live ref on a reported failure.
+            out_slot.emplace(ns, ref, Cas::ManifestRef{}, /*created=*/false);
+            const Cas::CommitResult r = metadata_storage.partAccess()->repointRef({ns, ref}, std::move(merged), Cas::ProvenanceOp::Other);
+            out_slot->manifest_ref = r.manifest_ref;   /// POD assignment, no allocation post-durable
+            out_slot->created = r.created;              /// always false here: this block only runs once `view` already resolved
             /// Test-only: models a concurrent writer racing in right after this transaction's own
             /// confirm (e.g. repointing `ref` again). A no-op in production.
             metadata_storage.runAfterPromoteHookForTest({ns, ref});
@@ -389,6 +399,9 @@ void ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
     /// sabotage (Gate A) is the formal guard.
     const Cas::ManifestId id = st.build->stageManifest(st.entries);
     st.build->precommitAdd(ns, ref, id);
+    /// Test-only seam (no-op in production): a barrier point so two parts sharing one pending blob can
+    /// be forced to overlap their uploads (the hardlink-shared-blob parallel test).
+    metadata_storage.runBeforeUploadHookForTest({ns, ref});
     uploadPendingBlobs(st);
 
     /// Test-only seams (Task 5 / Task 3 TDD): run `ref`'s before-promote hook (a slow-worker hold),
@@ -400,11 +413,21 @@ void ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
 
     /// The exact, in-lane-derived `created` from `promoteBuild` replaces the racy pre-check this used
     /// to be (`existsRef` before promote, which a concurrent writer could invalidate in the window
-    /// before the promote's own append confirms). Captured into `out_slot` IMMEDIATELY -- before the
-    /// test-only after-promote hook below (which can run arbitrary test code) or `st.build.reset()`
-    /// -- so a later throw there cannot lose it.
-    const Cas::CommitOutcome oc = metadata_storage.partAccess()->promoteBuild(*st.build, {ns, ref}, st.build->buildId(), id);
-    out_slot = oc;
+    /// before the promote's own append confirms).
+    ///
+    /// PRE-ENGAGE the outcome slot with the IDENTITY (`ns`/`ref`) BEFORE the durable promote (Fix 2):
+    /// the identity strings are known here, and the (possibly allocating) `emplace` runs pre-durably --
+    /// if it throws (`bad_alloc`) nothing durable has happened yet. AFTER `promoteBuild`'s durable
+    /// `appendRefOps` returns, the slot is FINALIZED with two trivially-copyable (provably no-throw,
+    /// no-allocation) field assignments from the allocation-free `CommitResult`. This closes the leak
+    /// the old `out_slot = oc` copy allowed: an allocation throwing between the durable commit and the
+    /// slot being recorded left the slot disengaged, so rollback could not drop the just-created ref
+    /// (a live ref leaked on a reported failure). The finalized slot is fully written BEFORE the
+    /// test-only after-promote hook (which can run arbitrary test code) and `st.build.reset()`.
+    out_slot.emplace(ns, ref, Cas::ManifestRef{}, /*created=*/false);
+    const Cas::CommitResult r = metadata_storage.partAccess()->promoteBuild(*st.build, {ns, ref}, st.build->buildId(), id);
+    out_slot->manifest_ref = r.manifest_ref;   /// POD assignment, no allocation post-durable
+    out_slot->created = r.created;
     /// Test-only: models a concurrent writer racing in right after this transaction's own confirm. A
     /// no-op in production.
     metadata_storage.runAfterPromoteHookForTest({ns, ref});
@@ -486,23 +509,34 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
     std::exception_ptr * errors_data = errors.data();
     std::atomic<size_t> next{0};
 
+    /// Test-only dispatch probe (nullptr in production -- read ONCE here, never per part): lets a test
+    /// assert exactly `min(concurrency, parts)` worker callbacks are scheduled, that they overlap up to
+    /// that bound (a serial regression fails), and that every part index is processed exactly once.
+    auto * commit_probe = metadata_storage.commitWorkerProbeForTest();
+
     try
     {
         if (total > 0)
         {
             const size_t workers = std::min<size_t>(
                 std::max<uint64_t>(1, metadata_storage.commitConcurrency()), total);
+            if (commit_probe)
+                commit_probe->expected = workers;   /// the rendezvous target the worker barrier waits for
             {
                 /// Inner scope: the runner drains on scope exit BEFORE the catch body can run.
                 ThreadPoolCallbackRunnerLocal<void> runner(Cas::getCasCommitThreadPool(), ThreadName::CAS_COMMIT);
                 std::atomic<size_t> * next_ptr = &next;
                 for (size_t w = 0; w < workers; ++w)
                     runner.enqueueAndKeepTrack(
-                        [this, next_ptr, total, ordered_data, outcomes_data, errors_data]
+                        [this, next_ptr, total, ordered_data, outcomes_data, errors_data, commit_probe]
                         {
+                            if (commit_probe)
+                                commit_probe->onWorkerStart();
                             for (size_t i = next_ptr->fetch_add(1, std::memory_order_relaxed); i < total;
                                  i = next_ptr->fetch_add(1, std::memory_order_relaxed))
                             {
+                                if (commit_probe)
+                                    commit_probe->onPartProcessed();   /// counts each pulled index exactly once
                                 try
                                 {
                                     /// The UNCHANGED per-part publish. Intra-part blobs stay serial
@@ -510,6 +544,11 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
                                     /// PARTS only.
                                     publishStaging(ordered_data[i].ns, ordered_data[i].ref,
                                                    *ordered_data[i].st, outcomes_data[i]);
+                                    /// Test-only seam (no-op in production): fires only once `publishStaging`
+                                    /// has FULLY returned for this part -- the join-before-rollback test sets
+                                    /// its completion marker here, so a no-drain regression cannot set it early.
+                                    metadata_storage.runAfterPublishHookForTest(
+                                        {ordered_data[i].ns, ordered_data[i].ref});
                                 }
                                 catch (...)
                                 {
@@ -518,6 +557,8 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
                                     errors_data[i] = std::current_exception();
                                 }
                             }
+                            if (commit_probe)
+                                commit_probe->onWorkerEnd();
                         });
                 runner.waitForAllToFinish();   /// non-throwing drain; NEVER get() in this noexcept-ish context
             }   /// runner dtor re-drains on every path (a partway `enqueueAndKeepTrack` throw included)

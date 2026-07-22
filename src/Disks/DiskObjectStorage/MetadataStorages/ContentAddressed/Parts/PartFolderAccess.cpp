@@ -8,6 +8,7 @@
 #include <base/scope_guard.h>
 #include <algorithm>
 #include <chrono>
+#include <type_traits>
 #include <unordered_set>
 
 namespace DB
@@ -321,21 +322,30 @@ bool CachedPartFolderAccess::existsRef(const PartRefKey & key, Freshness freshne
     return resolve(key, freshness).has_value();
 }
 
-Cas::CommitOutcome CachedPartFolderAccess::promoteBuild(Cas::PartWriteTxn & build, const PartRefKey & key, UInt128 build_id,
+/// The result a commit-shaped primitive hands back is intentionally an allocation-free POD, so a
+/// caller can record it into an already-engaged outcome slot with two trivially-copyable field
+/// assignments AFTER the durable append -- no post-durable allocation that could throw and lose the
+/// just-created ref (Fix 2). This static assertion is the compiler-enforced proof of that property.
+static_assert(std::is_trivially_copyable_v<Cas::CommitResult>,
+              "CommitResult must be trivially copyable so the write-path outcome slot can be finalized "
+              "with no-throw, no-allocation field assignments after the durable appendRefOps");
+
+Cas::CommitResult CachedPartFolderAccess::promoteBuild(Cas::PartWriteTxn & build, const PartRefKey & key, UInt128 build_id,
                                           const Cas::ManifestId & manifest_id, bool allow_repoint)
 {
     /// `build.promote` derives `created` INSIDE its own `appendRefOps` builder (the same in-closure
     /// pattern as that builder's `repoint_old`) and returns it the instant the append confirms. The
-    /// outcome is assembled here IMMEDIATELY -- before `eraseView` (cache invalidation) -- so nothing
-    /// throwable can run ahead of it; `eraseView` itself does not throw in practice, but the ordering
-    /// is the contract a later conditional rollback (Task 3) relies on.
+    /// result is assembled here IMMEDIATELY -- before `eraseView` (cache invalidation) -- and is an
+    /// allocation-free POD (`ManifestRef` + `bool`), so nothing allocatable is constructed between the
+    /// durable append and the return; `eraseView` itself does not throw in practice, but the ordering is
+    /// the contract the write-path conditional rollback (Task 3 / Fix 2) relies on.
     const bool created = build.promote(key.ns, key.ref, build_id, manifest_id, allow_repoint);
-    const Cas::CommitOutcome outcome{key.ns, key.ref, manifest_id.ref, created};
+    const Cas::CommitResult result{manifest_id.ref, created};
     eraseView(key);
-    return outcome;
+    return result;
 }
 
-Cas::CommitOutcome CachedPartFolderAccess::publishEntries(const PartRefKey & dst,
+Cas::CommitResult CachedPartFolderAccess::publishEntries(const PartRefKey & dst,
     const std::vector<Cas::ManifestEntry> & entries, Cas::ProvenanceOp op, bool allow_repoint)
 {
     auto build = store->beginPartWrite(Cas::PartWriteInfo{.intended_ref = dst.ns.string() + "/" + dst.ref,
@@ -401,7 +411,7 @@ bool CachedPartFolderAccess::republishRef(const PartRefKey & src, const PartRefK
     return true;
 }
 
-Cas::CommitOutcome CachedPartFolderAccess::repointRef(const PartRefKey & key, std::vector<Cas::ManifestEntry> entries, Cas::ProvenanceOp op)
+Cas::CommitResult CachedPartFolderAccess::repointRef(const PartRefKey & key, std::vector<Cas::ManifestEntry> entries, Cas::ProvenanceOp op)
 {
     /// Compare the candidate `entries` against the currently committed manifest's
     /// decoded entries. This must NOT stage a candidate manifest first: `stageManifest` mints a
@@ -431,13 +441,13 @@ Cas::CommitOutcome CachedPartFolderAccess::repointRef(const PartRefKey & key, st
         probe.payload_digest = Cas::computePayloadDigest(probe);
         const Cas::PartManifest canonical_candidate = Cas::decodePartManifest(Cas::encodePartManifest(probe));
         if (committed_manifest->entries == canonical_candidate.entries)
-            /// ZERO pool mutations: the outcome describes the manifest ALREADY committed, unchanged.
-            return Cas::CommitOutcome{key.ns, key.ref, resolved->manifest_id.ref, /*created=*/false};
+            /// ZERO pool mutations: the result describes the manifest ALREADY committed, unchanged.
+            return Cas::CommitResult{resolved->manifest_id.ref, /*created=*/false};
     }
     /// `publishEntries` takes `entries` by const reference, so the caller-owned vector remains valid.
-    /// Capture the exact outcome IMMEDIATELY -- before the ProfileEvent/logging below -- so it is
+    /// Capture the exact result IMMEDIATELY -- before the ProfileEvent/logging below -- so it is
     /// published ahead of any further (even if non-throwing in practice) post-commit work.
-    const Cas::CommitOutcome oc = publishEntries(key, entries, op, /*allow_repoint=*/true);
+    const Cas::CommitResult oc = publishEntries(key, entries, op, /*allow_repoint=*/true);
     ProfileEvents::increment(ProfileEvents::CasRefRepoint);
     if (resolved)
     {
