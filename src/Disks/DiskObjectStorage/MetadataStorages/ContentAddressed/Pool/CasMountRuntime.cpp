@@ -343,12 +343,16 @@ void CasMountRuntime::scheduleRemount()
     if (!config.background_watermark)
         return;
     /// A fully-terminal `Vanished` pool never claims/allocates/writes again (spec §3): the keeper
-    /// callback must not arm a recovery thread. `IdentityLost` is NOT terminal here — its non-mutating
-    /// observer intentionally keeps running through this same recovery loop.
-    if (remount_shutting_down.load() || remount_running.load() || isVanished())
+    /// callback must not arm a recovery thread. It reads the terminal-intent latch (`vanished_intent`,
+    /// published FIRST by `enterVanished`, and by Task 10's FORGET) alongside the settled state
+    /// `isVanished()`, so the earliest possible terminal signal is honored. `IdentityLost` is NOT terminal
+    /// here — it sets no latch, so its non-mutating observer keeps running through this same recovery loop.
+    if (remount_shutting_down.load() || remount_running.load()
+        || vanished_intent.load(std::memory_order_acquire) || isVanished())
         return;
     std::lock_guard g(remount_thread_mutex);
-    if (remount_shutting_down.load() || remount_running.load() || isVanished())
+    if (remount_shutting_down.load() || remount_running.load()
+        || vanished_intent.load(std::memory_order_acquire) || isVanished())
         return;
     if (remount_thread.joinable())
         remount_thread.join();   /// Reap a previous recovery before starting a new one.
@@ -357,11 +361,14 @@ void CasMountRuntime::scheduleRemount()
     {
         setThreadName(ThreadName::CAS_REMOUNT);
         uint64_t backoff_ms = 1000;
-        /// Exit at any step boundary once the pool is fully-terminal `Vanished` (spec §3). An
-        /// `IdentityLost` pool is NOT vanished, so this loop keeps running as its low-rate observer:
-        /// `remount_attempt` (the identity gate) returns false without claiming while it stays demoted,
-        /// and promotes one-way to `VanishedErased` (Task 6), which then trips this exit.
-        while (!remount_stop.load() && !isVanished())
+        /// Exit at any step boundary once a fully-terminal transition is intended (spec §3). It checks the
+        /// terminal-intent latch (`vanished_intent`, published FIRST by `enterVanished`, and by Task 10's
+        /// FORGET before it joins this thread) alongside the settled state `isVanished()`, so the loop
+        /// bails at the earliest terminal signal rather than only after the state store lands. An
+        /// `IdentityLost` pool sets no latch and is NOT vanished, so this loop keeps running as its
+        /// low-rate observer: `remount_attempt` (the identity gate) returns false without claiming while
+        /// it stays demoted, and promotes one-way to `VanishedErased` (Task 6), which then trips this exit.
+        while (!remount_stop.load() && !vanished_intent.load(std::memory_order_acquire) && !isVanished())
         {
             if (remount_attempt())
                 break;
