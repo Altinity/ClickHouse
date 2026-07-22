@@ -2,6 +2,7 @@
 
 #include <base/types.h>
 #include <ctime>
+#include <optional>
 #include <vector>
 #include <Common/Exception.h>
 #include <Poco/JSON/Object.h>
@@ -76,10 +77,12 @@ struct MergeTreePartitionExportTask
     bool write_full_path_in_iceberg_metadata = false;
     bool allow_lossy_cast = false;
     String iceberg_metadata_json;
-    String parquet_compression_method;
-    UInt64 output_format_compression_level = 0;
-    UInt64 parquet_row_group_size = 0;
-    UInt64 parquet_row_group_size_bytes = 0;
+    /// Optional for backwards compatibility with descriptors written before these
+    /// settings were persisted (same shape as ExportReplicatedMergeTreePartitionManifest).
+    std::optional<String> parquet_compression_method;
+    std::optional<UInt64> output_format_compression_level;
+    std::optional<UInt64> parquet_row_group_size;
+    std::optional<UInt64> parquet_row_group_size_bytes;
 
     size_t partsCount() const { return parts.size(); }
 
@@ -172,10 +175,14 @@ struct MergeTreePartitionExportTask
         json.set("allow_lossy_cast", allow_lossy_cast);
         if (!iceberg_metadata_json.empty())
             json.set("iceberg_metadata_json", iceberg_metadata_json);
-        json.set("parquet_compression_method", parquet_compression_method);
-        json.set("output_format_compression_level", output_format_compression_level);
-        json.set("parquet_row_group_size", parquet_row_group_size);
-        json.set("parquet_row_group_size_bytes", parquet_row_group_size_bytes);
+        if (parquet_compression_method)
+            json.set("parquet_compression_method", *parquet_compression_method);
+        if (output_format_compression_level)
+            json.set("output_format_compression_level", *output_format_compression_level);
+        if (parquet_row_group_size)
+            json.set("parquet_row_group_size", *parquet_row_group_size);
+        if (parquet_row_group_size_bytes)
+            json.set("parquet_row_group_size_bytes", *parquet_row_group_size_bytes);
 
         std::ostringstream oss;     // STYLE_CHECK_ALLOW_STD_STRING_STREAM
         oss.exceptions(std::ios::failbit);
@@ -238,10 +245,14 @@ struct MergeTreePartitionExportTask
         task.allow_lossy_cast = json->getValue<bool>("allow_lossy_cast");
         if (json->has("iceberg_metadata_json"))
             task.iceberg_metadata_json = json->getValue<String>("iceberg_metadata_json");
-        task.parquet_compression_method = json->getValue<String>("parquet_compression_method");
-        task.output_format_compression_level = json->getValue<UInt64>("output_format_compression_level");
-        task.parquet_row_group_size = json->getValue<UInt64>("parquet_row_group_size");
-        task.parquet_row_group_size_bytes = json->getValue<UInt64>("parquet_row_group_size_bytes");
+        if (json->has("parquet_compression_method"))
+            task.parquet_compression_method = json->getValue<String>("parquet_compression_method");
+        if (json->has("output_format_compression_level"))
+            task.output_format_compression_level = json->getValue<UInt64>("output_format_compression_level");
+        if (json->has("parquet_row_group_size"))
+            task.parquet_row_group_size = json->getValue<UInt64>("parquet_row_group_size");
+        if (json->has("parquet_row_group_size_bytes"))
+            task.parquet_row_group_size_bytes = json->getValue<UInt64>("parquet_row_group_size_bytes");
 
         return task;
     }

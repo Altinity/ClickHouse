@@ -198,7 +198,7 @@ namespace ExportPartitionUtils
         /// schema drifts to a lossy target between scheduling and execution.
         context_copy->setSetting("export_merge_tree_part_allow_lossy_cast", manifest.allow_lossy_cast);
 
-	    return context_copy;
+        return context_copy;
     }
 
     template ContextPtr getContextCopyWithTaskSettings<ExportReplicatedMergeTreePartitionManifest>(
