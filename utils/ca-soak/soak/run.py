@@ -477,9 +477,15 @@ class Driver:
         self.last_op = op
 
 
-def checkpoint(driver, cluster, model, phase):
+def checkpoint(driver, cluster, model, phase, *, strict_unreachable=False):
     """Pause workers (drain), quiesce, assert both replicas == model, drive GC to fixpoint, assert a
-    clean CA pool. Raises CheckpointFailure on any divergence."""
+    clean CA pool. Raises CheckpointFailure on any divergence.
+
+    `strict_unreachable`: assert the unreachable backlog has collapsed to the GC pipeline floor.
+    Pass True ONLY at the final converge checkpoint: mid-churn the backlog legitimately scales with
+    churn rate (multi-round condemn->graduate->delete pipeline, time/ack-gated), so any mid-run
+    level cap keyed to the live set is a guaranteed false trip on a churny run (2026-07-22 RCA:
+    169,837 AwaitingGc at t+420 drained to 14 by run end through the normal pipeline)."""
     driver.drain()
     now = quiesce(cluster, TABLE)
 
@@ -707,13 +713,17 @@ def checkpoint(driver, cluster, model, phase):
     reachable = f.get("reachable", 0)
     log(f"unreachable={unreachable} (M-F debris, pending Full GC / B140); reachable={reachable} "
         f"dangling=0 dryrun_subset=ok")
-    # Crude regression tripwire for a NEW unbounded-leak class distinct from B140: only fire if the
-    # debris grows PATHOLOGICALLY relative to the live set. Kept deliberately generous (not a tight
-    # bound) so it cannot flake on normal residual; a later metrics-curve task tracks growth precisely.
-    if unreachable > 50 * reachable + 100000:
+    # Mid-churn, `unreachable` is a fold BACKLOG (fsck class AwaitingGc), not a leak: it scales
+    # with churn rate while `reachable` sits at its floor, so a level cap here is a guaranteed
+    # false trip (see the docstring; BACKLOG.md already documents mid-run levels as transients).
+    # The honest assertion is CONVERGENCE once churn has stopped: at the final converge checkpoint
+    # the pipeline has had its time/ack grace, so anything beyond the pipeline floor is a real
+    # unbounded-leak signal.
+    if strict_unreachable and unreachable > 50 * reachable + 5000:
         raise CheckpointFailure(
-            f"unreachable={unreachable} grew pathologically vs reachable={reachable} "
-            f"(> 50*reachable + 100000) — a NEW unbounded-leak class distinct from M-F debris (B140)")
+            f"unreachable={unreachable} did not converge after quiesce (reachable={reachable}, "
+            f"bound 50*reachable + 5000) — an unbounded-leak class distinct from the normal "
+            f"GC-pipeline residual")
 
     return now, exp, n1, n2, f, dr
 
@@ -1266,7 +1276,7 @@ def run_phase3(args):
         log(f"phase-3 SELECT read-workload: {len(select_workers)} parallel worker(s), "
             f"~{args.select_interval_s}s mean pacing each (moderate bucket+k-range / recent-ts scans)")
 
-    def do_checkpoint(label):
+    def do_checkpoint(label, *, strict_unreachable=False):
         log(f"{label}")
         checkpoint_active.set()
         try:
@@ -1278,7 +1288,7 @@ def run_phase3(args):
             except FsckTimeout as _e:
                 log(f"WARNING [B146/B154] {label}: entry-gate fsck timed out ({_e}); "
                     f"proceeding to checkpoint without pool-consistent gate — soak continues")
-            now, exp, n1, n2, f, dr = checkpoint(driver, cluster, model, 2)
+            now, exp, n1, n2, f, dr = checkpoint(driver, cluster, model, 2, strict_unreachable=strict_unreachable)
         finally:
             checkpoint_active.clear()
         log(f"{label} OK: now={now} count={exp['count']} fsck reachable={f.get('reachable')} "
@@ -1395,7 +1405,7 @@ def run_phase3(args):
         drain_recovery_checkpoints()
         if chaos.error is not None:
             raise chaos.error
-        do_checkpoint("final converge checkpoint")
+        do_checkpoint("final converge checkpoint", strict_unreachable=True)
 
     except (CheckpointFailure, QueryError, OSError) as e:
         chaos_stop.set()
