@@ -13,14 +13,17 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
 . "$CUR_DIR"/../shell_config.sh
 
-DISK_NAME="05020_content_addressed_fsck"
+DISK_NAME="ca_fsck_${CLICKHOUSE_TEST_UNIQUE_NAME}_${RANDOM}"
+POOL_DIR="${CLICKHOUSE_USER_FILES_UNIQUE}_fsck_${RANDOM}"
+rm -rf "${POOL_DIR:?}"
+mkdir -p "${POOL_DIR}"
 DISK_CA="disk(
     type = object_storage,
     object_storage_type = local,
     metadata_type = content_addressed,
     server_root_id = '05020',
     name = '${DISK_NAME}',
-    path = '05020_content_addressed_fsck_pool/')"
+    path = '${POOL_DIR}/')"
 
 ${CLICKHOUSE_CLIENT} --query "DROP TABLE IF EXISTS t_fsck SYNC"
 
@@ -46,7 +49,8 @@ ${CLICKHOUSE_CLIENT} --query "SYSTEM CONTENT ADDRESSED UNMOUNT '${DISK_NAME}'"
 echo 'unmount_ok'
 
 # --- FSCK on the quiesced, healthy pool: a clean one-row summary, no dangling/unreachable ---
-${CLICKHOUSE_CLIENT} --format TSVWithNames --query "SYSTEM CONTENT ADDRESSED FSCK '${DISK_NAME}'"
+${CLICKHOUSE_CLIENT} --format TSVWithNames --query "SYSTEM CONTENT ADDRESSED FSCK '${DISK_NAME}'" \
+    | sed "s/${DISK_NAME}/<disk>/"
 
 # --- A non-CA disk is rejected (the always-present local \`default\`) ---
 echo -n 'fsck_non_ca_disk_rejected: '
@@ -57,3 +61,5 @@ ${CLICKHOUSE_CLIENT} --query "SYSTEM CONTENT ADDRESSED FSCK default" 2>&1 \
 echo -n 'fsck_requires_disk: '
 ${CLICKHOUSE_CLIENT} --query "SYSTEM CONTENT ADDRESSED FSCK" 2>&1 \
     | grep -cm1 "Syntax error"
+
+rm -rf "${POOL_DIR:?}"
