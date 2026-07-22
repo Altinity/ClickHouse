@@ -1,0 +1,336 @@
+#include <gtest/gtest.h>
+#include "cas_test_helpers.h"
+
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.h>
+
+#include <functional>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <utility>
+
+namespace DB::ErrorCodes
+{
+    extern const int INVALID_STATE;
+}
+
+/// Task 4 (spec §1 "Gate lifetime [C2]", §2 [D1]): every durable-effect path on the plain-object
+/// surface (`CasPlainObjects::casPutObject`/`casRemoveObject`) and the S3-native staging-buffer
+/// finalize (`Cas::CaContentWriteBuffer`) captures the mount runtime's fence generation at admission
+/// and re-checks it -- and `mayMutate()` -- immediately before its durable backend call, throwing the
+/// typed transient error (`INVALID_STATE`, 668) on a mismatch instead of letting a stale-incarnation
+/// write land. `CasMountRuntime::DurableRequestGuard` is the paired outstanding-durable-request
+/// counter Task 6's erasure-proof gate polls for full durable-lane quiescence.
+///
+/// These tests drive a real `Cas::Pool` over `InMemoryBackend` (the "Emulated"-style in-memory
+/// backend) via `Pool::open`, exactly like `gtest_cas_mount.cpp`/`gtest_cas_s3_staging.cpp` -- the
+/// fence is tripped/observed through `Pool`'s public forwarders (`tripMountLost`, `mayMutate`,
+/// `fenceGeneration`, `beginDurableRequest`, `checkFenceOrThrow`, `outstandingDurableRequestsForTest`).
+
+using namespace DB::Cas;
+
+namespace
+{
+
+/// A backend whose `head()` call can trigger an injected side-effect exactly once -- deterministically
+/// simulates a fence trip landing BETWEEN a durable-effect operation's admission and its durable
+/// backend call, with no real concurrency at all (mirrors the injected-fault shape of
+/// `TransportFaultBackend` in gtest_cas_sentinel_probe.cpp, but fires a callback instead of throwing).
+class TripOnHeadBackend final : public InMemoryBackend
+{
+public:
+    HeadResult head(const String & key) override
+    {
+        if (trigger)
+            std::exchange(trigger, {})();
+        return InMemoryBackend::head(key);
+    }
+
+    std::function<void()> trigger;
+};
+
+/// Same idea as `TripOnHeadBackend`, but fires on the SECOND `head()` call and forces a first-attempt
+/// `PreconditionFailed` so the retry loop actually reaches a second iteration -- proves the fence
+/// re-check runs on EVERY conditional-retry iteration, not just the admission-time first attempt.
+class TripOnSecondHeadBackend final : public InMemoryBackend
+{
+public:
+    using Backend::putIfAbsent;
+
+    HeadResult head(const String & key) override
+    {
+        ++head_calls;
+        if (head_calls == 2 && trigger)
+            std::exchange(trigger, {})();
+        return InMemoryBackend::head(key);
+    }
+
+    PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta) override
+    {
+        if (fail_first_put)
+        {
+            fail_first_put = false;
+            return PutResult{.outcome = PutOutcome::PreconditionFailed, .token = {}};
+        }
+        return InMemoryBackend::putIfAbsent(key, bytes, meta);
+    }
+
+    int head_calls = 0;
+    /// Default false: `Pool::open`'s own capability probe issues `putIfAbsent` calls before the test
+    /// gets to arm this, and those must succeed normally. The test flips this to `true` only right
+    /// before driving the write it actually targets.
+    bool fail_first_put = false;
+    std::function<void()> trigger;
+};
+
+/// A minimal in-memory `WriteBufferFromFileBase` standing in for an object-store sink, trimmed to just
+/// what these tests observe (whether `finalizeImpl` ran) -- mirrors `FakeStagingSink` in
+/// gtest_cas_s3_staging.cpp (not reusable from here: that one lives in that file's own anonymous
+/// namespace).
+class RecordingSink final : public DB::WriteBufferFromFileBase
+{
+public:
+    explicit RecordingSink(std::string key_)
+        : DB::WriteBufferFromFileBase(/*buf_size=*/8192, nullptr, 0), key(std::move(key_))
+    {
+    }
+
+    void sync() override {}
+    std::string getFileName() const override { return key; }
+    bool wasFinalizedForTest() const { return did_finalize; }
+
+protected:
+    void nextImpl() override
+    {
+        if (offset())
+            written.append(working_buffer.begin(), offset());
+    }
+
+    void finalizeImpl() override
+    {
+        next();
+        did_finalize = true;
+    }
+
+    void cancelImpl() noexcept override { cancelled = true; }
+
+private:
+    std::string key;
+    std::string written;
+    bool did_finalize = false;
+    bool cancelled = false;
+};
+
+PoolPtr openTestPool(BackendPtr backend)
+{
+    return Pool::open(std::move(backend), PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+}
+
+}
+
+/// (a) `casPutObject` (reached via `Pool::putNamespaceFile`) with the fence tripped BETWEEN admission
+/// and the durable PUT: typed 668, and the object is never actually written.
+TEST(CasFenceGeneration, PlainObjectPutAbortsWhenFenceTripsBetweenAdmissionAndDurableCall)
+{
+    auto backend = std::make_shared<TripOnHeadBackend>();
+    auto store = openTestPool(backend);
+    ASSERT_TRUE(store->mayMutate());
+
+    const RootNamespace ns{"test/ns"};
+    backend->trigger = [&] { store->tripMountLost(); };
+
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&]
+    {
+        store->putNamespaceFile(ns, "somefile", "hello");
+    });
+
+    /// No durable write ever landed -- assert via the Emulated backend listing.
+    EXPECT_TRUE(store->listNamespaceFiles(ns).empty());
+}
+
+/// `casRemoveObject`'s delete sibling, same shape: the fence trips between admission and the durable
+/// delete, so the victim object survives untouched.
+TEST(CasFenceGeneration, PlainObjectRemoveAbortsWhenFenceTripsBetweenAdmissionAndDurableCall)
+{
+    auto backend = std::make_shared<TripOnHeadBackend>();
+    auto store = openTestPool(backend);
+    const RootNamespace ns{"test/ns"};
+
+    /// Seed the victim BEFORE arming the trigger -- the seeding write itself must not trip the fence.
+    store->putNamespaceFile(ns, "victim", "still here");
+    ASSERT_TRUE(store->mayMutate());
+
+    backend->trigger = [&] { store->tripMountLost(); };
+
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&]
+    {
+        store->removeNamespaceFile(ns, "victim");
+    });
+
+    /// The durable delete never ran -- the object survives (reads are not fence-gated by this task).
+    const auto still_there = store->getNamespaceFile(ns, "victim");
+    ASSERT_TRUE(still_there.has_value());
+    EXPECT_EQ(*still_there, "still here");
+}
+
+/// The fence re-check must run before EVERY conditional-retry iteration, not just the first attempt
+/// (spec wording, verbatim): a synthetic `PreconditionFailed` forces a second loop iteration, and the
+/// fence trips on the SECOND `head()` call. If the check ran only once, at admission, this write would
+/// incorrectly succeed on the retry.
+TEST(CasFenceGeneration, PlainObjectPutRechecksFenceOnEveryRetryIterationNotJustFirst)
+{
+    auto backend = std::make_shared<TripOnSecondHeadBackend>();
+    auto store = openTestPool(backend);
+    ASSERT_TRUE(store->mayMutate());
+
+    const RootNamespace ns{"test/ns"};
+    backend->head_calls = 0;   /// reset past whatever `Pool::open`'s own probe/mount claim already did
+    backend->fail_first_put = true;
+    backend->trigger = [&] { store->tripMountLost(); };
+
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&]
+    {
+        store->putNamespaceFile(ns, "somefile", "hello");
+    });
+
+    EXPECT_EQ(backend->head_calls, 2);
+    EXPECT_TRUE(store->listNamespaceFiles(ns).empty());
+}
+
+/// (b) The S3-native staging-buffer finalize: the fence trips AFTER the buffer is constructed
+/// (admission) but BEFORE `finalize()` reaches the durable `sink->finalize()` call -- same typed abort,
+/// and the sink is never actually finalized (`on_finalized` never fires either, so the transaction
+/// never learns of a promote-worthy hash/size for bytes that were never durable).
+TEST(CasFenceGeneration, S3StagingFinalizeAbortsWhenFenceTripsBeforeDurableCall)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openTestPool(backend);
+    ASSERT_TRUE(store->mayMutate());
+
+    const std::string staging_key = "staging/mount1/racer.tmp";
+    auto * sink_ptr = new RecordingSink(staging_key);
+    std::unique_ptr<DB::WriteBufferFromFileBase> sink(sink_ptr);
+
+    bool on_finalized_called = false;
+    auto guard = store->beginDurableRequest();
+    const uint64_t admitted_generation = store->fenceGeneration();
+
+    auto buf = std::make_unique<CaContentWriteBuffer>(
+        std::move(sink),
+        staging_key,
+        /*envelope_header=*/std::string(),
+        BlobHashAlgo::CityHash128,
+        /*buf_size=*/8192,
+        /*use_adaptive_buffer_size=*/false,
+        /*adaptive_buffer_initial_size=*/0,
+        [&](const std::string &, size_t, const std::string &) { on_finalized_called = true; },
+        std::move(guard),
+        [store, admitted_generation] { store->checkFenceOrThrow(admitted_generation); });
+
+    const std::string payload = "some bytes that must never become durable";
+    buf->write(payload.data(), payload.size());
+
+    /// The race this test targets: admission already captured `admitted_generation` above, and now the
+    /// fence trips before `finalize()` runs.
+    store->tripMountLost();
+
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&] { buf->finalize(); });
+
+    EXPECT_FALSE(on_finalized_called);
+    EXPECT_FALSE(sink_ptr->wasFinalizedForTest());
+}
+
+/// (c) `DurableRequestGuard` counting: two guards alive -> `outstandingDurableRequestsForTest() == 2`;
+/// destruction (including nested, and via an exception-unwind path) decrements back to 0.
+TEST(CasFenceGeneration, DurableRequestGuardCountsOutstandingRequests)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openTestPool(backend);
+
+    EXPECT_EQ(store->outstandingDurableRequestsForTest(), 0u);
+    {
+        auto g1 = store->beginDurableRequest();
+        EXPECT_EQ(store->outstandingDurableRequestsForTest(), 1u);
+        {
+            auto g2 = store->beginDurableRequest();
+            EXPECT_EQ(store->outstandingDurableRequestsForTest(), 2u);
+        }
+        EXPECT_EQ(store->outstandingDurableRequestsForTest(), 1u);
+    }
+    EXPECT_EQ(store->outstandingDurableRequestsForTest(), 0u);
+}
+
+TEST(CasFenceGeneration, DurableRequestGuardDecrementsOnExceptionUnwind)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openTestPool(backend);
+
+    EXPECT_EQ(store->outstandingDurableRequestsForTest(), 0u);
+    try
+    {
+        auto guard = store->beginDurableRequest();
+        EXPECT_EQ(store->outstandingDurableRequestsForTest(), 1u);
+        throw std::runtime_error("injected unwind");
+    }
+    catch (const std::runtime_error &)
+    {
+        /// expected -- the guard's destructor must have already run during unwind.
+    }
+    EXPECT_EQ(store->outstandingDurableRequestsForTest(), 0u);
+}
+
+/// (d) Happy path unchanged: an ordinary plain-object write/read/remove, and an ordinary S3-staging
+/// finalize, both succeed exactly as before when the fence stays live throughout.
+TEST(CasFenceGeneration, HappyPathPlainObjectWriteReadRemoveUnaffected)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openTestPool(backend);
+    const RootNamespace ns{"test/ns"};
+
+    store->putNamespaceFile(ns, "a", "hello");
+    const auto got = store->getNamespaceFile(ns, "a");
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(*got, "hello");
+    EXPECT_EQ(store->outstandingDurableRequestsForTest(), 0u);
+
+    store->removeNamespaceFile(ns, "a");
+    EXPECT_FALSE(store->getNamespaceFile(ns, "a").has_value());
+    EXPECT_EQ(store->outstandingDurableRequestsForTest(), 0u);
+}
+
+TEST(CasFenceGeneration, HappyPathS3StagingFinalizeUnaffected)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openTestPool(backend);
+
+    const std::string staging_key = "staging/mount1/happy.tmp";
+    auto * sink_ptr = new RecordingSink(staging_key);
+    std::unique_ptr<DB::WriteBufferFromFileBase> sink(sink_ptr);
+
+    bool on_finalized_called = false;
+    {
+        auto guard = store->beginDurableRequest();
+        const uint64_t admitted_generation = store->fenceGeneration();
+
+        auto buf = std::make_unique<CaContentWriteBuffer>(
+            std::move(sink),
+            staging_key,
+            /*envelope_header=*/std::string(),
+            BlobHashAlgo::CityHash128,
+            /*buf_size=*/8192,
+            /*use_adaptive_buffer_size=*/false,
+            /*adaptive_buffer_initial_size=*/0,
+            [&](const std::string &, size_t, const std::string &) { on_finalized_called = true; },
+            std::move(guard),
+            [store, admitted_generation] { store->checkFenceOrThrow(admitted_generation); });
+
+        const std::string payload = "unaffected happy path bytes";
+        buf->write(payload.data(), payload.size());
+        buf->finalize();
+
+        EXPECT_TRUE(on_finalized_called);
+        EXPECT_TRUE(sink_ptr->wasFinalizedForTest());
+    }
+    EXPECT_EQ(store->outstandingDurableRequestsForTest(), 0u);
+}

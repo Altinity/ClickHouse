@@ -324,6 +324,22 @@ public:
     /// The real boot clock: CLOCK_BOOTTIME in milliseconds. Static so tests can compose it.
     static uint64_t bootMs();
 
+    /// ---- fence-generation admission (rev.7 [C2]/[D1]; owned by `mount_runtime`) ----
+    /// Bumped on every `tripMountLost`/`armMountFence`. Forwarders used directly by the S3-native
+    /// staging-buffer finalize (`ContentAddressedTransaction::writeFile`) -- the durable-effect site
+    /// outside `CasPlainObjects` that needs to capture-then-recheck a fence-generation token across an
+    /// async, potentially long-running upload. `CasPlainObjects` reaches the same primitives via
+    /// injected callbacks (see its own constructor).
+    uint64_t fenceGeneration() const { return mount_runtime.fenceGeneration(); }
+    /// Throws the typed transient error (`INVALID_STATE`) unless the fence is currently held AND still
+    /// at `admitted_generation`.
+    void checkFenceOrThrow(uint64_t admitted_generation) const { mount_runtime.checkFenceOrThrow(admitted_generation); }
+    /// Admits one durable-effect operation (see `CasMountRuntime::DurableRequestGuard`); the caller
+    /// holds the returned guard for the whole request lifetime (exception-safe via RAII).
+    CasMountRuntime::DurableRequestGuard beginDurableRequest() { return CasMountRuntime::DurableRequestGuard(mount_runtime); }
+    /// Test seam: count of durable-effect operations currently admitted (0 when none is in flight).
+    uint64_t outstandingDurableRequestsForTest() const { return mount_runtime.outstandingDurableRequests(); }
+
     /// ---- write side ----
     PartWriteTxnPtr beginPartWrite(PartWriteInfo info);                          /// W-HEARTBEAT durable before return
     /// Remove a build_seq from the active set; idempotent (safe from publish/abandon/dtor). Public

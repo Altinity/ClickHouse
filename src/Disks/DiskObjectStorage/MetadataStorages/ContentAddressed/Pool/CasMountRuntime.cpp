@@ -14,6 +14,7 @@ namespace DB
 {
 namespace ErrorCodes
 {
+    extern const int INVALID_STATE;
     extern const int LOGICAL_ERROR;
 }
 }
@@ -68,6 +69,16 @@ bool CasMountRuntime::mayMutate() const
 void CasMountRuntime::tripMountLost()
 {
     mount_fence.lost.store(true, std::memory_order_release);
+    /// A durable-effect caller admitted under the incarnation this trip just ended must never conclude
+    /// the fence is fine again just because a LATER `armMountFence` happens to re-arm it (rev.7 [C2]).
+    fence_generation.fetch_add(1, std::memory_order_acq_rel);
+}
+
+void CasMountRuntime::checkFenceOrThrow(uint64_t admitted_generation) const
+{
+    if (!mayMutate() || fenceGeneration() != admitted_generation)
+        throw Exception(ErrorCodes::INVALID_STATE,
+            "mount lease not held — backing may be temporarily unreachable");
 }
 
 bool CasMountRuntime::refAppendFenceOk() const
@@ -95,6 +106,9 @@ void CasMountRuntime::armMountFence(UInt128 server_uuid, uint64_t writer_epoch, 
     mount_fence.writer_epoch = writer_epoch;
     mount_fence.deadline_boot_ms.store(deadline_boot_ms, std::memory_order_release);
     mount_fence.lost.store(false, std::memory_order_release);
+    /// A fresh lease incarnation is a fresh generation too: a durable-effect caller admitted under the
+    /// PRIOR incarnation must re-check and abort rather than ride this re-arm through (rev.7 [C2]).
+    fence_generation.fetch_add(1, std::memory_order_acq_rel);
 }
 
 uint64_t CasMountRuntime::minActive()

@@ -111,6 +111,59 @@ public:
     /// The real boot clock: `CLOCK_BOOTTIME` in milliseconds. Static so tests can compose it.
     static uint64_t bootMs();
 
+    /// ---- fence-generation admission (rev.7 [C2]/[D1]) ----
+    /// Bumped by EVERY `tripMountLost` (a fence loss) and EVERY `armMountFence` (a re-arm -- a fresh
+    /// lease incarnation, e.g. after a self-remount). A durable-effect caller captures this value once
+    /// at admission and compares it again immediately before its durable backend call: a DIFFERENT
+    /// value means the lease incarnation moved from under it since admission -- even when the fence
+    /// happens to be live again under a brand-new incarnation, the caller's write is stale and must not
+    /// land. See `checkFenceOrThrow`.
+    uint64_t fenceGeneration() const { return fence_generation.load(std::memory_order_acquire); }
+
+    /// Fence-generation admission check for every durable CAS/PUT/DELETE (the plain-object surface,
+    /// staging-buffer finalize): the caller captures `fenceGeneration()` once at admission and passes it
+    /// back here immediately before its durable backend call -- and again before EVERY conditional-retry
+    /// iteration, not just the first attempt. Throws the typed transient error (`INVALID_STATE`) when the
+    /// fence is not currently held or the generation moved since admission; the caller's write must never
+    /// reach the backend in either case.
+    void checkFenceOrThrow(uint64_t admitted_generation) const;
+
+    /// RAII marker for one durable-effect operation's admission-through-resolution lifetime.
+    /// Construction increments `outstanding_durable_requests`; destruction -- including on an
+    /// exception-unwind path -- decrements it. This is what the erasure-proof gate waits to observe at
+    /// (and staying at) zero before treating the pool prefix as fully durable-lane-quiescent ([D1]): ref
+    /// lanes settling alone is not enough, because an admitted plain-object/staging request can still be
+    /// in flight.
+    class DurableRequestGuard
+    {
+    public:
+        explicit DurableRequestGuard(CasMountRuntime & runtime_) : runtime(&runtime_)
+        {
+            runtime->outstanding_durable_requests.fetch_add(1, std::memory_order_acq_rel);
+        }
+
+        ~DurableRequestGuard()
+        {
+            if (runtime)
+                runtime->outstanding_durable_requests.fetch_sub(1, std::memory_order_acq_rel);
+        }
+
+        DurableRequestGuard(const DurableRequestGuard &) = delete;
+        DurableRequestGuard & operator=(const DurableRequestGuard &) = delete;
+
+        DurableRequestGuard(DurableRequestGuard && other) noexcept : runtime(other.runtime)
+        {
+            other.runtime = nullptr;
+        }
+        DurableRequestGuard & operator=(DurableRequestGuard &&) = delete;
+
+    private:
+        CasMountRuntime * runtime;
+    };
+
+    /// Count of durable-effect operations currently admitted (their `DurableRequestGuard` still alive).
+    uint64_t outstandingDurableRequests() const { return outstanding_durable_requests.load(std::memory_order_acquire); }
+
     /// Extends `mayMutate` with a remaining-budget check. A ref-log attempt is refused unless the
     /// current lease has room for its configured timeout and safety margin, so work is not started when
     /// it cannot plausibly finish before the fence expires.
@@ -270,6 +323,12 @@ private:
     /// mutation until a keeper supplies a real lease deadline or reports that the lease was lost. This
     /// is the gate at the ref-append mutation chokepoint.
     MountFence mount_fence;
+
+    /// Fence-generation token (rev.7 [C2]): bumped by `tripMountLost` and `armMountFence`. See
+    /// `fenceGeneration`/`checkFenceOrThrow`.
+    std::atomic<uint64_t> fence_generation{0};
+    /// Count of currently-admitted durable-effect operations (rev.7 [D1]). See `DurableRequestGuard`.
+    std::atomic<uint64_t> outstanding_durable_requests{0};
 
     /// The `writer_epoch` that most recently reclaimed an unclean predecessor, or zero if none did. This
     /// is a per-epoch high-water mark rather than a sticky boolean: ref-table recovery seals only when

@@ -1,6 +1,7 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/IMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBlobHashingWriteBuffer.h>
 #include <Disks/WriteMode.h>
 #include <Core/Defines.h>
@@ -286,6 +287,17 @@ public:
     /// it too. `cancelImpl` only cancels `object_store_sink` — it never attempts to delete the
     /// (possibly partially-written) staging object; reclaiming an orphaned staging object after a
     /// cancelled write belongs to the mount-lease sweeper, not this buffer.
+    ///
+    /// `durable_guard_`/`check_fence_before_finalize_` are the rev.7 [C2]/[D1] fence-generation
+    /// admission for this durable write (the ONLY durable backend effect of the Local-mode constructor
+    /// above is a private scratch file, so it takes neither): `durable_guard_` is admitted by the
+    /// caller at construction (this buffer's whole lifetime, cancelled-or-finalized, is the
+    /// admission-through-resolution window the outstanding-durable-request counter tracks) and
+    /// `check_fence_before_finalize_` is invoked immediately before the durable `sink->finalize()` call
+    /// in `finalizeImpl`, aborting with the typed transient error on a fence trip or re-arm since
+    /// admission. Both default empty so the existing direct-construction unit tests
+    /// (`gtest_cas_s3_staging.cpp`), which exercise the buffer mechanics without a real `CasMountRuntime`,
+    /// are unaffected.
     CaContentWriteBuffer(
         std::unique_ptr<WriteBufferFromFileBase> object_store_sink,
         std::string object_key,
@@ -294,7 +306,9 @@ public:
         size_t buf_size,
         bool use_adaptive_buffer_size,
         size_t adaptive_buffer_initial_size,
-        OnFinalized on_finalized_);
+        OnFinalized on_finalized_,
+        std::optional<Cas::CasMountRuntime::DurableRequestGuard> durable_guard_ = std::nullopt,
+        std::function<void()> check_fence_before_finalize_ = {});
 
     ~CaContentWriteBuffer() override;
 
@@ -328,6 +342,15 @@ private:
     /// unchanged); `XXH3_128` hashes with the pool's selected algo instead.
     std::unique_ptr<Cas::IBlobHashingWriteBuffer> hashing;
     bool temp_ownership_transferred = false;   /// Set after successful `on_finalized`; the destructor skips local cleanup.
+
+    /// rev.7 [C2]/[D1]: populated only by the S3-staging constructor (the Local mode's sink is private
+    /// scratch, never a durable backend effect). Held for this object's whole lifetime -- construction
+    /// through `finalizeImpl`/`cancelImpl`/destruction -- so the outstanding-durable-request counter
+    /// reflects this staging upload for as long as it can still reach the durable `sink->finalize()` call.
+    std::optional<Cas::CasMountRuntime::DurableRequestGuard> durable_guard;
+    /// Fence-generation re-check invoked immediately before `sink->finalize()` in `finalizeImpl` (S3
+    /// mode only; a no-op empty `std::function` for Local mode).
+    std::function<void()> check_fence_before_finalize;
 };
 
 /// Write buffer for bytes that live INSIDE pool metadata (a small inline part file staged into the

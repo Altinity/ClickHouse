@@ -2,6 +2,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.h>
+#include <functional>
 #include <optional>
 #include <string>
 #include <vector>
@@ -21,10 +23,26 @@ namespace DB::Cas
 /// the observed incarnation changed, so the helper re-reads the head and retries; the fixed bound
 /// prevents an unexpected continuous conflict from becoming an unbounded operation and reports
 /// `ABORTED` when it is reached.
+///
+/// Every durable write/delete on this surface is fence-generation-gated (rev.7 [C2]): `Pool` injects
+/// three callbacks that reach its `mount_runtime` (declared AFTER this member, hence constructed
+/// after it -- these callbacks capture `Pool` itself and are invoked only at runtime, post-
+/// construction, exactly like `ref_ledger`'s callbacks in `CasPool.cpp`, so referencing a
+/// not-yet-constructed sibling member through them is safe).
 class CasPlainObjects
 {
 public:
-    CasPlainObjects(Backend & backend_, const Layout & layout_) : backend(backend_), layout(layout_) {}
+    CasPlainObjects(
+        Backend & backend_, const Layout & layout_,
+        std::function<uint64_t()> fence_generation_fn_,
+        std::function<void(uint64_t)> check_fence_or_throw_fn_,
+        std::function<CasMountRuntime::DurableRequestGuard()> begin_durable_request_fn_)
+        : backend(backend_), layout(layout_)
+        , fence_generation_fn(std::move(fence_generation_fn_))
+        , check_fence_or_throw_fn(std::move(check_fence_or_throw_fn_))
+        , begin_durable_request_fn(std::move(begin_durable_request_fn_))
+    {
+    }
 
     /// Stores the raw bytes under the namespace's `_files/` prefix. Existing files are replaced
     /// conditionally using the incarnation observed by `Backend::head`; a storage failure or an
@@ -65,17 +83,27 @@ public:
 private:
     /// Creates or conditionally replaces one raw object. The method re-heads after a conditional
     /// conflict and throws `ABORTED` after the bounded retry loop cannot establish a stable token.
+    /// Fence-generation-gated (rev.7 [C2]): admits one `DurableRequestGuard` and captures the fence
+    /// generation for the call's whole retry loop; every iteration re-checks it immediately before its
+    /// durable PUT.
     void casPutObject(const String & full_key, const String & bytes);
 
-    /// Reads one raw object by its complete backend key and returns `nullopt` when it is absent.
+    /// Reads one raw object by its complete backend key and returns `nullopt` when it is absent. A read,
+    /// not a durable-effect operation -- NOT fence-gated (rev.7 [C2] scopes the gate to durable writes).
     std::optional<String> casGetObject(const String & full_key);
 
     /// Removes one raw object by exact token. Absence is a successful no-op; a token mismatch causes
-    /// a fresh head and retry, while a bounded retry failure throws `ABORTED`.
+    /// a fresh head and retry, while a bounded retry failure throws `ABORTED`. Fence-generation-gated
+    /// the same way as `casPutObject`.
     void casRemoveObject(const String & full_key);
 
     Backend & backend;
     const Layout & layout;
+
+    /// ---- fence-generation admission (injected by `Pool`; see the class doc comment) ----
+    std::function<uint64_t()> fence_generation_fn;
+    std::function<void(uint64_t)> check_fence_or_throw_fn;
+    std::function<CasMountRuntime::DurableRequestGuard()> begin_durable_request_fn;
 };
 
 }

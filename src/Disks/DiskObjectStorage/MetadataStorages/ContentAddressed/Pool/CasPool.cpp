@@ -83,8 +83,16 @@ Pool::Pool(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
     /// `BlobRef` (algo + digest) directly, so the constructor takes only the pool prefix.
     , pool_layout(config.pool_prefix)
     /// Plain-object surface component: binds to this Pool's own backend + layout (declared after
-    /// both, so this reference-holding member is constructed last and destroyed first).
-    , plain_objects(*pool_backend, pool_layout)
+    /// both, so this reference-holding member is constructed last and destroyed first) plus three
+    /// fence-generation callbacks reaching `mount_runtime` (declared AFTER `plain_objects`, hence
+    /// constructed after it -- these callbacks capture `this` and are invoked only at runtime,
+    /// post-construction, exactly like `ref_ledger`'s callbacks below, so referencing a
+    /// not-yet-constructed sibling member through them is safe).
+    , plain_objects(
+          *pool_backend, pool_layout,
+          [this] { return mount_runtime.fenceGeneration(); },
+          [this] (uint64_t gen) { mount_runtime.checkFenceOrThrow(gen); },
+          [this] { return CasMountRuntime::DurableRequestGuard(mount_runtime); })
     /// Manifest reader component: backend/layout/meta by reference + the event-sink reference. The
     /// sink is installed by the factory before writable mounting starts. Owns the decode cache,
     /// built from the same config bytes the Pool ctor used before.

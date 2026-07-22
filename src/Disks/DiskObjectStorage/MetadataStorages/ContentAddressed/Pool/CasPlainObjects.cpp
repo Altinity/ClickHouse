@@ -30,9 +30,19 @@ void CasPlainObjects::casPutObject(const String & full_key, const String & bytes
     /// concurrently appends to the same key — a losing retry would overwrite the winner's bytes with a
     /// stale, pre-conflict payload (a lost update). Implement a real `casAppendObject` (re-reading the
     /// base content, not just the token, inside the loop) before adding any concurrent appender.
+    ///
+    /// rev.7 [C2]: this is a durable-effect operation for its whole retry loop -- one `DurableRequestGuard`
+    /// spans admission through return/throw, and the fence generation captured at admission is re-checked
+    /// immediately before EVERY durable PUT below, not just the first attempt. A mismatch (the mount lease
+    /// was lost, or re-armed under a fresh incarnation, since admission) aborts with the typed transient
+    /// error before the backend is ever touched.
+    auto durable_guard = begin_durable_request_fn();
+    const uint64_t admitted_generation = fence_generation_fn();
+
     for (size_t attempt = 0; attempt < MAX_CAS_ATTEMPTS; ++attempt)
     {
         HeadResult head = backend.head(full_key);
+        check_fence_or_throw_fn(admitted_generation);
         if (!head.exists)
         {
             if (backend.putIfAbsent(full_key, bytes).outcome == PutOutcome::Done)
@@ -61,11 +71,18 @@ void CasPlainObjects::casRemoveObject(const String & full_key)
     /// Delete only the incarnation observed by the preceding head. A token mismatch leaves the
     /// replacement untouched and is retried against a fresh observation; absence is a successful
     /// no-op.
+    ///
+    /// rev.7 [C2]/[D1]: same fence-generation admission as `casPutObject` -- one `DurableRequestGuard`
+    /// for the whole call, the admitted generation re-checked immediately before every durable delete.
+    auto durable_guard = begin_durable_request_fn();
+    const uint64_t admitted_generation = fence_generation_fn();
+
     for (size_t attempt = 0; attempt < MAX_CAS_ATTEMPTS; ++attempt)
     {
         const HeadResult head = backend.head(full_key);
         if (!head.exists)
             return;
+        check_fence_or_throw_fn(admitted_generation);
         const DeleteOutcome outcome = backend.deleteExact(full_key, head.token);
         if (outcome.kind == DeleteOutcome::Kind::Deleted || outcome.kind == DeleteOutcome::Kind::NotFound)
             return;
