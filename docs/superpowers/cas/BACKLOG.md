@@ -610,3 +610,6 @@ implemented is net-negative — disable/quarantine rather than fix one virtual a
   forward on `StorageProxy` also changes `StorageTableFunctionProxy` semantics (a table-function proxy now
   answers the mutation-possibility check from its nested storage rather than the `IStorage` default) — sound,
   but call it out explicitly (codex F5).
+
+## [C2] defense-in-depth: fence-generation check on resurrectStaged + putOverwrite {#c2-resurrect-putoverwrite-fence-check}
+(2026-07-23, from rev.7 Task 4b review) The condemned-displacement branches of `PartWriteTxn::uploadFromSource` call `resurrectStaged`/`putOverwrite` raw — zero fence coupling. SAFETY already holds (the subsequent ref publish is fence-coupled → post-trip displaced blob = unreferenced debris; never-revive invariant intact — writer re-uploads its OWN bytes under a fresh incarnation_tag; putOverwrite is If-Match). Residual = one wasted post-trip write + a GC-liveness nuisance (fresh token dodges a queued exact-token condemned delete → one extra round). Adding `checkFenceOrThrow` there closes [C2] uniformly. SCOPE EXACTLY these two calls; do NOT chase the debris deletes (`cleanupStagedManifestDebrisBestEffort`'s `deleteExact`, `cleanupPendingTempFiles`) — both proven structurally incarnation-safe (build-scoped manifest keys / per-txn random staging keys).
