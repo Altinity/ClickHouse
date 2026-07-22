@@ -40,11 +40,15 @@ gaps:
 
 ## Non-goals / constraints
 
-- **Do not touch upstream / generic code, or minimize it to nothing.** No disk eviction from
+- **Minimize the touch of upstream / generic code.** No disk eviction from
   `DiskSelector`/`StoragePolicySelector` (that needs new generic `erase` surface across two independent
-  caches + an audit of every `getDisksMap()`/`getPoliciesMap()` snapshot holder). Everything here lives
-  in `ContentAddressed*` + the already-sanctioned `SYSTEM`-verb family pattern (parser/AST/AccessType/
-  interpreter), which is the same generic surface the existing verbs already extend.
+  caches + an audit of every `getDisksMap()`/`getPoliciesMap()` snapshot holder). The design lives in
+  `ContentAddressed*` + the already-sanctioned `SYSTEM`-verb family pattern (parser/AST/AccessType/
+  interpreter). The **one** deliberate new generic-code edit is the table-bind hook (§2): a single
+  CA-gated `ensureMountedIfContentAddressed(disk)` call in `MergeTreeData`'s existing table-construction
+  disk loop. It is unavoidable there and only there — a CA-internal hook cannot distinguish a table
+  binding a disk from an all-disk sweep probing it (both go through the same benign methods), so the
+  distinction must come from the caller. It is one delegating line, a no-op for non-CA disks.
 - No cluster-wide pool lock is introduced. `ON CLUSTER` remains the way to act pool-wide.
 
 ## Design
@@ -59,10 +63,24 @@ to a not-`Mounted` disk does, split by surface:
   `getStorageObjectsIfExist` return "absent/empty" on a not-`Mounted` disk and **never auto-mount**.
   This is what keeps a server-wide sweep (`DROP TABLE` finalizer, `system.remote_data_paths`, …) from
   spuriously re-mounting every `Dormant` CA disk.
-- **Real-work operations auto-mount (new):** the content/size/mutation surface — `getStorageObjects`
-  (non-`IfExist`), `getFileSize`, `getLastModified`, `readFile`, `createTransaction` and every mutating
-  entry point, plus the admin GC/FSCK round entry points — first ensure the disk is `Mounted`, then
-  proceed.
+- **Table-bind mounts (new): an explicit hook where the table binds its disks.** The one place that
+  knows "a table is about to use this disk" (as opposed to "a sweep is probing all disks") is the
+  *caller* — `MergeTreeData` at table construction. A CA-internal hook cannot make this distinction: the
+  same benign method (`getStorageObjectsIfExist`, `iterateDirectory`) serves both an all-disk sweep
+  (must stay absent) and an ATTACH's `format_version`/parts read (must see real state), and the method
+  cannot tell them apart. So the mount is triggered by the caller: `MergeTreeData`, before it reads any
+  disk metadata (in `initializeDirectoriesAndFormatVersion`, whose disk loop already runs for both
+  CREATE and ATTACH, strictly before the `format_version` read and `loadDataParts`), calls one
+  CA-gated helper per disk — `ContentAddressedMetadataStorage::ensureMountedIfContentAddressed(disk)` —
+  a no-op for non-CA disks, and for a `Dormant` CA disk it re-mounts it. This is the single sanctioned
+  touch of generic code; it is honest ("the table readies its disks") and robust (independent of which
+  metadata call happens first).
+- **Everything else on a not-`Mounted` disk fails closed** (`INVALID_STATE`) as today — no per-op
+  auto-mount. Safe and sufficient because the **live-table guard** keeps a *bound* disk `Mounted` (a
+  disk with any live table can never be `Dormant`), so an ordinary read/write never lands on a `Dormant`
+  disk; the only `Dormant`-reachable callers are (a) a table binding it — handled by the table-bind hook
+  above, for CREATE *and* ATTACH — and (b) admin ops on a table-less disk, which the operator brings up
+  with an explicit `MOUNT` (by name or inline `disk(...)` — §4).
 
 **Why this is safe (the codex blockers that killed rev.1's lazy remount are gone):** the live-table
 guard forbids `UNMOUNT` while any live table references the disk, so **a `Dormant` disk has no live
@@ -103,26 +121,35 @@ scheduler (re)creation on `!cas_store` only; they route through `ensureMounted()
 on `mount_state == Mounted`) so they can never construct a scheduler during `Unmounting`. This is the
 goal-1 quiescence fix.
 
-**Where the hook sits — the real-work *entry points*, not `poolAccess()`.** `ensureMounted()` is
-called at the TOP of the public real-work methods, before they take any CA mutex or call `store()`:
-`createTransaction()` (covers every write — `CREATE TABLE`'s `format_version.txt` write, every
-`INSERT` part write, mutations), the real read getters (`getStorageObjects` non-`IfExist`,
-`getFileSize`, `getLastModified`, the read-buffer entries), and the GC/FSCK admin entries. It is NOT
-placed inside `poolAccess()`/`store()` — those run under `pointer_mutex`, and taking the outer
-`lifecycle_mutex` there is the exact inversion that deadlocked rev.1.
+**Where the hook sits — `MergeTreeData` table construction, delegating to a CA helper.** In
+`MergeTreeData::initializeDirectoriesAndFormatVersion`, whose `for (const auto & disk : getDisks())`
+loop already runs for both CREATE and ATTACH (`need_create_directories = true`, trace-verified as the
+unconditional header default) strictly before the `format_version.txt` `readFileIfExists` and
+`loadDataParts`, add one CA-gated call per disk BEFORE the reads:
+`ContentAddressedMetadataStorage::ensureMountedIfContentAddressed(disk)` (`tryFromDisk(disk)` → if CA,
+`ensureMounted()`; a no-op otherwise). `ensureMounted()` runs the fast-path/`lifecycle_mutex` logic
+above holding no CA mutex, so there is no lock inversion (rev.1 deadlocked only because it hung the
+mount inside `store()` under `pointer_mutex`). This is the sole edit to generic code — one honest line
+that says "ready the table's disks," not a CA-internal guess keyed off which metadata call happens to
+come first.
 
-**Verified against the CREATE TABLE path (trace, 2026-07-22).** On a fresh table on a `Dormant` disk:
-the database layer's existence check is a plain local `fs::exists` (never touches the CAS disk);
-`disk->createDirectories(...)` is a CAS **no-op** (content-addressed storage has no real directories —
-`ContentAddressedTransaction::createDirectory` is empty and its `commit()` iterates zero parts, so it
-never reaches `store()`); the one benign probe on the path,
-`readFileIfExists("format_version.txt")` → `getStorageObjectsIfExist`, correctly returns *absent* for a
-fresh table and does NOT short-circuit — the code proceeds into the write branch; the **first real-work
-op is the `format_version.txt` write** (`MergeTreeData::initializeDirectoriesAndFormatVersion`), which
-goes through a transaction → `store()`. Hanging `ensureMounted()` on `createTransaction()` therefore
-re-mounts a `Dormant` disk exactly at that first write, and `CREATE TABLE` (and `INSERT`, whose part
-writes hit the same gate — `reserve()` does not touch `poolAccess()`) succeeds transparently. No benign
-probe misdirects the path.
+**Why the caller must do it, and why it is correct for CREATE and ATTACH:**
+
+- **CREATE** on a `Dormant` husk: the hook mounts it, then the fresh table's `format_version` read is
+  genuinely absent (new uuid) and the write proceeds on the mounted disk.
+- **ATTACH** on a `Dormant` disk: the hook mounts it **before** the `format_version` read, so the read
+  returns the REAL on-disk value (not the benign-absent `std::nullopt` that would otherwise force the
+  write branch to clobber `format_version` with a schema-derived value), and `loadDataParts`'s parts
+  `iterateDirectory` sees the REAL parts (not a benign-empty listing that would silently attach an empty
+  table). This is a real fix, not just convenience: today ATTACH-on-`Dormant` is safe only by the
+  fragile accident that the `format_version` write always throws `INVALID_STATE` before `loadDataParts`
+  runs, and `loadDataParts` has no independent mount check — the table-bind hook makes the safety
+  intentional.
+
+The GC/FSCK admin entry points additionally call `ensureMounted()` at their top so a round issued
+during an in-flight `UNMOUNT` gets `INVALID_STATE` rather than resurrecting a scheduler (the goal-1
+race). For a table-less `Dormant` disk this is not a convenience auto-mount — the operator brings it up
+with an explicit `MOUNT` first.
 
 ### 3. `UNMOUNT` — unconditional full quiesce → inert `Dormant` husk
 
@@ -263,7 +290,8 @@ side-effects," not "eject").
 ## Rollout / definition of done
 
 - All of the above land as `ContentAddressed*` changes plus the sanctioned `SYSTEM`-verb family
-  extensions (parser/AST/AccessType/interpreter). No `DiskSelector`/`StoragePolicySelector`/generic-disk
-  edits.
+  extensions (parser/AST/AccessType/interpreter), plus exactly ONE generic edit: the CA-gated
+  table-bind hook line in `MergeTreeData::initializeDirectoriesAndFormatVersion` (§2). No
+  `DiskSelector`/`StoragePolicySelector`/generic-disk-registry edits.
 - CI: `Unit tests (asan_ubsan/tsan)` stay green; the `amd_asan_ubsan/amd_debug/amd_tsan` stateless lanes
   clear `05020` and the CA family.
