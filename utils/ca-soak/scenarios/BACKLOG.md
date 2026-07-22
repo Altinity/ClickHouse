@@ -2968,3 +2968,30 @@ campaign. The CAS gtest battery is green. No CAS action; if pursued, it belongs 
 
 ## OPTIMIZATION OPPORTUNITY — manifestAlreadyOwned linear value-scan is the residual admits/apply hotspot — Logged 2026-07-21 ~14:3x
 The 07-20 admits() O(1) rewrite (b5f448e9b41 + 13ab814869c, IN the attempt-4 binary) killed the full re-ENCODE; the f1f11 attempt-4 CPU trace shows the residual: `RefCowMap::const_iterator::operator++` now lives in `manifestAlreadyOwned` (CasRefProtocol.cpp:24-33) — a LINEAR scan of the whole committed+precommit state per add-precommit op, guarded by a comment ("the state machine is not the hot path") that predates the encode fix and is now stale. Hit 3 ways: real apply, admits() preview (per state-growing op per flush batch), and — largest — replay paths (`applyRefLogTxn`: recovery, GC fold, orphan-sweep view build — e.g. round-3's 97k-txn fold pays the scan per historical add). Fix direction: incremental reverse index (manifest_ref -> owner) on RefTableState maintained in applyOpInPlace's four arms — the exact pattern of the body-byte counters commit; BM_Admits benchmark suite already exists to gate it. Severity: perf-only (correctness unaffected).
+
+## KNOWN ISSUE (write-path design scope, MEDIUM) — bulk partition operations (`REPLACE`/`MOVE PARTITION`, `ATTACH`) commit part disk-transactions one at a time and get no CAS commit batching — Logged 2026-07-22
+The phased multi-commit design (specs/2026-07-22, second revision after the Codex `BLOCKING FLAW`
+review) deliberately scopes to the `MergeTreeData::Transaction::renameParts` seam, where the
+production topology is N independent single-part disk transactions (INSERT). Bulk partition
+operations do NOT benefit:
+- `REPLACE PARTITION` / `MOVE PARTITION TO TABLE` pass `ClonePartParams{.txn = ...}` (a MergeTree
+  transaction, NOT a shared disk transaction — `StorageMergeTree.cpp:2785`, `:2967`); each
+  `cloneAndLoadDataPart`/`freeze` creates and commits its OWN disk transaction before `renameParts`
+  runs (`DataPartStorageOnDiskBase.cpp:541`, `:603`), so per-part CAS commits (manifest PUT +
+  precommit/promote ref round-trips) stay serial there.
+- The `external_transaction` mechanism (`IDataPartStorage.h:263`) that WOULD carry one shared
+  N-part disk transaction is only exercised by detached-part cloning (`IMergeTreeDataPart.cpp:2444`)
+  and synthetic tests; production bulk paths never use it.
+Improvement options (any future effort should re-verify these lines first):
+1. **Thread a shared `external_transaction` through the bulk clone paths** so all cloned parts stage
+   into ONE disk transaction committed at `renameParts` — then the multi-part path of
+   `ContentAddressedTransaction::commit` (and any phased engine) batches naturally. Upstream-heavy:
+   touches `cloneAndLoadDataPart`/`freeze` ownership and the caller-owns-commit contract.
+2. **Defer clone-transaction commits to the seam**: keep per-part transactions but let bulk callers
+   hand them uncommitted to the same batched-commit seam INSERT uses (same topology as INSERT, no
+   shared-transaction rework). Requires the clone paths to stop committing inside `freeze`.
+3. **CAS-internal only**: leave upstream untouched; rely on the ref-ledger's concurrency batching by
+   running bulk clones on a thread pool so their per-part commits overlap (opportunistic batching
+   engages with concurrency, batch size 1.0 only when serial).
+Not scheduled; revisit if bulk-partition latency on CAS is ever measured as a problem (INSERT was
+the measured 7.6× case).
