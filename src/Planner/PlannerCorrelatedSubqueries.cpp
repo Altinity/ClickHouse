@@ -544,6 +544,10 @@ QueryPlan buildLogicalJoin(
     output_columns.insert_range(output_columns.cend(), rhs_plan_header->getNames());
     output_columns.push_back(correlated_subquery.action_node_name);
 
+    ColumnsWithTypeAndName output_columns_and_types;
+    output_columns_and_types.insert_range(output_columns_and_types.cend(), rhs_plan_header->getColumnsWithTypeAndName());
+    output_columns_and_types.emplace_back(lhs_plan_header->getByName(correlated_subquery.action_node_name));
+
     const auto & settings = planner_context->getQueryContext()->getSettingsRef();
 
     if (settings[Setting::correlated_subqueries_default_join_kind] == DecorrelationJoinKind::LEFT)
@@ -552,10 +556,6 @@ QueryPlan buildLogicalJoin(
         std::swap(lhs_plan_header, rhs_plan_header);
         std::swap(get_lhs_column_name, get_rhs_column_name);
     }
-
-    ColumnsWithTypeAndName output_columns_and_types;
-    output_columns_and_types.insert_range(output_columns_and_types.cend(), lhs_plan_header->getColumnsWithTypeAndName());
-    output_columns_and_types.emplace_back(rhs_plan_header->getByName(correlated_subquery.action_node_name));
 
     JoinExpressionActions join_expression_actions(
         lhs_plan_header->getColumnsWithTypeAndName(),
