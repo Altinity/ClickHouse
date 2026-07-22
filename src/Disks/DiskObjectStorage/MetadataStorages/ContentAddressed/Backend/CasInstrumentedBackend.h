@@ -92,6 +92,16 @@ public:
     void checkPoolPreconditions() override { inner->checkPoolPreconditions(); }
     void checkConditionalWriteSingleAttemptSupport() override { inner->checkConditionalWriteSingleAttemptSupport(); }
 
+    /// Typed erasure-evidence probes are diagnostic/authoritative reads, not routine storage
+    /// operations — deliberately uninstrumented (no ProfileEvent), like the capability checks above.
+    /// MUST still be forwarded explicitly: `Backend::probeSentinelRaw`/`probePrefixEmptinessRaw`'s
+    /// generic default derives its classification from THIS object's own `head`/`get`/`list` (virtual
+    /// dispatch would otherwise resolve back to `InstrumentedBackend`'s plain, non-typed overrides
+    /// above), silently discarding whatever sharper container/permission evidence the wrapped `inner`
+    /// backend (e.g. `ObjectStorageBackend`'s S3/Local classification) is able to provide.
+    SentinelProbeResult probeSentinelRaw(const String & key) override { return inner->probeSentinelRaw(key); }
+    SentinelProbeResult probePrefixEmptinessRaw(const String & prefix) override { return inner->probePrefixEmptinessRaw(prefix); }
+
     /// Delegate the read and count it after the inner call succeeds or returns absent. Exceptions
     /// propagate unchanged and therefore do not produce a separate outcome event.
     std::optional<GetResult> get(const String & key, Range range) override

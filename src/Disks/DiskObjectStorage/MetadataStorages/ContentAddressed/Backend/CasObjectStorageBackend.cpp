@@ -744,6 +744,15 @@ SentinelProbeResult ObjectStorageBackend::probeSentinelRaw(const String & key)
             /// `nullopt` before we get a chance to classify the S3 error. Its result is discarded here;
             /// only whether (and how) it throws matters — the body comes from `get` below.
             object_storage->getObjectMetadata(key, /*with_tags=*/false);
+
+            /// The raw HEAD proved the key present. Delegate the body read to the existing `get`, which
+            /// already HEADs again and reads — an extra round trip this authoritative, low-rate probe can
+            /// afford, in exchange for reusing its already-correct HEAD→GET race handling. Kept INSIDE
+            /// this try: a transient failure here must also classify Indeterminate, never escape unclassified.
+            auto g = get(key);
+            if (!g)
+                return {ProbeOutcome::KeyAbsent, std::nullopt};   /// raced a deletion right after the raw HEAD
+            return {ProbeOutcome::Present, std::move(g->bytes)};
         }
 #if USE_AWS_S3
         catch (const S3Exception & e)
@@ -751,6 +760,15 @@ SentinelProbeResult ObjectStorageBackend::probeSentinelRaw(const String & key)
             switch (e.getS3ErrorCode())
             {
                 case Aws::S3::S3Errors::NO_SUCH_KEY:
+                    return {ProbeOutcome::KeyAbsent, std::nullopt};
+                case Aws::S3::S3Errors::RESOURCE_NOT_FOUND:
+                    /// A HEAD response carries no body, so the SDK cannot parse a `NoSuchKey` `<Code>`
+                    /// and instead derives this generic code straight from the HTTP 404 status (see
+                    /// `isNotFoundError`, `src/IO/S3/getObjectInfo.cpp`) — this is what a REAL S3 HEAD
+                    /// on an absent key actually throws. The container/key distinction is deliberately
+                    /// NOT attempted here (a bodyless 404 cannot carry it); that discriminator lives in
+                    /// `probePrefixEmptinessRaw` below, whose LIST error responses DO have a parseable
+                    /// body and therefore a real `NO_SUCH_BUCKET` code.
                     return {ProbeOutcome::KeyAbsent, std::nullopt};
                 case Aws::S3::S3Errors::NO_SUCH_BUCKET:
                     return {ProbeOutcome::ContainerAbsent, std::nullopt};
@@ -767,14 +785,6 @@ SentinelProbeResult ObjectStorageBackend::probeSentinelRaw(const String & key)
         {
             return {ProbeOutcome::Indeterminate, std::nullopt};
         }
-
-        /// The raw HEAD proved the key present. Delegate the body read to the existing `get`, which
-        /// already HEADs again and reads — an extra round trip this authoritative, low-rate probe can
-        /// afford, in exchange for reusing its already-correct HEAD→GET race handling.
-        auto g = get(key);
-        if (!g)
-            return {ProbeOutcome::KeyAbsent, std::nullopt};   /// raced a deletion right after the raw HEAD
-        return {ProbeOutcome::Present, std::move(g->bytes)};
     }
 
     /// EmulatedSingleProcess (Local): stat the configured container directory FIRST — `emuExists`/`get`

@@ -4,6 +4,7 @@
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInstrumentedBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasSentinelProbe.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
@@ -29,6 +30,21 @@ using namespace DB::Cas;
 
 namespace
 {
+
+/// `Mode::Native` uses a key VERBATIM as the physical `LocalObjectStorage` path — no root-prefix
+/// mapping the way `EmulatedSingleProcess`'s `emuPath` does (`LocalObjectStorage::writeObject`/
+/// `readObject` pass `object.remote_path` straight through). A bare relative key like `"some/key"`
+/// would therefore resolve relative to the TEST PROCESS's cwd rather than the backend's own unique
+/// temp root, leaking a real file on disk and risking cross-test contamination if another test
+/// happens to probe the same literal key against a real (non-faked) filesystem check. Every
+/// Native-mode test below anchors its key under the backend's own root instead.
+String nativeKeyUnder(const DB::ObjectStoragePtr & storage, const String & suffix)
+{
+    String root = storage->getCommonKeyPrefix();
+    while (!root.empty() && root.back() == '/')
+        root.pop_back();
+    return root + "/" + suffix;
+}
 
 /// A Backend decorator whose head/get/list all throw an untyped runtime error when armed — modelling
 /// a backend with no sharper evidence than "something went wrong" (a network timeout, a 5xx, an
@@ -116,6 +132,24 @@ TEST(CasSentinelProbe, ContainerDirectoryRemovedReturnsContainerAbsent)
     const auto result = probeSentinel(backend, "k");
     EXPECT_EQ(result.outcome, ProbeOutcome::ContainerAbsent);
     EXPECT_FALSE(result.body.has_value());
+}
+
+/// `ObjectStorageBackend::Mode::Native` over a plain `LocalObjectStorage` (the same construction
+/// `gtest_cas_backend.cpp`'s Native-mode tests use to exercise the Native code path without a live S3
+/// endpoint): a present key must probe `Present` and carry the materialized body via the raw-HEAD ->
+/// `get` path, not just the EmulatedSingleProcess path already covered above.
+TEST(CasSentinelProbe, NativePresentKeyReturnsPresentWithBody)
+{
+    auto storage = tests::makeLocalObjectStorageForTest();
+    ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
+    const String key = nativeKeyUnder(storage, "some/key");
+
+    ASSERT_EQ(backend.putIfAbsent(key, "native body").outcome, PutOutcome::Done);
+
+    const auto result = probeSentinel(backend, key);
+    EXPECT_EQ(result.outcome, ProbeOutcome::Present);
+    ASSERT_TRUE(result.body.has_value());
+    EXPECT_EQ(*result.body, "native body");
 }
 
 /// (d) A backend forced to throw a transport error must probe Indeterminate — NEVER KeyAbsent, even
@@ -214,7 +248,20 @@ TEST(CasSentinelProbe, NativeClassifiesNoSuchKeyAsKeyAbsent)
     storage->throwOnGetObjectMetadata(Aws::S3::S3Errors::NO_SUCH_KEY);
     ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
 
-    EXPECT_EQ(probeSentinel(backend, "some/key").outcome, ProbeOutcome::KeyAbsent);
+    EXPECT_EQ(probeSentinel(backend, nativeKeyUnder(storage, "some/key")).outcome, ProbeOutcome::KeyAbsent);
+}
+
+/// A real S3 HEAD's 404 has no response body, so the SDK cannot parse a `NoSuchKey` `<Code>` and
+/// instead derives `RESOURCE_NOT_FOUND` straight from the HTTP status (see `isNotFoundError`,
+/// `src/IO/S3/getObjectInfo.cpp`) — THIS is the code a genuinely absent key throws on real S3, not
+/// `NO_SUCH_KEY`. Without classifying it, every real-S3 absence would be `Indeterminate` forever.
+TEST(CasSentinelProbe, NativeClassifiesResourceNotFoundAsKeyAbsent)
+{
+    auto storage = std::static_pointer_cast<ThrowingS3MetadataObjectStorage>(makeThrowingS3MetadataStorageForTest());
+    storage->throwOnGetObjectMetadata(Aws::S3::S3Errors::RESOURCE_NOT_FOUND);
+    ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
+
+    EXPECT_EQ(probeSentinel(backend, nativeKeyUnder(storage, "some/key")).outcome, ProbeOutcome::KeyAbsent);
 }
 
 TEST(CasSentinelProbe, NativeClassifiesNoSuchBucketAsContainerAbsent)
@@ -223,7 +270,7 @@ TEST(CasSentinelProbe, NativeClassifiesNoSuchBucketAsContainerAbsent)
     storage->throwOnGetObjectMetadata(Aws::S3::S3Errors::NO_SUCH_BUCKET);
     ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
 
-    EXPECT_EQ(probeSentinel(backend, "some/key").outcome, ProbeOutcome::ContainerAbsent);
+    EXPECT_EQ(probeSentinel(backend, nativeKeyUnder(storage, "some/key")).outcome, ProbeOutcome::ContainerAbsent);
 }
 
 TEST(CasSentinelProbe, NativeClassifiesAccessDeniedAsAccessDenied)
@@ -232,7 +279,7 @@ TEST(CasSentinelProbe, NativeClassifiesAccessDeniedAsAccessDenied)
     storage->throwOnGetObjectMetadata(Aws::S3::S3Errors::ACCESS_DENIED);
     ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
 
-    EXPECT_EQ(probeSentinel(backend, "some/key").outcome, ProbeOutcome::AccessDenied);
+    EXPECT_EQ(probeSentinel(backend, nativeKeyUnder(storage, "some/key")).outcome, ProbeOutcome::AccessDenied);
 }
 
 TEST(CasSentinelProbe, NativeClassifiesUnmodeledErrorAsIndeterminate)
@@ -241,7 +288,7 @@ TEST(CasSentinelProbe, NativeClassifiesUnmodeledErrorAsIndeterminate)
     storage->throwOnGetObjectMetadata(Aws::S3::S3Errors::SERVICE_UNAVAILABLE);
     ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
 
-    EXPECT_EQ(probeSentinel(backend, "some/key").outcome, ProbeOutcome::Indeterminate);
+    EXPECT_EQ(probeSentinel(backend, nativeKeyUnder(storage, "some/key")).outcome, ProbeOutcome::Indeterminate);
 }
 
 /// probePrefixEmptiness's Native/S3 path goes through ListObjectsV2 (`IObjectStorage::listObjects`),
@@ -262,6 +309,24 @@ TEST(CasSentinelProbe, NativePrefixEmptinessClassifiesAccessDeniedAsAccessDenied
     ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
 
     EXPECT_EQ(probePrefixEmptiness(backend, "pool_root/").outcome, ProbeOutcome::AccessDenied);
+}
+
+/// Production wiring (`Pool::open`) ALWAYS wraps the real backend in `InstrumentedBackend` before
+/// anything calls it. `InstrumentedBackend` must forward `probeSentinelRaw` to `inner`, not fall
+/// through to `Backend::probeSentinelRaw`'s generic head/get-based default — the default would derive
+/// its answer from THIS object's own (correctly delegating, but non-typed) `head`/`get` overrides,
+/// silently discarding `ObjectStorageBackend`'s real S3-error classification. NO_SUCH_BUCKET is chosen
+/// deliberately: the generic default cannot produce `ContainerAbsent` at all (it only ever returns
+/// Present/KeyAbsent/Indeterminate), so this test can ONLY pass if the typed override is actually
+/// reached through the wrapper.
+TEST(CasSentinelProbe, InstrumentedBackendForwardsToInnerClassification)
+{
+    auto storage = std::static_pointer_cast<ThrowingS3MetadataObjectStorage>(makeThrowingS3MetadataStorageForTest());
+    storage->throwOnGetObjectMetadata(Aws::S3::S3Errors::NO_SUCH_BUCKET);
+    auto inner = std::make_shared<ObjectStorageBackend>(storage, ObjectStorageBackend::Mode::Native);
+    InstrumentedBackend instrumented(inner);
+
+    EXPECT_EQ(probeSentinel(instrumented, nativeKeyUnder(storage, "some/key")).outcome, ProbeOutcome::ContainerAbsent);
 }
 
 #endif
