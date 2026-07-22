@@ -1,191 +1,211 @@
-# CAS disk: identity-validated recovery + honest throw-on-not-live (rev.2)
+# CAS disk lifecycle rev.3: throw-when-uncertain, truth-when-proven (`Vanished`)
 
-Status: **DESIGN rev.2 — for review.** Narrowed after a codex gpt-5.6-sol (high) adversarial review of rev.1
-found 3 P0 blockers. Supersedes the whole runtime-reuse lifecycle line.
+Status: **DESIGN rev.3 — for review.** Rewrites rev.2 in place (git history holds rev.1/rev.2).
 
-**What changed rev.1 → rev.2 (per the codex review):**
-- **Auto-recovery is NOT transparent-and-safe (rev.1 P0 #1/#2).** The existing self-remount (`tryRemountOnce`,
-  `CasPool.cpp:640-725`) re-claims owner on an *empty* subtree — so `rm -rf` under a mount makes it **bootstrap
-  a fresh empty pool and serve it as healthy** (silent empty table, worse than a throw). rev.2's core is the fix
-  for this: **identity-validated recovery** — validate `_pool_meta` before re-arming; missing ⇒ fail-loud. The
-  fresh-incarnation recovery (new writer epoch etc.) **already exists** and is **kept**; rev.1 merely misdescribed
-  it as "keeper re-acquires the old lease" — it does not.
-- **Runtime `STOP`/`START` DROPPED (rev.1 P0 #3).** Safe STOP needs a process-wide disk-use RAII barrier
-  (backups/reservations/buffers/non-MergeTree engines hold untracked `DiskPtr`s); out of scope. Only
-  `GC STOP/START` remains.
-- **Part 6 rollback = throw everywhere, "let it break" (owner decision).** An operation that touches a not-live
-  CA disk fails, like touching an unmounted Linux filesystem. The **one** exception is the `DROP` finalizer
-  fan-out (§5): it sweeps *all* disks for *every* table, so an unguarded throw wedges `DROP` of *unrelated*
-  tables server-wide — that is not "let it break", it is one dead disk breaking things unrelated to it, and it
-  re-breaks the test suite. That sweep gets minimal **typed** per-disk isolation (not benign-absent).
-- **Access gate uses `Pool::mayMutate`** (local, atomic, TTL-hysteretic) — not `system.content_addressed_mounts`
-  (remote I/O per call). No availability regression: a single slow renewal does not fence (rev.1 P0 (a) cleared).
-- **Read-only CA disks have no lease** (rev.1 P1 #8): their access is not lease-gated — spelled out in §3.
+**The rev.2 → rev.3 change, in one sentence:** stop trying to fix the not-live-disk problem at the *callers*
+(rev.1's typed-catch guard, the eject idea) — the correct behavior depends **only on the disk's own state**,
+so encode it there: **transient-not-live ⇒ throw to everyone; positively-proven-erased (`Vanished`) ⇒ answer
+the truth (absent/empty/no-op) to everyone**. The own-vs-foreign disk discriminator, the DROP-finalizer guard,
+the `IStorage`→disks contract, and registry eviction all **dissolve**. Generic/upstream code changes: **zero**.
 
-Supersedes: `2026-07-22-cas-disk-self-quiesce-simplification-design.md` (Path B, blocked),
-`2026-07-22-cas-disk-lifecycle-automount-design.md` (no code), and Parts 2–4 of
-`2026-07-21-cas-mount-lease-abort-and-disk-lifecycle-design.md` (landed Dormant/UNMOUNT/MOUNT, Task 4–8).
-**Part 1 (abort-hardening) is KEPT.** Companion: `2026-07-22-cas-disk-lifecycle-problem-and-constraints.md`.
+Why rev.2's §5 died: the owner rejected caller-side skip-with-log as "Part 6 again" (a quiet noop), and they
+were right — *any* caller-side skip policy re-encodes the same ambiguity. Why eject died on formulation:
+(a) a loaded table re-resolving its storage policy after eviction reaches `getOrCreateDisk` → fresh disk →
+`Pool::open` on the erased root → **bootstraps an empty pool** → silent empty table through a new door (the
+P0 #1 class again); (b) a table whose own disk was ejected-but-throwing becomes permanently un-droppable
+(`drop()` throws forever). Keeping the husk registered and giving it truthful `Vanished` semantics avoids both.
+
+**Part 6 vs `Vanished` — the honesty distinction this whole design rests on:**
+
+| | Part 6 (rolled back) | `Vanished` (rev.3) |
+|---|---|---|
+| Gate condition | "not Mounted" — **ambiguous**, data possibly intact | identity-gate **proved** the data root is erased/replaced |
+| exists/list answers | absent/empty — **a lie** when data is intact | absent/empty — **the truth** |
+| Content reads | absent-ish | **typed throw** ("data root erased") — loud diagnosis |
+| Writes/creates | benign | **typed throw** |
+| Transient outage | lied "absent" | **throws** (no benign answer while uncertain) |
+
+This is exactly constraint C2 / requirement R2 of the companion doc
+(`2026-07-22-cas-disk-lifecycle-problem-and-constraints.md`): benign-absent is legitimate **only** in a
+positively-established data-erased state — and rev.3 finally builds that establishment.
+
+Supersedes: rev.1/rev.2 of this file, `…-self-quiesce-simplification-design.md` (Path B),
+`…-lifecycle-automount-design.md`, Parts 2–4 of `2026-07-21-cas-mount-lease-abort-…-design.md` (landed
+Task 4–8; **Part 1 abort-hardening KEPT**).
 
 ---
 
-## 1. The decision, in one paragraph
+## 1. State model and access semantics
 
-Do **not** build a runtime reuse lifecycle, and do **not** add benign-absent lies. A CA disk's data becoming
-unreachable is handled by two honest mechanisms: (1) **identity-validated recovery** — the existing self-remount
-must positively confirm the pool is the *same intact* pool before it recovers; if the backing was erased it goes
-**fail-loud** ("data root erased"), never resurrects an empty pool; (2) **throw-on-not-live** — every access
-(including probes) to a not-live CA disk throws, and callers that touch it fail honestly. The two remaining
-runtime affordances are `SYSTEM CONTENT ADDRESSED GC STOP/START '<disk>'` and FSCK on a running disk. Tests are
-fixed with unique disk **names** + `DROP ... SYNC` before any `rm -rf`. This directly satisfies the owner's
-intent — "lease gone ⇒ throw, honestly; if data returns it heals; no benign-absent" — with **zero** new
-lifecycle state and **one** small, typed, non-lying generic guard.
+Per writable pool, one runtime condition with three values (an atomic enum on the pool runtime, no persisted
+state):
 
-## 2. Identity-validated recovery (the core fix — A)
+```
+[Running/live] ──lease renewal fails──► [Running/transient-not-live] ──identity gate proves erased/replaced──► [Vanished]
+      ▲                                        │   (self-remount keeps retrying;                                (terminal)
+      └────────── self-remount succeeds ───────┘    ALL access throws)
+```
 
-The self-remount `tryRemountOnce` (`CasPool.cpp:640-725`) exists to recover from a **fence-out by a twin**
-(another node took the writer slot; *the pool data is intact*). It allocates a fresh writer epoch, quiesces &
-re-recovers ref tables, and re-arms the fence — this **fresh-incarnation** sequence is correct and is **KEPT
-verbatim**. Its bug: it calls `claimOwnerOrThrow` (which admits an **empty** root as a fresh bootstrap) without
-first proving the pool it is recovering is the same pool it opened. So an erased backing (`rm -rf`) is
-misclassified as "claimable empty root" and bootstrapped fresh.
+| Operation class | Running/live | transient-not-live | `Vanished` |
+|---|---|---|---|
+| exists/isDirectoryEmpty probes | real answer | **throw** 668 ("lease not held; backing may be temporarily unreachable") | `false`/`true-empty` (truth) |
+| listDirectory/iterateDirectory/getStorageObjectsIfExist | real answer | **throw** 668 | empty (truth) |
+| Content reads (readFile/getFileSize/…) | real answer | **throw** 668 | **throw** typed `CAS_DATA_ROOT_ERASED`-style 668 ("data root erased/decommissioned — recreate the disk; restart re-registers the name") |
+| Removes (removeFile/removeRecursive/…) | real | **throw** 668 | **no-op success** (truth: nothing to remove) — this is what lets `DROP` of a vanished-disk table complete |
+| Writes/creates/renames | real | **throw** 668 | **throw** typed erased error |
+| `store()` (admin ops, GC RUN) | real | throw | throw typed erased error (GC RUN reports per-disk status, no silent no-op) |
 
-**Fix:** before the recovery re-arms anything (and symmetrically at the startup mount-probe — the B200 startup
-counterpart), **read/exact-HEAD `_pool_meta`** and require the **original pool ID and format**:
+- **Transient-not-live** covers *every* unproven cause: lease renewal failure, fence-out by a twin, network
+  outage, 403/5xx, mid-recovery. Reads are gated too (the mount contract couples any pool use to a live
+  lease — C3; this is a deliberate tightening and is called out for review in §10).
+- The gate signal is the pool's local atomic fence (`Pool::mayMutate` machinery in `CasMountRuntime` —
+  atomic lost/deadline with TTL hysteresis; codex rev.1 #9 confirmed a single slow renewal does **not**
+  fence, so no availability cliff on a heartbeat blip). Not `system.content_addressed_mounts` (remote I/O).
+- **Read-only pools** (`CasPool.cpp:282` — no keeper, no lease) are out of scope of the gate: they keep
+  today's behavior (backend 404s surface naturally; the `DROP` finalizer sweep already skips read-only disks
+  via `!disk->isReadOnly()` at `DatabaseCatalog.cpp:1650`, so they cannot wedge anything).
 
-- `_pool_meta` present and matches the opened identity ⇒ this is a genuine fence-out / transient → proceed with
-  the existing fresh-incarnation recovery.
-- `_pool_meta` absent, or ID/format mismatch ⇒ the data root is **erased or foreign** → enter a typed,
-  **fail-loud** `ContentAddressedDataRootErased` condition. Do **not** `claimOwnerOrThrow`, do **not** bootstrap.
-  The disk stays not-live and every access throws (§3). Recovery of a genuinely-erased pool is a deliberate act
-  (recreate the pool / restart), never an in-place silent re-bootstrap.
+## 2. The identity gate (single choke point: `tryRemountOnce`)
 
-This turns `rm -rf`-under-mount from "silent empty healthy table" into an honest throw, while preserving
-auto-recovery for real transient/fence cases. It is pure CA-internal; no generic/upstream surface.
+The existing self-remount (`CasPool.cpp:640-725`) is the **only** recovery path after the keeper exits on a
+terminal renewal failure, and it is **kept verbatim** (fresh writer epoch → `quiesceRefTablesForRemount` →
+`setLiveWriterEpoch` → `armMountFence`; codex rev.1 P0 #2). rev.3 adds **step 0**, before
+`claimOwnerOrThrow`:
 
-## 3. Access gating: throw on not-live, no benign-absent
+Authoritative, cache-bypassing GET of `_pool_meta`, compared against the in-memory `PoolMeta` identity
+captured at `open`:
 
-**Writable pool.** `poolAccess()` (`ContentAddressedMetadataStorage.cpp:~1548` / `throwNotMounted` `:805`) gates
-on the pool's **local** admission signal `Pool::mayMutate` (`CasMountRuntime`, atomic lost/deadline fields with
-TTL hysteresis) instead of the removed `MountState==Mounted` check. Lease currently valid → serve; lost / past
-deadline / erased (§2) → throw `INVALID_STATE` (668) with a precise reason
-("mount lease not currently held — backing may be temporarily unreachable" vs "data root erased — recreate the
-disk"). Threads keep running so a transient outage auto-recovers (§2). A single slow renewal does **not** throw
-(hysteresis), so there is no availability regression.
+1. **Present + identity matches** → genuine fence-out/transient → proceed with the existing recovery.
+2. **Present + identity mismatch** (different pool id/format — someone recreated a pool under our root) →
+   **`Vanished(replaced)`** immediately (an authoritative read proving foreign content; no second sample
+   needed).
+3. **Clean, authoritative 404** → count it; **two consecutive** clean 404s (across two remount attempts at
+   the loop's cadence) → **`Vanished(erased)`**. A single 404 → return false, retry.
+4. **Any error** (timeout, 5xx, 403, connection reset) → **reset the 404 counter**, stay
+   transient-not-live, retry forever. **An erased verdict is never derived from errors** — this is what makes
+   a transient outage unable to falsely kill a healthy disk (the Path-B blocker #1 class), per C2.
 
-**Probes.** With Part 6 removed (§4), `existsFile`/`existsDirectory`/`existsFileOrDirectory`/`isDirectoryEmpty`/
-`listDirectory`/`iterateDirectory`/`getStorageObjectsIfExist` **throw** on a not-live writable pool exactly like
-content/size/mutation methods. No absent/empty answers anywhere.
+Notes: `claimOwnerOrThrow`'s empty-root bootstrap admission is thereby unreachable from recovery — the gate
+answers first (fixes codex rev.1 P0 #1: `rm -rf` under a live mount can no longer be resurrected as a fresh
+empty healthy pool). The startup-side cold `open` is intentionally **not** gated: a cold open of an empty
+root is the documented way pools are ever created (§8, known limits).
 
-**Read-only / observe-only pool** (`CasPool.cpp:282` — intentionally no mount keeper, no lease). Its access is
-**not** lease-gated: reads are always admitted while the pool is published; a probe/read that hits a genuinely
-vanished backing throws naturally from the backend 404 (honest, not benign-absent). It has no writer epoch and
-does no destructive GC, so the mount-lease signal does not apply to it. `poolAccess` must branch on pool kind:
-writable → `mayMutate` gate; read-only → published gate only.
+## 3. On entering `Vanished`
 
-**GC while lease invalid.** GC runs under its **own** `gc/state` lease (independent of the mount lease —
-rev.1 P1 #10), and its destructive protocol is CAS/lease-protected and tolerant of stale leaders. rev.1's claim
-"GC cannot act without the mount lease" was false and is dropped. GC remains 404-tolerant (record + continue,
-never throw out of the fold). No new coupling is introduced; GC STOP/START (§6) is the only new control.
+- Set the terminal flag (atomic; checked by the access layer per §1's table).
+- The remount thread logs **one** WARN ("CAS data root for '<disk>' is erased/replaced — disk is vanished;
+  reads/writes fail, removals no-op; recreate the pool and restart to reuse the name"), bumps a
+  `CasDataRootVanished` ProfileEvent, and **exits its own loop**. The GC scheduler observes the flag at its
+  next tick and exits likewise. The keeper already exited (terminal renewal). No thread joins another from a
+  callback — joins happen only in `~Pool` at destruction (C6 holds). G2 (no zombie spam) is satisfied: after
+  the one WARN, silence.
+- The disk **stays registered** (no eject): `getDisksMap` sweeps get truthful answers, loaded tables get the
+  typed erased error, `system.content_addressed_mounts` can still show it (§7), and re-`CREATE` with the
+  same name gets the husk's honest throw rather than a silently re-bootstrapped pool. The husk costs one
+  quiesced object until restart (the known, accepted disk-registry leak).
 
-## 4. Rollback of the landed Task 4–8 — throw everywhere ("let it break")
+## 4. Blast radius (deliberate, enumerated)
 
-Remove:
+With Part 6 rolled back, callers touching a **transient-not-live** CA disk fail honestly ("пусть ломает" —
+like touching a dead NFS mount). Enumerated so review sees this is deliberate:
 
-1. **`MountState` enum** (`Mounted`/`Unmounting`/`Dormant`) + every branch → collapse to the `mayMutate`/kind
-   gate of §3. `poolAccess`/`throwNotMounted` kept, re-pointed.
-2. **`SYSTEM CONTENT ADDRESSED UNMOUNT`/`MOUNT`** verbs + AccessTypes + `ASTSystemQuery` fields +
-   `unmountSynchronously()` + the `Unmounting` drain. (No replacement — runtime STOP is dropped.)
-3. **Part 6 benign-absent probes** (`ContentAddressedMetadataStorage.cpp:~557-564`, `:1114`, `:1370`, siblings) →
-   throw via §3. **Load-bearing.**
-4. **FSCK-dormant-only** (Task 7) → FSCK on a running disk (§7).
-5. The **GC RUN → UNMOUNT → FSCK → rm -rf** test teardown → §8.
+| Caller | transient-not-live | `Vanished` |
+|---|---|---|
+| `DROP` finalizer all-disk sweep (`DatabaseCatalog.cpp:1657`) | per-table throw → re-queue → **auto-drains on recovery** (bounded delay, not a wedge; the queue's existing per-table catch does the deferral — no new code) | exists=false → skip (truth) |
+| `table->drop()` of a table on the disk | throws → that table's `DROP` re-queues until recovery | removes no-op → **`DROP` completes** |
+| Orphan store-dir sweep (`:1986`) | already skips CA disks (`supportsStat`/`supportsChmod` false) — unaffected either way | same |
+| `SYSTEM UNFREEZE` (`Freeze.cpp:147`), `system.remote_data_paths` (`:281`), `ATTACH AS REPLICATED` cleanup (`InterpreterCreateQuery.cpp:2807`), non-Atomic `DROP` (`DatabaseOnDisk.cpp:394`) | honest error; retry later | truthful absent/empty → proceed |
+| MergeTree foreign-part scan (`MergeTreeData.cpp:2398`) | honest load error for tables whose `search_orphaned_parts_disks` reaches the disk (defaults to be verified at implementation) | truthful absent → proceeds |
+| `SELECT` on a loaded table of the disk | throws 668 | typed erased error (loud — **never** a silent empty result; enumeration-based empty loads can't happen because ATTACH/CREATE hit the write-throw at directory init first, making the previously-"fragile accident" ordering an explicit contract) |
+| `BACKUP` of such a table | throws | typed erased error (no silent empty backup) |
 
-**Policy on the callers this breaks:** an operation that directly touches a not-live CA disk **fails, honestly**
-— `SYSTEM UNFREEZE` (`Freeze.cpp:147`), `system.remote_data_paths` (`:281`), `SYSTEM CONTENT ADDRESSED GC RUN`
-fan-out (`InterpreterSystemQuery.cpp:2456`), `ATTACH AS REPLICATED` cleanup (`InterpreterCreateQuery.cpp:2807`),
-the MergeTree foreign-part sanity scan (`MergeTreeData.cpp:2398`), non-Atomic `DROP` (`DatabaseOnDisk.cpp:394`).
-This is the intended contract, like operating on an unmounted Linux filesystem. We do **not** add per-caller
-protection. (These are enumerated so reviewers know the blast radius is deliberate, not missed.)
+**Residual hole + its escape hatch:** a disk that is *permanently* transient-not-live but never yields a
+clean 404 (e.g. credentials broken forever) delays all `DROP`s indefinitely (each re-queues). Cure below.
 
-Keep untouched: Part 1, the `poolAccess` snapshot, atomic-publish `startup()`, `ca-fsck` rename, the GC-round
-entry-point gating fix.
+## 5. `SYSTEM CONTENT ADDRESSED FORGET '<disk>'`
 
-## 5. The one exception: typed per-disk isolation in the `DROP` finalizer
+The operator's fire-marshal verb: an explicit, logged assertion "this pool is gone/decommissioned" that
+force-transitions the disk to `Vanished` (same semantics, threads stop the same way). It is the escape hatch
+for the §4 residual hole and the decommission handle that replaced the unsound runtime `STOP` (codex rev.1
+P0 #3 — no in-use registry needed: nothing is torn down; the pool object stays; in-flight users start
+getting `Vanished` answers). If the operator is *wrong* (data intact), `FORGET` reintroduces the benign-lie
+by explicit human assertion — documented as destructive-intent, like `umount -f`; the log screams. Access
+control: its own `AccessType` under `SYSTEM`.
 
-`DatabaseCatalog::dropTableFinally` (`DatabaseCatalog.cpp:1657-1665`) sweeps **all** `getDisksMap()` disks for
-**every** dropped table and re-queues the table forever on any throw (`dropTablesParallel` `:1589`). The drop
-queue is **server-wide**, so one lingering not-live CA disk would wedge `DROP` of **unrelated** tables until
-restart — and re-break the test suite. This is *not* "the operation that touched the dead disk fails"; it is a
-dead disk breaking things that never used it. So this **one** sweep gets isolation — **not** a benign-absent lie
-(the disk still throws); the *caller* is made resilient:
-
-- Wrap the per-disk probe+remove in try/catch that catches **only** a typed `ContentAddressedDiskNotLive`
-  exception, and **only after confirming the disk is CA** (all other exceptions propagate — rev.1 P1 #6, no
-  swallowing partial-`removeRecursive`/permission failures).
-- The typed exception carries the §2 distinction:
-  - **Foreign** disk (not in the dropped table's storage volumes), any not-live reason → **skip + log**. (Its
-    orphaned parts are never cleaned by CA's own orphan sweep regardless — CA lacks `supportsStat`/`supportsChmod`
-    so `cleanupStoreDirectoryTask` `:1986` skips CA anyway — rev.1 P1 #4/#7; skipping here changes nothing.)
-  - **Own** disk (in the table's volumes): `DataRootErased` → **skip + log** (nothing to reclaim — honest, the
-    C2/R2 "positively-confirmed vanished ⇒ benign is truthful" case); transient-not-live → **re-queue** (durable
-    deferral, never silent-skip → no leak; drains on recovery).
-- Discriminating own-vs-foreign needs disk-ownership, which today only works for `MergeTreeData`
-  (rev.1 P1 #5: `Log`/`StripeLog`/`Set`/`Join` cast to null → misclassified). Use the general
-  `IStorage`→disks contract if one exists; if not, add a minimal `IStorage::getDisks()`-style accessor rather
-  than casting to `MergeTreeData`. (Open item — §9.)
-
-Because tests DROP-while-live (§8), a table's **own** disk is live at finalize time in the normal path, so the
-own-disk branches are the rare involuntary cases; the common effect of this guard is "skip a lingering foreign
-dead disk", which is exactly what unblocks unrelated `DROP`s.
+Deliberately **not** doing: runtime `STOP/START` (unsound without a process-wide disk-use barrier),
+`UNMOUNT/MOUNT` reuse (rolled back), registry eviction.
 
 ## 6. `SYSTEM CONTENT ADDRESSED GC STOP '<disk>'` / `GC START '<disk>'`
 
-Stop/restart **only** the GC scheduler; the mount keeper and normal disk access are untouched. `stop` must
-**clear `i_am_leader`** (rev.1 P1 #10) so introspection does not lie and a later `GC START` re-enters leadership
-via a fresh round, and must be genuinely restartable (`CasGcScheduler`, same instance, `gc_id` preserved).
-`start`/`stop` are serialized (externally linearizable) so concurrent admin calls cannot race the scheduler
-lifecycle. This is the granular "turn GC off around a test / maintenance window" handle the owner asked for.
+Unchanged from rev.2: stop/restart only the GC scheduler; disk fully usable meanwhile. `stop` **clears
+`i_am_leader`** (codex rev.1 #10) and is genuinely restartable (same instance, `gc_id` preserved);
+`start`/`stop` serialized. GC's own `gc/state` lease is independent of the mount lease (rev.1's "GC cannot
+act without the mount lease" claim was false and stays dropped); its destructive protocol is CAS/lease
+protected and stale-leader tolerant.
 
-## 7. FSCK on a running disk
+## 7. Introspection
 
-Drop dormant-only; FSCK runs on a running disk with concurrent (any-node) GC expected. The existing blob
-`Dangling` path is **already sound** (it exact-HEADs the blob then re-replays refs via `blobStillReferenced`,
-`CasFsck.cpp:370`). Apply the **same** revalidation to the two remaining hard classes before incrementing hard
-counters: **missing committed manifest** (`CasFsck.cpp:290`, currently reported from a possibly-stale recovered
-table) and **`meta_without_body`** (`:563`, currently from two raw LIST partitions while GC deletes body-then-
-meta, `CasGc.cpp:419/474`) — re-validate against a fresh authoritative ref view **and** a direct HEAD of the
-exact object. `Reachable` is informational and `Unaccounted` is not part of `clean`; codex confirmed no other
-hard class needs this. One-row summary output unchanged.
+`system.content_addressed_mounts` gains a non-`store()`-gated lifecycle snapshot source (codex rev.1 #11):
+name, lifecycle (`live` / `not_live` / `vanished(reason, since)`), last-known identity. `Vanished` disks
+remain visible (an advantage of keeping the husk registered).
 
-## 8. Tests
+## 8. Known limits (explicit non-goals)
 
-- Rewrite `05020_content_addressed_fsck.sh` + the `04290`/`04295` family: unique per-invocation disk **names**
-  (`${CLICKHOUSE_TEST_UNIQUE_NAME}`, the registry keys on **name** — C8) and paths
-  (`${CLICKHOUSE_USER_FILES_UNIQUE}`); update every SQL predicate referencing the old fixed name.
-- `DROP TABLE ... SYNC` (or `database_atomic_wait_for_drop_and_detach_synchronously=1`) **before** any `rm -rf`,
-  so the finalizer reclaims on a **live** disk. With §2, the lingering keeper after `rm -rf` cannot resurrect the
-  erased pool — it fail-loud-throws and logs (Part 1 keeps it from aborting), and unique names prevent reuse — so
-  **no `STOP` is needed** to make teardown safe (rev.1 P1 #12 is resolved by §2, not by STOP).
-- Never `rm -rf` a globally-configured standard CA disk's data — only unique-name per-test disks.
-- New tests: `GC STOP/START` (no new rounds after STOP; reads/writes still work; rounds resume after START);
-  the DROP-wedge guard (§5) — table A on a CA disk erased under it, table B on a normal disk; `DROP B` completes
-  though the dead CA disk lingers; identity-gate (§2) — erased backing ⇒ access throws, never empty result
-  (gtest/integration).
+- **Cross-session:** a server restart over an erased root re-bootstraps an empty pool and tables load empty
+  — exactly today's behavior; indistinguishable from a legitimately new pool without durable local state.
+  Candidate future work: a local marker enabling a boot-time warning. Out of scope.
+- **Partial tampering** (e.g. `rm` of only refs, `_pool_meta` intact): invisible to the lease/identity gate;
+  FSCK's domain. Out of scope.
+- **Permanently-unconfirmable disk**: visible `DROP` delays until `FORGET`/restart (§4/§5).
 
-## 9. Open questions for review
+## 9. Rollback, FSCK, tests
 
-1. **§2 identity gate**: is exact-HEAD of `_pool_meta` + ID/format the right, race-free discriminator between
-   "fenced-but-intact" and "erased/foreign", and does it also need to run at the startup mount-probe (B200)?
-   Any window where meta is transiently unreadable but data is intact (would wrongly fail-loud)?
-2. **§5 own-vs-foreign**: is there an existing `IStorage`→disks ownership contract, or must one be added; is
-   "foreign not-live ⇒ skip" ever a real leak beyond the already-never-swept CA orphan case?
-3. **§3 read-only branch**: is "published gate only, throws on backend 404" a complete and safe contract for
-   read-only CA disks, including their (absent) GC-safety story?
-4. **§6 GC STOP/START**: does clearing `i_am_leader` on stop + fresh-round re-entry fully avoid a stale-leader
-   destructive action across a STOP/START, given GC's independent `gc/state` lease?
-5. **§4 rollback**: does collapsing `MountState` to the `mayMutate`/kind gate change any behavior the kept
-   pieces (Part 1, poolAccess snapshot, startup, GC entry-point gating) relied on?
-6. **§2 recovery vs GC-fence**: after identity-validated recovery re-arms with a fresh epoch, is any cached
-   state (ref table, GC leadership) left stale such that resuming corrupts — or does the existing
-   quiesce/re-recover sequence fully cover it?
+**Rollback of landed Task 4–8** (as rev.2, restated): remove the `MountState` enum and branches (collapse to
+§1's gate), the `UNMOUNT`/`MOUNT` verbs + AccessTypes + `ASTSystemQuery` fields + `unmountSynchronously` +
+drain loop, FSCK-dormant-only, and the GC RUN→UNMOUNT→FSCK→rm teardown pattern. The **Part 6 probe sites are
+not deleted but re-keyed**: gate changes from `!isMounted()` (ambiguous) to the `Vanished` flag (proven),
+and their write/content-read siblings get the typed erased throw — per §1's table; everything
+transient-not-live throws. Keep: Part 1, `poolAccess` coherent snapshot, atomic-publish `startup()`,
+`ca-fsck` rename, GC-round entry-point gating.
+
+**FSCK on a running disk** (as rev.2): drop dormant-only; before incrementing hard counters, re-validate
+**missing committed manifest** (`CasFsck.cpp:290`) and **`meta_without_body`** (`:563`) against a fresh
+authoritative ref view **plus** an exact-object HEAD (the already-sound blob-`Dangling` pattern,
+`CasFsck.cpp:370`), because GC deletes body-then-meta (`CasGc.cpp:419/474`). No other hard class needs it
+(codex-confirmed). One-row summary unchanged.
+
+**Tests:**
+- `05020` + `04290`/`04295` family: unique per-invocation disk **names** (`${CLICKHOUSE_TEST_UNIQUE_NAME}` —
+  registry keys on name, C8) and paths (`${CLICKHOUSE_USER_FILES_UNIQUE}`); update all SQL predicates;
+  `DROP TABLE ... SYNC` **before** any `rm -rf`; never `rm -rf` a globally-configured disk's data.
+- New: identity gate — erase pool under a live mount ⇒ disk becomes `Vanished`; `SELECT` fails with the
+  typed erased error (never empty); `DROP` of that table **completes**; `DROP` of an unrelated table
+  completes; one WARN, then log silence (G2).
+- New: transient — block/unblock backing (or drop lease key only, restore) ⇒ access throws during the gap,
+  auto-recovers after; a `DROP` issued during the gap drains after recovery.
+- New: `FORGET` — force-vanish; same observable contract. `GC STOP/START` — rounds stop/resume; access
+  unaffected; leader flag drops on stop.
+
+## 10. Open questions for review
+
+1. **Truthful-absent completeness:** enumerate every reader of the `Vanished` surface — is there any path
+   where truth-empty still yields a silent wrong result (fresh enumeration flows: ATTACH really blocked by
+   the write-throw at directory init in all variants? detached-parts scans? backup logic that treats
+   "no files" as success)?
+2. **404-confirmation soundness** vs real backends: versioned buckets/delete markers (GET-after-`rm -rf`
+   semantics on S3/GCS/rustfs), strong-read guarantees, the 2-consecutive-404 threshold, resetting on
+   interleaved errors.
+3. **Reads gated in transient-not-live:** today reads are effectively *not* fence-gated (`mayMutate` gates
+   mutations). Rev.3 tightens reads to throw during a lease gap — contract-correct per C3, but is it an
+   acceptable availability change, and is the fence's TTL-hysteresis window sufficient to keep normal
+   operation unaffected?
+4. **Remove-as-no-op:** any caller that interprets remove success as an accounting/space-freed signal in a
+   way that no-op breaks?
+5. **`FORGET`:** should it also run the keeper's terminal release op (free the mount slot for other nodes)
+   or leave the slot to expire? Operator-wrong-case consequences acceptable?
+6. **Thread-exit races:** remount thread setting `Vanished` and exiting vs a concurrent GC tick / `~Pool` /
+   a `FORGET` racing natural detection.
+7. **Residual `DROP` delay** under permanently-transient: acceptable operationally (log rate, queue growth),
+   given `FORGET`/restart as cures?
+8. **Rollback coupling:** does collapsing `MountState` to this gate change behavior any kept piece (Part 1,
+   `poolAccess`, startup, GC entry-point gating) relied on?
