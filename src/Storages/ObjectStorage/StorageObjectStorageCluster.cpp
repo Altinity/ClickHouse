@@ -212,6 +212,8 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
                 if (auto metadata_snapshot = configuration->buildStorageMetadataFromState(*state, context_))
                     metadata = *metadata_snapshot;
             }
+
+            StorageObjectStorage::updateIdentityPartitionColumns(metadata, configuration, *state, context_);
         }
     }
 
@@ -1066,6 +1068,13 @@ std::optional<NameSet> StorageObjectStorageCluster::supportedPrewhereColumns() c
     if (pure_storage)
         return pure_storage->supportedPrewhereColumns();
     return IStorageCluster::supportedPrewhereColumns();
+}
+
+std::optional<NameSet> StorageObjectStorageCluster::supportedAutomaticPrewhereColumns() const
+{
+    if (pure_storage)
+        return pure_storage->supportedAutomaticPrewhereColumns();
+    return IStorageCluster::supportedAutomaticPrewhereColumns();
 }
 
 IStorageCluster::ColumnSizeByName StorageObjectStorageCluster::getColumnSizes() const

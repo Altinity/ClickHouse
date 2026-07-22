@@ -343,6 +343,11 @@ bool StorageObjectStorage::canMoveConditionsToPrewhere() const
 
 std::optional<NameSet> StorageObjectStorage::supportedPrewhereColumns() const
 {
+    return getInMemoryMetadataPtr()->getColumnsWithoutDefaultExpressions(/*exclude=*/hive_partition_columns_to_read_from_file_path);
+}
+
+std::optional<NameSet> StorageObjectStorage::supportedAutomaticPrewhereColumns() const
+{
     auto exclude = hive_partition_columns_to_read_from_file_path;
 
     const auto metadata = getInMemoryMetadataPtr();
@@ -352,7 +357,7 @@ std::optional<NameSet> StorageObjectStorage::supportedPrewhereColumns() const
             exclude.emplace_back(identity_partition_column, metadata->getColumns().get(identity_partition_column).type);
     }
 
-    LOG_DEBUG(log, "Prewhere exclude list: [{}]", exclude.toString());
+    LOG_DEBUG(log, "Automatic-PREWHERE exclude list: [{}]", exclude.toString());
     return metadata->getColumnsWithoutDefaultExpressions(/*exclude=*/exclude);
 }
 
