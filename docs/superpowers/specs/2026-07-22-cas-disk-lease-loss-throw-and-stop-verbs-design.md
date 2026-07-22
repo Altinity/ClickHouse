@@ -68,6 +68,11 @@ step with this revision).
                        FORGET (from any state) ────────────────────────────────────────────────────► [Vanished(forgotten)] (truth)
 ```
 
+(Diagram note, Task-5 review 2026-07-23: `IdentityLost → Vanished(replaced)` is also reachable — a
+foreign `_pool_meta` appearing while `IdentityLost` proves our generation gone just as authoritatively as
+from transient. Only an out-of-contract erase-and-recreate can produce it; the transition is truthful and
+terminal, so it is allowed.)
+
 Plus the minimal storage-level lifecycle `Constructing → Started → ShutDown`: outside `Started`, the
 null-pool check in the `poolAccess` coherent snapshot fails loud.
 
