@@ -76,7 +76,6 @@ static const std::set<std::string> non_cas_keys = {
     DECLARE(Bool,   skip_access_check, false, "Skip the boot-time capability probe (start now, fix later)", 0) \
     DECLARE(UInt64, dedup_cache_bytes, 64ULL << 20, "Byte budget of the blob presence cache (0 disables)", 0) \
     DECLARE(UInt64, dedup_head_first_min_bytes, 1ULL << 20, "Minimum blob size to try a HEAD before uploading the body", 0) \
-    DECLARE(UInt64, cas_commit_concurrency, 16, "Bounded fan-out for dispatching per-part commit work onto the dedicated CAS commit thread pool", 0) \
     DECLARE(UInt64, gc_snap_generations_to_keep, 3, "GC snapshot generations retained", 0) \
     DECLARE(UInt64, gc_shards, 1, "Blob-hash-prefix reducer shards (>= 1); creation-time only", 0) \
     DECLARE(UInt64, manifest_sweep_list_budget_keys, 1000, "Orphan-manifest sweep LIST budget per round", 0) \

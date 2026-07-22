@@ -122,9 +122,6 @@ namespace
     DECLARE(UInt64, max_io_thread_pool_size, 100, R"(
     ClickHouse uses threads from the IO Thread pool to do some IO operations (e.g. to interact with S3). `max_io_thread_pool_size` limits the maximum number of threads in the pool.
     )", 0) \
-    DECLARE(UInt64, cas_commit_pool_size, 100, R"(
-    Size of the dedicated thread pool content-addressed (CAS) disks use to dispatch per-part commit work. This pool is deliberately separate from the IO Thread pool used for object-storage writes: a CAS commit worker blocks waiting on that pool while finalizing an upload, so drawing commit workers from the same pool could deadlock it.
-    )", 0) \
     DECLARE(UInt64, max_io_thread_pool_free_size, 0, R"(
     If the number of **idle** threads in the IO Thread pool exceeds `max_io_thread_pool_free_size`, ClickHouse will release resources occupied by idling threads and decrease the pool size. Threads can be created again if necessary.
     )", 0) \

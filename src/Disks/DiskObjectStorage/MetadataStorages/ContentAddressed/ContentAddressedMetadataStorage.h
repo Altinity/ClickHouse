@@ -10,9 +10,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h>
 #include <Interpreters/Context_fwd.h>
 #include <base/defines.h>
-#include <atomic>
-#include <chrono>
-#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -394,228 +391,22 @@ public:
     /// successful promote/repoint for `key` (before the caller's own post-commit bookkeeping), modeling
     /// a concurrent writer racing in right after this transaction's confirm -- e.g. repointing the same
     /// ref to a different manifest so a later rollback's `dropRefIfMatches` must see it changed.
-    /// Task 5 dispatches `publishStaging` (and therefore every `*ForTest` seam it consults) from
-    /// multiple commit-pool threads at once. `test_hooks_mutex` serializes access to the backing maps
-    /// so the read/find/erase below cannot race a concurrent arm/run on another part's thread. Each hook
-    /// BODY is always invoked with the mutex RELEASED -- a `before_promote` hook may block for a long
-    /// time (the slow-worker ordering test), and holding the lock across it would serialize the very
-    /// concurrency these seams are meant to exercise (and could deadlock a two-hook rendezvous). In
-    /// production these maps are always empty, so the lock is uncontended and the seams are no-ops.
-    /// PRODUCTION FAST PATH: every `run*`/`should*`/`commitConcurrency` consumer below is on the
-    /// per-part commit hot path that Task 5 runs on many threads at once. `any_test_hook_armed` is a
-    /// single monotone atomic (only ever set true, by a setter, never reset) so production -- where no
-    /// test ever arms anything -- takes a lock-free acquire-load and returns immediately, never touching
-    /// `test_hooks_mutex`. Once any test arms a seam the flag stays true and consumers take the mutex as
-    /// before. Setters publish their map write and the flag under the same lock, so a consumer that
-    /// observes the flag (acquire) also observes the map write.
-    void armPromoteFailureForTest(const Cas::PartRefKey & key)
-    {
-        std::lock_guard lock(test_hooks_mutex);
-        promote_failure_refs_for_test.insert(key.cacheKey());
-        any_test_hook_armed.store(true, std::memory_order_release);
-    }
-    bool shouldFailPromoteForTest(const Cas::PartRefKey & key) const
-    {
-        if (!any_test_hook_armed.load(std::memory_order_acquire))
-            return false;
-        std::lock_guard lock(test_hooks_mutex);
-        return promote_failure_refs_for_test.contains(key.cacheKey());
-    }
+    void armPromoteFailureForTest(const Cas::PartRefKey & key) { promote_failure_refs_for_test.insert(key.cacheKey()); }
+    bool shouldFailPromoteForTest(const Cas::PartRefKey & key) const { return promote_failure_refs_for_test.contains(key.cacheKey()); }
     void setAfterPromoteHookForTest(const Cas::PartRefKey & key, std::function<void()> hook)
     {
-        std::lock_guard lock(test_hooks_mutex);
         after_promote_hooks_for_test[key.cacheKey()] = std::move(hook);
-        any_test_hook_armed.store(true, std::memory_order_release);
     }
     /// Invokes and removes `key`'s one-shot hook, if any registered. A no-op when none is installed
     /// (the production hot path never installs one).
     void runAfterPromoteHookForTest(const Cas::PartRefKey & key)
     {
-        if (!any_test_hook_armed.load(std::memory_order_acquire))
+        auto it = after_promote_hooks_for_test.find(key.cacheKey());
+        if (it == after_promote_hooks_for_test.end())
             return;
-        std::function<void()> hook;
-        {
-            std::lock_guard lock(test_hooks_mutex);
-            auto it = after_promote_hooks_for_test.find(key.cacheKey());
-            if (it == after_promote_hooks_for_test.end())
-                return;
-            hook = std::move(it->second);
-            after_promote_hooks_for_test.erase(it);
-        }
+        auto hook = std::move(it->second);
+        after_promote_hooks_for_test.erase(it);
         hook();
-    }
-
-    /// Test-only seam run at the START of `publishStaging`'s promote/repoint for `key`, BEFORE the
-    /// `shouldFailPromoteForTest` throw check -- one-shot per `(ns, ref)`. Task 5's parallel-commit
-    /// ordering test arms one "slow" part's hook to block (until a "poison" part's hook releases it),
-    /// holding that commit worker mid-`publishStaging` so the drain-before-rollback ordering is
-    /// observable. No-op in production (nothing ever arms it).
-    void setBeforePromoteHookForTest(const Cas::PartRefKey & key, std::function<void()> hook)
-    {
-        std::lock_guard lock(test_hooks_mutex);
-        before_promote_hooks_for_test[key.cacheKey()] = std::move(hook);
-        any_test_hook_armed.store(true, std::memory_order_release);
-    }
-    void runBeforePromoteHookForTest(const Cas::PartRefKey & key)
-    {
-        if (!any_test_hook_armed.load(std::memory_order_acquire))
-            return;
-        std::function<void()> hook;
-        {
-            std::lock_guard lock(test_hooks_mutex);
-            auto it = before_promote_hooks_for_test.find(key.cacheKey());
-            if (it == before_promote_hooks_for_test.end())
-                return;
-            hook = std::move(it->second);
-            before_promote_hooks_for_test.erase(it);
-        }
-        hook();   /// may block; invoked WITHOUT the lock
-    }
-
-    /// Test-only seam run inside `publishStaging` immediately BEFORE `uploadPendingBlobs` for `key` --
-    /// one-shot per `(ns, ref)`. The hardlink-shared-blob test arms both sharing parts with a barrier so
-    /// their uploads provably overlap (both workers reach the shared-blob upload before either proceeds).
-    /// No-op in production (nothing ever arms it).
-    void setBeforeUploadHookForTest(const Cas::PartRefKey & key, std::function<void()> hook)
-    {
-        std::lock_guard lock(test_hooks_mutex);
-        before_upload_hooks_for_test[key.cacheKey()] = std::move(hook);
-        any_test_hook_armed.store(true, std::memory_order_release);
-    }
-    void runBeforeUploadHookForTest(const Cas::PartRefKey & key)
-    {
-        if (!any_test_hook_armed.load(std::memory_order_acquire))
-            return;
-        std::function<void()> hook;
-        {
-            std::lock_guard lock(test_hooks_mutex);
-            auto it = before_upload_hooks_for_test.find(key.cacheKey());
-            if (it == before_upload_hooks_for_test.end())
-                return;
-            hook = std::move(it->second);
-            before_upload_hooks_for_test.erase(it);
-        }
-        hook();   /// may block; invoked WITHOUT the lock
-    }
-
-    /// Test-only seam run in the commit worker loop immediately AFTER `publishStaging` FULLY returns for
-    /// `key` (the part is durably published) -- one-shot per `(ns, ref)`. The join-before-rollback test
-    /// sets the "slow" part's completion marker here so the marker is provably set only once that part's
-    /// publish has fully returned (a no-drain regression cannot set it early). No-op in production.
-    void setAfterPublishHookForTest(const Cas::PartRefKey & key, std::function<void()> hook)
-    {
-        std::lock_guard lock(test_hooks_mutex);
-        after_publish_hooks_for_test[key.cacheKey()] = std::move(hook);
-        any_test_hook_armed.store(true, std::memory_order_release);
-    }
-    void runAfterPublishHookForTest(const Cas::PartRefKey & key)
-    {
-        if (!any_test_hook_armed.load(std::memory_order_acquire))
-            return;
-        std::function<void()> hook;
-        {
-            std::lock_guard lock(test_hooks_mutex);
-            auto it = after_publish_hooks_for_test.find(key.cacheKey());
-            if (it == after_publish_hooks_for_test.end())
-                return;
-            hook = std::move(it->second);
-            after_publish_hooks_for_test.erase(it);
-        }
-        hook();
-    }
-
-    /// Test-only seam run in `commit()`'s rollback path immediately before each `dropRefIfMatches`.
-    /// Task 5's ordering test asserts (inside this hook) that the slow worker had already joined --
-    /// i.e. that the drain completed before rollback began. Rollback is single-threaded, so no lock is
-    /// needed around the invocation itself. No-op in production.
-    void setBeforeDropRefIfMatchesHookForTest(std::function<void()> hook)
-    {
-        std::lock_guard lock(test_hooks_mutex);
-        before_drop_ref_hook_for_test = std::move(hook);
-        any_test_hook_armed.store(true, std::memory_order_release);
-    }
-    void runBeforeDropRefIfMatchesHookForTest()
-    {
-        if (!any_test_hook_armed.load(std::memory_order_acquire))
-            return;
-        std::function<void()> hook;
-        {
-            std::lock_guard lock(test_hooks_mutex);
-            hook = before_drop_ref_hook_for_test;
-        }
-        if (hook)
-            hook();
-    }
-
-    /// Test-only probe into `commit()`'s worker dispatch (Task 5 `SaturationBoundedCompletion`): counts
-    /// scheduled worker callbacks, tracks peak simultaneous-active workers (via a rendezvous barrier so
-    /// they provably overlap), and counts parts processed. A raw pointer set by the test (which owns the
-    /// probe on its stack and clears it before the fixture is destroyed); `nullptr` in production, read
-    /// once per worker callback (never per part), so the production cost is a single predictable null
-    /// check. `expected` is the worker count `commit()` computed, filled in by `commit()` itself.
-    struct CommitWorkerProbeForTest
-    {
-        std::atomic<size_t> callbacks_started{0};
-        std::atomic<size_t> active_now{0};
-        std::atomic<size_t> peak_active{0};
-        std::atomic<size_t> parts_processed{0};
-
-        std::mutex barrier_mutex;
-        std::condition_variable barrier_cv;
-        size_t arrived = 0;
-        size_t expected = 0;   /// set by commit() to the scheduled worker count
-
-        /// Called once at each worker callback entry: count the callback, bump the active gauge and its
-        /// peak, then rendezvous so every worker is provably simultaneously active (a serial regression
-        /// never reaches `expected` and falls through on the bounded timeout with a peak below the bound,
-        /// failing the test rather than hanging forever).
-        void onWorkerStart()
-        {
-            callbacks_started.fetch_add(1, std::memory_order_relaxed);
-            const size_t now = active_now.fetch_add(1, std::memory_order_relaxed) + 1;
-            size_t prev_peak = peak_active.load(std::memory_order_relaxed);
-            while (now > prev_peak && !peak_active.compare_exchange_weak(prev_peak, now, std::memory_order_relaxed))
-                ;
-            std::unique_lock lk(barrier_mutex);
-            ++arrived;
-            barrier_cv.notify_all();
-            barrier_cv.wait_for(lk, std::chrono::seconds(30), [&] { return arrived >= expected; });
-        }
-        void onWorkerEnd() { active_now.fetch_sub(1, std::memory_order_relaxed); }
-        void onPartProcessed() { parts_processed.fetch_add(1, std::memory_order_relaxed); }
-    };
-    void setCommitWorkerProbeForTest(CommitWorkerProbeForTest * probe)
-    {
-        std::lock_guard lock(test_hooks_mutex);
-        commit_worker_probe_for_test = probe;
-        any_test_hook_armed.store(true, std::memory_order_release);
-    }
-    CommitWorkerProbeForTest * commitWorkerProbeForTest() const
-    {
-        if (!any_test_hook_armed.load(std::memory_order_acquire))
-            return nullptr;
-        std::lock_guard lock(test_hooks_mutex);
-        return commit_worker_probe_for_test;
-    }
-
-    /// Test-only override for `cas_commit_concurrency` (the per-part commit fan-out `commit()` reads).
-    /// Lets a fixture force a specific bound (e.g. 1 for a sequential oracle, 8 for parallel) without
-    /// reopening the pool. When unset, `commitConcurrency()` reads the pool config as production does.
-    void setCommitConcurrencyForTest(uint64_t n)
-    {
-        std::lock_guard lock(test_hooks_mutex);
-        commit_concurrency_override_for_test = n;
-        any_test_hook_armed.store(true, std::memory_order_release);
-    }
-
-    /// The effective per-part commit fan-out `commit()` dispatches with: the test override when one is
-    /// installed, otherwise the pool-config value threaded from `cas_commit_concurrency` at construction.
-    uint64_t commitConcurrency() const
-    {
-        if (!any_test_hook_armed.load(std::memory_order_acquire))
-            return cas_commit_concurrency;
-        std::lock_guard lock(test_hooks_mutex);
-        return commit_concurrency_override_for_test.value_or(cas_commit_concurrency);
     }
 
 private:
@@ -632,9 +423,6 @@ private:
     const std::chrono::seconds gc_interval;
     const uint64_t dedup_cache_bytes;            /// P1 known-present cache byte cap (0=off)
     const uint64_t dedup_head_first_min_bytes;   /// P2 HEAD-before-PUT size threshold (0=off)
-    /// CAS parallel-write-path (Task 5): fan-out cap for per-part commit dispatch. Threaded into
-    /// `Cas::PoolConfig::cas_commit_concurrency`; unused until Task 5 wires the commit loop onto it.
-    const uint64_t cas_commit_concurrency;
     const uint64_t gc_snap_generations_to_keep;  /// Number of GC snapshots retained (0 means keep all).
     const uint64_t gc_shards;                    /// Blob-hash-prefix reducer shard count, fixed at pool creation.
     const uint64_t manifest_sweep_list_budget_keys;
@@ -821,22 +609,10 @@ private:
     /// (best-effort). Returns an empty sink when context is null (unit tests).
     Cas::CasEventSink makeCasEventSink() const;
 
-    /// Backing state for the `*ForTest` promote fault-injection/hook seams declared above. Empty in
-    /// production (no test ever arms them); consulted only by `ContentAddressedTransaction::publishStaging`
-    /// and `commit()`. Guarded by `test_hooks_mutex` because Task 5 runs `publishStaging` on many commit
-    /// threads at once.
-    mutable std::mutex test_hooks_mutex;
-    /// Monotone lock-free fast-path gate: false in production (no seam ever armed), so hot-path
-    /// consumers skip `test_hooks_mutex` entirely. Set true (never reset) by any setter above.
-    std::atomic<bool> any_test_hook_armed{false};
+    /// Backing state for the `*ForTest` promote fault-injection/hook seam declared above. Empty in
+    /// production (no test ever arms them); consulted only by `ContentAddressedTransaction::publishStaging`.
     std::unordered_set<std::string> promote_failure_refs_for_test;
     std::unordered_map<std::string, std::function<void()>> after_promote_hooks_for_test;
-    std::unordered_map<std::string, std::function<void()>> before_promote_hooks_for_test;
-    std::unordered_map<std::string, std::function<void()>> before_upload_hooks_for_test;
-    std::unordered_map<std::string, std::function<void()>> after_publish_hooks_for_test;
-    std::function<void()> before_drop_ref_hook_for_test;
-    CommitWorkerProbeForTest * commit_worker_probe_for_test = nullptr;
-    std::optional<uint64_t> commit_concurrency_override_for_test;
 };
 
 }

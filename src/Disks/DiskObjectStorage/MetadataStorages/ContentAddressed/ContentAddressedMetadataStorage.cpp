@@ -56,7 +56,6 @@ namespace ContentAddressedSetting
     extern const ContentAddressedSettingsUInt64 gc_interval_sec;
     extern const ContentAddressedSettingsUInt64 dedup_cache_bytes;
     extern const ContentAddressedSettingsUInt64 dedup_head_first_min_bytes;
-    extern const ContentAddressedSettingsUInt64 cas_commit_concurrency;
     extern const ContentAddressedSettingsUInt64 gc_snap_generations_to_keep;
     extern const ContentAddressedSettingsUInt64 gc_shards;
     extern const ContentAddressedSettingsUInt64 manifest_sweep_list_budget_keys;
@@ -170,7 +169,6 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , gc_interval(std::chrono::seconds(settings_[ContentAddressedSetting::gc_interval_sec].value))
     , dedup_cache_bytes(settings_[ContentAddressedSetting::dedup_cache_bytes].value)
     , dedup_head_first_min_bytes(settings_[ContentAddressedSetting::dedup_head_first_min_bytes].value)
-    , cas_commit_concurrency(settings_[ContentAddressedSetting::cas_commit_concurrency].value)
     , gc_snap_generations_to_keep(settings_[ContentAddressedSetting::gc_snap_generations_to_keep].value)
     , gc_shards(settings_[ContentAddressedSetting::gc_shards].value)
     , manifest_sweep_list_budget_keys(settings_[ContentAddressedSetting::manifest_sweep_list_budget_keys].value)
@@ -535,7 +533,6 @@ ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openP
     pool_config.blob_hash_allow_new = blob_hash_allow_new;
     pool_config.dedup_cache_bytes = dedup_cache_bytes;
     pool_config.dedup_head_first_min_bytes = dedup_head_first_min_bytes;
-    pool_config.cas_commit_concurrency = cas_commit_concurrency;
     pool_config.manifest_decode_cache_bytes = manifest_decode_cache_bytes;
     pool_config.gc_snap_generations_to_keep = gc_snap_generations_to_keep;
     pool_config.gc_shards = gc_shards;

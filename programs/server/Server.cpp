@@ -72,7 +72,6 @@
 #include <Core/Settings.h>
 #include <IO/ReadHelpers.h>
 #include <IO/ReadBufferFromFile.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasCommitThreadPool.h>
 #include <IO/SharedThreadPools.h>
 #include <IO/S3/Credentials.h>
 #include <Interpreters/CancellationChecker.h>
@@ -316,7 +315,6 @@ namespace ServerSetting
     extern const ServerSettingsUInt64 max_database_num_to_warn;
     extern const ServerSettingsUInt32 max_database_replicated_create_table_thread_pool_size;
     extern const ServerSettingsUInt64 max_dictionary_num_to_warn;
-    extern const ServerSettingsUInt64 cas_commit_pool_size;
     extern const ServerSettingsUInt64 max_io_thread_pool_free_size;
     extern const ServerSettingsUInt64 max_io_thread_pool_size;
     extern const ServerSettingsUInt64 max_keep_alive_requests;
@@ -1496,10 +1494,6 @@ try
         Stopwatch watch;
         LOG_INFO(log, "Waiting for background threads");
         DB::StaticThreadPool::shutdownAll();
-        /// Same rationale as `StaticThreadPool::shutdownAll()` just above: this pool's workers must be
-        /// joined before the global pool shuts down, or a worker still running could try to schedule
-        /// onto an already-shut-down `GlobalThreadPool` and hang.
-        DB::Cas::shutdownCasCommitThreadPool();
         GlobalThreadPool::instance().shutdown();
         LOG_INFO(log, "Background threads finished in {} ms", watch.elapsedMilliseconds());
     });
@@ -1657,12 +1651,6 @@ try
         server_settings[ServerSetting::max_io_thread_pool_size],
         server_settings[ServerSetting::max_io_thread_pool_free_size],
         server_settings[ServerSetting::io_thread_pool_queue_size]);
-
-    /// Dedicated CAS commit pool (docs/superpowers/sdd CAS parallel-write-path plan, Task 4):
-    /// deliberately its OWN `ThreadPool`, disjoint from the IO pool just initialized above and from
-    /// `Context::getThreadPoolWriter()` -- see `Cas::getCasCommitThreadPool()`'s doc comment for why.
-    DB::Cas::initializeCasCommitThreadPool(
-        server_settings[ServerSetting::cas_commit_pool_size], 0, 10000);
 
     getBackupsIOThreadPool().initialize(
         server_settings[ServerSetting::max_backups_io_thread_pool_size],
