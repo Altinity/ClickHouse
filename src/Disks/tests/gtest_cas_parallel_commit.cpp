@@ -10,8 +10,12 @@
 #include <fmt/format.h>
 #include <gtest/gtest.h>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <filesystem>
+#include <map>
 #include <mutex>
+#include <sstream>
 
 /// Task 2 of the CAS parallel-write-path plan (docs/superpowers/sdd): `promoteBuild`/`repointRef`
 /// return an exact, in-lane-derived `Cas::CommitOutcome` instead of `void`/`bool`, and
@@ -33,6 +37,10 @@ using namespace DB::Cas::tests;
 
 namespace
 {
+
+/// The dedicated CAS commit pool `commit()` dispatches onto is initialized once, process-wide, by the
+/// unit-test `main` (`src/Common/tests/gtest_main.cpp`) -- mirroring server startup -- so tests here can
+/// commit transactions without arranging it themselves.
 
 /// Fixture mirroring `gtest_cas_part_folder_access.cpp`'s `publishPart`/`cacheOn` helpers: a fresh
 /// in-memory pool + a `CachedPartFolderAccess` facade over it, plus the minimal staging helpers this
@@ -250,6 +258,108 @@ struct CaTxnRollbackFixture
     {
         storage->setAfterPromoteHookForTest(key, std::move(hook));
     }
+
+    /// Force the per-part commit fan-out (Task 5): 1 = sequential oracle, N = N bounded worker-loops.
+    void setCommitConcurrency(uint64_t n) { storage->setCommitConcurrencyForTest(n); }
+
+    /// Rendezvous for the join-before-rollback test. The "slow" part's before-promote hook blocks
+    /// until the "poison" part's before-promote hook releases it -- a real handshake, NO sleep -- so the
+    /// slow commit worker is provably still in-flight when the poison worker throws. `on_slow_finish`
+    /// fires the instant the slow worker is released (its publish effectively done); the rollback hook
+    /// then asserts that flag was already set, i.e. the drain completed before rollback began.
+    struct SlowRendezvous
+    {
+        std::mutex m;
+        std::condition_variable cv;
+        bool poison_failed = false;
+        std::function<void()> on_slow_finish;
+    };
+    std::shared_ptr<SlowRendezvous> rendezvous = std::make_shared<SlowRendezvous>();
+
+    void onSlowUploadFinish(std::function<void()> cb) { rendezvous->on_slow_finish = std::move(cb); }
+    void onFirstDropRefIfMatches(std::function<void()> cb)
+    {
+        storage->setBeforeDropRefIfMatchesHookForTest(std::move(cb));
+    }
+
+    /// Arm `slow` to block mid-`publishStaging` until `poison`'s promote fails, and `poison` to release
+    /// `slow` and then fail its promote. With commit concurrency >= 2 they land on different workers.
+    void holdSlowWorkerUntilPoisonFails(const Cas::PartRefKey & slow, const Cas::PartRefKey & poison)
+    {
+        auto rv = rendezvous;
+        storage->setBeforePromoteHookForTest(slow, [rv]
+        {
+            {
+                std::unique_lock lk(rv->m);
+                /// Bounded wait: a safety net only -- `poison_failed` is always signalled by the poison
+                /// worker under commit concurrency >= 2. Never a fixed sleep to sequence threads.
+                rv->cv.wait_for(lk, std::chrono::seconds(60), [&] { return rv->poison_failed; });
+            }
+            if (rv->on_slow_finish)
+                rv->on_slow_finish();
+        });
+        storage->setBeforePromoteHookForTest(poison, [rv]
+        {
+            {
+                std::lock_guard lk(rv->m);
+                rv->poison_failed = true;
+            }
+            rv->cv.notify_all();
+        });
+        storage->armPromoteFailureForTest(poison);
+    }
+
+    /// Stage TWO parts that share ONE pending blob: write the blob into part A, then `createHardLink`
+    /// it into part B (copying the pending record). Committed in parallel, both parts upload the SAME
+    /// content key -- driving the concurrent putIfAbsent/412/adopt path on one blob.
+    void stageSharedBlobIntoTwoParts(const DB::MetadataTransactionPtr & txn,
+                                     const Cas::PartRefKey & key_a, const Cas::PartRefKey & key_b)
+    {
+        auto & ca = dynamic_cast<DB::ContentAddressedTransaction &>(*txn);
+        const std::string a_file = tablePrefix() + "/" + key_a.ref + "/data.bin";
+        const std::string b_file = tablePrefix() + "/" + key_b.ref + "/data.bin";
+        const std::string bytes = "shared-blob-payload";
+        auto buf = ca.writeFile(a_file, 65536, DB::WriteMode::Rewrite, {});
+        buf->write(bytes.data(), bytes.size());
+        buf->finalize();
+        txn->createHardLink(a_file, b_file);
+    }
+
+    /// A canonical, encoding-independent fold of the committed state: every live ref, each ref's
+    /// manifest entries (path, placement, blob-hash identity, size, inline payload) sorted by path, and
+    /// a global blob in-degree. Deliberately EXCLUDES allocated identities (`ManifestRef`
+    /// writer_epoch/build_sequence) and timestamps, which legitimately differ between a sequential and a
+    /// parallel commit -- only the LOGICAL state must match.
+    std::string foldedLogicalState()
+    {
+        std::map<std::string, int64_t> in_degree;
+        std::ostringstream out;
+        for (const auto & [ref_name, _] : storage->store()->listRefs(ns()))
+        {
+            auto view = partAccess().getView({ns(), ref_name}, Cas::Freshness::ForceFresh);
+            if (!view)
+                continue;
+            out << "REF " << ref_name << "\n";
+            std::vector<Cas::ManifestEntry> entries = view->manifest()->entries;
+            std::sort(entries.begin(), entries.end(),
+                      [](const Cas::ManifestEntry & a, const Cas::ManifestEntry & b) { return a.path < b.path; });
+            for (const auto & e : entries)
+            {
+                const std::string ident =
+                    std::to_string(static_cast<int>(e.ref.algo)) + ":" + DB::Cas::u128ToHex(e.ref.digest.toU128());
+                out << "  " << e.path << " placement=" << static_cast<int>(e.placement)
+                    << " ident=" << ident << " size=" << e.size();
+                if (e.placement == Cas::EntryPlacement::Inline)
+                    out << " inline=" << e.inline_bytes;
+                out << "\n";
+                in_degree[ident] += 1;
+            }
+        }
+        out << "INDEGREE\n";
+        for (const auto & [ident, count] : in_degree)
+            out << "  " << ident << "=" << count << "\n";
+        return out.str();
+    }
 };
 
 CaTxnRollbackFixture makeCaWiringFixture()
@@ -336,14 +446,10 @@ TEST(CasCommitRollback, RepointByOtherWriterSurvivesRollback)
 /// check below additionally proves (1) and (3) apart, and that (1) is a stable singleton.
 TEST(CasCommitPool, DistinctFromWriterPoolAndBounded)
 {
-    /// `getCasCommitThreadPool()` now throws `LOGICAL_ERROR` unless `initializeCasCommitThreadPool()`
-    /// ran first (no more lazy self-initializing fallback -- see the header's doc comment). This test
-    /// binary has no `programs/server/Server.cpp` startup path to wire that call for us, so do it here,
-    /// guarded by a `once_flag` so re-running this test (or other `CasCommitPool` tests sharing the
-    /// process) doesn't hit the equally-loud double-init throw.
-    static std::once_flag init_flag;
-    std::call_once(init_flag, [] { DB::Cas::initializeCasCommitThreadPool(8, 0, 10000); });
-
+    /// `getCasCommitThreadPool()` throws `LOGICAL_ERROR` unless `initializeCasCommitThreadPool()` ran
+    /// first (no lazy self-initializing fallback -- see the header's doc comment). The unit-test `main`
+    /// (`src/Common/tests/gtest_main.cpp`) wires that once, process-wide, mirroring server startup, so by
+    /// the time any test runs the pool is available.
     ThreadPool & cas_commit_pool = DB::Cas::getCasCommitThreadPool();
 
     /// Singleton stability: the same object every call (a prerequisite for "disjoint from the writer
@@ -359,4 +465,87 @@ TEST(CasCommitPool, DistinctFromWriterPoolAndBounded)
 
     /// Default concurrency setting is present.
     EXPECT_EQ(DB::Cas::PoolConfig{}.cas_commit_concurrency, 16u);
+}
+
+/// Task 5 -- the payoff. `commit()` now dispatches per-part `publishStaging` onto the dedicated CAS
+/// commit pool at a bounded fan-out (`cas_commit_concurrency`), with the join structurally ordered
+/// before rollback. These tests exercise the four hazards that concurrency introduces.
+
+/// SATURATION / no self-wait deadlock: a commit-pool bound of N with > N parts must still complete.
+/// Each worker-loop pulls the next part until the snapshot is exhausted; nothing waits on its own pool.
+/// A self-wait deadlock (e.g. one-task-per-part on a pool smaller than the part count, each task
+/// blocking on the pool) would hang here -- the whole run is wrapped in `timeout 180` by the harness.
+TEST(CasParallelCommit, SaturationBoundedCompletion)
+{
+    auto fx = makeCaWiringFixture();
+    fx.setCommitConcurrency(2);                       // N = 2 worker-loops
+    auto txn = fx.beginTxn();
+    for (int i = 0; i < 5; ++i)                       // N + 3 parts, one blob each
+        fx.stageInto(txn, {fx.ns(), fmt::format("p_{}_1_1_0", i)}, 1);
+    ASSERT_NO_THROW(txn->commit({}));                 // must return; a self-wait deadlock would hang
+    for (int i = 0; i < 5; ++i)
+        EXPECT_TRUE(fx.partAccess().existsRef({fx.ns(), fmt::format("p_{}_1_1_0", i)}, Cas::Freshness::ForceFresh));
+}
+
+/// JOIN BEFORE ROLLBACK: a slow worker is held mid-`publishStaging` while a second (poison) part's
+/// promote fails. The rollback's first `dropRefIfMatches` must observe the slow worker already joined,
+/// proving the drain (runner destructor / `waitForAllToFinish`) completed before the catch's rollback.
+TEST(CasParallelCommit, JoinPrecedesRollbackUnderSlowWorker)
+{
+    auto fx = makeCaWiringFixture();
+    fx.setCommitConcurrency(4);
+    auto txn = fx.beginTxn();
+    const Cas::PartRefKey slow{fx.ns(), "slow_1_1_0"};
+    const Cas::PartRefKey poison{fx.ns(), "poison_1_1_0"};
+    fx.stageInto(txn, slow, 1);
+    fx.stageInto(txn, poison, 1);
+    fx.holdSlowWorkerUntilPoisonFails(slow, poison);
+
+    std::atomic<bool> slow_done{false};
+    std::atomic<bool> rollback_ran{false};
+    fx.onSlowUploadFinish([&] { slow_done = true; });
+    fx.onFirstDropRefIfMatches([&]
+    {
+        rollback_ran = true;
+        EXPECT_TRUE(slow_done.load()) << "rollback ran before the slow worker joined";
+    });
+
+    EXPECT_ANY_THROW(txn->commit({}));
+    EXPECT_TRUE(rollback_ran.load()) << "the created 'slow' ref must have been rolled back";
+    // The slow ref was created then rolled back; the poison ref never committed.
+    EXPECT_FALSE(fx.partAccess().existsRef(slow, Cas::Freshness::ForceFresh));
+    EXPECT_FALSE(fx.partAccess().existsRef(poison, Cas::Freshness::ForceFresh));
+}
+
+/// HARDLINK-SHARED PENDING BLOB: two parts share ONE pending blob (createHardLink), committed in
+/// parallel. Both upload the SAME content key concurrently -- one wins putIfAbsent, the other takes the
+/// 412/adopt path. Both refs must commit and the shared blob must resolve for both.
+TEST(CasParallelCommit, HardlinkSharedPendingBlobParallel)
+{
+    auto fx = makeCaWiringFixture();
+    fx.setCommitConcurrency(4);
+    auto txn = fx.beginTxn();
+    fx.stageSharedBlobIntoTwoParts(txn, {fx.ns(), "h_a_1_1_0"}, {fx.ns(), "h_b_1_1_0"});
+    ASSERT_NO_THROW(txn->commit({}));
+    EXPECT_TRUE(fx.partAccess().existsRef({fx.ns(), "h_a_1_1_0"}, Cas::Freshness::ForceFresh));
+    EXPECT_TRUE(fx.partAccess().existsRef({fx.ns(), "h_b_1_1_0"}, Cas::Freshness::ForceFresh));
+}
+
+/// SEMANTIC DETERMINISM: a forced-sequential commit (concurrency 1) and a parallel commit
+/// (concurrency 8) of the SAME deterministic multi-part plan must fold to the SAME logical state --
+/// bindings + manifest entries + payloads + blob in-degree. Allocated IDs/timestamps legitimately
+/// differ and are excluded by `foldedLogicalState`.
+TEST(CasParallelCommit, ParallelMatchesSequentialLogicalState)
+{
+    auto commitPlan = [](uint64_t concurrency)
+    {
+        auto fx = makeCaWiringFixture();
+        fx.setCommitConcurrency(concurrency);
+        auto txn = fx.beginTxn();
+        for (int p = 0; p < 20; ++p)                                  // 20 parts, 3 blobs each
+            fx.stageInto(txn, {fx.ns(), fmt::format("part_{:04}_1_1_0", p)}, 3);
+        txn->commit({});
+        return fx.foldedLogicalState();
+    };
+    EXPECT_EQ(commitPlan(1), commitPlan(8));
 }

@@ -161,6 +161,12 @@ private:
     /// instead of paying one manifest-body HEAD per file. Cleared in `commit()`'s epilogue.
     std::unordered_set<String> force_fresh_validated_refs;
 
+    /// One `Cas::CommitOutcome` slot per part, index-addressed. `commit()` preallocates it (one slot per
+    /// entry in `parts`) BEFORE it schedules any per-part publish, so each `publishStaging` -- run
+    /// concurrently across parts on the CAS commit pool (Task 5) -- writes its slot with a no-throw store
+    /// into an existing element, and `commit()`'s rollback drops exactly the refs THIS commit created.
+    std::vector<std::optional<Cas::CommitOutcome>> part_outcomes;
+
     /// Stage a CONTENT part file as a blob: record the pending upload + a tokenless dependency
     /// and add/replace its manifest entry. Shared by the streaming-blob path
     /// (Local or S3-staging, `backend` says which) and the always-Local inline-cap fallback.

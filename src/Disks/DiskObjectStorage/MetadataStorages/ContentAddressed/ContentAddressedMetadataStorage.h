@@ -391,22 +391,103 @@ public:
     /// successful promote/repoint for `key` (before the caller's own post-commit bookkeeping), modeling
     /// a concurrent writer racing in right after this transaction's confirm -- e.g. repointing the same
     /// ref to a different manifest so a later rollback's `dropRefIfMatches` must see it changed.
-    void armPromoteFailureForTest(const Cas::PartRefKey & key) { promote_failure_refs_for_test.insert(key.cacheKey()); }
-    bool shouldFailPromoteForTest(const Cas::PartRefKey & key) const { return promote_failure_refs_for_test.contains(key.cacheKey()); }
+    /// Task 5 dispatches `publishStaging` (and therefore every `*ForTest` seam it consults) from
+    /// multiple commit-pool threads at once. `test_hooks_mutex` serializes access to the backing maps
+    /// so the read/find/erase below cannot race a concurrent arm/run on another part's thread. Each hook
+    /// BODY is always invoked with the mutex RELEASED -- a `before_promote` hook may block for a long
+    /// time (the slow-worker ordering test), and holding the lock across it would serialize the very
+    /// concurrency these seams are meant to exercise (and could deadlock a two-hook rendezvous). In
+    /// production these maps are always empty, so the lock is uncontended and the seams are no-ops.
+    void armPromoteFailureForTest(const Cas::PartRefKey & key)
+    {
+        std::lock_guard lock(test_hooks_mutex);
+        promote_failure_refs_for_test.insert(key.cacheKey());
+    }
+    bool shouldFailPromoteForTest(const Cas::PartRefKey & key) const
+    {
+        std::lock_guard lock(test_hooks_mutex);
+        return promote_failure_refs_for_test.contains(key.cacheKey());
+    }
     void setAfterPromoteHookForTest(const Cas::PartRefKey & key, std::function<void()> hook)
     {
+        std::lock_guard lock(test_hooks_mutex);
         after_promote_hooks_for_test[key.cacheKey()] = std::move(hook);
     }
     /// Invokes and removes `key`'s one-shot hook, if any registered. A no-op when none is installed
     /// (the production hot path never installs one).
     void runAfterPromoteHookForTest(const Cas::PartRefKey & key)
     {
-        auto it = after_promote_hooks_for_test.find(key.cacheKey());
-        if (it == after_promote_hooks_for_test.end())
-            return;
-        auto hook = std::move(it->second);
-        after_promote_hooks_for_test.erase(it);
+        std::function<void()> hook;
+        {
+            std::lock_guard lock(test_hooks_mutex);
+            auto it = after_promote_hooks_for_test.find(key.cacheKey());
+            if (it == after_promote_hooks_for_test.end())
+                return;
+            hook = std::move(it->second);
+            after_promote_hooks_for_test.erase(it);
+        }
         hook();
+    }
+
+    /// Test-only seam run at the START of `publishStaging`'s promote/repoint for `key`, BEFORE the
+    /// `shouldFailPromoteForTest` throw check -- one-shot per `(ns, ref)`. Task 5's parallel-commit
+    /// ordering test arms one "slow" part's hook to block (until a "poison" part's hook releases it),
+    /// holding that commit worker mid-`publishStaging` so the drain-before-rollback ordering is
+    /// observable. No-op in production (nothing ever arms it).
+    void setBeforePromoteHookForTest(const Cas::PartRefKey & key, std::function<void()> hook)
+    {
+        std::lock_guard lock(test_hooks_mutex);
+        before_promote_hooks_for_test[key.cacheKey()] = std::move(hook);
+    }
+    void runBeforePromoteHookForTest(const Cas::PartRefKey & key)
+    {
+        std::function<void()> hook;
+        {
+            std::lock_guard lock(test_hooks_mutex);
+            auto it = before_promote_hooks_for_test.find(key.cacheKey());
+            if (it == before_promote_hooks_for_test.end())
+                return;
+            hook = std::move(it->second);
+            before_promote_hooks_for_test.erase(it);
+        }
+        hook();   /// may block; invoked WITHOUT the lock
+    }
+
+    /// Test-only seam run in `commit()`'s rollback path immediately before each `dropRefIfMatches`.
+    /// Task 5's ordering test asserts (inside this hook) that the slow worker had already joined --
+    /// i.e. that the drain completed before rollback began. Rollback is single-threaded, so no lock is
+    /// needed around the invocation itself. No-op in production.
+    void setBeforeDropRefIfMatchesHookForTest(std::function<void()> hook)
+    {
+        std::lock_guard lock(test_hooks_mutex);
+        before_drop_ref_hook_for_test = std::move(hook);
+    }
+    void runBeforeDropRefIfMatchesHookForTest()
+    {
+        std::function<void()> hook;
+        {
+            std::lock_guard lock(test_hooks_mutex);
+            hook = before_drop_ref_hook_for_test;
+        }
+        if (hook)
+            hook();
+    }
+
+    /// Test-only override for `cas_commit_concurrency` (the per-part commit fan-out `commit()` reads).
+    /// Lets a fixture force a specific bound (e.g. 1 for a sequential oracle, 8 for parallel) without
+    /// reopening the pool. When unset, `commitConcurrency()` reads the pool config as production does.
+    void setCommitConcurrencyForTest(uint64_t n)
+    {
+        std::lock_guard lock(test_hooks_mutex);
+        commit_concurrency_override_for_test = n;
+    }
+
+    /// The effective per-part commit fan-out `commit()` dispatches with: the test override when one is
+    /// installed, otherwise the pool-config value threaded from `cas_commit_concurrency` at construction.
+    uint64_t commitConcurrency() const
+    {
+        std::lock_guard lock(test_hooks_mutex);
+        return commit_concurrency_override_for_test.value_or(cas_commit_concurrency);
     }
 
 private:
@@ -612,10 +693,16 @@ private:
     /// (best-effort). Returns an empty sink when context is null (unit tests).
     Cas::CasEventSink makeCasEventSink() const;
 
-    /// Backing state for the `*ForTest` promote fault-injection/hook seam declared above. Empty in
-    /// production (no test ever arms them); consulted only by `ContentAddressedTransaction::publishStaging`.
+    /// Backing state for the `*ForTest` promote fault-injection/hook seams declared above. Empty in
+    /// production (no test ever arms them); consulted only by `ContentAddressedTransaction::publishStaging`
+    /// and `commit()`. Guarded by `test_hooks_mutex` because Task 5 runs `publishStaging` on many commit
+    /// threads at once.
+    mutable std::mutex test_hooks_mutex;
     std::unordered_set<std::string> promote_failure_refs_for_test;
     std::unordered_map<std::string, std::function<void()>> after_promote_hooks_for_test;
+    std::unordered_map<std::string, std::function<void()>> before_promote_hooks_for_test;
+    std::function<void()> before_drop_ref_hook_for_test;
+    std::optional<uint64_t> commit_concurrency_override_for_test;
 };
 
 }

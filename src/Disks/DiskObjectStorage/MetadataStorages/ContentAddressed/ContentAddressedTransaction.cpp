@@ -11,7 +11,11 @@
 #include <Disks/IDiskTransaction.h>
 #include <Common/thread_local_rng.h>
 #include <Common/config_version.h>
+#include <Common/threadPoolCallbackRunner.h>
+#include <Common/setThreadName.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasCommitThreadPool.h>
 #include <algorithm>
+#include <atomic>
 #include <filesystem>
 #include <unordered_set>
 #include <Common/Exception.h>
@@ -341,8 +345,10 @@ void ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
             for (auto & s : st.entries)
                 merged.push_back(std::move(s));
 
-            /// Test-only fault seam (Task 3 TDD): simulate a promote-time backend failure for `ref`
-            /// right before the durable repoint call. A no-op in production (nothing ever arms it).
+            /// Test-only seam (Task 5 TDD): run `ref`'s before-promote hook (holds a "slow" commit
+            /// worker mid-publishStaging so the drain-before-rollback ordering is observable), then the
+            /// Task-3 promote-failure seam. Both are no-ops in production (nothing ever arms them).
+            metadata_storage.runBeforePromoteHookForTest({ns, ref});
             if (metadata_storage.shouldFailPromoteForTest({ns, ref}))
                 throw Exception(ErrorCodes::ABORTED,
                     "ContentAddressedTransaction: test-injected promote failure for {}/{}", ns.string(), ref);
@@ -385,8 +391,9 @@ void ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
     st.build->precommitAdd(ns, ref, id);
     uploadPendingBlobs(st);
 
-    /// Test-only fault seam (Task 3 TDD): simulate a promote-time backend failure for `ref` right
-    /// before the durable promote call. A no-op in production (nothing ever arms it).
+    /// Test-only seams (Task 5 / Task 3 TDD): run `ref`'s before-promote hook (a slow-worker hold),
+    /// then the promote-failure seam. Both are no-ops in production (nothing ever arms them).
+    metadata_storage.runBeforePromoteHookForTest({ns, ref});
     if (metadata_storage.shouldFailPromoteForTest({ns, ref}))
         throw Exception(ErrorCodes::ABORTED,
             "ContentAddressedTransaction: test-injected promote failure for {}/{}", ns.string(), ref);
@@ -437,19 +444,89 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
     /// `parts`' own iteration order (the map's (ns, ref) sort order) -- there is no real dependency
     /// between parts that would require a different order, and under Task 5's concurrent dispatch the
     /// publish order is racy regardless of how this snapshot is built.
+    ///
+    /// Task 5: the per-part publish loop is dispatched onto `Cas::getCasCommitThreadPool()` at a bounded
+    /// fan-out (`cas_commit_concurrency`), NOT sequentially. The rollback contract above is unchanged;
+    /// what changes is that `publishStaging` now runs on many threads at once. Two invariants make that
+    /// safe:
+    ///   (1) Every registration slot is PREALLOCATED before any task is scheduled -- the snapshot
+    ///       vector, the per-part `Cas::CommitOutcome` slots, and the per-part `std::exception_ptr`
+    ///       slots -- so a worker only ever writes into an already-sized, index-addressed slot (no
+    ///       container growth, no per-part allocation that could throw after a task is live).
+    ///   (2) The join is STRUCTURALLY ORDERED BEFORE the rollback. The runner is declared in an inner
+    ///       scope INSIDE the `try`; its destructor (and the explicit `waitForAllToFinish`) drains every
+    ///       scheduled worker before that scope closes. So on EVERY path out of the `try` -- a worker
+    ///       recorded an error we rethrow below, OR `enqueueAndKeepTrack` itself threw partway through
+    ///       dispatch -- no worker is still live when the `catch`'s `dropRefIfMatches` rollback (or, on a
+    ///       dispatch-throw that escapes, `~ContentAddressedTransaction`'s `abandon()`) runs. A
+    ///       function-scope `SCOPE_EXIT` would drain AFTER the same-function catch, which is exactly the
+    ///       ordering bug this structure avoids.
+    /// Each worker is a bounded WORKER-LOOP (not one task per part): exactly `min(concurrency, parts)`
+    /// callbacks are scheduled, each pulling the next part index from a shared atomic cursor over the
+    /// snapshot until it is exhausted. This caps the true concurrency at the configured bound rather than
+    /// at the pool size, and never schedules a task that would immediately find nothing to do.
     struct IndexedPart { Cas::RootNamespace ns; std::string ref; PartStaging * st; };
     std::vector<IndexedPart> ordered;
     ordered.reserve(parts.size());
     for (auto & [key, st] : parts)
         ordered.push_back({Cas::RootNamespace{key.first}, key.second, &st});
 
-    std::vector<std::optional<Cas::CommitOutcome>> part_outcomes;
+    /// Preallocated, index-addressed slots -- filled BEFORE any task is scheduled so a worker's slot
+    /// write is a no-throw store into an existing element (see invariant (1) above).
     part_outcomes.assign(ordered.size(), std::nullopt);
+    std::vector<std::exception_ptr> errors(ordered.size());
+
+    const size_t total = ordered.size();
+    /// Non-owning pointers into the stack/member vectors above; captured by value into the worker
+    /// lambda. Every pointee is declared in this outer scope and therefore outlives the runner's drain
+    /// (never an owning `shared_ptr` to the transaction -- attribution rides the thread group the runner
+    /// itself propagates from the enqueuing INSERT thread).
+    IndexedPart * ordered_data = ordered.data();
+    std::optional<Cas::CommitOutcome> * outcomes_data = part_outcomes.data();
+    std::exception_ptr * errors_data = errors.data();
+    std::atomic<size_t> next{0};
 
     try
     {
-        for (size_t i = 0; i < ordered.size(); ++i)
-            publishStaging(ordered[i].ns, ordered[i].ref, *ordered[i].st, part_outcomes[i]);
+        if (total > 0)
+        {
+            const size_t workers = std::min<size_t>(
+                std::max<uint64_t>(1, metadata_storage.commitConcurrency()), total);
+            {
+                /// Inner scope: the runner drains on scope exit BEFORE the catch body can run.
+                ThreadPoolCallbackRunnerLocal<void> runner(Cas::getCasCommitThreadPool(), ThreadName::CAS_COMMIT);
+                std::atomic<size_t> * next_ptr = &next;
+                for (size_t w = 0; w < workers; ++w)
+                    runner.enqueueAndKeepTrack(
+                        [this, next_ptr, total, ordered_data, outcomes_data, errors_data]
+                        {
+                            for (size_t i = next_ptr->fetch_add(1, std::memory_order_relaxed); i < total;
+                                 i = next_ptr->fetch_add(1, std::memory_order_relaxed))
+                            {
+                                try
+                                {
+                                    /// The UNCHANGED per-part publish. Intra-part blobs stay serial
+                                    /// (uploaded inside `publishStaging`); this task parallelizes across
+                                    /// PARTS only.
+                                    publishStaging(ordered_data[i].ns, ordered_data[i].ref,
+                                                   *ordered_data[i].st, outcomes_data[i]);
+                                }
+                                catch (...)
+                                {
+                                    /// Never let a worker throw out of the pool task: record it and keep
+                                    /// pulling. First-error-wins reconstruction happens after the drain.
+                                    errors_data[i] = std::current_exception();
+                                }
+                            }
+                        });
+                runner.waitForAllToFinish();   /// non-throwing drain; NEVER get() in this noexcept-ish context
+            }   /// runner dtor re-drains on every path (a partway `enqueueAndKeepTrack` throw included)
+        }
+
+        /// First-error-wins: rethrow the earliest engaged slot so the `catch` runs the exact rollback.
+        for (auto & e : errors)
+            if (e)
+                std::rethrow_exception(e);
     }
     catch (...)
     {
@@ -460,10 +537,14 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
         /// repoint of an already-committed ref (created=false) is pre-existing data and is never
         /// dropped. `dropRefIfMatches` additionally guards against a concurrent repoint of the SAME ref
         /// since this call's own publish: it removes the ref only if it still names the exact
-        /// `manifest_ref` this commit bound, leaving a newer binding untouched.
+        /// `manifest_ref` this commit bound, leaving a newer binding untouched. Runs single-threaded,
+        /// AFTER the drain above -- no worker is live here.
         for (const auto & oc : part_outcomes)
             if (oc && oc->created)
+            {
+                metadata_storage.runBeforeDropRefIfMatchesHookForTest();
                 metadata_storage.partAccess()->dropRefIfMatches({oc->ns, oc->ref}, oc->manifest_ref);
+            }
         throw;
     }
     committed = true;
