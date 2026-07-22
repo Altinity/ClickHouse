@@ -661,33 +661,41 @@ namespace
         return terms;
     }
 
-    /// Fold [min, max] of the partition-key column at `slot` across all parts of the partition.
-    /// Returns false if no part exposes an initialized min/max for that column.
-    bool foldPartitionColumnBounds(
-        const MergeTreeData::DataPartsVector & parts, size_t slot, Field & out_min, Field & out_max)
+    std::optional<std::pair<Field, Field>> calculatePartitionColumnMinMax(
+        const MergeTreeData::DataPartsVector & parts, size_t slot)
     {
-        bool found = false;
+        std::optional<std::pair<Field, Field>> bounds;
         for (const auto & part : parts)
         {
             if (!part->minmax_idx || !part->minmax_idx->initialized || slot >= part->minmax_idx->hyperrectangle.size())
                 continue;
             auto range = part->minmax_idx->hyperrectangle[slot];
             range.shrinkToIncludedIfPossible();
-            if (!found)
+            if (!bounds)
             {
-                out_min = range.left;
-                out_max = range.right;
-                found = true;
+                bounds.emplace(range.left, range.right);
             }
             else
             {
-                if (range.left < out_min)
-                    out_min = range.left;
-                if (out_max < range.right)
-                    out_max = range.right;
+                if (range.left < bounds->first)
+                    bounds->first = range.left;
+                if (bounds->second < range.right)
+                    bounds->second = range.right;
             }
         }
-        return found;
+        return bounds;
+    }
+
+
+    bool endpointsMapToDifferentValues(
+        const IFunctionBase & function, const ColumnsWithTypeAndName & arguments, size_t num_rows)
+    {
+        const auto result = function.execute(arguments, function.getResultType(), num_rows, /*dry_run=*/ false);
+        Field first;
+        Field second;
+        result->get(0, first);
+        result->get(1, second);
+        return first != second;
     }
 
     /// Whether the destination partition term yields a single value across [min, max] of its source
@@ -710,23 +718,15 @@ namespace
         auto values_column = column_type->createColumn();
         values_column->insert(min_value);
         values_column->insert(max_value);
-        const ColumnWithTypeAndName values{std::move(values_column), column_type, term.column};
+        const ColumnsWithTypeAndName arguments{{std::move(values_column), column_type, term.column}};
+        const auto function = resolver->build(arguments);
 
-        const ColumnsWithTypeAndName arguments{values};
-        const auto result_type = resolver->getReturnType(arguments);
-        const auto function_base = resolver->build(arguments);
-
-        if (!function_base->hasInformationAboutMonotonicity())
-            return false;
-        if (!function_base->getMonotonicityForRange(*column_type, min_value, max_value).is_monotonic)
+        /// Require provable monotonicity so the endpoint comparison covers all interior rows.
+        if (!function->hasInformationAboutMonotonicity()
+            || !function->getMonotonicityForRange(*column_type, min_value, max_value).is_monotonic)
             return false;
 
-        const auto result = function_base->execute(arguments, result_type, 2, /*dry_run=*/ false);
-        Field first;
-        Field second;
-        result->get(0, first);
-        result->get(1, second);
-        return first == second;
+        return !endpointsMapToDifferentValues(*function, arguments, /*num_rows=*/ 2);
     }
 }
 
@@ -812,11 +812,12 @@ namespace
 
     /// Apply the destination Iceberg transform (rebuilt as a ClickHouse function, mirroring
     /// ChunkPartitioner and the commit path) to a 2-row column holding [cast(min), cast(max)] and
-    /// return whether both rows map to the same value.
-    bool destinationTransformIsConstant(
+    /// return whether the endpoints map to different values, i.e. the source partition would be split
+    /// across more than one destination partition.
+    bool wouldPartitionBeSplit(
         const Iceberg::TransformAndArgument & transform, const ColumnWithTypeAndName & values, const ContextPtr & context)
     {
-        auto function = FunctionFactory::instance().get(transform.transform_name, context);
+        auto resolver = FunctionFactory::instance().get(transform.transform_name, context);
         const size_t num_rows = values.column->size();
 
         ColumnsWithTypeAndName arguments;
@@ -828,14 +829,7 @@ namespace
             arguments.push_back({DataTypeString().createColumnConst(num_rows, *transform.time_zone),
                                  std::make_shared<DataTypeString>(), "timezone"});
 
-        const auto result_type = function->getReturnType(arguments);
-        const auto result = function->build(arguments)->execute(arguments, result_type, num_rows, /*dry_run=*/ false);
-
-        Field first;
-        Field second;
-        result->get(0, first);
-        result->get(1, second);
-        return first == second;
+        return endpointsMapToDifferentValues(*resolver->build(arguments), arguments, num_rows);
     }
 }
 
@@ -1015,12 +1009,12 @@ namespace
                     "separate Iceberg partition; partition the source by the matching Iceberg transform.",
                     column);
 
-            Field min_value;
-            Field max_value;
-            if (!foldPartitionColumnBounds(parts, slot, min_value, max_value))
+            const auto bounds = calculatePartitionColumnMinMax(parts, slot);
+            if (!bounds)
                 throw Exception(ErrorCodes::BAD_ARGUMENTS,
                     "Cannot export partition to Iceberg table: no min/max statistics available for column "
                     "'{}' in partition '{}'; cannot validate partitioning.", column, partition_id);
+            const auto & [min_value, max_value] = *bounds;
 
             if (!destination_sample.has(column))
                 throw Exception(ErrorCodes::BAD_ARGUMENTS,
@@ -1053,7 +1047,7 @@ namespace
                 castColumn({std::move(values_column), source_type, column}, destination_type), destination_type, column};
 
             const auto dest_transform_with_tz = Iceberg::parseTransformAndArgument(dest_transform, partition_timezone);
-            if (!destinationTransformIsConstant(*dest_transform_with_tz, cast_values, context))
+            if (wouldPartitionBeSplit(*dest_transform_with_tz, cast_values, context))
                 throw Exception(ErrorCodes::BAD_ARGUMENTS,
                     "Cannot export partition to Iceberg table: partition '{}' spans multiple destination "
                     "partitions for column '{}' (transform '{}'). A source MergeTree partition must map to a "
@@ -1118,12 +1112,12 @@ namespace
                     "Cannot export partition: partition column '{}' is Nullable, so a NULL forms a separate "
                     "destination partition. Partition the source by the matching expression.", term.column);
 
-            Field min_value;
-            Field max_value;
-            if (!foldPartitionColumnBounds(parts, slot, min_value, max_value))
+            const auto bounds = calculatePartitionColumnMinMax(parts, slot);
+            if (!bounds)
                 throw Exception(ErrorCodes::BAD_ARGUMENTS,
                     "Cannot export partition: no min/max statistics available for column '{}' in partition "
                     "'{}'; cannot validate partitioning.", term.column, partition_id);
+            const auto & [min_value, max_value] = *bounds;
 
             if (!partitionTermIsConstantOverBounds(term, column_type, min_value, max_value, context))
                 throw Exception(ErrorCodes::BAD_ARGUMENTS,
