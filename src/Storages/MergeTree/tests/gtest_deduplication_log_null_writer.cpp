@@ -4,6 +4,7 @@
 #include <Storages/MergeTree/MergeTreeDeduplicationLog.h>
 #include <Storages/MergeTree/MergeTreePartInfo.h>
 #include <Common/Exception.h>
+#include <base/defines.h>   /// DEBUG_OR_SANITIZER_BUILD
 
 #include <filesystem>
 #include <memory>
@@ -63,8 +64,18 @@ struct DeduplicationLogNullWriterFixture : public ::testing::Test
 
 }
 
+#if defined(DEBUG_OR_SANITIZER_BUILD)
+/// gtest runs *DeathTest suites before others; reuse the same fixture via an alias so the death arm
+/// gets the same null-writer precondition.
+using DeduplicationLogNullWriterDeathTest = DeduplicationLogNullWriterFixture;
+#endif
+
+#ifndef DEBUG_OR_SANITIZER_BUILD
 TEST_F(DeduplicationLogNullWriterFixture, AddPartThrowsLogicalErrorInsteadOfCrashing)
 {
+    /// LOGICAL_ERROR "no writer" is a broken-invariant guard (addPart on a null current_writer). Under
+    /// abort_on_logical_error it aborts at construction instead of being catchable -- the DeathTest
+    /// below proves the abort in those builds.
     auto part_info = MergeTreePartInfo::fromPartName("all_0_0_0", FORMAT_VERSION);
 
     EXPECT_THROW(
@@ -87,7 +98,17 @@ TEST_F(DeduplicationLogNullWriterFixture, AddPartThrowsLogicalErrorInsteadOfCras
     /// crashing or behaving differently the second time.
     EXPECT_THROW(log->addPart({"block-1"}, part_info), Exception);
 }
+#endif
 
+#if defined(DEBUG_OR_SANITIZER_BUILD)
+TEST_F(DeduplicationLogNullWriterDeathTest, AddPartAborts)
+{
+    auto part_info = MergeTreePartInfo::fromPartName("all_0_0_0", FORMAT_VERSION);
+    EXPECT_DEATH({ log->addPart({"block-1"}, part_info); }, "no writer");
+}
+#endif
+
+#ifndef DEBUG_OR_SANITIZER_BUILD
 TEST_F(DeduplicationLogNullWriterFixture, DropPartThrowsLogicalErrorInsteadOfCrashing)
 {
     auto part_info = MergeTreePartInfo::fromPartName("all_0_0_0", FORMAT_VERSION);
@@ -107,3 +128,12 @@ TEST_F(DeduplicationLogNullWriterFixture, DropPartThrowsLogicalErrorInsteadOfCra
         },
         Exception);
 }
+#endif
+
+#if defined(DEBUG_OR_SANITIZER_BUILD)
+TEST_F(DeduplicationLogNullWriterDeathTest, DropPartAborts)
+{
+    auto part_info = MergeTreePartInfo::fromPartName("all_0_0_0", FORMAT_VERSION);
+    EXPECT_DEATH({ log->dropPart(part_info); }, "no writer");
+}
+#endif
