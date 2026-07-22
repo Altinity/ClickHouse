@@ -62,7 +62,9 @@ TEST(CasRepoint, ByteEqualIsNoOp)
 
     backend->resetCounts();
     const uint64_t repoints_before = ProfileEvents::global_counters[ProfileEvents::CasRefRepoint].load();
-    EXPECT_FALSE(access.repointRef(key, {inlineEntry("checksums.txt", "cs")}, ProvenanceOp::Other));
+    const DB::Cas::CommitOutcome oc = access.repointRef(key, {inlineEntry("checksums.txt", "cs")}, ProvenanceOp::Other);
+    EXPECT_FALSE(oc.created);
+    EXPECT_EQ(oc.manifest_ref, id.ref) << "the byte-equal outcome must name the manifest ALREADY committed, unchanged";
 
     EXPECT_EQ(backend->putTotal(), 0u) << "byte-equal repoint must perform ZERO pool mutations";
     EXPECT_EQ(store->resolveRef(ns, "part_1")->manifest_id, id)
@@ -70,9 +72,10 @@ TEST(CasRepoint, ByteEqualIsNoOp)
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasRefRepoint].load(), repoints_before);
 }
 
-/// A genuinely different entry set on an already-committed ref republishes the manifest: returns
-/// true, the new content resolves, and the repoint is loud (ProfileEvent + the ref's cached view
-/// erased so a subsequent read serves the new manifest, not a stale retained one).
+/// A genuinely different entry set on an already-committed ref republishes the manifest: the returned
+/// `CommitOutcome` names a FRESH manifest (`created` still false -- the ref was already committed),
+/// the new content resolves, and the repoint is loud (ProfileEvent + the ref's cached view erased so a
+/// subsequent read serves the new manifest, not a stale retained one).
 TEST(CasRepoint, AddFileRepoints)
 {
     auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
@@ -88,7 +91,9 @@ TEST(CasRepoint, AddFileRepoints)
 
     const uint64_t repoints_before = ProfileEvents::global_counters[ProfileEvents::CasRefRepoint].load();
     const std::vector<ManifestEntry> new_entries{inlineEntry("checksums.txt", "cs"), inlineEntry("metadata_version.txt", "7")};
-    EXPECT_TRUE(access.repointRef(key, new_entries, ProvenanceOp::Other));
+    const DB::Cas::CommitOutcome oc = access.repointRef(key, new_entries, ProvenanceOp::Other);
+    EXPECT_FALSE(oc.created);
+    EXPECT_NE(oc.manifest_ref, id_before.ref);
 
     const auto resolved = store->resolveRef(ns, "part_1");
     ASSERT_TRUE(resolved.has_value());

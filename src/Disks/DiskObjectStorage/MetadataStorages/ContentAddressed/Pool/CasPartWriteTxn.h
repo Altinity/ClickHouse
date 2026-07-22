@@ -155,7 +155,15 @@ public:
     /// still throws ABORTED. With `true`, the guard is skipped and the old committed binding is retired
     /// in the SAME ref-log record as the ordinary precommit->committed promotion, plus a
     /// `CasEventType::RefRepoint` audit event -- every effective repoint is loud by construction.
-    void promote(const RootNamespace & target_ns, const String & final_ref_name, UInt128 build_id, const ManifestId & id, bool allow_repoint = false);
+    ///
+    /// Returns `created`: whether `final_ref_name` had NO committed row before this call. Derived
+    /// INSIDE the `appendRefOps` builder (the same in-closure-output pattern the builder already uses
+    /// for `repoint_old`) as `state.getCommitted().find(final_ref_name) == end`, evaluated once at the
+    /// top of the closure -- so it is correct on every path the closure can take: a first-time bind
+    /// (true), a repoint of an existing binding (false), and the idempotent re-promote no-op (false,
+    /// since a committed row for this exact manifest already existed). `build_ops` runs at most once,
+    /// on the flush leader, so this single evaluation is authoritative.
+    bool promote(const RootNamespace & target_ns, const String & final_ref_name, UInt128 build_id, const ManifestId & id, bool allow_repoint = false);
 
     /// Retire the build sequence so the GC watermark floor can advance; staged manifest debris is best-effort
     /// cleaned, with the orphan sweep as the durable backstop.

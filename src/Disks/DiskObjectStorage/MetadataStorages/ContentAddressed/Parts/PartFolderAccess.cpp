@@ -321,14 +321,21 @@ bool CachedPartFolderAccess::existsRef(const PartRefKey & key, Freshness freshne
     return resolve(key, freshness).has_value();
 }
 
-void CachedPartFolderAccess::promoteBuild(Cas::PartWriteTxn & build, const PartRefKey & key, UInt128 build_id,
+Cas::CommitOutcome CachedPartFolderAccess::promoteBuild(Cas::PartWriteTxn & build, const PartRefKey & key, UInt128 build_id,
                                           const Cas::ManifestId & manifest_id, bool allow_repoint)
 {
-    build.promote(key.ns, key.ref, build_id, manifest_id, allow_repoint);
+    /// `build.promote` derives `created` INSIDE its own `appendRefOps` builder (the same in-closure
+    /// pattern as that builder's `repoint_old`) and returns it the instant the append confirms. The
+    /// outcome is assembled here IMMEDIATELY -- before `eraseView` (cache invalidation) -- so nothing
+    /// throwable can run ahead of it; `eraseView` itself does not throw in practice, but the ordering
+    /// is the contract a later conditional rollback (Task 3) relies on.
+    const bool created = build.promote(key.ns, key.ref, build_id, manifest_id, allow_repoint);
+    const Cas::CommitOutcome outcome{key.ns, key.ref, manifest_id.ref, created};
     eraseView(key);
+    return outcome;
 }
 
-void CachedPartFolderAccess::publishEntries(const PartRefKey & dst,
+Cas::CommitOutcome CachedPartFolderAccess::publishEntries(const PartRefKey & dst,
     const std::vector<Cas::ManifestEntry> & entries, Cas::ProvenanceOp op, bool allow_repoint)
 {
     auto build = store->beginPartWrite(Cas::PartWriteInfo{.intended_ref = dst.ns.string() + "/" + dst.ref,
@@ -343,7 +350,7 @@ void CachedPartFolderAccess::publishEntries(const PartRefKey & dst,
         /// its manifest ID, so `dst` receives a distinct manifest before ownership moves to it.
         const Cas::ManifestId id = build->stageManifest(entries);
         build->precommitAdd(dst.ns, dst.ref, id);
-        promoteBuild(*build, dst, build->buildId(), id, allow_repoint);
+        return promoteBuild(*build, dst, build->buildId(), id, allow_repoint);
     }
     catch (...)
     {
@@ -394,7 +401,7 @@ bool CachedPartFolderAccess::republishRef(const PartRefKey & src, const PartRefK
     return true;
 }
 
-bool CachedPartFolderAccess::repointRef(const PartRefKey & key, std::vector<Cas::ManifestEntry> entries, Cas::ProvenanceOp op)
+Cas::CommitOutcome CachedPartFolderAccess::repointRef(const PartRefKey & key, std::vector<Cas::ManifestEntry> entries, Cas::ProvenanceOp op)
 {
     /// Compare the candidate `entries` against the currently committed manifest's
     /// decoded entries. This must NOT stage a candidate manifest first: `stageManifest` mints a
@@ -424,10 +431,13 @@ bool CachedPartFolderAccess::repointRef(const PartRefKey & key, std::vector<Cas:
         probe.payload_digest = Cas::computePayloadDigest(probe);
         const Cas::PartManifest canonical_candidate = Cas::decodePartManifest(Cas::encodePartManifest(probe));
         if (committed_manifest->entries == canonical_candidate.entries)
-            return false;
+            /// ZERO pool mutations: the outcome describes the manifest ALREADY committed, unchanged.
+            return Cas::CommitOutcome{key.ns, key.ref, resolved->manifest_id.ref, /*created=*/false};
     }
     /// `publishEntries` takes `entries` by const reference, so the caller-owned vector remains valid.
-    publishEntries(key, entries, op, /*allow_repoint=*/true);
+    /// Capture the exact outcome IMMEDIATELY -- before the ProfileEvent/logging below -- so it is
+    /// published ahead of any further (even if non-throwing in practice) post-commit work.
+    const Cas::CommitOutcome oc = publishEntries(key, entries, op, /*allow_repoint=*/true);
     ProfileEvents::increment(ProfileEvents::CasRefRepoint);
     if (resolved)
     {
@@ -446,7 +456,7 @@ bool CachedPartFolderAccess::repointRef(const PartRefKey & key, std::vector<Cas:
             "unexpected call shape (repointRef requires an existing committed ref)",
             key.ns.string(), key.ref, entries.size());
     }
-    return true;
+    return oc;
 }
 
 void CachedPartFolderAccess::dropRef(const PartRefKey & key)
@@ -499,6 +509,51 @@ void CachedPartFolderAccess::dropRefBestEffort(const PartRefKey & key) noexcept
     /// In destructor/rollback context the ref's durable state is unknown, so invalidate the view even
     /// after a swallowed cleanup exception.
     eraseView(key);
+}
+
+bool CachedPartFolderAccess::dropRefIfMatches(const PartRefKey & key, const Cas::ManifestRef & expected) noexcept
+{
+    /// One `appendRefOps` builder does both the read and the conditional removal, mirroring
+    /// `CasRefLedger::dropRef`'s own protocol shape (read the committed binding, emit ONE
+    /// `OwnerTransition` removal op) but with the removal guarded on `expected` inside the SAME
+    /// closure -- the leader-thread read of `state.getCommitted()` is the authoritative committed
+    /// binding at append time, so this is race-free the same way `PartWriteTxn::promote`'s
+    /// `repoint_old`/idempotent-guard reads are: `build_ops` runs at most once, on the flush leader,
+    /// against the batch-validated state. A mismatch (repointed since `expected` was observed, or
+    /// already absent) returns an empty op list -- a legitimate no-op, not an error, exactly like
+    /// `promote`'s own idempotent-redrive branch.
+    bool removed = false;
+    try
+    {
+        store->appendRefOps(key.ns, MutationScope::ref(key.ref),
+            [&](const RefTableState & state) -> std::vector<RefOp>
+            {
+                const auto it = state.getCommitted().find(key.ref);
+                if (it == state.getCommitted().end() || !(it->second.manifest_ref == expected))
+                    return {};   /// absent, or repointed away from `expected` -- leave it alone
+
+                removed = true;
+                RefOp op;
+                op.kind = RefOpKind::OwnerTransition;
+                op.old_binding = RefOwnerBinding{RefOwnerKind::Committed, key.ref, expected};
+                return {op};
+            },
+            RootMutationOrigin::Writer, RootMutationKind::Drop);
+    }
+    catch (...)
+    {
+        /// Best-effort rollback cleanup, like dropRefBestEffort: debris is GC-reclaimed, but swallowing
+        /// without a diagnostic could leave a live phantom ref after a backend outage.
+        removed = false;
+        ProfileEvents::increment(ProfileEvents::CasRefRollbackBestEffortDropFailed);
+        tryLogCurrentException(getLogger("CachedPartFolderAccess"),
+            fmt::format("CA conditional rollback dropRefIfMatches failed (ns={} ref={} expected={}); "
+                        "the ref may remain live", key.ns.string(), key.ref, Cas::manifestRefDebugString(expected)));
+    }
+    /// The read above is authoritative fresh state regardless of outcome, so any locally retained view
+    /// is invalidated unconditionally -- cheap and conservative, matching dropRefBestEffort.
+    eraseView(key);
+    return removed;
 }
 
 void CachedPartFolderAccess::dropNamespace(const Cas::RootNamespace & ns)

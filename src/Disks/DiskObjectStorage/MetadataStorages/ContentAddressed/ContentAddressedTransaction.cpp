@@ -339,11 +339,14 @@ bool ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
             for (auto & s : st.entries)
                 merged.push_back(std::move(s));
 
-            metadata_storage.partAccess()->repointRef({ns, ref}, std::move(merged), Cas::ProvenanceOp::Other);
+            /// Capture the exact `CommitOutcome` IMMEDIATELY -- before the scratch-build `abandon()`
+            /// below, which can itself throw -- so a later throw there cannot lose it (Task 2's
+            /// publish-before-any-throwable-post-commit-work ordering).
+            const Cas::CommitOutcome oc = metadata_storage.partAccess()->repointRef({ns, ref}, std::move(merged), Cas::ProvenanceOp::Other);
             if (st.build)
                 st.build->abandon();   /// scratch precommit's protecting job is done; the real manifest is live
             st.published = true;
-            return false;   /// a repoint never creates a new ref
+            return oc.created;   /// always false here: this block only runs once `view` already resolved
         }
     }
 
@@ -366,10 +369,12 @@ bool ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
     st.build->precommitAdd(ns, ref, id);
     uploadPendingBlobs(st);
 
-    const bool ref_existed = metadata_storage.partAccess()->existsRef({ns, ref}, Cas::Freshness::ForceFresh);
-    metadata_storage.partAccess()->promoteBuild(*st.build, {ns, ref}, st.build->buildId(), id);
+    /// The exact, in-lane-derived `created` from `promoteBuild` replaces the racy pre-check this used
+    /// to be (`existsRef` before promote, which a concurrent writer could invalidate in the window
+    /// before the promote's own append confirms).
+    const Cas::CommitOutcome oc = metadata_storage.partAccess()->promoteBuild(*st.build, {ns, ref}, st.build->buildId(), id);
     st.published = true;
-    return !ref_existed;
+    return oc.created;
 }
 
 void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &)

@@ -34,6 +34,24 @@ struct PartRefKey
     String cacheKey() const { return ns.string() + '\0' + ref; }
 };
 
+/// Exact record of what one commit-shaped primitive (`promoteBuild`/`repointRef`) durably committed,
+/// derived INSIDE the primitive's own `appendRefOps` builder rather than read back with a separate
+/// call afterward -- a post-read would race against a concurrent repoint of the SAME ref and could
+/// observe someone else's commit instead of this caller's own. `created` distinguishes a first-time
+/// bind (no prior committed row for `ref`) from a repoint of an already-committed one; `manifest_ref`
+/// is the manifest now bound to `ref` (unchanged from before the call on a `repointRef` byte-equal
+/// no-op). A caller that needs to roll back its own commit later can drop `ref` conditionally on this
+/// exact `manifest_ref` (`dropRefIfMatches`) instead of unconditionally (`dropRef`), which would
+/// remove whatever manifest currently occupies the name -- unsafe once a concurrent writer may have
+/// repointed it since.
+struct CommitOutcome
+{
+    RootNamespace ns;
+    String ref;
+    ManifestRef manifest_ref;
+    bool created = false;
+};
+
 /// Read-freshness policy at the part-folder access boundary. The
 /// mutable-read-vs-write-evidence distinction is carried by the METHOD, not a fourth value:
 /// mutable per-part reads call `resolve` (no manifest involved); write-path source reads call
@@ -184,13 +202,16 @@ public:
     /// direction). Committed-ref mutations anywhere else in wiring are style-check failures.
 
     /// Completes a staged transaction with the atomic owner move and invalidates the affected view.
-    /// `allow_repoint` permits replacing a committed ref that names a different manifest.
-    void promoteBuild(Cas::PartWriteTxn & build, const PartRefKey & key, UInt128 build_id,
+    /// `allow_repoint` permits replacing a committed ref that names a different manifest. The returned
+    /// `CommitOutcome` is exact: `created` is derived INSIDE `PartWriteTxn::promote`'s `appendRefOps`
+    /// builder (the same in-closure-output pattern as that builder's own `repoint_old`), not read back
+    /// afterward.
+    CommitOutcome promoteBuild(Cas::PartWriteTxn & build, const PartRefKey & key, UInt128 build_id,
                       const Cas::ManifestId & manifest_id, bool allow_repoint = false);
     /// Performs the shared committed-publish sequence: adopt evidence over
     /// `entries`, stage a fresh manifest, precommit it, and promote it. The new manifest is fully
-    /// prepared before the committed ref is moved.
-    void publishEntries(const PartRefKey & dst, const std::vector<Cas::ManifestEntry> & entries,
+    /// prepared before the committed ref is moved. Returns `promoteBuild`'s exact `CommitOutcome`.
+    CommitOutcome publishEntries(const PartRefKey & dst, const std::vector<Cas::ManifestEntry> & entries,
                         Cas::ProvenanceOp op, bool allow_repoint = false);
     /// Moves a committed ref by publishing the source entries at `dst` and then dropping `src`.
     /// Returns false when the source is absent; a pre-existing destination with different content
@@ -201,8 +222,10 @@ public:
     /// currently committed manifest) is a ZERO-pool-mutation no-op, returns false. Otherwise republishes
     /// a byte-equal candidate returns false without pool mutation; an effective repoint publishes
     /// through `publishEntries(allow_repoint=true)`, emits the repoint audit signals, invalidates the
-    /// cached view, and returns true. `key` must already resolve.
-    bool repointRef(const PartRefKey & key, std::vector<Cas::ManifestEntry> entries, Cas::ProvenanceOp op);
+    /// cached view, and returns the exact `CommitOutcome` (`created` is false on both the byte-equal
+    /// no-op path -- `manifest_ref` names the manifest ALREADY committed, unchanged -- and on an
+    /// effective repoint of an existing ref). `key` must already resolve.
+    CommitOutcome repointRef(const PartRefKey & key, std::vector<Cas::ManifestEntry> entries, Cas::ProvenanceOp op);
     /// Drops a committed ref and invalidates its retained view after the drop succeeds.
     void dropRef(const PartRefKey & key);
     /// Idempotent removal: absent ref is success; a drop racing between resolve and the shard
@@ -211,6 +234,15 @@ public:
     /// Best-effort destructor/rollback cleanup: never throws, logs failure, and relies on GC to reclaim
     /// lingering debris. The view is invalidated even when the durable ref state becomes unknown.
     void dropRefBestEffort(const PartRefKey & key) noexcept;
+    /// Conditional rollback drop: removes `key`'s committed ref ONLY if its CURRENT committed manifest
+    /// binding equals `expected` (typically the `manifest_ref` from a `CommitOutcome` this caller
+    /// itself just produced). A ref repointed by someone else since then -- or already absent -- is
+    /// left untouched; the caller's stale rollback attempt must never clobber a newer commit. Reads
+    /// the committed binding and emits the removal op inside ONE `appendRefOps` builder (mirrors
+    /// `dropRef`'s underlying protocol call, guarded by the equality check inside the same closure).
+    /// `noexcept`: best-effort rollback context, like `dropRefBestEffort` -- swallows and logs a
+    /// failure rather than propagating it. Returns whether it actually removed the ref.
+    bool dropRefIfMatches(const PartRefKey & key, const ManifestRef & expected) noexcept;
     /// Drops all refs in a namespace and removes every retained view belonging to that namespace.
     void dropNamespace(const Cas::RootNamespace & ns);
 

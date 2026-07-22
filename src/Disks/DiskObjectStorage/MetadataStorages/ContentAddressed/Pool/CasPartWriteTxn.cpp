@@ -905,7 +905,7 @@ void PartWriteTxn::precommitAdd(const RootNamespace & target_ns, const String & 
     });
 }
 
-void PartWriteTxn::promote(const RootNamespace & target_ns, const String & final_ref_name, UInt128 promote_build_id, const ManifestId & id, bool allow_repoint)
+bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final_ref_name, UInt128 promote_build_id, const ManifestId & id, bool allow_repoint)
 {
     requireAlive();
 
@@ -939,17 +939,26 @@ void PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
     /// ordinary first-time-commit path. Set inside the closure below; read after it returns to decide
     /// whether the `RefRepoint` audit event fires.
     std::optional<ManifestRef> repoint_old;
+    /// `created`: whether `final_ref_name` has NO committed row as of THIS builder's read of `state`
+    /// -- set as the very first statement of the closure (before any other branch), so it is correct
+    /// on every path: idempotent re-promote no-op (a committed row for `id.ref` already existed ->
+    /// false), an intended repoint (a committed row for a DIFFERENT manifest already existed -> false),
+    /// or a genuine first-time bind (no committed row -> true). Same in-closure-output pattern as
+    /// `repoint_old` immediately below; read by the caller only after `appendRefOps` returns.
+    bool created = false;
     store->appendRefOps(target_ns, MutationScope::ref(final_ref_name),
         /// Capture the closure's INPUTS by value (ref name, manifest id, promote build id, repoint flag,
         /// and the manifest `body` it revalidates) rather than `[&]`, as defense-in-depth against a
         /// closure outliving this stack. Unlike `precommitAdd`, this closure cannot be made fully
         /// self-contained: `depIsTokened`/`isTrustedAdopt` read this build's `deps` member (so it must
-        /// keep `this`), and `repoint_old` is an OUTPUT read after the call returns (so it stays a
-        /// reference). The ref-lane leadership guard is the real fix; both residual by-reference captures
+        /// keep `this`), and `repoint_old`/`created` are OUTPUTS read after the call returns (so they stay
+        /// references). The ref-lane leadership guard is the real fix; both residual by-reference captures
         /// are safe because the guard guarantees the closure is never invoked after this frame unwinds.
-        [this, final_ref_name, id, promote_build_id, allow_repoint, body, &repoint_old]
+        [this, final_ref_name, id, promote_build_id, allow_repoint, body, &repoint_old, &created]
         (const RefTableState & state) -> std::vector<RefOp>
         {
+            created = state.getCommitted().find(final_ref_name) == state.getCommitted().end();
+
             /// Idempotent re-promote: the target ref is ALREADY committed to this EXACT manifest_ref --
             /// a legitimate re-drive (a crash/retry between a prior promote and its caller's own
             /// follow-up, or a direct repeat call) that must complete as a no-op, not require a live
@@ -1135,6 +1144,7 @@ void PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
             tryLogCurrentException(getLogger("CasPartWriteTxn"), "CAS event emission after durable promote");
         }
     }
+    return created;
 }
 
 void PartWriteTxn::abandon()
