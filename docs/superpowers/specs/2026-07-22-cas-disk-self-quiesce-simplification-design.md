@@ -1,5 +1,14 @@
 # CAS disk: self-quiesce on vanished backing, and drop the runtime mount/unmount reuse lifecycle
 
+> **SUPERSEDED (2026-07-22)** by `2026-07-22-cas-disk-lease-loss-throw-and-stop-verbs-design.md`.
+> A codex gpt-5.6-sol (high) adversarial review found this spec's central assumption false: keeping Part 6
+> (benign-absent probes) is NOT safe, because "mount-key absent ⇒ data gone" is false, and the new `Inert`
+> state (and startup/readonly/shutdown/false-transient-vanish) are all not-live-with-possibly-intact-data
+> states that reopen the silent-skip reclaim leak; the untyped `on_lost` self-quiesce also inerts a healthy
+> disk on a transient outage and self-joins the keeper thread. The successor drops Part 6 entirely (throw
+> always), keeps background threads running on involuntary lease loss (auto-recovery), and adds explicit
+> STOP/START verbs. Retained here only for the design record.
+
 Status: supersedes the disk-lifecycle parts of `2026-07-21-cas-mount-lease-abort-and-disk-lifecycle-design.md`
 (rev.2) and discards `2026-07-22-cas-disk-lifecycle-automount-design.md` (an eject/auto-mount exploration
 that produced no code). It keeps that first spec's Part 1 (abort-hardening) and Part 6 (benign-absent
