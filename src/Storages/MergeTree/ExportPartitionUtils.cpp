@@ -616,10 +616,15 @@ namespace
                 const auto * expression_list = child->as<ASTExpressionList>();
                 if (!expression_list)
                     continue;
+                /// A nested function such as toYYYYMM(toDate(ts)) is not unwrapped: it yields no column and
+                /// stays unmatched, as the monotonicity proof only handles a single function of a single column.
                 for (const auto & arg : expression_list->children)
                 {
                     if (const auto * id = arg->as<ASTIdentifier>())
                         term.column = id->name();
+                    /// Integer literal is the bucket/truncate width; a string literal is a date transform's timezone.
+                    /// In theory, the string literal could mean a different thing, but among the partition expressions iceberg supports
+                    /// time_zone is the only option
                     else if (const auto * lit = arg->as<ASTLiteral>())
                     {
                         if (lit->value.getType() == Field::Types::String)
