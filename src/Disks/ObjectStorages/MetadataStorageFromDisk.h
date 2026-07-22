@@ -33,6 +33,8 @@ public:
 
     MetadataTransactionPtr createTransaction() override;
 
+    bool supportWritingWithAppend() const override;
+
     const std::string & getPath() const override;
 
     MetadataStorageType getType() const override { return MetadataStorageType::Local; }
