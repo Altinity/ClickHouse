@@ -6,9 +6,12 @@ evidence instead of re-deriving the dead-ends. Written 2026-07-22 after four suc
 husk, eject, auto-mount, self-quiesce/"Path B") were each shown unsound — the last by an adversarial
 review (codex gpt-5.6-sol, high) that found the core assumption false.
 
-Related (all superseded / partial): `2026-07-21-cas-mount-lease-abort-and-disk-lifecycle-design.md`
-(rev.2 — Part 1 & Part 6 stand; Parts 2-4 rolled back), `2026-07-22-cas-disk-lifecycle-automount-design.md`
-(eject/auto-mount, no code), `2026-07-22-cas-disk-self-quiesce-simplification-design.md` (Path B, blocked).
+Related specs — **all deleted from the tree 2026-07-22; git history holds them**:
+`2026-07-21-cas-mount-lease-abort-and-disk-lifecycle-design.md` (rev.2 — Part 1 stands, contract
+transferred into the living spec's §9; Parts 2-4/Part 6 rolled back),
+`2026-07-22-cas-disk-lifecycle-automount-design.md` (eject/auto-mount, no code),
+`2026-07-22-cas-disk-self-quiesce-simplification-design.md` (Path B, blocked).
+**The living spec is `2026-07-22-cas-disk-lease-loss-throw-and-stop-verbs-design.md` (rev.6).**
 
 ---
 

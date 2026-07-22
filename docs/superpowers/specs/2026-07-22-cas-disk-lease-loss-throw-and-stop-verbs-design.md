@@ -24,13 +24,24 @@ permits truthful absence") has survived three adversarial reviews unchanged.
   (default `search_orphaned_parts_disks=ANY` sweeps every disk) until `FORGET`/restart — accepted and
   stated, not narrowed to "drops involving the disk".
 
-**Part 6 vs the terminal states (unchanged):** Part 6 answered absent when it *didn't know* (a lie).
-`Vanished` answers absent when it is *proven or operator-asserted* (the truth). Everything in between —
-`transient`, `IdentityLost` — **throws**.
+**Part 6 vs the terminal states — the honesty distinction this design rests on:**
 
-Supersedes: rev.1–rev.5, the Path-B spec, the automount/eject spec, Parts 2–4 of the 2026-07-21 spec
-(landed Task 4–8; **Part 1 KEPT**). Companion: `2026-07-22-cas-disk-lifecycle-problem-and-constraints.md`
-(C2/C3 refined in step with this revision).
+| | Part 6 (rolled back) | `Vanished` (rev.6) |
+|---|---|---|
+| Gate condition | "not Mounted" — **ambiguous**, data possibly intact | erasure **proven** (§2) or operator-asserted (`FORGET`) |
+| exists/list answers | absent/empty — **a lie** when data is intact | absent/empty — **the truth** |
+| Content reads | absent-ish | **typed throw** ("data root erased") — loud diagnosis |
+| Writes/creates | benign | **typed throw** |
+| Transient outage / `IdentityLost` | lied "absent" | **throws** (no benign answer while uncertain) |
+
+This is constraint C2 / requirement R2 of the companion: benign-absent is legitimate **only** in a
+positively-established data-erased state.
+
+Supersedes (all **deleted** from the tree — git history holds them): rev.1–rev.5 of this file, the Path-B
+self-quiesce spec, the automount/eject spec, and the 2026-07-21 Dormant/UNMOUNT spec (its landed Task 4–8
+are rolled back per §9; its **Part 1 is KEPT** — contract transferred into §9). The living documents are
+this file and the companion `2026-07-22-cas-disk-lifecycle-problem-and-constraints.md` (C2/C3 refined in
+step with this revision).
 
 ---
 
@@ -75,12 +86,21 @@ typed transient error. The ref-log publish chokepoint is `appendRefOps` + the co
 **reads** may complete on their existing pipelines (their failure modes are the backend's own errors) —
 this is the C3 refinement in the companion.
 
-**The empty-proof rule** (unchanged from rev.5, confirmed sound): pre-terminal and on read-only pools, an
+**The empty-proof rule** (confirmed sound by the rev.5 review): pre-terminal and on read-only pools, an
 enumeration about to answer empty at a data root (`TableDir`, `DetachedContainer` `DirShape`s,
 `ContentAddressedMetadataStorage.cpp:1303`) first confirms `_pool_meta` with an authoritative, uncached
 probe; absent ⇒ typed throw. Terminal `Vanished` answers truth-empty directly. Enumeration latency now
 couples to one backend GET on the empty path — the correct fail-closed trade-off, bounded by ordinary
 request timeouts.
+
+Why this rule is load-bearing for **read-only** pools: they have no keeper (no lease, no natural
+detection), and MergeTree skips both directory creation and the `format_version.txt` write on a read-only
+disk (`MergeTreeData.cpp:469/:501`) — enumeration is their *only* line of defense against silently
+attaching an empty table over an erased backing. On **writable** pools ATTACH/CREATE are protected by the
+write class instead: directory creation is unconditional for CREATE and ATTACH alike
+(`need_create_directories = true` — trace-verified in the automount exploration), so the gated
+`createDirectory*`/`format_version` write (`MergeTreeData.cpp:513`) throws before `loadDataParts` ever
+enumerates — an explicit contract now, not the fragile ordering accident it used to be.
 
 ## 2. Typed erasure evidence
 
@@ -88,10 +108,19 @@ Single choke point: step 0 of `tryRemountOnce` (existing fresh-incarnation recov
 `claimOwnerOrThrow`'s empty-root bootstrap unreachable from recovery).
 
 `ProbeResult ∈ {Present(meta), KeyAbsent, ContainerAbsent, AccessDenied, Indeterminate}` implemented at the
-`IObjectStorage`/raw-error boundary (raw HEAD error preserved before `getObjectInfo.cpp:135` discards it;
-Local: explicit stat of the configured container/parent; container proof = `ListObjectsV2(max-keys=1,
-prefix=pool_root)`; the IAM permutation table from the rev.4 review: only LIST-allowed+GET-allowed yields a
-trustworthy 404, everything else stays transient).
+`IObjectStorage`/raw-error boundary (raw HEAD error preserved before `getObjectInfo.cpp:135` discards it —
+today S3 merges `NO_SUCH_KEY`/`NO_SUCH_BUCKET`/`RESOURCE_NOT_FOUND` into one `nullopt`; Local: explicit
+stat of the configured container/parent distinguishes deleted-prefix from missing-key). Container proof =
+`ListObjectsV2(max-keys=1, prefix=pool_root)`, not bucket HEAD. The IAM permutations (verified against AWS
+semantics in the rev.4 review):
+
+| IAM state | Probe outcome | Verdict |
+|---|---|---|
+| `ListBucket(prefix)` + `GetObject` allowed | absence yields a genuine 404 | trustworthy `KeyAbsent` |
+| LIST allowed, GET denied | key probe answers 403 | `AccessDenied` → stay transient |
+| LIST denied, GET allowed | container proof fails | stay transient |
+| LIST denied, key absent | AWS answers 403, not 404 | stay transient |
+| Gateway masking denied-GET as 404 | indistinguishable from absent | excluded by contract (capability-probe territory) |
 
 - **`Present` + identity match** (`pool_id` + `blob_header_len`; format gate = successful compatible
   decode) → existing recovery. **`Present` + foreign `pool_id`** → `Vanished(replaced)`.
@@ -146,16 +175,24 @@ stopping/fencing every member first.
 
 ## 4. Blast radius
 
-Transient: honest failures, auto-drain; fence-out recovery ≈ 36.5 s (+30 s grace if a ref lane was
-unsettled); the first renewal failure may precede fence-out by the remaining lease budget.
+Transient: honest failures, auto-drain; fence-out recovery ≈ 36.5 s (TTL + 5 % + 5 s remount poll,
+`CasServerRoot.cpp:390`, `CasPool.cpp:632`) + 30 s materialization grace if a ref lane was unsettled
+(`CasPool.cpp:678`); the first renewal failure may precede fence-out by the remaining lease budget.
 **`IdentityLost` [C5]: one such disk stalls ALL eligible Atomic `DROP` finalizations** (the finalizer
 sweeps every registered disk under default `search_orphaned_parts_disks=ANY`,
 `DatabaseCatalog.cpp:1657`) and any other all-disk operation that probes it, until `FORGET`/restart —
 accepted: its origin is an out-of-contract erase or a genuinely broken backing, both operator-attention
-events; the cure is one explicit verb. Other rows as rev.5: `Vanished` rows all proceed on truth;
-transient/`IdentityLost` rows fail honestly; the `search_orphaned_parts_disks=ANY` + AsyncLoader-no-retry
-table-load exposure stands accepted with `LOCAL` guidance; `SELECT`/`BACKUP` on a vanished disk get typed
-errors, never silent-empty.
+events; the cure is one explicit verb.
+
+| Caller | transient / `IdentityLost` | `Vanished` |
+|---|---|---|
+| `DROP` finalizer all-disk sweep (`DatabaseCatalog.cpp:1657`) | per-table throw → re-queue (existing catch `:1562`) → drains on recovery (transient) or after `FORGET` (`IdentityLost`); logs ~1/5 s per queued table (`ServerSettings.cpp:456`) — throttled | exists=false → skip (truth) |
+| `table->drop()` of a table on the disk | throws → that table's `DROP` re-queues | removes no-op → **`DROP` completes** (txn constructible per the Factory class) |
+| Orphan store-dir sweep (`DatabaseCatalog.cpp:1986`) | already never visits CA disks (`supportsStat`/`supportsChmod` false) — unaffected | same |
+| `SYSTEM UNFREEZE` (`Freeze.cpp:147`), `system.remote_data_paths` (`:281`), `ATTACH AS REPLICATED` cleanup (`InterpreterCreateQuery.cpp:2807`), non-Atomic `DROP` (`DatabaseOnDisk.cpp:394`) | honest error; retry later | truthful absent/empty → proceed |
+| MergeTree foreign-part scan (`MergeTreeData.cpp:2362/2398`; default `search_orphaned_parts_disks=ANY`, `MergeTreeSettings.cpp:2228`) | can fail an **unrelated non-default-policy** table load, and AsyncLoader does **not** retry (`AsyncLoader.cpp:468`) — permanent until manual `ATTACH`/restart. **Accepted + documented**; cure: `ATTACH` after recovery; guidance: `search_orphaned_parts_disks = LOCAL` where CA disks are configured. Inline/custom disks and default-policy tables unaffected | truthful absent → proceeds |
+| `SELECT` on a loaded table of the disk | throw 668 | typed erased error — never silent-empty |
+| `BACKUP` of such a table | throw | typed erased error (no silent empty backup) |
 
 ## 5. `SYSTEM CONTENT ADDRESSED FORGET '<disk>'`
 
@@ -165,7 +202,10 @@ clean farewell); (4) stop GC (clear `i_am_leader`); (5) join keeper/remount/GC o
 (6) set `Vanished(forgotten)`. Hazards documented: operator-wrong = the benign lie by human assertion +
 no-op removes can orphan durable refs that a restart re-exposes; node-local. Own `AccessType`.
 
-Not doing: runtime `STOP/START`, reuse `UNMOUNT/MOUNT`, registry eviction.
+Not doing: runtime `STOP/START` (unsound without a process-wide disk-use barrier — rev.1 P0 #3), reuse
+`UNMOUNT/MOUNT`, registry eviction, `UNMOUNT ALL`, and **mounting an inline `disk(...)` without a table**
+(an early brainstorm goal — consciously dropped with the reuse lifecycle; admin verbs target registered
+disks, and a config-defined disk covers the table-less-FSCK case).
 
 ## 6. `GC STOP '<disk>'` / `GC START '<disk>'`
 
@@ -209,10 +249,23 @@ restart-after-full-deletion. Permanently-unconfirmable disk: stalls until `FORGE
 7. **The `GC RUN → UNMOUNT → FSCK → rm -rf` teardown pattern** in `04290`/`04295`/`05020` → replaced by
    the fail-closed `DROP SYNC → FORGET → verify → rm -rf` teardown below.
 
-**Keep untouched:** Part 1 (abort-hardening: vanished/absent lease → `FILE_DOESNT_EXIST`/no-op, never
-`LOGICAL_ERROR`), the `poolAccess` coherent snapshot, atomic-publish `startup()`, the `ca-fsck` rename, and
-the GC-round entry-point gating (now via §3's lifecycle protocol — the raw entry points
-`runGarbageCollectionRoundNow`/`runOneGcRoundForTest` get the same gate).
+**Keep untouched:** Part 1 (below), the `poolAccess` coherent snapshot, atomic-publish `startup()`, the
+`ca-fsck` rename, and the GC-round entry-point gating (now via §3's lifecycle protocol — the raw entry
+points `runGarbageCollectionRoundNow`/`runOneGcRoundForTest` get the same gate).
+
+**Part 1 — the landed abort-hardening contract** (transferred from the deleted 2026-07-21 spec; the code
+is landed and stays):
+- **Renewal path** (`MountLeaseKeeper::onRenewMismatch`, `CasServerRoot.cpp`): a re-read finding the mount
+  key **absent** (backing deleted under a live mount) is an ENVIRONMENTAL condition, not a logic error —
+  stop renewing fail-closed (fence latches to lost, never re-mint) via `FILE_DOESNT_EXIST`, **never**
+  `LOGICAL_ERROR` (which aborts debug/ASan builds at exception *construction* under
+  `abort_on_logical_error`). Genuine present-body foreign/superseded cases stay fatal.
+- **Terminate path**: absent-lease during the clean-release terminal write is likewise environmental —
+  complete the terminate as a no-op release (the object we would delete is already gone) or
+  `FILE_DOESNT_EXIST` where the caller's contract requires a throw.
+- **`CasMountLeaseLost` ProfileEvent**: counts terminal mount-lease losses (`vanished`, `superseded`,
+  `foreign_writer`; NOT the recoverable `fenced_by_gc` branch), paired with a
+  `system.content_addressed_log` `MountConflict` row.
 
 Tests — unique
 names+paths with invocation-random suffix, normalized reference output, **fail-closed teardown**

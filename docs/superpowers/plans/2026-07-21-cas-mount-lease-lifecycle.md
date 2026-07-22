@@ -8,7 +8,7 @@
 
 **Tech Stack:** C++ (ClickHouse fork; CAS subsystem under `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/`, SYSTEM-verb wiring in `src/Parsers` + `src/Interpreters` + `src/Access`), GoogleTest (`src/Disks/tests/`), bash stateless tests.
 
-**Spec:** `docs/superpowers/specs/2026-07-21-cas-mount-lease-abort-and-disk-lifecycle-design.md` (rev.2 — read it; it records WHY each mechanism is shaped this way, including the 11 review findings it answers).
+**Spec:** `docs/superpowers/specs/2026-07-21-cas-mount-lease-abort-and-disk-lifecycle-design.md` (rev.2) — **DELETED from the tree 2026-07-22 (git history holds it)**. This plan is a HISTORICAL record of landed work: its Tasks 4-8 (Dormant/UNMOUNT/MOUNT lifecycle, Part 6 benign-absent, dormant-only FSCK) are scheduled for ROLLBACK by the living spec `docs/superpowers/specs/2026-07-22-cas-disk-lease-loss-throw-and-stop-verbs-design.md` (rev.6, §9); Part 1 (abort-hardening) stays.
 
 ## Global Constraints
 
