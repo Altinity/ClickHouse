@@ -48,7 +48,7 @@ namespace ExportPartitionUtils
     /// assembles the Iceberg commit arguments (deriving the partition source block from the source
     /// table when the destination is a data lake with a partition key) and invokes
     /// `commitExportPartitionTransaction` on the destination storage.
-    void commitExportedPaths(
+    IStorage::ExportPartitionCommitInfo commitExportedPaths(
         const String & transaction_id,
         const String & partition_id,
         const String & iceberg_metadata_json,

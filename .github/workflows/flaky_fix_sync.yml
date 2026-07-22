@@ -1,0 +1,106 @@
+name: Flaky Fix Backport Check
+
+on:
+  workflow_dispatch:
+    inputs:
+      since_days:
+        description: 'How many days back to scan upstream master (default: 7)'
+        required: false
+        type: string
+        default: '7'
+      pattern:
+        description: 'Commit subject pattern to match (case-insensitive)'
+        required: false
+        type: string
+        default: 'fix flaky test'
+      upstream_ref:
+        description: 'Upstream branch/ref to scan'
+        required: false
+        type: string
+        default: 'master'
+      create_pr:
+        description: 'Cherry-pick missing commits and open a backport PR'
+        required: false
+        type: boolean
+        default: false
+
+  schedule:
+    - cron: '0 12 * * 1'  # Every Monday at 08:00 EDT (12:00 UTC)
+
+jobs:
+  check:
+    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          filter: blob:none
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+
+      - name: Check for missing flaky-fix backports
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 tests/ci/check_for_flaky_fixes.py \
+            --since-days "${{ inputs.since_days || '7' }}" \
+            --pattern "${{ inputs.pattern || 'fix flaky test' }}" \
+            --upstream-ref "${{ inputs.upstream_ref || 'master' }}" \
+            --md-output flaky_fix_report.md \
+            --json-output flaky_fix.json
+
+      - name: Write summary
+        if: always()
+        run: cat flaky_fix_report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload check results
+        uses: actions/upload-artifact@v4
+        with:
+          name: flaky-fix-check
+          path: |
+            flaky_fix_report.md
+            flaky_fix.json
+
+  backport:
+    needs: check
+    if: ${{ github.event_name == 'schedule' || inputs.create_pr == true }}
+    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          filter: blob:none
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+
+      - name: Download check results
+        uses: actions/download-artifact@v4
+        with:
+          name: flaky-fix-check
+
+      - name: Configure git identity
+        run: |
+          git config user.name altinity-robot
+          git config user.email altinity-robot@users.noreply.github.com
+
+      - name: Add upstream promisor remote
+        run: |
+          git remote add upstream https://github.com/ClickHouse/ClickHouse.git
+          git config remote.upstream.promisor true
+          git config remote.upstream.partialclonefilter blob:none
+
+      - name: Cherry-pick and open PR
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 tests/ci/backport_flaky_fixes.py \
+            --json-file flaky_fix.json \
+            --repo "${{ github.repository }}"
