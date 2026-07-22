@@ -1,9 +1,14 @@
 # CAS multi-commit — phased cross-part commit at the `renameParts` seam
 
 - **Date:** 2026-07-22
-- **Status:** design approved (supersedes the inner-loop half of
-  `2026-07-22-cas-parallel-write-path-design.md`; Tasks 4-5 of that plan were reverted after the
-  granularity investigation showed the inner loop is the wrong layer for INSERT)
+- **Status:** SUPERSEDED by `2026-07-22-cas-batched-part-commit-v2-design.md`. A Codex/gpt-5.6-sol
+  xhigh adversarial review returned `BLOCKING FLAW` (4 blocking + 5 important findings — ownership
+  lifecycle at the seam, void `submitBatch` without per-item results, non-reusable leadership-exit
+  guard, rollback semantics contradicting the `created`-filter, byte-estimate admission, and a
+  bulk-topology claim not present in the actual `REPLACE`/`MOVE PARTITION` paths). Kept for the
+  problem analysis; do not implement from this document. (Historical: supersedes the inner-loop
+  half of `2026-07-22-cas-parallel-write-path-design.md`; Tasks 4-5 of that plan were reverted
+  after the granularity investigation showed the inner loop is the wrong layer for INSERT.)
 - **Area:** `src/Storages/MergeTree/MergeTreeData.cpp` (`Transaction::renameParts`/`commit`),
   `src/Disks/IDisk.h` / `src/Disks/ObjectStorages/IMetadataStorage.h` (new seam),
   `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/` (phased implementation,
