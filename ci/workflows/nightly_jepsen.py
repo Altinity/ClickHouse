@@ -24,6 +24,7 @@ workflow = Workflow.Config(
     jobs=[
         binary_build_job,
         JobConfigs.jepsen_keeper,
+        JobConfigs.jepsen_server,
     ],
     artifacts=[
         *ArtifactConfigs.clickhouse_binaries,
@@ -33,7 +34,7 @@ workflow = Workflow.Config(
     enable_cache=True,
     enable_report=True,
     enable_cidb=True,
-    cron_schedules=["13 4 * * *"],
+    cron_schedules=["13 4 * * 0"],
     pre_hooks=["python3 ./ci/jobs/scripts/workflow_hooks/store_data.py"],
 )
 

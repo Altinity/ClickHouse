@@ -62,7 +62,6 @@ DISABLED_WORKFLOWS = [
     "optimize_toolchain.py",
     "nightly_coverage.py",
     "nightly_fuzzers.py",
-    "nightly_jepsen.py",
     "nightly_statistics.py",
     "VectorSearchStress.py",
 ]
