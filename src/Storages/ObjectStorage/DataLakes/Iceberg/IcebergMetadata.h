@@ -106,8 +106,6 @@ public:
 
     ColumnMapperPtr getColumnMapperForCurrentSchema(StorageMetadataPtr storage_metadata_snapshot, ContextPtr context) const override;
 
-    Names getIdentityPartitionColumnNames(const DataLakeTableStateSnapshot & state, ContextPtr context) const override;
-
     SinkToStoragePtr write(
         SharedHeader sample_block,
         const StorageID & table_id,
@@ -211,6 +209,7 @@ private:
 
     std::optional<String> getPartitionKey(ContextPtr local_context, Iceberg::TableStateSnapshot actual_table_state_snapshot) const;
     KeyDescription getSortingKey(ContextPtr local_context, Iceberg::TableStateSnapshot actual_table_state_snapshot) const;
+    KeyDescription getSortingKeyFromMetadata(const Poco::JSON::Object::Ptr & metadata_object, ContextPtr local_context) const;
 
     /// Non-empty return value means the attempt succeeded (covers both the normal
     /// publish path and the `isExportPartitionTransactionAlreadyCommitted` short-circuit).

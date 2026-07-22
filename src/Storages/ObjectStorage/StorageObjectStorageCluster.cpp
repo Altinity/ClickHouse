@@ -212,8 +212,6 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
                 if (auto metadata_snapshot = configuration->buildStorageMetadataFromState(*state, context_))
                     metadata = *metadata_snapshot;
             }
-
-            StorageObjectStorage::updateIdentityPartitionColumns(metadata, configuration, *state, context_);
         }
     }
 
@@ -567,12 +565,6 @@ void StorageObjectStorageCluster::updateExternalDynamicMetadataIfExists(ContextP
         if (auto metadata_snapshot = configuration->buildStorageMetadataFromState(*state, query_context))
             new_metadata = *metadata_snapshot;
     }
-
-    /// Resolved from the same pinned `state` above -- no second state resolution.
-    /// Stored directly in `new_metadata` so it reaches `pure_storage` (and, through
-    /// it, distributed workers constructed via the rewritten table function) via the
-    /// same setInMemoryMetadata propagation below, with no separate call needed.
-    StorageObjectStorage::updateIdentityPartitionColumns(new_metadata, configuration, *state, query_context);
 
     setInMemoryMetadata(new_metadata);
 

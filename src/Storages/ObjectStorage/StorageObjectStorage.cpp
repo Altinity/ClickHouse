@@ -285,12 +285,6 @@ StorageObjectStorage::StorageObjectStorage(
                 if (auto metadata_snapshot = configuration->buildStorageMetadataFromState(*state, context))
                     metadata = *metadata_snapshot;
             }
-
-            /// Table functions bypass updateExternalDynamicMetadataIfExists (see above),
-            /// so identity-partition columns must be resolved here as well -- otherwise
-            /// PREWHERE could be built over a column that gets erased from the read set
-            /// as file-constant (see StorageObjectStorageSource's constant-column handling).
-            updateIdentityPartitionColumns(metadata, configuration, *state, context);
         }
     }
 
@@ -375,16 +369,6 @@ configuration->update(object_storage, query_context);
     return configuration->getExternalMetadata();
 }
 
-void StorageObjectStorage::updateIdentityPartitionColumns(
-    StorageInMemoryMetadata & metadata,
-    const StorageObjectStorageConfigurationPtr & configuration,
-    const DataLakeTableStateSnapshot & state,
-    ContextPtr context)
-{
-    if (context->getSettingsRef()[Setting::allow_experimental_iceberg_read_optimization])
-        metadata.setIdentityPartitionColumns(configuration->getIdentityPartitionColumnNames(state, context));
-}
-
 void StorageObjectStorage::updateExternalDynamicMetadataIfExists(ContextPtr query_context)
 {
     if (!configuration->isDataLakeConfiguration())
@@ -411,9 +395,6 @@ void StorageObjectStorage::updateExternalDynamicMetadataIfExists(ContextPtr quer
         if (auto metadata_snapshot = configuration->buildStorageMetadataFromState(*state, query_context))
             new_metadata = *metadata_snapshot;
     }
-
-    /// Resolved from the same pinned `state` above -- no second state resolution.
-    updateIdentityPartitionColumns(new_metadata, configuration, *state, query_context);
 
     setInMemoryMetadata(new_metadata);
 }

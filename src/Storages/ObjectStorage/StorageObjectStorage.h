@@ -156,17 +156,6 @@ public:
 
     void addInferredEngineArgsToCreateQuery(ASTs & args, const ContextPtr & context) const override;
 
-    /// Resolves identity-partition column names for the given already-pinned table
-    /// state snapshot (no extra state resolution) and stores them into `metadata`,
-    /// gated by the `allow_experimental_iceberg_read_optimization` setting. Shared by
-    /// the table-function constructor, `updateExternalDynamicMetadataIfExists`, and
-    /// `StorageObjectStorageCluster`.
-    static void updateIdentityPartitionColumns(
-        StorageInMemoryMetadata & metadata,
-        const StorageObjectStorageConfigurationPtr & configuration,
-        const DataLakeTableStateSnapshot & state,
-        ContextPtr context);
-
     void updateExternalDynamicMetadataIfExists(ContextPtr query_context) override;
 
     IDataLakeMetadata * getExternalMetadata(ContextPtr query_context);

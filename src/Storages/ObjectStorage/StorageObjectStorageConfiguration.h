@@ -312,8 +312,6 @@ public:
 
     virtual ColumnMapperPtr getColumnMapperForCurrentSchema(StorageMetadataPtr /**/, ContextPtr /**/) const { return nullptr; }
 
-    virtual Names getIdentityPartitionColumnNames(const DataLakeTableStateSnapshot &, ContextPtr) const { return {}; }
-
     virtual std::shared_ptr<DataLake::ICatalog> getCatalog(ContextPtr /*context*/, const StorageID & /*table_id*/) const
     {
         return nullptr;
