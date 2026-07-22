@@ -78,8 +78,8 @@ struct MergeTreePartitionExportTask
     bool allow_lossy_cast = false;
     String iceberg_metadata_json;
 
-    /// Optional like on the manifest: an absent value means the task predates the setting and must
-    /// resolve to the setting's legacy default rather than to whatever the ambient context holds.
+    /// Optional for backwards compatibility with descriptors written before these
+    /// settings were persisted (same shape as ExportReplicatedMergeTreePartitionManifest).
     std::optional<String> parquet_compression_method;
     std::optional<UInt64> output_format_compression_level;
     std::optional<UInt64> parquet_row_group_size;
