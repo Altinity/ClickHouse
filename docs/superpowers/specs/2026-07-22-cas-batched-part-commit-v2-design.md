@@ -1,10 +1,19 @@
 # CAS batched part-commit v2 — ownership-safe seam, count-based ledger groups
 
 - **Date:** 2026-07-22
-- **Status:** design approved (second design; v1 `2026-07-22-cas-multicommit-phased-design.md` is
-  SUPERSEDED after a Codex/gpt-5.6-sol xhigh adversarial review returned `BLOCKING FLAW` — 4
-  blocking + 5 important findings, all adjudicated as real; this design resolves each one, see
-  `tmp/multicommit-spec-review-codex-full.log` for the full review)
+- **Status:** SUPERSEDED by `2026-07-22-cas-writepath-stage1-internal-design.md` (and a future
+  stage-2 sink-concurrency design). Codex review round 2 returned `BLOCKING FLAW` with the
+  decisive topology finding: `ReplicatedMergeTreeSink::finishDelayed` commits parts ONE AT A TIME
+  (each `commitPart` builds its own single-part `MergeTreeData::Transaction` and calls
+  `renameParts` before its Keeper multi — `ReplicatedMergeTreeSink.cpp:434,995-1011`), so any
+  batch seam at or below `renameParts` receives spans of ONE on the production INSERT path and
+  the phased engine never engages. Additional round-2 findings: throwable pending→owned carve
+  transfer (a real existing bug), first-item-over-op-cap livelock, removal-class budget
+  contradiction, destructor-is-not-undo, unspecified mixed-result outer epilogues, recovery
+  candidate-install discipline. The surviving CAS-internal pieces moved to the stage-1 spec;
+  cross-part parallelism moves to stage 2 (concurrent `commitPart`, emergent ledger batching).
+  Kept for the problem analysis; do not implement from this document. (Round-1 history: v1
+  `2026-07-22-cas-multicommit-phased-design.md`.)
 - **Area:** `src/Storages/MergeTree/MergeTreeData.cpp` (`Transaction::renameParts`),
   `src/Storages/MergeTree/IDataPartStorage.h` / `DataPartStorageOnDiskFull` (one new method),
   `src/Disks/IDisk.h` / `DiskObjectStorage` (one new method),
