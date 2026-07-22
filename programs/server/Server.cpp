@@ -1496,6 +1496,10 @@ try
         Stopwatch watch;
         LOG_INFO(log, "Waiting for background threads");
         DB::StaticThreadPool::shutdownAll();
+        /// Same rationale as `StaticThreadPool::shutdownAll()` just above: this pool's workers must be
+        /// joined before the global pool shuts down, or a worker still running could try to schedule
+        /// onto an already-shut-down `GlobalThreadPool` and hang.
+        DB::Cas::shutdownCasCommitThreadPool();
         GlobalThreadPool::instance().shutdown();
         LOG_INFO(log, "Background threads finished in {} ms", watch.elapsedMilliseconds());
     });

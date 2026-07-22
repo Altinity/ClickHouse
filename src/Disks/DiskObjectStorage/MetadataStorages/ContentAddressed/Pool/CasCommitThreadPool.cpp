@@ -1,5 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasCommitThreadPool.h>
 #include <Common/CurrentMetrics.h>
+#include <Common/Exception.h>
 #include <Common/ThreadPool.h>
 #include <memory>
 #include <mutex>
@@ -11,44 +12,47 @@ namespace CurrentMetrics
     extern const Metric LocalThreadScheduled;
 }
 
+namespace DB
+{
+namespace ErrorCodes
+{
+    extern const int LOGICAL_ERROR;
+}
+}
+
 namespace DB::Cas
 {
 
 namespace
 {
 
-/// The compiled-in default used only when nobody (server startup, a test) has explicitly sized the
-/// pool yet -- kept in sync with `cas_commit_pool_size`'s default (`Core/ServerSettings.cpp`), but not
-/// derived from it: this file must not depend on `ServerSettings` (a unit test constructing this pool
-/// has no server settings object at all).
-constexpr size_t default_max_threads = 100;
-
-/// The pool object itself, plus the `std::call_once` guard that makes both entry points below
-/// (an explicit server-startup size, or a lazy self-initializing first access) race-free and
-/// idempotent -- mirroring `StaticThreadPool`'s `initialize`/`initializeWithDefaultSettingsIfNotInitialized`
-/// pair (`IO/SharedThreadPools.h`), but kept private to this translation unit rather than reusing that
-/// class: this pool is a single, CAS-owned singleton, not one more entry in the generic
-/// `APPLY_FOR_STATIC_THREAD_POOLS` registry shared by unrelated subsystems (IO, backups, MergeTree...).
+/// The pool object itself, plus the mutex guarding construction/destruction -- mirroring
+/// `StaticThreadPool`'s `initialize`/`get`/`shutdown` (`IO/SharedThreadPools.cpp`), but kept private to
+/// this translation unit rather than reusing that class: this pool is a single, CAS-owned singleton,
+/// not one more entry in the generic `APPLY_FOR_STATIC_THREAD_POOLS` registry shared by unrelated
+/// subsystems (IO, backups, MergeTree...).
+///
+/// Deliberately fails loud on both ends: `get()` throws if `initialize()` hasn't run yet, and
+/// `initialize()` throws if called twice. There is no lazy self-initializing fallback with a
+/// hardcoded default -- that would make `cas_commit_pool_size` a silent no-op for any caller that
+/// reaches the pool before `programs/server/Server.cpp` wires it up.
 class CasCommitPoolHolder
 {
 public:
     ThreadPool & get()
     {
-        std::call_once(init_flag, [this] { initializeImpl(default_max_threads, 0, 10000); });
+        std::lock_guard lock(mutex);
+        if (!instance)
+            throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "CAS commit thread pool is not initialized");
         return *instance;
     }
 
     void initialize(size_t max_threads, size_t max_free_threads, size_t queue_size)
     {
-        std::call_once(init_flag, [this, max_threads, max_free_threads, queue_size]
-        {
-            initializeImpl(max_threads, max_free_threads, queue_size);
-        });
-    }
+        std::lock_guard lock(mutex);
+        if (instance)
+            throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "CAS commit thread pool is initialized twice");
 
-private:
-    void initializeImpl(size_t max_threads, size_t max_free_threads, size_t queue_size)
-    {
         instance = std::make_unique<ThreadPool>(
             CurrentMetrics::LocalThread,
             CurrentMetrics::LocalThreadActive,
@@ -59,7 +63,14 @@ private:
             /* shutdown_on_exception= */ false);
     }
 
-    std::once_flag init_flag;
+    void shutdown()
+    {
+        std::lock_guard lock(mutex);
+        instance.reset();
+    }
+
+private:
+    std::mutex mutex;
     std::unique_ptr<ThreadPool> instance;
 };
 
@@ -79,6 +90,11 @@ ThreadPool & getCasCommitThreadPool()
 void initializeCasCommitThreadPool(size_t max_threads, size_t max_free_threads, size_t queue_size)
 {
     holder().initialize(max_threads, max_free_threads, queue_size);
+}
+
+void shutdownCasCommitThreadPool()
+{
+    holder().shutdown();
 }
 
 }

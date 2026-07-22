@@ -19,16 +19,21 @@ namespace DB::Cas
 ///
 /// Sized from the server setting `cas_commit_pool_size` (default 100, `Core/ServerSettings.cpp`), wired
 /// from server startup via `initializeCasCommitThreadPool` (mirrors `getIOThreadPool().initialize(...)`
-/// in `programs/server/Server.cpp`). A caller that never wires the explicit initialize call (unit
-/// tests, `clickhouse-local`-style tools) still gets a working pool: the first `getCasCommitThreadPool()`
-/// call self-initializes with the compiled-in default size, exactly like `StaticThreadPool::
-/// initializeWithDefaultSettingsIfNotInitialized()` covers callers of `getIOThreadPool()` that skip the
-/// explicit server-startup `initialize()`.
+/// in `programs/server/Server.cpp`). Throws `LOGICAL_ERROR` if called before `initializeCasCommitThreadPool`
+/// has run -- mirrors `StaticThreadPool::get()` (`IO/SharedThreadPools.cpp`). There is deliberately no
+/// lazy self-initializing fallback: a caller that reaches this before server startup wired the pool
+/// (or a test that forgot to call `initializeCasCommitThreadPool` first) is a bug, and a fallback to a
+/// hardcoded default would make `cas_commit_pool_size` a silent no-op.
 ThreadPool & getCasCommitThreadPool();
 
-/// Called once from server startup to size the pool from `cas_commit_pool_size`. A no-op (never
-/// re-sizes, never throws) if the pool was already constructed by an earlier call -- either an earlier
-/// call to this function, or a lazy self-initialization triggered by `getCasCommitThreadPool()` itself.
+/// Called once from server startup to size the pool from `cas_commit_pool_size`. Throws `LOGICAL_ERROR`
+/// if called a second time -- mirrors `StaticThreadPool::initialize()` (`IO/SharedThreadPools.cpp`).
 void initializeCasCommitThreadPool(size_t max_threads, size_t max_free_threads, size_t queue_size);
+
+/// Called once from server teardown (right next to `StaticThreadPool::shutdownAll()`, before
+/// `GlobalThreadPool::instance().shutdown()`) so any workers this pool spun up can't outlive the global
+/// pool. Safe to call even if the pool was never initialized (e.g. a unit test process, or a server
+/// that failed to start before `initializeCasCommitThreadPool` ran).
+void shutdownCasCommitThreadPool();
 
 }

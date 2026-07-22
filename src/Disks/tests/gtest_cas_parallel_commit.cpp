@@ -11,6 +11,7 @@
 #include <gtest/gtest.h>
 #include <atomic>
 #include <filesystem>
+#include <mutex>
 
 /// Task 2 of the CAS parallel-write-path plan (docs/superpowers/sdd): `promoteBuild`/`repointRef`
 /// return an exact, in-lane-derived `Cas::CommitOutcome` instead of `void`/`bool`, and
@@ -335,6 +336,14 @@ TEST(CasCommitRollback, RepointByOtherWriterSurvivesRollback)
 /// check below additionally proves (1) and (3) apart, and that (1) is a stable singleton.
 TEST(CasCommitPool, DistinctFromWriterPoolAndBounded)
 {
+    /// `getCasCommitThreadPool()` now throws `LOGICAL_ERROR` unless `initializeCasCommitThreadPool()`
+    /// ran first (no more lazy self-initializing fallback -- see the header's doc comment). This test
+    /// binary has no `programs/server/Server.cpp` startup path to wire that call for us, so do it here,
+    /// guarded by a `once_flag` so re-running this test (or other `CasCommitPool` tests sharing the
+    /// process) doesn't hit the equally-loud double-init throw.
+    static std::once_flag init_flag;
+    std::call_once(init_flag, [] { DB::Cas::initializeCasCommitThreadPool(8, 0, 10000); });
+
     ThreadPool & cas_commit_pool = DB::Cas::getCasCommitThreadPool();
 
     /// Singleton stability: the same object every call (a prerequisite for "disjoint from the writer
