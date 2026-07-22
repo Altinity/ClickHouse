@@ -527,22 +527,13 @@ void PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef & ref, const 
             /// client-side streaming PUT. Same write-once contract (`Done` + dest-ETag token on created,
             /// `PreconditionFailed` when `key` already exists). The staging object IS the promote source
             /// — no envelope is streamed here.
-            ///
-            /// rev.7 [D1]: `one_attempt` is re-invoked once per `stagingConditionalCreate` retry, so the
-            /// guard is scoped per attempt (admitted right before, resolved when this specific attempt's
-            /// backend call returns/throws) -- matching how the controller's own fence predicate is also
-            /// re-checked per attempt, not once for the whole retry sequence.
             if (source.server_side_copy_from)
-            {
-                auto durable_guard = store->beginDurableRequest();
                 return store->backend().promoteStaged(*source.server_side_copy_from, key);
-            }
 
             /// No owner metadata is needed: protection is the precommit edge — reachability, not `cas_owner`.
             /// A throw mid-stream abandons the sink (its dtor cancels): nothing is ever published by a
             /// failed attempt except via the storage's own late-landing ambiguity, which the controller
             /// resolves.
-            auto durable_guard = store->beginDurableRequest();
             WriteSinkPtr sink = store->backend().putIfAbsentStream(key);
             WriteBuffer & out = sink->buffer();
             writeString(buildHeader(), out);
@@ -555,6 +546,15 @@ void PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef & ref, const 
             return sink->finalize();
         };
 
+        /// rev.7 [D1]: one guard for the WHOLE conditional-create operation this `streamIfAbsent` call
+        /// represents -- admitted before `stagingConditionalCreate` starts, resolved when it returns
+        /// (Committed/Occupied/Unresolved) or throws. This is operation-scoped, not per-attempt inside
+        /// `one_attempt` (which `stagingConditionalCreate` may re-invoke on retry): matching the "alive
+        /// until the request resolves" wording literally, staying locally sufficient with no need to
+        /// reason about the controller's own retry/backoff behavior, and consistent with every sibling
+        /// guard in this file (`stageManifest`, `writeResurrectMetaClean`,
+        /// `CasPlainObjects::casPutObject`), all scoped to their whole retry-bearing call, not per-attempt.
+        auto durable_guard = store->beginDurableRequest();
         const CasCreateResult res = store->stagingConditionalCreate(key, one_attempt);
         switch (res.outcome)
         {
