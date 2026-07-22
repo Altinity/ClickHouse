@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Read the JSON output from check_for_flaky_fix_backports.py, cherry-pick each
-missing commit onto a new branch, push it, and open a single PR.
+Read the JSON output from check_for_flaky_fixes.py and cherry-pick each missing
+commit onto a backport branch. Opens a new PR, or amends the open one from a
+previous run if it already exists for this base branch.
 """
 
 import argparse
@@ -86,6 +87,17 @@ def cherry_pick(sha: str) -> bool:
     return False
 
 
+def _commit_line(upstream_repo: str, sha, subject: str, date) -> str:
+    """Render one bullet. sha/date may be None for commits carried over from a
+    reused PR, where only the subject is known."""
+    link = ""
+    if sha:
+        url = UPSTREAM_COMMIT_URL.format(repo=upstream_repo, sha=sha)
+        link = f"[`{sha[:12]}`]({url}) "
+    suffix = f"  _(committed {date})_" if date else ""
+    return f"- {link}{subject}{suffix}"
+
+
 def build_pr_body(
     upstream_repo: str,
     applied: list,
@@ -101,19 +113,79 @@ def build_pr_body(
         lines.append("### Applied")
         lines.append("")
         for sha, subject, date in applied:
-            url = UPSTREAM_COMMIT_URL.format(repo=upstream_repo, sha=sha)
-            lines.append(f"- [`{sha[:12]}`]({url}) {subject}  _(committed {date})_")
+            lines.append(_commit_line(upstream_repo, sha, subject, date))
         lines.append("")
 
     if conflicted:
         lines.append("### Skipped (cherry-pick conflict — manual backport needed)")
         lines.append("")
         for sha, subject, date in conflicted:
-            url = UPSTREAM_COMMIT_URL.format(repo=upstream_repo, sha=sha)
-            lines.append(f"- [`{sha[:12]}`]({url}) {subject}  _(committed {date})_")
+            lines.append(_commit_line(upstream_repo, sha, subject, date))
         lines.append("")
 
     return "\n".join(lines)
+
+
+def find_open_backport_pr(repo: str, base_branch: str):
+    """Return (number, head_branch) of an open flaky-fix backport PR for this base
+    branch, or (None, None). Lets a weekly run amend last week's PR instead of
+    opening a fresh one each time."""
+    prefix = f"flaky-fix-backport/{base_branch}/"
+    result = subprocess.run(
+        ["gh", "pr", "list", "--repo", repo, "--state", "open", "--base", base_branch,
+         "--json", "number,headRefName", "--limit", "100"],
+        text=True, capture_output=True,
+    )
+    if result.returncode != 0:
+        print(f"Warning: gh pr list failed, will open a new PR:\n{result.stderr}", file=sys.stderr)
+        return None, None
+    for pr in json.loads(result.stdout):
+        if pr["headRefName"].startswith(prefix):
+            return pr["number"], pr["headRefName"]
+    return None, None
+
+
+def pr_backport_commits(repo: str, number: int) -> list:
+    """Return [(upstream_sha_or_None, subject)] for commits already on the PR,
+    oldest-first, by reading the `(cherry picked from commit <sha>)` trailer that
+    `cherry-pick -x` records."""
+    result = subprocess.run(
+        ["gh", "pr", "view", str(number), "--repo", repo, "--json", "commits"],
+        text=True, capture_output=True,
+    )
+    if result.returncode != 0:
+        print(f"Warning: could not read commits of PR #{number}:\n{result.stderr}", file=sys.stderr)
+        return []
+    out = []
+    for c in json.loads(result.stdout).get("commits", []):
+        body = c.get("messageBody", "") or ""
+        m = re.search(r"cherry picked from commit ([0-9a-f]{7,40})", body)
+        out.append((m.group(1) if m else None, c.get("messageHeadline", "")))
+    return out
+
+
+def update_pr(repo: str, number: int, title: str, body: str, labels: list, dry_run: bool) -> None:
+    if dry_run:
+        print(f"DRY RUN: would update PR #{number} in {repo}:", file=sys.stderr)
+        print(f"  title:  {title}", file=sys.stderr)
+        print(f"  labels: {', '.join(labels)}", file=sys.stderr)
+        return
+
+    labels = existing_labels(repo, labels)
+
+    cmd = [
+        "gh", "pr", "edit", str(number),
+        "--repo", repo,
+        "--title", title,
+        "--body", body,
+    ]
+    for label in labels:
+        cmd += ["--add-label", label]
+
+    result = subprocess.run(cmd, text=True, capture_output=False)
+    if result.returncode != 0:
+        print("gh pr edit failed", file=sys.stderr)
+        sys.exit(1)
 
 
 def create_pr(repo: str, branch: str, base: str, title: str, body: str, labels: list, dry_run: bool) -> None:
@@ -153,7 +225,7 @@ def parse_args() -> argparse.Namespace:
         "--json-file",
         required=True,
         metavar="PATH",
-        help="JSON output file produced by check_flaky_fix_backports.py",
+        help="JSON output file produced by check_for_flaky_fixes.py",
     )
     parser.add_argument(
         "--repo",
@@ -186,17 +258,36 @@ def main() -> None:
     # Sort oldest-first so cherry-picks apply in chronological order.
     missing.sort(key=lambda c: c["date"])
 
+    # Reuse an open PR from a previous run if one exists, so we amend a single
+    # rolling PR per base branch instead of opening a new one every week.
+    reuse_number, reuse_branch = find_open_backport_pr(args.repo, base_branch)
+
+    prior_applied = []
+    if reuse_branch:
+        print(f"Reusing open PR #{reuse_number} ({reuse_branch}).", file=sys.stderr)
+        prior_commits = pr_backport_commits(args.repo, reuse_number)
+        prior_shas = {sha for sha, _ in prior_commits if sha}
+        prior_applied = [(sha, subject, None) for sha, subject in prior_commits]
+        missing = [c for c in missing if c["sha"] not in prior_shas]
+        if not missing:
+            print(f"PR #{reuse_number} already contains all missing commits. Nothing to do.", file=sys.stderr)
+            return
+
     prefetch_upstream_objects([c["sha"] for c in missing])
 
     date_tag = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    backport_branch = f"flaky-fix-backport/{base_branch}/{date_tag}"
 
-    existing = run_git("branch", "--list", backport_branch).stdout.strip()
-    if existing:
-        print(f"Branch {backport_branch} already exists. Delete it first.", file=sys.stderr)
-        sys.exit(1)
-
-    run_git("checkout", "-b", backport_branch)
+    if reuse_branch:
+        backport_branch = reuse_branch
+        run_git("fetch", "--depth=1", "--no-tags", "origin", reuse_branch)
+        run_git("checkout", "-B", backport_branch, "FETCH_HEAD")
+    else:
+        backport_branch = f"flaky-fix-backport/{base_branch}/{date_tag}"
+        existing = run_git("branch", "--list", backport_branch).stdout.strip()
+        if existing:
+            print(f"Branch {backport_branch} already exists. Delete it first.", file=sys.stderr)
+            sys.exit(1)
+        run_git("checkout", "-b", backport_branch)
 
     applied = []
     conflicted = []
@@ -213,39 +304,49 @@ def main() -> None:
             conflicted.append((sha, subject, date))
             print(f"  Skipped {sha[:12]} (conflict)", file=sys.stderr)
 
-    if not applied:
+    if not reuse_branch and not applied:
         print("No commits could be applied (all conflicted). Cleaning up.", file=sys.stderr)
         run_git("checkout", base_branch)
         run_git("branch", "-D", backport_branch)
         sys.exit(0)
 
+    all_applied = prior_applied + applied
     pr_title = f"{base_branch.title()} - Backport flaky-fix commits from upstream ({date_tag})"
-    pr_body = build_pr_body(upstream_repo, applied, conflicted)
+    pr_body = build_pr_body(upstream_repo, all_applied, conflicted)
     pr_labels = labels_for_branch(base_branch)
 
     if args.dry_run:
+        action = f"amend PR #{reuse_number}" if reuse_branch else f"open PR against {base_branch}"
         print(
-            f"DRY RUN: would push {backport_branch} and open PR against {base_branch}.",
+            f"DRY RUN: would push {backport_branch} and {action}.",
             file=sys.stderr,
         )
-        print(f"  Applied: {len(applied)}  Conflicted/failed: {len(conflicted)}", file=sys.stderr)
+        print(f"  Newly applied: {len(applied)}  Carried over: {len(prior_applied)}  Conflicted: {len(conflicted)}", file=sys.stderr)
         print(f"\n--- PR title ---\n{pr_title}\n--- PR body ---\n{pr_body}---")
-        create_pr(repo=args.repo, branch=backport_branch, base=base_branch, title=pr_title, body=pr_body, labels=pr_labels, dry_run=True)
+        if reuse_branch:
+            update_pr(repo=args.repo, number=reuse_number, title=pr_title, body=pr_body, labels=pr_labels, dry_run=True)
+        else:
+            create_pr(repo=args.repo, branch=backport_branch, base=base_branch, title=pr_title, body=pr_body, labels=pr_labels, dry_run=True)
         run_git("checkout", base_branch)
         run_git("branch", "-D", backport_branch)
         return
 
-    run_git("push", "origin", backport_branch, capture=False)
+    # Only push when we added commits; body-only refreshes still update the PR.
+    if applied:
+        run_git("push", "origin", backport_branch, capture=False)
 
-    create_pr(
-        repo=args.repo,
-        branch=backport_branch,
-        base=base_branch,
-        title=pr_title,
-        body=pr_body,
-        labels=pr_labels,
-        dry_run=False,
-    )
+    if reuse_branch:
+        update_pr(repo=args.repo, number=reuse_number, title=pr_title, body=pr_body, labels=pr_labels, dry_run=False)
+    else:
+        create_pr(
+            repo=args.repo,
+            branch=backport_branch,
+            base=base_branch,
+            title=pr_title,
+            body=pr_body,
+            labels=pr_labels,
+            dry_run=False,
+        )
 
 
 if __name__ == "__main__":
