@@ -140,14 +140,6 @@ private:
         bool published = false;                    /// set by publishStaging during commit(); the commit
                                                    /// loop is idempotent (never re-publishes a staging).
 
-        /// Assigned once, the first time this (ns, ref) key is ever touched (`touchPart`), from a
-        /// per-transaction monotone counter. `commit()` processes parts in ASCENDING `part_seq` order
-        /// (the order this transaction first touched each key) rather than the incidental sort order
-        /// of the `parts` map's (ns, ref) string key -- load-bearing whenever one part's publish must
-        /// be observable (e.g. to a test hook modeling a concurrent writer, or a future dependent part)
-        /// before a LATER-staged part's publish runs.
-        uint64_t part_seq = 0;
-
         /// `staging_key` is either a private local temp path or an S3 staging object key returned by
         /// `CaContentWriteBuffer` at finalize. The backend selects cleanup and read-your-writes:
         /// local files are removed by this transaction, whereas aborted S3 objects must remain
@@ -159,8 +151,6 @@ private:
     /// Keyed by (namespace string, ref name) — the routed identity, so live/detached/shadow
     /// stagings never collide.
     std::map<std::pair<std::string, std::string>, PartStaging> parts;
-    /// Feeds `PartStaging::part_seq`; see its comment. Monotone for the lifetime of one transaction.
-    uint64_t next_part_seq = 0;
     bool committed = false;
     bool failed = false;
 
@@ -185,11 +175,6 @@ private:
 
     /// Returns (and, when necessary, creates) the staging state for a routed namespace/ref.
     PartStaging & stagingFor(const ContentAddressedMetadataStorage::Route & r);
-    /// Returns the staging state for `key`, creating it and stamping `part_seq` from the monotone
-    /// counter on FIRST touch only. The single insertion point for `parts` so `part_seq` is assigned
-    /// exactly once per key regardless of which call site (a routed write via `stagingFor`, or
-    /// `moveDirectory`'s re-key onto a fresh destination key) first creates it.
-    PartStaging & touchPart(const std::pair<std::string, std::string> & key);
     /// Finds existing staging state without creating an entry; returns nullptr when untouched.
     PartStaging * findStaging(const ContentAddressedMetadataStorage::Route & r);
     /// Finds the staged manifest entry for a routed file without consulting committed storage.

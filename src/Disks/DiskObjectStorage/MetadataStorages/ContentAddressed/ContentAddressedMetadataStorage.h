@@ -382,24 +382,26 @@ public:
     DirRoute classifyDirectoryForTest(const std::string & path) const { return classifyDirectory(path); }
 
     /// Test-only fault-injection/hook seam for `ContentAddressedTransaction::publishStaging`'s
-    /// promote/repoint call, keyed by ref name only (mirrors `CasRefLedger::setRefPreCarveHookForTest`'s
-    /// no-op-in-production shape). `armPromoteFailureForTest` makes the NEXT `promoteBuild`/`repointRef`
-    /// call for `ref` throw instead of committing, modeling a transient promote-time backend failure.
+    /// promote/repoint call, keyed by the full `(ns, ref)` routed identity via `PartRefKey::cacheKey()`
+    /// (mirrors `CasRefLedger::setRefPreCarveHookForTest`'s no-op-in-production shape) -- a bare ref
+    /// name would misfire across a future multi-namespace fixture where two namespaces coincidentally
+    /// share a ref name. `armPromoteFailureForTest` makes the NEXT `promoteBuild`/`repointRef` call for
+    /// `key` throw instead of committing, modeling a transient promote-time backend failure.
     /// `setAfterPromoteHookForTest` installs a one-shot callback run synchronously immediately after a
-    /// successful promote/repoint for `ref` (before the caller's own post-commit bookkeeping), modeling
+    /// successful promote/repoint for `key` (before the caller's own post-commit bookkeeping), modeling
     /// a concurrent writer racing in right after this transaction's confirm -- e.g. repointing the same
     /// ref to a different manifest so a later rollback's `dropRefIfMatches` must see it changed.
-    void armPromoteFailureForTest(const std::string & ref) { promote_failure_refs_for_test.insert(ref); }
-    bool shouldFailPromoteForTest(const std::string & ref) const { return promote_failure_refs_for_test.contains(ref); }
-    void setAfterPromoteHookForTest(const std::string & ref, std::function<void()> hook)
+    void armPromoteFailureForTest(const Cas::PartRefKey & key) { promote_failure_refs_for_test.insert(key.cacheKey()); }
+    bool shouldFailPromoteForTest(const Cas::PartRefKey & key) const { return promote_failure_refs_for_test.contains(key.cacheKey()); }
+    void setAfterPromoteHookForTest(const Cas::PartRefKey & key, std::function<void()> hook)
     {
-        after_promote_hooks_for_test[ref] = std::move(hook);
+        after_promote_hooks_for_test[key.cacheKey()] = std::move(hook);
     }
-    /// Invokes and removes `ref`'s one-shot hook, if any registered. A no-op when none is installed
+    /// Invokes and removes `key`'s one-shot hook, if any registered. A no-op when none is installed
     /// (the production hot path never installs one).
-    void runAfterPromoteHookForTest(const std::string & ref)
+    void runAfterPromoteHookForTest(const Cas::PartRefKey & key)
     {
-        auto it = after_promote_hooks_for_test.find(ref);
+        auto it = after_promote_hooks_for_test.find(key.cacheKey());
         if (it == after_promote_hooks_for_test.end())
             return;
         auto hook = std::move(it->second);

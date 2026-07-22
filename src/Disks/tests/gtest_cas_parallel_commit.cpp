@@ -236,13 +236,14 @@ struct CaTxnRollbackFixture
     Cas::ManifestRef lastRepointManifest() const { return last_repoint_manifest; }
 
     /// Test-only fault seam (see `ContentAddressedMetadataStorage::armPromoteFailureForTest`): the
-    /// NEXT `publishStaging` promote/repoint for `ref` throws instead of committing.
-    void armPromoteFailure(const std::string & ref) { storage->armPromoteFailureForTest(ref); }
+    /// NEXT `publishStaging` promote/repoint for `key` (the full `(ns, ref)` routed identity) throws
+    /// instead of committing.
+    void armPromoteFailure(const Cas::PartRefKey & key) { storage->armPromoteFailureForTest(key); }
     /// Test-only hook (see `ContentAddressedMetadataStorage::setAfterPromoteHookForTest`): runs once,
-    /// synchronously, immediately after `key.ref`'s promote/repoint confirms.
+    /// synchronously, immediately after `key`'s promote/repoint confirms.
     void armAfterPromoteHook(const Cas::PartRefKey & key, std::function<void()> hook)
     {
-        storage->setAfterPromoteHookForTest(key.ref, std::move(hook));
+        storage->setAfterPromoteHookForTest(key, std::move(hook));
     }
 };
 
@@ -276,7 +277,7 @@ TEST(CasCommitRollback, AbsentBeforeDroppedPreExistingUntouched)
     auto txn = fx.beginTxn();
     fx.stageInto(txn, {fx.ns(), "new_a_1_1_0"}, 1);
     fx.stageInto(txn, {fx.ns(), "new_b_1_1_0"}, 1);
-    fx.armPromoteFailure("new_b_1_1_0");                          // fault injection in publishStaging's promote
+    fx.armPromoteFailure({fx.ns(), "new_b_1_1_0"});               // fault injection in publishStaging's promote
     EXPECT_ANY_THROW(txn->commit({}));
     EXPECT_FALSE(fx.partAccess().existsRef({fx.ns(), "new_a_1_1_0"}, Cas::Freshness::ForceFresh)); // rolled back
     EXPECT_TRUE (fx.partAccess().existsRef(pre, Cas::Freshness::ForceFresh));                       // untouched
@@ -286,15 +287,20 @@ TEST(CasCommitRollback, AbsentBeforeDroppedPreExistingUntouched)
 /// (modeled by the after-promote hook) repoints it to M2 BEFORE T1's own commit later fails on
 /// `poison`'s promote. Rollback must use `dropRefIfMatches(M1)`: M1 != the now-current M2, so the
 /// conditional drop must leave `shared` bound to M2 untouched.
+///
+/// `commit()` publishes `parts` in the map's own (ns, ref) sort order -- so the "shared" part is named
+/// `a_shared_...` and the "poison" part `z_poison_...` here purely so `'a' < 'z'` makes "shared"
+/// publish (and get repointed by the hook) deterministically BEFORE "poison" fails; this is a test
+/// naming choice, not a production ordering guarantee.
 TEST(CasCommitRollback, RepointByOtherWriterSurvivesRollback)
 {
     auto fx = makeCaWiringFixture();
-    const Cas::PartRefKey key{fx.ns(), "shared_1_1_0"};
+    const Cas::PartRefKey key{fx.ns(), "a_shared_1_1_0"};
     auto txn = fx.beginTxn();
     fx.stageInto(txn, key, 1);                                   // T1 will create R -> M1
     fx.armAfterPromoteHook(key, [&]{ fx.repointToFreshManifest(key); }); // T2 repoints R -> M2 right after T1's promote
-    fx.stageInto(txn, {fx.ns(), "poison_1_1_0"}, 1);
-    fx.armPromoteFailure("poison_1_1_0");
+    fx.stageInto(txn, {fx.ns(), "z_poison_1_1_0"}, 1);
+    fx.armPromoteFailure({fx.ns(), "z_poison_1_1_0"});
     EXPECT_ANY_THROW(txn->commit({}));
     // T1's rollback used dropRefIfMatches(M1); M2 != M1 so it must survive.
     EXPECT_TRUE(fx.partAccess().existsRef(key, Cas::Freshness::ForceFresh));

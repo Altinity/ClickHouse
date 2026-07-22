@@ -128,16 +128,7 @@ ContentAddressedTransaction::~ContentAddressedTransaction()
 ContentAddressedTransaction::PartStaging &
 ContentAddressedTransaction::stagingFor(const ContentAddressedMetadataStorage::Route & r)
 {
-    return touchPart({r.ns.string(), r.ref});
-}
-
-ContentAddressedTransaction::PartStaging &
-ContentAddressedTransaction::touchPart(const std::pair<std::string, std::string> & key)
-{
-    auto [it, inserted] = parts.try_emplace(key);
-    if (inserted)
-        it->second.part_seq = next_part_seq++;
-    return it->second;
+    return parts[{r.ns.string(), r.ref}];
 }
 
 Cas::PartWriteTxn & ContentAddressedTransaction::buildFor(
@@ -352,7 +343,7 @@ void ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
 
             /// Test-only fault seam (Task 3 TDD): simulate a promote-time backend failure for `ref`
             /// right before the durable repoint call. A no-op in production (nothing ever arms it).
-            if (metadata_storage.shouldFailPromoteForTest(ref))
+            if (metadata_storage.shouldFailPromoteForTest({ns, ref}))
                 throw Exception(ErrorCodes::ABORTED,
                     "ContentAddressedTransaction: test-injected promote failure for {}/{}", ns.string(), ref);
 
@@ -364,7 +355,7 @@ void ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
             out_slot = oc;   /// always created=false here: this block only runs once `view` already resolved
             /// Test-only: models a concurrent writer racing in right after this transaction's own
             /// confirm (e.g. repointing `ref` again). A no-op in production.
-            metadata_storage.runAfterPromoteHookForTest(ref);
+            metadata_storage.runAfterPromoteHookForTest({ns, ref});
             if (st.build)
             {
                 st.build->abandon();   /// scratch precommit's protecting job is done; the real manifest is live
@@ -396,7 +387,7 @@ void ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
 
     /// Test-only fault seam (Task 3 TDD): simulate a promote-time backend failure for `ref` right
     /// before the durable promote call. A no-op in production (nothing ever arms it).
-    if (metadata_storage.shouldFailPromoteForTest(ref))
+    if (metadata_storage.shouldFailPromoteForTest({ns, ref}))
         throw Exception(ErrorCodes::ABORTED,
             "ContentAddressedTransaction: test-injected promote failure for {}/{}", ns.string(), ref);
 
@@ -409,7 +400,7 @@ void ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
     out_slot = oc;
     /// Test-only: models a concurrent writer racing in right after this transaction's own confirm. A
     /// no-op in production.
-    metadata_storage.runAfterPromoteHookForTest(ref);
+    metadata_storage.runAfterPromoteHookForTest({ns, ref});
     st.build.reset();   /// the build is consumed (promoted); never re-abandon it from the destructor
     st.published = true;
 }
@@ -442,16 +433,15 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
     /// this part's publish and a later part's failure (see `CasCommitRollback.RepointByOtherWriterSurvivesRollback`).
     /// `part_outcomes` is snapshotted and preallocated up front (one allocation, index-addressed, no
     /// per-part growth) so `publishStaging` can write `part_outcomes[i]` with a no-throw slot write --
-    /// load-bearing once Task 5 dispatches these calls from multiple threads.
+    /// load-bearing once Task 5 dispatches these calls from multiple threads. The snapshot preserves
+    /// `parts`' own iteration order (the map's (ns, ref) sort order) -- there is no real dependency
+    /// between parts that would require a different order, and under Task 5's concurrent dispatch the
+    /// publish order is racy regardless of how this snapshot is built.
     struct IndexedPart { Cas::RootNamespace ns; std::string ref; PartStaging * st; };
     std::vector<IndexedPart> ordered;
     ordered.reserve(parts.size());
     for (auto & [key, st] : parts)
         ordered.push_back({Cas::RootNamespace{key.first}, key.second, &st});
-    /// Process in the order this transaction first touched each part -- NOT `parts`' incidental (ns,
-    /// ref) string sort order, which is otherwise unrelated to any real dependency between parts.
-    std::sort(ordered.begin(), ordered.end(),
-        [](const IndexedPart & a, const IndexedPart & b) { return a.st->part_seq < b.st->part_seq; });
 
     std::vector<std::optional<Cas::CommitOutcome>> part_outcomes;
     part_outcomes.assign(ordered.size(), std::nullopt);
@@ -1224,7 +1214,7 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
         if (auto src_it = parts.find(src_key); src_it != parts.end())
         {
             had_staged_source = true;
-            PartStaging & dst_st = touchPart(dst_key);
+            PartStaging & dst_st = parts[dst_key];
             PartStaging & src_st = src_it->second;
             for (auto & entry : src_st.entries)
             {
