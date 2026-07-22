@@ -430,9 +430,9 @@ class CI:
         ),
         JobNames.INTEGRATION_TEST: CommonJobConfigs.INTEGRATION_TEST.with_properties(
             required_builds=[BuildNames.PACKAGE_RELEASE],
-            num_batches=4,
+            num_batches=6,
             # release_only=True,
-            timeout=12000,  # the job timed out with default value (7200)
+            timeout=4 * 3600,  # the job timed out with default value (7200)
         ),
         JobNames.INTEGRATION_TEST_FLAKY: CommonJobConfigs.INTEGRATION_TEST.with_properties(
             required_builds=[BuildNames.PACKAGE_ASAN],
