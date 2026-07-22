@@ -1,243 +1,217 @@
-# CAS disk lifecycle rev.5: throw-when-uncertain, truth-when-proven
+# CAS disk lifecycle rev.6: throw-when-uncertain, truth-when-proven
 
-Status: **DESIGN rev.5 — for final verification.** Rewrites rev.4 in place (git history holds rev.1–rev.4).
+Status: **DESIGN rev.6 — for final verification.** Rewrites rev.5 in place (git history holds rev.1–rev.5).
 
-**rev.4 → rev.5 (per the codex rev.4 verification):** the rev.3→rev.4 fold introduced three new blockers of
-my own making; rev.5 fixes them as **[B1]–[B6]**. The architecture ("uncertainty throws; genuinely proven
-old-generation loss permits truthful absence") has now survived two adversarial reviews unchanged.
+**rev.5 → rev.6 (per the codex rev.5 verification — 6 of 9 fold items were confirmed sound: B3, B4, B6,
+FSCK-advisory, fail-closed teardown, the FORGET deadlock fix):** five narrow amendments **[C1]–[C5]** plus
+cross-reference cleanups. The architecture ("uncertainty throws; genuinely proven old-generation loss
+permits truthful absence") has survived three adversarial reviews unchanged.
 
-**The biggest conceptual change [B1]:** natural detection alone **never** grants benign-absent. Losing the
-identity sentinels proves only *identity loss*, not *erasure* (a partial bulk delete can remove exactly
-`_pool_meta` + the owner key while refs/manifests/blobs survive — benign answers would then lie about live
-data, violating C2). So the terminal states split:
+- **[C1]** `IdentityLost` is fail-loud but **observationally non-absorbing**: a progressive `rm -rf`
+  deletes the sentinels first — terminal absorption would strand the disk before the emptiness proof could
+  complete. A low-rate, non-mutating lifecycle observer remains; one-way `IdentityLost → Vanished(erased)`.
+- **[C2]** The "all commits are fence-gated" safety claim was **false** (`CasPlainObjects::casPutObject`
+  writes table-level verbatim/dedup/rename objects with no `mayMutate` check). Every durable-effect path
+  gets a fence-generation check; the emptiness-proof window opens only after ref lanes settle or the
+  materialization grace elapses.
+- **[C3]** Natural `Vanished(erased)` requires a **strong-LIST backend capability** (AWS S3, GCS —
+  documented; RustFS pending evidence; Local/Emulated/unqualified gateways — never): elsewhere the only
+  path to benign truth is `FORGET`.
+- **[C4]** Startup bootstrap of a **missing `_pool_meta` requires a provably empty prefix**; a non-empty
+  prefix without meta fails startup with zero writes (closes the restart-poisons-partial-pool hole and
+  hardens the cross-session limit).
+- **[C5]** Honest wording: one `IdentityLost` disk stalls **all** eligible Atomic `DROP` finalizations
+  (default `search_orphaned_parts_disks=ANY` sweeps every disk) until `FORGET`/restart — accepted and
+  stated, not narrowed to "drops involving the disk".
 
-- **`IdentityLost`** — identity sentinels gone but erasure NOT proven: terminal for background work (threads
-  stop, one WARN), **fail-loud for every operation**. Cure: `FORGET` or restart.
-- **`Vanished`** — benign truth (absent/empty/no-op-removes + typed loud errors for content reads/writes),
-  reachable ONLY by: (a) **pool-wide emptiness proof** — container reachable AND a full-prefix
-  `ListObjectsV2(pool_root, max-keys=1)` returns **zero objects**, in ≥2 cycles spaced ≥ the renewal period
-  (`rm -rf` of the pool produces exactly this; partial deletion leaves objects → `IdentityLost`); or
-  (b) `_pool_meta` present with a different `pool_id` → `Vanished(replaced)` (authoritative proof our
-  generation is gone; removes are no-op so the foreign pool's objects are never touched); or (c) explicit
-  operator **`FORGET`** → `Vanished(forgotten)`.
+**Part 6 vs the terminal states (unchanged):** Part 6 answered absent when it *didn't know* (a lie).
+`Vanished` answers absent when it is *proven or operator-asserted* (the truth). Everything in between —
+`transient`, `IdentityLost` — **throws**.
 
-This is *stricter* than every earlier revision: the disk lies to no one, ever — benign answers require
-either a proof that the whole prefix is empty, or a human's explicit destructive assertion.
-
-**Part 6 vs `Vanished` (unchanged):** Part 6 answered absent when it *didn't know* (a lie); `Vanished`
-answers absent when it is *proven* (the truth); everything in between (`transient`, `IdentityLost`) throws.
-
-Supersedes: rev.1–rev.4, the Path-B spec, the automount/eject spec, Parts 2–4 of the 2026-07-21 spec
-(landed Task 4–8; **Part 1 KEPT**). Companion: `2026-07-22-cas-disk-lifecycle-problem-and-constraints.md`.
+Supersedes: rev.1–rev.5, the Path-B spec, the automount/eject spec, Parts 2–4 of the 2026-07-21 spec
+(landed Task 4–8; **Part 1 KEPT**). Companion: `2026-07-22-cas-disk-lifecycle-problem-and-constraints.md`
+(C2/C3 refined in step with this revision).
 
 ---
 
-## 1. States and the operation-class gate [B3][B4]
+## 1. States and the operation-class gate
 
 ```
-[Running/live] ──lease lost──► [transient-not-live] ──┬─ identity sentinels gone, prefix NOT empty ──► [IdentityLost]  (terminal, fail-loud)
-      ▲                            │ (all access throws;   ├─ pool-wide emptiness proof ×2 ──────────────► [Vanished(erased)]    (terminal, truth)
-      └── self-remount succeeds ───┘  remount retries)     └─ _pool_meta present, foreign pool_id ──────► [Vanished(replaced)]  (terminal, truth)
-                                                     FORGET (any live/not-live state) ─────────────────► [Vanished(forgotten)] (terminal, truth)
+[Running/live] ──lease lost──► [transient-not-live] ──┬─ sentinels gone, prefix NOT empty ─────────► [IdentityLost]
+      ▲                             │ (all access throws;  │                                        (fail-loud; bg writers stopped;
+      └── self-remount succeeds ────┘  remount retries)    │                                         non-mutating observer stays [C1])
+                                                           │                                                    │ one-way, on proof
+                                                           ├─ pool-wide emptiness proof (§2) ──────► [Vanished(erased)]   (truth)
+                                                           └─ _pool_meta present, foreign pool_id ─► [Vanished(replaced)] (truth)
+                       FORGET (from any state) ────────────────────────────────────────────────────► [Vanished(forgotten)] (truth)
 ```
 
-Plus the minimal **storage-level** lifecycle `Constructing → Started → ShutDown` (codex rev.3 #9): outside
-`Started`, the existing null-pool check in the `poolAccess` coherent snapshot fails loud. Two residual
-states, not a reuse machine.
+Plus the minimal storage-level lifecycle `Constructing → Started → ShutDown`: outside `Started`, the
+null-pool check in the `poolAccess` coherent snapshot fails loud.
 
-**Operation classes — SIX [B4]**, enforced centrally at every public metadata/transaction entry (not by
-re-keying the seven Part-6 branches; the known short-circuit offenders — `liveTreeDirHasChildren`
-hardcoded-true `ContentAddressedMetadataStorage.cpp:883`, `isDirectoryEmpty` part-dir short-circuit `:1385`,
-no-op `createDirectory*` `ContentAddressedTransaction.cpp:924`, empty-txn commit `:408`,
-`setLastModified`/`setReadOnly` `:1109`, and the `tryGetInManifestBytes` catch-all `:1488` which must be
-narrowed to not convert typed throws into `FILE_DOESNT_EXIST` — are all routed through the gate). The
-implementation plan must publish the **complete method→class inventory** (codex rev.4 J).
+**Operation classes — SIX**, enforced centrally at every public metadata/transaction entry (the known
+short-circuit offenders — `liveTreeDirHasChildren` `ContentAddressedMetadataStorage.cpp:883`,
+`isDirectoryEmpty` `:1385`, no-op `createDirectory*` `ContentAddressedTransaction.cpp:924`, empty-txn
+commit `:408`, `setLastModified`/`setReadOnly` `:1109`, the `tryGetInManifestBytes` catch-all `:1488` to be
+narrowed — all routed through the gate). The implementation plan must publish the complete method→class
+inventory.
 
 | Class | live | transient / `IdentityLost` | `Vanished` |
 |---|---|---|---|
-| **Factory / capability / introspection** (`createTransaction`, `getType`, `getPath`, capability getters, lifecycle snapshot, `gcHealth`) | works | **works** (no backing I/O) — a `DROP`'s removal transaction must be constructible on a vanished disk (`DiskObjectStorageTransaction.cpp:73` constructs eagerly) | **works** |
+| **Factory / capability / introspection** (`createTransaction` — I/O-free, verified; `getType`/`getPath`/capability getters/`gcHealth`/lifecycle snapshot) | works | **works** | **works** |
 | Probe / enumeration | real | **throw** 668 | absent / empty (truth) |
-| Content read | real | **throw** 668 | **throw** typed "data root erased/decommissioned — recreate the disk; restart re-registers the name" |
-| Create / write / rename (incl. previously-no-op `createDirectory*`, `setLastModified`; empty-txn commit) | real (no-ops stay no-ops when live) | **throw** 668 | **throw** typed erased |
-| Remove | real | **throw** 668 | **no-op success** (truth) — `DROP` of a vanished-disk table completes |
+| Content read | real | **throw** 668 | **throw** typed "data root erased/decommissioned" |
+| Create / write / rename (incl. previously-no-op sites; empty-txn commit) | real | **throw** 668 | **throw** typed erased |
+| Remove | real | **throw** 668 | **no-op success** (truth) — a vanished-disk table's `DROP` completes |
 | Admin (`store()`, GC RUN) | real | throw | throw typed erased (per-disk status in fan-outs) |
 
-**Gate lifetime = admission semantics [B2]** (explicit weakening of C3, with the safety argument):
-already-issued I/O pipelines bypass the metadata storage (`DiskObjectStorage::prepareRead` resolves once,
-`DiskObjectStorage.cpp:813/:879`; S3-staging opens an object-storage sink directly,
-`ContentAddressedTransaction.cpp:824`). The gate governs **operation admission**, not in-flight streams.
-Safety: (a) all *commits* (ref-log publish, txn finalize) ARE fence-gated (`mutateShard`), so a staging PUT
-landing after fence loss is unreferenced debris reclaimed by GC — never visible data; (b) in-flight reads on
-an actually-erased backing fail naturally with backend errors; on a fenced-but-intact backing they briefly
-read intact data — same as today, within RMT interserver-trust semantics. Optional hardening (plan item):
-a fence-generation token recheck at staging-buffer finalize.
+**Gate lifetime [C2]:** the gate governs **admission**, and additionally **every durable-effect
+finalization is fence-generation-checked**: the plain-object surface (`CasPlainObjects::casPutObject` /
+delete — table-level verbatim files, dedup metadata, rename copy/remove,
+`ContentAddressedTransaction.cpp:748/:1312`) and staging-buffer finalize acquire a fence-generation token
+at admission and re-check it immediately before the durable CAS/PUT; a mismatch aborts the write with the
+typed transient error. The ref-log publish chokepoint is `appendRefOps` + the controlled staging methods
+(not `mutateShard` — rev.5's wording corrected), already fence-coupled. Admitted, non-durable in-flight
+**reads** may complete on their existing pipelines (their failure modes are the backend's own errors) —
+this is the C3 refinement in the companion.
 
-**The empty-proof rule, rescoped [B3]:** *pre-terminal only* (live and transient states) and on **read-only
-pools** (which have no keeper and hence no natural detection — this rule is their only line of defense,
-fixing the read-only ATTACH silent-empty): an enumeration about to answer **empty at a data root** (the
-qualifying `DirShape`s: `TableDir`, `DetachedContainer` — the routing already exists,
-`ContentAddressedMetadataStorage.cpp:1303`) must first confirm `_pool_meta` presence with an
-**authoritative, uncached** probe; absent ⇒ throw typed. **A cached positive never authorizes an empty
-data-root answer** (rev.4's short-TTL cache is dropped — it left a silent-empty window). In terminal
-`Vanished` the rule does not apply — enumeration answers the promised truth-empty directly (rev.4's
-contradiction removed). Cost: one GET per empty-data-root enumeration on load/attach paths — acceptable.
-Partial namespace erasure with `_pool_meta` intact remains FSCK's domain (known limit).
+**The empty-proof rule** (unchanged from rev.5, confirmed sound): pre-terminal and on read-only pools, an
+enumeration about to answer empty at a data root (`TableDir`, `DetachedContainer` `DirShape`s,
+`ContentAddressedMetadataStorage.cpp:1303`) first confirms `_pool_meta` with an authoritative, uncached
+probe; absent ⇒ typed throw. Terminal `Vanished` answers truth-empty directly. Enumeration latency now
+couples to one backend GET on the empty path — the correct fail-closed trade-off, bounded by ordinary
+request timeouts.
 
-## 2. Typed erasure evidence [B5]
+## 2. Typed erasure evidence
 
-Single choke point: step 0 of `tryRemountOnce` (`CasPool.cpp:640-725`); the existing fresh-incarnation
-recovery is kept verbatim; `claimOwnerOrThrow`'s empty-root bootstrap is unreachable from recovery.
+Single choke point: step 0 of `tryRemountOnce` (existing fresh-incarnation recovery kept verbatim;
+`claimOwnerOrThrow`'s empty-root bootstrap unreachable from recovery).
 
-**`ProbeResult ∈ {Present(meta), KeyAbsent, ContainerAbsent, AccessDenied, Indeterminate}`, implemented at
-the `IObjectStorage`/raw-error boundary** — the flattening happens *below* today's `Backend`
-(`CasBackend.h:183` `optional`; S3 merges `NO_SUCH_KEY`/`NO_SUCH_BUCKET`/`RESOURCE_NOT_FOUND` at
-`getObjectInfo.cpp:90/:135` → `S3ObjectStorage.cpp:609` `nullopt`; Local maps missing-parent to `nullopt`,
-`LocalObjectStorage.cpp:397`), so the raw HEAD error must be preserved before `getObjectInfoIfExists`
-discards it. Local/Emulated: an explicit stat of the configured container (or parent) distinguishes
-deleted-prefix from missing-key.
+`ProbeResult ∈ {Present(meta), KeyAbsent, ContainerAbsent, AccessDenied, Indeterminate}` implemented at the
+`IObjectStorage`/raw-error boundary (raw HEAD error preserved before `getObjectInfo.cpp:135` discards it;
+Local: explicit stat of the configured container/parent; container proof = `ListObjectsV2(max-keys=1,
+prefix=pool_root)`; the IAM permutation table from the rev.4 review: only LIST-allowed+GET-allowed yields a
+trustworthy 404, everything else stays transient).
 
-- **Container proof** = `ListObjectsV2(max-keys=1, prefix=pool_root)` (not bucket HEAD). IAM permutations
-  (verified against AWS semantics): `ListBucket(prefix)`+`GetObject` allowed → absence yields a trustworthy
-  404; LIST allowed + GET denied → key probe is 403 → stay transient; LIST denied → container proof fails →
-  stay transient; LIST denied + key absent → AWS answers 403 → stay transient. A gateway that masks denied
-  GET as 404 is indistinguishable — excluded by contract (capability-probe territory).
-- **`Vanished(erased)`** = container proof succeeds AND the full-prefix LIST is **empty** (zero objects
-  under `pool_root` — the pool-wide emptiness proof of [B1], which subsumes per-key sentinels), in ≥2 cycles
-  spaced ≥ the renewal period; any error or non-empty result resets the counter. Identity sentinels absent
-  but prefix non-empty → `IdentityLost` (fail-loud).
-- **Identity comparison** on `Present`: **`pool_id` + `blob_header_len` only** [B6] — both proven immutable
-  (`pool_id` minted once, preserved by admission CAS, `CasPoolMeta.cpp:105`; `blob_header_len`
-  persisted-authoritative, `:117`). "Format identity" = successful compatible decode, not header equality
-  (every legal admission rewrites the object with the current writer header, `CasPoolMetaFormat.cpp:70`).
-  `algos_used`/`min_reader_generation` legally mutate — refreshed, never compared.
-- Versioned buckets: moot for writable pools — the capability probe already rejects delete-marker-producing
-  versioned buckets (`CasProbe.cpp:210`); rev.4's delete-marker rule is dropped as unreachable.
+- **`Present` + identity match** (`pool_id` + `blob_header_len`; format gate = successful compatible
+  decode) → existing recovery. **`Present` + foreign `pool_id`** → `Vanished(replaced)`.
+- **Sentinels absent, prefix non-empty** → **`IdentityLost`**: keeper/GC/writers stopped, **but the remount
+  thread demotes to a lifecycle observer [C1]** — non-mutating, low-rate (renewal-period cadence with
+  backoff), running only this typed probe; it never claims, allocates, or writes. One-way transition to
+  `Vanished(erased)` when the proof below completes; `FORGET` and restart remain available. (This is how a
+  progressive `rm -rf` — sentinels deleted first, the rest still draining — ends in `Vanished(erased)`
+  instead of being stranded.)
+- **`Vanished(erased)` proof [C2][C3]:** requires ALL of —
+  1. the backend declares the **strong-prefix-LIST capability** [C3]: documented strongly-consistent LIST
+     (AWS S3, GCS). RustFS: off until explicit evidence or an integration contract-test; Local/Emulated:
+     **never** (Local listing is best-effort `LocalObjectStorage.cpp:450`, and an unmounted NFS/removable
+     mount makes intact data look erased; Emulated scans before locking `CasObjectStorageBackend.cpp:1024`).
+     Without the capability, `IdentityLost` is the terminal natural state and `FORGET` is the only path to
+     benign truth — which is exactly the stateless-test story anyway (their teardown FORGETs).
+  2. the window opens only after this pool's ref lanes settled or the full materialization grace (default
+     30 s) elapsed since the fence trip [C2] — a durably-landing late ref PUT must not race the proof;
+  3. container proof succeeds AND the full-prefix LIST returns **zero objects**, in ≥2 cycles spaced ≥ the
+     renewal period; any error or non-empty result resets the counter.
+- **Startup [C4]:** `PoolMeta::createOrValidate` may **create** a missing `_pool_meta` only after proving
+  the pool prefix empty (same full-prefix LIST; on non-strong-LIST backends a single authoritative check —
+  best effort against the weaker guarantee, still fail-closed on any object found). Missing meta over a
+  non-empty prefix ⇒ startup fails with a typed error and **zero writes**. Restart is thereby a safe cure
+  only after deletion completed; it can no longer mint a fresh identity over residual data
+  (`CasPool.cpp:263/:310`).
 
-**[A1, kept] Erase-and-recreate at the same prefix while any old process may live is OUT OF CONTRACT**
-(keys are not `pool_id`-namespaced; a still-open fence has up to ~TTL of write authority). **`FORGET` is
-node-local** (the owner/mount protocol is per `server_root_id`, `CasLayout.h:295`) — it is *not*
-authorization to erase or reuse shared backing; same-prefix reuse requires stopping/fencing **every**
-member (ideally `ON CLUSTER`) first.
+**Contract [A1, wording fixed]:** *erase-and-**recreate*** at the same prefix while any old process may
+live is out of contract (keys are not `pool_id`-namespaced; an open fence has up to ~TTL of write
+authority). A plain live erase without recreation is *handled* (transient → `IdentityLost` →
+`Vanished(erased)`/`FORGET`), not encouraged. `FORGET` is **node-local** (per `server_root_id`,
+`CasLayout.h:295`) — never authorization to erase or reuse shared backing; same-prefix reuse requires
+stopping/fencing every member first.
 
-## 3. Entering a terminal state; lifecycle serialization [B4-races]
+## 3. Terminal transitions; serialization
 
-- One WARN + ProfileEvent (`CasDataRootVanished` / `CasIdentityLost`); the remount thread exits its own
-  loop; the GC scheduler observes the flag at its next tick and exits; the keeper already exited. Joins only
-  in `~Pool` (C6).
-- **Serialization protocol** (natural transitions, `FORGET`, `GC STOP/START`, `tryRemountOnce` — one
-  protocol): a **terminal-intent atomic flag is published FIRST**, before any lock, and is checked (i) by
-  the keeper's callback before scheduling a remount, (ii) by the remount loop at each step boundary (so an
-  in-flight `tryRemountOnce` — which may hold `remount_mutex` across its ~36.5 s observation loop +
-  backend timeouts, `CasPool.cpp:621` — aborts at the next boundary, bounding any waiter's delay to one
-  step + one backend timeout). **All thread joins happen outside `remount_mutex`** (the codex rev.4 wait
-  cycle: FORGET holds mutex → keeper schedules remount → remount blocks on mutex → FORGET joins it →
-  deadlock — is thereby impossible). A post-trip successful renewal is harmless: `tripMountLost` is latched;
-  renew updates only the deadline, never clears `lost` (`CasMountRuntime.cpp:68`).
-- An in-flight GC round during the transition performs a **bounded abort**: it may observe missing
-  `gc/state` (throws its corruption guard, `CasGc.cpp:2427`) or recreate control debris (`:2436`) — caught
-  by the scheduler as a failed round; no *new* round starts after the flag. Documented as bounded abort,
-  not "harmless completion".
-- The disk stays registered (no eject); introspection shows `identity_lost` / `vanished(reason, since)`
-  distinctly.
+- One WARN + ProfileEvent (`CasIdentityLost` / `CasDataRootVanished`); keeper already exited; GC scheduler
+  exits at its next tick; the remount thread either demotes to observer (`IdentityLost`) or exits
+  (`Vanished`). **Joins: natural transitions defer joins to `~Pool`; `FORGET` joins keeper/remount/GC
+  synchronously, outside `remount_mutex`, before publishing `Vanished(forgotten)`** (rev.5's contradictory
+  wording fixed).
+- Serialization: a terminal-intent atomic flag published FIRST, checked by the keeper callback before
+  scheduling a remount and by the remount loop at every step boundary (bounds any waiter to one step + one
+  backend timeout). A post-trip successful renewal is harmless (`tripMountLost` latched,
+  `CasMountRuntime.cpp:68`).
+- An in-flight GC round performs a **bounded abort** (may throw its `gc/state` corruption guard
+  `CasGc.cpp:2427` or recreate control debris `:2436` — caught as a failed round); no new round after the
+  flag.
+- The disk stays registered; introspection distinguishes `identity_lost` / `vanished(erased|replaced|
+  forgotten, since)` via the non-`store()`-gated snapshot (the system table must synthesize the lifecycle
+  row instead of skipping the disk, `StorageSystemContentAddressedMounts.cpp:101`).
 
-## 4. Blast radius (with real numbers)
+## 4. Blast radius
 
-Transient: honest failures, auto-drain. Fence-out recovery window **36.5 s** (TTL+5 %+5 s poll) **+30 s**
-grace if a ref lane was unsettled; the first renewal failure may precede fence-out by the remaining lease
-budget (codex rev.4 I). `IdentityLost`: same fail-loud surface, but no auto-recovery — `DROP`s involving
-the disk re-queue until `FORGET`/restart (out-of-contract territory by construction).
-
-| Caller | transient / `IdentityLost` | `Vanished` |
-|---|---|---|
-| `DROP` finalizer sweep (`DatabaseCatalog.cpp:1657`) | per-table throw → re-queue (existing catch `:1562`) → drains on recovery (transient) or after `FORGET` (`IdentityLost`); log-throttled | exists=false → skip (truth) |
-| `table->drop()` on the disk | throws → re-queues | removes no-op → **`DROP` completes** (txn constructible per the Factory class [B4]) |
-| `SYSTEM UNFREEZE`, `system.remote_data_paths`, `ATTACH AS REPLICATED` cleanup, non-Atomic `DROP` | honest error | truthful absent/empty → proceed |
-| MergeTree foreign-part scan (`search_orphaned_parts_disks` default `ANY`; AsyncLoader does not retry) | can permanently fail an unrelated non-default-policy table load until manual `ATTACH` — **accepted + documented**; guidance: `LOCAL` where CA disks are configured | truthful absent → proceeds |
-| `SELECT` / `BACKUP` on a loaded table | throw 668 | typed erased error (never silent-empty) |
+Transient: honest failures, auto-drain; fence-out recovery ≈ 36.5 s (+30 s grace if a ref lane was
+unsettled); the first renewal failure may precede fence-out by the remaining lease budget.
+**`IdentityLost` [C5]: one such disk stalls ALL eligible Atomic `DROP` finalizations** (the finalizer
+sweeps every registered disk under default `search_orphaned_parts_disks=ANY`,
+`DatabaseCatalog.cpp:1657`) and any other all-disk operation that probes it, until `FORGET`/restart —
+accepted: its origin is an out-of-contract erase or a genuinely broken backing, both operator-attention
+events; the cure is one explicit verb. Other rows as rev.5: `Vanished` rows all proceed on truth;
+transient/`IdentityLost` rows fail honestly; the `search_orphaned_parts_disks=ANY` + AsyncLoader-no-retry
+table-load exposure stands accepted with `LOCAL` guidance; `SELECT`/`BACKUP` on a vanished disk get typed
+errors, never silent-empty.
 
 ## 5. `SYSTEM CONTENT ADDRESSED FORGET '<disk>'`
 
-Operator fire-marshal verb + the tests' teardown handle. Protocol (under §3's serialization):
-1. Publish terminal-intent (blocks new remount scheduling).
-2. Trip the local fence (`mayMutate` → false) — allowed on a live disk; the trip *is* the deliberate act.
-3. Stop keeper background renewal **without** the clean terminal release unless ref lanes are provably
-   drained (`~Pool`'s rule, `CasPool.cpp:565`); otherwise leave the lease to expire by observation — never
-   an unearned clean farewell (`CasServerRoot.cpp:882`).
-4. Stop the GC scheduler (clear `i_am_leader`); joins outside `remount_mutex`.
-5. Set `Vanished(forgotten)`.
-
-Hazards, documented loudly: operator-wrong ⇒ the benign lie by human assertion, **plus** no-op removes make
-ClickHouse forget table/part state while durable refs remain (restart over the intact pool re-exposes
-them); `FORGET` is **node-local** (§2). Own `AccessType` under `SYSTEM`.
+As rev.5, with the join clarification of §3: (1) publish terminal-intent; (2) trip the fence; (3) stop
+keeper renewal **without** a clean terminal release unless ref lanes provably drained (never an unearned
+clean farewell); (4) stop GC (clear `i_am_leader`); (5) join keeper/remount/GC outside `remount_mutex`;
+(6) set `Vanished(forgotten)`. Hazards documented: operator-wrong = the benign lie by human assertion +
+no-op removes can orphan durable refs that a restart re-exposes; node-local. Own `AccessType`.
 
 Not doing: runtime `STOP/START`, reuse `UNMOUNT/MOUNT`, registry eviction.
 
 ## 6. `GC STOP '<disk>'` / `GC START '<disk>'`
 
-As rev.4: GC scheduler only; `stop` clears `i_am_leader`; restartable (`gc_id` preserved); serialized under
-§3. GC's `gc/state` lease is independent of the mount lease; its destructive protocol is CAS-protected and
-stale-leader tolerant.
+As rev.5 (confirmed sound): scheduler only; `stop` clears `i_am_leader`; restartable; serialized under §3.
 
 ## 7. Introspection, FSCK
 
-- Non-`store()`-gated lifecycle snapshot in `system.content_addressed_mounts`: name, lifecycle
-  (`live`/`not_live`/`identity_lost`/`vanished(reason, since)`), last-known identity.
-- FSCK on a running disk: dormant-only dropped. **Missing committed manifest** stays hard *with*
-  revalidation (exact ref re-resolve + exact-object HEAD — the sound `Dangling` pattern, `CasFsck.cpp:370`).
-  **`meta_without_body` is advisory indefinitely** [codex rev.4 #7]: GC's meta-delete jobs suppress errors
-  (`CasGc.cpp:198`) and `wait` proves only completion (`:601`), so no finite grace horizon makes persistence
-  hard evidence; a hard counter returns only if GC gains a durable retry/repair protocol. Consumers to
-  update: `FsckReport::clean` (`CasFsck.h:113`) and the gtest asserting hard (`gtest_cas_fsck.cpp:217`).
-  One-row summary unchanged (`meta_without_body` is not in the SQL row, `InterpreterSystemQuery.cpp:2402`).
+As rev.5 (confirmed sound): non-gated lifecycle snapshot; FSCK on a running disk — missing-manifest hard
+*with* ref+HEAD revalidation; **`meta_without_body` advisory indefinitely** (GC suppresses meta-delete
+errors, `CasGc.cpp:198`; no finite horizon exists); consumers to update: `FsckReport::clean`
+(`CasFsck.h:113`), `gtest_cas_fsck.cpp:217`.
 
-## 8. Known limits (explicit non-goals)
+## 8. Known limits
 
-Cross-session (restart over an erased root re-bootstraps empty — today's cold-open semantics; future: local
-marker for a boot warning). Partial tampering with `_pool_meta` intact (FSCK's domain). Erase-and-recreate
-under live processes (out of contract). Pre-detection window (~10 s) after an out-of-contract live erase —
-mitigated by the empty-proof rule for enumeration loads; writes can recreate keys (S3 PUT creates) — covered
-by the contract declaration. Permanently-unconfirmable disk: `DROP` delays until `FORGET`/restart.
+Cross-session: a restart over a **fully** erased root re-bootstraps empty **only after the [C4] empty-prefix
+proof**; over a partial erase it now fails loud (improvement over rev.5). Partial tampering with
+`_pool_meta` intact: FSCK's domain. Erase-and-recreate under live processes: out of contract.
+Pre-detection window (~10 s) after a live erase: mitigated by the empty-proof rule; writes can recreate
+keys — covered by the contract. Non-strong-LIST backends: no natural `Vanished(erased)`; `FORGET` or
+restart-after-full-deletion. Permanently-unconfirmable disk: stalls until `FORGET`/restart.
 
-## 9. Rollback and tests [B-tests]
+## 9. Rollback and tests
 
-**Rollback of landed Task 4–8**: `MountState` enum + branches → §1's storage lifecycle + pool condition;
-`UNMOUNT`/`MOUNT` verbs + two `AccessType`s + AST fields + parser/formatter cases + `unmountSynchronously` +
-`mountExplicitly` + drain loop; FSCK-dormant-only; the four lifecycle gtests (`gtest_ca_transaction.cpp:725`
-ff.); the old teardown patterns in `04290`/`04295`/`05020`. Part-6 sites subsumed by the §1 central gate.
-Keep: Part 1, `poolAccess` snapshot, atomic `startup()`, `ca-fsck` rename, GC entry-point gating (via §3;
-the raw entry points `runGarbageCollectionRoundNow`/`runOneGcRoundForTest` get the same gate —
-`store()` throwing does not cover them, `ContentAddressedMetadataStorage.cpp:407`).
-
-**Tests**:
-- Unique per-invocation disk **names and paths**: `${CLICKHOUSE_TEST_UNIQUE_NAME}` **plus an
-  invocation-random suffix** (it does not vary under a fixed `--database` rerun, `shell_config.sh:13`);
-  update SQL predicates; **normalize or omit the disk-name column in reference output** (05020's reference
-  currently prints a literal name).
-- **Teardown, fail-closed** [codex rev.4 #10]: `DROP TABLE ... SYNC` → `SYSTEM CONTENT ADDRESSED FORGET` →
-  **verify** `system.content_addressed_mounts` reports `vanished(forgotten)` → only then `rm -rf`. A failed
-  `FORGET` (permissions, timeout, wrong name) aborts the test loudly — `rm -rf` must be unreachable on the
-  failure path (the scripts have no `set -e`; the check is explicit). Never `rm -rf` a globally-configured
-  disk's data. Stateless-test privileges for the new `AccessType` must be verified (default user in tests is
-  privileged; the grants test `01271` gets the new rows).
-- New tests: `IdentityLost` (partial erase: sentinels gone, prefix non-empty ⇒ fail-loud, no benign answers,
-  no auto-recovery); `Vanished(erased)` (full `rm -rf` ⇒ after proof, truth-empty; that table's `DROP`
-  completes; unrelated `DROP` completes; one WARN then silence); transient (gap ⇒ throws, auto-recovers,
-  `DROP` drains); empty-proof (read-only pool over erased backing ⇒ ATTACH fails typed, never empty);
-  `FORGET` (live disk: fence tripped, no unearned clean farewell, `vanished(forgotten)` in introspection);
-  `GC STOP/START`.
+As rev.5 (rollback list unchanged; Part-6 sites subsumed by the §1 gate; keep Part 1, `poolAccess`
+snapshot, atomic `startup()`, `ca-fsck` rename, gated raw GC entry points). Tests as rev.5 — unique
+names+paths with invocation-random suffix, normalized reference output, **fail-closed teardown**
+(`DROP SYNC` → `FORGET` → verify `vanished(forgotten)` in the system table → only then `rm -rf`; failed
+`FORGET` aborts the test with `rm -rf` unreachable) — plus rev.6 additions: `IdentityLost` observer test
+(progressive erase: sentinels first ⇒ `IdentityLost` fail-loud; deletion completes ⇒ observer promotes to
+`Vanished(erased)` — gated on a strong-LIST backend, gtest/integration with the S3/rustfs harness or a
+mocked capability); startup-over-partial-erase test (missing meta + non-empty prefix ⇒ typed startup
+failure, zero writes); fence-generation test (staging finalize / plain-object CAS racing a fence trip ⇒
+typed abort, no durable write).
 
 ## 10. Review ledger
 
-- rev.1 (codex): 3 P0 (resurrect-erased-pool; nonexistent recovery mechanism; unsound STOP) → identity
-  gate; fresh-incarnation recovery kept; STOP dropped.
-- rev.2: caller-side typed-catch — owner-rejected (Part-6 redux); eject — died on formulation.
-- rev.3 (codex): **architecture endorsed**; protocol amendments A1–A7.
-- rev.4: A1–A7 folded; codex verification: fold recognized, but **A2/A3/A4 introduced new blockers** →
-- rev.5: this document — [B1] `IdentityLost`/`Vanished` split (benign only via pool-wide emptiness proof or
-  `FORGET`); [B2] admission semantics for issued I/O with the fence-gated-commit safety argument; [B3]
-  empty-proof pre-terminal + uncached authoritative positive + enumerated `DirShape`s; [B4] the sixth
-  Factory/introspection class (un-blocks `DROP`'s transaction construction); [B5] `ProbeResult` at the
-  `IObjectStorage`/raw-error boundary + `ListObjectsV2` container proof + IAM table + Local stat semantics;
-  [B6] identity = `pool_id`+`blob_header_len`, format = compatible decode; FORGET ordering (terminal-intent
-  first, joins outside `remount_mutex`, bounded-abort GC); `meta_without_body` advisory indefinitely;
-  fail-closed test teardown.
+- rev.1 (codex): 3 P0 → identity gate; fresh-incarnation recovery kept; STOP dropped.
+- rev.2: caller-side typed-catch — owner-rejected; eject — died on formulation.
+- rev.3 (codex): **architecture endorsed**; amendments A1–A7.
+- rev.4: A1–A7 folded; verification found fold blockers in A2/A3/A4 → 
+- rev.5: B1–B6 (IdentityLost/Vanished split; admission semantics; empty-proof rescope; Factory class;
+  ProbeResult boundary; identity fields). Verification: **B3/B4/B6/FSCK/teardown/FORGET-deadlock sound**;
+  five narrow amendments →
+- rev.6: this document — [C1] non-absorbing `IdentityLost` + observer + one-way promotion; [C2]
+  fence-generation checks on all durable-effect paths (`CasPlainObjects`, staging finalize) + proof window
+  opens post-settle/grace; [C3] strong-LIST backend capability gates natural `Vanished(erased)` (S3/GCS
+  yes; RustFS pending; Local/Emulated never — `FORGET` is their path); [C4] empty-prefix precondition for
+  missing-`_pool_meta` bootstrap at startup; [C5] honest `IdentityLost` blast-radius wording; companion
+  C2/C3 refined; `appendRefOps` chokepoint and FORGET-join wording corrected.

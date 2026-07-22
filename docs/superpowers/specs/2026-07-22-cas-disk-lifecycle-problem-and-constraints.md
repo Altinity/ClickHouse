@@ -80,12 +80,19 @@ These are the load-bearing facts, most discovered the hard way:
   probes benign-absent silently skips real reclaim (permanent ref leak) or loads an empty table.
   *(The false assumption that sank Path B.)*
 - **C2 — benign-absent is only safe for a POSITIVELY-established "data erased" state.** There is no cheap,
-  non-racy positive signal for "the pool's data is really gone" (a LIST can be transiently empty or
-  eventually-consistent). Any not-mounted state that is not provably data-erased must **fail loud**, not
-  benign-absent.
+  non-racy positive signal for "the pool's data is really gone" on an arbitrary backend (a LIST can be
+  transiently empty or eventually-consistent). Any not-mounted state that is not provably data-erased must
+  **fail loud**, not benign-absent. *(Refined 2026-07-22, rev.6: a full-prefix LIST CAN serve as an erasure
+  proof, but ONLY on backends with a documented strongly-consistent prefix LIST (AWS S3, GCS), only after
+  the ref-lane settle/materialization-grace window, and only with spaced repeated samples; on all other
+  backends (Local, Emulated, unqualified S3-compatible gateways, RustFS until evidence is provided) no
+  natural proof exists and erasure requires an explicit operator assertion — `FORGET`.)*
 - **C3 — the lease/heartbeat is coupled to ANY pool use, including reads.** You cannot stop the
   lease/heartbeat while anything still uses the pool without violating the mount contract. Therefore you
-  cannot quiesce a disk that is in use.
+  cannot quiesce a disk that is in use. *(Refined 2026-07-22, rev.6: the lease gates operation ADMISSION
+  and every DURABLE-EFFECT finalization (fence-generation checked at plain-object CAS writes and staging
+  finalize); an already-admitted, non-durable in-flight read may complete on its existing pipeline — its
+  failure modes are the backend's own errors.)*
 - **C4 — usage is via untracked `shared_ptr`; you cannot reliably detect "unused".** `use_count` is racy,
   does not distinguish a millisecond sweep snapshot from a week-long backup, and never says *who*. The only
   clean signals are **semantic**: enumerate loaded `IStorage`s (the live-table guard) and any explicitly
