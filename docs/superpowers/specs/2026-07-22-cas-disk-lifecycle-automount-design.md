@@ -103,6 +103,27 @@ scheduler (re)creation on `!cas_store` only; they route through `ensureMounted()
 on `mount_state == Mounted`) so they can never construct a scheduler during `Unmounting`. This is the
 goal-1 quiescence fix.
 
+**Where the hook sits — the real-work *entry points*, not `poolAccess()`.** `ensureMounted()` is
+called at the TOP of the public real-work methods, before they take any CA mutex or call `store()`:
+`createTransaction()` (covers every write — `CREATE TABLE`'s `format_version.txt` write, every
+`INSERT` part write, mutations), the real read getters (`getStorageObjects` non-`IfExist`,
+`getFileSize`, `getLastModified`, the read-buffer entries), and the GC/FSCK admin entries. It is NOT
+placed inside `poolAccess()`/`store()` — those run under `pointer_mutex`, and taking the outer
+`lifecycle_mutex` there is the exact inversion that deadlocked rev.1.
+
+**Verified against the CREATE TABLE path (trace, 2026-07-22).** On a fresh table on a `Dormant` disk:
+the database layer's existence check is a plain local `fs::exists` (never touches the CAS disk);
+`disk->createDirectories(...)` is a CAS **no-op** (content-addressed storage has no real directories —
+`ContentAddressedTransaction::createDirectory` is empty and its `commit()` iterates zero parts, so it
+never reaches `store()`); the one benign probe on the path,
+`readFileIfExists("format_version.txt")` → `getStorageObjectsIfExist`, correctly returns *absent* for a
+fresh table and does NOT short-circuit — the code proceeds into the write branch; the **first real-work
+op is the `format_version.txt` write** (`MergeTreeData::initializeDirectoriesAndFormatVersion`), which
+goes through a transaction → `store()`. Hanging `ensureMounted()` on `createTransaction()` therefore
+re-mounts a `Dormant` disk exactly at that first write, and `CREATE TABLE` (and `INSERT`, whose part
+writes hit the same gate — `reserve()` does not touch `poolAccess()`) succeeds transparently. No benign
+probe misdirects the path.
+
 ### 3. `UNMOUNT` — unconditional full quiesce → inert `Dormant` husk
 
 `unmountSynchronously()` already stops the GC scheduler, drains `store()` refs to sole ownership, runs
@@ -173,6 +194,45 @@ With auto-mount, a `Dormant` husk re-mounts on the next real-work access, so `05
 (`CREATE TABLE` → auto-mount → `GC RUN`) just works — no per-test rewrite. The CA stateless family is
 otherwise unchanged. New behavior gets its own coverage (below). `05020` may additionally be tidied to
 the setup-`MOUNT`/teardown-`UNMOUNT` idiom for clarity, but it is not required for green.
+
+## Relationship to the 2026-07-21 design (what this supersedes / carries)
+
+This spec builds on `2026-07-21-cas-mount-lease-abort-and-disk-lifecycle-design.md` (rev.2). Reconciled
+explicitly so the two do not contradict:
+
+1. **Supersedes Part 3 ("FSCK dormant-only is the honest contract") and the Out-of-scope line "Online
+   (mounted-state) FSCK".** Rev.2 dropped online FSCK on review blocker #6 (multi-phase scan, no
+   coherent snapshot). New evidence changes the verdict: `Dormant` stops only THIS node's GC while
+   another node sharing the pool keeps deleting `body`-then-`meta`, so the `meta_without_body`
+   hard-ERROR false-positives *regardless* of local dormancy — dormant-only was a false guarantee. The
+   real fix is the `blobStillReferenced` re-check in §5, which makes the check correct under any node's
+   GC (the reachability/dangling classes already re-check and were the other half of blocker #6).
+   FSCK therefore moves to mounted-state; dormant-only is removed.
+2. **Picks up the deferred auto-mount (Part 2 "Optional future improvement"), but CA-internally.**
+   Rev.2 deferred auto-`MOUNT` and sketched it "at disk-resolution time (`getOrCreateDisk`/
+   `DiskFromAST`)" — which is generic/upstream code. This spec instead auto-mounts **on real-work
+   access inside `ContentAddressedMetadataStorage`** (§2), which needs no generic-disk change — the
+   deliberate choice to honor "minimize upstream."
+3. **Carries Part 4 unchanged.** The `SYSTEM CONTENT ADDRESSED GC RUN` `pending_*` drain columns and
+   the no-leftovers teardown pattern (`04290`/`04295`) stay as implemented. One consequence of §5:
+   `FSCK` no longer requires the preceding `UNMOUNT` (it runs mounted), so the teardown's `UNMOUNT` is
+   now only for quiescing before `rm -rf`, not a precondition of `FSCK` — the existing pattern still
+   works either way.
+4. **Introspection + `UNMOUNT ALL` dedup shared storage.** Per rev.2 review finding #8, a CAS
+   cache-disk wrapper shares one `ContentAddressedMetadataStorage` between the base and cache disk
+   names. `UNMOUNT ALL` and `system.content_addressed_mounts` dedup by the storage pointer
+   (`tryFromDisk`), so a shared pool is unmounted once and shown once.
+5. **FSCK output shape stays the implemented one-row summary** (Task 7), not rev.2 Part 3's
+   per-object listing (that was reduced to a summary + a future `DETAIL` keyword by YAGNI). This spec
+   changes only FSCK's exclusivity and the `meta_without_body` classification, not its columns.
+
+Unchanged and still in force from rev.2: Part 1 abort-hardening; the state machine, `lifecycle_mutex`,
+live-table guard, resumable `UNMOUNT`, atomic-publish `startup()`, the single paired-snapshot gate
+(`poolAccess`), and Part 6 benign-absent probes. Still out of scope (unchanged): automatic teardown on
+`DROP TABLE`/`DROP DATABASE` (would couple generic `DROP`); registry eviction of the disk (a two-cache
+generic-upstream change — see Non-goals). Known accepted trade-off: the inert `Dormant` husk stays in
+the disk cache (the pre-existing disk-lifecycle-leak is not fixed here — the user chose "remove
+side-effects," not "eject").
 
 ## Error handling
 
