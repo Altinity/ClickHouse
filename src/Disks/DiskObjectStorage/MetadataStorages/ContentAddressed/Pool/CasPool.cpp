@@ -6,6 +6,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInstrumentedBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasProbe.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasSentinelProbe.h>
 #include <IO/ReadBufferFromMemory.h>
 #include <IO/ReadHelpers.h>
 #include <IO/WriteBufferFromString.h>
@@ -33,6 +34,7 @@ namespace ErrorCodes
     extern const int FILE_DOESNT_EXIST;
     extern const int LIMIT_EXCEEDED;
     extern const int LOGICAL_ERROR;
+    extern const int INVALID_STATE;
 }
 }
 
@@ -69,6 +71,85 @@ namespace CurrentMetrics
 
 namespace DB::Cas
 {
+
+namespace
+{
+
+/// The verdict of the pool-lifecycle identity gate (step 0 of `tryRemountOnce`, spec §2). Exactly one
+/// `Recover` path falls through to the existing fresh-incarnation recovery; every other verdict is
+/// resolved by the gate itself (a terminal transition, or staying transient to retry).
+enum class LifecycleGateVerdict : uint8_t
+{
+    Recover,        /// `_pool_meta` present + identity matches: proceed with the existing recovery.
+    Replaced,       /// `_pool_meta` present + a FOREIGN pool_id: `Vanished(replaced)` immediately.
+    IdentityLost,   /// sentinels (`_pool_meta` + owner) absent while the prefix is NOT empty.
+    StayTransient,  /// a probe error, an undecodable meta, or any ambiguous observation: retry as today.
+};
+
+struct LifecycleGate
+{
+    LifecycleGateVerdict verdict;
+    String reason;   /// human-readable detail for the WARN / typed error (only meaningful for Replaced).
+};
+
+/// Authoritative, cache-bypassing evaluation of the §2 verdict table. Reads ONLY; never claims,
+/// allocates, or writes. `expected_pool_id`/`expected_blob_header_len` are the identity this Pool
+/// established at open — the comparison is over those two fields ONLY ([B6]); `algos_used` and
+/// `min_reader_generation` are legally mutable and are deliberately not compared (the format gate is the
+/// decode itself succeeding).
+LifecycleGate probePoolLifecycleGate(
+    Backend & backend, const Layout & layout, const String & srid,
+    UInt128 expected_pool_id, uint64_t expected_blob_header_len)
+{
+    const SentinelProbeResult meta_probe = probeSentinel(backend, layout.poolMetaKey());
+    switch (meta_probe.outcome)
+    {
+        case ProbeOutcome::Present:
+        {
+            /// Format gate = a successful, compatible decode. A present-but-undecodable body proves
+            /// neither identity nor a foreign pool_id, so it stays transient rather than being declared
+            /// replaced (throw-when-uncertain).
+            PoolMeta fresh;
+            try
+            {
+                if (!meta_probe.body)
+                    return {LifecycleGateVerdict::StayTransient, "_pool_meta probed Present without a body"};
+                fresh = decodePoolMeta(*meta_probe.body);
+            }
+            catch (...)
+            {
+                return {LifecycleGateVerdict::StayTransient, "_pool_meta present but could not be decoded"};
+            }
+            if (fresh.pool_id == expected_pool_id && fresh.blob_header_len == expected_blob_header_len)
+                return {LifecycleGateVerdict::Recover, {}};
+            return {LifecycleGateVerdict::Replaced,
+                    fmt::format("data root replaced by a foreign pool (pool_id {} != {})",
+                                u128ToHex(fresh.pool_id), u128ToHex(expected_pool_id))};
+        }
+        case ProbeOutcome::KeyAbsent:
+        {
+            /// `_pool_meta` is authoritatively gone. Require the OTHER sentinel (the owner anchor) to be
+            /// conclusively absent too before declaring identity lost — any surviving sentinel, or an
+            /// undecidable owner probe, keeps us transient. Then the prefix must be provably NON-empty
+            /// (data remains): that is the `IdentityLost` signal. An empty/undecidable prefix is Task 6's
+            /// `Vanished(erased)` proof territory — never concluded here.
+            const SentinelProbeResult owner_probe = probeSentinel(backend, layout.ownerKey(srid));
+            if (owner_probe.outcome != ProbeOutcome::KeyAbsent)
+                return {LifecycleGateVerdict::StayTransient,
+                        "_pool_meta absent but the owner sentinel was not conclusively absent"};
+            const SentinelProbeResult prefix_probe = probePrefixEmptiness(backend, layout.poolPrefix() + "/");
+            if (prefix_probe.outcome == ProbeOutcome::Present)
+                return {LifecycleGateVerdict::IdentityLost,
+                        "pool sentinels (_pool_meta + owner) absent while the pool prefix is not empty"};
+            return {LifecycleGateVerdict::StayTransient,
+                    "pool sentinels absent; prefix empty or undecidable (Vanished-erased proof is Task 6)"};
+        }
+        default:   /// ContainerAbsent / AccessDenied / Indeterminate — absence was never proven.
+            return {LifecycleGateVerdict::StayTransient, "pool-meta probe inconclusive"};
+    }
+}
+
+}
 
 Pool::Pool(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
     : pool_backend(std::move(backend_))
@@ -226,6 +307,41 @@ void Pool::setMountDeadline(uint64_t deadline_boot_ms)
 void Pool::armMountFence(UInt128 server_uuid, uint64_t writer_epoch, uint64_t deadline_boot_ms)
 {
     mount_runtime.armMountFence(server_uuid, writer_epoch, deadline_boot_ms);
+}
+
+void Pool::throwIfLifecycleTerminal() const
+{
+    /// The typed error carries the sub-state in its message so a wrong diagnosis is impossible from the
+    /// first error line (spec §1 [D5]). `Live`/`TransientNotLive` proceed here — the transient class is
+    /// still gated only by the write fence in this task (the full six-class gate is Task 8).
+    switch (mount_runtime.lifecycle())
+    {
+        case PoolLifecycle::Live:
+        case PoolLifecycle::TransientNotLive:
+            return;
+        case PoolLifecycle::IdentityLost:
+            throw Exception(ErrorCodes::INVALID_STATE,
+                "content-addressed pool '{}' identity lost — the pool sentinels are absent while data "
+                "remains (a live erase in progress); access fails loud. Recover by restart or "
+                "SYSTEM CONTENT ADDRESSED FORGET (a matching-sentinel restore does not auto-revive it).",
+                config.server_root_id);
+        case PoolLifecycle::VanishedErased:
+            throw Exception(ErrorCodes::INVALID_STATE,
+                "content-addressed pool '{}' data root erased (verified: pool prefix empty) — recreate "
+                "the disk; restart re-registers the name.",
+                config.server_root_id);
+        case PoolLifecycle::VanishedReplaced:
+            throw Exception(ErrorCodes::INVALID_STATE,
+                "content-addressed pool '{}' data root replaced by a foreign pool (pool_id mismatch) — "
+                "our generation is gone; restart re-registers the name.",
+                config.server_root_id);
+        case PoolLifecycle::VanishedForgotten:
+            throw Exception(ErrorCodes::INVALID_STATE,
+                "content-addressed pool '{}' decommissioned by SYSTEM CONTENT ADDRESSED FORGET — erasure "
+                "was NOT verified; if this was a mistake the data may be intact (restart re-registers "
+                "the name).",
+                config.server_root_id);
+    }
 }
 
 PoolPtr Pool::open(BackendPtr backend, PoolConfig config)
@@ -650,6 +766,42 @@ bool Pool::tryRemountOnce()
         try { return currentGcRound(); } catch (...) { return 0; }
     };
 
+    /// ==== Step 0 (rev.7 §2): pool lifecycle identity gate — BEFORE any claim/allocate/mount write ====
+    /// A remount attempt means the lease is presumed lost, so first ensure we are at least transient
+    /// (production reaches here already transient via `tripMountLost`; a direct/forced call may still be
+    /// `Live`). Then authoritatively probe the pool sentinels and dispatch per the §2 verdict table. Only
+    /// `Recover` (a present `_pool_meta` whose identity matches, in a non-`IdentityLost` state) falls
+    /// through to the existing recovery below; every other verdict resolves here and returns false.
+    mount_runtime.noteLeaseLost();
+    /// A fully-terminal `Vanished` pool never probes/claims/writes again.
+    if (mount_runtime.isVanished())
+        return false;
+    {
+        const LifecycleGate gate = probePoolLifecycleGate(
+            *pool_backend, pool_layout, config.server_root_id, meta.pool_id, meta.blob_header_len);
+        switch (gate.verdict)
+        {
+            case LifecycleGateVerdict::Recover:
+                /// [D3] no auto-revival: a matching-sentinel observation while `IdentityLost` does NOT
+                /// bring the disk back — the observer stays fail-loud; only a restart recovers.
+                if (mount_runtime.lifecycle() == PoolLifecycle::IdentityLost)
+                    return false;
+                break;   /// fall through to the existing fresh-incarnation recovery.
+            case LifecycleGateVerdict::Replaced:
+                mount_runtime.enterVanished(PoolLifecycle::VanishedReplaced, gate.reason);
+                return false;
+            case LifecycleGateVerdict::IdentityLost:
+                /// Enter once (from `TransientNotLive`); on a repeat probe while already `IdentityLost`
+                /// this is a no-op and the demoted observer simply keeps probing. Task 6 fills the
+                /// one-way `IdentityLost -> Vanished(erased)` promotion at exactly this point.
+                if (mount_runtime.lifecycle() != PoolLifecycle::IdentityLost)
+                    mount_runtime.enterIdentityLost();
+                return false;
+            case LifecycleGateVerdict::StayTransient:
+                return false;   /// uncertain — remain transient and let the recovery loop retry.
+        }
+    }
+
     /// The same startup protocol as Pool::open steps 2-4, as a FRESH incarnation (the old one is
     /// dead by the fence-out contract and its keeper never re-mints). Open THROWS on any failure
     /// (startup is fail-closed); the remount RETURNS false instead — the recovery loop retries.
@@ -736,6 +888,9 @@ bool Pool::tryRemountOnce()
             e.detail = {{"writer_epoch", std::to_string(writer_epoch)},
                         {"server_root_id", srid}};
         });
+        /// Recovery succeeded: `TransientNotLive -> Live` (never revives a terminal state — but the gate
+        /// above guarantees we only reach here from a non-terminal state anyway).
+        mount_runtime.noteRemounted();
         return true;
     }
     catch (...)

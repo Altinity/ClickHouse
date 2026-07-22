@@ -340,6 +340,19 @@ public:
     /// Test seam: count of durable-effect operations currently admitted (0 when none is in flight).
     uint64_t outstandingDurableRequestsForTest() const { return mount_runtime.outstandingDurableRequests(); }
 
+    /// ---- pool lifecycle condition (rev.7 §1; owned by `mount_runtime`) ----
+    /// Atomic read of the current lifecycle condition. Thin forwarder; safe to call from any thread.
+    PoolLifecycle lifecycle() const { return mount_runtime.lifecycle(); }
+    /// Whether the pool has reached one of the three fully-terminal `Vanished` values.
+    bool isVanished() const { return mount_runtime.isVanished(); }
+    /// The store()-class lifecycle gate: throws the typed `INVALID_STATE` error, whose message names the
+    /// terminal sub-state, when the pool has entered `IdentityLost` or any `Vanished` state; returns
+    /// silently while `Live`/`TransientNotLive`. This is the minimal "nothing silently proceeds" hook the
+    /// metadata storage's `poolAccess()` calls ALONGSIDE its existing `MountState` check (both hold until
+    /// Task 15). The FULL six-class operation gate — which additionally throws in the transient state and
+    /// answers truth-absent on removes/enumeration — is Task 8; this covers only the terminal states.
+    void throwIfLifecycleTerminal() const;
+
     /// ---- write side ----
     PartWriteTxnPtr beginPartWrite(PartWriteInfo info);                          /// W-HEARTBEAT durable before return
     /// Remove a build_seq from the active set; idempotent (safe from publish/abandon/dtor). Public

@@ -23,6 +23,29 @@ namespace DB::Cas
 class PartWriteTxn;
 using PartWriteTxnPtr = std::shared_ptr<PartWriteTxn>;
 
+/// The pool-level lifecycle condition (rev.7 §1) a `Pool` moves through as its shared backing changes
+/// underfoot. It is distinct from the storage-level `Constructing/Started/ShutDown` and from the
+/// `MountState` the metadata storage tracks (both of which stay in force until Task 15). Ordering of the
+/// enumerators is not significant; membership tests do the work.
+///   - `Live`             — the steady state; the mount lease is (or was last) held.
+///   - `TransientNotLive` — the lease was lost; access is uncertain and a self-remount retries. The §2
+///                          `Present`+identity-match recovery rule fires only from here (or `Live`).
+///   - `IdentityLost`     — the pool sentinels are gone while data remains (a live erase in flight):
+///                          fail-loud, but NON-absorbing ([C1]) — a low-rate observer keeps probing and
+///                          may promote one-way to `VanishedErased` (Task 6). Matching-sentinel
+///                          reappearance does NOT auto-revive it ([D3]); only a restart recovers.
+///   - `Vanished*`        — fully terminal truth: the data root was erased/replaced, or the disk was
+///                          decommissioned by `FORGET`. Store-class access fails loud from here.
+enum class PoolLifecycle : uint8_t
+{
+    Live,
+    TransientNotLive,
+    IdentityLost,
+    VanishedErased,
+    VanishedReplaced,
+    VanishedForgotten,
+};
+
 /// Configuration owned by `CasMountRuntime`. `PoolConfig::mountConfig` projects the flat pool settings
 /// into this value, keeping the pool's existing configuration interface unchanged while allowing this
 /// lower-layer header to describe its own dependencies.
@@ -163,6 +186,37 @@ public:
 
     /// Count of durable-effect operations currently admitted (their `DurableRequestGuard` still alive).
     uint64_t outstandingDurableRequests() const { return outstanding_durable_requests.load(std::memory_order_acquire); }
+
+    /// ---- pool lifecycle condition (rev.7 §1, spec §§1-3); enum at namespace scope below ----
+    /// Atomic read of the current lifecycle (acquire).
+    PoolLifecycle lifecycle() const { return pool_lifecycle.load(std::memory_order_acquire); }
+    /// Whether the pool has reached one of the three fully-terminal `Vanished` values.
+    bool isVanished() const;
+
+    /// Non-terminal lease-loss transition: `Live -> TransientNotLive`. Idempotent and lock-free; a
+    /// compare-exchange FROM `Live` only, so it never downgrades a terminal state. `tripMountLost`
+    /// calls this (the lease-loss primitive), and the remount loop's identity gate calls it as its
+    /// first step so a direct/forced remount attempt has a valid non-terminal predecessor state.
+    void noteLeaseLost();
+    /// Non-terminal recovery transition: `TransientNotLive -> Live`. Called after a self-remount
+    /// reclaimed a fresh incarnation. A compare-exchange FROM `TransientNotLive` only, so it NEVER
+    /// revives `IdentityLost`/`Vanished` ([D3]).
+    void noteRemounted();
+
+    /// One-way terminal transition to `IdentityLost`, from `TransientNotLive` only (a compare-exchange
+    /// FROM `TransientNotLive`, so it is idempotent and cannot fire from `Live`/`Vanished`). On the
+    /// transition it emits ONE WARN and one `CasIdentityLost` ProfileEvent. `IdentityLost` is NON-absorbing
+    /// per [C1]: it does NOT publish the terminal-intent latch, so the lifecycle observer keeps running
+    /// and Task 6 may later promote it to `VanishedErased`. Must be called under the caller's remount
+    /// serialization (Pool::remount_mutex).
+    void enterIdentityLost();
+    /// One-way transition to a fully-terminal `Vanished` value (spec §3). Publishes the terminal-intent
+    /// latch FIRST (so the keeper stops scheduling remounts and the remount loop exits at its next step
+    /// boundary), then the state, then ONE WARN + one `CasDataRootVanished` ProfileEvent. Idempotent: the
+    /// first terminal transition wins. `which` MUST be one of the three `Vanished*` values. Threads exit
+    /// their own loops; the joins happen in `~Pool` for a natural transition. Must be called under the
+    /// caller's remount serialization (Pool::remount_mutex).
+    void enterVanished(PoolLifecycle which, const String & reason);
 
     /// Extends `mayMutate` with a remaining-budget check. A ref-log attempt is refused unless the
     /// current lease has room for its configured timeout and safety margin, so work is not started when
@@ -329,6 +383,19 @@ private:
     std::atomic<uint64_t> fence_generation{0};
     /// Count of currently-admitted durable-effect operations (rev.7 [D1]). See `DurableRequestGuard`.
     std::atomic<uint64_t> outstanding_durable_requests{0};
+
+    /// The pool lifecycle condition (rev.7 §1). Starts `Live`. Non-terminal transitions
+    /// (`noteLeaseLost`/`noteRemounted`) are lock-free compare-exchanges guarded by their exact
+    /// predecessor state; the terminal transitions (`enterIdentityLost`/`enterVanished`) are serialized
+    /// by the caller's `Pool::remount_mutex` and made race-safe against the keeper thread's concurrent
+    /// `noteLeaseLost` by the compare-exchange/latch discipline in the .cpp.
+    std::atomic<PoolLifecycle> pool_lifecycle{PoolLifecycle::Live};
+    /// Terminal-intent latch (spec §3), published FIRST by `enterVanished` before the state store. Only
+    /// the fully-terminal `Vanished` transition sets it — `IdentityLost` is NON-absorbing ([C1]) and
+    /// deliberately does NOT, so its observer keeps running. Checked by the keeper callback before
+    /// scheduling a remount and by the remount loop at every step boundary, so a vanished pool never
+    /// claims, allocates, or writes again.
+    std::atomic<bool> vanished_intent{false};
 
     /// The `writer_epoch` that most recently reclaimed an unclean predecessor, or zero if none did. This
     /// is a per-epoch high-water mark rather than a sticky boolean: ref-table recovery seals only when

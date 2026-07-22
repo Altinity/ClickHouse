@@ -799,6 +799,12 @@ ContentAddressedMetadataStorage::PoolAccessSnapshot ContentAddressedMetadataStor
     /// null -- the publish step in `startup` sets both together).
     if (state != MountState::Mounted || !snap.pool)
         throwNotMounted(state);
+    /// rev.7 §1: a `Mounted` pool that has entered a terminal lifecycle condition (`IdentityLost` or any
+    /// `Vanished`) must ALSO refuse store()-class access, so nothing silently proceeds against an erased
+    /// or replaced data root. Both the `MountState` check above and this lifecycle check hold until Task
+    /// 15 removes `MountState`; the full six-class operation gate (which also gates the transient state
+    /// and answers truth-absent on removes/enumeration) is Task 8.
+    snap.pool->throwIfLifecycleTerminal();
     return snap;
 }
 
