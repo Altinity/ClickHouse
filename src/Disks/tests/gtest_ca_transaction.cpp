@@ -319,9 +319,9 @@ TEST(CasTransactionLockScope, InFlightReadCarriedForwardProjectionSidecar)
 }
 
 /// [TXN-ONE-PIPELINE] Audit 5: on a commit, only refs this commit CREATED are eligible for rollback;
-/// a repoint of an already-existing ref is NEVER dropped as compensation. `publishStaging` returns
-/// false for the repoint path (a committed ref exists), so the repoint is never recorded in
-/// `created_refs` and the pre-existing part survives with its content carried forward.
+/// a repoint of an already-existing ref is NEVER dropped as compensation. `publishStaging` writes a
+/// `CommitOutcome` with `created=false` for the repoint path (a committed ref exists), so `commit`'s
+/// rollback loop skips this slot and the pre-existing part survives with its content carried forward.
 TEST(CasTransactionLockScope, CommitRollbackSparesPreexistingRef)
 {
     auto storage = openTxStorage();
@@ -336,8 +336,8 @@ TEST(CasTransactionLockScope, CommitRollbackSparesPreexistingRef)
     ASSERT_TRUE(storage->existsDirectory("a88/a88a88a8-8888-4888-8888-888888888888/all_1_1_0"));
 
     /// A standalone write on the committed part repoints the EXISTING ref. Even if a later part in the
-    /// same commit were to fail, the existing ref must survive: the repoint returns false from
-    /// `publishStaging`, so it never enters `created_refs` and is never dropped on the error path.
+    /// same commit were to fail, the existing ref must survive: `publishStaging` writes `created=false`
+    /// for this slot, so `commit`'s rollback loop skips it and it is never dropped on the error path.
     {
         auto tx = storage->createTransaction();
         writeFileTx(*tx, "a88/a88a88a8-8888-4888-8888-888888888888/all_1_1_0/metadata_version.txt", "1");

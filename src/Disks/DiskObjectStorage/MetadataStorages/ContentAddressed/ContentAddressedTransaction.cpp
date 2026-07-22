@@ -28,6 +28,7 @@ namespace DB
 {
 namespace ErrorCodes
 {
+    extern const int ABORTED;
     extern const int FILE_DOESNT_EXIST;
     extern const int LOGICAL_ERROR;
     extern const int NOT_IMPLEMENTED;
@@ -127,7 +128,16 @@ ContentAddressedTransaction::~ContentAddressedTransaction()
 ContentAddressedTransaction::PartStaging &
 ContentAddressedTransaction::stagingFor(const ContentAddressedMetadataStorage::Route & r)
 {
-    return parts[{r.ns.string(), r.ref}];
+    return touchPart({r.ns.string(), r.ref});
+}
+
+ContentAddressedTransaction::PartStaging &
+ContentAddressedTransaction::touchPart(const std::pair<std::string, std::string> & key)
+{
+    auto [it, inserted] = parts.try_emplace(key);
+    if (inserted)
+        it->second.part_seq = next_part_seq++;
+    return it->second;
 }
 
 Cas::PartWriteTxn & ContentAddressedTransaction::buildFor(
@@ -282,18 +292,19 @@ void ContentAddressedTransaction::uploadPendingBlobs(PartStaging & st)
     }
 }
 
-bool ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, const std::string & ref, PartStaging & st)
+void ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, const std::string & ref, PartStaging & st,
+                                                 std::optional<Cas::CommitOutcome> & out_slot)
 {
     if (st.published)
-        return false;   /// this staging was already published earlier in this commit loop — never re-publish
+        return;   /// this staging was already published earlier in this commit loop — never re-publish
 
     if (!st.build && st.entries.empty() && st.content_removed.empty())
     {
         /// Nothing staged for this ref this transaction -- a touched-but-empty PartStaging (e.g. the
         /// harmless residue of a removeDirectory that already superseded this staging's marks,
-        /// content_removed cleared to empty). Benign no-op.
+        /// content_removed cleared to empty). Benign no-op; `out_slot` stays `std::nullopt`.
         st.published = true;
-        return false;
+        return;
     }
 
     /// For committed-ref standalone writes and removal marks, `st.entries` holds only the
@@ -339,14 +350,28 @@ bool ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
             for (auto & s : st.entries)
                 merged.push_back(std::move(s));
 
-            /// Capture the exact `CommitOutcome` IMMEDIATELY -- before the scratch-build `abandon()`
-            /// below, which can itself throw -- so a later throw there cannot lose it (Task 2's
-            /// publish-before-any-throwable-post-commit-work ordering).
+            /// Test-only fault seam (Task 3 TDD): simulate a promote-time backend failure for `ref`
+            /// right before the durable repoint call. A no-op in production (nothing ever arms it).
+            if (metadata_storage.shouldFailPromoteForTest(ref))
+                throw Exception(ErrorCodes::ABORTED,
+                    "ContentAddressedTransaction: test-injected promote failure for {}/{}", ns.string(), ref);
+
+            /// Capture the exact `CommitOutcome` IMMEDIATELY -- into the caller-provided slot, before
+            /// the scratch-build `abandon()` below (which can itself throw), and before the test-only
+            /// after-promote hook (which can run arbitrary test code) -- so a later throw in either
+            /// cannot lose it (Task 2/3's publish-before-any-throwable-post-commit-work ordering).
             const Cas::CommitOutcome oc = metadata_storage.partAccess()->repointRef({ns, ref}, std::move(merged), Cas::ProvenanceOp::Other);
+            out_slot = oc;   /// always created=false here: this block only runs once `view` already resolved
+            /// Test-only: models a concurrent writer racing in right after this transaction's own
+            /// confirm (e.g. repointing `ref` again). A no-op in production.
+            metadata_storage.runAfterPromoteHookForTest(ref);
             if (st.build)
+            {
                 st.build->abandon();   /// scratch precommit's protecting job is done; the real manifest is live
+                st.build.reset();      /// never re-abandon this build from the destructor
+            }
             st.published = true;
-            return oc.created;   /// always false here: this block only runs once `view` already resolved
+            return;
         }
     }
 
@@ -369,12 +394,24 @@ bool ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
     st.build->precommitAdd(ns, ref, id);
     uploadPendingBlobs(st);
 
+    /// Test-only fault seam (Task 3 TDD): simulate a promote-time backend failure for `ref` right
+    /// before the durable promote call. A no-op in production (nothing ever arms it).
+    if (metadata_storage.shouldFailPromoteForTest(ref))
+        throw Exception(ErrorCodes::ABORTED,
+            "ContentAddressedTransaction: test-injected promote failure for {}/{}", ns.string(), ref);
+
     /// The exact, in-lane-derived `created` from `promoteBuild` replaces the racy pre-check this used
     /// to be (`existsRef` before promote, which a concurrent writer could invalidate in the window
-    /// before the promote's own append confirms).
+    /// before the promote's own append confirms). Captured into `out_slot` IMMEDIATELY -- before the
+    /// test-only after-promote hook below (which can run arbitrary test code) or `st.build.reset()`
+    /// -- so a later throw there cannot lose it.
     const Cas::CommitOutcome oc = metadata_storage.partAccess()->promoteBuild(*st.build, {ns, ref}, st.build->buildId(), id);
+    out_slot = oc;
+    /// Test-only: models a concurrent writer racing in right after this transaction's own confirm. A
+    /// no-op in production.
+    metadata_storage.runAfterPromoteHookForTest(ref);
+    st.build.reset();   /// the build is consumed (promoted); never re-abandon it from the destructor
     st.published = true;
-    return oc.created;
 }
 
 void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &)
@@ -398,23 +435,45 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
     /// Publishing over a live ref does not occur in the MergeTree write path (unique part names), but
     /// the rollback must not assume it. updateRefPayload mutations (autocommit one-shots on a COMMITTED
     /// part) are individually durable by design and are deliberately NOT rolled back.
-    std::vector<std::pair<Cas::RootNamespace, std::string>> created_refs;
+    ///
+    /// Task 3: the rollback keys on the EXACT manifest each `publishStaging` call committed
+    /// (`Cas::CommitOutcome`), not merely on "this part's (ns, ref) name" -- an unconditional `dropRef`
+    /// would clobber a DIFFERENT writer's repoint of the same ref name that lands in the window between
+    /// this part's publish and a later part's failure (see `CasCommitRollback.RepointByOtherWriterSurvivesRollback`).
+    /// `part_outcomes` is snapshotted and preallocated up front (one allocation, index-addressed, no
+    /// per-part growth) so `publishStaging` can write `part_outcomes[i]` with a no-throw slot write --
+    /// load-bearing once Task 5 dispatches these calls from multiple threads.
+    struct IndexedPart { Cas::RootNamespace ns; std::string ref; PartStaging * st; };
+    std::vector<IndexedPart> ordered;
+    ordered.reserve(parts.size());
+    for (auto & [key, st] : parts)
+        ordered.push_back({Cas::RootNamespace{key.first}, key.second, &st});
+    /// Process in the order this transaction first touched each part -- NOT `parts`' incidental (ns,
+    /// ref) string sort order, which is otherwise unrelated to any real dependency between parts.
+    std::sort(ordered.begin(), ordered.end(),
+        [](const IndexedPart & a, const IndexedPart & b) { return a.st->part_seq < b.st->part_seq; });
+
+    std::vector<std::optional<Cas::CommitOutcome>> part_outcomes;
+    part_outcomes.assign(ordered.size(), std::nullopt);
+
     try
     {
-        for (auto & [key, st] : parts)
-        {
-            const Cas::RootNamespace ns{key.first};
-            if (publishStaging(ns, key.second, st))
-                created_refs.emplace_back(ns, key.second);
-        }
+        for (size_t i = 0; i < ordered.size(); ++i)
+            publishStaging(ordered[i].ns, ordered[i].ref, *ordered[i].st, part_outcomes[i]);
     }
     catch (...)
     {
         failed = true;
         /// Compensating rollback. Best-effort: a ref we cannot unpublish becomes unreferenced debris
-        /// (GC-reclaimed); never mask the original failure with a rollback failure.
-        for (const auto & [ns, ref] : created_refs)
-            metadata_storage.partAccess()->dropRefBestEffort({ns, ref});
+        /// (GC-reclaimed); never mask the original failure with a rollback failure. Only a slot whose
+        /// outcome `created` is true names a ref THIS commit made durable for the first time; a
+        /// repoint of an already-committed ref (created=false) is pre-existing data and is never
+        /// dropped. `dropRefIfMatches` additionally guards against a concurrent repoint of the SAME ref
+        /// since this call's own publish: it removes the ref only if it still names the exact
+        /// `manifest_ref` this commit bound, leaving a newer binding untouched.
+        for (const auto & oc : part_outcomes)
+            if (oc && oc->created)
+                metadata_storage.partAccess()->dropRefIfMatches({oc->ns, oc->ref}, oc->manifest_ref);
         throw;
     }
     committed = true;
@@ -1165,7 +1224,7 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
         if (auto src_it = parts.find(src_key); src_it != parts.end())
         {
             had_staged_source = true;
-            PartStaging & dst_st = parts[dst_key];
+            PartStaging & dst_st = touchPart(dst_key);
             PartStaging & src_st = src_it->second;
             for (auto & entry : src_st.entries)
             {

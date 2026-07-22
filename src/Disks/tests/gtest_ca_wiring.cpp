@@ -1725,8 +1725,9 @@ TEST(CasWiringWrite, PartialCommitRollsBackPublishedParts)
     EXPECT_THROW(tx->commit(DB::NoCommitOptions{}), DB::Exception);
 
     /// All-or-nothing: the part that DID publish must have been rolled back (commit's compensating
-    /// dropRefBestEffort). Disarm first so the read-back assertions run clean — the rollback itself only
-    /// writes ref-log ops, never a manifest body, so it does not re-trip the count-2 fault.
+    /// `dropRefIfMatches`, keyed on the exact `CommitOutcome` `all_1_1_0`'s own publish produced).
+    /// Disarm first so the read-back assertions run clean — the rollback itself only writes ref-log
+    /// ops, never a manifest body, so it does not re-trip the count-2 fault.
     faulty->on_write = nullptr;
     EXPECT_FALSE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0"));
     EXPECT_FALSE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111/all_2_2_0"));

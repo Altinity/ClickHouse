@@ -525,7 +525,7 @@ bool CachedPartFolderAccess::dropRefIfMatches(const PartRefKey & key, const Cas:
     bool removed = false;
     try
     {
-        store->appendRefOps(key.ns, MutationScope::ref(key.ref),
+        const RefTxnId txn_id = store->appendRefOps(key.ns, MutationScope::ref(key.ref),
             [&](const RefTableState & state) -> std::vector<RefOp>
             {
                 const auto it = state.getCommitted().find(key.ref);
@@ -539,6 +539,24 @@ bool CachedPartFolderAccess::dropRefIfMatches(const PartRefKey & key, const Cas:
                 return {op};
             },
             RootMutationOrigin::Writer, RootMutationKind::Drop);
+
+        /// Audit a successful conditional removal exactly like `CasRefLedger::dropRef` audits its own
+        /// unconditional one -- otherwise a rollback drop (this method's only caller, as of Task 3)
+        /// would be invisible in `system.content_addressed_log`. Byte-neutral to the ref-log: this is
+        /// an audit event only, emitted after the removal is already durable.
+        if (removed && store->hasEventSink())
+        {
+            Cas::CasEvent ev;
+            ev.type = Cas::CasEventType::RefDrop;
+            ev.namespace_ = key.ns.string();
+            ev.ref_name = key.ref;
+            ev.object_kind = Cas::CasEventObjectKind::Manifest;
+            ev.object_hash = Cas::manifestRefDebugString(expected);
+            ev.at_version = txn_id.ref_sequence;
+            ev.outcome = "ok";
+            ev.reason = "dropRefIfMatches: conditional rollback removed the exact manifest this caller committed";
+            store->emitEvent(std::move(ev));
+        }
     }
     catch (...)
     {

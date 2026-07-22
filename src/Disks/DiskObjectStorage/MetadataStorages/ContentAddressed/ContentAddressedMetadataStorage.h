@@ -16,6 +16,8 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace Poco::Util { class AbstractConfiguration; }
 
@@ -379,6 +381,32 @@ public:
     /// dispatch order directly.
     DirRoute classifyDirectoryForTest(const std::string & path) const { return classifyDirectory(path); }
 
+    /// Test-only fault-injection/hook seam for `ContentAddressedTransaction::publishStaging`'s
+    /// promote/repoint call, keyed by ref name only (mirrors `CasRefLedger::setRefPreCarveHookForTest`'s
+    /// no-op-in-production shape). `armPromoteFailureForTest` makes the NEXT `promoteBuild`/`repointRef`
+    /// call for `ref` throw instead of committing, modeling a transient promote-time backend failure.
+    /// `setAfterPromoteHookForTest` installs a one-shot callback run synchronously immediately after a
+    /// successful promote/repoint for `ref` (before the caller's own post-commit bookkeeping), modeling
+    /// a concurrent writer racing in right after this transaction's confirm -- e.g. repointing the same
+    /// ref to a different manifest so a later rollback's `dropRefIfMatches` must see it changed.
+    void armPromoteFailureForTest(const std::string & ref) { promote_failure_refs_for_test.insert(ref); }
+    bool shouldFailPromoteForTest(const std::string & ref) const { return promote_failure_refs_for_test.contains(ref); }
+    void setAfterPromoteHookForTest(const std::string & ref, std::function<void()> hook)
+    {
+        after_promote_hooks_for_test[ref] = std::move(hook);
+    }
+    /// Invokes and removes `ref`'s one-shot hook, if any registered. A no-op when none is installed
+    /// (the production hot path never installs one).
+    void runAfterPromoteHookForTest(const std::string & ref)
+    {
+        auto it = after_promote_hooks_for_test.find(ref);
+        if (it == after_promote_hooks_for_test.end())
+            return;
+        auto hook = std::move(it->second);
+        after_promote_hooks_for_test.erase(it);
+        hook();
+    }
+
 private:
     const ObjectStoragePtr object_storage;
     const std::string storage_path_prefix;
@@ -578,6 +606,11 @@ private:
     /// `Cas::CasEvent` into a ContentAddressedLogElement, and appends it to the SystemLog
     /// (best-effort). Returns an empty sink when context is null (unit tests).
     Cas::CasEventSink makeCasEventSink() const;
+
+    /// Backing state for the `*ForTest` promote fault-injection/hook seam declared above. Empty in
+    /// production (no test ever arms them); consulted only by `ContentAddressedTransaction::publishStaging`.
+    std::unordered_set<std::string> promote_failure_refs_for_test;
+    std::unordered_map<std::string, std::function<void()>> after_promote_hooks_for_test;
 };
 
 }
