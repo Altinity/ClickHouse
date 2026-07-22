@@ -423,6 +423,9 @@ private:
     const std::chrono::seconds gc_interval;
     const uint64_t dedup_cache_bytes;            /// P1 known-present cache byte cap (0=off)
     const uint64_t dedup_head_first_min_bytes;   /// P2 HEAD-before-PUT size threshold (0=off)
+    /// CAS parallel-write-path (Task 5): fan-out cap for per-part commit dispatch. Threaded into
+    /// `Cas::PoolConfig::cas_commit_concurrency`; unused until Task 5 wires the commit loop onto it.
+    const uint64_t cas_commit_concurrency;
     const uint64_t gc_snap_generations_to_keep;  /// Number of GC snapshots retained (0 means keep all).
     const uint64_t gc_shards;                    /// Blob-hash-prefix reducer shard count, fixed at pool creation.
     const uint64_t manifest_sweep_list_budget_keys;

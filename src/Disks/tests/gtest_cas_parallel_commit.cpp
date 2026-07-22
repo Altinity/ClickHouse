@@ -1,8 +1,12 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Parts/PartFolderAccess.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasCommitThreadPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/tests/cas_test_helpers.h>
+#include <IO/SharedThreadPools.h>
+#include <Common/ThreadPool.h>
 #include <fmt/format.h>
 #include <gtest/gtest.h>
 #include <atomic>
@@ -305,4 +309,45 @@ TEST(CasCommitRollback, RepointByOtherWriterSurvivesRollback)
     // T1's rollback used dropRefIfMatches(M1); M2 != M1 so it must survive.
     EXPECT_TRUE(fx.partAccess().existsRef(key, Cas::Freshness::ForceFresh));
     EXPECT_EQ(fx.currentManifest(key), fx.lastRepointManifest());
+}
+
+/// Task 4 of the CAS parallel-write-path plan: `cas_commit_concurrency` (a `PoolConfig` tunable) +
+/// `DB::Cas::getCasCommitThreadPool()` (a dedicated, process-wide pool for Task 5's per-part commit
+/// dispatch). No behavior change yet -- this test only proves the two pieces exist and that the pool
+/// is genuinely disjoint from the S3 writer pool, which is the entire point of a dedicated pool (a
+/// commit worker blocks in `WriteBufferFromS3::finalize` waiting on the writer pool; if the worker
+/// were itself a writer-pool thread, that wait would deadlock one level down).
+///
+/// `Context::getThreadPoolWriter()` is a non-static member function reachable only through a fully
+/// bootstrapped `Context` (it lazily constructs `shared->threadpool_writer`, sized from
+/// `threadpool_writer_pool_size`/`threadpool_writer_queue_size` -- see `Context::getThreadPoolWriter`
+/// in `Interpreters/Context.cpp`), so this lightweight disk-layer unit test cannot reach it directly.
+/// Disjointness is proven STRUCTURALLY instead, per three independent facts:
+///   1) `getCasCommitThreadPool()`'s `ThreadPool` lives in a function-local static PRIVATE to
+///      `CasCommitThreadPool.cpp` (the `CasCommitPoolHolder` singleton) -- no other translation unit
+///      can obtain a reference to it except through this accessor.
+///   2) `Context::getThreadPoolWriter()`'s `ThreadPool` lives in `shared->threadpool_writer`, a member
+///      of `Context::ContextSharedPart` -- a completely different object, in a completely different
+///      translation unit, with a completely different sizing setting.
+///   3) `getIOThreadPool()`'s `ThreadPool` (checked below, since it IS reachable from a unit test) is
+///      a third, separately-declared static in `IO/SharedThreadPools.cpp`.
+/// Three distinct statics in three distinct translation units never alias one another; the runtime
+/// check below additionally proves (1) and (3) apart, and that (1) is a stable singleton.
+TEST(CasCommitPool, DistinctFromWriterPoolAndBounded)
+{
+    ThreadPool & cas_commit_pool = DB::Cas::getCasCommitThreadPool();
+
+    /// Singleton stability: the same object every call (a prerequisite for "disjoint from the writer
+    /// pool" to mean anything -- a pool that handed out a fresh object per call would trivially be
+    /// "distinct" from everything, including itself).
+    EXPECT_EQ(&cas_commit_pool, &DB::Cas::getCasCommitThreadPool());
+
+    /// `initializeWithDefaultSettingsIfNotInitialized` is idempotent (guarded by the same
+    /// `std::call_once` as an explicit `initialize()`), so this is safe even if another test in this
+    /// same process already initialized (or will initialize) the IO pool.
+    DB::getIOThreadPool().initializeWithDefaultSettingsIfNotInitialized();
+    EXPECT_NE(static_cast<void *>(&cas_commit_pool), static_cast<void *>(&DB::getIOThreadPool().get()));
+
+    /// Default concurrency setting is present.
+    EXPECT_EQ(DB::Cas::PoolConfig{}.cas_commit_concurrency, 16u);
 }

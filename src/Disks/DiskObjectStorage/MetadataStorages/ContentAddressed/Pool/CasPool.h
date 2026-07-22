@@ -71,6 +71,13 @@ struct PoolConfig
     /// HEAD-before-PUT: on a dedup-cache MISS, a blob whose body is >= this many bytes is written
     /// HEAD-first (a cheap HEAD avoids streaming a body that would 412). 0 disables the size trigger.
     uint64_t dedup_head_first_min_bytes = 1ULL << 20;   /// 1 MiB
+    /// CAS parallel-write-path (Task 5, docs/superpowers/sdd): bounded concurrency for dispatching
+    /// per-part commit work onto `Cas::getCasCommitThreadPool()` (a process-wide pool, disjoint from
+    /// the S3 writer pool -- see that pool's doc comment for why disjointness is load-bearing). NOT
+    /// itself a thread-pool size; a per-call fan-out cap so one `commit()` never floods the shared
+    /// pool with every part in the transaction at once. Unused until Task 5 wires it into the commit
+    /// loop; Task 4 only adds the tunable.
+    uint64_t cas_commit_concurrency = 16;
     /// Part-folder cache: byte bound for the manifest DECODE cache. The old cache
     /// was count-bounded only (16384 entries) — decoded manifests carry inline bytes, so the worst
     /// case was multi-GB. 0 disables decode caching (every read decodes fresh — diagnostic mode).
