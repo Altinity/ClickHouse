@@ -2,11 +2,14 @@
 
 ## Overview
 
-The `ALTER TABLE EXPORT PARTITION` command exports entire partitions from Replicated*MergeTree tables to object storage (S3, Azure Blob Storage, etc.) or data lakes like Apache Iceberg tables (with and without catalogs), typically in Parquet format. This feature coordinates export part operations across all replicas using ZooKeeper.
+The `ALTER TABLE EXPORT PARTITION` command exports entire partitions from `MergeTree`-family tables to object storage (S3, Azure Blob Storage, etc.) or data lakes like Apache Iceberg tables (with and without catalogs), typically in Parquet format.
 
-The set of parts that are exported is based on the list of parts the replica that received the export command sees. The other replicas will assist in the export process if they have those parts locally. Otherwise they will ignore it.
+- On `Replicated*MergeTree` tables the export is coordinated across all replicas using ZooKeeper.
+- On plain (non-replicated) `MergeTree` tables the export runs entirely on the single node that received the command. No ZooKeeper / `clickhouse-keeper` ensemble is required. See [Plain (non-replicated) MergeTree](#plain-non-replicated-mergetree) below.
 
-The partition export tasks can be observed through `system.replicated_partition_exports`. The table is served from each replica's in-memory mirror, so queries do not contact ZooKeeper and are cheap to run. The mirror is refreshed on the manifest-updater poll cycle and on every status change, so a freshly written exception or terminal state may take up to one poll interval to appear. Individual part export progress can be observed as usual through `system.exports`.
+The set of parts that are exported is based on the list of parts the replica that received the export command sees. On `Replicated*MergeTree`, the other replicas will assist in the export process if they have those parts locally. Otherwise they will ignore it.
+
+The partition export tasks can be observed through `system.replicated_partition_exports` (for `Replicated*MergeTree`) or `system.partition_exports` (for plain `MergeTree`). Both tables are served from an in-memory mirror, so queries do not contact ZooKeeper or disk and are cheap to run. The `system.replicated_partition_exports` mirror is refreshed on the manifest-updater poll cycle and on every status change, so a freshly written exception or terminal state may take up to one poll interval to appear. Individual part export progress can be observed as usual through `system.exports`.
 
 The same partition can not be exported to the same destination more than once. There are two ways to override this behavior: either by setting the `export_merge_tree_partition_force_export` setting or waiting for the task to expire.
 
@@ -34,6 +37,18 @@ The source partition must not be split in the destination. This is validated at 
 ### On plain object storage exports:
 
 Each MergeTree part will become a separate file with the following name convention: `<table_directory>/<partitioning>/<data_part_name>_<merge_tree_part_checksum>.<format>`. To ensure atomicity, a commit file containing the relative paths of all exported parts is also shipped. A data file should only be considered part of the dataset if a commit file references it. The commit file will be named using the following convention: `<table_directory>/commit_<partition_id>_<transaction_id>`.
+
+## Plain (non-replicated) MergeTree
+
+`EXPORT PARTITION` is supported on plain `MergeTree` tables in addition to `Replicated*MergeTree`. Because a single node owns the whole export there is no cross-replica coordination and no ZooKeeper is involved:
+
+- The task descriptor (the list of parts, their per-part progress, the export settings and the task status) is persisted as a small JSON file on the table's disk under `<table_data_path>/partition_exports/<transaction_id>.json`, instead of in ZooKeeper.
+- A local background task drives the export: it schedules the part exports, records their completion, and performs the final commit (a commit file for plain object storage, or the Iceberg snapshot commit for Iceberg destinations).
+- The task is persistent — an in-flight export is reloaded from disk and resumed after a server restart.
+- Progress is observed through `system.partition_exports` (not `system.replicated_partition_exports`). It exposes the same core columns: `source_database`, `source_table`, `destination_database`, `destination_table`, `create_time`, `partition_id`, `transaction_id`, `query_id`, `parts`, `parts_count`, `parts_to_do`, `status`, `last_exception`, `last_exception_part`, `last_exception_time`, and `exception_count`. Replica-specific columns are omitted.
+- Duplicate protection, `export_merge_tree_partition_force_export`, `EXPORT PARTITION ALL`, and `KILL EXPORT PARTITION` all behave the same way as for `Replicated*MergeTree`. A single `KILL EXPORT PARTITION ... WHERE ...` matches tasks from both engines.
+
+All the object-storage and Iceberg output layouts, atomicity guarantees, and settings described in this document apply equally to plain `MergeTree`.
 
 ## Syntax
 
@@ -66,7 +81,7 @@ TO TABLE [destination_database.]destination_table
 
 - **Type**: `Bool`
 - **Default**: `false`
-- **Description**: Enable export replicated merge tree partition feature. It is experimental and not yet ready for production use.
+- **Description**: Enable the `EXPORT PARTITION` feature for both `Replicated*MergeTree` and plain `MergeTree` tables. It is experimental and not yet ready for production use.
 
 ### Query Settings
 
@@ -173,7 +188,7 @@ WHERE partition_id = '2020'
   AND destination_table = 's3_table'
 ```
 
-The `WHERE` clause filters exports from the `system.replicated_partition_exports` table. You can use any columns from that table in the filter.
+The `WHERE` clause filters exports from the `system.replicated_partition_exports` table (for `Replicated*MergeTree`) and the `system.partition_exports` table (for plain `MergeTree`); a single `KILL EXPORT PARTITION` consults both. You can use any columns common to those tables in the filter (for example `partition_id`, `source_table`, `destination_table`).
 
 ## Monitoring
 
