@@ -82,10 +82,24 @@ inventory.
 |---|---|---|---|
 | **Factory / capability / introspection** (`createTransaction` — I/O-free, verified; `getType`/`getPath`/capability getters/`gcHealth`/lifecycle snapshot) | works | **works** | **works** |
 | Probe / enumeration | real | **throw** 668 | absent / empty (truth) |
-| Content read | real | **throw** 668 | **throw** typed "data root erased/decommissioned" |
+| Content read | real | **throw** 668 | **throw** typed, message names the ACTUAL reason (see below) |
 | Create / write / rename (incl. previously-no-op sites; empty-txn commit) | real | **throw** 668 | **throw** typed erased |
 | Remove | real | **throw** 668 | **no-op success** (truth) — a vanished-disk table's `DROP` completes |
 | Admin (`store()`, GC RUN) | real | throw | throw typed erased (per-disk status in fan-outs) |
+
+**Error messages tell the truth about the reason [D5].** The `Vanished` typed error (one error code) carries
+the sub-state in its message, because a wrong message would mislead diagnosis — the exact failure mode this
+design exists to kill:
+- `Vanished(erased)` — "data root erased (verified: pool prefix empty) — recreate the disk; restart
+  re-registers the name". Erasure was *proven*; saying so is the truth.
+- `Vanished(replaced)` — "data root replaced by a foreign pool (pool_id mismatch)". Our generation is gone,
+  but the prefix is not empty — never claim "erased".
+- `Vanished(forgotten)` — "disk decommissioned by SYSTEM CONTENT ADDRESSED FORGET at <timestamp> — erasure
+  was NOT verified; if this was a mistake the data may be intact (restart re-registers the name)". `FORGET`
+  is an operator assertion, not a proof; the message must say so, so an operator-wrong case is diagnosable
+  from the first error line and traceable to the audit log.
+The same reason strings appear in the `system.content_addressed_mounts` lifecycle snapshot and the one
+WARN logged at the transition.
 
 **Gate lifetime [C2]:** the gate governs **admission**, and additionally **every durable-effect
 finalization is fence-generation-checked**: the plain-object surface (`CasPlainObjects::casPutObject` /
