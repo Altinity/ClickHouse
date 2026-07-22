@@ -189,7 +189,11 @@ erased.
   peers must catch a not-live/`Unavailable` CAS disk and **defer/reschedule** (not conclude "already
   removed", not hang forever) — distinguishing transient-retry from give-up-with-a-loud-log; a `Vanished`
   disk's reclaim is a no-op (nothing to reclaim) but logged. Per-disk isolation (try/catch) so one disk
-  never poisons a whole fan-out. (Addresses G3.)
+  never poisons a whole fan-out. (Addresses G3.) *(Disposition, rev.6/7: satisfied WITHOUT generic code —
+  deferral is the existing per-table re-queue; `Vanished` no-op comes from the disk's truth-state. The
+  per-disk-isolation clause is consciously NOT met for `IdentityLost`: one such disk stalls all eligible
+  Atomic finalizations until `FORGET`/restart — an accepted exception, since its origin is an
+  out-of-contract erase or a broken backing, both operator-attention events with a one-verb cure.)*
 - **R5 — positive vanished detection, covering all paths.** Establish `Vanished` from a positive check
   (pool meta / roots gone), reachable from the GC path and read-only pools, not only the writable mount
   keeper; guard against a transient LIST-empty false positive. (Addresses C11, C7.)
@@ -218,20 +222,27 @@ erased.
 - **`poolAccess()` coherent snapshot, atomic-publish `startup()`, `ca-fsck` rename** — landed, independently
   good, keep.
 
-## 8. The genuinely-hard open core (for the future design to answer)
+## 8. The (formerly open) hard core — questions and their rev.6/7 dispositions
 
-1. How to **positively and cheaply** establish "this pool's data is really erased" (`Vanished`) without a
-   racy/eventually-consistent LIST giving a false positive?
-2. How should generic reclaim treat a CAS disk whose data may be intact but is **transiently unreachable**
-   — reschedule (risk: infinite retry if it never returns) vs give-up-and-log (risk: leak) — and how to
-   tell the two apart without a positive signal (see 1)?
-3. Is **runtime reuse of the same disk (G7)** worth supporting at all, given it was the source of the
-   Dormant/eject/auto-mount cascade? If tests use unique names (§7) and decommission is config+restart,
-   G7 may be unnecessary — which removes the persistent not-live state entirely and collapses the problem
-   to G1/G2/G3/G5.
+These were written as open questions for "the future design". That design now exists —
+`2026-07-22-cas-disk-lease-loss-throw-and-stop-verbs-design.md` (rev.7) — and answered them:
 
-The recommended framing for the next attempt: **do not build reuse.** Solve G1 (done), G2 (bounded/typed
-stop of background work on *positively-confirmed* vanish, lifetime-safe — R5/R6), G3 (fail-loud state +
-sweep handling — R2/R3/R4), and G5 (FSCK re-validation — R8), and treat any not-live-with-possibly-intact
-data as **fail-loud**, never benign-absent. Reconsider whether Part 6's benign-absent should exist at all,
-or be replaced by fail-loud + sweep-side handling (R4).
+1. *How to positively and cheaply establish "data really erased" without a racy LIST false positive?* →
+   **Answered**: full-prefix-empty LIST as the pool-wide proof, but ONLY on backends with documented
+   strongly-consistent prefix LIST (S3/GCS), only after full durable-lane quiescence (ref lanes + the
+   outstanding-durable-request counter + GC exit + grace), with ≥2 spaced samples, and with typed
+   `KeyAbsent`-vs-error evidence (errors never conclude erased). Where no such backend guarantee exists
+   (Local/Emulated/unqualified gateways): there is NO natural proof — `IdentityLost` (fail-loud) + operator
+   `FORGET` is the answer.
+2. *Transient-unreachable reclaim: reschedule vs give-up, and how to tell?* → **Answered**: always
+   reschedule (the existing per-table `DROP` re-queue — no new generic code); transient drains on
+   auto-recovery; the un-provable stuck case (`IdentityLost`) stalls visibly until the operator `FORGET`s
+   or restarts — never a silent skip, never a leak.
+3. *Is runtime reuse (G7) worth supporting?* → **Answered: no.** Dropped entirely; tests use unique names,
+   decommission is config+restart, and the whole Dormant/eject/auto-mount cascade dissolves with it.
+
+The closing framing stands, realized: no reuse; G1 (done — Part 1), G2 (terminal states stop background
+work; observer is non-mutating), G3 (fail-loud + truth-state + existing re-queue), G5 (FSCK
+re-validation; `meta_without_body` advisory); any not-live-with-possibly-intact data is **fail-loud**,
+never benign-absent — Part 6 is rolled back, and benign answers exist only in the proven/asserted
+`Vanished` state.
