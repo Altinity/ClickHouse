@@ -1,16 +1,22 @@
 # CAS write path, stage 1 — CAS-internal improvements (no upstream changes)
 
-- **Date:** 2026-07-22 (rev. 2 — all nine findings of Codex review round 3 folded in: chunked
-  flush replaces give-back, two-phase carve, decode-side byte cap retained, transaction-detached
-  upload contract, duplicate-ref grouping, merge-nothing failure contract, corruption≠vanish
-  recovery split, in-place replay builder, consumer-inventory completion)
+- **Date:** 2026-07-22 (rev. 3 — Codex round 4 folded in: per-chunk commit boundary, strong
+  exception safety for the result merge + public `BlobUploadRequest`, condemned-local resurrection
+  memory cap, event-sink concurrency contract, complete `RecoveryResult` publication inventory,
+  scope honesty for server wiring, test falsifiability fixes. Rev. 2 folded in the nine round-3
+  findings: chunked flush replaces give-back, two-phase carve, decode-side byte cap retained,
+  transaction-detached upload contract, duplicate-ref grouping, merge-nothing failure contract,
+  corruption≠vanish recovery split, in-place replay builder, consumer-inventory completion)
 - **Status:** design approved (third design of the write-path effort; v1
   `2026-07-22-cas-multicommit-phased-design.md` and v2
   `2026-07-22-cas-batched-part-commit-v2-design.md` are SUPERSEDED — two rounds of Codex
   adversarial review, both `BLOCKING FLAW`; round 2's decisive finding: the production INSERT
   path commits parts one at a time, so any batch seam at `renameParts` receives spans of one)
-- **Area:** `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/` only. Zero upstream
-  (MergeTree/Disks-generic) changes in this stage.
+- **Area:** `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/`, plus the minimal
+  server wiring the pool needs: the pool-size declaration in `src/Core/ServerSettings.cpp`, its
+  initialization/shutdown hookup in server startup, and the gtest wiring. Zero MergeTree /
+  generic-Disks logic changes in this stage ("no upstream changes" means no behavioral seam in
+  shared code — not that no file outside the CAS subtree is touched).
 - **Backlog item:** `utils/ca-soak/scenarios/BACKLOG.md` — *"OPTIMIZATION OPPORTUNITY (write-path
   latency, HIGH) — CAS-on-S3 INSERT ~7.6× slower than standard S3"* (logged 2026-07-21).
 
@@ -62,13 +68,32 @@ dedicated pool.
   - dedup-cache reads and insertions (`CacheBase` locks internally, `CacheBase.h:140` —
     concurrent insertion is safe and keeps the hint live for concurrent writers);
   - event-sink emission, request-controller accounting, ProfileEvents.
+  Two concurrency guards this fan-out newly requires (Codex round 4):
+  - **Event-sink contract:** `Pool::emitEvent` invokes the installed sink `std::function`
+    directly (`CasPool.h:570`) and several tests install lambdas pushing into unguarded vectors —
+    a real data race once emissions run concurrently. Event delivery is serialized inside `Pool`
+    (a small mutex around sink invocation), keeping every existing sink valid; a latch-driven
+    concurrent-emission test pins it. (The backends themselves are already safe: the in-memory
+    and emulated object-storage backends are fully mutex-guarded, and the request controller's
+    mutable seam is restricted to pre-traffic use.)
+  - **Condemned-local resurrection memory cap:** that branch materializes a complete
+    header+payload body for `putOverwrite` (`CasPartWriteTxn.cpp:631`); N concurrent condemned
+    large blobs would hold N full bodies (the serial path held one). A byte-weighted admission
+    semaphore caps the aggregate materialized bytes across concurrent resurrection tasks (a
+    thread-count limit is not sufficient); a streaming conditional-overwrite backend primitive is
+    the future removal of this cap, out of scope now.
   Every branch (dedup-cache hit, HEAD-first hit/miss + live adopt with its meta point-read and
   backfill, fresh local streaming, S3-native staging promotion, condemned local/S3 resurrection)
   returns a **complete** `BlobUploadResult` value carrying the dep record and outcome; no branch
   may leave its dep effect behind as a side effect.
-- **Merge is encapsulated:** a new `PartWriteTxn::mergeBlobUploadResults(span<BlobUploadResult>)`
-  applies the returned dep records on the calling thread after the join — the private dep
-  representation is not exposed to `ContentAddressedTransaction`.
+- **Merge is encapsulated and strongly exception-safe:** a new
+  `PartWriteTxn::mergeBlobUploadResults(span<BlobUploadResult>)` applies the returned dep records
+  on the calling thread after the join — the private dep representation is not exposed to
+  `ContentAddressedTransaction`. Merge failure must not leave a partially merged build: all
+  results and sizes are prevalidated first, then applied via a build-and-swap (or provably
+  no-throw overwrite) so the build is either fully merged or untouched. The task input is a
+  CAS-owned public `BlobUploadRequest` (`BlobRef` + source descriptor) — the transaction's
+  `PendingBlob` type stays private.
 - **One task per unique ref:** `pending_blobs` can hold duplicate `BlobRef`s (staged hardlink
   copies push a copy of the record, `ContentAddressedTransaction.h:205`; the current filter
   deduplicates membership, not the loop, `.cpp:248`). The fan-out groups pending blobs by
@@ -115,9 +140,16 @@ Fix — **two-phase carve**:
    build the selection (`seen_refs`, the batch vector, all reservations including
    `owned_items` capacity ≥ current size + selection size). Any throw here leaves the queue
    untouched.
-2. **Publish (no-throw):** still under the mutex, pop the selected items and append them to
-   `owned_items` using only non-throwing operations (capacity pre-reserved, moves of
-   `shared_ptr`s).
+2. **Publish (no-throw):** still under the SAME continuous `ref_queue_mutex` hold (no TOCTOU by
+   construction), pop the selected items and append them to `owned_items` using only non-throwing
+   operations (capacity pre-reserved, moves of `shared_ptr`s). ProfileEvents increments (e.g.
+   the scope-cut counter) are deferred until the plan succeeds so the plan phase is literally
+   non-mutating.
+
+Accepted cost: the mutex is global across namespaces (`CasRefLedger.h:366`) and the plan phase
+allocates under it with the item cap raised to 1000 — the hold time is measured in the plan's
+benchmark gate, and per-table queue sharding is the designated follow-up if it ever shows up in a
+profile (not part of this stage).
 
 A related pre-existing hole in the validation loop is fixed alongside (found in review round 3):
 `working` is updated before the allocating `final_ops.insert` / `survivors.push_back`
@@ -136,13 +168,24 @@ replaces spilling with **chunked flushing** — nothing is ever given back:
 
 - `ref_txn_max_ops` **1000 → 5000**; the carve item cap (`kMaxRefBatch`) **128 → 1000**. The
   validation loop counts ops per admitted item (`build_ops` result size — exact by construction).
-- **Chunked flush:** when admitting the next item's ops would exceed the op cap, the leader
-  **appends the accumulated transaction immediately** (encode + `PUT`, exactly the existing append
-  step), then continues the same validation loop into a fresh transaction against the updated
-  `working` state. The overflowing item is validated exactly once, in the chunk where it lands;
-  ownership (`owned_items`) is untouched across chunks; one leadership tenure may emit several
-  ref-log transactions. If a chunk's append fails, the remaining carved items fail with it — the
-  existing tenure-failure semantics, no new states.
+- **Chunked flush, where each chunk is a complete commit boundary** (Codex round 4): when
+  admitting the next item's ops would exceed the op cap, the leader runs `commitChunk` — the FULL
+  existing committed arm, not just encode+`PUT`: allocate the real transaction id, encode, `PUT`,
+  apply to `rt->state` under `state_mutex`, advance tail count/bytes, record per-transaction
+  metrics, complete exactly this chunk's surviving items with the real id and wake their waiters,
+  and schedule snapshot publication — then clears the chunk-local vectors and **reseeds `working`
+  and the trial-id high-water mark from the now-live state** (the speculative `working` with
+  trial ids from the previous chunk is discarded — a later zero-op item must never be completed
+  against a transaction id that never persisted). Validation then continues into a fresh chunk.
+  The overflowing item is validated exactly once, in the chunk where it lands; ownership
+  (`owned_items`) is untouched across chunks; one leadership tenure may emit several ref-log
+  transactions. Failure isolation per chunk: if chunk N's append fails (definite failure, wedge,
+  or throw), chunks < N are already fully committed and their callers have their success — only
+  chunk N's items and the not-yet-attempted remainder fail (an unresolved wedge contains only
+  chunk N). This holds on every throwable exit. Multiple transactions per tenure are safe
+  downstream: recovery replays by sorted transaction id and GC folds each log independently; a
+  crash between chunks leaves a valid persisted prefix precisely because each chunk was a
+  complete commit.
 - **A single item whose own op count exceeds the cap fails alone** — completed with an error like
   any per-item validation failure (its ops never enter a chunk), neighbors unaffected.
 - **Removal-class is exempt, detected by op inspection:** an item is removal-class iff its built
@@ -183,6 +226,10 @@ carry only `published_at_ms`. Per the pre-release no-compat policy:
 - **Operational requirement, stated explicitly:** wire-word and field removal are safe only
   because every existing pool is recreated before this ships (pre-release, no persisted data —
   the standing CA policy). No decoder tolerance for the old field is added.
+- **Repository-wide symbol sweep:** the rename also updates maintained prose — the numbered CAS
+  doc set (`docs/superpowers/cas/cache.md` has eight `updateRefPayload` references,
+  `03-writer-protocol.md` one) and the stale comment at `ContentAddressedTransaction.cpp:427` —
+  finished by a whole-repo search for the old symbols and wire word.
 - Non-goal (future): folding `published_at_ms` into `OwnerTransition` to drop one op per promote.
 
 ### 5. Recovery: streaming replay with candidate discipline {#recovery-streaming}
@@ -206,9 +253,13 @@ live `rt.state`:
   candidate, applies each decoded transaction in place (the private poisoning/in-place path,
   `CasRefProtocol.cpp:361` — the pattern current replay already uses), and discards the candidate
   on any failure.
-- Tail count/bytes tracked as scalars; the candidate, cleanup markers, snapshot identity,
-  counters, budgets and the `recovered` flag publish together under `state_mutex`, and recovery
-  waiters are notified only after that complete publication — as today.
+- **Publication is a complete `RecoveryResult`, not a named-field list** (Codex round 4 —
+  a prose inventory WILL drift): the builder returns one struct carrying everything successful
+  recovery seeds today — the state, cleanup markers, newest snapshot identity, tail count/bytes,
+  `base_snapshot_bytes`, admission budgets, the `needs_stale_precommit_sweep` flag, and
+  recovery-seal facts (`CasRefLedger.cpp:518-541` is the reference inventory). It installs
+  atomically under `state_mutex`; `recovered` is set last and waiters notified only after the
+  complete publication. Diagnostic restart counters may stay attempt-local.
 - **The other full-tail materializers are covered too** (review round 3): the shared recovery used
   by the orphan sweep (`recoverRefTableDetailed`, `CasRefProtocol.cpp:667`) and fsck's snapshot
   oracle (`CasFsck.cpp:209`) stream through the same builder. (GC folding already decodes one log
@@ -251,16 +302,26 @@ Unit (CA gtest gate `Cas*:CA*` — mind the filter-gap lesson):
    transaction.
 9. **Chunked flush** — a carve whose total ops exceed `ref_txn_max_ops`: multiple ref-log
    transactions appear in one tenure, every item completes exactly once (`build_ops` invocation
-   counters assert at-most-once), folded state matches the sequential result; a chunk-append
-   failure fails the remaining items with the existing tenure semantics.
+   counters assert at-most-once), folded state matches the sequential result; committed ids, tail
+   counters, per-chunk metrics, snapshot scheduling and follower wakeups are asserted PER CHUNK.
+   Three chunk-failure variants (chunk 1 succeeds, then chunk 2 hits): (a) definite failure,
+   (b) unresolved wedge — the wedge contains only chunk-2 items, (c) a throw — in all three,
+   chunk-1 callers observe SUCCESS with chunk 1's real transaction id and chunk-2 + unattempted
+   items fail.
 10. **Oversized item / oversized op fail alone** — an item with > `ref_txn_max_ops` ops fails only
     itself; an op > 4 KiB (maximum-length ref name) fails only its item; neighbors commit.
-11. **Removal-class detection** — a `dropNamespace` over > 5000 refs succeeds (byte-budgeted, no
-    op cap); a stale-precommit-reclaim `WholeShard` item is NOT exempted (op-inspection
-    discriminator, not scope).
+11. **Removal-class detection, falsifiably** — a `dropNamespace` over > 5000 refs succeeds
+    (byte-budgeted, no op cap); a SYNTHETIC `WholeShard` item with > 5000 non-removal ops is
+    rejected by the op cap (the production stale-precommit sweep self-limits to the cap,
+    `CasRefLedger.cpp:1964`, so running it proves nothing — the discriminator must be pinned with
+    an item that only op-inspection classifies correctly).
 12. **Decode-side bounds** — a raw (uncompressed) over-cap object is rejected (`object_cap`
-    applies to raw bodies); an unknown-field-padded normal transaction over 20 MiB is rejected at
-    decode; a 5000×4 KiB canonical transaction round-trips.
+    applies to raw bodies); a normal transaction padded over 20 MiB via the TOLERANT meta/trailer
+    records (each op individually legal — padding an op line would only trip the 4 KiB per-op cap
+    and prove nothing) is rejected at decode; a 5000×4 KiB canonical transaction round-trips
+    (20,480,000 bytes — under the 20 MiB cap with framing headroom; rejection uses the existing
+    strict-greater convention, and the writer-side check is a runtime throw, not a debug-only
+    `chassert`).
 13. **Payload removal pins** — `set_published_at` wire word, no `payload` key in ref-log or
     snapshot output; `CasInspect` renders the renamed op; codec round-trips.
 14. **Recovery streaming** — a long tail of maximum-op-count transactions replays under a hard
@@ -268,6 +329,17 @@ Unit (CA gtest gate `Cas*:CA*` — mind the filter-gap lesson):
     discards the candidate and re-LISTs; an injected corrupt object fails fast (no re-LIST loop);
     a concurrent recovery waiter is unblocked exactly once; the orphan-sweep recovery and fsck
     paths run under the same memory bound.
+15. **Recovery publication inventory** — after streaming recovery of a table with stale
+    predecessor precommits and a non-trivial snapshot base, the stale-precommit sweep actually
+    triggers and cache accounting matches (`needs_stale_precommit_sweep` / `base_snapshot_bytes`
+    made observable — the fields a prose inventory would silently drop).
+16. **Merge exception safety** — allocation-failure injection inside `mergeBlobUploadResults`
+    after the first result would have applied: the build is untouched (all-or-nothing observed).
+17. **Concurrent event emission** — latch-synchronized concurrent `emitEvent` from two upload
+    tasks: serialized delivery, no sink data race (TSan-clean with a vector-collecting test sink).
+18. **Condemned-local memory cap** — N concurrent condemned large local blobs: peak materialized
+    bytes stay under the configured aggregate cap (byte-weighted semaphore observed limiting
+    concurrency), and all resurrections complete.
 
 Integration / soak:
 
