@@ -3,6 +3,7 @@
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 
 #include <functional>
 #include <memory>
@@ -126,6 +127,36 @@ PoolPtr openTestPool(BackendPtr backend)
 {
     return Pool::open(std::move(backend), PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 }
+
+/// Task 4b: a backend that lets a test observe `outstandingDurableRequestsForTest()` WHILE a durable
+/// call is actually executing, by firing a hook from inside the overridden call before delegating to
+/// the real implementation -- deterministic, no threads/sleeps needed. `putIfAbsent` is what
+/// `PartWriteTxn::stageManifest`'s `store->stagingPutIfAbsent` resolves to (via
+/// `CasRequestController::putIfAbsentControlled`'s `backend->putIfAbsent(key, bytes)`);
+/// `putIfAbsentStream` is what `uploadFromSource`'s fresh-upload path calls directly.
+class ObserveDuringCallBackend final : public InMemoryBackend
+{
+public:
+    using Backend::putIfAbsent;
+    using Backend::putIfAbsentStream;
+
+    PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta) override
+    {
+        if (on_put_if_absent)
+            on_put_if_absent();
+        return InMemoryBackend::putIfAbsent(key, bytes, meta);
+    }
+
+    WriteSinkPtr putIfAbsentStream(const String & key, const ObjectMeta & meta) override
+    {
+        if (on_put_if_absent_stream)
+            on_put_if_absent_stream();
+        return InMemoryBackend::putIfAbsentStream(key, meta);
+    }
+
+    std::function<void()> on_put_if_absent;
+    std::function<void()> on_put_if_absent_stream;
+};
 
 }
 
@@ -332,5 +363,62 @@ TEST(CasFenceGeneration, HappyPathS3StagingFinalizeUnaffected)
         EXPECT_TRUE(on_finalized_called);
         EXPECT_TRUE(sink_ptr->wasFinalizedForTest());
     }
+    EXPECT_EQ(store->outstandingDurableRequestsForTest(), 0u);
+}
+
+/// Task 4b (spec [D1], companion review): the part-write pipeline's durable lanes must ALSO count
+/// toward `outstandingDurableRequests()` -- picking the two most representative lanes (manifest
+/// staging and blob-body upload) rather than all six guarded call sites: both are on the hot,
+/// every-part-write path (unlike the rarer condemned-resurrect/overwrite branches, which reuse the
+/// exact same wrap-a-call-in-a-guard shape already proven correct above and in Task 4's
+/// `CasPlainObjects` tests), and together they exercise both guard shapes this task added -- a single
+/// guard around one call (`stageManifest`) and a per-retry-attempt guard inside a lambda
+/// (`uploadFromSource`'s `one_attempt`).
+
+/// `stageManifest`'s `store->stagingPutIfAbsent` resolves to `backend->putIfAbsent`: the hook observes
+/// the counter already at >= 1 while that call is executing, and back at 0 once `stageManifest` returns.
+TEST(CasFenceGeneration, OutstandingDurableRequestsReflectsInFlightManifestStaging)
+{
+    auto backend = std::make_shared<ObserveDuringCallBackend>();
+    auto store = openTestPool(backend);
+    const RootNamespace ns{"test/ns"};
+
+    PartWriteInfo info;
+    info.intended_ref = ns.string() + "/part_a";
+    auto build = store->beginPartWrite(info);
+
+    uint64_t observed_during_call = 0;
+    backend->on_put_if_absent = [&] { observed_during_call = store->outstandingDurableRequestsForTest(); };
+
+    ManifestEntry entry;
+    entry.path = "col.bin";
+    entry.placement = EntryPlacement::Blob;
+    entry.ref = DB::Cas::tests::idOf("payload");
+    entry.blob_size = 1;
+    build->stageManifest({entry});
+
+    EXPECT_GE(observed_during_call, 1u);
+    EXPECT_EQ(store->outstandingDurableRequestsForTest(), 0u);
+}
+
+/// `PartWriteTxn::putBlob`'s fresh-upload path (`uploadFromSource` -> `streamIfAbsent` -> `one_attempt`)
+/// calls `backend->putIfAbsentStream` directly: same shape, for the blob-body lane.
+TEST(CasFenceGeneration, OutstandingDurableRequestsReflectsInFlightBlobBodyUpload)
+{
+    auto backend = std::make_shared<ObserveDuringCallBackend>();
+    auto store = openTestPool(backend);
+    const RootNamespace ns{"test/ns"};
+
+    PartWriteInfo info;
+    info.intended_ref = ns.string() + "/part_b";
+    auto build = store->beginPartWrite(info);
+
+    uint64_t observed_during_call = 0;
+    backend->on_put_if_absent_stream = [&] { observed_during_call = store->outstandingDurableRequestsForTest(); };
+
+    const std::string payload = "hello blob body";
+    build->putBlob(DB::Cas::tests::idOf(payload), BlobSource::fromString(payload));
+
+    EXPECT_GE(observed_during_call, 1u);
     EXPECT_EQ(store->outstandingDurableRequestsForTest(), 0u);
 }

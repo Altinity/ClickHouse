@@ -342,6 +342,12 @@ uint64_t PartWriteTxn::observeAndAdmit(ObjectKind kind, const BlobRef & ref, con
     if (!lm)
     {
         ProfileEvents::increment(ProfileEvents::CasMetaAdoptBackfill);
+        /// rev.7 [D1]: this backfill meta write is a durable-effect operation Task 6's erasure-proof
+        /// gate must see counted while in flight. Scoped narrowly to just this call (best-effort,
+        /// no retry loop here) -- not the GC-owned `writeCondemnedMeta`/`deleteConfirmedMeta` callers of
+        /// the same shared `putMetaIfAbsent`/`casMeta`/`deleteMetaExact` functions (CasGc.cpp), which stay
+        /// uncounted per the GC-own-lease exclusion.
+        auto durable_guard = store->beginDurableRequest();
         putMetaIfAbsent(*store, ref,
             BlobMeta{.state = MetaState::Clean, .condemn_round = 0, .size = logical_size});
     }
@@ -454,6 +460,10 @@ void PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef & ref, const 
     {
         ProfileEvents::increment(ProfileEvents::CasMetaResurrectClean);
         const BlobMeta clean{.state = MetaState::Clean, .condemn_round = 0, .size = source.size};
+        /// rev.7 [D1]: one guard for this whole meta-transition retry loop (mirrors
+        /// `CasPlainObjects::casPutObject`'s one-guard-per-retry-loop shape) -- covers both callers
+        /// (`writeFreshMetaClean`'s no-prior-point-read case and the resurrect case below).
+        auto durable_guard = store->beginDurableRequest();
         constexpr int max_meta_attempts = 8;
         for (int attempt = 0; attempt < max_meta_attempts; ++attempt)
         {
@@ -517,13 +527,22 @@ void PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef & ref, const 
             /// client-side streaming PUT. Same write-once contract (`Done` + dest-ETag token on created,
             /// `PreconditionFailed` when `key` already exists). The staging object IS the promote source
             /// — no envelope is streamed here.
+            ///
+            /// rev.7 [D1]: `one_attempt` is re-invoked once per `stagingConditionalCreate` retry, so the
+            /// guard is scoped per attempt (admitted right before, resolved when this specific attempt's
+            /// backend call returns/throws) -- matching how the controller's own fence predicate is also
+            /// re-checked per attempt, not once for the whole retry sequence.
             if (source.server_side_copy_from)
+            {
+                auto durable_guard = store->beginDurableRequest();
                 return store->backend().promoteStaged(*source.server_side_copy_from, key);
+            }
 
             /// No owner metadata is needed: protection is the precommit edge — reachability, not `cas_owner`.
             /// A throw mid-stream abandons the sink (its dtor cancels): nothing is ever published by a
             /// failed attempt except via the storage's own late-landing ambiguity, which the controller
             /// resolves.
+            auto durable_guard = store->beginDurableRequest();
             WriteSinkPtr sink = store->backend().putIfAbsentStream(key);
             WriteBuffer & out = sink->buffer();
             writeString(buildHeader(), out);
@@ -621,8 +640,17 @@ void PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef & ref, const 
         /// backend reads the payload from the staging object skipping its own `blob_header_len` envelope
         /// header and prepends this fresh header.
         const String fresh_header = buildHeader();
-        const Token tok = store->backend().resurrectStaged(
-            *source.server_side_copy_from, key, fresh_header, meta.blob_header_len);
+        /// rev.7 [D1]: a raw `backend()` call with NO existing fence coupling at all (unlike
+        /// `promoteStaged`/`putIfAbsentStream` above, reached only through `stagingConditionalCreate`'s
+        /// controller+fence_ok) -- structurally the same gap Task 4 closed on the plain-object surface.
+        /// This task adds only the outstanding-request COUNT here per its scope; a fence-generation
+        /// CHECK before this call is also warranted (flagged in the report, not added unilaterally).
+        Token tok{};
+        {
+            auto durable_guard = store->beginDurableRequest();
+            tok = store->backend().resurrectStaged(
+                *source.server_side_copy_from, key, fresh_header, meta.blob_header_len);
+        }
         recordDoneAndEmit(tok);
         writeResurrectMetaClean(lm);
         return;
@@ -646,7 +674,13 @@ void PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef & ref, const 
             throw Exception(ErrorCodes::LOGICAL_ERROR,
                 "uploadFromSource: source wrote {} bytes for overwrite, declared {}", written, source.size);
     }
-    const PutResult overwrite_res = store->backend().putOverwrite(key, overwrite_body, hr.token);
+    /// rev.7 [D1]: same as `resurrectStaged` above -- a raw, uncoupled backend call; counted here,
+    /// flagged in the report as also warranting a fence-generation check.
+    PutResult overwrite_res{};
+    {
+        auto durable_guard = store->beginDurableRequest();
+        overwrite_res = store->backend().putOverwrite(key, overwrite_body, hr.token);
+    }
     if (overwrite_res.outcome == PutOutcome::Done)
     {
         recordDoneAndEmit(overwrite_res.token);
@@ -793,6 +827,10 @@ ManifestId PartWriteTxn::stageManifest(std::vector<ManifestEntry> entries)
     /// the same fence anyway. There is no ref-table runtime here, so the lane's extra
     /// `superseded_by_remount` term does not apply.
     Token manifest_token;
+    /// rev.7 [D1]: the manifest body PUT is a durable-effect operation named verbatim by the spec;
+    /// held for the whole call including `stagingPutIfAbsent`'s own internal retries (same shape as
+    /// `CasPlainObjects::casPutObject`'s one-guard-per-retry-loop).
+    auto durable_guard = store->beginDurableRequest();
     const CasWriteOutcome put_outcome = store->stagingPutIfAbsent(key, encoded, &manifest_token);
     if (put_outcome == CasWriteOutcome::DefiniteFailure)
         throwCasWriteRetryLater(fmt::format(
