@@ -572,49 +572,45 @@ namespace ExportPartitionUtils
 
 namespace
 {
-    /// One top-level term of a MergeTree PARTITION BY: a column and, when the term is a function of a
-    /// single column, that function name and an optional integer argument. An empty function marks a
-    /// bare column (identity).
-    struct PartitionKeyTerm
+    /// One top-level term of a PARTITION BY: a column and, when the term is a function of a single
+    /// column, its function name (empty for a bare column) and optional integer / timezone arguments.
+    /// The Iceberg gate canonicalizes the function name against the Iceberg transforms at comparison time.
+    struct PartitionTerm
     {
         String column;
         String function;
         std::optional<Int64> argument;
+        std::optional<String> time_zone;
 
-        bool operator==(const PartitionKeyTerm & other) const
+        bool operator==(const PartitionTerm & other) const
         {
             return column == other.column && function == other.function && argument == other.argument;
         }
     };
 
-    /// Parse a PARTITION BY AST into per-column terms. Returns std::nullopt if any top-level term is
-    /// not a bare column or a function of exactly one column (nested/multi-column expressions), so the
-    /// caller can only satisfy such a key by an exact match.
-    std::optional<std::vector<PartitionKeyTerm>> parsePartitionKeyTerms(const ASTPtr & partition_key_ast)
+    /// Parse a PARTITION BY AST into one term per top-level expression. A bare column becomes a term
+    /// with an empty function; a function keeps its single column argument (the last one seen) plus any
+    /// integer / timezone literal. Elements that are neither a column nor a function are skipped.
+    std::vector<PartitionTerm> parsePartitionTerms(const ASTPtr & partition_key_ast)
     {
-        std::vector<PartitionKeyTerm> terms;
+        std::vector<PartitionTerm> terms;
         if (!partition_key_ast)
             return terms;
 
-        bool ok = true;
         auto parse_one = [&](const ASTPtr & element)
         {
             if (const auto * ident = element->as<ASTIdentifier>())
             {
-                terms.push_back({ident->name(), "", std::nullopt});
+                terms.push_back({ident->name(), "", std::nullopt, std::nullopt});
                 return;
             }
 
             const auto * func = element->as<ASTFunction>();
             if (!func)
-            {
-                ok = false;
                 return;
-            }
 
-            std::optional<String> column;
-            std::optional<Int64> argument;
-            size_t identifiers = 0;
+            PartitionTerm term;
+            term.function = func->name;
             for (const auto & child : func->children)
             {
                 const auto * expression_list = child->as<ASTExpressionList>();
@@ -623,27 +619,17 @@ namespace
                 for (const auto & arg : expression_list->children)
                 {
                     if (const auto * id = arg->as<ASTIdentifier>())
-                    {
-                        column = id->name();
-                        ++identifiers;
-                    }
+                        term.column = id->name();
                     else if (const auto * lit = arg->as<ASTLiteral>())
                     {
-                        /// A string literal is an optional timezone argument and does not affect the
-                        /// term; only an integer literal is the bucket/truncate width.
-                        if (lit->value.getType() != Field::Types::String)
-                            argument = lit->value.safeGet<Int64>();
+                        if (lit->value.getType() == Field::Types::String)
+                            term.time_zone = lit->value.safeGet<String>();
+                        else
+                            term.argument = lit->value.safeGet<Int64>();
                     }
-                    else
-                        ok = false;
                 }
             }
-            if (identifiers != 1)
-            {
-                ok = false;
-                return;
-            }
-            terms.push_back({*column, func->name, argument});
+            terms.push_back(std::move(term));
         };
 
         if (const auto * func = partition_key_ast->as<ASTFunction>(); func && func->name == "tuple")
@@ -656,8 +642,6 @@ namespace
         else
             parse_one(partition_key_ast);
 
-        if (!ok)
-            return std::nullopt;
         return terms;
     }
 
@@ -704,7 +688,7 @@ namespace
     /// value. Functions carrying an integer argument (bucket/truncate and similar) are not order
     /// preserving in general, so they can only be accepted by an exact structural match.
     bool partitionTermIsConstantOverBounds(
-        const PartitionKeyTerm & term, const DataTypePtr & column_type,
+        const PartitionTerm & term, const DataTypePtr & column_type,
         const Field & min_value, const Field & max_value, const ContextPtr & context)
     {
         if (term.function.empty() || term.function == "identity")
@@ -733,83 +717,6 @@ namespace
 #if USE_AVRO
 namespace
 {
-    /// One top-level term of the source MergeTree PARTITION BY, canonicalized for comparison against a
-    /// destination Iceberg partition field. `transform` holds the ClickHouse function name that
-    /// parseTransformAndArgument yields for the equivalent Iceberg transform ("toRelativeDayNum",
-    /// "identity", "icebergBucket", ...); std::nullopt marks a term that is not directly
-    /// Iceberg-representable and can therefore only satisfy a destination field via the dynamic proof.
-    struct SourcePartitionTerm
-    {
-        String column;
-        std::optional<String> transform;
-        std::optional<Int64> argument;
-        std::optional<String> time_zone;
-    };
-
-    std::vector<SourcePartitionTerm> parseSourcePartitionTerms(const ASTPtr & partition_key_ast)
-    {
-        /// The same functions getPartitionField maps 1:1 to an Iceberg transform.
-        static const std::unordered_set<String> iceberg_representable = {
-            "identity", "toYearNumSinceEpoch", "toMonthNumSinceEpoch",
-            "toRelativeDayNum", "toRelativeHourNum", "icebergBucket", "icebergTruncate"};
-
-        std::vector<SourcePartitionTerm> terms;
-        if (!partition_key_ast)
-            return terms;
-
-        auto parse_one = [&](const ASTPtr & element)
-        {
-            if (const auto * ident = element->as<ASTIdentifier>())
-            {
-                terms.push_back({ident->name(), std::optional<String>("identity"), std::nullopt, std::nullopt});
-                return;
-            }
-
-            const auto * func = element->as<ASTFunction>();
-            if (!func)
-                return;
-
-            std::optional<String> column;
-            std::optional<Int64> argument;
-            std::optional<String> time_zone;
-            for (const auto & child : func->children)
-            {
-                const auto * expression_list = child->as<ASTExpressionList>();
-                if (!expression_list)
-                    continue;
-                for (const auto & arg : expression_list->children)
-                {
-                    const auto * lit = arg->as<ASTLiteral>();
-                    if (const auto * id = arg->as<ASTIdentifier>())
-                        column = id->name();
-                    else if (lit && lit->value.getType() == Field::Types::String)
-                        time_zone = lit->value.safeGet<String>();
-                    else if (lit)
-                        argument = lit->value.safeGet<Int64>();
-                }
-            }
-            if (!column)
-                return;
-
-            std::optional<String> transform;
-            if (iceberg_representable.contains(func->name))
-                transform = func->name;
-            terms.push_back({*column, transform, argument, time_zone});
-        };
-
-        if (const auto * func = partition_key_ast->as<ASTFunction>(); func && func->name == "tuple")
-        {
-            for (const auto & child : func->children)
-                if (const auto * expression_list = child->as<ASTExpressionList>())
-                    for (const auto & element : expression_list->children)
-                        parse_one(element);
-        }
-        else
-            parse_one(partition_key_ast);
-
-        return terms;
-    }
-
     /// Apply the destination Iceberg transform (rebuilt as a ClickHouse function, mirroring
     /// ChunkPartitioner and the commit path) to a 2-row column holding [cast(min), cast(max)] and
     /// return whether the endpoints map to different values, i.e. the source partition would be split
@@ -893,7 +800,7 @@ namespace
         const auto actual_fields = partition_spec_json->getArray(Iceberg::f_fields);
         const size_t actual_size = actual_fields ? actual_fields->size() : 0;
 
-        const auto source_terms = parseSourcePartitionTerms(source_metadata->getPartitionKeyAST());
+        const auto source_terms = parsePartitionTerms(source_metadata->getPartitionKeyAST());
 
         /// A partitioned source cannot be exported into an unpartitioned Iceberg table: there is no
         /// destination partitioning to satisfy and the result would silently drop the source layout.
@@ -911,6 +818,11 @@ namespace
         const auto minmax_column_types = MergeTreeData::getMinMaxColumnsTypes(source_partition_key);
         const auto destination_sample = destination_metadata->getSampleBlockNonMaterialized();
         const String partition_timezone = context->getSettingsRef()[Setting::iceberg_partition_timezone];
+
+        /// ClickHouse functions that map 1:1 to an Iceberg transform; only these can match structurally.
+        static const std::unordered_set<String> iceberg_representable = {
+            "identity", "toYearNumSinceEpoch", "toMonthNumSinceEpoch",
+            "toRelativeDayNum", "toRelativeHourNum", "icebergBucket", "icebergTruncate"};
 
         /// year/month/day/hour depend on the timezone (for DateTime); the structural fast path is only
         /// sound when the source and destination evaluate them in the same timezone.
@@ -948,8 +860,12 @@ namespace
             bool matched_structurally = false;
             for (const auto & term : source_terms)
             {
-                if (term.column != column || !term.transform || !dest_canonical
-                    || *term.transform != dest_canonical->transform_name || term.argument != dest_argument)
+                /// A bare source column canonicalizes to "identity"; other functions match a destination
+                /// transform only when they are Iceberg-representable and their ClickHouse name equals
+                /// the one the transform maps to.
+                const String source_function = term.function.empty() ? "identity" : term.function;
+                if (term.column != column || !dest_canonical || !iceberg_representable.contains(source_function)
+                    || source_function != dest_canonical->transform_name || term.argument != dest_argument)
                     continue;
 
                 const auto & transform_name = dest_canonical->transform_name;
@@ -1074,23 +990,21 @@ namespace
         if (ast_to_string(source_key_ast) == ast_to_string(destination_key_ast))
             return;
 
-        const auto destination_terms = parsePartitionKeyTerms(destination_key_ast);
-        if (!destination_terms)
-            throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                "Cannot export partition: the destination partition key is not a supported per-column "
-                "expression and does not match the source partition key.");
+        /// A hive destination is always partitioned by bare columns (an expression key is rejected at
+        /// table creation), so every destination term is a single column here.
+        const auto destination_terms = parsePartitionTerms(destination_key_ast);
 
         /// Unpartitioned destination: a single output partition trivially holds every source partition.
-        if (destination_terms->empty())
+        if (destination_terms.empty())
             return;
 
-        const auto source_terms = parsePartitionKeyTerms(source_key_ast).value_or(std::vector<PartitionKeyTerm>{});
+        const auto source_terms = parsePartitionTerms(source_key_ast);
 
         const auto & source_partition_key = source_metadata->getPartitionKey();
         const auto minmax_column_names = MergeTreeData::getMinMaxColumnsNames(source_partition_key);
         const auto minmax_column_types = MergeTreeData::getMinMaxColumnsTypes(source_partition_key);
 
-        for (const auto & term : *destination_terms)
+        for (const auto & term : destination_terms)
         {
             /// Fast path: the source already partitions by the same expression on this column, so every
             /// source partition is single-valued for this destination term by construction.
