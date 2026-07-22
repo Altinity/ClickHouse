@@ -189,8 +189,32 @@ restart-after-full-deletion. Permanently-unconfirmable disk: stalls until `FORGE
 
 ## 9. Rollback and tests
 
-As rev.5 (rollback list unchanged; Part-6 sites subsumed by the §1 gate; keep Part 1, `poolAccess`
-snapshot, atomic `startup()`, `ca-fsck` rename, gated raw GC entry points). Tests as rev.5 — unique
+**Rollback of the landed Task 4–8 (the 2026-07-21 Dormant/UNMOUNT lifecycle) — the explicit list:**
+
+1. **`MountState` enum** (`Mounted`/`Unmounting`/`Dormant`) and every branch on it → replaced by §1's
+   storage-level lifecycle (`Constructing/Started/ShutDown`) + the pool condition
+   (live / transient / `IdentityLost` / `Vanished`).
+2. **`SYSTEM CONTENT ADDRESSED UNMOUNT` / `MOUNT` verbs** — parser + AST formatting cases,
+   `ASTSystemQuery` fields, interpreter execution, and their **two `AccessType`s** (the `01271` grants
+   reference loses those rows and gains `FORGET`'s).
+3. **`unmountSynchronously`** + the `Unmounting` drain loop, and **`mountExplicitly`**.
+4. **Part 6 benign-absent probes** — the `isMounted()`-guarded absent/empty answers
+   (`ContentAddressedMetadataStorage.cpp:~557-564`, `:1114` existsDirectory, `:1370`
+   iterateDirectory-empty, and siblings) → subsumed by the §1 central operation-class gate: transient /
+   `IdentityLost` ⇒ throw; only proven/asserted `Vanished` answers truth-absent. No benign branch keyed on
+   "not mounted" survives anywhere.
+5. **FSCK-dormant-only** (Task 7 requirement) → FSCK on a running disk (§7).
+6. **The four lifecycle gtests** asserting Dormant/UNMOUNT behavior (`gtest_ca_transaction.cpp:725` ff.) →
+   replaced by the §9 test list below.
+7. **The `GC RUN → UNMOUNT → FSCK → rm -rf` teardown pattern** in `04290`/`04295`/`05020` → replaced by
+   the fail-closed `DROP SYNC → FORGET → verify → rm -rf` teardown below.
+
+**Keep untouched:** Part 1 (abort-hardening: vanished/absent lease → `FILE_DOESNT_EXIST`/no-op, never
+`LOGICAL_ERROR`), the `poolAccess` coherent snapshot, atomic-publish `startup()`, the `ca-fsck` rename, and
+the GC-round entry-point gating (now via §3's lifecycle protocol — the raw entry points
+`runGarbageCollectionRoundNow`/`runOneGcRoundForTest` get the same gate).
+
+Tests — unique
 names+paths with invocation-random suffix, normalized reference output, **fail-closed teardown**
 (`DROP SYNC` → `FORGET` → verify `vanished(forgotten)` in the system table → only then `rm -rf`; failed
 `FORGET` aborts the test with `rm -rf` unreachable) — plus rev.6 additions: `IdentityLost` observer test
