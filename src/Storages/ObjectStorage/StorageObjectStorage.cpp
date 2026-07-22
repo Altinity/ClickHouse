@@ -346,11 +346,10 @@ std::optional<NameSet> StorageObjectStorage::supportedPrewhereColumns() const
     return getInMemoryMetadataPtr()->getColumnsWithoutDefaultExpressions(/*exclude=*/hive_partition_columns_to_read_from_file_path);
 }
 
-std::optional<NameSet> StorageObjectStorage::supportedAutomaticPrewhereColumns() const
+std::optional<NameSet> StorageObjectStorage::supportedAutomaticPrewhereColumns(const StorageMetadataPtr & metadata) const
 {
     auto exclude = hive_partition_columns_to_read_from_file_path;
 
-    const auto metadata = getInMemoryMetadataPtr();
     for (const auto & identity_partition_column : metadata->identity_partition_columns)
     {
         if (metadata->getColumns().has(identity_partition_column))
