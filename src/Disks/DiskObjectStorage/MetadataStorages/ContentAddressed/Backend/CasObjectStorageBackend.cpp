@@ -732,6 +732,119 @@ HeadResult ObjectStorageBackend::head(const String & key)
     return hr;
 }
 
+/// See Backend::probeSentinelRaw / CasBackend.h's ProbeOutcome for the semantics this classifies.
+SentinelProbeResult ObjectStorageBackend::probeSentinelRaw(const String & key)
+{
+    if (mode == Mode::Native)
+    {
+        try
+        {
+            /// `getObjectMetadata` (unlike `tryGetObjectMetadata`/`nativeHead`) is the THROWING raw-HEAD
+            /// primitive — it does NOT collapse NO_SUCH_KEY/NO_SUCH_BUCKET/RESOURCE_NOT_FOUND into one
+            /// `nullopt` before we get a chance to classify the S3 error. Its result is discarded here;
+            /// only whether (and how) it throws matters — the body comes from `get` below.
+            object_storage->getObjectMetadata(key, /*with_tags=*/false);
+        }
+#if USE_AWS_S3
+        catch (const S3Exception & e)
+        {
+            switch (e.getS3ErrorCode())
+            {
+                case Aws::S3::S3Errors::NO_SUCH_KEY:
+                    return {ProbeOutcome::KeyAbsent, std::nullopt};
+                case Aws::S3::S3Errors::NO_SUCH_BUCKET:
+                    return {ProbeOutcome::ContainerAbsent, std::nullopt};
+                case Aws::S3::S3Errors::ACCESS_DENIED:
+                    return {ProbeOutcome::AccessDenied, std::nullopt};
+                default:
+                    /// Everything else (timeouts, 5xx, throttling, an unmodeled code) is inconclusive —
+                    /// NEVER promoted to KeyAbsent, per the IAM permutation table in spec §2.
+                    return {ProbeOutcome::Indeterminate, std::nullopt};
+            }
+        }
+#endif
+        catch (...)
+        {
+            return {ProbeOutcome::Indeterminate, std::nullopt};
+        }
+
+        /// The raw HEAD proved the key present. Delegate the body read to the existing `get`, which
+        /// already HEADs again and reads — an extra round trip this authoritative, low-rate probe can
+        /// afford, in exchange for reusing its already-correct HEAD→GET race handling.
+        auto g = get(key);
+        if (!g)
+            return {ProbeOutcome::KeyAbsent, std::nullopt};   /// raced a deletion right after the raw HEAD
+        return {ProbeOutcome::Present, std::move(g->bytes)};
+    }
+
+    /// EmulatedSingleProcess (Local): stat the configured container directory FIRST — `emuExists`/`get`
+    /// alone cannot distinguish "this key is absent" from "the whole pool directory is gone" (Local
+    /// listing is best-effort and silently reports zero either way, see LocalObjectStorage::listObjects).
+    try
+    {
+        if (!object_storage->existsOrHasAnyChild(emu_root))
+            return {ProbeOutcome::ContainerAbsent, std::nullopt};
+
+        auto g = get(key);
+        if (!g)
+            return {ProbeOutcome::KeyAbsent, std::nullopt};
+        return {ProbeOutcome::Present, std::move(g->bytes)};
+    }
+    catch (...)
+    {
+        return {ProbeOutcome::Indeterminate, std::nullopt};
+    }
+}
+
+/// See Backend::probePrefixEmptinessRaw. Container proof: ListObjectsV2(max-keys=1), never a bucket
+/// HEAD — a bucket can forbid HeadBucket while still allowing a prefixed ListObjectsV2.
+SentinelProbeResult ObjectStorageBackend::probePrefixEmptinessRaw(const String & prefix)
+{
+    if (mode == Mode::Native)
+    {
+        try
+        {
+            RelativePathsWithMetadata children;
+            object_storage->listObjects(prefix, children, /*max_keys=*/1);
+            return {children.empty() ? ProbeOutcome::KeyAbsent : ProbeOutcome::Present, std::nullopt};
+        }
+#if USE_AWS_S3
+        catch (const S3Exception & e)
+        {
+            switch (e.getS3ErrorCode())
+            {
+                case Aws::S3::S3Errors::NO_SUCH_BUCKET:
+                    return {ProbeOutcome::ContainerAbsent, std::nullopt};
+                case Aws::S3::S3Errors::ACCESS_DENIED:
+                    return {ProbeOutcome::AccessDenied, std::nullopt};
+                default:
+                    return {ProbeOutcome::Indeterminate, std::nullopt};
+            }
+        }
+#endif
+        catch (...)
+        {
+            return {ProbeOutcome::Indeterminate, std::nullopt};
+        }
+    }
+
+    /// EmulatedSingleProcess (Local): stat the configured container directory first — see
+    /// probeSentinelRaw's comment; a missing sub-prefix and a missing pool root both list as empty.
+    try
+    {
+        if (!object_storage->existsOrHasAnyChild(emu_root))
+            return {ProbeOutcome::ContainerAbsent, std::nullopt};
+
+        RelativePathsWithMetadata children;
+        object_storage->listObjects(emuPath(prefix), children, /*max_keys=*/1);
+        return {children.empty() ? ProbeOutcome::KeyAbsent : ProbeOutcome::Present, std::nullopt};
+    }
+    catch (...)
+    {
+        return {ProbeOutcome::Indeterminate, std::nullopt};
+    }
+}
+
 /// Base WriteSettings for every Native conditional write. CAS-mutable keys (shard manifests,
 /// gc/state, the registry) override check_objects_after_upload to `false` (see WriteSettings.h);
 /// this was observed live against RustFS: a publish's manifest CAS raced the GC fence and the

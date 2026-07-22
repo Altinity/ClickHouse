@@ -127,6 +127,16 @@ public:
     /// `EmulatedSingleProcess`.
     void checkConditionalWriteSingleAttemptSupport() override;
 
+    /// See Backend::probeSentinelRaw. Native: a raw HEAD via `IObjectStorage::getObjectMetadata` (the
+    /// THROWING variant — unlike `tryGetObjectMetadata`/`nativeHead`, it never swallows the S3 error),
+    /// classified by S3 error code. EmulatedSingleProcess (Local): stats the configured container
+    /// directory (`emu_root`) first — `ContainerAbsent` if it is gone — then the key.
+    SentinelProbeResult probeSentinelRaw(const String & key) override;
+    /// See Backend::probePrefixEmptinessRaw. Native: `IObjectStorage::listObjects` with `max_keys=1`
+    /// (ListObjectsV2), classified by S3 error code on failure. EmulatedSingleProcess: the same
+    /// container-directory stat as `probeSentinelRaw`, then the listing.
+    SentinelProbeResult probePrefixEmptinessRaw(const String & prefix) override;
+
     /// The token kind this backend's object storage mints: TokenType::ETag for AWS-compatible
     /// stores, TokenType::Generation when the storage runs the GCS conditional dialect (the
     /// generation rides the ETag plumbing; the VALUE stays opaque either way).

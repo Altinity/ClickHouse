@@ -129,6 +129,33 @@ struct ListPage
     String next_cursor;       /// Last returned key; empty => no more pages.
 };
 
+/// Typed erasure evidence for one key or one prefix — see
+/// docs/superpowers/specs/2026-07-22-cas-disk-lease-loss-throw-and-stop-verbs-design.md §2. `head`/
+/// `get` deliberately flatten every kind of miss (a clean absence, a missing bucket/container, a
+/// permission failure, a transport fault) into one "not found" result, which is exactly right for
+/// their callers (a plain read) but wrong for lifecycle recovery, which must never treat a
+/// transport/permission failure as proof that data is gone. `ProbeOutcome` keeps the four cases
+/// distinct: only a backend's OWN authoritative "not found" evidence earns `KeyAbsent` — a timeout,
+/// a 5xx, or an unclassifiable error is ALWAYS `Indeterminate`, never promoted to absence.
+enum class ProbeOutcome : uint8_t
+{
+    Present,           /// the key (or, for a prefix probe, at least one object under it) exists
+    KeyAbsent,         /// authoritative miss: the container is alive, the key itself is not there
+    ContainerAbsent,   /// the bucket/prefix-parent itself is gone, not merely the key
+    AccessDenied,      /// the probe was rejected on permissions — absence was never established
+    Indeterminate,     /// a transport/timeout/unclassifiable error — absence was NEVER proven
+};
+
+/// Result of `Backend::probeSentinelRaw` / `Backend::probePrefixEmptinessRaw`. `body` carries the
+/// materialized bytes ONLY for a single-key probe (`probeSentinelRaw`) whose outcome is `Present`; a
+/// prefix-emptiness probe (`probePrefixEmptinessRaw`) never populates it — its `Present` means "at
+/// least one object was listed", not "one key was read".
+struct SentinelProbeResult
+{
+    ProbeOutcome outcome;
+    std::optional<String> body;
+};
+
 /// Streaming conditional create (If-None-Match:* semantics). The caller writes the FULL object body
 /// (envelope header + payload) into buffer, then calls finalize exactly once:
 ///   - Done                ⇒ the object is durable; the returned PutResult.token is the new incarnation's token
@@ -264,6 +291,49 @@ public:
     /// checkPoolPreconditions. Default: nothing to check (EmulatedSingleProcess and non-S3 backends
     /// are not gated here — see ObjectStorageBackend's override for the one backend that is).
     virtual void checkConditionalWriteSingleAttemptSupport() {}
+
+    /// Authoritative, cache-bypassing probe of one key — see `ProbeOutcome`. DEFAULT (used by every
+    /// backend without sharper raw-error evidence, e.g. `InMemoryBackend`): derived from `head`/`get`
+    /// alone, so it can only distinguish `Present` from `KeyAbsent`, and ANY exception from either
+    /// call is `Indeterminate` — never promoted to `KeyAbsent`. A backend able to surface real
+    /// container/permission evidence (the S3-native and Local paths of `ObjectStorageBackend`)
+    /// overrides this to sharpen the classification.
+    virtual SentinelProbeResult probeSentinelRaw(const String & key)
+    {
+        try
+        {
+            const HeadResult hr = head(key);
+            if (!hr.exists)
+                return {ProbeOutcome::KeyAbsent, std::nullopt};
+            auto g = get(key);
+            /// Vanished between head and get: still a clean, authoritative miss, not an error.
+            if (!g)
+                return {ProbeOutcome::KeyAbsent, std::nullopt};
+            return {ProbeOutcome::Present, std::move(g->bytes)};
+        }
+        catch (...)
+        {
+            return {ProbeOutcome::Indeterminate, std::nullopt};
+        }
+    }
+
+    /// Authoritative container proof: does at least one object exist under `prefix`? DEFAULT
+    /// (`list`-based): `Present` when `list` returns at least one key, `KeyAbsent` when it succeeds
+    /// with zero keys, `Indeterminate` on any exception — the same fail-closed posture as
+    /// `probeSentinelRaw`. A backend with real container/permission evidence overrides this the same
+    /// way.
+    virtual SentinelProbeResult probePrefixEmptinessRaw(const String & prefix)
+    {
+        try
+        {
+            const ListPage page = list(prefix, "", 1);
+            return {page.keys.empty() ? ProbeOutcome::KeyAbsent : ProbeOutcome::Present, std::nullopt};
+        }
+        catch (...)
+        {
+            return {ProbeOutcome::Indeterminate, std::nullopt};
+        }
+    }
 
     /// WRITE-ONCE conditional SERVER-SIDE COPY of `staging_key` to `blob_key` (`If-None-Match:*` on the
     /// destination) — the S3-native staging promote's create primitive. `Done` + `token` = the
