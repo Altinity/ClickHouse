@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -37,8 +38,39 @@ const String kSrid = "test";
 class ErasureProofBackend final : public InMemoryBackend
 {
 public:
+    /// Unhide the base convenience overloads shadowed by the head/get/list overrides below.
+    using Backend::get;
+    using Backend::getStream;
+    using Backend::putIfAbsent;
+    using Backend::putIfAbsentStream;
+    using Backend::putOverwrite;
+    using Backend::casPut;
+
     bool supportsErasureProof() const override { return capable.load(); }
+
+    /// While `fail_probes` is armed, head/get/list throw an untyped transport error, so the gate's
+    /// authoritative probes classify `Indeterminate` (absence never proven) — the sharp error-reset case.
+    HeadResult head(const String & key) override
+    {
+        if (fail_probes.load())
+            throw std::runtime_error("injected fault: transport error");
+        return InMemoryBackend::head(key);
+    }
+    std::optional<GetResult> get(const String & key, Range range) override
+    {
+        if (fail_probes.load())
+            throw std::runtime_error("injected fault: transport error");
+        return InMemoryBackend::get(key, range);
+    }
+    ListPage list(const String & prefix, const String & cursor, size_t limit) override
+    {
+        if (fail_probes.load())
+            throw std::runtime_error("injected fault: transport error");
+        return InMemoryBackend::list(prefix, cursor, limit);
+    }
+
     std::atomic<bool> capable{true};
+    std::atomic<bool> fail_probes{false};
 };
 
 struct ClockedPool
@@ -283,6 +315,82 @@ TEST(CasErasureProof, TwoSamplesInsideOneRenewalPeriodDoNotBothCount)
 
     /// Cross a full renewal period from the last COUNTED sample → the second sample counts → promote.
     advance(*cp.clock, cp.renew + 2);
+    EXPECT_FALSE(cp.store->tryRemountOnce());
+    EXPECT_EQ(cp.store->lifecycle(), PoolLifecycle::VanishedErased);
+}
+
+/// (f) The sharpest [D1] reset case: an ALREADY-ESTABLISHED streak (one counted empty sample) is reset when
+/// the NEXT correctly-spaced sample finds a durable-effect operation in flight (`DurableRequestGuard`
+/// held). Unlike (c) — which holds the guard from the start so the streak never reaches 1 — this proves the
+/// counter can invalidate an in-progress proof mid-window; and that the reset does not wedge the machinery
+/// (the proof completes cleanly once the guard is released).
+TEST(CasErasureProof, EstablishedStreakResetByDurableGuardAtNextSampleThenCompletes)
+{
+    auto cp = openClockedPool(/*capable=*/true);
+
+    /// Progressive erase → IdentityLost, then an established streak of one empty sample.
+    deleteKey(*cp.backend, cp.store->layout().poolMetaKey());
+    deleteKey(*cp.backend, cp.store->layout().ownerKey(kSrid));
+    EXPECT_FALSE(cp.store->tryRemountOnce());
+    ASSERT_EQ(cp.store->lifecycle(), PoolLifecycle::IdentityLost);
+    eraseAllUnderPool(*cp.backend, cp.store->layout());
+    advance(*cp.clock, cp.grace + 1);
+    EXPECT_FALSE(cp.store->tryRemountOnce());
+    ASSERT_EQ(cp.store->erasureProofEmptySamplesForTest(), 1u);
+
+    /// The next correctly-spaced sample finds a durable request in flight → the ESTABLISHED streak resets.
+    {
+        auto guard = cp.store->beginDurableRequest();
+        ASSERT_EQ(cp.store->outstandingDurableRequestsForTest(), 1u);
+        advance(*cp.clock, cp.renew + 1);
+        EXPECT_FALSE(cp.store->tryRemountOnce());
+        EXPECT_EQ(cp.store->erasureProofEmptySamplesForTest(), 0u)
+            << "a nonzero durable counter must reset the established streak";
+        EXPECT_EQ(cp.store->lifecycle(), PoolLifecycle::IdentityLost);
+        EXPECT_FALSE(cp.store->isVanished());
+    }
+
+    /// The reset did not wedge the machinery: two fresh spaced samples complete the proof.
+    ASSERT_EQ(cp.store->outstandingDurableRequestsForTest(), 0u);
+    advance(*cp.clock, cp.renew + 1);
+    EXPECT_FALSE(cp.store->tryRemountOnce());
+    ASSERT_EQ(cp.store->erasureProofEmptySamplesForTest(), 1u);
+    advance(*cp.clock, cp.renew + 1);
+    EXPECT_FALSE(cp.store->tryRemountOnce());
+    EXPECT_EQ(cp.store->lifecycle(), PoolLifecycle::VanishedErased);
+}
+
+/// (g) The same established-streak reset, driven instead by an UNDECIDABLE probe (Indeterminate) at the next
+/// spaced sample: absence is no longer proven, so the gate stays transient and the streak resets. Once the
+/// probe heals, the proof completes — proving an error mid-window neither concludes erased nor wedges.
+TEST(CasErasureProof, EstablishedStreakResetByErrorProbeAtNextSampleThenCompletes)
+{
+    auto cp = openClockedPool(/*capable=*/true);
+
+    deleteKey(*cp.backend, cp.store->layout().poolMetaKey());
+    deleteKey(*cp.backend, cp.store->layout().ownerKey(kSrid));
+    EXPECT_FALSE(cp.store->tryRemountOnce());
+    ASSERT_EQ(cp.store->lifecycle(), PoolLifecycle::IdentityLost);
+    eraseAllUnderPool(*cp.backend, cp.store->layout());
+    advance(*cp.clock, cp.grace + 1);
+    EXPECT_FALSE(cp.store->tryRemountOnce());
+    ASSERT_EQ(cp.store->erasureProofEmptySamplesForTest(), 1u);
+
+    /// The next spaced sample's probe errors (Indeterminate) → the gate stays transient and resets.
+    cp.backend->fail_probes.store(true);
+    advance(*cp.clock, cp.renew + 1);
+    EXPECT_FALSE(cp.store->tryRemountOnce());
+    EXPECT_EQ(cp.store->erasureProofEmptySamplesForTest(), 0u)
+        << "an undecidable probe must reset the established streak";
+    EXPECT_EQ(cp.store->lifecycle(), PoolLifecycle::IdentityLost);
+    EXPECT_FALSE(cp.store->isVanished());
+
+    /// The probe heals → the proof completes over two fresh spaced samples.
+    cp.backend->fail_probes.store(false);
+    advance(*cp.clock, cp.renew + 1);
+    EXPECT_FALSE(cp.store->tryRemountOnce());
+    ASSERT_EQ(cp.store->erasureProofEmptySamplesForTest(), 1u);
+    advance(*cp.clock, cp.renew + 1);
     EXPECT_FALSE(cp.store->tryRemountOnce());
     EXPECT_EQ(cp.store->lifecycle(), PoolLifecycle::VanishedErased);
 }
