@@ -265,8 +265,15 @@ void CasMountRuntime::noteLeaseLost()
     /// state untouched, so a terminal state is never downgraded and a repeated call is a no-op. This is
     /// the only transition the keeper thread performs, and it needs no lock because of that discipline.
     PoolLifecycle expected = PoolLifecycle::Live;
-    pool_lifecycle.compare_exchange_strong(
-        expected, PoolLifecycle::TransientNotLive, std::memory_order_acq_rel, std::memory_order_acquire);
+    if (pool_lifecycle.compare_exchange_strong(
+            expected, PoolLifecycle::TransientNotLive, std::memory_order_acq_rel, std::memory_order_acquire))
+    {
+        /// Record the lease-loss instant ONCE, exactly at the winning transition (rev.7 [D1]): the
+        /// erasure-proof grace gate measures elapsed-since-fence-trip from here. A later `noteLeaseLost`
+        /// (observer tick or a stale keeper trip) finds the state already non-`Live`, so its
+        /// compare-exchange fails and this timestamp is never advanced — it stays the true first loss.
+        fence_trip_boot_ms.store(bootMsNow(), std::memory_order_release);
+    }
 }
 
 void CasMountRuntime::noteRemounted()

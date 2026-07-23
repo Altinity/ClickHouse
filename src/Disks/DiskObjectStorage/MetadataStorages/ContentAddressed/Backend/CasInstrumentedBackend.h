@@ -176,6 +176,12 @@ public:
     /// This capability is a property of the wrapped backend, not an operation to count.
     bool supportsListTokens() const override { return inner->supportsListTokens(); }
 
+    /// The erasure-proof capability is a property of the wrapped backend. MUST be forwarded explicitly:
+    /// the lifecycle observer reads it through this decorator (`Pool::open` wraps the pool backend once),
+    /// and the base default is FALSE — so without this forwarder a genuinely strong-LIST inner backend
+    /// would be seen as incapable and no pool would ever reach `Vanished(erased)`.
+    bool supportsErasureProof() const override { return inner->supportsErasureProof(); }
+
     /// Count a successful staged promotion as a create of the destination blob; an existing
     /// destination is the same deduplication outcome as `putIfAbsent`.
     PutResult promoteStaged(const String & staging_key, const String & blob_key) override

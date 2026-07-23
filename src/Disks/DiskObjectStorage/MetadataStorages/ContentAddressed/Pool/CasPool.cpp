@@ -83,6 +83,12 @@ enum class LifecycleGateVerdict : uint8_t
     Recover,        /// `_pool_meta` present + identity matches: proceed with the existing recovery.
     Replaced,       /// `_pool_meta` present + a FOREIGN pool_id: `Vanished(replaced)` immediately.
     IdentityLost,   /// sentinels (`_pool_meta` + owner) absent while the prefix is NOT empty.
+    /// sentinels (`_pool_meta` + owner) absent AND the prefix probed AUTHORITATIVELY empty (KeyAbsent):
+    /// a qualifying empty sample for the `Vanished(erased)` proof (Task 6). Distinct from `StayTransient`,
+    /// which covers an UNDECIDABLE prefix (Indeterminate / AccessDenied / ContainerAbsent) that must NOT
+    /// count as empty. Reachable while `TransientNotLive` (a full live erase) or `IdentityLost` (the tail
+    /// of a progressive erase).
+    SentinelsGoneEmptyPrefix,
     StayTransient,  /// a probe error, an undecodable meta, or any ambiguous observation: retry as today.
 };
 
@@ -130,9 +136,12 @@ LifecycleGate probePoolLifecycleGate(
         {
             /// `_pool_meta` is authoritatively gone. Require the OTHER sentinel (the owner anchor) to be
             /// conclusively absent too before declaring identity lost — any surviving sentinel, or an
-            /// undecidable owner probe, keeps us transient. Then the prefix must be provably NON-empty
-            /// (data remains): that is the `IdentityLost` signal. An empty/undecidable prefix is Task 6's
-            /// `Vanished(erased)` proof territory — never concluded here.
+            /// undecidable owner probe, keeps us transient. Then classify by the prefix:
+            ///   - prefix provably NON-empty (Present, data remains)  → `IdentityLost`.
+            ///   - prefix provably EMPTY (KeyAbsent, an authoritative zero-object LIST) → a qualifying
+            ///     empty sample for the `Vanished(erased)` proof (`SentinelsGoneEmptyPrefix`).
+            ///   - prefix UNDECIDABLE (Indeterminate / AccessDenied / ContainerAbsent) → stay transient;
+            ///     absence was never proven, so this must NOT count as an empty sample.
             const SentinelProbeResult owner_probe = probeSentinel(backend, layout.ownerKey(srid));
             if (owner_probe.outcome != ProbeOutcome::KeyAbsent)
                 return {LifecycleGateVerdict::StayTransient,
@@ -141,8 +150,11 @@ LifecycleGate probePoolLifecycleGate(
             if (prefix_probe.outcome == ProbeOutcome::Present)
                 return {LifecycleGateVerdict::IdentityLost,
                         "pool sentinels (_pool_meta + owner) absent while the pool prefix is not empty"};
+            if (prefix_probe.outcome == ProbeOutcome::KeyAbsent)
+                return {LifecycleGateVerdict::SentinelsGoneEmptyPrefix,
+                        "pool sentinels absent and the pool prefix probed authoritatively empty"};
             return {LifecycleGateVerdict::StayTransient,
-                    "pool sentinels absent; prefix empty or undecidable (Vanished-erased proof is Task 6)"};
+                    "pool sentinels absent; prefix probe undecidable (absence not proven)"};
         }
         default:   /// ContainerAbsent / AccessDenied / Indeterminate — absence was never proven.
             return {LifecycleGateVerdict::StayTransient, "pool-meta probe inconclusive"};
@@ -782,23 +794,40 @@ bool Pool::tryRemountOnce()
         switch (gate.verdict)
         {
             case LifecycleGateVerdict::Recover:
+                /// A present, identity-matching `_pool_meta` means the pool is NOT erased — any accrued
+                /// erasure-proof streak is invalidated regardless of which sub-path we take next.
+                resetErasureProof();
                 /// [D3] no auto-revival: a matching-sentinel observation while `IdentityLost` does NOT
                 /// bring the disk back — the observer stays fail-loud; only a restart recovers.
                 if (mount_runtime.lifecycle() == PoolLifecycle::IdentityLost)
                     return false;
                 break;   /// fall through to the existing fresh-incarnation recovery.
             case LifecycleGateVerdict::Replaced:
+                resetErasureProof();
                 mount_runtime.enterVanished(PoolLifecycle::VanishedReplaced, gate.reason);
                 return false;
             case LifecycleGateVerdict::IdentityLost:
-                /// Enter once (from `TransientNotLive`); on a repeat probe while already `IdentityLost`
-                /// this is a no-op and the demoted observer simply keeps probing. Task 6 fills the
-                /// one-way `IdentityLost -> Vanished(erased)` promotion at exactly this point.
+                /// A NON-empty prefix: our data root still holds objects, so this is not an erasure
+                /// sample — reset the streak. Enter `IdentityLost` once (from `TransientNotLive`); on a
+                /// repeat probe while already `IdentityLost` this is a no-op and the demoted observer
+                /// simply keeps probing, waiting for the prefix to drain to empty.
+                resetErasureProof();
                 if (mount_runtime.lifecycle() != PoolLifecycle::IdentityLost)
                     mount_runtime.enterIdentityLost();
                 return false;
+            case LifecycleGateVerdict::SentinelsGoneEmptyPrefix:
+                /// A qualifying empty sample: run the FULL `Vanished(erased)` proof (Task 6, spec §2). It
+                /// may promote one-way to `VanishedErased`; otherwise the observer stays demoted and keeps
+                /// probing. Reachable from BOTH `TransientNotLive` (a full live erase — the spec permits
+                /// concluding erased directly through the same proof) and `IdentityLost` (the tail of a
+                /// progressive erase). It never claims/allocates/writes.
+                evaluateErasureProofEmptySample();
+                return false;
             case LifecycleGateVerdict::StayTransient:
-                return false;   /// uncertain — remain transient and let the recovery loop retry.
+                /// Uncertain — remain transient, reset any streak (the window is no longer clean), and let
+                /// the recovery loop retry.
+                resetErasureProof();
+                return false;
         }
     }
 
@@ -907,6 +936,133 @@ bool Pool::tryRemountOnce()
         });
         return false;
     }
+}
+
+void Pool::resetErasureProof()
+{
+    /// Called under `remount_mutex`. The proof window must be clean and continuous: any non-empty
+    /// observation, probe error, or quiescence failure discards the accrued streak.
+    erasure_empty_samples = 0;
+    erasure_last_sample_boot_ms = 0;
+}
+
+uint64_t Pool::erasureProofGraceMs() const
+{
+    /// [D1] elapsed-since-fence-trip must reach max(materialization grace, the backend's TOTAL
+    /// PER-OPERATION request-timeout budget) — NOT the per-ATTEMPT timeout. The proof cannot open its
+    /// window until this has elapsed, so any durable-effect write admitted under the dying incarnation has
+    /// provably landed or been dropped before the first empty LIST sample counts.
+    ///
+    /// Arithmetic (loud, per the 4b review). The per-operation budget is derived from the ACTUAL retry
+    /// policy, NOT the per-attempt timeout:
+    ///   retry_policy_total = max_attempts × attempt_timeout_ms + Σ(capped-exponential inter-attempt
+    ///                        backoffs) — the longest a single logical CAS/PUT could occupy issuing every
+    ///                        attempt back to back (defaults: 16 × 5000 + (200+400+800+1600+3200 + 10×5000)
+    ///                        = 80000 + 56200 = 136200 ms).
+    /// The controller ALSO enforces `operation_deadline_ms` (it aborts at that wall-clock bound), so the
+    /// real max is min(retry_policy_total, operation_deadline_ms) — but we take the MAX of the two here
+    /// (never under-wait relative to either a big configured deadline OR the raw attempt arithmetic), then
+    /// add ONE more `attempt_timeout_ms` for a final attempt already in flight when the bound passed (its
+    /// socket wait can straddle it). This is the FAIL-CLOSED (longer) choice: waiting too long only delays
+    /// a truthful conclusion, while waiting too little could let a late durable write land AFTER two empty
+    /// samples — the exact hazard [D1] closes. The `DurableRequestGuard` counter (checked separately at
+    /// each sample) covers an op still holding its guard; this grace covers the residual window where a
+    /// guard has been released but the backend write is still propagating.
+    const CasRequestBudget & b = config.cas_request_budget;
+    uint64_t backoff_sum = 0;
+    uint64_t next_backoff = b.retry_initial_backoff_ms;
+    for (uint32_t gap = 1; gap < b.max_attempts; ++gap)   /// (max_attempts - 1) inter-attempt gaps
+    {
+        backoff_sum += next_backoff;
+        next_backoff = std::min<uint64_t>(next_backoff * 2, b.retry_max_backoff_ms);
+    }
+    const uint64_t retry_policy_total = static_cast<uint64_t>(b.max_attempts) * b.attempt_timeout_ms + backoff_sum;
+    const uint64_t op_wallclock_bound =
+        std::max<uint64_t>(retry_policy_total, b.operation_deadline_ms) + b.attempt_timeout_ms;
+    return std::max<uint64_t>(config.materialization_grace_ms, op_wallclock_bound);
+}
+
+void Pool::evaluateErasureProofEmptySample()
+{
+    /// Called under `remount_mutex`, on gate verdict `SentinelsGoneEmptyPrefix` (both sentinels
+    /// authoritatively absent AND the pool prefix probed authoritatively empty). Evaluate the FULL proof
+    /// (spec §2 item 2, ALL conditions AND-ed). Reads only; never claims/allocates/writes.
+
+    /// [C3] capability gate — the strong-prefix-LIST capability is the ONLY licence to ever conclude
+    /// natural erasure. Without it, `IdentityLost` (or `TransientNotLive`) is the terminal natural state
+    /// and `FORGET`/restart is the only path to benign truth; the streak is meaningless, so leave it reset.
+    if (!pool_backend->supportsErasureProof())
+    {
+        resetErasureProof();
+        return;
+    }
+
+    /// [D1] FULL durable-lane quiescence, re-verified at THIS sample (cheapest checks first so a busy
+    /// pool short-circuits before the bounded ref-lane settle wait):
+    ///  - no durable-effect operation is admitted-and-unresolved (the op-scoped `DurableRequestGuard`
+    ///    counter is zero) — an admitted plain-object/staging/manifest write can still land after empty
+    ///    samples otherwise;
+    if (mount_runtime.outstandingDurableRequests() != 0)
+    {
+        resetErasureProof();
+        return;
+    }
+    ///  - the GC scheduler thread and any in-flight round have fully exited (an in-flight round can write
+    ///    `gc/state`/heartbeat objects after two empty samples). Absent an injected predicate the context
+    ///    runs no GC scheduler (unit tests / read-only / clickhouse-disks), so quiescence holds.
+    if (config.gc_quiescent_fn && !config.gc_quiescent_fn())
+    {
+        resetErasureProof();
+        return;
+    }
+    ///  - at least the minimum grace has elapsed since the fence trip, so any durable write admitted under
+    ///    the dying incarnation has provably drained or been dropped.
+    const uint64_t now = bootMsNow();
+    const uint64_t trip = mount_runtime.fenceTripBootMs();
+    if (trip == 0 || now < trip || (now - trip) < erasureProofGraceMs())
+    {
+        resetErasureProof();
+        return;
+    }
+    ///  - the ref lanes have settled (no pending item, no active leader; bounded by one attempt's budget).
+    ///    Checked LAST because it is the only condition that may briefly wait.
+    if (!ref_ledger.refLanesSettledForRemount())
+    {
+        resetErasureProof();
+        return;
+    }
+
+    /// Spacing: the proof needs >= 2 qualifying samples spaced >= the mount renewal period. Two samples
+    /// inside one renewal period must NOT both count (a fast observer must not shortcut the proof), so a
+    /// too-soon repeat is ignored — the streak neither advances nor resets (the window stays clean).
+    const uint64_t renew_period = static_cast<uint64_t>(config.mount_renew_period.count());
+    if (erasure_empty_samples == 0)
+    {
+        erasure_empty_samples = 1;
+        erasure_last_sample_boot_ms = now;
+        return;
+    }
+    if (now < erasure_last_sample_boot_ms || (now - erasure_last_sample_boot_ms) < renew_period)
+        return;   /// too soon after the last counted sample — keep waiting, do not advance.
+
+    ++erasure_empty_samples;
+    erasure_last_sample_boot_ms = now;
+    if (erasure_empty_samples >= 2)
+    {
+        /// One-way promotion. [D5]: the reason string MUST carry "verified: pool prefix empty" — erasure
+        /// was PROVEN (a strong-LIST backend, full durable-lane quiescence, two spaced authoritative
+        /// empty samples), so saying so is the truth. Publishes the terminal-intent latch, so the
+        /// observer loop exits at its next step boundary.
+        mount_runtime.enterVanished(PoolLifecycle::VanishedErased,
+            "verified: pool prefix empty (two authoritative empty LIST samples spaced >= the mount "
+            "renewal period, taken after full durable-lane quiescence and the minimum grace)");
+    }
+}
+
+size_t Pool::erasureProofEmptySamplesForTest()
+{
+    std::lock_guard serialize(remount_mutex);
+    return erasure_empty_samples;
 }
 
 /// The self-remount recovery thread + the merged-heartbeat renew live in `mount_runtime`

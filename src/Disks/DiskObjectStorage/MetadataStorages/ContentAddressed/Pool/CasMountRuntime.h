@@ -187,6 +187,16 @@ public:
     /// Count of durable-effect operations currently admitted (their `DurableRequestGuard` still alive).
     uint64_t outstandingDurableRequests() const { return outstanding_durable_requests.load(std::memory_order_acquire); }
 
+    /// The `bootMsNow()` instant at which this runtime FIRST lost its lease (the `Live -> TransientNotLive`
+    /// transition recorded in `noteLeaseLost`), or 0 if the lease was never lost. This is the anchor for
+    /// the erasure-proof minimum-grace gate ([D1]): the proof window may not open until at least
+    /// max(materialization grace, the backend's total per-operation request-timeout budget) has elapsed
+    /// since this instant, so any durable-effect write admitted under the dying incarnation has provably
+    /// drained or been dropped. Recorded once (on the first successful `Live -> TransientNotLive`
+    /// compare-exchange) and never advanced, so it reflects the ACTUAL lease loss — not a later observer
+    /// tick — in production (`tripMountLost -> noteLeaseLost` fires it before the observer even runs).
+    uint64_t fenceTripBootMs() const { return fence_trip_boot_ms.load(std::memory_order_acquire); }
+
     /// ---- pool lifecycle condition (rev.7 §1, spec §§1-3); enum at namespace scope below ----
     /// Atomic read of the current lifecycle (acquire).
     PoolLifecycle lifecycle() const { return pool_lifecycle.load(std::memory_order_acquire); }
@@ -383,6 +393,9 @@ private:
     std::atomic<uint64_t> fence_generation{0};
     /// Count of currently-admitted durable-effect operations (rev.7 [D1]). See `DurableRequestGuard`.
     std::atomic<uint64_t> outstanding_durable_requests{0};
+    /// `bootMsNow()` at the first `Live -> TransientNotLive` transition (rev.7 [D1]); 0 until then. The
+    /// erasure-proof grace gate measures elapsed-since-fence-trip from this. See `fenceTripBootMs`.
+    std::atomic<uint64_t> fence_trip_boot_ms{0};
 
     /// The pool lifecycle condition (rev.7 §1). Starts `Live`. Non-terminal transitions
     /// (`noteLeaseLost`/`noteRemounted`) are lock-free compare-exchanges guarded by their exact

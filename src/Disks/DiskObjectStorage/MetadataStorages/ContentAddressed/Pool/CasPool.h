@@ -156,6 +156,18 @@ struct PoolConfig
     /// blocking. Empty (the production default) sleeps for real.
     std::function<void(uint64_t)> wait_sleep_fn = {};   /// test hook for open/remount waits
 
+    /// GC-quiescence predicate for the `Vanished(erased)` proof ([D1], spec §2): the proof may not
+    /// conclude erasure until the GC scheduler thread AND any in-flight round have fully exited, because
+    /// a round mid-flight can still land a durable `gc/state`/heartbeat write after two empty LIST samples.
+    /// This returns TRUE iff GC is provably quiescent for this disk. Empty (the default) is treated as
+    /// TRUE — correct for every context that runs NO GC scheduler (the Pool unit tests, `clickhouse-disks`,
+    /// read-only opens). Production wiring (Task 8/12: the GC-scheduler lifecycle gate that stops GC at the
+    /// terminal transition, spec §3) MUST inject the real "scheduler stopped and no round in flight"
+    /// predicate here; until then the proof relies additionally on the minimum-grace gate, which by spec §3
+    /// already exceeds GC's exit latency (a round is bounded, and GC exits at its next tick after the
+    /// lifecycle transition). Consulted ONLY on the erasure-proof path, never on the hot path.
+    std::function<bool()> gc_quiescent_fn = {};
+
     /// a table becomes a publish candidate once its retained
     /// tail -- every applied txn strictly above the newest published snapshot, no age filter -- exceeds
     /// either threshold (their count / the sum of their encoded bytes), or right after recovery replays
@@ -562,6 +574,17 @@ public:
     /// the Pool down, so a test can assert `scheduleRemount` refuses to spawn once teardown has begun.
     void beginShutdownForTest();
 
+    /// Test seam: the current count of consecutive qualifying empty samples the `Vanished(erased)` proof
+    /// has accumulated (0 when the streak is reset / never started). Read under `remount_mutex`, so it is
+    /// consistent only when the caller is not concurrently driving `tryRemountOnce` on another thread —
+    /// which the synchronous erasure-proof tests never do. Lets a test assert sample-spacing enforcement
+    /// (a second sample inside one renewal period must NOT advance the streak) via the observer's own
+    /// bookkeeping rather than a wall-clock sleep.
+    size_t erasureProofEmptySamplesForTest();
+    /// Test seam: the erasure-proof minimum grace (bootMs), so a test can advance its virtual clock by
+    /// exactly this without re-deriving the retry-policy arithmetic. See `erasureProofGraceMs`.
+    uint64_t erasureProofGraceMsForTest() const { return erasureProofGraceMs(); }
+
     /// True once ANY writable `open`/self-remount of this incarnation's lifetime reclaimed a mount over
     /// an unclean predecessor (`MountPriorState::Fenced` or `UncleanObserved` -- see
     /// `materialization_grace_ms`). This is a lifetime diagnostic signal. The seal-gating decision does
@@ -822,6 +845,34 @@ private:
     /// atomics + build registry moved to `mount_runtime`, but the top-level remount serialization guards
     /// the Pool-side orchestration, so it stays on Pool.
     std::mutex remount_mutex;
+
+    /// ==== `Vanished(erased)` proof bookkeeping (Task 6, spec §2 [C2][C3][D1]) ====
+    /// Touched ONLY inside `tryRemountOnce`, under `remount_mutex` (the single-threaded lifecycle
+    /// observer), so plain non-atomic members are sufficient. `erasure_empty_samples` is the count of
+    /// consecutive qualifying empty samples accrued so far; `erasure_last_sample_boot_ms` is the
+    /// `bootMsNow()` of the most recently COUNTED sample, used to enforce the >= renewal-period spacing
+    /// between samples. Both reset to 0 on any non-empty observation, any probe error, or any quiescence
+    /// failure — the proof window must be clean and continuous.
+    size_t erasure_empty_samples = 0;
+    uint64_t erasure_last_sample_boot_ms = 0;
+
+    /// Reset the erasure-proof empty-sample streak. Called for every gate verdict OTHER than
+    /// "sentinels gone + prefix provably empty", and whenever a quiescence precondition fails at a sample.
+    void resetErasureProof();
+
+    /// Evaluate one qualifying empty sample (gate verdict `SentinelsGoneEmptyPrefix`) against the FULL
+    /// `Vanished(erased)` proof (spec §2 item 2, all AND-ed): the backend declares the strong-prefix-LIST
+    /// capability [C3]; FULL durable-lane quiescence holds at this sample [D1] (ref lanes settled AND
+    /// `outstandingDurableRequests()==0` AND GC quiescent AND elapsed-since-fence-trip >= the grace);
+    /// and this is at least the 2nd such sample spaced >= the mount renewal period. On satisfaction it
+    /// performs the one-way `enterVanished(VanishedErased, "verified: pool prefix empty")` promotion.
+    /// Called under `remount_mutex`; reads only, never claims/allocates/writes.
+    void evaluateErasureProofEmptySample();
+
+    /// The minimum grace that must elapse since the fence trip before the erasure-proof window may open
+    /// ([D1]): max(materialization grace, the backend's TOTAL per-operation request-timeout budget). See
+    /// the arithmetic at the definition — this is NOT the per-attempt timeout.
+    uint64_t erasureProofGraceMs() const;
 
     /// NOTE (M-C2): the ref-log is never trimmed here — trimming needs GC's fold state
     /// (`last_folded_ref_id`, INV-JOURNAL-COVERAGE), which is GC state landing in M-C3.
