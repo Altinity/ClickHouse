@@ -26,6 +26,11 @@
 namespace DB
 {
 
+namespace ErrorCodes
+{
+    extern const int INVALID_STATE;
+}
+
 StorageSystemContentAddressedMounts::StorageSystemContentAddressedMounts(const StorageID & table_id_)
     : StorageWithCommonVirtualColumns(table_id_)
 {
@@ -129,17 +134,22 @@ Pipe StorageSystemContentAddressedMounts::read(
 
         bool emitted_row = false;
 
-        /// store() succeeds only while the disk is Mounted (it does NOT itself refuse a terminal pool),
-        /// so a Mounted-but-Vanished disk still reaches here — its listMounts simply returns no slots and
-        /// falls through to the synthesized snapshot row below. A not-mounted disk throws and skips straight
-        /// to it. Either way the disk is visible.
+        /// store() -> poolAccess() throws INVALID_STATE both when the disk is NOT MOUNTED (never started /
+        /// shut down / unmounted) AND when the pool is TERMINAL (Vanished/IdentityLost, via
+        /// throwIfLifecycleTerminal) -- exactly the states that must still produce a visible row. Only a
+        /// Live or TransientNotLive pool returns a live handle and reaches the mount-listing path below; a
+        /// terminal or unmounted disk falls through to the synthesized snapshot row. Catch ONLY that typed
+        /// refusal: any OTHER exception is a genuine fault, so let it escape rather than fold a real bug
+        /// into a benign-looking synthesized row.
         Cas::PoolPtr store;
         try
         {
             store = ca->store();
         }
-        catch (...)   /// disk not mounted (never started / shut down / unmounted) — snapshot row only
+        catch (const Exception & e)
         {
+            if (e.code() != ErrorCodes::INVALID_STATE)
+                throw;
             store = nullptr;
         }
 

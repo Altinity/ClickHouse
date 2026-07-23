@@ -202,6 +202,13 @@ public:
     PoolLifecycle lifecycle() const { return pool_lifecycle.load(std::memory_order_acquire); }
     /// Whether the pool has reached one of the three fully-terminal `Vanished` values.
     bool isVanished() const;
+    /// Whether the terminal-intent latch (`vanished_intent`) is published — set by a natural
+    /// `enterVanished`, OR EARLY (spec §5 step 1) by FORGET's `publishVanishedIntent`, and NEVER by the
+    /// non-absorbing `IdentityLost` ([C1]). This is the EARLIEST terminal signal: it can already be true
+    /// while the state is still pre-terminal (mid-FORGET). Consulted alongside `isVanished()` by every
+    /// background worker that must self-exit the moment the pool is (being driven) terminal — the keeper
+    /// callback (`scheduleRemount`), the remount loop, and the GC scheduler.
+    bool vanishedIntentPublished() const { return vanished_intent.load(std::memory_order_acquire); }
 
     /// Non-terminal lease-loss transition: `Live -> TransientNotLive`. Idempotent and lock-free; a
     /// compare-exchange FROM `Live` only, so it never downgrades a terminal state. `tripMountLost`
@@ -256,13 +263,21 @@ public:
 
     /// Wall-clock second (`system_clock`, seconds since epoch) at which the pool ENTERED its current
     /// non-`Live` lifecycle state, or 0 while `Live`. This is the `since` the non-gated
-    /// `system.content_addressed_mounts` lifecycle snapshot (spec §7) reports. Written at each lifecycle
-    /// edge (`noteLeaseLost`/`enterIdentityLost`/`enterVanished` set it to now, `noteRemounted` clears it
-    /// to 0), and by `setLifecycleForTest`, so a forced state carries a `since` indistinguishable from a
-    /// naturally-reached one. Distinct from `fenceTripBootMs` (a boot-clock instant for the erasure-proof
-    /// grace gate, not a wall time): introspection needs a `time_t`, and this reflects the current state's
-    /// entry, not the first lease loss. Acquire-load pairs with the release-store made before the
-    /// `pool_lifecycle` transition, so a reader observing the state also observes this timestamp.
+    /// `system.content_addressed_mounts` lifecycle snapshot (spec §7) reports. Written (release) at each
+    /// lifecycle edge — `noteLeaseLost`/`enterIdentityLost`/`enterVanished` set it to now, `noteRemounted`
+    /// clears it to 0 — and by `setLifecycleForTest`, so a forced state carries a `since` indistinguishable
+    /// from a naturally-reached one. Distinct from `fenceTripBootMs` (a boot-clock instant for the
+    /// erasure-proof grace gate, not a wall time): introspection needs a `time_t`, and this reflects the
+    /// current state's entry, not the first lease loss.
+    ///
+    /// Ordering vs the `pool_lifecycle` transition it accompanies: the TERMINAL edges (`enterVanished`,
+    /// `enterIdentityLost`) publish this store BEFORE the state store, so a reader that acquire-observes a
+    /// terminal state is guaranteed (release/acquire handoff) to observe this timestamp. The lock-free
+    /// lease-loss/remount edges (`noteLeaseLost`, `noteRemounted`) stamp it in the compare-exchange's
+    /// SUCCESS branch — after the CAS — because they may run on an already-terminal pool (`noteLeaseLost` is
+    /// called before the caller's `isVanished()` gate), where a pre-CAS stamp would clobber the terminal
+    /// `since`; a reader may therefore momentarily observe a just-entered `not_live` with `since` not yet
+    /// updated, a benign introspection artifact that converges within nanoseconds.
     time_t lifecycleSinceWallS() const
     {
         return static_cast<time_t>(lifecycle_since_wall_s.load(std::memory_order_acquire));

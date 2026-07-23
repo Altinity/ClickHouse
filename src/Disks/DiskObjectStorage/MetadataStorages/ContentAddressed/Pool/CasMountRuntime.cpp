@@ -334,16 +334,20 @@ void CasMountRuntime::enterIdentityLost()
     /// `noteLeaseLost` (which only ever moves `Live -> TransientNotLive`, never away from it). Crucially,
     /// this does NOT set `vanished_intent`: `IdentityLost` is non-absorbing ([C1]) — the lifecycle
     /// observer must keep running so a progressive erase can still complete into `VanishedErased`.
+    /// `since` for the `identity_lost` snapshot row — the wall-clock instant the observer proved the
+    /// sentinels gone. Stamped (release) BEFORE the CAS that publishes `IdentityLost`, so a reader that
+    /// acquire-observes `IdentityLost` is guaranteed to observe this timestamp too (the winning CAS's
+    /// release carries this prior store) — the same before-publish ordering `enterVanished` uses. Safe to
+    /// stamp before the CAS here, unlike the lock-free `noteLeaseLost`: this runs only from
+    /// `TransientNotLive` under `Pool::remount_mutex` (a `Vanished` pool bailed at the caller's
+    /// `isVanished()` gate and the caller guards `!= IdentityLost`), so the CAS wins deterministically and
+    /// the stamp can never land on a state we did not transition.
+    lifecycle_since_wall_s.store(wallClockNowSeconds(), std::memory_order_release);
+
     PoolLifecycle expected = PoolLifecycle::TransientNotLive;
     if (!pool_lifecycle.compare_exchange_strong(
             expected, PoolLifecycle::IdentityLost, std::memory_order_acq_rel, std::memory_order_acquire))
         return;
-
-    /// `since` for the `identity_lost` snapshot row — the wall-clock instant the observer proved the
-    /// sentinels gone (release-store before/after the state store is immaterial for a single winner; a
-    /// microsecond of `TransientNotLive`-since carried into `identity_lost` would be benign for
-    /// introspection, but writing it here keeps it precise).
-    lifecycle_since_wall_s.store(wallClockNowSeconds(), std::memory_order_release);
 
     ProfileEvents::increment(ProfileEvents::CasIdentityLost);
     LOG_WARNING(getLogger("CasPool"),
