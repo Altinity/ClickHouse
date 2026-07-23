@@ -187,33 +187,47 @@ std::optional<Resolved> CasRefLedger::resolveRef(const RootNamespace & ns, const
     sweepStalePrecommitsForRead(ns, rt);
     maybeScheduleSnapshotPublish(ns, rt);
 
-    std::lock_guard lock(rt->state_mutex);
-    const auto it = rt->state.getCommitted().find(ref_name);
-    if (it == rt->state.getCommitted().end())
-        return std::nullopt;
-
-    const RefCommittedRow & row = it->second;
-    /// A resolved ref points to its manifest (the read-path entry point). `object_hash` is the manifest
-    /// instance id the ref names; pairs with a later readManifest ReadMissing if that body is gone.
-    /// `Deferred` (used only by `CachedPartFolderAccess::resolve` on the `getView` call path) skips this
-    /// emit; the caller decides, once it knows whether the access as a whole did real resolve work,
-    /// whether to emit the identical event itself — see `ResolveAudit`'s doc comment.
-    if (audit == ResolveAudit::Emit && hasEventSink())
+    /// Capture the resolved edge under `state_mutex`, but emit AFTER releasing it (Task 2): the audit
+    /// sink may re-enter a ledger read that itself takes `state_mutex` (e.g. `resolveRef`), so emitting
+    /// while holding the lock self-deadlocks that reentrant read on the same thread. The reentrancy-safe
+    /// dispatcher additionally serializes delivery, but the same-thread relock is prevented here by the
+    /// lock discipline, not the dispatcher.
+    ManifestRef resolved_ref;
+    uint64_t resolved_published_at_ms = 0;
+    std::optional<CasEvent> pending_event;
     {
-        CasEvent _ev0;
-        _ev0.type = CasEventType::RefResolve;
-        _ev0.namespace_ = ns.string();
-        _ev0.ref_name = ref_name;
-        _ev0.object_kind = CasEventObjectKind::Manifest;
-        _ev0.object_hash = manifestRefDebugString(row.manifest_ref);
-        _ev0.outcome = "resolved";
-        _ev0.reason = "read-side resolve of a ref to its part manifest";
-        emitEvent(std::move(_ev0));
+        std::lock_guard lock(rt->state_mutex);
+        const auto it = rt->state.getCommitted().find(ref_name);
+        if (it == rt->state.getCommitted().end())
+            return std::nullopt;
+
+        const RefCommittedRow & row = it->second;
+        resolved_ref = row.manifest_ref;
+        resolved_published_at_ms = row.published_at_ms;
+        /// A resolved ref points to its manifest (the read-path entry point). `object_hash` is the manifest
+        /// instance id the ref names; pairs with a later readManifest ReadMissing if that body is gone.
+        /// `Deferred` (used only by `CachedPartFolderAccess::resolve` on the `getView` call path) skips this
+        /// emit; the caller decides, once it knows whether the access as a whole did real resolve work,
+        /// whether to emit the identical event itself — see `ResolveAudit`'s doc comment.
+        if (audit == ResolveAudit::Emit && hasEventSink())
+        {
+            CasEvent _ev0;
+            _ev0.type = CasEventType::RefResolve;
+            _ev0.namespace_ = ns.string();
+            _ev0.ref_name = ref_name;
+            _ev0.object_kind = CasEventObjectKind::Manifest;
+            _ev0.object_hash = manifestRefDebugString(row.manifest_ref);
+            _ev0.outcome = "resolved";
+            _ev0.reason = "read-side resolve of a ref to its part manifest";
+            pending_event = std::move(_ev0);
+        }
     }
+    if (pending_event)
+        emitEvent(std::move(*pending_event));
     return Resolved{
-        .manifest_id = ManifestId{.root_namespace = ns, .ref = row.manifest_ref},
+        .manifest_id = ManifestId{.root_namespace = ns, .ref = resolved_ref},
         .manifest_size = 0,
-        .published_at_ms = row.published_at_ms,
+        .published_at_ms = resolved_published_at_ms,
     };
 }
 

@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBlobDigest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasEventDispatcher.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPoolMetaFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.h>
@@ -644,7 +645,20 @@ public:
     /// (unit tests, log disabled) makes emitEvent a no-op single branch. PartWriteTxn/Gc reach this via
     /// their owning Pool. `reason`/`detail` on the event carry the decision's full rationale.
     /// Intended only for pre-open wiring or tests with no active mount thread; later installation races emitters.
-    void setEventSink(CasEventSink sink) { event_sink_ = std::move(sink); }
+    /// Every component that emits (this `Pool`, the ref ledger, the manifest reader, the mount
+    /// renewer) holds a reference to `event_sink_`, so routing that ONE `std::function` through the
+    /// single `event_dispatcher_` funnels every emitter into serialized, reentrancy-safe delivery
+    /// (stage-1 §1, Task 2). The forwarder is installed only when a real sink is present so
+    /// `hasEventSink`/`event_sink_` stays a truthful "delivery enabled" predicate and the disabled hot
+    /// path still skips constructing events entirely.
+    void setEventSink(CasEventSink sink)
+    {
+        event_dispatcher_.setSink(std::move(sink));
+        if (event_dispatcher_.hasSink())
+            event_sink_ = [this](CasEvent e) { event_dispatcher_.emit(std::move(e)); };
+        else
+            event_sink_ = {};
+    }
     /// Rvalue-only: forces every call site to `std::move` its (dead-after) `CasEvent` local, so a
     /// site a future edit forgets to update is a COMPILE ERROR here rather than a silent deep copy.
     void emitEvent(CasEvent && e) const { if (event_sink_) event_sink_(std::move(e)); }
@@ -680,7 +694,14 @@ private:
     /// `NoWait` refuses immediately, with no observation wait.
     static void mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy policy);
 
-    CasEventSink event_sink_;   /// Null means disabled; `emitEvent` is a no-op.
+    /// The single serialized, reentrancy-safe event funnel (Task 2). Declared BEFORE `event_sink_` so
+    /// it constructs first and destructs last: the forwarder stored in `event_sink_` references it, and
+    /// reverse-order destruction retires the forwarder before the dispatcher it captures.
+    EventDispatcher event_dispatcher_;
+    /// Null means delivery is disabled and `emitEvent` is a no-op. When a real sink is installed this
+    /// holds a thin forwarder into `event_dispatcher_` (set by `setEventSink`); every other component
+    /// references this member, so all emitters share the one dispatcher.
+    CasEventSink event_sink_;
 
     /// ==== ref-ledger callbacks that stay on Pool (thin delegates onto `mount_runtime`) ==== The whole
     /// ref-log / ref-table subsystem moved to the `ref_ledger` member (Pool/CasRefLedger.h) and the mount/

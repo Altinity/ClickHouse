@@ -287,7 +287,16 @@ TEST(CasPool, MinActiveTracksInFlightBuilds)
     ASSERT_EQ(store->minActive(), store->peekNextBuildSeq());   /// empty again
 }
 
-TEST(CasPool, BeginPartWriteRetiresBuildSeqWhenConstructionFails)
+/// A throwing audit sink must NOT break a storage operation. The single reentrancy-safe event
+/// dispatcher (stage-1 §1, Task 2) CONTAINS sink exceptions ("never throws through"), so an arbitrary
+/// observer/sink callback failing during `beginPartWrite` is swallowed and construction succeeds --
+/// consistent with `CasPartWriteTxn.AbandonSwallowsThrowingEventSink` and
+/// `PromoteSwallowsPostDurableEventSinkFailure`, which already establish that an audit-sink failure
+/// never aborts the operation. Before Task 2 the sink was invoked directly and its exception
+/// propagated out of construction (audit-log backpressure breaking a write); the dispatcher removes
+/// that. The build_seq lifecycle is still exercised: the in-flight build holds the `minActive` GC
+/// floor and is retired on `abandon`.
+TEST(CasPool, BeginPartWriteSwallowsThrowingEventSink)
 {
     auto backend = std::make_shared<DB::Cas::InMemoryBackend>();
     DB::Cas::PoolConfig cfg;
@@ -297,26 +306,26 @@ TEST(CasPool, BeginPartWriteRetiresBuildSeqWhenConstructionFails)
     cfg.background_watermark = false;
     auto store = DB::Cas::Pool::open(backend, cfg);
 
-    const uint64_t failed_seq = store->peekNextBuildSeq();
+    const uint64_t next_seq = store->peekNextBuildSeq();
     /// UNKNOWN_EXCEPTION (not LOGICAL_ERROR): this simulates an arbitrary observer/sink callback
     /// failing, not a CAS invariant violation -- LOGICAL_ERROR would abort the whole process under
     /// debug/sanitizer builds instead of behaving like a catchable exception.
     store->setEventSink([](const CasEvent & e)
     {
         if (e.type == CasEventType::BuildStart)
-            throw DB::Exception(DB::ErrorCodes::UNKNOWN_EXCEPTION, "injected PartWriteTxn construction failure");
+            throw DB::Exception(DB::ErrorCodes::UNKNOWN_EXCEPTION, "injected audit sink failure");
     });
-    expectThrowsCode(DB::ErrorCodes::UNKNOWN_EXCEPTION, [&] { store->beginPartWrite({}); });
+
+    PartWriteTxnPtr build;
+    ASSERT_NO_THROW({ build = store->beginPartWrite({}); })
+        << "a throwing audit sink must be contained by the dispatcher, not fail construction";
     store->setEventSink(nullptr);
 
-    EXPECT_EQ(store->peekNextBuildSeq(), failed_seq + 1);
-    EXPECT_EQ(store->minActive(), store->peekNextBuildSeq());
-
-    auto build = store->beginPartWrite({});
-    EXPECT_EQ(build->buildSeq(), failed_seq + 1);
-    EXPECT_EQ(store->minActive(), build->buildSeq());
+    EXPECT_EQ(build->buildSeq(), next_seq);
+    EXPECT_EQ(store->peekNextBuildSeq(), next_seq + 1);
+    EXPECT_EQ(store->minActive(), build->buildSeq());              /// the in-flight build holds the floor
     build->abandon();
-    EXPECT_EQ(store->minActive(), store->peekNextBuildSeq());
+    EXPECT_EQ(store->minActive(), store->peekNextBuildSeq());      /// retired on abandon
 }
 
 TEST(CasPool, BuildSeqIsStrictlyMonotone)

@@ -440,7 +440,7 @@ PoolPtr Pool::open(BackendPtr backend, PoolConfig config)
 
     /// Private ctor: make_shared cannot reach it.
     PoolPtr store(new Pool(std::move(backend), std::move(config), std::move(meta)));
-    store->event_sink_ = std::move(store->config.event_sink);
+    store->setEventSink(std::move(store->config.event_sink));
 
     /// Register-before-first-write, belt-and-braces: `createOrValidate` above already
     /// admitted/validated the write algo, so the freshly-seeded cache must already contain it -- a
@@ -727,7 +727,7 @@ PoolPtr Pool::openForDecommission(BackendPtr backend, PoolConfig config, const S
 
     /// Private ctor: make_shared cannot reach it.
     PoolPtr store(new Pool(std::move(backend), std::move(config), std::move(meta)));
-    store->event_sink_ = std::move(store->config.event_sink);
+    store->setEventSink(std::move(store->config.event_sink));
 
     /// Register-before-first-write, belt-and-braces: same invariant `open` asserts.
     chassert(store->isAlgoAdmitted(write_algo));
