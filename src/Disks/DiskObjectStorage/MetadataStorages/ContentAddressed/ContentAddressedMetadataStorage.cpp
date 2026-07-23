@@ -76,7 +76,7 @@ namespace
 {
 /// The `lifecycle` column value for `system.content_addressed_mounts` (spec §7): the pool lifecycle
 /// condition collapsed to the operator-facing vocabulary. The three `Vanished*` sub-states all map to the
-/// bare `vanished` -- the sub-state (erased/replaced/forgotten) lives in the `lifecycle_reason` column,
+/// bare `vanished` -- the sub-state (replaced/forgotten) lives in the `lifecycle_reason` column,
 /// so a `NULL`-free `lifecycle` stays a small, stable enumerated set.
 const char * casLifecycleToString(Cas::PoolLifecycle lc)
 {
@@ -91,7 +91,7 @@ const char * casLifecycleToString(Cas::PoolLifecycle lc)
     return "unknown";
 }
 
-/// The ENUM-CLEAN `lifecycle_reason` word: the `vanished` sub-state (erased/replaced/forgotten) so a
+/// The ENUM-CLEAN `lifecycle_reason` word: the `vanished` sub-state (replaced/forgotten) so a
 /// downstream `lifecycle || '(' || lifecycle_reason || ')'` yields exactly e.g. `vanished(forgotten)`.
 /// Empty for every non-`vanished` state (the `lifecycle` column already fully names those). The rich [D5]
 /// text is carried separately in `lifecycle_detail`.

@@ -141,7 +141,7 @@ TEST(CasOperationGate, RemovesOnVanishedAreNoOpSuccessBackendUntouched)
 }
 
 /// (c) A content read on a Vanished disk throws the typed per-reason [D5] message -- the exact substring
-/// names the ACTUAL sub-state (erased / replaced / forgotten), never a wrong diagnosis.
+/// names the ACTUAL sub-state (replaced / forgotten), never a wrong diagnosis.
 TEST(CasOperationGate, ContentReadOnVanishedThrowsTypedPerReasonMessage)
 {
     auto storage = openGateStorage();
