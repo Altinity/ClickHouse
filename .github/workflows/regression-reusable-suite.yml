@@ -87,6 +87,7 @@ jobs:
         --collect-service-logs
         --output classic
         --parallel 1
+        --cicd
         --log raw.log
         --with-analyzer
       artifact_paths: |
