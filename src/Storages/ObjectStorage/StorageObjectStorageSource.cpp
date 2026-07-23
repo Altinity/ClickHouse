@@ -79,6 +79,11 @@ namespace ProfileEvents
     extern const Event ObjectStorageWaitPrefetchedReaderMicroseconds;
 }
 
+namespace FailPoints
+{
+    extern const char object_storage_file_prefetch_failpoint[];
+}
+
 namespace CurrentMetrics
 {
     extern const Metric StorageObjectStorageThreads;
