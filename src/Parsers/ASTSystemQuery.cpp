@@ -287,8 +287,9 @@ void ASTSystemQuery::formatImpl(WriteBuffer & ostr, const FormatSettings & setti
         case Type::CONTENT_ADDRESSED_UNMOUNT:
         case Type::CONTENT_ADDRESSED_MOUNT:
         case Type::CONTENT_ADDRESSED_FSCK:
+        case Type::CONTENT_ADDRESSED_FORGET:
         {
-            /// SYSTEM CONTENT ADDRESSED UNMOUNT/MOUNT/FSCK <disk> -- the disk is REQUIRED (unlike GC
+            /// SYSTEM CONTENT ADDRESSED UNMOUNT/MOUNT/FSCK/FORGET <disk> -- the disk is REQUIRED (unlike GC
             /// RUN's optional disk): each lifecycle transition/scan targets exactly one disk, never a
             /// fan-out.
             ostr << ' ';

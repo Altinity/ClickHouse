@@ -80,6 +80,7 @@ private:
     void contentAddressedUnmount(const String & disk_name);
     void contentAddressedMount(const String & disk_name);
     BlockIO runContentAddressedFsck(const String & disk_name);
+    void contentAddressedForget(const String & disk_name);
 
     void loadPrimaryKeys();
     void unloadPrimaryKeys();

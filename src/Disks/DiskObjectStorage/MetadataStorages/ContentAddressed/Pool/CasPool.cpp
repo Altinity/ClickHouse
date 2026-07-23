@@ -348,11 +348,21 @@ void Pool::throwIfLifecycleTerminal() const
                 "our generation is gone; restart re-registers the name.",
                 config.server_root_id);
         case PoolLifecycle::VanishedForgotten:
+        {
+            /// [D5]: the forgotten message carries the operator's decommission TIMESTAMP, threaded through
+            /// `enterVanished`'s reason by `forgetDisk` (`vanishedReason()`). A forced-for-test
+            /// `VanishedForgotten` (no real FORGET ran) has no stored reason, so fall back to the static
+            /// [D5] text — it still names the sub-state and keeps "erasure was NOT verified".
+            const String & reason = mount_runtime.vanishedReason();
+            if (!reason.empty())
+                throw Exception(ErrorCodes::INVALID_STATE,
+                    "content-addressed pool '{}' {}", config.server_root_id, reason);
             throw Exception(ErrorCodes::INVALID_STATE,
                 "content-addressed pool '{}' decommissioned by SYSTEM CONTENT ADDRESSED FORGET — erasure "
                 "was NOT verified; if this was a mistake the data may be intact (restart re-registers "
                 "the name).",
                 config.server_root_id);
+        }
     }
 }
 
@@ -763,6 +773,83 @@ Pool::~Pool()
     /// reclaims immediately) or the fail-closed no-terminal-op on an unresolved PUT, then does the
     /// belt-and-suspenders remount-thread re-join. See `CasMountRuntime::finishTeardown`.
     mount_runtime.finishTeardown(drained);
+}
+
+void Pool::forgetDisk(const std::function<void()> & stop_and_join_gc, const String & reason)
+{
+    /// Hazard C6: FORGET joins the self-remount thread (and, via `stop_and_join_gc`, the GC threads), so it
+    /// MUST run on the admin/query thread — never a pool thread, whose join of itself would deadlock. The
+    /// guard is a programming-error assertion (a self-join hangs; it never corrupts), so a chassert is the
+    /// right severity, not a release fail-close.
+    const ThreadName tn = getThreadName();
+    chassert(tn != ThreadName::CAS_REMOUNT && tn != ThreadName::CAS_GC_SCHEDULER
+             && tn != ThreadName::CAS_GC_HEARTBEAT
+             && "SYSTEM CONTENT ADDRESSED FORGET must not run on a CAS pool thread (self-join deadlock)");
+
+    /// Idempotent: an already-terminal `Vanished` pool (a second FORGET, or a pool that naturally vanished
+    /// as erased/replaced) is already the terminal truth — nothing to force, and re-running the teardown
+    /// would double-retire the keeper. `IdentityLost`/`TransientNotLive`/`Live` all proceed (FORGET is
+    /// their escape hatch). Reading `isVanished()` here without the lock is safe: only a terminal transition
+    /// sets it, terminal states are absorbing, and a natural transition that wins concurrently below merely
+    /// makes our own `enterVanished` a no-op (first terminal transition wins).
+    if (mount_runtime.isVanished())
+        return;
+
+    /// (1) Publish the terminal-intent latch FIRST (spec §5). The keeper callback stops arming remounts and
+    /// the remount loop bails at its next step boundary, so every join below is bounded to one step + one
+    /// backend timeout.
+    mount_runtime.publishVanishedIntent();
+
+    /// (2) Trip the local fence — the deliberate decommission act (allowed on a live disk). No durable-
+    /// effect write admits past this point (the fence-generation gate), and a live pool moves to
+    /// `TransientNotLive`, so store-class access already fails loud during the teardown window below.
+    mount_runtime.tripMountLost();
+
+    /// (3+4) Stop the GC scheduler (clears its leadership and JOINS its worker + heartbeat threads) BEFORE
+    /// the Pool-side teardown, so no round writes `gc/state` under a disk we are decommissioning. Injected
+    /// because the scheduler is owned above the Pool (a no-op in unit / read-only / clickhouse-disks
+    /// contexts that run none). Runs OUTSIDE `remount_mutex` (spec §3 join discipline).
+    if (stop_and_join_gc)
+        stop_and_join_gc();
+
+    /// (5a) Stop + join the self-remount thread. `stopRemountThread` latches the shutdown gate under the
+    /// thread mutex before joining, and the thread is already bailing on the intent latch (step 1) — so the
+    /// join is bounded and a keeper callback racing teardown can never re-arm it. Outside `remount_mutex`.
+    mount_runtime.stopRemountThread();
+
+    /// A remount attempt already IN FLIGHT when step 1 published the intent completes its current step
+    /// before the loop bails (the "one step + one backend timeout" bound of §5), and a successful reclaim in
+    /// that window re-arms the local fence (`lost = false`). Now that the remount thread is JOINED and can
+    /// never run again, re-latch the fence so the terminal `mayMutate() == false` holds regardless of any
+    /// such raced reclaim. Idempotent; the durable mount lease the reclaim wrote is retired by the
+    /// `finishTeardown` below (it operates on whatever keeper is current — the reclaimed one).
+    mount_runtime.tripMountLost();
+
+    /// (5b) Drain the ref lanes (bounded by one attempt's budget + safety margin) to learn whether a clean
+    /// farewell is EARNED — exactly the `~Pool` rule.
+    const bool drained = ref_ledger.drainRefLanesForShutdown(
+        config.cas_request_budget.attempt_timeout_ms + config.cas_request_budget.lease_safety_margin_ms);
+
+    /// (3+5c) Retire the merged heartbeat: a clean-release farewell ONLY if the lanes provably drained,
+    /// otherwise stop background renewal with NO terminal marker so the lease expires by observation (never
+    /// an unearned clean farewell). Also does the belt-and-suspenders remount rejoin. Outside `remount_mutex`.
+    mount_runtime.finishTeardown(drained);
+
+    /// The pool object OUTLIVES this FORGET (it stays registered, `Vanished(forgotten)`, until DROP/restart),
+    /// so `~Pool` will re-run the same teardown. Drop the keeper now so that later teardown finds none and
+    /// skips it: `MountLeaseKeeper::stop`'s terminal op is single-shot (`doTerminate` throws a `LOGICAL_ERROR`
+    /// on a second call — an ASan-abort at construction), so a keeper that already terminated here must not be
+    /// terminated again. `keeperReset` is safe now: every keeper-touching thread (renewal, remount) is joined.
+    mount_runtime.keeperReset();
+
+    /// (6) Publish the terminal state + WARN, under remount serialization — matching the natural-transition
+    /// contract. Every pool thread is already joined, so taking `remount_mutex` here cannot self-deadlock.
+    /// `reason` is the [D5] message (with the operator's decommission timestamp) that
+    /// `throwIfLifecycleTerminal` surfaces to store-class callers.
+    {
+        std::lock_guard g(remount_mutex);
+        mount_runtime.enterVanished(PoolLifecycle::VanishedForgotten, reason);
+    }
 }
 
 /// The plain-object surface (namespace files + mountpoint objects) is implemented by the stateless

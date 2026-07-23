@@ -251,6 +251,18 @@ public:
     /// finish (or retry) `unmountSynchronously` first.
     void mountExplicitly() TSA_NO_THREAD_SAFETY_ANALYSIS;
 
+    /// `SYSTEM CONTENT ADDRESSED FORGET` handler (Task 10, spec §5): the operator force-Vanish. Drives the
+    /// live pool to `Vanished(forgotten)` node-locally via `Pool::forgetDisk`'s fence-first protocol, and
+    /// stops + joins the GC scheduler as part of it. Unlike the store()-class verbs, this must work on a
+    /// NOT-live disk (a stuck transient / `IdentityLost` pool) — that is its purpose — so it reaches the
+    /// pool DIRECTLY, never through `poolAccess()`/`checkOpAdmitted` (which refuse a not-live disk); it is a
+    /// lifecycle verb, like the Factory class. FORGET is an operator ASSERTION, not an erasure proof: the
+    /// resulting [D5] error message (which carries the decommission timestamp) says so. The disk stays
+    /// registered and `Mounted`; the six-class gate then answers the truth (Probe/Remove truth-absent,
+    /// reads throw the [D5] message). Idempotent; a not-mounted disk is a no-op. Serialized by
+    /// `lifecycle_mutex` (against unmount/mount/fsck) and `gc_scheduler_mutex` (against a synchronous round).
+    void forgetDisk() TSA_NO_THREAD_SAFETY_ANALYSIS;
+
     /// Test-only fault-injection hook. When set, `startup` invokes it right before it publishes
     /// `cas_store`/`part_access`/`gc_scheduler`/`pool_uuid`/`conditional_copy_supported` -- everything
     /// up to that point (opening the pool, building the part-folder facade, running the capability

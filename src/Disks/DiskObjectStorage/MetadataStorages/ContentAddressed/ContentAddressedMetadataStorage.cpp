@@ -841,6 +841,66 @@ void ContentAddressedMetadataStorage::mountExplicitly()
     startup();                                             /// atomic publish (Task 3) sets Mounted
 }
 
+namespace
+{
+/// A human-readable UTC decommission stamp for the FORGET [D5] message (an operator asserted this, so the
+/// message must be traceable to the audit log by wall time). Format: "YYYY-MM-DD HH:MM:SS UTC".
+String utcStampNow()
+{
+    const std::time_t now = std::time(nullptr);
+    std::tm tm_utc{};
+    gmtime_r(&now, &tm_utc);
+    char buf[32];
+    const size_t n = std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S UTC", &tm_utc);
+    return String(buf, n);
+}
+}
+
+void ContentAddressedMetadataStorage::forgetDisk()
+{
+    /// SYSTEM CONTENT ADDRESSED FORGET (spec §5): the operator force-Vanish. A lifecycle verb, NOT a
+    /// store()-class op — it must work on a NOT-live disk (a stuck transient / IdentityLost pool), so it
+    /// reaches the pool DIRECTLY, never through `poolAccess()`/`checkOpAdmitted` (which refuse a not-live
+    /// disk). Serialized against unmount/mount/fsck by `lifecycle_mutex`, and against a concurrent
+    /// synchronous GC round by `gc_scheduler_mutex` (a round holds the latter, so this waits it out).
+    std::lock_guard lifecycle(lifecycle_mutex);
+    std::lock_guard round_lock(gc_scheduler_mutex);
+
+    Cas::PoolPtr pool;
+    std::shared_ptr<Cas::CasGcScheduler> scheduler;
+    {
+        std::lock_guard lock(pointer_mutex);
+        pool = cas_store;
+        /// Detach the scheduler from the member under `pointer_mutex` (as shutdown/unmount do): no new
+        /// synchronous round can adopt it, and `gcHealth`/`gcQuiescentForErasureProof` report "no GC" for a
+        /// forgotten disk immediately. The actual stop()+join runs below, inside the pool's protocol
+        /// (OUTSIDE `pointer_mutex`, since it joins threads).
+        scheduler = std::move(gc_scheduler);
+    }
+
+    if (!pool)
+    {
+        /// Nothing mounted to forget (never started / already unmounted / shut down). The disk is already
+        /// not serving; a restart re-registers the name. Idempotent no-op. (The detached `scheduler` is
+        /// null here too — `cas_store`/`gc_scheduler` are published and cleared together.)
+        LOG_WARNING(getLogger("ContentAddressedMetadataStorage"),
+            "SYSTEM CONTENT ADDRESSED FORGET on content-addressed disk '{}': not mounted — nothing to "
+            "decommission (a restart re-registers the name).", disk_name);
+        return;
+    }
+
+    /// The [D5] forgotten message, carrying the actual decommission timestamp (an operator ASSERTION, not
+    /// an erasure proof — the wording says so). `Pool::throwIfLifecycleTerminal` surfaces it verbatim to
+    /// every store-class caller after the transition, and the WARN at the transition logs it too.
+    const String reason = fmt::format(
+        "decommissioned by SYSTEM CONTENT ADDRESSED FORGET at {} — erasure was NOT verified; if this was a "
+        "mistake the data may be intact (restart re-registers the name)", utcStampNow());
+
+    /// Run the fence-first protocol on the pool. The GC-stop callback stops+joins the (detached) scheduler
+    /// at spec §5 step 3/4; the scheduler is destroyed when the local `scheduler` leaves this scope.
+    pool->forgetDisk([&scheduler] { if (scheduler) scheduler->stop(); }, reason);
+}
+
 Cas::FsckReport ContentAddressedMetadataStorage::runFsckOnDormant(bool detail) const
 {
     /// Outermost lock (see its own doc comment): held for the WHOLE scan, so a concurrent MOUNT/UNMOUNT

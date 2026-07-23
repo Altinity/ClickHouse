@@ -226,13 +226,33 @@ public:
     /// forced state is indistinguishable from a naturally-reached one. Never used in production.
     void setLifecycleForTest(PoolLifecycle lc);
 
+    /// Publish the terminal-intent latch (`vanished_intent`) WITHOUT settling the lifecycle state. This is
+    /// spec §5 step 1 of `SYSTEM CONTENT ADDRESSED FORGET`: publishing the latch FIRST makes the keeper
+    /// callback stop arming remounts and the remount loop bail at its next step boundary, so FORGET's
+    /// subsequent thread joins are bounded to one step + one backend timeout. The state store + WARN happen
+    /// later, in `enterVanished` at step 6. Idempotent; lock-free (a single release store). A natural
+    /// terminal transition does NOT call this — its `enterVanished` publishes the latch itself.
+    void publishVanishedIntent();
+
     /// One-way transition to a fully-terminal `Vanished` value (spec §3). Publishes the terminal-intent
-    /// latch FIRST (so the keeper stops scheduling remounts and the remount loop exits at its next step
-    /// boundary), then the state, then ONE WARN + one `CasDataRootVanished` ProfileEvent. Idempotent: the
-    /// first terminal transition wins. `which` MUST be one of the three `Vanished*` values. Threads exit
-    /// their own loops; the joins happen in `~Pool` for a natural transition. Must be called under the
-    /// caller's remount serialization (Pool::remount_mutex).
+    /// latch (so the keeper stops scheduling remounts and the remount loop exits at its next step
+    /// boundary) if it is not already published, records `reason`, stores the state, then emits ONE WARN +
+    /// one `CasDataRootVanished` ProfileEvent. Idempotent: the first terminal STATE transition wins (a
+    /// dedicated latch keyed separately from `vanished_intent`, because FORGET publishes that intent latch
+    /// early at step 1). `which` MUST be one of the three `Vanished*` values. `reason` is retained and
+    /// surfaced verbatim in the `VanishedForgotten` [D5] error message (see `vanishedReason`). Threads exit
+    /// their own loops; the joins happen in `~Pool` for a natural transition, or synchronously in
+    /// `Pool::forgetDisk` for FORGET. Must be called under the caller's remount serialization
+    /// (Pool::remount_mutex).
     void enterVanished(PoolLifecycle which, const String & reason);
+
+    /// The reason string recorded by the winning `enterVanished`, or empty when none has run (a
+    /// forced-for-test terminal state, or a non-terminal pool). `Pool::throwIfLifecycleTerminal` reads it
+    /// to build the `VanishedForgotten` [D5] message (which carries the operator's decommission timestamp
+    /// authored by `forgetDisk`). Safe to read only AFTER observing a terminal state via `lifecycle()`
+    /// (acquire): the reason is written once, before the state's release-store, so a reader that
+    /// acquire-observes the terminal state also observes the reason (release/acquire handoff).
+    const String & vanishedReason() const { return vanished_reason; }
 
     /// Extends `mayMutate` with a remaining-budget check. A ref-log attempt is refused unless the
     /// current lease has room for its configured timeout and safety margin, so work is not started when
@@ -409,12 +429,21 @@ private:
     /// by the caller's `Pool::remount_mutex` and made race-safe against the keeper thread's concurrent
     /// `noteLeaseLost` by the compare-exchange/latch discipline in the .cpp.
     std::atomic<PoolLifecycle> pool_lifecycle{PoolLifecycle::Live};
-    /// Terminal-intent latch (spec §3), published FIRST by `enterVanished` before the state store. Only
-    /// the fully-terminal `Vanished` transition sets it — `IdentityLost` is NON-absorbing ([C1]) and
-    /// deliberately does NOT, so its observer keeps running. Checked by the keeper callback before
-    /// scheduling a remount and by the remount loop at every step boundary, so a vanished pool never
-    /// claims, allocates, or writes again.
+    /// Terminal-intent latch (spec §3), published before the state store — by `enterVanished` for a
+    /// natural transition, or EARLY (step 1) by `publishVanishedIntent` for FORGET. Only the fully-terminal
+    /// `Vanished` transition sets it — `IdentityLost` is NON-absorbing ([C1]) and deliberately does NOT, so
+    /// its observer keeps running. Checked by the keeper callback before scheduling a remount and by the
+    /// remount loop at every step boundary, so a vanished pool never claims, allocates, or writes again.
     std::atomic<bool> vanished_intent{false};
+    /// Idempotency guard for the terminal STATE transition (`enterVanished`'s body). Distinct from
+    /// `vanished_intent`: FORGET publishes that intent latch at step 1, so it can no longer serve as the
+    /// "state transition already done" flag. The FIRST `enterVanished` to win this exchange stores the
+    /// state, records `vanished_reason`, and logs; every later call returns early.
+    std::atomic<bool> terminal_state_published{false};
+    /// The reason recorded by the winning `enterVanished` (see `vanishedReason`). Written once, BEFORE the
+    /// `pool_lifecycle` release-store, and immutable thereafter — so a reader that acquire-observes a
+    /// terminal state also observes this string. Empty when no terminal transition has run.
+    String vanished_reason;
 
     /// The `writer_epoch` that most recently reclaimed an unclean predecessor, or zero if none did. This
     /// is a per-epoch high-water mark rather than a sticky boolean: ref-table recovery seals only when

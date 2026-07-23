@@ -268,7 +268,12 @@ void CasMountRuntime::setLifecycleForTest(PoolLifecycle lc)
     if (lc == PoolLifecycle::VanishedErased
         || lc == PoolLifecycle::VanishedReplaced
         || lc == PoolLifecycle::VanishedForgotten)
+    {
         vanished_intent.store(true, std::memory_order_release);
+        /// Keep the terminal-state guard consistent with the forced state, so a later `enterVanished`
+        /// (unusual, but not forbidden) is a clean no-op rather than re-storing / re-logging.
+        terminal_state_published.store(true, std::memory_order_release);
+    }
 }
 
 void CasMountRuntime::noteLeaseLost()
@@ -337,12 +342,22 @@ void CasMountRuntime::enterVanished(PoolLifecycle which, const String & reason)
                 "CasMountRuntime::enterVanished called with a non-terminal lifecycle value");
     }
 
-    /// Publish the terminal-intent latch FIRST (spec §3). Its exchange doubles as the idempotency guard:
-    /// the FIRST terminal transition wins, and a second call returns without re-storing or re-logging.
-    if (vanished_intent.exchange(true, std::memory_order_acq_rel))
+    /// Publish the terminal-intent latch (spec §3). For a natural transition this is the FIRST publish; for
+    /// FORGET, `publishVanishedIntent` already set it at step 1. Either way it is published before the state
+    /// store below.
+    vanished_intent.store(true, std::memory_order_release);
+
+    /// Idempotency guard for the STATE transition, keyed on a dedicated latch rather than
+    /// `vanished_intent` (which FORGET publishes early): the FIRST winner stores the state, records the
+    /// reason, and logs; a later call returns here without re-storing or re-logging.
+    if (terminal_state_published.exchange(true, std::memory_order_acq_rel))
         return;
 
-    /// An unconditional store is safe now: the latch above serializes terminal transitions, and no
+    /// Record the reason BEFORE the state's release-store, so a reader that acquire-observes the terminal
+    /// state (e.g. `Pool::throwIfLifecycleTerminal`) also observes this string. Written exactly once.
+    vanished_reason = reason;
+
+    /// An unconditional store is safe now: the guard above serializes terminal transitions, and no
     /// non-terminal transition can move a `Vanished` state (their compare-exchanges are keyed on
     /// `Live`/`TransientNotLive`), so this value is absorbing.
     pool_lifecycle.store(which, std::memory_order_release);
@@ -352,6 +367,16 @@ void CasMountRuntime::enterVanished(PoolLifecycle which, const String & reason)
         "Content-addressed pool '{}' entered Vanished({}): {}. The disk stays registered but store-class "
         "access now fails loud with a typed error (truth); restart re-registers the name.",
         server_root_id, label, reason);
+}
+
+void CasMountRuntime::publishVanishedIntent()
+{
+    /// spec §5 step 1: publish the terminal-intent latch WITHOUT settling the state. The keeper callback
+    /// (`scheduleRemount`) and the remount loop both consult `vanished_intent` at their step boundaries, so
+    /// this stops new remount scheduling and makes an in-flight remount loop bail at its next step —
+    /// bounding FORGET's subsequent joins to one step + one backend timeout. The state store + WARN follow
+    /// in `enterVanished` (step 6). Idempotent.
+    vanished_intent.store(true, std::memory_order_release);
 }
 
 void CasMountRuntime::scheduleRemount()

@@ -1043,6 +1043,12 @@ BlockIO InterpreterSystemQuery::execute()
             result = runContentAddressedFsck(query.disk);
             break;
         }
+        case Type::CONTENT_ADDRESSED_FORGET:
+        {
+            getContext()->checkAccess(AccessType::SYSTEM_CONTENT_ADDRESSED_FORGET);
+            contentAddressedForget(query.disk);
+            break;
+        }
         case Type::CONTENT_ADDRESSED_DROP_POOL_MEMBER:
         {
             getContext()->checkAccess(AccessType::SYSTEM_CONTENT_ADDRESSED_DROP_POOL_MEMBER);
@@ -2572,6 +2578,31 @@ BlockIO InterpreterSystemQuery::runContentAddressedFsck(const String & disk_name
     return result;
 }
 
+void InterpreterSystemQuery::contentAddressedForget(const String & disk_name)
+{
+    /// The operator "fire-marshal" verb (spec §5): a force-Vanish that decommissions a content-addressed
+    /// disk NODE-LOCALLY. Unlike the store()-class verbs, FORGET must work on a disk that is NOT live --
+    /// that is its whole purpose (a stuck transient/IdentityLost pool, an operator-asserted decommission) --
+    /// so it does NOT go through `checkOpAdmitted`/`store()` (which refuse a not-live disk). It is a
+    /// lifecycle verb like the Factory class: it reaches the pool directly and drives it to
+    /// `Vanished(forgotten)`. FORGET is an operator ASSERTION, not an erasure proof; the resulting [D5]
+    /// error message says so.
+    if (disk_name.empty())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "SYSTEM CONTENT ADDRESSED FORGET requires an explicit disk name");
+
+    auto disk = getContext()->getDisk(disk_name);                       /// UNKNOWN_DISK on a bad name
+    auto * ca = ContentAddressedMetadataStorage::tryFromDisk(disk);
+    if (!ca)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Disk '{}' is not a content-addressed disk", disk_name);
+
+    ca->forgetDisk();
+    LOG_WARNING(log,
+        "SYSTEM CONTENT ADDRESSED FORGET decommissioned content-addressed disk '{}' (node-local; erasure "
+        "NOT verified). The disk stays registered and answers store-class access with a typed error; a "
+        "server restart re-registers the name.",
+        disk_name);
+}
+
 void InterpreterSystemQuery::loadPrimaryKeys()
 {
     loadOrUnloadPrimaryKeysImpl(true);
@@ -3158,6 +3189,11 @@ AccessRightsElements InterpreterSystemQuery::getRequiredAccessForDDLOnCluster() 
         case Type::CONTENT_ADDRESSED_FSCK:
         {
             required_access.emplace_back(AccessType::SYSTEM_CONTENT_ADDRESSED_FSCK);
+            break;
+        }
+        case Type::CONTENT_ADDRESSED_FORGET:
+        {
+            required_access.emplace_back(AccessType::SYSTEM_CONTENT_ADDRESSED_FORGET);
             break;
         }
         case Type::UNFREEZE:

@@ -365,6 +365,21 @@ public:
     /// answers truth-absent on removes/enumeration — is Task 8; this covers only the terminal states.
     void throwIfLifecycleTerminal() const;
 
+    /// `SYSTEM CONTENT ADDRESSED FORGET` — the operator force-Vanish (spec §5). Drives THIS pool to
+    /// `Vanished(forgotten)` with the fence-first protocol, node-locally, regardless of the current
+    /// lifecycle (it works precisely on a NOT-live disk — a stuck transient/`IdentityLost` pool). In order:
+    /// (1) publish the terminal-intent latch FIRST (so the remount loop / keeper callback bail at their
+    /// next step boundary, bounding the joins below); (2) trip the local fence (the deliberate
+    /// decommission act, allowed on a live disk); (3+4) stop the GC scheduler via `stop_and_join_gc` —
+    /// injected because the scheduler is owned above the Pool, a no-op in contexts that run none — and stop
+    /// + join the self-remount thread; (5) drain the ref lanes (bounded) and retire the keeper WITHOUT an
+    /// unearned clean farewell (the lease expires by observation unless the lanes provably drained); then
+    /// (6) publish `Vanished(forgotten)` carrying `reason` (the [D5] message with the operator's decommission
+    /// timestamp). Idempotent: an already-`Vanished` pool returns immediately (first terminal transition
+    /// wins). MUST run on the admin/query thread, never a pool (remount/GC) thread — the joins would
+    /// otherwise self-deadlock (hazard C6).
+    void forgetDisk(const std::function<void()> & stop_and_join_gc, const String & reason);
+
     /// Test seam: force the pool lifecycle condition directly to `lc` (see
     /// `CasMountRuntime::setLifecycleForTest`). Lets the operation-gate tests pin each class x state cell
     /// on a metadata-storage-owned pool without driving a full remount/erase sequence. Never used in
