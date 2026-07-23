@@ -95,11 +95,11 @@ enum class CasOpAdmission : uint8_t
 /// operator instead of silently missing from the table.
 ///   - `lifecycle`      — one of `live` / `not_live` / `identity_lost` / `vanished` (a live pool), or
 ///                        `constructing` / `shutdown` (no pool published).
-///   - `reason`         — the ENUM-CLEAN sub-state word: `erased` / `replaced` / `forgotten` for a
+///   - `reason`         — the ENUM-CLEAN sub-state word: `replaced` / `forgotten` for a
 ///                        `vanished` pool, empty otherwise. Kept a small closed vocabulary so a downstream
 ///                        `lifecycle || '(' || reason || ')'` yields e.g. exactly `vanished(forgotten)` —
 ///                        the [D5] free text lives in `detail`, never here.
-///   - `detail`         — the full [D5] reason text naming the actual failure (the erased/replaced
+///   - `detail`         — the full [D5] reason text naming the actual failure (the replaced
 ///                        diagnosis, the timestamped `FORGET` message, or the identity-loss message); spec §1
 ///                        requires it appear verbatim in the snapshot. Empty while `live` and for a null pool.
 ///   - `since`          — wall-clock second the current non-`live` state was entered; 0 while `live`/no pool.
@@ -293,7 +293,7 @@ public:
     /// keeps reading its (now stopped) state truthfully and a later `gcStart` re-enters the SAME instance
     /// with its `gc_id` + lease-observation history preserved. `stop()`
     /// joins the worker+heartbeat threads and clears the in-process leadership hint. Idempotent (a second
-    /// STOP is a no-op); a no-op success when no scheduler exists (GC disabled / read-only / not mounted).
+    /// STOP is a no-op); a no-op success when no scheduler exists (GC disabled / read-only / not started).
     /// Works on a not-live/Vanished disk too -- stopping GC on a sick disk is legitimate operator action, so
     /// this does NOT consult `checkOpAdmitted`. Serialized by `lifecycle_mutex` and `gc_scheduler_mutex`.
     void gcStop() TSA_NO_THREAD_SAFETY_ANALYSIS;

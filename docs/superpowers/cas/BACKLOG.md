@@ -621,12 +621,52 @@ implemented is net-negative — disable/quarantine rather than fix one virtual a
 
 > **OBSOLETE (2026-07-23): FORGET-only v1 decision** — the natural `Vanished(erased)` proof stack is excised entirely (spec rev.8 §9); no capability assertion is needed. Kept for history; the v2 door is the git history of the reviewed implementation.
 
-(REWRITTEN 2026-07-23 per the whole-increment review I3 — the earlier text was stale AND instructed the
-predicate rev-t8 adjudicated WRONG.) `gc_quiescent_fn` is ALREADY wired (Task 8: `openPoolView` →
-`gcQuiescentForErasureProof`, correctly "no round in flight" — NOT "stopped+no round", which would make
-natural promotion unreachable; do NOT change it). The ONLY remaining work: the `setStrongPrefixListCapable`
-operator assertion — a `ContentAddressedSetting` (AWS S3/GCS documented strong-LIST) consulted in
-`openPoolView`. Until it lands, production natural-`Vanished(erased)` ships DORMANT (fail-closed; FORGET is
-the operator path) — if we ship that way deliberately, spec §2 [C3] needs a one-line "requires the operator
-assertion, not yet wired" note instead. DECISION PENDING (controller): wire before T17, or explicit
-ship-dormant + spec note.
+Superseded 2026-07-23 (T17): the FORGET-only decision (the `OBSOLETE` note above) resolved the
+formerly-pending question — the natural-`Vanished(erased)` proof stack (`gc_quiescent_fn`,
+`setStrongPrefixListCapable`, the outstanding-request counter, the prefix-emptiness probe) was **excised**,
+neither wired nor shipped dormant (spec rev.8 §9 excision list; plan excision task, commit `434f3214cec`).
+Nothing remains to wire. Full technical detail is in the git history of the reviewed implementation (the v2 door).
+
+## CAS disk lifecycle rev.8 round (FORGET-only) — closure + residuals (2026-07-23) {#disk-lifecycle-rev8-closure}
+
+Round: spec `docs/superpowers/specs/2026-07-22-cas-disk-lease-loss-throw-and-stop-verbs-design.md` (rev.8,
+FORGET-only); plan `docs/superpowers/plans/2026-07-22-cas-disk-lifecycle-rev7.md` (17 tasks); problem framing
+`docs/superpowers/specs/2026-07-22-cas-disk-lifecycle-problem-and-constraints.md` (goals G1–G7).
+
+**Resolved this round:**
+- **G4 / `05020` test isolation** — `05020_content_addressed_fsck` (+ the `04290`/`04295` family) now use a
+  unique per-run disk name + pool path (plan Tasks 1–2). The old fixed-name registry entry that made a
+  same-server retry reuse a stale disk and trip `throwNotMounted` on `GC RUN` is gone; the Dormant/UNMOUNT
+  husk state it depended on was also rolled back (Task 15), so that failure mode no longer exists at all.
+- **G1 abort / G2 zombie-spam (terminal case)** — the lease-loss six-class gate throws instead of aborting
+  (G1's no-abort was Part 1, landed earlier); the GC scheduler now self-exits on `Vanished`/`IdentityLost`
+  (whole-increment-review C1 fix, `1fe585ea078`), closing the eternal `CORRUPTED_DATA`-every-tick class.
+- **G3 generic-code correctness** — the throw-when-uncertain gate + the empty-proof rule kill the
+  silent-empty ATTACH (plan Tasks 5/8/9); **G5 FSCK-on-running** with the `meta_without_body` advisory (Task 13).
+
+**NOT resolved (deliberately deferred):** the underlying **disk-lifecycle-leak** proper — a CA disk is still
+cached forever in the disk registry (`Context::getOrCreateDisk`) with no teardown/eject on `DROP TABLE`, and
+there is no runtime re-use of the same disk after a stop (G6 is met only node-locally via `FORGET`; G7
+abandoned). The Dormant/UNMOUNT/MOUNT reuse machinery that pursued this was rolled back (spec rev.8 §9);
+`FORGET` is the node-local decommission story. Full eject-on-`DROP` is future work (the disk-lifecycle
+redesign; v2 door in git history).
+
+**Accepted residuals / watch items (each a pointer into this round):**
+- (a) **`search_orphaned_parts_disks=ANY` × a transient CA disk strands an unrelated table's load** —
+  ACCEPTED (spec §4 blast radius). With `search_orphaned_parts_disks=ANY` the orphaned-parts sweep touches
+  every disk, so a transient / `IdentityLost` CA disk makes an unrelated table's AsyncLoader load throw, and
+  AsyncLoader does not retry-on-touch → the table stays FAILED until a manual `ATTACH`. Cure: `ATTACH` (or
+  restart); guidance: keep `search_orphaned_parts_disks=LOCAL` when a CA disk may be transiently unreachable.
+- (b) **Teardown/shutdown-window fail-loud** — NOTE (plan Task 15; spec §1/§3). Null-pool access
+  (`Constructing`/`ShutDown`) is now FAIL-LOUD (`INVALID_STATE`), including the `Probe` class. A generic
+  all-disks sweep racing table/server shutdown now sees a throw from the CA disk rather than a silent empty —
+  intended (fail-loud > silent-skip; the old T8a null-pool wedge is structurally gone), but watch for
+  benign-but-noisy shutdown-window throws in sweeps.
+- (c) **GC `start()` partial-start desync guard (pre-existing)** — DEFERRED (T11 review, M4). `gcStart`'s
+  re-enter of the scheduler `start()` has no guard against a partial-start desync (a worker/heartbeat pair
+  left half-started, leaving the started/stopped flag inconsistent). Pre-existing, out of this round's scope;
+  carried for a future GC-scheduler hardening pass.
+- (d) **`RefWriter` DeathTest fork-under-load flake** — WATCHED (fix1 review, `1fe585ea078`). A `RefWriter*`
+  `EXPECT_DEATH` test's `fork()` failed once (~1 ms) under full parallel gate load; 3/3 green isolated and on
+  clean re-run. Class = fork-under-load, not a product red. Watch for recurrence; if it recurs, serialize the
+  CAS DeathTests or lower gate parallelism around them.

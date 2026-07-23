@@ -315,9 +315,8 @@ String Pool::lifecycleReasonDetail(PoolLifecycle lc) const
         case PoolLifecycle::TransientNotLive:
             return {};
         case PoolLifecycle::IdentityLost:
-            return "identity lost — the pool sentinels are absent (a live erase in progress); access fails "
-                   "loud. Recover by restart or SYSTEM CONTENT ADDRESSED FORGET (a matching-sentinel restore "
-                   "does not auto-revive it).";
+            return "identity lost — the pool sentinels are absent; access fails loud. Recover by restart or "
+                   "SYSTEM CONTENT ADDRESSED FORGET (a matching-sentinel restore does not auto-revive it).";
         case PoolLifecycle::VanishedReplaced:
             return "data root replaced by a foreign pool (pool_id mismatch) — our generation is gone; "
                    "restart re-registers the name.";

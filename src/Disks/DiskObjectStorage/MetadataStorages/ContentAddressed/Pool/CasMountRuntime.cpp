@@ -347,8 +347,8 @@ void CasMountRuntime::enterIdentityLost()
     ProfileEvents::increment(ProfileEvents::CasIdentityLost);
     LOG_WARNING(getLogger("CasPool"),
         "Content-addressed pool '{}' entered IdentityLost: the pool sentinels (_pool_meta and the owner "
-        "anchor) are authoritatively absent while the pool prefix still holds objects (a live erase in "
-        "progress). Store-class access now fails loud; a low-rate, non-mutating observer keeps probing. "
+        "anchor) are authoritatively absent (both KeyAbsent). This is a fail-loud TERMINAL state: "
+        "store-class access now fails loud and this pool's remount + GC threads self-exit. "
         "Recover by restart or SYSTEM CONTENT ADDRESSED FORGET — a matching-sentinel restore does NOT "
         "auto-revive this disk.",
         server_root_id);

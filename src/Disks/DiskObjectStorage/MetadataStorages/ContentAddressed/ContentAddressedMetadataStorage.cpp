@@ -1062,7 +1062,7 @@ CasOpAdmission ContentAddressedMetadataStorage::checkOpAdmitted(CasOpClass op) c
 
     /// `IdentityLost` and the terminal `Vanished*` states carry the typed per-reason [D5] message the pool
     /// owns (single source). A SETTLED `Vanished` pool answers `Probe`/`Remove` truthfully without touching
-    /// it; `IdentityLost` (a live erase in flight, no auto-recovery) has NO benign answer -- every class
+    /// it; `IdentityLost` (sentinels absent, no auto-recovery) has NO benign answer -- every class
     /// fails loud with the "recover by restart or FORGET; a matching-sentinel restore does not auto-revive"
     /// diagnosis. So the truth-absent short-circuit is gated on the Vanished states specifically.
     const bool settled_vanished = lc == Cas::PoolLifecycle::VanishedReplaced
@@ -1124,8 +1124,8 @@ String ContentAddressedMetadataStorage::stagingKeyPrefix() const
 {
     /// Mirrors the probe's own prefix construction (`startup`'s `probe_prefix` above), minus
     /// the probe's own `/probe` leaf — this is the writer-owned sibling subtree of the SAME
-    /// `staging/<server_root_id>/` area. `store()` throws INVALID_STATE when not mounted; every caller
-    /// (writeFile, via a transaction) runs post-startup.
+    /// `staging/<server_root_id>/` area. `store()` throws INVALID_STATE when no pool is published
+    /// (pre-`startup`/post-`shutdown`); every caller (writeFile, via a transaction) runs post-startup.
     return physicalKey(store()->poolConfig().pool_prefix + "/staging/" + server_root_id);
 }
 
