@@ -162,7 +162,9 @@ TEST(CasOperationGate, ContentReadOnVanishedThrowsTypedPerReasonMessage)
               std::string::npos);
 }
 
-/// (d) Every class but Factory throws 668 on BOTH TransientNotLive AND IdentityLost (uncertain backing).
+/// (d) Every class but Factory throws 668 on BOTH TransientNotLive AND IdentityLost. The 668 message
+/// distinguishes the two: a transient blip reads "mount lease not held" (auto-recovering); IdentityLost
+/// gets its own richer, non-auto-recovering [D5] diagnosis ("identity lost … restart or FORGET").
 TEST(CasOperationGate, EveryClassThrows668OnTransientAndIdentityLost)
 {
     for (const auto lc : {PoolLifecycle::TransientNotLive, PoolLifecycle::IdentityLost})
@@ -192,6 +194,13 @@ TEST(CasOperationGate, EveryClassThrows668OnTransientAndIdentityLost)
         });
         /// Admin
         Cas::tests::expectThrowsCode(ErrorCodes::INVALID_STATE, [&] { storage->runOneGcRoundForTest(); });
+
+        /// The 668 message names the ACTUAL sub-state (not a uniform string): transient vs IdentityLost.
+        const std::string msg = messageOf([&] { storage->getFileSize(kPartFile); });
+        if (lc == PoolLifecycle::TransientNotLive)
+            EXPECT_NE(msg.find("mount lease not held"), std::string::npos) << msg;
+        else
+            EXPECT_NE(msg.find("identity lost"), std::string::npos) << msg;
     }
 }
 

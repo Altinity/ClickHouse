@@ -954,22 +954,27 @@ CasOpAdmission ContentAddressedMetadataStorage::checkOpAdmitted(CasOpClass op) c
     if (lc == Cas::PoolLifecycle::Live)
         return CasOpAdmission::Proceed;
 
-    if (lc == Cas::PoolLifecycle::TransientNotLive || lc == Cas::PoolLifecycle::IdentityLost)
-        /// Uncertain backing: no class but Factory proceeds. One uniform 668 -- the sub-state distinction
-        /// (a lease blip vs a live erase in flight) is surfaced in system.content_addressed_mounts and the
-        /// one WARN at the transition, not the per-operation error.
+    if (lc == Cas::PoolLifecycle::TransientNotLive)
+        /// A lease blip: uncertain but AUTO-RECOVERING. No class but Factory proceeds; one uniform 668
+        /// ("temporarily unreachable"). `IdentityLost` gets its own richer message below -- it does NOT
+        /// auto-recover, so "temporarily unreachable" would misdiagnose it.
         throw Exception(ErrorCodes::INVALID_STATE,
             "content-addressed disk '{}' -- mount lease not held; backing may be temporarily unreachable",
             disk_name);
 
-    /// Terminal `Vanished*`: the truth. `Probe`/`Remove` answer it without touching the pool; the
-    /// content-serving and mutating classes fail loud with the typed per-reason [D5] message. The pool
-    /// owns the canonical message strings (single source), and always throws for a `Vanished` lifecycle.
-    if (op == CasOpClass::Probe || op == CasOpClass::Remove)
+    /// `IdentityLost` and the terminal `Vanished*` states carry the typed per-reason [D5] message the pool
+    /// owns (single source). A SETTLED `Vanished` pool answers `Probe`/`Remove` truthfully without touching
+    /// it; `IdentityLost` (a live erase in flight, no auto-recovery) has NO benign answer -- every class
+    /// fails loud with the "recover by restart or FORGET; a matching-sentinel restore does not auto-revive"
+    /// diagnosis. So the truth-absent short-circuit is gated on the Vanished states specifically.
+    const bool settled_vanished = lc == Cas::PoolLifecycle::VanishedErased
+        || lc == Cas::PoolLifecycle::VanishedReplaced
+        || lc == Cas::PoolLifecycle::VanishedForgotten;
+    if (settled_vanished && (op == CasOpClass::Probe || op == CasOpClass::Remove))
         return CasOpAdmission::TruthAbsent;
     pool->throwIfLifecycleTerminal();
     throw Exception(ErrorCodes::LOGICAL_ERROR,
-        "checkOpAdmitted: unreachable -- Vanished pool did not throw for content-addressed disk '{}'", disk_name);
+        "checkOpAdmitted: unreachable -- non-Live pool did not throw for content-addressed disk '{}'", disk_name);
 }
 
 bool ContentAddressedMetadataStorage::gcQuiescentForErasureProof() const

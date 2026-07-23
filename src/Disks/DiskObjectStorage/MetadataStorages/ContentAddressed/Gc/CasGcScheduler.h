@@ -104,14 +104,24 @@ public:
     /// storage feeds into `PoolConfig::gc_quiescent_fn`.
     ///
     /// It deliberately does NOT also require the scheduler THREAD to have exited: the erasure proof is
-    /// reached from `IdentityLost`, where the pool's own writers are stopped but the GC scheduler is
-    /// still alive (its rounds now fail-closed on the lost write fence, [C2], so they land nothing). The
-    /// scheduler only exits once the pool is fully `Vanished` — the proof's OUTPUT, not a precondition —
-    /// so requiring "thread exited" here would make the natural proof unreachable. The scheduler-exit
-    /// half of [D1] is instead covered by the proof's minimum-grace gate (which by spec §3 exceeds GC's
-    /// bounded round + next-tick exit latency); this predicate adds the sharp per-sample "no round mid
-    /// flight" half that a pure timing argument cannot itself guarantee. An in-flight round resets the
-    /// proof's empty-sample streak, so the proof concludes only across samples with no round in flight.
+    /// reached from `IdentityLost`, where the pool's own writers are stopped but the GC scheduler is STILL
+    /// ALIVE (it exits only once the pool is fully `Vanished` — the proof's OUTPUT, not a precondition), so
+    /// requiring "thread exited" here would make the natural proof unreachable. GC's `gc/state`/heartbeat
+    /// writes are NOT fence-generation / `mayMutate`-checked (they bypass `CasPlainObjects`; Task 4
+    /// excluded them), so a live scheduler is safe against the proof for three CONCRETE reasons — not a
+    /// write fence:
+    ///   (a) `gcStateKey`/`gcHbKey` live under `poolPrefix`, which the proof's per-tick full-prefix
+    ///       emptiness LIST covers — any GC write that lands is seen and RESETS the empty-sample streak;
+    ///   (b) `round_in_flight` is held for the WHOLE round body (`SCOPE_EXIT` in `runRoundLogged`), so a
+    ///       sample taken while a round could still write reads not-quiescent — closing the
+    ///       landed-just-after-LIST window;
+    ///   (c) a round in the proof window has no valid `gc/state` to advance and its `has_observation` guard
+    ///       throws `CORRUPTED_DATA` rather than recreate an absent `gc/state`, so it lands nothing.
+    /// The scheduler-exit half of [D1] is thus covered by (a)+(b)+(c) plus the proof's minimum-grace gate
+    /// (which by spec §3 exceeds GC's bounded round + next-tick exit latency); this predicate surfaces the
+    /// sharp per-sample "no round mid-flight" half — (b) — that a pure timing argument cannot itself
+    /// guarantee. An in-flight round resets the empty-sample streak, so the proof concludes only across
+    /// samples with no round in flight.
     bool isQuiescent() const { return !round_in_flight.load(std::memory_order_acquire); }
 
     /// Test seam: force the in-flight-round flag `isQuiescent` reads, so a test can drive
