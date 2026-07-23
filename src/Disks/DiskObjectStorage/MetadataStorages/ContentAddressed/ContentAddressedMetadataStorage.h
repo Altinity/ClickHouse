@@ -53,7 +53,7 @@ namespace DB
 /// (rev.7 spec §1). Every public metadata/transaction entry declares its class so a single place decides
 /// what happens per pool-lifecycle condition:
 ///   - `Factory`     — I/O-free construction / capability / introspection (`createTransaction`, the
-///                     `getType`/`getPath`/capability getters, `gcHealth`, the lifecycle snapshot). NEVER
+///                     `getType`/`getPath`/capability getters, `gcHealth`, `lifecycleSnapshot`). NEVER
 ///                     gated: it works in every state. Such call sites do not invoke `checkOpAdmitted`.
 ///   - `Probe`       — existence / enumeration (`existsFile`/`existsDirectory`/`listDirectory`/
 ///                     `iterateDirectory`/`isDirectoryEmpty`/`getStorageObjectsIfExist`). Answers the
@@ -86,6 +86,28 @@ enum class CasOpAdmission : uint8_t
 {
     Proceed,
     TruthAbsent,
+};
+
+/// A non-gated lifecycle snapshot of one content-addressed disk for `system.content_addressed_mounts`
+/// (rev.7 spec §7, [C5]-visibility). It is a Factory-class read (§1): I/O-free, no `store()`/`poolAccess`,
+/// truthful in EVERY state — including a not-live / vanished pool the store()-class surface refuses, and a
+/// null pool (before `startup` / after `shutdown`). This is what keeps a disappearing disk VISIBLE to the
+/// operator instead of silently missing from the table.
+///   - `lifecycle`      — one of `live` / `not_live` / `identity_lost` / `vanished` (a live pool), or
+///                        `constructing` / `shutdown` (no pool published).
+///   - `reason`         — the [D5] detail naming the actual sub-state (erased/replaced/forgotten cause, or
+///                        the identity-loss diagnosis); empty while `live` and for a null pool.
+///   - `since`          — wall-clock second the current non-`live` state was entered; 0 while `live`/no pool.
+///   - `pool_id`        — last-known pool UUID (empty before the first `startup`); the disk stays
+///                        introspectable under its identity even once the pool is gone.
+///   - `server_root_id` — this server's node-local root id owning the mount slot.
+struct CasLifecycleSnapshot
+{
+    String lifecycle;
+    String reason;
+    time_t since = 0;
+    String pool_id;
+    String server_root_id;
 };
 
 /// Adapts ClickHouse's `IMetadataStorage` path-based interface to the content-addressed pool.
@@ -183,6 +205,14 @@ public:
     /// Holds `gc_scheduler_mutex` for the entire call so a concurrent system-table query cannot
     /// observe a scheduler while `shutdown` destroys it.
     std::optional<Cas::CasGcScheduler::GcHealth> gcHealth() const;
+
+    /// The non-gated lifecycle snapshot for `system.content_addressed_mounts` (spec §7, Factory class):
+    /// I/O-free, reachable in EVERY state — a live pool (forwards `Pool::lifecycleSnapshot`), a terminal
+    /// pool the store()-class surface refuses, and a null pool (before `startup`/after `shutdown`, reported
+    /// as `constructing`/`shutdown`). Never calls `store()`/`poolAccess()`, never touches the backend, so
+    /// the very disk that vanished stays visible. Takes only a brief `pointer_mutex` snapshot of the pool
+    /// pointer; the identity fields are read from immutable-after-startup storage members.
+    CasLifecycleSnapshot lifecycleSnapshot() const;
 
     MetadataStorageType getType() const override { return MetadataStorageType::ContentAddressed; }
     const std::string & getPath() const override { return storage_path_full; }

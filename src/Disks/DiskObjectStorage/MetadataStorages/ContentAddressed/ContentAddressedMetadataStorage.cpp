@@ -72,6 +72,27 @@ namespace ContentAddressedSetting
     extern const ContentAddressedSettingsUInt64 materialization_grace_ms;
 }
 
+namespace
+{
+/// The `lifecycle` column value for `system.content_addressed_mounts` (spec §7): the pool lifecycle
+/// condition collapsed to the operator-facing vocabulary. The three `Vanished*` sub-states all map to the
+/// bare `vanished` -- the sub-state (erased/replaced/forgotten) lives in the `lifecycle_reason` column,
+/// so a `NULL`-free `lifecycle` stays a small, stable enumerated set.
+const char * casLifecycleToString(Cas::PoolLifecycle lc)
+{
+    switch (lc)
+    {
+        case Cas::PoolLifecycle::Live:              return "live";
+        case Cas::PoolLifecycle::TransientNotLive:  return "not_live";
+        case Cas::PoolLifecycle::IdentityLost:      return "identity_lost";
+        case Cas::PoolLifecycle::VanishedErased:
+        case Cas::PoolLifecycle::VanishedReplaced:
+        case Cas::PoolLifecycle::VanishedForgotten: return "vanished";
+    }
+    return "unknown";
+}
+}
+
 /// ============================================================================================
 /// The method -> operation-class inventory (rev.7 spec §1; the review artifact of Task 8).
 ///
@@ -84,8 +105,10 @@ namespace ContentAddressedSetting
 /// Factory (never gated): getType, getPath, supportsChmod, supportsStat, isReadOnly, isContentAddressed,
 ///   transactionIsStagingOverlay, supportsAtomicFileWrites, supportsTransactionalMutableFiles,
 ///   areBlobPathsRandom, getHardlinkCount, createTransaction (I/O-free -- allocates a txn), getPoolUUID,
-///   serverRootId, scratchPath, stagingBackend, conditionalCopySupported, objectStorage, gcHealth
-///   (non-store()-gated introspection snapshot, spec §3), parseStagingBackend/parsePartFolderValidate/
+///   serverRootId, scratchPath, stagingBackend, conditionalCopySupported, objectStorage, gcHealth,
+///   lifecycleSnapshot (both non-store()-gated introspection reads for system.content_addressed_mounts --
+///   readable in EVERY lifecycle state including a not-live/vanished/null pool, spec §7),
+///   parseStagingBackend/parsePartFolderValidate/
 ///   tryFromDisk (static), checkNotReadOnly, the *ForTest seams, serverPrefix/liveNamespace/
 ///   shadowNamespace/route/classifyDirectory (pure path computation, no pool I/O).
 /// Probe:       existsFile, existsDirectory, existsFileOrDirectory, listDirectory, iterateDirectory,
@@ -366,6 +389,41 @@ std::optional<Cas::CasGcScheduler::GcHealth> ContentAddressedMetadataStorage::gc
     if (!snapshot)
         return std::nullopt;
     return snapshot->gcHealth();
+}
+
+CasLifecycleSnapshot ContentAddressedMetadataStorage::lifecycleSnapshot() const
+{
+    /// Factory-class (spec §7): I/O-free and reachable in EVERY state. NEVER calls store()/poolAccess()
+    /// (which refuse a not-mounted disk) or touches the backend -- that is the whole point, so the disk
+    /// that vanished is still visible. Only a brief pointer_mutex snapshot of the pool pointer, plus reads
+    /// of storage members that are immutable after startup.
+    CasLifecycleSnapshot snap;
+    snap.server_root_id = server_root_id;
+    /// The last-known pool identity. `pool_uuid` is written once (single-threaded) at the end of `startup`
+    /// and never reset by `shutdown`, so it is empty ONLY before the first successful startup and stable
+    /// thereafter -- the disk stays introspectable under its identity even once the pool is torn down.
+    snap.pool_id = pool_uuid;
+
+    Cas::PoolPtr pool;
+    {
+        std::lock_guard lock(pointer_mutex);
+        pool = cas_store;
+    }
+    if (!pool)
+    {
+        /// No pool published: the storage-level lifecycle (spec §1's Constructing/ShutDown). Distinguish
+        /// the two by whether startup ever ran, which `pool_uuid` records (empty => never started). A
+        /// disk that was mounted then torn down (shutdown, or a SYSTEM CONTENT ADDRESSED UNMOUNT before
+        /// Task 15 removes it) reports `shutdown`. reason/since stay empty/0 -- there is no terminal cause.
+        snap.lifecycle = snap.pool_id.empty() ? "constructing" : "shutdown";
+        return snap;
+    }
+
+    const Cas::Pool::LifecycleSnapshot ps = pool->lifecycleSnapshot();
+    snap.lifecycle = casLifecycleToString(ps.lifecycle);
+    snap.reason = ps.reason;
+    snap.since = ps.since;
+    return snap;
 }
 
 Cas::GcRoundLogger ContentAddressedMetadataStorage::makeGcRoundLogger() const

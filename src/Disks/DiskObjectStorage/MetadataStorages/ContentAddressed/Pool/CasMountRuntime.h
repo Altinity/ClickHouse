@@ -254,6 +254,20 @@ public:
     /// acquire-observes the terminal state also observes the reason (release/acquire handoff).
     const String & vanishedReason() const { return vanished_reason; }
 
+    /// Wall-clock second (`system_clock`, seconds since epoch) at which the pool ENTERED its current
+    /// non-`Live` lifecycle state, or 0 while `Live`. This is the `since` the non-gated
+    /// `system.content_addressed_mounts` lifecycle snapshot (spec §7) reports. Written at each lifecycle
+    /// edge (`noteLeaseLost`/`enterIdentityLost`/`enterVanished` set it to now, `noteRemounted` clears it
+    /// to 0), and by `setLifecycleForTest`, so a forced state carries a `since` indistinguishable from a
+    /// naturally-reached one. Distinct from `fenceTripBootMs` (a boot-clock instant for the erasure-proof
+    /// grace gate, not a wall time): introspection needs a `time_t`, and this reflects the current state's
+    /// entry, not the first lease loss. Acquire-load pairs with the release-store made before the
+    /// `pool_lifecycle` transition, so a reader observing the state also observes this timestamp.
+    time_t lifecycleSinceWallS() const
+    {
+        return static_cast<time_t>(lifecycle_since_wall_s.load(std::memory_order_acquire));
+    }
+
     /// Extends `mayMutate` with a remaining-budget check. A ref-log attempt is refused unless the
     /// current lease has room for its configured timeout and safety margin, so work is not started when
     /// it cannot plausibly finish before the fence expires.
@@ -444,6 +458,11 @@ private:
     /// `pool_lifecycle` release-store, and immutable thereafter — so a reader that acquire-observes a
     /// terminal state also observes this string. Empty when no terminal transition has run.
     String vanished_reason;
+
+    /// Wall-clock second at which the current non-`Live` lifecycle state was entered; 0 while `Live` (see
+    /// `lifecycleSinceWallS`). Set at every lifecycle edge with a release-store ordered before the
+    /// `pool_lifecycle` transition it accompanies.
+    std::atomic<int64_t> lifecycle_since_wall_s{0};
 
     /// The `writer_epoch` that most recently reclaimed an unclean predecessor, or zero if none did. This
     /// is a per-epoch high-water mark rather than a sticky boolean: ref-table recovery seals only when

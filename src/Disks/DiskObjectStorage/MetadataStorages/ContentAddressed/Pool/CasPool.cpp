@@ -321,49 +321,64 @@ void Pool::armMountFence(UInt128 server_uuid, uint64_t writer_epoch, uint64_t de
     mount_runtime.armMountFence(server_uuid, writer_epoch, deadline_boot_ms);
 }
 
-void Pool::throwIfLifecycleTerminal() const
+String Pool::lifecycleReasonDetail(PoolLifecycle lc) const
 {
-    /// The typed error carries the sub-state in its message so a wrong diagnosis is impossible from the
-    /// first error line (spec §1 [D5]). `Live`/`TransientNotLive` proceed here — the transient class is
-    /// still gated only by the write fence in this task (the full six-class gate is Task 8).
-    switch (mount_runtime.lifecycle())
+    /// The [D5] per-reason detail (spec §1) — named once here so the typed error and the introspection
+    /// snapshot always agree. No `content-addressed pool '<id>' ` prefix (callers add it if they want one).
+    switch (lc)
     {
         case PoolLifecycle::Live:
         case PoolLifecycle::TransientNotLive:
-            return;
+            return {};
         case PoolLifecycle::IdentityLost:
-            throw Exception(ErrorCodes::INVALID_STATE,
-                "content-addressed pool '{}' identity lost — the pool sentinels are absent while data "
-                "remains (a live erase in progress); access fails loud. Recover by restart or "
-                "SYSTEM CONTENT ADDRESSED FORGET (a matching-sentinel restore does not auto-revive it).",
-                config.server_root_id);
+            return "identity lost — the pool sentinels are absent while data remains (a live erase in "
+                   "progress); access fails loud. Recover by restart or SYSTEM CONTENT ADDRESSED FORGET "
+                   "(a matching-sentinel restore does not auto-revive it).";
         case PoolLifecycle::VanishedErased:
-            throw Exception(ErrorCodes::INVALID_STATE,
-                "content-addressed pool '{}' data root erased (verified: pool prefix empty) — recreate "
-                "the disk; restart re-registers the name.",
-                config.server_root_id);
+            return "data root erased (verified: pool prefix empty) — recreate the disk; restart "
+                   "re-registers the name.";
         case PoolLifecycle::VanishedReplaced:
-            throw Exception(ErrorCodes::INVALID_STATE,
-                "content-addressed pool '{}' data root replaced by a foreign pool (pool_id mismatch) — "
-                "our generation is gone; restart re-registers the name.",
-                config.server_root_id);
+            return "data root replaced by a foreign pool (pool_id mismatch) — our generation is gone; "
+                   "restart re-registers the name.";
         case PoolLifecycle::VanishedForgotten:
         {
-            /// [D5]: the forgotten message carries the operator's decommission TIMESTAMP, threaded through
+            /// The forgotten detail carries the operator's decommission TIMESTAMP, threaded through
             /// `enterVanished`'s reason by `forgetDisk` (`vanishedReason()`). A forced-for-test
             /// `VanishedForgotten` (no real FORGET ran) has no stored reason, so fall back to the static
             /// [D5] text — it still names the sub-state and keeps "erasure was NOT verified".
             const String & reason = mount_runtime.vanishedReason();
             if (!reason.empty())
-                throw Exception(ErrorCodes::INVALID_STATE,
-                    "content-addressed pool '{}' {}", config.server_root_id, reason);
-            throw Exception(ErrorCodes::INVALID_STATE,
-                "content-addressed pool '{}' decommissioned by SYSTEM CONTENT ADDRESSED FORGET — erasure "
-                "was NOT verified; if this was a mistake the data may be intact (restart re-registers "
-                "the name).",
-                config.server_root_id);
+                return reason;
+            return "decommissioned by SYSTEM CONTENT ADDRESSED FORGET — erasure was NOT verified; if this "
+                   "was a mistake the data may be intact (restart re-registers the name).";
         }
     }
+    return {};   /// unreachable — every `PoolLifecycle` value is handled above (`-Wswitch` enforces it).
+}
+
+void Pool::throwIfLifecycleTerminal() const
+{
+    /// The typed error carries the sub-state in its message so a wrong diagnosis is impossible from the
+    /// first error line (spec §1 [D5]). `Live`/`TransientNotLive` proceed here — the transient class is
+    /// still gated only by the write fence in this task (the full six-class gate is Task 8).
+    const PoolLifecycle lc = mount_runtime.lifecycle();
+    if (lc == PoolLifecycle::Live || lc == PoolLifecycle::TransientNotLive)
+        return;
+    throw Exception(ErrorCodes::INVALID_STATE,
+        "content-addressed pool '{}' {}", config.server_root_id, lifecycleReasonDetail(lc));
+}
+
+Pool::LifecycleSnapshot Pool::lifecycleSnapshot() const
+{
+    /// Non-gated, I/O-free (spec §7). Read the lifecycle ONCE (acquire), then the reason/`since` it
+    /// implies. `lifecycleReasonDetail` reads `vanishedReason()` only for a terminal state we have already
+    /// acquire-observed here, and `since` was release-stored before the same transition — so this coherent
+    /// triple never mixes a terminal state with a pre-terminal reason/timestamp.
+    LifecycleSnapshot snap;
+    snap.lifecycle = mount_runtime.lifecycle();
+    snap.reason = lifecycleReasonDetail(snap.lifecycle);
+    snap.since = mount_runtime.lifecycleSinceWallS();
+    return snap;
 }
 
 PoolPtr Pool::open(BackendPtr backend, PoolConfig config)

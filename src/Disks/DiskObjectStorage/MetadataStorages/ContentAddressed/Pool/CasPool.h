@@ -365,6 +365,19 @@ public:
     /// answers truth-absent on removes/enumeration — is Task 8; this covers only the terminal states.
     void throwIfLifecycleTerminal() const;
 
+    /// A non-gated, I/O-free lifecycle snapshot for `system.content_addressed_mounts` (spec §7,
+    /// Factory class). Reads only the runtime's atomics — NO backend op — so it is truthful in EVERY
+    /// state, including the terminal ones the store()-class surface refuses. `reason` is the same [D5]
+    /// detail `throwIfLifecycleTerminal` throws (empty while `Live`/`TransientNotLive`); `since` is the
+    /// wall-clock second the current non-`Live` state was entered (0 while `Live`).
+    struct LifecycleSnapshot
+    {
+        PoolLifecycle lifecycle = PoolLifecycle::Live;
+        String reason;
+        time_t since = 0;
+    };
+    LifecycleSnapshot lifecycleSnapshot() const;
+
     /// `SYSTEM CONTENT ADDRESSED FORGET` — the operator force-Vanish (spec §5). Drives THIS pool to
     /// `Vanished(forgotten)` with the fence-first protocol, node-locally, regardless of the current
     /// lifecycle (it works precisely on a NOT-live disk — a stuck transient/`IdentityLost` pool). In order:
@@ -894,6 +907,15 @@ private:
     /// ([D1]): max(materialization grace, the backend's TOTAL per-operation request-timeout budget). See
     /// the arithmetic at the definition — this is NOT the per-attempt timeout.
     uint64_t erasureProofGraceMs() const;
+
+    /// The single home of the [D5] per-lifecycle reason detail (spec §1) — the human-readable text that
+    /// names the ACTUAL sub-state, WITHOUT the `content-addressed pool '<id>' ` prefix. Both
+    /// `throwIfLifecycleTerminal` (which prefixes it and throws) and the non-gated `lifecycleSnapshot`
+    /// (which surfaces it verbatim in the system table) read it, so the error message and the introspection
+    /// row can never drift. Empty for `Live`/`TransientNotLive` (no terminal detail); for
+    /// `VanishedForgotten` it prefers the stored `vanishedReason()` (carrying the operator's decommission
+    /// timestamp) and falls back to the static [D5] text when none was recorded (a forced-for-test state).
+    String lifecycleReasonDetail(PoolLifecycle lc) const;
 
     /// NOTE (M-C2): the ref-log is never trimmed here — trimming needs GC's fold state
     /// (`last_folded_ref_id`, INV-JOURNAL-COVERAGE), which is GC state landing in M-C3.

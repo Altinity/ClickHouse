@@ -28,6 +28,18 @@ namespace ProfileEvents
 namespace DB::Cas
 {
 
+namespace
+{
+/// Wall-clock seconds since epoch — the `since` timestamp the lifecycle snapshot reports (spec §7). A
+/// wall clock, deliberately unlike the fence's `CLOCK_BOOTTIME`: this is an operator-facing DateTime, not
+/// an interval measured across a possible VM suspend.
+int64_t wallClockNowSeconds()
+{
+    return static_cast<int64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
+}
+}
+
 CasMountRuntime::CasMountRuntime(
     BackendPtr backend_ptr_,
     const Layout & layout_,
@@ -264,6 +276,11 @@ void CasMountRuntime::setLifecycleForTest(PoolLifecycle lc)
     /// Direct store, no precondition — the test harness pins an exact cell of the class × state table.
     /// A `Vanished*` value also latches `vanished_intent` so the forced terminal state matches what a
     /// natural `enterVanished` would leave behind (its truth semantics never depend on how it was reached).
+    /// Stamp `since` to match a naturally-reached state (release-store before the state store below, so a
+    /// snapshot reader that acquire-observes the forced state also observes the timestamp): 0 for `Live`,
+    /// now for every non-`Live` value. Keeps the forced cell of the class × state table indistinguishable
+    /// from a real transition for the introspection snapshot.
+    lifecycle_since_wall_s.store(lc == PoolLifecycle::Live ? 0 : wallClockNowSeconds(), std::memory_order_release);
     pool_lifecycle.store(lc, std::memory_order_release);
     if (lc == PoolLifecycle::VanishedErased
         || lc == PoolLifecycle::VanishedReplaced
@@ -290,6 +307,9 @@ void CasMountRuntime::noteLeaseLost()
         /// (observer tick or a stale keeper trip) finds the state already non-`Live`, so its
         /// compare-exchange fails and this timestamp is never advanced — it stays the true first loss.
         fence_trip_boot_ms.store(bootMsNow(), std::memory_order_release);
+        /// The `since` the lifecycle snapshot reports for `not_live` — the wall-clock instant this became
+        /// non-`Live`. Only the winning transition writes it (the guard above), so it is not re-stamped.
+        lifecycle_since_wall_s.store(wallClockNowSeconds(), std::memory_order_release);
     }
 }
 
@@ -298,8 +318,12 @@ void CasMountRuntime::noteRemounted()
     /// `TransientNotLive -> Live` on a successful reclaim. A compare-exchange FROM `TransientNotLive`
     /// never revives `IdentityLost` or a `Vanished` state ([D3]) and is a no-op if already `Live`.
     PoolLifecycle expected = PoolLifecycle::TransientNotLive;
-    pool_lifecycle.compare_exchange_strong(
-        expected, PoolLifecycle::Live, std::memory_order_acq_rel, std::memory_order_acquire);
+    if (pool_lifecycle.compare_exchange_strong(
+            expected, PoolLifecycle::Live, std::memory_order_acq_rel, std::memory_order_acquire))
+    {
+        /// Back to `Live`: the lifecycle snapshot reports no `since` (0) for a live pool.
+        lifecycle_since_wall_s.store(0, std::memory_order_release);
+    }
 }
 
 void CasMountRuntime::enterIdentityLost()
@@ -314,6 +338,12 @@ void CasMountRuntime::enterIdentityLost()
     if (!pool_lifecycle.compare_exchange_strong(
             expected, PoolLifecycle::IdentityLost, std::memory_order_acq_rel, std::memory_order_acquire))
         return;
+
+    /// `since` for the `identity_lost` snapshot row — the wall-clock instant the observer proved the
+    /// sentinels gone (release-store before/after the state store is immaterial for a single winner; a
+    /// microsecond of `TransientNotLive`-since carried into `identity_lost` would be benign for
+    /// introspection, but writing it here keeps it precise).
+    lifecycle_since_wall_s.store(wallClockNowSeconds(), std::memory_order_release);
 
     ProfileEvents::increment(ProfileEvents::CasIdentityLost);
     LOG_WARNING(getLogger("CasPool"),
@@ -356,6 +386,11 @@ void CasMountRuntime::enterVanished(PoolLifecycle which, const String & reason)
     /// Record the reason BEFORE the state's release-store, so a reader that acquire-observes the terminal
     /// state (e.g. `Pool::throwIfLifecycleTerminal`) also observes this string. Written exactly once.
     vanished_reason = reason;
+
+    /// The `since` the lifecycle snapshot reports for the `vanished` row — the wall-clock instant of the
+    /// terminal transition. Written before the `pool_lifecycle` release-store below, same as the reason,
+    /// so an acquire-observer of the terminal state also observes it.
+    lifecycle_since_wall_s.store(wallClockNowSeconds(), std::memory_order_release);
 
     /// An unconditional store is safe now: the guard above serializes terminal transitions, and no
     /// non-terminal transition can move a `Vanished` state (their compare-exchanges are keyed on
