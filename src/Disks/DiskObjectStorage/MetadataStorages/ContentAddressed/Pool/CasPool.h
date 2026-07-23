@@ -357,6 +357,11 @@ public:
     PoolLifecycle lifecycle() const { return mount_runtime.lifecycle(); }
     /// Whether the pool has reached one of the three fully-terminal `Vanished` values.
     bool isVanished() const { return mount_runtime.isVanished(); }
+    /// Whether the terminal-intent latch is published — a natural `enterVanished`, OR FORGET's early
+    /// (spec §5 step 1) `publishVanishedIntent`, and NEVER `IdentityLost` ([C1]). See
+    /// `CasMountRuntime::vanishedIntentPublished`. The GC scheduler consults this ALONGSIDE `isVanished()`
+    /// to self-exit its loops the instant the pool is (being driven) terminal, at the earliest signal.
+    bool vanishedIntentPublished() const { return mount_runtime.vanishedIntentPublished(); }
     /// The store()-class lifecycle gate: throws the typed `INVALID_STATE` error, whose message names the
     /// terminal sub-state, when the pool has entered `IdentityLost` or any `Vanished` state; returns
     /// silently while `Live`/`TransientNotLive`. This is the minimal "nothing silently proceeds" hook the
@@ -400,6 +405,12 @@ public:
     /// on a metadata-storage-owned pool without driving a full remount/erase sequence. Never used in
     /// production.
     void setLifecycleForTest(PoolLifecycle lc) { mount_runtime.setLifecycleForTest(lc); }
+
+    /// Test seam: publish the terminal-intent latch WITHOUT settling a terminal state (spec §5 step 1 of
+    /// FORGET), so a test can exercise the "FORGET intent published, state still pre-terminal" window — the
+    /// step-0 remount-observer bail (M1) and the GC scheduler's earliest-signal self-exit (C1). Never used
+    /// in production; FORGET reaches `publishVanishedIntent` through `forgetDisk`.
+    void publishVanishedIntentForTest() { mount_runtime.publishVanishedIntent(); }
 
     /// ---- write side ----
     PartWriteTxnPtr beginPartWrite(PartWriteInfo info);                          /// W-HEARTBEAT durable before return

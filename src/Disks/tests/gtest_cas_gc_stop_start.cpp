@@ -135,6 +135,98 @@ private:
 /// A generous wait bound for a background round to land -- trips only on a real deadlock/regression.
 constexpr std::chrono::milliseconds kRoundWait{60000};
 
+/// Bound for the [C1] self-exit observation: comfortably above the 1s pacing interval (so a slow CI box
+/// still sees the loop tick + observe the terminal state) yet short enough that the RED demo (self-exit
+/// removed) fails fast rather than hanging for `kRoundWait`.
+constexpr std::chrono::milliseconds kSelfExitWait{15000};
+
+}
+
+/// (C1) A NATURAL terminal transition (`VanishedErased`/`VanishedReplaced`, or here `VanishedForgotten`
+/// forced via the test seam) is never accompanied by a `stop()` on this scheduler — only `~Pool`/FORGET
+/// join it. The scheduler's OWN loops must observe the terminal lifecycle at their next tick and self-exit,
+/// so the pacing loop stops spamming Failed rounds (the G2 zombie) and the steal-capable loop can never
+/// fold/condemn a foreign pool's prefix. Drive it while RUNNING, then vanish it, then prove BOTH loops
+/// self-exit (bounded cv wait, no sleep) and that no further round-log rows appear.
+TEST(CasGcStopStart, SchedulerSelfExitsOnNaturalVanished)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+
+    RoundLogSink sink;
+    /// 1s interval: the loop ticks ~1s; the cv wait below (never a sleep) synchronizes on real records.
+    CasGcScheduler sched(store, std::chrono::seconds(1), "CasGcSelfExitTest", "ca-disk", sink.logger());
+    sched.start();
+
+    /// Prove the loop is genuinely RUNNING first: a background round must land and acquire the lease.
+    ASSERT_TRUE(sink.waitForSuccessFinish(/*from=*/0, kRoundWait).has_value())
+        << "the scheduler must be pacing rounds before we drive it terminal";
+
+    /// A natural terminal transition (forced here via the seam; in production `VanishedErased`/`Replaced`
+    /// arrive identically, WITHOUT anyone calling stop() on this scheduler).
+    store->setLifecycleForTest(PoolLifecycle::VanishedForgotten);
+
+    ASSERT_TRUE(sched.waitForTerminalSelfExitForTest(kSelfExitWait))
+        << "both the pacing and heartbeat loops must self-exit once the pool is Vanished";
+
+    /// No further round-log rows appear after the self-exit: both loops have returned, so capture the
+    /// count, reap them with stop() (a hang/double-terminate here would fail the test), and assert stable.
+    const size_t count_at_exit = sink.mark();
+    sched.stop();
+    EXPECT_EQ(sink.mark(), count_at_exit) << "a self-exited pacing loop must emit no further round records";
+    EXPECT_FALSE(sched.gcHealth().is_leader);
+}
+
+/// (C1 negative control) `IdentityLost` is NON-absorbing (spec [C1]) and publishes NO terminal-intent
+/// latch: the scheduler must KEEP ticking there (its GC writes are contained by `poolPrefix` LIST reset +
+/// the has-observation guard, and the observer must keep probing for the prefix to drain). Prove it does
+/// NOT self-exit and that fresh rounds keep landing.
+TEST(CasGcStopStart, SchedulerKeepsTickingOnIdentityLost)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+
+    RoundLogSink sink;
+    CasGcScheduler sched(store, std::chrono::seconds(1), "CasGcIdentityLostTest", "ca-disk", sink.logger());
+    sched.start();
+
+    ASSERT_TRUE(sink.waitForSuccessFinish(/*from=*/0, kRoundWait).has_value());
+
+    store->setLifecycleForTest(PoolLifecycle::IdentityLost);
+
+    /// It must NOT self-exit within a window spanning multiple pacing intervals...
+    EXPECT_FALSE(sched.waitForTerminalSelfExitForTest(std::chrono::milliseconds(2500)))
+        << "IdentityLost must NOT make the scheduler self-exit (non-absorbing, no terminal intent)";
+    /// ...and it must keep running rounds: a fresh Success round lands after the IdentityLost flip.
+    const size_t from = sink.mark();
+    EXPECT_TRUE(sink.waitForSuccessFinish(from, kRoundWait).has_value())
+        << "the scheduler must keep pacing rounds while IdentityLost";
+
+    sched.stop();
+}
+
+/// (C1 cleanup hygiene) After BOTH loops self-exit on a terminal transition, `stop()` must cleanly reap
+/// the already-finished (joinable) threads, a second `stop()` is a safe no-op, and destruction (scope exit
+/// → ~CasGcScheduler → stop()) runs clean — the ThreadFromGlobalPool join/reset contract holds for a
+/// self-exited thread exactly as for a stop()-signalled one.
+TEST(CasGcStopStart, StopAndDestroyCleanAfterSelfExit)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    {
+        RoundLogSink sink;
+        CasGcScheduler sched(store, std::chrono::seconds(1), "CasGcSelfExitCleanupTest", "ca-disk", sink.logger());
+        sched.start();
+        ASSERT_TRUE(sink.waitForSuccessFinish(/*from=*/0, kRoundWait).has_value());
+
+        store->setLifecycleForTest(PoolLifecycle::VanishedErased);
+        ASSERT_TRUE(sched.waitForTerminalSelfExitForTest(kSelfExitWait));
+
+        EXPECT_NO_THROW(sched.stop()) << "stop() must cleanly join the self-exited threads";
+        EXPECT_NO_THROW(sched.stop()) << "a second stop() after self-exit is a safe no-op";
+        /// Destruction at scope exit runs stop() a third time — also clean (test completing proves it).
+    }
+    SUCCEED();
 }
 
 /// (a + e) STOP joins the worker + heartbeat threads and clears the in-process leadership hint. The T10

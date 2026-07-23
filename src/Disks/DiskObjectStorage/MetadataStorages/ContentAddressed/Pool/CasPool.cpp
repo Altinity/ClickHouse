@@ -956,6 +956,20 @@ bool Pool::tryRemountOnce()
                     mount_runtime.enterIdentityLost();
                 return false;
             case LifecycleGateVerdict::SentinelsGoneEmptyPrefix:
+                /// M1 (whole-increment review): NOT while a FORGET is in progress. `forgetDisk` publishes the
+                /// terminal-intent latch at step 1 (`publishVanishedIntent`), then joins the remount thread;
+                /// an `tryRemountOnce` already IN FLIGHT — one that passed the step-0 `isVanished()` gate
+                /// BEFORE the intent was published, which that gate therefore cannot catch — could otherwise
+                /// reach this terminal, one-way erasure proof and conclude `VanishedErased` mid-FORGET,
+                /// stranding FORGET's own `enterVanished(VanishedForgotten)` (first terminal transition wins)
+                /// and mislabeling the operator-visible reason. The bail lives HERE, at the promotion, rather
+                /// than at step 0, precisely so the Recover/`armMountFence` reclaim path is untouched: a
+                /// mid-FORGET fence re-arm on that path is the SEPARATE hazard `forgetDisk`'s post-join
+                /// re-trip (trip#2) guards, and moving the check to step 0 would suppress that re-arm and
+                /// defeat trip#2's regression coverage. `IdentityLost`/`TransientNotLive` without an intent
+                /// promote exactly as before.
+                if (mount_runtime.vanishedIntentPublished())
+                    return false;
                 /// A qualifying empty sample: run the FULL `Vanished(erased)` proof (Task 6, spec §2). It
                 /// may promote one-way to `VanishedErased`; otherwise the observer stays demoted and keeps
                 /// probing. Reachable from BOTH `TransientNotLive` (a full live erase — the spec permits

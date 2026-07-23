@@ -624,6 +624,17 @@ void PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef & ref, const 
     }
 
     /// Condemned: displace the condemned incarnation with our fresh source.
+    ///
+    /// rev.7 [C2] (backlog {#c2-resurrect-putoverwrite-fence-check}): the two displacement calls below
+    /// (`resurrectStaged` / `putOverwrite`) are RAW backend writes with NO controller/fence coupling —
+    /// unlike `streamIfAbsent`, which rides the request controller's fence gate. They were the only
+    /// durable-effect writes left outside Task 4's fence-generation gate. Capture the mount fence
+    /// generation now, at the displacement DECISION, and re-check it (and `mayMutate()`) immediately before
+    /// whichever raw write we issue: a lease lost — or re-armed under a fresh incarnation — since we
+    /// observed the condemned state aborts with the typed transient error (`INVALID_STATE`) before any
+    /// stale-incarnation displacement can land. Mirrors `CasPlainObjects::casPutObject`'s
+    /// capture-at-admission-then-check-before-the-durable-write shape.
+    const uint64_t displace_admitted_generation = store->fenceGeneration();
     if (source.server_side_copy_from)
     {
         /// S3-native staging RESURRECT (INV-NO-RETURN): re-establish a fresh
@@ -640,14 +651,15 @@ void PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef & ref, const 
         /// backend reads the payload from the staging object skipping its own `blob_header_len` envelope
         /// header and prepends this fresh header.
         const String fresh_header = buildHeader();
-        /// rev.7 [D1]: a raw `backend()` call with NO existing fence coupling at all (unlike
+        /// rev.7 [D1]+[C2]: a raw `backend()` call with NO controller fence coupling (unlike
         /// `promoteStaged`/`putIfAbsentStream` above, reached only through `stagingConditionalCreate`'s
-        /// controller+fence_ok) -- structurally the same gap Task 4 closed on the plain-object surface.
-        /// This task adds only the outstanding-request COUNT here per its scope; a fence-generation
-        /// CHECK before this call is also warranted (flagged in the report, not added unilaterally).
+        /// controller+fence_ok). The `DurableRequestGuard` counts it toward erasure-proof quiescence, and
+        /// the `checkFenceOrThrow` re-checks the fence generation captured at the displacement decision,
+        /// closing the same gap Task 4 closed on the plain-object surface.
         Token tok{};
         {
             auto durable_guard = store->beginDurableRequest();
+            store->checkFenceOrThrow(displace_admitted_generation);
             tok = store->backend().resurrectStaged(
                 *source.server_side_copy_from, key, fresh_header, meta.blob_header_len);
         }
@@ -674,11 +686,13 @@ void PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef & ref, const 
             throw Exception(ErrorCodes::LOGICAL_ERROR,
                 "uploadFromSource: source wrote {} bytes for overwrite, declared {}", written, source.size);
     }
-    /// rev.7 [D1]: same as `resurrectStaged` above -- a raw, uncoupled backend call; counted here,
-    /// flagged in the report as also warranting a fence-generation check.
+    /// rev.7 [D1]+[C2]: same as `resurrectStaged` above -- a raw, uncoupled backend call; counted by the
+    /// `DurableRequestGuard` and fence-checked against the displacement-decision generation before the
+    /// durable write.
     PutResult overwrite_res{};
     {
         auto durable_guard = store->beginDurableRequest();
+        store->checkFenceOrThrow(displace_admitted_generation);
         overwrite_res = store->backend().putOverwrite(key, overwrite_body, hr.token);
     }
     if (overwrite_res.outcome == PutOutcome::Done)

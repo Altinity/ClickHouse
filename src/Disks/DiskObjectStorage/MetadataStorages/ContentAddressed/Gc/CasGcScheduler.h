@@ -132,6 +132,14 @@ public:
     /// "running round => not quiescent" without spinning up a real round against a live backend.
     void setRoundInFlightForTest(bool v) { round_in_flight.store(v, std::memory_order_release); }
 
+    /// Test seam (rev.7 §3 [C1]): block up to `timeout` for BOTH the pacing and heartbeat loops to have
+    /// SELF-EXITED via the terminal-lifecycle check — a `Vanished` pool or a published FORGET intent — as
+    /// opposed to exiting through `stop()`'s `stopping` flag. Returns false on timeout. Predicate-based
+    /// wait (no sleeps); the loops set their flag under `terminal_exit_mutex` before notifying, so there is
+    /// no lost-wakeup window. Lets a test prove the self-exit path fired without relying on any wall-clock
+    /// delay.
+    bool waitForTerminalSelfExitForTest(std::chrono::milliseconds timeout);
+
 private:
     /// Waits for the configured interval, runs scheduled rounds while the scheduler is active, and
     /// logs exceptions before continuing with the next tick. The round lock serializes this worker
@@ -187,6 +195,15 @@ private:
     /// critical section a scheduled or manual round runs under) and cleared when it returns, on the
     /// success AND exception paths. Read by `isQuiescent` for the `Vanished(erased)` erasure proof.
     std::atomic<bool> round_in_flight{false};
+
+    /// rev.7 §3 [C1] test-observation seam: set (under `terminal_exit_mutex`) by `loop`/`heartbeatLoop`
+    /// respectively when they SELF-EXIT via the terminal-lifecycle check, NOT when `stop()` flips
+    /// `stopping`. `waitForTerminalSelfExitForTest` waits on `terminal_exit_cv` for BOTH, so a test proves
+    /// the self-exit path fired without any sleep. Purely diagnostic; production behavior never reads them.
+    std::atomic<bool> loop_exited_on_terminal_for_test{false};
+    std::atomic<bool> hb_exited_on_terminal_for_test{false};
+    std::mutex terminal_exit_mutex;
+    std::condition_variable terminal_exit_cv;
 
     /// Cumulative condemned entries minus exact-token deletes completed by this scheduler while it
     /// led. It is an approximate health gauge, not durable GC state.

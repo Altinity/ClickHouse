@@ -394,3 +394,47 @@ TEST(CasErasureProof, EstablishedStreakResetByErrorProbeAtNextSampleThenComplete
     EXPECT_FALSE(cp.store->tryRemountOnce());
     EXPECT_EQ(cp.store->lifecycle(), PoolLifecycle::VanishedErased);
 }
+
+/// (M1, whole-increment review) The FORGET-blind-window race: `SYSTEM CONTENT ADDRESSED FORGET` publishes
+/// the terminal-intent latch at step 1 (`publishVanishedIntent`) BEFORE it settles the state and BEFORE its
+/// own `stop_and_join` reaches the lifecycle observer. In that window a `SentinelsGoneEmptyPrefix` sample —
+/// which WOULD promote to `VanishedErased` (proven by ProgressiveEraseOnCapableBackendReachesVanishedErased)
+/// — must be REFUSED at the promotion (the `SentinelsGoneEmptyPrefix` case guards `evaluateErasureProofEmptySample`
+/// on the published intent), so FORGET's own `enterVanished(VanishedForgotten)` is not stranded and the terminal
+/// reason is not mislabeled. The check lives at the promotion, NOT at step 0, so an in-flight reclaim that
+/// already passed step 0 before the intent was published is still caught here — and the Recover/`armMountFence`
+/// path stays untouched (its mid-FORGET fence re-arm is `forgetDisk`'s post-join trip#2 hazard, not this one).
+/// Set up EXACTLY the promotable state (IdentityLost + one established empty sample), publish the intent, then
+/// take the promoting sample and assert NO promotion.
+TEST(CasErasureProof, ForgetIntentBlocksNaturalErasedPromotion)
+{
+    auto cp = openClockedPool(/*capable=*/true);
+    ASSERT_EQ(cp.store->lifecycle(), PoolLifecycle::Live);
+
+    /// Sentinels gone → IdentityLost; then the prefix drains and one correctly-spaced empty sample is taken.
+    deleteKey(*cp.backend, cp.store->layout().poolMetaKey());
+    deleteKey(*cp.backend, cp.store->layout().ownerKey(kSrid));
+    EXPECT_FALSE(cp.store->tryRemountOnce());
+    ASSERT_EQ(cp.store->lifecycle(), PoolLifecycle::IdentityLost);
+
+    eraseAllUnderPool(*cp.backend, cp.store->layout());
+    advance(*cp.clock, cp.grace + 1);
+    EXPECT_FALSE(cp.store->tryRemountOnce());
+    ASSERT_EQ(cp.store->erasureProofEmptySamplesForTest(), 1u);
+    ASSERT_EQ(cp.store->lifecycle(), PoolLifecycle::IdentityLost)
+        << "one sample must not conclude erased — this is the promotable state a FORGET intent must freeze";
+
+    /// FORGET publishes the terminal-intent latch (spec §5 step 1), WITHOUT settling the state.
+    cp.store->publishVanishedIntentForTest();
+
+    /// The next correctly-spaced empty sample would promote to VanishedErased without the intent; with it,
+    /// the observer probes (SentinelsGoneEmptyPrefix) but bails on the published intent BEFORE the terminal
+    /// erasure proof — no promotion, no streak advance.
+    advance(*cp.clock, cp.renew + 1);
+    EXPECT_FALSE(cp.store->tryRemountOnce());
+    EXPECT_NE(cp.store->lifecycle(), PoolLifecycle::VanishedErased)
+        << "a FORGET-intent pool must never natural-promote to VanishedErased mid-protocol";
+    EXPECT_EQ(cp.store->lifecycle(), PoolLifecycle::IdentityLost)
+        << "it stays pre-terminal until FORGET's own enterVanished(VanishedForgotten)";
+    EXPECT_FALSE(cp.store->isVanished());
+}

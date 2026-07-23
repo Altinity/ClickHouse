@@ -227,6 +227,29 @@ void CasGcScheduler::loop()
             if (wake.wait_for(lock, interval, [this] { return stopping; }))
                 return;
         }
+        /// rev.7 §3 [C1]: self-exit the pacing loop the moment the pool reaches — or is being driven
+        /// toward — a terminal `Vanished` state. A NATURAL terminal transition (`VanishedErased` after a
+        /// live erase, `VanishedReplaced` after a foreign pool took the prefix) never calls `stop()` on this
+        /// scheduler: only `~Pool`/FORGET join it. Without this check the loop would tick FOREVER —
+        /// `acquireOrRenewLease` throws `CORRUPTED_DATA` against the vanished `gc/state` every interval (the
+        /// G2 zombie: an error-log line + a Failed round row each tick), and worse, after `VanishedReplaced`
+        /// the `allow_steal=true` rounds could STEAL the FOREIGN pool's `gc/state` lease and
+        /// fold/condemn/delete its objects. We also exit on a published FORGET intent
+        /// (`vanishedIntentPublished`, still pre-terminal) — earliest-signal discipline matching the remount
+        /// loop's dual check — so a disk being decommissioned stops pacing immediately, before FORGET's own
+        /// `stop_and_join` reaches this thread. `IdentityLost` deliberately does NOT exit (it publishes no
+        /// intent): its writes are contained and the observer must keep probing for the prefix to drain. The
+        /// thread exits its OWN loop here — no join from this context (C6-safe); `stop()`/`~CasGcScheduler`
+        /// still join the finished thread cleanly.
+        if (store->isVanished() || store->vanishedIntentPublished())
+        {
+            {
+                std::lock_guard exit_lock(terminal_exit_mutex);
+                loop_exited_on_terminal_for_test.store(true, std::memory_order_release);
+            }
+            terminal_exit_cv.notify_all();
+            return;
+        }
         try
         {
             /// LOW/benign: if stop() flips `stopping` while we're blocked here (a concurrent manual
@@ -291,6 +314,18 @@ void CasGcScheduler::heartbeatLoop()
             if (wake.wait_for(lock, hb_interval, [this] { return stopping; }))
                 return;
         }
+        /// rev.7 §3 [C1]: self-exit on a terminal (or FORGET-intent) pool, same as `loop()`. A vanished
+        /// pool's advisory pulses would either target a deleted `gc/hb` key (`VanishedErased`) or a FOREIGN
+        /// pool's key (`VanishedReplaced`) — stop pulsing the moment the pool vanishes.
+        if (store->isVanished() || store->vanishedIntentPublished())
+        {
+            {
+                std::lock_guard exit_lock(terminal_exit_mutex);
+                hb_exited_on_terminal_for_test.store(true, std::memory_order_release);
+            }
+            terminal_exit_cv.notify_all();
+            return;
+        }
         if (!i_am_leader.load(std::memory_order_relaxed))
             continue;
         try
@@ -319,6 +354,16 @@ CasGcScheduler::GcHealth CasGcScheduler::gcHealth() const
     }
     h.wedged_namespace_count = store->wedgedRefLaneCount();
     return h;
+}
+
+bool CasGcScheduler::waitForTerminalSelfExitForTest(std::chrono::milliseconds timeout)
+{
+    std::unique_lock lock(terminal_exit_mutex);
+    return terminal_exit_cv.wait_for(lock, timeout, [this]
+    {
+        return loop_exited_on_terminal_for_test.load(std::memory_order_acquire)
+            && hb_exited_on_terminal_for_test.load(std::memory_order_acquire);
+    });
 }
 
 }
