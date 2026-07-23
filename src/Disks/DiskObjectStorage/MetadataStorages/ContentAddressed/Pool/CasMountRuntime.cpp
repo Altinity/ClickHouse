@@ -388,9 +388,10 @@ void CasMountRuntime::scheduleRemount()
         return;
     /// A fully-terminal `Vanished` pool never claims/allocates/writes again (spec §3): the keeper
     /// callback must not arm a recovery thread. It reads the terminal-intent latch (`vanished_intent`,
-    /// published FIRST by `enterVanished`, and by Task 10's FORGET) alongside the settled state
-    /// `isVanished()`, so the earliest possible terminal signal is honored. `IdentityLost` is NOT terminal
-    /// here — it sets no latch, so its non-mutating observer keeps running through this same recovery loop.
+    /// published by `publishVanishedIntent` — at spec §5 step 1 for FORGET, or as `enterVanished`'s first
+    /// step for a natural transition) alongside the settled state `isVanished()`, so the earliest possible
+    /// terminal signal is honored. `IdentityLost` is NOT terminal here — it sets no latch, so its
+    /// non-mutating observer keeps running through this same recovery loop.
     if (remount_shutting_down.load() || remount_running.load()
         || vanished_intent.load(std::memory_order_acquire) || isVanished())
         return;
@@ -406,9 +407,10 @@ void CasMountRuntime::scheduleRemount()
         setThreadName(ThreadName::CAS_REMOUNT);
         uint64_t backoff_ms = 1000;
         /// Exit at any step boundary once a fully-terminal transition is intended (spec §3). It checks the
-        /// terminal-intent latch (`vanished_intent`, published FIRST by `enterVanished`, and by Task 10's
-        /// FORGET before it joins this thread) alongside the settled state `isVanished()`, so the loop
-        /// bails at the earliest terminal signal rather than only after the state store lands. An
+        /// terminal-intent latch (`vanished_intent`, published by `publishVanishedIntent` — by FORGET at
+        /// step 1, before it joins this thread, or as `enterVanished`'s first step for a natural
+        /// transition) alongside the settled state `isVanished()`, so the loop bails at the earliest
+        /// terminal signal rather than only after the state store lands. An
         /// `IdentityLost` pool sets no latch and is NOT vanished, so this loop keeps running as its
         /// low-rate observer: `remount_attempt` (the identity gate) returns false without claiming while
         /// it stays demoted, and promotes one-way to `VanishedErased` (Task 6), which then trips this exit.

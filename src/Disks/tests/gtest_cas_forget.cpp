@@ -59,6 +59,20 @@ void deleteKeyExact(DB::Cas::Backend & backend, const String & key)
         backend.deleteExact(key, got->token);
 }
 
+/// GC's fence-out applied directly to the mount lease (preserve the body, set `gc_fenced`, bump `seq`) —
+/// a subsequent `tryRemountOnce` verdicts `Recover` and reclaims a FRESH incarnation immediately (no
+/// lease-expiry wait), reaching `armMountFence`. Mirrors gtest_cas_lifecycle_condition.cpp's helper.
+void fenceOutMount(DB::Cas::Backend & backend, const String & mount_key)
+{
+    const auto got = backend.get(mount_key);
+    ASSERT_TRUE(got.has_value());
+    DB::Cas::MountLease m = DB::Cas::decodeMountLease(got->bytes);
+    m.gc_fenced = true;
+    m.seq += 1;
+    ASSERT_EQ(backend.putOverwrite(mount_key, DB::Cas::encodeMountLease(m), got->token).outcome,
+              DB::Cas::PutOutcome::Done);
+}
+
 /// A Backend decorator whose head/get/list throw an untyped transport error while `fail` is armed — so a
 /// self-remount attempt verdicts `StayTransient` (fast, no lease-expiry wait) and the remount loop keeps
 /// spinning. Starts DISARMED so `Pool::open` succeeds. Mirrors gtest_cas_lifecycle_condition.cpp's decorator.
@@ -182,8 +196,13 @@ TEST(CasForget, ForgetStopsAndJoinsRealGcScheduler)
     store->forgetDisk([&] { sched.stop(); gc_joined = true; }, kForgetReason);
 
     EXPECT_TRUE(gc_joined);
+    /// What this proves is the JOIN: `stop()` returned, so the worker + heartbeat threads are joined and
+    /// the test could not have hung; `isQuiescent()` confirms no round is in flight. NOTE: the callback is
+    /// only `sched.stop()`, which does NOT itself clear the in-process `i_am_leader` hint — the
+    /// metadata-storage handler clears leadership by DESTROYING the scheduler (see
+    /// `ContentAddressedMetadataStorage::forgetDisk`), so asserting `is_leader == false` here would be
+    /// vacuous (this 3600s scheduler never led) or, after a real round, wrong.
     EXPECT_TRUE(sched.isQuiescent()) << "no GC round may be in flight after FORGET joined the scheduler";
-    EXPECT_FALSE(sched.gcHealth().is_leader);
     EXPECT_EQ(store->lifecycle(), PoolLifecycle::VanishedForgotten);
 }
 
@@ -277,11 +296,10 @@ TEST(CasForget, ForgetCleanFarewellGatedOnDrain)
     }
 }
 
-/// (b) FORGET racing an ACTIVE in-flight self-remount completes without deadlock, and lands the terminal
-/// state with the fence latched (`mayMutate() == false`) even though a raced reclaim may have briefly
-/// re-armed it. A real remount thread spins against a faulting backend; FORGET runs on another thread and
-/// must join it in bounded time. Uses a `std::future` timeout wait (never a sleep) — the timeout only
-/// fires on a genuine deadlock regression.
+/// (b1) BOUNDED COMPLETION: FORGET racing an ACTIVE self-remount thread joins it without deadlock. Here the
+/// faulting backend keeps every attempt at `StayTransient` (it never reaches `armMountFence`), so this
+/// isolates the join/no-deadlock property; the fence re-arm path is covered by (b2) below. Uses a
+/// `std::future` timeout wait (never a sleep) — the timeout only fires on a genuine deadlock regression.
 TEST(CasForget, ForgetRacingActiveRemountThreadCompletesBounded)
 {
     auto backend = std::make_shared<ToggleableTransportFaultBackend>();
@@ -313,6 +331,36 @@ TEST(CasForget, ForgetRacingActiveRemountThreadCompletesBounded)
 
     EXPECT_EQ(store->lifecycle(), PoolLifecycle::VanishedForgotten);
     EXPECT_FALSE(store->mayMutate()) << "the fence must stay latched even if a raced reclaim re-armed it";
+}
+
+/// (b2) FENCE RE-LATCH REGRESSION GUARD (the fix's raison d'être): a self-remount that reaches
+/// `armMountFence` re-arms the local fence (`lost=false`) after FORGET has already tripped it. FORGET's
+/// SECOND `tripMountLost` — placed AFTER the remount thread is joined — must override it.
+///
+/// (b1)'s fault keeps every attempt at `StayTransient`, so it can NOT catch removal of that second trip. To
+/// make EXACTLY ONE reclaim reach `armMountFence` inside FORGET's window, deterministically and without a
+/// sleep, we drive a REAL `tryRemountOnce` from FORGET's own GC-stop step (invoked at spec §5 step 3/4,
+/// strictly AFTER the fence trip): the mount is fenced-out so the reclaim succeeds fast and re-arms the
+/// fence, and `tryRemountOnce`'s step-0 gate checks `isVanished()` — still false in this window — so it does
+/// NOT bail. The re-arm therefore lands after trip#1 and before trip#2, exactly the interval trip#2 guards.
+/// Verified to go RED when trip#2 is removed (see task-10-report.md — test_task10b_reddemo.log).
+TEST(CasForget, ForgetReLatchesFenceAfterAReclaimReachesArmMountFence)
+{
+    auto backend = std::make_shared<DB::Cas::InMemoryBackend>();
+    auto store = DB::Cas::tests::openPoolForTest(backend);
+
+    /// Make the current mount claimable so a self-remount SUCCEEDS fast and reaches `armMountFence`.
+    fenceOutMount(*backend, store->layout().mountKey(kSrid));
+
+    bool reclaimed = false;
+    store->forgetDisk([&] { reclaimed = store->tryRemountOnce(); }, kForgetReason);
+
+    /// Guard against a vacuous pass: if the injected reclaim did not actually succeed (reach
+    /// `armMountFence`), there is no re-arm for trip#2 to override and the test proves nothing.
+    ASSERT_TRUE(reclaimed) << "the injected reclaim must reach armMountFence, else this guard is vacuous";
+    EXPECT_EQ(store->lifecycle(), PoolLifecycle::VanishedForgotten);
+    EXPECT_FALSE(store->mayMutate())
+        << "FORGET's post-join fence re-latch (trip#2) must override the fence the reclaim re-armed";
 }
 
 /// (e) End-to-end through the verb entry `ContentAddressedMetadataStorage::forgetDisk` and the six-class
