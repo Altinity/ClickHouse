@@ -35,13 +35,18 @@ the receiver later commits a manifest whose blobs are gone — a dangling commit
   owner-liveness machinery. Rejected as structural growth in the most safety-critical component.
 - **Reserved precommit** (2026-07-23, removed same day; git history is its archive): the receiver
   reserves the manifest identity before the fetch and the *sender* materializes the body at the
-  reserved key. Found **unsound** by an adversarial review (codex `gpt-5.6-sol`, xhigh): a sender
-  PUT still in flight can land *after* the receiver was fenced and GC dead-build-skipped the
-  reservation's `+1`; the successor's lazy stale-precommit sweep then removes the binding, the fold
-  reads the late body and emits an **unmatched `-1`** — deleting blobs under a later successful
-  retry. Root lesson: a *foreign writer* into another server's manifest domain invalidates the
-  dead-build skip's "the body will never return" assumption and drags the whole state model
-  (codec, sweep, recovery, fold) into scope.
+  reserved key. Abandoned after an adversarial review (codex `gpt-5.6-sol`, xhigh). The review's
+  headline counterexample — a late foreign PUT after a dead-build skip yields an **unmatched
+  `-1`** — is real up to its last step, but the deletion consequence was later refuted: in-degree
+  is a source-edge SET applied last-wins per key (`CasBlobInDegree.h:139`, `.cpp:574`), so an
+  unmatched remove is a per-key no-op and cannot strip other manifests' edges (see BACKLOG §3
+  `[UNMATCHED-MINUS-ONE]`). The design was dropped for the review's OTHER confirmed findings,
+  each alone disqualifying: the `Reserved` kind sprawls through the whole owner state model
+  (kindless state rows, snapshot codec that hard-requires `Precommit`, sweep reconstruction,
+  recovery, fsck); foreign materialization bypasses `stageManifest`'s caps/sealing/controlled-PUT
+  and `promote`'s `adoptEvidence` discipline; and publishing at final names contradicts the
+  existing `tmp-fetch_<part>` + `renameTempPartAndReplace` fetch contract. Root lesson stands: a
+  *foreign writer* into another server's manifest domain drags the entire state model into scope.
 
 Both designs tried to *carry trust across two single-writer domains*. This design stops doing
 that: each party only ever writes its own domain, and the receiver *verifies* instead of trusting.
@@ -151,10 +156,11 @@ degrade to bytes, never to the unconfirmed relink with the known gap.
   in its owner's domain.
 - The ordinary write path (INSERT/merge) is untouched.
 - B66a — `BACKLOG.md` §14 (local-backend atomicity, orthogonal).
-- The **pre-existing** ordinary-`Precommit` unmatched-`-1` hazard (false-404 at activation-fold ×
-  dead-build skip × body readable at removal-fold), discovered while reviewing the abandoned
-  reserved design, is tracked as its own BACKLOG §3 item — same family the reserved counterexample
-  exploited, exists today independently of this spec, requires the false-404 store class.
+- The ordinary-`Precommit` unmatched-`-1` interleaving (false-404 at activation-fold × dead-build
+  skip × body readable at removal-fold), surfaced while reviewing the abandoned reserved design,
+  was **verified harmless**: in-degree is a source-edge set, an unmatched remove is a per-key
+  no-op (BACKLOG §3 `[UNMATCHED-MINUS-ONE]`). The backlog item now only pins the load-bearing
+  set-membership property with a regression test.
 - Bulk write-replica warm-up (future): confirm generalizes trivially — one batched confirm for N
   parts after N publishes; nothing here precludes it.
 
