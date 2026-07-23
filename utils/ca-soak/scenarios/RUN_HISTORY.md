@@ -469,3 +469,7 @@ Every attempted scenario run is appended here (newest at the bottom). `run_dir` 
 | 2026-07-19T00:03:59 | S39 | 1 | ci | 900s | pass | 35faaae182c5 | 20260719T000044_S39_seed1 |  |
 | 2026-07-19T00:08:02 | S40 | 1 | ci | 900s | pass | 35faaae182c5 | 20260719T000359_S40_seed1 | quiescence failed: <urlopen error [Errno 111] Connection refused> |
 | 2026-07-19T00:31:55 | S08 | 1 | ci | 900s | inconclusive | 35faaae182c5 | 20260719T000802_S08_seed1 |  |
+| 2026-07-23T18:41:56 | S41 | 1 | dev | 900s | fail | 29c98dcfd05c | 20260723T184127_S41_seed1 |  |
+| 2026-07-23T18:45:41 | S41 | 1 | dev | 900s | pass | 29c98dcfd05c | 20260723T184508_S41_seed1 |  |
+| 2026-07-23T18:49:18 | S41 | 1 | dev | 900s | pass | 29c98dcfd05c | 20260723T184846_S41_seed1 |  |
+| 2026-07-23T18:55:50 | S41 | 1 | full | 900s | pass | 29c98dcfd05c | 20260723T185256_S41_seed1 |  |
