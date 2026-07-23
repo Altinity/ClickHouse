@@ -5,6 +5,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasProbe.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasSentinelProbe.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/StaticDirectoryIterator.h>
 #include <Disks/IDisk.h>
@@ -89,6 +90,12 @@ namespace ContentAddressedSetting
 ///   shadowNamespace/route/classifyDirectory (pure path computation, no pool I/O).
 /// Probe:       existsFile, existsDirectory, existsFileOrDirectory, listDirectory, iterateDirectory,
 ///              isDirectoryEmpty, getStorageObjectsIfExist, liveTreeDirHasChildren, listLiveTreeChildren.
+///              EMPTY-PROOF RULE (Task 9, spec §1 [B3]): on a NON-terminal (Live/read-only) pool, an
+///              empty `listDirectory` answer at a `TableDir`/`DetachedContainer` root additionally runs
+///              `confirmPoolIdentityForEmptyEnumeration` (one authoritative, UNCACHED `_pool_meta` probe)
+///              -- a `KeyAbsent`/`ContainerAbsent`/transport result throws the typed 668 instead of the
+///              empty answer. `iterateDirectory`/`isDirectoryEmpty` inherit it (both funnel through
+///              `listDirectory`). A `Vanished` pool never reaches it (the gate short-circuits `Probe`).
 /// ContentRead: getFileSize, getLastModified, getStorageObjects, getBlobViewPlan, readBlobPayload,
 ///              prepareInManifestRead, tryGetInManifestBytes, getPartManifestBytes.
 /// Write:       adoptPartFromManifest.
@@ -98,6 +105,8 @@ namespace ContentAddressedSetting
 ///   Task 15). store()/partAccess()/poolAccess() are the internal accessors, not public op entries.
 ///   namespaceFilesReadable, stagingKeyPrefix, detachedRefNames, movingRefNames are post-gate helpers
 ///   (their public callers gate first; they reach store() only in the Live case).
+///   confirmPoolIdentityForEmptyEnumeration is a post-gate helper too (the EMPTY-PROOF RULE, Task 9):
+///   listDirectory calls it only after the gate admitted a Probe and only on an empty table-root answer.
 ///
 /// ---- ContentAddressedTransaction (routes through metadata_storage.checkOpAdmitted) ----
 /// Write:  writeFile (and tryCreateWriteBuffer, which funnels into it), createDirectory,
@@ -991,6 +1000,46 @@ bool ContentAddressedMetadataStorage::gcQuiescentForErasureProof() const
     return !snapshot || snapshot->isQuiescent();
 }
 
+void ContentAddressedMetadataStorage::confirmPoolIdentityForEmptyEnumeration(const std::string & path) const
+{
+    /// EMPTY-PROOF RULE (rev.7 spec §1 [B3]). Reached ONLY when `listDirectory` computed an EMPTY listing
+    /// at a `TableDir`/`DetachedContainer` root on a NON-terminal pool -- `checkOpAdmitted` already ran
+    /// (mounted, and NOT a settled `Vanished` state, which would have short-circuited `Probe` to
+    /// `TruthAbsent` before any classification). This is the last silent-empty-load killer: an empty table
+    /// root is exactly what a silently-erased backing looks like, and a read-only pool (no lease, no
+    /// erasure observer) has no other line of defense. So the empty answer is authorized ONLY by an
+    /// AUTHORITATIVE, UNCACHED positive on the pool identity object -- a cached positive never suffices.
+    const Cas::PoolPtr pool = store();   /// Live here (past the gate's Mounted + non-terminal check).
+
+    ++empty_proof_probe_count_for_test;
+    const Cas::SentinelProbeResult probe = empty_proof_probe_override_for_test
+        ? empty_proof_probe_override_for_test()
+        : Cas::probeSentinel(pool->backend(), pool->layout().poolMetaKey());
+
+    switch (probe.outcome)
+    {
+        case Cas::ProbeOutcome::Present:
+            /// The pool identity is authoritatively present -- the empty listing is the truth.
+            return;
+        case Cas::ProbeOutcome::KeyAbsent:
+        case Cas::ProbeOutcome::ContainerAbsent:
+            /// A clean authoritative miss on `_pool_meta`: the backing is (or is being) erased. Refuse
+            /// the empty answer rather than silently attaching an empty table over an erased pool.
+            throw Exception(ErrorCodes::INVALID_STATE,
+                "content-addressed disk '{}' -- pool identity object absent while enumerating '{}' -- "
+                "refusing the empty answer; the backing may be erased",
+                disk_name, path);
+        case Cas::ProbeOutcome::AccessDenied:
+        case Cas::ProbeOutcome::Indeterminate:
+            /// Absence was NEVER established (a transport/permission fault). Fail closed and retryable --
+            /// never promote an unproven probe into an empty answer.
+            throw Exception(ErrorCodes::INVALID_STATE,
+                "content-addressed disk '{}' -- pool identity object could not be confirmed while "
+                "enumerating '{}' (transport or permission fault) -- refusing the empty answer; retry",
+                disk_name, path);
+    }
+}
+
 MetadataTransactionPtr ContentAddressedMetadataStorage::createTransaction()
 {
     checkNotReadOnly("writes");
@@ -1482,6 +1531,11 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
             if (namespaceFilesReadable(ns))
                 for (const auto & name : store()->listNamespaceFiles(ns))
                     addFirstComponent(result, name);
+            /// EMPTY-PROOF RULE (Task 9, spec §1 [B3]): an empty table root is exactly what a
+            /// silently-erased backing looks like -- authorize the empty answer only against an
+            /// authoritative, uncached `_pool_meta` positive (see the helper).
+            if (result.empty())
+                confirmPoolIdentityForEmptyEnumeration(path);
             return toVector(std::move(result));
         }
         case DirShape::DetachedContainer:
@@ -1490,6 +1544,9 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
             std::vector<std::string> result;
             for (const auto & ref : detachedRefNames(dr.r->ns))
                 result.push_back(ref.substr(Cas::kDetachedRefPrefix.size()));
+            /// EMPTY-PROOF RULE (Task 9, spec §1 [B3]): same for an empty detached container root.
+            if (result.empty())
+                confirmPoolIdentityForEmptyEnumeration(path);
             return result;
         }
         case DirShape::MovingContainer:

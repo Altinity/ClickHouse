@@ -10,6 +10,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h>
 #include <Interpreters/Context_fwd.h>
 #include <base/defines.h>
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -442,6 +443,20 @@ public:
     /// (a forced in-flight round => not quiescent) without reaching the pool's erasure-proof observer.
     bool gcQuiescentForTest() const { return gcQuiescentForErasureProof(); }
 
+    /// Test seams for the EMPTY-PROOF RULE (Task 9, spec §1 [B3]). The counter is bumped on every
+    /// authoritative pool-identity probe the empty-proof issues, so a test can assert it fires EXACTLY
+    /// once per EMPTY `TableDir`/`DetachedContainer` enumeration and NEVER on the non-empty hot path,
+    /// a deeper part-dir, or a terminal (`Vanished`) pool. `setEmptyProofProbeOverrideForTest` replaces
+    /// the real backend probe so a test can inject a transport/permission fault (`Indeterminate`/
+    /// `AccessDenied`) deterministically -- the storage builds its own `ObjectStorageBackend` internally,
+    /// so a backend decorator cannot reach it otherwise. Both are inert in production.
+    uint64_t emptyProofProbeCountForTest() const { return empty_proof_probe_count_for_test.load(); }
+    void resetEmptyProofProbeCountForTest() { empty_proof_probe_count_for_test.store(0); }
+    void setEmptyProofProbeOverrideForTest(std::function<Cas::SentinelProbeResult()> fn)
+    {
+        empty_proof_probe_override_for_test = std::move(fn);
+    }
+
     /// Test-only fault-injection/hook seam for `ContentAddressedTransaction::publishStaging`'s
     /// promote/repoint call, keyed by the full `(ns, ref)` routed identity via `PartRefKey::cacheKey()`
     /// (mirrors `CasRefLedger::setRefPreCarveHookForTest`'s no-op-in-production shape) -- a bare ref
@@ -634,6 +649,21 @@ private:
     /// `gc_scheduler` here is safe.
     bool gcQuiescentForErasureProof() const;
 
+    /// EMPTY-PROOF RULE (rev.7 spec §1 [B3]): called by `listDirectory` when a `TableDir`/
+    /// `DetachedContainer` enumeration on a NON-terminal (Live or read-only) pool is about to answer
+    /// empty. "Empty at a table root" is exactly what a silently-erased backing looks like, and a
+    /// read-only pool has no lease/observer to detect that erasure any other way (MergeTree skips both
+    /// directory creation and the `format_version.txt` write on a read-only disk) -- enumeration is its
+    /// ONLY line of defense against ATTACHing an empty table over an erased pool. So before answering
+    /// empty, this confirms the pool identity object (`_pool_meta`) with an AUTHORITATIVE, UNCACHED
+    /// probe: `Present` authorizes the empty answer (the pool is genuinely there and genuinely empty);
+    /// `KeyAbsent`/`ContainerAbsent` throw the typed 668 "backing may be erased"; `AccessDenied`/
+    /// `Indeterminate` throw the typed transient 668 (fail-closed, retryable). NEVER reached on a
+    /// `Vanished` pool -- `checkOpAdmitted`'s `Probe`->`TruthAbsent` short-circuit answers truth-empty
+    /// before any classification runs, so the terminal path never pays the probe. Cost: one extra backend
+    /// HEAD per EMPTY table-root enumeration only (attach/load-time); the non-empty hot path is untouched.
+    void confirmPoolIdentityForEmptyEnumeration(const std::string & path) const;
+
     /// A pool opened as a standalone, UNPUBLISHED view: never touches `cas_store`/`part_access`/
     /// `gc_scheduler`/`mount_state` -- the caller owns it entirely and drops it when done.
     struct PoolView
@@ -683,6 +713,12 @@ private:
     /// production (no test ever arms them); consulted only by `ContentAddressedTransaction::publishStaging`.
     std::unordered_set<std::string> promote_failure_refs_for_test;
     std::unordered_map<std::string, std::function<void()>> after_promote_hooks_for_test;
+
+    /// Backing state for the EMPTY-PROOF RULE `*ForTest` seams (Task 9), declared above. The counter is
+    /// bumped on every empty-proof probe; the override, when set, replaces the real backend probe. Both
+    /// are inert in production (no test ever sets the override; the counter is write-only there).
+    mutable std::atomic<uint64_t> empty_proof_probe_count_for_test{0};
+    std::function<Cas::SentinelProbeResult()> empty_proof_probe_override_for_test;
 };
 
 }
