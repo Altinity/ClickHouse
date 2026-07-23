@@ -11,7 +11,7 @@ Related specs — **all deleted from the tree 2026-07-22; git history holds them
 transferred into the living spec's §9; Parts 2-4/Part 6 rolled back),
 `2026-07-22-cas-disk-lifecycle-automount-design.md` (eject/auto-mount, no code),
 `2026-07-22-cas-disk-self-quiesce-simplification-design.md` (Path B, blocked).
-**The living spec is `2026-07-22-cas-disk-lease-loss-throw-and-stop-verbs-design.md` (rev.6).**
+**The living spec is `2026-07-22-cas-disk-lease-loss-throw-and-stop-verbs-design.md` (rev.8, FORGET-only).**
 
 ---
 
