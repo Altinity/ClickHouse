@@ -105,6 +105,11 @@ For a `+1` edge with `owner_kind == Reserved` whose body GET returns 404:
     dead-build skip (`CasGcDeadPrecommitSkipped` path); an already-materialized body becomes an
     orphan manifest and is reclaimed by the orphan sweep (its active set = committed +
     live-precommit view — a dead/removed reservation drops out).
+- **Orphan-sweep requirement (implementation-must):** the orphan-manifest sweep's active set MUST
+  include **live `Reserved` bindings** exactly like live precommits — otherwise the sweep would
+  reclaim a just-materialized body in the healthy window between the sender's PUT and the
+  receiver's promote. (Dead/removed reservations drop out as above — that is the intended
+  reclamation path, gated on the same watermark facts the dead-build skip uses.)
 - **Promote-peek rule (keeps the hammer for real anomalies):** if the visible log suffix already
   contains a later owner binding for the same manifest id (the receiver promoted), a 404 on the body
   is **provably a store lie** — `promote` required the body — and is treated exactly like today's
