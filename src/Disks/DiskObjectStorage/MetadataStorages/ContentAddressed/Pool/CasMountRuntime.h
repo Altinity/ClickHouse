@@ -220,6 +220,12 @@ public:
     /// and Task 6 may later promote it to `VanishedErased`. Must be called under the caller's remount
     /// serialization (Pool::remount_mutex).
     void enterIdentityLost();
+    /// Test seam: force the lifecycle condition directly to `lc`, bypassing the natural transition
+    /// preconditions (used by the operation-gate tests to pin each class × state cell without driving a
+    /// full remount/erase sequence). For a `Vanished*` value it also latches `vanished_intent`, so the
+    /// forced state is indistinguishable from a naturally-reached one. Never used in production.
+    void setLifecycleForTest(PoolLifecycle lc);
+
     /// One-way transition to a fully-terminal `Vanished` value (spec §3). Publishes the terminal-intent
     /// latch FIRST (so the keeper stops scheduling remounts and the remount loop exits at its next step
     /// boundary), then the state, then ONE WARN + one `CasDataRootVanished` ProfileEvent. Idempotent: the

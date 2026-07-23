@@ -411,6 +411,23 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "retrying a failed content-addressed transaction is not supported");
 
+    /// Operation gate (rev.7 §1). A commit with staged parts to publish is a `Write` (throws typed erased
+    /// on a Vanished disk); a commit with nothing to publish is the DROP/rename path -- its ref mutations
+    /// already applied immediately (`removeRecursive`/`dropNamespace`/`moveDirectory`), so it is a `Remove`
+    /// that no-op-succeeds on a Vanished disk, which is what lets a vanished-disk table's DROP finish.
+    /// Both throw 668 while the backing is uncertain (transient / IdentityLost).
+    const CasOpClass commit_class = parts.empty() ? CasOpClass::Remove : CasOpClass::Write;
+    if (metadata_storage.checkOpAdmitted(commit_class) == CasOpAdmission::TruthAbsent)
+    {
+        /// Vanished + nothing to publish: complete as a no-op so the DROP/rename finishes. There are no
+        /// staged parts to publish and no local staging to keep; run the same idempotent epilogue a
+        /// normal empty commit runs.
+        committed = true;
+        cleanupPendingTempFiles();
+        force_fresh_validated_refs.clear();
+        return;
+    }
+
     /// Publish each staged part. [TXN-ONE-PIPELINE] This is the ONLY place a ref becomes durable — the
     /// tmp->final rename is a pure overlay re-key. Commit
     /// atomicity: there is no multi-ref atomic publish, so a publish that throws after
@@ -748,6 +765,10 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::tryCreateW
 std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
     const std::string & path, size_t buf_size, WriteMode mode, const WriteSettings & settings)
 {
+    /// Write gate (rev.7 §1): the single chokepoint every write buffer (both direct and via
+    /// `tryCreateWriteBuffer`) is created through -- refuse on a Vanished (typed erased) or transient/
+    /// IdentityLost (668) disk before staging any content or opening a verbatim buffer.
+    metadata_storage.checkOpAdmitted(CasOpClass::Write);
     /// Non-part files are VERBATIM namespace files, durable on finalize (no commit involvement -
     /// the disk layer's autocommit contract for them rides exactly this). Append is serviced by
     /// read-modify-rewrite: the existing bytes are carried forward (the MVCC mutation-entry CSN
@@ -931,11 +952,15 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
 
 void ContentAddressedTransaction::createDirectory(const std::string &)
 {
-    /// Object storage has no real directories (mirrors the plain-rewritable transaction).
+    /// Object storage has no real directories (mirrors the plain-rewritable transaction) -- but this is a
+    /// Write: the gate makes it throw typed on a Vanished disk / 668 while uncertain, so a mutation is
+    /// never silently accepted against an erased or unreachable backing (rev.7 §1 previously-no-op site).
+    metadata_storage.checkOpAdmitted(CasOpClass::Write);
 }
 
 void ContentAddressedTransaction::createDirectoryRecursive(const std::string &)
 {
+    metadata_storage.checkOpAdmitted(CasOpClass::Write);
 }
 
 void ContentAddressedTransaction::removeDirectory(const std::string & path)
@@ -948,6 +973,11 @@ void ContentAddressedTransaction::removeDirectory(const std::string & path)
     /// than an in-memory intent log. Recording these as staged intents and applying them at commit would
     /// duplicate that compensation machinery for no correctness gain.
     ///
+    /// Remove gate (rev.7 §1): a Vanished disk answers no-op success (nothing to remove -- truth), so the
+    /// enclosing DROP completes; a transient / IdentityLost disk throws 668 (the DROP re-queues).
+    if (metadata_storage.checkOpAdmitted(CasOpClass::Remove) == CasOpAdmission::TruthAbsent)
+        return;
+
     /// The MergeTree fast-removal path unlinks a part's files one by one (no-ops here) and then
     /// calls removeDirectory(<part>) - the SINGLE authoritative point at which the part's ref must
     /// be unlinked. Part dirs route to dropRef; anything else is a no-op (object
@@ -979,6 +1009,12 @@ void ContentAddressedTransaction::removeRecursive(const std::string & path, cons
     /// Removal = pointer-unlink + deferred GC: only refs and verbatim files go; the shared
     /// blobs/trees are reclaimed by Cas::Gc once unreachable. The predicate gates backing-object
     /// deletion, which CA always defers, so it is intentionally ignored here.
+
+    /// Remove gate (rev.7 §1): a Vanished disk answers no-op success (nothing to remove), so a
+    /// vanished-disk table's DROP -- which reaches here via `removeSharedRecursive` -- completes; a
+    /// transient / IdentityLost disk throws 668 (the DROP re-queues, drains after recovery/FORGET).
+    if (metadata_storage.checkOpAdmitted(CasOpClass::Remove) == CasOpAdmission::TruthAbsent)
+        return;
 
     /// FREEZE shadow shapes first (a shadow table dir also satisfies parseTableUuid).
     if (Cas::isShadowPath(path))
@@ -1057,6 +1093,8 @@ void ContentAddressedTransaction::removeRecursive(const std::string & path, cons
 
 void ContentAddressedTransaction::createHardLink(const std::string & path_from, const std::string & path_to)
 {
+    /// Write gate (rev.7 §1).
+    metadata_storage.checkOpAdmitted(CasOpClass::Write);
     auto src = routeOf(path_from);
     auto dst = routeOf(path_to);
     if (!src || src->file.empty() || !dst || dst->file.empty())
@@ -1116,7 +1154,10 @@ void ContentAddressedTransaction::createHardLink(const std::string & path_from, 
 
 void ContentAddressedTransaction::setLastModified(const std::string &, const Poco::Timestamp &)
 {
-    /// Timestamps are derived for content addressing (the publish stamp), so accept and ignore them.
+    /// Timestamps are derived for content addressing (the publish stamp), so accept and ignore them -- but
+    /// gate as a Write (previously-no-op site, rev.7 §1): never silently accept it on a Vanished/uncertain
+    /// disk.
+    metadata_storage.checkOpAdmitted(CasOpClass::Write);
 }
 
 void ContentAddressedTransaction::chmod(const String &, mode_t)
@@ -1126,11 +1167,16 @@ void ContentAddressedTransaction::chmod(const String &, mode_t)
 
 void ContentAddressedTransaction::setReadOnly(const std::string &)
 {
-    /// Read-only flags have no content-addressed representation — accept and ignore them.
+    /// Read-only flags have no content-addressed representation — accept and ignore them -- but gate as a
+    /// Write (previously-no-op site, rev.7 §1).
+    metadata_storage.checkOpAdmitted(CasOpClass::Write);
 }
 
 void ContentAddressedTransaction::moveDirectory(const std::string & path_from, const std::string & path_to)
 {
+    /// Write gate (rev.7 §1): mutates durable refs immediately -- throw before touching them on a
+    /// Vanished/uncertain disk.
+    metadata_storage.checkOpAdmitted(CasOpClass::Write);
     /// Same call-time-durability-plus-compensation contract as `removeDirectory` above: this mutates
     /// durable refs immediately rather than staging an intent for commit; see the contract note there.
     auto src_p = Cas::parsePartFilePath(path_from);
@@ -1306,6 +1352,8 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
 
 void ContentAddressedTransaction::moveFile(const std::string & path_from, const std::string & path_to)
 {
+    /// Write gate (rev.7 §1). (`replaceFile` delegates here, so its own gate below is defense in depth.)
+    metadata_storage.checkOpAdmitted(CasOpClass::Write);
     /// Verbatim table-level files and loose mountpoint files: physically move the object (the
     /// mutation entry tmp_mutation_N.txt -> mutation_N.txt rename; already durable from its finalize).
     if (!Cas::isPartFilePath(path_from) && !Cas::isPartFilePath(path_to))
@@ -1417,6 +1465,8 @@ void ContentAddressedTransaction::moveFile(const std::string & path_from, const 
 
 void ContentAddressedTransaction::replaceFile(const std::string & path_from, const std::string & path_to)
 {
+    /// Write gate (rev.7 §1): refuse before dropping staged destination state on a Vanished/uncertain disk.
+    metadata_storage.checkOpAdmitted(CasOpClass::Write);
     /// replaceFile = moveFile that overwrites the destination. Drop any staged destination state
     /// first, then delegate (the verbatim branch's putNamespaceFile already overwrites).
     if (auto dst = routeOf(path_to); dst && !dst->file.empty())
@@ -1454,6 +1504,11 @@ void ContentAddressedTransaction::unlinkFile(const std::string & path, bool if_e
     /// `removeVersionMetadata`, a future backfill/repair delete) resolves to one repoint-remove —
     /// this closes the file's former fail-open (a committed content file could never actually be
     /// deleted on its own; this behavior now closes that earlier fail-open.
+    ///
+    /// Remove gate (rev.7 §1): a Vanished disk answers no-op success; a transient / IdentityLost disk
+    /// throws 668.
+    if (metadata_storage.checkOpAdmitted(CasOpClass::Remove) == CasOpAdmission::TruthAbsent)
+        return;
     if (auto r = routeOf(path); r && !r->file.empty())
     {
         auto & st = stagingFor(*r);

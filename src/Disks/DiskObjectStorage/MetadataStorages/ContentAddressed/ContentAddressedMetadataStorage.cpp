@@ -71,6 +71,57 @@ namespace ContentAddressedSetting
     extern const ContentAddressedSettingsUInt64 materialization_grace_ms;
 }
 
+/// ============================================================================================
+/// The method -> operation-class inventory (rev.7 spec §1; the review artifact of Task 8).
+///
+/// EVERY public method of `ContentAddressedMetadataStorage` and `ContentAddressedTransaction` is listed
+/// with the `CasOpClass` it routes through `checkOpAdmitted` (or "Factory" for the never-gated I/O-free
+/// surface). The gate is consulted at the method's entry; `store()`/`partAccess()`/`poolAccess()` keep
+/// their own terminal check (Task 5) as low-level defense, reached only in the `Live` case.
+///
+/// ---- ContentAddressedMetadataStorage ----
+/// Factory (never gated): getType, getPath, supportsChmod, supportsStat, isReadOnly, isContentAddressed,
+///   transactionIsStagingOverlay, supportsAtomicFileWrites, supportsTransactionalMutableFiles,
+///   areBlobPathsRandom, getHardlinkCount, createTransaction (I/O-free -- allocates a txn), getPoolUUID,
+///   serverRootId, scratchPath, stagingBackend, conditionalCopySupported, objectStorage, gcHealth
+///   (non-store()-gated introspection snapshot, spec §3), parseStagingBackend/parsePartFolderValidate/
+///   tryFromDisk (static), checkNotReadOnly, the *ForTest seams, serverPrefix/liveNamespace/
+///   shadowNamespace/route/classifyDirectory (pure path computation, no pool I/O).
+/// Probe:       existsFile, existsDirectory, existsFileOrDirectory, listDirectory, iterateDirectory,
+///              isDirectoryEmpty, getStorageObjectsIfExist, liveTreeDirHasChildren, listLiveTreeChildren.
+/// ContentRead: getFileSize, getLastModified, getStorageObjects, getBlobViewPlan, readBlobPayload,
+///              prepareInManifestRead, tryGetInManifestBytes, getPartManifestBytes.
+/// Write:       adoptPartFromManifest.
+/// Admin:       runOneGcRoundForTest, runGarbageCollectionRoundNow, runGcRebuildNow.
+/// Lifecycle/uncgated drivers (NOT op-gated -- they DRIVE the state): startup, shutdown,
+///   unmountSynchronously, mountExplicitly, runFsckOnDormant (its own Dormant precondition; rewired at
+///   Task 15). store()/partAccess()/poolAccess() are the internal accessors, not public op entries.
+///   namespaceFilesReadable, stagingKeyPrefix, detachedRefNames, movingRefNames are post-gate helpers
+///   (their public callers gate first; they reach store() only in the Live case).
+///
+/// ---- ContentAddressedTransaction (routes through metadata_storage.checkOpAdmitted) ----
+/// Write:  writeFile (and tryCreateWriteBuffer, which funnels into it), createDirectory,
+///         createDirectoryRecursive, createHardLink, moveDirectory, moveFile, replaceFile,
+///         setLastModified, setReadOnly.
+/// Remove: removeDirectory, removeRecursive, unlinkFile.
+/// commit/tryCommit: Remove when there is nothing to publish (parts empty -- the DROP/rename path, which
+///         applied its ref mutations immediately), Write when it must publish staged parts. This is what
+///         lets a vanished-disk table's DROP finish (Remove -> no-op success) while a publishing commit
+///         throws typed erased.
+/// Unsupported (always throw, state-independent -- no gate needed): createMetadataFile,
+///   generateObjectKeyForPath, chmod, truncateFile.
+/// Factory / overlay-only (no committed-pool I/O): supportsChmod, getSubmittedForRemovalBlobs, and the
+///   read-your-writes overlay readers tryGetInFlightStorageObjects/tryReadFileInFlight/
+///   tryGetInFlightFileSize/hasInFlightDirectory/listInFlightDirectory (they read THIS transaction's own
+///   in-memory staging; a vanished-disk transaction has none because its writes threw at writeFile).
+///
+/// Transitional rule (Task 15): a Dormant disk (SYSTEM CONTENT ADDRESSED UNMOUNT) keeps its OLD
+/// benign-absent / not-mounted behavior. The probe surface keeps its landed `if (!isMounted()) return
+/// absent;` guard AHEAD of `checkOpAdmitted`, and the gate's own not-Mounted branch mirrors it -- both
+/// marked [Task 15]. When Task 15 removes `MountState`, those guards and that branch go, leaving the pool
+/// lifecycle as the sole authority.
+/// ============================================================================================
+
 namespace
 {
 
@@ -253,6 +304,10 @@ ContentAddressedMetadataStorage * ContentAddressedMetadataStorage::tryFromDisk(c
 
 void ContentAddressedMetadataStorage::runOneGcRoundForTest()
 {
+    /// Admin class (rev.7 spec §1): refuse on a transient / IdentityLost / Vanished pool (a terminal disk
+    /// throws typed erased; an uncertain one throws 668) before touching the scheduler. The later
+    /// `!cas_store` re-check under `gc_scheduler_mutex` still guards the not-mounted race.
+    checkOpAdmitted(CasOpClass::Admin);
     /// The pacing scheduler must be STABLE across calls: the lease's observation-window steal
     /// protocol compares consecutive observations of the SAME observer (gc_id), so an ad-hoc
     /// scheduler per call would acquire the lease on the first call and then back off forever
@@ -410,6 +465,9 @@ Cas::RoundReport ContentAddressedMetadataStorage::runGarbageCollectionRoundNow()
     if (!gc_enabled)
         throw Exception(ErrorCodes::BAD_ARGUMENTS,
             "Garbage collection is not enabled on this content-addressed disk");
+    /// Admin class (rev.7 spec §1): refuse on a transient / IdentityLost / Vanished pool before touching
+    /// the scheduler -- `SYSTEM CONTENT ADDRESSED GC RUN` reaches here directly.
+    checkOpAdmitted(CasOpClass::Admin);
     /// Mirror runOneGcRoundForTest: a STABLE scheduler instance across calls (the lease's
     /// observation-window steal protocol compares consecutive observations of the same gc_id).
     /// Hold gc_scheduler_mutex for the whole round: a concurrent `shutdown` waits for the round to
@@ -445,6 +503,10 @@ Cas::RebuildReport ContentAddressedMetadataStorage::runGcRebuildNow(bool force) 
     if (!gc_enabled)
         throw Exception(ErrorCodes::BAD_ARGUMENTS,
             "Garbage collection is not enabled on this content-addressed disk");
+    /// Admin class (rev.7 spec §1): refuse on a transient / IdentityLost / Vanished pool. (`store()` below
+    /// already throws on a terminal pool, but not on the merely-transient one -- this closes that gap and
+    /// keeps the refusal uniform with the other GC entry points.)
+    checkOpAdmitted(CasOpClass::Admin);
     /// A one-shot Gc instance is fine here (unlike the scheduler's stable-instance requirement for
     /// the lease's observation-window steal protocol): rebuildBaseline does its own lease
     /// acquire/steal check internally and this command runs exactly one round.
@@ -541,6 +603,13 @@ ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openP
     pool_config.gc_meta_pool_size = gc_meta_pool_size;
     pool_config.materialization_grace_ms = materialization_grace_ms;
     pool_config.event_sink = makeCasEventSink();
+    /// T6 tripwire: wire the real GC-quiescence predicate for the `Vanished(erased)` erasure proof ([D1])
+    /// on the LIVE mount only. The predicate captures `this` and reads `gc_scheduler` lazily (the scheduler
+    /// is created AFTER the pool in `startup()`), returning quiescent when no round is in flight. An
+    /// observe-only (FSCK) view runs no erasure-proof observer and owns no scheduler, so it keeps the
+    /// default (empty => quiescent) rather than pointing at the LIVE disk's scheduler.
+    if (!observe_only)
+        pool_config.gc_quiescent_fn = [this] { return gcQuiescentForErasureProof(); };
 
     PoolView view;
     view.physical_key_prefix = physical_key_prefix_local;
@@ -851,6 +920,72 @@ void ContentAddressedMetadataStorage::checkNotReadOnly(std::string_view what) co
             "Content-addressed disk is opened read-only: {} is rejected", what);
 }
 
+CasOpAdmission ContentAddressedMetadataStorage::checkOpAdmitted(CasOpClass op) const
+{
+    /// `Factory` is never routed here (its call sites are I/O-free and work in every state); a Factory
+    /// arg is a call-site bug. This unreachable path is genuinely unreachable, so the LOGICAL_ERROR never
+    /// constructs (never aborts a debug/ASan build).
+    if (op == CasOpClass::Factory)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "checkOpAdmitted must not be called for the Factory class");
+
+    MountState state;
+    Cas::PoolPtr pool;
+    {
+        std::lock_guard lock(pointer_mutex);
+        state = mount_state;
+        pool = cas_store;
+    }
+
+    /// [Task 15] Transitional MountState gate: the OLD behavior wins for a not-`Mounted` disk. A Dormant/
+    /// Unmounting disk (or the pre-publish/post-shutdown window) has no live pool and the new pool
+    /// lifecycle never moved for it (UNMOUNT does not set the lifecycle), so a `Probe` answers the landed
+    /// benign-absent (mirroring the retained `if (!isMounted()) return absent;` guards on the probe
+    /// surface) and every other class throws "not mounted" exactly as `poolAccess()` does. Removed with
+    /// `MountState` at Task 15, leaving the pool lifecycle below as the sole authority.
+    if (state != MountState::Mounted || !pool)
+    {
+        if (op == CasOpClass::Probe)
+            return CasOpAdmission::TruthAbsent;
+        throwNotMounted(state);
+    }
+
+    /// The rev.7 six-class gate keyed on the pool lifecycle condition (spec §1).
+    const Cas::PoolLifecycle lc = pool->lifecycle();
+    if (lc == Cas::PoolLifecycle::Live)
+        return CasOpAdmission::Proceed;
+
+    if (lc == Cas::PoolLifecycle::TransientNotLive || lc == Cas::PoolLifecycle::IdentityLost)
+        /// Uncertain backing: no class but Factory proceeds. One uniform 668 -- the sub-state distinction
+        /// (a lease blip vs a live erase in flight) is surfaced in system.content_addressed_mounts and the
+        /// one WARN at the transition, not the per-operation error.
+        throw Exception(ErrorCodes::INVALID_STATE,
+            "content-addressed disk '{}' -- mount lease not held; backing may be temporarily unreachable",
+            disk_name);
+
+    /// Terminal `Vanished*`: the truth. `Probe`/`Remove` answer it without touching the pool; the
+    /// content-serving and mutating classes fail loud with the typed per-reason [D5] message. The pool
+    /// owns the canonical message strings (single source), and always throws for a `Vanished` lifecycle.
+    if (op == CasOpClass::Probe || op == CasOpClass::Remove)
+        return CasOpAdmission::TruthAbsent;
+    pool->throwIfLifecycleTerminal();
+    throw Exception(ErrorCodes::LOGICAL_ERROR,
+        "checkOpAdmitted: unreachable -- Vanished pool did not throw for content-addressed disk '{}'", disk_name);
+}
+
+bool ContentAddressedMetadataStorage::gcQuiescentForErasureProof() const
+{
+    /// The `PoolConfig::gc_quiescent_fn` the live mount injects. A null scheduler (GC disabled / read-only /
+    /// observe-only) is quiescent by definition; otherwise defer to the scheduler's own "no round in
+    /// flight" observer. Called ONLY from the pool's remount-thread observer (see the header note on why
+    /// reading `gc_scheduler` here is lifetime-safe).
+    std::shared_ptr<Cas::CasGcScheduler> snapshot;
+    {
+        std::lock_guard lock(pointer_mutex);
+        snapshot = gc_scheduler;
+    }
+    return !snapshot || snapshot->isQuiescent();
+}
+
 MetadataTransactionPtr ContentAddressedMetadataStorage::createTransaction()
 {
     checkNotReadOnly("writes");
@@ -878,6 +1013,10 @@ std::string ContentAddressedMetadataStorage::serverPrefix() const
 
 std::vector<std::string> ContentAddressedMetadataStorage::listLiveTreeChildren(const std::string & path) const
 {
+    /// Probe: a Vanished disk enumerates empty (truth). Its callers (`listDirectory`) already gate, but
+    /// this public helper is gated too so a direct call is truthful.
+    if (checkOpAdmitted(CasOpClass::Probe) == CasOpAdmission::TruthAbsent)
+        return {};
     const std::string canonical = canonicalDiskPath(path);
     const std::string scope = serverPrefix() + "/" + (canonical.empty() ? "" : canonical + "/");
     std::unordered_set<std::string> result;
@@ -888,6 +1027,10 @@ std::vector<std::string> ContentAddressedMetadataStorage::listLiveTreeChildren(c
 
 bool ContentAddressedMetadataStorage::liveTreeDirHasChildren(const std::string & path) const
 {
+    /// Probe gate FIRST, ahead of the hardcoded disk-root short-circuit below (the rev.7 offender): on a
+    /// Vanished disk even the disk root reads absent (truth), never the unconditional `true`.
+    if (checkOpAdmitted(CasOpClass::Probe) == CasOpAdmission::TruthAbsent)
+        return false;
     const std::string canonical = canonicalDiskPath(path);
     /// The disk root always exists; otherwise a non-empty server-root-scoped mirrored LIST is the signal.
     if (canonical.empty())
@@ -989,8 +1132,11 @@ std::vector<std::string> ContentAddressedMetadataStorage::movingRefNames(const C
 
 bool ContentAddressedMetadataStorage::existsFile(const std::string & path) const
 {
-    /// [Task 8a] A not-Mounted disk answers this read-only probe as absent, before any `store()`.
+    /// [Task 15] A not-Mounted (Dormant) disk answers this read-only probe as absent, before any `store()`.
     if (!isMounted())
+        return false;
+    /// Probe gate (rev.7 §1): real while live, throws while uncertain, truthfully absent once Vanished.
+    if (checkOpAdmitted(CasOpClass::Probe) == CasOpAdmission::TruthAbsent)
         return false;
     if (!Cas::isPartFilePath(path))
     {
@@ -1119,8 +1265,10 @@ ContentAddressedMetadataStorage::DirRoute ContentAddressedMetadataStorage::class
 
 bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) const
 {
-    /// [Task 8a] A not-Mounted disk answers this read-only probe as absent, before any `store()`.
+    /// [Task 15] A not-Mounted (Dormant) disk answers this read-only probe as absent, before any `store()`.
     if (!isMounted())
+        return false;
+    if (checkOpAdmitted(CasOpClass::Probe) == CasOpAdmission::TruthAbsent)
         return false;
     const DirRoute dr = classifyDirectory(path);
     switch (dr.shape)
@@ -1189,8 +1337,10 @@ bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) 
 
 bool ContentAddressedMetadataStorage::existsFileOrDirectory(const std::string & path) const
 {
-    /// [Task 8a] A not-Mounted disk answers this read-only probe as absent, before any `store()`.
+    /// [Task 15] A not-Mounted (Dormant) disk answers this read-only probe as absent, before any `store()`.
     if (!isMounted())
+        return false;
+    if (checkOpAdmitted(CasOpClass::Probe) == CasOpAdmission::TruthAbsent)
         return false;
     if (Cas::isPartFilePath(path))
     {
@@ -1209,6 +1359,9 @@ bool ContentAddressedMetadataStorage::existsFileOrDirectory(const std::string & 
 
 uint64_t ContentAddressedMetadataStorage::getFileSize(const std::string & path) const
 {
+    /// ContentRead: a size query resolves a specific file; on a Vanished disk it fails loud with the typed
+    /// error rather than silent-absent (never let a reader mistake erased backing for "file not there").
+    checkOpAdmitted(CasOpClass::ContentRead);
     if (!Cas::isPartFilePath(path))
     {
         if (auto bytes = tryGetInManifestBytes(path))   /// verbatim table-level file
@@ -1235,6 +1388,8 @@ uint64_t ContentAddressedMetadataStorage::getFileSize(const std::string & path) 
 
 Poco::Timestamp ContentAddressedMetadataStorage::getLastModified(const std::string & path) const
 {
+    /// ContentRead: resolves a specific part's stamp; loud typed error on a Vanished disk.
+    checkOpAdmitted(CasOpClass::ContentRead);
     /// Timestamps are DERIVED for content addressing: the part's publish wall-clock, stamped by
     /// the transaction into the typed `RefPayload.published_at_ms` field (epoch milliseconds).
     /// Every shape (part dir, detached part dir, projection dir, part file) reports its part's
@@ -1265,8 +1420,10 @@ Poco::Timestamp ContentAddressedMetadataStorage::getLastModified(const std::stri
 
 std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const std::string & path) const
 {
-    /// [Task 8a] A not-Mounted disk enumerates as empty, before any `store()`.
+    /// [Task 15] A not-Mounted (Dormant) disk enumerates as empty, before any `store()`.
     if (!isMounted())
+        return {};
+    if (checkOpAdmitted(CasOpClass::Probe) == CasOpAdmission::TruthAbsent)
         return {};
     const DirRoute dr = classifyDirectory(path);
     switch (dr.shape)
@@ -1375,9 +1532,11 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
 
 DirectoryIteratorPtr ContentAddressedMetadataStorage::iterateDirectory(const std::string & path) const
 {
-    /// [Task 8a] A not-Mounted disk iterates as empty, before any `store()` — the SAME empty
+    /// [Task 15] A not-Mounted (Dormant) disk iterates as empty, before any `store()` — the SAME empty
     /// `StaticDirectoryIterator` the mounted path produces for a directory with no children.
     if (!isMounted())
+        return std::make_unique<StaticDirectoryIterator>(std::vector<fs::path>{});
+    if (checkOpAdmitted(CasOpClass::Probe) == CasOpAdmission::TruthAbsent)
         return std::make_unique<StaticDirectoryIterator>(std::vector<fs::path>{});
     /// Mirror MetadataStorageFromPlainObjectStorage: iterateDirectory includes the path.
     auto names = listDirectory(path);
@@ -1390,8 +1549,12 @@ DirectoryIteratorPtr ContentAddressedMetadataStorage::iterateDirectory(const std
 
 bool ContentAddressedMetadataStorage::isDirectoryEmpty(const std::string & path) const
 {
-    /// [Task 8a] A not-Mounted disk reports every directory empty, before any `store()`.
+    /// [Task 15] A not-Mounted (Dormant) disk reports every directory empty, before any `store()`.
     if (!isMounted())
+        return true;
+    /// A Vanished disk reports every directory empty too (truth): the ref-unlink removal path then
+    /// proceeds, letting a vanished-disk table's DROP complete rather than throwing CANNOT_RMDIR.
+    if (checkOpAdmitted(CasOpClass::Probe) == CasOpAdmission::TruthAbsent)
         return true;
     /// A part directory's files are virtual (derived from the tree): report it EMPTY so
     /// DiskObjectStorage::removeDirectory proceeds straight to the ref-unlink instead of throwing
@@ -1410,6 +1573,8 @@ bool ContentAddressedMetadataStorage::isDirectoryEmpty(const std::string & path)
 
 StoredObjects ContentAddressedMetadataStorage::getStorageObjects(const std::string & path) const
 {
+    /// ContentRead: resolves an object; loud typed error on a Vanished disk (never silent-empty).
+    checkOpAdmitted(CasOpClass::ContentRead);
     /// In-manifest bytes (mutable per-part files, inline entries, verbatim namespace files) have
     /// no object of their own: DiskObjectStorage::prepareRead serves them via tryGetInManifestBytes
     /// BEFORE asking for storage objects. The sized empty-key placeholder below keeps size-only
@@ -1458,9 +1623,13 @@ StoredObjects ContentAddressedMetadataStorage::getStorageObjects(const std::stri
 
 std::optional<StoredObjects> ContentAddressedMetadataStorage::getStorageObjectsIfExist(const std::string & path) const
 {
-    /// [Task 8a] A not-Mounted disk answers this read-only "if exists" probe as absent, before any
-    /// `store()`. The non-`IfExist` `getStorageObjects` stays fail-close (still throws).
+    /// [Task 15] A not-Mounted (Dormant) disk answers this read-only "if exists" probe as absent, before
+    /// any `store()`. The non-`IfExist` `getStorageObjects` stays fail-close (still throws).
     if (!isMounted())
+        return std::nullopt;
+    /// A Vanished disk answers absent (truth). Probe first so the non-part `getStorageObjects` fallback
+    /// below (ContentRead) is never reached on a Vanished disk.
+    if (checkOpAdmitted(CasOpClass::Probe) == CasOpAdmission::TruthAbsent)
         return std::nullopt;
     /// Non-part shapes (verbatim table files, loose mountpoint objects) are rare paths — the
     /// generic two-step is fine for them.
@@ -1493,21 +1662,17 @@ std::optional<StoredObjects> ContentAddressedMetadataStorage::getStorageObjectsI
 
 std::optional<String> ContentAddressedMetadataStorage::tryGetInManifestBytes(const std::string & path) const
 {
-    /// This site is deliberately NON-THROWING: `DiskObjectStorage::prepareRead`/`getStorageObjects`
-    /// call it speculatively before falling back to a real storage-object lookup, and both already
-    /// treat "not in-manifest" (`std::nullopt`) as a normal outcome. Unlike every other caller of
-    /// `poolAccess()`, an unmounted disk here must also read as `std::nullopt`, not propagate
-    /// `INVALID_STATE` -- so wrap the ONE snapshot acquisition in a try/catch instead of the manual
-    /// unchecked `cas_store` copy this used to take on its own.
-    PoolAccessSnapshot snap;
-    try
-    {
-        snap = poolAccess();
-    }
-    catch (const Exception &)
-    {
+    /// Speculative in-manifest probe: `DiskObjectStorage::prepareRead`/`getStorageObjects` call it before
+    /// falling back to a real storage-object lookup, and both treat "not in-manifest" (`std::nullopt`) as a
+    /// normal outcome. [Task 15] A not-Mounted (Dormant) disk answers `std::nullopt` (benign), like the
+    /// probe surface. But this is a ContentRead: a Mounted disk in a terminal/uncertain lifecycle must
+    /// PROPAGATE the typed 668 rather than convert it into a silent-absent `std::nullopt` -- so the gate
+    /// REPLACES the old catch-all that swallowed `poolAccess()`'s `INVALID_STATE` (which had hidden an
+    /// erased/replaced/transient backing behind a FILE_DOESNT_EXIST-shaped answer).
+    if (!isMounted())
         return std::nullopt;
-    }
+    checkOpAdmitted(CasOpClass::ContentRead);
+    const PoolAccessSnapshot snap = poolAccess();
 
     if (!Cas::isPartFilePath(path))
     {
@@ -1554,6 +1719,9 @@ bool ContentAddressedMetadataStorage::prepareInManifestRead(
 std::optional<ContentAddressedMetadataStorage::BlobViewPlan> ContentAddressedMetadataStorage::getBlobViewPlan(
     const std::string & path) const
 {
+    /// ContentRead: resolves a blob-backed path to its physical window; loud typed error on a Vanished
+    /// disk rather than a silent `std::nullopt` (which a reader would take as "not blob-backed").
+    checkOpAdmitted(CasOpClass::ContentRead);
     if (!Cas::isPartFilePath(path))
         return std::nullopt;
     auto p = Cas::parsePartFilePath(path);
@@ -1588,6 +1756,9 @@ std::optional<ContentAddressedMetadataStorage::BlobViewPlan> ContentAddressedMet
 std::unique_ptr<ReadBufferFromFileBase> ContentAddressedMetadataStorage::readBlobPayload(
     const Cas::BlobLocation & location, const std::string & path, const ReadSettings & settings) const
 {
+    /// ContentRead: the actual byte read; loud typed error on a Vanished disk instead of a raw backend
+    /// "no such key" from the erased object.
+    checkOpAdmitted(CasOpClass::ContentRead);
     auto impl = object_storage->readObject(
         StoredObject(physicalKey(location.key), path, location.offset + location.length), settings);
     return std::make_unique<ReadBufferFromFileView>(
@@ -1604,6 +1775,8 @@ std::optional<String> ContentAddressedMetadataStorage::getPartManifestBytes(cons
     /// it canonically. nullopt when the path is not a committed content-addressed part here (no ref =>
     /// no relink offer; the sender streams bytes). A live ref to a missing/corrupt manifest throws
     /// (INV-NO-DANGLE surfaced, never substituted) — the same fail-loud contract as partAccess()->getView.
+    /// ContentRead: reading a committed manifest; loud typed error on a Vanished disk.
+    checkOpAdmitted(CasOpClass::ContentRead);
     auto p = Cas::parsePartFilePath(part_path);
     if (!p)
         return std::nullopt;
@@ -1627,6 +1800,8 @@ bool ContentAddressedMetadataStorage::adoptPartFromManifest(
     const String & table_uuid, const String & part_name, const String & manifest_bytes)
 {
     checkNotReadOnly("adoptPartFromManifest (interserver relink receiver)");
+    /// Write class: publishing a receiver-local ref; throws typed on a Vanished disk, 668 while uncertain.
+    checkOpAdmitted(CasOpClass::Write);
 
     /// Receiver side. Sender identity is non-authoritative: we ignore the decoded
     /// ManifestRef, root_namespace_id and payload_digest, and use ONLY the entries. We run a normal

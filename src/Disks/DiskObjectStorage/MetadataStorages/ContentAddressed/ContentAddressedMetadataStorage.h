@@ -48,6 +48,45 @@ enum class StagingBackend
 namespace DB
 {
 
+/// The SIX operation classes the central `ContentAddressedMetadataStorage::checkOpAdmitted` gate keys on
+/// (rev.7 spec §1). Every public metadata/transaction entry declares its class so a single place decides
+/// what happens per pool-lifecycle condition:
+///   - `Factory`     — I/O-free construction / capability / introspection (`createTransaction`, the
+///                     `getType`/`getPath`/capability getters, `gcHealth`, the lifecycle snapshot). NEVER
+///                     gated: it works in every state. Such call sites do not invoke `checkOpAdmitted`.
+///   - `Probe`       — existence / enumeration (`existsFile`/`existsDirectory`/`listDirectory`/
+///                     `iterateDirectory`/`isDirectoryEmpty`/`getStorageObjectsIfExist`). Answers the
+///                     truth: real while live, throws while uncertain, absent/empty once `Vanished`.
+///   - `ContentRead` — resolving/serving bytes or per-file metadata (`getStorageObjects`/`getFileSize`/
+///                     `getLastModified`/`getBlobViewPlan`/`readBlobPayload`/`getPartManifestBytes`/
+///                     `tryGetInManifestBytes`/`prepareInManifestRead`). Never silent-absent on `Vanished`
+///                     — a loud typed error instead.
+///   - `Write`       — create / write / rename, INCLUDING the previously-no-op sites and a publishing
+///                     `commit`. Throws typed on `Vanished`.
+///   - `Remove`      — ref/file removal (`removeRecursive`/`removeDirectory`/`unlinkFile`, and an
+///                     empty/pure-remove `commit`). No-op SUCCESS on `Vanished` so a vanished-disk table's
+///                     `DROP` completes.
+///   - `Admin`       — `store()`-reaching admin + GC round entry points.
+enum class CasOpClass : uint8_t
+{
+    Factory,
+    Probe,
+    ContentRead,
+    Write,
+    Remove,
+    Admin,
+};
+
+/// The disposition `checkOpAdmitted` returns for the classes that have a truthful short-circuit answer in
+/// the terminal `Vanished` state (Probe / Remove). `Proceed` means run the operation normally against the
+/// live pool; `TruthAbsent` means answer the truth WITHOUT touching the pool (absent/empty for a Probe,
+/// no-op success for a Remove). Every other outcome is a throw, so a caller only ever sees these two.
+enum class CasOpAdmission : uint8_t
+{
+    Proceed,
+    TruthAbsent,
+};
+
 /// Adapts ClickHouse's `IMetadataStorage` path-based interface to the content-addressed pool.
 ///
 /// The class owns the pool and its cached part-folder facade for the lifetime of an opened disk. It
@@ -154,6 +193,23 @@ public:
     /// Fail-close gate shared by every mutating entry point (transactions, GC round, GC rebuild,
     /// pool-member decommission): an observe-only (`<readonly>`) disk must reject them all.
     void checkNotReadOnly(std::string_view what) const;
+
+    /// THE central six-class operation gate (rev.7 spec §1), consulted at EVERY public metadata/
+    /// transaction entry (see the `CasOpClass` doc above and the method->class inventory at the top of
+    /// the .cpp). Given `op`'s class it inspects the pool lifecycle ONCE and decides:
+    ///   - `Live`                            -> `Proceed` for every class.
+    ///   - not `Mounted` (Dormant/Unmounting, transitional until Task 15) -> `Probe` answers
+    ///     `TruthAbsent` (the OLD benign-absent behavior a Dormant disk kept); every other class throws
+    ///     "not mounted".
+    ///   - `TransientNotLive` / `IdentityLost` -> throws 668 for every class but `Factory` (uncertain
+    ///     backing; the sub-state distinction is surfaced in `system.content_addressed_mounts`, not the
+    ///     op error).
+    ///   - `Vanished*` -> `Probe`/`Remove` answer `TruthAbsent` (absent-empty / no-op success);
+    ///     `ContentRead`/`Write`/`Admin` throw the typed per-reason [D5] message (via
+    ///     `Pool::throwIfLifecycleTerminal`, the single home of those strings).
+    /// `Factory` is never passed here. Public because `ContentAddressedTransaction` funnels its own
+    /// mutating entries through it.
+    CasOpAdmission checkOpAdmitted(CasOpClass op) const;
 
     /// Content-addressed transactions are eager staging overlays: each mutating disk-transaction
     /// method reaches the metadata transaction immediately rather than entering the FIFO queue.
@@ -381,6 +437,11 @@ public:
     /// dispatch order directly.
     DirRoute classifyDirectoryForTest(const std::string & path) const { return classifyDirectory(path); }
 
+    /// Test seam: the value of the injected `gc_quiescent_fn` predicate right now (see
+    /// `gcQuiescentForErasureProof`) -- lets the gate tests assert the wiring reflects the real scheduler
+    /// (a forced in-flight round => not quiescent) without reaching the pool's erasure-proof observer.
+    bool gcQuiescentForTest() const { return gcQuiescentForErasureProof(); }
+
     /// Test-only fault-injection/hook seam for `ContentAddressedTransaction::publishStaging`'s
     /// promote/repoint call, keyed by the full `(ns, ref)` routed identity via `PartRefKey::cacheKey()`
     /// (mirrors `CasRefLedger::setRefPreCarveHookForTest`'s no-op-in-production shape) -- a bare ref
@@ -563,6 +624,15 @@ private:
     /// keeps those CA-agnostic sweeps from wedging while any CA disk is unmounted. Content/size/mutation
     /// entry points deliberately do NOT consult this and stay fail-close (they still throw).
     bool isMounted() const;
+
+    /// The `PoolConfig::gc_quiescent_fn` predicate this storage injects into its live mount (T6 tripwire):
+    /// TRUE iff GC is provably quiescent for the `Vanished(erased)` erasure proof ([D1], spec §2) -- no GC
+    /// scheduler, or the scheduler reports no round in flight (`CasGcScheduler::isQuiescent`). The injected
+    /// lambda captures `this` and calls this under `pointer_mutex`; it is invoked ONLY from the pool's own
+    /// remount-thread observer, which is joined before this storage tears down its members (production
+    /// always `shutdown()`s first; the unit tests that reach here never spawn that thread), so reading
+    /// `gc_scheduler` here is safe.
+    bool gcQuiescentForErasureProof() const;
 
     /// A pool opened as a standalone, UNPUBLISHED view: never touches `cas_store`/`part_access`/
     /// `gc_scheduler`/`mount_state` -- the caller owns it entirely and drops it when done.

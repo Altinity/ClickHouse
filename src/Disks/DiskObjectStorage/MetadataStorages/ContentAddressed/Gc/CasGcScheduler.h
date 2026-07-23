@@ -98,6 +98,26 @@ public:
     /// directly from the store.
     GcHealth gcHealth() const;
 
+    /// Whether GC is quiescent for the `Vanished(erased)` erasure proof ([D1], spec §2): TRUE iff NO
+    /// round is currently in flight on this scheduler. This is the per-sample "no GC round can land a
+    /// durable `gc/state`/heartbeat write between this LIST sample and the next" signal the metadata
+    /// storage feeds into `PoolConfig::gc_quiescent_fn`.
+    ///
+    /// It deliberately does NOT also require the scheduler THREAD to have exited: the erasure proof is
+    /// reached from `IdentityLost`, where the pool's own writers are stopped but the GC scheduler is
+    /// still alive (its rounds now fail-closed on the lost write fence, [C2], so they land nothing). The
+    /// scheduler only exits once the pool is fully `Vanished` — the proof's OUTPUT, not a precondition —
+    /// so requiring "thread exited" here would make the natural proof unreachable. The scheduler-exit
+    /// half of [D1] is instead covered by the proof's minimum-grace gate (which by spec §3 exceeds GC's
+    /// bounded round + next-tick exit latency); this predicate adds the sharp per-sample "no round mid
+    /// flight" half that a pure timing argument cannot itself guarantee. An in-flight round resets the
+    /// proof's empty-sample streak, so the proof concludes only across samples with no round in flight.
+    bool isQuiescent() const { return !round_in_flight.load(std::memory_order_acquire); }
+
+    /// Test seam: force the in-flight-round flag `isQuiescent` reads, so a test can drive
+    /// "running round => not quiescent" without spinning up a real round against a live backend.
+    void setRoundInFlightForTest(bool v) { round_in_flight.store(v, std::memory_order_release); }
+
 private:
     /// Waits for the configured interval, runs scheduled rounds while the scheduler is active, and
     /// logs exceptions before continuing with the next tick. The round lock serializes this worker
@@ -148,6 +168,11 @@ private:
     /// durable lease remains the authority, and a failed round clears the hint before retrying.
     std::atomic<bool> i_am_leader{false};
     ThreadFromGlobalPool hb_thread;
+
+    /// Set true for the whole body of one round (`runRoundLogged`, held across the `gc_round_mutex`
+    /// critical section a scheduled or manual round runs under) and cleared when it returns, on the
+    /// success AND exception paths. Read by `isQuiescent` for the `Vanished(erased)` erasure proof.
+    std::atomic<bool> round_in_flight{false};
 
     /// Cumulative condemned entries minus exact-token deletes completed by this scheduler while it
     /// led. It is an approximate health gauge, not durable GC state.

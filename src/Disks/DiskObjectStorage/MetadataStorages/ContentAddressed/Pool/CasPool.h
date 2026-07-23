@@ -365,6 +365,12 @@ public:
     /// answers truth-absent on removes/enumeration — is Task 8; this covers only the terminal states.
     void throwIfLifecycleTerminal() const;
 
+    /// Test seam: force the pool lifecycle condition directly to `lc` (see
+    /// `CasMountRuntime::setLifecycleForTest`). Lets the operation-gate tests pin each class x state cell
+    /// on a metadata-storage-owned pool without driving a full remount/erase sequence. Never used in
+    /// production.
+    void setLifecycleForTest(PoolLifecycle lc) { mount_runtime.setLifecycleForTest(lc); }
+
     /// ---- write side ----
     PartWriteTxnPtr beginPartWrite(PartWriteInfo info);                          /// W-HEARTBEAT durable before return
     /// Remove a build_seq from the active set; idempotent (safe from publish/abandon/dtor). Public

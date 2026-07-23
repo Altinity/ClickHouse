@@ -259,6 +259,18 @@ bool CasMountRuntime::isVanished() const
         || s == PoolLifecycle::VanishedForgotten;
 }
 
+void CasMountRuntime::setLifecycleForTest(PoolLifecycle lc)
+{
+    /// Direct store, no precondition — the test harness pins an exact cell of the class × state table.
+    /// A `Vanished*` value also latches `vanished_intent` so the forced terminal state matches what a
+    /// natural `enterVanished` would leave behind (its truth semantics never depend on how it was reached).
+    pool_lifecycle.store(lc, std::memory_order_release);
+    if (lc == PoolLifecycle::VanishedErased
+        || lc == PoolLifecycle::VanishedReplaced
+        || lc == PoolLifecycle::VanishedForgotten)
+        vanished_intent.store(true, std::memory_order_release);
+}
+
 void CasMountRuntime::noteLeaseLost()
 {
     /// `Live -> TransientNotLive`, and nothing else. A compare-exchange FROM `Live` leaves every other

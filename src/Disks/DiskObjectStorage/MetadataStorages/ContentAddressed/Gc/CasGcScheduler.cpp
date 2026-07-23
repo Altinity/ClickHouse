@@ -8,6 +8,7 @@
 #include <Common/logger_useful.h>
 #include <Common/setThreadName.h>
 #include <Common/thread_local_rng.h>
+#include <base/scope_guard.h>
 #include <algorithm>
 #include <optional>
 
@@ -103,6 +104,13 @@ Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & round_gc, GcRoundLogRe
                                                  std::function<void()> on_lease_acquired, bool allow_steal)
 {
     using Rec = GcRoundLogRecord;
+
+    /// Mark a round in flight for the whole body (success AND exception paths) so the `Vanished(erased)`
+    /// erasure proof's `gc_quiescent_fn` never samples an empty prefix while a round could still land a
+    /// durable `gc/state`/heartbeat write. See `isQuiescent`.
+    round_in_flight.store(true, std::memory_order_release);
+    SCOPE_EXIT({ round_in_flight.store(false, std::memory_order_release); });
+
     /// Best-effort: the table row must never break GC. A throwing sink is swallowed.
     auto emit = [&](const Rec & r)
     {
