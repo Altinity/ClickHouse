@@ -2569,9 +2569,9 @@ void InterpreterSystemQuery::contentAddressedMount(const String & disk_name)
 
 BlockIO InterpreterSystemQuery::runContentAddressedFsck(const String & disk_name)
 {
-    /// Dormant-only: a live mount stays serving normal traffic; FSCK requires the operator to
-    /// `SYSTEM CONTENT ADDRESSED UNMOUNT` first (quiesced pool). The disk is REQUIRED, enforced by
-    /// the parser -- there is no fan-out form.
+    /// FSCK runs on a RUNNING disk (rev.8): the scan is read-only and revalidates every ref-walk finding
+    /// against a fresh authoritative read, so it needs no quiesce. A DORMANT (UNMOUNTed) disk is still
+    /// accepted transitionally (Task 15). The disk is REQUIRED, enforced by the parser -- no fan-out form.
     if (disk_name.empty())
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "SYSTEM CONTENT ADDRESSED FSCK requires an explicit disk name");
 
@@ -2580,7 +2580,7 @@ BlockIO InterpreterSystemQuery::runContentAddressedFsck(const String & disk_name
     if (!ca)
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Disk '{}' is not a content-addressed disk", disk_name);
 
-    const Cas::FsckReport rep = ca->runFsckOnDormant(/* detail= */ false);   /// summary only (no DETAIL keyword yet)
+    const Cas::FsckReport rep = ca->runFsckNow(/* detail= */ false);   /// summary only (no DETAIL keyword yet)
 
     ColumnsDescription columns = contentAddressedFsckColumns();
     Block sample_block;

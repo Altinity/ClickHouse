@@ -142,6 +142,38 @@ bool blobStillReferenced(Pool & store, const Layout & layout,
     return false;   /// every label re-resolved away (re-published or dropped) — a stale-walk artifact
 }
 
+/// The manifest sibling of the `blobStillReferenced` recheck above. The ref-walk captures each committed
+/// `(ref_name -> manifest_ref)` from a FRESH per-namespace recovery, but the `backend.get(mkey)` that
+/// confirms the manifest body runs LATER in the same (possibly long) namespace loop. A ref republished to
+/// a DIFFERENT manifest — or DROPPED — in that window, combined with a legitimate GC delete of the OLD
+/// manifest body, makes the stale captured row look like a committed ref over a missing manifest (a
+/// "phantom dangling manifest"), the same dishonest-oracle failure `blobStillReferenced` kills for blobs.
+///
+/// Before counting a missing manifest body as `Dangling`, re-resolve the EXACT ref from a FRESH
+/// authoritative recovery (`recoverRefTable`, never the walk's captured row) and check whether the CURRENT
+/// committed row still names THIS exact manifest key. Only a current ref over the SAME still-missing
+/// manifest is a real dangle. Fails CLOSED on any ambiguity (a throw, a corrupt table): treated as "still
+/// referenced", the original conservative verdict — the fix can only SHRINK false positives, never hide a
+/// real loss.
+bool manifestStillReferenced(Backend & backend, const Layout & layout, const RootNamespace & ns,
+                             const String & ref_name, const String & mkey, const Deadline & deadline)
+{
+    checkDeadline(deadline, "re-resolving ref at missing-manifest");
+    try
+    {
+        const RefTableState table = recoverRefTable(backend, layout, ns);
+        const auto rit = table.getCommitted().find(ref_name);
+        if (rit == table.getCommitted().end())
+            return false;   /// the ref was DROPPED since the walk — no longer a committed owner
+        /// A republish moved the ref to a different manifest key: this old key is no longer owned.
+        return layout.manifestKey(ManifestId{ns, rit->second.manifest_ref}) == mkey;
+    }
+    catch (...)
+    {
+        return true;   /// cannot confirm the ref moved away — keep the conservative verdict
+    }
+}
+
 /// For the newest published snapshot `X` of `ns`, independently reconstruct
 /// the table state AT `X` from an EARLIER base (the greatest snapshot below `X`, or the empty state) plus
 /// the surviving logs in `(base, X]`, re-encode it deterministically, and byte-compare to the published
@@ -290,15 +322,27 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
             const auto got = backend.get(mkey);
             if (!got)
             {
-                /// A committed ref naming a missing manifest body — INV-NO-DANGLE surfaced (error).
-                ++report.dangling;
-                FsckObject o;
-                o.key = mkey;
-                o.kind = ObjectKind::Blob;   /// manifests have no ObjectKind; reuse Blob as the generic kind
-                o.size = 0;
-                o.cls = FsckClass::Dangling;
-                o.reachable_from = {label};
-                report.objects.push_back(std::move(o));
+                /// A committed ref naming a missing manifest body would be an INV-NO-DANGLE violation —
+                /// but the per-ref GET runs later than the namespace's ref recovery, so a stale captured
+                /// row plus a legitimate GC delete of a since-superseded manifest can masquerade as one,
+                /// and a bare GET can lag a present object. Revalidate exactly like the blob `Dangling`
+                /// recheck below: HEAD the exact object AND re-resolve the exact ref freshly. Count the
+                /// dangle ONLY when the exact object is HEAD-absent AND a CURRENT ref still names THIS
+                /// exact manifest — otherwise it is LIST/GET lag or a phantom stale-row, never a loss.
+                if (!backend.head(mkey).exists
+                    && manifestStillReferenced(backend, layout, ns, ref_name, mkey, deadline))
+                {
+                    ++report.dangling;
+                    FsckObject o;
+                    o.key = mkey;
+                    o.kind = ObjectKind::Blob;   /// manifests have no ObjectKind; reuse Blob as the generic kind
+                    o.size = 0;
+                    o.cls = FsckClass::Dangling;
+                    o.reachable_from = {label};
+                    report.objects.push_back(std::move(o));
+                }
+                /// A present object (GET lag) or a ref that moved away (stale-walk artifact) is not a
+                /// dangle; the manifest's blobs are re-walked under the ref's CURRENT manifest elsewhere.
                 ++refs_walked;
                 continue;
             }

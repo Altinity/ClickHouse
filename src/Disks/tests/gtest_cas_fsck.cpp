@@ -6,10 +6,19 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
 #include "cas_test_helpers.h"
 
+#include <filesystem>
 #include <functional>
 #include <mutex>
+#include <optional>
+
+namespace DB::ErrorCodes
+{
+extern const int INVALID_STATE;
+}
 
 using namespace DB::Cas;
 using namespace DB::Cas::tests;
@@ -59,6 +68,44 @@ public:
 private:
     std::mutex arm_mutex;
     String armed_prefix;
+    std::function<void()> pending_mutation;
+};
+
+/// Companion to `RepublishOnListBackend` for the MANIFEST phantom-dangle race: the ref-walk's
+/// per-namespace recovery captures each committed `(ref -> manifest)` minutes before the per-ref
+/// `backend.get(mkey)` that confirms the manifest body. This backend fires an injected mutation the
+/// FIRST time `get` is called for the armed manifest key — strictly AFTER the walk captured its (now
+/// stale) row and AT the GET that would otherwise read the manifest — reproducing "ref republished/
+/// dropped + old manifest legitimately GC-deleted" deterministically, with no real timing.
+class MutateOnFirstGetBackend : public InMemoryBackend
+{
+public:
+    void armOnFirstGet(String key, std::function<void()> mutation)
+    {
+        std::lock_guard<std::mutex> lock(arm_mutex);
+        armed_key = std::move(key);
+        pending_mutation = std::move(mutation);
+    }
+
+    std::optional<GetResult> get(const String & key, Range range) override
+    {
+        std::function<void()> to_run;
+        {
+            std::lock_guard<std::mutex> lock(arm_mutex);
+            if (pending_mutation && key == armed_key)
+            {
+                to_run = std::move(pending_mutation);
+                pending_mutation = nullptr;
+            }
+        }
+        if (to_run)
+            to_run();
+        return InMemoryBackend::get(key, range);
+    }
+
+private:
+    std::mutex arm_mutex;
+    String armed_key;
     std::function<void()> pending_mutation;
 };
 }
@@ -211,10 +258,13 @@ TEST(CasFsck, ForeignBlobClassifiesUnaccounted)
     EXPECT_EQ(rep.pending_gc, 0u);
 }
 
-/// A `.meta` descriptor whose body is missing is an INV-META-BODY violation (meta_without_body),
-/// NOT a `dangling` (nothing referenced it) and NOT one of the present-but-unreferenced blob
-/// pipeline classes (the `.meta` key must be excluded from body classification entirely).
-TEST(CasFsck, MetaWithoutBodyIsFlagged)
+/// A `.meta` descriptor whose body is missing is ADVISORY (meta_without_body), NOT a hard finding:
+/// GC deletes the body FIRST and drops the `.meta` afterwards on a bounded, error-suppressed advisory
+/// pool that may drop the op, so a single raw LIST legitimately observes a body-less `.meta` mid-
+/// graduation and no finite grace makes a persistent one hard evidence. It is still counted/reported;
+/// it must NOT be a `dangling` (nothing referenced it) and NOT one of the present-but-unreferenced blob
+/// pipeline classes (the `.meta` key is excluded from body classification entirely). `clean()` stays TRUE.
+TEST(CasFsck, MetaWithoutBodyIsAdvisoryNotHard)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -222,13 +272,13 @@ TEST(CasFsck, MetaWithoutBodyIsFlagged)
     writeMetaClean(*backend, store->layout(), h, /*size*/ 10);   /// meta only, no body written
 
     const FsckReport rep = runFsck(*store, /*detail*/true);
-    EXPECT_GE(rep.meta_without_body, 1u);
+    EXPECT_GE(rep.meta_without_body, 1u);   // still counted and reported in the full report
     EXPECT_EQ(rep.dangling, 0u);
     EXPECT_EQ(rep.unreachable, 0u);
     EXPECT_EQ(rep.pending_gc, 0u);
     EXPECT_EQ(rep.awaiting_gc, 0u);
     EXPECT_EQ(rep.unaccounted, 0u);
-    EXPECT_FALSE(rep.clean());   // clean() includes meta_without_body == 0
+    EXPECT_TRUE(rep.clean());   // meta_without_body is advisory — excluded from clean()
 }
 
 /// A body with no `.meta` sibling is a BENIGN not-yet-adopted (or crashed-birth) artifact — NOT a
@@ -467,4 +517,97 @@ TEST(CasFsck, RealDanglingStillCaughtAfterReresolve)
     const FsckReport rep = runFsck(*store, /*detail*/true);
     EXPECT_EQ(rep.dangling, 1u);
     EXPECT_FALSE(rep.clean());
+}
+
+/// The MANIFEST analogue of the blob phantom-dangle. The ref-walk captures "tbl" -> r1's manifest, then
+/// the ref is RE-PUBLISHED to a different manifest r2 and the OLD r1 manifest body is legitimately
+/// GC-deleted before the per-ref body GET. The missing OLD manifest must be revalidated away — a fresh
+/// re-resolve shows the CURRENT ref no longer names it — never surfacing as a phantom `dangling`.
+TEST(CasFsck, PhantomDanglingManifestFromRepublishedRefIsReresolvedAway)
+{
+    auto backend = std::make_shared<MutateOnFirstGetBackend>();
+    auto store = openPoolForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r1 = ref(1, 0xA1);
+    const ManifestRef r2 = ref(2, 0xA2);
+    const DB::UInt128 h1 = u128Of("phantom-manifest-old");
+    const DB::UInt128 h2 = u128Of("phantom-manifest-new");
+
+    writeBlobBody(*backend, store->layout(), h1);
+    writeManifestRaw(*backend, store->layout(), ns, r1, {blobEntryFor("a", h1)});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r1);
+
+    const String m1_key = store->layout().manifestKey(ManifestId{ns, r1});
+    /// Fires strictly between the ref-walk (captures "tbl" -> r1) and the per-ref GET of r1's manifest:
+    /// re-publish "tbl" to r2 and legitimately GC-delete the now-superseded r1 manifest body.
+    backend->armOnFirstGet(m1_key, [&]
+    {
+        writeBlobBody(*backend, store->layout(), h2);
+        writeManifestRaw(*backend, store->layout(), ns, r2, {blobEntryFor("a", h2)});
+        publishCommittedTransition(*backend, store->layout(), ns, "tbl", r1, r2);   /// re-publish
+
+        const HeadResult head = backend->head(m1_key);
+        ASSERT_TRUE(head.exists);
+        backend->deleteExact(m1_key, head.token);   /// legitimate GC delete of the superseded manifest
+    });
+
+    const FsckReport rep = runFsck(*store, /*detail*/true);
+    EXPECT_EQ(rep.dangling, 0u);
+    EXPECT_TRUE(rep.clean());
+}
+
+namespace
+{
+/// Build a real `ContentAddressedMetadataStorage` over Local object storage and start it (Mounted) --
+/// the same harness gtest_cas_operation_gate.cpp uses. Each call gets an isolated pool root.
+std::shared_ptr<DB::ContentAddressedMetadataStorage> openRunningStorageForTest()
+{
+    auto settings = makeSettingsForTest("test", std::filesystem::temp_directory_path() / "ca_fsck_running_scratch");
+    auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
+        makeLocalObjectStorageForTest(), "pool", "srv1", "", nullptr, settings);
+    storage->startup();
+    return storage;
+}
+
+/// Commit one real part (tmp -> final rename -> commit) so a RUNNING FSCK has live committed content.
+void commitOneRunningPart(DB::ContentAddressedMetadataStorage & storage)
+{
+    const std::string table_dir = "g80/g80g80g8-0808-4808-8808-080808080808";
+    auto tx = storage.createTransaction();
+    auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
+    auto buf = ca_tx.writeFile(table_dir + "/tmp_insert_all_1_1_0/data.bin", 65536, DB::WriteMode::Rewrite, {});
+    const std::string bytes = "content-of-the-part";
+    buf->write(bytes.data(), bytes.size());
+    buf->finalize();
+    tx->moveDirectory(table_dir + "/tmp_insert_all_1_1_0", table_dir + "/all_1_1_0");
+    tx->commit(DB::NoCommitOptions{});
+}
+}
+
+/// (rev.8) FSCK now runs on a RUNNING (Mounted) disk -- the old "run SYSTEM CONTENT ADDRESSED UNMOUNT
+/// first" refusal is gone. Scanning a live pool with one committed part succeeds and reports its content
+/// (the one-row summary the SQL verb renders from this report).
+TEST(CasFsckRunning, FsckOnMountedDiskSucceeds)
+{
+    auto storage = openRunningStorageForTest();
+    commitOneRunningPart(*storage);
+
+    FsckReport rep;
+    EXPECT_NO_THROW(rep = storage->runFsckNow(/*detail=*/false));
+    EXPECT_TRUE(rep.clean());
+    EXPECT_GE(rep.distinct_blobs, 1u) << "the running scan must see the live committed part's blob";
+    EXPECT_EQ(rep.dangling, 0u);
+}
+
+/// (rev.8) FSCK is Admin-class: on a not-live pool (a lease blip / IdentityLost) it refuses with the
+/// typed 668 (INVALID_STATE) before scanning, exactly like the GC entry points -- an FSCK of a disk whose
+/// data root may be gone or replaced is meaningless (the operator has the snapshot / FORGET path).
+TEST(CasFsckRunning, FsckOnNotLiveDiskThrowsTyped668)
+{
+    for (const auto lc : {PoolLifecycle::TransientNotLive, PoolLifecycle::IdentityLost})
+    {
+        auto storage = openRunningStorageForTest();
+        storage->store()->setLifecycleForTest(lc);   /// one force from Live; no later store() call
+        expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&] { storage->runFsckNow(/*detail=*/false); });
+    }
 }

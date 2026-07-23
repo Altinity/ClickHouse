@@ -138,10 +138,12 @@ const char * casLifecycleReasonWord(Cas::PoolLifecycle lc)
 /// ContentRead: getFileSize, getLastModified, getStorageObjects, getBlobViewPlan, readBlobPayload,
 ///              prepareInManifestRead, tryGetInManifestBytes, getPartManifestBytes.
 /// Write:       adoptPartFromManifest.
-/// Admin:       runOneGcRoundForTest, runGarbageCollectionRoundNow, runGcRebuildNow.
+/// Admin:       runOneGcRoundForTest, runGarbageCollectionRoundNow, runGcRebuildNow, runFsckNow (on a
+///              RUNNING disk -- the rev.8 FSCK-on-mounted path; a DORMANT disk keeps a transitional
+///              observe-only view instead, rewired at Task 15).
 /// Lifecycle/uncgated drivers (NOT op-gated -- they DRIVE the state): startup, shutdown,
-///   unmountSynchronously, mountExplicitly, runFsckOnDormant (its own Dormant precondition; rewired at
-///   Task 15). store()/partAccess()/poolAccess() are the internal accessors, not public op entries.
+///   unmountSynchronously, mountExplicitly. store()/partAccess()/poolAccess() are the internal accessors,
+///   not public op entries.
 ///   namespaceFilesReadable, stagingKeyPrefix, detachedRefNames, movingRefNames are post-gate helpers
 ///   (their public callers gate first; they reach store() only in the Live case).
 ///   confirmPoolIdentityForEmptyEnumeration is a post-gate helper too (the EMPTY-PROOF RULE, Task 9):
@@ -1049,22 +1051,36 @@ void ContentAddressedMetadataStorage::gcStart()
     snapshot->start();
 }
 
-Cas::FsckReport ContentAddressedMetadataStorage::runFsckOnDormant(bool detail) const
+Cas::FsckReport ContentAddressedMetadataStorage::runFsckNow(bool detail) const
 {
     /// Outermost lock (see its own doc comment): held for the WHOLE scan, so a concurrent MOUNT/UNMOUNT
-    /// cannot race a Dormant disk out from under an in-flight FSCK.
+    /// cannot race the disk out from under an in-flight FSCK. Under it the mount state is stable.
     std::lock_guard lifecycle(lifecycle_mutex);
+    MountState state;
     {
         std::lock_guard lock(pointer_mutex);
-        if (mount_state != MountState::Dormant)
-            throw Exception(ErrorCodes::INVALID_STATE,
-                "content-addressed disk '{}' is mounted — run SYSTEM CONTENT ADDRESSED UNMOUNT first "
-                "(FSCK requires a quiesced pool)", disk_name);
+        state = mount_state;
     }
-    /// TEMPORARY observe-only view: no probe, no watermark, no GC scheduler -- exactly the existing
-    /// `read_only` startup path (see `openPoolView`'s own doc comment). Never published to
-    /// `cas_store`/`part_access`/`mount_state`; destroyed (and its lease/background state torn down)
-    /// when `view` goes out of scope at the end of this call.
+
+    if (state == MountState::Mounted)
+    {
+        /// FSCK on a RUNNING disk (rev.8): scan the LIVE mounted pool directly. Admin class -- refuse on a
+        /// transient / IdentityLost / Vanished pool before touching it, exactly like the GC entry points
+        /// (`runGarbageCollectionRoundNow`/`runGcRebuildNow`). The scan is read-only and its findings are
+        /// revalidated against a fresh authoritative read (`CasFsck`'s Dangling / missing-manifest
+        /// rechecks), so concurrent writers never yield a phantom finding.
+        checkOpAdmitted(CasOpClass::Admin);
+        return Cas::runFsck(*store(), detail);
+    }
+
+    /// [Task 15] Transitional dormant observe-only path: an UNMOUNTed (Dormant) disk still FSCKs via a
+    /// TEMPORARY observe-only view (no probe, no watermark, no GC scheduler -- exactly the existing
+    /// `read_only` startup path; see `openPoolView`'s own doc comment). Never published to
+    /// `cas_store`/`part_access`/`mount_state`; destroyed (and its lease/background state torn down) when
+    /// `view` goes out of scope. Removed with `MountState` at Task 15. An Unmounting disk is a transient
+    /// window -> not mounted.
+    if (state != MountState::Dormant)
+        throwNotMounted(state);
     PoolView view = openPoolView(/* observe_only= */ true);
     return Cas::runFsck(*view.pool, detail);
 }

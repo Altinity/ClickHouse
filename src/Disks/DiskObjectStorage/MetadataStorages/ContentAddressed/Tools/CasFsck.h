@@ -78,7 +78,11 @@ struct FsckReport
 
     /// The per-hash `.meta` descriptor sibling of a blob body:
     /// pairing check between the `blobs/` physical listing's `.meta` keys and its body keys.
-    uint64_t meta_without_body = 0;   /// a `.meta` object with no body — INV-META-BODY violation (ERROR)
+    /// ADVISORY, not a hard finding: GC deletes the body FIRST and then drops the `.meta` on a bounded,
+    /// error-suppressed advisory pool that runs strictly after (and may drop the op — see `CasGc`), so a
+    /// single raw LIST legitimately observes a body-less `.meta` mid-graduation and NO finite grace makes
+    /// a persistent one hard evidence. Counted and reported; excluded from `clean()`.
+    uint64_t meta_without_body = 0;   /// a `.meta` object with no body — INV-META-BODY advisory
     uint64_t body_without_meta = 0;   /// a body with no `.meta` — a not-yet-adopted or interrupted-birth
                                        /// artifact; benign, NOT a dangle
 
@@ -111,8 +115,10 @@ struct FsckReport
     double dedupRatio() const { return distinct_blobs ? double(total_blob_refs) / double(distinct_blobs) : 0.0; }
 
     /// Return whether the scan found no missing reachable object or hard integrity violation. Expected
-    /// GC backlog classes do not make a report unclean; a partial report only covers the visited subset.
-    bool clean() const { return dangling == 0 && meta_without_body == 0 && snapshot_oracle_mismatches == 0 && corrupted_runs == 0; }
+    /// GC backlog classes do not make a report unclean, and `meta_without_body` is advisory (see its
+    /// field: GC's body-then-meta delete ordering makes a body-less `.meta` a legitimate transient with
+    /// no finite hard horizon); a partial report only covers the visited subset.
+    bool clean() const { return dangling == 0 && snapshot_oracle_mismatches == 0 && corrupted_runs == 0; }
 };
 
 /// Independently recompute reachability from authoritative refs (never from GC state or snapshots) and

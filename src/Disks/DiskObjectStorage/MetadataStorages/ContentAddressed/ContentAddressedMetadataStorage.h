@@ -197,14 +197,23 @@ public:
     /// Throws `BAD_ARGUMENTS` when GC is disabled by read-only mode or configuration.
     Cas::RebuildReport runGcRebuildNow(bool force) const;
 
-    /// The `SYSTEM CONTENT ADDRESSED FSCK` handler (Task 7): dormant-only, read-only independent
-    /// reachability audit. Requires `mount_state == Dormant` (else `INVALID_STATE`, directing the
-    /// operator to `SYSTEM CONTENT ADDRESSED UNMOUNT` first) -- a live mount keeps serving traffic that
-    /// an FSCK scan must never race against. Opens a TEMPORARY observe-only pool view via
-    /// `openPoolView(/* observe_only= */ true)` (no probe, no watermark, no GC scheduler -- exactly the
-    /// existing `read_only` startup path), runs `Cas::runFsck` over it, and destroys the view before
-    /// returning: nothing from this scan is published to `cas_store`/`part_access`/`mount_state`.
-    Cas::FsckReport runFsckOnDormant(bool detail) const;
+    /// The `SYSTEM CONTENT ADDRESSED FSCK` handler: a read-only, independent reachability audit.
+    ///
+    /// On a RUNNING (Mounted) disk it scans the LIVE pool directly (rev.8): Admin class -- it routes
+    /// through `checkOpAdmitted(CasOpClass::Admin)` (refuses on a transient / `IdentityLost` / `Vanished`
+    /// pool, consistent with `SYSTEM CONTENT ADDRESSED GC RUN`), because an FSCK of a not-live disk is
+    /// meaningless -- the operator has the snapshot / FORGET path. The scan tolerates concurrent writers:
+    /// its ref-walk findings (missing manifest, dangling blob) are revalidated against a FRESH
+    /// authoritative read before being reported, so a legitimate concurrent republish/drop + GC delete
+    /// never surfaces as a phantom.
+    ///
+    /// [Task 15] On a DORMANT (UNMOUNTed) disk it still works via a TEMPORARY observe-only pool view
+    /// (`openPoolView(/* observe_only= */ true)` -- no probe, no watermark, no GC scheduler, exactly the
+    /// `read_only` startup posture), destroyed before returning; nothing is published to
+    /// `cas_store`/`part_access`/`mount_state`. Both modes are accepted between Task 13 and Task 15; Task
+    /// 15 removes `MountState` and this dormant branch, leaving the running Admin path as the sole one.
+    /// Held under `lifecycle_mutex` for the whole scan so a concurrent MOUNT/UNMOUNT cannot race it.
+    Cas::FsckReport runFsckNow(bool detail) const;
 
     /// Returns per-disk GC health for `system.content_addressed_mounts`. Returns nullopt when this
     /// disk has no scheduler because GC is disabled, the disk is read-only, or startup has not run.
@@ -728,7 +737,7 @@ private:
         /// The direct-object-storage key prefix for this view's backend (see `physicalKey`'s own
         /// doc comment): populated for the Emulated (Local) backend, empty ("") for Native. Returned
         /// rather than written to the `physical_key_prefix` member so this helper stays side-effect-free
-        /// and callable from a `const` method (`runFsckOnDormant`).
+        /// and callable from a `const` method (`runFsckNow`).
         String physical_key_prefix;
         /// The resolved (bucket-relative, trailing-slash-trimmed) pool prefix passed into
         /// `Cas::PoolConfig::pool_prefix` -- `startup()`'s S3-staging capability probe below needs the
@@ -738,7 +747,7 @@ private:
     };
 
     /// Builds the backend + `Cas::PoolConfig` and opens a pool exactly as `startup()` does, shared by
-    /// its live-mount path and `runFsckOnDormant`'s TEMPORARY observe-only scan. `observe_only` forces
+    /// its live-mount path and `runFsckNow`'s TEMPORARY observe-only (dormant) scan. `observe_only` forces
     /// `PoolConfig::read_only` and disables the background watermark regardless of the disk's own
     /// `<readonly>` config -- an FSCK scan must never probe/schedule against a pool it does not own the
     /// lifecycle of, exactly like the `read_only` disk path startup() already has (no probe, no
