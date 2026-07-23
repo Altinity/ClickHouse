@@ -44,13 +44,21 @@ _VARIANT_FILE = {
     # writes configs/storage_conf_tuned_ch{1,2}.xml on demand; this compose mounts those instead of the
     # fixed per-variant XML the other entries above use.
     "tuned": "docker-compose-tuned.yml",
+    # S41: single-node write-path baseline in an ISOLATED docker-compose project (`name: ca-s41`) so
+    # it never disturbs a concurrently-running `ca-soak` stack. Point the framework at it with env
+    # CA_SOAK_NODE_COUNT=1, CA_SOAK_NODE1_PORT=18123, CA_SOAK_NODE1_CONTAINER=ca-s41-ch1-1,
+    # CA_SOAK_RUSTFS_CONTAINER=ca-s41-rustfs1-1, CA_SOAK_CH_CONTAINERS=ca-s41-ch1-1,
+    # CA_SOAK_FSCK_CONTAINER=ca-s41-ch1-1. On a host where `ca-soak` is running, this variant MUST be
+    # run with `--no-reset` against a pre-brought-up stack: reset_cluster's mandatory pre-`down` is
+    # scoped to the `ca-soak` project and would tear that stack down.
+    "s41": "docker-compose-s41.yml",
 }
 
 # Replica count per compose variant — drives the N-node Cluster + health wait + log-dir prep.
 _VARIANT_NODES = {
     None: 2, "default": 2, "gc_shards2": 2, "smalldedupcache": 2,
     "tenreplicas": 10, "gc_shards8": 2, "s3faultproxy": 2, "s3listproxy": 2, "s38": 2,
-    "tuned": 2, "multidisk": 2,
+    "tuned": 2, "multidisk": 2, "s41": 1,
 }
 
 

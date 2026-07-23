@@ -6,13 +6,16 @@ The end checkpoint implements the README §"Common run contract" quiesced fixpoi
 fsck + dry-run for the structural assertions.
 """
 
+import os
 import time
 
 from soak import fsck as fsck_mod
 from soak.cluster import QueryError
 from . import gc as gc_mod
 
-DEFAULT_FSCK_CONTAINER = "ca-soak-ch1-1"
+# Env-overridable so a scenario can fsck an ISOLATED compose stack (distinct docker-compose project,
+# e.g. S41's `ca-s41`) rather than the default `ca-soak` project. Default is the standard project.
+DEFAULT_FSCK_CONTAINER = os.environ.get("CA_SOAK_FSCK_CONTAINER", "ca-soak-ch1-1")
 DEFAULT_FSCK_DISK = "ca_ro"
 
 

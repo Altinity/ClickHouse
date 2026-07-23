@@ -1,5 +1,7 @@
 # Per-run docker logs preserved by scripts/run_phase1.sh before teardown.
 logs/
+# S41 isolated-stack (docker-compose-s41.yml) per-run server logs.
+logs_s41/
 # Scratch / downloaded artifacts.
 tmp/
 # Structured failure reproducer dumped by soak.run on a failed run.

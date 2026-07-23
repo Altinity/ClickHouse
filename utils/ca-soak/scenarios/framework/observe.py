@@ -16,15 +16,22 @@ must surface that as an `inconclusive` verdict (see assertions.py), not silently
 """
 
 import json
+import os
 import subprocess
 import time
 
 # Object-store container + pool data dir (mirror of soak/pool.py and configs/storage_conf.xml:
 # endpoint http://rustfs1:11121/test/soak_pool/ -> bucket "test", prefix "soak_pool/").
-RUSTFS_CONTAINER = "ca-soak-rustfs1-1"
-POOL_DIR = "/data/test/soak_pool"
+#
+# Container names + the pool data dir are env-overridable so a scenario can run against an ISOLATED
+# compose stack (a distinct docker-compose project) without disturbing the default `ca-soak` project
+# — e.g. S41's `ca-s41` stack. Defaults are the standard `ca-soak` project, so nothing changes for
+# the normal path. `CA_SOAK_CH_CONTAINERS` is a comma-separated list.
+RUSTFS_CONTAINER = os.environ.get("CA_SOAK_RUSTFS_CONTAINER", "ca-soak-rustfs1-1")
+POOL_DIR = os.environ.get("CA_SOAK_POOL_DIR", "/data/test/soak_pool")
 
-CH_CONTAINERS = ("ca-soak-ch1-1", "ca-soak-ch2-1")
+CH_CONTAINERS = tuple(
+    c for c in os.environ.get("CA_SOAK_CH_CONTAINERS", "ca-soak-ch1-1,ca-soak-ch2-1").split(",") if c)
 
 GC_LOG = "system.content_addressed_garbage_collection_log"
 CA_LOG = "system.content_addressed_log"
