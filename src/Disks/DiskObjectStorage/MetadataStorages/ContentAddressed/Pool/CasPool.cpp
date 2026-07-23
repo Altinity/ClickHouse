@@ -371,6 +371,33 @@ PoolPtr Pool::open(BackendPtr backend, PoolConfig config)
     /// read-only when the pool already exists; a missing pool meta on a read-only backend fails closed.)
     if (!config.read_only)
     {
+        /// (0) [C4][D2] Zero-write residual check FIRST — before ANY probe write. `pool_prefix` is
+        /// EXCLUSIVELY CAS-owned; `createOrValidate` below may mint a fresh `_pool_meta` only over a
+        /// genuinely empty prefix. The MUTATING capability battery must run AFTER this proof (it writes
+        /// `_probe/` debris, which would itself make the prefix look non-empty), and the emptiness
+        /// classification IGNORES structurally-valid `_probe/` debris so a normal restart after a
+        /// crash-mid-battery still bootstraps cleanly. This closes the "restart poisons a
+        /// partially-erased pool" hole: a missing `_pool_meta` over residual data now fails startup loud
+        /// with zero writes, instead of minting a fresh identity on top of the old objects.
+        switch (probePoolBootstrapResidual(*backend, layout))
+        {
+            case BootstrapResidual::PoolMetaPresent:
+            case BootstrapResidual::EmptyOrProbeOnly:
+                break;   /// authoritative pool present, or a provably empty prefix — safe to proceed.
+            case BootstrapResidual::ResidualWithoutMeta:
+                throw Exception(ErrorCodes::INVALID_STATE,
+                    "content-addressed pool '{}' (prefix '{}'): missing _pool_meta over a non-empty pool "
+                    "prefix — refusing to bootstrap over residual data; recreate the pool or restore "
+                    "_pool_meta. The pool prefix is exclusively CAS-owned.",
+                    config.server_root_id, config.pool_prefix);
+            case BootstrapResidual::Indeterminate:
+                throw Exception(ErrorCodes::INVALID_STATE,
+                    "content-addressed pool '{}' (prefix '{}'): could not authoritatively list the pool "
+                    "prefix to prove it is safe to bootstrap — refusing to create _pool_meta while "
+                    "residual data cannot be ruled out (fail-closed).",
+                    config.server_root_id, config.pool_prefix);
+        }
+
         if (!config.skip_access_check)
         {
             /// Give each mount a PER-MOUNT UNIQUE probe key prefix so two servers mounting the SAME

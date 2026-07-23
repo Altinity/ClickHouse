@@ -782,6 +782,8 @@ TEST(CasPool, ManifestDecodeCacheIsByteBounded)
 
     DB::Cas::PoolConfig config{.pool_prefix = "p", .server_root_id = "test"};
     config.manifest_decode_cache_bytes = 2ULL << 20;
+    /// Restart over pre-seeded pool content: establish `_pool_meta` first (Task 7 zero-write bootstrap).
+    DB::Cas::tests::seedPoolMetaForRestart(*backend);
     auto store = DB::Cas::Pool::open(backend, std::move(config));
 
     uint64_t total_gets = 0;
@@ -1450,6 +1452,8 @@ TEST(CasMountTmat, UncleanOpenWaitsMaterializationGrace)
 
     uint64_t fake_boot = 0;
     std::vector<uint64_t> waits;
+    /// Restart over a pre-planted mount lease: establish `_pool_meta` first (Task 7 zero-write bootstrap).
+    DB::Cas::tests::seedPoolMetaForRestart(*b);
     PoolPtr store;
     ASSERT_NO_THROW(
         store = Pool::open(b, PoolConfig{
@@ -1512,6 +1516,8 @@ TEST(CasMountTmat, FencedPriorPaysOnlyTmat)
     const CasRequestBudget tiny_budget{
         .attempt_timeout_ms = 50, .operation_deadline_ms = 50, .max_attempts = 1, .lease_safety_margin_ms = 50};
 
+    /// Restart over a pre-planted mount lease: establish `_pool_meta` first (Task 7 zero-write bootstrap).
+    DB::Cas::tests::seedPoolMetaForRestart(*b);
     std::vector<uint64_t> waits;
     PoolPtr store;
     ASSERT_NO_THROW(
@@ -1697,6 +1703,8 @@ TEST(CasPool, ReadManifestSharedReturnsSharedDecodeWithoutCopy)
         {DB::Cas::tests::namespaceBirthOp(), DB::Cas::tests::publishCommittedOps("part_1", ref)[0],
          DB::Cas::tests::publishCommittedOps("part_1", ref)[1]}});
 
+    /// Restart over pre-seeded pool content: establish `_pool_meta` first (Task 7 zero-write bootstrap).
+    DB::Cas::tests::seedPoolMetaForRestart(*backend);
     auto store = DB::Cas::Pool::open(backend,
         DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     const auto resolved = store->resolveRef(ns, "part_1");

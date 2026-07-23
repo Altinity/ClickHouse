@@ -126,6 +126,14 @@ PoolMeta PoolMeta::createOrValidate(
     /// Every pool this build creates is schema-3-shaped from birth (schemas 1/2 do not exist in this
     /// build at all), so the reader-generation floor is stamped at THIS build's `G_BUILD` at
     /// creation, not left at 0.
+    ///
+    /// BOOTSTRAP PRECONDITION (spec §2 [C4][D2]): this create-if-absent path may run ONLY after the
+    /// caller has proven the pool prefix genuinely empty. `Pool::open` runs that zero-write residual
+    /// check (`probePoolBootstrapResidual`) BEFORE the mutating `_probe/` capability battery — it cannot
+    /// live here, because by the time `createOrValidate` runs the battery has already written `_probe/`
+    /// debris, so an emptiness check here would false-positive on that debris. `pool_prefix` is
+    /// exclusively CAS-owned; a missing `_pool_meta` over residual data fails startup at that check
+    /// (INVALID_STATE), never reaching this mint.
     PoolMeta pm;
     pm.pool_id = mintPoolId();
     pm.blob_header_len = blob_header_len;

@@ -256,6 +256,8 @@ TEST(CasSweepLateLog, LogBetweenSealedFromAndSealIdIsReportedNotRevived)
     auto counting = std::make_shared<GetCountingBackend>(backend, watched_key);
     /// The sink target must outlive the Pool: `~Pool` emits terminate events into the sink.
     std::vector<CasEvent> events;
+    /// Restart over pre-seeded pool content: establish `_pool_meta` first (Task 7 zero-write bootstrap).
+    seedPoolMetaForRestart(*backend);
     auto store = Pool::open(counting, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     store->setEventSink([&](const CasEvent & e) { events.push_back(e); });
 
@@ -297,6 +299,8 @@ TEST(CasSweepLateLog, SecondPassSuppressedWithDedupLatchButNotWithoutOne)
 
     /// The sink target must outlive the Pool: `~Pool` emits terminate events into the sink.
     std::vector<CasEvent> events;
+    /// Restart over pre-seeded pool content: establish `_pool_meta` first (Task 7 zero-write bootstrap).
+    seedPoolMetaForRestart(*backend);
     auto store = openPoolForTest(backend);
     store->setEventSink([&](const CasEvent & e) { events.push_back(e); });
 

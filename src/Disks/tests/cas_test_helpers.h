@@ -601,6 +601,22 @@ inline DB::Cas::PoolPtr openPoolForTest(
                             .gc_fold_max_defer_rounds = gc_fold_max_defer_rounds});
 }
 
+/// Seed a valid `_pool_meta` so a subsequent `Pool::open` VALIDATES an already-existing pool (a restart)
+/// instead of bootstrapping a fresh one. Recovery/replay tests seed ref-log, snapshot, manifest, or
+/// gc-state residue directly into a bare backend; in production such residue only ever exists inside a
+/// pool whose FIRST open already minted `_pool_meta`. Task 7's zero-write bootstrap check (spec §2
+/// [C4][D2], `probePoolBootstrapResidual`) REFUSES to bootstrap a fresh identity over residual data with
+/// no `_pool_meta`, so a test that models a restart over seeded state must establish the sentinel first.
+/// Idempotent (a no-op when `_pool_meta` already exists — `createOrValidate` validates rather than
+/// re-mints). The default `blob_header_len`/`blob_hash_algo` match `PoolConfig`'s defaults, so a later
+/// `Pool::open` with a default config validates cleanly.
+inline void seedPoolMetaForRestart(DB::Cas::Backend & backend, const String & pool_prefix = "p")
+{
+    DB::Cas::PoolMeta::createOrValidate(
+        backend, DB::Cas::Layout(pool_prefix), /*blob_header_len=*/256,
+        DB::Cas::BlobHashAlgo::CityHash128, /*allow_new=*/false);
+}
+
 /// Write a blob object (envelope + payload) addressed by `hash`, so a HEAD returns a token. The bytes
 /// are arbitrary (GC never reads them); the hash is what the manifest entry references.
 inline void writeBlobBody(

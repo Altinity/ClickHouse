@@ -68,6 +68,11 @@ namespace
 
 PoolPtr openPool(const BackendPtr & backend, CasRequestBudget budget = {})
 {
+    /// Recovery tests seed ref-log/snapshot residue before opening; a pool with such residue always has a
+    /// `_pool_meta` in production, so establish it first (Task 7's zero-write bootstrap check refuses to
+    /// mint a fresh identity over residual data — see `seedPoolMetaForRestart`). Idempotent, and a no-op
+    /// for the fresh-open tests that seed nothing (the subsequent open validates the just-created meta).
+    DB::Cas::tests::seedPoolMetaForRestart(*backend);
     return Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .cas_request_budget = budget});
 }
 
@@ -78,6 +83,7 @@ PoolPtr openPoolWithConfig(const BackendPtr & backend, PoolConfig config)
 {
     config.pool_prefix = "p";
     config.server_root_id = "test";
+    DB::Cas::tests::seedPoolMetaForRestart(*backend);   /// see `openPool` above
     return Pool::open(backend, std::move(config));
 }
 
