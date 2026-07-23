@@ -4389,6 +4389,9 @@ Enables caching of rows number during count from files in table functions `file`
 
 Enabled by default.
 )", 0) \
+    DECLARE(UInt64, object_storage_max_files_to_prefetch, 1, R"(
+Number of files that each reading stream of `s3`/`azureBlobStorage`/`hdfs`/data lake table engines and table functions keeps open and priming (starting their background reads) ahead of the file currently being consumed. Since object storage reads are IO-wait-bound rather than CPU-bound, priming more files in advance overlaps their fetch latency with decoding the current file, instead of only starting the next file's fetch once its stream slot is scheduled. 1 keeps today's behaviour (only the current file is being read; the next file's reader is constructed ahead of time but its data is not fetched until it becomes current). Higher values increase read concurrency at the cost of memory (each additionally primed file holds its own transient buffers).
+)", 0) \
     DECLARE(Bool, optimize_respect_aliases, true, R"(
 If it is set to true, it will respect aliases in WHERE/GROUP BY/ORDER BY, that will help with partition pruning/secondary indexes/optimize_aggregation_in_order/optimize_read_in_order/optimize_trivial_count
 )", 0) \

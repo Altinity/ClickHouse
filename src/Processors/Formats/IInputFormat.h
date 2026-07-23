@@ -136,6 +136,12 @@ public:
 
     virtual std::optional<std::pair<std::vector<size_t>, size_t>> getMatchedBuckets() const { return std::nullopt; }
 
+    /// Called (from a background thread, before this format becomes the one being pulled from) to
+    /// eagerly start background reads for formats that support it, so their data is already in
+    /// flight by the time regular reading reaches this file. No-op by default; only overridden by
+    /// formats whose reads are otherwise lazy until the first read() call.
+    virtual void prefetch() {}
+
 protected:
     ReadBuffer & getReadBuffer() const { chassert(in); return *in; }
 
