@@ -243,6 +243,47 @@ BlobUploadResult PartWriteTxn::uploadBlobDetached(const BlobUploadRequest & req)
     throw Exception(ErrorCodes::LOGICAL_ERROR, "uploadBlobDetached: exhausted retries for {}", key);
 }
 
+void PartWriteTxn::mergeBlobUploadResults(std::span<const BlobUploadResult> results)
+{
+    /// Prevalidate EVERYTHING first, touching nothing but locals: a result without a token is
+    /// incomplete (every `uploadBlobDetached` branch sets one; a tokenless dep only ever arrives
+    /// through `adoptEvidence`'s separate direct-fold path, never through this method) -- a caller bug,
+    /// failed closed rather than merged as a hole. Two results for the SAME ref must carry an
+    /// IDENTICAL dep record (the fan-out's one-task-per-unique-ref invariant, spec §1); a conflict --
+    /// most commonly a conflicting size -- means that invariant was violated upstream.
+    std::map<DepKey, const BlobDepRecord *> seen;
+    for (const auto & r : results)
+    {
+        if (!r.dep.token.has_value())
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "PartWriteTxn::mergeBlobUploadResults: incomplete result for {} (no token) -- every "
+                "uploadBlobDetached branch sets one; a tokenless dep must be recorded via adoptEvidence, "
+                "never merged here", blobIdOf(r.ref));
+        const auto [it, inserted] = seen.try_emplace(r.ref, &r.dep);
+        if (!inserted && !(*it->second == r.dep))
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "PartWriteTxn::mergeBlobUploadResults: conflicting dep records for {} (size {} vs {}) -- "
+                "the fan-out must launch exactly one task per unique ref and merge exactly one result",
+                blobIdOf(r.ref), it->second->size, r.dep.size);
+    }
+
+    /// Build-and-swap: apply every result into a COPY of the live `deps`. The live member is touched
+    /// ONLY by the final `swap` below, which runs after every result has applied -- so a mid-loop
+    /// exception (a `bad_alloc` from map-node allocation, or one injected by `setMergeHookForTest`'s
+    /// hook) leaves `deps` byte-for-byte as it was before this call. Applying an already-validated
+    /// duplicate a second time is idempotent (identical value, same key).
+    std::map<DepKey, BlobDepRecord> candidate = deps;
+    size_t applied = 0;
+    for (const auto & r : results)
+    {
+        candidate[r.ref] = r.dep;
+        ++applied;
+        if (merge_hook_for_test)
+            merge_hook_for_test(applied);
+    }
+    deps.swap(candidate);
+}
+
 bool PartWriteTxn::isTrustedAdopt(const BlobRef & ref) const
 {
     /// §4: a leaf trusted at promote iff this build holds a TOKENLESS dep recorded by adoptEvidence

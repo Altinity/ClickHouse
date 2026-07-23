@@ -7,6 +7,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <span>
 #include <vector>
 
 namespace DB { class WriteBuffer; }
@@ -57,6 +58,8 @@ struct BlobDepRecord
     std::optional<Token> token;                       /// nullopt = live-source evidence
     uint64_t size = 0;
     bool adopted = false;                             /// true only for `adoptEvidence`
+
+    bool operator==(const BlobDepRecord &) const = default;
 };
 
 /// Which branch of the upload primitive admitted a blob. Carried out of `uploadBlobDetached` so the
@@ -140,6 +143,33 @@ public:
     /// safe to run off the owning writer thread while `PartWriteTxn` stays single-writer for `build`.
     /// `putBlob` = this primitive + a single-result `deps` fold on the calling thread.
     BlobUploadResult uploadBlobDetached(const BlobUploadRequest & req) const;
+
+    /// Applies a fan-out's `uploadBlobDetached` results into `deps` on the CALLING thread, after the
+    /// fan-out's join -- so this is an owning-writer-thread API exactly like `putBlob`, and MUST NOT be
+    /// called from a pool task. Merge failure must not leave a partially merged build (spec §1): every
+    /// result is prevalidated FIRST -- completeness (a result's dep must carry a token; every branch of
+    /// `uploadBlobDetached` sets one, so a tokenless result is a caller bug, not a valid dep-only-evidence
+    /// state, which is folded through `adoptEvidence` instead) and duplicate-grouping consistency
+    /// (two results for the same `BlobRef` must carry an identical dep record; a conflict -- most
+    /// commonly a conflicting size -- means the fan-out's one-task-per-unique-ref invariant was
+    /// violated) -- BEFORE any result is applied. Application then runs against a COPY of `deps` (a
+    /// "build"), so a mid-application exception (including one raised by `setMergeHookForTest`'s hook, or
+    /// a `bad_alloc` from map-node allocation) never touches the live `deps`; the copy is committed by a
+    /// single no-throw `swap` only after every result has applied. The build is therefore either fully
+    /// merged or byte-for-byte untouched -- never partially merged.
+    void mergeBlobUploadResults(std::span<const BlobUploadResult> results);
+
+    /// Test-only fault-injection seam (inert in production): invoked after each result has applied to
+    /// the in-progress merge copy, with the count of results applied so far (1-based). A hook that
+    /// throws (e.g. to model a `bad_alloc` mid-merge) aborts `mergeBlobUploadResults` before its final
+    /// swap, so the live `deps` stays untouched -- the seam exists to prove that all-or-nothing property
+    /// under injected failure at every application point, not just the first or the last.
+    void setMergeHookForTest(std::function<void(size_t applied_so_far)> hook) { merge_hook_for_test = std::move(hook); }
+
+    /// Test-only DEEP snapshot of this build's recorded deps, keyed by `BlobRef`. A plain copy of the
+    /// private `deps` map -- lets a test assert the whole build is byte-for-byte untouched after a
+    /// rejected or aborted merge, rather than probing one ref at a time via `depIsTokened`.
+    std::map<BlobRef, BlobDepRecord> depsSnapshotForTest() const { return deps; }
 
     /// Return whether this build holds a TOKENED Blob dep for `ref` (`putBlob` ⇒
     /// tokened) versus a tokenless evidence dep (`adoptEvidence` ⇒ tokenless)? False also when this
@@ -304,6 +334,9 @@ private:
     std::vector<ManifestId> staged_manifests;             /// for best-effort abandon cleanup
 
     std::map<DepKey, BlobDepRecord> deps;                 /// dependencies recorded by this build (blobs only)
+
+    /// Backing state for `setMergeHookForTest`; empty (no-op) in production.
+    std::function<void(size_t)> merge_hook_for_test;
 };
 
 }
