@@ -106,13 +106,15 @@ processes is out of contract; `FORGET` is node-local.
   one WARN + ProfileEvent (`CasIdentityLost` / `CasDataRootVanished`); idempotent via the intent latch.
 - **Thread exits on terminal states:** the keeper already exits on terminal renewal failure; the remount
   thread exits on `IdentityLost` and `Vanished`; **the GC scheduler self-exits at its next wake on
-  `Vanished` AND (rev.8) on `IdentityLost`** — rev.7 kept it ticking through `IdentityLost` solely because
-  the erased proof ran from there (rev-t8 adjudication); with the proof excised, the last G2-zombie case
-  (eternal `CORRUPTED_DATA` retries against a half-erased pool) closes too. Self-exit at the loop's own
-  wake — no join from any callback (C6).
+  `Vanished`, on the published FORGET-intent (`vanished_intent`, still pre-terminal — earliest-signal
+  discipline), AND (rev.8) on `IdentityLost`** (as built: `isVanished() || vanishedIntentPublished() ||
+  lifecycle()==IdentityLost` in both `loop()` and `heartbeatLoop()`) — rev.7 kept it ticking through
+  `IdentityLost` solely because the erased proof ran from there (rev-t8 adjudication); with the proof
+  excised, the last G2-zombie case (eternal `CORRUPTED_DATA` retries against a half-erased pool) closes too.
+  Self-exit at the loop's own wake — no join from any callback (C6).
 - The §3 serialization protocol (terminal-intent latch published first; checked by the keeper callback,
-  the remount loop, and — [M1] — the remount step-0; joins outside `remount_mutex`; FORGET joins
-  synchronously, natural transitions defer joins to `~Pool`) — unchanged.
+  the remount loop, the GC scheduler wake, and — [M1] — the remount step-0; joins outside `remount_mutex`;
+  FORGET joins synchronously, natural transitions defer joins to `~Pool`) — unchanged.
 - The disk stays registered; the T12 snapshot (`lifecycle`/`lifecycle_reason` enum-clean/`lifecycle_detail`
   full [D5]/`lifecycle_since`) shows every state.
 
@@ -128,7 +130,7 @@ vanished-table `DROP` completes, `SELECT`/`BACKUP` fail with the typed reason, n
 
 `SYSTEM CONTENT ADDRESSED FORGET` (§5 protocol as landed in T10 incl. the trip#2 race step), `GC
 STOP/START` (§6 as landed in T11), the non-gated lifecycle snapshot and FSCK-on-running with
-`meta_without_body` advisory (§7 as landed in T12/planned T13). FORGET is now not merely the escape hatch
+`meta_without_body` advisory (§7 as landed in T12/T13). FORGET is now not merely the escape hatch
 but **the** decommission/teardown story — which the test teardown (T14) and 04290/04295/05020 already
 assumed.
 
