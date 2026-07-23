@@ -30,7 +30,7 @@ using PartWriteTxnPtr = std::shared_ptr<PartWriteTxn>;
 ///   - `Live`             — the steady state; the mount lease is (or was last) held.
 ///   - `TransientNotLive` — the lease was lost; access is uncertain and a self-remount retries. The §2
 ///                          `Present`+identity-match recovery rule fires only from here (or `Live`).
-///   - `IdentityLost`     — the pool sentinels are authoritatively absent (a live erase in flight):
+///   - `IdentityLost`     — the pool sentinels are authoritatively absent (both KeyAbsent):
 ///                          fail-loud and TERMINAL (rev.8). The remount/GC observer threads self-exit;
 ///                          matching-sentinel reappearance does NOT auto-revive it ([D3]); recovery is a
 ///                          restart or `SYSTEM CONTENT ADDRESSED FORGET`.
