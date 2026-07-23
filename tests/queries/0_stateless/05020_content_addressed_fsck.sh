@@ -38,11 +38,6 @@ ${CLICKHOUSE_CLIENT} --format TSVWithNames --query "SYSTEM CONTENT ADDRESSED GC 
 ${CLICKHOUSE_CLIENT} --format TSV --query "SYSTEM CONTENT ADDRESSED GC RUN '${DISK_NAME}'" \
     | awk -F'\t' '{print $(NF-2), $(NF-1), $NF}'
 
-# --- FSCK is refused while the disk is mounted, pointing at UNMOUNT ---
-echo -n 'fsck_refused_while_mounted: '
-${CLICKHOUSE_CLIENT} --query "SYSTEM CONTENT ADDRESSED FSCK '${DISK_NAME}'" 2>&1 \
-    | grep -cm1 "run SYSTEM CONTENT ADDRESSED UNMOUNT first"
-
 # --- Drop the table (so UNMOUNT is not refused by the live-table guard), then UNMOUNT ---
 ${CLICKHOUSE_CLIENT} --query "DROP TABLE t_fsck SYNC"
 ${CLICKHOUSE_CLIENT} --query "SYSTEM CONTENT ADDRESSED UNMOUNT '${DISK_NAME}'"

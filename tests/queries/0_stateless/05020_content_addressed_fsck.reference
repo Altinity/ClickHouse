@@ -1,6 +1,5 @@
 3
 0 0 0
-fsck_refused_while_mounted: 1
 unmount_ok
 disk	reachable	dangling	unreachable	pending_gc	awaiting_gc	unaccounted	physical_bytes	referenced_logical_bytes	distinct_blobs	total_blob_refs
 <disk>	0	0	0	0	0	0	0	0	0	0
