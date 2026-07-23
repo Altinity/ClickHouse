@@ -44,6 +44,7 @@
 #include <boost/operators.hpp>
 #include <Poco/String.h>
 #include <Common/Exception.h>
+#include <Common/FailPoint.h>
 #include <Common/SipHash.h>
 #include <Common/parseGlobs.h>
 #include <Storages/ObjectStorage/IObjectIterator.h>
@@ -56,6 +57,8 @@
 #endif
 
 #include <fmt/ranges.h>
+#include <base/sleep.h>
+#include <Common/ElapsedTimeProfileEventIncrement.h>
 #include <Common/ProfileEvents.h>
 #include <Core/SettingsEnums.h>
 #include <Poco/String.h>
@@ -73,6 +76,7 @@ namespace ProfileEvents
     extern const Event ObjectStorageReadObjects;
     extern const Event ObjectStorageClusterProcessedTasks;
     extern const Event ObjectStorageClusterWaitingMicroseconds;
+    extern const Event ObjectStorageWaitPrefetchedReaderMicroseconds;
 }
 
 namespace CurrentMetrics
@@ -649,7 +653,10 @@ Chunk StorageObjectStorageSource::generate()
         total_rows_in_file = 0;
 
         chassert(!reader_futures.empty());
-        reader = reader_futures.front().get();
+        {
+            ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::ObjectStorageWaitPrefetchedReaderMicroseconds);
+            reader = reader_futures.front().get();
+        }
         reader_futures.pop_front();
 
         if (!reader)
@@ -1336,6 +1343,10 @@ std::future<StorageObjectStorageSource::ReaderHolder> StorageObjectStorageSource
         auto reader_holder = createReader();
         if (prime && reader_holder)
         {
+            fiu_do_on(FailPoints::object_storage_file_prefetch_failpoint,
+            {
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Failpoint for object storage file prefetch enabled");
+            });
             if (auto * input_format = reader_holder.getInputFormat())
                 input_format->prefetch();
         }
