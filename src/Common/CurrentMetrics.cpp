@@ -236,6 +236,9 @@
     M(CasManifestDecodeCacheEntries, "Entries retained by the CA manifest decode cache") \
     M(CasDedupCacheBytes, "Bytes retained by the CA blob presence (dedup) cache") \
     M(CasDedupCacheEntries, "Entries retained by the CA blob presence (dedup) cache") \
+    M(CasBlobUploadPoolThreads, "Number of threads in the CA blob upload thread pool.") \
+    M(CasBlobUploadPoolThreadsActive, "Number of threads in the CA blob upload thread pool running a task.") \
+    M(CasBlobUploadPoolThreadsScheduled, "Number of queued or active jobs in the CA blob upload thread pool.") \
     \
     M(MergeTreeFetchPartitionThreads, "Number of threads for ALTER TABLE FETCH PARTITION") \
     M(MergeTreeFetchPartitionThreadsActive, "Number of threads for ALTER TABLE FETCH PARTITION fetching part") \
