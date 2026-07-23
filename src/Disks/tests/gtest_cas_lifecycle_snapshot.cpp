@@ -84,6 +84,7 @@ TEST(CasLifecycleSnapshot, LiveIsTruthfulWithIdentity)
     const CasLifecycleSnapshot snap = storage->lifecycleSnapshot();
     EXPECT_EQ(snap.lifecycle, "live");
     EXPECT_TRUE(snap.reason.empty()) << snap.reason;
+    EXPECT_TRUE(snap.detail.empty()) << snap.detail;
     EXPECT_EQ(snap.since, 0) << "a live pool has no lifecycle `since`";
     EXPECT_EQ(snap.server_root_id, storage->serverRootId());
     EXPECT_FALSE(snap.pool_id.empty()) << "a started disk knows its pool identity";
@@ -91,8 +92,10 @@ TEST(CasLifecycleSnapshot, LiveIsTruthfulWithIdentity)
 }
 
 /// (b) IdentityLost (forced from Live on the captured handle, the gate-test idiom): the snapshot names the
-/// non-auto-recovering `identity_lost` state with the [D5] reason detail present and `since` set.
-TEST(CasLifecycleSnapshot, IdentityLostHasReasonAndSince)
+/// non-auto-recovering `identity_lost` state with the [D5] detail present and `since` set. The enum-clean
+/// `reason` word is empty here — it carries only the `vanished` sub-state, and `identity_lost` is already
+/// fully named by the `lifecycle` column.
+TEST(CasLifecycleSnapshot, IdentityLostHasDetailAndSince)
 {
     auto storage = openSnapshotStorage();
     commitOnePart(*storage);
@@ -102,16 +105,18 @@ TEST(CasLifecycleSnapshot, IdentityLostHasReasonAndSince)
 
     const CasLifecycleSnapshot snap = storage->lifecycleSnapshot();
     EXPECT_EQ(snap.lifecycle, "identity_lost");
-    EXPECT_NE(snap.reason.find("identity lost"), std::string::npos) << snap.reason;
+    EXPECT_TRUE(snap.reason.empty()) << "reason is the vanish sub-state word only: " << snap.reason;
+    EXPECT_NE(snap.detail.find("identity lost"), std::string::npos) << snap.detail;
     EXPECT_NE(snap.since, 0) << "a not-live state carries the wall-clock instant it was entered";
     /// Identity survives a terminal state — the disk stays introspectable under it.
     EXPECT_EQ(snap.pool_id, storage->getPoolUUID());
 }
 
 /// (c) VanishedForgotten via the REAL verb (`storage->forgetDisk()`): the snapshot reads `vanished` with the
-/// [D5] reason carrying the operator's decommission timestamp ("SYSTEM CONTENT ADDRESSED FORGET at ..."),
-/// `since` set, and the identity still present. This is the exact row Task 14's teardown verifies.
-TEST(CasLifecycleSnapshot, VanishedForgottenCarriesTimestampedReason)
+/// enum-clean `reason` word `forgotten` (so Task 14's `lifecycle || '(' || lifecycle_reason || ')'` reads
+/// EXACTLY `vanished(forgotten)`), the [D5] `detail` carrying the operator's decommission timestamp, `since`
+/// set, and the identity still present.
+TEST(CasLifecycleSnapshot, VanishedForgottenIsEnumCleanWithTimestampedDetail)
 {
     auto storage = openSnapshotStorage();
     commitOnePart(*storage);
@@ -121,8 +126,11 @@ TEST(CasLifecycleSnapshot, VanishedForgottenCarriesTimestampedReason)
 
     const CasLifecycleSnapshot snap = storage->lifecycleSnapshot();
     EXPECT_EQ(snap.lifecycle, "vanished");
-    EXPECT_NE(snap.reason.find("SYSTEM CONTENT ADDRESSED FORGET at "), std::string::npos) << snap.reason;
-    EXPECT_NE(snap.reason.find("erasure was NOT verified"), std::string::npos) << snap.reason;
+    EXPECT_EQ(snap.reason, "forgotten");
+    /// Task 14's teardown check depends on this exact concatenation.
+    EXPECT_EQ(snap.lifecycle + "(" + snap.reason + ")", "vanished(forgotten)");
+    EXPECT_NE(snap.detail.find("SYSTEM CONTENT ADDRESSED FORGET at "), std::string::npos) << snap.detail;
+    EXPECT_NE(snap.detail.find("erasure was NOT verified"), std::string::npos) << snap.detail;
     EXPECT_NE(snap.since, 0);
     /// The disk stays registered and introspectable under its identity after FORGET.
     EXPECT_EQ(snap.pool_id, pool_id_before);
@@ -142,6 +150,7 @@ TEST(CasLifecycleSnapshot, NullPoolReportsConstructingThenShutdown)
     const CasLifecycleSnapshot before = storage->lifecycleSnapshot();
     EXPECT_EQ(before.lifecycle, "constructing");
     EXPECT_TRUE(before.reason.empty());
+    EXPECT_TRUE(before.detail.empty());
     EXPECT_EQ(before.since, 0);
     EXPECT_TRUE(before.pool_id.empty()) << "no identity before startup";
     EXPECT_EQ(before.server_root_id, kSrid) << "the identity is known from config even pre-startup";
@@ -189,10 +198,10 @@ TEST(CasLifecycleSnapshot, PerformsZeroBackendOps)
     EXPECT_EQ(vanished.lifecycle, PoolLifecycle::VanishedErased);
 }
 
-/// (f) A NATURAL transition (not the forced setter) captures the reason + `since`, and the snapshot's reason
-/// is EXACTLY the [D5] detail `throwIfLifecycleTerminal` throws (minus the pool-name prefix) — the spec §1
+/// (f) A NATURAL transition (not the forced setter) captures the detail + `since`, and the snapshot's detail
+/// is EXACTLY the [D5] text `throwIfLifecycleTerminal` throws (minus the pool-name prefix) — the spec §1
 /// "same reason strings in the snapshot and the error" guarantee, so the two can never drift.
-TEST(CasLifecycleSnapshot, NaturalIdentityLostMatchesThrowReason)
+TEST(CasLifecycleSnapshot, NaturalIdentityLostMatchesThrowDetail)
 {
     auto backend = std::make_shared<DB::Cas::InMemoryBackend>();
     auto store = DB::Cas::tests::openPoolForTest(backend);
@@ -207,10 +216,10 @@ TEST(CasLifecycleSnapshot, NaturalIdentityLostMatchesThrowReason)
     const DB::Cas::Pool::LifecycleSnapshot snap = store->lifecycleSnapshot();
     EXPECT_EQ(snap.lifecycle, PoolLifecycle::IdentityLost);
     EXPECT_NE(snap.since, 0) << "the natural enterIdentityLost transition stamps the wall-clock `since`";
-    EXPECT_FALSE(snap.reason.empty());
+    EXPECT_FALSE(snap.detail.empty());
 
-    /// The snapshot reason is the SAME [D5] detail the typed error surfaces: the throw is
-    /// "content-addressed pool '<srid>' <reason>", so the error message must contain the snapshot reason.
+    /// The snapshot detail is the SAME [D5] text the typed error surfaces: the throw is
+    /// "content-addressed pool '<srid>' <detail>", so the error message must contain the snapshot detail.
     std::string thrown;
     try
     {
@@ -221,7 +230,7 @@ TEST(CasLifecycleSnapshot, NaturalIdentityLostMatchesThrowReason)
     {
         thrown = std::string(e.message());
     }
-    EXPECT_NE(thrown.find(snap.reason), std::string::npos)
-        << "snapshot reason and the typed error must not drift\n  reason: " << snap.reason
+    EXPECT_NE(thrown.find(snap.detail), std::string::npos)
+        << "snapshot detail and the typed error must not drift\n  detail: " << snap.detail
         << "\n  thrown: " << thrown;
 }

@@ -370,13 +370,13 @@ void Pool::throwIfLifecycleTerminal() const
 
 Pool::LifecycleSnapshot Pool::lifecycleSnapshot() const
 {
-    /// Non-gated, I/O-free (spec §7). Read the lifecycle ONCE (acquire), then the reason/`since` it
+    /// Non-gated, I/O-free (spec §7). Read the lifecycle ONCE (acquire), then the detail/`since` it
     /// implies. `lifecycleReasonDetail` reads `vanishedReason()` only for a terminal state we have already
     /// acquire-observed here, and `since` was release-stored before the same transition — so this coherent
-    /// triple never mixes a terminal state with a pre-terminal reason/timestamp.
+    /// triple never mixes a terminal state with a pre-terminal detail/timestamp.
     LifecycleSnapshot snap;
     snap.lifecycle = mount_runtime.lifecycle();
-    snap.reason = lifecycleReasonDetail(snap.lifecycle);
+    snap.detail = lifecycleReasonDetail(snap.lifecycle);
     snap.since = mount_runtime.lifecycleSinceWallS();
     return snap;
 }

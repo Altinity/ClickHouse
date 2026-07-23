@@ -49,7 +49,8 @@ StorageSystemContentAddressedMounts::StorageSystemContentAddressedMounts(const S
         {"last_success_age_seconds", std::make_shared<DataTypeNullable>(std::make_shared<DataTypeUInt64>()), "Seconds since this disk's GC last led a round (0 if it never led). NULL on rows describing other servers' mounts."},
         {"wedged_namespace_count", std::make_shared<DataTypeNullable>(std::make_shared<DataTypeUInt64>()), "Ref-append lanes currently wedged on this disk. NULL on rows describing other servers' mounts."},
         {"lifecycle", std::make_shared<DataTypeString>(), "This server's content-addressed pool lifecycle for the disk (non-gated snapshot, always populated so a not-live disk stays visible): live, not_live, identity_lost, vanished, constructing (never started) or shutdown (torn down)."},
-        {"lifecycle_reason", std::make_shared<DataTypeString>(), "The typed reason detail naming the actual sub-state when not live: the vanish cause (data root erased / replaced by a foreign pool / decommissioned by SYSTEM CONTENT ADDRESSED FORGET) or the identity-loss diagnosis. Empty when live."},
+        {"lifecycle_reason", std::make_shared<DataTypeString>(), "The enum-clean sub-state word for a vanished disk: erased, replaced or forgotten. Empty for every other lifecycle (so lifecycle || '(' || lifecycle_reason || ')' reads e.g. vanished(forgotten))."},
+        {"lifecycle_detail", std::make_shared<DataTypeString>(), "The full typed reason text naming the actual cause when not live: the vanish diagnosis (data root erased / replaced by a foreign pool / decommissioned by SYSTEM CONTENT ADDRESSED FORGET at <time>) or the identity-loss message. Empty when live."},
         {"lifecycle_since", std::make_shared<DataTypeNullable>(std::make_shared<DataTypeDateTime>()), "When this server entered the current non-live lifecycle state. NULL when live (or the state is not backed by a live pool)."},
     }));
     storage_metadata.setVirtuals(createVirtuals());
@@ -93,6 +94,7 @@ Pipe StorageSystemContentAddressedMounts::read(
     MutableColumnPtr col_wedged = ColumnNullable::create(ColumnUInt64::create(), ColumnUInt8::create());
     MutableColumnPtr col_lifecycle = ColumnString::create();
     MutableColumnPtr col_lifecycle_reason = ColumnString::create();
+    MutableColumnPtr col_lifecycle_detail = ColumnString::create();
     MutableColumnPtr col_lifecycle_since = ColumnNullable::create(ColumnDateTime::create(), ColumnUInt8::create());
 
     const uint64_t now_ms = static_cast<uint64_t>(
@@ -105,6 +107,7 @@ Pipe StorageSystemContentAddressedMounts::read(
     {
         col_lifecycle->insert(snap.lifecycle);
         col_lifecycle_reason->insert(snap.reason);
+        col_lifecycle_detail->insert(snap.detail);
         if (snap.since != 0)
             col_lifecycle_since->insert(static_cast<UInt64>(snap.since));
         else
@@ -248,6 +251,7 @@ Pipe StorageSystemContentAddressedMounts::read(
     res_columns.emplace_back(std::move(col_wedged));
     res_columns.emplace_back(std::move(col_lifecycle));
     res_columns.emplace_back(std::move(col_lifecycle_reason));
+    res_columns.emplace_back(std::move(col_lifecycle_detail));
     res_columns.emplace_back(std::move(col_lifecycle_since));
 
     UInt64 num_rows = res_columns.at(0)->size();

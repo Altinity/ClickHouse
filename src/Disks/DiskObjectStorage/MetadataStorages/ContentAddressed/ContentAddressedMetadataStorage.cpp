@@ -91,6 +91,24 @@ const char * casLifecycleToString(Cas::PoolLifecycle lc)
     }
     return "unknown";
 }
+
+/// The ENUM-CLEAN `lifecycle_reason` word: the `vanished` sub-state (erased/replaced/forgotten) so a
+/// downstream `lifecycle || '(' || lifecycle_reason || ')'` yields exactly e.g. `vanished(forgotten)`.
+/// Empty for every non-`vanished` state (the `lifecycle` column already fully names those). The rich [D5]
+/// text is carried separately in `lifecycle_detail`.
+const char * casLifecycleReasonWord(Cas::PoolLifecycle lc)
+{
+    switch (lc)
+    {
+        case Cas::PoolLifecycle::Live:
+        case Cas::PoolLifecycle::TransientNotLive:
+        case Cas::PoolLifecycle::IdentityLost:      return "";
+        case Cas::PoolLifecycle::VanishedErased:    return "erased";
+        case Cas::PoolLifecycle::VanishedReplaced:  return "replaced";
+        case Cas::PoolLifecycle::VanishedForgotten: return "forgotten";
+    }
+    return "";
+}
 }
 
 /// ============================================================================================
@@ -414,14 +432,15 @@ CasLifecycleSnapshot ContentAddressedMetadataStorage::lifecycleSnapshot() const
         /// No pool published: the storage-level lifecycle (spec §1's Constructing/ShutDown). Distinguish
         /// the two by whether startup ever ran, which `pool_uuid` records (empty => never started). A
         /// disk that was mounted then torn down (shutdown, or a SYSTEM CONTENT ADDRESSED UNMOUNT before
-        /// Task 15 removes it) reports `shutdown`. reason/since stay empty/0 -- there is no terminal cause.
+        /// Task 15 removes it) reports `shutdown`. reason/detail/since stay empty/0 -- no terminal cause.
         snap.lifecycle = snap.pool_id.empty() ? "constructing" : "shutdown";
         return snap;
     }
 
     const Cas::Pool::LifecycleSnapshot ps = pool->lifecycleSnapshot();
     snap.lifecycle = casLifecycleToString(ps.lifecycle);
-    snap.reason = ps.reason;
+    snap.reason = casLifecycleReasonWord(ps.lifecycle);
+    snap.detail = ps.detail;
     snap.since = ps.since;
     return snap;
 }

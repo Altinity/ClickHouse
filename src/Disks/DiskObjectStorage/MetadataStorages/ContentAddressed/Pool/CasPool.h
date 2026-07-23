@@ -367,13 +367,15 @@ public:
 
     /// A non-gated, I/O-free lifecycle snapshot for `system.content_addressed_mounts` (spec §7,
     /// Factory class). Reads only the runtime's atomics — NO backend op — so it is truthful in EVERY
-    /// state, including the terminal ones the store()-class surface refuses. `reason` is the same [D5]
-    /// detail `throwIfLifecycleTerminal` throws (empty while `Live`/`TransientNotLive`); `since` is the
-    /// wall-clock second the current non-`Live` state was entered (0 while `Live`).
+    /// state, including the terminal ones the store()-class surface refuses. `detail` is the same [D5]
+    /// reason text `throwIfLifecycleTerminal` throws (empty while `Live`/`TransientNotLive`), which spec §1
+    /// requires appear verbatim in the snapshot; `since` is the wall-clock second the current non-`Live`
+    /// state was entered (0 while `Live`). The metadata-storage layer maps `lifecycle` to the operator
+    /// vocabulary and derives the enum-clean sub-state word separately (see `CasLifecycleSnapshot`).
     struct LifecycleSnapshot
     {
         PoolLifecycle lifecycle = PoolLifecycle::Live;
-        String reason;
+        String detail;
         time_t since = 0;
     };
     LifecycleSnapshot lifecycleSnapshot() const;
