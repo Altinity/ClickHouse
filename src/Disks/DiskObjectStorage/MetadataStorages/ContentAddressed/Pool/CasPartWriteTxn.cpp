@@ -1,5 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobMeta.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobUploadPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBlobHashingWriteBuffer.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
@@ -712,23 +713,37 @@ BlobUploadResult PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef &
     /// materializes the header+payload on-demand by re-invoking `source.write_payload` (re-reading the
     /// staged temp file). This is the only path that holds a full in-memory copy, and only when a
     /// condemned incarnation must actually be displaced — not the common fresh-upload path.
-    String overwrite_body;
-    {
-        WriteBufferFromString wb{overwrite_body};
-        writeString(buildHeader(), wb);
-        const size_t before = wb.count();
-        source.write_payload(wb);
-        wb.finalize();
-        const size_t written = wb.count() - before;
-        if (written != source.size)
-            throw Exception(ErrorCodes::LOGICAL_ERROR,
-                "uploadFromSource: source wrote {} bytes for overwrite, declared {}", written, source.size);
-    }
-    /// rev.7 [C2]: same as `resurrectStaged` above -- a raw, uncoupled backend call; fence-checked against
-    /// the displacement-decision generation before the durable write.
+    ///
+    /// Stage-1 §1 (condemned-local resurrection memory cap): under the fan-out N such displacements can
+    /// run at once, so N full bodies would sit in memory where the serial path held one. A byte-weighted
+    /// admission caps the aggregate. The weight is the checked header+payload size, known HERE before
+    /// materialization: `buildHeader` encodes to the pool's fixed `blob_header_len`, and `source.size` is
+    /// the payload length verified below, so `overwrite_weight` equals the materialized body size exactly.
+    /// A body heavier than the whole cap is admitted alone (exclusive), never waiting forever. The permit
+    /// covers materialization + putOverwrite ONLY: `admit` is declared before `overwrite_body`, so on scope
+    /// exit the body's destructor frees the bytes FIRST and the permit is released immediately after —
+    /// before the event/meta work below (`makeDepAndEmit`, `writeResurrectMetaClean`), per the spec order.
+    const uint64_t overwrite_weight = meta.blob_header_len + source.size;
     PutResult overwrite_res{};
-    store->checkFenceOrThrow(displace_admitted_generation);
-    overwrite_res = store->backend().putOverwrite(key, overwrite_body, hr.token);
+    {
+        ByteWeightedSemaphoreLock admit(condemnedUploadAdmission(), overwrite_weight);
+        String overwrite_body;
+        {
+            WriteBufferFromString wb{overwrite_body};
+            writeString(buildHeader(), wb);
+            const size_t before = wb.count();
+            source.write_payload(wb);
+            wb.finalize();
+            const size_t written = wb.count() - before;
+            if (written != source.size)
+                throw Exception(ErrorCodes::LOGICAL_ERROR,
+                    "uploadFromSource: source wrote {} bytes for overwrite, declared {}", written, source.size);
+        }
+        /// rev.7 [C2]: same as `resurrectStaged` above -- a raw, uncoupled backend call; fence-checked against
+        /// the displacement-decision generation before the durable write.
+        store->checkFenceOrThrow(displace_admitted_generation);
+        overwrite_res = store->backend().putOverwrite(key, overwrite_body, hr.token);
+    }
     if (overwrite_res.outcome == PutOutcome::Done)
     {
         const BlobDepRecord dep = makeDepAndEmit(overwrite_res.token);

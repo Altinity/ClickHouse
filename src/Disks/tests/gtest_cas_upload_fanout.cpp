@@ -2,6 +2,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobUploadPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobMeta.h>
@@ -12,6 +13,7 @@
 #include <Common/CurrentMetrics.h>
 #include <Common/Exception.h>
 #include <Common/ThreadPool.h>
+#include <base/scope_guard.h>
 
 #include <algorithm>
 #include <atomic>
@@ -22,6 +24,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <thread>
 #include <tuple>
 #include <vector>
 
@@ -779,4 +782,172 @@ TEST(CasUploadFanout, DispatchThrowStillDrains)
     EXPECT_TRUE(b->head(s->layout().blobKey(idOf(enqueued))).exists)
         << "the already-dispatched task was drained by the runner destructor before the stack unwound";
     EXPECT_EQ(build->depsSnapshotForTest().size(), 0u) << "merge-nothing on a dispatch throw";
+}
+
+namespace
+{
+
+/// Seed `payload` as a PRESENT, CONDEMNED blob so its `uploadBlobDetached` upload takes the
+/// condemned-LOCAL displacement branch: a local source re-uploads its own bytes via `putOverwrite`,
+/// which materializes the whole `header + payload` body in memory (the one branch the byte-weighted
+/// admission caps). Mirrors `arrangeWorldA`'s condemned-local seeding.
+void seedCondemnedLocal(InMemoryBackend & b, const PoolPtr & s, const String & payload, uint64_t round)
+{
+    seedPresentBody(b, s->layout(), s->poolMeta(), payload);
+    writeMetaClean(b, s->layout(), u128Of(payload), payload.size());
+    condemnMeta(b, s->layout(), u128Of(payload), round);
+}
+
+}
+
+/// Test 18 (spec §1 "Condemned-local resurrection memory cap"): N concurrent condemned-LOCAL
+/// resurrections, each materializing a body of ~0.4 * capacity, fan out through a pool wide enough to
+/// run them all at once. The byte-weighted admission holds the aggregate materialized bytes at or below
+/// the configured capacity, so the semaphore's peak in-flight (its conservative bound on peak
+/// materialized bytes -- a permit is held across the whole materialize+putOverwrite window) never
+/// exceeds the cap. A held-hook rendezvous pins two co-admitted bodies together so the peak is genuinely
+/// reached (the assertion is not vacuously satisfied by tasks that happened to serialize), and the cap
+/// provably holds some tasks back. Every resurrection still completes to Clean.
+TEST(CasUploadFanout, CondemnedCapLimitsPeakBytes)
+{
+    auto & admission = condemnedUploadAdmission();
+    admission.resetStatsForTest();
+    SCOPE_EXIT({ admission.setHeldHookForTest({}); });
+
+    const uint64_t capacity = admission.capacity();
+
+    auto b = std::make_shared<InMemoryBackend>();
+    /// HEAD-first never fires by size (threshold set absurdly high): the condemned displacement -- and
+    /// hence the in-memory materialization the cap governs -- always lands in `uploadFromSource`,
+    /// regardless of body size.
+    auto s = openPool(b, /*head_first_min_bytes=*/ (1ULL << 40));
+    const RootNamespace ns{"srv1/nsCondemnedCap"};
+    auto build = precommitBuildFor(s, ns, "part");
+
+    /// ~0.4 * capacity per body: two co-admit (2 * weight <= capacity), a third cannot (3 * weight >
+    /// capacity), where weight = blob_header_len + payload_size. The header must be negligible next to
+    /// the payload for that math to hold -- assert it, so a future header/capacity change fails loudly
+    /// here rather than silently making the test vacuous.
+    const size_t payload_size = static_cast<size_t>(capacity * 2 / 5);
+    ASSERT_GT(payload_size, 10 * s->poolMeta().blob_header_len)
+        << "payload must dwarf the header for the two-co-admit sizing to hold";
+
+    constexpr int kBlobs = 4;
+    std::vector<BlobUploadRequest> reqs;
+    std::vector<String> payloads;
+    for (int i = 0; i < kBlobs; ++i)
+    {
+        payloads.emplace_back(payload_size, static_cast<char>('A' + i));   /// distinct large bodies
+        seedCondemnedLocal(*b, s, payloads.back(), /*round=*/ 7 + i);
+        reqs.push_back(localRequest(payloads.back()));
+    }
+
+    /// Force the overlap: the held hook fires while a permit is held (before the body is materialized),
+    /// and a bounded rendezvous holds the two co-admitted permits together. A third task cannot get a
+    /// permit while two are held (the cap), so it waits at `acquire` and never reaches the hook -- the
+    /// rendezvous target is therefore 2, never `kBlobs`, and cannot deadlock. `total = kBlobs` lets a
+    /// final straggler release without a partner; the 10s bound is a pure hang guard.
+    ConcurrencyProbe probe;
+    probe.total = kBlobs;
+    admission.setHeldHookForTest([&](uint64_t) { probe.enter(2, std::chrono::seconds(10)); });
+
+    auto pool = makePool(kBlobs);
+    fanOutBlobUploads(*build, reqs, *pool);
+
+    const auto stats = admission.statsForTest();
+    EXPECT_LE(stats.peak_in_flight, capacity) << "aggregate materialized bytes never exceed the cap";
+    EXPECT_GE(stats.peak_holders, 2u) << "two condemned bodies materialized concurrently (the cap is not vacuous)";
+    EXPECT_LT(stats.peak_holders, static_cast<uint32_t>(kBlobs)) << "the cap held some resurrections back";
+    EXPECT_FALSE(stats.co_hold_violation);
+
+    for (const auto & p : payloads)
+        EXPECT_EQ(metaStateAt(*b, s->layout(), p), std::optional<MetaState>(MetaState::Clean))
+            << "every condemned-local resurrection completed";
+}
+
+/// Test 18 (spec §1, overweight leg): a single condemned-LOCAL body larger than the WHOLE admission
+/// capacity cannot satisfy the counting rule, so it acquires EXCLUSIVE access -- it runs alone and
+/// completes rather than waiting forever. Exclusion is proven deterministically: while the overweight
+/// holds (pinned open by the held hook), a normal probe acquire on the same admission is shown to block
+/// on the wait queue (its wait hook fires before it sleeps), and the semaphore's exclusivity witness
+/// (`co_hold_violation`) stays false. Once the overweight releases, the probe admits and the
+/// resurrection has completed to Clean.
+TEST(CasUploadFanout, OverweightBlobRunsExclusively)
+{
+    auto & admission = condemnedUploadAdmission();
+    admission.resetStatsForTest();
+
+    const uint64_t capacity = admission.capacity();
+    const size_t overweight_payload = static_cast<size_t>(capacity) + (256u << 10);   /// weight > capacity
+
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = openPool(b, /*head_first_min_bytes=*/ (1ULL << 40));
+    const RootNamespace ns{"srv1/nsOverweight"};
+    auto build = precommitBuildFor(s, ns, "part");
+
+    const String big(overweight_payload, 'Z');
+    seedCondemnedLocal(*b, s, big, /*round=*/ 42);
+
+    BoundedEvent ow_holding;
+    BoundedEvent ow_release;
+    BoundedEvent probe_blocked;
+    std::atomic<bool> probe_acquired{false};
+
+    /// Cleanup runs in REVERSE declaration order: this thread-join guard runs BEFORE the hook-clearing
+    /// one below, so even if an assertion returns early we unlatch the exclusive holder (`ow_release`),
+    /// drain both threads, and only THEN clear the hooks -- never clearing a hook a live thread is inside.
+    std::thread fanout;
+    std::thread probe;
+    SCOPE_EXIT({ admission.setHeldHookForTest({}); admission.setWaitHookForTest({}); });
+    SCOPE_EXIT({
+        ow_release.fire();
+        if (probe.joinable()) probe.join();
+        if (fanout.joinable()) fanout.join();
+    });
+
+    /// The wait hook fires the first time an acquire cannot admit and is about to block. In this test the
+    /// overweight acquires with `in_flight == 0` (no drain wait), so the ONLY caller that blocks -- and
+    /// thus the only one that fires this -- is the normal probe held off by the exclusive holder.
+    admission.setWaitHookForTest([&] { probe_blocked.fire(); });
+    /// Hold the exclusive window open: only the overweight permit (weight > capacity) latches.
+    admission.setHeldHookForTest([&](uint64_t weight)
+    {
+        if (weight > capacity)
+        {
+            ow_holding.fire();
+            /// Released deterministically by the test (or the cleanup guard); the 10s bound only guards a hang.
+            (void)ow_release.wait(std::chrono::seconds(10));
+        }
+    });
+
+    auto pool = makePool(2);
+    std::vector<BlobUploadRequest> reqs{localRequest(big)};
+    fanout = std::thread([&] { fanOutBlobUploads(*build, reqs, *pool); });
+
+    /// The overweight drained an empty semaphore, so it acquired exclusively at once and now holds.
+    ASSERT_TRUE(ow_holding.wait(std::chrono::seconds(10))) << "overweight blob acquired the exclusive window";
+    EXPECT_EQ(admission.statsForTest().exclusive_grants, 1u) << "the branch took the exclusive (overweight) path";
+
+    /// A normal probe acquire must block while the exclusive holder runs.
+    probe = std::thread([&]
+    {
+        condemnedUploadAdmission().acquire(1024);
+        probe_acquired = true;
+        condemnedUploadAdmission().release(1024);
+    });
+
+    /// Deterministic: the exclusive holder makes the normal admit predicate false, so the probe cannot
+    /// admit and MUST enter the wait -- its wait hook fires. The bound is only a hang guard.
+    ASSERT_TRUE(probe_blocked.wait(std::chrono::seconds(10))) << "the probe acquire blocked behind the exclusive holder";
+    EXPECT_FALSE(probe_acquired.load()) << "no normal permit is co-held during the exclusive window";
+    EXPECT_FALSE(admission.statsForTest().co_hold_violation);
+
+    ow_release.fire();
+    fanout.join();
+    probe.join();
+
+    EXPECT_TRUE(probe_acquired.load()) << "the probe admits once the exclusive holder releases";
+    EXPECT_FALSE(admission.statsForTest().co_hold_violation);
+    EXPECT_EQ(metaStateAt(*b, s->layout(), big), std::optional<MetaState>(MetaState::Clean))
+        << "the overweight condemned-local resurrection completed (never waited forever)";
 }

@@ -153,6 +153,16 @@ namespace
     committing a content-addressed (CAS) part. `content_addressed_blob_upload_pool_size` limits the
     maximum number of threads in the pool. Zero is rejected: the pool must have at least one thread.
     )", 0) \
+    DECLARE(UInt64, content_addressed_condemned_upload_memory_bytes, 0, R"(
+    Aggregate memory budget, in bytes, for the one content-addressed (CAS) upload branch that
+    materializes a whole blob body in memory: resurrecting a condemned incarnation with a local source
+    (its `putOverwrite` has no streaming variant). Under the parallel blob-upload fan-out several such
+    resurrections can run at once, so this caps the total materialized bytes across them. `0` (the
+    default) derives the budget from `content_addressed_blob_upload_pool_size` times a 64 MiB per-task
+    budget (64 MiB is the CAS object size cap), i.e. one full-sized condemned body per pool thread. A
+    single blob larger than the whole budget is admitted alone. Other upload branches stream and are
+    unaffected.
+    )", 0) \
     DECLARE(UInt64, max_format_parsing_thread_pool_free_size, 0, R"(
     Maximum number of idle standby threads to keep in the thread pool for parsing input.
     )", 0) \

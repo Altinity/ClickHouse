@@ -64,6 +64,18 @@ inline void ensureBlobUploadPoolForTest(size_t size = 8)
         DB::Cas::initializeBlobUploadPool(size);
 }
 
+/// Bring up the condemned-local upload admission (stage-1 §1) if it is not already up, so any test that
+/// drives a condemned-local resurrection through `uploadBlobDetached` finds it initialized (the branch
+/// reaches `Cas::condemnedUploadAdmission()` fail-loud, like the pool getter). ROBUST for the same
+/// reason as `ensureBlobUploadPoolForTest`. The default capacity (1 MiB) is small enough for cheap
+/// byte-weighted tests yet far larger than the fixed blob header, so a couple of a few-hundred-KiB
+/// bodies co-admit while more are held -- the sizing tests 18 rely on.
+inline void ensureCondemnedUploadAdmissionForTest(uint64_t capacity_bytes = 1ULL << 20)
+{
+    if (!DB::Cas::condemnedUploadAdmissionInitializedForTest())
+        DB::Cas::initializeCondemnedUploadAdmission(capacity_bytes, /*pool_size=*/0);
+}
+
 /// Minimal `ContentAddressedSettings` for a direct-construction gtest fixture: sets only
 /// `server_root_id` and `scratch_path` (the two values every positional-ctor call site used to pass
 /// explicitly) and validates, so the cached enum-valued accessors (`stagingBackend`, `blobHashAlgo`,
