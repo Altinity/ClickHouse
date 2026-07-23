@@ -186,6 +186,10 @@
   message: 'Not found column __table1.'
   check_types:
   - DatabaseReplicated
+- name: 04299_constraint_subst_correlated_subquery_root
+  reason: 'KNOWN: Issue #2051, fix pending in #2108.'
+  check_types:
+  - ParallelReplicas
 
 # Regex rules should be ordered from most specific to least specific.
 # regex: true applies to name, message, and not_message fields, but not to reason or check_types fields.
