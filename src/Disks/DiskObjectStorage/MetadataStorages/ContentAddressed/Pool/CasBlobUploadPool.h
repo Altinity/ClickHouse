@@ -21,7 +21,9 @@ namespace DB::Cas
 /// Throws `BAD_ARGUMENTS` if `size == 0`. Throws `LOGICAL_ERROR` if already initialized.
 void initializeBlobUploadPool(size_t size);
 
-/// Throws `LOGICAL_ERROR` if the pool has not been initialized.
+/// Throws `LOGICAL_ERROR` if the pool has not been initialized. The returned reference is only
+/// valid while the pool stays initialized: callers must not race this against
+/// `shutdownBlobUploadPool` (in the server, shutdown runs after query drain; tests own the order).
 ThreadPool & blobUploadPool();
 
 /// Idempotent: safe to call multiple times, and safe to call even if never initialized. Joins all

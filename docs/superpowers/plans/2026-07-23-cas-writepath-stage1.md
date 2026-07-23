@@ -39,7 +39,7 @@ Each task below names its spec section; the task brief = this plan section + tha
 
 **Files:**
 - Create: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobUploadPool.h`, `.cpp`
-- Modify: `src/Core/ServerSettings.cpp` (add `content_addressed_blob_upload_pool_size`, default `16`), `programs/server/Server.cpp` (initialize after the other global pools; shutdown symmetrically)
+- Modify: `src/Core/ServerSettings.cpp` (add `content_addressed_blob_upload_pool_size`, default `16`), `programs/server/Server.cpp` (initialize after the other global pools; shutdown follows the documented IO-pools convention at `Server.cpp:1578` — the pool outlives object-storage teardown, which is safe because T5's submit-and-join discipline means no task outlives its transaction scope)
 - Test: `src/Disks/tests/gtest_cas_blob_upload_pool.cpp`
 
 **Interfaces (Produces):**
