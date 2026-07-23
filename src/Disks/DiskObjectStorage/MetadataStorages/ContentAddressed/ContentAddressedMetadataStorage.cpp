@@ -46,7 +46,6 @@ namespace ErrorCodes
     extern const int NETWORK_ERROR;
     extern const int NOT_IMPLEMENTED;
     extern const int INVALID_STATE;
-    extern const int TIMEOUT_EXCEEDED;
 }
 
 namespace ContentAddressedSetting
@@ -138,12 +137,10 @@ const char * casLifecycleReasonWord(Cas::PoolLifecycle lc)
 /// ContentRead: getFileSize, getLastModified, getStorageObjects, getBlobViewPlan, readBlobPayload,
 ///              prepareInManifestRead, tryGetInManifestBytes, getPartManifestBytes.
 /// Write:       adoptPartFromManifest.
-/// Admin:       runOneGcRoundForTest, runGarbageCollectionRoundNow, runGcRebuildNow, runFsckNow (on a
-///              RUNNING disk -- the rev.8 FSCK-on-mounted path; a DORMANT disk keeps a transitional
-///              observe-only view instead, rewired at Task 15).
-/// Lifecycle/uncgated drivers (NOT op-gated -- they DRIVE the state): startup, shutdown,
-///   unmountSynchronously, mountExplicitly. store()/partAccess()/poolAccess() are the internal accessors,
-///   not public op entries.
+/// Admin:       runOneGcRoundForTest, runGarbageCollectionRoundNow, runGcRebuildNow, runFsckNow (the
+///              rev.8 FSCK-on-running path -- an FSCK of a not-live disk is refused by the Admin gate).
+/// Lifecycle/uncgated drivers (NOT op-gated -- they DRIVE the state): startup, shutdown, forgetDisk,
+///   gcStop, gcStart. store()/partAccess()/poolAccess() are the internal accessors, not public op entries.
 ///   namespaceFilesReadable, stagingKeyPrefix, detachedRefNames, movingRefNames are post-gate helpers
 ///   (their public callers gate first; they reach store() only in the Live case).
 ///   confirmPoolIdentityForEmptyEnumeration is a post-gate helper too (the EMPTY-PROOF RULE, Task 9):
@@ -165,11 +162,10 @@ const char * casLifecycleReasonWord(Cas::PoolLifecycle lc)
 ///   tryGetInFlightFileSize/hasInFlightDirectory/listInFlightDirectory (they read THIS transaction's own
 ///   in-memory staging; a vanished-disk transaction has none because its writes threw at writeFile).
 ///
-/// Transitional rule (Task 15): a Dormant disk (SYSTEM CONTENT ADDRESSED UNMOUNT) keeps its OLD
-/// benign-absent / not-mounted behavior. The probe surface keeps its landed `if (!isMounted()) return
-/// absent;` guard AHEAD of `checkOpAdmitted`, and the gate's own not-Mounted branch mirrors it -- both
-/// marked [Task 15]. When Task 15 removes `MountState`, those guards and that branch go, leaving the pool
-/// lifecycle as the sole authority.
+/// Null-pool rule: a storage with no published pool (before `startup` or after `shutdown` -- the
+/// storage-level Constructing/ShutDown lifecycle) fails loud for EVERY class, `Probe` included, via
+/// `throwStorageNotStarted`. There is no benign "absent" answer for a storage that has never published a
+/// pool (or torn one down); the pool lifecycle below is the sole authority for a published pool.
 /// ============================================================================================
 
 namespace
@@ -376,12 +372,12 @@ void ContentAddressedMetadataStorage::runOneGcRoundForTest()
         std::lock_guard ptr_lock(pointer_mutex);
         if (!gc_scheduler)
         {
-            /// A Dormant/Unmounting disk here is a normal operational state (from Task 6 on, reachable
-            /// via `SYSTEM CONTENT ADDRESSED UNMOUNT`), not a programming invariant -- surface the same
-            /// `INVALID_STATE` refusal `poolAccess()` gives, never `LOGICAL_ERROR` (which would abort
-            /// under debug/ASan builds).
+            /// `checkOpAdmitted(Admin)` above already fails loud on a null pool; this is the defensive
+            /// re-check for a concurrent `shutdown` reset between the two `pointer_mutex` acquisitions.
+            /// Surface the same `INVALID_STATE` refusal `poolAccess()` gives, never `LOGICAL_ERROR`
+            /// (which would abort under debug/ASan builds).
             if (!cas_store)
-                throwNotMounted(mount_state);
+                throwStorageNotStarted();
             gc_scheduler = std::make_shared<Cas::CasGcScheduler>(
                 cas_store, gc_interval, fmt::format("{}::ContentAddressedGC", storage_path_full),
                 disk_name, makeGcRoundLogger());
@@ -431,8 +427,8 @@ CasLifecycleSnapshot ContentAddressedMetadataStorage::lifecycleSnapshot() const
     {
         /// No pool published: the storage-level lifecycle (spec §1's Constructing/ShutDown). Distinguish
         /// the two by whether startup ever ran, which `pool_uuid` records (empty => never started). A
-        /// disk that was mounted then torn down (shutdown, or a SYSTEM CONTENT ADDRESSED UNMOUNT before
-        /// Task 15 removes it) reports `shutdown`. reason/detail/since stay empty/0 -- no terminal cause.
+        /// disk that was started then torn down (shutdown) reports `shutdown`. reason/detail/since stay
+        /// empty/0 -- no terminal cause.
         snap.lifecycle = snap.pool_id.empty() ? "constructing" : "shutdown";
         return snap;
     }
@@ -569,11 +565,11 @@ Cas::RoundReport ContentAddressedMetadataStorage::runGarbageCollectionRoundNow()
         std::lock_guard ptr_lock(pointer_mutex);
         if (!gc_scheduler)
         {
-            /// Same Dormant/Unmounting-is-normal reasoning as `runOneGcRoundForTest` above: this is the
-            /// entry point `SYSTEM CONTENT ADDRESSED GC RUN <disk>` reaches directly, so an unmounted
-            /// disk here must be a normal `INVALID_STATE` refusal, never a `LOGICAL_ERROR` abort.
+            /// Same reasoning as `runOneGcRoundForTest` above: `checkOpAdmitted(Admin)` already failed
+            /// loud on a null pool, so this is the defensive re-check for a concurrent `shutdown` reset
+            /// -- a normal `INVALID_STATE` refusal, never a `LOGICAL_ERROR` abort.
             if (!cas_store)
-                throwNotMounted(mount_state);
+                throwStorageNotStarted();
             gc_scheduler = std::make_shared<Cas::CasGcScheduler>(
                 cas_store, gc_interval, fmt::format("{}::ContentAddressedGC", storage_path_full),
                 disk_name, makeGcRoundLogger());
@@ -603,7 +599,7 @@ Cas::RebuildReport ContentAddressedMetadataStorage::runGcRebuildNow(bool force) 
     return gc.rebuildBaseline(force);
 }
 
-ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openPoolView(bool observe_only) const
+ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openPoolView() const
 {
     /// Native mode rides real conditional ops (probed fail-closed by Pool::open); Local object
     /// storage has none, so the backend emulates exact token semantics in-process (single server).
@@ -668,11 +664,9 @@ ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openP
     pool_config.pool_prefix = pool_prefix;
     pool_config.server_id = serverIdToU128(server_id);
     pool_config.server_root_id = server_root_id;
-    /// `observe_only` (the FSCK TEMPORARY view) forces the same no-watermark/read-only posture as a
-    /// persistently read-only disk, regardless of this disk's own `read_only` member -- a scan must
-    /// never probe/schedule against a pool it does not own the lifecycle of.
-    pool_config.background_watermark = (context != nullptr) && !read_only && !observe_only;
-    pool_config.read_only = read_only || observe_only;
+    /// A read-only (`<readonly>`) disk opens with no background watermark and no write probe.
+    pool_config.background_watermark = (context != nullptr) && !read_only;
+    pool_config.read_only = read_only;
     pool_config.skip_access_check = skip_access_check;
     /// The node-local write algorithm: `PoolMeta::createOrValidate` accepts it with no write once
     /// it is a member of the pool's `algos_used`; a not-yet-admitted algo is admitted via
@@ -711,7 +705,7 @@ void ContentAddressedMetadataStorage::startup()
     /// very end. This makes a mid-startup throw leave the object exactly as unstarted as it was on
     /// entry (the `if (cas_store) return;` head above still sees an empty pool), so a caller can
     /// retry `startup` after a transient failure instead of being stuck with a half-built mount.
-    PoolView view = openPoolView(/* observe_only= */ false);
+    PoolView view = openPoolView();
     physical_key_prefix = view.physical_key_prefix;
     auto pool = std::move(view.pool);
     auto uuid = Cas::u128ToHex(pool->poolMeta().pool_id);
@@ -786,17 +780,15 @@ void ContentAddressedMetadataStorage::startup()
 
     /// The single publish step: as the LAST action of `startup`, atomically hand the fully-built
     /// pool, part-folder facade, and GC scheduler to the members other threads observe through
-    /// `store`/`partAccess`/the GC entry points, and flip the mount lifecycle to `Mounted` in the
-    /// SAME acquisition -- so no caller of `poolAccess()` can ever observe a published pool paired
-    /// with a stale (pre-mount) state, or vice versa. Everything above only ever touched locals, so
-    /// any throw before this point (including from the fault-injection hook above) leaves those
-    /// members, and `mount_state`, exactly as they were on entry.
+    /// `store`/`partAccess`/the GC entry points, in ONE `pointer_mutex` acquisition -- so no caller of
+    /// `poolAccess()` can ever observe a half-published mount. Everything above only ever touched locals,
+    /// so any throw before this point (including from the fault-injection hook above) leaves those
+    /// members (a null `cas_store`) exactly as they were on entry.
     {
         std::lock_guard lock(pointer_mutex);
         cas_store = std::move(pool);
         part_access = std::move(facade);
         gc_scheduler = std::move(scheduler);
-        mount_state = MountState::Mounted;
     }
     pool_uuid = std::move(uuid);
     conditional_copy_supported = copy_supported;
@@ -814,101 +806,16 @@ void ContentAddressedMetadataStorage::shutdown()
         old_scheduler = std::move(gc_scheduler);
         gc_scheduler.reset();
         part_access.reset();
+        /// Terminal server-shutdown semantics: a one-way trip (no server-lifecycle "remount" after
+        /// shutdown). Nulling `cas_store` puts the storage back into the null-pool (ShutDown) lifecycle,
+        /// so `poolAccess()`/the gate report the same operational refusal post-shutdown as pre-startup.
         cas_store.reset();
-        /// Terminal server-shutdown semantics are unchanged: this is a one-way trip (there is no
-        /// server-lifecycle "remount" after shutdown). Setting `Dormant` here only makes `poolAccess()`
-        /// report the same operational refusal post-shutdown as it does pre-startup, instead of the
-        /// stale (and now-published-nothing) `Mounted` value lingering on a reset-but-not-relabeled object.
-        mount_state = MountState::Dormant;
     }
     /// `stop` joins the background threads. Runs outside pointer_mutex (no reset left to race:
     /// gc_scheduler is already null) but still inside round_lock, so a NEW round can't start here.
     /// old_scheduler keeps the object alive regardless.
     if (old_scheduler)
         old_scheduler->stop();
-}
-
-void ContentAddressedMetadataStorage::unmountSynchronously(uint64_t drain_timeout_ms)
-{
-    std::lock_guard lifecycle(lifecycle_mutex);
-    {
-        std::lock_guard lock(pointer_mutex);
-        if (mount_state == MountState::Dormant)
-            return;                                        /// idempotent no-op
-        mount_state = MountState::Unmounting;              /// gate: new operations now refuse
-    }
-    /// Stop the GC scheduler first (waits for an in-flight synchronous round, same as shutdown()).
-    {
-        std::lock_guard round_lock(gc_scheduler_mutex);
-        std::shared_ptr<Cas::CasGcScheduler> old_scheduler;
-        {
-            std::lock_guard lock(pointer_mutex);
-            old_scheduler = std::move(gc_scheduler);
-            gc_scheduler.reset();
-            part_access.reset();
-        }
-        if (old_scheduler)
-            old_scheduler->stop();
-    }
-    /// Drain: wait for outstanding store() snapshots to die. In-flight part writes pin the pool via
-    /// shared_from_this, so this naturally waits them out. Bounded slice-poll of use_count() -- a
-    /// deliberate wait for an EXTERNAL condition (snapshot holders finishing), not a race-fix sleep;
-    /// under the Unmounting gate the count is monotonically non-increasing.
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(drain_timeout_ms);
-    for (;;)
-    {
-        long holders = 0;
-        {
-            std::lock_guard lock(pointer_mutex);
-            if (!cas_store)
-                break;                                     /// resumed after a prior successful reset
-            holders = cas_store.use_count() - 1;           /// -1: our own member reference
-        }
-        if (holders <= 0)
-            break;
-        if (std::chrono::steady_clock::now() >= deadline)
-            throw Exception(ErrorCodes::TIMEOUT_EXCEEDED,
-                "content-addressed disk unmount: {} pool reference(s) still live after {} ms — "
-                "disk stays in Unmounting (new operations refused); retry UNMOUNT to resume",
-                holders, drain_timeout_ms);
-        sleepForMilliseconds(50);
-    }
-    /// Sole owner: this reset runs ~Pool synchronously (lease clean-release -- hardened in part 1b --
-    /// write-lane drain, background thread joins, farewell).
-    {
-        Cas::PoolPtr last;
-        {
-            std::lock_guard lock(pointer_mutex);
-            last = std::move(cas_store);
-            cas_store.reset();
-        }
-        last.reset();                                      /// ~Pool outside pointer_mutex
-    }
-    {
-        std::lock_guard lock(pointer_mutex);
-        mount_state = MountState::Dormant;
-    }
-}
-
-void ContentAddressedMetadataStorage::mountExplicitly()
-{
-    std::lock_guard lifecycle(lifecycle_mutex);
-    {
-        std::lock_guard lock(pointer_mutex);
-        if (mount_state == MountState::Mounted)
-            return;                                        /// idempotent no-op
-        if (mount_state == MountState::Unmounting)
-            throw Exception(ErrorCodes::INVALID_STATE,
-                "content-addressed disk mount: an unmount is in progress/incomplete — "
-                "retry SYSTEM CONTENT ADDRESSED UNMOUNT to finish it first");
-    }
-    /// `startup()` does not consult `shutdown_called` -- only `shutdown()` sets that latch and only
-    /// the synchronous GC round entry points read it (`runOneGcRoundForTest`/
-    /// `runGarbageCollectionRoundNow`/`runGcRebuildNow` above). That latch is the terminal
-    /// server-shutdown path and is untouched here, exactly as `unmountSynchronously` above leaves it
-    /// alone -- an explicit remount is a normal, repeatable lifecycle transition, not a server
-    /// restart.
-    startup();                                             /// atomic publish (Task 3) sets Mounted
 }
 
 namespace
@@ -931,7 +838,7 @@ void ContentAddressedMetadataStorage::forgetDisk()
     /// SYSTEM CONTENT ADDRESSED FORGET (spec §5): the operator force-Vanish. A lifecycle verb, NOT a
     /// store()-class op — it must work on a NOT-live disk (a stuck transient / IdentityLost pool), so it
     /// reaches the pool DIRECTLY, never through `poolAccess()`/`checkOpAdmitted` (which refuse a not-live
-    /// disk). Serialized against unmount/mount/fsck by `lifecycle_mutex`, and against a concurrent
+    /// disk). Serialized against FSCK / GC STOP / GC START by `lifecycle_mutex`, and against a concurrent
     /// synchronous GC round by `gc_scheduler_mutex` (a round holds the latter, so this waits it out).
     std::lock_guard lifecycle(lifecycle_mutex);
     std::lock_guard round_lock(gc_scheduler_mutex);
@@ -950,12 +857,12 @@ void ContentAddressedMetadataStorage::forgetDisk()
 
     if (!pool)
     {
-        /// Nothing mounted to forget (never started / already unmounted / shut down). The disk is already
-        /// not serving; a restart re-registers the name. Idempotent no-op. (The detached `scheduler` is
-        /// null here too — `cas_store`/`gc_scheduler` are published and cleared together.)
+        /// No published pool to forget (never started / shut down). The disk is already not serving; a
+        /// restart re-registers the name. Idempotent no-op. (The detached `scheduler` is null here too —
+        /// `cas_store`/`gc_scheduler` are published and cleared together.)
         LOG_WARNING(getLogger("ContentAddressedMetadataStorage"),
-            "SYSTEM CONTENT ADDRESSED FORGET on content-addressed disk '{}': not mounted — nothing to "
-            "decommission (a restart re-registers the name).", disk_name);
+            "SYSTEM CONTENT ADDRESSED FORGET on content-addressed disk '{}': no published pool — nothing "
+            "to decommission (a restart re-registers the name).", disk_name);
         return;
     }
 
@@ -974,11 +881,11 @@ void ContentAddressedMetadataStorage::forgetDisk()
 void ContentAddressedMetadataStorage::gcStop()
 {
     /// SYSTEM CONTENT ADDRESSED GC STOP (spec §6): stop ONLY the background GC scheduler. STOP-IN-PLACE --
-    /// the scheduler object is RETAINED in the member (contrast `forgetDisk`/`shutdown`/`unmountSynchronously`,
-    /// which `std::move` it out and destroy it): a later `gcStart` must re-enter the SAME instance so its
-    /// `gc_id` + lease observation history survive. Keeping it in the member also keeps `gcHealth` reading
-    /// the (stopped) state truthfully, rather than "no GC".
-    /// A lifecycle-control verb: serialized against unmount/mount/fsck/forget by `lifecycle_mutex`, and
+    /// the scheduler object is RETAINED in the member (contrast `forgetDisk`/`shutdown`, which `std::move`
+    /// it out and destroy it): a later `gcStart` must re-enter the SAME instance so its `gc_id` + lease
+    /// observation history survive. Keeping it in the member also keeps `gcHealth` reading the (stopped)
+    /// state truthfully, rather than "no GC".
+    /// A lifecycle-control verb: serialized against FSCK / forget / GC START by `lifecycle_mutex`, and
     /// against a concurrent synchronous GC round by `gc_scheduler_mutex` (a round holds the latter, so this
     /// waits it out). It does NOT consult `checkOpAdmitted` -- stopping GC works on ANY disk state, including
     /// a not-live/Vanished one (stopping the reclaimer on a sick disk is a legitimate operator action).
@@ -1020,7 +927,7 @@ void ContentAddressedMetadataStorage::gcStart()
         throw Exception(ErrorCodes::BAD_ARGUMENTS,
             "Garbage collection is not enabled on this content-addressed disk");
     /// Admin class (rev.7 spec §1): refuse on a transient / `IdentityLost` / `Vanished` pool (typed 668 /
-    /// [D5]) and on a not-mounted disk (`throwNotMounted`). Only a `Live` pool proceeds -- the same uniform
+    /// [D5]) and on a null pool (`throwStorageNotStarted`). Only a `Live` pool proceeds -- the same uniform
     /// gate every GC entry point uses (`runGarbageCollectionRoundNow` / `runGcRebuildNow`).
     checkOpAdmitted(CasOpClass::Admin);
     if (shutdown_called)
@@ -1033,11 +940,11 @@ void ContentAddressedMetadataStorage::gcStart()
         if (!gc_scheduler)
         {
             /// `Live` + `gc_enabled` + not read-only but no scheduler: reachable only when the disk was
-            /// mounted in a context that started none (e.g. a unit-test null context) or after a GC RUN that
+            /// started in a context that started none (e.g. a unit-test null context) or after a GC RUN that
             /// created a lazy one was never started. Create a STABLE instance now, mirroring the GC RUN entry
             /// points, so START is meaningful. (`checkOpAdmitted` above already proved `cas_store` is live.)
             if (!cas_store)
-                throwNotMounted(mount_state);
+                throwStorageNotStarted();
             gc_scheduler = std::make_shared<Cas::CasGcScheduler>(
                 cas_store, gc_interval, fmt::format("{}::ContentAddressedGC", storage_path_full),
                 disk_name, makeGcRoundLogger());
@@ -1053,81 +960,50 @@ void ContentAddressedMetadataStorage::gcStart()
 
 Cas::FsckReport ContentAddressedMetadataStorage::runFsckNow(bool detail) const
 {
-    /// Outermost lock (see its own doc comment): held for the WHOLE scan, so a concurrent MOUNT/UNMOUNT
-    /// cannot race the disk out from under an in-flight FSCK. Under it the mount state is stable.
+    /// Outermost lock (see its own doc comment): held for the WHOLE scan, so a concurrent lifecycle-control
+    /// verb (FORGET / GC STOP / GC START) cannot race the disk out from under an in-flight FSCK.
     std::lock_guard lifecycle(lifecycle_mutex);
-    MountState state;
-    {
-        std::lock_guard lock(pointer_mutex);
-        state = mount_state;
-    }
 
-    if (state == MountState::Mounted)
-    {
-        /// FSCK on a RUNNING disk (rev.8): scan the LIVE mounted pool directly. Admin class -- refuse on a
-        /// transient / IdentityLost / Vanished pool before touching it, exactly like the GC entry points
-        /// (`runGarbageCollectionRoundNow`/`runGcRebuildNow`). The scan is read-only and its findings are
-        /// revalidated against a fresh authoritative read (`CasFsck`'s Dangling / missing-manifest
-        /// rechecks), so concurrent writers never yield a phantom finding.
-        checkOpAdmitted(CasOpClass::Admin);
-        return Cas::runFsck(*store(), detail);
-    }
-
-    /// [Task 15] Transitional dormant observe-only path: an UNMOUNTed (Dormant) disk still FSCKs via a
-    /// TEMPORARY observe-only view (no probe, no watermark, no GC scheduler -- exactly the existing
-    /// `read_only` startup path; see `openPoolView`'s own doc comment). Never published to
-    /// `cas_store`/`part_access`/`mount_state`; destroyed (and its lease/background state torn down) when
-    /// `view` goes out of scope. Removed with `MountState` at Task 15. An Unmounting disk is a transient
-    /// window -> not mounted.
-    if (state != MountState::Dormant)
-        throwNotMounted(state);
-    PoolView view = openPoolView(/* observe_only= */ true);
-    return Cas::runFsck(*view.pool, detail);
+    /// FSCK scans the LIVE running pool directly (rev.8). Admin class -- refuse on a transient /
+    /// IdentityLost / Vanished / null pool before touching it, exactly like the GC entry points
+    /// (`runGarbageCollectionRoundNow`/`runGcRebuildNow`). The scan is read-only and its findings are
+    /// revalidated against a fresh authoritative read (`CasFsck`'s Dangling / missing-manifest rechecks),
+    /// so concurrent writers never yield a phantom finding.
+    checkOpAdmitted(CasOpClass::Admin);
+    return Cas::runFsck(*store(), detail);
 }
 
 ContentAddressedMetadataStorage::PoolAccessSnapshot ContentAddressedMetadataStorage::poolAccess() const
 {
     PoolAccessSnapshot snap;
-    MountState state;
     {
         std::lock_guard lock(pointer_mutex);
-        state = mount_state;
         snap.pool = cas_store;
         snap.part_access = part_access;
     }
-    /// `mount_state != Mounted` covers before-first-startup and after-shutdown/unmount uniformly (both
-    /// start/settle at `Dormant`); `!snap.pool` is a defensive belt-and-braces check for the same
-    /// condition (there is no valid combination where `mount_state == Mounted` and `cas_store` is
-    /// null -- the publish step in `startup` sets both together).
-    if (state != MountState::Mounted || !snap.pool)
-        throwNotMounted(state);
-    /// rev.7 §1: a `Mounted` pool that has entered a terminal lifecycle condition (`IdentityLost` or any
+    /// A null pool covers before-first-startup and after-shutdown uniformly -- the storage-level
+    /// Constructing/ShutDown lifecycle. Fail loud (spec §1's null-pool fail-loud); there is no benign
+    /// answer for a storage that has not published a pool.
+    if (!snap.pool)
+        throwStorageNotStarted();
+    /// rev.7 §1: a published pool that has entered a terminal lifecycle condition (`IdentityLost` or any
     /// `Vanished`) must ALSO refuse store()-class access, so nothing silently proceeds against an erased
-    /// or replaced data root. Both the `MountState` check above and this lifecycle check hold until Task
-    /// 15 removes `MountState`; the full six-class operation gate (which also gates the transient state
-    /// and answers truth-absent on removes/enumeration) is Task 8.
+    /// or replaced data root. This is the store()-class terminal check; the full six-class operation gate
+    /// (which also gates the transient state and answers truth-absent on removes/enumeration) is
+    /// `checkOpAdmitted`.
     snap.pool->throwIfLifecycleTerminal();
     return snap;
 }
 
-void ContentAddressedMetadataStorage::throwNotMounted(MountState state) const
+void ContentAddressedMetadataStorage::throwStorageNotStarted() const
 {
-    const char * state_name = "Unknown";
-    switch (state)
-    {
-        case MountState::Mounted:
-            state_name = "Mounted";
-            break;
-        case MountState::Unmounting:
-            state_name = "Unmounting";
-            break;
-        case MountState::Dormant:
-            state_name = "Dormant";
-            break;
-    }
+    /// No pool is published: the storage-level lifecycle is Constructing (before `startup`) or ShutDown
+    /// (after `shutdown`). `pool_uuid` is empty ONLY before the first successful startup (written once at
+    /// its end, never reset by `shutdown`), so it distinguishes the two, exactly as `lifecycleSnapshot()`
+    /// reports `constructing`/`shutdown`. Immutable-after-startup, so read without `pointer_mutex`.
+    const char * phase = pool_uuid.empty() ? "constructing" : "shutdown";
     throw Exception(ErrorCodes::INVALID_STATE,
-        "content-addressed disk '{}' is not mounted (state: {}) — run SYSTEM CONTENT ADDRESSED MOUNT",
-        disk_name, state_name);
+        "content-addressed disk '{}' is not started (storage lifecycle: {})", disk_name, phase);
 }
 
 Cas::PoolPtr ContentAddressedMetadataStorage::store() const
@@ -1138,12 +1014,6 @@ Cas::PoolPtr ContentAddressedMetadataStorage::store() const
 std::shared_ptr<Cas::CachedPartFolderAccess> ContentAddressedMetadataStorage::partAccess() const
 {
     return poolAccess().part_access;
-}
-
-bool ContentAddressedMetadataStorage::isMounted() const
-{
-    std::lock_guard lock(pointer_mutex);
-    return mount_state == MountState::Mounted && cas_store != nullptr;
 }
 
 void ContentAddressedMetadataStorage::checkNotReadOnly(std::string_view what) const
@@ -1161,26 +1031,18 @@ CasOpAdmission ContentAddressedMetadataStorage::checkOpAdmitted(CasOpClass op) c
     if (op == CasOpClass::Factory)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "checkOpAdmitted must not be called for the Factory class");
 
-    MountState state;
     Cas::PoolPtr pool;
     {
         std::lock_guard lock(pointer_mutex);
-        state = mount_state;
         pool = cas_store;
     }
 
-    /// [Task 15] Transitional MountState gate: the OLD behavior wins for a not-`Mounted` disk. A Dormant/
-    /// Unmounting disk (or the pre-publish/post-shutdown window) has no live pool and the new pool
-    /// lifecycle never moved for it (UNMOUNT does not set the lifecycle), so a `Probe` answers the landed
-    /// benign-absent (mirroring the retained `if (!isMounted()) return absent;` guards on the probe
-    /// surface) and every other class throws "not mounted" exactly as `poolAccess()` does. Removed with
-    /// `MountState` at Task 15, leaving the pool lifecycle below as the sole authority.
-    if (state != MountState::Mounted || !pool)
-    {
-        if (op == CasOpClass::Probe)
-            return CasOpAdmission::TruthAbsent;
-        throwNotMounted(state);
-    }
+    /// A null pool = the storage-level lifecycle is Constructing (before `startup`) or ShutDown (after
+    /// `shutdown`): fail loud for EVERY class, `Probe` included. There is no benign "absent" answer for a
+    /// storage that has never published a pool (or torn one down) -- only a genuinely `Vanished` POOL
+    /// (below) answers truth-absent. This is the spec §1 null-pool fail-loud contract.
+    if (!pool)
+        throwStorageNotStarted();
 
     /// The rev.7 six-class gate keyed on the pool lifecycle condition (spec §1).
     const Cas::PoolLifecycle lc = pool->lifecycle();
@@ -1398,10 +1260,8 @@ std::vector<std::string> ContentAddressedMetadataStorage::movingRefNames(const C
 
 bool ContentAddressedMetadataStorage::existsFile(const std::string & path) const
 {
-    /// [Task 15] A not-Mounted (Dormant) disk answers this read-only probe as absent, before any `store()`.
-    if (!isMounted())
-        return false;
-    /// Probe gate (rev.7 §1): real while live, throws while uncertain, truthfully absent once Vanished.
+    /// Probe gate (rev.7 §1): real while live, throws while uncertain (incl. a null/unstarted pool),
+    /// truthfully absent once Vanished.
     if (checkOpAdmitted(CasOpClass::Probe) == CasOpAdmission::TruthAbsent)
         return false;
     if (!Cas::isPartFilePath(path))
@@ -1531,9 +1391,6 @@ ContentAddressedMetadataStorage::DirRoute ContentAddressedMetadataStorage::class
 
 bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) const
 {
-    /// [Task 15] A not-Mounted (Dormant) disk answers this read-only probe as absent, before any `store()`.
-    if (!isMounted())
-        return false;
     if (checkOpAdmitted(CasOpClass::Probe) == CasOpAdmission::TruthAbsent)
         return false;
     const DirRoute dr = classifyDirectory(path);
@@ -1603,9 +1460,6 @@ bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) 
 
 bool ContentAddressedMetadataStorage::existsFileOrDirectory(const std::string & path) const
 {
-    /// [Task 15] A not-Mounted (Dormant) disk answers this read-only probe as absent, before any `store()`.
-    if (!isMounted())
-        return false;
     if (checkOpAdmitted(CasOpClass::Probe) == CasOpAdmission::TruthAbsent)
         return false;
     if (Cas::isPartFilePath(path))
@@ -1686,9 +1540,6 @@ Poco::Timestamp ContentAddressedMetadataStorage::getLastModified(const std::stri
 
 std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const std::string & path) const
 {
-    /// [Task 15] A not-Mounted (Dormant) disk enumerates as empty, before any `store()`.
-    if (!isMounted())
-        return {};
     if (checkOpAdmitted(CasOpClass::Probe) == CasOpAdmission::TruthAbsent)
         return {};
     const DirRoute dr = classifyDirectory(path);
@@ -1806,10 +1657,6 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
 
 DirectoryIteratorPtr ContentAddressedMetadataStorage::iterateDirectory(const std::string & path) const
 {
-    /// [Task 15] A not-Mounted (Dormant) disk iterates as empty, before any `store()` — the SAME empty
-    /// `StaticDirectoryIterator` the mounted path produces for a directory with no children.
-    if (!isMounted())
-        return std::make_unique<StaticDirectoryIterator>(std::vector<fs::path>{});
     if (checkOpAdmitted(CasOpClass::Probe) == CasOpAdmission::TruthAbsent)
         return std::make_unique<StaticDirectoryIterator>(std::vector<fs::path>{});
     /// Mirror MetadataStorageFromPlainObjectStorage: iterateDirectory includes the path.
@@ -1823,9 +1670,6 @@ DirectoryIteratorPtr ContentAddressedMetadataStorage::iterateDirectory(const std
 
 bool ContentAddressedMetadataStorage::isDirectoryEmpty(const std::string & path) const
 {
-    /// [Task 15] A not-Mounted (Dormant) disk reports every directory empty, before any `store()`.
-    if (!isMounted())
-        return true;
     /// A Vanished disk reports every directory empty too (truth): the ref-unlink removal path then
     /// proceeds, letting a vanished-disk table's DROP complete rather than throwing CANNOT_RMDIR.
     if (checkOpAdmitted(CasOpClass::Probe) == CasOpAdmission::TruthAbsent)
@@ -1897,10 +1741,6 @@ StoredObjects ContentAddressedMetadataStorage::getStorageObjects(const std::stri
 
 std::optional<StoredObjects> ContentAddressedMetadataStorage::getStorageObjectsIfExist(const std::string & path) const
 {
-    /// [Task 15] A not-Mounted (Dormant) disk answers this read-only "if exists" probe as absent, before
-    /// any `store()`. The non-`IfExist` `getStorageObjects` stays fail-close (still throws).
-    if (!isMounted())
-        return std::nullopt;
     /// A Vanished disk answers absent (truth). Probe first so the non-part `getStorageObjects` fallback
     /// below (ContentRead) is never reached on a Vanished disk.
     if (checkOpAdmitted(CasOpClass::Probe) == CasOpAdmission::TruthAbsent)
@@ -1938,13 +1778,10 @@ std::optional<String> ContentAddressedMetadataStorage::tryGetInManifestBytes(con
 {
     /// Speculative in-manifest probe: `DiskObjectStorage::prepareRead`/`getStorageObjects` call it before
     /// falling back to a real storage-object lookup, and both treat "not in-manifest" (`std::nullopt`) as a
-    /// normal outcome. [Task 15] A not-Mounted (Dormant) disk answers `std::nullopt` (benign), like the
-    /// probe surface. But this is a ContentRead: a Mounted disk in a terminal/uncertain lifecycle must
+    /// normal outcome. But this is a ContentRead: a disk in a terminal/uncertain/unstarted lifecycle must
     /// PROPAGATE the typed 668 rather than convert it into a silent-absent `std::nullopt` -- so the gate
     /// REPLACES the old catch-all that swallowed `poolAccess()`'s `INVALID_STATE` (which had hidden an
     /// erased/replaced/transient backing behind a FILE_DOESNT_EXIST-shaped answer).
-    if (!isMounted())
-        return std::nullopt;
     checkOpAdmitted(CasOpClass::ContentRead);
     const PoolAccessSnapshot snap = poolAccess();
 

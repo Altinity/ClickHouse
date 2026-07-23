@@ -77,8 +77,6 @@ private:
     BlockIO runContentAddressedGcRun(const String & disk_name);
     BlockIO runContentAddressedGcRebuild(const String & disk_name, bool force);
 
-    void contentAddressedUnmount(const String & disk_name);
-    void contentAddressedMount(const String & disk_name);
     BlockIO runContentAddressedFsck(const String & disk_name);
     void contentAddressedForget(const String & disk_name);
     void contentAddressedGcStop(const String & disk_name);

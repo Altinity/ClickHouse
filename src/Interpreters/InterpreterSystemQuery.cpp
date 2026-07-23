@@ -1031,18 +1031,6 @@ BlockIO InterpreterSystemQuery::execute()
             result = runContentAddressedGcRebuild(query.disk, query.content_addressed_gc_rebuild_force);
             break;
         }
-        case Type::CONTENT_ADDRESSED_UNMOUNT:
-        {
-            getContext()->checkAccess(AccessType::SYSTEM_CONTENT_ADDRESSED_UNMOUNT);
-            contentAddressedUnmount(query.disk);
-            break;
-        }
-        case Type::CONTENT_ADDRESSED_MOUNT:
-        {
-            getContext()->checkAccess(AccessType::SYSTEM_CONTENT_ADDRESSED_MOUNT);
-            contentAddressedMount(query.disk);
-            break;
-        }
         case Type::CONTENT_ADDRESSED_FSCK:
         {
             getContext()->checkAccess(AccessType::SYSTEM_CONTENT_ADDRESSED_FSCK);
@@ -2533,45 +2521,11 @@ BlockIO InterpreterSystemQuery::runContentAddressedGcRebuild(const String & disk
     return result;
 }
 
-void InterpreterSystemQuery::contentAddressedUnmount(const String & disk_name)
-{
-    auto disk = getContext()->getDisk(disk_name);                       /// UNKNOWN_DISK on bad name
-    auto * ca = ContentAddressedMetadataStorage::tryFromDisk(disk);
-    if (!ca)
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Disk '{}' is not a content-addressed disk", disk_name);
-
-    /// Live-table guard: refuse while any loaded table's storage policy references ANY disk sharing
-    /// this metadata storage (a CAS cache wrapper shares one storage between the base and cache
-    /// disks). Traversal mirrors restartDisk's.
-    Strings live_tables;
-    for (auto & elem : DatabaseCatalog::instance().getDatabases(GetDatabasesOptions{.with_remote_databases = false}))
-        for (auto it = elem.second->getTablesIterator(getContext(), {}, /*skip_not_loaded=*/true); it->isValid(); it->next())
-            if (auto * mt = dynamic_cast<MergeTreeData *>(it->table().get()))
-                for (const auto & table_disk : mt->getStoragePolicy()->getDisks())
-                    if (ContentAddressedMetadataStorage::tryFromDisk(table_disk) == ca)
-                        live_tables.push_back(it->table()->getStorageID().getNameForLogs());
-    if (!live_tables.empty())
-        throw Exception(ErrorCodes::BAD_ARGUMENTS,
-            "Cannot unmount content-addressed disk '{}': {} live table(s) reference it ({}); "
-            "drop or detach them first", disk_name, live_tables.size(), fmt::join(live_tables, ", "));
-
-    ca->unmountSynchronously();
-}
-
-void InterpreterSystemQuery::contentAddressedMount(const String & disk_name)
-{
-    auto disk = getContext()->getDisk(disk_name);
-    auto * ca = ContentAddressedMetadataStorage::tryFromDisk(disk);
-    if (!ca)
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Disk '{}' is not a content-addressed disk", disk_name);
-    ca->mountExplicitly();
-}
-
 BlockIO InterpreterSystemQuery::runContentAddressedFsck(const String & disk_name)
 {
     /// FSCK runs on a RUNNING disk (rev.8): the scan is read-only and revalidates every ref-walk finding
-    /// against a fresh authoritative read, so it needs no quiesce. A DORMANT (UNMOUNTed) disk is still
-    /// accepted transitionally (Task 15). The disk is REQUIRED, enforced by the parser -- no fan-out form.
+    /// against a fresh authoritative read, so it needs no quiesce. The disk is REQUIRED, enforced by the
+    /// parser -- no fan-out form.
     if (disk_name.empty())
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "SYSTEM CONTENT ADDRESSED FSCK requires an explicit disk name");
 
@@ -3238,16 +3192,6 @@ AccessRightsElements InterpreterSystemQuery::getRequiredAccessForDDLOnCluster() 
         case Type::CONTENT_ADDRESSED_DROP_POOL_MEMBER:
         {
             required_access.emplace_back(AccessType::SYSTEM_CONTENT_ADDRESSED_DROP_POOL_MEMBER);
-            break;
-        }
-        case Type::CONTENT_ADDRESSED_UNMOUNT:
-        {
-            required_access.emplace_back(AccessType::SYSTEM_CONTENT_ADDRESSED_UNMOUNT);
-            break;
-        }
-        case Type::CONTENT_ADDRESSED_MOUNT:
-        {
-            required_access.emplace_back(AccessType::SYSTEM_CONTENT_ADDRESSED_MOUNT);
             break;
         }
         case Type::CONTENT_ADDRESSED_FSCK:

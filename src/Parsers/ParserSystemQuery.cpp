@@ -486,14 +486,12 @@ bool ParserSystemQuery::parseImpl(IParser::Pos & pos, ASTPtr & node, Expected & 
                 return false;
             break;
         }
-        case Type::CONTENT_ADDRESSED_UNMOUNT:
-        case Type::CONTENT_ADDRESSED_MOUNT:
         case Type::CONTENT_ADDRESSED_FSCK:
         case Type::CONTENT_ADDRESSED_FORGET:
         case Type::CONTENT_ADDRESSED_GC_STOP:
         case Type::CONTENT_ADDRESSED_GC_START:
         {
-            /// SYSTEM CONTENT ADDRESSED UNMOUNT/MOUNT/FSCK/FORGET/GC STOP/GC START <disk> [ON CLUSTER cluster].
+            /// SYSTEM CONTENT ADDRESSED FSCK/FORGET/GC STOP/GC START <disk> [ON CLUSTER cluster].
             /// Unlike GC RUN, the disk is REQUIRED -- mirrors CONTENT_ADDRESSED_GC_REBUILD (minus the FORCE
             /// keyword): parseQueryWithOnClusterAndTarget requires the target, so omitting the disk is a
             /// syntax error rather than a silent fan-out across every content-addressed disk.

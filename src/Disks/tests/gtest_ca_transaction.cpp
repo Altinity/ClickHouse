@@ -18,7 +18,6 @@ namespace DB::ErrorCodes
 {
 extern const int NOT_IMPLEMENTED;
 extern const int INVALID_STATE;
-extern const int TIMEOUT_EXCEEDED;
 }
 
 /// [TXN-ONE-PIPELINE] CA publish-at-commit lock-scope tests.
@@ -680,20 +679,20 @@ TEST(CasTransactionRemove, CreateThenDirDropDoesNotPublish)
 }
 
 /// [Task 3] `startup()` publishes `cas_store`/`part_access`/`gc_scheduler` (and sets
-/// `pool_uuid`/`conditional_copy_supported`/`mount_state`) atomically as its LAST action. Everything
+/// `pool_uuid`/`conditional_copy_supported`) atomically as its LAST action. Everything
 /// before that point -- opening the pool, building the part-folder facade, the capability probe,
 /// starting the GC scheduler -- happens into locals first, so a throw anywhere along the way (here
 /// simulated via `startup_fault_injection_for_test`, injected right before the publish step) must
-/// leave nothing published: `store()` still refuses (still `Dormant`, [Task 4]'s `INVALID_STATE`)
-/// even though `Pool::open` and everything else already succeeded. Clearing the hook and retrying
-/// `startup()` must then succeed cleanly.
+/// leave nothing published: `store()` still refuses (null pool -- the Constructing lifecycle,
+/// `INVALID_STATE` "not started") even though `Pool::open` and everything else already succeeded.
+/// Clearing the hook and retrying `startup()` must then succeed cleanly.
 TEST(CasTransactionLifecycle, StartupFailureLatePublishesNothing)
 {
     auto storage = makeUnstartedTxStorage();
 
     storage->startup_fault_injection_for_test = [] { throw std::runtime_error("injected late-startup failure"); };
     EXPECT_ANY_THROW(storage->startup());
-    /// Nothing was published by the failed attempt: store() must still refuse (still Dormant).
+    /// Nothing was published by the failed attempt: store() must still refuse (null pool, not started).
     EXPECT_ANY_THROW(storage->store());
 
     storage->startup_fault_injection_for_test = {};
@@ -701,20 +700,21 @@ TEST(CasTransactionLifecycle, StartupFailureLatePublishesNothing)
     EXPECT_NO_THROW(storage->store());
 }
 
-/// [Task 4] The mount lifecycle gate: `store()` (and every other caller of `poolAccess()`) must
+/// [Task 4] The storage-lifecycle gate: `store()` (and every other caller of `poolAccess()`) must
 /// refuse with `INVALID_STATE` -- an operational condition, not a programming invariant -- whenever
-/// the disk is not `Mounted`. This is a deliberate behavior change from the previous
-/// `LOGICAL_ERROR "accessed before startup"`, which would abort a debug/sanitizer build on a
-/// mis-sequenced access instead of surfacing a catchable, operator-actionable error.
+/// no pool is published (the null-pool ShutDown lifecycle after `shutdown`). This is a deliberate
+/// behavior change from the previous `LOGICAL_ERROR "accessed before startup"`, which would abort a
+/// debug/sanitizer build on a mis-sequenced access instead of surfacing a catchable, operator-actionable
+/// error.
 TEST(CaWiring, OperationsRefuseWhenNotMounted)
 {
     auto storage = openTxStorage();
-    storage->shutdown();   /// today's terminal path resets cas_store and settles mount_state to Dormant
+    storage->shutdown();   /// terminal path resets cas_store to null (the ShutDown storage lifecycle)
 
     try
     {
         storage->store();
-        FAIL() << "store() must refuse once the disk is no longer mounted";
+        FAIL() << "store() must refuse once the disk has no published pool";
     }
     catch (const DB::Exception & e)
     {
@@ -722,109 +722,33 @@ TEST(CaWiring, OperationsRefuseWhenNotMounted)
     }
 }
 
-/// [Task 5] `unmountSynchronously` is a resumable quiescence barrier: `Mounted -> Unmounting ->
-/// Dormant`. With no outstanding pool references the drain completes immediately, `store()` then
-/// refuses (Dormant), a repeated `unmountSynchronously()` is a no-op, `mountExplicitly()` remounts
-/// (Dormant -> Mounted via `startup()`), and a repeated `mountExplicitly()` is a no-op too.
-TEST(CaLifecycle, UnmountDrainsAndIsIdempotent)
+/// (rev.8, Task 15) The Dormant/UNMOUNT lifecycle rollback flips the transitional benign-absent probe
+/// behavior to fail-loud on a NULL pool. A storage with no published pool (here: after `shutdown()`, the
+/// null-pool ShutDown storage lifecycle) refuses the ENTIRE surface -- including the read-only
+/// existence/enumeration probes that the old (now-deleted) `DormantDiskAnswersExistenceProbesAsAbsent`
+/// asserted answered benign-absent. This is spec §1's null-pool fail-loud contract: every op class,
+/// `Probe` included, throws `INVALID_STATE` ("not started"); a genuinely `Vanished` POOL is the only
+/// state that answers truth-absent, and a null pool is not that. (Behavior change documented in the
+/// Task 15 report: generic all-disk existence sweeps during server shutdown now see a throw here, not a
+/// benign absent; the shutdown window is the deliberate cost of never lying about a not-started disk.)
+TEST(CaLifecycle, ShutdownDiskProbesFailLoud)
 {
     auto storage = openTxStorage();
-    storage->unmountSynchronously();
-    EXPECT_ANY_THROW(storage->store());                    /// gated
-    EXPECT_NO_THROW(storage->unmountSynchronously());      /// Dormant -> no-op
-    EXPECT_NO_THROW(storage->mountExplicitly());           /// Dormant -> Mounted
-    EXPECT_NO_THROW(storage->store());
-    EXPECT_NO_THROW(storage->mountExplicitly());           /// Mounted -> no-op
-}
-
-/// [Task 5] `unmountSynchronously` refuses to complete while a snapshot (an outstanding `Cas::PoolPtr`
-/// from `store()`) is still live -- the drain deadline elapses and the disk stays `Unmounting`, which
-/// refuses both new pool access AND a mount attempt (mounting on top of an incomplete unmount would
-/// let two live pool snapshots for the same pool exist under different mount generations). Releasing
-/// the held snapshot lets a retried `unmountSynchronously()` finish the drain and settle to `Dormant`.
-TEST(CaLifecycle, UnmountTimesOutWhileSnapshotHeldThenResumes)
-{
-    auto storage = openTxStorage();
-    auto held = storage->store();                          /// outstanding PoolPtr
-    try
-    {
-        storage->unmountSynchronously(/*drain_timeout_ms=*/100);
-        FAIL() << "must time out";
-    }
-    catch (const DB::Exception & e)
-    {
-        EXPECT_EQ(e.code(), DB::ErrorCodes::TIMEOUT_EXCEEDED) << e.message();
-    }
-    EXPECT_ANY_THROW(storage->store());                    /// state stays Unmounting: new ops refused
-    EXPECT_ANY_THROW(storage->mountExplicitly());          /// MOUNT from Unmounting refused
-    held.reset();
-    EXPECT_NO_THROW(storage->unmountSynchronously());      /// resume completes
-    EXPECT_NO_THROW(storage->mountExplicitly());
-}
-
-/// [Task 5] The clean-reuse contract: `UNMOUNT` then wiping the backing store entirely (the on-disk
-/// equivalent of `rm -rf` the pool root) then `MOUNT` must open a FRESH pool -- a brand-new
-/// `pool_uuid`, not a stale identity carried over from the wiped generation. `LocalObjectStorage`
-/// treats a missing root as an empty listing (see `listObjects`), so `Pool::open` mints a new pool
-/// exactly as it would against a never-used root.
-TEST(CaLifecycle, RemountAfterBackingWipeMintsFreshPool)
-{
-    auto storage = openTxStorage();
-    const String uuid_before = storage->getPoolUUID();     /// real accessor: getPoolUUID(), not poolUuid()
-    storage->unmountSynchronously();
-
-    const auto root = storage->objectStorage()->getCommonKeyPrefix();
-    std::filesystem::remove_all(root);
-
-    EXPECT_NO_THROW(storage->mountExplicitly());
-    EXPECT_NE(storage->getPoolUUID(), uuid_before) << "a wiped backing store must remount as a brand-new pool";
-}
-
-/// [Task 8a] A not-`Mounted` (Dormant) CA disk answers the READ-ONLY existence/enumeration surface as
-/// absent/empty instead of throwing `INVALID_STATE`. Generic server sweeps iterate ALL disks and probe
-/// each with an existence call: `DatabaseCatalog::dropTableFinally` calls `existsDirectory` on every
-/// disk, and before this fix a Dormant CA disk threw `INVALID_STATE` there, wedging every server-wide
-/// `DROP TABLE` while any CA disk was Dormant. The content/size/mutation surface stays fail-close and
-/// must STILL throw: a bare `getFileSize`/`getStorageObjects` on an unmounted disk should fail loudly,
-/// and guarding only the enumeration entry points is sufficient because a sweep that enumerates nothing
-/// never reaches those asserting getters.
-TEST(CaLifecycle, DormantDiskAnswersExistenceProbesAsAbsent)
-{
-    auto storage = openTxStorage();
-    storage->unmountSynchronously();   /// Mounted -> Dormant
+    storage->shutdown();   /// null pool -- the ShutDown storage lifecycle
 
     const std::string file = "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin";
     const std::string part_dir = "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0";
 
-    /// Benign-absent surface: no throw, absent/empty answer while Dormant.
-    EXPECT_FALSE(storage->existsDirectory("store"));
-    EXPECT_FALSE(storage->existsFile(file));
-    EXPECT_FALSE(storage->existsFileOrDirectory(part_dir));
-    EXPECT_TRUE(storage->isDirectoryEmpty("store"));
-    EXPECT_TRUE(storage->listDirectory("store").empty());
-    EXPECT_FALSE(storage->getStorageObjectsIfExist(file).has_value());
-    EXPECT_NO_THROW({
-        auto it = storage->iterateDirectory("store");
-        EXPECT_FALSE(it->isValid());
-    });
+    /// Every read-only probe now THROWS (not started), where the transitional Dormant path answered benign.
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&] { storage->existsDirectory("store"); });
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&] { storage->existsFile(file); });
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&] { storage->existsFileOrDirectory(part_dir); });
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&] { storage->isDirectoryEmpty("store"); });
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&] { (void)storage->listDirectory("store"); });
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&] { (void)storage->iterateDirectory("store"); });
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&] { (void)storage->getStorageObjectsIfExist(file); });
 
-    /// Fail-close surface: content/size getters must STILL throw `INVALID_STATE` when Dormant.
-    try
-    {
-        storage->getFileSize(file);
-        FAIL() << "getFileSize must fail closed on a Dormant disk";
-    }
-    catch (const DB::Exception & e)
-    {
-        EXPECT_EQ(e.code(), DB::ErrorCodes::INVALID_STATE) << e.message();
-    }
-    try
-    {
-        storage->getStorageObjects(file);
-        FAIL() << "getStorageObjects must fail closed on a Dormant disk";
-    }
-    catch (const DB::Exception & e)
-    {
-        EXPECT_EQ(e.code(), DB::ErrorCodes::INVALID_STATE) << e.message();
-    }
+    /// The content/size surface stays fail-close too (unchanged from the transitional behavior).
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&] { (void)storage->getFileSize(file); });
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&] { (void)storage->getStorageObjects(file); });
 }

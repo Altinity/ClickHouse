@@ -348,9 +348,9 @@ public:
     /// The store()-class lifecycle gate: throws the typed `INVALID_STATE` error, whose message names the
     /// terminal sub-state, when the pool has entered `IdentityLost` or any `Vanished` state; returns
     /// silently while `Live`/`TransientNotLive`. This is the minimal "nothing silently proceeds" hook the
-    /// metadata storage's `poolAccess()` calls ALONGSIDE its existing `MountState` check (both hold until
-    /// Task 15). The FULL six-class operation gate — which additionally throws in the transient state and
-    /// answers truth-absent on removes/enumeration — is Task 8; this covers only the terminal states.
+    /// metadata storage's `poolAccess()` calls after its null-pool (`throwStorageNotStarted`) check. The
+    /// FULL six-class operation gate — which additionally throws in the transient state and answers
+    /// truth-absent on removes/enumeration — is `checkOpAdmitted`; this covers only the terminal states.
     void throwIfLifecycleTerminal() const;
 
     /// A non-gated, I/O-free lifecycle snapshot for `system.content_addressed_mounts` (spec §7,

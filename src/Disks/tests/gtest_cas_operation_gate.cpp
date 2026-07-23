@@ -232,23 +232,25 @@ TEST(CasOperationGate, TryGetInManifestBytesPropagatesTypedError)
     });
 }
 
-/// (g) [Task 15] transitional guard: a Dormant disk (SYSTEM CONTENT ADDRESSED UNMOUNT) still answers the
-/// OLD benign-absent for probes and "not mounted" for store-class ops -- the gate's not-Mounted branch
-/// mirrors the landed `isMounted()` guards. REMOVE this test when Task 15 removes `MountState`.
-TEST(CasOperationGate, DormantDiskKeepsOldBenignAbsent_RemoveAtTask15)
+/// (g) (rev.8, Task 15) Null-pool fail-loud: the Dormant/UNMOUNT rollback replaced the transitional
+/// not-Mounted branch (which answered `Probe`->benign-absent) with a null-pool fail-loud. A storage whose
+/// pool is torn down (`shutdown()`) refuses EVERY class, `Probe` included, with `INVALID_STATE`
+/// ("not started") -- there is no benign-absent answer for a not-started disk; only a genuinely `Vanished`
+/// POOL answers truth-absent. Replaces the deleted `DormantDiskKeepsOldBenignAbsent_RemoveAtTask15`.
+TEST(CasOperationGate, NullPoolFailsLoudForEveryClass)
 {
     auto storage = openGateStorage();
     commitOnePart(*storage);
     ASSERT_TRUE(storage->existsDirectory(kPartDir));
 
-    storage->unmountSynchronously();   /// Mounted -> ... -> Dormant (no pool ref held above)
+    storage->shutdown();   /// null pool -- the ShutDown storage lifecycle
 
-    /// Probes answer benign-absent (a Dormant disk is NOT Vanished; this is the transitional lie).
-    EXPECT_FALSE(storage->existsFile(kPartFile));
-    EXPECT_FALSE(storage->existsDirectory(kPartDir));
-    EXPECT_TRUE(storage->listDirectory(kTableDir).empty());
-    EXPECT_TRUE(storage->isDirectoryEmpty(kTableDir));
-    /// Store-class ops throw "not mounted" (still INVALID_STATE), not the typed Vanished message.
+    /// Probes now THROW (not started), NOT the transitional benign-absent answer.
+    Cas::tests::expectThrowsCode(ErrorCodes::INVALID_STATE, [&] { storage->existsFile(kPartFile); });
+    Cas::tests::expectThrowsCode(ErrorCodes::INVALID_STATE, [&] { storage->existsDirectory(kPartDir); });
+    Cas::tests::expectThrowsCode(ErrorCodes::INVALID_STATE, [&] { (void)storage->listDirectory(kTableDir); });
+    Cas::tests::expectThrowsCode(ErrorCodes::INVALID_STATE, [&] { storage->isDirectoryEmpty(kTableDir); });
+    /// Store-class ops throw the same INVALID_STATE ("not started"), not the typed Vanished message.
     Cas::tests::expectThrowsCode(ErrorCodes::INVALID_STATE, [&] { storage->getFileSize(kPartFile); });
 }
 

@@ -584,9 +584,8 @@ void commitOneRunningPart(DB::ContentAddressedMetadataStorage & storage)
 }
 }
 
-/// (rev.8) FSCK now runs on a RUNNING (Mounted) disk -- the old "run SYSTEM CONTENT ADDRESSED UNMOUNT
-/// first" refusal is gone. Scanning a live pool with one committed part succeeds and reports its content
-/// (the one-row summary the SQL verb renders from this report).
+/// (rev.8) FSCK runs on a RUNNING disk: scanning a live pool with one committed part succeeds and reports
+/// its content (the one-row summary the SQL verb renders from this report).
 TEST(CasFsckRunning, FsckOnMountedDiskSucceeds)
 {
     auto storage = openRunningStorageForTest();

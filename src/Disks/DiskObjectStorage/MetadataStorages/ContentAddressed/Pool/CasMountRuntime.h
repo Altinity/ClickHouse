@@ -24,8 +24,8 @@ class PartWriteTxn;
 using PartWriteTxnPtr = std::shared_ptr<PartWriteTxn>;
 
 /// The pool-level lifecycle condition (rev.7 §1) a `Pool` moves through as its shared backing changes
-/// underfoot. It is distinct from the storage-level `Constructing/Started/ShutDown` and from the
-/// `MountState` the metadata storage tracks (both of which stay in force until Task 15). Ordering of the
+/// underfoot. It is distinct from the storage-level `Constructing/Started/ShutDown` lifecycle (a null
+/// published pool -- before `startup`/after `shutdown`) the metadata storage tracks. Ordering of the
 /// enumerators is not significant; membership tests do the work.
 ///   - `Live`             — the steady state; the mount lease is (or was last) held.
 ///   - `TransientNotLive` — the lease was lost; access is uncertain and a self-remount retries. The §2

@@ -199,20 +199,14 @@ public:
 
     /// The `SYSTEM CONTENT ADDRESSED FSCK` handler: a read-only, independent reachability audit.
     ///
-    /// On a RUNNING (Mounted) disk it scans the LIVE pool directly (rev.8): Admin class -- it routes
-    /// through `checkOpAdmitted(CasOpClass::Admin)` (refuses on a transient / `IdentityLost` / `Vanished`
-    /// pool, consistent with `SYSTEM CONTENT ADDRESSED GC RUN`), because an FSCK of a not-live disk is
+    /// FSCK scans the LIVE running pool directly: Admin class -- it routes through
+    /// `checkOpAdmitted(CasOpClass::Admin)` (refuses on a transient / `IdentityLost` / `Vanished` pool,
+    /// consistent with `SYSTEM CONTENT ADDRESSED GC RUN`), because an FSCK of a not-live disk is
     /// meaningless -- the operator has the snapshot / FORGET path. The scan tolerates concurrent writers:
     /// its ref-walk findings (missing manifest, dangling blob) are revalidated against a FRESH
     /// authoritative read before being reported, so a legitimate concurrent republish/drop + GC delete
-    /// never surfaces as a phantom.
-    ///
-    /// [Task 15] On a DORMANT (UNMOUNTed) disk it still works via a TEMPORARY observe-only pool view
-    /// (`openPoolView(/* observe_only= */ true)` -- no probe, no watermark, no GC scheduler, exactly the
-    /// `read_only` startup posture), destroyed before returning; nothing is published to
-    /// `cas_store`/`part_access`/`mount_state`. Both modes are accepted between Task 13 and Task 15; Task
-    /// 15 removes `MountState` and this dormant branch, leaving the running Admin path as the sole one.
-    /// Held under `lifecycle_mutex` for the whole scan so a concurrent MOUNT/UNMOUNT cannot race it.
+    /// never surfaces as a phantom. Held under `lifecycle_mutex` for the whole scan so a concurrent
+    /// lifecycle-control verb (FORGET / GC STOP / GC START) cannot race it.
     Cas::FsckReport runFsckNow(bool detail) const;
 
     /// Returns per-disk GC health for `system.content_addressed_mounts`. Returns nullopt when this
@@ -244,9 +238,9 @@ public:
     /// transaction entry (see the `CasOpClass` doc above and the method->class inventory at the top of
     /// the .cpp). Given `op`'s class it inspects the pool lifecycle ONCE and decides:
     ///   - `Live`                            -> `Proceed` for every class.
-    ///   - not `Mounted` (Dormant/Unmounting, transitional until Task 15) -> `Probe` answers
-    ///     `TruthAbsent` (the OLD benign-absent behavior a Dormant disk kept); every other class throws
-    ///     "not mounted".
+    ///   - null pool (the storage-level Constructing/ShutDown lifecycle -- before `startup`/after
+    ///     `shutdown`) -> throws "not started" for EVERY class, `Probe` included: a storage that has
+    ///     never published a pool (or torn one down) has no benign "absent" answer to give.
     ///   - `TransientNotLive` / `IdentityLost` -> throws 668 for every class but `Factory` (uncertain
     ///     backing; the sub-state distinction is surfaced in `system.content_addressed_mounts`, not the
     ///     op error).
@@ -280,22 +274,6 @@ public:
     /// synchronized with the accessors and synchronous GC entry points.
     void shutdown() override;
 
-    /// Idempotent, resumable quiescence barrier for the `SYSTEM CONTENT ADDRESSED UNMOUNT` handler
-    /// (Task 6): moves `Mounted -> Unmounting -> Dormant`. Gates new operations immediately (the
-    /// `Unmounting` flip happens before anything else), stops the GC scheduler, then waits for
-    /// outstanding `store()`/`partAccess()` snapshots to drop their references before releasing the
-    /// pool. A no-op when already `Dormant`. Throws `TIMEOUT_EXCEEDED` if snapshots are still live
-    /// after `drain_timeout_ms` -- the disk then stays `Unmounting` (new operations stay refused) and
-    /// a retried call resumes the drain from where it left off, rather than restarting the whole
-    /// unmount. Does not consult `shutdown_called`; unlike `shutdown()`, this is not a terminal path.
-    void unmountSynchronously(uint64_t drain_timeout_ms = 30000) TSA_NO_THREAD_SAFETY_ANALYSIS;
-    /// Idempotent explicit mount for the `SYSTEM CONTENT ADDRESSED MOUNT` handler (Task 6):
-    /// `Dormant -> Mounted` via `startup()`. A no-op when already `Mounted`. Throws `INVALID_STATE`
-    /// when called during an incomplete `Unmounting` -- mounting on top of an unfinished unmount could
-    /// let two live pool snapshots exist under different mount generations at once; the caller must
-    /// finish (or retry) `unmountSynchronously` first.
-    void mountExplicitly() TSA_NO_THREAD_SAFETY_ANALYSIS;
-
     /// `SYSTEM CONTENT ADDRESSED FORGET` handler (Task 10, spec §5): the operator force-Vanish. Drives the
     /// live pool to `Vanished(forgotten)` node-locally via `Pool::forgetDisk`'s fence-first protocol, and
     /// stops + joins the GC scheduler as part of it. Unlike the store()-class verbs, this must work on a
@@ -303,14 +281,14 @@ public:
     /// pool DIRECTLY, never through `poolAccess()`/`checkOpAdmitted` (which refuse a not-live disk); it is a
     /// lifecycle verb, like the Factory class. FORGET is an operator ASSERTION, not an erasure proof: the
     /// resulting [D5] error message (which carries the decommission timestamp) says so. The disk stays
-    /// registered and `Mounted`; the six-class gate then answers the truth (Probe/Remove truth-absent,
-    /// reads throw the [D5] message). Idempotent; a not-mounted disk is a no-op. Serialized by
-    /// `lifecycle_mutex` (against unmount/mount/fsck) and `gc_scheduler_mutex` (against a synchronous round).
+    /// registered; the six-class gate then answers the truth (Probe/Remove truth-absent, reads throw the
+    /// [D5] message). Idempotent; a disk with no published pool is a no-op. Serialized by `lifecycle_mutex`
+    /// (against FSCK / GC STOP / GC START) and `gc_scheduler_mutex` (against a synchronous round).
     void forgetDisk() TSA_NO_THREAD_SAFETY_ANALYSIS;
 
     /// `SYSTEM CONTENT ADDRESSED GC STOP` handler (Task 11, spec §6): stops ONLY the background GC scheduler.
     /// The disk stays fully usable -- reads/writes are unaffected; this is granular operator control of the
-    /// GC pacer alone, NOT a lifecycle transition. Unlike `forgetDisk`/`unmountSynchronously` this is
+    /// GC pacer alone, NOT a lifecycle transition. Unlike `forgetDisk` this is
     /// STOP-IN-PLACE: the scheduler object is RETAINED in the member (not detached/destroyed), so `gcHealth`
     /// keeps reading its (now stopped) state truthfully and a later `gcStart` re-enters the SAME instance
     /// with its `gc_id` + lease-observation history preserved. `stop()`
@@ -377,12 +355,11 @@ public:
 
     /// ==== wiring-internal surface (the transaction + the disk's prepareRead CA branch) ====
 
-    /// Returns a shared-ownership snapshot of the opened pool. Throws `INVALID_STATE` when the disk
-    /// is not mounted (before the first `startup`, after `shutdown`, or -- from Task 5 on -- during
-    /// or after an explicit `SYSTEM CONTENT ADDRESSED UNMOUNT`). A thin wrapper over `poolAccess()`.
+    /// Returns a shared-ownership snapshot of the opened pool. Throws `INVALID_STATE` when no pool is
+    /// published (before the first `startup`, or after `shutdown`). A thin wrapper over `poolAccess()`.
     Cas::PoolPtr store() const;
     /// Returns a shared-ownership snapshot of the cached part-folder facade. Throws `INVALID_STATE`
-    /// under the same not-mounted condition as `store()`. Committed part-folder reads and mutations
+    /// under the same not-started condition as `store()`. Committed part-folder reads and mutations
     /// go through this facade so cache validation remains centralized. Returning a `shared_ptr`
     /// snapshot (not a reference) means the returned handle keeps the facade alive via its own
     /// refcount even if `shutdown` concurrently resets the member -- unlike a reference, which would
@@ -605,18 +582,6 @@ private:
     /// Defaults to false (fail-close): assumed unsupported until the probe proves otherwise.
     bool conditional_copy_supported = false;
 
-    /// Explicit disk lifecycle. `startup()` moves `Dormant -> Mounted` as the last step of its single
-    /// publish section; `shutdown()` moves back to `Dormant` where it resets the pointers. From Task 5
-    /// on, `unmountSynchronously`/`mountExplicitly` drive `Mounted <-> Unmounting <-> Dormant` too.
-    /// `poolAccess()` is the ONE place that checks this against `Mounted` before handing out a
-    /// snapshot, so every operation on the pool or part-folder facade is gated the same way.
-    enum class MountState : uint8_t
-    {
-        Mounted,
-        Unmounting,
-        Dormant,
-    };
-
     /// A single coherent snapshot of the pool and its cached part-folder facade, taken under ONE
     /// `pointer_mutex` acquisition (see `poolAccess()`) so no caller can observe `pool` from one mount
     /// generation and `part_access` from another -- the two used to be fetched by two separate calls
@@ -636,21 +601,15 @@ private:
     /// startup right after Pool::open; reset in shutdown before cas_store. shared_ptr for the same
     /// snapshot-safety reason as cas_store.
     std::shared_ptr<Cas::CachedPartFolderAccess> part_access TSA_GUARDED_BY(pointer_mutex);
-    /// The mount lifecycle state; see `MountState` above. Starts `Dormant` (nothing published yet) --
-    /// this makes the pre-`startup` `poolAccess()` refusal uniform with the post-`shutdown`/unmounted
-    /// one: an access before/without a mount is an operational condition, not a programming invariant.
-    MountState mount_state TSA_GUARDED_BY(pointer_mutex) = MountState::Dormant;
     String pool_uuid;
     /// shared_ptr so `runGarbageCollectionRoundNow`/`runOneGcRoundForTest` can take a snapshot under
     /// `pointer_mutex`, release it, and run the (long) round via the snapshot -- never holding
     /// `pointer_mutex` itself for the round's duration, so `gcHealth`/`store`/`partAccess` never
     /// block behind an in-flight round.
     std::shared_ptr<Cas::CasGcScheduler> gc_scheduler TSA_GUARDED_BY(pointer_mutex);
-    /// Outermost lock, taken only by the explicit lifecycle operations: `mountExplicitly`,
-    /// `unmountSynchronously` (Task 5), and the FSCK handler (Task 7). Not acquired anywhere yet in
-    /// this task -- declared now so its place in the lock order is fixed before those operations
-    /// exist. Lock order when nested locks are needed: `lifecycle_mutex` -> `gc_scheduler_mutex` ->
-    /// `pointer_mutex`, never the reverse.
+    /// Outermost lock, taken by the lifecycle-control verbs: the FSCK handler, `forgetDisk`, and
+    /// `gcStop`/`gcStart`. Serializes them against each other. Lock order when nested locks are needed:
+    /// `lifecycle_mutex` -> `gc_scheduler_mutex` -> `pointer_mutex`, never the reverse.
     mutable std::mutex lifecycle_mutex;
     /// Serializes ONE synchronous GC round at a time and makes `shutdown` wait for an in-flight round
     /// to finish cleanly (clean GC completion has priority over fast shutdown) -- held for the WHOLE
@@ -658,7 +617,7 @@ private:
     /// long time, so nothing that only needs a brief pointer snapshot may share it.
     mutable std::mutex gc_scheduler_mutex;
     bool shutdown_called TSA_GUARDED_BY(gc_scheduler_mutex) = false;
-    /// Guards ONLY reads/writes of `cas_store`/`part_access`/`gc_scheduler`/`mount_state` themselves
+    /// Guards ONLY reads/writes of `cas_store`/`part_access`/`gc_scheduler` themselves
     /// (snapshot, create-if-absent, reset) -- always held briefly. Lock ordering when more than one of
     /// these is needed (the round entry points, `shutdown`, and -- outermost -- `lifecycle_mutex`):
     /// `lifecycle_mutex` first (if held at all), then `gc_scheduler_mutex`, then `pointer_mutex`
@@ -684,35 +643,22 @@ private:
     }
 
     /// The one place that takes a `{pool, facade}` snapshot under a SINGLE `pointer_mutex`
-    /// acquisition and checks it against `MountState::Mounted`. Throws `INVALID_STATE` when the disk
-    /// is not mounted (`mount_state != Mounted`, including a not-yet-started or a `!cas_store`
-    /// pre-publish window) or unmounted (no `cas_store`). `store()`/`partAccess()` are thin wrappers
-    /// over this; every other caller that needs BOTH the pool and the facade for one logical
-    /// operation must call this ONCE and use both fields from the same snapshot, rather than calling
-    /// `store()` and `partAccess()` separately -- otherwise it could straddle two mount generations
-    /// once unmount/mount (Task 5) can change `cas_store`/`part_access` after startup.
+    /// acquisition. Throws `INVALID_STATE` (via `throwStorageNotStarted`) when no pool is published
+    /// (before the first `startup` or after `shutdown` -- the storage-level Constructing/ShutDown
+    /// lifecycle), then refuses a terminal pool via `throwIfLifecycleTerminal`. `store()`/`partAccess()`
+    /// are thin wrappers over this; every other caller that needs BOTH the pool and the facade for one
+    /// logical operation must call this ONCE and use both fields from the same snapshot, rather than
+    /// calling `store()` and `partAccess()` separately -- otherwise it could straddle a startup/shutdown
+    /// that changes `cas_store`/`part_access`.
     PoolAccessSnapshot poolAccess() const;
 
-    /// Builds and throws the `INVALID_STATE` "disk is not mounted" exception `poolAccess()` throws,
-    /// naming `state` and directing the operator to `SYSTEM CONTENT ADDRESSED MOUNT`. Shared with the
-    /// synchronous GC round entry points (`runOneGcRoundForTest`/`runGarbageCollectionRoundNow`):
-    /// since `SYSTEM CONTENT ADDRESSED UNMOUNT` (Task 6) makes `Dormant` reachable from SQL, a GC
-    /// round dispatched at an unmounted disk must surface this same operator-facing refusal instead
-    /// of the `LOGICAL_ERROR` those entry points threw before this existed (which aborts the process
-    /// under debug/ASan builds -- a programming-invariant response to what is now a normal,
-    /// SQL-reachable operational state). Callers must already hold `pointer_mutex` and pass the
-    /// `mount_state` they read under it.
-    [[noreturn]] void throwNotMounted(MountState state) const;
-
-    /// Non-throwing counterpart to `poolAccess()`'s mount check, used ONLY by the read-only
-    /// existence/enumeration surface (`existsFile`/`existsDirectory`/`existsFileOrDirectory`/
-    /// `isDirectoryEmpty`/`listDirectory`/`iterateDirectory`/`getStorageObjectsIfExist`). A generic
-    /// server sweep iterates ALL disks and probes each with an existence call (e.g.
-    /// `DatabaseCatalog::dropTableFinally` calls `existsDirectory` on every disk); a Dormant CA disk
-    /// answering that surface as absent/empty — rather than throwing `INVALID_STATE` via `store()` —
-    /// keeps those CA-agnostic sweeps from wedging while any CA disk is unmounted. Content/size/mutation
-    /// entry points deliberately do NOT consult this and stay fail-close (they still throw).
-    bool isMounted() const;
+    /// Builds and throws the `INVALID_STATE` "disk is not started" exception `poolAccess()`, the gate,
+    /// and the synchronous GC round entry points throw when no pool is published -- the storage-level
+    /// Constructing (before `startup`) / ShutDown (after `shutdown`) lifecycle. `pool_uuid` (written once
+    /// at the end of a successful `startup`, never reset) distinguishes the two in the message, exactly
+    /// as `lifecycleSnapshot()` reports `constructing`/`shutdown`. A normal, operator-facing refusal,
+    /// never a `LOGICAL_ERROR` (which would abort under debug/ASan builds).
+    [[noreturn]] void throwStorageNotStarted() const;
 
     /// EMPTY-PROOF RULE (rev.7 spec §1 [B3]): called by `listDirectory` when a `TableDir`/
     /// `DetachedContainer` enumeration on a NON-terminal (Live or read-only) pool is about to answer
@@ -730,7 +676,7 @@ private:
     void confirmPoolIdentityForEmptyEnumeration(const std::string & path) const;
 
     /// A pool opened as a standalone, UNPUBLISHED view: never touches `cas_store`/`part_access`/
-    /// `gc_scheduler`/`mount_state` -- the caller owns it entirely and drops it when done.
+    /// `gc_scheduler` -- the caller owns it entirely and drops it when done.
     struct PoolView
     {
         Cas::PoolPtr pool;
@@ -746,15 +692,12 @@ private:
         String pool_prefix;
     };
 
-    /// Builds the backend + `Cas::PoolConfig` and opens a pool exactly as `startup()` does, shared by
-    /// its live-mount path and `runFsckNow`'s TEMPORARY observe-only (dormant) scan. `observe_only` forces
-    /// `PoolConfig::read_only` and disables the background watermark regardless of the disk's own
-    /// `<readonly>` config -- an FSCK scan must never probe/schedule against a pool it does not own the
-    /// lifecycle of, exactly like the `read_only` disk path startup() already has (no probe, no
-    /// watermark, no GC). Never touches `cas_store`/`part_access`/`gc_scheduler`/`mount_state`/
-    /// `physical_key_prefix`/`pool_uuid`/`conditional_copy_supported`; `startup()` applies its own
-    /// result to those members itself, in its single publish step.
-    PoolView openPoolView(bool observe_only) const;
+    /// Builds the backend + `Cas::PoolConfig` and opens a pool exactly as `startup()` does. A read-only
+    /// (`<readonly>`) disk opens with no write probe, no background watermark, and no GC scheduler. Never
+    /// touches `cas_store`/`part_access`/`gc_scheduler`/`physical_key_prefix`/`pool_uuid`/
+    /// `conditional_copy_supported`; `startup()` applies its own result to those members itself, in its
+    /// single publish step.
+    PoolView openPoolView() const;
 
     /// Classifies `path`'s directory shape by running the fixed dispatch order once (shadow ->
     /// atomic-shard -> table-uuid -> part -> subdir -> generic), including the part-branch
