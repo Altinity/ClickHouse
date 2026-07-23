@@ -2,6 +2,7 @@
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasServerRootFormats.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcScheduler.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/tests/cas_test_helpers.h>
@@ -78,6 +79,24 @@ std::string messageOf(const std::function<void()> & fn)
     }
     ADD_FAILURE() << "expected a DB::Exception";
     return {};
+}
+
+/// The Pool-level `server_root_id` a test mount uses (mirrors gtest_cas_lifecycle_condition.cpp).
+const std::string kSrid = "test";
+
+/// GC's fence-out applied to the mount lease (preserve the body, set `gc_fenced`, bump `seq`) so a
+/// subsequent `tryRemountOnce` verdicts `Recover` and reclaims a FRESH incarnation immediately, driving a
+/// transient-not-live pool back to `Live` without a lease-expiry wait. Mirrors
+/// gtest_cas_lifecycle_condition.cpp's helper.
+void fenceOutMount(DB::Cas::Backend & backend, const String & mount_key)
+{
+    const auto got = backend.get(mount_key);
+    ASSERT_TRUE(got.has_value());
+    DB::Cas::MountLease m = DB::Cas::decodeMountLease(got->bytes);
+    m.gc_fenced = true;
+    m.seq += 1;
+    ASSERT_EQ(backend.putOverwrite(mount_key, DB::Cas::encodeMountLease(m), got->token).outcome,
+              DB::Cas::PutOutcome::Done);
 }
 
 }
@@ -280,4 +299,51 @@ TEST(CasOperationGate, GcSchedulerIsQuiescentReflectsRoundInFlight)
     EXPECT_FALSE(scheduler->isQuiescent()) << "a round in flight must NOT read as GC-quiescent";
     scheduler->setRoundInFlightForTest(false);
     EXPECT_TRUE(scheduler->isQuiescent());
+}
+
+/// (j) (acceptance matrix — transient auto-recovery / DROP-drain round-trip) The full §4 recovery arc on ONE
+/// storage: a Remove-class op (the DROP shape) throws the typed 668 while the mount lease is transiently
+/// lost, then SUCCEEDS and actually drains once the disk self-remounts back to Live — no operator action,
+/// no restart. Where test (d) forces `TransientNotLive` via the setter to pin the gap, this drives a REAL
+/// transient→Live recovery (`tripMountLost` → fence-out → `tryRemountOnce`) so the throw-then-drain is one
+/// continuous arc on the same pool. Closes the "access throws in the gap, auto-recovers, a Remove re-queues
+/// and drains" matrix row end-to-end (the per-table DROP re-queue itself is the MergeTree caller's job; the
+/// CAS contract is exactly this: refuse in the gap, admit after recovery).
+TEST(CasOperationGate, RemoveThrowsDuringTransientAndDrainsAfterRecovery)
+{
+    auto storage = openGateStorage();
+    commitOnePart(*storage);
+    auto pool = storage->store();   /// captured while Live (store() is fail-closed once not-live)
+    ASSERT_EQ(pool->lifecycle(), PoolLifecycle::Live);
+    ASSERT_TRUE(storage->existsDirectory(kPartDir));   /// Live baseline: the part is present.
+
+    /// The mount lease is transiently lost — the pool goes TransientNotLive.
+    pool->tripMountLost();
+    ASSERT_EQ(pool->lifecycle(), PoolLifecycle::TransientNotLive);
+
+    /// In the gap, EVERY store-class access throws the typed 668 — the Remove (DROP shape) included, and a
+    /// content read too. Nothing is answered benign, nothing is silently dropped.
+    Cas::tests::expectThrowsCode(ErrorCodes::INVALID_STATE, [&] {
+        auto tx = storage->createTransaction();
+        tx->removeRecursive(kTableDir, /*should_remove_objects=*/nullptr);
+    });
+    Cas::tests::expectThrowsCode(ErrorCodes::INVALID_STATE, [&] { storage->getFileSize(kPartFile); });
+    const std::string gap_msg = messageOf([&] { storage->getFileSize(kPartFile); });
+    EXPECT_NE(gap_msg.find("mount lease not held"), std::string::npos)
+        << "the gap message must name the transient (auto-recovering) condition: " << gap_msg;
+
+    /// The lease is restored: the disk self-remounts a fresh incarnation and auto-recovers to Live.
+    fenceOutMount(pool->backend(), pool->layout().mountKey(kSrid));
+    ASSERT_TRUE(pool->tryRemountOnce()) << "the self-remount must reclaim a fresh incarnation";
+    ASSERT_EQ(pool->lifecycle(), PoolLifecycle::Live) << "the pool must auto-recover to Live";
+
+    /// After recovery the SAME Remove drains: it commits cleanly and actually removes the part.
+    {
+        auto tx = storage->createTransaction();
+        EXPECT_NO_THROW(tx->removeRecursive(kTableDir, /*should_remove_objects=*/nullptr));
+        EXPECT_NO_THROW(tx->commit(NoCommitOptions{}));
+    }
+    EXPECT_FALSE(storage->existsDirectory(kPartDir))
+        << "the re-queued removal must drain (really remove the part) once the disk recovers to Live";
+    EXPECT_FALSE(storage->existsFile(kPartFile));
 }

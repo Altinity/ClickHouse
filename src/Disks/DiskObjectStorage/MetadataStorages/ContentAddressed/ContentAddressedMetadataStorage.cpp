@@ -900,12 +900,12 @@ void ContentAddressedMetadataStorage::gcStop()
     }
     if (!snapshot)
     {
-        /// No scheduler at all (GC disabled / read-only / not mounted / already forgotten). Stopping GC on a
+        /// No scheduler at all (GC disabled / read-only / not started / already forgotten). Stopping GC on a
         /// disk that runs none is a no-op success -- the operator's intent ("no GC background activity")
         /// already holds.
         LOG_INFO(getLogger("ContentAddressedMetadataStorage"),
             "SYSTEM CONTENT ADDRESSED GC STOP on content-addressed disk '{}': no GC scheduler "
-            "(disabled/read-only/not mounted) -- nothing to stop.", disk_name);
+            "(disabled/read-only/not started) -- nothing to stop.", disk_name);
         return;
     }
     /// `stop()` joins the worker + heartbeat threads and clears the in-process leadership hint. Runs OUTSIDE
@@ -1078,12 +1078,12 @@ void ContentAddressedMetadataStorage::confirmPoolIdentityForEmptyEnumeration(con
 {
     /// EMPTY-PROOF RULE (rev.7 spec §1 [B3]). Reached ONLY when `listDirectory` computed an EMPTY listing
     /// at a `TableDir`/`DetachedContainer` root on a NON-terminal pool -- `checkOpAdmitted` already ran
-    /// (mounted, and NOT a settled `Vanished` state, which would have short-circuited `Probe` to
+    /// (admitted as `Live`, and NOT a settled `Vanished` state, which would have short-circuited `Probe` to
     /// `TruthAbsent` before any classification). This is the last silent-empty-load killer: an empty table
     /// root is exactly what a silently-erased backing looks like, and a read-only pool (no lease, no
     /// erasure observer) has no other line of defense. So the empty answer is authorized ONLY by an
     /// AUTHORITATIVE, UNCACHED positive on the pool identity object -- a cached positive never suffices.
-    const Cas::PoolPtr pool = store();   /// Live here (past the gate's Mounted + non-terminal check).
+    const Cas::PoolPtr pool = store();   /// Live here (past the op gate's Live, non-terminal admission).
 
     ++empty_proof_probe_count_for_test;
     const Cas::SentinelProbeResult probe = empty_proof_probe_override_for_test

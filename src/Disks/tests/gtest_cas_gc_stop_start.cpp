@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasServerRootFormats.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcScheduler.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/tests/cas_test_helpers.h>
@@ -13,6 +14,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <filesystem>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -51,6 +53,24 @@ namespace
 const std::string kTableDir = "gg0/gg0gg0g0-0808-4808-8808-080808080808";
 const std::string kPartDir = kTableDir + "/all_1_1_0";
 const std::string kPartFile = kPartDir + "/data.bin";
+
+/// The Pool-level `server_root_id` `openPoolForTest` mints (mirrors gtest_cas_lifecycle_condition.cpp).
+const std::string kSrid = "test";
+
+/// GC's fence-out applied directly to the mount lease (preserve the body, set `gc_fenced`, bump `seq`) so a
+/// subsequent `tryRemountOnce` verdicts `Recover` and reclaims a FRESH incarnation immediately (no
+/// lease-expiry wait), driving a transient-not-live pool back to `Live`. Mirrors
+/// gtest_cas_lifecycle_condition.cpp's helper — used by the operator-STOP-persistence test below.
+void fenceOutMount(DB::Cas::Backend & backend, const String & mount_key)
+{
+    const auto got = backend.get(mount_key);
+    ASSERT_TRUE(got.has_value());
+    DB::Cas::MountLease m = DB::Cas::decodeMountLease(got->bytes);
+    m.gc_fenced = true;
+    m.seq += 1;
+    ASSERT_EQ(backend.putOverwrite(mount_key, DB::Cas::encodeMountLease(m), got->token).outcome,
+              DB::Cas::PutOutcome::Done);
+}
 
 /// A real `ContentAddressedMetadataStorage` over a fresh, unique local object storage. `context == nullptr`
 /// (a unit-test mount), so `startup()` creates NO GC scheduler -- the GC entry points, and `gcStart`, create
@@ -139,6 +159,12 @@ constexpr std::chrono::milliseconds kRoundWait{60000};
 /// still sees the loop tick + observe the terminal state) yet short enough that the RED demo (self-exit
 /// removed) fails fast rather than hanging for `kRoundWait`.
 constexpr std::chrono::milliseconds kSelfExitWait{15000};
+
+/// A bounded OBSERVATION window (not a sleep-to-fix-a-race) for the "stays stopped across recovery" test:
+/// comfortably above the 1s pacing interval so a running scheduler would have filled it with several
+/// rounds, yet short enough to keep the negative assertion cheap. Its meaning is anchored by a positive
+/// control (an explicit START right after DOES produce a round through the same sink).
+constexpr std::chrono::milliseconds kStayStoppedWindow{3000};
 
 }
 
@@ -358,4 +384,109 @@ TEST(CasGcStopStart, DiskReadsWritesUnaffectedWhileGcStopped)
     EXPECT_NO_THROW(storage->gcStart());
     EXPECT_TRUE(storage->existsFile(kPartFile));
     storage->gcStop();
+}
+
+/// (T11 M3, acceptance matrix) Two threads hammering `gcStop`/`gcStart` on the SAME storage concurrently.
+/// The verbs serialize on `lifecycle_mutex` (then `gc_scheduler_mutex`, always in that order — so there is
+/// no lock-order inversion and hence no deadlock), so each call is atomic: the barrage interleaves in any
+/// order but never tears the retained scheduler pointer or its worker-thread set. We bound each worker with
+/// a `std::future` timeout (never a sleep) so a deadlock regression fails FAST instead of hanging the suite,
+/// and — since the final serialized call determines the resting state — a single quiet STOP then START at
+/// the end lands the object in a well-defined, usable state (last call wins). ASan/TSan running this proves
+/// the racing start()/stop() thread spawns+joins never race the shared members.
+TEST(CasGcStopStart, ConcurrentStopStartFromTwoThreadsStaysConsistent)
+{
+    auto storage = openGcStorage();
+
+    /// 200 iterations each, opposite phase, so the two threads spend the whole run contending on the
+    /// lifecycle mutex with one about to START while the other is about to STOP.
+    constexpr int kIters = 200;
+    auto worker = [&](bool start_first)
+    {
+        for (int i = 0; i < kIters; ++i)
+        {
+            if (start_first) { storage->gcStart(); storage->gcStop(); }
+            else             { storage->gcStop();  storage->gcStart(); }
+        }
+    };
+
+    auto a = std::async(std::launch::async, worker, true);
+    auto b = std::async(std::launch::async, worker, false);
+    ASSERT_EQ(a.wait_for(std::chrono::seconds(60)), std::future_status::ready)
+        << "two-thread GC stop/start must not deadlock (both verbs lock lifecycle_mutex then gc_scheduler_mutex)";
+    ASSERT_EQ(b.wait_for(std::chrono::seconds(60)), std::future_status::ready)
+        << "two-thread GC stop/start must not deadlock";
+    a.get();
+    b.get();
+
+    /// No torn state: a scheduler exists (both workers created/re-entered one) and its health snapshot is
+    /// coherently queryable rather than reading a half-published pointer.
+    ASSERT_TRUE(storage->gcHealth().has_value()) << "the scheduler must exist and report coherent health after the barrage";
+
+    /// Last call wins: once contention ends, one serialized STOP lands it stopped (leadership cleared,
+    /// quiescent), and one serialized START lands it running again — each observed deterministically.
+    storage->gcStop();
+    ASSERT_TRUE(storage->gcHealth().has_value());
+    EXPECT_FALSE(storage->gcHealth()->is_leader) << "a final serialized STOP clears leadership -- last call wins";
+
+    storage->gcStart();
+    EXPECT_TRUE(storage->gcHealth().has_value()) << "a final serialized START leaves the scheduler present";
+
+    /// The data plane is unharmed by the whole barrage: a write + read still succeed.
+    EXPECT_NO_THROW(commitOnePart(*storage));
+    EXPECT_TRUE(storage->existsFile(kPartFile));
+    storage->gcStop();
+}
+
+/// (T11 cannot-verify, acceptance matrix) Operator intent PERSISTS across a transient recovery: after the
+/// operator STOPs GC, the disk loses its mount lease (transient-not-live) and self-remounts back to Live —
+/// and NOTHING restarts the GC scheduler. Recovery is a Pool-internal operation with no reference to the
+/// scheduler; only an explicit START (`SYSTEM CONTENT ADDRESSED GC START`) resumes it. We prove the scheduler
+/// was genuinely running+leading first, STOP it, drive a real transient→Live recovery on the pool, then show
+/// it stays stopped across a bounded observation window (a running 1s-paced scheduler would have produced
+/// several rounds), and finally that an explicit START — the ONLY resumption path — brings rounds back on the
+/// SAME instance (`gc_id` preserved). The positive control makes the negative meaningful: the sink IS live.
+TEST(CasGcStopStart, OperatorStopPersistsAcrossTransientRecovery)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+
+    RoundLogSink sink;
+    /// 1s interval so a RUNNING scheduler would pace rounds within the observation window below.
+    CasGcScheduler sched(store, std::chrono::seconds(1), "CasGcStopPersistTest", "ca-disk", sink.logger());
+
+    /// The operator has GC running and leading.
+    sched.start();
+    ASSERT_TRUE(sink.waitForSuccessFinish(/*from=*/0, kRoundWait).has_value())
+        << "the scheduler must be pacing rounds and leading before the operator stops it";
+    ASSERT_TRUE(sched.gcHealth().is_leader);
+
+    /// The operator STOPs GC (stop-in-place: threads joined, leadership hint cleared).
+    sched.stop();
+    ASSERT_FALSE(sched.gcHealth().is_leader);
+    const size_t after_stop = sink.mark();
+
+    /// The disk now suffers a transient mount-lease loss and self-remounts back to Live (a fresh
+    /// incarnation), WITHOUT any operator action — exactly the recovery §4 describes.
+    store->tripMountLost();
+    ASSERT_EQ(store->lifecycle(), PoolLifecycle::TransientNotLive);
+    fenceOutMount(*backend, store->layout().mountKey(kSrid));
+    ASSERT_TRUE(store->tryRemountOnce()) << "the self-remount must reclaim a fresh incarnation";
+    ASSERT_EQ(store->lifecycle(), PoolLifecycle::Live) << "the pool must auto-recover to Live";
+
+    /// The operator's STOP persists: recovery restarted NOTHING. The scheduler is still not leading and
+    /// still quiescent, and NO background round appears across a window a running scheduler would have
+    /// filled many times over.
+    EXPECT_FALSE(sched.gcHealth().is_leader);
+    EXPECT_TRUE(sched.isQuiescent());
+    EXPECT_FALSE(sink.waitForSuccessFinish(after_stop, kStayStoppedWindow).has_value())
+        << "a self-remount recovery must NOT restart an operator-STOPped GC scheduler";
+
+    /// Positive control: only an explicit START resumes rounds, on the SAME instance (gc_id preserved).
+    /// This also proves the sink WOULD have caught a round, so the negative above is meaningful.
+    sched.start();
+    const auto resumed = sink.waitForSuccessFinish(after_stop, kRoundWait);
+    ASSERT_TRUE(resumed.has_value()) << "an explicit START must resume background rounds after the recovery";
+    EXPECT_TRUE(sched.gcHealth().is_leader);
+    sched.stop();
 }

@@ -706,7 +706,7 @@ TEST(CasTransactionLifecycle, StartupFailureLatePublishesNothing)
 /// behavior change from the previous `LOGICAL_ERROR "accessed before startup"`, which would abort a
 /// debug/sanitizer build on a mis-sequenced access instead of surfacing a catchable, operator-actionable
 /// error.
-TEST(CaWiring, OperationsRefuseWhenNotMounted)
+TEST(CaWiring, OperationsRefuseWithoutPublishedPool)
 {
     auto storage = openTxStorage();
     storage->shutdown();   /// terminal path resets cas_store to null (the ShutDown storage lifecycle)

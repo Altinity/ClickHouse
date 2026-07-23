@@ -8,6 +8,7 @@
 #include <Common/Exception.h>
 
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -74,6 +75,40 @@ struct ReadOnlyMount
     std::string root;
 };
 
+/// Delete ONLY the physical `_pool_meta` object under `root`, leaving the container directory and every
+/// other object intact — so a subsequent authoritative `probeSentinel` verdicts `KeyAbsent` (the identity
+/// key is gone while the container is alive), NOT `ContainerAbsent` (which a whole-root `remove_all` yields).
+/// This models the realistic "someone rm'd just the identity object" / partial-erase shape. Returns whether
+/// exactly one `_pool_meta` file was found and removed, so the test can guard against a vacuous pass.
+bool deleteOnlyPoolMetaUnder(const std::string & root)
+{
+    size_t removed = 0;
+    for (const auto & entry : std::filesystem::recursive_directory_iterator(root))
+    {
+        if (entry.is_regular_file() && entry.path().filename() == "_pool_meta")
+        {
+            std::filesystem::remove(entry.path());
+            ++removed;
+        }
+    }
+    return removed == 1;
+}
+
+/// The message thrown by `fn`, or a failure if it did not throw a `DB::Exception`.
+std::string messageOf(const std::function<void()> & fn)
+{
+    try
+    {
+        fn();
+    }
+    catch (const Exception & e)
+    {
+        return std::string(e.message());
+    }
+    ADD_FAILURE() << "expected a DB::Exception";
+    return {};
+}
+
 ReadOnlyMount openReadOnlyOverBootstrappedBacking()
 {
     auto settings = Cas::tests::makeSettingsForTest(
@@ -119,6 +154,37 @@ TEST(CasEmptyProof, ReadOnlyOverErasedBackingThrowsInsteadOfEmpty)
 
     /// Now the SAME empty listing must refuse: both enumeration entry points throw the typed 668.
     Cas::tests::expectThrowsCode(ErrorCodes::INVALID_STATE, [&] { mount.ro->listDirectory(kEmptyTableDir); });
+    Cas::tests::expectThrowsCode(ErrorCodes::INVALID_STATE, [&] { mount.ro->iterateDirectory(kEmptyTableDir); });
+    Cas::tests::expectThrowsCode(ErrorCodes::INVALID_STATE, [&] { mount.ro->isDirectoryEmpty(kEmptyTableDir); });
+}
+
+/// (a2, acceptance matrix — T9 review's KeyAbsent-specific real-backend follow-up) Test (a) erases the
+/// WHOLE backing (`remove_all(root)`), so its probe verdicts `ContainerAbsent`. This test deletes ONLY the
+/// `_pool_meta` object against the REAL Local backend — the container directory and every other object stay
+/// intact — so the authoritative probe verdicts `KeyAbsent` instead. Both flavours must reach the SAME
+/// "backing may be erased" refusal (distinct from the transient "transport or permission fault" one), so a
+/// targeted deletion of just the identity object (a partial erase) is caught exactly like a whole-root wipe.
+TEST(CasEmptyProof, ReadOnlyWithOnlyPoolMetaDeletedThrowsErasedFlavoredOnKeyAbsent)
+{
+    auto mount = openReadOnlyOverBootstrappedBacking();
+
+    /// Baseline while the backing is intact: the empty table root answers empty truthfully with one probe.
+    mount.ro->resetEmptyProofProbeCountForTest();
+    EXPECT_TRUE(mount.ro->listDirectory(kEmptyTableDir).empty());
+    EXPECT_EQ(mount.ro->emptyProofProbeCountForTest(), 1u);
+
+    /// Delete ONLY `_pool_meta` (container + every sibling object intact) → the probe verdicts KeyAbsent.
+    ASSERT_TRUE(deleteOnlyPoolMetaUnder(mount.root))
+        << "expected exactly one _pool_meta object to remove; otherwise this test is vacuous";
+
+    /// The KeyAbsent miss reaches the erased-flavored typed 668, NOT the transient one, and never answers empty.
+    const std::string msg = messageOf([&] { mount.ro->listDirectory(kEmptyTableDir); });
+    EXPECT_NE(msg.find("pool identity object absent"), std::string::npos) << msg;
+    EXPECT_NE(msg.find("the backing may be erased"), std::string::npos) << msg;
+    EXPECT_EQ(msg.find("transport or permission fault"), std::string::npos)
+        << "a KeyAbsent miss must give the erased message, not the transient/retry one: " << msg;
+
+    /// The other enumeration entry points refuse identically.
     Cas::tests::expectThrowsCode(ErrorCodes::INVALID_STATE, [&] { mount.ro->iterateDirectory(kEmptyTableDir); });
     Cas::tests::expectThrowsCode(ErrorCodes::INVALID_STATE, [&] { mount.ro->isDirectoryEmpty(kEmptyTableDir); });
 }
