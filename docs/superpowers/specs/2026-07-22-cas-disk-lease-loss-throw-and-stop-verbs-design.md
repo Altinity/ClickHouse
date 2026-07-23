@@ -155,7 +155,12 @@ semantics in the rev.4 review):
 - **`Present` + identity match** (`pool_id` + `blob_header_len`; format gate = successful compatible
   decode) → existing recovery. **This rule applies only in the transient state** (the live remount loop).
   **`Present` + foreign `pool_id`** → `Vanished(replaced)`.
-- **Sentinels absent, prefix non-empty** → **`IdentityLost`**: keeper/GC/writers stopped, **but the remount
+- **Sentinels absent, prefix non-empty** → **`IdentityLost`**: writers stopped (the operation gate) and the
+  keeper already exited; the GC scheduler THREAD keeps ticking but its effects are contained — its
+  `gc/state`/heartbeat keys live under the pool prefix so any landed write resets the emptiness proof via
+  the LIST, `round_in_flight` is held for the whole round, and the `has_observation` guard refuses to
+  recreate an absent `gc/state` (wording corrected 2026-07-23 per the Task-8 review — the earlier "GC
+  stopped" claim was neither implemented nor necessary). **The remount
   thread demotes to a lifecycle observer [C1]** — non-mutating, low-rate (renewal-period cadence with
   backoff), running only this typed probe; it never claims, allocates, or writes. One-way transition to
   `Vanished(erased)` when the proof below completes; `FORGET` and restart remain available. (This is how a
