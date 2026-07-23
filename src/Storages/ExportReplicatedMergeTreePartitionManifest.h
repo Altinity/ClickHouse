@@ -241,6 +241,7 @@ struct ExportReplicatedMergeTreePartitionManifest
     String filename_pattern;
     bool write_full_path_in_iceberg_metadata = false;
     bool allow_lossy_cast = false;
+    MergeTreePartExportSchemaMismatchMode schema_mismatch_mode = MergeTreePartExportSchemaMismatchMode::strict;
     String iceberg_metadata_json;
 
     /// Optional because of backwards compatibility
@@ -282,6 +283,7 @@ struct ExportReplicatedMergeTreePartitionManifest
         json.set("task_timeout_seconds", task_timeout_seconds);
         json.set("write_full_path_in_iceberg_metadata", write_full_path_in_iceberg_metadata);
         json.set("allow_lossy_cast", allow_lossy_cast);
+        json.set("schema_mismatch_mode", String(magic_enum::enum_name(schema_mismatch_mode)));
         if (parquet_compression_method)
             json.set("parquet_compression_method", *parquet_compression_method);
         if (output_format_compression_level)
@@ -357,6 +359,15 @@ struct ExportReplicatedMergeTreePartitionManifest
         /// on upgrade. New tasks always persist the initiator's actual choice.
         manifest.allow_lossy_cast = json->has("allow_lossy_cast") ? json->getValue<bool>("allow_lossy_cast") : true;
 
+        /// Tasks created before this field existed were always scheduled under the old,
+        /// strict column-count check (a mismatch could never reach scheduling in the first
+        /// place), so the struct's default of `strict` is the correct fallback here.
+        if (json->has("schema_mismatch_mode"))
+        {
+            const auto schema_mismatch_mode = magic_enum::enum_cast<MergeTreePartExportSchemaMismatchMode>(json->getValue<String>("schema_mismatch_mode"));
+            if (schema_mismatch_mode)
+                manifest.schema_mismatch_mode = schema_mismatch_mode.value();
+        }
 
         if (json->has("parquet_compression_method"))
         {

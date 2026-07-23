@@ -1300,6 +1300,91 @@ def test_export_partition_column_count_mismatch_source_fewer_is_rejected(cluster
     )
 
 
+def test_export_partition_source_more_columns_allowed_with_ignore_extra_setting(cluster):
+    """
+    Source has 3 columns (id, year, extra), destination has 2 (id, year).
+    With `export_merge_tree_part_schema_mismatch_mode = 'ignore_extra_source_columns_by_position'`,
+    the export must succeed: the trailing `extra` source column is dropped
+    (matched positionally) and only `id`/`year` land in the destination.
+    """
+    node = cluster.instances["replica1"]
+
+    uid = unique_suffix()
+    mt_table = f"mt_ignore_extra_{uid}"
+    iceberg_table = f"iceberg_ignore_extra_{uid}"
+
+    make_rmt(node, mt_table, "id Int64, year Int32, extra String", "year",
+             replica_name="replica1")
+    node.query(
+        f"INSERT INTO {mt_table} VALUES (1, 2020, 'foo'), (2, 2020, 'bar'), (3, 2020, 'baz')"
+    )
+
+    make_iceberg_s3(node, iceberg_table, "id Int64, year Int32", partition_by="year")
+
+    node.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}",
+        settings={
+            "allow_insert_into_iceberg": 1,
+            "export_merge_tree_part_schema_mismatch_mode": "ignore_extra_source_columns_by_position",
+        },
+    )
+    wait_for_export_status(node, mt_table, iceberg_table, "2020", "COMPLETED")
+
+    count = int(node.query(f"SELECT count() FROM {iceberg_table}").strip())
+    assert count == 3, f"Expected 3 rows in Iceberg table after export, got {count}"
+
+    result = node.query(f"SELECT id, year FROM {iceberg_table} ORDER BY id").strip()
+    assert result == "1\t2020\n2\t2020\n3\t2020", f"Unexpected data:\n{result}"
+
+
+def test_export_partition_column_count_mismatch_source_fewer_still_rejected_with_ignore_extra_setting(cluster):
+    """
+    `ignore_extra_source_columns_by_position` only relaxes the source-has-more-columns
+    direction. Source has 2 columns (id, year), destination has 3 (id, year, extra):
+    the destination cannot be filled from the source, so this must still be
+    rejected synchronously even with the relaxed setting.
+    """
+    node = cluster.instances["replica1"]
+
+    uid = unique_suffix()
+    mt_table = f"mt_ignore_extra_fewer_{uid}"
+    iceberg_table = f"iceberg_ignore_extra_fewer_{uid}"
+
+    make_rmt(node, mt_table, "id Int64, year Int32", "year", replica_name="replica1")
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 2020), (2, 2020)")
+
+    make_iceberg_s3(node, iceberg_table, "id Int64, year Int32, extra String",
+                    partition_by="year")
+
+    error = node.query_and_get_error(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}",
+        settings={
+            "allow_insert_into_iceberg": 1,
+            "export_merge_tree_part_schema_mismatch_mode": "ignore_extra_source_columns_by_position",
+        },
+    )
+    assert "NUMBER_OF_COLUMNS_DOESNT_MATCH" in error, (
+        f"Expected NUMBER_OF_COLUMNS_DOESNT_MATCH for source<dest column count "
+        f"even with ignore_extra_source_columns_by_position, got: {error!r}"
+    )
+
+    rows_in_system_view = node.query(
+        f"SELECT count() FROM system.replicated_partition_exports "
+        f"WHERE source_table = '{mt_table}' "
+        f"  AND destination_table = '{iceberg_table}' "
+        f"  AND partition_id = '2020'"
+    ).strip()
+    assert rows_in_system_view == "0", (
+        f"Expected no row in system.replicated_partition_exports after a "
+        f"synchronously-rejected export, got {rows_in_system_view}."
+    )
+
+    count = int(node.query(f"SELECT count() FROM {iceberg_table}").strip())
+    assert count == 0, (
+        f"Expected 0 rows in Iceberg table after rejected export, got {count}"
+    )
+
+
 def test_export_partition_with_renamed_destination_column(cluster):
     """
     Source has column `id`, destination has the same shape but the column is

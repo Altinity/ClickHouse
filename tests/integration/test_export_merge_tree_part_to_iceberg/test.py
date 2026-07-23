@@ -757,6 +757,75 @@ def test_export_part_column_count_mismatch_source_fewer_is_rejected(cluster):
     node.query(f"DROP TABLE IF EXISTS {iceberg}")
 
 
+def test_export_part_source_more_columns_allowed_with_ignore_extra_setting(cluster):
+    """
+    Source has 3 columns (id, year, extra), destination has 2 (id, year).
+    With `export_merge_tree_part_schema_mismatch_mode = 'ignore_extra_source_columns_by_position'`,
+    the export must succeed: the trailing `extra` source column is dropped
+    (matched positionally) and only `id`/`year` land in the destination.
+    """
+    node = cluster.instances["node1"]
+    sfx = unique_suffix()
+    mt = f"mt_ignore_extra_{sfx}"
+    iceberg = f"iceberg_ignore_extra_{sfx}"
+
+    make_mt(node, mt, "id Int32, year Int32, extra String", "year")
+    make_iceberg_s3(node, iceberg, "id Int32, year Int32", "year")
+
+    node.query(f"INSERT INTO {mt} VALUES (1, 2020, 'foo'), (2, 2020, 'bar'), (3, 2020, 'baz')")
+    part_2020 = get_part(node, mt, "2020")
+
+    export_part(
+        node, mt, part_2020, iceberg,
+        extra_settings="export_merge_tree_part_schema_mismatch_mode = 'ignore_extra_source_columns_by_position'",
+    )
+    wait_for_export_part(node, mt, part_2020)
+
+    count = int(node.query(f"SELECT count() FROM {iceberg}").strip())
+    assert count == 3, f"Expected 3 rows in Iceberg table after export, got {count}"
+
+    result = node.query(f"SELECT id, year FROM {iceberg} ORDER BY id").strip()
+    assert result == "1\t2020\n2\t2020\n3\t2020", f"Unexpected data:\n{result}"
+
+    assert_part_log(node, mt, part_2020)
+
+    node.query(f"DROP TABLE IF EXISTS {mt} SYNC")
+    node.query(f"DROP TABLE IF EXISTS {iceberg}")
+
+
+def test_export_part_column_count_mismatch_source_fewer_still_rejected_with_ignore_extra_setting(cluster):
+    """
+    `ignore_extra_source_columns_by_position` only relaxes the source-has-more-columns
+    direction. Source has 2 columns (id, year), destination has 3 (id, year, extra):
+    the destination cannot be filled from the source, so this must still be
+    rejected synchronously even with the relaxed setting.
+    """
+    node = cluster.instances["node1"]
+    sfx = unique_suffix()
+    mt = f"mt_ignore_extra_fewer_{sfx}"
+    iceberg = f"iceberg_ignore_extra_fewer_{sfx}"
+
+    make_mt(node, mt, "id Int32, year Int32", "year")
+    make_iceberg_s3(node, iceberg, "id Int32, year Int32, extra String", "year")
+
+    node.query(f"INSERT INTO {mt} VALUES (1, 2020), (2, 2020)")
+    part_2020 = get_part(node, mt, "2020")
+
+    error = node.query_and_get_error(
+        f"ALTER TABLE {mt} EXPORT PART '{part_2020}' TO TABLE {iceberg} "
+        f"SETTINGS allow_experimental_export_merge_tree_part = 1, "
+        f"allow_experimental_insert_into_iceberg = 1, "
+        f"export_merge_tree_part_schema_mismatch_mode = 'ignore_extra_source_columns_by_position'"
+    )
+    assert "NUMBER_OF_COLUMNS_DOESNT_MATCH" in error, (
+        f"Expected NUMBER_OF_COLUMNS_DOESNT_MATCH for source<dest column count "
+        f"even with ignore_extra_source_columns_by_position, got: {error!r}"
+    )
+
+    node.query(f"DROP TABLE IF EXISTS {mt} SYNC")
+    node.query(f"DROP TABLE IF EXISTS {iceberg}")
+
+
 def test_export_part_with_renamed_destination_column(cluster):
     """
     Source has column `id`, destination has the same shape but the column is
