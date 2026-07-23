@@ -71,11 +71,15 @@ public:
     ~CasGcScheduler();
 
     /// Starts the periodic round and heartbeat workers. Calling `start` more than once while the
-    /// scheduler is running is a no-op; after `stop`, it may be started again.
+    /// scheduler is running is a no-op; after `stop`, it may be started again on the SAME instance --
+    /// the persistent `gc` observer and `gc_id` are preserved, so the lease's observation-window
+    /// protocol continues across a stop/start (`SYSTEM CONTENT ADDRESSED GC START`).
     void start();
 
     /// Stops both workers, wakes them if they are waiting, and joins them before returning. It is
-    /// safe to call `stop` when the scheduler is not running and from the destructor.
+    /// safe to call `stop` when the scheduler is not running and from the destructor. It also clears
+    /// the in-process `i_am_leader` hint (after the joins), so a stopped scheduler reports it no longer
+    /// leads GC; the durable `gc/state` lease is untouched (`SYSTEM CONTENT ADDRESSED GC STOP`).
     void stop();
 
     /// Test/diagnostics hook: run ONE round synchronously on the caller's thread. Returns the round

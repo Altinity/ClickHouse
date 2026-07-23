@@ -263,6 +263,28 @@ public:
     /// `lifecycle_mutex` (against unmount/mount/fsck) and `gc_scheduler_mutex` (against a synchronous round).
     void forgetDisk() TSA_NO_THREAD_SAFETY_ANALYSIS;
 
+    /// `SYSTEM CONTENT ADDRESSED GC STOP` handler (Task 11, spec §6): stops ONLY the background GC scheduler.
+    /// The disk stays fully usable -- reads/writes are unaffected; this is granular operator control of the
+    /// GC pacer alone, NOT a lifecycle transition. Unlike `forgetDisk`/`unmountSynchronously` this is
+    /// STOP-IN-PLACE: the scheduler object is RETAINED in the member (not detached/destroyed), so `gcHealth`/
+    /// `gcQuiescentForErasureProof` keep reading its (now stopped => quiescent) state truthfully and a later
+    /// `gcStart` re-enters the SAME instance with its `gc_id` + lease-observation history preserved. `stop()`
+    /// joins the worker+heartbeat threads and clears the in-process leadership hint. Idempotent (a second
+    /// STOP is a no-op); a no-op success when no scheduler exists (GC disabled / read-only / not mounted).
+    /// Works on a not-live/Vanished disk too -- stopping GC on a sick disk is legitimate operator action, so
+    /// this does NOT consult `checkOpAdmitted`. Serialized by `lifecycle_mutex` and `gc_scheduler_mutex`.
+    void gcStop() TSA_NO_THREAD_SAFETY_ANALYSIS;
+
+    /// `SYSTEM CONTENT ADDRESSED GC START` handler (Task 11, spec §6): restarts the background GC scheduler
+    /// stopped by `gcStop`, re-entering the SAME instance (its `start()` is re-enterable after a join).
+    /// Leadership is NOT auto-restored -- the scheduler re-acquires the durable `gc/state` lease through the
+    /// next round's normal acquisition. Idempotent (a no-op on a running scheduler). Unlike `gcStop`, it goes
+    /// through the uniform GC gate (`checkOpAdmitted(Admin)`): it refuses on a transient / `IdentityLost` /
+    /// `Vanished` pool with the typed error (668 / [D5]) and on a not-mounted disk -- restarting GC on a
+    /// decommissioned/uncertain pool is meaningless and would only spin failing rounds. Serialized by
+    /// `lifecycle_mutex` and `gc_scheduler_mutex`.
+    void gcStart() TSA_NO_THREAD_SAFETY_ANALYSIS;
+
     /// Test-only fault-injection hook. When set, `startup` invokes it right before it publishes
     /// `cas_store`/`part_access`/`gc_scheduler`/`pool_uuid`/`conditional_copy_supported` -- everything
     /// up to that point (opening the pool, building the part-folder facade, running the capability

@@ -901,6 +901,86 @@ void ContentAddressedMetadataStorage::forgetDisk()
     pool->forgetDisk([&scheduler] { if (scheduler) scheduler->stop(); }, reason);
 }
 
+void ContentAddressedMetadataStorage::gcStop()
+{
+    /// SYSTEM CONTENT ADDRESSED GC STOP (spec §6): stop ONLY the background GC scheduler. STOP-IN-PLACE --
+    /// the scheduler object is RETAINED in the member (contrast `forgetDisk`/`shutdown`/`unmountSynchronously`,
+    /// which `std::move` it out and destroy it): a later `gcStart` must re-enter the SAME instance so its
+    /// `gc_id` + lease observation history survive. Keeping it in the member also keeps `gcHealth` and
+    /// `gcQuiescentForErasureProof` reading the (stopped => quiescent) state truthfully, rather than "no GC".
+    /// A lifecycle-control verb: serialized against unmount/mount/fsck/forget by `lifecycle_mutex`, and
+    /// against a concurrent synchronous GC round by `gc_scheduler_mutex` (a round holds the latter, so this
+    /// waits it out). It does NOT consult `checkOpAdmitted` -- stopping GC works on ANY disk state, including
+    /// a not-live/Vanished one (stopping the reclaimer on a sick disk is a legitimate operator action).
+    std::lock_guard lifecycle(lifecycle_mutex);
+    std::lock_guard round_lock(gc_scheduler_mutex);
+
+    /// Snapshot the scheduler under `pointer_mutex` by COPY (never `std::move`): leave it in the member.
+    std::shared_ptr<Cas::CasGcScheduler> snapshot;
+    {
+        std::lock_guard lock(pointer_mutex);
+        snapshot = gc_scheduler;
+    }
+    if (!snapshot)
+    {
+        /// No scheduler at all (GC disabled / read-only / not mounted / already forgotten). Stopping GC on a
+        /// disk that runs none is a no-op success -- the operator's intent ("no GC background activity")
+        /// already holds.
+        LOG_INFO(getLogger("ContentAddressedMetadataStorage"),
+            "SYSTEM CONTENT ADDRESSED GC STOP on content-addressed disk '{}': no GC scheduler "
+            "(disabled/read-only/not mounted) -- nothing to stop.", disk_name);
+        return;
+    }
+    /// `stop()` joins the worker + heartbeat threads and clears the in-process leadership hint. Runs OUTSIDE
+    /// `pointer_mutex` (it joins threads). Idempotent: a second STOP finds an already-stopped scheduler and
+    /// `stop()` is a safe no-op.
+    snapshot->stop();
+}
+
+void ContentAddressedMetadataStorage::gcStart()
+{
+    /// SYSTEM CONTENT ADDRESSED GC START (spec §6): restart the background GC scheduler stopped by `gcStop`.
+    /// Serialized like `gcStop`. Unlike it, START refuses on a decommissioned/uncertain pool: restarting GC
+    /// there would only spin failing rounds, so it goes through the uniform GC gate.
+    std::lock_guard lifecycle(lifecycle_mutex);
+    std::lock_guard round_lock(gc_scheduler_mutex);
+
+    checkNotReadOnly("GC start");
+    if (!gc_enabled)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "Garbage collection is not enabled on this content-addressed disk");
+    /// Admin class (rev.7 spec §1): refuse on a transient / `IdentityLost` / `Vanished` pool (typed 668 /
+    /// [D5]) and on a not-mounted disk (`throwNotMounted`). Only a `Live` pool proceeds -- the same uniform
+    /// gate every GC entry point uses (`runGarbageCollectionRoundNow` / `runGcRebuildNow`).
+    checkOpAdmitted(CasOpClass::Admin);
+    if (shutdown_called)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "Cannot start garbage collection after ContentAddressedMetadataStorage shutdown has begun");
+
+    std::shared_ptr<Cas::CasGcScheduler> snapshot;
+    {
+        std::lock_guard ptr_lock(pointer_mutex);
+        if (!gc_scheduler)
+        {
+            /// `Live` + `gc_enabled` + not read-only but no scheduler: reachable only when the disk was
+            /// mounted in a context that started none (e.g. a unit-test null context) or after a GC RUN that
+            /// created a lazy one was never started. Create a STABLE instance now, mirroring the GC RUN entry
+            /// points, so START is meaningful. (`checkOpAdmitted` above already proved `cas_store` is live.)
+            if (!cas_store)
+                throwNotMounted(mount_state);
+            gc_scheduler = std::make_shared<Cas::CasGcScheduler>(
+                cas_store, gc_interval, fmt::format("{}::ContentAddressedGC", storage_path_full),
+                disk_name, makeGcRoundLogger());
+        }
+        snapshot = gc_scheduler;
+    }
+    /// `start()` is a no-op if already running (idempotent) and re-enters the SAME instance after a stop --
+    /// the persistent `gc` observer + `gc_id` are preserved, and leadership is re-acquired only by the next
+    /// round's normal `gc/state` acquisition, never restored here. Runs outside `pointer_mutex` for symmetry
+    /// with `stop()` (it spawns threads but joins nothing, so it does not block).
+    snapshot->start();
+}
+
 Cas::FsckReport ContentAddressedMetadataStorage::runFsckOnDormant(bool detail) const
 {
     /// Outermost lock (see its own doc comment): held for the WHOLE scan, so a concurrent MOUNT/UNMOUNT

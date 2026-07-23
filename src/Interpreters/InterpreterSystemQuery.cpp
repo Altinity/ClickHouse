@@ -1049,6 +1049,18 @@ BlockIO InterpreterSystemQuery::execute()
             contentAddressedForget(query.disk);
             break;
         }
+        case Type::CONTENT_ADDRESSED_GC_STOP:
+        {
+            getContext()->checkAccess(AccessType::SYSTEM_CONTENT_ADDRESSED_GC_STOP);
+            contentAddressedGcStop(query.disk);
+            break;
+        }
+        case Type::CONTENT_ADDRESSED_GC_START:
+        {
+            getContext()->checkAccess(AccessType::SYSTEM_CONTENT_ADDRESSED_GC_START);
+            contentAddressedGcStart(query.disk);
+            break;
+        }
         case Type::CONTENT_ADDRESSED_DROP_POOL_MEMBER:
         {
             getContext()->checkAccess(AccessType::SYSTEM_CONTENT_ADDRESSED_DROP_POOL_MEMBER);
@@ -2603,6 +2615,52 @@ void InterpreterSystemQuery::contentAddressedForget(const String & disk_name)
         disk_name);
 }
 
+void InterpreterSystemQuery::contentAddressedGcStop(const String & disk_name)
+{
+    /// SYSTEM CONTENT ADDRESSED GC STOP (spec §6): stop ONLY the background GC scheduler on this disk. The
+    /// disk stays fully usable -- reads and writes are unaffected; this is granular operator control of GC
+    /// alone (e.g. to pause reclamation during an incident), not a lifecycle transition. STOP-IN-PLACE: the
+    /// scheduler object is retained so a later GC START restarts the SAME instance (its gc_id and lease
+    /// observation history preserved). Idempotent; works even on a not-live/Vanished disk (stopping GC on a
+    /// sick disk is legitimate). The disk is REQUIRED -- there is no fan-out form.
+    if (disk_name.empty())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "SYSTEM CONTENT ADDRESSED GC STOP requires an explicit disk name");
+
+    auto disk = getContext()->getDisk(disk_name);                       /// UNKNOWN_DISK on a bad name
+    auto * ca = ContentAddressedMetadataStorage::tryFromDisk(disk);
+    if (!ca)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Disk '{}' is not a content-addressed disk", disk_name);
+
+    ca->gcStop();
+    LOG_INFO(log,
+        "SYSTEM CONTENT ADDRESSED GC STOP: stopped the background garbage-collection scheduler on "
+        "content-addressed disk '{}' (the disk stays fully usable; SYSTEM CONTENT ADDRESSED GC START "
+        "resumes it).",
+        disk_name);
+}
+
+void InterpreterSystemQuery::contentAddressedGcStart(const String & disk_name)
+{
+    /// SYSTEM CONTENT ADDRESSED GC START (spec §6): restart the background GC scheduler stopped by GC STOP.
+    /// It re-enters the SAME scheduler instance; leadership is NOT auto-restored -- the scheduler re-acquires
+    /// the durable `gc/state` lease through the next round's normal acquisition. Idempotent (a no-op on a
+    /// running scheduler). Refuses on a decommissioned/uncertain pool (typed error) -- restarting GC there
+    /// would only spin failing rounds. The disk is REQUIRED -- there is no fan-out form.
+    if (disk_name.empty())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "SYSTEM CONTENT ADDRESSED GC START requires an explicit disk name");
+
+    auto disk = getContext()->getDisk(disk_name);                       /// UNKNOWN_DISK on a bad name
+    auto * ca = ContentAddressedMetadataStorage::tryFromDisk(disk);
+    if (!ca)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Disk '{}' is not a content-addressed disk", disk_name);
+
+    ca->gcStart();
+    LOG_INFO(log,
+        "SYSTEM CONTENT ADDRESSED GC START: resumed the background garbage-collection scheduler on "
+        "content-addressed disk '{}'.",
+        disk_name);
+}
+
 void InterpreterSystemQuery::loadPrimaryKeys()
 {
     loadOrUnloadPrimaryKeysImpl(true);
@@ -3194,6 +3252,16 @@ AccessRightsElements InterpreterSystemQuery::getRequiredAccessForDDLOnCluster() 
         case Type::CONTENT_ADDRESSED_FORGET:
         {
             required_access.emplace_back(AccessType::SYSTEM_CONTENT_ADDRESSED_FORGET);
+            break;
+        }
+        case Type::CONTENT_ADDRESSED_GC_STOP:
+        {
+            required_access.emplace_back(AccessType::SYSTEM_CONTENT_ADDRESSED_GC_STOP);
+            break;
+        }
+        case Type::CONTENT_ADDRESSED_GC_START:
+        {
+            required_access.emplace_back(AccessType::SYSTEM_CONTENT_ADDRESSED_GC_START);
             break;
         }
         case Type::UNFREEZE:

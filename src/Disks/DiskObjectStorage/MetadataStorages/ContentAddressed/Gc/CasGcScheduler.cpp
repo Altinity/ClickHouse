@@ -83,6 +83,13 @@ void CasGcScheduler::stop()
         thread.join();
     if (hb_thread.joinable())
         hb_thread.join();
+    /// Clear the in-process leadership hint AFTER both workers are joined, so it is final: no round can set
+    /// it again (a round in flight is joined above and clears `round_in_flight` on the way out; clearing
+    /// `i_am_leader` before the join would race a completing round that re-sets it). The durable `gc/state`
+    /// lease stays authoritative and untouched here -- a restarted scheduler re-enters leadership through the
+    /// next round's normal acquisition, never by inheriting a stale hint. This is what lets `SYSTEM CONTENT
+    /// ADDRESSED GC STOP` keep the scheduler object alive (restartable) yet report "no longer leading".
+    i_am_leader.store(false, std::memory_order_relaxed);
 }
 
 void CasGcScheduler::onLeaseAcquired()
