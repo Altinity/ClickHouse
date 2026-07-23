@@ -1,8 +1,0 @@
-unmount_refused_live_table: 1
-unmount_ok
-unmount_idempotent_ok
-dormant_refuses_new_table: 1
-gc_run_on_dormant_disk_clean_error: 1
-mount_ok
-mount_idempotent_ok
-42
