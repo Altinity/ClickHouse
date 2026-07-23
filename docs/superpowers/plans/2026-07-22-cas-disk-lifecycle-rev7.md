@@ -362,11 +362,14 @@ void checkOpAdmitted(CasOpClass op) const;   /// on ContentAddressedMetadataStor
 ${CLICKHOUSE_CLIENT} --query "DROP TABLE <table> SYNC"
 ${CLICKHOUSE_CLIENT} --query "SYSTEM CONTENT ADDRESSED FORGET '${DISK_NAME}'" || {
     echo "FORGET failed — leaving pool dir in place (fail-closed)"; exit 1; }
-LIFECYCLE=$(${CLICKHOUSE_CLIENT} --query "
-    SELECT lifecycle || '(' || lifecycle_reason || ')' FROM system.content_addressed_mounts
-    WHERE disk = '${DISK_NAME}'")
-[ "${LIFECYCLE}" = "vanished(forgotten)" ] || {
-    echo "unexpected lifecycle after FORGET: ${LIFECYCLE}"; exit 1; }
+LIFECYCLE_OK=$(${CLICKHOUSE_CLIENT} --query "
+    SELECT count() FROM system.content_addressed_mounts
+    WHERE disk = '${DISK_NAME}' AND lifecycle = 'vanished'
+      AND lifecycle_reason LIKE '%SYSTEM CONTENT ADDRESSED FORGET%'")
+[ "${LIFECYCLE_OK}" = "1" ] || {
+    echo "unexpected lifecycle after FORGET (see system.content_addressed_mounts)"; exit 1; }
+# (Amended 2026-07-23: T12 as-built keeps lifecycle enum-clean ('vanished') and lifecycle_reason as the
+#  FULL [D5] detail text — richer for operators than a bare 'forgotten'; the check matches accordingly.)
 rm -rf "${POOL_DIR:?}"   # safe: FORGET stopped and joined every CAS thread for this disk
 ```
 
