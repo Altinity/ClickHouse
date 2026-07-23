@@ -508,6 +508,15 @@ public:
         empty_proof_probe_override_for_test = std::move(fn);
     }
 
+    /// Test-only seam (inert in production): invoked at each manual GC verb's FORGET-race juncture so a test
+    /// can deterministically interleave a concurrent FORGET. For the round verbs
+    /// (`runOneGcRoundForTest`/`runGarbageCollectionRoundNow`) it fires PRE-lock, in the admission->lock
+    /// TOCTOU window (I-1: the call is admitted while `Live`, parks here until FORGET drives the pool
+    /// `Vanished`, then hits the under-lock re-check). For `runGcRebuildNow` it fires WHILE the rebuild HOLDS
+    /// `gc_scheduler_mutex` (I-2: the in-flight window a concurrent FORGET must serialize behind). Empty by
+    /// default; production installs none.
+    void setGcVerbAdmitWindowHookForTest(std::function<void()> fn) { gc_verb_admit_window_hook_for_test = std::move(fn); }
+
     /// Test-only fault-injection/hook seam for `ContentAddressedTransaction::publishStaging`'s
     /// promote/repoint call, keyed by the full `(ns, ref)` routed identity via `PartRefKey::cacheKey()`
     /// (mirrors `CasRefLedger::setRefPreCarveHookForTest`'s no-op-in-production shape) -- a bare ref
@@ -727,6 +736,11 @@ private:
     /// are inert in production (no test ever sets the override; the counter is write-only there).
     mutable std::atomic<uint64_t> empty_proof_probe_count_for_test{0};
     std::function<Cas::SentinelProbeResult()> empty_proof_probe_override_for_test;
+
+    /// Backing state for the `setGcVerbAdmitWindowHookForTest` seam declared above (the I-1/I-2 admission
+    /// TOCTOU tests). Empty in production; a `const` GC verb reads it and calls the const-qualified
+    /// `std::function::operator()`, so it needs no `mutable`.
+    std::function<void()> gc_verb_admit_window_hook_for_test;
 };
 
 }

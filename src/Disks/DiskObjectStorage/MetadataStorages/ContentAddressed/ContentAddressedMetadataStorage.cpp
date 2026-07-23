@@ -363,7 +363,17 @@ void ContentAddressedMetadataStorage::runOneGcRoundForTest()
     /// finish because clean GC completion takes priority over fast shutdown. pointer_mutex (a
     /// separate, briefly-held mutex) only guards the scheduler snapshot/creation below, so
     /// gcHealth/store/partAccess never block behind this round.
+    /// Test-only seam (inert in production): lets a test interleave a concurrent FORGET into the window
+    /// between the pre-lock admission check above and the lock acquisition below -- the exact I-1 TOCTOU.
+    if (gc_verb_admit_window_hook_for_test)
+        gc_verb_admit_window_hook_for_test();
     std::lock_guard round_lock(gc_scheduler_mutex);
+    /// Re-run the admission gate UNDER `gc_scheduler_mutex` (mirroring `gcStart`'s lock-then-gate): the
+    /// pre-lock check above is only a fast-fail. A round admitted while `Live` can block on this mutex behind
+    /// a concurrent FORGET (which holds it for its whole teardown); once FORGET settles the pool `Vanished`,
+    /// this re-check throws the typed [D5] refusal instead of resurrecting a scheduler on a decommissioned
+    /// pool. `checkOpAdmitted` takes only the brief `pointer_mutex` -- lock order gc_scheduler -> pointer.
+    checkOpAdmitted(CasOpClass::Admin);
     if (shutdown_called)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "Cannot run garbage collection after ContentAddressedMetadataStorage shutdown has begun");
@@ -556,7 +566,17 @@ Cas::RoundReport ContentAddressedMetadataStorage::runGarbageCollectionRoundNow()
     /// finish because clean GC completion takes priority over fast shutdown. pointer_mutex only
     /// guards the scheduler snapshot/creation below, so gcHealth/store/partAccess never block behind
     /// this round.
+    /// Test-only seam (inert in production): lets a test interleave a concurrent FORGET into the window
+    /// between the pre-lock admission check above and the lock acquisition below -- the exact I-1 TOCTOU.
+    if (gc_verb_admit_window_hook_for_test)
+        gc_verb_admit_window_hook_for_test();
     std::lock_guard round_lock(gc_scheduler_mutex);
+    /// Re-run the admission gate UNDER `gc_scheduler_mutex` (mirroring `gcStart`'s lock-then-gate): the
+    /// pre-lock check above is only a fast-fail. A round admitted while `Live` can block on this mutex behind
+    /// a concurrent FORGET (which holds it for its whole teardown); once FORGET settles the pool `Vanished`,
+    /// this re-check throws the typed [D5] refusal instead of resurrecting a scheduler on a decommissioned
+    /// pool. `checkOpAdmitted` takes only the brief `pointer_mutex` -- lock order gc_scheduler -> pointer.
+    checkOpAdmitted(CasOpClass::Admin);
     if (shutdown_called)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "Cannot run garbage collection after ContentAddressedMetadataStorage shutdown has begun");
@@ -587,8 +607,25 @@ Cas::RebuildReport ContentAddressedMetadataStorage::runGcRebuildNow(bool force) 
             "Garbage collection is not enabled on this content-addressed disk");
     /// Admin class (rev.7 spec §1): refuse on a transient / IdentityLost / Vanished pool. (`store()` below
     /// already throws on a terminal pool, but not on the merely-transient one -- this closes that gap and
-    /// keeps the refusal uniform with the other GC entry points.)
+    /// keeps the refusal uniform with the other GC entry points.) Pre-lock: only a fast-fail.
     checkOpAdmitted(CasOpClass::Admin);
+    /// Serialize the whole rebuild under `gc_scheduler_mutex`, exactly as a synchronous round and FORGET's
+    /// teardown are (both hold this same mutex). Held for the rebuild's DURATION so a concurrent FORGET waits
+    /// it out (fail-closed) instead of reporting the disk decommissioned while the rebuild's one-shot
+    /// `Cas::Gc` is still issuing durable `gc/`-plane writes. `Gc::rebuildBaseline` holds only the
+    /// Pool/backend (no back-reference to this storage), so it never re-takes this mutex -- no deadlock; and
+    /// `store()` takes only the brief `pointer_mutex` (lock order gc_scheduler -> pointer), so
+    /// gcHealth/store/partAccess never block behind this rebuild.
+    std::lock_guard round_lock(gc_scheduler_mutex);
+    /// Re-run the admission gate under the lock (mirroring the round verbs): a rebuild admitted while `Live`
+    /// but blocked here behind a FORGET refuses once the pool is `Vanished` (the later `store()` is also
+    /// fail-closed, so this is a fast-fail before minting the GC identity).
+    checkOpAdmitted(CasOpClass::Admin);
+    /// Test-only seam (inert in production): fires WHILE this rebuild holds `gc_scheduler_mutex` -- the
+    /// in-flight window a concurrent FORGET must serialize behind (I-2). Lets a test hold the lock here and
+    /// observe that FORGET blocks until the rebuild releases it.
+    if (gc_verb_admit_window_hook_for_test)
+        gc_verb_admit_window_hook_for_test();
     /// A one-shot Gc instance is fine here (unlike the scheduler's stable-instance requirement for
     /// the lease's observation-window steal protocol): rebuildBaseline does its own lease
     /// acquire/steal check internally and this command runs exactly one round.
