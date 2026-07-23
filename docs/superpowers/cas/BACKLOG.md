@@ -616,4 +616,12 @@ implemented is net-negative — disable/quarantine rather than fix one virtual a
 
 
 ## Operator assertion for natural Vanished(erased) + GC-quiescent wiring (land TOGETHER) {#erased-capability-operator-assertion}
-(2026-07-23, from rev.7 Task 6 + its review) Production natural-`Vanished(erased)` is fail-closed OFF: `setStrongPrefixListCapable` has zero production callers, and `PoolConfig::gc_quiescent_fn` defaults to quiescent (dead code while capability is OFF — it short-circuits first). Wire BOTH in ONE change (tripwire from the T6 review): a `ContentAddressedSetting` operator assertion (AWS S3/GCS documented strong-LIST) consulted in `openPoolView`, plus the real CasGcScheduler "stopped + no round in flight" predicate into `gc_quiescent_fn`. Flipping the capability without the GC predicate would rest GC-exit solely on the grace-timing backstop. Candidate slot: rev.7 plan Task 12 vicinity or a standalone mini-task before Task 17.
+(REWRITTEN 2026-07-23 per the whole-increment review I3 — the earlier text was stale AND instructed the
+predicate rev-t8 adjudicated WRONG.) `gc_quiescent_fn` is ALREADY wired (Task 8: `openPoolView` →
+`gcQuiescentForErasureProof`, correctly "no round in flight" — NOT "stopped+no round", which would make
+natural promotion unreachable; do NOT change it). The ONLY remaining work: the `setStrongPrefixListCapable`
+operator assertion — a `ContentAddressedSetting` (AWS S3/GCS documented strong-LIST) consulted in
+`openPoolView`. Until it lands, production natural-`Vanished(erased)` ships DORMANT (fail-closed; FORGET is
+the operator path) — if we ship that way deliberately, spec §2 [C3] needs a one-line "requires the operator
+assertion, not yet wired" note instead. DECISION PENDING (controller): wire before T17, or explicit
+ship-dormant + spec note.

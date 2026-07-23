@@ -183,7 +183,10 @@ semantics in the rev.4 review):
      durable write AFTER two empty samples). The proof window opens only when ALL of: ref lanes settled;
      the **outstanding-durable-request counter** (incremented at admission of every durable-effect
      operation, decremented at resolution — the same fence-token plumbing) is zero and stays zero across
-     both samples; the GC scheduler thread and any in-flight round have fully exited; and a minimum grace ≥
+     both samples; NO GC round is in flight at either sample (`isQuiescent` — the scheduler THREAD deliberately
+     keeps ticking through `IdentityLost` [it exits at its next wake only once fully `Vanished`, §3], its
+     writes contained by the LIST-reset + `round_in_flight` + `has_observation` backstops — wording aligned
+     with the as-built rev-t8-adjudicated form, 2026-07-23); and a minimum grace ≥
      max(materialization grace, the backend's total request-timeout budget) elapsed since the fence trip;
   3. container proof succeeds AND the full-prefix LIST returns **zero objects**, in ≥2 cycles spaced ≥ the
      renewal period; any error or non-empty result resets the counter.
