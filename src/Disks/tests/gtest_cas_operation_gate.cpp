@@ -97,7 +97,7 @@ TEST(CasOperationGate, ProbesOnVanishedAnswerAbsentEmpty)
     ASSERT_FALSE(storage->listDirectory(kTableDir).empty());
     ASSERT_TRUE(storage->getStorageObjectsIfExist(kPartFile).has_value());
 
-    pool->setLifecycleForTest(PoolLifecycle::VanishedErased);
+    pool->setLifecycleForTest(PoolLifecycle::VanishedReplaced);
 
     EXPECT_FALSE(storage->existsFile(kPartFile));
     EXPECT_FALSE(storage->existsDirectory(kPartDir));
@@ -119,7 +119,7 @@ TEST(CasOperationGate, RemovesOnVanishedAreNoOpSuccessBackendUntouched)
     auto pool = storage->store();   /// captured while Live
     ASSERT_TRUE(storage->existsDirectory(kPartDir));
 
-    pool->setLifecycleForTest(PoolLifecycle::VanishedErased);
+    pool->setLifecycleForTest(PoolLifecycle::VanishedReplaced);
 
     /// A whole-table removeRecursive + commit (the DROP shape): both no-op-succeed.
     {
@@ -148,14 +148,9 @@ TEST(CasOperationGate, ContentReadOnVanishedThrowsTypedPerReasonMessage)
     commitOnePart(*storage);
     auto pool = storage->store();   /// captured while Live
 
-    pool->setLifecycleForTest(PoolLifecycle::VanishedErased);
-    EXPECT_NE(messageOf([&] { storage->getFileSize(kPartFile); }).find("verified: pool prefix empty"),
-              std::string::npos);
-    EXPECT_NE(messageOf([&] { storage->getStorageObjects(kPartFile); }).find("verified: pool prefix empty"),
-              std::string::npos);
-
     pool->setLifecycleForTest(PoolLifecycle::VanishedReplaced);
     EXPECT_NE(messageOf([&] { storage->getFileSize(kPartFile); }).find("foreign pool"), std::string::npos);
+    EXPECT_NE(messageOf([&] { storage->getStorageObjects(kPartFile); }).find("foreign pool"), std::string::npos);
 
     pool->setLifecycleForTest(PoolLifecycle::VanishedForgotten);
     EXPECT_NE(messageOf([&] { storage->getFileSize(kPartFile); }).find("erasure was NOT verified"),
@@ -209,7 +204,7 @@ TEST(CasOperationGate, EveryClassThrows668OnTransientAndIdentityLost)
 TEST(CasOperationGate, FactoryClassWorksOnVanished)
 {
     auto storage = openGateStorage();
-    storage->store()->setLifecycleForTest(PoolLifecycle::VanishedErased);   /// one force from Live
+    storage->store()->setLifecycleForTest(PoolLifecycle::VanishedForgotten);   /// one force from Live
 
     EXPECT_NO_THROW({ auto tx = storage->createTransaction(); (void)tx; });
     EXPECT_EQ(storage->getType(), MetadataStorageType::ContentAddressed);
@@ -225,7 +220,7 @@ TEST(CasOperationGate, TryGetInManifestBytesPropagatesTypedError)
     commitOnePart(*storage);
     auto pool = storage->store();   /// captured while Live
 
-    pool->setLifecycleForTest(PoolLifecycle::VanishedErased);
+    pool->setLifecycleForTest(PoolLifecycle::VanishedReplaced);
     /// Never FILE_DOESNT_EXIST, never a swallowed nullopt -- the typed INVALID_STATE escapes.
     Cas::tests::expectThrowsCode(ErrorCodes::INVALID_STATE, [&] {
         storage->tryGetInManifestBytes(kTableDir + "/format_version.txt");
@@ -257,26 +252,23 @@ TEST(CasOperationGate, DormantDiskKeepsOldBenignAbsent_RemoveAtTask15)
     Cas::tests::expectThrowsCode(ErrorCodes::INVALID_STATE, [&] { storage->getFileSize(kPartFile); });
 }
 
-/// (h) The raw GC round entry points refuse on a not-live pool (Admin class): typed erased once Vanished.
+/// (h) The raw GC round entry points refuse on a not-live pool (Admin class): typed [D5] reason once Vanished.
 TEST(CasOperationGate, GcEntryPointsRefuseOnNotLive)
 {
     auto storage = openGateStorage();
     auto pool = storage->store();   /// captured while Live
 
-    pool->setLifecycleForTest(PoolLifecycle::VanishedErased);
-    EXPECT_NE(messageOf([&] { storage->runOneGcRoundForTest(); }).find("verified: pool prefix empty"),
-              std::string::npos);
+    pool->setLifecycleForTest(PoolLifecycle::VanishedReplaced);
+    EXPECT_NE(messageOf([&] { storage->runOneGcRoundForTest(); }).find("foreign pool"), std::string::npos);
 
     pool->setLifecycleForTest(PoolLifecycle::TransientNotLive);
     Cas::tests::expectThrowsCode(ErrorCodes::INVALID_STATE, [&] { storage->runOneGcRoundForTest(); });
 }
 
-/// (i) `gc_quiescent_fn` now reflects the REAL scheduler: a round in flight => not quiescent. The
-/// scheduler-level observer is driven by its seam; the storage-level wiring proves the metadata storage
-/// injects the predicate (not the default) and that it reads the storage's scheduler.
-TEST(CasOperationGate, GcQuiescentReflectsRealScheduler)
+/// (i) `CasGcScheduler::isQuiescent` reflects the round-in-flight flag: a round in flight => not quiescent.
+/// (This is the join-completion signal the FORGET / GC-STOP tests rely on.)
+TEST(CasOperationGate, GcSchedulerIsQuiescentReflectsRoundInFlight)
 {
-    /// Scheduler observer: an in-flight round is NOT quiescent.
     auto backend = std::make_shared<Cas::InMemoryBackend>();
     auto pool = Cas::tests::openPoolForTest(backend);
     auto scheduler = std::make_shared<Cas::CasGcScheduler>(
@@ -286,13 +278,4 @@ TEST(CasOperationGate, GcQuiescentReflectsRealScheduler)
     EXPECT_FALSE(scheduler->isQuiescent()) << "a round in flight must NOT read as GC-quiescent";
     scheduler->setRoundInFlightForTest(false);
     EXPECT_TRUE(scheduler->isQuiescent());
-
-    /// Storage wiring: the live mount carries the injected predicate (not empty), and it reflects the
-    /// storage's scheduler. This storage runs no GC scheduler (context is null), so the predicate reads
-    /// the default-quiescent (null scheduler) -- proving the injection happened and reads `gc_scheduler`.
-    auto storage = openGateStorage();
-    EXPECT_TRUE(static_cast<bool>(storage->store()->poolConfig().gc_quiescent_fn))
-        << "the live mount must carry the injected gc_quiescent_fn, not the empty default";
-    EXPECT_TRUE(storage->store()->poolConfig().gc_quiescent_fn());
-    EXPECT_TRUE(storage->gcQuiescentForTest());
 }

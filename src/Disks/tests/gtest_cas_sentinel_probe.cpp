@@ -22,11 +22,10 @@
 using namespace DB::Cas;
 
 /// Task 3 (spec §2): the typed sentinel probe below `Backend` must never conflate a transport error
-/// with absence. These tests exercise the free-function entry points (`probeSentinel`,
-/// `probePrefixEmptiness`) against the generic `Backend::probeSentinelRaw`/`probePrefixEmptinessRaw`
-/// default (via `InMemoryBackend`, the "Emulated"-style in-memory backend used by CAS tests) and
-/// against `ObjectStorageBackend`'s `EmulatedSingleProcess` override, which is the REAL production
-/// mode for a content-addressed disk over `object_storage_type=local`.
+/// with absence. These tests exercise the free-function entry point `probeSentinel` against the generic
+/// `Backend::probeSentinelRaw` default (via `InMemoryBackend`, the "Emulated"-style in-memory backend used
+/// by CAS tests) and against `ObjectStorageBackend`'s `EmulatedSingleProcess` override, which is the REAL
+/// production mode for a content-addressed disk over `object_storage_type=local`.
 
 namespace
 {
@@ -162,48 +161,22 @@ TEST(CasSentinelProbe, TransportErrorNeverClassifiesAsAbsent)
     EXPECT_FALSE(result.body.has_value());
 }
 
-/// (e) probePrefixEmptiness: zero objects under the prefix -> KeyAbsent (the pool-wide emptiness
-/// observation); one object -> Present. Never populates `body` (it is a container proof, not a read).
-TEST(CasSentinelProbe, PrefixEmptinessDistinguishesEmptyFromNonEmpty)
-{
-    InMemoryBackend backend;
-
-    const auto empty_result = probePrefixEmptiness(backend, "root/");
-    EXPECT_EQ(empty_result.outcome, ProbeOutcome::KeyAbsent);
-    EXPECT_FALSE(empty_result.body.has_value());
-
-    ASSERT_EQ(backend.putIfAbsent("root/obj", "x").outcome, PutOutcome::Done);
-    const auto nonempty_result = probePrefixEmptiness(backend, "root/");
-    EXPECT_EQ(nonempty_result.outcome, ProbeOutcome::Present);
-    EXPECT_FALSE(nonempty_result.body.has_value());
-}
-
-/// A transport fault during the prefix listing itself must also classify Indeterminate, not KeyAbsent.
-TEST(CasSentinelProbe, PrefixEmptinessIndeterminateOnTransportError)
-{
-    TransportFaultBackend backend;
-    const auto result = probePrefixEmptiness(backend, "root/");
-    EXPECT_EQ(result.outcome, ProbeOutcome::Indeterminate);
-}
-
 #if USE_AWS_S3
 
 namespace
 {
 
-/// A `LocalObjectStorage` whose `getObjectMetadata`/`listObjects` can be armed to throw a configurable
-/// synthetic `S3Exception` — the same technique `gtest_cas_backend.cpp`'s
-/// `NativeReadThrowsNoSuchKeyObjectStorage` uses to exercise S3 error codes without a live S3 endpoint.
-/// Constructing `ObjectStorageBackend` in `Mode::Native` over this fake is the established pattern for
-/// testing the Native/S3 raw-error classifier in isolation (see also `gtest_cas_backend.cpp`'s
-/// `NativeRejectsWrongDialectTokenBeforeTouchingTheWire`).
+/// A `LocalObjectStorage` whose `getObjectMetadata` can be armed to throw a configurable synthetic
+/// `S3Exception` — the same technique `gtest_cas_backend.cpp`'s `NativeReadThrowsNoSuchKeyObjectStorage`
+/// uses to exercise S3 error codes without a live S3 endpoint. Constructing `ObjectStorageBackend` in
+/// `Mode::Native` over this fake is the established pattern for testing the Native/S3 raw-error classifier
+/// in isolation (see also `gtest_cas_backend.cpp`'s `NativeRejectsWrongDialectTokenBeforeTouchingTheWire`).
 class ThrowingS3MetadataObjectStorage final : public DB::LocalObjectStorage
 {
 public:
     using DB::LocalObjectStorage::LocalObjectStorage;
 
     void throwOnGetObjectMetadata(Aws::S3::S3Errors code) { metadata_error = code; }
-    void throwOnListObjects(Aws::S3::S3Errors code) { list_error = code; }
 
     DB::ObjectMetadata getObjectMetadata(const std::string & path, bool with_tags) const override
     {
@@ -212,16 +185,8 @@ public:
         return DB::LocalObjectStorage::getObjectMetadata(path, with_tags);
     }
 
-    void listObjects(const std::string & path, DB::RelativePathsWithMetadata & children, size_t max_keys) const override
-    {
-        if (list_error)
-            throw DB::S3Exception("injected fault: " + path, *list_error);
-        DB::LocalObjectStorage::listObjects(path, children, max_keys);
-    }
-
 private:
     std::optional<Aws::S3::S3Errors> metadata_error;
-    std::optional<Aws::S3::S3Errors> list_error;
 };
 
 DB::ObjectStoragePtr makeThrowingS3MetadataStorageForTest()
@@ -289,26 +254,6 @@ TEST(CasSentinelProbe, NativeClassifiesUnmodeledErrorAsIndeterminate)
     ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
 
     EXPECT_EQ(probeSentinel(backend, nativeKeyUnder(storage, "some/key")).outcome, ProbeOutcome::Indeterminate);
-}
-
-/// probePrefixEmptiness's Native/S3 path goes through ListObjectsV2 (`IObjectStorage::listObjects`),
-/// a separate raw-request seam from the single-key HEAD above — classified the same way.
-TEST(CasSentinelProbe, NativePrefixEmptinessClassifiesNoSuchBucketAsContainerAbsent)
-{
-    auto storage = std::static_pointer_cast<ThrowingS3MetadataObjectStorage>(makeThrowingS3MetadataStorageForTest());
-    storage->throwOnListObjects(Aws::S3::S3Errors::NO_SUCH_BUCKET);
-    ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
-
-    EXPECT_EQ(probePrefixEmptiness(backend, "pool_root/").outcome, ProbeOutcome::ContainerAbsent);
-}
-
-TEST(CasSentinelProbe, NativePrefixEmptinessClassifiesAccessDeniedAsAccessDenied)
-{
-    auto storage = std::static_pointer_cast<ThrowingS3MetadataObjectStorage>(makeThrowingS3MetadataStorageForTest());
-    storage->throwOnListObjects(Aws::S3::S3Errors::ACCESS_DENIED);
-    ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
-
-    EXPECT_EQ(probePrefixEmptiness(backend, "pool_root/").outcome, ProbeOutcome::AccessDenied);
 }
 
 /// Production wiring (`Pool::open`) ALWAYS wraps the real backend in `InstrumentedBackend` before

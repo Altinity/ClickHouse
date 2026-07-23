@@ -853,10 +853,8 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
             /// buffer writes this header first, UNHASHED and excluded from the reported size, so the
             /// content key stays the pool's hash of `payload` and `blob_size` stays the payload size.
             std::string envelope_header = buildS3StagingBlobHeader(*r);
-            /// rev.7 [C2]/[D1]: this streaming upload is a durable-effect operation from admission
-            /// (here) through its eventual `finalizeImpl`'s `sink->finalize()` (or an abandoned
-            /// cancel/destruction). Admit one `DurableRequestGuard` and capture the fence generation now,
-            /// re-checked immediately before that durable call.
+            /// rev.7 [C2]: capture the fence generation now, re-checked immediately before the durable
+            /// `sink->finalize()` in `finalizeImpl` (the streaming upload becomes durable there).
             const Cas::PoolPtr pool = metadata_storage.store();
             const uint64_t admitted_generation = pool->fenceGeneration();
             return std::make_unique<Cas::CaContentWriteBuffer>(
@@ -872,7 +870,6 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
                     const Cas::BlobRef ref{hash_algo, Cas::codecFor(hash_algo).fromHex(hash_hex)};
                     stageBlobPartFile(route, ref, size, key, Cas::StagingBackend::S3);
                 },
-                pool->beginDurableRequest(),
                 [pool, admitted_generation] { pool->checkFenceOrThrow(admitted_generation); });
         }
 
@@ -1644,14 +1641,12 @@ CaContentWriteBuffer::CaContentWriteBuffer(
     bool use_adaptive_buffer_size,
     size_t adaptive_buffer_initial_size,
     OnFinalized on_finalized_,
-    std::optional<Cas::CasMountRuntime::DurableRequestGuard> durable_guard_,
     std::function<void()> check_fence_before_finalize_)
     : WriteBufferFromFileBase(clampCasWriteBufferSize(use_adaptive_buffer_size ? adaptive_buffer_initial_size : buf_size), nullptr, 0)
     , on_finalized(std::move(on_finalized_))
     , temp_path(std::move(object_key))
     , is_s3_staging(true)
     , sink(std::move(object_store_sink))
-    , durable_guard(std::move(durable_guard_))
     , check_fence_before_finalize(std::move(check_fence_before_finalize_))
 {
     /// The sink is ALREADY opened against the staging object by the caller (writeFile) — this

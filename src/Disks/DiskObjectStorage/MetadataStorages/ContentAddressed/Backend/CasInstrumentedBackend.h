@@ -92,15 +92,14 @@ public:
     void checkPoolPreconditions() override { inner->checkPoolPreconditions(); }
     void checkConditionalWriteSingleAttemptSupport() override { inner->checkConditionalWriteSingleAttemptSupport(); }
 
-    /// Typed erasure-evidence probes are diagnostic/authoritative reads, not routine storage
-    /// operations — deliberately uninstrumented (no ProfileEvent), like the capability checks above.
-    /// MUST still be forwarded explicitly: `Backend::probeSentinelRaw`/`probePrefixEmptinessRaw`'s
-    /// generic default derives its classification from THIS object's own `head`/`get`/`list` (virtual
-    /// dispatch would otherwise resolve back to `InstrumentedBackend`'s plain, non-typed overrides
-    /// above), silently discarding whatever sharper container/permission evidence the wrapped `inner`
-    /// backend (e.g. `ObjectStorageBackend`'s S3/Local classification) is able to provide.
+    /// The typed sentinel probe is a diagnostic/authoritative read, not a routine storage operation —
+    /// deliberately uninstrumented (no ProfileEvent), like the capability checks above. MUST still be
+    /// forwarded explicitly: `Backend::probeSentinelRaw`'s generic default derives its classification from
+    /// THIS object's own `head`/`get` (virtual dispatch would otherwise resolve back to
+    /// `InstrumentedBackend`'s plain, non-typed overrides above), silently discarding whatever sharper
+    /// container/permission evidence the wrapped `inner` backend (e.g. `ObjectStorageBackend`'s S3/Local
+    /// classification) is able to provide.
     SentinelProbeResult probeSentinelRaw(const String & key) override { return inner->probeSentinelRaw(key); }
-    SentinelProbeResult probePrefixEmptinessRaw(const String & prefix) override { return inner->probePrefixEmptinessRaw(prefix); }
 
     /// Delegate the read and count it after the inner call succeeds or returns absent. Exceptions
     /// propagate unchanged and therefore do not produce a separate outcome event.
@@ -175,12 +174,6 @@ public:
 
     /// This capability is a property of the wrapped backend, not an operation to count.
     bool supportsListTokens() const override { return inner->supportsListTokens(); }
-
-    /// The erasure-proof capability is a property of the wrapped backend. MUST be forwarded explicitly:
-    /// the lifecycle observer reads it through this decorator (`Pool::open` wraps the pool backend once),
-    /// and the base default is FALSE — so without this forwarder a genuinely strong-LIST inner backend
-    /// would be seen as incapable and no pool would ever reach `Vanished(erased)`.
-    bool supportsErasureProof() const override { return inner->supportsErasureProof(); }
 
     /// Count a successful staged promotion as a create of the destination blob; an existing
     /// destination is the same deduplication outcome as `putIfAbsent`.

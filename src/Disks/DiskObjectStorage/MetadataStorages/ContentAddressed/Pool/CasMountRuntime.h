@@ -30,18 +30,17 @@ using PartWriteTxnPtr = std::shared_ptr<PartWriteTxn>;
 ///   - `Live`             — the steady state; the mount lease is (or was last) held.
 ///   - `TransientNotLive` — the lease was lost; access is uncertain and a self-remount retries. The §2
 ///                          `Present`+identity-match recovery rule fires only from here (or `Live`).
-///   - `IdentityLost`     — the pool sentinels are gone while data remains (a live erase in flight):
-///                          fail-loud, but NON-absorbing ([C1]) — a low-rate observer keeps probing and
-///                          may promote one-way to `VanishedErased` (Task 6). Matching-sentinel
-///                          reappearance does NOT auto-revive it ([D3]); only a restart recovers.
-///   - `Vanished*`        — fully terminal truth: the data root was erased/replaced, or the disk was
-///                          decommissioned by `FORGET`. Store-class access fails loud from here.
+///   - `IdentityLost`     — the pool sentinels are authoritatively absent (a live erase in flight):
+///                          fail-loud and TERMINAL (rev.8). The remount/GC observer threads self-exit;
+///                          matching-sentinel reappearance does NOT auto-revive it ([D3]); recovery is a
+///                          restart or `SYSTEM CONTENT ADDRESSED FORGET`.
+///   - `Vanished*`        — fully terminal truth: the data root was replaced by a foreign pool, or the
+///                          disk was decommissioned by `FORGET`. Store-class access fails loud from here.
 enum class PoolLifecycle : uint8_t
 {
     Live,
     TransientNotLive,
     IdentityLost,
-    VanishedErased,
     VanishedReplaced,
     VanishedForgotten,
 };
@@ -151,52 +150,6 @@ public:
     /// reach the backend in either case.
     void checkFenceOrThrow(uint64_t admitted_generation) const;
 
-    /// RAII marker for one durable-effect operation's admission-through-resolution lifetime.
-    /// Construction increments `outstanding_durable_requests`; destruction -- including on an
-    /// exception-unwind path -- decrements it. This is what the erasure-proof gate waits to observe at
-    /// (and staying at) zero before treating the pool prefix as fully durable-lane-quiescent ([D1]): ref
-    /// lanes settling alone is not enough, because an admitted plain-object/staging request can still be
-    /// in flight.
-    class DurableRequestGuard
-    {
-    public:
-        explicit DurableRequestGuard(CasMountRuntime & runtime_) : runtime(&runtime_)
-        {
-            runtime->outstanding_durable_requests.fetch_add(1, std::memory_order_acq_rel);
-        }
-
-        ~DurableRequestGuard()
-        {
-            if (runtime)
-                runtime->outstanding_durable_requests.fetch_sub(1, std::memory_order_acq_rel);
-        }
-
-        DurableRequestGuard(const DurableRequestGuard &) = delete;
-        DurableRequestGuard & operator=(const DurableRequestGuard &) = delete;
-
-        DurableRequestGuard(DurableRequestGuard && other) noexcept : runtime(other.runtime)
-        {
-            other.runtime = nullptr;
-        }
-        DurableRequestGuard & operator=(DurableRequestGuard &&) = delete;
-
-    private:
-        CasMountRuntime * runtime;
-    };
-
-    /// Count of durable-effect operations currently admitted (their `DurableRequestGuard` still alive).
-    uint64_t outstandingDurableRequests() const { return outstanding_durable_requests.load(std::memory_order_acquire); }
-
-    /// The `bootMsNow()` instant at which this runtime FIRST lost its lease (the `Live -> TransientNotLive`
-    /// transition recorded in `noteLeaseLost`), or 0 if the lease was never lost. This is the anchor for
-    /// the erasure-proof minimum-grace gate ([D1]): the proof window may not open until at least
-    /// max(materialization grace, the backend's total per-operation request-timeout budget) has elapsed
-    /// since this instant, so any durable-effect write admitted under the dying incarnation has provably
-    /// drained or been dropped. Recorded once (on the first successful `Live -> TransientNotLive`
-    /// compare-exchange) and never advanced, so it reflects the ACTUAL lease loss — not a later observer
-    /// tick — in production (`tripMountLost -> noteLeaseLost` fires it before the observer even runs).
-    uint64_t fenceTripBootMs() const { return fence_trip_boot_ms.load(std::memory_order_acquire); }
-
     /// ---- pool lifecycle condition (rev.7 §1, spec §§1-3); enum at namespace scope below ----
     /// Atomic read of the current lifecycle (acquire).
     PoolLifecycle lifecycle() const { return pool_lifecycle.load(std::memory_order_acquire); }
@@ -222,10 +175,12 @@ public:
 
     /// One-way terminal transition to `IdentityLost`, from `TransientNotLive` only (a compare-exchange
     /// FROM `TransientNotLive`, so it is idempotent and cannot fire from `Live`/`Vanished`). On the
-    /// transition it emits ONE WARN and one `CasIdentityLost` ProfileEvent. `IdentityLost` is NON-absorbing
-    /// per [C1]: it does NOT publish the terminal-intent latch, so the lifecycle observer keeps running
-    /// and Task 6 may later promote it to `VanishedErased`. Must be called under the caller's remount
-    /// serialization (Pool::remount_mutex).
+    /// transition it emits ONE WARN and one `CasIdentityLost` ProfileEvent. rev.8: `IdentityLost` is a
+    /// fail-loud TERMINAL state — `remountTerminal()` reports it, so the remount observer thread self-exits
+    /// (and the GC scheduler self-exits, through `Pool`) at its next boundary; there is no demoted observer.
+    /// It deliberately does NOT publish the `vanished_intent` latch (which is reserved for the `Vanished*`
+    /// idempotency/FORGET protocol); `remountTerminal()` widens the observer-exit boundary to include it.
+    /// Must be called under the caller's remount serialization (Pool::remount_mutex).
     void enterIdentityLost();
     /// Test seam: force the lifecycle condition directly to `lc`, bypassing the natural transition
     /// preconditions (used by the operation-gate tests to pin each class × state cell without driving a
@@ -266,9 +221,7 @@ public:
     /// `system.content_addressed_mounts` lifecycle snapshot (spec §7) reports. Written (release) at each
     /// lifecycle edge — `noteLeaseLost`/`enterIdentityLost`/`enterVanished` set it to now, `noteRemounted`
     /// clears it to 0 — and by `setLifecycleForTest`, so a forced state carries a `since` indistinguishable
-    /// from a naturally-reached one. Distinct from `fenceTripBootMs` (a boot-clock instant for the
-    /// erasure-proof grace gate, not a wall time): introspection needs a `time_t`, and this reflects the
-    /// current state's entry, not the first lease loss.
+    /// from a naturally-reached one.
     ///
     /// Ordering vs the `pool_lifecycle` transition it accompanies: the TERMINAL edges (`enterVanished`,
     /// `enterIdentityLost`) publish this store BEFORE the state store, so a reader that acquire-observes a
@@ -392,6 +345,19 @@ public:
     void emitEvent(CasEvent && e) const { if (event_sink) event_sink(std::move(e)); }
 
 private:
+    /// TRUE once the pool has reached — or is being driven toward — a state on which the self-remount
+    /// observer thread must stop: a published terminal `Vanished` intent (`vanished_intent` — set early by
+    /// FORGET, or by a natural `enterVanished`, and already subsuming every settled `Vanished*` state since
+    /// it is published before the state store) OR `IdentityLost` (rev.8: a fail-loud TERMINAL state — no
+    /// demoted observer; recovery is restart or FORGET). Consulted by `scheduleRemount` before arming and by
+    /// the remount loop at every step boundary. (The GC scheduler applies the same three-way test through
+    /// `Pool`, spec §9 rev.8 item 8.)
+    bool remountTerminal() const
+    {
+        return vanished_intent.load(std::memory_order_acquire)
+            || lifecycle() == PoolLifecycle::IdentityLost;
+    }
+
     /// ---- injected environment (no `Pool` back-reference); initialized first, in this order ----
     BackendPtr backend_ptr;
     const Layout & layout;
@@ -446,11 +412,6 @@ private:
     /// Fence-generation token (rev.7 [C2]): bumped by `tripMountLost` and `armMountFence`. See
     /// `fenceGeneration`/`checkFenceOrThrow`.
     std::atomic<uint64_t> fence_generation{0};
-    /// Count of currently-admitted durable-effect operations (rev.7 [D1]). See `DurableRequestGuard`.
-    std::atomic<uint64_t> outstanding_durable_requests{0};
-    /// `bootMsNow()` at the first `Live -> TransientNotLive` transition (rev.7 [D1]); 0 until then. The
-    /// erasure-proof grace gate measures elapsed-since-fence-trip from this. See `fenceTripBootMs`.
-    std::atomic<uint64_t> fence_trip_boot_ms{0};
 
     /// The pool lifecycle condition (rev.7 §1). Starts `Live`. Non-terminal transitions
     /// (`noteLeaseLost`/`noteRemounted`) are lock-free compare-exchanges guarded by their exact
@@ -460,9 +421,10 @@ private:
     std::atomic<PoolLifecycle> pool_lifecycle{PoolLifecycle::Live};
     /// Terminal-intent latch (spec §3), published before the state store — by `enterVanished` for a
     /// natural transition, or EARLY (step 1) by `publishVanishedIntent` for FORGET. Only the fully-terminal
-    /// `Vanished` transition sets it — `IdentityLost` is NON-absorbing ([C1]) and deliberately does NOT, so
-    /// its observer keeps running. Checked by the keeper callback before scheduling a remount and by the
-    /// remount loop at every step boundary, so a vanished pool never claims, allocates, or writes again.
+    /// `Vanished*` transition sets it — `IdentityLost` deliberately does NOT (rev.8 folds IdentityLost into
+    /// the observer-exit boundary via `remountTerminal()` instead). Consulted (with `IdentityLost`) by
+    /// `remountTerminal()`, so a terminal pool's keeper callback never schedules a remount and the remount
+    /// loop bails at its next step boundary — no claim/allocate/write after the pool is (being driven) terminal.
     std::atomic<bool> vanished_intent{false};
     /// Idempotency guard for the terminal STATE transition (`enterVanished`'s body). Distinct from
     /// `vanished_intent`: FORGET publishes that intent latch at step 1, so it can no longer serve as the

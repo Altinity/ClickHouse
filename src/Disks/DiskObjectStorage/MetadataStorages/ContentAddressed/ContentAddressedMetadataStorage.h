@@ -302,9 +302,9 @@ public:
     /// `SYSTEM CONTENT ADDRESSED GC STOP` handler (Task 11, spec §6): stops ONLY the background GC scheduler.
     /// The disk stays fully usable -- reads/writes are unaffected; this is granular operator control of the
     /// GC pacer alone, NOT a lifecycle transition. Unlike `forgetDisk`/`unmountSynchronously` this is
-    /// STOP-IN-PLACE: the scheduler object is RETAINED in the member (not detached/destroyed), so `gcHealth`/
-    /// `gcQuiescentForErasureProof` keep reading its (now stopped => quiescent) state truthfully and a later
-    /// `gcStart` re-enters the SAME instance with its `gc_id` + lease-observation history preserved. `stop()`
+    /// STOP-IN-PLACE: the scheduler object is RETAINED in the member (not detached/destroyed), so `gcHealth`
+    /// keeps reading its (now stopped) state truthfully and a later `gcStart` re-enters the SAME instance
+    /// with its `gc_id` + lease-observation history preserved. `stop()`
     /// joins the worker+heartbeat threads and clears the in-process leadership hint. Idempotent (a second
     /// STOP is a no-op); a no-op success when no scheduler exists (GC disabled / read-only / not mounted).
     /// Works on a not-live/Vanished disk too -- stopping GC on a sick disk is legitimate operator action, so
@@ -508,11 +508,6 @@ public:
     /// dispatch order directly.
     DirRoute classifyDirectoryForTest(const std::string & path) const { return classifyDirectory(path); }
 
-    /// Test seam: the value of the injected `gc_quiescent_fn` predicate right now (see
-    /// `gcQuiescentForErasureProof`) -- lets the gate tests assert the wiring reflects the real scheduler
-    /// (a forced in-flight round => not quiescent) without reaching the pool's erasure-proof observer.
-    bool gcQuiescentForTest() const { return gcQuiescentForErasureProof(); }
-
     /// Test seams for the EMPTY-PROOF RULE (Task 9, spec §1 [B3]). The counter is bumped on every
     /// authoritative pool-identity probe the empty-proof issues, so a test can assert it fires EXACTLY
     /// once per EMPTY `TableDir`/`DetachedContainer` enumeration and NEVER on the non-empty hot path,
@@ -709,15 +704,6 @@ private:
     /// keeps those CA-agnostic sweeps from wedging while any CA disk is unmounted. Content/size/mutation
     /// entry points deliberately do NOT consult this and stay fail-close (they still throw).
     bool isMounted() const;
-
-    /// The `PoolConfig::gc_quiescent_fn` predicate this storage injects into its live mount (T6 tripwire):
-    /// TRUE iff GC is provably quiescent for the `Vanished(erased)` erasure proof ([D1], spec §2) -- no GC
-    /// scheduler, or the scheduler reports no round in flight (`CasGcScheduler::isQuiescent`). The injected
-    /// lambda captures `this` and calls this under `pointer_mutex`; it is invoked ONLY from the pool's own
-    /// remount-thread observer, which is joined before this storage tears down its members (production
-    /// always `shutdown()`s first; the unit tests that reach here never spawn that thread), so reading
-    /// `gc_scheduler` here is safe.
-    bool gcQuiescentForErasureProof() const;
 
     /// EMPTY-PROOF RULE (rev.7 spec §1 [B3]): called by `listDirectory` when a `TableDir`/
     /// `DetachedContainer` enumeration on a NON-terminal (Live or read-only) pool is about to answer

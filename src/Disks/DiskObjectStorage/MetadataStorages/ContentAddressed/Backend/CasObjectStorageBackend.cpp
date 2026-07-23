@@ -766,9 +766,7 @@ SentinelProbeResult ObjectStorageBackend::probeSentinelRaw(const String & key)
                     /// and instead derives this generic code straight from the HTTP 404 status (see
                     /// `isNotFoundError`, `src/IO/S3/getObjectInfo.cpp`) — this is what a REAL S3 HEAD
                     /// on an absent key actually throws. The container/key distinction is deliberately
-                    /// NOT attempted here (a bodyless 404 cannot carry it); that discriminator lives in
-                    /// `probePrefixEmptinessRaw` below, whose LIST error responses DO have a parseable
-                    /// body and therefore a real `NO_SUCH_BUCKET` code.
+                    /// NOT attempted here (a bodyless 404 cannot carry it).
                     return {ProbeOutcome::KeyAbsent, std::nullopt};
                 case Aws::S3::S3Errors::NO_SUCH_BUCKET:
                     return {ProbeOutcome::ContainerAbsent, std::nullopt};
@@ -799,55 +797,6 @@ SentinelProbeResult ObjectStorageBackend::probeSentinelRaw(const String & key)
         if (!g)
             return {ProbeOutcome::KeyAbsent, std::nullopt};
         return {ProbeOutcome::Present, std::move(g->bytes)};
-    }
-    catch (...)
-    {
-        return {ProbeOutcome::Indeterminate, std::nullopt};
-    }
-}
-
-/// See Backend::probePrefixEmptinessRaw. Container proof: ListObjectsV2(max-keys=1), never a bucket
-/// HEAD — a bucket can forbid HeadBucket while still allowing a prefixed ListObjectsV2.
-SentinelProbeResult ObjectStorageBackend::probePrefixEmptinessRaw(const String & prefix)
-{
-    if (mode == Mode::Native)
-    {
-        try
-        {
-            RelativePathsWithMetadata children;
-            object_storage->listObjects(prefix, children, /*max_keys=*/1);
-            return {children.empty() ? ProbeOutcome::KeyAbsent : ProbeOutcome::Present, std::nullopt};
-        }
-#if USE_AWS_S3
-        catch (const S3Exception & e)
-        {
-            switch (e.getS3ErrorCode())
-            {
-                case Aws::S3::S3Errors::NO_SUCH_BUCKET:
-                    return {ProbeOutcome::ContainerAbsent, std::nullopt};
-                case Aws::S3::S3Errors::ACCESS_DENIED:
-                    return {ProbeOutcome::AccessDenied, std::nullopt};
-                default:
-                    return {ProbeOutcome::Indeterminate, std::nullopt};
-            }
-        }
-#endif
-        catch (...)
-        {
-            return {ProbeOutcome::Indeterminate, std::nullopt};
-        }
-    }
-
-    /// EmulatedSingleProcess (Local): stat the configured container directory first — see
-    /// probeSentinelRaw's comment; a missing sub-prefix and a missing pool root both list as empty.
-    try
-    {
-        if (!object_storage->existsOrHasAnyChild(emu_root))
-            return {ProbeOutcome::ContainerAbsent, std::nullopt};
-
-        RelativePathsWithMetadata children;
-        object_storage->listObjects(emuPath(prefix), children, /*max_keys=*/1);
-        return {children.empty() ? ProbeOutcome::KeyAbsent : ProbeOutcome::Present, std::nullopt};
     }
     catch (...)
     {

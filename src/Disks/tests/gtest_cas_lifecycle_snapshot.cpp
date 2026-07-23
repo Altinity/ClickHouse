@@ -192,10 +192,10 @@ TEST(CasLifecycleSnapshot, PerformsZeroBackendOps)
     assertNoIo("live snapshot must not touch the backend");
 
     /// Forced terminal snapshot (the very state the store()-class surface refuses): still zero I/O.
-    store->setLifecycleForTest(PoolLifecycle::VanishedErased);
+    store->setLifecycleForTest(PoolLifecycle::VanishedReplaced);
     const DB::Cas::Pool::LifecycleSnapshot vanished = store->lifecycleSnapshot();
     assertNoIo("a vanished-pool snapshot must not touch the backend");
-    EXPECT_EQ(vanished.lifecycle, PoolLifecycle::VanishedErased);
+    EXPECT_EQ(vanished.lifecycle, PoolLifecycle::VanishedReplaced);
 }
 
 /// (f) A NATURAL transition (not the forced setter) captures the detail + `since`, and the snapshot's detail

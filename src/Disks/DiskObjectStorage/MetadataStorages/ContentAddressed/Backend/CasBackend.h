@@ -146,10 +146,8 @@ enum class ProbeOutcome : uint8_t
     Indeterminate,     /// a transport/timeout/unclassifiable error — absence was NEVER proven
 };
 
-/// Result of `Backend::probeSentinelRaw` / `Backend::probePrefixEmptinessRaw`. `body` carries the
-/// materialized bytes ONLY for a single-key probe (`probeSentinelRaw`) whose outcome is `Present`; a
-/// prefix-emptiness probe (`probePrefixEmptinessRaw`) never populates it — its `Present` means "at
-/// least one object was listed", not "one key was read".
+/// Result of `Backend::probeSentinelRaw`. `body` carries the materialized bytes only when the outcome is
+/// `Present`.
 struct SentinelProbeResult
 {
     ProbeOutcome outcome;
@@ -277,31 +275,6 @@ public:
     ///          the persisted folded token, saving a GET per unchanged shard.
     virtual bool supportsListTokens() const = 0;
 
-    /// Capability gate for the ONE mechanism allowed to conclude a pool's data is *gone*: the natural
-    /// `Vanished(erased)` proof (spec §2 [C3], docs/superpowers/specs/
-    /// 2026-07-22-cas-disk-lease-loss-throw-and-stop-verbs-design.md). A false positive here silently
-    /// converts a healthy disk into truth-empty answers — the single worst outcome of the whole design —
-    /// so this is FAIL-CLOSED by default: only a backend whose full-prefix LIST is *documented*
-    /// strongly-consistent may ever return TRUE.
-    ///
-    /// Capability matrix (see the concrete overrides):
-    ///   - AWS S3      — strong read-after-write AND strongly-consistent LIST in every region since
-    ///                   December 2020 (AWS: "Amazon S3 delivers strong read-after-write consistency ...
-    ///                   for ... list operations"). Qualifies (documented).
-    ///   - GCS         — strong global consistency, including list-after-write. Qualifies (documented).
-    ///   - RustFS      — FALSE, pending explicit LIST-consistency evidence or an integration contract-test.
-    ///   - Any unqualified S3 gateway — FALSE: a gateway may mask a denied GET as a 404 and cannot be
-    ///                   assumed to enumerate consistently (spec §2 IAM table: "excluded by contract").
-    ///   - Local / Emulated — FALSE: `LocalObjectStorage` listing is best-effort and an unmounted
-    ///                   NFS/removable mount makes intact data look erased; the Emulated backend scans
-    ///                   before locking. Their terminal natural state is `IdentityLost`; `FORGET`/restart
-    ///                   is the only path to benign truth (exactly the stateless-test teardown story).
-    ///
-    /// Default FALSE. Overridden TRUE only where the above holds. Without the capability the lifecycle
-    /// observer NEVER concludes erased — `IdentityLost` stays the terminal natural state, which is correct
-    /// behavior, not a gap.
-    virtual bool supportsErasureProof() const { return false; }
-
     /// Pool-level preconditions beyond per-op conditional semantics — checked by the capability
     /// probe BEFORE the op battery. Default: nothing to check. The S3 backend fails closed here
     /// when a generation-dialect (GCS) bucket has object versioning enabled: every token-exact
@@ -335,24 +308,6 @@ public:
             if (!g)
                 return {ProbeOutcome::KeyAbsent, std::nullopt};
             return {ProbeOutcome::Present, std::move(g->bytes)};
-        }
-        catch (...)
-        {
-            return {ProbeOutcome::Indeterminate, std::nullopt};
-        }
-    }
-
-    /// Authoritative container proof: does at least one object exist under `prefix`? DEFAULT
-    /// (`list`-based): `Present` when `list` returns at least one key, `KeyAbsent` when it succeeds
-    /// with zero keys, `Indeterminate` on any exception — the same fail-closed posture as
-    /// `probeSentinelRaw`. A backend with real container/permission evidence overrides this the same
-    /// way.
-    virtual SentinelProbeResult probePrefixEmptinessRaw(const String & prefix)
-    {
-        try
-        {
-            const ListPage page = list(prefix, "", 1);
-            return {page.keys.empty() ? ProbeOutcome::KeyAbsent : ProbeOutcome::Present, std::nullopt};
         }
         catch (...)
         {

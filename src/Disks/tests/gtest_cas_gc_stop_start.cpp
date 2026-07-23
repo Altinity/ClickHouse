@@ -142,9 +142,9 @@ constexpr std::chrono::milliseconds kSelfExitWait{15000};
 
 }
 
-/// (C1) A NATURAL terminal transition (`VanishedErased`/`VanishedReplaced`, or here `VanishedForgotten`
-/// forced via the test seam) is never accompanied by a `stop()` on this scheduler — only `~Pool`/FORGET
-/// join it. The scheduler's OWN loops must observe the terminal lifecycle at their next tick and self-exit,
+/// (C1) A NATURAL terminal transition (`VanishedReplaced`, or here `VanishedForgotten` forced via the test
+/// seam) is never accompanied by a `stop()` on this scheduler — only `~Pool`/FORGET join it. The scheduler's
+/// OWN loops must observe the terminal lifecycle at their next tick and self-exit,
 /// so the pacing loop stops spamming Failed rounds (the G2 zombie) and the steal-capable loop can never
 /// fold/condemn a foreign pool's prefix. Drive it while RUNNING, then vanish it, then prove BOTH loops
 /// self-exit (bounded cv wait, no sleep) and that no further round-log rows appear.
@@ -162,8 +162,8 @@ TEST(CasGcStopStart, SchedulerSelfExitsOnNaturalVanished)
     ASSERT_TRUE(sink.waitForSuccessFinish(/*from=*/0, kRoundWait).has_value())
         << "the scheduler must be pacing rounds before we drive it terminal";
 
-    /// A natural terminal transition (forced here via the seam; in production `VanishedErased`/`Replaced`
-    /// arrive identically, WITHOUT anyone calling stop() on this scheduler).
+    /// A natural terminal transition (forced here via the seam; in production `VanishedReplaced` and
+    /// `IdentityLost` arrive identically, WITHOUT anyone calling stop() on this scheduler).
     store->setLifecycleForTest(PoolLifecycle::VanishedForgotten);
 
     ASSERT_TRUE(sched.waitForTerminalSelfExitForTest(kSelfExitWait))
@@ -177,11 +177,11 @@ TEST(CasGcStopStart, SchedulerSelfExitsOnNaturalVanished)
     EXPECT_FALSE(sched.gcHealth().is_leader);
 }
 
-/// (C1 negative control) `IdentityLost` is NON-absorbing (spec [C1]) and publishes NO terminal-intent
-/// latch: the scheduler must KEEP ticking there (its GC writes are contained by `poolPrefix` LIST reset +
-/// the has-observation guard, and the observer must keep probing for the prefix to drain). Prove it does
-/// NOT self-exit and that fresh rounds keep landing.
-TEST(CasGcStopStart, SchedulerKeepsTickingOnIdentityLost)
+/// (C1, rev.8 §9 item 8) `IdentityLost` is now a fail-loud TERMINAL state, so the scheduler must self-exit
+/// there exactly as it does on `Vanished` — a scheduler ticking against a half-erased pool is a pure zombie
+/// (eternal `CORRUPTED_DATA` retries against the vanished `gc/state`). Prove BOTH loops self-exit and that no
+/// further round-log rows appear, and that leadership is cleared.
+TEST(CasGcStopStart, SchedulerSelfExitsOnIdentityLost)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -194,15 +194,13 @@ TEST(CasGcStopStart, SchedulerKeepsTickingOnIdentityLost)
 
     store->setLifecycleForTest(PoolLifecycle::IdentityLost);
 
-    /// It must NOT self-exit within a window spanning multiple pacing intervals...
-    EXPECT_FALSE(sched.waitForTerminalSelfExitForTest(std::chrono::milliseconds(2500)))
-        << "IdentityLost must NOT make the scheduler self-exit (non-absorbing, no terminal intent)";
-    /// ...and it must keep running rounds: a fresh Success round lands after the IdentityLost flip.
-    const size_t from = sink.mark();
-    EXPECT_TRUE(sink.waitForSuccessFinish(from, kRoundWait).has_value())
-        << "the scheduler must keep pacing rounds while IdentityLost";
+    ASSERT_TRUE(sched.waitForTerminalSelfExitForTest(kSelfExitWait))
+        << "IdentityLost is terminal (rev.8): both the pacing and heartbeat loops must self-exit";
 
+    const size_t count_at_exit = sink.mark();
     sched.stop();
+    EXPECT_EQ(sink.mark(), count_at_exit) << "a self-exited pacing loop must emit no further round records";
+    EXPECT_FALSE(sched.gcHealth().is_leader) << "a self-exited scheduler must report it no longer leads";
 }
 
 /// (C1 cleanup hygiene) After BOTH loops self-exit on a terminal transition, `stop()` must cleanly reap
@@ -219,7 +217,7 @@ TEST(CasGcStopStart, StopAndDestroyCleanAfterSelfExit)
         sched.start();
         ASSERT_TRUE(sink.waitForSuccessFinish(/*from=*/0, kRoundWait).has_value());
 
-        store->setLifecycleForTest(PoolLifecycle::VanishedErased);
+        store->setLifecycleForTest(PoolLifecycle::VanishedReplaced);
         ASSERT_TRUE(sched.waitForTerminalSelfExitForTest(kSelfExitWait));
 
         EXPECT_NO_THROW(sched.stop()) << "stop() must cleanly join the self-exited threads";

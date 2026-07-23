@@ -266,8 +266,7 @@ void CasMountRuntime::setUncleanEpochBoundarySeenAt(uint64_t v)
 bool CasMountRuntime::isVanished() const
 {
     const PoolLifecycle s = lifecycle();
-    return s == PoolLifecycle::VanishedErased
-        || s == PoolLifecycle::VanishedReplaced
+    return s == PoolLifecycle::VanishedReplaced
         || s == PoolLifecycle::VanishedForgotten;
 }
 
@@ -282,8 +281,7 @@ void CasMountRuntime::setLifecycleForTest(PoolLifecycle lc)
     /// from a real transition for the introspection snapshot.
     lifecycle_since_wall_s.store(lc == PoolLifecycle::Live ? 0 : wallClockNowSeconds(), std::memory_order_release);
     pool_lifecycle.store(lc, std::memory_order_release);
-    if (lc == PoolLifecycle::VanishedErased
-        || lc == PoolLifecycle::VanishedReplaced
+    if (lc == PoolLifecycle::VanishedReplaced
         || lc == PoolLifecycle::VanishedForgotten)
     {
         vanished_intent.store(true, std::memory_order_release);
@@ -302,11 +300,6 @@ void CasMountRuntime::noteLeaseLost()
     if (pool_lifecycle.compare_exchange_strong(
             expected, PoolLifecycle::TransientNotLive, std::memory_order_acq_rel, std::memory_order_acquire))
     {
-        /// Record the lease-loss instant ONCE, exactly at the winning transition (rev.7 [D1]): the
-        /// erasure-proof grace gate measures elapsed-since-fence-trip from here. A later `noteLeaseLost`
-        /// (observer tick or a stale keeper trip) finds the state already non-`Live`, so its
-        /// compare-exchange fails and this timestamp is never advanced — it stays the true first loss.
-        fence_trip_boot_ms.store(bootMsNow(), std::memory_order_release);
         /// The `since` the lifecycle snapshot reports for `not_live` — the wall-clock instant this became
         /// non-`Live`. Only the winning transition writes it (the guard above), so it is not re-stamped.
         lifecycle_since_wall_s.store(wallClockNowSeconds(), std::memory_order_release);
@@ -331,9 +324,11 @@ void CasMountRuntime::enterIdentityLost()
     /// `TransientNotLive -> IdentityLost`, one way. The compare-exchange FROM `TransientNotLive` gives
     /// the brief's "from TransientNotLive only" precondition, idempotency (a second call finds the state
     /// already `IdentityLost` and its exchange fails), and safety against a concurrent keeper
-    /// `noteLeaseLost` (which only ever moves `Live -> TransientNotLive`, never away from it). Crucially,
-    /// this does NOT set `vanished_intent`: `IdentityLost` is non-absorbing ([C1]) — the lifecycle
-    /// observer must keep running so a progressive erase can still complete into `VanishedErased`.
+    /// `noteLeaseLost` (which only ever moves `Live -> TransientNotLive`, never away from it). It does NOT
+    /// set `vanished_intent` (that latch is reserved for the `Vanished*` idempotency/FORGET protocol);
+    /// rev.8 makes `IdentityLost` a fail-loud TERMINAL state through `remountTerminal()`, which folds it
+    /// into the observer-exit boundary alongside `vanished_intent`, so the remount/GC observer threads
+    /// self-exit rather than demote.
     /// `since` for the `identity_lost` snapshot row — the wall-clock instant the observer proved the
     /// sentinels gone. Stamped (release) BEFORE the CAS that publishes `IdentityLost`, so a reader that
     /// acquire-observes `IdentityLost` is guaranteed to observe this timestamp too (the winning CAS's
@@ -366,7 +361,6 @@ void CasMountRuntime::enterVanished(PoolLifecycle which, const String & reason)
     const char * label = nullptr;
     switch (which)
     {
-        case PoolLifecycle::VanishedErased:    label = "erased"; break;
         case PoolLifecycle::VanishedReplaced:  label = "replaced"; break;
         case PoolLifecycle::VanishedForgotten: label = "forgotten"; break;
         case PoolLifecycle::Live:
@@ -425,18 +419,15 @@ void CasMountRuntime::scheduleRemount()
     schedule_remount_calls_for_test.fetch_add(1, std::memory_order_relaxed);
     if (!config.background_watermark)
         return;
-    /// A fully-terminal `Vanished` pool never claims/allocates/writes again (spec §3): the keeper
-    /// callback must not arm a recovery thread. It reads the terminal-intent latch (`vanished_intent`,
-    /// published by `publishVanishedIntent` — at spec §5 step 1 for FORGET, or as `enterVanished`'s first
-    /// step for a natural transition) alongside the settled state `isVanished()`, so the earliest possible
-    /// terminal signal is honored. `IdentityLost` is NOT terminal here — it sets no latch, so its
-    /// non-mutating observer keeps running through this same recovery loop.
-    if (remount_shutting_down.load() || remount_running.load()
-        || vanished_intent.load(std::memory_order_acquire) || isVanished())
+    /// A terminal pool never claims/allocates/writes again (spec §3): the keeper callback must not arm a
+    /// recovery thread. `remountTerminal()` covers a published terminal `Vanished` intent (`vanished_intent`,
+    /// set by `publishVanishedIntent` at spec §5 step 1 for FORGET, or as `enterVanished`'s first step for a
+    /// natural transition, and subsuming every settled `Vanished*` state) AND `IdentityLost` (rev.8: now a
+    /// fail-loud terminal state — no demoted observer).
+    if (remount_shutting_down.load() || remount_running.load() || remountTerminal())
         return;
     std::lock_guard g(remount_thread_mutex);
-    if (remount_shutting_down.load() || remount_running.load()
-        || vanished_intent.load(std::memory_order_acquire) || isVanished())
+    if (remount_shutting_down.load() || remount_running.load() || remountTerminal())
         return;
     if (remount_thread.joinable())
         remount_thread.join();   /// Reap a previous recovery before starting a new one.
@@ -445,15 +436,12 @@ void CasMountRuntime::scheduleRemount()
     {
         setThreadName(ThreadName::CAS_REMOUNT);
         uint64_t backoff_ms = 1000;
-        /// Exit at any step boundary once a fully-terminal transition is intended (spec §3). It checks the
-        /// terminal-intent latch (`vanished_intent`, published by `publishVanishedIntent` — by FORGET at
-        /// step 1, before it joins this thread, or as `enterVanished`'s first step for a natural
-        /// transition) alongside the settled state `isVanished()`, so the loop bails at the earliest
-        /// terminal signal rather than only after the state store lands. An
-        /// `IdentityLost` pool sets no latch and is NOT vanished, so this loop keeps running as its
-        /// low-rate observer: `remount_attempt` (the identity gate) returns false without claiming while
-        /// it stays demoted, and promotes one-way to `VanishedErased` (Task 6), which then trips this exit.
-        while (!remount_stop.load() && !vanished_intent.load(std::memory_order_acquire) && !isVanished())
+        /// Exit at any step boundary once the pool is (being driven) terminal (spec §3). `remountTerminal()`
+        /// bails on a published terminal `Vanished` intent (`vanished_intent` — by FORGET at step 1, before
+        /// it joins this thread, or as `enterVanished`'s first step for a natural transition, and subsuming
+        /// every settled `Vanished*` state) AND on `IdentityLost` (rev.8: a fail-loud terminal state whose
+        /// identity gate just set it — the thread self-exits at the next boundary, ending the observer).
+        while (!remount_stop.load() && !remountTerminal())
         {
             if (remount_attempt())
                 break;

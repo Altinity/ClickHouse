@@ -31,12 +31,10 @@ void CasPlainObjects::casPutObject(const String & full_key, const String & bytes
     /// stale, pre-conflict payload (a lost update). Implement a real `casAppendObject` (re-reading the
     /// base content, not just the token, inside the loop) before adding any concurrent appender.
     ///
-    /// rev.7 [C2]: this is a durable-effect operation for its whole retry loop -- one `DurableRequestGuard`
-    /// spans admission through return/throw, and the fence generation captured at admission is re-checked
-    /// immediately before EVERY durable PUT below, not just the first attempt. A mismatch (the mount lease
-    /// was lost, or re-armed under a fresh incarnation, since admission) aborts with the typed transient
-    /// error before the backend is ever touched.
-    auto durable_guard = begin_durable_request_fn();
+    /// rev.7 [C2]: the fence generation captured at admission is re-checked immediately before EVERY
+    /// durable PUT below, not just the first attempt. A mismatch (the mount lease was lost, or re-armed
+    /// under a fresh incarnation, since admission) aborts with the typed transient error before the backend
+    /// is ever touched.
     const uint64_t admitted_generation = fence_generation_fn();
 
     for (size_t attempt = 0; attempt < MAX_CAS_ATTEMPTS; ++attempt)
@@ -72,9 +70,8 @@ void CasPlainObjects::casRemoveObject(const String & full_key)
     /// replacement untouched and is retried against a fresh observation; absence is a successful
     /// no-op.
     ///
-    /// rev.7 [C2]/[D1]: same fence-generation admission as `casPutObject` -- one `DurableRequestGuard`
-    /// for the whole call, the admitted generation re-checked immediately before every durable delete.
-    auto durable_guard = begin_durable_request_fn();
+    /// rev.7 [C2]: same fence-generation admission as `casPutObject` -- the admitted generation is
+    /// re-checked immediately before every durable delete.
     const uint64_t admitted_generation = fence_generation_fn();
 
     for (size_t attempt = 0; attempt < MAX_CAS_ATTEMPTS; ++attempt)

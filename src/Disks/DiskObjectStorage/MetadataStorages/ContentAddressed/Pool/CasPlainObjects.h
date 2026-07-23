@@ -25,7 +25,7 @@ namespace DB::Cas
 /// `ABORTED` when it is reached.
 ///
 /// Every durable write/delete on this surface is fence-generation-gated (rev.7 [C2]): `Pool` injects
-/// three callbacks that reach its `mount_runtime` (declared AFTER this member, hence constructed
+/// two callbacks that reach its `mount_runtime` (declared AFTER this member, hence constructed
 /// after it -- these callbacks capture `Pool` itself and are invoked only at runtime, post-
 /// construction, exactly like `ref_ledger`'s callbacks in `CasPool.cpp`, so referencing a
 /// not-yet-constructed sibling member through them is safe).
@@ -35,12 +35,10 @@ public:
     CasPlainObjects(
         Backend & backend_, const Layout & layout_,
         std::function<uint64_t()> fence_generation_fn_,
-        std::function<void(uint64_t)> check_fence_or_throw_fn_,
-        std::function<CasMountRuntime::DurableRequestGuard()> begin_durable_request_fn_)
+        std::function<void(uint64_t)> check_fence_or_throw_fn_)
         : backend(backend_), layout(layout_)
         , fence_generation_fn(std::move(fence_generation_fn_))
         , check_fence_or_throw_fn(std::move(check_fence_or_throw_fn_))
-        , begin_durable_request_fn(std::move(begin_durable_request_fn_))
     {
     }
 
@@ -83,9 +81,8 @@ public:
 private:
     /// Creates or conditionally replaces one raw object. The method re-heads after a conditional
     /// conflict and throws `ABORTED` after the bounded retry loop cannot establish a stable token.
-    /// Fence-generation-gated (rev.7 [C2]): admits one `DurableRequestGuard` and captures the fence
-    /// generation for the call's whole retry loop; every iteration re-checks it immediately before its
-    /// durable PUT.
+    /// Fence-generation-gated (rev.7 [C2]): captures the fence generation at admission for the call's
+    /// whole retry loop; every iteration re-checks it immediately before its durable PUT.
     void casPutObject(const String & full_key, const String & bytes);
 
     /// Reads one raw object by its complete backend key and returns `nullopt` when it is absent. A read,
@@ -103,7 +100,6 @@ private:
     /// ---- fence-generation admission (injected by `Pool`; see the class doc comment) ----
     std::function<uint64_t()> fence_generation_fn;
     std::function<void(uint64_t)> check_fence_or_throw_fn;
-    std::function<CasMountRuntime::DurableRequestGuard()> begin_durable_request_fn;
 };
 
 }

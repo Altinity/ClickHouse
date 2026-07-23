@@ -160,7 +160,7 @@ TEST(CasEmptyProof, VanishedPoolAnswersTruthEmptyWithoutProbe)
     auto storage = openStorage();
     commitOnePart(*storage);
     auto pool = storage->store();   /// captured while Live
-    pool->setLifecycleForTest(PoolLifecycle::VanishedErased);
+    pool->setLifecycleForTest(PoolLifecycle::VanishedForgotten);
 
     storage->resetEmptyProofProbeCountForTest();
     EXPECT_TRUE(storage->listDirectory(kTableDir).empty());

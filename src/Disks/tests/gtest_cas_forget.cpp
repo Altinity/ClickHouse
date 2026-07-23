@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPoolMetaFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasServerRootFormats.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcScheduler.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
@@ -361,6 +362,49 @@ TEST(CasForget, ForgetReLatchesFenceAfterAReclaimReachesArmMountFence)
     EXPECT_EQ(store->lifecycle(), PoolLifecycle::VanishedForgotten);
     EXPECT_FALSE(store->mayMutate())
         << "FORGET's post-join fence re-latch (trip#2) must override the fence the reclaim re-armed";
+}
+
+/// (b3) PROMOTION-GUARD REGRESSION (spec §9 rev.8 item 7): with the erasure-proof excised, the natural
+/// `Vanished(replaced)` verdict is the ONLY remaining mid-FORGET natural-terminal race. A `tryRemountOnce`
+/// in flight during FORGET — one that passed step 0's `isVanished()` gate before FORGET published its intent
+/// — must NOT settle `Vanished(replaced)` and mislabel the operator-visible reason; FORGET's
+/// `Vanished(forgotten)` must win. We drive a REAL `tryRemountOnce` from FORGET's own GC-stop step (spec §5
+/// step 3/4, strictly AFTER the step-1 intent publish, BEFORE the step-6 settle), against a FOREIGN
+/// `_pool_meta` (the `Replaced` verdict), and assert the guard bailed.
+TEST(CasForget, ForgetIntentBlocksNaturalReplacedPromotion)
+{
+    auto backend = std::make_shared<DB::Cas::InMemoryBackend>();
+    auto store = DB::Cas::tests::openPoolForTest(backend);
+
+    /// Make the identity gate verdict `Replaced`: overwrite `_pool_meta` with a FOREIGN pool_id (present,
+    /// mismatched identity) — exactly gtest_cas_lifecycle_condition.cpp scenario (b).
+    const String meta_key = store->layout().poolMetaKey();
+    const auto got = backend->get(meta_key);
+    ASSERT_TRUE(got.has_value());
+    DB::Cas::PoolMeta foreign = DB::Cas::decodePoolMeta(got->bytes);
+    foreign.pool_id = foreign.pool_id + DB::UInt128(1);
+    ASSERT_EQ(backend->putOverwrite(meta_key, DB::Cas::encodePoolMeta(foreign), got->token).outcome,
+              DB::Cas::PutOutcome::Done);
+
+    /// The in-flight gate (run from the GC-stop callback) reaches the `Replaced` verdict but must BAIL on the
+    /// already-published intent rather than settle `Vanished(replaced)`.
+    bool replaced_settled_midforget = false;
+    store->forgetDisk(
+        [&]
+        {
+            store->tryRemountOnce();
+            replaced_settled_midforget = (store->lifecycle() == PoolLifecycle::VanishedReplaced);
+        },
+        kForgetReason);
+
+    EXPECT_FALSE(replaced_settled_midforget)
+        << "a mid-FORGET Replaced verdict must NOT settle — the intent guard bails before enterVanished(Replaced)";
+    EXPECT_EQ(store->lifecycle(), PoolLifecycle::VanishedForgotten)
+        << "FORGET's Vanished(forgotten) must win (first terminal STATE transition)";
+    const std::string msg = messageOf([&] { store->throwIfLifecycleTerminal(); });
+    EXPECT_NE(msg.find("erasure was NOT verified"), std::string::npos) << msg;
+    EXPECT_EQ(msg.find("foreign pool"), std::string::npos)
+        << "the reason must NOT be the mislabeled Replaced text: " << msg;
 }
 
 /// (e) End-to-end through the verb entry `ContentAddressedMetadataStorage::forgetDisk` and the six-class

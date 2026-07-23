@@ -17,18 +17,17 @@ namespace DB::ErrorCodes
     extern const int INVALID_STATE;
 }
 
-/// Task 4 (spec §1 "Gate lifetime [C2]", §2 [D1]): every durable-effect path on the plain-object
-/// surface (`CasPlainObjects::casPutObject`/`casRemoveObject`) and the S3-native staging-buffer
-/// finalize (`Cas::CaContentWriteBuffer`) captures the mount runtime's fence generation at admission
-/// and re-checks it -- and `mayMutate()` -- immediately before its durable backend call, throwing the
-/// typed transient error (`INVALID_STATE`, 668) on a mismatch instead of letting a stale-incarnation
-/// write land. `CasMountRuntime::DurableRequestGuard` is the paired outstanding-durable-request
-/// counter Task 6's erasure-proof gate polls for full durable-lane quiescence.
+/// Task 4 (spec §1 "Gate lifetime [C2]"): every durable-effect path on the plain-object surface
+/// (`CasPlainObjects::casPutObject`/`casRemoveObject`), the S3-native staging-buffer finalize
+/// (`Cas::CaContentWriteBuffer`), and the part-write condemned-displacement raw writes capture the mount
+/// runtime's fence generation at admission and re-check it -- and `mayMutate()` -- immediately before their
+/// durable backend call, throwing the typed transient error (`INVALID_STATE`, 668) on a mismatch instead
+/// of letting a stale-incarnation write land.
 ///
 /// These tests drive a real `Cas::Pool` over `InMemoryBackend` (the "Emulated"-style in-memory
 /// backend) via `Pool::open`, exactly like `gtest_cas_mount.cpp`/`gtest_cas_s3_staging.cpp` -- the
 /// fence is tripped/observed through `Pool`'s public forwarders (`tripMountLost`, `mayMutate`,
-/// `fenceGeneration`, `beginDurableRequest`, `checkFenceOrThrow`, `outstandingDurableRequestsForTest`).
+/// `fenceGeneration`, `checkFenceOrThrow`).
 
 using namespace DB::Cas;
 
@@ -128,36 +127,6 @@ PoolPtr openTestPool(BackendPtr backend)
 {
     return Pool::open(std::move(backend), PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 }
-
-/// Task 4b: a backend that lets a test observe `outstandingDurableRequestsForTest()` WHILE a durable
-/// call is actually executing, by firing a hook from inside the overridden call before delegating to
-/// the real implementation -- deterministic, no threads/sleeps needed. `putIfAbsent` is what
-/// `PartWriteTxn::stageManifest`'s `store->stagingPutIfAbsent` resolves to (via
-/// `CasRequestController::putIfAbsentControlled`'s `backend->putIfAbsent(key, bytes)`);
-/// `putIfAbsentStream` is what `uploadFromSource`'s fresh-upload path calls directly.
-class ObserveDuringCallBackend final : public InMemoryBackend
-{
-public:
-    using Backend::putIfAbsent;
-    using Backend::putIfAbsentStream;
-
-    PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta) override
-    {
-        if (on_put_if_absent)
-            on_put_if_absent();
-        return InMemoryBackend::putIfAbsent(key, bytes, meta);
-    }
-
-    WriteSinkPtr putIfAbsentStream(const String & key, const ObjectMeta & meta) override
-    {
-        if (on_put_if_absent_stream)
-            on_put_if_absent_stream();
-        return InMemoryBackend::putIfAbsentStream(key, meta);
-    }
-
-    std::function<void()> on_put_if_absent;
-    std::function<void()> on_put_if_absent_stream;
-};
 
 /// I2 (backlog {#c2-resurrect-putoverwrite-fence-check}): a backend that (1) trips an injected side-effect
 /// on the FIRST head() -- deterministically landing a fence trip BETWEEN `streamIfAbsent`'s conditional
@@ -293,7 +262,6 @@ TEST(CasFenceGeneration, S3StagingFinalizeAbortsWhenFenceTripsBeforeDurableCall)
     std::unique_ptr<DB::WriteBufferFromFileBase> sink(sink_ptr);
 
     bool on_finalized_called = false;
-    auto guard = store->beginDurableRequest();
     const uint64_t admitted_generation = store->fenceGeneration();
 
     auto buf = std::make_unique<CaContentWriteBuffer>(
@@ -305,7 +273,6 @@ TEST(CasFenceGeneration, S3StagingFinalizeAbortsWhenFenceTripsBeforeDurableCall)
         /*use_adaptive_buffer_size=*/false,
         /*adaptive_buffer_initial_size=*/0,
         [&](const std::string &, size_t, const std::string &) { on_finalized_called = true; },
-        std::move(guard),
         [store, admitted_generation] { store->checkFenceOrThrow(admitted_generation); });
 
     const std::string payload = "some bytes that must never become durable";
@@ -321,45 +288,6 @@ TEST(CasFenceGeneration, S3StagingFinalizeAbortsWhenFenceTripsBeforeDurableCall)
     EXPECT_FALSE(sink_ptr->wasFinalizedForTest());
 }
 
-/// (c) `DurableRequestGuard` counting: two guards alive -> `outstandingDurableRequestsForTest() == 2`;
-/// destruction (including nested, and via an exception-unwind path) decrements back to 0.
-TEST(CasFenceGeneration, DurableRequestGuardCountsOutstandingRequests)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openTestPool(backend);
-
-    EXPECT_EQ(store->outstandingDurableRequestsForTest(), 0u);
-    {
-        auto g1 = store->beginDurableRequest();
-        EXPECT_EQ(store->outstandingDurableRequestsForTest(), 1u);
-        {
-            auto g2 = store->beginDurableRequest();
-            EXPECT_EQ(store->outstandingDurableRequestsForTest(), 2u);
-        }
-        EXPECT_EQ(store->outstandingDurableRequestsForTest(), 1u);
-    }
-    EXPECT_EQ(store->outstandingDurableRequestsForTest(), 0u);
-}
-
-TEST(CasFenceGeneration, DurableRequestGuardDecrementsOnExceptionUnwind)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openTestPool(backend);
-
-    EXPECT_EQ(store->outstandingDurableRequestsForTest(), 0u);
-    try
-    {
-        auto guard = store->beginDurableRequest();
-        EXPECT_EQ(store->outstandingDurableRequestsForTest(), 1u);
-        throw std::runtime_error("injected unwind");
-    }
-    catch (const std::runtime_error &)
-    {
-        /// expected -- the guard's destructor must have already run during unwind.
-    }
-    EXPECT_EQ(store->outstandingDurableRequestsForTest(), 0u);
-}
-
 /// (d) Happy path unchanged: an ordinary plain-object write/read/remove, and an ordinary S3-staging
 /// finalize, both succeed exactly as before when the fence stays live throughout.
 TEST(CasFenceGeneration, HappyPathPlainObjectWriteReadRemoveUnaffected)
@@ -372,11 +300,9 @@ TEST(CasFenceGeneration, HappyPathPlainObjectWriteReadRemoveUnaffected)
     const auto got = store->getNamespaceFile(ns, "a");
     ASSERT_TRUE(got.has_value());
     EXPECT_EQ(*got, "hello");
-    EXPECT_EQ(store->outstandingDurableRequestsForTest(), 0u);
 
     store->removeNamespaceFile(ns, "a");
     EXPECT_FALSE(store->getNamespaceFile(ns, "a").has_value());
-    EXPECT_EQ(store->outstandingDurableRequestsForTest(), 0u);
 }
 
 TEST(CasFenceGeneration, HappyPathS3StagingFinalizeUnaffected)
@@ -389,87 +315,25 @@ TEST(CasFenceGeneration, HappyPathS3StagingFinalizeUnaffected)
     std::unique_ptr<DB::WriteBufferFromFileBase> sink(sink_ptr);
 
     bool on_finalized_called = false;
-    {
-        auto guard = store->beginDurableRequest();
-        const uint64_t admitted_generation = store->fenceGeneration();
+    const uint64_t admitted_generation = store->fenceGeneration();
 
-        auto buf = std::make_unique<CaContentWriteBuffer>(
-            std::move(sink),
-            staging_key,
-            /*envelope_header=*/std::string(),
-            BlobHashAlgo::CityHash128,
-            /*buf_size=*/8192,
-            /*use_adaptive_buffer_size=*/false,
-            /*adaptive_buffer_initial_size=*/0,
-            [&](const std::string &, size_t, const std::string &) { on_finalized_called = true; },
-            std::move(guard),
-            [store, admitted_generation] { store->checkFenceOrThrow(admitted_generation); });
+    auto buf = std::make_unique<CaContentWriteBuffer>(
+        std::move(sink),
+        staging_key,
+        /*envelope_header=*/std::string(),
+        BlobHashAlgo::CityHash128,
+        /*buf_size=*/8192,
+        /*use_adaptive_buffer_size=*/false,
+        /*adaptive_buffer_initial_size=*/0,
+        [&](const std::string &, size_t, const std::string &) { on_finalized_called = true; },
+        [store, admitted_generation] { store->checkFenceOrThrow(admitted_generation); });
 
-        const std::string payload = "unaffected happy path bytes";
-        buf->write(payload.data(), payload.size());
-        buf->finalize();
+    const std::string payload = "unaffected happy path bytes";
+    buf->write(payload.data(), payload.size());
+    buf->finalize();
 
-        EXPECT_TRUE(on_finalized_called);
-        EXPECT_TRUE(sink_ptr->wasFinalizedForTest());
-    }
-    EXPECT_EQ(store->outstandingDurableRequestsForTest(), 0u);
-}
-
-/// Task 4b (spec [D1], companion review): the part-write pipeline's durable lanes must ALSO count
-/// toward `outstandingDurableRequests()` -- picking the two most representative lanes (manifest
-/// staging and blob-body upload) rather than all six guarded call sites: both are on the hot,
-/// every-part-write path (unlike the rarer condemned-resurrect/overwrite branches, which reuse the
-/// exact same wrap-a-call-in-a-guard shape already proven correct above and in Task 4's
-/// `CasPlainObjects` tests), and together they exercise both guard shapes this task added -- a single
-/// guard around one call (`stageManifest`) and a per-retry-attempt guard inside a lambda
-/// (`uploadFromSource`'s `one_attempt`).
-
-/// `stageManifest`'s `store->stagingPutIfAbsent` resolves to `backend->putIfAbsent`: the hook observes
-/// the counter already at >= 1 while that call is executing, and back at 0 once `stageManifest` returns.
-TEST(CasFenceGeneration, OutstandingDurableRequestsReflectsInFlightManifestStaging)
-{
-    auto backend = std::make_shared<ObserveDuringCallBackend>();
-    auto store = openTestPool(backend);
-    const RootNamespace ns{"test/ns"};
-
-    PartWriteInfo info;
-    info.intended_ref = ns.string() + "/part_a";
-    auto build = store->beginPartWrite(info);
-
-    uint64_t observed_during_call = 0;
-    backend->on_put_if_absent = [&] { observed_during_call = store->outstandingDurableRequestsForTest(); };
-
-    ManifestEntry entry;
-    entry.path = "col.bin";
-    entry.placement = EntryPlacement::Blob;
-    entry.ref = DB::Cas::tests::idOf("payload");
-    entry.blob_size = 1;
-    build->stageManifest({entry});
-
-    EXPECT_GE(observed_during_call, 1u);
-    EXPECT_EQ(store->outstandingDurableRequestsForTest(), 0u);
-}
-
-/// `PartWriteTxn::putBlob`'s fresh-upload path (`uploadFromSource` -> `streamIfAbsent` -> `one_attempt`)
-/// calls `backend->putIfAbsentStream` directly: same shape, for the blob-body lane.
-TEST(CasFenceGeneration, OutstandingDurableRequestsReflectsInFlightBlobBodyUpload)
-{
-    auto backend = std::make_shared<ObserveDuringCallBackend>();
-    auto store = openTestPool(backend);
-    const RootNamespace ns{"test/ns"};
-
-    PartWriteInfo info;
-    info.intended_ref = ns.string() + "/part_b";
-    auto build = store->beginPartWrite(info);
-
-    uint64_t observed_during_call = 0;
-    backend->on_put_if_absent_stream = [&] { observed_during_call = store->outstandingDurableRequestsForTest(); };
-
-    const std::string payload = "hello blob body";
-    build->putBlob(DB::Cas::tests::idOf(payload), BlobSource::fromString(payload));
-
-    EXPECT_GE(observed_during_call, 1u);
-    EXPECT_EQ(store->outstandingDurableRequestsForTest(), 0u);
+    EXPECT_TRUE(on_finalized_called);
+    EXPECT_TRUE(sink_ptr->wasFinalizedForTest());
 }
 
 /// (I2, backlog {#c2-resurrect-putoverwrite-fence-check}) The condemned-displacement `putOverwrite` branch

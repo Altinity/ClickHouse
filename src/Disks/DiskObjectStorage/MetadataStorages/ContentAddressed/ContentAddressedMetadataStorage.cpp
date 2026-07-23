@@ -85,7 +85,6 @@ const char * casLifecycleToString(Cas::PoolLifecycle lc)
         case Cas::PoolLifecycle::Live:              return "live";
         case Cas::PoolLifecycle::TransientNotLive:  return "not_live";
         case Cas::PoolLifecycle::IdentityLost:      return "identity_lost";
-        case Cas::PoolLifecycle::VanishedErased:
         case Cas::PoolLifecycle::VanishedReplaced:
         case Cas::PoolLifecycle::VanishedForgotten: return "vanished";
     }
@@ -103,7 +102,6 @@ const char * casLifecycleReasonWord(Cas::PoolLifecycle lc)
         case Cas::PoolLifecycle::Live:
         case Cas::PoolLifecycle::TransientNotLive:
         case Cas::PoolLifecycle::IdentityLost:      return "";
-        case Cas::PoolLifecycle::VanishedErased:    return "erased";
         case Cas::PoolLifecycle::VanishedReplaced:  return "replaced";
         case Cas::PoolLifecycle::VanishedForgotten: return "forgotten";
     }
@@ -689,13 +687,6 @@ ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openP
     pool_config.gc_meta_pool_size = gc_meta_pool_size;
     pool_config.materialization_grace_ms = materialization_grace_ms;
     pool_config.event_sink = makeCasEventSink();
-    /// T6 tripwire: wire the real GC-quiescence predicate for the `Vanished(erased)` erasure proof ([D1])
-    /// on the LIVE mount only. The predicate captures `this` and reads `gc_scheduler` lazily (the scheduler
-    /// is created AFTER the pool in `startup()`), returning quiescent when no round is in flight. An
-    /// observe-only (FSCK) view runs no erasure-proof observer and owns no scheduler, so it keeps the
-    /// default (empty => quiescent) rather than pointing at the LIVE disk's scheduler.
-    if (!observe_only)
-        pool_config.gc_quiescent_fn = [this] { return gcQuiescentForErasureProof(); };
 
     PoolView view;
     view.physical_key_prefix = physical_key_prefix_local;
@@ -949,8 +940,8 @@ void ContentAddressedMetadataStorage::forgetDisk()
         std::lock_guard lock(pointer_mutex);
         pool = cas_store;
         /// Detach the scheduler from the member under `pointer_mutex` (as shutdown/unmount do): no new
-        /// synchronous round can adopt it, and `gcHealth`/`gcQuiescentForErasureProof` report "no GC" for a
-        /// forgotten disk immediately. The actual stop()+join runs below, inside the pool's protocol
+        /// synchronous round can adopt it, and `gcHealth` reports "no GC" for a forgotten disk immediately.
+        /// The actual stop()+join runs below, inside the pool's protocol
         /// (OUTSIDE `pointer_mutex`, since it joins threads).
         scheduler = std::move(gc_scheduler);
     }
@@ -983,8 +974,8 @@ void ContentAddressedMetadataStorage::gcStop()
     /// SYSTEM CONTENT ADDRESSED GC STOP (spec §6): stop ONLY the background GC scheduler. STOP-IN-PLACE --
     /// the scheduler object is RETAINED in the member (contrast `forgetDisk`/`shutdown`/`unmountSynchronously`,
     /// which `std::move` it out and destroy it): a later `gcStart` must re-enter the SAME instance so its
-    /// `gc_id` + lease observation history survive. Keeping it in the member also keeps `gcHealth` and
-    /// `gcQuiescentForErasureProof` reading the (stopped => quiescent) state truthfully, rather than "no GC".
+    /// `gc_id` + lease observation history survive. Keeping it in the member also keeps `gcHealth` reading
+    /// the (stopped) state truthfully, rather than "no GC".
     /// A lifecycle-control verb: serialized against unmount/mount/fsck/forget by `lifecycle_mutex`, and
     /// against a concurrent synchronous GC round by `gc_scheduler_mutex` (a round holds the latter, so this
     /// waits it out). It does NOT consult `checkOpAdmitted` -- stopping GC works on ANY disk state, including
@@ -1196,28 +1187,13 @@ CasOpAdmission ContentAddressedMetadataStorage::checkOpAdmitted(CasOpClass op) c
     /// it; `IdentityLost` (a live erase in flight, no auto-recovery) has NO benign answer -- every class
     /// fails loud with the "recover by restart or FORGET; a matching-sentinel restore does not auto-revive"
     /// diagnosis. So the truth-absent short-circuit is gated on the Vanished states specifically.
-    const bool settled_vanished = lc == Cas::PoolLifecycle::VanishedErased
-        || lc == Cas::PoolLifecycle::VanishedReplaced
+    const bool settled_vanished = lc == Cas::PoolLifecycle::VanishedReplaced
         || lc == Cas::PoolLifecycle::VanishedForgotten;
     if (settled_vanished && (op == CasOpClass::Probe || op == CasOpClass::Remove))
         return CasOpAdmission::TruthAbsent;
     pool->throwIfLifecycleTerminal();
     throw Exception(ErrorCodes::LOGICAL_ERROR,
         "checkOpAdmitted: unreachable -- non-Live pool did not throw for content-addressed disk '{}'", disk_name);
-}
-
-bool ContentAddressedMetadataStorage::gcQuiescentForErasureProof() const
-{
-    /// The `PoolConfig::gc_quiescent_fn` the live mount injects. A null scheduler (GC disabled / read-only /
-    /// observe-only) is quiescent by definition; otherwise defer to the scheduler's own "no round in
-    /// flight" observer. Called ONLY from the pool's remount-thread observer (see the header note on why
-    /// reading `gc_scheduler` here is lifetime-safe).
-    std::shared_ptr<Cas::CasGcScheduler> snapshot;
-    {
-        std::lock_guard lock(pointer_mutex);
-        snapshot = gc_scheduler;
-    }
-    return !snapshot || snapshot->isQuiescent();
 }
 
 void ContentAddressedMetadataStorage::confirmPoolIdentityForEmptyEnumeration(const std::string & path) const

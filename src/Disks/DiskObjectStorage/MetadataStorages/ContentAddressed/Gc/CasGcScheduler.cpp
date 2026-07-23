@@ -112,9 +112,9 @@ Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & round_gc, GcRoundLogRe
 {
     using Rec = GcRoundLogRecord;
 
-    /// Mark a round in flight for the whole body (success AND exception paths) so the `Vanished(erased)`
-    /// erasure proof's `gc_quiescent_fn` never samples an empty prefix while a round could still land a
-    /// durable `gc/state`/heartbeat write. See `isQuiescent`.
+    /// Mark a round in flight for the whole body (success AND exception paths). `isQuiescent` reads this;
+    /// the FORGET / `GC STOP` tests use it to prove the scheduler's workers were joined (no round can be
+    /// mid-flight once `stop()` returned). See `isQuiescent`.
     round_in_flight.store(true, std::memory_order_release);
     SCOPE_EXIT({ round_in_flight.store(false, std::memory_order_release); });
 
@@ -227,22 +227,24 @@ void CasGcScheduler::loop()
             if (wake.wait_for(lock, interval, [this] { return stopping; }))
                 return;
         }
-        /// rev.7 §3 [C1]: self-exit the pacing loop the moment the pool reaches — or is being driven
-        /// toward — a terminal `Vanished` state. A NATURAL terminal transition (`VanishedErased` after a
-        /// live erase, `VanishedReplaced` after a foreign pool took the prefix) never calls `stop()` on this
-        /// scheduler: only `~Pool`/FORGET join it. Without this check the loop would tick FOREVER —
-        /// `acquireOrRenewLease` throws `CORRUPTED_DATA` against the vanished `gc/state` every interval (the
-        /// G2 zombie: an error-log line + a Failed round row each tick), and worse, after `VanishedReplaced`
-        /// the `allow_steal=true` rounds could STEAL the FOREIGN pool's `gc/state` lease and
-        /// fold/condemn/delete its objects. We also exit on a published FORGET intent
-        /// (`vanishedIntentPublished`, still pre-terminal) — earliest-signal discipline matching the remount
-        /// loop's dual check — so a disk being decommissioned stops pacing immediately, before FORGET's own
-        /// `stop_and_join` reaches this thread. `IdentityLost` deliberately does NOT exit (it publishes no
-        /// intent): its writes are contained and the observer must keep probing for the prefix to drain. The
-        /// thread exits its OWN loop here — no join from this context (C6-safe); `stop()`/`~CasGcScheduler`
-        /// still join the finished thread cleanly.
-        if (store->isVanished() || store->vanishedIntentPublished())
+        /// rev.7 §3 [C1] + rev.8 §9 item 8: self-exit the pacing loop the moment the pool reaches — or is
+        /// being driven toward — ANY terminal state. A NATURAL terminal transition (`VanishedReplaced` after
+        /// a foreign pool took the prefix, or `IdentityLost` once the sentinels are gone) never calls
+        /// `stop()` on this scheduler: only `~Pool`/FORGET join it. Without this check the loop would tick
+        /// FOREVER — `acquireOrRenewLease` throws `CORRUPTED_DATA` against the vanished `gc/state` every
+        /// interval (the G2 zombie: an error-log line + a Failed round row each tick), and worse, after
+        /// `VanishedReplaced` the `allow_steal=true` rounds could STEAL the FOREIGN pool's `gc/state` lease
+        /// and fold/condemn/delete its objects. We also exit on a published FORGET intent
+        /// (`vanishedIntentPublished`, still pre-terminal) — earliest-signal discipline — and on `IdentityLost`
+        /// (rev.8: a fail-loud terminal state; the last G2-zombie case — eternal `CORRUPTED_DATA` retries
+        /// against a half-erased pool — closes with it). Clearing `i_am_leader` before returning keeps
+        /// `gcHealth` honest (a terminal, self-exited scheduler reports it no longer leads). The thread exits
+        /// its OWN loop here — no join from this context (C6-safe); `stop()`/`~CasGcScheduler` still join the
+        /// finished thread cleanly.
+        if (store->isVanished() || store->vanishedIntentPublished()
+            || store->lifecycle() == Cas::PoolLifecycle::IdentityLost)
         {
+            i_am_leader.store(false, std::memory_order_relaxed);
             {
                 std::lock_guard exit_lock(terminal_exit_mutex);
                 loop_exited_on_terminal_for_test.store(true, std::memory_order_release);
@@ -314,10 +316,11 @@ void CasGcScheduler::heartbeatLoop()
             if (wake.wait_for(lock, hb_interval, [this] { return stopping; }))
                 return;
         }
-        /// rev.7 §3 [C1]: self-exit on a terminal (or FORGET-intent) pool, same as `loop()`. A vanished
-        /// pool's advisory pulses would either target a deleted `gc/hb` key (`VanishedErased`) or a FOREIGN
-        /// pool's key (`VanishedReplaced`) — stop pulsing the moment the pool vanishes.
-        if (store->isVanished() || store->vanishedIntentPublished())
+        /// rev.7 §3 [C1] + rev.8 §9 item 8: self-exit on ANY terminal (or FORGET-intent) pool, same as
+        /// `loop()`. A terminal pool's advisory pulses would target a deleted `gc/hb` key (`IdentityLost`) or
+        /// a FOREIGN pool's key (`VanishedReplaced`) — stop pulsing the moment the pool goes terminal.
+        if (store->isVanished() || store->vanishedIntentPublished()
+            || store->lifecycle() == Cas::PoolLifecycle::IdentityLost)
         {
             {
                 std::lock_guard exit_lock(terminal_exit_mutex);

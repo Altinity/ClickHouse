@@ -97,10 +97,12 @@ public:
 
 }
 
-/// (a) `_pool_meta` + the owner anchor deleted, other objects remain → the gate enters `IdentityLost`
-/// (never `Vanished`), store()-class access fails loud, and the remount loop demotes to a read-only
-/// observer that never claims/allocates/writes.
-TEST(CasLifecycleCondition, SentinelsDeletedDataRemainingEntersIdentityLostAndDemotes)
+/// (a) `_pool_meta` + the owner anchor authoritatively absent → the gate enters `IdentityLost` (never
+/// `Vanished`) and store()-class access fails loud. rev.8: `IdentityLost` is a fail-loud TERMINAL state —
+/// `isVanished()` still reads false (it is a distinct terminal), but a direct gate re-probe refuses without
+/// ever claiming/allocating/writing (the thread-exit behavior of the background observer is covered by
+/// `RemountThreadSelfExitsOnceIdentityLost` below).
+TEST(CasLifecycleCondition, SentinelsDeletedEntersIdentityLostTerminal)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = DB::Cas::tests::openPoolForTest(backend);
@@ -109,7 +111,7 @@ TEST(CasLifecycleCondition, SentinelsDeletedDataRemainingEntersIdentityLostAndDe
     const String meta_key = store->layout().poolMetaKey();
     const String owner_key = store->layout().ownerKey(kSrid);
 
-    /// Both sentinels gone; the mount/epoch objects remain, so the pool prefix is NOT empty.
+    /// Both sentinels gone (other objects may or may not remain — rev.8 does not distinguish).
     deleteKeyReturningBody(*backend, meta_key);
     deleteKeyReturningBody(*backend, owner_key);
 
@@ -117,18 +119,42 @@ TEST(CasLifecycleCondition, SentinelsDeletedDataRemainingEntersIdentityLostAndDe
     /// and enters `IdentityLost` at step 0 — WITHOUT reaching `claimOwnerOrThrow`.
     EXPECT_FALSE(store->tryRemountOnce());
     EXPECT_EQ(store->lifecycle(), PoolLifecycle::IdentityLost);
-    EXPECT_FALSE(store->isVanished()) << "IdentityLost is not a terminal Vanished state";
+    EXPECT_FALSE(store->isVanished()) << "IdentityLost is a distinct terminal, not a Vanished state";
 
     /// store()-class access now fails loud with the typed lifecycle error.
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&] { store->throwIfLifecycleTerminal(); });
 
-    /// Demoted observer: a further attempt performs ZERO writes (never claims/allocates/mounts) while
-    /// still authoritatively probing the sentinels.
+    /// A direct gate re-probe still refuses without mutating: it probes the sentinels authoritatively and
+    /// performs ZERO writes (never claims/allocates/mounts on a terminal pool).
     backend->resetCounts();
     EXPECT_FALSE(store->tryRemountOnce());
     EXPECT_EQ(store->lifecycle(), PoolLifecycle::IdentityLost);
-    EXPECT_EQ(backend->putTotal(), 0u) << "the demoted observer must never claim, allocate, or write";
-    EXPECT_GE(backend->headCount(meta_key), 1u) << "the demoted observer must still probe _pool_meta";
+    EXPECT_EQ(backend->putTotal(), 0u) << "a terminal-IdentityLost gate probe must never claim, allocate, or write";
+    EXPECT_GE(backend->headCount(meta_key), 1u) << "the gate still probes _pool_meta authoritatively";
+}
+
+/// (a2) rev.8 thread-exit: `IdentityLost` is terminal, so the background self-remount thread must self-exit
+/// — mirroring how a `Vanished` pool refuses to arm one. With `background_watermark = true`, `scheduleRemount`
+/// must REFUSE to arm a recovery thread once the pool is `IdentityLost` (`remountTerminal()` covers it),
+/// exactly as it refuses on a published `Vanished` intent.
+TEST(CasLifecycleCondition, RemountThreadSelfExitsOnceIdentityLost)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    /// `background_watermark = true` so `scheduleRemount` actually arms a recovery thread in production mode
+    /// (mirrors gtest_cas_pool.cpp's ShutdownGuardRefusesToArmRemount setup).
+    auto store = DB::Cas::Pool::open(backend,
+        DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test", .background_watermark = true});
+
+    /// Drive the pool terminal (IdentityLost) synchronously first — a direct gate call, no thread spawned.
+    deleteKeyReturningBody(*backend, store->layout().poolMetaKey());
+    deleteKeyReturningBody(*backend, store->layout().ownerKey(kSrid));
+    EXPECT_FALSE(store->tryRemountOnce());
+    ASSERT_EQ(store->lifecycle(), PoolLifecycle::IdentityLost);
+
+    /// The keeper's on-lost callback (or any `scheduleRemount`) must now refuse: no observer runs on a
+    /// terminal pool.
+    EXPECT_FALSE(store->scheduleRemountForTest())
+        << "an IdentityLost pool is terminal (rev.8) — scheduleRemount must not arm a recovery thread";
 }
 
 /// (b) `_pool_meta` present but its `pool_id` is foreign → `Vanished(replaced)` immediately.

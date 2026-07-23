@@ -84,24 +84,6 @@ public:
     /// shard — a cost, not a correctness change).
     bool supportsListTokens() const override { return native_token_type != TokenType::Generation; }
 
-    /// See `Backend::supportsErasureProof` for the capability matrix and why this is fail-closed. This
-    /// backend qualifies ONLY in Native mode (EmulatedSingleProcess/Local NEVER — its listing is
-    /// best-effort and it scans before locking) AND when the deployment has *asserted* a documented
-    /// strongly-consistent prefix LIST via `setStrongPrefixListCapable(true)`. That assertion is an
-    /// operator/deployment decision (AWS S3, GCS qualify; RustFS and unqualified gateways do NOT), NOT a
-    /// runtime endpoint sniff: an `ObjectStorageType::S3` store is indistinguishable at runtime between
-    /// AWS S3, GCS, RustFS, and a masking gateway, and a false TRUE here silently turns a healthy disk
-    /// truth-empty. Default FALSE (fail-closed): a deployment that has not positively asserted strong LIST
-    /// consistency never concludes natural erasure — `FORGET`/restart remains its path to benign truth.
-    bool supportsErasureProof() const override
-    {
-        return mode == Mode::Native && strong_prefix_list_capable;
-    }
-    /// Deployment-time assertion that this Native store's full-prefix LIST is documented
-    /// strongly-consistent (AWS S3 / GCS). Set by the mount wiring for such stores; left false for
-    /// RustFS / unqualified gateways / unknown stores. Never a runtime probe — see above.
-    void setStrongPrefixListCapable(bool v) { strong_prefix_list_capable = v; }
-
     /// Create `key` only if it is absent. On a precondition failure the object is untouched and the
     /// result has no token; on success the token identifies the newly written incarnation.
     PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta) override;
@@ -151,10 +133,6 @@ public:
     /// classified by S3 error code. EmulatedSingleProcess (Local): stats the configured container
     /// directory (`emu_root`) first — `ContainerAbsent` if it is gone — then the key.
     SentinelProbeResult probeSentinelRaw(const String & key) override;
-    /// See Backend::probePrefixEmptinessRaw. Native: `IObjectStorage::listObjects` with `max_keys=1`
-    /// (ListObjectsV2), classified by S3 error code on failure. EmulatedSingleProcess: the same
-    /// container-directory stat as `probeSentinelRaw`, then the listing.
-    SentinelProbeResult probePrefixEmptinessRaw(const String & prefix) override;
 
     /// The token kind this backend's object storage mints: TokenType::ETag for AWS-compatible
     /// stores, TokenType::Generation when the storage runs the GCS conditional dialect (the
@@ -200,8 +178,6 @@ public:
 private:
     const ObjectStoragePtr object_storage;
     const Mode mode;
-    /// Deployment assertion gating `supportsErasureProof` (see there). Default false (fail-closed).
-    bool strong_prefix_list_capable = false;
     TokenType native_token_type = TokenType::ETag;
     /// GCS single-PUT budget for conditional writes (generation-token stores only); see ctor.
     const uint64_t conditional_single_put_cap;

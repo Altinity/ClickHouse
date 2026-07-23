@@ -15,12 +15,6 @@ namespace DB::Cas
 /// default for a backend without sharper evidence).
 SentinelProbeResult probeSentinel(Backend & backend, const String & key);
 
-/// Container proof: ListObjectsV2(max-keys=1, prefix=pool_root) — NOT bucket HEAD.
-/// Returns Present when the LIST succeeded and found >=1 object, KeyAbsent when it succeeded and
-/// found ZERO objects (the pool-wide emptiness observation), AccessDenied / ContainerAbsent /
-/// Indeterminate otherwise. Thin dispatch to `Backend::probePrefixEmptinessRaw`.
-SentinelProbeResult probePrefixEmptiness(Backend & backend, const String & pool_root_prefix);
-
 /// Verdict of the zero-write startup bootstrap residual check (spec §2 "Startup [C4], ordered vs the
 /// capability probe [D2]", docs/superpowers/specs/
 /// 2026-07-22-cas-disk-lease-loss-throw-and-stop-verbs-design.md). Before a writable `Pool::open` runs
