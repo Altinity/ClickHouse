@@ -102,22 +102,21 @@ valuable, not committed; **DOC** = documentation debt; **TEST/INFRA** = validati
 - **[B131] repo hygiene + M-W comment sweep** — GATE — 30 dangling `M-W`/`D-W1`/`2026-06-12-ca-core-m-w` comment references across 13 src files (incl. `ContentAddressedMetadataStorage.{h,cpp}`, `CasGcScheduler.h`, `DataPartsExchange.cpp:106`) reference the deleted plan — sweep to self-contained wording. Non-shippable files: `poc/cas_mergetree/` already deleted (F1 landed); the untracked empty `poc/` husk remains.
 - **[B15/B99/B169/B159] `system.*` views for pool/blob/part refcounts + `clickhouse-disks` decode/introspect** — HARD (PARTIAL) — GC log + event log + `content_addressed_mounts` + ca-fsck/dryrun/rebuild/ca-inspect CLI done; per-part/ref `system.*` views + a top-down decode/traversal surface not yet. (INTROSPECTION-1/2 close signals.)
 - **[B13] migration path for existing tables** — HARD — `ALTER TABLE … MOVE PARTITION` to a `content_addressed` disk re-packs; mixed-version rollout rule (read-new-before-write-new; format self-check fails closed) + a rollout-safety spec.
-- **[B48 / B167a/f] clean shutdown** — GATE — `clickhouse local` + CA disk hang (GC thread / `BackgroundSchedulePool` not reaped on `LocalServer` exit); server-side graceful-shutdown ordering (stop scheduler → release lease → farewell beat).
+- **[B48 / B167a/f] clean shutdown** — RESOLVED (verified 2026-07-23) — **B48 no longer reproduces**: `clickhouse local` + CA disk (local backend, `gc_interval_sec=2`) exits cleanly on today's release AND ASan builds across all variants — immediate exit, ~9s alive with GC rounds on the dedicated thread + `OPTIMIZE FINAL` + `DROP`, exit with the table still alive (no `DROP`), and re-open of an existing pool; trace log shows active `CA GC round N` ticks and `Destroying disk content_addressed` ~34ms after the last round (repro kept in `tmp/b48_repro/`). Fixed structurally by the rev.8 disk-lifecycle round (GC-scheduler self-exit + fail-loud teardown). **B167a/f code-verified as implemented**: `Context::shutdown` (`Context.cpp:1047`) → `DiskObjectStorage::shutdown` (`DiskObjectStorage.cpp:511`) → `ContentAddressedMetadataStorage::shutdown` (`ContentAddressedMetadataStorage.cpp:834` — waits out an in-flight synchronous GC round, detaches under `pointer_mutex`, then `stop()` joins the GC worker+heartbeat threads) → last pool ref drop runs `~Pool` (`CasPool.cpp:745` — stop remount thread → bounded `drainRefLanesForShutdown` → `CasMountRuntime::finishTeardown`), which on a certified drain has the keeper terminal op stamp the lease already-expired + fold in the watermark farewell (`min_active = UINT64_MAX`, `MountRelease`/"farewell" audit event), and on an uncertified drain fail-closed skips the clean marker (successor uses observation-based reclaim). Inline `disk(...)` disks are registered via `Context::getOrCreateDisk` into the SAME selector map the shutdown loop iterates, so they are covered. Out of scope here (tracked separately): hard-kill leaves no farewell by design, and DROP-TABLE disk eject remains the disk-lifecycle-leak item.
 - **[F1-prod] read-only same-pool shadow disk (`ca_ro`) breaks table load on restart** — GATE (prod) — MergeTree part discovery finds every part twice → `UNKNOWN_DISK` on restart with CA tables. Stand workaround shipped (standalone `clickhouse-disks -C` fsck-only config; propagated to the default stand); PRODUCT fix (part discovery skips `readonly` same-pool disks, or a `hidden`/`introspection_only` disk flag) still open; `10replicas`/`gc_shards2`/`awss3` server configs may still embed `ca_ro`.
 - **[B165] server OOM at hour-4 soak (~49 GiB RSS)** — VERIFY — Not reproduced since the `putBlob` streaming fix; re-run a long soak to confirm resolved.
 - **[SEC-1] trust-domain documentation** — DOC — Document "one CAS pool = one trust domain" (CityHash128/XXH3 are not cryptographic; dedup is cross-tenant within a pool). For a multi-tenant future: crypto hash mode or trust-domain-scoped dedup (sha256 mode now exists as a building block). SEC-2/SEC-3 are by-design under this model.
 - **[AD-3] day-2 runbook** — DOC — Table of failure mode → signal/metric → diagnostic command → recovery command → test (stalled GC, persistent clamp, lost/corrupt `gc/state`, live mount conflict, orphan refs/manifests, pool-meta corruption, control-plane backup/restore).
 - **[B14] expedited / GDPR right-to-erasure delete** — DESIRABLE — Under GC lock, confirm no live ref, then delete bypassing the two-phase graduation delay; no layout change.
 - **[B17] encryption-at-rest × content-addressing** — DESIRABLE — Dedup scope per-encryption-key; local to key/hash derivation.
-- **[B26 / B135] local / NFS / shared-fs as a first-class backend** — DESIRABLE — Unit-tested over `LocalObjectStorage`; needs server-level doc + the put-if-absent atomicity caveat (racy multi-writer on local/NFS) + multi-mount safety notes. (B66a concurrent-fetch torn read on local is the concrete instance.)
-- **[B66a] concurrent-fetch torn read of shared `detached` ref on local storage** — MINOR — `LocalObjectStorage` write is not atomic; safe on S3 (atomic PUT).
-- **[B66b] relink-into-detached (zero-byte `to_detached` fetch for same-pool parts)** — DESIRABLE — Currently byte-streams; extend `Fetcher::relinkPartToDisk` to honor `to_detached`. (RPL-4 perf cliff.)
+- **[B26 / B135] [B66a] → §14** — local/emulated-backend items collected into §14 {#local-backend} (2026-07-23 grooming, user direction: local-backend stories live in ONE section).
+- **[B66b] relink-into-detached (zero-byte `to_detached` fetch for same-pool parts)** — IN PROGRESS (2026-07-23) — folded into the reserved-precommit fetch-handoff iteration (spec `docs/superpowers/specs/2026-07-23-cas-fetch-handoff-reserved-precommit-design.md`): the sender is target-name-agnostic, so the receiver simply reserves `detached/<final_name>`; the `!to_detached` advertise gate (`DataPartsExchange.cpp:545`) is lifted in that work. (RPL-4 perf cliff.)
 
 ## 8. Mount-lease / fence recovery {#mount-fence}
 
 - **[P3.1 Task 6 / S13] live validation of fence-recovery** — TEST — TLA+ gate PASSED and the correctness paths landed (self-remount on GC fence-out is DONE); the gtest sweep + S13 3×-green live gate remain. **Task 5** (decouple renewal from the retired-view sync beat) is likely **MOOT** — freshness-v3 deleted `RetireView`/syncer/`observed_gc_round`; confirm and close.
 - **[A7-residual] gc_scheduler lifetime vs manual rounds** — VERIFY — Believed addressed by `89845c2a544` (shutdown serializes gc_scheduler teardown with health reads; wedged-lane count pinned) on top of the stabilization A7 fix. Confirm no residual: (a) a manual round on a raw pointer captured outside the lock, (b) lazy creation resurrecting a scheduler after shutdown.
-- **[codex-6] wire the fetch-handoff retention pin** — HARD (spec exists, not wired) — The relink sender is fire-and-forget (`DataPartsExchange.cpp:255-280` streams manifest bytes and releases the source part): if the receiver's `precommitAdd` edge-PUT stalls across ≥2 GC folds while the source part goes `Outdated` with no other ref, the blob is reclaimed → a dangling committed manifest (fsck-detected, not silent). The gap is self-documented at `ContentAddressedMetadataStorage.cpp:1335-1343` and re-confirmed by the 2026-07-17 codex-review triage (finding №6; token-CHANGE recoveries are already covered by the GC `deleteExact` liveness re-check — only this same-token tail is open). Fix: implement the sender-created, build-owned, epoch-floor handoff pin per `docs/superpowers/specs/2026-07-15-cas-fetch-handoff-retention-pin-design.md` (pin cleanup rides the heartbeat `min_active` floor). Interim alternative: gate relink off to the byte-fetch path until the pin lands. Own task, tracked separately from the rest of the codex-triage fix wave.
+- **[codex-6] wire the fetch-handoff retention pin** — HARD (spec exists, not wired) — The relink sender is fire-and-forget (`DataPartsExchange.cpp:255-280` streams manifest bytes and releases the source part): if the receiver's `precommitAdd` edge-PUT stalls across ≥2 GC folds while the source part goes `Outdated` with no other ref, the blob is reclaimed → a dangling committed manifest (fsck-detected, not silent). The gap is self-documented at `ContentAddressedMetadataStorage.cpp:1335-1343` and re-confirmed by the 2026-07-17 codex-review triage (finding №6; token-CHANGE recoveries are already covered by the GC `deleteExact` liveness re-check — only this same-token tail is open). Fix (REVISED 2026-07-23): the retention-pin design is **superseded** by the reserved-precommit protocol — the receiver reserves the manifest identity in its OWN journal before the fetch (`RefOwnerKind::Reserved`, a normal non-anomalous pending state for the GC fold — no round suppression), and the sender materializes the manifest body at the reserved id BEFORE releasing the part, so the receiver's `+1` is foldable before the sender's `-1` can exist (pure event-order seal, no pins, no GC overlay). Spec `docs/superpowers/specs/2026-07-23-cas-fetch-handoff-reserved-precommit-design.md` (supersedes `2026-07-15-cas-fetch-handoff-retention-pin-design.md`, banner added; also covers B66b relink-into-detached + the RPL-5 `REPLACE PARTITION` queue-clone test slice). Interim alternative unchanged: gate relink off to the byte-fetch path until it lands.
 
 ## 9. Architecture / refactoring (deferred, no behavior change) {#refactoring}
 
@@ -125,7 +124,7 @@ valuable, not committed; **DOC** = documentation debt; **TEST/INFRA** = validati
 - **[refactor: Store de-god-classing] extract remount-thread / caches / ref-append-lane out of `Cas::Store`** — DESIRABLE — 8-responsibility god class; friend-triangle with `Build`/`Gc`. (review1 #13.)
 - **[refactor: Store::open modes] split into create / open-rw / open-ro** — MINOR (real bug behind it) — Read-only `Store::open` can still write `_pool_meta` on an empty pool (`PoolMeta::createOrValidate`); make read-only semantics visible (`createOrLoad` vs `loadExisting`) or pass `create_if_missing=false` when `read_only`. (refactoring-ideas #1.)
 - **[DiskSelector per-disk isolation]** — HARD / upstream — `DiskSelector::initialize()` has no per-disk try/catch; one unreachable disk aborts disk-selector init server-wide. Pre-existing upstream gap; carve to an upstream PR (Group G). (review1 #5 residual.)
-- **[emulated list-token contract]** — MINOR / VERIFY — `ObjectStorageBackend::list` in `EmulatedSingleProcess` mode may still return a different token kind than `head`/`get`/`put`/`delete` (child etag vs `emuObserveToken`), a Liskov gap vs `supportsListTokens`. The token-policy centralization (C1, landed) added `tokenForHead/tokenForList/tokenMatches`; verify the emulated `list` path now agrees or make `supportsListTokens()==false`.
+- **[emulated list-token contract] → §14** {#local-backend} (2026-07-23 grooming).
 - **[Group G] carve generic Ring-2 fixes into separate upstream PRs** — MINOR (fork hygiene) — Shrinks the fork's long-term conflict surface: `ThreadStatus parent_thread_group` (B90), `ReadBufferFromFileView` (B115), `ReadBufferFromS3` cancel-stop (B117), `LocalObjectStorage` TOCTOU (B38), `MergeTreeDeduplicationLog` null-writer (B37), `copyS3File message_format_string`, `Expect:100-continue` opt-in, `S3Exception::isPreconditionFailed`, GCS conditional dialect + GOOG4 signer, generic conditional-S3-write plumbing. Non-blocking.
 - **[weighed refactors — not scheduled]** — see `refactoring-ideas.md` for the WEIGHED-not-mandated set (typed key-wrapper helpers #5, codec-validation/workflow split #6, naming disambiguation #10, backend-test fixture DSL #9). Token-policy (#2) + list-pagination (#7) + delete-outcome classifier (#8) already landed (C1/C2).
 
@@ -145,7 +144,7 @@ valuable, not committed; **DOC** = documentation debt; **TEST/INFRA** = validati
 - **[CI-P1] RustFS provisioning for the CA-s3 functional lane** — INFRA — Add a tracked `setup_rustfs.sh` (mirror `setup_minio.sh`) invoked before the job's `start()`; today it only checks for a pre-existing `ci/tmp/rustfs`.
 - **[soak-harness minors]** — INFRA — TTL-band oracle widening for long runs; unreliable pool telemetry at scale (`pool_objects`/`pool_bytes` None); `run_24h.sh` destroys prior-run raw logs at start (move → `logs/prev_<ts>` after a run); S24 needs a pre-agreement `SYSTEM SYNC REPLICA`; S01 scratch high-water sampler misses the OPTIMIZE-FINAL spike; `s3cache` scenario flip to a positive cache-hit assertion; scenario README/cards still say `root_shards` after the S08 oracle rewrite.
 - **[S16] strict resurrect-count check may fail deterministically** — TEST (watch) — If `forced_gc_to_fixpoint` fully deletes bodies, re-insert is a plain `blob_put` and `resurrect_count>0` fails — scenario-cycle tuning, not a product bug.
-- **[RPL-5 slice] `REPLACE PARTITION`/`ATTACH PARTITION ... FROM` queue-clone relink, untested on CA** — TEST — Scoped from the existing RPL-5 finding (`reviews.md`): a `REPLACE_RANGE` log entry from `REPLACE PARTITION`/`ATTACH PARTITION ... FROM` on a Replicated CA table, cloned to a second replica via the replication queue, reduces to a sequence of fetch (relink or byte) + drop — individually working — but there is no integration test proving the CLONED fetch specifically relinks rather than byte-refetches, and RPL-4 documents that `to_detached` relink is explicitly disabled, so it is not obvious a priori which branch a queue-cloned `REPLACE_RANGE` fetch takes. `test_cas_replicated_relink` proves relink for the plain INSERT/merge fetch path only; the freeze/`ATTACH` stateless set (`02271_replace_partition_many_tables`, `01901_test_attach_partition_from`) proves single-node CA correctness for these ops, not cross-replica relink. Deferred out of all-tree Task 12 (2026-07-15): determining the correct relink-eligibility branch for this path is a small investigation, not a copy-paste test — proportionate to do as its own dedicated pass (extend `test_cas_replicated_relink`'s existing 2-replica rustfs fixture with a `REPLACE PARTITION`/`ATTACH ... FROM` scenario + blob-count relink proof), not squeezed into a validation gate.
+- **[RPL-5 slice] `REPLACE PARTITION`/`ATTACH PARTITION ... FROM` queue-clone relink, untested on CA** — TEST — Scoped from the existing RPL-5 finding (`reviews.md`): a `REPLACE_RANGE` log entry from `REPLACE PARTITION`/`ATTACH PARTITION ... FROM` on a Replicated CA table, cloned to a second replica via the replication queue, reduces to a sequence of fetch (relink or byte) + drop — individually working — but there is no integration test proving the CLONED fetch specifically relinks rather than byte-refetches, and RPL-4 documents that `to_detached` relink is explicitly disabled, so it is not obvious a priori which branch a queue-cloned `REPLACE_RANGE` fetch takes. `test_cas_replicated_relink` proves relink for the plain INSERT/merge fetch path only; the freeze/`ATTACH` stateless set (`02271_replace_partition_many_tables`, `01901_test_attach_partition_from`) proves single-node CA correctness for these ops, not cross-replica relink. Deferred out of all-tree Task 12 (2026-07-15): determining the correct relink-eligibility branch for this path is a small investigation, not a copy-paste test — proportionate to do as its own dedicated pass (extend `test_cas_replicated_relink`'s existing 2-replica rustfs fixture with a `REPLACE PARTITION`/`ATTACH ... FROM` scenario + blob-count relink proof), not squeezed into a validation gate. PULLED INTO the 2026-07-23 reserved-precommit fetch-handoff iteration's test package (spec `2026-07-23-cas-fetch-handoff-reserved-precommit-design.md` §testing) — the iteration touches exactly the relink-eligibility branch this slice needs to prove.
 
 ## 11. Scalability findings from the full-scale campaign (S3 budget) {#scale-findings}
 
@@ -181,6 +180,47 @@ These are real scale/budget findings; most are variants of "O(N) GC / per-op amp
 - **[Build::promote owner-liveness guard is race-only]** — MINOR — Fires only in the narrow promote-vs-dropNamespace window; make the race deterministically testable or remove the guard with a TLA argument.
 - **[Ring-2 comment/convention nits]** — MINOR — `S3Common.h` comment overclaims for the RetryStrategy site; `static_assert(DEFAULT_EXPECT_CONTINUE_MIN_BYTES==0)`; `MergeTask::projection_uses_parent_transaction` could be a local; `ProfileEvents.cpp` changelog fragment in a description; `_ms` suffix on a `DateTime64(3)` column; the new `GC REBUILD` right abbreviates "GC" vs the sibling spelled-out "GARBAGE COLLECTION"; internal `cas_part_folder_cache_*` names outlived the key rename; `05011` `no-parallel` tag droppable; empty untracked `poc/` dir husk.
 - **[C2-followups] more pagination loops for `forEachListedKey`** — MINOR — Three more identical loops in `CasRefIntake.cpp`/`CasServerRoot.cpp`; `forEachListedKey` also lacks a stop-on-true/page-boundary hook to let `deletePrefixWholesale` + ns-cleanup migrate (interface addition, design first).
+
+## 14. Local / emulated backend {#local-backend}
+
+Collected 2026-07-23 (user direction): every "local backend" story lives HERE, so the class is visible
+as one body of work instead of scattered minors. Common root: `LocalObjectStorage` writes are plain
+`O_TRUNC` file writes — no atomic PUT, no conditional-write enforcement, no torn-read protection —
+while the CAS protocol is designed against S3 atomic/conditional semantics. Nothing in this section
+affects S3/GCS production pools.
+
+- **[disk-error-audit] temp-file + rename in the local blob write path** — HARD — (moved from the
+  2026-07-21 disk-error audit) `emuWrite` (`CasObjectStorageBackend.cpp:546-557`) streams through
+  `LocalObjectStorage::writeObject`, which opens a plain `WriteBufferFromFile` directly on the final
+  key with `O_TRUNC` (`LocalObjectStorage.cpp:250-277`). ENOSPC or a kill mid-write leaves a partial
+  file at the final content-addressed key; the next `putIfAbsent` sees `emuExists == true` and returns
+  `PreconditionFailed` = "already present" (`:776-780`), so the writer dedups against the truncated
+  body. Presence-only admission + non-atomic local write is the ONLY corruption window the audit
+  found. Native/S3 mode is not affected (`If-None-Match` + atomic completion). Fix: write to a sibling
+  temp name and `rename` into place (or fix it inside `LocalObjectStorage`), paired with the
+  dedup-admit size guard (still in the audit section) as defense-in-depth. Fixing this also closes
+  B66a's torn-read mechanism below.
+- **[B26 / B135] local / NFS / shared-fs as a first-class backend** — DESIRABLE — Unit-tested over
+  `LocalObjectStorage`; needs server-level doc + the put-if-absent atomicity caveat (racy multi-writer
+  on local/NFS) + multi-mount safety notes. (B66a is the concrete instance of the caveat.)
+- **[B66a] concurrent-fetch torn read of a shared `detached` ref on local storage** — MINOR —
+  `LocalObjectStorage` write is not atomic; a concurrent reader/writer of the SAME ref key can observe
+  a half-written object. Safe on S3 (atomic PUT). Freeze dodged this class by design (one ref per
+  frozen part, no shared container — `CONSOLIDATION-COVERAGE.md`); the residual case is concurrent
+  writers of one `detached/<part>` name. Mechanism is closed by the temp-file+rename item above;
+  until then racy multi-writer on local/NFS stays documented-unsafe. Deliberately OUT of the
+  2026-07-23 reserved-precommit iteration (orthogonal to the handoff protocol).
+- **[emulated list-token contract]** — MINOR / VERIFY — (moved from §9) `ObjectStorageBackend::list`
+  in `EmulatedSingleProcess` mode may still return a different token kind than
+  `head`/`get`/`put`/`delete` (child etag vs `emuObserveToken`), a Liskov gap vs `supportsListTokens`.
+  The token-policy centralization (C1, landed) added `tokenForHead/tokenForList/tokenMatches`; verify
+  the emulated `list` path now agrees or make `supportsListTokens()==false`.
+- **[STATELESS-04286 EISDIR]** — pointer — `existsFile` mountpoint probe throws "Is a directory"
+  (EISDIR) on the LOCAL CA backend; tracked in `utils/ca-soak/scenarios/BACKLOG.md`
+  (STATELESS-04286-getmountpoint-eisdir, 2026-07-08); needs a fail-closed-semantics decision +
+  re-check on RustFS/S3.
+- Related, landed: `LocalObjectStorage` TOCTOU walk fix (B38) — upstream carve-out tracked in §9
+  Group G.
 
 ## Recently closed (2026-07-13 grooming — do NOT re-open) {#recently-closed}
 
@@ -509,16 +549,8 @@ tolerant fold branch. The items below are the residual gaps, ordered by value.
   is admitted as a dedup hit and produces a durably unreadable part. One cheap comparison closes
   the whole truncation-admit class on every backend (the HEAD-first path, the post-412 revive
   observe, and the 3-arg gate path all funnel through this overload).
-- [ ] **HARD: temp-file + rename in the local blob write path** — `emuWrite`
-  (`CasObjectStorageBackend.cpp:546-557`) streams through
-  `LocalObjectStorage::writeObject`, which opens a plain `WriteBufferFromFile` directly on the
-  final key with `O_TRUNC` (`LocalObjectStorage.cpp:250-277`). ENOSPC or a kill mid-write leaves a
-  partial file at the final content-addressed key; the next `putIfAbsent` sees `emuExists == true`
-  and returns `PreconditionFailed` = "already present" (`:776-780`), so the writer dedups against
-  the truncated body. Presence-only admission + non-atomic local write is the ONLY corruption
-  window the audit found. Native/S3 mode is not affected (`If-None-Match` + atomic completion).
-  Fix: write to a sibling temp name and `rename` into place (or fix it inside
-  `LocalObjectStorage`), paired with the size guard above as defense-in-depth.
+- [ ] **HARD: temp-file + rename in the local blob write path** — moved to §14 {#local-backend}
+  (2026-07-23 grooming); paired with the size guard above as defense-in-depth.
 - [ ] **DESIRABLE: fsck physical-size check for blob bodies** — `runFsck` HEADs every blob but
   never compares the physical size against `blob_header_len + entry.blob_size`, so a truncated
   blob passes as `Reachable` (`CasFsck.cpp:371-414`). The listing already carries the sizes — the
