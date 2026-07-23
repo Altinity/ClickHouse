@@ -35,6 +35,7 @@
 #include <IO/SharedThreadPools.h>
 #include <Common/ThreadPool.h>
 #include <Common/scope_guard_safe.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobUploadPool.h>
 
 #include <Poco/FileChannel.h>
 
@@ -552,6 +553,13 @@ int DisksApp::main(const std::vector<String> & /*args*/)
         /*max_io_thread_pool_free_size*/ 0,
         /*io_thread_pool_queue_size*/ 10000);
 
+    /// `clickhouse-disks` loads no `ServerSettings`, so this can't read
+    /// `content_addressed_blob_upload_pool_size`; 16 mirrors that setting's default
+    /// (`src/Core/ServerSettings.cpp`). A `write` command that commits through a
+    /// `content_addressed` disk reaches `uploadPendingBlobs`, which calls this pool
+    /// unconditionally (see the analogous init in `Server.cpp`/`LocalServer.cpp`).
+    DB::Cas::initializeBlobUploadPool(16);
+
     registerCommands();
 
     registerDisks(/* global_skip_access_check= */ true);
@@ -663,6 +671,7 @@ int mainEntryClickHouseDisks(int argc, char ** argv)
     /// That way, accesses happen-before destruction.
     SCOPE_EXIT_SAFE({
         DB::StaticThreadPool::shutdownAll();
+        DB::Cas::shutdownBlobUploadPool();
         GlobalThreadPool::shutdown();
     });
 
