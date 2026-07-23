@@ -95,6 +95,8 @@ of `CaGcRootLocalPartManifestCore`.
 | `CaRefFoldClampRecoveryCore.tla` | fold clamp always recoverable: per-log cleanup staging | CURRENT | `run_foldclamp.sh` |
 | `CaRefNsCleanupStaleLeaderCore.tla` | stale-leader namespace-cleanup pass aborts on completed-marker observation | CURRENT | `run_nscleanup_staleleader.sh` |
 | `CaRefWriterCleanupCore.tla` | ref-table writer ownership lifecycle: precommit, promote, fence, successor cleanup | CURRENT | `run_refwcleanup.sh` |
+| `CaErasureProof.tla` | rev.7 `Vanished(erased)` erasure-proof soundness: writer paths closed by op-gate + guard counter + LIST-reset + grace ([D1] grace proven load-bearing); two GC-side windows found + fix candidate validated | CURRENT (documents two open GC-side findings) | `run_erasureproof.sh` |
+| `CaDiskLifecycle.tla` | rev.7 lifecycle one-way-ness + the as-built `FORGET` protocol: trip#2 sufficiency, earned farewell, GC stop/start serialization, first-terminal-wins race, FORGET always completes | CURRENT | `run_disklifecycle.sh` |
 | `CaB140DangleMerge.tla` (+ `m_*.cfg`) | journal-trim dangle across a lease handoff: trim-gate + cursor-in-snap jointly necessary | HISTORICAL | (inline TLC) |
 
 ## Model groups {#model-groups}
@@ -245,6 +247,43 @@ ordered scan and cleanup deletes only what it observed durable. The migration is
   shipped `CasServerRoot.cpp`. Configs: `_stage1`, `_rev6_observe` (main green gate),
   `_sab_adoptwedge`, `_sab_epochreset`, `_sab_fenceresurrect`, `_sab_foreigntakeover`,
   `_sab_wallclockreclaim`, and four `_witness_*` reachability checks.
+
+### rev.7 disk lifecycle: erasure proof + FORGET {#group-rev7-lifecycle}
+
+Gates for the rev.7 "throw-when-uncertain, truth-when-proven" disk-lifecycle redesign
+(spec `2026-07-22-cas-disk-lease-loss-throw-and-stop-verbs-design.md`, Tasks 1-11). Full run
+evidence and trace analysis: `.superpowers/sdd/tla-rev7-report.md`.
+
+- **`CaErasureProof.tla`** — soundness of the natural `Vanished(erased)` promotion (spec §2
+  [C2][C3][D1]): when the observer declares "verified: pool prefix empty", the prefix is empty and
+  stays empty. The observer's sample is split into its two non-atomic halves (the gate's LIST, then
+  the qualification reads) exactly as the code orders them — the load-bearing non-atomicity. The
+  writer machinery (op-gate `Live`-only admission, the op-scoped `DurableRequestGuard` counter, the
+  LIST/streak reset discipline, the [D1] grace) is proven closed (`_nogc_grace` green), the grace is
+  proven load-bearing (`_sab_nograce` red: a zombie request — guard released on timeout, request
+  still in flight — lands after the second sample), and two REAL GC-side windows were found: a
+  fresh (never-observed) scheduler's round CREATES `gc/state` between the final LIST and the
+  `round_in_flight` read and completes before it (`_gc_promptliteral` red — the Task-8 prose
+  containment does not close the completed-round window), and the as-built out-of-round
+  `heartbeatLoop` pulses plus the missing scheduler lifecycle-exit recreate control keys in the
+  qual window and after promotion (`_gc_asbuilt` red). The fix candidate — scheduled rounds AND
+  heartbeat pulses refuse unless the pool lifecycle is `Live`, the refusal the manual GC entry
+  points already make — is mechanically validated (`_fix_gclivegate` green). The natural promotion
+  is dormant in production until the strong-LIST capability is wired, so these are
+  pre-activation findings, not live bugs.
+- **`CaDiskLifecycle.tla`** — the rev.7 lifecycle state machine + the as-built
+  `SYSTEM CONTENT ADDRESSED FORGET` step order (`Pool::forgetDisk`), concurrent with keeper trips,
+  the self-remount thread (whose in-flight attempt may complete a full reclaim after the terminal
+  intent is published — intent is checked at step boundaries only), natural terminal promotions,
+  the GC scheduler loop, and the `GC STOP`/`GC START` verbs under `lifecycle_mutex`. Proves: FORGET
+  ends with the fence latched and a fully-terminal state under all interleavings (the second
+  `tripMountLost` is exactly what closes the join-window reclaim race — `_sab_notrip2` reproduces
+  Task 10's RED demo mechanically); the farewell is written only after a real drain
+  (`_sab_unearnedfarewell` red); `IdentityLost`/`Vanished` are one-way; terminal states imply a
+  latched fence; FORGET leaves GC destroyed and unrestartable; and a started FORGET always
+  completes (liveness under fairness), including when a racing natural promotion wins
+  enterVanished first (first-terminal-wins is by design; `_witness_racederased` shows the race is
+  real).
 
 ### Historical records (kept) {#group-historical}
 
