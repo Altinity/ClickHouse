@@ -44,6 +44,54 @@ struct PutBlobResult
     uint64_t size = 0;
 };
 
+/// One blob dependency this build contributes — EXACTLY the record `putBlob` folds into `deps`.
+/// A token identifies an incarnation uploaded by this transaction and must be retained through
+/// promotion; a tokenless entry relies on the durable source-manifest edge instead. `adopted`
+/// distinguishes trusted committed-source evidence (`adoptEvidence`) from a pending upload that has
+/// not yet been completed. CAS-owned public value type so a transaction-detached upload can RETURN
+/// its complete dep effect instead of folding it as a side effect (spec §1: "no branch may leave its
+/// dep effect behind as a side effect").
+struct BlobDepRecord
+{
+    ObjectKind kind = ObjectKind::Blob;
+    std::optional<Token> token;                       /// nullopt = live-source evidence
+    uint64_t size = 0;
+    bool adopted = false;                             /// true only for `adoptEvidence`
+};
+
+/// Which branch of the upload primitive admitted a blob. Carried out of `uploadBlobDetached` so the
+/// merge/fan-out layers (and tests) can assert the branch taken without inferring it from the dep.
+enum class BlobUploadOutcome
+{
+    DedupCacheHit,      /// dedup cache said present; HEAD-first confirmed a live incarnation; adopted
+    HeadHit,            /// size-triggered HEAD-first found a present live incarnation; adopted
+    HeadMissAdopted,    /// the write-once create 412'd on a live incarnation (or a racing writer's); adopted
+    FreshUpload,        /// the write-once conditional create streamed a fresh local body
+    StagingPromoted,    /// the write-once conditional server-side copy promoted an S3 staging object
+    ResurrectedLocal,   /// a condemned incarnation displaced by a fresh local `putOverwrite`
+    ResurrectedS3,      /// a condemned incarnation displaced by a fresh server-side copy from staging
+};
+
+/// Public, CAS-owned input to `uploadBlobDetached`; the transaction's private dep representation is not
+/// exposed. `source` mirrors `putBlob`'s re-readable `BlobSource` (local streaming / S3 staging copy).
+/// `declared_size` is the value the fan-out layer groups and conflict-checks on; it mirrors
+/// `source.size`, which stays the authority for the per-attempt streaming byte check.
+struct BlobUploadRequest
+{
+    BlobRef ref;
+    BlobSource source;
+    uint64_t declared_size = 0;
+};
+
+/// Complete result of one detached upload: the addressed ref, the COMPLETE dep effect the upload
+/// contributes (no side channel), and the branch outcome.
+struct BlobUploadResult
+{
+    BlobRef ref;
+    BlobDepRecord dep;
+    BlobUploadOutcome outcome = BlobUploadOutcome::FreshUpload;
+};
+
 /// Hash `payload` with `algo` using the same convention as the streaming blob writer and return the complete
 /// `BlobRef` identity. The algorithm travels with the digest; callers must not reconstruct a blob identity from
 /// a bare digest or from an independently supplied digest width.
@@ -83,6 +131,15 @@ public:
     /// compiled out in release) in observeAndAdmit. A FRESH upload before precommit is legal
     /// (newborn-debris watermark), but production never does it.
     PutBlobResult putBlob(const BlobRef & ref, BlobSource source);
+
+    /// Transaction-DETACHED upload primitive (spec §1). Runs the SAME durable, ordering-sensitive pool
+    /// effects `putBlob` runs — the HEAD-first dedup gate, the write-once conditional create, condemned
+    /// resurrection (INV-1: never GET a condemned object), the freshness-meta `Clean` transition,
+    /// dedup-cache reads/inserts, event emission, ProfileEvents — but folds NOTHING into `build`
+    /// (`deps`), returning the complete dep effect + branch outcome as a value instead. It is therefore
+    /// safe to run off the owning writer thread while `PartWriteTxn` stays single-writer for `build`.
+    /// `putBlob` = this primitive + a single-result `deps` fold on the calling thread.
+    BlobUploadResult uploadBlobDetached(const BlobUploadRequest & req) const;
 
     /// Return whether this build holds a TOKENED Blob dep for `ref` (`putBlob` ⇒
     /// tokened) versus a tokenless evidence dep (`adoptEvidence` ⇒ tokenless)? False also when this
@@ -183,20 +240,6 @@ public:
     uint64_t buildSeq() const { return build_seq; }
 
 private:
-    /// One blob dependency recorded by this build. A token identifies an incarnation uploaded by this
-    /// transaction and must be retained through promotion; a tokenless adopted entry relies on the durable
-    /// source-manifest edge instead. `adopted` distinguishes that trusted source evidence from a pending
-    /// upload that has not yet been completed by `putBlob`.
-    struct DepEntry
-    {
-        ObjectKind kind = ObjectKind::Blob;
-        std::optional<Token> token;                       /// nullopt = live-source evidence
-        uint64_t size = 0;
-        /// True only for `adoptEvidence` — a committed-source evidence dep, trusted at promote. A
-        /// tokenless dep with adopted=false is a PENDING upload (`recordPendingBlobDep`) that must be
-        /// tokened by putBlob before promote; reaching promote un-tokened is a staging bug (fail closed).
-        bool adopted = false;
-    };
     /// Keyed on the full `BlobRef` pair (algorithm + digest), because a bare digest is not a blob identity.
     /// This remains an ordered `std::map` (not `unordered_map`): `BlobRef` already provides `operator<=>`, so
     /// no hasher is needed here. `BlobRefHash` is for unordered dedup-cache/set consumers elsewhere. The
@@ -205,17 +248,19 @@ private:
 
     /// Apply the cold-reuse rule: HEAD the key; absent ⇒ FILE_DOESNT_EXIST;
     /// condemned-at-current-token ⇒ throw ABORTED (caller must re-upload from its own source bytes);
-    /// else record the current token as the dep. Returns the admitted size.
-    uint64_t observeAndAdmit(ObjectKind kind, const BlobRef & ref, const String & key);
+    /// else RETURN the adopt dep record (current token, admitted logical size). Build-neutral: it folds
+    /// nothing into `deps` (its callers compose the returned record into a `BlobUploadResult`).
+    BlobDepRecord observeAndAdmit(ObjectKind kind, const BlobRef & ref, const String & key) const;
     /// Overload for callers that already hold a fresh, present HeadResult for `key` (the putBlob
     /// HEAD-before-PUT path), avoiding a redundant second HEAD. `hr.exists` MUST be true.
-    uint64_t observeAndAdmit(ObjectKind kind, const BlobRef & ref, const String & key, const HeadResult & hr);
+    BlobDepRecord observeAndAdmit(ObjectKind kind, const BlobRef & ref, const String & key, const HeadResult & hr) const;
     /// INV-1 (revival-from-source): revive a condemned or absent object by re-uploading from the writer's
     /// OWN re-readable source without reading the dying object (no backend().get). The source is STREAMED
     /// into the put sink (header + `source.write_payload`), never materialized into a full in-memory copy;
     /// `source.write_payload` may be re-invoked on each conditional-write attempt (it re-reads the staged
-    /// temp file / re-emits the captured String), so it is taken by const ref and not consumed.
-    void uploadFromSource(ObjectKind kind, const BlobRef & ref, const String & key, const BlobSource & source);
+    /// temp file / re-emits the captured String), so it is taken by const ref and not consumed. Build-neutral:
+    /// RETURNS the complete `BlobUploadResult` (dep + branch outcome); it folds nothing into `deps`.
+    BlobUploadResult uploadFromSource(ObjectKind kind, const BlobRef & ref, const String & key, const BlobSource & source) const;
 
     /// The build's owning root namespace, derived from PartWriteInfo::intended_ref ("ns/ref" — the ref is the
     /// last `/`-segment; the namespace is everything before it). Sets a manifest body's root_namespace_id.
@@ -258,7 +303,7 @@ private:
 
     std::vector<ManifestId> staged_manifests;             /// for best-effort abandon cleanup
 
-    std::map<DepKey, DepEntry> deps;                      /// dependencies recorded by this build (blobs only)
+    std::map<DepKey, BlobDepRecord> deps;                 /// dependencies recorded by this build (blobs only)
 };
 
 }

@@ -145,16 +145,28 @@ void PartWriteTxn::requireAlive() const
 
 PutBlobResult PartWriteTxn::putBlob(const BlobRef & ref, BlobSource source)
 {
+    /// Serial API preserved for existing callers: run the transaction-detached primitive, then fold its
+    /// single result into `build` on this (the owning writer) thread. Semantics are byte-for-byte those
+    /// of the pre-carve `putBlob`. The fan-out path (spec §1) instead collects many results off-thread and
+    /// folds them together via `mergeBlobUploadResults`. `source.size` is the streaming byte authority, so
+    /// the request's `declared_size` mirrors it.
+    const uint64_t declared_size = source.size;
+    const BlobUploadResult r = uploadBlobDetached(BlobUploadRequest{ref, std::move(source), declared_size});
+    deps[r.ref] = r.dep;
+    return PutBlobResult{r.ref, r.dep.size};
+}
+
+BlobUploadResult PartWriteTxn::uploadBlobDetached(const BlobUploadRequest & req) const
+{
     requireAlive();
 
     const PoolConfig & cfg = store->poolConfig();
-    /// `putBlob` writes the blob identified by `ref` directly -- the caller (the
-    /// write-mint site) already produced the full `BlobRef` pair (algo + digest), so there is no hex
-    /// round-trip here anymore. `logical_ref` is the blob identity end-to-end from here on: the dedup
-    /// cache, the dep map, and every downstream event render key off THIS value directly.
-    const BlobRef & logical_ref = ref;
-
-    const String key = store->layout().blobKey(ref);
+    /// The caller (the write-mint site) already produced the full `BlobRef` pair (algo + digest), so there
+    /// is no hex round-trip here. `logical_ref` is the blob identity end-to-end: the dedup cache and every
+    /// downstream event render key off THIS value directly.
+    const BlobRef & logical_ref = req.ref;
+    const String key = store->layout().blobKey(req.ref);
+    const BlobSource & source = req.source;
 
     /// The source is RE-READABLE (the caller's `write_payload` re-reads a staged temp file, or re-emits a
     /// captured String): it can be invoked MULTIPLE times — the primary streaming PUT plus any INV-1
@@ -167,9 +179,11 @@ PutBlobResult PartWriteTxn::putBlob(const BlobRef & ref, BlobSource source)
     /// PUT, the broken-pipe and retry storm caused by early rejection). A present HEAD ⇒ admit without streaming the body;
     /// a stale/absent HEAD ⇒ fall through to the normal conditional upload. SAFE by construction: we
     /// always genuinely observe present-at-round before skipping the body, so the cache can never cause
-    /// a dangle (a stale hit just HEADs 404 and uploads).
+    /// a dangle (a stale hit just HEADs 404 and uploads). The cache membership is read ONCE here: it both
+    /// arms the HEAD-first gate and distinguishes the `DedupCacheHit` outcome from a size-triggered `HeadHit`.
+    const bool cache_hit = store->dedupCacheContains(logical_ref);
     const bool head_first =
-        store->dedupCacheContains(logical_ref)
+        cache_hit
         || (cfg.dedup_head_first_min_bytes > 0 && source.size >= cfg.dedup_head_first_min_bytes);
     if (head_first)
     {
@@ -178,13 +192,14 @@ PutBlobResult PartWriteTxn::putBlob(const BlobRef & ref, BlobSource source)
         if (hr.exists)
         {
             ProfileEvents::increment(ProfileEvents::CasBlobBodyPutAvoided);
-            if (store->dedupCacheContains(logical_ref))
+            if (cache_hit)
                 ProfileEvents::increment(ProfileEvents::CasBlobDedupCacheHit);
             try
             {
-                const uint64_t admitted = observeAndAdmit(ObjectKind::Blob, logical_ref, key, hr);
+                const BlobDepRecord dep = observeAndAdmit(ObjectKind::Blob, logical_ref, key, hr);
                 store->dedupCacheAdd(logical_ref);
-                return PutBlobResult{ref, admitted};
+                return BlobUploadResult{req.ref, dep,
+                    cache_hit ? BlobUploadOutcome::DedupCacheHit : BlobUploadOutcome::HeadHit};
             }
             catch (const Exception & e)
             {
@@ -205,10 +220,10 @@ PutBlobResult PartWriteTxn::putBlob(const BlobRef & ref, BlobSource source)
     {
         try
         {
-            uploadFromSource(ObjectKind::Blob, logical_ref, key, source);
+            const BlobUploadResult r = uploadFromSource(ObjectKind::Blob, logical_ref, key, source);
             /// This hash is now known-present — future writers can HEAD-first and skip the body.
             store->dedupCacheAdd(logical_ref);
-            return PutBlobResult{ref, source.size};
+            return r;
         }
         catch (const Exception & e)
         {
@@ -225,7 +240,7 @@ PutBlobResult PartWriteTxn::putBlob(const BlobRef & ref, BlobSource source)
     }
 
     /// Unreachable: the loop either returns or rethrows on the final attempt.
-    throw Exception(ErrorCodes::LOGICAL_ERROR, "putBlob: exhausted retries for {}", key);
+    throw Exception(ErrorCodes::LOGICAL_ERROR, "uploadBlobDetached: exhausted retries for {}", key);
 }
 
 bool PartWriteTxn::isTrustedAdopt(const BlobRef & ref) const
@@ -248,7 +263,7 @@ bool PartWriteTxn::depIsTokened(const BlobRef & ref) const
     return it != deps.end() && it->second.token.has_value();
 }
 
-uint64_t PartWriteTxn::observeAndAdmit(ObjectKind kind, const BlobRef & ref, const String & key)
+BlobDepRecord PartWriteTxn::observeAndAdmit(ObjectKind kind, const BlobRef & ref, const String & key) const
 {
     /// EDGE-BEFORE-OBSERVE: the durable-precommit guard
     /// lives in the 4-arg overload below, scoped to its ADOPT branch only — NOT here. A HEAD result
@@ -273,7 +288,7 @@ uint64_t PartWriteTxn::observeAndAdmit(ObjectKind kind, const BlobRef & ref, con
     return observeAndAdmit(kind, ref, key, hr);
 }
 
-uint64_t PartWriteTxn::observeAndAdmit(ObjectKind kind, const BlobRef & ref, const String & key, const HeadResult & hr)
+BlobDepRecord PartWriteTxn::observeAndAdmit(ObjectKind kind, const BlobRef & ref, const String & key, const HeadResult & hr) const
 {
     /// `hr.exists` is guaranteed by the caller (the 3-arg wrapper checked it; the putBlob HEAD-first
     /// path only calls this on a present HEAD). Avoids a redundant second HEAD on the dedup-hit path.
@@ -360,12 +375,17 @@ uint64_t PartWriteTxn::observeAndAdmit(ObjectKind kind, const BlobRef & ref, con
         e.outcome = "adopt";
         e.reason = "observed token not condemned (meta point-read); adopted the live incarnation (no bytes moved)";
     });
-    deps[ref] = DepEntry{kind, hr.token, logical_size};
-    return logical_size;
+    /// Build-neutral: RETURN the adopt dep (tokened, adopted=false) instead of folding it into `deps`.
+    return BlobDepRecord{kind, hr.token, logical_size, /*adopted=*/false};
 }
 
-void PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef & ref, const String & key, const BlobSource & source)
+BlobUploadResult PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef & ref, const String & key, const BlobSource & source) const
 {
+    /// StagingPromoted vs FreshUpload discriminator for the write-once create terminals: the source
+    /// carries a server-side-copy descriptor iff the bytes already live in an S3 staging object.
+    const BlobUploadOutcome fresh_outcome
+        = source.server_side_copy_from ? BlobUploadOutcome::StagingPromoted : BlobUploadOutcome::FreshUpload;
+
     /// INV-1 (revival-from-source): re-upload a condemned or absent object from the writer's OWN
     /// re-readable source — NEVER calls backend().get to read the dying object. W-FRESH-TAG: fresh
     /// incarnation_tag and this build's build_id so the new incarnation is owned by THIS live build
@@ -404,11 +424,11 @@ void PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef & ref, const 
     /// retryable race: convert FILE_DOESNT_EXIST → ABORTED so putBlob's bounded retry loop re-uploads
     /// from those bytes (and tree callers likewise re-create). Without this, FILE_DOESNT_EXIST escaped
     /// putBlob's ABORTED-only catch as a FATAL INSERT failure — the sibling of the gate bug.
-    auto reviveObserve = [&](const String & k_)
+    auto reviveObserve = [&](const String & k_) -> BlobDepRecord
     {
         try
         {
-            observeAndAdmit(kind, ref, k_);
+            return observeAndAdmit(kind, ref, k_);
         }
         catch (const Exception & e_)
         {
@@ -420,9 +440,10 @@ void PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef & ref, const 
         }
     };
 
-    auto recordDoneAndEmit = [&](Token tok)
+    /// Build-neutral: emit the BlobPut audit event and RETURN the fresh/resurrect dep record (tokened,
+    /// adopted=false) for the caller to compose into its `BlobUploadResult` — it folds nothing into `deps`.
+    auto makeDepAndEmit = [&](Token tok) -> BlobDepRecord
     {
-        deps[ref] = DepEntry{kind, tok, source.size};
         EventEmitter{*store}.emit([&](CasEvent & e)
         {
             e.type = CasEventType::BlobPut;
@@ -434,6 +455,7 @@ void PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef & ref, const 
             e.reason = "uploadFromSource: fresh incarnation streamed from writer's own re-readable source (INV-1)";
             e.detail = {{"size", std::to_string(source.size)}, {"build_id", u128ToHex(build_id)}};
         });
+        return BlobDepRecord{kind, tok, source.size, /*adopted=*/false};
     };
 
     /// Meta write for the RESURRECT (condemned-displacement) case: flip the now-stale Condemned meta
@@ -562,9 +584,9 @@ void PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef & ref, const 
         const PutResult res = streamIfAbsent();
         if (res.outcome == PutOutcome::Done)
         {
-            recordDoneAndEmit(res.token);
+            const BlobDepRecord dep = makeDepAndEmit(res.token);
             writeFreshMetaClean();
-            return;
+            return BlobUploadResult{ref, dep, fresh_outcome};
         }
     }
 
@@ -582,14 +604,13 @@ void PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef & ref, const 
         const PutResult res2 = streamIfAbsent();
         if (res2.outcome == PutOutcome::Done)
         {
-            recordDoneAndEmit(res2.token);
+            const BlobDepRecord dep = makeDepAndEmit(res2.token);
             writeFreshMetaClean();
-            return;
+            return BlobUploadResult{ref, dep, fresh_outcome};
         }
         /// Still 412 after the vanish-and-retry: a racing writer re-created it. Adopt their token.
         /// reviveObserve converts FILE_DOESNT_EXIST (deleted again in the window) → ABORTED (retryable).
-        reviveObserve(key);
-        return;
+        return BlobUploadResult{ref, reviveObserve(key), BlobUploadOutcome::HeadMissAdopted};
     }
 
     /// The condemned decision is a per-hash META POINT-READ, not
@@ -600,8 +621,7 @@ void PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef & ref, const 
     if (!condemned)
     {
         /// Live (not condemned): adopt the current incarnation — free, no bytes moved.
-        observeAndAdmit(kind, ref, key, hr);
-        return;
+        return BlobUploadResult{ref, observeAndAdmit(kind, ref, key, hr), BlobUploadOutcome::HeadMissAdopted};
     }
 
     /// Condemned: displace the condemned incarnation with our fresh source.
@@ -640,9 +660,9 @@ void PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef & ref, const 
         store->checkFenceOrThrow(displace_admitted_generation);
         tok = store->backend().resurrectStaged(
             *source.server_side_copy_from, key, fresh_header, meta.blob_header_len);
-        recordDoneAndEmit(tok);
+        const BlobDepRecord dep = makeDepAndEmit(tok);
         writeResurrectMetaClean(lm);
-        return;
+        return BlobUploadResult{ref, dep, BlobUploadOutcome::ResurrectedS3};
     }
 
     /// CRITICAL: we re-read the writer's OWN source (NOT backend().get) — no GET of the dying object.
@@ -670,9 +690,9 @@ void PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef & ref, const 
     overwrite_res = store->backend().putOverwrite(key, overwrite_body, hr.token);
     if (overwrite_res.outcome == PutOutcome::Done)
     {
-        recordDoneAndEmit(overwrite_res.token);
+        const BlobDepRecord dep = makeDepAndEmit(overwrite_res.token);
         writeResurrectMetaClean(lm);
-        return;
+        return BlobUploadResult{ref, dep, BlobUploadOutcome::ResurrectedLocal};
     }
     /// PreconditionFailed from putOverwrite: either a racing writer displaced the condemned token
     /// before us (their fresh token doesn't match hr.token), OR GC deleted the object between our
@@ -685,18 +705,17 @@ void PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef & ref, const 
             const PutResult res3 = streamIfAbsent();
             if (res3.outcome == PutOutcome::Done)
             {
-                recordDoneAndEmit(res3.token);
+                const BlobDepRecord dep = makeDepAndEmit(res3.token);
                 writeFreshMetaClean();
-                return;
+                return BlobUploadResult{ref, dep, fresh_outcome};
             }
             /// Still 412 — a racing writer re-created it. Observe their token.
             /// reviveObserve converts FILE_DOESNT_EXIST (deleted again in the window) → ABORTED (retryable).
-            reviveObserve(key);
-            return;
+            return BlobUploadResult{ref, reviveObserve(key), BlobUploadOutcome::HeadMissAdopted};
         }
         /// Present with a different token — a racing writer displaced the condemned incarnation.
         /// Adopt their token (or throw ABORTED if it too is condemned — bounded by caller loop).
-        observeAndAdmit(kind, ref, key, hr2);
+        return BlobUploadResult{ref, observeAndAdmit(kind, ref, key, hr2), BlobUploadOutcome::HeadMissAdopted};
     }
 }
 
@@ -713,14 +732,14 @@ void PartWriteTxn::adoptEvidence(const ManifestEntry & entry)
         /// Carry `entry.ref` WHOLE (the pair, never re-derived) — this is what makes a
         /// mixed-algo manifest's entries each dep-track under their OWN algo. §4: adopted=true marks this a
         /// committed-source W-EVIDENCE dep, trusted at promote via the durable manifest edge (no probe).
-        deps[entry.ref] = DepEntry{ObjectKind::Blob, std::nullopt, entry.blob_size, /*adopted=*/true};
+        deps[entry.ref] = BlobDepRecord{ObjectKind::Blob, std::nullopt, entry.blob_size, /*adopted=*/true};
     }
 }
 
 void PartWriteTxn::recordPendingBlobDep(const BlobRef & ref, uint64_t size)
 {
     requireAlive();
-    deps[ref] = DepEntry{ObjectKind::Blob, std::nullopt, size};
+    deps[ref] = BlobDepRecord{ObjectKind::Blob, std::nullopt, size};
 }
 
 RootNamespace PartWriteTxn::manifestNamespace() const
