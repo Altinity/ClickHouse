@@ -1015,6 +1015,12 @@ BlockIO InterpreterSystemQuery::execute()
         }
         case Type::CONTENT_ADDRESSED_GC_RUN:
         {
+            /// A manual GC RUN executes REGARDLESS of SYSTEM CONTENT ADDRESSED GC STOP: STOP pauses only the
+            /// background PACER, not the GC engine, so an explicit operator round still runs (explicit intent
+            /// wins). A round that acquires the lease sets the disk's in-process is_leader=true, which its
+            /// introspection can surface transiently even while the background scheduler stays stopped —
+            /// until a peer mounter steals the lease or GC START resumes pacing. This is truthful (the round
+            /// DID lead) and harmless (no background thread acts on it while stopped).
             getContext()->checkAccess(AccessType::SYSTEM_CONTENT_ADDRESSED_GC_RUN);
             result = runContentAddressedGcRun(query.disk);
             break;

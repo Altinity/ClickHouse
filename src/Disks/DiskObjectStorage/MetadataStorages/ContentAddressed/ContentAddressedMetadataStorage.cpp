@@ -1106,9 +1106,12 @@ CasOpAdmission ContentAddressedMetadataStorage::checkOpAdmitted(CasOpClass op) c
     if (lc == Cas::PoolLifecycle::TransientNotLive)
         /// A lease blip: uncertain but AUTO-RECOVERING. No class but Factory proceeds; one uniform 668
         /// ("temporarily unreachable"). `IdentityLost` gets its own richer message below -- it does NOT
-        /// auto-recover, so "temporarily unreachable" would misdiagnose it.
+        /// auto-recover, so "temporarily unreachable" would misdiagnose it. The wait-and-retry guidance is
+        /// actionable for every caller here, and specifically for `SYSTEM CONTENT ADDRESSED GC START` run
+        /// mid-recovery by an operator who STOPped GC pre-maintenance: this is a wait, not a dead end.
         throw Exception(ErrorCodes::INVALID_STATE,
-            "content-addressed disk '{}' -- mount lease not held; backing may be temporarily unreachable",
+            "content-addressed disk '{}' -- mount lease not held; backing may be temporarily unreachable; "
+            "retry once the disk recovers to Live",
             disk_name);
 
     /// `IdentityLost` and the terminal `Vanished*` states carry the typed per-reason [D5] message the pool
