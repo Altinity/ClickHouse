@@ -616,6 +616,9 @@ implemented is net-negative — disable/quarantine rather than fix one virtual a
 
 
 ## Operator assertion for natural Vanished(erased) + GC-quiescent wiring (land TOGETHER) {#erased-capability-operator-assertion}
+
+> **OBSOLETE (2026-07-23): FORGET-only v1 decision** — the natural `Vanished(erased)` proof stack is excised entirely (spec rev.8 §9); no capability assertion is needed. Kept for history; the v2 door is the git history of the reviewed implementation.
+
 (REWRITTEN 2026-07-23 per the whole-increment review I3 — the earlier text was stale AND instructed the
 predicate rev-t8 adjudicated WRONG.) `gc_quiescent_fn` is ALREADY wired (Task 8: `openPoolView` →
 `gcQuiescentForErasureProof`, correctly "no round in flight" — NOT "stopped+no round", which would make

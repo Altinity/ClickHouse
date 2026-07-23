@@ -82,6 +82,10 @@ These are the load-bearing facts, most discovered the hard way:
   **the refs/manifests/blobs may be fully intact.** Treating any of them as "data erased" and answering
   probes benign-absent silently skips real reclaim (permanent ref leak) or loads an empty table.
   *(The false assumption that sank Path B.)*
+- *(rev.8 disposition, 2026-07-23: the "positively-established" branch is realized ONLY as operator
+  assertion (`FORGET`) and foreign-`pool_id` proof (`replaced`). The automatic pool-wide-emptiness proof was
+  fully designed, implemented, reviewed and then EXCISED by owner decision — a scope call ("чем меньше кода
+  тем лучше"), not an impossibility; its reviewed implementation lives in git history as the v2 door.)*
 - **C2 — benign-absent is only safe for a POSITIVELY-established "data erased" state.** There is no cheap,
   non-racy positive signal for "the pool's data is really gone" on an arbitrary backend (a LIST can be
   transiently empty or eventually-consistent). Any not-mounted state that is not provably data-erased must
