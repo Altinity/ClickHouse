@@ -614,7 +614,7 @@ inline void seedPoolMetaForRestart(DB::Cas::Backend & backend, const String & po
 {
     DB::Cas::PoolMeta::createOrValidate(
         backend, DB::Cas::Layout(pool_prefix), /*blob_header_len=*/256,
-        DB::Cas::BlobHashAlgo::CityHash128, /*allow_new=*/false);
+        DB::Cas::BlobHashAlgo::CityHash128, /*allow_new=*/false, /*allow_mint=*/true);
 }
 
 /// Write a blob object (envelope + payload) addressed by `hash`, so a HEAD returns a token. The bytes

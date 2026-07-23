@@ -339,7 +339,8 @@ TEST(CasPoolMeta, CreateThenReopen)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout layout("p");
-    PoolMeta created = PoolMeta::createOrValidate(*b, layout, /*blob_header_len*/ 256);
+    PoolMeta created = PoolMeta::createOrValidate(*b, layout, /*blob_header_len*/ 256,
+        BlobHashAlgo::CityHash128, /*allow_new*/ false, /*allow_mint*/ true);
     EXPECT_NE(created.pool_id, UInt128{});
     PoolMeta reopened = PoolMeta::createOrValidate(*b, layout, /*blob_header_len*/ 512);
     EXPECT_EQ(reopened.pool_id, created.pool_id);     /// pool is authoritative — config ignored on reopen
@@ -481,7 +482,8 @@ TEST(CasPoolMeta, CasConflictReReadsWinner)
     Layout layout("p");
 
     /// Our config (512) is what we WOULD have minted, but we lose the race and inherit the winner.
-    PoolMeta result = PoolMeta::createOrValidate(*b, layout, /*blob_header_len*/ 512);
+    PoolMeta result = PoolMeta::createOrValidate(*b, layout, /*blob_header_len*/ 512,
+        BlobHashAlgo::CityHash128, /*allow_new*/ false, /*allow_mint*/ true);
     EXPECT_EQ(result.pool_id, winner);
     EXPECT_EQ(result.blob_header_len, 256u);
 }

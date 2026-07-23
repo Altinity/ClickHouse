@@ -43,10 +43,14 @@ struct PoolMeta
     /// `_pool_meta` then fails closed with `INVALID_STATE` instead of silently minting (which, on an
     /// observe scan over a partially-erased pool, would poison the next writable mount). The validate path
     /// (meta already present) never consults it.
+    ///
+    /// Defaults to `false` — a safety gate must fail CLOSED when a caller leaves it unstated, so a future
+    /// pool-lifecycle entry point cannot silently re-arm the observe-mint footgun by omission. The two
+    /// production callers pass it explicitly; only test minting sites opt in with `allow_mint=true`.
     static PoolMeta createOrValidate(
         Backend &, const Layout &, uint64_t blob_header_len,
         BlobHashAlgo blob_hash_algo = BlobHashAlgo::CityHash128, bool allow_new = false,
-        bool allow_mint = true);
+        bool allow_mint = false);
 };
 
 /// Serializes valid pool metadata as the versioned `_pool_meta` text object. The output includes the

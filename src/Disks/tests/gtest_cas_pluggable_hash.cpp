@@ -89,7 +89,7 @@ TEST(CasPluggableHash, CreateOrValidateRecordsConfigAlgoOnFreshPool)
     auto backend = std::make_shared<InMemoryBackend>();
     const Layout layout("p");
 
-    const PoolMeta pm = PoolMeta::createOrValidate(*backend, layout, /*blob_header_len*/ 256, BlobHashAlgo::XXH3_128);
+    const PoolMeta pm = PoolMeta::createOrValidate(*backend, layout, /*blob_header_len*/ 256, BlobHashAlgo::XXH3_128, /*allow_new*/ false, /*allow_mint*/ true);
     EXPECT_EQ(pm.algos_used, (std::vector<uint8_t>{static_cast<uint8_t>(BlobHashAlgo::XXH3_128)}));
 
     /// Reopening with the SAME algo is a no-op reopen: the recorded value comes back unchanged.
@@ -103,7 +103,7 @@ TEST(CasPluggableHash, CreateOrValidateDefaultsToCityHash128)
     auto backend = std::make_shared<InMemoryBackend>();
     const Layout layout("p");
 
-    const PoolMeta pm = PoolMeta::createOrValidate(*backend, layout, 256, BlobHashAlgo::CityHash128);
+    const PoolMeta pm = PoolMeta::createOrValidate(*backend, layout, 256, BlobHashAlgo::CityHash128, /*allow_new*/ false, /*allow_mint*/ true);
     EXPECT_EQ(pm.algos_used, (std::vector<uint8_t>{static_cast<uint8_t>(BlobHashAlgo::CityHash128)}));
 }
 
@@ -116,7 +116,7 @@ TEST(CasPluggableHash, CreateOrValidateFailsClosedOnAlgoMismatchWithoutFlag)
     auto backend = std::make_shared<InMemoryBackend>();
     const Layout layout("p");
 
-    PoolMeta::createOrValidate(*backend, layout, 256, BlobHashAlgo::CityHash128);
+    PoolMeta::createOrValidate(*backend, layout, 256, BlobHashAlgo::CityHash128, /*allow_new*/ false, /*allow_mint*/ true);
 
     expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS, [&]
     {
@@ -135,7 +135,7 @@ TEST(CasPluggableHash, AdmissionIsFlagGated)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     const Layout layout("p");
-    PoolMeta::createOrValidate(*backend, layout, 256, BlobHashAlgo::CityHash128, /*allow_new*/ false);
+    PoolMeta::createOrValidate(*backend, layout, 256, BlobHashAlgo::CityHash128, /*allow_new*/ false, /*allow_mint*/ true);
 
     /// without the flag: refuse, pool untouched
     expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS, [&]
@@ -154,7 +154,7 @@ TEST(CasPluggableHash, ConcurrentAdmissionUnions)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     const Layout layout("p");
-    PoolMeta::createOrValidate(*backend, layout, 256, BlobHashAlgo::CityHash128, false);
+    PoolMeta::createOrValidate(*backend, layout, 256, BlobHashAlgo::CityHash128, false, /*allow_mint*/ true);
     PoolMeta::createOrValidate(*backend, layout, 256, BlobHashAlgo::XXH3_128, true);
     PoolMeta::createOrValidate(*backend, layout, 256, BlobHashAlgo::Sha256, true);
     const PoolMeta final_pm = PoolMeta::createOrValidate(*backend, layout, 256, BlobHashAlgo::CityHash128, false);
@@ -661,7 +661,7 @@ TEST(CasPluggableHash, ReaderGenerationIsRaisedToThree)
     {
         auto backend = std::make_shared<InMemoryBackend>();
         const Layout layout("p");
-        PoolMeta pm = PoolMeta::createOrValidate(*backend, layout, /*blob_header_len*/ 256, BlobHashAlgo::CityHash128);
+        PoolMeta pm = PoolMeta::createOrValidate(*backend, layout, /*blob_header_len*/ 256, BlobHashAlgo::CityHash128, /*allow_new*/ false, /*allow_mint*/ true);
         pm.min_reader_generation = G_BUILD + 1;
         ASSERT_TRUE(backend->casPut(layout.poolMetaKey(), encodePoolMeta(pm), backend->get(layout.poolMetaKey())->token).outcome == CasOutcome::Committed);
 
@@ -677,7 +677,7 @@ TEST(CasPluggableHash, ReaderGenerationIsRaisedToThree)
     {
         auto backend = std::make_shared<InMemoryBackend>();
         const Layout layout("p");
-        PoolMeta pm = PoolMeta::createOrValidate(*backend, layout, /*blob_header_len*/ 256, BlobHashAlgo::CityHash128);
+        PoolMeta pm = PoolMeta::createOrValidate(*backend, layout, /*blob_header_len*/ 256, BlobHashAlgo::CityHash128, /*allow_new*/ false, /*allow_mint*/ true);
         const String fresh_bytes = encodePoolMeta(pm);
 
         const String from = "\"v\":" + std::to_string(G_BUILD);
