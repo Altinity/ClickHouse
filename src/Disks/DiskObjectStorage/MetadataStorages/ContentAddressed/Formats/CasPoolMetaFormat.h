@@ -35,9 +35,18 @@ struct PoolMeta
     /// size and records this build's reader-generation floor. Reopen ignores the supplied header size,
     /// because changing it would move the blob payload offset for existing objects; a new hash algorithm
     /// is rejected unless `allow_new` is set, and concurrent admission is retried from fresh metadata.
+    ///
+    /// `allow_mint` (spec §2 [C4][D2]) gates the create-if-absent path: minting a fresh `_pool_meta` is a
+    /// consequential write that establishes a brand-new pool identity, so it is permitted ONLY on the
+    /// writable startup path that has just passed the zero-write residual proof (`Pool::open`). Every
+    /// non-bootstrap caller — a read-only/observe open, `openForDecommission` — passes `false`; an absent
+    /// `_pool_meta` then fails closed with `INVALID_STATE` instead of silently minting (which, on an
+    /// observe scan over a partially-erased pool, would poison the next writable mount). The validate path
+    /// (meta already present) never consults it.
     static PoolMeta createOrValidate(
         Backend &, const Layout &, uint64_t blob_header_len,
-        BlobHashAlgo blob_hash_algo = BlobHashAlgo::CityHash128, bool allow_new = false);
+        BlobHashAlgo blob_hash_algo = BlobHashAlgo::CityHash128, bool allow_new = false,
+        bool allow_mint = true);
 };
 
 /// Serializes valid pool metadata as the versioned `_pool_meta` text object. The output includes the

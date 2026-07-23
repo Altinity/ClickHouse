@@ -423,8 +423,14 @@ PoolPtr Pool::open(BackendPtr backend, PoolConfig config)
             backend->checkConditionalWriteSingleAttemptSupport();
         }
     }
+    /// `allow_mint` = writable open only: a writable `Pool::open` reaches here having just passed the
+    /// zero-write residual proof above, so minting a missing `_pool_meta` is safe. A read-only/observe
+    /// open never ran that proof (and there is no truly-read-only backend — `openPoolView` opens the same
+    /// writable object storage and only sets `read_only`), so it must NEVER mint: an absent meta fails
+    /// closed instead (spec §2 [C4][D2]).
     PoolMeta meta = PoolMeta::createOrValidate(
-        *backend, layout, config.blob_header_len, config.blob_hash_algo, config.blob_hash_allow_new);
+        *backend, layout, config.blob_header_len, config.blob_hash_algo, config.blob_hash_allow_new,
+        /*allow_mint=*/!config.read_only);
     const BlobHashAlgo write_algo = config.blob_hash_algo;   /// `config` is moved-from just below
 
     /// Private ctor: make_shared cannot reach it.
@@ -705,8 +711,13 @@ PoolPtr Pool::openForDecommission(BackendPtr backend, PoolConfig config, const S
     config.server_id = *victim_uuid;
 
     backend->checkConditionalWriteSingleAttemptSupport();
+    /// Decommission operates on an EXISTING pool member (an owner anchor / mount lease was just found), so
+    /// `_pool_meta` must already be present. It never bootstraps: `allow_mint=false` so an absent meta
+    /// (a partially-erased pool whose owner anchor survives) fails closed with INVALID_STATE rather than
+    /// minting a fresh identity here (spec §2 [C4][D2]).
     PoolMeta meta = PoolMeta::createOrValidate(
-        *backend, layout, config.blob_header_len, config.blob_hash_algo, config.blob_hash_allow_new);
+        *backend, layout, config.blob_header_len, config.blob_hash_algo, config.blob_hash_allow_new,
+        /*allow_mint=*/false);
     const BlobHashAlgo write_algo = config.blob_hash_algo;   /// `config` is moved-from just below
 
     /// Private ctor: make_shared cannot reach it.

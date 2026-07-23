@@ -11,6 +11,7 @@ namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
     extern const int LOGICAL_ERROR;
+    extern const int INVALID_STATE;
 }
 }
 
@@ -104,7 +105,7 @@ PoolMeta admitOrValidate(Backend & backend, const String & key, PoolMeta pm, Tok
 
 PoolMeta PoolMeta::createOrValidate(
     Backend & backend, const Layout & layout, uint64_t blob_header_len,
-    BlobHashAlgo blob_hash_algo, bool allow_new)
+    BlobHashAlgo blob_hash_algo, bool allow_new, bool allow_mint)
 {
     /// The passed config is the caller's responsibility — reject bad values before any I/O.
     validatePoolBlobHeaderLen(blob_header_len, ErrorCodes::BAD_ARGUMENTS, "pool meta");
@@ -127,13 +128,19 @@ PoolMeta PoolMeta::createOrValidate(
     /// build at all), so the reader-generation floor is stamped at THIS build's `G_BUILD` at
     /// creation, not left at 0.
     ///
-    /// BOOTSTRAP PRECONDITION (spec §2 [C4][D2]): this create-if-absent path may run ONLY after the
-    /// caller has proven the pool prefix genuinely empty. `Pool::open` runs that zero-write residual
-    /// check (`probePoolBootstrapResidual`) BEFORE the mutating `_probe/` capability battery — it cannot
-    /// live here, because by the time `createOrValidate` runs the battery has already written `_probe/`
-    /// debris, so an emptiness check here would false-positive on that debris. `pool_prefix` is
-    /// exclusively CAS-owned; a missing `_pool_meta` over residual data fails startup at that check
-    /// (INVALID_STATE), never reaching this mint.
+    /// BOOTSTRAP GATE (spec §2 [C4][D2]): minting is permitted ONLY on the verified bootstrap path. A
+    /// non-bootstrap caller (a read-only/observe open, `openForDecommission`) passes `allow_mint=false`
+    /// and fails closed here — never minting a fresh identity outside that path (an observe scan that
+    /// minted would poison the next writable mount's residual check). The residual EMPTINESS proof itself
+    /// cannot live here: it must precede ANY write (spec's "zero-write residual check FIRST, before ANY
+    /// probe write"), and by the time `createOrValidate` runs the capability battery has already written
+    /// to the prefix, so `Pool::open` runs `probePoolBootstrapResidual` up front and only then passes
+    /// `allow_mint=true`. `pool_prefix` is exclusively CAS-owned.
+    if (!allow_mint)
+        throw Exception(ErrorCodes::INVALID_STATE,
+            "CAS pool meta: _pool_meta absent — refusing to mint outside the verified bootstrap path; "
+            "run a writable mount (or recreate the pool)");
+
     PoolMeta pm;
     pm.pool_id = mintPoolId();
     pm.blob_header_len = blob_header_len;

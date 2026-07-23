@@ -1,4 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasSentinelProbe.h>
+#include <Common/Exception.h>
+#include <Common/logger_useful.h>
 
 namespace DB::Cas
 {
@@ -63,7 +65,13 @@ BootstrapResidual probePoolBootstrapResidual(Backend & backend, const Layout & l
     }
     catch (...)
     {
-        /// The LIST failed: absence was never proven. Never mint a fresh identity under uncertainty.
+        /// The LIST failed: absence was never proven. Never mint a fresh identity under uncertainty —
+        /// but log the swallowed error so the fail-closed startup refusal is diagnosable (the root cause
+        /// must not vanish just because the verdict is "Indeterminate").
+        LOG_WARNING(getLogger("CasBootstrap"),
+            "Pool prefix '{}': the authoritative residual LIST failed; treating the bootstrap as "
+            "Indeterminate (fail-closed, will refuse to mint _pool_meta): {}",
+            prefix, getCurrentExceptionMessage(/*with_stacktrace=*/false));
         return BootstrapResidual::Indeterminate;
     }
     return has_residual ? BootstrapResidual::ResidualWithoutMeta : BootstrapResidual::EmptyOrProbeOnly;

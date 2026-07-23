@@ -265,3 +265,68 @@ TEST(CasBootstrapOrdering, ProbeSiblingLookalikeIsResidualNotDebris)
     EXPECT_EQ(backend->writeCount(), 0u);
     EXPECT_FALSE(backend->get(kPoolMetaKey).has_value());
 }
+
+/// (g) An OBSERVE / read-only open over a partially-erased pool (residual data, `_pool_meta` deleted)
+/// must NOT mint a fresh `_pool_meta` — there is no truly-read-only backend, so a mint here is a real
+/// write that would poison the next writable mount's residual check. It fails closed (typed INVALID_STATE)
+/// with ZERO writes. The read-only path skips the residual check, so the fail-closed gate lives in
+/// `createOrValidate` (`allow_mint=false`).
+TEST(CasBootstrapOrdering, ReadOnlyOverResidualWithoutMetaFailsClosedNoMint)
+{
+    auto backend = std::make_shared<RecordingBackend>();
+    ASSERT_EQ(backend->putIfAbsent("p/cas/refs/test%2Fabcd/_log/0000000000000001-0000000000000001.zst", "x").outcome,
+              PutOutcome::Done);
+    backend->clearLog();
+
+    PoolConfig cfg = makeConfig();
+    cfg.read_only = true;
+    expectThrowsCodeContaining(DB::ErrorCodes::INVALID_STATE, "refusing to mint outside the verified bootstrap path",
+                               [&] { Pool::open(backend, cfg); });
+
+    EXPECT_EQ(backend->writeCount(), 0u) << "an observe open must never write (least of all mint _pool_meta)";
+    EXPECT_FALSE(backend->get(kPoolMetaKey).has_value());
+}
+
+/// (h) An observe / read-only open over a HEALTHY pool (meta present) is unchanged: it validates the
+/// existing `_pool_meta` and succeeds, preserving the pool identity. `allow_mint=false` is never consulted
+/// on the validate path.
+TEST(CasBootstrapOrdering, ReadOnlyOverHealthyPoolSucceedsUnchanged)
+{
+    auto backend = std::make_shared<RecordingBackend>();
+    UInt128 pool_id_first;
+    {
+        PoolPtr store = Pool::open(backend, makeConfig());   /// writable: creates _pool_meta
+        pool_id_first = store->poolMeta().pool_id;
+    }
+
+    PoolConfig cfg = makeConfig();
+    cfg.read_only = true;
+    PoolPtr ro;
+    ASSERT_NO_THROW(ro = Pool::open(backend, cfg));
+    ASSERT_TRUE(ro);
+    EXPECT_EQ(ro->poolMeta().pool_id, pool_id_first) << "an observe open over a healthy pool must not re-mint";
+}
+
+/// (i) `openForDecommission` over a pool whose `_pool_meta` is absent but whose owner anchor survives (a
+/// partial erase) must NOT bootstrap a fresh identity — it fails closed (typed INVALID_STATE) with no
+/// mint. Decommission operates on an existing member; a missing meta is a broken state, not a bootstrap.
+TEST(CasBootstrapOrdering, DecommissionWithAbsentMetaFailsClosedNoMint)
+{
+    auto backend = std::make_shared<RecordingBackend>();
+    {
+        PoolPtr store = Pool::open(backend, makeConfig());   /// establishes owner anchor + _pool_meta
+    }
+    /// Delete only `_pool_meta`, leaving the owner anchor (and other control objects) behind.
+    {
+        const auto h = backend->head(kPoolMetaKey);
+        ASSERT_TRUE(h.exists);
+        ASSERT_EQ(backend->deleteExact(kPoolMetaKey, h.token).kind, DeleteOutcome::Kind::Deleted);
+    }
+    backend->clearLog();
+
+    expectThrowsCodeContaining(DB::ErrorCodes::INVALID_STATE, "refusing to mint outside the verified bootstrap path",
+                               [&] { Pool::openForDecommission(backend, makeConfig(), kSrid); });
+
+    EXPECT_EQ(backend->writeCount(), 0u) << "decommission must not mint a fresh _pool_meta";
+    EXPECT_FALSE(backend->get(kPoolMetaKey).has_value());
+}
