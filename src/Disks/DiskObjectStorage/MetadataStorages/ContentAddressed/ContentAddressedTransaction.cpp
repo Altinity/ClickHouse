@@ -18,9 +18,23 @@
 #include <Common/HashTable/Hash.h>
 #include <Common/getRandomASCIIString.h>
 #include <Common/logger_useful.h>
+#include <Common/ProfileEvents.h>
+#include <Common/ThreadPool.h>
+#include <Common/setThreadName.h>
+#include <Common/threadPoolCallbackRunner.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobUploadPool.h>
 #include <base/hex.h>
 #include <base/scope_guard.h>
 #include <ctime>
+#include <map>
+#include <span>
+#include <vector>
+
+namespace ProfileEvents
+{
+    extern const Event CasBlobUploadFanoutBatches;
+    extern const Event CasBlobUploadFanoutTasks;
+}
 
 namespace fs = std::filesystem;
 
@@ -250,20 +264,23 @@ void ContentAddressedTransaction::uploadPendingBlobs(PartStaging & st)
         if (entry.placement == Cas::EntryPlacement::Blob)
             referenced_hashes.insert(entry.ref);
 
-    for (const auto & pb : st.pending_blobs)         /// pool writes — uploads + 412/HEAD/resurrect
+    /// Build one upload request per referenced pending blob. Duplicate refs (staged-hardlink copies push
+    /// a copy of the record) are collapsed by `fanOutBlobUploads`' grouping, which SUBSUMES the former
+    /// duplicate-membership filter here — the fan-out launches one task per unique ref and merges one
+    /// dep. The upload primitive differs by staging backend exactly as before:
+    ///   - `Cas::StagingBackend::Local`: `write_payload` re-reads the local staged temp file and streams
+    ///     it into a write-once `putIfAbsentStream` create; the local-staging path remains byte-for-byte
+    ///     compatible with its previous behavior.
+    ///   - `Cas::StagingBackend::S3`: the bytes already live in an S3 staging object (`pb.staging_key`);
+    ///     `server_side_copy_from` drives a WRITE-ONCE conditional SERVER-SIDE COPY (and an unconditional
+    ///     resurrect copy FROM the staging object for a condemned incarnation). No local read-back —
+    ///     `write_payload` is left unset.
+    std::vector<Cas::BlobUploadRequest> requests;
+    requests.reserve(st.pending_blobs.size());
+    for (const auto & pb : st.pending_blobs)
     {
         if (!referenced_hashes.contains(pb.ref))
             continue;   /// The entry was removed by unlinkFile/replaceFile; skip this orphan.
-        /// Each pending blob
-        /// is promoted through the SAME condemn/resurrect gate in `PartWriteTxn::putBlob`. Only the upload
-        /// primitive differs by staging backend:
-        ///   - `Cas::StagingBackend::Local`: `write_payload` re-reads the local staged temp file and streams
-        ///     it into a write-once `putIfAbsentStream` create; the local-staging path remains
-        ///     byte-for-byte compatible with its previous behavior.
-        ///   - `Cas::StagingBackend::S3`: the bytes already live in an S3 staging object (`pb.staging_key`);
-        ///     `server_side_copy_from` drives a WRITE-ONCE conditional SERVER-SIDE COPY (and an
-        ///     unconditional resurrect copy FROM the staging object for a condemned incarnation). No
-        ///     local read-back — `write_payload` is left unset.
         Cas::BlobSource source;
         source.size = pb.size;
         if (pb.backend == Cas::StagingBackend::S3)
@@ -279,8 +296,18 @@ void ContentAddressedTransaction::uploadPendingBlobs(PartStaging & st)
                 copyData(in, out);
             };
         }
-        st.build->putBlob(pb.ref, std::move(source));
+        /// `declared_size` mirrors `source.size` (both are `pb.size`); the fan-out fail-closes if they
+        /// ever diverge, so build them together from the one authority.
+        requests.push_back(Cas::BlobUploadRequest{pb.ref, std::move(source), pb.size});
     }
+
+    if (requests.empty())
+        return;
+
+    /// Fan out the uploads on the server-wide pool (spec §1). The fan-out enforces
+    /// one-task-per-unique-ref grouping, the merge-nothing failure contract, and merges every result
+    /// into `st.build`'s dep set on THIS (the owning writer) thread after the join.
+    Cas::fanOutBlobUploads(*st.build, requests, Cas::blobUploadPool());
 }
 
 void ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, const std::string & ref, PartStaging & st,
@@ -1603,6 +1630,87 @@ size_t clampCasWriteBufferSize(size_t size)
     return std::min(size, kMaxCasWriteBufferBytes);
 }
 }
+
+void fanOutBlobUploads(
+    PartWriteTxn & build,
+    std::span<const BlobUploadRequest> requests,
+    ThreadPool & pool,
+    const BlobUploadFanoutHooksForTest * hooks)
+{
+    /// Group by unique ref. Staged-hardlink copies push a DUPLICATE pending-blob record for one BlobRef,
+    /// and the fan-out must launch exactly ONE task per unique ref (spec §1 "One task per unique ref").
+    /// An ordered map gives a DETERMINISTIC dispatch order (ascending `BlobRef`), which fixes the "first
+    /// error" of the merge-nothing contract to a stable task so a failure is reproducible.
+    std::map<BlobRef, BlobUploadRequest> grouped;
+    for (const auto & req : requests)
+    {
+        /// Fail-close: the fan-out groups and conflict-checks on `declared_size`, while `source.size` is
+        /// the per-attempt streaming byte authority. A wiring bug that let them diverge would group on
+        /// one value while streaming another — reject it rather than upload a wrong-length body.
+        if (req.declared_size != req.source.size)
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "fanOutBlobUploads: request for {} declares size {} but its source is sized {} -- the "
+                "grouping key and the streaming byte authority must agree",
+                blobIdOf(req.ref), req.declared_size, req.source.size);
+        const auto [it, inserted] = grouped.try_emplace(req.ref, req);
+        if (!inserted && it->second.declared_size != req.declared_size)
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "fanOutBlobUploads: conflicting declared sizes for {} ({} vs {}) -- staged-hardlink "
+                "copies of one ref must agree on size (one task, one dep per unique ref)",
+                blobIdOf(req.ref), it->second.declared_size, req.declared_size);
+    }
+
+    if (grouped.empty())
+        return;
+
+    ProfileEvents::increment(ProfileEvents::CasBlobUploadFanoutBatches);
+
+    /// One result slot per unique ref, pre-sized so element addresses are STABLE: each task writes ONLY
+    /// its own slot (no data race on the vector) and the vector never reallocates. Declared BEFORE the
+    /// runner so it OUTLIVES it — the runner's destructor joins every task before `results` is destroyed
+    /// on EVERY path, including a throw raised during the dispatch loop below (the B90 lesson,
+    /// `threadPoolCallbackRunner.h:68`). Tasks capture only owning/value state: a stable slot pointer,
+    /// the request by value (its source is captured by value too), and the txn pointer whose pointee
+    /// outlives the runner.
+    std::vector<BlobUploadResult> results(grouped.size());
+
+    {
+        /// `pool` is disjoint from the S3 writer pool an upload may itself use, and the calling thread
+        /// only submits and joins — it never occupies a pool slot — so a size-1 pool degenerates to a
+        /// correct serial run and can never deadlock. `ThreadName::UNKNOWN`: stage-1 must not add a
+        /// CAS-specific `ThreadName` to the shared enum (`setThreadName.h` is outside the allowed file
+        /// set), and UNKNOWN is the no-op name; it also stays clear of the pool-thread self-join
+        /// assertions in `CasPool`. The query `ThreadGroup` is still propagated per task by the runner.
+        ThreadPoolCallbackRunnerLocal<void> runner(pool, ThreadName::UNKNOWN);
+        const PartWriteTxn * txn = &build;   /// `uploadBlobDetached` is const + build-neutral: safe off-thread
+        size_t idx = 0;
+        for (const auto & [ref, req] : grouped)
+        {
+            BlobUploadResult * slot = &results[idx++];
+            BlobUploadRequest task_req = req;
+            const BlobUploadFanoutHooksForTest * task_hooks = hooks;
+            if (hooks && hooks->on_dispatch)
+                hooks->on_dispatch(ref);   /// may throw ⇒ runner destructor drains already-scheduled tasks
+            runner.enqueueAndKeepTrack([slot, txn, req_by_value = std::move(task_req), task_hooks]
+            {
+                if (task_hooks && task_hooks->in_task)
+                    task_hooks->in_task(req_by_value.ref);
+                *slot = txn->uploadBlobDetached(req_by_value);
+            });
+            ProfileEvents::increment(ProfileEvents::CasBlobUploadFanoutTasks);
+        }
+        /// Drain ALL tasks, then rethrow the FIRST (ascending-ref dispatch order) that failed. A rethrow
+        /// bypasses the merge below, so NOTHING is merged: `build` stays at its pre-fan-out pending-dep
+        /// state (merge-nothing). If the dispatch loop above threw, the runner's destructor — running as
+        /// this scope unwinds — drains every already-scheduled task before the stack leaves this frame.
+        runner.waitForAllToFinishAndRethrowFirstError();
+    }
+
+    /// Every task succeeded (else we rethrew above): fold all results into `build` on this (the owning
+    /// writer) thread, all-or-nothing (`mergeBlobUploadResults` prevalidates, then build-and-swaps).
+    build.mergeBlobUploadResults(results);
+}
+
 
 CaContentWriteBuffer::CaContentWriteBuffer(
     std::string temp_dir,

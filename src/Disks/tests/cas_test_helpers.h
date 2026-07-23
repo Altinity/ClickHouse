@@ -18,6 +18,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobUploadPool.h>
 #include <Common/Exception.h>
 #include <Common/thread_local_rng.h>
 
@@ -50,6 +51,18 @@ namespace DB::ContentAddressedSetting
 
 namespace DB::Cas::tests
 {
+
+/// Bring up the server-wide blob upload pool (stage-1 §1) if it is not already up, so any test that
+/// drives a `ContentAddressedTransaction` commit -- whose `uploadPendingBlobs` fans out on this pool --
+/// finds it initialized. ROBUST (init-if-not-initialized, NOT `call_once`): the raw-lifecycle suite in
+/// `gtest_cas_blob_upload_pool.cpp` deliberately shuts the pool down, so a `call_once` helper would fail
+/// to bring it back for a later test. A global test-event listener (`gtest_cas_blob_upload_pool_env.cpp`)
+/// calls this before every test, which is what makes it robust to test ordering.
+inline void ensureBlobUploadPoolForTest(size_t size = 8)
+{
+    if (!DB::Cas::blobUploadPoolInitializedForTest())
+        DB::Cas::initializeBlobUploadPool(size);
+}
 
 /// Minimal `ContentAddressedSettings` for a direct-construction gtest fixture: sets only
 /// `server_root_id` and `scratch_path` (the two values every positional-ctor call site used to pass

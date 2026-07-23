@@ -2,8 +2,11 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/IMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBlobHashingWriteBuffer.h>
 #include <Disks/WriteMode.h>
+#include <Common/ThreadPool_fwd.h>
+#include <span>
 #include <Core/Defines.h>
 #include <IO/WriteBufferFromFile.h>
 #include <IO/WriteBufferFromFileBase.h>
@@ -236,6 +239,43 @@ namespace DB::Cas
 /// `primary.idx`, which can be large (a size-threshold inlining of small primary.idx is a follow-up).
 /// Everything else (the small eager metadata files) is an inline candidate, subject to INLINE_CAP.
 bool partFileMustStayBlob(std::string_view file_name);
+
+/// Test-only fault-injection seams for the intra-part blob-upload fan-out. Inert in production
+/// (`ContentAddressedTransaction::uploadPendingBlobs` passes `nullptr`).
+struct BlobUploadFanoutHooksForTest
+{
+    /// Invoked ONCE per DISPATCHED task, on the calling (dispatch) thread, immediately before the task
+    /// is enqueued, with the unique `BlobRef` the task will upload. Lets a test count tasks (proving the
+    /// one-task-per-unique-ref grouping) and inject a throw mid-dispatch (to prove the runner's scope
+    /// destructor drains every already-scheduled task before the stack unwinds).
+    std::function<void(const BlobRef &)> on_dispatch;
+    /// Invoked at the TOP of each pool task (on the pool thread) BEFORE `uploadBlobDetached`, with the
+    /// task's `BlobRef`. Lets a test rendezvous tasks on a latch (concurrent dedup-cache insertion, pool
+    /// saturation) or fail a specific task deterministically, all without a sleep.
+    std::function<void(const BlobRef &)> in_task;
+};
+
+/// Fan out a part's pending blob uploads across `pool` and merge the results into `build`
+/// all-or-nothing (spec §1 "Parallel blob upload within a part"). It:
+///   - groups `requests` by `BlobRef` (staged-hardlink copies push duplicate records for one ref), so
+///     it launches EXACTLY ONE `uploadBlobDetached` task per unique ref and merges exactly one dep;
+///   - rejects, before any task runs, a request whose `declared_size` disagrees with its `source.size`
+///     (a wiring bug) and duplicate records for one ref that declare conflicting sizes (a staging bug),
+///     both as `LOGICAL_ERROR`;
+///   - runs each task's `uploadBlobDetached` (a `const`, build-neutral primitive) on `pool` while the
+///     calling thread only submits and joins -- never occupying a pool slot -- so a size-1 pool
+///     degenerates to a correct serial run and can never deadlock;
+///   - honours the MERGE-NOTHING failure contract: the join always drains every task (including on a
+///     throw raised during the dispatch loop, because the runner is scoped so its destructor drains
+///     first on the unwinding path); if ANY task threw, NOTHING is merged (`build` stays byte-for-byte
+///     at its pre-fan-out state) and the FIRST task error in ascending-`BlobRef` dispatch order is
+///     rethrown.
+/// The query `ThreadGroup` is propagated to each task the `ThreadPoolCallbackRunnerLocal` way.
+void fanOutBlobUploads(
+    PartWriteTxn & build,
+    std::span<const BlobUploadRequest> requests,
+    ThreadPool & pool,
+    const BlobUploadFanoutHooksForTest * hooks = nullptr);
 
 /// Writes a CONTENT part file while computing its content hash. The blob key is only known
 /// once all bytes are written, so the buffer spills to a unique local temp file while hashing with

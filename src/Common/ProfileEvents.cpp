@@ -766,6 +766,8 @@ The server successfully detected this situation and will download merged part fr
     M(CasBlobDedupCacheHit, "Number of CAS blob presence-cache hits. Growing values indicate effective deduplication and cache reuse.", ValueType::Number) \
     M(CasBlobHeadFirst,  "Number of CAS blob uploads that try a HEAD before sending the body. Growing values indicate deduplication checks are active.", ValueType::Number) \
     M(CasBlobBodyPutAvoided, "Number of CAS blob body PUTs avoided after a HEAD found the object present. Growing values indicate saved upload traffic.", ValueType::Number) \
+    M(CasBlobUploadFanoutBatches, "Number of CAS intra-part blob-upload fan-out invocations (one per part publish that had at least one unique blob to upload). Compare with CasBlobUploadFanoutTasks for the average number of unique blobs uploaded per part.", ValueType::Number) \
+    M(CasBlobUploadFanoutTasks, "Number of CAS blob-upload tasks dispatched to the fan-out pool (one per unique blob ref across all part publishes). Duplicate references within a part collapse to one task.", ValueType::Number) \
     M(CasRefBatchFlushes, "Number of committed CAS ref-log batch flushes. Compare with CasRefBatchedMutations to assess batching efficiency.", ValueType::Number) \
     M(CasRefBatchedMutations, "Number of CAS ref mutations committed through the per-namespace batching queue. Growth indicates reference-write activity.", ValueType::Number) \
     M(CasRefBatchScopeCuts, "Number of CAS ref batches cut short by scope limits. Growing values indicate smaller batches and more write overhead.", ValueType::Number) \
