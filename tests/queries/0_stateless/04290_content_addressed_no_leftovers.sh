@@ -15,12 +15,13 @@
 #   (3) assert the count rose above baseline,
 #   (4) DROP TABLE ... SYNC so the refs are unlinked and the blobs/footers become GC fodder,
 #   (5) drain the retire pipeline deterministically via `SYSTEM CONTENT ADDRESSED GC RUN` (bounded
-#       loop on the `pending_*` gauges, NOT a fixed sleep), then `UNMOUNT` the disk (this
-#       synchronously drains and joins every CAS background thread) and run a dormant `FSCK`: a
-#       clean reachability audit reading back zero `unreachable`/`dangling` is a strictly stronger
-#       no-leftovers oracle than polling the pool directory ever was.
-# `_pool_meta` (durable single-owner marker) and the `store/` metadata tree are expected to remain;
-# `rm -rf` only happens once `UNMOUNT` has quiesced the disk.
+#       loop on the `pending_*` gauges, NOT a fixed sleep), then run `FSCK` directly on the running
+#       disk (T13): a clean reachability audit reading back zero `unreachable`/`dangling` is a
+#       strictly stronger no-leftovers oracle than polling the pool directory ever was.
+# `_pool_meta` (durable single-owner marker) and the `store/` metadata tree are expected to remain.
+# Teardown is fail-closed (spec rev.8 §5/§9): `SYSTEM CONTENT ADDRESSED FORGET` the disk (force-Vanish,
+# node-local), verify it reads `vanished(forgotten)` in system.content_addressed_mounts, and only then
+# `rm -rf` — FORGET stopped and joined every CAS background thread for this disk.
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
@@ -100,13 +101,9 @@ if [ "${PENDING}" != "0" ]; then
     exit 1
 fi
 
-# (6) UNMOUNT: synchronously drains and joins every CAS background thread for this disk (the
-#     table is already dropped above, so the live-table guard does not block it).
-$CLICKHOUSE_CLIENT --query "SYSTEM CONTENT ADDRESSED UNMOUNT '${DISK_NAME}'"
-
-# (7) FSCK is dormant-only: a reachability audit that must read back zero unreachable/dangling
-#     objects. This is a strictly stronger no-leftovers oracle than the old dir-poll, since a
-#     dormant FSCK also proves every CAS background thread for the disk has been joined.
+# (6) FSCK runs directly on the running disk (T13): a reachability audit that must read back zero
+#     unreachable/dangling objects. This is a strictly stronger no-leftovers oracle than the old
+#     dir-poll.
 $CLICKHOUSE_CLIENT --query "SYSTEM CONTENT ADDRESSED FSCK '${DISK_NAME}'" --format TSVWithNames \
     | awk -F'\t' 'NR==1 { for (i = 1; i <= NF; i++) col[$i] = i; next }
                   { print "fsck_unreachable", $col["unreachable"]; print "fsck_dangling", $col["dangling"] }'
@@ -118,4 +115,18 @@ else
     echo "pool_meta_present 0"
 fi
 
-rm -rf "${POOL_DIR:?}"   # safe now: UNMOUNT drained and joined every CAS thread for this disk
+# (7) Fail-closed teardown (spec rev.8 §5/§9): FORGET the disk (force-Vanish, node-local; the table is
+#     already dropped above), verify it reads exactly `vanished(forgotten)` in the mounts table, and
+#     only then rm. A failed FORGET or an unexpected lifecycle aborts with the pool dir left in place.
+#     FORGET logs an operator WARNING; the harness runs the client at --send_logs_level=warning, so that
+#     expected warning would stream to stderr and be flagged as a failure -- suppress it for this call.
+$CLICKHOUSE_CLIENT --allow_repeated_settings --send_logs_level=fatal \
+    --query "SYSTEM CONTENT ADDRESSED FORGET '${DISK_NAME}'" || {
+    echo "FORGET failed — leaving pool dir in place (fail-closed)"; exit 1; }
+LIFECYCLE=$($CLICKHOUSE_CLIENT --query "
+    SELECT lifecycle || '(' || lifecycle_reason || ')' FROM system.content_addressed_mounts
+    WHERE disk = '${DISK_NAME}'")
+[ "${LIFECYCLE}" = "vanished(forgotten)" ] || {
+    echo "unexpected lifecycle after FORGET: ${LIFECYCLE}"; exit 1; }
+
+rm -rf "${POOL_DIR:?}"   # safe: FORGET stopped and joined every CAS thread for this disk
