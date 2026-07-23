@@ -9,6 +9,15 @@ doc_type: 'reference'
 
 # CAS fetch-handoff retention pin — commit-before-release for relink {#cas-fetch-handoff-pin}
 
+> **SUPERSEDED (2026-07-23).** Replaced by
+> [`2026-07-23-cas-fetch-handoff-reserved-precommit-design.md`](2026-07-23-cas-fetch-handoff-reserved-precommit-design.md):
+> the same commit-before-release seal is achieved with a **reserved precommit** in the receiver's own
+> journal plus sender-side manifest materialization before part release — pure event ordering, no
+> pool-global pin objects, no GC retention overlay, no removal-deferral. The transport analysis
+> (§Motivation: half-duplex rules out sender-side ACKs) remains valid and is inherited. The shared
+> GC retention-overlay primitive (§The shared primitive) now has a single prospective consumer — the
+> read-only replica design — and should be justified there alone. Kept for history.
+
 **Date:** 2026-07-15
 **Branch:** `cas-gc-rebuild`
 **Status:** design (extracted 2026-07-15 from the read-replica spec §8.1 after the mechanism converged in
