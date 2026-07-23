@@ -153,7 +153,8 @@ public:
     /// ---- pool lifecycle condition (rev.7 §1, spec §§1-3); enum at namespace scope below ----
     /// Atomic read of the current lifecycle (acquire).
     PoolLifecycle lifecycle() const { return pool_lifecycle.load(std::memory_order_acquire); }
-    /// Whether the pool has reached one of the three fully-terminal `Vanished` values.
+    /// Whether the pool has reached one of the two fully-terminal `Vanished` values
+    /// (`VanishedReplaced` / `VanishedForgotten`).
     bool isVanished() const;
     /// Whether the terminal-intent latch (`vanished_intent`) is published — set by a natural
     /// `enterVanished`, OR EARLY (spec §5 step 1) by FORGET's `publishVanishedIntent`, and NEVER by the
@@ -201,7 +202,8 @@ public:
     /// boundary) if it is not already published, records `reason`, stores the state, then emits ONE WARN +
     /// one `CasDataRootVanished` ProfileEvent. Idempotent: the first terminal STATE transition wins (a
     /// dedicated latch keyed separately from `vanished_intent`, because FORGET publishes that intent latch
-    /// early at step 1). `which` MUST be one of the three `Vanished*` values. `reason` is retained and
+    /// early at step 1). `which` MUST be one of the two `Vanished*` values (`VanishedReplaced` or
+    /// `VanishedForgotten`). `reason` is retained and
     /// surfaced verbatim in the `VanishedForgotten` [D5] error message (see `vanishedReason`). Threads exit
     /// their own loops; the joins happen in `~Pool` for a natural transition, or synchronously in
     /// `Pool::forgetDisk` for FORGET. Must be called under the caller's remount serialization

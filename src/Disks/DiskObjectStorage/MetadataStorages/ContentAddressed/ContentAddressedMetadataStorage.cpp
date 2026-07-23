@@ -74,7 +74,7 @@ namespace ContentAddressedSetting
 namespace
 {
 /// The `lifecycle` column value for `system.content_addressed_mounts` (spec §7): the pool lifecycle
-/// condition collapsed to the operator-facing vocabulary. The three `Vanished*` sub-states all map to the
+/// condition collapsed to the operator-facing vocabulary. The two `Vanished*` sub-states both map to the
 /// bare `vanished` -- the sub-state (replaced/forgotten) lives in the `lifecycle_reason` column,
 /// so a `NULL`-free `lifecycle` stays a small, stable enumerated set.
 const char * casLifecycleToString(Cas::PoolLifecycle lc)
@@ -154,7 +154,7 @@ const char * casLifecycleReasonWord(Cas::PoolLifecycle lc)
 /// commit/tryCommit: Remove when there is nothing to publish (parts empty -- the DROP/rename path, which
 ///         applied its ref mutations immediately), Write when it must publish staged parts. This is what
 ///         lets a vanished-disk table's DROP finish (Remove -> no-op success) while a publishing commit
-///         throws typed erased.
+///         throws the typed Vanished [D5] refusal.
 /// Unsupported (always throw, state-independent -- no gate needed): createMetadataFile,
 ///   generateObjectKeyForPath, chmod, truncateFile.
 /// Factory / overlay-only (no committed-pool I/O): supportsChmod, getSubmittedForRemovalBlobs, and the
@@ -351,8 +351,8 @@ ContentAddressedMetadataStorage * ContentAddressedMetadataStorage::tryFromDisk(c
 void ContentAddressedMetadataStorage::runOneGcRoundForTest()
 {
     /// Admin class (rev.7 spec §1): refuse on a transient / IdentityLost / Vanished pool (a terminal disk
-    /// throws typed erased; an uncertain one throws 668) before touching the scheduler. The later
-    /// `!cas_store` re-check under `gc_scheduler_mutex` still guards the not-mounted race.
+    /// throws the typed Vanished [D5] refusal; an uncertain one throws 668) before touching the scheduler.
+    /// The later `!cas_store` re-check under `gc_scheduler_mutex` still guards the not-mounted race.
     checkOpAdmitted(CasOpClass::Admin);
     /// The pacing scheduler must be STABLE across calls: the lease's observation-window steal
     /// protocol compares consecutive observations of the SAME observer (gc_id), so an ad-hoc

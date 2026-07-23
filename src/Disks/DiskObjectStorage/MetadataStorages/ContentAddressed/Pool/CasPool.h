@@ -338,7 +338,8 @@ public:
     /// ---- pool lifecycle condition (rev.7 §1; owned by `mount_runtime`) ----
     /// Atomic read of the current lifecycle condition. Thin forwarder; safe to call from any thread.
     PoolLifecycle lifecycle() const { return mount_runtime.lifecycle(); }
-    /// Whether the pool has reached one of the three fully-terminal `Vanished` values.
+    /// Whether the pool has reached one of the two fully-terminal `Vanished` values
+    /// (`VanishedReplaced` / `VanishedForgotten`).
     bool isVanished() const { return mount_runtime.isVanished(); }
     /// Whether the terminal-intent latch is published — a natural `enterVanished`, OR FORGET's early
     /// (spec §5 step 1) `publishVanishedIntent`, and NEVER `IdentityLost` ([C1]). See

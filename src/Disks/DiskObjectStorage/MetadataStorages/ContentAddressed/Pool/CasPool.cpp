@@ -782,7 +782,7 @@ void Pool::forgetDisk(const std::function<void()> & stop_and_join_gc, const Stri
              && "SYSTEM CONTENT ADDRESSED FORGET must not run on a CAS pool thread (self-join deadlock)");
 
     /// Idempotent: an already-terminal `Vanished` pool (a second FORGET, or a pool that naturally vanished
-    /// as erased/replaced) is already the terminal truth — nothing to force, and re-running the teardown
+    /// as replaced) is already the terminal truth — nothing to force, and re-running the teardown
     /// would double-retire the keeper. `IdentityLost`/`TransientNotLive`/`Live` all proceed (FORGET is
     /// their escape hatch). Reading `isVanished()` here without the lock is safe: only a terminal transition
     /// sets it, terminal states are absorbing, and a natural transition that wins concurrently below merely

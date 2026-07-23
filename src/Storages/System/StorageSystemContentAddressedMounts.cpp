@@ -129,7 +129,7 @@ Pipe StorageSystemContentAddressedMounts::read(
         /// This is what makes a not-live / stopped / vanished / never-started disk VISIBLE — the
         /// store()/listMounts path below may refuse or return nothing, but the disk still gets a row
         /// carrying its lifecycle truth, instead of silently vanishing from the table (the old behavior,
-        /// where a store() refusal or an empty erased-pool listing dropped the very disk under investigation).
+        /// where a store() refusal or an empty vanished-pool listing dropped the very disk under investigation).
         const CasLifecycleSnapshot snap = ca->lifecycleSnapshot();
 
         bool emitted_row = false;
@@ -218,7 +218,7 @@ Pipe StorageSystemContentAddressedMounts::read(
         }
 
         /// Ensure the disk is VISIBLE even when no mount row was emitted: not mounted, store() refused,
-        /// listMounts failed, or a vanished/erased pool with no slots left. Synthesize ONE row from the
+        /// listMounts failed, or a vanished (replaced/forgotten) pool with no slots left. Synthesize ONE row from the
         /// non-gated snapshot, with every live/lease and GC-health column defaulted (0) / NULL.
         if (!emitted_row)
         {

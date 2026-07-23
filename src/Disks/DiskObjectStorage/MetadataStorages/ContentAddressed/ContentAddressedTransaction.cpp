@@ -411,8 +411,8 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "retrying a failed content-addressed transaction is not supported");
 
-    /// Operation gate (rev.7 §1). A commit with staged parts to publish is a `Write` (throws typed erased
-    /// on a Vanished disk); a commit with nothing to publish is the DROP/rename path -- its ref mutations
+    /// Operation gate (rev.7 §1). A commit with staged parts to publish is a `Write` (throws the typed
+    /// Vanished [D5] refusal on a Vanished disk); a commit with nothing to publish is the DROP/rename path -- its ref mutations
     /// already applied immediately (`removeRecursive`/`dropNamespace`/`moveDirectory`), so it is a `Remove`
     /// that no-op-succeeds on a Vanished disk, which is what lets a vanished-disk table's DROP finish.
     /// Both throw 668 while the backing is uncertain (transient / IdentityLost).
@@ -766,7 +766,7 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
     const std::string & path, size_t buf_size, WriteMode mode, const WriteSettings & settings)
 {
     /// Write gate (rev.7 §1): the single chokepoint every write buffer (both direct and via
-    /// `tryCreateWriteBuffer`) is created through -- refuse on a Vanished (typed erased) or transient/
+    /// `tryCreateWriteBuffer`) is created through -- refuse on a Vanished (typed [D5]) or transient/
     /// IdentityLost (668) disk before staging any content or opening a verbatim buffer.
     metadata_storage.checkOpAdmitted(CasOpClass::Write);
     /// Non-part files are VERBATIM namespace files, durable on finalize (no commit involvement -
