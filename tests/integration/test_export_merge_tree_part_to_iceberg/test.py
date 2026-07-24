@@ -769,17 +769,17 @@ def test_export_part_source_more_columns_allowed_with_ignore_extra_setting(clust
     mt = f"mt_ignore_extra_{sfx}"
     iceberg = f"iceberg_ignore_extra_{sfx}"
 
-    make_mt(node, mt, "id Int32, year Int32, extra String", "year")
-    make_iceberg_s3(node, iceberg, "id Int32, year Int32", "year")
+    make_mt(node=node, name=mt, columns="id Int32, year Int32, extra String", partition_by="year")
+    make_iceberg_s3(node=node, name=iceberg, columns="id Int32, year Int32", partition_by="year")
 
     node.query(f"INSERT INTO {mt} VALUES (1, 2020, 'foo'), (2, 2020, 'bar'), (3, 2020, 'baz')")
-    part_2020 = get_part(node, mt, "2020")
+    part_2020 = get_part(node=node, table=mt, partition_id="2020")
 
     export_part(
-        node, mt, part_2020, iceberg,
+        node=node, table=mt, part=part_2020, dest=iceberg,
         extra_settings="export_merge_tree_part_schema_mismatch_mode = 'ignore_extra_source_columns_by_position'",
     )
-    wait_for_export_part(node, mt, part_2020)
+    wait_for_export_part(node=node, table=mt, part=part_2020)
 
     count = int(node.query(f"SELECT count() FROM {iceberg}").strip())
     assert count == 3, f"Expected 3 rows in Iceberg table after export, got {count}"
@@ -787,7 +787,7 @@ def test_export_part_source_more_columns_allowed_with_ignore_extra_setting(clust
     result = node.query(f"SELECT id, year FROM {iceberg} ORDER BY id").strip()
     assert result == "1\t2020\n2\t2020\n3\t2020", f"Unexpected data:\n{result}"
 
-    assert_part_log(node, mt, part_2020)
+    assert_part_log(node=node, table=mt, part=part_2020)
 
     node.query(f"DROP TABLE IF EXISTS {mt} SYNC")
     node.query(f"DROP TABLE IF EXISTS {iceberg}")
@@ -805,11 +805,11 @@ def test_export_part_column_count_mismatch_source_fewer_still_rejected_with_igno
     mt = f"mt_ignore_extra_fewer_{sfx}"
     iceberg = f"iceberg_ignore_extra_fewer_{sfx}"
 
-    make_mt(node, mt, "id Int32, year Int32", "year")
-    make_iceberg_s3(node, iceberg, "id Int32, year Int32, extra String", "year")
+    make_mt(node=node, name=mt, columns="id Int32, year Int32", partition_by="year")
+    make_iceberg_s3(node=node, name=iceberg, columns="id Int32, year Int32, extra String", partition_by="year")
 
     node.query(f"INSERT INTO {mt} VALUES (1, 2020), (2, 2020)")
-    part_2020 = get_part(node, mt, "2020")
+    part_2020 = get_part(node=node, table=mt, partition_id="2020")
 
     error = node.query_and_get_error(
         f"ALTER TABLE {mt} EXPORT PART '{part_2020}' TO TABLE {iceberg} "
@@ -821,6 +821,112 @@ def test_export_part_column_count_mismatch_source_fewer_still_rejected_with_igno
         f"Expected NUMBER_OF_COLUMNS_DOESNT_MATCH for source<dest column count "
         f"even with ignore_extra_source_columns_by_position, got: {error!r}"
     )
+
+    node.query(f"DROP TABLE IF EXISTS {mt} SYNC")
+    node.query(f"DROP TABLE IF EXISTS {iceberg}")
+
+
+def test_export_part_with_materialized_column(cluster):
+    node = cluster.instances["node1"]
+    sfx = unique_suffix()
+    mt = f"mt_materialized_{sfx}"
+    iceberg = f"iceberg_materialized_{sfx}"
+
+    make_mt(node=node, name=mt, columns="id Int32, year Int32, doubled Int32 MATERIALIZED id * 2", partition_by="year")
+    make_iceberg_s3(node=node, name=iceberg, columns="id Int32, year Int32, doubled Int32", partition_by="year")
+
+    node.query(f"INSERT INTO {mt} (id, year) VALUES (1, 2020), (2, 2020)")
+    part_2020 = get_part(node=node, table=mt, partition_id="2020")
+
+    export_part(node=node, table=mt, part=part_2020, dest=iceberg)
+    wait_for_export_part(node=node, table=mt, part=part_2020)
+
+    result = node.query(f"SELECT id, year, doubled FROM {iceberg} ORDER BY id").strip()
+    assert result == "1\t2020\t2\n2\t2020\t4", f"Unexpected data:\n{result}"
+
+    assert_part_log(node=node, table=mt, part=part_2020)
+
+    node.query(f"DROP TABLE IF EXISTS {mt} SYNC")
+    node.query(f"DROP TABLE IF EXISTS {iceberg}")
+
+
+def test_export_part_with_alias_column(cluster):
+    node = cluster.instances["node1"]
+    sfx = unique_suffix()
+    mt = f"mt_alias_{sfx}"
+    iceberg = f"iceberg_alias_{sfx}"
+
+    make_mt(node=node, name=mt, columns="id Int32, year Int32, id_alias Int32 ALIAS id", partition_by="year")
+    make_iceberg_s3(node=node, name=iceberg, columns="id Int32, year Int32, id_alias Int32", partition_by="year")
+
+    node.query(f"INSERT INTO {mt} (id, year) VALUES (1, 2020), (2, 2020)")
+    part_2020 = get_part(node=node, table=mt, partition_id="2020")
+
+    export_part(node=node, table=mt, part=part_2020, dest=iceberg)
+    wait_for_export_part(node=node, table=mt, part=part_2020)
+
+    result = node.query(f"SELECT id, year, id_alias FROM {iceberg} ORDER BY id").strip()
+    assert result == "1\t2020\t1\n2\t2020\t2", f"Unexpected data:\n{result}"
+
+    assert_part_log(node=node, table=mt, part=part_2020)
+
+    node.query(f"DROP TABLE IF EXISTS {mt} SYNC")
+    node.query(f"DROP TABLE IF EXISTS {iceberg}")
+
+
+def test_export_part_ignore_extra_setting_drops_trailing_alias_column(cluster):
+    node = cluster.instances["node1"]
+    sfx = unique_suffix()
+    mt = f"mt_ignore_extra_alias_{sfx}"
+    iceberg = f"iceberg_ignore_extra_alias_{sfx}"
+
+    make_mt(node=node, name=mt, columns="id Int32, year Int32, extra_alias String ALIAS toString(id)", partition_by="year")
+    make_iceberg_s3(node=node, name=iceberg, columns="id Int32, year Int32", partition_by="year")
+
+    node.query(f"INSERT INTO {mt} (id, year) VALUES (1, 2020), (2, 2020)")
+    part_2020 = get_part(node=node, table=mt, partition_id="2020")
+
+    export_part(
+        node=node, table=mt, part=part_2020, dest=iceberg,
+        extra_settings="export_merge_tree_part_schema_mismatch_mode = 'ignore_extra_source_columns_by_position'",
+    )
+    wait_for_export_part(node=node, table=mt, part=part_2020)
+
+    result = node.query(f"SELECT id, year FROM {iceberg} ORDER BY id").strip()
+    assert result == "1\t2020\n2\t2020", f"Unexpected data:\n{result}"
+
+    assert_part_log(node=node, table=mt, part=part_2020)
+
+    node.query(f"DROP TABLE IF EXISTS {mt} SYNC")
+    node.query(f"DROP TABLE IF EXISTS {iceberg}")
+
+
+def test_export_part_ignore_extra_setting_kept_alias_depends_on_dropped_column(cluster):
+    node = cluster.instances["node1"]
+    sfx = unique_suffix()
+    mt = f"mt_ignore_extra_dep_{sfx}"
+    iceberg = f"iceberg_ignore_extra_dep_{sfx}"
+
+    make_mt(
+        node=node, name=mt,
+        columns="id Int32, year Int32, computed_alias Int32 ALIAS extra * 2, extra Int32",
+        partition_by="year",
+    )
+    make_iceberg_s3(node=node, name=iceberg, columns="id Int32, year Int32, computed_alias Int32", partition_by="year")
+
+    node.query(f"INSERT INTO {mt} (id, year, extra) VALUES (1, 2020, 5), (2, 2020, 7)")
+    part_2020 = get_part(node=node, table=mt, partition_id="2020")
+
+    export_part(
+        node=node, table=mt, part=part_2020, dest=iceberg,
+        extra_settings="export_merge_tree_part_schema_mismatch_mode = 'ignore_extra_source_columns_by_position'",
+    )
+    wait_for_export_part(node=node, table=mt, part=part_2020)
+
+    result = node.query(f"SELECT id, year, computed_alias FROM {iceberg} ORDER BY id").strip()
+    assert result == "1\t2020\t10\n2\t2020\t14", f"Unexpected data:\n{result}"
+
+    assert_part_log(node=node, table=mt, part=part_2020)
 
     node.query(f"DROP TABLE IF EXISTS {mt} SYNC")
     node.query(f"DROP TABLE IF EXISTS {iceberg}")
