@@ -1003,16 +1003,25 @@ RefTxnId CasRefLedger::appendRefOps(const RootNamespace & ns, MutationScope scop
             /// callers.
             std::vector<std::shared_ptr<RefMutationItem>> owned_items;
             owned_items.push_back(item);
+            std::exception_ptr flush_exception;
             try
             {
                 runRefQueueLeader(ns, rt, item, owned_items);
             }
             catch (...)
             {
-                completeOwnedItemsAndReleaseLeadership(ns, rt, owned_items, std::current_exception());
-                throw;
+                flush_exception = std::current_exception();
             }
-            completeOwnedItemsAndReleaseLeadership(ns, rt, owned_items, nullptr);
+            /// Single exit authority (normal AND exceptional): complete every still-incomplete owned
+            /// item with `flush_exception` (nullptr on the normal path -> a fail-closed LOGICAL_ERROR)
+            /// and release leadership. This does NOT rethrow. Under chunked flush the leader's OWN item
+            /// may already have succeeded in an earlier committed chunk, and a later exception -- from a
+            /// subsequent chunk, the reseed, or chunk-N processing -- must NOT be handed to this caller
+            /// whose mutation is already durable (tenure exception containment, spec §3): the guard
+            /// leaves such an item `done` with no error, and the loop re-check + tail below return its
+            /// `committed_id`. An item that genuinely failed carries `item->error` and the tail rethrows
+            /// it, exactly as the old unconditional rethrow did for the single-chunk case.
+            completeOwnedItemsAndReleaseLeadership(ns, rt, owned_items, flush_exception);
             lk.lock();
         }
         else
@@ -1139,13 +1148,6 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
             config.server_root_id)));
         return;
     }
-
-    /// The pre-attempt / post-write fence gate for THIS flush's controller calls. It also folds in
-    /// `superseded_by_remount` so the append PUT is airtight against a self-remount that lands between a
-    /// leader's pre-allocate re-check and its PUT: `superseded` is published before `armMountFence`, so a
-    /// leader whose PUT observes a LIVE fence (`refAppendFenceOk` true) necessarily observes the flag too
-    /// (release/acquire through the fence) and reports Unresolved instead of committing against a stale cache.
-    const auto fence_ok = [this, &rt] { return fence_ok_fn() && !rt->superseded_by_remount.load(std::memory_order_acquire); };
 
     /// Resolve an outstanding wedge FIRST: "It does not start a later
     /// ref-log PUT for that table until the earlier result is resolved."
@@ -1328,7 +1330,10 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
 
     /// Per-item validation, in order, against `working` (per-request undo via `item_scratch`):
     /// business preconditions (thrown by `build_ops` itself) and the pre-encode admission budget both
-    /// fail ONLY the offending item; survivors' ops accumulate into `final_ops` for one transaction.
+    /// fail ONLY the offending item; survivors' ops accumulate into `final_ops` for ONE CHUNK. When
+    /// admitting the next item's ops would exceed `ref_txn_max_ops`, the accumulated chunk is committed
+    /// as a complete ref-log transaction and validation continues into a fresh chunk against the
+    /// reseeded live state (spec §3 chunked flush): one tenure may emit several transactions.
     std::vector<RefOp> final_ops;
     std::vector<std::shared_ptr<RefMutationItem>> survivors;
     /// The trial epoch is ALWAYS `live_epoch_fn()` -- the SAME source `allocateRefTxnId` stamps the
@@ -1339,19 +1344,32 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
     /// dominates `greatest_applied` (mount exclusivity guarantees `live_epoch_fn() >=
     /// greatest_applied.writer_epoch`), so the sequence starts fresh at 0. This also keeps the `+= 1`
     /// previews below overflow-safe: a seal's sequence field is `UINT64_MAX`, which would otherwise wrap
-    /// to 0 and be rejected as not strictly increasing. These trial ids are never
-    /// persisted or compared outside this loop.
+    /// to 0 and be rejected as not strictly increasing. These trial ids are never persisted or compared
+    /// outside this loop; after each committed chunk they are RESEEDED from the now-live `working` so a
+    /// later zero-op item is never completed against a trial id from a discarded speculative chunk.
     RefTxnId trial_id;
-    trial_id.writer_epoch = live_epoch_fn();
-    trial_id.ref_sequence = (working.getGreatestApplied().writer_epoch == trial_id.writer_epoch)
-        ? working.getGreatestApplied().ref_sequence
-        : 0;
-    for (const auto & it : batch)
+    const auto reseed_trial_id = [&]
     {
-        RefTableState item_scratch = working;
+        trial_id.writer_epoch = live_epoch_fn();
+        trial_id.ref_sequence = (working.getGreatestApplied().writer_epoch == trial_id.writer_epoch)
+            ? working.getGreatestApplied().ref_sequence
+            : 0;
+    };
+    reseed_trial_id();
+    for (size_t item_index = 0; item_index < batch.size(); ++item_index)
+    {
+        const auto & it = batch[item_index];
+
+        /// Step 1: build this item's ops and apply the counts-only per-item caps. `build_ops` runs at
+        /// most once per item, HERE -- the overflowing item's ops are built once and reused in the fresh
+        /// chunk it lands in (the at-most-once contract holds across a chunk boundary). A failure here
+        /// (a business precondition thrown by `build_ops`, or an over-cap item/op) fails ONLY this item;
+        /// the chunk in progress and the remaining items are untouched.
+        std::vector<RefOp> item_ops;
+        bool removal_class = false;
         try
         {
-            std::vector<RefOp> item_ops = it->build_ops(working);
+            item_ops = it->build_ops(working);
 
             /// Counts-only admission caps (spec §3), checked before any op is touched further so an
             /// oversized item or op never reaches `working` or the state-machine preview below and
@@ -1362,7 +1380,7 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
             /// discriminator (built ops contain `RemoveNamespace`) shared with the codec's own
             /// `checkBudget` -- `WholeShard` scope alone is NOT a substitute (the stale-precommit
             /// reclaim sweep is also `WholeShard`-scoped but is not removal-class).
-            const bool removal_class = refLogTxnIsRemovalClass(item_ops);
+            removal_class = refLogTxnIsRemovalClass(item_ops);
             if (!removal_class)
             {
                 if (item_ops.size() > ref_txn_max_ops)
@@ -1380,7 +1398,64 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
                             ns.string(), op_bytes, ref_op_max_bytes);
                 }
             }
+        }
+        catch (...)
+        {
+            complete_error({it}, std::current_exception());
+            continue;
+        }
 
+        /// Step 2: chunk boundary (spec §3). If admitting this item's ops would push the current
+        /// (non-empty) chunk over `ref_txn_max_ops`, COMMIT the accumulated chunk now as a COMPLETE
+        /// ref-log transaction and start a fresh one. Removal-class items are always solo-carved
+        /// (`WholeShard` scope), so `final_ops` is empty when one is processed and this branch never
+        /// fires for them.
+        if (!removal_class && !final_ops.empty()
+            && final_ops.size() + item_ops.size() > ref_txn_max_ops)
+        {
+            /// Release the scratch `working` so `commitRefChunk`'s post-commit overlay fold is in place
+            /// (the E5 fast path), exactly as the single-chunk path does before its commit arm.
+            working = RefTableState{};
+            const bool committed = commitRefChunk(ns, rt, final_ops, survivors);
+            if (!committed)
+            {
+                /// Failure isolation (spec §3): chunk N's survivors were already failed inside
+                /// `commitRefChunk`. Fail THIS item and the entire not-yet-attempted remainder too, so no
+                /// owned item is left stranded (its waiter would hang and its `build_ops` closure become
+                /// unsafe). Earlier chunks that already committed keep their callers' success -- an
+                /// unresolved wedge from `commitRefChunk` therefore contains ONLY this chunk.
+                std::vector<std::shared_ptr<RefMutationItem>> remainder(batch.begin() + item_index, batch.end());
+                complete_error(remainder, makeCasWriteRetryLaterExceptionPtr(fmt::format(
+                    "CAS ref-log append for namespace '{}': a preceding chunk of this multi-transaction "
+                    "flush did not commit — this item was not attempted and can be retried", ns.string())));
+                return;
+            }
+            /// Reseed `working` and the trial-id high-water mark from the now-live state: the speculative
+            /// `working` with trial ids from the just-committed chunk is discarded, so a later zero-op
+            /// item is completed against the REAL committed id, never a trial id that never persisted. A
+            /// throw at the boundary -- the injected `ChunkReseed` fault, or a genuine reseed allocation
+            /// failure -- propagates to `appendRefOps`' tenure-containment catch, which preserves the
+            /// already-committed chunk's callers' success.
+            if (carve_hook_for_test)
+                carve_hook_for_test(CarvePhaseForTest::ChunkReseed);
+            {
+                std::lock_guard lock(rt->state_mutex);
+                working = rt->state;
+            }
+            reseed_trial_id();
+            final_ops.clear();
+            survivors.clear();
+        }
+
+        /// Step 3: validate this item into the current (possibly fresh) chunk and, past all throwing
+        /// points, publish its effects into `working`/`final_ops`/`survivors`. A failure here fails ONLY
+        /// this item. `item_ops` was built in step 1 against the pre-boundary state; the carve
+        /// deduplicates ref names within a batch, so the overflowing item operates on a ref distinct
+        /// from the just-committed chunk's and re-validating it against the reseeded `working` is
+        /// consistent.
+        RefTableState item_scratch = working;
+        try
+        {
             /// Whole-item shape validation (prerequisite to `dropNamespace`): the
             /// per-op loop below previews each op as its OWN single-op trial transaction, so a
             /// whole-transaction-shape rule like "remove_namespace must be the FINAL op" trivially
@@ -1446,10 +1521,12 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
     if (final_ops.empty())
     {
         /// Either every item failed validation (already completed via complete_error above, nothing
-        /// left to do), or every survivor's own `build_ops` legitimately contributed ZERO ops (an
-        /// idempotent no-op, e.g. precommitAdd/promote re-targeting a manifest already exactly
-        /// committed). Survivors of the latter kind still need marking done -- with no new object
-        /// created, `committed_id` is simply the table's current (unchanged) high-water mark.
+        /// left to do), or every survivor of the LAST chunk contributed ZERO ops (an idempotent no-op,
+        /// e.g. precommitAdd/promote re-targeting a manifest already exactly committed). Survivors of the
+        /// latter kind still need marking done -- with no new object created, `committed_id` is the
+        /// table's current high-water mark. After an earlier committed chunk, `working` was reseeded from
+        /// the live state, so that mark is the REAL id the earlier chunk persisted, never a discarded
+        /// trial id.
         if (!survivors.empty())
         {
             std::lock_guard<std::mutex> g(ref_queue_mutex);
@@ -1463,17 +1540,35 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
         return;
     }
 
-    /// E5 fast-path reachability: `working` is a scratch copy whose `committed`/`owned_manifests` bases
-    /// SHARE the live `rt->state`'s bases (a `shared_ptr` refcount bump taken at `working = rt->state`
-    /// above). It is dead from here on -- the no-op path above already returned, and the PUT path below
-    /// never reads it again -- so release it NOW, BEFORE the post-PUT `materializeCommitted()` under
-    /// `state_mutex`. Kept alive to function scope it would pin a second reference to each base, so that
-    /// fold would always observe `use_count() == 2` and copy every row (O(N)); released here, the fold
-    /// sees `use_count() == 1` and folds the overlay in place (O(overlay)) -- the whole point of E5. This
-    /// release runs on the SAME thread as that fold, so its refcount decrement is program-order-before
-    /// the fold's `use_count()` load; no lock is needed (unlike the cross-thread `candidate_state` in
-    /// `trySnapshotPublishOnce`, which must reset under `state_mutex`).
+    /// Commit the FINAL chunk of this tenure (spec §3): the remaining accumulated ops form the last --
+    /// possibly only -- ref-log transaction. Release the scratch `working` first so `commitRefChunk`'s
+    /// post-commit overlay fold is in place (the E5 fast path), then run the full committed arm. Its
+    /// survivors are completed (success or failure) inside it, so nothing is owed here on any outcome;
+    /// the provably-unreachable durable-apply failure propagates to `appendRefOps`' catch as before.
     working = RefTableState{};
+    commitRefChunk(ns, rt, final_ops, survivors);
+}
+
+bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt,
+                                  const std::vector<RefOp> & chunk_ops,
+                                  const std::vector<std::shared_ptr<RefMutationItem>> & chunk_survivors)
+{
+    /// Reconstructed locally so this arm has the SAME completion + fence semantics as when it lived
+    /// inline in `flushRefBatch`: `complete_error` wakes a chunk's waiters under `ref_queue_mutex`, and
+    /// `fence_ok` folds `superseded_by_remount` into the append fence so a self-remount landing between a
+    /// leader's pre-allocate re-check and its `PUT` reports Unresolved rather than committing against a
+    /// stale cache.
+    auto complete_error = [&](const std::vector<std::shared_ptr<RefMutationItem>> & items, std::exception_ptr e)
+    {
+        std::lock_guard<std::mutex> g(ref_queue_mutex);
+        for (const auto & it : items)
+        {
+            it->error = e;
+            it->done = true;
+        }
+        rt->cv.notify_all();
+    };
+    const auto fence_ok = [this, &rt] { return fence_ok_fn() && !rt->superseded_by_remount.load(std::memory_order_acquire); };
 
     /// Self-remount re-check BEFORE allocating an id: the top-of-flush gate
     /// is passed once, but a leader can stall between it and here -- in `build_ops`' caller I/O -- across
@@ -1485,11 +1580,11 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
     /// (which also checks the flag) is the airtight backstop for the narrow window past this point.
     if (rt->superseded_by_remount.load(std::memory_order_acquire))
     {
-        complete_error(survivors, makeCasWriteRetryLaterExceptionPtr(fmt::format(
+        complete_error(chunk_survivors, makeCasWriteRetryLaterExceptionPtr(fmt::format(
             "CAS ref-log append for server_root '{}': this cached table was superseded by a self-remount "
             "before id allocation — retry against the fresh mount incarnation",
             config.server_root_id)));
-        return;
+        return false;
     }
 
     /// Wedge hard contract: at most one unresolved `PUT` per table, and the
@@ -1503,35 +1598,35 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
         std::optional<String> wedged_key;
         {
             std::lock_guard lock(rt->state_mutex);
-            chassert(!rt->wedge, "flushRefBatch: new-id allocation attempted while the ref-log lane was still wedged");
+            chassert(!rt->wedge, "commitRefChunk: new-id allocation attempted while the ref-log lane was still wedged");
             if (rt->wedge)
                 wedged_key = rt->wedge->key;
         }
         if (wedged_key)
         {
             on_impossible_interference(*wedged_key,
-                fmt::format("flushRefBatch attempted new-id allocation for namespace '{}' while the lane "
+                fmt::format("commitRefChunk attempted new-id allocation for namespace '{}' while the lane "
                     "was still wedged -- the wedge hard contract was violated", ns.string()),
                 ns.string());
-            complete_error(survivors, std::make_exception_ptr(Exception(ErrorCodes::LOGICAL_ERROR,
+            complete_error(chunk_survivors, std::make_exception_ptr(Exception(ErrorCodes::LOGICAL_ERROR,
                 "CAS ref-log append for namespace '{}': refusing to allocate a new ref-log id while the "
                 "lane is wedged (wedge hard contract violated) -- mount fenced closed and remount scheduled",
                 ns.string())));
-            return;
+            return false;
         }
     }
 
     const RefTxnId id = allocateRefTxnId();
-    const RefLogTxn final_txn{ns.string(), id, final_ops};
+    const RefLogTxn chunk_txn{ns.string(), id, chunk_ops};
     String bytes;
     try
     {
-        bytes = sealObject(FormatId::RefLog, encodeRefLogTxn(final_txn));
+        bytes = sealObject(FormatId::RefLog, encodeRefLogTxn(chunk_txn));
     }
     catch (...)
     {
-        complete_error(survivors, std::current_exception());
-        return;
+        complete_error(chunk_survivors, std::current_exception());
+        return false;
     }
     const String key = layout.refLogKey(ns, id);
 
@@ -1546,8 +1641,8 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
         /// object already at this txn's key -- a proven different-object conflict, not an unresolved PUT.
         /// Fail every survivor loudly and do NOT wedge (this is a conclusive rejection, not an uncertain
         /// outcome): the id is a safe gap, the cache is unchanged, and the lane stays usable.
-        complete_error(survivors, std::current_exception());
-        return;
+        complete_error(chunk_survivors, std::current_exception());
+        return false;
     }
     switch (outcome)
     {
@@ -1556,7 +1651,7 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
             try
             {
                 std::lock_guard lock(rt->state_mutex);
-                applyRefLogTxn(rt->state, final_txn);
+                applyRefLogTxn(rt->state, chunk_txn);
                 /// This commit's own transaction joins the applied-above-newest-snapshot tail counters --
                 /// the live `rt->state` just mutated above IS the next publish candidate's body, so there
                 /// is no per-entry log to retain. Bumped HERE, right after the apply and BEFORE the fold
@@ -1564,13 +1659,13 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
                 /// regardless of whether the overlay was folded.
                 rt->tail_count_since_snapshot.fetch_add(1, std::memory_order_relaxed);
                 rt->tail_bytes_since_snapshot.fetch_add(bytes.size(), std::memory_order_relaxed);
-                /// COW-map materialization: fold this flush's overlay into the base HERE, under the SAME
+                /// COW-map materialization: fold this chunk's overlay into the base HERE, under the SAME
                 /// state_mutex critical section as the install above, so `rt->state.getCommitted()` is
-                /// back to "base + empty overlay" before the next flush's trial copies (`working =
-                /// rt->state`) begin. With `working` already released just above, `rt->state`'s bases are
-                /// uniquely owned here (barring a concurrent publisher holding a copy, in which case the
-                /// fold correctly falls back to build-fresh-and-swap), so this is an O(overlay) IN-PLACE
-                /// fold, not the O(n) base copy it once was.
+                /// back to "base + empty overlay" before the next flush's -- or the next chunk's reseed --
+                /// trial copies (`working = rt->state`) begin. With `working` already released by the
+                /// caller, `rt->state`'s bases are uniquely owned here (barring a concurrent publisher
+                /// holding a copy, in which case the fold correctly falls back to build-fresh-and-swap),
+                /// so this is an O(overlay) IN-PLACE fold, not the O(n) base copy it once was.
                 ///
                 /// This fold is an OPTIMIZATION, NOT part of the commit: it runs after the txn is durable
                 /// AND applied, and each container's fold is coherent at every intermediate throw point
@@ -1598,14 +1693,15 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
                 /// above, since the txn is already durable and the state stays coherent). The whole-item
                 /// shape validation makes a SHAPE/logic failure here provably unreachable (every item's
                 /// COMPLETE ops array is validated as one combined transaction before any object is
-                /// created) -- and `final_txn` is now durably PUT, so a logic-level apply failure would
+                /// created) -- and `chunk_txn` is now durably PUT, so a logic-level apply failure would
                 /// re-throw on every future recovery replay, bricking this table forever. Fail every
                 /// waiting survivor's own caller with a clear diagnostic instead of leaving them hung on
                 /// an `item->done` that would otherwise never be set, then rethrow: `appendRefOps`'s own
                 /// catch is the SOLE authority that resets `leader_active` on an exceptional exit from the
                 /// leader loop, so this path must NOT reset it too (a double reset would open a two-leader
                 /// window -- a waiter woken by the first reset could become leader before this frame
-                /// unwinds).
+                /// unwinds). Under chunked flush an EARLIER chunk may already be durable; that catch keeps
+                /// its callers' success (tenure containment) and fails only the still-incomplete items.
                 const String detail = getCurrentExceptionMessage(false);
                 Exception rethrown(ErrorCodes::LOGICAL_ERROR,
                     "CAS ref-log append for namespace '{}': the durably-committed transaction {}-{} "
@@ -1614,14 +1710,14 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
                     "combined transaction before any object is created); the object is already durable, "
                     "so a logic-level apply failure would re-throw on every future recovery: {}",
                     ns.string(), id.writer_epoch, id.ref_sequence, detail);
-                complete_error(survivors, std::make_exception_ptr(rethrown));
+                complete_error(chunk_survivors, std::make_exception_ptr(rethrown));
                 throw rethrown; /// NOLINT(cert-err09-cpp,cert-err61-cpp,misc-throw-by-value-catch-by-reference) -- reused above via make_exception_ptr, cannot be an anonymous temporary
             }
             ProfileEvents::increment(ProfileEvents::CasRefBatchFlushes);
-            ProfileEvents::increment(ProfileEvents::CasRefBatchedMutations, survivors.size());
+            ProfileEvents::increment(ProfileEvents::CasRefBatchedMutations, chunk_survivors.size());
             {
                 std::lock_guard<std::mutex> g(ref_queue_mutex);
-                for (const auto & it : survivors)
+                for (const auto & it : chunk_survivors)
                 {
                     it->committed_id = id;
                     it->done = true;
@@ -1630,18 +1726,20 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
             }
             /// The threshold trigger -- off the lane,
             /// dispatched AFTER waking every waiter above so this commit's own callers are never
-            /// delayed by it.
+            /// delayed by it. Per chunk (spec §3): each committed chunk schedules its own publication,
+            /// and settlement coalesces the triggers so a mid-tenure publisher never suppresses a later
+            /// chunk (`settleSnapshotPublish`).
             maybeScheduleSnapshotPublish(ns, rt);
-            return;
+            return true;
         }
         case CasWriteOutcome::DefiniteFailure:
         {
             ProfileEvents::increment(ProfileEvents::CasRefAppendDefiniteFailure);
-            complete_error(survivors, makeCasWriteRetryLaterExceptionPtr(fmt::format(
+            complete_error(chunk_survivors, makeCasWriteRetryLaterExceptionPtr(fmt::format(
                 "CAS ref-log append for namespace '{}' definitively failed (non-retryable rejection); "
                 "cached state is unchanged and txn id {}-{} is a safe gap",
                 ns.string(), id.writer_epoch, id.ref_sequence)));
-            return;
+            return false;
         }
         case CasWriteOutcome::Unresolved:
         {
@@ -1650,71 +1748,62 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
                 rt->wedge = RefAppendWedge{id, key, bytes};
             }
             ProfileEvents::increment(ProfileEvents::CasRefAppendWedged);
-            complete_error(survivors, makeCasWriteRetryLaterExceptionPtr(fmt::format(
+            complete_error(chunk_survivors, makeCasWriteRetryLaterExceptionPtr(fmt::format(
                 "CAS ref-log append for namespace '{}' txn {}-{} is UNCERTAIN (retry budget exhausted) — "
                 "the append lane is wedged until the SAME key resolves durable or a conclusive rejection "
                 "is observed; this outcome is unproven, not failure",
                 ns.string(), id.writer_epoch, id.ref_sequence)));
-            return;
+            return false;
         }
     }
+    /// Unreachable: the switch above covers every `CasWriteOutcome`. Kept explicit so the function has a
+    /// defined return on all control-flow paths.
+    return false;
 }
 
 
-void CasRefLedger::maybeScheduleSnapshotPublish(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt)
+bool CasRefLedger::admitSnapshotPublishUnderStateLock(RefTableRuntime & rt)
 {
-    /// Never dispatch a publisher while the fence is lost: a publish is a
-    /// conditional PUT that would fail `fence_ok` and return non-Committed anyway, and dispatching one
-    /// during the self-remount window is exactly the stale-cache-publish race the remount quiesce closes
-    /// -- with no dispatch here, `quiesceRefTablesForRemount` only has to drain publishers already in
-    /// flight before the fence dropped, never a moving target.
-    if (!may_mutate())
-        return;
-
-    /// Bound the read-triggered dispatch. The whole decision --
-    /// the threshold trigger, the single-in-flight gate, the backoff deadline -- and the
-    /// `pending_snapshot_publishes` increment all happen under ONE `state_mutex` hold, so two racing
-    /// dispatchers can never both admit a publish for this table.
-    bool dispatch = false;
+    /// Caller holds `rt.state_mutex` (the `may_mutate` fence check is the caller's responsibility, since
+    /// it is not held under `state_mutex`). The whole decision -- the threshold trigger, the
+    /// single-in-flight gate, the backoff deadline -- and the `pending_snapshot_publishes` increment all
+    /// happen under that ONE hold, so two racing dispatchers can never both admit a publish for this
+    /// table, and the settlement re-evaluation can decrement-and-re-admit without the count transiently
+    /// reaching zero.
+    const uint64_t now = boot_ms_now_fn();
+    if (rt.state.getLifecycle() == RefLifecycle::Live
+        /// Single-in-flight gate: at most one background publish per table.
+        && rt.pending_snapshot_publishes.load(std::memory_order_relaxed) == 0
+        /// Backoff deadline: after a non-Committed publish, a saturated backend is not re-dispatched
+        /// until the bounded backoff elapses (the read-triggered PUT-storm latch).
+        && now >= rt.publish_backoff_until_ms)
     {
-        std::lock_guard lock(rt->state_mutex);
-        const uint64_t now = boot_ms_now_fn();
-        if (rt->state.getLifecycle() == RefLifecycle::Live
-            /// Single-in-flight gate: at most one background publish per table. A dropped trigger is
-            /// re-evaluated on the next trigger (post-flush / mount-time / the next read), so no snapshot
-            /// is permanently skipped -- compaction is best-effort, not a staleness bound.
-            && rt->pending_snapshot_publishes.load(std::memory_order_relaxed) == 0
-            /// Backoff deadline: after a non-Committed publish, a saturated backend is not re-dispatched
-            /// on the next read until the bounded backoff elapses (the read-triggered PUT-storm latch).
-            && now >= rt->publish_backoff_until_ms)
+        /// The threshold trigger reads the tail counters directly -- no walk, no age filter.
+        /// `tail_count_since_snapshot`/`tail_bytes_since_snapshot` count ONLY applied txns strictly above
+        /// `newest_snapshot_id` (maintained incrementally by every commit and every adoption, see
+        /// `flushRefBatch`/`trySnapshotPublishOnce`), so `over_threshold` here is never true without a
+        /// real, immediately-coverable candidate.
+        const uint64_t publishable_count = rt.tail_count_since_snapshot.load(std::memory_order_relaxed);
+        const uint64_t publishable_bytes = rt.tail_bytes_since_snapshot.load(std::memory_order_relaxed);
+        const bool over_threshold = publishable_count > config.snapshot_log_count_threshold
+            || publishable_bytes > config.snapshot_log_bytes_threshold;
+        if (over_threshold)
         {
-            /// The threshold trigger reads the tail counters
-            /// directly -- no walk, no age filter. `tail_count_since_snapshot`/`tail_bytes_since_snapshot`
-            /// count ONLY applied txns strictly above `newest_snapshot_id` (maintained incrementally by
-            /// every commit and every adoption, see `flushRefBatch`/`trySnapshotPublishOnce`), so
-            /// `over_threshold` here is never true without a real, immediately-coverable candidate: unlike
-            /// the deleted grace-window scheme, there is no longer a decoupling between "counted" and
-            /// "coverable" that a separate candidate-advance check would need to close.
-            const uint64_t publishable_count = rt->tail_count_since_snapshot.load(std::memory_order_relaxed);
-            const uint64_t publishable_bytes = rt->tail_bytes_since_snapshot.load(std::memory_order_relaxed);
-            const bool over_threshold = publishable_count > config.snapshot_log_count_threshold
-                || publishable_bytes > config.snapshot_log_bytes_threshold;
-            if (over_threshold)
-            {
-                rt->pending_snapshot_publishes.fetch_add(1, std::memory_order_relaxed);
-                dispatch = true;
-            }
+            rt.pending_snapshot_publishes.fetch_add(1, std::memory_order_relaxed);
+            return true;
         }
     }
-    if (!dispatch)
-        return;
-    ProfileEvents::increment(ProfileEvents::CasRefSnapshotPublishDispatched);
+    return false;
+}
 
-    /// Off the mutation hot path: `trySnapshotPublishOnce` never
-    /// touches the append queue, so dispatching it onto an unrelated global-pool thread can never
-    /// deadlock a flush leader. `pin_owner()` (the Pool's `shared_from_this`) keeps the Pool -- and
-    /// hence this ledger member -- alive for the thread's lifetime, exactly as the pre-decomposition
-    /// `shared_from_this()` capture did.
+void CasRefLedger::dispatchSnapshotPublisher(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt)
+{
+    /// `admitSnapshotPublishUnderStateLock` already incremented `pending_snapshot_publishes` for THIS
+    /// dispatch. Off the mutation hot path: `trySnapshotPublishOnce` never touches the append queue, so
+    /// dispatching it onto an unrelated global-pool thread can never deadlock a flush leader.
+    /// `pin_owner()` (the Pool's `shared_from_this`) keeps the Pool -- and hence this ledger member --
+    /// alive for the thread's lifetime.
+    ProfileEvents::increment(ProfileEvents::CasRefSnapshotPublishDispatched);
     auto owner = pin_owner();
     try
     {
@@ -1729,22 +1818,16 @@ void CasRefLedger::maybeScheduleSnapshotPublish(const RootNamespace & ns, const 
             {
                 tryLogCurrentException(getLogger("CasPool"), "CAS background snapshot publish attempt failed");
             }
-            {
-                std::lock_guard lock(rt->state_mutex);
-                rt->pending_snapshot_publishes.fetch_sub(1, std::memory_order_relaxed);
-            }
-            rt->publish_settle_cv.notify_all();
+            settleSnapshotPublish(ns, rt);
         }).detach();
     }
     catch (...)
     {
-        /// The `ThreadFromGlobalPool` ctor can throw (pool exhaustion) AFTER the
-        /// count was incremented. Undo the count (else `waitForSnapshotPublishSettleForTest` hangs and the
-        /// leaked pending count wedges every later settle) and SWALLOW the failure: read-path callers
-        /// (`resolveRef`/`listRefs`) invoke this OUTSIDE any insulation, and dispatching a background
-        /// publish is a best-effort maintenance trigger -- it must never fail an otherwise-successful read
-        /// (consistent with the `CasRefSweepDeferred` read-insulation adjudication). The next trigger
-        /// reschedules; a mutation caller has already committed regardless.
+        /// The `ThreadFromGlobalPool` ctor can throw (pool exhaustion) AFTER the count was incremented.
+        /// Undo the count WITHOUT the settlement re-evaluation (else a persistently-failing dispatch could
+        /// re-fire itself in a loop) and SWALLOW the failure: dispatching a background publish is a
+        /// best-effort maintenance trigger and must never fail an otherwise-successful read or mutation.
+        /// The next trigger reschedules.
         {
             std::lock_guard lock(rt->state_mutex);
             rt->pending_snapshot_publishes.fetch_sub(1, std::memory_order_relaxed);
@@ -1752,6 +1835,52 @@ void CasRefLedger::maybeScheduleSnapshotPublish(const RootNamespace & ns, const 
         rt->publish_settle_cv.notify_all();
         tryLogCurrentException(getLogger("CasPool"), "CAS background snapshot-publish dispatch failed to launch");
     }
+}
+
+void CasRefLedger::settleSnapshotPublish(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt)
+{
+    /// Fence re-checked outside `state_mutex` (as in `maybeScheduleSnapshotPublish`): a fence lost
+    /// between this publish's dispatch and its settlement must suppress a follow-up.
+    const bool live_mount = may_mutate();
+    bool redispatch = false;
+    {
+        std::lock_guard lock(rt->state_mutex);
+        /// Drop THIS publish's in-flight count and, under the SAME hold, re-evaluate the accumulated
+        /// tail. A chunked tenure (or any concurrent mutation) that raised more log above the newest
+        /// snapshot while this publish was capturing an earlier prefix had its trigger discarded by the
+        /// single-flight gate; settlement re-fires it here so chunks 2..N are not suppressed until an
+        /// unrelated later trigger (spec §3 snapshot coalescing). Re-admitting under the SAME lock as the
+        /// decrement means `pending_snapshot_publishes` never transiently reaches 0 across the handoff, so
+        /// `waitForSnapshotPublishSettleForTest` never observes a false "settled". A durable publish
+        /// already subtracted its captured tail, so this self-terminates once the tail is back at/under
+        /// threshold; a non-durable one armed the backoff, which `admit...` respects -- no PUT storm.
+        rt->pending_snapshot_publishes.fetch_sub(1, std::memory_order_relaxed);
+        if (live_mount)
+            redispatch = admitSnapshotPublishUnderStateLock(*rt);
+    }
+    if (redispatch)
+        dispatchSnapshotPublisher(ns, rt);
+    else
+        rt->publish_settle_cv.notify_all();
+}
+
+void CasRefLedger::maybeScheduleSnapshotPublish(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt)
+{
+    /// Never dispatch a publisher while the fence is lost: a publish is a
+    /// conditional PUT that would fail `fence_ok` and return non-Committed anyway, and dispatching one
+    /// during the self-remount window is exactly the stale-cache-publish race the remount quiesce closes
+    /// -- with no dispatch here, `quiesceRefTablesForRemount` only has to drain publishers already in
+    /// flight before the fence dropped, never a moving target.
+    if (!may_mutate())
+        return;
+
+    bool dispatch = false;
+    {
+        std::lock_guard lock(rt->state_mutex);
+        dispatch = admitSnapshotPublishUnderStateLock(*rt);
+    }
+    if (dispatch)
+        dispatchSnapshotPublisher(ns, rt);
 }
 
 

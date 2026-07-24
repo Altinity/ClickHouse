@@ -494,11 +494,12 @@ and `tmp/consult-gpt56sol-answer.md`.
   via a verified no-throw move under `state_mutex` (static_assert on noexcept), then update tail
   counters. Touches the ledger flush ordering — needs its own spec + soak gate. UPDATE 2026-07-23:
   the publish-confirm fetch-handoff review (round 3) independently rediscovered this window as the
-  one state breaking `confirmExactRef` ("durable, unapplied, unwedged, idle, warm" — the catch
-  installs no wedge); the confirm spec now REQUIRES the fail-closed half (a non-allocating
-  apply-pending poison marker armed before the PUT, cleared after a successful apply, read by the
-  confirm as *unknown*) — see `2026-07-23-cas-fetch-handoff-publish-confirm-design.md`
-  §confirm-primitive rule 4. The full no-throw-install fix stays THIS item's scope.
+  one state breaking `confirmExactRef`. UPDATE 2026-07-24: **FOLDED (user direction) into the
+  unified publish-confirm spec** `2026-07-23-cas-fetch-handoff-publish-confirm-design.md`
+  §ledger-hardening — the poison marker (fail-closed half) is its item 1 / execution phase 3, the
+  full no-throw-install (this item) is its item 3 / execution phase 7 with the measurement gate
+  (wedge→flush bench + `BM_FlushInstall`) as the phase's first task. Tracked THERE now; this entry
+  kept as a pointer.
 - [ ] **DESIRABLE (measured, est. 2-3× recovery/GC-rebuild cut): recovery re-runs 3-4 codec passes per
   snapshot row** (Fable F5). `recoverRefTableDetailed` decodes the snapshot, then `stateFromSnapshot`
   re-encodes + re-decodes it (hand-built-snapshot defense), then per-row size helpers re-encode

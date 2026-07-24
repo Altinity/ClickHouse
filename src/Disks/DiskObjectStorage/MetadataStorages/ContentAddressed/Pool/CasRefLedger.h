@@ -196,8 +196,12 @@ public:
     /// `PlanBatchGrow` and `PlanReserveOwned` fire in the non-mutating PLAN phase (nothing has been
     /// popped yet); `PublishPop` fires at the start of the no-throw PUBLISH phase; `ValidateFinalOps`
     /// fires once per admitted item, at the last throwing point before that item's effects are published
-    /// into `working`/`final_ops`. Null in production.
-    enum class CarvePhaseForTest { PlanSeenRefs, PlanBatchGrow, PlanReserveOwned, PublishPop, ValidateFinalOps };
+    /// into `working`/`final_ops`. `ChunkReseed` fires once at each chunk boundary of a chunked flush --
+    /// immediately AFTER the just-full chunk committed durably (its survivors already completed) and
+    /// BEFORE `working`/the trial-id high-water mark are reseeded from the now-live state; it is the
+    /// injection point for the tenure-exception-containment contract (a throw here, or from the reseed
+    /// itself, must leave the committed chunk's callers with their success). Null in production.
+    enum class CarvePhaseForTest { PlanSeenRefs, PlanBatchGrow, PlanReserveOwned, PublishPop, ValidateFinalOps, ChunkReseed };
     void setCarveHookForTest(std::function<void(CarvePhaseForTest)> hook) { carve_hook_for_test = std::move(hook); }
 
     /// Returns the number of queued mutations for `ns` under the queue mutex.
@@ -438,9 +442,25 @@ private:
 
     /// Validates, durably appends, and applies one compatible batch while preserving copy-before-commit
     /// and apply-after-commit ordering. Every item it carves out of `pending` is appended to
-    /// `owned_items` (the leader's responsibility set) at the moment it is carved.
+    /// `owned_items` (the leader's responsibility set) at the moment it is carved. When a batch's total
+    /// op count exceeds `ref_txn_max_ops`, the validation loop emits SEVERAL ref-log transactions in one
+    /// tenure via `commitRefChunk` -- each a complete commit boundary.
     void flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt,
                        std::vector<std::shared_ptr<RefMutationItem>> & owned_items);
+
+    /// Commits ONE chunk of a `flushRefBatch` tenure as a complete ref-log transaction: allocates the
+    /// real transaction id, encodes and durably `PUT`s `chunk_ops`, applies to `rt->state` under
+    /// `state_mutex`, advances the tail counters, records the per-transaction metrics, completes exactly
+    /// `chunk_survivors` with the real id (waking their waiters), and schedules snapshot publication.
+    /// Returns true when the chunk committed durably; false on any non-throwing failure
+    /// (DefiniteFailure / unresolved wedge / a conclusive PUT rejection / an encode failure), after
+    /// having already failed `chunk_survivors` with the appropriate error. Throws ONLY the
+    /// provably-unreachable durable-apply failure (a bricked lane), having first failed the survivors.
+    /// PRECONDITION: the caller has already released its scratch `working` copy so the post-commit
+    /// overlay fold is in place (the E5 fast path).
+    bool commitRefChunk(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt,
+                        const std::vector<RefOp> & chunk_ops,
+                        const std::vector<std::shared_ptr<RefMutationItem>> & chunk_survivors);
 
     /// Leadership-exit guard for `appendRefOps`: under `ref_queue_mutex`, completes every still-unfinished
     /// item this leader owned (with `flush_exception` when unwinding, or a fail-closed `LOGICAL_ERROR`
@@ -456,6 +476,27 @@ private:
     /// Schedules best-effort background publication when tail thresholds and backoff permit. The
     /// dispatch is fenced and the detached task retains the owner pin until it finishes.
     void maybeScheduleSnapshotPublish(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt);
+
+    /// The Live + single-in-flight-gate + backoff + tail-threshold admission decision, factored out so
+    /// both the trigger (`maybeScheduleSnapshotPublish`) and the settlement re-evaluation share ONE
+    /// authority. The caller MUST hold `rt.state_mutex`; on admission this increments
+    /// `pending_snapshot_publishes` and returns true (the caller then dispatches). The fence check
+    /// (`may_mutate`) is the caller's responsibility (it is not held under `state_mutex`).
+    bool admitSnapshotPublishUnderStateLock(RefTableRuntime & rt);
+
+    /// Launches one detached publish attempt. Assumes `pending_snapshot_publishes` was already
+    /// incremented for this dispatch (by `admitSnapshotPublishUnderStateLock`). The task settles through
+    /// `settleSnapshotPublish`; if the thread cannot even be constructed, the count is undone and the
+    /// settle waiter notified so a leaked in-flight count never wedges shutdown/settle.
+    void dispatchSnapshotPublisher(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt);
+
+    /// Runs at the end of one detached publish attempt: drops this attempt's in-flight count and, under
+    /// the SAME `state_mutex` hold, re-evaluates the accumulated tail so a trigger the single-flight gate
+    /// discarded during this attempt (e.g. chunks 2..N of a chunked tenure whose chunk-1 publish was
+    /// in flight) is re-fired instead of lost. Re-admitting under the same lock keeps the in-flight count
+    /// from transiently reaching zero across the handoff, so a settle waiter never observes a false
+    /// "settled". Notifies the settle condvar only when no follow-up publish is dispatched.
+    void settleSnapshotPublish(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt);
 
     /// Advances the exponential delay after a non-durable snapshot publication outcome.
     void advancePublishBackoff(RefTableRuntime & rt);
