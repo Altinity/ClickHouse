@@ -249,6 +249,11 @@ struct ExportReplicatedMergeTreePartitionManifest
     std::optional<UInt64> parquet_row_group_size;
     std::optional<UInt64> parquet_row_group_size_bytes;
 
+    /// this is a controversial setting. As far as I can infer from the iceberg docs, the transforms are always UTC.
+    /// this setting allows to specify different timezones. Since it is already implemented, we must respect it.
+    /// At the same time, we don't allow transforms with timezones, so this is very weird.
+    std::optional<String> iceberg_partition_timezone;
+
     std::string toJsonString() const
     {
         Poco::JSON::Object json;
@@ -290,6 +295,8 @@ struct ExportReplicatedMergeTreePartitionManifest
             json.set("parquet_row_group_size", *parquet_row_group_size);
         if (parquet_row_group_size_bytes)
             json.set("parquet_row_group_size_bytes", *parquet_row_group_size_bytes);
+        if (iceberg_partition_timezone)
+            json.set("iceberg_partition_timezone", *iceberg_partition_timezone);
         std::ostringstream oss;     // STYLE_CHECK_ALLOW_STD_STRING_STREAM
         oss.exceptions(std::ios::failbit);
         Poco::JSON::Stringifier::stringify(json, oss);
@@ -376,6 +383,11 @@ struct ExportReplicatedMergeTreePartitionManifest
         if (json->has("parquet_row_group_size_bytes"))
         {
             manifest.parquet_row_group_size_bytes = json->getValue<UInt64>("parquet_row_group_size_bytes");
+        }
+
+        if (json->has("iceberg_partition_timezone"))
+        {
+            manifest.iceberg_partition_timezone = json->getValue<String>("iceberg_partition_timezone");
         }
 
         return manifest;

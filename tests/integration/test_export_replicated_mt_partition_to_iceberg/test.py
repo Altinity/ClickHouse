@@ -1183,35 +1183,6 @@ def test_export_partition_day_source_into_year_metadata(cluster):
     )
 
 
-def test_export_partition_timezone_literal_partition_key(cluster):
-    """
-    A timezone argument in the partition key (toRelativeDayNum(event_time, 'UTC')) must not break
-    Iceberg table creation or the export compatibility gate; previously it threw a `Bad get`.
-    """
-    node = cluster.instances["replica1"]
-
-    uid = unique_suffix()
-    mt_table = f"mt_tz_{uid}"
-    iceberg_table = f"iceberg_tz_{uid}"
-
-    make_rmt(node, mt_table, "id Int64, event_time DateTime", "toRelativeDayNum(event_time, 'UTC')",
-             replica_name="replica1")
-    node.query(
-        f"INSERT INTO {mt_table} VALUES (1, '2024-03-05 01:00:00'), (2, '2024-03-05 23:00:00')"
-    )
-    # Creating the destination with the same timezone-qualified key exercises the getPartitionField fix.
-    make_iceberg_s3(node, iceberg_table, "id Int64, event_time DateTime",
-                    partition_by="toRelativeDayNum(event_time, 'UTC')")
-
-    pid = first_partition_id(node, mt_table)
-    node.query(
-        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {iceberg_table}",
-        settings={"allow_insert_into_iceberg": 1},
-    )
-    wait_for_export_status(node, mt_table, iceberg_table, pid, "COMPLETED")
-    assert int(node.query(f"SELECT count() FROM {iceberg_table}").strip()) == 2
-
-
 def test_export_partition_lossy_cast_dynamic_accept(cluster):
     """
     A lossy Int64 -> Int32 partition-column cast is accepted by the dynamic proof when the

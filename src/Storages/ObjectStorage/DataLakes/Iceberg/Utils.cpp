@@ -676,10 +676,10 @@ Poco::JSON::Object::Ptr getPartitionField(
                 field = identifier->name();
             }
             const auto * literal = expression_list_child->as<ASTLiteral>();
-            /// A String literal is an optional timezone argument (e.g. toRelativeDayNum(col, 'UTC')) and
-            /// does not affect the transform; only an integer literal is the bucket/truncate width.
-            if (literal && literal->value.getType() != Field::Types::String)
+            if (literal)
+            {
                 param = literal->value.safeGet<Int64>();
+            }
         }
     }
     if (!field)

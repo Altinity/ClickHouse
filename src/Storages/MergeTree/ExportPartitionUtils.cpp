@@ -319,6 +319,9 @@ namespace ExportPartitionUtils
         auto context = Context::createCopy(context_in);
         context->setSetting("write_full_path_in_iceberg_metadata", manifest.write_full_path_in_iceberg_metadata);
 
+        if (manifest.iceberg_partition_timezone)
+            context->setSetting("iceberg_partition_timezone", *manifest.iceberg_partition_timezone);
+
         /// Failpoint used by integration tests to force persistent commit failure and exercise
         /// the commit-attempts budget / FAILED state transition.
         fiu_do_on(FailPoints::export_partition_commit_always_throw,
