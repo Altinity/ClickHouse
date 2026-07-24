@@ -3009,6 +3009,19 @@ invisible to every existing card, and in ordinary testing allocations simply suc
 makes allocation failure a first-class fault source. Blanket requirement (user): **everything must
 stay consistent despite allocation errors** — queries may fail, invariants may not.
 
+**UPDATE 2026-07-24 (review round 4 corrections — apply when building the card):** (a) the
+thread-fault setting is applied on config reload in `Server.cpp:2763-2764`, NOT
+`InterpreterSystemQuery.cpp:1158` (that is `SYSTEM START THREAD FUZZER`); (b) it reaches
+thread-CREATING paths such as the background snapshot dispatcher (`CasRefLedger.cpp:1839`), NOT the
+ref append lane — the lane runs on the CALLER thread (`CasRefLedger.cpp:980`), which is why leg A's
+per-query knob is the one that reaches the CAS commit path; (c) the soundness guard must be a
+TARGETED post-PUT apply failpoint or a poison-transition counter — a nonzero
+`MEMORY_LIMIT_EXCEEDED` count only proves *some* allocation failed, not that the tiny post-durable
+window was hit; (d) leg C's restart oracle is NOT sufficient alone: a snapshot published from a
+poisoned cache makes the pre- and post-restart views identically wrong, so also replay from the
+last PRE-FAULT snapshot + raw tail logs and compare against the live cache, and assert that no
+snapshot advanced across a poisoned transaction.
+
 **Mechanisms (in-server, no new compose needed):**
 - `memory_tracker_fault_probability` — per-query `Float` Setting (`Core/Settings.cpp:2312`), throws
   on allocation with the given probability. NOT debug-gated (`MemoryTracker.cpp:340-342`), so it
