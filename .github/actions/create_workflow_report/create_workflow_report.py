@@ -31,6 +31,10 @@ DATABASE_PASSWORD_VAR = "CLICKHOUSE_TEST_STAT_PASSWORD"
 S3_BUCKET = "altinity-build-artifacts"
 GITHUB_REPO = "Altinity/ClickHouse"
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
+# Resolve from this file so discovery works from repo root or the action folder.
+KNOWN_FAILS_FILE = (
+    Path(__file__).resolve().parents[3] / "tests" / "broken_tests.yaml"
+)
 
 CVE_SEVERITY_ORDER = {"critical": 1, "high": 2, "medium": 3, "low": 4, "negligible": 5}
 
@@ -1015,7 +1019,7 @@ def parse_args() -> argparse.Namespace:
         "--no-upload", action="store_true", help="Do not upload the report"
     )
     parser.add_argument(
-        "--known-fails", type=str, help="Path to the file with known fails"
+        "--known-fails", action="store_true", help="Check known fails"
     )
     parser.add_argument(
         "--cves", action="store_true", help="Get CVEs from Grype results"
@@ -1031,7 +1035,7 @@ def create_workflow_report(
     pr_number: int = None,
     commit_sha: str = None,
     no_upload: bool = False,
-    known_fails_file_path: str = None,
+    check_known_fails: bool = False,
     check_cves: bool = False,
     mark_preview: bool = False,
 ) -> str:
@@ -1103,11 +1107,11 @@ def create_workflow_report(
     # This might occur when run in preview mode.
     cves_not_checked = not check_cves or results_dfs["docker_images_cves"] is ...
 
-    if known_fails_file_path:
-        if not os.path.exists(known_fails_file_path):
-            print(f"WARNING:Known fails file {known_fails_file_path} not found.")
+    if check_known_fails:
+        if not KNOWN_FAILS_FILE.exists():
+            print(f"WARNING:Known fails file {KNOWN_FAILS_FILE} not found.")
         else:
-            known_fails = get_broken_tests_rules(known_fails_file_path)
+            known_fails = get_broken_tests_rules(str(KNOWN_FAILS_FILE))
 
             results_dfs["checks_known_fails"] = get_checks_known_fails(
                 db_client, commit_sha, branch_name, known_fails
