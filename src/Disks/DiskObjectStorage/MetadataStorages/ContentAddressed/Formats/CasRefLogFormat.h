@@ -115,4 +115,12 @@ size_t removalFramingSize(const String & ns, const RefTxnId & txn_id, uint64_t o
 /// admission and at decode without ever accumulating a whole transaction's bytes.
 size_t encodedOpSize(const RefOp & op);
 
+/// The one canonical removal-class discriminator: a transaction (or a not-yet-encoded item's built
+/// ops) is removal-class iff `ops` contains a `RemoveNamespace` op. `MutationScope::Kind::WholeShard`
+/// is NOT a substitute -- the stale-precommit reclaim sweep is also `WholeShard`-scoped but is not
+/// removal-class. Every site that selects the removal byte budget (`ref_removal_max_bytes` vs
+/// `ref_txn_max_bytes`) or exempts an item from the normal-class op/per-op caps must call this, not
+/// re-derive its own predicate.
+bool refLogTxnIsRemovalClass(const std::vector<RefOp> & ops);
+
 }

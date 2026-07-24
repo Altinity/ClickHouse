@@ -48,18 +48,13 @@ void checkTxnIdNonzero(const RefTxnId & id)
             "RefLogTxn: txn_id fields must both be nonzero, got {}-{}", id.writer_epoch, id.ref_sequence);
 }
 
-bool isRemovalClass(const std::vector<RefOp> & ops)
-{
-    return std::any_of(ops.begin(), ops.end(), [](const RefOp & op) { return op.kind == RefOpKind::RemoveNamespace; });
-}
-
 /// Byte budget over the encoded text. A removal-class transaction uses the larger complete-table
 /// budget and has neither an op-count nor a per-op cap; normal transactions are bounded by
 /// `ref_txn_max_ops` and, per op, by `ref_op_max_bytes` (checked via `encodedOpSize`, one op at a
 /// time -- no accumulation).
 void checkBudget(const std::vector<RefOp> & ops, size_t encoded_bytes)
 {
-    const bool removal = isRemovalClass(ops);
+    const bool removal = refLogTxnIsRemovalClass(ops);
     const size_t byte_limit = removal ? ref_removal_max_bytes : ref_txn_max_bytes;
     if (encoded_bytes > byte_limit)
         throw Exception(ErrorCodes::CORRUPTED_DATA,
@@ -333,6 +328,11 @@ size_t encodedOpSize(const RefOp & op)
     CasJsonWriter out(256);
     writeOp(out, op);
     return out.size();
+}
+
+bool refLogTxnIsRemovalClass(const std::vector<RefOp> & ops)
+{
+    return std::any_of(ops.begin(), ops.end(), [](const RefOp & op) { return op.kind == RefOpKind::RemoveNamespace; });
 }
 
 size_t removalOpEncodedSize(RefOwnerKind owner_kind, const String & ref_name, const ManifestRef & manifest_ref)

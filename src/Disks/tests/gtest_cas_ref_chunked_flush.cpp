@@ -38,6 +38,9 @@ extern const int LIMIT_EXCEEDED;
 /// The suite name is prefixed `RefWriter` so it is covered by the `RefWriter*` unit-test gate filter.
 
 using namespace DB::Cas;
+using DB::Cas::tests::committedRow;
+using DB::Cas::tests::minimalLiveSnapshot;
+using DB::Cas::tests::writeRefSnapshotRaw;
 
 namespace
 {
@@ -105,6 +108,14 @@ Caller launchDrop(const PoolPtr & store, const RootNamespace & ns, const String 
 std::vector<RefOp> fillerOps(size_t n)
 {
     return std::vector<RefOp>(n, RefOp{});
+}
+
+/// A zero-padded ref name for index `i`, so `kTotalRefs` names sort in the same order as their index
+/// (the snapshot fixture's committed rows must already be sorted by `ref_name`).
+String paddedRefName(size_t i)
+{
+    String s = std::to_string(i);
+    return "ref_" + String(6 - s.size(), '0') + s;
 }
 
 /// A single `SetPayload` op whose `ref_name` is padded so its OWN encoded size (`encodedOpSize`) is
@@ -277,4 +288,75 @@ TEST(RefWriterChunkedFlush, CanonicalMaxTransactionRoundTrips)
     const RefLogTxn decoded = decodeRefLogTxn(bytes, txn.ns, txn.txn_id);
     EXPECT_EQ(decoded.ops.size(), ref_txn_max_ops);
     EXPECT_EQ(decoded, txn);
+}
+
+/// Test 11 (spec §3 "Removal-class detection, falsifiably"): `dropNamespace` over a table with
+/// > `ref_txn_max_ops` committed refs builds ONE transaction whose ops (one `owner_transition`
+/// removal per ref, plus a terminal `remove_namespace`) exceed the normal-class op-count cap --
+/// and must still succeed, because removal-class is byte-budgeted (`ref_removal_max_bytes`, 64 MiB)
+/// and has no op-count cap. Seeded via a raw snapshot (not `kTotalRefs` individual writer round-trips
+/// through `publishEmptyPart`) so the fixture stays fast; the writer never touches these rows until
+/// `dropNamespace` itself builds the one removal transaction.
+TEST(RefWriterChunkedFlush, DropNamespaceOverOpCapSucceeds)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/dropns_over_cap"};
+    constexpr size_t kTotalRefs = static_cast<size_t>(ref_txn_max_ops) + 200;
+
+    /// Open the store FIRST (still untouched for `ns`) so the seeded snapshot can use THIS mount's own
+    /// writer_epoch: namespace recovery is per-namespace and lazy (first touch), so writing the raw
+    /// fixture directly to `backend` after open, but before `ns` is ever touched, is observed identically
+    /// to writing it before open.
+    auto store = openPool(backend);
+    const uint64_t epoch = store->writerEpoch();
+
+    /// `allocateRefTxnId`'s sequence counter is POOL-WIDE (one counter per writer incarnation, shared
+    /// across every namespace it touches, `CasRefLedger.h:399`), not per-namespace, and starts fresh on
+    /// a virgin mount -- so the very first id it allocates, on ANY namespace, is `{epoch, 1}`. A snapshot
+    /// seeded directly at `{epoch, 1}` for `ns` would collide with that very first allocation once
+    /// `dropNamespace` (below) asks for a real id, since the same id can't be both the seeded
+    /// `greatest_applied` and the newly allocated one. Consume the first two allocations on an unrelated
+    /// throwaway namespace first, so `ns`'s seeded `greatest_applied` sits safely below whatever
+    /// `dropNamespace` allocates later.
+    publishEmptyPart(store, RootNamespace{"srv1/_seq_bump_for_dropns_over_cap"}, "bump");
+
+    std::vector<RefCommittedRow> committed;
+    committed.reserve(kTotalRefs);
+    for (size_t i = 0; i < kTotalRefs; ++i)
+        committed.push_back(committedRow(paddedRefName(i), ManifestRef{epoch, i + 1, 1}));
+    ASSERT_GT(committed.size(), ref_txn_max_ops);
+
+    writeRefSnapshotRaw(*backend, layout, minimalLiveSnapshot(ns.string(), RefTxnId{epoch, 1}, committed));
+    ASSERT_EQ(store->listRefs(ns).size(), kTotalRefs);
+
+    DropNamespaceStats stats;
+    EXPECT_NO_THROW(stats = store->dropNamespace(ns));
+    EXPECT_EQ(stats.committed_refs, kTotalRefs);
+    EXPECT_TRUE(store->namespaceIsRemoved(ns));
+}
+
+/// Test 11, second leg: `WholeShard` scope ALONE is not the removal-class discriminator -- the
+/// stale-precommit reclaim sweep is also `WholeShard`-scoped but is not removal-class
+/// (`CasRefLedger.cpp` ~:1979). Only a SYNTHETIC item can pin this: the production stale-precommit
+/// sweep self-limits its own chunk size to the op cap, so running it proves nothing (spec's own
+/// warning). This item drives `MutationScope::wholeShard()` directly with ops that contain NO
+/// `RemoveNamespace` op -- if classification were keyed on scope instead of op inspection, this would
+/// be wrongly treated as removal-class and admitted; op-inspection correctly rejects it under the
+/// ordinary normal-class op-count cap, exactly like `OversizedItemFailsAlone` above.
+TEST(RefWriterChunkedFlush, SyntheticWholeShardNonRemovalRejected)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/synthetic_wholeshard_nonremoval"};
+
+    Caller synthetic = launchAppend(store, ns, MutationScope::wholeShard(),
+        [](const RefTableState &) -> std::vector<RefOp> { return fillerOps(ref_txn_max_ops + 1); });
+    ASSERT_EQ(synthetic.fut.wait_for(std::chrono::seconds(10)), std::future_status::ready)
+        << "synthetic WholeShard item must not hang";
+    const std::exception_ptr err = synthetic.fut.get();
+    synthetic.t.join();
+
+    expectFailedWithCode(err, DB::ErrorCodes::LIMIT_EXCEEDED,
+        "synthetic WholeShard-scoped item with non-removal ops over the op cap");
 }

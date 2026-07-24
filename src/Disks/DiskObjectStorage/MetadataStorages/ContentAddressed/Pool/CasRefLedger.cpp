@@ -1355,12 +1355,14 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
 
             /// Counts-only admission caps (spec §3), checked before any op is touched further so an
             /// oversized item or op never reaches `working` or the state-machine preview below and
-            /// fails ALONE -- neighbors in this same batch are unaffected. Removal-class items (their
-            /// built ops contain `RemoveNamespace`) are exempt from both: they share the larger
-            /// `ref_removal_max_bytes` byte budget instead (`checkBudget`, `CasRefLogFormat.cpp`) and
-            /// are already carved as singletons (`WholeShard` scope forces a solo carve above).
-            const bool removal_class = std::any_of(item_ops.begin(), item_ops.end(),
-                [](const RefOp & op) { return op.kind == RefOpKind::RemoveNamespace; });
+            /// fails ALONE -- neighbors in this same batch are unaffected. Removal-class items are
+            /// exempt from both: they share the larger `ref_removal_max_bytes` byte budget instead
+            /// (`checkBudget`, `CasRefLogFormat.cpp`) and are already carved as singletons (`WholeShard`
+            /// scope forces a solo carve above). `refLogTxnIsRemovalClass` is the ONE canonical
+            /// discriminator (built ops contain `RemoveNamespace`) shared with the codec's own
+            /// `checkBudget` -- `WholeShard` scope alone is NOT a substitute (the stale-precommit
+            /// reclaim sweep is also `WholeShard`-scoped but is not removal-class).
+            const bool removal_class = refLogTxnIsRemovalClass(item_ops);
             if (!removal_class)
             {
                 if (item_ops.size() > ref_txn_max_ops)
