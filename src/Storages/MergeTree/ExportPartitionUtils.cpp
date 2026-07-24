@@ -684,75 +684,52 @@ namespace
     }
 
 
-    bool endpointsMapToDifferentValues(
-        const IFunctionBase & function, const ColumnsWithTypeAndName & arguments, size_t num_rows)
+    /// Whether the destination partition term maps the source column's [min, max] to more than one
+    /// value, i.e. the source partition would be split across several destination partitions. A bare
+    /// column (identity) is single-valued iff min == max; otherwise the transform must be provably
+    /// monotonic over the range (so the endpoints bound every interior row) and map both endpoints to
+    /// the same value. A non-monotonic transform (e.g. bucket, a hash) cannot be proven this way and is
+    /// treated as a split. Shared by the plain and Iceberg gates; the argument order [width?, values,
+    /// timezone?] covers truncate/bucket widths and date-transform timezones.
+    bool wouldPartitionBeSplit(
+        const String & function_name,
+        std::optional<Int64> argument,
+        const std::optional<String> & time_zone,
+        const DataTypePtr & value_type,
+        const Field & min_value, const Field & max_value,
+        const ContextPtr & context)
     {
-        const auto result = function.execute(arguments, function.getResultType(), num_rows, /*dry_run=*/ false);
+        if (function_name.empty() || function_name == "identity")
+            return min_value != max_value;
+
+        auto resolver = FunctionFactory::instance().get(function_name, context);
+        auto values = value_type->createColumn();
+        values->insert(min_value);
+        values->insert(max_value);
+
+        ColumnsWithTypeAndName arguments;
+        if (argument)
+            arguments.push_back({DataTypeUInt64().createColumnConst(2, *argument), std::make_shared<DataTypeUInt64>(), "width"});
+        arguments.push_back({std::move(values), value_type, "value"});
+        if (time_zone)
+            arguments.push_back({DataTypeString().createColumnConst(2, *time_zone), std::make_shared<DataTypeString>(), "timezone"});
+
+        const auto function = resolver->build(arguments);
+
+        if (!function->hasInformationAboutMonotonicity()
+            || !function->getMonotonicityForRange(*value_type, min_value, max_value).is_monotonic)
+            return true;
+
+        const auto result = function->execute(arguments, function->getResultType(), /*input_rows_count=*/ 2, /*dry_run=*/ false);
         Field first;
         Field second;
         result->get(0, first);
         result->get(1, second);
         return first != second;
     }
-
-    /// Whether the destination partition term yields a single value across [min, max] of its source
-    /// column. A bare column is single-valued iff min == max. A single-argument function is
-    /// single-valued when it is provably monotonic over the range and maps both endpoints to the same
-    /// value. Functions carrying an integer argument (bucket/truncate and similar) are not order
-    /// preserving in general, so they can only be accepted by an exact structural match.
-    bool partitionTermIsConstantOverBounds(
-        const PartitionTerm & term, const DataTypePtr & column_type,
-        const Field & min_value, const Field & max_value, const ContextPtr & context)
-    {
-        if (term.function.empty() || term.function == "identity")
-            return min_value == max_value;
-
-        if (term.argument.has_value())
-            return false;
-
-        auto resolver = FunctionFactory::instance().get(term.function, context);
-
-        auto values_column = column_type->createColumn();
-        values_column->insert(min_value);
-        values_column->insert(max_value);
-        const ColumnsWithTypeAndName arguments{{std::move(values_column), column_type, term.column}};
-        const auto function = resolver->build(arguments);
-
-        /// Require provable monotonicity so the endpoint comparison covers all interior rows.
-        if (!function->hasInformationAboutMonotonicity()
-            || !function->getMonotonicityForRange(*column_type, min_value, max_value).is_monotonic)
-            return false;
-
-        return !endpointsMapToDifferentValues(*function, arguments, /*num_rows=*/ 2);
-    }
 }
 
 #if USE_AVRO
-namespace
-{
-    /// Apply the destination Iceberg transform (rebuilt as a ClickHouse function, mirroring
-    /// ChunkPartitioner and the commit path) to a 2-row column holding [cast(min), cast(max)] and
-    /// return whether the endpoints map to different values, i.e. the source partition would be split
-    /// across more than one destination partition.
-    bool wouldPartitionBeSplit(
-        const Iceberg::TransformAndArgument & transform, const ColumnWithTypeAndName & values, const ContextPtr & context)
-    {
-        auto resolver = FunctionFactory::instance().get(transform.transform_name, context);
-        const size_t num_rows = values.column->size();
-
-        ColumnsWithTypeAndName arguments;
-        if (transform.argument)
-            arguments.push_back({DataTypeUInt64().createColumnConst(num_rows, *transform.argument),
-                                 std::make_shared<DataTypeUInt64>(), "width"});
-        arguments.push_back(values);
-        if (transform.time_zone)
-            arguments.push_back({DataTypeString().createColumnConst(num_rows, *transform.time_zone),
-                                 std::make_shared<DataTypeString>(), "timezone"});
-
-        return endpointsMapToDifferentValues(*resolver->build(arguments), arguments, num_rows);
-    }
-}
-
     void verifyIcebergPartitionCompatibility(
         const Poco::JSON::Object::Ptr & metadata_object,
         const StorageMetadataPtr & source_metadata,
@@ -912,9 +889,9 @@ namespace
             if (matched_structurally)
                 continue;
 
-            /// bucket is a hash: not order-preserving, so per-partition min/max cannot prove
-            /// single-valuedness. It (and any transform we cannot reconstruct) must match structurally.
-            if (!dest_canonical || dest_canonical->transform_name == "icebergBucket")
+            /// A transform we cannot reconstruct as a ClickHouse function must match structurally
+            /// (bucket, a non-order-preserving hash, is rejected below by the monotonicity check).
+            if (!dest_canonical)
                 throw Exception(ErrorCodes::BAD_ARGUMENTS,
                     "Cannot export partition to Iceberg table: destination field on column '{}' uses "
                     "transform '{}', which requires the source MergeTree to be partitioned by the matching "
@@ -972,11 +949,17 @@ namespace
             auto values_column = source_type->createColumn();
             values_column->insert(min_value);
             values_column->insert(max_value);
-            const ColumnWithTypeAndName cast_values{
-                castColumn({std::move(values_column), source_type, column}, destination_type), destination_type, column};
+            const auto cast_column = castColumn({std::move(values_column), source_type, column}, destination_type);
+            Field cast_min;
+            Field cast_max;
+            cast_column->get(0, cast_min);
+            cast_column->get(1, cast_max);
 
             const auto dest_transform_with_tz = Iceberg::parseTransformAndArgument(dest_transform, partition_timezone);
-            if (wouldPartitionBeSplit(*dest_transform_with_tz, cast_values, context))
+            const std::optional<Int64> transform_argument = dest_transform_with_tz->argument
+                ? std::optional<Int64>(static_cast<Int64>(*dest_transform_with_tz->argument)) : std::nullopt;
+            if (wouldPartitionBeSplit(dest_transform_with_tz->transform_name, transform_argument,
+                    dest_transform_with_tz->time_zone, destination_type, cast_min, cast_max, context))
                 throw Exception(ErrorCodes::BAD_ARGUMENTS,
                     "Cannot export partition to Iceberg table: partition '{}' spans multiple destination "
                     "partitions for column '{}' (transform '{}'). A source MergeTree partition must map to a "
@@ -1046,7 +1029,8 @@ namespace
                     "'{}'; cannot validate partitioning.", term.column, partition_id);
             const auto & [min_value, max_value] = *bounds;
 
-            if (!partitionTermIsConstantOverBounds(term, column_type, min_value, max_value, context))
+            if (wouldPartitionBeSplit(term.function, term.argument, term.time_zone,
+                    column_type, min_value, max_value, context))
                 throw Exception(ErrorCodes::BAD_ARGUMENTS,
                     "Cannot export partition '{}': the source partition spans multiple destination "
                     "partitions for column '{}'. A source MergeTree partition must map to a single "

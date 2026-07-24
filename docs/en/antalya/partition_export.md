@@ -43,12 +43,10 @@ Each MergeTree part will become a separate file with the following name conventi
 
 #### Source partition key compatibility
 
-The export writes all rows of a part to the single directory computed from the destination `PARTITION BY` on the part's values, so - exactly like the Iceberg gate - each destination partition must be single-valued across the exported source part. A destination partition column is accepted when either:
+A Hive-partitioned plain destination is always partitioned by bare storage columns (an expression key such as `PARTITION BY toYYYYMM(ts)` is rejected at table creation). Each destination column must be single-valued across the exported source part, which holds when either:
 
-- The whole source and destination `PARTITION BY` are identical, or the source already partitions by the same expression on that column (this covers a source that adds extra partition columns on top of the destination's, in any order - for example `PARTITION BY (year, country)` into a destination partitioned by `year`).
-- Or the destination expression is proven constant over the column's actual `[min, max]` in the part. This is data-dependent and accepts equivalent or finer source keys (for example `PARTITION BY toDate(ts)` into a destination partitioned by `toYYYYMM(ts)` when a part holds a single month). Only provably-monotonic single-argument functions and bare columns are proven this way.
-
-Otherwise the export is rejected with a `BAD_ARGUMENTS` error at `EXPORT` time: this includes a destination that partitions by a column absent from the source partition key, and a source partition whose rows would span more than one destination partition (for example a monthly source partition exported into a daily destination that actually contains several days). A `Nullable` partition column is only accepted through an exact match, because a `NULL` forms its own partition. Partition-column type differences follow the same lossy-cast gate as any other column (`export_merge_tree_part_allow_lossy_cast`).
+- The source already partitions by that column (destination columns are a subset of the source's, in any order) - for example `PARTITION BY (toYYYYMM(ts), country)` into a destination partitioned by `country`.
+- Or the column holds a single value over the part's actual `[min, max]` (data-dependent).
 
 ## Syntax
 
