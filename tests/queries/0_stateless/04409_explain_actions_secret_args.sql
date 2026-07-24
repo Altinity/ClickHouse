@@ -1,6 +1,9 @@
--- Tags: no-fasttest, no-old-analyzer
+-- Tags: no-fasttest
 -- Tag no-fasttest: the encryption functions are not available in the fast test build
--- Tag no-old-analyzer: the old analyzer builds the ActionsDAG without query-tree masking, so it still leaks the key
+
+-- The old analyzer builds the ActionsDAG without query-tree masking (and does not support
+-- EXPLAIN QUERY TREE at all), so force the new analyzer explicitly.
+SET enable_analyzer = 1;
 
 -- Secret arguments of recognized scalar functions must be hidden in the ActionsDAG dump of
 -- EXPLAIN actions, just like they already are for EXPLAIN SYNTAX and EXPLAIN QUERY TREE.
