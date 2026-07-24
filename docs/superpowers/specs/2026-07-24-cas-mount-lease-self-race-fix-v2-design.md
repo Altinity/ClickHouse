@@ -1,6 +1,14 @@
-# CAS mount-lease renewal ambiguity — fence-not-rescue fix (rev.3) — design
+# CAS mount-lease renewal ambiguity — fence-not-rescue fix (rev.4) — design
 
-**Status:** DESIGN rev.3 (2026-07-24), user-approved simplification of rev.2.
+**Status:** DESIGN rev.4 (2026-07-24). rev.3 = the user-approved fence-not-rescue simplification
+of rev.2; rev.4 folds in the four findings of the third codex round that survive the
+simplification (the round reviewed rev.2; its verdict: `tmp/codex_review_mountlease_v2rev2_verdict.md`;
+its six findings against the dropped rescue machinery are MOOT). The surviving four: the
+decommission bypass hardening (round-3 №1, Critical), startup-arm anchoring after the
+materialization grace (№2, Critical), precise per-domain clock wording (№4), and the
+implementation notes (№8/№9 and the closing notes: probe available in both backend modes;
+fence-latch testable via `startBackground` + loss callback; all three `mountWritable` allocation
+sites take the policy; self-remount stays `NormalMount`).
 **Reframing (the rev.3 decision):** rev.2 tried to *rescue* an ambiguous-but-landed renewal in
 place (resolve → adopt → continue), which required three proofs — attempt identity (a body nonce),
 read coherence (a HEAD-GET-HEAD sandwich), and liveness bounds (prepare-time anchored commit
@@ -91,13 +99,35 @@ established `CasWriteRetryLater` path); reads are unaffected.
 (`CasMountRuntime.cpp:81,240`) compute `now + TTL` at **response** time; the durable
 `expires_at_ms` was stamped at **prepare** time, so the local fence deadline exceeds the durable
 authorization by the request latency (pre-existing; today bounded only by the S3 request timeout,
-30 s by default — not by any protocol constant). Change: `renewOnce` captures the attempt-start
-instant **before calling `prepareRenew`** (so the anchor precedes the payload's own wall-clock
-stamp, keeping `anchor ≤ durable stamp` strict) and passes it to the success hooks; both deadlines
-become `attempt_start + TTL` (each site keeps its own clock domain). The local deadline is then ≤ the
-durable one **by construction**, closing the skew for good rather than relying on
-`request timeout < stale-token observation wait` staying true across config changes. ~5 lines +
-one test; independent of every other phase.
+30 s by default — not by any protocol constant). Change: `renewOnce` captures attempt-start
+instants **before calling `prepareRenew`** (so the anchors precede the payload's own wall-clock
+stamp) and passes them to the success hooks; both deadlines become `attempt_start + TTL`.
+
+Clock-domain precision (round-3 №4): the two deadline sites live in different domains — the
+keeper's `confirmed_deadline_ms` is wall-clock (`now_ms_fn`), the runtime's `mayMutate` fence is
+`CLOCK_BOOTTIME` (`CasMountRuntime.cpp:61,81`) — so ONE timestamp cannot serve both. `renewOnce`
+samples **one pre-I/O stamp per domain** (wall + boottime, both before `prepareRenew`) and each
+hook anchors in its own domain. The safety statement is therefore not a cross-domain absolute
+inequality but the standard lease argument the protocol already makes: within one domain the
+anchored deadline precedes the durable stamp by construction, and across nodes the comparison
+rides on the clock-rate allowance the successor's stale-token observation already grants
+explicitly (the 5% slack at `CasServerRoot.cpp:407`). Phase B removes the *request-latency* term
+from the skew — the unbounded one; the rate term was always present and stays modeled.
+
+**Startup-arm coverage (round-3 №2, Critical).** The renewal hooks are not the only fence-arm
+site: `mountWritable` claims the slot, may then wait an operator-configured
+`materialization_grace_ms` (unbounded; `CasPool.cpp:659`, `CasPool.h:145`), and only afterwards
+arms `bootMsNow() + TTL` and starts renewal (`CasPool.cpp:670`). With a grace longer than the
+stale-token observation threshold a successor can legally reclaim DURING the wait, and the
+predecessor then arms an already-superseded claim without revalidation. Fix, same anchoring
+discipline: the startup arm anchors at the **claim-attempt start** (pre-I/O, both domains); if by
+arm time the anchored deadline has already elapsed (the grace consumed the TTL), the arm is
+refused and the claim is redone — one fresh conditional lease write, which fails closed on a
+successor's token — before arming from the new attempt's anchor. A grace shorter than
+`TTL − safety margin` (every sane config; grace defaults are seconds, TTL 30 s) never triggers the
+redo — zero normal-path cost.
+
+~15 lines + two tests; independent of every other phase.
 
 ## Phase C — epoch re-mint guard, authoritative and decommission-aware {#phase-c}
 
@@ -118,9 +148,23 @@ Narrows the same-pair-twin hole that makes the Phase A branch "uncertain" rather
     stale mount object." (consistent with the recovery advice at `CasServerRoot.cpp:370`);
   - `ContainerAbsent` / `AccessDenied` / `Indeterminate` → fail closed naming the probe outcome.
 - **`DecommissionRecovery`** (only `openForDecommission`, `CasPool.cpp:700→735`, which derives the
-  victim uuid FROM a surviving mount and retires the slot as its purpose): guard bypassed —
-  operator-driven, and the guard's target (accidental same-pair revival by a normally restarting
-  server) does not apply. Pinned by a test.
+  victim uuid FROM a surviving mount and retires the slot as its purpose). **NOT a blind bypass**
+  (round-3 №1, Critical: a blind bypass would re-mint epoch 1 while a LIVE epoch-1 victim mount
+  survives; `claimMount` then same-pair-adopts it immediately — `CasServerRoot.cpp:286` — creating
+  exactly the forbidden twin and defeating the existing live-member refusal test,
+  `gtest_cas_decommission.cpp:374`). Instead, on the absent-epoch branch this policy:
+  - requires the surviving mount to be **terminal** (expired or released) — a LIVE mount refuses,
+    preserving decommission's existing live-member refusal semantics;
+  - mints an epoch **distinct by construction** from the surviving mount's:
+    `max(1, surviving_mount.writer_epoch + 1)` — the same-pair state is unrepresentable on this
+    path regardless of any other evidence.
+
+Implementation note (round 3): ALL THREE `allocateWriterEpoch` call sites inside `mountWritable`
+receive the policy (`CasPool.cpp:495, 592, 632` — startup claim and the fence-recovery
+re-allocations); the self-remount path stays `NormalMount` (`CasPool.cpp:957`). `probeSentinelRaw`
+is confirmed implemented for both Native and Emulated backends
+(`CasObjectStorageBackend.cpp:735`), and `InstrumentedBackend` preserves the outcome
+classification (`CasInstrumentedBackend.h:95`).
 
 Residual hole, honestly stated: epoch AND mount both wiped under a live mount still permits a
 same-pair twin — the survivor then fails safe on its next beat (vanished/uncertain → fence), a
@@ -143,10 +187,12 @@ absent-epoch path).
 **Gate 1 — TLA+ (small delta).** In `CaCasMountCore.tla`: map the new uncertain branch onto the
 existing `localLost` transition (the model already routes `superseded` there — Phase A aligns the
 implementation WITH the model rather than extending it); add the Phase C guard (epoch re-mint
-enabled only on authoritative absence) with an epoch-presence bit and one negative control
-(guard removed + epoch wipe ⇒ same-pair two-writer state reachable). The rev.2-scale rework
-(request/response split, stale deliveries, held tokens, fairness) is not needed — nothing new is
-adopted based on reads.
+enabled only on authoritative absence) with an epoch-presence bit, the **decommission policy
+branch** (terminal-mount requirement + distinct-epoch mint), and two negative controls: (a) guard
+removed + epoch wipe ⇒ same-pair two-writer state reachable; (b) decommission bypass minting
+epoch 1 over a live epoch-1 mount ⇒ same-pair reachable (the round-3 №1 trace). The rev.2-scale
+rework (request/response split, stale deliveries, held tokens, fairness) is not needed — nothing
+new is adopted based on reads.
 
 **Gate 2 — gtests (TDD, failing-first where the current code aborts).**
 - New `ApplyThenThrowPutOverwriteFaultBackend` (applies, then throws — the existing transient mock
@@ -158,10 +204,16 @@ adopted based on reads.
   same-uuid/same-epoch (its current construction) → `EXPECT_THROW(ABORTED)`, no death; NEW
   different-uuid variant → keeps `EXPECT_DEATH`; NEW same-uuid/different-epoch → `ABORTED`.
 - Phase B: deadline equals attempt-start + TTL even when the PUT ack is delayed (fault backend
-  with a controllable delay).
+  with a controllable delay); startup-arm redo: a `materialization_grace_ms` exceeding the TTL
+  forces a fresh claim before arming (and a successor's token meanwhile → fail closed, no arm).
+  Fence-latch observability is confirmed practical via `startBackground` + the loss callback
+  (round-3 №8, citing the existing pattern at `gtest_cas_heartbeat.cpp:442`).
 - Phase C: epoch absent + mount `Present` → `CORRUPTED_DATA`; + authoritative `KeyAbsent` → mints
-  (bootstrap unbroken); + `Indeterminate` → fail closed; `DecommissionRecovery` + surviving mount
-  + missing epoch → proceeds; epoch present → no probe issued (counting backend).
+  (bootstrap unbroken); + `Indeterminate` → fail closed; epoch present → no probe issued (counting
+  backend). Decommission: missing epoch + **live** epoch-1 mount → **refuses** (round-3 №1);
+  missing epoch + terminal mount → proceeds and mints `surviving.writer_epoch + 1` (asserted
+  distinct); the existing live-member refusal test (`gtest_cas_decommission.cpp:374`) still
+  passes.
 - Full suites: `CasHeartbeat.*`, `CasMountLease.*`, `gtest_cas_mount.cpp`,
   `gtest_cas_operation_gate.cpp`, `gtest_cas_decommission.cpp`.
 
