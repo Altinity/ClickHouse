@@ -233,8 +233,9 @@ bool looksZstd(std::string_view bytes);
 /// everything else -> identity (returns `text` unchanged).
 String sealObject(FormatId id, String text);
 /// Inverse of sealObject. A compressed body is only legal when `id`'s policy is `Always`
-/// (declared content size checked against the cap before allocation); a raw body is always
-/// accepted (repair path — e.g. an operator-restored uncompressed copy).
+/// (declared content size checked against the cap before allocation); a raw body is accepted
+/// (repair path — e.g. an operator-restored uncompressed copy) subject to the SAME `object_cap` --
+/// skipping compression must never also skip the size cap.
 String openObject(FormatId id, std::string_view stored);
 
 }

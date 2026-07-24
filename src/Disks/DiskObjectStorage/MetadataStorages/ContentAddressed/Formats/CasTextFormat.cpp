@@ -385,7 +385,12 @@ String openObject(FormatId id, std::string_view stored)
 {
     const FormatTraits & t = traitsFor(id);
     if (!looksZstd(stored))
+    {
+        if (t.object_cap != 0 && stored.size() > t.object_cap)
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS {}: raw object size {} exceeds the {}-byte cap", t.type, stored.size(), t.object_cap);
         return String(stored);
+    }
     if (t.compression != CompressionPolicy::Always)
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "CAS {}: compressed object in a format whose policy is raw", t.type);
