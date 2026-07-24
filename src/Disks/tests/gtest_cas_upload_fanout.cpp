@@ -746,9 +746,15 @@ TEST(CasUploadFanout, DrainPrecedesUnwind)
 }
 
 /// Test 6b: a throw injected DURING the dispatch loop (before all tasks are enqueued) still drains the
-/// tasks already scheduled -- the runner is declared inside the scope that owns the captured storage, so
-/// its destructor drains on the unwinding path (the B90 lesson). The first task's body is present after
-/// the dispatch throw is caught.
+/// tasks already scheduled -- the fan-out drains every already-scheduled task on the unwinding path
+/// before the captured storage is destroyed (the B90 lesson). The first task's body is present after the
+/// dispatch throw is caught.
+///
+/// The throw is GATED on the first task actually entering its body: the runner marks tasks that are
+/// still SCHEDULED as CANCELLED during unwind and skips waiting for a cancelled task, so a throw fired
+/// before the first task's body ran could cancel it and leave its body ABSENT -- a real flakiness the
+/// gate removes. Once the first task's `in_task` hook has fired, that task is past SCHEDULED (RUNNING),
+/// so it can no longer be cancelled and the drain deterministically waits for its upload.
 TEST(CasUploadFanout, DispatchThrowStillDrains)
 {
     auto b = std::make_shared<InMemoryBackend>();
@@ -758,13 +764,29 @@ TEST(CasUploadFanout, DispatchThrowStillDrains)
 
     const String first = "dispatch-throw-first";
     const String second = "dispatch-throw-second";
+    /// Dispatch runs in ascending-ref order, so the SMALLER-ref payload is the one enqueued before the
+    /// second dispatch throws.
+    const String enqueued = (idOf(first) < idOf(second)) ? first : second;
 
+    BoundedEvent first_task_running;
     std::atomic<int> dispatch_calls{0};
     BlobUploadFanoutHooksForTest hooks;
+    hooks.in_task = [&](const BlobRef & ref)
+    {
+        if (ref == idOf(enqueued))
+            first_task_running.fire();
+    };
     hooks.on_dispatch = [&](const BlobRef &)
     {
         if (++dispatch_calls == 2)
+        {
+            /// Wait until the first task's body has entered before throwing, so it is RUNNING (not
+            /// SCHEDULED) and the unwind cannot cancel it. Pool size 2 guarantees the first task gets a
+            /// worker while this (dispatch) thread waits; 10s is a pure hang guard, never a sequencer.
+            EXPECT_TRUE(first_task_running.wait(std::chrono::seconds(10)))
+                << "the first dispatched task must reach its body before the dispatch throw";
             throw DB::Exception(DB::ErrorCodes::INCORRECT_DATA, "dispatch-loop throw (test)");
+        }
     };
 
     std::vector<BlobUploadRequest> reqs{localRequest(first), localRequest(second)};
@@ -775,12 +797,10 @@ TEST(CasUploadFanout, DispatchThrowStillDrains)
     });
 
     EXPECT_EQ(dispatch_calls.load(), 2) << "the throw fired on the second dispatch";
-    /// Dispatch runs in ascending-ref order, so the SMALLER-ref payload was enqueued before the second
-    /// dispatch threw; the runner's destructor drained that already-scheduled task during unwind, so its
-    /// body is present although nothing was merged.
-    const String enqueued = (idOf(first) < idOf(second)) ? first : second;
+    /// The already-RUNNING first task was drained before the stack unwound, so its body is present
+    /// although nothing was merged.
     EXPECT_TRUE(b->head(s->layout().blobKey(idOf(enqueued))).exists)
-        << "the already-dispatched task was drained by the runner destructor before the stack unwound";
+        << "the already-dispatched task was drained before the stack unwound";
     EXPECT_EQ(build->depsSnapshotForTest().size(), 0u) << "merge-nothing on a dispatch throw";
 }
 
@@ -950,4 +970,59 @@ TEST(CasUploadFanout, OverweightBlobRunsExclusively)
     EXPECT_FALSE(admission.statsForTest().co_hold_violation);
     EXPECT_EQ(metaStateAt(*b, s->layout(), big), std::optional<MetaState>(MetaState::Clean))
         << "the overweight condemned-local resurrection completed (never waited forever)";
+}
+
+/// Test 6c (codex stage-1 review, Critical): a throw at the TRACKING-PUBLICATION seam still drains every
+/// already-scheduled task before the captured `results` storage is destroyed. In the broken form a task
+/// could be scheduled-but-untracked at the throw and run later against freed `results` (a
+/// heap-use-after-free); the fix schedules-and-tracks in ONE no-throw step (pre-reserved handle vector)
+/// and joins via a scope-exit drain guard, so a seam throw finds every scheduled task already tracked and
+/// drains it. The throw is gated on the first task RUNNING (same reason as `DispatchThrowStillDrains`) so
+/// its drain is deterministic; under ASan this run is UAF-clean -- the regression signature of a
+/// scheduled-but-untracked task is a heap-use-after-free on `results` here.
+TEST(CasUploadFanout, TrackingSeamThrowStillDrains)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = openPool(b);
+    const RootNamespace ns{"srv1/nsTrackSeam"};
+    auto build = precommitBuildFor(s, ns, "part");
+
+    const String first = "track-seam-first";
+    const String second = "track-seam-second";
+    /// Dispatch is ascending-ref, so the smaller ref is enqueued first.
+    const String smaller = (idOf(first) < idOf(second)) ? first : second;
+
+    BoundedEvent first_task_running;
+    std::atomic<int> enqueue_calls{0};
+    BlobUploadFanoutHooksForTest hooks;
+    hooks.in_task = [&](const BlobRef & ref)
+    {
+        if (ref == idOf(smaller))
+            first_task_running.fire();
+    };
+    hooks.after_enqueue = [&](const BlobRef &)
+    {
+        /// Throw at the tracking seam of the SECOND enqueue -- by then both tasks are scheduled and (in
+        /// the fixed code) tracked, so the drain guard must join both. Gate on the first task RUNNING so
+        /// the drain cannot race a still-SCHEDULED cancellation; 10s is a pure hang guard.
+        if (++enqueue_calls == 2)
+        {
+            EXPECT_TRUE(first_task_running.wait(std::chrono::seconds(10)))
+                << "the first task must be RUNNING before the tracking-seam throw";
+            throw DB::Exception(DB::ErrorCodes::INCORRECT_DATA, "tracking-seam throw (test)");
+        }
+    };
+
+    std::vector<BlobUploadRequest> reqs{localRequest(first), localRequest(second)};
+    auto pool = makePool(2);
+    expectThrowsCode(DB::ErrorCodes::INCORRECT_DATA, [&]
+    {
+        fanOutBlobUploads(*build, reqs, *pool, &hooks);
+    });
+
+    /// The already-scheduled first task was drained before `results` was destroyed, so its body is
+    /// present; nothing was merged (merge-nothing on any fan-out throw).
+    EXPECT_TRUE(b->head(s->layout().blobKey(idOf(smaller))).exists)
+        << "an already-scheduled task was not drained before the stack unwound";
+    EXPECT_EQ(build->depsSnapshotForTest().size(), 0u) << "merge-nothing on a tracking-seam throw";
 }

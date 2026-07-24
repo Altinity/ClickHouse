@@ -223,8 +223,10 @@ private:
     /// scratch-build abandon, or a test hook) -- so `commit` can roll back precisely with
     /// `dropRefIfMatches` even when this call later throws. `out_slot` is left `std::nullopt` when this
     /// staging had nothing to publish or was already published earlier in this commit loop; `commit`
-    /// preallocates one slot per part so this write is index-addressed and never grows a container
-    /// (load-bearing once Task 5 calls this from multiple threads).
+    /// preallocates one slot per part so this write is a no-throw, index-addressed slot write that never
+    /// grows a container -- it exists for the serial publish loop's rollback bookkeeping. Parts are
+    /// published serially (`commit`'s loop); only the blob uploads WITHIN a part fan out. Concurrent
+    /// cross-part publication is future scope and is NOT done here.
     void publishStaging(const Cas::RootNamespace & ns, const std::string & ref, PartStaging & st,
                         std::optional<Cas::CommitOutcome> & out_slot);
 };
@@ -253,6 +255,12 @@ struct BlobUploadFanoutHooksForTest
     /// task's `BlobRef`. Lets a test rendezvous tasks on a latch (concurrent dedup-cache insertion, pool
     /// saturation) or fail a specific task deterministically, all without a sleep.
     std::function<void(const BlobRef &)> in_task;
+    /// Invoked on the DISPATCH thread immediately AFTER a task has been scheduled AND recorded in the
+    /// fan-out's own tracking vector, with that task's `BlobRef`. A throw here exercises the invariant
+    /// that no scheduled task is ever left untracked: because tracking publication is a no-throw append
+    /// into a pre-reserved vector, the task is already tracked when this fires, so the drain-on-every-path
+    /// guard joins it before the captured `results` storage is destroyed.
+    std::function<void(const BlobRef &)> after_enqueue;
 };
 
 /// Fan out a part's pending blob uploads across `pool` and merge the results into `build`
@@ -266,10 +274,10 @@ struct BlobUploadFanoutHooksForTest
 ///     calling thread only submits and joins -- never occupying a pool slot -- so a size-1 pool
 ///     degenerates to a correct serial run and can never deadlock;
 ///   - honours the MERGE-NOTHING failure contract: the join always drains every task (including on a
-///     throw raised during the dispatch loop, because the runner is scoped so its destructor drains
-///     first on the unwinding path); if ANY task threw, NOTHING is merged (`build` stays byte-for-byte
-///     at its pre-fan-out state) and the FIRST task error in ascending-`BlobRef` dispatch order is
-///     rethrown.
+///     throw raised during the dispatch loop, because a scope-exit drain guard joins every
+///     already-scheduled task on the unwinding path); if ANY task threw, NOTHING is merged (`build`
+///     stays byte-for-byte at its pre-fan-out state) and the FIRST task error in ascending-`BlobRef`
+///     dispatch order is rethrown.
 /// The query `ThreadGroup` is propagated to each task the `ThreadPoolCallbackRunnerLocal` way.
 void fanOutBlobUploads(
     PartWriteTxn & build,

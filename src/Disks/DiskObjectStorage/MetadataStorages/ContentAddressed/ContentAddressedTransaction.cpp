@@ -477,10 +477,11 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
     /// this part's publish and a later part's failure (see `CasCommitRollback.RepointByOtherWriterSurvivesRollback`).
     /// `part_outcomes` is snapshotted and preallocated up front (one allocation, index-addressed, no
     /// per-part growth) so `publishStaging` can write `part_outcomes[i]` with a no-throw slot write --
-    /// load-bearing once Task 5 dispatches these calls from multiple threads. The snapshot preserves
-    /// `parts`' own iteration order (the map's (ns, ref) sort order) -- there is no real dependency
-    /// between parts that would require a different order, and under Task 5's concurrent dispatch the
-    /// publish order is racy regardless of how this snapshot is built.
+    /// the precondition for the precise per-part rollback below. Parts are published SERIALLY by the loop
+    /// that follows; only the blob uploads within each part fan out (`fanOutBlobUploads`). The snapshot
+    /// preserves `parts`' own iteration order (the map's (ns, ref) sort order); there is no dependency
+    /// between parts that would require a different order. Concurrent cross-part publication is future
+    /// scope and is NOT done here.
     struct IndexedPart { Cas::RootNamespace ns; std::string ref; PartStaging * st; };
     std::vector<IndexedPart> ordered;
     ordered.reserve(parts.size());
@@ -1667,11 +1668,11 @@ void fanOutBlobUploads(
 
     /// One result slot per unique ref, pre-sized so element addresses are STABLE: each task writes ONLY
     /// its own slot (no data race on the vector) and the vector never reallocates. Declared BEFORE the
-    /// runner so it OUTLIVES it — the runner's destructor joins every task before `results` is destroyed
-    /// on EVERY path, including a throw raised during the dispatch loop below (the B90 lesson,
-    /// `threadPoolCallbackRunner.h:68`). Tasks capture only owning/value state: a stable slot pointer,
-    /// the request by value (its source is captured by value too), and the txn pointer whose pointee
-    /// outlives the runner.
+    /// runner and the drain guard so it OUTLIVES them — the drain guard joins every scheduled task before
+    /// `results` is destroyed on EVERY path, including a throw raised during the dispatch loop below (the
+    /// B90 lesson, `threadPoolCallbackRunner.h:68`). Tasks capture only owning/value state: a stable slot
+    /// pointer, the request by value (its source is captured by value too), and the txn pointer whose
+    /// pointee outlives the runner.
     std::vector<BlobUploadResult> results(grouped.size());
 
     {
@@ -1681,8 +1682,26 @@ void fanOutBlobUploads(
         /// CAS-specific `ThreadName` to the shared enum (`setThreadName.h` is outside the allowed file
         /// set), and UNKNOWN is the no-op name; it also stays clear of the pool-thread self-join
         /// assertions in `CasPool`. The query `ThreadGroup` is still propagated per task by the runner.
+        using RunnerTask = ThreadPoolCallbackRunnerLocal<void>::Task;
         ThreadPoolCallbackRunnerLocal<void> runner(pool, ThreadName::UNKNOWN);
         const PartWriteTxn * txn = &build;   /// `uploadBlobDetached` is const + build-neutral: safe off-thread
+        /// We track scheduled tasks in OUR OWN vector (via `enqueueAndGiveOwnership`) rather than the
+        /// runner's `enqueueAndKeepTrack`: that helper schedules a task and only THEN appends its handle
+        /// to an UNRESERVED tracking vector, so a `bad_alloc` at the append would leave a
+        /// scheduled-but-untracked task the runner's destructor cannot join — it would run later against
+        /// the already-destroyed `results`/txn (a use-after-free; codex stage-1 review, Critical).
+        /// PRE-RESERVING `handles` to the exact task count makes the append after each schedule a
+        /// no-throw operation, so a task is NEVER scheduled without being tracked in the SAME expression.
+        std::vector<std::shared_ptr<RunnerTask>> handles;
+        handles.reserve(grouped.size());
+        /// Drain on EVERY path: the runner's destructor only joins tasks IT owns (we use
+        /// `enqueueAndGiveOwnership`, so its own set stays empty), so WE must join every scheduled task
+        /// before `results` and the upload sources are destroyed — including when the dispatch loop
+        /// throws (an `on_dispatch`/`after_enqueue` seam, or a scheduling failure mid-loop). Declared
+        /// AFTER `handles`/`runner` so it runs FIRST on scope exit, joining while both are still alive;
+        /// `waitForAllToFinish` only waits (never throws), so it is safe on the unwinding path (the B90
+        /// lesson, `threadPoolCallbackRunner.h:68`).
+        SCOPE_EXIT_SAFE({ ThreadPoolCallbackRunnerLocal<void>::waitForAllToFinish(handles); });
         size_t idx = 0;
         for (const auto & [ref, req] : grouped)
         {
@@ -1690,20 +1709,25 @@ void fanOutBlobUploads(
             BlobUploadRequest task_req = req;
             const BlobUploadFanoutHooksForTest * task_hooks = hooks;
             if (hooks && hooks->on_dispatch)
-                hooks->on_dispatch(ref);   /// may throw ⇒ runner destructor drains already-scheduled tasks
-            runner.enqueueAndKeepTrack([slot, txn, req_by_value = std::move(task_req), task_hooks]
+                hooks->on_dispatch(ref);   /// may throw ⇒ the drain guard joins already-scheduled tasks
+            /// Schedule and track in ONE no-throw step: `enqueueAndGiveOwnership` returns the handle (the
+            /// task is now runnable) and the pre-reserved `emplace_back` records it without allocating, so
+            /// there is no window in which a scheduled task is untracked.
+            handles.emplace_back(runner.enqueueAndGiveOwnership([slot, txn, req_by_value = std::move(task_req), task_hooks]
             {
                 if (task_hooks && task_hooks->in_task)
                     task_hooks->in_task(req_by_value.ref);
                 *slot = txn->uploadBlobDetached(req_by_value);
-            });
+            }));
+            if (task_hooks && task_hooks->after_enqueue)
+                task_hooks->after_enqueue(ref);   /// task already tracked ⇒ the drain guard joins it too
             ProfileEvents::increment(ProfileEvents::CasBlobUploadFanoutTasks);
         }
         /// Drain ALL tasks, then rethrow the FIRST (ascending-ref dispatch order) that failed. A rethrow
         /// bypasses the merge below, so NOTHING is merged: `build` stays at its pre-fan-out pending-dep
-        /// state (merge-nothing). If the dispatch loop above threw, the runner's destructor — running as
-        /// this scope unwinds — drains every already-scheduled task before the stack leaves this frame.
-        runner.waitForAllToFinishAndRethrowFirstError();
+        /// state (merge-nothing). On success this clears `handles`, so the drain guard above then waits an
+        /// empty set; on any throw it leaves them and the guard joins the survivors (already all done).
+        ThreadPoolCallbackRunnerLocal<void>::waitForAllToFinishAndRethrowFirstError(handles);
     }
 
     /// Every task succeeded (else we rethrew above): fold all results into `build` on this (the owning
