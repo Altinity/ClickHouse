@@ -98,13 +98,13 @@ TEST(CasRefIntake, ManifestEdgesPerOperationShape)
         const auto edges = manifestEdgesOfTxn(txn("db/t", rid(1, 3), {promote("p", mr(1, 5))}));
         EXPECT_TRUE(edges.empty());
     }
-    /// set_payload / namespace_birth / remove_namespace => no edge.
+    /// set_published_at / namespace_birth / remove_namespace => no edge.
     {
-        RefOp payload;
-        payload.kind = RefOpKind::SetPayload;
-        payload.ref_name = "p";
-        payload.expected_manifest_ref = mr(1, 5);
-        EXPECT_TRUE(manifestEdgesOfTxn(txn("db/t", rid(1, 4), {payload})).empty());
+        RefOp set_published_at;
+        set_published_at.kind = RefOpKind::SetPublishedAt;
+        set_published_at.ref_name = "p";
+        set_published_at.expected_manifest_ref = mr(1, 5);
+        EXPECT_TRUE(manifestEdgesOfTxn(txn("db/t", rid(1, 4), {set_published_at})).empty());
 
         RefOp birth;
         birth.kind = RefOpKind::NamespaceBirth;

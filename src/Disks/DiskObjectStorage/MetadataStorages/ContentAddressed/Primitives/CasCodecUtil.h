@@ -88,7 +88,7 @@ inline bool isCanonicalRefName(std::string_view name)
 }
 
 /// Throws CORRUPTED_DATA naming both `caller` (the codec, e.g. "RefLogTxn") and `what` (the field,
-/// e.g. "set_payload ref_name") when `name` fails `isCanonicalRefName`.
+/// e.g. "set_published_at ref_name") when `name` fails `isCanonicalRefName`.
 /// On success, the input is unchanged; on failure, no partial normalization is attempted.
 inline void checkCanonicalRefName(std::string_view name, std::string_view caller, std::string_view what)
 {
@@ -101,7 +101,7 @@ inline void checkCanonicalRefName(std::string_view name, std::string_view caller
 /// `CasRefSnapshotFormat`): `writer_epoch`/`build_sequence` nonzero, `manifest_ordinal` in
 /// `[1, kMaxManifestOrdinal]` -- the same range `manifestOrdinalFileName` (`CasManifestId.h`) enforces
 /// at key-construction time. Throws CORRUPTED_DATA naming both `caller` (the codec) and `what` (the
-/// field, e.g. "set_payload manifest_ref").
+/// field, e.g. "set_published_at manifest_ref").
 /// This keeps the value-level invariant aligned with the range enforced by manifest-key construction
 /// before either a codec encoder or decoder accepts the reference.
 inline void checkManifestRef(const ManifestRef & ref, std::string_view caller, std::string_view what)

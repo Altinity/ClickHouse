@@ -468,8 +468,8 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
     /// Fail-closed (CLAUDE.md): only refs that were ABSENT before we published them are rolled back. A
     /// ref that already existed is pre-existing data this commit must never destroy on its error path.
     /// Publishing over a live ref does not occur in the MergeTree write path (unique part names), but
-    /// the rollback must not assume it. updateRefPayload mutations (autocommit one-shots on a COMMITTED
-    /// part) are individually durable by design and are deliberately NOT rolled back.
+    /// the rollback must not assume it. updateRefPublishedAt mutations (autocommit one-shots on a
+    /// COMMITTED part) are individually durable by design and are deliberately NOT rolled back.
     ///
     /// Task 3: the rollback keys on the EXACT manifest each `publishStaging` call committed
     /// (`Cas::CommitOutcome`), not merely on "this part's (ns, ref) name" -- an unconditional `dropRef`

@@ -32,16 +32,15 @@ using DB::Cas::tests::expectThrowsCode;
 namespace
 {
 
-/// A single `SetPayload` op whose `ref_name` is padded so its own encoded size (`encodedOpSize`) is
-/// exactly `target_bytes` -- same construction as `gtest_cas_ref_chunked_flush.cpp`'s helper of the
-/// same shape (not shared: each test file owns its small fixture helpers).
-RefOp paddedSetPayloadOp(size_t target_bytes)
+/// A single `SetPublishedAt` op whose `ref_name` is padded so its own encoded size (`encodedOpSize`)
+/// is exactly `target_bytes` -- same construction as `gtest_cas_ref_chunked_flush.cpp`'s helper of
+/// the same shape (not shared: each test file owns its small fixture helpers).
+RefOp paddedSetPublishedAtOp(size_t target_bytes)
 {
     RefOp op;
-    op.kind = RefOpKind::SetPayload;
+    op.kind = RefOpKind::SetPublishedAt;
     op.ref_name = "r";
     op.expected_manifest_ref = ManifestRef{1, 1, 1};
-    op.payload = "";
     op.published_at_ms = 0;
     const size_t base = encodedOpSize(op);
     op.ref_name = "r" + String(target_bytes - base, 'a');
@@ -88,10 +87,9 @@ TEST(CasRefDecodeBounds, PaddedNormalTxnOver20MiBRejected)
     txn.txn_id = RefTxnId{1, 1};
 
     RefOp op;
-    op.kind = RefOpKind::SetPayload;
+    op.kind = RefOpKind::SetPublishedAt;
     op.ref_name = "r";
     op.expected_manifest_ref = ManifestRef{1, 1, 1};
-    op.payload = "";
     op.published_at_ms = 1;
     txn.ops.push_back(op);
 
@@ -132,7 +130,7 @@ TEST(CasRefDecodeBounds, WriterPostEncodeThrowIsRuntime)
     constexpr size_t op_count = ref_txn_max_bytes / ref_op_max_bytes + 16;
     txn.ops.reserve(op_count);
     for (size_t i = 0; i < op_count; ++i)
-        txn.ops.push_back(paddedSetPayloadOp(ref_op_max_bytes));
+        txn.ops.push_back(paddedSetPublishedAtOp(ref_op_max_bytes));
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
 }

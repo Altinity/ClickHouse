@@ -30,16 +30,18 @@ TEST(CasEncodingPins, RefLogTxnAllOpKinds)
     transition.new_binding = RefOwnerBinding{RefOwnerKind::Committed, "20260101_0_1_1_1", ManifestRef{1, 2, 3}};
     txn.ops.push_back(transition);
 
-    RefOp payload;
-    payload.kind = RefOpKind::SetPayload;
-    payload.ref_name = "20260101_0_1_1_1";
-    payload.expected_manifest_ref = ManifestRef{1, 2, 3};
+    RefOp set_published_at;
+    set_published_at.kind = RefOpKind::SetPublishedAt;
     /// NOTE the split literals: "\x01" "e" (else the hex escape would swallow the 'e') and
-    /// "\xA8" "f" (else it would swallow the 'f'). The payload exercises quote, backslash,
-    /// newline, a bare control byte, and the three-byte U+2028 sequence.
-    payload.payload = String("a\"b\\c\nd") + "\x01" "e" + "\xE2\x80\xA8" "f";
-    payload.published_at_ms = 1234;
-    txn.ops.push_back(payload);
+    /// "\xA8" "f" (else it would swallow the 'f'). `checkCanonicalRefName` forbids '\\' and NUL but
+    /// not quote/newline/control bytes/U+2028, so `ref_name` -- the only free-form string `RefOp`
+    /// still carries now that `payload` is gone -- exercises quote, newline, a bare control byte,
+    /// and the three-byte U+2028 sequence. Backslash escaping is pinned separately, over an
+    /// unrestricted string, by `gtest_cas_json_writer.cpp`'s `CasJsonWriterEscaping` suite.
+    set_published_at.ref_name = String("20260101_0_1_1_1\"c\nd") + "\x01" "e" + "\xE2\x80\xA8" "f";
+    set_published_at.expected_manifest_ref = ManifestRef{1, 2, 3};
+    set_published_at.published_at_ms = 1234;
+    txn.ops.push_back(set_published_at);
 
     RefOp removal;
     removal.kind = RefOpKind::RemoveNamespace;
@@ -52,8 +54,8 @@ TEST(CasEncodingPins, RefLogTxnAllOpKinds)
         "{\"op\":\"owner_transition\",\"obk\":\"precommit\",\"orn\":\"20260101_0_1_1_1\","
         "\"ome\":\"1\",\"omb\":\"2\",\"omo\":3,\"nbk\":\"committed\",\"nrn\":\"20260101_0_1_1_1\","
         "\"nme\":\"1\",\"nmb\":\"2\",\"nmo\":3}\n"
-        "{\"op\":\"set_payload\",\"rn\":\"20260101_0_1_1_1\",\"me\":\"1\",\"mb\":\"2\",\"mo\":3,"
-        "\"pl\":\"a\\\"b\\\\c\\nd\\u0001e\\u2028f\",\"ts\":1234}\n"
+        "{\"op\":\"set_published_at\",\"rn\":\"20260101_0_1_1_1\\\"c\\nd\\u0001e\\u2028f\","
+        "\"me\":\"1\",\"mb\":\"2\",\"mo\":3,\"ts\":1234}\n"
         "{\"op\":\"remove_namespace\"}\n"
         "{\"n\":4}\n";
     EXPECT_EQ(encodeRefLogTxn(txn), expected);
@@ -70,7 +72,6 @@ TEST(CasEncodingPins, RefSnapshotLiveWithSealedFrom)
     RefCommittedRow row;
     row.ref_name = "20260101_0_1_1_1";
     row.manifest_ref = ManifestRef{1, 2, 3};
-    row.payload = "p";
     row.published_at_ms = 5;
     snap.committed.push_back(row);
 
@@ -79,7 +80,7 @@ TEST(CasEncodingPins, RefSnapshotLiveWithSealedFrom)
     const String expected =
         "{\"type\":\"cas_ref_snap\",\"v\":3}\n"
         "{\"ns\":\"roots/pin\",\"we\":\"7\",\"rs\":\"9\",\"lc\":\"live\",\"sfe\":\"7\",\"sfs\":\"8\"}\n"
-        "{\"k\":\"c\",\"rn\":\"20260101_0_1_1_1\",\"me\":\"1\",\"mb\":\"2\",\"mo\":3,\"pl\":\"p\",\"ts\":5}\n"
+        "{\"k\":\"c\",\"rn\":\"20260101_0_1_1_1\",\"me\":\"1\",\"mb\":\"2\",\"mo\":3,\"ts\":5}\n"
         "{\"k\":\"p\",\"rn\":\"20260102_0_2_2_2\",\"me\":\"4\",\"mb\":\"5\",\"mo\":6}\n"
         "{\"n\":2}\n";
     EXPECT_EQ(encodeRefTableSnapshot(snap), expected);

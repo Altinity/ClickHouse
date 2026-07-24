@@ -31,14 +31,12 @@ enum class RefLifecycle : uint8_t
     Removed = 2,
 };
 
-/// One committed ref-name-to-manifest row in a `RefTableSnapshot`. `payload` is an opaque wire
-/// carrier that production no longer populates but the format retains for compatibility and test
-/// coverage; `published_at_ms` is the only field current callers set.
+/// One committed ref-name-to-manifest row in a `RefTableSnapshot`. `published_at_ms` is the only
+/// mutable metadata field a committed row carries.
 struct RefCommittedRow
 {
     String ref_name;
     ManifestRef manifest_ref;
-    String payload;
     uint64_t published_at_ms = 0;
 
     bool operator==(const RefCommittedRow &) const = default;

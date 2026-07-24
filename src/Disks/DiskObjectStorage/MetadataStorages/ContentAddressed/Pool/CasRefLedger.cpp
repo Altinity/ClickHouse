@@ -1498,12 +1498,12 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
             for (const RefOp & op : item_ops)
             {
                 /// Admission budget: only STATE-GROWING ops need the check --
-                /// an `owner_transition` installing a binding (add or promote) and `set_payload`.
+                /// an `owner_transition` installing a binding (add or promote) and `set_published_at`.
                 /// `namespace_birth` is exempt (it grows nothing, and a never-born state's preview has
                 /// no meaningful "current snapshot" to encode); `remove_namespace` and a pure
                 /// owner_transition removal shrink state and can never violate the budget.
                 const bool state_growing = (op.kind == RefOpKind::OwnerTransition && op.new_binding.has_value())
-                    || op.kind == RefOpKind::SetPayload;
+                    || op.kind == RefOpKind::SetPublishedAt;
                 if (state_growing && !admits(item_scratch, op, rt->snapshot_budget, rt->removal_budget))
                     throw Exception(ErrorCodes::LIMIT_EXCEEDED,
                         "ref mutation on namespace '{}' would exceed the table's admission budget "
@@ -2346,38 +2346,38 @@ void CasRefLedger::dropRef(const RootNamespace & ns, const String & ref_name)
 }
 
 
-void CasRefLedger::updateRefPayload(const RootNamespace & ns, const String & ref_name,
-                             std::function<void(RefPayloadUpdate &)> mutator)
+void CasRefLedger::updateRefPublishedAt(const RootNamespace & ns, const String & ref_name,
+                             std::function<void(RefPublishedAtUpdate &)> mutator)
 {
-    /// One `set_payload` ref-log transaction. EVERY change (even
-    /// payload-only) is an explicit logged operation -- the immutable append-only log has no other way
-    /// to record it. The payload this op carries has shrunk to just
-    /// `published_at_ms` (the mutable-file map is gone; every per-part file is an ordinary manifest
-    /// tree entry now, republished via `repointRef`, never through this side channel).
+    /// One `set_published_at` ref-log transaction. EVERY change (even timestamp-only) is an explicit
+    /// logged operation -- the immutable append-only log has no other way to record it.
+    /// `published_at_ms` is the only metadata this op carries (the mutable-file map is gone; every
+    /// per-part file is an ordinary manifest tree entry now, republished via `repointRef`, never
+    /// through this side channel).
     appendRefOps(ns, MutationScope::ref(ref_name),
         [&](const RefTableState & state) -> std::vector<RefOp>
         {
             const auto it = state.getCommitted().find(ref_name);
             if (it == state.getCommitted().end())
                 throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
-                    "updateRefPayload: no such ref {} in namespace {}", ref_name, ns.string());
+                    "updateRefPublishedAt: no such ref {} in namespace {}", ref_name, ns.string());
 
             /// The mutator edits only `published_at_ms`; the carrier deliberately carries no
             /// `manifest_ref`, so a reachability change is structurally impossible here (it goes through
             /// publish/drop/repoint instead).
-            RefPayloadUpdate update;
+            RefPublishedAtUpdate update;
             update.published_at_ms = it->second.published_at_ms;
 
             mutator(update);
 
             RefOp op;
-            op.kind = RefOpKind::SetPayload;
+            op.kind = RefOpKind::SetPublishedAt;
             op.ref_name = ref_name;
             op.expected_manifest_ref = it->second.manifest_ref;
             op.published_at_ms = update.published_at_ms;
             return {op};
         },
-        RootMutationOrigin::Writer, RootMutationKind::UpdateRefPayload);
+        RootMutationOrigin::Writer, RootMutationKind::UpdateRefPublishedAt);
 }
 
 

@@ -86,10 +86,10 @@ public:
     /// propagates its exception and does not apply the removal to the in-memory table.
     void dropRef(const RootNamespace & ns, const String & ref_name);
 
-    /// Builds and appends a payload update for one ref. The mutator is invoked while constructing the
-    /// transaction, and its changes become visible only after the append is durable.
-    void updateRefPayload(const RootNamespace & ns, const String & ref_name,
-                          std::function<void(RefPayloadUpdate &)> mutator);
+    /// Builds and appends a published_at_ms update for one ref. The mutator is invoked while
+    /// constructing the transaction, and its changes become visible only after the append is durable.
+    void updateRefPublishedAt(const RootNamespace & ns, const String & ref_name,
+                          std::function<void(RefPublishedAtUpdate &)> mutator);
 
     /// Durably removes the complete namespace, including its current ref/precommit state, then performs
     /// the associated cleanup and cancellation work. Repeated removal observes the cached `Removed`

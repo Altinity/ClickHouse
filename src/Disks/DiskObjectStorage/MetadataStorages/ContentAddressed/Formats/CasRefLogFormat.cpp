@@ -26,7 +26,7 @@ std::string_view opKindToWord(RefOpKind k)
     {
         case RefOpKind::NamespaceBirth:  return "namespace_birth";
         case RefOpKind::OwnerTransition: return "owner_transition";
-        case RefOpKind::SetPayload:      return "set_payload";
+        case RefOpKind::SetPublishedAt:  return "set_published_at";
         case RefOpKind::RemoveNamespace: return "remove_namespace";
     }
     throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: unknown op kind {}", static_cast<uint8_t>(k));
@@ -34,10 +34,10 @@ std::string_view opKindToWord(RefOpKind k)
 
 RefOpKind opKindFromWord(std::string_view w)
 {
-    if (w == "namespace_birth")  return RefOpKind::NamespaceBirth;
-    if (w == "owner_transition") return RefOpKind::OwnerTransition;
-    if (w == "set_payload")      return RefOpKind::SetPayload;
-    if (w == "remove_namespace") return RefOpKind::RemoveNamespace;
+    if (w == "namespace_birth")   return RefOpKind::NamespaceBirth;
+    if (w == "owner_transition")  return RefOpKind::OwnerTransition;
+    if (w == "set_published_at")  return RefOpKind::SetPublishedAt;
+    if (w == "remove_namespace")  return RefOpKind::RemoveNamespace;
     throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: unknown op kind '{}'", w);
 }
 
@@ -101,14 +101,12 @@ void writeOp(CasJsonWriter & out, const RefOp & op)
             if (op.new_binding)
                 writeBindingFields(out, first, "n", *op.new_binding);
             break;
-        case RefOpKind::SetPayload:
-            checkCanonicalRefName(op.ref_name, "RefLogTxn", "set_payload ref_name");
-            checkManifestRef(op.expected_manifest_ref, "RefLogTxn", "set_payload manifest_ref");
+        case RefOpKind::SetPublishedAt:
+            checkCanonicalRefName(op.ref_name, "RefLogTxn", "set_published_at ref_name");
+            checkManifestRef(op.expected_manifest_ref, "RefLogTxn", "set_published_at manifest_ref");
             writeKey(out, "rn", first);
             writeStringValue(out, op.ref_name);
             writeManifestRefFields(out, first, "", op.expected_manifest_ref);
-            writeKey(out, "pl", first);
-            writeStringValue(out, op.payload);
             writeKey(out, "ts", first);
             writeIntText(op.published_at_ms, out);
             break;
@@ -174,10 +172,9 @@ RefOp readOpRecord(JsonObjectReader & r, RefOpKind kind)
     RefOp op;
     op.kind = kind;
 
-    /// set_payload fields
+    /// set_published_at fields
     std::optional<String> sp_rn;
     ManifestFields sp_mf;
-    std::optional<String> sp_pl;
     std::optional<uint64_t> sp_ts;
     /// owner_transition bindings
     BindingFields ob;
@@ -190,7 +187,6 @@ RefOp readOpRecord(JsonObjectReader & r, RefOpKind kind)
         else if (key == "me") sp_mf.me = r.readU64String();
         else if (key == "mb") sp_mf.mb = r.readU64String();
         else if (key == "mo") sp_mf.mo = r.readU64Number();
-        else if (key == "pl") sp_pl = r.readString();
         else if (key == "ts") sp_ts = r.readU64Number();
         else if (key == "obk") ob.bk = r.readString();
         else if (key == "orn") ob.rn = r.readString();
@@ -216,13 +212,12 @@ RefOp readOpRecord(JsonObjectReader & r, RefOpKind kind)
             if (nb.any())
                 op.new_binding = nb.build("new");
             break;
-        case RefOpKind::SetPayload:
-            if (!sp_rn || !sp_pl || !sp_ts)
-                throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: set_payload missing rn/pl/ts");
+        case RefOpKind::SetPublishedAt:
+            if (!sp_rn || !sp_ts)
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: set_published_at missing rn/ts");
             op.ref_name = *sp_rn;
-            checkCanonicalRefName(op.ref_name, "RefLogTxn", "set_payload ref_name");
-            op.expected_manifest_ref = sp_mf.build("set_payload manifest_ref");
-            op.payload = *sp_pl;
+            checkCanonicalRefName(op.ref_name, "RefLogTxn", "set_published_at ref_name");
+            op.expected_manifest_ref = sp_mf.build("set_published_at manifest_ref");
             op.published_at_ms = *sp_ts;
             break;
     }

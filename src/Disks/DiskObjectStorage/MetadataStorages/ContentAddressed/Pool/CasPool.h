@@ -436,8 +436,8 @@ public:
 
     /// ---- ref lifecycle ----
     void dropRef(const RootNamespace & ns, const String & ref_name);            /// one owner_transition removal txn
-    void updateRefPayload(const RootNamespace & ns, const String & ref_name,
-                          std::function<void(RefPayloadUpdate &)> mutator);   /// one set_payload txn
+    void updateRefPublishedAt(const RootNamespace & ns, const String & ref_name,
+                          std::function<void(RefPublishedAtUpdate &)> mutator);   /// one set_published_at txn
     /// one ref-log transaction naming every owner's exact removal
     /// followed by `remove_namespace`, then a best-effort publish of the constant-size `Removed`
     /// snapshot. Performs NO physical deletion (no verbatim-file deletes, no tombstones) -- that is
@@ -457,7 +457,7 @@ public:
 
     /// ==== writer ref-log append lane ====
     ///
-    /// The ONE entry point every ref mutation funnels through -- Pool's own dropRef/updateRefPayload
+    /// The ONE entry point every ref mutation funnels through -- Pool's own dropRef/updateRefPublishedAt
     /// above, and (as a friend) PartWriteTxn's precommitAdd/promote/abandon. This is the SOLE ref-persistence
     /// lane now: the legacy per-(ns,shard) mutable manifest format was removed once GC/sweep/fsck/inspect
     /// were rewired onto the snapshot+log ref protocol.

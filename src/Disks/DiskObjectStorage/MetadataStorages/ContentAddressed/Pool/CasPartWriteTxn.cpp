@@ -1151,11 +1151,10 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
             }
 
             /// Promotion is a PURE OWNER MOVE: the SAME manifest_ref T moves from
-            /// precommit to committed in one atomic transaction, together with the SetPayload op that
-            /// stamps `published_at_ms` (the initial stamp arrives via a separate set_payload op,
-            /// in the same transaction or a later one -- here, the same one;
-            /// dropped the mutable-file payload this op used to also carry). It emits NO blob deltas; the
-            /// activating `+1` came from GC's barrier-activation of the create-precommit op.
+            /// precommit to committed in one atomic transaction, together with the SetPublishedAt op
+            /// that stamps `published_at_ms` (the initial stamp arrives via a separate set_published_at
+            /// op, in the same transaction or a later one -- here, the same one). It emits NO blob
+            /// deltas; the activating `+1` came from GC's barrier-activation of the create-precommit op.
             std::vector<RefOp> ops;
             /// An intended repoint additionally retires the OLD committed
             /// binding in this SAME ref-log record -- a separate OwnerTransition (old=Committed(repoint_old),
@@ -1182,12 +1181,12 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
             transition.new_binding = RefOwnerBinding{RefOwnerKind::Committed, final_ref_name, id.ref};
             ops.push_back(transition);
 
-            RefOp payload_op;
-            payload_op.kind = RefOpKind::SetPayload;
-            payload_op.ref_name = final_ref_name;
-            payload_op.expected_manifest_ref = id.ref;
-            payload_op.published_at_ms = nowMs();
-            ops.push_back(payload_op);
+            RefOp set_published_at;
+            set_published_at.kind = RefOpKind::SetPublishedAt;
+            set_published_at.ref_name = final_ref_name;
+            set_published_at.expected_manifest_ref = id.ref;
+            set_published_at.published_at_ms = nowMs();
+            ops.push_back(set_published_at);
             return ops;
         },
         RootMutationOrigin::Writer, RootMutationKind::Promote);

@@ -14,11 +14,10 @@ using namespace DB::Cas;
 namespace
 {
 
-RefCommittedRow row(uint64_t epoch, uint64_t seq, uint32_t ordinal, String payload = "")
+RefCommittedRow row(uint64_t epoch, uint64_t seq, uint32_t ordinal)
 {
     RefCommittedRow r;
     r.manifest_ref = ManifestRef{epoch, seq, ordinal};
-    r.payload = payload;
     return r;
 }
 

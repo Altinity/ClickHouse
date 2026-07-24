@@ -168,16 +168,15 @@ TEST(CasRefCodec, RoundTripRemoveNamespace)
     EXPECT_EQ(decoded, txn);
 }
 
-TEST(CasRefCodec, RoundTripSetPayload)
+TEST(CasRefCodec, RoundTripSetPublishedAt)
 {
     RefLogTxn txn;
     txn.ns = "srv1/db/table@cas@";
     txn.txn_id = RefTxnId{3, 5};
     RefOp op;
-    op.kind = RefOpKind::SetPayload;
+    op.kind = RefOpKind::SetPublishedAt;
     op.ref_name = "all_1_1_0";
     op.expected_manifest_ref = manifestRef(3, 4, 1);
-    op.payload = "mutable-ref-payload-bytes";
     op.published_at_ms = 1717000000000ULL;
     txn.ops.push_back(op);
 
@@ -186,16 +185,15 @@ TEST(CasRefCodec, RoundTripSetPayload)
     EXPECT_EQ(decoded, txn);
 }
 
-TEST(CasRefCodec, RoundTripSetPayloadEmptyPayload)
+TEST(CasRefCodec, RoundTripSetPublishedAtZeroTimestamp)
 {
     RefLogTxn txn;
     txn.ns = "ns";
     txn.txn_id = RefTxnId{1, 1};
     RefOp op;
-    op.kind = RefOpKind::SetPayload;
+    op.kind = RefOpKind::SetPublishedAt;
     op.ref_name = "r";
     op.expected_manifest_ref = manifestRef(1, 1, 1);
-    op.payload = "";
     op.published_at_ms = 0;
     txn.ops.push_back(op);
 
@@ -274,13 +272,12 @@ TEST(CasRefCodec, RoundTripMultipleOpsInOneTransaction)
     add.new_binding = RefOwnerBinding{RefOwnerKind::Precommit, "a/b/c", manifestRef(9, 1, 1)};
     txn.ops.push_back(add);
 
-    RefOp payload;
-    payload.kind = RefOpKind::SetPayload;
-    payload.ref_name = "a/b/c";
-    payload.expected_manifest_ref = manifestRef(9, 1, 1);
-    payload.payload = "x";
-    payload.published_at_ms = 42;
-    txn.ops.push_back(payload);
+    RefOp set_published_at;
+    set_published_at.kind = RefOpKind::SetPublishedAt;
+    set_published_at.ref_name = "a/b/c";
+    set_published_at.expected_manifest_ref = manifestRef(9, 1, 1);
+    set_published_at.published_at_ms = 42;
+    txn.ops.push_back(set_published_at);
 
     const String bytes = encodeRefLogTxn(txn);
     const RefLogTxn decoded = decodeRefLogTxn(bytes, txn.ns, txn.txn_id);
@@ -305,13 +302,12 @@ TEST(CasRefCodec, ByteIdenticalReencode)
     add.new_binding = RefOwnerBinding{RefOwnerKind::Committed, "a/b/c", manifestRef(9, 1, 1)};
     txn.ops.push_back(add);
 
-    RefOp payload;
-    payload.kind = RefOpKind::SetPayload;
-    payload.ref_name = "a/b/c";
-    payload.expected_manifest_ref = manifestRef(9, 1, 1);
-    payload.payload = "some-payload";
-    payload.published_at_ms = 1717000000000ULL;
-    txn.ops.push_back(payload);
+    RefOp set_published_at;
+    set_published_at.kind = RefOpKind::SetPublishedAt;
+    set_published_at.ref_name = "a/b/c";
+    set_published_at.expected_manifest_ref = manifestRef(9, 1, 1);
+    set_published_at.published_at_ms = 1717000000000ULL;
+    txn.ops.push_back(set_published_at);
 
     const String bytes1 = encodeRefLogTxn(txn);
     const RefLogTxn decoded = decodeRefLogTxn(bytes1, txn.ns, txn.txn_id);
@@ -337,10 +333,9 @@ TEST(CasRefCodec, DecodeRejectsTruncatedBuffer)
     txn.ns = "ns";
     txn.txn_id = RefTxnId{1, 1};
     RefOp op;
-    op.kind = RefOpKind::SetPayload;
+    op.kind = RefOpKind::SetPublishedAt;
     op.ref_name = "r";
     op.expected_manifest_ref = manifestRef(1, 1, 1);
-    op.payload = "some payload";
     txn.ops.push_back(op);
     const String bytes = encodeRefLogTxn(txn);
 
@@ -383,7 +378,7 @@ TEST(CasRefCodec, EncodeRejectsEmptyRefName)
     txn.ns = "ns";
     txn.txn_id = RefTxnId{1, 1};
     RefOp op;
-    op.kind = RefOpKind::SetPayload;
+    op.kind = RefOpKind::SetPublishedAt;
     op.ref_name = "";
     op.expected_manifest_ref = manifestRef(1, 1, 1);
     txn.ops.push_back(op);
@@ -396,7 +391,7 @@ TEST(CasRefCodec, EncodeRejectsDotRefName)
     txn.ns = "ns";
     txn.txn_id = RefTxnId{1, 1};
     RefOp op;
-    op.kind = RefOpKind::SetPayload;
+    op.kind = RefOpKind::SetPublishedAt;
     op.ref_name = ".";
     op.expected_manifest_ref = manifestRef(1, 1, 1);
     txn.ops.push_back(op);
@@ -409,7 +404,7 @@ TEST(CasRefCodec, EncodeRejectsDotDotSegment)
     txn.ns = "ns";
     txn.txn_id = RefTxnId{1, 1};
     RefOp op;
-    op.kind = RefOpKind::SetPayload;
+    op.kind = RefOpKind::SetPublishedAt;
     op.ref_name = "a/../b";
     op.expected_manifest_ref = manifestRef(1, 1, 1);
     txn.ops.push_back(op);
@@ -422,7 +417,7 @@ TEST(CasRefCodec, EncodeRejectsRepeatedSeparator)
     txn.ns = "ns";
     txn.txn_id = RefTxnId{1, 1};
     RefOp op;
-    op.kind = RefOpKind::SetPayload;
+    op.kind = RefOpKind::SetPublishedAt;
     op.ref_name = "a//b";
     op.expected_manifest_ref = manifestRef(1, 1, 1);
     txn.ops.push_back(op);
@@ -435,7 +430,7 @@ TEST(CasRefCodec, EncodeRejectsLeadingSlash)
     txn.ns = "ns";
     txn.txn_id = RefTxnId{1, 1};
     RefOp op;
-    op.kind = RefOpKind::SetPayload;
+    op.kind = RefOpKind::SetPublishedAt;
     op.ref_name = "/a";
     op.expected_manifest_ref = manifestRef(1, 1, 1);
     txn.ops.push_back(op);
@@ -448,7 +443,7 @@ TEST(CasRefCodec, EncodeRejectsTrailingSlash)
     txn.ns = "ns";
     txn.txn_id = RefTxnId{1, 1};
     RefOp op;
-    op.kind = RefOpKind::SetPayload;
+    op.kind = RefOpKind::SetPublishedAt;
     op.ref_name = "a/";
     op.expected_manifest_ref = manifestRef(1, 1, 1);
     txn.ops.push_back(op);
@@ -461,7 +456,7 @@ TEST(CasRefCodec, EncodeRejectsBackslash)
     txn.ns = "ns";
     txn.txn_id = RefTxnId{1, 1};
     RefOp op;
-    op.kind = RefOpKind::SetPayload;
+    op.kind = RefOpKind::SetPublishedAt;
     op.ref_name = "a\\b";
     op.expected_manifest_ref = manifestRef(1, 1, 1);
     txn.ops.push_back(op);
@@ -486,7 +481,7 @@ TEST(CasRefCodec, EncodeRejectsEmbeddedNulRefName)
     txn.ns = "ns";
     txn.txn_id = RefTxnId{1, 1};
     RefOp op;
-    op.kind = RefOpKind::SetPayload;
+    op.kind = RefOpKind::SetPublishedAt;
     op.ref_name = String("a\0b", 3);   /// embedded NUL byte -- never legitimate in a ref name
     op.expected_manifest_ref = manifestRef(1, 1, 1);
     txn.ops.push_back(op);
@@ -529,20 +524,19 @@ TEST(CasRefCodec, EncodeRejectsOversizedNormalTransaction)
     txn.ns = "ns";
     txn.txn_id = RefTxnId{1, 1};
     RefOp op;
-    op.kind = RefOpKind::SetPayload;
-    op.ref_name = "r";
+    op.kind = RefOpKind::SetPublishedAt;
+    op.ref_name = "r" + String(ref_txn_max_bytes + 1, 'x');
     op.expected_manifest_ref = manifestRef(1, 1, 1);
-    op.payload = String(ref_txn_max_bytes + 1, 'x');
     txn.ops.push_back(op);
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
 }
 
 TEST(CasRefCodec, RemovalClassTransactionLiftsByteBudgetAboveNormalLimit)
 {
-    /// A RemoveNamespace transaction carrying a payload bigger than the NORMAL limit but within the
+    /// A RemoveNamespace transaction carrying a ref_name bigger than the NORMAL limit but within the
     /// REMOVAL limit must succeed -- proving the removal-class flag actually lifts the byte budget
-    /// rather than merely being ignored. The single payload op here is also vastly bigger than
-    /// `ref_op_max_bytes`, so this doubles as proof that removal-class ops are exempt from the
+    /// rather than merely being ignored. The single set_published_at op here is also vastly bigger
+    /// than `ref_op_max_bytes`, so this doubles as proof that removal-class ops are exempt from the
     /// per-op cap too.
     RefLogTxn txn;
     txn.ns = "ns";
@@ -552,12 +546,11 @@ TEST(CasRefCodec, RemovalClassTransactionLiftsByteBudgetAboveNormalLimit)
     remove.kind = RefOpKind::RemoveNamespace;
     txn.ops.push_back(remove);
 
-    RefOp payload;
-    payload.kind = RefOpKind::SetPayload;
-    payload.ref_name = "r";
-    payload.expected_manifest_ref = manifestRef(1, 1, 1);
-    payload.payload = String(ref_txn_max_bytes + 1024, 'x');
-    txn.ops.push_back(payload);
+    RefOp set_published_at;
+    set_published_at.kind = RefOpKind::SetPublishedAt;
+    set_published_at.ref_name = "r" + String(ref_txn_max_bytes + 1024, 'x');
+    set_published_at.expected_manifest_ref = manifestRef(1, 1, 1);
+    txn.ops.push_back(set_published_at);
 
     const String bytes = encodeRefLogTxn(txn);
     EXPECT_GT(bytes.size(), ref_txn_max_bytes);
@@ -575,12 +568,11 @@ TEST(CasRefCodec, RemovalClassTransactionStillRejectsBeyondRemovalLimit)
     remove.kind = RefOpKind::RemoveNamespace;
     txn.ops.push_back(remove);
 
-    RefOp payload;
-    payload.kind = RefOpKind::SetPayload;
-    payload.ref_name = "r";
-    payload.expected_manifest_ref = manifestRef(1, 1, 1);
-    payload.payload = String(ref_removal_max_bytes + 1, 'x');
-    txn.ops.push_back(payload);
+    RefOp set_published_at;
+    set_published_at.kind = RefOpKind::SetPublishedAt;
+    set_published_at.ref_name = "r" + String(ref_removal_max_bytes + 1, 'x');
+    set_published_at.expected_manifest_ref = manifestRef(1, 1, 1);
+    txn.ops.push_back(set_published_at);
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
 }
@@ -623,10 +615,9 @@ TEST(CasRefCodec, EncodeAllowsExactlyMaxPerOpBytes)
     txn.ns = "ns";
     txn.txn_id = RefTxnId{1, 1};
     RefOp op;
-    op.kind = RefOpKind::SetPayload;
+    op.kind = RefOpKind::SetPublishedAt;
     op.ref_name = "r";
     op.expected_manifest_ref = manifestRef(1, 1, 1);
-    op.payload = "";
     txn.ops.push_back(op);
 
     const size_t base_size = encodedOpSize(op);
@@ -647,10 +638,9 @@ TEST(CasRefCodec, EncodeRejectsOversizedOpOnNormalTransaction)
     txn.ns = "ns";
     txn.txn_id = RefTxnId{1, 1};
     RefOp op;
-    op.kind = RefOpKind::SetPayload;
+    op.kind = RefOpKind::SetPublishedAt;
     op.ref_name = "r";
     op.expected_manifest_ref = manifestRef(1, 1, 1);
-    op.payload = "";
     txn.ops.push_back(op);
 
     const size_t base_size = encodedOpSize(op);
@@ -672,16 +662,18 @@ TEST(CasRefCodec, EncodeAllowsExactlyMaxRemovalBytes)
     RefOp remove;
     remove.kind = RefOpKind::RemoveNamespace;
     txn.ops.push_back(remove);
-    RefOp payload_op;
-    payload_op.kind = RefOpKind::SetPayload;
-    payload_op.ref_name = "r";
-    payload_op.expected_manifest_ref = manifestRef(1, 1, 1);
-    payload_op.payload = "";
-    txn.ops.push_back(payload_op);
+    RefOp ts_op;
+    ts_op.kind = RefOpKind::SetPublishedAt;
+    ts_op.ref_name = "r";
+    ts_op.expected_manifest_ref = manifestRef(1, 1, 1);
+    txn.ops.push_back(ts_op);
 
     const size_t base_size = encodeRefLogTxn(txn).size();
     ASSERT_LE(base_size, ref_removal_max_bytes);
-    txn.ops[1].payload = String(ref_removal_max_bytes - base_size, 'x');
+    /// Every added 'x' is one un-escaped byte inside the JSON ref-name string, so the encoded size
+    /// grows one-for-one to exactly the cap; the base "r" contributes 1 byte already counted in
+    /// base_size, so appending (rather than replacing) reaches the target exactly.
+    txn.ops[1].ref_name = "r" + String(ref_removal_max_bytes - base_size, 'x');
 
     const String bytes = encodeRefLogTxn(txn);
     EXPECT_EQ(bytes.size(), ref_removal_max_bytes);
@@ -729,13 +721,13 @@ TEST(CasRefCodec, EncodeRejectsOutOfRangeManifestOrdinalInOwnerBinding)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
 }
 
-TEST(CasRefCodec, EncodeRejectsZeroManifestRefInSetPayload)
+TEST(CasRefCodec, EncodeRejectsZeroManifestRefInSetPublishedAt)
 {
     RefLogTxn txn;
     txn.ns = "ns";
     txn.txn_id = RefTxnId{1, 1};
     RefOp op;
-    op.kind = RefOpKind::SetPayload;
+    op.kind = RefOpKind::SetPublishedAt;
     op.ref_name = "r";
     op.expected_manifest_ref = manifestRef(1, 1, 0);
     txn.ops.push_back(op);
@@ -752,10 +744,9 @@ TEST(CasFormatBattery, RefLog)
     txn.ns = "ns";
     txn.txn_id = RefTxnId{1, 1};
     RefOp op;
-    op.kind = RefOpKind::SetPayload;
+    op.kind = RefOpKind::SetPublishedAt;
     op.ref_name = "all_1_1_0";
     op.expected_manifest_ref = manifestRef(1, 1, 1);
-    op.payload = "p";
     op.published_at_ms = 42;
     txn.ops.push_back(op);
 
@@ -766,6 +757,6 @@ TEST(CasFormatBattery, RefLog)
         [ns, id](std::string_view s) { decodeRefLogTxn(openObject(FormatId::RefLog, s), ns, id); },
         "{\"type\":\"cas_ref_log\",\"v\":3}\n"
         "{\"ns\":\"ns\",\"we\":\"1\",\"rs\":\"1\"}\n"
-        "{\"op\":\"set_payload\",\"rn\":\"all_1_1_0\",\"me\":\"1\",\"mb\":\"1\",\"mo\":1,\"pl\":\"p\",\"ts\":42}\n"
+        "{\"op\":\"set_published_at\",\"rn\":\"all_1_1_0\",\"me\":\"1\",\"mb\":\"1\",\"mo\":1,\"ts\":42}\n"
         "{\"n\":1}\n"});
 }

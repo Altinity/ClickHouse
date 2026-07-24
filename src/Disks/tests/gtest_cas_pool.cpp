@@ -989,7 +989,7 @@ TEST(CasPool, ReadManifestFailsClosed)
     }
 }
 
-/// ---------- ref lifecycle: dropRef / updateRefPayload / dropNamespace ----------
+/// ---------- ref lifecycle: dropRef / updateRefPublishedAt / dropNamespace ----------
 
 TEST(CasPool, DropRefAppendsJournalAtomically)
 {
@@ -1012,16 +1012,16 @@ TEST(CasPool, DropRefAppendsJournalAtomically)
     expectThrowsCode(DB::ErrorCodes::FILE_DOESNT_EXIST, [&] { s->dropRef(ns, "no_such_ref"); });
 }
 
-/// Task 10 renamed this from "...WithoutJournal": updateRefPayload now DOES append an immutable
-/// `set_payload` ref-log transaction (spec §Update Payload) -- the old journal-free in-place field
-/// mutation had no equivalent once persistence is an append-only log; every change, even payload-only,
+/// Task 10 renamed this from "...WithoutJournal": updateRefPublishedAt now DOES append an immutable
+/// `set_published_at` ref-log transaction (spec §Update Payload) -- the old journal-free in-place field
+/// mutation had no equivalent once persistence is an append-only log; every change, even timestamp-only,
 /// must be a logged operation to be part of the ordered history. All-tree-part-files Task 9: the
 /// carrier's mutable-file map is gone -- `published_at_ms` is the only field left to mutate. The
 /// surviving contract is the user-visible one: a `published_at_ms` update is observable through
-/// resolveRef and the manifest edge cannot change on this path -- the `RefPayloadUpdate` carrier
+/// resolveRef and the manifest edge cannot change on this path -- the `RefPublishedAtUpdate` carrier
 /// deliberately has no `manifest_ref` field, so a reachability change is structurally impossible here
 /// (it goes through publish/drop/repoint instead).
-TEST(CasPool, UpdateRefPayloadUpdatesPublishedAtMs)
+TEST(CasPool, UpdateRefPublishedAtUpdatesPublishedAtMs)
 {
     auto b = std::make_shared<InMemoryBackend>();
     auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
@@ -1030,8 +1030,8 @@ TEST(CasPool, UpdateRefPayloadUpdatesPublishedAtMs)
     const ManifestId id = publishPart(s, ns.string(), "part_1", "payload-1");
     const ManifestRef manifest_ref = id.ref;
 
-    s->updateRefPayload(ns, "part_1", [](RefPayloadUpdate & r) { r.published_at_ms = 1; });
-    s->updateRefPayload(ns, "part_1", [](RefPayloadUpdate & r) { r.published_at_ms = 7; });
+    s->updateRefPublishedAt(ns, "part_1", [](RefPublishedAtUpdate & r) { r.published_at_ms = 1; });
+    s->updateRefPublishedAt(ns, "part_1", [](RefPublishedAtUpdate & r) { r.published_at_ms = 7; });
 
     auto after = s->resolveRef(ns, "part_1");
     ASSERT_TRUE(after.has_value());

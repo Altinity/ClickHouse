@@ -139,7 +139,6 @@ String renderRefCommittedRow(const RefCommittedRow & r)
     return JsonObj()
         .add("ref_name", jsonEscape(r.ref_name))
         .add("manifest_ref", renderManifestRef(r.manifest_ref))
-        .add("payload_size", jsonUInt(r.payload.size()))
         .add("published_at_ms", jsonUInt(r.published_at_ms))
         .str();
 }
@@ -188,7 +187,7 @@ String refOpKindName(RefOpKind k)
     {
         case RefOpKind::NamespaceBirth: return "NamespaceBirth";
         case RefOpKind::OwnerTransition: return "OwnerTransition";
-        case RefOpKind::SetPayload: return "SetPayload";
+        case RefOpKind::SetPublishedAt: return "SetPublishedAt";
         case RefOpKind::RemoveNamespace: return "RemoveNamespace";
     }
     return "Unknown";
@@ -202,7 +201,6 @@ String renderRefOp(const RefOp & op)
         .add("new_binding", op.new_binding ? renderRefOwnerBinding(*op.new_binding) : "null")
         .add("ref_name", jsonEscape(op.ref_name))
         .add("expected_manifest_ref", renderManifestRef(op.expected_manifest_ref))
-        .add("payload_size", jsonUInt(op.payload.size()))
         .add("published_at_ms", jsonUInt(op.published_at_ms))
         .str();
 }

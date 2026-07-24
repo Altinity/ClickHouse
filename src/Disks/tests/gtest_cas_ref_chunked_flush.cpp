@@ -139,17 +139,16 @@ String paddedRefName(size_t i)
     return "ref_" + String(6 - s.size(), '0') + s;
 }
 
-/// A single `SetPayload` op whose `ref_name` is padded so its OWN encoded size (`encodedOpSize`) is
-/// exactly `target_bytes`. Every added 'a' is one un-escaped byte in the JSON ref-name string, so the
-/// size grows one-for-one; `checkCanonicalRefName` imposes no length limit, so this stays a valid,
-/// merely over-long, canonical ref name.
-RefOp paddedSetPayloadOp(size_t target_bytes)
+/// A single `SetPublishedAt` op whose `ref_name` is padded so its OWN encoded size (`encodedOpSize`)
+/// is exactly `target_bytes`. Every added 'a' is one un-escaped byte in the JSON ref-name string, so
+/// the size grows one-for-one; `checkCanonicalRefName` imposes no length limit, so this stays a
+/// valid, merely over-long, canonical ref name.
+RefOp paddedSetPublishedAtOp(size_t target_bytes)
 {
     RefOp op;
-    op.kind = RefOpKind::SetPayload;
+    op.kind = RefOpKind::SetPublishedAt;
     op.ref_name = "r";
     op.expected_manifest_ref = ManifestRef{1, 1, 1};
-    op.payload = "";
     op.published_at_ms = 0;
     const size_t base = encodedOpSize(op);
     op.ref_name = "r" + String(target_bytes - base, 'a');
@@ -255,7 +254,7 @@ TEST(RefWriterChunkedFlush, OversizedOpFailsItsItemAlone)
     publishEmptyPart(store, ns, "neighbor");
     ASSERT_TRUE(store->resolveRef(ns, "neighbor").has_value());
 
-    const RefOp oversized_op = paddedSetPayloadOp(ref_op_max_bytes + 1);
+    const RefOp oversized_op = paddedSetPublishedAtOp(ref_op_max_bytes + 1);
     ASSERT_GT(encodedOpSize(oversized_op), ref_op_max_bytes);
 
     auto sync = std::make_shared<CaseSync>();
@@ -295,7 +294,7 @@ TEST(RefWriterChunkedFlush, CanonicalMaxTransactionRoundTrips)
     txn.ops.reserve(ref_txn_max_ops);
     for (size_t i = 0; i < ref_txn_max_ops; ++i)
     {
-        RefOp op = paddedSetPayloadOp(ref_op_max_bytes);
+        RefOp op = paddedSetPublishedAtOp(ref_op_max_bytes);
         ASSERT_EQ(encodedOpSize(op), ref_op_max_bytes);
         txn.ops.push_back(std::move(op));
     }

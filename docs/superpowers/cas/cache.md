@@ -151,7 +151,7 @@ Good fit:
 - `ContentAddressedMetadataStorage` already owns path parsing, namespace mapping, and
   `StoredObject` construction.
 - `Cas::Store` already exposes the protocol-level primitives needed by the facade:
-  `resolveRef`, `readManifest`, `locate`, `dropRef`, `updateRefPayload`, and `dropNamespace`.
+  `resolveRef`, `readManifest`, `locate`, `dropRef`, `updateRefPublishedAt`, and `dropNamespace`.
 - The cache can be inserted below `ContentAddressedMetadataStorage` without changing `MergeTree` or
   the generic `IMetadataStorage` API.
 
@@ -213,7 +213,7 @@ Concrete read-side findings:
 Concrete write-side findings:
 
 - `ContentAddressedTransaction` directly calls committed-ref mutations in several places:
-  `dropRef`, `updateRefPayload`, `dropNamespace`, and `Build::promote`.
+  `dropRef`, `updateRefPublishedAt`, `dropNamespace`, and `Build::promote`.
 - `republishRef` reads the source ref and manifest, stages a new manifest, promotes the destination,
   then drops the source. This is a real domain operation and should become a facade operation, or at
   least use facade read/write methods at every committed-ref boundary.
@@ -232,7 +232,7 @@ Concrete API smells:
 - `ContentAddressedMetadataStorage::store` exposes the whole `Cas::Store` to wiring code. It is
   convenient, but it makes it easy to bypass cache policy and freshness policy.
 - `Cas::Store` exposes pure manifest tree helpers (`lookupPath`, `listDirectory`) next to protocol
-  operations (`resolveRef`, `readManifest`, `dropRef`, `updateRefPayload`, `dropNamespace`). This
+  operations (`resolveRef`, `readManifest`, `dropRef`, `updateRefPublishedAt`, `dropNamespace`). This
   makes callers treat decoded manifests as a filesystem API.
 - `allow_stale` is a boolean. The cache facade needs a typed freshness enum so call sites say why a
   read may be cached or must be fresh.
@@ -725,7 +725,7 @@ Keep table-level namespace files and loose mountpoint objects outside this facad
 Replace committed part-ref mutations:
 
 - raw `Store::dropRef`;
-- raw `Store::updateRefPayload`;
+- raw `Store::updateRefPublishedAt`;
 - direct final `Build::promote` calls;
 - namespace drops for table/shadow namespaces.
 
@@ -772,7 +772,7 @@ Each write-through facade method has a fixed side effect:
 
 ```text
 updateMutableFiles:
-    call Store::updateRefPayload
+    call Store::updateRefPublishedAt
     erase cached view for `(ns, ref)` on success
 
 dropRef:
@@ -990,7 +990,7 @@ Relevant modeled actions remain the same:
 
 - `promoteBuild` corresponds to existing promote / committed publish actions;
 - `dropRef` corresponds to `WDropRef`;
-- `updateRefPayload` corresponds to `WMutableUpdate`;
+- `updateRefPublishedAt` corresponds to `WMutableUpdate`;
 - `dropNamespace` is a batch of committed-ref drops at the wiring level;
 - GC journal maintenance remains outside committed ref mutation.
 
@@ -1272,7 +1272,7 @@ Each extraction should be behavior-preserving and separately reviewable.
 18. The implementation review includes the API-fit red flags from `API Fit As A Design Test`; any
     normal part/projection read path that still calls `readManifest` directly must be justified or
     moved behind `CachedPartFolderAccess`, and any normal wiring path that calls `Build::promote`,
-    `dropRef`, `updateRefPayload`, or `dropNamespace` directly must be justified or moved behind the
+    `dropRef`, `updateRefPublishedAt`, or `dropNamespace` directly must be justified or moved behind the
     facade.
 19. A debug/test explain surface reports why the facade used hit, miss, force-fresh bypass,
     oversized bypass, invalidation, or strict validation for a `PartRefKey`.

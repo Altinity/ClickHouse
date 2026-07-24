@@ -57,7 +57,7 @@ enum class RootMutationKind : uint8_t
     Precommit,
     Promote,
     Abandon,
-    UpdateRefPayload,
+    UpdateRefPublishedAt,
     DropNamespace,
     ReclaimPrecommit,
 };
@@ -83,7 +83,7 @@ inline std::string_view toString(RootMutationKind kind)
         case RootMutationKind::Precommit:         return "Precommit";
         case RootMutationKind::Promote:           return "Promote";
         case RootMutationKind::Abandon:           return "Abandon";
-        case RootMutationKind::UpdateRefPayload:  return "UpdateRefPayload";
+        case RootMutationKind::UpdateRefPublishedAt: return "UpdateRefPublishedAt";
         case RootMutationKind::DropNamespace:     return "DropNamespace";
         case RootMutationKind::ReclaimPrecommit:  return "ReclaimPrecommit";
     }
@@ -104,11 +104,10 @@ struct Resolved
 
 /// The non-identity portion of a committed-ref update. The ref's manifest identity is deliberately
 /// absent: changing reachability must use an owner transition, while this carrier is only for updating
-/// the publication timestamp (and the legacy opaque payload bytes) without changing the manifest edge.
-/// In the current all-tree representation, per-part files are ordinary manifest entries rather than a
-/// separate mutable-file map, so `published_at_ms` is the remaining metadata that can be restamped in
-/// isolation.
-struct RefPayloadUpdate
+/// the publication timestamp without changing the manifest edge. In the current all-tree
+/// representation, per-part files are ordinary manifest entries rather than a separate mutable-file
+/// map, so `published_at_ms` is the remaining metadata that can be restamped in isolation.
+struct RefPublishedAtUpdate
 {
     uint64_t published_at_ms = 0;   /// publish wall-clock (epoch ms); 0 = unset
 };
@@ -207,9 +206,9 @@ private:
     /// runs unconditionally (it is O(1) via `owned_manifests`). Was free.
     void applyOwnerTransition(const RefOp & op);
 
-    /// The `set_payload` op kind: the committed ref must still name `expected_manifest_ref`; replaces
-    /// the opaque `payload` blob and `published_at_ms` without touching the manifest edge. Was free.
-    void applySetPayload(const RefOp & op);
+    /// The `set_published_at` op kind: the committed ref must still name `expected_manifest_ref`;
+    /// replaces `published_at_ms` without touching the manifest edge. Was free.
+    void applySetPublishedAt(const RefOp & op);
 
     /// Applies the COMPLETE transaction to `*this` IN PLACE (the two txn-wide preconditions first, then
     /// every op in array order), or throws `CORRUPTED_DATA` -- leaving `*this` PARTIALLY APPLIED
@@ -311,10 +310,10 @@ RefTableState stateFromSnapshot(const RefTableSnapshot & snapshot);
 ///    manifest-edge delta is read off each transaction's explicit
 ///    ops, not a before/after state diff, so a silent displacement would never emit the evicted
 ///    manifest's "-1" edge -- it would leak as phantom-alive forever. On success the precommit is
-///    replaced by a committed row with an EMPTY payload (the initial payload arrives
-///    via a separate `set_payload` op, in the same transaction or a later one).
+///    replaced by a committed row whose `published_at_ms` starts UNSET (the initial stamp arrives
+///    via a separate `set_published_at` op, in the same transaction or a later one).
 ///  - Any other `old_binding`/`new_binding` combination is not a recognized transition shape.
-///  - `set_payload`: namespace must be `Live`; the committed ref named by `ref_name` must still name
+///  - `set_published_at`: namespace must be `Live`; the committed ref named by `ref_name` must still name
 ///    `expected_manifest_ref`.
 ///  - `remove_namespace`: namespace must be `Live` and both `committed` and `precommits` must already
 ///    be empty at this point in the (in-array-order) replay -- which is only true if the transaction's
@@ -428,7 +427,7 @@ struct RefManifestEdge
 ///   - promote (old_binding.kind == Precommit, new_binding.kind == Committed, SAME ref_name and
 ///     manifest_ref)                                                    => no edge (net zero: the
 ///     manifest keeps an owner the whole time)
-///   - `namespace_birth` / `set_payload` / `remove_namespace`           => no edge
+///   - `namespace_birth` / `set_published_at` / `remove_namespace`      => no edge
 /// Any other `owner_transition` shape -- neither binding, old+new naming DIFFERENT manifests, a
 /// promote whose old/new ref_name disagree, or any other kind combination -- throws `CORRUPTED_DATA`.
 /// These are exactly the shapes `applyRefLogTxn`/`replay` already reject at the state-machine layer, so

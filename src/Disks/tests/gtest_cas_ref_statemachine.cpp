@@ -80,13 +80,12 @@ RefOp removeCommittedOp(const String & name, const ManifestRef & mref)
     return op;
 }
 
-RefOp setPayloadOp(const String & name, const ManifestRef & mref, const String & payload, uint64_t ts = 0)
+RefOp setPublishedAtOp(const String & name, const ManifestRef & mref, uint64_t ts = 0)
 {
     RefOp op;
-    op.kind = RefOpKind::SetPayload;
+    op.kind = RefOpKind::SetPublishedAt;
     op.ref_name = name;
     op.expected_manifest_ref = mref;
-    op.payload = payload;
     op.published_at_ms = ts;
     return op;
 }
@@ -192,11 +191,11 @@ TEST(CasRefStateMachine, OwnerTransitionWhileNeverBornRejected)
         [&] { applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {addPrecommitOp("a", manifestRef(1, 1, 1))})); });
 }
 
-TEST(CasRefStateMachine, SetPayloadWhileNeverBornRejected)
+TEST(CasRefStateMachine, SetPublishedAtWhileNeverBornRejected)
 {
     RefTableState state;
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-        [&] { applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {setPayloadOp("a", manifestRef(1, 1, 1), "x")})); });
+        [&] { applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {setPublishedAtOp("a", manifestRef(1, 1, 1))})); });
 }
 
 TEST(CasRefStateMachine, RemoveNamespaceWhileNeverBornRejected)
@@ -218,7 +217,7 @@ TEST(CasRefStateMachine, OpsWhileRemovedRejectedExceptBirth)
     expectStatesEqual(after_removal, state);
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-        [&] { applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 4}, {setPayloadOp("a", manifestRef(1, 1, 1), "x")})); });
+        [&] { applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 4}, {setPublishedAtOp("a", manifestRef(1, 1, 1))})); });
     expectStatesEqual(after_removal, state);
 
     /// Repeated removal is corruption at THIS layer (spec §Remove Namespace: idempotent-success is
@@ -368,11 +367,11 @@ TEST(CasRefStateMachine, PromoteRejectsAbsentPrecommit)
     expectStatesEqual(before, state);
 }
 
-TEST(CasRefStateMachine, PromoteAtomicityNoOwnerlessIntermediateEmptyPayload)
+TEST(CasRefStateMachine, PromoteAtomicityNoOwnerlessIntermediate)
 {
-    /// A bare promote (no set_payload in the same transaction) is itself a complete, valid, and
+    /// A bare promote (no set_published_at in the same transaction) is itself a complete, valid, and
     /// OBSERVABLE transaction -- there is no partial-op state exposed here, only the choice of
-    /// whether the payload arrives in this txn or a later one (spec §Promote).
+    /// whether the timestamp arrives in this txn or a later one (spec §Promote).
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {birthOp(), addPrecommitOp("a", manifestRef(1, 1, 1))}));
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 2}, {promoteOp("a", manifestRef(1, 1, 1))}));
@@ -380,18 +379,17 @@ TEST(CasRefStateMachine, PromoteAtomicityNoOwnerlessIntermediateEmptyPayload)
     EXPECT_FALSE(state.getPrecommits().contains({"a", manifestRef(1, 1, 1)}));
     ASSERT_TRUE(state.getCommitted().contains("a"));
     EXPECT_EQ(state.getCommitted().at("a").manifest_ref, manifestRef(1, 1, 1));
-    EXPECT_EQ(state.getCommitted().at("a").payload, "");
+    EXPECT_EQ(state.getCommitted().at("a").published_at_ms, 0u);
 }
 
-TEST(CasRefStateMachine, PromoteWithPayloadInSameTxnInstallsPayload)
+TEST(CasRefStateMachine, PromoteWithSetPublishedAtInSameTxnInstallsTimestamp)
 {
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {birthOp(), addPrecommitOp("a", manifestRef(1, 1, 1))}));
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 2},
-        {promoteOp("a", manifestRef(1, 1, 1)), setPayloadOp("a", manifestRef(1, 1, 1), "initial-payload", 42)}));
+        {promoteOp("a", manifestRef(1, 1, 1)), setPublishedAtOp("a", manifestRef(1, 1, 1), 42)}));
 
     ASSERT_TRUE(state.getCommitted().contains("a"));
-    EXPECT_EQ(state.getCommitted().at("a").payload, "initial-payload");
     EXPECT_EQ(state.getCommitted().at("a").published_at_ms, 42u);
 }
 
@@ -468,21 +466,21 @@ TEST(CasRefStateMachine, OwnerTransitionRejectsInvalidCombinations)
 }
 
 /// ===================================================================================
-/// SetPayload (spec §Update Payload)
+/// SetPublishedAt (spec §Update Payload)
 /// ===================================================================================
 
-TEST(CasRefStateMachine, SetPayloadRejectsWhenRefAbsent)
+TEST(CasRefStateMachine, SetPublishedAtRejectsWhenRefAbsent)
 {
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {birthOp()}));
     const RefTableState before = state;
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-        [&] { applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 2}, {setPayloadOp("a", manifestRef(1, 1, 1), "x")})); });
+        [&] { applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 2}, {setPublishedAtOp("a", manifestRef(1, 1, 1))})); });
     expectStatesEqual(before, state);
 }
 
-TEST(CasRefStateMachine, SetPayloadRejectsManifestMismatch)
+TEST(CasRefStateMachine, SetPublishedAtRejectsManifestMismatch)
 {
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1},
@@ -490,19 +488,18 @@ TEST(CasRefStateMachine, SetPayloadRejectsManifestMismatch)
     const RefTableState before = state;
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-        [&] { applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 2}, {setPayloadOp("a", manifestRef(9, 9, 9), "x")})); });
+        [&] { applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 2}, {setPublishedAtOp("a", manifestRef(9, 9, 9))})); });
     expectStatesEqual(before, state);
 }
 
-TEST(CasRefStateMachine, SetPayloadAcceptsAndReplacesPayload)
+TEST(CasRefStateMachine, SetPublishedAtAcceptsAndReplacesTimestamp)
 {
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1},
         {birthOp(), addPrecommitOp("a", manifestRef(1, 1, 1)), promoteOp("a", manifestRef(1, 1, 1))}));
-    applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 2}, {setPayloadOp("a", manifestRef(1, 1, 1), "v1", 10)}));
-    applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 3}, {setPayloadOp("a", manifestRef(1, 1, 1), "v2", 20)}));
+    applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 2}, {setPublishedAtOp("a", manifestRef(1, 1, 1), 10)}));
+    applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 3}, {setPublishedAtOp("a", manifestRef(1, 1, 1), 20)}));
 
-    EXPECT_EQ(state.getCommitted().at("a").payload, "v2");
     EXPECT_EQ(state.getCommitted().at("a").published_at_ms, 20u);
     EXPECT_EQ(state.getCommitted().at("a").manifest_ref, manifestRef(1, 1, 1));   /// unchanged: no edge move
 }
@@ -571,10 +568,10 @@ TEST(CasRefStateMachine, RemoveNamespaceRejectsNonRemovalEarlierOp)
         {birthOp(), addPrecommitOp("a", manifestRef(1, 1, 1)), promoteOp("a", manifestRef(1, 1, 1))}));
     const RefTableState before = state;
 
-    /// set_payload before remove_namespace: not an owner-removal transition.
+    /// set_published_at before remove_namespace: not an owner-removal transition.
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
         [&] { applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 2},
-            {setPayloadOp("a", manifestRef(1, 1, 1), "x"), removeCommittedOp("a", manifestRef(1, 1, 1)),
+            {setPublishedAtOp("a", manifestRef(1, 1, 1)), removeCommittedOp("a", manifestRef(1, 1, 1)),
              removeNamespaceOp()})); });
     expectStatesEqual(before, state);
 
@@ -813,7 +810,7 @@ TEST(CasRefStateMachine, ReplayEquationPropertyTest)
                 const auto & [name, mref] = open_committed[idx];
                 const uint64_t this_id = seq++;
                 history.push_back(makeTxn(kNs, RefTxnId{1, this_id},
-                    {setPayloadOp(name, mref, "payload-" + std::to_string(this_id))}));
+                    {setPublishedAtOp(name, mref, this_id)}));
             }
             else if (!open_precommits.empty())
             {
@@ -948,7 +945,7 @@ TEST(CasRefStateMachine, TrustedReplayEquivalentToLiveAppendOnValidTail)
         makeTxn(kNs, RefTxnId{1, 1}, {birthOp(), addPrecommitOp("a", manifestRef(1, 1, 1))}),
         makeTxn(kNs, RefTxnId{1, 2},
             {promoteOp("a", manifestRef(1, 1, 1)), addPrecommitOp("b", manifestRef(1, 2, 1))}),
-        makeTxn(kNs, RefTxnId{1, 3}, {setPayloadOp("a", manifestRef(1, 1, 1), "payload")}),
+        makeTxn(kNs, RefTxnId{1, 3}, {setPublishedAtOp("a", manifestRef(1, 1, 1), 7)}),
         makeTxn(kNs, RefTxnId{1, 4}, {promoteOp("b", manifestRef(1, 2, 1))}),
     };
 
@@ -1056,7 +1053,7 @@ TEST(CasRefStateMachine, E3AdmitsPreviewLeavesStateByteIdentical)
 }
 
 /// TrustedReplay in-place apply, SUCCESS path across every `applyOp` arm: a tail that births, adds,
-/// promotes, replaces a committed manifest, removes a committed and a precommit, restamps a payload,
+/// promotes, replaces a committed manifest, removes a committed and a precommit, restamps a timestamp,
 /// and finally removes the namespace, replayed via `replay` (TrustedReplay, in place) must produce a
 /// state byte-identical to the SAME tail applied op-by-op through `LiveAppend` (scratch copy). This is the
 /// test only E3's in-place machinery can fail: a mis-maintained counter, a dropped owned-manifest
@@ -1068,7 +1065,7 @@ TEST(CasRefStateMachine, E3TrustedReplayInPlaceMatchesLiveAppendAcrossAllArms)
             addPrecommitOp("a", manifestRef(1, 1, 1)), addPrecommitOp("b", manifestRef(1, 2, 1))}),
         makeTxn(kNs, RefTxnId{1, 2}, {
             promoteOp("a", manifestRef(1, 1, 1)),                     // precommit -> committed
-            setPayloadOp("a", manifestRef(1, 1, 1), "hello", 42)}),   // restamp payload
+            setPublishedAtOp("a", manifestRef(1, 1, 1), 42)}),        // restamp published_at_ms
         makeTxn(kNs, RefTxnId{1, 3}, {removePrecommitOp("b", manifestRef(1, 2, 1))}),   // drop precommit
         makeTxn(kNs, RefTxnId{1, 4}, {
             removeCommittedOp("a", manifestRef(1, 1, 1)),             // evict stale committed...
@@ -1145,13 +1142,13 @@ TEST(CasRefStateMachine, AdmitsRejectsGrowthPastSnapshotBudgetOwnerTransitionAdd
     EXPECT_FALSE(admits(state, op, true_size - 1, 1'000'000));
 }
 
-TEST(CasRefStateMachine, AdmitsRejectsGrowthPastSnapshotBudgetSetPayload)
+TEST(CasRefStateMachine, AdmitsRejectsGrowthPastSnapshotBudgetSetPublishedAt)
 {
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1},
         {birthOp(), addPrecommitOp("a", manifestRef(1, 1, 1)), promoteOp("a", manifestRef(1, 1, 1))}));
 
-    const RefOp op = setPayloadOp("a", manifestRef(1, 1, 1), String(200, 'x'));
+    const RefOp op = setPublishedAtOp("a", manifestRef(1, 1, 1), 1700000000000ull);
     RefTableState scratch = state;
     applyRefLogTxn(scratch, makeTxn(kNs, RefTxnId{1, 2}, {op}));
     const size_t true_size = encodeRefTableSnapshot(snapshotOf(scratch, "")).size();
@@ -1160,18 +1157,18 @@ TEST(CasRefStateMachine, AdmitsRejectsGrowthPastSnapshotBudgetSetPayload)
     EXPECT_FALSE(admits(state, op, true_size - 1, 1'000'000));
 }
 
-TEST(CasRefStateMachine, AdmitsRejectsGrowthPastSnapshotBudgetPromoteWithPayload)
+TEST(CasRefStateMachine, AdmitsRejectsGrowthPastSnapshotBudgetPromoteWithSetPublishedAt)
 {
-    /// The "promote-with-payload" growth class: the owner_transition half of a promote is admitted
-    /// cheaply (empty payload), but the immediately-following set_payload that installs the REAL
-    /// initial payload is where the growth actually happens.
+    /// The "promote-with-set_published_at" growth class: the owner_transition half of a promote is
+    /// admitted cheaply (published_at_ms starts unset), but the immediately-following set_published_at
+    /// that installs the REAL initial timestamp is where the growth actually happens.
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {birthOp(), addPrecommitOp("a", manifestRef(1, 1, 1))}));
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 2}, {promoteOp("a", manifestRef(1, 1, 1))}));
     ASSERT_TRUE(state.getCommitted().contains("a"));
-    ASSERT_EQ(state.getCommitted().at("a").payload, "");
+    ASSERT_EQ(state.getCommitted().at("a").published_at_ms, 0u);
 
-    const RefOp op = setPayloadOp("a", manifestRef(1, 1, 1), String(500, 'y'), 99);
+    const RefOp op = setPublishedAtOp("a", manifestRef(1, 1, 1), 1700000000099ull);
     RefTableState scratch = state;
     applyRefLogTxn(scratch, makeTxn(kNs, RefTxnId{1, 3}, {op}));
     const size_t true_size = encodeRefTableSnapshot(snapshotOf(scratch, "")).size();
@@ -1186,7 +1183,7 @@ TEST(CasRefStateMachine, AdmitsRejectsGrowthPastRemovalBudget)
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1},
         {birthOp(), addPrecommitOp("a", manifestRef(1, 1, 1)), promoteOp("a", manifestRef(1, 1, 1))}));
 
-    const RefOp op = setPayloadOp("a", manifestRef(1, 1, 1), String(300, 'z'));
+    const RefOp op = setPublishedAtOp("a", manifestRef(1, 1, 1), 1700000000300ull);
     RefTableState scratch = state;
     applyRefLogTxn(scratch, makeTxn(kNs, RefTxnId{1, 2}, {op}));
     const String removal_bytes = encodeRefLogTxn(buildRemovalTxnForTest(scratch, "", RefTxnId{1, 1}));
@@ -1212,7 +1209,7 @@ TEST(CasRefStateMachine, AdmitsExactnessPropertyTest)
         std::vector<std::pair<String, ManifestRef>> open_precommits;
         std::vector<std::pair<String, ManifestRef>> open_committed;
 
-        /// Build up a random but valid mid-state (a handful of precommits/committed rows/payloads).
+        /// Build up a random but valid mid-state (a handful of precommits/committed rows/timestamps).
         const int setup_steps = 1 + static_cast<int>(rng() % 5);
         for (int i = 0; i < setup_steps; ++i)
         {
@@ -1245,7 +1242,7 @@ TEST(CasRefStateMachine, AdmitsExactnessPropertyTest)
         else if (kind == 1)
         {
             const auto & [name, mref] = open_committed[rng() % open_committed.size()];
-            candidate = setPayloadOp(name, mref, String(1 + rng() % 64, 'q'), rng());
+            candidate = setPublishedAtOp(name, mref, rng());
         }
         else
         {
@@ -1272,14 +1269,15 @@ TEST(CasRefStateMachine, AdmitsExactnessPropertyTest)
 /// ===================================================================================
 TEST(CasRefSnapshotSizeHelpers, FramingPlusRowsEqualsFullEncode)
 {
-    /// Build a non-trivial Live table: two committed rows (one with a payload) and one precommit.
+    /// Build a non-trivial Live table: two committed rows (one with a stamped published_at_ms) and one
+    /// precommit.
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1},
         {birthOp(),
          addPrecommitOp("alpha", manifestRef(1, 1, 1)), promoteOp("alpha", manifestRef(1, 1, 1)),
          addPrecommitOp("beta", manifestRef(1, 2, 1)), promoteOp("beta", manifestRef(1, 2, 1))}));
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 2},
-        {setPayloadOp("alpha", manifestRef(1, 1, 1), String(123, 'p'), 42)}));
+        {setPublishedAtOp("alpha", manifestRef(1, 1, 1), 42)}));
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 3}, {addPrecommitOp("gamma", manifestRef(1, 3, 1))}));
 
     const RefTableSnapshot snap = snapshotOf(state, "");
@@ -1356,7 +1354,7 @@ TEST(CasRefStateCounters, CountersTrackRowsThroughEveryOpKind)
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 2}, {addPrecommitOp("a", manifestRef(1, 1, 1))}));
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 3}, {promoteOp("a", manifestRef(1, 1, 1))}));
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 4},
-        {setPayloadOp("a", manifestRef(1, 1, 1), String(77, 'x'), 5)}));
+        {setPublishedAtOp("a", manifestRef(1, 1, 1), 5)}));
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 5}, {addPrecommitOp("b", manifestRef(1, 2, 1))}));
     EXPECT_EQ(state.getSnapshotBodyBytes(), recomputeSnapshotBody(state));
     EXPECT_EQ(state.getRemovalBodyBytes(), recomputeRemovalBody(state));
@@ -1398,7 +1396,7 @@ TEST(CasRefBudgetSize, AccessorsEqualFullEncodeRandomized)
                 committed_names.emplace_back(name, mref);
                 if (rng() % 2 == 0)
                     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, seq++},
-                        {setPayloadOp(name, mref, String(rng() % 50, 's'), rng())}));
+                        {setPublishedAtOp(name, mref, rng())}));
             }
         }
 

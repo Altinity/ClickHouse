@@ -33,14 +33,12 @@ RefTableSnapshot makeLiveSnapshot()
     RefCommittedRow c1;
     c1.ref_name = "all_1_1_0";
     c1.manifest_ref = manifestRef(5, 10, 1);
-    c1.payload = "mutable-ref-bytes-1";
     c1.published_at_ms = 1717000000000ULL;
     s.committed.push_back(c1);
 
     RefCommittedRow c2;
     c2.ref_name = "all_2_2_0";
     c2.manifest_ref = manifestRef(5, 11, 1);
-    c2.payload = "mutable-ref-bytes-2";
     c2.published_at_ms = 1717000000001ULL;
     s.committed.push_back(c2);
 
@@ -344,9 +342,10 @@ TEST(CasRefSnapshotCodec, EncodeRejectsOversizedSnapshot)
     s.ns = "ns";
     s.snapshot_id = RefTxnId{1, 1};
     RefCommittedRow row;
-    row.ref_name = "r";
+    /// `ref_name` has no length limit (`checkCanonicalRefName`), so it is the padding field now that
+    /// `payload` is gone: a run of un-escaped 'x' bytes inflates the encoded row one-for-one.
+    row.ref_name = String(ref_snapshot_max_bytes + 1, 'x');
     row.manifest_ref = manifestRef(1, 1, 1);
-    row.payload = String(ref_snapshot_max_bytes + 1, 'x');
     s.committed.push_back(row);
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefTableSnapshot(s); });
 }
@@ -388,14 +387,14 @@ TEST(CasRefSnapshotCodec, EncodeAllowsExactlySnapshotMaxBytes)
     RefCommittedRow row;
     row.ref_name = "r";
     row.manifest_ref = manifestRef(1, 1, 1);
-    row.payload = "";
     s.committed.push_back(row);
 
     const size_t base_size = encodeRefTableSnapshot(s).size();
     ASSERT_LE(base_size, ref_snapshot_max_bytes);
-    /// Every added 'x' is one un-escaped byte inside the JSON payload string, so the encoded size grows
-    /// one-for-one to exactly the cap.
-    s.committed[0].payload = String(ref_snapshot_max_bytes - base_size, 'x');
+    /// Every added 'x' is one un-escaped byte inside the JSON ref_name string, so the encoded size
+    /// grows one-for-one to exactly the cap; +1 accounts for the base row's own 1-byte ref_name "r"
+    /// already counted in base_size.
+    s.committed[0].ref_name = String(ref_snapshot_max_bytes - base_size + 1, 'x');
 
     const String bytes = encodeRefTableSnapshot(s);
     EXPECT_EQ(bytes.size(), ref_snapshot_max_bytes);
@@ -426,8 +425,8 @@ TEST(CasFormatBattery, RefSnapshot)
         [ns, id](std::string_view d) { decodeRefTableSnapshot(openObject(FormatId::RefSnapshot, d), ns, id); },
         "{\"type\":\"cas_ref_snap\",\"v\":3}\n"
         "{\"ns\":\"srv1/db/table@cas@\",\"we\":\"5\",\"rs\":\"200\",\"lc\":\"live\"}\n"
-        "{\"k\":\"c\",\"rn\":\"all_1_1_0\",\"me\":\"5\",\"mb\":\"10\",\"mo\":1,\"pl\":\"mutable-ref-bytes-1\",\"ts\":1717000000000}\n"
-        "{\"k\":\"c\",\"rn\":\"all_2_2_0\",\"me\":\"5\",\"mb\":\"11\",\"mo\":1,\"pl\":\"mutable-ref-bytes-2\",\"ts\":1717000000001}\n"
+        "{\"k\":\"c\",\"rn\":\"all_1_1_0\",\"me\":\"5\",\"mb\":\"10\",\"mo\":1,\"ts\":1717000000000}\n"
+        "{\"k\":\"c\",\"rn\":\"all_2_2_0\",\"me\":\"5\",\"mb\":\"11\",\"mo\":1,\"ts\":1717000000001}\n"
         "{\"k\":\"p\",\"rn\":\"all_3_3_0\",\"me\":\"5\",\"mb\":\"12\",\"mo\":1}\n"
         "{\"n\":3}\n"});
 }

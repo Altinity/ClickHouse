@@ -396,9 +396,9 @@ void publishWiredPart(
     build->promote(ns, ref, build->buildId(), id);
 
     /// promote stamps published_at_ms with nowMs(); the read assertions want a FIXED stamp, so pin it
-    /// through the set_payload path (no journal record for anything but the stamp itself).
-    storage.store()->updateRefPayload(ns, ref,
-        [](DB::Cas::RefPayloadUpdate & r) { r.published_at_ms = 1700000000ULL * 1000; });   /// epoch ms; getLastModified /1000
+    /// through the set_published_at path (no journal record for anything but the stamp itself).
+    storage.store()->updateRefPublishedAt(ns, ref,
+        [](DB::Cas::RefPublishedAtUpdate & r) { r.published_at_ms = 1700000000ULL * 1000; });   /// epoch ms; getLastModified /1000
 }
 
 }
@@ -835,7 +835,7 @@ TEST(CasWiringWrite, MutableOnlyUpdateOnCommittedPart)
     tx->commit(DB::NoCommitOptions{});
 
     /// The MVCC autocommit one-shot shape: a fresh transaction rewriting ONLY a mutable file of a
-    /// COMMITTED part goes through updateRefPayload (no tree rebuild, no journal record).
+    /// COMMITTED part goes through updateRefPublishedAt (no tree rebuild, no journal record).
     auto tx2 = storage->createTransaction();
     writeThroughTransaction(*tx2, "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/txn_version.txt", "v2");
     tx2->commit(DB::NoCommitOptions{});
@@ -1131,7 +1131,7 @@ TEST(CasWiringOps, MoveDirectoryMutableCollisionPolicy)
 #endif
     /// Identical bytes → benign, no throw (source-wins, idempotent). Both parts carry real content so
     /// the eager publish-at-rename builds a proper ref (a mutable-only staging would instead hit
-    /// updateRefPayload on a not-yet-committed ref — unrelated to the collision policy under test).
+    /// updateRefPublishedAt on a not-yet-committed ref — unrelated to the collision policy under test).
     /// data.bin must ALSO match now: all-tree Task 9 generalized the differing-bytes collision check
     /// from the legacy mutable-file names to every entry, so a differing data.bin would (correctly)
     /// throw too and defeat this block's "benign" premise.
@@ -1785,8 +1785,8 @@ TEST(CasWiringRead, UnsetPublishedAtMsReturnsEpoch)
     tx->commit(DB::NoCommitOptions{});
 
     /// Ensure published_at_ms is unset (the default is 0).
-    storage->store()->updateRefPayload(storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111"), "all_1_1_0",
-        [](DB::Cas::RefPayloadUpdate & r) { r.published_at_ms = 0; });
+    storage->store()->updateRefPublishedAt(storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111"), "all_1_1_0",
+        [](DB::Cas::RefPublishedAtUpdate & r) { r.published_at_ms = 0; });
 
     EXPECT_EQ(storage->getLastModified("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0").epochTime(), 0);
 }

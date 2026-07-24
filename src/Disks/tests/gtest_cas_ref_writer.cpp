@@ -2742,12 +2742,12 @@ TEST(RefWriterAppendLane, SameRefMutationsSplitAcrossFlushes)
     });
 
     const uint64_t put_before = backend->putTotal();
-    std::thread t_a([&] { store->updateRefPayload(ns, "a", [](RefPayloadUpdate & r) { r.published_at_ms = 1; }); });
+    std::thread t_a([&] { store->updateRefPublishedAt(ns, "a", [](RefPublishedAtUpdate & r) { r.published_at_ms = 1; }); });
     {
         std::unique_lock lk(m);
         cv.wait(lk, [&] { return entered; });
     }
-    std::thread t_b([&] { store->updateRefPayload(ns, "a", [](RefPayloadUpdate & r) { r.published_at_ms = 2; }); });
+    std::thread t_b([&] { store->updateRefPublishedAt(ns, "a", [](RefPublishedAtUpdate & r) { r.published_at_ms = 2; }); });
     while (store->refQueuePendingForTest(ns) < 2)
         std::this_thread::yield();
     cv.notify_all();
@@ -3135,9 +3135,9 @@ TEST(RefWriterRecoverySeal, SealPutConflictThrowPropagatesAndDoesNotWedgeRecover
     foreign.lifecycle = RefLifecycle::Live;
     foreign.sealed_from = RefTxnId{2, 1};
     foreign.committed = {
-        DB::Cas::RefCommittedRow{.ref_name = "a", .manifest_ref = manifestRef(1, 1, 1), .payload = "", .published_at_ms = 0},
-        DB::Cas::RefCommittedRow{.ref_name = "b", .manifest_ref = manifestRef(2, 1, 1), .payload = "", .published_at_ms = 0},
-        DB::Cas::RefCommittedRow{.ref_name = "c", .manifest_ref = manifestRef(2, 1, 2), .payload = "", .published_at_ms = 0},
+        DB::Cas::RefCommittedRow{.ref_name = "a", .manifest_ref = manifestRef(1, 1, 1), .published_at_ms = 0},
+        DB::Cas::RefCommittedRow{.ref_name = "b", .manifest_ref = manifestRef(2, 1, 1), .published_at_ms = 0},
+        DB::Cas::RefCommittedRow{.ref_name = "c", .manifest_ref = manifestRef(2, 1, 2), .published_at_ms = 0},
     };
     backend->corrupt_foreign_bytes = DB::Cas::sealObject(DB::Cas::FormatId::RefSnapshot, DB::Cas::encodeRefTableSnapshot(foreign));
     backend->corrupt_key_substr = layout.refSnapshotKey(ns, seal_id);

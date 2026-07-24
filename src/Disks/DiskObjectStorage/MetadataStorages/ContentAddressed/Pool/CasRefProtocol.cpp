@@ -167,7 +167,7 @@ void RefTableState::applyOwnerTransition(const RefOp & op)
 
         /// Promote: the SAME ref_name and manifest_ref move from Precommit to Committed
         /// in one atomic step; the resulting row's `published_at_ms` starts unset (installed by the
-        /// companion set_payload op in the same transaction, or a later one).
+        /// companion set_published_at op in the same transaction, or a later one).
         case OwnerTransitionShape::Promote:
         {
             const RefOwnerBinding & b = *op.old_binding;
@@ -206,31 +206,28 @@ void RefTableState::applyOwnerTransition(const RefOp & op)
     throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableState: unhandled owner_transition shape");
 }
 
-/// The `set_payload` op kind: the committed ref must still name `expected_manifest_ref`; replaces the
-/// opaque `payload` blob and `published_at_ms` without touching the manifest edge. Production no longer
-/// uses the payload for a mutable-file map, but the wire carrier remains general and this state machine
-/// still applies whatever bytes a caller supplies.
-void RefTableState::applySetPayload(const RefOp & op)
+/// The `set_published_at` op kind: the committed ref must still name `expected_manifest_ref`; replaces
+/// `published_at_ms` without touching the manifest edge.
+void RefTableState::applySetPublishedAt(const RefOp & op)
 {
     if (lifecycle != RefLifecycle::Live)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableState: set_payload while namespace is not Live");
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableState: set_published_at while namespace is not Live");
 
     const auto it = committed.find(op.ref_name);
     if (it == committed.end() || !(it->second.manifest_ref == op.expected_manifest_ref))
         throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "RefTableState: set_payload '{}' no longer names its expected_manifest_ref", op.ref_name);
+            "RefTableState: set_published_at '{}' no longer names its expected_manifest_ref", op.ref_name);
 
     /// `RefCowMap`'s iterator is read-only (Pool/CasRefCowMap.h): a write always goes through
     /// `insert_or_assign`, never through the found iterator in place. Copy the row, apply the same
-    /// two field mutations the old in-place code did, and write the whole row back -- this IS the
-    /// COW map's single-row copy-out, not a whole-table one.
+    /// field mutation the old in-place code did, and write the whole row back -- this IS the COW
+    /// map's single-row copy-out, not a whole-table one.
     RefCommittedRow updated = it->second;
     const uint64_t old_row_bytes = committedRowEncodedSize(it->second);
-    updated.payload = op.payload;
     updated.published_at_ms = op.published_at_ms;
     snapshot_body_bytes -= old_row_bytes;
     snapshot_body_bytes += committedRowEncodedSize(updated);
-    /// removal_body_bytes unchanged: set_payload touches neither ref_name nor manifest_ref.
+    /// removal_body_bytes unchanged: set_published_at touches neither ref_name nor manifest_ref.
     committed.insert_or_assign(op.ref_name, std::move(updated));
 }
 
@@ -256,8 +253,8 @@ void RefTableState::applyOp(const RefOp & op, const RefTxnId & txn_id)
         case RefOpKind::OwnerTransition:
             applyOwnerTransition(op);
             return;
-        case RefOpKind::SetPayload:
-            applySetPayload(op);
+        case RefOpKind::SetPublishedAt:
+            applySetPublishedAt(op);
             return;
         case RefOpKind::RemoveNamespace:
         {

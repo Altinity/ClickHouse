@@ -25,15 +25,15 @@ enum class RefOpKind : uint8_t
 {
     NamespaceBirth = 1,
     OwnerTransition = 2,
-    SetPayload = 3,
+    SetPublishedAt = 3,
     RemoveNamespace = 4,
 };
 
 /// One operation inside a `RefLogTxn`. Only the fields documented next to `kind` are meaningful for
 /// that kind, and the codec never reads or writes the others. `OwnerTransition` optionally removes
-/// `old_binding` and/or installs `new_binding`; `SetPayload` carries the expected manifest, an opaque
-/// payload string retained for wire compatibility, and its publication timestamp. `RefOwnerBinding`
-/// is shared with the snapshot format through `CasRefWireVocab.h`.
+/// `old_binding` and/or installs `new_binding`; `SetPublishedAt` carries the expected manifest and the
+/// publication timestamp. `RefOwnerBinding` is shared with the snapshot format through
+/// `CasRefWireVocab.h`.
 struct RefOp
 {
     RefOpKind kind = RefOpKind::NamespaceBirth;
@@ -41,13 +41,9 @@ struct RefOp
     std::optional<RefOwnerBinding> old_binding;    /// OwnerTransition: absent = pure add
     std::optional<RefOwnerBinding> new_binding;    /// OwnerTransition: absent = pure removal
 
-    String ref_name;                               /// SetPayload
-    ManifestRef expected_manifest_ref;             /// SetPayload
-    String payload;                                /// SetPayload -- opaque wire carrier; production
-                                                   /// never populates this anymore (always empty), but
-                                                   /// the field stays on the wire (test coverage keys
-                                                   /// off it as a generic byte carrier)
-    uint64_t published_at_ms = 0;                  /// SetPayload
+    String ref_name;                               /// SetPublishedAt
+    ManifestRef expected_manifest_ref;             /// SetPublishedAt
+    uint64_t published_at_ms = 0;                  /// SetPublishedAt
 
     bool operator==(const RefOp &) const = default;
 };

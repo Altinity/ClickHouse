@@ -120,8 +120,6 @@ void writeCommittedRow(CasJsonWriter & out, const RefCommittedRow & row)
     writeKey(out, "rn", first);
     writeStringValue(out, row.ref_name);
     writeManifestRefFields(out, first, "", row.manifest_ref);
-    writeKey(out, "pl", first);
-    writeStringValue(out, row.payload);
     writeKey(out, "ts", first);
     writeIntText(row.published_at_ms, out);
     closeObject(out, first);
@@ -287,7 +285,6 @@ RefTableSnapshot decodeRefTableSnapshot(
 
         std::optional<String> rn;
         ManifestFields mf;
-        std::optional<String> pl;
         std::optional<uint64_t> ts;
         while (r.nextKey(key))
         {
@@ -295,7 +292,6 @@ RefTableSnapshot decodeRefTableSnapshot(
             else if (key == "me") mf.me = r.readU64String();
             else if (key == "mb") mf.mb = r.readU64String();
             else if (key == "mo") mf.mo = r.readU64Number();
-            else if (key == "pl") pl = r.readString();
             else if (key == "ts") ts = r.readU64Number();
             else r.skipUnknown(key);
         }
@@ -304,13 +300,12 @@ RefTableSnapshot decodeRefTableSnapshot(
 
         if (k == "c")
         {
-            if (!rn || !pl || !ts)
-                throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableSnapshot: committed row missing rn/pl/ts");
+            if (!rn || !ts)
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableSnapshot: committed row missing rn/ts");
             RefCommittedRow row;
             row.ref_name = *rn;
             checkCanonicalRefName(row.ref_name, "RefTableSnapshot", "committed ref_name");
             row.manifest_ref = mf.build("committed");
-            row.payload = *pl;
             row.published_at_ms = *ts;
             snapshot.committed.push_back(std::move(row));
         }

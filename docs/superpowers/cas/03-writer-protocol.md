@@ -586,7 +586,7 @@ rewrite resolves through `repointRef`'s byte-equal check with zero pool mutation
 
 The pre-all-tree mechanism this section used to describe — a dedicated "mutable-only" `publishStaging`
 branch that skipped manifest staging entirely and merged into the ref's separate `RootRef.mutable_files`
-payload via `updateRefPayload` — is superseded for these three files. That branch
+payload via `updateRefPublishedAt` — is superseded for these three files. That branch
 (`ContentAddressedTransaction.cpp`'s `!st.build && st.entries.empty() && st.content_removed.empty()`
 guard) still exists to serve the now-legacy `mutable_files`/`mutable_removed` fields until Task 9's
 schema-deletion sweep removes them, but nothing in the current write path populates those fields for

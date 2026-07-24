@@ -1408,10 +1408,10 @@ void Pool::dropRef(const RootNamespace & ns, const String & ref_name)
     ref_ledger.dropRef(ns, ref_name);
 }
 
-void Pool::updateRefPayload(const RootNamespace & ns, const String & ref_name,
-                             std::function<void(RefPayloadUpdate &)> mutator)
+void Pool::updateRefPublishedAt(const RootNamespace & ns, const String & ref_name,
+                             std::function<void(RefPublishedAtUpdate &)> mutator)
 {
-    ref_ledger.updateRefPayload(ns, ref_name, std::move(mutator));
+    ref_ledger.updateRefPublishedAt(ns, ref_name, std::move(mutator));
 }
 
 DropNamespaceStats Pool::dropNamespace(const RootNamespace & ns)
