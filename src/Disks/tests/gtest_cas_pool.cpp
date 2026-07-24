@@ -1548,6 +1548,77 @@ TEST(CasMountTmat, FencedPriorPaysOnlyTmat)
     EXPECT_TRUE(store->uncleanEpochBoundarySeenForTest());
 }
 
+namespace
+{
+/// Counts putOverwrite calls on the MOUNT key that happen at-or-after the materialization grace
+/// (the flag is flipped by the wait_sleep_fn hook below) — observable proof of the Phase B redo.
+class MountWriteAfterGraceCountingBackend final : public DB::Cas::InMemoryBackend
+{
+public:
+    String mount_key;
+    std::atomic<bool> grace_ran{false};
+    std::atomic<int> mount_writes_after_grace{0};
+
+    DB::Cas::PutResult putOverwrite(const String & k, const String & b, const DB::Cas::Token & e,
+                                    const DB::Cas::ObjectMeta & m) override
+    {
+        if (grace_ran.load() && k == mount_key)
+            ++mount_writes_after_grace;
+        return InMemoryBackend::putOverwrite(k, b, e, m);
+    }
+};
+}
+
+/// Phase B startup-arm (spec rev.4, codex round-3 finding 2): an unclean predecessor triggers the
+/// materialization grace; a grace that consumed the lease TTL must force ONE fresh conditional
+/// lease write before arming — the fence must never arm from a pre-grace anchor that has already
+/// expired (a successor could have legally reclaimed during the wait).
+TEST(CasPool, StartupArmRedoesLeaseWriteWhenGraceConsumesTtl)
+{
+    auto backend = std::make_shared<MountWriteAfterGraceCountingBackend>();
+    DB::Cas::Layout layout("pool");
+    const String srid = "s";
+    const DB::UInt128 uuid(0x42);
+    backend->mount_key = layout.mountKey(srid);
+
+    /// Seed a FENCED, expired predecessor body: the claim reclaims it with
+    /// MountPriorState::Fenced -> unclean_reclaim = true -> the grace wait runs.
+    {
+        DB::Cas::MountLease prior;
+        prior.server_uuid = uuid;
+        prior.writer_epoch = 1;
+        prior.seq = 7;
+        prior.expires_at_ms = 1;      /// long expired
+        prior.gc_fenced = true;
+        backend->putIfAbsent(layout.mountKey(srid), DB::Cas::encodeMountLease(prior));
+    }
+    /// The mount-lease seed above makes the pool prefix non-empty before `Pool::open` runs its own
+    /// bootstrap check; establish `_pool_meta` first (Task 7 zero-write bootstrap), exactly as the
+    /// other pre-seeded-mount tests in this file do (e.g. `FencedPriorPaysOnlyTmat`).
+    DB::Cas::tests::seedPoolMetaForRestart(*backend, "pool");
+
+    uint64_t fake_boot_ms = 10'000;
+    DB::Cas::PoolConfig cfg;
+    cfg.pool_prefix = "pool";
+    cfg.server_id = uuid;
+    cfg.server_root_id = srid;
+    cfg.mount_lease_ttl_ms = std::chrono::milliseconds(30'000);
+    cfg.materialization_grace_ms = 40'000;   /// grace > TTL -> the redo must trigger
+    cfg.boot_ms_fn = [&] { return fake_boot_ms; };
+    cfg.wait_sleep_fn = [&](uint64_t ms)
+    {
+        fake_boot_ms += ms;               /// the grace advances the fake boot clock past the TTL
+        backend->grace_ran.store(true);
+    };
+
+    auto store = DB::Cas::Pool::open(backend, cfg);
+    ASSERT_NE(store, nullptr);
+
+    EXPECT_EQ(backend->mount_writes_after_grace.load(), 1)
+        << "a TTL-consuming grace must be followed by exactly ONE fresh conditional lease write "
+           "(the re-anchoring redo) before the write fence arms";
+}
+
 /// ==== rev.6 Task 7: conditional T_mat on self-remount (`refLanesSettledForRemount`) ====
 
 TEST(CasRemountTmat, DrainedRemountSkipsGrace)

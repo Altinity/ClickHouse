@@ -562,6 +562,10 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
     /// (the last iteration's `claim` before `break` -- `claim` itself is loop-scoped). Read after the
     /// loop to decide the materialization-grace wait.
     MountPriorState claimed_prior = MountPriorState::None;
+    /// The pre-I/O boot-clock instant of the claim attempt FINALLY adopted below -- survives the
+    /// `break` so the arm after the materialization grace (below) can detect a grace that consumed
+    /// the lease TTL and re-anchor before arming (rev.4 Phase B, round-3 finding 2).
+    uint64_t claim_anchor_boot_ms = 0;
     constexpr int max_fence_recoveries = 3;
     for (int fence_recovery = 0; ; ++fence_recovery)
     {
@@ -618,6 +622,7 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
         /// `keeperStart` is separate so this claim orchestration can catch `MountFencedException` and
         /// retry with a fresh epoch.
         store->mount_runtime.installKeeper(our_uuid, writer_epoch, now_ms);
+        claim_anchor_boot_ms = store->bootMsNow();   /// pre-I/O anchor of the claim attempt
         try
         {
             store->mount_runtime.keeperStart();
@@ -667,10 +672,27 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
         store->mount_runtime.waitSleep(t_mat);
     }
 
-    /// Arm the local write fence: cache (uuid, epoch) and set the boottime deadline now + ttl. From
-    /// here ordinary ref mutations (appendRefOps) are fence-gated via mayMutate.
-    store->armMountFence(our_uuid, writer_epoch,
-        store->bootMsNow() + static_cast<uint64_t>(store->config.mount_lease_ttl_ms.count()));
+    /// Arm the local write fence: cache (uuid, epoch) and set the boottime deadline at the claim
+    /// attempt's anchor + ttl (NOT `bootMsNow()` here -- the materialization grace above can run
+    /// unboundedly long, and arming from the post-grace instant would authorize mutations under a
+    /// deadline the durable lease never actually backs). From here ordinary ref mutations
+    /// (appendRefOps) are fence-gated via mayMutate.
+    const uint64_t ttl_ms_u = static_cast<uint64_t>(store->config.mount_lease_ttl_ms.count());
+    if (store->bootMsNow() >= claim_anchor_boot_ms + ttl_ms_u)
+    {
+        /// The materialization grace consumed the lease TTL: the claim's anchor can no longer
+        /// authorize an armed fence (a successor may have legally started reclaiming). Re-anchor
+        /// with ONE fresh conditional lease write -- it fails closed (Phase A classification) if
+        /// anything took the slot meanwhile -- and arm from the new attempt's anchor (rev.4
+        /// Phase B, round-3 finding 2).
+        LOG_WARNING(getLogger("CasPool"),
+            "Content-addressed mount {}: materialization grace ({} ms) consumed the lease TTL "
+            "({} ms); re-writing the lease before arming the write fence", srid,
+            store->config.materialization_grace_ms, ttl_ms_u);
+        claim_anchor_boot_ms = store->bootMsNow();
+        store->mount_runtime.keeperRenewOnce();
+    }
+    store->armMountFence(our_uuid, writer_epoch, claim_anchor_boot_ms + ttl_ms_u);
     /// Gate the background renewer with `background_watermark`: it runs only in production
     /// (`background_watermark` = context != nullptr && !read_only), never in unit tests — which
     /// drive renewOnce (or renewWatermarkOnce) explicitly and rely on the armed sub-TTL deadline,

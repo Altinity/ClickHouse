@@ -278,6 +278,10 @@ public:
     void installKeeper(UInt128 our_uuid, uint64_t writer_epoch, const std::function<uint64_t()> & now_ms);
     /// Adopt the already-claimed mount slot; on return the adoption is durable.
     void keeperStart();
+    /// Force one fresh conditional lease write on the already-adopted slot (fails closed, like any
+    /// other `renewOnce`, if the slot changed hands underfoot). Used to re-anchor the write-fence
+    /// arm after a materialization grace long enough to have consumed the lease TTL.
+    void keeperRenewOnce();
     /// Discard a keeper after a refused adoption so the caller can retry with a fresh epoch.
     void keeperReset();
     /// Start periodic lease and watermark renewal.

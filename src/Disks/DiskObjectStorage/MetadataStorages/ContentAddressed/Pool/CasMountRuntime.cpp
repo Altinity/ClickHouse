@@ -253,6 +253,11 @@ void CasMountRuntime::keeperStart()
     mount_keeper->start();
 }
 
+void CasMountRuntime::keeperRenewOnce()
+{
+    mount_keeper->renewOnce();
+}
+
 void CasMountRuntime::keeperReset()
 {
     mount_keeper.reset();
