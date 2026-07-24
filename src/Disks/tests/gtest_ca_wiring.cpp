@@ -1,6 +1,14 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Parts/PartPathParser.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
+#include <Disks/DiskLocal.h>
+#include <Common/ErrorCodes.h>
+#include <filesystem>
+
+namespace DB::ErrorCodes
+{
+    extern const int NOT_IMPLEMENTED;
+}
 
 /// M-W wiring tier (design 2026-06-11 section 7 tier 3): the ClickHouse-facing translation layer
 /// tested through its own seams. Task 1: PartPathParser — the path-classification rows ported from
@@ -2596,4 +2604,27 @@ TEST(CasWiringResurrect, PromoteWithoutLivePrecommitAbortsWithoutResurrect)
     const auto lm_after = DB::Cas::tests::loadMetaForTest(store->backend(), store->layout(), u128Of(P));
     EXPECT_TRUE(lm_after.has_value() && lm_after->meta.state == MetaState::Condemned)
         << "no re-upload/resurrect before the owner check — the token is still the condemned one";
+}
+
+/// tryFromDisk must be exception-free for a plain local disk: it runs on every
+/// asynchronous-metrics tick for every configured disk, and probing via
+/// `getMetadataStorage`'s NOT_IMPLEMENTED throw pollutes `system.errors` (the Exception
+/// constructor counts the error even when the throw is caught) — a steady +N/s stream on a
+/// pure-local server, caught as a stray-error failure by strict-error tests
+/// (`test_cancel_backup`'s NoTrashChecker, Altinity PR#2073).
+TEST(CasWiring, TryFromDiskOnLocalDiskIsExceptionFreeAndCountsNoError)
+{
+    auto tmp = std::filesystem::temp_directory_path() / "ca_wiring_tryfromdisk_test";
+    std::filesystem::create_directories(tmp);
+    const DB::DiskPtr local = std::make_shared<DB::DiskLocal>("tryfromdisk_local", tmp.string());
+
+    const auto before = DB::ErrorCodes::values[DB::ErrorCodes::NOT_IMPLEMENTED].get().local.count;
+    auto * ca = DB::ContentAddressedMetadataStorage::tryFromDisk(local);
+    const auto after = DB::ErrorCodes::values[DB::ErrorCodes::NOT_IMPLEMENTED].get().local.count;
+
+    EXPECT_EQ(ca, nullptr);
+    EXPECT_EQ(after, before)
+        << "tryFromDisk on a non-content-addressed disk must not construct (and thereby count) "
+           "a NOT_IMPLEMENTED exception — it runs per disk on every asynchronous-metrics tick";
+    std::filesystem::remove_all(tmp);
 }

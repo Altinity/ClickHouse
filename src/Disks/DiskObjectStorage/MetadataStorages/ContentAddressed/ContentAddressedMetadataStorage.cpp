@@ -332,20 +332,19 @@ Cas::PartFolderValidate ContentAddressedMetadataStorage::parsePartFolderValidate
 
 ContentAddressedMetadataStorage * ContentAddressedMetadataStorage::tryFromDisk(const DiskPtr & disk)
 {
-    MetadataStoragePtr md;
-    try
-    {
-        md = disk->getMetadataStorage();
-    }
-    catch (const Exception & e)
-    {
-        if (e.code() == ErrorCodes::NOT_IMPLEMENTED)
-            return nullptr;
-        throw;
-    }
-    if (!md || !md->isContentAddressed())
+    /// The cheap predicate FIRST, never an exception probe: for every non-object-storage disk
+    /// (DiskLocal & co.) `getMetadataStorage` throws NOT_IMPLEMENTED, and merely CONSTRUCTING that
+    /// exception increments `system.errors` even when the throw is caught. This function runs on
+    /// every asynchronous-metrics tick for every configured disk, so the old exception-as-control-
+    /// flow probe polluted `system.errors` with a steady stream of NOT_IMPLEMENTED on pure-local
+    /// servers — caught as a stray-error failure by strict-error tests (`test_cancel_backup`'s
+    /// NoTrashChecker, Altinity PR#2073). `isContentAddressed` is a throw-free virtual (IDisk
+    /// defaults to false; wrappers forward it — see ReadOnlyDiskWrapper).
+    if (!disk || !disk->isContentAddressed())
         return nullptr;
-    return dynamic_cast<ContentAddressedMetadataStorage *>(md.get());
+    /// A content-addressed disk always implements getMetadataStorage (it IS the CA metadata
+    /// storage), so no NOT_IMPLEMENTED handling is needed past the predicate.
+    return dynamic_cast<ContentAddressedMetadataStorage *>(disk->getMetadataStorage().get());
 }
 
 void ContentAddressedMetadataStorage::runOneGcRoundForTest()
