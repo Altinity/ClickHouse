@@ -8,9 +8,9 @@ cluster = ClickHouseCluster(__file__)
 
 STORAGE_POLICY = "content_addressed_gc_s3"
 
-# Endpoint is http://minio1:9001/root/cas_gc_data/, so the pool's blobs and part footers live under
-# these key prefixes inside the `root` MinIO bucket. The authoritative "no S3 leftovers" proof checks
-# BOTH: a dropped table must leave neither content blobs nor part footers behind.
+# Endpoint is http://rustfs1:11121/test/cas_gc_data/, so the pool's blobs and part footers live
+# under these key prefixes inside the `test` RustFS bucket. The authoritative "no S3 leftovers"
+# proof checks BOTH: a dropped table must leave neither content blobs nor part footers behind.
 BLOBS_PREFIX = "cas_gc_data/blobs/"
 PARTS_PREFIX = "cas_gc_data/parts/"
 
@@ -30,7 +30,7 @@ def start_cluster():
     cluster.add_instance(
         "node",
         main_configs=["configs/storage_conf.xml"],
-        with_minio=True,
+        with_rustfs=True,
         stay_alive=True,
     )
 
@@ -42,8 +42,8 @@ def start_cluster():
 
 
 def count_prefix(prefix):
-    objects = cluster.minio_client.list_objects(
-        cluster.minio_bucket, prefix, recursive=True
+    objects = cluster.rustfs_client.list_objects(
+        cluster.rustfs_bucket, prefix, recursive=True
     )
     return len(list(objects))
 
