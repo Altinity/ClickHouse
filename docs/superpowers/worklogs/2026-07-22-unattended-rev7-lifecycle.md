@@ -111,3 +111,15 @@ Fable-ревью этапа умерло на чтении (артефактов
 ## 2026-07-24 14:40 — решение пользователя: stage 2 отложен; раунд финализируется {#stage2-postponed-wind-down}
 
 Brainstorm stage 2 дошёл до выбора подхода (скоуп A: только Replicated; анатомия обоих sink-ов + инвентарь опасностей сняты; форма патча — спящая настройка default 1 + ограниченный фан-аут) и был ОСТАНОВЛЕН решением пользователя: «слишком сильное / малопредсказуемое влияние на upstream / generic code». Все результаты исследования законсервированы в BACKLOG `{#stage2-concurrent-commitpart-postponed}`. Оба codex-ревью персистированы в `docs/superpowers/reports/2026-07-24-codex-stage1-reviews.md`. Идёт последний рабочий элемент раунда — `fix-codex2-s1` (фиксы находок второго codex-прохода); по его завершении и короткой codex-верификации раунд закрывается (пользователю нужен монопольный доступ к машине).
+
+## 2026-07-24 15:40 — РАУНД ЗАКРЫТ: codex-гейт FIXES VERIFIED {#round-closed}
+
+Финальная цепочка: codex-проход №2 (SOUND WITH FIXES) → фиксы `03e39609bd0`+`58a2601a853` (гейт 1270/1270) → верификация (2 остатка) → добивка `330d52e8c96` (гейт 1273/1273, двусторонние memory-границы + lifecycle `sealed_from`) → **FIXES VERIFIED**. Гейт раунда вырос 1204 → 1273 тестов.
+
+### Итоги unattended-раунда (2026-07-22 → 2026-07-24) {#round-summary}
+1. **rev.8 disk-lifecycle**: план 17/17, MERGEABLE AS-IS; FORGET-only модель, экзиция proof-стека (−1095), TLA-гейт, verb-поверхность SYSTEM CONTENT ADDRESSED FORGET / GC STOP / GC START, always-row system-таблица.
+2. **Пункт 2**: полный stateless (normal, asan) — продуктовых красных 0 (5 средовых IPv6-in-docker); пункт 3 пропущен по решению пользователя.
+3. **Пункт 4**: baseline s41 (10M×30col×500part): CA-S3 3.0× медленнее плоского S3, однопоточная заливка подтверждена.
+4. **Пункт 5 / stage 1**: 14/14 задач + 2 codex-раунда (4 жёстких дефекта найдено и пофикшено: fan-out UAF, pre-tenure стрэнд батона, слепой memory-страж, sealed_from) → **INSERT 58.41 → 30.26 с (−48%), 3.0× → 1.59×, CPU/wall 0.375 → 1.075**.
+5. **Stage 2**: исследование проведено, ОТЛОЖЕН решением пользователя (upstream-риск); записки в BACKLOG `{#stage2-concurrent-commitpart-postponed}`; кандидаты 2-6 в `{#writepath-candidates-post-stage1}`; HEAD-before-PUT + протокол — под вето.
+Ключевые процессные уроки записаны в память (GATE_EXIT-дисциплина, сериализация тяжёлых фаз, copy-paste фильтра, index-race гигиена).
