@@ -909,7 +909,7 @@ static ColumnWithTypeAndName readColumnWithUUIDFromFixedBinaryData(
     for (int chunk_i = 0, num_chunks = arrow_column->num_chunks(); chunk_i < num_chunks; ++chunk_i)
     {
         const auto & arrow_chunk = *(arrow_column->chunk(chunk_i));
-        const auto & fixed_binary_array = assert_cast<const arrow::FixedSizeBinaryArray &>(arrow_chunk);
+        const auto & fixed_binary_array = checkedCastFixedSizeBinary(arrow_chunk, column_name);
 
         // Security check: Ensure we actually got 16 bytes per row
         if (fixed_binary_array.byte_width() != sizeof(UUID))
