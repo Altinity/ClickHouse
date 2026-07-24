@@ -182,7 +182,8 @@ void ByteWeightedSemaphore::setWaitHookForTest(std::function<void()> hook)
 
 namespace
 {
-    /// 64 MiB per pool slot -- the CAS object size cap (see `ByteWeightedSemaphore`'s header comment).
+    /// 64 MiB per pool slot -- the chosen default per-task budget, not a blob-body cap (see
+    /// `initializeCondemnedUploadAdmission`'s header comment).
     constexpr uint64_t kCondemnedUploadPerTaskBudgetBytes = 64ULL << 20;
 
     std::mutex admission_mutex;

@@ -62,6 +62,33 @@ TEST(CasRefSnapshotCodec, RoundTripLive)
     EXPECT_EQ(decoded, s);
 }
 
+/// No-tolerance decode pin (codex round-2, finding 3): the `"pl"` (payload) field was removed from the
+/// committed-row wire in stage-1 T12. It is NOT a genuinely-unknown future field the tolerant reader may
+/// skip -- silently discarding a persisted payload would lose data -- so decoding a committed row that
+/// still carries `"pl"` must FAIL with `CORRUPTED_DATA` naming the removed field, not `skipUnknown` it.
+TEST(CasRefSnapshotCodec, DecodeRejectsRemovedPayloadFieldInCommittedRow)
+{
+    RefTableSnapshot s;
+    s.ns = "ns";
+    s.snapshot_id = RefTxnId{1, 1};
+    s.lifecycle = RefLifecycle::Live;
+    RefCommittedRow c;
+    c.ref_name = "all_1_1_0";
+    c.manifest_ref = manifestRef(5, 10, 1);
+    c.published_at_ms = 1717000000000ULL;
+    s.committed.push_back(c);
+
+    const String bytes = encodeRefTableSnapshot(s);
+    /// Splice the retired `"pl"` field back into the committed record, just before its `"ts"` field.
+    const String needle = ",\"ts\":";
+    const auto pos = bytes.find(needle);
+    ASSERT_NE(pos, String::npos);
+    const String tampered = bytes.substr(0, pos) + ",\"pl\":\"deadbeef\"" + bytes.substr(pos);
+
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { decodeRefTableSnapshot(tampered, s.ns, s.snapshot_id); });
+}
+
 TEST(CasRefSnapshotCodec, RoundTripLiveEmpty)
 {
     RefTableSnapshot s;

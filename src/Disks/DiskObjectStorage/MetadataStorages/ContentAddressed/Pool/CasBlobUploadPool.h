@@ -125,11 +125,12 @@ private:
 
 /// Fail-loud lifecycle mirroring the blob upload pool above. `configured_capacity_bytes` is the raw
 /// `content_addressed_condemned_upload_memory_bytes` server setting; `0` means "derive from the pool
-/// size": the derived capacity is `pool_size * 64 MiB`. 64 MiB is the CAS object size cap (the same
-/// bound `RefLog`/`RefSnapshot` decode enforces and `ref_removal_max_bytes` uses), so budgeting one
-/// full-sized condemned body per pool slot neither over-subscribes memory nor throttles a normal
-/// fan-out. Throws `BAD_ARGUMENTS` if the resolved capacity is 0; throws `LOGICAL_ERROR` if already
-/// initialized.
+/// size": the derived capacity is `pool_size * 64 MiB`. 64 MiB is the CHOSEN default per-task budget,
+/// NOT a cap on blob bodies -- blob bodies have no size cap; only `RefLog`/`RefSnapshot` objects are
+/// capped at 64 MiB (`ref_removal_max_bytes`). Budgeting one per-task budget per pool slot neither
+/// over-subscribes memory nor throttles a normal fan-out; a condemned body heavier than the whole
+/// capacity is admitted exclusively (alone) rather than deadlocking. Throws `BAD_ARGUMENTS` if the
+/// resolved capacity is 0; throws `LOGICAL_ERROR` if already initialized.
 void initializeCondemnedUploadAdmission(uint64_t configured_capacity_bytes, size_t pool_size);
 
 /// Throws `LOGICAL_ERROR` if not initialized.

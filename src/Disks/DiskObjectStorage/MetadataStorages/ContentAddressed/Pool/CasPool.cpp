@@ -1348,8 +1348,9 @@ std::vector<String> Pool::listMirroredChildren(const String & prefix)
     /// objects live under `cas/refs/<ns>/_log|_snap|_cleanup/…` while its verbatim files and PLAIN
     /// mountpoint objects stay under `roots/<ns>/_files/…` / `roots/<key>`. The browse therefore
     /// UNIONs the next-segment names from BOTH subtrees so a namespace discoverable only by its ref
-    /// objects (the common case — mutable per-part files ride inside the ref payload, not as
-    /// verbatim `_files`) is still surfaced.
+    /// objects (the common case — a table's parts are described by manifests referenced from its ref
+    /// bindings, so its data is reachable through the ref objects rather than as verbatim `_files`) is
+    /// still surfaced.
     std::unordered_set<String> children;
     const String roots_full = pool_layout.rootsPrefix() + prefix;       /// e.g. <pool>/roots/shadow/
     const String refs_full = pool_layout.casRefsPrefix() + prefix;      /// e.g. <pool>/cas/refs/shadow/
@@ -1514,6 +1515,11 @@ int Pool::pendingSnapshotPublishesForTest(const RootNamespace & ns)
 std::optional<RefTxnId> Pool::newestPublishedSnapshotIdForTest(const RootNamespace & ns)
 {
     return ref_ledger.newestPublishedSnapshotIdForTest(ns);
+}
+
+std::optional<RefTxnId> Pool::sealedFromForTest(const RootNamespace & ns)
+{
+    return ref_ledger.sealedFromForTest(ns);
 }
 
 size_t Pool::tailSinceSnapshotCountForTest(const RootNamespace & ns)

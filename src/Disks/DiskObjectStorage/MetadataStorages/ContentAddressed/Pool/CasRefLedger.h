@@ -182,6 +182,9 @@ public:
     int pendingSnapshotPublishesForTest(const RootNamespace & ns);
     /// Returns the newest snapshot id adopted by the cached runtime, if any.
     std::optional<RefTxnId> newestPublishedSnapshotIdForTest(const RootNamespace & ns);
+    /// Returns the `sealed_from` installed alongside `newestPublishedSnapshotIdForTest`: the seal's
+    /// observed-region upper bound when the newest snapshot is a recovery seal, else `nullopt`.
+    std::optional<RefTxnId> sealedFromForTest(const RootNamespace & ns);
     /// Returns the number of applied transactions newer than the adopted snapshot.
     size_t tailSinceSnapshotCountForTest(const RootNamespace & ns);
     /// Returns the number of committed entries in the mutable overlay, when the COW representation has one.
@@ -361,6 +364,14 @@ private:
         std::atomic<uint64_t> tail_count_since_snapshot{0};
         std::atomic<uint64_t> tail_bytes_since_snapshot{0};
         std::optional<RefTxnId> newest_snapshot_id;
+        /// The `sealed_from` of the snapshot at `newest_snapshot_id`, when that snapshot is a recovery
+        /// seal: the upper bound of what that recovery's LIST actually observed (`nullopt` for an
+        /// ordinary snapshot or a never-published table). Installed here so the recovered runtime carries
+        /// the COMPLETE `RecoveryResult` inventory rather than dropping one field (the drift-proof
+        /// publication invariant, Codex round 4 §5). The GC orphan sweep obtains `sealed_from`
+        /// independently via its own `recoverRefTableDetailed`, so this copy has no hot-read consumer in
+        /// the ledger today; it is kept for inventory completeness and introspection.
+        std::optional<RefTxnId> sealed_from;
         /// Whole-table cache-weight bookkeeping for `enforceRefTableCacheBudget`.
         /// `base_snapshot_bytes` is the encoded body size of the snapshot
         /// at `newest_snapshot_id` (0 for a never-published table), captured for free from the

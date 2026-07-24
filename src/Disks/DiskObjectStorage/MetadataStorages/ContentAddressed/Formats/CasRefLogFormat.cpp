@@ -198,6 +198,14 @@ RefOp readOpRecord(JsonObjectReader & r, RefOpKind kind)
         else if (key == "nme") nb.mf.me = r.readU64String();
         else if (key == "nmb") nb.mf.mb = r.readU64String();
         else if (key == "nmo") nb.mf.mo = r.readU64Number();
+        else if (key == "pl")
+            /// `"pl"` (payload) was removed from the op wire in stage-1 T12 (the `set_payload` op became
+            /// `set_published_at`). The retired op WORD is already rejected by `opKindFromWord`, but this
+            /// generic reader reads field keys before switching on kind, so a `"pl"` field paired with a
+            /// still-recognized op word would otherwise be `skipUnknown`'d. It is a KNOWN-removed field,
+            /// not a genuinely-unknown one -- reject it explicitly rather than silently discard it.
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "RefLogTxn: op record carries the removed \"pl\" (payload) field");
         else r.skipUnknown(key);
     }
 

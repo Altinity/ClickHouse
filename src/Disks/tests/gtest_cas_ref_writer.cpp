@@ -2858,6 +2858,41 @@ TEST(RefWriterRecoverySeal, UncleanBoundarySealsAllDeadEpochsBeforeExposingState
     EXPECT_EQ(seal.committed[1].ref_name, "b");
 }
 
+/// Codex round-2, finding 2 (RecoveryResult inventory completeness on the UNCLEAN path): after an
+/// unclean mount publishes a recovery seal, the recovered runtime must carry the seal's identity AND its
+/// `sealed_from` together. The durable seal (asserted above) records `sealed_from == {2,1}`; the runtime
+/// installed from the same `RecoveryResult` must expose the same value, not the stale predecessor
+/// `sealed_from` (`nullopt` here). Guards the fold that updates `newest_snapshot_id` to the seal while
+/// leaving `sealed_from` behind.
+TEST(RefWriterRecoverySeal, RuntimeInventoryCarriesSealSealedFrom)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/seal_inventory"};
+
+    seedSealFixtureDeadEpochs(*backend, layout, ns);
+    seedUncleanPredecessorMount(*backend, layout, /*epoch=*/2);
+
+    PoolConfig config;
+    config.server_id = UInt128(1);
+    config.mount_lease_ttl_ms = std::chrono::milliseconds(500);
+    config.cas_request_budget = sealTestTinyBudget();
+    config.materialization_grace_ms = 1000;
+    config.wait_sleep_fn = [](uint64_t) {};
+    auto store = openPoolWithConfig(backend, config);
+    ASSERT_TRUE(store);
+    ASSERT_TRUE(store->uncleanEpochBoundarySeenForTest());
+
+    /// Touch the namespace to drive recovery + the seal, then read the installed inventory.
+    ASSERT_EQ(store->listRefs(ns).size(), 2u);
+
+    const RefTxnId seal_id{2, UINT64_MAX};
+    EXPECT_EQ(store->newestPublishedSnapshotIdForTest(ns), std::optional<RefTxnId>(seal_id))
+        << "the runtime's newest snapshot must be the published seal";
+    EXPECT_EQ(store->sealedFromForTest(ns), std::optional<RefTxnId>(RefTxnId{2, 1}))
+        << "the runtime must carry the seal's sealed_from, not the stale predecessor value";
+}
+
 TEST(RefWriterRecoverySeal, LateLogBelowSealIsInvisibleToRecoveryAndFold)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();

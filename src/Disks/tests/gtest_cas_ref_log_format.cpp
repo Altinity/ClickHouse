@@ -185,6 +185,34 @@ TEST(CasRefCodec, RoundTripSetPublishedAt)
     EXPECT_EQ(decoded, txn);
 }
 
+/// No-tolerance decode pin (codex round-2, finding 3): the `"pl"` (payload) field was removed from the
+/// ref-op wire in stage-1 T12. Although the retired `set_payload` op WORD is already rejected by
+/// `opKindFromWord`, the generic op-record reader reads all field keys before switching on kind, so a
+/// `"pl"` field paired with a still-recognized op word would otherwise be `skipUnknown`'d. It is a
+/// removed field, not a genuinely-unknown one: decoding an op record that still carries `"pl"` must FAIL
+/// with `CORRUPTED_DATA` naming the removed field.
+TEST(CasRefCodec, DecodeRejectsRemovedPayloadFieldInOpRecord)
+{
+    RefLogTxn txn;
+    txn.ns = "srv1/db/table@cas@";
+    txn.txn_id = RefTxnId{3, 5};
+    RefOp op;
+    op.kind = RefOpKind::SetPublishedAt;
+    op.ref_name = "all_1_1_0";
+    op.expected_manifest_ref = manifestRef(3, 4, 1);
+    op.published_at_ms = 1717000000000ULL;
+    txn.ops.push_back(op);
+
+    const String bytes = encodeRefLogTxn(txn);
+    /// Splice the retired `"pl"` field back into the op record, just before its `"ts"` field.
+    const String needle = ",\"ts\":";
+    const auto pos = bytes.find(needle);
+    ASSERT_NE(pos, String::npos);
+    const String tampered = bytes.substr(0, pos) + ",\"pl\":\"deadbeef\"" + bytes.substr(pos);
+
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefLogTxn(tampered, txn.ns, txn.txn_id); });
+}
+
 TEST(CasRefCodec, RoundTripSetPublishedAtZeroTimestamp)
 {
     RefLogTxn txn;

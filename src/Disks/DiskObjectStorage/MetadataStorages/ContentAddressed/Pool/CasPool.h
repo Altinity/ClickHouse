@@ -776,6 +776,10 @@ public:
     /// or published), or `nullopt` if none. Recovers the table (idempotent) if not already cached.
     std::optional<RefTxnId> newestPublishedSnapshotIdForTest(const RootNamespace & ns);
 
+    /// test seam: the `sealed_from` installed with `newestPublishedSnapshotIdForTest` -- the recovery
+    /// seal's observed-region upper bound when the newest snapshot is a seal, else `nullopt`.
+    std::optional<RefTxnId> sealedFromForTest(const RootNamespace & ns);
+
     /// test seam: count of applied txns retained above `newestPublishedSnapshotIdForTest` (the
     /// tail a snapshot candidate would replay from).
     size_t tailSinceSnapshotCountForTest(const RootNamespace & ns);

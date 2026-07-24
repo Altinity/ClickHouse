@@ -538,8 +538,11 @@ void CasRefLedger::ensureRefTableRecovered(const RootNamespace & ns, RefTableRun
 
                     /// The seal now covers everything replayed so far: fold it into the publication as if it
                     /// were the recovered snapshot and the tail were empty -- exactly what a fresh recovery
-                    /// against the now-durable seal would find.
+                    /// against the now-durable seal would find. `sealed_from` must move to the seal's own
+                    /// value too: leaving the (pre-seal) base's `sealed_from` behind would describe the new
+                    /// seal with the predecessor's observed-region bound.
                     result.newest_snapshot_id = seal_id;
+                    result.sealed_from = seal.sealed_from;
                     result.tail_count = 0;
                     result.tail_bytes = 0;
                     result.base_snapshot_bytes = seal_bytes.size();
@@ -631,6 +634,11 @@ void CasRefLedger::installRecoveryResult(RefTableRuntime & rt, RecoveryResult &&
     rt.state = std::move(result.state);
     rt.cleanup_markers = std::move(result.cleanup_markers);
     rt.newest_snapshot_id = result.newest_snapshot_id;
+    /// `sealed_from` pairs with `newest_snapshot_id`: when the newest snapshot is a recovery seal this
+    /// is the seal's `sealed_from`, otherwise `nullopt`. Copied for a complete, drift-proof inventory --
+    /// the ledger has no hot-read consumer for it (see the field's doc comment), but leaving it out would
+    /// make the "copies EVERY field" contract false.
+    rt.sealed_from = result.sealed_from;
     rt.tail_count_since_snapshot.store(result.tail_count, std::memory_order_relaxed);
     rt.tail_bytes_since_snapshot.store(result.tail_bytes, std::memory_order_relaxed);
     rt.base_snapshot_bytes.store(result.base_snapshot_bytes, std::memory_order_relaxed);
@@ -1955,6 +1963,14 @@ std::optional<RefTxnId> CasRefLedger::newestPublishedSnapshotIdForTest(const Roo
     ensureRefTableRecovered(ns, *rt);
     std::lock_guard lock(rt->state_mutex);
     return rt->newest_snapshot_id;
+}
+
+std::optional<RefTxnId> CasRefLedger::sealedFromForTest(const RootNamespace & ns)
+{
+    const auto rt = getRefTableRuntime(ns);
+    ensureRefTableRecovered(ns, *rt);
+    std::lock_guard lock(rt->state_mutex);
+    return rt->sealed_from;
 }
 
 size_t CasRefLedger::tailSinceSnapshotCountForTest(const RootNamespace & ns)
