@@ -173,8 +173,12 @@ namespace ExportPartitionUtils
             context_copy->setSetting("output_format_parquet_row_group_size", *manifest.parquet_row_group_size);
         if (manifest.parquet_row_group_size_bytes)
             context_copy->setSetting("output_format_parquet_row_group_size_bytes", *manifest.parquet_row_group_size_bytes);
-        if (manifest.schema_mismatch_mode)
-            context_copy->setSetting("export_merge_tree_part_schema_mismatch_mode", String(magic_enum::enum_name(*manifest.schema_mismatch_mode)));
+        /// Manifests written before this setting existed have no value here; such tasks were always
+        /// scheduled under the old, strict column-count check, so an absent value must resolve to
+        /// `strict` regardless of the ambient context's setting (which may have since been changed).
+        context_copy->setSetting(
+            "export_merge_tree_part_schema_mismatch_mode",
+            String(magic_enum::enum_name(manifest.schema_mismatch_mode.value_or(MergeTreePartExportSchemaMismatchMode::strict))));
 
         context_copy->setSetting("max_threads", manifest.max_threads);
         context_copy->setSetting("export_merge_tree_part_file_already_exists_policy", String(magic_enum::enum_name(manifest.file_already_exists_policy)));
