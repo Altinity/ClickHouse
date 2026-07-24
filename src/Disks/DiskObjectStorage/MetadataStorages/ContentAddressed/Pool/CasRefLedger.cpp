@@ -989,8 +989,6 @@ RefTxnId CasRefLedger::appendRefOps(const RootNamespace & ns, MutationScope scop
     {
         if (!rt->leader_active)
         {
-            rt->leader_active = true;
-            lk.unlock();
             /// The set of items THIS leader is responsible for: its own enqueued `item` plus every item a
             /// flush carves out of `pending` (recorded by `flushRefBatch` as it carves). Whatever the
             /// leader loop does below -- return normally, or throw at ANY point including BEFORE it ever
@@ -1001,8 +999,30 @@ RefTxnId CasRefLedger::appendRefOps(const RootNamespace & ns, MutationScope scop
             /// the `leader_active` release the old catch used to own. Items NOT owned by this leader (other
             /// callers' still-queued items) are untouched -- they stay validly owned by their blocked
             /// callers.
+            ///
+            /// Build the responsibility set (its own `item`) BEFORE publishing the baton, so becoming
+            /// leader contains NO throwing operation once `leader_active` is set: the only allocation is
+            /// this first `push_back`, done here while still holding `lk` and NOT yet leader. If it throws
+            /// (a `bad_alloc` at the pre-tenure point; codex stage-1 review, Important), the baton is never
+            /// taken -- but `item` is already in `pending` (pushed above), so it must be un-enqueued before
+            /// propagating, else a future leader would carve an item whose `build_ops` closure died with
+            /// this unwinding caller (the same use-after-free the exit guard prevents post-publication).
+            /// Publishing the baton and reaching the exit guard is then a pure no-throw sequence.
             std::vector<std::shared_ptr<RefMutationItem>> owned_items;
-            owned_items.push_back(item);
+            try
+            {
+                if (ref_pre_tenure_hook_for_test)
+                    ref_pre_tenure_hook_for_test();
+                owned_items.push_back(item);
+            }
+            catch (...)
+            {
+                std::erase(rt->pending, item);
+                throw;
+            }
+
+            rt->leader_active = true;
+            lk.unlock();
             std::exception_ptr flush_exception;
             try
             {

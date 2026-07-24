@@ -788,6 +788,10 @@ public:
     /// caller's item join `rt->pending` before the carve, forcing deterministic co-batching.
     void setRefPreCarveHookForTest(std::function<void()> hook) { ref_ledger.setRefPreCarveHookForTest(std::move(hook)); }
 
+    /// Test-only: pre-tenure fault seam for the append-lane leadership acquisition; forwards to
+    /// `CasRefLedger::setRefPreTenureHookForTest` (see it for the baton-safety contract).
+    void setRefPreTenureHookForTest(std::function<void()> hook) { ref_ledger.setRefPreTenureHookForTest(std::move(hook)); }
+
     /// Test-only: fault seam for the ref-flush two-phase carve/validation protocol; forwards to
     /// `CasRefLedger::setCarveHookForTest` (see it for the phase-point contract).
     void setCarveHookForTest(std::function<void(CasRefLedger::CarvePhaseForTest)> hook)
@@ -805,6 +809,10 @@ public:
     /// Queue depth for the ref-append-lane tests (mirrors `shardQueuePendingForTest`): how many
     /// `appendRefOps` callers are enqueued for `ns` right now.
     size_t refQueuePendingForTest(const RootNamespace & ns) { return ref_ledger.refQueuePendingForTest(ns); }
+
+    /// Test seam: whether `ns` currently has an active append-lane leader (the baton). Mirrors
+    /// `refQueuePendingForTest`; used to assert the baton is not stranded on a pre-tenure fault.
+    bool refLeaderActiveForTest(const RootNamespace & ns) { return ref_ledger.refLeaderActiveForTest(ns); }
 
     /// Test seam: how many concurrent `ensureRefTableRecovered` callers for `ns` are
     /// PARKED right now waiting on the leader's in-flight recovery (see `RefTableRuntime::

@@ -138,3 +138,44 @@ TEST(RefWriterLaneExceptionSafety, FollowerNeverRunsStrandedLeaderClosure)
     EXPECT_EQ(store->refQueuePendingForTest(ns), 0u) << "an item was stranded in rt->pending";
     EXPECT_GE(ok.load(), 1) << "the non-faulted caller must complete cleanly";
 }
+
+/// codex stage-1 review (Important): an allocation exception at the PRE-TENURE point -- the first
+/// allocation that builds the leader's responsibility set, BEFORE `leader_active` is published -- must
+/// not permanently strand the append-lane baton. Before the fix the throwing allocation fired AFTER
+/// `leader_active = true` (and after the queue mutex was released), leaving the baton held with no live
+/// leader and the caller's item stuck in `pending`: every later writer on the namespace would wait
+/// forever at the leader-election cv, and shutdown draining could only time out. This drives the fault
+/// through the dedicated pre-tenure seam and asserts, deterministically (no hang), that the lane is left
+/// idle: the item is un-enqueued and the baton is un-taken.
+TEST(RefWriterLaneExceptionSafety, PreTenureAllocFailureReleasesBaton)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForRefLane(backend);
+    const RootNamespace ns{"srv1/reflane_pretenure"};
+
+    std::atomic<int> fault_armed{1};
+    store->setRefPreTenureHookForTest([&]
+    {
+        if (fault_armed.exchange(0) == 1)
+            throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "injected pre-tenure fault");
+    });
+
+    bool threw = false;
+    try
+    {
+        store->appendRefOps(ns, MutationScope::ref("ref_pretenure"),
+            [](const RefTableState &) -> std::vector<RefOp> { return {}; },
+            RootMutationOrigin::Writer, RootMutationKind::Publish);
+    }
+    catch (const DB::Exception &)
+    {
+        threw = true;
+    }
+    store->setRefPreTenureHookForTest(nullptr);
+
+    EXPECT_TRUE(threw) << "the faulted caller must observe the injected error";
+    EXPECT_EQ(store->refQueuePendingForTest(ns), 0u)
+        << "a pre-tenure allocation failure left the caller's item stranded in rt->pending";
+    EXPECT_FALSE(store->refLeaderActiveForTest(ns))
+        << "a pre-tenure allocation failure left the append-lane baton held with no live leader";
+}

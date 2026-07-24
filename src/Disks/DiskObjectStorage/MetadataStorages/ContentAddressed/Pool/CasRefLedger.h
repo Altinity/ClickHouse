@@ -204,12 +204,23 @@ public:
     enum class CarvePhaseForTest { PlanSeenRefs, PlanBatchGrow, PlanReserveOwned, PublishPop, ValidateFinalOps, ChunkReseed };
     void setCarveHookForTest(std::function<void(CarvePhaseForTest)> hook) { carve_hook_for_test = std::move(hook); }
 
+    /// Installs the pre-tenure fault seam (see `ref_pre_tenure_hook_for_test`).
+    void setRefPreTenureHookForTest(std::function<void()> hook) { ref_pre_tenure_hook_for_test = std::move(hook); }
+
     /// Returns the number of queued mutations for `ns` under the queue mutex.
     size_t refQueuePendingForTest(const RootNamespace & ns)
     {
         std::lock_guard<std::mutex> g(ref_queue_mutex);
         const auto it = ref_tables.find(ns.string());
         return it == ref_tables.end() ? 0 : it->second->pending.size();
+    }
+
+    /// Reports whether `ns` currently has an active append-lane leader (the baton). Under the queue mutex.
+    bool refLeaderActiveForTest(const RootNamespace & ns)
+    {
+        std::lock_guard<std::mutex> g(ref_queue_mutex);
+        const auto it = ref_tables.find(ns.string());
+        return it != ref_tables.end() && it->second->leader_active;
     }
 
     /// Returns the number of callers currently waiting for `ns` recovery under its state mutex.
@@ -414,6 +425,13 @@ private:
 
     /// Test-only hook called before a compatible append batch is carved; null in production.
     std::function<void()> ref_pre_carve_hook_for_test;
+
+    /// Test-only fault seam fired on the CALLING thread at the instant a queue caller takes append-lane
+    /// leadership -- i.e. at the FIRST allocation that builds the leader's responsibility set, the last
+    /// throwing point before the baton (`leader_active`) is published. A throw here must leave the lane
+    /// idle (baton un-taken, the caller's item un-enqueued), never a permanently non-idle namespace with
+    /// no live leader. Null in production. See `appendRefOps`.
+    std::function<void()> ref_pre_tenure_hook_for_test;
 
     /// Test-only hook fired at each carve/validation phase point (see `CarvePhaseForTest`); null in
     /// production.
