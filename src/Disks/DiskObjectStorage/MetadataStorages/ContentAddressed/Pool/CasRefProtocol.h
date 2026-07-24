@@ -238,6 +238,9 @@ private:
     friend RefTableState replay(const std::optional<RefTableSnapshot> & snapshot, std::span<const RefLogTxn> tail);
     friend bool admits(const RefTableState & state, const RefOp & op,
                        uint64_t snapshot_budget, uint64_t removal_budget);
+    /// The streaming generalisation of `replay`: reaches the same private in-place poisoning path
+    /// (`applyTxnInPlace`) on its own discard-on-throw candidate, one decoded transaction at a time.
+    friend class RefReplayBuilder;
 };
 
 /// The inverse of `snapshotOf`: state from a snapshot's rows. `replay` may receive a hand-built
@@ -355,6 +358,84 @@ RefTableSnapshot snapshotOf(const RefTableState & state, const String & ns);
 /// wrong-but-plausible-looking state, exactly the class of bug this equation exists to make
 /// impossible.
 RefTableState replay(const std::optional<RefTableSnapshot> & snapshot, std::span<const RefLogTxn> tail);
+
+/// Everything a successful recovery of one ref table seeds. Produced by streaming replay
+/// (`RefReplayBuilder::finish`) rather than assigned field-by-field into the runtime, so the whole
+/// publication is one value installed atomically -- a prose field list would drift, but a struct that
+/// the install copies wholesale cannot silently lose a field (Codex review round 4, spec §5).
+///
+/// `finish` populates the fields that are a pure function of `(base snapshot, replayed tail)`: `state`,
+/// `newest_snapshot_id`, `sealed_from`, `tail_count`, `tail_bytes`, and `base_snapshot_bytes`. The
+/// remaining fields are recovery-context the streaming builder cannot know -- the writer's own recovery
+/// (`CasRefLedger::ensureRefTableRecovered`) fills `cleanup_markers`, the admission budgets and
+/// `needs_stale_precommit_sweep`, and applies the recovery-seal override to the snapshot-identity/tail/
+/// base fields, before installing the whole struct under `state_mutex` with `recovered` set last. The
+/// read-only consumers (`recoverRefTableDetailed` for the orphan sweep, fsck's snapshot oracle) read
+/// only `state` (plus `newest_snapshot_id`/`sealed_from` for the sweep) and leave the rest at default.
+struct RecoveryResult
+{
+    RefTableState state;
+    /// Identity of the base snapshot this recovery replayed from: `nullopt` for a never-born table.
+    std::optional<RefTxnId> newest_snapshot_id;
+    /// Set only when the base is a recovery seal -- the upper bound of what that recovery's LIST saw.
+    std::optional<RefTxnId> sealed_from;
+    /// Applied transactions strictly newer than `newest_snapshot_id`, and the sum of their stored
+    /// (sealed) object byte sizes -- the tail-since-snapshot accounting the runtime tracks.
+    uint64_t tail_count = 0;
+    uint64_t tail_bytes = 0;
+    /// Encoded (sealed) body size of the base snapshot; 0 for a never-born base.
+    uint64_t base_snapshot_bytes = 0;
+
+    /// Recovery-context fields (filled by `ensureRefTableRecovered`, default for other consumers):
+    std::set<RefTxnId> cleanup_markers;
+    uint64_t snapshot_budget = 0;
+    uint64_t removal_budget = 0;
+    bool needs_stale_precommit_sweep = false;
+};
+
+/// The streaming generalisation of `replay` (spec §5): owns a PRIVATE candidate `RefTableState` and
+/// applies decoded transactions into it ONE AT A TIME, in place, discarding the candidate on any throw.
+/// It is the memory fix for a long post-snapshot tail: `replay` takes the whole `tail` materialised in a
+/// vector (every decoded transaction resident at once, each up to the 20 MiB normal-class cap), whereas
+/// a caller that GETs+decodes+`applyOne`+discards one object at a time holds at most a single decoded
+/// transaction. `applyOne` reaches `RefTableState::applyTxnInPlace` directly -- the same private
+/// poisoning path `replay` uses -- NOT the public scratch-copying `applyRefLogTxn`, which would deep-copy
+/// the growing candidate once per transaction and reintroduce the O(K*N) cost `replay` was written to
+/// avoid. The candidate never touches any live runtime state; a throw destroys it during unwinding, so no
+/// consumer ever observes a poisoned candidate. All three full-tail materialisers stream through this:
+/// the writer's recovery, `recoverRefTableDetailed` (orphan sweep), and fsck's snapshot oracle.
+class RefReplayBuilder
+{
+public:
+    /// Seeds the candidate from `base` (or the empty/never-born state when absent), revalidating the
+    /// snapshot in full exactly as `replay` does (`stateFromSnapshot`). `base_encoded_bytes` is the
+    /// stored (sealed) size of that snapshot object, carried through to `RecoveryResult::base_snapshot_bytes`
+    /// (0 when the caller does not track it -- the read-only consumers do not).
+    explicit RefReplayBuilder(std::optional<RefTableSnapshot> base, uint64_t base_encoded_bytes = 0);
+
+    /// Applies one decoded transaction to the candidate in place. `encoded_bytes` is the stored (sealed)
+    /// object size of `txn`, accumulated into the tail-byte total. A decode/apply corruption throws
+    /// `CORRUPTED_DATA` (the non-transient class recovery fails fast on), discarding the candidate.
+    void applyOne(RefLogTxn && txn, uint64_t encoded_bytes);
+
+    /// Materialises nothing extra (matches `replay`: the writer's recovery folds the COW overlays via
+    /// `materializeCommitted` on the result; the read-only consumers do not) and returns the replay-derived
+    /// `RecoveryResult` fields, moving the candidate out. The builder must not be used afterwards.
+    RecoveryResult finish() &&;
+
+private:
+    RefTableState candidate;
+    std::optional<String> expected_ns;
+    RecoveryResult result;
+};
+
+/// Test-only observability for the streaming-recovery memory invariant (spec §5): while a probe is
+/// installed, `RefReplayBuilder::applyOne` reports the running weight, in stored object bytes, of the
+/// decoded transactions it holds alive (`+weight` while applying one, `-weight` once it is discarded).
+/// A memory-bound test tracks the peak reported weight and asserts it stays within a single transaction,
+/// where the retired whole-tail materialiser held the entire tail. No probe installed => no accounting.
+/// Guarded by an internal mutex; install before driving recovery and clear afterwards.
+void setRecoveryReplayMemoryProbeForTest(std::function<void(int64_t delta_stored_bytes)> probe);
 
 /// The exact encoded size of `state`'s canonical snapshot (`encodeRefTableSnapshot(snapshotOf(state,
 /// "")).size()`), computed in O(1) from the running body counter plus O(1) framing instead of a full

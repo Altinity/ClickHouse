@@ -238,7 +238,12 @@ void checkSnapshotOracle(Backend & backend, const Layout & layout, const RootNam
 
     /// Logs in (base_id, X]. X reuses its last log's id, so X itself is a log id here: if its log -- or any
     /// covered log above the base -- was already cleaned, the independent reconstruction is unavailable.
-    std::vector<RefLogTxn> tail;
+    /// Reconstruct the state AT X by streaming those logs through one builder -- GET -> decode -> applyOne
+    /// -> discard, one at a time -- so a long log tail never materializes as a whole-tail vector (spec §5).
+    /// The builder revalidates the base snapshot in full (`stateFromSnapshot`) and applies the tail through
+    /// the SAME state machine the writer used; the last applied id is X, so `snapshotOf` below yields a
+    /// snapshot with id X whose bytes must equal the published object.
+    RefReplayBuilder builder(std::move(base));
     for (const RefTxnId & id : log_ids)
     {
         if (!(base_id < id))
@@ -249,13 +254,11 @@ void checkSnapshotOracle(Backend & backend, const Layout & layout, const RootNam
         const auto got_log = backend.get(layout.refLogKey(ns, id));
         if (!got_log)
             return;   /// a covered log was cleaned/vanished: oracle unavailable for X -> skip, not error
-        tail.push_back(decodeRefLogTxn(openObject(FormatId::RefLog, got_log->bytes), ns.string(), id));
+        builder.applyOne(
+            decodeRefLogTxn(openObject(FormatId::RefLog, got_log->bytes), ns.string(), id), got_log->bytes.size());
     }
 
-    /// Reconstruct the state AT X and re-encode. `replay` revalidates the base snapshot in full and applies
-    /// the tail through the SAME state machine the writer used; the last applied id is X, so `snapshotOf`
-    /// yields a snapshot with id X whose bytes must equal the published object.
-    const RefTableState reconstructed = replay(base, tail);
+    const RefTableState reconstructed = std::move(builder).finish().state;
     /// `recomputed` is canonical TEXT; the stored object is Always/`.zst`, so compare against the
     /// DECOMPRESSED stored bytes (zstd byte-determinism is not relied on here -- the canonical text is).
     const String recomputed = encodeRefTableSnapshot(snapshotOf(reconstructed, ns.string()));

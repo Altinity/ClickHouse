@@ -244,6 +244,39 @@ public:
         const auto it = ref_tables.find(ns.string());
         return it != ref_tables.end() && it->second->recovered;
     }
+    /// Recovery-publication inventory accessors: the seeded per-table admission budgets, the recovered
+    /// base snapshot's encoded body size, the tail-since-snapshot byte sum, and the `_cleanup` markers
+    /// observed at recovery. Together with `newestPublishedSnapshotIdForTest`,
+    /// `tailSinceSnapshotCountForTest`, `needsStalePrecommitSweepForTest` and the resolved state, they
+    /// let a test assert EVERY `RecoveryResult` field the install seeds.
+    uint64_t refSnapshotBudgetForTest(const RootNamespace & ns)
+    {
+        const auto rt = getRefTableRuntime(ns);
+        std::lock_guard<std::mutex> g(rt->state_mutex);
+        return rt->snapshot_budget;
+    }
+    uint64_t refRemovalBudgetForTest(const RootNamespace & ns)
+    {
+        const auto rt = getRefTableRuntime(ns);
+        std::lock_guard<std::mutex> g(rt->state_mutex);
+        return rt->removal_budget;
+    }
+    uint64_t refBaseSnapshotBytesForTest(const RootNamespace & ns)
+    {
+        const auto rt = getRefTableRuntime(ns);
+        return rt->base_snapshot_bytes.load(std::memory_order_relaxed);
+    }
+    uint64_t refTailBytesSinceSnapshotForTest(const RootNamespace & ns)
+    {
+        const auto rt = getRefTableRuntime(ns);
+        return rt->tail_bytes_since_snapshot.load(std::memory_order_relaxed);
+    }
+    std::set<RefTxnId> refCleanupMarkersForTest(const RootNamespace & ns)
+    {
+        const auto rt = getRefTableRuntime(ns);
+        std::lock_guard<std::mutex> g(rt->state_mutex);
+        return rt->cleanup_markers;
+    }
 
 private:
     /// Injected storage and mount environment. The member order is part of construction/destruction
@@ -444,6 +477,12 @@ private:
     /// table as recovered until any required recovery seal is durable; concurrent callers serialize
     /// across the unlocked seal I/O through `recovery_in_progress`.
     void ensureRefTableRecovered(const RootNamespace & ns, RefTableRuntime & rt);
+
+    /// Publishes a completed streaming recovery into the runtime in one atomic step: copies EVERY field
+    /// `RecoveryResult` carries into `rt` and sets `recovered` LAST, so a waiter woken after this returns
+    /// never observes a partially-installed table. Struct-driven so a future added publication field
+    /// cannot be silently dropped from a scattered assignment list (spec §5). MUST hold `rt.state_mutex`.
+    void installRecoveryResult(RefTableRuntime & rt, RecoveryResult && result);
 
     /// Evicts least-recently-touched, idle whole-table runtimes until the configured cache budget is met,
     /// retaining `keep_ns` even when it is the next candidate.

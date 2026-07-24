@@ -826,6 +826,15 @@ public:
     size_t refTablesCachedCountForTest() { return ref_ledger.refTablesCachedCountForTest(); }
     bool refTableCachedForTest(const RootNamespace & ns) { return ref_ledger.refTableCachedForTest(ns); }
 
+    /// Recovery-publication inventory seams (forward to `CasRefLedger`): the seeded admission budgets,
+    /// the recovered base snapshot's encoded body size, the tail-since-snapshot byte sum, and the
+    /// `_cleanup` markers observed at recovery -- so a test can assert every `RecoveryResult` field.
+    uint64_t refSnapshotBudgetForTest(const RootNamespace & ns) { return ref_ledger.refSnapshotBudgetForTest(ns); }
+    uint64_t refRemovalBudgetForTest(const RootNamespace & ns) { return ref_ledger.refRemovalBudgetForTest(ns); }
+    uint64_t refBaseSnapshotBytesForTest(const RootNamespace & ns) { return ref_ledger.refBaseSnapshotBytesForTest(ns); }
+    uint64_t refTailBytesSinceSnapshotForTest(const RootNamespace & ns) { return ref_ledger.refTailBytesSinceSnapshotForTest(ns); }
+    std::set<RefTxnId> refCleanupMarkersForTest(const RootNamespace & ns) { return ref_ledger.refCleanupMarkersForTest(ns); }
+
 private:
     BackendPtr pool_backend;
     PoolConfig config;

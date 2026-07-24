@@ -415,8 +415,12 @@ void CasRefLedger::ensureRefTableRecovered(const RootNamespace & ns, RefTableRun
                     }
                 }
 
-                std::vector<RefLogTxn> tail;
-                std::vector<uint64_t> tail_bytes;
+                /// Stream the post-snapshot tail through one builder: GET -> decode -> applyOne ->
+                /// discard, one transaction at a time into a PRIVATE candidate, so a long tail of
+                /// (post-op-cap) up-to-20-MiB transactions never materializes as a whole-tail vector. The
+                /// candidate never touches `rt.state`; it is published atomically as one `RecoveryResult`
+                /// (`installRecoveryResult`) only after the whole tail -- and any seal -- succeeds.
+                RefReplayBuilder builder(std::move(snapshot), snapshot_body_bytes);
                 if (!vanished)
                 {
                     for (const RefTxnId & id : log_ids)
@@ -429,64 +433,72 @@ void CasRefLedger::ensureRefTableRecovered(const RootNamespace & ns, RefTableRun
                             vanished = true;
                             break;
                         }
-                        tail.push_back(decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), id));
-                        tail_bytes.push_back(got->bytes.size());
+                        builder.applyOne(
+                            decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), id),
+                            got->bytes.size());
                     }
                 }
 
                 if (vanished)
-                    continue;   /// the selected object vanished; retry recovery from a fresh listing
+                    continue;   /// the selected object vanished; retry from a fresh listing (candidate discarded)
 
-                rt.state = replay(snapshot, tail);
-                /// `replay` (the pure state-machine equation) never materializes: `stateFromSnapshot`
-                /// loads every committed row and owned-manifest entry into the COW OVERLAY, and no tail
-                /// transaction materializes either. This state is retained as the table's long-lived
-                /// working state, so materialize ONCE here -- folding both `committed` and
-                /// `owned_manifests` into fresh shared bases -- rather than making the first flush's
-                /// scratch copy (and every per-item/shape-check copy on it) deep-copy an N-row overlay.
-                /// The O(N) fold rides inside recovery, which is already O(N).
-                rt.state.materializeCommitted();
-                rt.cleanup_markers = std::move(cleanup_markers);
+                RecoveryResult result = std::move(builder).finish();
+                /// `finish` returns the candidate WITHOUT materializing: `stateFromSnapshot` loads every
+                /// committed row and owned-manifest entry into the COW OVERLAY, and no tail transaction
+                /// materializes either. This state is the table's long-lived working state, so fold both
+                /// `committed` and `owned_manifests` into fresh shared bases ONCE here -- rather than making
+                /// the first flush's scratch copy (and every per-item/shape-check copy on it) deep-copy an
+                /// N-row overlay. The O(N) fold rides inside recovery, which is already O(N).
+                result.state.materializeCommitted();
+                result.cleanup_markers = std::move(cleanup_markers);
+                /// Stale-precommit cleanup is dispatched once, from `appendRefOps`'s top level (never from
+                /// here -- this call may itself be nested inside a queue leader's flush stack).
+                result.needs_stale_precommit_sweep = true;
+                /// Per-table admission budgets pre-subtract this table's own wire overhead
+                /// (`4 + ns.size()`, once in a snapshot body and once in a removal txn body) plus a fixed
+                /// safety margin from the raw hard limits, once, here.
+                const uint64_t overhead = 4 + ns.string().size() + kRefAdmissionSafetyMargin;
+                result.snapshot_budget = overhead < ref_snapshot_max_bytes ? ref_snapshot_max_bytes - overhead : 0;
+                result.removal_budget = overhead < ref_removal_max_bytes ? ref_removal_max_bytes - overhead : 0;
 
-                /// At an UNCLEAN mount, close every dead epoch this
-                /// recovery discovered with an immediate snapshot -- the seal -- published BEFORE the table is
-                /// exposed as recovered. This runs BEFORE `rt.recovered = true` below on purpose: a failed seal
-                /// PUT throws here, leaving the table unrecovered, so the NEXT touch restarts recovery from
-                /// scratch (fresh LIST, fresh replay, fresh seal attempt) rather than exposing a table whose
-                /// dead-epoch region was never actually closed; recovery therefore fails closed.
+                /// At an UNCLEAN mount, close every dead epoch this recovery discovered with an immediate
+                /// snapshot -- the seal -- published BEFORE the table is installed as recovered. A failed
+                /// seal PUT throws here, leaving the table unrecovered, so the NEXT touch restarts recovery
+                /// from scratch (fresh LIST, fresh replay, fresh seal attempt) rather than exposing a table
+                /// whose dead-epoch region was never closed; recovery therefore fails closed.
                 /// The encode and conditional `PUT` run OUTSIDE `state_mutex` (unlocked/relocked just below,
-                /// mirroring `trySnapshotPublishOnce`'s copy-under-lock/PUT-outside shape) -- it is the one part
-                /// of recovery that can run the full ~90s retry envelope, and holding the mutex across it stalls
-                /// every other touch of this table plus `wedgedRefLaneCount`'s whole-store walk (which locks each
-                /// table's `state_mutex` in turn). `recovery_in_progress` (set above), not the mutex, is what
-                /// keeps a concurrent second caller for this SAME table from redoing this same work during the
-                /// unlocked window -- see its doc comment. Nothing else can mutate `rt.state`/`rt.cleanup_markers`
-                /// meanwhile: every OTHER touch-point calls this function first and would block in the wait loop
-                /// above; `rt` itself cannot be destroyed underneath us (the caller's own `shared_ptr` keeps it
-                /// alive regardless of the mutex, which is also what protects it from `enforceRefTableCacheBudget`
-                /// -- eviction only ever considers a table at `use_count() == 1`).
+                /// mirroring `trySnapshotPublishOnce`'s copy-under-lock/PUT-outside shape) -- it is the one
+                /// part of recovery that can run the full ~90s retry envelope, and holding the mutex across
+                /// it stalls every other touch of this table plus `wedgedRefLaneCount`'s whole-store walk
+                /// (which locks each table's `state_mutex` in turn). `recovery_in_progress` (set above), not
+                /// the mutex, keeps a concurrent second caller for this SAME table from redoing this work
+                /// during the unlocked window -- see its doc comment. The seal reads the PRIVATE candidate
+                /// (`result.state`), not `rt.state`: nothing installs into the runtime before the single
+                /// atomic `installRecoveryResult` at the end, so no observer ever sees a half-published
+                /// table (`rt` itself cannot be destroyed underneath us -- the caller's own `shared_ptr`
+                /// keeps it alive, which is also what protects it from `enforceRefTableCacheBudget`).
                 ///
-                /// `seal_id` is the UPPER BOUND of the dead-epoch region, not the greatest listed id: the wedge
-                /// discipline places the predecessor's one possible in-flight PUT strictly above everything it
-                /// resolved, so only the epoch-closing bound is guaranteed to dominate it --
+                /// `seal_id` is the UPPER BOUND of the dead-epoch region, not the greatest listed id: the
+                /// wedge discipline places the predecessor's one possible in-flight PUT strictly above
+                /// everything it resolved, so only the epoch-closing bound is guaranteed to dominate it --
                 /// any later materialization from a dead epoch is born covered (`<=` seal_id) for every
-                /// observer, forever. `sealed_from` records the greatest id this recovery actually listed, the
-                /// observation horizon against which a later log is measured.
+                /// observer, forever. `sealed_from` records the greatest id this recovery actually listed.
                 const uint64_t my_epoch = live_epoch_fn();
                 const RefTxnId seal_id{my_epoch - 1, std::numeric_limits<uint64_t>::max()};
                 const bool dead_region_nonempty =
                     greatest_listed_id.has_value() && greatest_listed_id->writer_epoch < my_epoch;
-                const bool already_sealed = snapshot.has_value() && !(snapshot->snapshot_id < seal_id);
+                const bool already_sealed =
+                    result.newest_snapshot_id.has_value() && !(*result.newest_snapshot_id < seal_id);
                 /// Compare against the SPECIFIC epoch a reclaim was marked unclean for, not a
                 /// sticky "ever" bool -- a table recovered for the first time (or reloaded after LRU eviction)
                 /// under a LATER, perfectly clean epoch boundary must not get a parasitic seal just because
                 /// SOME earlier, unrelated boundary in this incarnation's life was unclean.
                 if (unclean_boundary_epoch() == my_epoch && my_epoch >= 2
-                    && dead_region_nonempty && !already_sealed && rt.state.getLifecycle() == RefLifecycle::Live)
+                    && dead_region_nonempty && !already_sealed && result.state.getLifecycle() == RefLifecycle::Live)
                 {
-                    RefTableSnapshot seal = snapshotOf(rt.state, ns.string());
-                    seal.snapshot_id = seal_id;                     /// upper bound of the covered region
-                    seal.sealed_from = rt.state.getGreatestApplied();    /// == greatest_listed_id: nothing else was applied
+                    RefTableSnapshot seal = snapshotOf(result.state, ns.string());
+                    seal.snapshot_id = seal_id;                            /// upper bound of the covered region
+                    seal.sealed_from = result.state.getGreatestApplied();  /// == greatest_listed_id: nothing else was applied
                     const String seal_bytes = sealObject(FormatId::RefSnapshot, encodeRefTableSnapshot(seal));
                     const auto fence_ok = [this] { return fence_ok_fn(); };
                     /// The `SCOPE_EXIT` above mutates
@@ -519,43 +531,20 @@ void CasRefLedger::ensureRefTableRecovered(const RootNamespace & ns, RefTableRun
                             "re-seals)", ns.string()));
                     ProfileEvents::increment(ProfileEvents::CasRefRecoverySealPublished);
 
-                    /// The seal now covers everything replayed so far: feed it into the SAME bookkeeping below
-                    /// (`rt.newest_snapshot_id`, the tail counters, cache weight) as if it were the recovered
-                    /// snapshot and the tail were empty -- exactly what a fresh recovery against the now-durable
-                    /// seal would find.
-                    snapshot = std::move(seal);
-                    tail.clear();
-                    tail_bytes.clear();
-                    snapshot_body_bytes = seal_bytes.size();
+                    /// The seal now covers everything replayed so far: fold it into the publication as if it
+                    /// were the recovered snapshot and the tail were empty -- exactly what a fresh recovery
+                    /// against the now-durable seal would find.
+                    result.newest_snapshot_id = seal_id;
+                    result.tail_count = 0;
+                    result.tail_bytes = 0;
+                    result.base_snapshot_bytes = seal_bytes.size();
                 }
 
-                rt.recovered = true;
-
-                /// Seed the tail counters from this SAME recovery
-                /// pass -- `rt.state` above already IS `Replay(snapshot, tail)` (the mount-time trigger's
-                /// candidate body needs no separate base+tail bookkeeping any more), so only the count and byte
-                /// sum of the logs strictly above the recovered snapshot need seeding.
-                rt.newest_snapshot_id = snapshot ? std::optional<RefTxnId>(snapshot->snapshot_id) : std::nullopt;
-                rt.tail_count_since_snapshot.store(tail.size(), std::memory_order_relaxed);
-                uint64_t seeded_tail_bytes = 0;
-                for (uint64_t bytes : tail_bytes)
-                    seeded_tail_bytes += bytes;
-                rt.tail_bytes_since_snapshot.store(seeded_tail_bytes, std::memory_order_relaxed);
-                /// Stale-precommit cleanup is dispatched once, from `appendRefOps`'s top level
-                /// (never from here -- this call may itself be nested inside a queue leader's flush stack).
-                rt.needs_stale_precommit_sweep = true;
-
-                /// Per-table admission budgets pre-subtract this table's own wire
-                /// overhead (`4 + ns.size()`, repeated once in a snapshot body and once in a removal txn body)
-                /// plus a fixed safety margin from the raw hard limits, once, here.
-                const uint64_t overhead = 4 + ns.string().size() + kRefAdmissionSafetyMargin;
-                rt.snapshot_budget = overhead < ref_snapshot_max_bytes ? ref_snapshot_max_bytes - overhead : 0;
-                rt.removal_budget = overhead < ref_removal_max_bytes ? ref_removal_max_bytes - overhead : 0;
-
-                /// The cache-weight base is the encoded body size of the recovered
-                /// base snapshot, captured for free from the GET above. The tail bytes are tracked separately in
-                /// `tail_bytes_since_snapshot`; the two sum to this table's estimated resident weight.
-                rt.base_snapshot_bytes.store(snapshot_body_bytes, std::memory_order_relaxed);
+                /// One atomic publication under `state_mutex`: `installRecoveryResult` copies every seeded
+                /// field from `result` and sets `recovered` LAST, so no waiter (woken only by the
+                /// function-scope SCOPE_EXIT's `recovery_cv` notify, which runs after this returns) ever
+                /// observes a partially-installed table.
+                installRecoveryResult(rt, std::move(result));
                 break;
             }
             break;   /// recovery succeeded -> exit the outer retry loop
@@ -626,6 +615,24 @@ void CasRefLedger::ensureRefTableRecovered(const RootNamespace & ns, RefTableRun
     /// the pass -- which acquires `ref_queue_mutex` and try-locks other tables' `state_mutex` -- never
     /// nests this table's `state_mutex` under `ref_queue_mutex`.
     enforceRefTableCacheBudget(ns);
+}
+
+void CasRefLedger::installRecoveryResult(RefTableRuntime & rt, RecoveryResult && result)
+{
+    /// One place that seeds a recovered table's runtime, copying EVERY `RecoveryResult` field so the
+    /// publication cannot drift from the struct. `recovered` is set LAST: the caller holds `state_mutex`
+    /// throughout and the function-scope SCOPE_EXIT notifies `recovery_cv` only after this returns, so a
+    /// parked waiter re-checking `recovered` under the same lock sees a fully-installed table or none.
+    rt.state = std::move(result.state);
+    rt.cleanup_markers = std::move(result.cleanup_markers);
+    rt.newest_snapshot_id = result.newest_snapshot_id;
+    rt.tail_count_since_snapshot.store(result.tail_count, std::memory_order_relaxed);
+    rt.tail_bytes_since_snapshot.store(result.tail_bytes, std::memory_order_relaxed);
+    rt.base_snapshot_bytes.store(result.base_snapshot_bytes, std::memory_order_relaxed);
+    rt.snapshot_budget = result.snapshot_budget;
+    rt.removal_budget = result.removal_budget;
+    rt.needs_stale_precommit_sweep = result.needs_stale_precommit_sweep;
+    rt.recovered = true;   /// set LAST
 }
 
 

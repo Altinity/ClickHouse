@@ -1,7 +1,9 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Common/Exception.h>
+#include <Common/scope_guard_safe.h>
 #include <algorithm>
+#include <mutex>
 
 namespace DB
 {
@@ -41,6 +43,25 @@ void checkRemoveNamespaceOrdering(const std::vector<RefOp> & ops)
             throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "RefTableState: every operation before remove_namespace must be an exact owner removal");
     }
+}
+
+/// Installed test probe for the streaming-recovery memory invariant (see the header). Guarded by its
+/// own mutex so an install/clear from a test thread cannot tear against a concurrent recovery.
+std::mutex g_recovery_replay_memory_probe_mutex;
+std::function<void(int64_t)> g_recovery_replay_memory_probe;
+
+/// Report a decoded-transaction memory delta to the installed probe, if any. A no-op in production
+/// (no probe installed). Reads the probe under the mutex and calls it OUTSIDE the lock so the probe
+/// body may itself do arbitrary work.
+void reportReplayMemoryDelta(int64_t delta_stored_bytes)
+{
+    std::function<void(int64_t)> probe;
+    {
+        std::lock_guard lock(g_recovery_replay_memory_probe_mutex);
+        probe = g_recovery_replay_memory_probe;
+    }
+    if (probe)
+        probe(delta_stored_bytes);
 }
 
 /// The four legal `owner_transition` shapes, decided purely from the (old_binding, new_binding)
@@ -88,6 +109,12 @@ enum class OwnerTransitionShape : uint8_t
         has_new, has_new ? std::to_string(static_cast<uint8_t>(op.new_binding->kind)) : "n/a");
 }
 
+}
+
+void setRecoveryReplayMemoryProbeForTest(std::function<void(int64_t delta_stored_bytes)> probe)
+{
+    std::lock_guard lock(g_recovery_replay_memory_probe_mutex);
+    g_recovery_replay_memory_probe = std::move(probe);
 }
 
 /// True iff `manifest_ref` already names an existing committed row or precommit binding under ANY
@@ -440,6 +467,52 @@ RefTableState replay(const std::optional<RefTableSnapshot> & snapshot, std::span
     return state;
 }
 
+RefReplayBuilder::RefReplayBuilder(std::optional<RefTableSnapshot> base, uint64_t base_encoded_bytes)
+{
+    if (base)
+    {
+        result.newest_snapshot_id = base->snapshot_id;
+        result.sealed_from = base->sealed_from;
+        result.base_snapshot_bytes = base_encoded_bytes;
+        expected_ns = base->ns;
+        candidate = stateFromSnapshot(*base);   /// full snapshot revalidation, exactly as `replay`
+    }
+}
+
+void RefReplayBuilder::applyOne(RefLogTxn && txn, uint64_t encoded_bytes)
+{
+    /// The decoded transaction is resident only for the duration of this call. Report its stored-byte
+    /// weight to the streaming-recovery memory probe on entry and release it on exit (or on throw), so a
+    /// bound-checking test observes at most one transaction's worth alive -- the whole point of streaming
+    /// over the retired whole-tail vector, which held the entire tail resident at once. No-op in
+    /// production (no probe installed).
+    reportReplayMemoryDelta(static_cast<int64_t>(encoded_bytes));
+    SCOPE_EXIT({ reportReplayMemoryDelta(-static_cast<int64_t>(encoded_bytes)); });
+
+    if (expected_ns && txn.ns != *expected_ns)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "RefReplayBuilder: transaction ns '{}' does not match the table's ns '{}'",
+            txn.ns, *expected_ns);
+    expected_ns = txn.ns;
+    /// The same private in-place poisoning path `replay` uses (E3): `candidate` is this builder's own
+    /// state, discarded on any throw (the builder is destroyed during unwinding), so a mid-tail
+    /// corruption fails closed here and no consumer ever observes a poisoned candidate. NOT the public
+    /// scratch-copying `applyRefLogTxn`, which would deep-copy the growing candidate once per
+    /// transaction and reintroduce the O(K*N) cost `replay` was written to avoid.
+    candidate.applyTxnInPlace(txn);
+    ++result.tail_count;
+    result.tail_bytes += encoded_bytes;
+}
+
+RecoveryResult RefReplayBuilder::finish() &&
+{
+    /// Matches `replay`: the candidate is returned WITHOUT `materializeCommitted` -- the writer's
+    /// recovery folds the COW overlays once on the result before installing it; the read-only consumers
+    /// (orphan sweep, fsck oracle) do not need the fold at all.
+    result.state = std::move(candidate);
+    return std::move(result);
+}
+
 uint64_t encodedSnapshotBudgetSize(const RefTableState & state)
 {
     /// snapshotOf uses snapshot_id = state.greatest_applied, empty ns, sealed_from unset, and the
@@ -660,8 +733,10 @@ RecoveredRefTable recoverRefTableDetailed(Backend & backend, const Layout & layo
                 snapshot = decodeRefTableSnapshot(openObject(FormatId::RefSnapshot, got->bytes), ns.string(), *snapshot_id);
         }
 
-        /// Replay every log with id greater than the selected snapshot, in id order.
-        std::vector<RefLogTxn> tail;
+        /// Stream every log with id greater than the selected snapshot, in id order, through one
+        /// builder: GET -> decode -> applyOne -> discard, holding at most a single decoded transaction
+        /// resident (unlike the retired whole-tail vector, which held every decoded transaction at once).
+        RefReplayBuilder builder(std::move(snapshot));
         if (!vanished)
             for (const RefTxnId & id : logs)
             {
@@ -673,20 +748,21 @@ RecoveredRefTable recoverRefTableDetailed(Backend & backend, const Layout & layo
                     vanished = true;
                     break;
                 }
-                tail.push_back(decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), id));
+                builder.applyOne(
+                    decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), id), got->bytes.size());
             }
 
         if (vanished)
         {
             if (attempt < max_restarts)
-                continue;   /// a concurrent cleanup deleted a selected object; restart with a fresh LIST
+                continue;   /// a selected object vanished; restart with a fresh LIST (the builder's candidate is discarded)
             throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "recoverRefTable: table {} kept losing a selected snapshot/tail object across {} restarts",
                 ns.string(), max_restarts);
         }
 
-        return RecoveredRefTable{replay(snapshot, tail), snapshot_id,
-                                 snapshot ? snapshot->sealed_from : std::nullopt};
+        RecoveryResult result = std::move(builder).finish();
+        return RecoveredRefTable{std::move(result.state), result.newest_snapshot_id, result.sealed_from};
     }
 }
 

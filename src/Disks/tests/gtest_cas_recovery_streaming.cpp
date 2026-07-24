@@ -1,0 +1,498 @@
+#include <gtest/gtest.h>
+
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
+#include "cas_test_helpers.h"
+
+#include <Common/Exception.h>
+#include <Common/scope_guard_safe.h>
+
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <future>
+#include <thread>
+
+namespace DB::ErrorCodes
+{
+extern const int CORRUPTED_DATA;
+extern const int S3_ERROR;
+}
+
+using namespace DB::Cas;
+using namespace DB::Cas::tests;
+
+namespace
+{
+
+/// A deterministic accountant for the streaming-recovery memory probe: the replay path reports
+/// `+weight` while one decoded transaction is being applied and `-weight` once it is discarded, so
+/// `peak` is the maximum stored-byte weight ever resident at one instant. Streaming holds one
+/// transaction; the retired whole-tail vector held the entire tail. Deterministic (it accounts the
+/// weights the probe is handed, not RSS), so it is stable under ASan quarantine noise.
+struct PeakTracker
+{
+    std::atomic<int64_t> alive_bytes{0};
+    std::atomic<int64_t> peak_bytes{0};
+
+    std::function<void(int64_t)> probe()
+    {
+        return [this](int64_t delta)
+        {
+            const int64_t now = alive_bytes.fetch_add(delta, std::memory_order_relaxed) + delta;
+            int64_t prev = peak_bytes.load(std::memory_order_relaxed);
+            while (now > prev && !peak_bytes.compare_exchange_weak(prev, now, std::memory_order_relaxed))
+            {
+            }
+        };
+    }
+
+    int64_t peak() const { return peak_bytes.load(std::memory_order_relaxed); }
+    int64_t alive() const { return alive_bytes.load(std::memory_order_relaxed); }
+};
+
+/// A distinct manifest per call: `build_sequence` carries the identity so every generated
+/// `(ref_name, manifest_ref)` add-precommit is a legal transition (no manifest is owned twice).
+ManifestRef mref(uint64_t seq)
+{
+    return ManifestRef{.writer_epoch = 1, .build_sequence = seq, .manifest_ordinal = 1};
+}
+
+/// One maximum-shaped ref-log transaction: `num_ops` add-precommit ops over distinct
+/// `(ref_name, manifest_ref)` pairs (plus a leading `namespace_birth` for the first transaction of a
+/// never-born table). Each pair is unique across the whole tail (the running `manifest_seq`), so the
+/// tail replays cleanly and the candidate state simply grows -- the point is a large decoded body per
+/// transaction, which is what makes the whole-tail vector's resident footprint N times a single
+/// transaction's.
+RefLogTxn makeBigTxn(const String & ns, RefTxnId id, size_t num_ops, uint64_t & manifest_seq, bool birth)
+{
+    RefLogTxn txn;
+    txn.ns = ns;
+    txn.txn_id = id;
+    if (birth)
+        txn.ops.push_back(namespaceBirthOp());
+    for (size_t i = 0; i < num_ops; ++i)
+    {
+        const String ref_name = "rs_" + std::to_string(id.ref_sequence) + "_" + std::to_string(i);
+        txn.ops.push_back(ownerTransitionOp(
+            std::nullopt, RefOwnerBinding{RefOwnerKind::Precommit, ref_name, mref(manifest_seq)}));
+        ++manifest_seq;
+    }
+    return txn;
+}
+
+/// Seed `num_txns` maximum-shaped transactions at ids {1,1}..{1,num_txns} directly into `ns`'s `_log/`
+/// stream, and return the stored (sealed) byte size of the largest single log plus the total across
+/// all logs. The largest single size is the streaming peak; the total is what the old whole-tail
+/// vector held resident at once.
+struct SeededTail
+{
+    uint64_t max_single_stored = 0;
+    uint64_t total_stored = 0;
+};
+
+SeededTail seedBigTail(
+    InMemoryBackend & backend, const Layout & layout, const RootNamespace & ns,
+    size_t num_txns, size_t ops_per_txn, uint64_t & manifest_seq)
+{
+    for (size_t t = 0; t < num_txns; ++t)
+        writeRefLogTxnRaw(backend, layout,
+            makeBigTxn(ns.string(), RefTxnId{1, t + 1}, ops_per_txn, manifest_seq, /*birth=*/t == 0));
+
+    SeededTail seeded;
+    for (size_t t = 0; t < num_txns; ++t)
+    {
+        const auto got = backend.get(layout.refLogKey(ns, RefTxnId{1, t + 1}));
+        EXPECT_TRUE(got.has_value());
+        seeded.max_single_stored = std::max<uint64_t>(seeded.max_single_stored, got->bytes.size());
+        seeded.total_stored += got->bytes.size();
+    }
+    return seeded;
+}
+
+/// Bounded busy-wait on a test-observable predicate (the established `yield()`-poll idiom for recovery
+/// waiters, see `CasPool::refRecoveryWaitersForTest`). Bound is a generous wall-clock ceiling that only
+/// trips on a genuine hang, never in the normal fast path; returns false on timeout so the caller can
+/// release any blocked threads before asserting.
+template <typename Pred>
+bool pollUntil(Pred pred)
+{
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (!pred())
+    {
+        if (std::chrono::steady_clock::now() > deadline)
+            return false;
+        std::this_thread::yield();
+    }
+    return true;
+}
+
+/// Backend that drops one selected `_log/` object on its FIRST GET (a concurrent-cleanup vanish),
+/// then serves it normally, and counts fresh (cursor-empty) LISTs of the ref prefix so a test can
+/// assert recovery re-LISTed a bounded number of times.
+class VanishMidTailOnceBackend : public InMemoryBackend
+{
+public:
+    using InMemoryBackend::get;   /// keep the one-arg convenience overload visible past our override
+
+    String target_log_key;
+    String refs_prefix;
+    std::atomic<bool> armed{false};
+    std::atomic<bool> vanished{false};
+    std::atomic<int> fresh_list_count{0};
+
+    std::optional<GetResult> get(const String & key, Range range) override
+    {
+        if (armed.load() && key == target_log_key && !vanished.exchange(true))
+            return std::nullopt;   /// selected object gone between LIST and GET; recovery must re-LIST
+        return InMemoryBackend::get(key, range);
+    }
+
+    ListPage list(const String & prefix, const String & cursor, size_t limit) override
+    {
+        if (armed.load() && prefix == refs_prefix && cursor.empty())
+            fresh_list_count.fetch_add(1, std::memory_order_relaxed);
+        return InMemoryBackend::list(prefix, cursor, limit);
+    }
+};
+
+/// Backend that replaces one selected `_log/` object's body with a valid-but-foreign ref-log object
+/// (a different namespace in the body): decoding it fails with CORRUPTED_DATA (body/key mismatch), the
+/// durable-corruption class recovery must fail fast on -- no re-LIST loop.
+class CorruptLogOnGetBackend : public InMemoryBackend
+{
+public:
+    using InMemoryBackend::get;   /// keep the one-arg convenience overload visible past our override
+
+    String target_log_key;
+    String corrupt_bytes;
+    String refs_prefix;
+    std::atomic<bool> armed{false};
+    std::atomic<int> refs_list_count{0};
+
+    std::optional<GetResult> get(const String & key, Range range) override
+    {
+        auto got = InMemoryBackend::get(key, range);
+        if (armed.load() && got && key == target_log_key)
+            got->bytes = corrupt_bytes;
+        return got;
+    }
+
+    ListPage list(const String & prefix, const String & cursor, size_t limit) override
+    {
+        if (armed.load() && prefix == refs_prefix && cursor.empty())
+            refs_list_count.fetch_add(1, std::memory_order_relaxed);
+        return InMemoryBackend::list(prefix, cursor, limit);
+    }
+};
+
+/// Backend that throws ONE transient LIST failure for the ref prefix, forcing recovery into its
+/// (unlocked) retry-backoff window; a concurrent second caller can then reach `recovery_cv`. Counts
+/// fresh LISTs so a test can assert the parked caller did not race its own independent recovery.
+class TransientListOnceBackend : public InMemoryBackend
+{
+public:
+    String refs_prefix;
+    std::atomic<bool> armed{false};
+    std::atomic<bool> threw_once{false};
+    std::atomic<int> fresh_list_count{0};
+
+    ListPage list(const String & prefix, const String & cursor, size_t limit) override
+    {
+        if (armed.load() && prefix == refs_prefix && cursor.empty())
+        {
+            fresh_list_count.fetch_add(1, std::memory_order_relaxed);
+            if (!threw_once.exchange(true))
+                throw DB::Exception(DB::ErrorCodes::S3_ERROR, "injected transient list failure (test)");
+        }
+        return InMemoryBackend::list(prefix, cursor, limit);
+    }
+};
+
+}
+
+/// Test 14 (load-bearing memory RED): a long tail of maximum-shaped transactions replays under a hard
+/// peak bound that the retired whole-tail materializer -- which held every decoded transaction resident
+/// at once -- provably exceeds. The bound is computed from the fixture's own stored sizes (twice the
+/// largest single transaction), and the total held by the old vector is asserted to exceed it, so the
+/// RED is a property of the fixture, not a lucky constant.
+TEST(CasRecoveryStreaming, LongTailReplaysUnderMemoryBound)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"00/aa@cas@"};
+
+    constexpr size_t kTxns = 24;
+    constexpr size_t kOpsPerTxn = 250;
+    uint64_t manifest_seq = 1;
+    const SeededTail seeded = seedBigTail(*backend, layout, ns, kTxns, kOpsPerTxn, manifest_seq);
+
+    const uint64_t bound = 2 * seeded.max_single_stored;
+    ASSERT_GT(seeded.total_stored, bound)
+        << "fixture must make the whole-tail vector (" << seeded.total_stored
+        << " B) provably exceed the bound (" << bound << " B)";
+
+    PeakTracker tracker;
+    setRecoveryReplayMemoryProbeForTest(tracker.probe());
+    SCOPE_EXIT({ setRecoveryReplayMemoryProbeForTest({}); });
+
+    const RefTableState state = recoverRefTable(*backend, layout, ns);
+    EXPECT_EQ(state.getPrecommits().size(), kTxns * kOpsPerTxn) << "the whole tail must have replayed";
+    EXPECT_LE(tracker.peak(), static_cast<int64_t>(bound))
+        << "streaming recovery must hold at most ~one decoded transaction (peak " << tracker.peak()
+        << " B) not the whole " << kTxns << "-transaction tail (" << seeded.total_stored << " B)";
+    EXPECT_EQ(tracker.alive(), 0) << "every decoded transaction must be discarded after it is applied";
+}
+
+/// Test 14 (vanished-selected-object leg): a mid-tail `_log/` object that disappears between the LIST
+/// and its GET is a concurrent-cleanup race, not corruption -- recovery discards the candidate and
+/// re-LISTs, bounded. Asserts exactly one restart (bounded) and a successful, complete recovery.
+TEST(CasRecoveryStreaming, MidTailVanishedObjectReLists)
+{
+    auto backend = std::make_shared<VanishMidTailOnceBackend>();
+    seedPoolMetaForRestart(*backend);
+    const Layout layout("p");
+    const RootNamespace ns{"00/aa@cas@"};
+
+    const uint64_t seq1 = publishCommittedTransition(*backend, layout, ns, "a", std::nullopt, mref(1));
+    const uint64_t seq2 = publishCommittedTransition(*backend, layout, ns, "b", std::nullopt, mref(2));
+    const uint64_t seq3 = publishCommittedTransition(*backend, layout, ns, "c", std::nullopt, mref(3));
+    ASSERT_LT(seq1, seq2);
+    ASSERT_LT(seq2, seq3);
+
+    auto store = openPoolForTest(backend);
+    backend->refs_prefix = layout.refsNamespacePrefix(ns);
+    backend->target_log_key = layout.refLogKey(ns, RefTxnId{1, seq2});   /// vanish a mid-tail object
+    backend->armed = true;
+
+    const auto refs = store->listRefs(ns);
+    EXPECT_EQ(refs.size(), 3u) << "recovery must complete with the full ref set after the re-LIST";
+    EXPECT_TRUE(store->resolveRef(ns, "a").has_value());
+    EXPECT_TRUE(store->resolveRef(ns, "b").has_value());
+    EXPECT_TRUE(store->resolveRef(ns, "c").has_value());
+    EXPECT_EQ(store->refRecoveryRestartsForTest(ns), 1u) << "exactly one bounded restart on the vanish";
+    EXPECT_EQ(backend->fresh_list_count.load(), 2) << "one initial LIST plus one re-LIST, no more";
+}
+
+/// Test 14 (durable-corruption leg): a `_log/` object whose body decodes to a foreign namespace is
+/// durable corruption, not a transient vanish -- recovery discards the candidate and fails fast with
+/// no re-LIST loop. Asserts the throw, zero restarts, and a single LIST.
+TEST(CasRecoveryStreaming, CorruptObjectFailsFast)
+{
+    auto backend = std::make_shared<CorruptLogOnGetBackend>();
+    seedPoolMetaForRestart(*backend);
+    const Layout layout("p");
+    const RootNamespace ns{"00/aa@cas@"};
+
+    publishCommittedTransition(*backend, layout, ns, "a", std::nullopt, mref(1));
+    const uint64_t seq2 = publishCommittedTransition(*backend, layout, ns, "b", std::nullopt, mref(2));
+    publishCommittedTransition(*backend, layout, ns, "c", std::nullopt, mref(3));
+
+    /// A structurally valid ref-log object for a DIFFERENT namespace: it decompresses and parses, but
+    /// its body namespace does not match the key, which `decodeRefLogTxn` rejects as CORRUPTED_DATA.
+    RefLogTxn foreign;
+    foreign.ns = "99/zz@cas@";
+    foreign.txn_id = RefTxnId{1, seq2};
+    foreign.ops = {namespaceBirthOp()};
+    backend->corrupt_bytes = sealObject(FormatId::RefLog, encodeRefLogTxn(foreign));
+
+    auto store = openPoolForTest(backend);
+    backend->refs_prefix = layout.refsNamespacePrefix(ns);
+    backend->target_log_key = layout.refLogKey(ns, RefTxnId{1, seq2});
+    backend->armed = true;
+
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { store->resolveRef(ns, "a"); });
+    /// A single LIST proves recovery did not re-LIST: it discarded the candidate and propagated the
+    /// decode error fast, unlike the vanish path which restarts on a fresh listing. (The recovery-restart
+    /// counter is not read here: its accessor re-drives recovery, which would re-throw against the still-
+    /// armed corrupt object.)
+    EXPECT_EQ(backend->refs_list_count.load(), 1) << "no re-LIST loop on durable corruption -- one LIST";
+}
+
+/// Test 14 (concurrent-waiter leg): while one caller is inside recovery's unlocked retry-backoff
+/// window, a second caller for the same table parks on `recovery_cv` and is woken exactly once when
+/// recovery completes -- it never races its own independent LIST+replay. Asserts a single parked
+/// waiter, both callers converging on the recovered state, and no phantom waiter left behind.
+TEST(CasRecoveryStreaming, ConcurrentWaiterUnblockedOnce)
+{
+    auto backend = std::make_shared<TransientListOnceBackend>();
+    seedPoolMetaForRestart(*backend);
+    const Layout layout("p");
+    const RootNamespace ns{"00/aa@cas@"};
+
+    publishCommittedTransition(*backend, layout, ns, "x", std::nullopt, mref(1));
+    publishCommittedTransition(*backend, layout, ns, "y", std::nullopt, mref(2));
+
+    auto store = openPoolForTest(backend);
+    backend->refs_prefix = layout.refsNamespacePrefix(ns);
+
+    /// Gate the retry-backoff sleep: the first recovering caller parks HERE (state_mutex released),
+    /// which is the only window in which a second caller can reach `recovery_cv`.
+    std::atomic<bool> sleep_entered{false};
+    std::promise<void> entered_promise;
+    std::promise<void> release_promise;
+    std::shared_future<void> release_future = release_promise.get_future().share();
+    store->setCasRetrySleepForTest([&](uint64_t)
+    {
+        if (!sleep_entered.exchange(true))
+            entered_promise.set_value();
+        release_future.wait();
+    });
+    backend->armed = true;
+
+    std::thread t1([&] { store->listRefs(ns); });   /// transient LIST failure -> parks in the gated sleep
+    entered_promise.get_future().wait();
+
+    std::thread t2([&] { store->listRefs(ns); });    /// second caller must park on recovery_cv
+    const bool parked = pollUntil([&] { return store->refRecoveryWaitersForTest(ns) >= 1; });
+
+    release_promise.set_value();
+    t1.join();
+    t2.join();
+
+    EXPECT_TRUE(parked) << "the second caller must reach recovery_cv while the first is in the retry window";
+    EXPECT_EQ(store->refRecoveryWaitersForTest(ns), 0u) << "no phantom waiter after recovery completes";
+    EXPECT_TRUE(store->resolveRef(ns, "x").has_value());
+    EXPECT_TRUE(store->resolveRef(ns, "y").has_value());
+    EXPECT_EQ(backend->fresh_list_count.load(), 2)
+        << "one failed LIST plus one successful LIST by the leader; the parked caller ran no LIST of its own";
+}
+
+/// Test 14 (other materializers leg): the orphan-sweep recovery (`recoverRefTableDetailed`) and fsck's
+/// snapshot oracle (reached through `runFsck`) stream through the SAME builder and hold under the SAME
+/// per-transaction bound the primary recovery does.
+TEST(CasRecoveryStreaming, OrphanSweepAndFsckSameBound)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    seedPoolMetaForRestart(*backend);
+    const Layout layout("p");
+    const RootNamespace ns_sweep{"00/sweep@cas@"};
+    const RootNamespace ns_oracle{"00/oracle@cas@"};
+
+    constexpr size_t kTxns = 16;
+    constexpr size_t kOpsPerTxn = 250;
+    uint64_t manifest_seq = 1;
+    const SeededTail sweep_tail = seedBigTail(*backend, layout, ns_sweep, kTxns, kOpsPerTxn, manifest_seq);
+    const SeededTail oracle_tail = seedBigTail(*backend, layout, ns_oracle, kTxns, kOpsPerTxn, manifest_seq);
+
+    /// Publish the byte-correct snapshot AT the oracle table's greatest log id: no snapshot below it,
+    /// so fsck's oracle rebuilds the state at X from the whole surviving log tail.
+    const RefTableState oracle_state = recoverRefTable(*backend, layout, ns_oracle);
+    writeRefSnapshotRaw(*backend, layout, snapshotOf(oracle_state, ns_oracle.string()));
+
+    const uint64_t max_single = std::max(sweep_tail.max_single_stored, oracle_tail.max_single_stored);
+    const uint64_t bound = 2 * max_single;
+    ASSERT_GT(sweep_tail.total_stored, bound);
+    ASSERT_GT(oracle_tail.total_stored, bound);
+
+    auto store = openPoolForTest(backend);
+
+    {
+        PeakTracker tracker;
+        setRecoveryReplayMemoryProbeForTest(tracker.probe());
+        SCOPE_EXIT({ setRecoveryReplayMemoryProbeForTest({}); });
+        const RecoveredRefTable recovered = recoverRefTableDetailed(*backend, layout, ns_sweep);
+        EXPECT_EQ(recovered.state.getPrecommits().size(), kTxns * kOpsPerTxn);
+        EXPECT_LE(tracker.peak(), static_cast<int64_t>(bound))
+            << "orphan-sweep recovery must stream: peak " << tracker.peak() << " B, bound " << bound << " B";
+        EXPECT_EQ(tracker.alive(), 0);
+    }
+
+    {
+        PeakTracker tracker;
+        setRecoveryReplayMemoryProbeForTest(tracker.probe());
+        SCOPE_EXIT({ setRecoveryReplayMemoryProbeForTest({}); });
+        const FsckReport report = runFsck(*store, /*detail=*/true);
+        EXPECT_GE(report.snapshot_oracle_checked, 1u) << "the oracle must actually replay the oracle table's tail";
+        EXPECT_LE(tracker.peak(), static_cast<int64_t>(bound))
+            << "fsck recovery/oracle must stream: peak " << tracker.peak() << " B, bound " << bound << " B";
+        EXPECT_EQ(tracker.alive(), 0);
+    }
+}
+
+/// Test 15 (publication inventory): after streaming recovery of a table with a non-trivial snapshot
+/// base, precommit bindings, a tail of committed transactions, and a `_cleanup` marker, EVERY field the
+/// recovery publication seeds is asserted -- not just the two a prose inventory would keep. This is a
+/// regression guard: streaming recovery must install exactly what the whole-tail recovery installed.
+TEST(CasRecoveryStreaming, RecoveryResultInventoryComplete)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    seedPoolMetaForRestart(*backend);
+    const Layout layout("p");
+    const RootNamespace ns{"00/inv@cas@"};
+
+    /// A non-trivial base snapshot: two committed rows plus a stale predecessor precommit binding.
+    RefTableSnapshot base;
+    base.ns = ns.string();
+    base.snapshot_id = RefTxnId{1, 5};
+    base.lifecycle = RefLifecycle::Live;
+    base.committed = {committedRow("c_one", mref(11)), committedRow("c_two", mref(12))};
+    base.precommits = {RefOwnerBinding{RefOwnerKind::Precommit, "p_stale", mref(13)}};
+    writeRefSnapshotRaw(*backend, layout, base);
+    const auto base_got = backend->get(layout.refSnapshotKey(ns, base.snapshot_id));
+    ASSERT_TRUE(base_got.has_value());
+    const uint64_t base_stored_bytes = base_got->bytes.size();
+
+    /// Two committed transactions strictly above the base -- the tail.
+    RefLogTxn t6;
+    t6.ns = ns.string();
+    t6.txn_id = RefTxnId{1, 6};
+    t6.ops = publishCommittedOps("c_three", mref(21));
+    writeRefLogTxnRaw(*backend, layout, t6);
+    RefLogTxn t7;
+    t7.ns = ns.string();
+    t7.txn_id = RefTxnId{1, 7};
+    t7.ops = publishCommittedOps("c_four", mref(22));
+    writeRefLogTxnRaw(*backend, layout, t7);
+
+    const uint64_t tail6 = backend->get(layout.refLogKey(ns, RefTxnId{1, 6}))->bytes.size();
+    const uint64_t tail7 = backend->get(layout.refLogKey(ns, RefTxnId{1, 7}))->bytes.size();
+
+    /// A completed-removal `_cleanup` marker recovery must retain for namespace-recreation checks.
+    const RefTxnId cleanup_id{1, 3};
+    backend->putIfAbsent(layout.refCleanupMarkerKey(ns, cleanup_id), "");
+
+    auto store = openPoolForTest(backend);
+
+    /// Drive recovery via a recovery-only accessor: `newestPublishedSnapshotIdForTest` recovers the
+    /// table WITHOUT the read-side stale-precommit sweep that `resolveRef`/`listRefs` dispatch (that
+    /// sweep would clear `needs_stale_precommit_sweep` before it could be observed). Every inventory
+    /// field below is then read straight off the seeded runtime, and the read-path state assertion is
+    /// left for LAST (after `needs_stale_precommit_sweep` has been observed).
+
+    /// newest snapshot identity: the recovered base id, no seal on this clean mount.
+    EXPECT_EQ(store->newestPublishedSnapshotIdForTest(ns), std::optional<RefTxnId>(base.snapshot_id));
+
+    /// stale-precommit sweep: recovery always arms it (asserted BEFORE any read-side sweep runs).
+    EXPECT_TRUE(store->needsStalePrecommitSweepForTest(ns));
+
+    /// tail count / bytes: exactly the two transactions above the base and their stored sizes.
+    EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), 2u);
+    EXPECT_EQ(store->refTailBytesSinceSnapshotForTest(ns), tail6 + tail7);
+
+    /// base snapshot bytes: the encoded body size of the recovered base snapshot.
+    EXPECT_EQ(store->refBaseSnapshotBytesForTest(ns), base_stored_bytes);
+
+    /// admission budgets: the raw hard limits minus this table's wire overhead and the safety margin.
+    const uint64_t overhead = 4 + ns.string().size() + 4096;
+    const uint64_t expected_budget = 64ULL * 1024 * 1024 - overhead;
+    EXPECT_EQ(store->refSnapshotBudgetForTest(ns), expected_budget);
+    EXPECT_EQ(store->refRemovalBudgetForTest(ns), expected_budget);
+
+    /// cleanup markers: exactly the one seeded marker.
+    const std::set<RefTxnId> markers = store->refCleanupMarkersForTest(ns);
+    EXPECT_EQ(markers.size(), 1u);
+    EXPECT_TRUE(markers.count(cleanup_id) == 1);
+
+    /// state: four committed rows (two from the base, two from the tail). This read dispatches the
+    /// read-side sweep, hence it comes last -- after the sweep flag has been observed above.
+    const auto refs = store->listRefs(ns);
+    EXPECT_EQ(refs.size(), 4u);
+    EXPECT_TRUE(store->resolveRef(ns, "c_one").has_value());
+    EXPECT_TRUE(store->resolveRef(ns, "c_two").has_value());
+    EXPECT_TRUE(store->resolveRef(ns, "c_three").has_value());
+    EXPECT_TRUE(store->resolveRef(ns, "c_four").has_value());
+}
