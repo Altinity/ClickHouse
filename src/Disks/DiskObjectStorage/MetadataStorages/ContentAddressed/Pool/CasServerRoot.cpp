@@ -203,6 +203,17 @@ uint64_t allocateWriterEpoch(Backend & b, const Layout & l, const String & srid,
                     {
                         chassert(now_ms != 0);   /// the decommission caller must pass its clock
                         const MountLease surviving = decodeMountLease(*mount_probe.body);
+                        /// Deliberately weaker than claimMount's reclaim gate (this file, ~:370-380),
+                        /// which never trusts a bare wall-clock comparison alone (only gc_fenced /
+                        /// the clean-farewell min_active==UINT64_MAX marker / a caller-proven-dead
+                        /// token justify a reclaim there, because clock skew can misjudge liveness).
+                        /// This is still safe: (a) the mint below is DISTINCT from the survivor's
+                        /// epoch by construction, so no same-(uuid, epoch) pair is ever representable
+                        /// even if this liveness read is wrong; (b) claimMount right after this still
+                        /// applies its own STRONG liveness gate and refuses a genuinely live member
+                        /// regardless of what happens here. So a clock-skewed "terminal" misread can
+                        /// only burn one epoch number on a doomed decommission attempt that aborts at
+                        /// claimMount — it can never admit a claim over a live member.
                         const bool live = !surviving.gc_fenced && surviving.expires_at_ms > now_ms;
                         if (live)
                             throw Exception(ErrorCodes::ABORTED,

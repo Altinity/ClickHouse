@@ -263,7 +263,7 @@ enum class EpochMintPolicy : uint8_t
 /// (`ServerEpoch{next_writer_epoch}`), returning the value the caller adopts as its writer_epoch.
 ///   - `epoch` absent AND the subtree is non-empty → throw `CORRUPTED_DATA` (missing epoch over
 ///     data is a reset hazard);
-///   - `epoch` absent AND the subtree is empty →  the absent-epoch branch is a LIFECYCLE decision,
+///   - `epoch` absent AND the subtree is empty → the absent-epoch branch is a LIFECYCLE decision,
 ///     so it uses `probeSentinelRaw`'s authoritative outcomes, never plain `get`-absence (which
 ///     flattens transport faults into "not found"), to decide whether the mount object is really
 ///     gone:
