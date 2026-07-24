@@ -51,11 +51,12 @@ RUN mkdir /tmp/ccache \
         -O https://github.com/ccache/ccache/releases/download/v$CCACHE_VERSION/ccache-$CCACHE_VERSION.tar.xz \
         -O https://github.com/ccache/ccache/releases/download/v$CCACHE_VERSION/ccache-$CCACHE_VERSION.tar.xz.asc \
     && gpg --recv-keys --keyserver hkps://keyserver.ubuntu.com 5A939A71A46792CF57866A51996DDA075594ADB8 \
-    && gpg --verify ccache-4.6.1.tar.xz.asc \
+    && gpg --verify ccache-$CCACHE_VERSION.tar.xz.asc \
     && tar xf ccache-$CCACHE_VERSION.tar.xz \
     && cd /tmp/ccache/ccache-$CCACHE_VERSION \
     && cmake -DCMAKE_INSTALL_PREFIX=/usr \
         -DCMAKE_BUILD_TYPE=None \
+        -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
         -DZSTD_FROM_INTERNET=ON \
         -DREDIS_STORAGE_BACKEND=OFF \
         -Wno-dev \

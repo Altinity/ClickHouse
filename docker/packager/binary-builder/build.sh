@@ -68,6 +68,13 @@ fi
 read -ra CMAKE_FLAGS_ARRAY <<< "${CMAKE_FLAGS:-}"
 env
 
+# Newer toolchain environments may have rustup metadata/toolchain discovery issues.
+# Provide an explicit rustc path to CMake's FindRust and avoid rustup toolchain probing,
+# which can silently disable Rust features (e.g. PRQL) when detection fails.
+if [ -x /rust/cargo/bin/rustc ]; then
+  CMAKE_FLAGS_ARRAY+=(-DRust_COMPILER=/rust/cargo/bin/rustc -DRust_RESOLVE_RUSTUP_TOOLCHAINS=OFF)
+fi
+
 if [ "$BUILD_MUSL_KEEPER" == "1" ]
 then
     # build keeper with musl separately

@@ -30,7 +30,7 @@ env:
   AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
   AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-  GRYPE_VERSION: "v0.92.2-arm64v8"
+  GRYPE_VERSION: "v0.115.0-arm64v8"
 
 jobs:
     grype_scan:
@@ -51,7 +51,7 @@ jobs:
             python3 -m venv venv
             source venv/bin/activate
             pip install --upgrade requests chardet urllib3 unidiff boto3 PyGithub
-            pip install testflows==$TESTFLOWS_VERSION awscli==1.33.28
+            pip install testflows==$TESTFLOWS_VERSION awscli==1.45.47
             echo PATH=$PATH >>$GITHUB_ENV
 
         - name: Set image tag if not given
@@ -85,7 +85,7 @@ jobs:
           id: upload_results
           env:
             S3_BUCKET: "altinity-build-artifacts"
-            COMMIT_SHA: ${{ steps.set_version.outputs.commit_sha || github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+            COMMIT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
             PR_NUMBER: ${{ env.PR_NUMBER || github.event.pull_request.number || 0 }}
             DOCKER_IMAGE: ${{ steps.set_version.outputs.docker_image || inputs.docker_image }}
           run: |

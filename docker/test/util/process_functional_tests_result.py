@@ -21,7 +21,27 @@ SUCCESS_FINISH_SIGNS = ["All tests have finished", "No tests were run"]
 RETRIES_SIGN = "Some tests were restarted"
 
 
+def _is_known_failing_test(
+    test_name, known_failing_tests, check_name, full_log_content
+):
+    if test_name not in known_failing_tests:
+        return False
+
+    entry = known_failing_tests[test_name]
+    check_types = entry.get("check_types", [])
+
+    if check_types and all(ct not in check_name for ct in check_types):
+        return False
+
+    message = entry.get("message")
+    if not message:
+        return True
+
+    return message in full_log_content
+
+
 def process_test_log(log_path, broken_tests, known_failing_tests):
+    check_name = os.getenv("CHECK_NAME", "")
     total = 0
     skipped = 0
     unknown = 0
@@ -34,7 +54,8 @@ def process_test_log(log_path, broken_tests, known_failing_tests):
     test_results = []
     test_end = True
     with open(log_path, "r") as test_file:
-        for line in test_file:
+        full_log_content = test_file.read()
+        for line in full_log_content.splitlines(keepends=True):
             original_line = line
             line = line.strip()
 
@@ -72,7 +93,9 @@ def process_test_log(log_path, broken_tests, known_failing_tests):
                         failed += 1
                         test_results.append((test_name, "Timeout", test_time, []))
                 elif FAIL_SIGN in line:
-                    if test_name in broken_tests or test_name in known_failing_tests:
+                    if test_name in broken_tests or _is_known_failing_test(
+                        test_name, known_failing_tests, check_name, full_log_content
+                    ):
                         success += 1
                         test_results.append((test_name, "BROKEN", test_time, []))
                     else:
@@ -232,12 +255,12 @@ if __name__ == "__main__":
         with open(args.broken_tests) as f:
             broken_tests = f.read().splitlines()
 
-    known_failing_tests = list()
+    known_failing_tests = {}
     if os.path.exists(args.broken_tests_json):
         logging.info(f"File {args.broken_tests_json} with broken tests found")
 
         with open(args.broken_tests_json) as f:
-            known_failing_tests = list(json.load(f).keys())
+            known_failing_tests = json.load(f)
 
     if broken_tests:
         logging.info(f"Broken tests in the list: {len(broken_tests)}")

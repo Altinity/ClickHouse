@@ -4,6 +4,7 @@
 #include <Common/ThreadStatus.h>
 #include <Common/CurrentThread.h>
 #include <Common/logger_useful.h>
+#include <Common/memory.h>
 #include <base/getPageSize.h>
 #include <base/errnoToString.h>
 #include <Interpreters/Context.h>
@@ -16,12 +17,25 @@
 
 namespace DB
 {
-
 thread_local ThreadStatus constinit * current_thread = nullptr;
+
+namespace ErrorCodes
+{
+    extern const int CANNOT_ALLOCATE_MEMORY;
+}
 
 #if !defined(SANITIZER)
 namespace
 {
+
+constexpr bool guardPagesEnabled()
+{
+#ifdef DEBUG_OR_SANITIZER_BUILD
+    return true;
+#else
+    return false;
+#endif
+}
 
 /// For aarch64 16K is not enough (likely due to tons of registers)
 constexpr size_t UNWIND_MINSIGSTKSZ = 32 << 10;
@@ -41,19 +55,43 @@ constexpr size_t UNWIND_MINSIGSTKSZ = 32 << 10;
 struct ThreadStack
 {
     ThreadStack()
-        : data(aligned_alloc(getPageSize(), getSize()))
     {
-        /// Add a guard page
-        /// (and since the stack grows downward, we need to protect the first page).
-        mprotect(data, getPageSize(), PROT_NONE);
+        auto page_size = getPageSize();
+        data = aligned_alloc(page_size, getSize());
+        if (!data)
+            throw ErrnoException(DB::ErrorCodes::CANNOT_ALLOCATE_MEMORY, "Cannot allocate ThreadStack");
+
+        if constexpr (guardPagesEnabled())
+        {
+            try
+            {
+                /// Since the stack grows downward, we need to protect the first page
+                memoryGuardInstall(data, page_size);
+            }
+            catch (...)
+            {
+                free(data);
+                throw;
+            }
+        }
     }
     ~ThreadStack()
     {
-        mprotect(data, getPageSize(), PROT_WRITE|PROT_READ);
+        if constexpr (guardPagesEnabled())
+            memoryGuardRemove(data, getPageSize());
+
         free(data);
     }
 
-    static size_t getSize() { return std::max<size_t>(UNWIND_MINSIGSTKSZ, MINSIGSTKSZ); }
+    static size_t getSize()
+    {
+        auto size = std::max<size_t>(UNWIND_MINSIGSTKSZ, MINSIGSTKSZ);
+
+        if constexpr (guardPagesEnabled())
+            size += 1;
+
+        return size;
+    }
     void * getData() const { return data; }
 
 private:
@@ -190,8 +228,9 @@ void ThreadStatus::flushUntrackedMemory()
     if (untracked_memory == 0)
         return;
 
-    memory_tracker.adjustWithUntrackedMemory(untracked_memory);
+    Int64 current_untracked_memory = current_thread->untracked_memory;
     untracked_memory = 0;
+    memory_tracker.adjustWithUntrackedMemory(current_untracked_memory);
 }
 
 bool ThreadStatus::isQueryCanceled() const

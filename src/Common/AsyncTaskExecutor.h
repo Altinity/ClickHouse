@@ -1,5 +1,6 @@
 #pragma once
 
+#include <base/types.h>
 #include <Common/Epoll.h>
 #include <Common/Fiber.h>
 #include <Common/FiberStack.h>

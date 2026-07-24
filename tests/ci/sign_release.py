@@ -6,6 +6,8 @@ from env_helper import TEMP_PATH, REPO_COPY, REPORT_PATH
 from s3_helper import S3Helper
 from pr_info import PRInfo
 from build_download_helper import download_builds_filter
+from report import JobReport, TestResult, OK, SUCCESS
+from stopwatch import Stopwatch
 import hashlib
 from pathlib import Path
 
@@ -47,6 +49,7 @@ def sign_file(file_path):
     return out_file_path
 
 def main():
+    stopwatch = Stopwatch()
     reports_path = Path(REPORT_PATH)
 
     if not os.path.exists(TEMP_PATH):
@@ -65,6 +68,7 @@ def main():
     # downloads `package_release` artifacts generated
     download_builds_filter(CHECK_NAME, reports_path, Path(TEMP_PATH))
 
+    signed_count = 0
     for f in os.listdir(TEMP_PATH):
         full_path = os.path.join(TEMP_PATH, f)
         if os.path.isdir(full_path):
@@ -74,6 +78,17 @@ def main():
         s3_path = s3_path_prefix / os.path.basename(signed_file_path)
         s3_helper.upload_build_file_to_s3(Path(signed_file_path), str(s3_path))
         print(f'Uploaded file {signed_file_path} to {s3_path}')
+        signed_count += 1
+
+    description = f"Signed and uploaded {signed_count} hashes"
+    JobReport(
+        description=description,
+        test_results=[TestResult(description, OK)],
+        status=SUCCESS,
+        start_time=stopwatch.start_time_str,
+        duration=stopwatch.duration_seconds,
+        additional_files=[],
+    ).dump()
 
     # Signed hashes are:
     # clickhouse-client_22.3.15.2.altinitystable_amd64.deb.sha512.gpg              clickhouse-keeper_22.3.15.2.altinitystable_x86_64.apk.sha512.gpg

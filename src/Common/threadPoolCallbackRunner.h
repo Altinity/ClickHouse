@@ -31,23 +31,14 @@ ThreadPoolCallbackRunnerUnsafe<Result, Callback> threadPoolCallbackRunnerUnsafe(
     {
         auto task = std::make_shared<std::packaged_task<Result()>>([thread_group, thread_name, my_callback = std::move(callback)]() mutable -> Result
         {
-            if (thread_group)
-                CurrentThread::attachToGroup(thread_group);
+            ThreadGroupSwitcher switcher(thread_group, thread_name.c_str());
 
             SCOPE_EXIT_SAFE(
             {
-                {
-                    /// Release all captured resources before detaching thread group
-                    /// Releasing has to use proper memory tracker which has been set here before callback
-
-                    [[maybe_unused]] auto tmp = std::move(my_callback);
-                }
-
-                if (thread_group)
-                    CurrentThread::detachFromGroupIfNotDetached();
+                /// Release all captured resources before detaching thread group
+                /// Releasing has to use proper memory tracker which has been set here before callback
+                [[maybe_unused]] auto tmp = std::move(my_callback);
             });
-
-            setThreadName(thread_name.data());
 
             return my_callback();
         });
@@ -75,6 +66,8 @@ std::future<Result> scheduleFromThreadPoolUnsafe(T && task, ThreadPool & pool, c
 template <typename Result, typename PoolT = ThreadPool, typename Callback = std::function<Result()>>
 class ThreadPoolCallbackRunnerLocal
 {
+    static_assert(!std::is_same_v<PoolT, GlobalThreadPool>, "Scheduling tasks directly on GlobalThreadPool is not allowed because it doesn't set up CurrentThread. Create a new ThreadPool (local or in SharedThreadPools.h) or use ThreadFromGlobalPool.");
+
     PoolT & pool;
     std::string thread_name;
 
@@ -124,6 +117,8 @@ public:
         auto task_func = std::make_shared<std::packaged_task<Result()>>(
         [task, thread_group = CurrentThread::getGroup(), my_thread_name = thread_name, my_callback = std::move(callback)]() mutable -> Result
         {
+            ThreadGroupSwitcher switcher(thread_group, my_thread_name.c_str());
+
             TaskState expected = SCHEDULED;
             if (!task->state.compare_exchange_strong(expected, RUNNING))
             {
@@ -139,9 +134,6 @@ public:
                     throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected state {} when finishing a task in {}", expected, my_thread_name);
             });
 
-            if (thread_group)
-                CurrentThread::attachToGroup(thread_group);
-
             SCOPE_EXIT_SAFE(
             {
                 {
@@ -150,12 +142,7 @@ public:
 
                     [[maybe_unused]] auto tmp = std::move(my_callback);
                 }
-
-                if (thread_group)
-                    CurrentThread::detachFromGroupIfNotDetached();
             });
-
-            setThreadName(my_thread_name.data());
 
             return my_callback();
         });

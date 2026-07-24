@@ -321,19 +321,29 @@ class CI:
             timeout=3600,
         ),
         JobNames.STATELESS_TEST_ASAN: CommonJobConfigs.STATELESS_TEST.with_properties(
-            required_builds=[BuildNames.PACKAGE_ASAN], num_batches=2
+            required_builds=[BuildNames.PACKAGE_ASAN],
+            num_batches=2,
+            timeout=3 * 3600,  # the job timed out with default value (7200)
         ),
         JobNames.STATELESS_TEST_TSAN: CommonJobConfigs.STATELESS_TEST.with_properties(
-            required_builds=[BuildNames.PACKAGE_TSAN], num_batches=4
+            required_builds=[BuildNames.PACKAGE_TSAN],
+            num_batches=4,
+            timeout=3 * 3600,  # the job timed out with default value (7200)
         ),
         JobNames.STATELESS_TEST_MSAN: CommonJobConfigs.STATELESS_TEST.with_properties(
-            required_builds=[BuildNames.PACKAGE_MSAN], num_batches=4
+            required_builds=[BuildNames.PACKAGE_MSAN],
+            num_batches=4,
+            timeout=3 * 3600,  # the job timed out with default value (7200)
         ),
         JobNames.STATELESS_TEST_UBSAN: CommonJobConfigs.STATELESS_TEST.with_properties(
-            required_builds=[BuildNames.PACKAGE_UBSAN], num_batches=2
+            required_builds=[BuildNames.PACKAGE_UBSAN],
+            num_batches=2,
+            timeout=3 * 3600,  # the job timed out with default value (7200)
         ),
         JobNames.STATELESS_TEST_DEBUG: CommonJobConfigs.STATELESS_TEST.with_properties(
-            required_builds=[BuildNames.PACKAGE_DEBUG], num_batches=2
+            required_builds=[BuildNames.PACKAGE_DEBUG], 
+            num_batches=2,
+            timeout=3 * 3600,  # the job timed out with default value (7200)
         ),
         JobNames.STATELESS_TEST_RELEASE: CommonJobConfigs.STATELESS_TEST.with_properties(
             required_builds=[BuildNames.PACKAGE_RELEASE],
@@ -400,7 +410,7 @@ class CI:
         JobNames.INTEGRATION_TEST_ASAN: CommonJobConfigs.INTEGRATION_TEST.with_properties(
             required_builds=[BuildNames.PACKAGE_ASAN],
             num_batches=4,
-            timeout=3 * 3600,  # the job timed out with default value (7200)
+            timeout=4 * 3600,  # the job timed out with default value (7200)
         ),
         JobNames.INTEGRATION_TEST_ASAN_OLD_ANALYZER: CommonJobConfigs.INTEGRATION_TEST.with_properties(
             required_builds=[BuildNames.PACKAGE_ASAN],
@@ -420,9 +430,9 @@ class CI:
         ),
         JobNames.INTEGRATION_TEST: CommonJobConfigs.INTEGRATION_TEST.with_properties(
             required_builds=[BuildNames.PACKAGE_RELEASE],
-            num_batches=4,
+            num_batches=6,
             # release_only=True,
-            timeout=12000,  # the job timed out with default value (7200)
+            timeout=4 * 3600,  # the job timed out with default value (7200)
         ),
         JobNames.INTEGRATION_TEST_FLAKY: CommonJobConfigs.INTEGRATION_TEST.with_properties(
             required_builds=[BuildNames.PACKAGE_ASAN],
