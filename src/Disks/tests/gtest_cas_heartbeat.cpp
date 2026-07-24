@@ -13,6 +13,7 @@
 namespace DB::ErrorCodes
 {
     extern const int NETWORK_ERROR;
+    extern const int ABORTED;
 }
 
 using namespace DB::Cas;
@@ -117,7 +118,11 @@ TEST(CasHeartbeat, StopStampsExpiredAndFarewellSentinel)
     EXPECT_EQ(m.min_active, std::numeric_limits<uint64_t>::max());
 }
 
-TEST(CasHeartbeat, ForeignTouchMakesRenewThrow)
+/// Phase A (spec rev.4 2026-07-24): a confirmed renewal mismatch whose re-read shows OUR OWN
+/// (uuid, epoch), unfenced, is state UNCERTAINTY (an ambiguous landed renewal of ours, or a
+/// same-pair twin after epoch-state loss) — fail closed via fence + self-remount, never an
+/// exception that aborts debug/ASan builds at construction.
+TEST(CasHeartbeat, SameEpochUnfencedTouchIsUncertainNotFatal)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     Layout layout("pool");
@@ -130,20 +135,93 @@ TEST(CasHeartbeat, ForeignTouchMakesRenewThrow)
                             [&] { return now_ms; }, [] { return uint64_t{5}; });
     keeper.start();
 
-    /// A foreign incarnation overwrites the slot: the single-writer contract fails closed on renew.
+    /// The slot advances past our held token under our own pair (the ambiguous-landed-renewal shape).
+    const HeadResult h = backend->head(layout.mountKey(srid));
+    ASSERT_TRUE(h.exists);
+    MountLease advanced;
+    advanced.server_uuid = uuid;
+    advanced.writer_epoch = 9;
+    advanced.seq = 99;
+    backend->putOverwrite(layout.mountKey(srid), encodeMountLease(advanced), h.token);
+
+    try
+    {
+        keeper.renewOnce();
+        FAIL() << "renewOnce must throw on a confirmed mismatch";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::ABORTED) << e.message();
+        EXPECT_NE(e.message().find("state uncertain"), String::npos) << e.message();
+        /// Forensics must ride in the message: the observed seq and our local seq.
+        EXPECT_NE(e.message().find("seq=99"), String::npos) << e.message();
+    }
+}
+
+/// A body under our own uuid but a NEWER writer_epoch is proven supersession — a normal fencing
+/// outcome (the TLA model's localLost), fail closed but never an abort.
+TEST(CasHeartbeat, SupersededTouchIsFailClosedNotFatal)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    Layout layout("pool");
+    const String srid = "test";
+    const UInt128 uuid(0x1234);
+    uint64_t now_ms = 1000;
+    seedOwnClaim(*backend, layout, srid, uuid, /*epoch=*/9, now_ms, /*ttl_ms=*/100);
+
+    MountLeaseKeeper keeper(backend, layout, srid, uuid, /*writer_epoch=*/9, std::chrono::milliseconds(100),
+                            [&] { return now_ms; }, [] { return uint64_t{5}; });
+    keeper.start();
+
+    const HeadResult h = backend->head(layout.mountKey(srid));
+    ASSERT_TRUE(h.exists);
+    MountLease successor;
+    successor.server_uuid = uuid;
+    successor.writer_epoch = 10;
+    successor.seq = 1;
+    backend->putOverwrite(layout.mountKey(srid), encodeMountLease(successor), h.token);
+
+    try
+    {
+        keeper.renewOnce();
+        FAIL() << "renewOnce must throw on a confirmed mismatch";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::ABORTED) << e.message();
+        EXPECT_NE(e.message().find("superseded by a newer incarnation"), String::npos) << e.message();
+    }
+}
+
+/// A FOREIGN uuid on our mount slot cannot arise from any protocol interleaving (the owner anchor
+/// refuses foreign claims at open; decommission impersonates the victim uuid). It stays a genuine
+/// invariant violation: loud, aborting in debug/ASan builds.
+TEST(CasHeartbeat, ForeignUuidTouchStillDies)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    Layout layout("pool");
+    const String srid = "test";
+    const UInt128 uuid(0x1234);
+    uint64_t now_ms = 1000;
+    seedOwnClaim(*backend, layout, srid, uuid, /*epoch=*/9, now_ms, /*ttl_ms=*/100);
+
+    MountLeaseKeeper keeper(backend, layout, srid, uuid, /*writer_epoch=*/9, std::chrono::milliseconds(100),
+                            [&] { return now_ms; }, [] { return uint64_t{5}; });
+    keeper.start();
+
     const HeadResult h = backend->head(layout.mountKey(srid));
     ASSERT_TRUE(h.exists);
     MountLease foreign;
-    foreign.server_uuid = uuid;
-    foreign.writer_epoch = 9;
-    foreign.seq = 99;
+    foreign.server_uuid = UInt128(0x9999);
+    foreign.writer_epoch = 1;
+    foreign.seq = 1;
     backend->putOverwrite(layout.mountKey(srid), encodeMountLease(foreign), h.token);
     EXPECT_DEATH(
         {
             DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
             keeper.renewOnce();
         },
-        "touched by a foreign writer");
+        "held by a foreign server");
 }
 
 /// Mount-slot writer audit (the P1 "foreign writer" instrument): every mount-slot WRITE and every
@@ -481,48 +559,42 @@ TEST(CasHeartbeat, BackgroundLoopRetriesTransientFailureWithoutFencingOrStopping
     EXPECT_FALSE(lost.load()) << "a transient putOverwrite failure must not trip the fence";
 }
 
-/// A CONFIRMED mismatch (a foreign incarnation lands on the slot) must fence immediately, even with the
-/// deadline nowhere near expiry -- the other half of fix #37 phase 1's distinction.
+/// A CONFIRMED mismatch (a same-(uuid, epoch) unfenced touch lands on the slot -- state
+/// uncertainty, spec rev.4) must fence immediately, even with the deadline nowhere near expiry --
+/// the other half of fix #37 phase 1's distinction. Phase A repartition: this shape is no longer
+/// fatal (it throws `ABORTED`, not `LOGICAL_ERROR`), so the loop must recover via `on_lost` instead
+/// of dying -- observe the fence the same way `BackgroundLoopRetriesTransientFailureWithoutFencingOrStopping`
+/// observes non-fencing.
 TEST(CasHeartbeat, BackgroundLoopFencesImmediatelyOnConfirmedMismatch)
 {
-    /// This death statement must start a `ThreadFromGlobalPool` worker in its child. The default
-    /// fork-only death-test style can inherit an unusable global-pool state once earlier tests have
-    /// created worker threads, so re-exec a clean child for this thread-aware case.
-    const String previous_death_test_style = GTEST_FLAG_GET(death_test_style);
-    GTEST_FLAG_SET(death_test_style, "threadsafe");
-    EXPECT_DEATH(
-        {
-            DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
+    auto backend = std::make_shared<InMemoryBackend>();
+    Layout layout("pool");
+    const String srid = "test";
+    const UInt128 uuid(0x1234);
+    uint64_t now_ms = 1000;
+    seedOwnClaim(*backend, layout, srid, uuid, /*epoch=*/9, now_ms, /*ttl_ms=*/30000);
 
-            auto backend = std::make_shared<InMemoryBackend>();
-            Layout layout("pool");
-            const String srid = "test";
-            const UInt128 uuid(0x1234);
-            uint64_t now_ms = 1000;
-            seedOwnClaim(*backend, layout, srid, uuid, /*epoch=*/9, now_ms, /*ttl_ms=*/30000);
+    std::atomic<bool> lost{false};
+    MountLeaseKeeper keeper(
+        backend, layout, srid, uuid, /*writer_epoch=*/9, std::chrono::milliseconds(30000),
+        [&] { return now_ms; }, [] { return uint64_t{0}; }, CasEventSink{}, std::chrono::milliseconds(2000));
+    keeper.setFenceCallbacks([] {}, [&] { lost = true; });
+    keeper.start();
 
-            std::atomic<bool> lost{false};
-            MountLeaseKeeper keeper(
-                backend, layout, srid, uuid, /*writer_epoch=*/9, std::chrono::milliseconds(30000),
-                [&] { return now_ms; }, [] { return uint64_t{0}; }, CasEventSink{}, std::chrono::milliseconds(2000));
-            keeper.setFenceCallbacks([] {}, [&] { lost = true; });
-            keeper.start();
+    /// A same-(uuid, epoch) unfenced touch overwrites the slot BEFORE the first background beat.
+    const HeadResult h = backend->head(layout.mountKey(srid));
+    MountLease advanced;
+    advanced.server_uuid = uuid;
+    advanced.writer_epoch = 9;
+    advanced.seq = 99;
+    ASSERT_EQ(backend->putOverwrite(layout.mountKey(srid), encodeMountLease(advanced), h.token).outcome,
+              PutOutcome::Done);
 
-            /// A foreign incarnation overwrites the slot BEFORE the first background beat.
-            const HeadResult h = backend->head(layout.mountKey(srid));
-            MountLease foreign;
-            foreign.server_uuid = uuid;
-            foreign.writer_epoch = 9;
-            foreign.seq = 99;
-            ASSERT_EQ(backend->putOverwrite(layout.mountKey(srid), encodeMountLease(foreign), h.token).outcome,
-                      PutOutcome::Done);
+    keeper.startBackground(std::chrono::milliseconds(20));
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!lost.load() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    keeper.stopBackground();
 
-            keeper.startBackground(std::chrono::milliseconds(20));
-            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-            while (!lost.load() && std::chrono::steady_clock::now() < deadline)
-                std::this_thread::sleep_for(std::chrono::milliseconds(5));
-            keeper.stopBackground();
-        },
-        "touched by a foreign writer");
-    GTEST_FLAG_SET(death_test_style, previous_death_test_style);
+    EXPECT_TRUE(lost.load()) << "background loop must fence immediately on a confirmed same-epoch mismatch";
 }

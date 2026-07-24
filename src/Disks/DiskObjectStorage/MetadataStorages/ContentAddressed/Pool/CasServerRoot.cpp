@@ -26,6 +26,7 @@ namespace DB
 {
 namespace ErrorCodes
 {
+    extern const int ABORTED;
     extern const int CORRUPTED_DATA;
     extern const int FILE_DOESNT_EXIST;
     extern const int LOGICAL_ERROR;
@@ -822,10 +823,10 @@ void MountLeaseKeeper::onRenewFailed()
 void MountLeaseKeeper::onRenewMismatch(const String & mismatched_key)
 {
     /// The base contract's PreconditionFailed just means "our token didn't match" — re-read the
-    /// CURRENT body to tell a GC fence of our own expired lease (recoverable: re-open with a fresh
-    /// writer_epoch) apart from a genuine foreign writer (the fail-closed single-writer violation
-    /// the base class stays loud about). Absent body, or same (uuid, epoch) unfenced — no plausible
-    /// classification — falls through to the base's generic throw.
+    /// CURRENT body and classify. All four body-present cases and the absent case are covered
+    /// below, each fail-closed and none (except the protocol-unreachable foreign_writer)
+    /// constructing a LOGICAL_ERROR, which aborts debug/ASan builds at exception construction
+    /// (STID 3982-3b48; parts 1a/1b covered vanished/absent-at-release, this covers the rest).
     const auto got = backend->get(mismatched_key);
     if (got)
     {
@@ -841,42 +842,65 @@ void MountLeaseKeeper::onRenewMismatch(const String & mismatched_key)
                 "recoverable: re-open with a fresh writer_epoch", mismatched_key, describeMountHolder(current)));
         }
 
+        if (current.server_uuid == server_uuid && current.writer_epoch == writer_epoch && !current.gc_fenced)
+        {
+            /// The slot advanced past our held token under our OWN (uuid, epoch), unfenced. This is
+            /// state UNCERTAINTY, not proof of anything (spec rev.4): the common cause is our own
+            /// earlier renewal PUT that landed while its ack was lost to a client-side timeout; the
+            /// pathological one is a same-pair twin after durable epoch-state loss (narrowed by the
+            /// allocateWriterEpoch re-mint guard). Both recover identically and fail closed: stop
+            /// renewing, latch the write fence, self-remount under a fresh writer_epoch. Never a
+            /// LOGICAL_ERROR — this shape is reachable by an ordinary network timeout.
+            ProfileEvents::increment(ProfileEvents::CasMountLeaseLost);
+            emitMountEvent(event_sink, CasEventType::MountConflict, srid, "same_epoch_state_uncertain", &current,
+                "own mount slot advanced past our held token under our own (uuid, epoch) — state "
+                "uncertain (ambiguous prior renewal or epoch-state loss); fencing and self-remounting");
+            throw Exception(ErrorCodes::ABORTED,
+                "CAS mount-lease: key '{}' advanced past our held token under our own (uuid, epoch) — "
+                "state uncertain; fencing and recovering via self-remount (observed {} vs our seq={})",
+                mismatched_key, describeMountHolder(current), seq);
+        }
+
         if (current.server_uuid == server_uuid && current.writer_epoch != writer_epoch)
         {
             ProfileEvents::increment(ProfileEvents::CasMountLeaseLost);
             emitMountEvent(event_sink, CasEventType::MountConflict, srid, "superseded", &current,
                 "own mount slot is held by a different writer_epoch — superseded by a newer incarnation");
-            throw Exception(ErrorCodes::LOGICAL_ERROR,
-                "CAS mount-lease: key '{}' was superseded by a newer incarnation ({})",
+            /// A normal fencing outcome (the model's localLost), not a programming assertion:
+            /// a suspended predecessor legitimately resumes into this after a successor reclaimed.
+            throw Exception(ErrorCodes::ABORTED,
+                "CAS mount-lease: key '{}' was superseded by a newer incarnation ({}) — fencing "
+                "(this incarnation is deposed; recovery is a fresh-epoch self-remount)",
                 mismatched_key, describeMountHolder(current));
         }
 
-        if (current.server_uuid != server_uuid)
-        {
-            ProfileEvents::increment(ProfileEvents::CasMountLeaseLost);
-            emitMountEvent(event_sink, CasEventType::MountConflict, srid, "foreign_writer", &current,
-                "mount slot is held by a foreign server — failing closed, never taking over");
-            throw Exception(ErrorCodes::LOGICAL_ERROR,
-                "CAS mount-lease: key '{}' is held by a foreign server ({}) — failing closed, never taking over",
-                mismatched_key, describeMountHolder(current));
-        }
-    }
-    else
-    {
-        /// The mount slot object VANISHED (backing store deleted under a live mount -- e.g. an
-        /// operator or test rm -rf'd the pool dir). This is an ENVIRONMENTAL condition, not a logic
-        /// error: there is no foreign writer to fail closed against. Stop renewing (fail-closed: the
-        /// write fence latches to lost, we never re-mint) WITHOUT aborting the server --
-        /// LOGICAL_ERROR here aborts debug/ASan builds at exception construction.
+        /// current.server_uuid != server_uuid — the one genuinely protocol-unreachable case
+        /// (the owner anchor refuses foreign claims at open; decommission impersonates the victim
+        /// uuid, it never manufactures a foreign one). Deliberately still LOGICAL_ERROR-loud.
         ProfileEvents::increment(ProfileEvents::CasMountLeaseLost);
-        emitMountEvent(event_sink, CasEventType::MountConflict, srid, "vanished", nullptr,
-            "mount slot object vanished (backing store deleted under a live mount) — stopping renewal, fail-closed");
-        throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
-            "CAS mount-lease: key '{}' vanished (backing store deleted under a live mount) — "
-            "stopping renewal, fail-closed (never re-minting)", mismatched_key);
+        emitMountEvent(event_sink, CasEventType::MountConflict, srid, "foreign_writer", &current,
+            "mount slot is held by a foreign server — failing closed, never taking over");
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "CAS mount-lease: key '{}' is held by a foreign server ({}) — failing closed, never taking over",
+            mismatched_key, describeMountHolder(current));
     }
 
-    SingleWriterSlot::onRenewMismatch(mismatched_key);
+    /// The mount slot object VANISHED (backing store deleted under a live mount -- e.g. an
+    /// operator or test rm -rf'd the pool dir). This is an ENVIRONMENTAL condition, not a logic
+    /// error: there is no foreign writer to fail closed against. Stop renewing (fail-closed: the
+    /// write fence latches to lost, we never re-mint) WITHOUT aborting the server --
+    /// LOGICAL_ERROR here aborts debug/ASan builds at exception construction.
+    ProfileEvents::increment(ProfileEvents::CasMountLeaseLost);
+    emitMountEvent(event_sink, CasEventType::MountConflict, srid, "vanished", nullptr,
+        "mount slot object vanished (backing store deleted under a live mount) — stopping renewal, fail-closed");
+    throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
+        "CAS mount-lease: key '{}' vanished (backing store deleted under a live mount) — "
+        "stopping renewal, fail-closed (never re-minting)", mismatched_key);
+
+    /// NOTE: the pre-rev.4 trailing `SingleWriterSlot::onRenewMismatch(mismatched_key)` call is
+    /// GONE — the five cases above are exhaustive for this keeper (body-present × {fenced,
+    /// same-pair-unfenced, superseded, foreign} + absent), so the base class's generic
+    /// LOGICAL_ERROR is unreachable here. The base implementation stays for other slot subclasses.
 }
 
 void MountLeaseKeeper::terminate()
