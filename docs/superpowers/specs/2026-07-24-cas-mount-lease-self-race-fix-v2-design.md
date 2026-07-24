@@ -1,6 +1,13 @@
 # CAS mount-lease renewal ambiguity — fence-not-rescue fix (rev.4) — design
 
-**Status:** DESIGN rev.4 (2026-07-24). rev.3 = the user-approved fence-not-rescue simplification
+**Status:** IMPLEMENTED (2026-07-24) — Phases A-C + TLA+ gate + addenda all landed on `cas-gc-rebuild`:
+TLA+ gate `8451222bb14` + `f39f2070bbd`; Phase A classifier `2e5b2df7397` + e2e test `07c8770eb0b`;
+Phase B keeper anchoring `e6b1d90acc0`, startup-arm `e0ee7af7564` + remount-arm addendum
+`25e3e34413c` + regression test `683579789c7`; Phase C guard `6094c1473ea` + follow-up
+`d00cc114af8`. `Cas*:CA*` gtest gate green post-landing. Open: the `amd_msan`/`amd_tsan` 6h-hang
+question (BACKLOG §8, Task F) is unrelated and still unanswered; Gate 3 (live CAS-s3 stateless-lane
+validation) rides the next CI push of `cas-gc-rebuild` rather than a local re-run of the full lane.
+rev.3 = the user-approved fence-not-rescue simplification
 of rev.2; rev.4 folds in the four findings of the third codex round that survive the
 simplification (the round reviewed rev.2; its verdict: `tmp/codex_review_mountlease_v2rev2_verdict.md`;
 its six findings against the dropped rescue machinery are MOOT). The surviving four: the
