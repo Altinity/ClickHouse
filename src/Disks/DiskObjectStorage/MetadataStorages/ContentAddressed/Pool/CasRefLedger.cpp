@@ -433,9 +433,14 @@ void CasRefLedger::ensureRefTableRecovered(const RootNamespace & ns, RefTableRun
                             vanished = true;
                             break;
                         }
-                        builder.applyOne(
-                            decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), id),
-                            got->bytes.size());
+                        RefLogTxn txn = decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), id);
+                        /// Account the decoded transaction's resident footprint to the memory probe for
+                        /// exactly this iteration (see `reportReplayMemoryDelta`): the streaming loop holds
+                        /// one at a time. No-op in production.
+                        const int64_t footprint = static_cast<int64_t>(decodedRefLogTxnFootprint(txn));
+                        reportReplayMemoryDelta(footprint);
+                        SCOPE_EXIT({ reportReplayMemoryDelta(-footprint); });
+                        builder.applyOne(std::move(txn), got->bytes.size());
                     }
                 }
 

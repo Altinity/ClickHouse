@@ -50,20 +50,6 @@ void checkRemoveNamespaceOrdering(const std::vector<RefOp> & ops)
 std::mutex g_recovery_replay_memory_probe_mutex;
 std::function<void(int64_t)> g_recovery_replay_memory_probe;
 
-/// Report a decoded-transaction memory delta to the installed probe, if any. A no-op in production
-/// (no probe installed). Reads the probe under the mutex and calls it OUTSIDE the lock so the probe
-/// body may itself do arbitrary work.
-void reportReplayMemoryDelta(int64_t delta_stored_bytes)
-{
-    std::function<void(int64_t)> probe;
-    {
-        std::lock_guard lock(g_recovery_replay_memory_probe_mutex);
-        probe = g_recovery_replay_memory_probe;
-    }
-    if (probe)
-        probe(delta_stored_bytes);
-}
-
 /// The four legal `owner_transition` shapes, decided purely from the (old_binding, new_binding)
 /// optionals and their `RefOwnerKind`s -- no state read. `RefTableState::applyOwnerTransition` (the
 /// writer/replay state machine) and `manifestEdgesOfTxn` (the GC fold's edge extractor) both switch
@@ -111,10 +97,41 @@ enum class OwnerTransitionShape : uint8_t
 
 }
 
-void setRecoveryReplayMemoryProbeForTest(std::function<void(int64_t delta_stored_bytes)> probe)
+void setRecoveryReplayMemoryProbeForTest(std::function<void(int64_t delta_footprint_bytes)> probe)
 {
     std::lock_guard lock(g_recovery_replay_memory_probe_mutex);
     g_recovery_replay_memory_probe = std::move(probe);
+}
+
+void reportReplayMemoryDelta(int64_t delta_footprint_bytes)
+{
+    /// Reads the installed probe under the mutex and calls it OUTSIDE the lock so the probe body may
+    /// itself do arbitrary work. A no-op in production (no probe installed).
+    std::function<void(int64_t)> probe;
+    {
+        std::lock_guard lock(g_recovery_replay_memory_probe_mutex);
+        probe = g_recovery_replay_memory_probe;
+    }
+    if (probe)
+        probe(delta_footprint_bytes);
+}
+
+uint64_t decodedRefLogTxnFootprint(const RefLogTxn & txn)
+{
+    /// A deterministic proxy for the heap a decoded transaction keeps alive: the ns string, the op
+    /// vector's element storage (ops count x per-op record size), and every owned ref-name string. Uses
+    /// `size()` (not `capacity()`) so the value depends only on the decoded content, hence is identical
+    /// across a streaming decode and a materialising control's decode of the same object.
+    uint64_t bytes = txn.ns.size() + txn.ops.size() * sizeof(RefOp);
+    for (const RefOp & op : txn.ops)
+    {
+        bytes += op.ref_name.size();
+        if (op.old_binding)
+            bytes += op.old_binding->ref_name.size();
+        if (op.new_binding)
+            bytes += op.new_binding->ref_name.size();
+    }
+    return bytes;
 }
 
 /// True iff `manifest_ref` already names an existing committed row or precommit binding under ANY
@@ -481,14 +498,10 @@ RefReplayBuilder::RefReplayBuilder(std::optional<RefTableSnapshot> base, uint64_
 
 void RefReplayBuilder::applyOne(RefLogTxn && txn, uint64_t encoded_bytes)
 {
-    /// The decoded transaction is resident only for the duration of this call. Report its stored-byte
-    /// weight to the streaming-recovery memory probe on entry and release it on exit (or on throw), so a
-    /// bound-checking test observes at most one transaction's worth alive -- the whole point of streaming
-    /// over the retired whole-tail vector, which held the entire tail resident at once. No-op in
-    /// production (no probe installed).
-    reportReplayMemoryDelta(static_cast<int64_t>(encoded_bytes));
-    SCOPE_EXIT({ reportReplayMemoryDelta(-static_cast<int64_t>(encoded_bytes)); });
-
+    /// The streaming-recovery memory probe is driven by the CALLER's loop (around GET->decode->this
+    /// call->discard), not here: the alive decoded-transaction set is a property of how the loop holds
+    /// its transactions, which `applyOne` -- seeing one at a time regardless -- cannot observe. See
+    /// `reportReplayMemoryDelta` / `decodedRefLogTxnFootprint`.
     if (expected_ns && txn.ns != *expected_ns)
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "RefReplayBuilder: transaction ns '{}' does not match the table's ns '{}'",
@@ -748,8 +761,15 @@ RecoveredRefTable recoverRefTableDetailed(Backend & backend, const Layout & layo
                     vanished = true;
                     break;
                 }
-                builder.applyOne(
-                    decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), id), got->bytes.size());
+                RefLogTxn txn = decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), id);
+                /// Account this decoded transaction's resident footprint to the memory probe for exactly
+                /// the span it is held -- this iteration. The streaming loop holds one at a time, so the
+                /// probe's peak stays within a single transaction (a whole-tail materialiser would hold
+                /// the entire tail, and the probe would see it). No-op in production.
+                const int64_t footprint = static_cast<int64_t>(decodedRefLogTxnFootprint(txn));
+                reportReplayMemoryDelta(footprint);
+                SCOPE_EXIT({ reportReplayMemoryDelta(-footprint); });
+                builder.applyOne(std::move(txn), got->bytes.size());
             }
 
         if (vanished)

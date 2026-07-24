@@ -28,11 +28,12 @@ using namespace DB::Cas::tests;
 namespace
 {
 
-/// A deterministic accountant for the streaming-recovery memory probe: the replay path reports
-/// `+weight` while one decoded transaction is being applied and `-weight` once it is discarded, so
-/// `peak` is the maximum stored-byte weight ever resident at one instant. Streaming holds one
-/// transaction; the retired whole-tail vector held the entire tail. Deterministic (it accounts the
-/// weights the probe is handed, not RSS), so it is stable under ASan quarantine noise.
+/// A deterministic accountant for the streaming-recovery memory probe: each recovery loop reports
+/// `+footprint` while one decoded transaction is resident and `-footprint` once it is discarded, so
+/// `peak` is the maximum summed decoded-transaction footprint ever resident at one instant. Streaming
+/// holds one transaction; the retired whole-tail materialiser -- and the test-local control that stands
+/// in for it -- held the entire tail. Deterministic (it accounts the footprints the probe is handed, a
+/// pure function of decoded content, not RSS), so it is stable under ASan quarantine noise.
 struct PeakTracker
 {
     std::atomic<int64_t> alive_bytes{0};
@@ -85,30 +86,30 @@ RefLogTxn makeBigTxn(const String & ns, RefTxnId id, size_t num_ops, uint64_t & 
 }
 
 /// Seed `num_txns` maximum-shaped transactions at ids {1,1}..{1,num_txns} directly into `ns`'s `_log/`
-/// stream, and return the stored (sealed) byte size of the largest single log plus the total across
-/// all logs. The largest single size is the streaming peak; the total is what the old whole-tail
-/// vector held resident at once.
+/// stream, and return the resident DECODED footprint (`decodedRefLogTxnFootprint`) of the largest single
+/// transaction plus the total across all. The largest single footprint is the streaming peak (one
+/// transaction resident at a time); the total is what a whole-tail materialiser holds resident at once.
+/// Footprint -- not the compressed stored size -- is the bound's currency: it is what actually sits in
+/// memory and what a materialising regression accumulates N-fold, and it is a deterministic function of
+/// the decoded content (identical whether computed on the built or the decoded transaction).
 struct SeededTail
 {
-    uint64_t max_single_stored = 0;
-    uint64_t total_stored = 0;
+    uint64_t max_single_footprint = 0;
+    uint64_t total_footprint = 0;
 };
 
 SeededTail seedBigTail(
     InMemoryBackend & backend, const Layout & layout, const RootNamespace & ns,
     size_t num_txns, size_t ops_per_txn, uint64_t & manifest_seq)
 {
-    for (size_t t = 0; t < num_txns; ++t)
-        writeRefLogTxnRaw(backend, layout,
-            makeBigTxn(ns.string(), RefTxnId{1, t + 1}, ops_per_txn, manifest_seq, /*birth=*/t == 0));
-
     SeededTail seeded;
     for (size_t t = 0; t < num_txns; ++t)
     {
-        const auto got = backend.get(layout.refLogKey(ns, RefTxnId{1, t + 1}));
-        EXPECT_TRUE(got.has_value());
-        seeded.max_single_stored = std::max<uint64_t>(seeded.max_single_stored, got->bytes.size());
-        seeded.total_stored += got->bytes.size();
+        const RefLogTxn txn = makeBigTxn(ns.string(), RefTxnId{1, t + 1}, ops_per_txn, manifest_seq, /*birth=*/t == 0);
+        const uint64_t footprint = decodedRefLogTxnFootprint(txn);
+        seeded.max_single_footprint = std::max(seeded.max_single_footprint, footprint);
+        seeded.total_footprint += footprint;
+        writeRefLogTxnRaw(backend, layout, txn);
     }
     return seeded;
 }
@@ -214,11 +215,12 @@ public:
 
 }
 
-/// Test 14 (load-bearing memory RED): a long tail of maximum-shaped transactions replays under a hard
-/// peak bound that the retired whole-tail materializer -- which held every decoded transaction resident
-/// at once -- provably exceeds. The bound is computed from the fixture's own stored sizes (twice the
-/// largest single transaction), and the total held by the old vector is asserted to exceed it, so the
-/// RED is a property of the fixture, not a lucky constant.
+/// Test 14 (load-bearing memory bound): a long tail of maximum-shaped transactions replays under a hard
+/// peak bound (twice the largest single transaction's decoded footprint) that a whole-tail materialiser
+/// -- which holds every decoded transaction resident at once -- provably exceeds. The bound is computed
+/// from the fixture's own footprints and the whole-tail total is asserted to exceed it, so the bound is
+/// a property of the fixture, not a lucky constant. Its materialising counterpart,
+/// `MaterializingControlExceedsMemoryBound`, trips this same bound.
 TEST(CasRecoveryStreaming, LongTailReplaysUnderMemoryBound)
 {
     auto backend = std::make_shared<InMemoryBackend>();
@@ -230,9 +232,9 @@ TEST(CasRecoveryStreaming, LongTailReplaysUnderMemoryBound)
     uint64_t manifest_seq = 1;
     const SeededTail seeded = seedBigTail(*backend, layout, ns, kTxns, kOpsPerTxn, manifest_seq);
 
-    const uint64_t bound = 2 * seeded.max_single_stored;
-    ASSERT_GT(seeded.total_stored, bound)
-        << "fixture must make the whole-tail vector (" << seeded.total_stored
+    const uint64_t bound = 2 * seeded.max_single_footprint;
+    ASSERT_GT(seeded.total_footprint, bound)
+        << "fixture must make the whole tail (" << seeded.total_footprint
         << " B) provably exceed the bound (" << bound << " B)";
 
     PeakTracker tracker;
@@ -243,8 +245,66 @@ TEST(CasRecoveryStreaming, LongTailReplaysUnderMemoryBound)
     EXPECT_EQ(state.getPrecommits().size(), kTxns * kOpsPerTxn) << "the whole tail must have replayed";
     EXPECT_LE(tracker.peak(), static_cast<int64_t>(bound))
         << "streaming recovery must hold at most ~one decoded transaction (peak " << tracker.peak()
-        << " B) not the whole " << kTxns << "-transaction tail (" << seeded.total_stored << " B)";
+        << " B) not the whole " << kTxns << "-transaction tail (" << seeded.total_footprint << " B)";
     EXPECT_EQ(tracker.alive(), 0) << "every decoded transaction must be discarded after it is applied";
+}
+
+/// Test 14 (materialising RED control): the discriminating counterpart to the streaming bound above. A
+/// control that GETs+decodes the WHOLE tail into a vector BEFORE applying it -- the retired whole-tail
+/// shape -- holds every decoded transaction resident at once. Driven through the SAME memory probe as
+/// streaming recovery, its peak must EXCEED the same bound the streaming path stays under. This is the
+/// regression the memory guard exists to catch, and the guard discriminates precisely because the probe
+/// now accounts the caller's whole resident set (each decoded transaction for the span it is held), not
+/// one apply in isolation. Under the retired stored-byte-in-`applyOne` probe this control's peak stayed
+/// at one transaction (see the RED capture in the round-2 fix report); it now correctly trips.
+TEST(CasRecoveryStreaming, MaterializingControlExceedsMemoryBound)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"00/aa@cas@"};
+
+    constexpr size_t kTxns = 24;
+    constexpr size_t kOpsPerTxn = 250;
+    uint64_t manifest_seq = 1;
+    const SeededTail seeded = seedBigTail(*backend, layout, ns, kTxns, kOpsPerTxn, manifest_seq);
+
+    const uint64_t bound = 2 * seeded.max_single_footprint;
+    ASSERT_GT(seeded.total_footprint, bound)
+        << "fixture must make the whole tail (" << seeded.total_footprint
+        << " B) provably exceed the bound (" << bound << " B)";
+
+    PeakTracker tracker;
+    setRecoveryReplayMemoryProbeForTest(tracker.probe());
+    SCOPE_EXIT({ setRecoveryReplayMemoryProbeForTest({}); });
+
+    /// Materialise the WHOLE tail first (retired shape): every decoded transaction stays resident in
+    /// `resident_txns`, and its footprint is reported to the probe up front, released only AFTER the whole
+    /// tail has been applied -- exactly the memory profile streaming recovery replaced.
+    std::vector<RefLogTxn> resident_txns;
+    int64_t held = 0;
+    for (size_t t = 1; t <= kTxns; ++t)
+    {
+        const auto got = backend->get(layout.refLogKey(ns, RefTxnId{1, t}));
+        ASSERT_TRUE(got.has_value());
+        RefLogTxn txn = decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), RefTxnId{1, t});
+        const int64_t footprint = static_cast<int64_t>(decodedRefLogTxnFootprint(txn));
+        reportReplayMemoryDelta(footprint);
+        held += footprint;
+        resident_txns.push_back(std::move(txn));
+    }
+
+    RefReplayBuilder builder(std::nullopt);
+    for (RefLogTxn & txn : resident_txns)
+        builder.applyOne(std::move(txn), 0);
+    const RecoveryResult result = std::move(builder).finish();
+    EXPECT_EQ(result.state.getPrecommits().size(), kTxns * kOpsPerTxn) << "the whole tail must have applied";
+
+    EXPECT_GT(tracker.peak(), static_cast<int64_t>(bound))
+        << "the materialising control holds the whole tail resident; the probe must exceed the "
+           "single-transaction bound (peak " << tracker.peak() << " B, bound " << bound << " B)";
+
+    reportReplayMemoryDelta(-held);   /// release the whole tail
+    EXPECT_EQ(tracker.alive(), 0);
 }
 
 /// Test 14 (vanished-selected-object leg): a mid-tail `_log/` object that disappears between the LIST
@@ -383,10 +443,10 @@ TEST(CasRecoveryStreaming, OrphanSweepAndFsckSameBound)
     const RefTableState oracle_state = recoverRefTable(*backend, layout, ns_oracle);
     writeRefSnapshotRaw(*backend, layout, snapshotOf(oracle_state, ns_oracle.string()));
 
-    const uint64_t max_single = std::max(sweep_tail.max_single_stored, oracle_tail.max_single_stored);
+    const uint64_t max_single = std::max(sweep_tail.max_single_footprint, oracle_tail.max_single_footprint);
     const uint64_t bound = 2 * max_single;
-    ASSERT_GT(sweep_tail.total_stored, bound);
-    ASSERT_GT(oracle_tail.total_stored, bound);
+    ASSERT_GT(sweep_tail.total_footprint, bound);
+    ASSERT_GT(oracle_tail.total_footprint, bound);
 
     auto store = openPoolForTest(backend);
 
@@ -465,6 +525,11 @@ TEST(CasRecoveryStreaming, RecoveryResultInventoryComplete)
 
     /// newest snapshot identity: the recovered base id, no seal on this clean mount.
     EXPECT_EQ(store->newestPublishedSnapshotIdForTest(ns), std::optional<RefTxnId>(base.snapshot_id));
+
+    /// sealed_from: the base is an ordinary snapshot (not a recovery seal) and this mount is clean, so
+    /// the installed inventory carries no seal upper bound. Pins that the field IS part of the published
+    /// inventory (the unclean-seal counterpart lives in RefWriterRecoverySeal.RuntimeInventoryCarriesSealSealedFrom).
+    EXPECT_EQ(store->sealedFromForTest(ns), std::nullopt);
 
     /// stale-precommit sweep: recovery always arms it (asserted BEFORE any read-side sweep runs).
     EXPECT_TRUE(store->needsStalePrecommitSweepForTest(ns));

@@ -12,6 +12,7 @@
 
 #include <Common/Exception.h>
 #include <Common/HashTable/Hash.h>
+#include <Common/scope_guard_safe.h>
 
 #include <algorithm>
 #include <set>
@@ -254,8 +255,13 @@ void checkSnapshotOracle(Backend & backend, const Layout & layout, const RootNam
         const auto got_log = backend.get(layout.refLogKey(ns, id));
         if (!got_log)
             return;   /// a covered log was cleaned/vanished: oracle unavailable for X -> skip, not error
-        builder.applyOne(
-            decodeRefLogTxn(openObject(FormatId::RefLog, got_log->bytes), ns.string(), id), got_log->bytes.size());
+        RefLogTxn txn = decodeRefLogTxn(openObject(FormatId::RefLog, got_log->bytes), ns.string(), id);
+        /// Account the decoded transaction's resident footprint to the memory probe for exactly this
+        /// iteration (see `reportReplayMemoryDelta`): the oracle streams one transaction at a time.
+        const int64_t footprint = static_cast<int64_t>(decodedRefLogTxnFootprint(txn));
+        reportReplayMemoryDelta(footprint);
+        SCOPE_EXIT({ reportReplayMemoryDelta(-footprint); });
+        builder.applyOne(std::move(txn), got_log->bytes.size());
     }
 
     const RefTableState reconstructed = std::move(builder).finish().state;

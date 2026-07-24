@@ -429,13 +429,33 @@ private:
     RecoveryResult result;
 };
 
+/// Resident footprint, in bytes, of a decoded ref-log transaction: the heap it keeps alive while it is
+/// held in memory -- its op vector's element storage plus every owned string (the transaction `ns` and
+/// each op's ref-name strings). A deterministic function of the decoded CONTENT (unlike the compressed
+/// stored size, which understates a highly-compressible transaction), so a memory-bound test built on it
+/// is stable under ASan. This is what a whole-tail materialiser accumulates N-fold, while the streaming
+/// recovery loops hold exactly one decoded transaction resident at a time.
+uint64_t decodedRefLogTxnFootprint(const RefLogTxn & txn);
+
+/// Report a decoded-transaction memory delta to the installed streaming-recovery memory probe, if any
+/// (a no-op in production -- no probe is installed). Each recovery loop calls `+footprint` when a
+/// decoded transaction becomes resident and `-footprint` when it is discarded, so the probe observes the
+/// loop's real resident set. Exposed (rather than confined to one translation unit) because the three
+/// recovery loops live in three files and a memory-bound test's materialising control drives the
+/// identical seam.
+void reportReplayMemoryDelta(int64_t delta_footprint_bytes);
+
 /// Test-only observability for the streaming-recovery memory invariant (spec §5): while a probe is
-/// installed, `RefReplayBuilder::applyOne` reports the running weight, in stored object bytes, of the
-/// decoded transactions it holds alive (`+weight` while applying one, `-weight` once it is discarded).
-/// A memory-bound test tracks the peak reported weight and asserts it stays within a single transaction,
-/// where the retired whole-tail materialiser held the entire tail. No probe installed => no accounting.
-/// Guarded by an internal mutex; install before driving recovery and clear afterwards.
-void setRecoveryReplayMemoryProbeForTest(std::function<void(int64_t delta_stored_bytes)> probe);
+/// installed, each recovery loop reports the resident footprint of every decoded transaction it holds,
+/// for exactly the span it holds it (`reportReplayMemoryDelta` + `decodedRefLogTxnFootprint`). A
+/// memory-bound test tracks the peak of the summed reported footprint and asserts it stays within a
+/// single transaction, where the retired whole-tail materialiser -- and the test-local materialising
+/// control that stands in for it -- held the entire tail resident at once. Because the report spans the
+/// decoded transaction's whole GET->decode->apply->discard lifetime at the LOOP, not one apply in
+/// isolation, a regression that materialises the whole tail before applying it is caught. No probe
+/// installed => no accounting. Guarded by an internal mutex; install before driving recovery and clear
+/// afterwards.
+void setRecoveryReplayMemoryProbeForTest(std::function<void(int64_t delta_footprint_bytes)> probe);
 
 /// The exact encoded size of `state`'s canonical snapshot (`encodeRefTableSnapshot(snapshotOf(state,
 /// "")).size()`), computed in O(1) from the running body counter plus O(1) framing instead of a full
