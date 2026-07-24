@@ -142,11 +142,37 @@ CONSTANTS
     SabAdoptWedgeOnTouch, \* FALSE = honest; TRUE makes an adopt token-mismatch a PERMANENT wedge
     SabAdoptIgnoresFence, \* FALSE = honest; TRUE lets AdoptRead accept a fenced same-epoch body
     Drift,                \* max extra ticks the holder's TRUE local-fence expiry outlives the stamp
-    SabWallClockReclaim   \* FALSE = honest observation-based reclaim; TRUE = trust the stamp (rev.6 bug)
+    SabWallClockReclaim,  \* FALSE = honest observation-based reclaim; TRUE = trust the stamp (rev.6 bug)
+    SabEpochGuardOff,     \* FALSE = honest (epoch re-mint from 0 requires mount = None); TRUE drops
+                          \* that guard -- models the pre-fix allocateWriterEpoch
+    SabDecomBlindBypass   \* FALSE = honest (decommission re-mint requires a TERMINAL mount); TRUE =
+                          \* the rejected blind bypass -- mint epoch 1 regardless of mount liveness
+                          \* (the round-3 finding-1 bug)
 
 VARIABLES
     owner,        \* Actors \cup {None}; sticky once non-None
     epoch,        \* 0..MaxEpoch; durable monotone counter (its own object)
+    epochCeiling, \* 2026-07-24 fence-not-rescue gate: history -- monotone high-water mark over
+                  \* every value `epoch` has ever held (mirrors `epoch` on every increase, stays
+                  \* put on every wipe/reset). Purely derived bookkeeping: drives the
+                  \* genesis-vs-wipe guard on `RemintEpoch`/`RemintEpochDecom`/`AllocEpoch`/
+                  \* `ObservedReclaim`/`WallClockReclaim` (`epoch = 0 /\ epochCeiling > 0` means
+                  \* a genuine prior allocation was WIPED, distinct from bare genesis/never-yet-
+                  \* allocated). NOT used by `WriterEpochMonotoneUnique` (an earlier draft tried
+                  \* that and it was wrong -- see that invariant's own comment for why).
+    epochWiped,   \* 2026-07-24: BOOLEAN, history -- TRUE once `WipeEpoch` has EVER fired on
+                  \* this behavior. `WipeEpoch` is a ONE-SHOT-per-trace event: without this
+                  \* guard, `WipeEpoch` composes with `AllocEpoch`/`RemintEpoch`/`RemintEpochDecom`
+                  \* re-minting and wiping again, repeatedly, multiplying the explored state
+                  \* space without adding any new KIND of scenario (a second, third, ... loss
+                  \* is not qualitatively different from the first for what this gate's
+                  \* invariants can distinguish) -- confirmed empirically: `rev6_observe.cfg`
+                  \* reached 179M states generated / 28M distinct with an UNBOUNDED, still-
+                  \* growing queue before this guard. Both negative-control cfgs
+                  \* (`_sab_epochwipelive`, `_sab_decomblindbypass`) stay reachable with a
+                  \* SINGLE wipe (that is what births the same-pair twin); repeated epoch-object
+                  \* loss is out of this gate's modeled scope by deliberate, documented choice
+                  \* (a state-space bound, not a claim that a second loss is safe or unsafe).
     mount,        \* None, or [uuid |-> Actor, epoch |-> Nat, deadline |-> Nat, fenced |-> BOOLEAN]
     mtoken,       \* 0..MaxToken; bumped by EVERY mount write (claim/renew/fence/adopt/reclaim)
     clock,        \* 0..MaxClock; abstract time
@@ -176,7 +202,7 @@ VARIABLES
                         \* the durable counter) had already advanced past the writer's OWN
                         \* `localEpoch[a]` -- i.e. a completed reclaim the writer did not know about
 
-vars == << owner, epoch, mount, mtoken, clock, localEpoch, localLost, crashed, rejected,
+vars == << owner, epoch, epochCeiling, epochWiped, mount, mtoken, clock, localEpoch, localLost, crashed, rejected,
            adoptObs, fencedEpochs, wedged, wrote, rootEmpty, firstOwner,
            lostThenWrote, reclaimed, remountedAfterFence,
            fenceUntil, obsToken, obsSince, observedReclaimEver, supersededThenWrote >>
@@ -184,6 +210,8 @@ vars == << owner, epoch, mount, mtoken, clock, localEpoch, localLost, crashed, r
 Init ==
     /\ owner = None
     /\ epoch = 0
+    /\ epochCeiling = 0
+    /\ epochWiped = FALSE
     /\ mount = None
     /\ mtoken = 0
     /\ clock = 0
@@ -214,7 +242,7 @@ ClaimOwnerEmpty(a) ==
     /\ rootEmpty
     /\ owner' = a
     /\ firstOwner' = IF firstOwner = None THEN a ELSE firstOwner
-    /\ UNCHANGED << epoch, mount, mtoken, clock, localEpoch, localLost, crashed, rejected,
+    /\ UNCHANGED << epochCeiling, epochWiped, epoch, mount, mtoken, clock, localEpoch, localLost, crashed, rejected,
                     adoptObs, fencedEpochs, wedged, wrote, rootEmpty,
                     lostThenWrote, reclaimed, remountedAfterFence,
                     fenceUntil, obsToken, obsSince, observedReclaimEver, supersededThenWrote >>
@@ -225,7 +253,7 @@ RejectForeignOwner(a) ==
     /\ owner # a
     /\ ~rejected[a]
     /\ rejected' = [rejected EXCEPT ![a] = TRUE]
-    /\ UNCHANGED << owner, epoch, mount, mtoken, clock, localEpoch, localLost, crashed,
+    /\ UNCHANGED << epochCeiling, epochWiped, owner, epoch, mount, mtoken, clock, localEpoch, localLost, crashed,
                     adoptObs, fencedEpochs, wedged, wrote, rootEmpty, firstOwner,
                     lostThenWrote, reclaimed, remountedAfterFence,
                     fenceUntil, obsToken, obsSince, observedReclaimEver, supersededThenWrote >>
@@ -250,10 +278,21 @@ AllocEpoch(a) ==
     /\ ~rejected[a] /\ ~wedged[a]
     /\ owner = a
     /\ epoch < MaxEpoch
+    /\ (epoch > 0 \/ epochCeiling = 0)   \* 2026-07-24: the PRESENT-epoch CAS-bump branch --
+                                         \* `epoch = 0 /\ epochCeiling > 0` is a genuine WIPE
+                                         \* of a previously-allocated epoch (the object reads
+                                         \* ABSENT), routed exclusively through the Phase C
+                                         \* absent-epoch branch (`RemintEpoch`/
+                                         \* `RemintEpochDecom`, guarded); bare genesis
+                                         \* (`epochCeiling = 0`, never yet allocated) still
+                                         \* mints here as before (byte-identical to every
+                                         \* pre-existing cfg, none of which could ever reach
+                                         \* `epoch = 0 /\ epochCeiling > 0` before `WipeEpoch`).
     /\ ~(mount # None /\ mount.uuid = a /\ ~mount.fenced)
     /\ epoch' = epoch + 1
+    /\ epochCeiling' = IF epoch' > epochCeiling THEN epoch' ELSE epochCeiling
     /\ localEpoch' = [localEpoch EXCEPT ![a] = epoch + 1]
-    /\ UNCHANGED << owner, mount, mtoken, clock, localLost, crashed, rejected,
+    /\ UNCHANGED << owner, epochWiped, mount, mtoken, clock, localLost, crashed, rejected,
                     adoptObs, fencedEpochs, wedged, wrote, rootEmpty, firstOwner,
                     lostThenWrote, reclaimed, remountedAfterFence,
                     fenceUntil, obsToken, obsSince, observedReclaimEver, supersededThenWrote >>
@@ -335,7 +374,7 @@ ClaimMount(a) ==
     /\ reclaimed' = IF ownExpired THEN [reclaimed EXCEPT ![a] = TRUE] ELSE reclaimed
     /\ remountedAfterFence' =
          IF wasFenced THEN [remountedAfterFence EXCEPT ![a] = TRUE] ELSE remountedAfterFence
-    /\ UNCHANGED << owner, epoch, clock, localEpoch, rejected, fencedEpochs, wedged,
+    /\ UNCHANGED << epochCeiling, epochWiped, owner, epoch, clock, localEpoch, rejected, fencedEpochs, wedged,
                     wrote, rootEmpty, firstOwner, lostThenWrote,
                     obsToken, obsSince, observedReclaimEver, supersededThenWrote >>
 
@@ -368,7 +407,7 @@ Renew(a) ==
                  /\ UNCHANGED << mount, mtoken, fenceUntil >>
        ELSE /\ localLost' = [localLost EXCEPT ![a] = TRUE]
             /\ UNCHANGED << mount, mtoken, fenceUntil >>
-    /\ UNCHANGED << owner, epoch, clock, localEpoch, crashed, rejected, adoptObs, fencedEpochs,
+    /\ UNCHANGED << epochCeiling, epochWiped, owner, epoch, clock, localEpoch, crashed, rejected, adoptObs, fencedEpochs,
                     wedged, wrote, rootEmpty, firstOwner, lostThenWrote, reclaimed,
                     remountedAfterFence, obsToken, obsSince, observedReclaimEver, supersededThenWrote >>
 
@@ -419,7 +458,7 @@ GcFence ==
     /\ mount' = [mount EXCEPT !.fenced = TRUE]
     /\ mtoken' = mtoken + 1
     /\ fencedEpochs' = fencedEpochs \union { << mount.uuid, mount.epoch >> }
-    /\ UNCHANGED << owner, epoch, clock, localEpoch, localLost, crashed, rejected, adoptObs,
+    /\ UNCHANGED << epochCeiling, epochWiped, owner, epoch, clock, localEpoch, localLost, crashed, rejected, adoptObs,
                     wedged, wrote, rootEmpty, firstOwner, lostThenWrote, reclaimed,
                     remountedAfterFence, fenceUntil, obsToken, obsSince, observedReclaimEver, supersededThenWrote >>
 
@@ -441,7 +480,7 @@ AdoptRead(a) ==
             /\ UNCHANGED adoptObs
        ELSE /\ adoptObs' = [adoptObs EXCEPT ![a] = mtoken]
             /\ UNCHANGED localLost
-    /\ UNCHANGED << owner, epoch, mount, mtoken, clock, localEpoch, crashed, rejected,
+    /\ UNCHANGED << epochCeiling, epochWiped, owner, epoch, mount, mtoken, clock, localEpoch, crashed, rejected,
                     fencedEpochs, wedged, wrote, rootEmpty, firstOwner,
                     lostThenWrote, reclaimed, remountedAfterFence,
                     fenceUntil, obsToken, obsSince, observedReclaimEver, supersededThenWrote >>
@@ -508,7 +547,7 @@ AdoptWrite(a) ==
                     ELSE /\ localLost' = [localLost EXCEPT ![a] = TRUE]
                          /\ UNCHANGED wedged
             /\ UNCHANGED << mount, mtoken, fenceUntil >>
-    /\ UNCHANGED << owner, epoch, clock, localEpoch, crashed, rejected, fencedEpochs, wrote,
+    /\ UNCHANGED << epochCeiling, epochWiped, owner, epoch, clock, localEpoch, crashed, rejected, fencedEpochs, wrote,
                     rootEmpty, firstOwner, lostThenWrote, reclaimed, remountedAfterFence,
                     obsToken, obsSince, observedReclaimEver, supersededThenWrote >>
 
@@ -516,7 +555,7 @@ AdoptWrite(a) ==
 Tick ==
     /\ clock < MaxClock
     /\ clock' = clock + 1
-    /\ UNCHANGED << owner, epoch, mount, mtoken, localEpoch, localLost, crashed, rejected,
+    /\ UNCHANGED << epochCeiling, epochWiped, owner, epoch, mount, mtoken, localEpoch, localLost, crashed, rejected,
                     adoptObs, fencedEpochs, wedged, wrote, rootEmpty, firstOwner,
                     lostThenWrote, reclaimed, remountedAfterFence,
                     fenceUntil, obsToken, obsSince, observedReclaimEver, supersededThenWrote >>
@@ -531,7 +570,7 @@ Die(a) ==
     /\ mount.uuid = a
     /\ crashed' = [crashed EXCEPT ![a] = TRUE]
     /\ adoptObs' = [adoptObs EXCEPT ![a] = None]
-    /\ UNCHANGED << owner, epoch, mount, mtoken, clock, localEpoch, localLost, rejected,
+    /\ UNCHANGED << epochCeiling, epochWiped, owner, epoch, mount, mtoken, clock, localEpoch, localLost, rejected,
                     fencedEpochs, wedged, wrote, rootEmpty, firstOwner,
                     lostThenWrote, reclaimed, remountedAfterFence,
                     fenceUntil, obsToken, obsSince, observedReclaimEver, supersededThenWrote >>
@@ -586,7 +625,7 @@ Write(a) ==
     /\ rootEmpty' = FALSE
     /\ lostThenWrote' = (lostThenWrote \/ localLost[a])
     /\ supersededThenWrote' = (supersededThenWrote \/ trulySuperseded)
-    /\ UNCHANGED << owner, epoch, mount, mtoken, clock, localEpoch, localLost, crashed, rejected,
+    /\ UNCHANGED << epochCeiling, epochWiped, owner, epoch, mount, mtoken, clock, localEpoch, localLost, crashed, rejected,
                     adoptObs, fencedEpochs, wedged, firstOwner, reclaimed,
                     remountedAfterFence, fenceUntil, obsToken, obsSince, observedReclaimEver >>
 
@@ -597,7 +636,7 @@ SabResetEpoch ==
     /\ mount = None
     /\ epoch > 0
     /\ epoch' = 0
-    /\ UNCHANGED << owner, mount, mtoken, clock, localEpoch, localLost, crashed, rejected,
+    /\ UNCHANGED << epochCeiling, epochWiped, owner, mount, mtoken, clock, localEpoch, localLost, crashed, rejected,
                     adoptObs, fencedEpochs, wedged, wrote, rootEmpty, firstOwner,
                     lostThenWrote, reclaimed, remountedAfterFence,
                     fenceUntil, obsToken, obsSince, observedReclaimEver, supersededThenWrote >>
@@ -623,7 +662,7 @@ ClearExpiredMount ==
     /\ ~mount.fenced
     /\ mount.deadline + Drift <= clock
     /\ mount' = None
-    /\ UNCHANGED << owner, epoch, mtoken, clock, localEpoch, localLost, crashed, rejected,
+    /\ UNCHANGED << epochCeiling, epochWiped, owner, epoch, mtoken, clock, localEpoch, localLost, crashed, rejected,
                     adoptObs, fencedEpochs, wedged, wrote, rootEmpty, firstOwner,
                     lostThenWrote, reclaimed, remountedAfterFence,
                     fenceUntil, obsToken, obsSince, observedReclaimEver, supersededThenWrote >>
@@ -638,7 +677,7 @@ StartObservation ==
     /\ obsToken = None
     /\ obsToken' = mtoken
     /\ obsSince' = clock
-    /\ UNCHANGED << owner, epoch, mount, mtoken, clock, localEpoch, localLost, crashed, rejected,
+    /\ UNCHANGED << epochCeiling, epochWiped, owner, epoch, mount, mtoken, clock, localEpoch, localLost, crashed, rejected,
                     adoptObs, fencedEpochs, wedged, wrote, rootEmpty, firstOwner,
                     lostThenWrote, reclaimed, remountedAfterFence, fenceUntil,
                     observedReclaimEver, supersededThenWrote >>
@@ -679,13 +718,15 @@ ObservedReclaim ==
     /\ obsToken # None /\ obsToken = mtoken            \* token stable since obsSince
     /\ clock - obsSince >= TTL + Drift                 \* full rate-bound wait on OUR clock
     /\ epoch < MaxEpoch
+    /\ (epoch > 0 \/ epochCeiling = 0)   \* see AllocEpoch's identical guard/comment
     /\ mtoken < MaxToken
     /\ epoch' = epoch + 1
+    /\ epochCeiling' = IF epoch' > epochCeiling THEN epoch' ELSE epochCeiling
     /\ mtoken' = mtoken + 1
     /\ mount' = [uuid |-> mount.uuid, epoch |-> epoch', deadline |-> clock + TTL, fenced |-> FALSE]
     /\ obsToken' = None
     /\ observedReclaimEver' = TRUE
-    /\ UNCHANGED << owner, clock, localEpoch, localLost, crashed, rejected,
+    /\ UNCHANGED << owner, epochWiped, clock, localEpoch, localLost, crashed, rejected,
                     adoptObs, fencedEpochs, wedged, wrote, rootEmpty, firstOwner, lostThenWrote,
                     reclaimed, remountedAfterFence, fenceUntil, obsSince, supersededThenWrote >>
 
@@ -712,14 +753,115 @@ WallClockReclaim ==
     /\ SabWallClockReclaim
     /\ mount # None /\ clock > mount.deadline
     /\ epoch < MaxEpoch
+    /\ (epoch > 0 \/ epochCeiling = 0)   \* see AllocEpoch's identical guard/comment
     /\ mtoken < MaxToken
     /\ epoch' = epoch + 1
+    /\ epochCeiling' = IF epoch' > epochCeiling THEN epoch' ELSE epochCeiling
     /\ mtoken' = mtoken + 1
     /\ mount' = [uuid |-> mount.uuid, epoch |-> epoch', deadline |-> clock + TTL, fenced |-> FALSE]
-    /\ UNCHANGED << owner, clock, localEpoch, localLost, crashed, rejected,
+    /\ UNCHANGED << owner, epochWiped, clock, localEpoch, localLost, crashed, rejected,
                     adoptObs, fencedEpochs, wedged, wrote, rootEmpty, firstOwner, lostThenWrote,
                     reclaimed, remountedAfterFence, fenceUntil, obsToken, obsSince,
                     observedReclaimEver, supersededThenWrote >>
+
+\* --- 2026-07-24 fence-not-rescue gate (spec rev.4): the epoch-wipe twin + re-mint guard ---
+\* WipeEpoch: environmental sabotage-adjacent action (always enabled, subject to the
+\* ONE-SHOT-per-behavior `~epochWiped` guard below -- the environment can lose the durable
+\* epoch OBJECT at any time, independent of any Sab flag: this models a genuine data-loss
+\* event, e.g. the keeper znode/S3 object backing `epoch` vanishing or being recreated empty).
+\* The QUESTION this task's guard answers is not "can the epoch object be lost" (yes, always)
+\* but "is re-minting OVER that loss, while a mount may still be live, guarded" -- see
+\* `RemintEpoch` below.
+\*
+\* `~epochWiped` (state-space bound, not a safety claim): without this, `WipeEpoch` composes
+\* with subsequent re-mints (`AllocEpoch`/`RemintEpoch`/`RemintEpochDecom`) to wipe again,
+\* repeatedly, multiplying the explored state space with no new KIND of scenario -- confirmed
+\* empirically (`rev6_observe.cfg` reached 179M states generated / 28M distinct with an
+\* unbounded, still-growing queue before this guard was added). Both negative-control cfgs
+\* (`_sab_epochwipelive`, `_sab_decomblindbypass`) stay reachable with a SINGLE wipe (that is
+\* what births the same-pair twin); repeated epoch-object loss within one behavior is out of
+\* this gate's modeled scope by deliberate, documented choice (see `epochWiped`'s own comment).
+WipeEpoch ==
+    /\ ~epochWiped
+    /\ epoch > 0
+    /\ epoch' = 0
+    /\ epochWiped' = TRUE
+    /\ UNCHANGED << epochCeiling, owner, mount, mtoken, clock, localEpoch, localLost, crashed, rejected,
+                    adoptObs, fencedEpochs, wedged, wrote, rootEmpty, firstOwner,
+                    lostThenWrote, reclaimed, remountedAfterFence,
+                    fenceUntil, obsToken, obsSince, observedReclaimEver, supersededThenWrote >>
+
+\* RemintEpoch: the code's absent-epoch branch of `allocateWriterEpoch` -- distinct from
+\* `AllocEpoch` above, which models the CAS bump over a PRESENT epoch object. Fires only when
+\* the durable counter reads 0 (freshly lost, e.g. by `WipeEpoch`). `SabEpochGuardOff = FALSE`
+\* (honest): the Phase C guard requires `mount = None` -- an authoritative record that no
+\* mount can possibly be live for this server_root, so nothing gets orphaned/duplicated by
+\* the re-mint. `SabEpochGuardOff = TRUE` (sabotage) drops that guard: the pre-fix
+\* `allocateWriterEpoch` re-mints epoch 1 unconditionally whenever it reads 0, including
+\* while `mount # None` still holds a live (unfenced) incarnation.
+RemintEpoch(a) ==
+    /\ ~rejected[a] /\ ~wedged[a]
+    /\ owner = a
+    /\ epoch = 0
+    /\ epochCeiling > 0   \* a genuine WIPE of a previously-allocated epoch, not bare genesis
+                          \* (epoch = 0 alone is ambiguous with "never yet allocated" -- the
+                          \* pre-existing `ClaimMount(mount=None /\ strictOK)` bootstrap path
+                          \* already covers genuine first-ever allocation via `AllocEpoch`)
+    /\ (SabEpochGuardOff \/ mount = None)   \* the Phase C guard: authoritative mount absence
+    /\ epoch' = 1
+    /\ epochCeiling' = IF epoch' > epochCeiling THEN epoch' ELSE epochCeiling
+    /\ localEpoch' = [localEpoch EXCEPT ![a] = 1]
+    /\ UNCHANGED << owner, epochWiped, mount, mtoken, clock, localLost, crashed, rejected,
+                    adoptObs, fencedEpochs, wedged, wrote, rootEmpty, firstOwner,
+                    lostThenWrote, reclaimed, remountedAfterFence,
+                    fenceUntil, obsToken, obsSince, observedReclaimEver, supersededThenWrote >>
+
+\* RemintEpochDecom: Phase C's `DecommissionRecovery` branch -- also re-mints over a lost
+\* (epoch = 0) durable counter, but ONLY when a mount record still exists (`mount # None`,
+\* the decommission-recovery precondition: this actor is reconciling a mount object left
+\* behind by a prior incarnation). Honest (`SabDecomBlindBypass = FALSE`): the re-mint is
+\* permitted ONLY over a TERMINAL mount (fenced, or wall-clock expired) and mints strictly
+\* PAST the terminal mount's own epoch (`mount.epoch + 1`, distinct by construction -- never
+\* reuses the terminal incarnation's epoch value). Sabotage
+\* (`SabDecomBlindBypass = TRUE`, the round-3 finding-1 bug): mints epoch 1 unconditionally,
+\* regardless of whether the mount is still LIVE.
+RemintEpochDecom(a) ==
+    /\ ~rejected[a] /\ ~wedged[a]
+    /\ owner = a
+    /\ epoch = 0
+    /\ epochCeiling > 0   \* a genuine WIPE of a previously-allocated epoch, not bare genesis
+                          \* (see RemintEpoch's identical guard for the rationale)
+    /\ crashed[a]         \* decommission is ALWAYS performed on behalf of a presumed-dead
+                          \* identity (`openForDecommission` derives the victim uuid FROM a
+                          \* surviving mount left behind by a DIFFERENT process/run -- never
+                          \* the same still-live process examining its own in-flight mount).
+                          \* This model has no separate "decommission operator" identity
+                          \* distinct from `Actors` (round-3 finding-5's actor-uuid caveat),
+                          \* so `crashed[a]` (the model's existing "this process genuinely
+                          \* died, a fresh incarnation is now running" marker -- see
+                          \* `ClaimMount`'s own comment on `crashed`-reset-on-reclaim) is the
+                          \* faithful proxy: without it, TLC finds a spurious self-decommission
+                          \* on a's OWN still-in-sync, actively-serviced mount purely because
+                          \* the wall clock passed its deadline (a beat-blocked-but-alive
+                          \* incarnation, exactly the case `Renew`'s late-renewal already
+                          \* handles safely elsewhere) -- not the genuine abandoned-slot
+                          \* scenario this action exists to model.
+    /\ mount # None
+    /\ IF SabDecomBlindBypass
+       THEN epoch' = 1                                  \* the round-3 finding-1 bug
+       ELSE /\ mount.fenced \/ mount.deadline + Drift <= clock  \* TERMINAL, Drift-aware:
+                                                                 \* an OBSERVER-side death
+                                                                 \* verdict (see `GcFence`/
+                                                                 \* `ClearExpiredMount`'s
+                                                                 \* identical convention)
+            /\ mount.epoch < MaxEpoch                    \* TLC finiteness (mirrors AllocEpoch)
+            /\ epoch' = mount.epoch + 1                 \* distinct by construction
+    /\ epochCeiling' = IF epoch' > epochCeiling THEN epoch' ELSE epochCeiling
+    /\ localEpoch' = [localEpoch EXCEPT ![a] = epoch']
+    /\ UNCHANGED << owner, epochWiped, mount, mtoken, clock, localLost, crashed, rejected,
+                    adoptObs, fencedEpochs, wedged, wrote, rootEmpty, firstOwner,
+                    lostThenWrote, reclaimed, remountedAfterFence,
+                    fenceUntil, obsToken, obsSince, observedReclaimEver, supersededThenWrote >>
 
 Next ==
     \/ Tick
@@ -738,6 +880,9 @@ Next ==
     \/ StartObservation
     \/ ObservedReclaim
     \/ WallClockReclaim
+    \/ WipeEpoch
+    \/ \E a \in Actors : RemintEpoch(a)
+    \/ \E a \in Actors : RemintEpochDecom(a)
 
 Spec == Init /\ [][Next]_vars
 
@@ -745,6 +890,8 @@ Spec == Init /\ [][Next]_vars
 TypeOK ==
     /\ owner \in Actors \union {None}
     /\ epoch \in 0..MaxEpoch
+    /\ epochCeiling \in 0..MaxEpoch
+    /\ epochWiped \in BOOLEAN
     /\ mtoken \in 0..MaxToken
     /\ clock \in 0..MaxClock
     /\ \/ mount = None
@@ -783,6 +930,19 @@ ForeignUuidNeverAutoTakesOver ==
 \*  (1) no two distinct actors share a written epoch;
 \*  (2) the durable `epoch` counter is a monotone ceiling over every written
 \*      epoch -- it only ever grows, so a written epoch can never exceed it.
+\* 2026-07-24 fence-not-rescue gate: NOTE -- an earlier draft of this task's change read
+\* `epochCeiling` (the monotone high-water mark) here instead of the live `epoch`, to tolerate
+\* an honest `WipeEpoch` with no consequential re-mint. That draft was WRONG: it also made the
+\* PRE-EXISTING `SabResetEpoch` sabotage (`CaCasMountCore_sab_epochreset.cfg`) undetectable by
+\* this conjunct, since `SabResetEpoch` zeroes `epoch` the identical way `WipeEpoch` does and
+\* `epochCeiling` is deliberately immune to both -- a real regression (old RED silently turned
+\* GREEN), caught by re-running the full battery per Step 5. Reverted to the ORIGINAL raw
+\* `epoch` reading, unchanged from every pre-existing round. `WipeEpoch`'s honest false-alarm
+\* on this exact conjunct is instead accepted and documented at the cfg level (see
+\* `CaCasMountCore_stage1.cfg`'s own comment, alongside `FenceCostsEpoch` for the identical
+\* underlying reason: an ungated epoch-zeroing action, honest or not, makes this conjunct
+\* momentarily unable to distinguish "temporarily inconsistent, self-healing" from "genuinely
+\* corrupted" -- exactly the design spec's own "Residual hole, honestly stated").
 WriterEpochMonotoneUnique ==
     /\ \A x \in wrote : \A y \in wrote : (x[2] = y[2]) => (x[1] = y[1])
     /\ \A x \in wrote : x[2] <= epoch
