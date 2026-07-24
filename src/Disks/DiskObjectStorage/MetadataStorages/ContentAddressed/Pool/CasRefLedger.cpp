@@ -1251,36 +1251,78 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
         table_live = rt->state.getLifecycle() == RefLifecycle::Live;
     }
 
+    /// Two-phase carve (spec §2). The old carve popped from `pending` while interleaving the allocating
+    /// `seen_refs`/`batch` growth and only recorded the batch into `owned_items` afterwards, so any throw
+    /// after the first pop stranded already-popped items -- neither in `pending` nor in `owned_items` --
+    /// and their waiters hung forever. Instead:
+    ///   PLAN (may throw, mutates NOTHING): under `ref_queue_mutex`, scan `pending` WITHOUT popping and
+    ///   build the selection count, reserving every container (`batch`, `owned_items`) that the publish
+    ///   below grows. A throw here leaves `pending`/`owned_items` byte-for-byte unchanged, so the
+    ///   leadership-exit guard completes only the leader's own item and the untouched followers stay
+    ///   queued for a later leader.
+    ///   PUBLISH (no-throw): still under the SAME continuous `ref_queue_mutex` hold (no TOCTOU by
+    ///   construction), pop the selected front items and append them to `batch` and `owned_items` using
+    ///   only non-throwing operations (capacity pre-reserved; `shared_ptr` copies and `deque::pop_front`
+    ///   never throw). ProfileEvents increments are deferred past the plan so the plan is literally
+    ///   non-mutating.
     std::vector<std::shared_ptr<RefMutationItem>> batch;
     {
         std::lock_guard<std::mutex> g(ref_queue_mutex);
         const size_t cap = table_live ? kMaxRefBatch : 1;
+
+        /// --- PLAN ---
         std::set<String> seen_refs;
-        while (!rt->pending.empty() && batch.size() < cap)
+        size_t selected = 0;         /// contiguous front items to carve
+        bool scope_cut = false;      /// a duplicate ref name ended the selection early
+        for (const auto & candidate : rt->pending)
         {
-            const auto & front = rt->pending.front();
-            if (front->scope.kind == MutationScope::Kind::WholeShard)
+            if (selected >= cap)
+                break;
+            if (candidate->scope.kind == MutationScope::Kind::WholeShard)
             {
-                if (!batch.empty())
+                /// A whole-shard mutation carves solo -- it may only be the FIRST (and then only) item.
+                if (selected != 0)
                     break;
-                batch.push_back(front);
-                rt->pending.pop_front();
+                if (carve_hook_for_test)
+                    carve_hook_for_test(CarvePhaseForTest::PlanBatchGrow);
+                batch.reserve(1);
+                ++selected;
                 break;
             }
-            if (!seen_refs.insert(front->scope.ref_name).second)
+            if (carve_hook_for_test)
+                carve_hook_for_test(CarvePhaseForTest::PlanSeenRefs);
+            if (!seen_refs.insert(candidate->scope.ref_name).second)
             {
-                ProfileEvents::increment(ProfileEvents::CasRefBatchScopeCuts);
+                scope_cut = true;
                 break;
             }
-            batch.push_back(front);
+            if (carve_hook_for_test)
+                carve_hook_for_test(CarvePhaseForTest::PlanBatchGrow);
+            batch.reserve(selected + 1);
+            ++selected;
+        }
+        /// Reserve the leader's responsibility set for the whole selection BEFORE any pop, so the publish
+        /// append below cannot throw. `owned_items` already holds the leader's own item (recorded by
+        /// `appendRefOps`), which the carve re-adds as it re-appears at the front of `pending` -- a
+        /// harmless idempotent double-listing the guard tolerates, matching the pre-fix behavior.
+        if (carve_hook_for_test)
+            carve_hook_for_test(CarvePhaseForTest::PlanReserveOwned);
+        owned_items.reserve(owned_items.size() + selected);
+
+        /// --- PUBLISH (no-throw) ---
+        if (carve_hook_for_test)
+            carve_hook_for_test(CarvePhaseForTest::PublishPop);
+        for (size_t i = 0; i < selected; ++i)
+        {
+            batch.push_back(rt->pending.front());        /// shared_ptr copy, capacity reserved
+            owned_items.push_back(rt->pending.front());  /// same item into the responsibility set
             rt->pending.pop_front();
         }
+
+        /// Deferred past the plan (spec §2) so the plan phase performs no observable mutation.
+        if (scope_cut)
+            ProfileEvents::increment(ProfileEvents::CasRefBatchScopeCuts);
     }
-    /// Record everything this flush just carved into the leader's responsibility set BEFORE any further
-    /// step can throw: the leadership-exit guard (`completeOwnedItemsAndReleaseLeadership`) must be able to
-    /// complete + de-pend each carved item on ANY exceptional exit below, so none is ever left half-carved
-    /// (removed from `pending` yet never completed) with a waiter blocked forever.
-    owned_items.insert(owned_items.end(), batch.begin(), batch.end());
     if (batch.empty())
         return;   /// raced: everything was carved by a previous flush of this leader
 
@@ -1351,8 +1393,21 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
                 trial_id.ref_sequence += 1;
                 applyRefLogTxn(item_scratch, RefLogTxn{ns.string(), trial_id, {op}});
             }
+            /// Reserve the growth of BOTH accumulators BEFORE this item's effects are published. These
+            /// reservations are the ONLY remaining throwing steps; once they succeed the publish below is
+            /// no-throw -- `working`'s move-assignment is `noexcept`, and the `RefOp` moves and the
+            /// `shared_ptr` copy land in pre-reserved capacity. Before the fix, `working` was moved and
+            /// `final_ops` appended before these allocations, so a failure here left a failed item applied
+            /// to `working` (corrupting later items' validation) and -- when the throw fell between the
+            /// two accumulator writes -- its ops already in the durably-committed transaction while its
+            /// own caller was told the append failed.
+            final_ops.reserve(final_ops.size() + item_ops.size());
+            survivors.reserve(survivors.size() + 1);
+            if (carve_hook_for_test)
+                carve_hook_for_test(CarvePhaseForTest::ValidateFinalOps);
             working = std::move(item_scratch);
-            final_ops.insert(final_ops.end(), item_ops.begin(), item_ops.end());
+            for (RefOp & op : item_ops)
+                final_ops.push_back(std::move(op));
             survivors.push_back(it);
         }
         catch (...)

@@ -189,6 +189,17 @@ public:
     /// Installs the test hook invoked immediately before the leader carves a compatible batch.
     void setRefPreCarveHookForTest(std::function<void()> hook) { ref_pre_carve_hook_for_test = std::move(hook); }
 
+    /// Test-only fault seam for the two-phase carve/validation protocol (same `*ForTest` pattern as
+    /// `setRefPreCarveHookForTest`). `flushRefBatch` fires the hook at each named point of the carve's
+    /// plan/publish phases and of the per-item validation loop, so a test can inject `std::bad_alloc`
+    /// and assert the append queue and the batch-validation `working` state stay intact. `PlanSeenRefs`,
+    /// `PlanBatchGrow` and `PlanReserveOwned` fire in the non-mutating PLAN phase (nothing has been
+    /// popped yet); `PublishPop` fires at the start of the no-throw PUBLISH phase; `ValidateFinalOps`
+    /// fires once per admitted item, at the last throwing point before that item's effects are published
+    /// into `working`/`final_ops`. Null in production.
+    enum class CarvePhaseForTest { PlanSeenRefs, PlanBatchGrow, PlanReserveOwned, PublishPop, ValidateFinalOps };
+    void setCarveHookForTest(std::function<void(CarvePhaseForTest)> hook) { carve_hook_for_test = std::move(hook); }
+
     /// Returns the number of queued mutations for `ns` under the queue mutex.
     size_t refQueuePendingForTest(const RootNamespace & ns)
     {
@@ -399,6 +410,10 @@ private:
 
     /// Test-only hook called before a compatible append batch is carved; null in production.
     std::function<void()> ref_pre_carve_hook_for_test;
+
+    /// Test-only hook fired at each carve/validation phase point (see `CarvePhaseForTest`); null in
+    /// production.
+    std::function<void(CarvePhaseForTest)> carve_hook_for_test;
 
     /// Returns the cached runtime for `ns`, creating an empty unrecovered runtime when needed.
     std::shared_ptr<RefTableRuntime> getRefTableRuntime(const RootNamespace & ns);

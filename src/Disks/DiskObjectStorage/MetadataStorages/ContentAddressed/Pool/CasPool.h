@@ -788,6 +788,13 @@ public:
     /// caller's item join `rt->pending` before the carve, forcing deterministic co-batching.
     void setRefPreCarveHookForTest(std::function<void()> hook) { ref_ledger.setRefPreCarveHookForTest(std::move(hook)); }
 
+    /// Test-only: fault seam for the ref-flush two-phase carve/validation protocol; forwards to
+    /// `CasRefLedger::setCarveHookForTest` (see it for the phase-point contract).
+    void setCarveHookForTest(std::function<void(CasRefLedger::CarvePhaseForTest)> hook)
+    {
+        ref_ledger.setCarveHookForTest(std::move(hook));
+    }
+
     /// Test-only: replace the request controller's inter-attempt backoff sleep (e.g. with a no-op) —
     /// for tests that drive a persistent conditional-write fault to budget exhaustion through a fully
     /// wired Pool/disk and must not serve the production capped-exponential sleeps for real (see
