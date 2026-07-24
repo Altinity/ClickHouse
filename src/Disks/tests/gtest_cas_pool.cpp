@@ -1528,6 +1528,10 @@ TEST(CasMountTmat, UncleanOpenWaitsMaterializationGrace)
     /// `gc_fenced`, so the successor below has no certificate of death until it observes one itself.
     ASSERT_EQ(claimMount(*b, l, "test", UInt128(1), /*epoch*/ 7, /*now_ms*/ 1000, /*ttl_ms*/ 500).kind,
               MountClaimResult::Claimed);
+    /// A real predecessor at epoch 7 durably minted it first (`allocateWriterEpoch` always runs
+    /// before the mount claim); seed that durable epoch object here too, or the successor's own
+    /// `allocateWriterEpoch` trips the Phase C guard (epoch absent, mount present -> fail closed).
+    b->putIfAbsent(l.epochKey("test"), encodeServerEpoch(ServerEpoch{.next_writer_epoch = 8}));
 
     /// A 500ms lease TTL is far below the default `cas_request_budget` (RFC
     /// cas-s3-timeout-retry-control §required-timeout-model requires attempt_timeout + safety_margin <
@@ -1593,6 +1597,10 @@ TEST(CasMountTmat, FencedPriorPaysOnlyTmat)
     Layout l{"p"};
     ASSERT_EQ(claimMount(*b, l, "test", UInt128(1), /*epoch*/ 7, /*now_ms*/ 1000, /*ttl_ms*/ 500).kind,
               MountClaimResult::Claimed);
+    /// A real predecessor at epoch 7 durably minted it first (`allocateWriterEpoch` always runs
+    /// before the mount claim); seed that durable epoch object here too, or the successor's own
+    /// `allocateWriterEpoch` trips the Phase C guard (epoch absent, mount present -> fail closed).
+    b->putIfAbsent(l.epochKey("test"), encodeServerEpoch(ServerEpoch{.next_writer_epoch = 8}));
     /// Predecessor lease carries gc_fenced=true: fence it directly, exactly as `computeHeartbeatFloor`'s
     /// fence-out does (preserve the body, gc_fenced = true, seq + 1, token-guarded).
     fenceOutMount(*b, l.mountKey("test"));
@@ -1671,6 +1679,10 @@ TEST(CasPool, StartupArmRedoesLeaseWriteWhenGraceConsumesTtl)
         prior.gc_fenced = true;
         backend->putIfAbsent(layout.mountKey(srid), DB::Cas::encodeMountLease(prior));
     }
+    /// A real predecessor at epoch 7 durably minted it first (`allocateWriterEpoch` always runs
+    /// before the mount claim); seed that durable epoch object here too, or `Pool::open`'s own
+    /// `allocateWriterEpoch` trips the Phase C guard (epoch absent, mount present -> fail closed).
+    backend->putIfAbsent(layout.epochKey(srid), DB::Cas::encodeServerEpoch(DB::Cas::ServerEpoch{.next_writer_epoch = 8}));
     /// The mount-lease seed above makes the pool prefix non-empty before `Pool::open` runs its own
     /// bootstrap check; establish `_pool_meta` first (Task 7 zero-write bootstrap), exactly as the
     /// other pre-seeded-mount tests in this file do (e.g. `FencedPriorPaysOnlyTmat`).

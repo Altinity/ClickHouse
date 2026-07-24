@@ -252,14 +252,35 @@ std::optional<UInt128> readOwnerUuid(Backend & b, const Layout & l, const String
 /// The owner object is never deleted and never reassigned to a different UUID.
 void claimOwnerOrThrow(Backend & b, const Layout & l, const String & srid, UInt128 our_uuid);
 
+/// Which mint policy governs `allocateWriterEpoch`'s absent-epoch branch (see below).
+enum class EpochMintPolicy : uint8_t
+{
+    NormalMount,            /// absent-epoch re-mint requires authoritative mount absence
+    DecommissionRecovery,   /// absent-epoch re-mint requires a TERMINAL mount; mints a distinct epoch
+};
+
 /// Allocate the next durable-monotone `writer_epoch` by CAS-bumping the sticky `epoch` object
 /// (`ServerEpoch{next_writer_epoch}`), returning the value the caller adopts as its writer_epoch.
 ///   - `epoch` absent AND the subtree is non-empty → throw `CORRUPTED_DATA` (missing epoch over
 ///     data is a reset hazard);
-///   - `epoch` absent AND the subtree is empty → start at 0;
+///   - `epoch` absent AND the subtree is empty →  the absent-epoch branch is a LIFECYCLE decision,
+///     so it uses `probeSentinelRaw`'s authoritative outcomes, never plain `get`-absence (which
+///     flattens transport faults into "not found"), to decide whether the mount object is really
+///     gone:
+///       - `KeyAbsent` → authoritative absence, mint epoch 1 (fresh-root bootstrap);
+///       - `Present`, `policy == NormalMount` → throw `CORRUPTED_DATA` (durable epoch state was
+///         lost while a mount is live or recently live — refusing to re-mint epoch 1 there is how a
+///         same-(uuid, epoch) twin is avoided);
+///       - `Present`, `policy == DecommissionRecovery` → the surviving mount must be TERMINAL (not
+///         live); a live member throws `ABORTED`, otherwise mint `surviving.writer_epoch + 1` —
+///         distinct from the survivor's by construction (`now_ms` is required, nonzero, here);
+///       - anything else (`ContainerAbsent`/`AccessDenied`/`Indeterminate`) → throw
+///         `CORRUPTED_DATA` (absence was never proven; fail closed);
 ///   - otherwise read `next = current.next_writer_epoch`, `casPut` `{next + 1}` against the
 ///     observed token, retry on `Conflict` (bounded), and return `next`.
-uint64_t allocateWriterEpoch(Backend & b, const Layout & l, const String & srid);
+uint64_t allocateWriterEpoch(Backend & b, const Layout & l, const String & srid,
+                             EpochMintPolicy policy = EpochMintPolicy::NormalMount,
+                             uint64_t now_ms = 0);   /// now_ms: required (nonzero) for DecommissionRecovery
 
 /// Which certificate of death justified a same-uuid, different-epoch mount reclaim. `None` when no
 /// reclaim of that kind happened (a fresh claim, a

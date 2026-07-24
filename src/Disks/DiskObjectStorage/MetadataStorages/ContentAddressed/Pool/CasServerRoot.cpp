@@ -10,6 +10,7 @@
 #include <Common/setThreadName.h>
 #include <base/getFQDNOrHostName.h>
 #include <fmt/format.h>
+#include <magic_enum.hpp>
 
 #include <algorithm>
 #include <ctime>
@@ -55,6 +56,10 @@ uint64_t defaultBootMs()
     clock_gettime(CLOCK_BOOTTIME, &ts);
     return static_cast<uint64_t>(ts.tv_sec) * 1000 + static_cast<uint64_t>(ts.tv_nsec) / 1000000;
 }
+
+/// Forward declaration: defined below (same TU-unique anonymous namespace) — `allocateWriterEpoch`
+/// names the current mount holder in its DecommissionRecovery live-refusal message.
+String describeMountHolder(const MountLease & m);
 
 std::optional<OwnerObject> readOwnerObject(Backend & b, const Layout & l, const String & server_root_id)
 {
@@ -157,7 +162,7 @@ void claimOwnerOrThrow(Backend & b, const Layout & l, const String & srid, UInt1
         srid);
 }
 
-uint64_t allocateWriterEpoch(Backend & b, const Layout & l, const String & srid)
+uint64_t allocateWriterEpoch(Backend & b, const Layout & l, const String & srid, EpochMintPolicy policy, uint64_t now_ms)
 {
     const String key = l.epochKey(srid);
 
@@ -182,10 +187,52 @@ uint64_t allocateWriterEpoch(Backend & b, const Layout & l, const String & srid)
                     "CAS server-root '{}' has no durable epoch object but its data subtree is "
                     "non-empty (writer_epoch reset hazard) — refusing to proceed",
                     srid);
-            /// Fresh empty root: reserve 0 as a sentinel (0 means "no epoch", UINT64_MAX is the
-            /// retired sentinel), so the first epoch handed out is 1 — matching the random
-            /// `process_epoch` draw (CasPool.cpp re-draws on 0): the first allocated epoch is 1.
-            current.next_writer_epoch = 1;
+
+            /// Same hazard through the CONTROL objects (spec rev.4 Phase C): an absent epoch while
+            /// a mount object exists means epoch state was lost under a live/recent mount —
+            /// re-minting epoch 1 there is how a same-(uuid, epoch) twin is born. This is a
+            /// lifecycle decision, so it uses the authoritative probe, never get-absence.
+            const SentinelProbeResult mount_probe = b.probeSentinelRaw(l.mountKey(srid));
+            switch (mount_probe.outcome)
+            {
+                case ProbeOutcome::KeyAbsent:
+                    break;   /// authoritative absence — fresh-root bootstrap proceeds below
+                case ProbeOutcome::Present:
+                {
+                    if (policy == EpochMintPolicy::DecommissionRecovery)
+                    {
+                        chassert(now_ms != 0);   /// the decommission caller must pass its clock
+                        const MountLease surviving = decodeMountLease(*mount_probe.body);
+                        const bool live = !surviving.gc_fenced && surviving.expires_at_ms > now_ms;
+                        if (live)
+                            throw Exception(ErrorCodes::ABORTED,
+                                "CAS decommission '{}': epoch object missing but a LIVE mount lease "
+                                "exists ({}) — refusing to re-mint an epoch under a live member "
+                                "(stop the server or wait for its lease to lapse)",
+                                srid, describeMountHolder(surviving));
+                        /// Terminal mount: proceed, but mint an epoch DISTINCT from the survivor's
+                        /// by construction — the same-pair state is unrepresentable on this path.
+                        current.next_writer_epoch = std::max<uint64_t>(1, surviving.writer_epoch + 1);
+                        break;
+                    }
+                    throw Exception(ErrorCodes::CORRUPTED_DATA,
+                        "CAS server-root '{}' has no durable epoch object but a mount lease exists — "
+                        "durable epoch state was lost while a mount is live or recently live; "
+                        "refusing to re-mint epoch 1. If no server is live on this root, "
+                        "decommission it or manually remove the stale mount object '{}'.",
+                        srid, l.mountKey(srid));
+                }
+                case ProbeOutcome::ContainerAbsent:
+                case ProbeOutcome::AccessDenied:
+                case ProbeOutcome::Indeterminate:
+                    throw Exception(ErrorCodes::CORRUPTED_DATA,
+                        "CAS server-root '{}': cannot verify mount-lease absence before re-minting "
+                        "the writer epoch (probe outcome: {}) — absence was never proven; failing closed",
+                        srid, magic_enum::enum_name(mount_probe.outcome));
+            }
+
+            if (current.next_writer_epoch == 0)
+                current.next_writer_epoch = 1;
         }
 
         const uint64_t next = current.next_writer_epoch;

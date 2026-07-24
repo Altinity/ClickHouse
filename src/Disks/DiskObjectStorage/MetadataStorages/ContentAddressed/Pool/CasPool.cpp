@@ -485,6 +485,15 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
     ///    non-empty subtree is CORRUPTED_DATA; a fresh empty root is claimed.
     claimOwnerOrThrow(*store->pool_backend, store->pool_layout, srid, our_uuid);
 
+    /// Wall-clock `now_ms`, hoisted above the writer_epoch allocation below: the absent-epoch
+    /// branch's `DecommissionRecovery` policy needs it to judge a surviving mount's liveness before
+    /// the mount-lease claim (step 4) gets its own use of the same clock.
+    const auto now_ms = []() -> uint64_t
+    {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    };
+
     /// 3. Durable-monotone writer_epoch — CAS-bump the sticky `epoch` object. THE BRIDGE: this
     ///    durable value REPLACES the random `process_epoch` for identity, so the watermark + every
     ///    manifest ref carries it (the random mint above stays for the read-only
@@ -492,15 +501,18 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
     /// Mutable: a GC fence of our fresh lease during open (expiry mid-open racing a GC round) is
     /// recoverable — a fence costs an epoch, so the fence-recovery loop below re-allocates a fresh
     /// writer_epoch and re-claims (the TLA+-checked `NoPermanentWedge` invariant).
-    uint64_t writer_epoch = allocateWriterEpoch(*store->pool_backend, store->pool_layout, srid);
+    /// `epoch_policy`: `openForDecommission`'s `NoWait` gates the absent-epoch branch's mount-probe
+    /// on a TERMINAL (not live) surviving mount instead of authoritative absence (Phase C) — passed
+    /// uniformly to every call below, including the fence-recovery re-allocations, where it is inert
+    /// because those run with the epoch object already present.
+    const EpochMintPolicy epoch_policy = (policy == MountClaimPolicy::NoWait)
+        ? EpochMintPolicy::DecommissionRecovery
+        : EpochMintPolicy::NormalMount;
+    uint64_t writer_epoch = allocateWriterEpoch(*store->pool_backend, store->pool_layout, srid, epoch_policy, now_ms());
     store->mount_runtime.setProcessEpoch(writer_epoch, std::memory_order_relaxed);
 
-    /// 4. Mount lease — LIVENESS. Decide over the current mount object using a wall-clock `now_ms`.
-    const auto now_ms = []() -> uint64_t
-    {
-        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count());
-    };
+    /// 4. Mount lease — LIVENESS. Decide over the current mount object using the wall-clock `now_ms`
+    ///    hoisted above.
     const uint64_t ttl_ms = static_cast<uint64_t>(store->config.mount_lease_ttl_ms.count());
 
     /// CAS request budget: a
@@ -593,7 +605,7 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
                     "({} recoveries exhausted) — a fresh writer_epoch kept being fenced before we "
                     "could adopt it. This should not persist; investigate GC fence-out timing.",
                     srid, max_fence_recoveries);
-            writer_epoch = allocateWriterEpoch(*store->pool_backend, store->pool_layout, srid);
+            writer_epoch = allocateWriterEpoch(*store->pool_backend, store->pool_layout, srid, epoch_policy, now_ms());
             store->mount_runtime.setProcessEpoch(writer_epoch, std::memory_order_relaxed);
             continue;
         }
@@ -634,7 +646,7 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
             if (fence_recovery >= max_fence_recoveries)
                 throw;
             store->mount_runtime.keeperReset();
-            writer_epoch = allocateWriterEpoch(*store->pool_backend, store->pool_layout, srid);
+            writer_epoch = allocateWriterEpoch(*store->pool_backend, store->pool_layout, srid, epoch_policy, now_ms());
             store->mount_runtime.setProcessEpoch(writer_epoch, std::memory_order_relaxed);
             continue;
         }

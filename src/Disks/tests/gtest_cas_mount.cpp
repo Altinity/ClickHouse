@@ -136,6 +136,95 @@ TEST(CasServerRootEpoch, AllocatorIsMonotoneAndSurvivesMountConcept)
     EXPECT_GT(allocateWriterEpoch(*b, l, "r"), e2);
 }
 
+/// Phase C (spec rev.4): an ABSENT epoch object over a PRESENT mount object means durable epoch
+/// state was lost while a mount is live/recent — re-minting epoch 1 there is how a same-(uuid,
+/// epoch) twin is born. Refuse.
+TEST(CasMount, EpochRemintOverExistingMountRefuses)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    claimOwnerOrThrow(*b, l, "r", UInt128(1));
+    ASSERT_EQ(claimMount(*b, l, "r", UInt128(1), /*epoch=*/1, /*now_ms=*/1000, /*ttl_ms=*/30000).kind,
+              MountClaimResult::Claimed);
+    /// The epoch object is ABSENT (never created in this sequence) while the mount exists:
+    EXPECT_THROW(allocateWriterEpoch(*b, l, "r"), DB::Exception);   /// CORRUPTED_DATA
+}
+
+TEST(CasMount, EpochRemintAuthoritativeAbsenceMints)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    claimOwnerOrThrow(*b, l, "r", UInt128(1));
+    EXPECT_EQ(allocateWriterEpoch(*b, l, "r"), 1u);   /// fresh root: both control objects absent
+    EXPECT_EQ(allocateWriterEpoch(*b, l, "r"), 2u);   /// epoch present now: normal CAS bump, no probe
+}
+
+/// The probe outcome gates the mint: anything short of authoritative KeyAbsent fails closed.
+TEST(CasMount, EpochRemintIndeterminateProbeFailsClosed)
+{
+    class IndeterminateProbeBackend final : public InMemoryBackend
+    {
+    public:
+        SentinelProbeResult probeSentinelRaw(const String &) override
+        {
+            return {.outcome = ProbeOutcome::Indeterminate, .body = std::nullopt};
+        }
+    };
+    auto b = std::make_shared<IndeterminateProbeBackend>();
+    Layout l("p");
+    claimOwnerOrThrow(*b, l, "r", UInt128(1));
+    EXPECT_THROW(allocateWriterEpoch(*b, l, "r"), DB::Exception);
+}
+
+/// Decommission over a TERMINAL (expired/fenced) mount with a lost epoch object proceeds and mints
+/// an epoch DISTINCT from the surviving mount's — the same-pair state is unrepresentable.
+TEST(CasMount, DecommissionRemintOverTerminalMountMintsDistinctEpoch)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    claimOwnerOrThrow(*b, l, "r", UInt128(1));
+    ASSERT_EQ(claimMount(*b, l, "r", UInt128(1), /*epoch=*/3, /*now_ms=*/1000, /*ttl_ms=*/100).kind,
+              MountClaimResult::Claimed);
+    /// now_ms=5000: the ttl_ms=100 lease above is long expired -> terminal.
+    EXPECT_EQ(allocateWriterEpoch(*b, l, "r", EpochMintPolicy::DecommissionRecovery, /*now_ms=*/5000), 4u);
+}
+
+/// Decommission over a LIVE mount with a lost epoch refuses — the blind bypass would recreate the
+/// forbidden pair (codex round-3 finding 1) and defeat CasDecommission.RefusesLiveMember.
+TEST(CasMount, DecommissionRemintOverLiveMountRefuses)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    claimOwnerOrThrow(*b, l, "r", UInt128(1));
+    ASSERT_EQ(claimMount(*b, l, "r", UInt128(1), /*epoch=*/1, /*now_ms=*/1000, /*ttl_ms=*/30000).kind,
+              MountClaimResult::Claimed);
+    EXPECT_THROW(allocateWriterEpoch(*b, l, "r", EpochMintPolicy::DecommissionRecovery, /*now_ms=*/2000),
+                 DB::Exception);   /// ABORTED: live member
+}
+
+/// The steady-state path (epoch object PRESENT) must never pay the probe — pins the zero
+/// normal-path cost the spec claims.
+TEST(CasMount, EpochBumpWithPresentEpochIssuesNoProbe)
+{
+    class ProbeCountingBackend final : public InMemoryBackend
+    {
+    public:
+        int probes = 0;
+        SentinelProbeResult probeSentinelRaw(const String & k) override
+        {
+            ++probes;
+            return InMemoryBackend::probeSentinelRaw(k);
+        }
+    };
+    auto b = std::make_shared<ProbeCountingBackend>();
+    Layout l("p");
+    claimOwnerOrThrow(*b, l, "r", UInt128(1));
+    EXPECT_EQ(allocateWriterEpoch(*b, l, "r"), 1u);   /// bootstrap: ONE probe (absent-epoch branch)
+    const int probes_after_bootstrap = b->probes;
+    EXPECT_EQ(allocateWriterEpoch(*b, l, "r"), 2u);   /// epoch present: normal CAS bump...
+    EXPECT_EQ(b->probes, probes_after_bootstrap) << "...must not probe the mount key";
+}
+
 TEST(CasServerRootClaim, MissingOwnerOverNonEmptyRootIsCorrupted)
 {
     auto b = std::make_shared<InMemoryBackend>();
