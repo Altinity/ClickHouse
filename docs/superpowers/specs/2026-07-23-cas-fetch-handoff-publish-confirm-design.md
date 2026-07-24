@@ -220,7 +220,9 @@ Three sender-side changes, ordered from interim to full:
    cleared ONLY by a fresh recovery (remount / evict-and-reload), never by the next successful
    flush. Effect on this feature: relink from that sender for that table degrades to bytes until
    recovery — fail-closed and self-limiting. After item 3 lands the marker remains as an
-   assert-layer (it should never trip).
+   assert-layer (it should never trip). The marker itself must be allocation-free (a plain atomic
+   flag): arm/clear go inside `DENY_ALLOCATIONS_IN_SCOPE` so "non-allocating" is enforced rather
+   than asserted in prose — arming it must never become the thing that throws.
 2. **`precommitAdd` mint-tightening** (confirm gate 1 rule 5's soundness). An unowned
    `ManifestId` may enter ownership only from the transaction that freshly staged it.
    Re-verified 2026-07-24: `precommitAdd` (`CasPartWriteTxn.cpp:920`) still validates ONLY
@@ -241,6 +243,23 @@ Three sender-side changes, ordered from interim to full:
    candidate is bounded by one chunk's ops (`ref_txn_max_ops`), not a whole tenure.
    Apply the same pattern to the SECOND call site — wedge resolution (`CasRefLedger.cpp:1205+`
    applies post-durable too; the wedge can retain the candidate alongside `{id, key, bytes}`).
+   **Mechanical enforcement — `DENY_ALLOCATIONS_IN_SCOPE`** (`Common/MemoryTracker.h:35`; the
+   thread-local flag makes `MemoryTracker` throw `LOGICAL_ERROR` on ANY allocation attempt in the
+   scope; a no-op in Release). Wrap EXACTLY the post-durability install region — the no-throw move
+   plus the atomic tail-counter bumps — at both call sites. Upstream precedent is the identical
+   intent: `AsyncLoader.cpp:363-364` ("We do not want any exception to be thrown after this point,
+   because the following code is not exception-safe" → `DENY_ALLOCATIONS_IN_SCOPE`); also
+   `ThreadPool.cpp:795`, `ProcessList`, `StorageBuffer`. Why it matters more than the
+   `static_assert`: `noexcept` proves the type-level contract, but the DEFECT CLASS here is
+   invisible in ordinary testing — an allocation inside the window normally *succeeds*, so nothing
+   fails until real memory pressure in production. The deny-scope makes the **presence** of an
+   allocation the failure signal, so every debug/CI run that exercises a ref commit mechanically
+   enforces the invariant instead of restating it in a comment. Scope discipline: the overlay fold
+   (`materializeCommitted`) legitimately allocates and is optimization-only — it must stay OUTSIDE
+   the deny region (or inside an explicit `ALLOW_ALLOCATIONS_IN_SCOPE`), as must the survivor
+   completion under `ref_queue_mutex` and event/`ProfileEvents` emission. Limits to state plainly:
+   debug-only (a CI-grade invariant, not a production guarantee — production safety comes from the
+   restructure), and it only catches allocations routed through the tracker.
    **New finding (2026-07-24), fold into this item:** the two sites are ASYMMETRIC — the
    wedge-resolution arm calls `applyRefLogTxn` → `materializeCommitted` → `wedge.reset()` with NO
    inner swallow (unlike `commitRefChunk`'s `:1718-1728`). A `materializeCommitted` throw there
@@ -414,7 +433,12 @@ One spec, one plan, phases in this order (writing-plans maps them to tasks):
   incl. allocation-failure injection between PUT and install (post-fix: install provably cannot
   throw — the poison assert-layer never trips); wedge-arm symmetry test (a `materializeCommitted`
   throw during wedge resolution must not leave an applied-but-unreset wedge → no double-apply, no
-  double-counted tail); soak.
+  double-counted tail); soak. **No dedicated "does it allocate?" test is needed** — the
+  `DENY_ALLOCATIONS_IN_SCOPE` region turns EVERY existing debug/ASan/TSan test that commits a ref
+  op into that assertion, which is the point: the whole CAS gtest battery plus the CA stateless
+  lane become the enforcement surface. Add only one negative control: a test-only allocation
+  deliberately injected inside the region must fail loudly (proves the guard is armed and the
+  region is actually entered, not compiled out or bypassed).
 
 ## Naming {#naming}
 
