@@ -713,3 +713,34 @@ redesign; v2 door in git history).
   `EXPECT_DEATH` test's `fork()` failed once (~1 ms) under full parallel gate load; 3/3 green isolated and on
   clean re-run. Class = fork-under-load, not a product red. Watch for recurrence; if it recurs, serialize the
   CAS DeathTests or lower gate parallelism around them.
+
+## Write-path optimization candidates after stage 1 (2026-07-24) {#writepath-candidates-post-stage1}
+
+Context: stage 1 (parallel intra-part blob upload) took the wide 10M×30col×500part CA-S3 `INSERT` from
+58.41 s to 30.26 s (3.0× → 1.59× vs plain S3); the workload is still ~87% network-bound. Reports:
+`docs/superpowers/reports/2026-07-23-cas-wide-insert-baseline.md` (baseline),
+`docs/superpowers/reports/2026-07-24-cas-wide-insert-stage1-effect.md` (stage-1 effect). The residual
+splits between the serial cross-part commit (stage 2's target, program point 7 — active, NOT a backlog
+item) and the items below. STANDING USER VETO: the `HEAD`-before-`PUT` dedup gate (~12% of wall,
+268.8 `HEAD`/part) and any change to the durable-op protocol are NOT candidates.
+
+- (1) **Enable S3-native staging on the wide-insert profile and measure** — the feature exists
+  (opt-in, write-once conditional server-side copy; validated e2e). Local staging then upload moves
+  every blob's bytes twice; native staging may cut wall on S3 backends. Zero new code: flip the
+  setting in an s41 variant leg and compare. Status: MEASURE.
+- (2) **S3 client concurrency/connection tuning for the upload pool** — with 16-33 threads now
+  issuing PUTs concurrently, client-side limits (connections, per-request concurrency) may cap
+  overlap. Config-level experiment on s41. Status: MEASURE.
+- (3) **Inline-placement threshold tuning** — small part files inline into the manifest
+  (`CaInlinePlacement` machinery). The wide profile pays ~239 `PUT`/part (~8 objects/column);
+  raising the inline threshold could fold the small tail (marks, minor streams) into the manifest.
+  First verify the threshold is a setting (not a pinned format constant), then measure PUT-count and
+  wall deltas on s41. Status: INVESTIGATE THEN MEASURE.
+- (4) **Repoint waste on part removal** — known class (`project_part_removal_repoint_waste`):
+  repoints against `delete_tmp_*` refs ≈ 22% of the writer `PUT` class. Eliminating them changes
+  WHICH ledger ops are issued — protocol-adjacent, needs an explicit user decision with a risk
+  analysis before any work. Status: DECISION NEEDED (present risk analysis to user).
+- (5) **Unconditional manifest `GET` on promote** — part of the 108.7 `GET`/part during insert;
+  separate long-standing item. Verification semantics of the write path → under the spirit of the
+  protocol veto; do not touch without an explicit user go-ahead. Status: DECISION NEEDED (present
+  risk analysis to user).
