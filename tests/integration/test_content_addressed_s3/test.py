@@ -13,7 +13,7 @@ def start_cluster():
     cluster.add_instance(
         "node",
         main_configs=["configs/storage_conf.xml"],
-        with_minio=True,
+        with_rustfs=True,
         stay_alive=True,
     )
 

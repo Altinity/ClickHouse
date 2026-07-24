@@ -28,18 +28,20 @@ RECLAIM_SLEEP = 1.0  # seconds; total bound ~= 60s
 
 @pytest.fixture(scope="module", autouse=True)
 def start_cluster():
-    # Only one instance needs with_minio to stand up MinIO; both reach the shared minio1. Both load the
+    # RustFS (not MinIO) backs the pool: the CA mount capability probe requires enforced
+    # conditional-DELETE semantics, which MinIO OSS lacks — the fail-closed probe aborted server
+    # startup there (PR#2073 CI triage). Both instances reach the shared rustfs1 and load the
     # identical storage_conf.xml, so both mount the SAME shared pool.
     cluster.add_instance(
         "node1",
         main_configs=["configs/storage_conf.xml", "configs/server_root_id_node1.xml"],
-        with_minio=True,
+        with_rustfs=True,
         stay_alive=True,
     )
     cluster.add_instance(
         "node2",
         main_configs=["configs/storage_conf.xml", "configs/server_root_id_node2.xml"],
-        with_minio=True,
+        with_rustfs=True,
         stay_alive=True,
     )
 
@@ -51,8 +53,8 @@ def start_cluster():
 
 
 def count_prefix(prefix):
-    objects = cluster.minio_client.list_objects(
-        cluster.minio_bucket, prefix, recursive=True
+    objects = cluster.rustfs_client.list_objects(
+        cluster.rustfs_bucket, prefix, recursive=True
     )
     return len(list(objects))
 
@@ -259,7 +261,12 @@ def test_pool_survives_node_crash():
     # (4) RESTART node1. The bucket is self-describing: node1 rebuilds its active set from the durable
     #     refs and must re-read its table with the EXACT pre-crash count/sum/digest. After a hard kill
     #     the harness reconnects on start_clickhouse via wait_start; use the instance object fresh.
-    node1.start_clickhouse()
+    #     150s, not the 60s default: a post-SIGKILL restart legitimately pays the unclean-reclaim
+    #     cost before serving — the stale-token observation window over its own unexpired lease
+    #     (~TTL + 5% + renew_period/2 ≈ 36.5s with defaults) plus the materialization grace
+    #     (30s default) plus the lease re-write; ~71s observed end-to-end. A bounded wait on a
+    #     known, by-design recovery protocol — not a race hack.
+    node1.start_clickhouse(start_wait_sec=150)
 
     assert int(node1.query("SELECT count() FROM crash1")) == n1_count
     assert int(node1.query("SELECT sum(id) FROM crash1")) == n1_sum_id
