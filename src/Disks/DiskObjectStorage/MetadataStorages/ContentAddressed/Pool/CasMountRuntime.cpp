@@ -234,11 +234,12 @@ void CasMountRuntime::installKeeper(UInt128 our_uuid, uint64_t writer_epoch, con
         config.mount_lease_ttl_ms, now_ms,
         [this] { return minActive(); },
         [this](CasEvent e) { emitEvent(std::move(e)); },
-        std::chrono::milliseconds(cas_request_budget.lease_safety_margin_ms));
+        std::chrono::milliseconds(cas_request_budget.lease_safety_margin_ms),
+        [this] { return bootMsNow(); });
     /// Install the fence callbacks before any background renewal can run: successful renewals extend the
     /// local BOOTTIME deadline, while a superseded or foreign renewal latches the fence and starts recovery.
     mount_keeper->setFenceCallbacks(
-        [this, ttl_ms] { setMountDeadline(bootMsNow() + ttl_ms); },
+        [this, ttl_ms](uint64_t attempt_boot_ms) { setMountDeadline(attempt_boot_ms + ttl_ms); },
         [this]
         {
             tripMountLost();

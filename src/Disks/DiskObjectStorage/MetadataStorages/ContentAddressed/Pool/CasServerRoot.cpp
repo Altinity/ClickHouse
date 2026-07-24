@@ -12,6 +12,7 @@
 #include <fmt/format.h>
 
 #include <algorithm>
+#include <ctime>
 #include <limits>
 #include <set>
 #include <string_view>
@@ -46,6 +47,13 @@ namespace
 bool prefixHasAnyKey(Backend & b, const String & prefix)
 {
     return !b.list(prefix, /*cursor*/ "", /*limit*/ 1).keys.empty();
+}
+
+uint64_t defaultBootMs()
+{
+    struct timespec ts{};
+    clock_gettime(CLOCK_BOOTTIME, &ts);
+    return static_cast<uint64_t>(ts.tv_sec) * 1000 + static_cast<uint64_t>(ts.tv_nsec) / 1000000;
 }
 
 std::optional<OwnerObject> readOwnerObject(Backend & b, const Layout & l, const String & server_root_id)
@@ -646,7 +654,8 @@ MountLeaseKeeper::MountLeaseKeeper(
     uint64_t writer_epoch_, std::chrono::milliseconds ttl_, std::function<uint64_t()> now_ms_fn_,
     std::function<uint64_t()> min_active_fn_,
     CasEventSink event_sink_,
-    std::chrono::milliseconds lease_safety_margin_)
+    std::chrono::milliseconds lease_safety_margin_,
+    std::function<uint64_t()> boot_ms_fn_)
     : SingleWriterSlot(std::move(backend_), layout_.mountKey(srid_), "mount-lease", "release", "CasMountLeaseKeeper")
     , srid(srid_)
     , server_uuid(server_uuid_)
@@ -656,12 +665,13 @@ MountLeaseKeeper::MountLeaseKeeper(
     , min_active_fn(std::move(min_active_fn_))
     , event_sink(std::move(event_sink_))
     , lease_safety_margin(lease_safety_margin_)
+    , boot_ms_fn(boot_ms_fn_ ? std::move(boot_ms_fn_) : defaultBootMs)
 {
 }
 
-void MountLeaseKeeper::refreshConfirmedDeadline()
+void MountLeaseKeeper::refreshConfirmedDeadline(uint64_t anchor_wall_ms)
 {
-    confirmed_deadline_ms = now_ms_fn() + static_cast<uint64_t>(ttl.count());
+    confirmed_deadline_ms = anchor_wall_ms + static_cast<uint64_t>(ttl.count());
 }
 
 bool MountLeaseKeeper::shouldFenceOnTransientRenewFailure()
@@ -679,7 +689,11 @@ SingleWriterSlot::RenewPayload MountLeaseKeeper::prepareRenew() const
     /// Carry the two dynamic fields (both read OFF the state lock — the merged floor callback reaches
     /// into the Pool's own lock): `value` = wall-clock `now_ms` (so `encodeBody` stamps a fresh
     /// `expires_at_ms = now_ms + ttl`), `value2` = `min_active` (the build-watermark floor).
-    return {.value = now_ms_fn(), .value2 = min_active_fn()};
+    /// Pre-I/O anchors (spec rev.4 Phase B): both fence deadlines anchor at this instant — the
+    /// wall stamp doubles as the payload's now_ms, so anchor <= the durable stamp trivially.
+    last_attempt_wall_ms = now_ms_fn();
+    last_attempt_boot_ms = boot_ms_fn();
+    return {.value = last_attempt_wall_ms, .value2 = min_active_fn()};
 }
 
 String MountLeaseKeeper::encodeBody(uint64_t seq_, const RenewPayload & payload) const
@@ -715,7 +729,7 @@ SingleWriterSlot::Token MountLeaseKeeper::claim(const String & body)
                 "CAS mount-lease: key '{}' appeared between head and putIfAbsent — concurrent writer on our mount slot", key);
         emitMountEvent(event_sink, CasEventType::MountClaim, srid, "mint", nullptr,
             "mount slot absent — keeper minted it directly (no prior claimMount)");
-        refreshConfirmedDeadline();
+        refreshConfirmedDeadline(last_attempt_wall_ms);
         return res.token;
     }
 
@@ -794,18 +808,18 @@ SingleWriterSlot::Token MountLeaseKeeper::claim(const String & body)
     }
     emitMountEvent(event_sink, CasEventType::MountClaim, srid, "adopt", &observed,
         "adopted our own already-live (uuid, epoch) mount slot");
-    refreshConfirmedDeadline();
+    refreshConfirmedDeadline(last_attempt_wall_ms);
     return res.token;
 }
 
 void MountLeaseKeeper::onRenewSucceeded()
 {
-    /// A successful background renew extended the durable lease. Refresh OUR OWN confirmed-deadline
-    /// bookkeeping as well as the local write-fence deadline (the Pool translates this
-    /// to `steady_clock::now() + ttl`, monotonic). No S3 read either way.
-    refreshConfirmedDeadline();
+    /// Anchor at the attempt start (stashed by prepareRenew), never at this ack instant — a slow
+    /// ack must not extend either fence past what the durable body it acknowledges authorizes
+    /// (spec rev.4 Phase B).
+    refreshConfirmedDeadline(last_attempt_wall_ms);
     if (on_renew_ok)
-        on_renew_ok();
+        on_renew_ok(last_attempt_boot_ms);
 }
 
 void MountLeaseKeeper::onRenewFailed()

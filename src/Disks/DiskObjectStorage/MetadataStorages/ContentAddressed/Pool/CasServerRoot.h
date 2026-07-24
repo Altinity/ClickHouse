@@ -499,7 +499,10 @@ public:
         uint64_t writer_epoch_, std::chrono::milliseconds ttl_, std::function<uint64_t()> now_ms_fn_,
         std::function<uint64_t()> min_active_fn_,
         CasEventSink event_sink_ = {},
-        std::chrono::milliseconds lease_safety_margin_ = std::chrono::milliseconds(2000));
+        std::chrono::milliseconds lease_safety_margin_ = std::chrono::milliseconds(2000),
+        /// boot-domain clock for the on_renew_ok anchor; empty = real CLOCK_BOOTTIME. Injectable for
+        /// tests and wired by CasMountRuntime::installKeeper.
+        std::function<uint64_t()> boot_ms_fn_ = {});
 
     /// Claims (adopts) the mount slot for (server_uuid, writer_epoch) with seq following the observed
     /// one — durable when `start` returns.
@@ -520,7 +523,9 @@ public:
     /// refreshes its monotonic fence deadline); when background renewal FAILS (a foreign/superseded
     /// touch makes `renewOnce` throw and the loop stop) the keeper calls `on_lost` (the Pool latches
     /// its fence to lost). Both default to no-op so a keeper used without a Pool is inert.
-    void setFenceCallbacks(std::function<void()> on_renew_ok_, std::function<void()> on_lost_)
+    /// `on_renew_ok` receives the ATTEMPT-START boot-domain instant of the renewal it acknowledges —
+    /// the fence deadline must anchor there, never at response time (spec rev.4 Phase B).
+    void setFenceCallbacks(std::function<void(uint64_t)> on_renew_ok_, std::function<void()> on_lost_)
     {
         on_renew_ok = std::move(on_renew_ok_);
         on_lost = std::move(on_lost_);
@@ -559,10 +564,11 @@ protected:
     bool shouldFenceOnTransientRenewFailure() override;
 
 private:
-    /// Refreshes `confirmed_deadline_ms` from `now_ms_fn` + `ttl`. Called on every point this keeper
-    /// KNOWS it holds a live lease: both success paths of `claim` (mint and adopt), and every
-    /// successful background renew (`onRenewSucceeded`).
-    void refreshConfirmedDeadline();
+    /// Refreshes `confirmed_deadline_ms` from `anchor_wall_ms` + `ttl` — anchor = the pre-I/O wall
+    /// instant of the confirming attempt. Called on every point this keeper KNOWS it holds a live
+    /// lease: both success paths of `claim` (mint and adopt), and every successful background renew
+    /// (`onRenewSucceeded`).
+    void refreshConfirmedDeadline(uint64_t anchor_wall_ms);
 
     String srid;
     UInt128 server_uuid;
@@ -570,15 +576,24 @@ private:
     std::chrono::milliseconds ttl;
     std::function<uint64_t()> now_ms_fn;
     std::function<uint64_t()> min_active_fn;
-    std::function<void()> on_renew_ok;
+    std::function<void(uint64_t)> on_renew_ok;
     std::function<void()> on_lost;
     CasEventSink event_sink;
     std::chrono::milliseconds lease_safety_margin;
+    /// boot-domain clock for the on_renew_ok anchor; empty = real CLOCK_BOOTTIME. Injectable for
+    /// tests and wired by CasMountRuntime::installKeeper.
+    std::function<uint64_t()> boot_ms_fn;
     /// BOOTTIME-ms deadline (same clock as `now_ms_fn`/`MountFence`, and for the SAME suspend-safety
     /// reason -- see `MountFence`'s doc comment in `CasMountRuntime.h`) of the last CONFIRMED lease.
     /// 0 = none yet (`claim` always sets this before `startBackground` can run, so
     /// `shouldFenceOnTransientRenewFailure` observing 0 is defensive, not an expected steady state).
     uint64_t confirmed_deadline_ms = 0;
+    /// Pre-I/O anchors of the CURRENT attempt, stashed by prepareRenew (which runs at the start of
+    /// every doStart/renewOnce attempt, off the state lock) and consumed by the success hooks.
+    /// `mutable` + no synchronization is safe: prepareRenew, claim, and the hooks all run on the
+    /// single renewal driver thread (see renewOnce's single-driver invariant).
+    mutable uint64_t last_attempt_wall_ms = 0;
+    mutable uint64_t last_attempt_boot_ms = 0;
 };
 
 /// Mount-lease-scoped staging sweeper for objects left behind by S3-native staging.

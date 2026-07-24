@@ -530,7 +530,7 @@ TEST(CasHeartbeat, BackgroundLoopRetriesTransientFailureWithoutFencingOrStopping
     MountLeaseKeeper keeper(backend, layout, srid, uuid, /*writer_epoch=*/9, std::chrono::milliseconds(30000),
                             [&] { return now_ms; }, [] { return uint64_t{0}; }, CasEventSink{},
                             std::chrono::milliseconds(2000));
-    keeper.setFenceCallbacks([] {}, [&] { lost = true; });
+    keeper.setFenceCallbacks([](uint64_t) {}, [&] { lost = true; });
     keeper.start();   /// the adopt-path putOverwrite must land BEFORE the faults are armed below.
 
     /// Arm the faults only for the BACKGROUND renewals under test -- `start`'s own adopt-path
@@ -578,7 +578,7 @@ TEST(CasHeartbeat, BackgroundLoopFencesImmediatelyOnConfirmedMismatch)
     MountLeaseKeeper keeper(
         backend, layout, srid, uuid, /*writer_epoch=*/9, std::chrono::milliseconds(30000),
         [&] { return now_ms; }, [] { return uint64_t{0}; }, CasEventSink{}, std::chrono::milliseconds(2000));
-    keeper.setFenceCallbacks([] {}, [&] { lost = true; });
+    keeper.setFenceCallbacks([](uint64_t) {}, [&] { lost = true; });
     keeper.start();
 
     /// A same-(uuid, epoch) unfenced touch overwrites the slot BEFORE the first background beat.
@@ -641,7 +641,7 @@ TEST(CasHeartbeat, BackgroundLoopSurvivesAmbiguousLandedRenewal)
     MountLeaseKeeper keeper(backend, layout, srid, uuid, /*writer_epoch=*/9, std::chrono::milliseconds(30000),
                             [&] { return now_ms; }, [] { return uint64_t{0}; }, CasEventSink{},
                             std::chrono::milliseconds(2000));
-    keeper.setFenceCallbacks([] {}, [&] { lost = true; });
+    keeper.setFenceCallbacks([](uint64_t) {}, [&] { lost = true; });
     keeper.start();   /// the adopt-path putOverwrite must land unfaulted.
 
     backend->fault_count = 1;   /// beat 1: lands + throws (ambiguous); beat 2: confirmed mismatch.
@@ -653,7 +653,44 @@ TEST(CasHeartbeat, BackgroundLoopSurvivesAmbiguousLandedRenewal)
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (!lost.load() && std::chrono::steady_clock::now() < deadline)
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    /// Restore the default before returning: unlike the EXPECT_DEATH-wrapped uses above (which flip
+    /// this flag only inside a forked child), this test sets it in the actual test process — leaving
+    /// it ON would make every LOGICAL_ERROR raised by any LATER test in this binary abort instead of
+    /// throwing, regardless of that test's own intent.
+    DB::abort_on_logical_error.store(false, std::memory_order_relaxed);
     EXPECT_TRUE(lost.load()) << "the confirmed mismatch after an ambiguous landed renewal must "
                                 "latch the fence via on_lost (and must not abort the process)";
     keeper.stopBackground();
+}
+
+/// Phase B: the confirmed-lease deadline anchors at the ATTEMPT-START instant, not the response
+/// instant — a slow ack must not extend the local fence past what the durable body authorizes.
+TEST(CasHeartbeat, RenewDeadlineAnchorsAtAttemptStartNotResponseTime)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    Layout layout("pool");
+    const String srid = "test";
+    const UInt128 uuid(0x1234);
+    uint64_t now_ms = 1000;
+    seedOwnClaim(*backend, layout, srid, uuid, /*epoch=*/9, now_ms, /*ttl_ms=*/1000);
+
+    TestableMountLeaseKeeper keeper(backend, layout, srid, uuid, /*writer_epoch=*/9,
+                                    std::chrono::milliseconds(1000),
+                                    [&] { return now_ms; }, [] { return uint64_t{0}; }, CasEventSink{},
+                                    std::chrono::milliseconds(100));
+    keeper.start();   /// claim at now=1000 -> anchored confirmed deadline 2000
+
+    /// Beat at now=1500; the "ack" (onRenewSucceeded) arrives late, at now=2400 — after the
+    /// durable expiry stamped by THIS beat's payload (1500+1000=2500 durable; anchor 1500).
+    now_ms = 1500;
+    keeper.renewOnce();
+    now_ms = 2400;
+    keeper.onRenewSucceeded();
+
+    /// Anchored: deadline = 1500 + 1000 = 2500. At now=2401 with margin 100 the boundary check is
+    /// 2401 + 100 >= 2500 -> must fence. (Response-time behavior — the bug — would give
+    /// 2400 + 1000 = 3400 and NOT fence.)
+    now_ms = 2401;
+    EXPECT_TRUE(keeper.shouldFenceOnTransientRenewFailure())
+        << "a late ack must not extend the confirmed deadline past attempt-start + TTL";
 }
