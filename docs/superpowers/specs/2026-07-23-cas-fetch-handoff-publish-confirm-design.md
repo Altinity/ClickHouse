@@ -9,11 +9,22 @@ doc_type: 'reference'
 
 # CAS fetch-handoff — publish-then-confirm relink {#cas-fetch-handoff-publish-confirm}
 
-**Date:** 2026-07-23, rev.4 2026-07-24
+**Date:** 2026-07-23, rev.4 2026-07-24 (re-verified against HEAD after the stage1 ref-lane
+landing, 2026-07-24)
 **Branch:** `cas-gc-rebuild`
 **Status:** design (user-approved brainstorm; three adversarial review rounds folded in; rev.4
 unifies the confirm protocol with the ref-lane hardening into ONE spec per user direction and adds
 the part-anchored confirm gate per user insight)
+
+> **Re-verification note (2026-07-24).** The ref lane was rewritten under this spec by the parallel
+> stage1 round (chunked flush `commitRefChunk`, counts-only admission caps, streaming recovery,
+> `SetPublishedAt`). Every load-bearing claim was re-checked against HEAD; the design is unchanged,
+> with three substantive updates folded in: (a) the post-durable-PUT window NARROWED — the overlay
+> fold is now swallowed as an optimization, leaving only `applyRefLogTxn` itself, which shrinks
+> phase 7's scope; (b) the poison marker must be **sticky** until a fresh recovery, since the cache
+> stays divergent and later flushes would build on the stale base; (c) chunked flush adds a
+> mid-tenure partially-durable state — already covered by the `leader_active` predicate, but it
+> widens the *unknown* window under load. Citations throughout were re-anchored to HEAD.
 **Covers:** codex-6 / #42/#43 (relink commit-before-release gap); B66b (relink-into-detached,
 RPL-4 perf cliff); RPL-5 test slice; ref-lane hardening: apply-pending poison marker,
 `precommitAdd` mint-tightening, and the full **post-durable-PUT no-throw-install** fix (absorbs
@@ -76,8 +87,13 @@ own domain, and the receiver *verifies* instead of trusting.
 
 1. The receiver runs today's flow unchanged: stage its own manifest body, `precommitAdd` — its
    `+1` edge is durable in its own journal with a present body (**T1**). (`precommitAdd` is
-   durable on return: append at `CasPartWriteTxn.cpp:926-970`, synchronous completion at
-   `CasRefLedger.cpp:988-1030`.)
+   durable on return: `CasPartWriteTxn.cpp:920` appends via `store->appendRefOps` at `:940`, and
+   the caller blocks on `while (!item->done)` — `CasRefLedger.cpp:1008` — which the lane sets only
+   after the acked conditional PUT. Re-verified against the stage1 chunked lane: chunk boundaries
+   fall on ITEM boundaries only — a chunk commits when admitting the next item's ops would exceed
+   `ref_txn_max_ops` (`CasRefLedger.cpp:1448-1454`), and a single item exceeding the cap is
+   rejected outright (`:1426`) — so one item's ops are never split across durable transactions and
+   T1 stays atomic.)
 2. **Confirm** (`confirmExactRef`, one read-only interserver query): "is the transferred manifest
    still the live binding of `<part>` on your side?" — answered under the two-layer rules below
    (**T2**).
@@ -122,12 +138,21 @@ and **removal-mark unlinks** (Task 8; content-REMOVING — the dangerous kind). 
 possibly-lagging cache. Return *yes* iff ALL hold, evaluated as ONE snapshot:
 
 1. lock `ref_queue_mutex`, pin the resident runtime, lock `state_mutex` (the predicates span both
-   mutexes — `pending`/`leader_active` under the queue mutex, `CasRefLedger.h:267,344`, admission
-   at `:978`; rows and wedge under the state mutex);
-2. table warm: recovered, not `recovery_in_progress`, not `superseded_by_remount`, resident —
-   else *unknown* (the confirm performs **zero object-store I/O**; no recovery from storage);
+   mutexes — `pending`/`leader_active` are guarded by the queue mutex, `CasRefLedger.h:414-415`,
+   admission `pending.push_back` at `CasRefLedger.cpp:1006`; rows and wedge under the state
+   mutex);
+2. table warm: `recovered` and not `recovery_in_progress` (`CasRefLedger.h:338,343`), not
+   `superseded_by_remount` (`:425`), resident — else *unknown* (the confirm performs **zero
+   object-store I/O**; no recovery from storage). Streaming recovery (stage1 T13) publishes into
+   the runtime in one atomic step (`CasRefLedger.h:492`), so there is no half-recovered view to
+   read;
 3. lane quiescent: no `RefAppendWedge`, no pending items, no `leader_active` in-flight batch —
-   else *unknown* (closes the durable-PUT→cache-flip and wedge windows);
+   else *unknown* (closes the durable-PUT→cache-flip and wedge windows). **Chunked-lane note
+   (stage1):** one leader tenure now commits MULTIPLE durable transactions
+   (`commitRefChunk`, `CasRefLedger.cpp:1592`), so mid-tenure a table can be *partially* durable —
+   chunk 1's removal applied while chunks 2..N are unwritten. `leader_active` stays set for the
+   whole tenure, so this state is already *unknown*; the practical effect is a wider unknown
+   window under write load, not a hole (correctness never rests on the optimistic answer);
 4. **apply-pending poison marker clear** — else *unknown* (closes the post-durable-PUT
    apply-exception window; §[Ledger hardening](#ledger-hardening));
 5. the committed row for `ref_name` exists and equals the token's `ManifestRef` exactly — else
@@ -174,26 +199,57 @@ Three sender-side changes, ordered from interim to full:
 
 1. **Apply-pending poison marker** (the fail-closed half; confirm gate 1 rule 4). A
    non-allocating marker armed before the lane's durable PUT, cleared only after `applyRefLogTxn`
-   succeeds. Today the catch after the apply installs no wedge (`CasRefLedger.cpp:~1512`), so an
-   allocation failure between the PUT and the install (COW tombstones —
-   `CasRefCowMap.cpp:146`; `materializeCommitted`; realistic trigger = `MemoryTracker` limits)
-   leaves "durable, unapplied, unwedged, idle, warm" invisible. The marker makes it visible:
-   confirm answers *unknown*; observability gets a counter. After item 3 lands the marker remains
-   as an assert-layer (it should never trip).
+   succeeds.
+   **Re-verified against the stage1 lane (2026-07-24) — the window NARROWED but did not close.**
+   In `commitRefChunk` the durable PUT is `CasRefLedger.cpp:1676`, the apply `:1694`. The
+   post-apply overlay fold now has its OWN inner catch that SWALLOWS a failure as an
+   optimization-only step (`:1718-1728`: "the commit succeeded... nothing is bricked", each
+   container coherent-on-throw), so `materializeCommitted` is no longer part of the window. What
+   remains is `applyRefLogTxn` **itself** throwing: shape/logic failures are argued unreachable
+   (whole-item validation precedes object creation), but an ALLOCATION failure is not — the COW
+   containers allocate on apply (`RefCowMap::erase` tombstones a base-only row,
+   `CasRefCowMap.cpp:162`), and the tracked allocator can throw `MEMORY_LIMIT_EXCEEDED` (the
+   sibling fold catch says so explicitly). The outer catch (`:1730-1755`) fails the survivors and
+   RETHROWS `LOGICAL_ERROR`; `completeOwnedItemsAndReleaseLeadership` (`:1100-1126`) then clears
+   `leader_active`. No wedge, no fence, no remount — the exact "durable, unapplied, unwedged,
+   idle, warm" state, now with a loud error to the WRITER but nothing observable to a READER.
+   (Build asymmetry: `LOGICAL_ERROR` aborts under `DEBUG_OR_SANITIZER_BUILD`, so this state is
+   release-only — which is precisely where it must not be silent.)
+   **The marker is STICKY**: the cache stays divergent from durable truth until the table is
+   re-recovered, and later flushes would apply on top of that stale base — so the marker is
+   cleared ONLY by a fresh recovery (remount / evict-and-reload), never by the next successful
+   flush. Effect on this feature: relink from that sender for that table degrades to bytes until
+   recovery — fail-closed and self-limiting. After item 3 lands the marker remains as an
+   assert-layer (it should never trip).
 2. **`precommitAdd` mint-tightening** (confirm gate 1 rule 5's soundness). An unowned
-   `ManifestId` may enter ownership only from the transaction that freshly staged it
-   (`CasPartWriteTxn.cpp:906` currently accepts any namespace-matching id; re-owning an exact old
-   unowned pair is tested-legal, `gtest_cas_promote_republish.cpp:283` — that pin is replaced).
-   Already-committed idempotence stays a read-only no-op. No production path performs the
-   rejected transition.
+   `ManifestId` may enter ownership only from the transaction that freshly staged it.
+   Re-verified 2026-07-24: `precommitAdd` (`CasPartWriteTxn.cpp:920`) still validates ONLY
+   `id.root_namespace == target_ns` (`:926-929`) — any namespace-matching id is accepted — so the
+   ABA latitude is unchanged and the tightening is still required. Re-owning an exact old unowned
+   pair is tested-legal (`gtest_cas_promote_republish.cpp:283` — that pin is replaced).
+   Already-committed idempotence stays a read-only no-op (the closure's existing
+   already-committed-to-this-exact-`manifest_ref` short-circuit, `:952-954`). No production path
+   performs the rejected transition.
 3. **No-throw-install** (the full fix for the post-durable-PUT allocation window; was BACKLOG
-   §ref-ledger-consult-followups-2026-07-21, F2 — folded in here). Restructure the commit arm of
-   the lane flush: construct AND fully materialize the exact candidate `RefTableState` BEFORE the
-   PUT (the existing trial apply's result is kept instead of discarded); after durability,
-   install via a verified no-throw move under `state_mutex` (`static_assert` on noexcept); tail
-   counters (plain atomics) after. Apply the same pattern to the SECOND call site — wedge
-   resolution (`CasRefLedger.cpp:~1150-1235` applies post-durable too; the wedge can retain the
-   candidate alongside `{id, key, bytes}`).
+   §ref-ledger-consult-followups-2026-07-21, F2 — folded in here). Scope is now NARROWER than the
+   consult framing, because stage1 already solved the fold half (item 1): only the **apply** step
+   must become allocation-free after durability. Restructure `commitRefChunk`'s commit arm:
+   construct AND fully materialize the exact candidate `RefTableState` BEFORE the PUT (`:1676`) —
+   the per-chunk trial apply's result is kept instead of discarded; after durability, install via
+   a verified no-throw move under `state_mutex` (`static_assert` on noexcept) in place of the
+   throwing `applyRefLogTxn` at `:1694`; tail counters (plain atomics) after. Per-chunk, so the
+   candidate is bounded by one chunk's ops (`ref_txn_max_ops`), not a whole tenure.
+   Apply the same pattern to the SECOND call site — wedge resolution (`CasRefLedger.cpp:1205+`
+   applies post-durable too; the wedge can retain the candidate alongside `{id, key, bytes}`).
+   **New finding (2026-07-24), fold into this item:** the two sites are ASYMMETRIC — the
+   wedge-resolution arm calls `applyRefLogTxn` → `materializeCommitted` → `wedge.reset()` with NO
+   inner swallow (unlike `commitRefChunk`'s `:1718-1728`). A `materializeCommitted` throw there
+   leaves the transaction applied but the wedge NOT cleared, so the next resolution re-applies the
+   same txn (the `txn_id`-equality guard does not help — it only prevents applying a DIFFERENT
+   wedge) and double-bumps the tail counters. Harmless-ish today (erase/insert are idempotent;
+   counters only drive the snapshot threshold), but it is the same class and should be fixed with
+   the same restructure — or, minimally, by giving the wedge arm `commitRefChunk`'s swallow +
+   reset ordering.
    - **Measurement gate FIRST** (consult amendment b): benchmark wedge-resolution-followed-by-
      flush and re-run `BM_FlushInstall` — the current COW shape was justified by numbers; the
      naive pre-PUT materialization must not regress them.
@@ -217,10 +273,13 @@ reclaimed by the stale sweep (older-epoch predicate, `CasRefLedger.cpp:1983-1985
 **`PreparedRelink`**: move-only; owns the `PartWriteTxn`, receiver `ManifestId`, target ref name,
 decoded entries, and the exact source token; explicit terminal states; operations `promote` and
 durable `abort` (precommit-removal append); a scope guard aborts on every non-promote exit.
+(`~PartWriteTxn` — `CasPartWriteTxn.cpp:119-124` — only retires the build sequence; it does NOT
+abandon, so destruction alone is never cleanup.)
 
-**Abort-uncertain semantics (honest).** An `Unresolved` abort append wedges the table's lane —
-the PRE-EXISTING discipline for any uncertain append: the wedge retains `{id, key, bytes}`; every
-later append first re-runs `resolveByExactGet` (`CasRefLedger.cpp:~1150-1235`); a landed PUT is
+**Abort-uncertain semantics (honest).** An `Unresolved` abort append wedges the table's lane
+(`CasRefLedger.cpp:1784-1796`) — the PRE-EXISTING discipline for any uncertain append: the wedge
+retains `{id, key, bytes}`; every later append first re-runs `resolveByExactGet` (`:1205`); a
+landed PUT is
 applied-before-unwedging (abort completes); a never-landing PUT keeps the lane wedged **until
 remount** (GET-based resolution never re-issues). Consequences: fail-long over-protection of the
 blobs; the wedge blocks all ref appends for that table on this replica until resolution/remount
@@ -320,8 +379,11 @@ One spec, one plan, phases in this order (writing-plans maps them to tasks):
   *no*; `Active`/`Outdated` live → gate 1 proceeds; concurrent grab vs confirm → safe direction
   (grab after snapshot ⇒ `-1` after T2); restart with durably-initiated removal → part not
   reloaded → *no*.
-- **Gate 1 determinism**: failpoint between committed PUT and apply (apply-exception) → poison →
-  *unknown*; durable-but-wedged drop (`gtest_cas_ref_writer.cpp:778` shape) → *unknown*;
+- **Gate 1 determinism**: failpoint injecting an allocation failure inside `applyRefLogTxn` after
+  the chunk's committed PUT → poison armed → *unknown*, and the marker STAYS armed across a later
+  successful flush (sticky), clearing only after a fresh recovery; mid-tenure partially-durable
+  chunked flush (`CarvePhaseForTest::ChunkReseed`) → *unknown* while `leader_active`;
+  durable-but-wedged drop (`gtest_cas_ref_writer.cpp:778` shape) → *unknown*;
   repointed live part (removal-mark unlink) → *no* by equality — the gate-0-bypass regression;
   dropped+recreated → *no*; mint-tightening: `precommitAdd` of an unstaged old id → rejected
   (replaces `gtest_cas_promote_republish.cpp:283`); cold/evicted/recovering → *unknown*, zero
@@ -347,9 +409,12 @@ One spec, one plan, phases in this order (writing-plans maps them to tasks):
 - **RPL-5 slice**: `REPLACE PARTITION`/`ATTACH PARTITION ... FROM` on 2-replica CA (extend
   `test_cas_replicated_relink`): queue-cloned `REPLACE_RANGE` fetch relinks (blob-count proof).
 - **Version-mix**: confirm-capable receiver × legacy sender cookie → clean byte fallback.
-- **No-throw-install (phase 7)**: bench gates (wedge→flush, `BM_FlushInstall`) before/after;
-  failpoint battery incl. allocation-failure injection between PUT and install (post-fix: install
-  provably cannot throw — the poison assert-layer never trips); soak.
+- **No-throw-install (phase 7)**: bench gates (wedge→flush, `BM_FlushInstall`, plus a chunked
+  multi-transaction tenure — the candidate is now built per chunk) before/after; failpoint battery
+  incl. allocation-failure injection between PUT and install (post-fix: install provably cannot
+  throw — the poison assert-layer never trips); wedge-arm symmetry test (a `materializeCommitted`
+  throw during wedge resolution must not leave an applied-but-unreset wedge → no double-apply, no
+  double-counted tail); soak.
 
 ## Naming {#naming}
 
