@@ -1353,6 +1353,32 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
         {
             std::vector<RefOp> item_ops = it->build_ops(working);
 
+            /// Counts-only admission caps (spec §3), checked before any op is touched further so an
+            /// oversized item or op never reaches `working` or the state-machine preview below and
+            /// fails ALONE -- neighbors in this same batch are unaffected. Removal-class items (their
+            /// built ops contain `RemoveNamespace`) are exempt from both: they share the larger
+            /// `ref_removal_max_bytes` byte budget instead (`checkBudget`, `CasRefLogFormat.cpp`) and
+            /// are already carved as singletons (`WholeShard` scope forces a solo carve above).
+            const bool removal_class = std::any_of(item_ops.begin(), item_ops.end(),
+                [](const RefOp & op) { return op.kind == RefOpKind::RemoveNamespace; });
+            if (!removal_class)
+            {
+                if (item_ops.size() > ref_txn_max_ops)
+                    throw Exception(ErrorCodes::LIMIT_EXCEEDED,
+                        "ref mutation on namespace '{}' has {} operations, exceeding the normal-class "
+                        "per-item op-count cap {} — refusing before any object is created",
+                        ns.string(), item_ops.size(), ref_txn_max_ops);
+                for (const RefOp & op : item_ops)
+                {
+                    const size_t op_bytes = encodedOpSize(op);
+                    if (op_bytes > ref_op_max_bytes)
+                        throw Exception(ErrorCodes::LIMIT_EXCEEDED,
+                            "ref mutation on namespace '{}' contains an op of encoded size {}, exceeding "
+                            "the normal-class per-op cap {} — refusing before any object is created",
+                            ns.string(), op_bytes, ref_op_max_bytes);
+                }
+            }
+
             /// Whole-item shape validation (prerequisite to `dropNamespace`): the
             /// per-op loop below previews each op as its OWN single-op trial transaction, so a
             /// whole-transaction-shape rule like "remove_namespace must be the FINAL op" trivially

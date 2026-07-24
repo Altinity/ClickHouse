@@ -1938,7 +1938,7 @@ TEST(RefWriterStalePrecommitSweep, SweepsOnlyStaleEpochPrecommitsKeepsCurrentEpo
     EXPECT_EQ(replayed.getPrecommits().begin()->second, fresh_id.ref);
 }
 
-/// The sweep chunks its removal to `ref_txn_max_ops` (1000) stale precommits per transaction (spec
+/// The sweep chunks its removal to `ref_txn_max_ops` stale precommits per transaction (spec
 /// §Clean Up Old Precommits), and an interruption (an uncertain PUT, wedging the lane) leaves the
 /// remainder harmlessly for a LATER mount's own fresh recovery to finish -- "each chunk re-reads the
 /// LIVE state, so a partial sweep just leaves fewer stale bindings for the next chunk (a later retry
@@ -1949,7 +1949,9 @@ TEST(RefWriterStalePrecommitSweep, BoundedBatchesAndInterruptionResumeAcrossMoun
     auto backend = std::make_shared<RefWriterTestBackend>();
     const Layout layout("p");
     const RootNamespace ns{"srv1/precommit_sweep_bounded"};
-    constexpr int kTotalStale = 1200;   /// > ref_txn_max_ops (1000): forces at least two removal chunks
+    /// Derived from `ref_txn_max_ops` (not a literal) so a future cap change cannot silently drop this
+    /// back to a single removal chunk: still > the cap, forcing at least two removal chunks.
+    constexpr int kTotalStale = static_cast<int>(ref_txn_max_ops) + 200;
 
     uint64_t e1 = 0;
     {
@@ -1958,7 +1960,7 @@ TEST(RefWriterStalePrecommitSweep, BoundedBatchesAndInterruptionResumeAcrossMoun
     }   /// predecessor released; only its epoch is needed -- the stale precommits are seeded raw below
 
     /// Seed kTotalStale precommits directly (bypassing any Pool) under the predecessor's epoch,
-    /// spread over two raw log objects (each within the per-transaction 1000-op ENCODE cap) so recovery
+    /// spread over two raw log objects (each within the per-transaction op ENCODE cap) so recovery
     /// costs only two GETs, not kTotalStale of them.
     {
         std::vector<RefOp> ops1;

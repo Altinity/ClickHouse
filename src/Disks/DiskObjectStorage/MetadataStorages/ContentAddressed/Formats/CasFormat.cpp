@@ -77,7 +77,7 @@ constexpr uint64_t kMiB = 1024 * 1024;
 /// Caps are 100-1000x above realistic sizes; hitting one indicates a corrupt object or protocol bug.
 /// `RefLog` and `RefSnapshot` objects are read whole, so their 64 MiB decompressed object cap
 /// accommodates the JSON-inflated removal-class transaction and full snapshot. Their codecs
-/// independently enforce the existing `ref_txn_max_bytes` (1 MiB) and 64 MiB removal/snapshot budgets
+/// independently enforce the existing `ref_txn_max_bytes` (20 MiB) and 64 MiB removal/snapshot budgets
 /// before sealing.
 ///
 /// Their `line_cap` intentionally equals `object_cap`. A smaller per-line limit would add no memory

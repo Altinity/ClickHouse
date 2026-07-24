@@ -365,7 +365,7 @@ private:
         /// the fence and reads this flag false.
         std::atomic<bool> superseded_by_remount{false};
     };
-    static constexpr size_t kMaxRefBatch = 128;
+    static constexpr size_t kMaxRefBatch = 1000;
     /// Recovery retries at most this many times when an object selected by LIST vanishes before GET.
     /// A failed recovery-seal `PUT` is separate: it leaves `recovered` false and the next touch starts
     /// a fresh LIST/replay/seal attempt rather than resuming this bounded vanish-retry loop.

@@ -54,7 +54,9 @@ bool isRemovalClass(const std::vector<RefOp> & ops)
 }
 
 /// Byte budget over the encoded text. A removal-class transaction uses the larger complete-table
-/// budget; normal transactions also remain bounded by `ref_txn_max_ops`.
+/// budget and has neither an op-count nor a per-op cap; normal transactions are bounded by
+/// `ref_txn_max_ops` and, per op, by `ref_op_max_bytes` (checked via `encodedOpSize`, one op at a
+/// time -- no accumulation).
 void checkBudget(const std::vector<RefOp> & ops, size_t encoded_bytes)
 {
     const bool removal = isRemovalClass(ops);
@@ -63,9 +65,18 @@ void checkBudget(const std::vector<RefOp> & ops, size_t encoded_bytes)
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "RefLogTxn: encoded size {} exceeds the {}-class byte limit {}",
             encoded_bytes, removal ? "removal" : "normal", byte_limit);
-    if (!removal && ops.size() > ref_txn_max_ops)
+    if (removal)
+        return;
+    if (ops.size() > ref_txn_max_ops)
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "RefLogTxn: {} operations exceeds the normal-class op-count limit {}", ops.size(), ref_txn_max_ops);
+    for (const RefOp & op : ops)
+    {
+        const size_t op_bytes = encodedOpSize(op);
+        if (op_bytes > ref_op_max_bytes)
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "RefLogTxn: op encoded size {} exceeds the normal-class per-op limit {}", op_bytes, ref_op_max_bytes);
+    }
 }
 
 void writeBindingFields(CasJsonWriter & out, bool & first, std::string_view prefix, const RefOwnerBinding & b)
@@ -315,6 +326,13 @@ RefLogTxn decodeRefLogTxn(std::string_view data, const String & expected_ns, con
 
     checkBudget(txn.ops, data.size());
     return txn;
+}
+
+size_t encodedOpSize(const RefOp & op)
+{
+    CasJsonWriter out(256);
+    writeOp(out, op);
+    return out.size();
 }
 
 size_t removalOpEncodedSize(RefOwnerKind owner_kind, const String & ref_name, const ManifestRef & manifest_ref)

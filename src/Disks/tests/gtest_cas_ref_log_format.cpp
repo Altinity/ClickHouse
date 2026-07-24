@@ -541,7 +541,9 @@ TEST(CasRefCodec, RemovalClassTransactionLiftsByteBudgetAboveNormalLimit)
 {
     /// A RemoveNamespace transaction carrying a payload bigger than the NORMAL limit but within the
     /// REMOVAL limit must succeed -- proving the removal-class flag actually lifts the byte budget
-    /// rather than merely being ignored.
+    /// rather than merely being ignored. The single payload op here is also vastly bigger than
+    /// `ref_op_max_bytes`, so this doubles as proof that removal-class ops are exempt from the
+    /// per-op cap too.
     RefLogTxn txn;
     txn.ns = "ns";
     txn.txn_id = RefTxnId{1, 1};
@@ -606,7 +608,16 @@ TEST(CasRefCodec, RemovalClassTransactionNotCappedOnOpCount)
     EXPECT_EQ(decoded.ops.size(), txn.ops.size());
 }
 
-TEST(CasRefCodec, EncodeAllowsExactlyMaxBytesNormalTransaction)
+/// Stage-1 T8 (spec §3 "Budget: counts only, chunked flush") retires the scenario this test used to
+/// pin: ONE op carrying almost the whole `ref_txn_max_bytes` budget in its payload. The new per-op
+/// cap (`ref_op_max_bytes`, `EncodeAllowsExactlyMaxPerOpBytes` below) makes that construction illegal
+/// for a normal-class transaction — no single op may exceed `ref_op_max_bytes` regardless of the
+/// whole-transaction budget — so the exact-boundary pin moves to the per-op cap, the boundary a
+/// legally-admitted normal-class transaction can actually reach (`ref_txn_max_ops * ref_op_max_bytes`
+/// stays comfortably under `ref_txn_max_bytes`, pinned by `CanonicalMaxTransactionRoundTrips` in
+/// `gtest_cas_ref_chunked_flush.cpp`).
+
+TEST(CasRefCodec, EncodeAllowsExactlyMaxPerOpBytes)
 {
     RefLogTxn txn;
     txn.ns = "ns";
@@ -618,16 +629,39 @@ TEST(CasRefCodec, EncodeAllowsExactlyMaxBytesNormalTransaction)
     op.payload = "";
     txn.ops.push_back(op);
 
-    const size_t base_size = encodeRefLogTxn(txn).size();
-    ASSERT_LE(base_size, ref_txn_max_bytes);
-    /// Every added 'x' is one un-escaped byte inside the JSON payload string, so the encoded size grows
-    /// one-for-one to exactly the cap.
-    txn.ops[0].payload = String(ref_txn_max_bytes - base_size, 'x');
+    const size_t base_size = encodedOpSize(op);
+    ASSERT_LE(base_size, ref_op_max_bytes);
+    /// Every added 'a' is one un-escaped byte inside the JSON ref-name string, so the encoded op size
+    /// grows one-for-one to exactly the per-op cap.
+    txn.ops[0].ref_name = "r" + String(ref_op_max_bytes - base_size, 'a');
+    ASSERT_EQ(encodedOpSize(txn.ops[0]), ref_op_max_bytes);
 
     const String bytes = encodeRefLogTxn(txn);
-    EXPECT_EQ(bytes.size(), ref_txn_max_bytes);
     const RefLogTxn decoded = decodeRefLogTxn(bytes, txn.ns, txn.txn_id);
     EXPECT_EQ(decoded, txn);
+}
+
+TEST(CasRefCodec, EncodeRejectsOversizedOpOnNormalTransaction)
+{
+    RefLogTxn txn;
+    txn.ns = "ns";
+    txn.txn_id = RefTxnId{1, 1};
+    RefOp op;
+    op.kind = RefOpKind::SetPayload;
+    op.ref_name = "r";
+    op.expected_manifest_ref = manifestRef(1, 1, 1);
+    op.payload = "";
+    txn.ops.push_back(op);
+
+    const size_t base_size = encodedOpSize(op);
+    ASSERT_LE(base_size, ref_op_max_bytes);
+    /// One byte past the per-op cap, well within the whole-transaction byte cap -- isolates the
+    /// per-op check from the (much larger) whole-transaction one.
+    txn.ops[0].ref_name = "r" + String(ref_op_max_bytes - base_size + 1, 'a');
+    ASSERT_GT(encodedOpSize(txn.ops[0]), ref_op_max_bytes);
+    ASSERT_LT(encodedOpSize(txn.ops[0]), ref_txn_max_bytes);
+
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
 }
 
 TEST(CasRefCodec, EncodeAllowsExactlyMaxRemovalBytes)

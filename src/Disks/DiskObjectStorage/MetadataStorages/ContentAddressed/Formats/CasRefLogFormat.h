@@ -65,12 +65,22 @@ struct RefLogTxn
 };
 
 /// Hard limits enforced by the codec at both encode and decode, measured over the JSON text bytes.
-/// Normal transactions have both an operation-count and a byte limit. A transaction containing
-/// `RemoveNamespace` is "removal-class": it shares the larger complete-table byte budget and has no
-/// separate operation-count cap because that byte budget bounds it.
-inline constexpr size_t ref_txn_max_ops = 1000;
-inline constexpr size_t ref_txn_max_bytes = 1024 * 1024;
+/// Normal transactions have an operation-count limit, a byte limit, and a per-op size limit. A
+/// transaction containing `RemoveNamespace` is "removal-class": it shares the larger complete-table
+/// byte budget and has neither a separate operation-count cap nor a per-op cap, because that byte
+/// budget alone bounds it.
+inline constexpr size_t ref_txn_max_ops = 5000;
+/// Admission is ops-only (no accumulated-size estimation); this stays as a decode-side acceptance
+/// bound plus a post-encode writer assert. The canonical writer cannot reach it: at most
+/// `ref_txn_max_ops` ops at `ref_op_max_bytes` each is well under this, with framing headroom to
+/// spare.
+inline constexpr size_t ref_txn_max_bytes = 20 * 1024 * 1024;
 inline constexpr size_t ref_removal_max_bytes = 64 * 1024 * 1024;
+/// Per-op size cap on normal-class ops, enforced exactly per op (one op encoded alone, no
+/// accumulation) both at admission and at decode. Not unreachable: `checkCanonicalRefName` imposes
+/// no length limit and ref/part names grow with partition-key values. Removal-class ops are exempt
+/// (they share the byte budget above and have no per-op cap).
+inline constexpr size_t ref_op_max_bytes = 4096;
 
 /// Encode the transaction to canonical, uncompressed text. The persist path seals this text according
 /// to the `Always`/`.zst` policy; keeping the codec unsealed lets the byte-budget check and preview
@@ -99,5 +109,10 @@ size_t removalOpEncodedSize(RefOwnerKind owner_kind, const String & ref_name, co
 /// + Σ removalOpEncodedSize` equals `encodeRefLogTxn(...)`'s size, for the hypothetical whole-namespace
 /// removal transaction described above, exactly.
 size_t removalFramingSize(const String & ns, const RefTxnId & txn_id, uint64_t op_count);
+
+/// Encoded byte size of exactly one op, on its own, as it appears inside a `RefLogTxn` body (the
+/// record line only -- no header, meta, or trailer framing). Used to enforce the per-op size cap at
+/// admission and at decode without ever accumulating a whole transaction's bytes.
+size_t encodedOpSize(const RefOp & op);
 
 }
