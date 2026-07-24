@@ -98,7 +98,9 @@ against the literal sketch — not speculative:
    `sab_epochreset.cfg` sabotage (`SabResetEpoch` zeroes `epoch` the identical way `WipeEpoch`
    does, and `epochCeiling` is immune to both) — a real regression, old RED silently turned
    GREEN. Reverted; see "Accepted residual gap" below for how the resulting honest-config
-   false-alarm on this conjunct (and on `FenceCostsEpoch`) is instead handled at the cfg level.
+   false-alarm on this conjunct is instead handled at the cfg level (note: `FenceCostsEpoch`
+   was ALSO dropped from the same cfgs, but for a distinct cause — see that section's
+   corrected, per-invariant causal breakdown, not a shared "`WipeEpoch` alone" trigger).
 4. **`WipeEpoch` made one-shot-per-behavior (`epochWiped` guard).** Originally unconditional
    per the brief's sketch ("always enabled"). Controller-flagged runaway CPU: `WipeEpoch`
    composing repeatedly with subsequent re-mints multiplied the explored state space with no
@@ -112,14 +114,43 @@ against the literal sketch — not speculative:
 
 ### Accepted residual gap: `FenceCostsEpoch` / `WriterEpochMonotoneUnique` in honest configs {#accepted-residual-gap}
 
-`WipeEpoch`, even alone (no re-mint, no sabotage), can make `epoch` legitimately read below a
-value already recorded in `wrote`/`fencedEpochs` — the SAME underlying mechanism the
-pre-existing, Sab-gated `SabResetEpoch` models, just reachable without that sabotage flag. This
-is **precisely** the design spec's own "Residual hole, honestly stated" (Phase C section):
-"epoch AND mount both wiped under a live mount still permits a same-pair twin... degrading to a
-remount, never to two silently-live writers persisting" — an ACCEPTED, bounded, self-healing
-risk Phase C does not eliminate (no body nonce / coherent-read machinery is a stated non-goal),
-not a regression this gate is meant to catch.
+**Correction (2026-07-24, review follow-up):** the original text below conflated the causes of
+the two dropped invariants under one "`WipeEpoch` alone" narrative. An independent reviewer
+re-ran both invariants individually (re-added to `stage1.cfg` one at a time) and found their
+causes are **different** — only one of the two is actually triggered by `WipeEpoch` alone. Both
+are corrected separately here.
+
+**`WriterEpochMonotoneUnique`** — genuinely triggered by `WipeEpoch` **alone**, no re-mint
+needed. Shortest counterexample (depth 6, honest `stage1.cfg`): `ClaimOwnerEmpty → AllocEpoch
+(epoch 1) → ClaimMount → Write (wrote = {(A,1)}) → WipeEpoch (epoch: 1→0)`. At that final state,
+`wrote` already contains `(A,1)` while the live `epoch` reads `0`, directly violating the
+conjunct `\A x \in wrote : x[2] <= epoch`. This is the SAME underlying mechanism the
+pre-existing, Sab-gated `SabResetEpoch` models (`SabResetEpoch` also zeroes `epoch` while
+`wrote` already holds a higher value), just now reachable without that sabotage flag, since
+`WipeEpoch` is deliberately ungated.
+
+**`FenceCostsEpoch`** — **NOT** triggered by `WipeEpoch` alone; requires `RemintEpoch`'s
+**honest** branch to actually fire afterward. Shortest counterexample found by the reviewer
+(re-adding `FenceCostsEpoch` to `stage1.cfg` in isolation): `AllocEpoch (epoch 1) → ClaimMount →
+GcFence (fencedEpochs = {(A,1)}) → AllocEpoch (epoch 2) → ClaimMount → ClearExpiredMount (mount
+= None) → WipeEpoch (epoch: 2→0) → RemintEpoch mints the literal 1 (mount = None satisfies the
+honest guard) → ClaimMount reinstalls a LIVE, unfenced mount at (A,1)` — colliding with the
+`(A,1)` pair `GcFence` already fenced earlier. **Root cause: `RemintEpoch`'s honest branch mints
+a hardcoded literal `1` with no distinctness protection**, unlike `RemintEpochDecom`'s honest
+branch, which mints `mount.epoch + 1` (distinct by construction against the surviving mount it
+can see). `RemintEpoch`'s `mount = None` guard correctly prevents re-arming a still-LIVE mount,
+but does nothing to prevent the freshly-minted epoch NUMBER from colliding with a **historical**
+value already recorded in `fencedEpochs` for this same uuid — a distinct failure mode from the
+"is a mount currently live" question the guard actually answers.
+
+Both mechanisms are, at the level of the design spec's own language, instances of the same
+accepted category: "Residual hole, honestly stated" (Phase C section) — "epoch AND mount both
+wiped under a live mount still permits a same-pair twin... degrading to a remount, never to two
+silently-live writers persisting" — a bounded, self-healing risk Phase C does not eliminate (no
+body nonce / coherent-read machinery is a stated non-goal). But they are two **different**
+concrete triggers within that category, not one, and `FenceCostsEpoch`'s trigger is narrower and
+plausibly closeable (see "Follow-up" below) — it should not be read as equally fundamental to
+`WriterEpochMonotoneUnique`'s.
 
 Both `FenceCostsEpoch` and `WriterEpochMonotoneUnique` read raw, instantaneous state
 (`fencedEpochs` membership / the live `epoch` value) and cannot distinguish "temporarily
@@ -130,6 +161,23 @@ model's own pre-existing precedent: `CaCasMountCore_sab_epochreset.cfg` has neve
 meaningful and are still exercised where they are each cfg's own primary target
 (`WriterEpochMonotoneUnique` in `sab_epochreset.cfg`; `FenceCostsEpoch` in
 `sab_fenceresurrect.cfg` and — as the actual intended finding — `sab_decomblindbypass.cfg`).
+
+#### Follow-up (NOT implemented in this task) {#followup-remintepoch-distinct-mint}
+
+Minting `epochCeiling + 1` instead of the literal `1` in `RemintEpoch`'s honest branch would
+plausibly close the `FenceCostsEpoch` hole identified above: since `epochCeiling` is already a
+monotone high-water mark over every value `epoch` has ever held (including values later
+fenced), a mint of `epochCeiling + 1` can never numerically collide with anything in
+`fencedEpochs` for this uuid, by construction — the same distinctness argument
+`RemintEpochDecom`'s `mount.epoch + 1` already relies on. This would likely allow restoring
+BOTH `FenceCostsEpoch` and `WriterEpochMonotoneUnique`'s ceiling conjunct to `stage1.cfg` (the
+latter would still need the `WipeEpoch`-alone depth-6 case addressed separately, e.g. via the
+`epochCeiling`-based ceiling substitution attempted and reverted in deviation #3 above — revisit
+that revert in light of this fix, since the reason it was wrong was that it ALSO defeated
+`sab_epochreset.cfg`'s detection, a concern orthogonal to this follow-up), narrowing the
+residual gap to only the "epoch AND mount BOTH wiped simultaneously under a live mount" case
+the design spec explicitly accepts. **Deliberately not implemented here** — flagged as a
+candidate refinement for a later task/round, not a blocking gap in this phase-0 gate's verdict.
 
 ### Step 4/5 — full battery on the modified model {#step-4-5-full-battery}
 
