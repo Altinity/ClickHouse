@@ -1024,6 +1024,17 @@ bool Pool::tryRemountOnce()
         if (mount_runtime.hasKeeper())
             mount_runtime.keeperStopBackground();
         mount_runtime.installKeeper(our_uuid, writer_epoch, now_ms);
+        /// Pre-I/O anchor of this remount's claim attempt (mirrors `mountWritable`'s
+        /// `claim_anchor_boot_ms`, captured at the identical point -- right after `installKeeper`,
+        /// right before the keeper's own adopt write). Unlike `mountWritable`, the (conditional)
+        /// materialization-grace wait on THIS path already ran above (the `refLanesSettledForRemount`
+        /// check), strictly BEFORE this anchor is taken -- so no wait can land between this anchor and
+        /// the arm below, and no TTL-consumed redo is needed here: the anchor alone suffices (rev.4
+        /// Phase B, round-3 finding 2; the redo lives in `mountWritable`, whose grace wait runs AFTER
+        /// its own anchor). `quiesceRefTablesForRemount` below only drains already-in-flight
+        /// publishers, bounded by the same `cas_request_budget` that `validateCasRequestBudget`
+        /// already guarantees fits under `ttl_ms` -- not an unbounded operator-configured wait.
+        const uint64_t remount_anchor_boot_ms = mount_runtime.bootMsNow();
         mount_runtime.keeperStart();
 
         /// Re-establish the ref-protocol incarnation BEFORE re-arming the fence. Order is load-bearing:
@@ -1039,8 +1050,10 @@ bool Pool::tryRemountOnce()
         /// 2. Drain publishers and drop the cached tables so each re-recovers under the new epoch on next
         ///    touch (and any leader still holding an orphaned runtime fails closed). While the fence is lost.
         ref_ledger.quiesceRefTablesForRemount();
-        /// 3. Re-open the gate. From here appends allocate ids under the new epoch and touch fresh runtimes.
-        mount_runtime.armMountFence(our_uuid, writer_epoch, mount_runtime.bootMsNow() + ttl_ms);
+        /// 3. Re-open the gate. Anchored at the claim attempt's pre-I/O instant (`remount_anchor_boot_ms`),
+        ///    never at response time -- see the comment above `keeperStart()`. From here appends allocate
+        ///    ids under the new epoch and touch fresh runtimes.
+        mount_runtime.armMountFence(our_uuid, writer_epoch, remount_anchor_boot_ms + ttl_ms);
         if (config.background_watermark)
             mount_runtime.keeperStartBackground(config.mount_renew_period);
 

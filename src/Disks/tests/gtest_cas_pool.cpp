@@ -1581,12 +1581,17 @@ TEST(CasPool, StartupArmRedoesLeaseWriteWhenGraceConsumesTtl)
     const DB::UInt128 uuid(0x42);
     backend->mount_key = layout.mountKey(srid);
 
-    /// Seed a FENCED, expired predecessor body: the claim reclaims it with
+    /// Seed a FENCED, expired predecessor body under a DIFFERENT epoch (7, matching
+    /// `FencedPriorPaysOnlyTmat`'s convention — the pool's own first-allocated epoch is always 1,
+    /// so colliding with it would make the FIRST claim attempt hit claimMount's same-uuid-same-epoch
+    /// FencedSelf branch instead, costing one silent fence-recovery iteration before the SECOND
+    /// attempt -- now epoch 2 vs the seeded epoch 7 -- finally reclaims via the different-epoch
+    /// Fenced path below). With epoch 7 the first (and only) attempt reclaims directly with
     /// MountPriorState::Fenced -> unclean_reclaim = true -> the grace wait runs.
     {
         DB::Cas::MountLease prior;
         prior.server_uuid = uuid;
-        prior.writer_epoch = 1;
+        prior.writer_epoch = 7;
         prior.seq = 7;
         prior.expires_at_ms = 1;      /// long expired
         prior.gc_fenced = true;
