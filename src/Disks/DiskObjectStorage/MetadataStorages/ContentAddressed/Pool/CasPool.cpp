@@ -1026,14 +1026,14 @@ bool Pool::tryRemountOnce()
         mount_runtime.installKeeper(our_uuid, writer_epoch, now_ms);
         /// Pre-I/O anchor of this remount's claim attempt (mirrors `mountWritable`'s
         /// `claim_anchor_boot_ms`, captured at the identical point -- right after `installKeeper`,
-        /// right before the keeper's own adopt write). Unlike `mountWritable`, the (conditional)
-        /// materialization-grace wait on THIS path already ran above (the `refLanesSettledForRemount`
-        /// check), strictly BEFORE this anchor is taken -- so no wait can land between this anchor and
-        /// the arm below, and no TTL-consumed redo is needed here: the anchor alone suffices (rev.4
-        /// Phase B, round-3 finding 2; the redo lives in `mountWritable`, whose grace wait runs AFTER
-        /// its own anchor). `quiesceRefTablesForRemount` below only drains already-in-flight
-        /// publishers, bounded by the same `cas_request_budget` that `validateCasRequestBudget`
-        /// already guarantees fits under `ttl_ms` -- not an unbounded operator-configured wait.
+        /// right before the keeper's own adopt write). No UNBOUNDED wait can land between this anchor
+        /// and the arm below, so no TTL-consumed redo is needed here: the anchor alone suffices (rev.4
+        /// Phase B, round-3 finding 2; the redo lives in `mountWritable`, whose materialization-grace
+        /// wait runs AFTER its own anchor -- on THIS path that (conditional) grace wait already ran
+        /// above, the `refLanesSettledForRemount` check, strictly BEFORE this anchor is taken).
+        /// `quiesceRefTablesForRemount` below IS a wait, but a bounded one -- bounded by the same
+        /// `cas_request_budget` that `validateCasRequestBudget` already guarantees fits under
+        /// `ttl_ms`, never an unbounded operator-configured wait like `materialization_grace_ms`.
         const uint64_t remount_anchor_boot_ms = mount_runtime.bootMsNow();
         mount_runtime.keeperStart();
 

@@ -1359,6 +1359,80 @@ TEST(CasPoolRemount, ShutdownGuardRefusesToArmRemount)
         << "scheduleRemount must not arm a recovery thread once teardown has begun";
 }
 
+namespace
+{
+/// A sequenced fake boot clock: the first N `bootMsNow()` calls return the values queued via
+/// `.queue`, in order; every call after the queue drains returns `.steady`. `CasMountRuntime::bootMsNow`
+/// re-invokes `PoolConfig::boot_ms_fn` on EVERY call, with zero memoization -- so a plain call-counter
+/// deterministically distinguishes an early (anchor) reading from a later (response-time) one, with no
+/// real sleep and no threads.
+struct SequencedBootClock
+{
+    std::vector<uint64_t> queue;
+    size_t next = 0;
+    uint64_t steady = 0;
+
+    uint64_t operator()()
+    {
+        if (next < queue.size())
+            return queue[next++];
+        return steady;
+    }
+};
+}
+
+/// Phase B addendum 2 (task 5b review, reviewer's probe): the self-remount arm must anchor at the
+/// claim attempt's pre-I/O instant (`remount_anchor_boot_ms`, captured right after `installKeeper`
+/// and right before `keeperStart()` in `Pool::tryRemountOnce`), never at a later reading taken after
+/// `keeperStart`/`quiesceRefTablesForRemount` have already run.
+///
+/// The two `bootMsNow()` calls of interest, in the ORDER each code version issues them:
+///   - FIXED code: call #1 = the new anchor (`remount_anchor_boot_ms`, before `keeperStart`);
+///     call #2 = `MountLeaseKeeper::prepareRenew`'s own internal boot read inside `keeperStart`'s
+///     `doStart` (feeds only the keeper's OWN internal `confirmed_deadline_ms` -- unrelated to the
+///     Pool-level arm -- so its value is irrelevant to the arm post-fix).
+///   - PRE-FIX code (no anchor line): call #1 = that SAME `prepareRenew` read (now the first boot
+///     call of the attempt, since nothing reads the clock before `keeperStart`); call #2 = the
+///     arm-site's own `mount_runtime.bootMsNow()`, read AFTER `keeperStart` returns -- the stale,
+///     response-time reading this whole fix exists to stop using.
+/// A sequenced clock returning 10000 then 999999 (an inflated, much-later reading) therefore arms
+/// the FIXED code from 10000 and the PRE-FIX code from 999999, regardless of which call site reads
+/// which value -- letting a single deterministic probe (`mayMutate()` at boot == 10000+ttl) tell
+/// them apart with no sleep and no thread. (TDD evidence for both branches is recorded in the task-5
+/// report, not re-asserted here: this test body only encodes the FIXED expectation.)
+TEST(CasPoolRemount, RemountArmAnchorsAtClaimAttemptNotResponseTime)
+{
+    SequencedBootClock clock;
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = DB::Cas::Pool::open(backend, DB::Cas::PoolConfig{
+        .pool_prefix = "p", .server_root_id = "test",
+        .mount_lease_ttl_ms = std::chrono::milliseconds(30'000),
+        .boot_ms_fn = [&] { return clock(); },
+    });
+    ASSERT_TRUE(store);
+
+    /// Trip the fence exactly as every other remount test in this file does.
+    fenceOutMount(*backend, store->layout().mountKey("test"));
+
+    /// Arm the sequence for the upcoming remount attempt: the initial `open` above already drained
+    /// an unrelated number of `bootMsNow()` calls (all served from `.steady = 0` -- irrelevant, since
+    /// nothing probes the resulting arm before this point). Reset the counter so the FIRST call from
+    /// here on is the remount attempt's own call #1.
+    clock.queue = {10000, 999999};
+    clock.next = 0;
+
+    ASSERT_TRUE(store->tryRemountOnce());
+
+    /// Probe at boot == anchor + ttl (10000 + 30000 = 40000): the fixed code armed from the anchor
+    /// (10000), so the fence has JUST expired here -- `mayMutate` must be false. (The pre-fix code
+    /// would still read `mayMutate` as true here, armed from 999999 + 30000 -- see the TDD run in the
+    /// report.)
+    clock.steady = 40000;
+    EXPECT_FALSE(store->mayMutate())
+        << "the remount arm must anchor at the claim attempt's pre-I/O instant, not a later "
+           "response-time reading taken after keeperStart/quiesceRefTablesForRemount";
+}
+
 /// ==== rev.6 Task 5: clean-release drain gates the farewell marker ====
 
 namespace
