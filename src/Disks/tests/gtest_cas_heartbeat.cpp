@@ -598,3 +598,62 @@ TEST(CasHeartbeat, BackgroundLoopFencesImmediatelyOnConfirmedMismatch)
 
     EXPECT_TRUE(lost.load()) << "background loop must fence immediately on a confirmed same-epoch mismatch";
 }
+
+namespace
+{
+/// The landed-but-unacked case: the putOverwrite APPLIES to the in-memory state, THEN throws a
+/// transient exception — the exact CI shape (a client-side timeout whose PUT landed server-side).
+/// The existing TransientPutOverwriteFaultBackend throws BEFORE applying and cannot model this.
+class ApplyThenThrowPutOverwriteFaultBackend final : public InMemoryBackend
+{
+public:
+    int fault_count = 0;
+
+    PutResult putOverwrite(const String & k, const String & b, const Token & e, const ObjectMeta & m) override
+    {
+        if (fault_count > 0)
+        {
+            --fault_count;
+            InMemoryBackend::putOverwrite(k, b, e, m);   /// the write LANDS...
+            throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR,
+                "injected ambiguous fault: applied, ack lost");   /// ...the ack does not.
+        }
+        return InMemoryBackend::putOverwrite(k, b, e, m);
+    }
+};
+}
+
+/// End-to-end reproduction of the CI crash (Altinity PR#2073, asan CAS-s3 stateless): beat 1's
+/// renewal lands but its ack is lost (transient -> the loop retries, deadline permitting); beat 2
+/// renews with the now-stale token, gets a CONFIRMED mismatch, re-reads our own advanced body ->
+/// the Phase A uncertain branch -> the loop stops, on_lost fires (fence latches; in production the
+/// Pool self-remounts from there). No process death anywhere.
+TEST(CasHeartbeat, BackgroundLoopSurvivesAmbiguousLandedRenewal)
+{
+    auto backend = std::make_shared<ApplyThenThrowPutOverwriteFaultBackend>();
+    Layout layout("pool");
+    const String srid = "test";
+    const UInt128 uuid(0x1234);
+    uint64_t now_ms = 1000;
+    seedOwnClaim(*backend, layout, srid, uuid, /*epoch=*/9, now_ms, /*ttl_ms=*/30000);
+
+    std::atomic<bool> lost{false};
+    MountLeaseKeeper keeper(backend, layout, srid, uuid, /*writer_epoch=*/9, std::chrono::milliseconds(30000),
+                            [&] { return now_ms; }, [] { return uint64_t{0}; }, CasEventSink{},
+                            std::chrono::milliseconds(2000));
+    keeper.setFenceCallbacks([] {}, [&] { lost = true; });
+    keeper.start();   /// the adopt-path putOverwrite must land unfaulted.
+
+    backend->fault_count = 1;   /// beat 1: lands + throws (ambiguous); beat 2: confirmed mismatch.
+    keeper.startBackground(std::chrono::milliseconds(20));
+
+    /// Bounded poll for on_lost (never a blind sleep): the deadline is generous; the loop needs
+    /// two ~20ms beats. abort_on_logical_error stays ON to prove no branch constructs one.
+    DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!lost.load() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    EXPECT_TRUE(lost.load()) << "the confirmed mismatch after an ambiguous landed renewal must "
+                                "latch the fence via on_lost (and must not abort the process)";
+    keeper.stopBackground();
+}
