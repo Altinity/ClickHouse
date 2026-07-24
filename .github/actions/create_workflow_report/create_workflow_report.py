@@ -279,9 +279,11 @@ def _git_log_merge_prs(
 
 def _find_release_baseline(
     branch_ref: str, repo: str, cwd: str | None
-) -> tuple[str | None, str | None]:
+) -> tuple[str | None, str | None, str | None]:
+    """Return (tag_name, tag_sha, published_date YYYY-MM-DD) for the latest
+    non-draft release tag that is an ancestor of branch_ref."""
     if not GITHUB_TOKEN:
-        return None, None
+        return None, None, None
     headers = {
         "Authorization": f"token {GITHUB_TOKEN}",
         "Accept": "application/vnd.github.v3+json",
@@ -305,8 +307,10 @@ def _find_release_baseline(
             continue
         if not _git_is_ancestor(tag_sha, branch_ref, cwd):
             continue
-        return tag_name, tag_sha
-    return None, None
+        published_at = rel.get("published_at") or rel.get("created_at") or ""
+        published_date = published_at[:10] if published_at else None
+        return tag_name, tag_sha, published_date
+    return None, None, None
 
 
 def _find_rebase_baseline(branch_ref: str, cwd: str | None) -> str | None:
@@ -336,17 +340,33 @@ def _find_rebase_baseline(branch_ref: str, cwd: str | None) -> str | None:
     return lines[0]
 
 
+def _git_commit_date(sha: str, cwd: str | None) -> str | None:
+    p = subprocess.run(
+        ["git", "show", "-s", "--format=%cs", sha],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if p.returncode != 0:
+        return None
+    date = p.stdout.strip()
+    return date or None
+
+
 def get_prs_in_release_dataframe(
     branch_ref: str = "HEAD",
     *,
     repo: str = GITHUB_REPO,
     cwd: str,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, str | None]:
     f"""
     PRs merged into branch_ref that belong in the next release notes: after the latest GitHub
     Release tag on this history, or after the oldest rebase bootstrap if no such tag exists.
     Only merge commits whose subject has from <repo_owner>/ (e.g. from Altinity/) are included.
     Columns: pr_number, pr_name, labels. Omits PRs labeled cicd.
+
+    Returns (dataframe, baseline_date YYYY-MM-DD or None).
     """
     branch_sha = _git_rev_parse(branch_ref, cwd)
     if not branch_sha:
@@ -369,6 +389,7 @@ def get_prs_in_release_dataframe(
     )
 
     baseline_sha = None
+    baseline_date = None
     for _ in range(DEEPEN_CAP // DEEPEN_STEP):
         subprocess.run(
             ["git", "fetch", f"--deepen={DEEPEN_STEP}", "origin", branch_ref],
@@ -377,9 +398,13 @@ def get_prs_in_release_dataframe(
             text=True,
             check=False,
         )
-        _, baseline_sha = _find_release_baseline(branch_ref, repo, cwd)
+        _, baseline_sha, baseline_date = _find_release_baseline(
+            branch_ref, repo, cwd
+        )
         if not baseline_sha:
             baseline_sha = _find_rebase_baseline(branch_ref, cwd)
+            if baseline_sha:
+                baseline_date = _git_commit_date(baseline_sha, cwd)
         if baseline_sha:
             break
 
@@ -390,7 +415,24 @@ def get_prs_in_release_dataframe(
         )
 
     df = _git_log_merge_prs(baseline_sha, branch_ref, cwd, repo)
-    return _enrich_prs_in_release_merge_prs(df, repo)
+    return _enrich_prs_in_release_merge_prs(df, repo), baseline_date
+
+
+def _prs_in_release_search_url(branch_name: str, baseline_date: str | None) -> str | None:
+    if not baseline_date:
+        return None
+    # Tag-triggered runs expose the tag as head_branch; search needs the PR base
+    # branch (e.g. v25.8.28.10001.altinitystable → stable-25.8).
+    match = re.match(
+        r"^v(\d+)\.(\d+)\.\d+\.\d+\.altinity(stable|antalya)$", branch_name
+    )
+    if match:
+        branch_name = f"{match.group(3)}-{match.group(1)}.{match.group(2)}"
+    query = f"is:pr base:{branch_name} merged:>{baseline_date}"
+    return (
+        f"https://github.com/{GITHUB_REPO}/pulls?"
+        + urllib.parse.urlencode({"q": query})
+    )
 
 
 def _checks_latest_test_status_cte(commit_sha: str, branch_name: str) -> str:
@@ -723,6 +765,37 @@ def get_cached_job(job_name: str) -> dict:
     return workflow_config["cache_jobs"].get(job_name, {})
 
 
+@lru_cache
+def get_expected_version_labels() -> list[str]:
+    """Return required version labels from workflow_config.custom_data.version.
+
+    Stable releases use the minor and full version labels. Antalya releases use
+    ``antalya``, ``antalya-{major}.{minor}``, and ``antalya-{full_version}``.
+    Returns an empty list when version metadata is unavailable.
+    """
+    try:
+        version = get_workflow_config().get("custom_data", {}).get("version") or {}
+        major = version.get("major")
+        minor = version.get("minor")
+        patch = version.get("patch")
+        tweak = version.get("tweak")
+        flavour = version.get("flavour")
+        if None in (major, minor, patch, tweak, flavour):
+            print("WARNING:Incomplete version metadata in workflow config.")
+            return []
+        minor_version = f"{major}.{minor}"
+        full_version = f"{minor_version}.{patch}.{tweak}"
+        if flavour == "altinityantalya":
+            return ["antalya", f"antalya-{minor_version}", f"antalya-{full_version}"]
+        if flavour in ["altinitystable", "altinitytest"]:
+            return [minor_version, full_version]
+        print(f"WARNING:Unknown release flavour in workflow config: {flavour}")
+        return []
+    except Exception as e:
+        print(f"WARNING:Could not read expected version labels: {e}")
+        return []
+
+
 def get_cves(pr_number, commit_sha, branch):
     """
     Fetch Grype results from S3.
@@ -836,12 +909,20 @@ def format_pr_labels_with_verification(labels: str) -> str:
 
     Expects ``labels`` to be already HTML-escaped at collection time
     (see _enrich_prs_in_release_merge_prs).
+
+    Requires ``verified`` plus expected minor and full version labels when
+    version metadata is available.
     """
-    labels_list = labels.split(", ")
-    if "verified" in labels_list:
+    labels_list = labels.split(", ") if labels else []
+    required = ["verified"] + get_expected_version_labels()
+    missing = [label for label in required if label not in labels_list]
+    if not missing:
         return labels
-    else:
-        return f'<span style="font-weight: bold; color: red;">{labels} (missing verification)</span>'
+    missing_text = html.escape(", ".join(missing), quote=True)
+    return (
+        f'<span style="font-weight: bold; color: red;">'
+        f"{labels} (missing: {missing_text})</span>"
+    )
 
 
 def format_test_name_for_linewrap(text: str) -> str:
@@ -1088,11 +1169,17 @@ def create_workflow_report(
         "docker_images_cves": [],
     }
     known_fails = {}
+    prs_in_release_search_url = None
 
     if pr_number == 0 and not mark_preview:
         try:
-            prs_df = get_prs_in_release_dataframe(branch_name, cwd=os.getcwd())
+            prs_df, baseline_date = get_prs_in_release_dataframe(
+                branch_name, cwd=os.getcwd()
+            )
             results_dfs["prs_in_release"] = prs_df
+            prs_in_release_search_url = _prs_in_release_search_url(
+                branch_name, baseline_date
+            )
         except Exception as e:
             print(f"Error in get_prs_in_release_dataframe: {e}")
 
@@ -1184,10 +1271,13 @@ def create_workflow_report(
         "build_report_links": get_build_report_links(
             results_dfs["job_statuses"], pr_number, branch_name, commit_sha
         ),
+        "prs_in_release_search_url": prs_in_release_search_url,
         "prs_in_release_html": (
             "<p>PR details are not loaded during preview.</p>"
             if mark_preview or pr_number != 0
-            else format_results_as_html_table(results_dfs["prs_in_release"])
+            else format_results_as_html_table(
+                results_dfs["prs_in_release"]
+            )
         ),
         "ci_jobs_status_html": format_results_as_html_table(
             results_dfs["job_statuses"]
