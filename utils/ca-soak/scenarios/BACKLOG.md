@@ -2995,3 +2995,51 @@ Improvement options (any future effort should re-verify these lines first):
    engages with concurrency, batch size 1.0 only when serial).
 Not scheduled; revisit if bulk-partition latency on CAS is ever measured as a problem (INSERT was
 the measured 7.6× case).
+
+## NEW CARD TO BUILD — S42: allocation-fault soak (exception safety of the CAS write path) (requested 2026-07-24) {#s42-allocation-fault-soak}
+
+**Origin:** user request during the publish-confirm fetch-handoff design round. Design lives in
+`docs/superpowers/specs/2026-07-23-cas-fetch-handoff-publish-confirm-design.md` §testing; this entry
+is the suite-side registration. Next free id is **S42** (`s41_wide_insert_baseline.py` is taken).
+
+**Why:** the suite faults nodes (kill/restart) and the object store (s3faultproxy), but never the
+ALLOCATOR. The whole exception-safety class the ref-lane hardening is about — a throw landing
+between a durable PUT and its in-memory apply, leaving the cache diverged from the journal — is
+invisible to every existing card, and in ordinary testing allocations simply succeed. This card
+makes allocation failure a first-class fault source. Blanket requirement (user): **everything must
+stay consistent despite allocation errors** — queries may fail, invariants may not.
+
+**Mechanisms (in-server, no new compose needed):**
+- `memory_tracker_fault_probability` — per-query `Float` Setting (`Core/Settings.cpp:2312`), throws
+  on allocation with the given probability. NOT debug-gated (`MemoryTracker.cpp:340-342`), so it
+  works on the ordinary RelWithDebInfo soak image, and it faults allocations inside the CAS commit
+  path (`stageManifest` -> `precommitAdd` -> ref-lane apply -> `promote`) — exactly the window the
+  hardening targets.
+- `cannot_allocate_thread_fault_injection_probability` — `ServerSetting`
+  (`ServerSettings.cpp:233`), applied via config + `SYSTEM RELOAD CONFIG`
+  (`InterpreterSystemQuery.cpp:1158` -> `CannotAllocateThreadFaultInjector::setFaultProbability`).
+  Different class: thread creation fails, reaching the background pools (GC scheduler, merges,
+  ref-lane dispatch) that the query-level setting cannot.
+
+**Legs:** A = query-thread alloc faults over a soak-shaped workload window; B = thread-allocation
+faults over the same workload; C = disarm both -> quiesce -> GC to fixpoint -> fsck -> RESTART the
+node and assert the post-restart view (rebuilt from the durable journal) equals the pre-restart view
+part-for-part and row-for-row (the diverged-ledger-cache oracle — nothing else in the suite catches
+it).
+
+**Oracle (queries ARE allowed to fail):** zero `LOGICAL_ERROR` / zero aborts in `err.log`; every
+ACKED insert's rows present (S40-shaped acked-vs-lost); replicas agree; fsck `dangling=0` /
+`unaccounted=0`, unreachable settles; GC rounds succeed again after disarm; no permanently wedged
+ref lane (a lane wedged by an uncertain append must resolve or provably self-heal after remount —
+assert it, do not assume); no query hung past a bound.
+
+**Soundness guard (mandatory, S39-style):** assert the faults were actually exercised (nonzero
+injected-failure count) or report `inconclusive` — never a vacuous pass. Same lesson as S07's
+never-triggered manifest cap and S37's vacuous TTL leg.
+
+**Optional stronger mode:** run the same card against a DEBUG image — `DENY_ALLOCATIONS_IN_SCOPE`
+regions (debug-only) are then enforced under real allocation pressure, turning the soak into a live
+check of the no-throw-install invariant.
+
+**Params:** per-scale probability (dev low enough that the workload still progresses; ci/full
+higher; plus a short high-probability burst), fault-window and settle durations.

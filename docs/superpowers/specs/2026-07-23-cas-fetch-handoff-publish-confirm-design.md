@@ -428,6 +428,41 @@ One spec, one plan, phases in this order (writing-plans maps them to tasks):
 - **RPL-5 slice**: `REPLACE PARTITION`/`ATTACH PARTITION ... FROM` on 2-replica CA (extend
   `test_cas_replicated_relink`): queue-cloned `REPLACE_RANGE` fetch relinks (blob-count proof).
 - **Version-mix**: confirm-capable receiver × legacy sender cookie → clean byte fallback.
+- **Allocation-fault soak — new ca-soak scenario S42** (user request; gates phases 3 and 7, and
+  guards the whole CAS write path against the exception-safety class these phases are about).
+  Soak-shaped workload with in-server fault injection instead of an external fault proxy:
+  - **Leg A — query-thread allocation faults:** `memory_tracker_fault_probability` (a per-query
+    `Float` Setting, `Core/Settings.cpp:2312` — "throw an exception every time you allocate memory
+    with the specified probability") armed on the workload's INSERT/SELECT for a window. It is NOT
+    debug-gated (`MemoryTracker.cpp:340-342`), so it runs on the ordinary RelWithDebInfo soak
+    image, and it faults allocations exactly where this spec cares: inside the CAS commit path
+    (`stageManifest` → `precommitAdd` → ref-lane apply → `promote`).
+  - **Leg B — thread-allocation faults:** `cannot_allocate_thread_fault_injection_probability` (a
+    `ServerSetting`, `ServerSettings.cpp:233`, applied through `SYSTEM RELOAD CONFIG` →
+    `CannotAllocateThreadFaultInjector::setFaultProbability`, `InterpreterSystemQuery.cpp:1158`) —
+    a different class: thread creation fails, hitting the background pools (GC scheduler, merges,
+    ref-lane dispatch) that leg A cannot reach.
+  - **Leg C — post-fault consistency + fresh-recovery equality:** disarm both, quiesce, GC to
+    fixpoint, fsck; then RESTART the node and assert the post-restart view (rebuilt from the
+    durable journal) equals the pre-restart view part-for-part and row-for-row. This is the direct
+    oracle for the diverged-ledger-cache class (a failed apply leaves the cache stale while the
+    journal is right) — nothing else in the suite catches it.
+  - **Oracle (queries are ALLOWED to fail; consistency is not):** zero `LOGICAL_ERROR` and zero
+    aborts in `err.log`; every ACKED insert's rows present (the driver's acked-vs-lost model — the
+    S40-shaped data-loss check); replicas agree; fsck `dangling=0`/`unaccounted=0` and unreachable
+    settles; GC rounds succeed again after disarm; no permanently wedged ref lane (a lane wedged by
+    an uncertain append must resolve, or provably self-heal after remount — the documented
+    semantics, asserted rather than assumed); no query hung past a bound.
+  - **Soundness guard (S39-style, mandatory):** assert the faults were actually exercised — a
+    nonzero count of injected failures (`MEMORY_LIMIT_EXCEEDED` occurrences / failed-query count)
+    — else report `inconclusive`, never a vacuous pass.
+  - **Optional stronger mode:** the same card against a DEBUG image additionally enforces every
+    `DENY_ALLOCATIONS_IN_SCOPE` region under real allocation pressure (the macro is debug-only),
+    turning the soak into a live check of the phase-7 invariant.
+  - Params (`param_table`): probability per scale (dev small enough that the workload still makes
+    progress, ci/full higher, plus a short high-probability burst window), fault-window and settle
+    durations. Registered in `utils/ca-soak/scenarios/BACKLOG.md`; next free id is **S42**
+    (`s41_wide_insert_baseline.py` is taken).
 - **No-throw-install (phase 7)**: bench gates (wedge→flush, `BM_FlushInstall`, plus a chunked
   multi-transaction tenure — the candidate is now built per chunk) before/after; failpoint battery
   incl. allocation-failure injection between PUT and install (post-fix: install provably cannot
