@@ -114,7 +114,7 @@ private:
     std::condition_variable cv;
 
     uint64_t in_flight = 0;          /// sum of admitted NORMAL weights (overweight bodies are not counted -- they run alone)
-    size_t waiting_exclusive = 0;    /// overweight acquirers queued OR currently running (drives the fairness gate)
+    size_t waiting_exclusive = 0;    /// overweight acquirers QUEUED (a running one is tracked by `exclusive_active`); drives the fairness gate
     bool exclusive_active = false;   /// an overweight acquirer is currently holding
     size_t active_holders = 0;       /// all permit holders (normal + the one exclusive)
 

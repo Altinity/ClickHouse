@@ -263,8 +263,10 @@ void PartWriteTxn::mergeBlobUploadResults(std::span<const BlobUploadResult> resu
         const auto [it, inserted] = seen.try_emplace(r.ref, &r.dep);
         if (!inserted && !(*it->second == r.dep))
             throw Exception(ErrorCodes::LOGICAL_ERROR,
-                "PartWriteTxn::mergeBlobUploadResults: conflicting dep records for {} (size {} vs {}) -- "
-                "the fan-out must launch exactly one task per unique ref and merge exactly one result",
+                "PartWriteTxn::mergeBlobUploadResults: dep records differ for {} (sizes {} vs {}) -- "
+                "the fan-out must launch exactly one task per unique ref and merge exactly one result; "
+                "records for one ref that differ in ANY field (size, token, kind, or adopted) are a "
+                "wiring error, so the sizes shown may be equal when the mismatch is in another field",
                 blobIdOf(r.ref), it->second->size, r.dep.size);
     }
 
@@ -316,14 +318,12 @@ BlobDepRecord PartWriteTxn::observeAndAdmit(ObjectKind kind, const BlobRef & ref
     /// pre-precommit.
     const HeadResult hr = store->backend().head(key);
     if (!hr.exists)
-        /// Object absent at observe time. Two contexts call this overload:
-        ///   1. adoptTree (fail-closed): a detached/frozen tree that is absent at adopt time is
-        ///      NOT a transient race — it was GC-collected. The caller must abort or re-create from
-        ///      source (not retry forever). FILE_DOESNT_EXIST is the right outcome for adoptTree.
-        ///   2. checkAndResolveDeps gate (retryable): a GC-deleted object at gate time is a race
-        ///      under INV-3 — the caller retries the whole operation and re-materializes from source.
-        ///      The gate catches FILE_DOESNT_EXIST here and re-throws it as ABORTED (see
-        ///      gateObserveAndAdmit below) so the INSERT layer sees the uniform retryable error.
+        /// Object absent at observe time. The live caller of this overload is the revival re-observe in
+        /// `uploadFromSource` (`reviveObserve` below, retryable): a GC-deleted object at re-observe time
+        /// is a race under INV-3 — the caller HOLDS the source bytes, so it catches FILE_DOESNT_EXIST
+        /// here and re-throws it as ABORTED so the INSERT layer sees the uniform retryable error and
+        /// re-uploads from those bytes. This overload only ever raises FILE_DOESNT_EXIST; the caller
+        /// decides fail-closed vs retry.
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
             "PartWriteTxn::observeAndAdmit: object {} vanished (GC-deleted) before observe; "
             "caller must re-upload/re-materialize from source", key);
@@ -359,8 +359,7 @@ BlobDepRecord PartWriteTxn::observeAndAdmit(ObjectKind kind, const BlobRef & ref
         /// INV-1 (revival-from-source): the observed token is condemned — we must NOT read the dying
         /// object via backend().get. Throw ABORTED so the caller can re-upload from its OWN source bytes.
         ///   • putBlob (has BlobSource): catches ABORTED, calls uploadFromSource from held bytes.
-        ///   • uploadStagedTree / recreateTree (has retained_trees payload): calls uploadFromSource.
-        ///   • gate bodyless (no source): propagates ABORTED (retryable; caller retries op).
+        ///   • a bodyless observe (no source): propagates ABORTED (retryable; caller retries op).
         EventEmitter{*store}.emit([&](CasEvent & e)
         {
             e.type = CasEventType::BlobReuseResurrect;
@@ -462,10 +461,10 @@ BlobUploadResult PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef &
     /// racing writer is assumed to have (re-)created the object, so we adopt its token via the 3-arg
     /// observeAndAdmit. But the object can be GC-deleted in the window (present at the conditional PUT
     /// → 412, gone at the subsequent HEAD), making the 3-arg overload throw FILE_DOESNT_EXIST. The
-    /// caller (putBlob / uploadStagedTree / recreateTree) HOLDS the source bytes, so a vanish here is a
-    /// retryable race: convert FILE_DOESNT_EXIST → ABORTED so putBlob's bounded retry loop re-uploads
-    /// from those bytes (and tree callers likewise re-create). Without this, FILE_DOESNT_EXIST escaped
-    /// putBlob's ABORTED-only catch as a FATAL INSERT failure — the sibling of the gate bug.
+    /// caller (putBlob's fresh-upload path, via `uploadFromSource`) HOLDS the source bytes, so a vanish
+    /// here is a retryable race: convert FILE_DOESNT_EXIST → ABORTED so putBlob's bounded retry loop
+    /// re-uploads from those bytes. Without this, FILE_DOESNT_EXIST escaped putBlob's ABORTED-only catch
+    /// as a FATAL INSERT failure — the sibling of the gate bug.
     auto reviveObserve = [&](const String & k_) -> BlobDepRecord
     {
         try

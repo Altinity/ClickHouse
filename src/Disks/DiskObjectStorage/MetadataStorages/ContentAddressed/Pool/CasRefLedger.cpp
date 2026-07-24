@@ -1807,8 +1807,8 @@ bool CasRefLedger::admitSnapshotPublishUnderStateLock(RefTableRuntime & rt)
     {
         /// The threshold trigger reads the tail counters directly -- no walk, no age filter.
         /// `tail_count_since_snapshot`/`tail_bytes_since_snapshot` count ONLY applied txns strictly above
-        /// `newest_snapshot_id` (maintained incrementally by every commit and every adoption, see
-        /// `flushRefBatch`/`trySnapshotPublishOnce`), so `over_threshold` here is never true without a
+        /// `newest_snapshot_id` (maintained incrementally by every commit in `commitRefChunk` and by the
+        /// wedge-resolution apply in `flushRefBatch`), so `over_threshold` here is never true without a
         /// real, immediately-coverable candidate.
         const uint64_t publishable_count = rt.tail_count_since_snapshot.load(std::memory_order_relaxed);
         const uint64_t publishable_bytes = rt.tail_bytes_since_snapshot.load(std::memory_order_relaxed);

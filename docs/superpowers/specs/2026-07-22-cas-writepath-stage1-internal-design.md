@@ -137,6 +137,16 @@ dedicated pool.
   CAS packs ~2 blobs/part, so the win there is bounded; merges and large parts with many blobs
   benefit proportionally more.
 
+**As built (T14 note):** the entry point is the free function `Cas::fanOutBlobUploads(build, requests,
+pool)` (`ContentAddressedTransaction.cpp`), called from `uploadPendingBlobs`; it performs the
+one-task-per-unique-ref grouping, dispatches `PartWriteTxn::uploadBlobDetached` per unique ref on the
+pool, joins under a `SCOPE_EXIT_SAFE` drain guard, then applies `mergeBlobUploadResults` on the owning
+writer thread. A codex-review Critical fix landed inside it: each task is TRACKED (a pre-reserved handle
+vector, appended via `enqueueAndGiveOwnership`) in the SAME no-throw step in which it is scheduled — not
+the runner's `enqueueAndKeepTrack`, which schedules first and only THEN appends to an unreserved vector —
+so a `bad_alloc` can never strand a scheduled-but-untracked task the drain guard cannot join (a
+use-after-free on the `results`/txn the task captures).
+
 ### 2. Ledger: two-phase carve (fix the throwable transfer window) {#two-phase-carve}
 
 Real today, independent of everything else: the flush carve pops items from `pending` under
@@ -170,6 +180,11 @@ A related pre-existing hole in the validation loop is fixed alongside (found in 
 `working` or its ops in `final_ops`. Fix: reserve `final_ops`/`survivors` growth before applying
 the item to `working`; publish `working` only after all accumulation steps are past their throwing
 points.
+
+**As built (T14 note):** a codex-review Important fix landed alongside the carve — the ref-lane leader
+baton (`leader_active`) is published only AFTER the first `owned_items` allocation, never before; a
+throw in the pre-carve window would otherwise strand the baton and wedge every waiting writer (the same
+strand class the carve itself closes, just at the tenure boundary).
 
 ### 3. Budget: counts only, chunked flush {#budget}
 
@@ -231,6 +246,11 @@ replaces spilling with **chunked flushing** — nothing is ever given back:
   `checkCanonicalRefName` imposes no length limit and part names grow with partition-key values
   (`MergeTreePartition.cpp:272`). The decoder enforces the same per-op bound.
 
+**As built (T14 note):** the `ref_txn_max_bytes` constant was **1 MiB** before this stage; T8 raised it
+to the **20 MiB** this section specifies (`CasRefLogFormat.h`), so "retained at 20 MiB" above is achieved
+by that bump, not by a pre-existing 20 MiB value. `ref_txn_max_ops` (5000) and the carve item cap
+`kMaxRefBatch` (1000) landed exactly as specified.
+
 ### 4. `RefOp::payload` removal {#payload-removal}
 
 Production never populates the opaque `payload` string; the promote-time op and `updateRefPayload`
@@ -288,6 +308,14 @@ live `rt.state`:
   oracle (`CasFsck.cpp:209`) stream through the same builder. (GC folding already decodes one log
   at a time, `CasGc.cpp:1073` — unchanged.)
 - The stale 1 MiB budget comment near `CasFormat.cpp:80` is updated.
+
+**As built (T14 note):** `RecoveryResult` is filled in two parts — the streaming replay builder fills the
+replay-derived fields, and the ledger fills the recovery-context fields — but it is INSTALLED by a single
+`installRecoveryResult` that copies EVERY field under `state_mutex` with `recovered` set LAST (a
+deviation from the literal "the builder returns one fully-complete struct"). The
+`RecoveryResult`-inventory gtest asserts every current field is filled, so the split cannot silently drop
+one. `applyOne` also carries `encoded_bytes` (the stored transaction size known at the GET site) into the
+tail-bytes accounting.
 
 ## Settings {#settings}
 

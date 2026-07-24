@@ -123,9 +123,11 @@ Caller launchDrop(const PoolPtr & store, const RootNamespace & ns, const String 
     return Caller{std::move(t), std::move(fut)};
 }
 
-/// `n` ops that contribute nothing when applied (default-constructed = `NamespaceBirth`) -- safe
-/// filler for a `build_ops` result whose only purpose is to overflow the per-item op-count cap; the
-/// count check fires before any of these ops is ever applied or otherwise inspected.
+/// `n` filler ops for a `build_ops` result whose only purpose is to overflow the per-item op-count
+/// cap. They are NOT inert-when-applied: a default-constructed op is a `NamespaceBirth`, which throws
+/// `CORRUPTED_DATA` ("namespace_birth while already Live") if it were ever applied to the pre-published
+/// namespace. The load-bearing safety property is that the count check fires BEFORE any of these ops is
+/// applied or otherwise inspected.
 std::vector<RefOp> fillerOps(size_t n)
 {
     return std::vector<RefOp>(n, RefOp{});
@@ -474,8 +476,13 @@ public:
     void awaitBlockEntered()
     {
         std::unique_lock lk(block_mutex);
-        /// Bounded (20s): if the latched publisher never reaches its PUT, fail the wait rather than hang.
+        /// Bounded (20s): if the latched publisher never reaches its PUT, fail LOUDLY rather than hang.
+        /// The assertion is load-bearing -- without it a wiring regression that never parks the publisher
+        /// would let `SnapshotPublisherLatchedAcrossChunks` pass VACUOUSLY (its final re-fire assertion
+        /// can still hold via a direct, non-coalesced dispatch).
         block_cv.wait_for(lk, std::chrono::seconds(20), [&] { return block_entered; });
+        ASSERT_TRUE(block_entered) << "latched publisher never entered its blocked PUT within 20s -- "
+                                      "coalescing was not exercised";
     }
     void releaseBlock()
     {

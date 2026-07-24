@@ -139,10 +139,18 @@ void ByteWeightedSemaphore::release(uint64_t weight) noexcept
 {
     {
         std::lock_guard lock(mutex);
+        /// Fail loud (debug/sanitizer builds) on an unpaired release. The sole production caller
+        /// (`ByteWeightedSemaphoreLock`) pairs acquire/release exactly; a trip here means a wiring
+        /// regression or a second caller underflowing these unsigned counters, which would otherwise
+        /// silently wedge every subsequent admission with no signal.
+        chassert(active_holders > 0);
         if (weight > capacity_bytes)
             exclusive_active = false;
         else
+        {
+            chassert(in_flight >= weight);
             in_flight -= weight;
+        }
         --active_holders;
     }
     cv.notify_all();
