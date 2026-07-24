@@ -100,9 +100,18 @@ protected:
     virtual Token claim(const String & body) = 0;
 
     /// === optional background-renewal observation hooks (default no-op) ===
-    /// Called from the background loop after a SUCCESSFUL `renewOnce` (off `state_mutex`); the
-    /// mount-lease keeper refreshes the local write-fence deadline here. The watermark keeper does not
-    /// override it (no-op), so its behavior is unchanged.
+    /// Called from `renewOnce` itself, right after a SUCCESSFUL write is recorded (under
+    /// `state_mutex`, on EVERY caller of `renewOnce` — the background loop AND any direct caller,
+    /// such as the startup-arm redo in `CasPool.cpp`'s `mountWritable`). The mount-lease keeper
+    /// refreshes its confirmed-lease wall deadline here, so a direct `renewOnce` (which never goes
+    /// through `onRenewSucceeded` below) still keeps that deadline current. The watermark keeper does
+    /// not override it (no-op), so its behavior is unchanged.
+    virtual void onRenewCommitted() {}
+    /// Called from the background loop after a SUCCESSFUL `renewOnce` (off `state_mutex`, AFTER
+    /// `onRenewCommitted` has already run); the mount-lease keeper fires the boot-domain
+    /// write-fence callback (`on_renew_ok`) here — this hook is background-loop-only, unlike
+    /// `onRenewCommitted` above. The watermark keeper does not override it (no-op), so its behavior
+    /// is unchanged.
     virtual void onRenewSucceeded() {}
     /// Called from the background loop when `renewOnce` THREW (the loop is about to stop, off
     /// `state_mutex`); the mount-lease keeper latches the write fence to lost here. Default no-op.
@@ -569,15 +578,26 @@ protected:
     /// the base state lock and `dead` flag prevent another renewal from racing this write.
     void terminate() override;
 
-    /// Refreshes the Pool's local write-fence deadline after a confirmed lease renewal.
+    /// Refreshes `confirmed_deadline_ms` after EVERY successful renewal (background OR a direct
+    /// caller) — see `onRenewCommitted`'s base doc comment.
+    void onRenewCommitted() override;
+
+    /// Fires the boot-domain write-fence callback (`on_renew_ok`) after a confirmed BACKGROUND
+    /// lease renewal. `confirmed_deadline_ms` itself is refreshed by `onRenewCommitted` above (which
+    /// already ran, for this same successful renewal, before the background loop calls this).
     void onRenewSucceeded() override;
 
     /// Latches the Pool's local write fence when renewal can no longer prove that this incarnation
     /// owns the mount slot.
     void onRenewFailed() override;
 
-    /// Re-reads a failed renewal and classifies a GC fence of this incarnation separately from a
-    /// foreign writer; both outcomes remain terminal and fail closed.
+    /// Re-reads a failed renewal and classifies it five ways -- fenced_by_gc, same_epoch_state_uncertain
+    /// (this incarnation's own token was advanced past under our own (uuid, epoch): ambiguous, not
+    /// proof of anything, and NOT fatal), superseded (a newer epoch), foreign_writer, and vanished
+    /// (the backing object disappeared) -- every branch stays terminal and fail closed, but only
+    /// `foreign_writer` constructs a `LOGICAL_ERROR`; the rest throw non-aborting exception codes
+    /// (`ABORTED`/`FILE_DOESNT_EXIST`) since each is reachable by an ordinary network timeout or
+    /// environmental condition, not a programming bug.
     void onRenewMismatch(const String & mismatched_key) override;
     /// Fence immediately only once our last CONFIRMED lease (the last successful
     /// `claim`/renew) has reached its safety-margin boundary -- `confirmed_deadline_ms - now <=
@@ -587,8 +607,8 @@ protected:
 private:
     /// Refreshes `confirmed_deadline_ms` from `anchor_wall_ms` + `ttl` — anchor = the pre-I/O wall
     /// instant of the confirming attempt. Called on every point this keeper KNOWS it holds a live
-    /// lease: both success paths of `claim` (mint and adopt), and every successful background renew
-    /// (`onRenewSucceeded`).
+    /// lease: both success paths of `claim` (mint and adopt), and every successful `renewOnce`
+    /// (`onRenewCommitted`) — background-driven or a direct caller alike.
     void refreshConfirmedDeadline(uint64_t anchor_wall_ms);
 
     String srid;

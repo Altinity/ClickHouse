@@ -77,8 +77,11 @@ paths reachable by normal operation:
 The new branch's name and message state what is KNOWN — the slot advanced past our held token
 under our own (uuid, epoch); cause uncertain (an ambiguous landed renewal of ours is the common
 cause; a same-pair twin after epoch-state loss is the pathological one — Phase C narrows the
-latter). Forensics in the message and the `MountConflict` event: observed vs local `seq`, observed
-`pid`/`hostname`/`started_at_ms`. Recovery is uniform and already proven: `ABORTED` →
+latter). Forensics: the exception `message` carries the observed body's full identity
+(`describeMountHolder`: `server_uuid`/`hostname`/`pid`/`writer_epoch`/`seq`/`expires_at_ms`) plus
+OUR local `seq` ("... vs our seq=N"); the `MountConflict` event carries only the observed body's
+identity (`holder_uuid`/`holder_hostname`/`holder_pid`/`holder_epoch`/`holder_seq`/
+`holder_expires_at_ms` — `expires_at_ms`, not `started_at_ms`). Recovery is uniform and already proven: `ABORTED` →
 `backgroundLoop` confirmed-mismatch path → `onRenewFailed` → `on_lost` → write fence latches →
 self-remount re-claims with a fresh durable epoch (`CasPool.cpp:950-1050`; observed working
 end-to-end in the very CI run that caught the crash).
@@ -107,8 +110,10 @@ established `CasWriteRetryLater` path); reads are unaffected.
 `expires_at_ms` was stamped at **prepare** time, so the local fence deadline exceeds the durable
 authorization by the request latency (pre-existing; today bounded only by the S3 request timeout,
 30 s by default — not by any protocol constant). Change: `renewOnce` captures attempt-start
-instants **before calling `prepareRenew`** (so the anchors precede the payload's own wall-clock
-stamp) and passes them to the success hooks; both deadlines become `attempt_start + TTL`.
+instants **before calling `prepareRenew`** (so the anchors precede-or-equal the payload's own
+wall-clock stamp — the wall anchor IS the payload stamp: `prepareRenew` reads it from the same
+`last_attempt_wall_ms` the renewal hooks anchor from) and passes them to the success hooks; both
+deadlines become `attempt_start + TTL`.
 
 Clock-domain precision (round-3 №4): the two deadline sites live in different domains — the
 keeper's `confirmed_deadline_ms` is wall-clock (`now_ms_fn`), the runtime's `mayMutate` fence is

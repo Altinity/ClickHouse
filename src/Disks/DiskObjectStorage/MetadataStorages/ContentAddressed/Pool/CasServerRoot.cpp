@@ -870,12 +870,21 @@ SingleWriterSlot::Token MountLeaseKeeper::claim(const String & body)
     return res.token;
 }
 
-void MountLeaseKeeper::onRenewSucceeded()
+void MountLeaseKeeper::onRenewCommitted()
 {
     /// Anchor at the attempt start (stashed by prepareRenew), never at this ack instant — a slow
     /// ack must not extend either fence past what the durable body it acknowledges authorizes
-    /// (spec rev.4 Phase B).
+    /// (spec rev.4 Phase B). Runs for EVERY successful `renewOnce` — background-driven or a direct
+    /// caller (e.g. the startup-arm redo in `CasPool.cpp`'s `mountWritable`) — so the wall deadline
+    /// never goes stale just because a renewal happened to be invoked outside the background loop.
     refreshConfirmedDeadline(last_attempt_wall_ms);
+}
+
+void MountLeaseKeeper::onRenewSucceeded()
+{
+    /// `confirmed_deadline_ms` was already refreshed by `onRenewCommitted` above, which `renewOnce`
+    /// (base) calls right after recording the successful write — before the background loop reaches
+    /// this hook. This hook fires only the boot-domain write-fence callback.
     if (on_renew_ok)
         on_renew_ok(last_attempt_boot_ms);
 }
@@ -884,8 +893,9 @@ void MountLeaseKeeper::onRenewFailed()
 {
     /// Background renewal failed: `renewOnce` threw and the loop is stopping. Latch the local write
     /// fence to lost so no further mutation proceeds — fail closed. The mismatch itself was already
-    /// classified and emitted by `onRenewMismatch` (fenced_by_gc / superseded / foreign_writer) just
-    /// before this throw propagated here — this event is only the fence-latch timeline marker.
+    /// classified and emitted by `onRenewMismatch` (fenced_by_gc / same_epoch_state_uncertain /
+    /// superseded / foreign_writer / vanished) just before this throw propagated here — this event is
+    /// only the fence-latch timeline marker.
     emitMountEvent(event_sink, CasEventType::MountConflict, srid, "renew_failed", nullptr,
         "renew mismatch — see the preceding classified mount_conflict event; write fence latched to lost");
     if (on_lost)
@@ -1100,6 +1110,11 @@ void SingleWriterSlot::renewOnce()
     }
 
     recordWrite(seq + 1, res.token);
+    /// Reached only on success (the branch above always throws on a mismatch). Notify the subclass
+    /// EVERY successful renewal is committed — background-driven (`backgroundLoop`'s own call) or a
+    /// direct caller (a redo site invoking `renewOnce` outright) alike; the mount-lease keeper
+    /// refreshes its confirmed-lease wall deadline here regardless of who called us.
+    onRenewCommitted();
 }
 
 void SingleWriterSlot::onRenewMismatch(const String & mismatched_key)
@@ -1207,7 +1222,8 @@ void SingleWriterSlot::backgroundLoop(std::chrono::milliseconds period)
             return;
         }
         /// Successful renewal: notify the subclass (off `state_mutex`) before sleeping again. The
-        /// mount-lease keeper refreshes the write-fence deadline here.
+        /// wall deadline was already refreshed inside `renewOnce` (`onRenewCommitted`); the
+        /// mount-lease keeper fires the boot-domain write-fence callback here.
         try
         {
             onRenewSucceeded();

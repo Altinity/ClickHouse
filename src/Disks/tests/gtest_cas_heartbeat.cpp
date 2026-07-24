@@ -155,6 +155,9 @@ TEST(CasHeartbeat, SameEpochUnfencedTouchIsUncertainNotFatal)
         EXPECT_NE(e.message().find("state uncertain"), String::npos) << e.message();
         /// Forensics must ride in the message: the observed seq and our local seq.
         EXPECT_NE(e.message().find("seq=99"), String::npos) << e.message();
+        /// The local-seq fragment specifically -- not just any "seq=99" substring (which the
+        /// OBSERVED holder's own describeMountHolder text could also satisfy on its own).
+        EXPECT_NE(e.message().find("vs our seq="), String::npos) << e.message();
     }
 }
 
@@ -490,6 +493,38 @@ TEST(CasHeartbeat, SuccessfulRenewExtendsTransientRetryDeadline)
     keeper.onRenewSucceeded();
     EXPECT_FALSE(keeper.shouldFenceOnTransientRenewFailure())
         << "the refreshed deadline (2900, margin 100) must not trip at now_ms=1900 any more";
+}
+
+/// Fence-not-rescue round follow-up #1: the redo site in `CasPool.cpp`'s `mountWritable` (the
+/// materialization-grace-consumed-the-TTL branch) calls `renewOnce` DIRECTLY -- never through
+/// `onRenewSucceeded` (that hook is only ever invoked by `backgroundLoop`). Before this fix, only
+/// `onRenewSucceeded` refreshed `confirmed_deadline_ms`, so a direct `renewOnce` call left the wall
+/// deadline stale at the pre-redo anchor. A successful renewal must refresh the deadline regardless
+/// of who called `renewOnce` -- background loop or a direct caller alike.
+TEST(CasHeartbeat, DirectRenewOnceRefreshesConfirmedDeadlineWithoutOnRenewSucceeded)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    Layout layout("pool");
+    const String srid = "test";
+    const UInt128 uuid(0x1234);
+    uint64_t now_ms = 1000;
+    seedOwnClaim(*backend, layout, srid, uuid, /*epoch=*/9, now_ms, /*ttl_ms=*/1000);
+
+    TestableMountLeaseKeeper keeper(backend, layout, srid, uuid, /*writer_epoch=*/9,
+                                     std::chrono::milliseconds(1000), [&] { return now_ms; },
+                                     [] { return uint64_t{0}; }, CasEventSink{},
+                                     /*lease_safety_margin=*/std::chrono::milliseconds(100));
+    keeper.start();   /// confirmed_deadline_ms = 2000
+
+    now_ms = 1900;
+    ASSERT_TRUE(keeper.shouldFenceOnTransientRenewFailure()) << "sanity: 1900 trips the OLD deadline";
+
+    /// A DIRECT renewOnce -- exactly what the redo site calls, with `onRenewSucceeded` never invoked
+    /// anywhere near it -- must ALSO refresh confirmed_deadline_ms to 1900 + 1000 = 2900.
+    keeper.renewOnce();
+    EXPECT_FALSE(keeper.shouldFenceOnTransientRenewFailure())
+        << "a direct renewOnce (with no onRenewSucceeded call at all) must refresh the confirmed "
+           "deadline too -- the redo's wall anchor must not go stale";
 }
 
 namespace

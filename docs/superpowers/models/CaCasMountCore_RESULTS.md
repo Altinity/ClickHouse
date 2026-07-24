@@ -179,6 +179,18 @@ residual gap to only the "epoch AND mount BOTH wiped simultaneously under a live
 the design spec explicitly accepts. **Deliberately not implemented here** — flagged as a
 candidate refinement for a later task/round, not a blocking gap in this phase-0 gate's verdict.
 
+Honesty note on this whole follow-up: the model's `RemintEpoch` action is gated only by
+`~(mount # None /\ mount.uuid = a /\ ~mount.fenced)` — it never checks `rootEmpty`, and
+`rootEmpty` itself is one-way (TRUE only at genesis, `FALSE` once any `Write` fires and never
+`TRUE` again), so the model's honest `RemintEpoch` reaches states the real code's
+`allocateWriterEpoch` cannot: the code's absent-epoch branch additionally requires
+`serverRootSubtreeEmpty` (an authoritative empty-subtree probe) before minting, a precondition
+this model omits entirely. The honest-config `FenceCostsEpoch` counterexample above therefore
+over-approximates the code's real exposure — conservative in direction (it can only find a
+hole the code might not actually have, never hide one the code does have) — and should be
+revisited together with the `epochCeiling + 1` refinement, not treated as proof the code itself
+reaches this state.
+
 ### Step 4/5 — full battery on the modified model {#step-4-5-full-battery}
 
 All runs below are against the final committed `.tla` + cfg state (single `java
