@@ -8573,9 +8573,6 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     }
     else
     {
-        /// Plain (hive) object storage writes every row of each part to the one directory computed from
-        /// the destination PARTITION BY on the part's min row, so each source partition must map to a
-        /// single destination partition. Equivalent or finer source keys are accepted.
         ExportPartitionUtils::verifyPlainPartitionCompatibility(
             src_snapshot,
             destination_snapshot,
