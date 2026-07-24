@@ -2114,6 +2114,12 @@ bool CasRefLedger::trySnapshotPublishOnce(const RootNamespace & ns)
         /// logs-per-table-after-snapshot: the tail this publish compacted.
         ProfileEvents::increment(ProfileEvents::CasRefSnapshotTailLogs, captured_count);
         rt->newest_snapshot_id = candidate_x;
+        /// `sealed_from` pairs with `newest_snapshot_id` (CasRefLedger.h): it is the newest snapshot's own
+        /// seal bound, `nullopt` for an ordinary Live snapshot. Take it from the snapshot just published
+        /// (`snap`, always `nullopt` here) so this later publication CLEARS any predecessor recovery seal's
+        /// `sealed_from` -- leaving it would describe this non-seal snapshot with the seal's observed-region
+        /// bound, a false introspection contract.
+        rt->sealed_from = snap.sealed_from;
         /// The new cache-weight base is exactly the snapshot
         /// we just encoded and PUT, so its body size is the fresh base weight -- no re-encode needed.
         rt->base_snapshot_bytes.store(bytes.size(), std::memory_order_relaxed);
@@ -2328,6 +2334,10 @@ void CasRefLedger::publishRemovedSnapshotNow(const RootNamespace & ns)
 
     std::lock_guard lock(rt->state_mutex);
     rt->newest_snapshot_id = remove_id;
+    /// A Removed snapshot is never a recovery seal; take `sealed_from` from it (`nullopt`) so this
+    /// publication CLEARS any predecessor seal's `sealed_from`, keeping the runtime field paired with
+    /// `newest_snapshot_id` (CasRefLedger.h).
+    rt->sealed_from = removed_snap.sealed_from;
     rt->tail_count_since_snapshot.store(0, std::memory_order_relaxed);
     rt->tail_bytes_since_snapshot.store(0, std::memory_order_relaxed);
 }

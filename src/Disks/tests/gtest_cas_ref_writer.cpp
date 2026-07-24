@@ -2893,6 +2893,106 @@ TEST(RefWriterRecoverySeal, RuntimeInventoryCarriesSealSealedFrom)
         << "the runtime must carry the seal's sealed_from, not the stale predecessor value";
 }
 
+/// Codex round-2b, residual 2 (runtime `sealed_from` lifecycle on LATER publication -- ordinary variant):
+/// the runtime `sealed_from` is documented (CasRefLedger.h) to pair with `newest_snapshot_id` -- it is
+/// the seal's bound when the newest snapshot IS a recovery seal, `nullopt` otherwise. Recovery-from-seal
+/// installs it as the seal's value; a LATER ordinary Live snapshot publication that advances
+/// `newest_snapshot_id` must therefore CLEAR it, since the new snapshot is not a seal. Without the clear
+/// the field describes a non-seal snapshot with the predecessor seal's bound -- a false introspection
+/// contract. Sequence: recover from an unclean seal (`sealed_from == {2,1}`), append above the seal in
+/// the live epoch, publish an ordinary snapshot, and assert the runtime now reports `nullopt` while
+/// `newest_snapshot_id` names the new (non-seal) snapshot.
+TEST(RefWriterRecoverySeal, OrdinarySnapshotPublicationClearsStaleSealedFrom)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/seal_then_ordinary"};
+
+    seedSealFixtureDeadEpochs(*backend, layout, ns);
+    seedUncleanPredecessorMount(*backend, layout, /*epoch=*/2);
+
+    PoolConfig config;
+    config.server_id = UInt128(1);
+    config.mount_lease_ttl_ms = std::chrono::milliseconds(500);
+    config.cas_request_budget = sealTestTinyBudget();
+    config.materialization_grace_ms = 1000;
+    config.wait_sleep_fn = [](uint64_t) {};
+    /// High thresholds: no automatic background publish fires -- we drive `trySnapshotPublishOnce` directly.
+    config.snapshot_log_count_threshold = 1ULL << 40;
+    config.snapshot_log_bytes_threshold = 1ULL << 40;
+    auto store = openPoolWithConfig(backend, config);
+    ASSERT_TRUE(store);
+    ASSERT_EQ(store->liveWriterEpoch(), 3u);
+    ASSERT_TRUE(store->uncleanEpochBoundarySeenForTest());
+
+    /// Drive recovery + the seal, then confirm the recovered runtime carries the seal's own bound.
+    ASSERT_EQ(store->listRefs(ns).size(), 2u);
+    const RefTxnId seal_id{2, UINT64_MAX};
+    ASSERT_EQ(store->newestPublishedSnapshotIdForTest(ns), std::optional<RefTxnId>(seal_id));
+    ASSERT_EQ(store->sealedFromForTest(ns), std::optional<RefTxnId>(RefTxnId{2, 1}))
+        << "recovery-from-seal must install the seal's sealed_from";
+
+    /// Append above the seal in the live epoch (3), then publish an ordinary Live snapshot at it.
+    publishEmptyPart(store, ns, "c");
+    ASSERT_TRUE(store->trySnapshotPublishOnce(ns))
+        << "there is now committed state above the seal to publish";
+
+    const auto newest = store->newestPublishedSnapshotIdForTest(ns);
+    ASSERT_TRUE(newest.has_value());
+    EXPECT_EQ(newest->writer_epoch, 3u) << "the newest snapshot is the ordinary Live one just published in epoch 3";
+    EXPECT_GT(*newest, seal_id) << "and it strictly succeeds the recovery seal";
+    EXPECT_EQ(store->sealedFromForTest(ns), std::nullopt)
+        << "an ordinary Live snapshot publication must clear the predecessor seal's sealed_from -- the "
+           "runtime field pairs with newest_snapshot_id and the newest is no longer a seal";
+}
+
+/// Codex round-2b, residual 2 (removed-snapshot publication variant): a Removed snapshot is never a
+/// recovery seal, so publishing one (via `dropNamespace` -> `publishRemovedSnapshotNow`) that advances
+/// `newest_snapshot_id` must likewise CLEAR a predecessor seal's `sealed_from`. Same recover-from-seal
+/// prelude as the ordinary variant, then drop the namespace and assert the runtime reports `nullopt`
+/// while `newest_snapshot_id` names the Removed snapshot.
+TEST(RefWriterRecoverySeal, RemovedSnapshotPublicationClearsStaleSealedFrom)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/seal_then_removed"};
+
+    seedSealFixtureDeadEpochs(*backend, layout, ns);
+    seedUncleanPredecessorMount(*backend, layout, /*epoch=*/2);
+
+    PoolConfig config;
+    config.server_id = UInt128(1);
+    config.mount_lease_ttl_ms = std::chrono::milliseconds(500);
+    config.cas_request_budget = sealTestTinyBudget();
+    config.materialization_grace_ms = 1000;
+    config.wait_sleep_fn = [](uint64_t) {};
+    config.snapshot_log_count_threshold = 1ULL << 40;
+    config.snapshot_log_bytes_threshold = 1ULL << 40;
+    auto store = openPoolWithConfig(backend, config);
+    ASSERT_TRUE(store);
+    ASSERT_EQ(store->liveWriterEpoch(), 3u);
+    ASSERT_TRUE(store->uncleanEpochBoundarySeenForTest());
+
+    ASSERT_EQ(store->listRefs(ns).size(), 2u);
+    const RefTxnId seal_id{2, UINT64_MAX};
+    ASSERT_EQ(store->newestPublishedSnapshotIdForTest(ns), std::optional<RefTxnId>(seal_id));
+    ASSERT_EQ(store->sealedFromForTest(ns), std::optional<RefTxnId>(RefTxnId{2, 1}))
+        << "recovery-from-seal must install the seal's sealed_from";
+
+    /// Drop the namespace: the removal transaction (epoch 3, above the seal) is published as a Removed
+    /// snapshot, advancing newest_snapshot_id to it.
+    store->dropNamespace(ns);
+    ASSERT_TRUE(store->namespaceIsRemoved(ns));
+
+    const auto newest = store->newestPublishedSnapshotIdForTest(ns);
+    ASSERT_TRUE(newest.has_value());
+    EXPECT_EQ(newest->writer_epoch, 3u) << "the newest snapshot is the Removed one published in epoch 3";
+    EXPECT_GT(*newest, seal_id) << "and it strictly succeeds the recovery seal";
+    EXPECT_EQ(store->sealedFromForTest(ns), std::nullopt)
+        << "a Removed snapshot publication must clear the predecessor seal's sealed_from -- a Removed "
+           "snapshot is never a recovery seal";
+}
+
 TEST(RefWriterRecoverySeal, LateLogBelowSealIsInvisibleToRecoveryAndFold)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();

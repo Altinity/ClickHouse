@@ -246,6 +246,13 @@ TEST(CasRecoveryStreaming, LongTailReplaysUnderMemoryBound)
     EXPECT_LE(tracker.peak(), static_cast<int64_t>(bound))
         << "streaming recovery must hold at most ~one decoded transaction (peak " << tracker.peak()
         << " B) not the whole " << kTxns << "-transaction tail (" << seeded.total_footprint << " B)";
+    /// Lower bound (the accountant's fail-close): the peak must reach at least one whole decoded
+    /// transaction's footprint. This couples the assertion to the production report calls -- delete them
+    /// and the peak collapses to zero, failing HERE instead of passing vacuously under the upper bound.
+    EXPECT_GE(tracker.peak(), static_cast<int64_t>(seeded.max_single_footprint))
+        << "the probe must observe at least one whole decoded transaction resident (peak " << tracker.peak()
+        << " B, one transaction " << seeded.max_single_footprint
+        << " B) -- a zero peak means the production report calls were removed and the bound guards nothing";
     EXPECT_EQ(tracker.alive(), 0) << "every decoded transaction must be discarded after it is applied";
 }
 
@@ -458,6 +465,9 @@ TEST(CasRecoveryStreaming, OrphanSweepAndFsckSameBound)
         EXPECT_EQ(recovered.state.getPrecommits().size(), kTxns * kOpsPerTxn);
         EXPECT_LE(tracker.peak(), static_cast<int64_t>(bound))
             << "orphan-sweep recovery must stream: peak " << tracker.peak() << " B, bound " << bound << " B";
+        EXPECT_GE(tracker.peak(), static_cast<int64_t>(sweep_tail.max_single_footprint))
+            << "the probe must observe at least one decoded sweep transaction (peak " << tracker.peak()
+            << " B) -- a zero peak means the orphan-sweep report call was silently removed";
         EXPECT_EQ(tracker.alive(), 0);
     }
 
@@ -469,8 +479,60 @@ TEST(CasRecoveryStreaming, OrphanSweepAndFsckSameBound)
         EXPECT_GE(report.snapshot_oracle_checked, 1u) << "the oracle must actually replay the oracle table's tail";
         EXPECT_LE(tracker.peak(), static_cast<int64_t>(bound))
             << "fsck recovery/oracle must stream: peak " << tracker.peak() << " B, bound " << bound << " B";
+        EXPECT_GE(tracker.peak(), static_cast<int64_t>(oracle_tail.max_single_footprint))
+            << "the oracle probe must observe at least one decoded oracle transaction (peak " << tracker.peak()
+            << " B) -- a zero peak means the fsck-oracle report call was silently removed";
         EXPECT_EQ(tracker.alive(), 0);
     }
+}
+
+/// Test 14 (writer-ledger leg -- the production recovery path): the writer ledger's OWN recovery loop
+/// (`CasRefLedger::ensureRefTableRecovered`, reached through any Pool touch) must stream the tail under
+/// the SAME per-transaction bound the free recovery does. This is the exact production path the original
+/// memory finding named; `LongTailReplaysUnderMemoryBound` above exercises the free `recoverRefTable`,
+/// NOT the ledger loop, so the ledger could regress to whole-tail materialisation while every other
+/// bound stayed green. Recovery is driven through `tailSinceSnapshotCountForTest` -- a recovery-only
+/// accessor that does NOT dispatch the read-side stale-precommit sweep `listRefs` would (that sweep
+/// would append removals over the seeded epoch-1 precommit bindings and perturb both the count and the
+/// probe). The whole tail sits above a never-born base, so the retained tail count equals the whole tail.
+TEST(CasRecoveryStreaming, LedgerRecoveryReplaysUnderMemoryBound)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    seedPoolMetaForRestart(*backend);
+    const Layout layout("p");
+    const RootNamespace ns{"00/ledger@cas@"};
+
+    constexpr size_t kTxns = 24;
+    constexpr size_t kOpsPerTxn = 250;
+    uint64_t manifest_seq = 1;
+    const SeededTail seeded = seedBigTail(*backend, layout, ns, kTxns, kOpsPerTxn, manifest_seq);
+
+    const uint64_t bound = 2 * seeded.max_single_footprint;
+    ASSERT_GT(seeded.total_footprint, bound)
+        << "fixture must make the whole tail (" << seeded.total_footprint
+        << " B) provably exceed the bound (" << bound << " B)";
+
+    auto store = openPoolForTest(backend);
+
+    PeakTracker tracker;
+    setRecoveryReplayMemoryProbeForTest(tracker.probe());
+    SCOPE_EXIT({ setRecoveryReplayMemoryProbeForTest({}); });
+
+    /// A recovery-only accessor drives `CasRefLedger::ensureRefTableRecovered` (the ledger's streaming
+    /// replay loop) and returns the retained tail count -- the whole tail, above a never-born base.
+    EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), kTxns)
+        << "the whole tail must have replayed through the ledger's own recovery loop";
+    EXPECT_LE(tracker.peak(), static_cast<int64_t>(bound))
+        << "ledger recovery must hold at most ~one decoded transaction (peak " << tracker.peak()
+        << " B) not the whole " << kTxns << "-transaction tail (" << seeded.total_footprint << " B)";
+    /// Lower bound (the accountant's fail-close): a zero peak means the ledger loop's production report
+    /// call was removed and this bound would guard nothing -- the exact silent-decoupling this leg exists
+    /// to catch on the production path.
+    EXPECT_GE(tracker.peak(), static_cast<int64_t>(seeded.max_single_footprint))
+        << "the probe must observe at least one whole decoded transaction resident (peak " << tracker.peak()
+        << " B, one transaction " << seeded.max_single_footprint
+        << " B) -- a zero peak means the ledger's production report call was removed and the bound guards nothing";
+    EXPECT_EQ(tracker.alive(), 0) << "every decoded transaction must be discarded after it is applied";
 }
 
 /// Test 15 (publication inventory): after streaming recovery of a table with a non-trivial snapshot
