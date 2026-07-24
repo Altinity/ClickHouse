@@ -129,7 +129,7 @@ namespace
     {
         const auto destination_header
             = destination_storage.getInMemoryMetadataPtr()->getSampleBlockNonMaterialized();
-        const auto destination_columns = destination_header.getColumnsWithTypeAndName();
+        const auto & destination_columns = destination_header.getColumnsWithTypeAndName();
 
         const bool ignore_extra_source_columns_by_position =
             local_context->getSettingsRef()[Setting::export_merge_tree_part_schema_mismatch_mode]
@@ -139,6 +139,12 @@ namespace
 
         if (ignore_extra_source_columns_by_position && source_columns.size() > destination_columns.size())
         {
+            LOG_DEBUG(getLogger("ExportPartTask"),
+                "Source has {} columns while destination has {} columns, "
+                "the {} extra trailing source column(s) will be ignored",
+                source_columns.size(), destination_columns.size(),
+                source_columns.size() - destination_columns.size());
+
             Names kept_names;
             kept_names.reserve(destination_columns.size());
             for (size_t i = 0; i < destination_columns.size(); ++i)

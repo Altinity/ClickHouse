@@ -173,6 +173,8 @@ namespace ExportPartitionUtils
             context_copy->setSetting("output_format_parquet_row_group_size", *manifest.parquet_row_group_size);
         if (manifest.parquet_row_group_size_bytes)
             context_copy->setSetting("output_format_parquet_row_group_size_bytes", *manifest.parquet_row_group_size_bytes);
+        if (manifest.schema_mismatch_mode)
+            context_copy->setSetting("export_merge_tree_part_schema_mismatch_mode", String(magic_enum::enum_name(*manifest.schema_mismatch_mode)));
 
         context_copy->setSetting("max_threads", manifest.max_threads);
         context_copy->setSetting("export_merge_tree_part_file_already_exists_policy", String(magic_enum::enum_name(manifest.file_already_exists_policy)));
@@ -199,11 +201,6 @@ namespace ExportPartitionUtils
         /// scheduled without the opt-in could still apply a lossy cast if the destination
         /// schema drifts to a lossy target between scheduling and execution.
         context_copy->setSetting("export_merge_tree_part_allow_lossy_cast", manifest.allow_lossy_cast);
-
-        /// Same reasoning as above, for the schema column-count mismatch mode: the worker
-        /// re-runs `verifyExportSchemaCastable` per part (via `exportPartToTable`) and must
-        /// honor the initiator's choice regardless of which replica picks up the task.
-        context_copy->setSetting("export_merge_tree_part_schema_mismatch_mode", String(magic_enum::enum_name(manifest.schema_mismatch_mode)));
 
 	    return context_copy;
     }
@@ -762,7 +759,7 @@ namespace ExportPartitionUtils
         const auto destination_sample_block = destination_metadata->getSampleBlockNonMaterialized();
 
         auto source_columns = source_sample_block.getColumnsWithTypeAndName();
-        const auto destination_columns = destination_sample_block.getColumnsWithTypeAndName();
+        const auto & destination_columns = destination_sample_block.getColumnsWithTypeAndName();
 
         /// In `ignore_extra_source_columns_by_position` mode a source with more columns than the destination
         /// is allowed: the extra trailing source columns (by position) are dropped, mirroring
@@ -774,7 +771,15 @@ namespace ExportPartitionUtils
                 == MergeTreePartExportSchemaMismatchMode::ignore_extra_source_columns_by_position;
 
         if (ignore_extra_source_columns_by_position && source_columns.size() > destination_columns.size())
+        {
+            LOG_DEBUG(getLogger("ExportPartitionUtils"),
+                "Source has {} columns while destination has {} columns, "
+                "the {} extra trailing source column(s) will be ignored",
+                source_columns.size(), destination_columns.size(),
+                source_columns.size() - destination_columns.size());
+
             source_columns.resize(destination_columns.size());
+        }
 
         (void) ActionsDAG::makeConvertingActions(
             source_columns,
