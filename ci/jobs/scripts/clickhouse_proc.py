@@ -1287,6 +1287,17 @@ fi
         Shell.check(
             f"sed -i 's|<errorlog>.*</errorlog>|<errorlog>{self.CH_LOCAL_ERR_LOG}</errorlog>|' /etc/clickhouse-server/config.xml"
         )
+        # Open any content-addressed disk read-only for this scrape. The server is already
+        # stopped, so `clickhouse local` opens the pool under its own (unrelated) identity;
+        # a normal (writable) open claims server-root ownership (`Pool::mountWritable` ->
+        # `claimOwnerOrThrow`) and fails closed with "owned by a different server" against the
+        # real server's persisted owner uuid. A read-only open skips that claim entirely
+        # (`Pool::open`: `if (!config.read_only) mountWritable(...)`), which is all a read-only
+        # dump needs. Keyed on the CAS marker tag, not the disk name, so it covers every
+        # content-addressed disk regardless of how it's named in this job's config.
+        Shell.check(
+            "sed -i 's|<metadata_type>content_addressed</metadata_type>|<metadata_type>content_addressed</metadata_type><readonly>true</readonly>|g' /etc/clickhouse-server/config.xml"
+        )
         # FIXME: Hack for s3_with_keeper (note, that we don't need the disk,
         # the problem is that whenever we need disks all disks will be
         # initialized [1])
