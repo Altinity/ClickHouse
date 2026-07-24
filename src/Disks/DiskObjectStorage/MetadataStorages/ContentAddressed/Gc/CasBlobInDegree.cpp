@@ -1,10 +1,17 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBlobDigest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasCodecUtil.h>
 #include <IO/ReadBufferFromMemory.h>
 #include <IO/WriteBufferFromString.h>
 #include <base/defines.h>
 #include <Common/Exception.h>
+#include <Common/ProfileEvents.h>
 #include <Common/logger_useful.h>
+
+namespace ProfileEvents
+{
+    extern const Event CasGcRetiredSparedByReref;
+}
 #include <city.h>
 #include <algorithm>
 #include <cstring>
@@ -407,18 +414,26 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
         chassert(e.kind == ObjectKind::Blob);   /// the in-degree merge settles Blob entries only
         if (indeg > 0)
         {
-            /// A delete_pending entry recovering in-degree is structurally impossible (a published pending
-            /// blob should never be re-referenced) but is reachable under real races.
-            /// Spare it LOUDLY — never a fail-closed abort and never a delete of a re-referenced blob.
+            /// A delete_pending entry recovering in-degree is the expected shape of a dedup-adopt vs
+            /// condemn race, not an ack-floor violation: a graduated blob carries NO surviving prior
+            /// edges (see the comment on the sentinel emission below), so any edge that resurrects its
+            /// in-degree is necessarily a FRESH this-generation edge -- a writer's `observeAndAdmit`
+            /// point-read of the per-hash meta raced GC's `Condemned` write and adopted the (about to
+            /// be deleted) token instead of resurrecting from source. Spare it LOUDLY (never a
+            /// fail-closed abort, never a delete of a re-referenced blob), but at Debug: this is a
+            /// routine, safely-handled race, not something to page on.
             if (e.delete_pending)
+            {
                 /// No LoggerPtr is threaded this deep (foldDeltasIntoGeneration is a free function
                 /// shared by the non-sharded fold and CasGcShardPlan's per-shard reduce); scope the
                 /// message with the pool's own key prefix instead so a multi-disk process's logs can
                 /// still be attributed.
-                LOG_WARNING(getLogger("CasGcFold"),
-                    "CAS gc fold ({}): a delete_pending retired entry recovered in-degree {} — "
-                    "structurally impossible but reachable under races; sparing (never a fail-closed "
-                    "delete)", layout.poolPrefix(), indeg);
+                LOG_DEBUG(getLogger("CasGcFold"),
+                    "CAS gc fold ({}): delete_pending blob {} (condemned at round {}, observed at round {}) "
+                    "recovered in-degree {} -- a fresh dedup-adopt raced the condemn; sparing (never a "
+                    "fail-closed delete)", layout.poolPrefix(), blobIdOf(e.ref), e.condemn_round, current_round, indeg);
+                ProfileEvents::increment(ProfileEvents::CasGcRetiredSparedByReref);
+            }
             rmr.spared.push_back(e);            /// recovery wins, even past the floor
         }
         else if (e.delete_pending)

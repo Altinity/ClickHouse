@@ -481,11 +481,14 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         }
         for (const RetiredEntry & entry : merge.spared)
         {
+            /// A fresh dedup-adopt raced the condemn (see the matching CasGcFold Debug log emitted
+            /// during the merge, which increments CasGcRetiredSparedByReref) -- not an ack-floor
+            /// violation, so this is Debug, not a page-worthy Warning.
             if (entry.delete_pending)
-                LOG_WARNING(logger,
-                    "CAS gc: delete_pending blob {} recovered in-degree — structurally impossible under "
-                    "the ack floor (spared anyway, fail-closed); investigate",
-                    blobIdOf(entry.ref));
+                LOG_DEBUG(logger,
+                    "CAS gc: delete_pending blob {} (condemned at round {}, this round {}) recovered "
+                    "in-degree -- a fresh dedup-adopt raced the condemn; spared (never a fail-closed delete)",
+                    blobIdOf(entry.ref), entry.condemn_round, new_round);
             /// Emit the spare verdict — a publish re-pinned the candidate before graduation.
             EventEmitter{*store}.emit([&](CasEvent & e)
             {

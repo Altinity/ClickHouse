@@ -858,6 +858,7 @@ The server successfully detected this situation and will download merged part fr
     M(CasOtherList,      "Number of CAS other-object LIST requests. Growing values indicate more object enumeration.", ValueType::Number) \
     M(CasGcRetiredCondemned,   "Number of CAS GC entries newly condemned into the retired set. Growth indicates objects becoming eligible for later cleanup.", ValueType::Number) \
     M(CasGcRetiredSpared,      "Number of CAS GC retired entries spared after references returned. Growing values indicate reference churn or resurrection.", ValueType::Number) \
+    M(CasGcRetiredSparedByReref, "Number of CAS GC delete_pending entries spared because a fresh dedup-adopt re-referenced them after graduation (an ordinary observe/condemn race, not a fail-closed abort). Subset of CasGcRetiredSpared.", ValueType::Number) \
     M(CasGcRetiredGraduated,   "Number of CAS GC retired entries that passed the safety floor and became pending deletion. Growth indicates cleanup progress.", ValueType::Number) \
     M(CasGcRetiredRedeleted,   "Number of CAS GC pending deletes executed with an exact object token. Growth indicates physical cleanup activity.", ValueType::Number) \
     M(CasGcCondemnMarkerUnconfirmedCarry, "Number of CAS GC retirements delayed because a durable condemn marker could not be confirmed. A non-zero value indicates marker write or read failures and safely postpone deletion.", ValueType::Number) \
