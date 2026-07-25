@@ -382,3 +382,7 @@ ETA ~12:33 UTC. 330G free at start.
   Whether it reclaims is something to OBSERVE at the 09:49/10:09 ticks, not to predict — v2's 115 GB
   reclaim was at a different pool size and is not a basis for extrapolation. Acting only on a measured
   crossing.
+- 09:49 UTC — watchdog: soak v3 t+1h16m healthy (STAGE ttl_pressure since t+3606s, 0 failures, log fresh).
+  Disk burn MEASURED DOWN to 42 GB/h this interval (215G→201G) from 120 GB/h the previous one — the drop
+  coincides with the ttl_pressure stage starting, i.e. TTL eviction now offsets part of the growth.
+  pool_bytes 123 GB, still climbing but slower. 141 GB above the 60G line. gc_checkpoint starts in 8 min.
