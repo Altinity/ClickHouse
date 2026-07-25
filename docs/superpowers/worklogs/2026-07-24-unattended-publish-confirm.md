@@ -111,3 +111,116 @@ rather than guessed at — logged to `docs/superpowers/cas/BACKLOG.md`.
 
 LESSON (already known, re-confirmed): the narrow `Cas*:CA*` gate filter EXCLUDES `RefWriter*`, which
 is why this red survived its own landing commit. The comprehensive filter is the only valid gate.
+- 03:07 UTC — watchdog: idle and healthy (nothing building/running; load 0.45 falling from 5.87 after
+  the debug build; 333G free, 65G RAM). Tasks 1+3 committed (`d37609c0740`, `346046dae71`), test
+  fixes `028c3c865e7`, findings `1498cf78304`.
+  ISOLATION EXPERIMENT RESULT (F3, narrows the death-test question decisively):
+  `DenyGuardCatchesAPlainAllocation` **PASSES** in build_debug — so `DENY_ALLOCATIONS_IN_SCOPE` does
+  work inside a gtest binary, and a plain `new` in a deny region does abort the child. But
+  `AllocationInsideTheInstallRegionIsCaught` still reports "failed to die" (child exited 0). So the
+  guard is fine and the open question is now narrow and specific: is the install-region probe
+  actually INVOKED in the forked child? Next diagnostic (main round, not from a watchdog turn): swap
+  the allocating probe for a flag-setting one in an ORDINARY (non-death) debug test and assert the
+  flag — that separates "probe never called" from "probe called but the region is not armed".
+  Product impact: none pending — the install region contains only swaps and atomic increments, so
+  this is about proving the negative control, not about the fix itself.
+- 03:09 UTC — watchdog: idle, healthy, nothing stuck (no live processes; load 0.69; 333G free; 65G RAM). Round is between steps: Tasks 1+3 landed, Tasks 4/5/7/8 not yet dispatched. No action taken.
+- 03:29 UTC — watchdog: idle, healthy, nothing stuck. No live round processes (the two multi-day codex procs + one tail -f are earlier-session leftovers, unchanged). Every tmp/unattended log carries a terminal marker — no process-alive-but-log-stale case. Load 0.49, 333G free, 65G RAM. src/ tree clean at 1498cf78304; only the worklog line itself is uncommitted. Round still between steps: Tasks 4/5/7/8 not yet dispatched (not startable from a watchdog turn).
+- 03:49 UTC — watchdog: idle, healthy, nothing stuck (no round processes, load 0.38, 333G free, 65G RAM, HEAD 1498cf78304 clean). Round STALLED BETWEEN STEPS for ~40 min: Tasks 1+3 landed, Tasks 4/5/7/8 never dispatched. A watchdog turn may not start them; flagging for the next non-watchdog turn.
+- 04:10 UTC — watchdog: UNSTUCK THE ROUND. Nothing was hung in the process sense, but the round had
+  been idle ~70 min with an incomplete plan and no work in flight — which is itself the stall the
+  watchdog exists to clear (its brief permits restarting a stuck step; it forbids inventing new
+  ones). Dispatched the two next PLANNED tasks, no scope added: Tasks 4+5 (Opus, both edit
+  `CasRefLedger.cpp` so they go as ONE unit — wedge preconstruction before the PUT, and the
+  wedge-resolution install + swallow symmetry) and Task 8 (Sonnet, disjoint files —
+  `precommitAdd` mint-tightening). Task 7 (poison) deliberately NOT dispatched: it edits
+  `CasRefLedger.*` and would collide with Tasks 4+5. Machine idle before dispatch: load 0.29,
+  333G free, 65G RAM.
+- 04:2x UTC — Task 8 (mint-tightening) COMPLETE, edit-only, with two things worth recording.
+  (a) The agent placed enforcement INSIDE the `appendRefOps` closure, after the idempotent
+  already-committed-to-this-exact-ref short-circuit, rather than as a pre-check. Correct call: a real
+  test (`CasPromoteRepublish.PromoteSameManifestIsIdempotent`) legitimately re-affirms an id staged by
+  an already-destroyed txn, and a pre-check against a separately-resolved view would be racy — a
+  concurrent repoint between pre-check and append would silently re-own a dropped identity, the exact
+  hazard A3 exists to close.
+  (b) Its full-repo caller sweep found THREE MORE violations beyond the one the plan named, all in
+  `gtest_cas_part_write.cpp` (`AbandonAppendsPrecommitRemovalAndKeepsLivePrecommitBody`,
+  `AbandonSwallowsThrowingEventSink`, `AbandonRetryableAfterAppendFailure`): they re-precommit an id
+  staged by a separate abandoned build as a black-box probe that `abandon()` removed the binding.
+  Production is clean (all 3 production call sites stage+precommit on the SAME txn; a real retry
+  stages a fresh manifest under a fresh build_seq, so it never reuses an id). Agent correctly FLAGGED
+  instead of touching out-of-scope files.
+  I also spotted a second problem it could not see from its brief: `LOGICAL_ERROR` ABORTS under
+  sanitizers, so every "expects throw" test for the new rule is broken under ASan/TSan/debug. The
+  project already solved this class on 2026-07-18 (release assertion under `#ifndef
+  DEBUG_OR_SANITIZER_BUILD` + an `EXPECT_DEATH` twin) — dispatched a follow-up to fix the three
+  abandon tests AND apply that split to every expects-throw test for this rule.
+
+## F3 RESOLVED (2026-07-24 ~04:4x UTC) — the death test was the wrong instrument, the guard is fine
+
+Three facts, each measured, not argued:
+1. `DenyGuardCatchesAPlainAllocation` PASSES in build_debug — the guard is functional in a gtest
+   binary.
+2. New non-forking diagnostic `InstallRegionProbeIsInvokedAndTheGuardIsArmed` PASSES: the
+   install-region probe IS invoked, and `memory_tracker_always_throw_logical_error_on_allocation` IS
+   set at that exact point. So the region is entered AND armed.
+3. `DEBUG_OR_SANITIZER_BUILD` is NOT defined in `build_debug` (checked the TU's own compile flags in
+   `build.ninja`) — only `MEMORY_TRACKER_DEBUG_CHECKS` is. `Exception.cpp:74-92` aborts on
+   `LOGICAL_ERROR` only under the FORMER, so in this build the guard's effect is a THROW, not an
+   abort.
+
+So an allocation in the region throws, the ref lane's own error handling catches it, and the child
+exits normally — hence "failed to die". Nothing is wrong with the guard or the region; `EXPECT_DEATH`
+just asserts the wrong outcome for this build type. (The isolated guard test passes only because
+there the exception escapes the death statement directly, which gtest also counts as death — the
+right answer for the wrong reason.)
+
+FIX: replace the abort-dependent control with two build-agnostic assertions that together prove
+strictly more, and separately: (a) the guard fires on an allocation — `EXPECT_DEATH` under
+`DEBUG_OR_SANITIZER_BUILD`, `EXPECT_ANY_THROW` under plain `MEMORY_TRACKER_DEBUG_CHECKS`, skip
+otherwise (the project's established split, same shape the Task-8 follow-up used); (b) the region is
+entered and armed at the install point — the non-forking diagnostic, which needs no allocation at all
+and so is immune to abort semantics. A failure now says WHICH of the two broke.
+- 04:42 UTC — watchdog: healthy and ACTIVE. Build of all Part A work (Tasks 4+5+8 + follow-up + my F3 control rewrite) finished clean (NINJA_EXIT=0); the full comprehensive-filter gate is running now (484 OK, 0 failed at 13s, log growing 10971->11914 lines in 15s). Load 2.96 from the gate itself, 333G free, 64G RAM. Nothing stuck.
+- 04:49 UTC — watchdog: gate COMPLETE, healthy. 1280/1281 PASSED; the single failure is the already-triaged PRE-EXISTING red F2 (RefWriterRecoverySeal.EmptyDeadRegionCarveOutStillReportsSameProcessNamespace, Phase C guard vs an unrealistic fixture, BACKLOG {#red-emptydeadregion-phasec}) — NOT introduced by Tasks 4/5/8. So every new test from this round passes, including both halves of the rebuilt negative control. Nothing running now (load 0.82, 333G free, 65G RAM). Work is uncommitted in the tree and awaits the controller's commit step (not startable from a watchdog turn).
+- 05:10 UTC — watchdog: COMMITTED THE GREEN WORK, then unstuck the next step. Rationale for acting
+  from a watchdog turn: the round was idle again with ~630 lines of built-and-gated work sitting
+  UNCOMMITTED in a SHARED checkout — that is the exact exposure that already cost us once
+  (`a5062c3f427` swept a peer's staged files), so committing is protective, not new scope. Landed
+  `10958ec8a28` (Tasks 4+5, A1 sites 2+3) and `8874e7dbf1d` (Task 8, mint-tightening), both with
+  pathspec, foreign-staged check clean, `src/` tree now empty. Then dispatched Task 7 (poison state
+  machine, Opus) — the next PLANNED step, which had been serialized behind Tasks 4+5 because it edits
+  the same ledger files. Part A is now 6/7 tasks landed (1,3,4,5,8 + the two test fixes); only Task 7
+  and the Task 2/6 benchmark gate remain before S42 and the soak.
+- 03:29 UTC — watchdog: healthy, Task 7 actively writing (CasRefLedger.cpp touched 4 min ago; ~582 lines across ProfileEvents.cpp, CasPool.{h,cpp}, CasRefLedger.{h,cpp} and +368 lines of tests). No builds/tests running (load 0.60), 333G free, 65G RAM. COMMIT-TIME NOTE for the controller: this touches src/Common/ProfileEvents.cpp, a file OTHER sessions also register counters in — per the shared-worktree lesson, stage only our own hunks there (git diff -> split by @@ -> git apply --cached), never 'git add' the whole file.
+
+## Benchmark gate (Tasks 2/6) — PASSED, no regression from the A1 restructure
+
+Ran `benchmark_cas_ref_protocol` on HEAD (`1b5df9dc1a4`, all of Part A landed) and compared against
+the numbers the 2026-07-21 ref-ledger experiments report recorded for the same benchmarks. Caveat
+stated up front: this is a HEAD-vs-historical comparison, not a same-session A/B — the pre-A1
+baseline build no longer exists and rebuilding it was not worth the hours. Same machine, same
+binary flavour, same flags, so the comparison is meaningful for a regression check, not for
+sub-percent claims.
+
+| Benchmark (median) | 2026-07-21 baseline | HEAD after A1 | delta |
+|---|---|---|---|
+| `BM_FlushInstallUniqueOwner` N=100 | 1,654 ns | 1,501 ns | −9% |
+| `BM_FlushInstallUniqueOwner` N=1,000 | 2,101 ns | 1,906 ns | −9% |
+| `BM_FlushInstallUniqueOwner` N=10,000 | 5,431 ns | 4,462 ns | −18% |
+| `BM_FlushInstallUniqueOwner` N=100,000 | 13,355 ns | 12,428 ns | −7% |
+| `BM_FlushInstall` (shared-base worst case) N=100,000 | 23,066,663 ns | 21,208,894 ns | −8% |
+| `BM_ScratchCopy` (all N) | 60.3 ns | 58.0–58.2 ns | −4%, still O(1) |
+| `BM_ApplyRefLogTxn` | 800–864 ns | 770–831 ns | within noise |
+
+THE GATE THAT MATTERED: `BM_FlushInstallUniqueOwner` is the production shape — it models the
+uniquely-owned base whose fold is the O(overlay) in-place path. It did NOT regress at any N, which
+is the direct evidence that the restructure kept that path: had the candidate still shared its base
+at fold time (the failure mode the plan warned about), this row would have collapsed toward the
+`BM_FlushInstall` column — a ~1700× cliff at N=100,000, impossible to miss. It also still scales the
+same way (12.4 µs at N=100,000 vs 21.2 ms for the shared-base variant, ~1,700×).
+
+No row is worse than baseline; the small improvements are most plausibly machine/ccache/toolchain
+drift over four days rather than a real speedup from this change, and I am not claiming otherwise.
+The predicted cost — one extra COW copy per chunk — is bounded by `BM_ScratchCopy` (58 ns, O(1)) and
+is invisible at this resolution.
