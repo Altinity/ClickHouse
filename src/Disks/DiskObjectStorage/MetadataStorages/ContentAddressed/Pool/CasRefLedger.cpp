@@ -1538,6 +1538,14 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
                 /// exception and do not allocate a new id. A later call into this namespace's queue
                 /// retries the resolve -- rebuilding the candidate from scratch, which is why nothing of
                 /// it is kept in the wedge (see the candidate build above).
+                ///
+                /// There is deliberately NO `NoAttemptSent` counterpart to `commitRefChunk`'s arm here,
+                /// and the asymmetry is not an oversight: this `Unresolved` comes from
+                /// `resolveByExactGet`, which has no pre-attempt gate at all -- it always issues its GET,
+                /// and reports `Unresolved` for "absent" and "the read failed" alike. So a resolution can
+                /// never mean "nothing was sent", and more to the point the wedge it would skip ALREADY
+                /// EXISTS and describes an object that may well be durable. Clearing it on a failed read
+                /// is the one thing this path must never do.
                 complete_error(carve_all_pending(), makeCasWriteRetryLaterExceptionPtr(fmt::format(
                     "CAS ref-log append for namespace '{}' txn {}-{} is still UNCERTAIN — the append lane "
                     "stays wedged until the SAME key resolves durable or a conclusive rejection is observed",
@@ -1996,8 +2004,9 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
     armApplyPending(*rt);
 
     CasWriteOutcome outcome{};
-    /// Diagnostic only (finding #37 defect 3): says WHY an Unresolved came back, so the wedge message
-    /// stops claiming an exhausted retry budget when in fact no request was ever sent.
+    /// WHY an Unresolved came back. Two jobs (finding #37 defect 3): the wedge message stops claiming an
+    /// exhausted retry budget when in fact no request was ever sent, and -- see the `Unresolved` arm --
+    /// the one reason that PROVES nothing was sent decides whether the lane wedges at all.
     CasUnresolvedReason unresolved_reason = CasUnresolvedReason::NotUnresolved;
     try
     {
@@ -2141,6 +2150,45 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
         }
         case CasWriteOutcome::Unresolved:
         {
+            /// The ONE `Unresolved` shape that must NOT wedge (finding #37 defect 3). The wedge exists
+            /// because an `Unresolved` PUT MAY HAVE LANDED: the durable log may or may not contain this
+            /// transaction, only `resolveByExactGet` on that exact key can settle it, and until it does,
+            /// minting a later id would build on a state that may be missing a landed transaction. All of
+            /// that presupposes an attempt was SENT.
+            ///
+            /// `unresolvedProvesNothingWasSent` is true only for `NoAttemptSent`, which
+            /// `putIfAbsentControlled` reports only when a pre-attempt gate -- the mount fence or the
+            /// operation deadline -- rejected while `attempts_sent == 0`, i.e. strictly before the first
+            /// `backend->putIfAbsent`. Nothing reached the network, so the key is provably unwritten:
+            /// there is nothing for a wedge to resolve, and wedging is not merely pointless but harmful.
+            /// A wedge over a key that was never written can NEVER clear -- `resolveByExactGet` reads the
+            /// key absent and reports `Unresolved` forever -- so it blocks every ref append for this table
+            /// on this replica, inserts included, until a remount. A transient fence blip in the
+            /// pre-attempt gate would cost the table its write availability.
+            ///
+            /// The counterexample this argument deliberately excludes: a fence lost or a deadline reached
+            /// AFTER at least one attempt is `FenceLostMidWay`/`DeadlineMidWay`, and an attempt that
+            /// COMMITTED but returned under a dropped fence is `FenceLostPostWrite`. Each of those may
+            /// have left a durable object, so each keeps wedging -- as does anything a future contributor
+            /// adds to the enum without classifying it (see the predicate's allow-list construction).
+            if (unresolvedProvesNothingWasSent(unresolved_reason))
+            {
+                /// Nothing can be durable, so no apply is owed and the marker returns to `Clean`, exactly
+                /// as on the `DefiniteFailure` arm. Leaving it `ApplyPending` would claim this table may
+                /// be missing a durable transaction for the rest of the runtime's life.
+                clearApplyPending(*rt);
+                /// The allocated id is left as a safe gap: ids are not required to be contiguous
+                /// (`CasRefProtocol.cpp` enforces strict increase only), and nothing was written under it.
+                /// `prepared_wedge` is simply discarded -- building it before the PUT costs nothing here
+                /// and is what makes the genuinely ambiguous path below allocation-free.
+                complete_error(chunk_survivors, makeCasWriteRetryLaterExceptionPtr(fmt::format(
+                    "CAS ref-log append for namespace '{}' txn {}-{} was refused BEFORE any request was "
+                    "sent ({}) — the append lane is NOT wedged (nothing can be durable, so there is "
+                    "nothing to resolve) and the txn id is a safe gap",
+                    ns.string(), id.writer_epoch, id.ref_sequence,
+                    describeUnresolvedReason(unresolved_reason))));
+                return false;
+            }
             {
                 std::lock_guard lock(rt->state_mutex);
                 static_assert(std::is_nothrow_move_constructible_v<RefAppendWedge>,

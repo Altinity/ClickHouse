@@ -28,17 +28,20 @@ enum class CasWriteOutcome : uint8_t
     Unresolved,
 };
 
-/// WHY a controlled write came back `Unresolved`. Purely diagnostic today: the outcome the caller
-/// acts on is unchanged, and nothing branches on this. It exists because `Unresolved` covers two
-/// materially different states, and telling them apart is the difference between a five-minute
-/// triage and an hour of it.
+/// WHY a controlled write came back `Unresolved`. It exists because `Unresolved` covers two materially
+/// different states, and telling them apart is the difference between a five-minute triage and an hour
+/// of it — and, since finding #37 defect 3, between a table that keeps its write availability and one
+/// that loses it until remount.
 ///
 /// `NoAttemptSent` is the one that carries real information: both pre-attempt gates (the mount fence
 /// and the operation deadline) reject BEFORE anything reaches the backend, so on the very first
 /// iteration the key is PROVABLY unwritten — there is no ambiguity to resolve, only a lost right to
 /// write. Every other reason leaves an object that may or may not be durable, which is what the
-/// wedge/resolve machinery exists for. See the backlog item on not wedging a lane in the
-/// `NoAttemptSent` case; that is a protocol change and deliberately NOT part of this diagnostic.
+/// wedge/resolve machinery exists for.
+///
+/// NOT purely diagnostic any more: `unresolvedProvesNothingWasSent` below turns this into the fact the
+/// ref append lane acts on (`CasRefLedger::commitRefChunk`'s `Unresolved` arm), so ADDING A MEMBER HERE
+/// IS A PROTOCOL DECISION — read that predicate before you do.
 enum class CasUnresolvedReason : uint8_t
 {
     NotUnresolved,     /// the call did not return Unresolved
@@ -48,6 +51,38 @@ enum class CasUnresolvedReason : uint8_t
     FenceLostPostWrite,/// an attempt COMMITTED but the fence had dropped by the time it returned
     AttemptsExhausted, /// the genuine case the "retry budget exhausted" wording describes
 };
+
+/// Does this `Unresolved` PROVE that no attempt ever reached the network — i.e. that the key is
+/// unwritten and there is nothing for an exact-key resolution to settle?
+///
+/// True for exactly ONE value, and that is the whole design: `NoAttemptSent` is reported only when a
+/// pre-attempt gate rejected while `attempts_sent == 0`, so `backend->putIfAbsent` was never called
+/// (see `putIfAbsentControlled`). Every other value — including `NotUnresolved`, which a caller can
+/// still observe if some path returns `Unresolved` without recording a reason — leaves an object that
+/// MAY be durable, and callers that protect themselves against that (the ref lane's append wedge) must
+/// keep doing so.
+///
+/// Written as an allow-list: a switch with no `default` and a trailing `return false`, so a member
+/// added to `CasUnresolvedReason` later fails BOTH ways safely. The missing case is a `-Wswitch` build
+/// error, which forces the contributor to classify it deliberately; and if that diagnostic is ever
+/// silenced, the runtime answer for the unclassified member is "no, this does not prove anything",
+/// which is the conservative side. Never turn this into a deny-list — a new reason must not be able to
+/// claim "nothing was sent" by omission.
+constexpr bool unresolvedProvesNothingWasSent(CasUnresolvedReason reason)
+{
+    switch (reason)
+    {
+        case CasUnresolvedReason::NoAttemptSent:
+            return true;
+        case CasUnresolvedReason::NotUnresolved:
+        case CasUnresolvedReason::FenceLostMidWay:
+        case CasUnresolvedReason::DeadlineMidWay:
+        case CasUnresolvedReason::FenceLostPostWrite:
+        case CasUnresolvedReason::AttemptsExhausted:
+            return false;
+    }
+    return false;
+}
 
 /// Human-readable tail for an exception or log line, so the two states above stop reading alike.
 constexpr std::string_view describeUnresolvedReason(CasUnresolvedReason reason)
@@ -430,7 +465,12 @@ private:
     /// entirely (returning false, no sleep served) when the sleep plus one more attempt could not fit
     /// the operation deadline. Returns true when the loop may proceed to the next attempt; the loop
     /// top's own pre-attempt fence/deadline checks re-run AFTER the sleep.
-    bool pauseBeforeReissue(uint32_t completed_attempt, uint64_t deadline_ms, const std::function<bool()> & fence_ok);
+    ///
+    /// `out_reason` (optional) receives WHICH of the two refusals returned false, so a caller reporting
+    /// an `Unresolved` from here does not have to guess between them. Both are mid-way by construction:
+    /// this gate is only reached once an attempt has been sent.
+    bool pauseBeforeReissue(uint32_t completed_attempt, uint64_t deadline_ms, const std::function<bool()> & fence_ok,
+                            CasUnresolvedReason * out_reason = nullptr);
     /// The backoff scheduled before attempt `next_attempt` (attempt 2 sleeps `retry_initial_backoff_ms`,
     /// doubling per reissue), saturating at `retry_max_backoff_ms`. 0 when backoff is disabled.
     uint64_t backoffBeforeAttempt(uint32_t next_attempt) const;

@@ -105,7 +105,17 @@ WAppendDurable(t) ==
     /\ UNCHANGED << nextId, cursor, cand, csnap, snap, delta, folded,
                     scanPos, gcPhase, roundOutcome, dupFlag, lateFired >>
 
-(* Resolution by definite failure: the id never becomes durable and remains a safe gap. *)
+(* Resolution WITHOUT durability: the id never becomes durable, the lane is not wedged, and the id
+   remains a safe gap (premise 1 allows gaps; only strict increase is required).
+
+   TWO implementation paths reach this action, and they are the same transition here because they
+   are the same fact — nothing became durable:
+     - `DefiniteFailure`: the attempt was sent and PROVEN never applied;
+     - `CasUnresolvedReason::NoAttemptSent` (finding #37 defect 3): both pre-attempt gates rejected
+       before the first request, so the attempt was never sent at all.
+   Only a genuinely ambiguous outcome — an attempt that MAY have landed — keeps `pendingId` set, and
+   that is `WAppendStart` with no resolution yet. So the Task-18 behaviour needs no new action: it
+   widens which C++ paths reach `WAppendAbandon`, not what the model admits. *)
 WAppendAbandon(t) ==
     /\ pendingId[t] # 0
     /\ pendingId' = [pendingId EXCEPT ![t] = 0]

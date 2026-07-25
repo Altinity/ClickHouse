@@ -7,14 +7,18 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/MemoryTracker.h>
 #include <Common/ProfileEvents.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <exception>
+#include <functional>
 #include <memory>
+#include <string>
 
 /// Task 3 (spec §A1, site 1): the region of `CasRefLedger::commitRefChunk` between "this chunk's
 /// ref-log object is durable" and "the runtime records it".
@@ -75,6 +79,21 @@ PoolPtr openPoolSingleAttempt(const BackendPtr & backend)
     return Pool::open(backend, cfg);
 }
 
+/// The mount-fence deadlines the pre-attempt tests drive, in the FROZEN boot clock of
+/// `openPoolFenceControlled` (which is pinned at 0, so these are also the remaining lease budgets).
+///
+/// `CasMountRuntime` has TWO fence predicates and they are deliberately not the same:
+///   `mayMutate`         -- `now < deadline`; the top-of-flush gate in `flushRefBatch`.
+///   `refAppendFenceOk`  -- additionally `attempt_timeout_ms + lease_safety_margin_ms < deadline - now`,
+///                          i.e. "there is room for one whole controlled attempt"; the `fence_ok`
+///                          `commitRefChunk` hands to `putIfAbsentControlled`.
+/// With the single-attempt budget below that margin is 100 + 100 = 200 ms, so a 100 ms remaining lease
+/// sits BETWEEN them: the flush is admitted and then its very first pre-attempt gate refuses. That is
+/// exactly the production shape this task is about (a lease too short to start a write, not a lost
+/// one), and it needs no fault injection at all -- which is the point: nothing is sent.
+constexpr uint64_t FENCE_DEADLINE_HEALTHY_MS = 30000;
+constexpr uint64_t FENCE_DEADLINE_REFUSES_ATTEMPT_MS = 100;
+
 /// A legal blob-free part: stage an empty manifest, precommit, promote -- enough to drive real
 /// ref-log transactions through the append lane.
 void publishEmptyPart(const PoolPtr & s, const RootNamespace & ns, const String & ref)
@@ -86,6 +105,48 @@ void publishEmptyPart(const PoolPtr & s, const RootNamespace & ns, const String 
     const ManifestId id = build->stageManifest({});
     build->precommitAdd(ns, ref, id);
     build->promote(ns, ref, build->buildId(), id);
+}
+
+/// As `openPoolSingleAttempt`, but with the mount fence under the TEST's control instead of the wall
+/// clock's:
+///   - the boot clock is FROZEN at 0, so `setMountDeadline` alone decides both fence predicates and no
+///     elapsed real time can flip one of them mid-test (the same load-bearing injection, for the same
+///     reason, as `gtest_cas_ref_chunked_flush.cpp`'s `openPool`);
+///   - lease renewal is parked an hour out, so the keeper's background renew cannot re-arm the deadline
+///     underneath a test that just shortened it. Ten seconds (the default) would be enough in practice
+///     and flaky in principle; this removes the race rather than betting on it.
+PoolPtr openPoolFenceControlled(const BackendPtr & backend)
+{
+    DB::Cas::tests::seedPoolMetaForRestart(*backend);
+    PoolConfig cfg{.pool_prefix = "p", .server_root_id = "test"};
+    cfg.boot_ms_fn = [] { return uint64_t{0}; };
+    cfg.mount_renew_period = std::chrono::milliseconds{3600000};
+    CasRequestBudget budget;
+    budget.max_attempts = 1;
+    budget.attempt_timeout_ms = 100;
+    budget.operation_deadline_ms = 100;
+    budget.lease_safety_margin_ms = 100;
+    cfg.cas_request_budget = budget;
+    return Pool::open(backend, cfg);
+}
+
+/// Runs `f`, requires it to throw the ref lane's retry-later condition, and returns the message so a
+/// caller can assert WHICH condition it was. The message is the only place the `CasUnresolvedReason`
+/// surfaces -- there is no accessor for it, by design (it is a diagnostic, not state) -- so this is how
+/// a test proves the reason actually reached the decision site instead of defaulting.
+String retryLaterMessageOf(const std::function<void()> & f)
+{
+    try
+    {
+        f();
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::NETWORK_ERROR) << e.message();
+        return e.message();
+    }
+    ADD_FAILURE() << "expected the CAS retry-later condition, but nothing was thrown";
+    return {};
 }
 
 /// Installs a ONE-SHOT throwing probe into the post-durable install regions (spec §A2): the next region
@@ -174,7 +235,7 @@ TEST(CasRefInstallSafety, UnresolvedAlwaysRecordsTheWedge)
     backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::Unresolved;
     backend->fault_count = 1;
 
-    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { publishEmptyPart(store, ns, "part_a"); });
+    const String message = retryLaterMessageOf([&] { publishEmptyPart(store, ns, "part_a"); });
 
     EXPECT_TRUE(store->refLaneWedgedForTest(ns)) << "an Unresolved PUT must always leave a wedge";
     const String wedged_key = store->wedgedKeyForTest(ns);
@@ -183,6 +244,203 @@ TEST(CasRefInstallSafety, UnresolvedAlwaysRecordsTheWedge)
         << "the wedged key must be this namespace's ref-log object, not some other key: " << wedged_key;
     EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), 0u)
         << "an UNPROVEN transaction must not be recorded as applied";
+
+    /// Task 18. The contrast half of `PreAttemptRefusalDoesNotWedgeTheLane` below, asserted on the ONE
+    /// artifact that carries the distinction: an attempt WAS sent here (the fault is thrown by the
+    /// backend's `putIfAbsent`, so the request reached it), the single-attempt budget is then spent, and
+    /// the lane wedges. The message must say so -- and must NOT say "no attempt was sent", which is the
+    /// only shape allowed to skip the wedge.
+    EXPECT_NE(message.find("attempt budget was exhausted"), String::npos)
+        << "the reason must reach the wedge message rather than defaulting: " << message;
+    EXPECT_EQ(message.find("no attempt was sent"), String::npos)
+        << "an ambiguous PUT is not a pre-attempt refusal: " << message;
+}
+
+/// Task 18 (finding #37 defect 3, behavioural half). A `NoAttemptSent` `Unresolved` must NOT wedge.
+///
+/// The wedge exists because an ambiguous PUT MAY HAVE LANDED, so the durable log may or may not contain
+/// the transaction and only an exact-key GET can settle it. That reasoning needs an attempt to have been
+/// SENT. Here both pre-attempt gates reject on the FIRST iteration -- the remaining lease has no room
+/// for one controlled attempt -- so nothing reaches the backend, the key is provably unwritten, and a
+/// wedge would protect against nothing while costing the table every ref append (inserts included)
+/// until a remount: an exact-key GET of a key that was never written reports `Unresolved` forever, so
+/// such a wedge can never clear itself.
+///
+/// No fault injection anywhere in this test, deliberately: the ZERO ref-log I/O assertion below is the
+/// direct proof that nothing was sent, and it would be meaningless if a fault backend were swallowing
+/// the request.
+TEST(CasRefInstallSafety, PreAttemptRefusalDoesNotWedgeTheLane)
+{
+    auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
+    auto store = openPoolFenceControlled(backend);
+    const RootNamespace ns{"srv1/pre_attempt_refusal"};
+
+    publishEmptyPart(store, ns, "part_a");
+    const size_t tail_after_seed = store->tailSinceSnapshotCountForTest(ns);
+    const String log_prefix = store->layout().refsNamespacePrefix(ns) + "_log/";
+    const uint64_t log_io_after_seed = backend->ioCountForKeysContaining(log_prefix);
+
+    /// Shorten the lease to the window where the flush is admitted but no attempt may start.
+    store->setMountDeadline(FENCE_DEADLINE_REFUSES_ATTEMPT_MS);
+    /// Half of "the PRE-ATTEMPT gate is what refuses" is asserted here (the flush is admitted, so this
+    /// is not the top-of-flush `mayMutate` gate); the other half is asserted below, by the message
+    /// naming `NoAttemptSent` and by the ref-log I/O count not moving. `refAppendFenceOk` itself is
+    /// private to `Pool`, and is not worth widening for a test that can prove the same thing from the
+    /// outside.
+    ASSERT_TRUE(store->mayMutate()) << "the flush must still be ADMITTED, or this exercises the "
+                                       "top-of-flush gate instead of the pre-attempt one";
+
+    const String message = retryLaterMessageOf([&] { store->dropRef(ns, "part_a"); });
+
+    EXPECT_NE(message.find("no attempt was sent"), String::npos)
+        << "the caller must be told WHY, and this is the reason the no-wedge decision rests on: " << message;
+    EXPECT_FALSE(store->refLaneWedgedForTest(ns))
+        << "nothing was sent, so nothing can be durable: there is no ambiguity for a wedge to resolve";
+    EXPECT_TRUE(store->wedgedKeyForTest(ns).empty());
+    EXPECT_EQ(backend->ioCountForKeysContaining(log_prefix), log_io_after_seed)
+        << "the refusal must be PRE-attempt: not one ref-log object may have been touched";
+    EXPECT_EQ(store->applyStateForTest(ns), RefApplyState::Clean)
+        << "no apply is owed for a transaction that was never sent -- leaving the marker pending would "
+           "claim this table may be missing a durable transaction for the rest of its life";
+    EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), tail_after_seed)
+        << "nothing was committed, so nothing may be recorded";
+    EXPECT_TRUE(store->resolveRef(ns, "part_a", /*allow_stale=*/false).has_value())
+        << "the refused drop must not have taken effect";
+
+    /// The availability half of the claim: the lane is usable the moment the lease is healthy again --
+    /// no remount, no wedge resolution, nothing to clear. Before this task the same sequence left a
+    /// wedge over a key that was never written, and this append would have failed forever.
+    store->setMountDeadline(FENCE_DEADLINE_HEALTHY_MS);
+    store->dropRef(ns, "part_a");
+    EXPECT_FALSE(store->resolveRef(ns, "part_a", /*allow_stale=*/false).has_value())
+        << "the retry on the same lane must commit";
+    EXPECT_FALSE(store->refLaneWedgedForTest(ns));
+    EXPECT_EQ(store->applyStateForTest(ns), RefApplyState::Clean);
+}
+
+/// Task 18, the same pair on the WEDGE-RESOLUTION path -- the negative half.
+///
+/// One flush does both things: it resolves an outstanding wedge over a genuinely durable object (the
+/// resolving GET proves it, so the transaction is installed and the lane unwedged), and then commits
+/// its own new chunk, which the pre-attempt gate refuses. The lane must come out CLEAN.
+///
+/// This is the worst pre-fix shape and the reason the case is worth its own test: the flush had just
+/// converted a resolvable wedge into a recorded transaction, and the old code immediately re-wedged the
+/// lane over an id whose object was never written -- turning a wedge that WOULD have cleared into one
+/// that never can.
+TEST(CasRefInstallSafety, PreAttemptRefusalAfterAWedgeResolutionLeavesTheLaneClean)
+{
+    auto backend = std::make_shared<DB::Cas::tests::ChunkFaultBackend>();
+    auto store = openPoolFenceControlled(backend);
+    const RootNamespace ns{"srv1/pre_attempt_after_unwedge"};
+
+    publishEmptyPart(store, ns, "x");
+    publishEmptyPart(store, ns, "y");
+    const size_t tail_after_seed = store->tailSinceSnapshotCountForTest(ns);
+
+    /// Wedge over an object that IS durable: the write lands, its acknowledgement is lost, and the
+    /// controller's own verifying read is lost too (the only mode that reaches the resolution install).
+    backend->fault_substr = store->layout().refsNamespacePrefix(ns) + "_log/";
+    backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::LandedThenLost;
+    backend->fault_count = 1;
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
+    ASSERT_TRUE(store->refLaneWedgedForTest(ns));
+    ASSERT_EQ(store->tailSinceSnapshotCountForTest(ns), tail_after_seed);
+
+    backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::None;
+    store->setMountDeadline(FENCE_DEADLINE_REFUSES_ATTEMPT_MS);
+    const String message = retryLaterMessageOf([&] { store->dropRef(ns, "y"); });
+
+    EXPECT_NE(message.find("no attempt was sent"), String::npos) << message;
+    EXPECT_FALSE(store->refLaneWedgedForTest(ns))
+        << "the wedge that existed was RESOLVED, and the chunk that followed it was never sent -- the "
+           "lane must be left clean, not re-wedged over an id that can never resolve";
+    EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), tail_after_seed + 1)
+        << "the resolved wedge must still have been installed exactly once";
+    EXPECT_FALSE(store->resolveRef(ns, "x", /*allow_stale=*/false).has_value())
+        << "the wedged drop was proven durable, so its removal must be visible";
+    EXPECT_TRUE(store->resolveRef(ns, "y", /*allow_stale=*/false).has_value())
+        << "the refused chunk must not have taken effect";
+    EXPECT_EQ(store->applyStateForTest(ns), RefApplyState::Clean);
+
+    store->setMountDeadline(FENCE_DEADLINE_HEALTHY_MS);
+    store->dropRef(ns, "y");
+    EXPECT_FALSE(store->resolveRef(ns, "y", /*allow_stale=*/false).has_value());
+    EXPECT_FALSE(store->refLaneWedgedForTest(ns));
+}
+
+/// Task 18, the same pair on the wedge-resolution path -- the POSITIVE half, so the test above cannot
+/// pass by the fix having weakened the wedge generally. Same flush shape (resolve a durable wedge, then
+/// commit a new chunk), except the new chunk's PUT is genuinely ambiguous: an attempt WAS sent, so the
+/// lane must wedge again, now over the NEW transaction.
+TEST(CasRefInstallSafety, AmbiguousChunkAfterAWedgeResolutionRewedgesTheLane)
+{
+    auto backend = std::make_shared<DB::Cas::tests::ChunkFaultBackend>();
+    auto store = openPoolFenceControlled(backend);
+    const RootNamespace ns{"srv1/ambiguous_after_unwedge"};
+
+    publishEmptyPart(store, ns, "x");
+    publishEmptyPart(store, ns, "y");
+    const size_t tail_after_seed = store->tailSinceSnapshotCountForTest(ns);
+
+    backend->fault_substr = store->layout().refsNamespacePrefix(ns) + "_log/";
+    backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::LandedThenLost;
+    backend->fault_count = 1;
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
+    ASSERT_TRUE(store->refLaneWedgedForTest(ns));
+    const String first_wedged_key = store->wedgedKeyForTest(ns);
+    ASSERT_FALSE(first_wedged_key.empty());
+
+    /// The resolving GET of the wedged key is NOT faulted (the fault modes intercept `putIfAbsent`, and
+    /// `LandedThenLost`'s one-shot lost read was consumed inside the previous attempt), so the wedge
+    /// resolves `Committed`; the fault below then hits this flush's OWN chunk PUT.
+    backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::Unresolved;
+    backend->fault_count = 1;
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "y"); });
+
+    EXPECT_TRUE(store->refLaneWedgedForTest(ns))
+        << "an attempt was sent for the new chunk, so its object may be durable: the lane must wedge";
+    EXPECT_NE(store->wedgedKeyForTest(ns), first_wedged_key)
+        << "the new wedge must describe the NEW transaction, not the resolved one";
+    EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), tail_after_seed + 1)
+        << "only the resolved wedge is recorded; the in-doubt chunk is not";
+    EXPECT_EQ(store->applyStateForTest(ns), RefApplyState::ApplyPending)
+        << "a wedged lane may hold a durable transaction the runtime has not recorded";
+}
+
+/// Task 18's regression guard, asserted on the mapping itself rather than through six pieces of fault
+/// choreography. `unresolvedProvesNothingWasSent` is the whole decision: the ledger wedges unless it
+/// answers true, so this table IS the protocol.
+///
+/// What protects a future contributor who adds a `CasUnresolvedReason` member and forgets this file:
+/// the predicate is a switch with NO `default`, so the addition is a `-Wswitch` build error (a forced
+/// decision, not a silent one), and its trailing `return false` makes the runtime answer "wedge" even
+/// if that diagnostic is ever suppressed. Both directions fail closed; neither can widen the allow-list
+/// by omission. The `static_assert`s make the mapping a compile-time fact, and the `EXPECT`s repeat it
+/// so a break names the offending value in the test report.
+TEST(CasRefInstallSafety, OnlyNoAttemptSentMaySkipTheWedge)
+{
+    static_assert(unresolvedProvesNothingWasSent(CasUnresolvedReason::NoAttemptSent));
+    static_assert(!unresolvedProvesNothingWasSent(CasUnresolvedReason::NotUnresolved));
+    static_assert(!unresolvedProvesNothingWasSent(CasUnresolvedReason::FenceLostMidWay));
+    static_assert(!unresolvedProvesNothingWasSent(CasUnresolvedReason::DeadlineMidWay));
+    static_assert(!unresolvedProvesNothingWasSent(CasUnresolvedReason::FenceLostPostWrite));
+    static_assert(!unresolvedProvesNothingWasSent(CasUnresolvedReason::AttemptsExhausted));
+
+    EXPECT_TRUE(unresolvedProvesNothingWasSent(CasUnresolvedReason::NoAttemptSent))
+        << "the pre-attempt gates rejected before the first request: the key is provably unwritten";
+    /// `NotUnresolved` is reachable at the decision site if any path ever returns `Unresolved` without
+    /// recording a reason, so it is listed here as a real case, not as enum hygiene.
+    EXPECT_FALSE(unresolvedProvesNothingWasSent(CasUnresolvedReason::NotUnresolved))
+        << "an unrecorded reason proves nothing and must keep wedging";
+    EXPECT_FALSE(unresolvedProvesNothingWasSent(CasUnresolvedReason::FenceLostMidWay))
+        << "an attempt was already sent: its object may be durable";
+    EXPECT_FALSE(unresolvedProvesNothingWasSent(CasUnresolvedReason::DeadlineMidWay))
+        << "an attempt was already sent: its object may be durable";
+    EXPECT_FALSE(unresolvedProvesNothingWasSent(CasUnresolvedReason::FenceLostPostWrite))
+        << "the attempt COMMITTED and only the fence was lost afterwards -- the most durable case of all";
+    EXPECT_FALSE(unresolvedProvesNothingWasSent(CasUnresolvedReason::AttemptsExhausted))
+        << "every attempt is a candidate for having landed";
 }
 
 /// Task 5 (spec §A1, site 2). Resolving a wedge is a post-durable install too: the resolving GET PROVES

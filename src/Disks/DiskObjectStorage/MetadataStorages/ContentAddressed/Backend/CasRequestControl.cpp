@@ -216,20 +216,29 @@ uint64_t CasRequestController::backoffBeforeAttempt(uint32_t next_attempt) const
     return std::min(initial << doublings, cap);
 }
 
-bool CasRequestController::pauseBeforeReissue(uint32_t completed_attempt, uint64_t deadline_ms, const std::function<bool()> & fence_ok)
+bool CasRequestController::pauseBeforeReissue(uint32_t completed_attempt, uint64_t deadline_ms,
+                                              const std::function<bool()> & fence_ok, CasUnresolvedReason * out_reason)
 {
     /// Fence BEFORE the sleep (the pre-attempt fence rule applies to the whole loop, not just the
     /// attempt): a fence lost mid-backoff aborts the operation instantly — sleeping first would keep a
     /// fenced writer alive for up to a full backoff cap after it lost its right to write.
     if (!fence_ok())
+    {
+        if (out_reason)
+            *out_reason = CasUnresolvedReason::FenceLostMidWay;
         return false;
+    }
     const uint64_t backoff = backoffBeforeAttempt(completed_attempt + 1);
     if (backoff == 0)
         return true;
     /// Never serve a sleep the operation cannot afford: if the backoff plus one more attempt would
     /// cross the operation deadline, give up NOW instead of sleeping into a guaranteed Unresolved.
     if (now_ms() + backoff + budget.attempt_timeout_ms > deadline_ms)
+    {
+        if (out_reason)
+            *out_reason = CasUnresolvedReason::DeadlineMidWay;
         return false;
+    }
     sleep_ms(backoff);
     return true;
 }
@@ -330,8 +339,16 @@ CasWriteOutcome CasRequestController::putIfAbsentControlled(
                 /// Absent/unreadable: another attempt of the SAME (key, bytes) may be legal — after the
                 /// fence-gated capped-exponential backoff (pauseBeforeReissue). No pause after the LAST
                 /// attempt: the budget is spent, sleeping would only delay the Unresolved verdict.
-                if (attempt == budget.max_attempts || !pauseBeforeReissue(attempt, deadline_ms, fence_ok))
-                    return CasWriteOutcome::Unresolved;
+                ///
+                /// Both refusals report through `unresolved`, never a bare `return Unresolved`: this is
+                /// the ordinary way a busy lane exhausts itself, so leaving `out_reason` at its initial
+                /// `NotUnresolved` here made the ref lane's wedge message read "is UNCERTAIN (not
+                /// unresolved)" for the single most common wedge there is.
+                if (attempt == budget.max_attempts)
+                    return unresolved(CasUnresolvedReason::AttemptsExhausted);
+                CasUnresolvedReason pause_reason = CasUnresolvedReason::AttemptsExhausted;
+                if (!pauseBeforeReissue(attempt, deadline_ms, fence_ok, &pause_reason))
+                    return unresolved(pause_reason);
                 continue;
             }
         }
