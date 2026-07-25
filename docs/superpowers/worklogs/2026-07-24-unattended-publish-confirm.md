@@ -269,3 +269,49 @@ sessions (minikube, buildx, tc_1_*, zk-monotonicity-tester) and to prior runs' e
 Relaunched: `--seed 1 --phase 3 --duration 4h --insert-mode sync --max-pool-gb 12` ->
 `tmp/unattended/soak_4h_v2.log`. Watchdog must keep sampling free space; if the burn still projects
 past the budget, the next step is to shorten the run rather than to delete other people's data.
+- 05:49 UTC — watchdog: soak v2 healthy and progressing (tick #9, pool 4.07GB of the 12GB budget,
+  log fresh, driver RSS 2.8GB, load 27.8, 51G RAM free). Burn re-measured: 90 GB/h (down from 150),
+  but the naive projection over the remaining ~3.7h is 333G against 314G free — marginal.
+  DELIBERATELY NOT ACTING YET, because that sample is from the UNTHROTTLED ramp: the pool is still
+  filling toward its budget, so no pacing is in effect. The rate that matters is the post-saturation
+  steady state. DECISION RULE for the next check (~06:09), so this is not re-litigated ad hoc: once
+  the pool reaches ~12GB and throttling engages, re-measure over 2 min; if the steady-state rate
+  projects to exceed free space minus a 60G floor, shorten the run (SIGINT at a stage boundary and
+  report a partial soak) rather than delete other sessions' data.
+
+## F4 continued (06:12 UTC) — steady-state burn is 168 GB/h; a 4h soak is not physically possible here
+
+Decision-rule measurement taken as promised, once throttling had engaged (ticks #18-22 all pacing at
+1.0s/insert): **168 GB/h**, free space 263 GB. So the remaining 3.5h would need ~588 GB. Confirmed
+infeasible — not marginal.
+
+COUNTERINTUITIVE AND WORTH KNOWING: shrinking the pool budget made the burn WORSE, not better
+(40 GB budget -> ~150 GB/h; 12 GB budget -> 168 GB/h). The consistent reading is that the physical
+footprint tracks WRITE VOLUME, and a tighter logical budget forces GC to reclaim more aggressively —
+every condemn/delete/rewrite cycle is itself more writes into a store that keeps every version. So
+the pacing knob cannot buy headroom on a non-compacting store; it buys the opposite.
+
+REVISED PLAN (not a silent truncation — the stage schedule makes a clean cut available):
+`stage_plan(4h)` = WARMUP 0-12, STEADY 12-36, MUTATIONS 36-60, TTL_PRESSURE 60-84,
+**GC_CHECKPOINT 84-96**, CHAOS 96-204, CLIFF 204-216, CONVERGE 216-240 (minutes). At 168 GB/h the
+60 GB floor is reached at about t+105min, i.e. AFTER the GC_CHECKPOINT stage completes at t+96min.
+So: let the run continue through the quiesced GC_CHECKPOINT — the stage that actually verifies
+(quiesce, GC to fixpoint, both-replica aggregates, fsck) — and stop cleanly after it, at ~t+96min,
+before the CHAOS stage that would run into the wall. Expected deliverable: a ~1.6h soak covering
+warmup/steady/mutations/TTL-pressure WITH a full checkpoint, instead of a 4h run that ENOSPCs mid-chaos.
+Watchdog keeps sampling; if the burn accelerates and threatens the floor before t+96min, stop earlier
+and take whatever checkpoint has completed.
+
+Status at this check: t+33min, STEADY stage, zero failures, zero dangling reports, load 5.5, 51G RAM.
+- 06:31 UTC — watchdog: soak healthy at t+49min (MUTATIONS stage, zero failures, load 4.5, 49G RAM). Burn re-measured at 120 GB/h (down from 168 as throttling bites). Projection to the plan's stop point holds with margin: GC_CHECKPOINT completes at t+96min = 45 min out, costing ~90G and leaving ~138G against the 60G floor. Plan unchanged — run through the checkpoint, stop before CHAOS. NOTE for the report: tick #38 shows pool_bytes=86.5GB against a 12GB budget, i.e. the metric is tracking the PHYSICAL bucket (retained overwrite versions), which is exactly why the pacing knob cannot bound it — same root as F4, now visible in the soak's own telemetry.
+- 06:52 UTC — watchdog: soak healthy at t+71min (TTL_PRESSURE, zero failures / zero dangling / zero LOGICAL_ERROR, load 3.5, 52G RAM). Burn steady at 60 GB/h, 208G free; GC_CHECKPOINT (t+84..96) costs ~25G and leaves ~183G, so the checkpoint is comfortably affordable and the earlier 'chaos cannot survive' projection is superseded — it was extrapolated from the 168 GB/h ramp peak. Telemetry note: tick #54 reports pool_bytes=114GB against a 12GB budget, i.e. the metric tracks the PHYSICAL bucket with retained overwrite versions (F4). Pending decision put to the user (not actionable from a watchdog turn): whether to stop after the checkpoint and repurpose the stand for an allocation-fault run, since the standard soak driver treats any non-ABORTED query error as a hard workload failure and therefore CANNOT host memory_tracker_fault_probability — which is exactly why S42 needs its own oracle.
+- 07:09 UTC — watchdog: soak at t+89min, INSIDE the gc_checkpoint stage, zero failures. **F4 PARTLY
+  CORRECTED BY OBSERVATION**: free space went UP from 208G to 323G during this stage — the quiesced
+  GC-to-fixpoint reclaimed ~115G. So the physical footprint is NOT monotonic as F4's wording implied;
+  it collapses when GC is allowed to run to fixpoint, and what actually grows unboundedly is the
+  footprint BETWEEN reclaim points. Consequence: the 4h run now fits — after the checkpoint the
+  remaining 144 min at ~60 GB/h costs ~144G against 323G free — so the earlier plan to cut the run
+  after the checkpoint is unnecessary and I am letting it continue through CHAOS/CLIFF/CONVERGE.
+  Also: Task 18 (do not wedge a lane when no attempt was sent) and Task 19 (a diagnostic tool must not
+  claim ownership of a live pool — the recurring CI scrape failure) appended to the plan; a subagent
+  is investigating the 04286 600s timeout from the CI logs.

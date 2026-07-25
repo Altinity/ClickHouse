@@ -1049,6 +1049,52 @@ Subject: `ca: a pre-attempt fence reject no longer wedges the lane (finding #37 
 
 ---
 
+## Task 19: a diagnostic tool must not claim ownership of a live pool (CI "Scraping system tables")
+
+Known since the 2026-07-23 PR-2073 triage and seen again in the 2026-07-24 run, so it is not a flake.
+The CI step that scrapes system tables runs `clickhouse-local` against the same data directory as the
+LIVE server; on a CA disk that goes `Pool::mountWritable` -> `claimOwnerOrThrow` and fails, because
+the running server legitimately owns that server root. The scrape step then reports a failure that has
+nothing to do with the change under test, and — worse — it is indistinguishable at a glance from a
+real mount-ownership bug, which is exactly what a diagnostic path must never look like.
+
+**Why this is a product task, not a CI-config tweak.** The same shape bites any read-only consumer of
+a live pool: `clickhouse-disks`/`ca-fsck` against a running server, a post-mortem scrape, an operator
+inspecting a pool from a second process. The stand already carries a bespoke workaround for exactly
+this (`utils/ca-soak/configs/fsck_only_ca.xml`, a separate fsck-only config), and BACKLOG's
+`[F1-prod]` entry records the same class from the other direction (a read-only shadow disk breaking
+part discovery). One decision should serve all of them.
+
+**Design question to settle FIRST (do not skip to code):** which of these is the contract?
+  (a) a CA disk opened by a tool declares itself read-only and NEVER claims the mount — the pool is
+      readable without ownership, and every write-class op fails closed;
+  (b) tools keep claiming, but a claim by a NON-server process against a live root is a clean,
+      typed refusal the caller can recognise and downgrade to read-only itself;
+  (c) the scrape simply must not see CA disks (a CI-config carve-out) — cheapest, but leaves the
+      general problem and the operator case unsolved.
+`Store::open`'s existing `read_only` path is the natural home for (a) — note the BACKLOG item
+"[refactor: Store::open modes] split into create / open-rw / open-ro", which flags that read-only
+`Store::open` can still write `_pool_meta`; that bug must be fixed as part of (a) or it undermines it.
+
+**Files (once the contract is chosen):**
+- `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.{h,cpp}` (open modes)
+- `.../Pool/CasServerRoot.cpp` (`claimOwnerOrThrow` refusal typing, for (b))
+- the CI scrape invocation, wherever it builds its `clickhouse-local` config
+
+- [ ] **Step 1: Reproduce locally** — start the soak stand, then run the same `clickhouse-local`
+  scrape against its data dir and capture the exact failure. Without a local repro this task is
+  guesswork.
+- [ ] **Step 2: Pick the contract** (a)/(b)/(c) and write it into
+  `docs/superpowers/cas/` where the disk-lifecycle rules live, with the operator case named.
+- [ ] **Step 3: Implement, with a test that a read-only open of a LIVE pool succeeds and takes no
+  ownership** — assert the live server's mount object is untouched (same holder, same epoch) after
+  the tool exits.
+- [ ] **Step 4: Verify the CI scrape step passes against a running CA server; Step 5: Commit.**
+
+Subject: `ca: read-only pool access for tools — stop the system-table scrape claiming a live mount`
+
+---
+
 ## Self-Review
 
 **Spec coverage:** §A1 → Tasks 3-6; §A2 → Task 7; §A3 → Task 8; §confirm-primitive gate 1 → Task
