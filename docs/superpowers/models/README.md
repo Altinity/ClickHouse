@@ -95,6 +95,7 @@ of `CaGcRootLocalPartManifestCore`.
 | `CaRefFoldClampRecoveryCore.tla` | fold clamp always recoverable: per-log cleanup staging | CURRENT | `run_foldclamp.sh` |
 | `CaRefNsCleanupStaleLeaderCore.tla` | stale-leader namespace-cleanup pass aborts on completed-marker observation | CURRENT | `run_nscleanup_staleleader.sh` |
 | `CaRefWriterCleanupCore.tla` | ref-table writer ownership lifecycle: precommit, promote, fence, successor cleanup | CURRENT | `run_refwcleanup.sh` |
+| `CaRelinkConfirmCore.tla` | publish-then-confirm relink: gate 1 (exact-`ManifestRef` equality, lane quiescence, poison, mount fence) and the publish-before-confirm order, each proven load-bearing — **plus the finding that the theorem is violable independently of the protocol under an honest fold cursor** | CURRENT (gates unlanded Part B; `_main` is CONDITIONAL on `LIST` completeness) | `run_relinkconfirm.sh` |
 | `CaErasureProof.tla` | rev.7 natural `Vanished(erased)` proof soundness: writer paths closed by op-gate + guard counter + LIST-reset + grace ([D1] grace proven load-bearing); two GC-side windows found — evidence in the decision to excise the natural-erasure stack from v1 | HISTORICAL (design excised before activation) | `run_erasureproof.sh` |
 | `CaDiskLifecycle.tla` | rev.8 FORGET-only v1 lifecycle: one-way-ness, the as-built `FORGET` protocol (trip#2 sufficiency, earned farewell, first-terminal-wins), the [C1] GC self-exit-on-Vanished, the [M1] intent-bail; Task-15 gate | CURRENT | `run_disklifecycle.sh` |
 | `CaB140DangleMerge.tla` (+ `m_*.cfg`) | journal-trim dangle across a lease handoff: trim-gate + cursor-in-snap jointly necessary | HISTORICAL | (inline TLC) |
@@ -234,6 +235,30 @@ ordered scan and cleanup deletes only what it observed durable. The migration is
   remove-then-retire; a successor fences a new epoch and removes stale precommits by exact
   identity, bounded. Invariants: no wrongful reclaim of a live build's objects, promote never
   leaves a ref ownerless, retire only after removal, namespace removal complete.
+
+### Fetch handoff: publish-then-confirm relink {#group-relink-confirm}
+
+- **`CaRelinkConfirmCore.tla`** — the Task-9 gate for the publish-then-confirm relink protocol
+  (spec `2026-07-23-cas-fetch-handoff-publish-confirm-design.md` rev.5, Part B). A sender ref lane
+  with a durable journal, an in-memory committed row that may lag it (the post-durable-PUT window),
+  an admission queue, a leader tenure, an apply-pending poison state and a mount fence; a receiver
+  running publish (durable `+1`) → confirm → promote, or a durable releasing abort; and a GC round
+  with a per-namespace fold cursor and condemn → `delete_pending` → delete graduation with sparing
+  on positive in-degree. Proves `ConfirmedRelinkNeverDangles`, with five sabotages each removing one
+  rule: gate 1's exact-`ManifestRef` equality (an ABA via a repoint answers *yes* by name),
+  lane quiescence, the poison state (separately load-bearing — after a poisoned apply the lane looks
+  perfectly quiescent), the mount-fence/current-writer check, and the publish-BEFORE-confirm order.
+  Four `_witness_*` configs pin non-vacuity, including that the theorem's antecedent and physical
+  deletion are both reachable.
+  **Read the headline finding before trusting the green run:** the fold cursor is modelled honestly
+  — it advances over what a round OBSERVED, and GC discovers ref-log transactions by a paginated
+  `LIST` with no completeness proof. `_sab_holeylist` keeps every confirm rule intact and allows
+  exactly ONE incomplete page in the whole behaviour, and the theorem still breaks: the omitted `+1`
+  sinks below its namespace cursor and is never folded again, so GC deletes a deduplicated blob a
+  confirmed, promoted manifest references. That is BACKLOG
+  `{#list-as-journal-dataloss-2026-07-25}` mechanised. `_main` therefore runs with `MaxHoles = 0`
+  and must be read as "the confirm protocol adds no new dangle path", not "a confirmed relink cannot
+  dangle". Full run evidence and traces: `CaRelinkConfirmCore_RESULTS.md`.
 
 ### Mount ownership {#group-mount}
 
