@@ -186,6 +186,29 @@ These are real scale/budget findings; most are variants of "O(N) GC / per-op amp
 - **[Ring-2 comment/convention nits]** — MINOR — `S3Common.h` comment overclaims for the RetryStrategy site; `static_assert(DEFAULT_EXPECT_CONTINUE_MIN_BYTES==0)`; `MergeTask::projection_uses_parent_transaction` could be a local; `ProfileEvents.cpp` changelog fragment in a description; `_ms` suffix on a `DateTime64(3)` column; the new `GC REBUILD` right abbreviates "GC" vs the sibling spelled-out "GARBAGE COLLECTION"; internal `cas_part_folder_cache_*` names outlived the key rename; `05011` `no-parallel` tag droppable; empty untracked `poc/` dir husk.
 - **[C2-followups] more pagination loops for `forEachListedKey`** — MINOR — Three more identical loops in `CasRefIntake.cpp`/`CasServerRoot.cpp`; `forEachListedKey` also lacks a stop-on-true/page-boundary hook to let `deletePrefixWholesale` + ns-cleanup migrate (interface addition, design first).
 
+## RED (pre-existing, found 2026-07-24): `RefWriterRecoverySeal.EmptyDeadRegionCarveOutStillReportsSameProcessNamespace` {#red-emptydeadregion-phasec}
+
+The Phase C re-mint guard (`6094c1473ea`, "refuse to re-mint writer_epoch 1 while a mount object
+exists") makes this seal test unable to open its pool: `Pool::open` -> `mountWritable` ->
+`allocateWriterEpoch` (`CasServerRoot.cpp:229`) throws `CORRUPTED_DATA` "no durable epoch object but
+a mount lease exists ... refusing to re-mint epoch 1".
+
+Trigger set: {no durable epoch object} x {server-root data subtree EMPTY} x {mount object Present} x
+{normal mint policy}. Only this test constructs it — `seedUncleanPredecessorMount`
+(`gtest_cas_ref_writer.cpp:2805`) writes a mount through the production `claimMount` and nothing
+else, and this is the only seal test whose dead region is deliberately empty; all 11 siblings pass.
+
+Assessment (not a fix): in production that state looks UNREACHABLE, because `mountWritable` calls
+`allocateWriterEpoch` — which writes the epoch object — BEFORE `claimMount` publishes the mount. On
+that reading the guard is right and the FIXTURE is unrealistic (a real predecessor at epoch 1 leaves
+an epoch object behind), so the fix is to seed the epoch object for this one test rather than to
+weaken the guard. NOT applied: the guard and the test are the same parallel round's just-landed work,
+and if the state turns out to be reachable by some other order, refusing it would brick a pool — that
+is a product question for the guard's author, not a test tweak to guess at.
+
+Why it survived its own landing commit: the narrow `Cas*:CA*` gate filter EXCLUDES `RefWriter*` (the
+2026-07-17 gate-filter gap). Use the comprehensive filter.
+
 ## 14. Local / emulated backend {#local-backend}
 
 Collected 2026-07-23 (user direction): every "local backend" story lives HERE, so the class is visible
