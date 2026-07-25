@@ -396,3 +396,36 @@ ETA ~12:33 UTC. 330G free at start.
   still ran and passed, but its entry gate did not. This is the SAME cost family as the study opened
   today (BACKLOG {#gc-bottleneck-study-2026-07-25}): whole-pool enumeration blowing a fixed timeout as the
   pool grows. Another argument for measuring enumeration cost as a curve rather than tuning the 180s.
+- 10:29 UTC — watchdog: soak v3 t+1h56m, STAGE chaos, 0 failures, disk 324G, load 0.5. Chaos is doing its
+  job (8 faults fired; INSERTs correctly surface `stageManifest … is UNCERTAIN (retry budget exhausted)`
+  and the driver reroutes — that is the designed shape, not an error).
+
+### F6 — `unreachable=41` at the gc_checkpoint is NOT the B140/M-F debris the harness labels it (user-flagged)
+
+I repeated the harness's `(M-F debris, B140)` label without checking it. Checked now; the label is wrong
+for this observation on two independent counts.
+
+FACTS:
+1. **The checkpoint ran with ZERO injected faults.** `gc_checkpoint` occupies t+5045..5760s; the first
+   chaos fault is `CHAOS firing fault #1 at t+5845s`. So no kill, no restart, no rustfs pause had
+   happened when the 41 were counted.
+2. **The count was STABLE, not in-flight.** The checkpoint drives GC to its fixpoint and only accepts a
+   settled band, and inserts are off for the whole stage — so these are not staged-but-uncommitted blobs
+   caught mid-write.
+3. **GC does not even nominate them.** Same checkpoint: `dryrun_count=0` against `unreachable=41`. GC's
+   own `previewDeletes` proposes deleting nothing, so these 41 are invisible to the zero-in-degree
+   candidate computation, not merely awaiting a round.
+4. **Both rationales the harness cites are inapplicable here.** `checker.py:544` and `run.py:555` say the
+   residual is "blobs orphaned by a displaced-before-expansion tree", reclaimable only by the unimplemented
+   Full-GC. But `03-writer-protocol.md:454` states that leak is closed BY CONSTRUCTION (B199-S2 inline
+   closure of the staged tree on the precommit journal `Add`). The other cited cause,
+   `02-methodology.md:247` "abandoned builds", requires a writer to die — see fact 1.
+5. The count is not monotone across the run: `41 → 41 → 22 → 22 → 48 …`, so it is a live population, not
+   a sediment.
+
+NOT ESTABLISHED: what the 41 objects actually are. That needs `ca-fsck --detail` classification, which I
+am deliberately NOT running now — the pool is mid-chaos with rustfs being paused and restarted, so any
+sample taken now is contaminated and would answer a different question. Doing it after the run.
+
+NOTE the harness comments are stale regardless of what the 41 turn out to be: they assert a
+reclaim-impossibility that the writer protocol says no longer exists. Not editing them mid-run.
