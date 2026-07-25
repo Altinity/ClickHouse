@@ -726,3 +726,9 @@ Also queued and not decision-blocked, if more unattended time is wanted later: t
 deliverable 1 (per-phase round introspection), the S42 server-reachable failpoint without which that
 scenario can never return a conclusive green, and making `ca-fsck` fatal on `stale_edge` once the leak is
 fixed.
+- 18:09 UTC — watchdog: IDLE and the round is closed. Nothing running, working tree clean of round files,
+  disk 330G, 61G RAM, load 0.3. No further work is startable: every remaining item needs a user decision
+  (upstream authorization for Tasks 11-16, the Task 19 contract, the containment + journal-chain fix, and
+  Task 20 which the user already deferred). Per the watchdog's own rule for this state, I am saying so and
+  scheduling no further work. The ca-soak stand stays UP deliberately as the live reproduction for
+  BACKLOG {#unmatched-minus-one-retention-leak}; do not `down -v` it without capturing more.
