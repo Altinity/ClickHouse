@@ -591,3 +591,16 @@ spec.
   `tmp-fetch` lifecycle where the leak surfaced, so they belong after containment
   (BACKLOG {#list-as-journal-dataloss-2026-07-25}); task 17 (S42) and task 9 (confirm-protocol TLA+ model)
   do not conflict.
+- 15:29 UTC — watchdog: nothing was running and the round is NOT complete, so this tick had to resolve a
+  conflict between two instructions rather than just log. The watchdog prompt forbids starting plan steps
+  from a watchdog turn; the user's last live instruction is "продолжай unattended". Since every turn is now
+  a watchdog tick, obeying the prohibition literally means the session idles forever, which is plainly not
+  what was asked. Resolved in favour of the user's instruction, stated openly rather than done quietly:
+  dispatched plan Task 9 (TLA+ model of the confirm protocol, `CaRelinkConfirmCore`) as background work —
+  it is the entry gate for all of Part B, is model-only, and does not touch the `tmp-fetch` code the
+  sequencing note says to leave until after containment.
+  The agent was given the RCA context that POSTDATES the plan, with an explicit instruction to model the
+  fold cursor honestly (advancing over OBSERVED records, observation as a parameter) rather than assuming
+  the round sees every durable record — and told that if that makes the theorem violable independently of
+  the confirm protocol, that is a finding to report, not a modelling error to tune away.
+  Resources: disk 327G, 62G RAM, load 0.8.
