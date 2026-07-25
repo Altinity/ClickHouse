@@ -209,6 +209,39 @@ is a product question for the guard's author, not a test tweak to guess at.
 Why it survived its own landing commit: the narrow `Cas*:CA*` gate filter EXCLUDES `RefWriter*` (the
 2026-07-17 gate-filter gap). Use the comprehensive filter.
 
+## [GC-THROUGHPUT-COLLAPSE] dropped namespaces are never pruned once GC rounds stall — 63% of the CI pool was corpses {#gc-throughput-collapse}
+
+Found 2026-07-24 by asking a question the first analysis had waved away ("isn't that LIST just the
+live refs of many parallel tests?"). It is not. Measured from the PR-2073 CA-s3 stateless run's
+server log:
+
+- of the 167 distinct ref-page boundaries the slow LIST walked, **128 distinct namespaces; 113 have an
+  explicit drop record and 97 were dropped BEFORE the query even started** (median 25 min earlier,
+  oldest 58 min). Weighted by page boundary, **63% of the listed volume sits in already-dropped
+  namespaces**; the only undropped ones are the server's own `system.*_log` tables;
+- 15,123 namespaces existed before the query, **9,538 explicitly dropped**;
+- the pool ran **32 GC rounds in 95 minutes and then none at all for the last ≥47 minutes**;
+- the rounds were losing: candidates 1006 -> 4841 -> 20046 while deletions stayed ~700/round, and the
+  round interval went 9 min -> 28 min -> never.
+
+Mechanism: `Gc::cleanupRefObjects` and `runNamespaceCleanupPasses` (`CasGc.cpp:1502`, `:1570`) only
+execute INSIDE a round. So once round wall-time exceeds the interval, cleanup stops happening at all,
+dropped namespaces' `_log` objects stay forever, every LIST gets more expensive, and the next round is
+slower still — a positive feedback loop, not a plateau. The 04286 600s timeout
+({#remote-data-paths-no-pushdown}) is a SYMPTOM of this; the disk-name pushdown fixes that one query,
+not the pool.
+
+NOT the same as `[codex-11]` (an EMPTY Live-but-ownerless ref-table revived through an
+allocate/register TOCTOU): here the namespaces were cleanly dropped, with populated ref-table logs
+left behind. This is a cleanup-THROUGHPUT failure and belongs with the GC scalability family
+(§2 `[Lever B]`, the O(pool) round cost, the quadratic-LIST scenario finding) — Lever B's change
+signal is exactly what would stop a round from re-walking an unchanged universe.
+
+Why it matters beyond CI: the same feedback loop applies to any long-lived pool with table churn.
+Evidence caveat from the analysis: 167 pages is a LOWER bound (the client only logs a URL when it
+retried), so the absolute volume is larger; the dead/live ratio is unaffected because boundaries
+sample uniformly by object count.
+
 ## [04286 timeout] `system.remote_data_paths` walks EVERY disk — 600s timeout on the CA-s3 lane {#remote-data-paths-no-pushdown}
 
 Root-caused 2026-07-24 from the PR-2073 CI logs. `04286_content_addressed_remote_data_paths` timed
