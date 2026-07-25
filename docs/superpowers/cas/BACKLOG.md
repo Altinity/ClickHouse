@@ -958,3 +958,63 @@ NAIVE fold budget is unsafe, because an omitted `+1` edge must suppress deletion
 **Measurement we do not have and need before choosing a production fix:** per-round wall-time split
 across global ref LIST / ref-log+manifest GETs / candidate HEADs / meta-pool scheduling wait / blob+
 manifest deletes / namespace+ref cleanup. Without it any knob choice is a guess.
+
+## STUDY: GC bottleneck measurement rig + round introspection (opened 2026-07-25) {#gc-bottleneck-study-2026-07-25}
+
+**Gates** every fix proposed in [#gc-throughput-collapse-2026-07-25](#gc-throughput-collapse-2026-07-25).
+None of those may be implemented on the strength of the RCA alone: the RCA established the shape of the
+feedback loop from log timestamps, but it did NOT establish where the time inside a round goes. Picking
+a knob (meta-pool queue depth, `gc_meta_pool_size`, a round budget, a prefix split) without that split
+is guessing, and two of the knobs can plausibly make things worse — the endpoint was already saturated.
+
+### Why we cannot measure this today
+
+The GC has **no timing instrumentation at all**: `grep -i "Stopwatch|elapsed"` over
+`.../ContentAddressed/Gc/*.cpp` returns nothing. The one round-summary line
+(`CasGcScheduler.cpp:276`) reports `candidates / deleted / absent / replaced / spared /
+manifests_deleted` and **not even the round's own duration** — every wall-time number in the CI analysis
+was reconstructed by subtracting consecutive log timestamps, which is why "where did round 33 spend 39
+minutes" is unanswerable from the artifact. The existing `CasGc*` ProfileEvents
+(`CasGcEnumerationPages`, `CasGcMetaOps`, `CasGcRetired*`, `CasGcClampSuppressedPasses`, …) are all
+COUNTS of outcomes, never latencies and never per-phase request volume.
+
+### Deliverable 1 — introspection (ship this first; it is useful in production, not just for the study)
+
+Per-round, per-phase: wall time, S3 request count by verb (LIST/GET/HEAD/PUT/DELETE), bytes moved, page
+count. Phases at minimum: global ref-prefix LIST; ref-log GETs; manifest-edge GETs; candidate HEADs;
+meta-pool **scheduling wait** (distinct from meta-op execution — defect 1 predicts this is where the
+fold thread parks); the `gc/state` CAS; owner-manifest deletes; namespace cleanup; ref cleanup.
+Plus: retry/timeout counts per phase, so endpoint degradation is visible as itself rather than as
+"GC got slow". Surface via ProfileEvents + the round summary line + `system.content_addressed_log`
+(the B170 table already exists — see [[project_b170_cas_event_log]]). Decide deliberately whether the
+per-phase split is always-on or behind a setting; always-on is preferable if the cost is a few counters.
+
+### Deliverable 2 — a reproduction rig
+
+The ca-soak driver is the wrong instrument: it is steady-state on a small table set, and this failure
+mode is driven by **namespace churn**, not by data volume. The rig needs the CI lane's shape:
+one server, CA as the default MergeTree disk, one shared pool, `gc_interval_sec=5`, a local S3
+endpoint, and a generator that concurrently CREATEs and DROPs many short-lived tables. Target: drive
+the pool to the CI numbers (≈15k namespaces, ≈9.5k dropped, ≈20k candidates in one round) in far less
+than the 95 minutes the CI lane took, and make the arrival rate a knob so the queue-stability boundary
+can be crossed on purpose and observed from both sides. It must also be able to hold the endpoint
+UNsaturated, so endpoint slowness and GC cost can be separated — in the CI artifact they are confounded.
+
+### Deliverable 3 — the measurements
+
+1. Round wall-time split at a fixed pool size (answers "which phase dominates" — currently unknown).
+2. Scaling curves, measured separately: cost vs number of live namespaces; vs number of *historically
+   unique* namespaces (defect 2's permanent tombstones predict this one never flattens); vs candidate
+   count. These three are conflated in the CI data.
+3. The queue-stability boundary: DROP arrival rate at which round time stops converging, and how it
+   moves with `gc_meta_pool_size` and with meta-pool queue depth. Defect 1 predicts a deeper queue buys
+   overlap but does NOT move the `candidates / pool_size × RTT` floor, because `meta_pool->wait()`
+   precedes the CAS — that is a falsifiable prediction, so test it.
+4. Whether the collapse is self-limiting at some pool size or unbounded (open question from the RCA).
+
+### Then, and only then
+
+Choose a fix with numbers attached, and re-run the rig as the regression gate. Note that a naive fold
+budget is unsafe by construction: an omitted `+1` edge must suppress deletion, never permit it — so any
+bounded-round design has to carry durable progress state, which is why it needs a spec rather than a
+patch.
