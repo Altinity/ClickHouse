@@ -6,6 +6,7 @@
 #include <map>
 #include <memory>
 #include <unordered_set>
+#include <utility>
 
 namespace DB::Cas
 {
@@ -85,6 +86,18 @@ public:
     /// at every throw point; `base` is a non-const `shared_ptr` so no `const_cast` is needed). Both paths
     /// leave an empty overlay and `net_delta == 0`.
     void materialize();
+
+    /// Member-wise swap, guaranteed non-throwing AND allocation-free, with the same contract and the
+    /// same install-time purpose as `RefCowMap::swap` (Pool/CasRefCowMap.h): `shared_ptr::swap` and
+    /// `std::map::swap` exchange pointers only, `net_delta` is a POD. The swapped-out set keeps its
+    /// former base reference until it is destroyed, so a caller that folds the installed set must
+    /// destroy the swapped-out one first.
+    void swap(RefCowManifestSet & other) noexcept
+    {
+        base.swap(other.base);
+        overlay.swap(other.overlay);
+        std::swap(net_delta, other.net_delta);
+    }
 
     /// Test-only: current overlay entry count (0 right after `materialize()`).
     size_t overlayEntriesForTest() const { return overlay.size(); }

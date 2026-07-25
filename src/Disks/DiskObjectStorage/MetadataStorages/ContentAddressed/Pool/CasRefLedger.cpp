@@ -8,6 +8,7 @@
 #include <IO/WriteHelpers.h>
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
+#include <Common/MemoryTracker.h>
 #include <Common/ProfileEvents.h>
 #include <Common/setThreadName.h>
 #include <Common/ThreadPool.h>
@@ -1130,12 +1131,12 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
 {
     /// One flush = one carved batch through one attempted append. Contract: every ORDINARY outcome
     /// (validation reject, DefiniteFailure, Unresolved/wedge, Committed) lands in the affected items so
-    /// waiters always wake, and this does NOT throw for any of them. The ONE
-    /// exception is the provably-unreachable case where a DURABLY-committed transaction then fails to
-    /// apply to the in-memory state (which the whole-item shape validation is supposed to preclude): that
-    /// path completes every waiting survivor with the error, restores the leader bookkeeping, and RETHROWS
-    /// a LOGICAL_ERROR (the object is already durable and every future recovery would re-hit it -- see the
-    /// Committed-case catch below), so the caller learns this table's lane is bricked instead of hanging.
+    /// waiters always wake, and this does NOT throw for any of them. `commitRefChunk` no longer throws
+    /// past its durable `PUT` at all -- its install is allocation-free by construction (spec §A1) -- so
+    /// the paths that can still throw are the wedge-resolution apply above and an allocation failure in
+    /// this function's own bookkeeping (e.g. the chunk-boundary reseed). Both are contained by
+    /// `appendRefOps`' catch, which completes every still-unfinished survivor and restores the leader
+    /// bookkeeping, so no caller hangs.
     auto complete_error = [&](const std::vector<std::shared_ptr<RefMutationItem>> & items, std::exception_ptr e)
     {
         std::lock_guard<std::mutex> g(ref_queue_mutex);
@@ -1500,9 +1501,10 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
             /// per-op loop below previews each op as its OWN single-op trial transaction, so a
             /// whole-transaction-shape rule like "remove_namespace must be the FINAL op" trivially
             /// passes on every singleton slice regardless of this item's REAL combined shape -- a
-            /// malformed item (e.g. remove_namespace not last) would otherwise only be caught by the
-            /// post-persist apply further below, AFTER its object is already durable (see that apply's
-            /// own catch for why that would ALSO wedge this table's lane). Validate the item's COMPLETE
+            /// malformed item (e.g. remove_namespace not last) would otherwise only be caught by
+            /// `commitRefChunk`'s candidate apply -- which fails the whole chunk, taking every innocent
+            /// co-batched item with it, and (before the candidate moved ahead of the `PUT`) did so only
+            /// after the object was already durable. Validate the item's COMPLETE
             /// ops array as ONE combined transaction, against a throwaway copy of the pre-item state,
             /// before doing any other per-op work -- exactly what the real persisted transaction will
             /// contain, using only the public two-phase `applyRefLogTxn` entry point (no need to reach
@@ -1583,8 +1585,8 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
     /// Commit the FINAL chunk of this tenure (spec §3): the remaining accumulated ops form the last --
     /// possibly only -- ref-log transaction. Release the scratch `working` first so `commitRefChunk`'s
     /// post-commit overlay fold is in place (the E5 fast path), then run the full committed arm. Its
-    /// survivors are completed (success or failure) inside it, so nothing is owed here on any outcome;
-    /// the provably-unreachable durable-apply failure propagates to `appendRefOps`' catch as before.
+    /// survivors are completed (success or failure) inside it, so nothing is owed here on any outcome,
+    /// and it no longer throws past its durable `PUT` at all (spec §A1).
     working = RefTableState{};
     commitRefChunk(ns, rt, final_ops, survivors);
 }
@@ -1658,6 +1660,41 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
 
     const RefTxnId id = allocateRefTxnId();
     const RefLogTxn chunk_txn{ns.string(), id, chunk_ops};
+
+    /// Build the candidate state BEFORE the PUT (spec §A1), so that the region between "this chunk's
+    /// object is durable" and "the runtime records it" is allocation-free and therefore cannot throw.
+    /// It used to be the other way round -- PUT, then `applyRefLogTxn(rt->state, chunk_txn)` -- and that
+    /// apply CAN throw on an allocation failure (the COW containers allocate their overlays), which left
+    /// the transaction durable but invisible to the writer: a later transaction only needs
+    /// `greatest_applied < its id` (contiguity is not checked), and a snapshot published afterwards is
+    /// labelled with THAT id, so recovery skips the stranded transaction forever while GC, which folds
+    /// the ref LOGS, still applies it. That divergence is a data-loss class, not a stale cache.
+    ///
+    /// A throw HERE, by contrast, is a clean PRE-durability failure -- the same class as an ordinary
+    /// validation reject: no object exists yet, the cache is untouched, and the id is a safe gap.
+    ///
+    /// The copy is cheap because it SHARES the live state's COW bases; the apply allocates only the
+    /// overlay. The candidate is deliberately NOT materialized here: a state that shares its base cannot
+    /// fold in place, so folding now would rebuild the whole base (O(table) per chunk). The install
+    /// below restores unique base ownership before the existing post-install fold, which therefore stays
+    /// O(overlay), exactly as it is today.
+    std::optional<RefTableState> candidate;
+    RefTxnId candidate_base_id;
+    {
+        std::lock_guard lock(rt->state_mutex);
+        candidate.emplace(rt->state);
+        candidate_base_id = rt->state.getGreatestApplied();
+    }
+    try
+    {
+        applyRefLogTxn(*candidate, chunk_txn);
+    }
+    catch (...)
+    {
+        complete_error(chunk_survivors, std::current_exception());
+        return false;
+    }
+
     String bytes;
     try
     {
@@ -1688,33 +1725,63 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
     {
         case CasWriteOutcome::Committed:
         {
-            try
+            if (carve_hook_for_test)
+                carve_hook_for_test(CarvePhaseForTest::PostDurableInstall);
             {
                 std::lock_guard lock(rt->state_mutex);
-                applyRefLogTxn(rt->state, chunk_txn);
-                /// This commit's own transaction joins the applied-above-newest-snapshot tail counters --
-                /// the live `rt->state` just mutated above IS the next publish candidate's body, so there
-                /// is no per-entry log to retain. Bumped HERE, right after the apply and BEFORE the fold
-                /// below, so a fold that fails can never skip them: the transaction is durable and applied
-                /// regardless of whether the overlay was folded.
-                rt->tail_count_since_snapshot.fetch_add(1, std::memory_order_relaxed);
-                rt->tail_bytes_since_snapshot.fetch_add(bytes.size(), std::memory_order_relaxed);
+                /// Only this leader mutates `rt->state`, so the candidate's base snapshot is still the
+                /// current one: there is one append-lane leader per table at a time (the `leader_active`
+                /// baton), the wedge-resolution apply ran earlier in this same flush on this same thread,
+                /// recovery installs a state exactly once per runtime and has already completed for this
+                /// table, and every other consumer (readers, the snapshot publisher) only COPIES the
+                /// state under this mutex. Evaluated here, one statement before the install, and
+                /// asserted inside it: the comparison allocates nothing, and the identifier is short
+                /// enough that even the failure path's message is inline-buffered rather than heap
+                /// allocated, so no build can turn the assert itself into an allocation in the region.
+                [[maybe_unused]] const bool state_unchanged = rt->state.getGreatestApplied() == candidate_base_id;
+                {
+                    DENY_ALLOCATIONS_IN_SCOPE;
+                    /// The negative control (`setInstallRegionProbeForTest`): fired with the guard
+                    /// already armed, so a probe that allocates aborts a debug build. Null in production.
+                    if (install_region_probe_for_test)
+                        install_region_probe_for_test();
+                    chassert(state_unchanged);
+                    /// The install. Allocation-free by construction -- a member-wise swap of pointers and
+                    /// PODs plus two atomic increments -- hence non-throwing, which is the whole point:
+                    /// the object is already durable, and anything that could throw between here and the
+                    /// durable PUT would strand the transaction (see the candidate's construction above).
+                    /// The tail counters are bumped in the SAME region as the install, so no failure mode
+                    /// can record one without the other.
+                    rt->state.swap(*candidate);
+                    rt->tail_count_since_snapshot.fetch_add(1, std::memory_order_relaxed);
+                    rt->tail_bytes_since_snapshot.fetch_add(bytes.size(), std::memory_order_relaxed);
+                }
+                /// `candidate` now holds the DISPLACED state, which still shares the COW bases
+                /// `rt->state` uses. Destroy it before the fold and the fold takes its O(overlay)
+                /// in-place path (`use_count() == 1`); leave it alive and every commit would rebuild the
+                /// whole base instead. `reset` only destroys: it allocates nothing and cannot throw,
+                /// which is also why it is safe to do here, after the transaction is already recorded.
+                /// This is the same work the pre-fix `applyRefLogTxn(rt->state, ...)` did when it
+                /// move-assigned its scratch over the live state, moved one statement later; it stays
+                /// under `state_mutex` because the release decrements bases whose `use_count()` the fold
+                /// below reads (see both COW headers' materialize safety argument).
+                candidate.reset();
                 /// COW-map materialization: fold this chunk's overlay into the base HERE, under the SAME
                 /// state_mutex critical section as the install above, so `rt->state.getCommitted()` is
                 /// back to "base + empty overlay" before the next flush's -- or the next chunk's reseed --
                 /// trial copies (`working = rt->state`) begin. With `working` already released by the
-                /// caller, `rt->state`'s bases are uniquely owned here (barring a concurrent publisher
-                /// holding a copy, in which case the fold correctly falls back to build-fresh-and-swap),
-                /// so this is an O(overlay) IN-PLACE fold, not the O(n) base copy it once was.
+                /// caller and the displaced state destroyed just above, `rt->state`'s bases are uniquely
+                /// owned here (barring a concurrent publisher holding a copy, in which case the fold
+                /// correctly falls back to build-fresh-and-swap), so this is an O(overlay) IN-PLACE fold,
+                /// not the O(n) base copy it once was.
                 ///
                 /// This fold is an OPTIMIZATION, NOT part of the commit: it runs after the txn is durable
-                /// AND applied, and each container's fold is coherent at every intermediate throw point
+                /// AND installed, and each container's fold is coherent at every intermediate throw point
                 /// (see `CasRefCowMap.cpp`). So a mid-fold allocation failure (the tracked allocator can
                 /// throw `MEMORY_LIMIT_EXCEEDED`) leaves `rt->state` EXACTLY coherent -- only with a
                 /// non-empty overlay the next flush re-folds. Swallow it: the commit succeeded, the
-                /// survivors below must be told so, and nothing is bricked. This is why the outer catch's
-                /// "provably unreachable / every recovery re-hits" framing does NOT cover it -- a durable,
-                /// correctly-applied txn whose fold merely deferred is not a bricked lane.
+                /// survivors below must be told so, and nothing is bricked. It is deliberately OUTSIDE
+                /// the deny region: it is allowed to allocate, and it is allowed to fail.
                 try
                 {
                     rt->state.materializeCommitted();
@@ -1727,32 +1794,10 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
                         ns.string(), id.writer_epoch, id.ref_sequence));
                 }
             }
-            catch (...)
-            {
-                /// Reached ONLY if `applyRefLogTxn` itself threw (a materialize failure is swallowed
-                /// above, since the txn is already durable and the state stays coherent). The whole-item
-                /// shape validation makes a SHAPE/logic failure here provably unreachable (every item's
-                /// COMPLETE ops array is validated as one combined transaction before any object is
-                /// created) -- and `chunk_txn` is now durably PUT, so a logic-level apply failure would
-                /// re-throw on every future recovery replay, bricking this table forever. Fail every
-                /// waiting survivor's own caller with a clear diagnostic instead of leaving them hung on
-                /// an `item->done` that would otherwise never be set, then rethrow: `appendRefOps`'s own
-                /// catch is the SOLE authority that resets `leader_active` on an exceptional exit from the
-                /// leader loop, so this path must NOT reset it too (a double reset would open a two-leader
-                /// window -- a waiter woken by the first reset could become leader before this frame
-                /// unwinds). Under chunked flush an EARLIER chunk may already be durable; that catch keeps
-                /// its callers' success (tenure containment) and fails only the still-incomplete items.
-                const String detail = getCurrentExceptionMessage(false);
-                Exception rethrown(ErrorCodes::LOGICAL_ERROR,
-                    "CAS ref-log append for namespace '{}': the durably-committed transaction {}-{} "
-                    "failed to apply to the in-memory table state -- this should be provably "
-                    "unreachable for any shape-legal transaction (every item's ops are validated as one "
-                    "combined transaction before any object is created); the object is already durable, "
-                    "so a logic-level apply failure would re-throw on every future recovery: {}",
-                    ns.string(), id.writer_epoch, id.ref_sequence, detail);
-                complete_error(chunk_survivors, std::make_exception_ptr(rethrown));
-                throw rethrown; /// NOLINT(cert-err09-cpp,cert-err61-cpp,misc-throw-by-value-catch-by-reference) -- reused above via make_exception_ptr, cannot be an anonymous temporary
-            }
+            /// There is no outer catch around the install any more. The old one turned an apply that
+            /// threw AFTER the PUT into a `LOGICAL_ERROR` -- an honest report of a lane that its own
+            /// comment predicted would be bricked on every future recovery. The install can no longer
+            /// throw, so there is nothing left for it to catch.
             ProfileEvents::increment(ProfileEvents::CasRefBatchFlushes);
             ProfileEvents::increment(ProfileEvents::CasRefBatchedMutations, chunk_survivors.size());
             {

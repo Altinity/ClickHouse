@@ -4,6 +4,8 @@
 #include <Common/scope_guard_safe.h>
 #include <algorithm>
 #include <mutex>
+#include <type_traits>
+#include <utility>
 
 namespace DB
 {
@@ -132,6 +134,32 @@ uint64_t decodedRefLogTxnFootprint(const RefLogTxn & txn)
             bytes += op.new_binding->ref_name.size();
     }
     return bytes;
+}
+
+/// Member-wise swap; see the header for the install-region contract it exists for. Every member is
+/// enumerated here by hand rather than swapped through a generated move, so a member added to the
+/// class without a line here is a silent state-corruption bug -- the `static_assert`s below are the
+/// type-level half of the guarantee (the macro at the call site proves the code path, these prove the
+/// contract of the types), and `debugAssertBodyCounters` cross-checks the counters this swap carries.
+void RefTableState::swap(RefTableState & other) noexcept
+{
+    static_assert(std::is_nothrow_swappable_v<RefLifecycle>);
+    static_assert(std::is_nothrow_swappable_v<std::optional<RefTxnId>>);
+    static_assert(std::is_nothrow_swappable_v<RefTxnId>);
+    static_assert(std::is_nothrow_swappable_v<std::set<std::pair<String, ManifestRef>>>);
+    static_assert(std::is_nothrow_swappable_v<uint64_t>);
+    static_assert(noexcept(std::declval<RefCowMap &>().swap(std::declval<RefCowMap &>())));
+    static_assert(noexcept(std::declval<RefCowManifestSet &>().swap(std::declval<RefCowManifestSet &>())));
+
+    using std::swap;
+    swap(lifecycle, other.lifecycle);
+    swap(remove_txn_id, other.remove_txn_id);
+    swap(greatest_applied, other.greatest_applied);
+    committed.swap(other.committed);
+    precommits.swap(other.precommits);
+    owned_manifests.swap(other.owned_manifests);
+    swap(snapshot_body_bytes, other.snapshot_body_bytes);
+    swap(removal_body_bytes, other.removal_body_bytes);
 }
 
 /// True iff `manifest_ref` already names an existing committed row or precommit binding under ANY

@@ -165,6 +165,21 @@ public:
     /// in-place fold cannot invalidate an outstanding one.
     void materialize();
 
+    /// Member-wise swap, guaranteed non-throwing AND allocation-free: `shared_ptr::swap` exchanges two
+    /// pointers, `std::map::swap` exchanges the trees' internal pointers (the allocator is
+    /// `std::allocator`, so it is always-equal and the swap is `noexcept`), and `net_delta` is a POD.
+    /// This is what lets a completed candidate state be installed inside `DENY_ALLOCATIONS_IN_SCOPE`
+    /// after its transaction is durable -- see `RefTableState::swap` and `CasRefLedger::commitRefChunk`.
+    /// Note the deliberate consequence: the swapped-out map still OWNS its former base reference, so the
+    /// caller must destroy it before folding the installed map (`materialize` takes its O(overlay)
+    /// in-place path only while `base` is uniquely owned).
+    void swap(RefCowMap & other) noexcept
+    {
+        base.swap(other.base);
+        overlay.swap(other.overlay);
+        std::swap(net_delta, other.net_delta);
+    }
+
     /// Test-only: current overlay row count (0 right after `materialize()`).
     size_t overlayEntriesForTest() const { return overlay.size(); }
     /// Test-only: `base`'s `shared_ptr::use_count()` -- a copy that shares `base` (no per-row

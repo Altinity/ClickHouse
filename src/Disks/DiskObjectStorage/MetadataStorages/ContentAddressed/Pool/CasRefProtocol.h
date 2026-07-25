@@ -172,6 +172,17 @@ public:
     /// `materialize`).
     void materializeCommitted() { committed.materialize(); owned_manifests.materialize(); }
 
+    /// Member-wise swap, guaranteed non-throwing and allocation-free: every member's own swap is both
+    /// (`shared_ptr::swap`, `std::map::swap`, `std::set::swap`, `std::optional::swap` over a trivially
+    /// swappable payload, plus PODs). This is the ONLY sanctioned way to install a prepared candidate
+    /// state after its transaction is already durable -- see `CasRefLedger::commitRefChunk`'s
+    /// post-durable install region, which runs under `DENY_ALLOCATIONS_IN_SCOPE`. Move-assignment would
+    /// ALSO be `noexcept` today, but it would destroy the displaced state (freeing every `precommits`
+    /// node) INSIDE that region; a swap hands the old state back to the caller, which destroys it
+    /// outside. That destruction is not merely a tidiness matter: the old state still shares the COW
+    /// bases, and `materializeCommitted` folds in place only while they are uniquely owned.
+    void swap(RefTableState & other) noexcept;
+
 private:
     RefLifecycle lifecycle = RefLifecycle::Removed;   /// see representation note above
     std::optional<RefTxnId> remove_txn_id;

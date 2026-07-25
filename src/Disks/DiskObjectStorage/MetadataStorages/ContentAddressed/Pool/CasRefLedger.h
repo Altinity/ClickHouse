@@ -203,9 +203,18 @@ public:
     /// immediately AFTER the just-full chunk committed durably (its survivors already completed) and
     /// BEFORE `working`/the trial-id high-water mark are reseeded from the now-live state; it is the
     /// injection point for the tenure-exception-containment contract (a throw here, or from the reseed
-    /// itself, must leave the committed chunk's callers with their success). Null in production.
-    enum class CarvePhaseForTest { PlanSeenRefs, PlanBatchGrow, PlanReserveOwned, PublishPop, ValidateFinalOps, ChunkReseed };
+    /// itself, must leave the committed chunk's callers with their success). `PostDurableInstall` fires
+    /// inside `commitRefChunk` after that chunk's `PUT` returned `Committed` and BEFORE the prepared
+    /// candidate is installed into the live state -- the seam a test uses to prove that the region
+    /// between "durable" and "recorded" can no longer strand a transaction (a throw injected there is
+    /// the only way left to simulate the OLD post-durable apply failure, since the install itself is now
+    /// allocation-free and cannot throw). Null in production.
+    enum class CarvePhaseForTest { PlanSeenRefs, PlanBatchGrow, PlanReserveOwned, PublishPop, ValidateFinalOps, ChunkReseed, PostDurableInstall };
     void setCarveHookForTest(std::function<void(CarvePhaseForTest)> hook) { carve_hook_for_test = std::move(hook); }
+
+    /// Installs the negative control for the post-durable install region (see
+    /// `install_region_probe_for_test`).
+    void setInstallRegionProbeForTest(std::function<void()> probe) { install_region_probe_for_test = std::move(probe); }
 
     /// Installs the pre-tenure fault seam (see `ref_pre_tenure_hook_for_test`).
     void setRefPreTenureHookForTest(std::function<void()> hook) { ref_pre_tenure_hook_for_test = std::move(hook); }
@@ -481,6 +490,12 @@ private:
     /// production.
     std::function<void(CarvePhaseForTest)> carve_hook_for_test;
 
+    /// Test-only probe fired INSIDE `commitRefChunk`'s post-durable install region, i.e. under
+    /// `DENY_ALLOCATIONS_IN_SCOPE`. It is the negative control for that guard: a probe that allocates
+    /// must abort a debug build, which is what proves the region is armed and actually entered -- so a
+    /// future edit that adds an allocating statement there cannot pass unnoticed. Null in production.
+    std::function<void()> install_region_probe_for_test;
+
     /// Returns the cached runtime for `ns`, creating an empty unrecovered runtime when needed.
     std::shared_ptr<RefTableRuntime> getRefTableRuntime(const RootNamespace & ns);
 
@@ -509,7 +524,9 @@ private:
                            std::vector<std::shared_ptr<RefMutationItem>> & owned_items);
 
     /// Validates, durably appends, and applies one compatible batch while preserving copy-before-commit
-    /// and apply-after-commit ordering. Every item it carves out of `pending` is appended to
+    /// and apply-after-commit ordering -- the LIVE state is still only ever advanced once the object is
+    /// durable; `commitRefChunk`'s pre-`PUT` apply targets a private candidate that nothing else can
+    /// observe. Every item it carves out of `pending` is appended to
     /// `owned_items` (the leader's responsibility set) at the moment it is carved. When a batch's total
     /// op count exceeds `ref_txn_max_ops`, the validation loop emits SEVERAL ref-log transactions in one
     /// tenure via `commitRefChunk` -- each a complete commit boundary.
@@ -517,13 +534,16 @@ private:
                        std::vector<std::shared_ptr<RefMutationItem>> & owned_items);
 
     /// Commits ONE chunk of a `flushRefBatch` tenure as a complete ref-log transaction: allocates the
-    /// real transaction id, encodes and durably `PUT`s `chunk_ops`, applies to `rt->state` under
-    /// `state_mutex`, advances the tail counters, records the per-transaction metrics, completes exactly
-    /// `chunk_survivors` with the real id (waking their waiters), and schedules snapshot publication.
-    /// Returns true when the chunk committed durably; false on any non-throwing failure
-    /// (DefiniteFailure / unresolved wedge / a conclusive PUT rejection / an encode failure), after
-    /// having already failed `chunk_survivors` with the appropriate error. Throws ONLY the
-    /// provably-unreachable durable-apply failure (a bricked lane), having first failed the survivors.
+    /// real transaction id, applies `chunk_ops` to a CANDIDATE copy of `rt->state`, encodes and durably
+    /// `PUT`s them, installs the candidate under `state_mutex` by a no-throw swap, advances the tail
+    /// counters, records the per-transaction metrics, completes exactly `chunk_survivors` with the real
+    /// id (waking their waiters), and schedules snapshot publication. The apply comes BEFORE the `PUT`
+    /// so that nothing between "durable" and "recorded" can throw (spec §A1); a failure of that apply is
+    /// an ordinary pre-durability rejection.
+    /// Returns true when the chunk committed durably; false on any non-throwing failure (a rejected
+    /// apply / DefiniteFailure / unresolved wedge / a conclusive PUT rejection / an encode failure),
+    /// after having already failed `chunk_survivors` with the appropriate error. Past the durable `PUT`
+    /// it does not throw at all.
     /// PRECONDITION: the caller has already released its scratch `working` copy so the post-commit
     /// overlay fold is in place (the E5 fast path).
     bool commitRefChunk(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt,

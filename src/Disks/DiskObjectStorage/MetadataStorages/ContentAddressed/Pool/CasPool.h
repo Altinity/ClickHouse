@@ -803,6 +803,13 @@ public:
         ref_ledger.setCarveHookForTest(std::move(hook));
     }
 
+    /// Test-only: negative control for the post-durable install region; forwards to
+    /// `CasRefLedger::setInstallRegionProbeForTest` (see it for what an allocating probe must do).
+    void setInstallRegionProbeForTest(std::function<void()> probe)
+    {
+        ref_ledger.setInstallRegionProbeForTest(std::move(probe));
+    }
+
     /// Test-only: replace the request controller's inter-attempt backoff sleep (e.g. with a no-op) —
     /// for tests that drive a persistent conditional-write fault to budget exhaustion through a fully
     /// wired Pool/disk and must not serve the production capped-exponential sleeps for real (see
