@@ -1110,3 +1110,51 @@ deletion, never permit it, and that change would delete live data on any transie
 
 Artifacts: `tmp/f6-unreachable/` — `fsck_detail.txt`, `the_56_keys.txt`, `drain_watch.txt`,
 `run343.bin` (the decoded in-degree run), `manifest_bodies.txt` (all 96 present manifests).
+
+#### Event-log forensics (2026-07-25): all 56 leaks trace to FOUR `tmp-fetch_*` refs in a 43 ms window {#unmatched-minus-one-fetch-window}
+
+Follows [#unmatched-minus-one-retention-leak](#unmatched-minus-one-retention-leak) and CORRECTS one of
+its conclusions.
+
+**Correction 1 — the event log DOES carry the edge identity.** I wrote that it records only namespace +
+object_hash. Wrong: `root_add`/`root_remove` rows carry `detail['manifest_ref_instance']`
+(`writer_epoch:build_sequence:manifest_ordinal`) and `detail['path']`, which together with `namespace`
+are exactly the inputs of `sourceEdgeId`. The edge balance IS reconstructable from the log.
+
+**Methodological trap worth remembering: you must UNION both nodes' logs.** Edge events are emitted by
+the folding leader, leadership moved between ch1 and ch2, and each server has its own
+`system.content_addressed_log`. Querying ch1 alone showed ~19 "uncancelled" edges for a single blob;
+after unioning ch2 it collapsed to exactly ONE — matching the in-degree run's ground truth exactly.
+
+**Correction 2 — the `-1` was not "emitted with a mismatched key"; no `root_remove` was ever recorded
+for these edges at all.** Per-path balance for manifest `1:42969:1` (ns `ca_soak_ch1`) is `adds=1
+removes=0` for ALL TWENTY of its paths, so the whole manifest's removal never folded — not a per-path
+key mismatch.
+
+**Where they come from.** All 56 blobs' uncancelled edges belong to just FOUR manifests, all in
+`ca_soak_ch1`, build_sequences 42969/42970/42971/42972, and every one of them is a FETCH TEMP ref:
+`tmp-fetch_20260725_2680{1,2}_…`, `tmp-fetch_20260725_2679{8,9}_…`. All four were published
+(`build_publish` → `promoted`) between 08:37:56.924 and .945 and dropped (`ref_drop`, "appended an
+owner_transition removal ref-log transaction") between .960 and .967 — a 43 ms window. Each published
+exactly once and dropped exactly once.
+
+**Rate: 4 out of 48,791 `tmp-fetch_*` refs in that namespace (~0.008%)** — a rare race, not a broken
+path, and clustered in one 43 ms window with four concurrent fetch publishes.
+
+**The ordering anomaly.** Their `+1` edges were folded at 08:40:51 — about three minutes AFTER the
+`ref_drop` that should have cancelled them.
+
+**LEADING HYPOTHESIS, NOT VERIFIED: an ordering inversion.** If the fold applied the removal record
+BEFORE the add record (journal position, not wall-clock), the removal would find no edge and be a
+SILENT no-op (the set-presence merge, `CasBlobInDegree.cpp:585-597`, writes nothing and counts nothing),
+and the subsequent add would then install an edge that nothing will ever cancel. That is precisely an
+[UNMATCHED-MINUS-ONE]. Verifying it needs the ref-log record order for those transactions, and those
+log objects have long been reclaimed on this stand — so it needs a TARGETED REPRODUCTION (concurrent
+fetch publish + immediate drop), not more archaeology here. Note this sits squarely in the fetch-handoff
+area the publish-confirm plan already covers.
+
+**Caveat on the numbers.** 19 chaos container restarts × a 2 s `flush_interval_milliseconds` means the
+event log can lose buffered rows. Log-derived uncancelled edges came to 80 against the run's ground
+truth of 56, so some rows ARE missing. The per-manifest conclusion is still safe: a manifest's `+1` and
+`-1` are emitted microseconds apart inside one fold, so losing the `-1` while keeping all twenty `+1`s
+is not a plausible loss pattern.
