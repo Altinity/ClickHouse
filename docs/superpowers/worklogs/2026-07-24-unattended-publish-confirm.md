@@ -604,3 +604,15 @@ spec.
   the round sees every durable record — and told that if that makes the theorem violable independently of
   the confirm protocol, that is a finding to report, not a modelling error to tune away.
   Resources: disk 327G, 62G RAM, load 0.8.
+- 15:49 UTC — watchdog: idle, tree clean, disk 327G, 62G RAM, load 0.9. Task 9 landed and was independently
+  re-verified by the controller (`_main` 72,984 states clean, `_sab_holeylist` violates) — commits
+  `0d1e3f4cc7c` (model) and `c531f0115c4` (critical-entry upgrade: the deletion path is mechanised, no
+  longer an inference).
+  Same instruction conflict as the previous tick, resolved the same way and for the same stated reason:
+  dispatched plan Task 10 (`confirmExactRef`, the ledger-side gate 1) as background work. It is TDD against
+  a spec that already spells out the six-rule snapshot, and it does not touch the `tmp-fetch` lifecycle the
+  sequencing note reserves until after containment.
+  The agent was given today's two findings with the implication stated: `confirmExactRef`'s only safe
+  failure direction is `Unknown`, so any path where a lagging or partially-recovered view could answer `Yes`
+  is to be reported as a bug, not smoothed over. It was also given the CORRECTED battery filter and told
+  1335/1335 was green at `ca5a6b7bee8`, so any red is its own.
