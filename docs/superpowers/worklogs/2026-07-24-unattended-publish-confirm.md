@@ -796,3 +796,16 @@ fixed.
   `src/Storages/StorageReplicatedMergeTree.cpp` is UNTOUCHED — the stricter boundary held and the plan's
   Step 4 was indeed unnecessary — and `src/CMakeLists.txt` is clean, so the cppexpr leftover did not
   recur. Disk 332G, load 2.2. Nothing to unstick.
+- 21:09 UTC — watchdog: idle, tree clean, disk 332G, load 0.7. Task 15 committed (`fac69e10dbd`) with the
+  boundary held and the untested-brake gap carried into Task 16 (`69e81b12732`).
+  Dispatched **Task 16 DELIBERATELY PARTIAL — steps 2, 5, 6, 7 only.** Checking the step list turned up
+  more than expected: the failpoint blocker is not just step 4's. Step 1 (the race test) needs a failpoint
+  between `precommitAdd` and the confirm, and step 3 needs to stall the receiver's publish across GC
+  rounds — so THREE of the eight steps are blocked on the same unanswered question about
+  `src/Common/FailPoint.cpp`. Better to land five than to sit on all eight, and better to ask twice than to
+  edit a shared upstream registry unasked.
+  The agent was told the thing that matters most here: a relink test that passes because it silently fell
+  back to bytes proves nothing, and that is the easiest green to write. Every relink assertion must carry a
+  POSITIVE proof the relink path ran (`CasBlobPut == 0`, or the "no bytes transferred" log line reachable
+  only after a confirm yes plus a successful promote), and step 7 must prove the inverse — that the byte
+  fallback actually ran, not merely that the query succeeded.
