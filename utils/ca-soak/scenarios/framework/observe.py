@@ -10,15 +10,23 @@ Everything the README §"Common observations" asks for, gathered from a running 
 - `system.content_addressed_log` event counts by `event_type` / `object_kind` / `outcome`.
 - Raw system-table extracts written to TSV files for the run archive.
 
-All collectors are best-effort on transport: a probe failure is logged and yields a sentinel (None /
-empty), never an exception into the scenario — but a scenario that depends on a missing observation
-must surface that as an `inconclusive` verdict (see assertions.py), not silently pass.
+All collectors are best-effort on TRANSPORT (a node unreachable under chaos, or a log table not yet
+materialized): those failures are logged and yield a sentinel (None / empty), never an exception into
+the scenario — but a scenario that depends on a missing observation must surface that as an
+`inconclusive` verdict (see assertions.py), not silently pass. A query that reaches the server and is
+REJECTED there (`UNKNOWN_IDENTIFIER`, a syntax error, any other server-side exception) is a different
+class entirely: the query itself is broken, which is a harness bug, not an absent observation, and
+must never degrade to the same empty sentinel — see `_is_benign_probe_gap` below (2026-07-25: exactly
+this distinction was missing when `gc_log_rows` selected a dropped column and every GC verdict in the
+suite passed vacuously; BACKLOG.md `{#gc-observation-vacuous-2026-07-25}`).
 """
 
 import json
 import os
 import subprocess
 import time
+
+from soak.cluster import QueryError, is_transport_error
 
 # Object-store container + pool data dir (mirror of soak/pool.py and configs/storage_conf.xml:
 # endpoint http://rustfs1:11121/test/soak_pool/ -> bucket "test", prefix "soak_pool/").
@@ -47,6 +55,37 @@ BAD_EVENT_TYPES = (
 # `classify_pool_path` (per-server-tree relocation): `_manifests` = `cas/manifests/`, `refs` =
 # `cas/refs/`. Key NAMES kept from the pre-relocation era — cards consume them.
 POOL_PREFIXES = ("blobs", "_manifests", "refs", "roots", "_files", "gc", "_pool_meta")
+
+
+# ClickHouse error code UNKNOWN_TABLE (Common/ErrorCodes.cpp). `SystemLog<>`-backed tables
+# (`content_addressed_garbage_collection_log`, `content_addressed_log`, ...) are materialized lazily —
+# `SystemLog::prepareTable` (src/Interpreters/SystemLog.cpp) only runs once there is something to
+# flush — so a freshly-reset cluster, or a log that has genuinely never had an entry, can legitimately
+# raise UNKNOWN_TABLE on the very first probe. That is "nothing has happened yet", the same class as
+# an empty result set, NOT a harness bug.
+_UNKNOWN_TABLE_CODE = 60
+
+
+def _is_missing_table(exc: BaseException) -> bool:
+    """True if `exc` is a `QueryError` carrying UNKNOWN_TABLE (60) — see `_UNKNOWN_TABLE_CODE`."""
+    if not isinstance(exc, QueryError):
+        return False
+    body = exc.body or ""
+    return f"Code: {_UNKNOWN_TABLE_CODE}." in body or "UNKNOWN_TABLE" in body
+
+
+def _is_benign_probe_gap(exc: BaseException) -> bool:
+    """True if `exc` is a LEGITIMATE reason an observation query came back with nothing: the node was
+    unreachable (`is_transport_error` — a chaos-killed/paused/restarting node, or one still coming up)
+    or the log table has not been materialized yet (`_is_missing_table`). Both are indistinguishable
+    from "no observation yet" and are the only cases a caller may fold into an empty/None sentinel.
+
+    Anything else — `UNKNOWN_IDENTIFIER` (a column the schema no longer has), a syntax error, or any
+    other server-side rejection of the query — means the query ITSELF is broken. That is a harness
+    bug, not an absent observation, and every caller below re-raises it instead of swallowing it: a
+    query that fails must never be silently mistaken for a query that legitimately found nothing (see
+    the module docstring and BACKLOG.md `{#gc-observation-vacuous-2026-07-25}`)."""
+    return is_transport_error(exc) or _is_missing_table(exc)
 
 
 def classify_pool_path(key: str) -> str:
@@ -93,13 +132,17 @@ def classify_pool_path(key: str) -> str:
 
 def events_snapshot(node) -> dict:
     """Snapshot the cumulative `Cas*`/`DiskS3*`/`S3*` counters from `system.events` on one node.
-    Returns {event_name: value}. Empty dict on any transport failure (logged by caller)."""
+    Returns {event_name: value}. Empty dict on a legitimate probe gap (node unreachable); any other
+    query failure RAISES rather than returning an empty snapshot (`_is_benign_probe_gap`) —
+    `system.events` is a built-in table that always exists, so anything else here is a harness bug."""
     try:
         txt = node.query(
             "SELECT event, value FROM system.events "
             "WHERE event LIKE 'Cas%' OR event LIKE 'DiskS3%' OR event LIKE 'S3%' "
             "FORMAT TabSeparated")
-    except Exception:
+    except Exception as e:
+        if not _is_benign_probe_gap(e):
+            raise
         return {}
     out = {}
     for line in txt.splitlines():
@@ -170,12 +213,16 @@ def s3_error_rates(node) -> dict:
 
 def server_memory(node) -> dict:
     """{mem_resident, mem_tracking} in bytes from system.asynchronous_metrics / system.metrics.
-    None for a field that cannot be read (so a gap is visible rather than faked as 0)."""
+    None for a field that cannot be read because of a legitimate probe gap (node unreachable) — so a
+    gap is visible rather than faked as 0. Any other query failure RAISES (`_is_benign_probe_gap`):
+    these are built-in system tables, always present, so anything else is a harness bug."""
     def _q(sql):
         try:
             v = node.scalar(sql)
             return int(v) if v not in (None, "") else None
-        except Exception:
+        except Exception as e:
+            if not _is_benign_probe_gap(e):
+                raise
             return None
     return {
         "mem_resident": _q("SELECT value FROM system.asynchronous_metrics WHERE metric='MemoryResident'"),
@@ -192,6 +239,9 @@ def cluster_memory(cluster) -> dict:
 # ---------------------------------------------------------------------------
 
 def _docker_exec(container: str, argv, timeout_s: float = 20.0):
+    # Already a TYPED failure, not a bare except-to-empty: an exception here becomes rc=1 (every
+    # caller below is an explicit `if rc == 0:` gate), which can never be confused with rc=0's "ran
+    # and produced this stdout" — no separate raise-vs-sentinel decision is needed for this one.
     try:
         p = subprocess.run(["docker", "exec", container, *argv],
                            capture_output=True, text=True, timeout=timeout_s)
@@ -321,7 +371,16 @@ def gc_log_rows(node, since_event_time: str | None = None, *,
     Issues `SYSTEM FLUSH LOGS` then queries, retrying up to `poll_tries` times (sleeping
     `poll_interval_s` between empty attempts) before giving up — see the module comment above. On
     exhaustion this still returns [] so the caller's `inconclusive` verdict stays genuine; it is
-    never fabricated into a `pass`."""
+    never fabricated into a `pass`.
+
+    That [] is ONLY returned for a legitimate gap (`_is_benign_probe_gap`: node unreachable, or the
+    log table not yet materialized). A query that reaches the server and is REJECTED there — the
+    2026-07-25 incident: `min_ack` was dropped from the schema, this SELECT raised
+    `UNKNOWN_IDENTIFIER`, and the old bare `except` turned that into [] for every scenario in the
+    suite, so `assert_gc_no_failed` (0 Failed rows in an empty set) passed VACUOUSLY everywhere — is
+    RAISED immediately instead of being retried or swallowed: a broken query is a harness bug, not an
+    absent observation, and retrying it `poll_tries` times would only delay discovering that. See
+    BACKLOG.md `{#gc-observation-vacuous-2026-07-25}`."""
     where = "event_type='Finish'"
     if since_event_time:
         where += f" AND event_time >= '{since_event_time}'"
@@ -348,7 +407,9 @@ def gc_log_rows(node, since_event_time: str | None = None, *,
             txt = node.query(
                 f"SELECT {', '.join(cols)} FROM {GC_LOG} WHERE {where} "
                 f"ORDER BY event_time FORMAT TabSeparated")
-        except Exception:
+        except Exception as e:
+            if not _is_benign_probe_gap(e):
+                raise
             txt = ""
         rows = []
         for line in txt.splitlines():
@@ -400,13 +461,20 @@ def gc_log_all(cluster, since_event_time: str | None = None) -> dict:
     """GC finish rows per node + a summary {failed, failed_benign, not_a_leader, success, ...}.
 
     `failed` counts only REAL Error rows; `failed_benign` counts concurrency-retry aborts that are an
-    expected outcome under concurrent GC leaders (see `_gc_error_is_benign`)."""
+    expected outcome under concurrent GC leaders (see `_gc_error_is_benign`).
+
+    `rows_total` is the non-vacuity guard `assert_gc_no_failed` needs: this summary dict is ALWAYS
+    truthy (every key defaults to 0), so a caller-side `if not gc_summary` can never detect "zero rows
+    were actually observed" — that shape is exactly the 2026-07-25 bug (BACKLOG.md
+    `{#gc-observation-vacuous-2026-07-25}`), where every node's `gc_log_rows` degraded to [] and "0
+    Failed rows" trivially passed. `rows_total` makes the emptiness explicit and checkable."""
     per_node = {}
     summary = {"failed": 0, "failed_benign": 0, "not_a_leader": 0, "success": 0, "deleted_total": 0,
-               "manifests_deleted_total": 0, "spared_total": 0, "replaced_total": 0}
+               "manifests_deleted_total": 0, "spared_total": 0, "replaced_total": 0, "rows_total": 0}
     for n in cluster.nodes():
         rows = gc_log_rows(n, since_event_time)
         per_node[n.container] = rows
+        summary["rows_total"] += len(rows)
         for r in rows:
             oc = r.get("outcome", "")
             if oc == "Error":
@@ -431,7 +499,12 @@ def gc_log_all(cluster, since_event_time: str | None = None) -> dict:
 
 def ca_event_counts(node, since_event_time: str | None = None) -> dict:
     """Counts grouped by (event_type, object_kind, outcome) on one node. Returns
-    {"by_event_type": {...}, "bad": {bad_type: count, ...}, "rows": total}."""
+    {"by_event_type": {...}, "bad": {bad_type: count, ...}, "rows": total}.
+
+    The all-zero `out` sentinel is returned ONLY for a legitimate probe gap (node unreachable, or the
+    log table not yet materialized — `_is_benign_probe_gap`); this is exactly the same class of table
+    as the GC log (`gc_log_rows`) and gets the same treatment, since a schema-drift query error here
+    would just as vacuously pass `assert_event_audit`'s "0 bad-type rows" check on an empty `bad`."""
     where = "1"
     if since_event_time:
         where = f"event_time >= '{since_event_time}'"
@@ -440,7 +513,9 @@ def ca_event_counts(node, since_event_time: str | None = None) -> dict:
         txt = node.query(
             f"SELECT event_type, count() FROM {CA_LOG} WHERE {where} "
             f"GROUP BY event_type ORDER BY event_type FORMAT TabSeparated")
-    except Exception:
+    except Exception as e:
+        if not _is_benign_probe_gap(e):
+            raise
         return out
     for line in txt.splitlines():
         if "\t" not in line:
@@ -458,19 +533,37 @@ def ca_event_counts(node, since_event_time: str | None = None) -> dict:
 
 
 def ca_event_counts_all(cluster, since_event_time: str | None = None) -> dict:
+    """Per-node CA-log counts + `bad_total` across the cluster.
+
+    `rows_total` is the non-vacuity guard `assert_event_audit` needs: `bad_total` being empty is
+    legitimately what a healthy run looks like (thousands of ordinary events, zero bad ones) — but it
+    is ALSO what every node degrading to `ca_event_counts`'s empty sentinel looks like. The two are
+    indistinguishable from `bad_total` alone, so `rows_total` (total rows actually read) is carried
+    alongside it; a quiesced end-checkpoint after any real workload always has CA-log traffic, so
+    `rows_total == 0` means the observation itself is missing, not that it found nothing bad."""
     per_node = {}
     bad_total = {}
+    rows_total = 0
     for n in cluster.nodes():
         c = ca_event_counts(n, since_event_time)
         per_node[n.container] = c
+        rows_total += c.get("rows", 0)
         for k, v in c["bad"].items():
             bad_total[k] = bad_total.get(k, 0) + v
-    return {"per_node": per_node, "bad_total": bad_total}
+    return {"per_node": per_node, "bad_total": bad_total, "rows_total": rows_total}
 
 
 def object_lifetime(node, object_hash: str = None, token: str = None, limit: int = 200) -> list:
     """All CA-log rows for a suspicious object hash or token, ordered in time — the README §"Report
-    anomaly handling" object-lifetime trace. Returns list of TSV-row dicts."""
+    anomaly handling" object-lifetime trace. Returns list of TSV-row dicts.
+
+    An empty list for `object_hash`/`token` both absent is a caller-error shortcut, not a probe
+    result. A legitimate probe gap (node unreachable / log table not yet materialized) also yields []
+    (`_is_benign_probe_gap`) — this is forensics-only evidence gathered best-effort when a suspicious
+    object is already found by fsck (`dump_object_forensics`, whose caller in checkpoint.py already
+    catches and logs any exception, so raising here cannot crash a scenario). Any OTHER query failure
+    still RAISES rather than silently returning an empty trace, so a broken forensics query is visible
+    in the run log instead of just producing a suspiciously-empty lifetime dump."""
     conds = []
     if object_hash:
         conds.append(f"object_hash = '{object_hash}'")
@@ -484,7 +577,9 @@ def object_lifetime(node, object_hash: str = None, token: str = None, limit: int
         txt = node.query(
             f"SELECT {', '.join(cols)} FROM {CA_LOG} WHERE {' OR '.join(conds)} "
             f"ORDER BY event_time_microseconds LIMIT {limit} FORMAT TabSeparated")
-    except Exception:
+    except Exception as e:
+        if not _is_benign_probe_gap(e):
+            raise
         return []
     rows = []
     for line in txt.splitlines():
@@ -511,7 +606,10 @@ RAW_EXTRACTS = [
 
 def dump_raw_extract(ctx, node, name: str, table: str, where: str, order_by: str,
                      limit: int = 100000) -> None:
-    """Write a TSVWithNames extract of a system table to <run>/raw/<name>_<node>.tsv. Best-effort."""
+    """Write a TSVWithNames extract of a system table to <run>/raw/<name>_<node>.tsv. Best-effort:
+    already a TYPED failure rather than a bare except-to-empty — a failure writes a `.err` file with
+    the exception text INSTEAD of the `.tsv`, so "extract failed" is never confused with "extract ran
+    and the table was empty" (the archive layout itself carries the distinction)."""
     rawdir = ctx.subdir("raw")
     try:
         txt = node.query(

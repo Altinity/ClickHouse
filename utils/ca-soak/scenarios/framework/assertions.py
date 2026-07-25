@@ -18,7 +18,12 @@ from .report import Verdict
 
 
 def assert_fsck_clean(result, fsck: dict):
-    """fsck dangling == 0. A missing/timed-out fsck is inconclusive."""
+    """fsck dangling == 0. A missing/timed-out fsck is inconclusive.
+
+    Non-vacuity review (2026-07-25 sweep): the subject here is a scalar count from an explicitly
+    presence-checked summary dict, not a row set that silently shrinks to empty — `dangling == 0` is a
+    real, meaningful fsck result on its own, so no additional guard is needed once `fsck` is confirmed
+    present."""
     if not fsck or "dangling" not in fsck:
         return [result.add(Verdict.inconclusive(
             "fsck dangling", "0", "fsck summary unavailable (timeout or parse failure)"))]
@@ -54,7 +59,13 @@ _DRYRUN_DELETABLE_CLASSES = {"unreachable", "pending-gc", "awaiting-gc"}
 
 def assert_dryrun_subset(result, fsck_detail_res: dict, dryrun_res: dict):
     """Dry-run delete candidates ⊆ fsck DELETABLE key set (unreachable ∪ pending-gc ∪ awaiting-gc).
-    Requires a detailed fsck; if detail is unavailable the assertion is inconclusive."""
+    Requires a detailed fsck; if detail is unavailable the assertion is inconclusive.
+
+    Non-vacuity review (2026-07-25 sweep): this IS a subset check that trivially passes when the
+    dry-run's `entries` is an empty list (candidate_keys ⊆ deletable_keys when candidate_keys = ∅) —
+    but that is a deliberate, legitimate pass, not a vacuous one: an empty candidate set genuinely means
+    "GC proposed deleting nothing," which cannot leak anything. It is distinct from the observability
+    gap this check already guards against (missing `detail`/`entries` keys entirely, handled above)."""
     if not fsck_detail_res or "detail" not in fsck_detail_res:
         return [result.add(Verdict.inconclusive(
             "dryrun ⊆ deletable (unreachable ∪ pending-gc)", "subset", "detailed fsck unavailable"))]
@@ -82,7 +93,19 @@ def assert_dryrun_subset(result, fsck_detail_res: dict, dryrun_res: dict):
 
 def assert_event_audit(result, ca_events: dict, expect_exception: bool = False):
     """No bad CA-log event types. For a negative scenario (`expect_exception=True`) a single
-    `exception` row is allowed and the assertion instead requires the OTHER bad types stay zero."""
+    `exception` row is allowed and the assertion instead requires the OTHER bad types stay zero.
+
+    Non-vacuity guard: `bad_total` empty is what a healthy run looks like, but it is ALSO what a
+    totally unobserved CA log looks like (every node's probe degraded to empty) — the two cannot be
+    told apart from `bad_total` alone. `rows_total` (`observe.ca_event_counts_all`) disambiguates: a
+    quiesced end-checkpoint after any real workload always has CA-log traffic, so 0 rows means the
+    observation is missing, not that it found nothing bad — this is inconclusive, never a silent pass
+    (same shape as `assert_gc_no_failed` below; BACKLOG.md `{#gc-observation-vacuous-2026-07-25}`)."""
+    if not ca_events.get("rows_total"):
+        return [result.add(Verdict.inconclusive(
+            "event audit (no bad rows)", "0 bad-type rows",
+            "0 CA-log rows observed across all nodes — cannot tell 'no bad events' from "
+            "'nothing was observed'"))]
     bad = dict(ca_events.get("bad_total", {}))
     if expect_exception:
         bad.pop("exception", None)
@@ -102,9 +125,24 @@ def assert_gc_no_failed(result, gc_summary: dict):
     leader and are NOT failures. Only real errors fail here — notably the in-degree `merged ... < 0`
     undercount CORRUPTED_DATA, which is still counted in `failed`. The concurrent-leader RECLAIM
     property (does the residual actually drain?) is asserted separately by the residual-drain checks,
-    not by counting Error rows."""
+    not by counting Error rows.
+
+    Non-vacuity guard: `observe.gc_log_all` ALWAYS returns a truthy summary dict (every counter
+    defaults to 0), so `if not gc_summary` below can never catch "zero rows were actually observed" —
+    that is precisely the 2026-07-25 incident (`gc_log_rows` degraded to [] on every node; "0 Failed
+    rows" out of 0 observed rows trivially passed every scenario's GC verdict; BACKLOG.md
+    `{#gc-observation-vacuous-2026-07-25}`). Every end-checkpoint drives at least one explicit GC round
+    on top of the periodic background tick (`checkpoint.end_checkpoint` -> `forced_gc_to_fixpoint`), so
+    a healthy run always has >0 GC-log finish rows; `rows_total == 0` means the observation itself
+    failed (or GC genuinely never ran), and either way "0 Failed" proves nothing — inconclusive, not a
+    pass."""
     if not gc_summary:
         return [result.add(Verdict.inconclusive("GC no Failed rounds", "0", "GC log unavailable"))]
+    if not gc_summary.get("rows_total"):
+        return [result.add(Verdict.inconclusive(
+            "GC no Failed rounds", "0",
+            "0 GC-log finish rows observed across all nodes — cannot tell 'no failures' from "
+            "'nothing was observed'"))]
     failed = gc_summary.get("failed", 0)
     benign = gc_summary.get("failed_benign", 0)
     observed = str(failed) + (f" (+{benign} benign concurrency-retry)" if benign else "")
@@ -178,7 +216,13 @@ def assert_no_leftovers(result, fsck: dict, abandons: bool = False, residual_aft
     awaiting ack-floor graduation) is EXPECTED and bounded — it PASSES (a create/insert/DROP at the
     quiesced fixpoint always leaves the last drop's condemned blobs in the pipeline until the periodic
     retired-view sync advances the floor); `bookkeeping` (GC state, root/namespace-registry objects)
-    also PASSES. Abandoning scenarios relax to recorded+classified (their own bound assertion governs)."""
+    also PASSES. Abandoning scenarios relax to recorded+classified (their own bound assertion governs).
+
+    Non-vacuity review (2026-07-25 sweep): `val is None` (fsck/residual unavailable) is guarded above
+    into `inconclusive`. `val == 0` is a deliberate, legitimate PASS, not a vacuous one — it is a
+    concrete fsck-derived count of zero orphans, not an empty/absent observation. A nonzero `val` with
+    no per-object detail to classify is ALSO guarded into `inconclusive` just below, rather than
+    letting an unclassifiable residual default to either pass or fail."""
     val = residual_after_gc if residual_after_gc is not None else (fsck or {}).get("unreachable")
     if val is None:
         return [result.add(Verdict.inconclusive("no unbounded leftovers", "no orphan content",
@@ -238,6 +282,11 @@ def assert_reclaimable_drained(result, verdict_name, residual, fsck_detail_res: 
 
     Returns the list of `Verdict`s added (one). On a bookkeeping-only residual the verdict is `pass`
     with a note. On a nonzero reclaimable residual the verdict is `fail` with the classified counts.
+
+    Non-vacuity review (2026-07-25 sweep): `residual is None` is guarded into `inconclusive` below.
+    `residual == 0` is a deliberate, legitimate PASS — a real fsck-derived count, not an absent
+    observation. A nonzero residual with no `fsck_detail_res`/`buckets` to classify it by prefix is
+    ALSO guarded into `inconclusive` further down, rather than assuming it is bookkeeping.
     """
     if residual is None:
         return [result.add(Verdict.inconclusive(
