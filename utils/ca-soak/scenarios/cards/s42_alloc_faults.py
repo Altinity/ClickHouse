@@ -35,24 +35,25 @@ Legs (leg B is deliberately ABSENT — see below):
   (`snapshot_oracle_checked == 0`) and the oracle is structurally vacuous. A zero check count is
   reported `inconclusive`, never as a pass.
 
-**Soundness guard (step 5, mandatory).** A run that merely produced some `MEMORY_LIMIT_EXCEEDED`
-responses proves NOTHING about the target window: those faults land wherever allocations happen, and
-the post-durable install region is a few instructions wide. The guard therefore requires a nonzero
-TARGETED signal:
+**What green means (2026-07-25 decision).** Green is A CONSISTENT STATE ON DISK AND IN MEMORY, not
+proof that a fault landed in the post-durable install window. The verdict rests on the consistency
+oracle: the post-restart (journal-rebuilt) view identical to the pre-restart view, every acked
+block present, replicas agreeing, fsck `dangling`/`unaccounted`/`stale_edge` clean pre- and
+post-restart, the snapshot integrity oracle clean, zero `LOGICAL_ERROR`, no wedged ref lane, GC
+rounds succeeding after disarm.
+
+**Anti-vacuity, which survives.** A run in which no allocation fault occurred at all still cannot
+read green: `generic == 0` (client-visible injected failures plus the `QueryMemoryLimitExceeded`
+delta) is `inconclusive`. Only the WINDOW-SPECIFIC targeting was dropped as a gate.
+
+**The targeted signal is reported, not gating.**
 
   targeted = CasRefApplyPoisoned transitions + post-PUT apply failpoint hits
 
-and reports `inconclusive` when it is zero, however many generic allocation failures occurred.
-
-Today `post-PUT apply failpoint hits` is structurally 0: the §A1 seam is a gtest-only C++ hook
-(`CasRefLedger::setInstallRegionProbeForTest`, `CarvePhaseForTest::PostDurableInstall`) and no CAS
-failpoint is registered in `src/Common/FailPoint.cpp`, so nothing a running server can arm reaches
-that region. And `CasRefApplyPoisoned` is (correctly) 0 while §A1 holds — the region allocates
-nothing, so no allocation fault can throw inside it. The honest consequence, which this card states
-rather than hides: **until a server-reachable post-durable-install failpoint exists, S42 can only
-return `inconclusive` (window traversal unproven) or `fail` (poison actually fired = a real §A1
-regression). It cannot return a conclusive green.** An `inconclusive` that says so is worth more than
-a green that tested nothing.
+is structurally 0 today: the §A1 seam is the gtest-only `CasRefLedger::setInstallRegionProbeForTest`
+with no `src/Common/FailPoint.cpp` registration, and `CasRefApplyPoisoned` is correctly 0 while §A1
+holds. The card records it and says so. If poison ever DOES fire, the `CasRefApplyPoisoned == 0`
+verdict is a real `check` and the run fails — that half is unchanged.
 
 **Oracle (queries ARE allowed to fail; invariants are not):** zero `LOGICAL_ERROR`/abort; every ACKED
 insert's rows present (S40-shaped, block-granular); replicas agree; fsck `dangling=0`,
@@ -515,10 +516,14 @@ class S42(Scenario):
             "allocation-free install regions did not hold"))
 
         if poison_total == 0:
-            result.add(Verdict.skipped(
+            result.add(Verdict.reported(
                 "no snapshot advanced across a poisoned transaction",
-                "no transaction was poisoned this run, so nothing could advance across one (the "
-                "snapshot integrity oracle above is the unconditional half of this check)"))
+                "vacuous while poison_total == 0",
+                "not exercised",
+                "no transaction was poisoned this run, so nothing could advance across one. The "
+                "snapshot integrity oracle above is the unconditional half of this check and DID "
+                "run. Reported rather than skipped: `skipped` outranks `pass` in the harness, so a "
+                "structurally-vacuous branch would otherwise cap every healthy run."))
         else:
             result.add(Verdict.check(
                 "no snapshot advanced across a poisoned transaction",
@@ -552,24 +557,28 @@ class S42(Scenario):
                 "allocation faults were actually injected (generic anti-vacuity)",
                 "> 0 injected allocation failures during the armed window",
                 f"{generic} (client-visible {injected_client_failures[0]})", True,
-                "generic only — proves SOME allocation failed, NOT that the post-durable window was hit"))
+                "generic only — proves SOME allocation failed, NOT that the post-durable window was "
+                "hit. This guard STAYS gating (2026-07-25 decision): a run in which no allocation "
+                "fault occurred at all must never read green."))
 
         if targeted == 0:
-            result.add(Verdict.inconclusive(
-                "SOUNDNESS GUARD: the post-durable install window was actually exercised",
+            result.add(Verdict.reported(
+                "post-durable install window traversal (reported, not gating)",
                 "> 0 targeted signals (CasRefApplyPoisoned transitions or post-PUT failpoint hits)",
-                f"targeted=0 with {generic} generic allocation failures — a nonzero "
-                f"MEMORY_LIMIT_EXCEEDED count proves only that SOME allocation failed, never that the "
-                f"few-instruction post-durable install region was entered while armed. "
-                f"{failpoint_why}. With §A1 landed the region allocates nothing, so the poison counter "
-                f"is expected to stay 0: this run is INCONCLUSIVE about its target window, not green."))
+                f"targeted=0 with {generic} generic allocation failures",
+                f"the window was NOT proven traversed: a nonzero MEMORY_LIMIT_EXCEEDED count proves "
+                f"only that SOME allocation failed, never that the few-instruction post-durable "
+                f"install region was entered while armed. {failpoint_why}. With §A1 landed the region "
+                f"allocates nothing, so this counter is EXPECTED to stay 0. Per the 2026-07-25 "
+                f"decision this no longer gates: green means the consistency oracle held, not that "
+                f"the target window was hit."))
         else:
-            result.add(Verdict.check(
-                "SOUNDNESS GUARD: the post-durable install window was actually exercised",
+            result.add(Verdict.reported(
+                "post-durable install window traversal (reported, not gating)",
                 "> 0 targeted signals (CasRefApplyPoisoned transitions or post-PUT failpoint hits)",
-                f"targeted={targeted} (poison={poison_total}, failpoint={failpoint_hits})", True,
-                "the window was reached — the poison verdict above is now a conclusive statement "
-                "about §A1, not a vacuous zero"))
+                f"targeted={targeted} (poison={poison_total}, failpoint={failpoint_hits})",
+                "the window WAS reached — the poison verdict above is a conclusive statement about "
+                "§A1 for this run, not a vacuous zero"))
 
         # ---- Remaining oracle terms ----------------------------------------------------------------
         # The needle is deliberately narrow. A bare `%Logical error%` also matches the harmless
@@ -670,17 +679,17 @@ class S42(Scenario):
         # Reported, never gating (see the module docstring).
         unmatched = (int(armed_delta.get("CasGcUnmatchedRemoveDeltas", 0))
                      + _event_total(ev_post, "CasGcUnmatchedRemoveDeltas"))
-        result.add(Verdict(
+        result.add(Verdict.reported(
             "CasGcUnmatchedRemoveDeltas (reported, not gating)",
             "(recorded; benign rate not yet characterised)",
             f"{unmatched} (armed window {armed_delta.get('CasGcUnmatchedRemoveDeltas', 0)}, "
-            f"post-restart {_event_total(ev_post, 'CasGcUnmatchedRemoveDeltas')})", "pass",
+            f"post-restart {_event_total(ev_post, 'CasGcUnmatchedRemoveDeltas')})",
             "removal deltas that matched no existing source edge; a per-key no-op by design, but a "
             "persistent rate means deltas reach the reducer without their activation"))
-        result.add(Verdict(
+        result.add(Verdict.reported(
             "ref-lane wedge counters (reported)", "(recorded)",
             f"wedged={armed_delta.get('CasRefAppendWedged', 0)} "
             f"unwedged={armed_delta.get('CasRefAppendUnwedged', 0)} "
-            f"definite_failure={armed_delta.get('CasRefAppendDefiniteFailure', 0)}", "pass"))
+            f"definite_failure={armed_delta.get('CasRefAppendDefiniteFailure', 0)}"))
 
         _common.standard_end(ctx, result, [_TABLE], expect_exception=True)

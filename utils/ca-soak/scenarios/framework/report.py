@@ -41,6 +41,17 @@ class Verdict:
     def skipped(name: str, reason: str) -> "Verdict":
         return Verdict(name, "(not run)", "skipped", SKIPPED, reason)
 
+    @staticmethod
+    def reported(name: str, expected: str, observed, note: str = "") -> "Verdict":
+        """A recorded observation that never gates the run status.
+
+        Use ONLY where the metric is non-gating BY DESIGN (a characterisation number, or a signal
+        that is structurally zero in the current build). Never as a way to soften an assertion that
+        should fail, and never for data that is UNAVAILABLE -- that stays `inconclusive`, per the
+        README rule that a missing observation must never be silently converted into a pass.
+        """
+        return Verdict(name, expected, str(observed), PASS, note)
+
 
 def worst_status(verdicts) -> str:
     if not verdicts:
