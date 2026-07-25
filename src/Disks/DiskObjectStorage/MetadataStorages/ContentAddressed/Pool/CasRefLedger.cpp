@@ -45,6 +45,7 @@ namespace ProfileEvents
     extern const Event CasRefRecoveryRestarts;
     extern const Event CasRefRecoveryRetries;
     extern const Event CasRefAppendWedged;
+    extern const Event CasRefAppendPreAttemptRefused;
     extern const Event CasRefAppendUnwedged;
     extern const Event CasRefAppendDefiniteFailure;
     extern const Event CasRefApplyPoisoned;
@@ -2177,6 +2178,12 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
                 /// as on the `DefiniteFailure` arm. Leaving it `ApplyPending` would claim this table may
                 /// be missing a durable transaction for the rest of the runtime's life.
                 clearApplyPending(*rt);
+                /// Count it. Before this arm existed these refusals bumped `CasRefAppendWedged`, so
+                /// removing the wedge also removed the only signal they were happening at all -- and a
+                /// soak oracle watching that counter fall could not tell "the fix works" from "nothing
+                /// happened". A separate event keeps both readings available: the wedge counter now means
+                /// only genuinely ambiguous appends, and this one means availability preserved.
+                ProfileEvents::increment(ProfileEvents::CasRefAppendPreAttemptRefused);
                 /// The allocated id is left as a safe gap: ids are not required to be contiguous
                 /// (`CasRefProtocol.cpp` enforces strict increase only), and nothing was written under it.
                 /// `prepared_wedge` is simply discarded -- building it before the PUT costs nothing here
