@@ -575,3 +575,7 @@ once, per [[feedback_shared_worktree_git_index_races]]).
 Deliberately NOT in this round: the journal-gap detection and the authoritative per-namespace chain — those
 are the FIX (BACKLOG {#list-as-journal-dataloss-2026-07-25} items 1-2), not instrumentation, and they need a
 spec.
+- 14:52 UTC — watchdog: four instrumentation subagents (I1-I4) running ~8 min, no working-tree writes yet —
+  expected at this stage, they were told to read the surrounding code carefully before editing and I1 in
+  particular has a lot to read. Nothing else live (no ninja, no soak, no codex). Low host load (0.4) is
+  normal: subagent work is model-side, not local CPU. Disk 327G, 62G RAM. Nothing to unstick.
