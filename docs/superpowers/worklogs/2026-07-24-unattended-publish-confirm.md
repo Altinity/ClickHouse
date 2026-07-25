@@ -450,3 +450,8 @@ reclaim-impossibility that the writer protocol says no longer exists. Not editin
   `unreachable` flat at 56 across the last two (no further growth in this interval), disk 326G stable,
   pool_bytes 0.57 GB, log fresh. Nothing to unstick. 1h03m left; `cliff` stage starts at t+12240s
   (11:57 UTC), `converge` at t+12960s (12:09 UTC).
+- 11:49 UTC — watchdog: soak v3 t+3h16m, STAGE chaos, 0 failures, 29 faults, 17 checkpoints OK,
+  `unreachable` still flat at 56, disk 327G, log fresh. The last line is `metrics tick skipped (snapshot
+  failed, node likely down): ConnectionResetError` — that is a tick landing inside a fault window, which
+  the ticker is built to survive (and B204's fail-closed throttle covers the unmeasurable-pool case), not
+  a stall. 43 min left.
