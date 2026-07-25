@@ -495,3 +495,30 @@ OPEN: whether they actually drain. `AwaitingGc` is only benign if a later fold r
 Running a drain watch on the now-idle stand (8 samples, 45 s apart) to see the count go to 0. If it
 does NOT drain with zero workload, the class is right but the pipeline is stalled, which is a different
 and real finding.
+
+### F6 FINAL — not harness-only after all: fsck and GC disagree persistently about the same 56 blobs
+
+The drain watch settles it. MEASURED, on the idle post-run stand with no workload:
+
+- 8 fsck samples over 5.3 min: `unreachable=56 pending_gc=0 awaiting_gc=56 unaccounted=0` — **flat, every
+  single sample**. Re-sampled again 8 min later: still exactly 56.
+- GC is NOT idle and NOT leaderless: ch1 holds the lease and is folding — rounds 325..334+ logged, one
+  per 10 s. (The `CA GC round 0:` lines that first looked alarming are DEFER rounds: the defer path at
+  `CasGc.cpp:368` returns before `report.round` is ever assigned, so a skip-unchanged round prints round
+  0. Cosmetic, but it makes a deferred round indistinguishable from a round that folded and found
+  nothing — worth fixing while we are adding round introspection.)
+- Every one of those folds reports `candidates=0`, and `previewDeletes` reports `dryrun_count=0`.
+- All 56 carry the identical note `edges still in the GC snapshot; the drop has not folded yet
+  (expected)`. 104,755 bytes total. Keys saved to `tmp/f6-unreachable/the_56_keys.txt`, full detail fsck
+  to `tmp/f6-unreachable/fsck_detail.txt`, the drain series to `tmp/f6-unreachable/drain_watch.txt`.
+
+So the two components disagree, persistently and with no workload to explain it: **fsck's reachability
+walk finds no live reference to these 56 blobs, while GC's in-degree view assigns them in-degree > 0 and
+never nominates them.** One of the two is wrong. Either fsck over-reports unreferenced, or GC
+under-collects and this is a real retention leak. NOT ESTABLISHED WHICH — and I am deliberately not
+guessing a mechanism here, having been wrong twice on GC mechanisms this week.
+
+The fsck note calls the state "expected", which is only true if a later fold clears it. Dozens of folds
+did not. So the note is at best misleading and at worst hiding a leak.
+
+The stand is being LEFT UP — it is a live reproduction, and tearing it down destroys the evidence.
