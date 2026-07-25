@@ -1324,3 +1324,23 @@ CONSEQUENCE for how the model may be cited: `_main` passing is CONDITIONAL on a 
 assumption the shipped code does not establish. It means "the confirm protocol adds no new dangle path",
 NOT "a confirmed relink cannot dangle". It may not be cited as dangle-freedom until fix items 1-2 (the
 authoritative per-namespace chain and the complete-cut gate) land.
+
+### CORRECTION 2026-07-25: the "live reproduction" stand was destroyed by our own S42 smoke runs {#leak-repro-lost}
+
+The stand referenced by [#unmatched-minus-one-retention-leak](#unmatched-minus-one-retention-leak) as a
+live reproduction STOPPED being one at ~16:49 UTC, and the worklog kept asserting otherwise for another
+hour. Cause: the S42 card's smoke runs reset the cluster (two runs, `20260725T164254` and
+`20260725T164929`), which recreated the pool. Found only because the state was re-checked before teardown
+instead of trusting the note — post-teardown check read `reachable=6 unreachable=0`, i.e. a fresh pool.
+
+No evidence was lost: every artifact was captured between 12:50 and 15:00 and is in `tmp/f6-unreachable/`
+(detail fsck, the 56 keys, the decoded in-degree run, all 96 manifest bodies, the uncancelled-edge table,
+the per-path balance for the leaking manifest, both nodes' event-log slices). The mechanism is also
+mechanised in `CaRelinkConfirmCore.tla` `_sab_holeylist`, and the fix needs a targeted reproduction rather
+than this stand.
+
+LESSON, and the reason this is recorded rather than quietly dropped: a scenario card that resets the
+cluster is indistinguishable, from the outside, from one that does not. If a stand is being held as
+evidence, that has to be enforced (a lock file the cards honour, or a separate compose project), not
+merely written in a log — the same "a note is not a mechanism" failure as the harness whitelists found
+today.
