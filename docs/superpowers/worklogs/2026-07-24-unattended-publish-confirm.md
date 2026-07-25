@@ -458,3 +458,6 @@ reclaim-impossibility that the writer protocol says no longer exists. Not editin
 - 12:09 UTC — watchdog: soak v3 t+3h36m, now in STAGE cliff (t+12241s), 0 failures, 35 faults,
   21 checkpoints OK, `unreachable` still 56, disk 327G, log fresh (a `pool drain probe` just started,
   pool_bytes down to 3.8 MB). 23 min left; `converge` at t+12960s. No action.
+- 12:29 UTC — watchdog: soak v3 t+3h56m, STAGE converge, 0 failures, 37 faults, 23 checkpoints OK, disk
+  326G, log fresh. The pool drain probe shows the pool settling: 4.75 MB -> 2.10 MB over 10 samples. ~3 min
+  to the 4h mark; next tick collects the verdict, then the F6 detail fsck.
