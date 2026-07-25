@@ -822,3 +822,16 @@ fixed.
   `test_cas_replicated_relink/test.py`, plus a new untracked
   `configs/storage_conf_other_pool.xml` — a second pool fixture, which is what the version-mix and
   cross-pool cases need. Disk 332G, 62G RAM, load 1.3. Nothing to unstick.
+- 22:09 UTC — watchdog: **PART B IS CLOSED** (`037cc6d0e41`) — 1368/1368 CA battery, 11/11 integration.
+  Task 16 landed all eight steps in one pass because the failpoint approval reached the running agent
+  mid-task. Its most valuable output was a plan defect, not a test: the plan prescribed proving a relink by
+  counting blobs, and a byte fetch onto a CA disk writes the same content, dedups and is also flat — so the
+  prescribed proof would have passed whether or not relink ran, in seven tests.
+  The mandatory Part B codex review ({#partb-codex-review}) is RUNNING — gpt-5.6-sol at xhigh, read-only,
+  430 s in, 2.1 MB of log, mtime current. Package in `tmp/partb-review/`: the combined 23-file/~4000-line
+  diff plus a prompt built around the real risk — eight agents each saw only their own task, so nobody has
+  read this as one protocol, and the composition seam is where a defect would sit. It was handed the three
+  things that postdate the spec (the LIST-as-journal finding, the TLA+ config that mechanises it together
+  with the limit on how the passing main config may be cited, and the No-means-not-proven ordering) and
+  asked explicitly to look for things that are green for the wrong reason.
+  Disk 332G, 61G RAM, load 0.3. Nothing to unstick.
