@@ -2,6 +2,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
 #include <Common/DateLUT.h>
+#include <Common/MemoryTracker.h>
 #include <Common/ProfileEvents.h>
 #include <Common/logger_useful.h>
 #include <base/defines.h>
@@ -323,15 +324,37 @@ bool CachedPartFolderAccess::existsRef(const PartRefKey & key, Freshness freshne
 }
 
 Cas::CommitOutcome CachedPartFolderAccess::promoteBuild(Cas::PartWriteTxn & build, const PartRefKey & key, UInt128 build_id,
-                                          const Cas::ManifestId & manifest_id, bool allow_repoint)
+                                          const Cas::ManifestId & manifest_id, bool allow_repoint,
+                                          bool * commit_recorded)
 {
     /// `build.promote` derives `created` INSIDE its own `appendRefOps` builder (the same in-closure
-    /// pattern as that builder's `repoint_old`) and returns it the instant the append confirms. The
-    /// outcome is assembled here IMMEDIATELY -- before `eraseView` (cache invalidation) -- so nothing
-    /// throwable can run ahead of it; `eraseView` itself does not throw in practice, but the ordering
-    /// is the contract a later conditional rollback (Task 3) relies on.
+    /// pattern as that builder's `repoint_old`) and returns it the instant the append confirms.
+    ///
+    /// The outcome's STRINGS are copied BEFORE the append, so the only thing the post-durable region
+    /// has left to do is store a bool -- which makes that region allocation-free, hence non-throwing.
+    /// This is Part A's rule applied one layer up: nothing after a durable commit may throw before the
+    /// caller has recorded it. Assembling the outcome afterwards (as this did) put two `String` copies
+    /// and a cache invalidation between "the ref is committed" and "the handle knows", so a
+    /// `MEMORY_LIMIT_EXCEEDED` there landed in the caller's failed-promote handler -- which abandons
+    /// the build and, one layer up again, reports a byte fallback for a relink that already published.
+    Cas::CommitOutcome outcome{key.ns, key.ref, manifest_id.ref, /*created=*/false};
+
     const bool created = build.promote(key.ns, key.ref, build_id, manifest_id, allow_repoint);
-    const Cas::CommitOutcome outcome{key.ns, key.ref, manifest_id.ref, created};
+
+    /// POST-DURABLE REGION. Two plain stores, no allocation, no call that can fail.
+    {
+        DENY_ALLOCATIONS_IN_SCOPE;
+        outcome.created = created;
+        if (commit_recorded)
+            *commit_recorded = true;
+    }
+
+    /// Test-only (see `setPostCommitProbeForTest`): models an allocation failure in the throwable
+    /// post-commit work below. It fires AFTER the region above, because the property under test is that
+    /// the commit is already recorded by the time anything here can throw.
+    if (post_commit_probe_for_test)
+        post_commit_probe_for_test();
+
     eraseView(key);
     return outcome;
 }
@@ -377,24 +400,6 @@ PreparedPartWrite::PreparedPartWrite(PreparedPartWrite && other) noexcept
     other.terminal = true;
 }
 
-PreparedPartWrite & PreparedPartWrite::operator=(PreparedPartWrite && other) noexcept
-{
-    if (this == &other)
-        return *this;
-    /// Overwriting a handle that still owes a terminal would silently drop that duty, so discharge it
-    /// here exactly as the destructor does.
-    if (!terminal && build)
-        terminal = abandonBuildBestEffort(*build, "aborting a prepared part write overwritten by a move assignment");
-    owner = other.owner;
-    build = std::move(other.build);
-    key = std::move(other.key);
-    id = std::move(other.id);
-    terminal = other.terminal;
-    other.owner = nullptr;
-    other.terminal = true;
-    return *this;
-}
-
 PreparedPartWrite::~PreparedPartWrite()
 {
     if (terminal || !build)
@@ -410,6 +415,11 @@ PreparedPartWrite::~PreparedPartWrite()
     abandonBuildBestEffort(*build, "aborting a prepared part write destroyed without a terminal operation");
 }
 
+bool PreparedPartWrite::commitIsUnresolved() const
+{
+    return build && build->commitState() == Cas::PartWriteTxn::CommitState::Uncertain;
+}
+
 Cas::CommitOutcome PreparedPartWrite::promote(bool allow_repoint)
 {
     if (terminal)
@@ -419,15 +429,26 @@ Cas::CommitOutcome PreparedPartWrite::promote(bool allow_repoint)
             key.ns.string(), key.ref);
     try
     {
-        Cas::CommitOutcome outcome = owner->promoteBuild(*build, key, build->buildId(), id, allow_repoint);
-        terminal = true;
-        return outcome;
+        /// `terminal` is set by `promoteBuild` itself, inside the allocation-free region immediately
+        /// after the durable append -- NOT after this call returns. The difference is the whole point:
+        /// the outcome assembly and the cache invalidation that follow the append can throw, and a
+        /// handle that had not yet recorded the commit would then take the catch below and abandon a
+        /// build whose ref is already published.
+        return owner->promoteBuild(*build, key, build->buildId(), id, allow_repoint, &terminal);
     }
     catch (...)
     {
-        /// The catch-abandon-rethrow discipline the atomic `publishEntries` has always owned. The
-        /// terminal flag flips only if the abandon actually landed: a failed abandon leaves the handle
-        /// owing cleanup, which the destructor then retries.
+        /// The commit is durable and this handle knows it, so the duty is discharged and there is
+        /// nothing to abandon -- the error is post-commit work failing, which the caller still hears
+        /// about, unchanged.
+        if (terminal)
+            throw;
+        /// The catch-abandon-rethrow discipline the atomic `publishEntries` has always owned. It stays
+        /// correct even when the append itself was ambiguous: `abandon` appends a PRECOMMIT removal,
+        /// and a promote that did land moved the binding to committed, so the removal is rejected by
+        /// the state machine rather than undoing a published ref. The terminal flag flips only if the
+        /// abandon actually landed: a failed abandon leaves the handle owing cleanup, which the
+        /// destructor then retries.
         terminal = abandonBuildBestEffort(*build, "abandoning the build of a failed PreparedPartWrite::promote");
         throw;
     }

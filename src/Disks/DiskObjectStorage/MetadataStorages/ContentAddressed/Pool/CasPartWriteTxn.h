@@ -277,6 +277,43 @@ public:
     /// The strictly increasing per-process sequence used by the active-build watermark.
     uint64_t buildSeq() const { return build_seq; }
 
+    /// Lifecycle of THIS build's create-precommit `owner_transition`.
+    ///
+    /// It is a state and not a bool because `appendRefOps` has three outcomes and only two of them are
+    /// knowledge: an `Unresolved` `PUT` MAY HAVE LANDED (`CasRefLedger.cpp`, the `Unresolved` arm), so a
+    /// `precommitAdd` that threw can still have made this build's manifest a LIVE precommit owner. The
+    /// intent is therefore recorded BEFORE the ambiguous append -- the same "preconstruct before the
+    /// PUT" discipline the ref lane's wedge uses -- and settled either way when it returns.
+    ///
+    ///   `NotAttempted` -- `precommitAdd` never reached its append; nothing can be owned, and this
+    ///                     build's staged manifest bodies are ordinary writer debris.
+    ///   `Uncertain`    -- the append was ATTEMPTED and its outcome is unknown. The build OWES the
+    ///                     precommit removal exactly as if it were durable, and its manifest body is
+    ///                     NOT writer-deletable: it may be a live precommit input whose deletion would
+    ///                     strand GC's fold barrier.
+    ///   `Durable`      -- the append returned, so the precommit binding is this build's.
+    ///   `Settled`      -- the owed terminal operation (`promote` or `abandon`) has discharged the duty.
+    ///                     The body stays non-deletable: after a promote it belongs to a committed ref,
+    ///                     and after an abandon it is GC's to reclaim after the sealed decrement.
+    enum class PrecommitState : uint8_t { NotAttempted, Uncertain, Durable, Settled };
+    PrecommitState precommitState() const { return precommit_state; }
+
+    /// Lifecycle of THIS build's promote (precommit -> committed) append, recorded for the same reason
+    /// and in the same way as `precommitState`: a promote whose append threw may still have COMMITTED
+    /// the ref. The distinction is load-bearing one layer up -- the interserver relink maps a promote
+    /// that definitely did not commit to "fetch the bytes from the same source instead", and doing that
+    /// after a commit that actually landed would publish the same part twice.
+    ///
+    ///   `NotAttempted` -- promote failed (or was never called) strictly BEFORE its append: a rejected
+    ///                     validation, an absent body, a lost owner liveness. Proof of the negative.
+    ///   `Uncertain`    -- the append was attempted and its outcome is unknown. Conservative: the ref
+    ///                     lane collapses `DefiniteFailure` and a pre-attempt refusal into the same
+    ///                     retry-later class as a genuinely ambiguous `PUT`, so both are reported here
+    ///                     as uncertain. That costs a retry, never correctness.
+    ///   `Durable`      -- the append returned; the ref is committed.
+    enum class CommitState : uint8_t { NotAttempted, Uncertain, Durable };
+    CommitState commitState() const { return commit_state; }
+
 private:
     /// Keyed on the full `BlobRef` pair (algorithm + digest), because a bare digest is not a blob identity.
     /// This remains an ordered `std::map` (not `unordered_map`): `BlobRef` already provides `operator<=>`, so
@@ -332,9 +369,15 @@ private:
     /// once this build's owning namespace is durably removed. Atomic because it is WRITTEN cross-thread
     /// and READ by `requireAlive` on the build's own thread. Once cancelled, every further op fails closed.
     std::atomic<bool> cancelled{false};
-    bool precommitted = false;                            /// a create-precommit owner_transition was appended
+    PrecommitState precommit_state = PrecommitState::NotAttempted;
+    CommitState commit_state = CommitState::NotAttempted;
 
-    /// Set by precommitAdd so promote knows which shard to move ownership in.
+    /// The precommit's target, recorded by `precommitAdd` BEFORE its append and never cleared
+    /// afterwards. Two consumers with different lifetimes read them: `abandon` needs them while the
+    /// duty is owed (`Uncertain`/`Durable`), and `cleanupStagedManifestDebrisBestEffort` needs them for
+    /// as long as this object lives, because a body that was ever the target of a precommit attempt
+    /// must never be writer-deleted -- which is why the terminal operations move `precommit_state` to
+    /// `Settled` rather than resetting these back to their unset values.
     RootNamespace precommit_target_ns;
     String precommit_final_ref;
     ManifestRef precommit_manifest;

@@ -21,6 +21,8 @@ namespace DB::ErrorCodes
     extern const int BAD_ARGUMENTS;
     extern const int CORRUPTED_DATA;
     extern const int LOGICAL_ERROR;
+    extern const int MEMORY_LIMIT_EXCEEDED;
+    extern const int NETWORK_ERROR;
 }
 
 namespace ProfileEvents
@@ -1001,4 +1003,133 @@ TEST(CasPartFolderAccess, BestEffortRollbackDropCountsAndSurvivesABackendOutage)
     EXPECT_EQ(after, before + 1);
 
     backend->armed = false;   /// let store teardown release its lease cleanly
+}
+
+namespace
+{
+
+/// A pool whose ref lane makes ONE attempt per append. That is what turns a single lost-response fault
+/// into a conclusive `Unresolved`: with retries allowed the controller's resolve-before-reissue would
+/// settle the ambiguity inside the same attempt and the lane would never wedge. Same budget shape, and
+/// the same reason, as `gtest_cas_ref_install_safety.cpp`'s `openPoolSingleAttempt`.
+Cas::PoolPtr openPoolSingleAttempt(const std::shared_ptr<Cas::InMemoryBackend> & backend)
+{
+    Cas::PoolConfig cfg{.pool_prefix = "p", .server_root_id = "test"};
+    Cas::CasRequestBudget budget;
+    budget.max_attempts = 1;
+    budget.attempt_timeout_ms = 100;
+    budget.operation_deadline_ms = 100;
+    budget.lease_safety_margin_ms = 100;
+    cfg.cas_request_budget = budget;
+    return Cas::Pool::open(backend, cfg);
+}
+
+}
+
+/// Part B review, MAJOR 3a: a promote whose ref-log append did not resolve MUST NOT be reported as
+/// "nothing was committed".
+///
+/// `PreparedRelinkOverPartWrite::promote` maps a `NETWORK_ERROR` to `MechanismFallbackAllowed`, which
+/// tells the interserver receiver to fetch the part's bytes from the same sender instead. That is sound
+/// only when the promote is PROVEN not to have committed. It is not proven here: the promotion object
+/// landed and only its acknowledgement was lost, so the ref below IS committed while `promote` reports
+/// failure -- and a byte fetch on top of it is a sequential double publication of one logical fetch.
+///
+/// The transaction therefore records the distinction where it is knowable (around its own append)
+/// rather than leaving it to be guessed from an error code, which cannot carry it: the SAME
+/// `NETWORK_ERROR` is raised by a promote rejected before the append (proof of the negative) and by one
+/// whose append never resolved.
+TEST(CasPartFolderAccess, AnUnresolvedPromoteIsNotReportedAsDefinitelyNotCommitted)
+{
+    auto backend = std::make_shared<Cas::tests::ChunkFaultBackend>();
+    auto store = openPoolSingleAttempt(backend);
+    const Cas::RootNamespace ns{"srv/t1"};
+    Cas::CachedPartFolderAccess access(store, cacheOn());
+    const Cas::PartRefKey key{ns, "part_1"};
+
+    auto prepared = access.prepareEntries(key, {inlineEntry("f", "one")}, Cas::ProvenanceOp::Insert);
+    ASSERT_FALSE(prepared.commitIsUnresolved()) << "no promote has been attempted yet";
+
+    /// The promotion's own ref-log object lands; only the acknowledgement, and the controller's
+    /// verifying read, are lost. Scoped to this namespace's ref log so nothing else consumes the fault.
+    backend->fault_substr = store->layout().refsNamespacePrefix(ns) + "_log/";
+    backend->mode = Cas::tests::ChunkFaultBackend::Mode::LandedThenLost;
+    backend->fault_count = 1;
+    expectThrowsCode(ErrorCodes::NETWORK_ERROR, [&] { prepared.promote(); });
+
+    EXPECT_TRUE(prepared.commitIsUnresolved())
+        << "a promote whose append may have landed must not be classified as a mechanism failure -- the "
+           "receiver would fetch the bytes and publish the same part a second time";
+
+    /// The hazard itself, stated as an assertion: the promote DID commit. Any further append into this
+    /// table resolves the wedge first, which is what makes the committed row visible.
+    backend->mode = Cas::tests::ChunkFaultBackend::Mode::None;
+    access.prepareEntries({ns, "flush_driver"}, {inlineEntry("f", "two")}, Cas::ProvenanceOp::Insert).abort();
+    EXPECT_TRUE(access.existsRef(key, Cas::Freshness::ForceFresh))
+        << "the promotion object landed, so 'the promote failed' says nothing about the ref";
+}
+
+/// Part B review, MAJOR 3b: nothing after a durable commit may throw before the handle records it.
+///
+/// `promoteBuild` used to assemble its `CommitOutcome` -- two `String` copies -- and invalidate the
+/// cached view AFTER the durable append and BEFORE `PreparedPartWrite::promote` set `terminal`. An
+/// allocation failure in that window therefore entered the failed-promote catch with the ref already
+/// committed, where the handle abandons its build and reports the promote as failed. The outcome's
+/// strings are now copied BEFORE the append and the commit is recorded in an allocation-free region
+/// immediately after it, so the window is empty by construction; the probe below fires just past it.
+TEST(CasPartFolderAccess, APostCommitFailureLeavesTheHandleTerminal)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend);
+    const Cas::RootNamespace ns{"srv/t1"};
+    Cas::CachedPartFolderAccess access(store, cacheOn());
+    const Cas::PartRefKey key{ns, "part_1"};
+
+    auto prepared = access.prepareEntries(key, {inlineEntry("f", "one")}, Cas::ProvenanceOp::Insert);
+
+    std::vector<Cas::CasEvent> seen;
+    store->setEventSink([&](const Cas::CasEvent & e) { seen.push_back(e); });
+
+    /// `MEMORY_LIMIT_EXCEEDED` -- what a tracked allocation failure actually raises -- and deliberately
+    /// not `LOGICAL_ERROR`, which aborts at construction in debug/sanitizer builds.
+    access.setPostCommitProbeForTest([]
+    {
+        throw Exception(ErrorCodes::MEMORY_LIMIT_EXCEEDED,
+            "simulated allocation failure in the post-commit work of promoteBuild");
+    });
+    expectThrowsCode(ErrorCodes::MEMORY_LIMIT_EXCEEDED, [&] { prepared.promote(); });
+    access.setPostCommitProbeForTest(nullptr);
+    store->setEventSink(nullptr);
+
+    EXPECT_TRUE(prepared.isTerminal())
+        << "the commit is durable, so the handle owes nothing";
+    EXPECT_TRUE(access.existsRef(key, Cas::Freshness::ForceFresh)) << "the promote really did commit";
+    EXPECT_TRUE(store->livePrecommitsForTest(ns).empty());
+
+    /// The discriminating assertion. `isTerminal` alone is not one: the old code reached the catch,
+    /// abandoned an ALREADY PROMOTED build -- which succeeds, because a promoted build no longer owes a
+    /// precommit removal -- and so ended up terminal too, by accident. What the abandon leaves behind is
+    /// the audit trail of a publish that is reported as thrown away while its ref is committed.
+    const auto build_aborts = std::count_if(seen.begin(), seen.end(),
+        [](const Cas::CasEvent & e) { return e.type == Cas::CasEventType::BuildAbort; });
+    EXPECT_EQ(build_aborts, 0)
+        << "a build whose promote is DURABLE was abandoned by the failed-promote catch: the handle had "
+           "not yet recorded the commit when the post-commit work threw";
+    EXPECT_EQ(std::count_if(seen.begin(), seen.end(),
+        [](const Cas::CasEvent & e) { return e.type == Cas::CasEventType::BuildPublish; }), 1);
+}
+
+/// Part B review, MAJOR 4: move ASSIGNMENT is deleted rather than implemented.
+///
+/// It cannot be implemented correctly. Overwriting a handle that still owes a terminal must first
+/// discharge that duty, and `abandon` appends through the ref lane, so it can FAIL -- which a move
+/// assignment has no way to report. The old implementation overwrote the destination's build even when
+/// `abandonBuildBestEffort` returned false, permanently dropping a cleanup owner: a live-epoch precommit
+/// that no sweep and no GC ever reclaims. Nothing needs the operator (the interserver relink's handle is
+/// move CONSTRUCTED into place), and a contract that cannot be relied on is worse than none.
+TEST(CasPartFolderAccess, PreparedPartWriteIsNotMoveAssignable)
+{
+    EXPECT_FALSE(std::is_move_assignable_v<Cas::PreparedPartWrite>)
+        << "a move assignment cannot discharge a terminal duty that may fail to be discharged";
+    EXPECT_TRUE(std::is_move_constructible_v<Cas::PreparedPartWrite>);
 }

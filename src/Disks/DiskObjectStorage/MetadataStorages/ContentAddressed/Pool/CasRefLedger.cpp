@@ -356,9 +356,11 @@ ConfirmAnswer CasRefLedger::confirmExactRef(const RootNamespace & ns, const Stri
     if (rt.apply_state.load(std::memory_order_relaxed) != RefApplyState::Clean)
         return ConfirmAnswer::Unknown;
 
-    /// Rule 5 (exact row equality) -- the only rule that can produce a PROOF OF THE NEGATIVE. On a
-    /// table that passed rules 2-4 the committed map is this writer's authoritative view, so a missing
-    /// row or a different `ManifestRef` is knowledge, not ambiguity. Equality is exact and total:
+    /// Rule 5 (exact row equality) -- the only rule that can answer `No` at all. On a table that passed
+    /// rules 2-4 the committed map is this writer's view, so a missing row or a different `ManifestRef`
+    /// is a real disagreement rather than an ambiguity about this cache. It is NOT a proof about the
+    /// DURABLE table: the fence has not been checked yet (rule 6, below, states why that order is
+    /// deliberate and why it is sound). Equality is exact and total:
     /// mint-tightening (spec §A3) guarantees a repoint or a recreation mints a fresh `ManifestRef`, so
     /// there is no ABA to defend against here.
     const auto & committed = rt.state.getCommitted();

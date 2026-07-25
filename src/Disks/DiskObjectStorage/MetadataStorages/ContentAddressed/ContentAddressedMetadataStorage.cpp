@@ -2063,6 +2063,21 @@ public:
         }
         catch (const Exception & e)
         {
+            /// UNCERTAINTY IS CHECKED FIRST, and it outranks the error code. A `NETWORK_ERROR` out of
+            /// the promote means one of two entirely different things: the promote was rejected before
+            /// its ref-log append (nothing committed), or the append itself was attempted and did not
+            /// resolve -- in which case the promotion PUT may have landed and the ref may be live. The
+            /// error code cannot tell them apart, which is why the transaction records the distinction
+            /// as it happens. Reporting the second case as a mechanism fallback would have the receiver
+            /// fetch the bytes and publish a second time over a relink that already committed.
+            if (write.commitIsUnresolved())
+            {
+                LOG_INFO(getLogger("ContentAddressedMetadataStorage"),
+                    "Relink of part {} could not be resolved: the promotion append may or may not have "
+                    "committed ({}); the caller must retry the whole fetch later, NOT fetch the bytes",
+                    ref_name, e.message());
+                return CaRelinkPromote::Unresolved;
+            }
             /// The same retryable class the staging half classifies: a body-absent precommit, a
             /// precommit binding that is no longer the live owner, or a ref conflict. `promote` has
             /// already abandoned the build on its way out, so the `+1` is released and the sender's
@@ -2129,8 +2144,14 @@ CaRelinkPrepare ContentAddressedMetadataStorage::prepareAdoptFromManifest(
     /// this function used to carry (codex-6). The sender's relink response is fire-and-forget: it
     /// releases the source part when `processQuery` returns, so if this `+1` were not yet durable while
     /// the source's now-`Outdated` part was collected, the receiver would commit a manifest whose blobs
-    /// are gone. Publishing FIRST and asking SECOND removes the window: any removal of the source
-    /// binding is appended strictly after a `+1` every subsequent GC fold can see.
+    /// are gone. Publishing FIRST and asking SECOND closes THAT window: any removal of the source
+    /// binding is appended strictly after this `+1` is durable in the ref log.
+    ///
+    /// It does NOT establish that every subsequent GC fold SEES the `+1`, and the ordering must not be
+    /// read as if it did: `CaRelinkConfirmCore.tla` config `_sab_holeylist` shows a fold that misses it
+    /// (BACKLOG `{#list-as-journal-dataloss-2026-07-25}`), which is why the caller-side taxonomy states
+    /// plainly that a confirmed relink is not proven dangle-free (`DataPartsExchange.cpp`, "What a
+    /// `yes` does NOT prove"). Durable-before-asking is necessary, not sufficient.
     ///
     /// Promotion trusts the adopted leaves via the durable manifest edge (no per-file HEAD/loadMeta
     /// probe); a genuinely-absent adopted blob is an invariant violation caught by fsck, not here — the

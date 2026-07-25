@@ -1289,7 +1289,7 @@ MergeTreeData::MutableDataPartPtr Fetcher::downloadPartToDisk(
 }
 
 /// The receiver's half of publish-then-confirm, and its complete failure taxonomy (spec
-/// §failure-taxonomy). Every exit of `relinkPartToDisk` is one of these six rows; the last two columns
+/// §failure-taxonomy). Every exit of `relinkPartToDisk` is one of these seven rows; the last two columns
 /// are the questions a reviewer has to be able to answer without reading the control flow, because a
 /// part-exchange path that gets them wrong either loses a part or commits it twice.
 ///
@@ -1301,9 +1301,15 @@ MergeTreeData::MutableDataPartPtr Fetcher::downloadPartToDisk(
 /// 2. `prepareAdoptFromManifest` -> `MechanismFallbackAllowed` (manifest decode failure, or the
 ///    retryable staging class: body-absent precommit / precommit no longer the live owner / ref
 ///    conflict).
-///    `+1`: never staged -- `prepareEntries` abandons its own build before propagating.
+///    `+1`: NOTHING IS PUBLISHED, and that -- not "never staged" -- is what makes the byte fallback
+///    sound here. A precommit whose ref-log append came back `Unresolved` may in fact be durable, so
+///    `prepareEntries`' own `abandon` queues the exact removal for it (`PartWriteTxn::precommitAdd`
+///    records the intent BEFORE the append precisely so that removal is never skipped) and leaves the
+///    manifest body for GC rather than deleting it. A precommit is not a committed ref: a later byte
+///    fetch publishes the same ref name over it without conflict, and a removal that could not be
+///    appended at all leaks retained blobs -- it never double-publishes.
 ///    Action: return `nullptr`, the caller byte-fetches. Lose a part? No, as row 1.
-///    Double-promote? No -- no handle exists.
+///    Double-promote? No -- no handle exists, and nothing was committed.
 ///
 /// 3. THE CONFIRM DID NOT PROVE THE SOURCE: an `unproven` answer, an absent answer cookie, a transport
 ///    failure, a timeout. All one outcome, deliberately (`CasConfirmAnswer`: only `yes` authorizes).
@@ -1321,10 +1327,22 @@ MergeTreeData::MutableDataPartPtr Fetcher::downloadPartToDisk(
 ///    finished transaction.
 ///
 /// 5. CONFIRM `yes`, `promote` -> `MechanismFallbackAllowed` (a local ref conflict; the source proved
-///    its side, this receiver could not commit its own).
+///    its side, this receiver could not commit its own). The promote was rejected BEFORE its ref-log
+///    append, so "nothing was committed" is proven, not assumed -- see row 5b for the case where it is
+///    not.
 ///    `+1`: released -- a failed `promote` abandons its build on the way out.
 ///    Action: return `nullptr`, the caller byte-fetches. Lose a part? No, as row 1.
 ///    Double-promote? No -- the byte fetch starts from a clean slate.
+///
+/// 5b. CONFIRM `yes`, `promote` -> `Unresolved` (the promotion's ref-log append was attempted and came
+///    back without a verdict; the receiver's ref MAY be committed).
+///    `+1`: still owed -- the handle attempts its abandon, which is REJECTED by the state machine if
+///    the promote in fact landed (a promoted binding is no longer a precommit), so no committed ref is
+///    ever undone here.
+///    Action: THROW the retry-later `NETWORK_ERROR`, as row 3 -- returning `nullptr` is the one thing
+///    that must not happen, because a byte fetch would publish the part a SECOND time over a relink
+///    that may already be committed.
+///    Lose a part? No -- retry-later, as row 3. Double-promote? No -- nothing is published on this exit.
 ///
 /// 6. ANY OTHER EXCEPTION (an unclassified local error, or a `promote` failure outside the known
 ///    retryable class).
@@ -1444,9 +1462,11 @@ MergeTreeData::MutableDataPartPtr Fetcher::relinkPartToDisk(
     /// fetch — see `prepareAdoptFromManifest`.
     ///
     /// The order is the whole protocol. This `+1` must be DURABLE before the source is asked anything,
-    /// because the question "do you still hold it?" only excludes a later removal if every subsequent GC
-    /// fold already sees the receiver's own reference (spec §correctness). Asking first and publishing
-    /// after would prove nothing about the interval in between.
+    /// because the question "do you still hold it?" only excludes a later removal if the receiver's own
+    /// reference is already in the ref log when that removal is appended (spec §correctness). Asking
+    /// first and publishing after would prove nothing about the interval in between. What it does NOT
+    /// establish is that every subsequent GC fold OBSERVES that reference -- see "What a `yes` does NOT
+    /// prove" above; ordering is necessary here, not sufficient.
     std::unique_ptr<ICaPreparedRelink> prepared;
     if (ca_meta->prepareAdoptFromManifest(part_path, sender_manifest_bytes, prepared)
         == CaRelinkPrepare::MechanismFallbackAllowed)
@@ -1539,6 +1559,16 @@ MergeTreeData::MutableDataPartPtr Fetcher::relinkPartToDisk(
             break;
         case CaRelinkPromote::MechanismFallbackAllowed:
             return nullptr;                                 /// taxonomy row 5
+        case CaRelinkPromote::Unresolved:
+            /// The promotion append may have landed, so this is the ONE promote outcome that is not row
+            /// 5: returning `nullptr` would send the caller to fetch the bytes and publish the part a
+            /// second time over a relink that may already be committed. Thrown in the retry-later class
+            /// instead, exactly as an unproven confirm is (row 3) -- the queue stores it, backs off, and
+            /// re-executes, by which time the ref lane has resolved the ambiguity one way or the other.
+            throw Exception(ErrorCodes::NETWORK_ERROR,
+                "Relink of part {} from {} could not be resolved: the promotion may or may not have "
+                "committed, so the bytes must NOT be fetched; the fetch will be retried later",
+                part_name, fetch_uri.getHost());
     }
     /// The single terminal operation is done, so the handle owes nothing; releasing it here also disarms
     /// the scope guard for the part-building code below.

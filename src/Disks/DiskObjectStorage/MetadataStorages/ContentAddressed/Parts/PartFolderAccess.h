@@ -158,7 +158,13 @@ class CachedPartFolderAccess;
 /// `promote` (commit) or `abort` (append the exact precommit removal).
 ///
 /// Getting that wrong is made impossible rather than merely discouraged:
-///  - move-only, and a move leaves the source terminal, so the duty is never held twice;
+///  - move-CONSTRUCT-only, and a move leaves the source terminal, so the duty is never held twice.
+///    Move ASSIGNMENT is deleted: overwriting a handle that still owes a terminal has no correct
+///    implementation. Discharging the duty first can FAIL (`abandon` appends through the ref lane, and
+///    the lane can be wedged or fenced), and the assignment cannot report that -- so it would either
+///    drop a cleanup owner permanently or refuse to complete an operation the language says cannot
+///    fail. Nothing needs it: the one handle that travels (the interserver relink's) is move
+///    CONSTRUCTED into place, and a contract that cannot be relied on is worse than no contract;
 ///  - an explicit terminal flag, set only once the underlying operation has actually completed, so a
 ///    second `promote`/`abort` is rejected with `LOGICAL_ERROR` instead of re-driving a dead
 ///    transaction -- while a terminal that FAILED (an append the caller may legitimately retry) leaves
@@ -171,13 +177,16 @@ public:
     PreparedPartWrite(const PreparedPartWrite &) = delete;
     PreparedPartWrite & operator=(const PreparedPartWrite &) = delete;
     PreparedPartWrite(PreparedPartWrite && other) noexcept;
-    PreparedPartWrite & operator=(PreparedPartWrite && other) noexcept;
+    PreparedPartWrite & operator=(PreparedPartWrite && other) = delete;
     /// Best-effort abort of a handle that never reached a terminal state; never throws.
     ~PreparedPartWrite();
 
     /// Completes the write: the atomic precommit-to-committed owner move, plus the facade's cache
-    /// invalidation. On failure the build is abandoned (the same catch-abandon-rethrow discipline the
-    /// atomic `publishEntries` has always applied) and the original error propagates.
+    /// invalidation. The handle records the commit INSIDE the allocation-free region that immediately
+    /// follows the durable append, so nothing between "the ref is committed" and "this handle knows it"
+    /// can throw. On a failure that is PROVEN to have committed nothing the build is abandoned (the
+    /// catch-abandon-rethrow discipline the atomic `publishEntries` has always applied); the original
+    /// error propagates in either case.
     CommitOutcome promote(bool allow_repoint = false);
     /// Durably abandons the write: appends the EXACT precommit removal so the manifest's `+1` is
     /// released. Propagates an append failure -- the caller may retry, and the destructor is the
@@ -186,6 +195,13 @@ public:
 
     /// Whether the owed terminal operation has already completed. A moved-from handle is terminal.
     bool isTerminal() const { return terminal; }
+    /// Whether a `promote` attempt reached the ref lane's append and did not come back with a verdict,
+    /// i.e. the commit MAY be durable. Only meaningful after `promote` threw; false everywhere else,
+    /// including on a promote that failed its pre-append validation (proof of the negative) and on a
+    /// moved-from handle. A caller that treats a failed promote as "nothing was published" -- the
+    /// interserver relink's byte fallback -- must consult this first: doing that after a commit that
+    /// actually landed publishes the same part twice.
+    bool commitIsUnresolved() const;
     /// The ref this write will commit to, and the manifest staged for it.
     const PartRefKey & refKey() const { return key; }
     const ManifestId & manifestId() const { return id; }
@@ -264,8 +280,16 @@ public:
     /// `CommitOutcome` is exact: `created` is derived INSIDE `PartWriteTxn::promote`'s `appendRefOps`
     /// builder (the same in-closure-output pattern as that builder's own `repoint_old`), not read back
     /// afterward.
+    ///
+    /// `commit_recorded`, when supplied, is set to `true` inside the allocation-free region that
+    /// immediately follows the durable append -- before the `CommitOutcome` is finished and before the
+    /// cache invalidation, both of which allocate and may therefore throw. It exists so a caller
+    /// holding a terminal duty (`PreparedPartWrite`) can record "committed" with nothing throwable in
+    /// between; without it an allocation failure in the post-commit work lands in the caller's
+    /// failed-promote handler with the ref already published.
     CommitOutcome promoteBuild(Cas::PartWriteTxn & build, const PartRefKey & key, UInt128 build_id,
-                      const Cas::ManifestId & manifest_id, bool allow_repoint = false);
+                      const Cas::ManifestId & manifest_id, bool allow_repoint = false,
+                      bool * commit_recorded = nullptr);
     /// The first half of the committed-publish sequence: adopt evidence over `entries`, stage a fresh
     /// manifest, and precommit it -- then STOP. The receiver's `+1` is durable, the promote is deferred
     /// until the caller has proven the source still holds the manifest (spec §relink-handle). The
@@ -328,6 +352,12 @@ public:
     };
     /// Returns the test/log-only decision record for `key`; an absent key yields the default result.
     ExplainResult explain(const PartRefKey & key) const;
+
+    /// Test-only seam (nothing installs it in production): fires in `promoteBuild` immediately after
+    /// the commit has been recorded and before the throwable post-commit work (`CommitOutcome`
+    /// assembly's copies, `eraseView`). A test uses it to model an allocation failure in exactly that
+    /// window and assert that the caller's terminal duty is already discharged.
+    void setPostCommitProbeForTest(std::function<void()> fn) { post_commit_probe_for_test = std::move(fn); }
     /// Test-only: number of entries in the decision journal (0 whenever explain is disabled).
     size_t explainJournalSizeForTest() const;
 
@@ -373,6 +403,9 @@ private:
     /// Records the latest diagnostic decision without affecting read or write behavior.
     void recordDecision(const String & cache_key, LastDecision decision,
                         const PartFolderView * view, bool retained) const;
+
+    /// See `setPostCommitProbeForTest`. Empty in production.
+    std::function<void()> post_commit_probe_for_test;
 };
 
 }

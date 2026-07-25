@@ -57,10 +57,17 @@ enum class RefApplyState : uint8_t { Clean, ApplyPending, Poisoned };
 /// The answer of the relink confirm's gate 1 (`CasRefLedger::confirmExactRef`).
 ///
 /// `Yes` is the only answer that AUTHORIZES anything, so it is the only one that must be earned: it is
-/// returned exclusively when every rule of the lane snapshot holds. `No` is a proof of the negative --
-/// the committed binding is demonstrably not the one asked about. `Unknown` is the catch-all for every
-/// ambiguity, and it is the answer this primitive is biased towards: a cold, evicted, recovering,
-/// busy, wedged, poisoned or unfenced table answers `Unknown` rather than doing any work to find out.
+/// returned exclusively when every rule of the lane snapshot holds. `Unknown` is the catch-all for
+/// every ambiguity, and it is the answer this primitive is biased towards: a cold, evicted, recovering,
+/// busy, wedged or poisoned table answers `Unknown` rather than doing any work to find out.
+///
+/// `No` means "this runtime's committed row for that ref is not the manifest you asked about" -- and
+/// nothing more. It is NOT a proof of the negative about the durable table, because the mount fence is
+/// evaluated LAST (rule 6, deliberately): a mount that has already lost its fence, and whose view may
+/// therefore be behind another writer's repoint, still answers `No` rather than `Unknown`. That is
+/// sound only because `No` and `Unknown` are the SAME outcome for the caller -- both are
+/// `SourceProofFailed` (spec §failure-taxonomy) -- so nothing is authorized by either. Do not build a
+/// consumer that treats `No` as knowledge; only `Yes` is gated on the fence.
 enum class ConfirmAnswer : uint8_t { Yes, No, Unknown };
 
 /// Coordinates the writer-side ref-log and ref-table protocol for all namespaces in one mounted pool.

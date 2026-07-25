@@ -84,16 +84,25 @@ enum class CaRelinkPrepare : uint8_t
     MechanismFallbackAllowed,
 };
 
-/// Receiver side, the outcome of promoting a prepared relink. Same two-value discipline: either the
-/// receiver's ref is committed, or the promote failed in a way that leaves the sender's copy the only
-/// authority and its bytes a sound recovery (a ref conflict, a precommit that is no longer the live
-/// owner). Anything else PROPAGATES as an exception rather than becoming a value here -- an unclassified
-/// local failure is not evidence that a byte fetch would fare better, and hiding it is exactly the
-/// catch-all this boundary replaced.
+/// Receiver side, the outcome of promoting a prepared relink. THREE values, because a promote has
+/// three outcomes and only two of them are knowledge:
+///  - `Committed` -- the receiver's ref is committed.
+///  - `MechanismFallbackAllowed` -- the promote is PROVEN to have committed nothing (it was rejected
+///    before its ref-log append: a body-absent precommit, a precommit that is no longer the live owner,
+///    a ref conflict), which leaves the sender's copy the only authority and its bytes a sound recovery.
+///  - `Unresolved` -- the ref-log append was attempted and did not come back with a verdict, so the ref
+///    MAY be committed. This is NOT a mechanism fallback and must never be reported as one: fetching
+///    the bytes after a relink that actually committed publishes the same part twice. The only sound
+///    recovery is to retry the whole fetch later, which is what the caller does with it.
+///
+/// Anything else PROPAGATES as an exception rather than becoming a value here -- an unclassified local
+/// failure is not evidence that a byte fetch would fare better, and hiding it is exactly the catch-all
+/// this boundary replaced.
 enum class CaRelinkPromote : uint8_t
 {
     Committed,
     MechanismFallbackAllowed,
+    Unresolved,
 };
 
 /// Receiver side: a relink that is DURABLE BUT NOT PROMOTED, as the exchange sees it. It exists because
@@ -110,7 +119,9 @@ public:
     virtual ~ICaPreparedRelink() = default;
 
     /// Commits the receiver's ref over the shared-pool blobs. Call ONLY after the source has proven it
-    /// still holds exactly the offered manifest.
+    /// still holds exactly the offered manifest. `Unresolved` is a real outcome, not a defensive
+    /// leftover: the commit may be durable, so the caller must neither publish the part nor fetch its
+    /// bytes.
     virtual CaRelinkPromote promote() = 0;
 
     /// Releases the durable `+1` by appending the exact precommit removal. NEVER THROWS, and that is a

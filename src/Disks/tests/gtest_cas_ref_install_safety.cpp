@@ -882,3 +882,87 @@ TEST(CasRefInstallSafety, PoisonedSurvivesALaterSuccessfulFlush)
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasRefApplyPoisoned].load() - poisoned_before, 1u)
         << "the event counts TRANSITIONS, so the successful flush must not have added another";
 }
+
+/// Part B review, BLOCKER 2: an UNCERTAIN `precommitAdd` must keep its cleanup owner and its body.
+///
+/// `PartWriteTxn::precommitAdd` used to record `precommit_*` and set its `precommitted` flag only AFTER
+/// `appendRefOps` returned. But an `Unresolved` append MAY HAVE LANDED -- the `Unresolved` arm of
+/// `commitRefChunk` says exactly that, and wedges the lane for precisely that reason -- so on that path
+/// `abandon` ran against an object that believed it had never precommitted. It therefore queued NO
+/// removal, and `cleanupStagedManifestDebrisBestEffort`, deciding from the same unset state, DELETED the
+/// manifest body. When the wedge later resolved as committed, the table gained a live precommit with no
+/// cleanup owner and no body -- which clamps GC's fold barrier (a live precommit whose body is missing)
+/// forever.
+///
+/// The fix is the same discipline the wedge itself uses: record the intent BEFORE the ambiguous
+/// operation. Both assertions below fail against the old code -- the body is gone, and the precommit is
+/// still live once the wedge resolves.
+TEST(CasRefInstallSafety, UncertainPrecommitKeepsItsCleanupOwnerAndItsBody)
+{
+    auto backend = std::make_shared<DB::Cas::tests::ChunkFaultBackend>();
+    auto store = openPoolSingleAttempt(backend);
+    const RootNamespace ns{"srv1/uncertain_precommit"};
+
+    PartWriteInfo info;
+    info.intended_namespace = ns;
+    info.intended_ref = ns.string() + "/part_a";
+    auto build = store->beginPartWrite(info);
+    const ManifestId id = build->stageManifest({});
+    const String manifest_key = store->layout().manifestKey(id);
+    ASSERT_TRUE(backend->head(manifest_key).exists) << "the staged body must exist before the precommit";
+
+    /// Scoped to THIS namespace's ref log so the manifest body's own PUT cannot consume the fault. The
+    /// object LANDS and only its acknowledgement is lost, which with the single-attempt budget wedges
+    /// the lane over a genuinely durable precommit -- the exact shape the old code mishandled.
+    backend->fault_substr = store->layout().refsNamespacePrefix(ns) + "_log/";
+    backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::LandedThenLost;
+    backend->fault_count = 1;
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { build->precommitAdd(ns, "part_a", id); });
+    ASSERT_TRUE(store->refLaneWedgedForTest(ns)) << "the lost-response precommit must wedge the lane";
+    EXPECT_EQ(build->precommitState(), PartWriteTxn::PrecommitState::Uncertain)
+        << "an append that may have landed is neither 'never precommitted' nor 'durably precommitted'";
+
+    /// The cleanup owner survives the uncertainty: this `abandon` resolves the wedge (proving the
+    /// precommit durable) and appends the exact removal in the same flush.
+    build->abandon();
+
+    EXPECT_TRUE(backend->head(manifest_key).exists)
+        << "abandon writer-deleted the body of a precommit that may be live -- GC's fold barrier would "
+           "clamp on it forever";
+    EXPECT_TRUE(store->livePrecommitsForTest(ns).empty())
+        << "the uncertain precommit landed, so abandon owed its exact removal";
+    EXPECT_FALSE(store->refLaneWedgedForTest(ns)) << "the abandon's own flush must have resolved the wedge";
+}
+
+/// The other side of the same state, and the reason it is a STATE and not just an extra bool: an
+/// `Uncertain` precommit that in fact never landed must not make `abandon` fail forever.
+///
+/// `RefTableState::applyOwnerTransition` rejects a removal whose `old_binding` names an absent
+/// precommit, so the removal is NOT unconditionally idempotent (the review's "it is idempotent" is only
+/// true with the presence check this test pins). Here the append is refused BEFORE any request is sent,
+/// which is provably-nothing-durable, and yet the transaction has already recorded the intent -- so the
+/// removal it owes must resolve to a no-op rather than to `CORRUPTED_DATA`.
+TEST(CasRefInstallSafety, UncertainPrecommitThatNeverLandedStillAbandonsCleanly)
+{
+    auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
+    auto store = openPoolFenceControlled(backend);
+    const RootNamespace ns{"srv1/uncertain_precommit_absent"};
+
+    PartWriteInfo info;
+    info.intended_namespace = ns;
+    info.intended_ref = ns.string() + "/part_a";
+    auto build = store->beginPartWrite(info);
+    const ManifestId id = build->stageManifest({});
+
+    /// A lease with room for the flush but not for one whole controlled attempt: the pre-attempt gate
+    /// refuses, nothing is sent, and no wedge forms (`PreAttemptRefusalDoesNotWedgeTheLane`).
+    store->setMountDeadline(FENCE_DEADLINE_REFUSES_ATTEMPT_MS);
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { build->precommitAdd(ns, "part_a", id); });
+    ASSERT_FALSE(store->refLaneWedgedForTest(ns));
+    EXPECT_EQ(build->precommitState(), PartWriteTxn::PrecommitState::Uncertain);
+
+    store->setMountDeadline(FENCE_DEADLINE_HEALTHY_MS);
+    build->abandon();   /// must not throw: there is no binding to remove, and that is not an anomaly here
+    EXPECT_EQ(build->precommitState(), PartWriteTxn::PrecommitState::Settled);
+    EXPECT_TRUE(store->livePrecommitsForTest(ns).empty());
+}

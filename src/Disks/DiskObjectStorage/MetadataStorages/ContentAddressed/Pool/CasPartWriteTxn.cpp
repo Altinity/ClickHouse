@@ -384,7 +384,11 @@ BlobDepRecord PartWriteTxn::observeAndAdmit(ObjectKind kind, const BlobRef & ref
     /// compiled out in release, and a wiring/retry bug that reached adopt without a durable precommit
     /// would silently drop watermark protection (later dangling ref / data loss with no production
     /// signal).
-    if (!precommitted)
+    /// `Durable` and nothing else. `Uncertain` is a precommit that MAY be live and may equally not
+    /// exist at all, and "may" is not the closure this invariant needs: the adopted blob would carry
+    /// the original writer's build_id with only a possibly-absent edge protecting it. It fails closed
+    /// here exactly as `NotAttempted` does, and for the same reason.
+    if (precommit_state != PrecommitState::Durable)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "PartWriteTxn::observeAndAdmit: EDGE-BEFORE-OBSERVE invariant violated — adopting an existing "
             "incarnation before this build's precommit is durable would admit {} ({}) under the original "
@@ -948,6 +952,21 @@ void PartWriteTxn::precommitAdd(const RootNamespace & target_ns, const String & 
     /// same batch; when that state is not `Live` (never born, or `Removed`), it prepends
     /// `namespace_birth` in the SAME transaction (the birth transaction
     /// normally also adds the first precommit").
+    ///
+    /// THE INTENT IS RECORDED BEFORE THE APPEND, and that ordering is the whole point: an `Unresolved`
+    /// append MAY HAVE LANDED (`CasRefLedger.cpp`, the `Unresolved` arm says so explicitly), so a
+    /// `precommitAdd` that throws can still have made `id.ref` a live precommit owner. Setting the
+    /// fields afterwards left that case with an object which believed it had never precommitted:
+    /// `abandon` queued no removal and `cleanupStagedManifestDebrisBestEffort` -- deciding from the same
+    /// unset state -- writer-DELETED the body, so a wedge that later resolved as committed installed a
+    /// live precommit with no cleanup owner and no body. Same discipline, and same reason, as the ref
+    /// lane's preconstructed wedge. The three fields are plain assignments of already-materialized
+    /// values, so this cannot throw between the record and the append.
+    precommit_target_ns = target_ns;
+    precommit_final_ref = final_ref_name;
+    precommit_manifest = id.ref;
+    precommit_state = PrecommitState::Uncertain;
+
     store->appendRefOps(target_ns, MutationScope::ref(final_ref_name),
         /// Capture everything the closure reads BY VALUE (the `store` handle, target namespace, ref name,
         /// and manifest id) rather than `[&]`: defense-in-depth so a closure that ever outlives this
@@ -1012,10 +1031,9 @@ void PartWriteTxn::precommitAdd(const RootNamespace & target_ns, const String & 
         },
         RootMutationOrigin::Writer, RootMutationKind::Precommit);
 
-    precommit_target_ns = target_ns;
-    precommit_final_ref = final_ref_name;
-    precommit_manifest = id.ref;
-    precommitted = true;
+    /// The append returned: the precommit binding is durably this build's, so the duty settles from
+    /// `Uncertain` to `Durable` and `observeAndAdmit`'s EDGE-BEFORE-OBSERVE gate opens.
+    precommit_state = PrecommitState::Durable;
 
     EventEmitter{*store}.emit([&](CasEvent & e)
     {
@@ -1070,6 +1088,12 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
     /// or a genuine first-time bind (no committed row -> true). Same in-closure-output pattern as
     /// `repoint_old` immediately below; read by the caller only after `appendRefOps` returns.
     bool created = false;
+    /// Recorded BEFORE the append for the same reason `precommitAdd` records its intent before its own:
+    /// the append is the point past which failure stops being proof of the negative. Everything above
+    /// this line is validation that rejects without publishing anything, so a throw there leaves
+    /// `NotAttempted` -- and a caller may safely conclude the ref was not committed. From here on it
+    /// may not.
+    commit_state = CommitState::Uncertain;
     store->appendRefOps(target_ns, MutationScope::ref(final_ref_name),
         /// Capture the closure's INPUTS by value (ref name, manifest id, promote build id, repoint flag,
         /// and the manifest `body` it revalidates) rather than `[&]`, as defense-in-depth against a
@@ -1219,7 +1243,10 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
         },
         RootMutationOrigin::Writer, RootMutationKind::Promote);
 
-    precommitted = false;
+    commit_state = CommitState::Durable;
+    /// The owed terminal operation is discharged. `Settled`, not `NotAttempted`: the manifest body now
+    /// belongs to a committed ref, so it stays out of `cleanupStagedManifestDebrisBestEffort`'s reach.
+    precommit_state = PrecommitState::Settled;
     store->retireBuildSeq(build_seq);
     try
     {
@@ -1282,7 +1309,7 @@ void PartWriteTxn::abandon()
         /// this build's OWN thread); leave the precommit body, if any, for GC's
         /// delete-after-sealed-decrements exactly as the normal path does.
         alive = false;
-        precommitted = false;
+        precommit_state = PrecommitState::Settled;
         store->retireBuildSeq(build_seq);
         cleanupStagedManifestDebrisBestEffort();
         /// Audit emission is best-effort: a throwing sink (e.g. a bad_alloc growing the system-log
@@ -1320,21 +1347,37 @@ void PartWriteTxn::abandon()
     /// `appendRefOps` (the reliable append lane), not best-effort. It precedes the best-effort debris
     /// deletion below so a partial cleanup can never leave the precommit binding live without its
     /// body's GC release queued.
-    if (precommitted)
+    ///
+    /// `Uncertain` is treated EXACTLY as `Durable` here, and that is the point of the state existing: a
+    /// precommit that may be live owes the same removal a precommit that is live owes. The one
+    /// difference is the closure's tolerance below.
+    if (precommit_state == PrecommitState::Uncertain || precommit_state == PrecommitState::Durable)
     {
+        /// A removal whose `old_binding` names an ABSENT precommit is rejected by the state machine
+        /// (`RefTableState::applyOwnerTransition`, `RemovePrecommit`: "exact precommit binding to remove
+        /// is absent") -- so the removal is NOT unconditionally idempotent, and an `Uncertain` append
+        /// that in fact never landed would make every `abandon` of this build fail forever, destructor
+        /// retries included. Under `Uncertain` the closure therefore reads the CURRENT table state and
+        /// emits NO op when the binding is not there: same read, same flush, no race. Under `Durable`
+        /// the binding is known to have been appended, so an absent one is a genuine anomaly and the
+        /// strict form is kept -- a fail-closed error is the right report for it.
+        const bool tolerate_absent = precommit_state == PrecommitState::Uncertain;
         store->appendRefOps(precommit_target_ns, MutationScope::ref(precommit_final_ref),
-            /// By-value capture of the two values the closure reads (ref name + manifest) rather than
-            /// `[&]`: defense-in-depth so the closure is self-contained if it ever outlives this stack.
-            [ref_name = precommit_final_ref, manifest = precommit_manifest]
-            (const RefTableState &) -> std::vector<RefOp>
+            /// By-value capture of the values the closure reads (ref name, manifest and the tolerance
+            /// flag) rather than `[&]`: defense-in-depth so the closure is self-contained if it ever
+            /// outlives this stack.
+            [ref_name = precommit_final_ref, manifest = precommit_manifest, tolerate_absent]
+            (const RefTableState & state) -> std::vector<RefOp>
             {
+                if (tolerate_absent && !state.getPrecommits().contains({ref_name, manifest}))
+                    return {};
                 RefOp op;
                 op.kind = RefOpKind::OwnerTransition;
                 op.old_binding = RefOwnerBinding{RefOwnerKind::Precommit, ref_name, manifest};
                 return {op};
             },
             RootMutationOrigin::Writer, RootMutationKind::Abandon);
-        precommitted = false;
+        precommit_state = PrecommitState::Settled;
 
         try
         {
@@ -1355,9 +1398,10 @@ void PartWriteTxn::abandon()
     }
 
     /// `alive` flips to false only AFTER the correctness-bearing precommit removal above is durable: if
-    /// `appendRefOps` threw, `alive` stays true and `precommitted` stays true, so a caller that catches
-    /// the failure can retry `abandon()` on this same object. A retry after an ambiguous
-    /// already-appended failure re-validates `old_binding` and errors (or no-ops) -- it never corrupts.
+    /// `appendRefOps` threw, `alive` stays true and `precommit_state` keeps owing the removal, so a
+    /// caller that catches the failure can retry `abandon()` on this same object. A retry after an
+    /// ambiguous already-appended failure re-validates `old_binding` and errors (or, under the
+    /// `Uncertain` tolerance above, no-ops) -- it never corrupts.
     alive = false;
 
     /// No longer in-flight: retire the seq so the per-server active-build floor (`min_active`) can advance
@@ -1397,10 +1441,17 @@ void PartWriteTxn::cleanupStagedManifestDebrisBestEffort()
     /// is writer cleanup; a missed object is benign — the namespace-scoped orphan sweep reclaims it. Exact-token delete only; never
     /// throws. SKIP the manifest that became a live precommit owner: its body is a live precommit input
     /// whose deletion is GC's job after the sealed decrement (never writer-delete it).
+    ///
+    /// "Became a live precommit owner" is decided from the ATTEMPT, not from a confirmed append: any
+    /// state other than `NotAttempted` -- including `Uncertain`, where the precommit may or may not
+    /// exist -- protects the body. Deleting it under uncertainty is the unrecoverable direction (a
+    /// precommit that turns out to be live and whose body is gone clamps GC's fold barrier forever),
+    /// while keeping it is not: an unreferenced body is ordinary orphan-sweep debris.
+    const bool precommit_attempted = precommit_state != PrecommitState::NotAttempted;
     for (const ManifestId & id : staged_manifests)
     {
-        if (id.ref == precommit_manifest && id.root_namespace == precommit_target_ns)
-            continue;   /// the live precommit body — left for GC (delete-after-sealed-decrements)
+        if (precommit_attempted && id.ref == precommit_manifest && id.root_namespace == precommit_target_ns)
+            continue;   /// the (possibly) live precommit body — left for GC (delete-after-sealed-decrements)
         try
         {
             const String key = store->layout().manifestKey(id);
