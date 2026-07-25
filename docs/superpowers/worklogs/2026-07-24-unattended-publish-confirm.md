@@ -696,3 +696,33 @@ per-helper verdict, since "empty is legitimately fine here" is a decision worth 
 rule.
 
 After this lands there is genuinely nothing left that does not need the user, and I will say so and stop.
+
+## UNATTENDED ROUND CLOSED (18:0x UTC) — everything remaining needs a decision
+
+Landed today, in order: the 668 mount-fence classifier fix; a green 4h chaos soak (`PHASE3 OK`, 38 faults,
+27 checkpoints, dangling=0 throughout); the GC throughput-collapse RCA and the bottleneck study that gates
+its fixes; the retention-leak root cause and the CRITICAL LIST-as-journal data-loss finding, later
+MECHANISED in TLA+; four instrumentation changes (fsck `stale_edge`, unmatched-remove counter, deferred-round
+logging, `ca-inspect` run decoding); plan Tasks 9, 10, 17, 18 and Task 19's design note; a new ProfileEvent
+so the Task 18 fix does not erase its own signal; and the harness anti-vacuity sweep.
+
+Three defects were found by writing the tests rather than by the tests passing: the confirm's blocking
+`state_mutex` acquire stalling pool-wide append admission, the attempts-exhausted path reporting
+"(not unresolved)" in the most common wedge message, and every GC verdict in the scenario suite being
+vacuous. That ratio is worth remembering when judging what these rounds are for.
+
+OPEN, all requiring the user:
+1. **Authorization** for Tasks 11-16 — they modify `src/Storages/MergeTree/DataPartsExchange.cpp` and the
+   interserver wire protocol. Two standing rules cover that surface. The spec designs it and the user
+   reviewed the spec, but reviewed is not authorized.
+2. **Contract choice** for Task 19 — the design note recommends role-based observe-only and rules option
+   (b) out on verified evidence.
+3. **The critical fix** ({#list-as-journal-dataloss-2026-07-25}) — containment first (disable destructive
+   GC for this pool format), then an authoritative per-namespace chain and a complete-cut gate. A product
+   behaviour change plus a format bump; not startable unattended.
+4. Task 20 (S43), already deferred by the user.
+
+Also queued and not decision-blocked, if more unattended time is wanted later: the GC bottleneck study's
+deliverable 1 (per-phase round introspection), the S42 server-reachable failpoint without which that
+scenario can never return a conclusive green, and making `ca-fsck` fatal on `stale_edge` once the leak is
+fixed.
