@@ -1018,3 +1018,37 @@ Choose a fix with numbers attached, and re-run the rig as the regression gate. N
 budget is unsafe by construction: an omitted `+1` edge must suppress deletion, never permit it — so any
 bounded-round design has to carry durable progress state, which is why it needs a spec rather than a
 patch.
+
+## fsck vs GC disagree persistently about the same unreferenced blobs (found 2026-07-25, soak v3) {#fsck-gc-indegree-disagreement-2026-07-25}
+
+**LIVE REPRODUCTION EXISTS** on the ca-soak stand as left after soak v3 — do not `down -v` it without
+capturing more. Artifacts: `tmp/f6-unreachable/{fsck_detail.txt,the_56_keys.txt,drain_watch.txt}`.
+
+MEASURED on the idle stand, zero workload:
+- `ca-fsck`: `reachable=406 dangling=0 unreachable=56 pending_gc=0 awaiting_gc=56 unaccounted=0`, FLAT
+  across 8 samples over 5.3 min and again 8 min later. 56 blobs, 104,755 bytes.
+- All 56 classify as `AwaitingGc` (`CasFsck.cpp:582`) with the note "edges still in the GC snapshot; the
+  drop has not folded yet (expected)".
+- GC holds the lease and folds once per 10 s (rounds 325..334+ observed). Every fold: `candidates=0`.
+  `previewDeletes`: `dryrun_count=0`.
+
+So fsck's reachability walk finds no live reference to these blobs, while GC's in-degree view assigns
+them in-degree > 0 and never nominates them, and dozens of folds do not change either verdict. Exactly
+one of the two components is wrong: fsck over-reports unreferenced, or GC under-collects (a retention
+leak). WHICH IS NOT ESTABLISHED — do not accept a mechanism that has not been checked against the live
+stand; two GC mechanisms proposed this week from log reading alone turned out wrong.
+
+Note the fsck note's word "expected" is load-bearing and currently unearned: the state is only expected
+if a later fold clears it, and folds did not.
+
+Related: the ca-soak harness labels this population `(M-F debris, B140)` in `checker.py:544`,
+`run.py:555` and the checkpoint lines. That label is wrong on its own terms — the product classifies
+them as `AwaitingGc`, not as the abandoned-build/displaced-tree class the harness cites, and
+`unaccounted=0` throughout. Fix the harness label together with whatever this turns out to be, not
+before: the label change must not be what makes the number stop looking suspicious.
+
+Sub-finding (cosmetic, fix with the round introspection in
+[#gc-bottleneck-study-2026-07-25](#gc-bottleneck-study-2026-07-25)): the DEFER path returns at
+`CasGc.cpp:368` before `report.round` is assigned, so every skip-unchanged round logs as
+`CA GC round 0: candidates=0 …` and is indistinguishable from a round that folded and found nothing.
+That cost real diagnosis time here.
