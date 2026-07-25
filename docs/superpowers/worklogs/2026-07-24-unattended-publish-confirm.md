@@ -579,3 +579,15 @@ spec.
   expected at this stage, they were told to read the surrounding code carefully before editing and I1 in
   particular has a lot to read. Nothing else live (no ninja, no soak, no codex). Low host load (0.4) is
   normal: subagent work is model-side, not local CPU. Disk 327G, 62G RAM. Nothing to unstick.
+- 15:09 UTC — watchdog: instrumentation round COMPLETE and committed; nothing running, nothing to unstick.
+  Build clean, gate `unit_tests_dbms` 1335/1335 over 227 suites. Commits: `34f6d8967ec` (I1 fsck stale-edge
+  + harness parser), `d8ce5f77426` (I2 unmatched-remove counter + I3 deferred-round logging — they share
+  `CasGc.cpp`, so one commit), `84cefb2c224` (I4 ca-inspect run decoding), `ca5a6b7bee8` (third gate-filter
+  gap). Working tree clean of this round's files. Disk 327G, 62G RAM, load 0.8.
+  Two things worth carrying forward: the build failed first time on MY spec error (I2 logged a raw `UInt128`,
+  which fmt cannot format — fixed with `u128ToHex`); and building the gate filter BY ENUMERATION rather than
+  from the documented string exposed a third coverage gap, the parameterized `*/CasBackendContract` suites.
+  Next, per the user: back to the publish-confirm plan. Sequencing note stands — tasks 13-14 rewrite the
+  `tmp-fetch` lifecycle where the leak surfaced, so they belong after containment
+  (BACKLOG {#list-as-journal-dataloss-2026-07-25}); task 17 (S42) and task 9 (confirm-protocol TLA+ model)
+  do not conflict.
