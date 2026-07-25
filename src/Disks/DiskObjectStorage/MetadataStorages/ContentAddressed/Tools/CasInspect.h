@@ -14,7 +14,8 @@ namespace DB::Cas
 /// involved.
 ///
 /// Dispatch is by KEY SHAPE, most-specific first (`cas/manifests/.../NNNNNN.zst` before the
-/// `cas/refs/` root-shard prefix, `/mount` and `/fold_seal` suffixes, then the pool-wide `gc/state`
+/// `cas/refs/` root-shard prefix, `/mount` and `/fold_seal` suffixes, the
+/// `gc/gen/*/attempt/*/blob_target/*/*` source-edge run segments, then the pool-wide `gc/state`
 /// and `blobs/` prefix). u128 and hash fields render as lowercase hex strings (matching
 /// `u128ToHex`), while backend-native `Token` values render as escaped strings. Neither is exposed
 /// as an array of bytes or a raw struct dump.

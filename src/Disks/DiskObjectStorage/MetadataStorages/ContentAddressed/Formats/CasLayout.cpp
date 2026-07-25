@@ -1,9 +1,33 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Common/Exception.h>
+#include <charconv>
 
 namespace DB::Cas
 {
+
+namespace
+{
+
+/// Parses a canonical unsigned-decimal path segment (the shape `std::to_string` produces): non-empty,
+/// digits only, no leading zero unless the segment is exactly "0", and fits in a `uint64_t`. Returns
+/// `std::nullopt` for anything else -- never throws, since key parsing classifies a foreign/malformed
+/// segment as debris, not an error (mirrors `parseManifestKey`'s ordinal parse).
+std::optional<uint64_t> parseCanonicalU64(std::string_view s)
+{
+    if (s.empty() || (s.size() > 1 && s[0] == '0'))
+        return std::nullopt;
+    for (char c : s)
+        if (c < '0' || c > '9')
+            return std::nullopt;
+    uint64_t v = 0;
+    const auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
+    if (ec != std::errc{} || ptr != s.data() + s.size())
+        return std::nullopt;   /// overflowed uint64_t or otherwise not fully consumed
+    return v;
+}
+
+}
 
 /// Blob-key operations are kept together with their parsing inverse. `CasTypes.h` supplies the
 /// complete `BlobRef` type and the hash-algorithm helpers used to render and validate the path.
@@ -170,6 +194,65 @@ std::optional<ManifestId> Layout::parseManifestKey(std::string_view key) const
     parsed.ref.build_sequence = build->ref_sequence;
     parsed.ref.manifest_ordinal = ordinal;
     return parsed;
+}
+
+std::optional<ParsedBlobTargetRunKey> Layout::parseBlobTargetRunKey(std::string_view key) const
+{
+    const String base = prefix + "/gc/gen/";
+    if (!key.starts_with(base))
+        return std::nullopt;
+    std::string_view rest = key;
+    rest.remove_prefix(base.size());
+
+    /// Splits the next '/'-delimited segment off the front of `rest`, returning `std::nullopt` if
+    /// `rest` has no further '/' (an incomplete key shape).
+    auto takeSegment = [](std::string_view & s) -> std::optional<std::string_view>
+    {
+        const size_t sep = s.find('/');
+        if (sep == std::string_view::npos)
+            return std::nullopt;
+        const std::string_view seg = s.substr(0, sep);
+        s.remove_prefix(sep + 1);
+        return seg;
+    };
+
+    const auto generation_seg = takeSegment(rest);
+    if (!generation_seg)
+        return std::nullopt;
+    const auto generation = parseCanonicalU64(*generation_seg);
+    if (!generation)
+        return std::nullopt;
+
+    const auto attempt_lit = takeSegment(rest);
+    if (!attempt_lit || *attempt_lit != "attempt")
+        return std::nullopt;
+
+    const auto attempt_seg = takeSegment(rest);
+    if (!attempt_seg)
+        return std::nullopt;
+    const auto attempt = parseCanonicalU64(*attempt_seg);
+    if (!attempt)
+        return std::nullopt;
+
+    const auto blob_target_lit = takeSegment(rest);
+    if (!blob_target_lit || *blob_target_lit != "blob_target")
+        return std::nullopt;
+
+    const auto shard_seg = takeSegment(rest);
+    if (!shard_seg)
+        return std::nullopt;
+    const auto shard = parseCanonicalU64(*shard_seg);
+    if (!shard)
+        return std::nullopt;
+
+    /// `rest` is now the final segment (`seq`): reject trailing garbage (a further '/').
+    if (rest.find('/') != std::string_view::npos)
+        return std::nullopt;
+    const auto seq = parseCanonicalU64(rest);
+    if (!seq)
+        return std::nullopt;
+
+    return ParsedBlobTargetRunKey{*generation, *attempt, *shard, *seq};
 }
 
 /// A namespace must be non-empty, with no leading/trailing '/', no empty segment ("//"), and no

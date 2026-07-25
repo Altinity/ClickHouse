@@ -4,7 +4,9 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
+#include <IO/WriteBufferFromString.h>
 
 using namespace DB::Cas;
 
@@ -14,6 +16,11 @@ namespace
 ManifestRef manifestRef(uint64_t epoch, uint64_t seq, uint32_t ordinal)
 {
     return ManifestRef{epoch, seq, ordinal};
+}
+
+BlobRef bh(uint64_t n)
+{
+    return BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(UInt128(n))};
 }
 
 }
@@ -68,4 +75,54 @@ TEST(CasInspect, RendersCommittedRowWithNoPayloadSizeKey)
     const String json = caInspectToJson(layout, key, bytes);
     EXPECT_EQ(json.find("payload"), String::npos) << json;
     EXPECT_NE(json.find(R"("published_at_ms":42)"), String::npos) << json;
+}
+
+/// A blob-target source-edge run segment (`Layout::blobTargetRunKey`) is the ground truth for every
+/// in-degree question; `ca-inspect` decodes it with the typed `SourceEdgeRunView` reader (not by hand)
+/// and must distinguish an active edge from a condemned sentinel row, decoding the latter's fields.
+TEST(CasInspect, RendersBlobTargetRunEdgeAndCondemnedRows)
+{
+    const Layout layout("p");
+
+    /// `SourceEdgeRunWriter::append` requires non-decreasing `(ref, source_id)` order; the condemned
+    /// sentinel sorts first for its blob (source_id 0), and `bh(1) < bh(2)`, so appending in this
+    /// order already satisfies it.
+    SourceEdgeRecord condemned_rec;
+    condemned_rec.ref = bh(1);
+    condemned_rec.source_id = UInt128{0};
+    condemned_rec.marker = kCondemned;
+    condemned_rec.delete_pending = true;
+    condemned_rec.token = Token{.value = "etag-1", .type = TokenType::Emulated};
+    condemned_rec.size = 123;
+    condemned_rec.condemn_round = 7;
+    condemned_rec.marker_confirmed = true;
+
+    SourceEdgeRecord edge_rec;
+    edge_rec.ref = bh(2);
+    edge_rec.source_id = UInt128(9);
+    edge_rec.marker = kEdgeActive;
+
+    DB::WriteBufferFromOwnString out;
+    SourceEdgeRunWriter writer(out);
+    writer.append(condemned_rec);
+    writer.append(edge_rec);
+    writer.finish();
+    out.finalize();
+    const String bytes = out.str();
+
+    const String key = layout.blobTargetRunKey(/*generation*/2, /*attempt*/0, /*shard*/0, /*seq*/0);
+
+    const String json = caInspectToJson(layout, key, bytes);
+    EXPECT_NE(json.find(R"("object":"blob_target_run")"), String::npos) << json;
+    EXPECT_NE(json.find(R"("generation":2)"), String::npos) << json;
+    EXPECT_NE(json.find(R"("kind":"edge")"), String::npos) << json;
+    EXPECT_NE(json.find(R"("kind":"condemned")"), String::npos) << json;
+    EXPECT_NE(json.find(R"("delete_pending":true)"), String::npos) << json;
+    EXPECT_NE(json.find(R"("condemn_round":7)"), String::npos) << json;
+    EXPECT_NE(json.find(R"("value":"etag-1")"), String::npos) << json;
+    EXPECT_NE(json.find(R"("rows":2)"), String::npos) << json;
+    EXPECT_NE(json.find(R"("distinct_blobs":2)"), String::npos) << json;
+    EXPECT_NE(json.find(R"("edges":1)"), String::npos) << json;
+    EXPECT_NE(json.find(R"("condemned":1)"), String::npos) << json;
+    EXPECT_NE(json.find(R"("zero_markers":0)"), String::npos) << json;
 }

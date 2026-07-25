@@ -41,6 +41,18 @@ struct ParsedRefObjectKey
     bool operator==(const ParsedRefObjectKey &) const = default;
 };
 
+/// The result of `Layout::parseBlobTargetRunKey`: the (generation, attempt, shard, seq) coordinates
+/// recovered from a listed blob-target in-degree/delta run segment key.
+struct ParsedBlobTargetRunKey
+{
+    uint64_t generation = 0;
+    uint64_t attempt = 0;
+    uint64_t shard = 0;
+    uint64_t seq = 0;
+
+    bool operator==(const ParsedBlobTargetRunKey &) const = default;
+};
+
 /// Builds and parses object-storage keys for one content-addressed pool.
 ///
 /// `Layout` owns only the pool prefix; it does not own storage, cache state, or a pool-wide blob hash
@@ -261,6 +273,16 @@ public:
         return gcGenAttemptPrefix(generation, attempt) + "blob_target/"
                + std::to_string(shard) + "/" + std::to_string(seq);
     }
+
+    /// Inverse of `blobTargetRunKey`: parses
+    /// `<prefix>/gc/gen/<generation>/attempt/<attempt>/blob_target/<shard>/<seq>`. Strict: rejects a
+    /// missing/foreign top-level prefix, a missing `attempt`/`blob_target` literal segment, a missing
+    /// generation/attempt/shard/seq segment, a non-canonical decimal component (empty, non-digit, a
+    /// leading zero other than a bare "0", or a value that overflows `uint64_t`), or trailing garbage.
+    /// Foreign/malformed keys return `std::nullopt`, never throw -- callers (`ca-inspect`) classify by
+    /// key shape, not by validity. Defined out-of-line in `CasLayout.cpp`, where the key construction
+    /// and parsing helpers remain together.
+    std::optional<ParsedBlobTargetRunKey> parseBlobTargetRunKey(std::string_view key) const;
 
     /// Outcomes key: <prefix>/gc/gen/<generation>/attempt/<attempt>/outcomes/<round>/<shard>.zst
     /// The `.zst` suffix comes from the traits table (cas_gc_outcomes is the one Always-compressed
