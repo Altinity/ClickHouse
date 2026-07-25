@@ -376,3 +376,9 @@ ETA ~12:33 UTC. 330G free at start.
   free when it starts, i.e. above the 60G alert line. CONTINGENCY if the next tick undershoots ~205G:
   ~100 GB of docker artifacts are reclaimable without touching the running stand (43.9 GB unused local
   volumes incl. the 29.8 GB clickhouse_integration_tests_volume, 28.1 GB unused images, 4.4 GB build cache).
+- 09:29 UTC — watchdog: soak v3 t+0h56m healthy (STAGE mutations, 0 failures, log fresh). Disk 255G→215G
+  over the interval = 120 GB/h measured (not the 150 GB/h I estimated last tick); pool_bytes 100 GB,
+  throttle still pinned at max. 155 GB of headroom above the 60G line, `gc_checkpoint` starts 09:57 UTC.
+  Whether it reclaims is something to OBSERVE at the 09:49/10:09 ticks, not to predict — v2's 115 GB
+  reclaim was at a different pool size and is not a basis for extrapolation. Acting only on a measured
+  crossing.
