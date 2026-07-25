@@ -965,8 +965,10 @@ fiu_do_on(FailPoints::cas_relink_receiver_force_mechanism_failure, { return null
 ```
 
 `src/Common/FailPoint.cpp` is a SHARED UPSTREAM surface and sits outside {#upstream-authorization} — it is
-a registration line in a generic registry, not the CAS parts-exchange portion. Get the user's word before
-adding it. With the failpoint, `SYSTEM ENABLE FAILPOINT` plus `SYSTEM SYNC REPLICA` is a real test:
+a registration line in a generic registry, not the CAS parts-exchange portion. **APPROVED by the user
+2026-07-25**: adding the failpoint is authorized. Scope of that approval as exercised: the registration
+line(s) in that file and nothing else in it. This also unblocks Task 16 steps 1 and 3, which need their
+own injection points for the same reason. With the failpoint, `SYSTEM ENABLE FAILPOINT` plus `SYSTEM SYNC REPLICA` is a real test:
 unbraked it recurses to a stack overflow, braked it is exactly one relink attempt and then bytes.
 
 Note also: the plan's command lines use `python`, which is not on PATH in this environment — use `python3`.
