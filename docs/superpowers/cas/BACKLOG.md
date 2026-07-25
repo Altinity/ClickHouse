@@ -1271,3 +1271,30 @@ collect nothing.
 NOT ESTABLISHED: whether the prune raced the adopt, whether `snap_pruned_through=339` is inclusive of 339,
 or whether the parent-seal capture missed the carry. Needs the same treatment as the other GC findings: a
 targeted test, not log archaeology. Note the stand is still up.
+
+## THIRD gtest gate-filter gap: parameterized `*/CasBackendContract` suites match neither `Cas*` nor `CA*` (found 2026-07-25) {#gate-filter-gap-3-backend-contract}
+
+Found by ENUMERATING the binary's suites instead of trusting the documented filter — which is the only
+method that works here, two previous gaps having been found the hard way (see
+[[reference_ca_gtest_gate_filter]] and {#gate-filter-gap} above).
+
+`InMemory/CasBackendContract` and `Local/CasBackendContract` are value-parameterized, so their full test
+names begin with the instantiation prefix (`InMemory/CasBackendContract.X/0`). A `Cas*` or `CA*` pattern
+anchors at the start of the FULL name, so both suites — the backend contract itself, i.e. exactly the
+layer every GC and ref-lane conclusion rests on — were excluded from every battery run.
+
+CORRECTED FILTER, verified by enumeration against `--gtest_list_tests` on 2026-07-25:
+
+```
+Ca*:CA*:ContentAddressed*:CountingBackendShape*:RefSnapshotCodec*:RefTableCacheEviction*:RefWriter*:*CasBackendContract*
+```
+
+`Ca*` subsumes `Cas*` and also picks up `CaLifecycle`/`CaWiring` (gap 2). The trailing `*CasBackendContract*`
+is unanchored on purpose — that is the whole point. Runs 1335 tests over 227 suites; green as of
+`84cefb2c224`.
+
+Note `Cas*` also sweeps in `CascadeWriteBuffer`, which is unrelated to CAS and merely shares a prefix.
+Harmless (it passes), but do not read the suite count as "all CAS".
+
+LESSON, worth generalizing: a name-pattern gate silently under-tests and never reports what it skipped.
+Any gate defined by a glob should be re-derived from an enumeration periodically, not maintained by hand.
