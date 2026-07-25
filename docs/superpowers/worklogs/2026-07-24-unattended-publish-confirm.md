@@ -616,3 +616,12 @@ spec.
   failure direction is `Unknown`, so any path where a lagging or partially-recovered view could answer `Yes`
   is to be reported as a bug, not smoothed over. It was also given the CORRECTED battery filter and told
   1335/1335 was green at `ca5a6b7bee8`, so any red is its own.
+- 16:09 UTC — watchdog: Task 10 agent progressing well, nothing to unstick. It has written
+  `Pool/CasRefLedger.{h,cpp}`, `Pool/CasPool.h` and the new `src/Disks/tests/gtest_cas_confirm_exact_ref.cpp`,
+  built clean, and its battery run in `build/gate_task10.log` reports **1348/1348 PASSED over 228 suites**
+  (up from 1335/227 at `ca5a6b7bee8` — i.e. +13 new tests, +1 suite, no regressions). No build or test
+  process still executing, so the agent is in its write-up phase. Disk 327G, 62G RAM, load 1.3.
+  NOTE for the controller's own review when it reports: a green battery is necessary but not sufficient
+  here — the thing to check by hand is that no path can answer `Yes` from a lagging or partially-recovered
+  view, and that the zero-I/O rule is pinned by an actual `CountingBackend` assertion rather than by
+  inspection.
