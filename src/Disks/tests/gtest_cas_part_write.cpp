@@ -1672,12 +1672,18 @@ TEST(CasPartWriteTxn, AbandonAppendsPrecommitRemovalAndKeepsLivePrecommitBody)
         << "abandon must NOT writer-delete a live precommit body (delete-after-sealed-decrements)";
 
     /// (b) the exact precommit binding is gone (spec §Remove Precommit: an exact owner_transition
-    /// removal, old=Precommit new=none). Proven black-box: a FRESH precommitAdd for the SAME
-    /// (ref_name, manifest_ref) must succeed -- if abandon had failed to remove the exact binding, this
-    /// would instead throw CORRUPTED_DATA ("add precommit ... already exists").
+    /// removal, old=Precommit new=none). Proven black-box: a FRESH precommitAdd for the ref must
+    /// succeed -- if abandon had failed to remove the exact binding, this would instead throw
+    /// CORRUPTED_DATA ("add precommit ... already exists"). The probe manifest must be freshly staged
+    /// BY `rebuild` itself rather than re-precommitting `mid` (which `build`, a different transaction,
+    /// staged): A3 mint-tightening now refuses an unowned `ManifestId` from any transaction other than
+    /// the one that minted it, regardless of whether abandon's removal landed, so re-using `mid` here
+    /// would no longer distinguish the property under test. Content identity is irrelevant to the
+    /// ref-level owner-slot check this proves, so a fresh manifest is just as conclusive a probe.
     (void)abandoned_build_id;
     auto rebuild = startBuildFor(s, ns, "part_1");
-    EXPECT_NO_THROW(rebuild->precommitAdd(ns, "part_1", mid));
+    const ManifestId rebuild_mid = rebuild->stageManifest({blobManifestEntry("data.bin", "kept")});
+    EXPECT_NO_THROW(rebuild->precommitAdd(ns, "part_1", rebuild_mid));
 }
 
 /// BUG 2 regression for the never-precommitted path: a manifest that was STAGED but never precommitted is
@@ -1734,10 +1740,13 @@ TEST(CasPartWriteTxn, AbandonSwallowsThrowingEventSink)
 
     /// The precommit binding is gone despite the sink failure -- proven black-box exactly like
     /// `AbandonAppendsPrecommitRemovalAndKeepsLivePrecommitBody` above: a FRESH precommitAdd for the
-    /// SAME (ref_name, manifest_ref) must succeed (it would instead throw CORRUPTED_DATA "add
-    /// precommit ... already exists" had the throwing sink aborted the removal).
+    /// ref must succeed (it would instead throw CORRUPTED_DATA "add precommit ... already exists" had
+    /// the throwing sink aborted the removal). The probe manifest is freshly staged BY `rebuild`
+    /// itself, not `mid` (staged by `build`, a different transaction) -- A3 mint-tightening now refuses
+    /// a foreign id unconditionally, so re-using `mid` would no longer isolate the property under test.
     auto rebuild = startBuildFor(s, ns, "part_1");
-    EXPECT_NO_THROW(rebuild->precommitAdd(ns, "part_1", mid));
+    const ManifestId rebuild_mid = rebuild->stageManifest({blobManifestEntry("data.bin", "kept")});
+    EXPECT_NO_THROW(rebuild->precommitAdd(ns, "part_1", rebuild_mid));
 }
 
 namespace
@@ -1805,10 +1814,14 @@ TEST(CasPartWriteTxn, AbandonRetryableAfterAppendFailure)
     /// throw LOGICAL_ERROR "has been abandoned").
     EXPECT_NO_THROW(build->abandon());
 
-    /// The precommit binding really is gone now: a fresh precommitAdd for the same (ref, manifest)
-    /// succeeds (it would throw CORRUPTED_DATA "already exists" had the removal never landed).
+    /// The precommit binding really is gone now: a fresh precommitAdd for the ref succeeds (it would
+    /// throw CORRUPTED_DATA "already exists" had the removal never landed). The probe manifest is
+    /// freshly staged BY `rebuild` itself, not `mid` (staged by `build`, a different transaction) -- A3
+    /// mint-tightening now refuses a foreign id unconditionally, so re-using `mid` would no longer
+    /// isolate the property under test.
     auto rebuild = startBuildFor(s, ns, "part_1");
-    EXPECT_NO_THROW(rebuild->precommitAdd(ns, "part_1", mid));
+    const ManifestId rebuild_mid = rebuild->stageManifest({blobManifestEntry("data.bin", "kept")});
+    EXPECT_NO_THROW(rebuild->precommitAdd(ns, "part_1", rebuild_mid));
 }
 
 /// ------------------------------------------------------------------------------------------------

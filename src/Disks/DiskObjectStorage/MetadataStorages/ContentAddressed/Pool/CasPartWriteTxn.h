@@ -200,6 +200,14 @@ public:
     /// owner move over that same entry. Needs NO body-exists HEAD as a safety authority: GC and
     /// promotion handle a missing precommit manifest body by failing closed (a missing-body precommit
     /// is a non-activating, non-promotable intent).
+    ///
+    /// A3 mint-tightening: `id` must either be one THIS transaction minted via `stageManifest`, or
+    /// already be `final_ref_name`'s current committed manifest (the idempotent re-drive -- see the
+    /// closure in the .cpp). Any other id names a manifest this transaction never staged and does not
+    /// currently own -- most commonly one a DIFFERENT, since-abandoned/dropped transaction once staged
+    /// -- and granting it fresh ownership here would let a later exact-`ManifestRef` equality check
+    /// (the relink confirm) compare true against a token whose blobs may already be reclaimed (an ABA).
+    /// Rejected with `LOGICAL_ERROR`: this is a programming-invariant violation, never an operational one.
     void precommitAdd(const RootNamespace & target_ns, const String & final_ref_name, const ManifestId & id);
 
     /// Atomically promote the precommit to the committed ref with one `appendRefOps` call on the target ref's
@@ -332,6 +340,14 @@ private:
     ManifestRef precommit_manifest;
 
     std::vector<ManifestId> staged_manifests;             /// for best-effort abandon cleanup
+
+    /// Every `ManifestId` this transaction has minted via `stageManifest`, checked by `precommitAdd`
+    /// (A3 mint-tightening, spec 2026-07-23-cas-fetch-handoff-publish-confirm-design.md): an unowned
+    /// id may enter ownership only from the transaction that freshly staged it. Kept separate from
+    /// `staged_manifests` above -- that vector's role (best-effort abandon cleanup) is unrelated and
+    /// could change independently; this set exists purely as the ABA barrier's identity check, so it
+    /// stays correct even if the cleanup vector's contents or lifetime ever change.
+    std::set<ManifestId> staged_manifest_ids;
 
     std::map<DepKey, BlobDepRecord> deps;                 /// dependencies recorded by this build (blobs only)
 

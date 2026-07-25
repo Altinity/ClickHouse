@@ -914,6 +914,7 @@ ManifestId PartWriteTxn::stageManifest(std::vector<ManifestEntry> entries)
     });
 
     staged_manifests.push_back(id);
+    staged_manifest_ids.insert(id);   /// A3 mint-tightening: `precommitAdd`'s only legal fresh-ownership source
     return id;
 }
 
@@ -927,6 +928,16 @@ void PartWriteTxn::precommitAdd(const RootNamespace & target_ns, const String & 
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "precommitAdd: manifest namespace '{}' != target namespace '{}'",
             id.root_namespace.string(), target_ns.string());
+
+    /// A3 mint-tightening (ABA barrier for the relink confirm's exact-`ManifestRef` equality): an
+    /// unowned `ManifestId` may enter ownership only from the transaction that freshly staged it.
+    /// Evaluated HERE (synchronously, off this transaction's own private `staged_manifest_ids` --
+    /// never mutated concurrently, so no snapshot races) rather than read live inside the closure
+    /// below, because it does not depend on ledger state at all. The bool is captured BY VALUE into
+    /// the closure -- consistent with every other capture there -- rather than capturing `this`,
+    /// which would let a closure that outlives this stack (see the capture comment below) dereference
+    /// a dead transaction. Enforcement, however, is NOT done here: see the closure for why.
+    const bool id_staged_by_this_txn = staged_manifest_ids.contains(id);
 
     /// One `owner_transition` create-precommit op.
     /// No body HEAD — a missing body is a legal fail-closed, non-activating intent, unchanged from the
@@ -942,16 +953,34 @@ void PartWriteTxn::precommitAdd(const RootNamespace & target_ns, const String & 
         /// and manifest id) rather than `[&]`: defense-in-depth so a closure that ever outlives this
         /// stack frame (e.g. if the append lane stranded its item) never dereferences a dead stack. The
         /// ref-lane leadership guard is the real fix; this makes the closure self-contained regardless.
-        [pool = store, target_ns, final_ref_name, id](const RefTableState & state) -> std::vector<RefOp>
+        [pool = store, target_ns, final_ref_name, id, id_staged_by_this_txn](const RefTableState & state) -> std::vector<RefOp>
         {
             /// Idempotent re-add: the target ref is ALREADY committed to this EXACT manifest_ref (a
             /// legitimate re-drive calling precommitAdd+promote again for content that is already
             /// live -- see `promote`'s matching no-op guard). Nothing to append: re-adding a precommit
             /// for an already-owned manifest would violate "no conflicting owner may name the same
             /// manifest", which the state machine enforces for every OTHER case.
+            ///
+            /// A3 mint-tightening's enforcement lives HERE, gated on this SAME live-state read, rather
+            /// than unconditionally before the closure: a legitimate re-drive can be handed an id that
+            /// this exact `PartWriteTxn` object never staged (e.g. a fresh build re-precommitting
+            /// content a PRIOR, since-destroyed build already promoted -- `CasPromoteRepublish.
+            /// PromoteSameManifestIsIdempotent`). That case is not a fresh ownership grant: the manifest
+            /// is already `final_ref_name`'s live, currently-protected binding, so re-affirming it
+            /// creates no new ABA surface. Checking membership-or-committed-match atomically under the
+            /// SAME state read (rather than a separate pre-check against a possibly-stale resolve) is
+            /// what keeps this race-free: a snapshot taken before the closure could see "already
+            /// committed to id.ref" and let a later closure invocation append a fresh owner_transition
+            /// after a concurrent repoint moved the ref away from id.ref in between -- exactly the
+            /// re-ownership of a dropped identity this check exists to prevent.
             if (const auto it = state.getCommitted().find(final_ref_name);
                 it != state.getCommitted().end() && it->second.manifest_ref == id.ref)
                 return {};
+            if (!id_staged_by_this_txn)
+                throw Exception(ErrorCodes::LOGICAL_ERROR,
+                    "precommitAdd: manifest '{}' was not staged by this transaction and is not the current "
+                    "committed manifest of ref '{}' -- refusing to re-own a foreign or previously-dropped identity",
+                    manifestRefDebugString(id.ref), final_ref_name);
 
             std::vector<RefOp> ops;
             if (state.getLifecycle() != RefLifecycle::Live)

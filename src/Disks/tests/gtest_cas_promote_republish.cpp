@@ -26,6 +26,7 @@ namespace DB::ErrorCodes
 {
 extern const int ABORTED;
 extern const int NETWORK_ERROR;
+extern const int LOGICAL_ERROR;
 }
 
 using namespace DB::Cas;
@@ -274,12 +275,25 @@ TEST(CasPromoteRepublish, RepublishReDriveOverDifferentContentDstFailsClosed)
 /// build_seq, so the build stays active until that removal is durable and no freshness-window consumer
 /// judges the manifest build-dead while an un-removed precommit still names it (GC no longer reclaims
 /// abandoned precommits — the writer removes them itself).
-/// Assert the removal is present in the shard journal immediately after `abandon` returns.
-/// (This test passes both before AND after the reorder -- the removal is emitted either way. Its value
-/// is as a regression guard that `abandon` still emits the removal after the reorder. The reorder's
-/// *ordering* correctness -- that GC cannot observe the pre-reorder window -- is not deterministically
-/// reproducible as a timing race in a unit test; it is covered structurally by this reorder plus the
-/// TLA+ `WAbandonPrecommit` model.)
+///
+/// A3 mint-tightening (spec 2026-07-23-cas-fetch-handoff-publish-confirm-design.md §A3) INVERTS this
+/// test's original tail assertion. Before A3, this test's black-box PROOF that `abandon()` had really
+/// removed the exact precommit binding was that a FRESH `precommitAdd` for the SAME (ref_name,
+/// manifest_ref) succeeded -- a still-live binding would instead throw CORRUPTED_DATA ("add precommit
+/// ... already exists"). That proof mechanism no longer works: `rebuild` is a DIFFERENT `PartWriteTxn`
+/// from `build` and never staged `id` itself (`build` did), so `precommitAdd` now refuses it
+/// UNCONDITIONALLY under A3 -- regardless of whether abandon's removal ever landed. Re-owning a
+/// dropped identity from a transaction that did not mint it would let a later relink confirm's exact
+/// `ManifestRef` equality (Part B of the same design) compare true against a token whose blobs may
+/// already be reclaimed -- an ABA the whole publish-confirm design depends on being structurally
+/// impossible. The removal-before-retire property this test used to prove is unaffected by A3 and
+/// stays covered by the TLA+ `WAbandonPrecommit` model; `PrecommitAddRejectsAnIdThisTxnDidNotStage`
+/// below is the dedicated A3 regression pin.
+///
+/// `rebuild->precommitAdd(ns, ref, id)` below throws `LOGICAL_ERROR`, which aborts the whole process in
+/// debug/sanitizer builds instead of behaving like a catchable exception -- `CasPromoteRepublishDeathTest.
+/// AbandonEmitsRemovalBeforeRetireAborts` below proves the abort positively in those builds instead.
+#ifndef DEBUG_OR_SANITIZER_BUILD
 TEST(CasPromoteRepublish, AbandonEmitsRemovalBeforeRetire)
 {
     auto b = std::make_shared<InMemoryBackend>();
@@ -291,11 +305,98 @@ TEST(CasPromoteRepublish, AbandonEmitsRemovalBeforeRetire)
     build->precommitAdd(ns, ref, id);
     build->abandon();
 
-    /// Task 10: the exact precommit-removal transaction is proven black-box (spec §Remove Precommit):
-    /// a FRESH precommitAdd for the SAME (ref_name, manifest_ref) must succeed -- if abandon had left
-    /// the exact binding live, this would instead throw CORRUPTED_DATA ("add precommit ... already
-    /// exists").
+    /// `rebuild` never staged `id` -- A3 refuses it on that basis alone, before ever reaching the
+    /// ledger-state check that would otherwise distinguish "removed" from "still live".
     auto rebuild = s->beginPartWrite(PartWriteInfo{.intended_ref = ns.string() + "/" + ref, .intended_namespace = ns});
-    EXPECT_NO_THROW(rebuild->precommitAdd(ns, ref, id))
-        << "abandon() must append the exact precommit-removal transaction before returning";
+    try
+    {
+        rebuild->precommitAdd(ns, ref, id);
+        FAIL() << "A3 mint-tightening: precommitAdd must refuse an id 'rebuild' never staged, even one "
+                  "'build' legitimately staged and precommitted before dropping it via abandon()";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::LOGICAL_ERROR);
+    }
 }
+#endif
+
+#if defined(DEBUG_OR_SANITIZER_BUILD)
+TEST(CasPromoteRepublishDeathTest, AbandonEmitsRemovalBeforeRetireAborts)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = openPool(b);
+    const RootNamespace ns{"srv/tbl@cas@"};
+    const String ref = "all_0_0_0";
+    auto build = s->beginPartWrite(PartWriteInfo{.intended_ref = ns.string() + "/" + ref, .intended_namespace = ns});
+    const ManifestId id = build->stageManifest(inlineEntries("f", "AAA"));
+    build->precommitAdd(ns, ref, id);
+    build->abandon();
+
+    auto rebuild = s->beginPartWrite(PartWriteInfo{.intended_ref = ns.string() + "/" + ref, .intended_namespace = ns});
+    EXPECT_DEATH({ rebuild->precommitAdd(ns, ref, id); }, "");
+}
+#endif
+
+/// A3 mint-tightening's dedicated regression pin: an unowned `ManifestId` may enter ownership ONLY
+/// from the transaction that freshly staged it. Without this, a dropped identity could be re-owned
+/// later, which would make the relink confirm's exact-`ManifestRef` equality an ABA (the same token
+/// could then name a manifest whose blobs were already reclaimed). No production path performs this
+/// transition -- every real caller precommits an id it JUST staged itself, on the SAME `PartWriteTxn`
+/// (`ContentAddressedTransaction.cpp:358,412`, `PartFolderAccess.cpp:352`).
+///
+/// `txn2->precommitAdd(ns, ref, id)` below throws `LOGICAL_ERROR`, which aborts the whole process in
+/// debug/sanitizer builds instead of behaving like a catchable exception -- `CasPromoteRepublishDeathTest.
+/// PrecommitAddRejectsAnIdThisTxnDidNotStageAborts` below proves the abort positively in those builds
+/// instead (it cannot also re-check the post-throw ref-log-tail/resolveRef state this test verifies,
+/// since there IS no post-abort state in a real debug/sanitizer build).
+#ifndef DEBUG_OR_SANITIZER_BUILD
+TEST(CasPromoteRepublish, PrecommitAddRejectsAnIdThisTxnDidNotStage)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = openPool(b);
+    const RootNamespace ns{"srv/tbl_mint_tighten@cas@"};
+    const String ref = "all_0_0_0";
+
+    /// txn1 mints `id` and abandons before ever precommitting it -- a genuinely unowned identity (it
+    /// was never even a live precommit), the simplest form A3 must still refuse for a foreign txn.
+    auto txn1 = s->beginPartWrite(PartWriteInfo{.intended_ref = ns.string() + "/" + ref, .intended_namespace = ns});
+    const ManifestId id = txn1->stageManifest(inlineEntries("f", "AAA"));
+    txn1->abandon();
+
+    const size_t tail_before = s->tailSinceSnapshotCountForTest(ns);
+
+    /// txn2 never staged `id` -- only the transaction that minted an id may precommit it.
+    auto txn2 = s->beginPartWrite(PartWriteInfo{.intended_ref = ns.string() + "/" + ref, .intended_namespace = ns});
+    try
+    {
+        txn2->precommitAdd(ns, ref, id);
+        FAIL() << "A3 mint-tightening: precommitAdd must refuse an id staged by a DIFFERENT transaction";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::LOGICAL_ERROR);
+    }
+
+    /// Nothing was appended: the ref-log tail is unchanged and `ref` still has no owner at all.
+    EXPECT_EQ(s->tailSinceSnapshotCountForTest(ns), tail_before);
+    EXPECT_FALSE(s->resolveRef(ns, ref).has_value());
+}
+#endif
+
+#if defined(DEBUG_OR_SANITIZER_BUILD)
+TEST(CasPromoteRepublishDeathTest, PrecommitAddRejectsAnIdThisTxnDidNotStageAborts)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = openPool(b);
+    const RootNamespace ns{"srv/tbl_mint_tighten@cas@"};
+    const String ref = "all_0_0_0";
+
+    auto txn1 = s->beginPartWrite(PartWriteInfo{.intended_ref = ns.string() + "/" + ref, .intended_namespace = ns});
+    const ManifestId id = txn1->stageManifest(inlineEntries("f", "AAA"));
+    txn1->abandon();
+
+    auto txn2 = s->beginPartWrite(PartWriteInfo{.intended_ref = ns.string() + "/" + ref, .intended_namespace = ns});
+    EXPECT_DEATH({ txn2->precommitAdd(ns, ref, id); }, "");
+}
+#endif
