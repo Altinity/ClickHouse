@@ -551,3 +551,27 @@ The stand is being LEFT UP — it is a live reproduction, and tearing it down de
   since last write — well inside the 15 min threshold. Partial conclusion already visible in the stream:
   "the source refutes a per-namespace write-order inversion, but it does support a cursor-coverage
   failure" — i.e. my ordering-inversion hypothesis looks REFUTED. Waiting.
+
+## Instrumentation round (started 14:4x UTC, user: "усилить инструментацию, потом возвращаемся к плану")
+
+Four changes dispatched in parallel, all observability-only, none touching the protocol. Each agent was
+told NOT to commit and NOT to build (shared checkout — the controller commits with pathspecs and builds
+once, per [[feedback_shared_worktree_git_index_races]]).
+
+- **I1 (opus) — fsck flags edges whose source manifest is gone.** The headline gap: fsck already reads the
+  in-degree run AND enumerates every manifest, so it can build the live `sourceEdgeId` set and flag any
+  edge not in it. Rule: a blob keeps `AwaitingGc` if ANY of its edges names a present manifest (legitimate
+  — unowned manifest debris still holds edges); only when ALL its edges name absent manifests is it the new
+  `StaleEdge` class, because then the in-degree can never reach zero. Detail-mode only: the summary path
+  must not gain a request, the soak's fixpoint poll calls it in a loop.
+- **I2 (sonnet) — count unmatched remove deltas.** Today a remove whose key is absent is a silent no-op with
+  no counter. Caller-side counting preferred over plumbing a logger into a per-edge inner loop.
+- **I3 (sonnet) — a deferred round must stop logging as `round 0`.** The defer path returns before
+  `report.round` is assigned, so skip-unchanged rounds are indistinguishable from folds that found nothing;
+  today that read as "GC is dead" and cost real time.
+- **I4 (sonnet) — `ca-inspect` must decode source-edge runs.** The ground truth for every edge question is
+  currently unreadable by our own tool; I had to pull raw bytes through the `s3` table function.
+
+Deliberately NOT in this round: the journal-gap detection and the authoritative per-namespace chain — those
+are the FIX (BACKLOG {#list-as-journal-dataloss-2026-07-25} items 1-2), not instrumentation, and they need a
+spec.
