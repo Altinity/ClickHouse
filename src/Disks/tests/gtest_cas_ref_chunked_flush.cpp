@@ -69,8 +69,22 @@ namespace
 PoolPtr openPool(const BackendPtr & backend)
 {
     /// A fresh pool with no residue, mirroring the T7 carve suite's `openPool`.
+    ///
+    /// The FROZEN clock is load-bearing, not hygiene. `CasMountRuntime::refAppendFenceOk` gates every
+    /// controlled attempt against `boot_ms_fn`, and with the compiled defaults (mount_lease_ttl_ms
+    /// 30000, safety margin 7000) a pool opened on the REAL clock fences itself ~23s later — no
+    /// background renewal advances that deadline in a unit-test pool. Every test in this suite is
+    /// about chunking and op-caps, none about wall-clock lease behaviour, so any of them that runs
+    /// long enough simply dies of an unrelated fence trip: `DropNamespaceOverOpCapSucceeds` (5200
+    /// refs) takes 43-65s under a sanitizer and failed deterministically on all three sanitizer CI
+    /// builds with `txn is UNCERTAIN (retry budget exhausted)` — the pre-attempt fence reject, not a
+    /// real retry exhaustion. Same artifact, same fix as
+    /// `CasPartWriteTxn.ManifestCapEncodedBytesJustUnderStagesSuccessfully` (2026-07-18): decouple the
+    /// fence from execution speed. The waits in this file are `steady_clock` timeouts on futures and
+    /// condvars, which are unaffected by this injection.
     DB::Cas::tests::seedPoolMetaForRestart(*backend);
-    return Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    return Pool::open(backend, PoolConfig{
+        .pool_prefix = "p", .server_root_id = "test", .boot_ms_fn = [] { return uint64_t{0}; }});
 }
 
 /// A legal blob-free part: stage an empty manifest, precommit, promote -- enough to leave one
@@ -406,6 +420,10 @@ PoolPtr openPoolWith(const BackendPtr & backend, PoolConfig cfg)
     DB::Cas::tests::seedPoolMetaForRestart(*backend);
     cfg.pool_prefix = "p";
     cfg.server_root_id = "test";
+    /// Same frozen clock as `openPool` above, and for the same reason — see its comment. Defaulted
+    /// rather than forced, so a future test that IS about lease timing can still supply its own.
+    if (!cfg.boot_ms_fn)
+        cfg.boot_ms_fn = [] { return uint64_t{0}; };
     return Pool::open(backend, cfg);
 }
 
