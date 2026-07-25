@@ -853,3 +853,16 @@ fixed.
   receiver's `+1`" but "confirm answered Yes from a stale row" — which I put to the user as a reason to
   move the chain ahead of the soak rather than after it. Awaiting that call.
   Disk 332G, load low. Nothing stuck.
+- 23:09 UTC — watchdog: the review-fix agent is working across the whole affected chain —
+  `Pool/CasPartWriteTxn.{h,cpp}` (the uncertain-precommit blocker), `Parts/PartFolderAccess.{h,cpp}`
+  (promote outcome + move assignment), `Pool/CasRefLedger.{h,cpp}` (the "`No` is a proof of the negative"
+  header correction) and the exchange/metadata-storage pair (the promote's typed outcome). `build_fixes.log`
+  is current, load 2.2 — a build is in flight. Disk 332G, 62G RAM. Nothing stuck.
+  Note for my own future self: the other `build/*fixes*` logs are from earlier, unrelated sessions (19:07,
+  12:10, 08:41 local) — mine is `build_fixes.log` at 01:09. I have now been misled by same-named build logs
+  twice today; check mtimes before reading one as evidence.
+  Also corrected this tick, on the user's challenge: review "blocker 1" is NOT a Part B defect
+  (BACKLOG {#partb-review-blocker1-downgraded}). `confirmExactRef` reads the same runtime state that
+  `resolveRef` serves reads from, so it inherits the mount's trust rather than creating a new assumption —
+  the reviewer stated a true fact and attributed it to the wrong component, and I accepted that without
+  checking the boundary. That also withdraws my own argument for moving the journal chain ahead of the soak.
