@@ -809,3 +809,11 @@ fixed.
   POSITIVE proof the relink path ran (`CasBlobPut == 0`, or the "no bytes transferred" log line reachable
   only after a confirm yes plus a successful promote), and step 7 must prove the inverse — that the byte
   fallback actually ran, not merely that the query succeeded.
+- 21:29 UTC — watchdog: Task 16 running with all eight steps now in scope; the user approved the failpoint
+  (`d9ce072efe9`) and I passed it to the already-running agent rather than spawning a second one onto the
+  same test files. Editing has started. VERIFIED the authorization boundary rather than trusting it: the
+  `src/Common/FailPoint.cpp` diff is three lines and is registration ONLY — `cas_relink_receiver_force_mechanism_failure`
+  (REGULAR, for the brake) and `cas_relink_receiver_pause_before_confirm` (PAUSEABLE_ONCE, for the race
+  window), plus a line-continuation backslash. Nothing else in that file.
+  No build or test process running yet; `tests/integration/test_log.txt` appeared untracked and is run
+  debris — not to be committed. Disk 332G, load 0.7. Nothing to unstick.
