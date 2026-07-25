@@ -1344,3 +1344,45 @@ cluster is indistinguishable, from the outside, from one that does not. If a sta
 evidence, that has to be enforced (a lock file the cards honour, or a separate compose project), not
 merely written in a log — the same "a note is not a mechanism" failure as the harness whitelists found
 today.
+
+### DECISION 2026-07-25 (user): option C — catch it by the tail first, because the diagnosis is NOT confirmed {#list-as-journal-decision-c}
+
+Chosen over containment (disable destructive GC now) and over going straight to the journal chain.
+Reasoning recorded because the reasoning is the load-bearing part:
+
+- The pool is PRE-RELEASE with no production data at risk, so the present cost of the hole is possible
+  data loss in our OWN test pools — bad for attributing soak failures, not a loss of anything valuable.
+- Containment would disable GC exactly while we are building a soak gate to exercise GC, would break the
+  soak's disk budget (the last run reclaimed 124 GB at a single checkpoint), and would MASK the other GC
+  defects already in this backlog.
+- The chain + complete-cut fix is right but is protocol state plus a format bump, and it would cut across
+  Part B, which is mid-flight.
+
+**The user's qualification, which changes the design and not merely the wording: the LIST hypothesis is
+still UNCONFIRMED.** A holey page was never directly observed; it survives by elimination and is
+mechanised in TLA+, which proves the mechanism is SUFFICIENT, not that it is what happened.
+
+CONSEQUENCE — the detector must not be built for that hypothesis. A LIST-hole detector catches only a
+LIST hole; if the record is instead lost further down the pipeline (delta routing across gc shards, the
+reducer, the run flush) such a detector stays silent AND manufactures false confidence. So detect the
+EFFECT, mechanism-agnostically: *the fold cursor advanced past a transaction that was never applied.*
+
+Two cheap, complementary probes, neither assuming a cause:
+1. **The store lied** — after paginating the ref prefix and BEFORE advancing any cursor, re-derive the id
+   set independently and require agreement. A mismatch means the object store gave two different answers
+   about the same durable prefix; suppress destructive actions for the round and log loudly.
+2. **We dropped it** — count records intended-to-fold versus actually-applied per round and require
+   equality. This is the half a LIST-focused detector would miss entirely.
+
+Plus the mirror SAFETY test from the RCA, which is valuable independent of any of this: omit a second
+live owner's `+1`, fold the first owner's `-1`, drive graduation, and assert the live blob is never
+deleted. That pins "a missing `+1` suppresses deletion" BEFORE the protocol gets rewritten, not after.
+
+NOTE the detector is not free to design: id gaps are LEGITIMATE — Task 18 (landed today, `252ccbdf2d4`)
+deliberately leaves a safe gap when an append is refused before any attempt. So "a hole in the sequence"
+is not by itself an anomaly. An object that EXISTS in the store at or below the cursor and was never
+applied is unambiguous; a gap with no object is not.
+
+COMMITMENT attached to this choice, stated by the controller and accepted implicitly by choosing C: the
+real fix (the authoritative per-namespace chain and the complete-cut gate) lands BEFORE release. C makes
+the defect visible; it does not prevent it.
