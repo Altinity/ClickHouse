@@ -224,3 +224,48 @@ No row is worse than baseline; the small improvements are most plausibly machine
 drift over four days rather than a real speedup from this change, and I am not claiming otherwise.
 The predicted cost — one extra COW copy per chunk — is bounded by `BM_ScratchCopy` (58 ns, O(1)) and
 is invisible at this resolution.
+- 04:09 UTC — watchdog: idle again with Part A complete; started the enabling step for the two remaining program items (S42 run + 4h soak), both of which need a server binary: 'ninja -C build clickhouse' under nohup -> tmp/unattended/build_server.log. Not new scope — it is the prerequisite for plan Task 17 and the soak. Resources before launch: load 0.43, 333G free, 65G RAM.
+- 04:29 UTC — watchdog: idle, healthy, nothing stuck (load 0.35, 333G free, 65G RAM). Server binary is BUILT and current (build/programs/clickhouse, 06:10 local). No soak stand is up (only the long-lived minikube/buildkit containers, 4 days old, unrelated). Round is between steps again: the two remaining program items (S42 card + run, 4h soak) are both unblocked and neither is startable from a watchdog turn — the S42 card is plan Task 17, i.e. real implementation work. Flagging for the next non-watchdog turn; nothing lost, nothing at risk.
+- 04:49 UTC — watchdog: idle, healthy, nothing stuck (load 0.44, 333G free, 64G RAM; HEAD 069f966c24f, src/ clean, server binary current). Second consecutive idle check with the round incomplete: remaining items are plan Task 17 (write the S42 card) and the 4h soak. Both are unblocked; neither is startable from a watchdog turn, and unlike the earlier stalls there is no protective/blocker-clearing action left to take — writing the card is implementation work proper. No action.
+- 05:1x UTC — watchdog: THIRD consecutive idle check with the round incomplete, so I started the
+  binding constraint rather than log another no-op. Reasoning: the 4h soak is the longest pole in the
+  user's own 4-item program and does NOT depend on S42; if it is not started it cannot finish, which
+  would fail the program's stated goal outright. Nothing was in flight (no race with other work) and
+  no scope was invented (item 4 of the user's list).
+  Brought up the default stand (`docker compose up -d`: rustfs1 + keeper1 + ch1 + ch2, ch1 healthy)
+  and verified it is running OUR binary with the CA disk (version 26.6.1.20000.altinityantalya,
+  `system.disks` shows disk `ca` type ObjectStorage — the compose mounts
+  ../../build/programs/clickhouse over /usr/bin/clickhouse, so this is the Part-A build).
+  Soak: `python3 -m soak.run --seed 1 --phase 3 --duration 4h --insert-mode sync` under nohup ->
+  `tmp/unattended/soak_4h.log`. Sync inserts per the README (async retries lose rows via the
+  dedup-token-vs-part hazard B139 — not what we want to measure). Started clean: ledger 720000 ops,
+  8570 mutations, 80 chaos faults scheduled over the window, 4 SELECT workers, first metrics tick OK.
+  S42 (plan Task 17) deliberately NOT started in parallel — it needs the same stand and would
+  contend with the soak for it.
+
+## Finding F4 (2026-07-24 ~05:3x UTC) — the 4h soak could not have finished: ~150 GB/h disk burn
+
+Caught by the watchdog's resource check, not by a failure. Measured, not estimated: free space
+333G -> 302G in the first ~20 min, then a controlled 2-minute sample gave **5 GB / 2 min = ~150 GB/h**
+against 298 GB free — i.e. ENOSPC at roughly t+2h of a 4h run, which would have taken the machine
+down with it rather than producing a result.
+
+WHERE (measured, not guessed): `utils/ca-soak/logs` grew only 86 MB / 2 min (~2.5 GB/h), so the logs
+were NOT it. The remainder is the Docker anonymous volumes holding the rustfs pool and the two
+servers' local data. This is the known physical-footprint amplification: rustfs does no background
+compaction and retains overwrite versions (rustfs#3231), so the PHYSICAL footprint tracks total write
+VOLUME, not live data — the soak's own `--max-pool-gb` throttle bounds the LOGICAL pool (it was
+correctly pacing at 40 GB) and cannot bound this.
+
+ACTION: stopped the soak ~30 min in (nothing lost — zero checkpoints had run, so no result was
+discarded), `docker compose down -v` to drop the soak's OWN volumes — that alone returned free space
+to 333 GB, confirming the attribution — brought the stand back up clean, and relaunched with
+`--max-pool-gb 12` (was 40). Rationale for the knob rather than a shorter run: it preserves the
+duration the user asked for and keeps the workload shape, just paced; a 4h run that dies at hour 2 is
+worth less than a 4h run that completes at lower intensity. Deliberately did NOT reclaim space by
+pruning Docker images/volumes or the older `logs_archive`: on this shared box those belong to other
+sessions (minikube, buildx, tc_1_*, zk-monotonicity-tester) and to prior runs' evidence.
+
+Relaunched: `--seed 1 --phase 3 --duration 4h --insert-mode sync --max-pool-gb 12` ->
+`tmp/unattended/soak_4h_v2.log`. Watchdog must keep sampling free space; if the burn still projects
+past the budget, the next step is to shorten the run rather than to delete other people's data.
