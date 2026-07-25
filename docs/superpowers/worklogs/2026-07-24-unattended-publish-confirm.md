@@ -762,3 +762,10 @@ fixed.
   Task 12 committed (`41a248fd9c5`, 1361/1361); all four user decisions recorded (`128392e6fe3`); the
   execution order agreed with the user is 13-16 → codex review of all Part B → fixes → the four follow-ups
   → soak (20 min to stability, then 4h).
+- 19:29 UTC — watchdog: Task 13 agent active and healthy — `DataPartsExchange.cpp`, the exchange interface,
+  the metadata storage and two test files written; server build finished 21:27 local; its battery is
+  RUNNING right now (`unit_tests_dbms`, 109 s in). The planner agent has not written its documents yet at
+  ~35 min, which is still within reason given it must read four decisions, a superseded design note, the GC
+  intake code AND check a CI job definition; nothing to act on, but it is the one to watch next tick.
+  Note the `build/*task13*` logs from 16:xx belong to an EARLIER, unrelated task numbering from a previous
+  round — mine are the 21:xx ones. Disk 331G, load 1.9.
