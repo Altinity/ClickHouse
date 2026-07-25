@@ -1158,3 +1158,87 @@ event log can lose buffered rows. Log-derived uncancelled edges came to 80 again
 truth of 56, so some rows ARE missing. The per-manifest conclusion is still safe: a manifest's `+1` and
 `-1` are emitted microseconds apart inside one fold, so losing the `-1` while keeping all twenty `+1`s
 is not a plausible loss pattern.
+
+## *** CRITICAL / RELEASE-BLOCKER: GC treats a paginated `LIST` as the journal, so a single incomplete page can silently DELETE LIVE DATA (2026-07-25) *** {#list-as-journal-dataloss-2026-07-25}
+
+Independent RCA by codex gpt-5.6-sol (xhigh) on the facts-only package in `tmp/leak-rca/`, dispatched
+after the retention leak in [#unmatched-minus-one-retention-leak](#unmatched-minus-one-retention-leak).
+It REFUTED my ordering-inversion hypothesis and found a worse defect. Full output:
+`tmp/leak-rca/codex_rca.log`. The load-bearing step was re-verified by the controller (see below).
+
+**The defect.** GC discovers ref-log transactions by paginating `LIST(cas/refs/)`, groups the returned
+keys per namespace, and folds those above the namespace cursor (`CasGc.cpp:829`, `:1033`). The listing
+API gives a continuation cursor but NO snapshot token, high-water mark, or contiguity proof
+(`CasBackend.h:359`, `CasObjectStorageBackend.cpp:1083`), and transaction ids are not required to be
+contiguous — there is no gap check anywhere in the fold. The cursor then advances "per FULLY folded
+log", i.e. per record the round happened to SEE. A record omitted from one page is therefore skipped
+permanently: on later rounds it sorts at or below the cursor and is ignored, ref-log cleanup may delete
+it (`CasGc.cpp:1502` requires cursor coverage, not proof the record was applied), and the orphan sweep
+may then reclaim the manifest body (`CasOrphanManifestSweep.cpp:197`).
+
+CONTROLLER VERIFICATION of the two load-bearing claims: the comment at `CasGc.cpp:1035-1037` does say
+"the durable cursor advances per FULLY folded log", and `grep -niE "contiguous|gap|prev_txn"` over
+`CasGc.cpp` returns nothing that checks for a hole. Both hold.
+
+**BLAST RADIUS — this is a data-loss class, not a leak class.** The listing/cursor logic is
+operation-agnostic, so it can drop a `+1` exactly as easily as a `-1`:
+1. manifest `M1` owns blob token `B`; edge `E1` is known to GC.
+2. a new live manifest `M2` adopts the SAME deduplicated token `B`.
+3. `M2`'s `+1` is omitted from a listing page while GC advances past it.
+4. `M1` is removed and its `-1` folds normally.
+5. GC now sees zero edges for `B`, condemns it, graduates it, and deletes it by exact token —
+   while `M2` still references it.
+Exact-token deletion does NOT protect against this: `M2` references that exact token. Condemnation
+protects writes that occur AFTER condemnation; it cannot protect an already-committed owner whose `+1`
+was skipped. Dedup is what turns a silently-skipped `+1` into a deletion, which is why the observed
+symptom so far has only been retention.
+
+**What the observed 56 blobs are:** the benign polarity of the same defect. And per codex the rate is
+NOT 4-in-48,791 independent failures — the removals were batched (two refs share one `at_version`), so
+it is closer to ONE holey scan affecting four refs.
+
+**Origin of the holey page is NOT established** and is not recoverable from the captured state.
+Candidates: rustfs returning an incomplete/inconsistent page; S3 continuation behaviour under
+concurrent mutation; a bug in or below the iterator. Note ordinary concurrent append during a CORRECT
+paginated scan is NOT sufficient — a later same-namespace record was returned while an already-durable
+earlier one was not, which requires a real hole in the return set.
+
+**Fix plan (codex's, ordered).**
+0. **Containment:** disable destructive GC for the current pool format — blob graduation/deletion,
+   ref-log cleanup, orphan-manifest cleanup. Folding and diagnostics continue. A pool whose journal
+   coverage cannot be proven must not delete.
+1. **Replace LIST-as-journal with an authoritative per-namespace chain:** immutable `prev_txn_id` on
+   each transaction; an exact-addressed CAS-updated namespace head whose update IS the commit point;
+   an add-only exact-addressed namespace registry (itself chained — discovering namespaces by `LIST`
+   would recreate the defect). Format bump, no dual protocol (pre-release).
+2. **Make destructive GC conditional on a complete cut:** capture registry cut + per-namespace heads at
+   round start, traverse exact predecessor links back to the sealed cursor, require an exact meet; on
+   any unreadable/unvalidatable link, discard that namespace's fold and GLOBALLY suppress destructive
+   actions for the round (an unproven namespace may reference any blob). `LIST` becomes cleanup
+   inventory only, never evidence of completeness.
+3. **Ordering + diagnostics:** carry `(txn_id, op_ordinal)` into `BlobDelta` and validate by explicit
+   journal order; COUNT unmatched `-1`s, head-chain gaps, cursor/head lag, and cleanup attempts on
+   unproven records; preserve suspect logs on any anomaly instead of cleaning them.
+4. **Recovery:** format bump + fresh pools; for the affected pool keep destructive GC off or recreate
+   from authoritative replicas. NOTE `ca-gc-rebuild` is NOT a sufficient release fix — it also
+   discovers ref state through listing.
+
+**Reproduction (primary regression test):** subclass `CasInMemoryBackend`, seed `A` (owner-add),
+`R` (its owner-remove), `H` (later harmless record); have the first ref-prefix `LIST` return `A` and `H`
+but filter out `R`, while exact `GET(R)` still works. Assert today: cursor advances to `H`, a residual
+`+1` survives, restoring the listing does not cancel it. Add the MIRROR SAFETY TEST: omit a second live
+owner's `+1`, fold the first owner's `-1`, drive graduation, and assert the live blob is never deleted.
+
+**Codex's corrections to my evidence, accepted:** M5's event-log argument is supportive, not conclusive
+(add and remove may fold in different rounds, so a restart can keep one batch and lose the other) — the
+source-edge run plus the durable `ref_drop` plus the reclaimed removal logs is the stronger argument.
+M3 proves no OBSERVED transaction hit an absent body, not that every transaction was observed — which is
+exactly why the clamp never engaged. M4's silent no-op is real but probably not exercised here: the
+evidence supports "the remove never reached the reducer", not "it folded first". M8 is fold lag, not
+journal inversion.
+
+**Relationship to the publish-confirm plan:** Task 1 already pins `[UNMATCHED-MINUS-ONE]`, but only in
+the no-premature-deletion direction (see its own test comment). The retention direction is unpinned, and
+this entry shows the deletion direction is reachable by a DIFFERENT route than the counter-regression
+Task 1 guards. Tasks 13-14 (wire protocol, receiver flow) rewrite the very `tmp-fetch` lifecycle where
+this surfaced — sequence them AFTER containment, or attribution of future findings will be hopeless.
