@@ -28,6 +28,48 @@ enum class CasWriteOutcome : uint8_t
     Unresolved,
 };
 
+/// WHY a controlled write came back `Unresolved`. Purely diagnostic today: the outcome the caller
+/// acts on is unchanged, and nothing branches on this. It exists because `Unresolved` covers two
+/// materially different states, and telling them apart is the difference between a five-minute
+/// triage and an hour of it.
+///
+/// `NoAttemptSent` is the one that carries real information: both pre-attempt gates (the mount fence
+/// and the operation deadline) reject BEFORE anything reaches the backend, so on the very first
+/// iteration the key is PROVABLY unwritten — there is no ambiguity to resolve, only a lost right to
+/// write. Every other reason leaves an object that may or may not be durable, which is what the
+/// wedge/resolve machinery exists for. See the backlog item on not wedging a lane in the
+/// `NoAttemptSent` case; that is a protocol change and deliberately NOT part of this diagnostic.
+enum class CasUnresolvedReason : uint8_t
+{
+    NotUnresolved,     /// the call did not return Unresolved
+    NoAttemptSent,     /// a pre-attempt gate rejected on the FIRST iteration: nothing was ever sent
+    FenceLostMidWay,   /// >= 1 attempt was sent, then the mount fence dropped
+    DeadlineMidWay,    /// >= 1 attempt was sent, then the operation deadline left no room for another
+    FenceLostPostWrite,/// an attempt COMMITTED but the fence had dropped by the time it returned
+    AttemptsExhausted, /// the genuine case the "retry budget exhausted" wording describes
+};
+
+/// Human-readable tail for an exception or log line, so the two states above stop reading alike.
+constexpr std::string_view describeUnresolvedReason(CasUnresolvedReason reason)
+{
+    switch (reason)
+    {
+        case CasUnresolvedReason::NotUnresolved:      return "not unresolved";
+        case CasUnresolvedReason::NoAttemptSent:      return "no attempt was sent (the mount fence or the "
+                                                             "operation deadline rejected before the first "
+                                                             "request) — the key is provably unwritten";
+        case CasUnresolvedReason::FenceLostMidWay:    return "the mount fence dropped after at least one "
+                                                             "attempt had been sent";
+        case CasUnresolvedReason::DeadlineMidWay:     return "the operation deadline ran out after at least "
+                                                             "one attempt had been sent";
+        case CasUnresolvedReason::FenceLostPostWrite: return "an attempt committed but the mount fence had "
+                                                             "dropped before it returned";
+        case CasUnresolvedReason::AttemptsExhausted:  return "the attempt budget was exhausted without a "
+                                                             "definite outcome";
+    }
+    return "unspecified";
+}
+
 /// The success path: `buf.finalize()` returned without throwing. Always Committed — kept as a named,
 /// counted entry point so both paths of a classify-then-record call site read the same way (see the
 /// exception overload below).
@@ -276,8 +318,18 @@ public:
     /// the attempt's own `PutResult` token, or the token the resolve GET observed when it proved an
     /// earlier ambiguous attempt landed. Lets audit emitters (e.g. `PartWriteTxn::stageManifest`'s
     /// `ManifestPut` event) keep the token without a follow-up HEAD. Untouched on any other return.
+    /// `out_reason` (optional): WHY an `Unresolved` was returned. Diagnostic only — the returned
+    /// outcome is unchanged, so no caller's decision depends on it. It exists because `Unresolved`
+    /// currently conflates two very different situations, and the resulting message
+    /// ("retry budget exhausted") is printed even where NOTHING was ever sent: finding #37 defect 3,
+    /// whose own note records that the opacity "plausibly fed 3 prior wrong analyses" — and it did so
+    /// again on 2026-07-24, when a sanitizer-slow unit test fenced itself and the text sent the CI
+    /// triage looking for a retry problem that did not exist. `NoAttemptSent` is the load-bearing
+    /// distinction: it means the key was provably never written, whereas the other reasons leave a
+    /// possibly-durable object behind.
     CasWriteOutcome putIfAbsentControlled(std::string_view key, std::string_view bytes,
-                                          const std::function<bool()> & fence_ok, Token * out_token = nullptr);
+                                          const std::function<bool()> & fence_ok, Token * out_token = nullptr,
+                                          CasUnresolvedReason * out_reason = nullptr);
 
     /// One-shot exact-key resolution of an uncertain immutable create:
     ///   - identical bytes observed at `key`  -> Committed (the earlier attempt DID commit)

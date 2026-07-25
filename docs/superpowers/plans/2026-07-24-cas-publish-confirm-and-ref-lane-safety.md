@@ -992,6 +992,63 @@ plus `utils/ca-soak/scenarios/BACKLOG.md` §s42-allocation-fault-soak (read BOTH
 
 ---
 
+## Task 18: do not wedge a ref lane when no attempt was ever sent (finding #37 defect 3, behavioural half)
+
+The diagnostic half landed separately: `putIfAbsentControlled` now reports WHY it returned
+`Unresolved` via `CasUnresolvedReason`, and `CasUnresolvedReason::NoAttemptSent` marks the case where
+both pre-attempt gates (mount fence, operation deadline) rejected on the FIRST iteration — the key is
+provably unwritten. This task acts on that fact; it is deliberately separate because it changes
+protocol behaviour, not a message.
+
+**The problem.** `commitRefChunk`'s `Unresolved` arm wedges the table's append lane unconditionally.
+A wedge is the right response to genuine ambiguity — an object that may or may not be durable, which
+only `resolveByExactGet` can settle. But on `NoAttemptSent` nothing was ever sent, so there is nothing
+to resolve, and the wedge is pure cost: it blocks EVERY ref append for that table on this replica
+(inserts included) until the key resolves or the mount is remounted, and a GET-based resolution of a
+key that was never written can never resolve — it stays `Unresolved` forever. So a transient fence
+blip during the pre-attempt gate currently costs a table its write availability until remount.
+
+**Files:**
+- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp`
+  (`commitRefChunk`'s `Unresolved` arm, and the same decision in the wedge-resolution path)
+- Test: `src/Disks/tests/gtest_cas_ref_install_safety.cpp`
+
+**Interfaces:** consumes `CasUnresolvedReason` from
+`Backend/CasRequestControl.h`; produces no new public surface.
+
+- [ ] **Step 1: Write the failing test.** Drive a `NoAttemptSent` rejection (a fence that is already
+  false when `commitRefChunk` is entered — `ChunkFaultBackend` is not even needed, the fence hook is
+  enough) and assert: the caller gets a retry-later error, `refLaneWedgedForTest(ns)` is FALSE, and a
+  subsequent append on the same table succeeds without a remount. Then the contrast case: a genuinely
+  ambiguous PUT (`Mode::Unresolved`) must STILL wedge — that assertion already exists as
+  `UnresolvedAlwaysRecordsTheWedge`, so extend rather than duplicate it.
+
+- [ ] **Step 2: Run — the no-wedge assertion fails** (today the lane wedges in both cases).
+
+- [ ] **Step 3: Implement.** In the `Unresolved` arm, skip the wedge install when the reason is
+  `NoAttemptSent`: complete the survivors with the same retry-later error (unchanged), leave
+  `rt->wedge` disengaged, and leave the allocated txn id as a safe gap (it already is one — ids are
+  not required to be contiguous, `CasRefProtocol.cpp` only enforces strict increase). Keep the
+  prepared wedge construction where it is: it is allocation-free to discard, and building it before
+  the PUT is what makes the ambiguous path safe.
+
+- [ ] **Step 4: Prove the safety argument in the comment, not just in the commit message.** The claim
+  is "no attempt was sent, therefore the key is unwritten, therefore there is nothing a wedge could
+  resolve". It rests on both pre-attempt gates returning before `backend->putIfAbsent` — state that,
+  and state the counterexample it excludes (a fence lost AFTER an attempt is `FenceLostMidWay`, which
+  keeps wedging).
+
+- [ ] **Step 5: TLA.** The wedge is part of the append-lane's at-most-one-unresolved-PUT contract, so
+  extend the ref-lane model with a `NoAttemptSent` transition and re-check that
+  "every durable object is either applied or wedged" still holds. If the existing model has no
+  pre-attempt gate, adding one is the work.
+
+- [ ] **Step 6: Run the full CAS gate; Step 7: Commit.**
+
+Subject: `ca: a pre-attempt fence reject no longer wedges the lane (finding #37 defect 3)`
+
+---
+
 ## Self-Review
 
 **Spec coverage:** §A1 → Tasks 3-6; §A2 → Task 7; §A3 → Task 8; §confirm-primitive gate 1 → Task

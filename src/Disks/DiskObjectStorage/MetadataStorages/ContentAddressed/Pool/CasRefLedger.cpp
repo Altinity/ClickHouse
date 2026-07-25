@@ -1892,9 +1892,13 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
     armApplyPending(*rt);
 
     CasWriteOutcome outcome{};
+    /// Diagnostic only (finding #37 defect 3): says WHY an Unresolved came back, so the wedge message
+    /// stops claiming an exhausted retry budget when in fact no request was ever sent.
+    CasUnresolvedReason unresolved_reason = CasUnresolvedReason::NotUnresolved;
     try
     {
-        outcome = ref_request_controller->putIfAbsentControlled(prepared_wedge.key, prepared_wedge.bytes, fence_ok);
+        outcome = ref_request_controller->putIfAbsentControlled(
+            prepared_wedge.key, prepared_wedge.bytes, fence_ok, /*out_token=*/nullptr, &unresolved_reason);
     }
     catch (...)
     {
@@ -2070,10 +2074,11 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
             }
             ProfileEvents::increment(ProfileEvents::CasRefAppendWedged);
             complete_error(chunk_survivors, makeCasWriteRetryLaterExceptionPtr(fmt::format(
-                "CAS ref-log append for namespace '{}' txn {}-{} is UNCERTAIN (retry budget exhausted) — "
+                "CAS ref-log append for namespace '{}' txn {}-{} is UNCERTAIN ({}) — "
                 "the append lane is wedged until the SAME key resolves durable or a conclusive rejection "
                 "is observed; this outcome is unproven, not failure",
-                ns.string(), id.writer_epoch, id.ref_sequence)));
+                ns.string(), id.writer_epoch, id.ref_sequence,
+                describeUnresolvedReason(unresolved_reason))));
             return false;
         }
     }

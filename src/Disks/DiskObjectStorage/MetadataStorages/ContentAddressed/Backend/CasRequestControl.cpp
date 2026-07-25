@@ -268,11 +268,22 @@ CasWriteOutcome CasRequestController::resolveByExactGet(std::string_view key, st
 }
 
 CasWriteOutcome CasRequestController::putIfAbsentControlled(
-    std::string_view key, std::string_view bytes, const std::function<bool()> & fence_ok, Token * out_token)
+    std::string_view key, std::string_view bytes, const std::function<bool()> & fence_ok, Token * out_token,
+    CasUnresolvedReason * out_reason)
 {
     const String key_s{key};
     const String bytes_s{bytes};
     const uint64_t deadline_ms = now_ms() + budget.operation_deadline_ms;
+    /// Diagnostic bookkeeping only -- nothing below branches on it (finding #37 defect 3).
+    uint32_t attempts_sent = 0;
+    const auto unresolved = [&](CasUnresolvedReason reason)
+    {
+        if (out_reason)
+            *out_reason = reason;
+        return CasWriteOutcome::Unresolved;
+    };
+    if (out_reason)
+        *out_reason = CasUnresolvedReason::NotUnresolved;
 
     for (uint32_t attempt = 1; attempt <= budget.max_attempts; ++attempt)
     {
@@ -280,9 +291,12 @@ CasWriteOutcome CasRequestController::putIfAbsentControlled(
         /// local mount fence must still hold, and there must be enough of the operation's own deadline
         /// left for one more attempt to plausibly complete. Neither check sends anything to the backend.
         if (!fence_ok())
-            return CasWriteOutcome::Unresolved;
+            return unresolved(attempts_sent == 0 ? CasUnresolvedReason::NoAttemptSent
+                                                 : CasUnresolvedReason::FenceLostMidWay);
         if (now_ms() + budget.attempt_timeout_ms > deadline_ms)
-            return CasWriteOutcome::Unresolved;
+            return unresolved(attempts_sent == 0 ? CasUnresolvedReason::NoAttemptSent
+                                                 : CasUnresolvedReason::DeadlineMidWay);
+        ++attempts_sent;
 
         /// The committed incarnation's token, filled by whichever leg proves Committed below.
         Token committed_token;
@@ -330,14 +344,14 @@ CasWriteOutcome CasRequestController::putIfAbsentControlled(
         if (!fence_ok())
         {
             ProfileEvents::increment(ProfileEvents::CasConditionalWriteFenceLostPostWrite);
-            return CasWriteOutcome::Unresolved;
+            return unresolved(CasUnresolvedReason::FenceLostPostWrite);
         }
         if (out_token)
             *out_token = committed_token;
         return CasWriteOutcome::Committed;
     }
 
-    return CasWriteOutcome::Unresolved;   /// attempt budget exhausted without a definite outcome
+    return unresolved(CasUnresolvedReason::AttemptsExhausted);   /// budget exhausted, no definite outcome
 }
 
 CasCreateResult CasRequestController::conditionalCreateControlled(
