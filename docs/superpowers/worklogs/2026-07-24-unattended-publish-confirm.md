@@ -791,3 +791,8 @@ fixed.
   Also warned it that the plan's line numbers for those callers are STALE (`:8125`/`:8281` vs the real
   `:3386`/`:3514`/`:5632`/`:5818`) and that other line refs in that plan deserve the same suspicion — and to
   check `src/CMakeLists.txt` for the cppexpr leftover before finishing, since that bit us once today.
+- 20:49 UTC — watchdog: Task 15 in its write-up phase, healthy. Battery **1368 PASSED** (1366 at
+  `260a6f81169`, so +2), server build just finished. Two things verified rather than assumed:
+  `src/Storages/StorageReplicatedMergeTree.cpp` is UNTOUCHED — the stricter boundary held and the plan's
+  Step 4 was indeed unnecessary — and `src/CMakeLists.txt` is clean, so the cppexpr leftover did not
+  recur. Disk 332G, load 2.2. Nothing to unstick.
