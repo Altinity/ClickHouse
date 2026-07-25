@@ -1345,8 +1345,8 @@ TEST(CasWiringGc, DroppedPartIsReclaimedByRounds)
 
     EXPECT_FALSE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0"));
     /// The relink offer (B7 part_manifest_v2): a reclaimed part is no longer a committed CA part here,
-    /// so getPartManifestBytes offers NOTHING and the sender streams bytes — the documented fallback.
-    EXPECT_FALSE(exchange->getPartManifestBytes("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0").has_value());
+    /// so getRelinkOffer offers NOTHING and the sender streams bytes — the documented fallback.
+    EXPECT_FALSE(exchange->getRelinkOffer("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0").has_value());
 
     /// A fresh identical write re-CREATES the content at the same key and reads back fine.
     auto tx3 = storage->createTransaction();
@@ -1431,10 +1431,13 @@ TEST(CasWiringGc, DisplacedTreeBlobsReclaimedThroughRealPath)
 
 /// ==== M-W Task 11 / B7: the DataPartsExchange facade (manifest relink, part_manifest_v2) ====
 
-/// B7 sender side: getPartManifestBytes returns the COMMITTED part's encoded PartManifest body — the
+/// B7 sender side: getRelinkOffer returns the COMMITTED part's encoded PartManifest body — the
 /// opaque payload the receiver decodes. The bytes must decode to the same entries the part was
 /// published with; an absent part offers nothing (the sender streams bytes — the documented fallback).
-TEST(CasWiringExchange, GetPartManifestBytesReturnsBodyForCommittedPart)
+/// Task 13 adds the second half of the offer: the confirm token, which must name the SAME manifest the
+/// body carries. That equality is the offer's whole safety property — a token naming anything else
+/// would have the receiver confirm a manifest whose entries it never adopted.
+TEST(CasWiringExchange, GetRelinkOfferReturnsBodyAndTokenForCommittedPart)
 {
     auto storage = openWiringStorage();
     /// Publish a real committed part (data.bin + a projection blob + mutable per-part files).
@@ -1444,22 +1447,34 @@ TEST(CasWiringExchange, GetPartManifestBytesReturnsBodyForCommittedPart)
     ASSERT_NE(exchange, nullptr);
     EXPECT_FALSE(exchange->getPoolUUID().empty());
 
-    auto bytes = exchange->getPartManifestBytes("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0");
-    ASSERT_TRUE(bytes.has_value());
-    EXPECT_FALSE(bytes->empty());
+    auto offer = exchange->getRelinkOffer("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0");
+    ASSERT_TRUE(offer.has_value());
+    EXPECT_FALSE(offer->manifest_bytes.empty());
 
     /// The transferred body decodes to the SAME entries the part names — the blob entries AND the
     /// per-part files (uuid.txt/metadata_version.txt are ordinary tree entries now, all-tree Task 6/9).
     /// The sender's ManifestRef/namespace/digest are present but non-authoritative downstream.
-    const DB::Cas::PartManifest decoded = DB::Cas::decodePartManifest(*bytes);
+    const DB::Cas::PartManifest decoded = DB::Cas::decodePartManifest(offer->manifest_bytes);
     ASSERT_EQ(decoded.entries.size(), 4u);
     EXPECT_EQ(decoded.entries[0].path, "data.bin");
     EXPECT_EQ(decoded.entries[0].ref.digest.toU128(), u128Of("payload-A"));
     EXPECT_EQ(decoded.entries[2].path, "p.proj/data.bin");
     EXPECT_EQ(decoded.entries[2].ref.digest.toU128(), u128Of("payload-B"));
 
+    /// The token: it decodes, it names this mount and this pool, and it names the manifest that the
+    /// body just decoded to.
+    const auto token = DB::decodeCasRelinkSourceToken(offer->confirm_token);
+    ASSERT_TRUE(token.has_value()) << "the sender minted a token its own decoder rejects: " << offer->confirm_token;
+    EXPECT_EQ(token->pool_uuid, exchange->getPoolUUID());
+    EXPECT_EQ(token->root_namespace, storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111").string());
+    EXPECT_EQ(token->ref_name, "all_1_1_0");
+    EXPECT_EQ(token->part_name, "all_1_1_0");
+    EXPECT_EQ(token->manifest_ref_text, DB::Cas::manifestRefDebugString(decoded.ref));
+    EXPECT_TRUE(exchange->ownsNamespace(token->server_root_id, token->root_namespace))
+        << "the minted token must route back to the mount that minted it";
+
     /// An absent part is not a committed CA part here -> no offer.
-    EXPECT_FALSE(exchange->getPartManifestBytes("a11/a11a11a1-1111-4111-8111-111111111111/all_9_9_9").has_value());
+    EXPECT_FALSE(exchange->getRelinkOffer("a11/a11a11a1-1111-4111-8111-111111111111/all_9_9_9").has_value());
 }
 
 /// B7 receiver side (the core): take a COMMITTED part's transferred manifest bytes and adopt them into
@@ -1477,8 +1492,9 @@ TEST(CasWiringExchange, AdoptPartFromManifestPublishesFreshLocalManifest)
     auto * exchange = dynamic_cast<DB::IContentAddressedExchange *>(storage.get());
     ASSERT_NE(exchange, nullptr);
 
-    auto bytes = exchange->getPartManifestBytes("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0");
-    ASSERT_TRUE(bytes.has_value());
+    auto offer = exchange->getRelinkOffer("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0");
+    ASSERT_TRUE(offer.has_value());
+    const String & bytes = offer->manifest_bytes;
     const DB::Cas::ManifestId sender_id =
         storage->store()->resolveRef(sender_ns, "all_1_1_0")->manifest_id;
 
@@ -1492,7 +1508,7 @@ TEST(CasWiringExchange, AdoptPartFromManifestPublishesFreshLocalManifest)
 
     /// Adopt into a DIFFERENT table (a22a22a2-2222-4222-8222-222222222222). The transferred body's root_namespace_id is the sender's
     /// (a11a11a1-1111-4111-8111-111111111111) — the receiver must IGNORE it and use a22a22a2-2222-4222-8222-222222222222.
-    const bool ok = exchange->adoptPartFromManifest("a22a22a2-2222-4222-8222-222222222222", "tmp-fetch_all_1_1_0", *bytes);
+    const bool ok = exchange->adoptPartFromManifest("a22a22a2-2222-4222-8222-222222222222", "tmp-fetch_all_1_1_0", bytes);
     EXPECT_TRUE(ok);
 
     /// The adopted ref is live in the RECEIVER namespace and loadable.
@@ -1535,8 +1551,9 @@ TEST(CasWiringExchange, AdoptFailsClosedAndFallsBackOnCondemnedBlob)
 
     auto * exchange = dynamic_cast<DB::IContentAddressedExchange *>(storage.get());
     ASSERT_NE(exchange, nullptr);
-    auto bytes = exchange->getPartManifestBytes("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0");
-    ASSERT_TRUE(bytes.has_value());
+    auto offer = exchange->getRelinkOffer("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0");
+    ASSERT_TRUE(offer.has_value());
+    const String & bytes = offer->manifest_bytes;
 
     /// Artificially delete a referenced pool blob — the live-sender invariant excludes this on the real
     /// path; §4 promote does not re-probe it, so adopt trusts the manifest edge and publishes.
@@ -1547,7 +1564,7 @@ TEST(CasWiringExchange, AdoptFailsClosedAndFallsBackOnCondemnedBlob)
               DB::Cas::DeleteOutcome::Kind::Deleted);
 
     /// §4: promote trusts the adopted leaves — no re-probe — so adopt SUCCEEDS (returns true) and publishes.
-    const bool ok = exchange->adoptPartFromManifest("a22a22a2-2222-4222-8222-222222222222", "tmp-fetch_all_1_1_0", *bytes);
+    const bool ok = exchange->adoptPartFromManifest("a22a22a2-2222-4222-8222-222222222222", "tmp-fetch_all_1_1_0", bytes);
     EXPECT_TRUE(ok) << "§4: adopt trusts the manifest edge; a raced pool blob is not re-probed at promote";
 
     /// The receiver ref publishes (the D4 trade-off), and the deleted pool blob surfaces via fsck's
@@ -1585,14 +1602,15 @@ TEST(CasWiringExchange, AdoptPartFromManifestSelfContainedWithoutMutableFilesSid
 
     auto * exchange = dynamic_cast<DB::IContentAddressedExchange *>(storage.get());
     ASSERT_NE(exchange, nullptr);
-    auto bytes = exchange->getPartManifestBytes("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0");
-    ASSERT_TRUE(bytes.has_value());
-    const DB::Cas::PartManifest decoded = DB::Cas::decodePartManifest(*bytes);
+    auto offer = exchange->getRelinkOffer("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0");
+    ASSERT_TRUE(offer.has_value());
+    const String & bytes = offer->manifest_bytes;
+    const DB::Cas::PartManifest decoded = DB::Cas::decodePartManifest(bytes);
     ASSERT_EQ(decoded.entries.size(), 3u) << "uuid.txt/metadata_version.txt travel as ordinary entries";
 
     /// No sidecar parameter to pass anymore — exactly what Fetcher::relinkPartToDisk's call looks like
     /// now that the manifest is self-contained (no reconstruction from a wire-transferred header).
-    const bool ok = exchange->adoptPartFromManifest("a22a22a2-2222-4222-8222-222222222222", "tmp-fetch_all_1_1_0", *bytes);
+    const bool ok = exchange->adoptPartFromManifest("a22a22a2-2222-4222-8222-222222222222", "tmp-fetch_all_1_1_0", bytes);
     EXPECT_TRUE(ok);
 
     const auto receiver_ns = storage->liveNamespace("a22a22a2-2222-4222-8222-222222222222");

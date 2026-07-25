@@ -15,6 +15,7 @@
 #include <Common/MemoryTracker.h>
 
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <exception>
@@ -22,6 +23,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -721,20 +723,17 @@ void commitExchangePart(DB::ContentAddressedMetadataStorage & storage)
     tx->commit(DB::NoCommitOptions{});
 }
 
-/// The token fields the sender will mint for the committed part: the namespace and the manifest
-/// reference the RECEIVER gets, read back out of the very manifest body that is put on the wire.
-struct SourceToken
+/// The token the sender mints for the committed part, decoded back into its fields. Read through the
+/// real offer path rather than reconstructed, so the tests below exercise exactly what goes on the wire.
+DB::CasRelinkSourceToken readSourceToken(const DB::ContentAddressedMetadataStorage & storage)
 {
-    String root_namespace;
-    String manifest_ref_text;
-};
-
-SourceToken readSourceToken(const DB::ContentAddressedMetadataStorage & storage)
-{
-    const auto manifest_bytes = storage.getPartManifestBytes(kExchangePartDir);
-    EXPECT_TRUE(manifest_bytes.has_value()) << "the committed part must offer a manifest to relink";
-    const auto manifest = decodePartManifest(*manifest_bytes);
-    return SourceToken{manifest.root_namespace_id.string(), manifestRefDebugString(manifest.ref)};
+    const auto offer = storage.getRelinkOffer(kExchangePartDir);
+    EXPECT_TRUE(offer.has_value()) << "the committed part must offer a manifest to relink";
+    if (!offer)
+        return {};
+    const auto token = DB::decodeCasRelinkSourceToken(offer->confirm_token);
+    EXPECT_TRUE(token.has_value()) << "the sender minted a token its own decoder rejects";
+    return token.value_or(DB::CasRelinkSourceToken{});
 }
 
 }
@@ -770,6 +769,104 @@ TEST(CasConfirmExactRef, ManifestRefTextRoundTripsAndRejectsMalformedTokens)
         EXPECT_FALSE(tryParseManifestRef(malformed).has_value())
             << "accepted a malformed manifest reference: '" << malformed << "'";
     }
+}
+
+
+/// Task 13, the confirm token's wire codec (spec §wire-protocol). The token is minted by the sender,
+/// stored nowhere, and handed back by an untrusted peer, so the only property that matters is that
+/// decode is the exact inverse of encode: the fields the sender meant are the fields that route and
+/// compare. A codec that merged two fields, or that let a separator through unescaped, would let a
+/// peer aim a confirm at a namespace the sender never named.
+TEST(CasConfirmExactRef, SourceTokenRoundTripsThroughItsWireForm)
+{
+    const auto round_trip = [](const DB::CasRelinkSourceToken & token, const char * what)
+    {
+        const auto text = DB::encodeCasRelinkSourceToken(token);
+        ASSERT_TRUE(text.has_value()) << what;
+        /// The wire form is cookie-safe and URL-safe by construction: only the RFC 3986 unreserved set,
+        /// the escape character, and the field separator ever appear in it.
+        for (const char ch : *text)
+            EXPECT_TRUE(std::isalnum(static_cast<unsigned char>(ch))
+                        || std::string_view("-._~%|").find(ch) != std::string_view::npos)
+                << "the wire form leaked an unsafe character '" << ch << "' from " << what << ": " << *text;
+
+        const auto decoded = DB::decodeCasRelinkSourceToken(*text);
+        ASSERT_TRUE(decoded.has_value()) << what << ": " << *text;
+        EXPECT_EQ(decoded->pool_uuid, token.pool_uuid) << what;
+        EXPECT_EQ(decoded->server_root_id, token.server_root_id) << what;
+        EXPECT_EQ(decoded->root_namespace, token.root_namespace) << what;
+        EXPECT_EQ(decoded->ref_name, token.ref_name) << what;
+        EXPECT_EQ(decoded->part_name, token.part_name) << what;
+        EXPECT_EQ(decoded->manifest_ref_text, token.manifest_ref_text) << what;
+    };
+
+    round_trip({"abcdef0123456789", "srv1", "srv1/store/abc/abcdef@cas@", "all_1_1_0", "all_1_1_0", "1:1:1"},
+               "the ordinary shape");
+    /// The characters that make a naive codec wrong: the separator itself, the escape character, the
+    /// cookie-forbidden set, and the `/`+`@` a namespace and a detached ref carry as a matter of course.
+    round_trip({"p|o%o=l", "srv 1;x,y", "srv 1;x,y/store/abc/abcdef@cas@", "detached/broken_all_1_1_0",
+                "all_1_1_0", "18446744073709551615:18446744073709551615:999999"},
+               "the hostile shape");
+    /// A field at the cap must survive; one past it must not (asserted below).
+    round_trip({String(256, 'a'), "srv1", "srv1/store/abc/abcdef@cas@", "all_1_1_0", "all_1_1_0", "1:1:1"},
+               "a field at the length cap");
+}
+
+/// Everything a peer can hand back that is not a token this sender minted. None of these may decode:
+/// a decoded-but-wrong token routes a confirm somewhere, and "somewhere" is exactly what routing exists
+/// to prevent. Refusing costs a byte fetch and nothing else.
+TEST(CasConfirmExactRef, SourceTokenRejectsMalformedAndOverlongInput)
+{
+    const DB::CasRelinkSourceToken good{"pool", "srv1", "srv1/store/abc/abcdef@cas@", "all_1_1_0", "all_1_1_0", "1:1:1"};
+    const String text = DB::encodeCasRelinkSourceToken(good).value();
+
+    /// Every literal below is a SEVEN-segment token (version + six fields) unless it is testing the
+    /// segment count itself, so each case fails for the reason it names and not because it is short.
+    for (const std::string_view malformed : {
+             /// Empty, no version, the wrong version, and versions that merely start or end right.
+             "", "|a|b|c|d|e|f", "car0|a|b|c|d|e|f", "car|a|b|c|d|e|f", "car11|a|b|c|d|e|f",
+             /// Too few and too many fields -- a shape that is one field off must not shift the rest.
+             "car1|a|b|c|d|e", "car1|a|b|c|d|e|f|g", "car1", "car1|",
+             /// An empty field: a token with a hole in it routes somewhere it was not meant to.
+             "car1||b|c|d|e|f", "car1|a|b|c|d|e|",
+             /// Malformed escapes: truncated, non-hex, and a lone escape character.
+             "car1|%|b|c|d|e|f", "car1|%4|b|c|d|e|f", "car1|%zz|b|c|d|e|f", "car1|a%|b|c|d|e|f",
+             /// Unescaped bytes outside the unreserved set: the decoder is the encoder's inverse, so
+             /// anything the encoder would have escaped is not a token, however readable it looks.
+             "car1|a/b|c|d|e|f|g", "car1|a b|c|d|e|f|g", "car1|a@b|c|d|e|f|g", "car1|1:1:1|b|c|d|e|f",
+             /// A control character smuggled in as an escape -- the classic forged-log-line vector.
+             "car1|a%00b|c|d|e|f|g", "car1|a%0Ab|c|d|e|f|g"})
+    {
+        EXPECT_FALSE(DB::decodeCasRelinkSourceToken(malformed).has_value())
+            << "accepted a malformed source token: '" << malformed << "'";
+    }
+
+    /// Over-long: refused in BOTH directions, so an over-long field can neither be minted nor accepted.
+    DB::CasRelinkSourceToken too_long = good;
+    too_long.ref_name = String(257, 'a');
+    EXPECT_FALSE(DB::encodeCasRelinkSourceToken(too_long).has_value());
+    EXPECT_FALSE(DB::decodeCasRelinkSourceToken(
+        "car1|pool|srv1|ns|" + String(257, 'a') + "|all_1_1_0|1%3A1%3A1").has_value());
+    /// A field whose ENCODED form blows the whole-token cap (every byte escapes to three).
+    DB::CasRelinkSourceToken all_escaped = good;
+    all_escaped.root_namespace = String(200, ' ');
+    all_escaped.ref_name = String(200, ' ');
+    EXPECT_FALSE(DB::encodeCasRelinkSourceToken(all_escaped).has_value());
+    EXPECT_FALSE(DB::decodeCasRelinkSourceToken(String(2000, 'a')).has_value());
+
+    /// An empty field is refused on the way out too, not only on the way in.
+    DB::CasRelinkSourceToken empty_field = good;
+    empty_field.part_name.clear();
+    EXPECT_FALSE(DB::encodeCasRelinkSourceToken(empty_field).has_value());
+
+    /// The control-character refusal is symmetric: the sender cannot mint one either.
+    DB::CasRelinkSourceToken control = good;
+    control.server_root_id = "srv\n1";
+    EXPECT_FALSE(DB::encodeCasRelinkSourceToken(control).has_value());
+
+    /// Sanity: the good token itself decodes, so the rejections above are about the input and not about
+    /// a codec that refuses everything.
+    EXPECT_TRUE(DB::decodeCasRelinkSourceToken(text).has_value());
 }
 
 
@@ -826,7 +923,7 @@ TEST(CasConfirmExactRef, StorageConfirmAnswersForTheCommittedBinding)
     storage->startup();
     commitExchangePart(*storage);
 
-    const SourceToken token = readSourceToken(*storage);
+    const DB::CasRelinkSourceToken token = readSourceToken(*storage);
     ASSERT_TRUE(storage->ownsNamespace("test", token.root_namespace))
         << "the sender must route its own committed namespace to itself: " << token.root_namespace;
 
@@ -874,7 +971,7 @@ TEST(CasConfirmExactRef, StorageConfirmIsUnknownWhenTheDiskCannotSpeakForItsView
 
     storage->startup();
     commitExchangePart(*storage);
-    const SourceToken token = readSourceToken(*storage);
+    const DB::CasRelinkSourceToken token = readSourceToken(*storage);
     ASSERT_EQ(storage->confirmExactRef(token.root_namespace, kExchangePartName, token.manifest_ref_text),
               DB::CasConfirmAnswer::Yes);
 

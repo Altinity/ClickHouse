@@ -53,6 +53,12 @@ private:
     /// table's disks is entitled to answer (`ownsNamespace` under a matching pool UUID, exactly one match
     /// or `Unknown`), and gate 0, the part-anchored filter over this table's parts set. Never throws, and
     /// `No` is not knowledge — see `CasConfirmAnswer`.
+    /// The confirm action's handler: decode the peer's token, resolve it, and set the answer cookie.
+    /// Exactly two answers cross the wire — proven, and not proven — because only `Yes` authorizes
+    /// anything and `No` is not knowledge (see `CasConfirmAnswer`). Never throws: an unparsable token
+    /// is one more unproven answer, not an error the receiver would have to classify.
+    void answerContentAddressedConfirm(const String & token_text, HTTPServerResponse & response) const;
+
     CasConfirmAnswer resolveContentAddressedConfirm(
         const String & pool_uuid,
         const String & server_root_id,

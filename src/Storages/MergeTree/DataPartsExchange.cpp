@@ -89,6 +89,11 @@ constexpr auto REPLICATION_PROTOCOL_VERSION_WITH_COLUMNS_SUBSTREAMS = 9;
 /// zero-copy metadata-only fetch). Everything is gated behind a matching pool_uuid, so a non-CA fetch
 /// is byte-for-byte unchanged.
 constexpr auto REPLICATION_PROTOCOL_VERSION_WITH_CA_RELINK = 10;
+/// CAS replication, publish-then-confirm (spec §wire-protocol). A relink offer is now accompanied by a
+/// source token, and the endpoint answers a second, part-less request that asks whether that token is
+/// still exactly what the sender's ref names. A server advertising this version serves the confirm
+/// action; a receiver advertising it must confirm before it promotes.
+constexpr auto REPLICATION_PROTOCOL_VERSION_WITH_CA_CONFIRM = 11;
 
 std::string getEndpointId(const std::string & node_id)
 {
@@ -109,6 +114,31 @@ constexpr auto CA_RELINK_COOKIE = "content_addressed_relink";
 /// — the receiver rejects a cookie value it does not recognize and falls back to a byte fetch instead
 /// of desyncing on the wire format.
 constexpr auto CA_RELINK_COOKIE_VALUE = "part_manifest_v2";
+
+/// CAS fetch-by-relink, publish-then-confirm (spec §wire-protocol). Three names make up the second
+/// request of the handshake.
+///
+/// The request parameter both selects the confirm action and carries its only argument: the opaque
+/// source token the sender minted for the offer. There is no separate action flag, because an action
+/// without its token is not a question anyone can answer, and a token without the action would have to
+/// be ignored — one name cannot be half-present.
+constexpr auto CA_CONFIRM_ACTION_PARAM = "content_addressed_confirm";
+/// Response cookie on the relink offer: the token, opaque to the receiver, echoed back verbatim.
+constexpr auto CA_CONFIRM_TOKEN_COOKIE = "content_addressed_source_token";
+/// Response cookie on the confirm: the answer.
+constexpr auto CA_CONFIRM_ANSWER_COOKIE = "content_addressed_confirm_answer";
+/// The ONLY value that authorizes the receiver to promote.
+constexpr auto CA_CONFIRM_ANSWER_PROVEN = "yes";
+/// Everything else: the source did not prove the binding. The wire vocabulary is deliberately BINARY
+/// even though `CasConfirmAnswer` has three values. `No` and `Unknown` are one outcome for every caller
+/// (see `CasConfirmAnswer`): gate 1 evaluates the mount fence LAST, so a mount that has already lost
+/// its fence — and can no longer speak for the namespace at all — still answers `No` for a token that
+/// does not match its last-known row. Putting `no` on the wire as a distinct value would invite a
+/// receiver to act on it as knowledge, and it is not knowledge. The distinction is diagnostic only, so
+/// it is logged on the sender, where the gate that produced it can be named, and never transmitted.
+/// An ABSENT cookie reads as unproven too, which is what makes an older peer and a failed request the
+/// same safe outcome as a refusal.
+constexpr auto CA_CONFIRM_ANSWER_UNPROVEN = "unproven";
 
 /// Resolve a disk to the content-addressed exchange facade, or nullptr if the disk is not CA. The
 /// cast targets the purpose-built INTERFACE (IContentAddressedExchange), never the concrete
@@ -226,8 +256,49 @@ CasConfirmAnswer Service::resolveContentAddressedConfirm(
     return matched->confirmExactRef(root_namespace, ref_name, manifest_ref_text);
 }
 
+void Service::answerContentAddressedConfirm(const String & token_text, HTTPServerResponse & response) const
+{
+    /// The confirm action's whole handler. It reads no part parameter, sends no body, and touches no
+    /// send metric: the request asks a question about a binding, it does not transfer anything.
+    const auto token = decodeCasRelinkSourceToken(token_text);
+    if (!token)
+    {
+        /// The raw text is NOT logged: it is unvalidated peer bytes, and a decoded token is the only
+        /// form this server has established is free of the control characters that forge log lines.
+        LOG_DEBUG(log, "Relink confirm is unproven: the source token ({} bytes) is not one this server minted",
+            token_text.size());
+        response.addCookie({CA_CONFIRM_ANSWER_COOKIE, CA_CONFIRM_ANSWER_UNPROVEN});
+        return;
+    }
+
+    const CasConfirmAnswer answer = resolveContentAddressedConfirm(
+        token->pool_uuid, token->server_root_id, token->root_namespace,
+        token->ref_name, token->part_name, token->manifest_ref_text);
+
+    /// The `No`/`Unknown` distinction stays here, on the node that computed it and can name the binding
+    /// that produced it. It is triage information, not an authorization, and the wire carries only the
+    /// authorization (`CA_CONFIRM_ANSWER_UNPROVEN`).
+    if (answer != CasConfirmAnswer::Yes)
+        LOG_DEBUG(log, "Relink confirm is unproven ({}) for ref '{}' (part {}, manifest {}) in namespace '{}'",
+            answer == CasConfirmAnswer::No ? "no" : "unknown",
+            token->ref_name, token->part_name, token->manifest_ref_text, token->root_namespace);
+
+    response.addCookie({CA_CONFIRM_ANSWER_COOKIE,
+        answer == CasConfirmAnswer::Yes ? CA_CONFIRM_ANSWER_PROVEN : CA_CONFIRM_ANSWER_UNPROVEN});
+}
+
 void Service::processQuery(const HTMLForm & params, ReadBufferPtr body, WriteBuffer & out, HTTPServerResponse & response)
 {
+    /// CAS fetch-by-relink, publish-then-confirm (spec §wire-protocol): the second request of the
+    /// handshake, dispatched before `part` is required because a confirm carries none — the part name
+    /// is inside the token. Authentication parity with the fetch is inherent: the shared handler
+    /// authenticates before it dispatches to any endpoint.
+    if (const String confirm_token = params.get(CA_CONFIRM_ACTION_PARAM, ""); !confirm_token.empty())
+    {
+        answerContentAddressedConfirm(confirm_token, response);
+        return;
+    }
+
     // nothing to read from body
     body.reset();
 
@@ -241,7 +312,7 @@ void Service::processQuery(const HTMLForm & params, ReadBufferPtr body, WriteBuf
     MergeTreePartInfo::fromPartName(part_name, data.format_version);
 
     /// We pretend to work as older server version, to be sure that client will correctly process our version
-    response.addCookie({"server_protocol_version", toString(std::min(client_protocol_version, REPLICATION_PROTOCOL_VERSION_WITH_CA_RELINK))});
+    response.addCookie({"server_protocol_version", toString(std::min(client_protocol_version, REPLICATION_PROTOCOL_VERSION_WITH_CA_CONFIRM))});
 
     LOG_TRACE(log, "Sending part {}", part_name);
 
@@ -311,6 +382,13 @@ void Service::processQuery(const HTMLForm & params, ReadBufferPtr body, WriteBuf
         /// the receiver can "fetch" by publishing its own ref to the blobs already in the shared pool.
         /// Strictly gated on a matching pool_uuid: a non-CA part, a CA part on a different pool, or a
         /// receiver without the capability all fall through to the unchanged byte path below.
+        ///
+        /// The gate is still `..._WITH_CA_RELINK`, not `..._WITH_CA_CONFIRM`. Raising it belongs with
+        /// the receiver change that makes the higher version TRUE of a receiver: a receiver advertising
+        /// `..._WITH_CA_CONFIRM` promises to confirm before it promotes, and until the receiver flow
+        /// exists no receiver may make that promise. The two edits — the version the client advertises
+        /// and this gate — must land together; separated in either order they either disable relink or
+        /// hand an unconfirmed relink to a receiver that claimed it would confirm.
         if (client_protocol_version >= REPLICATION_PROTOCOL_VERSION_WITH_CA_RELINK
             && part->getDataPartStorage().isContentAddressed())
         {
@@ -319,22 +397,27 @@ void Service::processQuery(const HTMLForm & params, ReadBufferPtr body, WriteBuf
             auto * ca_meta = tryGetContentAddressedExchange(part_disk);
             if (ca_meta && !receiver_pool_uuid.empty() && receiver_pool_uuid == ca_meta->getPoolUUID())
             {
-                auto manifest_bytes = ca_meta->getPartManifestBytes(part->getDataPartStorage().getRelativePath());
-                if (manifest_bytes)
+                auto offer = ca_meta->getRelinkOffer(part->getDataPartStorage().getRelativePath());
+                if (offer)
                 {
                     LOG_DEBUG(log, "Sending part {} by relink (content-addressed, shared pool {}), manifest payload {} bytes",
-                        part_name, receiver_pool_uuid, manifest_bytes->size());
+                        part_name, receiver_pool_uuid, offer->manifest_bytes.size());
                     response.addCookie({CA_RELINK_COOKIE, CA_RELINK_COOKIE_VALUE});
+                    /// The source token for the confirm request the receiver makes before it promotes
+                    /// (spec §wire-protocol). It always accompanies the offer, and its ABSENCE is what
+                    /// tells a confirm-capable receiver that this sender predates the handshake.
+                    response.addCookie({CA_CONFIRM_TOKEN_COOKIE, offer->confirm_token});
                     /// The relink payload (B7 part_manifest_v2, all-tree task 7): the opaque encoded
                     /// PartManifest body (the receiver decodes it, ignores the sender identity, and
                     /// stages its OWN local manifest over the shared-pool blobs; the legacy part_id wire
                     /// field carries it). Self-contained: uuid.txt/metadata_version.txt are ordinary
                     /// manifest entries now (task 6), so no separate mutable-header field is sent.
-                    writeStringBinary(*manifest_bytes, out);
+                    writeStringBinary(offer->manifest_bytes, out);
                     data.addLastSentPart(part->info);
                     return;
                 }
-                /// no tree id (no committed ref for this part here) — fall through to the byte path.
+                /// No offer (no committed ref for this part here, or no mintable token) — fall through
+                /// to the byte path.
             }
         }
 

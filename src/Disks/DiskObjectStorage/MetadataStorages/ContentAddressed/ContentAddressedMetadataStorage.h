@@ -59,7 +59,7 @@ namespace DB
 ///                     `iterateDirectory`/`isDirectoryEmpty`/`getStorageObjectsIfExist`). Answers the
 ///                     truth: real while live, throws while uncertain, absent/empty once `Vanished`.
 ///   - `ContentRead` — resolving/serving bytes or per-file metadata (`getStorageObjects`/`getFileSize`/
-///                     `getLastModified`/`getBlobViewPlan`/`readBlobPayload`/`getPartManifestBytes`/
+///                     `getLastModified`/`getBlobViewPlan`/`readBlobPayload`/`getRelinkOffer`/
 ///                     `tryGetInManifestBytes`/`prepareInManifestRead`). Never silent-absent on `Vanished`
 ///                     — a loud typed error instead.
 ///   - `Write`       — create / write / rename, INCLUDING the previously-no-op sites and a publishing
@@ -352,9 +352,10 @@ public:
     /// unparsable token and for a disk that has not started or has reached a terminal lifecycle.
     CasConfirmAnswer confirmExactRef(const String & root_namespace, const String & ref_name,
                                      const String & manifest_ref_text) const override;
-    /// Returns the canonical encoded manifest for a committed part, or nullopt when the path is not
-    /// a committed CA part. Missing or corrupt committed state propagates as an exception.
-    std::optional<String> getPartManifestBytes(const String & part_path) const override;
+    /// Returns the canonical encoded manifest for a committed part plus the confirm token minted from
+    /// that same resolution, or nullopt when the path is not a committed CA part or the token cannot be
+    /// minted. Missing or corrupt committed state propagates as an exception.
+    std::optional<RelinkOffer> getRelinkOffer(const String & part_path) const override;
     /// Adopts a peer-supplied manifest into this server's namespace without transferring blob bodies.
     /// Returns false for decode or retryable publication failures so the caller can perform a byte
     /// fetch; read-only disks throw `READONLY`.

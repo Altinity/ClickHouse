@@ -3,6 +3,7 @@
 #include <base/types.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
 #include <optional>
+#include <string_view>
 
 namespace DB
 {
@@ -29,15 +30,50 @@ enum class CasConfirmAnswer : uint8_t
     Unknown,
 };
 
+/// The sender's confirm token for one relink offer (spec §wire-protocol). It rides back to the receiver
+/// as a response cookie on the offer and returns verbatim as the only argument of the confirm request,
+/// so the receiver never has to understand a field of it and the sender never has to remember anything
+/// between the two requests. Every field is minted by the sender out of its OWN committed state; when
+/// it comes back it is untrusted peer input and is used only as a lookup key -- `resolveContentAddressedConfirm`
+/// answers whatever the fields happen to select, and selects nothing at all when they match nothing.
+///
+/// `pool_uuid` and `server_root_id` route the question to the one mount entitled to answer it (a pool
+/// UUID is shared by every server root writing into the pool, so it cannot select a mount on its own);
+/// `root_namespace` and `ref_name` name the binding; `manifest_ref_text` is the exact manifest the
+/// offer carried; `part_name` is gate 0's key into the sender's parts set.
+struct CasRelinkSourceToken
+{
+    String pool_uuid;
+    String server_root_id;
+    String root_namespace;
+    String ref_name;          /// the ref the sender published the part under (`detached/<name>` for B66b)
+    String part_name;         /// the MergeTree part name
+    String manifest_ref_text; /// canonical `writer_epoch:build_sequence:manifest_ordinal`
+};
+
+/// The token's wire form: `car1|<f1>|…|<f6>`, each field percent-encoded down to the RFC 3986
+/// unreserved set. The encoding exists because two of the fields are not character-safe as they stand
+/// -- a namespace carries `/` and `@`, and `server_root_id` is whatever the operator configured -- and
+/// the token has to survive both an HTTP cookie value and a URL query parameter. Percent-encoding is
+/// what makes that true by construction, instead of by a character allowlist that would silently
+/// disable relink for a legal-but-unusual `server_root_id`.
+///
+/// `nullopt` in either direction means "not a token": an empty or over-long field on the way out, and
+/// on the way in a wrong version tag, a wrong field count, a malformed escape, a control character or
+/// an over-long field. A refusal is never an answer about the source -- the sender simply makes no
+/// offer, and the receiver's confirm is simply unproven.
+std::optional<String> encodeCasRelinkSourceToken(const CasRelinkSourceToken & token);
+std::optional<CasRelinkSourceToken> decodeCasRelinkSourceToken(std::string_view text);
+
 /// Purpose-built seam for `DataPartsExchange`: it exposes everything replication needs from a
 /// content-addressed disk and nothing else. `ContentAddressedMetadataStorage` implements it, and
 /// the exchange obtains the interface by casting the disk's `IMetadataStorage` to this interface
 /// rather than depending on the concrete storage class. Keeping this boundary narrow prevents the
 /// replication path from becoming coupled to content-addressed storage internals.
 ///
-/// Relink wire contract: the sender transmits `{pool_uuid, encoded PartManifest body}`. The
-/// replica-internal `part_id` cookie carries the opaque manifest bytes, so this exchange does not
-/// add a protocol field. The manifest's sender-specific identity (`ManifestRef`, `root_namespace_id`,
+/// Relink wire contract: the sender transmits `{pool_uuid, encoded PartManifest body, confirm token}`.
+/// The replica-internal `part_id` cookie carries the opaque manifest bytes and a response cookie carries
+/// the token, so this exchange adds no protocol field of its own. The manifest's sender-specific identity (`ManifestRef`, `root_namespace_id`,
 /// and `payload_digest`) is not authoritative: the receiver uses only the entries, adopts references
 /// to blobs in the shared pool by hash without reading blob bodies from the sender, and publishes a
 /// fresh manifest in its own namespace. Every per-part file is an ordinary manifest entry, so the
@@ -73,11 +109,24 @@ public:
     virtual CasConfirmAnswer confirmExactRef(const String & root_namespace, const String & ref_name,
                                              const String & manifest_ref_text) const = 0;
 
-    /// Sender side: returns the encoded `PartManifest` body for this server's committed part at the
-    /// given disk-relative path. The body is opaque to the exchange caller and is decoded by the
-    /// receiver. `nullopt` means that the path is not a committed content-addressed part here, so
-    /// the sender must make no relink offer and streams the part bytes instead.
-    virtual std::optional<String> getPartManifestBytes(const String & part_path) const = 0;
+    /// Sender side: everything one relink offer puts on the wire. The manifest body is opaque to the
+    /// exchange caller and is decoded by the receiver; the token is what the receiver hands back to
+    /// confirm the offer before it promotes.
+    struct RelinkOffer
+    {
+        String manifest_bytes;
+        String confirm_token;
+    };
+
+    /// Sender side: build the relink offer for this server's committed part at the given disk-relative
+    /// path. `nullopt` means the path is not a committed content-addressed part here, or the token
+    /// could not be minted, so the sender must make no offer and streams the part bytes instead.
+    ///
+    /// The manifest body and the token come out of ONE resolution of the part, and that is the point of
+    /// returning them together rather than as two calls: a repoint between them would hand the receiver
+    /// a token naming a manifest whose entries it never adopted, and a `Yes` for that manifest would
+    /// protect the wrong blobs.
+    virtual std::optional<RelinkOffer> getRelinkOffer(const String & part_path) const = 0;
 
     /// Receiver side: decodes the transferred manifest, performs a normal local build from shared-
     /// pool blob references without reading blob bodies from the sender, and stages a fresh manifest

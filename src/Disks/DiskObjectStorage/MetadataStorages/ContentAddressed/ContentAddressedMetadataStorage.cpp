@@ -137,7 +137,7 @@ const char * casLifecycleReasonWord(Cas::PoolLifecycle lc)
 ///              empty answer. `iterateDirectory`/`isDirectoryEmpty` inherit it (both funnel through
 ///              `listDirectory`). A `Vanished` pool never reaches it (the gate short-circuits `Probe`).
 /// ContentRead: getFileSize, getLastModified, getStorageObjects, getBlobViewPlan, readBlobPayload,
-///              prepareInManifestRead, tryGetInManifestBytes, getPartManifestBytes, confirmExactRef
+///              prepareInManifestRead, tryGetInManifestBytes, getRelinkOffer, confirmExactRef
 ///              (the ONE ContentRead entry that converts the gate's refusal into its own typed
 ///              `Unknown` answer instead of propagating it -- a confirm never throws at its caller).
 /// Write:       adoptPartFromManifest.
@@ -1987,14 +1987,16 @@ CasConfirmAnswer ContentAddressedMetadataStorage::confirmExactRef(
     }
 }
 
-std::optional<String> ContentAddressedMetadataStorage::getPartManifestBytes(const String & part_path) const
+std::optional<IContentAddressedExchange::RelinkOffer>
+ContentAddressedMetadataStorage::getRelinkOffer(const String & part_path) const
 {
     /// Sender side: the committed part's encoded `PartManifest` body — the opaque payload the
-    /// receiver decodes. Resolve the part path to its (ns, ref) exactly as the read surface does
-    /// (route), resolve the committed ref to its ManifestId, read the immutable manifest, and re-encode
-    /// it canonically. nullopt when the path is not a committed content-addressed part here (no ref =>
-    /// no relink offer; the sender streams bytes). A live ref to a missing/corrupt manifest throws
-    /// (INV-NO-DANGLE surfaced, never substituted) — the same fail-loud contract as partAccess()->getView.
+    /// receiver decodes — and the confirm token for it. Resolve the part path to its (ns, ref) exactly
+    /// as the read surface does (route), resolve the committed ref to its ManifestId, read the
+    /// immutable manifest, and re-encode it canonically. nullopt when the path is not a committed
+    /// content-addressed part here (no ref => no relink offer; the sender streams bytes). A live ref to
+    /// a missing/corrupt manifest throws (INV-NO-DANGLE surfaced, never substituted) — the same
+    /// fail-loud contract as partAccess()->getView.
     /// ContentRead: reading a committed manifest; loud typed error on a Vanished disk.
     checkOpAdmitted(CasOpClass::ContentRead);
     auto p = Cas::parsePartFilePath(part_path);
@@ -2007,7 +2009,29 @@ std::optional<String> ContentAddressedMetadataStorage::getPartManifestBytes(cons
     auto view = partAccess()->getView(r->refKey(), Cas::Freshness::ForceFresh);
     if (!view)
         return std::nullopt;
-    return Cas::encodePartManifest(*view->manifest());
+
+    /// The token names the manifest THIS view resolved, so the offer and the question the receiver will
+    /// ask are about one and the same object by construction. `manifestId` is the journal identity the
+    /// ledger compares in gate 1, and it is already proven to agree with the body: `readManifest`
+    /// enforces `refMatchesBody`/`manifestNamespaceMatches` and throws `CORRUPTED_DATA` otherwise, so
+    /// there is no disagreement left for this function to discover or to quietly turn into a byte fetch.
+    ///
+    /// `ref_name` is what this mount publishes the part under and `part_name` is what gate 0 looks up
+    /// in the parts set; they coincide for every offer the sender can actually make, because it offers
+    /// only a live part. A staging path (`detached/`, `moving/`) reports the reserved directory name as
+    /// `part_name`, so a token minted for one selects no part at all — `Unknown`, which is the safe
+    /// direction — rather than selecting the wrong one.
+    const auto token = encodeCasRelinkSourceToken(CasRelinkSourceToken{
+        .pool_uuid = pool_uuid,
+        .server_root_id = server_root_id,
+        .root_namespace = r->ns.string(),
+        .ref_name = r->ref,
+        .part_name = p->part_name,
+        .manifest_ref_text = Cas::manifestRefDebugString(view->manifestId().ref)});
+    if (!token)
+        return std::nullopt;
+
+    return RelinkOffer{.manifest_bytes = Cas::encodePartManifest(*view->manifest()), .confirm_token = *token};
 }
 
 /// TRUST MODEL: adopting a part from a peer-supplied manifest is exactly as trusted as an ordinary
