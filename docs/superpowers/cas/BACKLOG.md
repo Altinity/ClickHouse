@@ -1052,3 +1052,61 @@ Sub-finding (cosmetic, fix with the round introspection in
 `CasGc.cpp:368` before `report.round` is assigned, so every skip-unchanged round logs as
 `CA GC round 0: candidates=0 …` and is indistinguishable from a round that folded and found nothing.
 That cost real diagnosis time here.
+
+### ROOT CAUSE (systematic debugging, 2026-07-25): an UNMATCHED-MINUS-ONE permanently retains one blob per occurrence {#unmatched-minus-one-retention-leak}
+
+Resolves the investigation opened in
+[#fsck-gc-indegree-disagreement-2026-07-25](#fsck-gc-indegree-disagreement-2026-07-25). Every step below
+is a MEASUREMENT on the live post-soak stand or a line of source, not an inference.
+
+1. **56 present blobs have no live reference.** `ca-fsck`'s reachability walk (refs -> manifests ->
+   blobs) does not reach them. `dangling=0`, `unaccounted=0`.
+2. **Each has exactly ONE residual source edge** in the adopted in-degree run
+   (`soak_pool/gc/gen/343/attempt/1046/blob_target/0/0`, NDJSON): `{"b":"01<digest>","s":"<source_id>",
+   "m":"edge"}`. Verified 56/56, one row each, 56 DISTINCT source ids. So most of each blob's edges were
+   cancelled correctly and exactly one was not.
+3. **An edge identity is a (manifest, file-path) pair**: `source_id = CityHash128(namespace ‖
+   writer_epoch ‖ build_sequence ‖ manifest_ordinal ‖ path)` (`CasBlobInDegree.cpp:165`).
+4. **The manifests that contributed those edges are GONE.** None of the 56 digests appears in ANY of the
+   96 manifests still present in the pool. Methodology validated with a positive control: manifest bodies
+   carry `"blob":"ch128:<hex>"`, and a reachable blob's digest IS found by the same grep.
+5. **So GC computes in-degree = 1 and never nominates them**: `candidates_marked=0` on every one of 1062
+   rounds, `ca-gc-dryrun` = 0, and the count is flat at 56 across 8 fsck samples over 5.3 min and again
+   later — with zero workload on the CA pool (ca_stress has 0 active parts on BOTH nodes; the churning
+   `system.*_log` tables live on the `default` disk, not on CA).
+6. **This is NOT the missing-body path, and the designed protection never engaged.**
+   `foldManifestEdges` returns false without emitting deltas when the body is absent
+   (`CasGc.cpp:750-755`), and the caller is supposed to CLAMP the table (`CasGc.cpp:1123-1131`,
+   "a missing manifest body is a per-table CLAMP (barrier), never a round abort"). Measured:
+   `CasGcClampSuppressedPasses = 0` across 1062 rounds, against `CasRefManifestBodyFoldGets = 1,519,186`.
+   The barrier never fired, so bodies WERE present at fold time and the `-1` WAS emitted.
+7. **The `-1` therefore cancelled nothing.** The merge is a set-presence merge keyed by
+   `(blob_ref, source_id)` (`CasBlobInDegree.cpp:585-597`): a remove delta whose key is not present in
+   the prior is silently a no-op — `present` stays false, nothing is written, and **no counter records
+   it**. The unmatched `+1` is carried forward from the prior run forever.
+
+**CONSEQUENCE.** Every unmatched `-1` permanently retains one blob. The incremental GC can never reclaim
+it — not a latency, a leak. Only `ca-gc-rebuild` (disaster recovery, full traversal) clears it. Observed
+rate: 56 blobs / 104,755 bytes over one 4h soak. Unbounded in time.
+
+**This also explains the CI observation** that the ca-soak harness has been labelling `(M-F debris,
+B140)` for months. It is neither M-F debris nor B140.
+
+**NOT ESTABLISHED — the next question, stated precisely:** why the removal computed a different edge
+identity than the add. Two candidates: (a) the manifest body's entry paths differed between the
+add-fold and the remove-fold, so the `-1` was keyed on a different `path`; (b) the removal named a
+different `ManifestRef` (epoch/build/ordinal) than the add. Distinguishing them requires the MANIFEST
+ID on the edge events — `system.content_addressed_log` currently records only namespace + object_hash
+for `root_add`/`root_remove`, which is exactly why this could not be closed from the event log. Concrete
+introspection requirement for [#gc-bottleneck-study-2026-07-25](#gc-bottleneck-study-2026-07-25).
+
+**CHEAP AND SAFE NOW (does not fix the leak, makes it visible):** count remove deltas that matched no
+prior edge, as a ProfileEvent + a WARNING with the blob and source id. Pure observability, no protocol
+change, no behaviour change. A silent no-op on an unmatched cancel is the reason this survived months of
+soaks. Do this even before the mechanism is known.
+
+**DO NOT** "fix" it by making the fold drop edges whose manifest is absent: an omitted `+1` must suppress
+deletion, never permit it, and that change would delete live data on any transient body read failure.
+
+Artifacts: `tmp/f6-unreachable/` — `fsck_detail.txt`, `the_56_keys.txt`, `drain_watch.txt`,
+`run343.bin` (the decoded in-degree run), `manifest_bodies.txt` (all 96 present manifests).
