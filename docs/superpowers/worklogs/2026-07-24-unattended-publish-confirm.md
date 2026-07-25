@@ -437,3 +437,12 @@ reclaim-impossibility that the writer protocol says no longer exists. Not editin
   F6 STRENGTHENED: the last three recovery checkpoints report `unreachable=41 dangling=0 dryrun_count=0`
   — the SAME 41, now surviving 13 injected faults and 8 checkpoints, with GC still nominating nothing
   against them. So it is a stable population that GC cannot see, not chaos debris and not a transient.
+- 11:09 UTC — watchdog: soak v3 t+2h36m, STAGE chaos, 0 failures, 17 faults, 10 checkpoints OK, disk 327G,
+  log fresh, ticks advancing.
+  F6 REFINED — and partly walked back: `unreachable` moved 41 -> 56 during chaos. That GROWTH is exactly
+  the documented M-F class (a killed writer abandons a staged build; only the heartbeat-gated full-GC tier
+  reclaims those — `01-architecture.md:274`), so the harness's label is legitimate for the chaos-era
+  counts. What it does NOT explain, and what remains the finding, is the ORIGINAL 41 counted before the
+  first fault ever fired, with inserts off and GC at a settled fixpoint. Keep the two apart when
+  identifying objects after the run: the question is whether the post-run detail fsck shows one
+  population or two.
