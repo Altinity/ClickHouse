@@ -1431,6 +1431,27 @@ TEST(CasWiringGc, DisplacedTreeBlobsReclaimedThroughRealPath)
 
 /// ==== M-W Task 11 / B7: the DataPartsExchange facade (manifest relink, part_manifest_v2) ====
 
+/// Publish-then-confirm (Task 14) split the receiver's adoption into `prepare` + `promote`, with the
+/// interserver confirm interposed between them. The confirm belongs to `Fetcher`, not to the storage, so
+/// the tests below that only care about the ADOPTION drive both halves back to back through this helper
+/// -- which is exactly what `publishEntries` does for the atomic callers. `false` is the
+/// `MechanismFallbackAllowed` outcome of either half: nothing published, the caller byte-fetches.
+namespace
+{
+
+bool adoptPartFromManifestAndPromote(DB::IContentAddressedExchange & exchange, const String & table_uuid,
+                                     const String & part_name, const String & manifest_bytes)
+{
+    std::unique_ptr<DB::ICaPreparedRelink> prepared;
+    if (exchange.prepareAdoptFromManifest(table_uuid, part_name, manifest_bytes, prepared)
+        == DB::CaRelinkPrepare::MechanismFallbackAllowed)
+        return false;
+    EXPECT_NE(prepared, nullptr) << "a Prepared outcome must carry the handle that owes the terminal operation";
+    return prepared->promote() == DB::CaRelinkPromote::Committed;
+}
+
+}
+
 /// B7 sender side: getRelinkOffer returns the COMMITTED part's encoded PartManifest body — the
 /// opaque payload the receiver decodes. The bytes must decode to the same entries the part was
 /// published with; an absent part offers nothing (the sender streams bytes — the documented fallback).
@@ -1508,7 +1529,7 @@ TEST(CasWiringExchange, AdoptPartFromManifestPublishesFreshLocalManifest)
 
     /// Adopt into a DIFFERENT table (a22a22a2-2222-4222-8222-222222222222). The transferred body's root_namespace_id is the sender's
     /// (a11a11a1-1111-4111-8111-111111111111) — the receiver must IGNORE it and use a22a22a2-2222-4222-8222-222222222222.
-    const bool ok = exchange->adoptPartFromManifest("a22a22a2-2222-4222-8222-222222222222", "tmp-fetch_all_1_1_0", bytes);
+    const bool ok = adoptPartFromManifestAndPromote(*exchange, "a22a22a2-2222-4222-8222-222222222222", "tmp-fetch_all_1_1_0", bytes);
     EXPECT_TRUE(ok);
 
     /// The adopted ref is live in the RECEIVER namespace and loadable.
@@ -1564,7 +1585,7 @@ TEST(CasWiringExchange, AdoptFailsClosedAndFallsBackOnCondemnedBlob)
               DB::Cas::DeleteOutcome::Kind::Deleted);
 
     /// §4: promote trusts the adopted leaves — no re-probe — so adopt SUCCEEDS (returns true) and publishes.
-    const bool ok = exchange->adoptPartFromManifest("a22a22a2-2222-4222-8222-222222222222", "tmp-fetch_all_1_1_0", bytes);
+    const bool ok = adoptPartFromManifestAndPromote(*exchange, "a22a22a2-2222-4222-8222-222222222222", "tmp-fetch_all_1_1_0", bytes);
     EXPECT_TRUE(ok) << "§4: adopt trusts the manifest edge; a raced pool blob is not re-probed at promote";
 
     /// The receiver ref publishes (the D4 trade-off), and the deleted pool blob surfaces via fsck's
@@ -1610,7 +1631,7 @@ TEST(CasWiringExchange, AdoptPartFromManifestSelfContainedWithoutMutableFilesSid
 
     /// No sidecar parameter to pass anymore — exactly what Fetcher::relinkPartToDisk's call looks like
     /// now that the manifest is self-contained (no reconstruction from a wire-transferred header).
-    const bool ok = exchange->adoptPartFromManifest("a22a22a2-2222-4222-8222-222222222222", "tmp-fetch_all_1_1_0", bytes);
+    const bool ok = adoptPartFromManifestAndPromote(*exchange, "a22a22a2-2222-4222-8222-222222222222", "tmp-fetch_all_1_1_0", bytes);
     EXPECT_TRUE(ok);
 
     const auto receiver_ns = storage->liveNamespace("a22a22a2-2222-4222-8222-222222222222");
@@ -1631,6 +1652,93 @@ TEST(CasWiringExchange, AdoptPartFromManifestSelfContainedWithoutMutableFilesSid
     EXPECT_TRUE(has_uuid_entry) << "uuid.txt must read back as an ordinary content entry, not mutable_files";
     EXPECT_TRUE(has_metadata_version_entry)
         << "metadata_version.txt must read back as an ordinary content entry, not mutable_files";
+}
+
+/// Publish-then-confirm, receiver half (Task 14): `prepare` must make the receiver's `+1` DURABLE while
+/// publishing NOTHING. That combination is the protocol -- the durable `+1` is what a later `yes` is
+/// worth anything against, and the absent committed ref is what makes an unproven source cost nothing.
+TEST(CasWiringExchange, PrepareAdoptIsDurableButPublishesNothingUntilPromote)
+{
+    auto storage = openWiringStorage();
+    const auto sender_ns = storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111");
+    publishWiredPart(*storage, sender_ns, "all_1_1_0");
+
+    auto * exchange = dynamic_cast<DB::IContentAddressedExchange *>(storage.get());
+    ASSERT_NE(exchange, nullptr);
+    auto offer = exchange->getRelinkOffer("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0");
+    ASSERT_TRUE(offer.has_value());
+
+    const auto receiver_ns = storage->liveNamespace("a22a22a2-2222-4222-8222-222222222222");
+    std::unique_ptr<DB::ICaPreparedRelink> prepared;
+    ASSERT_EQ(exchange->prepareAdoptFromManifest("a22a22a2-2222-4222-8222-222222222222", "tmp-fetch_all_1_1_0",
+                                                 offer->manifest_bytes, prepared),
+              DB::CaRelinkPrepare::Prepared);
+    ASSERT_NE(prepared, nullptr);
+
+    EXPECT_FALSE(storage->store()->resolveRef(receiver_ns, "tmp-fetch_all_1_1_0").has_value())
+        << "prepare must not commit the ref -- the source has not been asked anything yet";
+    EXPECT_EQ(storage->store()->livePrecommitsForTest(receiver_ns).size(), 1u)
+        << "prepare must leave the receiver's +1 durable, or a later confirm proves nothing";
+
+    EXPECT_EQ(prepared->promote(), DB::CaRelinkPromote::Committed);
+    EXPECT_TRUE(storage->store()->resolveRef(receiver_ns, "tmp-fetch_all_1_1_0").has_value());
+    EXPECT_TRUE(storage->store()->livePrecommitsForTest(receiver_ns).empty())
+        << "promote moves the binding out of the precommit view";
+}
+
+/// The unproven-source branch of the taxonomy (row 3), at the storage seam: `abort` releases the durable
+/// `+1` and publishes nothing. A leaked same-epoch precommit is reclaimed by nothing -- not the
+/// prior-epoch stale sweep, not GC -- so this removal is the ONLY thing standing between an unproven
+/// confirm and permanently retained blobs.
+TEST(CasWiringExchange, AbortedPrepareReleasesThePrecommitAndPublishesNothing)
+{
+    auto storage = openWiringStorage();
+    const auto sender_ns = storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111");
+    publishWiredPart(*storage, sender_ns, "all_1_1_0");
+
+    auto * exchange = dynamic_cast<DB::IContentAddressedExchange *>(storage.get());
+    ASSERT_NE(exchange, nullptr);
+    auto offer = exchange->getRelinkOffer("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0");
+    ASSERT_TRUE(offer.has_value());
+
+    const auto receiver_ns = storage->liveNamespace("a22a22a2-2222-4222-8222-222222222222");
+    std::unique_ptr<DB::ICaPreparedRelink> prepared;
+    ASSERT_EQ(exchange->prepareAdoptFromManifest("a22a22a2-2222-4222-8222-222222222222", "tmp-fetch_all_1_1_0",
+                                                 offer->manifest_bytes, prepared),
+              DB::CaRelinkPrepare::Prepared);
+    ASSERT_NE(prepared, nullptr);
+    ASSERT_EQ(storage->store()->livePrecommitsForTest(receiver_ns).size(), 1u);
+
+    prepared->abort();
+    EXPECT_TRUE(storage->store()->livePrecommitsForTest(receiver_ns).empty())
+        << "abort must append the exact precommit removal, not merely drop the transaction";
+    EXPECT_FALSE(storage->store()->resolveRef(receiver_ns, "tmp-fetch_all_1_1_0").has_value())
+        << "an aborted relink must leave no committed ref behind";
+
+    /// A second `abort` -- what the scope guard does after an explicit one -- must be a silent no-op
+    /// rather than an error, and destruction of an aborted handle must not re-drive anything.
+    prepared->abort();
+    prepared.reset();
+    EXPECT_TRUE(storage->store()->livePrecommitsForTest(receiver_ns).empty());
+}
+
+/// The `MechanismFallbackAllowed` branch (taxonomy row 2): an undecodable manifest is a mechanism
+/// failure, not a source failure -- the sender still has the part, so the receiver byte-fetches. Nothing
+/// may be staged, because there is no handle to abort it with.
+TEST(CasWiringExchange, PrepareAdoptOfAnUndecodableManifestAllowsTheByteFallback)
+{
+    auto storage = openWiringStorage();
+    auto * exchange = dynamic_cast<DB::IContentAddressedExchange *>(storage.get());
+    ASSERT_NE(exchange, nullptr);
+
+    const auto receiver_ns = storage->liveNamespace("a22a22a2-2222-4222-8222-222222222222");
+    std::unique_ptr<DB::ICaPreparedRelink> prepared;
+    EXPECT_EQ(exchange->prepareAdoptFromManifest("a22a22a2-2222-4222-8222-222222222222", "tmp-fetch_all_1_1_0",
+                                                 "not a manifest at all", prepared),
+              DB::CaRelinkPrepare::MechanismFallbackAllowed);
+    EXPECT_EQ(prepared, nullptr) << "no handle may be returned when nothing was staged";
+    EXPECT_TRUE(storage->store()->livePrecommitsForTest(receiver_ns).empty());
+    EXPECT_FALSE(storage->store()->resolveRef(receiver_ns, "tmp-fetch_all_1_1_0").has_value());
 }
 
 /// ==== Commit atomicity (B122): a publish failing mid-loop must not leave a PARTIAL commit ====
@@ -1797,7 +1905,11 @@ TEST(CasWiringReadOnly, ObserveOnlyOpenReadsButRejectsWrites)
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::READONLY,
         [&] { ro->createTransaction(); });
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::READONLY,
-        [&] { ro->adoptPartFromManifest("a11a11a1-1111-4111-8111-111111111111", "tmp-fetch", std::string{}); });
+        [&]
+        {
+            std::unique_ptr<DB::ICaPreparedRelink> prepared;
+            ro->prepareAdoptFromManifest("a11a11a1-1111-4111-8111-111111111111", "tmp-fetch", std::string{}, prepared);
+        });
 }
 
 TEST(CasWiringRead, UnsetPublishedAtMsReturnsEpoch)

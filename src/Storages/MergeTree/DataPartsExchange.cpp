@@ -64,6 +64,7 @@ namespace ErrorCodes
     extern const int CHECKSUM_DOESNT_MATCH;
     extern const int INSECURE_PATH;
     extern const int LOGICAL_ERROR;
+    extern const int NETWORK_ERROR;
     extern const int S3_ERROR;
     extern const int ZERO_COPY_REPLICATION_ERROR;
 }
@@ -88,7 +89,10 @@ constexpr auto REPLICATION_PROTOCOL_VERSION_WITH_COLUMNS_SUBSTREAMS = 9;
 /// publishing its own ref to the blobs already present in the shared pool (the CA analogue of the
 /// zero-copy metadata-only fetch). Everything is gated behind a matching pool_uuid, so a non-CA fetch
 /// is byte-for-byte unchanged.
-constexpr auto REPLICATION_PROTOCOL_VERSION_WITH_CA_RELINK = 10;
+/// Kept although nothing gates on it any more: the offer gate moved to `..._WITH_CA_CONFIRM` below, but
+/// 10 is a version peers still advertise, and deleting the record of what it meant would leave the next
+/// reader unable to tell what an incoming 10 promises (a relink it will NOT confirm).
+[[maybe_unused]] constexpr auto REPLICATION_PROTOCOL_VERSION_WITH_CA_RELINK = 10;
 /// CAS replication, publish-then-confirm (spec §wire-protocol). A relink offer is now accompanied by a
 /// source token, and the endpoint answers a second, part-less request that asks whether that token is
 /// still exactly what the sender's ref names. A server advertising this version serves the confirm
@@ -383,13 +387,13 @@ void Service::processQuery(const HTMLForm & params, ReadBufferPtr body, WriteBuf
         /// Strictly gated on a matching pool_uuid: a non-CA part, a CA part on a different pool, or a
         /// receiver without the capability all fall through to the unchanged byte path below.
         ///
-        /// The gate is still `..._WITH_CA_RELINK`, not `..._WITH_CA_CONFIRM`. Raising it belongs with
-        /// the receiver change that makes the higher version TRUE of a receiver: a receiver advertising
-        /// `..._WITH_CA_CONFIRM` promises to confirm before it promotes, and until the receiver flow
-        /// exists no receiver may make that promise. The two edits — the version the client advertises
-        /// and this gate — must land together; separated in either order they either disable relink or
-        /// hand an unconfirmed relink to a receiver that claimed it would confirm.
-        if (client_protocol_version >= REPLICATION_PROTOCOL_VERSION_WITH_CA_RELINK
+        /// The gate is `..._WITH_CA_CONFIRM`, not `..._WITH_CA_RELINK`: a receiver is offered a relink
+        /// only once it advertises that it will confirm the offer before promoting it. A receiver that
+        /// still advertises `..._WITH_CA_RELINK` gets the bytes — mixed versions degrade to bytes, never
+        /// to an unconfirmed relink. This gate and the version the client advertises
+        /// (`fetchSelectedPart`) are one change in two places; separated in either order they either
+        /// disable relink outright or hand an unconfirmed relink to a receiver that claimed it confirms.
+        if (client_protocol_version >= REPLICATION_PROTOCOL_VERSION_WITH_CA_CONFIRM
             && part->getDataPartStorage().isContentAddressed())
         {
             const String receiver_pool_uuid = parse<String>(params.get(CA_POOL_UUID_PARAM, ""));
@@ -666,7 +670,11 @@ std::pair<MergeTreeData::MutableDataPartPtr, scope_guard> Fetcher::fetchSelected
     {
         {"endpoint",                endpoint_id},
         {"part",                    part_name},
-        {"client_protocol_version", toString(REPLICATION_PROTOCOL_VERSION_WITH_CA_RELINK)},
+        /// Advertising `..._WITH_CA_CONFIRM` is a PROMISE, not a capability list: this receiver will
+        /// confirm a relink offer against its source before it promotes (`relinkPartToDisk`). It is the
+        /// pair of the sender-side offer gate on the same constant, and the two cannot be separated —
+        /// see the comment there.
+        {"client_protocol_version", toString(REPLICATION_PROTOCOL_VERSION_WITH_CA_CONFIRM)},
         {"compress",                "false"}
     });
 
@@ -903,12 +911,17 @@ std::pair<MergeTreeData::MutableDataPartPtr, scope_guard> Fetcher::fetchSelected
         readStringBinary(sender_manifest_bytes, *in);
         assertEOF(*in);
 
-        auto relinked = relinkPartToDisk(part_name, tmp_prefix, disk, sender_manifest_bytes);
+        /// Publish-then-confirm (spec §core-idea) happens inside `relinkPartToDisk`, including the second
+        /// interserver request; the token cookie is the sender's offer identity and is opaque here. A
+        /// `nullptr` means the mechanism cannot work but the sender still has the part, so the byte
+        /// re-request below is sound; a THROW means the source did not prove the binding, and the whole
+        /// point of it being a throw is that this fallback must NOT run for it.
+        auto relinked = relinkPartToDisk(part_name, tmp_prefix, disk, sender_manifest_bytes,
+            in->getResponseCookie(CA_CONFIRM_TOKEN_COOKIE, ""), uri, creds, timeouts, read_settings);
         if (relinked)
             return std::make_pair(std::move(relinked), std::move(temporary_directory_lock));
 
-        LOG_INFO(log, "Relink of part {} not possible (manifest's blobs not resolvable in the shared pool); "
-            "falling back to a byte fetch", part_name);
+        LOG_INFO(log, "Relink of part {} is not possible on this pair; falling back to a byte fetch", part_name);
         return fall_back_to_byte_fetch();
     }
 
@@ -1246,11 +1259,72 @@ MergeTreeData::MutableDataPartPtr Fetcher::downloadPartToDisk(
     return new_data_part;
 }
 
+/// The receiver's half of publish-then-confirm, and its complete failure taxonomy (spec
+/// §failure-taxonomy). Every exit of `relinkPartToDisk` is one of these six rows; the last two columns
+/// are the questions a reviewer has to be able to answer without reading the control flow, because a
+/// part-exchange path that gets them wrong either loses a part or commits it twice.
+///
+/// 1. THE SOURCE SENT NO TOKEN (a peer that predates the handshake).
+///    `+1`: never staged. Action: return `nullptr`, the caller byte-fetches from the same sender.
+///    Lose a part? No -- the sender still has it and streams it.
+///    Double-promote? No -- nothing was staged, so there is nothing to promote.
+///
+/// 2. `prepareAdoptFromManifest` -> `MechanismFallbackAllowed` (manifest decode failure, or the
+///    retryable staging class: body-absent precommit / precommit no longer the live owner / ref
+///    conflict).
+///    `+1`: never staged -- `prepareEntries` abandons its own build before propagating.
+///    Action: return `nullptr`, the caller byte-fetches. Lose a part? No, as row 1.
+///    Double-promote? No -- no handle exists.
+///
+/// 3. THE CONFIRM DID NOT PROVE THE SOURCE: an `unproven` answer, an absent answer cookie, a transport
+///    failure, a timeout. All one outcome, deliberately (`CasConfirmAnswer`: only `yes` authorizes).
+///    `+1`: durable, then released by `abort`. Action: THROW a locally generated retry-later
+///    `NETWORK_ERROR` naming the source and the part -- never `nullptr`, because a byte re-request goes
+///    back to the very source whose state is in doubt.
+///    Lose a part? No -- the queue stores the exception, backs off, and re-executes the entry, which
+///    recomputes the source and the covering-part discovery. The fetch is postponed, not dropped.
+///    Double-promote? No -- `abort` appends the exact precommit removal and no committed ref exists.
+///
+/// 4. CONFIRM `yes`, `promote` -> `Committed`.
+///    `+1`: committed. Action: return the relinked part; the usual `tmp-fetch_<part>` re-key follows.
+///    Lose a part? No. Double-promote? No -- `promote` is the handle's single terminal operation, the
+///    handle is released immediately after it, and a second call is rejected rather than re-driving a
+///    finished transaction.
+///
+/// 5. CONFIRM `yes`, `promote` -> `MechanismFallbackAllowed` (a local ref conflict; the source proved
+///    its side, this receiver could not commit its own).
+///    `+1`: released -- a failed `promote` abandons its build on the way out.
+///    Action: return `nullptr`, the caller byte-fetches. Lose a part? No, as row 1.
+///    Double-promote? No -- the byte fetch starts from a clean slate.
+///
+/// 6. ANY OTHER EXCEPTION (an unclassified local error, or a `promote` failure outside the known
+///    retryable class).
+///    `+1`: durable if one was staged, then released by the scope guard. Action: propagate.
+///    Lose a part? No -- retry-later, exactly as row 3. Double-promote? No -- the scope guard runs
+///    `abort` before the exception leaves the function, and the handle's own destructor is the backstop
+///    if that abort's append fails.
+///
+/// The asymmetry between rows 2/5 and row 3 is the entire point of the typed boundary. A byte
+/// re-request goes back to the SAME sender, so it is a sound recovery exactly when the doubt is about
+/// the MECHANISM and the sender is known to still hold the part -- and never when the doubt is about
+/// the source itself. `adoptPartFromManifest` used to collapse the two by catching every `Exception`
+/// and returning `false`.
+///
+/// What a `yes` does NOT prove: `CaRelinkConfirmCore.tla` config `_sab_holeylist` shows that with every
+/// confirm rule intact and one incomplete listing page permitted, `ConfirmedRelinkNeverDangles` still
+/// breaks (BACKLOG `{#list-as-journal-dataloss-2026-07-25}`). A confirmed relink is therefore NOT proven
+/// dangle-free; a `yes` means only "the source still holds exactly this manifest right now", which is
+/// what closes the codex-6 handoff window and nothing more.
 MergeTreeData::MutableDataPartPtr Fetcher::relinkPartToDisk(
     const String & part_name,
     const String & tmp_prefix,
     DiskPtr disk,
-    const String & sender_manifest_bytes)
+    const String & sender_manifest_bytes,
+    const String & source_token,
+    const Poco::URI & fetch_uri,
+    const Poco::Net::HTTPBasicCredentials & credentials,
+    const ConnectionTimeouts & timeouts,
+    const ReadSettings & read_settings)
 {
     auto * ca_meta = tryGetContentAddressedExchange(disk);
     if (!ca_meta)
@@ -1262,6 +1336,19 @@ MergeTreeData::MutableDataPartPtr Fetcher::relinkPartToDisk(
         || std::string::npos != tmp_prefix.find_first_of("/.")
         || std::string::npos != part_name.find_first_of("/."))
         throw Exception(ErrorCodes::LOGICAL_ERROR, "`tmp_prefix` and `part_name` cannot be empty or contain '.' or '/' characters.");
+
+    /// Taxonomy row 1 — the capability gate, and it comes FIRST so a pre-confirm sender costs nothing.
+    /// An absent token is how such a sender identifies itself: it offers relink exactly as before and
+    /// simply has no token cookie to attach. There is no version number to consult here and that is
+    /// deliberate — the sender's advertised version says what it can serve, while the token's presence
+    /// says what it actually did for THIS offer, and only the latter can be confirmed. A relink that
+    /// cannot be confirmed is never promoted, so the bytes are fetched instead.
+    if (source_token.empty())
+    {
+        LOG_INFO(log, "Part {} was offered by relink without a source token, so the offer cannot be confirmed "
+            "(the sender predates the publish-then-confirm handshake); falling back to a byte fetch", part_name);
+        return nullptr;
+    }
 
     /// Stage under the tmp-fetch dir. The caller commits via renameTempPartAndReplace, whose
     /// moveDirectory(tmp-fetch_<part> -> <part>) re-keys this server's committed ref to the final part
@@ -1278,17 +1365,105 @@ MergeTreeData::MutableDataPartPtr Fetcher::relinkPartToDisk(
     LOG_DEBUG(log, "Relinking part {} (staged as {}) onto content-addressed disk {} from a {}-byte transferred manifest.",
         part_name, part_dir, disk->getName(), sender_manifest_bytes.size());
 
-    /// Adopt-from-manifest + publish (B7 part_manifest_v2, all-tree task 7): the receiver decodes the
-    /// transferred body, stages its OWN local manifest over the shared-pool blobs (adopt-by-hash), and
-    /// promotes it with fail-closed blob revalidation (the GC-race safety the old 4-step pin protocol
-    /// carried). Self-contained: uuid.txt/metadata_version.txt are ordinary entries in the transferred
-    /// manifest (task 6, and task 9 dropped the now-unused sidecar parameter entirely) — there is no
-    /// sidecar to reconstruct. Returns false if a referenced blob is missing/condemned in this pool —
-    /// relink not possible, the caller falls back to a byte fetch; nothing was published (no dangling ref).
-    /// Trust boundary is the interserver channel, as for a normal part fetch — see adoptPartFromManifest.
-    const bool published = ca_meta->adoptPartFromManifest(*table_uuid, part_dir, sender_manifest_bytes);
-    if (!published)
-        return nullptr;
+    /// T1 — PUBLISH. Adopt-from-manifest and precommit, stopping short of the promote (B7
+    /// part_manifest_v2, all-tree task 7): the receiver decodes the transferred body and stages its OWN
+    /// local manifest over the shared-pool blobs (adopt-by-hash). Self-contained:
+    /// uuid.txt/metadata_version.txt are ordinary entries in the transferred manifest (task 6), so there
+    /// is no sidecar to reconstruct. Trust boundary is the interserver channel, as for a normal part
+    /// fetch — see `prepareAdoptFromManifest`.
+    ///
+    /// The order is the whole protocol. This `+1` must be DURABLE before the source is asked anything,
+    /// because the question "do you still hold it?" only excludes a later removal if every subsequent GC
+    /// fold already sees the receiver's own reference (spec §correctness). Asking first and publishing
+    /// after would prove nothing about the interval in between.
+    std::unique_ptr<ICaPreparedRelink> prepared;
+    if (ca_meta->prepareAdoptFromManifest(*table_uuid, part_dir, sender_manifest_bytes, prepared)
+        == CaRelinkPrepare::MechanismFallbackAllowed)
+        return nullptr;                                     /// taxonomy row 2
+    if (!prepared)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "Relink of part {} reported a prepared write but produced no handle", part_name);
+
+    /// Belt-and-braces over the handle's own destructor: the durable `+1` is released on EVERY exit that
+    /// is not a completed promote, including an exception. `abort` is the non-throwing form by contract —
+    /// this runs while the retry-later error of row 3 is already in flight.
+    SCOPE_EXIT({
+        if (prepared)
+            prepared->abort();
+    });
+
+    /// T2 — CONFIRM. One read-only interserver question, aimed at the endpoint copied out of the fetch
+    /// URI so it reaches exactly the table and replica that made the offer. Only the literal
+    /// `CA_CONFIRM_ANSWER_PROVEN` cookie authorizes a promote: an `unproven` answer, an absent cookie
+    /// (any peer that does not implement the action) and a failed request are ONE outcome, and it is not
+    /// knowledge about the source — see `CasConfirmAnswer` on why `no` is never put on the wire.
+    bool source_proved_the_binding = false;
+    try
+    {
+        Poco::URI confirm_uri;
+        confirm_uri.setScheme(fetch_uri.getScheme());
+        confirm_uri.setHost(fetch_uri.getHost());
+        confirm_uri.setPort(fetch_uri.getPort());
+        Poco::URI::QueryParameters confirm_params;
+        for (const auto & fetch_param : fetch_uri.getQueryParameters())
+            if (fetch_param.first == "endpoint")
+                confirm_params.push_back(fetch_param);
+        confirm_params.emplace_back(CA_CONFIRM_ACTION_PARAM, source_token);
+        confirm_params.emplace_back("compress", "false");
+        confirm_uri.setQueryParameters(confirm_params);
+
+        /// `read_settings` is the caller's, which already caps HTTP retries at one: the queue owns the
+        /// retry policy for a fetch, and a silently retried confirm would widen the window it measures.
+        auto confirm_in = BuilderRWBufferFromHTTP(confirm_uri)
+                              .withConnectionGroup(HTTPConnectionGroupType::HTTP)
+                              .withBypassProxy(true)
+                              .withMethod(Poco::Net::HTTPRequest::HTTP_POST)
+                              .withTimeouts(timeouts)
+                              .withSettings(read_settings)
+                              .withDelayInit(false)
+                              .create(credentials);
+        /// The confirm answer is a cookie and the response body is empty by construction. Requiring EOF
+        /// before reading the answer means a response carrying anything at all — a misrouted reply, a
+        /// desynchronized peer — is unproven rather than half-parsed.
+        assertEOF(*confirm_in);
+        source_proved_the_binding
+            = confirm_in->getResponseCookie(CA_CONFIRM_ANSWER_COOKIE, "") == CA_CONFIRM_ANSWER_PROVEN;
+    }
+    catch (...)
+    {
+        /// Not a fallback: a confirm that could not be delivered is the same "not proven" as a refusal,
+        /// and it takes the same path out. Logged rather than propagated so the error the caller sees is
+        /// the one that names the relink — but logged in full, because the reason (refused, timed out,
+        /// 500) exists nowhere else. `information`, not `error`: a peer restarting mid-fetch is ordinary,
+        /// and the throw below is what makes the failure loud.
+        tryLogCurrentException(log, fmt::format("while confirming the relink offer for part {} with {}",
+            part_name, fetch_uri.getHost()), LogsLevel::information);
+        source_proved_the_binding = false;
+    }
+
+    if (!source_proved_the_binding)
+    {
+        /// Taxonomy row 3. Locally generated on purpose — nothing here is the source's error to report —
+        /// and thrown rather than returned, because the one recovery that is NOT sound after this is a
+        /// byte re-request to the same source. `NETWORK_ERROR` puts it in the retry-later class, so the
+        /// queue stores it, backs off, and re-selects on re-execution.
+        throw Exception(ErrorCodes::NETWORK_ERROR,
+            "Source {} did not prove it still holds the manifest it offered for part {} by relink; "
+            "the relink is abandoned and the fetch will be retried later",
+            fetch_uri.getHost(), part_name);
+    }
+
+    /// T3 — PROMOTE. Only now, and only because the source proved the binding at T2 > T1.
+    switch (prepared->promote())
+    {
+        case CaRelinkPromote::Committed:
+            break;
+        case CaRelinkPromote::MechanismFallbackAllowed:
+            return nullptr;                                 /// taxonomy row 5
+    }
+    /// The single terminal operation is done, so the handle owes nothing; releasing it here also disarms
+    /// the scope guard for the part-building code below.
+    prepared.reset();
 
     auto volume = std::make_shared<SingleDiskVolume>("volume_" + part_name, disk);
 

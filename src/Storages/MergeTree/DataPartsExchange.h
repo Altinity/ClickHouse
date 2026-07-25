@@ -18,11 +18,17 @@ namespace zkutil
     using ZooKeeperPtr = std::shared_ptr<ZooKeeper>;
 }
 
+/// Only the content-addressed relink's confirm request needs these, and only as parameter types, so
+/// they are declared rather than included — this header is pulled in by the whole replication tree.
+namespace Poco { class URI; }
+namespace Poco::Net { class HTTPBasicCredentials; }
+
 namespace DB
 {
 
 class StorageReplicatedMergeTree;
 class ReadWriteBufferFromHTTP;
+struct ReadSettings;
 
 /// Declared by `ContentAddressedExchange.h` (the narrow content-addressed seam). Opaque-enum-declared
 /// here so this header stays free of content-addressed includes; the definition must keep the same
@@ -137,19 +143,32 @@ private:
         ThrottlerPtr throttler,
         bool sync);
 
-    /// CAS replication 2b — fetch-by-relink (spec §4). Build a part WITHOUT downloading any bytes by
-    /// publishing this server's own ref to the blobs already in the shared content-addressed pool. Stages
-    /// the ref under the tmp-fetch dir (so the caller's renameTempPartAndReplace re-keys it to the final
-    /// part name, exactly as for a byte-fetched part), loads the part from the shared manifest, and
-    /// returns it. Returns nullptr if the relink is not possible (the transferred manifest's blobs are
-    /// not resolvable in this pool — missing/condemned), in which case the caller falls back to a byte fetch.
-    /// Self-contained (all-tree task 7): the transferred manifest alone is enough to rebuild the part — no
-    /// separate uuid/metadata_version wire fields to reconstruct as a sidecar.
+    /// CAS replication 2b — fetch-by-relink (spec §4), publish-then-confirm (spec §core-idea). Build a
+    /// part WITHOUT downloading any bytes by publishing this server's own ref to the blobs already in the
+    /// shared content-addressed pool. Stages the ref under the tmp-fetch dir (so the caller's
+    /// renameTempPartAndReplace re-keys it to the final part name, exactly as for a byte-fetched part),
+    /// ASKS THE SOURCE whether it still holds exactly the manifest it offered, and only then promotes and
+    /// loads the part. Self-contained (all-tree task 7): the transferred manifest alone is enough to
+    /// rebuild the part — no separate uuid/metadata_version wire fields to reconstruct as a sidecar.
+    ///
+    /// The whole failure taxonomy lives at the definition; the two outcomes a CALLER must distinguish:
+    /// `nullptr` means relink cannot work here and the source still has the part, so a byte re-request to
+    /// the SAME source is sound; a THROW means the source could not prove it still holds the manifest,
+    /// and the one recovery that is not sound is asking that same source for the bytes.
+    ///
+    /// `source_token`, `fetch_uri` and the connection parameters are what the confirm request is built
+    /// from: the token is the sender's opaque offer identity, and the request is aimed at the endpoint
+    /// COPIED out of the fetch URI so it cannot reach a different table or replica than the offer did.
     MergeTreeData::MutableDataPartPtr relinkPartToDisk(
         const String & part_name,
         const String & tmp_prefix,
         DiskPtr disk,
-        const String & sender_manifest_bytes);
+        const String & sender_manifest_bytes,
+        const String & source_token,
+        const Poco::URI & fetch_uri,
+        const Poco::Net::HTTPBasicCredentials & credentials,
+        const ConnectionTimeouts & timeouts,
+        const ReadSettings & read_settings);
 
     MergeTreeData::MutableDataPartPtr downloadPartToDiskRemoteMeta(
        const String & part_name,

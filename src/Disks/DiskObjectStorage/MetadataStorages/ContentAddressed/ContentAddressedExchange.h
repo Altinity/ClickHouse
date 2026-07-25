@@ -2,6 +2,7 @@
 
 #include <base/types.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
+#include <memory>
 #include <optional>
 #include <string_view>
 
@@ -64,6 +65,62 @@ struct CasRelinkSourceToken
 /// offer, and the receiver's confirm is simply unproven.
 std::optional<String> encodeCasRelinkSourceToken(const CasRelinkSourceToken & token);
 std::optional<CasRelinkSourceToken> decodeCasRelinkSourceToken(std::string_view text);
+
+/// Receiver side, the outcome of staging a relink (spec §failure-taxonomy). Two values, because the
+/// receiver has exactly two safe responses to a relink that did not commit, and they are NOT
+/// interchangeable:
+///  - `Prepared` -- the receiver's `+1` is durable and the caller now OWES the handle a terminal
+///    operation. It has published nothing yet.
+///  - `MechanismFallbackAllowed` -- relink cannot work here, nothing was staged, and the SENDER STILL
+///    HAS THE PART, so re-requesting the bytes from that same sender is a sound recovery.
+///
+/// A failure to prove the source is deliberately NOT representable here. That is the whole reason this
+/// is typed at all: `adoptPartFromManifest` used to catch every `Exception` and return `false`, which
+/// turned "the source could not prove it still holds the manifest" into "ask the source for the bytes"
+/// -- the one recovery that is unsound, because the doubt is about the source itself.
+enum class CaRelinkPrepare : uint8_t
+{
+    Prepared,
+    MechanismFallbackAllowed,
+};
+
+/// Receiver side, the outcome of promoting a prepared relink. Same two-value discipline: either the
+/// receiver's ref is committed, or the promote failed in a way that leaves the sender's copy the only
+/// authority and its bytes a sound recovery (a ref conflict, a precommit that is no longer the live
+/// owner). Anything else PROPAGATES as an exception rather than becoming a value here -- an unclassified
+/// local failure is not evidence that a byte fetch would fare better, and hiding it is exactly the
+/// catch-all this boundary replaced.
+enum class CaRelinkPromote : uint8_t
+{
+    Committed,
+    MechanismFallbackAllowed,
+};
+
+/// Receiver side: a relink that is DURABLE BUT NOT PROMOTED, as the exchange sees it. It exists because
+/// the confirm has to interpose between the receiver's `+1` becoming durable and the promote (spec
+/// §relink-handle), and it is abstract so `DataPartsExchange` can own that window without owning any
+/// content-addressed type.
+///
+/// Exactly one terminal operation is owed, `promote` or `abort`. Destruction is a backstop, not a
+/// substitute: the underlying transaction's precommit binding is live-epoch, so no sweep and no GC
+/// reclaims it -- only the removal that `abort` appends does.
+class ICaPreparedRelink
+{
+public:
+    virtual ~ICaPreparedRelink() = default;
+
+    /// Commits the receiver's ref over the shared-pool blobs. Call ONLY after the source has proven it
+    /// still holds exactly the offered manifest.
+    virtual CaRelinkPromote promote() = 0;
+
+    /// Releases the durable `+1` by appending the exact precommit removal. NEVER THROWS, and that is a
+    /// requirement rather than a convenience: this is what a scope guard runs while an exception is
+    /// already in flight (the receiver's own retry-later error), and it must neither replace that error
+    /// nor terminate the process. An append that fails is logged here and retried by the underlying
+    /// handle's own destructor. Calling it after a `promote` -- successful or not -- is a no-op: a
+    /// promote that failed has already discharged the duty on its way out.
+    virtual void abort() noexcept = 0;
+};
 
 /// Purpose-built seam for `DataPartsExchange`: it exposes everything replication needs from a
 /// content-addressed disk and nothing else. `ContentAddressedMetadataStorage` implements it, and
@@ -128,22 +185,31 @@ public:
     /// protect the wrong blobs.
     virtual std::optional<RelinkOffer> getRelinkOffer(const String & part_path) const = 0;
 
-    /// Receiver side: decodes the transferred manifest, performs a normal local build from shared-
-    /// pool blob references without reading blob bodies from the sender, and stages a fresh manifest
-    /// in the receiver namespace derived from `table_uuid`. The sender's `root_namespace_id` is
-    /// ignored. The build calls `precommitAdd` and then `promote`. Promotion trusts the adopted
-    /// references through the durable manifest edge — it does not re-read each blob body — the same
-    /// interserver trust as an ordinary `ReplicatedMergeTree` fetch. Returns `true` only after the
-    /// local manifest is committed and its ref is live. Returns `false` without publishing anything on
-    /// a manifest decode failure, on a retryable promote failure (a body-absent precommit, a precommit
-    /// that is no longer the live owner, or a ref conflict, reported as `ABORTED` or `NETWORK_ERROR`),
-    /// or on any other error; the caller then falls back to fetching the part bytes. A blob that
-    /// becomes absent or condemned after adoption is not caught here; it is an fsck-detectable
+    /// Receiver side, the FIRST half of a relink: decode the transferred manifest, perform a normal
+    /// local build from shared-pool blob references without reading a single blob body from the sender,
+    /// stage a fresh manifest in the receiver namespace derived from `table_uuid`, `precommitAdd` it --
+    /// and STOP. The sender's `root_namespace_id`, `ManifestRef` and `payload_digest` are ignored; only
+    /// the entries are used.
+    ///
+    /// On `Prepared` the receiver's `+1` is DURABLE and `out` holds the handle that owes the terminal
+    /// operation; nothing is committed and no ref is live yet. The promote is deferred because the
+    /// receiver must first ask the source whether it still holds exactly this manifest (spec
+    /// §core-idea): the `+1` has to be durable BEFORE that question is asked, or the answer proves
+    /// nothing about the window that follows it.
+    ///
+    /// On `MechanismFallbackAllowed` nothing was staged and `out` is null: the manifest did not decode,
+    /// or the local staging hit the retryable class (a body-absent precommit, a precommit that is no
+    /// longer the live owner, a ref conflict -- `ABORTED`/`NETWORK_ERROR`). Any OTHER error propagates.
+    ///
+    /// Promotion trusts the adopted references through the durable manifest edge -- it does not re-read
+    /// each blob body -- the same interserver trust as an ordinary `ReplicatedMergeTree` fetch. A blob
+    /// that becomes absent or condemned after adoption is not caught here; it is an fsck-detectable
     /// invariant violation.
-    virtual bool adoptPartFromManifest(
+    virtual CaRelinkPrepare prepareAdoptFromManifest(
         const String & table_uuid,
         const String & part_name,
-        const String & manifest_bytes) = 0;
+        const String & manifest_bytes,
+        std::unique_ptr<ICaPreparedRelink> & out) = 0;
 
     /// ==== `DiskObjectStorage::prepareRead` hooks ====
     /// The two CA-only reads `DiskObjectStorage::prepareRead` needs before it composes the standard

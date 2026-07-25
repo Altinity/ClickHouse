@@ -356,11 +356,13 @@ public:
     /// that same resolution, or nullopt when the path is not a committed CA part or the token cannot be
     /// minted. Missing or corrupt committed state propagates as an exception.
     std::optional<RelinkOffer> getRelinkOffer(const String & part_path) const override;
-    /// Adopts a peer-supplied manifest into this server's namespace without transferring blob bodies.
-    /// Returns false for decode or retryable publication failures so the caller can perform a byte
-    /// fetch; read-only disks throw `READONLY`.
-    bool adoptPartFromManifest(
-        const String & table_uuid, const String & part_name, const String & manifest_bytes) override;
+    /// Stages a peer-supplied manifest into this server's namespace without transferring blob bodies and
+    /// hands back the durable-but-unpromoted handle. Answers `MechanismFallbackAllowed` for a decode
+    /// failure or a retryable staging failure so the caller can byte-fetch instead; read-only disks
+    /// throw `READONLY`.
+    CaRelinkPrepare prepareAdoptFromManifest(
+        const String & table_uuid, const String & part_name, const String & manifest_bytes,
+        std::unique_ptr<ICaPreparedRelink> & out) override;
 
     /// ==== wiring-internal surface (the transaction + the disk's prepareRead CA branch) ====
 

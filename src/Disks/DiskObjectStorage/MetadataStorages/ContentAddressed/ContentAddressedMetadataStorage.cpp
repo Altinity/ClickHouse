@@ -2034,30 +2034,108 @@ ContentAddressedMetadataStorage::getRelinkOffer(const String & part_path) const
     return RelinkOffer{.manifest_bytes = Cas::encodePartManifest(*view->manifest()), .confirm_token = *token};
 }
 
+namespace
+{
+
+/// The exchange's view of one durable-but-unpromoted relink: a `Cas::PreparedPartWrite` with the two
+/// content-addressed-free verbs `DataPartsExchange` is allowed to know about.
+///
+/// It also OWNS a `shared_ptr` snapshot of the part-folder facade, and that is load-bearing rather than
+/// tidy: `PreparedPartWrite` holds its owner as a raw pointer, and this handle deliberately outlives
+/// the call that made it -- it spans an interserver round trip -- so a concurrent `shutdown` resetting
+/// the disk's facade would dangle that pointer. The snapshot is declared BEFORE the write, so the write
+/// (and any abort its destructor runs) is destroyed first, while the facade is still alive.
+class PreparedRelinkOverPartWrite : public ICaPreparedRelink
+{
+public:
+    PreparedRelinkOverPartWrite(std::shared_ptr<Cas::CachedPartFolderAccess> access_, Cas::PreparedPartWrite write_,
+                                String part_name_)
+        : access(std::move(access_)), write(std::move(write_)), part_name(std::move(part_name_))
+    {
+    }
+
+    CaRelinkPromote promote() override
+    {
+        try
+        {
+            write.promote();
+            return CaRelinkPromote::Committed;
+        }
+        catch (const Exception & e)
+        {
+            /// The same retryable class the staging half classifies: a body-absent precommit, a
+            /// precommit binding that is no longer the live owner, or a ref conflict. `promote` has
+            /// already abandoned the build on its way out, so the `+1` is released and the sender's
+            /// bytes are a sound recovery. Anything else propagates -- it is not a known-safe
+            /// mechanism failure, and the receiver must not silently turn it into a byte fetch.
+            if (e.code() != ErrorCodes::ABORTED && e.code() != ErrorCodes::NETWORK_ERROR)
+                throw;
+            LOG_INFO(getLogger("ContentAddressedMetadataStorage"),
+                "Relink of part {} could not be promoted (body-absent precommit, precommit not the live "
+                "owner, or a ref conflict): {}; the caller may fetch the bytes from the same source",
+                part_name, e.message());
+            return CaRelinkPromote::MechanismFallbackAllowed;
+        }
+    }
+
+    void abort() noexcept override
+    {
+        /// Not defensive noise: a `promote` that FAILED discharges the duty itself (its catch abandons
+        /// the build), so the scope guard that always runs finds a terminal handle on exactly that path.
+        if (write.isTerminal())
+            return;
+        try
+        {
+            write.abort();
+        }
+        catch (...)
+        {
+            /// The removal append did not land. `PreparedPartWrite` stays non-terminal, so its own
+            /// destructor retries it; beyond that the durable backstop is the ref lane's wedge, exactly
+            /// as for every other abandon path.
+            tryLogCurrentException(getLogger("ContentAddressedMetadataStorage"),
+                fmt::format("aborting the prepared relink of part {}", part_name));
+        }
+    }
+
+private:
+    std::shared_ptr<Cas::CachedPartFolderAccess> access;
+    Cas::PreparedPartWrite write;
+    String part_name;
+};
+
+}
+
 /// TRUST MODEL: adopting a part from a peer-supplied manifest is exactly as trusted as an ordinary
 /// ReplicatedMergeTree interserver part fetch. The interserver HTTP channel — not a per-blob ACL — is
 /// the trust boundary: a malicious or MITM peer on that channel can already serve arbitrary part bytes
 /// that the receiver adopts, in both the byte-streaming and the relink path. Table-level RBAC never
 /// defended against a hostile peer, so relink-by-manifest adds no new trust surface. (See the retracted
 /// umbrella "RBAC bypass" finding.)
-bool ContentAddressedMetadataStorage::adoptPartFromManifest(
-    const String & table_uuid, const String & part_name, const String & manifest_bytes)
+CaRelinkPrepare ContentAddressedMetadataStorage::prepareAdoptFromManifest(
+    const String & table_uuid, const String & part_name, const String & manifest_bytes,
+    std::unique_ptr<ICaPreparedRelink> & out)
 {
-    checkNotReadOnly("adoptPartFromManifest (interserver relink receiver)");
+    checkNotReadOnly("prepareAdoptFromManifest (interserver relink receiver)");
     /// Write class: publishing a receiver-local ref; throws typed on a Vanished disk, 668 while uncertain.
     checkOpAdmitted(CasOpClass::Write);
 
-    /// Receiver side. Sender identity is non-authoritative: we ignore the decoded
-    /// ManifestRef, root_namespace_id and payload_digest, and use ONLY the entries. We run a normal
-    /// LOCAL build (the proven republishRef sequence) over the SHARED-pool blobs — adopted by hash via
-    /// adoptEvidence, NO blob body transferred — then stage a FRESH receiver-local ManifestId in the
-    /// receiver namespace, `precommitAdd`, and promote. Promotion trusts the adopted leaves
-    /// via the durable manifest edge (no per-file HEAD/loadMeta probe); a genuinely-absent adopted blob is
-    /// an invariant violation caught by fsck, not here — the ordinary
-    /// ReplicatedMergeTree interserver trust. A retryable promote failure (a body-absent precommit, a
-    /// precommit that is no longer the live owner, or a ref conflict => `ABORTED` or `NETWORK_ERROR`, the
-    /// retry-later class), a manifest decode failure, or any other error returns false, publishing NOTHING,
-    /// so the caller byte-fetches instead.
+    /// Receiver side. Sender identity is non-authoritative: we ignore the decoded ManifestRef,
+    /// root_namespace_id and payload_digest, and use ONLY the entries. We run a normal LOCAL build over
+    /// the SHARED-pool blobs — adopted by hash via adoptEvidence, NO blob body transferred — then stage a
+    /// FRESH receiver-local ManifestId in the receiver namespace and `precommitAdd` it.
+    ///
+    /// The promote does NOT happen here, and that split is the fix for the commit-before-release gap
+    /// this function used to carry (codex-6). The sender's relink response is fire-and-forget: it
+    /// releases the source part when `processQuery` returns, so if this `+1` were not yet durable while
+    /// the source's now-`Outdated` part was collected, the receiver would commit a manifest whose blobs
+    /// are gone. Publishing FIRST and asking SECOND removes the window: any removal of the source
+    /// binding is appended strictly after a `+1` every subsequent GC fold can see.
+    ///
+    /// Promotion trusts the adopted leaves via the durable manifest edge (no per-file HEAD/loadMeta
+    /// probe); a genuinely-absent adopted blob is an invariant violation caught by fsck, not here — the
+    /// ordinary ReplicatedMergeTree interserver trust.
+    out.reset();
 
     Cas::PartManifest decoded;
     try
@@ -2070,47 +2148,32 @@ bool ContentAddressedMetadataStorage::adoptPartFromManifest(
             throw;
         LOG_INFO(getLogger("ContentAddressedMetadataStorage"), "Relink of part {} not possible: transferred manifest failed to decode ({}); "
             "caller falls back to a byte fetch", part_name, e.message());
-        return false;
+        return CaRelinkPrepare::MechanismFallbackAllowed;
     }
 
     /// The RECEIVER namespace, derived from THIS server's table_uuid — never the sender's
     /// root_namespace_id (which is foreign to this server's path-mirroring identity).
     const Cas::RootNamespace receiver_ns = liveNamespace(table_uuid);
 
+    auto access = partAccess();
     try
     {
-        /// Sender identity is NON-AUTHORITATIVE: only the entries are used. The blobs are already
-        /// in the shared pool (referenced by hash) — publishEntries adopts them as tokenless
-        /// W-EVIDENCE; promotion trusts them through the durable manifest edge (no per-blob re-probe).
-        ///
-        /// There is a commit-before-release gap. The relink sender is
-        /// fire-and-forget (DataPartsExchange.cpp:256-259 releases the source part before this commit), so
-        /// there is no in-degree overlap: if THIS precommitAdd edge-PUT stalls across >= 2 GC folds while
-        /// the source's Outdated part is concurrently collected and the blob has no other ref, the blob can
-        /// be reclaimed under us → a dangling committed manifest (fsck-detected). deleteExact covers every
-        /// token-CHANGE recovery; only this same-token tail remains. A retention floor for read-replica
-        /// snapshots is the intended protection for the source manifest while this asynchronous relink
-        /// is in progress, but that protocol is not wired here yet; the current same-token tail remains
-        /// an acknowledged fsck-detectable risk.
-        /// Do NOT build a bespoke relink handshake — the Poco interserver transport is half-duplex.
-        partAccess()->publishEntries({receiver_ns, part_name}, decoded.entries, Cas::ProvenanceOp::Attach);
-        return true;
+        out = std::make_unique<PreparedRelinkOverPartWrite>(
+            access, access->prepareEntries({receiver_ns, part_name}, decoded.entries, Cas::ProvenanceOp::Attach), part_name);
+        return CaRelinkPrepare::Prepared;
     }
     catch (const Exception & e)
     {
-        /// `ABORTED` or `NETWORK_ERROR` means a body-absent precommit, a precommit binding that is no longer
-        /// the live owner, or a ref conflict: retryable, the caller byte-fetches. Both codes are part of
-        /// the retry-later path so merge backoff can engage. Promotion trusts the adopted pool blobs through the durable manifest edge,
-        /// so an absent or condemned blob is an fsck finding, not a relink abort. Any other exception:
-        /// fail safe to a byte fetch too (publish
-        /// nothing), but log it as it is not the expected retryable path.
-        if (e.code() == ErrorCodes::ABORTED || e.code() == ErrorCodes::NETWORK_ERROR)
-            LOG_INFO(getLogger("ContentAddressedMetadataStorage"), "Relink of part {} deferred (body-absent precommit, "
-                "precommit not the live owner, or a ref conflict): {}; caller falls back to a byte fetch", part_name, e.message());
-        else
-            LOG_WARNING(getLogger("ContentAddressedMetadataStorage"), "Relink of part {} failed with an unexpected error: {}; caller falls back to a "
-                "byte fetch", part_name, e.message());
-        return false;
+        /// `ABORTED` or `NETWORK_ERROR` means a body-absent precommit, a precommit binding that is no
+        /// longer the live owner, or a ref conflict: retryable, and the sender still has the part, so the
+        /// caller may fetch its bytes. `prepareEntries` abandons its own build before propagating, so
+        /// nothing is staged and no `+1` is left behind. Any other error propagates — an unclassified
+        /// local failure is not evidence that a byte fetch would do better.
+        if (e.code() != ErrorCodes::ABORTED && e.code() != ErrorCodes::NETWORK_ERROR)
+            throw;
+        LOG_INFO(getLogger("ContentAddressedMetadataStorage"), "Relink of part {} deferred (body-absent precommit, "
+            "precommit not the live owner, or a ref conflict): {}; caller falls back to a byte fetch", part_name, e.message());
+        return CaRelinkPrepare::MechanismFallbackAllowed;
     }
 }
 
