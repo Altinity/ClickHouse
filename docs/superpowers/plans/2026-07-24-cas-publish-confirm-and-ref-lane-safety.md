@@ -1206,6 +1206,39 @@ re-reading the function before each edit.
 
 ---
 
+## Task 20b: CODEX REVIEW OF ALL OF PART B — mandatory gate before the soak (user instruction, 2026-07-25) {#partb-codex-review}
+
+**Runs when Tasks 9-16 are all complete, and BEFORE Task 21's soak.** That order is deliberate: a soak is
+hours of machine time and its failures are expensive to attribute, so it should run on reviewed code, not
+be used as the first reader. If the review lands findings, fix them and only then soak.
+
+**Scope: the whole of Part B as one change, not task by task.** The per-task subagents each saw only their
+own task; nobody has yet read tasks 9-16 as a single protocol. That seam is exactly where the defects will
+be — an invariant each task preserves locally but the composition does not.
+
+**Prompt discipline, learned from the two codex RCAs run on 2026-07-25** (`tmp/gc-collapse-rca/`,
+`tmp/leak-rca/`, both of which produced findings that survived independent verification): give FACTS and
+artifacts, state no hypothesis as fact, and say plainly where the author is inferring. Both of those runs
+corrected conclusions I had already written down, which is the entire value.
+
+**Must be handed to the reviewer explicitly, because they postdate the spec and the plan:**
+- BACKLOG `{#list-as-journal-dataloss-2026-07-25}` — GC's fold cursor advances over the records a round
+  OBSERVED, from a paginated `LIST` with no completeness proof; blast radius is live-blob deletion.
+- `docs/superpowers/models/CaRelinkConfirmCore.tla`, config `_sab_holeylist` — that finding mechanised:
+  with every confirm rule intact and ONE incomplete page permitted, `ConfirmedRelinkNeverDangles` breaks.
+  So `_main` passing means "the confirm protocol adds no new dangle path", NOT "a confirmed relink cannot
+  dangle", and the reviewer must not be allowed to read it as the latter.
+- The `No`-vs-`Unknown` ordering carried from Task 10 into Task 11: rule 6 (fence) is evaluated LAST, so a
+  fence-lost mount answers `No`. Nothing may treat `No` as authoritative knowledge without hoisting rule 6.
+  Ask the reviewer specifically whether anything in Tasks 13-16 broke that.
+
+**Ask for, at minimum:** whether the composition preserves the spec's invariants; whether any path can
+produce a `Yes` from a stale or partially-recovered view; whether the upstream footprint stayed within the
+authorization ({#upstream-authorization}); what the receiver does on each failure-taxonomy branch and
+whether any branch can lose or double-promote a part; and what is NOT covered by the tests that exist.
+
+---
+
 ## Task 21: Part B soak gate — 20-minute shakeout first, then 4 hours
 
 **Why this task exists.** Task 16's pytest battery proves the confirm protocol FUNCTIONS. It does not
