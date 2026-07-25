@@ -653,3 +653,14 @@ matter how many generic allocation failures occurred, and to wire in today's two
   presumably next. Disk 330G, 61G RAM, load 1.1.
   (The long untracked list under `utils/ca-soak/` is pre-existing soak-run debris — `*.db`, `*_curve.tsv`,
   compose variants — none of it from this round; leaving it alone.)
+- 17:09 UTC — watchdog: idle, all round work committed, disk 331G, 61G RAM, load 0.4. S42 landed
+  (`c44cb6cbe44`) plus its finding (`017d5fa22a4` — every scenario's GC verdict was vacuous; verified
+  independently against `system.columns` before believing the report).
+  Dispatched **Task 18** (do not wedge a ref lane when no attempt was ever sent — finding #37 defect 3's
+  behavioural half). Chosen because it is CAS-internal (`Pool/CasRefLedger.cpp` only), the user asked for it
+  explicitly, and it does not touch the upstream surface Tasks 11/13 are held on. The agent was given the
+  safety argument in the direction that is easy to get backwards — a wedge protects against a PUT that may
+  have LANDED, which cannot apply when nothing was sent — and told to write the predicate so a NEWLY ADDED
+  enum member defaults to WEDGING, never to skipping.
+  Also closing a stale item from earlier in this log: the "deferred full gate for the #37 diagnostic change"
+  is satisfied — that change has been in every build since, and the battery has run green at 1335 and 1348.
