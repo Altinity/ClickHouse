@@ -367,3 +367,4 @@ fatal. Worth deciding whether the retry-later class should have its own code.
 RE-RUN: torn down with `-v`, stand recreated clean, soak v3 launched 08:33 UTC
 (`--seed 1 --phase 3 --duration 4h --insert-mode sync --max-pool-gb 12`) -> `tmp/unattended/soak_4h_v3.log`,
 ETA ~12:33 UTC. 330G free at start.
+- 08:49 UTC — watchdog: soak v3 t+0h16m healthy (STAGE steady, 0 failures, 0 checkpoints yet), log fresh, 305G free, 52G available RAM (the 1G 'free' is page cache, server MemoryTracking 1.5 GiB). No hung processes.
