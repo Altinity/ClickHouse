@@ -676,3 +676,23 @@ matter how many generic allocation failures occurred, and to wire in today's two
   each as a WRONG answer or merely an INCONCLUSIVE one. That distinction is the crux and is exactly today's
   recurring theme: a read-only mode that silently reports wrong findings would be worse than a tool that
   refuses to run. Output is a spec for the user to approve, not an implementation.
+- 17:49 UTC — watchdog: idle, everything committed, disk 330G, load 2.6 (settling after the gate run).
+  Task 19's design note landed (`c6a6c909be4`) with option (b) ruled out on verified evidence — a tool's
+  claim SUCCEEDS against an owner-absent empty root, locking the real server out.
+
+### The round has reached the boundary of what I can do without a decision
+
+Everything remaining needs the user: Tasks 11-16 (the `DataPartsExchange.cpp` / interserver-protocol
+authorization question), Task 19's implementation (which contract), Task 20 (S43, already deferred by the
+user), and the containment + journal-chain fix for the critical LIST-as-journal finding (a product
+behaviour change and a format bump — not something to start unattended).
+
+One item did NOT need a decision, so it went out rather than sitting: the two follow-ups recorded in
+scenarios/BACKLOG {#gc-observation-vacuous-2026-07-25} — an unreadable observation must not degrade to an
+empty one, and an assert whose subject is a row set needs an explicit non-vacuity decision. Harness-only,
+directly closes the hazard that made every GC verdict in the suite vacuous, and it is the third instance
+this week of the same shape. The agent must also produce an INVENTORY of every `assert_*` helper with a
+per-helper verdict, since "empty is legitimately fine here" is a decision worth recording, not a blanket
+rule.
+
+After this lands there is genuinely nothing left that does not need the user, and I will say so and stop.
