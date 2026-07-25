@@ -3116,6 +3116,18 @@ TEST(RefWriterRecoverySeal, EmptyDeadRegionCarveOutStillReportsSameProcessNamesp
     const RootNamespace ns{"test/f1_empty_carveout"};   /// matches openPoolWithConfig's own server_root_id
     std::vector<CasEvent> events;   /// declared BEFORE the Pool so it outlives the background syncer's emits (ASan 2026-07-09)
 
+    /// Burn epoch 1 the way a real predecessor does, BEFORE planting its mount. `mountWritable`
+    /// allocates the writer epoch (`CasPool.cpp`, `allocateWriterEpoch`) and only then publishes the
+    /// mount via `claimMount`, so "a mount object exists but the durable epoch object does not" is a
+    /// state production can never reach -- and since the Phase C guard landed
+    /// (`6094c1473ea`, refuse to re-mint epoch 1 while a mount object exists) it is refused as the
+    /// epoch-reset hazard it would be. Without this line the fixture asked the pool to bootstrap over
+    /// exactly that impossible state and `Pool::open` threw CORRUPTED_DATA before the test began. The
+    /// sibling seal tests never hit it only because `seedSealFixtureDeadEpochs` burns its epochs
+    /// first; this test seeds nothing on purpose (an EMPTY dead region is its whole subject), so it
+    /// has to burn the epoch itself. The NAMESPACE stays empty either way -- that is what the test is
+    /// about, not the server root.
+    allocateWriterEpoch(*backend, layout, "test");                /// burns epoch 1, as the predecessor did
     seedUncleanPredecessorMount(*backend, layout, /*epoch=*/1);   /// predecessor dies uncleanly at epoch 1
 
     PoolConfig config;
