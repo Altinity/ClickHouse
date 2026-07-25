@@ -70,6 +70,7 @@ public:
         std::cout << "reachable=" << report.reachable << " dangling=" << report.dangling << " unreachable=" << report.unreachable
                   << " pending_gc=" << report.pending_gc << " awaiting_gc=" << report.awaiting_gc
                   << " unaccounted=" << report.unaccounted
+                  << " stale_edge=" << report.stale_edge
                   << " snapshot_oracle_mismatches=" << report.snapshot_oracle_mismatches
                   << " snapshot_oracle_checked=" << report.snapshot_oracle_checked
                   << " physical_bytes=" << report.physical_bytes << " referenced_logical_bytes=" << report.referenced_logical_bytes
@@ -80,11 +81,20 @@ public:
         std::cout << "\n";
 
         /// De-alarm the pipeline classes for humans: on an active pool a nonzero pending/awaiting
-        /// count is the ack-floor deletion pipeline working as designed, not a leak.
+        /// count is the ack-floor deletion pipeline working as designed, not a leak. `stale_edge` is
+        /// deliberately NOT part of this sentence: those blobs look exactly like an `AwaitingGc`
+        /// backlog but will never drain, and being swept into "expected, no action needed" is what
+        /// hid them.
         if (report.pending_gc + report.awaiting_gc > 0)
             std::cout << "note: " << report.pending_gc + report.awaiting_gc
                       << " unreferenced object(s) are inside the normal GC deletion pipeline "
                          "(condemn -> graduate -> exact-token delete takes ~2-3 rounds) — expected, no action needed\n";
+        if (report.stale_edge > 0)
+            std::cout << "note: " << report.stale_edge
+                      << " unreferenced object(s) carry ONLY source edges naming manifests that no longer "
+                         "exist: their in-degree can never reach zero, so the incremental GC will never "
+                         "reclaim them — NOT expected, investigate (a rebuild of the in-degree state is the "
+                         "only way to clear them)\n";
         if (report.unaccounted > 0)
             std::cout << "note: " << report.unaccounted
                       << " object(s) are outside the current GC view — normal only as a transient "
@@ -104,6 +114,7 @@ public:
                     case Cas::FsckClass::PendingGc:   c = "pending-gc"; break;
                     case Cas::FsckClass::AwaitingGc:  c = "awaiting-gc"; break;
                     case Cas::FsckClass::Unaccounted: c = "unaccounted"; break;
+                    case Cas::FsckClass::StaleEdge:   c = "stale-edge"; break;
                     case Cas::FsckClass::SnapshotOracleMismatch: c = "snapshot-oracle-mismatch"; break;
                     case Cas::FsckClass::CorruptedRun: c = "corrupted-run"; break;
                 }

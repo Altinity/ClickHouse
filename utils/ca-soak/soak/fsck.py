@@ -139,16 +139,35 @@ def run_fsck(container: str, disk: str = "ca_ro", detail: bool = True,
 
     if detail:
         # Detail rows: TSV with the object class in column 0. pending-gc / awaiting-gc are the
-        # ack-floor deletion pipeline mid-flight (expected); unaccounted = outside the GC view.
+        # ack-floor deletion pipeline mid-flight (expected); unaccounted = outside the GC view;
+        # stale-edge = every source edge on the blob names a manifest that no longer exists, so its
+        # in-degree can never reach zero and the incremental GC can never reclaim it (a hard finding,
+        # NOT pipeline backlog).
+        #
+        # This whitelist is a KNOWN HAZARD, not a nicety: a class the product emits but this list omits
+        # is dropped SILENTLY, so the harness under-reports exactly the objects a new fsck class was
+        # added to surface. That is how `awaiting-gc` objects sat mislabelled as B140 M-F debris for
+        # months. Whenever `FsckClass` gains a member, extend this tuple in the same change — and note
+        # the parser below now warns rather than discarding an unknown class outright.
+        known_classes = (
+            "reachable", "dangling", "unreachable", "pending-gc", "awaiting-gc", "unaccounted",
+            "stale-edge",
+        )
         detail_rows: list[dict] = []
+        unknown_classes: set[str] = set()
         for ln in p.stdout.splitlines():
             parts = ln.split("\t")
-            if len(parts) >= 3 and parts[0] in (
-                    "reachable", "dangling", "unreachable", "pending-gc", "awaiting-gc", "unaccounted"):
+            if len(parts) >= 3 and parts[0] not in known_classes and parts[0].islower() \
+                    and " " not in parts[0] and parts[2].isdigit():
+                unknown_classes.add(parts[0])
+            if len(parts) >= 3 and parts[0] in known_classes:
                 detail_rows.append(
                     {"class": parts[0], "key": parts[1], "size": int(parts[2])}
                 )
         res["detail"] = detail_rows
+        # Never silently drop a class the product knows about and this parser does not.
+        if unknown_classes:
+            res["unknown_detail_classes"] = sorted(unknown_classes)
 
     return res
 

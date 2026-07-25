@@ -473,6 +473,12 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
     std::unordered_map<BlobRef, RetiredEntry, BlobRefHash> retired_by_hash;
     std::unordered_set<BlobRef, BlobRefHash> unref_hashes;
     std::unordered_set<BlobRef, BlobRefHash> in_run_hashes;
+    /// The NON-SENTINEL source edges the snapshot still holds on each unreferenced blob, collected in
+    /// `detail` mode only. `in_run_hashes` alone answers "does GC still see this blob at all"; the
+    /// stale-edge cross-check below needs the edge IDENTITIES so it can ask whether their source
+    /// manifests still exist. Sentinel rows (`source_id == 0` — `kZeroMarker`/`kCondemned`) are not
+    /// edges and are excluded.
+    std::unordered_map<BlobRef, std::vector<UInt128>, BlobRefHash> unref_edge_sources;
     bool have_gc_state = false;
 
     for (const auto & [bkey, sz] : present_blobs)
@@ -520,6 +526,8 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
                         if (unref_hashes.contains(ref))
                         {
                             in_run_hashes.insert(ref);
+                            if (detail && source_id != UInt128{0})
+                                unref_edge_sources[ref].push_back(source_id);
                             if (!payload.empty() && payload[0] == kCondemned)
                             {
                                 const CondemnedRow row = decodeCondemnedRow(payload);
@@ -553,6 +561,59 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
         }
     }
 
+    /// STALE-EDGE cross-check. A residual `+1` whose matching `-1` never folded pins its blob at
+    /// in-degree 1 forever: every GC round recomputes the same nonzero in-degree and never nominates
+    /// the blob, so the `AwaitingGc` "expected, no action needed" label is a lie — nothing will ever
+    /// reclaim it. The edge names its source, so the check is to ask whether that source still exists:
+    /// build the set of source ids that every manifest body PRESENT in the pool would contribute, and
+    /// treat an edge outside that set as one whose source manifest is gone.
+    ///
+    /// COST: one LIST per namespace plus one GET per manifest body. It is therefore gated on `detail`
+    /// — the cheap summary path (the ca-soak fixpoint poll calls it in a loop) must not gain a single
+    /// extra request — and additionally on some unreferenced blob actually carrying a real edge, so a
+    /// pool with nothing to cross-check pays nothing.
+    ///
+    /// `stale_edge_check_available` is the fail-closed switch: a manifest body we cannot decode would
+    /// silently withhold its edges from the live set and turn every blob it owns into a false hard
+    /// finding, so one undecodable body disables the whole cross-check for this scan rather than
+    /// manufacture an error. The check may only ever SHRINK to silence, never invent a finding.
+    std::unordered_set<UInt128, UInt128Hash> live_source_ids;
+    bool stale_edge_check_available = detail && !unref_edge_sources.empty();
+    if (stale_edge_check_available)
+    {
+        for (const String & ns_str : store.listNamespaces(namespace_prefix))
+        {
+            const RootNamespace ns{ns_str};
+            std::unordered_map<String, uint64_t> manifest_bodies;
+            listAll(backend, layout.manifestNamespacePrefix(ns), manifest_bodies, on_progress, deadline,
+                    "listing manifests for the stale-edge check");
+            for (const auto & [mkey, _] : manifest_bodies)
+            {
+                checkDeadline(deadline, "reading manifests for the stale-edge check");
+                const std::optional<ManifestId> id = layout.parseManifestKey(mkey);
+                if (!id)
+                    continue;   /// foreign/malformed key under `manifests/` — contributes no source edge
+                const auto got = backend.get(mkey);
+                if (!got)
+                    continue;   /// gone between the LIST and the GET — genuinely not a live source
+                try
+                {
+                    const PartManifest body = decodePartManifest(openObject(FormatId::PartManifest, got->bytes));
+                    for (const ManifestEntry & e : body.entries)
+                        if (e.placement == EntryPlacement::Blob)
+                            live_source_ids.insert(sourceEdgeId(*id, e.path));
+                }
+                catch (...)
+                {
+                    stale_edge_check_available = false;   /// incomplete live set — do not accuse anyone
+                    break;
+                }
+            }
+            if (!stale_edge_check_available)
+                break;
+        }
+    }
+
     for (const auto & [bkey, sz] : present_blobs)
     {
         if (reachable_blobs.contains(bkey))
@@ -581,8 +642,34 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
         }
         else if (in_run_hashes.contains(hash))
         {
-            cls = FsckClass::AwaitingGc;
-            note = "edges still in the GC snapshot; the drop has not folded yet (expected)";
+            /// `in_run_hashes` only says the GC snapshot still holds SOMETHING for this blob. Split on
+            /// whether any of it is still actionable. One edge whose source manifest is PRESENT keeps
+            /// the ordinary `AwaitingGc` verdict — that manifest's removal still folds its `-1`, and an
+            /// unowned-but-present manifest is reclaimed by the orphan sweep, so the blob is genuinely
+            /// mid-pipeline. When EVERY edge names a manifest that no longer exists, no `-1` is left to
+            /// fold: the in-degree is pinned above zero for good and only a rebuild can clear it.
+            uint64_t stale_edges = 0;
+            bool all_edges_stale = false;
+            if (const auto eit = unref_edge_sources.find(hash);
+                stale_edge_check_available && eit != unref_edge_sources.end() && !eit->second.empty())
+            {
+                for (const UInt128 & source_id : eit->second)
+                    if (!live_source_ids.contains(source_id))
+                        ++stale_edges;
+                all_edges_stale = stale_edges == eit->second.size();
+            }
+
+            if (all_edges_stale)
+            {
+                cls = FsckClass::StaleEdge;
+                note = "all " + std::to_string(stale_edges) + " source edges name manifests that no longer "
+                       "exist — unreclaimable by the incremental GC (needs `ca-gc-rebuild`); NOT expected, investigate";
+            }
+            else
+            {
+                cls = FsckClass::AwaitingGc;
+                note = "edges still in the GC snapshot; the drop has not folded yet (expected)";
+            }
         }
         else if (!have_gc_state)
         {
@@ -599,6 +686,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
         {
             case FsckClass::PendingGc:   ++report.pending_gc;   break;
             case FsckClass::AwaitingGc:  ++report.awaiting_gc;  break;
+            case FsckClass::StaleEdge:   ++report.stale_edge;   break;
             default:                     ++report.unaccounted;  break;
         }
         if (detail)

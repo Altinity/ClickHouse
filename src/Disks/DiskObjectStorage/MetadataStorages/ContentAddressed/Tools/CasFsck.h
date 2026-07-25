@@ -36,6 +36,11 @@ enum class FsckClass : uint8_t
     AwaitingGc,    /// edges still in the GC snapshot (drop/reclaim not folded yet) or GC never ran — EXPECTED
     Unaccounted,   /// absent from the whole GC view — transient for a fast create+drop between rounds;
                    /// PERSISTENT occurrences should be impossible (INV-2 reachability-before-content)
+    StaleEdge,     /// every source edge the GC snapshot still holds on this blob names a manifest that no
+                   /// longer exists anywhere in the pool, so the matching `-1` can never fold: the blob's
+                   /// in-degree can never reach zero and the incremental GC can never reclaim it. Only a
+                   /// full rebuild of the in-degree state can. ERROR — never an `AwaitingGc` "expected"
+                   /// backlog, which is exactly the label that used to hide it.
     SnapshotOracleMismatch,  /// a published table snapshot's bytes diverge from an independent replay of
                              /// its logs — cache/codec corruption, ERROR
     CorruptedRun,  /// a GC source-edge run's whole-file seal checksum (`RunRef::checksum`) disagrees with
@@ -75,6 +80,11 @@ struct FsckReport
     uint64_t pending_gc = 0;     /// blobs in the retired set — deletion scheduled (expected)
     uint64_t awaiting_gc = 0;    /// blobs whose drop is not folded yet / GC never ran (expected)
     uint64_t unaccounted = 0;    /// blobs outside the GC view (transient or anomaly)
+    /// Blobs whose every remaining source edge names a manifest that no longer exists — permanently
+    /// stuck at a nonzero in-degree, unreclaimable by the incremental GC. A hard ERROR (see
+    /// `FsckClass::StaleEdge`). Populated only in `detail` mode: naming the live sources costs one GET
+    /// per manifest body, and the cheap summary path must stay request-for-request unchanged.
+    uint64_t stale_edge = 0;
 
     /// The per-hash `.meta` descriptor sibling of a blob body:
     /// pairing check between the `blobs/` physical listing's `.meta` keys and its body keys.
@@ -117,8 +127,13 @@ struct FsckReport
     /// Return whether the scan found no missing reachable object or hard integrity violation. Expected
     /// GC backlog classes do not make a report unclean, and `meta_without_body` is advisory (see its
     /// field: GC's body-then-meta delete ordering makes a body-less `.meta` a legitimate transient with
-    /// no finite hard horizon); a partial report only covers the visited subset.
-    bool clean() const { return dangling == 0 && snapshot_oracle_mismatches == 0 && corrupted_runs == 0; }
+    /// no finite hard horizon); a partial report only covers the visited subset. `stale_edge` is a hard
+    /// finding, but it is only ever nonzero in `detail` mode — a clean summary report says nothing about
+    /// stale edges, exactly as a partial report says nothing about the unvisited part of the pool.
+    bool clean() const
+    {
+        return dangling == 0 && snapshot_oracle_mismatches == 0 && corrupted_runs == 0 && stale_edge == 0;
+    }
 };
 
 /// Independently recompute reachability from authoritative refs (never from GC state or snapshots) and

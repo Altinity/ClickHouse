@@ -222,6 +222,69 @@ TEST(CasFsck, DroppedButUnfoldedBlobClassifiesAwaitingGc)
     EXPECT_EQ(rep.unaccounted, 0u);
 }
 
+/// Stale-edge cross-check, NEGATIVE side: the residual edge's source manifest body is still PRESENT in
+/// the pool, so its removal still has a `-1` to fold (and the orphan sweep still has a body to reclaim).
+/// That is a genuine mid-pipeline backlog and must keep the `AwaitingGc` verdict — the new check may
+/// never turn an ordinary unfolded drop into a hard finding.
+TEST(CasFsck, UnfoldedDropWithPresentSourceManifestStaysAwaitingGc)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref(1, 0xA1);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+    Gc gc(store, hexToU128("00000000000000000000000000000001"));
+    gc.runRegularRound();                                        /// +1 folded into the snapshot
+    dropRefTransition(*backend, store->layout(), ns, "tbl", r);  /// -1 NOT folded; the BODY survives
+
+    const FsckReport rep = runFsck(*store, /*detail*/true);
+    EXPECT_TRUE(rep.clean());
+    EXPECT_EQ(rep.awaiting_gc, 1u);
+    EXPECT_EQ(rep.stale_edge, 0u);
+    bool saw = false;
+    for (const FsckObject & o : rep.objects)
+        if (o.cls == FsckClass::AwaitingGc)
+            saw = true;
+    EXPECT_TRUE(saw);
+}
+
+/// Stale-edge cross-check, POSITIVE side: the blob's only residual `+1` names a manifest that no longer
+/// exists anywhere in the pool, so no `-1` is left to fold — the in-degree stays at 1 for every future
+/// round and the incremental GC can never nominate the blob. It must NOT be labeled `AwaitingGc`
+/// ("expected, no action needed", the sentence that hid 56 permanently retained blobs); it is the hard
+/// `StaleEdge` finding and the report is not `clean()`.
+TEST(CasFsck, ResidualEdgeNamingAnAbsentManifestClassifiesStaleEdge)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref(1, 0xA1);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    const ManifestId id = writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+    Gc gc(store, hexToU128("00000000000000000000000000000001"));
+    gc.runRegularRound();                                        /// +1 folded into the snapshot
+    dropRefTransition(*backend, store->layout(), ns, "tbl", r);  /// the owner is gone ...
+    deleteManifestBody(*backend, store->layout(), id);           /// ... and so is the body, un-folded
+
+    const FsckReport rep = runFsck(*store, /*detail*/true);
+    EXPECT_EQ(rep.stale_edge, 1u);
+    EXPECT_EQ(rep.awaiting_gc, 0u);
+    EXPECT_EQ(rep.dangling, 0u) << "no committed ref names the manifest any more — this is not a dangle";
+    EXPECT_FALSE(rep.clean());
+    bool saw = false;
+    for (const FsckObject & o : rep.objects)
+        if (o.cls == FsckClass::StaleEdge)
+        {
+            saw = true;
+            ASSERT_FALSE(o.reachable_from.empty());
+            EXPECT_NE(o.reachable_from[0].find("no longer exist"), String::npos);
+        }
+    EXPECT_TRUE(saw);
+}
+
 /// GC never ran on the pool: nothing is classifiable through the GC view — everything unreferenced
 /// is AwaitingGc ("GC has not run yet"), never a false Unaccounted alarm.
 TEST(CasFsck, GcNeverRanClassifiesAwaitingGc)
