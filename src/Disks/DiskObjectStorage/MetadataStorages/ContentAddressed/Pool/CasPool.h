@@ -797,6 +797,11 @@ public:
     size_t tailSinceSnapshotCountForTest(const RootNamespace & ns);
     size_t committedOverlayEntriesForTest(const RootNamespace & ns);
 
+    /// test seam: the ledger's live precommit view for `ns` (see
+    /// `CasRefLedger::livePrecommitsForTest`) -- the durable-but-unpromoted owner bindings, which is
+    /// what an abandoned/aborted build must leave empty.
+    std::set<std::pair<String, ManifestRef>> livePrecommitsForTest(const RootNamespace & ns);
+
     /// Test-only hook: called by `flushRefBatch`
     /// right before it carves a batch, i.e. AFTER the table is already recovered -- the one otherwise
     /// untestable timing window `BlockingGetBackend`-style backend tricks cannot reach, since a warm

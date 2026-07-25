@@ -11,6 +11,7 @@
 #include <latch>
 #include <sstream>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 namespace DB::ErrorCodes
@@ -19,6 +20,7 @@ namespace DB::ErrorCodes
     extern const int ABORTED;
     extern const int BAD_ARGUMENTS;
     extern const int CORRUPTED_DATA;
+    extern const int LOGICAL_ERROR;
 }
 
 namespace ProfileEvents
@@ -358,6 +360,153 @@ TEST(CasPartFolderAccess, PublishEntriesAbandonsBuildOnPromoteFailure)
                                                   .intended_namespace = ns, .op = Cas::ProvenanceOp::Other});
     const Cas::ManifestId rebuild_id = rebuild->stageManifest({inlineEntry("f", "same")});
     EXPECT_NO_THROW(rebuild->precommitAdd(ns, "dst", rebuild_id));
+}
+
+
+/// ==== Task 12: the prepared-part-write handle (spec §relink-handle) ====
+/// `prepareEntries` stops after `precommitAdd`, so the durable-but-unpromoted state -- the window the
+/// relink confirm round-trip has to sit inside -- becomes an OWNED object instead of an interval inside
+/// one call. Every test below pins one half of that ownership contract.
+
+/// Prepare-then-promote must be indistinguishable from today's atomic `publishEntries`, and the state
+/// BETWEEN the two halves must be exactly one live precommit and no committed ref.
+TEST(CasPartFolderAccess, PrepareThenPromoteMatchesPublishEntries)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend);
+    const Cas::RootNamespace ns{"srv/t1"};
+    Cas::CachedPartFolderAccess access(store, cacheOn());
+
+    const std::vector<Cas::ManifestEntry> entries{inlineEntry("f", "one"), inlineEntry("g", "two")};
+    const Cas::CommitOutcome published = access.publishEntries({ns, "via_publish"}, entries, Cas::ProvenanceOp::Insert);
+
+    auto prepared = access.prepareEntries({ns, "via_prepare"}, entries, Cas::ProvenanceOp::Insert);
+
+    /// The interposition point: the manifest is durable and owned by a LIVE precommit, but nothing is
+    /// committed yet. This is precisely the state the confirm round-trip runs in.
+    EXPECT_TRUE(store->livePrecommitsForTest(ns).contains({"via_prepare", prepared.manifestId().ref}))
+        << "prepareEntries must leave the precommit binding live -- it is the durable `+1`";
+    EXPECT_FALSE(access.existsRef({ns, "via_prepare"}, Cas::Freshness::ForceFresh))
+        << "prepareEntries must not commit the ref";
+
+    const Cas::CommitOutcome promoted = prepared.promote();
+    EXPECT_EQ(promoted.ns.string(), ns.string());
+    EXPECT_EQ(promoted.ref, "via_prepare");
+    EXPECT_EQ(promoted.manifest_ref, prepared.manifestId().ref);
+    EXPECT_TRUE(promoted.created);
+    EXPECT_EQ(promoted.created, published.created) << "the split must reproduce publishEntries's outcome shape";
+    EXPECT_TRUE(store->livePrecommitsForTest(ns).empty()) << "promote moves the binding out of the precommit view";
+
+    auto view = access.getView({ns, "via_prepare"}, Cas::Freshness::ForceFresh);
+    ASSERT_NE(view, nullptr);
+    EXPECT_EQ(view->inlineBytes("f"), std::optional<String>("one"));
+    EXPECT_EQ(view->inlineBytes("g"), std::optional<String>("two"));
+}
+
+/// Abort is not "drop the handle": it must APPEND the exact precommit removal. An abandoned precommit
+/// that keeps its `+1` is the retention-leak class (`BACKLOG {#unmatched-minus-one-retention-leak}`),
+/// and the stale-precommit sweep is prior-epoch-scoped, so a same-epoch leak is never reclaimed.
+/// Asserted through the ledger's own precommit view rather than inferred from a later `precommitAdd`.
+TEST(CasPartFolderAccess, PrepareThenAbortAppendsThePrecommitRemoval)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend);
+    const Cas::RootNamespace ns{"srv/t1"};
+    Cas::CachedPartFolderAccess access(store, cacheOn());
+
+    auto prepared = access.prepareEntries({ns, "part_1"}, {inlineEntry("f", "one")}, Cas::ProvenanceOp::Insert);
+    const Cas::ManifestId id = prepared.manifestId();
+    ASSERT_TRUE(store->livePrecommitsForTest(ns).contains({"part_1", id.ref}));
+
+    prepared.abort();
+
+    EXPECT_FALSE(access.existsRef({ns, "part_1"}, Cas::Freshness::ForceFresh)) << "an aborted prepare commits nothing";
+    EXPECT_FALSE(store->livePrecommitsForTest(ns).contains({"part_1", id.ref}))
+        << "abort must append the EXACT precommit removal; a same-epoch precommit left behind retains its "
+           "blobs forever (the prior-epoch-scoped stale sweep never reclaims it)";
+    EXPECT_TRUE(store->livePrecommitsForTest(ns).empty());
+    /// The precommit BODY survives (delete-after-sealed-decrements) -- the removal queues GC's `-1`,
+    /// it does not writer-delete the manifest. Mirrors
+    /// `CasPartWriteTxn.AbandonAppendsPrecommitRemovalAndKeepsLivePrecommitBody`.
+    EXPECT_TRUE(backend->head(store->layout().manifestKey(id)).exists);
+}
+
+/// A forgotten terminal must be impossible, not merely discouraged: `~PartWriteTxn` only retires the
+/// build sequence, so the handle's own destructor is the last-resort owner of the precommit removal.
+TEST(CasPartFolderAccess, DestroyingAnUnfinishedPreparedPartWriteAborts)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend);
+    const Cas::RootNamespace ns{"srv/t1"};
+    Cas::CachedPartFolderAccess access(store, cacheOn());
+
+    std::optional<Cas::ManifestId> id;
+    {
+        auto prepared = access.prepareEntries({ns, "part_1"}, {inlineEntry("f", "one")}, Cas::ProvenanceOp::Insert);
+        id = prepared.manifestId();
+        ASSERT_TRUE(store->livePrecommitsForTest(ns).contains({"part_1", id->ref}));
+    }   /// neither promoted nor aborted
+
+    EXPECT_TRUE(store->livePrecommitsForTest(ns).empty())
+        << "destruction without a terminal must still append the precommit removal";
+    EXPECT_FALSE(access.existsRef({ns, "part_1"}, Cas::Freshness::ForceFresh));
+}
+
+/// The terminal flag is explicit and one-shot: a second `promote`/`abort` is a caller bug, not an
+/// idempotent no-op, and must never re-drive the (already dead) transaction.
+TEST(CasPartFolderAccess, PreparedPartWriteRejectsASecondTerminal)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend);
+    const Cas::RootNamespace ns{"srv/t1"};
+    Cas::CachedPartFolderAccess access(store, cacheOn());
+
+    auto promoted = access.prepareEntries({ns, "promoted"}, {inlineEntry("f", "one")}, Cas::ProvenanceOp::Insert);
+    EXPECT_FALSE(promoted.isTerminal());
+    promoted.promote();
+    EXPECT_TRUE(promoted.isTerminal());
+    expectThrowsCode(ErrorCodes::LOGICAL_ERROR, [&] { promoted.promote(); });
+    expectThrowsCode(ErrorCodes::LOGICAL_ERROR, [&] { promoted.abort(); });
+
+    auto aborted = access.prepareEntries({ns, "aborted"}, {inlineEntry("f", "one")}, Cas::ProvenanceOp::Insert);
+    aborted.abort();
+    EXPECT_TRUE(aborted.isTerminal());
+    expectThrowsCode(ErrorCodes::LOGICAL_ERROR, [&] { aborted.abort(); });
+    expectThrowsCode(ErrorCodes::LOGICAL_ERROR, [&] { aborted.promote(); });
+
+    EXPECT_TRUE(access.existsRef({ns, "promoted"}, Cas::Freshness::ForceFresh));
+    EXPECT_FALSE(access.existsRef({ns, "aborted"}, Cas::Freshness::ForceFresh));
+    EXPECT_TRUE(store->livePrecommitsForTest(ns).empty());
+}
+
+/// Move-only, and the move transfers the terminal duty in full: the moved-from handle is already
+/// terminal (its destructor must not re-abort a transaction the destination now owns), while the
+/// destination still owes exactly one terminal.
+TEST(CasPartFolderAccess, PreparedPartWriteMoveTransfersTheTerminalDuty)
+{
+    static_assert(!std::is_copy_constructible_v<Cas::PreparedPartWrite>);
+    static_assert(!std::is_copy_assignable_v<Cas::PreparedPartWrite>);
+
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend);
+    const Cas::RootNamespace ns{"srv/t1"};
+    Cas::CachedPartFolderAccess access(store, cacheOn());
+
+    auto source = access.prepareEntries({ns, "part_1"}, {inlineEntry("f", "one")}, Cas::ProvenanceOp::Insert);
+    const Cas::ManifestId id = source.manifestId();
+    {
+        Cas::PreparedPartWrite moved = std::move(source);
+        /// NOLINTNEXTLINE(bugprone-use-after-move,clang-analyzer-cplusplus.Move)
+        EXPECT_TRUE(source.isTerminal()) << "a moved-from handle owes nothing";
+        expectThrowsCode(ErrorCodes::LOGICAL_ERROR, [&] { source.abort(); });
+        EXPECT_TRUE(store->livePrecommitsForTest(ns).contains({"part_1", id.ref}))
+            << "the moved-from handle must not have aborted the transaction it handed over";
+        EXPECT_EQ(moved.manifestId().ref, id.ref);
+        moved.promote();
+    }   /// the moved-from handle's destructor also runs here: it must be a no-op, not a second abort
+
+    EXPECT_TRUE(access.existsRef({ns, "part_1"}, Cas::Freshness::ForceFresh));
+    EXPECT_TRUE(store->livePrecommitsForTest(ns).empty());
 }
 
 TEST(CasPartFolderAccess, ExplainRecordsDecisions)

@@ -1584,4 +1584,9 @@ size_t Pool::committedOverlayEntriesForTest(const RootNamespace & ns)
     return ref_ledger.committedOverlayEntriesForTest(ns);
 }
 
+std::set<std::pair<String, ManifestRef>> Pool::livePrecommitsForTest(const RootNamespace & ns)
+{
+    return ref_ledger.livePrecommitsForTest(ns);
+}
+
 }

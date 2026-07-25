@@ -243,6 +243,11 @@ public:
     size_t tailSinceSnapshotCountForTest(const RootNamespace & ns);
     /// Returns the number of committed entries in the mutable overlay, when the COW representation has one.
     size_t committedOverlayEntriesForTest(const RootNamespace & ns);
+    /// Returns this table's LIVE precommit view: the exact `{ref_name, manifest}` owner bindings that
+    /// `precommitAdd` creates and that `promote` (move to committed) or `abandon` (exact precommit
+    /// removal) take away again. A leaked binding here is the same-epoch precommit leak the stale sweep
+    /// -- prior-epoch-scoped -- can never reclaim, so it is what an abandon-path test must assert on.
+    std::set<std::pair<String, ManifestRef>> livePrecommitsForTest(const RootNamespace & ns);
     /// Installs the test hook invoked immediately before the leader carves a compatible batch.
     void setRefPreCarveHookForTest(std::function<void()> hook) { ref_pre_carve_hook_for_test = std::move(hook); }
 

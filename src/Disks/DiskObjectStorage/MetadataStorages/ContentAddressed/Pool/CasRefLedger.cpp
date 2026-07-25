@@ -2434,6 +2434,14 @@ size_t CasRefLedger::committedOverlayEntriesForTest(const RootNamespace & ns)
     return rt->state.getCommitted().overlayEntriesForTest();
 }
 
+std::set<std::pair<String, ManifestRef>> CasRefLedger::livePrecommitsForTest(const RootNamespace & ns)
+{
+    const auto rt = getRefTableRuntime(ns);
+    ensureRefTableRecovered(ns, *rt);
+    std::lock_guard lock(rt->state_mutex);
+    return rt->state.getPrecommits();
+}
+
 namespace
 {
 /// A clamped-to-zero fetch-subtract for the tail counters. `trySnapshotPublishOnce` is public and NOT

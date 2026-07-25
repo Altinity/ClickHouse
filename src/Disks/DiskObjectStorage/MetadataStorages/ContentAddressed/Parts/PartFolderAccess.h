@@ -143,6 +143,64 @@ struct PartFolderValidate
     uint64_t age_seconds = 0;    /// only meaningful for Mode::Age
 };
 
+class CachedPartFolderAccess;
+
+/// A part write that has been staged and PRECOMMITTED but not yet promoted -- the durable-but-
+/// unpromoted state made into an owned object rather than an interval inside one call
+/// (spec §relink-handle). It exists because the relink confirm has to interpose between the receiver's
+/// `+1` becoming durable and the promote, so that the source can be asked whether it still holds the
+/// manifest before the receiver commits to it.
+///
+/// The handle OWNS an open `PartWriteTxn`, and DESTRUCTION IS NOT CLEANUP at the transaction level:
+/// `~PartWriteTxn` only retires the build sequence, so a dropped precommit would keep a live-epoch
+/// binding -- one the stale-precommit sweep (prior-epoch-scoped) never reclaims and GC never touches --
+/// permanently retaining the manifest's blobs. Exactly one terminal operation is therefore owed:
+/// `promote` (commit) or `abort` (append the exact precommit removal).
+///
+/// Getting that wrong is made impossible rather than merely discouraged:
+///  - move-only, and a move leaves the source terminal, so the duty is never held twice;
+///  - an explicit terminal flag, set only once the underlying operation has actually completed, so a
+///    second `promote`/`abort` is rejected with `LOGICAL_ERROR` instead of re-driving a dead
+///    transaction -- while a terminal that FAILED (an append the caller may legitimately retry) leaves
+///    the handle non-terminal;
+///  - the destructor is the last-resort guard: a handle that reaches it non-terminal aborts
+///    best-effort and logs, so a forgotten or exception-skipped terminal still appends the removal.
+class PreparedPartWrite
+{
+public:
+    PreparedPartWrite(const PreparedPartWrite &) = delete;
+    PreparedPartWrite & operator=(const PreparedPartWrite &) = delete;
+    PreparedPartWrite(PreparedPartWrite && other) noexcept;
+    PreparedPartWrite & operator=(PreparedPartWrite && other) noexcept;
+    /// Best-effort abort of a handle that never reached a terminal state; never throws.
+    ~PreparedPartWrite();
+
+    /// Completes the write: the atomic precommit-to-committed owner move, plus the facade's cache
+    /// invalidation. On failure the build is abandoned (the same catch-abandon-rethrow discipline the
+    /// atomic `publishEntries` has always applied) and the original error propagates.
+    CommitOutcome promote(bool allow_repoint = false);
+    /// Durably abandons the write: appends the EXACT precommit removal so the manifest's `+1` is
+    /// released. Propagates an append failure -- the caller may retry, and the destructor is the
+    /// backstop if it does not.
+    void abort();
+
+    /// Whether the owed terminal operation has already completed. A moved-from handle is terminal.
+    bool isTerminal() const { return terminal; }
+    /// The ref this write will commit to, and the manifest staged for it.
+    const PartRefKey & refKey() const { return key; }
+    const ManifestId & manifestId() const { return id; }
+
+private:
+    friend class CachedPartFolderAccess;
+    PreparedPartWrite(CachedPartFolderAccess & owner_, PartWriteTxnPtr build_, PartRefKey key_, ManifestId id_);
+
+    CachedPartFolderAccess * owner = nullptr;
+    PartWriteTxnPtr build;
+    PartRefKey key;
+    ManifestId id;
+    bool terminal = false;
+};
+
 /// Single facade for committed content-addressed part-folder access. Reads build immutable
 /// `PartFolderView`s; committed-ref mutations are facade methods so cache invalidation is write-through
 /// rather than a caller responsibility. A bounded retained-view map is consulted for `CachedForLoad`
@@ -208,9 +266,21 @@ public:
     /// afterward.
     CommitOutcome promoteBuild(Cas::PartWriteTxn & build, const PartRefKey & key, UInt128 build_id,
                       const Cas::ManifestId & manifest_id, bool allow_repoint = false);
+    /// The first half of the committed-publish sequence: adopt evidence over `entries`, stage a fresh
+    /// manifest, and precommit it -- then STOP. The receiver's `+1` is durable, the promote is deferred
+    /// until the caller has proven the source still holds the manifest (spec §relink-handle). The
+    /// returned handle OWNS the open transaction and must be either `promote`d or `abort`ed --
+    /// destruction alone is not cleanup at the transaction level (`~PartWriteTxn` only retires the
+    /// build sequence), which is why the handle's own destructor aborts as a last resort. A failure
+    /// inside `prepareEntries` itself abandons the build before propagating, so no handle is returned
+    /// and no precommit is leaked.
+    PreparedPartWrite prepareEntries(const PartRefKey & dst, const std::vector<Cas::ManifestEntry> & entries,
+                        Cas::ProvenanceOp op);
     /// Performs the shared committed-publish sequence: adopt evidence over
     /// `entries`, stage a fresh manifest, precommit it, and promote it. The new manifest is fully
     /// prepared before the committed ref is moved. Returns `promoteBuild`'s exact `CommitOutcome`.
+    /// Implemented as `prepareEntries` immediately followed by `promote`, so the atomic callers and the
+    /// confirm-interposed relink path share one protocol sequence.
     CommitOutcome publishEntries(const PartRefKey & dst, const std::vector<Cas::ManifestEntry> & entries,
                         Cas::ProvenanceOp op, bool allow_repoint = false);
     /// Moves a committed ref by publishing the source entries at `dst` and then dropping `src`.

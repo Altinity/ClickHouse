@@ -16,6 +16,7 @@ namespace ErrorCodes
 {
     extern const int FILE_DOESNT_EXIST;
     extern const int ABORTED;
+    extern const int LOGICAL_ERROR;
 }
 }
 
@@ -335,8 +336,119 @@ Cas::CommitOutcome CachedPartFolderAccess::promoteBuild(Cas::PartWriteTxn & buil
     return outcome;
 }
 
-Cas::CommitOutcome CachedPartFolderAccess::publishEntries(const PartRefKey & dst,
-    const std::vector<Cas::ManifestEntry> & entries, Cas::ProvenanceOp op, bool allow_repoint)
+namespace
+{
+
+/// A failed publish must not leak a live-epoch precommit binding: only `abandon` removes it (the build
+/// destructor merely retires the build seq; the stale-precommit sweep is prior-epoch-scoped and GC
+/// never touches a live precommit). `abandon` may itself fail on the same broken backend -- log and let
+/// whatever error the caller is already carrying stay primary. Returns whether the abandon completed,
+/// so a caller tracking a terminal state can tell a finished transaction from one still owing cleanup
+/// (`PartWriteTxn::abandon` stays retryable after an append failure).
+bool abandonBuildBestEffort(Cas::PartWriteTxn & build, const char * context) noexcept
+{
+    try
+    {
+        build.abandon();
+        return true;
+    }
+    catch (...)
+    {
+        tryLogCurrentException(getLogger("CachedPartFolderAccess"), context);
+        return false;
+    }
+}
+
+}
+
+PreparedPartWrite::PreparedPartWrite(CachedPartFolderAccess & owner_, PartWriteTxnPtr build_,
+                                     PartRefKey key_, ManifestId id_)
+    : owner(&owner_), build(std::move(build_)), key(std::move(key_)), id(std::move(id_))
+{
+}
+
+PreparedPartWrite::PreparedPartWrite(PreparedPartWrite && other) noexcept
+    : owner(other.owner), build(std::move(other.build)), key(std::move(other.key)), id(std::move(other.id))
+    , terminal(other.terminal)
+{
+    /// The move takes over the owed terminal operation in full: the source must never run it again,
+    /// so it is left terminal (and holding no transaction) rather than merely emptied.
+    other.owner = nullptr;
+    other.terminal = true;
+}
+
+PreparedPartWrite & PreparedPartWrite::operator=(PreparedPartWrite && other) noexcept
+{
+    if (this == &other)
+        return *this;
+    /// Overwriting a handle that still owes a terminal would silently drop that duty, so discharge it
+    /// here exactly as the destructor does.
+    if (!terminal && build)
+        terminal = abandonBuildBestEffort(*build, "aborting a prepared part write overwritten by a move assignment");
+    owner = other.owner;
+    build = std::move(other.build);
+    key = std::move(other.key);
+    id = std::move(other.id);
+    terminal = other.terminal;
+    other.owner = nullptr;
+    other.terminal = true;
+    return *this;
+}
+
+PreparedPartWrite::~PreparedPartWrite()
+{
+    if (terminal || !build)
+        return;
+    /// Last-resort guard. Reaching here means no terminal operation COMPLETED -- it was forgotten, an
+    /// exception skipped it, or one was attempted and its append failed -- so the precommit binding is
+    /// still live and its removal is appended here rather than left to leak. Best-effort and noexcept:
+    /// a destructor that propagated the append failure would terminate the process, and the durable
+    /// backstop for a removal that cannot land at all is the same one every other abandon path uses.
+    LOG_ERROR(getLogger("CachedPartFolderAccess"),
+              "PreparedPartWrite for '{}/{}' was destroyed while still owing its terminal operation; "
+              "aborting it now", key.ns.string(), key.ref);
+    abandonBuildBestEffort(*build, "aborting a prepared part write destroyed without a terminal operation");
+}
+
+Cas::CommitOutcome PreparedPartWrite::promote(bool allow_repoint)
+{
+    if (terminal)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "PreparedPartWrite for '{}/{}' has already been promoted or aborted; it owes exactly one "
+            "terminal operation",
+            key.ns.string(), key.ref);
+    try
+    {
+        Cas::CommitOutcome outcome = owner->promoteBuild(*build, key, build->buildId(), id, allow_repoint);
+        terminal = true;
+        return outcome;
+    }
+    catch (...)
+    {
+        /// The catch-abandon-rethrow discipline the atomic `publishEntries` has always owned. The
+        /// terminal flag flips only if the abandon actually landed: a failed abandon leaves the handle
+        /// owing cleanup, which the destructor then retries.
+        terminal = abandonBuildBestEffort(*build, "abandoning the build of a failed PreparedPartWrite::promote");
+        throw;
+    }
+}
+
+void PreparedPartWrite::abort()
+{
+    if (terminal)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "PreparedPartWrite for '{}/{}' has already been promoted or aborted; it owes exactly one "
+            "terminal operation",
+            key.ns.string(), key.ref);
+    /// `abandon` appends the EXACT precommit removal through the reliable append lane -- that append,
+    /// not the destruction of the transaction object, is what releases the manifest's `+1`. A failure
+    /// propagates: the caller may retry the same handle, and the destructor is the backstop.
+    build->abandon();
+    terminal = true;
+}
+
+PreparedPartWrite CachedPartFolderAccess::prepareEntries(const PartRefKey & dst,
+    const std::vector<Cas::ManifestEntry> & entries, Cas::ProvenanceOp op)
 {
     auto build = store->beginPartWrite(Cas::PartWriteInfo{.intended_ref = dst.ns.string() + "/" + dst.ref,
                                                   .intended_namespace = dst.ns, .op = op});
@@ -350,25 +462,24 @@ Cas::CommitOutcome CachedPartFolderAccess::publishEntries(const PartRefKey & dst
         /// its manifest ID, so `dst` receives a distinct manifest before ownership moves to it.
         const Cas::ManifestId id = build->stageManifest(entries);
         build->precommitAdd(dst.ns, dst.ref, id);
-        return promoteBuild(*build, dst, build->buildId(), id, allow_repoint);
+        return PreparedPartWrite(*this, std::move(build), dst, id);
     }
     catch (...)
     {
-        /// A failed publish must not leak a live-epoch precommit binding: only `abandon` removes it
-        /// (the build destructor merely retires the build seq; the stale-precommit sweep is
-        /// prior-epoch-scoped and GC never touches a live precommit). `abandon` may itself fail on the
-        /// same broken backend -- log and let the original error stay primary.
-        try
-        {
-            build->abandon();
-        }
-        catch (...)
-        {
-            tryLogCurrentException(getLogger("CachedPartFolderAccess"),
-                                   "abandoning the build of a failed publishEntries");
-        }
+        /// No handle is returned on this path, so the cleanup cannot be deferred to one: abandon here.
+        abandonBuildBestEffort(*build, "abandoning the build of a failed prepareEntries");
         throw;
     }
+}
+
+Cas::CommitOutcome CachedPartFolderAccess::publishEntries(const PartRefKey & dst,
+    const std::vector<Cas::ManifestEntry> & entries, Cas::ProvenanceOp op, bool allow_repoint)
+{
+    /// The atomic form: prepare and promote back to back, with no window in between. `promote` carries
+    /// the catch-abandon-rethrow discipline, so a failure here behaves exactly as it did when this was
+    /// one function.
+    PreparedPartWrite prepared = prepareEntries(dst, entries, op);
+    return prepared.promote(allow_repoint);
 }
 
 bool CachedPartFolderAccess::republishRef(const PartRefKey & src, const PartRefKey & dst)
