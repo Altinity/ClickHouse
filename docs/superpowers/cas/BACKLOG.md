@@ -1242,3 +1242,32 @@ the no-premature-deletion direction (see its own test comment). The retention di
 this entry shows the deletion direction is reachable by a DIFFERENT route than the counter-regression
 Task 1 guards. Tasks 13-14 (wire protocol, receiver flow) rewrite the very `tmp-fetch` lifecycle where
 this surfaced — sequence them AFTER containment, or attribution of future findings will be hopeless.
+
+## The adopted fold seal referenced a PRUNED generation's run (observed 2026-07-25, same stand) {#adopted-seal-pruned-run-2026-07-25}
+
+Noticed while verifying an unrelated change; recording the measurement before it is lost.
+
+MEASURED on the post-soak stand, one consistent read:
+- `gc/state` = `{"round":342,"gc_shards":1,"snap_generation":342,"snap_pruned_through":339,"snap_attempt":1043,...}`
+- the ADOPTED seal `soak_pool/gc/gen/342/attempt/1043/fold_seal` carried
+  `"blob_target_runs":[{"key":"soak_pool/gc/gen/339/attempt/1016/blob_target/0/0","generation":339}]`
+  (reference-parent carry — a current shard's run legitimately living under an older generation's key)
+- that run object **did not exist**: `ca-inspect` reported "key … does not exist", and an `s3` listing of
+  `soak_pool/gc/gen/**` returned only the seals for 341/342/343 plus gen 343's own run.
+
+That is exactly what `CasGc.cpp:629-645` says must never happen. `pruneSupersededGenerations` is passed a
+`referenced_generations` set built from the new seal's runs AND the parent seal's runs, with the comment
+"Retention must never reclaim these" and "a losing leader must not destroy what the winning leader's
+already-adopted seal still points at (triage #5)". Here the adopted seal's referenced generation was
+reclaimed anyway.
+
+CONSEQUENCE while it lasts: `zeroInDegree` iterates the adopted seal's runs, so an absent run yields ZERO
+candidates — GC keeps completing rounds and reclaims nothing, silently (per
+[[feedback_ca_gc_never_throw_on_404]] GC must not throw on a 404 during fold, so nothing surfaces). This is
+NOT the explanation for the 56 retained blobs — a later observation had gen 343 adopted WITH its run present
+and `candidates_marked` still 0 — but it is an independent defect and a second reason a round can quietly
+collect nothing.
+
+NOT ESTABLISHED: whether the prune raced the adopt, whether `snap_pruned_through=339` is inclusive of 339,
+or whether the parent-seal capture missed the carry. Needs the same treatment as the other GC findings: a
+targeted test, not log archaeology. Note the stand is still up.
