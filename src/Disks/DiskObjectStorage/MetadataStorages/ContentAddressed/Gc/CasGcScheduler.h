@@ -20,7 +20,11 @@ namespace DB::Cas
 struct GcRoundLogRecord
 {
     enum class EventType { Start, Finish };
-    enum class Outcome { Unknown, Success, NotALeader, Failed };
+    /// `Deferred`: the round acquired the lease and took the skip-unchanged fast path (`RoundReport::deferred`)
+    /// -- no fold, no pre-CAS deletes, no `gc/state` CAS. Distinct from `Success` so a reader of
+    /// `system.content_addressed_garbage_collection_log` (or this scheduler's own log line) can tell a round
+    /// that genuinely folded and found nothing apart from one that never folded at all.
+    enum class Outcome { Unknown, Success, NotALeader, Failed, Deferred };
     enum class Trigger { Scheduled, Manual };
 
     EventType event_type = EventType::Start;

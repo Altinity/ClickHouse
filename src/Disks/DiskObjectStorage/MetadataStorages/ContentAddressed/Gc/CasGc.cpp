@@ -353,6 +353,16 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         {
             ++rounds_since_last_fold_;
             report.deferred = true;
+            /// A DEFER round mints no new round -- unlike the fold path below (CasGc.cpp:642), which sets
+            /// `report.round = state.round` only AFTER the round's single `gc/state` CAS has committed
+            /// `next.round = new_round` and `state` was reassigned to that committed `next` (so on that
+            /// path `state.round` reads the FRESH round number). Here the round CAS never runs, so `state`
+            /// is still the round that was already adopted BEFORE this round started: `state.round` is the
+            /// honest, already-durable round number, while `new_round` (`state.round + 1`) would report a
+            /// round that never actually happened. Use `state.round` so `RoundReport::round` and the
+            /// `system.content_addressed_garbage_collection_log` row it feeds never print a fabricated
+            /// round number on a deferred round.
+            report.round = state.round;
             EventEmitter{*store}.emit([&](CasEvent & e)
             {
                 e.type = CasEventType::GcFence;   /// reuse the Snap round-event channel; outcome = "deferred"
@@ -1432,6 +1442,30 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             result.fold_seal.condemned_summary[shard] = summarize(result.retired_merge[shard].still_retired);
         }
     }
+
+    /// Aggregate the unmatched-remove signal across every gc-shard this pass touched and log ONCE per
+    /// round with the total plus one example, rather than from the hot per-edge inner loop that detects
+    /// them (see `foldDeltasIntoGeneration`'s comment) — that loop runs over potentially millions of
+    /// rows, so it only counts (`ProfileEvents::CasGcUnmatchedRemoveDeltas`, incremented per occurrence)
+    /// and hands back one example; this is the bounded, once-per-round operator-visible trail.
+    {
+        uint64_t total_unmatched_removes = 0;
+        std::optional<UnmatchedRemoveExample> example;
+        for (const RetiredMergeResult & merge : result.retired_merge)
+        {
+            total_unmatched_removes += merge.unmatched_removes;
+            if (!example && merge.unmatched_remove_example)
+                example = merge.unmatched_remove_example;
+        }
+        if (total_unmatched_removes > 0 && example)
+            LOG_WARNING(logger,
+                "CAS GC fold: {} unmatched removal delta(s) this pass (matched no existing source edge; "
+                "a harmless per-key no-op by design, since the in-degree model is a set, not a counter — "
+                "but a persistent nonzero rate means removal deltas are reaching the reducer without "
+                "their matching activation, which is a correctness signal) — example: blob {} source {}",
+                total_unmatched_removes, blobIdOf(example->ref), u128ToHex(example->source_id));
+    }
+
     /// The part-manifest cleanup RUN + its fold-seal record are removed: the run
     /// object had no reader — the manifest cleanups execute inline from `result.mf_cleanup` (below /
     /// the recheck path), so the durable bundle was pure dead weight. `result.mf_cleanup` is unchanged.

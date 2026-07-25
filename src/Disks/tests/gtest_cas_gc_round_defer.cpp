@@ -169,7 +169,8 @@ TEST(CasGcRoundDefer, IdleRoundDefersAndReadsNoGeneration)
 
     Gc gc(store, kGc);
     backend->resetCounts();
-    ASSERT_FALSE(gc.runRegularRound().deferred);   /// round 1: folds the +1 (no trim-lag, quiesces at once)
+    const RoundReport fold_rep = gc.runRegularRound();   /// round 1: folds the +1 (no trim-lag, quiesces at once)
+    ASSERT_FALSE(fold_rep.deferred);
     const uint64_t fold_round_gets = backend->getTotal();
     EXPECT_GT(fold_round_gets, 0u) << "sanity: a real fold round performs some GETs";
 
@@ -180,6 +181,14 @@ TEST(CasGcRoundDefer, IdleRoundDefersAndReadsNoGeneration)
     const uint64_t defer_round_gets = backend->getTotal();
 
     EXPECT_TRUE(rep.deferred) << "a settled idle round must re-adopt the sealed generation, not fold";
+    /// A deferred round mints no new round (CasGc.cpp:runRegularRound's defer branch), so the honest
+    /// `report.round` is the round that was ALREADY adopted before this round started -- the same round
+    /// the preceding fold round committed. Guards against the bug where the defer path returned WITHOUT
+    /// ever assigning `report.round`, leaving it at its zero-initialized default and making every
+    /// deferred round print `CA GC round 0` regardless of how far GC had actually progressed.
+    EXPECT_NE(rep.round, 0u) << "a deferred round must report a truthful, nonzero round number";
+    EXPECT_EQ(rep.round, fold_rep.round)
+        << "a deferred round re-adopts the already-committed round, not a fabricated new one";
 
     const auto st_after = decodeGcState(backend->get(store->layout().gcStateKey())->bytes);
     EXPECT_EQ(st_after.snap_generation, st_before.snap_generation)

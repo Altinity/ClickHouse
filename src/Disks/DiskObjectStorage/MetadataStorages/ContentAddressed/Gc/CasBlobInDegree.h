@@ -173,6 +173,15 @@ struct ReplacedEntry
     Token old_token;      /// the superseded (stale) entry's token — what the resurrect replaced
 };
 
+/// One example of an unmatched-remove delta, kept for the caller's single once-per-round WARNING
+/// (see `RetiredMergeResult::unmatched_removes` below) — naming the blob and source id is enough to
+/// start an investigation without logging every occurrence from the hot inner loop.
+struct UnmatchedRemoveExample
+{
+    BlobRef ref{};
+    UInt128 source_id{};
+};
+
 /// Outcome of the retired merge: the same
 /// streaming pass that folds edges settles every prior retired entry and detects new candidates.
 struct RetiredMergeResult
@@ -182,6 +191,17 @@ struct RetiredMergeResult
     std::vector<RetiredEntry> spared;          /// in-degree recovered — entry dropped
     std::vector<RetiredEntry> redelete;        /// pending in the PRIOR list — execute deleteExact pre-CAS, drop
     std::vector<ReplacedEntry> replaced;  /// re-condemned CURRENT tokens that superseded a stale entry (resurrect-replaced); caller emits blob_retire_replaced
+
+    /// Count of `remove == true` deltas that matched no presence for their `(BlobRef, source_id)` key —
+    /// neither the prior run nor an earlier delta in the same `scattered` batch had activated it. The
+    /// in-degree model is a SET, so an unmatched remove is a per-key no-op BY DESIGN (never a false
+    /// deletion), but a persistent nonzero rate means removal deltas are reaching the reducer without
+    /// their matching activation, which is a correctness signal worth paging on. See
+    /// `ProfileEvents::CasGcUnmatchedRemoveDeltas`.
+    uint64_t unmatched_removes = 0;
+    /// The first unmatched remove observed this merge, for the caller's WARNING (one example is enough
+    /// to start an investigation; logging every occurrence would flood a hot per-edge inner loop).
+    std::optional<UnmatchedRemoveExample> unmatched_remove_example;
 };
 
 /// Merge the prior generation's source-edge run with new deltas. The prior run's `kCondemned` rows RIDE

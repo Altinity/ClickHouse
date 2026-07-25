@@ -174,7 +174,9 @@ Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & round_gc, GcRoundLogRe
                     std::chrono::steady_clock::now().time_since_epoch()).count()),
                 std::memory_order_relaxed);
         }
-        fin.outcome = rep.acquired_lease ? Rec::Outcome::Success : Rec::Outcome::NotALeader;
+        fin.outcome = !rep.acquired_lease ? Rec::Outcome::NotALeader
+                    : rep.deferred        ? Rec::Outcome::Deferred
+                                           : Rec::Outcome::Success;
         fin.round = rep.round;
         fin.candidates_marked = rep.candidates;
         fin.objects_deleted = rep.deleted;
@@ -273,9 +275,19 @@ void CasGcScheduler::loop()
             if (report.acquired_lease)
             {
                 consecutive_backoffs = 0;
-                LOG_DEBUG(log, "CA GC round {}: candidates={} deleted={} absent={} replaced={} spared={} manifests_deleted={}",
-                    report.round, report.candidates, report.deleted, report.absent,
-                    report.replaced, report.spared, report.manifests_deleted);
+                /// A deferred round never folds -- every counter below stays zero by construction
+                /// (RoundReport's own doc comment), so printing them through the SAME line as a folding
+                /// round reads as "GC is dead / stuck", indistinguishable from a round that genuinely
+                /// folded and found nothing. Keep the deferred case on its own, clearly-worded line
+                /// instead of adding a boolean to the counters line.
+                if (report.deferred)
+                    LOG_DEBUG(log, "CA GC round {}: deferred (skip-unchanged; no changed shard reached the "
+                        "fold threshold and no graduation was due; sealed generation re-adopted, no fold ran)",
+                        report.round);
+                else
+                    LOG_DEBUG(log, "CA GC round {}: candidates={} deleted={} absent={} replaced={} spared={} manifests_deleted={}",
+                        report.round, report.candidates, report.deleted, report.absent,
+                        report.replaced, report.spared, report.manifests_deleted);
             }
             else
             {

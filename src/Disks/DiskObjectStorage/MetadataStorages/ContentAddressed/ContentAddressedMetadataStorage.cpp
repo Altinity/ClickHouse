@@ -491,6 +491,9 @@ Cas::GcRoundLogger ContentAddressedMetadataStorage::makeGcRoundLogger() const
             case Cas::GcRoundLogRecord::Outcome::Failed:
                 e.outcome = ContentAddressedGarbageCollectionLogElement::FAILED;
                 break;
+            case Cas::GcRoundLogRecord::Outcome::Deferred:
+                e.outcome = ContentAddressedGarbageCollectionLogElement::DEFERRED;
+                break;
         }
         e.round = r.round;
         e.candidates_marked = r.candidates_marked;

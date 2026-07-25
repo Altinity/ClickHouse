@@ -34,7 +34,7 @@ specified (it is enabled by default in the shipped `config.xml`).
 - `gc_id` ([String](/sql-reference/data-types/string)) — The GC scheduler instance id (which mounter ran the round).
 - `trigger` ([Enum8](/sql-reference/data-types/enum)) — `Scheduled` (background tick) or `Manual` (`SYSTEM` command).
 - `round` ([UInt64](/sql-reference/data-types/int-uint)) — The GC round number (`0` on a `Start` row).
-- `outcome` ([Enum8](/sql-reference/data-types/enum)) — `Unknown` (on a `Start` row), `Success` (led and completed), `NotALeader` (another replica holds the GC lease), or `Error` (the round threw).
+- `outcome` ([Enum8](/sql-reference/data-types/enum)) — `Unknown` (on a `Start` row), `Success` (led, folded, and completed), `NotALeader` (another replica holds the GC lease), `Deferred` (led but took the skip-unchanged fast path — no fold ran, because no changed shard reached the fold threshold and no graduation was due), or `Error` (the round threw).
 - `candidates_marked` ([UInt64](/sql-reference/data-types/int-uint)) — Objects retired (marked) this round.
 - `objects_deleted` ([UInt64](/sql-reference/data-types/int-uint)) — Objects physically deleted this round.
 - `objects_absent` ([UInt64](/sql-reference/data-types/int-uint)) — Retire candidates found already absent.

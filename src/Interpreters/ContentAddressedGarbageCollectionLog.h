@@ -10,7 +10,10 @@ namespace DB
 struct ContentAddressedGarbageCollectionLogElement
 {
     enum EventType : int8_t { START = 1, FINISH = 2 };
-    enum Outcome   : int8_t { UNKNOWN = 1, SUCCESS = 2, NOT_A_LEADER = 3, FAILED = 4 };
+    /// `DEFERRED`: the round acquired the GC lease and took the skip-unchanged fast path -- no fold, no
+    /// pre-CAS deletes, no `gc/state` CAS. Kept distinct from `SUCCESS` so a query against this table can
+    /// tell a round that genuinely folded and found nothing apart from one that never folded at all.
+    enum Outcome   : int8_t { UNKNOWN = 1, SUCCESS = 2, NOT_A_LEADER = 3, FAILED = 4, DEFERRED = 5 };
     enum Trigger   : int8_t { SCHEDULED = 1, MANUAL = 2 };
 
     time_t event_time = 0;

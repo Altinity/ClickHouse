@@ -856,3 +856,42 @@ TEST(CasBlobInDegree, UnmatchedRemovalIsAPerKeyNoOpAndSparesSiblingEdges)
     const auto zero = zeroInDegree(backend, runs2);
     EXPECT_TRUE(zero.empty()) << "b1 still has two live source edges";
 }
+
+/// The silence in `UnmatchedRemovalIsAPerKeyNoOpAndSparesSiblingEdges` above is exactly what let a whole
+/// class of GC defects survive months of soak runs undetected — the fold's per-key no-op left no trace.
+/// This test pins the COUNTING surface added on top: `RetiredMergeResult::unmatched_removes` /
+/// `unmatched_remove_example` must report the unmatched remove precisely (one hit, naming the right blob
+/// and source id), while the byte-level no-op behaviour (asserted above) is unchanged.
+TEST(CasBlobInDegree, UnmatchedRemovalIsCountedWithAnExample)
+{
+    InMemoryBackend backend;
+    Layout layout{"pool"};
+
+    /// Generation 1: blob b1 is referenced by TWO distinct sources (two manifests), same fixture as the
+    /// no-op test above.
+    std::vector<RunRef> runs1;
+    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, /*new_generation*/1, /*attempt*/0, /*shard*/0,
+        {{bh(1), s(1), false}, {bh(1), s(2), false}}, runs1);
+
+    /// Generation 2: fold a removal for a THIRD source that never had an activation folded.
+    std::vector<RunRef> runs2;
+    RetiredMergeResult rmr;
+    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/runs1, /*new_generation*/2, /*attempt*/0, /*shard*/0,
+        {{bh(1), s(99), true}}, runs2,
+        /*current_round*/0, /*condemn_round*/0, /*head_blob*/{}, /*peek_head*/{}, /*confirm_condemned_marker*/{}, &rmr);
+
+    /// The run is byte-identical to the no-op test's outcome for the blob's OTHER edges: both survive.
+    const DecodedRun out = decodeRun(backend, runs2[0]);
+    ASSERT_EQ(out.edges.size(), 2u) << "the counting surface must not perturb the no-op fold outcome";
+    EXPECT_EQ(out.edges[0].first, b(1));
+    EXPECT_EQ(out.edges[1].first, b(1));
+    std::vector<UInt128> surviving_sources{out.edges[0].second, out.edges[1].second};
+    EXPECT_NE(std::find(surviving_sources.begin(), surviving_sources.end(), s(1)), surviving_sources.end());
+    EXPECT_NE(std::find(surviving_sources.begin(), surviving_sources.end(), s(2)), surviving_sources.end());
+
+    /// The counting surface reports exactly the one unmatched remove, naming the right blob and source id.
+    EXPECT_EQ(rmr.unmatched_removes, 1u);
+    ASSERT_TRUE(rmr.unmatched_remove_example.has_value());
+    EXPECT_EQ(rmr.unmatched_remove_example->ref, bh(1));
+    EXPECT_EQ(rmr.unmatched_remove_example->source_id, s(99));
+}

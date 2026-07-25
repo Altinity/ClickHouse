@@ -19,7 +19,8 @@ ColumnsDescription ContentAddressedGarbageCollectionLogElement::getColumnsDescri
         {"Start", static_cast<Int8>(START)}, {"Finish", static_cast<Int8>(FINISH)}});
     auto outcome_enum = std::make_shared<DataTypeEnum8>(DataTypeEnum8::Values{
         {"Unknown", static_cast<Int8>(UNKNOWN)}, {"Success", static_cast<Int8>(SUCCESS)},
-        {"NotALeader", static_cast<Int8>(NOT_A_LEADER)}, {"Error", static_cast<Int8>(FAILED)}});
+        {"NotALeader", static_cast<Int8>(NOT_A_LEADER)}, {"Error", static_cast<Int8>(FAILED)},
+        {"Deferred", static_cast<Int8>(DEFERRED)}});
     auto trigger_enum = std::make_shared<DataTypeEnum8>(DataTypeEnum8::Values{
         {"Scheduled", static_cast<Int8>(SCHEDULED)}, {"Manual", static_cast<Int8>(MANUAL)}});
     auto lc_string = std::make_shared<DataTypeLowCardinality>(std::make_shared<DataTypeString>());
@@ -36,7 +37,7 @@ ColumnsDescription ContentAddressedGarbageCollectionLogElement::getColumnsDescri
         {"gc_id", std::make_shared<DataTypeString>(), "GC scheduler instance id (which mounter)."},
         {"trigger", trigger_enum, "Scheduled (background tick) or Manual (SYSTEM command)."},
         {"round", std::make_shared<DataTypeUInt64>(), "GC round number (0 on Start)."},
-        {"outcome", outcome_enum, "Unknown (Start) / Success (led and completed) / NotALeader (another replica holds the GC lease) / Error (the round threw)."},
+        {"outcome", outcome_enum, "Unknown (Start) / Success (led, folded, and completed) / NotALeader (another replica holds the GC lease) / Deferred (led but took the skip-unchanged fast path -- no fold ran) / Error (the round threw)."},
         {"candidates_marked", std::make_shared<DataTypeUInt64>(), "Objects retired (marked) this round."},
         {"objects_deleted", std::make_shared<DataTypeUInt64>(), "Objects physically deleted this round."},
         {"objects_absent", std::make_shared<DataTypeUInt64>(), "Retire candidates found already absent."},

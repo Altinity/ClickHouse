@@ -73,7 +73,9 @@ struct RoundReport
     bool acquired_lease = false;  /// false => another leader is alive; nothing else was done
     /// True iff this round deferred (re-adopted the sealed
     /// in-degree generation instead of folding). A deferred round performs no fold, no pre-CAS
-    /// deletes, and no gc/state CAS -- every other RoundReport field below is meaningless/zero on it.
+    /// deletes, and no gc/state CAS -- every other RoundReport field below is meaningless/zero on it,
+    /// EXCEPT `round` (below), which a deferred round still sets to the honest, already-adopted round
+    /// number (see the defer branch of runRegularRound, CasGc.cpp) -- it just never advances it.
     bool deferred = false;
     uint64_t round = 0;
     uint64_t candidates = 0;      /// retired entries WRITTEN this round (absent candidates are skipped)

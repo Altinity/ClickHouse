@@ -11,6 +11,7 @@
 namespace ProfileEvents
 {
     extern const Event CasGcRetiredSparedByReref;
+    extern const Event CasGcUnmatchedRemoveDeltas;
 }
 #include <city.h>
 #include <algorithm>
@@ -586,6 +587,19 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
         while (di < scattered.size()
                && scattered[di].ref == blob_ref && scattered[di].source_id == source_id)
         {
+            /// An unmatched remove: `present` was false immediately before this remove delta is
+            /// applied, meaning neither the prior run nor an earlier delta in this same scattered run
+            /// for this key had activated it. The set semantics make this a harmless per-key no-op
+            /// (never a false deletion), but a persistent nonzero rate is a correctness signal — count
+            /// it and hand ONE example back to the caller, who logs once per round (never from this
+            /// hot inner loop; it runs over potentially millions of rows).
+            if (scattered[di].remove && !present)
+            {
+                ++rmr.unmatched_removes;
+                ProfileEvents::increment(ProfileEvents::CasGcUnmatchedRemoveDeltas);
+                if (!rmr.unmatched_remove_example)
+                    rmr.unmatched_remove_example = UnmatchedRemoveExample{blob_ref, source_id};
+            }
             present = scattered[di].remove ? false : true;   // apply in order; last wins
             cur_touched = true;
             ++di;
