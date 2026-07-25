@@ -117,10 +117,31 @@ it cannot throw. Sites:
 reusable: trial ids advance locally per op (`CasRefLedger.cpp:1532`, `trial_id.ref_sequence += 1`)
 while the durable transaction gets one independently allocated pool-wide id — reusing the trial
 state would install the wrong `greatest_applied` (and, for namespace removal, the wrong removal
-id). So, per chunk: allocate the real txn id → copy the live state → apply the complete chunk once
-with the REAL id → fully materialize → PUT → install by no-throw move. This is an extra pre-PUT
-apply+copy per chunk; its cost is a measurement gate, not an assumption (§[Order](#execution-order)
-step 2).
+id). So, per chunk: allocate the real txn id → **COW-copy** the live state → apply the complete
+chunk once with the REAL id → PUT → install by no-throw move → fold.
+
+**Refinement (2026-07-24, derived while planning — do NOT materialize the candidate before the
+PUT).** The consult's "fully materialize before the PUT" would force an **O(n) base rebuild per
+chunk**: a candidate that shares its COW base with the live state cannot fold in place, so
+materializing it copies the whole base — whereas today's post-apply fold is O(overlay) precisely
+because the live state uniquely owns its base (`CasRefLedger.cpp:1702-1717`). Materialization is
+NOT required for a no-throw install: moving an unmaterialized candidate (base pointer + overlay)
+is equally noexcept. Correct order, cost-neutral vs today:
+1. pre-PUT: `candidate = rt->state` (COW copy, cheap — base shared) and
+   `applyRefLogTxn(candidate, chunk_txn)` with the REAL id (allocates the overlay; a throw here is
+   now a clean PRE-durability failure — the same class as today's validation rejects);
+2. PUT;
+3. on `Committed`, under `state_mutex` + `DENY_ALLOCATIONS_IN_SCOPE`: `rt->state =
+   std::move(candidate)` + the atomic tail bumps. Destroying the old state restores unique base
+   ownership;
+4. still under `state_mutex` but OUTSIDE the deny region: today's `materializeCommitted()` inside
+   its existing swallow — in-place O(overlay), exactly as now.
+Net change vs today: one extra cheap COW copy, and the apply MOVES from after the PUT to before it.
+The benchmark gate (§[Order](#execution-order) step 2) measures this rather than assuming it.
+Safety note: between the copy and the install only this leader mutates `rt->state` (single leader
+per table; the wedge-resolution apply runs earlier in the same flush; publishers only read), so add
+a debug assert that `greatest_applied` is unchanged at install time — a non-allocating comparison,
+safe inside the deny region.
 
 **Enforcement — `DENY_ALLOCATIONS_IN_SCOPE`** (`Common/MemoryTracker.h:35`; thread-local flag makes
 `MemoryTracker` throw `LOGICAL_ERROR` on any allocation in scope; no-op in Release). Upstream
