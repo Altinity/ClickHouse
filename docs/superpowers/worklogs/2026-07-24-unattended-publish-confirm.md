@@ -461,3 +461,37 @@ reclaim-impossibility that the writer protocol says no longer exists. Not editin
 - 12:29 UTC — watchdog: soak v3 t+3h56m, STAGE converge, 0 failures, 37 faults, 23 checkpoints OK, disk
   326G, log fresh. The pool drain probe shows the pool settling: 4.75 MB -> 2.10 MB over 10 samples. ~3 min
   to the 4h mark; next tick collects the verdict, then the F6 detail fsck.
+
+## SOAK v3 COMPLETE — `PHASE3 OK`, `SOAK_EXIT=0` (12:33 UTC, 4h with chaos)
+
+`ABORTED-retried INSERT attempts: 0; transport-retried op attempts: 446; faults fired: 38; restarts: 19`.
+27 checkpoints, ALL OK, `dangling=0` at every one. Final: `reachable=406 dangling=0 unreachable=56
+pending_gc=0 unaccounted=0 dryrun_subset=ok`. SELECT workload 10,653 queries / 201,153,149 rows across 4
+workers, 411 non-fatal failures. Availability by class: `mount_fenced=32, node_down=414` — all
+driver-retried, none product-visible as a failure. This is the first clean 4h chaos run on this branch.
+
+### F6 RESOLVED as a HARNESS LABELLING BUG — the product's own classifier disagrees with the harness
+
+Ran `ca-fsck --detail` on the idle post-run stand. The tool itself prints:
+
+```
+note: 56 unreferenced object(s) are inside the normal GC deletion pipeline
+      (condemn -> graduate -> exact-token delete takes ~2-3 rounds) — expected, no action needed
+reachable=406 dangling=0 unreachable=56 pending_gc=0 awaiting_gc=56 unaccounted=0
+```
+
+All 56 are class `AwaitingGc`, whose definition (`CasFsck.cpp:582-586`) is "edges still in the GC
+snapshot; the drop has not folded yet (expected)". Not one is `Unaccounted` — and `Unaccounted` is
+precisely the class whose note says "PERSISTENT occurrences violate INV-2, investigate". So the objects
+the harness has been reporting for months as `(M-F debris, B140)` — i.e. as permanently unreclaimable by
+the incremental GC and needing an unimplemented Full-GC — are, per the product, ordinary in-pipeline
+drops. The harness's label and its `checker.py`/`run.py` rationale are wrong about WHICH class it is
+looking at.
+
+The user was right that B140 debris should no longer be showing up here; what was showing up was never
+B140.
+
+OPEN: whether they actually drain. `AwaitingGc` is only benign if a later fold removes those edges.
+Running a drain watch on the now-idle stand (8 samples, 45 s apart) to see the count go to 0. If it
+does NOT drain with zero workload, the class is right but the pipeline is stalled, which is a different
+and real finding.
