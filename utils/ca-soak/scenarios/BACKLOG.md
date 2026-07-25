@@ -3056,3 +3056,32 @@ check of the no-throw-install invariant.
 
 **Params:** per-scale probability (dev low enough that the workload still progresses; ci/full
 higher; plus a short high-probability burst), fault-window and settle durations.
+
+## Suite-wide GC blindness: every scenario's GC verdict was vacuous (found 2026-07-25 by S42) {#gc-observation-vacuous-2026-07-25}
+
+FIXED for the immediate cause (`c44cb6cbe44`), but the hazard that produced it is NOT fixed.
+
+`framework/observe.gc_log_rows` selected `min_ack` from
+`system.content_addressed_garbage_collection_log`. That column no longer exists, so the query raised
+`UNKNOWN_IDENTIFIER`, the function's bare `except` converted it to `[]`, and every GC observation in
+every scenario card came back empty — which made every GC verdict pass vacuously, including
+`assert_gc_no_failed`.
+
+Verified independently before acting on the agent's report: `system.columns` returns 0 rows for that
+column, and `SELECT min_ack FROM system.content_addressed_garbage_collection_log` errors.
+
+This is the SECOND occurrence of this exact class; the function's own comment already records the P9-era
+one. Two follow-ups, neither done:
+
+1. **The `except` must not turn a schema mismatch into an empty result.** An unreadable observation is not
+   an observation of nothing. Distinguish "table absent / not yet flushed" (legitimately empty) from
+   "query failed" (must surface, and should fail the run rather than silently pass every GC assert).
+2. **`assert_gc_no_failed` passes on empty.** Any assert whose subject is a row set needs an explicit
+   non-vacuity guard — the same discipline the TLA+ models use `_witness_*` configs for. Sweep the other
+   `assert_*` helpers in `framework/` for the same shape.
+
+Worth generalising: this is the third distinct instance this week of a HARNESS silently under-reporting
+what the product actually said (the others: the 668 mount-fence classifier that killed a soak, and the
+fsck detail-class whitelist that would have dropped `stale-edge`). The pattern is always the same — the
+harness pins a name or a column the product later changes, and the mismatch degrades to silence rather
+than to an error.
