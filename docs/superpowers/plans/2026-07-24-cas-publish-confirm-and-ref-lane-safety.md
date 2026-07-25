@@ -1103,7 +1103,7 @@ Subject: `ca: read-only pool access for tools — stop the system-table scrape c
 
 ---
 
-## Task 20: ca-soak scenario S43 — thread-allocation fault injection
+## Task 20 (DEFERRED — different scope, not this round): ca-soak scenario S43 — thread-allocation fault injection
 
 Split out of S42 (Task 17): `cannot_allocate_thread_fault_injection_probability` is a different fault
 class from `memory_tracker_fault_probability`, and running both in one card would make any finding
