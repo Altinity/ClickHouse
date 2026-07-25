@@ -1600,3 +1600,33 @@ not to be one.
 
 The other three review findings (uncertain `precommitAdd`, promote-committed-reported-as-fallback, move
 assignment) are unaffected and are being fixed.
+
+### Part B review findings — RESOLVED, with two reviewer errors and one residual window (2026-07-26) {#partb-review-resolved}
+
+Fixed in `8e6fe6ef0af`. Gate 1373/1373 (five new tests, each seen red first), integration 11/11.
+
+Blocker 2, major 3 and major 4 are closed. Blocker 1 was downgraded, not fixed — see
+{#partb-review-blocker1-downgraded}; it is the known LIST-as-journal finding, not a Part B defect.
+
+**TWO PLACES THE REVIEWER WAS WRONG**, both caught by the implementer rather than by me — I had passed the
+first one straight through into the fix instructions:
+
+1. "Queue the exact removal (it is idempotent)" is FALSE. `RefTableState::applyOwnerTransition`'s
+   `RemovePrecommit` arm throws `CORRUPTED_DATA` on an absent binding
+   (`CasRefProtocol.cpp:216`). Following the review literally would have made every `abandon` of an
+   uncertain build fail forever, destructor retries included — turning a leak into a permanent wedge. The
+   removal is presence-checked under `Uncertain` only.
+2. Major 3's stated chain — "report fallback, remove it, publish the byte-fetched ref" — does not hold. An
+   allocation failure raises `MEMORY_LIMIT_EXCEEDED`, which is neither `ABORTED` nor `NETWORK_ERROR`, so it
+   propagates instead of becoming a fallback; and `abandon` appends a PRECOMMIT removal, which cannot undo
+   a committed ref. `isTerminal()` is also not discriminating, since abandoning an already-promoted build
+   succeeds. The defect was real; its mechanism was not as described.
+
+**RESIDUAL WINDOW, flagged not fixed:** `eraseView` still runs after the durable commit and can throw, and
+`ContentAddressedTransaction::publishStaging`'s `out_slot` is assigned only after `promoteBuild` returns.
+Small, pre-existing, and unnamed by the review. Recorded here so it is not lost — closing it means
+extending the same no-throw-after-commit discipline one frame outward.
+
+**LESSON for how these reviews are consumed:** a strong review is evidence, not instruction. Two of its
+four remedies were wrong in ways that would have made things worse, and I forwarded one of them verbatim.
+Prescriptions from a reviewer deserve the same verification as claims from an implementer.
