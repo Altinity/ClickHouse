@@ -647,3 +647,9 @@ allocation-free), that the soundness guard must report `inconclusive` when the T
 matter how many generic allocation failures occurred, and to wire in today's two new signals: assert
 `stale_edge == 0` in leg C's fsck (in DETAIL mode, since the counter is detail-only) and report
 `CasGcUnmatchedRemoveDeltas` without failing on it, its benign rate not yet being characterised.
+- 16:49 UTC — watchdog: S42 agent working, nothing stuck. `cards/s42_alloc_faults.py` written (39 KB, this
+  minute); it has also touched `scenarios/framework/observe.py` and `cards/__init__.py` — the latter is
+  registration, the former is OUTSIDE the plan's stated file list, so ask why when it reports. Smoke run
+  presumably next. Disk 330G, 61G RAM, load 1.1.
+  (The long untracked list under `utils/ca-soak/` is pre-existing soak-run debris — `*.db`, `*_curve.tsv`,
+  compose variants — none of it from this round; leaving it alone.)
