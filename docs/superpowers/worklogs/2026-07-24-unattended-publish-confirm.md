@@ -542,3 +542,12 @@ The stand is being LEFT UP — it is a live reproduction, and tearing it down de
 - 13:49 UTC — watchdog: codex RCA on the retention leak RUNNING (gpt-5.6-sol, xhigh, read-only) — 532s in,
   2.1 MB of log, mtime 3 min old and growing (currently reading CAS sources). Prompt+artifacts in
   `tmp/leak-rca/`. Nothing else live; stand still up as the reproduction. Disk 326G, 62G RAM, load 1.0.
+- 14:09 UTC — watchdog: codex RCA STILL RUNNING (1762s), composing the final answer. CORRECTION to my own
+  reading this tick: an unanchored `grep CODEX_EXIT` reported `CODEX_EXIT=1`, which was a FALSE POSITIVE —
+  the string occurs inside codex's own output, where it quotes this worklog's note about the earlier
+  GC-collapse run. Line-anchored `grep -c "^CODEX_EXIT="` = 0, and the process is alive. Same class of
+  trap as [[reference_grep_nul_bytes_binary_mode_gotcha]]: always anchor the marker grep.
+  Log flat for 30 s (reasoning summaries are off, so nothing streams while it composes) but only 3 min
+  since last write — well inside the 15 min threshold. Partial conclusion already visible in the stream:
+  "the source refutes a per-namespace write-order inversion, but it does support a cursor-coverage
+  failure" — i.e. my ordering-inversion hypothesis looks REFUTED. Waiting.
