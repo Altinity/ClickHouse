@@ -952,6 +952,26 @@ Subject: `ca: B66b — relink into detached behind allow_ca_relink, with a recur
 
 ## Task 16: Integration test battery
 
+**CARRIED IN FROM TASK 15 — the recursion brake is wired but UNTESTED.** Task 15 (`fac69e10dbd`) could
+not prove it and said so instead of inventing a test. Read its reasoning before writing one: the
+reservation-outside-the-pool exit is self-braking regardless and must NOT be mistaken for evidence the
+brake is unnecessary; the exits the brake actually bounds — the mixed-build cookie-value mismatch and
+taxonomy rows 1, 2 and 5 — are properties of the sender/receiver PAIR and are unreachable from
+configuration. Proving it needs a failpoint, which is two lines:
+
+```
+REGULAR(cas_relink_receiver_force_mechanism_failure)   // src/Common/FailPoint.cpp
+fiu_do_on(FailPoints::cas_relink_receiver_force_mechanism_failure, { return nullptr; });  // after the token gate
+```
+
+`src/Common/FailPoint.cpp` is a SHARED UPSTREAM surface and sits outside {#upstream-authorization} — it is
+a registration line in a generic registry, not the CAS parts-exchange portion. Get the user's word before
+adding it. With the failpoint, `SYSTEM ENABLE FAILPOINT` plus `SYSTEM SYNC REPLICA` is a real test:
+unbraked it recurses to a stack overflow, braked it is exactly one relink attempt and then bytes.
+
+Note also: the plan's command lines use `python`, which is not on PATH in this environment — use `python3`.
+
+
 **Files:**
 - Modify/create under `tests/integration/test_cas_replicated_relink/`
 
