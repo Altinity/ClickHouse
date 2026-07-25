@@ -1569,3 +1569,34 @@ Missing: recovery after one omitted LIST record then `confirmExactRef`; `LandedT
 failing abort; every gate-0 case (the gtest says integration owns them and no integration test does);
 source remount between offer and confirm; zero/multiple routing matches; confirm transport failure at HTTP
 level.
+
+### CORRECTION 2026-07-26 (user): "BLOCKER 1" is NOT a Part B defect — the confirm inherits the mount's trust, it does not create it {#partb-review-blocker1-downgraded}
+
+Downgraded from {#partb-review-findings}'s blocker 1 after the user challenged the framing. The challenge
+was right and the controller had accepted the reviewer's attribution without checking the boundary.
+
+VERIFIED: `confirmExactRef` reads the same `RefTableRuntime` and the same recovered `state` that
+`resolveRef` reads (`CasRefLedger.cpp:182` uses `getRefTableRuntime` + `ensureRefTableRecovered`;
+`confirmExactRef` at `:318` uses `find` on the same map purely to avoid CREATING a runtime). It is the same
+in-memory view that serves every ordinary read and that the write path makes its decisions on.
+
+So the confirm introduces no new trust assumption — it inherits the mount's. If that view can be stale in a
+way that matters, then the sender is ALSO serving reads from a manifest that is gone and deciding writes on
+a false picture. The blast radius is the mount, not the confirm, and the remedy is not in the confirm
+protocol.
+
+Blocker 1 is therefore the already-recorded {#list-as-journal-dataloss-2026-07-25} finding seen through one
+more lens, not a defect introduced by Part B. The reviewer stated a true fact and attributed it to the
+wrong component.
+
+WHAT SURVIVES, and it is smaller than the heading suggested: the confirm gives a stale LOCAL view a REMOTE
+consequence — without it a corrupt view harms its own mount, with it a peer can durably commit on the
+strength of it. That is amplification, not a new root cause, and it does not change the remedy.
+
+CONSEQUENCE the controller must own: the argument for moving the journal-chain fix AHEAD of the soak was
+built on "the same root now reaches a second path". That argument is weakened — same root, same path, plus
+propagation. The scheduling decision should rest on the original grounds, not on a blocker that turned out
+not to be one.
+
+The other three review findings (uncertain `precommitAdd`, promote-committed-reported-as-fallback, move
+assignment) are unaffected and are being fixed.
