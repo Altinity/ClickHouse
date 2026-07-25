@@ -732,3 +732,15 @@ fixed.
   Task 20 which the user already deferred). Per the watchdog's own rule for this state, I am saying so and
   scheduling no further work. The ca-soak stand stays UP deliberately as the live reproduction for
   BACKLOG {#unmatched-minus-one-retention-leak}; do not `down -v` it without capturing more.
+- 18:29 UTC — watchdog: idle, tree clean, disk 331G, 64G RAM, load 1.1. The soak stand is GONE — torn down
+  on the user's instruction after establishing it had already stopped being a reproduction (see BACKLOG
+  {#leak-repro-lost}: our own S42 smoke runs reset it at ~16:49, and the log kept claiming otherwise for an
+  hour; caught only by re-checking before teardown).
+  Task 11 landed (`41fa94de18b`) with a footprint tighter than the authorization required: `DataPartsExchange`
+  purely additive, one self-contained method, zero existing functions modified, `processQuery` untouched.
+  Task 21 (the Part B soak gate: 20-minute shakeout, then 4h) added to the plan on the user's instruction.
+  Dispatched **Task 12** (`PreparedRelink` handle). No new decision needed — it is CAS-internal, touches no
+  upstream file, and the user's authorization already covers the chain. The agent was told WHY the split
+  exists: to make the durable-but-unpromoted state a first-class owned thing, with `abort` proven to append
+  the precommit REMOVAL through the ledger's precommit view rather than assumed — an abandoned precommit
+  leaving its `+1` behind is exactly the leak class root-caused today.
