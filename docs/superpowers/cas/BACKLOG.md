@@ -1483,3 +1483,89 @@ surfaces found the same day ({#gc-observation-vacuous-2026-07-25} and the entrie
 
 Verified by simulating the substitution against the two real config files before committing, rather than
 by reading the sed and believing it.
+
+## Part B codex review — DO NOT MERGE AS-IS: two blockers, two majors (2026-07-25) {#partb-review-findings}
+
+Full output `tmp/partb-review/codex_review.log`, package `tmp/partb-review/`. gpt-5.6-sol at xhigh over the
+combined 23-file diff, read as ONE protocol — which is exactly what none of the eight per-task agents did.
+The normal gate-0 → gate-1 → prepare → confirm → promote ordering is confirmed sound, and tasks 13-16 did
+NOT make `No` authoritative. Everything below is what composition exposed.
+
+### BLOCKER 1 — a completed recovery can expose a stale row and authorize `Yes`
+
+Recovery discovers snapshots and logs through paginated `backend.list` with no completeness proof, then
+publishes the result as `recovered = true` (`CasRefLedger.cpp:463`, `:736`). `confirmExactRef` treats a
+recovered, quiescent, clean, fenced runtime holding the exact row as sufficient for `Yes`
+(`CasRefLedger.cpp:334`). Atomic publication prevents a HALF-BUILT view; it does not prove the listing was
+COMPLETE.
+
+So if recovery's listing omits a later durable removal or repoint, it publishes a stale but
+apparently-healthy runtime and gate 1 answers `Yes` for a manifest that is gone. **That is a route around
+every ambiguity check** — the ambiguity was erased when incomplete recovery set `recovered = true`. If GC
+already folded the omitted removal and collected the blobs, the receiver commits a dangling manifest.
+
+This is DISTINCT from `_sab_holeylist`, where a CORRECT `Yes` still dangles because GC skips the receiver's
+own `+1`. Same root cause (LIST as journal), different path.
+
+Short-term safe behaviour: a LIST-recovered runtime must be ineligible for `Yes`. Real fix is the
+authoritative head/predecessor traversal already recorded in {#list-as-journal-dataloss-2026-07-25}.
+
+### BLOCKER 2 — an uncertain `precommitAdd` loses its cleanup owner and may delete its manifest body
+
+`PartWriteTxn::precommitAdd` records `precommit_target_ns` / `precommit_manifest` / `precommitted = true`
+only AFTER `appendRefOps` returns successfully (`CasPartWriteTxn.cpp:1013`). But an `Unresolved` append MAY
+HAVE LANDED — the code says so itself (`CasRefLedger.cpp:2152`). So on that path `prepareEntries`' catch
+calls `abandon` on an object that believes it never precommitted (`PartFolderAccess.cpp:450`): no removal
+is queued, no handle is returned, the error is converted to `MechanismFallbackAllowed`, and — worse —
+`abandon` best-effort DELETES the manifest body (`CasPartWriteTxn.cpp:1394`). When the wedge later resolves
+as committed, it installs a live precommit with no owning handle and possibly no body.
+
+This falsifies taxonomy row 2's "never staged". Needs an explicit uncertain-precommit state whose cleanup
+ownership survives the call; an arbitrary `NETWORK_ERROR` cannot be classified as safe byte fallback.
+
+### MAJOR 3 — a promote can commit and still be reported as fallback or failure
+
+`promote` maps every `NETWORK_ERROR` to `MechanismFallbackAllowed`
+(`ContentAddressedMetadataStorage.cpp:2057`), but the promotion PUT may have landed. There is also a purely
+local post-commit window: `promoteBuild` builds a `CommitOutcome` with copied strings BEFORE marking the
+handle terminal (`PartFolderAccess.cpp:325`), so an allocation failure there enters the failed-promote
+catch with the ref already committed. One logical fetch can then durably publish the relink ref, report
+fallback, remove it, and publish the byte-fetched ref — a sequential double publication rows 5 and 6 claim
+cannot happen. Promotion needs a terminal outcome distinguishing not-committed / committed / unresolved,
+and nothing after a durable commit may throw before the handle records `Committed`.
+
+### MAJOR 4 (latent) — move assignment can discard a terminal duty
+
+`PreparedPartWrite::operator=` overwrites the destination's build even when `abandonBuildBestEffort`
+returns false (`PartFolderAccess.cpp:380`), permanently dropping a cleanup owner. Not exercised today (the
+exchange path uses move construction), but the move-only ownership contract is false as written. Delete
+move assignment or preserve the original handle on failed cleanup.
+
+### Comments that overclaim, and one that is simply wrong
+
+- `CasRefLedger.h:57` states "`No` is a proof of the negative". It is not — the fence is evaluated LAST, so
+  a fence-lost mount answers `No`. This is the exact inversion the whole round has been guarding against,
+  sitting in the header that defines the contract.
+- `ContentAddressedMetadataStorage.cpp:2128` and `DataPartsExchange.cpp:1446` both claim every subsequent
+  GC fold sees the receiver's `+1`. The taxonomy caveat at `DataPartsExchange.cpp:1365` correctly
+  contradicts them.
+
+### Footprint objections (to weigh, not all accepted)
+
+`DataPartsExchange.h` exposes CAS-specific `allow_ca_relink` and service helpers beyond the opaque enum;
+receiver work spans `fetchSelectedPart` and `relinkPartToDisk`, sender work spans `processQuery` and two
+helpers. Both were knowingly accepted at the time and reported to the user. The reviewer also counts the
+`ProfileEvents.cpp` registration as outside the approved failpoint scope — that is a conflation: it came
+from Task 18, not the failpoint approval, and a ProfileEvent registration is not protocol coupling. Worth
+the user's judgement, not a silent dismissal.
+
+### Test gaps, and one pre-existing test that is green for the wrong reason
+
+`test_replicated_fetch_by_relink` (`test.py:255`) still proves relink ONLY through a flat blob count — the
+exact defect Task 16 found in the plan, left unfixed in the older test. A byte fetch dedups and passes it.
+
+Missing: recovery after one omitted LIST record then `confirmExactRef`; `LandedThenLost` during receiver
+`precommitAdd`, promotion and abort; allocation failure after durable promotion; move assignment with a
+failing abort; every gate-0 case (the gtest says integration owns them and no integration test does);
+source remount between offer and confirm; zero/multiple routing matches; confirm transport failure at HTTP
+level.
