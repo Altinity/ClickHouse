@@ -625,3 +625,25 @@ spec.
   here — the thing to check by hand is that no path can answer `Yes` from a lagging or partially-recovered
   view, and that the zero-I/O rule is pinned by an actual `CountingBackend` assertion rather than by
   inspection.
+- 16:29 UTC — watchdog: idle, nothing stuck, disk 327G, 62G RAM, load 0.9. Task 10 committed (`7da3586ed29`)
+  after hand-review beyond the battery.
+
+### SEQUENCING DECISION: Task 11 is NOT being started unattended — it needs the user
+
+Task 11's file list includes `src/Storages/MergeTree/DataPartsExchange.cpp`, and Task 13 is the wire
+protocol itself. That is a SHARED/UPSTREAM surface, and two standing user rules bear directly on it:
+[[feedback_upstream_code_consult_first]] (no edits to shared/upstream surfaces without consultation) and
+[[feedback_cas_upstream_coupling_minimization]] (never add CA-specific fields to generic Replicated code
+or formats). The spec does design a confirm action on that path and the user reviewed the spec, so this is
+plausibly already accepted — but "plausibly already accepted" is not the same as authorized, and this is
+exactly the class of change the user asked to be consulted on. Flagged for the user; not dispatched.
+
+Started instead: **Task 17 (S42 allocation-fault card)** — ca-soak harness only, no upstream surface, and
+one of the four items of the original unattended program. It also does not touch the `tmp-fetch` lifecycle
+the containment sequencing reserves.
+
+The agent was told what S42 is actually FOR (the post-durable install window that Part A made
+allocation-free), that the soundness guard must report `inconclusive` when the TARGETED signal is zero no
+matter how many generic allocation failures occurred, and to wire in today's two new signals: assert
+`stale_edge == 0` in leg C's fsck (in DETAIL mode, since the counter is detail-only) and report
+`CasGcUnmatchedRemoveDeltas` without failing on it, its benign rate not yet being characterised.
