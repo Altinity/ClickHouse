@@ -769,3 +769,13 @@ fixed.
   intake code AND check a CI job definition; nothing to act on, but it is the one to watch next tick.
   Note the `build/*task13*` logs from 16:xx belong to an EARLIER, unrelated task numbering from a previous
   round — mine are the 21:xx ones. Disk 331G, load 1.9.
+- 20:09 UTC — watchdog: Task 14 active and healthy — `DataPartsExchange.cpp`, the exchange interface, the
+  metadata storage and `gtest_ca_wiring.cpp` written; its battery already reads **1366 PASSED** (1363 at
+  `c74d8e6549a`, so +3), server build done, a rebuild running. Disk 331G, load 1.1.
+  CAUGHT AND REVERTED, unrelated to Task 14: `src/CMakeLists.txt` carried a stray
+  `add_subdirectory (cppexpr_4111832)` — debris from the `cppexpr` tool, which appends its scratch
+  subdirectory to that file. The directory exists locally but is UNTRACKED, so committing that line would
+  have broken cmake in every other checkout and in CI while building fine here. Found only because the
+  file showed up in a status listing I actually read instead of skimming. Reverted; noted as a recurring
+  hazard of `.claude/tools/cppexpr.sh` — check `src/CMakeLists.txt` before any commit that follows a
+  cppexpr run.
