@@ -224,10 +224,23 @@ server log:
 - the rounds were losing: candidates 1006 -> 4841 -> 20046 while deletions stayed ~700/round, and the
   round interval went 9 min -> 28 min -> never.
 
-Mechanism: `Gc::cleanupRefObjects` and `runNamespaceCleanupPasses` (`CasGc.cpp:1502`, `:1570`) only
-execute INSIDE a round. So once round wall-time exceeds the interval, cleanup stops happening at all,
-dropped namespaces' `_log` objects stay forever, every LIST gets more expensive, and the next round is
-slower still — a positive feedback loop, not a plateau. The 04286 600s timeout
+MECHANISM (read from the code, not inferred from the timings — the first wording here was too
+vague). A round is ALL-OR-NOTHING: `fold` (O(universe)) -> ONE `gc/state` CAS (`CasGc.cpp:636`) ->
+cleanup (`runNamespaceCleanupPasses` + `cleanupRefObjects`, `:725-727`). Cleanup sits AFTER the commit
+point by design (a `Removed` snapshot must be durable before the logs it covers may be deleted —
+"ORDER IS LOAD-BEARING" at `:713-724`), and a lost CAS THROWS at `:638`:
+`"gc/state moved during the round (another leader advanced it); retry next round"`.
+So a round that cannot finish before another leader advances `gc/state` (or steals the lease) does not
+do LESS cleanup — it does ZERO, and discards the whole fold. Beyond a threshold, throughput does not
+degrade gracefully, it goes to zero while the rounds keep burning I/O. That is the feedback loop:
+no cleanup -> dead namespaces persist -> universe grows -> fold slower -> more likely to lose the CAS.
+
+OPEN QUESTION (do not state either as fact until checked): the CI evidence is "no round COMPLETED
+after 05:36", which fits BOTH "rounds start and lose the CAS" (a two-leader livelock) and "one round
+is still folding and never reached the CAS" (merely a very slow fold). The discriminator is the
+presence of `gc/state moved during the round` lines in the server log — grep for it in the retained
+CI artifacts before designing a fix, because the two cases want different remedies (leader/lease
+arbitration vs fold cost). The 04286 600s timeout
 ({#remote-data-paths-no-pushdown}) is a SYMPTOM of this; the disk-name pushdown fixes that one query,
 not the pool.
 
