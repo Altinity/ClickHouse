@@ -880,3 +880,14 @@ fixed.
   damage; and Task 1's mirror test must not be left red in the battery — this project has no known reds,
   so it either passes or is pinned as an explicit expected-failure naming its un-skip condition.
   Disk 332G, load 0.4.
+- 23:49 UTC — watchdog: task 9 (S42 verdict) committed after hand-verification (`402a85c4a64`) — the
+  pytest baseline is unchanged, `Verdict.skipped` survives for other cards, and the generic anti-vacuity
+  guard still gates. The detector agent is writing: `Gc/CasGc.{h,cpp}`, `ProfileEvents.cpp`, two existing
+  GC test files, and a NEW `src/Disks/tests/gtest_cas_holey_list_detector.cpp`. Disk 332G, load 2.5.
+  TO CHECK WHEN IT REPORTS, and the reason it is written down now rather than trusted later: that file name
+  says "holey list detector". The binding instruction was the opposite — catch the EFFECT (a cursor
+  advanced past a transaction that was never applied), NOT the LIST hypothesis, because the hypothesis is
+  unconfirmed and a detector built for it would stay silent on a loss below the intake while manufacturing
+  confidence. The name alone proves nothing; probe B2 exists precisely for the non-LIST half. But if the
+  tests inside only exercise a holey listing, the deliverable is narrower than the decision and must be
+  said so plainly rather than accepted because the gate is green.
