@@ -368,3 +368,11 @@ RE-RUN: torn down with `-v`, stand recreated clean, soak v3 launched 08:33 UTC
 (`--seed 1 --phase 3 --duration 4h --insert-mode sync --max-pool-gb 12`) -> `tmp/unattended/soak_4h_v3.log`,
 ETA ~12:33 UTC. 330G free at start.
 - 08:49 UTC — watchdog: soak v3 t+0h16m healthy (STAGE steady, 0 failures, 0 checkpoints yet), log fresh, 305G free, 52G available RAM (the 1G 'free' is page cache, server MemoryTracking 1.5 GiB). No hung processes.
+- 09:09 UTC — watchdog: soak v3 t+0h36m healthy (STAGE mutations, 0 failures), but DISK on a watch-list:
+  free 305G→255G in 20 min (~150 GB/h), pool_bytes 59.5 GB against a 12 GB budget with the throttle
+  already pinned at its `_THROTTLE_MAX` 1.0s/insert. That is by design, not a runaway: `compute_throttle`
+  never drops work, and its docstring names TTL eviction + GC as the real cap. The reclaim event is the
+  `gc_checkpoint` stage at t+5040s = 09:57 UTC (inserts off); v2 reclaimed 115 GB there. Projection: ~135G
+  free when it starts, i.e. above the 60G alert line. CONTINGENCY if the next tick undershoots ~205G:
+  ~100 GB of docker artifacts are reclaimable without touching the running stand (43.9 GB unused local
+  volumes incl. the 29.8 GB clickhouse_integration_tests_volume, 28.1 GB unused images, 4.4 GB build cache).
