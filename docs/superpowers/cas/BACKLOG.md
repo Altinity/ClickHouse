@@ -1298,3 +1298,29 @@ Harmless (it passes), but do not read the suite count as "all CAS".
 
 LESSON, worth generalizing: a name-pattern gate silently under-tests and never reports what it skipped.
 Any gate defined by a glob should be re-derived from an enumeration periodically, not maintained by hand.
+
+### UPGRADE 2026-07-25: the deletion path is no longer an inference — it is MECHANISED in TLA+ {#list-as-journal-mechanised}
+
+`docs/superpowers/models/CaRelinkConfirmCore.tla`, config `_sab_holeylist` (Task 9 of the publish-confirm
+plan, landed `0d1e3f4cc7c`). Controller re-ran it independently: `_main` completes clean at 72,984 states,
+`_sab_holeylist` violates.
+
+The sabotage config changes NOTHING about the confirm protocol — every rule stays intact — and permits
+exactly **one** incomplete `LIST` page in the whole behaviour (`MaxHoles = 1`).
+`ConfirmedRelinkNeverDangles` breaks anyway. Essential trace: the receiver's `+1` is durable; an
+edge-neutral later transaction lands in the same namespace; confirm CORRECTLY answers yes; promote; the
+single holey fold observes the later transaction but omits the `+1` and advances the namespace cursor past
+it; the record is below the cursor forever, so complete later pages cannot recover it; condemn →
+`delete_pending` → delete over three rounds; a promoted, correctly-confirmed manifest now references a
+deleted blob.
+
+Two details that make this stronger, not weaker:
+- The one-hole budget was TIGHTENED during modelling. A first version let GC be arbitrarily lazy and TLC
+  found a cheap violation with no permanent skip at all; the adversary was constrained so the counterexample
+  is FORCED through the permanent skip. The finding survived being made harder to reach.
+- Three-phase graduation's sparing does not help. It can only spare what a fold shows it.
+
+CONSEQUENCE for how the model may be cited: `_main` passing is CONDITIONAL on a LIST-completeness
+assumption the shipped code does not establish. It means "the confirm protocol adds no new dangle path",
+NOT "a confirmed relink cannot dangle". It may not be cited as dangle-freedom until fix items 1-2 (the
+authoritative per-namespace chain and the complete-cut gate) land.
