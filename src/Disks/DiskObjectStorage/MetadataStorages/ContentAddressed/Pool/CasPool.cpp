@@ -1544,6 +1544,11 @@ void Pool::forceWedgeForTest(const RootNamespace & ns, uint64_t writer_epoch, ui
     ref_ledger.forceWedgeForTest(ns, writer_epoch, ref_sequence, key, bytes);
 }
 
+RefApplyState Pool::applyStateForTest(const RootNamespace & ns)
+{
+    return ref_ledger.applyStateForTest(ns);
+}
+
 bool Pool::needsStalePrecommitSweepForTest(const RootNamespace & ns)
 {
     return ref_ledger.needsStalePrecommitSweepForTest(ns);

@@ -777,6 +777,7 @@ The server successfully detected this situation and will download merged part fr
     M(CasRefAppendWedged, "Number of CAS ref-log append lanes that exhausted retries after an uncertain PUT. A non-zero value indicates ref-log progress may be stalled.", ValueType::Number) \
     M(CasRefAppendUnwedged, "Number of CAS ref-log append lanes recovered after an uncertain PUT was later observed durable. A non-zero value indicates transient write uncertainty.", ValueType::Number) \
     M(CasRefAppendDefiniteFailure, "Number of CAS ref-log appends rejected with certainty. A non-zero value indicates invalid requests or backend rejection requiring investigation.", ValueType::Number) \
+    M(CasRefApplyPoisoned, "Number of CAS ref tables whose cached state may be MISSING a durable transaction: an install failed although its ref-log object may already be durable. This must always be zero; a non-zero value means that table's writer view is untrustworthy until the disk is remounted.", ValueType::Number) \
     M(CasRefSweepDeferred, "Number of stale-precommit sweeps deferred after a read-only failure. A non-zero value indicates cleanup is waiting for a later trigger.", ValueType::Number) \
     M(CasRefSweepRearmed, "Number of failed or partial stale-precommit sweeps scheduled for retry. Growing values indicate persistent cleanup or backend errors.", ValueType::Number) \
     M(CasRefStalePrecommitsReclaimed, "Number of stale precommit bindings removed by CAS ref cleanup. Growth indicates superseded writer state is being reclaimed.", ValueType::Number) \

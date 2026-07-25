@@ -29,6 +29,31 @@ namespace DB::Cas
 /// re-validating anything.
 enum class ResolveAudit : uint8_t { Emit, Deferred };
 
+/// Per-table marker for the ref lane's three post-durable install regions (spec §A2).
+///
+/// §A1 made every one of those regions allocation-free, so "the ref-log object is durable but the
+/// runtime does not record it" is unreachable by construction. This marker exists so that if it ever
+/// happens ANYWAY it is VISIBLE instead of silent, and so the relink confirm has a cheap predicate to
+/// read (its rule 4). The states:
+///   `Clean`        -- no ref-log object of this table's is known to be, or may be, durable without
+///                     having been applied to the cached state;
+///   `ApplyPending` -- armed immediately BEFORE a durable `PUT` and cleared once that transaction is
+///                     installed (or once it is PROVEN that nothing became durable). It is also the
+///                     steady state of a wedged lane, which is exactly "may be durable, not applied";
+///   `Poisoned`     -- an install failed although its object may already be durable, i.e. the cached
+///                     state can be MISSING a durable transaction. TERMINAL for the runtime: no later
+///                     flush clears it, only a fresh recovery (which means a REPLACED runtime -- a
+///                     runtime is never re-recovered in place). Enforced by construction: every
+///                     transition out of it would have to be a `Clean`/`ApplyPending` CAS whose
+///                     expected value is not `Poisoned`, and there is no plain store anywhere.
+///
+/// It is deliberately an ASSERT LAYER, NOT an operational fence: nothing refuses work because a table
+/// is `Poisoned`. Safety rests on §A1. Turning this into a fence (the spec's "ordering caveat") would
+/// require rejecting later `appendRefOps`, stale-precommit sweeps and snapshot admissions, exposing
+/// reads/confirm as unknown, and ACTIVELY driving runtime replacement -- none of which this does, and
+/// none of which should be inferred from the marker's existence.
+enum class RefApplyState : uint8_t { Clean, ApplyPending, Poisoned };
+
 /// Coordinates the writer-side ref-log and ref-table protocol for all namespaces in one mounted pool.
 /// It owns the recovered whole-table cache, the flat-combining append lane and its unresolved-`PUT`
 /// wedge, snapshot publication, stale-precommit cleanup, cache-budget eviction, and remount/shutdown
@@ -174,6 +199,10 @@ public:
     /// Installs a synthetic unresolved append for `ns` so callers can exercise resolution and blocking.
     void forceWedgeForTest(const RootNamespace & ns, uint64_t writer_epoch, uint64_t ref_sequence,
                            const String & key, const String & bytes);
+    /// Returns the post-durable install marker of `ns` (spec §A2; see `RefApplyState`). Reads the
+    /// runtime's atomic directly -- no lock, and no recovery is forced beyond the runtime materialization
+    /// every other seam here already performs.
+    RefApplyState applyStateForTest(const RootNamespace & ns);
     /// Reports whether recovery or a prior incomplete sweep requires stale-precommit cleanup.
     bool needsStalePrecommitSweepForTest(const RootNamespace & ns);
     /// Waits until all background snapshot publications for `ns` have completed.
@@ -359,6 +388,12 @@ private:
         /// checks.
         std::set<RefTxnId> cleanup_markers;
         std::optional<RefAppendWedge> wedge;
+        /// The post-durable install marker (spec §A2; see `RefApplyState` for the state machine and for
+        /// why it is an assert layer rather than a fence). Atomic and RELAXED because it is written
+        /// inside the install regions, which must not allocate and must not take another lock -- and
+        /// because it publishes no other state: every reader wants the marker itself, never a
+        /// happens-before edge to the table state (which `state_mutex` provides).
+        std::atomic<RefApplyState> apply_state{RefApplyState::Clean};
         uint64_t recovery_restarts = 0;           /// diagnostic: LIST/GET restarts forced by a vanished object
         /// Per-table admission budgets: raw configured limits minus the table's `4 + ns.size()` wire
         /// overhead and the fixed safety margin, computed once at recovery.
@@ -490,10 +525,15 @@ private:
     /// production.
     std::function<void(CarvePhaseForTest)> carve_hook_for_test;
 
-    /// Test-only probe fired INSIDE `commitRefChunk`'s post-durable install region, i.e. under
-    /// `DENY_ALLOCATIONS_IN_SCOPE`. It is the negative control for that guard: a probe that allocates
-    /// must abort a debug build, which is what proves the region is armed and actually entered -- so a
-    /// future edit that adds an allocating statement there cannot pass unnoticed. Null in production.
+    /// Test-only probe fired INSIDE each of the THREE post-durable install regions, i.e. under their
+    /// `DENY_ALLOCATIONS_IN_SCOPE`: `commitRefChunk`'s candidate install (`Committed`) and its wedge
+    /// install (`Unresolved`), and the wedge-resolution install in `flushRefBatch`. It is the negative
+    /// control for the guard: a probe that allocates must abort a debug build, which is what proves the
+    /// region is armed and actually entered -- so a future edit that adds an allocating statement there
+    /// cannot pass unnoticed. It is ALSO the only way left to reach the `Poisoned` transition (spec
+    /// §A2), by throwing an exception BUILT OUTSIDE the region (building it inside would trip the guard
+    /// instead of testing the poison). A test that installs a throwing probe must therefore disarm it
+    /// after the region it targets, or every later install throws too. Null in production.
     std::function<void()> install_region_probe_for_test;
 
     /// Returns the cached runtime for `ns`, creating an empty unrecovered runtime when needed.
@@ -551,6 +591,25 @@ private:
     bool commitRefChunk(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt,
                         const std::vector<RefOp> & chunk_ops,
                         const std::vector<std::shared_ptr<RefMutationItem>> & chunk_survivors);
+
+    /// The three `RefApplyState` transitions (spec §A2), the ONLY writers of `RefTableRuntime::
+    /// apply_state`. All of them are allocation-free at the point where it matters, so they can be
+    /// called from inside a `DENY_ALLOCATIONS_IN_SCOPE` install region.
+    ///
+    /// `Clean -> ApplyPending`, armed immediately before a durable `PUT`. A CAS rather than a store, so
+    /// arming can never resurrect a `Poisoned` table; a lane that is somehow already `ApplyPending`
+    /// (impossible under the wedge hard contract, which forbids a new `PUT` while wedged) is left as it
+    /// is, which is the conservative value anyway.
+    static void armApplyPending(RefTableRuntime & rt) noexcept;
+    /// `ApplyPending -> Clean`, on a completed install AND on every path that PROVES nothing became
+    /// durable, so no apply is owed. Also a CAS: `Poisoned` is terminal, and a `Clean` table stays
+    /// `Clean`.
+    static void clearApplyPending(RefTableRuntime & rt) noexcept;
+    /// `* -> Poisoned` with the `CasRefApplyPoisoned` event, emitted once per TRANSITION (a
+    /// re-poisoned table is already accounted for). `noexcept`: it runs from a `catch` that is about to
+    /// rethrow the original post-durable exception, and a failure to REPORT the poison must never
+    /// replace it -- so the marker and the event are set first and only the logging is swallowed.
+    static void poisonApplyState(RefTableRuntime & rt, const RootNamespace & ns, std::string_view region) noexcept;
 
     /// Leadership-exit guard for `appendRefOps`: under `ref_queue_mutex`, completes every still-unfinished
     /// item this leader owned (with `flush_exception` when unwinding, or a fail-closed `LOGICAL_ERROR`

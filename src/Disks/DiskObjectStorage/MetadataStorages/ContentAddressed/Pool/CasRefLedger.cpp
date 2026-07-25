@@ -47,6 +47,7 @@ namespace ProfileEvents
     extern const Event CasRefAppendWedged;
     extern const Event CasRefAppendUnwedged;
     extern const Event CasRefAppendDefiniteFailure;
+    extern const Event CasRefApplyPoisoned;
     extern const Event CasRefSweepDeferred;
     extern const Event CasRefSweepRearmed;
     extern const Event CasRefStalePrecommitsReclaimed;
@@ -858,6 +859,17 @@ void CasRefLedger::forceWedgeForTest(const RootNamespace & ns, uint64_t writer_e
     ensureRefTableRecovered(ns, *rt);
     std::lock_guard lock(rt->state_mutex);
     rt->wedge = RefAppendWedge{RefTxnId{writer_epoch, ref_sequence}, key, bytes};
+    /// A wedge -- synthetic or not -- IS "a ref-log object that may be durable and is not applied", so
+    /// the seam reproduces the whole runtime state the production `Unresolved` arm leaves behind, marker
+    /// included. Nothing reads the marker to make a decision (spec §A2: assert layer, not fence), so this
+    /// changes no behaviour; it only keeps the seam from constructing a state production cannot reach.
+    armApplyPending(*rt);
+}
+
+RefApplyState CasRefLedger::applyStateForTest(const RootNamespace & ns)
+{
+    const auto rt = getRefTableRuntime(ns);
+    return rt->apply_state.load(std::memory_order_relaxed);
 }
 
 bool CasRefLedger::needsStalePrecommitSweepForTest(const RootNamespace & ns)
@@ -1127,6 +1139,50 @@ void CasRefLedger::completeOwnedItemsAndReleaseLeadership(
     rt->cv.notify_all();
 }
 
+void CasRefLedger::armApplyPending(RefTableRuntime & rt) noexcept
+{
+    /// A CAS from `Clean` ONLY. That is what makes `Poisoned` terminal BY CONSTRUCTION rather than by
+    /// call-site discipline: this and `clearApplyPending` are the only writers besides
+    /// `poisonApplyState`, both name their expected value explicitly, and neither names `Poisoned` --
+    /// so no store that could clear a poison exists anywhere in the translation unit. A failed CAS is
+    /// not an error on either of its two possible losers: `ApplyPending` is already the value we want,
+    /// and `Poisoned` must stay.
+    RefApplyState expected = RefApplyState::Clean;
+    rt.apply_state.compare_exchange_strong(expected, RefApplyState::ApplyPending, std::memory_order_relaxed);
+}
+
+void CasRefLedger::clearApplyPending(RefTableRuntime & rt) noexcept
+{
+    RefApplyState expected = RefApplyState::ApplyPending;
+    rt.apply_state.compare_exchange_strong(expected, RefApplyState::Clean, std::memory_order_relaxed);
+}
+
+void CasRefLedger::poisonApplyState(RefTableRuntime & rt, const RootNamespace & ns, std::string_view region) noexcept
+{
+    /// The marker and the metric first, and both are non-allocating: this runs from a `catch` that is
+    /// about to rethrow, so everything that can fail must come after everything that must not.
+    const RefApplyState previous = rt.apply_state.exchange(RefApplyState::Poisoned, std::memory_order_relaxed);
+    if (previous == RefApplyState::Poisoned)
+        return;   /// one event per TRANSITION: a runtime that is already poisoned is already accounted for
+    ProfileEvents::increment(ProfileEvents::CasRefApplyPoisoned);
+    try
+    {
+        LOG_ERROR(getLogger("CasPool"),
+            "CAS ref table '{}' is POISONED at {}: an install failed although its ref-log object may "
+            "already be durable, so this cached table may be MISSING a durable transaction. The "
+            "allocation-free install regions make this unreachable by construction, so reaching it is a "
+            "bug in that construction. The marker is terminal for this runtime -- only a remount, which "
+            "replaces the runtime, clears it.",
+            ns.string(), region);
+    }
+    catch (...)   // NOLINT(bugprone-empty-catch)
+    {
+        /// `noexcept`, and the logging allocates. A failure to REPORT the poison must not become a
+        /// `std::terminate` and must not replace the post-durable exception the caller is rethrowing;
+        /// the marker and the metric above already carry the signal.
+    }
+}
+
 void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt,
                                  std::vector<std::shared_ptr<RefMutationItem>> & owned_items)
 {
@@ -1242,6 +1298,19 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
                 /// detection case: fail closed LOUDLY (LOGICAL_ERROR, routed through
                 /// `reportImpossibleInterference`) to every queued caller and KEEP the wedge, so the lane is
                 /// left explicitly wedged for inspection rather than hanging every future caller.
+                ///
+                /// The one wedge resolution that is CONCLUSIVELY NEGATIVE, and therefore the third
+                /// "nothing became durable, no apply is owed" clear (spec §A2). The ref-log key is
+                /// write-once: a DIFFERENT object sitting at it proves OUR body never landed there --
+                /// our `putIfAbsent` would have been rejected. (`resolveByExactGet` never reports a
+                /// plain absent verdict: an absent or unreadable key returns `Unresolved`, since
+                /// another attempt may still be legal. This foreign-bytes arm is the only shape in
+                /// which a resolution proves the transaction is not durable.) Cleared BEFORE the
+                /// anomaly reaction below, whose `LOGICAL_ERROR` aborts the process outright in
+                /// debug/sanitizer builds. The wedge is deliberately KEPT for inspection, so this is
+                /// the one state where a wedged lane is not `ApplyPending`; the lane is fenced closed
+                /// and headed for a remount anyway.
+                clearApplyPending(*rt);
                 on_impossible_interference(wedge_copy->key,
                     fmt::format("ref-log wedge resolution for namespace '{}' txn {}-{} observed foreign bytes "
                         "at the wedged key ({})", ns.string(), wedge_copy->txn_id.writer_epoch,
@@ -1278,8 +1347,19 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
                             "the wedge hand-off below must be non-throwing: it runs after the wedged object "
                             "is proven durable, where a throw would re-apply the transaction on the next "
                             "resolution");
+                        /// Post-durable install region 2 of 3 (spec §A2). The `catch` cannot fire while
+                        /// §A1 holds -- the body below allocates nothing -- and is what makes a
+                        /// violation of §A1 VISIBLE rather than silent: the GET proved the object
+                        /// durable, so an install that does not complete leaves this table's cached
+                        /// state missing it. It rethrows unchanged, so the lane's error handling is
+                        /// exactly what it was; only the marker and the metric are added.
+                        try
                         {
                             DENY_ALLOCATIONS_IN_SCOPE;
+                            /// The negative control (`setInstallRegionProbeForTest`), fired with the
+                            /// guard already armed, exactly as in `commitRefChunk`'s region.
+                            if (install_region_probe_for_test)
+                                install_region_probe_for_test();
                             chassert(state_unchanged);
                             /// The install, allocation-free by construction: a member-wise swap of
                             /// pointers and PODs, two atomic increments, and a second swap of pointers.
@@ -1298,6 +1378,16 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
                             rt->tail_count_since_snapshot.fetch_add(1, std::memory_order_relaxed);
                             rt->tail_bytes_since_snapshot.fetch_add(wedge_copy->bytes.size(), std::memory_order_relaxed);
                             rt->wedge.swap(displaced_wedge);
+                            /// Last statement of the install, in the SAME allocation-free region as the
+                            /// swap that performs it: "the transaction is recorded" and "no apply is
+                            /// owed" become true together or not at all (spec §A2). A relaxed CAS on a
+                            /// `uint8_t` -- it cannot allocate and cannot throw.
+                            clearApplyPending(*rt);
+                        }
+                        catch (...)
+                        {
+                            poisonApplyState(*rt, ns, "wedge-resolution install");
+                            throw;
                         }
                         /// `candidate` now holds the DISPLACED state, which still shares the COW bases
                         /// `rt->state` uses; destroying it here restores unique base ownership so the fold
@@ -1793,6 +1883,14 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
         return false;
     }
 
+    /// Arm the apply-pending marker (spec §A2) IMMEDIATELY before the `PUT` -- the last statement that
+    /// still runs while nothing of this transaction can possibly be durable. A relaxed CAS on a
+    /// `uint8_t`: allocation-free, because arming the marker must never be the thing that throws, and
+    /// because everything BEFORE this point (the superseded re-check, the wedge contract, the candidate
+    /// apply, the seal) is a pre-durability rejection that owes no clear -- which is precisely why the
+    /// arm sits here and not at the top of the function.
+    armApplyPending(*rt);
+
     CasWriteOutcome outcome{};
     try
     {
@@ -1804,6 +1902,9 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
         /// object already at this txn's key -- a proven different-object conflict, not an unresolved PUT.
         /// Fail every survivor loudly and do NOT wedge (this is a conclusive rejection, not an uncertain
         /// outcome): the id is a safe gap, the cache is unchanged, and the lane stays usable.
+        /// Conclusive also means PROVEN NON-DURABLE for our bytes (the key is write-once and holds
+        /// someone else's object), so no apply is owed and the marker goes back to `Clean` (spec §A2).
+        clearApplyPending(*rt);
         complete_error(chunk_survivors, std::current_exception());
         return false;
     }
@@ -1825,6 +1926,12 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
                 /// enough that even the failure path's message is inline-buffered rather than heap
                 /// allocated, so no build can turn the assert itself into an allocation in the region.
                 [[maybe_unused]] const bool state_unchanged = rt->state.getGreatestApplied() == candidate_base_id;
+                /// Post-durable install region 1 of 3 (spec §A2). The `catch` is unreachable while §A1
+                /// holds -- the body allocates nothing -- and exists so that a violation of §A1 is
+                /// VISIBLE (`Poisoned` + `CasRefApplyPoisoned`) instead of silently leaving this table's
+                /// cached state missing a durable transaction. It rethrows unchanged: the lane's error
+                /// handling (the survivors' completion in `appendRefOps`' catch) is exactly what it was.
+                try
                 {
                     DENY_ALLOCATIONS_IN_SCOPE;
                     /// The negative control (`setInstallRegionProbeForTest`): fired with the guard
@@ -1841,6 +1948,14 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
                     rt->state.swap(*candidate);
                     rt->tail_count_since_snapshot.fetch_add(1, std::memory_order_relaxed);
                     rt->tail_bytes_since_snapshot.fetch_add(prepared_wedge.bytes.size(), std::memory_order_relaxed);
+                    /// Last statement of the install, in the SAME allocation-free region: "recorded" and
+                    /// "no apply owed" become true together or not at all (spec §A2).
+                    clearApplyPending(*rt);
+                }
+                catch (...)
+                {
+                    poisonApplyState(*rt, ns, "commitRefChunk install");
+                    throw;
                 }
                 /// `candidate` now holds the DISPLACED state, which still shares the COW bases
                 /// `rt->state` uses. Destroy it before the fold and the fold takes its O(overlay)
@@ -1880,10 +1995,11 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
                         ns.string(), id.writer_epoch, id.ref_sequence));
                 }
             }
-            /// There is no outer catch around the install any more. The old one turned an apply that
-            /// threw AFTER the PUT into a `LOGICAL_ERROR` -- an honest report of a lane that its own
-            /// comment predicted would be bricked on every future recovery. The install can no longer
-            /// throw, so there is nothing left for it to catch.
+            /// The OLD outer catch around the install is gone. It turned an apply that threw AFTER the
+            /// PUT into a `LOGICAL_ERROR` -- an honest report of a lane that its own comment predicted
+            /// would be bricked on every future recovery. The install can no longer throw, so there is
+            /// nothing left for it to convert. The catch that remains around the region changes no
+            /// behaviour: it only marks the table `Poisoned` and rethrows the original exception.
             ProfileEvents::increment(ProfileEvents::CasRefBatchFlushes);
             ProfileEvents::increment(ProfileEvents::CasRefBatchedMutations, chunk_survivors.size());
             {
@@ -1905,6 +2021,9 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
         }
         case CasWriteOutcome::DefiniteFailure:
         {
+            /// PROVEN never applied (that is the whole meaning of this outcome), so no apply is owed
+            /// and the marker returns to `Clean` (spec §A2).
+            clearApplyPending(*rt);
             ProfileEvents::increment(ProfileEvents::CasRefAppendDefiniteFailure);
             complete_error(chunk_survivors, makeCasWriteRetryLaterExceptionPtr(fmt::format(
                 "CAS ref-log append for namespace '{}' definitively failed (non-retryable rejection); "
@@ -1919,8 +2038,20 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
                 static_assert(std::is_nothrow_move_constructible_v<RefAppendWedge>,
                     "the wedge install below must be non-throwing: the object it describes may already be "
                     "durable, and the wedge is the only record that can ever resolve it");
+                /// Post-durable install region 3 of 3 (spec §A2). The marker deliberately STAYS
+                /// `ApplyPending` on the success path: an `Unresolved` outcome is precisely "an object
+                /// that may be durable and is not applied", and the wedge is what will later resolve it
+                /// -- so the wedged lane's steady state is the pending state, cleared only when the
+                /// resolution installs the transaction or proves it never landed. Losing the wedge here
+                /// is strictly WORSE than being wedged (neither the transaction nor the record of it
+                /// exists, and the next append mints a fresh id against a state that may be missing a
+                /// landed transaction), so a throw poisons even though durability is unproven here.
+                try
                 {
                     DENY_ALLOCATIONS_IN_SCOPE;
+                    /// The negative control, as in the other two regions.
+                    if (install_region_probe_for_test)
+                        install_region_probe_for_test();
                     /// The install of the OTHER post-durable record (spec §A1 site 3). `Unresolved` means
                     /// the object may well be durable, so this wedge is the only thing that can ever
                     /// resolve it -- recording it must not be able to fail. `rt->wedge` is provably
@@ -1930,6 +2061,11 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
                     /// engaged, the same statement would move-ASSIGN and free the displaced buffers inside
                     /// the region -- which is exactly why the contract is checked, not assumed.
                     rt->wedge = std::move(prepared_wedge);
+                }
+                catch (...)
+                {
+                    poisonApplyState(*rt, ns, "commitRefChunk wedge install");
+                    throw;
                 }
             }
             ProfileEvents::increment(ProfileEvents::CasRefAppendWedged);

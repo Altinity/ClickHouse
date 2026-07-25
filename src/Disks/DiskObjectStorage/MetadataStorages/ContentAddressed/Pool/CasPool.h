@@ -752,6 +752,11 @@ public:
     /// top-of-flush wedge-resolution check has already run clean but BEFORE the batch is carved.
     void forceWedgeForTest(const RootNamespace & ns, uint64_t writer_epoch, uint64_t ref_sequence,
                            const String & key, const String & bytes);
+    /// test seam: this table's post-durable install marker (spec §A2) -- `Clean`, `ApplyPending`
+    /// (a durable `PUT` is in flight, or the lane is wedged), or the terminal `Poisoned`. See
+    /// `RefApplyState` for why it is an assert layer and not a fence.
+    RefApplyState applyStateForTest(const RootNamespace & ns);
+
     /// Whether this table still owes a stale-precommit sweep (armed by recovery; re-armed by a
     /// failed attempt; cleared permanently only by a verified-clean sweep). Recovers the table (like any
     /// real read) if not already cached.
