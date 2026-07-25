@@ -446,3 +446,7 @@ reclaim-impossibility that the writer protocol says no longer exists. Not editin
   first fault ever fired, with inserts off and GC at a settled fixpoint. Keep the two apart when
   identifying objects after the run: the question is whether the post-run detail fsck shows one
   population or two.
+- 11:29 UTC — watchdog: soak v3 t+2h56m, STAGE chaos, 0 failures, 20 faults, 13 checkpoints OK,
+  `unreachable` flat at 56 across the last two (no further growth in this interval), disk 326G stable,
+  pool_bytes 0.57 GB, log fresh. Nothing to unstick. 1h03m left; `cliff` stage starts at t+12240s
+  (11:57 UTC), `converge` at t+12960s (12:09 UTC).
