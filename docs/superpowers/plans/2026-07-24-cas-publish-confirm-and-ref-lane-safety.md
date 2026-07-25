@@ -1203,3 +1203,80 @@ exposed through `ICaPreparedRelink` (Task 14, abstract) for the same reason.
 **Residual risk to watch during execution:** Part A edits `commitRefChunk`, which a parallel session
 rewrote hours ago (stage1). Rebase-free discipline means implementing from the landed head and
 re-reading the function before each edit.
+
+---
+
+## Task 21: Part B soak gate — 20-minute shakeout first, then 4 hours
+
+**Why this task exists.** Task 16's pytest battery proves the confirm protocol FUNCTIONS. It does not
+prove it survives hours of concurrent load with chaos, and Part B rewrites the `tmp-fetch` lifecycle
+where every one of the 56 leaked blobs originated (BACKLOG `{#unmatched-minus-one-fetch-window}`). Task 18
+also changed lease-loss behaviour, which is precisely what chaos generates, and it landed AFTER the last
+green soak.
+
+**Order is deliberate (user decision, 2026-07-25): a 20-minute run FIRST, to tune the harness, verify every
+signal is actually observed, and fix the bugs that shakes out. Only once the 20-minute run is stable does
+the 4-hour run happen.** Do not skip to the long run: three separate harness surfaces were found silently
+under-reporting the product this week, and a 4-hour run that reports nothing useful costs a day.
+
+**Files:**
+- Modify: `utils/ca-soak/soak/run.py` (checkpoint asserts; metrics)
+- Modify: `utils/ca-soak/soak/cluster.py` (ProfileEvents collection — see step 2)
+- Test: `utils/ca-soak/tests/` (unit tests for whatever pure logic you add)
+
+- [ ] **Step 1: Add `stale_edge` to the checkpoint's hard asserts.**
+
+The checkpoint already raises on `dangling != 0` at `run.py:642` and already has a detail fsck available at
+`run.py:606`. `stale_edge` is DETAIL-MODE ONLY (see `CasFsck.h`), so assert it off that detail read, not
+off the cheap summary at `:596`. A blob whose every source edge names a manifest that no longer exists can
+never be reclaimed by the incremental GC, so a nonzero count is a hard failure, not debris.
+
+Fail CLOSED on absence: if the detail fsck result has no `stale_edge` key at all, that means the binary
+predates the class — raise `CheckpointFailure` naming that, never treat a missing key as zero.
+
+- [ ] **Step 2: Teach the driver to read ProfileEvents at all.**
+
+`grep -n "ProfileEvents" utils/ca-soak/soak/*.py` returns NOTHING today — the soak driver cannot observe a
+single counter. That is why the three signals added on 2026-07-25 would be invisible to it. Add a
+collector to `cluster.py` alongside the existing metric probes:
+
+```sql
+SELECT event, value FROM system.events WHERE event IN (
+    'CasGcUnmatchedRemoveDeltas', 'CasRefAppendPreAttemptRefused', 'CasRefAppendWedged',
+    'CasGcCondemnMarkerUnconfirmedCarry', 'CasGcClampSuppressedPasses')
+```
+
+Record them per metrics tick and in every checkpoint row. Follow `soak/fsck.py`'s error discipline as
+FIXED on 2026-07-25 (`observe.py`'s `_is_benign_probe_gap`): a node that is down during a chaos window is
+legitimately unreadable; a query that FAILS is not, and must surface rather than degrade to zero.
+
+- [ ] **Step 3: Report the counters; do NOT fail on them yet.**
+
+Their benign rates are uncharacterised. `CasGcUnmatchedRemoveDeltas` should be zero in a healthy pool but
+may be nonzero for reasons we have not enumerated; `CasRefAppendPreAttemptRefused` is EXPECTED to be
+nonzero under chaos — that is the availability fix working. Characterising them is the point of the
+20-minute runs. Record a threshold only once several runs agree.
+
+- [ ] **Step 4: The 20-minute shakeout, repeated until stable.**
+
+```bash
+cd utils/ca-soak && docker compose up -d && python3 -m soak.run --seed 1 --phase 3 --duration 20m \
+    --insert-mode sync --max-pool-gb 12 > tmp/unattended/soak_partb_20m_<n>.log 2>&1
+```
+
+(Phase 3 with `--duration` is the real timed soak; phase 1 `--ops` finishes ~10× faster and does NOT
+exercise the stage plan — see [[reference_ca_soak_duration_phase3]].)
+
+EXPECT the first runs to fail on harness problems rather than product problems, and fix those. The run is
+"stable" when two consecutive runs are green AND every signal above was actually OBSERVED at least once —
+a green run in which a counter was never read is not stable, it is blind. Record each attempt in
+`RUN_HISTORY.md` with what broke and what was fixed.
+
+- [ ] **Step 5: The 4-hour run, with chaos.**
+
+Same invocation with `--duration 4h`. Gate: `PHASE3 OK`, `dangling == 0` at every checkpoint,
+`stale_edge == 0` at every checkpoint, zero `WORKLOAD FAILURE`, and the counters recorded.
+
+- [ ] **Step 6: Commit** the harness changes, the run history, and a short results note.
+
+---
