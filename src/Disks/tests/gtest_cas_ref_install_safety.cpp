@@ -27,6 +27,11 @@
 ///
 /// The suite name is prefixed `Cas` so it is covered by the `Cas*` unit-test gate filter.
 
+namespace DB::ErrorCodes
+{
+extern const int NETWORK_ERROR;
+}
+
 using namespace DB::Cas;
 
 namespace
@@ -37,6 +42,25 @@ PoolPtr openPool(const BackendPtr & backend)
     /// A fresh pool with no residue, mirroring `gtest_cas_ref_chunked_flush.cpp`'s `openPool`.
     DB::Cas::tests::seedPoolMetaForRestart(*backend);
     return Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+}
+
+/// As `openPool`, but with a SINGLE-attempt request budget, which is what makes one ambiguous `PUT`
+/// conclusive: with retries allowed the controller's resolve-before-reissue would either re-`PUT` (the
+/// object never landed) or prove the object durable (it did) and report `Committed`, and neither of the
+/// wedge arms under test would ever be reached. Same budget shape as
+/// `gtest_cas_ref_chunked_flush.cpp`'s `runChunkFailureCase`, including the short timeouts so there is
+/// no inter-attempt sleep to serve.
+PoolPtr openPoolSingleAttempt(const BackendPtr & backend)
+{
+    DB::Cas::tests::seedPoolMetaForRestart(*backend);
+    PoolConfig cfg{.pool_prefix = "p", .server_root_id = "test"};
+    CasRequestBudget budget;
+    budget.max_attempts = 1;
+    budget.attempt_timeout_ms = 100;
+    budget.operation_deadline_ms = 100;
+    budget.lease_safety_margin_ms = 100;
+    cfg.cas_request_budget = budget;
+    return Pool::open(backend, cfg);
 }
 
 /// A legal blob-free part: stage an empty manifest, precommit, promote -- enough to drive real
@@ -85,36 +109,105 @@ TEST(CasRefInstallSafety, PostDurableInstallIsAllocationFree)
     EXPECT_TRUE(store->resolveRef(ns, "part_a", /*allow_stale=*/false).has_value());
 }
 
-/// The install region must contain no allocation. Under a debug build `DENY_ALLOCATIONS_IN_SCOPE` turns
-/// any allocation there into a `LOGICAL_ERROR`, which aborts, so this negative control proves the guard
-/// is ARMED and the region is actually entered -- otherwise a future edit could add an allocating
-/// statement to it and nothing would notice. `threadsafe` death-test style: the parent process has CAS
-/// background threads by the time this runs, and forking without exec would inherit their locks.
-TEST(CasRefInstallSafetyDeathTest, AllocationInsideTheInstallRegionIsCaught)
+/// Task 4 (spec §A1, site 3). An `Unresolved` PUT must ALWAYS leave the lane wedged with the exact
+/// {id, key, bytes} of the in-doubt object -- the wedge is the only record that can ever resolve it, and
+/// on this path the object may already be durable. Building the wedge AFTER the PUT copies two `String`s
+/// and could therefore fail on allocation, recording NEITHER the transaction nor the wedge: strictly
+/// worse than a wedge, because the next append then mints a fresh id and proceeds against a state that
+/// is missing a landed transaction. It is now preconstructed before the PUT and installed by a
+/// non-throwing move.
+///
+/// `Mode::Unresolved` deliberately lands NOTHING, so this test also pins the other half of the wedge
+/// contract: an ambiguous outcome wedges even when the object turns out never to have existed. The tail
+/// counter must NOT advance -- an unproven transaction is not a recorded one.
+TEST(CasRefInstallSafety, UnresolvedAlwaysRecordsTheWedge)
 {
-#if defined(MEMORY_TRACKER_DEBUG_CHECKS)
-    GTEST_FLAG_SET(death_test_style, "threadsafe");
-    EXPECT_DEATH(
-        {
-            auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
-            auto store = openPool(backend);
-            const RootNamespace ns{"srv1/install_safety_probe"};
-            store->setInstallRegionProbeForTest([] { volatile auto * p = new char[64]; (void)p; });
-            publishEmptyPart(store, ns, "part_a");
-        },
-        "");
-#else
-    GTEST_SKIP() << "DENY_ALLOCATIONS_IN_SCOPE is a no-op in this build";
-#endif
+    auto backend = std::make_shared<DB::Cas::tests::ChunkFaultBackend>();
+    auto store = openPoolSingleAttempt(backend);
+    const RootNamespace ns{"srv1/unresolved_wedge"};
+
+    /// Scoped to THIS namespace's ref log, so nothing else the part publish writes (the manifest, the
+    /// pool's own metadata) can consume the single fault.
+    backend->fault_substr = store->layout().refsNamespacePrefix(ns) + "_log/";
+    backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::Unresolved;
+    backend->fault_count = 1;
+
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { publishEmptyPart(store, ns, "part_a"); });
+
+    EXPECT_TRUE(store->refLaneWedgedForTest(ns)) << "an Unresolved PUT must always leave a wedge";
+    const String wedged_key = store->wedgedKeyForTest(ns);
+    EXPECT_FALSE(wedged_key.empty()) << "the wedge must retain the in-doubt object's key";
+    EXPECT_TRUE(wedged_key.starts_with(store->layout().refsNamespacePrefix(ns) + "_log/"))
+        << "the wedged key must be this namespace's ref-log object, not some other key: " << wedged_key;
+    EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), 0u)
+        << "an UNPROVEN transaction must not be recorded as applied";
 }
 
-/// Isolation probe for the negative control above: does `DENY_ALLOCATIONS_IN_SCOPE` catch an
-/// allocation AT ALL inside a gtest binary? Touches no CAS machinery, so a failure here means the
-/// guard cannot be exercised from a unit test (and the control above is unimplementable as written),
-/// while a pass narrows the problem to the install-region probe path.
-TEST(CasRefInstallSafetyDeathTest, DenyGuardCatchesAPlainAllocation)
+/// Task 5 (spec §A1, site 2). Resolving a wedge is a post-durable install too: the resolving GET PROVES
+/// the object landed, so the transaction MUST be recorded -- and recording it must be inseparable from
+/// clearing the wedge. It was not: the apply and the `materializeCommitted` fold sat between them
+/// WITHOUT the ordinary commit arm's swallow, so a fold failure left the transaction applied and the
+/// wedge still set, and the next resolution re-applied the same transaction and DOUBLE-bumped the tail
+/// counters. The candidate is now built before the GET and installed by a `noexcept` swap that clears
+/// the wedge in the same allocation-free region, with the fold outside it and swallowing.
+///
+/// Drives the real thing end to end (no seam beyond the `LandedThenLost` backend mode): a drop whose
+/// object landed but whose acknowledgement -- and whose immediate verification read -- were both lost,
+/// then a second append whose flush resolves it. The tail counter is the "exactly once" witness: it is
+/// bumped once per install, so a re-applied transaction shows up as one extra.
+TEST(CasRefInstallSafety, WedgeResolutionInstallsExactlyOnce)
 {
-#if defined(MEMORY_TRACKER_DEBUG_CHECKS)
+    auto backend = std::make_shared<DB::Cas::tests::ChunkFaultBackend>();
+    auto store = openPoolSingleAttempt(backend);
+    const RootNamespace ns{"srv1/wedge_resolution"};
+
+    publishEmptyPart(store, ns, "x");
+    publishEmptyPart(store, ns, "y");
+    /// No snapshot publish can interfere and reset these: the thresholds are 256 logs / 1 MiB and this
+    /// whole test is a handful of tiny transactions, so every delta below is exact.
+    const size_t tail_after_seed = store->tailSinceSnapshotCountForTest(ns);
+
+    /// Drop "x" through a PUT that LANDS and then loses its response, plus the one-shot lost read that
+    /// keeps the controller's own resolve-before-reissue from settling it inside the same attempt. One
+    /// attempt, so the lane wedges over an object that is genuinely durable -- the only way in.
+    backend->fault_substr = store->layout().refsNamespacePrefix(ns) + "_log/";
+    backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::LandedThenLost;
+    backend->fault_count = 1;
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
+
+    ASSERT_TRUE(store->refLaneWedgedForTest(ns)) << "the lost-response drop must wedge the lane";
+    ASSERT_FALSE(store->wedgedKeyForTest(ns).empty());
+    ASSERT_EQ(store->tailSinceSnapshotCountForTest(ns), tail_after_seed)
+        << "the wedged transaction is durable but not yet PROVEN, so it must not be recorded yet";
+
+    /// A second append into the same table: its flush resolves the wedge first (+1 install) and then
+    /// commits its own transaction (+1). Nothing else can add a transaction in between.
+    backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::None;
+    store->dropRef(ns, "y");
+
+    EXPECT_FALSE(store->refLaneWedgedForTest(ns)) << "a wedge proven durable must be cleared";
+    EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), tail_after_seed + 2)
+        << "the resolved transaction must be recorded EXACTLY once: +1 for it and +1 for the append that "
+           "resolved it (a double-apply would show as +3)";
+    /// Both drops took effect -- the wedged one via the resolution install, which is what proves that
+    /// install happened at all rather than the wedge merely being discarded.
+    EXPECT_FALSE(store->resolveRef(ns, "x", /*allow_stale=*/false).has_value())
+        << "the wedged drop was proven durable, so its removal must be visible in the cached state";
+    EXPECT_FALSE(store->resolveRef(ns, "y", /*allow_stale=*/false).has_value());
+}
+
+/// Negative control, part 1 of 2: does `DENY_ALLOCATIONS_IN_SCOPE` actually fire on an allocation in
+/// THIS binary? Deliberately split by build type instead of always asserting death, because the two
+/// build flavours turn the guard's `LOGICAL_ERROR` into different observable outcomes:
+/// `DEBUG_OR_SANITIZER_BUILD` aborts at Exception construction (`Exception.cpp:74-92`), while a build
+/// with only `MEMORY_TRACKER_DEBUG_CHECKS` — e.g. a plain Debug build, which does NOT define the
+/// former — merely throws. An earlier version of this control asserted death unconditionally and
+/// failed in the latter: the guard had fired correctly, the throw was simply caught by the ref lane's
+/// own error handling instead of killing the process. Same split shape as
+/// `CasGcStateFormat`/`CasGcStateFormatDeathTest`.
+#if defined(DEBUG_OR_SANITIZER_BUILD)
+TEST(CasRefInstallSafetyDeathTest, DenyGuardStopsAnAllocation)
+{
     EXPECT_DEATH(
         {
             DENY_ALLOCATIONS_IN_SCOPE;
@@ -122,7 +215,44 @@ TEST(CasRefInstallSafetyDeathTest, DenyGuardCatchesAPlainAllocation)
             (void)p;
         },
         "");
-#else
-    GTEST_SKIP() << "DENY_ALLOCATIONS_IN_SCOPE is a no-op in this build";
+}
+#elif defined(MEMORY_TRACKER_DEBUG_CHECKS)
+TEST(CasRefInstallSafety, DenyGuardStopsAnAllocation)
+{
+    EXPECT_ANY_THROW({
+        DENY_ALLOCATIONS_IN_SCOPE;
+        volatile auto * p = new char[64];
+        (void)p;
+    });
+}
+#endif
+
+/// Negative control, part 2 of 2: the region the guard protects is actually ENTERED, and the guard is
+/// armed at that exact point. A probe that only reads flags proves both without allocating, so unlike
+/// part 1 this assertion is immune to how a build type renders a `LOGICAL_ERROR`. Together the two
+/// parts give what a single death test was meant to give, and a failure now names WHICH half broke:
+/// "the guard does not fire" versus "the install region is never reached / not armed".
+TEST(CasRefInstallSafety, InstallRegionProbeIsInvokedAndTheGuardIsArmed)
+{
+    auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/install_probe_diag"};
+
+    bool probe_ran = false;
+    [[maybe_unused]] bool guard_armed_when_probe_ran = false;
+    store->setInstallRegionProbeForTest([&]
+    {
+        probe_ran = true;
+#if defined(MEMORY_TRACKER_DEBUG_CHECKS)
+        guard_armed_when_probe_ran = memory_tracker_always_throw_logical_error_on_allocation;
+#endif
+    });
+
+    publishEmptyPart(store, ns, "part_a");
+    store->setInstallRegionProbeForTest(nullptr);
+
+    EXPECT_TRUE(probe_ran) << "the install-region probe was never invoked";
+#if defined(MEMORY_TRACKER_DEBUG_CHECKS)
+    EXPECT_TRUE(guard_armed_when_probe_ran) << "the probe ran but DENY_ALLOCATIONS_IN_SCOPE was not armed";
 #endif
 }

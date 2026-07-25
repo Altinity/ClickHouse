@@ -395,111 +395,11 @@ TEST(RefWriterChunkedFlush, SyntheticWholeShardNonRemovalRejected)
 namespace
 {
 
-/// A `CountingBackend` that can fault ONLY the chunked flush's own `_log/` PUTs (skip the first
-/// `fault_skip` matches -- chunk 1 -- then fault the next -- chunk 2), and can latch a matching PUT
-/// (a `_snap/` publication) mid-flight. This is the same class of seam the wedge tests in
-/// `gtest_cas_ref_writer.cpp` use (`fault_key_substr`/`corrupt_key_substr`/`armPutBlock`), narrowed to
-/// exactly what the chunk-boundary tests need and kept TU-local so this file stages alone.
-class ChunkFaultBackend : public DB::Cas::tests::CountingBackend
-{
-public:
-    using CountingBackend::putIfAbsent;
-    using CountingBackend::get;
-
-    /// Unresolved       -> a lost-response ambiguity; with a single-attempt budget this wedges the lane.
-    /// Definite         -> an S3-classified malformed request -> `CasWriteOutcome::DefiniteFailure`.
-    /// ForeignConflict  -> a DIFFERENT object lands at the key, then the response is lost -> the
-    ///                     controller's resolve-before-reissue GET observes foreign bytes and throws
-    ///                     CORRUPTED_DATA straight out of the PUT (a proven conflict).
-    enum class Mode { None, Unresolved, Definite, ForeignConflict };
-
-    /// Fault matching is single-threaded during a flush (one leader per table PUTs `_log/`), so these
-    /// need no lock; set them before driving the flush.
-    String fault_substr;
-    Mode mode = Mode::None;
-    int fault_skip = 0;
-    int fault_count = 0;
-
-    DB::Cas::PutResult putIfAbsent(const String & key, const String & bytes, const DB::Cas::ObjectMeta & meta) override
-    {
-        if (mode != Mode::None && !fault_substr.empty() && key.find(fault_substr) != String::npos)
-        {
-            if (fault_skip > 0)
-            {
-                --fault_skip;
-            }
-            else if (fault_count > 0)
-            {
-                --fault_count;
-                switch (mode)
-                {
-                    case Mode::Unresolved:
-                        throw Poco::TimeoutException("ChunkFaultBackend: simulated ambiguous _log PUT (response lost)");
-                    case Mode::Definite:
-#if USE_AWS_S3
-                        throw DB::S3Exception("ChunkFaultBackend: simulated malformed request",
-                                              Aws::S3::S3Errors::UNKNOWN, "MalformedXML");
-#else
-                        throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
-                            "ChunkFaultBackend: DefiniteFailure requires S3 error classification (USE_AWS_S3 off)");
-#endif
-                    case Mode::ForeignConflict:
-                        /// A foreign writer lands DIFFERENT bytes at this exact key; then our response is
-                        /// lost, so resolve-before-reissue GETs foreign bytes -> CORRUPTED_DATA.
-                        CountingBackend::putIfAbsent(key, bytes + String("\x01_FOREIGN_DIFFERENT"));
-                        throw Poco::TimeoutException("ChunkFaultBackend: foreign different object landed; response lost");
-                    case Mode::None:
-                        break;
-                }
-            }
-        }
-        {
-            std::unique_lock lk(block_mutex);
-            if (block_armed && !block_substr.empty() && key.find(block_substr) != String::npos)
-            {
-                block_entered = true;
-                block_cv.notify_all();
-                /// Bounded (20s) so a wiring bug bounds the wait rather than hanging the whole suite.
-                block_cv.wait_for(lk, std::chrono::seconds(20), [&] { return !block_armed; });
-            }
-        }
-        return CountingBackend::putIfAbsent(key, bytes, meta);
-    }
-
-    void armBlock(const String & substr)
-    {
-        std::lock_guard lk(block_mutex);
-        block_substr = substr;
-        block_armed = true;
-        block_entered = false;
-    }
-    void awaitBlockEntered()
-    {
-        std::unique_lock lk(block_mutex);
-        /// Bounded (20s): if the latched publisher never reaches its PUT, fail LOUDLY rather than hang.
-        /// The assertion is load-bearing -- without it a wiring regression that never parks the publisher
-        /// would let `SnapshotPublisherLatchedAcrossChunks` pass VACUOUSLY (its final re-fire assertion
-        /// can still hold via a direct, non-coalesced dispatch).
-        block_cv.wait_for(lk, std::chrono::seconds(20), [&] { return block_entered; });
-        ASSERT_TRUE(block_entered) << "latched publisher never entered its blocked PUT within 20s -- "
-                                      "coalescing was not exercised";
-    }
-    void releaseBlock()
-    {
-        {
-            std::lock_guard lk(block_mutex);
-            block_armed = false;
-        }
-        block_cv.notify_all();
-    }
-
-private:
-    std::mutex block_mutex;
-    std::condition_variable block_cv;
-    String block_substr;
-    bool block_armed = false;
-    bool block_entered = false;
-};
+/// The `_log/`-PUT fault seam these tests are built on now lives in `cas_test_helpers.h`, next to
+/// `CountingBackend` it derives from: `gtest_cas_ref_install_safety.cpp` needs the SAME seam (spec §A1
+/// sites 2 and 3 both turn on what happens when a `_log/` PUT's response is lost), and two copies of a
+/// fault backend would drift apart.
+using DB::Cas::tests::ChunkFaultBackend;
 
 PoolPtr openPoolWith(const BackendPtr & backend, PoolConfig cfg)
 {

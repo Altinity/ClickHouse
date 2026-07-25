@@ -539,7 +539,9 @@ private:
     /// counters, records the per-transaction metrics, completes exactly `chunk_survivors` with the real
     /// id (waking their waiters), and schedules snapshot publication. The apply comes BEFORE the `PUT`
     /// so that nothing between "durable" and "recorded" can throw (spec §A1); a failure of that apply is
-    /// an ordinary pre-durability rejection.
+    /// an ordinary pre-durability rejection. For the same reason the `RefAppendWedge` is built COMPLETE
+    /// before the `PUT` -- the request reads its key and body -- so the `Unresolved` arm only has to move
+    /// it into the runtime: the OTHER thing that must be recorded once the object may be durable.
     /// Returns true when the chunk committed durably; false on any non-throwing failure (a rejected
     /// apply / DefiniteFailure / unresolved wedge / a conclusive PUT rejection / an encode failure),
     /// after having already failed `chunk_survivors` with the appropriate error. Past the durable `PUT`

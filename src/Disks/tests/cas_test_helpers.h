@@ -1,5 +1,7 @@
 #pragma once
 
+#include "config.h"
+
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedSettings.h>
@@ -28,13 +30,19 @@
 #include <gtest/gtest.h>
 #include <IO/HashingReadBuffer.h>
 #include <IO/ReadBufferFromMemory.h>
+/// For `ChunkFaultBackend`'s `DefiniteFailure` mode, which needs a real S3-classified error, and for
+/// the ambiguity it raises otherwise.
+#include <IO/S3Common.h>
+#include <Poco/Exception.h>
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <filesystem>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unistd.h>
 #include <vector>
@@ -47,6 +55,13 @@ namespace DB::ContentAddressedSetting
 {
     extern const ContentAddressedSettingsString server_root_id;
     extern const ContentAddressedSettingsString scratch_path;
+}
+
+/// Same per-TU pattern for the error codes this header's fault backends raise (`ChunkFaultBackend`'s
+/// non-S3 build of the `Definite` mode).
+namespace DB::ErrorCodes
+{
+    extern const int CORRUPTED_DATA;
 }
 
 namespace DB::Cas::tests
@@ -1043,6 +1058,146 @@ private:
     uint64_t put_total = 0;
     uint64_t get_stream_total = 0;
     uint64_t list_total = 0;
+};
+
+/// A `CountingBackend` that can fault selected PUTs by key substring (skip the first `fault_skip`
+/// matches, then fault the next `fault_count`), and can latch a matching PUT mid-flight. Same class of
+/// seam as the wedge tests in `gtest_cas_ref_writer.cpp` use
+/// (`fault_key_substr`/`corrupt_key_substr`/`armPutBlock`), narrowed to what the ref-lane tests need.
+/// Shared (rather than TU-local) because the chunk-boundary tests and the post-durable install-safety
+/// tests need exactly the same seam.
+class ChunkFaultBackend : public CountingBackend
+{
+public:
+    using CountingBackend::putIfAbsent;
+    using CountingBackend::get;
+
+    /// Unresolved       -> a lost-response ambiguity, NOTHING landed; with a single-attempt budget this
+    ///                     wedges the lane and a later resolve proves the key ABSENT.
+    /// LandedThenLost   -> our OWN exact bytes land and only the acknowledgement is lost, AND the
+    ///                     controller's immediate resolve-before-reissue GET is lost too. Both legs are
+    ///                     required to wedge over a DURABLE object: the resolve happens inside the same
+    ///                     attempt, so a readable key would prove `Committed` there and no wedge would
+    ///                     ever form. Real-world shape: the write succeeded server-side, the connection
+    ///                     dropped, and the verification read hit the same transient outage. With a
+    ///                     single-attempt budget the lane then wedges over an object that IS durable, so
+    ///                     the NEXT flush's `resolveByExactGet` reports `Committed` and drives the
+    ///                     wedge-RESOLUTION install (spec §A1 site 2) -- the only mode that reaches it.
+    /// Definite         -> an S3-classified malformed request -> `CasWriteOutcome::DefiniteFailure`.
+    /// ForeignConflict  -> a DIFFERENT object lands at the key, then the response is lost -> the
+    ///                     controller's resolve-before-reissue GET observes foreign bytes and throws
+    ///                     CORRUPTED_DATA straight out of the PUT (a proven conflict).
+    enum class Mode { None, Unresolved, LandedThenLost, Definite, ForeignConflict };
+
+    /// Fault matching is single-threaded during a flush (one leader per table PUTs `_log/`), so these
+    /// need no lock; set them before driving the flush.
+    String fault_substr;
+    Mode mode = Mode::None;
+    int fault_skip = 0;
+    int fault_count = 0;
+    /// One-shot: the next `get` of exactly this key throws, then it is cleared. Armed by
+    /// `Mode::LandedThenLost` (see above); settable directly for a bare lost-read fault.
+    String fail_get_once_key;
+
+    std::optional<DB::Cas::GetResult> get(const String & key, DB::Cas::Range range) override
+    {
+        if (!fail_get_once_key.empty() && key == fail_get_once_key)
+        {
+            fail_get_once_key.clear();
+            throw Poco::TimeoutException("ChunkFaultBackend: simulated lost GET (read response never arrived)");
+        }
+        return CountingBackend::get(key, range);
+    }
+
+    DB::Cas::PutResult putIfAbsent(const String & key, const String & bytes, const DB::Cas::ObjectMeta & meta) override
+    {
+        if (mode != Mode::None && !fault_substr.empty() && key.find(fault_substr) != String::npos)
+        {
+            if (fault_skip > 0)
+            {
+                --fault_skip;
+            }
+            else if (fault_count > 0)
+            {
+                --fault_count;
+                switch (mode)
+                {
+                    case Mode::Unresolved:
+                        throw Poco::TimeoutException("ChunkFaultBackend: simulated ambiguous _log PUT (response lost)");
+                    case Mode::LandedThenLost:
+                        /// The write SUCCEEDS -- byte-for-byte what the caller asked for, through the
+                        /// counting path so the object is indistinguishable from a normal PUT -- and only
+                        /// the acknowledgement is lost. The controller's resolve-before-reissue GET is
+                        /// armed to fail ONCE for this key as well, or it would prove the object durable
+                        /// inside this very attempt and the lane would never wedge; the wedge-resolution
+                        /// GET a flush later then reads it normally.
+                        CountingBackend::putIfAbsent(key, bytes, meta);
+                        fail_get_once_key = key;
+                        throw Poco::TimeoutException("ChunkFaultBackend: object landed; response lost");
+                    case Mode::Definite:
+#if USE_AWS_S3
+                        throw DB::S3Exception("ChunkFaultBackend: simulated malformed request",
+                                              Aws::S3::S3Errors::UNKNOWN, "MalformedXML");
+#else
+                        throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
+                            "ChunkFaultBackend: DefiniteFailure requires S3 error classification (USE_AWS_S3 off)");
+#endif
+                    case Mode::ForeignConflict:
+                        /// A foreign writer lands DIFFERENT bytes at this exact key; then our response is
+                        /// lost, so resolve-before-reissue GETs foreign bytes -> CORRUPTED_DATA.
+                        CountingBackend::putIfAbsent(key, bytes + String("\x01_FOREIGN_DIFFERENT"));
+                        throw Poco::TimeoutException("ChunkFaultBackend: foreign different object landed; response lost");
+                    case Mode::None:
+                        break;
+                }
+            }
+        }
+        {
+            std::unique_lock lk(block_mutex);
+            if (block_armed && !block_substr.empty() && key.find(block_substr) != String::npos)
+            {
+                block_entered = true;
+                block_cv.notify_all();
+                /// Bounded (20s) so a wiring bug bounds the wait rather than hanging the whole suite.
+                block_cv.wait_for(lk, std::chrono::seconds(20), [&] { return !block_armed; });
+            }
+        }
+        return CountingBackend::putIfAbsent(key, bytes, meta);
+    }
+
+    void armBlock(const String & substr)
+    {
+        std::lock_guard lk(block_mutex);
+        block_substr = substr;
+        block_armed = true;
+        block_entered = false;
+    }
+    void awaitBlockEntered()
+    {
+        std::unique_lock lk(block_mutex);
+        /// Bounded (20s): if the latched publisher never reaches its PUT, fail LOUDLY rather than hang.
+        /// The assertion is load-bearing -- without it a wiring regression that never parks the publisher
+        /// would let `SnapshotPublisherLatchedAcrossChunks` pass VACUOUSLY (its final re-fire assertion
+        /// can still hold via a direct, non-coalesced dispatch).
+        block_cv.wait_for(lk, std::chrono::seconds(20), [&] { return block_entered; });
+        ASSERT_TRUE(block_entered) << "latched publisher never entered its blocked PUT within 20s -- "
+                                      "coalescing was not exercised";
+    }
+    void releaseBlock()
+    {
+        {
+            std::lock_guard lk(block_mutex);
+            block_armed = false;
+        }
+        block_cv.notify_all();
+    }
+
+private:
+    std::mutex block_mutex;
+    std::condition_variable block_cv;
+    String block_substr;
+    bool block_armed = false;
+    bool block_entered = false;
 };
 
 /// Fault decorator for the condemn-marker gate tests (codex-review triage 2026-07-17 §3.4): while

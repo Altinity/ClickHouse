@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <chrono>
 #include <thread>
+#include <type_traits>
 #include <unordered_set>
 
 namespace DB
@@ -1131,12 +1132,13 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
 {
     /// One flush = one carved batch through one attempted append. Contract: every ORDINARY outcome
     /// (validation reject, DefiniteFailure, Unresolved/wedge, Committed) lands in the affected items so
-    /// waiters always wake, and this does NOT throw for any of them. `commitRefChunk` no longer throws
-    /// past its durable `PUT` at all -- its install is allocation-free by construction (spec §A1) -- so
-    /// the paths that can still throw are the wedge-resolution apply above and an allocation failure in
-    /// this function's own bookkeeping (e.g. the chunk-boundary reseed). Both are contained by
-    /// `appendRefOps`' catch, which completes every still-unfinished survivor and restores the leader
-    /// bookkeeping, so no caller hangs.
+    /// waiters always wake, and this does NOT throw for any of them. Neither `commitRefChunk` nor the
+    /// wedge-resolution block below throws past the point where its object is proven durable -- both
+    /// installs are allocation-free by construction (spec §A1) -- so the paths that can still throw are
+    /// the wedge-resolution candidate build, which runs BEFORE the resolving GET and therefore before
+    /// anything is proven, and an allocation failure in this function's own bookkeeping (e.g. the
+    /// chunk-boundary reseed). Both are contained by `appendRefOps`' catch, which completes every
+    /// still-unfinished survivor and restores the leader bookkeeping, so no caller hangs.
     auto complete_error = [&](const std::vector<std::shared_ptr<RefMutationItem>> & items, std::exception_ptr e)
     {
         std::lock_guard<std::mutex> g(ref_queue_mutex);
@@ -1194,12 +1196,39 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
     /// ref-log PUT for that table until the earlier result is resolved."
     {
         std::optional<RefAppendWedge> wedge_copy;
+        /// Prepared in the SAME hold that reads the wedge, for the same reason `commitRefChunk` prepares
+        /// its candidate before the PUT (spec §A1, here site 2): a successful `resolveByExactGet` PROVES
+        /// the wedged object is durable, so everything between that proof and "the runtime records it"
+        /// must be incapable of throwing. The COW copy is cheap -- it shares the live state's bases -- and
+        /// is only taken when there is actually a wedge to resolve, so the ordinary flush pays nothing.
+        std::optional<RefTableState> candidate;
+        RefTxnId candidate_base_id;
         {
             std::lock_guard lock(rt->state_mutex);
             wedge_copy = rt->wedge;
+            if (wedge_copy)
+            {
+                candidate.emplace(rt->state);
+                candidate_base_id = rt->state.getGreatestApplied();
+            }
         }
         if (wedge_copy)
         {
+            /// Decode and apply BEFORE the resolving GET. The wedge carries the encoded body, so this
+            /// costs no extra I/O -- only the decode and the overlay build, both of which can throw
+            /// (allocation) and both of which used to run AFTER the GET had already proved the object
+            /// durable. A throw here now happens while the outcome is still UNKNOWN and the wedge is
+            /// still set, i.e. it is indistinguishable from "the resolve has not been attempted yet": the
+            /// lane stays wedged and a later flush retries the whole resolution. It propagates to
+            /// `appendRefOps`' catch exactly as the old post-durable apply did.
+            ///
+            /// The candidate is deliberately NOT cached in the wedge across attempts: a wedge can live
+            /// until remount, and retaining a full state copy for that long is a real memory cost on a
+            /// path that is rare by construction. Recomputing it per attempt is the cheaper trade.
+            const RefLogTxn wedged_txn = decodeRefLogTxn(
+                openObject(FormatId::RefLog, wedge_copy->bytes), ns.string(), wedge_copy->txn_id);
+            applyRefLogTxn(*candidate, wedged_txn);
+
             CasWriteOutcome resolved{};
             try
             {
@@ -1228,31 +1257,75 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
             {
                 {
                     std::lock_guard lock(rt->state_mutex);
-                    /// Apply BEFORE unwedging ("a wedged append later observed durable is applied to
+                    /// Install BEFORE unwedging ("a wedged append later observed durable is applied to
                     /// cache before unwedging"). Guard against a re-entrant double-apply: only if this is
                     /// still the SAME wedge (single leader per table makes a mismatch impossible, but the
                     /// check costs nothing and documents the invariant).
                     if (rt->wedge && rt->wedge->txn_id == wedge_copy->txn_id)
                     {
-                        const RefLogTxn wedged_txn = decodeRefLogTxn(openObject(FormatId::RefLog, wedge_copy->bytes), ns.string(), wedge_copy->txn_id);
-                        applyRefLogTxn(rt->state, wedged_txn);
-                        /// A wedge-resolved transaction is a commit like any other: it must join the
-                        /// applied-above-newest-snapshot tail counters exactly as the ordinary Committed
-                        /// arm's does, or the snapshot-publish threshold and the resident-weight estimate
-                        /// undercount by one transaction per resolved wedge until the next recovery
-                        /// reseeds (the invariant stated at the publish check: "maintained by every
-                        /// commit and every adoption").
-                        rt->tail_count_since_snapshot.fetch_add(1, std::memory_order_relaxed);
-                        rt->tail_bytes_since_snapshot.fetch_add(wedge_copy->bytes.size(), std::memory_order_relaxed);
-                        /// Fold the just-applied overlay back into the base right here, exactly as the
+                        /// Only this leader mutates `rt->state`, and the resolving GET above ran without
+                        /// the lock, so this is the assertion that nothing advanced the state underneath
+                        /// the candidate during that round trip -- the same argument (and the same reason
+                        /// for hoisting it out of the region under a SHORT name) as in `commitRefChunk`:
+                        /// `chassert` stringifies its condition, so a long condition would heap-allocate
+                        /// ON FAILURE inside the very region that must not allocate.
+                        [[maybe_unused]] const bool state_unchanged = rt->state.getGreatestApplied() == candidate_base_id;
+                        /// Receives the resolved wedge so it is destroyed OUTSIDE the region: clearing
+                        /// `rt->wedge` in place would free its two `String` bodies there, and the region's
+                        /// contract is that it touches no allocator at all.
+                        std::optional<RefAppendWedge> displaced_wedge;
+                        static_assert(std::is_nothrow_swappable_v<std::optional<RefAppendWedge>>,
+                            "the wedge hand-off below must be non-throwing: it runs after the wedged object "
+                            "is proven durable, where a throw would re-apply the transaction on the next "
+                            "resolution");
+                        {
+                            DENY_ALLOCATIONS_IN_SCOPE;
+                            chassert(state_unchanged);
+                            /// The install, allocation-free by construction: a member-wise swap of
+                            /// pointers and PODs, two atomic increments, and a second swap of pointers.
+                            /// The GET proved the object durable, so the transaction MUST be recorded --
+                            /// and recording it MUST be inseparable from clearing the wedge. It was not:
+                            /// the apply and the `materializeCommitted` fold used to sit between them
+                            /// WITHOUT the ordinary commit arm's swallow, so a fold failure left the
+                            /// transaction applied and the wedge still set, and the next resolution
+                            /// re-applied the same transaction and double-bumped these very counters.
+                            /// A wedge-resolved transaction is a commit like any other: it joins the
+                            /// applied-above-newest-snapshot tail counters exactly as the ordinary
+                            /// Committed arm's does, or the snapshot-publish threshold and the
+                            /// resident-weight estimate undercount by one transaction per resolved wedge
+                            /// until the next recovery reseeds.
+                            rt->state.swap(*candidate);
+                            rt->tail_count_since_snapshot.fetch_add(1, std::memory_order_relaxed);
+                            rt->tail_bytes_since_snapshot.fetch_add(wedge_copy->bytes.size(), std::memory_order_relaxed);
+                            rt->wedge.swap(displaced_wedge);
+                        }
+                        /// `candidate` now holds the DISPLACED state, which still shares the COW bases
+                        /// `rt->state` uses; destroying it here restores unique base ownership so the fold
+                        /// below keeps its O(overlay) in-place path instead of rebuilding the whole base.
+                        /// Both `reset`s only destroy: they allocate nothing and cannot throw.
+                        candidate.reset();
+                        displaced_wedge.reset();
+                        /// Fold the just-installed overlay back into the base right here, exactly as the
                         /// ordinary Committed arm does at its install point, so `rt->state` returns to
                         /// "base + empty overlay" and the next flush's trial copies stay cheap. Cheap: no
                         /// scratch copy shares the base at this point in the flush (`working` is not taken
                         /// until below), so this is the O(overlay) in-place fold. Coherent-on-throw (see
-                        /// `CasRefCowMap.cpp`); the counters above are already bumped, so a deferred fold
-                        /// never loses the resolved transaction.
-                        rt->state.materializeCommitted();
-                        rt->wedge.reset();
+                        /// `CasRefCowMap.cpp`), and now SWALLOWING, symmetrically with the ordinary commit
+                        /// arm: the transaction is durable, installed and unwedged before this runs, so a
+                        /// mid-fold allocation failure merely defers the fold to the next flush -- it must
+                        /// not unwind past a completed install.
+                        try
+                        {
+                            rt->state.materializeCommitted();
+                        }
+                        catch (...)
+                        {
+                            tryLogCurrentException(getLogger("CasPool"), fmt::format(
+                                "CAS ref-log append for namespace '{}': wedged txn {}-{} resolved durable and "
+                                "was installed, but the post-install overlay fold failed and was retained "
+                                "coherently for the next flush",
+                                ns.string(), wedge_copy->txn_id.writer_epoch, wedge_copy->txn_id.ref_sequence));
+                        }
                     }
                     ProfileEvents::increment(ProfileEvents::CasRefAppendUnwedged);
                 }
@@ -1269,7 +1342,8 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
             {
                 /// Still Unresolved: fail every CURRENTLY queued item with the SAME uncertainty
                 /// exception and do not allocate a new id. A later call into this namespace's queue
-                /// retries the resolve.
+                /// retries the resolve -- rebuilding the candidate from scratch, which is why nothing of
+                /// it is kept in the wedge (see the candidate build above).
                 complete_error(carve_all_pending(), makeCasWriteRetryLaterExceptionPtr(fmt::format(
                     "CAS ref-log append for namespace '{}' txn {}-{} is still UNCERTAIN — the append lane "
                     "stays wedged until the SAME key resolves durable or a conclusive rejection is observed",
@@ -1695,22 +1769,34 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
         return false;
     }
 
-    String bytes;
+    /// Preconstruct the COMPLETE wedge here, BEFORE the PUT (spec §A1 site 3), and let the request read
+    /// its key and body straight out of it. The `Unresolved` arm below used to build
+    /// `RefAppendWedge{id, key, bytes}` AFTER the PUT, which copies two `String`s: an allocation failure
+    /// there would leave a possibly-DURABLE object with NEITHER the transaction nor the wedge recorded --
+    /// strictly worse than a wedge, because the next append then mints a fresh id and proceeds against a
+    /// state that is missing a landed transaction, exactly the divergence the candidate above exists to
+    /// prevent. With the wedge already built, that arm only has to MOVE it into the runtime.
+    /// This is a rename, not an extra copy: the seal writes its result directly into the wedge's body,
+    /// and the key is computed directly into the wedge's key, so nothing is copied twice on the ordinary
+    /// committed path either. The key is computed OUTSIDE the seal's catch on purpose -- that keeps its
+    /// (pre-durability) failure behaviour exactly as it was, propagating to `appendRefOps`' catch.
+    RefAppendWedge prepared_wedge;
+    prepared_wedge.txn_id = id;
+    prepared_wedge.key = layout.refLogKey(ns, id);
     try
     {
-        bytes = sealObject(FormatId::RefLog, encodeRefLogTxn(chunk_txn));
+        prepared_wedge.bytes = sealObject(FormatId::RefLog, encodeRefLogTxn(chunk_txn));
     }
     catch (...)
     {
         complete_error(chunk_survivors, std::current_exception());
         return false;
     }
-    const String key = layout.refLogKey(ns, id);
 
     CasWriteOutcome outcome{};
     try
     {
-        outcome = ref_request_controller->putIfAbsentControlled(key, bytes, fence_ok);
+        outcome = ref_request_controller->putIfAbsentControlled(prepared_wedge.key, prepared_wedge.bytes, fence_ok);
     }
     catch (...)
     {
@@ -1754,7 +1840,7 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
                     /// can record one without the other.
                     rt->state.swap(*candidate);
                     rt->tail_count_since_snapshot.fetch_add(1, std::memory_order_relaxed);
-                    rt->tail_bytes_since_snapshot.fetch_add(bytes.size(), std::memory_order_relaxed);
+                    rt->tail_bytes_since_snapshot.fetch_add(prepared_wedge.bytes.size(), std::memory_order_relaxed);
                 }
                 /// `candidate` now holds the DISPLACED state, which still shares the COW bases
                 /// `rt->state` uses. Destroy it before the fold and the fold takes its O(overlay)
@@ -1830,7 +1916,21 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
         {
             {
                 std::lock_guard lock(rt->state_mutex);
-                rt->wedge = RefAppendWedge{id, key, bytes};
+                static_assert(std::is_nothrow_move_constructible_v<RefAppendWedge>,
+                    "the wedge install below must be non-throwing: the object it describes may already be "
+                    "durable, and the wedge is the only record that can ever resolve it");
+                {
+                    DENY_ALLOCATIONS_IN_SCOPE;
+                    /// The install of the OTHER post-durable record (spec §A1 site 3). `Unresolved` means
+                    /// the object may well be durable, so this wedge is the only thing that can ever
+                    /// resolve it -- recording it must not be able to fail. `rt->wedge` is provably
+                    /// disengaged here (the wedge hard contract, enforced above before the id was minted),
+                    /// so this engages the optional by MOVE-CONSTRUCTING from the prepared wedge: two
+                    /// pointer-stealing `String` moves and a POD id, no allocation, no free. Had it been
+                    /// engaged, the same statement would move-ASSIGN and free the displaced buffers inside
+                    /// the region -- which is exactly why the contract is checked, not assumed.
+                    rt->wedge = std::move(prepared_wedge);
+                }
             }
             ProfileEvents::increment(ProfileEvents::CasRefAppendWedged);
             complete_error(chunk_survivors, makeCasWriteRetryLaterExceptionPtr(fmt::format(
