@@ -84,11 +84,35 @@ TEST(RefWriterLaneExceptionSafety, FollowerNeverRunsStrandedLeaderClosure)
     const RootNamespace ns{"srv1/reflane_follower"};
 
     std::atomic<int> fault_armed{1};
+    /// The leader parks HERE, at the pre-carve point, until the main thread has queued the follower
+    /// behind it -- and only then throws. Parking (rather than letting the leader race ahead while the
+    /// main thread polls the queue depth) is what makes the interleaving this test is about --
+    /// "the leader throws WHILE a follower is waiting for the baton" -- deterministic. The previous
+    /// formulation polled `refQueuePendingForTest(ns) >= 1` from the main thread AFTER starting t1,
+    /// which loses a race the scheduler decides: t1 could enqueue, take the baton, throw, and have its
+    /// item erased by `completeOwnedItemsAndReleaseLeadership` before the main thread was ever
+    /// scheduled to sample -- after which `pending` is 0 forever and the poll spins until the harness
+    /// is killed. Invisible on an idle 32-core box (10/10 green) and a guaranteed hang under
+    /// contention (8/8 when pinned to one CPU with `taskset -c 3`).
+    std::mutex hook_mutex;
+    std::condition_variable hook_cv;
+    bool leader_parked_at_precarve = false;   /// guarded by hook_mutex
+    bool release_leader = false;              /// guarded by hook_mutex
     store->setRefPreCarveHookForTest([&]
     {
-        /// Throw only on the FIRST leader flush, so the follower (or a re-drive) can proceed.
-        if (fault_armed.exchange(0) == 1)
-            throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "injected pre-carve fault");
+        /// Park+throw only on the FIRST leader flush, so the follower (or a re-drive) can proceed.
+        if (fault_armed.exchange(0) != 1)
+            return;
+        {
+            std::lock_guard announce(hook_mutex);
+            leader_parked_at_precarve = true;
+        }
+        hook_cv.notify_all();
+        {
+            std::unique_lock wait_for_follower(hook_mutex);
+            hook_cv.wait(wait_for_follower, [&] { return release_leader; });
+        }
+        throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "injected pre-carve fault");
     });
 
     /// Set by the faulted caller's own closure iff a DIFFERENT thread (a follower leader) ever runs it --
@@ -119,15 +143,27 @@ TEST(RefWriterLaneExceptionSafety, FollowerNeverRunsStrandedLeaderClosure)
     };
 
     /// Serialize the two callers so the fault deterministically lands on the FIRST one to lead: t1
-    /// enqueues and becomes leader before t2 enters. t2 is released only once t1 is already pending.
+    /// enqueues, takes the baton, and PARKS at the pre-carve hook; t2 then queues behind it as a
+    /// follower; only then is t1 released to throw.
     std::thread t1([&]
     {
         faulted_owner.store(std::this_thread::get_id());
         caller(1, /*is_faulted=*/true);
     });
-    while (store->refQueuePendingForTest(ns) < 1)
-        std::this_thread::yield();
+    {
+        std::unique_lock wait_for_leader(hook_mutex);
+        hook_cv.wait(wait_for_leader, [&] { return leader_parked_at_precarve; });
+    }
     std::thread t2([&] { caller(2, /*is_faulted=*/false); });
+    /// The parked leader cannot drain anything, so this poll cannot miss its window: t1's own item is
+    /// already in `pending`, and the count reaches 2 as soon as t2 has enqueued.
+    while (store->refQueuePendingForTest(ns) < 2)
+        std::this_thread::yield();
+    {
+        std::lock_guard release(hook_mutex);
+        release_leader = true;
+    }
+    hook_cv.notify_all();
 
     t1.join();
     t2.join();
