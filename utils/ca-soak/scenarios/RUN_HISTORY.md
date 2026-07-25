@@ -473,3 +473,6 @@ Every attempted scenario run is appended here (newest at the bottom). `run_dir` 
 | 2026-07-23T18:45:41 | S41 | 1 | dev | 900s | pass | 29c98dcfd05c | 20260723T184508_S41_seed1 |  |
 | 2026-07-23T18:49:18 | S41 | 1 | dev | 900s | pass | 29c98dcfd05c | 20260723T184846_S41_seed1 |  |
 | 2026-07-23T18:55:50 | S41 | 1 | full | 900s | pass | 29c98dcfd05c | 20260723T185256_S41_seed1 |  |
+| 2026-07-24T10:54:58 | S41 | 1 | full | 900s | pass | a9449127f724 | 20260724T105212_S41_seed1 |  |
+| 2026-07-25T16:45:35 | S42 | 1 | dev | 900s | fail | 830c4997a73f | 20260725T164254_S42_seed1 |  |
+| 2026-07-25T16:51:56 | S42 | 1 | dev | 900s | inconclusive | 830c4997a73f | 20260725T164929_S42_seed1 |  |

@@ -329,10 +329,14 @@ def gc_log_rows(node, since_event_time: str | None = None, *,
     # `forgotten_on_delete`/`forgotten_absent` columns were removed by the ack-floor redesign, but
     # this query kept them -> UNKNOWN_IDENTIFIER 213x/night -> `gc_log` captured [] for EVERY
     # scenario of the 2026-07-05 campaign and every GC verdict was vacuous (2026-07-06 re-audit).
+    # 2026-07-25: the SAME class of breakage recurred — `min_ack` was dropped from the log schema, so
+    # this SELECT raised UNKNOWN_IDENTIFIER, the `except` below turned it into [], and every GC
+    # observation in the suite was empty again (S42 smoke run 20260725T164254). Any change to
+    # `ContentAddressedGarbageCollectionLog`'s columns must be mirrored here in the same commit.
     cols = ("event_time", "gc_id", "trigger", "round", "outcome", "candidates_marked",
             "objects_deleted", "objects_absent", "objects_replaced", "objects_spared",
             "manifests_deleted", "entries_condemned", "entries_graduated", "entries_redeleted",
-            "fence_outs", "min_ack", "anomalies", "duration_ms", "error")
+            "fence_outs", "anomalies", "duration_ms", "error")
     tries = max(1, int(poll_tries))
     for attempt in range(tries):
         try:

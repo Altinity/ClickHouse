@@ -482,6 +482,46 @@ Expected:
 - No unknown-disk false positives from read-only `fsck` aliases.
 - First query latency is explained by required root/manifest reads.
 
+### S42: allocation-fault soak (query-thread)
+
+Card: `cards/s42_alloc_faults.py`. Priority `P0`. (Cards `S28`-`S41` predate this section and are
+documented in their own module docstrings; `S42` is registered here because its guard semantics are
+easy to misread as a failed run.)
+
+Purpose: prove the CAS write path stays consistent when ALLOCATION fails — specifically in the
+post-durable install window, where a ref-log transaction's PUT has already succeeded and the
+in-memory apply then throws, leaving the writer cache missing a durable transaction. Queries may
+fail; invariants may not.
+
+Workload:
+
+- Leg A: `memory_tracker_fault_probability` armed per query through the driver's URL parameters
+  (with `max_untracked_memory=0`, or small allocations never reach the tracker) over a soak-shaped
+  insert/select workload, plus a short high-probability burst. Thread-allocation faults are NOT part
+  of this card — they are a different fault class with a different blast radius and live in `S43`.
+- Leg C: disarm, quiesce, `GC` to fixpoint, detail-mode `fsck`, restart both servers, and compare
+  the journal-rebuilt view with the pre-restart view; plus the `fsck` snapshot integrity oracle,
+  which replays each table's surviving covered ref logs and compares the re-encoded snapshot with
+  the published object.
+
+Observations:
+
+- `CasRefApplyPoisoned`, `QueryMemoryLimitExceeded`, `CasRefAppendWedged`/`CasRefAppendUnwedged`/
+  `CasRefAppendDefiniteFailure`, `CasGcUnmatchedRemoveDeltas` (reported, never gating),
+  `fsck` `stale_edge`/`unaccounted`/`snapshot_oracle_*`, acked-vs-lost blocks, max query duration.
+
+Expected:
+
+- Zero `LOGICAL_ERROR`, zero `CasRefApplyPoisoned`, every acked insert present, replicas agree,
+  `fsck` `dangling=0`/`unaccounted=0`/`stale_edge=0` in detail mode, snapshot oracle clean, `GC`
+  rounds succeed after disarm, no permanently wedged ref lane, no query hung past its bound.
+- Soundness guard: the run is `inconclusive` unless a TARGETED signal is nonzero (a
+  `CasRefApplyPoisoned` transition or a post-PUT apply failpoint hit). A nonzero
+  `MEMORY_LIMIT_EXCEEDED` count is NOT such a signal. Because the only post-durable-install seam
+  today is the gtest-only `setInstallRegionProbeForTest` hook and §A1 made the region
+  allocation-free, this card currently returns either `inconclusive` (window traversal unproven) or
+  `fail` (poison fired = a real §A1 regression) — never a conclusive green.
+
 ## P1 scenario cards
 
 ### S15: `GC` target shard comparison
