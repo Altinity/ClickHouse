@@ -835,3 +835,21 @@ fixed.
   with the limit on how the passing main config may be cited, and the No-means-not-proven ordering) and
   asked explicitly to look for things that are green for the wrong reason.
   Disk 332G, 61G RAM, load 0.3. Nothing to unstick.
+- 22:49 UTC — watchdog: the Part B review finished with **DO NOT MERGE AS-IS** — two blockers, two majors,
+  recorded with evidence in BACKLOG {#partb-review-findings} (`ba45217f307`). Reading the eight tasks as one
+  protocol found what eight per-task reviews could not.
+  Dispatched the fixes for three of the four: the uncertain-`precommitAdd` blocker (record the intent
+  BEFORE the ambiguous append — the same pattern Part A Task 4 used for the wedge, so there is house
+  precedent), the promote-committed-but-reported-as-fallback major (tri-state terminal outcome, plus Part
+  A's "nothing may throw after a durable commit" rule), the move-assignment major (delete it), and three
+  comments that assert what the code does not do — including `CasRefLedger.h:57` claiming "`No` is a proof
+  of the negative", which is the exact inversion this whole round has been guarding against, sitting in the
+  header that defines the contract.
+  NOT dispatched: blocker 1 (a LIST-recovered runtime can authorize `Yes`). It has no cheap correct fix —
+  the reviewer's "make LIST-recovered runtimes ineligible" would disqualify EVERY runtime, since all
+  recovery goes through LIST, and `unproven` aborts and throws rather than falling back to bytes, so relink
+  would never succeed. Its real fix is the authoritative journal chain the user deferred to before-release
+  under option C. What is new is that the same root now reaches a SECOND path — not only "GC skipped the
+  receiver's `+1`" but "confirm answered Yes from a stale row" — which I put to the user as a reason to
+  move the chain ahead of the soak rather than after it. Awaiting that call.
+  Disk 332G, load low. Nothing stuck.
