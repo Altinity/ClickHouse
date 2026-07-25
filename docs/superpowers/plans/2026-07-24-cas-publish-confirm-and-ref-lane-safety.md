@@ -751,6 +751,31 @@ Subject: `ca: confirmExactRef — exact-token lane-linearized confirm (gate 1)`
 
 ---
 
+## UPSTREAM AUTHORIZATION AND ITS LIMITS (user decision, 2026-07-25) {#upstream-authorization}
+
+Applies to Tasks 11, 13 and 14 — every task in this plan that touches
+`src/Storages/MergeTree/DataPartsExchange.cpp` or the interserver wire.
+
+**Authorized:** the CAS parts-exchange portion only — the code we wrote ourselves (the fetch-by-relink
+path: the `content_addressed_pool_uuid` advertisement, the `content_addressed_relink` cookie, and the
+relink send/receive branches). Nothing else in that file, and nothing in generic MergeTree, Replicated or
+Keeper code or formats.
+
+**Required shape:** the change must be LOCALIZED, as far as possible, to ONE function/method on the sender
+side and ONE on the receiver side. From the current file that means:
+- sender: `Service::processQuery` (already carries the relink branch),
+- receiver: `Fetcher::relinkPartToDisk` (where the promote happens, so where a confirm must precede it).
+
+`Fetcher::fetchSelectedPart` already advertises the pool uuid and reads the relink cookie; do NOT spread
+new confirm logic into it as well unless there is no alternative, and if there is none, say so explicitly
+rather than widening the footprint quietly.
+
+Everything else lives behind `IContentAddressedExchange` and inside the CAS tree. This authorization does
+NOT relax [[feedback_cas_upstream_coupling_minimization]]: generic code must not learn CAS-specific
+concepts beyond what the existing relink path already carries.
+
+---
+
 ## Task 11: Storage-level confirm + gate 0 + exchange interface
 
 **Files:**
