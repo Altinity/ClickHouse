@@ -530,3 +530,12 @@ The stand is being LEFT UP — it is a live reproduction, and tearing it down de
   Round status: soak DONE (green), F6 root-caused. NOT started: task 17 (S42), plan Part B (tasks 9-16),
   tasks 18/19/20, and the deferred full gate for the #37 diagnostic change. Not starting any of them from
   a watchdog turn.
+- 13:30 UTC — watchdog: IDLE, nothing to unstick. No soak/build/praktika running; stand deliberately up as
+  the leak reproduction; disk 326G, 62G RAM available, load 0.25. Since the last tick the leak was traced
+  further via the CA event log (BACKLOG {#unmatched-minus-one-fetch-window}): all 56 leaked blobs belong to
+  four `tmp-fetch_*` refs published and dropped inside one 43 ms window — 4 of 48,791 such refs — with the
+  `+1` folded three minutes AFTER the drop and no `-1` ever recorded. Two of my earlier conclusions were
+  corrected there. Leading hypothesis (ordering inversion making the removal a silent no-op) is UNVERIFIED
+  and needs a targeted reproduction; the ref logs involved are already reclaimed.
+  Still not started, and not startable from a watchdog turn: task 17 (S42), plan Part B (9-16), tasks
+  18/19/20, the deferred #37 gate, and the cheap unmatched-remove counter.
