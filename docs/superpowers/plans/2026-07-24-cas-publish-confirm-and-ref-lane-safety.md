@@ -972,9 +972,11 @@ plus `utils/ca-soak/scenarios/BACKLOG.md` §s42-allocation-fault-soak (read BOTH
   `name`/`title`/`priority`/`param_table`/`run`), keeping its soundness-guard style.
 - [ ] **Step 2: Leg A** — arm `memory_tracker_fault_probability` per query through the driver's URL
   parameters (`utils/ca-soak/soak/cluster.py:247`) over a soak-shaped insert/select workload.
-- [ ] **Step 3: Leg B** — arm `cannot_allocate_thread_fault_injection_probability` via a reversible
-  generated config overlay + `SYSTEM RELOAD CONFIG` (applied in `Server.cpp:2763-2764`), and verify
-  arm/disarm by reading it back from `system.server_settings`.
+- [ ] **Step 3: (MOVED to Task 20 / scenario S43.)** Thread-allocation faults were originally leg B
+  here. They are a different fault CLASS with a different blast radius — they cannot reach the CAS
+  commit path at all, because the ref append lane runs on the caller's thread — and mixing them into
+  one card destroys attribution when something breaks. S42 is therefore query-thread allocation
+  faults only.
 - [ ] **Step 4: Leg C** — disarm, quiesce, GC to fixpoint, fsck, restart, and compare; ALSO replay
   from the last pre-fault snapshot plus the raw tail logs and compare against the live cache, and
   assert no snapshot advanced across a poisoned transaction (`CasRefApplyPoisoned` from Task 7).
@@ -1092,6 +1094,62 @@ part discovery). One decision should serve all of them.
 - [ ] **Step 4: Verify the CI scrape step passes against a running CA server; Step 5: Commit.**
 
 Subject: `ca: read-only pool access for tools — stop the system-table scrape claiming a live mount`
+
+---
+
+## Task 20: ca-soak scenario S43 — thread-allocation fault injection
+
+Split out of S42 (Task 17): `cannot_allocate_thread_fault_injection_probability` is a different fault
+class from `memory_tracker_fault_probability`, and running both in one card would make any finding
+unattributable. Query-thread allocation faults hit the CAS commit path; THREAD-creation faults cannot
+— the ref append lane runs on the caller's thread (`CasRefLedger.cpp`, verified in the round-4 review)
+— so what S43 actually stresses is everything CAS runs in the BACKGROUND, which no other card covers.
+
+**Mechanism.** `cannot_allocate_thread_fault_injection_probability` is a `ServerSetting`
+(`src/Core/ServerSettings.cpp:233`) applied on config reload in `programs/server/Server.cpp:2763-2764`
+(NOT via `InterpreterSystemQuery` — that site is `SYSTEM START THREAD FUZZER`), which installs it into
+`CannotAllocateThreadFaultInjector`. Arm and disarm with a reversible generated config overlay plus
+`SYSTEM RELOAD CONFIG`, and verify both transitions by reading the value back from
+`system.server_settings` — an unverified arm is how a scenario silently becomes vacuous.
+
+**What is actually at risk (this is the interesting part, and the oracle follows from it):**
+- the **GC scheduler**'s worker and heartbeat threads — a round that cannot start must be retried, not
+  lost, and the scheduler must not spin;
+- the **mount-lease keeper**'s renewal — if renewal cannot run, the lease lapses and the mount fences.
+  That is CORRECT fail-closed behaviour, so the card must not treat a fence as a failure; what it must
+  prove is that the fence is followed by **recovery** once injection stops (self-remount rearms and
+  writes resume) rather than a permanent write outage;
+- the **self-remount thread** itself — the recovery path failing to spawn is the nastiest case,
+  because it is the thing that repairs the previous bullet;
+- the background **snapshot-publish dispatcher** (`CasRefLedger.cpp:1839`) — a dropped publish must
+  cost a redundant snapshot later, never a lost transaction.
+
+**Files:**
+- Create: `utils/ca-soak/scenarios/cards/s43_thread_alloc_faults.py`
+- Modify: `utils/ca-soak/scenarios/README.md` (register S43), `utils/ca-soak/scenarios/BACKLOG.md`
+  (cross-reference from the S42 entry)
+
+- [ ] **Step 1: Copy the card skeleton** from `cards/s39_lease_fault_tolerance.py` — it is the closest
+  analogue, since it already reasons about lease TTL versus a fault window.
+- [ ] **Step 2: Leg A — armed window.** Arm the injector at a probability low enough that the server
+  still functions (start at 0.001 and calibrate on a dev run; too high and nothing starts, which
+  proves nothing), run a soak-shaped insert/merge workload for the window, and record which background
+  subsystems reported failures.
+- [ ] **Step 3: Leg B — recovery.** Disarm, then assert RECOVERY explicitly: GC rounds succeed again,
+  the mount is live (self-remount rearmed it if it fenced), inserts succeed, and
+  `system.content_addressed_mounts` shows a healthy lease. A scenario that only checks "nothing
+  corrupted" would pass while leaving the node permanently unable to write.
+- [ ] **Step 4: Oracle.** Queries and background tasks MAY fail during the armed window; invariants may
+  not: zero `LOGICAL_ERROR`/abort in `err.log`, every ACKED insert present, replicas agree, fsck
+  `dangling=0`/`unaccounted=0`, `CasRefApplyPoisoned == 0`, no permanently wedged ref lane, and the
+  recovery assertions of Step 3.
+- [ ] **Step 5: Soundness guard.** Require positive evidence that threads actually failed to spawn
+  (the injector's own counter, or the log lines the failure path emits) — a nonzero count of *some*
+  error is not enough. Otherwise report `inconclusive`, never a vacuous pass.
+- [ ] **Step 6: Run at dev scale** (`python3 -m scenarios.run --scenario S43 --seed 1 --scale dev`),
+  iterate to GREEN or to a triaged finding, then **commit** the card with its `RUN_HISTORY.md` entry.
+
+Subject: `ca: ca-soak scenario S43 — thread-allocation fault injection with an explicit recovery oracle`
 
 ---
 
