@@ -21,6 +21,9 @@ import urllib.request
 # (this harness) must retry the INSERT. A retried identical INSERT is idempotent thanks to
 # ReplicatedMergeTree block-dedup, and the model has already applied the op exactly once.
 ABORTED_CODE = 236
+# ClickHouse error code INVALID_STATE: carries the CAS "mount lease not held" refusal (see
+# `is_mount_fenced`), which is retry-later despite the code's permanent-sounding name.
+INVALID_STATE_CODE = 668
 
 # ClickHouse error code TABLE_IS_READ_ONLY (Common/ErrorCodes.cpp). A ReplicatedMergeTree replica
 # transiently becomes read-only while it re-establishes its ZooKeeper session after a fault (docker
@@ -200,9 +203,16 @@ class QueryError(RuntimeError):
         recovery is to REROUTE the write to the healthy peer (which shares the pool and holds its own
         live lease) — the same recovery as node-down. Detected by the fence message in the body."""
         b = self.body or ""
-        if not self.is_aborted:
-            return False
-        return ("mount lost" in b or "lease expired" in b or "refusing to mutate ref shard" in b)
+        if self.is_aborted:
+            return ("mount lost" in b or "lease expired" in b or "refusing to mutate ref shard" in b)
+        # The same condition also arrives as INVALID_STATE (668), not ABORTED: the rev.8 disk-lifecycle
+        # round made the lease-loss gate THROW a typed not-mounted error instead of aborting, and its
+        # own message says "retry once the disk recovers to Live" -- i.e. retry-later semantics under a
+        # code that reads like a permanent one. Recognising only 236 here is what turned a routine
+        # chaos-window fence into a WORKLOAD FAILURE and killed a 2.5h soak on 2026-07-24: the driver
+        # has always known how to handle a fence (reroute to the peer, which holds its own live lease),
+        # it just no longer recognised it.
+        return ("Code: %d." % INVALID_STATE_CODE) in b and "mount lease not held" in b
 
 # Port/container convention for replica i (1-based): ch1=8123, ch2=8124, ..., chN=8122+N;
 # container ca-soak-ch{i}-1. Matches docker-compose.yml (2 nodes) and docker-compose-10replicas.yml

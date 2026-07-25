@@ -315,3 +315,55 @@ Status at this check: t+33min, STEADY stage, zero failures, zero dangling report
   Also: Task 18 (do not wedge a lane when no attempt was sent) and Task 19 (a diagnostic tool must not
   claim ownership of a live pool — the recurring CI scrape failure) appended to the plan; a subagent
   is investigating the 04286 600s timeout from the CI logs.
+- 07:29 UTC — watchdog: soak at t+1h50m, **CHAOS stage running**, healthy. Investigated a scary-looking
+  jump (a grep for FAILURE|dangling|LOGICAL_ERROR went 0 -> 136) and it is NOISE from my own pattern,
+  not the run: 133 hits are the driver's own "INSERT … transport failure on assigned-replica;
+  rerouting/retrying" lines — i.e. chaos killing a node and the driver doing exactly what it should —
+  and the 4 "dangling" hits are all `dangling=0` in passing fsck reports. Real verdict counters:
+  `CHECKPOINT FAILURE|WORKLOAD FAILURE|assert` = **0**, checkpoints passed = **2** (the GC checkpoint
+  and a recovery checkpoint), both with `dangling=0` and a clean dry-run subset.
+  One WARNING worth recording, and it is the known SOAK-TTL-BAND harness limitation, not a product
+  fault: the ambiguous-TTL-band oracle did not clear after 6 waits and the harness degraded that
+  checkpoint to a band-tolerant count-range + fsck gate ("TTL-timing artifact, not corruption — soak
+  continues"). Worth noting that this is a WEAKENED assertion for that one checkpoint, so it should
+  not be quoted later as a full-strength pass.
+  Resources fine: 320G free (still above the post-checkpoint reclaim level), 56G RAM, load 4.7.
+- 07:50 UTC — watchdog: soak healthy at t+2h09m in CHAOS (6 checkpoints OK, 0 real failure verdicts, ticks and recorded counters both advancing, ch1/rustfs restarted by chaos as designed); 323G free, 57G RAM. Assembled tmp/gc-collapse-rca/ (PROMPT.md + artifacts/) for the GC-collapse RCA and dispatched codex gpt-5.6 high on it. TWO NEW FACTS found while assembling, both from the log: (1) 'gc/state moved during the round' appears ZERO times, so the lost-CAS path never fired — my earlier leader-contention story is refuted by direct evidence, not just by parsimony; (2) round 33 was IN FLIGHT for >=47 min — the same GC thread (TID 2912) that closed round 32 at 05:36:46 is still emitting 'this round 33' lines at 06:16:18 and never logs a completion. So cleanup did not run because one round never reached its commit point.
+- 08:09 UTC — watchdog: soak healthy at t+2h29m (CHAOS, 1h30m left, 0 failure verdicts). CAUGHT AND
+  FIXED a dead task: the GC-collapse RCA had exited immediately with CODEX_EXIT=1 —
+  `"The 'gpt-5.6' model is not supported when using Codex with a ChatGPT account"` — so 15 minutes of
+  apparent progress were nothing. I used the bare `gpt-5.6` name; the name that works on this account
+  is `gpt-5.6-sol` (as in every earlier review this session). Relaunched with
+  `-m gpt-5.6-sol -c model_reasoning_effort=high`; verified it is actually reading sources this time
+  (it is quoting CasPool.cpp) rather than erroring out. Lesson for the log: a nohup wrapper's exit
+  marker must be CHECKED, not assumed — the marker was there and said 1 the whole time.
+
+## Finding F5 (2026-07-24 08:2x UTC) — the 4h soak DIED at t+2h30m on a harness classifier gap, not a product fault
+
+`WORKLOAD FAILURE: HTTP 500 Code: 668 … content-addressed disk 'ca' -- mount lease not held; backing
+may be temporarily unreachable; retry once the disk recovers to Live. (INVALID_STATE)` on an INSERT,
+during the CHAOS stage. Run ended at t+2h30m of 4h with 10 checkpoints passed, zero dangling, and
+`fsck_status: settled` — so nothing was corrupted; the driver simply gave up.
+
+WHY (read, not guessed): the driver ALREADY has a classifier for exactly this state —
+`ClusterNode.is_mount_fenced` (`soak/cluster.py:193-204`), whose docstring says a fence "persists for
+the WHOLE outage" and that the correct recovery is to reroute to the peer holding its own live lease.
+But it only fires for ABORTED (236) plus specific substrings. The server no longer reports it that
+way: the rev.8 disk-lifecycle round made the lease-loss gate THROW a typed not-mounted error, and the
+throw site (`ContentAddressedMetadataStorage.cpp:1095`) uses INVALID_STATE (668). So the harness
+stopped recognising a condition it was built to handle, and a routine chaos-window fence became a
+hard failure.
+
+FIXED (harness only): `is_mount_fenced` now also matches 668 + "mount lease not held". Verified the
+4 pre-existing `pytest tests/` failures are identical before and after the change (214 passed, same 4
+failed on both sides), so nothing else moved.
+
+PRODUCT QUESTION worth raising separately, NOT fixed here: 668 INVALID_STATE carries retry-later
+semantics — its own message says "retry once the disk recovers to Live" — under a code that reads as
+a permanent state error. That is the same family as finding #37 defect 2, where a code choice defeated
+the caller's retry logic. Any client that classifies by code (not by message text) will treat this as
+fatal. Worth deciding whether the retry-later class should have its own code.
+
+RE-RUN: torn down with `-v`, stand recreated clean, soak v3 launched 08:33 UTC
+(`--seed 1 --phase 3 --duration 4h --insert-mode sync --max-pool-gb 12`) -> `tmp/unattended/soak_4h_v3.log`,
+ETA ~12:33 UTC. 330G free at start.
