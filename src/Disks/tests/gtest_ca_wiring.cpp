@@ -1439,11 +1439,17 @@ TEST(CasWiringGc, DisplacedTreeBlobsReclaimedThroughRealPath)
 namespace
 {
 
-bool adoptPartFromManifestAndPromote(DB::IContentAddressedExchange & exchange, const String & table_uuid,
-                                     const String & part_name, const String & manifest_bytes)
+/// The RECEIVER's disk-relative staging path for every relink test below: the tmp-fetch dir of the
+/// receiving table (a22...), which is a DIFFERENT table from the sender's (a11...) -- that is what makes
+/// the "the sender's namespace id is ignored" assertions meaningful. `prepareAdoptFromManifest` is
+/// addressed by path, exactly like `getRelinkOffer`, so the ref name is the router's business.
+constexpr auto kReceiverTmpFetchPath = "a22/a22a22a2-2222-4222-8222-222222222222/tmp-fetch_all_1_1_0";
+
+bool adoptPartFromManifestAndPromote(DB::IContentAddressedExchange & exchange, const String & part_path,
+                                     const String & manifest_bytes)
 {
     std::unique_ptr<DB::ICaPreparedRelink> prepared;
-    if (exchange.prepareAdoptFromManifest(table_uuid, part_name, manifest_bytes, prepared)
+    if (exchange.prepareAdoptFromManifest(part_path, manifest_bytes, prepared)
         == DB::CaRelinkPrepare::MechanismFallbackAllowed)
         return false;
     EXPECT_NE(prepared, nullptr) << "a Prepared outcome must carry the handle that owes the terminal operation";
@@ -1529,7 +1535,7 @@ TEST(CasWiringExchange, AdoptPartFromManifestPublishesFreshLocalManifest)
 
     /// Adopt into a DIFFERENT table (a22a22a2-2222-4222-8222-222222222222). The transferred body's root_namespace_id is the sender's
     /// (a11a11a1-1111-4111-8111-111111111111) — the receiver must IGNORE it and use a22a22a2-2222-4222-8222-222222222222.
-    const bool ok = adoptPartFromManifestAndPromote(*exchange, "a22a22a2-2222-4222-8222-222222222222", "tmp-fetch_all_1_1_0", bytes);
+    const bool ok = adoptPartFromManifestAndPromote(*exchange, kReceiverTmpFetchPath, bytes);
     EXPECT_TRUE(ok);
 
     /// The adopted ref is live in the RECEIVER namespace and loadable.
@@ -1585,7 +1591,7 @@ TEST(CasWiringExchange, AdoptFailsClosedAndFallsBackOnCondemnedBlob)
               DB::Cas::DeleteOutcome::Kind::Deleted);
 
     /// §4: promote trusts the adopted leaves — no re-probe — so adopt SUCCEEDS (returns true) and publishes.
-    const bool ok = adoptPartFromManifestAndPromote(*exchange, "a22a22a2-2222-4222-8222-222222222222", "tmp-fetch_all_1_1_0", bytes);
+    const bool ok = adoptPartFromManifestAndPromote(*exchange, kReceiverTmpFetchPath, bytes);
     EXPECT_TRUE(ok) << "§4: adopt trusts the manifest edge; a raced pool blob is not re-probed at promote";
 
     /// The receiver ref publishes (the D4 trade-off), and the deleted pool blob surfaces via fsck's
@@ -1631,7 +1637,7 @@ TEST(CasWiringExchange, AdoptPartFromManifestSelfContainedWithoutMutableFilesSid
 
     /// No sidecar parameter to pass anymore — exactly what Fetcher::relinkPartToDisk's call looks like
     /// now that the manifest is self-contained (no reconstruction from a wire-transferred header).
-    const bool ok = adoptPartFromManifestAndPromote(*exchange, "a22a22a2-2222-4222-8222-222222222222", "tmp-fetch_all_1_1_0", bytes);
+    const bool ok = adoptPartFromManifestAndPromote(*exchange, kReceiverTmpFetchPath, bytes);
     EXPECT_TRUE(ok);
 
     const auto receiver_ns = storage->liveNamespace("a22a22a2-2222-4222-8222-222222222222");
@@ -1670,8 +1676,7 @@ TEST(CasWiringExchange, PrepareAdoptIsDurableButPublishesNothingUntilPromote)
 
     const auto receiver_ns = storage->liveNamespace("a22a22a2-2222-4222-8222-222222222222");
     std::unique_ptr<DB::ICaPreparedRelink> prepared;
-    ASSERT_EQ(exchange->prepareAdoptFromManifest("a22a22a2-2222-4222-8222-222222222222", "tmp-fetch_all_1_1_0",
-                                                 offer->manifest_bytes, prepared),
+    ASSERT_EQ(exchange->prepareAdoptFromManifest(kReceiverTmpFetchPath, offer->manifest_bytes, prepared),
               DB::CaRelinkPrepare::Prepared);
     ASSERT_NE(prepared, nullptr);
 
@@ -1703,8 +1708,7 @@ TEST(CasWiringExchange, AbortedPrepareReleasesThePrecommitAndPublishesNothing)
 
     const auto receiver_ns = storage->liveNamespace("a22a22a2-2222-4222-8222-222222222222");
     std::unique_ptr<DB::ICaPreparedRelink> prepared;
-    ASSERT_EQ(exchange->prepareAdoptFromManifest("a22a22a2-2222-4222-8222-222222222222", "tmp-fetch_all_1_1_0",
-                                                 offer->manifest_bytes, prepared),
+    ASSERT_EQ(exchange->prepareAdoptFromManifest(kReceiverTmpFetchPath, offer->manifest_bytes, prepared),
               DB::CaRelinkPrepare::Prepared);
     ASSERT_NE(prepared, nullptr);
     ASSERT_EQ(storage->store()->livePrecommitsForTest(receiver_ns).size(), 1u);
@@ -1733,12 +1737,92 @@ TEST(CasWiringExchange, PrepareAdoptOfAnUndecodableManifestAllowsTheByteFallback
 
     const auto receiver_ns = storage->liveNamespace("a22a22a2-2222-4222-8222-222222222222");
     std::unique_ptr<DB::ICaPreparedRelink> prepared;
-    EXPECT_EQ(exchange->prepareAdoptFromManifest("a22a22a2-2222-4222-8222-222222222222", "tmp-fetch_all_1_1_0",
-                                                 "not a manifest at all", prepared),
+    EXPECT_EQ(exchange->prepareAdoptFromManifest(kReceiverTmpFetchPath, "not a manifest at all", prepared),
               DB::CaRelinkPrepare::MechanismFallbackAllowed);
     EXPECT_EQ(prepared, nullptr) << "no handle may be returned when nothing was staged";
     EXPECT_TRUE(storage->store()->livePrecommitsForTest(receiver_ns).empty());
     EXPECT_FALSE(storage->store()->resolveRef(receiver_ns, "tmp-fetch_all_1_1_0").has_value());
+}
+
+/// B66b: a relink whose TARGET is a DETACHED part dir -- what `FETCH PARTITION ... TO detached` now
+/// does instead of streaming bytes. Nothing about the detached case is special-cased on the receiver:
+/// `Fetcher::relinkPartToDisk` hands over the staging path under the `detached/` parent and the router
+/// folds it onto a `detached/`-prefixed ref in the table's OWN namespace, exactly as every other read
+/// and write of a detached part is routed.
+///
+/// The load-bearing assertion is the NEGATIVE one. A detached fetch must publish a detached ref and
+/// nothing else: a live ref of the same name would make an un-attached part visible to the table, which
+/// is the one way a detached target could differ from the active one in a way that matters.
+TEST(CasWiringExchange, AdoptIntoADetachedTargetPublishesADetachedRefAndNoLiveRef)
+{
+    auto storage = openWiringStorage();
+    const auto sender_ns = storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111");
+    publishWiredPart(*storage, sender_ns, "all_1_1_0");
+
+    auto * exchange = dynamic_cast<DB::IContentAddressedExchange *>(storage.get());
+    ASSERT_NE(exchange, nullptr);
+    auto offer = exchange->getRelinkOffer("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0");
+    ASSERT_TRUE(offer.has_value());
+
+    /// The receiver's staging path under the detached parent -- the path `relinkPartToDisk` composes
+    /// with `to_detached`, and the same one `downloadPartToDisk` would have written bytes into.
+    const String detached_tmp_path
+        = "a22/a22a22a2-2222-4222-8222-222222222222/detached/tmp-fetch_all_1_1_0";
+    EXPECT_TRUE(adoptPartFromManifestAndPromote(*exchange, detached_tmp_path, offer->manifest_bytes));
+
+    const auto receiver_ns = storage->liveNamespace("a22a22a2-2222-4222-8222-222222222222");
+    EXPECT_TRUE(storage->store()->resolveRef(receiver_ns, "detached/tmp-fetch_all_1_1_0").has_value())
+        << "the detached target must publish the `detached/`-prefixed ref in the table's own namespace";
+    EXPECT_FALSE(storage->store()->resolveRef(receiver_ns, "tmp-fetch_all_1_1_0").has_value())
+        << "a detached fetch must NOT publish a live ref of the same name";
+
+    /// The adopted part reads back through the ordinary path surface, blobs and per-part files alike --
+    /// no bytes were transferred for any of them.
+    EXPECT_TRUE(storage->existsFile(detached_tmp_path + "/data.bin"));
+    EXPECT_TRUE(storage->existsFile(detached_tmp_path + "/p.proj/data.bin"));
+    EXPECT_TRUE(storage->existsFile(detached_tmp_path + "/uuid.txt"));
+
+    /// Finalization, unchanged by this task: `IMergeTreeDataPart::renameTo(detached/<part>)` is a
+    /// moveDirectory of the staged dir to its final detached name, which on a content-addressed disk is
+    /// a ref repoint WITHIN the same namespace -- the same shape the active path's
+    /// `renameTempPartAndReplace` uses, and the reason the relinked detached part needs no new
+    /// finalization of its own.
+    {
+        auto tx = storage->createTransaction();
+        tx->moveDirectory(detached_tmp_path, "a22/a22a22a2-2222-4222-8222-222222222222/detached/all_1_1_0");
+        tx->commit(DB::NoCommitOptions{});
+    }
+    EXPECT_TRUE(storage->existsFile(
+        "a22/a22a22a2-2222-4222-8222-222222222222/detached/all_1_1_0/data.bin"));
+    EXPECT_FALSE(storage->store()->resolveRef(receiver_ns, "detached/tmp-fetch_all_1_1_0").has_value());
+    EXPECT_EQ(storage->detachedRefNames(receiver_ns), (std::vector<std::string>{"detached/all_1_1_0"}));
+    EXPECT_FALSE(storage->store()->resolveRef(receiver_ns, "all_1_1_0").has_value())
+        << "the detached finalization must stay inside the `detached/` ref space";
+}
+
+/// A relink target that is not a part DIRECTORY is a caller bug, and it must be loud rather than
+/// answered with `MechanismFallbackAllowed`: the byte fetch that a fallback invites would write to the
+/// same wrong place. The table dir stands in for the whole class (a file inside a part, a FREEZE shadow
+/// path, a bare `detached` container) -- all of them route to something that is not a part ref.
+TEST(CasWiringExchange, PrepareAdoptRefusesATargetThatIsNotAPartDirectory)
+{
+    auto storage = openWiringStorage();
+    auto * exchange = dynamic_cast<DB::IContentAddressedExchange *>(storage.get());
+    ASSERT_NE(exchange, nullptr);
+
+    std::unique_ptr<DB::ICaPreparedRelink> prepared;
+    EXPECT_THROW(exchange->prepareAdoptFromManifest(
+                     "a22/a22a22a2-2222-4222-8222-222222222222", std::string{}, prepared),
+                 DB::Exception);
+    EXPECT_THROW(exchange->prepareAdoptFromManifest(
+                     "a22/a22a22a2-2222-4222-8222-222222222222/tmp-fetch_all_1_1_0/data.bin",
+                     std::string{}, prepared),
+                 DB::Exception);
+    EXPECT_THROW(exchange->prepareAdoptFromManifest(
+                     "shadow/bk1/store/a22/a22a22a2-2222-4222-8222-222222222222/all_1_1_0",
+                     std::string{}, prepared),
+                 DB::Exception);
+    EXPECT_EQ(prepared, nullptr);
 }
 
 /// ==== Commit atomicity (B122): a publish failing mid-loop must not leave a PARTIAL commit ====
@@ -1908,7 +1992,7 @@ TEST(CasWiringReadOnly, ObserveOnlyOpenReadsButRejectsWrites)
         [&]
         {
             std::unique_ptr<DB::ICaPreparedRelink> prepared;
-            ro->prepareAdoptFromManifest("a11a11a1-1111-4111-8111-111111111111", "tmp-fetch", std::string{}, prepared);
+            ro->prepareAdoptFromManifest("a11/a11a11a1-1111-4111-8111-111111111111/tmp-fetch", std::string{}, prepared);
         });
 }
 

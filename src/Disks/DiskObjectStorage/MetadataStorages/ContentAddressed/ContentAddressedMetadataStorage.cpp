@@ -2049,8 +2049,8 @@ class PreparedRelinkOverPartWrite : public ICaPreparedRelink
 {
 public:
     PreparedRelinkOverPartWrite(std::shared_ptr<Cas::CachedPartFolderAccess> access_, Cas::PreparedPartWrite write_,
-                                String part_name_)
-        : access(std::move(access_)), write(std::move(write_)), part_name(std::move(part_name_))
+                                String ref_name_)
+        : access(std::move(access_)), write(std::move(write_)), ref_name(std::move(ref_name_))
     {
     }
 
@@ -2073,7 +2073,7 @@ public:
             LOG_INFO(getLogger("ContentAddressedMetadataStorage"),
                 "Relink of part {} could not be promoted (body-absent precommit, precommit not the live "
                 "owner, or a ref conflict): {}; the caller may fetch the bytes from the same source",
-                part_name, e.message());
+                ref_name, e.message());
             return CaRelinkPromote::MechanismFallbackAllowed;
         }
     }
@@ -2094,14 +2094,14 @@ public:
             /// destructor retries it; beyond that the durable backstop is the ref lane's wedge, exactly
             /// as for every other abandon path.
             tryLogCurrentException(getLogger("ContentAddressedMetadataStorage"),
-                fmt::format("aborting the prepared relink of part {}", part_name));
+                fmt::format("aborting the prepared relink of part {}", ref_name));
         }
     }
 
 private:
     std::shared_ptr<Cas::CachedPartFolderAccess> access;
     Cas::PreparedPartWrite write;
-    String part_name;
+    String ref_name;
 };
 
 }
@@ -2113,7 +2113,7 @@ private:
 /// defended against a hostile peer, so relink-by-manifest adds no new trust surface. (See the retracted
 /// umbrella "RBAC bypass" finding.)
 CaRelinkPrepare ContentAddressedMetadataStorage::prepareAdoptFromManifest(
-    const String & table_uuid, const String & part_name, const String & manifest_bytes,
+    const String & part_path, const String & manifest_bytes,
     std::unique_ptr<ICaPreparedRelink> & out)
 {
     checkNotReadOnly("prepareAdoptFromManifest (interserver relink receiver)");
@@ -2137,6 +2137,19 @@ CaRelinkPrepare ContentAddressedMetadataStorage::prepareAdoptFromManifest(
     /// ordinary ReplicatedMergeTree interserver trust.
     out.reset();
 
+    /// The RECEIVER's own (namespace, ref) for the target path — never the sender's `root_namespace_id`,
+    /// which is foreign to this server's path-mirroring identity. Routing rather than composing is what
+    /// gives B66b its detached target for free: `TABLE/detached/DIR` folds onto `detached/DIR` in
+    /// the table's OWN namespace, and a live target onto `DIR`, through the same `route` the reads use.
+    /// A path that is not a part DIRECTORY here is a caller error, not a fallback: a byte fetch to the
+    /// same place would be just as wrong, so it must not be quietly substituted. Shadow (FREEZE) paths
+    /// are rejected for the same reason — a backup namespace is never a fetch target.
+    auto p = Cas::parsePartFilePath(part_path);
+    auto r = p ? route(*p) : std::nullopt;
+    if (!p || !r || !p->backup_name.empty() || r->ref.empty() || !r->file.empty())
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "Relink target '{}' does not address a content-addressed part directory of a live table", part_path);
+
     Cas::PartManifest decoded;
     try
     {
@@ -2147,19 +2160,15 @@ CaRelinkPrepare ContentAddressedMetadataStorage::prepareAdoptFromManifest(
         if (e.code() != ErrorCodes::CORRUPTED_DATA)
             throw;
         LOG_INFO(getLogger("ContentAddressedMetadataStorage"), "Relink of part {} not possible: transferred manifest failed to decode ({}); "
-            "caller falls back to a byte fetch", part_name, e.message());
+            "caller falls back to a byte fetch", part_path, e.message());
         return CaRelinkPrepare::MechanismFallbackAllowed;
     }
-
-    /// The RECEIVER namespace, derived from THIS server's table_uuid — never the sender's
-    /// root_namespace_id (which is foreign to this server's path-mirroring identity).
-    const Cas::RootNamespace receiver_ns = liveNamespace(table_uuid);
 
     auto access = partAccess();
     try
     {
         out = std::make_unique<PreparedRelinkOverPartWrite>(
-            access, access->prepareEntries({receiver_ns, part_name}, decoded.entries, Cas::ProvenanceOp::Attach), part_name);
+            access, access->prepareEntries(r->refKey(), decoded.entries, Cas::ProvenanceOp::Attach), r->ref);
         return CaRelinkPrepare::Prepared;
     }
     catch (const Exception & e)
@@ -2172,7 +2181,7 @@ CaRelinkPrepare ContentAddressedMetadataStorage::prepareAdoptFromManifest(
         if (e.code() != ErrorCodes::ABORTED && e.code() != ErrorCodes::NETWORK_ERROR)
             throw;
         LOG_INFO(getLogger("ContentAddressedMetadataStorage"), "Relink of part {} deferred (body-absent precommit, "
-            "precommit not the live owner, or a ref conflict): {}; caller falls back to a byte fetch", part_name, e.message());
+            "precommit not the live owner, or a ref conflict): {}; caller falls back to a byte fetch", part_path, e.message());
         return CaRelinkPrepare::MechanismFallbackAllowed;
     }
 }

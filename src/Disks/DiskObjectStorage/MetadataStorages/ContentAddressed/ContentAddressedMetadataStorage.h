@@ -357,11 +357,12 @@ public:
     /// minted. Missing or corrupt committed state propagates as an exception.
     std::optional<RelinkOffer> getRelinkOffer(const String & part_path) const override;
     /// Stages a peer-supplied manifest into this server's namespace without transferring blob bodies and
-    /// hands back the durable-but-unpromoted handle. Answers `MechanismFallbackAllowed` for a decode
-    /// failure or a retryable staging failure so the caller can byte-fetch instead; read-only disks
-    /// throw `READONLY`.
+    /// hands back the durable-but-unpromoted handle. The receiver's `part_path` is routed exactly as any
+    /// other part path, so a live target and a `detached/` one (B66b) differ only in the ref the router
+    /// derives. Answers `MechanismFallbackAllowed` for a decode failure or a retryable staging failure so
+    /// the caller can byte-fetch instead; read-only disks throw `READONLY`.
     CaRelinkPrepare prepareAdoptFromManifest(
-        const String & table_uuid, const String & part_name, const String & manifest_bytes,
+        const String & part_path, const String & manifest_bytes,
         std::unique_ptr<ICaPreparedRelink> & out) override;
 
     /// ==== wiring-internal surface (the transaction + the disk's prepareRead CA branch) ====

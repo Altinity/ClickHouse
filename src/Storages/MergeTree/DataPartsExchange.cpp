@@ -7,7 +7,6 @@
 #include <Disks/createVolume.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/IMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedExchange.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Parts/PartPathParser.h>
 #include <Storages/MergeTree/MergeTreeDataPartBuilder.h>
 #include <Formats/NativeWriter.h>
 #include <IO/HTTPCommon.h>
@@ -637,7 +636,8 @@ std::pair<MergeTreeData::MutableDataPartPtr, scope_guard> Fetcher::fetchSelected
     const String & tmp_prefix_,
     std::optional<CurrentlySubmergingEmergingTagger> * tagger_ptr,
     bool try_zero_copy,
-    DiskPtr disk)
+    DiskPtr disk,
+    bool allow_ca_relink)
 {
     if (blocker.isCancelled())
         throw Exception(ErrorCodes::ABORTED, "Fetching of part was cancelled");
@@ -685,14 +685,16 @@ std::pair<MergeTreeData::MutableDataPartPtr, scope_guard> Fetcher::fetchSelected
     /// pool identity so a same-pool sender can relink instead of streaming bytes. The target disk is the
     /// provided one if it is CA, else the first CA disk among the table's disks. A non-CA fetch adds
     /// nothing here and is byte-for-byte unchanged.
-    /// Gated on `try_zero_copy` so the byte-fetch FALLBACK (which re-requests with try_zero_copy=false)
-    /// does NOT re-advertise relink — otherwise a sender that keeps choosing relink would loop.
-    /// Also gated on `!to_detached`: the relink path (`relinkPartToDisk`) stages at the ACTIVE part path
-    /// and ignores `to_detached`, so a `FETCH PARTITION ... TO detached` must NOT advertise relink —
-    /// not advertising forces the sender to stream bytes, which `downloadPartToDisk` writes into the
-    /// `detached/` namespace. Relink-into-detached is a deferred optimization (see backlog).
+    /// Gated on `allow_ca_relink` alone (B66b). That flag is the RECURSION BRAKE and nothing else: not
+    /// advertising is what makes the sender stream bytes, so every same-sender byte re-request below
+    /// clears it, and a persistent relink-mechanism failure therefore costs exactly one relink attempt.
+    /// The gate used to be `try_zero_copy && !to_detached`, and BOTH halves were accidents of that same
+    /// brake — `try_zero_copy` because the fallback re-requests with it false, and `!to_detached`
+    /// because the relink path staged at the ACTIVE part path and ignored `to_detached`. `to_detached`
+    /// is now a parameter of `relinkPartToDisk` (it stages under the `detached/` parent), and
+    /// `try_zero_copy` goes back to meaning real zero-copy only.
     String advertised_pool_uuid;
-    if (try_zero_copy && !to_detached)
+    if (allow_ca_relink)
     {
         if (auto * ca_meta = tryGetContentAddressedExchange(disk))
         {
@@ -880,12 +882,26 @@ std::pair<MergeTreeData::MutableDataPartPtr, scope_guard> Fetcher::fetchSelected
     {
         /// Re-request without the relink capability: pass the SAME (CA) disk but disable zero-copy/relink
         /// so the sender streams bytes; on CA the downloaded files content-address and dedup.
+        ///
+        /// THE RECURSION BRAKE (B66b). `allow_ca_relink=false` is what bounds this: the re-request does
+        /// not advertise the pool identity, so the sender cannot offer relink again, so this lambda
+        /// cannot be reached a second time for the same fetch. Before relink had its own capability the
+        /// brake was implicit in `try_zero_copy=false`; with the two decoupled it has to be spelled out,
+        /// and it must be spelled out at EVERY same-sender fallback — a relink failure that is a
+        /// property of the pair reproduces on every attempt, so without the brake the fallback re-offers
+        /// and recurses without bound. The failures it actually bounds are the ones that leave the CA
+        /// disk resolved and matching: a mixed build offering an unrecognized cookie value, a sender that
+        /// predates the confirm handshake, an undecodable manifest, a local ref conflict. (The
+        /// reservation-outside-the-pool exit below is bounded twice over — it re-requests with the
+        /// non-CA disk it resolved, which cannot advertise anything either way — so do not read that one
+        /// as evidence that the brake is redundant.)
         auto fall_back_to_byte_fetch = [&]
         {
             temporary_directory_lock = {};
             return fetchSelectedPart(
                 metadata_snapshot, context, part_name, zookeeper_name, replica_path, host, port, timeouts,
-                user, password, interserver_scheme, throttler, to_detached, tmp_prefix, nullptr, false, disk);
+                user, password, interserver_scheme, throttler, to_detached, tmp_prefix, nullptr, false, disk,
+                /*allow_ca_relink=*/ false);
         };
 
         if (ca_relink != CA_RELINK_COOKIE_VALUE)
@@ -916,7 +932,7 @@ std::pair<MergeTreeData::MutableDataPartPtr, scope_guard> Fetcher::fetchSelected
         /// `nullptr` means the mechanism cannot work but the sender still has the part, so the byte
         /// re-request below is sound; a THROW means the source did not prove the binding, and the whole
         /// point of it being a throw is that this fallback must NOT run for it.
-        auto relinked = relinkPartToDisk(part_name, tmp_prefix, disk, sender_manifest_bytes,
+        auto relinked = relinkPartToDisk(part_name, tmp_prefix, disk, to_detached, sender_manifest_bytes,
             in->getResponseCookie(CA_CONFIRM_TOKEN_COOKIE, ""), uri, creds, timeouts, read_settings);
         if (relinked)
             return std::make_pair(std::move(relinked), std::move(temporary_directory_lock));
@@ -966,7 +982,10 @@ std::pair<MergeTreeData::MutableDataPartPtr, scope_guard> Fetcher::fetchSelected
 
             temporary_directory_lock = {};
 
-            /// Try again but without zero-copy
+            /// Try again but without zero-copy. `allow_ca_relink=false` for the same reason as the relink
+            /// branch's fallback above: this is a same-sender byte re-request, and it must not re-open a
+            /// capability the failed attempt is not evidence about. It also preserves the behaviour this
+            /// call had while relink rode on `try_zero_copy` — the flag it already passes as false.
             return fetchSelectedPart(
                 metadata_snapshot,
                 context,
@@ -976,7 +995,8 @@ std::pair<MergeTreeData::MutableDataPartPtr, scope_guard> Fetcher::fetchSelected
                 host,
                 port,
                 timeouts,
-                user, password, interserver_scheme, throttler, to_detached, tmp_prefix, nullptr, false, disk);
+                user, password, interserver_scheme, throttler, to_detached, tmp_prefix, nullptr, false, disk,
+                /*allow_ca_relink=*/ false);
         }
     }
 
@@ -1310,6 +1330,29 @@ MergeTreeData::MutableDataPartPtr Fetcher::downloadPartToDisk(
 /// the source itself. `adoptPartFromManifest` used to collapse the two by catching every `Exception`
 /// and returning `false`.
 ///
+/// B66b — WHAT CHANGES WHEN THE TARGET IS `detached/`. Every row above still holds, and the two columns
+/// that matter are unchanged in every one of them, but two rows hold for a DIFFERENT reason and that
+/// difference is worth stating rather than rediscovering:
+///
+/// - Row 3 (and row 6, which recovers the same way) argues "no part is lost" from the replication queue:
+///   it stores the exception, backs off, and re-executes the entry. Two of the three detached callers
+///   have no queue entry -- `FETCH PARTITION`/`FETCH PART ... FROM` are user DDL -- so the retry-later
+///   error surfaces to the user, who re-issues the statement. Nothing is lost either way, and for a
+///   stronger reason than in the active case: a detached fetch is not replication, so no replicated
+///   state was ever expecting the part. (The third, `executeClonePartFromShard`, IS a queue entry and
+///   recovers exactly as the active path does.)
+/// - Row 4's "no double-promote" is about the relink's own terminal operation and is unaffected. What
+///   the CALLER then does with the part differs: `renameTo(detached/<part>, true)` rather than
+///   `renameTempPartAndReplace`. Both are ref repoints within one namespace on a content-addressed disk
+///   (`detached/` is a ref-name prefix, not a namespace), and the detached one keeps its existing
+///   collision behaviour -- an existing `detached/<part>` is displaced. That is the pre-existing
+///   semantic of a detached BYTE fetch, deliberately left alone: relink must not change what a fetch
+///   into `detached/` means, only how the bytes get there.
+///
+/// The staged ref itself is `detached/tmp-fetch_<part>` rather than `tmp-fetch_<part>`, which is what
+/// keeps a failed detached relink from ever being visible as a live part: the abandoned precommit and
+/// the abandoned staging directory both live in the detached ref space.
+///
 /// What a `yes` does NOT prove: `CaRelinkConfirmCore.tla` config `_sab_holeylist` shows that with every
 /// confirm rule intact and one incomplete listing page permitted, `ConfirmedRelinkNeverDangles` still
 /// breaks (BACKLOG `{#list-as-journal-dataloss-2026-07-25}`). A confirmed relink is therefore NOT proven
@@ -1319,6 +1362,7 @@ MergeTreeData::MutableDataPartPtr Fetcher::relinkPartToDisk(
     const String & part_name,
     const String & tmp_prefix,
     DiskPtr disk,
+    bool to_detached,
     const String & sender_manifest_bytes,
     const String & source_token,
     const Poco::URI & fetch_uri,
@@ -1350,20 +1394,25 @@ MergeTreeData::MutableDataPartPtr Fetcher::relinkPartToDisk(
         return nullptr;
     }
 
-    /// Stage under the tmp-fetch dir. The caller commits via renameTempPartAndReplace, whose
-    /// moveDirectory(tmp-fetch_<part> -> <part>) re-keys this server's committed ref to the final part
-    /// name (the existing renameCommittedPartRef path) — exactly as for a byte-fetched part.
+    /// Stage under the tmp-fetch dir OF THE TARGET PARENT — the table dir, or `TABLE/detached` when
+    /// the caller asked for a detached fetch (B66b). The parent is composed exactly as
+    /// `downloadPartToDisk` composes it, so the two fetch paths put a part in the same place and the
+    /// caller's finalization is unchanged: `renameTempPartAndReplace`'s moveDirectory(tmp-fetch_<part>
+    /// -> <part>) for the active path, `renameTo(detached/<part>)` for the detached one. Both are ref
+    /// repoints within one namespace on a content-addressed disk (`detached/` is a ref-name prefix, not
+    /// a namespace), so a relinked part re-keys exactly as a byte-fetched one does.
+    ///
+    /// The ref name is NOT built here: the disk-relative path is handed to the CA exchange whole and its
+    /// router folds `TABLE/detached/DIR` onto the `detached/DIR` ref, the same routing every other
+    /// read and write of a detached part goes through. This side has no business knowing that prefix,
+    /// and the sender's half of the offer (`getRelinkOffer`) is already addressed by path too.
     const String part_dir = tmp_prefix + part_name;
-    const auto part_relative_path = data.getRelativeDataPath();
-
-    auto table_uuid = Cas::parseTableUuid(part_relative_path);
-    if (!table_uuid)
-        throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "Cannot derive content-addressed table uuid from data path {} for relink of part {}",
-            part_relative_path, part_name);
+    const String part_relative_path
+        = data.getRelativeDataPath() + String(to_detached ? MergeTreeData::DETACHED_DIR_NAME : "");
+    const String part_path = fs::path(part_relative_path) / part_dir;
 
     LOG_DEBUG(log, "Relinking part {} (staged as {}) onto content-addressed disk {} from a {}-byte transferred manifest.",
-        part_name, part_dir, disk->getName(), sender_manifest_bytes.size());
+        part_name, part_path, disk->getName(), sender_manifest_bytes.size());
 
     /// T1 — PUBLISH. Adopt-from-manifest and precommit, stopping short of the promote (B7
     /// part_manifest_v2, all-tree task 7): the receiver decodes the transferred body and stages its OWN
@@ -1377,7 +1426,7 @@ MergeTreeData::MutableDataPartPtr Fetcher::relinkPartToDisk(
     /// fold already sees the receiver's own reference (spec §correctness). Asking first and publishing
     /// after would prove nothing about the interval in between.
     std::unique_ptr<ICaPreparedRelink> prepared;
-    if (ca_meta->prepareAdoptFromManifest(*table_uuid, part_dir, sender_manifest_bytes, prepared)
+    if (ca_meta->prepareAdoptFromManifest(part_path, sender_manifest_bytes, prepared)
         == CaRelinkPrepare::MechanismFallbackAllowed)
         return nullptr;                                     /// taxonomy row 2
     if (!prepared)

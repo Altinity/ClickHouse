@@ -187,9 +187,15 @@ public:
 
     /// Receiver side, the FIRST half of a relink: decode the transferred manifest, perform a normal
     /// local build from shared-pool blob references without reading a single blob body from the sender,
-    /// stage a fresh manifest in the receiver namespace derived from `table_uuid`, `precommitAdd` it --
-    /// and STOP. The sender's `root_namespace_id`, `ManifestRef` and `payload_digest` are ignored; only
-    /// the entries are used.
+    /// stage a fresh manifest in the receiver namespace, `precommitAdd` it -- and STOP. The sender's
+    /// `root_namespace_id`, `ManifestRef` and `payload_digest` are ignored; only the entries are used.
+    ///
+    /// `part_path` is the RECEIVER's disk-relative path of the part directory being built, addressed the
+    /// same way `getRelinkOffer` addresses the sender's: the namespace and the ref name come from
+    /// routing it, so the caller never composes a ref name and a relink into `TABLE/detached/DIR`
+    /// (B66b) lands on the `detached/<dir>` ref for free, through the one router every other read and
+    /// write of that part uses. A path that does not route to a part DIRECTORY of a live table -- a
+    /// table dir, a file inside a part, a FREEZE shadow path -- is a caller error and throws.
     ///
     /// On `Prepared` the receiver's `+1` is DURABLE and `out` holds the handle that owes the terminal
     /// operation; nothing is committed and no ref is live yet. The promote is deferred because the
@@ -206,8 +212,7 @@ public:
     /// that becomes absent or condemned after adoption is not caught here; it is an fsck-detectable
     /// invariant violation.
     virtual CaRelinkPrepare prepareAdoptFromManifest(
-        const String & table_uuid,
-        const String & part_name,
+        const String & part_path,
         const String & manifest_bytes,
         std::unique_ptr<ICaPreparedRelink> & out) = 0;
 
