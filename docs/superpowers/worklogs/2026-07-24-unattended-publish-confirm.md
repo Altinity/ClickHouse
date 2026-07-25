@@ -754,3 +754,11 @@ fixed.
   User decisions still open: Q2 (tool read-without-ownership contract), Q3 (when `ca-fsck` turns fatal on
   `stale_edge`), Q4 (S42's missing targeted signal), Q5 (GC bottleneck study scope). Q1 answered: option C,
   detect the EFFECT rather than the unconfirmed LIST hypothesis (BACKLOG {#list-as-journal-decision-c}).
+- 19:09 UTC — watchdog: two agents running ~20 min, neither has written yet — expected, both were told to
+  read substantially first (Task 13 must read the plan's authorization section, the spec's wire chapter and
+  Task 11's landed method; the planner must read four BACKLOG decisions, the superseded design note, the GC
+  intake code and a CI job definition). No build or test process alive, which is normal: subagent work is
+  model-side until they start editing. Disk 331G, 64G RAM, load 0.7. Nothing to unstick.
+  Task 12 committed (`41a248fd9c5`, 1361/1361); all four user decisions recorded (`128392e6fe3`); the
+  execution order agreed with the user is 13-16 → codex review of all Part B → fixes → the four follow-ups
+  → soak (20 min to stability, then 4h).
