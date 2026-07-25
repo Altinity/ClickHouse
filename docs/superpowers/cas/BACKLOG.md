@@ -1437,3 +1437,49 @@ Then, AFTER Part B and its soak: study the collected metrics, look for anomalies
 further investigation is warranted. The reproduction rig from
 {#gc-bottleneck-study-2026-07-25} is therefore NOT built yet — real metrics from real runs come first and
 may well retarget it.
+
+## Operator recovery: mounting a pool whose owner uuid differs (deferred 2026-07-25) {#operator-uuid-recovery}
+
+Split out of {#q2-force-claim} once the CI motivation for it evaporated. The CI scrape is fixed by a
+one-line change to which file its `sed` patches — the read-only path already exists in the product and CI
+already tried to use it — so nothing about the scrape needs a product change. See
+{#ci-scrape-readonly-sed-fix} below.
+
+WHAT REMAINS, and it is a real operator need, not a CI one: a server whose local uuid file was regenerated
+(wiped `/var/lib/clickhouse`, a pod recreated without a persistent volume) cannot mount its own pool. The
+refusal at `CasServerRoot.cpp:120-131` already names the three manual recoveries — restore the uuid file,
+configure a fresh `server_root_id`, or delete the owner object by hand after verifying no server uses the
+root. A supported command would automate the third.
+
+TWO READINGS, and the choice matters — settle it before implementing:
+- **Overwrite the owner uuid with a new one** (the literal reading of "force a new one"). Works, and
+  permanently locks the ORIGINAL server out of the pool. Also insufficient on its own: the uuid lives in
+  two durable objects, and a graceful shutdown leaves a mount object carrying the predecessor's uuid, so
+  `claimMount` then refuses it as `ForeignOwner`. The force has to cover both, in an order that keeps the
+  refuse-to-re-mint-epoch-1 guard armed.
+- **Adopt the pool's existing owner uuid and mount as it.** Reaches the same "mount as WRITE despite a
+  differing local uuid" outcome with no durable identity damage. `Pool::openForDecommission`
+  (`CasPool.cpp:720-776`) already does exactly this, so most of the work exists.
+
+The second reading looks strictly better for the stated need and the first should have to justify itself.
+Not decided; not started.
+
+NOTE this is NOT the read-only-mount task. The user was explicit that a genuine read-only mount is a
+separate, unimplemented piece of work, and it — not this — is the right answer to "an operator wants to
+look at a live pool from a second process".
+
+## CI scrape opens CA disks read-only — the remedy existed but never applied (fixed 2026-07-25) {#ci-scrape-readonly-sed-fix}
+
+`dump_system_tables` already carried the correct remedy: insert `<readonly>true</readonly>` next to the
+`content_addressed` marker so `clickhouse local` skips `mountWritable` and never claims ownership. It
+patched `/etc/clickhouse-server/config.xml`, where that marker does not exist — the CA storage policy is
+symlinked into `config.d/` by `tests/config/install.sh`. So `sed` matched nothing, silently, and the
+scrape kept dying on "owned by a different server" while looking like it had been handled.
+
+Fixed by patching `config.d/*.xml` as well, and by making a future no-op LOUD: if a CA disk is declared
+and the read-only marker is absent afterwards, the job now prints a warning naming the consequence. A
+silent no-op is how this survived in the first place, and it is the same shape as three other harness
+surfaces found the same day ({#gc-observation-vacuous-2026-07-25} and the entries it references).
+
+Verified by simulating the substitution against the two real config files before committing, rather than
+by reading the sed and believing it.

@@ -1295,9 +1295,31 @@ fi
         # (`Pool::open`: `if (!config.read_only) mountWritable(...)`), which is all a read-only
         # dump needs. Keyed on the CAS marker tag, not the disk name, so it covers every
         # content-addressed disk regardless of how it's named in this job's config.
+        #
+        # The marker lives in `config.d/`, NOT in `config.xml` -- the CA storage policy is symlinked in
+        # as `config.d/content_addressed*_storage_policy_for_merge_tree_by_default.xml` (see
+        # `tests/config/install.sh`). The original version of this line targeted `config.xml` alone, where
+        # the tag does not exist, so `sed` matched nothing, `<readonly>` was never inserted, and the
+        # scrape kept failing on ownership -- the remedy was written but never applied. Patch both paths:
+        # `config.xml` costs nothing and keeps working if a job ever inlines the disk there.
         Shell.check(
-            "sed -i 's|<metadata_type>content_addressed</metadata_type>|<metadata_type>content_addressed</metadata_type><readonly>true</readonly>|g' /etc/clickhouse-server/config.xml"
+            "sed -i 's|<metadata_type>content_addressed</metadata_type>|<metadata_type>content_addressed</metadata_type><readonly>true</readonly>|g' "
+            "/etc/clickhouse-server/config.xml /etc/clickhouse-server/config.d/*.xml"
         )
+        # Fail LOUDLY rather than silently, if the substitution ever stops matching again: a CA disk that
+        # is declared but not marked read-only means this scrape is about to die on ownership, and a
+        # silent no-op is precisely how that went unnoticed before. Reports; does not abort the dump.
+        if Shell.check(
+            "grep -rlq '<metadata_type>content_addressed</metadata_type>' /etc/clickhouse-server/",
+            verbose=False,
+        ) and not Shell.check(
+            "grep -rlq '<metadata_type>content_addressed</metadata_type><readonly>true</readonly>' /etc/clickhouse-server/",
+            verbose=False,
+        ):
+            print(
+                "WARNING: a content-addressed disk is declared but the read-only marker was not inserted "
+                "-- `clickhouse local` will claim server-root ownership and this scrape will fail"
+            )
         # FIXME: Hack for s3_with_keeper (note, that we don't need the disk,
         # the problem is that whenever we need disks all disks will be
         # initialized [1])
