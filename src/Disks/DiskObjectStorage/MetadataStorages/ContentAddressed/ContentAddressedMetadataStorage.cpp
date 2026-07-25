@@ -125,7 +125,9 @@ const char * casLifecycleReasonWord(Cas::PoolLifecycle lc)
 ///   readable in EVERY lifecycle state including a not-live/vanished/null pool, spec §7),
 ///   parseStagingBackend/parsePartFolderValidate/
 ///   tryFromDisk (static), checkNotReadOnly, the *ForTest seams, serverPrefix/liveNamespace/
-///   shadowNamespace/route/classifyDirectory (pure path computation, no pool I/O).
+///   shadowNamespace/route/classifyDirectory (pure path computation, no pool I/O),
+///   ownsNamespace (the relink-confirm routing predicate -- a string comparison against
+///   `server_root_id`, deliberately answerable in EVERY lifecycle state).
 /// Probe:       existsFile, existsDirectory, existsFileOrDirectory, listDirectory, iterateDirectory,
 ///              isDirectoryEmpty, getStorageObjectsIfExist, liveTreeDirHasChildren, listLiveTreeChildren.
 ///              EMPTY-PROOF RULE (Task 9, spec §1 [B3]): on a NON-terminal (Live/read-only) pool, an
@@ -135,7 +137,9 @@ const char * casLifecycleReasonWord(Cas::PoolLifecycle lc)
 ///              empty answer. `iterateDirectory`/`isDirectoryEmpty` inherit it (both funnel through
 ///              `listDirectory`). A `Vanished` pool never reaches it (the gate short-circuits `Probe`).
 /// ContentRead: getFileSize, getLastModified, getStorageObjects, getBlobViewPlan, readBlobPayload,
-///              prepareInManifestRead, tryGetInManifestBytes, getPartManifestBytes.
+///              prepareInManifestRead, tryGetInManifestBytes, getPartManifestBytes, confirmExactRef
+///              (the ONE ContentRead entry that converts the gate's refusal into its own typed
+///              `Unknown` answer instead of propagating it -- a confirm never throws at its caller).
 /// Write:       adoptPartFromManifest.
 /// Admin:       runOneGcRoundForTest, runGarbageCollectionRoundNow, runGcRebuildNow, runFsckNow (the
 ///              rev.8 FSCK-on-running path -- an FSCK of a not-live disk is refused by the Admin gate).
@@ -1916,6 +1920,72 @@ std::unique_ptr<ReadBufferFromFileBase> ContentAddressedMetadataStorage::readBlo
 }
 
 /// ==== `IContentAddressedExchange` ====
+
+bool ContentAddressedMetadataStorage::ownsNamespace(const String & other_server_root_id, const String & root_namespace) const
+{
+    /// Routing for the relink confirm (spec §wire-protocol). `pool_uuid` says which POOL a token refers
+    /// to and is compared by the caller; every server root writing into that pool shares it, so the
+    /// namespace's owner is decided here. `liveNamespace` builds live and detached namespaces as
+    /// `<server_root_id>/<mirrored table dir>`, so ownership is exactly "rooted at MY server root".
+    /// The strict prefix (not a bare equality, not `starts_with(server_root_id)`) is what keeps
+    /// `srv1` from claiming `srv10/...`, and it deliberately does not match a pool-global shadow
+    /// namespace: a FREEZE tree belongs to no single mount and is never a relink source.
+    ///
+    /// Factory-class: no `store()`, no gate, no I/O, no throw. A misrouted question must come back as
+    /// an unproven answer, never as an error.
+    if (other_server_root_id.empty() || other_server_root_id != server_root_id)
+        return false;
+    return root_namespace.starts_with(server_root_id + "/");
+}
+
+CasConfirmAnswer ContentAddressedMetadataStorage::confirmExactRef(
+    const String & root_namespace, const String & ref_name, const String & manifest_ref_text) const
+{
+    /// Gate 1 of the relink confirm: a thin forward to the ledger, whose declaration
+    /// (`CasRefLedger::confirmExactRef`) carries the six-rule snapshot and the zero-I/O contract. This
+    /// layer adds exactly two things: the token text is decoded here, and the disk's own lifecycle is
+    /// answered as `Unknown` instead of as an exception.
+    const auto manifest_ref = Cas::tryParseManifestRef(manifest_ref_text);
+    if (!manifest_ref)
+    {
+        LOG_DEBUG(getLogger("ContentAddressedMetadataStorage"),
+            "Relink confirm for ref '{}' in namespace '{}' is unanswerable: manifest reference '{}' is not "
+            "the canonical epoch:build:ordinal form", ref_name, root_namespace, manifest_ref_text);
+        return CasConfirmAnswer::Unknown;
+    }
+
+    Cas::ConfirmAnswer answer = Cas::ConfirmAnswer::Unknown;
+    try
+    {
+        /// ContentRead: the confirm reads this disk's committed view. A disk that never started, was shut
+        /// down, is transiently not live, or has reached a terminal lifecycle has no committed view to
+        /// speak for -- and `checkOpAdmitted` says so by throwing.
+        checkOpAdmitted(CasOpClass::ContentRead);
+        answer = store()->confirmExactRef(Cas::RootNamespace{root_namespace}, ref_name, *manifest_ref);
+    }
+    catch (const Exception & e)
+    {
+        /// This is NOT a fallback path: `Unknown` is the typed refusal this primitive is built around,
+        /// not an alternate behavior substituted for a failed one. Nothing consequential happens on it --
+        /// the receiver aborts its prepared relink and retries later -- so swallowing the lifecycle
+        /// refusal costs a retry and can never authorize anything. Only `Yes` authorizes, and no `catch`
+        /// can produce a `Yes`.
+        LOG_DEBUG(getLogger("ContentAddressedMetadataStorage"),
+            "Relink confirm for ref '{}' in namespace '{}' is unanswerable on disk '{}': {}",
+            ref_name, root_namespace, disk_name, e.message());
+        return CasConfirmAnswer::Unknown;
+    }
+
+    switch (answer)
+    {
+        case Cas::ConfirmAnswer::Yes:
+            return CasConfirmAnswer::Yes;
+        case Cas::ConfirmAnswer::No:
+            return CasConfirmAnswer::No;
+        case Cas::ConfirmAnswer::Unknown:
+            return CasConfirmAnswer::Unknown;
+    }
+}
 
 std::optional<String> ContentAddressedMetadataStorage::getPartManifestBytes(const String & part_path) const
 {

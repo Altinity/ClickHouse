@@ -10,6 +10,25 @@ namespace DB
 class ReadPipeline;
 struct ReadSettings;
 
+/// The answer of the relink confirm as it crosses the exchange seam (spec §confirm-primitive). Declared
+/// here, on the narrow interface, so `DataPartsExchange` can carry the answer without including any
+/// content-addressed header; `ContentAddressedMetadataStorage` maps `Cas::ConfirmAnswer` onto it.
+///
+/// ONLY `Yes` AUTHORIZES ANYTHING. `No` and `Unknown` are one outcome for every caller -- both mean
+/// "not proven", both are `SourceProofFailed` in the spec's failure taxonomy, and neither may be used
+/// to conclude anything about the source. That is not a simplification, it is a coupling: gate 1
+/// evaluates the mount fence LAST (`CasRefLedger::confirmExactRef` rule 6), so a mount that has already
+/// lost its fence -- and can therefore no longer speak for the namespace at all -- still answers `No`
+/// for a token that does not match its last-known row. Any code that ever treats `No` as authoritative
+/// knowledge (say, to skip a retry or to conclude the part is gone) makes that ordering wrong and must
+/// hoist rule 6 above the row comparison first.
+enum class CasConfirmAnswer : uint8_t
+{
+    Yes,
+    No,
+    Unknown,
+};
+
 /// Purpose-built seam for `DataPartsExchange`: it exposes everything replication needs from a
 /// content-addressed disk and nothing else. `ContentAddressedMetadataStorage` implements it, and
 /// the exchange obtains the interface by casting the disk's `IMetadataStorage` to this interface
@@ -34,6 +53,25 @@ public:
     /// — endpoint/prefix string-matching is unsafe (false positives => mis-relink). Empty before
     /// the storage started up.
     virtual const String & getPoolUUID() const = 0;
+
+    /// Sender side, routing predicate for the confirm action (spec §wire-protocol "Routing contract"):
+    /// does THIS instance own `root_namespace` under `server_root_id`? A pool UUID is shared by every
+    /// server root writing into the pool, so `getPoolUUID` alone cannot select the mount that is
+    /// entitled to answer for a namespace; the caller pairs the two and requires EXACTLY one match
+    /// (zero or several are both `Unknown`). I/O-free and never throws in any lifecycle state -- a
+    /// routing predicate that could fail would turn a misrouted question into an error instead of an
+    /// unproven answer.
+    virtual bool ownsNamespace(const String & server_root_id, const String & root_namespace) const = 0;
+
+    /// Sender side, gate 1 of the relink confirm (spec §confirm-primitive), forwarded to the ledger:
+    /// does `ref_name` in `root_namespace` still name EXACTLY the manifest rendered by
+    /// `manifest_ref_text` (the canonical `writer_epoch:build_sequence:manifest_ordinal` form) in this
+    /// writer's committed view? Read-only, performs ZERO object-store I/O, and creates nothing: a cold,
+    /// evicted, recovering, busy, wedged, poisoned or unfenced table answers `Unknown` rather than
+    /// doing work, because a remote peer drives this query. Never throws: an unparsable token and a
+    /// disk that is not started or has reached a terminal lifecycle are `Unknown` too.
+    virtual CasConfirmAnswer confirmExactRef(const String & root_namespace, const String & ref_name,
+                                             const String & manifest_ref_text) const = 0;
 
     /// Sender side: returns the encoded `PartManifest` body for this server's committed part at the
     /// given disk-relative path. The body is opaque to the exchange caller and is decoded by the

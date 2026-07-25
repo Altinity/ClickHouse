@@ -7,6 +7,7 @@
 #include <base/types.h>
 #include <Common/Exception.h>
 #include <array>
+#include <charconv>
 #include <compare>
 #include <cstddef>
 #include <cstdint>
@@ -159,10 +160,50 @@ inline String manifestOrdinalFileName(uint32_t manifest_ordinal)
     return fmt::format("{:06}{}", manifest_ordinal, storedSuffix(FormatId::PartManifest));
 }
 
-/// Formats a manifest reference for logs and diagnostics; this is not an object-key encoding.
+/// The canonical `writer_epoch:build_sequence:manifest_ordinal` text form of a manifest reference.
+/// It is not an object-key encoding: keys are derived by `CasLayout::manifestKey`. Besides logs and
+/// diagnostics it is the wire form of the relink confirm token (spec §confirm-primitive), so
+/// `tryParseManifestRef` below is its exact inverse and the two must be changed together.
 inline String manifestRefDebugString(const ManifestRef & ref)
 {
     return fmt::format("{}:{}:{}", ref.writer_epoch, ref.build_sequence, ref.manifest_ordinal);
+}
+
+/// Parses the canonical text form produced by `manifestRefDebugString` back into a reference.
+///
+/// Everything that is not EXACTLY three colon-separated decimal fields in range is `nullopt`. The text
+/// arrives from a remote peer in the relink confirm token, so it is untrusted: `from_chars` is used
+/// precisely because it accepts no sign, no whitespace and no partial consumption, and the ordinal is
+/// range-checked the same way `manifestOrdinalFileName` checks it (`0` is the reserved invalid
+/// sentinel, never emitted, so a token carrying it can only be malformed or forged). A refusal here is
+/// never a `No`: the caller cannot tell what was asked, which is an ambiguity, not knowledge.
+inline std::optional<ManifestRef> tryParseManifestRef(std::string_view text)
+{
+    const auto parse_field = [](std::string_view field, auto & out) -> bool
+    {
+        if (field.empty())
+            return false;
+        const auto * const begin = field.data();
+        const auto * const end = field.data() + field.size();
+        const auto result = std::from_chars(begin, end, out);
+        return result.ec == std::errc{} && result.ptr == end;
+    };
+
+    const size_t first = text.find(':');
+    if (first == std::string_view::npos)
+        return std::nullopt;
+    const size_t second = text.find(':', first + 1);
+    if (second == std::string_view::npos || text.find(':', second + 1) != std::string_view::npos)
+        return std::nullopt;
+
+    ManifestRef ref;
+    if (!parse_field(text.substr(0, first), ref.writer_epoch)
+        || !parse_field(text.substr(first + 1, second - first - 1), ref.build_sequence)
+        || !parse_field(text.substr(second + 1), ref.manifest_ordinal))
+        return std::nullopt;
+    if (ref.manifest_ordinal == 0 || ref.manifest_ordinal > kMaxManifestOrdinal)
+        return std::nullopt;
+    return ref;
 }
 
 }

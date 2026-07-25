@@ -344,6 +344,14 @@ public:
 
     /// ==== `IContentAddressedExchange` (interserver relinking facade) ====
     const String & getPoolUUID() const override { return pool_uuid; }
+    /// Routing predicate for the confirm action: this mount owns a namespace iff the namespace is rooted
+    /// at ITS `server_root_id` (`liveNamespace` builds every live/detached namespace as
+    /// `<server_root_id>/<mirrored table dir>`). Factory-class: I/O-free, ungated, never throws.
+    bool ownsNamespace(const String & other_server_root_id, const String & root_namespace) const override;
+    /// Gate 1 of the relink confirm, forwarded to the pool's ref ledger. Answers `Unknown` for an
+    /// unparsable token and for a disk that has not started or has reached a terminal lifecycle.
+    CasConfirmAnswer confirmExactRef(const String & root_namespace, const String & ref_name,
+                                     const String & manifest_ref_text) const override;
     /// Returns the canonical encoded manifest for a committed part, or nullopt when the path is not
     /// a committed CA part. Missing or corrupt committed state propagates as an exception.
     std::optional<String> getPartManifestBytes(const String & part_path) const override;

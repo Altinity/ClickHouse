@@ -2,6 +2,9 @@
 
 #include "config.h"
 
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedExchange.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h>
@@ -15,6 +18,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <exception>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -673,4 +677,210 @@ TEST(CasConfirmExactRef, ConcurrentAppendIsOrderedAfterTheSnapshot)
 
     /// Phase 3: durable and applied.
     EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::No) << "phase 3: after the removal";
+}
+
+
+/// ===========================================================================================
+/// Task 11: the EXCHANGE-level confirm -- `IContentAddressedExchange::ownsNamespace` (routing) and
+/// `::confirmExactRef` (the storage forward of gate 1, plus the token text and the disk lifecycle).
+///
+/// Gate 0 is not exercised here on purpose: it reads a `StorageReplicatedMergeTree` parts set, so
+/// `Deleting`, absent, other-disk and the `MOVE ... TO DISK` same-name case are integration-level and
+/// belong to the Task 16 pytest battery.
+/// ===========================================================================================
+
+namespace
+{
+
+/// A storage adapter over its own private local object storage. `startup` is the caller's business:
+/// several tests below assert behavior BEFORE it and AFTER `shutdown`.
+std::shared_ptr<DB::ContentAddressedMetadataStorage> makeExchangeStorage(const std::string & server_root_id)
+{
+    auto settings = tests::makeSettingsForTest(
+        server_root_id, std::filesystem::temp_directory_path() / "ca_confirm_exchange_scratch");
+    return std::make_shared<DB::ContentAddressedMetadataStorage>(
+        tests::makeLocalObjectStorageForTest(), "pool", "srv1", "", nullptr, settings);
+}
+
+const std::string kExchangeTableDir = "e11/e11e11e1-0808-4808-8808-080808080808";
+const std::string kExchangePartName = "all_1_1_0";
+const std::string kExchangePartDir = kExchangeTableDir + "/" + kExchangePartName;
+
+/// Commit one real part through the ordinary transaction path, so the committed binding under test is
+/// produced exactly the way an INSERT produces it.
+void commitExchangePart(DB::ContentAddressedMetadataStorage & storage)
+{
+    auto tx = storage.createTransaction();
+    auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
+    auto buf = ca_tx.writeFile(kExchangeTableDir + "/tmp_insert_" + kExchangePartName + "/data.bin",
+                               65536, DB::WriteMode::Rewrite, {});
+    const std::string bytes = "content-of-the-part";
+    buf->write(bytes.data(), bytes.size());
+    buf->finalize();
+    tx->moveDirectory(kExchangeTableDir + "/tmp_insert_" + kExchangePartName, kExchangePartDir);
+    tx->commit(DB::NoCommitOptions{});
+}
+
+/// The token fields the sender will mint for the committed part: the namespace and the manifest
+/// reference the RECEIVER gets, read back out of the very manifest body that is put on the wire.
+struct SourceToken
+{
+    String root_namespace;
+    String manifest_ref_text;
+};
+
+SourceToken readSourceToken(const DB::ContentAddressedMetadataStorage & storage)
+{
+    const auto manifest_bytes = storage.getPartManifestBytes(kExchangePartDir);
+    EXPECT_TRUE(manifest_bytes.has_value()) << "the committed part must offer a manifest to relink";
+    const auto manifest = decodePartManifest(*manifest_bytes);
+    return SourceToken{manifest.root_namespace_id.string(), manifestRefDebugString(manifest.ref)};
+}
+
+}
+
+
+/// The canonical text form of a `ManifestRef` becomes wire input with Task 11: it is what the confirm
+/// token carries and what `confirmExactRef` compares. It is therefore parsed as untrusted input --
+/// exactly three decimal fields, nothing consumed partially, no sign, no padding -- and the parser is
+/// pinned as the exact inverse of the renderer, because a mismatch between the two would silently turn
+/// every confirm into an `Unknown` (or, far worse, make two different manifests compare equal).
+TEST(CasConfirmExactRef, ManifestRefTextRoundTripsAndRejectsMalformedTokens)
+{
+    for (const ManifestRef & ref : {ManifestRef{1, 1, 1}, ManifestRef{7, 42, 999999},
+                                    ManifestRef{18446744073709551615ULL, 18446744073709551615ULL, 123}})
+    {
+        const String text = manifestRefDebugString(ref);
+        const auto parsed = tryParseManifestRef(text);
+        ASSERT_TRUE(parsed.has_value()) << "the renderer produced text its own parser rejects: " << text;
+        EXPECT_EQ(*parsed, ref) << text;
+    }
+
+    EXPECT_EQ(manifestRefDebugString(ManifestRef{7, 42, 3}), "7:42:3") << "the canonical form is epoch:build:ordinal";
+
+    for (const std::string_view malformed : {
+             "", "1", "1:2", "1:2:3:4", ":2:3", "1::3", "1:2:", "1:2:x", "x:2:3", " 1:2:3", "1:2:3 ",
+             "1: 2:3", "+1:2:3", "-1:2:3", "1:2:3\n", "0x1:2:3",
+             /// `0` is the reserved invalid ordinal and is never emitted; `1000000` is past the six-digit
+             /// filename range, so neither can name a real manifest.
+             "1:2:0", "1:2:1000000",
+             /// One past `uint64` / `uint32` -- `from_chars` reports overflow rather than truncating.
+             "18446744073709551616:1:1", "1:18446744073709551616:1", "1:1:4294967296"})
+    {
+        EXPECT_FALSE(tryParseManifestRef(malformed).has_value())
+            << "accepted a malformed manifest reference: '" << malformed << "'";
+    }
+}
+
+
+/// Routing (spec §wire-protocol). A pool UUID is shared by every server root writing into the pool, so
+/// it cannot select the mount entitled to answer for a namespace; `ownsNamespace` is what does. It is a
+/// pure string question about the mount's own identity: no pool, no I/O, no lifecycle -- asserted here
+/// by answering the same before `startup`, while live, and after `shutdown`. A routing predicate that
+/// could throw would turn a misrouted question into an error instead of an unproven answer.
+TEST(CasConfirmExactRef, OwnsNamespaceSelectsTheMountByServerRootInEveryLifecycleState)
+{
+    auto storage = makeExchangeStorage("srv1");
+
+    const auto assert_routing = [&](const char * phase)
+    {
+        /// Live and detached namespaces are `<server_root_id>/<mirrored table dir>` (`liveNamespace`).
+        EXPECT_TRUE(storage->ownsNamespace("srv1", "srv1/store/abc/abcdef@cas@")) << phase;
+        EXPECT_TRUE(storage->ownsNamespace("srv1", storage->liveNamespace("abcdef").string())) << phase;
+
+        /// A different server root's namespace, and this namespace asked about under a different server
+        /// root: the same pool, a different owner. Both must miss, or a confirm could be answered by a
+        /// mount that never wrote the ref.
+        EXPECT_FALSE(storage->ownsNamespace("srv2", "srv1/store/abc/abcdef@cas@")) << phase;
+        EXPECT_FALSE(storage->ownsNamespace("srv1", "srv2/store/abc/abcdef@cas@")) << phase;
+
+        /// The prefix trap: a bare `starts_with(server_root_id)` would let `srv1` claim `srv10`.
+        EXPECT_FALSE(storage->ownsNamespace("srv1", "srv10/store/abc/abcdef@cas@")) << phase;
+        EXPECT_FALSE(storage->ownsNamespace("srv10", "srv10/store/abc/abcdef@cas@")) << phase;
+
+        /// The server root itself is not a namespace, and a pool-global FREEZE tree belongs to no mount.
+        EXPECT_FALSE(storage->ownsNamespace("srv1", "srv1")) << phase;
+        EXPECT_FALSE(storage->ownsNamespace("srv1", "shadow/backup/store/abc/abcdef")) << phase;
+
+        /// Empty fields are never a match -- an absent token field must not route anywhere.
+        EXPECT_FALSE(storage->ownsNamespace("", "")) << phase;
+        EXPECT_FALSE(storage->ownsNamespace("", "srv1/store/abc/abcdef@cas@")) << phase;
+        EXPECT_FALSE(storage->ownsNamespace("srv1", "")) << phase;
+    };
+
+    assert_routing("before startup");
+    storage->startup();
+    assert_routing("while live");
+    storage->shutdown();
+    assert_routing("after shutdown");
+}
+
+
+/// The storage forward of gate 1, driven end to end: a part committed through the ordinary transaction
+/// path, and a token read out of the very manifest body the sender puts on the wire. The three
+/// non-`Yes` cases pin the two halves this layer adds on top of the ledger -- the token text is decoded
+/// here, and a namespace this mount holds no resident runtime for is an ambiguity, not a `No`.
+TEST(CasConfirmExactRef, StorageConfirmAnswersForTheCommittedBinding)
+{
+    auto storage = makeExchangeStorage("test");
+    storage->startup();
+    commitExchangePart(*storage);
+
+    const SourceToken token = readSourceToken(*storage);
+    ASSERT_TRUE(storage->ownsNamespace("test", token.root_namespace))
+        << "the sender must route its own committed namespace to itself: " << token.root_namespace;
+
+    EXPECT_EQ(storage->confirmExactRef(token.root_namespace, kExchangePartName, token.manifest_ref_text),
+              DB::CasConfirmAnswer::Yes);
+
+    /// A manifest this ref never named, and a ref name that was never committed: both are knowledge on
+    /// a warm table, and both are `No` -- which the caller must still treat as "not proven".
+    const auto other_ref = tryParseManifestRef(token.manifest_ref_text);
+    ASSERT_TRUE(other_ref.has_value());
+    EXPECT_EQ(storage->confirmExactRef(token.root_namespace, kExchangePartName,
+                                       manifestRefDebugString(ManifestRef{other_ref->writer_epoch,
+                                                                          other_ref->build_sequence,
+                                                                          other_ref->manifest_ordinal + 1})),
+              DB::CasConfirmAnswer::No);
+    EXPECT_EQ(storage->confirmExactRef(token.root_namespace, "all_9_9_9", token.manifest_ref_text),
+              DB::CasConfirmAnswer::No);
+
+    /// A namespace with no resident runtime: the ledger will not recover one to answer, so this is an
+    /// ambiguity. It must not read as "the ref does not exist".
+    EXPECT_EQ(storage->confirmExactRef("test/store/zzz/zzzzzz@cas@", kExchangePartName, token.manifest_ref_text),
+              DB::CasConfirmAnswer::Unknown);
+
+    /// An unparsable token: the question cannot be understood, so it cannot be answered `No`.
+    EXPECT_EQ(storage->confirmExactRef(token.root_namespace, kExchangePartName, "not-a-manifest-ref"),
+              DB::CasConfirmAnswer::Unknown);
+    EXPECT_EQ(storage->confirmExactRef(token.root_namespace, kExchangePartName, ""),
+              DB::CasConfirmAnswer::Unknown);
+
+    storage->shutdown();
+}
+
+
+/// The disk's own lifecycle is an answer, not an exception. The confirm is served on an interserver
+/// request, and the caller has a durable precommit waiting on it: a thrown `INVALID_STATE` would have
+/// to be classified by the HTTP layer, whereas `Unknown` is already the taxonomy's "not proven". Only
+/// `Yes` authorizes, and no lifecycle state can produce one.
+TEST(CasConfirmExactRef, StorageConfirmIsUnknownWhenTheDiskCannotSpeakForItsView)
+{
+    auto storage = makeExchangeStorage("test");
+
+    /// Never started: no pool has ever been published, so there is no committed view at all.
+    EXPECT_EQ(storage->confirmExactRef("test/store/abc/abcdef@cas@", kExchangePartName, "1:1:1"),
+              DB::CasConfirmAnswer::Unknown);
+
+    storage->startup();
+    commitExchangePart(*storage);
+    const SourceToken token = readSourceToken(*storage);
+    ASSERT_EQ(storage->confirmExactRef(token.root_namespace, kExchangePartName, token.manifest_ref_text),
+              DB::CasConfirmAnswer::Yes);
+
+    /// Shut down: the same question, the same token, and the same table -- but this process no longer
+    /// speaks for the namespace.
+    storage->shutdown();
+    EXPECT_EQ(storage->confirmExactRef(token.root_namespace, kExchangePartName, token.manifest_ref_text),
+              DB::CasConfirmAnswer::Unknown);
 }

@@ -24,6 +24,11 @@ namespace DB
 class StorageReplicatedMergeTree;
 class ReadWriteBufferFromHTTP;
 
+/// Declared by `ContentAddressedExchange.h` (the narrow content-addressed seam). Opaque-enum-declared
+/// here so this header stays free of content-addressed includes; the definition must keep the same
+/// underlying type.
+enum class CasConfirmAnswer : uint8_t;
+
 namespace DataPartsExchange
 {
 
@@ -41,6 +46,21 @@ public:
     void processQuery(const HTMLForm & params, ReadBufferPtr body, WriteBuffer & out, HTTPServerResponse & response) override;
 
 private:
+    /// CAS fetch-by-relink, publish-then-confirm: answer one relink confirm token — "is `manifest_ref_text`
+    /// still exactly what `ref_name` names here?" — for a receiver that has already made its own `+1`
+    /// durable and may promote only on `Yes`. Everything content-addressed is behind
+    /// `IContentAddressedExchange`; what has to live here is what only the storage can see: which of this
+    /// table's disks is entitled to answer (`ownsNamespace` under a matching pool UUID, exactly one match
+    /// or `Unknown`), and gate 0, the part-anchored filter over this table's parts set. Never throws, and
+    /// `No` is not knowledge — see `CasConfirmAnswer`.
+    CasConfirmAnswer resolveContentAddressedConfirm(
+        const String & pool_uuid,
+        const String & server_root_id,
+        const String & root_namespace,
+        const String & ref_name,
+        const String & part_name,
+        const String & manifest_ref_text) const;
+
     MergeTreeData::DataPartPtr findPart(const String & name);
 
     MergeTreeData::DataPart::Checksums sendPartFromDisk(

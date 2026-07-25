@@ -167,6 +167,65 @@ std::string Service::getId(const std::string & node_id) const
     return getEndpointId(node_id);
 }
 
+CasConfirmAnswer Service::resolveContentAddressedConfirm(
+    const String & pool_uuid,
+    const String & server_root_id,
+    const String & root_namespace,
+    const String & ref_name,
+    const String & part_name,
+    const String & manifest_ref_text) const
+{
+    /// CAS fetch-by-relink, publish-then-confirm (spec §confirm-primitive). The receiver's own `+1` is
+    /// already durable when this runs; a `Yes` is what authorizes it to promote a part whose blobs are
+    /// protected only by THIS server's committed binding of that exact manifest. Every field below comes
+    /// from a remote peer, so nothing here is trusted beyond being used as a lookup key.
+    if (pool_uuid.empty() || server_root_id.empty() || root_namespace.empty() || ref_name.empty() || part_name.empty())
+        return CasConfirmAnswer::Unknown;
+
+    /// Routing. A pool UUID identifies the shared pool, not the mount: every server root writing into it
+    /// reports the same one, so the namespace's owner decides which instance may answer. EXACTLY one
+    /// match is required — zero means this table has no such disk, several mean the question is
+    /// ambiguous, and both are `Unknown` rather than a guess.
+    const IContentAddressedExchange * matched = nullptr;
+    DiskPtr matched_disk;
+    for (const auto & disk : data.getDisks())
+    {
+        const auto * ca_meta = tryGetContentAddressedExchange(disk);
+        if (!ca_meta || ca_meta->getPoolUUID() != pool_uuid || !ca_meta->ownsNamespace(server_root_id, root_namespace))
+            continue;
+        if (matched)
+            return CasConfirmAnswer::Unknown;
+        matched = ca_meta;
+        matched_disk = disk;
+    }
+    if (!matched)
+        return CasConfirmAnswer::Unknown;
+
+    /// Gate 0 — the part-anchored fast filter. It is an AVAILABILITY filter and never a proof (spec
+    /// §confirm-primitive, demoted in rev.5): `rollbackDeletingParts` puts a part back to `Outdated`
+    /// after a failed filesystem removal, and the in-memory part path is deliberately not updated by a
+    /// `delete_tmp_*` rename, so an `Active`/`Outdated` part object authorizes nothing. What it buys is
+    /// a cheap `No` that costs no ledger work; every `Yes` is earned by gate 1 alone.
+    ///
+    /// `Deleting` is excluded by the state filter, an unknown name yields no part at all, and a part of
+    /// this name living on ANOTHER disk is rejected explicitly — `MOVE ... TO DISK` leaves a same-name
+    /// `Active` part behind on the destination disk, and only the instance the token routed to may be
+    /// the one the confirm is about. The parts set is read under its own lock, which
+    /// `getPartIfExists` takes and releases, and the part reference is dropped before any ledger lock.
+    {
+        const auto part_info = MergeTreePartInfo::tryParsePartName(part_name, data.format_version);
+        if (!part_info)
+            return CasConfirmAnswer::Unknown;
+        const auto part = data.getPartIfExists(
+            *part_info, {MergeTreeDataPartState::Active, MergeTreeDataPartState::Outdated});
+        if (!part || part->getDataPartStorage().getDiskName() != matched_disk->getName())
+            return CasConfirmAnswer::No;
+    }
+
+    /// Gate 1 — authoritative, and the only source of a `Yes`.
+    return matched->confirmExactRef(root_namespace, ref_name, manifest_ref_text);
+}
+
 void Service::processQuery(const HTMLForm & params, ReadBufferPtr body, WriteBuffer & out, HTTPServerResponse & response)
 {
     // nothing to read from body
