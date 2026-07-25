@@ -664,3 +664,15 @@ matter how many generic allocation failures occurred, and to wire in today's two
   enum member defaults to WEDGING, never to skipping.
   Also closing a stale item from earlier in this log: the "deferred full gate for the #37 diagnostic change"
   is satisfied — that change has been in every build since, and the battery has run green at 1335 and 1348.
+- 17:35 UTC — watchdog: idle, tree clean, disk 330G, load 0.5. Task 18 committed (`252ccbdf2d4`) plus a
+  follow-up I chose to close rather than defer (`99684c66655`): the fix removed the wedge, and with it the
+  only signal those refusals ever happened, so `CasRefAppendPreAttemptRefused` now counts them separately —
+  same signal-degrades-to-silence shape that came up three times today from the other direction.
+  Dispatched **Task 19 as a DESIGN ANALYSIS ONLY, no code**: the plan itself says the design question must
+  be settled first, and it is a genuine product-contract choice (should a tool read a live CA pool without
+  claiming the mount, should the claim refusal become typed so callers downgrade themselves, or is it a CI
+  carve-out). The agent must ground it in what the mount claim actually protects, with file:line evidence,
+  and must enumerate what a NON-CLAIMING reader can observe while GC mutates concurrently — classifying
+  each as a WRONG answer or merely an INCONCLUSIVE one. That distinction is the crux and is exactly today's
+  recurring theme: a read-only mode that silently reports wrong findings would be worse than a tool that
+  refuses to run. Output is a spec for the user to approve, not an implementation.
