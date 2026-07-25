@@ -886,3 +886,75 @@ Path anatomy + hazard inventory (from code reading, 2026-07-24):
   (complexity without the win).
 - Expected effect calibration: even a perfect stage 2 does not reach 1.0× — ~12% of wall is the vetoed
   `HEAD`-before-`PUT` dedup cost; realistic target ~1.2×.
+
+## GC throughput collapse under a mass-DROP burst — RCA landed, three separable defects (2026-07-25) {#gc-throughput-collapse-2026-07-25}
+
+Source: independent RCA by codex gpt-5.6 over the CA-s3 stateless lane log
+(`tmp/gc-collapse-rca/`, prompt was facts-only after two of my own hypotheses were wrong and retracted).
+Every load-bearing claim below was re-verified against the source by the controller.
+
+**Observation.** On the CA-s3 lane (one server, CA is the default MergeTree disk, so every stateless
+test drops tables into one shared pool) GC round wall time went `~20s → 72 → 98 → 195 → 532 → 1716s`
+over rounds 27..32 while candidates went `188 → 20,046`. Round 33 was still in its pre-CAS path 39.5
+minutes in when the capture ended. NOT a deadlock, NOT lease theft, NOT a lost `gc/state` CAS
+(`grep -c "gc/state moved during the round"` = 0).
+
+**Mechanism: a queue-stability crossing.** Rounds are serialized under `gc_round_mutex`, a round drains
+ALL available work (no regular-round budget on ref-log, manifest-edge, candidate or owner-delete
+counts), and dropped-namespace logs are protected from ref cleanup until a LATER completed round
+observes physical emptiness. So DROP arrivals between completions (measured `97, 270, 250, 525, 1297,
+4142`) feed the next round, and a longer round accumulates a bigger next batch. Once arrivals exceed
+one serialized round's service rate the loop diverges. Self-inflicted, not external.
+
+**Defect 1 (verified, cheap): the "bounded" meta pool has zero queue depth, so it back-pressures the
+fold thread.** `Gc::Gc` builds `meta_pool` with the 4-arg `ThreadPool` ctor
+(`CasGc.cpp:194`), which sets `queue_size = max_free_threads = max_threads = gc_meta_pool_size` (16)
+— see `ThreadPool.cpp:161`. `scheduleMetaJob` uses `scheduleOrThrowOnError` (`CasGc.cpp:226`), i.e.
+`wait_microseconds = nullopt`, i.e. `job_finished.wait(lock, pred)` — an UNBOUNDED block
+(`ThreadPool.cpp:342`). So this is not an async fan-out: from the 17th in-flight condemn-marker write
+onward the folding thread blocks on S3 latency in lockstep, and the fold's own LIST/GET work cannot
+overlap with the condemn PUTs. Under the lane's saturated endpoint (50% of LISTs hit `Poco Timeout`
+on attempt 1) 20k candidates at multi-second effective latency is tens of minutes — consistent with
+round 33.
+  - Bounding the round below is `meta_pool->wait()` before the single CAS (`CasGc.cpp:609`), so a
+    deeper queue does NOT change the `candidates / pool_size × RTT` floor; it only buys overlap.
+    Worth doing (a queue of, say, `4 × pool_size` keeps back-pressure and costs ~200 B per queued
+    closure) but it is an amplifier fix, not the cure. MEASURE first — the endpoint was already
+    saturated, so raising concurrency blindly can make it worse.
+  - Note for S43: `CannotAllocateThreadFaultInjector::injectFault()` sits inside this exact
+    `scheduleImpl`, and the CA fallback is "run the meta op inline" — correct, but it converts a
+    thread-allocation failure into a further round slowdown. That is the behaviour S43 should assert.
+
+**Defect 2 (verified, needs protocol work): completed namespaces keep permanent tombstones under the
+globally-enumerated ref prefix.** Ref cleanup never deletes the `_cleanup` marker or the newest
+constant-size `Removed` snapshot. Correct by design, but it makes the cost of every future fold grow
+LINEARLY in the number of historically-unique namespaces, forever, with no self-limit under a workload
+that keeps minting new ones (a CI lane; in production, every dropped table). The fix is to separate
+completed-namespace tombstones from the prefix the fold enumerates — real protocol state and
+migration, so: spec first, do NOT hack.
+
+**Defect 3 (upstream, do not patch unilaterally): `system.remote_data_paths` has no `disk_name`
+pushdown** (`StorageSystemRemoteDataPaths.cpp:153`, the TODO is already there), so
+`04286_content_addressed_remote_data_paths` recursively LISTed the whole CA pool: 872 LISTs, 436
+timing out on attempt 1. The server spent 1181.9 s and then returned `ABORTED` because the client had
+already disconnected at the 600 s harness limit. This AMPLIFIED round 33 but did not start the
+collapse — round 32 already took 28.6 min before that query began. Falls under the
+upstream-consult-first rule.
+
+**The `deleted` plateau (~700-744 while candidates hit 20,046) is a DIFFERENT mechanism, not a budget.**
+`report.deleted` counts outcome-log entries of the delete pass (`CasGc.cpp:592`), and only
+prior-pass `delete_pending` entries enter `merge.redelete` (`CasBlobInDegree.cpp:412`). So the pipeline
+is condemn at round R → graduate at R+1 → delete at R+2, and each cohort lands two rounds later:
+188→151, 571→535, 794→723, 1006→769. Round 32's 20,046 fresh candidates COULD NOT have contributed to
+round 32's `deleted`. The 100-key `manifest_sweep_delete_budget_keys` applies only to the separate
+orphan-manifest sweep and never populates this field. Same DROP burst drives both symptoms; the
+plateau does not explain the long rounds.
+
+**Cheapest thing that actually breaks the loop, in evidence order:** stop making CA-S3 the default disk
+for the entire stateless lane (or throttle that lane's concurrency) — costs CA coverage breadth. The
+robust fix is resumable/bounded regular rounds with durable progress plus defect 2's prefix split; a
+NAIVE fold budget is unsafe, because an omitted `+1` edge must suppress deletion, not permit it.
+
+**Measurement we do not have and need before choosing a production fix:** per-round wall-time split
+across global ref LIST / ref-log+manifest GETs / candidate HEADs / meta-pool scheduling wait / blob+
+manifest deletes / namespace+ref cleanup. Without it any knob choice is a guess.
