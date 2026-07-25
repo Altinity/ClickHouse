@@ -1083,6 +1083,12 @@ part discovery). One decision should serve all of them.
 - `.../Pool/CasServerRoot.cpp` (`claimOwnerOrThrow` refusal typing, for (b))
 - the CI scrape invocation, wherever it builds its `clickhouse-local` config
 
+**Prior attempt that did NOT fix it (know this before starting):** `ee15c8ade23` ("open CA disks
+read-only for the post-run scrape") is already in the SHA that still failed on 2026-07-24, with
+`clickhouse-local` claiming `stateless-ca-s3` under `server_uuid=0000…`. So "make the scrape
+read-only" has been tried at the call site and was not sufficient — find out why before repeating it;
+that is evidence for contract (a) or (b) over (c).
+
 - [ ] **Step 1: Reproduce locally** — start the soak stand, then run the same `clickhouse-local`
   scrape against its data dir and capture the exact failure. Without a local repro this task is
   guesswork.

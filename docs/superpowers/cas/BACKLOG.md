@@ -209,6 +209,29 @@ is a product question for the guard's author, not a test tweak to guess at.
 Why it survived its own landing commit: the narrow `Cas*:CA*` gate filter EXCLUDES `RefWriter*` (the
 2026-07-17 gate-filter gap). Use the comprehensive filter.
 
+## [04286 timeout] `system.remote_data_paths` walks EVERY disk — 600s timeout on the CA-s3 lane {#remote-data-paths-no-pushdown}
+
+Root-caused 2026-07-24 from the PR-2073 CI logs. `04286_content_addressed_remote_data_paths` timed
+out at 600s; the server finished the query only at 1181s. NOT a CAS regression and NOT the
+mount-lease path (zero `mountWritable`/`claimOwner`/fence lines in the window — the fence-not-rescue
+round is exonerated). The test is unchanged since `84d93c2f817` (2026-06-29) and PASSES on the
+CA-local lane in the same run.
+
+Cause is generic ClickHouse, not CAS: `StorageSystemRemoteDataPaths` walks every disk on the server
+because `WHERE disk_name = …` is not pushed down — the TODO is still in the source
+(`src/Storages/System/StorageSystemRemoteDataPaths.cpp:153`, "void applyFilters(...) can be
+implemented to filter out disk names"). On this lane that walk covered two PUBLIC-INTERNET web disks
+(168 probes, ~19s) and then a recursive paginated LIST of the shared CA-s3 pool's ref namespace for
+all ~11k parallel tests: 872 LIST requests at ~1.3s each, of which 436 (50%) timed out on the first
+attempt and succeeded on retry. No wedged lane, no stuck GC round, no lease failure.
+
+So it is scale/latency dependent and will RECUR non-deterministically on the CA-s3 lane whenever the
+shared pool is large. FIX (highest value): implement the `applyFilters` disk-name pushdown, which
+makes this test cheap and removes a general foot-gun for anyone querying `system.remote_data_paths` on
+a server with slow/remote disks. **That file is generic upstream code, so per the standing rule it
+needs consultation before editing** — flagged rather than patched. Without the pushdown, the test
+cannot be made safe on a lane whose default disk is a shared CA-s3 pool.
+
 ## 14. Local / emulated backend {#local-backend}
 
 Collected 2026-07-23 (user direction): every "local backend" story lives HERE, so the class is visible
