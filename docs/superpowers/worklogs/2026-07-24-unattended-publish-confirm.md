@@ -522,3 +522,11 @@ The fsck note calls the state "expected", which is only true if a later fold cle
 did not. So the note is at best misleading and at worst hiding a leak.
 
 The stand is being LEFT UP — it is a live reproduction, and tearing it down destroys the evidence.
+- 13:18 UTC — watchdog: IDLE. No soak, no build, no codex task of this round running. The two long-lived
+  `codex`/`codex-code-mode-host` processes (etimes ~5d and ~4.3d, 71/76 MB RSS) predate this round and are
+  environment daemons, not work of mine — left alone. Disk 327G, 62G available RAM, load 0.8.
+  The ca-soak stand is deliberately still UP as the live reproduction for the retention leak
+  (BACKLOG {#unmatched-minus-one-retention-leak}); do not tear it down without capturing more.
+  Round status: soak DONE (green), F6 root-caused. NOT started: task 17 (S42), plan Part B (tasks 9-16),
+  tasks 18/19/20, and the deferred full gate for the #37 diagnostic change. Not starting any of them from
+  a watchdog turn.
