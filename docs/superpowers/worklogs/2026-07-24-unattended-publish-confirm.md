@@ -386,3 +386,13 @@ ETA ~12:33 UTC. 330G free at start.
   Disk burn MEASURED DOWN to 42 GB/h this interval (215G→201G) from 120 GB/h the previous one — the drop
   coincides with the ttl_pressure stage starting, i.e. TTL eviction now offsets part of the growth.
   pool_bytes 123 GB, still climbing but slower. 141 GB above the 60G line. gc_checkpoint starts in 8 min.
+- 10:09 UTC — watchdog: soak v3 t+1h36m, `STAGE chaos` since t+5760s, 0 failures. The gc_checkpoint fired
+  and PASSED: `dangling=0 dryrun_count=0 count=2794330 fsck reachable=2484 unreachable=41` (the 41 are the
+  known B140 M-F debris). Observed, not predicted: pool_bytes 123 GB -> 0.67 GB, disk 201G -> 325G
+  (124 GB reclaimed), throttle back to 0.0. So the resource story is closed — the throttle+TTL+GC design
+  does hold, the earlier disk worry was mine, not the system's.
+  ONE DEGRADED GATE worth recording: `WARNING [B146/B154] entry-gate fsck timed out (ca-fsck exceeded 180s
+  on ca-soak-ch1-1); proceeding to checkpoint without pool-consistent gate`. The checkpoint's own asserts
+  still ran and passed, but its entry gate did not. This is the SAME cost family as the study opened
+  today (BACKLOG {#gc-bottleneck-study-2026-07-25}): whole-pool enumeration blowing a fixed timeout as the
+  pool grows. Another argument for measuring enumeration cost as a curve rather than tuning the 180s.
