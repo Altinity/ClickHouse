@@ -977,22 +977,64 @@ Note also: the plan's command lines use `python`, which is not on PATH in this e
 **Files:**
 - Modify/create under `tests/integration/test_cas_replicated_relink/`
 
-- [ ] **Step 1: Race test** — failpoint between `precommitAdd` and the confirm; sender drops the
+- [x] **Step 1: Race test** — failpoint between `precommitAdd` and the confirm; sender drops the
   part in the window → confirm `no` → abort → retryable failure → assert the queue re-selects
   (covering-part / other replica) and that **no** byte re-request went to the original sender.
-- [ ] **Step 2: Happy path** — relink proof: `CasBlobPut == 0` on the receiver.
-- [ ] **Step 3: codex-6 regression** — stall the receiver's publish across ≥ 3 GC rounds with a
+  (`test_confirm_refuses_when_source_dropped_in_window`; the queue re-selected the covering part.)
+- [x] **Step 2: Happy path** — relink proof: `CasBlobPut == 0` on the receiver.
+  (`test_relink_happy_path_proof`. `CasBlobPut == 0` is corroboration only — see the note below.)
+- [x] **Step 3: codex-6 regression** — stall the receiver's publish across ≥ 3 GC rounds with a
   small `old_parts_lifetime`, merge the sender's part away, GC to fixpoint → the stalled attempt
   must NOT produce a committed ref; fsck clean, `dangling=0`.
-- [ ] **Step 4: Recursion brake** — force a persistent mechanism failure → exactly one relink
-  attempt then bytes, no loop.
-- [ ] **Step 5: B66b** — `FETCH PART` into `detached/` on both manual callers → relink proof +
-  `ATTACH` reads correctly; cross-pool → bytes.
-- [ ] **Step 6: RPL-5 slice** — `REPLACE PARTITION` / `ATTACH PARTITION ... FROM` on the 2-replica
+  (`test_stalled_publish_protects_source_blobs_and_commits_nothing`, with an explicit soundness guard:
+  the same blobs ARE reclaimed once the attempt is abandoned.)
+- [x] **Step 4: Recursion brake** — force a persistent mechanism failure → exactly one relink
+  attempt then bytes, no loop. (`test_recursion_brake_bounds_relink_to_one_attempt`; the assertion is
+  the COUNT of offers the sender made, which is 1.)
+- [x] **Step 5: B66b** — `FETCH PART` into `detached/` on both manual callers → relink proof +
+  `ATTACH` reads correctly; cross-pool → bytes. (Three tests. The third manual detached caller,
+  `executeClonePartFromShard`, is deliberately not covered — see the note below.)
+- [x] **Step 6: RPL-5 slice** — `REPLACE PARTITION` / `ATTACH PARTITION ... FROM` on the 2-replica
   fixture: assert the queue-cloned `REPLACE_RANGE` fetch relinks (blob-count proof).
-- [ ] **Step 7: Version mix** — confirm-capable receiver × legacy sender cookie → clean byte
-  fallback.
-- [ ] **Step 8: Run and commit**
+- [x] **Step 7: Version mix** — confirm-capable receiver × legacy sender cookie → clean byte
+  fallback. (`test_version_mix_legacy_peer_gets_bytes` covers the SENDER-side half of the gate, which
+  is the half reachable without a second binary — see the note below.)
+- [x] **Step 8: Run and commit**
+
+**Corrections to this task's own text, found while executing it:**
+- "the existing relink proof is `count_blobs()` staying flat across a fetch … reuse that helper for
+  every new relink proof" is WRONG as a proof, and following it would have produced seven green and
+  worthless tests. A BYTE fetch onto a content-addressed disk writes the same content, which
+  deduplicates, so its blob-count delta is zero too. Every relink assertion instead keys on the
+  receiver's `Relink of part <p> … finished (no bytes transferred).` line, which is reachable only
+  after a confirm `yes` and a `Committed` promote; the blob counts stayed as corroboration. For the
+  same reason `CasBlobPut == 0` (step 2's stated proof) is corroboration, not proof.
+- Counting blobs by TOTAL is also wrong on this fixture: `gc_interval_sec` is 1, so unrelated debris
+  can be reclaimed mid-test and the count goes DOWN. The tests assert on the KEY SET delta instead.
+- Two tables inserting `numbers(0, N)` with the same schema produce byte-identical blobs, so the
+  second table's "new blob" delta is EMPTY. Any test reasoning about a specific part's blobs must
+  make its rows unique first; this cost one full run to discover.
+- `SYSTEM … FORMAT TSVWithNames` is a syntax error (`ASTSystemQuery` is not an `ASTQueryWithOutput`),
+  and the server container has no `clickhouse-client` — `SYSTEM CONTENT ADDRESSED FSCK` has to be run
+  as `clickhouse client --format …` inside the container.
+- Task 15's step 4 ("update the two manual detached callers to pass `allow_ca_relink=true`") needed no
+  edit at all and none was made: the parameter defaults to `true`, and `allow_ca_relink` appears
+  nowhere in `StorageReplicatedMergeTree.cpp`. The two callers are at `:8125` (`FETCH PART`) and
+  `:8273` (`FETCH PARTITION`), not `:8281`.
+- **`executeClonePartFromShard` (`:3475`) is a THIRD detached caller** and is deliberately left
+  uncovered. It reaches `relinkPartToDisk` with exactly the same arguments as the two DDL callers
+  (`to_detached=true`, default `allow_ca_relink`), and finalizes the same way
+  (`renameTo(detached/<part>)`), so it adds no new behaviour to prove; the one thing that differs is
+  its recovery on taxonomy row 3, which is queue-driven and is already exercised by step 1 on the
+  active path. Reaching it needs `part_moves_between_shards_enable` and a two-shard fixture, which
+  would buy a second copy of an already-proven path.
+- **What step 7 does NOT cover.** The receiver-side row-1 branch — a genuinely old sender that offers
+  a relink and attaches NO source token — is unreachable here: `getRelinkOffer` never yields an offer
+  without a token, so producing one needs either another failpoint or a pre-`WITH_CA_CONFIRM` binary
+  to play the sender. The test covers the sender-side half instead (a peer advertising protocol 10 is
+  served bytes, with an otherwise identical protocol-11 request as the positive control), which is the
+  half that decides whether a mixed cluster can ever see an unconfirmed relink. Covering the receiver
+  half faithfully would need a MITM interserver proxy registered as a fake replica in ZooKeeper.
 
 ```bash
 ninja -C build clickhouse > build/build_srv_t16.log 2>&1; echo NINJA_EXIT=$?

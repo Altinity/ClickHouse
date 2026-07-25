@@ -47,6 +47,15 @@ namespace CurrentMetrics
 namespace DB
 {
 
+namespace FailPoints
+{
+    /// CAS fetch-by-relink, receiver side. Both exist because the two exits they drive are properties of
+    /// the sender/receiver PAIR and of the interval between the receiver's publish and its confirm — and
+    /// neither is reachable from configuration, so an integration test cannot produce them any other way.
+    extern const char cas_relink_receiver_force_mechanism_failure[];
+    extern const char cas_relink_receiver_pause_before_confirm[];
+}
+
 namespace MergeTreeSetting
 {
     extern const MergeTreeSettingsBool allow_remote_fs_zero_copy_replication;
@@ -1394,6 +1403,19 @@ MergeTreeData::MutableDataPartPtr Fetcher::relinkPartToDisk(
         return nullptr;
     }
 
+    /// Test-only. Forces the "mechanism failed, the sender still has the part" exit (the ACTION of
+    /// taxonomy rows 2 and 5) on EVERY attempt, which is precisely the shape the recursion brake has to
+    /// bound: a persistent property of this sender/receiver pair, so the byte re-request re-offers and
+    /// re-fails unless it clears `allow_ca_relink`. It fires AFTER the token gate and BEFORE
+    /// `prepareAdoptFromManifest`, so nothing is staged and no `+1` has to be released — the failpoint
+    /// injects the exit, never a half-finished transaction.
+    fiu_do_on(FailPoints::cas_relink_receiver_force_mechanism_failure,
+    {
+        LOG_INFO(log, "Failpoint cas_relink_receiver_force_mechanism_failure: abandoning the relink of part {} "
+            "before anything is staged", part_name);
+        return nullptr;
+    });
+
     /// Stage under the tmp-fetch dir OF THE TARGET PARENT — the table dir, or `TABLE/detached` when
     /// the caller asked for a detached fetch (B66b). The parent is composed exactly as
     /// `downloadPartToDisk` composes it, so the two fetch paths put a part in the same place and the
@@ -1440,6 +1462,14 @@ MergeTreeData::MutableDataPartPtr Fetcher::relinkPartToDisk(
         if (prepared)
             prepared->abort();
     });
+
+    /// Test-only, and this is the ONE seam worth injecting on the whole path: it opens the window the
+    /// protocol exists to make safe. The receiver's `+1` is durable and its release is armed, and the
+    /// source has not been asked anything yet, so a test that holds the fetch here can do to the source
+    /// exactly what codex-6 described — merge the part away, run GC to fixpoint — and then observe both
+    /// halves of the contract: the source's blobs survive the round (this receiver's binding protects
+    /// them) and the confirm that follows refuses to authorize a promote (the binding it named is gone).
+    FailPointInjection::pauseFailPoint(FailPoints::cas_relink_receiver_pause_before_confirm);
 
     /// T2 — CONFIRM. One read-only interserver question, aimed at the endpoint copied out of the fetch
     /// URI so it reaches exactly the table and replica that made the offer. Only the literal
