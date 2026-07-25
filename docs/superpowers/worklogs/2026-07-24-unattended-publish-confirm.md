@@ -744,3 +744,13 @@ fixed.
   exists: to make the durable-but-unpromoted state a first-class owned thing, with `abort` proven to append
   the precommit REMOVAL through the ledger's precommit view rather than assumed — an abandoned precommit
   leaving its `+1` behind is exactly the leak class root-caused today.
+- 18:49 UTC — watchdog: Task 12 agent in its write-up phase, nothing stuck. It has written
+  `Parts/PartFolderAccess.{h,cpp}` plus `Pool/CasPool.{h,cpp}` and `Pool/CasRefLedger.{h,cpp}`; its battery
+  run reports **1361/1361 over 228 suites** (1356 at `41fa94de18b`, so +5 new tests, no regressions).
+  TO ASK WHEN IT REPORTS: `CasPool` and `CasRefLedger` are OUTSIDE the plan's stated file list for Task 12
+  (which named PartFolderAccess, ContentAddressedExchange and ContentAddressedMetadataStorage). A Pool
+  forward is plausible, a ledger change less so — do not accept it without the reason.
+  Disk 331G, 64G RAM, load 0.7.
+  User decisions still open: Q2 (tool read-without-ownership contract), Q3 (when `ca-fsck` turns fatal on
+  `stale_edge`), Q4 (S42's missing targeted signal), Q5 (GC bottleneck study scope). Q1 answered: option C,
+  detect the EFFECT rather than the unconfirmed LIST hypothesis (BACKLOG {#list-as-journal-decision-c}).
