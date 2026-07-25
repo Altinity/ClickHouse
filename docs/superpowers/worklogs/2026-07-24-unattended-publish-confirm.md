@@ -817,3 +817,8 @@ fixed.
   window), plus a line-continuation backslash. Nothing else in that file.
   No build or test process running yet; `tests/integration/test_log.txt` appeared untracked and is run
   debris — not to be committed. Disk 332G, load 0.7. Nothing to unstick.
+- 21:49 UTC — watchdog: Task 16 healthy and mid-gate. Build finished 23:37 local, the CA battery is running
+  now (82 s in). Written so far: the two failpoint registrations, `DataPartsExchange.cpp`,
+  `test_cas_replicated_relink/test.py`, plus a new untracked
+  `configs/storage_conf_other_pool.xml` — a second pool fixture, which is what the version-mix and
+  cross-pool cases need. Disk 332G, 62G RAM, load 1.3. Nothing to unstick.
