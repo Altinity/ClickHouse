@@ -866,3 +866,17 @@ fixed.
   `resolveRef` serves reads from, so it inherits the mount's trust rather than creating a new assumption —
   the reviewer stated a true fact and attributed it to the wrong component, and I accepted that without
   checking the boundary. That also withdraws my own argument for moving the journal chain ahead of the soak.
+- 23:29 UTC — watchdog: review fixes committed (`8e6fe6ef0af`, gate 1373/1373, integration 11/11) and the
+  findings closed with two REVIEWER errors recorded (`93eda876ddd`) — the prescribed removal is not
+  idempotent and would have turned a leak into a permanent wedge, and major 3's mechanism was not as
+  described. I had forwarded the first prescription verbatim, so that one is mine to own.
+  Dispatched the follow-ups that need no further decision, split so they cannot collide: **tasks 1-4**
+  (the detector: mirror safety test, probe A, probe B1, probe B2) in `src/`, and **task 9** (S42's verdict)
+  in `utils/ca-soak/`. Tasks 5-8 (per-phase GC rows) wait for the detector, since task 7 carries the
+  detector's numbers onto the fold rows. Tasks 10-12 (force-claim) stay BLOCKED on the user's choice of
+  reading, and their CI motivation already evaporated.
+  Two things I put to the detector agent explicitly: probe A's comparison must sit BEFORE any cursor
+  commit, because suppressing deletion while still advancing the cursor leaves the permanent half of the
+  damage; and Task 1's mirror test must not be left red in the battery — this project has no known reds,
+  so it either passes or is pinned as an explicit expected-failure naming its un-skip condition.
+  Disk 332G, load 0.4.
