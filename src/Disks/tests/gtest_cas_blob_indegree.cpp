@@ -826,3 +826,33 @@ TEST(CasBlobInDegree, TwoAlgoFoldSettlesBothInOneShardRun)
     EXPECT_EQ(DB::Cas::tests::inDegreeInRuns(backend, runs2, ch_x), 0);
     EXPECT_EQ(DB::Cas::tests::inDegreeInRuns(backend, runs2, sha_y_ref), 0);
 }
+
+/// [UNMATCHED-MINUS-ONE] pin. In-degree is a SET of source edges applied last-wins per
+/// (ref, ManifestId, path) key -- NOT a counter. A removal delta whose matching activation was
+/// never folded (reachable today via a false-404 at the activation fold plus a dead-build skip)
+/// must therefore be a per-key NO-OP: it marks an already-absent edge absent and cannot strip a
+/// sibling manifest's edge for the SAME blob. The whole "that interleaving is harmless" argument in
+/// the publish-confirm design rests on this; if the model ever regresses to counter arithmetic this
+/// test goes red and premature deletion becomes reachable again.
+TEST(CasBlobInDegree, UnmatchedRemovalIsAPerKeyNoOpAndSparesSiblingEdges)
+{
+    InMemoryBackend backend;
+    Layout layout{"pool"};
+
+    /// Generation 1: blob b1 is referenced by TWO distinct sources (two manifests).
+    std::vector<RunRef> runs1;
+    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, /*new_generation*/1, /*attempt*/0, /*shard*/0,
+        {{bh(1), s(1), false}, {bh(1), s(2), false}}, runs1);
+
+    /// Generation 2: fold a removal for a THIRD source that never had an activation folded.
+    std::vector<RunRef> runs2;
+    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/runs1, /*new_generation*/2, /*attempt*/0, /*shard*/0,
+        {{bh(1), s(99), true}}, runs2);
+
+    /// Both original edges survive: the unmatched removal touched only its own (absent) key.
+    const DecodedRun out = decodeRun(backend, runs2[0]);
+    ASSERT_EQ(out.edges.size(), 2u) << "an unmatched removal must not strip sibling edges";
+    /// And the blob is NOT a deletion candidate.
+    const auto zero = zeroInDegree(backend, runs2);
+    EXPECT_TRUE(zero.empty()) << "b1 still has two live source edges";
+}
