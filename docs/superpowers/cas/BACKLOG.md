@@ -1386,3 +1386,54 @@ applied is unambiguous; a gap with no object is not.
 COMMITMENT attached to this choice, stated by the controller and accepted implicitly by choosing C: the
 real fix (the authoritative per-namespace chain and the complete-cut gate) lands BEFORE release. C makes
 the defect visible; it does not prevent it.
+
+## USER DECISIONS 2026-07-25 on the four open questions {#user-decisions-2026-07-25}
+
+### Q2 — the tool-vs-live-pool problem: the FRAMING was wrong, not just the answer {#q2-force-claim}
+
+Both my question and the design note
+(`specs/2026-07-25-cas-tool-read-without-ownership-design.md`) treated this as "may a tool read without
+claiming the mount". **It is not that.** The user: the problem is the differing SERVER UUID, not
+`mountWritable`. What is needed is the ability to say at mount time *"never mind that the server uuid
+differs — force a new one"* and mount as WRITE. A genuine read-only mount is a SEPARATE, not-yet-implemented
+task, not the answer to this one.
+
+So the design note is superseded as a recommendation. Its VERIFIED facts stand and stay useful — in
+particular that a claim against an owner-absent empty root SUCCEEDS and would lock the real server out
+(`CasServerRoot.cpp:142` then `:120-131`), and that the earlier CI carve-out never actually ran because its
+`sed` patches `config.xml` while the CA disk is declared in `config.d`.
+
+ONE FACTUAL CONCERN to settle before implementing, raised once and then dropped: the plan text describes
+the scrape as running against the data directory of a LIVE server. Force-claiming there does not merely
+bypass a nuisance check — it takes ownership from a running server, which is the failure the refusal
+exists to prevent. If the scrape actually runs post-mortem (server already stopped), force is exactly
+right and this concern is void. Worth one look at the CI step before coding, not a redesign.
+
+### Q3 — `ca-fsck` stays NON-fatal on `stale_edge` for now {#q3-stale-edge-nonfatal}
+
+As implemented. No change. (The controller's suggestion to bind the flip to the leak fix was not adopted;
+leave it simply non-fatal.)
+
+### Q4 — what "green" means for S42 {#q4-s42-green}
+
+Green is **a consistent state on disk and in memory**, NOT "we proved a fault landed in the post-durable
+install window". This overrides the card's current soundness guard, which returns `inconclusive` whenever
+the targeted poison/failpoint signal is zero — a signal that is zero by construction today, since the
+install-region seam is gtest-only.
+
+Consequence for the card: the verdict rests on the consistency assertions (post-restart view identical to
+pre-restart, journal-rebuilt view containing every acked block, replicas agreeing, fsck clean). The
+targeted counters stay REPORTED, not gating. Keep an anti-vacuity guard on the GENERIC fault count so a run
+in which no allocation fault occurred at all still cannot read as green — that part of the discipline
+survives; it is only the window-specific targeting that is dropped.
+
+### Q5 — option (c): introspection now, study later {#q5-gc-introspection-now}
+
+Do the introspection NOW. Shape specified by the user: **each GC phase emits its own ROW in
+`system.content_addressed_garbage_collection_log`**, carrying all the metrics that matter for that phase —
+not extra columns on the single per-round row.
+
+Then, AFTER Part B and its soak: study the collected metrics, look for anomalies, and only then decide what
+further investigation is warranted. The reproduction rig from
+{#gc-bottleneck-study-2026-07-25} is therefore NOT built yet — real metrics from real runs come first and
+may well retarget it.
