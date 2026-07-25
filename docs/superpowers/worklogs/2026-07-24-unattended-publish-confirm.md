@@ -455,3 +455,6 @@ reclaim-impossibility that the writer protocol says no longer exists. Not editin
   failed, node likely down): ConnectionResetError` — that is a tick landing inside a fault window, which
   the ticker is built to survive (and B204's fail-closed throttle covers the unmeasurable-pool case), not
   a stall. 43 min left.
+- 12:09 UTC — watchdog: soak v3 t+3h36m, now in STAGE cliff (t+12241s), 0 failures, 35 faults,
+  21 checkpoints OK, `unreachable` still 56, disk 327G, log fresh (a `pool drain probe` just started,
+  pool_bytes down to 3.8 MB). 23 min left; `converge` at t+12960s. No action.
