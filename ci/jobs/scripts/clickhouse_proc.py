@@ -1296,15 +1296,15 @@ fi
         # dump needs. Keyed on the CAS marker tag, not the disk name, so it covers every
         # content-addressed disk regardless of how it's named in this job's config.
         #
-        # The marker lives in `config.d/`, NOT in `config.xml` -- the CA storage policy is symlinked in
-        # as `config.d/content_addressed*_storage_policy_for_merge_tree_by_default.xml` (see
-        # `tests/config/install.sh`). The original version of this line targeted `config.xml` alone, where
-        # the tag does not exist, so `sed` matched nothing, `<readonly>` was never inserted, and the
-        # scrape kept failing on ownership -- the remedy was written but never applied. Patch both paths:
-        # `config.xml` costs nothing and keeps working if a job ever inlines the disk there.
+        # FIND the files by the marker instead of naming them. The original version of this line patched
+        # `config.xml`, where the tag does not live -- the CA storage policy is symlinked into `config.d/`
+        # by `tests/config/install.sh` -- so `sed` matched nothing, `<readonly>` was never inserted, and
+        # the scrape kept failing on ownership while looking handled. Naming `config.d` instead would fix
+        # today and break again the next time the layout moves, so the path is not named at all.
+        # `xargs -r` makes this a clean no-op on a job with no content-addressed disk.
         Shell.check(
-            "sed -i 's|<metadata_type>content_addressed</metadata_type>|<metadata_type>content_addressed</metadata_type><readonly>true</readonly>|g' "
-            "/etc/clickhouse-server/config.xml /etc/clickhouse-server/config.d/*.xml"
+            "grep -rl '<metadata_type>content_addressed</metadata_type>' /etc/clickhouse-server/ 2>/dev/null "
+            "| xargs -r sed -i 's|<metadata_type>content_addressed</metadata_type>|<metadata_type>content_addressed</metadata_type><readonly>true</readonly>|g'"
         )
         # Fail LOUDLY rather than silently, if the substitution ever stops matching again: a CA disk that
         # is declared but not marked read-only means this scrape is about to die on ownership, and a
