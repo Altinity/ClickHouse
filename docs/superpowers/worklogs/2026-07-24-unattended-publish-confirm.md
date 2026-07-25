@@ -779,3 +779,15 @@ fixed.
   file showed up in a status listing I actually read instead of skimming. Reverted; noted as a recurring
   hazard of `.claude/tools/cppexpr.sh` — check `src/CMakeLists.txt` before any commit that follows a
   cppexpr run.
+- 20:29 UTC — watchdog: idle, tree clean, disk 331G, load 0.7. Task 14 committed (`260a6f81169`) — the v11
+  protocol is now coherent on both sides, verified by hand, and `test_cas_replicated_relink` passed on real
+  RustFS with the node logs proving relink actually fired.
+  Dispatched **Task 15** (B66b) with a boundary STRICTER than the plan: its Step 4 edits
+  `StorageReplicatedMergeTree.cpp`, which is outside the user's authorization. I checked before dispatching
+  rather than asking — those `fetchSelectedPart` calls are positional and stop before any new trailing
+  parameter, so a parameter defaulted to `true` needs no caller edit and Step 4 is probably unnecessary. The
+  agent is told to do the task without that file and to STOP and report if it turns out unavoidable, since
+  a user round-trip is cheap and an unauthorized upstream edit is not.
+  Also warned it that the plan's line numbers for those callers are STALE (`:8125`/`:8281` vs the real
+  `:3386`/`:3514`/`:5632`/`:5818`) and that other line refs in that plan deserve the same suspicion — and to
+  check `src/CMakeLists.txt` for the cppexpr leftover before finishing, since that bit us once today.
