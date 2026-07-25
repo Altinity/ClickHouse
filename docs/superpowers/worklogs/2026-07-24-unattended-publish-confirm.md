@@ -539,3 +539,6 @@ The stand is being LEFT UP — it is a live reproduction, and tearing it down de
   and needs a targeted reproduction; the ref logs involved are already reclaimed.
   Still not started, and not startable from a watchdog turn: task 17 (S42), plan Part B (9-16), tasks
   18/19/20, the deferred #37 gate, and the cheap unmatched-remove counter.
+- 13:49 UTC — watchdog: codex RCA on the retention leak RUNNING (gpt-5.6-sol, xhigh, read-only) — 532s in,
+  2.1 MB of log, mtime 3 min old and growing (currently reading CAS sources). Prompt+artifacts in
+  `tmp/leak-rca/`. Nothing else live; stand still up as the reproduction. Disk 326G, 62G RAM, load 1.0.
