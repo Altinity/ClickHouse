@@ -275,6 +275,110 @@ bool CasRefLedger::hasAnyRefWithPrefix(const RootNamespace & ns, std::string_vie
 }
 
 
+ConfirmAnswer CasRefLedger::confirmExactRef(const RootNamespace & ns, const String & ref_name,
+                                           const ManifestRef & manifest_ref) const
+{
+    /// Gate 1 of the relink confirm (spec §confirm-primitive). A `Yes` authorizes a REMOTE receiver to
+    /// promote a manifest whose blobs are protected only by this writer's committed binding of that
+    /// exact manifest, so a `Yes` is an assertion about the durable table, not about this cache. Every
+    /// rule below exists to make that assertion true; the answer to anything a rule cannot establish is
+    /// `Unknown`, which costs the receiver a retry and costs correctness nothing.
+    ///
+    /// Two structural properties, both load-bearing:
+    ///
+    ///   ZERO object-store I/O. This runs on an interserver request, so anything it could be made to
+    ///   do is something a remote peer can make this writer do. It therefore reads only what is already
+    ///   resident, never recovers, never resolves a wedge, and -- see the `find` below -- never even
+    ///   materializes a runtime. Deliberately absent for the same reason: `ensureRefTableRecovered`,
+    ///   `sweepStalePrecommitsForRead` and `maybeScheduleSnapshotPublish`, the three maintenance calls
+    ///   `resolveRef` performs and all three of which can do I/O.
+    ///
+    ///   ONE snapshot across BOTH lane mutexes. `pending`/`leader_active` live under
+    ///   `ref_queue_mutex`, the rows and the wedge under `state_mutex`, and the whole point of the
+    ///   rules is their CONJUNCTION -- read at different instants they would prove nothing. The lock
+    ///   ORDER is the one the rest of this file already establishes (`enforceRefTableCacheBudget`
+    ///   nests `state_mutex` under `ref_queue_mutex`, and nothing anywhere takes them the other way
+    ///   round). Because admission (`appendRefOps`' `pending.push_back`) happens under
+    ///   `ref_queue_mutex`, an append is either entirely before this snapshot -- and then visible as a
+    ///   pending item -- or entirely after it. There is no interleaving in which a removal is admitted
+    ///   and this function still answers `Yes`.
+    ///
+    /// What a `Yes` does NOT prove, stated so nobody has to rediscover it: that this runtime's
+    /// recovered view is a COMPLETE replay of the durable log. Completeness is recovery's contract, not
+    /// this function's, and it cannot be re-established here without I/O. Rules 2-4 exclude every way
+    /// this MOUNT can have fallen behind its own durable writes; a recovery that silently observed less
+    /// than it should have is a different defect, in a different component.
+    std::lock_guard<std::mutex> qlock(ref_queue_mutex);
+
+    /// Rule 2 (residency). `find`, NOT `getRefTableRuntime`: the latter INSERTS an empty, unrecovered
+    /// runtime for any namespace named, so a read-only query would let a peer grow this writer's table
+    /// cache -- and the very next reader would then pay a recovery this query invented. A cold or
+    /// evicted table is simply unknown here.
+    const auto it = ref_tables.find(ns.string());
+    if (it == ref_tables.end())
+        return ConfirmAnswer::Unknown;
+    RefTableRuntime & rt = *it->second;
+
+    /// `try_to_lock`, not a blocking acquire: `ensureRefTableRecovered` holds `state_mutex` across its
+    /// whole LIST + replay, so blocking here would make a confirm WAIT on someone else's recovery --
+    /// up to the full retry envelope -- while holding `ref_queue_mutex`, which is pool-wide append
+    /// admission. That is the zero-I/O contract broken by proxy: the query would not issue a request,
+    /// it would merely be paid for by one, and it would stall every table's lane meanwhile. Failing to
+    /// take the lock is just one more ambiguity, so it answers like every other one. (Same technique,
+    /// and same non-blocking rationale, as `enforceRefTableCacheBudget`'s candidate loop.)
+    std::unique_lock<std::mutex> slock(rt.state_mutex, std::try_to_lock);
+    if (!slock.owns_lock())
+        return ConfirmAnswer::Unknown;
+
+    /// Rule 2 (warm). An unrecovered or mid-recovery runtime has an EMPTY `state`, which would read as
+    /// "the ref does not exist" -- knowledge it does not have. `superseded_by_remount` is the same
+    /// class: this runtime was detached by a self-remount and its view belongs to a dead incarnation.
+    /// Recovery publishes atomically (`installRecoveryResult` sets `recovered` LAST under this mutex),
+    /// so there is no half-recovered view to catch in between.
+    if (!rt.recovered || rt.recovery_in_progress || rt.superseded_by_remount.load(std::memory_order_acquire))
+        return ConfirmAnswer::Unknown;
+
+    /// Rule 3 (lane quiescent). A wedge is "an object that may be durable and is not applied" -- it may
+    /// BE the removal being asked about. A pending item or an active leader tenure is a mutation this
+    /// table has already admitted; mid-tenure, a chunked flush has committed some of its transactions
+    /// and not others, and `leader_active` spans the whole tenure, so that partially-durable window is
+    /// covered too. None of the three says anything about WHICH ref is affected, so all three are
+    /// table-scoped refusals.
+    if (rt.wedge.has_value() || !rt.pending.empty() || rt.leader_active)
+        return ConfirmAnswer::Unknown;
+
+    /// Rule 4 (poison). `Poisoned` means an install failed over a possibly-durable object, i.e. this
+    /// cached state may be MISSING a durable transaction whose contents are by definition unknown --
+    /// so no row of this table can be confirmed. `ApplyPending` is the same statement about a
+    /// transaction still in flight. This is the ONE consumer that reads the marker to make a decision;
+    /// it remains an assert layer for everything else (see `RefApplyState`).
+    if (rt.apply_state.load(std::memory_order_relaxed) != RefApplyState::Clean)
+        return ConfirmAnswer::Unknown;
+
+    /// Rule 5 (exact row equality) -- the only rule that can produce a PROOF OF THE NEGATIVE. On a
+    /// table that passed rules 2-4 the committed map is this writer's authoritative view, so a missing
+    /// row or a different `ManifestRef` is knowledge, not ambiguity. Equality is exact and total:
+    /// mint-tightening (spec §A3) guarantees a repoint or a recreation mints a fresh `ManifestRef`, so
+    /// there is no ABA to defend against here.
+    const auto & committed = rt.state.getCommitted();
+    const auto row = committed.find(ref_name);
+    if (row == committed.end() || !(row->second.manifest_ref == manifest_ref))
+        return ConfirmAnswer::No;
+
+    /// Rule 6 (mount fence), LAST and still under both locks -- the order the spec fixes. Everything
+    /// above describes what this process believes; this is the check that it is still entitled to
+    /// believe it: a fenced-out mount is no longer the namespace's single writer, so another writer may
+    /// already have repointed the ref. Being last means a token that does not match is reported as `No`
+    /// even under a lost fence: `No` and `Unknown` are the same outcome for the caller (both are
+    /// `SourceProofFailed`, spec §failure-taxonomy), and only `Yes` is gated on the fence.
+    /// `superseded_by_remount` is folded in exactly as `commitRefChunk`'s own `fence_ok` folds it: the
+    /// flag is published BEFORE the remount re-arms the fence, so a stale runtime can never pass both.
+    if (!fence_ok_fn() || rt.superseded_by_remount.load(std::memory_order_acquire))
+        return ConfirmAnswer::Unknown;
+
+    return ConfirmAnswer::Yes;
+}
+
 std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::getRefTableRuntime(const RootNamespace & ns)
 {
     std::lock_guard lock(ref_queue_mutex);

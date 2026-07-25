@@ -54,6 +54,15 @@ enum class ResolveAudit : uint8_t { Emit, Deferred };
 /// none of which should be inferred from the marker's existence.
 enum class RefApplyState : uint8_t { Clean, ApplyPending, Poisoned };
 
+/// The answer of the relink confirm's gate 1 (`CasRefLedger::confirmExactRef`).
+///
+/// `Yes` is the only answer that AUTHORIZES anything, so it is the only one that must be earned: it is
+/// returned exclusively when every rule of the lane snapshot holds. `No` is a proof of the negative --
+/// the committed binding is demonstrably not the one asked about. `Unknown` is the catch-all for every
+/// ambiguity, and it is the answer this primitive is biased towards: a cold, evicted, recovering,
+/// busy, wedged, poisoned or unfenced table answers `Unknown` rather than doing any work to find out.
+enum class ConfirmAnswer : uint8_t { Yes, No, Unknown };
+
 /// Coordinates the writer-side ref-log and ref-table protocol for all namespaces in one mounted pool.
 /// It owns the recovered whole-table cache, the flat-combining append lane and its unresolved-`PUT`
 /// wedge, snapshot publication, stale-precommit cleanup, cache-budget eviction, and remount/shutdown
@@ -106,6 +115,22 @@ public:
     /// all" and short-circuits on the first entry, so this is O(1) for that (dominant, emptiness-probe)
     /// case; a non-empty prefix still stays a no-allocation scan.
     bool hasAnyRefWithPrefix(const RootNamespace & ns, std::string_view prefix);
+
+    /// Gate 1 of the relink confirm (spec §confirm-primitive): does `ref_name` in `ns` still name
+    /// EXACTLY `manifest_ref` in this writer's committed view, read under a lane snapshot that cannot
+    /// observe a stale cache?
+    ///
+    /// Performs ZERO object-store I/O: a cold, evicted or recovering table answers `Unknown` rather
+    /// than recovering from storage, and no runtime is created as a side effect of asking. That is a
+    /// contract, not an optimization -- the confirm is a read-only interserver query that a remote
+    /// receiver drives, so it must never be able to make this writer do work.
+    ///
+    /// The rules are evaluated as ONE snapshot spanning both lane mutexes, in this order: table warm
+    /// and resident; lane quiescent; apply-state `Clean`; exact committed-row equality; mount fence
+    /// live LAST. Every ambiguity answers `Unknown` -- see `ConfirmAnswer`, and the .cpp for why the
+    /// order and the two-mutex hold are what make a `Yes` a linearization point rather than a guess.
+    ConfirmAnswer confirmExactRef(const RootNamespace & ns, const String & ref_name,
+                                  const ManifestRef & manifest_ref) const;
 
     /// Appends the transaction that removes one ref and waits for its durable result. A failed append
     /// propagates its exception and does not apply the removal to the in-memory table.
@@ -477,7 +502,9 @@ private:
     /// the raw `ref_snapshot_max_bytes`/`ref_removal_max_bytes` hard limits before calling `admits`.
     static constexpr uint64_t kRefAdmissionSafetyMargin = 4096;
 
-    std::mutex ref_queue_mutex;
+    /// `mutable` for `confirmExactRef`, the one CONST member function that needs the lane snapshot:
+    /// taking a mutex to read consistently does not make the read a mutation.
+    mutable std::mutex ref_queue_mutex;
     std::map<String, std::shared_ptr<RefTableRuntime>> ref_tables;
     /// Monotonic access stamp for whole-table cache LRU eviction, bumped on every table touch and
     /// recorded in `RefTableRuntime::last_touch_tick`.

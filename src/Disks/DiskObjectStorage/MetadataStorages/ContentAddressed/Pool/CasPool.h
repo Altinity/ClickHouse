@@ -409,6 +409,13 @@ public:
     /// `ResolveAudit`'s doc comment (`CasRefLedger.h`) for the one `Deferred` call site.
     std::optional<Resolved> resolveRef(const RootNamespace & ns, const String & ref_name, bool allow_stale = false,
                                        ResolveAudit audit = ResolveAudit::Emit);
+    /// Gate 1 of the relink confirm -- a thin forward to the ref ledger, whose declaration carries the
+    /// rules (`CasRefLedger::confirmExactRef`). Read-only and object-store-I/O-free by contract.
+    ConfirmAnswer confirmExactRef(const RootNamespace & ns, const String & ref_name,
+                                  const ManifestRef & manifest_ref) const
+    {
+        return ref_ledger.confirmExactRef(ns, ref_name, manifest_ref);
+    }
     /// Read the single immutable part manifest named by `id`. Derives the key via CasLayout::manifestKey,
     /// decodes the body, and fails CLOSED: a committed ref naming a missing body throws FILE_DOESNT_EXIST
     /// (INV-NO-DANGLE surfaced on the read path); a body whose `ref` ≠ id.ref (refMatchesBody) or whose
