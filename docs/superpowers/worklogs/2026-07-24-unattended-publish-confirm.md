@@ -429,3 +429,11 @@ sample taken now is contaminated and would answer a different question. Doing it
 
 NOTE the harness comments are stale regardless of what the 41 turn out to be: they assert a
 reclaim-impossibility that the writer protocol says no longer exists. Not editing them mid-run.
+- 10:49 UTC — watchdog: soak v3 t+2h16m, STAGE chaos, 0 failures, 13 faults fired, 8 recovery checkpoints
+  all OK, disk 326G, log fresh. Low load (0.8) is not a stall: the chaos stage spends most of its time
+  either inside a fault window or inside the recovery checkpoint that each window triggers (inserts are
+  gated by `checkpoint_active`), and metric ticks + op_ids are both still advancing. 261 transport
+  failures so far, all rerouted by the driver — the designed shape.
+  F6 STRENGTHENED: the last three recovery checkpoints report `unreachable=41 dangling=0 dryrun_count=0`
+  — the SAME 41, now surviving 13 injected faults and 8 checkpoints, with GC still nominating nothing
+  against them. So it is a stable population that GC cannot see, not chaos debris and not a transient.
