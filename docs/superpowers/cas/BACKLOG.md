@@ -2178,3 +2178,40 @@ So one of these is true, and the next step is to find out which:
 RustFS faults and S3 request errors during the soak. If every firing sits inside a fault window, candidate
 2 is the answer and the store is innocent under normal operation — which changes the blocker's urgency
 without changing its validity, since a GC that trusts LIST completeness is still wrong.
+
+### The holes are NOT page-shaped — which rules out the model everyone would reach for {#probe-a-hole-shape}
+
+Decoded the ids and namespaces out of one firing (ch1, 06:06:09, 13 holes):
+
+```
+11 holes  span 0x1f171..0x1f17f  (15 id slots)  ns ca_soak_ch1/store/162/...
+ 2 holes  span 0x1119c..0x1119d  ( 2 id slots)  ns ca_soak_ch2/store/243/...
+```
+
+Two TIGHT CONTIGUOUS CLUSTERS of adjacent keys, 13 in total, in two namespaces at the same instant. (The
+gaps inside the first span — `1f172`, `1f177`, … — are not evidence of interleaving: `appendRefOps`
+legitimately leaves id gaps, "the id is a safe gap", on its conclusive-rejection path.)
+
+**A dropped LIST page would be ~1000 keys.** This is thirteen. So "the store lost a page" — the natural
+reading of {#probe-a-answered}, and the one the probe's own message suggests — does not fit the data. Ref
+log keys are `<epoch hex>-<seq hex>.zst` zero-padded, so lexicographic order IS id order and these are
+physically ADJACENT keys in the listing. Walk 1 returned the keys after `0x1f17f` and skipped the short run
+before it.
+
+Two consequences:
+
+1. **It also rules out classic offset-pagination skew**, which the deletion regime would have exposed:
+   `del2` deleted ~31,000 keys from behind the cursor across each of 40 walks and produced ZERO holes. A
+   store that shifted its cursor on deletion would have failed that test loudly.
+2. **The mechanism drops SHORT ADJACENT RUNS, not pages.** That is a much narrower target than "the store
+   is inconsistent", and it is the shape any explanation now has to produce.
+
+I do not have a mechanism that predicts this shape yet. Stating that plainly rather than picking whichever
+of the surviving hypotheses is least disproved — the honest position after {#probe-a-hammer-negative} is
+that the cause is UNKNOWN, with the LIST-completeness reading weakened by two direct experiments and the
+elimination argument weakened by this shape.
+
+**Where it goes next:** the CAS walk lists through the ClickHouse S3 client under chaos, my hammer used
+boto3 against a healthy store. A retried page request is the one path that could plausibly return a
+slightly different window of keys. That is now the leading candidate and it is testable — inject page-level
+errors into the hammer's client and see whether short adjacent runs start disappearing.
