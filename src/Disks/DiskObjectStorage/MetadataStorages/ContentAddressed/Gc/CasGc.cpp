@@ -42,6 +42,8 @@ namespace ProfileEvents
     extern const Event CasRefGlobalListPages;
     extern const Event CasRefLogBodyGets;
     extern const Event CasRefManifestBodyFoldGets;
+    extern const Event CasGcProbeAHolePresent;
+    extern const Event CasGcProbeAHoleAbsent;
     extern const Event CasRefEmittedEdges;
     extern const Event CasRefCleanupObjectsDeleted;
 }
@@ -1100,17 +1102,67 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             if (const auto mit = pre_scan.max_log_by_ns.find(ns_str); mit != pre_scan.max_log_by_ns.end())
                 pre_max = mit->second;
 
+            /// Emit at most this many `gc_anomaly` rows per round. One firing has been observed with
+            /// 244,939 holes; the diagnostic value is in the FIRST few (with their HEAD verdicts), and a
+            /// quarter-million audit rows would be a self-inflicted outage. The cap and the true total
+            /// both travel in every row, so a truncated report can never read as a complete one.
+            static constexpr uint64_t kAnomalyRowCap = 32;
+
             const auto reportHole = [&](const RefTxnId & id, const char * which)
             {
                 ++holes;
+                /// THE DECISIVE OBSERVATION, taken while the disagreement still exists rather than
+                /// reconstructed from a log afterwards. Two verdicts, two different defects:
+                ///   present -> one enumeration MISSED a durable object; the listing was incomplete.
+                ///   absent  -> the other enumeration returned a key that is not there; a phantom, which
+                ///              indicts the client/iterator and NOT list completeness.
+                /// Reconstructing this after the fact is impossible: by the time anyone reads the log the
+                /// object has legitimately been deleted either way. One HEAD per reported hole, bounded by
+                /// the row cap above.
+                const char * head_verdict = "not_probed";
+                if (holes <= kAnomalyRowCap)
+                {
+                    try
+                    {
+                        const bool present = backend.head(layout.refLogKey(RootNamespace{ns_str}, id)).exists;
+                        head_verdict = present ? "present" : "absent";
+                        /// Also a counter, not only an audit row and a log line: the audit sink is
+                        /// optional (`EventEmitter` no-ops without one) and the text log is rotated and
+                        /// root-owned, so a counter is the one form of this verdict that every consumer
+                        /// -- soak harness, CI scrape, an operator's `system.events` -- can actually read.
+                        ProfileEvents::increment(present ? ProfileEvents::CasGcProbeAHolePresent
+                                                         : ProfileEvents::CasGcProbeAHoleAbsent);
+                    }
+                    catch (...)
+                    {
+                        /// A probe that throws must not convert a diagnostic into a round failure.
+                        head_verdict = "probe_failed";
+                    }
+                    EventEmitter{*store}.emit([&](CasEvent & ev)
+                    {
+                        ev.type = CasEventType::GcAnomaly;
+                        ev.namespace_ = ns_str;
+                        ev.object_kind = CasEventObjectKind::Root;
+                        ev.outcome = "ref_folding_aborted";
+                        ev.reason = "ref-prefix enumerations disagree about a durable ref log";
+                        ev.detail = {{"probe", "A"},
+                                     {"log", renderRefTxnId(id)},
+                                     {"direction", which},
+                                     {"head", head_verdict},
+                                     {"fold_max", renderRefTxnId(fold_max)},
+                                     {"pre_max", renderRefTxnId(pre_max)},
+                                     {"hole_ordinal", std::to_string(holes)},
+                                     {"row_cap", std::to_string(kAnomalyRowCap)}};
+                    });
+                }
                 LOG_ERROR(logger,
                     "CAS GC probe A: ref log {} of namespace {} was returned by one enumeration of {} "
                     "and NOT by the other ({}), below that enumeration's own maximum id for the "
-                    "namespace -- an append cannot explain this. Either the object store gave two "
-                    "different answers about the same durable prefix, or a deposed leader is deleting "
-                    "ref objects concurrently. Ref folding is ABORTED this round: no cursor advances "
-                    "and no destructive action runs.",
-                    renderRefTxnId(id), ns_str, layout.casRefsPrefix(), which);
+                    "namespace -- an append cannot explain this. A HEAD of the key right now says '{}'. "
+                    "Either the object store gave two different answers about the same durable prefix, or "
+                    "a deposed leader is deleting ref objects concurrently. Ref folding is ABORTED this "
+                    "round: no cursor advances and no destructive action runs.",
+                    renderRefTxnId(id), ns_str, layout.casRefsPrefix(), which, head_verdict);
             };
 
             for (const RefTxnId & id : pre_logs)
@@ -1130,6 +1182,13 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         /// positive here blocks the cursor advance for good rather than for one round.
         if (holes > 0)
         {
+            /// NO SILENT CAPS: if the row cap truncated the per-hole detail, say so on the round record,
+            /// so a reader of `gc_anomaly` can never mistake 32 rows for 32 holes.
+            if (holes > 32)
+                LOG_ERROR(logger,
+                    "CAS GC probe A: {} holes this round; only the first 32 carry a `gc_anomaly` row with "
+                    "a HEAD verdict (row cap). The remaining {} are counted, not detailed.",
+                    holes, holes - 32);
             ProfileEvents::increment(ProfileEvents::CasGcRefScanDisagreements, holes);
             ref_folding_aborted = true;
             report.recordAnomaly(RootNamespace{}, 0, ManifestId{},

@@ -32,6 +32,8 @@
 namespace ProfileEvents
 {
     extern const Event CasGcRefScanDisagreements;
+extern const Event CasGcProbeAHolePresent;
+extern const Event CasGcProbeAHoleAbsent;
 }
 
 using namespace DB::Cas;
@@ -203,6 +205,16 @@ uint64_t probeAHoles()
     return ProfileEvents::global_counters[ProfileEvents::CasGcRefScanDisagreements].load();
 }
 
+uint64_t probeAHolesPresent()
+{
+    return ProfileEvents::global_counters[ProfileEvents::CasGcProbeAHolePresent].load();
+}
+
+uint64_t probeAHolesAbsent()
+{
+    return ProfileEvents::global_counters[ProfileEvents::CasGcProbeAHoleAbsent].load();
+}
+
 void runRounds(const PoolPtr & s, Gc & gc, int rounds)
 {
     for (int i = 0; i < rounds; ++i)
@@ -317,4 +329,56 @@ TEST(CasHoleyListDetector, OmittedActivationNeverPermitsDeletingALiveBlob)
     EXPECT_GT(probeAHoles() - holes_before, 0u)
         << "the live blob survived, but probe A never fired — this test may be passing for the wrong "
            "reason";
+}
+
+/// The detector must not merely COUNT a disagreement — it must say WHICH defect it saw, at the moment it
+/// can still be seen. Reconstructing this afterwards is impossible: by the time anyone reads a log the
+/// object has legitimately been deleted either way, so "the listing omitted a durable object" and "the
+/// listing invented a key" are indistinguishable in hindsight. They are opposite defects and point at
+/// different components.
+///
+/// `HoleyListBackend` hides a key from a listing WITHOUT deleting it, which is exactly the first case. So
+/// the HEAD taken at firing time must say `present`, and it must be the `present` counter that moves.
+/// Pinning the direction is the point: a probe that recorded `absent` here would be inverted, and an
+/// inverted verdict is worse than no verdict — it would send the investigation at the listing client
+/// while the store was the culprit.
+TEST(CasHoleyListDetector, TheHoleVerdictDistinguishesAMissedObjectFromAPhantomKey)
+{
+    std::shared_ptr<HoleyListBackend> b;
+    auto s = openHoleyPool(b);
+    const Layout & layout = s->layout();
+    const RootNamespace ns{"test/tbl"};
+    const String payload = "verdict-payload";
+
+    const ManifestId part = publishOneBlobPart(s, ns, "part_a", payload);
+    Gc gc(s, hexToU128("00000000000000000000000000000002"));
+    runRounds(s, gc, 2);
+    ASSERT_TRUE(blobPresent(b, layout, payload));
+
+    const std::set<String> before_drop = listRefKeys(*b, layout, ns);
+    s->dropRef(ns, "part_a");
+    const std::set<String> after_drop = listRefKeys(*b, layout, ns);
+    const String remove_key =
+        refLogKeyEmittingEdge(*b, layout, ns, addedKeys(before_drop, after_drop), part, -1);
+    ASSERT_FALSE(remove_key.empty());
+
+    publishOneBlobPart(s, ns, "part_h", "harmless-payload");
+    s->renewWatermarkOnce();
+    b->omitFromNthListCall(remove_key, /*nth=*/1);
+
+    const uint64_t holes_before = probeAHoles();
+    const uint64_t present_before = probeAHolesPresent();
+    const uint64_t absent_before = probeAHolesAbsent();
+
+    runRounds(s, gc, 1);
+    ASSERT_TRUE(b->holeServed()) << "the sabotage never fired — the omitted key was never listed";
+    ASSERT_GT(probeAHoles() - holes_before, 0u) << "probe A did not fire";
+
+    /// The object was hidden from the listing, never deleted. The verdict must say so.
+    EXPECT_GT(probeAHolesPresent() - present_before, 0u)
+        << "the hole key was omitted from a listing but still exists, so the HEAD taken at firing time "
+           "must have recorded `present`. A zero here means the verdict is not being taken at all.";
+    EXPECT_EQ(probeAHolesAbsent() - absent_before, 0u)
+        << "the verdict is INVERTED: the object demonstrably exists, yet the probe recorded it absent. "
+           "That would point every future investigation at the listing client instead of the store.";
 }

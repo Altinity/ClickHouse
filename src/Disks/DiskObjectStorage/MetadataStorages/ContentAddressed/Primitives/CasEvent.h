@@ -21,6 +21,12 @@ enum class CasEventType
     RefPublish, RefDrop, RefRepoint, RootAdd, RootRemove, RootRepoint, IndegZero,
     GcFoldBegin, GcFoldEnd, GcRetireObserve, GcRetireDecision, GcRecheckVerdict,
     GcFence, GcCursorAdvance, GcShardReclaim, GcFenceOut, GcRebuild, GcFoldClamp,
+    /// One GC round anomaly, with the context of the decision it forced. `gc_fold_end` reports only a
+    /// COUNT of anomalies, which cannot even distinguish a ref-prefix enumeration disagreement from an
+    /// undecodable ref-log body -- so every investigation had to fall back on the rotated text log, which
+    /// is how a masked permission error once produced a confident "no occurrences". An anomaly aborts ref
+    /// folding; that decision deserves a queryable record, not a counter.
+    GcAnomaly,
     GcLeaseAcquire, GcLeaseSteal, GcLeaseHeartbeat,
     BuildStart, BuildPublish, BuildAbort, Precommit, PrecommitRemoved, PrecommitReclaim,
     GateRevalidate, GateResurrect, WatermarkRenew, MountRemount,
