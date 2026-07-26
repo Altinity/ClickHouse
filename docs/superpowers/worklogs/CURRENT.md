@@ -235,12 +235,15 @@ call this proof:
 
 `iter 8` is the one that survives both confounds and is the interesting datum.
 
-SEPARATE FINDING, independent of all the above and worth its own attention: **each namespace has TWO live
-writer epochs at once** — ch1 holds epochs 2 and 4, ch2 holds 1 and 3. Probe A's max-witness rule compares
-`(epoch, seq)` tuples per namespace. A concurrent append at a LOWER epoch than the namespace's current max
-is therefore *below the witness* and the rule does not exclude it — so the rule has a false-positive mode
-that has nothing to do with the store. That is a defect in the probe as written, findable by reading, and
-it should be fixed regardless of how the store question resolves.
+~~SEPARATE FINDING: each namespace has TWO live writer epochs at once, so a concurrent append at a lower
+epoch sits below the max witness and the rule fails to exclude it.~~ **WITHDRAWN 2026-07-26, it was wrong.**
+Counted the keys instead of assuming: `ca_soak_ch1` holds **178,146** keys at epoch 4 and **188** at epoch
+2. Epoch 4 is the only one being appended to; epoch 2 is RESIDUAL — leftovers from a previous mount that
+cleanup has not reclaimed, because chaos restarts the node and each remount mints a fresh epoch
+(`allocateWriterEpoch`, `CasServerRoot.cpp:165`). There is no concurrent writer at the lower epoch, every
+append lands ABOVE the max, and the rule excludes them correctly. I mistook undeleted debris for a live
+writer. Left struck through rather than deleted: an invented defect sends the next reader to fix a rule
+that is fine.
 
 A clean test must: list through the CAS backend adapter rather than the `s3` function, and either quiesce
 GC cleanup or account for it.
@@ -255,3 +258,9 @@ GC cleanup or account for it.
   and a firing one is not a new incident — it is the same open investigation, whose next step is already
   written down: list through the CAS backend adapter rather than the `s3` function, with GC cleanup
   quiesced or accounted for.
+- 06:26 UTC — watchdog: 4 h soak at t+0h29m, STAGE steady, **0 failures**, `signals=2/2 nodes` on all 23
+  ticks, no probe-A firing yet. Log fresh (12 s). Disk **272G** — still far above the 60G line but falling
+  faster than the short runs (they held ~327G); load 8.7. Watching disk from here: the 4 h plan reclaims at
+  its `gc_checkpoint` stage, as the earlier 4 h run did when it returned 124G at one checkpoint.
+  Corrected the "two live writer epochs" claim in this log — see the struck-through paragraph above. It was
+  mine and it was wrong.
