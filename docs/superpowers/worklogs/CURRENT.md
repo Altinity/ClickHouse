@@ -324,3 +324,19 @@ instrumentation — the phase rows record the enumeration but not the lease iden
   read `stale_edge=None` and I would have taken them for four clean checks. The instrumentation caught its
   own blind spot, which is the point, but the gate itself is ineffective under chaos as wired and that has
   to be fixed rather than noted.
+- 08:57 UTC — watchdog: 4 h soak at t+3h00m (59m left), **0 failures**, 16 checkpoints OK, disk recovered to
+  321G, signals read on 146 ticks at 2/2 and 6 at 1/2.
+  **CORRECTING MY OWN FINDING from 08:26.** I wrote that the run "will finish green with the stale-edge
+  class never once checked". That is now false: the tally is **24 × `stale_edge=0`** against 4 ×
+  `not-checked`. The assert has been evaluated two dozen times.
+  The finding was true when I made it and I over-generalised from four data points to a prediction about
+  the whole run. The sharper and more useful statement: the gate is skipped ONLY when fsck exceeds its flat
+  180 s budget, which happens when the ref space is large; once GC has cleaned it down, fsck finishes and
+  the gate runs. So it is not "ineffective under chaos" — it is "ineffective exactly when the pool is
+  biggest", which is both a narrower claim and a worse one, since that is when a leak would matter most.
+  Measured this tick, on the fsck timeout question: fsck is **I/O-bound, not CPU-bound** — 1.38 s real /
+  0.45 s CPU on ch1 and 1.78 s / 0.52 s on ch2, i.e. ~70% of wall time spent waiting on the object store,
+  at a pool of ~1.3k blobs. Its cost tracks the REF-LOG volume, not the blob count, because it does a fresh
+  LIST + full replay of every ref log per namespace; that volume reached 365k objects in this run against
+  a flat 180 s budget. Note `system.trace_log` cannot answer this — fsck is a separate `clickhouse disks`
+  process whose config declares no system tables at all.
