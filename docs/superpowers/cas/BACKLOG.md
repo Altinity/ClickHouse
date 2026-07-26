@@ -1823,3 +1823,40 @@ Also confirmed by the same rows: `S3ListObjects = 0` throughout `fold_ref_intake
 
 Still not measured: whether the manifest-body re-reads are the multiplier. `CasRefManifestBodyFoldGets` is
 already recorded per phase, so this is again a query rather than an experiment.
+
+### ATTRIBUTED 2026-07-26: the multiplier is manifest edges, and every edge costs a HEAD *and* a GET {#gc-perf-multiplier-attributed}
+
+Task #9 answered by query, as predicted — no experiment needed. The counters were on the rows all along.
+
+**`S3GetObject` = `CasRefLogBodyGets` + `CasRefManifestBodyFoldGets`, exactly, on all six rows.**
+5672+9034=14706 · 16421+35634=52055 · 96167+231990=328157 · 123057+190071=313128 ·
+132618+478598=611216 · 404065+1508013=1912078. Nothing else in the phase reads from the store.
+
+So the composition is not mysterious. It is **one GET per ref-log body** — my original inference, correct
+for the log itself — **plus one GET per emitted manifest edge**. The "4.15 GETs per log" was never a per-log
+cost; it was `1 + edges_per_log`, and `edges_per_log` runs 1.54 → 3.73 and CLIMBS with backlog. That climb
+is the whole growth story.
+
+**And every edge costs a second round trip.** `CasManifestHead` = `CasManifestGet` =
+`CasRefManifestBodyFoldGets` = `CasRefEmittedEdges`, exactly, on every row. Each edge is a HEAD followed by
+a GET. Total round trips per phase = `logs + 2 × edges`:
+
+| logs | edges/log | round trips | ms/trip |
+|---:|---:|---:|---:|
+| 5,672 | 1.59 | 23,740 | 1.20 |
+| 96,167 | 2.41 | 560,147 | 0.46 |
+| 132,618 | 3.61 | 1,089,814 | 0.47 |
+| 404,065 | 3.73 | 3,420,091 | 0.53 |
+
+**~0.5 ms per round trip at scale**, flat across a 140x range of request counts. The intake phase is a
+straight function of its request count and nothing else — no hidden CPU term, no lock term.
+
+**The equality `manifest body GETs == emitted edges` is itself the finding.** It means there is NO caching
+of manifest bodies within a round, by construction: if the same manifest is named by ten edges, its body is
+fetched ten times. Whether that actually happens is the one thing still uncounted — it needs a DISTINCT
+manifest count against the edge count, which no counter currently carries. That is the next question, and
+it is the difference between "the work is irreducible" and "three quarters of it is repeat reads".
+
+**Do NOT read the HEAD-before-GET pair as a removable step.** It is a protocol step; the standing user veto
+on treating protocol steps as cheap wins applies (see [[feedback_head_before_put_protocol_untouchable]]).
+It is recorded here as a measured cost, not as a proposal.
