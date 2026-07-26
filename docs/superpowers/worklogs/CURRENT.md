@@ -244,3 +244,14 @@ it should be fixed regardless of how the store question resolves.
 
 A clean test must: list through the CAS backend adapter rather than the `s3` function, and either quiesce
 GC cleanup or account for it.
+- 05:56 UTC — watchdog: **shakeout #3 GREEN** (`PHASE3 OK`, 0 failures, signals read on 44/45 ticks at 2/2
+  nodes and one tick at 1/2 — a node down, correctly recorded as a PARTIAL read rather than as zeros).
+  `probe_a_holes=0` this run.
+  **Three 20-minute runs, all three green.** Task 21's stability criterion — two consecutive green runs with
+  every signal actually observed — is met, so the 4-hour run is now the right next step and is STARTED
+  (`tmp/unattended/soak_partb_4h.log`, db `soak_partb_4h.db`, seed 11).
+  Worth carrying into how the 4 h run is read: probe A fired in ONE of the three runs (run #2: 14 holes,
+  3 aborts) and not in the other two. It is intermittent, so a clean 4 h run does not clear the question
+  and a firing one is not a new incident — it is the same open investigation, whose next step is already
+  written down: list through the CAS backend adapter rather than the `s3` function, with GC cleanup
+  quiesced or accounted for.
