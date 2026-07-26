@@ -803,3 +803,33 @@ New task #20: per-anomaly audit event carrying reason, namespace, hole id, DIREC
 enumeration's max id, and the HEAD verdict on the hole key. It subsumes the HEAD-at-firing-time step and is
 far smaller than the experiments it replaces. Volume caveat recorded: a 244,939-hole firing must not write
 244,939 rows.
+
+## 2026-07-26 16:26 UTC — watchdog: verdict soak RUNNING on the new binary, signals genuinely observed
+
+The user asked the three right questions: instrumentation added? test run? caught anything yet? Answers
+were yes, yes, and **no — and it could not have been**, because the containers were still running the
+binary built at 01:27, before any of this work. The unit test proves the verdict mechanism is sound on a
+synthetic hole; it says nothing about a real one.
+
+Stand restarted `down -v` onto the 16:15 UTC build; 20-minute phase-3 chaos soak running (seed 21, sync
+inserts). 20-minute runs are the right length — the 02:28-02:34 firings analysed earlier came from one.
+
+**Signal duty, and it passes for real this time:**
+
+```
+CAS SIGNALS preflight OK: 10 counters present on all 2 node(s) —
+  CasGcUnmatchedRemoveDeltas, CasRefAppendPreAttemptRefused,
+  CasGcProbeAHolePresent, CasGcProbeAHoleAbsent, CasRefAppendWedged, ...
+CAS SIGNALS baseline Node(:8123): ... CasGcProbeAHolePresent=0 CasGcProbeAHoleAbsent=0 ...
+CAS SIGNALS baseline Node(:8124): ... same
+```
+
+Both NEW counters are in the preflight set with a per-node baseline, so they are being READ, not merely
+present — and had the binary lacked them, preflight would have failed the run rather than reading zero.
+`signals=2/2 nodes` on every metrics tick since.
+
+State at t+195s: mutations stage, chaos not yet started, 0 firings, all verdict counters 0 on both nodes.
+Log fresh (5 s). Disk 321G — recovered, since `down -v` released the old pool volume. Load 19.4, high but
+that is a sync-insert soak under way, not a stall.
+
+Nothing to unstick. 21 local commits held back per the push instruction.
