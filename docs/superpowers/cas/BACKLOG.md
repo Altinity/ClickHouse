@@ -1705,3 +1705,34 @@ mismatch with a number attached.
 - Per-log cost is presumed to be one GET each; that is inferred from the flatness and the I/O-bound
   fsck measurement, NOT from counting requests. The per-phase rows carry `ProfileEvents`, so the request
   count per phase is available and would settle it — that is the cheapest next step.
+
+### CORRECTION, same day: it is NOT one GET per log — it is 2.5-4.7, and the ratio GROWS {#gc-perf-gets-per-log}
+
+I wrote above that the flat per-log cost "is what one object-store GET per log looks like", and flagged
+that it was inferred from flatness rather than counted. Counted it — the `ProfileEvents` were already on
+every phase row — and the inference was wrong:
+
+| logs | secs | S3 GETs | GETs/log | ms/GET |
+|---:|---:|---:|---:|---:|
+| 5,672 | 28.6 | 14,706 | 2.59 | 1.94 |
+| 16,421 | 116.0 | 52,055 | 3.17 | 2.23 |
+| 96,167 | 260.2 | 328,157 | 3.41 | 0.79 |
+| 123,057 | 245.3 | 313,128 | 2.54 | 0.78 |
+| 132,618 | 507.0 | 611,216 | 4.61 | 0.83 |
+| 404,065 | 1829.6 | 1,912,078 | 4.73 | 0.96 |
+
+**Weighted: 4.29 GETs per log at ~0.94 ms per GET.** What is actually flat is the PER-REQUEST cost — a
+store round trip — while requests per log range 2.5 to 4.7 and trend UPWARD with backlog size.
+
+That changes where the lever is. The cost is not "one unavoidable read per log"; it is a request
+multiplier of four-ish that nobody has looked at. `foldManifestEdges` GETs a manifest BODY per manifest
+edge (`CasRefManifestBodyFoldGets` exists precisely to count that), so a log carrying several edges costs
+several GETs, and the same manifest body may be re-read across logs within one round with no cache in
+between. Reducing the multiplier is a different and probably cheaper intervention than anything aimed at
+the logs themselves.
+
+Also confirmed by the same rows: `S3ListObjects = 0` throughout `fold_ref_intake` — all the listing is in
+`fold_ref_list`, so the phase split is clean and the two costs are genuinely separable.
+
+Still not measured: whether the manifest-body re-reads are the multiplier. `CasRefManifestBodyFoldGets` is
+already recorded per phase, so this is again a query rather than an experiment.
