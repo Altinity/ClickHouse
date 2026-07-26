@@ -2480,3 +2480,44 @@ Three separable pieces of real work instead:
 
 Task #11's framing ("fix the unmatched-minus-one retention leak") is therefore wrong as written and has
 been left in place only so the history reads honestly; the work is the three items above.
+
+## *** PROVEN BY MEASUREMENT: the enumeration was incomplete *** {#probe-a-proven-by-measurement}
+
+I wrote in {#probe-a-remaining-hardening} that the object's write time was "NOT currently reachable" and
+that the ordering guarantee therefore rested on reading source. **That was wrong.** `system.blob_storage_log`
+records every object write with a microsecond timestamp, and the user asked the obvious question I had not:
+what do the storage logs say?
+
+### The three keys of the captured firing {#proven-three-keys}
+
+```
+Upload  16:47:19.211480   .../_log/0000000000000001-000000000001430c.zst   200 B   <- hole
+Upload  16:47:19.212340   .../_log/0000000000000001-000000000001430d.zst   200 B   <- hole
+Upload  16:47:19.213680   .../_log/0000000000000001-000000000001430e.zst   195 B   <- the witness
+gc_anomaly fired at 16:47:38                                                       <- 19 SECONDS later
+```
+
+All three were written in strict id order, 2.2 ms apart. Walk 1 returned `0x1430e`, so walk 1 ran after
+`16:47:19.213680` — by which time `0x1430c` and `0x1430d` had been durable for 1.3-2.2 ms, and by the time
+the disagreement was reported, for nineteen seconds. Walk 1 did not return them.
+
+### The ordering guarantee is now measured too {#proven-ordering}
+
+Not "argued from `appendRefOps`". Across **65,263 ref-log uploads** in this namespace, partitioned by writer
+epoch: **zero out of order** (65,157 in epoch 1, 106 in epoch 2). Upload timestamps rise monotonically with
+id, exactly as the single-leader/awaited-PUT reading claimed.
+
+(A first pass reported one inversion. That was my query mixing two epochs — a remount restarts the
+sequence, so sorting by sequence alone puts a small post-remount id "before" a large pre-remount one.
+Corrected by partitioning; the artifact was mine, not the system's.)
+
+### So the conclusion no longer rests on any code reading {#proven-conclusion}
+
+**A ref-prefix enumeration failed to return two objects that had been durable for nineteen seconds, while
+returning a third written 2.2 ms after them.** {#list-as-journal-dataloss-2026-07-25} is proven.
+
+### The fail-closed path also worked end to end {#proven-failclosed}
+
+The same three keys were `Delete`d at `16:53:59` — six minutes later. Probe A aborted folding, the cursor
+did not advance, a later round enumerated completely and folded them, and GC then reclaimed them normally.
+**No leak resulted from this occurrence**, which is the behaviour the detector exists to produce.
