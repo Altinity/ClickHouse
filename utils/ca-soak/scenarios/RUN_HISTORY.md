@@ -476,3 +476,5 @@ Every attempted scenario run is appended here (newest at the bottom). `run_dir` 
 | 2026-07-24T10:54:58 | S41 | 1 | full | 900s | pass | a9449127f724 | 20260724T105212_S41_seed1 |  |
 | 2026-07-25T16:45:35 | S42 | 1 | dev | 900s | fail | 830c4997a73f | 20260725T164254_S42_seed1 |  |
 | 2026-07-25T16:51:56 | S42 | 1 | dev | 900s | inconclusive | 830c4997a73f | 20260725T164929_S42_seed1 |  |
+| 2026-07-26T21:22:46 | S42 | 42 | ci | 900s | fail | ef3347160aad | 20260726T205952_S42_seed42 | GC log has 2 real (non-benign) Error finish row(s) |
+| 2026-07-26T21:49:03 | S42 | 43 | ci | 900s | fail | 7c8a302393f8 | 20260726T212653_S42_seed43 |  |

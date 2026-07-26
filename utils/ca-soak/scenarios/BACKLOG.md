@@ -543,6 +543,14 @@ CLOSED/explained (no action): S16 dangling=racy-fsck FP; disk-growth=inactive-pa
 - **Severity:** suspected-bug
 - **Run:** 20260701T133614_S33_seed20260701
 - **Observed:** GC log has 2 real (non-benign) Error finish row(s)
+- **TRIAGED 2026-07-27: ENVIRONMENT, not a bug.** Both Error rows are
+  `Code: 499 ... Timeout ... (S3_ERROR)` on objects of **268 bytes** and **4,606 bytes**. A 268-byte GET
+  timing out is a store that is not answering, not a GC defect. The host was still recovering from an
+  aborted `--scale full` attempt (load average 22-48 at launch), which also produced 23,561
+  `UNCERTAIN (retry budget exhausted)` client failures in the same run. The seed-43 repeat on a quiet host
+  had ZERO environmental failures. Downgrading from `suspected-bug`; see BACKLOG
+  `{#s42-ci-verdict}`. The genuine finding from seed 43 is the stale-edge defect, root-caused in
+  `docs/superpowers/reports/2026-07-26-s42-stale-edge-repro/PHASE1.md`.
 
 ## S03-20260701T133659-1: GC log has 1 real (non-benign) Error finish row(s)
 
@@ -3085,3 +3093,10 @@ what the product actually said (the others: the 668 mount-fence classifier that 
 fsck detail-class whitelist that would have dropped `stale-edge`). The pattern is always the same — the
 harness pins a name or a column the product later changes, and the mismatch degrades to silence rather
 than to an error.
+## S42-20260726T205952-1: GC log has 2 real (non-benign) Error finish row(s)
+
+- **Logged (UTC):** 2026-07-26T21:22:46
+- **Severity:** suspected-bug
+- **Run:** 20260726T205952_S42_seed42
+- **Observed:** GC log has 2 real (non-benign) Error finish row(s)
+
