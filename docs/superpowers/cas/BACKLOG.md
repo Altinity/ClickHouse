@@ -1860,3 +1860,29 @@ it is the difference between "the work is irreducible" and "three quarters of it
 **Do NOT read the HEAD-before-GET pair as a removable step.** It is a protocol step; the standing user veto
 on treating protocol steps as cheap wins applies (see [[feedback_head_before_put_protocol_untouchable]]).
 It is recorded here as a measured cost, not as a proposal.
+
+### Structure behind the multiplier, and a SHARPENED hypothesis for the distinct-manifest question {#gc-perf-intake-structure}
+
+More read-only decomposition of the same six rows. Structural facts, each an exact counter reading:
+
+- **`txns_opened == logs_intended`, exactly, every row.** One ref-log transaction per log object. No batching
+  and no fan-out at that level.
+- **`deltas_emitted / edges` ≈ 14-20**, stable across a 70x range of round sizes. Each manifest fetched
+  yields on the order of sixteen in-degree deltas — consistent with a part manifest naming ~16-20 files.
+  The delta volume is large in absolute terms (24.6M for the 404k-log round) but it is CPU-and-memory work,
+  not store traffic; the store traffic is entirely `logs + 2 × edges` as established above.
+- **`tables_scanned` is 2-8.** The ref-table dimension is negligible; nothing in this phase scales with it.
+
+**The hypothesis this sharpens, stated as a hypothesis.** `edges_per_log` runs 1.54-3.73. A transaction that
+publishes one ref and drops another names two manifests and therefore costs two fetches — and if the add and
+the drop concern the SAME manifest, that is two fetches of one body, a 50% waste on that transaction alone.
+There is a prior for exactly this shape in the writer path: [[project_part_removal_repoint_waste]] found
+repoints on `delete_tmp_*` refs accounting for ~22% of the writer PUT class.
+
+**This is NOT established.** No counter distinguishes "two manifests" from "one manifest twice", which is
+precisely why task #17 exists. What the structure adds is a specific thing to look for rather than a general
+suspicion, and a reason to expect the answer to be non-trivial rather than a tidy 1:1.
+
+It is also testable READ-ONLY before any counter is added: decode a sample of `_log/` objects on the stand
+and check whether the manifests named within a single transaction repeat. That would answer the cheap half
+of #17 without a product change.
