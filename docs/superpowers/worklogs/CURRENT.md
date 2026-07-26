@@ -340,3 +340,7 @@ instrumentation — the phase rows record the enumeration but not the lease iden
   LIST + full replay of every ref log per namespace; that volume reached 365k objects in this run against
   a flat 180 s budget. Note `system.trace_log` cannot answer this — fsck is a separate `clickhouse disks`
   process whose config declares no system tables at all.
+- 09:27 UTC — watchdog: 4 h soak at t+3h30m, 29m left. **0 failures, 30 checkpoints OK.** `stale_edge`
+  evaluated **52 times, all 0**, against the same 4 early skips — the skips were confined to the
+  large-pool window and have not recurred. Signals read on 179 ticks at 2/2 and 9 at 1/2. Disk stable at
+  322G, load 1.8, log 19 s old. Nothing to unstick.
