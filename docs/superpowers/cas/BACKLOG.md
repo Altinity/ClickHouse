@@ -2249,3 +2249,38 @@ key and record the verdict in the same log line:
 One HEAD per hole, and holes are rare by construction (7 firings in four hours). It converts the next
 firing from a forensic puzzle into a decisive observation, and it is far cheaper than another 19M-key
 hammer run.
+
+## WHY the audit log could not trace this, which is itself the defect (user challenge, 2026-07-26) {#anomaly-detail-is-a-bare-count}
+
+Asked why `system.content_addressed_log` could not settle the probe A mechanism, given that this project's
+convention is to write the FULL CONTEXT of every critical decision into `detail`. Checked. The convention
+is not being followed at the one event that matters:
+
+```
+gc_fold_end   detail = {anomalies: '1', shards: '8'}
+gc_fold_begin detail = {}                                  -- empty, every row
+```
+
+`Gc::Report::recordAnomaly` takes `(namespace, shard, ManifestId, reason)`. **None of it reaches the audit
+log.** The row carries a COUNT. Probe A ABORTS ref folding — no cursor advance, no destructive action — and
+the queryable record of that decision is the number 1.
+
+Three consequences, all of which I hit this round without naming the cause:
+
+1. **The count cannot even identify WHICH anomaly fired.** A probe A disagreement and an undecodable
+   ref-log body both land as `anomalies: 1`. There is a `gc_fold_end` at 08:30:35 on ch1 that does not
+   appear among the probe A firings in the per-phase rows, and I cannot say what it was.
+2. **The real context exists only in the TEXT log**, which is rotated, compressed, syslog-owned and
+   unreadable from the host — which is how I produced a masked-permission "zero" earlier today
+   ({#probe-a-permission-error}).
+3. **So every investigation becomes forensics**: decode ids out of grep output instead of querying the
+   table built for exactly this.
+
+**Fix, and it subsumes the HEAD-at-firing-time step in {#probe-a-hammer-three-negatives}:** give the
+anomaly its own audit event carrying its context in `detail` — `reason`, `namespace`, the hole id, the
+DIRECTION (which enumeration missed it), the other enumeration's max id for that namespace, and the
+HEAD verdict on the hole key (exists / absent). Then the next firing is one `SELECT` away from a mechanism
+instead of an afternoon of log archaeology.
+
+That is the correct next step for {#probe-a-answered}, and it is a smaller change than the three hammer
+runs it would have replaced.
