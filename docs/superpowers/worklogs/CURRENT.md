@@ -859,3 +859,36 @@ reappears — this is the same defect, still unfixed, not a new one.
 
 **Signal duty:** `signals=2/2 nodes` on every tick, both new verdict counters in the preflight set with a
 per-node baseline. Genuinely read, not merely present.
+
+## 2026-07-26 17:26 UTC — watchdog: idle, soak finished GREEN, evidence intact
+
+Idle: no soak, no build, no agent. 323G disk (recovered), load 2.96, nothing to unstick. Nothing
+uncommitted in `src/`, `programs/`, `utils/ca-soak/soak|tests` or `docs/superpowers`. Probe artifacts under
+`tmp/listprobe` are 48K of logs — harmless.
+
+**The captured evidence survives on the stand: `gc_anomaly` count is still 2 on ch1.** Worth re-checking
+deliberately, because ch1 shows "Up 19 minutes" — it was restarted by chaos during the soak, which is
+exactly what wiped the ProfileEvents to zero. The audit rows outlived the restart that erased the counters.
+
+**Signal duty: no long run in flight, so nothing to observe this cycle.** The run that just ended read all
+10 signals 88 times with per-node baselines, including both new verdict counters.
+
+### Where the round stands
+
+Closed: the GET multiplier (#9), manifest re-reads at 39.6% (#17), fsck reporting (#13), the anomaly
+context gap (#20), the store hammer (#18), and the probe A cause (#19) — **the LIST-as-journal release
+blocker is now OBSERVED**, with both alternative branches eliminated.
+
+Also landed unplanned: a fix for my own partial-fsck regression, four stale RED harness tests cleared, and
+a `.gitignore` guard after a 2 GiB pack rejection.
+
+Open: probe A's two blind spots + the `-1`-before-`+1` path + reconciling the 56 leaked blobs (#11,
+reframed — the reducer needs no fix, the leak is a CONSEQUENCE of the hole); the fsck entry gate that still
+does not run on a 5.5 GB pool (#21); the bottleneck rig (#10); the four instrumentation-review
+recommendations (#14); Part B test debt (#15); S42 at scale (#16).
+
+Two measurements the round produced that nobody has acted on yet: `pending_deletes` at 77.2 s in a single
+occurrence (three orders above the next phase), and probe A being `reported-not-gated` so a soak can be
+green with confirmed enumeration holes.
+
+29 local commits, unpushed per instruction.
