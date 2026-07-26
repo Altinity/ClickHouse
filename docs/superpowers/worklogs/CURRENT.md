@@ -743,3 +743,29 @@ of arithmetic that would have predicted the collapse.
 
 Standing result so far: only run 1 counts, and it is a clean NEGATIVE for the add-only regime (24 rounds,
 0 holes, 6.85M keys listed cumulatively, up to 888 pages). The delete regime is still unmeasured.
+
+### del2 landed VALID, and it went against me
+
+Population held at 135-150k, listings 151-166 pages, **~31,000 keys deleted under each walk**, 40 rounds —
+**zero holes**. Combined with run 1's add-only result that is ~13M keys listed across the two obvious
+regimes, more than nine times what probe A saw in four hours, with nothing found.
+
+Recorded in BACKLOG as weakening {#probe-a-answered} rather than filed as inconclusive. My conclusion there
+came from ELIMINATION; this is direct evidence pointing the other way.
+
+**Then the shape changed the question.** Decoded one firing's ids: 13 holes in two TIGHT CONTIGUOUS
+CLUSTERS — 11 spanning 15 id slots in one namespace, 2 spanning 2 slots in another, same instant. A dropped
+page is ~1000 keys. Ref-log keys sort in id order, so these are physically adjacent keys: walk 1 returned
+what came after the run and skipped the run.
+
+So the obvious model — "the store lost a page" — **does not fit**. And offset-pagination skew is ruled out
+independently, since del2 deleted 31k keys from behind the cursor 40 times and a cursor-shifting store
+could not have survived that.
+
+**Honest position: the cause is UNKNOWN.** The LIST-completeness reading is weakened by two direct
+experiments; the elimination argument is weakened by a shape none of its survivors predicts. I am not
+picking the least-disproved option and calling it settled.
+
+Leading candidate, and it is testable: the CAS walk lists through the ClickHouse S3 client WITH RETRIES,
+under chaos; the hammer used boto3 against a healthy store. Inject page-level errors into the hammer and
+see whether short adjacent runs start vanishing.
