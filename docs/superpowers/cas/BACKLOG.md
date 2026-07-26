@@ -2304,3 +2304,54 @@ enumeration omitted a durable object — {#list-as-journal-dataloss-2026-07-25} 
 returned a key that does not exist, which would invalidate that reading entirely and point at the client.
 Neither is recoverable after the fact, which is why three hammer runs and ~19M listed keys could not settle
 it.
+
+## *** CAUGHT LIVE 2026-07-26: a ref-prefix enumeration omitted two adjacent objects that DEMONSTRABLY EXISTED *** {#probe-a-caught-live}
+
+The instrumentation from {#anomaly-detail-fixed} paid off on its FIRST soak, inside the first four minutes.
+Three hammer runs and ~19M listed keys had failed to reproduce this; one `SELECT` now shows it.
+
+```
+namespace    ca_soak_ch1/store/3ba/3ba2c30d-...@cas@
+hole         epoch 1, seq 0x1430c   head_verdict = present
+hole         epoch 1, seq 0x1430d   head_verdict = present
+direction    missing from the pre-fold scan
+pre_max      epoch 1, seq 0x1430e          <-- walk 1 DID return this
+fold_max     epoch 1, seq 0x14a10
+```
+
+Counters agree: `CasGcRefScanDisagreements=2`, `CasGcProbeAHolePresent=2`, `CasGcProbeAHoleAbsent=0`.
+
+**Walk 1 returned `0x1430e` and skipped the two keys immediately below it.** Both objects were confirmed
+present by a HEAD taken at the moment of the disagreement. Same short-adjacent-run shape as the historical
+firings ({#probe-a-hole-shape}), now with a verdict attached instead of reconstructed.
+
+### What this settles, and what it does not {#probe-a-caught-live-limits}
+
+**Settled: the holes are not phantoms and not deletions.** `absent` would have meant walk 2 invented a key,
+which would have invalidated the whole reading; it did not happen. Deletion cannot explain a key that is
+present when checked.
+
+**NOT settled: incomplete listing vs non-serialized appends.** Two branches remain, and the HEAD verdict
+cannot separate them:
+
+1. The enumeration was incomplete — the LIST-as-journal blocker, observed.
+2. `0x1430c`/`0x1430d` were written AFTER `0x1430e`, so they genuinely did not exist when walk 1 ran. That
+   requires appends to a single namespace to complete out of order, which contradicts the reading of
+   `appendRefOps` in {#probe-a-answered} — one leader per `RefTable`, synchronous awaited PUT. That reading
+   is the weakest link in the argument and this is exactly where it would break.
+
+**The discriminator is one more field.** `HeadResult::attributes` carries object metadata; recording the
+hole object's LAST-MODIFIED time against the walk's start time decides it outright — modified before walk 1
+means the listing was incomplete, full stop; modified after means the append ordering assumption is wrong
+and the defect is in our writer, not the store. That is a small addition to the same event.
+
+Do NOT close {#list-as-journal-dataloss-2026-07-25} on this. It is much stronger evidence than anything
+before it, and it is still one field short of proof.
+
+### The lesson worth more than the finding {#probe-a-caught-live-lesson}
+
+Three hammer runs, ~19M keys listed, several code reads, an afternoon — all negative. One instrumentation
+change, one 20-minute soak, four minutes in — decisive. The detector was standing at the moment of the
+disagreement the whole time and throwing it away, and I went looking for the crime scene elsewhere instead
+of asking it what it saw. The user's question ("why can't you trace this through the CA log, we write the
+full context of every critical decision") is what redirected it.
