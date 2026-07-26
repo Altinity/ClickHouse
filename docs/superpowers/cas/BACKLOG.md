@@ -1630,3 +1630,20 @@ extending the same no-throw-after-commit discipline one frame outward.
 **LESSON for how these reviews are consumed:** a strong review is evidence, not instruction. Two of its
 four remedies were wrong in ways that would have made things worse, and I forwarded one of them verbatim.
 Prescriptions from a reviewer deserve the same verification as claims from an implementer.
+
+## `ca-fsck` never prints `corrupted_runs`, though `clean()` requires it zero (found 2026-07-26) {#fsck-corrupted-runs-invisible}
+
+Found while wiring the soak's signal capture. `FsckReport::clean()` requires `corrupted_runs == 0`, but
+`programs/disks/CommandFsck.cpp` does not print the field on the summary line — it prints `stale_edge` and
+its neighbours and omits this one. So a corrupt source-edge run is invisible to every consumer of the
+applet: the summary says nothing, and the only observable form is a `corrupted-run` DETAIL row, which only
+a `--detail` scan produces.
+
+The harness now counts those detail rows and warns, but that is a workaround for a one-line product fix.
+Same family as everything else this week: the information exists, the reporting path drops it, and the
+result reads as absence rather than as an error.
+
+Also worth noting alongside: `ca-fsck` exits 0 on `stale_edge > 0` — only `dangling` and
+`snapshot_oracle_mismatches` throw — so the soak checkpoint's existing `exit_code != 0` gate never covered
+that class either. The new checkpoint assert is the only gate, deliberately (see
+{#q3-stale-edge-nonfatal}: the user chose non-fatal for the applet).
