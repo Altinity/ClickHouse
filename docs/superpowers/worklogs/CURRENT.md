@@ -311,3 +311,16 @@ useless: the next real firing will be read as "the lease thing again".
 NOT improvising a fix. What must be established first: whether ch2 held the lease at walk 1 and had lost it
 by walk 2. That is one comparison of the lease owner recorded at the two points, and it is the missing
 instrumentation — the phase rows record the enumeration but not the lease identity at each end of it.
+- 08:26 UTC — watchdog: 4 h soak at t+2h29m (1h30m left), STAGE chaos, **0 failures**, 4 checkpoints OK,
+  signals read on 116 ticks at 2/2 nodes and 2 at 1/2 (node down under chaos — recorded as partial, not as
+  zeros). Disk RECOVERED on its own: 176G → **277G**, the `gc_checkpoint` stage reclaiming ~100G exactly as
+  the previous 4 h run did. The disk watch is closed by observation.
+  **FINDING, and it is the "blind not green" case the watchdog exists to catch: `stale_edge=not-checked` on
+  ALL FOUR checkpoints.** The assert I added has not been evaluated ONCE in two and a half hours. It sits
+  behind the detail-fsck gate, and that gate is skipped whenever the entry-gate fsck times out — which
+  under chaos is every time (B146/B154, a known open item). So this run will finish green with the
+  stale-edge class never once checked.
+  The display fix from 02:56 is what makes this visible at all — before it, these four lines would have
+  read `stale_edge=None` and I would have taken them for four clean checks. The instrumentation caught its
+  own blind spot, which is the point, but the gate itself is ineffective under chaos as wired and that has
+  to be fixed rather than noted.
