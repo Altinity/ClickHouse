@@ -69,6 +69,12 @@ def main():
     ap.add_argument("--rounds", type=int, default=40, help="listing rounds under concurrent write")
     ap.add_argument("--writers", type=int, default=4)
     ap.add_argument("--listers", type=int, default=3)
+    ap.add_argument("--deleters", type=int, default=0,
+                    help="threads deleting the OLDEST live keys while listings walk. This is the "
+                         "configuration that models the real ref prefix: GC removes folded logs from "
+                         "BEHIND the listing cursor, and a paginated walk over a shrinking key space is "
+                         "where store implementations differ. An add-only run exercises the wrong regime.")
+    ap.add_argument("--delete-batch", type=int, default=50)
     ap.add_argument("--page-size", type=int, default=1000, help="matches the CAS listing page size")
     ap.add_argument("--keep", action="store_true", help="do not delete the probe prefix afterwards")
     a = ap.parse_args()
@@ -110,6 +116,24 @@ def main():
         while not stop.is_set():
             write_one()
 
+    def deleter_loop():
+        """Remove the OLDEST live keys — i.e. from behind a listing cursor that walks in key order.
+
+        A key leaves `durable` BEFORE its DELETE is issued, never after. That ordering is what keeps the
+        hole rule honest: a key still in the snapshot is one whose deletion had not even been requested
+        when the listing began, so its absence cannot be excused as a race with this thread.
+        """
+        while not stop.is_set():
+            with dlock:
+                victims = sorted(durable)[:a.delete_batch]
+                for v in victims:
+                    durable.discard(v)
+            if not victims:
+                time.sleep(0.05)
+                continue
+            st.s3.delete_objects(Bucket=a.bucket,
+                                 Delete={"Objects": [{"Key": v} for v in victims]})
+
     def lister_loop():
         while True:
             with rlock:
@@ -132,15 +156,16 @@ def main():
             print(f"  round {mine:>3}: listed={len(got):>6} pages={pages:>3} "
                   f"durable_before={len(snapshot):>6} HOLES={len(holes)} dupes={dupes}", flush=True)
 
-    print(f"{a.rounds} listing rounds, {a.writers} writers + {a.listers} listers, "
-          f"page_size={a.page_size} ...", flush=True)
-    with cf.ThreadPoolExecutor(max_workers=a.writers + a.listers) as ex:
+    print(f"{a.rounds} listing rounds, {a.writers} writers + {a.listers} listers + "
+          f"{a.deleters} deleters, page_size={a.page_size} ...", flush=True)
+    with cf.ThreadPoolExecutor(max_workers=a.writers + a.listers + a.deleters) as ex:
         futs = [ex.submit(lister_loop) for _ in range(a.listers)]
-        wf = [ex.submit(writer_loop) for _ in range(a.writers)]
+        bg = [ex.submit(writer_loop) for _ in range(a.writers)]
+        bg += [ex.submit(deleter_loop) for _ in range(a.deleters)]
         for f in futs:
             f.result()
         stop.set()
-        for f in wf:
+        for f in bg:
             f.result()
 
     total_holes = sum(len(f["holes"]) for f in findings)
