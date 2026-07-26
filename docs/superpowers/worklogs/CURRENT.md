@@ -1058,3 +1058,10 @@ to observe. Committed the two files the scenario runner had written on its own (
 `scenarios/BACKLOG.md`) and TRIAGED the entry it auto-filed as `suspected-bug`: seed 42's two GC Error rows
 are Code 499 S3 timeouts on 268-byte and 4,606-byte objects — environment, not a defect — with the triage
 attached rather than the entry deleted, so nobody re-investigates it. 55 local commits.
+
+**01:26 UTC watchdog** — idle: nothing running, 320G, load 0.80, 0 uncommitted, 56 local commits. No long
+run, so no signals to observe. **The reproduction strengthened on its own: still exactly 15 stale-edge
+blobs, now at 642 GC rounds** — 533 rounds since the time series began, none reclaimed. For scale, the
+historical 56 held flat across 1,062 rounds; this cohort is halfway there and behaving identically. Stand
+preserved deliberately; the evidence is also captured to
+`reports/2026-07-26-s42-stale-edge-repro/` so the stand is not load-bearing.
