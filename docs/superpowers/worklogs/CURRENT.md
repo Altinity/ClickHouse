@@ -162,3 +162,34 @@ believed.
 BLOCKED ON AN INSTRUMENTATION GAP, which is worth its own note: `ref_object_cleanup`'s phase metrics carry
 `namespaces_planned` / `suppressed` / `trim_enabled` but NOT how many objects were deleted. That is exactly
 the number this investigation needs, and its absence is the same shape as everything else this week.
+
+### Probe A — elimination complete, and the remainder is the original hypothesis
+
+Ruled out, each by reading or measuring:
+
+| Candidate | Why it is out |
+|---|---|
+| Deletion by the folding node between its two walks | The ONLY deleter of ref-log objects in the whole tree is `CasGc.cpp:2080`, inside the post-CAS cleanup — after both walks of its own round |
+| Deletion by the peer | ch1 emitted no `fold_ref_intake` and no `ref_object_cleanup` phase in ch2's gap windows — it was not folding |
+| Namespace erase | No DROP/TRUNCATE in the run, no `namespace_removals` |
+| Scope or filter mismatch between the walks | Both use `forEachListedKey(backend, layout.casRefsPrefix(), …)` with `kind == Log` |
+| A cap or deadline truncating one walk | Both use page size 1000, neither carries a budget, limit or deadline |
+
+**And the lease-straddle hypothesis I was carrying is REFUTED** — it required the peer to clean up during
+the freeze, and the peer did nothing.
+
+What survives is the hypothesis this whole line of work started from: **the object store returned two
+different answers for the same durable prefix.** Never directly observed until now.
+
+The strongest supporting evidence is a pattern I did not expect and did not look for: the hole count scales
+with the size of the enumeration — 1 hole at 38,355 keys, 3 at 85,943, 10 at 127,742. A one-off event
+(a freeze, a restart, a single cleanup) does not produce that. A per-page inconsistency rate does.
+
+NOT YET PROVEN, and I am not going to write it up as proven: no hole has been observed DIRECTLY. The
+decisive experiment is cheap and specific — list `cas/refs/` twice against the live rustfs under write
+load and diff the two key sets, outside GC entirely. If they differ, the store is the source and probe A
+is doing exactly its job; if they never differ, the disagreement is being introduced somewhere between the
+backend adapter and the probe, and that is a different bug in our own code.
+
+Note this cuts BOTH ways for the option-C decision: if the store is the source, the detector was the right
+call and the journal chain becomes more urgent, not less.
