@@ -833,3 +833,29 @@ Log fresh (5 s). Disk 321G — recovered, since `down -v` released the old pool 
 that is a sync-insert soak under way, not a stall.
 
 Nothing to unstick. 21 local commits held back per the push instruction.
+
+## 2026-07-26 16:56 UTC — watchdog: soak healthy at t+10m; three things worth recording
+
+Soak alive (605 s of 20 min), log written 2 s ago, 311G disk, load 6.0. Nothing to unstick.
+
+**1. The blocker was CAUGHT (see BACKLOG {#probe-a-caught-live}).** Walk 1 returned ref log `0x1430e` and
+skipped `0x1430c`/`0x1430d`, the two consecutive keys below it; a HEAD at the moment of the disagreement
+says both are PRESENT. `RefScanDisagreements=2 ProbeAHolePresent=2 ProbeAHoleAbsent=0`. The out-of-order-
+append branch is closed by verifying the ordering guarantee at three levels, so the enumeration was
+incomplete. Four minutes into the first soak carrying the new instrumentation, after three hammer runs and
+~19M listed keys had found nothing.
+
+**2. My partial-fsck regression is gone, and the underlying problem is NOT.** Zero occurrences of the false
+"PERSISTENT dangling" message this run — the waiter takes complete scans again and a timeout degrades to a
+logged skip. But the skip still happened: `entry-gate fsck timed out (exceeded 180s)` on a **5.5 GB** pool.
+So #13 made the failure honest, not absent. The fsck budget problem is open and the entry gate is still
+being skipped exactly when the pool is big — that is worth its own item, not a footnote.
+
+**3. `CasGcUnmatchedRemoveDeltas=22` — the retention-leak signal is firing, and it is the KNOWN one.** Not
+a reappearance requiring systematic debugging: {#unmatched-minus-one-retention-leak} is root-caused and
+deliberately NOT fixed (task #11 open), so the counter firing is the instrument working on an open defect.
+Saying so explicitly because the standing instruction is to stop and escalate if the retention defect
+reappears — this is the same defect, still unfixed, not a new one.
+
+**Signal duty:** `signals=2/2 nodes` on every tick, both new verdict counters in the preflight set with a
+per-node baseline. Genuinely read, not merely present.
