@@ -100,3 +100,36 @@ Gate at the stop: 1382/1382 unit, 11/11 integration.
   `not-checked` (`e49f...` follow-up commit). Fifth instance this session of reporting degrading to
   something that reads as absence.
   Disk 315G, load 3.8.
+
+## 03:26 UTC — PROBE A FIRED IN A LIVE RUN. Shakeout #2 green, but it caught something.
+
+`PHASE3 OK`, `SOAK_EXIT=0`, 0 failures — and:
+
+    fold_ref_list.probe_a_holes = 14
+    fold_ref_list.ref_folding_aborted = 3
+    CasGcRefScanDisagreements peak = 14
+
+The two enumerations of `cas/refs/` that a round already performs DISAGREED, 14 times, and the fold aborted
+three times. The fail-closed path did its job: the fold was discarded and the cursor did not advance.
+
+This is the first time the mechanism has been OBSERVED rather than inferred or modelled. It is also exactly
+what the instrumentation was built for, so it now goes to systematic debugging rather than to a guess.
+
+**Evidence captured** (`soak_partb_20m_2.db`, table `gc_phases`): the firing row is node
+`localhost:8124`, checkpoint "GC checkpoint (stage §8 checkpoint+GC)", `ref_keys_listed=385442` over 20
+namespaces. The peer node was unreadable in that window.
+
+**What the window contained:** chaos faults #1-#3 — ch2 pause 22 s, ch2 freeze_long 80 s, both kill 37 s.
+It did NOT contain a rustfs pause; those are faults #4/#5 at t+810/874, after this window closed. So the
+object store itself was never interrupted, which removes the most convenient benign explanation.
+
+**Leading hypothesis, NOT established, and it is a FALSE-POSITIVE hypothesis rather than a defect one:**
+probe A's max-witness rule excludes concurrent APPENDS (they sort above the other walk's maximum) but says
+nothing about concurrent DELETIONS. GC's own ref-log cleanup deletes exactly these objects. An id present
+in walk 1, deleted before walk 2, and below walk 2's maximum fires the probe and is entirely legitimate.
+If that is what happened, the probe is over-firing and its rule needs a deletion-aware exclusion — and,
+importantly, `ref_folding_aborted=3` means over-firing COSTS us: it discards real folds.
+
+The alternative is that these are genuine holes, which is the defect we have been chasing.
+
+Distinguishing the two is the job. Handing it to systematic debugging now.
