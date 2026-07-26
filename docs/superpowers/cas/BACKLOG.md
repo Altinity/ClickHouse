@@ -2013,3 +2013,62 @@ each the tail of a deliberate 2026-07-22 change nobody updated the test for: `la
 emitted after it was turned off; a `FakeNode` answering only `ping` after the readiness gate started
 proving table load with a real read; an error-message assertion pinned to the pre-2026-07-22 wording. A red
 suite is worse than no suite — nobody can tell signal from noise in it. Now 275 pass, 0 fail.
+
+## Probe A, task #12: the hypothesis space is now THREE, and the third one is new {#probe-a-direction-evidence}
+
+### CORRECTION FIRST: my own "zero probe A lines" reading was a masked permission error {#probe-a-permission-error}
+
+I grepped the soak's server logs from the host, got `0` everywhere, and wrote in the worklog that the
+current logs hold no probe A lines. The files are `-rw-r----- syslog:syslog`; my user is not in `syslog`.
+Every one of those greps was PERMISSION DENIED, and `2>/dev/null || echo 0` turned each denial into a
+confident zero. **That is the project's recurring failure shape, produced by my own shell.** Re-run inside
+the containers, the same logs hold 177,276 probe A lines on ch2's current log alone. Never let `|| echo 0`
+stand in for a command that can fail for reasons other than "no match".
+
+### Lost-lease: REFUTED {#probe-a-lease-refuted}
+
+Correlated all seven surviving firings against `gc_fence` / `gc_fence_out` / `mount_remount` /
+`mount_conflict`. **No lease-class event falls inside any firing window**, on either node, including the
+244,939 instance; a ±60 s halo finds nothing for it either. `gc_fence` fired 400 times on ch1 and 4,245 on
+ch2 during the run, so the logging is live and its silence here means something. My earlier claim that the
+giant instance was "very likely a lost-lease artifact" is withdrawn.
+
+(An intermediate query returned `NULL` rather than `0` from a correlated subquery. Reading that as "no
+events" would have reached the same conclusion by accident. Redone offline against the full event list.)
+
+### The direction split, which is the real evidence {#probe-a-direction-split}
+
+Probe A logs every hole with its id AND its direction. The two directions are not equally informative:
+
+| direction | ch1 | ch2 | what it excludes |
+|---|---:|---:|---|
+| missing from the FOLD's scan (walk 2) | 0 | 338,559 | nothing — concurrent deletion explains it |
+| missing from the PRE-FOLD scan (walk 1) | **30** | **28** | deletion cannot: walk 2 SAW the object |
+
+For the second direction the object demonstrably existed, and its id is below what walk 1 had already
+observed for that namespace, so walk 1 should have returned it.
+
+**Stale-epoch writer is also excluded.** Every one of the 58 ids carries epoch `0x4`, with near-consecutive
+sequences (`0x1f171`, `0x1f173`, `0x1f174` inside one namespace at one instant). A writer at an older epoch
+would be the only way to mint an id below `pre_max` after walk 1 — and these are not from an older epoch.
+
+### The third hypothesis, which the probe's own message does not consider {#probe-a-third-hypothesis}
+
+The log line asserts "an append cannot explain this". That reasoning holds only if appends become VISIBLE
+in sequence order. If a ref-log PUT can still be in flight while a later-sequenced PUT has already landed,
+then walk 1 legitimately sees `0x1f180` and legitimately misses `0x1f174` — no listing hole required, and
+walk 2 later sees both.
+
+This is not idle: `appendRefOps` uses a leader/batch model (`pending.push_back`, a leader carves and
+flushes a batch) and the queue mutex is released around the flush. Whether one leader's flush can issue
+several ref-log PUTs whose completions are observable out of order is the question, and it must be READ
+rather than assumed.
+
+**So #12 is not settled, but it is much better posed.** Either the object store returned an incomplete
+prefix — the release blocker {#list-as-journal-dataloss-2026-07-25}, observed rather than modelled — or
+the probe's justification has a hole and 58 of its firings are false positives that abort folding for
+nothing. Both outcomes matter, and they are distinguished by one question about the append path.
+
+**Next step, precisely:** determine whether a single leader's batch flush can have two ref-log PUTs in
+flight simultaneously for the same namespace. If it cannot, in-order visibility holds, the third hypothesis
+dies, and the 58 holes ARE the blocker observed in the wild.
