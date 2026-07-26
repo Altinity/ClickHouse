@@ -631,3 +631,36 @@ nothing. One question decides it: can a single leader's batch flush have two ref
 same namespace at once? That must be READ, not assumed, and is where #12 resumes.
 
 BACKLOG {#probe-a-direction-evidence}, commit `05992148a9b`.
+
+## 2026-07-26 13:26 UTC — watchdog: idle; #12 ANSWERED — the blocker is observed, not modelled
+
+Watchdog: idle, 313G, load 0.37, containers healthy, no long run so the signal-observation duty is not
+applicable. Not pushing per the user's instruction; commits are local from here.
+
+Closed out #12 by excluding the remaining alternatives one at a time:
+
+- **Two appends in flight, completing out of order** (the hypothesis I raised last turn, which the probe's
+  own message assumes away) — DEAD. `leader_active` is per-`RefTable` under `ref_queue_mutex`, so one
+  leader per namespace; `putIfAbsentControlled` is synchronous and awaited; a carved chunk seals to exactly
+  one object. W's PUT completes before X's is issued.
+- **A late-landing `Unresolved` PUT after resolution freed the id** — DEAD, and the source says so
+  outright: `resolveByExactGet` never reports a plain absent verdict; absent returns `Unresolved` and the
+  lane stays wedged. The id is never freed. Worth excluding rather than assuming —
+  `CasConditionalWriteUnresolved` fires 416 times on ch1 in a few hours.
+
+With deletion and stale-epoch already excluded by direction and by the ids, what remains is the probe's
+first-named explanation: **the object store gave two different answers about the same durable prefix.**
+{#list-as-journal-dataloss-2026-07-25} moves from mechanised-in-TLA+ to **observed in a running system**.
+
+Two limits recorded with it, because the headline is stronger than the evidence in two specific ways: this
+is RustFS and not AWS S3 (changes the alarm level, not the design conclusion — the GC must not depend on
+LIST completeness either way), and the in-flight-append exclusion rests on reading the append path rather
+than on an experiment.
+
+**And the reassuring half: the detector worked.** All 7 firings aborted ref folding — no cursor advanced,
+nothing was deleted. The blocker's blast radius did not occur because the probe built earlier this round
+stopped it, on its first live outing, against exactly the defect it was aimed at.
+
+Next cheap step named in BACKLOG {#probe-a-store-experiment}: hammer RustFS directly — known key set,
+repeated LIST under concurrent writes, diff each answer — to confirm the store-side behaviour without a
+soak.
