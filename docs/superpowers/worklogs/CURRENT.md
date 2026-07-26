@@ -769,3 +769,37 @@ picking the least-disproved option and calling it settled.
 Leading candidate, and it is testable: the CAS walk lists through the ClickHouse S3 client WITH RETRIES,
 under chaos; the hammer used boto3 against a healthy store. Inject page-level errors into the hammer and
 see whether short adjacent runs start vanishing.
+
+## 2026-07-26 15:56 UTC — watchdog: idle; and the user's question found the real defect
+
+Watchdog: idle, 313G, load 0.71, probe prefix cleaned up by the tool itself, containers healthy, no long
+run so the signal duty is not applicable.
+
+**sa1 (start-after pagination — what CAS actually does) came back CLEAN**: 40 rounds, 6.08M keys, ~15,500
+deletes under each walk, zero holes. Three valid runs now, ~19M keys listed, nothing. Two more hypotheses
+also died on inspection: both walks use page limit 1000, and both filter with `parseRefObjectKey` (their
+only asymmetry is that walk 1 skips an unparseable key silently while walk 2 aborts the round — worth
+tidying, but it produces an abort, not a hole).
+
+**Then the user asked why the audit log could not trace this, given that we write the full context of every
+critical decision into `detail`. Checked, and the answer IS the defect:**
+
+```
+gc_fold_end   detail = {anomalies: '1', shards: '8'}
+gc_fold_begin detail = {}                                -- empty on every row
+```
+
+`recordAnomaly` takes namespace, shard, manifest and reason. None of it reaches the table. Probe A aborts
+ref folding and the queryable record of that decision is the number **1** — which cannot even distinguish a
+probe A disagreement from an undecodable ref-log body. There is a `gc_fold_end` at 08:30:35 carrying
+`anomalies=1` that I cannot identify at all.
+
+So the reason I spent this round doing archaeology on gzipped syslog-owned text logs — and produced a
+masked-permission false zero doing it — is that the event which fires at the exact moment of interest
+writes a counter. That is a bigger finding than any of the three hammer runs, and the user got to it by
+asking why the obvious tool was not being used.
+
+New task #20: per-anomaly audit event carrying reason, namespace, hole id, DIRECTION, the other
+enumeration's max id, and the HEAD verdict on the hole key. It subsumes the HEAD-at-firing-time step and is
+far smaller than the experiments it replaces. Volume caveat recorded: a 244,939-hole firing must not write
+244,939 rows.
