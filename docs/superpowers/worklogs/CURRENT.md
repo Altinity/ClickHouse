@@ -518,3 +518,34 @@ that a larger fold window pushes redundancy higher is a prediction, and task #10
 
 Task #10 (rig) unblocked and its description updated with what it must now verify. BACKLOG
 {#gc-manifest-reuse-measured}, commit `256f01fb7d7`.
+
+## 2026-07-26 12:26 UTC — watchdog + task #13 DONE (four defects, not one)
+
+Watchdog: idle, healthy, 322G disk, load 0.45, containers up, remote in sync, no long run so the
+signal-observation duty is not applicable. Noted a stale premise in the watchdog text itself — it still
+says "until the user has confirmed", and the user confirmed with "начинай"; the consolidation freeze is
+over and the round is running.
+
+Task #13 was carded as "the `corrupted_runs` one-liner plus the 180 s budget". Measuring first turned it
+into four, two of them worse than the card:
+
+1. `corrupted_runs` invisible on the summary AND non-fatal, though it is a `clean()` term. Summary moved
+   into `Cas::formatFsckSummary` so a test can reach it; the test is written against `clean()`'s own terms.
+   **Proved it fails without the fix** rather than trusting a green.
+2. The 180 s budget was an INVERSION — subprocess 180 s, scan deadline 600 s — so `--partial` was
+   unreachable from the harness. Measured cost: **4 of 39 checkpoints lost their whole fsck gate** in the
+   4h soak, plus 4 entry-gate skips.
+3. **Turning `--partial` on would have introduced a fabricated consistency proof.** A timed-out scan now
+   returns `dangling=0`, and `wait_for_pool_consistent` counts that as a clean read. Caught by writing the
+   regression test before believing the fix.
+4. The `M-F debris, B140` label still printed 40 times per run, at THREE sites — the third found only by
+   re-grepping the whole file after `grep | head -3` showed two.
+
+Also cleared **4 pre-existing RED tests** in the harness suite, found while running it for this task. All
+stale tests, each the tail of a deliberate 2026-07-22 change: `lazy_load_tables` asserted after it was
+turned off, a `FakeNode` answering only `ping` after the gate started proving table load by reading, an
+error string pinned to the old wording. 275 pass / 0 fail; CAS gtest gate 1260 pass.
+
+Residual recorded, not half-fixed: the remaining `FsckTimeout` path still substitutes fabricated zeros.
+Every consumer is guarded today, so it is a landmine rather than a live defect; removing it means auditing
+every downstream `f.get(...)`. BACKLOG {#fsck-fabricated-clean-on-timeout}.
