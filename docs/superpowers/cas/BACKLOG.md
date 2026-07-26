@@ -1647,3 +1647,61 @@ Also worth noting alongside: `ca-fsck` exits 0 on `stale_edge > 0` — only `dan
 `snapshot_oracle_mismatches` throw — so the soak checkpoint's existing `exit_code != 0` gate never covered
 that class either. The new checkpoint assert is the only gate, deliberately (see
 {#q3-stale-edge-nonfatal}: the user chose non-fatal for the applet).
+
+## GC performance, FIRST MEASUREMENT (2026-07-26) {#gc-perf-first-measurement}
+
+No dedicated performance test has been run — this is the metric study the user scheduled for after the
+soak ({#q5-gc-introspection-now}), mined from the per-phase rows the 4 h run collected over 1,673 round
+attempts. It is the first quantitative answer to "where does GC slow down", a question that had no
+answer at all before this week because the GC carried no timers.
+
+### Where the time is
+
+| phase | rows | total | p50 | max |
+|---|---:|---:|---:|---:|
+| `fold_ref_intake` | 126 | **2998 s** | 21 ms | **1830 s** |
+| `fold_ref_list` | 128 | 1355 s | 98 ms | 491 s |
+| `defer_decision` | 253 | 1346 s | 98 ms | 431 s |
+| `orphan_sweep` | 123 | 975 s | **383 ms** | 526 s |
+| `ref_object_cleanup` | 123 | 785 s | 0 ms | 500 s |
+| `fold_reduce` | 125 | 760 s | 7 ms | 372 s |
+| `manifest_deletes` | 123 | 724 s | 0 ms | 556 s |
+| `lease` | 2255 | 104 s | 2 ms | 52 s |
+
+Two shapes, and they call for different responses. `fold_ref_intake` has a p50 of 21 ms and a max of
+**1830 s** — five orders of magnitude; the median round is free and the whole cost lives in the tail.
+`orphan_sweep` is the opposite: the worst MEDIAN at 383 ms, a steady toll on every round. `lease` runs on
+all 2,255 rounds and costs nothing — worth knowing so nobody optimises it.
+
+### The intake tail is LINEAR in the ref-log backlog
+
+| logs folded | duration | ms per log |
+|---:|---:|---:|
+| ~0 (120 rounds) | 21 ms | — |
+| 5,000 | 28.6 s | 5.72 |
+| 15,000 | 116.0 s | 7.73 |
+| 95,000 | 260.2 s | 2.74 |
+| 120,000 | 245.3 s | 2.04 |
+| 130,000 | 507.0 s | 3.90 |
+| 400,000 | 1829.6 s | 4.57 |
+
+**Weighted mean 3.9 ms per ref log ⇒ ~256 logs/s sustained fold throughput.** The per-log cost is flat
+across two orders of magnitude of backlog, which is what one object-store GET per log looks like — and the
+fsck measurement on the same store put ~70% of wall time in I/O wait, not CPU.
+
+### What this settles
+
+The CI throughput collapse ({#gc-throughput-collapse-2026-07-25}) was RCA'd as a queue-stability crossing
+and is now MEASURED: the fold's service rate is ~256 logs/s, so if ref logs arrive faster than that the
+backlog grows, the next round is longer, and more accumulates while it runs. The 400k-log round taking
+half an hour in a single phase is that loop at work. Nothing about it is mysterious any more; it is a rate
+mismatch with a number attached.
+
+### Caveats, stated because the numbers look cleaner than they are
+
+- The data comes from chaos runs. Node freezes and kills inflate tails; some part of the max column is a
+  frozen process, not work. Separating those needs a no-chaos run, which has not been done.
+- Sample sizes at the top of the backlog range are n=1 per bucket. The linearity rests on six points.
+- Per-log cost is presumed to be one GET each; that is inferred from the flatness and the I/O-bound
+  fsck measurement, NOT from counting requests. The per-phase rows carry `ProfileEvents`, so the request
+  count per phase is available and would settle it — that is the cheapest next step.
