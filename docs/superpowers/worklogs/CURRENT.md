@@ -355,3 +355,32 @@ instrumentation — the phase rows record the enumeration but not the lease iden
   `defer_decision=3.6s` dominating, while ch2 shows total=1.0s. Under load earlier the dominant phase was
   `fold_ref_intake` at 196s. So the phase that costs the most depends entirely on the regime — which is
   exactly the thing no one could see before this instrumentation existed, and exactly what the study needs.
+
+## 10:26 UTC — 4-HOUR PART B SOAK GATE: PASSED
+
+`PHASE3 OK`, `SOAK_EXIT=0`. Task 21 is complete: three green 20-minute shakeouts, then four green hours.
+
+| | |
+|---|---|
+| Workload / checkpoint failures | **0** |
+| Checkpoints OK | 40 |
+| `stale_edge` | **72 evaluations, all 0** (+ the 4 early skips) |
+| Signal reads | **529 successful, 45 probe gaps** — gaps classed as node-down, never as zeros |
+| GC phase capture | **67/80 checkpoints, 1,673 round attempts observed** |
+| Chaos | 54 faults, 28 restarts |
+| `ABORTED`-retried INSERT attempts | **0** |
+| SELECT workload | 10,723 queries, 193.8M rows, 118 non-fatal failures |
+| Availability by class | `mount_fenced=4`, `node_down=330` — all absorbed by driver retries |
+
+What this run actually establishes, beyond "it stayed up": the instrumentation built during this round WORKS
+under four hours of chaos. 529 signal reads with the gaps honestly separated from zeros; 1,673 round
+attempts with per-phase timing; 72 real evaluations of an assert that did not exist yesterday.
+
+**Probe A fired twice** — 15 holes, and the 244,939 instance analysed earlier. The investigation stands
+where it was: the giant instance has a peer `ref_object_cleanup` six seconds before it and is very likely a
+lost-lease artifact, and the missing instrumentation to settle it is the lease identity at each end of the
+enumeration. That is the next concrete step and it is small.
+
+Of the three things the user is waiting for: **(1) soak with the new introspection — DONE and green.**
+(2) S42 results and (3) the GC-under-load study remain, and the study now has 1,673 rounds of phase data to
+start from rather than nothing.
