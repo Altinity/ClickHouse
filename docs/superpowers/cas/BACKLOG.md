@@ -2622,3 +2622,24 @@ S42 was the consumer.
 
 **Next attempt must be at `--scale ci`,** with disk headroom checked BEFORE launch and memory headroom
 checked as a precondition of the fault injection being meaningful.
+
+### `pending_deletes` at 77 s has the SAME shape — and the obvious remedy is unavailable {#pending-deletes-shape}
+
+Phase 11/18 is a nested serial loop — per gc-shard, per retired entry — issuing one
+`backend.deleteExact(blobKey, token)` per object. One round trip each, awaited, no pool, no batching. At
+the measured ~0.5 ms per request, **77.2 s is roughly 150,000 deletes performed one after another.**
+
+So intake and pending_deletes are the same story: request-bound and serial.
+
+**The obvious remedy — S3 `DeleteObjects`, up to 1000 keys per call — is NOT available, and it is worth
+recording why so nobody re-proposes it.** `deleteExact` is SAFETY-critical and token-conditional: it must
+remove ONLY the incarnation whose token matches, and a wrong token must be a `TokenMismatch` with the
+object untouched (`CasBackend.h`: "conditional PUTs are protocol hygiene; casPut and deleteExact are
+SAFETY-critical", and backends that silently ignore the condition are rejected by `Cas::Probe`). Bulk
+delete carries no per-object precondition, so batching would trade exactness — the guarantee that GC never
+removes a replaced incarnation — for throughput. That is the wrong trade at any speedup.
+
+The backend exposes no bulk path at all, which is consistent with that.
+
+**Parallelism, however, IS available here**: N concurrent conditional deletes preserve exactness perfectly,
+because each carries its own token. The same lever as intake, and the same reason it works.
