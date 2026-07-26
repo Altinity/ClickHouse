@@ -466,3 +466,26 @@ question, BACKLOG {#gc-perf-multiplier-attributed}, commit `4adaa5b923b`.
 
 Task #10 (the rig) was gated on this and is now unblocked in principle, but it is implementation and the
 round has not been started. Not scheduling it.
+
+## 2026-07-26 11:56 UTC — watchdog: idle, healthy, one more read-only decomposition
+
+Idle. No build, no soak, no agent; nothing written in 30 min. Disk 322G, mem 33G free, load 1.14. Soak
+containers healthy. Remote in sync. Codex leftovers from previous sessions still resident, work complete,
+not reaped (shared worktree). **Signal-observation duty not applicable — no long run in flight.**
+
+Diagnosis only, on the same captured rows: `txns_opened == logs_intended` exactly (one transaction per log,
+no batching); `deltas_emitted / edges` ≈ 14-20 and stable across a 70x range, so each manifest yields about
+sixteen in-degree deltas — large in absolute terms (24.6M on the 404k round) but CPU work, not store
+traffic; `tables_scanned` is 2-8, so the ref-table dimension is irrelevant to this phase.
+
+Useful part: it sharpens #17 from "is there repetition" into something specific. A transaction that
+publishes one ref and drops another names two manifests, hence two fetches — and if both concern the SAME
+manifest that is one body fetched twice. The writer path already showed this exact shape once
+([[project_part_removal_repoint_waste]], ~22% of the writer PUT class in `delete_tmp_*` repoints). Recorded
+as HYPOTHESIS, not finding: no counter separates two manifests from one manifest twice.
+
+Also noted, because it may save the product change entirely: the cheap half of #17 is answerable READ-ONLY
+by decoding a sample of `_log/` objects on the stand and checking whether manifests repeat within a single
+transaction. Not done from a watchdog turn.
+
+Nothing scheduled. Round not started; consolidation stands.
