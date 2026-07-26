@@ -2438,3 +2438,45 @@ someone should make deliberately rather than inherit.
 20-minute run. The GC-performance work has been looking at `fold_ref_intake` because that is what dominated
 the 4-hour data; this says `pending_deletes` deserves its own look. Folded into the study
 ({#gc-bottleneck-study-2026-07-25}), not chased now.
+
+### #11 and #19 are the SAME DEFECT seen from two ends {#leak-is-a-consequence-of-the-hole}
+
+Reading `CasBlobInDegree.cpp`'s merge against the recorded root cause makes the connection plain, and it
+reframes the leak fix.
+
+In-degree is a SET of source edges. The leak is a residual `+1` whose `-1` never folded
+({#unmatched-minus-one-retention-leak}: 56 blobs, exactly one residual edge each, contributing manifest
+gone). There are exactly two ways a `-1` fails to cancel its `+1`:
+
+1. **The `-1`'s ref log was OMITTED from an enumeration and the cursor advanced past it.** The log is never
+   folded again — sealing a cursor above a record is permanent — so the `+1` stands forever. This is
+   {#list-as-journal-dataloss-2026-07-25}, and as of {#probe-a-caught-live} it is CONFIRMED to happen.
+2. **The `-1` arrived BEFORE its `+1`.** `present` is false when the remove is applied, so the remove is
+   dropped as a per-key no-op; the `+1` then lands with nothing left to cancel it. This is the direction
+   `CasGcUnmatchedRemoveDeltas` counts — 22 occurrences in the 20-minute verdict soak.
+
+So the retention leak is not an independent bug to be fixed in the reducer. **It is a CONSEQUENCE**, and
+the reducer is behaving correctly in both cases: a set cannot cancel an element it never received, and
+dropping an unmatched remove is exactly right (the alternative — materialising a negative edge — is how a
+false deletion would be born).
+
+### What this changes about the fix {#leak-fix-reframed}
+
+**Do not "fix" the merge.** The obvious remedy was already known to be wrong (`RefTableState` throws
+`CORRUPTED_DATA` on an absent binding, turning a leak into a permanent wedge); this says something stronger
+— there is nothing to fix at that layer at all.
+
+Three separable pieces of real work instead:
+
+- **Source, path 1:** enumeration completeness. Probe A already ABORTS folding when it catches a hole, so
+  the cursor does not advance and path 1 is closed for holes it catches. Its two stated blind spots remain
+  open: a hole that reproduces IDENTICALLY in both enumerations, and a namespace dropped WHOLESALE from one
+  enumeration (no `ref_tables` entry, so the comparison loop never visits it).
+- **Source, path 2:** whatever lets a `-1` reach the reducer ahead of its `+1`. Unexamined. 22 occurrences
+  in 20 minutes is not rare, and it needs its own investigation — `CasGcUnmatchedRemoveDeltas` hands back
+  one example per round (`unmatched_remove_example`), which is where to start.
+- **The 56 already-leaked blobs:** a one-off reconciliation, since no incremental round can ever reclaim
+  them. Only a rebuild of the in-degree state can, which is what the fsck note already says.
+
+Task #11's framing ("fix the unmatched-minus-one retention leak") is therefore wrong as written and has
+been left in place only so the history reads honestly; the work is the three items above.
