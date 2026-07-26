@@ -2411,3 +2411,30 @@ nothing is better than one that lies, and still not a check. Options, none yet c
   per-request cost dominates here.
 
 Tracked so the skip does not become the accepted normal.
+
+### Verdict soak: GREEN, and three things it taught beyond the catch {#verdict-soak-outcome}
+
+`PHASE3 OK`, `SOAK_EXIT=0`. 88 signal reads, both new counters in preflight with per-node baselines, GC
+phases captured at 5/6 checkpoints over 179 round attempts.
+
+**1. The ProfileEvents counters were WIPED and the audit rows survived.** Final `system.events`:
+`disagreements=0 present=0 absent=0` on both nodes — chaos restarted the servers and process-local counters
+reset. `system.content_addressed_log` still holds the 2 `gc_anomaly` rows on ch1, with the ids, the
+direction and the `present` verdicts intact.
+
+**The finding this whole round turned on would have been ERASED by a restart if I had shipped only the
+counters.** The audit event is what made it durable, and that was the user's point when they asked why the
+CA log was not being used. Recording it because the reflex "add a ProfileEvent" is cheap and would have
+quietly lost the evidence.
+
+**2. Probe A is `reported-not-gated`** — `CasGcProbeAHolePresent peak=2, nonzero_in=28/88 reads`. A soak can
+go green with confirmed enumeration holes. Defensible today: the product already fails closed (folding
+aborted, no cursor advance, nothing deleted), so the run genuinely was safe. But now that the holes are
+CONFIRMED rather than suspected, whether a green run should be allowed to contain them is a decision
+someone should make deliberately rather than inherit.
+
+**3. `pending_deletes` hit 77.2 SECONDS in a single occurrence** — against `orphan_sweep=242.8ms`,
+`fold_reduce=223.1ms`, `fold_ref_list=60.7ms`. Three orders of magnitude above every other phase, on a
+20-minute run. The GC-performance work has been looking at `fold_ref_intake` because that is what dominated
+the 4-hour data; this says `pending_deletes` deserves its own look. Folded into the study
+({#gc-bottleneck-study-2026-07-25}), not chased now.
