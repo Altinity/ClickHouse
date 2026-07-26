@@ -208,3 +208,8 @@ call and the journal chain becomes more urgent, not less.
   consistent across continuations under concurrent writes". That is a sharper, cheaper thing to test.
   What a valid test needs: a ref prefix of >100 pages AND demonstrable concurrent appends during the walk.
   Building that state takes a sustained insert run, not a 45-second one.
+- 05:26 UTC — watchdog: started soak #3 (seed 3) for two purposes at once — a third shakeout data point,
+  and the STATE the decisive experiment needs. Within 90 s the ref prefix was already 28,842 keys / 29
+  pages, versus the 285 keys / 1 page my earlier attempt ran against, so the pagination condition that
+  attempt lacked is now reachable. Running probe A's rule outside GC against it while the soak writes;
+  result pending in the background.
