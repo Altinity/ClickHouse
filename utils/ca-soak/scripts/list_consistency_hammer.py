@@ -36,20 +36,48 @@ class Store:
     def put(self, k, body=b"x"):
         self.s3.put_object(Bucket=self.bucket, Key=k, Body=body)
 
-    def list_all(self, prefix, page_size):
-        """One complete paginated enumeration of the prefix. Returns keys in the order returned."""
-        out, token = [], None
+    def list_all(self, prefix, page_size, mode="continuation"):
+        """One complete paginated enumeration of the prefix. Returns keys in the order returned.
+
+        Two modes, and the difference is the whole point of this tool:
+
+        ``continuation``
+            One listing SESSION resumed by the server's opaque `ContinuationToken`. This is what boto3
+            paginators do by default and what the first hammer runs used.
+
+        ``start-after``
+            A FRESH listing session per page, resumed by the LAST KEY RETURNED. **This is what CAS
+            actually does** — `forEachListedKey` (CasBackend.h) documents its cursor as "last key
+            returned", and `ObjectStorageBackend::list` builds a new `object_storage->iterate(...,
+            start_after)` for every page, abandoning the previous iterator.
+
+        The two exercise different store code paths. Under `start-after` each page boundary STITCHES TWO
+        INDEPENDENT ENUMERATIONS together, so any disagreement between them lands exactly at a boundary —
+        which matches the observed hole shape (short runs of adjacent keys, not whole pages). Under
+        `continuation` the server keeps one cursor and no stitching happens. The first two runs found
+        nothing while testing the mode CAS does NOT use.
+        """
+        out, token, after = [], None, None
         pages = 0
         while True:
             kw = {"Bucket": self.bucket, "Prefix": prefix, "MaxKeys": page_size}
-            if token:
-                kw["ContinuationToken"] = token
+            if mode == "continuation":
+                if token:
+                    kw["ContinuationToken"] = token
+            elif after is not None:
+                kw["StartAfter"] = after
             r = self.s3.list_objects_v2(**kw)
-            out.extend(o["Key"] for o in r.get("Contents", []))
+            got = [o["Key"] for o in r.get("Contents", [])]
+            out.extend(got)
             pages += 1
-            token = r.get("NextContinuationToken")
-            if not r.get("IsTruncated"):
-                break
+            if mode == "continuation":
+                token = r.get("NextContinuationToken")
+                if not r.get("IsTruncated"):
+                    break
+            else:
+                if not got or not r.get("IsTruncated"):
+                    break
+                after = got[-1]          # exactly CAS's `next_cursor = page.keys.back().key`
         return out, pages
 
     def delete_prefix(self, prefix):
@@ -84,6 +112,10 @@ def main():
                          "single PUTs by an order of magnitude. A run whose rounds list single digits "
                          "measures nothing.")
     ap.add_argument("--page-size", type=int, default=1000, help="matches the CAS listing page size")
+    ap.add_argument("--paginate", choices=["continuation", "start-after"], default="start-after",
+                    help="how to resume between pages. DEFAULT is start-after because that is what CAS "
+                         "does; continuation is kept only to reproduce the first runs, which found "
+                         "nothing precisely because they tested the wrong mode.")
     ap.add_argument("--keep", action="store_true", help="do not delete the probe prefix afterwards")
     a = ap.parse_args()
 
@@ -169,7 +201,7 @@ def main():
                 mine = rounds_done[0]
             with dlock:
                 snapshot = set(durable)           # known durable BEFORE this listing began
-            keys, pages = st.list_all(prefix, a.page_size)
+            keys, pages = st.list_all(prefix, a.page_size, a.paginate)
             got = set(keys)
             if not got:
                 continue
