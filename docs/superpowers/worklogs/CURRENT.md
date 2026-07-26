@@ -935,3 +935,8 @@ recommendations, Part B test debt, S42 — are all substantial enough to deserve
 **18:56 UTC watchdog** — idle, unchanged from 18:26: nothing running, 323G, load 0.42, containers healthy,
 0 uncommitted, 35 local commits. No long run, so no signals to observe. Nothing scheduled; the open items
 all warrant a deliberate start rather than a timer-driven one.
+
+**19:26 UTC watchdog** — idle, unchanged: nothing running, 323G, load 0.66, 0 uncommitted, 36 local
+commits. Evidence intact (2 `gc_anomaly` rows on ch1, and captured to
+`reports/2026-07-26-list-incompleteness-proof/` so the stand is no longer load-bearing). No long run, no
+signals to observe. Nothing scheduled.
