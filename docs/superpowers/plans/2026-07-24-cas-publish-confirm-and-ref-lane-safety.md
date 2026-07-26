@@ -2,6 +2,15 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **ROUND STATUS 2026-07-26 — CLOSED for this round.** Tasks 1-16 (Part A ref-lane exception safety,
+> Part B publish-confirm protocol v11) are DONE, reviewed by codex, and the review's findings are fixed
+> (`8e6fe6ef0af`) — with two of the reviewer's four remedies rejected as WRONG, one of which would have
+> turned a leak into a permanent wedge. Task 17-18 done. Task 19 SUPERSEDED (see its own status). Task 21
+> (the soak gate) DONE and green. **Still open and carried forward: Task 20 (deferred, different scope),
+> Tasks 22-25** — gate 0 has no test, the review's genuinely-missing tests, `test_cas_replicated_relink`
+> being green for the wrong reason, and the residual `eraseView` post-commit window. Those four are real
+> debt, not bookkeeping; they are listed in BACKLOG so they survive this plan.
+
 **Goal:** Close two defects on `cas-gc-rebuild`: (A) the ref lane can lose a durable transaction from
 its in-memory view and then permanently hide it behind a snapshot — a data-loss class; (B) the
 fetch-by-relink handoff commits the receiver's ref without proving the sender's blobs are still
@@ -1660,6 +1669,8 @@ whether any branch can lose or double-promote a part; and what is NOT covered by
 
 ## Task 21: Part B soak gate — 20-minute shakeout first, then 4 hours
 
+**STATUS: DONE 2026-07-26.** Three 20-minute shakeouts green (the stability criterion), then the 4-hour chaos run: `PHASE3 OK`, 0 failures, 40 checkpoints, 529 signal reads, 72 real `stale_edge` evaluations, 1,673 round attempts. Commit `8f4e3c1f701`. Probe A fired twice during it — recorded, investigation carried to the next round, NOT a gate failure.
+
 **STATUS: NOT STARTED.** Its prerequisites (Tasks 9-16, then 20b and its fixes) are all complete. Note
 that the signals Step 2 collects have grown since this task was written: the sibling follow-ups plan
 adds `CasGcRefScanDisagreements` and `CasGcUnappliedFoldedTxns` (`e01b5cd82be`), and both belong in the
@@ -1682,7 +1693,7 @@ under-reporting the product this week, and a 4-hour run that reports nothing use
 - Modify: `utils/ca-soak/soak/cluster.py` (ProfileEvents collection — see step 2)
 - Test: `utils/ca-soak/tests/` (unit tests for whatever pure logic you add)
 
-- [ ] **Step 1: Add `stale_edge` to the checkpoint's hard asserts.**
+- [x] **Step 1: Add `stale_edge` to the checkpoint's hard asserts.**
 
 The checkpoint already raises on `dangling != 0` at `run.py:642` and already has a detail fsck available at
 `run.py:606`. `stale_edge` is DETAIL-MODE ONLY (see `CasFsck.h`), so assert it off that detail read, not
@@ -1692,7 +1703,7 @@ never be reclaimed by the incremental GC, so a nonzero count is a hard failure, 
 Fail CLOSED on absence: if the detail fsck result has no `stale_edge` key at all, that means the binary
 predates the class — raise `CheckpointFailure` naming that, never treat a missing key as zero.
 
-- [ ] **Step 2: Teach the driver to read ProfileEvents at all.**
+- [x] **Step 2: Teach the driver to read ProfileEvents at all.**
 
 `grep -n "ProfileEvents" utils/ca-soak/soak/*.py` returns NOTHING today — the soak driver cannot observe a
 single counter. That is why the three signals added on 2026-07-25 would be invisible to it. Add a
@@ -1708,14 +1719,14 @@ Record them per metrics tick and in every checkpoint row. Follow `soak/fsck.py`'
 FIXED on 2026-07-25 (`observe.py`'s `_is_benign_probe_gap`): a node that is down during a chaos window is
 legitimately unreadable; a query that FAILS is not, and must surface rather than degrade to zero.
 
-- [ ] **Step 3: Report the counters; do NOT fail on them yet.**
+- [x] **Step 3: Report the counters; do NOT fail on them yet.**
 
 Their benign rates are uncharacterised. `CasGcUnmatchedRemoveDeltas` should be zero in a healthy pool but
 may be nonzero for reasons we have not enumerated; `CasRefAppendPreAttemptRefused` is EXPECTED to be
 nonzero under chaos — that is the availability fix working. Characterising them is the point of the
 20-minute runs. Record a threshold only once several runs agree.
 
-- [ ] **Step 4: The 20-minute shakeout, repeated until stable.**
+- [x] **Step 4: The 20-minute shakeout, repeated until stable.**
 
 ```bash
 cd utils/ca-soak && docker compose up -d && python3 -m soak.run --seed 1 --phase 3 --duration 20m \
@@ -1730,12 +1741,12 @@ EXPECT the first runs to fail on harness problems rather than product problems, 
 a green run in which a counter was never read is not stable, it is blind. Record each attempt in
 `RUN_HISTORY.md` with what broke and what was fixed.
 
-- [ ] **Step 5: The 4-hour run, with chaos.**
+- [x] **Step 5: The 4-hour run, with chaos.**
 
 Same invocation with `--duration 4h`. Gate: `PHASE3 OK`, `dangling == 0` at every checkpoint,
 `stale_edge == 0` at every checkpoint, zero `WORKLOAD FAILURE`, and the counters recorded.
 
-- [ ] **Step 6: Commit** the harness changes, the run history, and a short results note.
+- [x] **Step 6: Commit** the harness changes, the run history, and a short results note.
 
 ---
 

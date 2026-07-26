@@ -2,6 +2,12 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **ROUND STATUS 2026-07-26 — CLOSED except force-claim.** Tasks 1-9 DONE: the S42 verdict rework, the
+> skipped-transaction detector (probes A/B1/B2), and the per-phase GC log rows with their documentation.
+> The detector has since FIRED 14 times in a live soak and that investigation carries into the GC round.
+> **Tasks 10-12 (force-claim) NOT STARTED, deliberately** — blocked on a user decision and stripped of
+> their original motivation when the one-line CI fix landed.
+
 **Goal:** Land the four decided follow-ups from BACKLOG {#user-decisions-2026-07-25} and
 {#list-as-journal-decision-c} as one batch, after the Part B codex review and before the Part B soak.
 
@@ -1298,6 +1304,8 @@ git show --stat HEAD
 
 ## Task 5: Per-phase row plumbing — schema, record, correlator
 
+**STATUS: DONE 2026-07-26** — landed with Tasks 6-8 in `d412f85f749`.
+
 **STATUS: IN PROGRESS** (tasks 5-8 dispatched together at 00:09 UTC 2026-07-26, worklog
 `75a03e26ffb`). No commit yet — nothing below is ticked, and nothing in tasks 5-8 should be read as
 landed. Two constraints were given to the executing agent on dispatch and are recorded here so they
@@ -1327,7 +1335,7 @@ rows. Kept separate so the schema change can be reviewed on its own.
   `std::map<String, UInt64> phase_metrics`, and `EventType::Phase`. Tasks 6 and 7 emit rows through
   `CasGcScheduler`'s new `emitPhase` sink.
 
-- [ ] **Step 1: Extend `GcRoundLogRecord`**
+- [x] **Step 1: Extend `GcRoundLogRecord`**
 
 `Gc/CasGcScheduler.h`, inside `struct GcRoundLogRecord`:
 
@@ -1352,7 +1360,7 @@ profile_events;` (the last member today). Nothing existing is removed or reorder
     std::map<String, UInt64> phase_metrics;
 ```
 
-- [ ] **Step 2: Extend the log element**
+- [x] **Step 2: Extend the log element**
 
 `src/Interpreters/ContentAddressedGarbageCollectionLog.h` — change the enum at `:12` and append four
 members after `std::map<String, UInt64> profile_events;` at `:43`:
@@ -1384,7 +1392,7 @@ existing positional readers are undisturbed):
 and the matching four `columns[i++]->insert(...)` at the end of `appendToBlock`, with the map built
 exactly like `profile_events`.
 
-- [ ] **Step 3: Mint the correlator and add the phase sink**
+- [x] **Step 3: Mint the correlator and add the phase sink**
 
 `Gc/CasGcScheduler.cpp`, inside `runRoundLogged`, immediately after the `SCOPE_EXIT` at `:119`:
 
@@ -1431,7 +1439,7 @@ using GcPhaseSink = std::function<void(const GcPhaseRecord &)>;
 and to `class Gc` (`Gc/CasGc.h`, public): `void setPhaseSink(GcPhaseSink sink) { phase_sink = std::move(sink); }`
 with the private member `GcPhaseSink phase_sink;`.
 
-- [ ] **Step 4: Extend the converter**
+- [x] **Step 4: Extend the converter**
 
 `ContentAddressedMetadataStorage.cpp:475-477`, replace the two-way `event_type` mapping with a
 three-way switch, and add after `e.profile_events = r.profile_events;` (`:516`):
@@ -1443,7 +1451,7 @@ three-way switch, and add after `e.profile_events = r.profile_events;` (`:516`):
         e.phase_metrics = r.phase_metrics;
 ```
 
-- [ ] **Step 5: Extend the scheduler gtest**
+- [x] **Step 5: Extend the scheduler gtest**
 
 In `src/Disks/tests/gtest_cas_gc_log.cpp`, add:
 
@@ -1485,7 +1493,7 @@ TEST(CasGcLog, EveryRowOfARoundSharesOneRoundId)
 }
 ```
 
-- [ ] **Step 6: Build and gate**
+- [x] **Step 6: Build and gate**
 
 ```bash
 ninja -C build unit_tests_dbms > build/build_task5.log 2>&1; echo NINJA_EXIT=$?
@@ -1493,7 +1501,7 @@ build/src/unit_tests_dbms --gtest_filter='Ca*:CA*:ContentAddressed*:CountingBack
 ```
 Expected: `NINJA_EXIT=0`, `EXIT=0`.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add src/Interpreters/ContentAddressedGarbageCollectionLog.{h,cpp} \
@@ -1519,6 +1527,8 @@ git show --stat HEAD
 
 ## Task 6: The phase timer and the ten round-level phases
 
+**STATUS: DONE 2026-07-26** (`d412f85f749`), `CasGcPhaseTimer.h`.
+
 **STATUS: IN PROGRESS** — see Task 5's status note. Not landed.
 
 **Files:**
@@ -1531,7 +1541,7 @@ git show --stat HEAD
   literals at the single site that uses each one, and an enum plus a name function would add a second
   place to keep in sync for no reader benefit. Consumed by Task 7.
 
-- [ ] **Step 1: Write the timer**
+- [x] **Step 1: Write the timer**
 
 Create `Gc/CasGcPhaseTimer.h`:
 
@@ -1604,7 +1614,7 @@ private:
 }
 ```
 
-- [ ] **Step 2: Instrument `lease` and `heartbeat_floor`**
+- [x] **Step 2: Instrument `lease` and `heartbeat_floor`**
 
 In `runRegularRound`, wrap `acquireOrRenewLease` (`:274`):
 
@@ -1627,7 +1637,7 @@ recording `t.metric("live", floor.live)`, `"terminated"`, `"fenced_now"`, `"alre
 `floor` must be hoisted out of the block (declare `HeartbeatFloor floor;` before it and assign inside)
 because it is read later.
 
-- [ ] **Step 3: Instrument `defer_decision`**
+- [x] **Step 3: Instrument `defer_decision`**
 
 Rewrite `CasGc.cpp:347-381` (the block Task 2 already touched). `pre_scan` must OUTLIVE the timer
 block because the fold consumes it, and `report.deferred` must be set before the timer's destructor
@@ -1680,7 +1690,7 @@ runs — hence the explicit inner scope rather than wrapping the whole `if`:
 Keep the existing long comment above `report.round = state.round;` verbatim — it explains why a
 deferred round must not print `new_round`, and deleting it would lose that reasoning.
 
-- [ ] **Step 4: Instrument the seven post-fold phases**
+- [x] **Step 4: Instrument the seven post-fold phases**
 
 Same pattern, one `{ GcPhaseTimer t(phase_sink, "<name>"); … }` block each:
 
@@ -1699,7 +1709,7 @@ For `meta_pool_wait`, add two `std::atomic<uint64_t>` members to `Gc` (`meta_job
 `meta_jobs_completed_`), incremented in `scheduleMetaJob` (`:198`) at submission and at the end of the
 job lambda. Snapshot both at the start of the round and report the deltas.
 
-- [ ] **Step 5: Build, gate, and eyeball the rows**
+- [x] **Step 5: Build, gate, and eyeball the rows**
 
 ```bash
 ninja -C build unit_tests_dbms > build/build_task6.log 2>&1; echo NINJA_EXIT=$?
@@ -1707,7 +1717,7 @@ build/src/unit_tests_dbms --gtest_filter='Ca*:CA*:ContentAddressed*:CountingBack
 ```
 Expected: `NINJA_EXIT=0`, `EXIT=0`.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcPhaseTimer.h \
@@ -1733,6 +1743,8 @@ git show --stat HEAD
 
 ## Task 7: The seven fold phases, carrying the detector's numbers
 
+**STATUS: DONE 2026-07-26** (`d412f85f749`).
+
 **STATUS: IN PROGRESS** — see Task 5's status note. Not landed.
 
 **One thing this task's tables cannot know, because the detector landed after it was written:** all
@@ -1745,7 +1757,7 @@ nonzero `txns_unapplied` throws before the seal — which is exactly what makes 
 **Files:**
 - Modify: `src/Disks/.../ContentAddressed/Gc/CasGc.cpp` (`fold`, `:833-1489`)
 
-- [ ] **Step 1: Instrument the fold's phases**
+- [x] **Step 1: Instrument the fold's phases**
 
 Same `{ GcPhaseTimer t(phase_sink, "<name>"); … }` pattern:
 
@@ -1763,7 +1775,7 @@ Note the `fold_seal_read` row's `redundant_reads` metric is deliberate: `adopted
 `/// One redundant GET per round: both reads resolve the same key. Instrumented, not fixed — the
 follow-up study decides.` above the second read.
 
-- [ ] **Step 2: Extend the stateless test**
+- [x] **Step 2: Extend the stateless test**
 
 Read `tests/queries/0_stateless/05007_content_addressed_gc_introspection.sh` in full, then append a
 check that phase rows appear and correlate:
@@ -1781,7 +1793,7 @@ WHERE round_id = (SELECT round_id FROM system.content_addressed_garbage_collecti
 
 Update `05007_content_addressed_gc_introspection.reference` accordingly.
 
-- [ ] **Step 3: Build, gate, run the stateless test**
+- [x] **Step 3: Build, gate, run the stateless test**
 
 ```bash
 ninja -C build unit_tests_dbms clickhouse > build/build_task7.log 2>&1; echo NINJA_EXIT=$?
@@ -1790,7 +1802,7 @@ python3 -m ci.praktika run "stateless" --test 05007_content_addressed_gc_introsp
 ```
 Expected: all zero. Have a subagent summarise each log.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp \
@@ -1815,17 +1827,19 @@ git show --stat HEAD
 
 ## Task 8: Document the new columns
 
+**STATUS: DONE 2026-07-26** — `docs/en/operations/system-tables/content_addressed_garbage_collection_log.md` carries the phase columns.
+
 **STATUS: IN PROGRESS** — see Task 5's status note. Not landed.
 
 **Files:**
 - Modify: `docs/en/operations/system-tables/content_addressed_garbage_collection_log.md`
 
-- [ ] **Step 1: Read the existing doc**
+- [x] **Step 1: Read the existing doc**
 
 Read the whole file, noting its heading style and whether every heading already carries a
 `{#kebab-case-anchor}` (the project rule requires it; if an existing heading lacks one, add it).
 
-- [ ] **Step 2: Add the four columns and a phase section**
+- [x] **Step 2: Add the four columns and a phase section**
 
 Add the four column descriptions matching `getColumnsDescription` verbatim, then append the section
 below (shown here inside a four-backtick fence so its own SQL fences are literal):
@@ -1864,7 +1878,7 @@ Caveat: work scheduled onto the GC meta pool runs on other threads, so the `meta
 `jobs_completed` next to its duration instead.
 ````
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add docs/en/operations/system-tables/content_addressed_garbage_collection_log.md
@@ -2040,6 +2054,8 @@ git show --stat HEAD
 ---
 
 ## Task 10: `proveForeignMountDead` — the certificate of death for a foreign mount slot
+
+**STATUS: NOT STARTED — deliberately.** Blocked on the user's choice between overwriting the owner uuid and adopting the pool's existing one, and its CI motivation evaporated when the one-line CI fix landed. NOT part of the GC round.
 
 > ### ⛔ TASKS 10-12 ARE BLOCKED — DO NOT START THEM {#tasks-10-12-blocked}
 >
@@ -2223,6 +2239,8 @@ git show --stat HEAD
 ---
 
 ## Task 11: The force path in `mountWritable`
+
+**STATUS: NOT STARTED** — see Task 10.
 
 **STATUS: BLOCKED — see {#tasks-10-12-blocked}.** This task is where the unmade choice is isolated
 (`Pool::forceOwnerClaim`), which is exactly why it must not be written before the choice is made.
@@ -2413,6 +2431,8 @@ git show --stat HEAD
 ---
 
 ## Task 12: Expose the setting and document it
+
+**STATUS: NOT STARTED** — see Task 10.
 
 **STATUS: BLOCKED — see {#tasks-10-12-blocked}.** The setting's NAME and its warning text both depend on
 which reading wins, so this cannot be written ahead of Task 11.
