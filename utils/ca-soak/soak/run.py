@@ -4,7 +4,10 @@ Drives the deterministic ledger workload (`soak.ledger`) against a live 2-replic
 (`soak.cluster`) while mirroring every op into the authoritative in-memory `Model` (`soak.model`).
 At periodic quiesced checkpoints it HARD-ASSERTS the invariants the CURRENT CA design guarantees:
 BOTH replicas equal the model exactly (no loss, no divergence), fsck `dangling==0` (INV-NO-LOSS:
-every ref-reachable object exists), and the GC dry-run preview is a subset of the fsck `unreachable`
+every ref-reachable object exists), fsck `stale_edge==0` (no blob whose every source edge names a
+manifest that no longer exists — such a blob's in-degree is pinned above zero and the incremental GC
+can never reclaim it; `ca-fsck` itself does not exit nonzero on this, so the checkpoint is the only
+gate), and the GC dry-run preview is a subset of the fsck `unreachable`
 set (GC never plans to delete a reachable object). The residual fsck `unreachable` after the
 incremental GC reaches its fixpoint is TRACKED, not failed on: it is the known M-F Full-GC debris
 (B140) — per CA spec §8 the incremental GC cannot reclaim blobs orphaned by a
@@ -27,6 +30,14 @@ ledger into an EFFECTIVE ledger where a cliff is DEMOTED to OPTIMIZE unless (a) 
 cliffs have executed so far AND (b) at least MIN_OPS_BETWEEN_CLIFFS ops have elapsed since the previous
 executed cliff. Demotion is a pure function of op_id order, so the cluster and model consume the
 IDENTICAL effective ledger.
+
+Signals (2026-07-26). The driver also READS the product's own counters, which until this change it did
+not do at all: the `Cas*` `ProfileEvents` in `soak.signals.CAS_SIGNAL_EVENTS` (per metrics tick and at
+every checkpoint) and the per-phase GC log rows (`event_type = 'Phase'`, summarised per checkpoint into
+the `gc_phases` table of the metrics db). Both are REPORTED, not gated — their benign rates are
+uncharacterised — but a `preflight_signals` at bring-up refuses to start a run whose binary does not
+have every watched counter, because a counter that reads as a quiet zero for four hours is worse than
+no counter at all.
 """
 
 import argparse
@@ -60,7 +71,17 @@ from soak.checker import (
     compare_aggregates,
     drive_gc_to_fixpoint,
 )
-from soak.fsck import run_fsck, run_dryrun, FsckTimeout
+from soak.fsck import run_fsck, run_dryrun, FsckTimeout, stale_edge_verdict
+from soak.signals import (
+    CAS_SIGNAL_EVENTS,
+    PhaseCoverage,
+    SignalTracker,
+    format_phase_summary,
+    preflight_signals,
+    read_phase_summary,
+    read_signal_events,
+    summarize_phases,
+)
 from soak.replay import dump_failure
 from soak.chaos import generate_chaos_schedule, apply_fault, Fault, FaultTarget, FaultAction
 from soak import metrics as metrics_mod
@@ -568,6 +589,7 @@ def checkpoint(driver, cluster, model, phase, *, strict_unreachable=False):
     # remains, so the checker was chasing a moving target. `drain_interval_s` matches the existing
     # metrics-tick cadence (`METRICS_INTERVAL_S`).
     _detail_fsck_skipped = False  # set True if `--detail` fsck times out; skips dryrun-subset assert
+    _fsck_is_detail = False       # True once `f` holds the result of a `--detail` scan (see stale_edge)
     try:
         residual = drive_gc_to_fixpoint(
             cluster,
@@ -604,6 +626,7 @@ def checkpoint(driver, cluster, model, phase, *, strict_unreachable=False):
         if not _detail_fsck_skipped and (f.get("dangling", 0) != 0 or f.get("unreachable", 0) != 0):
             try:
                 f = run_fsck(FSCK_CONTAINER, detail=True, timeout_s=600)
+                _fsck_is_detail = True
             except FsckTimeout as _e:
                 log(f"WARNING [B146/B154] post-GC fsck --detail timed out ({_e}); "
                     f"keeping summary result (dangling={f.get('dangling')} unreachable={f.get('unreachable')}); "
@@ -634,6 +657,7 @@ def checkpoint(driver, cluster, model, phase, *, strict_unreachable=False):
                 f = wait_for_pool_consistent(
                     lambda: run_fsck(FSCK_CONTAINER, timeout_s=180)
                 )
+                _fsck_is_detail = True   # run_fsck defaults to detail=True
             except FsckTimeout as _e:
                 log(f"WARNING [B146/B154] wait_for_pool_consistent fsck timed out ({_e}); "
                     f"SKIPPING dangling re-confirm for this checkpoint — soak continues")
@@ -642,6 +666,49 @@ def checkpoint(driver, cluster, model, phase, *, strict_unreachable=False):
             raise CheckpointFailure(f"fsck dangling != 0: {f.get('dangling')} (INV-NO-LOSS) detail={f.get('detail')}")
     if not _detail_fsck_skipped and f.get("exit_code") != 0:
         raise CheckpointFailure(f"fsck exit_code != 0: {f.get('exit_code')} stderr={f.get('stderr')}")
+
+    # INV-NO-STALE-EDGE: no blob may be left whose every source edge names a manifest that no longer
+    # exists. Such a blob's in-degree is pinned above zero forever, so the incremental GC will never
+    # reclaim it -- and until the class existed it was reported as an `AwaitingGc` "expected, no action
+    # needed" backlog, which is what hid it. `ca-fsck` does NOT exit nonzero on it (only `dangling` and
+    # `snapshot_oracle_mismatches` throw in CommandFsck.cpp), so the `exit_code` gate above does not
+    # cover this and THIS assert is the only gate.
+    #
+    # Asserted off the `--detail` result, never the summary: the cross-check is detail-gated in
+    # `runFsck`, so a summary line's `stale_edge=0` is structural. `stale_edge_verdict` also fails
+    # CLOSED when the key is absent entirely -- that means the binary predates the class and the
+    # checkpoint is not looking at anything. See its docstring for why `unreachable == 0` is a genuine
+    # proof of cleanliness rather than a shortcut.
+    if not _detail_fsck_skipped:
+        _se_verdict, _se_why = stale_edge_verdict(f, detail=_fsck_is_detail)
+        if _se_verdict in ("absent", "found"):
+            raise CheckpointFailure(f"fsck stale_edge check failed: {_se_why} detail={f.get('detail')}")
+        if _se_verdict == "unchecked":
+            log(f"WARNING [stale-edge] {_se_why} — this checkpoint does not gate the class")
+        else:
+            log(f"stale_edge=0 ({_se_why})")
+
+    # The fsck detail parser drops any object class it does not know about, which silently
+    # under-reports exactly the objects a NEW fsck class was added to surface (that is how
+    # `awaiting-gc` sat mislabelled for months). `run_fsck` records the unknown names; nothing read
+    # them until now. Loud, not fatal: it is a harness gap, so the fix is to extend
+    # `soak/fsck.py:known_classes` -- but the run must say so instead of quietly narrowing its view.
+    if f.get("unknown_detail_classes"):
+        log(f"WARNING [fsck-whitelist] ca-fsck emitted detail classes this harness does not know: "
+            f"{f['unknown_detail_classes']} — objects in those classes were DROPPED from the "
+            f"checkpoint's view. Extend soak/fsck.py:known_classes.")
+
+    # `corrupted-run` (a GC source-edge run whose whole-file seal checksum disagrees with its bytes)
+    # is an ERROR class that nothing gates: `CommandFsck` does not throw on it, and -- unlike
+    # `stale_edge` -- it is not even PRINTED on the summary line, so `FsckReport::corrupted_runs` is
+    # invisible to any consumer of the applet. It is only observable as a `--detail` row, so that is
+    # what is counted here. Reported rather than asserted: fixing the missing summary field is a
+    # product change, outside this harness change's mandate.
+    _corrupted = sum(1 for row in f.get("detail", []) if row["class"] == "corrupted-run")
+    if _corrupted:
+        log(f"WARNING [corrupted-run] {_corrupted} fsck detail row(s) in class `corrupted-run` — a GC "
+            f"source-edge run's seal checksum disagrees with its bytes. Gated by neither this "
+            f"checkpoint nor ca-fsck's exit code (and absent from its summary line); investigate.")
 
     # GC never plans to delete a REACHABLE object: {dryrun delete set} subset of {fsck deletion-pipeline}.
     # The "retired-in-snapshot" refactor made ca-gc-dryrun (previewDeletes) emit a SUPERSET: not only
@@ -674,6 +741,7 @@ def checkpoint(driver, cluster, model, phase, *, strict_unreachable=False):
     if not _detail_fsck_skipped and dr.get("entries") and "detail" not in f:
         try:
             f = run_fsck(FSCK_CONTAINER, detail=True, timeout_s=600)
+            _fsck_is_detail = True
         except FsckTimeout as _e:
             log(f"WARNING [B146/B154] dryrun-subset `--detail` fsck timed out ({_e}); "
                 f"SKIPPING dryrun-subset assert for this checkpoint (B146/B154; O(pool) scan under load); "
@@ -726,6 +794,57 @@ def checkpoint(driver, cluster, model, phase, *, strict_unreachable=False):
             f"GC-pipeline residual")
 
     return now, exp, n1, n2, f, dr
+
+
+def capture_checkpoint_signals(cluster, label, *, tracker, log_fn=log):
+    """Read the CAS signal counters at a checkpoint, FAIL-CLOSED, and report them.
+
+    Distinct from the ticker's read in one way that matters: a checkpoint has already waited for both
+    replicas to be HTTP-healthy with tables loaded (`wait_for_healthy`), so there is no chaos window to
+    excuse a gap and every node is expected to answer. A gap is still tolerated (it is logged as one,
+    never as zeros) because a node can go down between the health gate and this read, but a query
+    FAILURE propagates and the counters are never invented.
+
+    REPORTED, NOT GATED (Task 21 step 3). Their benign rates are uncharacterised as of 2026-07-26:
+    `CasRefAppendPreAttemptRefused` is EXPECTED to be nonzero under chaos -- that is the availability
+    fix working -- and `CasGcUnmatchedRemoveDeltas` should be zero in a healthy pool but may not be for
+    reasons nobody has enumerated. A threshold goes in once several runs agree on a rate, not before."""
+    for node in cluster.nodes():
+        tracker.observe(repr(node), read_signal_events(node))
+    log_fn(f"{label} CAS SIGNALS: {tracker.format_latest()}")
+
+
+def capture_phase_summary(cluster, label, *, since_ts, coverage, conn=None, ts=None, log_fn=log):
+    """Summarize the per-phase GC log for the window since `since_ts` on every node, log it, and (when
+    a metrics db is open) persist it into `gc_phases`.
+
+    The eighteen `event_type = 'Phase'` rows a folding round emits are the only artifact that can
+    answer "where did this round spend its time"; they are also where the four detector values now
+    surface (`fold_ref_list.probe_a_holes`, `fold_ref_intake.logs_intended`/`logs_applied`,
+    `fold_reduce.txns_unapplied`). They are captured PER CHECKPOINT rather than only printed because
+    the load study that comes next needs them after the run has ended.
+
+    Gaps are tolerated and counted (a node that is down, or a replica that has never held the GC lease
+    and so has no log table). Anything else -- notably `UNKNOWN_IDENTIFIER`, i.e. a server that
+    predates the phase rows -- raises out of `read_phase_summary`."""
+    written = 0
+    for node in cluster.nodes():
+        rows = read_phase_summary(node, since_ts)
+        if rows is None:
+            coverage.observe(None)
+            log_fn(f"{label} GC PHASES [{node!r}]: unavailable (node unreadable, or the GC log has "
+                   f"never been materialized on this replica) — recorded as a gap, not as zero")
+            continue
+        summary = summarize_phases(rows)
+        coverage.observe(summary)
+        log_fn(f"{label} GC PHASES [{node!r}]: {format_phase_summary(summary)}")
+        if conn is not None and rows:
+            written += metrics_mod.record_phases(
+                conn, metrics_mod.phase_row_dicts(ts if ts is not None else int(time.time()),
+                                                  label, repr(node), rows))
+    if written:
+        log_fn(f"{label} GC PHASES: {written} per-phase row(s) persisted to the metrics db (gc_phases)")
+    return written
 
 
 def wait_for_healthy(cluster, *, timeout_s: float = 180.0, settle_s: float = 2.0,
@@ -960,9 +1079,12 @@ class MetricsTicker(threading.Thread):
     asserted on the main thread, unchanged."""
 
     def __init__(self, conn, cluster, table, *, interval_s, max_pool_bytes, driver, stop_event,
-                 restarts_fn, fsck_fn=None):
+                 restarts_fn, fsck_fn=None, signal_tracker=None):
         super().__init__(daemon=True, name="metrics")
         self.conn = conn
+        # Accumulates what the CAS signal counters actually showed, so the end-of-run report can state
+        # whether they were ever read at all rather than leaving a silent zero to be mistaken for one.
+        self.signal_tracker = signal_tracker if signal_tracker is not None else SignalTracker()
         self.cluster = cluster
         self.table = table
         self.interval_s = interval_s
@@ -994,9 +1116,23 @@ class MetricsTicker(threading.Thread):
             pbytes = fsck.get("physical_bytes")
             objs = fsck.get("distinct_blobs", objs)
         self.last_pool_bytes = pbytes
+
+        # CAS signal counters, read BEFORE the try/except that skips a tick. Deliberate: a node that is
+        # down under chaos yields `None` here (a visible gap, recorded as NULL columns), while a query
+        # that FAILS -- a broken probe, or a counter the binary does not have (`SignalsUnsupported`) --
+        # propagates out of `tick_once`. In the ticker thread that lands in `self.error`, which the
+        # main loop raises; folding it into "metrics tick skipped" would silently blind the whole run,
+        # which is the exact defect this instrumentation exists to detect.
+        signals_by_node = {}
+        for node in self.cluster.nodes():
+            values = read_signal_events(node)
+            signals_by_node[repr(node)] = values
+            self.signal_tracker.observe(repr(node), values)
+
         try:
             snaps = metrics_mod.snapshot_cluster(
-                self.cluster, self.table, ts, fsck=fsck, restarts=self.restarts_fn())
+                self.cluster, self.table, ts, fsck=fsck, restarts=self.restarts_fn(),
+                signals_by_node=signals_by_node)
         except Exception as e:   # node transiently down under chaos -> skip this tick
             log(f"metrics tick skipped (snapshot failed, node likely down): {type(e).__name__}: {e}")
             return 0
@@ -1019,8 +1155,24 @@ class MetricsTicker(threading.Thread):
                 f"budget={budget_gb:.2f}GB ({pct:.0f}%) "
                 f"-- pacing inserts (work is slowed, NEVER dropped)")
             self.driver.throttle_sleep_s = new
+        # Signals on the tick line: which nodes answered, and every counter that is nonzero. A tick
+        # that read nothing says `signals=gap(N)` rather than printing zeros -- silence and zero must
+        # not look the same.
+        read_ok = [n for n, v in signals_by_node.items() if v is not None]
+        nonzero = {}
+        for values in signals_by_node.values():
+            for event, value in (values or {}).items():
+                if value:
+                    nonzero[event] = max(nonzero.get(event, 0), value)
+        if read_ok:
+            sig_s = (f"signals={len(read_ok)}/{len(signals_by_node)} nodes"
+                     + ("" if not nonzero
+                        else " nonzero[" + " ".join(f"{k}={v}" for k, v in sorted(nonzero.items())) + "]"))
+        else:
+            sig_s = f"signals=gap({len(signals_by_node)} nodes unreadable)"
         log(f"metrics tick #{self.ticks + 1}: ts={ts} pool_objects={objs} "
-            f"pool_bytes={pbytes} throttle={self.driver.throttle_sleep_s}s recorded={self.recorded}")
+            f"pool_bytes={pbytes} throttle={self.driver.throttle_sleep_s}s recorded={self.recorded} "
+            f"{sig_s}")
         return len(snaps)
 
     def run(self):
@@ -1217,6 +1369,22 @@ def run_phase3(args):
     cluster, model, base_time = setup_cluster_and_table(
         args.seed, 3, args.ops, args.workers, "stage-boundary")
 
+    # PREFLIGHT: prove every watched CAS counter EXISTS in this binary before a single op runs. Without
+    # it, a renamed or not-yet-existing counter reads as a permanent quiet zero and the run is blind for
+    # its whole duration; with it, the run dies at second zero naming the counter. It also exercises the
+    # exact query the ticker will use, so a malformed probe cannot silently disable the metrics curve.
+    signal_baseline = preflight_signals(cluster)
+    log(f"CAS SIGNALS preflight OK: {len(CAS_SIGNAL_EVENTS)} counters present on all "
+        f"{len(signal_baseline)} node(s) — {', '.join(CAS_SIGNAL_EVENTS)}")
+    for node_name, values in sorted(signal_baseline.items()):
+        log(f"CAS SIGNALS baseline {node_name}: "
+            + " ".join(f"{k}={values[k]}" for k in CAS_SIGNAL_EVENTS))
+    signal_tracker = SignalTracker()
+    phase_coverage = PhaseCoverage()
+    # Start of the first per-phase GC-log window. Advanced to each checkpoint's own time afterwards so
+    # consecutive checkpoints report disjoint windows.
+    phase_window_start = {"ts": int(time.time())}
+
     # Phase 3 ALWAYS exercises crash+recovery (chaos), so the driver is transport-resilient.
     driver = Driver(cluster, model, args.seed, base_time, args.workers,
                     insert_mode=args.insert_mode, transport_resilient=True)
@@ -1260,7 +1428,7 @@ def run_phase3(args):
 
     ticker = MetricsTicker(conn, cluster, TABLE, interval_s=metrics_interval,
                            max_pool_bytes=max_pool_bytes, driver=driver, stop_event=metrics_stop,
-                           restarts_fn=lambda: restarts["n"])
+                           restarts_fn=lambda: restarts["n"], signal_tracker=signal_tracker)
 
     select_stop = threading.Event()
     select_stats = {"issued": 0, "errors": 0, "rows": 0}
@@ -1293,9 +1461,16 @@ def run_phase3(args):
             checkpoint_active.clear()
         log(f"{label} OK: now={now} count={exp['count']} fsck reachable={f.get('reachable')} "
             f"unreachable={f.get('unreachable')} (M-F debris, B140) dangling={f.get('dangling')} "
-            f"dryrun_count={dr.get('count')}")
+            f"stale_edge={f.get('stale_edge')} dryrun_count={dr.get('count')}")
         # Record a checkpoint-tagged metrics tick carrying the fsck result (§2: include fsck at checkpoints).
-        ticker.tick_once(int(time.time()), fsck=f)
+        checkpoint_ts = int(time.time())
+        ticker.tick_once(checkpoint_ts, fsck=f)
+        # The two signal families the driver could not see before 2026-07-26. Both are read here
+        # fail-closed (the cluster is quiesced and health-gated) and reported, not gated.
+        capture_checkpoint_signals(cluster, label, tracker=signal_tracker)
+        capture_phase_summary(cluster, label, since_ts=phase_window_start["ts"],
+                              coverage=phase_coverage, conn=conn, ts=checkpoint_ts)
+        phase_window_start["ts"] = checkpoint_ts
         return now, exp, n1, n2, f, dr
 
     def drain_recovery_checkpoints():
@@ -1473,6 +1648,13 @@ def run_phase3(args):
         log(f"AVAILABILITY: driver-retried product-visible failures by class: {breakdown}")
     else:
         log("AVAILABILITY: zero driver-retried product-visible failures (server absorbed everything)")
+    # SIGNAL REPORT. Task 21's stability criterion is not "the run was green" but "the run was green
+    # AND every signal was actually observed at least once" -- a green run in which a counter was never
+    # read is blind, not green. These two blocks are what makes that checkable from the run log.
+    for line in signal_tracker.report_lines():
+        log(line)
+    for line in phase_coverage.report_lines():
+        log(line)
     print("PHASE3 OK")
     return 0
 
@@ -1565,6 +1747,13 @@ def main(argv=None):
     cluster, model, base_time = setup_cluster_and_table(
         args.seed, args.phase, args.ops, args.workers, args.checkpoint_every)
 
+    # Same preflight as phase 3: refuse to start a run that cannot read its own signals.
+    preflight_signals(cluster)
+    log(f"CAS SIGNALS preflight OK: {len(CAS_SIGNAL_EVENTS)} counters present on all nodes")
+    signal_tracker = SignalTracker()
+    phase_coverage = PhaseCoverage()
+    phase_window_start = {"ts": int(time.time())}
+
     ledger = generate_ledger(args.seed, args.ops)
     min_gap = args.min_ops_between_cliffs if args.min_ops_between_cliffs is not None else max(1, args.ops // 4)
     effective = build_effective_ledger(ledger, args.max_cliffs, min_gap)
@@ -1624,7 +1813,14 @@ def main(argv=None):
             checkpoint_active.clear()
         log(f"{label} OK: now={now} count={exp['count']} "
             f"fsck reachable={f.get('reachable')} unreachable={f.get('unreachable')} "
-            f"(M-F debris, B140) dangling={f.get('dangling')} dryrun_count={dr.get('count')}")
+            f"(M-F debris, B140) dangling={f.get('dangling')} stale_edge={f.get('stale_edge')} "
+            f"dryrun_count={dr.get('count')}")
+        checkpoint_ts = int(time.time())
+        capture_checkpoint_signals(cluster, label, tracker=signal_tracker)
+        # Phase 1/2 has no metrics db, so the phase summary is logged only (conn=None).
+        capture_phase_summary(cluster, label, since_ts=phase_window_start["ts"],
+                              coverage=phase_coverage, conn=None, ts=checkpoint_ts)
+        phase_window_start["ts"] = checkpoint_ts
         return now, exp, n1, n2, f, dr
 
     def drain_recovery_checkpoints(executed_count, op_id):
@@ -1724,6 +1920,10 @@ def main(argv=None):
         driver.executor.shutdown(wait=True)
 
     log(f"ABORTED-retried INSERT attempts (B137 race fired and was handled): {driver.aborted_retries}")
+    for line in signal_tracker.report_lines():
+        log(line)
+    for line in phase_coverage.report_lines():
+        log(line)
     if phase2:
         log(f"transport-retried op attempts (chaos node-down fired and was handled): "
             f"{driver.transport_retries}; faults fired: {chaos.faults_fired if chaos else 0}")

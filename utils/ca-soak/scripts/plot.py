@@ -33,7 +33,12 @@ def load_series(db_path: str):
     seconds-from-start column for plotting."""
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
-    cur = conn.execute(f"SELECT {', '.join(_COLS)} FROM metrics ORDER BY ts")
+    # Select only the columns this particular db actually has: `_COLS` grows over time (the CAS signal
+    # counters were added 2026-07-26) and the repository is full of older soak dbs that must stay
+    # plottable. Every consumer below already treats a missing value as None.
+    have = {r[1] for r in conn.execute("PRAGMA table_info(metrics)")}
+    selected = [c for c in _COLS if c in have]
+    cur = conn.execute(f"SELECT {', '.join(selected)} FROM metrics ORDER BY ts")
     raw = [dict(r) for r in cur.fetchall()]
     conn.close()
 

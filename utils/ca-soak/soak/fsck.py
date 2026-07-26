@@ -50,6 +50,63 @@ def parse_fsck_summary(line: str) -> dict:
     return out
 
 
+def stale_edge_verdict(fsck_result: dict, *, detail: bool) -> tuple:
+    """Decide whether an fsck result PROVES the `stale-edge` class is empty. Pure; the caller raises.
+
+    A stale-edge blob carries only source edges naming manifests that no longer exist anywhere in the
+    pool, so the matching `-1` can never fold: its in-degree is pinned above zero for good and the
+    incremental GC will never reclaim it. It looks exactly like an `AwaitingGc` backlog, which is the
+    label that used to hide it — so the soak asserts it, and `ca-fsck` itself does NOT: `CommandFsck`
+    throws (nonzero exit) only on `dangling` and `snapshot_oracle_mismatches`, which means the
+    harness's existing `exit_code != 0` gate does not cover this class at all.
+
+    Returns `(verdict, message)` with verdict one of:
+
+    ``absent``
+        The result carries no `stale_edge` key. `CommandFsck.cpp` prints `stale_edge=` on EVERY
+        summary line, so a missing key means the binary predates the class. FAIL CLOSED: a missing key
+        is not a zero, it is the absence of an answer, and reading it as zero is how a check comes to
+        pass while looking at nothing.
+
+    ``found``
+        A positive count — a hard failure, not debris.
+
+    ``clean``
+        Either a `--detail` scan that counted zero, or a summary scan whose `unreachable` is zero. The
+        second case is a genuine proof, not a shortcut: `runFsck` increments `report.unreachable` for
+        EVERY present-but-unreferenced blob before classifying it (CasFsck.cpp, the `present_blobs`
+        loop), and `StaleEdge` is one of those classifications — so `unreachable == 0` implies
+        `stale_edge == 0` with no cross-check needed.
+
+    ``unchecked``
+        A SUMMARY scan with unreferenced blobs present. The stale-edge cross-check is gated on
+        `detail` (it costs one LIST per namespace plus a GET per manifest body), so the `stale_edge=0`
+        printed on a summary line is STRUCTURAL, not evidence, and must never be reported as clean.
+    """
+    if "stale_edge" not in fsck_result:
+        return ("absent",
+                "fsck result carries no `stale_edge` field. `ca-fsck` prints it on every summary line "
+                "(programs/disks/CommandFsck.cpp), so this binary predates the StaleEdge class and the "
+                "checkpoint cannot prove the class is empty. Failing CLOSED — a missing key is not zero.")
+    value = fsck_result["stale_edge"]
+    if detail:
+        if value != 0:
+            return ("found",
+                    f"fsck stale_edge = {value}: blob(s) whose every source edge names a manifest that "
+                    "no longer exists. Their in-degree can never reach zero, so the incremental GC can "
+                    "never reclaim them (only a rebuild of the in-degree state can). This is a hard "
+                    "finding, not GC-pipeline debris.")
+        return ("clean", "stale_edge == 0 on a --detail scan (cross-check ran)")
+    if fsck_result.get("unreachable") == 0:
+        return ("clean",
+                "stale_edge == 0 implied: the summary counted zero unreferenced blobs, and every "
+                "stale-edge blob is counted among them")
+    return ("unchecked",
+            f"stale_edge was NOT checked: this was a summary scan (the cross-check is --detail-gated) "
+            f"and unreachable={fsck_result.get('unreachable')} > 0, so the printed stale_edge="
+            f"{value} is structural rather than evidence")
+
+
 def parse_dryrun(text: str) -> dict:
     """Parse the full stdout of `clickhouse-disks ca-gc-dryrun`.
 
@@ -149,9 +206,14 @@ def run_fsck(container: str, disk: str = "ca_ro", detail: bool = True,
         # added to surface. That is how `awaiting-gc` objects sat mislabelled as B140 M-F debris for
         # months. Whenever `FsckClass` gains a member, extend this tuple in the same change — and note
         # the parser below now warns rather than discarding an unknown class outright.
+        # `snapshot-oracle-mismatch` and `corrupted-run` were added to `FsckClass` without this tuple
+        # being extended, so every such row was being dropped here — the exact hazard the paragraph
+        # above describes, happening to the two remaining ERROR classes. Added 2026-07-26. Note that a
+        # dropped row is not merely unreported: `run.py`'s dryrun-subset check reads a dryrun key it
+        # cannot find in `detail` as "already deleted, tolerated".
         known_classes = (
             "reachable", "dangling", "unreachable", "pending-gc", "awaiting-gc", "unaccounted",
-            "stale-edge",
+            "stale-edge", "snapshot-oracle-mismatch", "corrupted-run",
         )
         detail_rows: list[dict] = []
         unknown_classes: set[str] = set()
