@@ -90,6 +90,7 @@ def main():
     # `durable` holds every key whose PUT has RETURNED. A reader may only be blamed for missing one of
     # these. The lock makes the snapshot a listing compares against well-defined.
     durable = set()
+    delete_floor = [""]      # highest key ever HANDED to a deleter; see `deleter_loop` and the hole rule
     dlock = threading.Lock()
     stop = threading.Event()
     seq = [0]
@@ -139,6 +140,12 @@ def main():
                 victims = sorted(durable)[:a.delete_batch]
                 for v in victims:
                     durable.discard(v)
+                # Raise the deletion floor BEFORE the DELETE is issued. Deletion is monotone from the
+                # low end -- the deleter always takes the smallest live keys -- so "at or below the
+                # floor" is exactly "may legitimately be gone", and the floor is the whole bookkeeping
+                # the hole rule needs.
+                if victims:
+                    delete_floor[0] = max(delete_floor[0], victims[-1])
             if not victims:
                 time.sleep(0.05)
                 continue
@@ -158,14 +165,23 @@ def main():
             got = set(keys)
             if not got:
                 continue
+            with dlock:
+                floor_after = delete_floor[0]     # anything at or below this may legitimately be gone
             witness = max(got)                    # probe A's witness: the listing's own maximum
-            holes = sorted(k for k in snapshot if k < witness and k not in got)
+            # Three conditions, and the floor one is NOT optional once deleters run. Without it every key
+            # legitimately deleted DURING the walk counts as a hole, and the run manufactures exactly the
+            # finding it is supposed to test for. `> floor_after` uses the floor as of the walk's END, so
+            # a key deleted at any point during the walk is excluded.
+            holes = sorted(k for k in snapshot
+                           if k < witness and k > floor_after and k not in got)
             dupes = len(keys) - len(got)
             with rlock:
                 findings.append({"round": mine, "listed": len(got), "pages": pages,
                                  "snapshot": len(snapshot), "holes": holes, "dupes": dupes})
+            excluded = sum(1 for k in snapshot if k <= floor_after)
             print(f"  round {mine:>3}: listed={len(got):>6} pages={pages:>3} "
-                  f"durable_before={len(snapshot):>6} HOLES={len(holes)} dupes={dupes}", flush=True)
+                  f"durable_before={len(snapshot):>6} deleted_under_walk={excluded:>6} "
+                  f"HOLES={len(holes)} dupes={dupes}", flush=True)
 
     print(f"{a.rounds} listing rounds, {a.writers} writers + {a.listers} listers + "
           f"{a.deleters} deleters, page_size={a.page_size} ...", flush=True)
