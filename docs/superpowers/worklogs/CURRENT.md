@@ -133,3 +133,32 @@ importantly, `ref_folding_aborted=3` means over-firing COSTS us: it discards rea
 The alternative is that these are genuine holes, which is the defect we have been chasing.
 
 Distinguishing the two is the job. Handing it to systematic debugging now.
+
+### Systematic debugging of the probe-A firing — Phase 1 largely complete
+
+ESTABLISHED (read or measured, not inferred):
+1. The firing node is `localhost:8124`, and the compose maps 8124 to **ch2** — precisely the node chaos
+   PAUSED for 22 s and then FROZE for 80 s inside that window (faults #1 and #2).
+2. **Nothing on the folding node deletes ref logs between the two walks.** I had assumed `pending_deletes`
+   sat between them; it does not — `preFoldRefScan` is at `CasGc.cpp:397`, `fold` at `:479`, and
+   `pending_deletes` only at `:500`, i.e. AFTER the fold. Between the walks there is a seal GET and nothing
+   else.
+3. No DROP/TRUNCATE in the run log, no `namespace_removals`, no ref-cleanup activity in that checkpoint's
+   own phase rows — so the concurrent-namespace-erase explanation is unsupported.
+4. Both walks enumerate the SAME prefix with the SAME `kind == Log` filter, so a scope mismatch between
+   them is excluded.
+
+LEADING HYPOTHESIS, still unverified: the round STRADDLED A LEASE LOSS. ch2 completes walk 1 over 385,442
+keys, chaos freezes it for 80 s, ch1 takes the lease as a dead incumbent and its own post-CAS
+`cleanupRefObjects` deletes ref logs ch2 had just listed; ch2 thaws, walk 2 legitimately misses them, probe
+A fires.
+
+If that is the mechanism, the important consequence is that **the three aborted folds cost nothing** — a
+round that lost its lease must not commit anyway, so probe A merely aborted earlier and under a scarier
+name. The defect would then be in the probe's REPORTING, not in its safety: it reports a scan anomaly when
+the truth is "we lost the lease mid-round", and those two must not be conflated in a signal built to be
+believed.
+
+BLOCKED ON AN INSTRUMENTATION GAP, which is worth its own note: `ref_object_cleanup`'s phase metrics carry
+`namespaces_planned` / `suppressed` / `trim_enabled` but NOT how many objects were deleted. That is exactly
+the number this investigation needs, and its absence is the same shape as everything else this week.
