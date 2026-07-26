@@ -2355,3 +2355,38 @@ change, one 20-minute soak, four minutes in — decisive. The detector was stand
 disagreement the whole time and throwing it away, and I went looking for the crime scene elsewhere instead
 of asking it what it saw. The user's question ("why can't you trace this through the CA log, we write the
 full context of every critical decision") is what redirected it.
+
+### The second branch closes too: append ordering verified at THREE levels {#probe-a-append-order-verified}
+
+{#probe-a-caught-live} left two branches. The second — that `0x1430c`/`0x1430d` were written AFTER
+`0x1430e`, so walk 1 legitimately missed them — required appends to one namespace to complete out of order.
+That rested on a single reading of `appendRefOps`, which I had repeatedly flagged as the argument's weakest
+link. Re-checked properly, it holds at three independent levels:
+
+1. **The baton.** `leader_active` lives in `RefTable`, guarded by `ref_queue_mutex`: one leader per
+   namespace, and a new tenure cannot begin until the previous released.
+2. **The flush loop is sequential.** `for (size_t item_index = 0; item_index < batch.size(); ++item_index)`,
+   committing chunk by chunk through `commitRefChunk`. Its own failure-isolation comment states the
+   ordering outright: "Earlier chunks that already committed keep their callers' success" — chunk N is
+   fully committed or failed before chunk N+1 is attempted.
+3. **The PUT is synchronous and awaited**, one object per carved chunk.
+
+Ids are minted in increasing order; within a tenure chunk order is id order, across tenures the baton
+orders them. **So the PUT for id N completes before the PUT for N+1 is issued.**
+
+Apply that to the captured firing: `0x1430c`, `0x1430d`, `0x1430e` are consecutive and ALL THREE were
+confirmed present. Therefore `c` and `d` were durable before `e`'s PUT even started. Walk 1 returned `e`,
+so walk 1 ran after `e` landed — hence after `c` and `d` landed — and did not return them.
+
+**The enumeration was incomplete.** {#list-as-journal-dataloss-2026-07-25} is no longer a model, an
+inference, or a survivor of elimination: it is observed, with the omitted objects proven to exist and the
+ordering that makes their absence impossible verified in three places.
+
+### The one thing still resting on reading rather than measurement {#probe-a-remaining-hardening}
+
+The ordering guarantee is established from SOURCE, not from an experiment. A reader who rejects it can
+still reject the conclusion. The clean way to close that is the object's LAST-MODIFIED time against the
+walk's start — and it is NOT currently reachable: `HeadResult::attributes` is `map<String,String>` of USER
+metadata, not S3's `LastModified`, and the writer's `ref_publish`/`ref_drop` audit events do not carry the
+ref txn id either (checked both). Surfacing either one is a real change, worth making, and it is hardening
+of a conclusion rather than a gate on it.
