@@ -1,0 +1,43 @@
+Row 1:
+──────
+hostname:                ea718f519e36
+event_date:              2026-07-26
+event_time:              2026-07-26 16:47:38
+event_time_microseconds: 2026-07-26 16:47:38.052344
+event_type:              gc_anomaly
+disk_name:               ca
+namespace:               ca_soak_ch1/store/3ba/3ba2c30d-d1b2-4b17-a536-d311f1e239d4@cas@
+ref_name:                
+object_kind:             root
+object_hash:             
+token:                   
+round:                   0
+gen:                     0
+at_version:              0
+outcome:                 ref_folding_aborted
+reason:                  ref-prefix enumerations disagree about a durable ref log
+thread_id:               727
+query_id:                
+detail:                  {'direction':'missing from the pre-fold scan','fold_max':'0000000000000001-0000000000014a10','head':'present','hole_ordinal':'1','log':'0000000000000001-000000000001430c','pre_max':'0000000000000001-000000000001430e','probe':'A','row_cap':'32'}
+
+Row 2:
+──────
+hostname:                ea718f519e36
+event_date:              2026-07-26
+event_time:              2026-07-26 16:47:38
+event_time_microseconds: 2026-07-26 16:47:38.052731
+event_type:              gc_anomaly
+disk_name:               ca
+namespace:               ca_soak_ch1/store/3ba/3ba2c30d-d1b2-4b17-a536-d311f1e239d4@cas@
+ref_name:                
+object_kind:             root
+object_hash:             
+token:                   
+round:                   0
+gen:                     0
+at_version:              0
+outcome:                 ref_folding_aborted
+reason:                  ref-prefix enumerations disagree about a durable ref log
+thread_id:               727
+query_id:                
+detail:                  {'direction':'missing from the pre-fold scan','fold_max':'0000000000000001-0000000000014a10','head':'present','hole_ordinal':'2','log':'0000000000000001-000000000001430d','pre_max':'0000000000000001-000000000001430e','probe':'A','row_cap':'32'}
