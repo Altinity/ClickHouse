@@ -1886,3 +1886,67 @@ suspicion, and a reason to expect the answer to be non-trivial rather than a tid
 It is also testable READ-ONLY before any counter is added: decode a sample of `_log/` objects on the stand
 and check whether the manifests named within a single transaction repeat. That would answer the cheap half
 of #17 without a product change.
+
+## ANSWERED 2026-07-26 — task #17: 39.6% of intake manifest fetches are re-reads, and the mechanism is exact {#gc-manifest-reuse-measured}
+
+Answered the cheap way, as {#gc-perf-intake-structure} proposed: decoded the ref-log objects on the stand
+with `ca-inspect` and counted. **No product change was needed to get the answer**, so the counter proposed
+in task #17 is not required for the decision (it may still be wanted for continuous tracking — separate
+question).
+
+Population: **all 959 ref-log transactions** currently in the soak pool, 8 namespaces, 6 epochs. Not a
+sample.
+
+### The rule that decides the cost {#reuse-rule}
+
+`manifestEdgesOfTxn` (Pool/CasRefProtocol.cpp) emits at most one edge per `OwnerTransition`, by shape:
+
+| shape | edge | manifest fetched |
+|---|---|---|
+| `AddPrecommit` | `+1` on the new manifest | yes |
+| `RemovePrecommit` / `RemoveCommitted` | `-1` on the old manifest | yes |
+| `Promote` (Precommit -> Committed, same manifest) | **none** — "the manifest keeps an owner the whole time, so there is no net edge" | **no** |
+
+The `Promote` exemption matters and I initially got it wrong: my first pass charged two fetches to every
+promote (it names the same manifest in both bindings) and produced 66.6% redundancy. Reading the emission
+rule instead of assuming it removed 6,112 phantom fetches and brought the number to 39.6%. **The measured
+number below is the one derived from the actual rule.**
+
+### What was measured {#reuse-numbers}
+
+```
+transactions                      959
+shapes            AddPrecommit 2991 · RemoveCommitted 4574 · Promote (no edge) 3056
+EDGES emitted (== manifest GETs)  7565      = 7.89 per txn
+distinct manifests among edges    4573
+  redundancy                      39.6%
+  repeat histogram                {1: 1582, 2: 2990, 3: 1}
+intra-transaction redundancy      0.0%      <- every edge WITHIN a txn names a distinct manifest
+manifests with both +1 and -1     2991      <- fetched once to add, once to remove
+```
+
+**The waste is entirely cross-transaction and the mechanism is exact.** 7565 − 4573 = 2992 redundant
+fetches; 2991 manifests carry both an add and a remove edge in this window. A part's manifest body is read
+once when its ref is published and again when its ref is dropped — the same bytes, for the same blob list,
+because there is no cache between them (proven independently by `CasManifestGet == CasRefEmittedEdges`
+exactly, in {#gc-perf-multiplier-attributed}).
+
+### What this does and does not license {#reuse-conclusions}
+
+A **round-scoped manifest-body cache** is a real lever: it would eliminate ~40% of the dominant phase's
+store traffic on this workload, and each avoided edge saves TWO round trips (HEAD + GET), not one. An
+op-scoped or transaction-scoped cache would save **nothing** — intra-transaction redundancy is exactly zero.
+
+Three honest caveats:
+
+1. **This is the residual pool (959 logs), not the measured rounds (5k-404k logs).** Direction of the bias
+   is arguable but not measured: a larger fold window should capture MORE add/remove pairs in one round,
+   pushing redundancy up, not down. That is a prediction. It should be checked against a large round before
+   any cache is sized.
+2. `edges/txn` here is 7.89 against 1.54-3.73 observed in the soak rounds — a different transaction mix
+   (this pool holds bulk-drop transactions of up to 297 ops). The REDUNDANCY FRACTION is the transferable
+   quantity, not the per-txn rate.
+3. A cache needs a memory bound; manifests are not small, and the fold already holds per-round buffers.
+
+Task #10 (the rig) was blocked on this and is unblocked: the service rate to design against is the measured
+256 logs/s, with a known ~40% headroom available from caching rather than from protocol change.
