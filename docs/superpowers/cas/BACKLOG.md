@@ -2643,3 +2643,59 @@ The backend exposes no bulk path at all, which is consistent with that.
 
 **Parallelism, however, IS available here**: N concurrent conditional deletes preserve exactness perfectly,
 because each carries its own token. The same lever as intake, and the same reason it works.
+
+## S42 at `ci` scale: the OOM machinery HELD; the run failed on the environment {#s42-ci-verdict}
+
+Status line: `S42 DONE: status=FAIL (26/28 verdicts pass)`. Both failures are ENVIRONMENTAL, and the
+distinction is the whole result.
+
+### The safety signals — all clean {#s42-safety}
+
+```
+QueryMemoryLimitExceeded     2184   <- the injected faults DID fire; the run is NOT vacuous
+CasRefApplyPoisoned             0   <- THE critical invariant: no writer's view is untrustworthy
+CasRefAppendWedged              2
+CasRefAppendUnwedged            2   <- both wedges RESOLVED; fail-closed worked end to end
+CasRefAppendDefiniteFailure     0
+CasGcUnmatchedRemoveDeltas      0   <- no retention-leak signal
+acked blocks               11,960
+```
+
+**On the question actually asked — do we break under memory exhaustion? — the answer is no.** 2,184
+allocation faults landed, no cache was poisoned, both wedged ref lanes recovered, and every acked block
+survived.
+
+### The two failed verdicts, and why they are the environment {#s42-env}
+
+**1. "statements failed only with the injected allocation error" — 23,561 other failures.** Every sampled
+one is `Code: 210 ... CAS write could not be committed (stageManifest: part-manifest PUT is UNCERTAIN
+(retry budget exhausted))`. That is a request-timeout cascade, not a memory error.
+
+**2. "GC no Failed rounds" — 2.** Both are `Code: 499 ... Timeout ... (S3_ERROR)` on objects of **268 bytes**
+and **4,606 bytes**. A 268-byte GET timing out is a store that is not answering, not a product that cannot
+allocate.
+
+### Why the environment was compromised, and why that was predictable {#s42-env-cause}
+
+This run started while the host was still recovering from the `--scale full` attempt
+({#s42-full-scale-too-big}): load average was 22–48 at launch, and RustFS shares the machine with two
+ClickHouse servers and the workload. Under that, small-object requests time out and the retry budget
+empties.
+
+**The card's gate did exactly its job.** It is built to fail when non-injected errors appear, precisely so
+attribution is never muddied — and here it caught a polluted experiment rather than a defect. That is the
+gate working, not the gate being wrong.
+
+### Verdict, stated the way it should be recorded {#s42-verdict-wording}
+
+- **On memory-exhaustion safety: PASS on every signal**, with the anti-vacuity gate satisfied (2,184 faults).
+- **On the card's own strict criterion: FAIL**, because the environment injected 23,561 failures of its own.
+- **Therefore the run is INCONCLUSIVE as a certification** and must be repeated on a quiet host before S42
+  can be called green. It is NOT evidence of a defect.
+
+### What the product did under a store that stopped answering {#s42-behaviour}
+
+Worth recording separately, because it is the interesting half: faced with mass request timeouts, the write
+path returned `UNCERTAIN (retry budget exhausted)` to the client and **wedged the affected ref lanes rather
+than guessing**. Both lanes later unwedged. No data was lost and nothing was silently dropped. That is the
+fail-closed design behaving correctly under a fault class the card was not even aiming at.
