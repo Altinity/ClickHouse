@@ -1302,18 +1302,24 @@ fi
         # the scrape kept failing on ownership while looking handled. Naming `config.d` instead would fix
         # today and break again the next time the layout moves, so the path is not named at all.
         # `xargs -r` makes this a clean no-op on a job with no content-addressed disk.
+        #
+        # `-R`, NOT `-r`: `tests/config/install.sh` SYMLINKS these configs into `config.d` (`ln -sf`), and
+        # `grep -r` skips symlinks it finds while walking a tree — only `-R` follows them. The first
+        # version of this fix used `-r`, was "verified" against a directory of regular files, and would
+        # therefore still have matched nothing in CI. `sed --follow-symlinks` likewise, so the edit lands
+        # in the file rather than replacing the link with a regular copy.
         Shell.check(
-            "grep -rl '<metadata_type>content_addressed</metadata_type>' /etc/clickhouse-server/ 2>/dev/null "
-            "| xargs -r sed -i 's|<metadata_type>content_addressed</metadata_type>|<metadata_type>content_addressed</metadata_type><readonly>true</readonly>|g'"
+            "grep -Rl '<metadata_type>content_addressed</metadata_type>' /etc/clickhouse-server/ 2>/dev/null "
+            "| xargs -r sed -i --follow-symlinks 's|<metadata_type>content_addressed</metadata_type>|<metadata_type>content_addressed</metadata_type><readonly>true</readonly>|g'"
         )
         # Fail LOUDLY rather than silently, if the substitution ever stops matching again: a CA disk that
         # is declared but not marked read-only means this scrape is about to die on ownership, and a
         # silent no-op is precisely how that went unnoticed before. Reports; does not abort the dump.
         if Shell.check(
-            "grep -rlq '<metadata_type>content_addressed</metadata_type>' /etc/clickhouse-server/",
+            "grep -Rlq '<metadata_type>content_addressed</metadata_type>' /etc/clickhouse-server/",
             verbose=False,
         ) and not Shell.check(
-            "grep -rlq '<metadata_type>content_addressed</metadata_type><readonly>true</readonly>' /etc/clickhouse-server/",
+            "grep -Rlq '<metadata_type>content_addressed</metadata_type><readonly>true</readonly>' /etc/clickhouse-server/",
             verbose=False,
         ):
             print(
