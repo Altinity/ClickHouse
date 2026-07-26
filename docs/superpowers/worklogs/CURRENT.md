@@ -344,3 +344,14 @@ instrumentation — the phase rows record the enumeration but not the lease iden
   evaluated **52 times, all 0**, against the same 4 early skips — the skips were confined to the
   large-pool window and have not recurred. Signals read on 179 ticks at 2/2 and 9 at 1/2. Disk stable at
   322G, load 1.8, log 19 s old. Nothing to unstick.
+- 09:56 UTC — watchdog: 4 h soak at t+3h59m, in its final converge/drain, **0 failures, 37 checkpoints OK,
+  66 × `stale_edge=0`** against the same 4 early skips. Signals still read every tick. Disk 322G.
+  One WARNING to carry, not a failure: `pool drain wait exceeded its rate-scaled budget (300s)`; the
+  trajectory `[15289771, 4071093, 4071094, 3034558, 2003866, 2003866]` shows the pool genuinely draining
+  and flattening, so the budget was tight rather than the drain being stuck — worth a look at how that
+  budget is scaled, since a warning that fires on a healthy drain trains people to ignore it.
+  The quiesced GC phase profile is DIFFERENT from the loaded one and that is the interesting part for the
+  load study: at the end, ch1 shows rounds=39 total=17.6s with `orphan_sweep=7.1s` and
+  `defer_decision=3.6s` dominating, while ch2 shows total=1.0s. Under load earlier the dominant phase was
+  `fold_ref_intake` at 196s. So the phase that costs the most depends entirely on the regime — which is
+  exactly the thing no one could see before this instrumentation existed, and exactly what the study needs.
