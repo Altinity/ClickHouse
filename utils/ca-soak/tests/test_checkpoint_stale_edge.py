@@ -60,7 +60,10 @@ def stubbed(monkeypatch):
     monkeypatch.setattr(run_mod, "log", lambda msg: calls.setdefault("log", []).append(msg))
 
     def install(fsck_fn):
-        def wrapped(container, disk="ca_ro", detail=True, timeout_s=600.0):
+        # `**kwargs` deliberately: this stub stands in for the REAL `run_fsck`, whose signature grows
+        # (it gained `partial` on 2026-07-26). A stub that pins the signature turns every such addition
+        # into a fake test failure, which teaches the reader to distrust the suite.
+        def wrapped(container, disk="ca_ro", detail=True, timeout_s=600.0, **kwargs):
             calls["fsck"].append(detail)
             return fsck_fn(detail)
         monkeypatch.setattr(run_mod, "run_fsck", wrapped)

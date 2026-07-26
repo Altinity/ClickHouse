@@ -673,3 +673,57 @@ TEST(CasFsckRunning, FsckOnNotLiveDiskThrowsTyped668)
         expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&] { storage->runFsckNow(/*detail=*/false); });
     }
 }
+
+/// The summary line is the ONLY thing most consumers ever read: the soak harness parses it, an operator
+/// eyeballs it, and `exit_code` gates CI on it. So a field that `clean()` treats as a hard finding but the
+/// summary omits is invisible in practice, however faithfully it is counted -- which is exactly what
+/// happened to `corrupted_runs`: counted since the seal check landed, part of `clean()`, rendered in
+/// `--detail` rows, and absent from the summary, so no run has ever reported one.
+///
+/// This test is deliberately written against `clean()`'s OWN field set rather than a hand-listed set of
+/// names, so that adding a hard finding to `clean()` without rendering it fails HERE instead of hiding for
+/// months. `formatFsckSummary` exists to be testable at all: the line used to be built inline in
+/// `CommandFsck::executeImpl`, where nothing could reach it.
+TEST(CasFsckSummary, EveryHardFindingAppearsOnTheSummaryLine)
+{
+    FsckReport rep;
+    rep.dangling = 11;
+    rep.snapshot_oracle_mismatches = 22;
+    rep.corrupted_runs = 33;
+    rep.stale_edge = 44;
+
+    const String line = formatFsckSummary(rep);
+
+    /// One assertion per `clean()` term. If `clean()` grows a term, add it here in the same change.
+    EXPECT_NE(line.find("dangling=11"), String::npos) << line;
+    EXPECT_NE(line.find("snapshot_oracle_mismatches=22"), String::npos) << line;
+    EXPECT_NE(line.find("corrupted_runs=33"), String::npos) << line;
+    EXPECT_NE(line.find("stale_edge=44"), String::npos) << line;
+
+    /// A report carrying these values is NOT clean; the line must not be mistakable for a clean one.
+    EXPECT_FALSE(rep.clean());
+}
+
+/// A zero must be PRINTED, not omitted. The harness's `stale_edge_verdict` fails closed on an absent key
+/// precisely because "field missing" and "field zero" are different facts, and a formatter that skips
+/// zeros would turn every clean pool into an unparseable one.
+TEST(CasFsckSummary, ZeroValuedHardFindingsAreStillPrinted)
+{
+    const String line = formatFsckSummary(FsckReport{});
+    EXPECT_NE(line.find("corrupted_runs=0"), String::npos) << line;
+    EXPECT_NE(line.find("stale_edge=0"), String::npos) << line;
+    EXPECT_EQ(line.find("partial="), String::npos) << "a non-partial report must not claim partial: " << line;
+}
+
+/// A partial scan is a lower bound over the visited subset, so the flag and its reason must travel WITH
+/// the counts -- a consumer that sees the numbers but not `partial=1` reads a truncated walk as the pool
+/// truth.
+TEST(CasFsckSummary, PartialFlagAndReasonTravelWithTheCounts)
+{
+    FsckReport rep;
+    rep.partial = true;
+    rep.partial_reason = "deadline exceeded after 180s";
+    const String line = formatFsckSummary(rep);
+    EXPECT_NE(line.find("partial=1"), String::npos) << line;
+    EXPECT_NE(line.find("reason='deadline exceeded after 180s'"), String::npos) << line;
+}

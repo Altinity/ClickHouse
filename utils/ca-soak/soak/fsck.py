@@ -10,6 +10,13 @@ Both functions return a dict that is safe to assert on in integration tests.
 import subprocess
 
 
+#: How far INSIDE the subprocess budget the scan's own deadline is placed when `partial=True`.
+#: `ca-fsck --timeout N --partial` prints the counts it accumulated before N; that printing only happens
+#: if the process is still alive, so the subprocess budget must outlast N. The margin covers process
+#: start-up, the final summary write, and the `--detail` row dump.
+PARTIAL_MARGIN_S = 20
+
+
 class FsckTimeout(RuntimeError):
     """The fsck/dryrun subprocess exceeded its timeout (an O(pool) scan crawling under load — B146/B154)."""
 
@@ -89,6 +96,21 @@ def stale_edge_verdict(fsck_result: dict, *, detail: bool) -> tuple:
                 "(programs/disks/CommandFsck.cpp), so this binary predates the StaleEdge class and the "
                 "checkpoint cannot prove the class is empty. Failing CLOSED — a missing key is not zero.")
     value = fsck_result["stale_edge"]
+    # A positive count is checked BEFORE the partial gate below, deliberately: being partial weakens
+    # proofs of ABSENCE, never evidence of PRESENCE. A stale edge the scan actually saw is a stale edge,
+    # whether or not the walk finished.
+    if detail and value != 0:
+        return ("found",
+                f"fsck stale_edge = {value}: blob(s) whose every source edge names a manifest that "
+                "no longer exists. Their in-degree can never reach zero, so the incremental GC can "
+                "never reclaim them (only a rebuild of the in-degree state can). This is a hard "
+                "finding, not GC-pipeline debris.")
+    if fsck_result.get("partial"):
+        return ("unchecked",
+                f"stale_edge was NOT checked: the scan is PARTIAL (reason: "
+                f"{fsck_result.get('reason', 'unstated')}), so its counts are a lower bound over the "
+                f"subset it walked. Neither `stale_edge == 0` nor `unreachable == 0` then says anything "
+                f"about the pool — only about the prefix reached before the deadline.")
     if detail:
         if value != 0:
             return ("found",
@@ -156,7 +178,7 @@ _CLICKHOUSE_DISKS = [
 
 
 def run_fsck(container: str, disk: str = "ca_ro", detail: bool = True,
-             timeout_s: float = 600.0) -> dict:
+             timeout_s: float = 600.0, partial: bool = False) -> dict:
     """Run `clickhouse disks --disk <disk> --query "ca-fsck [--detail]"` in the container.
 
     Uses the read-only disk (``ca_ro`` by default) so the mutating capability probe is
@@ -174,6 +196,13 @@ def run_fsck(container: str, disk: str = "ca_ro", detail: bool = True,
     kills the child process automatically on ``TimeoutExpired`` in Python 3.x.
     """
     query = "ca-fsck --detail" if detail else "ca-fsck"
+    if partial:
+        # Put the scan's own deadline strictly INSIDE the subprocess budget. Until 2026-07-26 these two
+        # were inverted -- subprocess 180s, product default 600s -- so the process was always killed
+        # before it could print anything, and `--partial` was unreachable from this harness. That
+        # inversion cost 4 of 39 checkpoints their entire fsck gate in the 4h Part B soak.
+        scan_budget = max(int(timeout_s) - PARTIAL_MARGIN_S, 1)
+        query += f" --timeout {scan_budget} --partial"
     cmd = [
         "docker", "exec", container,
         *_CLICKHOUSE_DISKS,

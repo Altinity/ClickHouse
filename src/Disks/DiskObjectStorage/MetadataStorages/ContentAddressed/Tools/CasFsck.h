@@ -149,4 +149,13 @@ FsckReport runFsck(Pool & store, bool detail, FsckProgress on_progress = {},
                    std::optional<std::chrono::steady_clock::time_point> deadline = {},
                    bool partial_on_deadline = false, const String & namespace_prefix = {});
 
+/// Render the single machine-parseable summary line (no trailing newline). This is the ONLY view of a
+/// report most consumers ever get -- the soak harness parses it, CI greps it, an operator reads it -- so
+/// it lives here, next to the report and under test, rather than inline in the command where nothing
+/// could reach it. Every term of `FsckReport::clean` MUST appear: a hard finding the line omits is a
+/// finding no run will ever report, which is how `corrupted_runs` stayed invisible from the day it was
+/// first counted. Zeros are printed, never omitted: "absent" and "zero" are different facts, and
+/// consumers (e.g. the harness's `stale_edge_verdict`) fail closed on absence by design.
+String formatFsckSummary(const FsckReport & report);
+
 }

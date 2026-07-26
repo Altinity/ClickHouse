@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <set>
+#include <sstream>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -812,6 +813,35 @@ FsckReport runFsck(Pool & store, bool detail, FsckProgress on_progress,
         report.partial_reason = e.message();
     }
     return report;
+}
+
+String formatFsckSummary(const FsckReport & report)
+{
+    /// Field order is load-bearing for humans only; every consumer parses `key=value` tokens. `partial`
+    /// and its free-text reason go LAST because the reason can contain spaces and quotes, so a parser
+    /// splitting on whitespace has to trim from the tail (see the harness's `parse_fsck_summary`).
+    /// `std::ostringstream`, not a ClickHouse write buffer: this reproduces the exact `std::cout`
+    /// formatting the line has always had, `dedup_ratio`'s default double precision included, so
+    /// extracting the line from the command changes nothing a parser can observe.
+    std::ostringstream out;   // STYLE_CHECK_ALLOW_STD_STRING_STREAM
+    out << "reachable=" << report.reachable
+        << " dangling=" << report.dangling
+        << " unreachable=" << report.unreachable
+        << " pending_gc=" << report.pending_gc
+        << " awaiting_gc=" << report.awaiting_gc
+        << " unaccounted=" << report.unaccounted
+        << " stale_edge=" << report.stale_edge
+        << " corrupted_runs=" << report.corrupted_runs
+        << " snapshot_oracle_mismatches=" << report.snapshot_oracle_mismatches
+        << " snapshot_oracle_checked=" << report.snapshot_oracle_checked
+        << " physical_bytes=" << report.physical_bytes
+        << " referenced_logical_bytes=" << report.referenced_logical_bytes
+        << " distinct_blobs=" << report.distinct_blobs
+        << " total_blob_refs=" << report.total_blob_refs
+        << " dedup_ratio=" << report.dedupRatio();
+    if (report.partial)
+        out << " partial=1 reason='" << report.partial_reason << "'";
+    return out.str();
 }
 
 }

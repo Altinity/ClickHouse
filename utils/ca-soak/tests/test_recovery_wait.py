@@ -21,6 +21,16 @@ class FakeNode:
         self.calls += 1
         return self.calls > self.down_for
 
+    def query(self, sql, timeout=5.0):
+        # `wait_for_healthy`'s readiness gate stopped being `ping()` alone on 2026-07-22: it now proves
+        # the table is actually loaded by READING it, because /ping turns 200 before async table load
+        # finishes. This fake answered only `ping`, so every node looked permanently un-loaded and all
+        # three tests in this file failed — a stale fake, not a product defect. The read succeeds exactly
+        # when the node is up, which is the behaviour the gate is written against.
+        if not self.calls > self.down_for:
+            raise RuntimeError(f"{self!r} is down")
+        return "1"
+
     def __repr__(self):
         return f"FakeNode({self.name})"
 
@@ -61,7 +71,9 @@ def test_wait_fails_loudly_if_node_never_returns():
     with pytest.raises(CheckpointFailure) as ei:
         wait_for_healthy(cluster, timeout_s=10, settle_s=2.0,
                          sleep_fn=clock.sleep, monotonic_fn=clock.monotonic)
-    assert "never returned HTTP-healthy" in str(ei.value)
+    # The message became "healthy-with-tables-loaded" when the gate stopped trusting /ping alone
+    # (2026-07-22); the old "HTTP-healthy" wording was pinned here and had been failing since.
+    assert "never returned healthy-with-tables-loaded" in str(ei.value)
 
 
 def test_wait_requires_settle_recheck():

@@ -67,4 +67,8 @@ def test_lazy_database_ddl_is_emitted(monkeypatch):
 
     joined = "\n".join(captured)
     assert "CREATE DATABASE IF NOT EXISTS ca_soak" in joined
-    assert "lazy_load_tables = 1" in joined
+    # The database is created EAGERLY. `lazy_load_tables` was deliberately turned OFF on 2026-07-22
+    # (see the rationale at soak/run.py's DB constant and BACKLOG {#lazy-load-tables-decision-2026-07-21});
+    # this assertion was left behind asserting the abandoned behaviour and had been failing ever since.
+    # Pinned in the negative so that re-enabling the setting has to come back through this test.
+    assert "lazy_load_tables" not in joined

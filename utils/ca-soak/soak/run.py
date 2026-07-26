@@ -607,7 +607,7 @@ def checkpoint(driver, cluster, model, phase, *, strict_unreachable=False):
     try:
         residual = drive_gc_to_fixpoint(
             cluster,
-            lambda: run_fsck(FSCK_CONTAINER, detail=False, timeout_s=180)["unreachable"],
+            lambda: run_fsck(FSCK_CONTAINER, detail=False, timeout_s=180, partial=True)["unreachable"],
             pool_bytes_fn=lambda: pool_size()[1],
             drain_interval_s=METRICS_INTERVAL_S,
             log_fn=log,
@@ -629,12 +629,19 @@ def checkpoint(driver, cluster, model, phase, *, strict_unreachable=False):
     # If even the summary fsck times out here (B146/B154), we log a LOUD warning and skip this
     # checkpoint's fsck asserts entirely — a slow fsck must never wedge or fail the soak.
     try:
-        f = run_fsck(FSCK_CONTAINER, detail=False, timeout_s=180)
+        f = run_fsck(FSCK_CONTAINER, detail=False, timeout_s=180, partial=True)
     except FsckTimeout as _e:
         log(f"WARNING [B146/B154] post-GC summary fsck timed out ({_e}); "
             f"SKIPPING fsck/dryrun asserts for this checkpoint — dangling==0 gate unavailable; "
             f"soak continues (primary purpose: live workload exercise, fsck is best-effort oracle)")
         _detail_fsck_skipped = True
+        # HAZARD, kept deliberately and narrowly: these zeros are FABRICATED, not measured. They exist
+        # only to keep the code below flowing, and every consumer of `f` past this point is guarded by
+        # `not _detail_fsck_skipped`, so no assert ever reads them. Do NOT remove that guard from any
+        # consumer without also removing this dict -- a fabricated `dangling: 0` reaching an assert is
+        # precisely the "check that passed while looking at nothing" failure. Tracked in BACKLOG
+        # {#fsck-fabricated-clean-on-timeout}. With `partial=True` above this path is now rare: the scan
+        # reports a lower bound instead of dying empty-handed.
         f = {"dangling": 0, "unreachable": 0, "reachable": 0, "exit_code": 0, "detail": []}
     else:
         if not _detail_fsck_skipped and (f.get("dangling", 0) != 0 or f.get("unreachable", 0) != 0):
@@ -669,7 +676,7 @@ def checkpoint(driver, cluster, model, phase, *, strict_unreachable=False):
         if phase == 2:
             try:
                 f = wait_for_pool_consistent(
-                    lambda: run_fsck(FSCK_CONTAINER, timeout_s=180)
+                    lambda: run_fsck(FSCK_CONTAINER, timeout_s=180, partial=True)
                 )
                 _fsck_is_detail = True   # run_fsck defaults to detail=True
             except FsckTimeout as _e:
@@ -790,10 +797,14 @@ def checkpoint(driver, cluster, model, phase, *, strict_unreachable=False):
         if already_deleted_count > 0:
             log(f"dryrun: {already_deleted_count} keys already deleted, pending fold — tolerated")
 
-    # --- TRACK (do NOT hard-fail): residual unreachable is the known M-F Full-GC debris -------
+    # --- TRACK (do NOT hard-fail): residual unreachable is fold BACKLOG, not debris ----------
+    # The label used to read "M-F debris, pending Full GC / B140". That attribution is WRONG and was
+    # actively misleading: the product classifies these objects as `AwaitingGc` -- the ack-floor deletion
+    # pipeline mid-flight -- and the one time the B140 label was believed, it hid a real retention leak
+    # for months (BACKLOG {#unmatched-minus-one-retention-leak}). Say what the product says.
     unreachable = f.get("unreachable", 0)
     reachable = f.get("reachable", 0)
-    log(f"unreachable={unreachable} (M-F debris, pending Full GC / B140); reachable={reachable} "
+    log(f"unreachable={unreachable} (fold backlog / AwaitingGc); reachable={reachable} "
         f"dangling=0 dryrun_subset=ok")
     # Mid-churn, `unreachable` is a fold BACKLOG (fsck class AwaitingGc), not a leak: it scales
     # with churn rate while `reachable` sits at its floor, so a level cap here is a guaranteed
@@ -929,7 +940,14 @@ def wait_for_pool_consistent(fsck_fn, *, timeout_s: float = 180.0, stable: int =
     last_clean = None
     while True:
         last = fsck_fn()
-        clean = last.get("dangling") == 0 and last.get("exit_code") == 0
+        # A PARTIAL read never counts as clean. Its `dangling == 0` is a lower bound over the prefix the
+        # scan reached before its deadline, not a statement about the pool, so treating it as a coherent
+        # cut would fabricate exactly the consistency proof this gate exists to establish. (Live risk
+        # since 2026-07-26: the callers now pass `partial=True`, so a slow scan RETURNS zeros instead of
+        # raising `FsckTimeout` — before that change this branch was unreachable.)
+        clean = (last.get("dangling") == 0
+                 and last.get("exit_code") == 0
+                 and not last.get("partial"))
         if clean:
             last_clean = last
         consecutive_clean = consecutive_clean + 1 if clean else 0
@@ -1466,7 +1484,7 @@ def run_phase3(args):
             # Entry gate only needs dangling/exit_code -> cheap summary fsck (detail=False).
             # Each poll is bounded at 180s; FsckTimeout degrades to a logged skip (B146/B154).
             try:
-                wait_for_pool_consistent(lambda: run_fsck(FSCK_CONTAINER, detail=False, timeout_s=180))
+                wait_for_pool_consistent(lambda: run_fsck(FSCK_CONTAINER, detail=False, timeout_s=180, partial=True))
             except FsckTimeout as _e:
                 log(f"WARNING [B146/B154] {label}: entry-gate fsck timed out ({_e}); "
                     f"proceeding to checkpoint without pool-consistent gate — soak continues")
@@ -1474,7 +1492,7 @@ def run_phase3(args):
         finally:
             checkpoint_active.clear()
         log(f"{label} OK: now={now} count={exp['count']} fsck reachable={f.get('reachable')} "
-            f"unreachable={f.get('unreachable')} (M-F debris, B140) dangling={f.get('dangling')} "
+            f"unreachable={f.get('unreachable')} (fold backlog / AwaitingGc) dangling={f.get('dangling')} "
             f"stale_edge={_stale_edge_display(f)} dryrun_count={dr.get('count')}")
         # Record a checkpoint-tagged metrics tick carrying the fsck result (§2: include fsck at checkpoints).
         checkpoint_ts = int(time.time())
@@ -1620,7 +1638,7 @@ def run_phase3(args):
         # Quiesce-before-dump: do NOT record a bare fsck on a still-churning pool (it false-positives
         # transient `dangling` — B141/B144/B145). Settle to a stable `dangling==0` (or label the
         # verdict transient/persistent) before recording it.
-        f, fsck_status = settle_fsck_for_dump(lambda: run_fsck(FSCK_CONTAINER, timeout_s=180))
+        f, fsck_status = settle_fsck_for_dump(lambda: run_fsck(FSCK_CONTAINER, timeout_s=180, partial=True))
         op_id = last_op.op_id if last_op is not None else None
         last_op_d = last_op.__dict__ if last_op is not None else None
         payload = write_failure(
@@ -1818,7 +1836,7 @@ def main(argv=None):
                 # PERSISTENT dangling>0 past the bound is escalated as a REAL durability finding.
                 # Each poll is bounded at 180s; FsckTimeout degrades to a logged skip (B146/B154).
                 try:
-                    wait_for_pool_consistent(lambda: run_fsck(FSCK_CONTAINER, timeout_s=180))
+                    wait_for_pool_consistent(lambda: run_fsck(FSCK_CONTAINER, timeout_s=180, partial=True))
                 except FsckTimeout as _e:
                     log(f"WARNING [B146/B154] {label}: entry-gate fsck timed out ({_e}); "
                         f"proceeding to checkpoint without pool-consistent gate — soak continues")
@@ -1827,7 +1845,7 @@ def main(argv=None):
             checkpoint_active.clear()
         log(f"{label} OK: now={now} count={exp['count']} "
             f"fsck reachable={f.get('reachable')} unreachable={f.get('unreachable')} "
-            f"(M-F debris, B140) dangling={f.get('dangling')} stale_edge={_stale_edge_display(f)} "
+            f"(fold backlog / AwaitingGc) dangling={f.get('dangling')} stale_edge={_stale_edge_display(f)} "
             f"dryrun_count={dr.get('count')}")
         checkpoint_ts = int(time.time())
         capture_checkpoint_signals(cluster, label, tracker=signal_tracker)
@@ -1915,7 +1933,7 @@ def main(argv=None):
             n1 = n2 = None
         # Quiesce-before-dump: settle the fsck to a stable `dangling==0` (or label it transient/
         # persistent) rather than recording a bare fsck on a churning pool (B141/B144/B145).
-        f, fsck_status = settle_fsck_for_dump(lambda: run_fsck(FSCK_CONTAINER, timeout_s=180))
+        f, fsck_status = settle_fsck_for_dump(lambda: run_fsck(FSCK_CONTAINER, timeout_s=180, partial=True))
         op_id = last_op.op_id if last_op is not None else None
         last_op_d = last_op.__dict__ if last_op is not None else None
         payload = write_failure(

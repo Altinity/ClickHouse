@@ -67,18 +67,10 @@ public:
 
         const Cas::FsckReport report = Cas::runFsck(*ca->store(), detail, on_progress, deadline, partial, namespace_prefix);
 
-        std::cout << "reachable=" << report.reachable << " dangling=" << report.dangling << " unreachable=" << report.unreachable
-                  << " pending_gc=" << report.pending_gc << " awaiting_gc=" << report.awaiting_gc
-                  << " unaccounted=" << report.unaccounted
-                  << " stale_edge=" << report.stale_edge
-                  << " snapshot_oracle_mismatches=" << report.snapshot_oracle_mismatches
-                  << " snapshot_oracle_checked=" << report.snapshot_oracle_checked
-                  << " physical_bytes=" << report.physical_bytes << " referenced_logical_bytes=" << report.referenced_logical_bytes
-                  << " distinct_blobs=" << report.distinct_blobs << " total_blob_refs=" << report.total_blob_refs
-                  << " dedup_ratio=" << report.dedupRatio();
-        if (report.partial)
-            std::cout << " partial=1 reason='" << report.partial_reason << "'";
-        std::cout << "\n";
+        /// Built by `Cas::formatFsckSummary` rather than here, so the line is reachable from a unit test.
+        /// It was assembled inline until 2026-07-26, and in that time `corrupted_runs` was added to the
+        /// report and to `clean()` without ever being rendered — a hard finding no run could report.
+        std::cout << Cas::formatFsckSummary(report) << "\n";
 
         /// De-alarm the pipeline classes for humans: on an active pool a nonzero pending/awaiting
         /// count is the ack-floor deletion pipeline working as designed, not a leak. `stale_edge` is
@@ -133,6 +125,16 @@ public:
                 ErrorCodes::BAD_ARGUMENTS,
                 "ca-fsck: {} table snapshot(s) diverge from an independent replay of their logs "
                 "(cache/codec corruption, spec §Snapshot Publication oracle)", report.snapshot_oracle_mismatches);
+        /// The third term of `clean()`, and until 2026-07-26 the only one that neither printed nor exited
+        /// nonzero — so a corrupt run was invisible twice over. A seal-checksum mismatch is not debris:
+        /// `fold`/`zeroInDegree`/`previewDeletes` all fail closed on the same run, so GC cannot make
+        /// progress past it, and the audit deliberately continues only so ONE pass enumerates them all.
+        if (report.corrupted_runs > 0)
+            throw Exception(
+                ErrorCodes::BAD_ARGUMENTS,
+                "ca-fsck: {} GC source-edge run(s) failed their whole-file seal checksum — the deletion-"
+                "deriving consumers fail closed on these, so GC cannot advance past them (run keys are "
+                "listed as `corrupted-run` rows under --detail)", report.corrupted_runs);
     }
 };
 

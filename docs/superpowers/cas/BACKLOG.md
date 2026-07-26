@@ -1950,3 +1950,66 @@ Three honest caveats:
 
 Task #10 (the rig) was blocked on this and is unblocked: the service rate to design against is the measured
 256 logs/s, with a known ~40% headroom available from caching rather than from protocol change.
+
+## FIXED 2026-07-26 — task #13: fsck could not report on a large pool, in four separate ways {#fsck-large-pool-fixed}
+
+Opened as "the `corrupted_runs` one-liner plus the 180 s budget". Measuring first turned it into four
+defects, two of which were worse than the ones on the card.
+
+### 1. `corrupted_runs` was invisible AND non-fatal {#fsck-corrupted-runs-fixed}
+
+Counted since the seal check landed, a term of `FsckReport::clean`, rendered in `--detail` rows — and
+absent from the summary line, which is the only thing the harness parses, CI greps, or an operator reads.
+It also did not make `ca-fsck` exit nonzero, unlike the other two `clean()` terms. So a GC source-edge run
+failing its whole-file seal checksum was invisible twice over, and no run has ever reported one.
+
+Both fixed. The summary line moved out of `CommandFsck::executeImpl` into `Cas::formatFsckSummary`, which
+exists so the line is reachable from a unit test at all — `CasFsckSummary.EveryHardFindingAppearsOnThe
+SummaryLine` is written against `clean()`'s own terms, so the NEXT hard finding added without rendering
+fails there instead of hiding for months. Verified failing before the fix, not just passing after.
+
+### 2. The two timeout budgets were INVERTED, which made `--partial` unreachable {#fsck-partial-inversion}
+
+The harness bounded the SUBPROCESS at 180 s while `ca-fsck`'s own scan deadline defaulted to 600 s. The
+process was therefore always killed before its internal deadline could fire — and that internal deadline
+is the only path that prints accumulated `partial=1` counts. `--partial` existed in the product the entire
+time and could not be reached from the caller.
+
+Measured cost in the 4-hour Part B soak: **4 of 39 checkpoints lost their whole post-GC fsck gate**
+(`dangling`, `stale_edge`, dryrun-subset — all skipped), plus 4 entry-gate skips. The gate drops out
+exactly when the pool is big, which is when it is worth having.
+
+Fixed by placing the scan deadline strictly inside the subprocess budget (`PARTIAL_MARGIN_S = 20`) and
+passing `--partial` from the timeout-prone call sites.
+
+### 3. The fix would have introduced a fabricated consistency proof {#fsck-partial-gate-hazard}
+
+Caught by writing the regression test before believing the fix. With `partial=True` a timed-out scan now
+RETURNS `dangling=0, exit_code=0` instead of raising — and `wait_for_pool_consistent` counts exactly that
+as a clean read. Turning on partial would have converted an honest timeout into a fabricated coherent cut:
+the precise failure the partial work exists to remove. `clean` now also requires `not partial`, and
+`stale_edge_verdict` returns `unchecked` on any partial result. A positive finding is still checked BEFORE
+the partial gate — being partial weakens proofs of ABSENCE, never evidence of PRESENCE.
+
+### 4. The `M-F debris, B140` label was still printed 40 times per run {#fsck-mf-debris-label-removed}
+
+The attribution is wrong — the product classifies these as `AwaitingGc`, the ack-floor pipeline mid-flight
+— and believing that label is what hid the retention leak. Three output sites, not the two a first
+`grep | head -3` showed; the third was found only by re-grepping the whole file. Explanatory docstrings in
+`checker.py`, `run.py` and `plot.py` still carry the B140 rationale and are NOT fixed here.
+
+### Residual, recorded rather than half-fixed {#fsck-fabricated-clean-on-timeout}
+
+On the remaining `FsckTimeout` path the harness still substitutes `{"dangling": 0, "unreachable": 0, ...}`
+— fabricated zeros. Every consumer past that point is guarded by `not _detail_fsck_skipped`, so no assert
+reads them today; it is a landmine, not a live defect, and it is now commented as one at the site. Removing
+it means auditing every downstream `f.get(...)`, which is a change with real regression surface and does
+not belong bolted onto this one.
+
+### Also fixed: the harness suite had 4 pre-existing RED tests {#soak-suite-stale-reds}
+
+Found while running the suite for this task, unrelated to it, all stale tests rather than product defects —
+each the tail of a deliberate 2026-07-22 change nobody updated the test for: `lazy_load_tables` asserted as
+emitted after it was turned off; a `FakeNode` answering only `ping` after the readiness gate started
+proving table load with a real read; an error-message assertion pinned to the pre-2026-07-22 wording. A red
+suite is worse than no suite — nobody can tell signal from noise in it. Now 275 pass, 0 fail.
