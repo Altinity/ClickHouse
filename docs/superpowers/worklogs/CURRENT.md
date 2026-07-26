@@ -931,3 +931,7 @@ Not scheduling further work from a watchdog turn. The open items — probe A's b
 recommendations, Part B test debt, S42 — are all substantial enough to deserve a deliberate start.
 
 34 local commits, unpushed per instruction.
+
+**18:56 UTC watchdog** — idle, unchanged from 18:26: nothing running, 323G, load 0.42, containers healthy,
+0 uncommitted, 35 local commits. No long run, so no signals to observe. Nothing scheduled; the open items
+all warrant a deliberate start rather than a timer-driven one.
