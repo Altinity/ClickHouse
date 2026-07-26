@@ -417,3 +417,24 @@ conservation check, drop the fsck detail-class whitelist, sample per-phase rows 
 recorded and deliberately unexecuted. Of the three things the user is waiting for: (1) soak — DONE green;
 (2) S42 — card exists, not run at scale; (3) GC-under-load — now has two measurements and a corrected model,
 but the reproduction rig is not built. Scheduling no further work.
+
+## 2026-07-26 11:15 UTC — round closed, pushed to Altinity, GC round opened
+
+Pushed `3c54eca3bd2..596a969fa73` to `Altinity/ClickHouse cas-gc-rebuild` — 149 commits, fast-forward,
+no uncommitted code. Authorized by the user explicitly.
+
+Marked what closed. The checkboxes in both active plans had never been ticked as the work landed, so both
+read far less complete than they were: the soak gate and the whole per-phase-rows group are now ticked, and
+each plan carries a head status block. BACKLOG got a round-closure roll-up in the same shape as the
+2026-07-13 grooming note, four headings restamped, and ROADMAP a DONE entry.
+
+What did NOT close is named rather than dropped: the LIST-as-journal blocker, the unmatched-minus-one leak
+(root-caused, fix open, and the obvious remedy is WRONG), the bottleneck rig, probe A's 14 firings, S42 at
+scale, the four instrumentation-review recommendations, `corrupted_runs` invisibility, the fsck 180 s
+budget, and the four Part B test-debt tasks.
+
+New round opened: **GC performance + blobs that never get reclaimed**, BACKLOG
+{#round-gc-perf-and-stuck-blobs}, eight tasks. Recorded there in writing, because it will otherwise be
+misread: `dangling` in fsck vocabulary is *referenced but MISSING* and has been zero in every run; the class
+that actually gets stuck is `unreachable`/`awaiting-gc`. Force-claim and stage-2 `commitPart` are explicitly
+out of scope.
