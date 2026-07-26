@@ -688,3 +688,29 @@ mutating key space is the suspect. Now running 100k keys (100 pages), 40 rounds,
 
 Stated in the tool itself so a clean result cannot be over-read: absence of holes over a short hammer is
 WEAK evidence — probe A found 58 in ~1.4M keys listed across four hours.
+
+## 2026-07-26 14:26 UTC — watchdog: the hammer was RUNAWAY, not hung; stopped deliberately
+
+Not a stall — a design fault of mine. Writers ran flat out through the listing phase, so the prefix grew
+all run: by round 24 a single listing covered **887,614 keys / 888 pages**, disk had gone 313G → 301G on
+~900k tiny objects, and load average hit 8.3. Each round was bigger and slower than the last; round 40
+would have been multi-million. Killed both the run and its monitor on purpose, cleaned up the prefix, and
+capped the population so writers idle at the cap — churn stays high, listing size stays steady, which is
+the combination the experiment actually wants.
+
+**What the add-only regime established before it was stopped: 24 rounds, ZERO holes, 6.85M keys listed
+cumulatively** — roughly five times what probe A saw across its entire four-hour run — at page counts up to
+888. So the store does not lose keys from a paginated listing when the key space only GROWS.
+
+That is a real negative result and it sharpens rather than weakens {#probe-a-answered}: I had already
+recorded, BEFORE this verdict landed, that add-only is the wrong regime
+({#probe-a-hammer-design-gap}). The real ref prefix has GC deleting folded logs from BEHIND the listing
+cursor, and a paginated walk over a SHRINKING key space is where store implementations differ — a
+continuation token can name a position whose key is gone by the time the next page is fetched.
+
+Next: the same hammer with `--deleters`, bounded population. That is the configuration that models GC, and
+it should have been the first one run.
+
+Signals: no soak or S42 in flight, so `stale_edge` / `CasGcUnmatchedRemoveDeltas` /
+`CasRefAppendPreAttemptRefused` / per-phase rows have nothing to observe this cycle. Seven local commits
+held back per the push instruction.
