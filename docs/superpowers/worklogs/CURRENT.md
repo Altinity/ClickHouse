@@ -438,3 +438,31 @@ New round opened: **GC performance + blobs that never get reclaimed**, BACKLOG
 misread: `dangling` in fsck vocabulary is *referenced but MISSING* and has been zero in every run; the class
 that actually gets stuck is `unreachable`/`awaiting-gc`. Force-claim and stage-2 `commitPart` are explicitly
 out of scope.
+
+## 2026-07-26 11:31 UTC — watchdog: idle; task #9 answered by query, as it was supposed to be
+
+Idle. No build, no soak, no agent; no log touched in 30 min. Disk 322G, mem 32G free, load 1.25. Soak
+containers up 2h and healthy — keep them, they hold the 1,673 rounds every measurement this round comes
+from. Remote in sync (0 commits ahead of `altinity/cas-gc-rebuild`). The 0.6-day and 6-day codex processes
+are still resident with completed work; not reaped, this worktree is shared.
+
+**Signal-observation duty: not applicable** — no long run in flight.
+
+**Diagnosis this turn (read-only query on captured data, no implementation):** task #9 said the GET
+multiplier was a query and not an experiment. It was. `S3GetObject` decomposes EXACTLY into
+`CasRefLogBodyGets + CasRefManifestBodyFoldGets` on all six rows — one GET per ref-log body, one per emitted
+manifest edge. So "4.15 GETs per log" was `1 + edges_per_log`, and `edges_per_log` climbs 1.54 → 3.73 with
+backlog. My original one-GET-per-log inference was right about the log and blind to the edges.
+
+Every edge also costs a HEAD: `CasManifestHead == CasManifestGet == CasRefManifestBodyFoldGets ==
+CasRefEmittedEdges`, exactly, every row. Round trips = `logs + 2 × edges`, at a flat ~0.5 ms each across a
+140x range — the phase is a function of its request count and nothing else.
+
+The finding worth the round's attention is the equality itself: manifest-body GETs equalling edge count
+means **no manifest body is ever reused within a round**. If the same manifest is named by ten edges it is
+fetched ten times. Whether that happens is uncounted — it needs a distinct-manifest count, which no counter
+carries — and it is the difference between irreducible work and mostly repeat reads. Recorded as the next
+question, BACKLOG {#gc-perf-multiplier-attributed}, commit `4adaa5b923b`.
+
+Task #10 (the rig) was gated on this and is now unblocked in principle, but it is implementation and the
+round has not been started. Not scheduling it.
