@@ -2284,3 +2284,23 @@ instead of an afternoon of log archaeology.
 
 That is the correct next step for {#probe-a-answered}, and it is a smaller change than the three hammer
 runs it would have replaced.
+
+### #20 DONE: the anomaly now records what it saw {#anomaly-detail-fixed}
+
+`gc_anomaly` event (namespace, hole id, direction, both enumerations' maxima, hole ordinal), two
+ProfileEvents (`CasGcProbeAHolePresent` / `CasGcProbeAHoleAbsent`), and the verdict in the log line.
+
+Three carriers on purpose, each covering another's blind spot: `EventEmitter` no-ops when no audit sink is
+installed, the text log is rotated and root-owned (which already produced one false "zero occurrences"
+today), and only the counters are readable by the soak harness, CI and `system.events`. Both counters are
+registered in `soak/signals.py`, so preflight fails rather than silently reading zero.
+
+Capped at 32 rows/round with the cap and true total in every row, plus an explicit line naming what was
+dropped. Test pins the DIRECTION of the verdict and was verified failing both ways — not taken, and
+inverted. Widened gate green (1379).
+
+**What this buys: the next probe A firing is one `SELECT` from a mechanism.** `present` means an
+enumeration omitted a durable object — {#list-as-journal-dataloss-2026-07-25} observed. `absent` means one
+returned a key that does not exist, which would invalidate that reading entirely and point at the client.
+Neither is recoverable after the fact, which is why three hammer runs and ~19M listed keys could not settle
+it.
