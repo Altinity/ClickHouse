@@ -33,6 +33,21 @@ not committed; **REJECTED** = investigated and deliberately not pursued (reason 
 
 ---
 
+
+> **DONE 2026-07-26 — the publish-confirm + introspection round.** Landed on `cas-gc-rebuild` and pushed
+> to `Altinity/ClickHouse`: **ref-lane exception safety** (uncertain-`precommitAdd` intent recorded before
+> the append; `PreparedPartWrite` move-only handle; `confirmExactRef` whose try-lock removed a pool-wide
+> append stall); **the fetch-handoff publish-confirm protocol** (replication protocol v11, sender-side
+> resolve/answer and receiver-side relink with an enumerated failure taxonomy, rule 6 evaluated last so
+> `No` means "not proven"); **introspection I1-I4** (`stale_edge` fsck class, unmatched-remove-delta
+> counter, DEFER rounds no longer logging as round 0, `ca-inspect` decoding source-edge runs);
+> **`CasRefAppendPreAttemptRefused`**; **per-phase GC log rows** — 18 phases per round, so "where did this
+> round spend 39 minutes" is answerable from a captured artifact for the first time; **the
+> skipped-transaction detector**; **the harness anti-vacuity sweep**; **the CI marker-based CA-disk fix**;
+> **the third gtest gate-filter gap**. Validated by three 20-minute shakeouts plus a 4-hour chaos soak,
+> 0 failures. Detail and the carry-forward list: [`BACKLOG.md`](BACKLOG.md) {#round-gc-perf-and-stuck-blobs}.
+
+
 ## Architecture and object model {#area-architecture}
 
 See [`01-architecture.md`](01-architecture.md) for full detail.
