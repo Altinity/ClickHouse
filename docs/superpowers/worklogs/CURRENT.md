@@ -958,3 +958,29 @@ or research — the `-1`-before-`+1` path (the one live signal with no known mec
 Part B test debt, a chaos-free bottleneck rig, verifying the 39.6% manifest redundancy on a large fold
 window, and whether AWS S3 shows the incompleteness at all. Offered to re-split the tasks so the two are
 separable; awaiting a decision on that and on fix-design-now versus measure-first.
+
+## 2026-07-26 21:26 UTC — watchdog: S42 re-running on a now-quiet host; parts B and C delivered
+
+Host recovered (311G, load 1.85 falling, 20G RAM). Ran the new headroom preflight against it — "disk 310 GB
+free, RAM 55 GB available, concerns: NONE" — then relaunched S42 at `ci` scale, seed 43. The first `ci` run
+was INCONCLUSIVE purely because the host was still recovering from the full-scale attempt; this is the
+repeat that can actually certify.
+
+**Part B delivered — the GC round-duration question is answered.** A 30-minute round is 3.42 MILLION serial
+round trips at ~0.5 ms. Phase time is 100% serial request latency across four large rounds (spread 1.15x):
+no CPU term, no lock term. Of the three hypotheses — serialism is the answer; repeated work is real but
+secondary (39.6% manifest re-reads, ~600 s of 1830 s) and the fold-seal suspicion is REFUTED by the counter
+that already measured it; unnecessary work reduces to the HEAD pair, 44% of trips, under standing veto.
+`pending_deletes` is the same shape, ~150k serial conditional deletes, and bulk delete is ruled out because
+`deleteExact` is token-conditional and safety-critical.
+
+**Part A delivered — S42 answered the question asked, if not the card's own gate.** 2,184 injected faults
+landed, `CasRefApplyPoisoned` 0, both wedged lanes resolved, 11,960 acked blocks intact. The two failing
+verdicts are environmental: 23,561 `UNCERTAIN (retry budget exhausted)` PUTs and two GC rounds killed by
+S3 timeouts on 268-byte and 4.6 KB objects. Recorded INCONCLUSIVE as a certification, not as a defect.
+
+**Part C delivered** — `docs/superpowers/cas/draft-fixes-20260726.md`, five proposals each with a
+refutation condition, and a suggested order that leads with the cheap counter making P2's go/no-go
+decidable from data.
+
+48 local commits, unpushed.
