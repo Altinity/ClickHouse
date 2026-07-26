@@ -891,3 +891,17 @@ fixed.
   confidence. The name alone proves nothing; probe B2 exists precisely for the non-LIST half. But if the
   tests inside only exercise a holey listing, the deliverable is narrower than the decision and must be
   said so plainly rather than accepted because the gate is green.
+- 00:09 UTC — watchdog: the detector landed (`e01b5cd82be`, gate 1382/1382) and my naming worry from the
+  previous tick was UNFOUNDED, checked not assumed: `gtest_cas_holey_list_detector.cpp` is Task 1's mirror
+  test, where a holey listing is merely the injection method, and probe B2's non-LIST coverage lives in its
+  own `gtest_cas_txn_apply_ledger.cpp` with tests that drive the real reducer.
+  The headline is that the data-loss class is now EXECUTABLE and reproduced against shipped code —
+  "GC deleted a blob that manifest 1:2:1 still references" — with probe A making it pass for the right
+  reason, since the test also asserts the detector fired.
+  Dispatched **tasks 5-8** (per-phase GC log rows), the last unblocked follow-up. It is the reader for the
+  four values the detector deliberately left written-but-unread, so they were designed together and must be
+  wired, not duplicated. Told it two things the design already knows and that are easy to lose: the
+  correlator must not be `round` (which is 0 on Start and nonexistent on a non-leader round — exactly the
+  rounds worth correlating), and phase 11's ProfileEvents delta is empty BY CONSTRUCTION because its work
+  runs on other threads, so it must carry explicit job counts rather than look like it has coverage.
+  Disk 332G, load 0.7. Nothing stuck.
