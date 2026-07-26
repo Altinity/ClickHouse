@@ -54,3 +54,18 @@ Gate at the stop: 1382/1382 unit, 11/11 integration.
   fixed — each read is separately attributable now, so the study decides on data.
   AWAITING the user on: the want/don't-want statement and the codex plan review (their steps 2-3), and the
   force-claim reading (BACKLOG {#operator-uuid-recovery}).
+- 01:26-01:35 UTC — user said "начинай, работай unattended, не останавливайся" — the consolidation block is
+  lifted. Landed since: `INTENT.md` (`3caa6873c0d`, the criterion a plan is checked against), the soak's
+  signal wiring (`9db1b50025d`), and a product finding that `ca-fsck` never prints `corrupted_runs`
+  (`89777554608`).
+  Re-scoped the codex review after the user corrected me: I had asked it whether the confirm protocol
+  itself should be reverted, which is NOT what was asked. Killed and re-dispatched narrowed to the
+  INSTRUMENTATION and self-initiated improvements only, with Part A, Part B and the review fixes declared
+  out of scope — real features and fixes stay. Running, 1071 s at last check.
+  **20-minute shakeout STARTED** (`tmp/unattended/soak_partb_20m_1.log`, db `soak_partb_20m_1.db`).
+  Rebuilt the server binary first and VERIFIED it carries the new introspection by name — `fold_ref_intake`,
+  `meta_pool_wait`, `CasGcRefScanDisagreements`, `CasRefAppendPreAttemptRefused`, `stale_edge` all present
+  in the binary. Running the soak against a stale binary would have produced a green run that exercised
+  none of it, which is the exact blindness this round keeps finding.
+  First ticks show `signals=2/2 nodes` — the counters are being READ, not merely defined. That line is the
+  thing to keep watching.
