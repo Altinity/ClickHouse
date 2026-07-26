@@ -2072,3 +2072,52 @@ nothing. Both outcomes matter, and they are distinguished by one question about 
 **Next step, precisely:** determine whether a single leader's batch flush can have two ref-log PUTs in
 flight simultaneously for the same namespace. If it cannot, in-order visibility holds, the third hypothesis
 dies, and the 58 holes ARE the blocker observed in the wild.
+
+### #12 ANSWERED: all four alternatives are excluded — the store returned an incomplete prefix {#probe-a-answered}
+
+Continuing {#probe-a-direction-evidence}. The 58 "missing from the pre-fold scan" holes survive every
+alternative explanation, each excluded on evidence rather than plausibility:
+
+1. **Concurrent deletion** — excluded by direction. Walk 2 SAW the object; deletion cannot make something
+   reappear.
+2. **A stale-epoch writer minting an id below `pre_max`** — excluded by the ids. All 58 carry epoch `0x4`
+   with near-consecutive sequences, not an older epoch.
+3. **Two appends in flight at once, completing out of order** — excluded by the append path.
+   `leader_active` is per-`RefTable`, guarded by `ref_queue_mutex`, so one leader per namespace; the leader
+   PUTs via `putIfAbsentControlled`, which is synchronous and awaited; a carved chunk seals to exactly ONE
+   ref-log object. The PUT for W therefore completes before the PUT for X is issued. This is the
+   hypothesis the probe's own "an append cannot explain this" implicitly assumes away — it is true, but it
+   needed checking rather than asserting.
+4. **An `Unresolved` PUT landing late, after resolution declared the id a free gap** — excluded by design,
+   and the design says so explicitly: "`resolveByExactGet` never reports a plain absent verdict: an absent
+   or unreadable key returns `Unresolved`, since another attempt may still be legal." An absent key does
+   NOT free the id; the lane stays wedged, so no later append can get ahead of a still-flying one.
+   (`CasConditionalWriteUnresolved` fires 416 times on ch1 in a few hours, so this path is well travelled
+   — worth excluding rather than waving away.)
+
+**What remains is the probe's first-named explanation: the object store gave two different answers about
+the same durable prefix.** That is {#list-as-journal-dataloss-2026-07-25} — until now mechanised in TLA+
+and argued from first principles — **observed in a running system.**
+
+### Two things this does NOT establish {#probe-a-answered-limits}
+
+**It is RustFS, not AWS S3.** Everything here is against the test object store the soak and CI run on. It
+does not show that S3 behaves this way. That changes how alarming the observation is; it changes nothing
+about the design conclusion, because the GC must not depend on LIST completeness in the first place — which
+is precisely what the blocker says. A store that can do this exists and we run on it daily.
+
+**Exclusion 3 rests on reading the code, not on an experiment.** The reasoning is short and the invariants
+are documented in the source, but a reader who disagrees should attack that link first.
+
+### The reassuring half {#probe-a-detector-worked}
+
+Every one of the 7 firings ABORTED ref folding: no cursor advanced, no destructive action ran. The detector
+built earlier this round did exactly the job it was built for, on its first live outing, against the defect
+it was aimed at. The blocker's blast radius — a cursor advancing over records a round merely OBSERVED —
+did not occur because the probe stopped it.
+
+### Confirmation step worth doing cheaply {#probe-a-store-experiment}
+
+A standalone hammer against RustFS — write a known key set, LIST the prefix repeatedly under concurrent
+writes, diff each answer against the known set — would confirm the store-side behaviour directly, without a
+soak. That belongs with the rig (#10) and is much cheaper than one.
