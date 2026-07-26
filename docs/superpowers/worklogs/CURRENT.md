@@ -984,3 +984,40 @@ refutation condition, and a suggested order that leads with the cheap counter ma
 decidable from data.
 
 48 local commits, unpushed.
+
+## 2026-07-26 21:56 UTC — watchdog: S42 REPRODUCED a retention defect; handed to systematic debugging
+
+**The repeat run on the quiet host did NOT come back clean.** `S42 FAIL (26/28)`, and this time both failures
+are the product, not the environment:
+
+```
+fsck pre-restart : stale_edge == 0   ->  observed 12
+fsck post-restart: stale_edge == 0   ->  observed 67
+other_failures                        =  0     (the environment behaved)
+QueryMemoryLimitExceeded              =  1965  (faults DID fire; not vacuous)
+CasRefApplyPoisoned                   =  0
+CasRefAppendWedged                    =  0
+CasGcUnmatchedRemoveDeltas            =  0
+acked blocks                          =  12998
+```
+
+Per the standing instruction I did NOT improvise — invoked systematic debugging and stayed in Phase 1.
+
+**Phase 1 so far, and two of my own instruments were wrong before the data was:**
+
+- **Not deterministic.** Seed 42: 0 and 0. Seed 43: 12 and 67. One run in two.
+- **An inversion worth explaining:** the run with 23,561 environmental failures was CLEAN; the quiet run
+  reproduced. Chaos may simply have stopped the workload reaching the window.
+- **The count is NOT monotone: 12 -> 67 -> 12.** Fifty-five drained after the run. So some of what the
+  oracle counts as stale-edge is TRANSIENT — the manifest is already gone but the matching `-1` is still in
+  an unfolded ref log and will cancel later. That is a question about the ORACLE, not only the defect.
+- **My round counter was broken.** I sampled `event_type='Round'`, which does not exist — the values are
+  `Start`/`Finish`/`Phase`. So the first four flat readings of 12 are NOT "flat across N rounds"; they are
+  flat across an unknown number. Restarted the series against `Finish` (107 rounds so far) and added a
+  keyset fingerprint so I can tell whether the SAME twelve blobs persist or the set churns.
+- **The stand is quiescent for workload** — `ca_soak` has 0 active parts, 0 merges — so the only actor is
+  GC draining the pool after the drop. The jump to 15/23 at 21:56 is GC's own pipeline, not new load.
+
+Live reproduction preserved; evidence copied to `reports/2026-07-26-s42-stale-edge-repro/`. Resources fine
+(310G, load 0.49). No conclusion yet, deliberately: the discriminator between transient and permanent needs
+GC rounds to pass, and that is what the corrected series is collecting.
