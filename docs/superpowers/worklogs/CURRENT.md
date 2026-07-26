@@ -664,3 +664,27 @@ stopped it, on its first live outing, against exactly the defect it was aimed at
 Next cheap step named in BACKLOG {#probe-a-store-experiment}: hammer RustFS directly — known key set,
 repeated LIST under concurrent writes, diff each answer — to confirm the store-side behaviour without a
 soak.
+
+## 2026-07-26 13:56 UTC — watchdog: idle; #18 built and running
+
+Watchdog: idle, 313G, load 0.35, containers healthy, no long run at check time so the signal-observation
+duty was not applicable. Two local commits held back per the user's push instruction.
+
+Built the direct store hammer (#18), `tmp/listprobe/hammer.py`. It corroborates {#probe-a-answered} without
+depending on its weakest link: that conclusion was reached by ELIMINATION, and one elimination (two appends
+in flight) rests on reading the append path rather than on an experiment. Hitting the store directly needs
+neither.
+
+The rule is deliberately IDENTICAL to probe A's, so a hit is the same shape of evidence: a key counts only
+if its PUT returned before the listing began AND it sits below the maximum key that same listing returned.
+The witness clause is what stops a merely-not-yet-visible concurrent write from counting.
+
+Writes go to `test/listprobe/<run>/` — a different top-level prefix from `soak_pool/`, so the CAS pool is
+never touched, and the probe deletes its own keys afterwards.
+
+Smoke run (300 keys, 5 rounds): clean, no holes — but single-PAGE listings, which is the uninteresting
+regime. Probe A's holes came from enumerations of 76k-343k keys, i.e. 77-343 pages, so pagination under a
+mutating key space is the suspect. Now running 100k keys (100 pages), 40 rounds, 6 writers, 3 listers.
+
+Stated in the tool itself so a clean result cannot be over-read: absence of holes over a short hammer is
+WEAK evidence — probe A found 58 in ~1.4M keys listed across four hours.
