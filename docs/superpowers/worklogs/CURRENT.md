@@ -909,3 +909,25 @@ timing is bounded and the conclusion holds, but the store-side mechanism — dro
 boundary, something else — is still unknown. And it is RustFS, not S3.
 
 31 local commits, unpushed.
+
+## 2026-07-26 18:26 UTC — watchdog: idle, tree clean, nothing scheduled
+
+Nothing running. 323G disk, load 0.78, containers healthy, zero uncommitted changes in code or docs. No
+long run, so the signal-observation duty does not apply.
+
+Since the last cycle, the user's second question — look at the OTHER node's blob storage log — closed the
+remaining branch. ch2 has never deleted a ref object, and during the firing minute neither node deleted
+any: 0 and 0. ch2's 45 touches in ch1's namespace are all `cas/manifests`, ordinary pool-wide GC by the
+lease holder. So probe A's own alternative explanation, a concurrent deleter, is measurably dead for this
+occurrence. Folded into the captured report.
+
+**Every branch the probe named is now excluded by measurement rather than argument:** not phantoms (HEAD
+says present), not deletion (nobody deleted), not append ordering (65,263 uploads, zero inversions by
+epoch), not "not yet landed" (written 19 s before, witness 2.2 ms after). What remains is the store's
+answer, and the mechanism inside it is still invisible because `blob_storage_log` does not log LIST calls.
+
+Not scheduling further work from a watchdog turn. The open items — probe A's blind spots, the
+`-1`-before-`+1` path, reconciling the 56, the fsck entry gate, the bottleneck rig, the review
+recommendations, Part B test debt, S42 — are all substantial enough to deserve a deliberate start.
+
+34 local commits, unpushed per instruction.
