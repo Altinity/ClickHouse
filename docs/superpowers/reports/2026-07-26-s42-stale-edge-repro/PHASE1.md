@@ -146,3 +146,74 @@ this run.
 
 **Do not skip to a fix.** The reducer is correct (a set cannot cancel what it never received); the defect
 is upstream of it, and which upstream path is still unproven.
+
+---
+
+# Phase 2 — the standing hypothesis is CONFIRMED for the epoch-1 cohort {#phase2}
+
+## The correlation {#phase2-correlation}
+
+Testing §7 directly: do the orphan-sweep deletions name the manifests carrying unmatched `+1` edges?
+
+```
+distinct manifests with an unmatched add : 8
+distinct manifests swept by the orphan sweep : 71
+unmatched-add manifests that WERE swept : 6
+```
+
+Per manifest:
+
+| manifest instance | fate |
+|---|---|
+| `1:9825` | **SWEPT** |
+| `1:34437` | **SWEPT** |
+| `1:34438` | **SWEPT** |
+| `1:34443` | **SWEPT** |
+| `1:34447` | **SWEPT** |
+| `1:34449` | **SWEPT** |
+| `4:66` | not swept — and never deleted at all |
+| `4:71` | not swept — and never deleted at all |
+
+**Every epoch-1 manifest carrying an unmatched `+1` was deleted by the orphan-manifest sweep.** Six for six.
+
+## The mechanism, stated {#phase2-mechanism}
+
+1. A precommit's `+1` edges are folded into the blob in-degree.
+2. An allocation fault aborts the build. The abort "appends a precommit-removal event for the live
+   precommit (body left for GC)" — 130 aborts in this run against only 18 `precommit_removed`.
+3. The manifest becomes **eligible + unowned**.
+4. The orphan-manifest sweep deletes the manifest body with an exact-token delete. **It does not require
+   that the manifest's edges were decremented first** — the sweep's premise is that an unowned manifest has
+   no folded edges, and that premise is false once the precommit's `+1` has already folded.
+5. The `+1` edges are stranded: no `-1` will ever be emitted, and the manifest they name is gone.
+6. Blob in-degree is pinned above zero forever. **Permanently unreclaimable** — only `ca-gc-rebuild` clears it.
+
+This is a **race between fold and abort**, which explains why it reproduces in one run out of two.
+
+## The boundary — what is NOT established {#phase2-boundary}
+
+Two of the eight (`4:66`, `4:71`) do NOT fit: their manifests still EXIST in the pool, yet the blobs
+carrying those attributions ARE in the stale-edge list. That is a contradiction with the class definition
+("all source edges name manifests that no longer exist").
+
+**The likeliest explanation is my own measurement, not a second defect.** `adds > removes` is not a valid
+residual test — in-degree is a SET with last-wins ordering, which I flagged when I first used it. The
+authoritative residuals are the 15 rows in the in-degree run, whose `source_id`s are one-way hashes and
+therefore cannot be mapped back to a manifest instance without additional instrumentation.
+
+So: the epoch-1 cohort is proven; the epoch-4 attributions are unreliable and should be re-derived, not
+believed. **Do not present this as 8/8.**
+
+## What a fix must do — direction only, NOT implemented {#phase2-fix-direction}
+
+The sweep's premise needs to become true, or the sweep needs to stop relying on it. Two shapes, both
+needing design:
+
+- **Decrement before delete.** The sweep emits the `-1` edges for the manifest it is about to delete, so
+  the in-degree is settled first. Cost: the sweep must read the manifest body to know its blob list —
+  exactly the request-cost problem measured tonight.
+- **Do not sweep a manifest whose edges may be folded.** Requires knowing whether a precommit's `+1` was
+  folded, which is a durable-state question, not an in-memory one.
+
+**Do not implement either tonight.** The reducer is correct and must not be touched; the defect is in the
+sweep's premise, and choosing between these needs the cost model from `draft-fixes-20260726.md`.
