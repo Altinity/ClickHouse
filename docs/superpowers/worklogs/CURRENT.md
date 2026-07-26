@@ -274,3 +274,9 @@ GC cleanup or account for it.
   there. I am recording the rate and the schedule, not a forecast — last time I turned this into arithmetic
   and the arithmetic was the wrong tool. If the checkpoint does not reclaim, the 60G line is the trigger,
   and ~100GB of docker artifacts remain reclaimable without touching the run.
+- 07:26 UTC — watchdog: 4 h soak at t+1h29m (2h30m left), **0 failures**, `signals=2/2 nodes` on all 66
+  ticks. It is INSIDE the `gc_checkpoint` stage right now (entered t+5040s), which is why no checkpoint has
+  completed yet — that stage is where both the reclaim and the first `stale_edge` evaluation happen, so the
+  next tick is the informative one. Log 64 s old, which is normal across checkpoint work.
+  Disk 209G → **176G**, i.e. ~66 GB/h over this interval against ~126 GB/h over the previous one — the
+  slowdown lines up with inserts being off for this stage. Still 116G above the line.
