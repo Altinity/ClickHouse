@@ -33,7 +33,15 @@ binding, and only then does the receiver promote. No GC-side changes anywhere.
   anomaly/suppression semantics. Part A changes HOW a committed transaction is installed, never
   WHAT is committed.
 - **gtest gate** after every task that touches C++:
-  `build/src/unit_tests_dbms --gtest_filter='Cas*:CA*:ContentAddressedLog*:CountingBackendShape*:RefSnapshotCodec*:RefTableCacheEviction*:RefWriter*'`
+  ~~`build/src/unit_tests_dbms --gtest_filter='Cas*:CA*:ContentAddressedLog*:CountingBackendShape*:RefSnapshotCodec*:RefTableCacheEviction*:RefWriter*'`~~
+  **CORRECTED 2026-07-25** — that filter has a third known gap (parameterized `*/CasBackendContract`
+  suites match neither `Cas*` nor `CA*`; see BACKLOG {#gate-filter-gap-3-backend-contract}). The
+  operative filter, and the one the sibling follow-ups plan uses, is:
+
+  ```
+  build/src/unit_tests_dbms --gtest_filter='Ca*:CA*:ContentAddressed*:CountingBackendShape*:RefSnapshotCodec*:RefTableCacheEviction*:RefWriter*:*CasBackendContract*'
+  ```
+
   — must stay at zero failures. Build first:
   `ninja -C build unit_tests_dbms > build/build_<task>.log 2>&1; echo NINJA_EXIT=$?` (never pass
   `-j`, never use `nproc`), and have a subagent summarize the log.
@@ -70,6 +78,9 @@ binding, and only then does the receiver promote. No GC-side changes anywhere.
 
 ## Task 1: Pin the source-edge set property (`[UNMATCHED-MINUS-ONE]`)
 
+**STATUS: DONE** — `d37609c0740`. The test passed on the first run, as Step 3 required, so the design
+history's premise holds.
+
 Independent, zero risk. The whole design history leans on "in-degree is a SET, last-wins per key",
 so an unmatched removal delta must be provably a per-key no-op. If someone ever changes the model to
 a counter, this test must go red.
@@ -87,14 +98,14 @@ a counter, this test must go red.
   `foldDeltasIntoGeneration(...)`, `zeroInDegree(backend, runs)`.
 - Produces: nothing consumed by later tasks.
 
-- [ ] **Step 1: Read the two existing tests this one is modelled on**
+- [x] **Step 1: Read the two existing tests this one is modelled on**
 
 `TEST(CasBlobInDegree, PlusMinusCancelToZeroDetectsCandidate)` (`gtest_cas_blob_indegree.cpp:56-74`)
 already folds an unmatched removal; `TEST(CasThreeCursorMerge, SnapshotEdgesUnperturbedByRetired)`
 (`:452-484`) shows the explicit "surviving edge rows are byte-identical" assertion via `decodeRun`.
 The new test combines the two: an unmatched removal for blob H must not disturb H's OTHER edge.
 
-- [ ] **Step 2: Write the test**
+- [x] **Step 2: Write the test**
 
 Append to `src/Disks/tests/gtest_cas_blob_indegree.cpp`, following the fold-call shape of the
 `PlusMinusCancelToZeroDetectsCandidate` test verbatim (same `InMemoryBackend`/`Layout` setup, same
@@ -138,13 +149,13 @@ TEST(CasBlobInDegree, UnmatchedRemovalIsAPerKeyNoOpAndSparesSiblingEdges)
 Adjust `decodeRun`'s field access and the `foldDeltasIntoGeneration` defaulted trailing arguments to
 match the file's current signature (read `CasBlobInDegree.h:244-254` before writing).
 
-- [ ] **Step 3: Run it — it must PASS immediately**
+- [x] **Step 3: Run it — it must PASS immediately**
 
 Run: `build/src/unit_tests_dbms --gtest_filter='CasBlobInDegree.UnmatchedRemovalIsAPerKeyNoOpAndSparesSiblingEdges'`
 Expected: PASS. This is a characterization test of existing correct behavior, not red-then-green.
 If it FAILS, STOP the whole plan and report — the design history's premise would be wrong.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git commit -F <msgfile> -- src/Disks/tests/gtest_cas_blob_indegree.cpp
@@ -155,20 +166,23 @@ Message subject: `ca: pin the source-edge set model — an unmatched removal is 
 
 ## Task 2: Benchmark baseline for the install restructure (measurement gate, part 1)
 
+**STATUS: DONE** — baseline captured; the comparison and its verdict are recorded in the worklog with
+`069f966c24f` ("Part A benchmark gate passed, no regression in the production fold path").
+
 The current COW shape was justified by numbers; capture them BEFORE touching the lane.
 
 **Files:**
 - Run only: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/benchmarks/benchmark_cas_ref_protocol.cpp`
   (exists; `ENABLE_BENCHMARKS=ON` in `build`, OFF in `build_asan` — so use `build`)
 
-- [ ] **Step 1: Build the benchmark**
+- [x] **Step 1: Build the benchmark**
 
 ```bash
 ninja -C build benchmark_cas_ref_protocol > build/build_bench_baseline.log 2>&1; echo NINJA_EXIT=$?
 ```
 Binary: `build/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/benchmarks/benchmark_cas_ref_protocol`
 
-- [ ] **Step 2: Record the baseline**
+- [x] **Step 2: Record the baseline**
 
 ```bash
 build/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/benchmarks/benchmark_cas_ref_protocol \
@@ -186,13 +200,13 @@ shapes):
 - `BM_ScratchCopy` is the isolation floor for the one extra COW copy the restructure adds.
 - `BM_ApplyRefLogTxn` covers the apply itself, which merely MOVES to before the PUT.
 
-- [ ] **Step 3: Record a memory baseline**
+- [x] **Step 3: Record a memory baseline**
 
 Note the RSS of the benchmark process at the largest N (`/usr/bin/time -v` on the run above), so
 Task 6 can compare. The restructure holds one extra COW copy (base shared, overlay only) across the
 PUT — the expectation is "no material change".
 
-- [ ] **Step 4: Record the numbers in the worklog and commit it**
+- [x] **Step 4: Record the numbers in the worklog and commit it**
 
 `tmp/` is scratch; paste the medians into
 `docs/superpowers/worklogs/2026-07-24-unattended-publish-confirm.md` and
@@ -201,6 +215,10 @@ PUT — the expectation is "no material change".
 ---
 
 ## Task 3: A1 site 1 — no-throw install in `commitRefChunk`
+
+**STATUS: DONE** — `346046dae71`. Its gate run produced two findings that landed separately:
+`028c3c865e7` (a load-sensitive hang in `RefWriterLaneExceptionSafety`, plus sizing the `phase_hits`
+array off the enum) and `1498cf78304` (the two findings recorded in the worklog and BACKLOG).
 
 The core fix. Today: PUT (`CasRefLedger.cpp:1676`) → `applyRefLogTxn(rt->state, chunk_txn)`
 (`:1694`) which can throw on allocation, leaving the transaction durable but unrecorded. After:
@@ -221,7 +239,7 @@ the candidate is built BEFORE the PUT and installed by a noexcept swap.
   after `putIfAbsentControlled` returns `Committed` and BEFORE the install; tests inject a throw
   there to simulate the post-durable failure.
 
-- [ ] **Step 1: Add the noexcept swap to `RefTableState`**
+- [x] **Step 1: Add the noexcept swap to `RefTableState`**
 
 In `CasRefProtocol.h`, in the public section of `class RefTableState` (after the getters around
 line 167):
@@ -260,7 +278,7 @@ member list against the header before writing this** — `RefTableState`'s priva
 `CasRefProtocol.h:176-195`; if a member was added since, swap it too (a missed member is a silent
 state-corruption bug).
 
-- [ ] **Step 2: Add the test hook phase**
+- [x] **Step 2: Add the test hook phase**
 
 `CasRefLedger.h:207` — extend the enum:
 
@@ -272,7 +290,7 @@ Document it next to `ChunkReseed`'s comment (around `:202-206`): `PostDurableIns
 `commitRefChunk` after the chunk's `PUT` returned `Committed` and BEFORE the candidate is installed
 — the seam a test uses to prove that a throw there can no longer strand a durable transaction.
 
-- [ ] **Step 3: Write the failing tests**
+- [x] **Step 3: Write the failing tests**
 
 In `src/Disks/tests/gtest_cas_ref_install_safety.cpp` (reuse `openPool`, `publishEmptyPart` and the
 `Caller` pattern from `src/Disks/tests/gtest_cas_ref_chunked_flush.cpp:69-95`):
@@ -333,12 +351,12 @@ the existing `setCarveHookForTest` / `tailSinceSnapshotCountForTest` / `refLaneW
 the `Pool` forwarder next to those. Do NOT introduce a second accessor style
 (no `refLedgerForTest()`).
 
-- [ ] **Step 4: Run the tests to verify they fail**
+- [x] **Step 4: Run the tests to verify they fail**
 
 Run: `build/src/unit_tests_dbms --gtest_filter='CasRefInstallSafety*'`
 Expected: compile error (the new hook phase / accessors do not exist yet) — that is the red state.
 
-- [ ] **Step 5: Implement the restructure in `commitRefChunk`**
+- [x] **Step 5: Implement the restructure in `commitRefChunk`**
 
 In `CasRefLedger.cpp`, inside `commitRefChunk` (currently lines 1592-1802):
 
@@ -431,18 +449,18 @@ next to `setCarveHookForTest` (`:208`), and add `#include <Common/MemoryTracker.
    `setCarveHookForTest` forwarder. The other assertions reuse seams that already exist
    (`tailSinceSnapshotCountForTest`, `resolveRef`).
 
-- [ ] **Step 6: Run the tests to verify they pass**
+- [x] **Step 6: Run the tests to verify they pass**
 
 Run: `ninja -C build unit_tests_dbms > build/build_task3.log 2>&1; echo NINJA_EXIT=$?`
 then `build/src/unit_tests_dbms --gtest_filter='CasRefInstallSafety*'`
 Expected: PASS (the death test runs only in debug builds; under RelWithDebInfo it SKIPs).
 
-- [ ] **Step 7: Run the full CAS gate**
+- [x] **Step 7: Run the full CAS gate**
 
 Run: `build/src/unit_tests_dbms --gtest_filter='Cas*:CA*:ContentAddressedLog*:CountingBackendShape*:RefSnapshotCodec*:RefTableCacheEviction*:RefWriter*' > build/gate_task3.log 2>&1; echo EXIT=$?`
 Expected: zero failures. Have a subagent summarize the log.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git commit -F <msgfile> -- \
@@ -458,6 +476,10 @@ Subject: `ca: ref lane — no-throw post-durable install in commitRefChunk (A1 s
 
 ## Task 4: A1 site 3 — preconstruct the wedge before the PUT
 
+**STATUS: DONE** — landed together with Task 5 in ONE commit, `10958ec8a28` ("no-throw install at the
+two wedge sites (A1 sites 2 and 3)"), not as the two separate commits this plan prescribes. The two
+sites share the same install shape, so splitting the commit would have split one argument in half.
+
 Today `rt->wedge = RefAppendWedge{id, key, bytes}` (`CasRefLedger.cpp:1788`) copies two `String`s
 (`CasRefLedger.h:308-310`) inside the post-durable path. If that allocation fails, the object may be
 durable while the runtime records NEITHER the transaction NOR the wedge — worse than a wedge,
@@ -467,7 +489,7 @@ because the next append allocates a fresh id and proceeds against a state missin
 - Modify: `.../Pool/CasRefLedger.cpp` (`commitRefChunk`)
 - Test: `src/Disks/tests/gtest_cas_ref_install_safety.cpp`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```cpp
 /// An `Unresolved` PUT must always leave the lane wedged with the EXACT {id, key, bytes} of the
@@ -494,13 +516,13 @@ promoting it into `src/Disks/tests/cas_test_helpers.h` (where `CountingBackend` 
 `MetaWriteFaultBackend` already live) over duplicating it; if promoting, move it verbatim and
 update the chunked-flush file's use — no behavior change, and run that file's suite to prove it.
 
-- [ ] **Step 2: Run to verify it fails or is vacuous**
+- [x] **Step 2: Run to verify it fails or is vacuous**
 
 Run: `build/src/unit_tests_dbms --gtest_filter='CasRefInstallSafety.UnresolvedAlwaysRecordsTheWedge'`
 Expected: compile error (missing accessor) or PASS-by-accident. Note which — if it passes, it is a
 characterization test that must keep passing after Step 3.
 
-- [ ] **Step 3: Implement preconstruction**
+- [x] **Step 3: Implement preconstruction**
 
 In `commitRefChunk`, before the PUT call (`:1673-1676`):
 
@@ -534,17 +556,19 @@ and in the `Unresolved` arm (`:1784-1789`):
 allocation. Keep `bytes` alive for the `sealObject`/PUT usage by reading it from `prepared_wedge`
 everywhere below (replace the remaining `bytes.size()` uses with `prepared_wedge.bytes.size()`).
 
-- [ ] **Step 4: Run the test + full gate**
+- [x] **Step 4: Run the test + full gate**
 
 Run the single test, then the full CAS filter as in Task 3 Step 7. Expected: all pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 Subject: `ca: ref lane — preconstruct the wedge before the PUT (A1 site 3)`
 
 ---
 
 ## Task 5: A1 site 2 — wedge-resolution apply + swallow symmetry
+
+**STATUS: DONE** — in `10958ec8a28`, jointly with Task 4 (see Task 4's status note).
 
 The wedge-resolution arm (`CasRefLedger.cpp:1205+`) applies post-durably too, and unlike
 `commitRefChunk` it has no inner swallow around `materializeCommitted` — a throw there leaves the
@@ -555,7 +579,7 @@ the tail counters.
 - Modify: `.../Pool/CasRefLedger.cpp` (the wedge-resolution block inside `flushRefBatch`)
 - Test: `src/Disks/tests/gtest_cas_ref_install_safety.cpp`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```cpp
 /// Resolving a wedge is a post-durable install too: the GET proves the object landed, so the
@@ -574,11 +598,11 @@ TEST(CasRefInstallSafety, WedgeResolutionInstallsExactlyOnce)
 Fill in with the `ChunkFaultBackend` "landed but lost response" mode (add such a mode if only
 `Unresolved` exists: put the object, then report Unresolved).
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Expected: the double-count / wedge-not-cleared assertion fails, or the test compiles red.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 In the wedge-resolution block: decode the wedged transaction and build the candidate BEFORE calling
 `resolveByExactGet` (the bytes are already in the wedge, so no extra I/O), then on `Committed`
@@ -588,7 +612,7 @@ region, and move `materializeCommitted()` outside it into a try/catch that swall
 resolution attempt (the wedge can live until remount; a retained full state copy would be a
 long-lived memory cost for a rare path).
 
-- [ ] **Step 4: Run test + full gate; Step 5: Commit**
+- [x] **Step 4: Run test + full gate; Step 5: Commit**
 
 Subject: `ca: ref lane — no-throw install + swallow symmetry in wedge resolution (A1 site 2)`
 
@@ -596,7 +620,10 @@ Subject: `ca: ref lane — no-throw install + swallow symmetry in wedge resoluti
 
 ## Task 6: Measurement gate (part 2) — prove no regression
 
-- [ ] **Step 1: Rebuild and re-run**
+**STATUS: DONE** — passed, no regression in the production fold path (`BM_FlushInstallUniqueOwner`);
+recorded in the worklog with `069f966c24f`. Step 3's stop-condition was never reached.
+
+- [x] **Step 1: Rebuild and re-run**
 
 ```bash
 ninja -C build benchmark_cas_ref_protocol > build/build_bench_after.log 2>&1; echo NINJA_EXIT=$?
@@ -605,18 +632,23 @@ build/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/benchmarks/b
   > tmp/unattended/bench_after.txt 2>&1; echo EXIT=$?
 ```
 
-- [ ] **Step 2: Compare.** Acceptance: **`BM_FlushInstallUniqueOwner` median within 5% of
+- [x] **Step 2: Compare.** Acceptance: **`BM_FlushInstallUniqueOwner` median within 5% of
   baseline** (the production shape — the primary gate), `BM_ScratchCopy` unchanged, and no other
   benchmark worse than 10%. RSS not materially higher.
-- [ ] **Step 3: If `BM_FlushInstallUniqueOwner` regresses**, STOP and report with the numbers. The
+- [x] **Step 3: If `BM_FlushInstallUniqueOwner` regresses**, STOP and report with the numbers. The
   overwhelmingly likely cause is that the candidate is still sharing its base at fold time (i.e.
   something kept the old state alive past the swap, or the candidate got materialized before the
   PUT after all) — re-read Task 3's comment block rather than tuning around it.
-- [ ] **Step 4: Record the comparison in the worklog and commit the worklog.**
+- [x] **Step 4: Record the comparison in the worklog and commit the worklog.**
 
 ---
 
 ## Task 7: A2 — apply-pending poison state machine
+
+**STATUS: DONE** — `1b5df9dc1a4`. Note for later readers: Task 18 (`252ccbdf2d4`) added a transition
+this task does not list — a `NoAttemptSent` pre-attempt refusal must ALSO clear the apply-pending
+marker, because nothing was sent and leaving it set makes `confirmExactRef`'s rule 4 answer `Unknown`
+forever.
 
 Defense in depth after Task 3, and the confirm's rule 4.
 
@@ -629,19 +661,19 @@ Defense in depth after Task 3, and the confirm's rule 4.
   `RefApplyState applyStateForTest(const RootNamespace &) const;` plus an internal
   `std::atomic<RefApplyState> apply_state{RefApplyState::Clean};` on `RefTableRuntime`.
 
-- [ ] **Step 1: Write the failing tests** covering every transition:
+- [x] **Step 1: Write the failing tests** covering every transition:
   `Clean → ApplyPending → Clean` on a successful commit; `→ Clean` on a conclusive PUT throw
   (`CasRefLedger.cpp:1678-1686`), on `DefiniteFailure` (`:1775-1783`), and on a wedge that resolves
   to absent; `→ Poisoned` when the install probe throws post-durability (only reachable via the
   test seam after Task 3); and `Poisoned` is NEVER cleared by a later successful flush.
-- [ ] **Step 2: Run — red.**
-- [ ] **Step 3: Implement.** Arm (`Clean → ApplyPending`) immediately before the PUT — a plain
+- [x] **Step 2: Run — red.**
+- [x] **Step 3: Implement.** Arm (`Clean → ApplyPending`) immediately before the PUT — a plain
   `store(std::memory_order_relaxed)`, allocation-free. Clear on the paths above. Set `Poisoned` in
   the (now unreachable in production) failure path. Export a ProfileEvent
   `CasRefApplyPoisoned` on the transition to `Poisoned`.
-- [ ] **Step 4: Wire rule 4** — nothing to wire yet (the confirm arrives in Task 11); just expose
+- [x] **Step 4: Wire rule 4** — nothing to wire yet (the confirm arrives in Task 11); just expose
   the accessor.
-- [ ] **Step 5: Run tests + full gate; Step 6: Commit.**
+- [x] **Step 5: Run tests + full gate; Step 6: Commit.**
 
 Subject: `ca: ref lane — apply-pending poison state machine (A2)`
 
@@ -649,13 +681,16 @@ Subject: `ca: ref lane — apply-pending poison state machine (A2)`
 
 ## Task 8: A3 — `precommitAdd` mint-tightening
 
+**STATUS: DONE** — `8874e7dbf1d` (subject as landed: "precommitAdd accepts only ids this transaction
+staged (A3, the confirm's ABA barrier)").
+
 **Files:**
 - Modify: `.../Pool/CasPartWriteTxn.cpp` (`precommitAdd`, line 920) and `.h` if a member set of
   staged ids is needed
 - Modify: `src/Disks/tests/gtest_cas_promote_republish.cpp` (the legality pin at line 283 is
   replaced)
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```cpp
 /// An unowned ManifestId may enter ownership ONLY from the transaction that freshly staged it.
@@ -671,14 +706,14 @@ TEST(CasPromoteRepublish, PrecommitAddRejectsAnIdThisTxnDidNotStage)
 and update the existing test at `gtest_cas_promote_republish.cpp:283` that currently pins the
 opposite behavior — read it first and rewrite its expectation with a comment explaining the change.
 
-- [ ] **Step 2: Run — red.**
-- [ ] **Step 3: Implement.** In `PartWriteTxn`, record every `ManifestId` returned by
+- [x] **Step 2: Run — red.**
+- [x] **Step 3: Implement.** In `PartWriteTxn`, record every `ManifestId` returned by
   `stageManifest` in a member set; in `precommitAdd`, after the existing namespace check
   (`:926-929`), require membership unless the id is already the committed binding for that ref (the
   idempotent re-drive short-circuit at `:952-954` must keep working — it is evaluated inside the
   closure against live state, so the membership check must not reject that path; verify by running
   the existing re-drive tests).
-- [ ] **Step 4: Run tests + full gate; Step 5: Commit.**
+- [x] **Step 4: Run tests + full gate; Step 5: Commit.**
 
 Subject: `ca: precommitAdd accepts only ids this transaction staged (A3, ABA barrier)`
 
@@ -686,18 +721,40 @@ Subject: `ca: precommitAdd accepts only ids this transaction staged (A3, ABA bar
 
 ## Task 9: TLA+ model for the confirm protocol
 
+**STATUS: DONE** — `0d1e3f4cc7c`; the BACKLOG entry it upgraded from inference to counterexample is
+`c531f0115c4`. Results in `docs/superpowers/models/CaRelinkConfirmCore_RESULTS.md`.
+
+**Corrections to this task's own text, found while executing it:**
+- **The cfg list below is short by seven.** What landed: `_main`, `_main2r` (two receivers, 4.8M
+  states, covering the theorem's quantifier), sabotages `_sab_nogate1`, `_sab_stalecache`,
+  `_sab_nopoison`, `_sab_nofence`, `_sab_publishafterconfirm`, `_sab_holeylist`, and witnesses
+  `_witness_confirmyes`, `_witness_confirmno`, `_witness_confirmunknown`, `_witness_delete`.
+  Poison and fence are SEPARATELY load-bearing — after a poisoned apply the lane is quiescent, so only
+  the fence rule catches it — and Step 4's two-sabotage list would have hidden that by lumping them.
+- **Step 3's theorem is VACUOUS in the publish-after-confirm sabotage**, because its antecedent
+  includes `ActivationDurableBefore[r]`, which that sabotage is precisely about not establishing. That
+  config needed a second, antecedent-free invariant (`PromotedNeverDangles`).
+- **The fold cursor had to be modelled honestly** — advancing over the records a round OBSERVED, with
+  observation as a parameter — rather than assuming every durable record is seen. That is what
+  produced `_sab_holeylist`, and with it the load-bearing caveat this plan did not anticipate:
+  `_main` runs at `MaxHoles = 0`, i.e. it ASSUMES a completeness property the shipped code does not
+  establish. So `_main` passing means "the confirm protocol adds NO NEW dangle path", **not** "a
+  confirmed relink cannot dangle" — see BACKLOG {#list-as-journal-dataloss-2026-07-25}. Do not cite
+  it as dangle-freedom until the journal-chain fix lands.
+
 **Files:**
 - Create: `docs/superpowers/models/CaRelinkConfirmCore.tla`
 - Create: `docs/superpowers/models/CaRelinkConfirmCore_main.cfg`,
   `..._sab_nogate1.cfg`, `..._sab_stalecache.cfg`, `..._witness_confirmno.cfg`
+  (plus the seven listed in the corrections above)
 - Create: `docs/superpowers/models/run_relinkconfirm.sh` (copy `run_ackfloor.sh`, change the module)
 
-- [ ] **Step 1: Read `docs/superpowers/models/README.md`** for the naming/gating conventions
+- [x] **Step 1: Read `docs/superpowers/models/README.md`** for the naming/gating conventions
   (`_sab_*` must FAIL, `_witness_*` violation means reachable).
-- [ ] **Step 2: Model** two journals (sender, receiver) with a monotonic id per journal, a GC round
+- [x] **Step 2: Model** two journals (sender, receiver) with a monotonic id per journal, a GC round
   with a fold cursor and three-phase graduation (condemn → delete_pending → delete) with sparing on
   positive in-degree, and the confirm as an atomic predicate over the sender's state.
-- [ ] **Step 3: State the property**
+- [x] **Step 3: State the property**
 
 ```
 THEOREM ConfirmedRelinkNeverDangles ==
@@ -705,16 +762,34 @@ THEOREM ConfirmedRelinkNeverDangles ==
        (Promoted[r] /\ ConfirmYesObservedAt[r] /\ ActivationDurableBefore[r])
          => BlobsOf(Manifest[r]) \subseteq LiveBlobs)
 ```
-- [ ] **Step 4: Sabotage configs** — `_sab_nogate1` (confirm answers yes on ref-name match only →
+- [x] **Step 4: Sabotage configs** — `_sab_nogate1` (confirm answers yes on ref-name match only →
   must produce a violation, proving gate 1's exactness is load-bearing); `_sab_stalecache` (confirm
   reads a cache that may lag a durable removal → violation, proving the lane-quiescence rules).
-- [ ] **Step 5: Run** `cd docs/superpowers/models && ./run_relinkconfirm.sh CaRelinkConfirmCore_main`
+- [x] **Step 5: Run** `cd docs/superpowers/models && ./run_relinkconfirm.sh CaRelinkConfirmCore_main`
   (positive: "Model checking completed", no violation) and each `_sab_*` (must violate).
-- [ ] **Step 6: Record results** in `CaRelinkConfirmCore_RESULTS.md` and **commit**.
+- [x] **Step 6: Record results** in `CaRelinkConfirmCore_RESULTS.md` and **commit**.
 
 ---
 
 ## Task 10: `confirmExactRef` — the ledger-side lane snapshot (gate 1)
+
+**STATUS: DONE** — `7da3586ed29`, gate 1348/1348 (1335 baseline + 13 new).
+
+**Correction to Step 3, and it is the most valuable thing this task produced:** Step 3 says to take
+`state_mutex` "while still holding the queue mutex", which reads as a BLOCKING acquire. A blocking
+acquire is wrong. `ensureRefTableRecovered` holds `state_mutex` across its whole `LIST` and replay, so
+a confirm would wait on someone else's recovery *while holding the pool-wide append-admission mutex* —
+stalling every table's append lane for up to the full retry envelope. The zero-I/O contract is then
+broken by proxy: the query issues no request but is paid for by one. The landed code **try-locks**, and
+failing to take the lock is simply one more ambiguity → `Unknown`. The test pins the answer arriving in
+under 5 s against a 20 s parked `LIST`, where it previously took 20 s.
+
+Also recorded in the function's own comment, because it is the standing limit of what a `Yes` means: a
+`Yes` does not prove this runtime's recovered view is a COMPLETE replay of the durable log. Rules 2-4
+exclude every way this mount can lag its own durable writes; a recovery that silently observed less
+than it should is a different defect in a different component (BACKLOG
+{#list-as-journal-dataloss-2026-07-25}, and the downgraded review "blocker 1",
+{#partb-review-blocker1-downgraded}).
 
 **Files:**
 - Modify: `.../Pool/CasRefLedger.h/.cpp`
@@ -731,21 +806,21 @@ THEOREM ConfirmedRelinkNeverDangles ==
     ConfirmAnswer confirmExactRef(const RootNamespace & ns, const String & ref_name, const ManifestRef & manifest_ref) const;
 ```
 
-- [ ] **Step 1: Write the failing tests** — one per rule, from the spec §testing "Gate 1
+- [x] **Step 1: Write the failing tests** — one per rule, from the spec §testing "Gate 1
   determinism" list: repointed live part → `No`; dropped+recreated → `No`; cold/evicted/recovering
   → `Unknown` with zero backend requests (assert via `CountingBackend`'s counters);
   pending/in-flight/wedge/mid-tenure (`CarvePhaseForTest::ChunkReseed`) → `Unknown`; poison set →
   `Unknown`; quiescent exact match → `Yes`; and a race test where an append admitted concurrently
   with the snapshot is ordered strictly after it.
-- [ ] **Step 2: Run — red.**
-- [ ] **Step 3: Implement** exactly the six-rule snapshot from the spec: take `ref_queue_mutex`,
+- [x] **Step 2: Run — red.**
+- [x] **Step 3: Implement** exactly the six-rule snapshot from the spec: take `ref_queue_mutex`,
   find the runtime **without creating one** (`ref_tables.find`, not `getRefTableRuntime`, which
   would create an unrecovered entry), then take `state_mutex` while still holding the queue mutex;
   evaluate warm → quiescent (`wedge`, `pending`, `leader_active`) → poison → exact row equality →
   fence last (`fence_ok_fn()` and `!superseded_by_remount`); return `Unknown` for every ambiguity.
   **Do not call** `ensureRefTableRecovered`, `sweepStalePrecommitsForRead`, or
   `maybeScheduleSnapshotPublish` — all three are in `resolveRef` and all three can do I/O.
-- [ ] **Step 4: Run tests + full gate; Step 5: Commit.**
+- [x] **Step 4: Run tests + full gate; Step 5: Commit.**
 
 Subject: `ca: confirmExactRef — exact-token lane-linearized confirm (gate 1)`
 
@@ -774,9 +849,52 @@ Everything else lives behind `IContentAddressedExchange` and inside the CAS tree
 NOT relax [[feedback_cas_upstream_coupling_minimization]]: generic code must not learn CAS-specific
 concepts beyond what the existing relink path already carries.
 
+### As-built footprint: two ACCEPTED deviations and one conflation (recorded 2026-07-26) {#upstream-authorization-as-built}
+
+The Part B codex review (BACKLOG {#partb-review-findings}, "footprint objections") raised three points
+about the landed footprint. They are written down here, next to the rule they are measured against, so a
+future reader neither re-litigates them nor mistakes them for oversights.
+
+1. **`DataPartsExchange.h` exposes CAS-specific `allow_ca_relink` and service helpers beyond the opaque
+   enum.** True, and **knowingly accepted at the time and reported to the user** — `allow_ca_relink` is
+   the capability parameter Task 15 exists to add, and it replaced the implicit `try_zero_copy &&
+   !to_detached` brake that was worse coupling in the same file.
+2. **The receiver work spans `fetchSelectedPart` AND `relinkPartToDisk`, and the sender work spans
+   `processQuery` and two helpers**, where the "required shape" above asks for one function per side.
+   Also **knowingly accepted and reported**. The rule's intent held where it mattered: Task 14 moved the
+   confirm OUT of `fetchSelectedPart` and into `relinkPartToDisk` precisely because the plan's Step 2
+   would have spread it further (see Task 14's corrections), and Task 11's `DataPartsExchange.cpp`
+   change is purely additive with `processQuery` untouched.
+3. **The reviewer also counted the `src/Common/ProfileEvents.cpp` registration as outside the approved
+   failpoint scope. That is a CONFLATION and the objection does not stand:** that registration came from
+   Task 18, not from the Task 16 failpoint approval, and a ProfileEvent registration is not protocol
+   coupling. The failpoint approval's scope was exercised exactly as recorded — the registration lines in
+   `src/Common/FailPoint.cpp` and nothing else in that file.
+
+Points 1 and 2 are recorded as accepted, not as debt. If the boundary is to be tightened later, that is a
+new decision, not a correction of these tasks.
+
 ---
 
 ## Task 11: Storage-level confirm + gate 0 + exchange interface
+
+**STATUS: DONE** — `41fa94de18b`, gate 1356/1356.
+
+**Corrections to this task's own text:**
+- The footprint came out TIGHTER than the constraint asked: `DataPartsExchange.cpp` is purely
+  additive — one self-contained `Service::resolveContentAddressedConfirm`, zero lines removed, no
+  existing function modified. `processQuery` is deliberately UNTOUCHED here; its dispatch is Task 13's.
+  The header is in the diff only because the build runs `-Weverything -Werror`, where a yet-uncalled
+  function in an anonymous namespace is a `-Wunused-function` failure and a private member declaration
+  is not.
+- **Step 1's deferral of the gate-0 cases to Task 16 was never honoured.** The gtest says so in its own
+  comment (`gtest_cas_confirm_exact_ref.cpp:689`: `Deleting`, absent, other-disk and the
+  `MOVE ... TO DISK` same-name case "belong to the Task 16 pytest battery") and none of Task 16's
+  eleven integration tests covers them. A declared handoff that nobody completed is indistinguishable
+  from coverage — see **Task 22**, which exists to close it.
+- Carried forward from Task 10 and made explicit at this boundary: rule 6 (fence) is evaluated LAST, so
+  gate 0's `No`, gate 1's `No` and every `Unknown` reach the SAME caller outcome. Any future code that
+  wants to treat `No` as authoritative must hoist rule 6 first.
 
 **Files:**
 - Modify: `.../ContentAddressedExchange.h` (two methods), `.../ContentAddressedMetadataStorage.h/.cpp`
@@ -799,32 +917,57 @@ concepts beyond what the existing relink path already carries.
   `epoch:build:ordinal` rendering already used in events — reuse the existing formatter, find it
   with `grep -n "manifestRefDebugString\|renderManifestRef" -r src/.../ContentAddressed/`.)
 
-- [ ] **Step 1: Write the failing tests** for gate 0's filter semantics (spec §testing "Gate 0"):
+- [x] **Step 1: Write the failing tests** for gate 0's filter semantics (spec §testing "Gate 0"):
   `Deleting` → `No`; absent/other-disk → `No`; the `Deleting → Outdated` rollback state must still
   be rejected by gate 1 when the ref is gone; `MOVE ... TO DISK` same-name-other-disk → `No` unless
   the matched instance is the part's current disk. These are integration-level — put them in the
   Task 16 pytest file and keep this task's unit tests to `ownsNamespace` routing.
-- [ ] **Step 2: Implement `ownsNamespace` + `confirmExactRef`** on
+- [x] **Step 2: Implement `ownsNamespace` + `confirmExactRef`** on
   `ContentAddressedMetadataStorage` as thin forwards (`store()`/the ledger), with the
   storage-lifecycle gates applied (a not-started / terminal disk answers `Unknown`, never throws
   out of a confirm).
-- [ ] **Step 3: Implement the `Service`-side resolution**: enumerate `data.getDisks()`, map each
+- [x] **Step 3: Implement the `Service`-side resolution**: enumerate `data.getDisks()`, map each
   through the existing `tryGetContentAddressedExchange` (`DataPartsExchange.cpp:117-122`), keep the
   ones where `ownsNamespace(...)` is true; **zero or more than one match → `Unknown`**; then gate 0:
   look up the part by name in the parts set and require `Active`/`Outdated` **on the matched
   instance's disk** (the `MOVE ... TO DISK` same-name case). Read the parts set under its own lock
   and release it before calling into the ledger.
-- [ ] **Step 4: Run gate; Step 5: Commit.**
+- [x] **Step 4: Run gate; Step 5: Commit.**
 
 Subject: `ca: exchange-level confirm (ownsNamespace + confirmExactRef) with the gate-0 part filter`
 
 ---
 
-## Task 12: `PreparedRelink` handle + typed prepare boundary
+## Task 12: ~~`PreparedRelink`~~ `PreparedPartWrite` handle + typed prepare boundary
+
+**STATUS: DONE** — `41a248fd9c5`, gate 1361/1361. Nothing under `src/Storages`.
+
+**Corrections to this task's own text:**
+- **The heading named the wrong type.** It said `PreparedRelink` while this task's own Interfaces block
+  says `PreparedPartWrite`, and the two are DIFFERENT LAYERS: the receiver's token and decoded entries
+  belong to Task 14's exchange boundary (`ICaPreparedRelink`), not to a CAS-internal facade. The
+  heading above is corrected in place; the commit subject as landed still says `PreparedRelink handle`.
+- **The file list below names two files that belong to Task 14** — `ContentAddressedExchange.h` and
+  `ContentAddressedMetadataStorage.h/.cpp`. They were correctly left alone here.
+- Two files this task DID touch that the list does not name: `Pool/CasPool.{h,cpp}` and
+  `Pool/CasRefLedger.{h,cpp}`, for a `livePrecommitsForTest` seam — Step 1 requires asserting through
+  the ledger's precommit view and no accessor existed.
+- **"move-only" (below) was implemented as move-construct + move-assign, and the assignment was later
+  DELETED** by the Part B review fix (`8e6fe6ef0af`, major 4). It has no correct implementation:
+  overwriting a handle that still owes a terminal must discharge that duty first, `abandon` appends
+  through the ref lane and can FAIL, and an assignment cannot report that — so the landed version
+  overwrote the destination even when `abandonBuildBestEffort` returned false, permanently dropping a
+  cleanup owner. Read "move-only" below as move-CONSTRUCT-only; pinned by
+  `CasPartFolderAccess.PreparedPartWriteIsNotMoveAssignable`.
+- The `abort`-appends-the-precommit-removal property is MUTATION-VERIFIED, not asserted: `abandon` was
+  commented out, the test failed on exactly that assertion, and the mutation was reverted.
 
 **Files:**
 - Modify: `.../Parts/PartFolderAccess.h/.cpp` (split `publishEntries`, currently `.cpp:338-372`)
-- Modify: `.../ContentAddressedExchange.h`, `.../ContentAddressedMetadataStorage.h/.cpp`
+- ~~Modify: `.../ContentAddressedExchange.h`, `.../ContentAddressedMetadataStorage.h/.cpp`~~
+  (Task 14's, not this task's — see the corrections above)
+- Modify (not in the original list): `.../Pool/CasPool.h/.cpp`, `.../Pool/CasRefLedger.h/.cpp`
+  (`livePrecommitsForTest`)
 
 **Interfaces:**
 - Produces, on `CachedPartFolderAccess`:
@@ -840,16 +983,16 @@ Subject: `ca: exchange-level confirm (ownsNamespace + confirmExactRef) with the 
   and exposing `Cas::CommitOutcome promote(bool allow_repoint = false)` and `void abort()`, move-only,
   with an explicit terminal-state flag so a scope guard can abort exactly once.
 
-- [ ] **Step 1: Write the failing tests** — prepare-then-promote equals today's `publishEntries`
+- [x] **Step 1: Write the failing tests** — prepare-then-promote equals today's `publishEntries`
   outcome; prepare-then-abort leaves no committed ref AND appends the precommit removal (assert via
   the ledger's precommit view — no same-epoch leak); double-terminal is rejected.
-- [ ] **Step 2: Run — red.**
-- [ ] **Step 3: Implement** by splitting `publishEntries` at `PartFolderAccess.cpp:353`: everything
+- [x] **Step 2: Run — red.**
+- [x] **Step 3: Implement** by splitting `publishEntries` at `PartFolderAccess.cpp:353`: everything
   up to and including `precommitAdd` moves into `prepareEntries`; `promoteBuild` becomes the
   handle's `promote`; the existing `catch` → `abandon` → rethrow discipline (`.cpp:361-371`) moves
   into the handle's `abort` and into `prepareEntries`'s own failure path. **Keep `publishEntries`**
   implemented in terms of the new pair, so every existing caller is untouched.
-- [ ] **Step 4: Run gate; Step 5: Commit.**
+- [x] **Step 4: Run gate; Step 5: Commit.**
 
 Subject: `ca: split publishEntries into prepare/promote/abort (PreparedRelink handle)`
 
@@ -857,10 +1000,37 @@ Subject: `ca: split publishEntries into prepare/promote/abort (PreparedRelink ha
 
 ## Task 13: Wire protocol — the confirm action and the source token
 
+**STATUS: DONE** — `c74d8e6549a`, gate 1363/1363. Deliberately HALF-landed in the safe direction: the
+server's advertised clamp rises to 11, but the client still advertises 10 and the relink-offer gate is
+still keyed on 10, so no receiver asks for a confirm. Raising the gate alone would silently disable
+relink; bumping the client alone would make the receiver claim it confirms when it does not. Those two
+edits land together in Task 14.
+
+**Corrections to this task's own text:**
+- **Step 2's premise is wrong twice, and the second way is a TOCTOU.** It says the sender "already has
+  all of these (the manifest bytes carry `ref`/`root_namespace_id`)". Decoding a manifest in
+  `DataPartsExchange.cpp` would put CAS types in generic code; and minting the token from a SECOND
+  lookup lets a repoint between the OFFER and the MINT hand the receiver a token naming a manifest
+  whose entries it never adopted — a `Yes` for that protects the wrong blobs. The lookup now returns
+  the bytes AND the token from ONE resolution.
+- **Task 11's "three-line dispatch" estimate for Step 3 is wrong.** Within `processQuery` it is ~21
+  added lines across eight places, because the confirm must run BEFORE the part-name validation (a
+  confirm request has no part), and the offer rename touches its call sites. Footprint stayed within
+  {#upstream-authorization}: one function on the sender side.
+- **Stated deviation from the spec's literal `yes`/`no`/`unknown` wire:** the wire is BINARY. Only
+  `yes` authorizes; `No`, `Unknown` and an absent cookie all read as `unproven`. Putting `no` on the
+  wire as a distinct value would invite a receiver to treat it as knowledge, and with rule 6 evaluated
+  last it is not — a fence-lost mount answers `No`. The distinction is logged where the gate that
+  produced it can be named, never transmitted.
+- Old peers, fail-closed both ways: an old receiver ignores an unknown cookie by name; an old sender
+  offers relink with NO token, and that absence is the capability signal Task 14 keys on.
+- Removed a re-check the agent had first added: the manifest reader already enforces it and throws, so
+  the addition would only have converted a loud corruption error into a silent byte fetch.
+
 **Files:**
 - Modify: `src/Storages/MergeTree/DataPartsExchange.h/.cpp`
 
-- [ ] **Step 1: Add the protocol version and token constants** next to the existing ones
+- [x] **Step 1: Add the protocol version and token constants** next to the existing ones
   (`.cpp:76-111`):
 ```cpp
 constexpr auto REPLICATION_PROTOCOL_VERSION_WITH_CA_CONFIRM = 11;
@@ -868,20 +1038,20 @@ constexpr auto CA_CONFIRM_ACTION_PARAM = "content_addressed_confirm";     /// re
 constexpr auto CA_CONFIRM_TOKEN_COOKIE = "content_addressed_source_token"; /// response cookie on the relink offer
 ```
   and bump the version the server advertises (`.cpp:185`) and the client sends (`.cpp:523-529`).
-- [ ] **Step 2: Mint the token on the sender** inside the existing relink branch
+- [x] **Step 2: Mint the token on the sender** inside the existing relink branch
   (`.cpp:249-280`), as a compact text encoding of
   `{pool_uuid, server_root_id, root_namespace, ref_name, part_name, manifest_ref}` — the sender
   already has all of these (the manifest bytes carry `ref`/`root_namespace_id`, see
   `CasPartManifestFormat.h:76-78`). Add it as a response cookie next to `CA_RELINK_COOKIE`
   (`.cpp:268`).
-- [ ] **Step 3: Handle the confirm action** at the TOP of `Service::processQuery`
+- [x] **Step 3: Handle the confirm action** at the TOP of `Service::processQuery`
   (before the body reset and before `part` is required/parsed, `.cpp:170-205`): parse the token,
   resolve the instance via Task 11's routing, answer `yes`/`no`/`unknown` as a response cookie plus
   an empty body, and return.
-- [ ] **Step 4: Test** with an integration test in Task 16 (a unit test cannot exercise the HTTP
+- [x] **Step 4: Test** with an integration test in Task 16 (a unit test cannot exercise the HTTP
   endpoint); here, add a round-trip test for the token encoder/decoder (a pure function — put it in
   `gtest_cas_confirm_exact_ref.cpp`), including rejection of malformed and over-long fields.
-- [ ] **Step 5: Run gate; Step 6: Commit.**
+- [x] **Step 5: Run gate; Step 6: Commit.**
 
 Subject: `ca: interserver confirm action + source token (relink protocol v11)`
 
@@ -889,12 +1059,40 @@ Subject: `ca: interserver confirm action + source token (relink protocol v11)`
 
 ## Task 14: Receiver flow — prepare, confirm, promote, and the typed failure taxonomy
 
+**STATUS: DONE** — `260a6f81169`, gate 1366/1366; `test_cas_replicated_relink` verified on real RustFS
+with the node logs proving the relink actually ran. Later hardened by the Part B review fix
+`8e6fe6ef0af` (see the last bullet).
+
+**Corrections to this task's own text — two deviations, both toward the spec:**
+- **Step 2 puts the confirm in the receiver branch of `fetchSelectedPart` (`.cpp:728-771`). That
+  contradicts {#upstream-authorization}'s one-function-per-side rule and the spec's own "Fetcher owns
+  confirm, abort and the throw." The authorization won:** the confirm lives in
+  `Fetcher::relinkPartToDisk`.
+- **Step 1's `void promote()` cannot express the spec's "receiver-side ref conflict is mechanism
+  fallback"** without leaking CAS error codes into generic code. `promote` therefore returns a TYPED
+  answer, and `abort` is `noexcept` on the interface, since it runs with the row-3 error in flight.
+- A catch-all was REMOVED that the spec contradicts: the old adopt path treated ANY error as grounds
+  for a byte fetch — a fourth cause where the spec lists three. An unclassified local error is not
+  evidence that a byte fetch would fare better.
+- **A lifetime hazard the split created, not anticipated here:** `PreparedPartWrite` keeps its owner as
+  a RAW pointer, and the handle now spans a network round trip, so the wrapper holds a `shared_ptr`
+  snapshot of the part-folder facade — otherwise a concurrent shutdown dangles it.
+- Step 4's grep was done and the throw is not swallowed: every `catch` between here and the queue was
+  read.
+- **Later correction (`8e6fe6ef0af`, review major 3):** `promote` mapped every `NETWORK_ERROR` to
+  `MechanismFallbackAllowed`, but the promotion PUT MAY HAVE LANDED — a byte re-fetch on top of that is
+  a sequential double publication the taxonomy says is impossible. The outcome is now tri-valued
+  (`Committed` / `MechanismFallbackAllowed` = proven-not-committed / `Unresolved` = may have committed
+  → retry the whole fetch later), and the post-commit window is closed the way Part A closed its own:
+  outcome strings copied before the append, the commit recorded inside `DENY_ALLOCATIONS_IN_SCOPE`
+  straight after it, and the catch rethrows rather than abandoning a committed build.
+
 **Files:**
 - Modify: `.../ContentAddressedMetadataStorage.h/.cpp` (`adoptPartFromManifest` → typed prepare),
   `.../ContentAddressedExchange.h`, `src/Storages/MergeTree/DataPartsExchange.cpp`
   (`Fetcher::relinkPartToDisk` `.cpp:1107-1169` and the receiver branch `.cpp:728-771`)
 
-- [ ] **Step 1: Replace the boolean adoption** with a typed prepare on the exchange interface:
+- [x] **Step 1: Replace the boolean adoption** with a typed prepare on the exchange interface:
 ```cpp
     enum class CaRelinkPrepare : uint8_t { Prepared, MechanismFallbackAllowed };
     /// Stage + precommit the receiver-local manifest and RETURN a handle; the caller must confirm
@@ -907,19 +1105,19 @@ Subject: `ca: interserver confirm action + source token (relink protocol v11)`
 ```
   (`ICaPreparedRelink` = a tiny abstract handle with `promote()`/`abort()` so
   `DataPartsExchange.cpp` stays free of CAS-internal types.)
-- [ ] **Step 2: Rewrite the receiver branch** (`.cpp:728-771`): parse the relink cookie AND the
+- [x] **Step 2: Rewrite the receiver branch** (`.cpp:728-771`): parse the relink cookie AND the
   token cookie → `prepareAdoptFromManifest` → on `MechanismFallbackAllowed` keep today's
   `fall_back_to_byte_fetch()` → otherwise issue the confirm request → on `yes` `promote()` and
   build the part exactly as `relinkPartToDisk` does today → on anything else `abort()` and
   **throw** a locally generated retry-later `NETWORK_ERROR` with a message naming the source and
   part.
-- [ ] **Step 3: Scope guard** — the handle must be aborted on every non-promote exit including
+- [x] **Step 3: Scope guard** — the handle must be aborted on every non-promote exit including
   exceptions; use `SCOPE_EXIT` around the confirm+promote region.
-- [ ] **Step 4: Verify the throw is not swallowed** — grep the call chain
+- [x] **Step 4: Verify the throw is not swallowed** — grep the call chain
   (`fetchSelectedPart` → `fetchPart` → `executeFetch`) for `catch` blocks that would convert it
   back into a byte re-request; the typed boundary exists precisely because
   `adoptPartFromManifest`'s old catch-all (`ContentAddressedMetadataStorage.cpp:2002`) did that.
-- [ ] **Step 5: Run gate; Step 6: Commit.**
+- [x] **Step 5: Run gate; Step 6: Commit.**
 
 Subject: `ca: relink receiver — prepare/confirm/promote with a typed failure taxonomy`
 
@@ -927,30 +1125,64 @@ Subject: `ca: relink receiver — prepare/confirm/promote with a typed failure t
 
 ## Task 15: B66b — `allow_ca_relink` capability, recursion brake, detached target
 
-**Files:**
-- Modify: `src/Storages/MergeTree/DataPartsExchange.h/.cpp`,
-  `src/Storages/StorageReplicatedMergeTree.cpp` (the two manual detached callers, `:8125`, `:8281`)
+**STATUS: DONE** — `fac69e10dbd`, gate 1368/1368; `test_cas_replicated_relink` passes on real RustFS
+with the relink still firing. The brake it wired was UNTESTED and said so; that gap was carried into
+Task 16 by `69e81b12732` and closed there.
 
-- [ ] **Step 1: Add the capability parameter.** Replace the `try_zero_copy && !to_detached` gate
+**Corrections to this task's own text:**
+- **Step 4 is DEAD — it needed no code and none was written.** `src/Storages/StorageReplicatedMergeTree.cpp`
+  was NOT touched, as {#upstream-authorization} requires: the parameter is appended after `dest_disk`
+  with default `true`, so all four positional call sites keep compiling and the server links — which is
+  the proof, not the argument. `allow_ca_relink` appears nowhere in that file.
+- **The line numbers in the file list are stale, and the two sources that corrected them DISAGREE.**
+  Task 16's own corrections block says the two manual detached callers are at `:8125` (`FETCH PART`)
+  and `:8273` (`FETCH PARTITION`), "not `:8281`". The worklog's 20:29 UTC entry instead says the
+  plan's `:8125`/`:8281` are stale "vs the real `:3386`/`:3514`/`:5632`/`:5818`". The two are probably
+  counting different things (DDL detached callers vs all `fetchSelectedPart` call sites), but neither
+  source says so. **Re-derive with a grep before trusting either.**
+- **There is a THIRD detached caller neither this plan nor the spec mentions:**
+  `executeClonePartFromShard` (`:3475`). Unlike the two DDL callers it IS a queue entry, which matters
+  for the taxonomy: two of the three detached callers have no queue entry, so row 3 rests on the
+  statement failing to the user rather than on queue re-execution (verified by checking that
+  `NETWORK_ERROR` is not in the swallow list). It is deliberately left untested — see Task 16's
+  corrections.
+- Beyond the plan: the ref name is no longer composed in generic code. The receiver entry now takes a
+  disk-relative part path, symmetric with the sender's, and the CAS side derives the namespace and ref
+  itself; `detached/` folds for free, and a target that is not a live part directory throws instead of
+  inviting a byte fallback to the same wrong place. That closes CAS-archaeology finding §9 #12, whose
+  recommended fix was verbatim this.
+
+**Files:**
+- Modify: `src/Storages/MergeTree/DataPartsExchange.h/.cpp`
+- ~~Modify: `src/Storages/StorageReplicatedMergeTree.cpp` (the two manual detached callers, `:8125`, `:8281`)~~
+  **NOT modified — see the corrections above. Step 4 required no edit.**
+
+- [x] **Step 1: Add the capability parameter.** Replace the `try_zero_copy && !to_detached` gate
   (`.cpp:545`) with a dedicated `allow_ca_relink` parameter on `fetchSelectedPart`
   (default `true`), leaving `try_zero_copy` untouched for real zero-copy (`.cpp:566`).
-- [ ] **Step 2: Wire the recursion brake.** Every `fall_back_to_byte_fetch()` re-request
+- [x] **Step 2: Wire the recursion brake.** Every `fall_back_to_byte_fetch()` re-request
   (`.cpp:733-739`) must pass `allow_ca_relink=false` — this replaces the brake that
   `try_zero_copy=false` provided implicitly. Without it a persistent mechanism failure loops.
-- [ ] **Step 3: Pass `to_detached` into `relinkPartToDisk`** and construct the temporary storage
+- [x] **Step 3: Pass `to_detached` into `relinkPartToDisk`** and construct the temporary storage
   under the detached parent (today the active parent is hardcoded, `.cpp:1128`); the CA router
   already folds any `detached/<name>` ref (`ContentAddressedMetadataStorage.cpp:1241`).
-- [ ] **Step 4: Update the two manual detached callers** to pass `allow_ca_relink=true`
-  independently of `try_fetch_shared=false`.
-- [ ] **Step 5: Do NOT change detached finalization** — it stays `renameTo(detached/<part>, true)`
+- [x] ~~**Step 4: Update the two manual detached callers** to pass `allow_ca_relink=true`
+  independently of `try_fetch_shared=false`.~~
+  **DEAD STEP — no edit was needed and none was made.** The parameter defaults to `true` and the call
+  sites are positional, so they stop before it. Making this edit would have touched
+  `StorageReplicatedMergeTree.cpp`, which {#upstream-authorization} does not cover.
+- [x] **Step 5: Do NOT change detached finalization** — it stays `renameTo(detached/<part>, true)`
   (`StorageReplicatedMergeTree.cpp:5719`) with its existing collision behavior.
-- [ ] **Step 6: Run gate; Step 7: Commit.**
+- [x] **Step 6: Run gate; Step 7: Commit.**
 
 Subject: `ca: B66b — relink into detached behind allow_ca_relink, with a recursion brake`
 
 ---
 
 ## Task 16: Integration test battery
+
+**STATUS: DONE** — `037cc6d0e41`, all eight steps; 11 integration tests passing in 55 s, CA battery
+unchanged at 1368/1368. Part B closed here.
 
 **CARRIED IN FROM TASK 15 — the recursion brake is wired but UNTESTED.** Task 15 (`fac69e10dbd`) could
 not prove it and said so instead of inventing a test. Read its reasoning before writing one: the
@@ -1036,19 +1268,50 @@ Note also: the plan's command lines use `python`, which is not on PATH in this e
   half that decides whether a mixed cluster can ever see an unconfirmed relink. Covering the receiver
   half faithfully would need a MITM interserver proxy registered as a fake replica in ZooKeeper.
 
+- **What the review found still uncovered AFTER this battery** (BACKLOG {#partb-review-findings}, test
+  gaps): every gate-0 case (see **Task 22**); the genuinely-uncovered subset of the review's
+  missing-test list (see **Task 23**); and a pre-existing test in this very file that is green for the
+  wrong reason (see **Task 24**).
+
 ```bash
 ninja -C build clickhouse > build/build_srv_t16.log 2>&1; echo NINJA_EXIT=$?
-python -m ci.praktika run "integration" --test test_cas_replicated_relink > build/test_t16_relink.log 2>&1; echo EXIT=$?
+python3 -m ci.praktika run "integration" --test test_cas_replicated_relink > build/test_t16_relink.log 2>&1; echo EXIT=$?
 ```
 The fixture is 2-replica with `with_rustfs=True` (RustFS, not MinIO — the CAS probe needs real
 conditional-PUT semantics) over the shared-pool disk in
-`tests/integration/test_cas_replicated_relink/configs/storage_conf.xml`; the existing relink proof
-is `count_blobs()` staying flat across a fetch (`test.py:47-51`). Reuse that helper for every new
-relink proof rather than inventing a second one.
+`tests/integration/test_cas_replicated_relink/configs/storage_conf.xml`.
+~~the existing relink proof is `count_blobs()` staying flat across a fetch (`test.py:47-51`). Reuse
+that helper for every new relink proof rather than inventing a second one.~~
+**DO NOT DO THIS — it is the defect the corrections block above records, repeated here in the original
+text.** A flat blob count is satisfied by a BYTE fetch too, because the same content deduplicates.
+Key every relink assertion on the receiver's `Relink of part <p> … finished (no bytes transferred).`
+log line; `count_blobs()` key-set deltas are corroboration only. Task 16 landed a second fixture,
+`configs/storage_conf_other_pool.xml`, for the cross-pool and version-mix cases.
 
 ---
 
 ## Task 17: ca-soak scenario S42 — allocation-fault soak
+
+**STATUS: DONE** — `c44cb6cbe44`. Two smoke runs at dev scale; the second read 26/28 pass, 1 skipped,
+1 inconclusive (the soundness guard itself, targeted=0 against generic=70).
+
+**Corrections to this task's own text:**
+- **Step 4's ORDERING was wrong and made leg C vacuous every time.** Running the snapshot/journal
+  oracle AFTER the forced GC cannot work: ref cleanup deletes exactly the logs the oracle needs to
+  replay. The card takes its oracle scan at QUIESCENCE, before the forced GC.
+- **Step 5's soundness guard, implemented literally, makes a conclusive green unreachable.** The
+  failpoint term is zero BY CONSTRUCTION — the install-region seam is gtest-only and no CAS failpoint
+  is registered for a running server — so S42 could return `inconclusive` or `fail` but never a
+  conclusive green however healthy the system was. **Superseded by the user's Q4 decision** (BACKLOG
+  {#q4-s42-green}) and implemented in the sibling follow-ups plan's Task 9 (`402a85c4a64`): green is a
+  consistent state on disk and in memory; the window-specific targeting becomes REPORTED; only the
+  GENERIC anti-vacuity guard still gates.
+- **Writing the card found a harness regression that matters more than the card.**
+  `observe.gc_log_rows` still selected `min_ack`, a column the GC log schema no longer has, so the
+  query raised `UNKNOWN_IDENTIFIER`, a bare `except` turned that into an empty list, and **every GC
+  verdict in every scenario was vacuously true**. Fixed in the same commit; the deeper `except`
+  hazard and `assert_gc_no_failed`-passes-on-empty were closed after it in `017d5fa22a4` /
+  `646fdac53fc`.
 
 **Files:**
 - Create: `utils/ca-soak/scenarios/cards/s42_alloc_faults.py`
@@ -1057,33 +1320,53 @@ relink proof rather than inventing a second one.
 Design: `docs/superpowers/specs/2026-07-23-cas-fetch-handoff-publish-confirm-design.md` §testing,
 plus `utils/ca-soak/scenarios/BACKLOG.md` §s42-allocation-fault-soak (read BOTH before writing).
 
-- [ ] **Step 1: Copy the card skeleton** from `cards/s39_lease_fault_tolerance.py` (`@register`,
+- [x] **Step 1: Copy the card skeleton** from `cards/s39_lease_fault_tolerance.py` (`@register`,
   `name`/`title`/`priority`/`param_table`/`run`), keeping its soundness-guard style.
-- [ ] **Step 2: Leg A** — arm `memory_tracker_fault_probability` per query through the driver's URL
+- [x] **Step 2: Leg A** — arm `memory_tracker_fault_probability` per query through the driver's URL
   parameters (`utils/ca-soak/soak/cluster.py:247`) over a soak-shaped insert/select workload.
-- [ ] **Step 3: (MOVED to Task 20 / scenario S43.)** Thread-allocation faults were originally leg B
+- [x] **Step 3: (MOVED to Task 20 / scenario S43.)** Thread-allocation faults were originally leg B
   here. They are a different fault CLASS with a different blast radius — they cannot reach the CAS
   commit path at all, because the ref append lane runs on the caller's thread — and mixing them into
   one card destroys attribution when something breaks. S42 is therefore query-thread allocation
   faults only.
-- [ ] **Step 4: Leg C** — disarm, quiesce, GC to fixpoint, fsck, restart, and compare; ALSO replay
+- [x] **Step 4: Leg C** — disarm, quiesce, GC to fixpoint, fsck, restart, and compare; ALSO replay
   from the last pre-fault snapshot plus the raw tail logs and compare against the live cache, and
   assert no snapshot advanced across a poisoned transaction (`CasRefApplyPoisoned` from Task 7).
-- [ ] **Step 5: Soundness guard** — require a nonzero targeted signal (the poison-transition
+- [x] **Step 5: Soundness guard** — require a nonzero targeted signal (the poison-transition
   counter, or a post-PUT failpoint hit), NOT merely a nonzero `MEMORY_LIMIT_EXCEEDED` count; report
   `inconclusive` otherwise.
-- [ ] **Step 6: Oracle** — queries may fail; invariants may not: zero `LOGICAL_ERROR`/abort in
+- [x] **Step 6: Oracle** — queries may fail; invariants may not: zero `LOGICAL_ERROR`/abort in
   `err.log` (only expected injected errors during the armed window), acked-vs-lost = 0, replicas
   agree, fsck `dangling=0`/`unaccounted=0`, GC recovers after disarm, no permanently wedged lane,
   no query hung past a bound.
-- [ ] **Step 7: Run at dev scale**
+- [x] **Step 7: Run at dev scale**
   `cd utils/ca-soak && python3 -m scenarios.run --scenario S42 --seed 1 --scale dev`
   and iterate until it is GREEN or produces a genuine, triaged finding.
-- [ ] **Step 8: Commit** the card plus its `RUN_HISTORY.md` entry.
+- [x] **Step 8: Commit** the card plus its `RUN_HISTORY.md` entry.
 
 ---
 
 ## Task 18: do not wedge a ref lane when no attempt was ever sent (finding #37 defect 3, behavioural half)
+
+**STATUS: DONE** — `252ccbdf2d4`, gate 1352/1352 (1348 baseline + 4 new), plus the follow-on
+`99684c66655`.
+
+**Corrections to this task's own text:**
+- **Step 3's "and the same decision in the wedge-resolution path" cannot be done: that path has no
+  pre-attempt gate to make the decision at.** Documented in place rather than worked around.
+- **Step 5's TLA+ target does not exist.** The nearest model already ADMITS this transition, so this
+  change widens which C++ paths reach it rather than what the model admits. That model was re-run:
+  5/5 expectations met. No new model was written.
+- **Step 3 understates the work:** the apply-pending marker must ALSO be cleared. Leaving it set is a
+  permanent false claim that the table may be missing a durable transaction, and `confirmExactRef`'s
+  rule 4 would then answer `Unknown` forever. Nothing was sent, so nothing is owed.
+- Beyond the plan, and needed for the soak oracle to read the change at all: `99684c66655` adds
+  `CasRefAppendPreAttemptRefused`, because removing the wedge also removed the ONLY evidence these
+  refusals happen — an oracle watching the wedge count fall could not tell "the availability fix is
+  working" from "nothing happened this run".
+- A diagnostic bug fixed on the way, unrelated to the behaviour: the attempts-exhausted path returned
+  `Unresolved` through bare returns that bypassed the reason helper, so the single most common wedge
+  message in the system read "is UNCERTAIN (not unresolved)".
 
 The diagnostic half landed separately: `putIfAbsentControlled` now reports WHY it returned
 `Unresolved` via `CasUnresolvedReason`, and `CasUnresolvedReason::NoAttemptSent` marks the case where
@@ -1107,40 +1390,69 @@ blip during the pre-attempt gate currently costs a table its write availability 
 **Interfaces:** consumes `CasUnresolvedReason` from
 `Backend/CasRequestControl.h`; produces no new public surface.
 
-- [ ] **Step 1: Write the failing test.** Drive a `NoAttemptSent` rejection (a fence that is already
+- [x] **Step 1: Write the failing test.** Drive a `NoAttemptSent` rejection (a fence that is already
   false when `commitRefChunk` is entered — `ChunkFaultBackend` is not even needed, the fence hook is
   enough) and assert: the caller gets a retry-later error, `refLaneWedgedForTest(ns)` is FALSE, and a
   subsequent append on the same table succeeds without a remount. Then the contrast case: a genuinely
   ambiguous PUT (`Mode::Unresolved`) must STILL wedge — that assertion already exists as
   `UnresolvedAlwaysRecordsTheWedge`, so extend rather than duplicate it.
 
-- [ ] **Step 2: Run — the no-wedge assertion fails** (today the lane wedges in both cases).
+- [x] **Step 2: Run — the no-wedge assertion fails** (today the lane wedges in both cases).
 
-- [ ] **Step 3: Implement.** In the `Unresolved` arm, skip the wedge install when the reason is
+- [x] **Step 3: Implement.** In the `Unresolved` arm, skip the wedge install when the reason is
   `NoAttemptSent`: complete the survivors with the same retry-later error (unchanged), leave
   `rt->wedge` disengaged, and leave the allocated txn id as a safe gap (it already is one — ids are
   not required to be contiguous, `CasRefProtocol.cpp` only enforces strict increase). Keep the
   prepared wedge construction where it is: it is allocation-free to discard, and building it before
   the PUT is what makes the ambiguous path safe.
 
-- [ ] **Step 4: Prove the safety argument in the comment, not just in the commit message.** The claim
+- [x] **Step 4: Prove the safety argument in the comment, not just in the commit message.** The claim
   is "no attempt was sent, therefore the key is unwritten, therefore there is nothing a wedge could
   resolve". It rests on both pre-attempt gates returning before `backend->putIfAbsent` — state that,
   and state the counterexample it excludes (a fence lost AFTER an attempt is `FenceLostMidWay`, which
   keeps wedging).
 
-- [ ] **Step 5: TLA.** The wedge is part of the append-lane's at-most-one-unresolved-PUT contract, so
+- [x] **Step 5: TLA.** The wedge is part of the append-lane's at-most-one-unresolved-PUT contract, so
   extend the ref-lane model with a `NoAttemptSent` transition and re-check that
   "every durable object is either applied or wedged" still holds. If the existing model has no
   pre-attempt gate, adding one is the work.
 
-- [ ] **Step 6: Run the full CAS gate; Step 7: Commit.**
+- [x] **Step 6: Run the full CAS gate; Step 7: Commit.**
 
 Subject: `ca: a pre-attempt fence reject no longer wedges the lane (finding #37 defect 3)`
 
 ---
 
 ## Task 19: a diagnostic tool must not claim ownership of a live pool (CI "Scraping system tables")
+
+**STATUS: SUPERSEDED — this task, as written, is NOT the work that will happen.** What landed:
+- The DESIGN analysis only (`c6a6c909be4`), which Step 2 required before any code. It recommends
+  contract (a) in a fourth shape (observe-only decided by process ROLE, not by a config flag) and
+  rules out (b) on verified evidence.
+- The CI symptom fixed by a one-liner instead of a product change: `d99a7df4540` (patch `config.d`,
+  not just `config.xml`, and make the next no-op LOUD) and `8aea3a0dedc` (find the CA disks by their
+  MARKER instead of naming any path at all).
+- The remainder split to BACKLOG {#operator-uuid-recovery} and reframed by the user's Q2 decision
+  (BACKLOG {#q2-force-claim}): **the problem is the differing SERVER UUID, not "may a tool read
+  without claiming".** A genuine read-only mount is a separate, unimplemented task. The force-claim
+  successor is the sibling follow-ups plan's Tasks 10-12, which are themselves BLOCKED on the user's
+  choice between overwriting the owner uuid and adopting the pool's existing one.
+
+**Corrections to this task's own text:**
+- **Step 1 (local repro) was never done and no longer applies**: the soak stand had been torn down,
+  and the question it existed to settle was settled by reading the call site instead — **the CI scrape
+  runs against a STOPPED server** (stated in the code's own comment, confirmed at the call site;
+  `ebbae78d739`). The preamble below, which says it runs "against the same data directory as the LIVE
+  server", is therefore wrong.
+- **The "Prior attempt that did NOT fix it" argument is weaker than this task claims.** `ee15c8ade23`
+  never actually ran: its `sed` patches `config.xml` while the CA disk is declared in `config.d`. So
+  it is not evidence that a read-only scrape is insufficient, and the case it builds against contract
+  (c) does not stand on it.
+- A prerequisite BACKLOG item cited here is stale and already fixed.
+- **One genuine wrong-answer class was found that is mount-independent and needs a fix under ANY
+  contract:** `fsck` reads `gc/state` and then streams the source-edge runs, so a snap-prune retiring
+  that generation mid-scan surfaces as `CORRUPTED_DATA` on a healthy pool. Same area as BACKLOG
+  {#adopted-seal-pruned-run-2026-07-25}, observed from the other side.
 
 Known since the 2026-07-23 PR-2073 triage and seen again in the 2026-07-24 run, so it is not a flake.
 The CI step that scrapes system tables runs `clickhouse-local` against the same data directory as the
@@ -1178,21 +1490,33 @@ read-only for the post-run scrape") is already in the SHA that still failed on 2
 read-only" has been tried at the call site and was not sufficient — find out why before repeating it;
 that is evidence for contract (a) or (b) over (c).
 
-- [ ] **Step 1: Reproduce locally** — start the soak stand, then run the same `clickhouse-local`
+- [ ] ~~**Step 1: Reproduce locally**~~ — **NOT DONE and no longer applicable** (the stand was torn
+  down, and the question was settled by reading the call site: the scrape runs against a STOPPED
+  server). ~~start the soak stand, then run the same `clickhouse-local`
   scrape against its data dir and capture the exact failure. Without a local repro this task is
-  guesswork.
+  guesswork.~~
 - [ ] **Step 2: Pick the contract** (a)/(b)/(c) and write it into
   `docs/superpowers/cas/` where the disk-lifecycle rules live, with the operator case named.
+  **PARTIAL:** the analysis exists (`c6a6c909be4`) and recommends (a) in a fourth shape, but it was
+  deliberately "not committed as a decision". The user then reframed the question entirely (Q2), which
+  superseded the note as a recommendation while leaving its verified facts standing. **No contract was
+  chosen; this step is still open, now under BACKLOG {#operator-uuid-recovery}.**
 - [ ] **Step 3: Implement, with a test that a read-only open of a LIVE pool succeeds and takes no
   ownership** — assert the live server's mount object is untouched (same holder, same epoch) after
-  the tool exits.
-- [ ] **Step 4: Verify the CI scrape step passes against a running CA server; Step 5: Commit.**
+  the tool exits. **NOT DONE.** Its successor, if the force-claim reading wins, is the follow-ups
+  plan's Tasks 10-12; if the read-only reading wins, it is the "separate, unimplemented" read-only
+  mount the user named. That choice is unmade.
+- [ ] ~~**Step 4: Verify the CI scrape step passes against a running CA server; Step 5: Commit.**~~
+  **DONE differently, and the premise was wrong:** the scrape runs against a STOPPED server. Fixed by
+  `d99a7df4540` + `8aea3a0dedc` with no product change.
 
 Subject: `ca: read-only pool access for tools — stop the system-table scrape claiming a live mount`
 
 ---
 
 ## Task 20 (DEFERRED — different scope, not this round): ca-soak scenario S43 — thread-allocation fault injection
+
+**STATUS: DEFERRED by the user** (`6b547a5c220`). Not started, and not part of this round.
 
 Split out of S42 (Task 17): `cannot_allocate_thread_fault_injection_probability` is a different fault
 class from `memory_tracker_fault_probability`, and running both in one card would make any finding
@@ -1268,9 +1592,40 @@ exposed through `ICaPreparedRelink` (Task 14, abstract) for the same reason.
 rewrote hours ago (stage1). Rebase-free discipline means implementing from the landed head and
 re-reading the function before each edit.
 
+**This self-review predates Tasks 18-25 and is not a map of the plan as it stands.** Tasks 18-21 were
+added during execution, and Tasks 22-25 ({#partb-review-created-work}) came out of the Task 20b review.
+Two entries above are also superseded by what execution found: §confirm-primitive gate 0 → Task 11
+records a coverage handoff that was never completed (now Task 22), and §testing's integration list →
+Task 16 was written around a proof that does not prove anything (see Task 16's corrections block).
+
 ---
 
 ## Task 20b: CODEX REVIEW OF ALL OF PART B — mandatory gate before the soak (user instruction, 2026-07-25) {#partb-codex-review}
+
+**STATUS: DONE.** Ran gpt-5.6-sol at xhigh over the combined 23-file diff, read as one protocol
+(`tmp/partb-review/`, log `tmp/partb-review/codex_review.log`). Verdict: DO NOT MERGE AS-IS — two
+blockers, two majors, recorded with evidence in BACKLOG {#partb-review-findings} (`ba45217f307`).
+
+Outcome, in order:
+- **Blocker 1 was DOWNGRADED, not fixed** (`006cab3bdf7`, BACKLOG {#partb-review-blocker1-downgraded}).
+  The user challenged the framing and was right: `confirmExactRef` reads the same `RefTableRuntime` and
+  recovered state that `resolveRef` serves ordinary reads from, so it INHERITS the mount's trust rather
+  than creating a new assumption. The reviewer stated a true fact and attributed it to the wrong
+  component; the controller had accepted that without checking the boundary. What survives is smaller:
+  the confirm gives a stale LOCAL view a REMOTE consequence — amplification, not a new root cause. It
+  is the known {#list-as-journal-dataloss-2026-07-25} finding through one more lens.
+- **Blocker 2, major 3 and major 4 are FIXED** (`8e6fe6ef0af`, gate 1373/1373 with five new tests each
+  seen red first; integration 11/11), and closed in BACKLOG {#partb-review-resolved} (`93eda876ddd`).
+- **TWO of the review's four prescribed remedies were WRONG**, both caught by the implementer, and the
+  controller had forwarded the first verbatim into the fix instructions. (1) "Queue the exact removal
+  (it is idempotent)" is false — `RefTableState::applyOwnerTransition`'s `RemovePrecommit` arm throws
+  `CORRUPTED_DATA` on an absent binding, so following it literally would have made every `abandon` of
+  an uncertain build fail FOREVER, destructor retries included: a leak turned into a permanent wedge.
+  (2) Major 3's stated chain does not hold — an allocation failure raises `MEMORY_LIMIT_EXCEEDED`,
+  which is neither `ABORTED` nor `NETWORK_ERROR` and so propagates rather than becoming a fallback, and
+  `abandon` appends a PRECOMMIT removal, which cannot undo a committed ref. The defect was real; its
+  mechanism was not as described. **Standing lesson: a strong review is evidence, not instruction.**
+- **What the review created rather than corrected is now scheduled as Tasks 22-25** below.
 
 **Runs when Tasks 9-16 are all complete, and BEFORE Task 21's soak.** That order is deliberate: a soak is
 hours of machine time and its failures are expensive to attribute, so it should run on reviewed code, not
@@ -1304,6 +1659,12 @@ whether any branch can lose or double-promote a part; and what is NOT covered by
 ---
 
 ## Task 21: Part B soak gate — 20-minute shakeout first, then 4 hours
+
+**STATUS: NOT STARTED.** Its prerequisites (Tasks 9-16, then 20b and its fixes) are all complete. Note
+that the signals Step 2 collects have grown since this task was written: the sibling follow-ups plan
+adds `CasGcRefScanDisagreements` and `CasGcUnappliedFoldedTxns` (`e01b5cd82be`), and both belong in the
+collector's `IN (...)` list. Whether Tasks 22-25 run before this soak is NOT decided in any source —
+decide it deliberately rather than by execution order.
 
 **Why this task exists.** Task 16's pytest battery proves the confirm protocol FUNCTIONS. It does not
 prove it survives hours of concurrent load with chaos, and Part B rewrites the `tmp-fetch` lifecycle
@@ -1375,5 +1736,159 @@ Same invocation with `--duration 4h`. Gate: `PHASE3 OK`, `dangling == 0` at ever
 `stale_edge == 0` at every checkpoint, zero `WORKLOAD FAILURE`, and the counters recorded.
 
 - [ ] **Step 6: Commit** the harness changes, the run history, and a short results note.
+
+---
+
+# Tasks 22-25: work the Part B codex review CREATED (added 2026-07-26) {#partb-review-created-work}
+
+Task 20b's review produced two kinds of output. The first — findings against code that existed — is
+closed (`8e6fe6ef0af`, BACKLOG {#partb-review-resolved}). The second is work that existed nowhere as a
+task, and prose in a findings section is not a task. These four are that work, sized and placed.
+
+**Ordering relative to Task 21 (the soak) is NOT decided in any source.** Decide it deliberately. The
+argument for going first is Task 20b's own: a soak is hours of machine time whose failures are expensive
+to attribute, and Task 22 and Task 24 are about the difference between coverage and the appearance of
+coverage — which is the failure mode this whole round kept hitting.
+
+**Already covered — do NOT re-create these as tasks.** The review's missing-test list is partly obsolete
+because `8e6fe6ef0af` closed part of it while fixing the defects:
+- `LandedThenLost` during the receiver's `precommitAdd` → `CasRefInstallSafety.UncertainPrecommitKeepsItsCleanupOwnerAndItsBody`
+  and `…UncertainPrecommitThatNeverLandedStillAbandonsCleanly`.
+- `LandedThenLost` during promotion → `CasPartFolderAccess.AnUnresolvedPromoteIsNotReportedAsDefinitelyNotCommitted`.
+- An allocation failure after a durable promote but before the handle is terminal →
+  `CasPartFolderAccess.APostCommitFailureLeavesTheHandleTerminal`.
+- Move assignment with a failing abort → **VOID, not missing.** Move assignment was deleted rather than
+  fixed, and its absence is pinned by `CasPartFolderAccess.PreparedPartWriteIsNotMoveAssignable`.
+
+---
+
+## Task 22: gate 0 has no test at all — complete the handoff the gtest declares
+
+`gtest_cas_confirm_exact_ref.cpp:689` says, in its own comment, that gate 0's cases "belong to the
+Task 16 pytest battery": `Deleting`, absent, other-disk, the `Deleting → Outdated` rollback state, and
+the `MOVE ... TO DISK` same-name-other-disk case. **None of Task 16's eleven integration tests covers
+any of them.** A handoff that is declared and never completed reads exactly like coverage — which is
+worse than an acknowledged gap, because nothing points at it.
+
+Gate 0 is the part filter in `Service::resolveContentAddressedConfirm` (Task 11 Step 3): the part must
+be `Active`/`Outdated` **on the matched instance's disk**. It is the first thing a confirm consults, so
+a wrong answer here is a wrong answer for the whole protocol.
+
+**Files:**
+- Modify: `tests/integration/test_cas_replicated_relink/test.py`
+
+- [ ] **Step 1: Read Task 11 Step 3's implementation and Task 16's corrections block** before writing
+  anything. The relink-proof rule from Task 16 applies unchanged: key every assertion on the receiver's
+  `Relink of part <p> … finished (no bytes transferred).` line, never on a flat blob count.
+- [ ] **Step 2: `Deleting` → the confirm must not authorize.** Drive a source-side part into `Deleting`
+  inside the confirm window (the `cas_relink_receiver_pause_before_confirm` failpoint registered by
+  Task 16 is the existing seam) and assert the receiver does NOT promote.
+- [ ] **Step 3: absent, and other-disk.** A part name the source does not have, and a part the source
+  has on a DIFFERENT disk from the matched instance.
+- [ ] **Step 4: the `Deleting → Outdated` rollback state.** Task 11 Step 1 states the requirement
+  precisely: this state must still be rejected **by gate 1** when the ref is gone. Assert that, not
+  merely that the fetch failed — a test that only observes a failure cannot tell which gate produced it.
+- [ ] **Step 5: `MOVE ... TO DISK` same-name-other-disk** — the case gate 0's "on the matched
+  instance's disk" clause exists for.
+- [ ] **Step 6: Run and commit.** `python3 -m ci.praktika run "integration" --test test_cas_replicated_relink`
+
+Subject: `ca: integration coverage for the relink confirm's gate-0 part filter`
+
+---
+
+## Task 23: the review's missing tests that are still genuinely missing
+
+Only the uncovered subset — the covered ones are listed under {#partb-review-created-work} above and
+must not be re-created. Each item below states what it proves, because "add a test for X" is how a test
+that proves nothing gets written.
+
+**Files:**
+- Modify: `src/Disks/tests/gtest_cas_confirm_exact_ref.cpp`,
+  `src/Disks/tests/gtest_cas_part_folder_access.cpp`,
+  `tests/integration/test_cas_replicated_relink/test.py`
+
+- [ ] **Step 1: a recovery that omitted one `LIST` record, then `confirmExactRef`.** The downgraded
+  blocker 1 ({#partb-review-blocker1-downgraded}) says the confirm INHERITS the mount's trust rather
+  than creating a new assumption — that is an argument, and this is the test that makes it checkable.
+  Recovery publishes `recovered = true` from a paginated listing with no completeness proof; assert what
+  the confirm actually answers when that listing was short by one durable removal. **Whatever it
+  answers, record it as the pinned behaviour** — this test's job is to make the amplification property
+  visible, not to assert a fix that was deliberately not made. The sibling follow-ups plan's
+  `HoleyListBackend` (`src/Disks/tests/gtest_cas_holey_list_detector.cpp`, `e01b5cd82be`) is the
+  injection tool; do not write a second one.
+- [ ] **Step 2: `LandedThenLost` during the ABORT's own removal append.** The precommitAdd and promotion
+  halves are covered; the abort half is not. It matters because `abandon` is deliberately retryable
+  after an append failure and the destructor retries it — so an ambiguous removal append must not strand
+  the cleanup owner or double-remove.
+- [ ] **Step 3: zero and multiple routing matches.** Task 11 Step 3 requires "zero or more than one
+  match → `Unknown`". `OwnsNamespaceSelectsTheMountByServerRootInEveryLifecycleState` covers
+  `ownsNamespace` itself, not the `Service`-side resolution's zero/multiple branch. Two CA disks whose
+  instances both claim the namespace is the case that must answer `Unknown`, not pick one.
+- [ ] **Step 4: source remount (or recovery) between the offer and the confirm.**
+  `CasConfirmExactRef.LostMountFenceIsUnknown` covers a fence-lost mount at the ledger level; the
+  end-to-end offer → remount → confirm sequence is not covered anywhere.
+- [ ] **Step 5: confirm transport failure and an ABSENT answer at HTTP level.** The wire is binary — only
+  `yes` authorizes, and an absent cookie must read as `unproven` (Task 13's corrections). That is a
+  fail-closed claim about a peer's behaviour and nothing currently exercises it over HTTP.
+- [ ] **Step 6: Run the gate + the integration battery; commit.**
+
+Subject: `ca: close the Part B review's remaining test gaps`
+
+---
+
+## Task 24: `test_replicated_fetch_by_relink` is green for the wrong reason
+
+`tests/integration/test_cas_replicated_relink/test.py:255` still proves a relink ONLY by a flat
+`count_blobs()` delta. That is exactly the defect Task 16 found in this plan's own text and fixed for
+the seven tests it wrote — and it left the older test standing. **A byte fetch onto a
+content-addressed disk writes the same content, deduplicates, and produces the same flat count**, so
+this test passes whether or not relink ran. It is the oldest relink test in the file, which makes it the
+one most likely to be trusted.
+
+**Files:**
+- Modify: `tests/integration/test_cas_replicated_relink/test.py`
+
+- [ ] **Step 1: Re-key the assertion** on the receiver's `Relink of part <p> … finished (no bytes
+  transferred).` log line, reachable only after a confirm `yes` and a `Committed` promote. Keep the blob
+  count as corroboration, converted to a KEY-SET delta — the fixture runs `gc_interval_sec = 1`, so a
+  total count can fall mid-test (Task 16's corrections).
+- [ ] **Step 2: Prove the new assertion can FAIL.** Force the byte path once (the existing
+  `cas_relink_receiver_force_mechanism_failure` failpoint) and confirm the test goes red. Without this
+  the fix is unverified in exactly the way the original was.
+- [ ] **Step 3: Sweep the file for any other flat-count proof** and re-key it the same way; state
+  explicitly if there are none left.
+- [ ] **Step 4: Run and commit.**
+
+Subject: `ca: the oldest relink test proved nothing — re-key it on the relink log line`
+
+---
+
+## Task 25: close the residual post-commit window (`eraseView`, `publishStaging::out_slot`)
+
+Flagged-not-fixed by the Part B review fix and recorded at BACKLOG {#partb-review-resolved}. Part A's
+rule is "nothing may throw after a durable commit before the commit is recorded", and `8e6fe6ef0af`
+applied it one frame in. Two sites still sit OUTSIDE that frame:
+- `eraseView` runs after the durable commit and can throw;
+- `ContentAddressedTransaction::publishStaging`'s `out_slot` is assigned only after `promoteBuild`
+  returns, so a throw between the two leaves the slot empty over a committed ref.
+
+Small and pre-existing, and **unnamed by the review** — it was found by the implementer while fixing
+major 3. Closing it means extending the same no-throw-after-commit discipline one frame outward.
+
+**Files:**
+- Modify: `.../Parts/PartFolderAccess.cpp`, `.../ContentAddressedTransaction.cpp`
+- Test: `src/Disks/tests/gtest_cas_part_folder_access.cpp`
+
+- [ ] **Step 1: Read `APostCommitFailureLeavesTheHandleTerminal`** — it is the shape this task extends,
+  and its probe is placed just past the window that was closed. The new probe goes past THIS one.
+- [ ] **Step 2: Write the failing tests** — a throw at `eraseView` after a durable commit, and a throw
+  between `promoteBuild` returning and `out_slot` being assigned. Both must leave the handle terminal
+  and the commit recorded; neither may report the promote as not-committed.
+- [ ] **Step 3: Implement** by moving the fallible work before the commit, or the recording before the
+  fallible work — whichever keeps the allocation-free region genuinely allocation-free. Do NOT widen
+  `DENY_ALLOCATIONS_IN_SCOPE` over an operation that can legitimately allocate.
+- [ ] **Step 4: Run the gate; Step 5: Commit.**
+
+Subject: `ca: extend the no-throw-after-commit discipline over eraseView and publishStaging`
 
 ---
