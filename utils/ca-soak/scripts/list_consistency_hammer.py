@@ -76,10 +76,13 @@ def main():
                          "where store implementations differ. An add-only run exercises the wrong regime.")
     ap.add_argument("--delete-batch", type=int, default=50)
     ap.add_argument("--max-keys", type=int, default=0,
-                    help="cap the live key population; writers idle at the cap. 0 = unbounded. NOT "
-                         "optional in practice: with unbounded writers the prefix grows all run, every "
-                         "listing is bigger and slower than the last, and the run degrades quadratically. "
-                         "The first real run reached 888k keys / 888 pages and had to be killed.")
+                    help="TARGET live key population, held from BOTH sides: writers idle at or above it, "
+                         "deleters idle below its lower band. 0 = unbounded. Neither half is optional. "
+                         "Unbounded writers made the first run grow to 888k keys / 888 pages before it had "
+                         "to be killed; unthrottled deleters then emptied the SECOND run from 150k to one "
+                         "key by round 31, because 3 deleters at 200 keys per batch outrun 4 writers doing "
+                         "single PUTs by an order of magnitude. A run whose rounds list single digits "
+                         "measures nothing.")
     ap.add_argument("--page-size", type=int, default=1000, help="matches the CAS listing page size")
     ap.add_argument("--keep", action="store_true", help="do not delete the probe prefix afterwards")
     a = ap.parse_args()
@@ -135,9 +138,14 @@ def main():
         hole rule honest: a key still in the snapshot is one whose deletion had not even been requested
         when the listing began, so its absence cannot be excused as a race with this thread.
         """
+        # Lower band of the target population. Deleting below it starves the listings; see --max-keys.
+        floor_pop = int(a.max_keys * 0.9) if a.max_keys else 0
         while not stop.is_set():
             with dlock:
-                victims = sorted(durable)[:a.delete_batch]
+                if floor_pop and len(durable) <= floor_pop:
+                    victims = []
+                else:
+                    victims = sorted(durable)[:a.delete_batch]
                 for v in victims:
                     durable.discard(v)
                 # Raise the deletion floor BEFORE the DELETE is issued. Deletion is monotone from the
