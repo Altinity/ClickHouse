@@ -34,6 +34,93 @@ valuable, not committed; **DOC** = documentation debt; **TEST/INFRA** = validati
 > event-name review, and several B10 minor findings (`~Build` noexcept, `inDegreeInGeneration`,
 > redundant watermark GET, signed-in-degree accumulation) also verified closed. See §Recently closed.
 
+
+> **What just closed (2026-07-26, the publish-confirm + introspection round).** DONE at HEAD and not
+> carried forward: **Part A** — ref-lane exception safety, tasks 1-8 (uncertain-`precommitAdd` intent
+> recorded before the append, `PreparedPartWrite` move-only handle, `confirmExactRef` with the try-lock
+> that removed a pool-wide append stall). **Part B** — the fetch-handoff publish-confirm protocol,
+> tasks 9-16, protocol v11, plus its codex review and the four findings that review produced
+> (`8e6fe6ef0af`; two of the reviewer's four remedies were WRONG and were not applied — see
+> {#partb-review-resolved}). **Introspection I1-I4** — `stale_edge` fsck class, unmatched-remove-delta
+> counter, DEFER rounds no longer logging as "round 0", `ca-inspect` decoding source-edge runs.
+> **`CasRefAppendPreAttemptRefused`** counter. **The harness anti-vacuity sweep** — every soak assert
+> can now go red, and signal reads are separated from zeros. **Per-phase GC log rows** (Q5 option (c),
+> 18 phases/round). **The skipped-transaction detector** (option C, probes A/B1/B2). **The CI marker-based
+> CA-disk fix.** **The third gate-filter gap.** **Soak gate** — 3x 20-min green plus a 4h chaos run:
+> 0 failures, 40 checkpoints, 529 signal reads, 72 real `stale_edge` evaluations, 1,673 round attempts.
+>
+> **What did NOT close and is the material of the next round** (GC performance + blobs that never get
+> reclaimed): the LIST-as-journal deletion hole {#list-as-journal-dataloss-2026-07-25} (release blocker,
+> mechanised in TLA+, detector built but the defect not yet caught by it); the unmatched-minus-one
+> retention leak {#unmatched-minus-one-retention-leak} (ROOT-CAUSED, fix NOT landed); the GC bottleneck
+> study {#gc-bottleneck-study-2026-07-25} (deliverable 1 shipped; the rig and the controlled measurements
+> are not built); probe A's 14 firings (next step named: lease identity at each end of the enumeration);
+> S42 at scale; the four instrumentation-review recommendations; `ca-fsck` never printing `corrupted_runs`;
+> the fsck 180 s flat budget; force-claim tasks 10-12; the residual `eraseView` post-commit window.
+
+---
+
+## NEXT ROUND (opened 2026-07-26): GC performance, and blobs that never get reclaimed {#round-gc-perf-and-stuck-blobs}
+
+Two themes, chosen by the user. They are listed together because the evidence says they are the same
+system seen from two ends: a GC that cannot keep up leaves work undone, and work left undone is what an
+operator sees as blobs that never go away.
+
+**A terminology note, stated because it matters for what we go looking for.** In `ca-fsck` vocabulary
+`dangling` means *referenced but MISSING* — that is the data-loss class, and it has been **zero in every
+run to date**. The class that actually gets stuck is `unreachable`/`awaiting-gc`: present, unreferenced,
+and never reclaimed. Where this round says "stuck blobs" it means the second. If a true `dangling` ever
+appears, that is not a performance topic — it is INV-NO-LOSS and it stops everything.
+
+### Known, root-caused, not yet fixed {#round-gc-known}
+
+- **The unmatched-minus-one retention leak** — {#unmatched-minus-one-retention-leak}. 56 blobs, each
+  holding exactly one residual source edge whose manifest no longer exists, all traced to 4 `tmp-fetch_*`
+  refs published and dropped inside a 43 ms window (4 of 48,791 such refs). Root cause is measured, not
+  inferred. The fix is NOT landed, and the obvious remedy — queue the exact removal — is WRONG:
+  `RefTableState` throws `CORRUPTED_DATA` on an absent binding, which would convert a leak into a
+  permanent wedge. A correct fix has to reconcile the in-degree, not re-issue the delete.
+- **`ca-fsck` never prints `corrupted_runs`** — {#fsck-corrupted-runs-invisible}. One-line product fix;
+  `clean()` requires the value zero and no operator can see it.
+- **The fsck 180 s flat budget** — times out once the ref space is large, so the check that would find
+  stuck blobs is the check that stops running exactly when the pool gets big enough to have them.
+
+### Performance: what is measured, and the two open questions {#round-gc-perf}
+
+Measured so far, from 1,673 rounds of phase data — {#gc-perf-first-measurement} and its same-day
+correction {#gc-perf-gets-per-log}:
+
+- `fold_ref_intake` dominates and is LINEAR in the ref-log backlog: **256 logs/s** sustained.
+- The flat cost is **per REQUEST (~0.92 ms)**, not per log. Requests per log run **2.5 to 4.7 and climb
+  with backlog size** — a multiplier of about four that nobody has examined.
+- `orphan_sweep` has the worst MEDIAN (383 ms/round) — a constant tax, a different shape from intake's
+  five-orders-of-magnitude tail.
+- `lease` is free (2 ms p50 across 2,255 rounds); nobody should optimise it.
+
+Open question 1 — **where does the 4x multiplier come from?** `foldManifestEdges` GETs a manifest body
+per edge and the same body can be re-read across logs within a round with no cache between.
+`CasRefManifestBodyFoldGets` is already on every phase row, so this is a QUERY, not an experiment.
+
+Open question 2 — **is 256 logs/s enough, and for what arrival rate?** The CI collapse was a queue
+crossing: service rate below arrival rate, each round longer than the last. That needs the reproduction
+rig ({#gc-bottleneck-study-2026-07-25} deliverable 2), which does not exist, plus a chaos-free run so the
+tails are work rather than frozen processes.
+
+### The release blocker that rides along {#round-gc-blocker}
+
+{#list-as-journal-dataloss-2026-07-25} — GC advances its fold cursor over records a paginated LIST merely
+OBSERVED, with no completeness proof. Mechanised in TLA+. The detector shipped this round (probe A) and
+has FIRED 14 times, but has not yet been shown to be catching the real thing rather than concurrent
+deletion between the two enumerations. Next step is named and small: record the lease identity at each end
+of the enumeration. This is a GC-correctness item, not a performance one, but it lives in the same code
+and the same round.
+
+### Do NOT start with {#round-gc-not-first}
+
+Force-claim (follow-ups tasks 10-12) — its CI motivation evaporated when the one-line CI fix landed
+({#operator-uuid-recovery}). Stage 2 concurrent `commitPart` — postponed by user decision. Neither is in
+this round unless something new argues for it.
+
 ---
 
 ## 1. Ref protocol — rev.6 lease-boundary exclusivity (highest-priority open design) {#ref-protocol}
@@ -1019,7 +1106,7 @@ budget is unsafe by construction: an omitted `+1` edge must suppress deletion, n
 bounded-round design has to carry durable progress state, which is why it needs a spec rather than a
 patch.
 
-## fsck vs GC disagree persistently about the same unreferenced blobs (found 2026-07-25, soak v3) {#fsck-gc-indegree-disagreement-2026-07-25}
+## ROOT-CAUSED 2026-07-25, FIX OPEN: fsck vs GC disagree persistently about the same unreferenced blobs (soak v3) {#fsck-gc-indegree-disagreement-2026-07-25}
 
 **LIVE REPRODUCTION EXISTS** on the ca-soak stand as left after soak v3 — do not `down -v` it without
 capturing more. Artifacts: `tmp/f6-unreachable/{fsck_detail.txt,the_56_keys.txt,drain_watch.txt}`.
@@ -1272,7 +1359,7 @@ NOT ESTABLISHED: whether the prune raced the adopt, whether `snap_pruned_through
 or whether the parent-seal capture missed the carry. Needs the same treatment as the other GC findings: a
 targeted test, not log archaeology. Note the stand is still up.
 
-## THIRD gtest gate-filter gap: parameterized `*/CasBackendContract` suites match neither `Cas*` nor `CA*` (found 2026-07-25) {#gate-filter-gap-3-backend-contract}
+## FIXED 2026-07-25 (`ca5a6b7bee8`): THIRD gtest gate-filter gap — parameterized `*/CasBackendContract` suites match neither `Cas*` nor `CA*` {#gate-filter-gap-3-backend-contract}
 
 Found by ENUMERATING the binary's suites instead of trusting the documented filter — which is the only
 method that works here, two previous gaps having been found the hard way (see
@@ -1345,7 +1432,7 @@ evidence, that has to be enforced (a lock file the cards honour, or a separate c
 merely written in a log — the same "a note is not a mechanism" failure as the harness whitelists found
 today.
 
-### DECISION 2026-07-25 (user): option C — catch it by the tail first, because the diagnosis is NOT confirmed {#list-as-journal-decision-c}
+### DECISION 2026-07-25 (user), DETECTOR SHIPPED 2026-07-26: option C — catch it by the tail first, because the diagnosis is NOT confirmed {#list-as-journal-decision-c}
 
 Chosen over containment (disable destructive GC now) and over going straight to the journal chain.
 Reasoning recorded because the reasoning is the load-bearing part:
@@ -1427,7 +1514,7 @@ targeted counters stay REPORTED, not gating. Keep an anti-vacuity guard on the G
 in which no allocation fault occurred at all still cannot read as green — that part of the discipline
 survives; it is only the window-specific targeting that is dropped.
 
-### Q5 — option (c): introspection now, study later {#q5-gc-introspection-now}
+### DONE 2026-07-26 — Q5 option (c): introspection now, study later {#q5-gc-introspection-now}
 
 Do the introspection NOW. Shape specified by the user: **each GC phase emits its own ROW in
 `system.content_addressed_garbage_collection_log`**, carrying all the metrics that matter for that phase —
