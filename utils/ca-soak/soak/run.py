@@ -498,6 +498,20 @@ class Driver:
         self.last_op = op
 
 
+
+def _stale_edge_display(fsck_result: dict) -> str:
+    """Render `stale_edge` for a summary line WITHOUT letting "not checked" read as "checked, nothing".
+
+    A checkpoint that skipped its fsck asserts (a timed-out entry gate, B146/B154) still prints this line,
+    and `f.get('stale_edge')` is then `None`. Printed raw, that is indistinguishable from a check that ran
+    and found nothing — which is the reporting-degrades-to-absence shape this project has now hit five
+    separate times (BACKLOG {#gc-observation-vacuous-2026-07-25} and the entries it references). Say
+    `not-checked` instead, so a reader of the run log can tell the two apart.
+    """
+    value = fsck_result.get("stale_edge")
+    return "not-checked" if value is None else str(value)
+
+
 def checkpoint(driver, cluster, model, phase, *, strict_unreachable=False):
     """Pause workers (drain), quiesce, assert both replicas == model, drive GC to fixpoint, assert a
     clean CA pool. Raises CheckpointFailure on any divergence.
@@ -1461,7 +1475,7 @@ def run_phase3(args):
             checkpoint_active.clear()
         log(f"{label} OK: now={now} count={exp['count']} fsck reachable={f.get('reachable')} "
             f"unreachable={f.get('unreachable')} (M-F debris, B140) dangling={f.get('dangling')} "
-            f"stale_edge={f.get('stale_edge')} dryrun_count={dr.get('count')}")
+            f"stale_edge={_stale_edge_display(f)} dryrun_count={dr.get('count')}")
         # Record a checkpoint-tagged metrics tick carrying the fsck result (§2: include fsck at checkpoints).
         checkpoint_ts = int(time.time())
         ticker.tick_once(checkpoint_ts, fsck=f)
@@ -1813,7 +1827,7 @@ def main(argv=None):
             checkpoint_active.clear()
         log(f"{label} OK: now={now} count={exp['count']} "
             f"fsck reachable={f.get('reachable')} unreachable={f.get('unreachable')} "
-            f"(M-F debris, B140) dangling={f.get('dangling')} stale_edge={f.get('stale_edge')} "
+            f"(M-F debris, B140) dangling={f.get('dangling')} stale_edge={_stale_edge_display(f)} "
             f"dryrun_count={dr.get('count')}")
         checkpoint_ts = int(time.time())
         capture_checkpoint_signals(cluster, label, tracker=signal_tracker)
