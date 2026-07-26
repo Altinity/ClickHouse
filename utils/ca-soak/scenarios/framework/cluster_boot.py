@@ -177,6 +177,45 @@ def archive_server_logs(tag, node_count=2, log_fn=print):
                 log_fn(f"archive_server_logs {d}: {e}")
 
 
+def check_host_headroom(log_fn=print, *, min_disk_gb=80, min_free_ram_gb=8) -> list:
+    """Report host resources a scenario is about to consume, and RETURN the concerns rather than raising.
+
+    Written after S42 at `--scale full` had to be killed 12 minutes in: it consumed ~21 GB/minute and was
+    on course to need ~380 GB against 218 GB free. Nothing warned, because the scenario runner has no
+    pool-size cap of its own (`--max-pool-gb` belongs to the soak driver, not here).
+
+    Memory is checked for a DIFFERENT reason than disk, and the difference matters. Low disk breaks the
+    machine. Low free RAM breaks the EXPERIMENT: an allocation-fault scenario (S42) cannot distinguish a
+    real host OOM kill from its own injected fault, so a run started without memory headroom produces a
+    verdict that means nothing whichever colour it comes out.
+
+    Returns a list of human-readable concerns (empty when clear). Deliberately non-fatal: the operator may
+    have reason to proceed, and a hard stop in shared tooling is how people learn to bypass it.
+    """
+    import shutil
+    concerns = []
+    free_gb = shutil.disk_usage("/").free / (1 << 30)
+    log_fn(f"host headroom: disk {free_gb:.0f} GB free")
+    if free_gb < min_disk_gb:
+        concerns.append(f"disk {free_gb:.0f} GB free is under the {min_disk_gb} GB floor")
+
+    try:
+        with open("/proc/meminfo") as fh:
+            meminfo = {k.strip(): v for k, v in (l.split(":", 1) for l in fh)}
+        avail_gb = int(meminfo["MemAvailable"].split()[0]) / (1 << 20)
+        log_fn(f"host headroom: RAM {avail_gb:.0f} GB available")
+        if avail_gb < min_free_ram_gb:
+            concerns.append(
+                f"RAM {avail_gb:.0f} GB available is under the {min_free_ram_gb} GB floor — for an "
+                f"allocation-fault scenario this invalidates the run rather than merely risking it")
+    except (OSError, KeyError, ValueError) as e:
+        concerns.append(f"could not read /proc/meminfo ({e}) — memory headroom UNKNOWN, not assumed fine")
+
+    for c in concerns:
+        log_fn(f"host headroom WARNING: {c}")
+    return concerns
+
+
 def reset_cluster(variant=None, *, archive_tag=None, log_fn=print, timeout_s=300, overrides=None) -> bool:
     """Hard reset to a fresh pool: down -v (current + variant), then up -d the chosen variant, then
     wait for ALL replicas healthy. Returns True iff healthy after bring-up. The 10-replica variant
