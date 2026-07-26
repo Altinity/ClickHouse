@@ -948,3 +948,13 @@ surfaced but never tracked — the round-scoped manifest cache (#22, the measure
 LIST-consistency mount probe (#23, a standing backlog GATE that today's proof promoted from prudent to
 necessary). Awaiting a decision on whether to start the fix design or finish the measurement work
 (#22 → #10) first so the fix is designed against known numbers.
+
+**20:26 UTC watchdog** — idle: nothing running, 323G, load 0.11, 0 uncommitted, 39 local commits. No long
+run, no signals to observe.
+
+Open point from the user, not yet acted on: the task list mixes tests, fixes and chores, and reads as a
+plan of work rather than a plan of INVESTIGATION. Of the 8 open items only six things are genuinely tests
+or research — the `-1`-before-`+1` path (the one live signal with no known mechanism), S42 at scale, the
+Part B test debt, a chaos-free bottleneck rig, verifying the 39.6% manifest redundancy on a large fold
+window, and whether AWS S3 shows the incompleteness at all. Offered to re-split the tasks so the two are
+separable; awaiting a decision on that and on fix-design-now versus measure-first.
