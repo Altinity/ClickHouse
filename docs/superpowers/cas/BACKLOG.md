@@ -2591,3 +2591,34 @@ while the previous log is being applied. The ordering constraint is on the fold,
 
 **Combining the two levers is multiplicative**: dropping the 39.6% redundant edge fetches first shrinks the
 request count, then parallelism divides what remains.
+
+### S42 at `--scale full` does NOT FIT on this machine — a finding, not just an incident {#s42-full-scale-too-big}
+
+Launched S42 at `--scale full` (8 writers, 4 readers, 1800 s leg-A workload). Watchdog caught it 12 minutes
+in on a disk trajectory, not a hang:
+
+```
+disk free  323G -> 223G in ~30 min, then 225G -> 218G in 20 SECONDS
+rate       ~21 GB/minute
+remaining  18 min of leg A still to run  =>  ~380 GB needed
+available  218 GB, and the alert floor is 60 GB
+load average 70.5, free memory 2 GB
+```
+
+Stopped deliberately before it broke the machine. Disk stabilised at 218 GB the moment it died, confirming
+S42 was the consumer.
+
+**Three things this is worth recording for:**
+
+1. **`--scale full` is not runnable on this host.** Any future attempt needs either a disk budget of ~400 GB
+   free or a smaller scale. The scenario has no pool-size cap parameter of its own (`--max-pool-gb` exists
+   on the soak driver, not on the scenario runner), so nothing stops it.
+2. **A memory-fault test run with 2 GB free RAM is compromised anyway.** S42 injects allocation failures via
+   `memory_tracker_fault_probability`; if the host is itself near exhaustion, real OOM kills become
+   indistinguishable from injected faults and the attribution the card is built for is destroyed. The run
+   needed headroom it did not have.
+3. **Load average 70** on a 2-replica scenario suggests the full-scale writer/reader counts are tuned for a
+   bigger machine than this one.
+
+**Next attempt must be at `--scale ci`,** with disk headroom checked BEFORE launch and memory headroom
+checked as a precondition of the fault injection being meaningful.
