@@ -2521,3 +2521,73 @@ returning a third written 2.2 ms after them.** {#list-as-journal-dataloss-2026-0
 The same three keys were `Delete`d at `16:53:59` — six minutes later. Probe A aborted folding, the cursor
 did not advance, a later round enumerated completely and folded them, and GC then reclaimed them normally.
 **No leak resulted from this occurrence**, which is the behaviour the detector exists to produce.
+
+## GC round duration: the answer is SERIAL REQUEST LATENCY, measured (2026-07-26 night) {#gc-round-duration-answered}
+
+The user's three hypotheses for why a round takes tens of minutes — repeated work, unnecessary work,
+serial-where-parallel-is-possible — tested against the recorded data. **The third dominates and the other
+two are secondary**, with one of them refuted outright.
+
+### The decisive arithmetic {#duration-arithmetic}
+
+Requests per intake phase = `log GETs + edge GETs + edge HEADs`. Time divided by TOTAL requests (my earlier
+0.9 ms figure divided by GETs only and ignored the HEADs, which inflated it):
+
+| logs | secs | GETs | HEADs | requests | ms/request |
+|---:|---:|---:|---:|---:|---:|
+| 5,672 | 28.6 | 14,706 | 9,034 | 23,740 | 1.205 |
+| 16,421 | 116.0 | 52,055 | 35,634 | 87,689 | 1.323 |
+| 96,167 | 260.2 | 328,157 | 231,990 | 560,147 | **0.465** |
+| 123,057 | 245.3 | 313,128 | 190,071 | 503,199 | **0.487** |
+| 132,618 | 507.0 | 611,216 | 478,598 | 1,089,814 | **0.465** |
+| 404,065 | 1,829.6 | 1,912,078 | 1,508,013 | 3,420,091 | **0.535** |
+
+**The four large rounds agree within 1.15x at ~0.5 ms per request.** For the rounds that actually take
+minutes, phase time is 100% accounted for by serial round-trip latency: **there is no CPU term and no lock
+term to find.** The two small rounds sit at 1.2-1.3 ms and are not trusted — all this data comes from chaos
+runs, and at that size a single freeze dominates.
+
+The 30-minute round was **3.42 MILLION serial round trips**. Nothing is slow; there are simply that many,
+one after another.
+
+### Confirmed serial from source, and the code says so itself {#duration-serial}
+
+A plain `for (auto & [ns_str, listing] : ref_tables)` with a synchronous GET per log and per edge. No
+prefetch, no batching, no thread pool. GC's own comment: "one GET per new ref log plus one HEAD+GET per
+manifest edge, which on a busy pool is where the round's object-read budget goes." (`meta_pool` exists but
+is for async/advisory delete-side ops, not intake reads.)
+
+### Hypothesis 1, repeated work: REAL but secondary {#duration-repeated}
+
+- **Manifest bodies: 39.6% of edge fetches are re-reads** ({#gc-manifest-reuse-measured}). On the 404k
+  round that is ~597k redundant edges x 2 trips x 0.5 ms = **~600 s of the 1830 s**. Substantial, and a
+  round-scoped cache removes it without touching the protocol.
+- **Fold seal: REFUTED as a cost.** The product already counts it: 26 seal reads with 13 redundant across
+  all rounds on the stand — 50% redundant by COUNT, but 2 reads per round at 1-3.5 ms. It is noise. The
+  standing backlog suspicion that "the fold seal is read five times per round" does not survive contact
+  with the counter.
+
+### Hypothesis 2, unnecessary work: only the HEAD, and it is off-limits {#duration-unnecessary}
+
+Every edge costs a HEAD before its GET — **1.5 M of the 3.42 M trips on the big round, i.e. 44% of them,
+~800 s**. That is the single largest identifiable block. It is a protocol step under a standing user veto,
+so it is recorded as a measured cost and NOT proposed for removal. Everything else is irreducible: the log
+body must be read to know the transaction, and the manifest body must be read to know the blob list.
+
+### Hypothesis 3, serialism: THE ANSWER {#duration-serial-answer}
+
+At ~0.5 ms per trip and 3.42 M trips, parallel fetching alone gives:
+
+| concurrency | intake floor on the 404k round |
+|---|---|
+| 1 (today) | 1830 s |
+| 4 | ~460 s |
+| 8 | ~230 s |
+| 16 | ~115 s |
+
+Fetching is independent even though APPLICATION order is not: tables fold independently by design (a clamp
+on one does not stop others), and within a table the log bodies for ids above the cursor can be prefetched
+while the previous log is being applied. The ordering constraint is on the fold, not on the read.
+
+**Combining the two levers is multiplicative**: dropping the 39.6% redundant edge fetches first shrinks the
+request count, then parallelism divides what remains.
