@@ -892,3 +892,20 @@ occurrence (three orders above the next phase), and probe A being `reported-not-
 green with confirmed enumeration holes.
 
 29 local commits, unpushed per instruction.
+
+## 2026-07-26 17:56 UTC — watchdog: idle; proof captured off the stand
+
+Idle: nothing running. 323G disk, load 0.40, containers healthy, the 2 `gc_anomaly` rows still on ch1. No
+long run, so the signal-observation duty does not apply this cycle.
+
+Did the one thing that was actually urgent: **the proof lived only on a stand that will be torn down**, and
+this project has already lost a live reproduction that way ({#leak-repro-lost}). Captured to
+`docs/superpowers/reports/2026-07-26-list-incompleteness-proof/` — the two audit rows, the
+`blob_storage_log` writes/deletes for the three keys, and the 65,263-upload ordering measurement, with a
+README carrying the argument and its limits.
+
+Stated in that README rather than buried: `blob_storage_log` logs object writes, **not LIST calls**. The
+timing is bounded and the conclusion holds, but the store-side mechanism — dropped page, mishandled
+boundary, something else — is still unknown. And it is RustFS, not S3.
+
+31 local commits, unpushed.
