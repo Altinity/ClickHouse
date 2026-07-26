@@ -72,3 +72,20 @@ Gate at the stop: 1382/1382 unit, 11/11 integration.
 - 01:56 UTC — watchdog: 20-min shakeout healthy at t+980s (STAGE chaos), **0 failures**, and the thing
   worth recording — `signals=2/2 nodes` on all 35 metric ticks so far. The counters are being READ on both
   nodes every tick, so this run is not blind. Disk 327G, load 2.2. Codex instrumentation review FINISHED.
+- 02:26 UTC — **20-minute shakeout #1 GREEN**: `PHASE3 OK`, `SOAK_EXIT=0`, 0 workload/checkpoint failures.
+  The instrumentation worked on its first outing, which is the point of the run:
+  - **99 successful signal reads, 5 probe gaps** correctly classified as node-down-under-chaos rather than
+    as zeros. All eight counters read on both nodes at every tick (`signals=2/2 nodes`, 44/44 ticks). All
+    peaked at 0 — reported, not gated.
+  - **GC phases captured at 7/8 checkpoints, 195 round attempts observed.**
+  FIRST REAL LOAD DATA, and it points somewhere specific: worst single occurrence per phase is
+  `fold_ref_intake = 196.6 s`, then `pending_deletes = 107.2 s`, `manifest_deletes = 91.3 s`,
+  `fold_reduce = 66.6 s`. Everything else is under 5 s. Per-phase totals are ~equal to those worsts, so each
+  is ONE outlier occurrence, not a steady cost.
+  NOT YET ATTRIBUTED, and I am not going to claim it is: chaos pauses rustfs for tens of seconds, and
+  `fold_ref_intake` is GET-bound, so a paused backend plus retry backoff is a live alternative explanation
+  for a single 196 s occurrence. Observed pause durations this session were 14-59 s, so 196 s is not
+  directly explained by one pause — but compounding retries could. Run #2 (seed 2) is running; if it
+  reproduces the same shape, that is worth a targeted look, and the phase rows now make it answerable.
+  Started run #2 — Task 21's stability criterion is two consecutive green runs with every signal observed,
+  and one is not two.
