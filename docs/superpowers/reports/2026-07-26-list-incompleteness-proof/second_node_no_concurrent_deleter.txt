@@ -1,0 +1,4 @@
+ch2 ref-object deletes, all time	0
+ch1 ref deletes in 16:47:00-16:48:00	0
+ch2 ref deletes in 16:47:00-16:48:00	0
+ch2 touches in ch1 namespace, by prefix	cas/manifests	45

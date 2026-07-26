@@ -32,6 +32,25 @@ previous live reproduction of a CAS defect was destroyed by our own smoke runs
 4. Upload order is not an assumption: 65,263 ref-log uploads, **zero out of order** once partitioned by
    epoch.
 
+## The concurrent-deleter branch is excluded too, on the SECOND node {#second-node}
+
+Probe A's own message names two explanations: an inconsistent store, or "a deposed leader is deleting ref
+objects concurrently". The second is now measurably dead for this occurrence — and it needed the OTHER
+node's log to check, which the first pass did not do.
+
+| check | result |
+|---|---|
+| ch2 deletes of ref objects, all time | **0** |
+| ch1 ref deletes during 16:47:00–16:48:00 | **0** |
+| ch2 ref deletes during 16:47:00–16:48:00 | **0** |
+| ch2 touches in ch1's namespace | 45, all under `cas/manifests` — ordinary pool-wide GC |
+
+So at the moment of the disagreement there was no deleter of ref objects anywhere in the cluster. `ch2`
+does operate inside `ch1`'s namespace, which is by design (GC is pool-wide and the lease holder cleans for
+everyone), but it has never removed a ref object.
+
+`second_node_no_concurrent_deleter.txt` holds these counts.
+
 ## What it does NOT show {#limits}
 
 `blob_storage_log` records object writes and deletes, **not LIST calls**. The enumeration requests
