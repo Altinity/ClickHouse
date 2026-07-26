@@ -2139,3 +2139,42 @@ regime. The run that matters adds a DELETER thread removing keys from behind the
 walks. That is the next configuration, and it should have been the first.
 
 Recording the gap before the verdict lands, so the verdict cannot be quietly reinterpreted to fit.
+
+### #18 RESULT: both direct regimes are CLEAN — which weakens {#probe-a-answered} {#probe-a-hammer-negative}
+
+Two valid runs against RustFS, using probe A's own witness rule:
+
+| regime | rounds | pages/listing | keys listed | deleted under each walk | HOLES |
+|---|---:|---:|---:|---:|---:|
+| add-only | 24 | up to 888 | 6.85M cumulative | — | **0** |
+| held population + deletion behind the cursor | 40 | 151-166 | ~6.2M cumulative | ~31,000 | **0** |
+
+(A third run is excluded as worthless: unthrottled deleters drained it to a single key by round 31, so most
+rounds listed 1-3 keys and could not have produced a hole. Recorded so nobody counts it as a third clean
+result.)
+
+**This is a real negative and it counts against my own conclusion.** {#probe-a-answered} reached "the store
+gave two different answers about the same durable prefix" by ELIMINATION. Two direct attempts in the two
+obvious regimes — the second of them a deliberate model of GC deleting from behind the listing cursor —
+found nothing at ~13M keys listed, more than nine times what probe A saw across its whole four-hour run.
+
+So one of these is true, and the next step is to find out which:
+
+1. **An eliminated hypothesis was eliminated wrongly.** The weakest link remains the in-flight-append
+   exclusion, which rests on reading the append path rather than on an experiment.
+2. **The hammer still differs from the CAS walk in a way that matters.** Three candidates, in my order of
+   suspicion:
+   - **RETRIES INSIDE A PAGINATED WALK.** CAS lists through the ClickHouse S3 client, with its own retry
+     and timeout budget; my hammer uses boto3 with 3 attempts against a healthy store. A page request that
+     errors and is retried mid-pagination is a completely untested path, and it is the one place a page
+     could be silently skipped.
+   - **CHAOS.** The soak froze and killed RustFS during runs. My hammer ran against a store nobody was
+     attacking. A pagination interrupted by a store restart may not honour its continuation token the same
+     way.
+   - **Key shape.** CAS keys are nested paths containing `@cas@`; mine are flat `k-NNNNNNNN`. Least likely,
+     but not excluded.
+
+**Cheapest next test, and it uses evidence already on disk:** correlate the probe A firing windows against
+RustFS faults and S3 request errors during the soak. If every firing sits inside a fault window, candidate
+2 is the answer and the store is innocent under normal operation — which changes the blocker's urgency
+without changing its validity, since a GC that trusts LIST completeness is still wrong.
