@@ -50,6 +50,16 @@ CAS_SIGNAL_EVENT_NOTES = (
      "made, nothing can be durable). EXPECTED to be nonzero under chaos — this is the availability fix "
      "working, and it is counted apart from CasRefAppendWedged so a falling wedge count cannot be "
      "misread as nothing happening."),
+    ("CasGcProbeAHolePresent",
+     "Probe A holes CONFIRMED to still exist by a HEAD taken at the moment of the disagreement. This is "
+     "the direct observation that a ref-prefix enumeration OMITTED a durable object — the "
+     "LIST-as-journal release blocker, seen rather than inferred. Cannot be reconstructed afterwards: by "
+     "the time a log is read the object has legitimately been deleted either way."),
+    ("CasGcProbeAHoleAbsent",
+     "Probe A holes that were ABSENT when HEADed at firing time. The OPPOSITE defect to "
+     "CasGcProbeAHolePresent and it indicts a different component: the other enumeration returned a key "
+     "that is not there, which points at the listing client or iterator rather than at store "
+     "completeness. Watched separately precisely so the two are never summed into one number."),
     ("CasRefAppendWedged",
      "Ref-log append lanes that exhausted retries after an UNCERTAIN put. Ref-log progress may be "
      "stalled on that lane."),
