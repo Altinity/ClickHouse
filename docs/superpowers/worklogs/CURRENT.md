@@ -714,3 +714,32 @@ it should have been the first one run.
 Signals: no soak or S42 in flight, so `stale_edge` / `CasGcUnmatchedRemoveDeltas` /
 `CasRefAppendPreAttemptRefused` / per-phase rows have nothing to observe this cycle. Seven local commits
 held back per the push instruction.
+
+## 2026-07-26 14:56 UTC — watchdog: del2 hammer seeding, healthy; and my THIRD design error on it
+
+Run alive (88 s, still seeding its 150k keys), log written 1.5 min ago, 311G disk, load 3.0. Nothing to
+unstick.
+
+**Signal duty, adapted.** No soak or S42 is in flight, so `stale_edge` / `CasGcUnmatchedRemoveDeltas` /
+`CasRefAppendPreAttemptRefused` / per-phase rows have nothing to observe. The equivalent question for THIS
+run is whether its own signal can fire at all — and that is precisely what went wrong last cycle, so it is
+now the thing to check every watchdog: **are the listings multi-page and is the population in band?** A
+round listing single digits cannot produce a hole and measures nothing.
+
+**Run 2 (`del1`) was worthless and I nearly recorded its verdict as a result.** 3 deleters at 200 keys per
+batch outrun 4 writers doing single PUTs by about ten to one, so the population drained from 150,000 to ONE
+key by round 31; most rounds listed 1-3 keys. Its "40 rounds, zero holes" says nothing whatsoever. Had I
+taken it at face value I would have manufactured a false clean bill for the store — the exact failure this
+round keeps catching in other people's work.
+
+That is the **third** design error on this experiment: unbounded writers (run 1, killed at 888k keys), a
+hole rule that would have counted legitimately-deleted keys (caught by re-reading before running, not by
+running), and now unthrottled deleters. Common cause: I launched each without doing the steady-state
+arithmetic first. Writer throughput ~1,100 keys/s against deleter throughput ~12,000 keys/s is half a line
+of arithmetic that would have predicted the collapse.
+
+`del2` now holds the population from BOTH sides — writers idle at the target, deleters idle below 90% of it
+— with 6 writers against 2 deleters at batch 100.
+
+Standing result so far: only run 1 counts, and it is a clean NEGATIVE for the add-only regime (24 rounds,
+0 holes, 6.85M keys listed cumulatively, up to 888 pages). The delete regime is still unmeasured.
