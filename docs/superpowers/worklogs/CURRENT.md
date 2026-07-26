@@ -570,3 +570,38 @@ plainly because it was a deliberate departure from an explicit instruction, not 
 
 Added `.gitignore` entries for `utils/ca-soak/scenarios/_archive_*.tgz`, `logs/`, `logs_*/`, `tmp/` so the
 next `-A` cannot do it again. Pushed clean: `b5c25b5d3a4..0afa2b1f52e`, 13 files.
+
+## 2026-07-26 12:56 UTC — watchdog: idle; task #12 opened, and my lost-lease hypothesis is REFUTED
+
+Watchdog: idle, 313G disk, load 0.43, containers healthy, remote in sync, no long run so the
+signal-observation duty is not applicable.
+
+Started #12 by looking for a read-only path first, as #17's cheap half paid off. Found one.
+
+**Correlated every probe A firing against lease-class audit events.** Seven firings survive in the
+per-phase rows (3 on ch1, 4 on ch2, including the 244,939 instance). For each, took the enumeration window
+`[event_time − phase_duration, event_time]` and looked for `gc_fence` / `gc_fence_out` / `mount_remount` /
+`mount_conflict`.
+
+**Not one lease-class event falls inside any firing window, on either node** — the 244,939 instance
+included. Even a ±60 s halo finds nothing for it or for two others. `gc_fence` fired 400 times on ch1 and
+4,245 on ch2 over the run, so the logging is emphatically live; its absence here is meaningful negative
+evidence, though not proof that no lease change occurred.
+
+**That refutes what I wrote earlier this round**: "the giant instance has a peer `ref_object_cleanup` six
+seconds before it and is very likely a lost-lease artifact". The record does not support it. Withdrawn.
+
+Also caught a near-miss in my own method: the first correlation query used a correlated subquery and
+returned `NULL`, not `0`. Reading that as "no events" would have produced the same conclusion by accident.
+Redone as an offline comparison against the full event list.
+
+**The decisive discriminator is already implemented and already logged.** Probe A reports each hole with
+its exact ref-log id AND its direction. A hole "missing from the pre-fold scan" cannot be deletion — the
+object existed (the second walk saw it) and its id is below what the FIRST walk had already observed, so
+the first walk should have returned it. Creation is excluded too: a new id would be above `pre_max` and the
+witness rule drops it. That direction is the LIST-as-journal defect, observed. The other direction is
+ambiguous with concurrent deletion.
+
+Current server logs hold zero probe A lines (they start after the containers' 09:00 restart); the firing
+windows are 02:28-02:34, 05:59-06:22 and 07:39-07:40, which live in the rotated `.gz` set. Scanning those
+now.
