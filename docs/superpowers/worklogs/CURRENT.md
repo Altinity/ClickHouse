@@ -605,3 +605,29 @@ ambiguous with concurrent deletion.
 Current server logs hold zero probe A lines (they start after the containers' 09:00 restart); the firing
 windows are 02:28-02:34, 05:59-06:22 and 07:39-07:40, which live in the rotated `.gz` set. Scanning those
 now.
+
+### CORRECTION to the entry above: "current server logs hold zero probe A lines" was FALSE
+
+Those greps ran on the host against `-rw-r----- syslog:syslog` files with my user outside the `syslog`
+group. Every one was PERMISSION DENIED, and my own `2>/dev/null || echo 0` turned each denial into a
+confident zero — the project's recurring failure shape, self-inflicted this time. Re-run inside the
+containers, ch2's current log alone holds **177,276** probe A lines.
+
+**What the real data says.** Probe A logs each hole's DIRECTION, and they are not equally informative:
+338,559 holes on ch2 are "missing from the fold's own scan" (walk 2) — concurrent deletion explains those
+fine. But **58 holes (30 ch1, 28 ch2) are "missing from the PRE-fold scan"** (walk 1): walk 2 saw the
+object, and its id sits below what walk 1 had already observed for that namespace. Deletion cannot produce
+that. Nor can a stale-epoch writer — every id is epoch `0x4` with near-consecutive sequences.
+
+**But a third explanation appeared that the probe's own message does not consider.** The line asserts "an
+append cannot explain this", which holds only if appends become VISIBLE in sequence order. If one PUT is
+still in flight while a later-sequenced PUT has landed, walk 1 legitimately misses the earlier id. And
+`appendRefOps` runs a leader/batch model with the queue mutex released around the flush, so this is a live
+question, not a quibble.
+
+So #12 is **not settled, but properly posed**: either the store returned an incomplete prefix — the release
+blocker observed in the wild — or the probe's justification has a hole and 58 firings aborted folding for
+nothing. One question decides it: can a single leader's batch flush have two ref-log PUTs in flight for the
+same namespace at once? That must be READ, not assumed, and is where #12 resumes.
+
+BACKLOG {#probe-a-direction-evidence}, commit `05992148a9b`.
