@@ -1065,3 +1065,8 @@ blobs, now at 642 GC rounds** — 533 rounds since the time series began, none r
 historical 56 held flat across 1,062 rounds; this cohort is halfway there and behaving identically. Stand
 preserved deliberately; the evidence is also captured to
 `reports/2026-07-26-s42-stale-edge-repro/` so the stand is not load-bearing.
+
+**01:56 UTC watchdog** — idle and unchanged: nothing running, 320G, load 0.36, 0 uncommitted, 57 local
+commits. No long run, so no signals to observe. Nothing scheduled — the night's assigned work (S42, the GC
+duration study, the draft proposals) is delivered, and the open items all need a decision rather than a
+timer.
