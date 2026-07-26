@@ -193,3 +193,18 @@ backend adapter and the probe, and that is a different bug in our own code.
 
 Note this cuts BOTH ways for the option-C decision: if the store is the source, the detector was the right
 call and the journal chain becomes more urgent, not less.
+- 04:56 UTC — watchdog: idle; stand kept up. I RAN the decisive experiment and it was **INCONCLUSIVE, not
+  negative** — recording that distinction because the raw result reads like exoneration and is not.
+  Replicated probe A's own max-witness rule outside GC entirely: 12 paired back-to-back enumerations of
+  `cas/refs/` against the live rustfs. Result: 0 disagreements. But `|A| = |B| = 285` on every single
+  iteration, so the test had NEITHER of the two conditions that matter — no concurrent mutation (the count
+  never moved; the load generator had already finished and GC trims as fast as inserts add at this scale)
+  and, more importantly, **no pagination**: 285 keys is ONE page at GC's page size of 1000, while the three
+  firing rounds listed 38,355 / 85,943 / 127,742 keys — 38, 86 and 128 pages.
+  THIS SHARPENS THE HYPOTHESIS rather than weakening it. A single-page listing cannot exhibit a
+  continuation defect at all, so the experiment could not have found one. Combined with the earlier
+  observation that hole count scales with enumeration size — 1 hole at 38 pages, 3 at 86, 10 at 128 — the
+  suspicion narrows from "the store returns inconsistent listings" to "the store's PAGINATION is not
+  consistent across continuations under concurrent writes". That is a sharper, cheaper thing to test.
+  What a valid test needs: a ref prefix of >100 pages AND demonstrable concurrent appends during the walk.
+  Building that state takes a sustained insert run, not a 45-second one.
