@@ -19,7 +19,10 @@ namespace DB::Cas
 /// POD lets the scheduler (and its unit tests) stay free of the system-log machinery.
 struct GcRoundLogRecord
 {
-    enum class EventType { Start, Finish };
+    /// `Phase`: one row per GC phase of the round, carrying that phase's own duration, semantic counts,
+    /// and `ProfileEvents` delta. Emitted between the round's `Start` and `Finish`, correlated with them
+    /// by `round_id`.
+    enum class EventType { Start, Finish, Phase };
     /// `Deferred`: the round acquired the lease and took the skip-unchanged fast path (`RoundReport::deferred`)
     /// -- no fold, no pre-CAS deletes, no `gc/state` CAS. Distinct from `Success` so a reader of
     /// `system.content_addressed_garbage_collection_log` (or this scheduler's own log line) can tell a round
@@ -48,7 +51,26 @@ struct GcRoundLogRecord
     UInt64 anomalies = 0;           /// fold clamps surfaced (never wedging) this round
     UInt64 duration_ms = 0;
     String error;
+    /// On a `Start`/`Finish` row: the whole round's delta. On a `Phase` row: THAT PHASE's delta.
     std::map<String, UInt64> profile_events;
+
+    /// Correlator for every row of ONE round attempt: a fresh random hex id minted per `runRoundLogged`
+    /// invocation and stamped on the `Start` row, every `Phase` row, and the `Finish` row.
+    ///
+    /// DELIBERATELY NOT `round`. `round` is 0 on `Start`, is only known after the round's single
+    /// `gc/state` CAS on a folding round, and does not exist AT ALL on a `NotALeader` round -- and the
+    /// rounds a reader most needs to reconstruct are exactly the ones that never got that far.
+    String round_id;
+    /// The GC phase this row describes; empty on `Start`/`Finish`. The literals are the ones passed to
+    /// `Cas::GcPhaseTimer` at each phase's single instrumentation site.
+    String phase;
+    /// Wall time of this phase. MICROseconds, not milliseconds: `meta_pool_wait`, `round_commit` and
+    /// `parent_seal_read` are routinely sub-millisecond and the whole point of the row is seeing when
+    /// they are not.
+    UInt64 phase_duration_us = 0;
+    /// Phase-specific semantic counts (`Phase` rows only). The per-phase verb counts ride
+    /// `profile_events` above instead, so no verb columns are invented.
+    std::map<String, UInt64> phase_metrics;
 };
 
 using GcRoundLogger = std::function<void(const GcRoundLogRecord &)>;

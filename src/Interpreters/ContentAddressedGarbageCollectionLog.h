@@ -9,7 +9,9 @@ namespace DB
 
 struct ContentAddressedGarbageCollectionLogElement
 {
-    enum EventType : int8_t { START = 1, FINISH = 2 };
+    /// `PHASE`: one row per GC phase, emitted between the round's `START` and `FINISH` and correlated
+    /// with them by `round_id`.
+    enum EventType : int8_t { START = 1, FINISH = 2, PHASE = 3 };
     /// `DEFERRED`: the round acquired the GC lease and took the skip-unchanged fast path -- no fold, no
     /// pre-CAS deletes, no `gc/state` CAS. Kept distinct from `SUCCESS` so a query against this table can
     /// tell a round that genuinely folded and found nothing apart from one that never folded at all.
@@ -40,7 +42,12 @@ struct ContentAddressedGarbageCollectionLogElement
     UInt64 anomalies = 0;           /// fold clamps surfaced this round
     UInt64 duration_ms = 0;
     String error;
-    std::map<String, UInt64> profile_events;   /// per-round delta (FINISH)
+    std::map<String, UInt64> profile_events;   /// per-round delta (FINISH); per-phase delta (PHASE)
+
+    String round_id;                           /// correlator for every row of one round attempt
+    String phase;                              /// empty on START/FINISH
+    UInt64 phase_duration_us = 0;              /// PHASE rows only
+    std::map<String, UInt64> phase_metrics;    /// PHASE rows only
 
     static std::string name() { return "ContentAddressedGarbageCollectionLog"; }
     static ColumnsDescription getColumnsDescription();

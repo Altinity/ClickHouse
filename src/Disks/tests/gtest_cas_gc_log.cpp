@@ -60,9 +60,23 @@ ManifestId publishPart(const PoolPtr & s, const String & ns, const String & ref,
 
 }
 
+namespace
+{
+/// One round emits a Start, then one Phase row per GC phase it reached, then a Finish. Tests that care
+/// only about the round-outcome rows filter the phase rows out through this.
+std::vector<Rec> roundRowsOnly(const std::vector<Rec> & rows)
+{
+    std::vector<Rec> out;
+    for (const Rec & r : rows)
+        if (r.event_type != Rec::EventType::Phase)
+            out.push_back(r);
+    return out;
+}
+}
+
 /// The happy path: a marking round (candidates_marked > 0) followed by a deletion round
-/// (objects_deleted > 0). Each `runOneRoundNow` must emit exactly one Start then one Finish, with
-/// `disk_name`/`gc_id` set and `duration_ms` populated on the Finish.
+/// (objects_deleted > 0). Each `runOneRoundNow` must emit exactly one Start, then its phase rows, then
+/// one Finish, with `disk_name`/`gc_id` set and `duration_ms` populated on the Finish.
 TEST(CasGcLog, EmitsStartFinishWithCounts)
 {
     auto backend = std::make_shared<InMemoryBackend>();
@@ -90,7 +104,7 @@ TEST(CasGcLog, EmitsStartFinishWithCounts)
     /// pipeline a candidate is marked (condemned) in one round and physically deleted a few rounds later,
     /// once the mount's ack floor graduates it — so advance the store's own mount ack after each round
     /// (renewWatermarkOnce runs the beat) and give the pipeline a generous round budget. Each
-    /// runOneRoundNow call appends exactly a Start then a Finish.
+    /// runOneRoundNow call appends a Start, the round's phase rows, and a Finish.
     bool saw_marked = false;
     bool saw_deleted = false;
     size_t marking_finish_idx = 0;
@@ -102,21 +116,26 @@ TEST(CasGcLog, EmitsStartFinishWithCounts)
         sched.runOneRoundNow(Rec::Trigger::Manual);
         store->renewWatermarkOnce();
 
-        /// Each call emits exactly one Start then one Finish.
-        ASSERT_EQ(rows.size(), before + 2u) << "each round must emit exactly one Start + one Finish";
+        /// Each call emits exactly one Start (first) and one Finish (last), with the round's phase rows
+        /// in between.
+        ASSERT_GE(rows.size(), before + 2u) << "each round must emit at least a Start and a Finish";
         ASSERT_EQ(rows[before].event_type, Rec::EventType::Start);
-        ASSERT_EQ(rows[before + 1].event_type, Rec::EventType::Finish);
+        ASSERT_EQ(rows.back().event_type, Rec::EventType::Finish);
+        for (size_t i = before + 1; i + 1 < rows.size(); ++i)
+            ASSERT_EQ(rows[i].event_type, Rec::EventType::Phase)
+                << "only Phase rows may sit between a round's Start and Finish";
 
-        const Rec & fin = rows[before + 1];
+        const size_t finish_idx = rows.size() - 1;
+        const Rec & fin = rows[finish_idx];
         if (!saw_marked && fin.candidates_marked > 0)
         {
             saw_marked = true;
-            marking_finish_idx = before + 1;
+            marking_finish_idx = finish_idx;
         }
         if (!saw_deleted && fin.objects_deleted > 0)
         {
             saw_deleted = true;
-            deleting_finish_idx = before + 1;
+            deleting_finish_idx = finish_idx;
         }
     }
 
@@ -140,9 +159,13 @@ TEST(CasGcLog, EmitsStartFinishWithCounts)
         EXPECT_FALSE(r.gc_id.empty());
         EXPECT_EQ(r.trigger, Rec::Trigger::Manual);
     }
-    /// `duration_ms` is meaningful on Finish (>= 0 always; populated unconditionally there).
-    for (size_t i = 1; i < rows.size(); i += 2)
-        EXPECT_EQ(rows[i].event_type, Rec::EventType::Finish);
+    /// The round-outcome rows alternate Start, Finish, Start, Finish, ... once the phase rows are
+    /// filtered out; `duration_ms` is meaningful on each Finish (populated unconditionally there).
+    const std::vector<Rec> round_rows = roundRowsOnly(rows);
+    ASSERT_EQ(round_rows.size() % 2, 0u);
+    for (size_t i = 0; i < round_rows.size(); ++i)
+        EXPECT_EQ(round_rows[i].event_type,
+                  i % 2 == 0 ? Rec::EventType::Start : Rec::EventType::Finish);
 }
 
 namespace
@@ -255,13 +278,181 @@ TEST(CasGcLog, AbortedFinishOnThrowingRound)
 
     EXPECT_THROW(sched.runOneRoundNow(Rec::Trigger::Manual), DB::Exception);
 
-    ASSERT_EQ(rows.size(), 2u) << "a throwing round still emits a Start and a (Aborted) Finish";
-    EXPECT_EQ(rows[0].event_type, Rec::EventType::Start);
-    EXPECT_EQ(rows[1].event_type, Rec::EventType::Finish);
-    EXPECT_EQ(rows[1].outcome, Rec::Outcome::Failed);
-    EXPECT_FALSE(rows[1].error.empty()) << "a failed Finish must carry the exception text";
-    EXPECT_EQ(rows[1].disk_name, "ca");
-    EXPECT_FALSE(rows[1].gc_id.empty());
+    /// A throwing round still emits a Start and an Aborted Finish. It also emits the phase row of the
+    /// phase it died in -- the timer is RAII, so it fires during unwinding, which is exactly the forensic
+    /// record a failed round needs. That is also why `round_id`, not `round`, is the correlator: this
+    /// round has no round number at all.
+    const std::vector<Rec> round_rows = roundRowsOnly(rows);
+    ASSERT_EQ(round_rows.size(), 2u) << "a throwing round still emits a Start and a (Aborted) Finish";
+    EXPECT_EQ(round_rows[0].event_type, Rec::EventType::Start);
+    EXPECT_EQ(round_rows[1].event_type, Rec::EventType::Finish);
+    EXPECT_EQ(round_rows[1].outcome, Rec::Outcome::Failed);
+    EXPECT_FALSE(round_rows[1].error.empty()) << "a failed Finish must carry the exception text";
+    EXPECT_EQ(round_rows[1].disk_name, "ca");
+    EXPECT_FALSE(round_rows[1].gc_id.empty());
+    EXPECT_FALSE(round_rows[1].round_id.empty());
+    for (const Rec & r : rows)
+        EXPECT_EQ(r.round_id, round_rows[0].round_id)
+            << "every row of a FAILED round must still correlate through round_id";
+}
+
+/// Every row of one round -- its Start, each of its Phase rows, and its Finish -- carries the SAME
+/// non-empty `round_id`, and two rounds carry DIFFERENT ones. That is the property the column exists
+/// for: `round` is 0 on Start, is only known after the round's single `gc/state` CAS, and is absent on a
+/// round that never led, so it cannot serve as the correlator.
+TEST(CasGcLog, EveryRowOfARoundSharesOneRoundId)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = Pool::open(backend,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_fold_max_defer_rounds = 0});
+    const RootNamespace ns{"srv1/tbl"};
+    publishPart(store, ns.string(), "all_0_0_0", "hello-round-id");
+    store->dropRef(ns, "all_0_0_0");
+    store->renewWatermarkOnce();
+
+    std::vector<Rec> rows;
+    DB::Cas::CasGcScheduler sched(
+        store, std::chrono::seconds(1), "test::gc", "ca",
+        [&](const Rec & r) { rows.push_back(r); });
+
+    sched.runOneRoundNow(Rec::Trigger::Manual);
+    const size_t after_first = rows.size();
+    ASSERT_GE(after_first, 2u);
+    const String first_id = rows.front().round_id;
+    EXPECT_FALSE(first_id.empty());
+    for (size_t i = 0; i < after_first; ++i)
+        EXPECT_EQ(rows[i].round_id, first_id) << "row " << i << " of the first round has a different round_id";
+
+    store->renewWatermarkOnce();
+    sched.runOneRoundNow(Rec::Trigger::Manual);
+    ASSERT_GT(rows.size(), after_first);
+    const String second_id = rows[after_first].round_id;
+    EXPECT_FALSE(second_id.empty());
+    EXPECT_NE(second_id, first_id) << "two rounds must not share a round_id";
+    for (size_t i = after_first; i < rows.size(); ++i)
+        EXPECT_EQ(rows[i].round_id, second_id);
+}
+
+namespace
+{
+/// The phase names of one round, in emission order.
+std::vector<String> phaseNames(const std::vector<Rec> & rows, size_t from)
+{
+    std::vector<String> out;
+    for (size_t i = from; i < rows.size(); ++i)
+        if (rows[i].event_type == Rec::EventType::Phase)
+            out.push_back(rows[i].phase);
+    return out;
+}
+
+/// The `phase_metrics` of the named phase of one round. Fails the caller's expectation if absent.
+std::map<String, UInt64> metricsOf(const std::vector<Rec> & rows, size_t from, const String & phase)
+{
+    for (size_t i = from; i < rows.size(); ++i)
+        if (rows[i].event_type == Rec::EventType::Phase && rows[i].phase == phase)
+            return rows[i].phase_metrics;
+    return {};
+}
+}
+
+/// A FOLDING round emits every phase, in execution order, and each phase's row carries the semantic
+/// counts only that phase can compute. This is the test that would catch an instrumentation site
+/// silently dropping out of the round -- a phase that stops emitting reads exactly like a phase that
+/// costs nothing, which is the failure mode this whole change exists to prevent.
+///
+/// ProfileEvents are deliberately NOT asserted: `runOneRoundNow` runs on the bare gtest thread, which
+/// has no attached `ThreadStatus`, so per-phase capture degrades to an empty map exactly as the
+/// round-level capture already does (see the note at the top of this file).
+TEST(CasGcLog, FoldingRoundEmitsEveryPhaseInOrder)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = Pool::open(backend,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_fold_max_defer_rounds = 0});
+    const RootNamespace ns{"srv1/tbl"};
+    publishPart(store, ns.string(), "all_0_0_0", "hello-cas-gc-phases");
+    store->dropRef(ns, "all_0_0_0");
+    store->renewWatermarkOnce();
+
+    std::vector<Rec> rows;
+    DB::Cas::CasGcScheduler sched(
+        store, std::chrono::seconds(1), "test::gc", "ca",
+        [&](const Rec & r) { rows.push_back(r); });
+
+    ASSERT_TRUE(sched.runOneRoundNow(Rec::Trigger::Manual).acquired_lease);
+
+    const std::vector<String> expected = {
+        "lease", "heartbeat_floor", "defer_decision", "parent_seal_read",
+        "fold_ref_list", "fold_seal_read", "fold_ref_intake", "fold_ns_cleanup_scan",
+        "fold_reduce", "fold_seal_write",
+        "pending_deletes", "meta_pool_wait", "round_commit", "handoff_reclaim",
+        "manifest_deletes", "namespace_cleanup", "ref_object_cleanup", "orphan_sweep"};
+    EXPECT_EQ(phaseNames(rows, 0), expected);
+
+    /// Every phase row is a Phase row of THIS round and carries a duration field (0 is a legitimate
+    /// microsecond reading for a phase that did nothing, so only the shape is asserted).
+    for (const Rec & r : rows)
+        if (r.event_type == Rec::EventType::Phase)
+        {
+            EXPECT_EQ(r.round_id, rows.front().round_id);
+            EXPECT_FALSE(r.phase.empty());
+            EXPECT_TRUE(r.error.empty());
+        }
+
+    /// The defer decision reports the signal it decided on, and the two fold-seal reads it paid for.
+    const auto defer = metricsOf(rows, 0, "defer_decision");
+    EXPECT_EQ(defer.at("deferred"), 0u) << "this round folded, so it cannot report itself deferred";
+    EXPECT_EQ(defer.at("fold_seal_reads"), 2u);
+    EXPECT_GT(defer.at("namespaces_seen"), 0u);
+
+    /// Probe A's per-round hole count is reported on EVERY round, healthy or not -- a value that is
+    /// always 0 is what makes the one round where it is not stand out.
+    const auto ref_list = metricsOf(rows, 0, "fold_ref_list");
+    EXPECT_EQ(ref_list.at("probe_a_holes"), 0u);
+    EXPECT_EQ(ref_list.at("ref_folding_aborted"), 0u);
+    EXPECT_GT(ref_list.at("ref_keys_listed"), 0u);
+
+    /// Probe B1's identity, as an OBSERVABLE property of the table rather than an assumption in a
+    /// comment: the round sealed coverage over exactly the logs it folded.
+    const auto intake = metricsOf(rows, 0, "fold_ref_intake");
+    EXPECT_EQ(intake.at("logs_intended"), intake.at("logs_applied"));
+    EXPECT_GT(intake.at("logs_applied"), 0u);
+    EXPECT_GT(intake.at("deltas_emitted"), 0u);
+
+    /// Probe B2's verdict. Nonzero would have thrown, so the row can only ever read 0 on a round that
+    /// reached its Finish -- which is the point: the column is the round's own attestation.
+    EXPECT_EQ(metricsOf(rows, 0, "fold_reduce").at("txns_unapplied"), 0u);
+
+    /// The honest gap: the meta pool's work runs on other threads, so this row's ProfileEvents delta is
+    /// empty by construction and these two counts are its ONLY signal. They must be real numbers.
+    const auto meta = metricsOf(rows, 0, "meta_pool_wait");
+    EXPECT_GT(meta.at("jobs_scheduled"), 0u) << "this round condemns, so it schedules condemn-marker writes";
+    EXPECT_EQ(meta.at("jobs_completed"), meta.at("jobs_scheduled"))
+        << "every scheduled job must have finished by the time the wait returns";
+}
+
+/// A round that never leads emits ONLY the phase it reached. `round` does not exist for such a round,
+/// so `round_id` is the only thing tying its rows together -- which is why it is the correlator.
+TEST(CasGcLog, NotALeaderRoundEmitsOnlyTheLeasePhase)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+
+    /// A foreign incumbent holds the lease, so the scheduler's round backs off immediately.
+    Gc incumbent(store, hexToU128("00000000000000000000000000000abc"));
+    ASSERT_TRUE(incumbent.runRegularRound().acquired_lease);
+
+    std::vector<Rec> rows;
+    DB::Cas::CasGcScheduler sched(
+        store, std::chrono::seconds(1), "test::gc", "ca",
+        [&](const Rec & r) { rows.push_back(r); });
+    EXPECT_FALSE(sched.runOneRoundNow(Rec::Trigger::Manual).acquired_lease);
+
+    EXPECT_EQ(phaseNames(rows, 0), (std::vector<String>{"lease"}));
+    EXPECT_EQ(metricsOf(rows, 0, "lease").at("acquired"), 0u);
+    ASSERT_EQ(rows.size(), 3u);
+    EXPECT_EQ(rows.back().outcome, Rec::Outcome::NotALeader);
+    for (const Rec & r : rows)
+        EXPECT_EQ(r.round_id, rows.front().round_id);
 }
 
 /// B3: the scheduler exposes per-disk GC health for system.content_addressed_mounts (the process-

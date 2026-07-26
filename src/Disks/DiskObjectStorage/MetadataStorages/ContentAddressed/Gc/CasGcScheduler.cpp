@@ -133,13 +133,35 @@ Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & round_gc, GcRoundLogRe
         }
     };
 
+    /// The correlator every row of this round attempt carries -- see `GcRoundLogRecord::round_id` for why
+    /// it is a fresh id rather than the round number.
+    const String round_id = Cas::u128ToHex(
+        (static_cast<UInt128>(thread_local_rng()) << 64) | thread_local_rng());
+
     Rec start;
     start.event_type = Rec::EventType::Start;
     start.trigger = trigger;
     start.disk_name = disk_name;
     start.srid = store->poolConfig().server_root_id;
     start.gc_id = Cas::u128ToHex(gc_id);
+    start.round_id = round_id;
     emit(start);
+
+    /// The phase sink handed to the round engine for the duration of THIS round. Same best-effort
+    /// discipline as `emit`: a throwing sink must never break GC. Cleared on the way out (on the
+    /// exception path too), so it never outlives the locals it captures -- this guard is declared after
+    /// them, so it is destroyed before them.
+    round_gc.setPhaseSink([&](const Cas::GcPhaseRecord & p)
+    {
+        Rec row = start;
+        row.event_type = Rec::EventType::Phase;
+        row.phase = p.phase;
+        row.phase_duration_us = p.duration_us;
+        row.phase_metrics = p.metrics;
+        row.profile_events = p.profile_events;
+        emit(row);
+    });
+    SCOPE_EXIT({ round_gc.setPhaseSink({}); });
 
     const auto t0 = std::chrono::steady_clock::now();
     /// ProfileEventsScope requires an attached ThreadStatus (CurrentThread::get throws otherwise).

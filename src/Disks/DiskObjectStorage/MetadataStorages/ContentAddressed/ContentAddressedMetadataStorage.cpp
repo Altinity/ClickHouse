@@ -472,9 +472,18 @@ Cas::GcRoundLogger ContentAddressedMetadataStorage::makeGcRoundLogger() const
         const auto now = std::chrono::system_clock::now();
         e.event_time = std::chrono::system_clock::to_time_t(now);
         e.event_time_microseconds = timeInMicroseconds(now);
-        e.event_type = r.event_type == Cas::GcRoundLogRecord::EventType::Start
-            ? ContentAddressedGarbageCollectionLogElement::START
-            : ContentAddressedGarbageCollectionLogElement::FINISH;
+        switch (r.event_type)
+        {
+            case Cas::GcRoundLogRecord::EventType::Start:
+                e.event_type = ContentAddressedGarbageCollectionLogElement::START;
+                break;
+            case Cas::GcRoundLogRecord::EventType::Finish:
+                e.event_type = ContentAddressedGarbageCollectionLogElement::FINISH;
+                break;
+            case Cas::GcRoundLogRecord::EventType::Phase:
+                e.event_type = ContentAddressedGarbageCollectionLogElement::PHASE;
+                break;
+        }
         e.disk_name = r.disk_name.empty() ? disk : r.disk_name;
         e.srid = r.srid;
         e.gc_id = r.gc_id;
@@ -514,6 +523,10 @@ Cas::GcRoundLogger ContentAddressedMetadataStorage::makeGcRoundLogger() const
         e.duration_ms = r.duration_ms;
         e.error = r.error;
         e.profile_events = r.profile_events;
+        e.round_id = r.round_id;
+        e.phase = r.phase;
+        e.phase_duration_us = r.phase_duration_us;
+        e.phase_metrics = r.phase_metrics;
         /// Best-effort: SystemLog::add never blocks GC; a full queue drops the row with a warning.
         log->add(std::move(e));
     };

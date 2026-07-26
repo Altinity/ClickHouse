@@ -4,6 +4,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobMeta.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcPhaseTimer.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcShardPlan.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
@@ -19,6 +20,7 @@
 #include <unordered_set>
 #include <algorithm>
 #include <limits>
+#include <optional>
 #include <set>
 
 namespace ProfileEvents
@@ -204,7 +206,11 @@ void Gc::scheduleMetaJob(std::function<void()> job)
     /// op is advisory; the ledger + exact-token body delete are the actual safety core).
     /// Capture the logger by value under a distinct name (the pool job may outlive nothing here, but it
     /// must not depend on `this`; the copy also keeps the capture from shadowing the `logger` member).
-    auto run = [job, job_logger = this->logger]()
+    /// `completed` is the `meta_pool_wait` phase's only visible signal: that phase's work runs HERE, on
+    /// a pool thread, so it contributes nothing to the round thread's ProfileEvents delta. Captured as a
+    /// raw pointer to the atomic rather than `this`, keeping `run`'s existing "must not depend on `this`"
+    /// property -- the pool is a member of the same `Gc` and is joined by `~Gc` before the atomic dies.
+    auto run = [job, job_logger = this->logger, completed = &meta_jobs_completed_]()
     {
         /// Count one per-hash freshness-meta op EXECUTED (attempt, not success) on this
         /// bounded pool. `run` is invoked on the pool thread (the common path below) or inline on the
@@ -222,7 +228,11 @@ void Gc::scheduleMetaJob(std::function<void()> job)
                 "CAS gc: a per-hash freshness-meta op failed on the bounded pool (advisory-only; "
                 "never wedges the round)");
         }
+        /// After the catch: a job that threw still FINISHED, and `meta_pool_wait` reports drain
+        /// progress, not success (the anomaly counter above is what reports failure).
+        completed->fetch_add(1, std::memory_order_relaxed);
     };
+    meta_jobs_scheduled_.fetch_add(1, std::memory_order_relaxed);
     try
     {
         meta_pool->scheduleOrThrowOnError(run);
@@ -273,9 +283,21 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     RoundReport report;
     GcState state;
     Token state_token;
-    report.acquired_lease = acquireOrRenewLease(state, state_token, allow_steal);
+    /// PHASE 1/18 `lease`. Also the ONLY phase a `NotALeader` round emits, which is why the phase rows
+    /// are correlated by `round_id` and not by the round number a follower never learns.
+    {
+        GcPhaseTimer t(phase_sink, "lease");
+        report.acquired_lease = acquireOrRenewLease(state, state_token, allow_steal);
+        t.metric("acquired", report.acquired_lease ? 1 : 0);
+        t.metric("steal_allowed", allow_steal ? 1 : 0);
+    }
     if (!report.acquired_lease)
         return report;
+
+    /// Baseline for the `meta_pool_wait` phase's job counts (the pool is per-`Gc`, the counters
+    /// cumulative), taken before anything in this round can schedule a job.
+    const uint64_t meta_jobs_scheduled_at_round_start = meta_jobs_scheduled_.load(std::memory_order_relaxed);
+    const uint64_t meta_jobs_completed_at_round_start = meta_jobs_completed_.load(std::memory_order_relaxed);
 
     /// Fire the acquire-time hook BEFORE the long fold below, not after the round
     /// returns - a new leader's first round could otherwise run for the whole fold with no
@@ -305,42 +327,53 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// `mountObservationThresholdMs` -- see its doc comment (CasServerRoot.h).
     const uint64_t stable_threshold_ms = mountObservationThresholdMs(
         ttl_ms, static_cast<uint64_t>(store->poolConfig().mount_renew_period.count()));
-    const HeartbeatFloor floor = computeHeartbeatFloor(backend, layout, now_ms_fn(), mono_ms_fn(),
-                                                        stable_threshold_ms, mount_obs);
-    report.fence_outs = floor.fenced_now;
-    if (floor.fenced_now > 0)
-        ProfileEvents::increment(ProfileEvents::CasGcHeartbeatFenceOuts, floor.fenced_now);
 
-    /// GcFenceOut audit row per expired mount fenced-out this round: the round latched a fence-out to
-    /// re-arm a sleeper's write fence (its held token is now invalid). One row per srid so the log
-    /// reconstructs which mount was reclaimed.
-    for (const String & srid : floor.fenced_srids)
+    /// PHASE 2/18 `heartbeat_floor`: one LIST of `gc/server-roots/`, one GET per mount slot, and a fence
+    /// PUT per newly-fenced mount.
+    {
+        GcPhaseTimer t(phase_sink, "heartbeat_floor");
+        const HeartbeatFloor floor = computeHeartbeatFloor(backend, layout, now_ms_fn(), mono_ms_fn(),
+                                                           stable_threshold_ms, mount_obs);
+        report.fence_outs = floor.fenced_now;
+        if (floor.fenced_now > 0)
+            ProfileEvents::increment(ProfileEvents::CasGcHeartbeatFenceOuts, floor.fenced_now);
+
+        /// GcFenceOut audit row per expired mount fenced-out this round: the round latched a fence-out to
+        /// re-arm a sleeper's write fence (its held token is now invalid). One row per srid so the log
+        /// reconstructs which mount was reclaimed.
+        for (const String & srid : floor.fenced_srids)
+            EventEmitter{*store}.emit([&](CasEvent & e)
+            {
+                e.type = CasEventType::GcFenceOut;
+                e.object_kind = CasEventObjectKind::Snap;
+                e.round = new_round;
+                e.gen = state.snap_generation;
+                e.outcome = "fenced";
+                e.reason = "expired mount lease past skew margin; token-guarded fence-out re-arms the write "
+                           "fence (prevents a resumed sleeper from mutating)";
+                e.detail = {{"srid", srid}};
+            });
+
+        /// Emit the round's heartbeat classification (what mounts are live/terminated/fenced this round).
         EventEmitter{*store}.emit([&](CasEvent & e)
         {
-            e.type = CasEventType::GcFenceOut;
+            e.type = CasEventType::GcFence;
             e.object_kind = CasEventObjectKind::Snap;
             e.round = new_round;
             e.gen = state.snap_generation;
-            e.outcome = "fenced";
-            e.reason = "expired mount lease past skew margin; token-guarded fence-out re-arms the write "
-                       "fence (prevents a resumed sleeper from mutating)";
-            e.detail = {{"srid", srid}};
+            e.outcome = "floor";
+            e.reason = "R1: heartbeat classification (live/terminated/fenced mounts)";
+            e.detail = {{"live", std::to_string(floor.live)},
+                        {"terminated", std::to_string(floor.terminated)},
+                        {"fenced_now", std::to_string(floor.fenced_now)},
+                        {"already_fenced", std::to_string(floor.already_fenced)}};
         });
 
-    /// Emit the round's heartbeat classification (what mounts are live/terminated/fenced this round).
-    EventEmitter{*store}.emit([&](CasEvent & e)
-    {
-        e.type = CasEventType::GcFence;
-        e.object_kind = CasEventObjectKind::Snap;
-        e.round = new_round;
-        e.gen = state.snap_generation;
-        e.outcome = "floor";
-        e.reason = "R1: heartbeat classification (live/terminated/fenced mounts)";
-        e.detail = {{"live", std::to_string(floor.live)},
-                    {"terminated", std::to_string(floor.terminated)},
-                    {"fenced_now", std::to_string(floor.fenced_now)},
-                    {"already_fenced", std::to_string(floor.already_fenced)}};
-    });
+        t.metric("live", floor.live);
+        t.metric("terminated", floor.terminated);
+        t.metric("fenced_now", floor.fenced_now);
+        t.metric("already_fenced", floor.already_fenced);
+    }
 
     /// Decide DEFER vs FOLD from cheap pre-fold signals.
     /// A DEFER round re-adopts the sealed generation — no fold, no delete, no gc/state write — so a
@@ -351,13 +384,38 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// (rather than discarded once the defer decision is taken) so `fold` can compare it against its
     /// own enumeration of the same prefix — probe A, at zero additional backend calls. A deferred round
     /// simply drops it.
-    const RefScanSummary pre_scan = preFoldRefScan(state);
+    ///
+    /// PHASE 3/18 `defer_decision`. `pre_scan` OUTLIVES the timer because the fold consumes it, and
+    /// `report.deferred` is set INSIDE the scope so the row already reflects the verdict when the
+    /// timer's destructor fires on the deferred round's early return. This phase also performs TWO of
+    /// the round's reads of the adopted fold seal (`graduationDue` and `preFoldRefScan` each read the
+    /// same key) -- see `fold_seal_reads` below.
+    RefScanSummary pre_scan;
     {
+        GcPhaseTimer t(phase_sink, "defer_decision");
         const bool graduation_due = graduationDue(state, new_round);
+        pre_scan = preFoldRefScan(state);
         const size_t changed = pre_scan.changed_shards;
-        if (shouldDeferRound(changed, graduation_due, rounds_since_last_fold_,
-                             store->poolConfig().gc_fold_threshold,
-                             store->poolConfig().gc_fold_max_defer_rounds))
+        const bool defer = shouldDeferRound(changed, graduation_due, rounds_since_last_fold_,
+                                            store->poolConfig().gc_fold_threshold,
+                                            store->poolConfig().gc_fold_max_defer_rounds);
+        uint64_t ref_log_keys = 0;
+        for (const auto & [scanned_ns, ids] : pre_scan.logs_by_ns)
+            ref_log_keys += ids.size();
+        t.metric("changed_shards", changed);
+        t.metric("namespaces_seen", pre_scan.max_log_by_ns.size());
+        t.metric("ref_log_keys_listed", ref_log_keys);
+        t.metric("graduation_due", graduation_due ? 1 : 0);
+        t.metric("deferred", defer ? 1 : 0);
+        /// The number of consecutive rounds already deferred BEFORE this one (this round's own verdict is
+        /// `deferred` above), so the pair reads unambiguously against `gc_fold_max_defer_rounds`.
+        t.metric("rounds_deferred_before", rounds_since_last_fold_);
+        /// `graduationDue` and `preFoldRefScan` each GET the adopted fold seal at the SAME
+        /// (generation, attempt). Recorded, not fixed -- see the `fold_seal_read` phase, which records
+        /// the other duplicate pair; the round GETs that one key FIVE times on a folding round.
+        t.metric("fold_seal_reads", 2);
+
+        if (defer)
         {
             ++rounds_since_last_fold_;
             report.deferred = true;
@@ -403,11 +461,21 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// NEW seal's refs post-CAS to detect a ref that moved OFF an already-pruned generation (the
     /// wholesale prune skipped it while it was still referenced and its cursor advanced past it), and
     /// hand-off delete that generation's now-unreferenced leftover. Absent parent seal => empty.
+    ///
+    /// PHASE 4/18 `parent_seal_read`: the round's THIRD GET of the adopted fold seal (`graduationDue`
+    /// and `preFoldRefScan` already read it in `defer_decision`, and `fold` reads it twice more). One
+    /// small GET, given its own row rather than left untimed, because "the same key, five times a round"
+    /// is only actionable if each read is attributable to a phase.
     std::vector<RunRef> parent_seal_runs;
-    if (const auto parent_seal = readFoldSeal(state.snap_generation, state.snap_attempt))
-        parent_seal_runs = parent_seal->blob_target_runs;
+    {
+        GcPhaseTimer t(phase_sink, "parent_seal_read");
+        if (const auto parent_seal = readFoldSeal(state.snap_generation, state.snap_attempt))
+            parent_seal_runs = parent_seal->blob_target_runs;
+        t.metric("parent_runs", parent_seal_runs.size());
+    }
 
     /// The pass performs discovery, windowing, and the three-cursor merge (spare / graduate / condemn).
+    /// It emits phases 5..10 of its own.
     FoldResult folded = fold(state, state_token, report, new_round, pre_scan);
 
     EventEmitter{*store}.emit([&](CasEvent & e)
@@ -428,6 +496,15 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// PRE-CAS deletes affect ONLY entries the PREVIOUS pass published as delete_pending (justified by
     /// durable state and safe at any leader staleness), plus outcome bookkeeping for
     /// every settled entry. THE SINGLE CONTENT-DELETE SITE.
+    ///
+    /// PHASE 11/18 `pending_deletes`, covering both the exact-token delete loop and the outcome-log
+    /// writes it feeds. Held in an `optional` rather than a `{ }` scope purely so this long, delicate
+    /// block is not reindented wholesale; `reset()` below is what emits the row, and an exception
+    /// escaping before it still emits from the destructor.
+    std::optional<GcPhaseTimer> pending_deletes_timer;
+    pending_deletes_timer.emplace(phase_sink, "pending_deletes");
+    const uint64_t redeleted_before = report.redeleted;
+    const uint64_t graduated_before = report.graduated;
     std::map<uint64_t, OutcomeLog> outcomes;
     for (uint64_t shard = 0; shard < folded.retired_merge.size(); ++shard)
     {
@@ -618,13 +695,40 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
             }
         }
     }
+    pending_deletes_timer->metric("redeleted", report.redeleted - redeleted_before);
+    pending_deletes_timer->metric("graduated", report.graduated - graduated_before);
+    pending_deletes_timer->metric("deleted", report.deleted);
+    pending_deletes_timer->metric("absent", report.absent);
+    pending_deletes_timer->metric("replaced", report.replaced);
+    pending_deletes_timer->metric("spared", report.spared);
+    pending_deletes_timer->metric("outcome_logs_written", outcomes.size());
+    pending_deletes_timer.reset();   /// emits the `pending_deletes` row
 
     /// Wait for the round's whole batch of per-hash freshness-meta writes (condemned during the
     /// fold above, spared/redeleted-confirmed during R3 above) BEFORE the round's retired-list publish and
     /// its single gc/state CAS below — the writer's meta point-read gate must see this round's condemns
     /// durable no later than the ledger it is paired with. `wait()` never throws here: every scheduled job
     /// already caught its own exception (see `scheduleMetaJob`).
-    meta_pool->wait();
+    ///
+    /// PHASE 12/18 `meta_pool_wait`, AND THE ONE HONEST GAP IN THIS INSTRUMENTATION: the work being
+    /// waited on runs on `meta_pool` threads, so none of it appears in this thread's `ProfileEvents`
+    /// delta and the row's `ProfileEvents` map is EMPTY BY CONSTRUCTION. That is not a phase with no
+    /// cost -- it is a phase whose cost this mechanism cannot see, so it carries explicit job counts
+    /// instead: read `jobs_scheduled` / `jobs_completed` next to the duration to tell "the queue was
+    /// deep" from "the endpoint was slow". `jobs_completed` is sampled BEFORE the wait deliberately --
+    /// after it, it would always equal `jobs_scheduled` and say nothing.
+    {
+        GcPhaseTimer t(phase_sink, "meta_pool_wait");
+        const uint64_t scheduled = meta_jobs_scheduled_.load(std::memory_order_relaxed)
+            - meta_jobs_scheduled_at_round_start;
+        const uint64_t completed_on_entry = meta_jobs_completed_.load(std::memory_order_relaxed)
+            - meta_jobs_completed_at_round_start;
+        meta_pool->wait();
+        t.metric("jobs_scheduled", scheduled);
+        t.metric("jobs_completed_on_entry", completed_on_entry);
+        t.metric("jobs_completed", meta_jobs_completed_.load(std::memory_order_relaxed)
+                                   - meta_jobs_completed_at_round_start);
+    }
 
     /// Retired-in-snapshot — there is NO separate retired-list object to publish anymore. The
     /// round's surviving condemned entries were already sealed as `kCondemned` rows inside the fold's
@@ -632,6 +736,14 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// `condemned_summary` the seal carries makes the next round's graduation/carry decisions zero-I/O.
 
     /// The SINGLE round CAS publishes the round, adopted (generation, attempt), and retention cursor.
+    ///
+    /// PHASE 13/18 `round_commit`. It deliberately covers BOTH the retention prune (heavy: LISTs and
+    /// wholesale deletes, bounded at 64 generations a round) and the single `gc/state` CAS (trivial),
+    /// because the prune's writes are only safe as a pre-CAS action and splitting the two would suggest
+    /// they are independently retryable. `generations_visited` vs the prune's actual deletes is what
+    /// separates the two costs inside the row.
+    std::optional<GcPhaseTimer> round_commit_timer;
+    round_commit_timer.emplace(phase_sink, "round_commit");
     GcState next = state;
     next.round = new_round;
     /// The generations the adopted seal's runs physically live in (reference-parent carry can point a
@@ -650,7 +762,11 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// then LOSES, the prune reclaimed one generation deeper than the durably-adopted generation would
     /// imply -- an accepted forensics-window slack, not a data-loss risk: every still-reachable
     /// run/blob is independently protected via `referenced_generations` (captured pre-fold above).
+    const uint64_t pruned_through_before = state.snap_pruned_through;
     pruneSupersededGenerations(generation, attempt, next, referenced_generations);
+    round_commit_timer->metric("generations_visited", next.snap_pruned_through - pruned_through_before);
+    round_commit_timer->metric("pruned_through", next.snap_pruned_through);
+    round_commit_timer->metric("generations_referenced", referenced_generations.size());
     const CasResult res = backend.casPut(layout.gcStateKey(), encodeGcState(next), state_token);
     if (res.outcome != CasOutcome::Committed)
         throw Exception(ErrorCodes::ABORTED,
@@ -658,6 +774,9 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     state = std::move(next);
     state_token = res.token;
     report.round = state.round;
+    round_commit_timer->metric("round", report.round);
+    round_commit_timer->metric("generation", generation);
+    round_commit_timer.reset();   /// emits the `round_commit` row
 
     /// Task 7: the retire pipeline's REMAINING sizes, read from the seal this round's CAS just
     /// committed (`folded.fold_seal.condemned_summary` is TOTAL over every gc-shard -- see its own doc
@@ -680,7 +799,11 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// reclaimer the normal prune would have used, deferred until the ref finally moved off. Best-effort:
     /// a crash between the CAS and here leaks the prefix to fsck (single-crash window, no permanent leak —
     /// but note the cursor already advanced, so a plain retry will NOT re-attempt it; fsck is the backstop).
+    ///
+    /// PHASE 14/18 `handoff_reclaim`.
     {
+        GcPhaseTimer t(phase_sink, "handoff_reclaim");
+        uint64_t objects_reclaimed = 0;
         std::set<uint64_t> new_referenced_generations;
         for (const RunRef & r : folded.fold_seal.blob_target_runs)
             new_referenced_generations.insert(r.generation);
@@ -697,34 +820,45 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
                 continue;   /// already reclaimed this round via another shard's ref
             const uint64_t reclaimed = deletePrefixWholesale(
                 backend, layout.gcGenPrefix(old_ref.generation), std::numeric_limits<uint64_t>::max());
+            objects_reclaimed += reclaimed;
             LOG_TRACE(logger,
                 "CAS GC hand-off: generation {} moved out of the live seal below the retention cursor "
                 "({} objects) — post-CAS wholesale reclaim (the prune had skipped it while referenced)",
                 old_ref.generation, reclaimed);
         }
+        t.metric("generations_reclaimed", handed_off.size());
+        t.metric("objects_reclaimed", objects_reclaimed);
     }
 
     /// Post-CAS: owner-removed manifest bodies — deleted ONLY now, after their decrements were
     /// ADOPTED by the round CAS (delete-after-sealed-decrements). Best-effort: a crash
     /// here leaks bodies to the orphan sweep, never a dangle.
-    for (const auto & [id, token] : folded.mf_cleanup)
+    ///
+    /// PHASE 15/18 `manifest_deletes`.
     {
-        const DeleteOutcome mdel = backend.deleteExact(layout.manifestKey(id), token);   /// NotFound/TokenMismatch tolerated
-        const DeleteClass mdel_class = classifyDeleteOutcome(mdel);
-        if (mdel_class == DeleteClass::Deleted)
-            ++report.manifests_deleted;
-        EventEmitter{*store}.emit([&](CasEvent & e)
+        GcPhaseTimer t(phase_sink, "manifest_deletes");
+        const uint64_t manifests_deleted_before = report.manifests_deleted;
+        for (const auto & [id, token] : folded.mf_cleanup)
         {
-            e.type = CasEventType::ManifestDelete;
-            e.namespace_ = id.root_namespace.string();
-            e.object_kind = CasEventObjectKind::Manifest;
-            e.object_hash = manifestRefDebugString(id.ref);
-            e.token = token.value;
-            e.round = new_round;
-            e.gen = generation;
-            e.outcome = String{deleteClassName(mdel_class)};
-            e.reason = "owner-removed manifest body; exact-token delete after decrements adopted";
-        });
+            const DeleteOutcome mdel = backend.deleteExact(layout.manifestKey(id), token);   /// NotFound/TokenMismatch tolerated
+            const DeleteClass mdel_class = classifyDeleteOutcome(mdel);
+            if (mdel_class == DeleteClass::Deleted)
+                ++report.manifests_deleted;
+            EventEmitter{*store}.emit([&](CasEvent & e)
+            {
+                e.type = CasEventType::ManifestDelete;
+                e.namespace_ = id.root_namespace.string();
+                e.object_kind = CasEventObjectKind::Manifest;
+                e.object_hash = manifestRefDebugString(id.ref);
+                e.token = token.value;
+                e.round = new_round;
+                e.gen = generation;
+                e.outcome = String{deleteClassName(mdel_class)};
+                e.reason = "owner-removed manifest body; exact-token delete after decrements adopted";
+            });
+        }
+        t.metric("attempted", folded.mf_cleanup.size());
+        t.metric("deleted", report.manifests_deleted - manifests_deleted_before);
     }
 
     /// Ref-object cleanup + namespace-cleanup item passes, post-CAS so the durable fold
@@ -741,18 +875,46 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// removed namespace's covered logs persisted as debris until some later fold -- which never comes on
     /// a quiesced pool.
     const bool suppress_destructive = folded.suppress_destructive;
-    runNamespaceCleanupPasses(folded.fold_seal, folded.ref_tables, new_round, suppress_destructive);
-    if (trim_enabled)
-        cleanupRefObjects(folded, suppress_destructive);
+    /// PHASE 16/18 `namespace_cleanup`.
+    {
+        GcPhaseTimer t(phase_sink, "namespace_cleanup");
+        uint64_t pending = 0;
+        uint64_t completed = 0;
+        for (const auto & [key, item] : folded.fold_seal.ns_cleanup_items)
+            (item.state == RefNsCleanupState::Completed ? completed : pending) += 1;
+        runNamespaceCleanupPasses(folded.fold_seal, folded.ref_tables, new_round, suppress_destructive);
+        t.metric("items", folded.fold_seal.ns_cleanup_items.size());
+        t.metric("items_pending", pending);
+        t.metric("items_completed", completed);
+        t.metric("suppressed", suppress_destructive ? 1 : 0);
+    }
+    /// PHASE 17/18 `ref_object_cleanup`. Emitted even when the whole pass is skipped (`trim_enabled` is
+    /// a test seam, `suppressed` gates the deletes), because "this phase did nothing and why" is exactly
+    /// what a reader of a round that reclaimed nothing needs to see.
+    {
+        GcPhaseTimer t(phase_sink, "ref_object_cleanup");
+        if (trim_enabled)
+            cleanupRefObjects(folded, suppress_destructive);
+        t.metric("suppressed", suppress_destructive ? 1 : 0);
+        t.metric("trim_enabled", trim_enabled ? 1 : 0);
+        t.metric("namespaces_planned", folded.ref_tables.size());
+    }
 
     /// Bounded orphan-manifest backstop: cleanup-only cursor progress; never fails the round.
-    try
+    /// PHASE 18/18 `orphan_sweep`.
     {
-        runManifestSweepCursorPass(state, state_token);
-    }
-    catch (const Exception & e)
-    {
-        LOG_WARNING(logger, "CAS gc orphan sweep skipped this round: {}", e.message());
+        GcPhaseTimer t(phase_sink, "orphan_sweep");
+        const String sweep_cursor_before = state.manifest_sweep_cursor;
+        try
+        {
+            runManifestSweepCursorPass(state, state_token);
+        }
+        catch (const Exception & e)
+        {
+            LOG_WARNING(logger, "CAS gc orphan sweep skipped this round: {}", e.message());
+        }
+        t.metric("cursor_advanced", state.manifest_sweep_cursor != sweep_cursor_before ? 1 : 0);
+        t.metric("list_budget_keys", store->poolConfig().manifest_sweep_list_budget_keys);
     }
 
     return report;
@@ -849,6 +1011,13 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// 1. One global paginated LIST of cas/refs/, grouped into per-table (log / snapshot / cleanup-marker)
     /// listings. This single enumeration serves BOTH ref-log intake and
     /// ref-object cleanup planning. Resume is by explicit last-returned-key (`ListPage::next_cursor`).
+    ///
+    /// PHASE 5/18 `fold_ref_list`, covering the LIST, `groupRefKeys`, and probe A -- everything that
+    /// decides WHAT this round will fold, before it reads a single body. This is the round's SECOND full
+    /// enumeration of `cas/refs/` (the first is `defer_decision`'s), and having the two as separate rows
+    /// is how the cost of listing the prefix twice becomes visible instead of hiding inside one blob.
+    std::optional<GcPhaseTimer> ref_list_timer;
+    ref_list_timer.emplace(phase_sink, "fold_ref_list");
     std::vector<String> ref_object_keys;
     {
         static constexpr size_t kListPageLimit = 1000;
@@ -968,6 +1137,13 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         }
         probe_a_holes_this_round = holes;
     }
+    ref_list_timer->metric("ref_keys_listed", ref_object_keys.size());
+    ref_list_timer->metric("namespaces_seen", ref_tables.size());
+    /// Probe A's per-round verdict, on every round, healthy or not: a column that is always 0 is what
+    /// makes the one round where it is not stand out. See `Gc::probe_a_holes_this_round`.
+    ref_list_timer->metric("probe_a_holes", probe_a_holes_this_round);
+    ref_list_timer->metric("ref_folding_aborted", ref_folding_aborted ? 1 : 0);
+    ref_list_timer.reset();   /// emits the `fold_ref_list` row
 
     /// Parent cursors — the per-(ns,shard) cursors a prior round sealed. One-pass round: read them from
     /// the fold seal at the adopted (snap_generation, snap_attempt) (the fold seal IS the coverage record).
@@ -978,6 +1154,15 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// empty would re-fold only journal tails and mass-condemn everything the lost snapshot
     /// protected. NOTE the distinction from a PRESENT seal with an empty per_ns_shard (a legitimate
     /// empty-universe generation) — the audit keys on object absence, not coverage emptiness.
+    ///
+    /// PHASE 6/18 `fold_seal_read`. The scope reaches down to `discover_ref_seal` below, because that is
+    /// a SECOND GET of the SAME key at the SAME (generation, attempt) -- the two reads belong on one row
+    /// or the redundancy is invisible. Everything between them is I/O-free (a `resize`, three lambda
+    /// DEFINITIONS, and plain assignments), so the duration is honestly the two GETs and their decodes.
+    /// Instrumented, NOT fixed: removing the second read is a behaviour change the follow-up study
+    /// decides, and the `redundant_reads` metric is the evidence it will need.
+    std::optional<GcPhaseTimer> seal_read_timer;
+    seal_read_timer.emplace(phase_sink, "fold_seal_read");
     const std::optional<CasFoldSeal> adopted_seal = readFoldSeal(state.snap_generation, state.snap_attempt);
     if (!adopted_seal && state.snap_generation > 0)
         throw Exception(ErrorCodes::CORRUPTED_DATA,
@@ -1139,9 +1324,20 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// pool has none (empty seal). Under the snapshot+log ref model there is no per-shard token-diff Skip:
     /// the "did this table change" signal is simply whether the global LIST returned any log id above the
     /// table's durable cursor, which the per-table loop below tests directly.
+    /// SECOND read of the key `adopted_seal` already holds: same generation, same attempt, same bytes
+    /// (nothing between the two touches `state.snap_generation` / `snap_attempt` or writes that key).
+    /// One redundant GET per folding round, and the round's FIFTH GET of this one key overall --
+    /// `graduationDue` and `preFoldRefScan` make two in `defer_decision`, `parent_seal_read` a third,
+    /// `adopted_seal` above a fourth. Recorded on this row, not fixed here.
     CasFoldSeal discover_ref_seal;
     if (const auto fold_seal = readFoldSeal(state.snap_generation, state.snap_attempt))
         discover_ref_seal = *fold_seal;
+    seal_read_timer->metric("seal_reads", 2);
+    seal_read_timer->metric("redundant_reads", 1);
+    seal_read_timer->metric("parent_cursors", parent_cursors.size());
+    seal_read_timer->metric("parent_runs", discover_ref_seal.blob_target_runs.size());
+    seal_read_timer->metric("ns_cleanup_items", discover_ref_seal.ns_cleanup_items.size());
+    seal_read_timer.reset();   /// emits the `fold_seal_read` row
 
     /// Each fully-folded remove_namespace transaction seeds a namespace-cleanup item.
     std::vector<std::pair<RootNamespace, RefTxnId>> new_removals;
@@ -1152,6 +1348,16 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// per-blob `BlobDelta`s to `deltas`). The durable cursor advances per FULLY folded log; a missing
     /// manifest body clamps this table below the log (barrier, re-read next round) while other tables keep
     /// folding. One transaction = one key, so logs of one table fold in strict id order.
+    ///
+    /// PHASE 7/18 `fold_ref_intake`: one GET per new ref log plus one HEAD+GET per manifest edge, which
+    /// on a busy pool is where the round's object-read budget goes. It also carries probe B1's two
+    /// numbers -- reported on EVERY healthy round, so "logs_intended always equals logs_applied" becomes
+    /// an observable property of the table rather than a claim in a comment.
+    std::optional<GcPhaseTimer> intake_timer;
+    intake_timer.emplace(phase_sink, "fold_ref_intake");
+    uint64_t intake_tables_changed = 0;
+    uint64_t intake_tables_clamped = 0;
+    uint64_t intake_dead_precommits_skipped = 0;
     for (auto & [ns_str, listing] : ref_tables)
     {
         if (ref_folding_aborted)
@@ -1269,6 +1475,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                                        .build_sequence = edge.manifest_id.ref.build_sequence}))
                 {
                     ProfileEvents::increment(ProfileEvents::CasGcDeadPrecommitSkipped);
+                    ++intake_dead_precommits_skipped;
                     EventEmitter{*store}.emit([&](CasEvent & ev)
                     {
                         ev.type = CasEventType::GcFoldClamp;   /// reuse the fold-decision channel; outcome distinguishes
@@ -1330,7 +1537,12 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         cov.classification = clamped ? 4 : (table_changed ? 2 : 1);
         result.fold_seal.per_ns_shard[cursor_key] = cov;
         if (table_changed)
+        {
             folded_any = true;
+            ++intake_tables_changed;
+        }
+        if (clamped)
+            ++intake_tables_clamped;
     }
 
     /// All-or-nothing: a malformed key/body anywhere aborts the round's ref folding. Discard
@@ -1354,6 +1566,47 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         }
     }
 
+    /// PROBE B1's recomputation, taken HERE rather than at the seal write: every input it reads
+    /// (`ref_tables`, `parent_cursors`, the sealed `per_ns_shard`) is final as of this line, and nothing
+    /// between here and the seal write touches any of them. Computing it inside the intake phase is what
+    /// lets the `fold_ref_intake` row carry both numbers; the comparison and its fail-closed throw stay
+    /// where they were, just before the seal write. Both stay 0 on a ref-folding abort -- that path
+    /// discards every cursor advance and carries the parent cursors, so the identity does not apply.
+    logs_intended_this_round = 0;
+    logs_applied_this_round = 0;
+    if (!ref_folding_aborted)
+    {
+        uint64_t logs_intended = 0;
+        for (const auto & [ns_str, listing] : ref_tables)
+        {
+            const String cursor_key = cursorKey(RootNamespace{ns_str}, /*shard*/0);
+            RefTxnId cursor_prev{};
+            if (const auto pit = parent_cursors.find(cursor_key); pit != parent_cursors.end())
+                cursor_prev = pit->second.last_folded_ref_id;
+            RefTxnId sealed{};
+            if (const auto sit = result.fold_seal.per_ns_shard.find(cursor_key);
+                sit != result.fold_seal.per_ns_shard.end())
+                sealed = sit->second.last_folded_ref_id;
+            for (const RefTxnId & id : listing.logs)
+                if (cursor_prev < id && !(sealed < id))
+                    ++logs_intended;
+        }
+        logs_intended_this_round = logs_intended;
+        logs_applied_this_round = logs_applied;
+    }
+
+    intake_timer->metric("logs_intended", logs_intended_this_round);
+    intake_timer->metric("logs_applied", logs_applied_this_round);
+    intake_timer->metric("deltas_emitted", deltas.size());
+    intake_timer->metric("txns_opened", ledger.txns.size());
+    intake_timer->metric("tables_scanned", ref_tables.size());
+    intake_timer->metric("tables_changed", intake_tables_changed);
+    intake_timer->metric("tables_clamped", intake_tables_clamped);
+    intake_timer->metric("dead_precommits_skipped", intake_dead_precommits_skipped);
+    intake_timer->metric("namespace_removals", new_removals.size());
+    intake_timer->metric("ref_folding_aborted", ref_folding_aborted ? 1 : 0);
+    intake_timer.reset();   /// emits the `fold_ref_intake` row
+
     /// Reuse the round's single ref LIST for post-CAS ref-object cleanup: one LIST serves
     /// intake AND cleanup planning).
     result.ref_tables = ref_tables;
@@ -1363,8 +1616,17 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// promote a Pending item to Completed once its physical `@cas@` prefixes (manifest bodies + verbatim
     /// files) are empty. The Pending->Completed transition depends only on physical emptiness, so a carried
     /// item still advances even on an abort.
+    ///
+    /// PHASE 8/18 `fold_ns_cleanup_scan`: TWO prefix LISTs per not-yet-Completed item
+    /// (`namespacePhysicallyEmpty`), which is the phase's whole cost and the reason it is separated from
+    /// the intake it sits next to.
+    std::optional<GcPhaseTimer> ns_scan_timer;
+    ns_scan_timer.emplace(phase_sink, "fold_ns_cleanup_scan");
     result.fold_seal.ns_cleanup_items =
         adopted_seal ? adopted_seal->ns_cleanup_items : std::map<String, RefNsCleanupItem>{};
+    const uint64_t ns_items_carried = result.fold_seal.ns_cleanup_items.size();
+    uint64_t ns_items_scanned = 0;
+    uint64_t ns_items_completed_now = 0;
     if (!ref_folding_aborted)
         for (const auto & [rns, remove_txn_id] : new_removals)
         {
@@ -1373,8 +1635,15 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                 .ns = rns, .remove_txn_id = remove_txn_id, .state = RefNsCleanupState::Pending};
         }
     for (auto & [key, item] : result.fold_seal.ns_cleanup_items)
-        if (item.state != RefNsCleanupState::Completed && namespacePhysicallyEmpty(item.ns))
-            item.state = RefNsCleanupState::Completed;
+        if (item.state != RefNsCleanupState::Completed)
+        {
+            ++ns_items_scanned;
+            if (namespacePhysicallyEmpty(item.ns))
+            {
+                item.state = RefNsCleanupState::Completed;
+                ++ns_items_completed_now;
+            }
+        }
 
     /// Retire a Completed item once its completion artifacts are DURABLY OBSERVED in this round's own
     /// global LIST -- the `_cleanup` marker present AND (the `Removed` snapshot present OR superseded by a
@@ -1408,6 +1677,12 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             else
                 ++it;
         }
+    ns_scan_timer->metric("items_carried", ns_items_carried);
+    ns_scan_timer->metric("items_added", new_removals.size());
+    ns_scan_timer->metric("items_scanned", ns_items_scanned);
+    ns_scan_timer->metric("items_completed_now", ns_items_completed_now);
+    ns_scan_timer->metric("items_final", result.fold_seal.ns_cleanup_items.size());
+    ns_scan_timer.reset();   /// emits the `fold_ns_cleanup_scan` row
 
     /// The parent generation's per-shard run segments, resolved from
     /// the parent fold seal's `blob_target_runs` and grouped by the ref's explicit `shard`. The same seal
@@ -1486,6 +1761,16 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// must not graduate NOR execute pending deletes (the merge carries everything; condemnation
     /// and sparing continue). Deletes resume on the first clamp-free pass. This is the honest-mode
     /// counterpart of the model's SabotageSkipChangedShard counterexample.
+    ///
+    /// PHASE 9/18 `fold_reduce`: the prior-run streaming GETs, one HEAD per zero-transition candidate,
+    /// and the run PUTs -- the heaviest phase of a folding round on a pool with churn. It also carries
+    /// probe B2's verdict (`txns_unapplied`), which is 0 on every committed round because a nonzero
+    /// value throws a few lines below; the row is therefore the forensic record of a round that failed.
+    std::optional<GcPhaseTimer> reduce_timer;
+    reduce_timer.emplace(phase_sink, "fold_reduce");
+    const uint64_t deltas_in = deltas.size();
+    const uint64_t condemned_before = report.condemned;
+    uint64_t shards_pure_carry = 0;
     result.suppress_destructive = !report.anomalies.empty();
     const bool suppress_destructive = result.suppress_destructive;
     if (suppress_destructive)
@@ -1506,6 +1791,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             /// Pure ref-carry: nothing changed and no condemned entries to settle => zero run I/O. Carry the
             /// parent shard-0 refs + summary into the seal so coverage/resume/graduation stay durable.
             carryParentRefs(0);
+            ++shards_pure_carry;
         }
         else
         {
@@ -1542,6 +1828,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             {
                 /// Pure ref-carry for this shard: empty delta + no condemned entries => zero run I/O.
                 carryParentRefs(shard);
+                ++shards_pure_carry;
                 continue;
             }
             /// A reducer owns exactly one disjoint shard. Two replicas may run reducers for DIFFERENT
@@ -1582,7 +1869,36 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                 "but a persistent nonzero rate means removal deltas are reaching the reducer without "
                 "their matching activation, which is a correctness signal) — example: blob {} source {}",
                 total_unmatched_removes, blobIdOf(example->ref), u128ToHex(example->source_id));
+        reduce_timer->metric("unmatched_removes", total_unmatched_removes);
     }
+
+    /// PROBE B2's ledger verdict, computed inside the reduce phase so the row carries it; the
+    /// fail-closed throw it drives stays below, at its original site before the seal write.
+    const std::vector<uint32_t> unapplied_txns = ledger.unapplied();
+    txns_unapplied_this_round = unapplied_txns.size();
+    {
+        uint64_t graduated = 0;
+        uint64_t spared = 0;
+        uint64_t redelete_pending = 0;
+        for (const RetiredMergeResult & merge : result.retired_merge)
+        {
+            graduated += merge.graduated.size();
+            spared += merge.spared.size();
+            redelete_pending += merge.redelete.size();
+        }
+        reduce_timer->metric("shards_total", state.gc_shards);
+        reduce_timer->metric("shards_pure_carry", shards_pure_carry);
+        reduce_timer->metric("shards_reduced", state.gc_shards - shards_pure_carry);
+        reduce_timer->metric("deltas_in", deltas_in);
+        reduce_timer->metric("runs_written", result.fold_seal.blob_target_runs.size());
+        reduce_timer->metric("condemned", report.condemned - condemned_before);
+        reduce_timer->metric("graduated", graduated);
+        reduce_timer->metric("spared", spared);
+        reduce_timer->metric("redelete_pending", redelete_pending);
+        reduce_timer->metric("suppress_destructive", suppress_destructive ? 1 : 0);
+        reduce_timer->metric("txns_unapplied", txns_unapplied_this_round);
+    }
+    reduce_timer.reset();   /// emits the `fold_reduce` row
 
     /// The part-manifest cleanup RUN + its fold-seal record are removed: the run
     /// object had no reader — the manifest cleanups execute inline from `result.mf_cleanup` (below /
@@ -1600,59 +1916,48 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// of loss, so the round fails CLOSED: nothing is adopted, GC reclaims and deletes nothing, and an
     /// operator has to intervene. Thrown before the seal write, and therefore long before the single
     /// `gc/state` CAS, so the whole round evaporates.
-    txns_unapplied_this_round = 0;
-    if (const std::vector<uint32_t> unapplied = ledger.unapplied(); !unapplied.empty())
+    /// `unapplied_txns` was computed in the reduce phase above (so its row could report it); the verdict
+    /// itself is unchanged and still fires here, before the seal write.
+    if (!unapplied_txns.empty())
     {
-        txns_unapplied_this_round = unapplied.size();
         String detail;
-        for (size_t i = 0; i < unapplied.size() && i < 8; ++i)
+        for (size_t i = 0; i < unapplied_txns.size() && i < 8; ++i)
         {
             if (i != 0)
                 detail += ", ";
-            detail += ledger.namespaces[unapplied[i]] + "@" + renderRefTxnId(ledger.txns[unapplied[i]]);
+            detail += ledger.namespaces[unapplied_txns[i]] + "@"
+                + renderRefTxnId(ledger.txns[unapplied_txns[i]]);
         }
-        ProfileEvents::increment(ProfileEvents::CasGcUnappliedFoldedTxns, unapplied.size());
+        ProfileEvents::increment(ProfileEvents::CasGcUnappliedFoldedTxns, unapplied_txns.size());
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "CAS GC fold: {} ref transaction(s) folded and merged into the round buffers but NONE of "
             "their blob deltas reached a shard reducer ({}{}). The round would have advanced its "
             "cursor past a transaction it never applied. GC refuses to commit the round; recover with "
             "SYSTEM CONTENT ADDRESSED GC REBUILD.",
-            unapplied.size(), detail, unapplied.size() > 8 ? ", ..." : "");
+            unapplied_txns.size(), detail, unapplied_txns.size() > 8 ? ", ..." : "");
     }
 
-    /// PROBE B1's comparison. Skipped on a ref-folding abort: that path deliberately discards every
-    /// cursor advance and carries the parent cursors, so the identity does not apply.
-    logs_intended_this_round = 0;
-    logs_applied_this_round = 0;
-    if (!ref_folding_aborted)
+    /// PROBE B1's comparison. Both terms were derived at the end of the ref intake (see the
+    /// recomputation there, which is also what the `fold_ref_intake` row reports) and are 0 on a
+    /// ref-folding abort, where the identity does not apply -- so the inequality below can only fire on
+    /// a round that actually folded.
+    if (logs_intended_this_round != logs_applied_this_round)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS GC fold: the round sealed coverage over {} ref log(s) but only {} fully folded -- "
+            "a cursor advanced past a log this round never applied. GC refuses to commit the round; "
+            "recover with SYSTEM CONTENT ADDRESSED GC REBUILD.",
+            logs_intended_this_round, logs_applied_this_round);
+
+    /// PHASE 10/18 `fold_seal_write`: one PUT (or, on a deterministic replay, a byte-compare GET).
     {
-        uint64_t logs_intended = 0;
-        for (const auto & [ns_str, listing] : ref_tables)
-        {
-            const String cursor_key = cursorKey(RootNamespace{ns_str}, /*shard*/0);
-            RefTxnId cursor_prev{};
-            if (const auto pit = parent_cursors.find(cursor_key); pit != parent_cursors.end())
-                cursor_prev = pit->second.last_folded_ref_id;
-            RefTxnId sealed{};
-            if (const auto sit = result.fold_seal.per_ns_shard.find(cursor_key);
-                sit != result.fold_seal.per_ns_shard.end())
-                sealed = sit->second.last_folded_ref_id;
-            for (const RefTxnId & id : listing.logs)
-                if (cursor_prev < id && !(sealed < id))
-                    ++logs_intended;
-        }
-        if (logs_intended != logs_applied)
-            throw Exception(ErrorCodes::CORRUPTED_DATA,
-                "CAS GC fold: the round sealed coverage over {} ref log(s) but only {} fully folded -- "
-                "a cursor advanced past a log this round never applied. GC refuses to commit the round; "
-                "recover with SYSTEM CONTENT ADDRESSED GC REBUILD.",
-                logs_intended, logs_applied);
-        logs_intended_this_round = logs_intended;
-        logs_applied_this_round = logs_applied;
+        GcPhaseTimer t(phase_sink, "fold_seal_write");
+        const String seal_body = encodeFoldSeal(result.fold_seal);
+        t.metric("seal_bytes", seal_body.size());
+        t.metric("seal_runs", result.fold_seal.blob_target_runs.size());
+        t.metric("seal_namespaces", result.fold_seal.per_ns_shard.size());
+        t.metric("ns_cleanup_items", result.fold_seal.ns_cleanup_items.size());
+        putDeterministicArtifact(backend, layout.foldSealKey(new_generation, attempt), seal_body);
     }
-
-    putDeterministicArtifact(backend, layout.foldSealKey(new_generation, attempt),
-                             encodeFoldSeal(result.fold_seal));
 
     /// One-pass round: the fold NO LONGER CASes gc/state. (new_generation, attempt) are adopted
     /// in-memory here and committed — together with the round, the retired refs, and the retention

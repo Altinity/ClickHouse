@@ -16,7 +16,8 @@ namespace DB
 ColumnsDescription ContentAddressedGarbageCollectionLogElement::getColumnsDescription()
 {
     auto type_enum = std::make_shared<DataTypeEnum8>(DataTypeEnum8::Values{
-        {"Start", static_cast<Int8>(START)}, {"Finish", static_cast<Int8>(FINISH)}});
+        {"Start", static_cast<Int8>(START)}, {"Finish", static_cast<Int8>(FINISH)},
+        {"Phase", static_cast<Int8>(PHASE)}});
     auto outcome_enum = std::make_shared<DataTypeEnum8>(DataTypeEnum8::Values{
         {"Unknown", static_cast<Int8>(UNKNOWN)}, {"Success", static_cast<Int8>(SUCCESS)},
         {"NotALeader", static_cast<Int8>(NOT_A_LEADER)}, {"Error", static_cast<Int8>(FAILED)},
@@ -31,7 +32,7 @@ ColumnsDescription ContentAddressedGarbageCollectionLogElement::getColumnsDescri
         {"event_date", std::make_shared<DataTypeDate>(), "Event date."},
         {"event_time", std::make_shared<DataTypeDateTime>(), "Event time."},
         {"event_time_microseconds", std::make_shared<DataTypeDateTime64>(6), "Event time with microseconds."},
-        {"event_type", type_enum, "Start or Finish of a GC round."},
+        {"event_type", type_enum, "Start or Finish of a GC round, or one Phase of it."},
         {"disk_name", lc_string, "Content-addressed disk the round ran on."},
         {"srid", lc_string, "server_root_id of the mount whose GC scheduler ran this round. Distinguishes concurrent mounters of the same shared pool; join on this column when correlating rounds against `system.content_addressed_mounts`."},
         {"gc_id", std::make_shared<DataTypeString>(), "GC scheduler instance id (which mounter)."},
@@ -52,7 +53,15 @@ ColumnsDescription ContentAddressedGarbageCollectionLogElement::getColumnsDescri
         {"duration_ms", std::make_shared<DataTypeUInt64>(), "Round wall-clock duration (Finish)."},
         {"error", std::make_shared<DataTypeString>(), "Exception text when outcome = Error."},
         {"ProfileEvents", std::make_shared<DataTypeMap>(lc_string, std::make_shared<DataTypeUInt64>()),
-            "Per-round ProfileEvents delta (the Cas* counters and S3 events for this round)."},
+            "On a Start/Finish row: the per-round ProfileEvents delta (the Cas* counters and S3 events for this round). On a Phase row: THAT PHASE's delta, so `GROUP BY phase` over `ProfileEvents['S3ListObjects']` attributes the round's LIST budget to the phase that spent it. Empty on the `meta_pool_wait` row by construction — that phase's work runs on other threads (read its `phase_metrics` instead)."},
+        {"round_id", std::make_shared<DataTypeString>(),
+            "Correlator for every row of one round attempt (its Start, each Phase, and its Finish). Minted per attempt; unlike `round` it exists even for a round that never committed and for a round that never led. Group by this column to reconstruct one round."},
+        {"phase", lc_string,
+            "The GC phase this row describes (empty on Start/Finish), in execution order: lease, heartbeat_floor, defer_decision, parent_seal_read, fold_ref_list, fold_seal_read, fold_ref_intake, fold_ns_cleanup_scan, fold_reduce, fold_seal_write, pending_deletes, meta_pool_wait, round_commit, handoff_reclaim, manifest_deletes, namespace_cleanup, ref_object_cleanup, orphan_sweep. A round that defers, or that never acquires the lease, emits only the phases it reached."},
+        {"phase_duration_us", std::make_shared<DataTypeUInt64>(),
+            "Wall-clock duration of this phase in microseconds (Phase rows only). Microseconds because several phases are routinely sub-millisecond and the point is to see when they are not. Phase durations do not sum to the round's `duration_ms`: the round also does untimed bookkeeping between phases."},
+        {"phase_metrics", std::make_shared<DataTypeMap>(lc_string, std::make_shared<DataTypeUInt64>()),
+            "Phase-specific semantic counts a phase computes for itself and no ProfileEvent can supply (Phase rows only) — for example `changed_shards` on defer_decision, `probe_a_holes` on fold_ref_list, `logs_intended`/`logs_applied` on fold_ref_intake, `txns_unapplied` on fold_reduce, `jobs_scheduled`/`jobs_completed` on meta_pool_wait. The verb counts ride the `ProfileEvents` column of the same row."},
     };
 }
 
@@ -87,6 +96,16 @@ void ContentAddressedGarbageCollectionLogElement::appendToBlock(MutableColumns &
         Map map;
         map.reserve(profile_events.size());
         for (const auto & [k, v] : profile_events)
+            map.push_back(Tuple{k, v});
+        columns[i++]->insert(map);
+    }
+    columns[i++]->insert(round_id);
+    columns[i++]->insert(phase);
+    columns[i++]->insert(phase_duration_us);
+    {
+        Map map;
+        map.reserve(phase_metrics.size());
+        for (const auto & [k, v] : phase_metrics)
             map.push_back(Tuple{k, v});
         columns[i++]->insert(map);
     }

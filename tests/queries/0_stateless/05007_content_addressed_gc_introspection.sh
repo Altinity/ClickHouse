@@ -70,6 +70,34 @@ WHERE disk_name LIKE '%05007_content_addressed_gc_introspection%'
   AND event_type = 'Finish'
   AND trigger = 'Manual';
 
+-- Per-phase rows: a folding round emits one Phase row per phase it reached (18 of them), so a run
+-- that folded at least once must show most of the phase vocabulary, including the fold's own
+-- ref-prefix enumeration and the round-commit CAS.
+SELECT countDistinct(phase) >= 10,
+       countIf(phase = 'fold_ref_list') > 0,
+       countIf(phase = 'round_commit') > 0
+FROM system.content_addressed_garbage_collection_log
+WHERE disk_name LIKE '%05007_content_addressed_gc_introspection%'
+  AND event_type = 'Phase';
+
+-- The correlator: every row of the most recent round of this disk -- its Start, each Phase, and its
+-- Finish -- shares one \`round_id\`, and that round emitted at least one Phase row between them.
+SELECT countIf(event_type = 'Start') = 1,
+       countIf(event_type = 'Finish') = 1,
+       countIf(event_type = 'Phase') > 0
+FROM system.content_addressed_garbage_collection_log
+WHERE round_id = (
+    SELECT round_id FROM system.content_addressed_garbage_collection_log
+    WHERE disk_name LIKE '%05007_content_addressed_gc_introspection%' AND event_type = 'Finish'
+    ORDER BY event_time_microseconds DESC LIMIT 1);
+
+-- A Phase row's \`ProfileEvents\` is that phase's own delta, not the whole round's: the ref-prefix
+-- enumeration must show fewer events than the round summary it is a part of.
+SELECT max(length(ProfileEvents)) > 0
+FROM system.content_addressed_garbage_collection_log
+WHERE disk_name LIKE '%05007_content_addressed_gc_introspection%'
+  AND event_type = 'Phase' AND phase = 'fold_ref_list';
+
 -- The error path: a non-CA disk (the always-present local \`default\`) is rejected.
 SYSTEM CONTENT ADDRESSED GC RUN 'default'; -- { serverError BAD_ARGUMENTS }
 

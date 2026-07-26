@@ -118,6 +118,31 @@ struct RoundReport
     }
 };
 
+/// One phase of one GC round. Pure data with no Interpreters dependency -- the same discipline
+/// `GcRoundLogRecord` follows, so the round engine can be instrumented without linking the system-log
+/// machinery. `CasGcScheduler` converts it into one `Phase` row of
+/// `system.content_addressed_garbage_collection_log`.
+///
+/// DELIBERATELY NO VERB COLUMNS. `profile_events` is this phase's delta of the ordinary process
+/// counters, so `ProfileEvents['S3ListObjects']` on a `Phase` row answers "which phase burns the LIST
+/// budget" with no schema invention; `metrics` carries only the semantic counts a phase computes for
+/// itself and no counter can supply.
+///
+/// This lives in `CasGc.h` rather than next to `GcRoundLogRecord` in `CasGcScheduler.h` because
+/// `Cas::Gc` holds the sink as a member, and `CasGcScheduler.h` already includes this header -- putting
+/// it there would make the include cycle.
+struct GcPhaseRecord
+{
+    String phase;
+    UInt64 duration_us = 0;
+    std::map<String, UInt64> metrics;
+    std::map<String, UInt64> profile_events;   /// this phase's ProfileEvents delta
+};
+
+/// Where a phase record goes. Installed for the duration of one round by `CasGcScheduler`; empty
+/// elsewhere (a unit test driving `Gc` directly emits nothing).
+using GcPhaseSink = std::function<void(const GcPhaseRecord &)>;
+
 /// The pre-fold enumeration of `cas/refs/`, retained rather than discarded. Two independent uses:
 /// the DEFER signal (`changed_shards`, unchanged semantics), and the round's SECOND witness for the
 /// skipped-transaction detector — `Gc::fold` performs its own full enumeration of the same prefix a
@@ -271,6 +296,12 @@ public:
     /// not-provably-dead over-protection), mints round/generation above every surviving ack/number,
     /// publishes EMPTY retired lists, and CASes gc/state. Live-conservative; fail-closed refusals.
     RebuildReport rebuildBaseline(bool force);
+
+    /// Install (or clear) the per-phase sink for the round that is about to run. `CasGcScheduler`
+    /// installs it around one `runRegularRound` and clears it afterwards, so the sink never outlives the
+    /// scheduler locals it captures. Not thread-safe, like the rest of `Gc`: one pacing thread drives one
+    /// instance, and the scheduler holds `gc_round_mutex` across both the install and the round.
+    void setPhaseSink(GcPhaseSink sink) { phase_sink = std::move(sink); }
 
     void setRebuildEdgeBudgetForTest(uint64_t n) { rebuild_edge_budget_override = n; }
 
@@ -468,6 +499,9 @@ private:
     void forgetCondemnMarker(const BlobRef & ref, const Token & token);
 
     PoolPtr store;
+    /// Where `GcPhaseTimer` sends one record per GC phase. Empty unless a `CasGcScheduler` installed one
+    /// for the current round, in which case every phase of that round emits a row.
+    GcPhaseSink phase_sink;
     UInt128 gc_id{};   /// this leader's identity (random u128, never 0)
     /// Every round-engine log line goes through this logger (see the constructor's `log_` doc
     /// comment) so multi-disk processes can attribute GC logs to the disk/srid that produced them.
@@ -512,6 +546,14 @@ private:
     /// never touches a possibly-null `store` at member-init time). A `unique_ptr` (not a plain member)
     /// so construction can happen in the ctor body, after validating `store`.
     std::unique_ptr<ThreadPool> meta_pool;
+
+    /// Cumulative counts of the per-hash freshness-meta jobs this leader handed to `meta_pool` and of
+    /// those that finished. The `meta_pool_wait` phase reports the ROUND's deltas: that phase's work runs
+    /// on other threads, so its `ProfileEvents` delta is empty BY CONSTRUCTION, and these two numbers are
+    /// what distinguish "the queue was deep" from "the endpoint was slow" when read next to its duration.
+    /// Atomic because a pool thread increments `meta_jobs_completed_` while the round thread reads it.
+    std::atomic<uint64_t> meta_jobs_scheduled_{0};
+    std::atomic<uint64_t> meta_jobs_completed_{0};
 
     /// In-process confirmations of durable condemn-marker writes, keyed (blob, exact incarnation-token
     /// value): inserted by `scheduleCondemnMarkerWrite`'s completion (and the rebuild's synchronous
