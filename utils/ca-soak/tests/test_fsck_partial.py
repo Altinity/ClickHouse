@@ -148,7 +148,10 @@ def test_pool_consistent_gate_does_not_count_a_partial_read_as_clean():
     def sleep(_s):
         clock["t"] += 10.0
 
-    with pytest.raises(CheckpointFailure, match="never reached a self-consistent state"):
+    # The assertion is that the gate REFUSES a partial read, not what it says about it. The wording moved
+    # when the partial path got its own honest message (see the SCAN-COST test below); the intent -- never
+    # return successfully on a partial scan -- is unchanged and is what this pins.
+    with pytest.raises(CheckpointFailure, match="SCAN-COST problem"):
         wait_for_pool_consistent(lambda: dict(partial_clean), timeout_s=30, stable=2,
                                  sleep_fn=sleep, monotonic_fn=monotonic)
 
@@ -163,3 +166,51 @@ def test_pool_consistent_gate_still_returns_on_complete_clean_reads():
                                    sleep_fn=lambda _s: clock.__setitem__("t", clock["t"] + 1),
                                    monotonic_fn=lambda: clock["t"])
     assert got["reachable"] == 5
+
+
+# ---------------------------------------------------------------------------
+# The regression my own partial work caused
+# ---------------------------------------------------------------------------
+
+def test_a_partial_only_window_does_not_claim_persistent_dangling():
+    """A scan that never FINISHED has no verdict; saying "PERSISTENT dangling" about it is a lie.
+
+    Happened for real on 2026-07-26. `partial=True` was wired into `wait_for_pool_consistent`, whose whole
+    job is to WAIT FOR PROOF of consistency. A partial scan can never supply that proof, so once the pool
+    grew past what the scan could finish in its budget the gate span its full bound and then raised the
+    hard-coded durability message — announcing "PERSISTENT dangling=0 ... a REAL crash-recovery /
+    object-store durability finding" while `dangling` was 0 and `reachable` was 0.
+
+    Two things were wrong and both are fixed: the waiters take COMPLETE scans again (partial belongs on
+    one-shot reporting reads, where an honest lower bound beats nothing), and the timeout path now says
+    which of the two situations it is in.
+    """
+    from soak.run import wait_for_pool_consistent, CheckpointFailure
+
+    partial_only = {"dangling": 0, "exit_code": 0, "reachable": 0, "unreachable": 0,
+                    "partial": 1, "reason": "fsck: exceeded the deadline during listing"}
+    clock = {"t": 0.0}
+
+    with pytest.raises(CheckpointFailure) as ei:
+        wait_for_pool_consistent(lambda: dict(partial_only), timeout_s=30, stable=2,
+                                 sleep_fn=lambda _s: clock.__setitem__("t", clock["t"] + 10),
+                                 monotonic_fn=lambda: clock["t"])
+
+    msg = str(ei.value)
+    assert "SCAN-COST problem" in msg, msg
+    assert "PERSISTENT dangling" not in msg, (
+        "a scan that never completed must not be reported as a durability finding: " + msg)
+
+
+def test_a_real_persistent_dangling_still_says_so():
+    """The genuine INV-NO-LOSS message must survive — the fix must not mute a real finding."""
+    from soak.run import wait_for_pool_consistent, CheckpointFailure
+
+    really_dangling = {"dangling": 7, "exit_code": 0, "reachable": 100, "unreachable": 0}
+    clock = {"t": 0.0}
+
+    with pytest.raises(CheckpointFailure) as ei:
+        wait_for_pool_consistent(lambda: dict(really_dangling), timeout_s=30, stable=2,
+                                 sleep_fn=lambda _s: clock.__setitem__("t", clock["t"] + 10),
+                                 monotonic_fn=lambda: clock["t"])
+    assert "PERSISTENT dangling=7" in str(ei.value)

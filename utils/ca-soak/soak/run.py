@@ -676,7 +676,7 @@ def checkpoint(driver, cluster, model, phase, *, strict_unreachable=False):
         if phase == 2:
             try:
                 f = wait_for_pool_consistent(
-                    lambda: run_fsck(FSCK_CONTAINER, timeout_s=180, partial=True)
+                    lambda: run_fsck(FSCK_CONTAINER, timeout_s=180)
                 )
                 _fsck_is_detail = True   # run_fsck defaults to detail=True
             except FsckTimeout as _e:
@@ -964,6 +964,18 @@ def wait_for_pool_consistent(fsck_fn, *, timeout_s: float = 180.0, stable: int =
                     f"durability finding -- continuing on the last clean reading "
                     f"(reachable={last_clean.get('reachable')} unreachable={last_clean.get('unreachable')}).")
                 return last_clean
+            if last.get("partial"):
+                # NOT a durability finding: the scan never FINISHED, so it never had a verdict to give.
+                # Distinguished explicitly because the message below asserts a real INV-NO-LOSS violation,
+                # and emitting it for a slow scan is how an operator gets sent after data loss that did not
+                # happen. Seen for real on 2026-07-26 when `partial=True` was wired into this waiter: it
+                # reported "PERSISTENT dangling" while dangling was 0 and reachable was 0.
+                raise CheckpointFailure(
+                    f"CA pool consistency could not be ESTABLISHED within {timeout_s:.0f}s: every fsck in "
+                    f"the window returned PARTIAL (reason: {last.get('reason', 'unstated')}), so the scan "
+                    f"never produced a verdict. This is a SCAN-COST problem, not a durability finding -- "
+                    f"`dangling` was {last.get('dangling')} over the subset actually walked. Raise the fsck "
+                    f"budget or reduce pool size before reading anything into this.")
             raise CheckpointFailure(
                 f"CA pool never reached a self-consistent state (fsck dangling==0) within {timeout_s:.0f}s "
                 f"after a fault window -- PERSISTENT dangling={last.get('dangling')} "
@@ -1484,7 +1496,7 @@ def run_phase3(args):
             # Entry gate only needs dangling/exit_code -> cheap summary fsck (detail=False).
             # Each poll is bounded at 180s; FsckTimeout degrades to a logged skip (B146/B154).
             try:
-                wait_for_pool_consistent(lambda: run_fsck(FSCK_CONTAINER, detail=False, timeout_s=180, partial=True))
+                wait_for_pool_consistent(lambda: run_fsck(FSCK_CONTAINER, detail=False, timeout_s=180))
             except FsckTimeout as _e:
                 log(f"WARNING [B146/B154] {label}: entry-gate fsck timed out ({_e}); "
                     f"proceeding to checkpoint without pool-consistent gate — soak continues")
@@ -1638,7 +1650,7 @@ def run_phase3(args):
         # Quiesce-before-dump: do NOT record a bare fsck on a still-churning pool (it false-positives
         # transient `dangling` — B141/B144/B145). Settle to a stable `dangling==0` (or label the
         # verdict transient/persistent) before recording it.
-        f, fsck_status = settle_fsck_for_dump(lambda: run_fsck(FSCK_CONTAINER, timeout_s=180, partial=True))
+        f, fsck_status = settle_fsck_for_dump(lambda: run_fsck(FSCK_CONTAINER, timeout_s=180))
         op_id = last_op.op_id if last_op is not None else None
         last_op_d = last_op.__dict__ if last_op is not None else None
         payload = write_failure(
@@ -1836,7 +1848,7 @@ def main(argv=None):
                 # PERSISTENT dangling>0 past the bound is escalated as a REAL durability finding.
                 # Each poll is bounded at 180s; FsckTimeout degrades to a logged skip (B146/B154).
                 try:
-                    wait_for_pool_consistent(lambda: run_fsck(FSCK_CONTAINER, timeout_s=180, partial=True))
+                    wait_for_pool_consistent(lambda: run_fsck(FSCK_CONTAINER, timeout_s=180))
                 except FsckTimeout as _e:
                     log(f"WARNING [B146/B154] {label}: entry-gate fsck timed out ({_e}); "
                         f"proceeding to checkpoint without pool-consistent gate — soak continues")
@@ -1933,7 +1945,7 @@ def main(argv=None):
             n1 = n2 = None
         # Quiesce-before-dump: settle the fsck to a stable `dangling==0` (or label it transient/
         # persistent) rather than recording a bare fsck on a churning pool (B141/B144/B145).
-        f, fsck_status = settle_fsck_for_dump(lambda: run_fsck(FSCK_CONTAINER, timeout_s=180, partial=True))
+        f, fsck_status = settle_fsck_for_dump(lambda: run_fsck(FSCK_CONTAINER, timeout_s=180))
         op_id = last_op.op_id if last_op is not None else None
         last_op_d = last_op.__dict__ if last_op is not None else None
         payload = write_failure(
