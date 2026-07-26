@@ -213,3 +213,34 @@ call and the journal chain becomes more urgent, not less.
   pages, versus the 285 keys / 1 page my earlier attempt ran against, so the pagination condition that
   attempt lacked is now reachable. Running probe A's rule outside GC against it while the soak writes;
   result pending in the background.
+
+### The at-scale experiment DID reproduce disagreements — but my experiment has confounds GC's case does not
+
+Ran probe A's rule outside GC at 72-77k keys / ~75 pages while soak #3 wrote. **Two runs: 4/12 and 2/12
+paired listings disagreed.** Details from the second (the first I truncated with my own `tail -8`, losing
+the evidence — my error):
+
+- `iter 8`: |A|=76370 |B|=76743, one hole B→A — a key present in the LATER listing, absent from the
+  EARLIER one, below the earlier's max for its namespace. Deletion cannot explain that direction.
+- `iter 12`: |A|=76743 |B|=72680, 4063 holes A→B — B returned ~4 pages fewer.
+
+TWO CONFOUNDS IN MY OWN EXPERIMENT, which GC's case does NOT have, and they matter enough that I will not
+call this proof:
+1. **GC cleanup runs between MY two listings.** `iter 12`'s 4063-key shortfall is exactly the shape of a
+   ref-cleanup batch. Inside a GC round this cannot happen — the only deleter runs post-CAS, after both
+   walks. So my large A→B disagreements are probably legitimate deletion, and they are NOT evidence for
+   the store hypothesis.
+2. **The `s3` table function is a different listing client** from the CAS backend adapter, with its own
+   globbing and parallelism. A hole there does not by itself prove a hole in the adapter.
+
+`iter 8` is the one that survives both confounds and is the interesting datum.
+
+SEPARATE FINDING, independent of all the above and worth its own attention: **each namespace has TWO live
+writer epochs at once** — ch1 holds epochs 2 and 4, ch2 holds 1 and 3. Probe A's max-witness rule compares
+`(epoch, seq)` tuples per namespace. A concurrent append at a LOWER epoch than the namespace's current max
+is therefore *below the witness* and the rule does not exclude it — so the rule has a false-positive mode
+that has nothing to do with the store. That is a defect in the probe as written, findable by reading, and
+it should be fixed regardless of how the store question resolves.
+
+A clean test must: list through the CAS backend adapter rather than the `s3` function, and either quiesce
+GC cleanup or account for it.
