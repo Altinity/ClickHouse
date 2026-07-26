@@ -89,3 +89,14 @@ Gate at the stop: 1382/1382 unit, 11/11 integration.
   reproduces the same shape, that is worth a targeted look, and the phase rows now make it answerable.
   Started run #2 — Task 21's stability criterion is two consecutive green runs with every signal observed,
   and one is not two.
+- 02:56 UTC — watchdog: run #2 healthy at t+874s, 0 failures, `signals=2/2 nodes` on all 38 ticks. My first
+  read of it was WRONG and worth recording: I compared elapsed wall clock (1772 s) against the last printed
+  `=== STAGE` line (t+421s) and suspected a stall. The log mtime was 9 seconds old and chaos faults were
+  firing at t+810/874s — the stage line simply is not printed per transition. Check freshness before
+  inferring a stall.
+  FOUND AND FIXED from the run's own log: two checkpoint lines printed `stale_edge=None`. The assert is
+  correctly wired and was correctly bypassed (those checkpoints skipped their fsck asserts on a timed-out
+  entry gate), but the printed `None` is indistinguishable from "checked, found nothing". Now prints
+  `not-checked` (`e49f...` follow-up commit). Fifth instance this session of reporting degrading to
+  something that reads as absence.
+  Disk 315G, load 3.8.
