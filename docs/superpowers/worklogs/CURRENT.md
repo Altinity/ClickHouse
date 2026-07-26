@@ -384,3 +384,36 @@ enumeration. That is the next concrete step and it is small.
 Of the three things the user is waiting for: **(1) soak with the new introspection — DONE and green.**
 (2) S42 results and (3) the GC-under-load study remain, and the study now has 1,673 rounds of phase data to
 start from rather than nothing.
+
+## 2026-07-26 10:57 UTC — watchdog: idle, consolidation awaiting confirmation
+
+Nothing is running. No build, no soak, no agent. No log under `tmp/` or `build*/` has been touched in six
+hours. Disk 322G free (under the 60G alert? no — comfortable), mem 34G free, load 0.66. Soak containers are
+still up and are worth keeping: they hold the 1,673 rounds of phase data this round's analysis is mining.
+
+Codex processes from 2026-07-25 23:08-23:19 are still resident (~75 MB each) with their logs last written at
+03:30. Their work COMPLETED — `codex_instrreview.log` is a finished 2.1 MB review whose findings are already
+extracted. Deliberately NOT killed: this worktree is shared with live sessions and the processes may not be
+mine to reap.
+
+**Signal-observation duty: not applicable this run** — no long run is in flight, so there is nothing to check
+for silent under-reporting. The last run that WAS watched (the 4h soak) recorded 529 signal reads, 72 real
+`stale_edge` evaluations, and per-phase rows on 1,673 rounds; all four watched signals were genuinely read.
+
+**Analysis done this turn (diagnosis of already-captured data, no implementation):** counted the requests the
+per-phase rows had been recording all along and **refuted my own claim from an hour earlier**. It is not one
+GET per ref-log — it is 4.15 GETs per log at a flat 0.92 ms each, and the ratio climbs with backlog size
+(2.59 at 5.6k logs, 4.73 at 404k). What is flat is the per-REQUEST cost; the per-log cost is a multiplier
+nobody has examined. `foldManifestEdges` GETs a manifest body per edge, and the same body can be re-read
+across logs within one round. That is a cheaper lever than anything aimed at the logs, and
+`CasRefManifestBodyFoldGets` — already on every phase row — would confirm it with another query rather than
+an experiment. Committed as `a6cb73a62d7`; BACKLOG `{#gc-perf-gets-per-log}`.
+
+`fold_ref_intake` shows zero LISTs, so the phase split cleanly separates listing cost from intake cost.
+
+**State: consolidation is NOT approved and no implementation may start.** The instrumentation review is
+complete and its four recommendations (drop probe B1, replace B2's per-transaction ledger with a scalar
+conservation check, drop the fsck detail-class whitelist, sample per-phase rows on ordinary rounds) are
+recorded and deliberately unexecuted. Of the three things the user is waiting for: (1) soak — DONE green;
+(2) S42 — card exists, not run at scale; (3) GC-under-load — now has two measurements and a corrected model,
+but the reproduction rig is not built. Scheduling no further work.
