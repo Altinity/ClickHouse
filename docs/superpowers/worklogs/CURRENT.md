@@ -41,3 +41,16 @@ Gate at the stop: 1382/1382 unit, 11/11 integration.
 - 00:3x UTC — watchdog cadence changed 20 min → 30 min and re-pointed at this file; the previous log
   rotated to `archive/`. Both in-flight agents left running, with the reasoning above stated rather than
   assumed.
+- 00:56 UTC — watchdog: IDLE, and the consolidation is NOT yet approved, so nothing is scheduled. Both
+  in-flight agents returned and their work is committed: the per-phase GC rows (`d412f85f749`, gate
+  1385/1385 plus the stateless introspection test) and the plan reconciliation (`7461dfb0853`, ~976 lines
+  across both plans). No build, soak, codex or test process is running. Disk 331G, 60G RAM, load 1.6.
+  The only uncommitted files under `docs/superpowers/` are pre-existing from other sessions
+  (`cas/README.md` modified, plus several untracked notes) — not this round's, left alone per the
+  shared-worktree rule.
+  Carried forward for the load study the user asked for, because it is the kind of thing that gets lost
+  between rounds: enumerating the phases turned up that a folding round GETs the adopted fold seal FIVE
+  times per round at the same `(generation, attempt)`, where the design recorded two. Instrumented, not
+  fixed — each read is separately attributable now, so the study decides on data.
+  AWAITING the user on: the want/don't-want statement and the codex plan review (their steps 2-3), and the
+  force-claim reading (BACKLOG {#operator-uuid-recovery}).
