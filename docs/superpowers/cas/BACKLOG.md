@@ -2390,3 +2390,24 @@ walk's start — and it is NOT currently reachable: `HeadResult::attributes` is 
 metadata, not S3's `LastModified`, and the writer's `ref_publish`/`ref_drop` audit events do not carry the
 ref txn id either (checked both). Surfacing either one is a real change, worth making, and it is hardening
 of a conclusion rather than a gate on it.
+
+### STILL OPEN after #13: the fsck budget, which #13 made honest rather than sufficient {#fsck-budget-still-open}
+
+The 2026-07-26 verdict soak skipped its GC-checkpoint entry gate again: `entry-gate fsck timed out
+(ca-fsck (detail=False) exceeded 180s)` on a pool of **5.5 GB**. No false "PERSISTENT dangling" this time —
+that regression is fixed and the timeout now degrades to a logged skip, which is correct behaviour.
+
+But correct behaviour here means **the gate does not run.** #13 removed the lie; it did not buy the check
+any time. A 5.5 GB pool is small, and 180 s is not close to enough — the earlier measurement of
+`reachable=0` after 160 s says the scan had not finished even its first phase.
+
+This is the same shape as everything else this round: an instrument that reports honestly that it saw
+nothing is better than one that lies, and still not a check. Options, none yet chosen:
+
+- scale the budget with pool size instead of a flat wall-clock number;
+- make the entry gate use `--partial` deliberately and treat the result as a lower bound (safe for the
+  gate's purpose only if a partial `dangling > 0` still fails, which it would);
+- make fsck itself cheaper — the intake measurements ({#gc-perf-multiplier-attributed}) suggest the same
+  per-request cost dominates here.
+
+Tracked so the skip does not become the accepted normal.
