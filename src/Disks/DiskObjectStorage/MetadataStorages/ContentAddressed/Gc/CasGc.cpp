@@ -35,6 +35,8 @@ namespace ProfileEvents
     extern const Event CasGcMetaWriteAnomaly;
     extern const Event CasGcMetaOps;
     extern const Event CasGcEnumerationPages;
+    extern const Event CasGcRefScanDisagreements;
+    extern const Event CasGcUnappliedFoldedTxns;
     extern const Event CasRefGlobalListPages;
     extern const Event CasRefLogBodyGets;
     extern const Event CasRefManifestBodyFoldGets;
@@ -344,9 +346,15 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// A DEFER round re-adopts the sealed generation — no fold, no delete, no gc/state write — so a
     /// slow idle/small-delta round no longer rebuilds the whole in-degree snapshot. Safety: a due
     /// graduation forces a FOLD (graduationDue), so no destructive decision runs on a stale snapshot.
+    ///
+    /// `preFoldRefScan` is the round's FIRST full enumeration of `cas/refs/`. Its result is RETAINED
+    /// (rather than discarded once the defer decision is taken) so `fold` can compare it against its
+    /// own enumeration of the same prefix — probe A, at zero additional backend calls. A deferred round
+    /// simply drops it.
+    const RefScanSummary pre_scan = preFoldRefScan(state);
     {
         const bool graduation_due = graduationDue(state, new_round);
-        const size_t changed = changedShardCount(state);
+        const size_t changed = pre_scan.changed_shards;
         if (shouldDeferRound(changed, graduation_due, rounds_since_last_fold_,
                              store->poolConfig().gc_fold_threshold,
                              store->poolConfig().gc_fold_max_defer_rounds))
@@ -400,7 +408,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         parent_seal_runs = parent_seal->blob_target_runs;
 
     /// The pass performs discovery, windowing, and the three-cursor merge (spare / graduate / condemn).
-    FoldResult folded = fold(state, state_token, report, new_round);
+    FoldResult folded = fold(state, state_token, report, new_round, pre_scan);
 
     EventEmitter{*store}.emit([&](CasEvent & e)
     {
@@ -751,7 +759,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
 }
 
 bool Gc::foldManifestEdges(const ManifestId & id, int sign, std::vector<BlobDelta> & deltas,
-                           std::map<ManifestId, Token> & mf_cleanup)
+                           std::map<ManifestId, Token> & mf_cleanup, uint32_t txn_ordinal)
 {
     Backend & backend = store->backend();
     const Layout & layout = store->layout();
@@ -806,7 +814,8 @@ bool Gc::foldManifestEdges(const ManifestId & id, int sign, std::vector<BlobDelt
             deltas.push_back(BlobDelta{
                 .ref = entry.ref,
                 .source_id = sourceEdgeId(id, entry.path),
-                .remove = (sign < 0)});
+                .remove = (sign < 0),
+                .txn_ordinal = txn_ordinal});
             /// A folded owner edge over this blob (the manifest-model analog of the old
             /// `RootAdd`). +1 = the manifest's owner activated this blob's reference; -1 =
             /// the owner was removed, dropping the reference. Reconstructs WHY a blob's in-degree moved.
@@ -830,7 +839,8 @@ bool Gc::foldManifestEdges(const ManifestId & id, int sign, std::vector<BlobDelt
     return true;
 }
 
-Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & report, uint64_t current_round)
+Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & report,
+                        uint64_t current_round, const RefScanSummary & pre_scan)
 {
     Backend & backend = store->backend();
     const Layout & layout = store->layout();
@@ -877,6 +887,87 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     }
     for (const auto & [ns_str, listing] : ref_tables)
         result.root_shards.emplace_back(RootNamespace{ns_str}, 0);
+
+    /// PROBE A — "the store lied". Compare this round's TWO independent full enumerations of
+    /// `cas/refs/` (the pre-fold scan and the one just performed above). The ref log per namespace is
+    /// append-only with strictly increasing ids, so:
+    ///
+    ///   an id present in one enumeration, absent from the other, and STRICTLY BELOW the other
+    ///   enumeration's maximum id for that same namespace CANNOT be a concurrent append.
+    ///
+    /// That is the only unambiguous signal available: a bare gap in the id sequence is LEGITIMATE
+    /// (an append refused before any network attempt leaves a safe gap by design), and the interval
+    /// between two ids is unbounded across a `writer_epoch` change, so the missing ids cannot be
+    /// enumerated and probed. This check makes no assumption about WHY an enumeration was incomplete
+    /// -- a backend page, continuation behaviour, the iterator, or a mis-parse all surface identically.
+    /// It therefore detects the EFFECT (a record one walk saw and the other did not) and not any one
+    /// hypothesised mechanism.
+    ///
+    /// The one benign explanation is a DELETION between the two walks. Only `cleanupRefObjects`
+    /// deletes ref logs and it runs post-CAS, so this round cannot be the deleter -- but a DEPOSED
+    /// leader still finishing its own post-CAS cleanup can be. That is itself a reason not to advance
+    /// this round's cursors, so it takes the same path, with the alternative named in the log.
+    ///
+    /// PLACEMENT IS LOAD-BEARING: this sits before the parent-cursor read and the intake loop, so a
+    /// disagreement suppresses the CURSOR ADVANCE, not merely the deletions. Suppressing deletion while
+    /// still advancing the cursor would leave the permanent half of the damage in place -- a record
+    /// sealed below the cursor can never be folded by a later complete enumeration.
+    probe_a_holes_this_round = 0;
+    if (!ref_folding_aborted)
+    {
+        uint64_t holes = 0;
+        const std::set<RefTxnId> no_logs;   /// the "this namespace was not in the pre-scan" stand-in
+        for (const auto & [ns_str, listing] : ref_tables)
+        {
+            const std::set<RefTxnId> fold_logs(listing.logs.begin(), listing.logs.end());
+            const auto pre_it = pre_scan.logs_by_ns.find(ns_str);
+            const std::set<RefTxnId> & pre_logs =
+                pre_it != pre_scan.logs_by_ns.end() ? pre_it->second : no_logs;
+
+            RefTxnId fold_max{};
+            if (!fold_logs.empty())
+                fold_max = *fold_logs.rbegin();
+            RefTxnId pre_max{};
+            if (const auto mit = pre_scan.max_log_by_ns.find(ns_str); mit != pre_scan.max_log_by_ns.end())
+                pre_max = mit->second;
+
+            const auto reportHole = [&](const RefTxnId & id, const char * which)
+            {
+                ++holes;
+                LOG_ERROR(logger,
+                    "CAS GC probe A: ref log {} of namespace {} was returned by one enumeration of {} "
+                    "and NOT by the other ({}), below that enumeration's own maximum id for the "
+                    "namespace -- an append cannot explain this. Either the object store gave two "
+                    "different answers about the same durable prefix, or a deposed leader is deleting "
+                    "ref objects concurrently. Ref folding is ABORTED this round: no cursor advances "
+                    "and no destructive action runs.",
+                    renderRefTxnId(id), ns_str, layout.casRefsPrefix(), which);
+            };
+
+            for (const RefTxnId & id : pre_logs)
+                if (id < fold_max && !fold_logs.contains(id))
+                    reportHole(id, "missing from the fold's own scan");
+            for (const RefTxnId & id : fold_logs)
+                if (id < pre_max && !pre_logs.contains(id))
+                    reportHole(id, "missing from the pre-fold scan");
+        }
+        /// STATED LIMITATION, not an oversight. The rule needs a WITNESS above the missing id in the
+        /// other enumeration, so two shapes stay invisible: (a) a hole that reproduces IDENTICALLY in
+        /// both enumerations (nothing cheap catches that), and (b) a namespace one enumeration dropped
+        /// WHOLESALE -- it has no `ref_tables` entry, so the loop above never visits it, and the fold's
+        /// side offers no id to witness against. Widening (b) to use the pre-scan's OWN maximum as the
+        /// witness was considered and rejected: it inverts the rule's justification and would fire on a
+        /// namespace whose logs were legitimately all cleaned between the two walks, and a false
+        /// positive here blocks the cursor advance for good rather than for one round.
+        if (holes > 0)
+        {
+            ProfileEvents::increment(ProfileEvents::CasGcRefScanDisagreements, holes);
+            ref_folding_aborted = true;
+            report.recordAnomaly(RootNamespace{}, 0, ManifestId{},
+                                 "ref-prefix enumerations disagree: ref folding aborted this round");
+        }
+        probe_a_holes_this_round = holes;
+    }
 
     /// Parent cursors — the per-(ns,shard) cursors a prior round sealed. One-pass round: read them from
     /// the fold seal at the adopted (snap_generation, snap_attempt) (the fold seal IS the coverage record).
@@ -1025,7 +1116,22 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     result.fold_seal.parent_generation = state.snap_generation;
 
     std::vector<BlobDelta> deltas;
+    /// PROBE B2's round-local ledger (see `TxnApplyLedger`). Grows one entry per ref log the intake
+    /// opens; the reducers mark `applied` through `&ledger.applied` at the point they consume a delta.
+    TxnApplyLedger ledger;
     bool folded_any = false;
+
+    /// PROBE B1 -- intake-layer identity. `logs_applied` counts, at the SINGLE cursor-advance site
+    /// below, every log whose whole body folded. At seal time it is compared against a recomputation
+    /// from the sealed coverage and the listing. The two are derived differently (a running counter vs
+    /// a recomputation), so a control-flow bug that advances a cursor without folding breaks the
+    /// equality.
+    ///
+    /// REACH, stated so this is not over-trusted: the recomputation reads the SAME listing the intake
+    /// read, so B1 is BLIND to a record missing from that listing. It is a control-flow assertion, not
+    /// a detector for the skipped-transaction defect -- probe A covers the listing, probe B2 covers
+    /// everything below the intake.
+    uint64_t logs_applied = 0;
 
     /// The adopted parent seal, read once at the ADOPTED (snap_generation, snap_attempt): it carries the
     /// parent generation's `blob_target_runs` (resolved below into per-gc-shard prior runs) and the parent
@@ -1090,6 +1196,10 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             if (clamped)
                 break;
 
+            /// Probe B2: open this transaction's ledger entry. A clamped log is opened but never
+            /// committed, so it is correctly not reported unapplied.
+            const uint32_t txn_ordinal = ledger.open(ns, log_id);
+
             /// GET + decode the new log body. A missing or invalid log body aborts ref folding for the whole
             /// round: the listed key was durable, so absence is input-visibility ambiguity,
             /// never a partial ref delta.
@@ -1139,7 +1249,8 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             for (const RefManifestEdge & edge : edges)
             {
                 ProfileEvents::increment(ProfileEvents::CasRefEmittedEdges);   /// one manifest-edge event
-                if (foldManifestEdges(edge.manifest_id, edge.change, log_deltas, log_mf_cleanup))
+                if (foldManifestEdges(edge.manifest_id, edge.change, log_deltas, log_mf_cleanup,
+                                      txn_ordinal))
                     continue;
 
                 if (edge.change < 0 && edge.owner_kind == RefOwnerKind::Precommit)
@@ -1198,6 +1309,9 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                 break;   /// discard the staged log_deltas / log_mf_cleanup (never merged) and stop this table
 
             /// The whole log folded: merge its staged transaction into the round buffers.
+            if (!log_deltas.empty())
+                ledger.markProduced(txn_ordinal);
+            ledger.markCommitted(txn_ordinal);
             for (BlobDelta & d : log_deltas)
                 deltas.push_back(std::move(d));
             for (const auto & [mid, tok] : log_mf_cleanup)
@@ -1208,6 +1322,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             if (const auto removal = removalTxnId(txn))
                 new_removals.emplace_back(ns, *removal);
             resolved_through = log_id;     /// this log fully folded
+            ++logs_applied;                /// probe B1: the SINGLE cursor-advance site
             table_changed = true;
         }
 
@@ -1224,6 +1339,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     if (ref_folding_aborted)
     {
         deltas.clear();
+        ledger = TxnApplyLedger{};   /// the deltas are gone, so nothing can be unapplied
         result.mf_cleanup.clear();
         folded_any = false;
         result.fold_seal.per_ns_shard.clear();
@@ -1400,7 +1516,8 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                                      std::move(deltas), result.fold_seal.blob_target_runs,
                                      current_round, condemn_round, head_blob, peek_head,
                                      confirm_condemned_marker,
-                                     result.retired_merge.data(), suppress_destructive);
+                                     result.retired_merge.data(), suppress_destructive,
+                                     &ledger.applied);
             result.fold_seal.condemned_summary[0] = summarize(result.retired_merge[0].still_retired);
         }
     }
@@ -1436,7 +1553,8 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                                std::move(buckets[shard]),
                                current_round, condemn_round, head_blob, peek_head,
                                confirm_condemned_marker,
-                               &result.retired_merge[shard], suppress_destructive);
+                               &result.retired_merge[shard], suppress_destructive,
+                               &ledger.applied);
             for (RunRef & r : shard_runs)
                 result.fold_seal.blob_target_runs.push_back(std::move(r));
             result.fold_seal.condemned_summary[shard] = summarize(result.retired_merge[shard].still_retired);
@@ -1476,6 +1594,63 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// under correct operation and fail closed with `CORRUPTED_DATA`. A deposed leader writes under its
     /// own unadopted attempt so it never collides with the adopted seal — the occupant here is only ever
     /// our own prior attempt-scoped write.
+    /// PROBE B2's verdict. A committed transaction that produced deltas but whose deltas never
+    /// reached a reducer means this round LOST a durable record it had already read and decoded.
+    /// Unlike a 404 during a fold (missing evidence, which must never wedge the round), this is proof
+    /// of loss, so the round fails CLOSED: nothing is adopted, GC reclaims and deletes nothing, and an
+    /// operator has to intervene. Thrown before the seal write, and therefore long before the single
+    /// `gc/state` CAS, so the whole round evaporates.
+    txns_unapplied_this_round = 0;
+    if (const std::vector<uint32_t> unapplied = ledger.unapplied(); !unapplied.empty())
+    {
+        txns_unapplied_this_round = unapplied.size();
+        String detail;
+        for (size_t i = 0; i < unapplied.size() && i < 8; ++i)
+        {
+            if (i != 0)
+                detail += ", ";
+            detail += ledger.namespaces[unapplied[i]] + "@" + renderRefTxnId(ledger.txns[unapplied[i]]);
+        }
+        ProfileEvents::increment(ProfileEvents::CasGcUnappliedFoldedTxns, unapplied.size());
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS GC fold: {} ref transaction(s) folded and merged into the round buffers but NONE of "
+            "their blob deltas reached a shard reducer ({}{}). The round would have advanced its "
+            "cursor past a transaction it never applied. GC refuses to commit the round; recover with "
+            "SYSTEM CONTENT ADDRESSED GC REBUILD.",
+            unapplied.size(), detail, unapplied.size() > 8 ? ", ..." : "");
+    }
+
+    /// PROBE B1's comparison. Skipped on a ref-folding abort: that path deliberately discards every
+    /// cursor advance and carries the parent cursors, so the identity does not apply.
+    logs_intended_this_round = 0;
+    logs_applied_this_round = 0;
+    if (!ref_folding_aborted)
+    {
+        uint64_t logs_intended = 0;
+        for (const auto & [ns_str, listing] : ref_tables)
+        {
+            const String cursor_key = cursorKey(RootNamespace{ns_str}, /*shard*/0);
+            RefTxnId cursor_prev{};
+            if (const auto pit = parent_cursors.find(cursor_key); pit != parent_cursors.end())
+                cursor_prev = pit->second.last_folded_ref_id;
+            RefTxnId sealed{};
+            if (const auto sit = result.fold_seal.per_ns_shard.find(cursor_key);
+                sit != result.fold_seal.per_ns_shard.end())
+                sealed = sit->second.last_folded_ref_id;
+            for (const RefTxnId & id : listing.logs)
+                if (cursor_prev < id && !(sealed < id))
+                    ++logs_intended;
+        }
+        if (logs_intended != logs_applied)
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS GC fold: the round sealed coverage over {} ref log(s) but only {} fully folded -- "
+                "a cursor advanced past a log this round never applied. GC refuses to commit the round; "
+                "recover with SYSTEM CONTENT ADDRESSED GC REBUILD.",
+                logs_intended, logs_applied);
+        logs_intended_this_round = logs_intended;
+        logs_applied_this_round = logs_applied;
+    }
+
     putDeterministicArtifact(backend, layout.foldSealKey(new_generation, attempt),
                              encodeFoldSeal(result.fold_seal));
 
@@ -1907,11 +2082,13 @@ bool Gc::graduationDue(const GcState & state, uint64_t current_round)
     return false;
 }
 
-size_t Gc::changedShardCount(const GcState & state)
+RefScanSummary Gc::preFoldRefScan(const GcState & state)
 {
-    /// The number of tables with at least one ref log above their sealed cursor -- the pre-fold DEFER
-    /// signal. Lenient parse: a malformed key is simply not counted here; the fold's own
-    /// `groupRefKeys` does the strict validation and round-abort. `parseRefObjectKey` never throws.
+    /// One full enumeration of `cas/refs/`. It yields the pre-fold DEFER signal (the number of tables
+    /// with at least one ref log above their sealed cursor) AND the id set probe A compares against the
+    /// fold's own enumeration of the same prefix. Lenient parse: a malformed key is simply not counted
+    /// here; the fold's own `groupRefKeys` does the strict validation and round-abort.
+    /// `parseRefObjectKey` never throws.
     const Layout & layout = store->layout();
     Backend & backend = store->backend();
 
@@ -1919,28 +2096,29 @@ size_t Gc::changedShardCount(const GcState & state)
     if (const auto seal = readFoldSeal(state.snap_generation, state.snap_attempt))
         cursors = seal->per_ns_shard;
 
-    std::map<String, RefTxnId> greatest_log;
+    RefScanSummary scan;
     forEachListedKey(backend, layout.casRefsPrefix(), [&](const ListedKey & lk)
     {
         const auto parsed = layout.parseRefObjectKey(lk.key);
         if (parsed && parsed->kind == RefObjectKind::Log)
         {
-            RefTxnId & g = greatest_log[parsed->ns.string()];
+            const String ns_str = parsed->ns.string();
+            scan.logs_by_ns[ns_str].insert(parsed->txn_id);
+            RefTxnId & g = scan.max_log_by_ns[ns_str];
             if (g < parsed->txn_id)
                 g = parsed->txn_id;
         }
     }, 1000, onGcEnumerationPage);
 
-    size_t changed = 0;
-    for (const auto & [ns_str, greatest] : greatest_log)
+    for (const auto & [ns_str, greatest] : scan.max_log_by_ns)
     {
         RefTxnId folded{};
         if (const auto it = cursors.find(cursorKey(RootNamespace{ns_str}, /*shard*/0)); it != cursors.end())
             folded = it->second.last_folded_ref_id;
         if (folded < greatest)
-            ++changed;
+            ++scan.changed_shards;
     }
-    return changed;
+    return scan;
 }
 
 RebuildReport Gc::rebuildBaseline(bool force)
@@ -2074,7 +2252,12 @@ RebuildReport Gc::rebuildBaseline(bool force)
                                  shard, std::move(buckets[shard]), out,
                                  /*current_round*/0, /*condemn_round*/condemn_round_stamp, condemn_seed_head,
                                  /*peek_head*/{}, /*confirm_condemned_marker*/{},
-                                 /*out_retired*/nullptr, /*suppress_destructive*/false);
+                                 /*out_retired*/nullptr, /*suppress_destructive*/false,
+                                 /// Probe B2 does not apply to the rebuild: it derives edges from raw
+                                 /// owner STATE, not from a stream of ref transactions, so there is no
+                                 /// transaction whose deltas could go unapplied and no fold cursor to
+                                 /// advance past one. Every delta it emits carries ordinal 0.
+                                 /*out_applied_by_txn_ordinal*/nullptr);
         buckets[shard].clear();
         prior_runs[shard] = std::move(out);
     };
@@ -2129,7 +2312,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
         {
             const ManifestId id{ns, row.manifest_ref};
             owned_manifest_keys.insert(layout.manifestKey(id));
-            if (!foldManifestEdges(id, +1, deltas, mf_cleanup_unused))
+            if (!foldManifestEdges(id, +1, deltas, mf_cleanup_unused, /*txn_ordinal=*/0))
             {
                 rep.refusal = "committed ref '" + ns.string() + "/" + ref_name
                     + "' names a missing or invalid part manifest — that is DATA LOSS the rebuild "
@@ -2145,7 +2328,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
         {
             const ManifestId id{ns, manifest_ref};
             owned_manifest_keys.insert(layout.manifestKey(id));
-            if (foldManifestEdges(id, +1, deltas, mf_cleanup_unused))
+            if (foldManifestEdges(id, +1, deltas, mf_cleanup_unused, /*txn_ordinal=*/0))
                 ++rep.live_precommits;
             else
             {
@@ -2180,7 +2363,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
             if (prefixEligible(*store, ns, BuildPrefix{mref.writer_epoch, mref.build_sequence}))
                 return;   /// provably dead — the orphan sweep's territory, never an edge
             const ManifestId id{ns, mref};
-            if (foldManifestEdges(id, +1, deltas, mf_cleanup_unused))
+            if (foldManifestEdges(id, +1, deltas, mf_cleanup_unused, /*txn_ordinal=*/0))
             {
                 ++rep.unowned_alive_manifests;
                 route_deltas(deltas);

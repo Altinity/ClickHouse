@@ -118,6 +118,78 @@ struct RoundReport
     }
 };
 
+/// The pre-fold enumeration of `cas/refs/`, retained rather than discarded. Two independent uses:
+/// the DEFER signal (`changed_shards`, unchanged semantics), and the round's SECOND witness for the
+/// skipped-transaction detector — `Gc::fold` performs its own full enumeration of the same prefix a
+/// moment later, and disagreement between two enumerations of an append-only prefix is the only
+/// unambiguous evidence available (a bare GAP in the id sequence is legitimate by design: an append
+/// refused before any network attempt leaves one).
+///
+/// KEEPING THE TWO WALKS SEPARATE IS LOAD-BEARING. Merging them into one enumeration — an otherwise
+/// obvious optimisation, since the round lists the same prefix twice — silently makes probe A vacuous.
+/// `CasGcRound.EnumerationPagesCountedEvenWithSweepBudgetZeroed` pins that both walks happen.
+struct RefScanSummary
+{
+    size_t changed_shards = 0;                          /// tables with a log above their sealed cursor
+    std::map<String, std::set<RefTxnId>> logs_by_ns;    /// Log-kind ids only, per namespace
+    std::map<String, RefTxnId> max_log_by_ns;           /// greatest Log-kind id per namespace
+};
+
+/// PROBE B2 — end-to-end transaction accounting for ONE round. Round-local, never persisted.
+///
+/// The naive "intended vs applied" counter pair is VACUOUS: in the intake both counts increment in the
+/// same basic block, so they cannot differ. This ledger separates them across the whole pipeline
+/// instead — a transaction is `committed` when the intake merges its staged buffers, `produced` when
+/// it emitted at least one `BlobDelta`, and `applied` only when a shard reducer actually CONSUMED one
+/// of its deltas. A delta lost between the intake and a reducer (routing across gc shards, a skipped
+/// bucket, a future filter) leaves a committed+produced transaction unapplied.
+///
+/// Marking happens at reducer CONSUMPTION, not at run flush: the in-degree model is a SET, so an
+/// unmatched `-1` and a duplicate `+1` legitimately vanish inside the reducer and a flush-side mark
+/// would fire on healthy rounds. Loss INSIDE the reducer's own set collapse is a different class,
+/// covered by `CasGcUnmatchedRemoveDeltas` and by the mirror safety test in
+/// `gtest_cas_holey_list_detector.cpp`; probe B2 does not claim it.
+///
+/// SINGLE-THREADED: the shard reducers run sequentially on the fold thread (`Gc::fold`), so `applied`
+/// needs no synchronisation. A future parallel reducer must revisit this.
+struct TxnApplyLedger
+{
+    std::vector<RefTxnId> txns;        /// ordinal -> the log id
+    std::vector<String> namespaces;    /// ordinal -> namespace, for the failure message
+    std::vector<uint8_t> produced;     /// this transaction emitted >= 1 BlobDelta
+    std::vector<uint8_t> committed;    /// this transaction folded fully and merged into the round buffers
+    /// >= 1 of this transaction's deltas was consumed by a reducer. Public and written through a raw
+    /// pointer by `foldDeltasIntoGeneration`: that write sits in a loop over potentially millions of
+    /// rows, where a `std::function` hop is not free.
+    std::vector<uint8_t> applied;
+
+    /// Open a transaction and return its round-local ordinal.
+    uint32_t open(const RootNamespace & ns, const RefTxnId & id)
+    {
+        const uint32_t ordinal = static_cast<uint32_t>(txns.size());
+        txns.push_back(id);
+        namespaces.push_back(ns.string());
+        produced.push_back(0);
+        committed.push_back(0);
+        applied.push_back(0);
+        return ordinal;
+    }
+    void markProduced(uint32_t ordinal) { produced[ordinal] = 1; }
+    void markCommitted(uint32_t ordinal) { committed[ordinal] = 1; }
+    void markApplied(uint32_t ordinal) { applied[ordinal] = 1; }
+
+    /// Ordinals that were committed AND produced deltas but whose deltas never reached a reducer.
+    /// Empty on a healthy round.
+    std::vector<uint32_t> unapplied() const
+    {
+        std::vector<uint32_t> out;
+        for (uint32_t i = 0; i < txns.size(); ++i)
+            if (committed[i] && produced[i] && !applied[i])
+                out.push_back(i);
+        return out;
+    }
+};
+
 /// Leader-paced regular GC: one pass per round — heartbeat
 /// ack floor -> fold (two-cursor merge) -> pre-CAS deletes of previously-published pending
 /// entries -> single `gc/state` CAS -> post-CAS cleanup/trim, over the root-local part-manifest model. The lease is work deduplication only —
@@ -272,14 +344,19 @@ private:
     /// graduates once `condemn_round < current_round`, i.e. it survived at least one full round after
     /// being condemned. The fold no longer CASes gc/state — it sets (snap_generation, snap_attempt)
     /// in-memory; the SINGLE round CAS commits them.
-    FoldResult fold(GcState & state, Token & state_token, RoundReport & report, uint64_t current_round);
+    /// `pre_scan` is the round's OWN pre-fold enumeration of `cas/refs/` (see `RefScanSummary`); the fold
+    /// compares it against its own enumeration of the same prefix — probe A.
+    FoldResult fold(GcState & state, Token & state_token, RoundReport & report, uint64_t current_round,
+                    const RefScanSummary & pre_scan);
 
     /// Read ONE part manifest named by `id`, validate it, and append sign*(+1) blob deltas for each
     /// blob entry to `deltas`. On sign<0 queue (id -> token) into mf_cleanup. Returns whether a body was
     /// read+validated: false => ABSENT body (404; the caller decides per the 404 rule). A body that is
     /// PRESENT but fails refMatchesBody / manifestNamespaceMatches throws CORRUPTED_DATA.
+    /// `txn_ordinal` stamps every delta this call pushes with the round-local ordinal of the ref
+    /// transaction that emitted it (probe B2 — see `TxnApplyLedger`).
     bool foldManifestEdges(const ManifestId & id, int sign, std::vector<BlobDelta> & deltas,
-                           std::map<ManifestId, Token> & mf_cleanup);
+                           std::map<ManifestId, Token> & mf_cleanup, uint32_t txn_ordinal);
 
 
 
@@ -336,10 +413,13 @@ private:
     /// path surfaces it); a round must never silently defer on corrupt bookkeeping.
     bool graduationDue(const GcState & state, uint64_t current_round);
 
-    /// The number of tables (namespaces) with at least one ref log above their sealed durable cursor --
-    /// the pre-fold DEFER signal. Computed from one `LIST cas/refs/` compared against the
-    /// per-table cursors in the adopted fold seal at `state.snap_generation`/`snap_attempt`.
-    size_t changedShardCount(const GcState & state);
+    /// One full enumeration of `cas/refs/`, producing BOTH the pre-fold DEFER signal
+    /// (`RefScanSummary::changed_shards` -- the number of tables with at least one ref log above their
+    /// sealed durable cursor, compared against the per-table cursors in the adopted fold seal at
+    /// `state.snap_generation`/`snap_attempt`) and the detector's first witness. Lenient parse: a
+    /// malformed key is not counted here; `groupRefKeys` in the fold does the strict validation and
+    /// round-abort. `parseRefObjectKey` never throws.
+    RefScanSummary preFoldRefScan(const GcState & state);
 
     /// (reclaimDroppedShards was removed with the snapshot+log ref model: there is no mutable per-namespace
     /// shard object to tombstone+reclaim; physical namespace reclamation is the namespace-cleanup item.)
@@ -443,6 +523,26 @@ private:
     std::mutex condemn_marker_mutex;
     std::set<std::pair<BlobRef, String>> condemn_markers_confirmed;
 
+    /// Probe A's per-round count of ref-log ids on which the round's two independent enumerations of
+    /// `cas/refs/` disagreed. Written by `fold`; the per-phase GC row emitter surfaces it as the
+    /// `fold_ref_list` phase metric. The always-available reading is the `CasGcRefScanDisagreements`
+    /// profile event, which `fold` increments by the same amount.
+    uint64_t probe_a_holes_this_round = 0;
+
+    /// Probe B1's two numbers for the round: the ref logs the sealed coverage declares covered, and the
+    /// ref logs that actually folded. They are EQUAL on every committed round (the fold throws
+    /// otherwise) -- carrying them is what turns "they are always equal" from an assumption into an
+    /// observable property once the per-phase GC row emitter reports them on the `fold_ref_intake` row.
+    /// Both stay 0 on a ref-folding abort, where the identity does not apply.
+    uint64_t logs_intended_this_round = 0;
+    uint64_t logs_applied_this_round = 0;
+
+    /// Probe B2's verdict for the round: ref transactions the round folded and merged but whose blob
+    /// deltas never reached a shard reducer. 0 on every COMMITTED round -- a nonzero value is
+    /// accompanied by the fold's fail-closed throw, so the value only ever exists as the forensic
+    /// record of a round that then failed.
+    uint64_t txns_unapplied_this_round = 0;
+
 public:
     /// TEST SEAM: expose LIST-based namespace/shard discovery so unit tests can assert the
     /// discovered universe equals the set of present ref shards without driving a full round.
@@ -458,10 +558,10 @@ public:
         return graduationDue(state, current_round);
     }
 
-    /// Test-only access to the changed-shard signal used before a fold.
-    size_t changedShardCountForTest(const GcState & state)
+    /// Test-only access to the pre-fold ref scan (its `changed_shards` is the defer signal).
+    RefScanSummary preFoldRefScanForTest(const GcState & state)
     {
-        return changedShardCount(state);
+        return preFoldRefScan(state);
     }
 
     /// TEST SEAM: drive one namespace-cleanup pass directly so a test can

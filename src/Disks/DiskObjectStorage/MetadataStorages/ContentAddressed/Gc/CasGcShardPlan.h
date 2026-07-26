@@ -112,7 +112,10 @@ public:
                                const std::function<std::optional<HeadResult>(const BlobRef &)> & peek_head = {},
                                const std::function<bool(const RetiredEntry &)> & confirm_condemned_marker = {},
                                RetiredMergeResult * out_retired = nullptr,
-                               bool suppress_destructive = false) const;
+                               bool suppress_destructive = false,
+                               /// PROBE B2: forwarded verbatim to `foldDeltasIntoGeneration` — see its
+                               /// declaration and `Cas::TxnApplyLedger`.
+                               std::vector<uint8_t> * out_applied_by_txn_ordinal = nullptr) const;
 
 private:
     uint64_t shard;

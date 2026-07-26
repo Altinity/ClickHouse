@@ -142,7 +142,26 @@ struct BlobDelta
     BlobRef ref{};
     UInt128 source_id{};   /// `sourceEdgeId(ManifestId, path)` — an edge identity, not a content hash
     bool remove = false;
+    /// Round-local index of the ref transaction that emitted this delta, into `Cas::TxnApplyLedger`.
+    /// NEVER persisted and never part of any comparator: it exists only so the reducer can prove it
+    /// consumed at least one delta from every transaction the round declared covered (probe B2). It
+    /// lands in the struct's existing tail padding — see `kBlobDeltaSize` below.
+    ///
+    /// DECLARED LAST, and that is load-bearing: several tests brace-initialise a `BlobDelta`
+    /// POSITIONALLY as `{ref, source_id, remove}`. Inserting a field ahead of `remove` silently rebinds
+    /// that third initialiser to the ordinal and turns every removal delta into an activation — a
+    /// compiling, type-correct, wrong-answer change. Any future field goes after this one, or every
+    /// aggregate initialiser gets converted to designated form first.
+    uint32_t txn_ordinal = 0;
 };
+
+/// The fold's per-edge row runs over potentially millions of records per round, so its size is a
+/// deliberate property, not an accident. Pinned here (rather than left to a perf run to discover)
+/// because probe B2's `txn_ordinal` was added into the existing tail padding: the row did NOT grow.
+/// A future field that breaks this assertion is a hot-path change and must be argued as one.
+static constexpr size_t kBlobDeltaSize = 64;
+static_assert(sizeof(BlobDelta) == kBlobDeltaSize,
+              "BlobDelta is the fold's hot per-edge row; growing it is a hot-path change");
 
 /// A blob whose active source-edge set became empty this generation — a retire candidate.
 struct BlobCandidate
@@ -271,7 +290,14 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
                               const std::function<std::optional<HeadResult>(const BlobRef &)> & peek_head = {},
                               const std::function<bool(const RetiredEntry &)> & confirm_condemned_marker = {},
                               RetiredMergeResult * out_retired = nullptr,
-                              bool suppress_destructive = false);
+                              bool suppress_destructive = false,
+                              /// PROBE B2 (see `Cas::TxnApplyLedger`): when set, one byte is stored per
+                              /// CONSUMED delta at `(*out_applied_by_txn_ordinal)[d.txn_ordinal]`. A raw
+                              /// vector rather than a callback: this runs once per delta over a stream
+                              /// that can reach millions of rows, and a `std::function` call there is
+                              /// not free. Never read by the merge; write-only. The caller must size it
+                              /// to cover every `txn_ordinal` present in `scattered`.
+                              std::vector<uint8_t> * out_applied_by_txn_ordinal = nullptr);
 
 /// Stream the sealed in-degree runs named by `runs` (the current seal's `blob_target_runs` filtered to one
 /// shard) and return every blob written at in-degree 0 (the candidates that transitioned to zero). An

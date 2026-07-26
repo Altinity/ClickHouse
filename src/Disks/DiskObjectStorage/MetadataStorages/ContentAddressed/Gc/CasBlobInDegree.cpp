@@ -361,7 +361,8 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
                               const std::function<std::optional<HeadResult>(const BlobRef &)> & peek_head,
                               const std::function<bool(const RetiredEntry &)> & confirm_condemned_marker,
                               RetiredMergeResult * out_retired,
-                              bool suppress_destructive)
+                              bool suppress_destructive,
+                              std::vector<uint8_t> * out_applied_by_txn_ordinal)
 {
     RetiredMergeResult sink;
     RetiredMergeResult & rmr = out_retired ? *out_retired : sink;
@@ -600,6 +601,12 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
                 if (!rmr.unmatched_remove_example)
                     rmr.unmatched_remove_example = UnmatchedRemoveExample{blob_ref, source_id};
             }
+            /// PROBE B2: this delta reached a reducer and is being CONSUMED. Marked here rather than
+            /// at run flush because the in-degree model is a SET — an unmatched `-1` and a duplicate
+            /// `+1` legitimately vanish inside the merge, so a flush-side mark would fire on healthy
+            /// rounds. See `Cas::TxnApplyLedger`.
+            if (out_applied_by_txn_ordinal)
+                (*out_applied_by_txn_ordinal)[scattered[di].txn_ordinal] = 1;
             present = scattered[di].remove ? false : true;   // apply in order; last wins
             cur_touched = true;
             ++di;
