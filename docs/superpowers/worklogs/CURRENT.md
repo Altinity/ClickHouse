@@ -264,3 +264,13 @@ GC cleanup or account for it.
   its `gc_checkpoint` stage, as the earlier 4 h run did when it returned 124G at one checkpoint.
   Corrected the "two live writer epochs" claim in this log — see the struck-through paragraph above. It was
   mine and it was wrong.
+- 06:56 UTC — watchdog: 4 h soak at t+0h59m (3h00m left), STAGE mutations, **0 failures**, log fresh,
+  `signals=2/2 nodes` on all 45 ticks. Probe A has not fired.
+  NOT YET EXERCISED in this run, and worth saying rather than reading the green as complete: zero
+  checkpoints have run, so the `stale_edge` assert has not been evaluated once. The first `gc_checkpoint`
+  stage is at t+5040s ≈ 07:21 UTC.
+  DISK, measured not projected: 272G at 06:26 → **209G** now, i.e. ~126 GB/h over that interval. The
+  scheduled reclaim is the same `gc_checkpoint` stage, ~25 min out; the previous 4 h run returned 124G
+  there. I am recording the rate and the schedule, not a forecast — last time I turned this into arithmetic
+  and the arithmetic was the wrong tool. If the checkpoint does not reclaim, the 60G line is the trigger,
+  and ~100GB of docker artifacts remain reclaimable without touching the run.
