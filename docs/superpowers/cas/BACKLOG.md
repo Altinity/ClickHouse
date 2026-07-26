@@ -2215,3 +2215,37 @@ elimination argument weakened by this shape.
 boto3 against a healthy store. A retried page request is the one path that could plausibly return a
 slightly different window of keys. That is now the leading candidate and it is testable — inject page-level
 errors into the hammer's client and see whether short adjacent runs start disappearing.
+
+### THREE valid hammer runs, all negative — stop guessing and make the detector self-diagnosing {#probe-a-hammer-three-negatives}
+
+| run | pagination | rounds | pages | keys listed | deletes under each walk | HOLES |
+|---|---|---:|---:|---:|---:|---:|
+| add-only | continuation | 24 | ≤888 | 6.85M | — | 0 |
+| held population | continuation | 40 | 151-166 | 6.2M | ~31,000 | 0 |
+| held population | **start-after (what CAS does)** | 40 | 151-166 | 6.08M | ~15,500 | 0 |
+
+~19M keys listed. Nothing. Two more code-level hypotheses died on inspection in the same stretch:
+
+- **Page-limit mismatch between the two walks** — no: both use 1000 (walk 2 passes it explicitly, walk 1
+  takes the default). The stitch points still DRIFT between walks, because the key space mutates and the
+  count of keys before any given key differs — so a store that disagreed with itself at a stitch would
+  produce asymmetric holes. That remains a mechanism; it is just not a page-size bug.
+- **The two walks filtering keys differently** — no. Walk 1 selects with `parseRefObjectKey` inline; walk 2
+  collects raw keys and filters later via `groupRefKeys`. Both call the same parser. The only asymmetry is
+  STRICTNESS: walk 1 silently skips an unparseable key, walk 2 throws `CORRUPTED_DATA` and aborts the
+  round. That is worth tidying, but it produces an abort, never a hole.
+
+**The approach is wrong, not just the hypotheses.** Every attempt so far reconstructs the crime scene after
+the fact from ids in a log. The detector is already at the exact moment the disagreement exists and throws
+that moment away.
+
+**Change probe A to answer the question at firing time.** When a hole is found, immediately `HEAD` the hole
+key and record the verdict in the same log line:
+
+- **object EXISTS** → walk 1 missed a durable object. The listing was incomplete; store or client.
+- **object ABSENT** → walk 2 returned a key that is not there. A phantom, which points at the client or
+  iterator, not at LIST completeness — and would invalidate the whole reading of {#probe-a-answered}.
+
+One HEAD per hole, and holes are rare by construction (7 firings in four hours). It converts the next
+firing from a forensic puzzle into a decisive observation, and it is far cheaper than another 19M-key
+hammer run.
