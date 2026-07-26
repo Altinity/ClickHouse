@@ -1052,3 +1052,9 @@ reads zero on both nodes.
 Fix direction recorded, NOT implemented — either the sweep decrements before deleting (costs a manifest
 body read, the exact request-cost problem measured tonight) or it stops sweeping manifests whose edges may
 be folded (a durable-state question). The reducer is correct and must not be touched.
+
+**00:56 UTC watchdog** — idle: nothing running, 320G, load 0.47, containers up. No long run, so no signals
+to observe. Committed the two files the scenario runner had written on its own (`RUN_HISTORY.md`,
+`scenarios/BACKLOG.md`) and TRIAGED the entry it auto-filed as `suspected-bug`: seed 42's two GC Error rows
+are Code 499 S3 timeouts on 268-byte and 4,606-byte objects — environment, not a defect — with the triage
+attached rather than the entry deleted, so nobody re-investigates it. 55 local commits.
