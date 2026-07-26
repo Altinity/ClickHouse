@@ -280,3 +280,34 @@ GC cleanup or account for it.
   next tick is the informative one. Log 64 s old, which is normal across checkpoint work.
   Disk 209G → **176G**, i.e. ~66 GB/h over this interval against ~126 GB/h over the previous one — the
   slowdown lines up with inserts being off for this stage. Still 116G above the line.
+
+## 07:56 UTC — PROBE A FIRED AGAIN, and this time the number is decisive
+
+4 h soak at t+1h59m, still 0 failures, `signals=2/2 nodes` throughout. But:
+
+    ch2 07:40:36   ref_keys_listed = 120,541   probe_a_holes = 244,939   (ch1 also fired 1, 13, 1 earlier)
+
+**The hole count is DOUBLE the keys listed.** That is impossible for a difference within one key set, so it
+fixes the shape of what happened: walk 1 must have seen ≈ 365,480 keys (120,541 + 244,939) and walk 2 only
+120,541. **Walk 2 returned a third of walk 1.** This is not a continuation glitch of a few keys — a quarter
+of a million ref-log objects were present for the first enumeration and absent for the second, inside one
+round.
+
+DECISIVE NEW EVIDENCE, and it revives a hypothesis I had refuted: at **07:40:30**, six seconds before ch2's
+firing, **ch1 ran a `ref_object_cleanup` phase.** Earlier I ruled out the lease-straddle explanation
+because in run #2's window the peer was doing nothing. Here the peer was doing exactly the thing that
+deletes ref-log objects, seconds before the disagreement, while ch2 had a fold in flight.
+
+So the leading explanation is now: ch2 begins a round and enumerates; ch2 loses the GC lease mid-round
+(chaos is running); ch1 takes it, folds, and its post-CAS cleanup deletes en masse; ch2 — still executing
+its now-doomed round — enumerates again and legitimately sees a third of what it saw. Probe A reports a
+scan anomaly. The store never lied.
+
+If that holds, the consequence stated earlier stands and sharpens: the aborted folds cost nothing, because
+a round that lost its lease must not commit anyway — but the SIGNAL is wrong, and at 244,939 it is wrong
+loudly enough to bury a real hole in the noise. A detector that cries this large a wolf is worse than
+useless: the next real firing will be read as "the lease thing again".
+
+NOT improvising a fix. What must be established first: whether ch2 held the lease at walk 1 and had lost it
+by walk 2. That is one comparison of the lease owner recorded at the two points, and it is the missing
+instrumentation — the phase rows record the enumeration but not the lease identity at each end of it.
