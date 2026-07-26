@@ -489,3 +489,32 @@ by decoding a sample of `_log/` objects on the stand and checking whether manife
 transaction. Not done from a watchdog turn.
 
 Nothing scheduled. Round not started; consolidation stands.
+
+## 2026-07-26 12:35 UTC — round started; task #17 ANSWERED by counting, no product change needed
+
+Started the GC round on the user's go. First task was #17 and its cheap read-only half paid off: decoded
+**all 959** ref-log transactions in the soak pool with `ca-inspect` (not a sample) and counted. The counter
+task #17 proposed turned out not to be needed to reach the decision.
+
+**Result: 7,565 edges over 4,573 distinct manifests — 39.6% of intake manifest fetches are re-reads.**
+Intra-transaction redundancy is exactly ZERO; all of it is cross-transaction, and the mechanism is exact:
+2,991 manifests carry both an add and a remove edge in the window, so the same body is read once when the
+ref is published and again when it is dropped. A round-scoped body cache is therefore a real lever worth
+~40% of the dominant phase, at two round trips per avoided edge; an op- or transaction-scoped cache would
+save nothing at all.
+
+**Two errors of mine along the way, both caught, one material.**
+- `xargs -P 8` writing to one file interleaved the long JSON documents and corrupted 161 of 959 records. It
+  failed loudly on a parse error rather than silently skewing the count. Redone with per-key output files.
+- My first pass reported 66.6% redundancy because it charged two fetches to every `Promote` — a promote
+  names the same manifest in both bindings, so it LOOKS like double work. `manifestEdgesOfTxn` exempts
+  promotes outright: the manifest keeps an owner throughout, so there is no net edge and no fetch. Reading
+  the emission rule instead of assuming it removed 6,112 phantom fetches. **39.6% is the rule's number;
+  66.6% was mine.**
+
+Caveats recorded with the finding: this is the 959-log residual pool, not the 5k-404k rounds that were
+timed, and the transferable quantity is the redundancy FRACTION, not the 7.89 edges/txn rate. The prediction
+that a larger fold window pushes redundancy higher is a prediction, and task #10 is where it gets checked.
+
+Task #10 (rig) unblocked and its description updated with what it must now verify. BACKLOG
+{#gc-manifest-reuse-measured}, commit `256f01fb7d7`.
