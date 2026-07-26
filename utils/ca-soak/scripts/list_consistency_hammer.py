@@ -75,6 +75,11 @@ def main():
                          "BEHIND the listing cursor, and a paginated walk over a shrinking key space is "
                          "where store implementations differ. An add-only run exercises the wrong regime.")
     ap.add_argument("--delete-batch", type=int, default=50)
+    ap.add_argument("--max-keys", type=int, default=0,
+                    help="cap the live key population; writers idle at the cap. 0 = unbounded. NOT "
+                         "optional in practice: with unbounded writers the prefix grows all run, every "
+                         "listing is bigger and slower than the last, and the run degrades quadratically. "
+                         "The first real run reached 888k keys / 888 pages and had to be killed.")
     ap.add_argument("--page-size", type=int, default=1000, help="matches the CAS listing page size")
     ap.add_argument("--keep", action="store_true", help="do not delete the probe prefix afterwards")
     a = ap.parse_args()
@@ -114,6 +119,12 @@ def main():
 
     def writer_loop():
         while not stop.is_set():
+            if a.max_keys:
+                with dlock:
+                    at_cap = len(durable) >= a.max_keys
+                if at_cap:
+                    time.sleep(0.02)
+                    continue
             write_one()
 
     def deleter_loop():
