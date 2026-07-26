@@ -1021,3 +1021,34 @@ Per the standing instruction I did NOT improvise — invoked systematic debuggin
 Live reproduction preserved; evidence copied to `reports/2026-07-26-s42-stale-edge-repro/`. Resources fine
 (310G, load 0.49). No conclusion yet, deliberately: the discriminator between transient and permanent needs
 GC rounds to pass, and that is what the corrected series is collecting.
+
+## 2026-07-27 00:27 UTC — watchdog: ROOT CAUSE FOUND for the S42 stale-edge defect
+
+Idle, 320G, load 0.37. Reproduction intact and now stronger: still exactly 15 stale-edge blobs at **289 GC
+rounds** — 180 rounds since the series began, key set unchanged.
+
+**Phase 2 confirmed the standing hypothesis. Six for six.** Every epoch-1 manifest carrying an unmatched
+`+1` edge was deleted by the orphan-manifest sweep:
+
+```
+1:9825  1:34437  1:34438  1:34443  1:34447  1:34449   -> all SWEPT
+```
+
+**Mechanism:** a precommit's `+1` edges fold into the in-degree; an allocation fault aborts the build
+("body left for GC" — 130 aborts against 18 precommit removals in this run); the manifest becomes
+eligible+unowned; the orphan sweep deletes it with an exact-token delete **without requiring that its
+edges were decremented**, because the sweep's premise is that an unowned manifest has no folded edges — and
+that premise is false once the precommit's `+1` has folded. The edges are stranded with no `-1` possible
+and the manifest they name gone. A race between fold and abort, which is why it reproduces one run in two.
+
+**Boundary stated, not rounded up.** Two of eight (`4:66`, `4:71`) do not fit: their manifests still exist
+in the pool. The likeliest explanation is my own `adds > removes` heuristic, which is not a valid residual
+test under last-wins set semantics and which I flagged as unsound when I first used it. Six for six on
+epoch 1; NOT eight for eight.
+
+Also refuted along the way: the dead-precommit skip, which fit the signature exactly and whose own counter
+reads zero on both nodes.
+
+Fix direction recorded, NOT implemented — either the sweep decrements before deleting (costs a manifest
+body read, the exact request-cost problem measured tonight) or it stops sweeping manifests whose edges may
+be folded (a durable-state question). The reducer is correct and must not be touched.

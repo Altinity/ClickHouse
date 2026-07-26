@@ -1,7 +1,10 @@
 # S42 stale-edge reproduction — systematic debugging, Phase 1
 
-**Status: Phase 1 complete. Root cause NOT yet established. One hypothesis refuted, one specific
-hypothesis standing and untested. No fix attempted — the Iron Law holds.**
+**Status: Phases 1 and 2 complete. ROOT CAUSE ESTABLISHED for the epoch-1 cohort (6/6) — the
+orphan-manifest sweep deletes a manifest whose `+1` edges have already folded, stranding them forever. One
+competing hypothesis refuted on the way. Two of eight attributions remain unexplained and are probably an
+artifact of my own counting heuristic, NOT a second defect; see §Phase 2 boundary. NO FIX ATTEMPTED — the
+Iron Law holds, and the fix direction needs a cost model.**
 
 Live reproduction preserved on the ca-soak stand as of 2026-07-27 ~22:20 UTC.
 
