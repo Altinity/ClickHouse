@@ -69,3 +69,6 @@ Gate at the stop: 1382/1382 unit, 11/11 integration.
   none of it, which is the exact blindness this round keeps finding.
   First ticks show `signals=2/2 nodes` — the counters are being READ, not merely defined. That line is the
   thing to keep watching.
+- 01:56 UTC — watchdog: 20-min shakeout healthy at t+980s (STAGE chaos), **0 failures**, and the thing
+  worth recording — `signals=2/2 nodes` on all 35 metric ticks so far. The counters are being READ on both
+  nodes every tick, so this run is not blind. Disk 327G, load 2.2. Codex instrumentation review FINISHED.
