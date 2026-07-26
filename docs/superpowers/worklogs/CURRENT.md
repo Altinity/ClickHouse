@@ -940,3 +940,11 @@ all warrant a deliberate start rather than a timer-driven one.
 commits. Evidence intact (2 `gc_anomaly` rows on ch1, and captured to
 `reports/2026-07-26-list-incompleteness-proof/` so the stand is no longer load-bearing). No long run, no
 signals to observe. Nothing scheduled.
+
+**19:56 UTC watchdog** — idle: nothing running, 323G, load 0.95, 0 uncommitted, 38 local commits. No long
+run, no signals to observe. Since 19:26 the only work was documentation: the full investigation record
+(`reports/2026-07-26-list-incompleteness-investigation.md`, 469 lines) and two tasks for work this round
+surfaced but never tracked — the round-scoped manifest cache (#22, the measured 40% lever) and the
+LIST-consistency mount probe (#23, a standing backlog GATE that today's proof promoted from prudent to
+necessary). Awaiting a decision on whether to start the fix design or finish the measurement work
+(#22 → #10) first so the fix is designed against known numbers.
