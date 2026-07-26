@@ -2121,3 +2121,21 @@ did not occur because the probe stopped it.
 A standalone hammer against RustFS — write a known key set, LIST the prefix repeatedly under concurrent
 writes, diff each answer against the known set — would confirm the store-side behaviour directly, without a
 soak. That belongs with the rig (#10) and is much cheaper than one.
+
+### #18 in progress — and a GAP in my own experiment design, stated before the result {#probe-a-hammer-design-gap}
+
+The add-only hammer is running: 380k-key, 382-page listings under 6 concurrent writers, **zero holes across
+the first 21 rounds** (~5M keys listed cumulatively). That is already the page-count regime probe A's
+firings came from.
+
+**But the experiment is not yet a fair model of the CAS ref prefix, and the difference is the most likely
+discriminator.** My hammer only ADDS keys. The real ref prefix has objects being DELETED concurrently —
+GC removes folded logs — and deletion during a paginated walk is the classic source of listing anomalies:
+a continuation token can name a position whose key is gone by the time the next page is fetched, and how a
+store handles that is exactly where implementations differ.
+
+So a zero result from THIS run does not weigh against {#probe-a-answered}; it only rules out the add-only
+regime. The run that matters adds a DELETER thread removing keys from behind the listing cursor while it
+walks. That is the next configuration, and it should have been the first.
+
+Recording the gap before the verdict lands, so the verdict cannot be quietly reinterpreted to fit.
