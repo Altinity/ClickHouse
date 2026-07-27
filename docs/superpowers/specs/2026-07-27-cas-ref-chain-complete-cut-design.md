@@ -228,10 +228,23 @@ change (r6-13), on `HoleyListBackend` + a delayed-PUT fault backend:
 - catalog/`_ckpt` absence → fail closed loudly; probe A's sampling cadence deterministic and
   observable; B1 identity with `EpochSeal` no-ops; fsck clean on healthy, fatal on `chain-broken`.
 
-TLA+ (phase 0): extend `_sab_holeylist` with INV-1..4; prove the cursor never passes an unfolded
-record under arbitrary hint omissions; the flipped `LatePredecessorPut`; id-reuse safety under the
-every-attempt rule incl. the wedge-retry escape; sweep removal-tail retention; `_ckpt`
-no-dangling-pointer under the retention rule. Then consult round 7, then the soak gate.
+**TLA+ is phase 0 of the plan** (per project precedent: model changes land and go green BEFORE code),
+against the existing `docs/superpowers/models/` suite and its conventions (green configs, `_sab_*`
+sabotage configs proving each property can go red, `run_*.sh` runners, `*_RESULTS.md`):
+
+| model | v7 impact |
+|---|---|
+| `CaRefTableSnapshotLogCore` | REWRITE core: INV-1 allocator (state-derived next id; every-attempt reuse; ambiguous-then-definite wedge + same-bytes retry), INV-2 CAS-walk/`EpochSeal`/`prev_epoch_seal`, INV-4 `_ckpt` as the recovery base (merge loop, strictly-below retention, revalidation). `LatePredecessorPut` FLIPS from counterexample to proof: no record lands behind a closed frontier. |
+| `CaRefDeltaIntakeCore` | REWRITE premises: enumerate-once/list-trust replaced by arithmetic advance with hint-only listings; epoch crossing by seal consumption; sabotage = arbitrary hint omission (incl. a wholly-hidden epoch) must be unable to move the cursor. |
+| `CaRelinkConfirmCore` (`_sab_holeylist`) | The defect mechanization becomes the fix's permanent regression witness: the sabotaged enumeration can no longer reach the damage state under v7 intake. |
+| `CaRefNsCleanupStaleLeaderCore` | REWRITE around catalog states + incarnations replacing the `_cleanup` gate; stale-leader straggler deletes become inert-by-incarnation (the property turns structural); removal-append legality (owner/fenced successor only, never GC). |
+| `CaRefWriterCleanupCore` | Extend: build-not-retired-under-uncertainty; cleanup duties; the grant/removal epoch-locality facts the sweep rules rest on. |
+| `CaRefFoldClampRecoveryCore` (or sibling `CaSweepEpochSealCore`) | Extend: sweep eligibility = epoch seal consumed AND no unconsumed removal names the manifest (the S42 rule); orphan-blob nomination entering the condemn pipeline without breaking two-phase/exact-token. |
+| `CaCasMountCore` | Extend its fence sabotage family: recovery generations captured at admission; `slot-occupy`/`_ckpt`/install refused across a remount. |
+| `CaRefCatalogCore` (NEW) | Catalog lifecycle (`Creating` reconciliation bound to creator fence-liveness; capacity at the admission CAS; `Removing` completion), `_ckpt` deletion ordering, incarnation aliasing properties (no stale handle crosses incarnations; no dangling checkpoint; stale `_ckpt` under-cleans only). Reuses `CaIncarnationCore`'s vocabulary. |
+| `CaErasureProof`, `CaDiskLifecycle`, ack-floor/condemn family | AUDIT: they reference listing behavior; verify none encodes LIST-trust v7 removes, and that condemn-entry admits the nomination path. |
+
+Then consult round 7, then the soak gate.
 
 ## 11. History {#history}
 
