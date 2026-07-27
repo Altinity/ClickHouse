@@ -867,18 +867,6 @@ namespace
 
         const auto source_terms = parsePartitionTerms(source_metadata->getPartitionKeyAST());
 
-        /// todo arthur the below is questionable
-        /// A partitioned source cannot be exported into an unpartitioned Iceberg table: there is no
-        /// destination partitioning to satisfy and the result would silently drop the source layout.
-        if (actual_size == 0)
-        {
-            if (!source_terms.empty())
-                throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                    "Cannot export partition to Iceberg table: partition scheme mismatch. "
-                    "Source MergeTree is partitioned but the destination Iceberg table is unpartitioned.");
-            return;
-        }
-
         const auto & source_partition_key = source_metadata->getPartitionKey();
         const auto minmax_column_names = MergeTreeData::getMinMaxColumnsNames(source_partition_key);
         const auto minmax_column_types = MergeTreeData::getMinMaxColumnsTypes(source_partition_key);
