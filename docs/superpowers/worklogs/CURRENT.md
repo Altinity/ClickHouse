@@ -1115,3 +1115,6 @@ each, i.e. the reproduction stand's GC still turning over — background work, n
 rounds.** That is 2,859 rounds since the time series began, none reclaimed — and it now EXCEEDS the
 historical 56-blob cohort's 1,062 rounds. Permanence is no longer an inference from a trend; it is the
 longest-running observation this project has of the class.
+
+**08:26 UTC watchdog** — idle and unchanged: nothing running, 319G, load 1.10 (the repro stand's GC), 0
+uncommitted, 70 local commits. No long run under test, no signals to observe, nothing scheduled.
