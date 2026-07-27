@@ -4485,6 +4485,14 @@ MergeTreeDataPartFormat MergeTreeData::choosePartFormat(size_t bytes_uncompresse
     using PartType = MergeTreeDataPartType;
     using PartStorageType = MergeTreeDataPartStorageType;
 
+    /// Deprecated Object type doesn't work correctly with compact parts
+    /// when write_marks_for_substreams_in_compact_parts is disabled,
+    /// because the compact reader cannot properly handle missing substreams
+    /// in complex nested Tuple structures that Object converts to.
+    /// Force wide parts for such tables to avoid deserialization crashes.
+    if (hasDynamicSubcolumnsDeprecated(getInMemoryMetadataPtr()->getColumns()))
+        return {PartType::Wide, PartStorageType::Full};
+
     String out_reason;
     const auto settings = getSettings();
     if (!canUsePolymorphicParts(*settings, out_reason))

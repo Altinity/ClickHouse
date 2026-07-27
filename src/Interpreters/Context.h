@@ -525,6 +525,11 @@ protected:
     /// field and does not propagate through settings copies (e.g. getSQLSecurityOverriddenContext),
     /// so view-inner queries on the same node are unaffected.
     bool positional_arguments_already_resolved = false;
+    /// Set for queries created internally by the server for DDL replication (ON CLUSTER, DatabaseReplicated)
+    /// and internal backup coordination.
+    /// Unlike query_kind == SECONDARY_QUERY (which comes from the client and can be spoofed),
+    /// this flag can only be set server-side and is safe to use for security-sensitive checks.
+    bool is_ddl_or_on_cluster_internal = false;
 
     inline static ContextPtr global_context_instance;
 
@@ -1469,6 +1474,9 @@ public:
 
     bool isPositionalArgumentsAlreadyResolved() const { return positional_arguments_already_resolved; }
     void setPositionalArgumentsAlreadyResolved(bool value) { positional_arguments_already_resolved = value; }
+
+    bool isDDLOrOnClusterInternal() const { return is_ddl_or_on_cluster_internal; }
+    void setDDLOrOnClusterInternal(bool value) { is_ddl_or_on_cluster_internal = value; }
 
     ActionLocksManagerPtr getActionLocksManager() const;
 

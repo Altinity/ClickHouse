@@ -1167,6 +1167,7 @@ ContextData::ContextData(const ContextData &o) :
     is_internal_query(o.is_internal_query),
     is_view_inner_query(o.is_view_inner_query),
     positional_arguments_already_resolved(o.positional_arguments_already_resolved),
+    is_ddl_or_on_cluster_internal(o.is_ddl_or_on_cluster_internal),
     temp_data_on_disk(o.temp_data_on_disk),
     classifier(o.classifier),
     prepared_sets_cache(o.prepared_sets_cache),

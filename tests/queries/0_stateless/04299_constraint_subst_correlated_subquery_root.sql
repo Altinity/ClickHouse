@@ -17,6 +17,10 @@ CREATE TABLE t_constraint_corr_root
 -- fail with `NOT_IMPLEMENTED` on this version, so use `MergeTree`, whose read step is cloneable.
 ENGINE = MergeTree ORDER BY tuple();
 
+-- With parallel replicas the read becomes a `ReadFromPreparedSource` step, which is not
+-- cloneable either, so decorrelation would fail the same way. Disable parallel replicas.
+SET enable_parallel_replicas = 0;
+
 INSERT INTO t_constraint_corr_root VALUES ('1', '2', '3', '4');
 
 SELECT count() FROM t_constraint_corr_root
