@@ -1070,3 +1070,6 @@ preserved deliberately; the evidence is also captured to
 commits. No long run, so no signals to observe. Nothing scheduled — the night's assigned work (S42, the GC
 duration study, the draft proposals) is delivered, and the open items all need a decision rather than a
 timer.
+
+**02:26 UTC watchdog** — idle and unchanged: nothing running, 320G, load 1.10, 0 uncommitted, 58 local
+commits. No long run, no signals to observe, nothing scheduled.
