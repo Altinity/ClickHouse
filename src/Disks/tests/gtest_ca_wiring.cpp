@@ -1804,6 +1804,13 @@ TEST(CasWiringExchange, AdoptIntoADetachedTargetPublishesADetachedRefAndNoLiveRe
 /// answered with `MechanismFallbackAllowed`: the byte fetch that a fallback invites would write to the
 /// same wrong place. The table dir stands in for the whole class (a file inside a part, a FREEZE shadow
 /// path, a bare `detached` container) -- all of them route to something that is not a part ref.
+///
+/// The refusal throws LOGICAL_ERROR, which aborts the whole process in debug/sanitizer builds
+/// (Exception.cpp's handle_error_code) instead of behaving like a catchable exception -- so the
+/// EXPECT_THROW form only makes sense in a plain release build, and CasWiringExchangeDeathTest below
+/// proves the SAME refusals positively abort under debug/sanitizer builds instead (same pattern as
+/// CasWiringOpsDeathTest above).
+#ifndef DEBUG_OR_SANITIZER_BUILD
 TEST(CasWiringExchange, PrepareAdoptRefusesATargetThatIsNotAPartDirectory)
 {
     auto storage = openWiringStorage();
@@ -1824,6 +1831,28 @@ TEST(CasWiringExchange, PrepareAdoptRefusesATargetThatIsNotAPartDirectory)
                  DB::Exception);
     EXPECT_EQ(prepared, nullptr);
 }
+#else
+TEST(CasWiringExchangeDeathTest, PrepareAdoptRefusesATargetThatIsNotAPartDirectoryAborts)
+{
+    auto storage = openWiringStorage();
+    auto * exchange = dynamic_cast<DB::IContentAddressedExchange *>(storage.get());
+    ASSERT_NE(exchange, nullptr);
+
+    std::unique_ptr<DB::ICaPreparedRelink> prepared;
+    EXPECT_DEATH(exchange->prepareAdoptFromManifest(
+                     "a22/a22a22a2-2222-4222-8222-222222222222", std::string{}, prepared),
+                 "does not address a content-addressed part directory");
+    EXPECT_DEATH(exchange->prepareAdoptFromManifest(
+                     "a22/a22a22a2-2222-4222-8222-222222222222/tmp-fetch_all_1_1_0/data.bin",
+                     std::string{}, prepared),
+                 "does not address a content-addressed part directory");
+    EXPECT_DEATH(exchange->prepareAdoptFromManifest(
+                     "shadow/bk1/store/a22/a22a22a2-2222-4222-8222-222222222222/all_1_1_0",
+                     std::string{}, prepared),
+                 "does not address a content-addressed part directory");
+    EXPECT_EQ(prepared, nullptr);
+}
+#endif
 
 /// ==== Commit atomicity (B122): a publish failing mid-loop must not leave a PARTIAL commit ====
 
