@@ -152,9 +152,8 @@ namespace ExportPartitionUtils
         const auto parts = storage.getDataPartsVectorInPartitionForInternalUsage(
             {MergeTreeDataPartState::Active, MergeTreeDataPartState::Outdated}, partition_id, lock);
 
-        /// Derive the representative only from the exact parts that were validated and exported (recorded
-        /// in the manifest), never from unrelated parts inserted/merged after scheduling: those could map
-        /// to a different Iceberg partition and stamp metadata that does not match the exported files.
+        /// Only look at the parts being exported. These parts are guaranteed to map to a single partition.
+        /// Parts that were later inserted shall be ignored
         const std::unordered_set<String> exported(exported_part_names.begin(), exported_part_names.end());
         MergeTreeData::DataPartsVector exported_parts;
         for (const auto & part : parts)
@@ -168,13 +167,14 @@ namespace ExportPartitionUtils
                 "on this replica. The commit will be retried.",
                 partition_id);
 
-        /// The gate proved the exported parts map to a single Iceberg partition, so any exported part's
-        /// values yield the same tuple; fold the global min across them as a deterministic representative.
         const auto metadata_snapshot = storage.getInMemoryMetadataPtr();
         const auto & partition_key = metadata_snapshot->getPartitionKey();
         const auto minmax_column_names = MergeTreeData::getMinMaxColumnsNames(partition_key);
         const auto minmax_column_types = MergeTreeData::getMinMaxColumnsTypes(partition_key);
 
+
+        /// Grab the min/ max value from the partition. When the query was scheduled, we validated that
+        /// dst_expression(min) == dst_expression(max). Therefore, we can use only the min value, no need for the max.
         Block block;
         for (size_t i = 0; i < minmax_column_types.size(); ++i)
         {
