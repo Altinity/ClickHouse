@@ -878,25 +878,20 @@ namespace
             const auto dest_source_id = af->getValue<Int32>(Iceberg::f_source_id);
             const auto dest_transform = af->getValue<String>(Iceberg::f_transform);
             const String column = source_id_to_name(dest_source_id);
-            const auto dest_canonical = Iceberg::parseTransformAndArgument(dest_transform, partition_timezone);
+            const auto transform_and_argument = Iceberg::parseTransformAndArgument(dest_transform, partition_timezone);
 
             /// A transform we cannot reconstruct as a ClickHouse function must match structurally.
-            if (!dest_canonical)
-                throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                    "Cannot export partition to Iceberg table: destination field on column '{}' uses "
-                    "transform '{}', which requires the source MergeTree to be partitioned by the matching "
-                    "function.", column, dest_transform);
+            if (!transform_and_argument)
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unknown transform {}", transform_and_argument->transform_name);
 
-            const std::optional<Int64> dest_argument = dest_canonical->argument
-                ? std::optional<Int64>(static_cast<Int64>(*dest_canonical->argument)) : std::nullopt;
+            const std::optional<Int64> dest_argument = transform_and_argument->argument
+                ? std::optional<Int64>(static_cast<Int64>(*transform_and_argument->argument)) : std::nullopt;
 
-            /// bucket is a hash: not order-preserving, so the dynamic min/max proof cannot show that a
-            /// source partition maps to a single bucket. It is only accepted when the source already
-            /// partitions by the same icebergBucket(N, col) on an identical column type - the hash is
-            /// representation-sensitive, so a pre-transform cast that changes the type changes the result.
-            if (dest_canonical->transform_name == "icebergBucket")
+            /// bucket is a hash, monotonicity check won't work. Check it manually.
+            if (transform_and_argument->transform_name == "icebergBucket")
             {
                 const auto slot_it = std::find(minmax_column_names.begin(), minmax_column_names.end(), column);
+
                 bool matched_structurally = false;
                 if (slot_it != minmax_column_names.end() && destination_sample.has(column)
                     && minmax_column_types[slot_it - minmax_column_names.begin()]->equals(*destination_sample.getByName(column).type))
@@ -908,6 +903,7 @@ namespace
                             break;
                         }
                 }
+
                 if (!matched_structurally)
                     throw Exception(ErrorCodes::BAD_ARGUMENTS,
                         "Cannot export partition to Iceberg table: destination field on column '{}' uses the "
@@ -918,8 +914,8 @@ namespace
 
             /// Every other Iceberg transform (identity/year/month/day/hour/truncate) is monotonic, so the
             /// dynamic proof evaluates it on the partition's real [min, max] and accepts iff it is constant.
-            verifyColumnMapsToSinglePartition(column, dest_canonical->transform_name, dest_argument,
-                dest_canonical->time_zone, minmax_column_names, minmax_column_types, destination_sample,
+            verifyColumnMapsToSinglePartition(column, transform_and_argument->transform_name, dest_argument,
+                transform_and_argument->time_zone, minmax_column_names, minmax_column_types, destination_sample,
                 parts, partition_id, context);
         }
     }
