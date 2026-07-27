@@ -456,6 +456,13 @@ TEST(CasPartFolderAccess, DestroyingAnUnfinishedPreparedPartWriteAborts)
 
 /// The terminal flag is explicit and one-shot: a second `promote`/`abort` is a caller bug, not an
 /// idempotent no-op, and must never re-drive the (already dead) transaction.
+///
+/// The rejection throws LOGICAL_ERROR, which aborts the whole process in debug/sanitizer builds
+/// (Exception.cpp's handle_error_code) instead of behaving like a catchable exception -- so the
+/// expectThrowsCode form only makes sense in a plain release build, and the DeathTest variant below
+/// proves the SAME rejections positively abort under debug/sanitizer builds instead (same pattern as
+/// CasWiringOpsDeathTest in gtest_ca_wiring.cpp).
+#ifndef DEBUG_OR_SANITIZER_BUILD
 TEST(CasPartFolderAccess, PreparedPartWriteRejectsASecondTerminal)
 {
     auto backend = std::make_shared<CountingBackend>();
@@ -480,6 +487,31 @@ TEST(CasPartFolderAccess, PreparedPartWriteRejectsASecondTerminal)
     EXPECT_FALSE(access.existsRef({ns, "aborted"}, Cas::Freshness::ForceFresh));
     EXPECT_TRUE(store->livePrecommitsForTest(ns).empty());
 }
+#else
+TEST(CasPartFolderAccessDeathTest, PreparedPartWriteRejectsASecondTerminalAborts)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend);
+    const Cas::RootNamespace ns{"srv/t1"};
+    Cas::CachedPartFolderAccess access(store, cacheOn());
+
+    auto promoted = access.prepareEntries({ns, "promoted"}, {inlineEntry("f", "one")}, Cas::ProvenanceOp::Insert);
+    promoted.promote();
+    EXPECT_TRUE(promoted.isTerminal());
+    EXPECT_DEATH(promoted.promote(), "owes exactly one terminal operation");
+    EXPECT_DEATH(promoted.abort(), "owes exactly one terminal operation");
+
+    auto aborted = access.prepareEntries({ns, "aborted"}, {inlineEntry("f", "one")}, Cas::ProvenanceOp::Insert);
+    aborted.abort();
+    EXPECT_TRUE(aborted.isTerminal());
+    EXPECT_DEATH(aborted.abort(), "owes exactly one terminal operation");
+    EXPECT_DEATH(aborted.promote(), "owes exactly one terminal operation");
+
+    EXPECT_TRUE(access.existsRef({ns, "promoted"}, Cas::Freshness::ForceFresh));
+    EXPECT_FALSE(access.existsRef({ns, "aborted"}, Cas::Freshness::ForceFresh));
+    EXPECT_TRUE(store->livePrecommitsForTest(ns).empty());
+}
+#endif
 
 /// Move-only, and the move transfers the terminal duty in full: the moved-from handle is already
 /// terminal (its destructor must not re-abort a transaction the destination now owns), while the
@@ -500,7 +532,13 @@ TEST(CasPartFolderAccess, PreparedPartWriteMoveTransfersTheTerminalDuty)
         Cas::PreparedPartWrite moved = std::move(source);
         /// NOLINTNEXTLINE(bugprone-use-after-move,clang-analyzer-cplusplus.Move)
         EXPECT_TRUE(source.isTerminal()) << "a moved-from handle owes nothing";
+#ifndef DEBUG_OR_SANITIZER_BUILD
         expectThrowsCode(ErrorCodes::LOGICAL_ERROR, [&] { source.abort(); });
+#else
+        /// LOGICAL_ERROR aborts the process in debug/sanitizer builds; EXPECT_DEATH forks, so the
+        /// parent's state (and the rest of this test) is unaffected.
+        EXPECT_DEATH(source.abort(), "owes exactly one terminal operation");
+#endif
         EXPECT_TRUE(store->livePrecommitsForTest(ns).contains({"part_1", id.ref}))
             << "the moved-from handle must not have aborted the transaction it handed over";
         EXPECT_EQ(moved.manifestId().ref, id.ref);
