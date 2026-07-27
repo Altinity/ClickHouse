@@ -1079,3 +1079,6 @@ run, no signals to observe. Closed task #16 (Run S42 at scale), which was still 
 being finished twice over — a stale task list is worse than none. Its record now carries the verdict (no
 break under memory exhaustion), the real defect it uncovered and its root cause, the inconclusive first
 attempt and why, and the two follow-ups that are NOT part of it.
+
+**03:26 UTC watchdog** — idle and unchanged: nothing running, 320G, load 0.72, 0 uncommitted, 60 local
+commits. No long run, no signals to observe, nothing scheduled.
