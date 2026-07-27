@@ -787,21 +787,37 @@ class JobConfigs:
             runs_on=RunnerLabels.AMD_MEDIUM_CPU,
             requires=[ArtifactNames.CH_AMD_BINARY_GH],
         ),
-        Job.ParamSet(
-            parameter="amd_asan_ubsan, content_addressed s3 storage, parallel",
-            runs_on=RunnerLabels.AMD_MEDIUM_CPU,
-            requires=[ArtifactNames.CH_AMD_ASAN_UBSAN_GH],
-        ),
-        Job.ParamSet(
-            parameter="amd_tsan, content_addressed s3 storage, parallel",
-            runs_on=RunnerLabels.AMD_MEDIUM,
-            requires=[ArtifactNames.CH_AMD_TSAN_GH],
-        ),
-        Job.ParamSet(
-            parameter="amd_msan, content_addressed s3 storage, parallel",
-            runs_on=RunnerLabels.FUNC_TESTER_AMD,
-            requires=[ArtifactNames.CH_AMD_MSAN_GH],
-        ),
+        # The sanitizer variants are sharded: a single unsharded lane does not fit the 6h GitHub job
+        # timeout (tsan finished its tests at ~5h59m and was killed during artifact upload; msan was
+        # at 53% of the test list when killed; asan_ubsan passed at 5.4h — too close). The kill lands
+        # after the test loop but before result upload, so such a lane reports no artifacts at all.
+        *[
+            Job.ParamSet(
+                parameter=f"amd_asan_ubsan, content_addressed s3 storage, parallel, {batch}/{total_batches}",
+                runs_on=RunnerLabels.AMD_MEDIUM_CPU,
+                requires=[ArtifactNames.CH_AMD_ASAN_UBSAN_GH],
+            )
+            for total_batches in (2,)
+            for batch in range(1, total_batches + 1)
+        ],
+        *[
+            Job.ParamSet(
+                parameter=f"amd_tsan, content_addressed s3 storage, parallel, {batch}/{total_batches}",
+                runs_on=RunnerLabels.AMD_MEDIUM,
+                requires=[ArtifactNames.CH_AMD_TSAN_GH],
+            )
+            for total_batches in (2,)
+            for batch in range(1, total_batches + 1)
+        ],
+        *[
+            Job.ParamSet(
+                parameter=f"amd_msan, content_addressed s3 storage, parallel, {batch}/{total_batches}",
+                runs_on=RunnerLabels.FUNC_TESTER_AMD,
+                requires=[ArtifactNames.CH_AMD_MSAN_GH],
+            )
+            for total_batches in (3,)
+            for batch in range(1, total_batches + 1)
+        ],
         Job.ParamSet(
             parameter="arm_binary, content_addressed s3 storage, parallel",
             runs_on=RunnerLabels.ARM_MEDIUM_CPU,
