@@ -882,7 +882,7 @@ namespace
 
             /// A transform we cannot reconstruct as a ClickHouse function must match structurally.
             if (!transform_and_argument)
-                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unknown transform {}", transform_and_argument->transform_name);
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unknown transform");
 
             const std::optional<Int64> dest_argument = transform_and_argument->argument
                 ? std::optional<Int64>(static_cast<Int64>(*transform_and_argument->argument)) : std::nullopt;
