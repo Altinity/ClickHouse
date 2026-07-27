@@ -591,7 +591,8 @@ namespace
 
         bool operator==(const PartitionTerm & other) const
         {
-            return column == other.column && function == other.function && argument == other.argument;
+            return column == other.column && function == other.function && argument == other.argument
+                && time_zone == other.time_zone;
         }
     };
 
@@ -788,6 +789,51 @@ namespace
                 "for column '{}'. A source MergeTree partition must map to a single destination partition.",
                 partition_id, column);
     }
+
+    bool sourceHasMatchingPartitionTerm(
+        const PartitionTerm & term,
+        const std::vector<PartitionTerm> & source_terms,
+        const Names & minmax_column_names,
+        const DataTypes & minmax_column_types,
+        const Block & destination_sample)
+    {
+        if (std::find(source_terms.begin(), source_terms.end(), term) == source_terms.end())
+            return false;
+
+        if (term.function.empty())
+            return true;
+
+        const auto it = std::find(minmax_column_names.begin(), minmax_column_names.end(), term.column);
+        return it != minmax_column_names.end() && destination_sample.has(term.column)
+            && minmax_column_types[it - minmax_column_names.begin()]->equals(*destination_sample.getByName(term.column).type);
+    }
+
+    /// Asserts every destination partition term maps the whole source partition to a single destination
+    /// partition, either because the source already partitions by that term or because the min/max proof holds.
+    void verifyPartitionTermsCompatibility(
+        const std::vector<PartitionTerm> & destination_terms,
+        const StorageMetadataPtr & source_metadata,
+        const StorageMetadataPtr & destination_metadata,
+        const MergeTreeData::DataPartsVector & parts,
+        const String & partition_id,
+        const ContextPtr & context)
+    {
+        const auto source_terms = parsePartitionTerms(source_metadata->getPartitionKeyAST());
+
+        const auto & source_partition_key = source_metadata->getPartitionKey();
+        const auto minmax_column_names = MergeTreeData::getMinMaxColumnsNames(source_partition_key);
+        const auto minmax_column_types = MergeTreeData::getMinMaxColumnsTypes(source_partition_key);
+        const auto destination_sample = destination_metadata->getSampleBlockNonMaterialized();
+
+        for (const auto & term : destination_terms)
+        {
+            if (sourceHasMatchingPartitionTerm(term, source_terms, minmax_column_names, minmax_column_types, destination_sample))
+                continue;
+
+            verifyColumnMapsToSinglePartition(term.column, term.function, term.argument, term.time_zone,
+                minmax_column_names, minmax_column_types, destination_sample, parts, partition_id, context);
+        }
+    }
 }
 
 #if USE_AVRO
@@ -853,57 +899,36 @@ namespace
 
         const auto actual_fields = partition_spec_json->getArray(Iceberg::f_fields);
         const size_t actual_size = actual_fields ? actual_fields->size() : 0;
-
-        const auto source_terms = parsePartitionTerms(source_metadata->getPartitionKeyAST());
-
-        const auto & source_partition_key = source_metadata->getPartitionKey();
-        const auto minmax_column_names = MergeTreeData::getMinMaxColumnsNames(source_partition_key);
-        const auto minmax_column_types = MergeTreeData::getMinMaxColumnsTypes(source_partition_key);
-        const auto destination_sample = destination_metadata->getSampleBlockNonMaterialized();
         const String partition_timezone = context->getSettingsRef()[Setting::iceberg_partition_timezone];
 
+        /// Rebuild the destination spec as ClickHouse partition terms, mirroring ChunkPartitioner and the commit
+        /// path, so the same compatibility rule applies as for a plain object storage destination. An empty spec
+        /// yields no terms: an unpartitioned table has a single partition that every source part maps to.
+        std::vector<PartitionTerm> destination_terms;
+        destination_terms.reserve(actual_size);
         for (UInt32 i = 0; i < actual_size; ++i)
         {
             const auto af = actual_fields->getObject(i);
-            const auto dest_source_id = af->getValue<Int32>(Iceberg::f_source_id);
             const auto dest_transform = af->getValue<String>(Iceberg::f_transform);
-            const String column = source_id_to_name(dest_source_id);
+            const String column = source_id_to_name(af->getValue<Int32>(Iceberg::f_source_id));
             const auto transform_and_argument = Iceberg::parseTransformAndArgument(dest_transform, partition_timezone);
 
-            /// A transform we cannot reconstruct as a ClickHouse function must match structurally.
             if (!transform_and_argument)
-                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unknown transform");
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "Cannot export partition to Iceberg table: destination field on column '{}' uses transform "
+                    "'{}', which has no ClickHouse equivalent.", column, dest_transform);
 
-            const auto dest_argument = transform_and_argument->argument;
-
-            const auto & dest_function = transform_and_argument->transform_name;
-
-            const auto min_max_column_it = std::find(minmax_column_names.begin(), minmax_column_names.end(), column);
-            const bool has_min_max_column = min_max_column_it != minmax_column_names.end();
-            const bool has_destination_column = destination_sample.has(column);
-            const bool types_match = has_min_max_column && has_destination_column && minmax_column_types[min_max_column_it - minmax_column_names.begin()]->equals(*destination_sample.getByName(column).type);
-
-            bool identical = false;
-            for (const auto & term : source_terms)
-            {
-                if (term.column != column
-                    || (term.function.empty() ? "identity" : term.function) != dest_function
-                    || term.argument != dest_argument
-                    || term.time_zone != transform_and_argument->time_zone)
-                    continue;
-
-                identical = types_match || dest_function == "identity";
-                break;
-            }
-
-            if (identical)
-                continue;
-
-            /// if it is not an exact match, check monotonicity
-            verifyColumnMapsToSinglePartition(column, dest_function, dest_argument,
-                transform_and_argument->time_zone, minmax_column_names, minmax_column_types, destination_sample,
-                parts, partition_id, context);
+            /// A bare source column parses to an empty function name, which is what Iceberg calls identity.
+            destination_terms.push_back({
+                column,
+                transform_and_argument->transform_name == "identity" ? "" : transform_and_argument->transform_name,
+                transform_and_argument->argument
+                    ? std::optional<Int64>(static_cast<Int64>(*transform_and_argument->argument)) : std::nullopt,
+                transform_and_argument->time_zone});
         }
+
+        verifyPartitionTermsCompatibility(
+            destination_terms, source_metadata, destination_metadata, parts, partition_id, context);
     }
 #endif
 
@@ -924,24 +949,8 @@ namespace
             return;
 
         /// If the partition keys are not identical, we need to verify that the source partition maps to a single destination partition
-        const auto source_terms = parsePartitionTerms(source_key_ast);
-        const auto destination_terms = parsePartitionTerms(destination_key_ast);
-
-        const auto & source_partition_key = source_metadata->getPartitionKey();
-        const auto minmax_column_names = MergeTreeData::getMinMaxColumnsNames(source_partition_key);
-        const auto minmax_column_types = MergeTreeData::getMinMaxColumnsTypes(source_partition_key);
-        const auto destination_sample = destination_metadata->getSampleBlockNonMaterialized();
-
-        for (const auto & term : destination_terms)
-        {
-            /// Destination term is present in the source partition key, skip
-            if (std::find(source_terms.begin(), source_terms.end(), term) != source_terms.end())
-                continue;
-
-            /// Destination term is not present in the source partition key, verify that the source partition maps to a single destination partition
-            verifyColumnMapsToSinglePartition(term.column, term.function, term.argument, term.time_zone,
-                minmax_column_names, minmax_column_types, destination_sample, parts, partition_id, context);
-        }
+        verifyPartitionTermsCompatibility(
+            parsePartitionTerms(destination_key_ast), source_metadata, destination_metadata, parts, partition_id, context);
     }
 
     void verifyExportSchemaCastable(
