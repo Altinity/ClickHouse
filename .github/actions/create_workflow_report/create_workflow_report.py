@@ -10,7 +10,6 @@ import json
 from datetime import datetime
 from datetime import timezone
 from functools import lru_cache
-from glob import glob
 import urllib.parse
 import re
 import subprocess
@@ -736,45 +735,64 @@ def get_new_fails_this_pr(
     return new_fails_df
 
 
-@lru_cache
-def get_workflow_config() -> dict:
-
-    # 25.12+
-    if os.path.exists("./ci/tmp/workflow_status.json"):
-        with open("./ci/tmp/workflow_status.json", "r") as f:
-            data = json.load(f)["config_workflow"]["outputs"]["data"]
-            assert data is not None, "data is None"
-            if isinstance(data, str):
-                data = json.loads(data)
-            assert (
-                "WORKFLOW_CONFIG" in data.keys()
-            ), f"WORKFLOW_CONFIG not found in data: {data.keys()}"
-            return data["WORKFLOW_CONFIG"]
-
-    workflow_config_files = glob("./ci/tmp/workflow_config*.json")
-    if len(workflow_config_files) == 0:
-        raise Exception("No workflow config file found")
-    if len(workflow_config_files) > 1:
-        raise Exception("Multiple workflow config files found")
-    with open(workflow_config_files[0], "r") as f:
-        return json.load(f)
-
-
-def get_cached_job(job_name: str) -> dict:
-    workflow_config = get_workflow_config()
-    return workflow_config["cache_jobs"].get(job_name, {})
+def _workflow_config_s3_url(pr_number: int, commit_sha: str, ref_name: str) -> str:
+    if pr_number == 0:
+        # REF uploads use a double slash before config_workflow in the S3 key.
+        return (
+            f"https://{S3_BUCKET}.s3.amazonaws.com/REFs/{ref_name}/{commit_sha}/"
+            "/config_workflow/workflow_config_masterci.json"
+        )
+    return (
+        f"https://{S3_BUCKET}.s3.amazonaws.com/PRs/{pr_number}/{commit_sha}/"
+        "config_workflow/workflow_config_pr.json"
+    )
 
 
 @lru_cache
-def get_expected_version_labels() -> list[str]:
+def get_workflow_config(pr_number: int, commit_sha: str, ref_name: str) -> dict:
+    """Fetch workflow config published by Config Workflow from S3.
+
+    On failure, warn and return a minimal empty config (same shape recreation uses).
+    """
+    url = _workflow_config_s3_url(pr_number, commit_sha, ref_name)
+    try:
+        response = requests.get(url, timeout=30)
+        if response.status_code != 200:
+            print(
+                f"WARNING:Failed to fetch workflow config from {url}: "
+                f"{response.status_code}"
+            )
+            return {"cache_jobs": {}}
+        return response.json()
+    except Exception as e:
+        print(f"WARNING:Failed to fetch workflow config from {url}: {e}")
+        return {"cache_jobs": {}}
+
+
+def get_cached_job(
+    job_name: str, pr_number: int, commit_sha: str, ref_name: str
+) -> dict:
+    workflow_config = get_workflow_config(pr_number, commit_sha, ref_name)
+    return workflow_config.get("cache_jobs", {}).get(job_name, {})
+
+
+@lru_cache
+def get_expected_version_labels(
+    pr_number: int, commit_sha: str, ref_name: str
+) -> tuple[str, ...]:
     """Return required version labels from workflow_config.custom_data.version.
 
     Stable releases use the minor and full version labels. Antalya releases use
     ``antalya``, ``antalya-{major}.{minor}``, and ``antalya-{full_version}``.
-    Returns an empty list when version metadata is unavailable.
+    Returns an empty tuple when version metadata is unavailable.
     """
     try:
-        version = get_workflow_config().get("custom_data", {}).get("version") or {}
+        version = (
+            get_workflow_config(pr_number, commit_sha, ref_name)
+            .get("custom_data", {})
+            .get("version")
+            or {}
+        )
         major = version.get("major")
         minor = version.get("minor")
         patch = version.get("patch")
@@ -782,18 +800,18 @@ def get_expected_version_labels() -> list[str]:
         flavour = version.get("flavour")
         if None in (major, minor, patch, tweak, flavour):
             print("WARNING:Incomplete version metadata in workflow config.")
-            return []
+            return ()
         minor_version = f"{major}.{minor}"
         full_version = f"{minor_version}.{patch}.{tweak}"
         if flavour == "altinityantalya":
-            return ["antalya", f"antalya-{minor_version}", f"antalya-{full_version}"]
+            return ("antalya", f"antalya-{minor_version}", f"antalya-{full_version}")
         if flavour in ["altinitystable", "altinitytest"]:
-            return [minor_version, full_version]
+            return (minor_version, full_version)
         print(f"WARNING:Unknown release flavour in workflow config: {flavour}")
-        return []
+        return ()
     except Exception as e:
         print(f"WARNING:Could not read expected version labels: {e}")
-        return []
+        return ()
 
 
 def get_cves(pr_number, commit_sha, branch):
@@ -811,7 +829,9 @@ def get_cves(pr_number, commit_sha, branch):
         else:
             return f"PRs/{pr_number}/{commit_sha}/grype/"
 
-    cached_server_job = get_cached_job("Docker server image")
+    cached_server_job = get_cached_job(
+        "Docker server image", pr_number, commit_sha, branch
+    )
     if cached_server_job:
         prefixes_to_check.add(
             format_prefix(
@@ -820,7 +840,9 @@ def get_cves(pr_number, commit_sha, branch):
                 cached_server_job["branch"],
             )
         )
-    cached_keeper_job = get_cached_job("Docker keeper image")
+    cached_keeper_job = get_cached_job(
+        "Docker keeper image", pr_number, commit_sha, branch
+    )
     if cached_keeper_job:
         prefixes_to_check.add(
             format_prefix(
@@ -904,17 +926,19 @@ def url_to_html_link(url: str) -> str:
     return f'<a href="{url}">{text}</a>'
 
 
-def format_pr_labels_with_verification(labels: str) -> str:
+def format_pr_labels_with_verification(
+    labels: str, required_labels: tuple[str, ...] = ()
+) -> str:
     """Format the PR labels with verification.
 
     Expects ``labels`` to be already HTML-escaped at collection time
     (see _enrich_prs_in_release_merge_prs).
 
-    Requires ``verified`` plus expected minor and full version labels when
-    version metadata is available.
+    Requires ``verified`` plus ``required_labels`` (the expected version labels
+    when version metadata is available).
     """
     labels_list = labels.split(", ") if labels else []
-    required = ["verified"] + get_expected_version_labels()
+    required = ["verified", *required_labels]
     missing = [label for label in required if label not in labels_list]
     if not missing:
         return labels
@@ -944,7 +968,9 @@ def format_test_status(text: str) -> str:
     return f'<span style="font-weight: bold; color: {color}">{text}</span>'
 
 
-def format_results_as_html_table(results) -> str:
+def format_results_as_html_table(
+    results, *, required_pr_labels: tuple[str, ...] = ()
+) -> str:
     if not isinstance(results, pd.DataFrame):
         return results
 
@@ -977,7 +1003,9 @@ def format_results_as_html_table(results) -> str:
         "PR Number": lambda n: url_to_html_link(
             f"https://github.com/{GITHUB_REPO}/pull/{n}"
         ),
-        "PR Labels": format_pr_labels_with_verification,
+        "PR Labels": lambda labels: format_pr_labels_with_verification(
+            labels, required_pr_labels
+        ),
     }
 
     html = results.to_html(
@@ -1276,7 +1304,10 @@ def create_workflow_report(
             "<p>PR details are not loaded during preview.</p>"
             if mark_preview or pr_number != 0
             else format_results_as_html_table(
-                results_dfs["prs_in_release"]
+                results_dfs["prs_in_release"],
+                required_pr_labels=get_expected_version_labels(
+                    pr_number, commit_sha, branch_name
+                ),
             )
         ),
         "ci_jobs_status_html": format_results_as_html_table(
