@@ -26,27 +26,14 @@ The Iceberg manifest files contain statistics about the data. Exporting a merge 
 
 #### Source partition key compatibility
 
-Because the commit writes a single partition tuple per exported partition, every destination Iceberg partition field must be single-valued across the exported source partition. A source `PARTITION BY` field is accepted when either:
+The source partition must not be split in the destination. This is validated at schedule time through two mechanisms:
 
-- It structurally matches the destination transform on the same column. The functions with a direct Iceberg equivalent are `identity` (a bare column), `toYearNumSinceEpoch` (`year`), `toMonthNumSinceEpoch` (`month`), `toRelativeDayNum` (`day`), `toRelativeHourNum` (`hour`), `icebergTruncate` (`truncate`), and `icebergBucket` (`bucket`).
-- Or the destination transform is proven constant over the exported partition's actual `[min, max]`. This accepts other equivalent or finer keys - for example `PARTITION BY toDate(ts)` or `toYYYYMM(ts)` or `toStartOfHour(ts)` into a destination partitioned by `day(ts)` / `month(ts)` / `hour(ts)`, a bare `Date` column into a `day` transform, or a source that adds extra partition columns on top of the destination's.
-
-The proof uses each part's min/max statistics, so it is data-dependent: a partition whose rows would span more than one destination partition (for example a monthly source partition exported into a daily destination that actually contains several days) is rejected with a `BAD_ARGUMENTS` error at `EXPORT` time.
-
-`bucket` is a hash and is not order-preserving, so it can only be matched structurally: the source must be partitioned by `icebergBucket(N, col)` with the same `N`.
-
-Lossy partition-column casts (allowed via `export_merge_tree_part_allow_lossy_cast`) are supported as long as the cast stays order-preserving over the partition's actual values; a partition whose values cross the destination type's overflow boundary is rejected. A `Nullable` partition column is only accepted through a structural match, because a `NULL` forms its own Iceberg partition.
+1. Identical expressions; or
+2. Destination partition expression is monotonically increasing in the min/max column ranges and the destination expression columns are a subset of the source expression;
 
 ### On plain object storage exports:
 
 Each MergeTree part will become a separate file with the following name convention: `<table_directory>/<partitioning>/<data_part_name>_<merge_tree_part_checksum>.<format>`. To ensure atomicity, a commit file containing the relative paths of all exported parts is also shipped. A data file should only be considered part of the dataset if a commit file references it. The commit file will be named using the following convention: `<table_directory>/commit_<partition_id>_<transaction_id>`.
-
-#### Source partition key compatibility
-
-A Hive-partitioned plain destination is always partitioned by bare storage columns (an expression key such as `PARTITION BY toYYYYMM(ts)` is rejected at table creation). Each destination column must be single-valued across the exported source part, which holds when either:
-
-- The source already partitions by that column (destination columns are a subset of the source's, in any order) - for example `PARTITION BY (toYYYYMM(ts), country)` into a destination partitioned by `country`.
-- Or the column holds a single value over the part's actual `[min, max]` (data-dependent).
 
 ## Syntax
 
