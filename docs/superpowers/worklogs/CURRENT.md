@@ -1073,3 +1073,9 @@ timer.
 
 **02:26 UTC watchdog** — idle and unchanged: nothing running, 320G, load 1.10, 0 uncommitted, 58 local
 commits. No long run, no signals to observe, nothing scheduled.
+
+**02:56 UTC watchdog** — idle: nothing running, 320G, load 0.70, 0 uncommitted, 59 local commits. No long
+run, no signals to observe. Closed task #16 (Run S42 at scale), which was still marked in-progress after
+being finished twice over — a stale task list is worse than none. Its record now carries the verdict (no
+break under memory exhaustion), the real defect it uncovered and its root cause, the inconclusive first
+attempt and why, and the two follow-ups that are NOT part of it.
