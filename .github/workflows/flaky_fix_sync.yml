@@ -12,7 +12,7 @@ on:
         description: 'Commit subject pattern to match (case-insensitive)'
         required: false
         type: string
-        default: 'fix flaky test'
+        default: 'fix flaky'
       upstream_ref:
         description: 'Upstream branch/ref to scan'
         required: false
@@ -48,7 +48,7 @@ jobs:
         run: |
           python3 tests/ci/check_for_flaky_fixes.py \
             --since-days "${{ inputs.since_days || '7' }}" \
-            --pattern "${{ inputs.pattern || 'fix flaky test' }}" \
+            --pattern "${{ inputs.pattern || 'fix flaky' }}" \
             --upstream-ref "${{ inputs.upstream_ref || 'master' }}" \
             --md-output flaky_fix_report.md \
             --json-output flaky_fix.json
