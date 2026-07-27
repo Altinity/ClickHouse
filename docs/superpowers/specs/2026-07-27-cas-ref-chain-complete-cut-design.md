@@ -1,383 +1,282 @@
 ---
-description: 'Design for closing the LIST-incompleteness release blocker: every ref-log record carries a prev link to its durable predecessor, the GC fold advances its cursor only along the verified chain (repairing listing holes with exact-key reads), a fixed-key CAS seal pointer makes void intervals decidable without trusting listings, the orphan-manifest sweep gains a provable owner-grant bound, REBUILD and fsck stop trusting hot listings, and every residual is named with its detector.'
-sidebar_label: 'CAS ref-chain complete-cut'
+description: 'v5 design for the LIST-incompleteness release blocker: three invariant changes — per-namespace contiguous ref-log ids, in-band epoch-close records that CAS-occupy the next slot, and a point-readable namespace catalog — replace the v1–v4 certificate machinery entirely; LIST is demoted to a zero-trust hint everywhere.'
+sidebar_label: 'CAS ref contiguous-chain'
 sidebar_position: 20260727
 slug: /superpowers/specs/cas-ref-chain-complete-cut-design
-title: 'CAS: ref-log prev-chain and the complete-cut fold'
+title: 'CAS: contiguous ref streams and the in-band epoch seal'
 doc_type: 'reference'
 ---
 
-# CAS: ref-log prev-chain and the complete-cut fold {#cas-ref-chain-complete-cut}
+# CAS: contiguous ref streams and the in-band epoch seal {#cas-ref-contiguous-chain}
 
-**Date:** 2026-07-27. **Status:** v4 — after three adversarial review rounds (all REJECT; every finding
-incorporated, refuted-with-record, or superseded — §14–§16); awaiting review round 4 and user review.
-**Branch:** `cas-gc-rebuild`.
+**Date:** 2026-07-27. **Status:** v5 — full reformulation after the user rejected v4's accretion;
+awaiting adversarial review round 5 and user review. **Branch:** `cas-gc-rebuild`.
 
-Fixes BACKLOG `{#list-as-journal-dataloss-2026-07-25}` — observed, not modelled: an enumeration of
-`cas/refs/` omitted two objects durable for nineteen seconds while returning a key written 2.2 ms after
-them (`reports/2026-07-26-list-incompleteness-investigation.md`, evidence in
-`reports/2026-07-26-list-incompleteness-proof/`). Realizes proposal P4 of `cas/draft-fixes-20260726.md`
-("authoritative per-namespace chain plus a complete-cut gate") and satisfies its refutation condition:
-the append path and the fold's per-record path add zero requests.
+Fixes BACKLOG `{#list-as-journal-dataloss-2026-07-25}` — observed, not modelled
+(`reports/2026-07-26-list-incompleteness-investigation.md`, evidence in
+`reports/2026-07-26-list-incompleteness-proof/`) — and closes the `Late Predecessor PUT` limitation
+documented in the Phase-1 ref spec (rev.4). Realizes P4 of `cas/draft-fixes-20260726.md` within its
+refutation condition: zero added requests on the append path and on the fold's per-record path.
 
-## 1. Problem {#problem}
+## 1. Problem, and why v1–v4 grew a tumor {#problem}
 
-GC discovers ref-log transactions by listing the ref prefix, folds what the listing returned, and seals
-the per-namespace cursor (`ShardCoverage::last_folded_ref_id`) above every record the round OBSERVED —
-not above every record that EXISTS. The intake loop (`CasGc.cpp`, `fold`) iterates listed ids only, so an
-id the listing omitted between two listed ids is sealed past silently and can never be folded again. A
-skipped `-1` leaves a permanent retention leak; a skipped `+1` hides a live owner and lets GC delete a
-blob a committed manifest still references — acknowledged-data loss.
+GC discovers ref-log transactions by listing `cas/refs/`, folds what the listing returned, and seals a
+per-namespace cursor above what it OBSERVED, not what EXISTS. A record the listing omitted is sealed
+past forever: a missed `-1` is a permanent leak; a missed `+1` lets GC delete a blob a committed
+manifest still references. Writer recovery, the orphan sweep, REBUILD and fsck consume the same
+untrusted listings.
 
-The untrusted-listing shape has several destructive consumers, all covered here: the fold cursor (§5),
-the orphan-manifest sweep's protection set (§8), snapshot/log cleanup planning (§7), writer recovery
-(§9), `SYSTEM CONTENT ADDRESSED GC REBUILD` and fsck (§10).
+Four adversarial review rounds against the v1–v4 drafts (all REJECT, §13) each patched the previous
+patch, accreting: a per-record `prev` link, recovery-seal interval semantics, a `NeverBorn` variant, a
+fixed-key seal pointer, a birth-time authority, a pool-wide recovery generation, an `R*` owner bound in
+the lease, a CASed admission object, lineage tombstones, sticky floors, persistent quarantine. The
+design owner rejected the accretion outright. The root cause of it, converged on independently by this
+author and by a blinded consult (§13.5): **absence is undecidable in a sparse id space**, so every hole
+demanded one more certificate. `next_ref_sequence` is pool-wide — one counter shared by every namespace
+of a mounted writer — so within one namespace, id gaps are the norm and "what is missing" is not
+computable.
 
-Why nothing simpler works: `next_ref_sequence` is pool-wide (`CasRefLedger.h`), shared by every
-namespace of the mounted writer, so within one namespace arbitrary id gaps are the NORM. The candidate
-ids of a suspected hole cannot be enumerated and probed. Completeness therefore needs declarations from
-the writer: a per-record `prev` link, and a per-namespace point-readable seal pointer.
+The fix is not another certificate. It is changing the invariants that made certificates necessary.
 
-## 2. Trust boundary {#trust-boundary}
+## 2. The three invariant changes {#invariants}
 
-- **Hot-prefix LIST is UNTRUSTED.** The GC fold, the orphan sweep, cleanup planning, REBUILD and fsck
-  enumerate `cas/refs/` under concurrent appends and deletes. No destructive decision may assume such a
-  listing is complete — and no VOID decision may depend on a listing having shown the seal (§4's
-  pointer exists precisely for that).
-- **Cold-prefix LIST is TRUSTED for the acked region.** Recovery lists a namespace whose writer session
-  has ended; every ACKED transaction settled strictly before that session ended, so the documented
-  strong read-after-write contract (which includes `LIST`) covers it. Permitted concurrent mutators are
-  enumerated and handled (late snapshot PUTs of the dead session; peer-GC log deletions gated by
-  cursor AND snapshot coverage; peer-GC snapshot deletions after §7's pin; `Removed`-snapshot
-  publication) — object-level races go through the vanish-restart loop with a sticky floor (§9).
-- **The unacked in-flight tail is NOT timing-bounded.** v3 argued a same-node ghost (a PUT recovery did
-  not see that lands later) was chronologically impossible; review round 3 refuted it at source level:
-  `attempt_timeout_ms` is a scheduling check only, the socket-level wait lives on the disk client and
-  no mount validation ties it to the self-remount drain or `materialization_grace_ms`
-  (`CasRequestControl.h`, `validateCasRequestBudget`, `CasPool.cpp` grace comment — which itself
-  predicted this). A socket-stuck conditional PUT can therefore land AFTER recovery sealed past it.
-  Consequence: voidness must be decidable from durable data — the seal pointer (§4) — not from timing
-  and not from listings.
-- Point reads (`GET`/`HEAD`/CAS of an exact key) are trusted; conditional writes already depend on
-  them, and at the observed firing the point read told the truth while the listing lied. A store that
-  violates the cold contract or conditional-write semantics is rejected by `Cas::Probe` / the
-  mount-time LIST probe (task #23), and violations that leave traces are made LOUD (§5).
+**INV-1 — per-namespace contiguous ids.** `ref_sequence` becomes per-namespace: the next id is
+`greatest_applied.ref_sequence + 1` (the value `commitRefChunk` already computes as its trial preview),
+and an id whose outcome is PROVEN not durable (`DefiniteFailure`, `NoAttemptSent` pre-attempt refusal)
+is REUSED by the next flush — the key is provably unwritten. The wedge discipline is untouched: an
+uncertain PUT still blocks the lane, so at most one id per namespace is ever in flight. Consequence:
+within `(namespace, epoch)`, durable ids are **dense**: `1..T`, no gaps, ever. The pool-wide
+`next_ref_sequence` atomic is deleted. "What is missing" becomes arithmetic; the missing key's exact
+name is computable; and point reads — which told the truth even while LIST lied (`head_verdict =
+present`) — are the only reads correctness relies on.
 
-## 3. Invariant {#invariant}
+**INV-2 — an epoch is closed in-band, by occupying the next slot.** Recovery finds the dead epoch's
+tail with a **CAS-walk** that never trusts a listing: starting from the greatest replayed id `(E, k)`,
+it `putIfAbsent`s an `EpochSeal` record at `(E, k+1)`.
 
-**Complete cut.** A namespace's cursor advances only along the verified chain: every id between the old
-and the new cursor is either (a) folded, in id order, or (b) inside the void interval declared by the
-namespace's seal pointer. Completeness and voidness are proved from point-readable data; listing
-completeness is assumed nowhere. Destructive decisions derived from a listing — sweep deletions (§8),
-cleanup (§7), REBUILD condemnation (§10) — are valid only at or below a proven cut or under a proven
-quiescent view.
+- **Lost the race** → the slot holds a durable record (the dead session's at-most-one in-flight PUT
+  that landed, or an acked record the hint listing hid): adopt it, replay it, `k+1`, repeat. The loop
+  is bounded: at most one in-flight record exists (the wedge contract), plus whatever acked records
+  the hint omitted — each iteration makes progress on real data.
+- **Won the race** → epoch `E` is closed at `k`, and the ghost of the `Late Predecessor PUT`
+  limitation can NEVER land: its only possible slot is taken, its conditional create is conclusively
+  rejected by the store's own write-once guarantee. No timing argument, no grace, no interval, no
+  authority object — the store's conditional create, which the pool already requires and probes, is
+  the fence.
 
-## 4. Writer changes {#writer-changes}
+The `EpochSeal` is an ordinary ref-log record (a new op kind), folded as a state no-op. The first
+record of the NEXT epoch carries one small field, `prev_epoch_seal = (E, T+1)` — the seal id the
+recovering writer just wrote or adopted — so epochs chain by exact ids across arbitrary burned epochs,
+and a fold can never cross from epoch to epoch past records it has not consumed (§5). The synthetic
+`{epoch−1, UINT64_MAX}` recovery-seal snapshot, `sealed_from`, and the entire retroactive-void concept
+are deleted: nothing is ever voided, because nothing can land behind a closed frontier.
 
-**The `prev` link.** Every ref-log transaction body gains one field: `prev : RefTxnId` — the id of the
-previous durable record of THIS namespace, across epoch boundaries; the value is `candidate_base_id`
-in `commitRefChunk`, exact by the wedge discipline. Chunked flushes link chunk to chunk.
+**INV-3 — the namespace universe is a point-readable catalog.** One pool-level control object,
+`cas/ref_catalog`, token-CAS'd exactly like `gc/state`: a sorted map `namespace → {Live | Removing}`,
+~50–100 bytes per entry, written only at DDL rate — entry added (CAS) before a namespace's first
+append is legal; `Live → Removing` when removal is admitted (this IS the removal-admission bound: the
+catalog's size cap refuses new namespaces and new removals loudly, before the budget is exceeded);
+entry deleted by GC after the terminal removal folded and physical cleanup completed. Absent or
+undecodable catalog on an initialized pool = corruption: fail closed, loudly, never rebuilt from LIST.
+The catalog is read once per fold round (one small `GET`) and answers the one question contiguity
+cannot: *which streams exist* — closing wholesale-drop cursor loss, fsck's universe, and REBUILD's
+condemn-the-unlisted hazard with a single object whose write rate is `CREATE/DROP TABLE`.
 
-**The seal, unchanged in shape.** The recovery seal stays what it is: a write-once `RefTableSnapshot`
-at `_snap/{adopted_epoch − 1, UINT64_MAX}` carrying `sealed_from` and the full recovered state,
-published fail-closed before the table installs. Publishing it also advances the recovered state's
-high-water to the seal id (r1 finding 1), so the first post-recovery append stamps `prev = seal_id` and
-the chain passes THROUGH the seal. Voidness is the INTERVAL `sealed_from < X.id <= seal_id` — never
-keyed by epoch (mount retries burn epochs; r2 finding 1).
+**LIST is demoted everywhere.** It remains as a zero-trust HINT: which namespaces look active this
+round, bulk id prefetch, garbage-candidate nomination. A hint's omission costs one round of delay,
+never data — every advance, every deletion premise, every universe claim rests on arithmetic, point
+reads, conditional writes, and the catalog.
 
-**The seal POINTER — the seal's LIST-free discoverability (r3 blockers 1–2, user decision).** The
-seal's own key is id-derived and not computable from a dead record's id, and discovering it through a
-listing would hand the void decision back to the liar. Recovery therefore also advances a per-namespace
-fixed-key object (`<ns>/_seal_latest`, ~100 bytes): `{seal_id, sealed_from, lineage}`. Discipline:
+## 3. Writer {#writer}
 
-- written in the SAME fail-closed publication step: seal (write-once) → pointer (CAS) → install; a
-  failed pointer CAS fails recovery exactly as a failed seal PUT does today, and the install re-checks
-  `superseded_by_remount` before publishing (closing the adjacent install race r3 found);
-- **CAS-monotone by `seal_id`**, same conditional-update mechanics as `gc/state`: a socket-stuck stale
-  pointer PUT from an older recovery loses the CAS and rolls nothing back;
-- updates MERGE fields: a seal update preserves the lineage slot and vice versa;
-- `NeverBorn`: an unclean recovery over an EMPTY listing still publishes a seal + pointer. The seal
-  format gains an explicit never-born state: `sealed_from = {0,0}` permitted in THIS state only (the
-  codec's zero-rejection gains exactly this exception), no rows, no `remove_txn_id`, lifecycle
-  distinct from `Live` and `Removed`, greatest-applied = seal id (r2 finding 3, r3 finding 10);
-- namespace-removal cleanup RETAINS `_seal_latest` (it is the lineage tombstone, §6) and its presence
-  does not contradict the "observed empty" completion criterion.
+Unchanged except the allocator, which gets simpler: per-namespace `greatest_applied + 1` under the
+existing lane (delete the shared atomic and the safe-gap comments); reuse on proven-not-durable
+outcomes; a conclusive different-object rejection at our key remains the anomaly it is today
+(single-writer contract violation → fence). Chunked flushes number chunks sequentially. The
+`EpochSeal` op kind and the `prev_epoch_seal` field of each epoch's first record are the only format
+additions; both are stamped from values recovery already holds. Namespace creation CASes its catalog
+entry before the first append (fail-closed); `remove_namespace` admission CASes `Live → Removing`
+first, then appends.
 
-**Owner-grant bound `R*`, reformulated (r3 blockers 3–4).** v3 defined `R*` over settled grants; that
-premise is false — `~PartWriteTxn` retires the build unconditionally while a grant may still be
-wedged-Unresolved and resolve durable later. `R*` is therefore the member's **highest ALLOCATED ref
-id** (`next_ref_sequence` sample), with enforced ordering: retire build → sample allocator → publish
-the lease with `min_active` and `R*`. Every grant of a retired build has an id allocated before
-retirement, hence `<= R*` regardless of how late it settles. Cross-epoch initialization: the FIRST
-lease of a claimed epoch `E` publishes the bound `{E − 1, UINT64_MAX}`, covering every dead epoch's
-grants by construction; `min_active`/`R*` replacement is monotone. An absent or undecodable bound
-means RETAIN (§8).
+## 4. Recovery {#recovery}
 
-**Id hygiene.** `allocateRefTxnId` saturates (fails closed) before `ref_sequence` reaches
-`UINT64_MAX`; the codec rejects any non-anchor `prev >= txn_id`; chain walkers carry cycle detection
-and a step bound.
+1. Hint-LIST the namespace prefix (bulk discovery of snapshot + log ids; zero trust).
+2. Replay: newest snapshot, then logs upward **by arithmetic** — expected next id is `last + 1`; an id
+   the hint omitted is fetched by its exact key; a point-`GET` 404 below a durable higher id of the
+   same epoch is impossible-by-INV-1 (store hides a durable object) → the existing vanish-restart
+   loop, then fail closed.
+3. Close the dead epoch with the INV-2 CAS-walk; publish an ordinary state snapshot as today (real
+   ids only — the synthetic-id machinery is gone).
+4. Install; append lanes open; the first append of the new epoch stamps `prev_epoch_seal`.
 
-Anchor forms of `prev`:
+The acked region needs no trust discussion anymore: acked ⇒ durable ⇒ its id is below the CAS-walked
+frontier and dense ⇒ recovery read it or fetched it by exact key. The unacked in-flight record is
+either adopted (it landed first) or permanently fenced out (the seal landed first). The `Late
+Predecessor PUT` TLA action flips from demonstrating the counterexample to proving its absence.
 
-| form | meaning | acceptance rule at the consumer |
-|---|---|---|
-| `(E, s)` | ordinary link, incl. across a CLEAN epoch boundary and across removal/rebirth | `prev == resolved_through` |
-| `{E, UINT64_MAX}` | the recovery seal published at the boundary the writer recovered across | seal point-read at its exact key AND `resolved_through == seal.sealed_from` (verbatim; consecutive seals chain by declared values; `NeverBorn` declares `{0,0}`) |
-| `{0, 0}` | first record of the namespace's FIRST life | `resolved_through == {0,0}` AND the seal pointer is absent AND no lineage tombstone exists |
+## 5. GC fold {#fold}
 
-Cost: ~16 bytes per ref-log record; one `RefTxnId` in the lease; one ~100-byte CAS object per
-namespace touched only on unclean recovery and removal completion; zero added requests on the append
-path. Format: version bumps of `CasRefLogFormat`, `CasRefSnapshotFormat`, the lease format, and the new
-pointer object; decoders do not accept old versions — pre-release, no compat scaffolding.
+Per round: one catalog `GET`; one hint-LIST of `cas/refs/`; then per namespace with candidates (a
+quiet namespace — nothing hinted above its cursor — costs zero):
 
-## 5. Fold rules {#fold-rules}
+- **Advance by arithmetic.** Expected next = `cursor + 1`. `GET` it (the hint told us the body is
+  probably there; the `GET` was owed anyway — one per folded record, exactly as today). Found → fold →
+  repeat. This subsumes repair: a hint hole changes nothing, the observed `0x1430c`/`0x1430d` omission
+  is folded through without noticing.
+- **Cross epochs only through consumption.** An `EpochSeal` at `(E, T+1)` folds as a no-op and switches
+  the expectation to "first record of the epoch named by a later record's `prev_epoch_seal`" — the
+  fold accepts `(E', 1)` only if its `prev_epoch_seal == (E, T+1)`. A fully-hidden intermediate epoch
+  is impossible to skip: the next epoch's first record names its true predecessor seal by exact id,
+  and every id in between is reachable by arithmetic point reads.
+- **Frontier.** Expected-next `GET` returns absent → that is the frontier (nothing acked can be
+  missing — density), stop this namespace for the round. Optionally skip the terminal probe when the
+  hint showed nothing new: pure delay, zero cost.
+- **Hold.** A point-`GET` 404 below a durable higher id of the same epoch, an `(E', 1)` whose
+  `prev_epoch_seal` names an unconsumed seal, or any impossible shape → per-namespace hold
+  (`classification = 4`, loud `gc_anomaly`, `CasGcChainHolds`), cursor stays, siblings proceed;
+  `suppress_destructive` remains pool-wide while any hold is carried (an unknown `+1` may name any
+  shared blob — stated honestly), with escalating backoff on the namespace's retries and an operator
+  surface. Whole-round abort remains only for an unparseable key in `groupRefKeys`.
 
-The listing is only a CANDIDATE stream; the chain and the pointer are the truth.
+Cursor entries in the fold seal are keyed by the CATALOG, not the listing: entries for unhinted
+namespaces are carried verbatim; retirement happens only when GC deletes the catalog entry after
+removal cleanup. Wholesale-drop of a namespace from a listing is thereby pure delay, and the v2
+carry-forward patch plus all lineage-tombstone machinery collapse into this one rule. Probe B1's
+identity is `logs_accounted == logs_applied` over the sealed cut, with `EpochSeal` records counted as
+applied no-ops; there are no voids to account for. Probe A (the two-enumeration comparison) is KEPT as
+a store-quality detector but demoted from the correctness path: it can run sampled (every Nth round),
+and its firings no longer abort anything — the chain does not depend on listings.
 
-**Rule 0 — pointer read.** A namespace with NO listed candidates above its cursor is skipped entirely,
-at zero cost, exactly as today. A namespace WITH candidates first point-reads `_seal_latest` (one small
-`GET`; absent pointer = no unclean boundary ever = empty void interval). The read is per round, not
-cached across rounds: a cache's validity would depend on knowing whether a remount happened, which
-without the read is exactly the listing-trust hole.
+Cleanup: covered logs below the cursor form contiguous ranges of computable keys — deletion needs no
+listing and parallelizes under the shared budget; a crossed dead epoch is one closed range
+`(E, 1..T+1)`.
 
-Then, for each candidate X in ascending id order, after the body `GET` + decode the fold already
-performs:
+## 6. Orphan-manifest sweep {#sweep}
 
-1. **Void.** `pointer.sealed_from < X.id <= pointer.seal_id` → certified void: skip, never fold (the
-   writer retroactively erased it; folding a late `-1` or `remove_namespace` the table never applied is
-   corruption), count `certified_void`, LOUD `gc_anomaly` (such a record is a socket-stuck straggler or
-   worse — §2). Once the cursor crosses the anchor, void records sit below it and `cleanupRefObjects`
-   removes them as covered debris.
-2. **Continue.** `X.prev == resolved_through` → fold, advance. One comparison; zero added requests.
-3. **Repair.** `X.prev > resolved_through` → walk backward by exact-key `GET` until reaching
-   `resolved_through` or an anchor accepted by §4, then fold forward in id order. Bounded: bodies up to
-   a byte budget, then ids-only with forward re-reads in bounded chunks; past a hard step bound → hold.
-   Loud: `CasGcChainRepairedHoles` + `gc_anomaly` rows capped at 32/round with true totals.
-4. **Anchor crossing.** `X.prev == {E', UINT64_MAX}` → point-read that seal (exact key from the anchor
-   value). Accept iff `resolved_through == seal.sealed_from`; if `resolved_through < sealed_from`,
-   enter rule 3's walk at `sealed_from` first.
-5. **Breach.** `sealed_from < resolved_through < seal_id` at rule 0 or at an anchor crossing — a past
-   round folded records later voided (the pointer race of §5c, or worse) → immediate breach: the
-   namespace holds AT its current cursor (no further advance), `CasGcChainIntervalBreach`, persistent
-   quarantine, destructive suppression stays asserted (§5b), operator escalation. Repair of
-   already-folded void edges is a REBUILD-class action; the spec does not pretend a cheaper one exists.
-6. **Hold.** A repair `GET` 404s (deposed-leader LOG cleanup cannot explain it — log deletion requires
-   cursor AND snapshot coverage below `resolved_through`; seal/`Removed` deletion is excluded by §7's
-   pin), or `X.prev < resolved_through` outside any void interval (chain split), or an anchor's seal
-   point-read 404s → per-namespace hold: `classification = 4`, cursor stays, loud `gc_anomaly`,
-   `CasGcChainHolds`. Sibling namespaces proceed.
+All owner grants of a build live in the build's epoch (builds die with their mount). Rule: **a
+manifest of a build from epoch `E` is deletable only when the namespace's cursor has consumed epoch
+`E`'s `EpochSeal`** — at that point every grant that could name it is folded, and "no owner" is a
+statement about complete knowledge; otherwise retain (delay, never damage). Live-epoch orphans are the
+writer's own job — `maybeSweepStalePrecommits` already runs on authoritative in-memory state and
+trusts no listing; its coverage of died-mid-build cases is verified in the plan. The `R*` bound, the
+lease field, and the `min_active` linearization protocol are deleted. This section lands together with
+the S42 stale-edge fix (the sweep stranding folded `+1` edges) as one coherent change.
 
-The whole-round `ref_folding_aborted` remains only for an unparseable key in `groupRefKeys`; "ref log
-body vanished mid-fold" becomes a rule-6 hold.
+## 7. REBUILD and fsck {#rebuild-fsck}
 
-**Probe A is kept verbatim** (both walks, comparison, HEAD verdict, both counters, 32-row cap); the
-chain repairs or holds instead of aborting. Blind spots close structurally: identical holes repair off
-`prev`; a wholesale-dropped namespace is pure delay via §6.
+REBUILD takes its universe from the catalog and each namespace's state from snapshot + arithmetic
+tail — no maintenance fence, no operator attestation, no lease-enumeration circularity. Its physical
+blob LIST can only leak (an omitted blob stays), never condemn a hidden namespace's data. fsck gets a
+provable universe (catalog), verifies streams by arithmetic (a `chain-broken` class that is a
+`clean()` term and exit-code-fatal), replays only above the newest snapshot (its cost stops tracking
+total ref-log volume — the 180 s budget problem shrinks structurally), and reports `unchecked` only
+for what is genuinely unproven; a healthy pool can return clean.
 
-### 5a. Accounting: probes B1 and B2, cut-scoped (r2 finding 8) {#fold-accounting}
+## 8. Performance interactions {#performance}
 
-One shared intake primitive processes listed AND repaired records; B2 opens ordinals only for
-transactions whose deltas commit into the round. B1 is two-phase and cut-scoped:
-`logs_accounted == logs_applied + logs_certified_void` over exactly `(parent_cursor, final_cursor]`;
-speculative repairs and void observations above the final cut are separate metrics. Negative controls
-in §11.
+Measured base (investigation §7.2): a 30-minute round is 3.42 M serial round trips at ~0.5 ms; intake
+is 256 logs/s, request-bound, with `1 + edges_per_log` `GET`s per log and a HEAD per edge; 39.6 % of
+manifest body reads are cross-transaction re-reads; `pending_deletes` hit 77.2 s serial.
 
-### 5b. Quarantine, persisted (r3 finding 9) {#quarantine}
+- **P1 (parallel fetch, 4–16×) is de-risked and simplified:** prefetch keys are `cursor+1..cursor+K`
+  by arithmetic — no dependency on listing contents, mispredictions impossible (404 = frontier),
+  strict apply order untouched.
+- **One enumeration instead of two:** the second full walk existed for probe A's correctness role;
+  demoted to a sampled detector. The defer decision runs off the hint.
+- **Range cleanup:** covered-log deletion generates keys arithmetically and shares P3's bounded
+  concurrency; dead epochs delete as closed ranges.
+- **fsck** replays tails, not histories, and reads its universe in one `GET`.
+- **Unchanged and still wanted:** P2's round-scoped manifest body cache (the 39.6 % is
+  cross-transaction and orthogonal to id shape); the HEAD-per-edge protocol step (standing veto); the
+  chaos-free rig (#10) before sizing any of it.
+- **Named future lever (not this spec):** snapshot-diff folding — for a deeply backlogged cursor,
+  fold the NET owner diff between the snapshot at the cursor and the snapshot at the tip instead of
+  every intermediate log; the transient `+1/−1` pairs (exactly the 39.6 %) cancel by construction.
+  Needs its own design (precommit barriers, `mf_cleanup` from the dropped set); recorded in BACKLOG.
+- P1+P3 share one pool-level concurrency budget setting.
 
-Hold and breach states are DURABLE: the fold seal's coverage entry gains first-held round, retry
-generation and the offending link/anchor. `suppress_destructive` is computed from every CARRIED
-quarantine on every round — a backoff round that skips a held namespace's point reads must not let
-destructive work resume. Backoff bounds only the namespace's anchor/repair point reads; the honest
-liveness statement stands: one quarantined namespace suspends pool-wide destructive work until
-revalidated or operator-resolved, because an unknown `+1` may name any shared blob. Revalidation (a
-later round whose reads succeed and whose chain verifies) clears the quarantine explicitly.
+Costs of this design: append path +0 requests (allocator simpler than today); recovery +1 conditional
+PUT per namespace per unclean remount (+ one per adopted straggler); fold +1 catalog `GET` per round
+and one optional frontier probe per ACTIVE namespace; DDL +1 catalog CAS. Formats: `EpochSeal` op
+kind, `prev_epoch_seal` on epoch-first records, the catalog object; DELETED: pool-wide sequence,
+synthetic snapshot ids, `sealed_from`. Pre-release, no compat scaffolding.
 
-### 5c. The fold-vs-recovery race, named (round-4 target) {#fold-recovery-race}
+## 9. What this deletes {#deletions}
 
-A fold (possibly on a peer node) can run CONCURRENTLY with a not-yet-finished recovery: it reads the
-OLD pointer, and a socket-stuck straggler that the in-flight recovery will void can pass rule 2 as a
-plain continuation. Claimed containment, to be attacked in round 4 and mechanised in the TLA model:
-the ghost's edges cannot reach a destructive action before detection, because (a) deletion graduation
-waits for the ack floor — every mount, including the recovering one, must ack past the minting round —
-and (b) the recovering mount's first post-install fold reads the NEW pointer and rule 5 fires the
-breach, asserting suppression, before that ack can land. If round 4 breaks this ordering, the fallback
-is a recovery-generation check in graduation itself; the race does NOT weaken rule 1's decidability
-for every round that starts after the pointer is durable.
+From v1–v4 drafts: the per-record `prev` link; recovery-seal intervals, `NeverBorn`, and every
+void/breach rule; the seal pointer and birth authority; `recovery_generation` and graduation gating;
+`R*`, its lease field and linearization; the CASed removal-admission object (the catalog subsumes it);
+lineage tombstones and handoff; sticky recovery floors; seal retention pins; most of the trust-boundary
+essay. From current code: the pool-wide `next_ref_sequence` and safe-gap reasoning; the synthetic
+recovery-seal snapshot machinery; the second full enumeration as a correctness dependency; the
+carry-forward patch as a special case; the `_cleanup`-marker-gated physical-empty rebirth checks
+(subsumed by catalog states — verified in the plan).
 
-## 6. Cursor lineage: carry-forward and tombstone handoff (r2 finding 6, r3 finding 8) {#cursor-lineage}
+## 10. Verification {#verification}
 
-The new fold seal carries forward the parent `per_ns_shard` entry of every namespace NOT visited this
-round, on the normal AND the abort path. Entries are retired exactly once, by HANDOFF: when a removal
-reaches `Completed`, the lineage (`remove_txn_id`) is CAS-merged into `_seal_latest` FIRST, and only a
-round that has verified the pointer carries the lineage drops the seal entry. The fold seal therefore
-stays bounded by ACTIVE namespaces; the per-namespace tombstone is permanent, tiny, and point-readable.
-Rebirth: `prev == remove_txn_id` is accepted against the seal entry or the pointer lineage; `{0,0}` is
-rejected whenever either exists. A resurfaced old-life log is rejected by the same comparison.
+All tests proven RED before trusted; `HoleyListBackend` plus a new delayed-PUT fault backend:
 
-Removal admission (r3 finding 8): a `remove_namespace` reserves capacity through a CASed pool-wide
-admission object BEFORE appending; the slot is released at `Completed`. The cap is hard; the refusal is
-loud. `DROP TABLE` is rare — one CAS on that path is acceptable.
+- hint hides `0x1430c`/`0x1430d`-style middles → fold advances by arithmetic, folds them anyway;
+- point-`GET` 404 below a same-epoch witness → hold, siblings advance, suppression carried;
+- CAS-walk: seal loses to a landed straggler → adopted and replayed, then seals; seal wins → a delayed
+  ghost PUT is conclusively rejected (the flipped `LatePredecessorPut`);
+- an entire intermediate epoch hidden by the hint → `prev_epoch_seal` mismatch holds the namespace;
+  burned epochs cross correctly;
+- allocator: reuse after `DefiniteFailure`/`NoAttemptSent`; density under chunked flushes; wedge still
+  blocks; saturating overflow;
+- catalog: absent/undecodable → fail-closed loud; unhinted namespace's cursor carried; creation-before-
+  first-append enforced; `Removing` admission bound refuses loudly at the cap;
+- sweep: hidden newest promote → retained (epoch not sealed); sealed epoch → deletable; live epoch →
+  writer-side sweep covers the died-mid-build case;
+- fsck: `chain-broken` fatal both in summary and exit code; healthy pool returns clean; hidden
+  namespace vs catalog → `unchecked`, never "empty";
+- B1 identity with `EpochSeal` no-ops; probe A sampled yet still firing on a synthetic holey store.
 
-## 7. Retention pins (r2 finding 7, r3 finding 11) {#snapshot-pin}
+TLA+ (phase 0): extend the `_sab_holeylist` model with INV-1/INV-2 and prove: the cursor never passes
+an unfolded record under arbitrary hint omissions; the flipped `LatePredecessorPut` proves no record
+lands behind a closed frontier; the sweep never deletes an owned manifest. Then adversarial consult
+round 5 (this document, with all four prior rounds' findings and the blinded consult's alternative in
+context), then the soak gate: repairs-by-arithmetic > 0 on a lying store, zero holds, zero aborts.
 
-Recovery seals and `Removed` snapshots are not deletable while above the namespace's durable fold
-cursor; ordinary snapshots keep newest-only retention. The cleanup planner receives the durable cursor
-already; identifying `Removed` snapshots needs lifecycle metadata beside the listed id (one extra read
-or a listing-side marker — plan detail, named).
+## 11. History and the archaeology that de-risks this {#history}
 
-## 8. Orphan-manifest sweep: deletions bounded by `R*` (r2 finding 2, r3 blockers 3–5) {#orphan-sweep}
+- **Contiguity is the project's own resurrected invariant.** The 2026-07-10 spec
+  (`2026-07-10-cas-ref-snapshot-log-design.md`) had it as **I7 Contiguous replay** ("a gap before the
+  maximum observed sequence is an exception"), one stream per incarnation, birth as sequence one. It
+  died as COLLATERAL of abandoning the GC-owned-base model it lived in (full-base rewrites — the
+  RefSnapLog performance dead end); the 2026-07-11 successor adopted the pool-wide counter with only
+  "gaps are harmless" as rationale — written before anyone knew LIST lies. No recorded refutation of
+  contiguity itself exists.
+- **The ghost was a documented open limitation, not a discovery of this effort.** Rev.4 of the Phase-1
+  spec names `Late Predecessor PUT` an "open correctness limitation", keeps a TLA action
+  demonstrating it, and explicitly defers closure: "Phase 1 does not add a per-table `_seal`, mutable
+  `_head`, or extra request to every ordinary mutation." INV-2 closes it while honoring exactly that
+  constraint — zero extra requests on ordinary mutations; recovery pays one conditional PUT.
+- **Review rounds 1–4** (`gpt-5.6-sol` `xhigh`, logs `tmp/codex_spec_review_sol*.log`): four REJECTs
+  whose findings were all incorporated into v2–v4 and whose accumulated machinery this v5 deletes; the
+  rounds' factual discoveries stand (burned epochs; graduation paced by rounds, not acks; unconditional
+  build retirement vs wedged grants; `attempt_timeout` is scheduling-only) and shaped INV-1..3.
+- **The blinded simplification consult** (`tmp/codex_simplify_probe.log`, prompt without any hint of
+  this direction) independently reproduced the diagnosis ("absence is undecidable in a sparse ID
+  space"), independently arrived at dense per-incarnation sequences, and proposed the alternative §12
+  records.
 
-The sweep's owner-set reconstruction switches to the chain-verified read path, and a manifest of build
-B is deletable only if: B is below the CURRENT lease's `min_active`; the namespace's chain-verified cut
-is at or above the `R*` paired with that `min_active`; and the cut shows no owner. Every other state —
-absent `R*`, stale or unreadable lease, cut below `R*`, hold/quarantine in effect — RETAINS. With `R*`
-as highest-allocated (§4) the bound covers wedged grants that settle late; with the epoch-claim
-initialization it covers dead epochs.
+## 12. Alternatives {#alternatives}
 
-Documented consequence of the member-wide bound (r3 finding 5): a QUIET namespace whose chain frontier
-sits far below the member's allocator retains its orphans until the namespace writes again or a remount
-seal dominates the bound. That is retention, not loss; a quiet namespace also produces no new orphans.
-Per-namespace grant certificates are named future work if this retention ever matters in practice.
-
-This section lands together with the S42 stale-edge fix (the sweep stranding folded `+1` edges) as one
-coherent change to the sweep.
-
-## 9. Recovery replay verification (r1 finding 7, r2 finding 5, r3 finding 7) {#recovery}
-
-Recovery replay verifies the same chain (seeded by the selected snapshot's id; anchors per §4), repairs
-missing middle links by exact-key `GET`, and routes a repair 404 through the bounded vanish-restart
-loop — **with a sticky floor held in LEDGER-level state**, surviving runtime eviction and transferred
-across self-remount: once a successor declared predecessor `P`, every later attempt must select a
-snapshot covering at least `P` or find `P`; omission of the successor does not lower the floor.
-Exhausting the brake fails recovery closed, loudly. The frontier above the listed maximum is trusted
-per §2's acked-region contract; the unacked straggler is the seal's and pointer's job, not replay's.
-
-## 10. REBUILD and fsck (r2 finding 4, r3 findings 6, 10) {#rebuild-fsck}
-
-REBUILD condemns from a LIST-derived universe, and today even lease discovery is LIST-based — a
-quiescence proof built on lease enumeration would be circular. Therefore: **REBUILD refuses to run**
-until a durable pool-wide maintenance fence exists (the `SYSTEM` control surface dependency, named), OR
-the operator passes an explicit attestation flag asserting all writers are stopped — trust-the-operator,
-stated as such in its own output. This interim matters because `gc/state` corruption recovery currently
-DIRECTS the operator to REBUILD; a silent dead end is not acceptable, a loud attested path is.
-
-fsck gains a seal-aware oracle (a synthetic seal id with no same-id log is NOT evidence of listing
-incompleteness — otherwise every healthy sealed pool reads `unchecked` forever), and its absence-based
-verdicts are whole-run `unchecked` only when the universe or frontier is genuinely unproven. Both
-`chain-broken` and the unchecked state are `clean()` terms and exit-code-fatal, with RED tests in both
-directions: `unchecked` fires when it must, and a healthy sealed pool can still return clean.
-
-## 11. Observability and verification {#verification}
-
-ProfileEvents: `CasGcChainRepairedHoles`, `CasGcChainHolds`, `CasGcChainVoidCertified`,
-`CasGcChainIntervalBreach`, `CasRefRecoveryChainRepairs`. Per-phase metrics on `fold_ref_intake`:
-`chain_repairs`, `chain_holds`, `certified_void`, `pointer_reads`, held-namespace age. All registered
-in the soak preflight. Audit: `gc_anomaly` rows for every repair, hold, void and breach, capped with
-true totals. Counters die with the process; audit rows do not; ship both.
-
-Verification, all tests proven RED first:
-
-- **Unit, on `HoleyListBackend`:**
-  - hidden middle key, honest `GET` → repair in id order (the observed `0x1430c`/`0x1430d` scenario);
-    hidden key AND broken point read → hold, siblings advance;
-  - ghost on a QUIET namespace, no successor ever: pointer read certifies void with no anchor crossing
-    needed (r3 blocker 2's counterexample becomes the test);
-  - same-round ghost + successor: void fires before continuation; breach fires when the cursor is
-    already inside the interval (`resolved` inside, not only `parent_cursor` — the r3 correction);
-  - burned epochs: interval semantics only, no epoch-keyed logic;
-  - pointer: CAS-monotone under a late stale writer; merge preserves lineage; absent pointer on a
-    clean-history namespace folds normally; recovery fails closed when the pointer CAS fails; install
-    refuses after `superseded_by_remount`;
-  - `NeverBorn`: codec round-trip with the zero-`sealed_from` exception, later `NamespaceBirth`
-    proceeds, fsck reads it as sealed-clean, not unchecked;
-  - seal high-water adoption: first post-recovery record's `prev == seal_id`;
-  - rebirth and resurfaced old-life logs against seal entry and pointer lineage; handoff drops the
-    seal entry only after the pointer carries the lineage; cleanup retains `_seal_latest`;
-  - pins: seal and `Removed` snapshot above the cursor survive cleanup planning; ordinary snapshots do
-    not accumulate;
-  - sweep: newest promote hidden → retained; cut below `R*` → retained; stale/absent lease or bound →
-    retained; wedged grant resolving late above a settled-style bound would delete (RED against the v3
-    definition) and retains under highest-allocated; epoch-claim init covers dead epochs;
-  - recovery sticky floor survives runtime eviction and self-remount;
-  - B1 two-phase negative controls; id hygiene (saturating allocator, `prev >= txn_id` rejected, cycle
-    bound); quarantine persistence: suppression computed from carried state on a backoff round.
-- **TLA+ (phase 0):** extend `_sab_holeylist` with the chain rule, pointer/interval void semantics,
-  and the sweep's `R*` bound; prove: the cursor never passes an unfolded non-void record under
-  arbitrary listing omissions; void certification never voids a writer-applied record; the sweep never
-  deletes an owned manifest; and the §5c race cannot reach a graduated deletion before breach
-  suppression (or produce the counterexample that forces the graduation-side check).
-- **Consult round 4** attacks, at minimum: the pointer lifecycle (CAS semantics, mid-sequence failure,
-  merge, cleanup survival), §5c's containment argument, `R*` highest-allocated ordering
-  enforceability, the REBUILD attestation interim, and the fsck seal-aware/unchecked balance.
-- **Gate:** the existing soak; expected signature: repairs > 0 on a lying store, zero holds, zero
-  breaches, zero aborts.
-
-## 12. Performance, narrowed honestly (r3 finding 11) {#performance}
-
-The append path and the fold's per-record path add zero requests (~16 bytes/record; one comparison).
-Per-round additions: one `_seal_latest` `GET` per namespace WITH candidates (quiet namespaces: zero);
-repair `GET`s equal to the omitted records' owed body reads, doubled only for over-budget runs; one
-anchor seal read per crossing, repeated per round only while clamped below it, stopped by quarantine
-backoff. NOT bounded by backoff and stated plainly: the two full ref-prefix enumerations per round,
-probe A's set comparisons, and fold-seal encode/decode — the last no longer grows with dead namespaces
-(lineage handoff, §6). Strict per-namespace apply order is unchanged; P1 prefetch stays compatible.
-
-## 13. Alternatives rejected, with their review history {#alternatives}
-
-| alternative | why rejected |
+| alternative | disposition |
 |---|---|
-| GC-side containment only (hold + scoped re-`LIST` + K-round quorum) | Probabilistic; asks the liar again; sound elements survive as rules 3/6. |
-| Local acked-floor file / `_tail` object / Keeper floor for the recovery TAIL | User ruling stands: the acked region is contract-covered; the floor protects nothing the seal machinery does not. |
-| Widening probe A's witness rule | Permanent-block risk on cleaned namespaces (pre-existing decision). |
-| `{0,0}` rebirth + cursor retirement | Destroyed the lineage proof (r2 finding 3). |
-| NO pointer — chronology bounds the ghost (v3 §2/§13) | **Refuted by r3 at source level** (socket wait unbounded by any enforced relation); withdrawn. |
-| Enforced-timing alternative (mount-validated `grace > full client socket budget`) | Considered at the r3 fork; rejected with the user: argued-from-config with an undocumented server-side materialization tail — INTENT wants demonstrated-from-data; the pointer costs one tiny GET per active namespace instead. |
-| Void by settled-`R*` (v3 §8) | Refuted by r3 (unconditional build retirement vs wedged grants); superseded by highest-allocated. |
-| Pinning every snapshot above the cursor | Unbounded accumulation (r2 finding 7); narrowed to seals + `Removed`. |
-| Tombstones forever in every fold seal | Unbounded control object (r2 finding 6, r3 finding 8); superseded by pointer handoff. |
+| v1–v4 certificate stack (prev links, seals-as-intervals, pointer, authority, generation, `R*`, tombstones) | Rejected by the user as accretion; every element deleted by INV-1..3. |
+| **Full head-CAS commit chain** (blinded consult's pick: pool catalog + per-namespace mutable `_head`, commit point = head CAS, nodes inert until linked; wedge dissolves, fold needs no LIST at all) | Evaluated seriously; recorded as the north star if the wedge is ever worth deleting. Not taken now: it moves the COMMIT POINT (+1 head CAS per flush — the exact "extra request per ordinary mutation" rev.4 refused; ~+1–2 RTT per INSERT), rewrites the most battle-hardened module, and its pure form needs N head `GET`s per round for change discovery (regressing the one-LIST economy) unless it too re-adopts LIST-as-hint. The catalog is the one element borrowed. |
+| RefSnapLog-style combined mutable state object | Historical: works, but the CAS loop serializes the whole growing state and truncation is painful; rejected on measured grounds in the project's past. |
+| Local acked-floor / `_tail` / Keeper floor | User ruling stands; INV-2 makes them moot (the tail is CAS-walked, not declared). |
+| Enforced-timing containment of the ghost | Refuted in round 3 (no enforceable relation; socket wait unbounded); INV-2 needs no timing. |
+| Widening probe A's witness rule | Pre-existing rejection (permanent-block risk) — unchanged. |
 
-## 14. Review round 1 {#review-round-1}
+## 13. Out of scope, named {#out-of-scope}
 
-`gpt-5.6-sol` `xhigh`, `tmp/codex_spec_review_sol.log`, **REJECT**, eleven findings — all verified
-against code and acted on; eight remedies later refuted in whole or part by round 2 (§15). Mapping as
-in v2/v3: seal adoption; sweep; rebirth/tombstones; empty seal; snapshot pin; B1/B2; recovery
-mutators/404; fsck; pending liveness; bounded repair; id hygiene.
-
-## 15. Review round 2 {#review-round-2}
-
-Fresh context, tasked to refute round 1, `tmp/codex_spec_review_sol_r2.log`, **REJECT**, ten findings:
-interval-not-epoch voidness; the sweep's missing primitive; `NeverBorn`; REBUILD/fsck as hot-LIST
-consumers; sticky recovery floor; tombstone bounds; pin narrowing; cut-scoped B1; quarantine honesty;
-repair-row caps. Two remedies (authority object; disable-sweep) were overruled in v3 — wrongly, as
-round 3 showed for the first.
-
-## 16. Review round 3 {#review-round-3}
-
-Fresh context, tasked to attack v3's two overrules, `tmp/codex_spec_review_sol_r3.log`, **REJECT**:
-
-| # | severity | finding | disposition in v4 |
-|---|---|---|---|
-| 1 | blocker | the in-flight chronology is not a protocol guarantee (socket wait unbounded by any enforced relation) | overrule withdrawn; seal pointer added (§4, user decision) |
-| 2 | blocker | §5b detection neither eventual nor correct (quiet namespace; `resolved` vs `parent_cursor`) | pointer read before rule 2; breach condition on `resolved` (§5 rules 0/1/5) |
-| 3 | blocker | settled-`R*` premise false (unconditional build retirement vs wedged grants) | `R*` = highest allocated, ordered sample (§4) |
-| 4 | blocker | no cross-epoch `R*` initialization; `min_active=0` fresh leases | epoch-claim bound `{E−1, MAX}`; absent ⇒ retain (§4/§8) |
-| 5 | major | member-wide `R*` starves quiet namespaces | documented retention; per-namespace certificates named future work (§8) |
-| 6 | major | REBUILD quiescence proof circular over LIST-based lease discovery | REBUILD refuses; interim operator attestation flag (§10) |
-| 7 | major | sticky floor stored in evictable runtime; install race with supersession | ledger-level floor; install re-check (§9, §4) |
-| 8 | major | admission cap not linearizable; tombstones still unbounded | CASed admission object; pointer handoff bounds the seal (§6) |
-| 9 | major | quarantine unpersisted; suppression could lapse on backoff rounds | durable quarantine; suppression from carried state (§5b) |
-| 10 | major | `NeverBorn` unencodable as specified; seal-unaware fsck makes sealed pools forever `unchecked` | precise `NeverBorn` + seal-aware oracle (§4/§10) |
-| 11 | minor | performance claim over-broad; planner cannot identify `Removed` snapshots | §12 narrowed; §7 metadata named |
-
-Survivors it confirmed: interval construction under burned epochs; rebirth safety via the durable
-tombstone; cut-scoped B1 coherence; cleanup planner's access to the durable cursor.
-
-## 17. Out of scope, named {#out-of-scope}
-
-- The mount-time LIST-consistency probe (task #23) — separate, tracked.
-- The decommission/adoption proven-dead fencing against frozen-not-dead writers — the pool-member
-  decommission spec.
-- The durable pool-wide maintenance fence (`SYSTEM` control surface) — named dependency of §10; until
-  it lands, REBUILD runs only under operator attestation.
-- The soak-gating policy for the new counters; the 56 leaked blobs; the `-1`-before-`+1` path; GC
-  performance work (P1/P2/P3); the fsck budget; the RustFS store-side mechanism.
+- The mount-time LIST-consistency probe (#23) — separate, tracked; still wanted as a store gate.
+- The decommission/adoption proven-dead fencing (frozen-not-dead writer vs cross-node adoption) — the
+  pool-member decommission spec; INV-2 narrows but does not own it.
+- Snapshot-diff folding (§8) — future lever, own design.
+- GC performance work P1/P2/P3 and the rig (#10); the 56 leaked blobs; the `-1`-before-`+1` path;
+  the RustFS store-side mechanism (unknown; this design holds either way).
