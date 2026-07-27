@@ -1129,3 +1129,6 @@ commits. No long run under test, no signals to observe, nothing scheduled.
 commits. No long run under test, no signals to observe. Delivered the weekend summary to the user this
 cycle; awaiting the two decisions it ends on (should probe A gate a soak; fix design now versus measure
 first) plus a push decision on the 73 commits.
+
+**10:27 UTC watchdog** — idle and unchanged: nothing running, 319G, load 0.67, 0 uncommitted, 74 local
+commits. No long run under test, no signals to observe, nothing scheduled.
