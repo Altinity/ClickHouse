@@ -1106,3 +1106,12 @@ commits. No long run, no signals to observe, nothing scheduled.
 
 **07:26 UTC watchdog** — idle and unchanged: nothing running, 320G, load 0.38, 0 uncommitted, 68 local
 commits. No long run, no signals to observe, nothing scheduled.
+
+**07:56 UTC watchdog** — idle, 319G, load 3.38 (a blip: rustfs 11% CPU and two ClickHouse servers at ~7%
+each, i.e. the reproduction stand's GC still turning over — background work, not a runaway). 0 uncommitted,
+69 local commits.
+
+**Free strengthening of the finding while it sat there: still exactly 15 stale-edge blobs at 2,968 GC
+rounds.** That is 2,859 rounds since the time series began, none reclaimed — and it now EXCEEDS the
+historical 56-blob cohort's 1,062 rounds. Permanence is no longer an inference from a trend; it is the
+longest-running observation this project has of the class.
