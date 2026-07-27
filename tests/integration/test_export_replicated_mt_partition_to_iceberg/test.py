@@ -879,11 +879,12 @@ def test_partition_key_compatibility_check(cluster):
     """
     Verify that EXPORT PARTITION throws BAD_ARGUMENTS synchronously when the
     MergeTree partition key does not match the Iceberg table's partition spec,
-    and is accepted without error when the keys match.
+    and is accepted without error when the destination is satisfiable.
 
     Three cases:
-    1. Column mismatch   – MergeTree PARTITION BY year, Iceberg PARTITION BY id
-    2. Count mismatch    – MergeTree PARTITION BY year, Iceberg unpartitioned
+    1. Column mismatch   – MergeTree PARTITION BY year, Iceberg PARTITION BY id (must be rejected)
+    2. Unpartitioned dst – MergeTree PARTITION BY year, Iceberg unpartitioned (accepted: the source is
+                           flattened into the single empty Iceberg partition)
     3. Matching keys     – both PARTITION BY year (must be accepted)
     """
     node = cluster.instances["replica1"]
@@ -917,27 +918,31 @@ def test_partition_key_compatibility_check(cluster):
         f"Expected BAD_ARGUMENTS for partition column mismatch, got: {error!r}"
     )
 
-    # --- Case 2: Iceberg unpartitioned but MergeTree PARTITION BY year ---
-    iceberg_count_mismatch = f"iceberg_count_mismatch_{uid}"
+    # --- Case 2: Iceberg unpartitioned, MergeTree PARTITION BY year ---
+    # An unpartitioned Iceberg table has a single (empty) partition, so a partitioned source is
+    # flattened into it and the export is accepted; the partition-column values survive as data.
+    iceberg_unpartitioned = f"iceberg_unpartitioned_{uid}"
     node.query(
         f"""
-        CREATE TABLE {iceberg_count_mismatch}
+        CREATE TABLE {iceberg_unpartitioned}
         (id Int64, year Int32)
         ENGINE = IcebergS3(
-            'http://minio1:9001/root/data/{iceberg_count_mismatch}/',
+            'http://minio1:9001/root/data/{iceberg_unpartitioned}/',
             'minio',
             'ClickHouse_Minio_P@ssw0rd'
         )
         SETTINGS s3_retry_attempts = 3
         """
     )
-    error = node.query_and_get_error(
-        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_count_mismatch}",
+    node.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_unpartitioned}",
         settings={"allow_insert_into_iceberg": 1},
     )
-    assert "BAD_ARGUMENTS" in error, (
-        f"Expected BAD_ARGUMENTS for partition count mismatch, got: {error!r}"
-    )
+    wait_for_export_status(node, mt_table, iceberg_unpartitioned, "2020", "COMPLETED")
+    count = int(node.query(f"SELECT count() FROM {iceberg_unpartitioned}").strip())
+    assert count == 2, f"Expected 2 rows in unpartitioned Iceberg table after export, got {count}"
+    result = node.query(f"SELECT id, year FROM {iceberg_unpartitioned} ORDER BY id").strip()
+    assert result == "1\t2020\n2\t2020", f"Unexpected data in unpartitioned Iceberg table:\n{result}"
 
     # --- Case 3: Matching partition keys (both PARTITION BY year) ---
     iceberg_match = f"iceberg_match_{uid}"
