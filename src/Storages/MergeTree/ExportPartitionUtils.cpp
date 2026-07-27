@@ -880,37 +880,33 @@ namespace
             if (!transform_and_argument)
                 throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unknown transform");
 
-            const std::optional<Int64> dest_argument = transform_and_argument->argument
-                ? std::optional<Int64>(static_cast<Int64>(*transform_and_argument->argument)) : std::nullopt;
+            const auto dest_argument = transform_and_argument->argument;
 
-            /// bucket is a hash, monotonicity check won't work. Check it manually.
-            if (transform_and_argument->transform_name == "icebergBucket")
+            const auto & dest_function = transform_and_argument->transform_name;
+
+            const auto min_max_column_it = std::find(minmax_column_names.begin(), minmax_column_names.end(), column);
+            const bool has_min_max_column = min_max_column_it != minmax_column_names.end();
+            const bool has_destination_column = destination_sample.has(column);
+            const bool types_match = has_min_max_column && has_destination_column && minmax_column_types[min_max_column_it - minmax_column_names.begin()]->equals(*destination_sample.getByName(column).type);
+
+            bool identical = false;
+            for (const auto & term : source_terms)
             {
-                const auto slot_it = std::find(minmax_column_names.begin(), minmax_column_names.end(), column);
+                if (term.column != column
+                    || (term.function.empty() ? "identity" : term.function) != dest_function
+                    || term.argument != dest_argument
+                    || term.time_zone != transform_and_argument->time_zone)
+                    continue;
 
-                bool matched_structurally = false;
-                if (slot_it != minmax_column_names.end() && destination_sample.has(column)
-                    && minmax_column_types[slot_it - minmax_column_names.begin()]->equals(*destination_sample.getByName(column).type))
-                {
-                    for (const auto & term : source_terms)
-                        if (term.column == column && term.function == "icebergBucket" && term.argument == dest_argument)
-                        {
-                            matched_structurally = true;
-                            break;
-                        }
-                }
-
-                if (!matched_structurally)
-                    throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                        "Cannot export partition to Iceberg table: destination field on column '{}' uses the "
-                        "bucket transform, which requires the source MergeTree to be partitioned by the matching "
-                        "icebergBucket(N, '{}') of the same type.", column, column);
-                continue;
+                identical = types_match || dest_function == "identity";
+                break;
             }
 
-            /// Every other Iceberg transform (identity/year/month/day/hour/truncate) is monotonic, so the
-            /// dynamic proof evaluates it on the partition's real [min, max] and accepts iff it is constant.
-            verifyColumnMapsToSinglePartition(column, transform_and_argument->transform_name, dest_argument,
+            if (identical)
+                continue;
+
+            /// if it is not an exact match, check monotonicity
+            verifyColumnMapsToSinglePartition(column, dest_function, dest_argument,
                 transform_and_argument->time_zone, minmax_column_names, minmax_column_types, destination_sample,
                 parts, partition_id, context);
         }

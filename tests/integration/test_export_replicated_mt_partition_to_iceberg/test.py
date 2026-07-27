@@ -1008,6 +1008,25 @@ def test_partition_transform_equivalence_gate(cluster):
         # bucket is non-monotonic: an identity source cannot satisfy a bucket destination.
         {"name": "bucket_needs_structural", "columns": "id Int64, k Int64", "source_key": "k",
          "dest_key": "icebergBucket(8, k)", "rows": "(1, 10), (2, 10)", "expect_ok": False},
+        # Identical expressions on a Nullable column: accepted structurally. The min/max proof refuses
+        # Nullable (a NULL forms its own destination partition and the endpoints cannot rule it out),
+        # so this only passes because the source already groups by exactly this transform. DateTime64(6)
+        # round-trips through the Iceberg schema unchanged, which the structural type check requires.
+        {"name": "nullable_exact_day", "columns": "id Int64, event_time Nullable(DateTime64(6))",
+         "source_key": "toRelativeDayNum(event_time)", "dest_key": "toRelativeDayNum(event_time)",
+         "rows": "(1, '2024-03-05 01:00:00'), (2, '2024-03-05 20:00:00')",
+         "source_settings": "allow_nullable_key = 1", "expect_ok": True},
+        # Same, for identity, which is exempt from the structural type check.
+        {"name": "nullable_exact_identity", "columns": "id Int64, k Nullable(Int64)",
+         "source_key": "k", "dest_key": "k", "rows": "(1, 10), (2, 10)",
+         "source_settings": "allow_nullable_key = 1", "expect_ok": True,
+         "verify": [("k", "k")]},
+        # A Nullable column without identical expressions falls to the min/max proof, which cannot see
+        # NULLs, so it is rejected.
+        {"name": "nullable_no_match", "columns": "id Int64, event_time Nullable(DateTime64(6))",
+         "source_key": "toYYYYMM(event_time)", "dest_key": "toRelativeDayNum(event_time)",
+         "rows": "(1, '2024-03-05 01:00:00'), (2, '2024-03-05 20:00:00')",
+         "source_settings": "allow_nullable_key = 1", "expect_ok": False},
     ]
     run_partition_compat_cases(node, cases)
 
@@ -1929,14 +1948,15 @@ def run_partition_compat_cases(node, cases):
     data (full ordered row comparison against the exported source partition) and Iceberg partition
     metadata are verified. Each case is a dict: name, columns, source_key, dest_key, rows, expect_ok,
     and optional verify (list of (metadata_field_name, value_expr); defaults to
-    [("event_time", dest_key)])."""
+    [("event_time", dest_key)]) and source_settings (extra MergeTree settings)."""
     settings = {"allow_insert_into_iceberg": 1}
 
     def setup(case):
         uid = unique_suffix()
         mt_table = f"mt_{case['name']}_{uid}"
         iceberg_table = f"iceberg_{case['name']}_{uid}"
-        make_rmt(node, mt_table, case["columns"], case["source_key"], replica_name="replica1")
+        make_rmt(node, mt_table, case["columns"], case["source_key"], replica_name="replica1",
+                 extra_settings=case.get("source_settings", ""))
         node.query(f"INSERT INTO {mt_table} VALUES {case['rows']}")
         make_iceberg_s3(node, iceberg_table, case["columns"], partition_by=case["dest_key"])
         pid = first_partition_id(node, mt_table)
