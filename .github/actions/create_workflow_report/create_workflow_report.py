@@ -417,16 +417,36 @@ def get_prs_in_release_dataframe(
     return _enrich_prs_in_release_merge_prs(df, repo), baseline_date
 
 
+def _parse_release_ref(ref_name: str) -> tuple[str, str, str | None] | None:
+    """Parse a release ref into (flavour, minor_version, full_version).
+
+    Handles version tags (``v25.8.28.10001.altinitystable``) and release
+    branches (``stable-25.8``). ``full_version`` is None for branches, which
+    carry no patch or tweak. Returns None for refs without a version.
+    """
+    # Match tag
+    match = re.match(
+        r"^v((\d+\.\d+)\.\d+\.\d+)\.altinity(stable|antalya|test)$", ref_name
+    )
+    if match:
+        flavour = "antalya" if match.group(3) == "antalya" else "stable"
+        return flavour, match.group(2), match.group(1)
+    # Match branch
+    match = re.match(r"^(stable|antalya)-(\d+\.\d+)$", ref_name)
+    if match:
+        return match.group(1), match.group(2), None
+    return None
+
+
 def _prs_in_release_search_url(branch_name: str, baseline_date: str | None) -> str | None:
     if not baseline_date:
         return None
     # Tag-triggered runs expose the tag as head_branch; search needs the PR base
     # branch (e.g. v25.8.28.10001.altinitystable → stable-25.8).
-    match = re.match(
-        r"^v(\d+)\.(\d+)\.\d+\.\d+\.altinity(stable|antalya)$", branch_name
-    )
-    if match:
-        branch_name = f"{match.group(3)}-{match.group(1)}.{match.group(2)}"
+    parsed = _parse_release_ref(branch_name)
+    if parsed:
+        flavour, minor_version, _ = parsed
+        branch_name = f"{flavour}-{minor_version}"
     query = f"is:pr base:{branch_name} merged:>{baseline_date}"
     return (
         f"https://github.com/{GITHUB_REPO}/pulls?"
@@ -775,43 +795,29 @@ def get_cached_job(
     workflow_config = get_workflow_config(pr_number, commit_sha, ref_name)
     return workflow_config.get("cache_jobs", {}).get(job_name, {})
 
-
 @lru_cache
-def get_expected_version_labels(
-    pr_number: int, commit_sha: str, ref_name: str
-) -> tuple[str, ...]:
-    """Return required version labels from workflow_config.custom_data.version.
+def get_expected_version_labels(ref_name: str) -> tuple[str, ...]:
+    """Return required version labels for the release ref being reported.
 
-    Stable releases use the minor and full version labels. Antalya releases use
-    ``antalya``, ``antalya-{major}.{minor}``, and ``antalya-{full_version}``.
-    Returns an empty tuple when version metadata is unavailable.
+    Stable releases use the minor version label. Antalya releases use
+    ``antalya`` and ``antalya-{minor_version}``. The full version label is only
+    required on tag-triggered runs, where the tag pins patch and tweak.
+    Returns an empty tuple when the ref carries no version.
     """
-    try:
-        version = (
-            get_workflow_config(pr_number, commit_sha, ref_name)
-            .get("custom_data", {})
-            .get("version")
-            or {}
-        )
-        major = version.get("major")
-        minor = version.get("minor")
-        patch = version.get("patch")
-        tweak = version.get("tweak")
-        flavour = version.get("flavour")
-        if None in (major, minor, patch, tweak, flavour):
-            print("WARNING:Incomplete version metadata in workflow config.")
-            return ()
-        minor_version = f"{major}.{minor}"
-        full_version = f"{minor_version}.{patch}.{tweak}"
-        if flavour == "altinityantalya":
-            return ("antalya", f"antalya-{minor_version}", f"antalya-{full_version}")
-        if flavour in ["altinitystable", "altinitytest"]:
-            return (minor_version, full_version)
-        print(f"WARNING:Unknown release flavour in workflow config: {flavour}")
+    parsed = _parse_release_ref(ref_name)
+    if not parsed:
+        print(f"WARNING:No version in ref [{ref_name}], not checking version labels.")
         return ()
-    except Exception as e:
-        print(f"WARNING:Could not read expected version labels: {e}")
-        return ()
+    flavour, minor_version, full_version = parsed
+    if flavour == "antalya":
+        labels = ("antalya", f"antalya-{minor_version}")
+        if full_version:
+            labels += (f"antalya-{full_version}",)
+        return labels
+    labels = (minor_version,)
+    if full_version:
+        labels += (full_version,)
+    return labels
 
 
 def get_cves(pr_number, commit_sha, branch):
@@ -926,17 +932,15 @@ def url_to_html_link(url: str) -> str:
     return f'<a href="{url}">{text}</a>'
 
 
-def format_pr_labels_with_verification(
-    labels: str, required_labels: tuple[str, ...] = ()
-) -> str:
+def format_pr_labels_with_verification(labels: str, branch_name: str = "") -> str:
     """Format the PR labels with verification.
 
     Expects ``labels`` to be already HTML-escaped at collection time
     (see _enrich_prs_in_release_merge_prs).
 
-    Requires ``verified`` plus ``required_labels`` (the expected version labels
-    when version metadata is available).
+    Requires ``verified`` plus the version labels expected for ``branch_name``.
     """
+    required_labels = get_expected_version_labels(branch_name) if branch_name else ()
     labels_list = labels.split(", ") if labels else []
     required = ["verified", *required_labels]
     missing = [label for label in required if label not in labels_list]
@@ -968,9 +972,7 @@ def format_test_status(text: str) -> str:
     return f'<span style="font-weight: bold; color: {color}">{text}</span>'
 
 
-def format_results_as_html_table(
-    results, *, required_pr_labels: tuple[str, ...] = ()
-) -> str:
+def format_results_as_html_table(results, *, branch_name: str = "") -> str:
     if not isinstance(results, pd.DataFrame):
         return results
 
@@ -1004,7 +1006,7 @@ def format_results_as_html_table(
             f"https://github.com/{GITHUB_REPO}/pull/{n}"
         ),
         "PR Labels": lambda labels: format_pr_labels_with_verification(
-            labels, required_pr_labels
+            labels, branch_name=branch_name
         ),
     }
 
@@ -1305,9 +1307,7 @@ def create_workflow_report(
             if mark_preview or pr_number != 0
             else format_results_as_html_table(
                 results_dfs["prs_in_release"],
-                required_pr_labels=get_expected_version_labels(
-                    pr_number, commit_sha, branch_name
-                ),
+                branch_name=branch_name,
             )
         ),
         "ci_jobs_status_html": format_results_as_html_table(
