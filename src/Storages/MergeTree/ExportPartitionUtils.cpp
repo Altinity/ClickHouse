@@ -680,13 +680,7 @@ namespace
     }
 
 
-    /// Proves the source `column`'s [min, max] over `parts` maps to a single destination partition, or
-    /// throws BAD_ARGUMENTS. The written value is transform(cast(source)): a value-preserving cast is
-    /// order-preserving, a lossy cast must be monotonic over the range, the transform must be monotonic
-    /// (a hash such as bucket is not), then the endpoints decide single-valuedness. `function_name` empty
-    /// means the destination partitions by the bare column (identity). Shared by the plain and Iceberg
-    /// gates; the argument order [width?, values, timezone?] covers truncate/bucket widths and
-    /// date-transform timezones.
+    /// asserts that the source column maps to a single destination partition by checking the monotonicity on the min/max ranges
     void verifyColumnMapsToSinglePartition(
         const String & column,
         const String & function_name,

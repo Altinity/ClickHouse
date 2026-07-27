@@ -30,18 +30,7 @@ namespace ExportPartitionUtils
 
     ContextPtr getContextCopyWithTaskSettings(const ContextPtr & context, const ExportReplicatedMergeTreePartitionManifest & manifest);
 
-    /// Returns the representative source partition-key columns (a folded global-min minmax block) for
-    /// the given partition_id, derived only from the exact parts that were validated and exported
-    /// (`exported_part_names`, looked up among Active and Outdated parts). The destination recomputes
-    /// the Iceberg partition tuple from this block by casting to its column types and applying the
-    /// partition transform. Restricting to the exported parts keeps the committed metadata consistent
-    /// with the exported files even if unrelated parts were inserted/merged into the partition after
-    /// scheduling.
-    ///
-    /// Edge case: if none of the exported parts are found (merged away and cleaned up before commit,
-    /// or not present on this replica), a NO_SUCH_DATA_PART exception is thrown; it is retryable, so
-    /// the commit is retried on the next poll cycle or picked up by a different replica, rather than
-    /// silently stamping metadata derived from unrelated parts.
+    /// Get the min/max values from the partition expression columns
     Block getPartitionSourceBlockForIcebergCommit(
         MergeTreeData & storage, const String & partition_id, const std::vector<String> & exported_part_names);
 
@@ -94,24 +83,12 @@ namespace ExportPartitionUtils
         const std::string & exception_message,
         const LoggerPtr & log);
 
-    /// Validates that source columns can be exported into the destination with the
-    /// same positional CAST matching as `INSERT INTO dest SELECT * FROM src`. Lossy
-    /// casts are rejected unless `export_merge_tree_part_allow_lossy_cast` is set.
-    /// Throws BAD_ARGUMENTS on any violation.
     void verifyExportSchemaCastable(
         const StorageMetadataPtr & source_metadata,
         const StorageMetadataPtr & destination_metadata,
         const StorageID & destination_storage_id,
         const ContextPtr & context);
 
-    /// Verifies the source MergeTree partition key is compatible with a plain (hive) object storage
-    /// destination partition key. The hive write path evaluates the destination PARTITION BY on the
-    /// source part's minmax block and writes every part row to that single directory, so each source
-    /// partition must map to exactly one destination partition. A destination term is proven either by
-    /// an exact match (identical partition keys, or the same per-column expression) or dynamically, by
-    /// checking the destination expression is constant over the column's actual [min, max] folded
-    /// across `parts` (provably-monotonic single-argument functions and bare columns only). Throws
-    /// BAD_ARGUMENTS when a term cannot be proven single-valued.
     void verifyPlainPartitionCompatibility(
         const StorageMetadataPtr & source_metadata,
         const StorageMetadataPtr & destination_metadata,
