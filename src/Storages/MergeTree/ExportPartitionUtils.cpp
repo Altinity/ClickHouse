@@ -31,7 +31,6 @@
 #if USE_AVRO
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
-#include <DataTypes/TimezoneMixin.h>
 #endif
 
 namespace ProfileEvents
@@ -873,100 +872,54 @@ namespace
         const auto destination_sample = destination_metadata->getSampleBlockNonMaterialized();
         const String partition_timezone = context->getSettingsRef()[Setting::iceberg_partition_timezone];
 
-        /// ClickHouse functions that map 1:1 to an Iceberg transform; only these can match structurally.
-        static const std::unordered_set<String> iceberg_representable = {
-            "identity", "toYearNumSinceEpoch", "toMonthNumSinceEpoch",
-            "toRelativeDayNum", "toRelativeHourNum", "icebergBucket", "icebergTruncate"};
-
-        /// year/month/day/hour depend on the timezone (for DateTime); the structural fast path is only
-        /// sound when the source and destination evaluate them in the same timezone.
-        static const std::unordered_set<String> timezone_sensitive_transforms = {
-            "toYearNumSinceEpoch", "toMonthNumSinceEpoch", "toRelativeDayNum", "toRelativeHourNum"};
-
-        auto column_explicit_time_zone = [](const DataTypePtr & type) -> String
-        {
-            if (const auto * tz = dynamic_cast<const TimezoneMixin *>(type.get()); tz && tz->hasExplicitTimeZone())
-                return tz->getTimeZone().getTimeZone();
-            return "";
-        };
-
         for (UInt32 i = 0; i < actual_size; ++i)
         {
             const auto af = actual_fields->getObject(i);
             const auto dest_source_id = af->getValue<Int32>(Iceberg::f_source_id);
             const auto dest_transform = af->getValue<String>(Iceberg::f_transform);
             const String column = source_id_to_name(dest_source_id);
-            const auto dest_canonical = Iceberg::parseTransformAndArgument(dest_transform, "");
+            const auto dest_canonical = Iceberg::parseTransformAndArgument(dest_transform, partition_timezone);
 
-            const std::optional<Int64> dest_argument = dest_canonical && dest_canonical->argument
-                ? std::optional<Int64>(static_cast<Int64>(*dest_canonical->argument)) : std::nullopt;
-
-            /// Fast path: the source already applies the matching transform on this column, so every
-            /// source partition is single-valued for this field by construction (covers bucket too).
-            /// It is only taken when the transform semantics are provably identical. identity is
-            /// exempt: an identity source partition is already a single value, so it stays single-valued
-            /// under any cast. Every other transform is applied to the destination column type, so a
-            /// structural match requires identical types (icebergTruncate/icebergBucket are numeric on
-            /// integers but byte-wise on strings, so a pre-transform cast that changes the type changes
-            /// the result); year/month/day/hour on DateTime additionally require the same effective
-            /// timezone. Mismatches fall through to the dynamic proof, which evaluates the destination
-            /// transform on the real data.
-            bool matched_structurally = false;
-            for (const auto & term : source_terms)
-            {
-                /// A bare source column canonicalizes to "identity"; other functions match a destination
-                /// transform only when they are Iceberg-representable and their ClickHouse name equals
-                /// the one the transform maps to.
-                const String source_function = term.function.empty() ? "identity" : term.function;
-                if (term.column != column || !dest_canonical || !iceberg_representable.contains(source_function)
-                    || source_function != dest_canonical->transform_name || term.argument != dest_argument)
-                    continue;
-
-                const auto & transform_name = dest_canonical->transform_name;
-                if (transform_name != "identity")
-                {
-                    const auto slot_it = std::find(minmax_column_names.begin(), minmax_column_names.end(), column);
-                    if (slot_it == minmax_column_names.end() || !destination_sample.has(column))
-                        continue;
-                    const auto & structural_source_type = minmax_column_types[slot_it - minmax_column_names.begin()];
-                    const auto & structural_dest_type = destination_sample.getByName(column).type;
-                    if (!structural_source_type->equals(*structural_dest_type))
-                        continue;
-
-                    if (timezone_sensitive_transforms.contains(transform_name))
-                    {
-                        const WhichDataType which(structural_source_type);
-                        if (which.isDateTime() || which.isDateTime64())
-                        {
-                            const String source_tz = term.time_zone.value_or(column_explicit_time_zone(structural_source_type));
-                            const String dest_tz = partition_timezone.empty()
-                                ? column_explicit_time_zone(structural_dest_type) : partition_timezone;
-                            if (source_tz != dest_tz)
-                                continue;
-                        }
-                    }
-                }
-
-                matched_structurally = true;
-                break;
-            }
-            if (matched_structurally)
-                continue;
-
-            /// A transform we cannot reconstruct as a ClickHouse function must match structurally
-            /// (bucket, a non-order-preserving hash, is rejected below by the monotonicity check).
+            /// A transform we cannot reconstruct as a ClickHouse function must match structurally.
             if (!dest_canonical)
                 throw Exception(ErrorCodes::BAD_ARGUMENTS,
                     "Cannot export partition to Iceberg table: destination field on column '{}' uses "
                     "transform '{}', which requires the source MergeTree to be partitioned by the matching "
                     "function.", column, dest_transform);
 
-            /// Dynamic proof: the destination transform must be constant across the partition's data.
-            const auto transform = Iceberg::parseTransformAndArgument(dest_transform, partition_timezone);
-            const std::optional<Int64> transform_argument = transform->argument
-                ? std::optional<Int64>(static_cast<Int64>(*transform->argument)) : std::nullopt;
-            verifyColumnMapsToSinglePartition(column, transform->transform_name, transform_argument,
-                transform->time_zone, minmax_column_names, minmax_column_types, destination_sample,
+            const std::optional<Int64> dest_argument = dest_canonical->argument
+                ? std::optional<Int64>(static_cast<Int64>(*dest_canonical->argument)) : std::nullopt;
+
+            /// bucket is a hash: not order-preserving, so the dynamic min/max proof cannot show that a
+            /// source partition maps to a single bucket. It is only accepted when the source already
+            /// partitions by the same icebergBucket(N, col) on an identical column type - the hash is
+            /// representation-sensitive, so a pre-transform cast that changes the type changes the result.
+            if (dest_canonical->transform_name == "icebergBucket")
+            {
+                const auto slot_it = std::find(minmax_column_names.begin(), minmax_column_names.end(), column);
+                bool matched_structurally = false;
+                if (slot_it != minmax_column_names.end() && destination_sample.has(column)
+                    && minmax_column_types[slot_it - minmax_column_names.begin()]->equals(*destination_sample.getByName(column).type))
+                {
+                    for (const auto & term : source_terms)
+                        if (term.column == column && term.function == "icebergBucket" && term.argument == dest_argument)
+                        {
+                            matched_structurally = true;
+                            break;
+                        }
+                }
+                if (!matched_structurally)
+                    throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                        "Cannot export partition to Iceberg table: destination field on column '{}' uses the "
+                        "bucket transform, which requires the source MergeTree to be partitioned by the matching "
+                        "icebergBucket(N, '{}') of the same type.", column, column);
+                continue;
+            }
+
+            /// Every other Iceberg transform (identity/year/month/day/hour/truncate) is monotonic, so the
+            /// dynamic proof evaluates it on the partition's real [min, max] and accepts iff it is constant.
+            verifyColumnMapsToSinglePartition(column, dest_canonical->transform_name, dest_argument,
+                dest_canonical->time_zone, minmax_column_names, minmax_column_types, destination_sample,
                 parts, partition_id, context);
         }
     }
