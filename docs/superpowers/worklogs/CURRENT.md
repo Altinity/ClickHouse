@@ -1155,3 +1155,8 @@ run under test, no signals to observe, nothing scheduled.
 
 **12:56 UTC watchdog** — idle for my work: nothing of mine running, 319G, load 1.04, 0 uncommitted, 83
 commits ahead. No long run under test, no signals to observe, nothing scheduled.
+
+**13:56 UTC watchdog** — idle for my work: nothing of mine running, 319G, load 0.65, 0 uncommitted, 84
+commits ahead. No long run under test, no signals to observe, nothing scheduled. (Two watchdog prompts
+arrived together and the clock had advanced a full hour since the previous check, so there is no 13:26
+entry — a skipped cycle, not an unnoticed gap.)
