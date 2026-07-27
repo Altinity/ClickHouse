@@ -178,28 +178,29 @@ namespace ExportPartitionUtils
         Block block;
         for (size_t i = 0; i < minmax_column_types.size(); ++i)
         {
-            Field min_value;
-            bool found = false;
+            std::optional<Field> min_value;
             for (const auto & part : exported_parts)
             {
                 if (i >= part->minmax_idx->hyperrectangle.size())
                     continue;
                 auto range = part->minmax_idx->hyperrectangle[i];
                 range.shrinkToIncludedIfPossible();
-                if (!found || range.left < min_value)
+                if (!min_value || range.left < min_value)
                 {
                     min_value = range.left;
-                    found = true;
                 }
             }
 
+            if (!min_value)
+                throw Exception(ErrorCodes::LOGICAL_ERROR,
+                    "Cannot derive Iceberg partition value: no min/max statistics for partition-key column "
+                    "'{}' in any exported part of partition '{}'.", minmax_column_names[i], partition_id);
+
             auto column = minmax_column_types[i]->createColumn();
-            if (found)
-                column->insert(min_value);
-            else
-                column->insertDefault();
+            column->insert(*min_value);
             block.insert(ColumnWithTypeAndName(column->getPtr(), minmax_column_types[i], minmax_column_names[i]));
         }
+
         return block;
     }
 
@@ -992,20 +993,12 @@ namespace
         auto ast_to_string = [](const ASTPtr & ast) { return ast ? ast->formatWithSecretsOneLine() : String{}; };
 
         /// Fast path: identical partition keys are single-valued per source partition by construction.
-        /// This also preserves acceptance of non-monotonic keys (hashes, modulo) that the dynamic proof
-        /// below cannot reason about.
         if (ast_to_string(source_key_ast) == ast_to_string(destination_key_ast))
             return;
 
-        /// A hive destination is always partitioned by bare columns (an expression key is rejected at
-        /// table creation), so every destination term is a single column here.
-        const auto destination_terms = parsePartitionTerms(destination_key_ast);
-
-        /// Unpartitioned destination: a single output partition trivially holds every source partition.
-        if (destination_terms.empty())
-            return;
-
+        /// If the partition keys are not identical, we need to verify that the source partition maps to a single destination partition
         const auto source_terms = parsePartitionTerms(source_key_ast);
+        const auto destination_terms = parsePartitionTerms(destination_key_ast);
 
         const auto & source_partition_key = source_metadata->getPartitionKey();
         const auto minmax_column_names = MergeTreeData::getMinMaxColumnsNames(source_partition_key);
@@ -1014,11 +1007,11 @@ namespace
 
         for (const auto & term : destination_terms)
         {
-            /// Fast path: the source already partitions by the same expression on this column, so every
-            /// source partition is single-valued for this destination term by construction.
+            /// Destination term is present in the source partition key, skip
             if (std::find(source_terms.begin(), source_terms.end(), term) != source_terms.end())
                 continue;
 
+            /// Destination term is not present in the source partition key, verify that the source partition maps to a single destination partition
             verifyColumnMapsToSinglePartition(term.column, term.function, term.argument, term.time_zone,
                 minmax_column_names, minmax_column_types, destination_sample, parts, partition_id, context);
         }
