@@ -580,9 +580,8 @@ namespace ExportPartitionUtils
 
 namespace
 {
-    /// One top-level term of a PARTITION BY: a column and, when the term is a function of a single
-    /// column, its function name (empty for a bare column) and optional integer / timezone arguments.
-    /// The Iceberg gate canonicalizes the function name against the Iceberg transforms at comparison time.
+    /// Terms of a given partition key expression.
+    /// E.g. for "PARTITION BY (toYYYYMM(ts), country)", the terms are "toYYYYMM(ts)" and "country".
     struct PartitionTerm
     {
         String column;
@@ -596,9 +595,6 @@ namespace
         }
     };
 
-    /// Parse a PARTITION BY AST into one term per top-level expression. A bare column becomes a term
-    /// with an empty function; a function keeps its single column argument (the last one seen) plus any
-    /// integer / timezone literal. Elements that are neither a column nor a function are skipped.
     std::vector<PartitionTerm> parsePartitionTerms(const ASTPtr & partition_key_ast)
     {
         std::vector<PartitionTerm> terms;
