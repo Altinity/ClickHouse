@@ -374,6 +374,21 @@ a server with slow/remote disks. **That file is generic upstream code, so per th
 needs consultation before editing** — flagged rather than patched. Without the pushdown, the test
 cannot be made safe on a lane whose default disk is a shared CA-s3 pool.
 
+Mitigation landed 2026-07-27: the test is tagged `no-content-addressed-storage` (its coverage is the
+inline CA disk it creates itself, so the CA-default lanes added nothing but the pathological walk —
+it recurred in the 2026-07-26 run at 600s + a "Some queries hung" ride-along on the asan lane). The
+pushdown item above stays open as the real fix.
+
+## [CA-s3 Disk session pressure] `ConnectionGroup: Too many active sessions in group Disk` (noted 2026-07-27) {#ca-s3-disk-session-pressure}
+
+On the asan CA-s3 lane (run for `e2d04bfe37e`), `00149_quantiles_timing_distributed` flipped on a
+leaked stderr warning: `ConnectionGroup: Too many active sessions in group Disk, count 10400,
+warning limit 8000`. The test's stdout was correct and reruns passed — the failure is warning noise,
+but 10k+ concurrently active Disk-group sessions under parallel load is a real pressure signal for
+the CA-s3 request fan-out (compare the write-path request-class findings in
+`{#disk-error-audit-followups-2026-07-21}` and the insert-slowness item). Worth a look at whether CA
+holds S3 sessions longer than needed (e.g. across retry backoffs) before raising any limit.
+
 ## 14. Local / emulated backend {#local-backend}
 
 Collected 2026-07-23 (user direction): every "local backend" story lives HERE, so the class is visible

@@ -1,5 +1,11 @@
--- Tags: no-fasttest
--- ^ content_addressed is an object-storage metadata type; keep it off the minimal fasttest image.
+-- Tags: no-fasttest, no-content-addressed-storage
+-- no-fasttest: content_addressed is an object-storage metadata type; keep it off the minimal
+-- fasttest image.
+-- no-content-addressed-storage: the coverage lives in the INLINE content-addressed disk created
+-- below, so the test is meaningful on every ordinary lane. On lanes where the DEFAULT MergeTree
+-- storage is itself content-addressed, `system.remote_data_paths` (whose `disk_name` filter is
+-- applied only after the traversal) also walks the huge shared default pool holding the whole
+-- run's data, and on the S3 (RustFS) variant that walk does not fit the 600s test timeout.
 
 -- B38: querying system.remote_data_paths traverses the disk and probes existsFile on pool sub-dirs
 -- (e.g. the "store" directory). Such a path resolves to a directory object key; existsFile must treat
