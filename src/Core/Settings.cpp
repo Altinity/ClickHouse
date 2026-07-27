@@ -5561,6 +5561,14 @@ Possible values:
 - 0 - Disabled
 - 1 - Enabled
 )", 0) \
+    DECLARE(Bool, use_puffin_files_cache, true, R"(
+If turned on, Iceberg reads may utilize the Puffin files cache for parsed puffin file content such as deletion vectors.
+
+Possible values:
+
+- 0 - Disabled
+- 1 - Enabled
+)", 0) \
     DECLARE(Seconds, iceberg_compaction_delay_bias, 60 * 60 * 3, R"(
 Minimum time of delay between 2 background compaction operations.
 )", 0) \

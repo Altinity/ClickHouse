@@ -13,6 +13,16 @@ namespace DB::ErrorCodes
 namespace DB
 {
 
+bool hasNonEmptyExcludedRows(const DataLakeObjectMetadata & metadata)
+{
+    return metadata.excluded_rows && metadata.excluded_rows->size() > 0;
+}
+
+bool hasNonEmptyExcludedRows(const std::optional<DataLakeObjectMetadata> & metadata)
+{
+    return metadata.has_value() && hasNonEmptyExcludedRows(*metadata);
+}
+
 DeletionVectorTransform::DeletionVectorTransform(
     const DB::SharedHeader & header_,
     ExcludedRowsPtr excluded_rows_)
