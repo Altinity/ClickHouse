@@ -842,7 +842,10 @@ namespace
         }
 
         if (!current_schema_json || !partition_spec_json)
-            return;
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                "Cannot export partition to Iceberg table: destination metadata is malformed, "
+                "current-schema-id '{}' or default-spec-id '{}' does not resolve to a schema/spec.",
+                original_schema_id, partition_spec_id);
 
         std::unordered_map<Int32, String> source_id_to_column_name;
         {
@@ -864,6 +867,7 @@ namespace
 
         const auto source_terms = parsePartitionTerms(source_metadata->getPartitionKeyAST());
 
+        /// todo arthur the below is questionable
         /// A partitioned source cannot be exported into an unpartitioned Iceberg table: there is no
         /// destination partitioning to satisfy and the result would silently drop the source layout.
         if (actual_size == 0)
