@@ -1,0 +1,2474 @@
+v6 still has three correctness blockers. I treated “plan-phase audit,” unnamed durable state, and actors without legal fencing authority as unresolved design work.
+
+## Findings
+
+1. **blocker — Fresh-epoch rebirth is still a deferred alternative, not a protocol.**
+
+   **Claim attacked:** §3 says a fresh `life_epoch` from the existing allocator prevents all old-life collisions.
+
+   **Proof:** The existing allocator is server-root-wide, not namespace-local ([CasServerRoot.cpp:165](/home/mfilimonov/workspace/ClickHouse/master/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:165)); its result becomes the mounted process epoch ([CasPool.cpp:497](/home/mfilimonov/workspace/ClickHouse/master/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:497)). Bumping it for one warm rebirth without a full remount leaves the mount lease on the old epoch; doing a full remount changes every namespace.
+
+   The layout audit fails:
+
+   - Ref logs/snapshots/cleanup are `{namespace, server writer_epoch, ref_sequence}` ([CasLayout.h:126](/home/mfilimonov/workspace/ClickHouse/master/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h:126)). A warm rebirth in the same mount reuses the writer epoch and resets the per-namespace sequence.
+   - Verbatim files are only `{namespace, file_name}` ([CasLayout.h:175](/home/mfilimonov/workspace/ClickHouse/master/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h:175)); `CasPlainObjects` has no incarnation parameter ([CasPlainObjects.cpp:91](/home/mfilimonov/workspace/ClickHouse/master/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPlainObjects.cpp:91)).
+   - Fold cursors and cleanup work are keyed only by namespace ([CasFoldSealFormat.h:95](/home/mfilimonov/workspace/ClickHouse/master/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h:95)).
+   - Manifest bodies pass this audit because their mount epoch plus globally increasing build sequence already prevents warm reuse ([CasTypes.h:110](/home/mfilimonov/workspace/ClickHouse/master/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h:110)).
+
+   A reader retaining `(namespace, file_name)` across rebirth aliases the new life directly. v6 itself leaves qualification versus fallback as a “plan-phase audit obligation” ([v6:108](/home/mfilimonov/workspace/ClickHouse/master/docs/superpowers/specs/2026-07-27-cas-ref-chain-complete-cut-design.md:108)).
+
+   **Smallest fix:** choose the fallback now: mint an explicit catalog incarnation and qualify ref keys, verbatim keys, `_ckpt`, fold cursors, cleanup work, and cached namespace handles with it. Reject stale handles by catalog-incarnation mismatch. The alternative is a fully specified whole-server-root remount on every rebirth, with its much larger cost and concurrency surface.
+
+2. **blocker — `_ckpt` lacks a safe publication, merge, retention, and deletion state machine.**
+
+   **Claim attacked:** a stale `_ckpt` only under-cleans, and a snapshot PUT preceding a lost pointer CAS leaves safely deletable debris ([v6:85](/home/mfilimonov/workspace/ClickHouse/master/docs/superpowers/specs/2026-07-27-cas-ref-chain-complete-cut-design.md:85)).
+
+   **Proof:**
+
+   - Start with `_ckpt=S1`. The writer PUTs `S2`, but has not yet advanced `_ckpt`. If cleanup treats this “unreferenced” `S2` as deletable, it may delete `S2`; the writer then CASes `_ckpt→S2`. Backend CAS checks only the expected object token, not whether `S2` exists ([CasBackend.h:247](/home/mfilimonov/workspace/ClickHouse/master/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h:247), [CasObjectStorageBackend.cpp:897](/home/mfilimonov/workspace/ClickHouse/master/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.cpp:897)). `_ckpt` now dangles.
+   - Therefore every snapshot greater than the current checkpoint must remain pinned while its publisher may still be live. A crash after PUT can leave such a candidate indefinitely; it is not immediately distinguishable from a prepublication snapshot.
+   - Snapshot publication and epoch sealing update different fields. Two writers reading token `t0` race; one wins and the other conflicts. Retrying by writing its old body erases the winner; abandoning loses the update. Token CAS supplies neither `max(snapshot_id)` nor field merging.
+   - Recovery may read `_ckpt=S1`, then cleanup advances to `S2` and deletes `S1` before recovery GETs it. The historical protocol explicitly restarted from a fresh authority observation in this case ([2026-07-11 design:475](/home/mfilimonov/workspace/ClickHouse/master/docs/superpowers/specs/2026-07-11-cas-ref-table-snapshot-log-design.md:475)); v6 has no equivalent token-revalidation rule.
+   - Deleting the catalog entry before `_ckpt` permits a new `Creating` entry to race the old cleanup. An unconditional or wrong-token `_ckpt` delete can then leave a successor `Live` without its checkpoint.
+
+   A PUT acknowledged `Done` and then spontaneously lost is not reachable under the backend seam; pointer-to-missing becomes reachable through the unspecified concurrent cleanup.
+
+   **Smallest fix:** define one read/decode/merge/CAS loop that validates `life_epoch`, takes the semantic maximum of both pointer fields, preserves unrelated fields, and resolves ambiguous CAS by reread. Delete snapshots only when strictly below the current checkpoint; treat a missing sampled base as “reread `_ckpt`; restart if its token advanced, corruption if unchanged.” On removal, exact-delete `_ckpt` while the catalog remains `Removing`, then CAS-delete the catalog entry last.
+
+3. **blocker — GC is not a legal sequencer for an interrupted terminal removal.**
+
+   **Claim attacked:** GC can reconcile `Removing` by appending the terminal record “as a normal lane operation” ([v6:102](/home/mfilimonov/workspace/ClickHouse/master/docs/superpowers/specs/2026-07-27-cas-ref-chain-complete-cut-design.md:102)).
+
+   **Proof:** The historical invariant says only the mounted writer allocates namespace log IDs and GC never appends ([2026-07-10 design:131](/home/mfilimonov/workspace/ClickHouse/master/docs/superpowers/specs/2026-07-10-cas-ref-snapshot-log-design.md:131)). Current code preserves that boundary explicitly: GC never mutates another writer’s ref-table state ([CasRefLedger.cpp:2690](/home/mfilimonov/workspace/ClickHouse/master/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2690)).
+
+   A GC leader encountering another server root’s namespace has neither its mount fence nor its per-namespace lane/wedge state. Direct PUT violates INV-1; using its local lane stamps the wrong server-root epoch.
+
+   **Smallest fix:** only the owning mounted writer or a successor that has claimed/fenced that server root may append the terminal record. GC must hold/report the `Removing` entry. If autonomous GC completion is required, it needs a separate explicitly fenced authority protocol, not an ordinary writer-lane call.
+
+4. **major — Self-remount permits two recoveries of the same namespace to overlap.**
+
+   **Claim attacked:** mount exclusivity and lazy per-namespace serialization make CAS-walk recovery single-owner.
+
+   **Proof:** `recovery_in_progress` serializes only callers sharing one `RefTableRuntime` ([CasRefLedger.cpp:394](/home/mfilimonov/workspace/ClickHouse/master/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:394)). Self-remount waits for snapshot publishers but not recovery, marks the old runtime superseded, and clears the runtime map ([CasRefLedger.cpp:891](/home/mfilimonov/workspace/ClickHouse/master/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:891)). The current recovery write callback checks the current boolean fence only ([CasRefLedger.cpp:618](/home/mfilimonov/workspace/ClickHouse/master/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:618)); after remount rearms it, an old recovery may continue alongside the new runtime’s recovery. Ordinary appends already include `superseded_by_remount` ([CasRefLedger.cpp:1892](/home/mfilimonov/workspace/ClickHouse/master/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1892)); recovery does not consistently do so.
+
+   **Smallest fix:** capture the mount fence generation at recovery admission and require the same generation plus non-superseded runtime for every `slot-occupy`, `_ckpt` CAS, and final install. Remount must cancel or wait for `recovery_in_progress` before rearming.
+
+5. **major — The “durable writer cleanup queue” has no durable representation or recovery actor.**
+
+   **Claim attacked:** live-epoch bodies are retried to completion and the build is not retired while cleanup is uncertain.
+
+   **Proof:** `PartWriteTxn` destruction immediately retires the build sequence ([CasPartWriteTxn.cpp:119](/home/mfilimonov/workspace/ClickHouse/master/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:119)). Staged-body cleanup catches and discards every failure ([CasPartWriteTxn.cpp:1438](/home/mfilimonov/workspace/ClickHouse/master/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:1438)). v6 names exactly two new object kinds, neither of whose schemas contains per-build cleanup duties.
+
+   An in-memory queue handles a long-lived process but dies on process loss. Without a successor touching that namespace and creating its epoch seal, §6 still refuses the old bodies indefinitely.
+
+   **Smallest fix:** persist each unsettled cleanup duty before retiring the build and define its adopter, exact-delete completion, and retirement transaction. If the intended design is merely an in-memory queue plus crash-to-successor fallback, say so and prove that a successor/GC actor always seals and drains it; do not call it durable.
+
+6. **major — Removal-tail retention is safe in principle but has no bounded execution protocol.**
+
+   **Claim attacked:** the sweep proves no unconsumed arithmetic-tail record names a removal target while sharing the P1/P3 bounded budget.
+
+   **Proof:** That negative fact requires reading every record from the cursor to the authoritative frontier. Current cursor-page sweeping bounds manifest enumeration, but protection construction already scans the entire listed tail once per namespace ([CasOrphanManifestSweep.cpp:205](/home/mfilimonov/workspace/ClickHouse/master/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.cpp:205), [CasOrphanManifestSweep.cpp:342](/home/mfilimonov/workspace/ClickHouse/master/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.cpp:342)). Replacing LIST with arithmetic GETs makes a million-record backlog a million serial point reads before one bounded manifest page finishes. No tail cursor, byte/request budget, or reusable protection summary is specified.
+
+   **Smallest fix:** scan under the common round budget, cache/share decoded tail protection across every candidate in the namespace, and persist or safely resume the scan. If the proof cannot reach the frontier within budget, retain every affected candidate and continue next round.
+
+7. **major — Every-attempt safety creates a permanent absent-key wedge with no stated escape.**
+
+   **Claim attacked:** the existing wedge eventually resolves exact occupancy.
+
+   **Proof:** The corrected rule is implementable without breaking `NoAttemptSent`: track whether any send was ambiguous; a later definite result remains `Unresolved`, while zero sends safely frees the ID. But after the original budget expires, current wedge resolution only performs an exact GET ([CasRefLedger.cpp:1358](/home/mfilimonov/workspace/ClickHouse/master/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1358)). Absence stays `Unresolved` forever ([CasRefLedger.cpp:1545](/home/mfilimonov/workspace/ClickHouse/master/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1545)).
+
+   If the ambiguous first attempt never landed, no object will appear spontaneously, the ID is never freed, and the namespace remains unavailable until an externally induced remount.
+
+   **Smallest fix:** while wedged, retry conditional creation of the same `(key, bytes)` under the original fence generation. A successful create or identical exact GET resolves durable; later definite failures after ambiguity remain unresolved. Alternatively specify and automate an epoch-close/remount escalation.
+
+8. **major — Catalog creation reconciliation and capacity charging are assertions, not algorithms.**
+
+   **Claim attacked:** GC reconciles `Creating` “after a bound,” and creation atomically reserves enough capacity for removal and cursor state.
+
+   **Proof:** No clock, owner identity, nonce, or liveness authority defines the bound. A wall-clock timeout can race a merely slow live creator. Token-exact CAS can make that race safe, but v6 does not state that GC deletes only the unchanged `Creating` incarnation or how a valid existing `_ckpt` is completed versus discarded.
+
+   Capacity is similarly unspecified. Namespace length is currently unbounded ([CasLayout.cpp:258](/home/mfilimonov/workspace/ClickHouse/master/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.cpp:258)), while the fold seal has a 256 MiB cap ([CasFormat.cpp:102](/home/mfilimonov/workspace/ClickHouse/master/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.cpp:102)). There is no stated encoded-size equation, entry limit, reservation field, or CAS admission check.
+
+   **Smallest fix:** bind `Creating` to creator mount identity/fence generation and reconcile only after that authority is terminal; CAS-delete the unchanged catalog token. Define a concrete namespace byte bound and make the catalog CAS reject creation unless the encoded catalog plus worst-case fold cursor/removal reservation remains within both caps.
+
+9. **major — Condemn-nothing is safe, but normal sweep cannot reclaim the orphan blobs v6 delegates to it.**
+
+   **Claim attacked:** genuinely orphaned debris rejected by REBUILD is reclaimed by §6’s normal sweep.
+
+   **Proof:** Current REBUILD’s zero-edge pass exists specifically because a physically present blob absent from the rebuilt baseline never undergoes a transition to zero ([CasGc.cpp:2739](/home/mfilimonov/workspace/ClickHouse/master/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2739)). The orphan-manifest sweep deletes bodies and deliberately emits no blob deltas ([CasOrphanManifestSweep.h:41](/home/mfilimonov/workspace/ClickHouse/master/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.h:41)).
+
+   Thus a build may upload blobs, stage an unowned manifest, lose cleanup, and die. The manifest sweep deletes the manifest; its blobs have no in-degree row and will never be condemned. Every future condemn-nothing REBUILD preserves that leak.
+
+   **Smallest fix:** either document REBUILD as logical-edge repair that intentionally cannot make orphan-blob progress, or add a safe candidate path. Proven-dead orphan manifests can nominate their blobs for a current-edge-count recheck before deletion, but blobs uploaded without any manifest still require an authoritative build/upload registry or maintenance fence.
+
+10. **major — `EpochSeal` lacks a canonical record grammar.**
+
+   **Claim attacked:** an occupied seal terminates CAS-walk and folds as an ordinary no-op.
+
+   **Proof:** v6 calls it an operation kind but never requires it to be the only operation in its transaction. If mixed with owner operations, “adopted `EpochSeal` terminates the walk” either skips those effects or silently turns a user mutation into the closing record. `prev_epoch_seal` is also not constrained to exactly the first record of a new epoch, including the empty-epoch case where that first record is itself a seal.
+
+   **Smallest fix:** require an `EpochSeal` transaction to contain exactly one seal operation and no manifest edges or lifecycle changes. Require `prev_epoch_seal` exactly on sequence 1 of every non-genesis epoch—including a sequence-1 seal—and forbid it elsewhere. Reuse `decodeRefLogTxn`’s existing key/body ID binding.
+
+11. **major — §9 deletes `_cleanup` before its replacement dependency is implementable, and `_ckpt` is missing from strict key classification.**
+
+   **Claim attacked:** catalog plus rebirth subsume `_cleanup`, and the single strict enumeration understands all v6 ref objects.
+
+   **Proof:** Current rebirth is directly gated at `CasPartWriteTxn.cpp:1017` by the exact cleanup marker ([CasPartWriteTxn.cpp:1005](/home/mfilimonov/workspace/ClickHouse/master/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:1005)). Removing that check before finding 1’s incarnation wiring either wedges all rebirths or permits stale-file aliasing.
+
+   Separately, current strict parsing accepts only `_log`, `_snap`, and `_cleanup` ([CasLayout.cpp:118](/home/mfilimonov/workspace/ClickHouse/master/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.cpp:118)). If `<ns>/_ckpt` resides under `cas/refs/<ns>/`, the first live checkpoint makes `groupRefKeys` abort every fold round as an unparseable key.
+
+   **Smallest fix:** order the change explicitly: land incarnation-qualified catalog/key APIs and change `PartWriteTxn` gating first, then remove `_cleanup`. Add a singleton checkpoint key classification—or place checkpoints under a separately excluded prefix—and test it through the real strict enumeration.
+
+12. **minor — Probe A sampling no longer supplies its former fail-closed store-quality role.**
+
+   **Claim attacked:** Probe A remains the field detector while its second walk is sampled and aborts nothing.
+
+   **Proof:** Arithmetic replay removes Probe A from the cursor-safety proof, so sampling does not itself permit data loss. But the investigation called Probe A the only field detector for inconsistent enumeration and required keeping it ([investigation:396](/home/mfilimonov/workspace/ClickHouse/master/docs/superpowers/reports/2026-07-26-list-incompleteness-investigation.md:396)). Sampling can miss intermittent bad rounds, while the mount-time store-quality gate is explicitly out of scope. It therefore cannot also be presented as the replacement gate.
+
+   **Smallest fix:** specify deterministic cadence/rate and durable “sample due/performed/skipped” observability. Keep the separate mount-time capability decision explicit; do not infer it from an unsampled Probe A round. Attribute parseable malformed keys to one namespace where possible instead of globally suppressing every namespace.
+
+13. **minor — Performance accounting and several proposed tests can remain green without exercising the claimed guarantee.**
+
+   **Claim attacked:** §8’s costs and §10’s negative controls are exact.
+
+   **Proof:** Creation is at least three conditional writes—catalog `Creating`, `_ckpt` create, catalog `Live`—not “DDL +2 CAS.” `_ckpt` merge conflicts can require multiple GET/CAS attempts. The removal-tail scan omitted from the cost model dominates the bounded sweep case. Incarnation-qualified verbatim access also needs a cached incarnation or an added catalog read.
+
+   Tests needing stronger negative controls:
+
+   - Race cleanup precisely between snapshot PUT and `_ckpt` CAS.
+   - Read an old checkpoint token, advance/delete its snapshot, and require authority reread.
+   - Hard-kill after durable cleanup enqueue but before deletion, then restart.
+   - Pause recovery across self-remount and rearm.
+   - Let an old lane attempt a second append after the seal, proving it retries `T+1` rather than producing `T+2`.
+   - Rebirth with the same logical verbatim name and a stale old-life handle.
+   - Make Probe A’s sampling round deterministic.
+   - Add orphan-blob progress verification; “REBUILD condemns nothing” stays green while finding 9 leaks forever.
+
+   **Smallest fix:** correct the request model and turn each test into a fault-injected interleaving with an assertion that demonstrably fails before the protocol change, as required by `INTENT.md:18`.
+
+## Checks that held
+
+- A body whose decoded sequence differs from its key is already rejected ([CasRefLogFormat.cpp:285](/home/mfilimonov/workspace/ClickHouse/master/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.cpp:285)).
+- Under a true state-derived next ID, a dying lane that sees a seal at `T+1` cannot create `T+2`; its state did not advance, so it must retry `T+1`. The test plan should make this explicit.
+- Seal-on-every-transition, including clean transitions, is now stated correctly.
+- The S42 removal-tail retention rule is safety-correct; finding 6 is its missing bounded execution design.
+- REBUILD condemn-nothing fixes the round-5 asymmetric-LIST data-loss scenario; finding 9 is the resulting reclamation failure.
+
+## Round-5 disposition
+
+| Round-5 finding | Resolved by v6? | Disposition |
+|---|---:|---|
+| 1. Recovery snapshot authority | **No, partial only** | `_ckpt` removes the original LIST ambiguity, but its publication/retention/retry protocol is unsafe (finding 2). |
+| 2. Later definite result after ambiguity | **Yes** | INV-1 restores the every-attempt rule. The absent-key liveness issue is new (finding 7). |
+| 3. Namespace incarnation | **No** | v6 defers the key audit/fallback instead of choosing and wiring an incarnation (finding 1). |
+| 4. REBUILD condemnation | **Yes for safety** | Zero-edge condemnation is disabled. Normal orphan-blob progress is not solved (finding 9). |
+| 5. Current-epoch manifest bodies | **No** | A “durable queue” is named but has no durable carrier or adopter (finding 5). |
+| 6. Catalog partial transitions/capacity | **No** | States were added, but GC has no append authority and creation/capacity reconciliation remains unspecified (findings 3 and 8). |
+| 7. CAS-walk controller mismatch | **Yes for the original mismatch** | A dedicated `slot-occupy` primitive is specified. Remount serialization and seal grammar remain open (findings 4 and 10). |
+| 8. Clean transitions need seals | **Yes** | INV-2 now requires sealing after every epoch transition. |
+| 9. Cross-epoch removals | **Yes for safety semantics** | The normative arithmetic-tail rule is present; its bounded implementation is missing (finding 6). |
+| 10. One enumeration/falsifiability | **Partial** | One strict walk and the original counterexamples are named, but `_ckpt` classification and new resolution-race tests are absent (findings 11–13). |
+
+REJECT
+diff --git a/tmp/codex_r6_symbol_map.txt b/tmp/codex_r6_symbol_map.txt
+deleted file mode 100644
+index c7d3b20ba1ebdee17188534c7a5773a98c84b1a9..0000000000000000000000000000000000000000
+--- a/tmp/codex_r6_symbol_map.txt
++++ /dev/null
+@@ -1,2295 +0,0 @@
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobMetaFormat.cpp:25:        case MetaState::Condemned: return "condemned";
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobMetaFormat.cpp:36:    if (w == "condemned") return MetaState::Condemned;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobMetaFormat.cpp:52:    writeU64StringValue(out, meta.condemn_round);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobMetaFormat.cpp:81:            m.condemn_round = r.readU64String();
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasProbe.h:16:///   2. Conditional-create and conditional-overwrite are enforced (`putIfAbsent` prevents overwrites,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasProbe.h:18:///   3. `casPut` supports create-if-absent, conflict-on-existing, conflict-on-stale, and commit-on-current.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.h:33:    bool slot_removed = false;                    /// Whether mount and epoch were deleted and the owner was tombstoned.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.h:34:    std::vector<String> warnings;                 /// Drain or slot-retirement failures; a non-empty list keeps the slot.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.h:38:/// slot as an administrative writer; a live lease is refused, and the claim fences the dead member from
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.h:39:/// writing while cleanup runs. It then drops each table namespace through `Pool::dropNamespace`, drains
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.h:40:/// eligible manifest debris, staging objects, and mountpoint objects, and retires the slot only after all
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.h:46:/// terminated slot as a resume anchor; other failures, including refusal to claim the member, propagate
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobUploadPool.h:19:/// occupies a pool slot itself -- so pool size 1 is a valid (fully serial) configuration, never a
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobUploadPool.h:41:/// Byte-weighted admission for the condemned-LOCAL resurrection branch (stage-1 design §1,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobUploadPool.h:44:/// streaming variant), so under Task 5's fan-out N concurrent condemned-local displacements would hold
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobUploadPool.h:127:/// `content_addressed_condemned_upload_memory_bytes` server setting; `0` means "derive from the pool
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobUploadPool.h:130:/// capped at 64 MiB (`ref_removal_max_bytes`). Budgeting one per-task budget per pool slot neither
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobUploadPool.h:131:/// over-subscribes memory nor throttles a normal fan-out; a condemned body heavier than the whole
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobUploadPool.h:137:ByteWeightedSemaphore & condemnedUploadAdmission();
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobUploadPool.h:143:bool condemnedUploadAdmissionInitializedForTest();
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasServerRootFormats.h:25:/// the UUID that the caller must compare with its local server identity and the retirement state.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasServerRootFormats.h:33:    std::optional<uint64_t> retired_at_ms;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasServerRootFormats.h:46:/// merged GC acknowledgement floor, with `UINT64_MAX` marking a clean farewell (retired lease).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasServerRootFormats.h:56:    uint64_t min_active = 0;   /// UINT64_MAX = retired (farewell)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasServerRootFormats.h:61:/// optional retirement timestamp is omitted for a never-retired owner, preserving its historical
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasServerRootFormats.h:66:/// Decode an owner anchor, requiring its `su` field, tolerating an absent optional `rt` retirement
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCowMap.cpp:224:            it = overlay.erase(it);       /// non-throwing: retire this entry only after its base mutation stuck
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcScheduler.h:47:    UInt64 entries_condemned = 0;   /// entries newly condemned into the retired list this round
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcScheduler.h:116:    /// rounds snapshot this scheduler's state, while `wedged_namespace_count` is read live from the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcScheduler.h:122:        Int64 pending_reclaim = 0;             /// cumulative condemned - executed deletes (this process)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcScheduler.h:126:    /// Takes a consistent-enough atomic snapshot for diagnostics. The returned counters are local
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcScheduler.h:170:    /// `allow_steal` is forwarded to `Cas::Gc::runRegularRound` verbatim (see its doc comment).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcScheduler.h:184:    /// calls of the same instance). A throwaway per call could never recover a dead-incumbent lease.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcScheduler.h:214:    /// Cumulative condemned entries minus exact-token deletes completed by this scheduler while it
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCowManifestSet.cpp:99:            it = overlay.erase(it);       /// non-throwing: retire this entry only after its base mutation stuck
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.cpp:33:/// objects from being attempted. The caller keeps the pool slot whenever warnings are present, so the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.cpp:34:/// terminated slot remains available as a resume anchor instead of being deleted after an unconfirmed
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.cpp:74:/// Delete one slot control object by a token captured at the protocol-defined fence point. Slot
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.cpp:75:/// retirement is fail-closed: unlike the debris drains above, any non-`Deleted` outcome or exception
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.cpp:86:        warnings.push_back("slot delete failed: " + key + ": delete outcome "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.cpp:91:        warnings.push_back("slot delete failed: " + key + ": "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.cpp:131:        const auto stats = admin->dropNamespace(ns);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.cpp:148:    /// Manifest debris must be removed before the mount slot: deleting the mount body removes the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.cpp:179:    /// Retire the slot strictly last and only after a clean drain. Copy the layout and shared backend
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.cpp:181:    /// retire the slot objects afterwards.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.cpp:192:        /// claim, so this token is the epoch-side successor fence for the retirement tail.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.cpp:198:                report.warnings.push_back("slot capture failed: " + epoch_key + " is absent under the admin claim");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.cpp:202:            report.warnings.push_back("slot capture failed: " + epoch_key + ": "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.cpp:207:        /// (`min_active = UINT64_MAX`), making the slot `terminated` before its mutable control objects
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.cpp:220:                report.warnings.push_back("slot capture failed: " + mount_key + " farewell is absent");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.cpp:224:            report.warnings.push_back("slot capture failed: " + mount_key + ": "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.cpp:242:                        "slot capture failed: " + mount_key
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.cpp:248:                report.warnings.push_back("slot capture failed while validating " + mount_key + " and " + epoch_key + ": "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.cpp:258:        /// rewriting the owner identity anchor. Mere presence proves that the slot is live again. Every
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.cpp:265:        /// server_uuid, not yet retired) then gets tombstoned by this decommission run. The successor's
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.cpp:266:        /// live process is not deleted (only its owner anchor is marked retired), but a LATER restart of
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.cpp:271:        report.slot_removed = false;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.cpp:284:                report.warnings.push_back("slot liveness recheck failed: " + mount_key + ": "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.cpp:294:                report.warnings.push_back("slot liveness recheck failed: " + epoch_key + ": "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.cpp:302:                    "slot delete aborted: successor reappeared after mutable control-object deletion; owner kept");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.cpp:311:                        tombstoned.retired_at_ms = nowMs();
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.cpp:325:                            report.slot_removed = true;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.cpp:328:                                "slot tombstone failed: " + owner_key
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.cpp:332:                                "slot tombstone failed: " + owner_key
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.cpp:338:                            "slot tombstone failed: " + owner_key + ": object absent before tombstone write");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.cpp:342:                    report.warnings.push_back("slot tombstone failed: " + owner_key + ": "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.cpp:350:        report.slot_removed = false;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.cpp:352:            "CAS decommission '{}': drain incomplete ({} warnings) — mount slot kept (terminated); "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.cpp:354:        admin.reset();   /// Graceful close still stamps the farewell, leaving the slot `terminated`.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.cpp:358:    /// now. This also means its `warnings` count reflects the FINAL total, including a slot-retirement
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.cpp:370:                    {"slot_removed", report.slot_removed ? "1" : "0"}};
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h:23:/// Which immutable ref-object kind a `_cleanup`, `_log`, or `_snap` key names. The declaration order
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h:33:/// transaction identifier recovered from a listed key. The namespace is syntactically parsed here;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h:45:/// recovered from a listed blob-target in-degree/delta run segment key.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h:59:/// algorithm. Callers use its pure methods to derive keys for blobs, manifests, refs, verbatim files,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h:67:///   - ref objects:      POOL/cas/refs/NAMESPACE/_log|_snap|_cleanup/ID
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h:68:///   - verbatim files:   POOL/roots/NAMESPACE/_files/FILE_NAME
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h:111:    /// `_log`/`_snap`/`_cleanup` objects. One LIST of it enumerates the table's present ref objects
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h:112:    /// (recovery, orphan-sweep tail read).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h:135:    /// Writer-published table snapshot at `.../_snap/<render>.zst`. The snapshot
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h:144:    /// `.../_cleanup/<render>` that GC publishes once the exact removal durably reaches `Completed`.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h:147:        return refsNamespacePrefix(ns) + "_cleanup/" + renderRefTxnId(id);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h:151:    /// `casRefsPrefix()` by its kind directory (`_cleanup`, `_log`, `_snap`) and parses the trailing
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h:156:    /// `.zst` suffix (both are always-compressed text), a `_cleanup` id carrying any
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h:177:    /// deduplication_logs/deduplication_log_1.txt verbatim); empty segments, leading or
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h:191:    /// Prefix that covers all verbatim files of a namespace (for list).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h:313:    /// HEAD'd, or condemned as an orphan blob — `Cas::sweepOwnMountStaging` (`CasStagingSweeper.h`) is
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h:384:    /// The pool's root key prefix, i.e. the constructor's `prefix_` verbatim. Exposed for diagnostics
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h:21:/// The durable control state for GC rounds and snapshot generations. It is materialized as one
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h:24:/// `round` and the snapshot fields are publication cursors: a committed round makes its retire sets
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h:25:/// durable, while `snap_generation` and `snap_attempt` identify the fold seal whose snapshot was
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h:32:    uint64_t round = 0;            /// the highest GC round whose retire sets are durable
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h:35:    PendingGc,     /// listed in the retired set (condemned / delete_pending) — deletion is scheduled; EXPECTED
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h:36:    AwaitingGc,    /// edges still in the GC snapshot (drop/reclaim not folded yet) or GC never ran — EXPECTED
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h:39:    StaleEdge,     /// every source edge the GC snapshot still holds on this blob names a manifest that no
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h:44:    SnapshotOracleMismatch,  /// a published table snapshot's bytes diverge from an independent replay of
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h:80:    uint64_t pending_gc = 0;     /// blobs in the retired set — deletion scheduled (expected)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h:99:    /// Snapshot integrity oracle: for each table with a published snapshot
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h:101:    /// snapshot; a byte divergence from the published object means the writer cache or a codec is
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h:102:    /// corrupt and is a hard ERROR. `snapshot_oracle_checked` counts tables the oracle could actually
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h:104:    uint64_t snapshot_oracle_mismatches = 0;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h:105:    uint64_t snapshot_oracle_checked = 0;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h:135:        return dangling == 0 && snapshot_oracle_mismatches == 0 && corrupted_runs == 0 && stale_edge == 0;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h:139:/// Independently recompute reachability from authoritative refs (never from GC state or snapshots) and
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRecordStreamFormat.h:22:/// generation and is dropped when the row is carried forward. `kCondemned` carries the condemned
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRecordStreamFormat.h:24:/// deletion token and other condemned-row state. A condemned row subsumes the zero marker for that
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRecordStreamFormat.h:38:/// packed keys and condemned rows; this codec owns only the durable text representation and its
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRecordStreamFormat.h:45:///   {"b":"01<digest-hex>","s":"00000000000000000000000000000000","m":"condemned","pend":false,"tt":"etag","tv":"...","sz":123,"cr":"7","mc":false}
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRecordStreamFormat.h:52:/// `m` maps to the `kEdgeActive`/`kZeroMarker`/`kCondemned` bytes; a `condemned` row additionally
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRecordStreamFormat.h:53:/// carries the retired incarnation (`pend`/`tt`/`tv`/`sz`/`cr`) and the durable condemn-marker
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRecordStreamFormat.h:57:/// The condemned-only fields (`delete_pending`/`token`/`size`/`condemn_round`/`marker_confirmed`) are
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRecordStreamFormat.h:67:    uint64_t condemn_round = 0;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRecordStreamFormat.h:151:    /// the run before acting on decoded condemned rows.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRecordStreamFormat.cpp:87:        case kCondemned:  return "condemned";
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRecordStreamFormat.cpp:97:    if (w == "condemned") return kCondemned;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRecordStreamFormat.cpp:190:        writeU64StringValue(scratch, rec.condemn_round);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRecordStreamFormat.cpp:281:        else if (key == "cr") { out.condemn_round = r.readU64String(); have_cr = true; }
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRecordStreamFormat.cpp:292:            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_run: condemned record missing pend/tt/tv/sz/cr/mc");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRecordStreamFormat.cpp:296:        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_run: non-condemned record carries condemned fields");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:17:///   - DefiniteFailure: a synchronous rejection that PROVES the request was never applied server-side
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:20:///   - Unresolved: everything else — `PreconditionFailed`/`NoSuchKey`, a client-side timeout, a
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:23:///     resolves toward Unresolved, never toward a false DefiniteFailure or a false Committed.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:27:    DefiniteFailure,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:28:    Unresolved,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:31:/// WHY a controlled write came back `Unresolved`. It exists because `Unresolved` covers two materially
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:36:/// `NoAttemptSent` is the one that carries real information: both pre-attempt gates (the mount fence
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:43:/// ref append lane acts on (`CasRefLedger::commitRefChunk`'s `Unresolved` arm), so ADDING A MEMBER HERE
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:45:enum class CasUnresolvedReason : uint8_t
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:47:    NotUnresolved,     /// the call did not return Unresolved
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:48:    NoAttemptSent,     /// a pre-attempt gate rejected on the FIRST iteration: nothing was ever sent
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:55:/// Does this `Unresolved` PROVE that no attempt ever reached the network — i.e. that the key is
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:58:/// True for exactly ONE value, and that is the whole design: `NoAttemptSent` is reported only when a
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:59:/// pre-attempt gate rejected while `attempts_sent == 0`, so `backend->putIfAbsent` was never called
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:60:/// (see `putIfAbsentControlled`). Every other value — including `NotUnresolved`, which a caller can
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:61:/// still observe if some path returns `Unresolved` without recording a reason — leaves an object that
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:66:/// added to `CasUnresolvedReason` later fails BOTH ways safely. The missing case is a `-Wswitch` build
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:71:constexpr bool unresolvedProvesNothingWasSent(CasUnresolvedReason reason)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:75:        case CasUnresolvedReason::NoAttemptSent:
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:77:        case CasUnresolvedReason::NotUnresolved:
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:78:        case CasUnresolvedReason::FenceLostMidWay:
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:79:        case CasUnresolvedReason::DeadlineMidWay:
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:80:        case CasUnresolvedReason::FenceLostPostWrite:
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:81:        case CasUnresolvedReason::AttemptsExhausted:
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:88:constexpr std::string_view describeUnresolvedReason(CasUnresolvedReason reason)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:92:        case CasUnresolvedReason::NotUnresolved:      return "not unresolved";
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:93:        case CasUnresolvedReason::NoAttemptSent:      return "no attempt was sent (the mount fence or the "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:96:        case CasUnresolvedReason::FenceLostMidWay:    return "the mount fence dropped after at least one "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:98:        case CasUnresolvedReason::DeadlineMidWay:     return "the operation deadline ran out after at least "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:100:        case CasUnresolvedReason::FenceLostPostWrite: return "an attempt committed but the mount fence had "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:102:        case CasUnresolvedReason::AttemptsExhausted:  return "the attempt budget was exhausted without a "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:143:    /// `putIfAbsentControlled`. A DURATION, not an absolute deadline: each call establishes its own
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:152:    /// and `fence_ok` stops the loop ≈ TTL−attempt_timeout−margin (~23s) after the last successful
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:164:    /// TTL. Not consulted at runtime by the controller itself — the caller's `fence_ok` callback (backed
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:176:    /// Recovery-level retry (`CasRefLedger::ensureRefTableRecovered`): a whole ref-table recovery
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:177:    /// attempt (LIST + snapshot/log GETs + seal PUT) that fails with a transient NETWORK_ERROR is
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:181:    /// envelope above: one recovery attempt may itself burn ~90s inside a single seal PUT. Independent
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:184:    uint64_t recovery_retry_budget_ms = 120000;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:185:    uint64_t recovery_retry_initial_backoff_ms = 1000;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:186:    uint64_t recovery_retry_max_backoff_ms = 30000;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:200:/// materialization grace period, before trusting recovery listings. This is long enough for any
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:207:/// Throw the recoverable "CAS write could not be committed, retry later" condition.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:251:/// uncertain / conditional-create Unresolved). The ABORTED values used as internal
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:252:/// control-flow signals (the condemned/vanished "re-upload from source" signal caught
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:270:///     caller runs its ordinary occupant machinery (adopt live / displace condemned).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:271:///   - Unresolved: budget exhausted or fence lost without a definite outcome — the write may or may
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:273:///     the orphan sweep, exactly like a stageManifest Unresolved).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:278:    Unresolved,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:287:    CasCreateOutcome outcome = CasCreateOutcome::Unresolved;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:300:///     collapsed into Unresolved/DefiniteFailure -- mirrors the existing uncontrolled
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:302:///   - Unresolved: budget exhausted, fence lost, or the current token still equals `expected` (the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:309:    Unresolved,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:316:    CasOverwriteOutcome outcome = CasOverwriteOutcome::Unresolved;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:333:    /// uploads, snapshot publishes — invokes the controller outside its locks; the append lane's
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:339:    /// Controlled `putIfAbsent` with resolve-before-reissue. Performs at
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:343:    /// `fence_ok` is consulted before EVERY attempt (a false answer sends no further attempt), before
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:346:    /// this call reports `Unresolved`, never a false `Committed`). A sleep is
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:350:    /// conflict, never collapsed into `Unresolved`/`DefiniteFailure`. Returns `Unresolved` (never
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:356:    /// `out_reason` (optional): WHY an `Unresolved` was returned. Diagnostic only — the returned
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:357:    /// outcome is unchanged, so no caller's decision depends on it. It exists because `Unresolved`
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:362:    /// triage looking for a retry problem that did not exist. `NoAttemptSent` is the load-bearing
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:365:    CasWriteOutcome putIfAbsentControlled(std::string_view key, std::string_view bytes,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:366:                                          const std::function<bool()> & fence_ok, Token * out_token = nullptr,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:367:                                          CasUnresolvedReason * out_reason = nullptr);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:373:    ///   - absent, or the GET itself fails    -> Unresolved (another attempt may still be legal)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:374:    /// NEVER returns DefiniteFailure: an absent or unreadable key proves nothing about whether the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:381:    /// byte-compared across attempts — the blob-body `putIfAbsentStream` create and `promoteStaged`'s
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:391:    ///     schedule as putIfAbsentControlled); `attempt` re-streams from the caller's REPLAYABLE
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:396:    /// PutResult (Done/PreconditionFailed) or throws. A whitelisted DefiniteFailure classification
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:409:                                                const std::function<bool()> & fence_ok);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:415:    /// the same fence/backoff/deadline gates as `putIfAbsentControlled`. An ambiguous attempt
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:416:    /// (`PreconditionFailed`, or a transient exception classified `Unresolved`) is resolved with ONE
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:425:    /// A whitelisted `DefiniteFailure` classification, or a deterministic LOCAL failure
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:427:    /// `conditionalCreateControlled`'s convention, never `putIfAbsentControlled`'s (that method
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:430:                                              const Token & expected, const std::function<bool()> & fence_ok);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:435:    /// `putIfAbsentControlled`: that method's resolve (`resolveByExactGet`) throws `CORRUPTED_DATA`
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:442:    /// `putIfAbsentControlled`. An ambiguous attempt (`PreconditionFailed`, or a transient exception
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:443:    /// classified `Unresolved`) is resolved with ONE GET at `key`:
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:452:    /// Same DefiniteFailure/deterministic-local-failure rethrow convention as `putOverwriteControlled`.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:453:    CasOverwriteResult putIfAbsentControlledMutable(std::string_view key, std::string_view bytes,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:454:                                                    const std::function<bool()> & fence_ok);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:470:    /// an `Unresolved` from here does not have to guess between them. Both are mid-way by construction:
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:472:    bool pauseBeforeReissue(uint32_t completed_attempt, uint64_t deadline_ms, const std::function<bool()> & fence_ok,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:473:                            CasUnresolvedReason * out_reason = nullptr);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:74:    if (!owner.retired_at_ms)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:81:        "(same manual-recovery pattern as an owner anchor lost over existing data)",
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:82:        srid, *owner.retired_at_ms);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:88:    /// All three subtrees that can ever hold this server root's data: `roots/<srid>/` (verbatim
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:124:        /// recovery options instead of a bare refusal.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:142:    const PutResult put = b.putIfAbsent(key, encodeOwner(OwnerObject{
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:144:        .retired_at_ms = std::nullopt,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:149:    /// Race: another process claimed between our get and our putIfAbsent. Re-read and compare.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:253:        const CasResult res = b.casPut(key, encodeServerEpoch(new_state), expected);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:289:/// The mount-slot "foreign writer" audit instrument: every mount-slot WRITE
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:332:        const PutResult put = b.putIfAbsent(key, encodeMountLease(body));
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:334:            /// Raced with a concurrent writer between get and putIfAbsent. Treat as a live double
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:335:            /// start — fail closed; never overwrite a slot that appeared under us. No re-read was
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:338:        emitMountEvent(sink, CasEventType::MountClaim, srid, "mint", nullptr, "fresh mount slot minted");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:349:            "mount slot is held by a foreign server_uuid — refusing to take over across identities");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:362:                "own (uuid, epoch) mount slot is GC-fenced — terminal for this incarnation; "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:363:                "recover with a fresh writer_epoch");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:447:/// Bounded number of observation restarts before giving up on a same-uuid slot whose write-token keeps
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:503:                /// The slot vanished between claimMount's own GET and ours — normally self-resolving
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:504:                /// within one more `claimMount` call (which re-mints fresh on an absent slot), but under
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:505:                /// slot churn (something else concurrently removing/re-minting it) that resolution could
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:509:                /// — a persistently vanishing slot is exactly as "alive and contended" as a persistently
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:776:    /// (server_uuid, writer_epoch); `start` then adopts that very slot. We must NOT self-trip the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:781:        /// Absent → put it ourselves (a fresh start that ran without a prior claimMount, or a slot
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:782:        /// that lapsed and was swept). putIfAbsent fails closed if it appears under us; that race has
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:784:        const PutResult res = backend->putIfAbsent(key, body);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:787:                "CAS mount-lease: key '{}' appeared between head and putIfAbsent — concurrent writer on our mount slot", key);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:789:            "mount slot absent — keeper minted it directly (no prior claimMount)");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:794:    /// Read the observed slot to decide adopt vs fail-closed by the (uuid, epoch) discriminator.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:802:    /// body's identity is exactly WHO touched the slot.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:806:            "mount slot is held by a foreign server — failing closed, never taking over");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:817:            fmt::format("mount slot is held by a different writer_epoch ({} != ours {}) — superseded, failing closed",
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:826:    /// recovers by allocating a fresh `writer_epoch` and re-claiming.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:830:            "own mount slot fenced by GC after lease expiry — recoverable with a fresh writer_epoch");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:833:            "recoverable: re-open with a fresh writer_epoch", key, describeMountHolder(observed)));
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:842:        /// The slot moved between our GET and PUT. Diagnose by the CURRENT body, not the token
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:852:                    "GC fenced our mount between the adopt's read and write — recoverable with a "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:856:                    "recoverable: re-open with a fresh writer_epoch", key, describeMountHolder(current)));
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:859:                "mount slot was touched while adopting our own mount slot — failing closed");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:861:                "CAS mount-lease: key '{}' was touched while adopting our own mount slot ({}) — failing closed",
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:865:            "CAS mount-lease: key '{}' vanished while adopting our own mount slot — failing closed", key);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:868:        "adopted our own already-live (uuid, epoch) mount slot");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:920:                "own mount slot fenced by GC after lease expiry (late renewal) — recoverable with a "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:924:                "recoverable: re-open with a fresh writer_epoch", mismatched_key, describeMountHolder(current)));
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:929:            /// The slot advanced past our held token under our OWN (uuid, epoch), unfenced. This is
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:933:            /// allocateWriterEpoch re-mint guard). Both recover identically and fail closed: stop
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:938:                "own mount slot advanced past our held token under our own (uuid, epoch) — state "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:942:                "state uncertain; fencing and recovering via self-remount (observed {} vs our seq={})",
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:950:                "own mount slot is held by a different writer_epoch — superseded by a newer incarnation");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:955:                "(this incarnation is deposed; recovery is a fresh-epoch self-remount)",
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:964:            "mount slot is held by a foreign server — failing closed, never taking over");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:970:    /// The mount slot object VANISHED (backing store deleted under a live mount -- e.g. an
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:977:        "mount slot object vanished (backing store deleted under a live mount) — stopping renewal, fail-closed");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:985:    /// LOGICAL_ERROR is unreachable here. The base implementation stays for other slot subclasses.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:990:    /// Terminal op: retire the lease by stamping it already-expired (expires_at_ms = started_at_ms),
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:992:    /// merged watermark farewell folds in HERE: `min_active = UINT64_MAX` is the retired sentinel the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:993:    /// GC floor treats as "every build_seq of this server is retired" — one release retires both the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:1011:        /// slot is already released-by-fence and there is nothing left to retire. Anything else on
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:1031:            "mount slot object already gone at release (backing store deleted) — no-op release");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:1042:    BackendPtr backend_, String key_, std::string_view slot_name_, std::string_view terminal_verb_,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:1046:    , slot_name(slot_name_)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:1055:    /// leaves the slot object persisted with a frozen seq, which full GC observes as stale state.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:1073:        throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS {}: start after {} on key '{}'", slot_name, terminal_verb, key);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:1075:        throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS {}: already started on key '{}'", slot_name, key);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:1098:        throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS {}: renew after {} on key '{}'", slot_name, terminal_verb, key);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:1100:        throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS {}: renew before start on key '{}'", slot_name, key);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:1123:        "CAS {}: key '{}' was touched by a foreign writer — failing closed, never re-minting", slot_name, mismatched_key);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:1134:        /// so there is nothing to release. A never-started slot is inert: BOTH/ALL terminate calls on
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:1141:        throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS {}: double {} on key '{}'", slot_name, terminal_verb, key);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:1157:        throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS {}: background renewal is already running for key '{}'", slot_name, key);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:1180:    /// lease deadline has neared, stops the loop for good: the slot's seq stops
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:1183:    /// other writer can claim the slot before that deadline, so retrying is safe.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:1204:                    slot_name));
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:1210:                log, fmt::format("CAS {}: background renewal failed, the {} stops advancing", slot_name, slot_name));
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobMetaFormat.h:23:/// one JSON object with the state word, the GC condemnation round, and the raw body size. `size` is
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobMetaFormat.h:32:    uint64_t condemn_round = 0;   /// The GC round that condemned this blob; distinguishes a stale
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobMetaFormat.h:33:                                  /// condemnation from a later spare-and-recondemn transition.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:25:/// The logical (GC-bookkeeping) size of a retired object: a blob subtracts the pool's fixed
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:29:uint64_t retiredLogicalSize(ObjectKind kind, uint64_t object_size, uint64_t blob_header_len);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:35:/// load-bearing safety guard: no destructive decision ever runs on a not-fully-folded snapshot.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:53:struct RebuildReport
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:81:    uint64_t candidates = 0;      /// retired entries WRITTEN this round (absent candidates are skipped)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:88:    size_t condemned = 0;         /// entries newly condemned into the retired list this round
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:95:    /// unlike `condemned`/`graduated`/`redeleted` above (this round's DELTAs), these are the pipeline's
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:97:    /// (`Formats/CasFoldSealFormat.h`). `pending_retired` = still delete_pending (graduated, awaiting the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:98:    /// exact-token delete next pass); `pending_candidates` = condemned but not yet floor-passed;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:99:    /// `pending_condemned` = their total (candidates + retired), the overall pipeline gauge. Left at 0 on
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:102:    size_t pending_condemned = 0;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:103:    size_t pending_retired = 0;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:221:/// every step is idempotent and split-brain-safe (monotone `gc/state`, append-by-unique-path retire and
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:266:    /// dead-incumbent recovery stays the loop's job.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:283:        Token token;            /// stored condemn-time token (empty for "unreachable")
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:284:        uint64_t condemn_round = 0;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:294:    /// Raw baseline rebuild — the `gc/state` disaster-recovery command. Recomputes
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:295:    /// the in-degree snapshot from raw owner state (committed refs + live precommits + the unowned
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:297:    /// publishes EMPTY retired lists, and CASes gc/state. Live-conservative; fail-closed refusals.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:298:    RebuildReport rebuildBaseline(bool force);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:306:    void setRebuildEdgeBudgetForTest(uint64_t n) { rebuild_edge_budget_override = n; }
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:310:    /// next round's fold MUST recover the exact sealed cursor (else it re-folds the event and double-counts
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:321:    /// The recheck's manifest-body exact-token delete (after its decrements are sealed), the retired-set
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:322:    /// drop, the resume path (GC metadata), dropNamespace (verbatim files), and the capability probe
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:335:    /// `root_shards` the discovered universe, `mf_cleanup` the part-manifest cleanup work keyed by
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:337:    /// sealed), and `retired_merge` the per-gc-shard ack-floor retired-cursor outcome.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:342:        std::map<ManifestId, Token> mf_cleanup;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:343:        /// Ack-floor one-pass round: the retired-cursor outcome per gc-shard (settled entries, new
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:344:        /// condemnations, floor-passed pendings, and the prior pendings to delete pre-CAS).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:345:        std::vector<RetiredMergeResult> retired_merge;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:347:        /// ref-object cleanup (covered logs / superseded snapshots) so a second LIST is never issued.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:372:    /// token. The committed pair is THREADED into retire, never re-read (zombie-steal protection).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:373:    /// Round-paced graduation: `current_round` (= state.round + 1, the SAME basis condemn_round is
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:374:    /// stamped at) is the threshold the fold's two-cursor merge graduates/condemns against — an entry
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:375:    /// graduates once `condemn_round < current_round`, i.e. it survived at least one full round after
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:376:    /// being condemned. The fold no longer CASes gc/state — it sets (snap_generation, snap_attempt)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:384:    /// blob entry to `deltas`. On sign<0 queue (id -> token) into mf_cleanup. Returns whether a body was
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:390:                           std::map<ManifestId, Token> & mf_cleanup, uint32_t txn_ordinal);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:396:    /// covered by BOTH the durable fold cursor AND a durable snapshot, and snapshots older than the newest
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:397:    /// observed one, in batches of <=1000 exact keys. A remove_namespace log is retained until its
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:399:    /// covering snapshot of the whole tail and its logs are cleaned in the same round. Runs post-CAS
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:401:    /// made the `Removed` snapshot durable, and only on a clamp-free round (`suppress_destructive == false`).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:402:    /// Acts only on keys THIS round's scan returned (reused via `folded.ref_tables`), so a covering snapshot
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:408:    /// prefixes (manifest bodies + verbatim files); a Completed item publishes the `_cleanup` marker and
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:409:    /// republishes the constant-size `Removed` snapshot (both idempotent `putIfAbsent`). Runs post-CAS.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:412:    /// unless `durable.round == new_round` under our lease) and aborts on the `_cleanup` marker's presence
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:416:    /// `ref_tables` is this round's own global LIST: the `Removed`-snapshot republication is gated on it
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:417:    /// so a snapshot a recreated namespace already superseded is never re-created (the per-round churn).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:421:    /// Whether a namespace's physical `@cas@` metadata prefixes (manifest bodies + verbatim files) hold no
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:435:    /// state already reachable before the fold's snapshot merge (O(retired)/O(shards), no snapshot
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:439:    /// `condemned_summary` (retired-in-snapshot): `∃ shard: pending_total > 0 ||
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:440:    /// oldest_nonpending_condemn_round < current_round`. `snap_generation == 0` (fresh pool) => false.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:451:    /// malformed key is not counted here; `groupRefKeys` in the fold does the strict validation and
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:455:    /// (reclaimDroppedShards was removed with the snapshot+log ref model: there is no mutable per-namespace
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:464:    ///   retired/ and outcomes/ sets AND any deposed-leader debris under a non-adopted attempt. Walks
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:481:    /// Submit one per-hash freshness-meta op (condemn/spare/delete) to the bounded `meta_pool`.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:489:    /// Schedule the async per-hash condemn-marker write for a (ref, token) entering or being carried in
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:490:    /// the retired set; when `writeCondemnedMeta` reports durable Condemned evidence, the in-process
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:494:                                    uint64_t condemn_round, uint64_t size);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:496:    /// The in-process condemn-marker confirmation registry (see `condemn_markers_confirmed`).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:498:    bool condemnMarkerConfirmedInProcess(const BlobRef & ref, const Token & token);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:544:    /// Bounded pool for the round's per-hash freshness-meta writes (condemn/spare/delete);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:558:    /// In-process confirmations of durable condemn-marker writes, keyed (blob, exact incarnation-token
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:564:    /// `condemn_marker_mutex`: meta-pool completions insert concurrently with the fold thread's reads.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:565:    std::mutex condemn_marker_mutex;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:566:    std::set<std::pair<BlobRef, String>> condemn_markers_confirmed;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:568:    /// Probe A's per-round count of ref-log ids on which the round's two independent enumerations of
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:572:    uint64_t probe_a_holes_this_round = 0;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasInspect.cpp:179:        .add("object", jsonEscape("ref_snapshot"))
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasInspect.cpp:181:        .add("snapshot_id", renderRefTxnIdObj(s.snapshot_id))
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasInspect.cpp:184:        /// A recovery seal records the greatest transaction id observed by the recovery `LIST`.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasInspect.cpp:187:        /// Ordinary snapshots do not establish such an observation boundary and therefore use `null`.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasInspect.cpp:322:/// renders verbatim (escaped), not hex-converted; `type` names which backend family minted it.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasInspect.cpp:371:    /// summary from the seal itself; the older separate retired-reference object is no longer part
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasInspect.cpp:373:    JsonObj condemned_summary;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasInspect.cpp:374:    for (const auto & [shard, cs] : seal.condemned_summary)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasInspect.cpp:375:        condemned_summary.add(std::to_string(shard), JsonObj()
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasInspect.cpp:376:            .add("condemned_total", jsonUInt(cs.condemned_total))
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasInspect.cpp:378:            .add("oldest_nonpending_condemn_round", jsonUInt(cs.oldest_nonpending_condemn_round))
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasInspect.cpp:386:        .add("condemned_summary", condemned_summary.str())
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasInspect.cpp:419:        case MetaState::Condemned: return "condemned";
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasInspect.cpp:433:        .add("condemn_round", jsonUInt(m.condemn_round))
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasInspect.cpp:462:        case kCondemned:  return "condemned";
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasInspect.cpp:473:        .add("condemn_round", jsonUInt(r.condemn_round))
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasInspect.cpp:479:/// zero-marker, or condemned sentinel), plus a summary. `parsed` carries the run's own coordinates
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasInspect.cpp:480:/// recovered from the key; `bytes` is decoded with the same typed `SourceEdgeRunView` reader the fold /
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasInspect.cpp:492:    uint64_t condemned_count = 0;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasInspect.cpp:525:                ++condemned_count;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasInspect.cpp:526:                row.add("condemned", renderCondemnedRow(decodeCondemnedRow(payload)));   // CORRUPTED_DATA on malformed (fail-closed)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasInspect.cpp:547:            .add("condemned", jsonUInt(condemned_count))
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasInspect.cpp:575:        /// A `_cleanup` marker is a zero-byte object — nothing to decode, so render its key-derived facts.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasInspect.cpp:577:            .add("object", jsonEscape("ref_cleanup_marker"))
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasInspect.cpp:611:        "retired, blobs, blobs/*.meta)", key);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h:33:    using Backend::putIfAbsent;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h:34:    using Backend::putIfAbsentStream;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h:36:    using Backend::casPut;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h:56:    PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta) override;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h:59:    /// create semantics as `putIfAbsent`. Cancelling or destroying the sink before finalization does
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h:61:    WriteSinkPtr putIfAbsentStream(const String & key, const ObjectMeta & meta) override;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h:70:    CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h:90:    /// condemned incarnation, so a delayed exact-token delete for that old incarnation cannot remove
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h:92:    /// destination is condemned.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h:112:    /// Injects a one-shot artificial `Conflict` on the next `casPut` for `key`.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h:155:    std::vector<PendingDelete> pending_deletes_;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcShardPlan.h:97:    /// `out_runs`, and returns the `RunRef`. The call is idempotent (write-once via `putIfAbsent`).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcShardPlan.h:110:                               uint64_t current_round = 0, uint64_t condemn_round = 0,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcShardPlan.h:113:                               const std::function<bool(const RetiredEntry &)> & confirm_condemned_marker = {},
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcShardPlan.h:114:                               RetiredMergeResult * out_retired = nullptr,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcShardPlan.h:116:                               /// PROBE B2: forwarded verbatim to `foldDeltasIntoGeneration` — see its
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcShardPlan.cpp:47:                                         uint64_t current_round, uint64_t condemn_round,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcShardPlan.cpp:50:                                         const std::function<bool(const RetiredEntry &)> & confirm_condemned_marker,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcShardPlan.cpp:51:                                         RetiredMergeResult * out_retired,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcShardPlan.cpp:58:                             current_round, condemn_round, head_blob, peek_head,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcShardPlan.cpp:59:                             confirm_condemned_marker, out_retired,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPoolMetaFormat.cpp:105:    /// Ref state before the snapshot+log model used mutable per-namespace ref-shard objects. That
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPoolMetaFormat.cpp:112:            "(generation {}); this build reads only the snapshot+log ref format (generation {}+). "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInstrumentedBackend.cpp:117:    /// Ref logs, snapshots, and cleanup markers are immutable objects under `cas/refs/<namespace>/`;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInstrumentedBackend.cpp:142:/// Buffer access and cancellation delegate verbatim, while exceptions from the inner sink propagate.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInstrumentedBackend.cpp:168:WriteSinkPtr InstrumentedBackend::putIfAbsentStream(const String & key, const ObjectMeta & meta)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInstrumentedBackend.cpp:170:    WriteSinkPtr sink = inner->putIfAbsentStream(key, meta);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.h:30:/// The pool-format generation at which ref state became immutable snapshot+log objects. Pool metadata
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.h:37:/// retired values remain unused so an old object can never be mistaken for a later class.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.h:41:    /// Values 2, 3, and 4 are retired. The former tree and GC-snapshot classes were replaced by the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.h:45:    /// Value 6 is retired: condemned state now rides source-edge runs and the fold-seal
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.h:46:    /// `condemned_summary`. Keep it unused. Value 7 is also retired: the build-watermark floor is
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.h:50:    /// Value 10 is retired: discovery authority is the `cas/refs/` listing rather than a roots
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.h:56:    /// Value 15 is retired: the fold seal is the sole per-generation coverage record after the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.h:62:    /// the ref transaction log, complete ref snapshot, blob freshness sidecar, and GC heartbeat.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcScheduler.cpp:20:    /// Non-zero events of a per-round snapshot, keyed by event name. The snapshot is already a
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcScheduler.cpp:22:    std::map<String, UInt64> snapshotToMap(const ProfileEvents::Counters::Snapshot & snap)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcScheduler.cpp:179:        return snapshotToMap(*profile_scope->getSnapshot());
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcScheduler.cpp:192:                static_cast<Int64>(rep.condemned) - static_cast<Int64>(rep.redeleted),
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcScheduler.cpp:209:        fin.entries_condemned = rep.condemned;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcScheduler.cpp:236:    /// steal a live incumbent — see Cas::Gc::runRegularRound's doc comment. Dead-incumbent recovery
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcScheduler.cpp:261:        /// and fold/condemn/delete its objects. We also exit on a published FORGET intent
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcScheduler.cpp:320:                /// needed for dead-incumbent recovery.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:43:/// BOTH surviving edges (`kEdgeActive`) AND the retired `kCondemned` sentinel rows at the zero source id,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:44:/// so the cursor stops at edges AND at condemned rows (exposing the type via `rowType`), while zero-marker
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:64:    /// The value byte of the current row: `kEdgeActive` (a surviving edge) or `kCondemned` (a retired
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:67:    /// The decoded retired sentinel for the current row (only valid when `rowType() == kCondemned`).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:68:    const CondemnedRow & condemnedRow() const { return current_condemned; }
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:70:    /// Advance to the next surviving edge OR retired sentinel, dropping zero markers, enforcing the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:76:            /// Pull rows from the open segment until a surviving edge, retired sentinel, or the segment ends.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:109:                        /// A retired sentinel: decode and surface it (settled at close-out, not an edge).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:110:                        current_condemned = decodeCondemnedRow(p);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:155:    CondemnedRow current_condemned;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:198:    beU64(row.condemn_round);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:201:        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS condemned row: token too long ({})", row.token.value.size());
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:213:        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS condemned row: malformed header");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:217:        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS condemned row: unknown flags 0x{:02x}", flags);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:222:        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS condemned row: unknown token_type {}", type);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:225:    row.condemn_round = beU64(3);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:229:        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS condemned row: declared token_len {} vs payload {}", len, p.size() - kFixed);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:246:    /// or the encoded condemned row) so the fold / zeroInDegree / previewDeletes / fsck consumers keep
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:258:                                                      .condemn_round = rec.condemn_round,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:343:    if (backend.putIfAbsent(key, bytes).outcome == PutOutcome::PreconditionFailed)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:359:                              uint64_t current_round, uint64_t condemn_round,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:362:                              const std::function<bool(const RetiredEntry &)> & confirm_condemned_marker,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:363:                              RetiredMergeResult * out_retired,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:368:    RetiredMergeResult & rmr = out_retired ? *out_retired : sink;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:389:    // Streaming two-cursor merge over the prior run (surviving edges AND retired kCondemned
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:393:    // absent), settle each blob's carried retired row against its post-merge in-degree at close-out, and
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:394:    // re-emit the surviving retired rows / zero-transition markers. O(block) IO + O(1) per current blob.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:400:    std::optional<CondemnedRow> cur_condemned;   // the retired sentinel carried on the prior run for cur_blob
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:409:        e.condemn_round = r.condemn_round;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:419:            /// A delete_pending entry recovering in-degree is the expected shape of a dedup-adopt vs
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:420:            /// condemn race, not an ack-floor violation: a graduated blob carries NO surviving prior
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:434:                    "CAS gc fold ({}): delete_pending blob {} (condemned at round {}, observed at round {}) "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:435:                    "recovered in-degree {} -- a fresh dedup-adopt raced the condemn; sparing (never a "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:436:                    "fail-closed delete)", layout.poolPrefix(), blobIdOf(e.ref), e.condemn_round, current_round, indeg);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:439:            rmr.spared.push_back(e);            /// recovery wins, even past the floor
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:444:                rmr.still_retired.push_back(e); /// clamp-suppressed pass: carry pending UNCHANGED
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:448:        else if (!suppress_destructive && e.condemn_round < current_round)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:456:            if (e.marker_confirmed || !confirm_condemned_marker || confirm_condemned_marker(e))
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:462:                rmr.still_retired.push_back(std::move(pending));
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:465:                rmr.still_retired.push_back(e); /// no durable condemn-marker evidence yet — carried
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:468:            rmr.still_retired.push_back(e);     /// carried unchanged until the floor passes it
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:475:        const size_t retired_before = rmr.still_retired.size();
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:477:        /// Settle the retired row carried on the prior run for the blob being closed, against its
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:479:        if (cur_condemned)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:481:            /// The retired row already identifies the blob with the native `BlobRef` used by the run.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:482:            const RetiredEntry stale = toRetiredEntry(cur_blob, *cur_condemned);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:484:            /// re-observe the CURRENT token. If it differs from the retired row's token, a resurrect
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:485:            /// replaced the incarnation at this key — supersede the stale entry with a fresh condemn of the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:489:            /// `head_blob` is the fresh-condemn hook (emits `BlobRetire` + increments
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:490:            /// `CasGcRetiredCondemned`); calling it here would double-emit `blob_retire` alongside the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:491:            /// `blob_retire_replaced` this supersede already produces below, and double-count the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:492:            /// condemned counter for one physical condemnation.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:504:                    fresh.condemn_round = condemn_round;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:508:                    rmr.replaced.push_back(std::move(re));       /// caller emits blob_retire_replaced
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:509:                    rmr.still_retired.push_back(std::move(fresh));
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:516:        /// ...or condemn a fresh transition-to-zero (no carried row). `head_blob` captures the exact
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:527:                fresh.condemn_round = condemn_round;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:528:                rmr.still_retired.push_back(std::move(fresh));
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:533:        /// blob is condemned/carried/graduated this pass (still_retired grew for it), else a per-generation
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:534:        /// `kZeroMarker` when it transitioned to zero this pass but was not condemned (redelete-dropped or
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:535:        /// absent-at-condemn). A blob with surviving edges (cur_edges > 0) emits neither — its edge rows
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:536:        /// were appended inline, and a condemned/zeroed blob has NO surviving edges, so appending the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:538:        /// sorted. `still_retired` therefore mirrors exactly the emitted `kCondemned` rows, in order.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:539:        if (rmr.still_retired.size() > retired_before)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:541:            const RetiredEntry & e = rmr.still_retired.back();
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:544:                                           .size = e.size, .condemn_round = e.condemn_round,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:555:            cur_blob = b; have_blob = true; cur_edges = 0; cur_touched = false; cur_condemned.reset();
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:576:        /// A retired sentinel row from the prior run: stash it for close-out settlement. It is not an edge
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:581:            cur_condemned = cursor.condemnedRow();
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.cpp:627:    /// accumulates on the read path, replacing the retired one-shot cityHash128. Carried by the fold
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.cpp:178:/// `Done`/`PreconditionFailed`-or-rethrow contract. A classified precondition loss is `Unresolved`,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.cpp:188:            legacy == PutOutcome::Done ? classifyConditionalWriteResult() : CasWriteOutcome::Unresolved);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.cpp:292:/// conditional publish to putIfAbsent at finalize, which provides atomicity under emu_mutex. Nothing
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.cpp:310:        return backend.putIfAbsent(key, buf.str(), meta);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.cpp:358:/// of reading a whole snapshot run and slicing it afterward; snapshot runs can be gigabytes at scale,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.cpp:617:        /// conditional precondition (`casPut`/`putOverwrite`/`deleteExact`), which fails closed EXACTLY
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.cpp:839:PutResult ObjectStorageBackend::putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.cpp:855:WriteSinkPtr ObjectStorageBackend::putIfAbsentStream(const String & key, const ObjectMeta & meta)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.cpp:859:        /// Same WriteSettings construction as putIfAbsent — the condition rides on the write buffer
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.cpp:897:CasResult ObjectStorageBackend::casPut(const String & key, const String & bytes, const std::optional<Token> & expected, const ObjectMeta & meta)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.cpp:942:    /// §3.18 №19: same local dialect guard as putOverwrite/casPut — never forward a foreign-dialect
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.cpp:1017:    /// A resolved `!created` is counted `Unresolved` (the 412 does not prove who created the occupant),
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.cpp:1031:    recordConditionalWriteOutcome(res.created ? classifyConditionalWriteResult() : CasWriteOutcome::Unresolved);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.cpp:1045:    /// A condemned-resurrect overwrite is not a verbatim server-side copy: that would reproduce the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.cpp:1046:    /// condemned incarnation's exact bytes and therefore its identical ETag. The queued exact-token
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.cpp:1047:    /// delete of the condemned incarnation could then delete the live resurrection. Instead re-upload
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.cpp:1049:    /// fresh-tagged `fresh_header`, so the resurrected body and token differ from the condemned one
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.cpp:1051:    /// The source is always the writer's staging object, never the condemned `blob_key`; the caller
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.cpp:1057:    /// Unconditional overwrite of the condemned body (plain WriteSettings — no If-Match/If-None-Match).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.cpp:1064:    /// differs from the condemned one, so every already-queued exact-token GC delete of the condemned
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.cpp:1065:    /// incarnation mismatches and misses (`INV-NO-RETURN`). An `If-Match` on the condemned token would
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.cpp:95:    /// condemned summary (std::map<uint64> => shard-sorted)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.cpp:96:    for (const auto & [shard, s] : seal.condemned_summary)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.cpp:101:        writeKey(out, "ct", first);    writeIntText(s.condemned_total, out);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.cpp:103:        writeKey(out, "ocr", first);   writeU64StringValue(out, s.oldest_nonpending_condemn_round);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.cpp:110:    for (const auto & [key, item] : seal.ns_cleanup_items)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.cpp:221:                else if (key == "ct") s.condemned_total = r.readU64Number();
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.cpp:223:                else if (key == "ocr") s.oldest_nonpending_condemn_round = r.readU64String();
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.cpp:226:            seal.condemned_summary[shard] = s;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.cpp:245:            seal.ns_cleanup_items[map_key] = RefNsCleanupItem{RootNamespace{ns}, txn, st};
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobMeta.h:45:/// `CasOverwriteOutcome::Conflict`, never thrown -- this uses `putIfAbsentControlledMutable`, NOT the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobMeta.h:46:/// ref-log lane's `putIfAbsentControlled` (that method's resolve throws `CORRUPTED_DATA` on any
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.cpp:119:    if (kind_seg == "_cleanup")
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.cpp:131:        /// `_log` and `_snap` are always-compressed text stored under a `.zst` suffix. `_cleanup`
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.cpp:140:        return std::nullopt;   /// `_cleanup` ids never carry an extension
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.h:15:/// Text codec for `cas_ref_snap`, the complete per-namespace ref table snapshot at
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.h:16:/// `_snap/<snapshot_id>`. The object is read whole rather than streamed and belongs to the Control
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.h:20:/// A recovery seal is represented by the same snapshot type: it is a Live snapshot whose
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.h:21:/// `sealed_from` is set and whose `snapshot_id` is the synthetic `{my_epoch - 1, UINT64_MAX}`. All
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.h:24:/// still published through the ordinary single-owner `putIfAbsentControlled` path, not a
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.h:45:/// The complete state of one namespace's ref table in one canonical snapshot object. `precommits`
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.h:47:/// A Removed snapshot carries its nonzero `remove_txn_id` and no rows. A Live snapshot has no
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.h:48:/// `remove_txn_id`; when `sealed_from` is present it is nonzero and no later than `snapshot_id`.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.h:54:    RefTxnId snapshot_id;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.h:57:    std::optional<RefTxnId> sealed_from;        /// recovery seal upper bound;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.h:58:                                                 /// if present, `*sealed_from <= snapshot_id`
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.h:65:/// Hard encoded-size limit over the uncompressed text. The snapshot reuses the removal-class
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.h:67:inline constexpr size_t ref_snapshot_max_bytes = ref_removal_max_bytes;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.h:72:/// CORRUPTED_DATA on: a zero `snapshot_id`/`remove_txn_id`/`sealed_from` field; the Live/Removed
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.h:73:/// coupling broken (Live with `remove_txn_id`, or Removed without it / with rows); `snapshot_id <
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.h:76:String encodeRefTableSnapshot(const RefTableSnapshot & snapshot);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.h:79:/// `expected_snapshot_id` are recovered from the object key; the decoded body must equal them (the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.h:83:    std::string_view data, const String & expected_ns, const RefTxnId & expected_snapshot_id);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.h:92:/// Encoded byte size of a snapshot's framing (header + meta line + trailer) for the given metadata and
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.h:93:/// row count, excluding all row lines. `snapshotFramingSize(...) + Σ committedRowEncodedSize +
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.h:95:size_t snapshotFramingSize(const String & ns, const RefTxnId & snapshot_id, RefLifecycle lifecycle,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.h:32:///                          `Present`+identity-match recovery rule fires only from here (or `Live`).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.h:35:///                          matching-sentinel reappearance does NOT auto-revive it ([D3]); recovery is a
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.h:57:    /// the merged mount-lease/build-watermark heartbeat and self-remount recovery.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.h:85:/// Owns the live writer-incarnation mechanics shared by the pool's mount and recovery orchestration:
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.h:88:/// claim/recovery sequence and its `remount_mutex`; in particular, the runtime does not acquire or own
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.h:102:        /// One pool-level recovery attempt. The callback captures the owning `Pool` and is invoked only
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.h:103:        /// after construction, from the recovery thread.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.h:172:    /// Non-terminal recovery transition: `TransientNotLive -> Live`. Called after a self-remount
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.h:207:    /// surfaced verbatim in the `VanishedForgotten` [D5] error message (see `vanishedReason`). Threads exit
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.h:223:    /// `system.content_addressed_mounts` lifecycle snapshot (spec §7) reports. Written (release) at each
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.h:254:    /// Register the in-flight build so `dropNamespace`'s post-durable cancellation can reach it (weak_ptr).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.h:257:    void retireBuildSeq(uint64_t seq);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.h:279:    /// Adopt the already-claimed mount slot; on return the adoption is durable.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.h:281:    /// Force one fresh conditional lease write on the already-adopted slot (fails closed, like any
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.h:282:    /// other `renewOnce`, if the slot changed hands underfoot). Used to re-anchor the write-fence
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.h:295:    /// recovery seal gate; zero means no such boundary has been observed.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.h:321:    /// ---- self-remount recovery ----
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.h:322:    /// On a lost lease, arm a recovery thread when background operation is enabled. It retries the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.h:325:    /// Test seam: drive the arm/refuse path directly. Returns true iff a recovery thread is armed after.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.h:330:    /// setting. This is useful for testing the keeper's loss callback without starting a real recovery.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.h:342:    /// certified as clean. Finish with a second recovery-thread join to close the final callback window.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.h:358:    /// demoted observer; recovery is restart or FORGET). Consulted by `scheduleRemount` before arming and by
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.h:390:    /// In-flight builds keyed by `build_seq`. `dropNamespace` upgrades these weak pointers only after its
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.h:398:    /// superseded/foreign touch). Teardown stops it, whose `terminate` retires the lease (so a
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.h:451:    /// is a per-epoch high-water mark rather than a sticky boolean: ref-table recovery seals only when
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.h:453:    /// whose dead region it recovered. `uncleanEpochBoundarySeenForTest` exposes the coarser lifetime
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h:136:/// their callers (a plain read) but wrong for lifecycle recovery, which must never treat a
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h:160:///   - PreconditionFailed  ⇒ the key already existed — NOTHING was changed (same contract as putIfAbsent)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h:182:///   - putOverwrite/casPut succeed only against the expected current token (or expected absence);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h:186:///   - conditional PUTs are protocol hygiene; casPut and deleteExact are SAFETY-critical.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h:201:/// objects. LARGE content blobs stream through `putIfAbsentStream` (see `WriteSink`); reads stay
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h:231:    virtual PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta) = 0;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h:232:    PutResult putIfAbsent(const String & key, const String & bytes) { return putIfAbsent(key, bytes, {}); }
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h:233:    /// Streaming variant of putIfAbsent — see WriteSink. Large content blobs use this; whole-String
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h:235:    virtual WriteSinkPtr putIfAbsentStream(const String & key, const ObjectMeta & meta) = 0;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h:236:    WriteSinkPtr putIfAbsentStream(const String & key) { return putIfAbsentStream(key, {}); }
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h:250:    virtual CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h:252:    CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h:254:        return casPut(key, bytes, expected, {});
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h:321:    /// streaming `putIfAbsentStream` PUT's ETag plays) when this call created `blob_key`;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h:323:    /// contract as `putIfAbsentStream`). No LIVE object is ever overwritten by this call.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h:327:    /// staging + `putIfAbsentStream`), so this must throw rather than silently degrade to an
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h:336:    /// envelope header — the sanctioned condemned-object resurrection overwrite. The backend reads
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h:341:    /// condemned `blob_key`. The fresh header guarantees the resurrected body — and hence its
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h:342:    /// ETag/token — differs from the condemned incarnation, so a queued
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h:343:    /// exact-token delete of the condemned incarnation can never match the live resurrection
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h:346:    /// meta point-read) before calling this, so it overwrites a condemned body, never a live blob (INV:
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h:51:/// Per-shard summary of condemned rows carried in the sealed source-edge run. It lets graduation and
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h:54:/// condemned rows, while a pure-carry shard copies the parent's entry. Missing entries are invalid and
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h:58:    uint64_t condemned_total = 0;   /// count of `kCondemned` rows in this shard's sealed run
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h:60:    uint64_t oldest_nonpending_condemn_round = UINT64_MAX;   /// min condemn_round over non-pending; UINT64_MAX = none
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h:66:/// physical pass: the namespace was observed empty, after which the cleanup marker and `Removed` snapshot
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h:97:    std::map<uint64_t, CondemnedSummary> condemned_summary;   /// gc-shard -> summary; TOTAL over gc_shards
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h:100:    std::map<String, RefNsCleanupItem> ns_cleanup_items;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:37:/// `WholeShard` calls SOLO (dropNamespace and anything touching multiple refs wholesale).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:118:/// `remove_namespace` operation; callers interested only in completion may ignore this summary.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:132:    uint64_t snapshot_log_count_threshold = 256;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:133:    uint64_t snapshot_log_bytes_threshold = 1ULL << 20;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:134:    uint64_t snapshot_publish_backoff_initial_ms = 200;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:135:    uint64_t snapshot_publish_backoff_max_ms = 30000;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:141:/// The in-memory table state: `TableState = Replay(S_X.state, tail(X))`. This class, `applyRefLogTxn`, `snapshotOf`, and
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:142:/// `replay` are the ONE shared implementation of that equation -- used verbatim by the writer, its
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:143:/// own recovery path, `fsck`, and snapshot construction, so every consumer agrees on what a
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:149:/// `remove_txn_id`: absent means the namespace has never completed a `remove_namespace` transaction
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:154:/// maintains: `remove_namespace` only fires once both are already empty, and no other operation is
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:163:    const RefTxnId & getGreatestApplied() const { return greatest_applied; }
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:166:    uint64_t getSnapshotBodyBytes() const { return snapshot_body_bytes; }
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:178:    /// state after its transaction is already durable -- see `CasRefLedger::commitRefChunk`'s
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:189:    RefTxnId greatest_applied{};                       /// {0, 0} = no transaction applied yet
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:205:    uint64_t snapshot_body_bytes = 0;   /// Σ committedRowEncodedSize + Σ precommitRowEncodedSize
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:248:    friend RefTableState stateFromSnapshot(const RefTableSnapshot & snapshot);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:249:    friend RefTableState replay(const std::optional<RefTableSnapshot> & snapshot, std::span<const RefLogTxn> tail);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:251:                       uint64_t snapshot_budget, uint64_t removal_budget);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:257:/// The inverse of `snapshotOf`: state from a snapshot's rows. `replay` may receive a hand-built
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:262:/// coupling) that could silently miss a case. Concretely: a hand-built snapshot with two committed
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:266:/// through snapshot loading instead of a transaction.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:271:/// precommits. A snapshot naming one manifest under two owners is semantically corrupt (it would
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:275:/// explicit check here reports "corrupt snapshot data" rather than the container's "index drifted =
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:276:/// code bug" framing, which is the accurate diagnosis for a malformed persisted snapshot.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:281:RefTableState stateFromSnapshot(const RefTableSnapshot & snapshot);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:286:/// (strictly-increasing `txn_id`, `remove_namespace` ordering) are checked before any mutation, and the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:300:///  - `txn.txn_id` must be strictly greater than `state.greatest_applied`
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:302:///  - `remove_namespace`, if present, must be the transaction's FINAL operation, and every earlier
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:307:///    recreation on the `_cleanup` marker for a completed removal is the writer's recovery-time
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:332:///  - `remove_namespace`: namespace must be `Live` and both `committed` and `precommits` must already
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:348:/// The canonical snapshot of `state` under `ns`: `committed` sorted by
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:353:/// matches the tuple order `CasRefSnapshotCodec` itself sorts by). `snapshot_id` is
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:354:/// `state.greatest_applied`; a `Removed` state produces zero rows plus `remove_txn_id`, per spec.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:355:/// Does not itself enforce that the result is encodable (a never-born state's `snapshot_id` is
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:358:RefTableSnapshot snapshotOf(const RefTableState & state, const String & ns);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:360:/// `TableState = Replay(S_X.state, tail(X))` in one call: starts from `snapshot`
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:362:/// `applyRefLogTxn`. A given `snapshot` is revalidated in full -- sortedness, no duplicates, canonical
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:366:/// notably). Every entry of `tail` must also share one `ns` -- with `snapshot`'s `ns` when a snapshot
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:368:/// accepting a malformed snapshot or replaying transactions from the wrong table would produce a
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:371:RefTableState replay(const std::optional<RefTableSnapshot> & snapshot, std::span<const RefLogTxn> tail);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:373:/// Everything a successful recovery of one ref table seeds. Produced by streaming replay
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:378:/// `finish` populates the fields that are a pure function of `(base snapshot, replayed tail)`: `state`,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:379:/// `newest_snapshot_id`, `sealed_from`, `tail_count`, `tail_bytes`, and `base_snapshot_bytes`. The
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:380:/// remaining fields are recovery-context the streaming builder cannot know -- the writer's own recovery
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:382:/// `needs_stale_precommit_sweep`, and applies the recovery-seal override to the snapshot-identity/tail/
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:383:/// base fields, before installing the whole struct under `state_mutex` with `recovered` set last. The
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:384:/// read-only consumers (`recoverRefTableDetailed` for the orphan sweep, fsck's snapshot oracle) read
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:385:/// only `state` (plus `newest_snapshot_id`/`sealed_from` for the sweep) and leave the rest at default.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:389:    /// Identity of the base snapshot this recovery replayed from: `nullopt` for a never-born table.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:390:    std::optional<RefTxnId> newest_snapshot_id;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:391:    /// Set only when the base is a recovery seal -- the upper bound of what that recovery's LIST saw.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:393:    /// Applied transactions strictly newer than `newest_snapshot_id`, and the sum of their stored
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:394:    /// (sealed) object byte sizes -- the tail-since-snapshot accounting the runtime tracks.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:397:    /// Encoded (sealed) body size of the base snapshot; 0 for a never-born base.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:398:    uint64_t base_snapshot_bytes = 0;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:402:    uint64_t snapshot_budget = 0;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:409:/// It is the memory fix for a long post-snapshot tail: `replay` takes the whole `tail` materialised in a
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:417:/// the writer's recovery, `recoverRefTableDetailed` (orphan sweep), and fsck's snapshot oracle.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:422:    /// snapshot in full exactly as `replay` does (`stateFromSnapshot`). `base_encoded_bytes` is the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:423:    /// stored (sealed) size of that snapshot object, carried through to `RecoveryResult::base_snapshot_bytes`
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:429:    /// `CORRUPTED_DATA` (the non-transient class recovery fails fast on), discarding the candidate.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:432:    /// Materialises nothing extra (matches `replay`: the writer's recovery folds the COW overlays via
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:448:/// recovery loops hold exactly one decoded transaction resident at a time.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:451:/// Report a decoded-transaction memory delta to the installed streaming-recovery memory probe, if any
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:452:/// (a no-op in production -- no probe is installed). Each recovery loop calls `+footprint` when a
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:455:/// recovery loops live in three files and a memory-bound test's materialising control drives the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:459:/// Test-only observability for the streaming-recovery memory invariant (spec §5): while a probe is
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:460:/// installed, each recovery loop reports the resident footprint of every decoded transaction it holds,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:463:/// single transaction, where the retired whole-tail materialiser -- and the test-local materialising
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:467:/// installed => no accounting. Guarded by an internal mutex; install before driving recovery and clear
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:471:/// The exact encoded size of `state`'s canonical snapshot (`encodeRefTableSnapshot(snapshotOf(state,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:483:/// the budget", not "is this op legal") keeps BOTH the resulting table snapshot and the resulting
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:490:/// so it cancels -- only the `ns` bytes themselves are the delta; repeated exactly once in a snapshot
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:493:/// `ref_snapshot_max_bytes` / `ref_removal_max_bytes` hard limits before calling `admits`.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:496:/// (`snapshot_body_bytes` / `removal_body_bytes`) maintained O(1) per applied op by `RefTableState::applyOp`;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:503:bool admits(const RefTableState & state, const RefOp & op, uint64_t snapshot_budget, uint64_t removal_budget);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:506:/// manifest body, a snapshot body, or `gc/state`: they turn a global `LIST cas/refs/` result and the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:507:/// decoded bodies of new transactions into (a) the per-table log/snapshot/marker listing, (b) the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:542:///   - `namespace_birth` / `set_published_at` / `remove_namespace`      => no edge
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:553:/// The `remove_namespace` operation changes lifecycle only; the exact owner removals that must precede
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:566:/// The `remove_txn_id` of a transaction that ends its namespace's life (contains a `remove_namespace`
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:572:/// ascending. `_cleanup` markers are consulted only by the writer's recreation gate;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:577:    std::vector<RefTxnId> snapshots;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:591:std::map<String, RefTableListing> groupRefKeys(const Layout & layout, const std::vector<String> & listed_keys);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:594:/// Pure; acts only on keys THIS round's scan returned, so a covering snapshot is always
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:596:///   1. the newest observed snapshot `X` covers it (`L <= X`);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:598:///   3. it is not in `removal_logs_blocked` (a `remove_namespace` log whose namespace-cleanup item has
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:600:/// Snapshots with id `< X` are deletable. With no observed snapshot, `X` is undefined and no log is
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:601:/// coverage-deletable (an empty plan). The newest snapshot `X` itself is retained.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:603:/// `completed_removal_snapshot` (optional) is the identifier of a `Removed` snapshot that the caller has
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:604:/// already made durable THIS round via `putIfAbsent` for a namespace-cleanup item that reached
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:606:/// snapshot exactly as if the round's scan had returned it -- the caller guarantees it is durable before
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:607:/// any delete this plan authorizes, preserving the "covering snapshot durable before deletion" invariant.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:608:/// It is never itself scheduled for deletion (it is not in `listing.snapshots` on the round it is first
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:609:/// published; on a later round it appears in `listing.snapshots` as the newest and is retained there).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:613:    std::vector<RefTxnId> deletable_snapshots;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:619:                              std::optional<RefTxnId> completed_removal_snapshot = std::nullopt);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:621:/// The result of `recoverRefTableDetailed`: the replayed table state plus the two facts the late-log
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:622:/// detector needs about the snapshot recovery actually selected: its id and, when it is a
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:623:/// recovery seal, the `sealed_from` upper bound of what that recovery's `LIST` actually observed. Both
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:624:/// are `nullopt` exactly when recovery found no snapshot at all; `sealed_from` alone is `nullopt`
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:625:/// whenever the selected snapshot is an ordinary published one (only a seal ever sets it).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:629:    std::optional<RefTxnId> newest_snapshot_id;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:633:/// Recover one table's state via the shared recovery equation:
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:634:/// one `LIST` of the table prefix, the newest valid snapshot, and replay of the later log tail through the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:635:/// same state machine the writer uses. This is the read-only recovery `fsck`, offline repair, and GC's
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:636:/// disaster-recovery rebuild all consume, so every consumer agrees on what a table's ref state is.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:637:/// Restart-on-vanish: a selected snapshot or tail body deleted between the `LIST` and its `GET` (a
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:638:/// concurrent GC cleanup published a covering newer snapshot) is not corruption -- recovery restarts with a
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:646:RecoveredRefTable recoverRefTableDetailed(Backend & backend, const Layout & layout, const RootNamespace & ns,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:650:/// Thin wrapper over `recoverRefTableDetailed` for the consumers that only need the replayed state
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:651:/// (fsck, offline repair, the writer's own recovery-on-open, and the GC fold's owner-set builder).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h:652:RefTableState recoverRefTable(Backend & backend, const Layout & layout, const RootNamespace & ns,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcPhaseTimer.h:15:/// The `ProfileEvents` delta is a plain snapshot DIFFERENCE of whatever counters container is currently
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcPhaseTimer.h:18:/// holding that slot. A snapshot diff composes with the outer scope instead of fighting it, and degrades
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcPhaseTimer.h:33:/// Cost per phase: one `Stopwatch` and two counters snapshots, against phases that each perform network
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobUploadPool.cpp:185:    /// 64 MiB per pool slot -- the chosen default per-task budget, not a blob-body cap (see
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobUploadPool.cpp:201:            "The CAS condemned-upload memory cap resolves to 0 bytes "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobUploadPool.cpp:202:            "(content_addressed_condemned_upload_memory_bytes and the derived pool_size * 64 MiB are both 0)");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobUploadPool.cpp:206:        throw Exception(ErrorCodes::LOGICAL_ERROR, "The CAS condemned-upload admission is initialized twice");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobUploadPool.cpp:211:ByteWeightedSemaphore & condemnedUploadAdmission()
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobUploadPool.cpp:215:        throw Exception(ErrorCodes::LOGICAL_ERROR, "The CAS condemned-upload admission is not initialized");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobUploadPool.cpp:226:bool condemnedUploadAdmissionInitializedForTest()
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefWireVocab.h:11:/// Shared identifier vocabulary for the ref-log and ref-snapshot text formats. `RefOwnerBinding` and
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefWireVocab.h:12:/// `RefOwnerKind` are used in log `OwnerTransition` records and snapshot `precommits`, so neither
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefWireVocab.h:17:/// Identifies which ownership slot a `RefOwnerBinding` occupies. The numeric values are the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefWireVocab.h:26:/// owners; snapshots use it for precommit rows, whose `kind` must be `Precommit`. A precommit's build
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.cpp:23:/// conditional publish to InMemoryBackend::putIfAbsent at finalize — the single mutex acquisition
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.cpp:24:/// inside putIfAbsent gives atomicity for free. Nothing is ever published on cancel/destruction.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.cpp:41:        return backend_.putIfAbsent(key_, buf_.str(), meta_);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.cpp:131:PutResult InMemoryBackend::putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.cpp:146:WriteSinkPtr InMemoryBackend::putIfAbsentStream(const String & key, const ObjectMeta & meta)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.cpp:168:CasResult InMemoryBackend::casPut(const String & key, const String & bytes, const std::optional<Token> & expected, const ObjectMeta & meta)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.cpp:260:        pending_deletes_.push_back(std::move(pd));
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.cpp:302:    /// instead of copying the staging object verbatim. The fresh header makes the resurrected body
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.cpp:303:    /// different from the condemned incarnation for the same payload; on a content-addressed store
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.cpp:305:    /// cannot remove the resurrection (`INV-NO-RETURN`). The condemned `blob_key` is never read. The
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.cpp:363:    return pending_deletes_.size();
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.cpp:369:    if (i >= pending_deletes_.size())
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.cpp:376:    PendingDelete pd = pending_deletes_[i];
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.cpp:377:    pending_deletes_.erase(pending_deletes_.begin() + static_cast<ptrdiff_t>(i));
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h:24:/// condemned-object resurrection.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h:31:    /// `write_payload` — and resurrects a condemned incarnation by an unconditional server-side copy
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h:32:    /// from the SAME staging object (`Backend::resurrectStaged`), never a read of the condemned blob
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h:74:    ResurrectedLocal,   /// a condemned incarnation displaced by a fresh local `putOverwrite`
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h:75:    ResurrectedS3,      /// a condemned incarnation displaced by a fresh server-side copy from staging
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h:123:    /// `promote` or `abandon` already retired the sequence, and also covers destruction during unwinding.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h:128:    /// (observe current token; condemned ⇒ uploadFromSource — re-upload from the writer's source
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h:139:    /// effects `putBlob` runs — the HEAD-first dedup gate, the write-once conditional create, condemned
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h:140:    /// resurrection (INV-1: never GET a condemned object), the freshness-meta `Clean` transition,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h:169:    /// Test-only DEEP snapshot of this build's recorded deps, keyed by `BlobRef`. A plain copy of the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h:215:    ///  1. tokened leaves are already protected by the durable precommit edge, so no writer-side retired-view
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h:243:    /// path to occur through: promotion is not a recoverable/resumable operation, only a synchronous
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h:250:    /// still throws ABORTED. With `true`, the guard is skipped and the old committed binding is retired
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h:267:    /// Called by `Pool::dropNamespace` for every in-flight build once its namespace-removal transaction is
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h:283:    /// knowledge: an `Unresolved` `PUT` MAY HAVE LANDED (`CasRefLedger.cpp`, the `Unresolved` arm), so a
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h:310:    ///                     lane collapses `DefiniteFailure` and a pre-attempt refusal into the same
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h:325:    /// condemned-at-current-token ⇒ throw ABORTED (caller must re-upload from its own source bytes);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h:332:    /// INV-1 (revival-from-source): revive a condemned or absent object by re-uploading from the writer's
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h:355:    /// (in-degree >= 1, not condemnable) and this build's precommit edge is durable, so the durable manifest
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h:368:    /// Set by `cancelForNamespaceRemoval` from `Pool::dropNamespace`'s thread
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCowMap.h:27:///   overlay overrides/tombstones -- used only by the table's cold full-scan paths (`snapshotOf`,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCowMap.h:28:///   `CasRefLedger::listRefs`, `dropNamespace`, `CasFsck`/`CasGc` owner-set builders) once the map
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCowMap.h:30:///   order required by snapshot encoding.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCowMap.h:154:    ///    background snapshot publisher's `candidate_state`) is BOTH created and destroyed under the same
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCowMap.h:172:    /// after its transaction is durable -- see `RefTableState::swap` and `CasRefLedger::commitRefChunk`.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcOutcomesFormat.h:18:/// `putIfAbsent` adopts an existing durable log on replay rather than treating a byte difference as
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.cpp:30:/// Hook used by this file's GC-owned enumeration calls to `forEachListedKey` and `recoverRefTable`.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.cpp:42:/// across process replacement and the retired sentinel.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.cpp:108:/// A listed `_log` id strictly above the recovered seal's `sealed_from` and at or below the seal's own
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.cpp:109:/// `snapshot_id` was materialized after the recovery `LIST` that produced the seal. This is a LIST-only
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.cpp:115:/// trace that can prove, after a process change, that a later dead-epoch log materialized after recovery's
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.cpp:117:/// nevertheless identify the narrow safe case: if it recorded the unclean reclaim, has no snapshot at all,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.cpp:120:void reportLateLogsIfAny(Pool & store, const RootNamespace & ns, const RecoveredRefTable & recovered,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.cpp:125:    if (recovered.sealed_from)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.cpp:129:            if (!(*recovered.sealed_from < id))
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.cpp:131:            if (recovered.newest_snapshot_id && *recovered.newest_snapshot_id < id)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.cpp:139:                        "CAS T_mat violation: namespace {} log {} listed above the recovery seal's "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.cpp:140:                        "sealed_from {} and covered by its snapshot {} -- the store materialized a write "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.cpp:141:                        "after the recovery LIST; reporting only, never reviving (GC's ordinary "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.cpp:143:                        ns.string(), renderRefTxnId(id), renderRefTxnId(*recovered.sealed_from),
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.cpp:144:                        renderRefTxnId(*recovered.newest_snapshot_id));
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.cpp:151:                e.reason = "T_mat violation: ref log listed above the recovery seal's sealed_from and "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.cpp:152:                           "covered by its snapshot -- reporting only, never reviving (resurrect invariant)";
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.cpp:155:                            {"sealed_from", renderRefTxnId(*recovered.sealed_from)},
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.cpp:156:                            {"seal_snapshot_id", renderRefTxnId(*recovered.newest_snapshot_id)}};
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.cpp:162:    if (recovered.newest_snapshot_id || !store.ownsAndSawUncleanBoundaryFor(ns))
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.cpp:163:        return;   /// an ordinary (non-seal) snapshot exists, or no same-process signal available
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.cpp:176:                    "dead epoch (writer_epoch {} < live {}) with no snapshot at all to explain its "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.cpp:177:                    "presence -- this incarnation's own unclean-reclaim recovery found the namespace "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.cpp:179:                    "recovery's LIST; reporting only, never reviving",
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.cpp:187:            e.reason = "T_mat violation: ref log from a dead epoch with no covering snapshot at all "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.cpp:198:/// same complete view writer recovery uses:
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.cpp:199:///   owners in the newest snapshot + owner changes in every later log (== `recoverRefTable`'s committed
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.cpp:202:/// Keys (not ManifestIds) so a listed object key can be tested directly. Throws on a corrupt snapshot /
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.cpp:203:/// invalid transaction (via `recoverRefTable` / `decodeRefLogTxn`); the caller SKIPS the namespace's
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.cpp:211:    /// Current owners = snapshot + replayed tail (committed rows + live precommits).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.cpp:212:    const RecoveredRefTable recovered = recoverRefTableDetailed(backend, layout, ns, onGcEnumerationPage);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.cpp:213:    const RefTableState & state = recovered.state;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.cpp:233:    reportLateLogsIfAny(store, ns, recovered, logs, dedup);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.cpp:241:            continue;   /// vanished (a concurrent cleanup published a covering snapshot) -- its -1 was folded
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.cpp:268:        return true;   /// farewell/retired sentinel: every seq is retired
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.cpp:281:    /// Build the protection view. A missing snapshot body, an invalid transaction, or an incomplete
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.cpp:395:            /// A corrupt snapshot or invalid transaction means the protection view is unavailable. Skip
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.h:44:///   - eligibility from the durable watermark fact only: the retired sentinel
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.h:51:///   - never GETs a condemned body to revive it — eligibility +
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.h:61:/// this call; likewise a protection-view-unavailable namespace (the pre-existing corrupt-snapshot skip
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:70:/// metadata and rows are allowed, `sealed_from` must not be later than `snapshot_id`, and both row
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:73:void checkSnapshotInvariants(const RefTableSnapshot & snapshot)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:75:    checkTxnIdNonzero(snapshot.snapshot_id, "snapshot_id");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:77:    if (snapshot.lifecycle == RefLifecycle::Removed)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:79:        if (!snapshot.remove_txn_id)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:80:            throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableSnapshot: Removed snapshot is missing remove_txn_id");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:81:        checkTxnIdNonzero(*snapshot.remove_txn_id, "remove_txn_id");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:82:        if (!snapshot.committed.empty() || !snapshot.precommits.empty())
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:84:                "RefTableSnapshot: Removed snapshot must have zero committed/precommit rows, got {}/{}",
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:85:                snapshot.committed.size(), snapshot.precommits.size());
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:87:    else if (snapshot.remove_txn_id)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:88:        throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableSnapshot: Live snapshot must not carry remove_txn_id");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:90:    if (snapshot.sealed_from)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:92:        checkTxnIdNonzero(*snapshot.sealed_from, "sealed_from");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:93:        if (snapshot.snapshot_id < *snapshot.sealed_from)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:95:                "RefTableSnapshot: sealed_from {}-{} exceeds snapshot_id {}-{}",
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:96:                snapshot.sealed_from->writer_epoch, snapshot.sealed_from->ref_sequence,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:97:                snapshot.snapshot_id.writer_epoch, snapshot.snapshot_id.ref_sequence);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:100:    checkCommittedSorted(snapshot.committed);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:101:    checkPrecommitsSorted(snapshot.precommits);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:106:    /// Both fields decimal STRINGS: ref_sequence reaches UINT64_MAX for a recovery seal.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:147:/// The snapshot's header-object meta line (ns, snapshot_id, lifecycle, and the optional remove/sealed
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:148:/// ids). Shared by `encodeRefTableSnapshot` and `snapshotFramingSize` so the two never disagree by a
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:149:/// byte. Assumes the caller has already validated the snapshot (or is measuring framing only).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:150:void writeSnapshotMeta(CasJsonWriter & out, const RefTableSnapshot & snapshot)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:154:    writeStringValue(out, snapshot.ns);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:155:    writeIdFields(out, first, "we", "rs", snapshot.snapshot_id);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:157:    writeStringValue(out, lifecycleToWord(snapshot.lifecycle));
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:158:    if (snapshot.lifecycle == RefLifecycle::Removed)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:159:        writeIdFields(out, first, "rte", "rts", *snapshot.remove_txn_id);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:160:    if (snapshot.sealed_from)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:161:        writeIdFields(out, first, "sfe", "sfs", *snapshot.sealed_from);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:186:String encodeRefTableSnapshot(const RefTableSnapshot & snapshot)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:188:    checkSnapshotInvariants(snapshot);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:190:    CasJsonWriter out(256 + 128 * (snapshot.committed.size() + snapshot.precommits.size()));
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:193:    writeSnapshotMeta(out, snapshot);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:195:    for (const RefCommittedRow & row : snapshot.committed)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:197:    for (const RefOwnerBinding & row : snapshot.precommits)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:200:    writeTrailerLine(out, snapshot.committed.size() + snapshot.precommits.size());
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:202:    if (text.size() > ref_snapshot_max_bytes)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:204:            "RefTableSnapshot: encoded size {} exceeds the snapshot byte limit {}", text.size(), ref_snapshot_max_bytes);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:209:    std::string_view data, const String & expected_ns, const RefTxnId & expected_snapshot_id)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:215:    RefTableSnapshot snapshot;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:232:            if (key == "ns") { snapshot.ns = r.readString(); saw_ns = true; }
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:233:            else if (key == "we") { snapshot.snapshot_id.writer_epoch = r.readU64String(); saw_we = true; }
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:234:            else if (key == "rs") { snapshot.snapshot_id.ref_sequence = r.readU64String(); saw_rs = true; }
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:235:            else if (key == "lc") { snapshot.lifecycle = lifecycleFromWord(r.readString()); saw_lc = true; }
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:248:            snapshot.remove_txn_id = RefTxnId{*rte, *rts};
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:254:            snapshot.sealed_from = RefTxnId{*sfe, *sfs};
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:277:            if (n != snapshot.committed.size() + snapshot.precommits.size())
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:279:                    "RefTableSnapshot: trailer count {} != {} rows", n, snapshot.committed.size() + snapshot.precommits.size());
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:316:            snapshot.committed.push_back(std::move(row));
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:327:            snapshot.precommits.push_back(std::move(row));
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:334:    /// decoded state so bytes stored under one namespace or snapshot ID cannot be interpreted as
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:336:    if (snapshot.ns != expected_ns || snapshot.snapshot_id != expected_snapshot_id)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:338:            "RefTableSnapshot: body (ns='{}', snapshot_id={}-{}) does not match the key it was read from "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:339:            "(ns='{}', snapshot_id={}-{})",
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:340:            snapshot.ns, snapshot.snapshot_id.writer_epoch, snapshot.snapshot_id.ref_sequence,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:341:            expected_ns, expected_snapshot_id.writer_epoch, expected_snapshot_id.ref_sequence);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:343:    checkSnapshotInvariants(snapshot);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:344:    return snapshot;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:361:size_t snapshotFramingSize(const String & ns, const RefTxnId & snapshot_id, RefLifecycle lifecycle,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.cpp:367:    meta_only.snapshot_id = snapshot_id;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.cpp:56:    return 1;       /// everything else, INCLUDING '/', verbatim
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.cpp:78:/// escape; `/` and every other byte pass verbatim. (`writeStringValue`/`FormatSettings::JSON` may
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasProbe.cpp:21:    // Probe key used for the casPut chain.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasProbe.cpp:55:        // ---- Step 1: putIfAbsent fresh → Done; read-after-write returns the bytes. ----
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasProbe.cpp:58:            const auto res = backend.putIfAbsent(key, "probe-v1");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasProbe.cpp:62:                    "CasProbe: putIfAbsent on a fresh key returned PreconditionFailed — backend is unexpectedly occupied or broken");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasProbe.cpp:68:                    "CasProbe: read-after-write failed — putIfAbsent succeeded but the object is not readable");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasProbe.cpp:71:        // ---- Step 2: putIfAbsent same key → PreconditionFailed; bytes intact. ----
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasProbe.cpp:73:            const auto outcome = backend.putIfAbsent(key, "should-not-land").outcome;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasProbe.cpp:76:                    "CasProbe: putIfAbsent on an existing key was not rejected (PreconditionFailed expected) — "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasProbe.cpp:81:                    "CasProbe: putIfAbsent conflict was 'reported' but the original bytes were clobbered — "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasProbe.cpp:129:        // ---- Step 5: casPut chain. ----
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasProbe.cpp:133:            const auto res = backend.casPut(cas_key, "cas-s1", std::nullopt);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasProbe.cpp:137:                    "CasProbe: casPut create-if-absent (nullopt expected) was not committed — "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasProbe.cpp:142:            const auto outcome = backend.casPut(cas_key, "cas-s1x", std::nullopt).outcome;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasProbe.cpp:145:                    "CasProbe: casPut with nullopt expected against an existing key was not Conflict — "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasProbe.cpp:146:                    "backend does not enforce create-if-absent semantics on casPut");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasProbe.cpp:151:            const auto outcome = backend.casPut(cas_key, "cas-s1y", stale).outcome;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasProbe.cpp:154:                    "CasProbe: casPut with a stale token was not Conflict — "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasProbe.cpp:162:                    "CasProbe: casPut conflicts were reported but the original bytes were altered");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasProbe.cpp:166:            const auto res = backend.casPut(cas_key, "cas-s2", ct1);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasProbe.cpp:169:                    "CasProbe: casPut with the current token was not committed — "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasProbe.cpp:170:                    "backend does not honor casPut with matching token");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasProbe.cpp:174:                    "CasProbe: casPut committed but new bytes are not readable");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.cpp:33:/// Wall-clock seconds since epoch — the `since` timestamp the lifecycle snapshot reports (spec §7). A
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.cpp:103:    /// code cannot tell them apart. So it must NOT promise recovery ("temporarily unreachable" would
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.cpp:109:            "loss the disk auto-recovers from) or terminal (a FORGET decommission or a lost identity, which "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.cpp:110:            "does NOT recover) — consult system.content_addressed_mounts for the disk's lifecycle before retrying",
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.cpp:181:void CasMountRuntime::retireBuildSeq(uint64_t seq)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.cpp:206:    /// Mint a nonzero equality-only identity. Keep it away from the zero/unarmed and UINT64_MAX/retired
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.cpp:229:    /// to adopt that exact slot rather than triggering its double-start guard. The keeper reads the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.cpp:240:    /// local BOOTTIME deadline, while a superseded or foreign renewal latches the fence and starts recovery.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.cpp:294:    /// snapshot reader that acquire-observes the forced state also observes the timestamp): 0 for `Live`,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.cpp:296:    /// from a real transition for the introspection snapshot.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.cpp:318:        /// The `since` the lifecycle snapshot reports for `not_live` — the wall-clock instant this became
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.cpp:332:        /// Back to `Live`: the lifecycle snapshot reports no `since` (0) for a live pool.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.cpp:347:    /// `since` for the `identity_lost` snapshot row — the wall-clock instant the observer proved the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.cpp:404:    /// The `since` the lifecycle snapshot reports for the `vanished` row — the wall-clock instant of the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.cpp:434:    /// the keeper's loss callback without depending on a recovery thread being spawned.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.cpp:439:    /// recovery thread. `remountTerminal()` covers a published terminal `Vanished` intent (`vanished_intent`,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.cpp:449:        remount_thread.join();   /// Reap a previous recovery before starting a new one.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.cpp:488:    /// Refuse further recovery arming under the same mutex used by `scheduleRemount`, before joining.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.cpp:489:    /// Thus a keeper callback racing with teardown cannot re-arm the recovery thread after the join.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.cpp:494:    /// Stop recovery first; it could otherwise recreate the keeper while the heartbeat is being retired.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.cpp:508:    /// durable owner and epoch. A failure, such as another incarnation touching the slot, must not escape
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPoolMeta.cpp:90:        const CasResult res = backend.casPut(key, encodePoolMeta(next), token);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPoolMeta.cpp:150:    if (backend.casPut(key, encodePoolMeta(pm), /*expected*/ std::nullopt).outcome == CasOutcome::Committed)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.h:55:    using Backend::putIfAbsent;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.h:56:    using Backend::putIfAbsentStream;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.h:58:    using Backend::casPut;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.h:89:    PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta) override;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.h:93:    /// to putIfAbsent (acceptable: this mode exists for unit tests only).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.h:94:    WriteSinkPtr putIfAbsentStream(const String & key, const ObjectMeta & meta) override;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.h:101:    CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected, const ObjectMeta & meta) override;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.h:114:    /// tag ⇒ distinct ETag from the condemned incarnation, INV-NO-RETURN), then a fresh HEAD for the ETag.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPlainObjects.h:86:    void casPutObject(const String & full_key, const String & bytes);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPlainObjects.h:94:    /// the same way as `casPutObject`.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInstrumentedBackend.h:22:///   <prefix>/cas/refs/..      → Root  (immutable ref logs, snapshots, and cleanup markers)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInstrumentedBackend.h:39:///   putIfAbsent / putIfAbsentStream finalize → Done ⇒ Put ; PreconditionFailed ⇒ PutDedup
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInstrumentedBackend.h:41:///   casPut                                    → Committed ⇒ Cas ; Conflict ⇒ CasConflict
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInstrumentedBackend.h:84:    using Backend::putIfAbsent;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInstrumentedBackend.h:85:    using Backend::putIfAbsentStream;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInstrumentedBackend.h:87:    using Backend::casPut;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInstrumentedBackend.h:130:    PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta) override
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInstrumentedBackend.h:132:        PutResult result = inner->putIfAbsent(key, bytes, meta);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInstrumentedBackend.h:138:    WriteSinkPtr putIfAbsentStream(const String & key, const ObjectMeta & meta) override;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInstrumentedBackend.h:151:    CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInstrumentedBackend.h:154:        CasResult result = inner->casPut(key, bytes, expected, meta);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInstrumentedBackend.h:179:    /// destination is the same deduplication outcome as `putIfAbsent`.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInstrumentedBackend.h:189:    /// wrapped backend remains responsible for its fresh-header and condemned-token guarantees.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInstrumentedBackend.h:194:        /// An unconditional resurrect re-upload overwrites the (condemned) BLOB key.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPlainObjects.cpp:21:void CasPlainObjects::casPutObject(const String & full_key, const String & bytes)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPlainObjects.cpp:46:            if (backend.putIfAbsent(full_key, bytes).outcome == PutOutcome::Done)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPlainObjects.cpp:73:    /// rev.7 [C2]: same fence-generation admission as `casPutObject` -- the admitted generation is
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPlainObjects.cpp:93:    casPutObject(layout.namespaceFileKey(ns, name), bytes);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPlainObjects.cpp:132:    casPutObject(layout.mountpointObjectKey(key), bytes);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:52:    extern const Event CasRefAppendDefiniteFailure;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:79:/// `Recover` path falls through to the existing fresh-incarnation recovery; every other verdict is
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:83:    Recover,        /// `_pool_meta` present + identity matches: proceed with the existing recovery.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:184:    /// preserving the original member order verbatim (see the header note).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:200:    /// recovery ORCHESTRATION stays on Pool). The callback captures `this`; it is invoked only at runtime
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:202:    /// verbatim (mount destroyed first, ledger last; both orders proven safe -- see the header note).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:270:/// fence, the per-server build watermark, the live-incarnation epoch, and the self-remount recovery
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:311:    /// snapshot always agree. No `content-addressed pool '<id>' ` prefix (callers add it if they want one).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:410:            /// `<pool>/_probe/cas` keys. Without this, the loser of the `putIfAbsent` race aborts startup
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:502:    /// recoverable — a fence costs an epoch, so the fence-recovery loop below re-allocates a fresh
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:506:    /// uniformly to every call below, including the fence-recovery re-allocations, where it is inert
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:550:    /// Mount-slot writer audit (the "foreign writer" instrument): route every mount-slot
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:559:    /// Crash-recovery (`WaitForExpiry` only): a hard-killed prior incarnation leaves a stale,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:567:    /// Fence-recovery loop: if the GC fences our own fresh lease while we are opening
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:571:    /// ways: `claimMount` observes an already-fenced own slot (`FencedSelf`), or the keeper's adopt
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:581:    constexpr int max_fence_recoveries = 3;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:582:    for (int fence_recovery = 0; ; ++fence_recovery)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:602:            if (fence_recovery >= max_fence_recoveries)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:605:                    "({} recoveries exhausted) — a fresh writer_epoch kept being fenced before we "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:607:                    srid, max_fence_recoveries);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:630:        /// -- which ADOPTS that very (uuid, epoch) slot rather than self-tripping the double-start guard --
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:646:            if (fence_recovery >= max_fence_recoveries)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:658:    /// incarnation starts trusting its recovery listings -- `Fenced` and `UncleanObserved` are
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:683:            "requests before trusting recovery listings", srid, t_mat);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:698:        /// anything took the slot meanwhile -- and arm from the new attempt's anchor (rev.4
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:735:    /// below is then EXACTLY the crash-recovery reclaim semantics (`MountClaimPolicy::NoWait`): a
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:747:                "Nothing to decommission; if victim objects linger without a slot, run ca-fsck.",
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:783:    /// 1. Stop + join the self-remount recovery thread FIRST (it may otherwise re-create the keeper
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:820:    /// would double-retire the keeper. `IdentityLost`/`TransientNotLive`/`Live` all proceed (FORGET is
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:853:    /// such raced reclaim. Idempotent; the durable mount lease the reclaim wrote is retired by the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:940:    /// through to the existing recovery below; every other verdict resolves here and returns false.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:952:                /// bring the disk back — the state is terminal; only a restart recovers.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:955:                break;   /// fall through to the existing fresh-incarnation recovery.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:980:                /// Uncertain — remain transient and let the recovery loop retry.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:987:    /// (startup is fail-closed); the remount RETURNS false instead — the recovery loop retries.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:993:        /// Mount-slot writer audit: `this` is already fully open (setEventSink ran long ago), so
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:1020:        /// ref-log conditional `PUT` from the dying epoch could still land after recovery starts trusting
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:1032:        /// its failed renew; never run its terminal op (the slot now belongs to the new claim).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:1062:        /// 2. Drain publishers and drop the cached tables so each re-recovers under the new epoch on next
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:1073:            "CAS self-remount '{}': recovered as writer_epoch {} (fresh incarnation; older builds fail closed)",
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:1080:            e.reason = "self-remount recovered a fresh mount incarnation after fence-out / renewal failure";
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:1097:            e.reason = "self-remount attempt failed; the recovery loop retries with backoff";
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:1105:/// The self-remount recovery thread + the merged-heartbeat renew live in `mount_runtime`
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:1107:/// bound to `Pool::tryRemountOnce` (the claim/recovery orchestration that stays on Pool).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:1123:void Pool::retireBuildSeq(uint64_t seq)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:1125:    mount_runtime.retireBuildSeq(seq);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:1136:    /// added to the active set here and retired on publish/abandon/dtor, so minActive — the GC floor
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:1141:    SCOPE_EXIT({ if (!registered) retireBuildSeq(seq); });
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:1144:    /// Register for `dropNamespace`'s post-durable build cancellation. weak_ptr:
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:1145:    /// the wiring owns the returned shared_ptr; `retireBuildSeq` (publish/abandon/dtor) removes the entry.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:1324:    /// from ref shards under `cas/refs/` UNION verbatim-file namespaces under `roots/`.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:1331:    /// `cas/refs/`: ref-object keys are `<pool_prefix>/cas/refs/<ns>/_log|_snap|_cleanup/<txn-id>`.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:1357:    /// `roots/`: verbatim-file keys are `<pool_prefix>/roots/<ns>/_files/<name>`.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:1374:                    continue;   /// plain mountpoint object (not a namespaced verbatim file); skip
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:1391:    /// names. NOT authoritative — callers must re-check `listRefs` per candidate before surfacing
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:1394:    /// A namespace's presence is split across two physical subtrees — its ref-log/snapshot
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:1395:    /// objects live under `cas/refs/<ns>/_log|_snap|_cleanup/…` while its verbatim files and PLAIN
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:1399:    /// bindings, so its data is reachable through the ref objects rather than as verbatim `_files`) is
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:1444:std::map<String, Resolved> Pool::listRefs(const RootNamespace & ns)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:1446:    return ref_ledger.listRefs(ns);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:1465:DropNamespaceStats Pool::dropNamespace(const RootNamespace & ns)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:1467:    return ref_ledger.dropNamespace(ns);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.cpp:30:        case RefOpKind::RemoveNamespace: return "remove_namespace";
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.cpp:40:    if (w == "remove_namespace")  return RefOpKind::RemoveNamespace;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.cpp:203:            /// `set_published_at`). The retired op WORD is already rejected by `opKindFromWord`, but this
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.cpp:356:    /// Header + meta + the terminal remove_namespace op + trailer(op_count). `op_count` counts every op
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.cpp:357:    /// including the remove_namespace op (i.e. committed + precommits + 1).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h:35:/// Durable single-writer-slot state machine used by the per-server merged heartbeat
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h:48:///   - `encodeBody`       — builds the slot's exact JSON bytes for a given `seq` and payload;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h:49:///   - `claim`            — the slot-specific anchor sequence in `start` (the watermark's
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h:50:///                          head→putIfAbsent/putOverwrite dance), returning the token we now hold;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h:62:    /// `slot_name_` is the noun in every message ("watermark"); `terminal_verb_` is the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h:65:        BackendPtr backend_, String key_, std::string_view slot_name_, std::string_view terminal_verb_,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h:69:    /// the slot persisted, with its seq no longer advancing, so full GC observes frozen state.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h:81:    /// renewal failure or from destruction; it does not perform the slot's terminal operation.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h:87:    /// token. `value2` is a second scalar for slots that renew more than one dynamic field per beat (the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h:128:    /// other writer can claim the slot before that deadline, so continuing to retry (not fencing) is
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h:138:    /// Runs the slot's terminal op against the held `last_token`. Called under `state_mutex` with
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h:144:    /// Anchors the slot for seq=1 — durable when `doStart` returns. Subclasses expose this under their
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h:168:    std::string_view slot_name;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h:256:///   - owner present and tombstoned → throw `CORRUPTED_DATA` (explicitly retired — fail closed);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h:258:///   - owner absent AND the subtree is provably empty → `putIfAbsent` the owner (claim);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h:288:///   - otherwise read `next = current.next_writer_epoch`, `casPut` `{next + 1}` against the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h:308:/// slot. Decision over `get(mountKey)`:
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h:309:///   - absent → write our body via `putIfAbsent` → `Claimed`;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h:346:    /// every other `Kind`, and for the absent-slot / same-epoch-refresh `Claimed` cases).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h:351:    /// used to re-GET the mount key itself just to recover this token that `claimMount` had already
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h:357:/// Thrown when a mount operation observes that OUR OWN (uuid, epoch) slot was `gc_fenced` by the GC
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h:385:/// Observation-based mount claim for restart recovery.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h:472:/// without a fresh `open`. Liveness: a dead server's stale mount slot must not linger forever.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h:473:/// Preserving the body keeps restart recovery intact: a same-uuid reopen reads the current body and
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h:489:/// A read-only snapshot of one server's mount slot, for introspection (`system.content_addressed_mounts`).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h:500:/// Enumerate every mount slot under `gc/server-roots/`, decoded and classified — the read-only sibling
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h:501:/// of `computeHeartbeatFloor`: ZERO writes (no fence-out), per-row fail-open. One LIST + one GET per slot.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h:506:/// clock and the build-watermark floor together. Anchors the slot synchronously on `start`, renews it
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h:519:///   - absent → `putIfAbsent`; expired-our-uuid (any epoch) → `putOverwrite` reclaim.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h:520:/// After `start`, `renewOnce` (base) keeps the slot alive and already fails closed on a foreign touch.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h:537:    /// Claims (adopts) the mount slot for (server_uuid, writer_epoch) with seq following the observed
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h:569:    /// Encodes one complete mount body, combining the sequence assigned by the base slot with the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h:574:    /// from the durable write that the base slot must retain for its next token-guarded renewal.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h:591:    /// owns the mount slot.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h:666:/// `cas/manifests/` (see `CasLayout.h`) — so a `staging/` object is never listed, HEAD'd, or condemned by
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:75:/// The `on_page_fetched` hook GC passes to every `forEachListedKey`/`recoverRefTable`
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:89:/// promote gate; the ledger retired-set + the exact-token body delete remain the actual safety
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:93:/// below assumes the marker was durably written before the delete fires; a swallowed condemn-marker
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:105:/// spare's meta then lost its round CAS would leave a durable stray-`Clean` over a still-condemned body;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:106:/// a writer reading `Clean` would reuse the exact condemned token, which a stale pre-CAS exact-token
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:107:/// redelete then deletes -- live-blob data loss (INV_NO_LOSS). Removing the clear restores the exact-token
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:108:/// delete argument in full: once a hash is `Condemned`, observing `Clean` means EITHER the condemned body
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:112:/// Write the per-hash meta to Condemned: a blob newly entering the retired set this round (either the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:113:/// fresh zero-in-degree condemn, or a resurrect-supersede re-condemn of the current token). Absent meta
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:114:/// is created fresh; an already-Condemned meta (a racing condemn, or a replay of this same round) is left
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:115:/// alone rather than clobbering a possibly-newer condemn_round.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:121:bool writeCondemnedMeta(Pool & pool, const BlobRef & ref, uint64_t condemn_round, uint64_t size)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:124:    const BlobMeta desired{.state = MetaState::Condemned, .condemn_round = condemn_round, .size = size};
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:134:/// means not condemned"). Idempotent: an already-absent meta, or one a racing writer/GC pass already
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:146:uint64_t retiredLogicalSize(ObjectKind kind, uint64_t object_size, uint64_t blob_header_len)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:152:            "CAS gc retire: blob object of {} bytes is smaller than the pool's fixed blob header ({} bytes)",
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:254:                                    uint64_t condemn_round, uint64_t size)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:256:    scheduleMetaJob([this, ref, token, condemn_round, size]()
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:258:        if (writeCondemnedMeta(*store, ref, condemn_round, size))
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:267:    std::lock_guard lock(condemn_marker_mutex);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:268:    condemn_markers_confirmed.emplace(ref, token.value);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:271:bool Gc::condemnMarkerConfirmedInProcess(const BlobRef & ref, const Token & token)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:273:    std::lock_guard lock(condemn_marker_mutex);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:274:    return condemn_markers_confirmed.contains({ref, token.value});
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:279:    std::lock_guard lock(condemn_marker_mutex);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:280:    condemn_markers_confirmed.erase({ref, token.value});
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:333:    /// PHASE 2/18 `heartbeat_floor`: one LIST of `gc/server-roots/`, one GET per mount slot, and a fence
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:382:    /// slow idle/small-delta round no longer rebuilds the whole in-degree snapshot. Safety: a due
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:383:    /// graduation forces a FOLD (graduationDue), so no destructive decision runs on a stale snapshot.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:442:                           "is due; re-adopting the sealed generation (snapshot rebuild elided)";
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:458:        e.reason = "R2: one-pass fold (edges x deltas x retired) into a new durable generation";
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:479:    /// The pass performs discovery, windowing, and the three-cursor merge (spare / graduate / condemn).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:502:    /// PHASE 11/18 `pending_deletes`, covering both the exact-token delete loop and the outcome-log
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:506:    std::optional<GcPhaseTimer> pending_deletes_timer;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:507:    pending_deletes_timer.emplace(phase_sink, "pending_deletes");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:511:    for (uint64_t shard = 0; shard < folded.retired_merge.size(); ++shard)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:513:        RetiredMergeResult & merge = folded.retired_merge[shard];
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:560:                e.detail = {{"condemn_round", std::to_string(entry.condemn_round)},
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:576:            /// The entry left the pipeline — drop its in-process condemn-marker confirmation.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:581:            /// A fresh dedup-adopt raced the condemn (see the matching CasGcFold Debug log emitted
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:586:                    "CAS gc: delete_pending blob {} (condemned at round {}, this round {}) recovered "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:587:                    "in-degree -- a fresh dedup-adopt raced the condemn; spared (never a fail-closed delete)",
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:588:                    blobIdOf(entry.ref), entry.condemn_round, new_round);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:599:                e.reason = "in-degree recovered in the pass merge; entry dropped";
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:605:            /// meta. GC freshness meta is add-only — GC never publishes `Clean`. The in-degree recovered,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:610:            /// condemned token and lose the reuse to a stale exact-token redelete (INV_NO_LOSS); see
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:613:            /// The entry left the pipeline — drop its in-process condemn-marker confirmation.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:630:                e.reason = "condemn_round < current_round; published delete_pending (two-phase graduation)";
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:631:                e.detail = {{"condemn_round", std::to_string(entry.condemn_round)}};
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:638:            /// RESURRECT-REUPLOAD-ORPHAN: the current object token differed from a stale retired entry;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:639:            /// the fold superseded that entry and re-condemned the current token in the same window.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:652:                e.reason = "current object token differs from the retired entry — resurrect replaced the "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:653:                           "incarnation; superseded the stale entry and re-condemned the current token";
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:656:            /// The supersede is ALSO a blob entering the retired set fresh (a re-condemn of the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:657:            /// CURRENT token) — write the meta Condemned exactly like a fresh `head_blob` condemn would,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:662:            scheduleCondemnMarkerWrite(entry.ref, entry.token, entry.condemn_round, entry.size);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:673:        if (backend.putIfAbsent(key, body).outcome == PutOutcome::PreconditionFailed)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:678:                    "CAS gc: outcome log at {} vanished between putIfAbsent and read", key);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:700:    pending_deletes_timer->metric("redeleted", report.redeleted - redeleted_before);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:701:    pending_deletes_timer->metric("graduated", report.graduated - graduated_before);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:702:    pending_deletes_timer->metric("deleted", report.deleted);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:703:    pending_deletes_timer->metric("absent", report.absent);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:704:    pending_deletes_timer->metric("replaced", report.replaced);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:705:    pending_deletes_timer->metric("spared", report.spared);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:706:    pending_deletes_timer->metric("outcome_logs_written", outcomes.size());
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:707:    pending_deletes_timer.reset();   /// emits the `pending_deletes` row
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:709:    /// Wait for the round's whole batch of per-hash freshness-meta writes (condemned during the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:710:    /// fold above, spared/redeleted-confirmed during R3 above) BEFORE the round's retired-list publish and
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:711:    /// its single gc/state CAS below — the writer's meta point-read gate must see this round's condemns
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:735:    /// Retired-in-snapshot — there is NO separate retired-list object to publish anymore. The
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:736:    /// round's surviving condemned entries were already sealed as `kCondemned` rows inside the fold's
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:738:    /// `condemned_summary` the seal carries makes the next round's graduation/carry decisions zero-I/O.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:772:    const CasResult res = backend.casPut(layout.gcStateKey(), encodeGcState(next), state_token);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:783:    /// Task 7: the retire pipeline's REMAINING sizes, read from the seal this round's CAS just
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:784:    /// committed (`folded.fold_seal.condemned_summary` is TOTAL over every gc-shard -- see its own doc
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:786:    for (const auto & [shard, summary] : folded.fold_seal.condemned_summary)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:788:        report.pending_retired += summary.pending_total;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:789:        report.pending_candidates += summary.condemned_total - summary.pending_total;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:790:        report.pending_condemned += summary.condemned_total;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:797:    /// it — a ref that later moves off it would strand that generation's WHOLE prefix (fold seal, retired/
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:843:        for (const auto & [id, token] : folded.mf_cleanup)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:862:        t.metric("attempted", folded.mf_cleanup.size());
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:868:    /// deletes; the idempotent marker / `Removed`-snapshot republication for a Completed item still runs.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:871:    /// snapshot for a Completed item (via idempotent putIfAbsent) -- and only after that snapshot is
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:872:    /// durable may `cleanupRefObjects` delete the logs it covers: a covering snapshot is
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:873:    /// always durable before any deletion it authorizes"). A concurrent recovering reader that misses this
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:875:    /// `Removed` snapshot -- a complete constant-size state with no tail to replay. Running cleanup first
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:876:    /// (the previous order) left the completing round unable to see its own just-published snapshot, so a
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:880:    /// PHASE 16/18 `namespace_cleanup`.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:882:        GcPhaseTimer t(phase_sink, "namespace_cleanup");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:885:        for (const auto & [key, item] : folded.fold_seal.ns_cleanup_items)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:888:        t.metric("items", folded.fold_seal.ns_cleanup_items.size());
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:893:    /// PHASE 17/18 `ref_object_cleanup`. Emitted even when the whole pass is skipped (`trim_enabled` is
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:897:        GcPhaseTimer t(phase_sink, "ref_object_cleanup");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:926:                           std::map<ManifestId, Token> & mf_cleanup, uint32_t txn_ordinal)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1002:        mf_cleanup.emplace(id, got->token);   /// owner removed: defer exact-token body delete to recheck
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1013:    /// 1. One global paginated LIST of cas/refs/, grouped into per-table (log / snapshot / cleanup-marker)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1017:    /// PHASE 5/18 `fold_ref_list`, covering the LIST, `groupRefKeys`, and probe A -- everything that
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1049:        ref_tables = groupRefKeys(layout, ref_object_keys);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1086:    probe_a_holes_this_round = 0;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1197:        probe_a_holes_this_round = holes;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1201:    /// Probe A's per-round verdict, on every round, healthy or not: a column that is always 0 is what
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1202:    /// makes the one round where it is not stand out. See `Gc::probe_a_holes_this_round`.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1203:    ref_list_timer->metric("probe_a_holes", probe_a_holes_this_round);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1213:    /// empty would re-fold only journal tails and mass-condemn everything the lost snapshot
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1229:            "gc/state — GC bookkeeping is corrupt. GC refuses to run; recover with "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1230:            "SYSTEM CONTENT ADDRESSED GC REBUILD.",
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1235:    /// Retired-in-snapshot: the prior generation's condemned entries RIDE the source-edge run as
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1236:    /// `kCondemned` sentinel rows, so the round no longer reads any separate retired-list object —
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1237:    /// the parent seal's `blob_target_runs` ARE the retired input. The per-gc-shard `condemned_summary`
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1238:    /// the seal carries below is distilled from the `still_retired` rows each shard re-emits, making the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1240:    const uint64_t condemn_round = state.round + 1;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1241:    result.retired_merge.resize(state.gc_shards);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1244:    /// the eventual delete carries (absent => a prior landed delete => nothing to condemn). Emits the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1253:            e.round = condemn_round;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1264:            e.round = condemn_round;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1272:        ++report.condemned;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1280:            e.round = condemn_round;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1282:            e.outcome = "retired";
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1283:            e.reason = "condemned zero-in-degree candidate; entering the current retired list";
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1286:        adjusted.size = retiredLogicalSize(ObjectKind::Blob, observed.size, store->poolMeta().blob_header_len);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1289:        /// side-effecting condemn site. Write the meta Condemned so the writer's point-read gate
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1293:        scheduleCondemnMarkerWrite(ref, observed.token, condemn_round, adjusted.size);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1299:    /// retired entry, but must NOT emit the fresh-condemn trail or bump `CasGcRetiredCondemned` — that
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1301:    /// own event is `blob_retire_replaced`, emitted once below from `merge.replaced`. Plain HEAD, no
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1308:        hr.size = retiredLogicalSize(ObjectKind::Blob, hr.size, store->poolMeta().blob_header_len);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1322:    const auto confirm_condemned_marker = [&](const RetiredEntry & entry) -> bool
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1324:        if (condemnMarkerConfirmedInProcess(entry.ref, entry.token))
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1338:                "CAS gc: condemn-marker re-check failed to read the meta (treated as missing evidence; "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1344:        /// retry, the retry stamps `Condemned` over that writer's live, uncondemned incarnation. This is
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1348:        scheduleCondemnMarkerWrite(entry.ref, entry.token, entry.condemn_round, entry.size);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1382:    /// `condemned_summary` (the pure-carry decision). A completed round leaves its fold seal there; a fresh
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1383:    /// pool has none (empty seal). Under the snapshot+log ref model there is no per-shard token-diff Skip:
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1398:    seal_read_timer->metric("ns_cleanup_items", discover_ref_seal.ns_cleanup_items.size());
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1401:    /// Each fully-folded remove_namespace transaction seeds a namespace-cleanup item.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1435:        /// newest snapshot have all been cleaned means a prior fold advanced+cleaned them and then gc/state
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1436:        /// was lost -- folding from {0,0} would miss those edges and mass-condemn their blobs. Fail closed;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1437:        /// recover with the explicit rebuild. A fresh table (writer already snapshotted, logs still present)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1438:        /// passes because its logs at or below the snapshot survive.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1439:        if (cursor_it == parent_cursors.end() && !listing.snapshots.empty())
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1441:            const RefTxnId newest_snapshot = listing.snapshots.back();
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1442:            const bool logs_below_snapshot_gone = listing.logs.empty() || newest_snapshot < listing.logs.front();
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1443:            if (logs_below_snapshot_gone)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1445:                    "CAS GC baseline guard: table {} has snapshot {} but no surviving log at or below it and "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1447:                    "run; recover with SYSTEM CONTENT ADDRESSED GC REBUILD.",
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1448:                    ns_str, renderRefTxnId(newest_snapshot));
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1513:            std::map<ManifestId, Token> log_mf_cleanup;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1517:                if (foldManifestEdges(edge.manifest_id, edge.change, log_deltas, log_mf_cleanup,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1575:                break;   /// discard the staged log_deltas / log_mf_cleanup (never merged) and stop this table
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1583:            for (const auto & [mid, tok] : log_mf_cleanup)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1584:                result.mf_cleanup.emplace(mid, tok);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1586:            /// A fully-folded remove_namespace transaction hands its {ns, remove_txn_id} to the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1608:    /// every ref delta and cursor advance already accumulated, carry each table's parent cursor verbatim,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1614:        result.mf_cleanup.clear();
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1674:    /// item for each remove_namespace transaction folded this round (skipped on a ref-folding abort), and
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1675:    /// promote a Pending item to Completed once its physical `@cas@` prefixes (manifest bodies + verbatim
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1679:    /// PHASE 8/18 `fold_ns_cleanup_scan`: TWO prefix LISTs per not-yet-Completed item
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1683:    ns_scan_timer.emplace(phase_sink, "fold_ns_cleanup_scan");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1684:    result.fold_seal.ns_cleanup_items =
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1685:        adopted_seal ? adopted_seal->ns_cleanup_items : std::map<String, RefNsCleanupItem>{};
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1686:    const uint64_t ns_items_carried = result.fold_seal.ns_cleanup_items.size();
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1693:            result.fold_seal.ns_cleanup_items[key] = RefNsCleanupItem{
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1696:    for (auto & [key, item] : result.fold_seal.ns_cleanup_items)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1708:    /// global LIST -- the `_cleanup` marker present AND (the `Removed` snapshot present OR superseded by a
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1709:    /// newer Live snapshot). Carrying Completed items forever grows the seal unboundedly and, once a
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1710:    /// removed namespace is recreated (whose Live snapshot supersedes the `Removed` one, which cleanup
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1711:    /// then deletes), drives a per-round republish/delete churn. Gate retirement on ARTIFACT presence,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1712:    /// not marker-only: a `Removed` snapshot lost to a crash between the two publishes (no recreation)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1713:    /// must still be repaired by the Completed branch before the item retires. Skipped on a ref-folding
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1714:    /// abort (the LIST may be incomplete); a later clean round retires it.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1716:        for (auto it = result.fold_seal.ns_cleanup_items.begin(); it != result.fold_seal.ns_cleanup_items.end();)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1719:            bool retire = false;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1727:                    const bool removed_snapshot_present =
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1728:                        std::find(listing.snapshots.begin(), listing.snapshots.end(),
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1729:                                  item.remove_txn_id) != listing.snapshots.end();
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1731:                        !listing.snapshots.empty() && item.remove_txn_id < listing.snapshots.back();
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1732:                    retire = marker_present && (removed_snapshot_present || superseded_by_newer);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1734:            if (retire)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1735:                it = result.fold_seal.ns_cleanup_items.erase(it);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1743:    ns_scan_timer->metric("items_final", result.fold_seal.ns_cleanup_items.size());
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1744:    ns_scan_timer.reset();   /// emits the `fold_ns_cleanup_scan` row
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1756:    /// AND an EMPTY retired input list neither reads nor writes its run — the new fold_seal copies the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1759:    /// An empty delta with a NON-EMPTY retired list still runs the merge: settlement must happen every
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1761:    /// Distill one shard's `condemned_summary` entry from the `kCondemned` rows it re-emitted this pass
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1762:    /// (`still_retired` mirrors those rows exactly). Folding shards call this; it makes the next
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1767:        s.condemned_total = still.size();
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1773:                s.oldest_nonpending_condemn_round =
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1774:                    std::min(s.oldest_nonpending_condemn_round, e.condemn_round);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1778:    /// The parent seal's summary for a shard, used ONLY for the pure-carry DECISION (condemned_total==0).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1783:        const auto it = discover_ref_seal.condemned_summary.find(shard);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1784:        return it != discover_ref_seal.condemned_summary.end() ? it->second : CondemnedSummary{};
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1791:                result.fold_seal.blob_target_runs.push_back(r);   /// verbatim: parent key/checksum/gen
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1792:        /// Totality: a pure-carry shard settled nothing, so its `condemned_summary` entry is the parent's
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1797:            result.fold_seal.condemned_summary[shard] = CondemnedSummary{};
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1800:            const auto sit = discover_ref_seal.condemned_summary.find(shard);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1801:            if (sit == discover_ref_seal.condemned_summary.end())
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1803:                    "CAS gc fold: parent fold seal (generation {}, attempt {}) lacks a condemned_summary "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1806:            result.fold_seal.condemned_summary[shard] = sit->second;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1820:    /// must not graduate NOR execute pending deletes (the merge carries everything; condemnation
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1831:    const uint64_t condemned_before = report.condemned;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1848:        if (!folded_any && summaryOfParent(0).condemned_total == 0)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1850:            /// Pure ref-carry: nothing changed and no condemned entries to settle => zero run I/O. Carry the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1857:            /// Either a real delta or a non-empty retired input: run the merge (empty deltas still settle
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1862:                                     current_round, condemn_round, head_blob, peek_head,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1863:                                     confirm_condemned_marker,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1864:                                     result.retired_merge.data(), suppress_destructive,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1866:            result.fold_seal.condemned_summary[0] = summarize(result.retired_merge[0].still_retired);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1886:            if (buckets[shard].empty() && summaryOfParent(shard).condemned_total == 0)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1888:                /// Pure ref-carry for this shard: empty delta + no condemned entries => zero run I/O.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1900:                               current_round, condemn_round, head_blob, peek_head,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1901:                               confirm_condemned_marker,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1902:                               &result.retired_merge[shard], suppress_destructive,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1906:            result.fold_seal.condemned_summary[shard] = summarize(result.retired_merge[shard].still_retired);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1918:        for (const RetiredMergeResult & merge : result.retired_merge)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1942:        for (const RetiredMergeResult & merge : result.retired_merge)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1953:        reduce_timer->metric("condemned", report.condemned - condemned_before);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1963:    /// object had no reader — the manifest cleanups execute inline from `result.mf_cleanup` (below /
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1964:    /// the recheck path), so the durable bundle was pure dead weight. `result.mf_cleanup` is unchanged.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1994:            "cursor past a transaction it never applied. GC refuses to commit the round; recover with "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:1995:            "SYSTEM CONTENT ADDRESSED GC REBUILD.",
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2007:            "recover with SYSTEM CONTENT ADDRESSED GC REBUILD.",
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2017:        t.metric("ns_cleanup_items", result.fold_seal.ns_cleanup_items.size());
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2022:    /// in-memory here and committed — together with the round, the retired refs, and the retention
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2048:    const CasResult res = store->backend().casPut(store->layout().gcStateKey(), encodeGcState(next), state_token);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2085:    /// A remove_namespace log is retained until its namespace-cleanup item is durably Completed:
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2087:    /// Once Completed, the item's `remove_txn_id` also names the constant-size `Removed` snapshot -- the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2088:    /// covering snapshot of the WHOLE tail (every log id <= remove_txn_id). `runNamespaceCleanupPasses`
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2089:    /// ran first this round and made that snapshot durable (idempotent putIfAbsent), so we hand its id to
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2090:    /// `planRefCleanup` as a covering snapshot even when the writer never published it and this round's
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2095:    for (const auto & [key, item] : folded.fold_seal.ns_cleanup_items)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2100:            RefTxnId & slot = completed_removals[item.ns.string()];
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2101:            if (slot < item.remove_txn_id)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2102:                slot = item.remove_txn_id;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2132:        std::optional<RefTxnId> completed_removal_snapshot;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2134:            completed_removal_snapshot = cit->second;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2137:            planRefCleanup(listing, durable_cursor, removal_logs_blocked, completed_removal_snapshot);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2140:        for (const RefTxnId & snap_id : plan.deletable_snapshots)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2165:    for (const auto & [key, item] : seal.ns_cleanup_items)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2183:            /// (manifest bodies + verbatim files). NotFound/TokenMismatch tolerated.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2202:                        /// `_cleanup` marker's presence is the exact precondition for ANY recreation.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2215:                        /// above is the load-bearing guard; verbatim files carry no epoch and rely on it alone.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2237:            /// Removed snapshot, both derived from {namespace, remove_txn_id} alone. Winning this round's
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2240:            /// putIfAbsent is a no-op when present ("republish only if absent"). The `Removed` snapshot is
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2241:            /// republished ONLY when it is absent AND not superseded by a newer Live snapshot: a lost
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2242:            /// snapshot (crash between the two publishes, no recreation) is repaired, but a snapshot a
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2245:            backend.putIfAbsent(layout.refCleanupMarkerKey(item.ns, item.remove_txn_id), String{});
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2246:            bool removed_snapshot_present = false;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2251:                removed_snapshot_present = std::find(listing.snapshots.begin(), listing.snapshots.end(),
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2252:                                                     item.remove_txn_id) != listing.snapshots.end();
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2253:                superseded_by_newer = !listing.snapshots.empty() && item.remove_txn_id < listing.snapshots.back();
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2255:            if (!removed_snapshot_present && !superseded_by_newer)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2259:                removed.snapshot_id = item.remove_txn_id;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2262:                backend.putIfAbsent(layout.refSnapshotKey(item.ns, item.remove_txn_id),
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2330:    /// its fold_seal/runs/cleanup AND its attempt-scoped retired/outcomes sets under its OWN unadopted
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2334:    /// the retired/ and outcomes/ sets that now live under `gc/gen/<g>/attempt/<a>/`. Bounded per round;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2396:    /// Under the snapshot+log ref model there is one immutable-object stream per table (no numeric shards),
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2416:    /// Retired-in-snapshot: the graduation signal is read from the adopted fold seal's per-shard
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2417:    /// `condemned_summary` — ZERO backend I/O beyond the single seal read. A summary distilled from this
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2419:    /// is already published) and the oldest non-pending condemn round (one crosses the floor once
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2420:    /// `condemn_round < current_round`).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2422:        return false;   /// fresh pool: nothing condemned yet, nothing to graduate.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2440:        const auto it = seal->condemned_summary.find(shard);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2441:        if (it == seal->condemned_summary.end())
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2443:        if (it->second.pending_total > 0 || it->second.oldest_nonpending_condemn_round < current_round)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2454:    /// here; the fold's own `groupRefKeys` does the strict validation and round-abort.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2488:RebuildReport Gc::rebuildBaseline(bool force)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2490:    /// The `gc/state` disaster-recovery command.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2495:    RebuildReport rep;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2501:    /// is claimed, the seal + every referenced run + every retired list are HEAD-present.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2515:                    /// guard: a snapshot with no surviving log at or below it (its covered logs were cleaned
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2522:                        const auto grouped = groupRefKeys(layout, table_keys);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2524:                        if (git != grouped.end() && !git->second.snapshots.empty()
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2525:                            && (git->second.logs.empty() || git->second.snapshots.back() < git->second.logs.front()))
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2558:    /// manual disaster-recovery command, same reasoning as the manual GC round (runRegularRound's doc
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2602:    /// Retired-in-snapshot: the final flush folds the orphan condemn synth deltas ALONGSIDE the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2603:    /// edges into one run, so `condemn_seed_head` (the captured tokens/sizes) and `condemn_round_stamp`
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2606:    /// edge-only fold (`foldDeltasIntoGeneration` defaults: no head_blob condemns, current_round 0
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2608:    std::function<std::optional<HeadResult>(const BlobRef &)> condemn_seed_head;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2609:    uint64_t condemn_round_stamp = 0;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2617:                                 /*current_round*/0, /*condemn_round*/condemn_round_stamp, condemn_seed_head,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2618:                                 /*peek_head*/{}, /*confirm_condemned_marker*/{},
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2619:                                 /*out_retired*/nullptr, /*suppress_destructive*/false,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2628:    /// `edge_bearing` is `BlobRef`-keyed natively; the pipeline-blindness LIST/HEAD
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2632:    std::unordered_set<BlobRef, BlobRefHash> edge_bearing;   /// O(distinct blobs) — maintenance op
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2638:            edge_bearing.insert(d.ref);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2655:    std::map<ManifestId, Token> mf_cleanup_unused;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2662:        /// Recover the table via the shared snapshot+tail equation: the current
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2665:        const RefTableState st = recoverRefTable(backend, layout, ns, onGcEnumerationPage);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2679:            if (!foldManifestEdges(id, +1, deltas, mf_cleanup_unused, /*txn_ordinal=*/0))
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2695:            if (foldManifestEdges(id, +1, deltas, mf_cleanup_unused, /*txn_ordinal=*/0))
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2730:            if (foldManifestEdges(id, +1, deltas, mf_cleanup_unused, /*txn_ordinal=*/0))
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2742:    /// FULL-TRAVERSAL knowledge, so it condemns them itself: every physically-present blob with
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2743:    /// zero rebuilt edges is condemned at the minted round. Graduation still waits for every mount to
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2745:    /// condemnation the next pass would perform if the fold were omniscient. This LIST/HEAD sweep runs
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2746:    /// BEFORE the run flush (retired-in-snapshot): the orphans are folded into the SAME single flush
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2748:    /// `edge_bearing` set from the traversal above.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2749:    std::vector<std::vector<RetiredEntry>> zero_condemned(gc_shards);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2760:                return;   /// foreign key shape (`.meta` sibling, unknown algo, wrong width) — not ours to condemn
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2762:            if (edge_bearing.contains(ref))
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2767:            zero_condemned[blobShard(ref, gc_shards)].push_back(RetiredEntry{
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2773:    /// condemn_round stamped on the full-traversal condemns folded into the runs below).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2776:    /// Publish the per-hash condemn marker for EVERY full-traversal condemn SYNCHRONOUSLY (the rebuild
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2781:    /// entry enters the retired set UNCONFIRMED — the graduation gate then carries it (and retries the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2785:        for (const RetiredEntry & e : zero_condemned[shard])
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2796:                    "CAS gc rebuild: condemn-marker write failed; the entry enters the retired set "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2802:    /// Retired-in-snapshot seeding: append each full-traversal condemn's synthetic +edge/-edge
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2804:    /// bucket, and expose the already-captured exact token/size through `condemn_seed_head`. The SINGLE
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2805:    /// `flush_shard` below then folds these alongside the real edges: the fold's own fresh-condemn path
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2806:    /// mints a `kCondemned` sentinel row at `round` for each. The condemn set is disjoint from
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2808:    /// each row FROM THE RUN (the fold no longer takes a separate retired-set input).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2809:    std::unordered_map<BlobRef, HeadResult, BlobRefHash> condemn_seeded;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2812:        for (const RetiredEntry & e : zero_condemned[shard])
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2814:            condemn_seeded.emplace(e.ref, HeadResult{.exists = true, .size = e.size, .token = e.token, .attributes = {}});
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2819:    condemn_seed_head = [&condemn_seeded](const BlobRef & ref) -> std::optional<HeadResult>
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2821:        const auto it = condemn_seeded.find(ref);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2822:        return it == condemn_seeded.end() ? std::nullopt : std::optional<HeadResult>(it->second);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2824:    condemn_round_stamp = round;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2833:    /// Also fence out any dead mounts as part of the disaster-recovery pass (liveness cleanup; the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2843:    /// Retired-in-snapshot: the rebuilt seal's `condemned_summary` must be TOTAL over gc_shards so a
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2845:    /// totality check does not fail closed). The full-traversal condemns seeded above are all fresh and
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2846:    /// non-pending, condemned at `round`.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2850:        cs.condemned_total = zero_condemned[shard].size();
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2851:        if (!zero_condemned[shard].empty())
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2852:            cs.oldest_nonpending_condemn_round = round;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2853:        seal.condemned_summary[shard] = cs;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2867:    /// Retired-in-snapshot: the orphan condemns now live as `kCondemned` rows IN the rebuilt runs
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2873:        zero_total += zero_condemned[shard].size();
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2874:    const CasResult res = backend.casPut(layout.gcStateKey(), encodeGcState(next), state_token);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2886:        e.type = CasEventType::GcRebuild;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2891:        e.reason = "raw baseline rebuild from owner state (gc/state disaster recovery)";
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2899:                    {"zero_condemned", std::to_string(zero_total)},
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2926:    /// Scan every blob-target shard (see `retire`): a preview that only looked at shard 0 would miss the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2947:        /// Retired-in-snapshot: stream the SAME adopted seal runs and emit every `kCondemned`
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2970:                e.condemn_round = row.condemn_round;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:2974:            /// Whole-file seal-checksum: verify the drained run before its condemned
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:3002:    store.backend().casPut(key, encodeGcHeartbeat(hb), expected);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:3026:            const CasResult acquire_res = store->backend().casPut(key, encodeGcState(fresh), std::nullopt);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:3043:            const CasResult renew_res = store->backend().casPut(key, encodeGcState(next), got->token);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:3079:            /// loop's own very next tick treat THIS snapshot as one half of ITS two-observation window,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:3097:        const CasResult steal_res = store->backend().casPut(key, encodeGcState(next), got->token);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:93:/// apart with no snapshot between them. A ref that gets republished (now names a
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:122:            /// Read freshly via `recoverRefTable` (a full LIST + replay), not `store.resolveRef`: the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:123:            /// mounted Pool caches its `RefTableState` and never re-recovers it, so a concurrent external
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:124:            /// ref write is invisible to the cache. The recovery equation sees every log.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:126:            const RefTableState table = recoverRefTable(store.backend(), layout, rns);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:148:/// `(ref_name -> manifest_ref)` from a FRESH per-namespace recovery, but the `backend.get(mkey)` that
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:155:/// authoritative recovery (`recoverRefTable`, never the walk's captured row) and check whether the CURRENT
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:166:        const RefTableState table = recoverRefTable(backend, layout, ns);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:179:/// For the newest published snapshot `X` of `ns`, independently reconstruct
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:180:/// the table state AT `X` from an EARLIER base (the greatest snapshot below `X`, or the empty state) plus
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:189:/// snapshot) is likewise a skip, exactly like recovery's restart-on-vanish -- never corruption. This
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:190:/// oracle therefore validates freshly-published snapshots and any table whose `GC` cleanup is still
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:191:/// behind; it uses only the shared `replay`/`snapshotOf` state machine, never a second copy.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:195:    checkDeadline(deadline, "snapshot oracle");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:197:    /// One LIST of the table prefix; gather snapshot and log ids.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:211:        return;   /// no published snapshot: recovering from logs alone is valid, nothing to oracle
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:215:    const RefTxnId snapshot_x = snap_ids.back();
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:216:    const auto got_x = backend.get(layout.refSnapshotKey(ns, snapshot_x));
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:218:        return;   /// vanished (a covering newer snapshot superseded it): restart-on-vanish -> skip
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:223:    if (!std::binary_search(log_ids.begin(), log_ids.end(), snapshot_x))
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:226:    /// Independent base: the greatest snapshot strictly below X we can still fetch, else the empty state.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:231:        if (!(*it < snapshot_x))
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:235:            continue;   /// vanished; try the next older snapshot
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:245:    /// The builder revalidates the base snapshot in full (`stateFromSnapshot`) and applies the tail through
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:246:    /// the SAME state machine the writer used; the last applied id is X, so `snapshotOf` below yields a
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:247:    /// snapshot with id X whose bytes must equal the published object.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:252:            continue;   /// <= base: already folded into the base snapshot
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:253:        if (snapshot_x < id)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:255:        checkDeadline(deadline, "snapshot oracle");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:271:    const String recomputed = encodeRefTableSnapshot(snapshotOf(reconstructed, ns.string()));
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:272:    ++report.snapshot_oracle_checked;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:275:        ++report.snapshot_oracle_mismatches;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:277:        o.key = layout.refSnapshotKey(ns, snapshot_x);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:278:        o.kind = ObjectKind::Blob;   /// snapshots have no ObjectKind; reuse Blob as the generic kind
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:282:            o.reachable_from = {"published snapshot bytes diverge from an independent replay of its logs "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:289:/// recovers authoritative refs, then checks physical objects and GC labels, while preserving the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:317:        /// Fresh recovery (LIST + replay), not the mounted Pool's cached `listRefs`: fsck is a read-only
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:319:        const RefTableState table = recoverRefTable(backend, layout, ns);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:321:        /// snapshot is byte-identical to an independent replay of its own logs. Fails closed (records a
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:336:                /// but the per-ref GET runs later than the namespace's ref recovery, so a stale captured
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:474:    std::unordered_map<BlobRef, RetiredEntry, BlobRefHash> retired_by_hash;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:477:    /// The NON-SENTINEL source edges the snapshot still holds on each unreferenced blob, collected in
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:498:            /// The adopted fold seal names the snapshot runs; resolution is by ref, never by key
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:501:            /// `kCondemned` sentinel row that carries the condemned state (retired-in-snapshot):
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:502:            /// the `kCondemned` rows feed `retired_by_hash` (the `PendingGc` classification) in the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:503:            /// SAME pass, replacing the removed `retired_refs`/`decodeRetiredSet` loop.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:515:                    checkDeadline(deadline, "reading gc snapshot runs");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:540:                                e.condemn_round = row.condemn_round;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:542:                                retired_by_hash.emplace(ref, std::move(e));
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:546:                            on_progress("reading gc snapshot runs", in_run_hashes.size(), rows);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:625:        /// which cannot match a real `retired_by_hash`/`in_run_hashes` entry — it lands in the generic
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:632:        if (const auto rit = retired_by_hash.find(hash); rit != retired_by_hash.end()
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:635:            /// The PRESENT incarnation is the condemned one — deletion is scheduled. A token
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:637:            /// nothing about this object; fall through to the snapshot check.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:641:                : "condemned at round " + std::to_string(rit->second.condemn_round)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:646:            /// `in_run_hashes` only says the GC snapshot still holds SOMETHING for this blob. Split on
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:672:                note = "edges still in the GC snapshot; the drop has not folded yet (expected)";
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:835:        << " snapshot_oracle_mismatches=" << report.snapshot_oracle_mismatches
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp:836:        << " snapshot_oracle_checked=" << report.snapshot_oracle_checked
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:23:    extern const Event CasConditionalWriteDefiniteFailure;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:24:    extern const Event CasConditionalWriteUnresolved;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:49:    /// not recognize all fall through to the fail-safe default below: Unresolved. Only the WHITELIST
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:54:            return CasWriteOutcome::DefiniteFailure;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:60:    /// DefiniteFailure.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:61:    return CasWriteOutcome::Unresolved;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:76:        case CasWriteOutcome::DefiniteFailure:
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:77:            ProfileEvents::increment(ProfileEvents::CasConditionalWriteDefiniteFailure);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:79:        case CasWriteOutcome::Unresolved:
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:80:            ProfileEvents::increment(ProfileEvents::CasConditionalWriteUnresolved);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:95:/// fence-gated pacing of reissues toward a recovering object store, and it is injectable so tests
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:127:            "putIfAbsentControlled return Unresolved without ever sending an attempt.",
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:220:                                              const std::function<bool()> & fence_ok, CasUnresolvedReason * out_reason)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:225:    if (!fence_ok())
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:228:            *out_reason = CasUnresolvedReason::FenceLostMidWay;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:235:    /// cross the operation deadline, give up NOW instead of sleeping into a guaranteed Unresolved.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:239:            *out_reason = CasUnresolvedReason::DeadlineMidWay;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:258:        /// way — an unresolved read leaves this Unresolved, exactly like an absent read.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:259:        return CasWriteOutcome::Unresolved;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:263:        return CasWriteOutcome::Unresolved;   /// absent -> another attempt may still be legal
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:273:    /// ambiguity. Fail closed rather than silently treating it as Unresolved/DefiniteFailure.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:279:CasWriteOutcome CasRequestController::putIfAbsentControlled(
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:280:    std::string_view key, std::string_view bytes, const std::function<bool()> & fence_ok, Token * out_token,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:281:    CasUnresolvedReason * out_reason)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:288:    const auto unresolved = [&](CasUnresolvedReason reason)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:292:        return CasWriteOutcome::Unresolved;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:295:        *out_reason = CasUnresolvedReason::NotUnresolved;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:302:        if (!fence_ok())
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:303:            return unresolved(attempts_sent == 0 ? CasUnresolvedReason::NoAttemptSent
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:304:                                                 : CasUnresolvedReason::FenceLostMidWay);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:306:            return unresolved(attempts_sent == 0 ? CasUnresolvedReason::NoAttemptSent
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:307:                                                 : CasUnresolvedReason::DeadlineMidWay);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:315:            const PutResult put = backend->putIfAbsent(key_s, bytes_s);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:317:            /// created it (possibly OUR earlier unresolved attempt). Collapse it onto Unresolved so it
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:319:            /// false DefiniteFailure/Committed.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:320:            attempt_outcome = put.outcome == PutOutcome::Done ? CasWriteOutcome::Committed : CasWriteOutcome::Unresolved;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:329:        if (attempt_outcome == CasWriteOutcome::DefiniteFailure)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:330:            return CasWriteOutcome::DefiniteFailure;   /// proven never applied — no resolve, no retry
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:332:        if (attempt_outcome == CasWriteOutcome::Unresolved)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:337:            if (attempt_outcome == CasWriteOutcome::Unresolved)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:341:                /// attempt: the budget is spent, sleeping would only delay the Unresolved verdict.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:343:                /// Both refusals report through `unresolved`, never a bare `return Unresolved`: this is
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:345:                /// `NotUnresolved` here made the ref lane's wedge message read "is UNCERTAIN (not
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:348:                    return unresolved(CasUnresolvedReason::AttemptsExhausted);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:349:                CasUnresolvedReason pause_reason = CasUnresolvedReason::AttemptsExhausted;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:350:                if (!pauseBeforeReissue(attempt, deadline_ms, fence_ok, &pause_reason))
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:359:        /// after the local fence" leg separately from the generic Unresolved classifier so a cross-epoch
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:361:        if (!fence_ok())
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:364:            return unresolved(CasUnresolvedReason::FenceLostPostWrite);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:371:    return unresolved(CasUnresolvedReason::AttemptsExhausted);   /// budget exhausted, no definite outcome
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:375:    std::string_view key, const std::function<PutResult()> & attempt, const std::function<bool()> & fence_ok)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:382:        /// Same pre-attempt gates as putIfAbsentControlled.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:383:        if (!fence_ok())
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:384:            return {CasCreateOutcome::Unresolved, {}};
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:386:            return {CasCreateOutcome::Unresolved, {}};
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:398:            /// per-code rationale). This deliberately differs from `putIfAbsentControlled`'s
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:399:            /// everything-Unresolved:
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:410:            if (classifyConditionalWriteResult(e) == CasWriteOutcome::DefiniteFailure)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:421:            if (!fence_ok())
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:424:                return {CasCreateOutcome::Unresolved, {}};
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:430:        /// may be multi-GB, and reading a possibly-condemned occupant would flirt with the resurrect
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:448:        if (attempt_no == budget.max_attempts || !pauseBeforeReissue(attempt_no, deadline_ms, fence_ok))
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:449:            return {CasCreateOutcome::Unresolved, {}};
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:452:    return {CasCreateOutcome::Unresolved, {}};   /// attempt budget exhausted without a definite outcome
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:456:    std::string_view key, std::string_view bytes, const Token & expected, const std::function<bool()> & fence_ok)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:464:        if (!fence_ok())
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:465:            return {CasOverwriteOutcome::Unresolved, {}};
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:467:            return {CasOverwriteOutcome::Unresolved, {}};
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:480:            if (classifyConditionalWriteResult(e) == CasWriteOutcome::DefiniteFailure)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:487:            if (!fence_ok())
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:490:                return {CasOverwriteOutcome::Unresolved, {}};
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:515:            if (!fence_ok())
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:518:                return {CasOverwriteOutcome::Unresolved, {}};
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:525:            /// never collapsed into Unresolved/DefiniteFailure, never thrown.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:530:        if (attempt_no == budget.max_attempts || !pauseBeforeReissue(attempt_no, deadline_ms, fence_ok))
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:531:            return {CasOverwriteOutcome::Unresolved, {}};
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:534:    return {CasOverwriteOutcome::Unresolved, {}};   /// attempt budget exhausted without a definite outcome
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:537:CasOverwriteResult CasRequestController::putIfAbsentControlledMutable(
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:538:    std::string_view key, std::string_view bytes, const std::function<bool()> & fence_ok)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:546:        if (!fence_ok())
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:547:            return {CasOverwriteOutcome::Unresolved, {}};
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:549:            return {CasOverwriteOutcome::Unresolved, {}};
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:554:            put = backend->putIfAbsent(key_s, bytes_s);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:561:            if (classifyConditionalWriteResult(e) == CasWriteOutcome::DefiniteFailure)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:568:            if (!fence_ok())
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:571:                return {CasOverwriteOutcome::Unresolved, {}};
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:596:            if (!fence_ok())
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:599:                return {CasOverwriteOutcome::Unresolved, {}};
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:611:        if (attempt_no == budget.max_attempts || !pauseBeforeReissue(attempt_no, deadline_ms, fence_ok))
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:612:            return {CasOverwriteOutcome::Unresolved, {}};
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:615:    return {CasOverwriteOutcome::Unresolved, {}};   /// attempt budget exhausted without a definite outcome
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasServerRootFormats.cpp:37:    if (o.retired_at_ms)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasServerRootFormats.cpp:40:        writeIntText(*o.retired_at_ms, out);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasServerRootFormats.cpp:71:    o.retired_at_ms = rt;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:121:    /// Crash semantics: the PartWriteTxn dtor retires the build_seq so the GC watermark floor (minActive) can
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:122:    /// advance even if neither publish nor abandon ran (idempotent — safe if already retired).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:123:    store->retireBuildSeq(build_seq);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:130:    /// `dropNamespace` cancels in-flight builds once its removal transaction is
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:136:            "PartWriteTxn cancelled: its owning namespace was removed (dropNamespace) while this build was "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:138:    /// Self-remount (fence-out recovery) supersedes the mount incarnation this build was minted
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:207:                /// INV-1: HEAD-first path hit a condemned token → re-upload from our OWN source bytes.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:213:        /// hr.exists == false OR condemned-ABORTED → fall through to uploadFromSource / fresh upload.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:216:    /// Fresh-upload path + condemned-dedup recovery under INV-1. Try the primary upload via
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:217:    /// uploadFromSource (which handles condemned-present via putOverwrite and absent via putIfAbsentStream
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:218:    /// without any backend().get). Bounded loop guards against rare concurrent-condemnation churn.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:233:            ///   • a racing writer displaced the condemned token before our putOverwrite landed and
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:234:            ///     their fresh incarnation is itself already condemned (observeAndAdmit → ABORTED); or
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:293:    /// (a committed-source W-EVIDENCE adopt: the source pins it, in-degree >= 1, not condemnable). A
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:315:    /// the condemned/ABORTED branch or the adopt branch once the 4-arg overload point-reads the meta;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:316:    /// gating here (before that point-read) would wrongly block the condemned branch too, which
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:339:    /// as CORRUPTED_DATA, never wrap to a huge value. Mirrors the GC path's `retiredLogicalSize`.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:349:    /// The condemned decision is a per-hash META POINT-READ, not
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:350:    /// the retired-view snapshot. `absent` meta means "not condemned" — GC always writes a `Condemned`
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:356:    const bool condemned = lm && lm->meta.state == MetaState::Condemned;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:357:    if (condemned)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:359:        /// INV-1 (revival-from-source): the observed token is condemned — we must NOT read the dying
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:369:            e.round = 0;   /// the round is no longer a writer concept (meta point-read replaces the retired view)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:370:            e.outcome = "condemned";
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:371:            e.reason = "observed token is condemned (meta point-read); caller must re-upload from source (INV-1)";
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:374:            "PartWriteTxn::observeAndAdmit: condemned token for {} — caller must re-upload from source bytes (INV-1)",
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:379:    /// ADOPT the live (non-condemned) incarnation as our own dependency — safe ONLY under this build's
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:381:    /// newborn-debris watermark does not cover it. (The condemned branch above is unaffected — it
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:406:            BlobMeta{.state = MetaState::Clean, .condemn_round = 0, .size = logical_size});
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:410:    /// Reuse an ADOPTED existing incarnation's token as NOT condemned (per the meta point-read).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:419:        e.round = 0;   /// the round is no longer a writer concept (meta point-read replaces the retired view)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:421:        e.reason = "observed token not condemned (meta point-read); adopted the live incarnation (no bytes moved)";
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:434:    /// INV-1 (revival-from-source): re-upload a condemned or absent object from the writer's OWN
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:498:            e.round = 0;   /// the round is no longer a writer concept (meta point-read replaces the retired view)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:506:    /// Meta write for the RESURRECT (condemned-displacement) case: flip the now-stale Condemned meta
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:507:    /// back to Clean now that a live incarnation has displaced the condemned body. `lm_before` is the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:508:    /// point-read taken just before the condemned decision — its etag is the CAS precondition (absent
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:513:    /// call intended: a racing writer or GC re-condemning) by reloading and retrying against the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:514:    /// fresh state. `Unresolved` (the controller's own budget/fence exhausted for one attempt) is
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:523:        const BlobMeta clean{.state = MetaState::Clean, .condemn_round = 0, .size = source.size};
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:543:    /// the same Clean state" (the retired comment this replaced assumed) -- it can be a stale
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:553:    /// Stream header + payload into a fresh putIfAbsentStream sink WITHOUT materializing the whole blob.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:594:            WriteSinkPtr sink = store->backend().putIfAbsentStream(key);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:613:            case CasCreateOutcome::Unresolved:
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:616:        /// Unresolved = budget exhausted or fence lost without a definite outcome. Nothing referenced
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:638:    /// PreconditionFailed: an incarnation exists. HEAD it to check whether it is condemned or live.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:640:    ///   • live (not condemned)  → adopt; this is the standard dedup case.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:641:    ///   • condemned             → displace via putOverwrite(If-Match: current_token) by re-reading our
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:647:        /// Object vanished between putIfAbsentStream (412d) and our HEAD — a concurrent GC delete.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:661:    /// The condemned decision is a per-hash META POINT-READ, not
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:662:    /// the retired-view snapshot. `lm` (and its etag) is reused below to flip a condemned meta back to
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:665:    const bool condemned = lm && lm->meta.state == MetaState::Condemned;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:666:    if (!condemned)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:668:        /// Live (not condemned): adopt the current incarnation — free, no bytes moved.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:672:    /// Condemned: displace the condemned incarnation with our fresh source.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:680:    /// observed the condemned state aborts with the typed transient error (`INVALID_STATE`) before any
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:681:    /// stale-incarnation displacement can land. Mirrors `CasPlainObjects::casPutObject`'s
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:688:        /// NEVER a read/copy of the condemned `key` (`feedback_ca_resurrect_invariant`). We reach here
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:690:        /// condemned body, never a live blob (INV: never overwrite a live blob).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:693:        /// condemned incarnation's exact bytes ⇒ identical ETag ⇒ the queued exact-token delete of the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:694:        /// condemned incarnation would kill the live resurrection (data loss). `buildHeader` mints a
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:696:        /// hence its ETag) differs from the condemned incarnation regardless of edge-before-observe. The
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:701:        /// `promoteStaged`/`putIfAbsentStream` above, reached only through `stagingConditionalCreate`'s
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:702:        /// controller+fence_ok). The `checkFenceOrThrow` re-checks the fence generation captured at the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:715:    /// putOverwrite is whole-body only (no streaming variant), so this rare condemned-displacement path
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:718:    /// condemned incarnation must actually be displaced — not the common fresh-upload path.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:720:    /// Stage-1 §1 (condemned-local resurrection memory cap): under the fan-out N such displacements can
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:732:        ByteWeightedSemaphoreLock admit(condemnedUploadAdmission(), overwrite_weight);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:756:    /// PreconditionFailed from putOverwrite: either a racing writer displaced the condemned token
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:775:        /// Present with a different token — a racing writer displaced the condemned incarnation.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:776:        /// Adopt their token (or throw ABORTED if it too is condemned — bounded by caller loop).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:808:    /// must NOT recover the namespace by splitting intended_ref on the last `/` — that would yield a
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:889:    /// fence_ok is the ref lane's own mount predicate (`refAppendFenceOk`: fence not lost + enough
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:896:    if (put_outcome == CasWriteOutcome::DefiniteFailure)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:900:    /// Unresolved = budget exhausted (or fence lost) without a definite outcome. Unlike the ref-log
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:905:    if (put_outcome == CasWriteOutcome::Unresolved)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:939:    /// never mutated concurrently, so no snapshot races) rather than read live inside the closure
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:956:    /// THE INTENT IS RECORDED BEFORE THE APPEND, and that ordering is the whole point: an `Unresolved`
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:957:    /// append MAY HAVE LANDED (`CasRefLedger.cpp`, the `Unresolved` arm says so explicitly), so a
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:991:            /// what keeps this race-free: a snapshot taken before the closure could see "already
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:1008:                /// EXACT `_cleanup/<remove_txn_id>` completion marker from this table's own recovery --
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:1074:    /// condemned-tokenless copy-forward (a GET+PUT) now runs inside the append lane's flush, briefly
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:1122:            /// guarantees contains every graduated entry (in EVERY view >= condemn round + 1).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:1141:            /// observed them, so a condemnation in the putBlob→promote window cannot graduate (the next fold
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:1146:            /// durable manifest edge (the live source pins the blob, in-degree >= 1, not condemnable) and this
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:1163:                /// in-degree, so a trusted-promote leaf cannot have been condemned/deleted. The backstop for
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:1211:            /// An intended repoint additionally retires the OLD committed
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:1213:            /// new=absent), since one RefOwnerBinding cannot carry both the retired-committed and the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:1250:    store->retireBuildSeq(build_seq);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:1304:        /// `dropNamespace` cancelled this build once its removal transaction became durable: that same
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:1308:        /// anyway). Do ONLY the best-effort staged-debris cleanup + seq retire (both idempotent, both on
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:1313:        store->retireBuildSeq(build_seq);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:1325:                e.reason = "cancelForNamespaceRemoval: owning namespace removed (dropNamespace); best-effort "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:1407:    /// No longer in-flight: retire the seq so the per-server active-build floor (`min_active`) can advance
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:1408:    /// (idempotent). This runs AFTER the precommit removal above (mirrors `PartWriteTxn::promote`, which retires
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:1412:    /// precommit still names it. Ordering removal-before-retire keeps that happens-before clean.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:1413:    store->retireBuildSeq(build_seq);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:1418:    /// the durable work (precommit removal + seq retire) is already done, so a throwing sink must not
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:1447:    /// exist -- protects the body. Deleting it under uncertainty is the unrecoverable direction (a
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:1472:    /// the immutable `info` set at construction, so this is safe to call from `dropNamespace`'s thread
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.h:19:/// property of the representation, not an adoption gate: ref commits use `putIfAbsentControlled`, and
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.h:35:/// publication timestamp. `RefOwnerBinding` is shared with the snapshot format through
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.h:99:/// such op per committed ref and precommit, followed by a terminal `remove_namespace`), encoded via
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.h:103:/// Encoded byte size of a removal transaction's framing (header + meta + terminal remove_namespace op +
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.cpp:79:/// accommodates the JSON-inflated removal-class transaction and full snapshot. Their codecs
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.cpp:80:/// independently enforce the existing `ref_txn_max_bytes` (20 MiB) and 64 MiB removal/snapshot budgets
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasWireVocab.h:14:/// ref logs, ref snapshots, part manifests, and blob envelopes. Every reverse map rejects an
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:25:/// today's behavior for every existing caller (`listRefs`, `dropRef`, GC, and ordinary reads).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:45:///                     flush clears it, only a fresh recovery (which means a REPLACED runtime -- a
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:46:///                     runtime is never re-recovered in place). Enforced by construction: every
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:52:/// require rejecting later `appendRefOps`, stale-precommit sweeps and snapshot admissions, exposing
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:60:/// returned exclusively when every rule of the lane snapshot holds. `Unknown` is the catch-all for
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:61:/// every ambiguity, and it is the answer this primitive is biased towards: a cold, evicted, recovering,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:74:/// It owns the recovered whole-table cache, the flat-combining append lane and its unresolved-`PUT`
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:75:/// wedge, snapshot publication, stale-precommit cleanup, cache-budget eviction, and remount/shutdown
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:83:/// cancellation of in-flight builds. The detached snapshot publisher uses the lifetime pin; no
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:99:        std::function<bool()> fence_ok_fn_,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:109:    /// alternate shard cache, so the recovered table is always the view used for the result.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:116:    /// maintenance may schedule snapshot publication and stale-precommit cleanup, but those actions do
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:118:    std::map<String, Resolved> listRefs(const RootNamespace & ns);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:121:    /// without materializing the full ref map `listRefs` returns. An empty `prefix` means "any ref at
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:127:    /// EXACTLY `manifest_ref` in this writer's committed view, read under a lane snapshot that cannot
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:130:    /// Performs ZERO object-store I/O: a cold, evicted or recovering table answers `Unknown` rather
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:131:    /// than recovering from storage, and no runtime is created as a side effect of asking. That is a
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:135:    /// The rules are evaluated as ONE snapshot spanning both lane mutexes, in this order: table warm
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:154:    DropNamespaceStats dropNamespace(const RootNamespace & ns);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:156:    /// Reports whether recovery has established the namespace's durable lifecycle as `Removed`.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:169:    /// Records that recovery observed the cleanup marker for `remove_txn_id`; returns whether the marker
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:170:    /// was present. The observation is retained with the recovered table for namespace recreation gates.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:173:    /// Attempts one snapshot publication from a copy of the live state. The copy is made under
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:175:    /// only when this attempt successfully publishes the captured snapshot.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:190:    /// Closes admission, snapshots the current table set, and waits up to `wait_budget_ms` for queued
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:192:    /// mutation can appear after shutdown has taken its snapshot.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:210:    /// `CasRequestController::putIfAbsentControlledMutable`).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:221:    /// Test-only observability and fault-injection seams for recovery, wedges, cleanup, and publication.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:222:    /// The counters expose recovery and publication progress; wedge methods create and inspect the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:224:    /// settling, snapshot identity, and tail accounting.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:225:    /// Returns the number of LIST/GET recovery restarts recorded for `ns`.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:235:    /// runtime's atomic directly -- no lock, and no recovery is forced beyond the runtime materialization
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:238:    /// Reports whether recovery or a prior incomplete sweep requires stale-precommit cleanup.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:240:    /// Waits until all background snapshot publications for `ns` have completed.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:242:    /// Returns the number of background snapshot publications currently in flight for `ns`.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:244:    /// Returns the newest snapshot id adopted by the cached runtime, if any.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:247:    /// observed-region upper bound when the newest snapshot is a recovery seal, else `nullopt`.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:249:    /// Returns the number of applied transactions newer than the adopted snapshot.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:273:    /// inside `commitRefChunk` after that chunk's `PUT` returned `Committed` and BEFORE the prepared
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:304:    /// Returns the number of callers currently waiting for `ns` recovery under its state mutex.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:309:        return rt->recovery_waiters_for_test;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:318:    /// Reports whether `ns` has a cached runtime whose recovery completed.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:323:        return it != ref_tables.end() && it->second->recovered;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:325:    /// Recovery-publication inventory accessors: the seeded per-table admission budgets, the recovered
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:326:    /// base snapshot's encoded body size, the tail-since-snapshot byte sum, and the `_cleanup` markers
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:327:    /// observed at recovery. Together with `newestPublishedSnapshotIdForTest`,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:334:        return rt->snapshot_budget;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:345:        return rt->base_snapshot_bytes.load(std::memory_order_relaxed);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:350:        return rt->tail_bytes_since_snapshot.load(std::memory_order_relaxed);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:368:    std::function<bool()> fence_ok_fn;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:377:    /// interruptible slice-sleep (bails early if `fence_ok_fn` drops, e.g. on shutdown/lease loss);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:379:    std::function<void(uint64_t)> recovery_retry_sleep_fn;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:404:    /// One coherent decoded `RefTableState` and append runtime for a namespace. It is recovered lazily
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:407:    /// listRefs) can observe `state` without contending with the flush leader's network round trip --
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:409:    /// apply-after-commit steps, never for the `putIfAbsentControlled` call itself.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:413:        bool recovered = false;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:414:        /// Gates the recovery-seal I/O that runs outside `state_mutex`. A second caller waits on
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:415:        /// `recovery_cv` and rechecks `recovered` after the first caller finishes; otherwise it could
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:418:        bool recovery_in_progress = false;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:419:        std::condition_variable recovery_cv;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:420:        /// Test-only count of callers currently waiting for recovery; guarded by `state_mutex` so tests
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:422:        uint64_t recovery_waiters_for_test = 0;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:424:        /// `_cleanup/<remove-txn-id>` markers observed at recovery, retained for namespace recreation
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:434:        uint64_t recovery_restarts = 0;           /// diagnostic: LIST/GET restarts forced by a vanished object
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:436:        /// overhead and the fixed safety margin, computed once at recovery.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:437:        uint64_t snapshot_budget = 0;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:440:        /// Number and encoded-byte sum of applied transactions strictly newer than `newest_snapshot_id`.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:441:        /// The live `state` is the next snapshot candidate, so no separate tail replay is retained.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:445:        std::atomic<uint64_t> tail_count_since_snapshot{0};
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:446:        std::atomic<uint64_t> tail_bytes_since_snapshot{0};
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:447:        std::optional<RefTxnId> newest_snapshot_id;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:448:        /// The `sealed_from` of the snapshot at `newest_snapshot_id`, when that snapshot is a recovery
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:449:        /// seal: the upper bound of what that recovery's LIST actually observed (`nullopt` for an
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:450:        /// ordinary snapshot or a never-published table). Installed here so the recovered runtime carries
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:453:        /// independently via its own `recoverRefTableDetailed`, so this copy has no hot-read consumer in
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:457:        /// `base_snapshot_bytes` is the encoded body size of the snapshot
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:458:        /// at `newest_snapshot_id` (0 for a never-published table), captured for free from the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:459:        /// recovered/published snapshot body -- refreshed only when that snapshot changes (recovery +
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:461:        /// `base_snapshot_bytes + tail_bytes_since_snapshot`. `base_snapshot_bytes` is ATOMIC (relaxed)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:462:        /// for the same cross-lock `total`-loop read as `tail_bytes_since_snapshot` above. `last_touch_tick`
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:466:        std::atomic<uint64_t> base_snapshot_bytes{0};
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:468:        /// Set true by recovery; cleared when a sweep attempt is
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:478:        /// `maybeSweepStalePrecommits` refuses to re-attempt; `ms` is the current exponential interval
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:482:        /// Test-observability + graceful settling for the background snapshot-publish dispatch (see
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:485:        std::atomic<int> pending_snapshot_publishes{0};
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:487:        /// Per-table snapshot-publish dispatch backoff (guarded by
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:500:        /// the fresh incarnation re-recovers each table under the new epoch on next touch, so any leader
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:510:    /// A failed recovery-seal `PUT` is separate: it leaves `recovered` false and the next touch starts
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:514:    /// the raw `ref_snapshot_max_bytes`/`ref_removal_max_bytes` hard limits before calling `admits`.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:517:    /// `mutable` for `confirmExactRef`, the one CONST member function that needs the lane snapshot:
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:525:    /// snapshots `ref_tables`/waits on each table's queue -- every ordinary ref mutation (`appendRefOps`)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:527:    /// check-and-enqueue is atomic with the drain's snapshot-and-wait: a caller either enqueues strictly
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:544:    /// conditional log/snapshot `PUT` and uncertain-result resolution. Also shared (via the PartWriteTxn
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:547:    /// `putIfAbsentStream` PUT and `promoteStaged`'s conditional server-side copy — via
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:568:    /// `DENY_ALLOCATIONS_IN_SCOPE`: `commitRefChunk`'s candidate install (`Committed`) and its wedge
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:569:    /// install (`Unresolved`), and the wedge-resolution install in `flushRefBatch`. It is the negative
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:578:    /// Returns the cached runtime for `ns`, creating an empty unrecovered runtime when needed.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:581:    /// Lazily recovers `ns` by listing and replaying its snapshot/log objects. It does not expose the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:582:    /// table as recovered until any required recovery seal is durable; concurrent callers serialize
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:583:    /// across the unlocked seal I/O through `recovery_in_progress`.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:586:    /// Publishes a completed streaming recovery into the runtime in one atomic step: copies EVERY field
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:587:    /// `RecoveryResult` carries into `rt` and sets `recovered` LAST, so a waiter woken after this returns
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:607:    /// durable; `commitRefChunk`'s pre-`PUT` apply targets a private candidate that nothing else can
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:611:    /// tenure via `commitRefChunk` -- each a complete commit boundary.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:619:    /// id (waking their waiters), and schedules snapshot publication. The apply comes BEFORE the `PUT`
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:622:    /// before the `PUT` -- the request reads its key and body -- so the `Unresolved` arm only has to move
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:625:    /// apply / DefiniteFailure / unresolved wedge / a conclusive PUT rejection / an encode failure),
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:630:    bool commitRefChunk(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:671:    /// `pending_snapshot_publishes` and returns true (the caller then dispatches). The fence check
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:675:    /// Launches one detached publish attempt. Assumes `pending_snapshot_publishes` was already
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:689:    /// Advances the exponential delay after a non-durable snapshot publication outcome.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:691:    /// Clears the snapshot-publication delay after durable progress.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:694:    /// Checks whether recovery or a mutation requested stale-precommit cleanup and dispatches it when
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:696:    void maybeSweepStalePrecommits(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h:710:    /// Publishes the terminal `Removed` snapshot after the namespace-removal transaction is durable;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:37:            "RefTableState: remove_namespace must be the final operation of its transaction");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:46:                "RefTableState: every operation before remove_namespace must be an exact owner removal");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:50:/// Installed test probe for the streaming-recovery memory invariant (see the header). Guarded by its
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:51:/// own mutex so an install/clear from a test thread cannot tear against a concurrent recovery.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:52:std::mutex g_recovery_replay_memory_probe_mutex;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:53:std::function<void(int64_t)> g_recovery_replay_memory_probe;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:104:    std::lock_guard lock(g_recovery_replay_memory_probe_mutex);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:105:    g_recovery_replay_memory_probe = std::move(probe);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:114:        std::lock_guard lock(g_recovery_replay_memory_probe_mutex);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:115:        probe = g_recovery_replay_memory_probe;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:157:    swap(greatest_applied, other.greatest_applied);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:161:    swap(snapshot_body_bytes, other.snapshot_body_bytes);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:198:            /// measurable while making a corrupted log/snapshot FAIL OPEN -- a double-owner input would drift
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:205:            snapshot_body_bytes += precommitRowEncodedSize(RefOwnerBinding{RefOwnerKind::Precommit, b.ref_name, b.manifest_ref});
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:218:            snapshot_body_bytes -= precommitRowEncodedSize(RefOwnerBinding{RefOwnerKind::Precommit, b.ref_name, b.manifest_ref});
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:234:            snapshot_body_bytes -= committedRowEncodedSize(removed);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:249:            snapshot_body_bytes -= precommitRowEncodedSize(RefOwnerBinding{RefOwnerKind::Precommit, b.ref_name, b.manifest_ref});
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:269:            snapshot_body_bytes += committedRowEncodedSize(row);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:300:    snapshot_body_bytes -= old_row_bytes;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:301:    snapshot_body_bytes += committedRowEncodedSize(updated);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:317:            /// recreation on the `_cleanup` marker is the writer's recovery-time responsibility;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:337:                throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableState: remove_namespace while not Live");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:340:                    "RefTableState: remove_namespace with nonempty owner sets");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:355:RefTableState stateFromSnapshot(const RefTableSnapshot & snapshot)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:357:    const String bytes = encodeRefTableSnapshot(snapshot);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:358:    const RefTableSnapshot validated = decodeRefTableSnapshot(bytes, snapshot.ns, snapshot.snapshot_id);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:363:    state.greatest_applied = validated.snapshot_id;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:365:    /// cross-owner `manifest_ref` uniqueness -- a snapshot naming one manifest under two owners
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:368:    /// reports "corrupt snapshot data" rather than the container's "index drifted = code bug" framing,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:374:                "stateFromSnapshot: snapshot names one manifest under two owners (committed ref '{}')", row.ref_name);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:376:        state.snapshot_body_bytes += committedRowEncodedSize(row);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:384:                "stateFromSnapshot: snapshot names one manifest under two owners (precommit ref '{}')", b.ref_name);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:386:        state.snapshot_body_bytes += precommitRowEncodedSize(RefOwnerBinding{RefOwnerKind::Precommit, b.ref_name, b.manifest_ref});
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:424:    chassert(snapshot_body_bytes == snap);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:433:    if (!(greatest_applied < txn.txn_id))
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:437:            greatest_applied.writer_epoch, greatest_applied.ref_sequence);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:449:    greatest_applied = txn.txn_id;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:471:RefTableSnapshot snapshotOf(const RefTableState & state, const String & ns)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:473:    RefTableSnapshot snapshot;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:474:    snapshot.ns = ns;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:475:    snapshot.snapshot_id = state.getGreatestApplied();
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:476:    snapshot.lifecycle = state.getLifecycle();
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:477:    snapshot.remove_txn_id = state.getRemoveTxnId();
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:479:    snapshot.committed.reserve(state.getCommitted().size());
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:481:        snapshot.committed.push_back(row);   /// RefCowMap iterates sorted by ref_name (Pool/CasRefCowMap.h)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:483:    snapshot.precommits.reserve(state.getPrecommits().size());
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:485:        snapshot.precommits.push_back(RefOwnerBinding{RefOwnerKind::Precommit, name, manifest_ref});
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:489:    return snapshot;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:492:RefTableState replay(const std::optional<RefTableSnapshot> & snapshot, std::span<const RefLogTxn> tail)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:494:    RefTableState state = snapshot ? stateFromSnapshot(*snapshot) : RefTableState{};
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:496:    const String * expected_ns = snapshot ? &snapshot->ns : nullptr;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:519:        result.newest_snapshot_id = base->snapshot_id;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:521:        result.base_snapshot_bytes = base_encoded_bytes;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:523:        candidate = stateFromSnapshot(*base);   /// full snapshot revalidation, exactly as `replay`
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:529:    /// The streaming-recovery memory probe is driven by the CALLER's loop (around GET->decode->this
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:551:    /// recovery folds the COW overlays once on the result before installing it; the read-only consumers
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:559:    /// snapshotOf uses snapshot_id = state.greatest_applied, empty ns, sealed_from unset, and the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:562:    return snapshotFramingSize("", state.getGreatestApplied(), state.getLifecycle(),
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:570:    /// and one removal op per owner (committed + precommit) plus a terminal remove_namespace op -- so
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:577:bool admits(const RefTableState & state, const RefOp & op, uint64_t snapshot_budget, uint64_t removal_budget)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:592:    if (encodedSnapshotBudgetSize(scratch) > snapshot_budget)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:646:std::map<String, RefTableListing> groupRefKeys(const Layout & layout, const std::vector<String> & listed_keys)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:659:                "groupRefKeys: key '{}' under the ref prefix is not a valid ref object -- aborting ref folding", key);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:673:                table.snapshots.push_back(parsed->txn_id);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:684:        std::sort(table.snapshots.begin(), table.snapshots.end());
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:693:                              std::optional<RefTxnId> completed_removal_snapshot)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:697:    /// The coverage boundary `X` is the newest snapshot known to be durable: the newest observed in this
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:699:    /// `Removed` snapshot the caller just made durable. With
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:700:    /// neither there is no boundary, so no log is coverage-deletable and no older snapshot exists to delete.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:701:    std::optional<RefTxnId> newest_snapshot;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:702:    if (!listing.snapshots.empty())
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:703:        newest_snapshot = listing.snapshots.back();
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:704:    if (completed_removal_snapshot && (!newest_snapshot || *newest_snapshot < *completed_removal_snapshot))
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:705:        newest_snapshot = completed_removal_snapshot;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:706:    if (!newest_snapshot)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:711:        if (*newest_snapshot < log_id)     /// L > X: not covered by any durable snapshot
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:715:        if (removal_logs_blocked.contains(log_id))   /// remove_namespace log whose item is not Completed
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:720:    /// Only snapshots the scan actually returned are deletion candidates; a `completed_removal_snapshot`
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:721:    /// first published this round is not in `listing.snapshots`, so it is never scheduled for deletion,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:723:    for (const RefTxnId & snapshot_id : listing.snapshots)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:724:        if (snapshot_id < *newest_snapshot)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:725:            plan.deletable_snapshots.push_back(snapshot_id);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:730:RecoveredRefTable recoverRefTableDetailed(Backend & backend, const Layout & layout, const RootNamespace & ns,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:735:        /// One LIST of the table prefix; classify keys into logs and snapshots.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:737:        std::vector<RefTxnId> snapshots;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:752:                        snapshots.push_back(parsed->txn_id);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:760:        std::sort(snapshots.begin(), snapshots.end());
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:764:        /// Newest snapshot, if any.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:765:        std::optional<RefTableSnapshot> snapshot;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:766:        std::optional<RefTxnId> snapshot_id;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:767:        if (!snapshots.empty())
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:769:            snapshot_id = snapshots.back();
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:770:            const auto got = backend.get(layout.refSnapshotKey(ns, *snapshot_id));
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:774:                snapshot = decodeRefTableSnapshot(openObject(FormatId::RefSnapshot, got->bytes), ns.string(), *snapshot_id);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:777:        /// Stream every log with id greater than the selected snapshot, in id order, through one
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:779:        /// resident (unlike the retired whole-tail vector, which held every decoded transaction at once).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:780:        RefReplayBuilder builder(std::move(snapshot));
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:784:                if (snapshot_id && !(*snapshot_id < id))
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:785:                    continue;   /// id <= snapshot: already included in the snapshot
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:808:                "recoverRefTable: table {} kept losing a selected snapshot/tail object across {} restarts",
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:813:        return RecoveredRefTable{std::move(result.state), result.newest_snapshot_id, result.sealed_from};
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:817:RefTableState recoverRefTable(Backend & backend, const Layout & layout, const RootNamespace & ns,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp:820:    return recoverRefTableDetailed(backend, layout, ns, on_page_fetched, max_restarts).state;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h:20:/// In-memory description of a blob incarnation condemned by the in-degree merge. The exact token and
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h:22:/// `condemn_round` controls round-paced graduation. Entries are decoded from `kCondemned` rows and are
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h:30:    uint64_t condemn_round = 0;   /// the GC round that condemned this incarnation (round-paced
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h:31:                                  /// graduation: an entry graduates only once condemn_round < the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h:37:                                  /// it condemned and recreate).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h:39:                                     /// graduation gate (triage 2026-07-17 §3.4): the per-hash condemn
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h:69:/// Serialized payload of a condemned source-edge sentinel. The payload retains the full incarnation
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h:78:    uint64_t condemn_round = 0;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h:83:/// Encode a condemned-row payload. Throws `CORRUPTED_DATA` if the token cannot fit in its u16 length.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h:86:/// Decode and validate a condemned-row payload. Unknown flags, token types, or inconsistent lengths
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h:93:/// marker byte for an edge / zero row, or the `encodeCondemnedRow` blob for a condemned row) from the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h:129:/// runs and fold seals. `putIfAbsent`; on a `PreconditionFailed` the key is already
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h:132:/// rather than let a divergent artifact disagree with the adopted snapshot. Deterministic artifacts are
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h:166:/// A blob whose active source-edge set became empty this generation — a retire candidate.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h:185:/// The fresh entry that re-condemns the current
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h:191:    RetiredEntry fresh;   /// the freshly condemned CURRENT token (also pushed into still_retired byte-identically)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h:204:/// Outcome of the retired merge: the same
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h:205:/// streaming pass that folds edges settles every prior retired entry and detects new candidates.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h:208:    std::vector<RetiredEntry> still_retired;   /// carried + newly-condemned + newly-PENDING entries (the next list)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h:210:    std::vector<RetiredEntry> spared;          /// in-degree recovered — entry dropped
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h:212:    std::vector<ReplacedEntry> replaced;  /// re-condemned CURRENT tokens that superseded a stale entry (resurrect-replaced); caller emits blob_retire_replaced
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h:228:/// `prior_retired` cursor — the prior run IS the retired input. `PriorEdgeCursor` decodes each sentinel
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h:230:/// the old sorted vector had). Settlement rules, in order, per condemned row for blob `h` with post-merge
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h:237:///   d > 0                                       -> spared (recovery wins even past the floor);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h:238:///   d = 0 and condemn_round < current_round     -> graduated: REPUBLISHED as delete_pending (two-phase
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h:240:///                                                 confirmed durable condemn marker (see
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h:241:///                                                 `confirm_condemned_marker` below): an unconfirmed
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h:243:///   d = 0 otherwise                             -> still_retired, carried byte-unchanged.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h:246:/// `still_retired` entries are re-emitted as `kCondemned` sentinel rows into the OUTPUT run (one sentinel
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h:248:/// reads them back — `still_retired` mirrors exactly those rows, in the same order.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h:254:/// floor-passed entries stay condemned-only. Condemnation and sparing remain (both non-destructive).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h:255:/// A blob that transitions to zero THIS pass with no prior entry is condemned: `head_blob` captures
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h:257:/// and the entry is minted at `condemn_round`. Entries for blobs the merged stream never visits
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h:258:/// (no edges, no deltas) settle at in-degree 0 by definition. The retired cursor never changes the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h:259:/// snapshot run bytes. Defaults preserve the empty-retired behavior
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h:260:/// current_round 0 => nothing graduates, no head_blob => nothing condemned).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h:263:/// branch (a `prior_retired` entry whose blob re-touched this pass at net in-degree 0, current token
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h:266:/// wrong for a supersede (the supersede's own event is `blob_retire_replaced`, emitted once by the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h:268:/// double-emit `blob_retire` alongside `blob_retire_replaced` and double-count the condemned counter;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h:272:/// `confirm_condemned_marker` is the GRADUATION GATE (triage 2026-07-17 §3.4): graduation to
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h:273:/// `delete_pending` is the one edge that authorizes an irreversible delete, and the per-hash condemn
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h:288:                              uint64_t current_round = 0, uint64_t condemn_round = 0,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h:291:                              const std::function<bool(const RetiredEntry &)> & confirm_condemned_marker = {},
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h:292:                              RetiredMergeResult * out_retired = nullptr,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:79:    /// How many superseded snapshot generations to retain. After committing
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:105:    /// meta writes GC schedules at condemn/spare/delete (mass-DROP: a round condemning ~1M blobs would
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:148:    /// budget before this incarnation trusts its recovery listings. A `Clean` farewell (drained
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:161:    /// tail -- every applied txn strictly above the newest published snapshot, no age filter -- exceeds
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:162:    /// either threshold (their count / the sum of their encoded bytes), or right after recovery replays
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:165:    /// apply is gone by design: the recovery-seal plus the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:169:    /// re-encodes and PUTs the FULL snapshot, so a low threshold under sustained load degenerates into
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:170:    /// a near-continuous full-snapshot PUT stream, while on the read side a cold fold pays one GET per
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:171:    /// log the newest snapshot does not cover -- 256 bounds that at 256 extra GETs, each far cheaper
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:172:    /// than the snapshot churn it avoids.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:173:    uint64_t snapshot_log_count_threshold = 256;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:174:    uint64_t snapshot_log_bytes_threshold = 1ULL << 20;   /// 1 MiB
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:177:    /// turns every ref read into a re-dispatched full-snapshot encode+PUT (the read-triggered PUT storm),
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:182:    uint64_t snapshot_publish_backoff_initial_ms = 200;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:183:    uint64_t snapshot_publish_backoff_max_ms = 30000;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:197:    /// dropped (never rows) and the next touch re-recovers them from the durable snapshot+log objects
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:199:    /// recovery"). A table with a wedged append lane, a nonempty pending queue, or any in-flight
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:201:    /// neither is the table whose recovery just triggered the pass -- so the effective floor is one
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:202:    /// table. 0 = unbounded (eviction disabled). The estimate is the base snapshot body size plus the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:215:            .snapshot_log_count_threshold = snapshot_log_count_threshold,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:216:            .snapshot_log_bytes_threshold = snapshot_log_bytes_threshold,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:217:            .snapshot_publish_backoff_initial_ms = snapshot_publish_backoff_initial_ms,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:218:            .snapshot_publish_backoff_max_ms = snapshot_publish_backoff_max_ms,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:278:    /// owner uuid (`readOwnerUuid`, or -- when the owner anchor itself is missing -- recovered from a
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:358:    /// A non-gated, I/O-free lifecycle snapshot for `system.content_addressed_mounts` (spec §7,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:362:    /// requires appear verbatim in the snapshot; `since` is the wall-clock second the current non-`Live`
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:380:    /// + join the self-remount thread; (5) drain the ref lanes (bounded) and retire the keeper WITHOUT an
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:403:    /// PartWriteTxn-facing surface: a `PartWriteTxn` retires its own seq on finalize/abandon/dtor (previously reached
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:405:    void retireBuildSeq(uint64_t seq);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:430:    std::map<String, Resolved> listRefs(const RootNamespace & ns);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:432:    /// materializing `listRefs`'s full map. Empty `prefix` means "any ref at all".
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:439:    /// `roots/<prefix>` (a loose LIST used by browse only; callers re-check `listRefs`/`getFileSize`
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:449:    /// followed by `remove_namespace`, then a best-effort publish of the constant-size `Removed`
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:450:    /// snapshot. Performs NO physical deletion (no verbatim-file deletes, no tombstones) -- that is
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:452:    DropNamespaceStats dropNamespace(const RootNamespace & ns);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:454:    /// True iff this namespace's ref-table lifecycle is durably `Removed` — a table that `dropNamespace`
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:462:    /// fresh namespace), and itself gated on this namespace's `_cleanup` marker.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:470:    /// were rewired onto the snapshot+log ref protocol.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:482:    /// `Unresolved` outcome wedges this namespace's lane -- no later id is allocated until the SAME
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:488:    /// suppresses the hoisted `maybeSweepStalePrecommits` call below for THIS call only. Set ONLY by
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:489:    /// `dropNamespace`'s own removal call: that call's `build_ops` already names every current precommit
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:493:    /// `dropNamespace`'s later `build_ops` would see it already gone and undercount
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:501:    /// whether namespace `ns`'s recovery observed the exact
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:502:    /// `_cleanup/<remove_txn_id>` completion marker for `remove_txn_id` -- the SOLE gate on recreating
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:508:    /// the live `RefTableState` ONCE under `state_mutex` (candidate `X` = the state's `greatest_applied`
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:509:    /// at that instant, no replay), encodes it, and `putIfAbsentControlled`s it off the lock. Returns true iff
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:510:    /// a NEW snapshot was confirmed durable this call (false covers "nothing eligible yet", "nothing
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:512:    /// "Snapshot create fails: keep all logs; writer recovery remains unchanged"). Public so tests can
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:517:    /// ---- verbatim namespace files (format_version.txt, ...) — plain keys, never content-addressed ----
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:521:    /// Exact-token delete of one verbatim file (no-op when absent). Verbatim files are never
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:545:    /// The owning `BackendPtr` itself (not just a reference into it): the decommission slot-retirement
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:601:    /// renewer's cadence. Returns true iff a recovery thread is armed after the call.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:632:    /// for the empty-dead-region case (unlike a non-empty one, which the recovery seal covers), and
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:634:    /// first real snapshot of the new epoch).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:696:    /// writer_epoch → mount claim (+fence-recovery loop) → `MountLeaseKeeper` start → watermark
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:706:    /// reverse-order destruction retires the forwarder before the dispatcher it captures.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:716:    /// because the ledger is injected with them as callbacks (`fence_ok_fn` / `cancel_inflight_builds` /
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:728:    /// as `fence_ok` to every `CasRequestController` call the ref-log writer path makes.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:748:    /// Test seams: observe recovery-restart counting and wedge state without a private-member
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:767:    /// Whether this table still owes a stale-precommit sweep (armed by recovery; re-armed by a
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:777:    /// test seam: blocks until every background snapshot-publish attempt dispatched so far for
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:783:    /// test seam: the count of in-flight background snapshot-publish attempts for `ns` (the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:787:    /// test seam: the id of the newest snapshot this runtime has confirmed durable (recovered
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:791:    /// test seam: the `sealed_from` installed with `newestPublishedSnapshotIdForTest` -- the recovery
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:792:    /// seal's observed-region upper bound when the newest snapshot is a seal, else `nullopt`.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:796:    /// tail a snapshot candidate would replay from).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:806:    /// right before it carves a batch, i.e. AFTER the table is already recovered -- the one otherwise
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:846:    /// PARKED right now waiting on the leader's in-flight recovery (see `RefTableRuntime::
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:847:    /// recovery_waiters_for_test`) -- lets a test `yield()`-poll for "a second caller actually reached
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:852:    /// specific table's runtime is currently materialized (recovered) in the cache -- a table that was
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:853:    /// evicted reports false until its next touch re-recovers it.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:858:    /// the recovered base snapshot's encoded body size, the tail-since-snapshot byte sum, and the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:859:    /// `_cleanup` markers observed at recovery -- so a test can assert every `RecoveryResult` field.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:905:    /// whole-table ref cache, the append lane + wedge protocol, snapshot publication, stale-precommit
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:920:    /// self-remount recovery thread (with its own thread-lifecycle locks). Injected with backend/layout +
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:922:    /// + a `remount_attempt` callback (== `Pool::tryRemountOnce`, which STAYS on Pool: the claim/recovery
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:936:    /// Serializes `tryRemountOnce` (whose claim/recovery ORCHESTRATION stays on Pool). STAYS here with
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h:945:    /// (which surfaces it verbatim in the system table) read it, so the error message and the introspection
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:50:    extern const Event CasRefAppendDefiniteFailure;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:68:/// Classifies whether an exception thrown out of a ref-table recovery attempt (namespace LIST,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:69:/// snapshot/log GETs, or the seal PUT) is a TRANSIENT object-store transport failure worth retrying,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:71:/// fast. The recovery reads call the backend directly (not through `ref_request_controller`), so a
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:95:    std::function<bool()> fence_ok_fn_,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:108:    , fence_ok_fn(std::move(fence_ok_fn_))
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:123:    /// Default backoff sleep for the recovery retry loop (`ensureRefTableRecovered`): sleep in short
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:128:    recovery_retry_sleep_fn = [this](uint64_t total_ms)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:132:        while (slept < total_ms && fence_ok_fn())
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:143:    /// The ref lane's mount predicate (`fence_ok_fn` == `Pool::refAppendFenceOk`, with no per-table
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:145:    return ref_request_controller->putIfAbsentControlled(key, bytes, fence_ok_fn, out_token);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:152:    return ref_request_controller->conditionalCreateControlled(key, attempt, fence_ok_fn);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:159:    return ref_request_controller->putOverwriteControlled(key, bytes, expected, fence_ok_fn);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:164:    return ref_request_controller->putIfAbsentControlledMutable(key, bytes, fence_ok_fn);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:170:    recovery_retry_sleep_fn = std::move(sleep_fn);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:177:    /// The read side of the snapshot+log protocol has one authoritative cached table for this mounted
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:180:    /// per-shard decode cache), so the recovered-and-cached `RefTableState` is always this process's
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:238:std::map<String, Resolved> CasRefLedger::listRefs(const RootNamespace & ns)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:240:    /// The whole ref set is a map iteration over this namespace's recovered-and-cached `RefTableState`:
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:242:    /// never-touched namespace still costs exactly one `LIST` (recovery) and zero further requests;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:264:    /// Same recovery/maintenance preamble as `listRefs`; see there for why an empty or never-touched
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:265:    /// namespace still costs exactly one `LIST` (recovery) and a warm namespace costs nothing at all.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:292:    ///   resident, never recovers, never resolves a wedge, and -- see the `find` below -- never even
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:297:    ///   ONE snapshot across BOTH lane mutexes. `pending`/`leader_active` live under
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:303:    ///   `ref_queue_mutex`, an append is either entirely before this snapshot -- and then visible as a
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:308:    /// recovered view is a COMPLETE replay of the durable log. Completeness is recovery's contract, not
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:310:    /// this MOUNT can have fallen behind its own durable writes; a recovery that silently observed less
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:314:    /// Rule 2 (residency). `find`, NOT `getRefTableRuntime`: the latter INSERTS an empty, unrecovered
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:316:    /// cache -- and the very next reader would then pay a recovery this query invented. A cold or
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:324:    /// whole LIST + replay, so blocking here would make a confirm WAIT on someone else's recovery --
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:334:    /// Rule 2 (warm). An unrecovered or mid-recovery runtime has an EMPTY `state`, which would read as
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:337:    /// Recovery publishes atomically (`installRecoveryResult` sets `recovered` LAST under this mutex),
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:338:    /// so there is no half-recovered view to catch in between.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:339:    if (!rt.recovered || rt.recovery_in_progress || rt.superseded_by_remount.load(std::memory_order_acquire))
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:377:    /// `superseded_by_remount` is folded in exactly as `commitRefChunk`'s own `fence_ok` folds it: the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:379:    if (!fence_ok_fn() || rt.superseded_by_remount.load(std::memory_order_acquire))
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:388:    auto & slot = ref_tables[ns.string()];
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:389:    if (!slot)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:390:        slot = std::make_shared<RefTableRuntime>();
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:391:    return slot;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:396:    /// Held for the WHOLE recovery's LIST+replay: there is nothing safe to do with an unrecovered
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:399:    /// per mounted `Pool`: one `LIST` caches the resulting complete table state. The recovery seal's
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:401:    /// `recovery_in_progress` (not the mutex) is what serializes concurrent callers across that window;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:408:    if (rt.recovered)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:413:    while (rt.recovery_in_progress)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:415:        ++rt.recovery_waiters_for_test;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:416:        rt.recovery_cv.wait(lock);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:417:        --rt.recovery_waiters_for_test;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:419:    if (rt.recovered)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:422:    rt.recovery_in_progress = true;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:426:        rt.recovery_in_progress = false;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:427:        rt.recovery_cv.notify_all();
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:430:    /// Outer transient-retry loop (Layer 1 of the stuck-table-load fix): a whole recovery attempt
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:431:    /// (LIST + snapshot/log GETs + seal PUT) that fails with a TRANSIENT object-store transport error
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:434:    /// `recovery_retry_budget_ms` is spent, instead of propagating and failing this table's async load
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:438:    const uint64_t recovery_start_ms = boot_ms_now_fn();
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:439:    uint64_t recovery_retry_num = 0;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:456:                            "CAS ref-table recovery for namespace '{}' restarted {} times (a selected snapshot or "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:461:                    ++rt.recovery_restarts;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:465:                /// One namespace `LIST` returns every surviving snapshot, log,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:466:                /// and `_cleanup` marker key.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:467:                std::optional<RefTxnId> greatest_snapshot;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:495:                                if (!greatest_snapshot || *greatest_snapshot < parsed->txn_id)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:496:                                    greatest_snapshot = parsed->txn_id;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:507:                /// BOTH snapshots and logs -- used below to decide whether a dead-epoch region exists to seal.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:508:                /// Recomputed fresh on every restart-on-vanish attempt, exactly like `greatest_snapshot`/`log_ids`.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:509:                std::optional<RefTxnId> greatest_listed_id = greatest_snapshot;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:514:                std::optional<RefTableSnapshot> snapshot;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:515:                uint64_t snapshot_body_bytes = 0;   /// weight of the recovered base; 0 = never-born base
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:516:                if (greatest_snapshot)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:518:                    const auto got = backend.get(layout.refSnapshotKey(ns, *greatest_snapshot));
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:520:                        vanished = true;   /// covered by a newer snapshot published-before-delete; restart
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:523:                        snapshot = decodeRefTableSnapshot(openObject(FormatId::RefSnapshot, got->bytes), ns.string(), *greatest_snapshot);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:524:                        snapshot_body_bytes = got->bytes.size();
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:528:                /// Stream the post-snapshot tail through one builder: GET -> decode -> applyOne ->
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:533:                RefReplayBuilder builder(std::move(snapshot), snapshot_body_bytes);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:538:                        if (greatest_snapshot && !(*greatest_snapshot < id))
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:539:                            continue;   /// at or below the selected snapshot: already covered
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:566:                /// N-row overlay. The O(N) fold rides inside recovery, which is already O(N).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:573:                /// (`4 + ns.size()`, once in a snapshot body and once in a removal txn body) plus a fixed
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:576:                result.snapshot_budget = overhead < ref_snapshot_max_bytes ? ref_snapshot_max_bytes - overhead : 0;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:579:                /// At an UNCLEAN mount, close every dead epoch this recovery discovered with an immediate
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:580:                /// snapshot -- the seal -- published BEFORE the table is installed as recovered. A failed
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:581:                /// seal PUT throws here, leaving the table unrecovered, so the NEXT touch restarts recovery
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:583:                /// whose dead-epoch region was never closed; recovery therefore fails closed.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:586:                /// part of recovery that can run the full ~90s retry envelope, and holding the mutex across
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:588:                /// (which locks each table's `state_mutex` in turn). `recovery_in_progress` (set above), not
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:600:                /// observer, forever. `sealed_from` records the greatest id this recovery actually listed.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:606:                    result.newest_snapshot_id.has_value() && !(*result.newest_snapshot_id < seal_id);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:608:                /// sticky "ever" bool -- a table recovered for the first time (or reloaded after LRU eviction)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:614:                    RefTableSnapshot seal = snapshotOf(result.state, ns.string());
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:615:                    seal.snapshot_id = seal_id;                            /// upper bound of the covered region
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:618:                    const auto fence_ok = [this] { return fence_ok_fn(); };
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:620:                    /// `recovery_in_progress` and notifies `recovery_cv`, and it MUST run with `state_mutex`
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:621:                    /// held. `putIfAbsentControlled` can THROW (its contract: `CORRUPTED_DATA` when it
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:623:                    /// `recovery_in_progress` cannot serialize); if that exception escaped between `unlock`
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:633:                        outcome = ref_request_controller->putIfAbsentControlled(
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:634:                            layout.refSnapshotKey(ns, seal_id), seal_bytes, fence_ok);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:644:                            "CAS recovery seal PUT for namespace '{}' did not commit; failing recovery closed "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:645:                            "(the table stays unrecovered/non-writable; the next touch restarts recovery and "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:650:                    /// were the recovered snapshot and the tail were empty -- exactly what a fresh recovery
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:654:                    result.newest_snapshot_id = seal_id;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:658:                    result.base_snapshot_bytes = seal_bytes.size();
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:662:                /// field from `result` and sets `recovered` LAST, so no waiter (woken only by the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:663:                /// function-scope SCOPE_EXIT's `recovery_cv` notify, which runs after this returns) ever
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:668:            break;   /// recovery succeeded -> exit the outer retry loop
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:672:            /// `catch (...)`, not `catch (const Exception &)`: recovery LIST/GET failures can surface as
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:680:            const uint64_t elapsed_ms = boot_ms_now_fn() - recovery_start_ms;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:682:            /// a self-remount (mirrors `appendRefOps`' fence gate -- recovery must not re-drive on an
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:684:            if (elapsed_ms >= cas_request_budget.recovery_retry_budget_ms
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:685:                || !fence_ok_fn()
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:689:            /// Saturating `initial << recovery_retry_num` (mirrors `CasRequestController::backoffBefore
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:692:            const uint64_t init_backoff = cas_request_budget.recovery_retry_initial_backoff_ms;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:693:            const uint64_t cap_backoff = cas_request_budget.recovery_retry_max_backoff_ms;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:694:            const uint64_t backoff_ms = (recovery_retry_num >= 63 || init_backoff > (cap_backoff >> recovery_retry_num))
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:696:                : std::min(cap_backoff, init_backoff << recovery_retry_num);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:697:            ++recovery_retry_num;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:700:                "CAS ref-table recovery for namespace '{}' hit a transient object-store error "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:703:                recovery_retry_num, backoff_ms, elapsed_ms, cas_request_budget.recovery_retry_budget_ms);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:707:            /// (which mutates `recovery_in_progress` + notifies `recovery_cv` and MUST run under
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:711:                recovery_retry_sleep_fn(backoff_ms);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:720:            /// starting the next full attempt so we never re-drive recovery on an orphaned runtime, past
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:722:            if (boot_ms_now_fn() - recovery_start_ms >= cas_request_budget.recovery_retry_budget_ms
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:723:                || !fence_ok_fn()
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:726:            /// loop: re-run recovery from a fresh LIST (fresh snapshot/log/replay/seal)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:740:    /// One place that seeds a recovered table's runtime, copying EVERY `RecoveryResult` field so the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:741:    /// publication cannot drift from the struct. `recovered` is set LAST: the caller holds `state_mutex`
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:742:    /// throughout and the function-scope SCOPE_EXIT notifies `recovery_cv` only after this returns, so a
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:743:    /// parked waiter re-checking `recovered` under the same lock sees a fully-installed table or none.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:746:    rt.newest_snapshot_id = result.newest_snapshot_id;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:747:    /// `sealed_from` pairs with `newest_snapshot_id`: when the newest snapshot is a recovery seal this
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:752:    rt.tail_count_since_snapshot.store(result.tail_count, std::memory_order_relaxed);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:753:    rt.tail_bytes_since_snapshot.store(result.tail_bytes, std::memory_order_relaxed);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:754:    rt.base_snapshot_bytes.store(result.base_snapshot_bytes, std::memory_order_relaxed);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:755:    rt.snapshot_budget = result.snapshot_budget;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:758:    rt.recovered = true;   /// set LAST
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:768:    /// owner is its map slot is never destroyed while we still hold its `state_mutex` (that would destroy
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:779:            return rt.base_snapshot_bytes.load(std::memory_order_relaxed)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:780:                 + rt.tail_bytes_since_snapshot.load(std::memory_order_relaxed);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:791:        /// copy), no active queue leader, an empty pending queue, and not the just-recovered `keep_ns`.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:819:                /// the durable objects, and re-recovery could re-allocate an id:
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:905:    /// detached. A publisher observes the lost fence (`fence_ok` false) and returns without committing,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:906:    /// then decrements `pending_snapshot_publishes` under `state_mutex` and signals `publish_settle_cv`.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:911:            [&] { return rt->pending_snapshot_publishes.load(std::memory_order_relaxed) == 0; });
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:919:    /// re-recovers from the durable snapshot+log objects under `live_writer_epoch`. Dropping the map slot
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:945:    return rt->recovery_restarts;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:970:    /// the seam reproduces the whole runtime state the production `Unresolved` arm leaves behind, marker
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1013:    /// Latch FIRST, then snapshot under `ref_queue_mutex` (see the `shutting_down` member comment): this
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1015:    /// as its `pending.push_back` -- race-free against the snapshot below, for both an already-cached
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1055:    /// reset (see `flushRefBatch`'s `Unresolved` case), so this check -- performed AFTER the wait above
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1079:    /// Warm-mount re-observation: the recovery `LIST` that populated `cleanup_markers` may have
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1080:    /// run BEFORE GC's namespace-cleanup item published the `_cleanup/<remove_txn_id>` marker, so a
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1085:    /// matches the recovery restart-on-vanish philosophy of consulting the durable object on a cache miss.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1104:    /// becomes a queue leader -- `maybeSweepStalePrecommits`'s own nested `appendRefOps` calls are
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1109:        maybeSweepStalePrecommits(ns, rt);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1122:    /// this race-free against the drain's snapshot-and-wait (see the `shutting_down` member comment).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1297:    /// (validation reject, DefiniteFailure, Unresolved/wedge, Committed) lands in the affected items so
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1298:    /// waiters always wake, and this does NOT throw for any of them. Neither `commitRefChunk` nor the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1346:    /// re-armed fence would split-brain against the fresh runtime the next touch re-recovers. The
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1362:        /// Prepared in the SAME hold that reads the wedge, for the same reason `commitRefChunk` prepares
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1412:                /// our `putIfAbsent` would have been rejected. (`resolveByExactGet` never reports a
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1413:                /// plain absent verdict: an absent or unreadable key returns `Unresolved`, since
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1445:                        /// for hoisting it out of the region under a SHORT name) as in `commitRefChunk`:
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1467:                            /// guard already armed, exactly as in `commitRefChunk`'s region.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1480:                            /// applied-above-newest-snapshot tail counters exactly as the ordinary
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1481:                            /// Committed arm's does, or the snapshot-publish threshold and the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1483:                            /// until the next recovery reseeds.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1485:                            rt->tail_count_since_snapshot.fetch_add(1, std::memory_order_relaxed);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1486:                            rt->tail_bytes_since_snapshot.fetch_add(wedge_copy->bytes.size(), std::memory_order_relaxed);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1529:                /// The wedge's tail bump above may have crossed the snapshot-publish threshold. This flush
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1540:                /// Still Unresolved: fail every CURRENTLY queued item with the SAME uncertainty
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1545:                /// There is deliberately NO `NoAttemptSent` counterpart to `commitRefChunk`'s arm here,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1546:                /// and the asymmetry is not an oversight: this `Unresolved` comes from
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1548:                /// and reports `Unresolved` for "absent" and "the read failed" alike. So a resolution can
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1661:    /// sequence continues `greatest_applied`'s counter only when its epoch already matches the live
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1663:    /// recovery seal's `{dead_epoch, UINT64_MAX}` -- the live epoch alone already
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1664:    /// dominates `greatest_applied` (mount exclusivity guarantees `live_epoch_fn() >=
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1665:    /// greatest_applied.writer_epoch`), so the sequence starts fresh at 0. This also keeps the `+= 1`
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1736:            /// Release the scratch `working` so `commitRefChunk`'s post-commit overlay fold is in place
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1739:            const bool committed = commitRefChunk(ns, rt, final_ops, survivors);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1743:                /// `commitRefChunk`. Fail THIS item and the entire not-yet-attempted remainder too, so no
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1746:                /// unresolved wedge from `commitRefChunk` therefore contains ONLY this chunk.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1779:            /// Whole-item shape validation (prerequisite to `dropNamespace`): the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1781:            /// whole-transaction-shape rule like "remove_namespace must be the FINAL op" trivially
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1783:            /// malformed item (e.g. remove_namespace not last) would otherwise only be caught by
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1784:            /// `commitRefChunk`'s candidate apply -- which fails the whole chunk, taking every innocent
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1804:                /// no meaningful "current snapshot" to encode); `remove_namespace` and a pure
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1808:                if (state_growing && !admits(item_scratch, op, rt->snapshot_budget, rt->removal_budget))
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1811:                        "(snapshot_budget={} removal_budget={}) — refusing before any object is created",
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1812:                        ns.string(), rt->snapshot_budget, rt->removal_budget);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1865:    /// possibly only -- ref-log transaction. Release the scratch `working` first so `commitRefChunk`'s
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1870:    commitRefChunk(ns, rt, final_ops, survivors);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1873:bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt,
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1879:    /// `fence_ok` folds `superseded_by_remount` into the append fence so a self-remount landing between a
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1880:    /// leader's pre-allocate re-check and its `PUT` reports Unresolved rather than committing against a
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1892:    const auto fence_ok = [this, &rt] { return fence_ok_fn() && !rt->superseded_by_remount.load(std::memory_order_acquire); };
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1897:    /// seq} now and PUTting it (its live `fence_ok` would pass) would persist a transaction validated
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1900:    /// cache unchanged) keeps the durable log free of any stale-view transaction. The append `fence_ok`
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1913:    /// returned this whole batch closed (Unresolved / foreign interference) -- reaching HERE with a
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1922:            chassert(!rt->wedge, "commitRefChunk: new-id allocation attempted while the ref-log lane was still wedged");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1929:                fmt::format("commitRefChunk attempted new-id allocation for namespace '{}' while the lane "
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1948:    /// `greatest_applied < its id` (contiguity is not checked), and a snapshot published afterwards is
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1949:    /// labelled with THAT id, so recovery skips the stranded transaction forever while GC, which folds
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:1978:    /// its key and body straight out of it. The `Unresolved` arm below used to build
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2010:    /// WHY an Unresolved came back. Two jobs (finding #37 defect 3): the wedge message stops claiming an
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2011:    /// exhausted retry budget when in fact no request was ever sent, and -- see the `Unresolved` arm --
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2013:    CasUnresolvedReason unresolved_reason = CasUnresolvedReason::NotUnresolved;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2016:        outcome = ref_request_controller->putIfAbsentControlled(
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2017:            prepared_wedge.key, prepared_wedge.bytes, fence_ok, /*out_token=*/nullptr, &unresolved_reason);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2021:        /// `putIfAbsentControlled` throws CORRUPTED_DATA when resolve-before-reissue observes a DIFFERENT
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2039:                /// Only this leader mutates `rt->state`, so the candidate's base snapshot is still the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2042:                /// recovery installs a state exactly once per runtime and has already completed for this
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2043:                /// table, and every other consumer (readers, the snapshot publisher) only COPIES the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2069:                    rt->tail_count_since_snapshot.fetch_add(1, std::memory_order_relaxed);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2070:                    rt->tail_bytes_since_snapshot.fetch_add(prepared_wedge.bytes.size(), std::memory_order_relaxed);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2077:                    poisonApplyState(*rt, ns, "commitRefChunk install");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2120:            /// would be bricked on every future recovery. The install can no longer throw, so there is
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2142:        case CasWriteOutcome::DefiniteFailure:
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2147:            ProfileEvents::increment(ProfileEvents::CasRefAppendDefiniteFailure);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2154:        case CasWriteOutcome::Unresolved:
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2156:            /// The ONE `Unresolved` shape that must NOT wedge (finding #37 defect 3). The wedge exists
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2157:            /// because an `Unresolved` PUT MAY HAVE LANDED: the durable log may or may not contain this
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2162:            /// `unresolvedProvesNothingWasSent` is true only for `NoAttemptSent`, which
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2163:            /// `putIfAbsentControlled` reports only when a pre-attempt gate -- the mount fence or the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2165:            /// `backend->putIfAbsent`. Nothing reached the network, so the key is provably unwritten:
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2168:            /// key absent and reports `Unresolved` forever -- so it blocks every ref append for this table
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2180:                /// as on the `DefiniteFailure` arm. Leaving it `ApplyPending` would claim this table may
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2198:                    describeUnresolvedReason(unresolved_reason))));
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2207:                /// `ApplyPending` on the success path: an `Unresolved` outcome is precisely "an object
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2220:                    /// The install of the OTHER post-durable record (spec §A1 site 3). `Unresolved` means
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2232:                    poisonApplyState(*rt, ns, "commitRefChunk wedge install");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2242:                describeUnresolvedReason(unresolved_reason))));
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2256:    /// single-in-flight gate, the backoff deadline -- and the `pending_snapshot_publishes` increment all
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2263:        && rt.pending_snapshot_publishes.load(std::memory_order_relaxed) == 0
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2269:        /// `tail_count_since_snapshot`/`tail_bytes_since_snapshot` count ONLY applied txns strictly above
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2270:        /// `newest_snapshot_id` (maintained incrementally by every commit in `commitRefChunk` and by the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2273:        const uint64_t publishable_count = rt.tail_count_since_snapshot.load(std::memory_order_relaxed);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2274:        const uint64_t publishable_bytes = rt.tail_bytes_since_snapshot.load(std::memory_order_relaxed);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2275:        const bool over_threshold = publishable_count > config.snapshot_log_count_threshold
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2276:            || publishable_bytes > config.snapshot_log_bytes_threshold;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2279:            rt.pending_snapshot_publishes.fetch_add(1, std::memory_order_relaxed);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2288:    /// `admitSnapshotPublishUnderStateLock` already incremented `pending_snapshot_publishes` for THIS
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2306:                tryLogCurrentException(getLogger("CasPool"), "CAS background snapshot publish attempt failed");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2320:            rt->pending_snapshot_publishes.fetch_sub(1, std::memory_order_relaxed);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2323:        tryLogCurrentException(getLogger("CasPool"), "CAS background snapshot-publish dispatch failed to launch");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2337:        /// snapshot while this publish was capturing an earlier prefix had its trigger discarded by the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2339:        /// unrelated later trigger (spec §3 snapshot coalescing). Re-admitting under the SAME lock as the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2340:        /// decrement means `pending_snapshot_publishes` never transiently reaches 0 across the handoff, so
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2344:        rt->pending_snapshot_publishes.fetch_sub(1, std::memory_order_relaxed);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2357:    /// conditional PUT that would fail `fence_ok` and return non-Committed anyway, and dispatching one
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2380:        ? config.snapshot_publish_backoff_initial_ms
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2381:        : std::min<uint64_t>(rt.publish_backoff_ms * 2, config.snapshot_publish_backoff_max_ms);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2397:    rt->publish_settle_cv.wait(lock, [&] { return rt->pending_snapshot_publishes.load(std::memory_order_relaxed) == 0; });
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2404:    return rt->pending_snapshot_publishes.load(std::memory_order_relaxed);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2412:    return rt->newest_snapshot_id;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2428:    return rt->tail_count_since_snapshot.load(std::memory_order_relaxed);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2460:/// live state fresh, so snapshot CONTENT is never affected) over an unsafe wraparound.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2487:            return false;   /// nothing to (re)publish here; dropNamespace publishes its own Removed snapshot
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2488:        if (rt->newest_snapshot_id && !(*rt->newest_snapshot_id < rt->state.getGreatestApplied()))
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2489:            return false;   /// nothing above the newest snapshot
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2492:        captured_count = rt->tail_count_since_snapshot.load(std::memory_order_relaxed);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2493:        captured_bytes = rt->tail_bytes_since_snapshot.load(std::memory_order_relaxed);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2496:    const RefTableSnapshot snap = snapshotOf(candidate_state, ns.string());
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2499:    /// dead past `snapshotOf`. Destroy it HERE, under `state_mutex` -- not at function return outside any
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2521:        /// Failure Handling: "Snapshot create fails: keep all logs; writer recovery remains unchanged."
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2529:    const auto fence_ok = [this] { return fence_ok_fn(); };
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2530:    const CasWriteOutcome outcome = ref_request_controller->putIfAbsentControlled(key, bytes, fence_ok);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2533:        /// DefiniteFailure/Unresolved: DO NOT prune (no durable covering snapshot -- pruning the tail
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2535:        /// re-dispatch this full-snapshot encode+PUT until it elapses -- the read-triggered PUT-storm
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2546:        /// monotonic guard below skips the in-memory adoption because a newer snapshot already won).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2551:        /// `newest_snapshot_id` below what a newer attempt already advanced it to -- the next published
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2552:        /// snapshot would then omit committed transactions and recovery would lose refs. Skip the
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2553:        /// in-memory adoption (and the counter subtraction below) whenever a newer-or-equal snapshot is
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2555:        /// the greatest snapshot, GC reclaims covered ones). This also keeps the Removed path monotonic:
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2556:        /// a stale Live attempt can never drag `newest_snapshot_id` back below a `remove_txn_id` that
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2559:        if (rt->newest_snapshot_id && !(*rt->newest_snapshot_id < candidate_x))
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2567:        clampedCounterSub(rt->tail_count_since_snapshot, captured_count);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2568:        clampedCounterSub(rt->tail_bytes_since_snapshot, captured_bytes);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2569:        /// logs-per-table-after-snapshot: the tail this publish compacted.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2571:        rt->newest_snapshot_id = candidate_x;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2572:        /// `sealed_from` pairs with `newest_snapshot_id` (CasRefLedger.h): it is the newest snapshot's own
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2573:        /// seal bound, `nullopt` for an ordinary Live snapshot. Take it from the snapshot just published
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2574:        /// (`snap`, always `nullopt` here) so this later publication CLEARS any predecessor recovery seal's
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2575:        /// `sealed_from` -- leaving it would describe this non-seal snapshot with the seal's observed-region
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2578:        /// The new cache-weight base is exactly the snapshot
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2580:        rt->base_snapshot_bytes.store(bytes.size(), std::memory_order_relaxed);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2588:    /// A read-only caller (resolveRef/listRefs) must not fail its OWN
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2591:    /// top-level hoisted call, which calls `maybeSweepStalePrecommits` directly, uncaught) keeps
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2595:    /// `maybeSweepStalePrecommits`, so a later read/mutation trigger on THIS mount retries until a
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2601:        maybeSweepStalePrecommits(ns, rt);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2612:void CasRefLedger::maybeSweepStalePrecommits(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2679:    /// After a fresh mount fence and recovery, this writer
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2685:    /// (a later retry on this mount, or the next mount's recovery) to find; nothing here can loop
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2774:        if (rt->newest_snapshot_id && *rt->newest_snapshot_id == remove_id)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2775:            return;   /// already published this exact Removed snapshot
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2780:    removed_snap.snapshot_id = remove_id;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2785:    const auto fence_ok = [this] { return fence_ok_fn(); };
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2786:    const CasWriteOutcome outcome = ref_request_controller->putIfAbsentControlled(key, bytes, fence_ok);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2791:    rt->newest_snapshot_id = remove_id;
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2792:    /// A Removed snapshot is never a recovery seal; take `sealed_from` from it (`nullopt`) so this
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2794:    /// `newest_snapshot_id` (CasRefLedger.h).
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2796:    rt->tail_count_since_snapshot.store(0, std::memory_order_relaxed);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2797:    rt->tail_bytes_since_snapshot.store(0, std::memory_order_relaxed);
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2890:DropNamespaceStats CasRefLedger::dropNamespace(const RootNamespace & ns)
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2893:    /// removal for every committed ref and precommit, followed by `remove_namespace` -- the removal
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2968:    /// the constant-size Removed snapshot"; best-effort here (the removal itself already succeeded) --
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2976:        tryLogCurrentException(getLogger("CasPool"), "CAS dropNamespace: publishing the Removed snapshot failed (best-effort)");
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2979:    /// The writer performs NO physical deletion of ref-log/snapshot objects or verbatim namespace files
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2981:    /// keyed off the durable `remove_namespace` this call just appended.
+-src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:2982:    /// Until GC reclaims it, a dropped namespace's ref-log objects and verbatim files remain as debris.
+
