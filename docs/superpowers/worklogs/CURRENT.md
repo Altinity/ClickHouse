@@ -1138,3 +1138,13 @@ commits. No long run under test, no signals to observe, nothing scheduled.
 
 **11:26 UTC watchdog** — idle and unchanged: nothing running, 319G, load 0.48, 0 uncommitted, 76 local
 commits. No long run under test, no signals to observe, nothing scheduled.
+
+**11:56 UTC watchdog** — idle for MY work, but the worktree is NOT idle: 5 commits appeared this cycle that
+are not mine (`04286` test lane exclusion, CI cache-status cleanup, a death-test split, sharding the CA-s3
+sanitizer stateless lanes) and a second `claude` process is at 15% CPU with 1,058 s elapsed. Another live
+session is working in this shared checkout — expected, and per standing practice I do not halt or interfere.
+
+Noting it explicitly because it changes what my own numbers mean: the commit count (81) and the load
+average (peaked 3.82) are no longer solely mine, and free RAM dropped to 3 GB with 55 GB in cache, i.e.
+someone is doing heavy I/O. Disk steady at 319G, nothing of mine running, no long run under test, no
+signals to observe, nothing scheduled.
