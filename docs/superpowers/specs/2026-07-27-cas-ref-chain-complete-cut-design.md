@@ -9,9 +9,10 @@ doc_type: 'reference'
 
 # CAS: contiguous ref streams and the in-band epoch seal {#cas-ref-contiguous-chain}
 
-**Date:** 2026-07-28. **Status:** v9 — the CORE, cut back after the user's second scope intervention;
-adjacent findings moved to `cas/2026-07-28-ref-rework-adjacent-findings.md`; awaiting one final
-review round and user review. **Branch:** `cas-gc-rebuild`.
+**Date:** 2026-07-28. **Status:** v9 CONVERGED — round 9 verdict APPROVE-WITH-FIXES (no core
+data-loss counterexample; the six fixes are folded into this text and the plan obligations); the
+user delegated the proceed decision to convergence (unattended directive). **Branch:**
+`cas-gc-rebuild`.
 
 Fixes BACKLOG `{#list-as-journal-dataloss-2026-07-25}` (observed:
 `reports/2026-07-26-list-incompleteness-investigation.md`) and closes the rev.4 `Late Predecessor
@@ -60,7 +61,8 @@ Removal deletes the catalog entry IMMEDIATELY after the terminal record folds an
 cleanup runs — no physical-empty proof: surviving old-incarnation objects are structurally inert
 (foreign prefix; the fold works only off catalog entries) and a lazy janitor deletes
 foreign-incarnation debris whenever listed (omission = deferred cleanup, leak-only direction).
-**The catalog stays O(live + in-flight-removing) under any create/drop churn.** Manifests keep their
+**The catalog stays O(`Creating` + `Live` + `Removing`) under any create/drop churn** (stalled
+creators occupy entries until fence-terminal reconciliation — r9-6). Manifests keep their
 `(namespace, mount-epoch, build-sequence)` identity — mount-global build ids already prevent
 rebirth aliasing; verbatim FILES stay unqualified and keep today's `_cleanup` gate — their
 pre-existing rebirth-aliasing hazard is register item R1, not this spec. Capacity: namespace names
@@ -81,7 +83,10 @@ corruption. Removal deletes `_ckpt` by exact token while the entry is `Removing`
 **Read-side contract, stated honestly:** ref-layer readers hold `(namespace, incarnation)` and can
 never alias a new life (foreign prefix); a stale reader gets stale-or-`NotFound`, not rejection —
 rejection would need a fence/catalog read that hot paths do not pay. Destructive cleanup revalidates
-life and fence immediately before every delete.
+life and fence immediately before every delete. **Closed at the API boundary (r9-3):** one typed
+`RefNamespaceId{namespace, incarnation}` is required by every ref prefix/key/parser/cache helper and
+the namespace-only overloads are DELETED — recovery/fold/fsck/sweep derive it from the catalog, live
+readers from their handle — so dropping the incarnation is unrepresentable, not merely forbidden.
 
 ## 3. Lifecycles {#lifecycles}
 
@@ -118,22 +123,28 @@ is corruption, never grounds for clearing — or an unconsumed-seal crossing) HO
 deletion, sweep deletes, ref cleanup) only holding a frontier proof for EVERY `Live`/`Removing`
 entry: hinted-active namespaces prove theirs by walking to an absent expected-next; every other
 namespace gets one exact `GET cursor+1` (present → it was wrongly quiet, walk it). Budget exhausted
-first → cursor advances may seal, all destruction suppressed. **The temporal lemma, normative:** the
-proof is a snapshot, and the existing machinery closes each window — a `+1` landing after its
-namespace's probe cannot lose data because a newly condemned blob is not deleted in the same round,
-an already-delete-pending blob's `Condemned` meta forces writer rematerialization from source, and
-the exact-token delete cannot remove the rematerialized incarnation; `Creating` cannot publish;
-`Removing` cannot add ownership; a late terminal record only delays reclamation.
+first → cursor advances may seal, all destruction suppressed. **The temporal lemma, normative (split per r9-2):** the proof is a snapshot, and the existing
+machinery closes each window — a `+1` landing after its namespace's probe cannot lose data because a
+newly condemned blob is not deleted in the same round, and for the already-delete-pending case each
+writer path has its own closure: SOURCE-BACKED/TOKENED adoption reads `Condemned` meta and
+rematerializes from source (the exact-token delete cannot remove the new incarnation), while
+TOKENLESS relink (`adoptEvidence`) performs no meta read and is safe by ORDERING — the receiver's
+`+1` is durable before the source releases its committed edge, so the blob inherits an unbroken
+ownership chain; `Creating` cannot publish; `Removing` cannot add ownership; a late terminal record
+only delays reclamation.
 
 **The hold is durable and survives REBUILD.** `ShardCoverage::classification == 4` carries
 `{reason, offending position, retry/backoff}` per `(namespace, incarnation)` — a strict grammar:
-these fields required for classification 4, forbidden otherwise. `suppress_destructive` = current
+these fields required for classification 4, forbidden otherwise; the wire definition (a bounded
+reason ENUM, numeric maxima, duplicate rules) and a byte-exact reservation including escaping,
+framing and trailer growth are plan obligations with boundary and boundary-plus-one tests (r9-4). `suppress_destructive` = current
 anomalies OR every carried hold, computed before EVERY destructive site. A carried hold forces an
 exact retry of its offending position even when the hint omits the namespace, and clears ONLY by
 folding through that position and adopting the result in `gc/state` — never by observing another
-absent. **REBUILD carries every hold verbatim into the rebuilt baseline; a missing or undecodable
-prior seal makes the rebuilt baseline pool-wide-held (or the rebuild refuses) — never an ordinary
-deletion-capable baseline.**
+absent. **REBUILD carries every hold verbatim into the rebuilt baseline; with a missing or undecodable
+prior seal REBUILD REFUSES, naming pool recreation as the recovery path** (r9-1: the "pool-wide-held
+baseline" alternative is not representable in the per-namespace shapes and would need an invented
+offending position that could never be folded through — the refusal branch is the already-safe one).
 
 Cursors are keyed by catalog entries; unhinted namespaces carry verbatim. B1:
 `logs_accounted == logs_applied` over the cut, `EpochSeal` an applied no-op (B2 `produced=false`).
@@ -162,8 +173,10 @@ genuinely unproven; a healthy pool returns clean.
 ## 8. Costs, honestly {#costs}
 
 Append path: +0 requests (the allocator gets simpler). Recovery: +1 conditional PUT per touched
-namespace per epoch transition (+1 per adopted straggler) + one `_ckpt` CAS. Snapshot publication:
-+1 `_ckpt` CAS (async). DDL: three conditional writes to create; catalog CAS to remove. Fold: +1
+namespace per epoch transition, and each adopted straggler costs a conditional PUT PLUS an exact
+`GET` (`putIfAbsent` conflicts return no bytes — r9-6) + one `_ckpt` CAS. Snapshot publication:
++1 `_ckpt` CAS (async). DDL: three conditional writes to create; removal = `Live→Removing` CAS +
+terminal append + exact `_ckpt` delete + catalog-entry CAS. Fold: +1
 catalog `GET` per round; destructive rounds add one exact `GET` per quiet namespace (the frontier
 proof); deep arithmetic walks dominate backlog cost and share one pool-level concurrency budget with
 cleanup. Performance interactions with the measured GC study (3.42 M serial trips/round, 256 logs/s,
@@ -194,7 +207,12 @@ ambiguous-then-definite id reuse; CAS-walk both directions incl. clean transitio
 `_ckpt` races (cleanup between PUT and CAS; stale base three-way; merge; no-op skip); recovery
 across self-remount; incarnation inertness at rebirth under churn (create/drop per second: catalog
 size stays flat); legacy-pool open fails closed; hold grammar strict codec; max-size seal write
-check. The full enumerated list from rounds 5–8 rides in the implementation plan.
+check; and the four r9-5 sabotages: REBUILD with a missing/undecodable prior seal REFUSES (never
+publishes a deletion-capable baseline); a held higher witness disappearing while the gap remains =
+corruption; a ref key builder that drops the incarnation cannot compile/encode; an old-generation
+wedge or recovery result returning after the successor sealed the slot is refused by a generation
+recheck under the install lock (post-I/O, immediately before every install/unwedge/`_ckpt`
+publication). The full enumerated list from rounds 5–9 rides in the implementation plan.
 
 ## 10. Alternatives and history {#alternatives}
 
