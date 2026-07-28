@@ -43,7 +43,7 @@ task here. Additional Stage-B constraints:
 | 5 | Removal lifecycle: terminal record, janitor, deposited-incarnation cleanup | §3 | 3,4 |
 | 6 | Read-side contract: handles + pre-delete life/fence revalidation | §2 | 4 |
 | 7 | R5 decommission duties | register R5 | 4,5 |
-| 7b | Destruction enablement: flip `kUniverseAuthoritative` | staging contract | 4,5,6,7 |
+| 7b | Destruction enablement: `UniversePolicy::kDefault` → authoritative | staging contract | 4,5,6,7 |
 | 8 | R2+R3: writer duty queue + orphan-blob nomination (one coherent change) + model extensions | register R2/R3, §9 | 4 |
 | 9 | R1 spec (verbatim-file rebirth aliasing) — spec only | register R1 | — |
 | 10 | TLA debt: `listedTok` audit, unasserted drivers, runnerless models, classifier | phase follow-ups | — |
@@ -196,7 +196,10 @@ struct RefCatalog                          /// one object, key `cas/ref_catalog`
   while creator fence is live, succeeds token-exactly after fence terminal; stale token at
   reconciliation → fail closed; publication attempted while `Creating` → refused;
   fenced-out between `_ckpt` create and the `Creating→Live` CAS → the CAS refuses (the
-  zombie-install C++ twin — `CaRefCatalogCore` `ZombieGoLive` red).
+  zombie-install C++ twin — `CaRefCatalogCore` `ZombieGoLive` red); token-stale: entry token
+  advanced by a concurrent reconciler between the creator's read and its `Creating → Live`
+  CAS → refused by token, entry unchanged; both-stale: fence bumped AND token advanced →
+  refused (either check first, both orders exercised).
 - [ ] **Step 2:** → FAIL. **Step 3:** Implement. **Step 4:** CA gate green.
 - [ ] **Step 5: Commit** `ca: ref — namespace creation lifecycle; token-exact reconciliation; three-site recheck`.
 
@@ -214,8 +217,9 @@ struct RefCatalog                          /// one object, key `cas/ref_catalog`
 - Consumes: Tasks 1-3.
 - Produces: spec §5's fold shape — per round ONE catalog `GET`; cursors keyed by catalog
   entries `(ns, incarnation)`; unhinted namespaces carry verbatim; the frontier proof (Stage A
-  Task 9) now iterates EVERY `Live`/`Removing` entry. **`kUniverseAuthoritative` stays FALSE in
-  this task** [codex r2 finding 1 — flipping here would open a deletion-capable window before
+  Task 9) now iterates EVERY `Live`/`Removing` entry. **`UniversePolicy::kDefault` stays
+  `StageA_Suppressed` in this task** [codex r2 finding 1 — flipping here would open a
+  deletion-capable window before
   the removal lifecycle (Task 5) and read-side/pre-delete contracts (Task 6) exist]; the flip
   is Task 7b's, after Tasks 5/6/7 are green. Recovery/fold/fsck/sweep construct
   `RefNamespaceId` from the catalog, live readers from their handle (§2).
@@ -334,21 +338,22 @@ root remains.
   `test_content_addressed_drop_pool_member` lane green.
 - [ ] **Step 5: Commit** `ca: decommission — catalog-exact duties; retirement fenced on owned entries`.
 
-### Task 7b: Destruction enablement — flip `kUniverseAuthoritative` {#task-7b}
+### Task 7b: Destruction enablement — `UniversePolicy::kDefault` → authoritative {#task-7b}
 
 **Files:**
-- Modify: the Stage-A constant's translation unit (`Gc/CasGc.h` region — the constexpr from
-  Stage A Task 9) — `false` → `true`, comment updated to cite THIS task
+- Modify: the `UniversePolicy` enum's translation unit (`Gc/CasGc.h` region — Stage A Task 9's
+  seam) — `kDefault` changes from `StageA_Suppressed` to the authoritative value; comment
+  updated to cite THIS task
 - Test: the Stage-A cross-namespace kill-shot test in `gtest_cas_list_liar_end_to_end.cpp`
 
 [Codex r2 finding 1: this flip is deliberately AFTER the removal lifecycle (Task 5), the
 read-side/pre-delete contracts (Task 6), and the same-rollout decommission duties (Task 7).]
 
-- [ ] **Step 1:** Flip the constant. The kill-shot test's expectations change: "zero deletes
+- [ ] **Step 1:** Change `kDefault` (the source-level flip — no other seam exists). The
+  kill-shot test's expectations change: "zero deletes
   because suppressed" becomes "zero deletes because namespace `A` is IN the catalog and its
   frontier is probed" — the same scenario now survives on PROOF, not suppression; the
-  seam-forced variant (constant already true) collapses into the production case and is
-  removed. This is the ONE intentional Stage-B edit of that Stage-A test (the reviewer expects
+  explicit-`AuthoritativeForTest` variant collapses into the production case and is removed. This is the ONE intentional Stage-B edit of that Stage-A test (the reviewer expects
   exactly this diff).
 - [ ] **Step 2:** Full CA gate + both CA-s3 lanes + `test_content_addressed_gc_s3` green —
   destruction now ACTIVE for the first time on the new universe; watch the delete families'

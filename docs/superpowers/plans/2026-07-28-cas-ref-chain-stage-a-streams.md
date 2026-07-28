@@ -66,7 +66,8 @@ Blob in-degree is POOL-WIDE (spec §1): an acked hidden `+1` in a namespace abse
 hint and `gc/state` can coexist with a visible `-1` elsewhere, and no per-known-namespace
 frontier proof can exclude it — the catalog universe (Stage B Task 4) is LOAD-BEARING for the
 acked-loss closure. Therefore Stage A hard-wires `frontier_incomplete = true` at the universe
-seam (a named constant `kUniverseAuthoritative = false` with a comment citing this paragraph),
+seam (`UniversePolicy::kDefault = StageA_Suppressed`, a source-level default with a comment citing
+this paragraph),
 so `suppress_destructive` holds on EVERY round: folds, seals, cursors, holds, recovery and
 `_ckpt` all run for real; every delete family stays inert. Stage B flips the constant when the
 catalog becomes the universe. Deletion-path CORRECTNESS is still fully tested in Stage A gtests
@@ -152,9 +153,9 @@ SEQUENTIALLY (never two implementers in one worktree).
 
 Grammar (spec INV-2, with the genesis contract made explicit — codex r2 finding 2): "genesis"
 is PER-NAMESPACE — the namespace's `life_epoch` (the writer epoch of its `NamespaceBirth`
-record; a brand-new namespace born at global epoch `E > 1` is at ITS genesis). The validator is
-therefore CONTEXTUAL: `void validateEpochSealGrammar(const RefLogTxn &, uint64_t life_epoch)`.
-Rules: a seal txn contains EXACTLY ONE op and it is `EpochSeal`; `prev_epoch_seal` is REQUIRED
+record; a brand-new namespace born at global epoch `E > 1` is at ITS genesis). Validation is SPLIT (see Produces): structural rules live in the codec; the required-iff rule
+is contextual — `validateEpochSealGrammarContextual(const RefLogTxn &, uint64_t life_epoch)` —
+and runs where `life_epoch` is known. Rules: a seal txn contains EXACTLY ONE op and it is `EpochSeal`; `prev_epoch_seal` is REQUIRED
 on exactly sequence 1 of every epoch with `writer_epoch > life_epoch` (including a sequence-1
 seal closing an empty epoch) and FORBIDDEN elsewhere — in particular FORBIDDEN at
 `{life_epoch, 1}`; the seal's own id is `{closing_writer_epoch, T+1}` where `T` = greatest
@@ -182,8 +183,10 @@ path lands in Task 4 Step 1 (it needs the writer runtime).
 - [ ] **Step 2:** Run: `unit_tests_dbms --gtest_filter='CasRefEpochSealFormat*'` → FAIL (kind not defined).
 - [ ] **Step 3:** Implement: add the enum value + word mapping (`"epoch_seal"`), the optional
   meta field (additive encode: emit only when set; decode: accept once, reject duplicates),
-  `validateEpochSealGrammar` called from `readOpRecord`'s txn finalization AND from the encoder
-  (both directions fail closed — Constraint 7). `refLogTxnIsRemovalClass` returns `false` for seals.
+  `validateEpochSealGrammarStructural` called from `readOpRecord`'s txn finalization AND from
+  the encoder (both directions fail closed — Constraint 7); `validateEpochSealGrammarContextual`
+  exported for the apply/encode call sites (wired by Tasks 3/4/6 — the codec never sees
+  `life_epoch`). `refLogTxnIsRemovalClass` returns `false` for seals.
 - [ ] **Step 4:** Run the new filter → PASS; run the full CA gate filter → no regressions.
 - [ ] **Step 5: Commit** `ca: formats — EpochSeal record kind + strict seal grammar`.
 
@@ -454,7 +457,7 @@ CkptPublishOutcome publishCkpt(Backend &, const Layout &, const RootNamespace &,
 - Create: `src/Disks/tests/gtest_cas_ref_recovery_cas_walk.cpp`
 
 **Interfaces:**
-- Consumes: Task 1 grammar (`prev_epoch_seal`, `validateEpochSealGrammar`), Task 2 `slotOccupy`,
+- Consumes: Task 1 grammar (`prev_epoch_seal`, `validateEpochSealGrammarContextual`), Task 2 `slotOccupy`,
   Task 4 wedge adoption, Task 5 `publishCkpt` + three-way revalidation,
   `checkFenceOrThrow` (`CasMountRuntime.cpp:105`).
 - Produces: recovery per spec §4 — the sequence Stage B extends with the catalog step.
@@ -667,19 +670,19 @@ quiet → walk it this round (Task 7 loop). Budget exhausted before every proof 
 advances may still seal, ALL destruction suppressed this round. `suppress_destructive` becomes
 `anomalies present OR any hold carried OR frontier incomplete`, and is CONSULTED at every
 destructive site. **The Stage-A universe seam:** `frontier_incomplete` is computed as
-`!kUniverseAuthoritative || <per-namespace proofs missing>` where
-`constexpr bool kUniverseAuthoritative = false;` in Stage A (staging contract; the comment cites
-codex finding 1's cross-namespace scenario verbatim); gtests reach the per-namespace logic via a
-test seam (`GcTestHooks::force_universe_authoritative`) that constructs CLOSED universes — and
+`policy != UniversePolicy::AuthoritativeForTest || <per-namespace proofs missing>` where the
+destructive-gate computation receives `UniversePolicy policy = UniversePolicy::kDefault` and
+`kDefault = StageA_Suppressed` in Stage A (staging contract; the comment at the enum cites
+codex finding 1's cross-namespace scenario verbatim); gtests reach the per-namespace logic by
+passing `AuthoritativeForTest` explicitly at the fold-entry call with CLOSED universes — and
 the seam is PRODUCTION-UNREACHABLE [codex r2 finding 1]: `GcTestHooks` is declared in a
 test-only header compiled solely into `unit_tests_dbms` (no production translation unit
 includes it), and the injection is a PARAMETER, not an override [codex r3 finding 1 — a test-only header cannot
-override a `constexpr` compiled into production code]: the destructive-gate computation takes
-`UniversePolicy policy = UniversePolicy::kDefault` where `kDefault` is `StageA_Suppressed`
-(this stage) and the enum's only other value `AuthoritativeForTest` is passed EXPLICITLY by
-gtests at the fold-entry call; the single production call site passes nothing. No config, no
-env, no runtime flag reads the policy — Stage B's Task 7b changes `kDefault` itself (a source
-change), which is the entire flip.
+override a constant compiled into production code]: the enum's only other value
+`AuthoritativeForTest` is passed EXPLICITLY by gtests at the fold-entry call; the single
+production call site passes nothing. No config, no env, no runtime flag reads the policy —
+Stage B's Task 7b changes `kDefault` itself (a source change), which is the entire flip. There
+is NO other seam: no `GcTestHooks`, no mutable global.
 **Destructive-site inventory is a STEP, not an assumption** [codex finding 6]: before wiring,
 run a tree-wide inventory of every `deleteExact`/`deletePrefixWholesale`/delete-marker call
 reachable from GC and list each with its gate status in the task report — the known un-gated
@@ -703,8 +706,8 @@ GREEN [codex finding 16].
   count == 0); every inventoried destructive site individually (at minimum: manifest-body
   delete, generation prune, orphan sweep, `handoff_reclaim`) — all inert under suppression
   (assert per-site, delete-op count == 0 each) [codex finding 6]; production default
-  (`kUniverseAuthoritative == false`) → destruction inert even with every constructed proof
-  green; late `+1` folded AFTER condemnation but BEFORE the delete
+  (`UniversePolicy::kDefault == StageA_Suppressed`, no explicit policy argument) → destruction
+  inert even with every constructed proof green; late `+1` folded AFTER condemnation but BEFORE the delete
   pass → `settleEntry` spares it (`indeg > 0`) — the normative third-arm regression (with the
   seam-RED proof, above); **the temporal lemma's OTHER arms, pinned in C++** [codex finding 5]:
   (a) a post-probe `+1` followed by SAME-round condemnation → the newly condemned blob is not
@@ -894,8 +897,8 @@ overturn any of these with evidence, which then goes to the controller as a ques
   does not strand it; **(the cross-namespace kill shot — the staging suppression's regression)**
   namespace `A` absent from BOTH hint and `gc/state`, its acked `+1` on a shared blob hidden,
   while namespace `B`'s visible `-1` drives the blob's observable in-degree to zero → REQUIRED
-  VERDICT: ZERO deletes (`kUniverseAuthoritative = false` holds destruction); the SAME test with
-  the seam forcing the constant true and `A` absent from the constructed universe MUST delete
+  VERDICT: ZERO deletes (the `StageA_Suppressed` default holds destruction); the SAME test with
+  an explicit `AuthoritativeForTest` argument and `A` absent from the constructed universe MUST delete
   the blob — proving the suppression is the only thing between Stage A and this data loss, i.e.
   the constant is load-bearing and Stage B's catalog is its honest replacement [codex finding 1];
   **(fsck)** fsck under the lie → clean (arithmetic streams don't consult LIST
