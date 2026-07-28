@@ -161,6 +161,39 @@ public:
     }
 };
 
+/// The same shape as `PromoteConflictOnceBackend`, except its fault is a whitelisted SYNCHRONOUS
+/// REJECTION -- an S3-classified malformed request, which `classifyConditionalWriteResult` proves was
+/// never applied. That distinction is the whole reason this second backend exists: a proven DIFFERENT
+/// OBJECT is a breach of mount write-exclusivity and fences the whole mount closed, so every cleanup
+/// append after it is refused at the gate and becomes unobservable. A definite rejection is an ordinary
+/// failed write -- nothing is fenced, nothing is wedged, the table stays usable -- so the cleanup
+/// appends that follow DO reach the store and can be counted.
+class PromoteDefiniteFailureBackend final : public Cas::InMemoryBackend
+{
+public:
+    String fault_key_substr;
+    int skip = 0;
+    int fault_count = 0;
+    int matching_put_attempts = 0;
+
+    Cas::PutResult putIfAbsent(const String & key, const String & bytes, const Cas::ObjectMeta & meta) override
+    {
+        if (!fault_key_substr.empty() && key.find(fault_key_substr) != String::npos)
+        {
+            ++matching_put_attempts;
+            if (skip > 0)
+                --skip;
+            else if (fault_count > 0)
+            {
+                --fault_count;
+                throw DB::S3Exception("PromoteDefiniteFailureBackend: simulated malformed request",
+                                      Aws::S3::S3Errors::UNKNOWN, "MalformedXML");
+            }
+        }
+        return InMemoryBackend::putIfAbsent(key, bytes, meta);
+    }
+};
+
 }
 
 TEST(CasPartFolderAccess, RetainedHitSkipsManifestHead)
@@ -410,6 +443,49 @@ TEST(CasPartFolderAccess, PublishEntriesAbandonsBuildOnPromoteFailure)
     EXPECT_NE(greatest_body->bytes.find("_FOREIGN_DIFFERENT"), String::npos)
         << "the foreign occupant must still be the highest id in this table's stream: a log object above "
            "it would mean an append carved a fresh id around the damage instead of failing closed";
+}
+
+/// The DISCRIMINATING guard for the same duty, on the path where it can still be observed: a promote
+/// failure that is an ordinary failed write rather than a breach of mount write-exclusivity. Nothing is
+/// fenced and nothing is wedged, so both cleanup appends reach the store and the two worlds separate.
+///
+/// The fault covers TWO appends, and that is the whole construction:
+///   with `promote`'s catch-abandon -- precommitAdd lands (skipped), promote's append is refused,
+///   the catch-abandon's append is refused too, and the handle DESTRUCTOR's backstop retries and lands:
+///   FOUR attempts, and no binding is left behind;
+///   without it -- precommitAdd lands, promote's append is refused, and the destructor's backstop takes
+///   the second fault and is refused: THREE attempts, and the precommit binding LEAKS.
+/// So the count and the end state disagree between the two worlds, which is what makes this a guard
+/// rather than a shape check. `livePrecommitsForTest` is the direct statement of the property --
+/// `publishEntries` must not walk away from a live precommit binding -- and the count is what pins
+/// WHERE the cleanup came from.
+TEST(CasPartFolderAccess, PublishEntriesAbandonsBuildOnARetryablePromoteFailure)
+{
+    auto backend = std::make_shared<PromoteDefiniteFailureBackend>();
+    auto store = Cas::Pool::open(backend, Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    const Cas::RootNamespace ns{"srv/t1"};
+    Cas::CachedPartFolderAccess access(store);
+
+    publishPart(store, ns, "src", {inlineEntry("f", "same")});
+
+    backend->fault_key_substr = store->layout().refsNamespacePrefix(ns) + "_log/";
+    backend->skip = 1;         /// let precommitAdd's own ref-log append land normally
+    backend->fault_count = 2;  /// fault promote's append AND the cleanup append that follows it
+    const int attempts_before = backend->matching_put_attempts;
+
+    /// A definite rejection is reported to the caller as a retry-later failure, not as corruption.
+    expectThrowsCode(ErrorCodes::NETWORK_ERROR, [&] { access.republishRef({ns, "src"}, {ns, "dst"}); });
+    EXPECT_FALSE(access.existsRef({ns, "dst"}, Cas::Freshness::ForceFresh)) << "the failed promote never committed dst";
+
+    EXPECT_TRUE(store->mayMutate()) << "an ordinary failed write must not fence the mount";
+    EXPECT_EQ(store->scheduleRemountCallCountForTest(), 0u) << "and must not schedule a remount";
+    EXPECT_FALSE(store->refLaneWedgedForTest(ns)) << "a definite rejection is proven non-durable: no wedge";
+
+    EXPECT_EQ(backend->matching_put_attempts, attempts_before + 4)
+        << "three attempts means only the destructor backstop ran -- publishEntries stopped abandoning "
+           "the build at the promote site";
+    EXPECT_TRUE(store->livePrecommitsForTest(ns).empty())
+        << "publishEntries must not walk away from a live precommit binding";
 }
 
 
