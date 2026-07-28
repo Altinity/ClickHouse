@@ -1386,3 +1386,6 @@ TDD build running (task1_build.log fresh, 2 live build procs). No push.
 
 **2026-07-28 15:0x local** — task 1 DONE_WITH_CONCERNS (`4a1fe50ec8e`, 1374/1374); reviewer
 dispatched (mechanical -Werror overrun + two judgment calls to adjudicate). No push.
+
+**2026-07-28 14:40 local watchdog** — task 1 reviewer mid-read (no review file yet; some
+unit_tests_dbms procs live — verification runs, possibly the other session's too). No push.
