@@ -1227,3 +1227,7 @@ continuously productive. No push.
 **2026-07-28 06:5x UTC watchdog** — task 2 CLOSED (2 fix rounds; grep-verified sweep; spec gained the
 temporal-lemma third arm + corruptgap residual along the way). Task 3 (`CaRefCatalogCore`, sonnet)
 dispatched minutes ago — reading phase, no artifacts yet, normal. No TLC/codex. No push.
+
+**2026-07-28 07:1x UTC watchdog** — task 3: ZERO artifacts after ~25 min (module, logs, report all
+absent) — crossed the escalation threshold; pinged the agent for status/blockers. Everything else
+quiet. No push.
