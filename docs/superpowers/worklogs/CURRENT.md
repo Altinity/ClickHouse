@@ -1509,3 +1509,6 @@ soak B1 detector killed by rename) — fix round dispatched. Lane L: follow-up c
 1419/1419; x25 no-flake) but the 8-finding diff review had not reached the agent — relayed as
 follow-up-2 mandate (OOM-laundering + seal 3-way + self-pointer brick top). Reviewer still held.
 Lane G fix round in progress. No push.
+
+**2026-07-28 20:40 local watchdog** — lane G fix round iterating (fix1 build2 + targeted runs,
+seconds-fresh); lane L follow-up-2 in edit phase (last logs 20:31 = rulings-round tail). No push.
