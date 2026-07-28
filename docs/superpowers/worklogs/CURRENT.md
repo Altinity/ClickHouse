@@ -1473,3 +1473,7 @@ pre-lock marker-read race, StayTransient loud signal ruled in); fix round 2 disp
 
 **2026-07-28 19:20 local watchdog** — lane-g initial build 17037/17040 (nearly done); task 3
 fix round 2 mid-cycle (fix2 build log 19:01). No push.
+
+**2026-07-28 19:3x local** — task 3 fix round 2 landed one-turn (`ee0f1ae7fcf`; R1 deepened to
++4 w/ destructor backstop; R2 in-lock read; R3 ProfileEvent; both R4 reds proven via scratch
+revert). Re-review-2 running. LANE-G READY (LANEG_SETUP=done). Briefs 4+7 cut. No push.
