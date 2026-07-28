@@ -1193,3 +1193,8 @@ to first commit). Next tick without artifacts → ping the agent. No TLC/codex r
 
 **2026-07-28 03:5x UTC watchdog** — task 2 actively writing: `CaRefDeltaIntakeCore.tla` rewritten
 03:40 (13.7→27.7 KB), configs/TLC/report pending — healthy mid-implementation. No push.
+
+**2026-07-28 04:1x UTC watchdog** — task 2 in TLC phase: live tlc2.TLC on a `_fix_ckptwitness` cfg,
+sabotage logs (skipquietprobe, cleanupignorescursor) written 04:00, extra witness configs appearing
+(`witness_corruptgap`) — the agent is iterating config expectations, healthy. No report/commit yet.
+No push.
