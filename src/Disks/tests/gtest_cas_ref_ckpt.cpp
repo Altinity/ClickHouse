@@ -92,6 +92,21 @@ CkptDeadline generousDeadline()
     return CkptDeadline{[] { return uint64_t{1000}; }, 60000};
 }
 
+/// Reads the namespace's `_ckpt` and returns its body, or a default-constructed one after failing the
+/// current test when the object is absent. Every assertion below goes through this rather than
+/// dereferencing the optional directly: a bare `->` on a disengaged optional ABORTS the whole test
+/// binary, so one regression would take every later suite's result with it instead of failing a test.
+RefCkpt readCkptOrFail(Backend & backend, const Layout & layout, const RootNamespace & ns)
+{
+    const std::optional<CkptSample> sample = readCkpt(backend, layout, ns);
+    if (!sample)
+    {
+        ADD_FAILURE() << "expected a _ckpt for namespace '" << ns.string() << "', found none";
+        return RefCkpt{};
+    }
+    return sample->ckpt;
+}
+
 /// Replaces the whole body of one key, minting a new incarnation -- how a test installs a deliberately
 /// malformed or concurrently-advanced object.
 void overwriteObject(Backend & backend, const String & key, const String & bytes)
@@ -484,7 +499,7 @@ TEST(CasRefCkpt, AFenceBumpBetweenTheReadAndTheCasWritesNothing)
               CkptPublishOutcome::FencedOut);
     EXPECT_EQ(backend->casPutCount(key), writes_before) << "the check precedes the CAS, so nothing is sent";
     EXPECT_EQ(backend->head(key).token, token_before);
-    EXPECT_EQ(readCkpt(*backend, layout, ns)->ckpt, base);
+    EXPECT_EQ(readCkptOrFail(*backend, layout, ns), base);
 }
 
 /// Persistent contention fails CLOSED and says so. There is no partial state to clean up -- every
@@ -516,7 +531,7 @@ TEST(CasRefCkpt, AnExhaustedDeadlineUnderPersistentConflictThrowsRetryLater)
     const RefCkpt advance{.life_epoch = std::nullopt, .checkpoint_snapshot_id = ID_1_2, .last_epoch_seal = std::nullopt};
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR,
         [&] { publishCkpt(*backend, layout, ns, advance, 1, ALWAYS_ADMITTED, CkptDeadline{[&] { return now; }, 5}); });
-    EXPECT_EQ(readCkpt(*backend, layout, ns)->ckpt, base) << "no partial state: every attempt either "
+    EXPECT_EQ(readCkptOrFail(*backend, layout, ns), base) << "no partial state: every attempt either "
                                                              "committed the complete merged body or wrote nothing";
 }
 
@@ -605,7 +620,7 @@ TEST(CasRefCkpt, ACommittedSnapshotPublishAdvancesTheCheckpoint)
     const RootNamespace ns{"srv1/ckpt_publish"};
 
     ASSERT_EQ(publishRef(store, ns, "ref_1", 1), (RefTxnId{epoch, 1}));
-    ASSERT_FALSE(readCkpt(*backend, store->layout(), ns)->ckpt.checkpoint_snapshot_id.has_value());
+    ASSERT_FALSE(readCkptOrFail(*backend, store->layout(), ns).checkpoint_snapshot_id.has_value());
 
     ASSERT_TRUE(store->trySnapshotPublishOnce(ns));
     const auto published = store->newestPublishedSnapshotIdForTest(ns);
@@ -638,7 +653,7 @@ TEST(CasRefCkpt, CleanupPlannedBetweenTheBodyPutAndTheCkptCasCannotDeleteTheNewS
     ASSERT_EQ(publishRef(store, ns, "ref_2", 2), (RefTxnId{epoch, 2}));
     /// The checkpoint a cleanup pass sampled BEFORE the second publication -- the stale reading the
     /// race hands it.
-    const std::optional<RefTxnId> stale_checkpoint = readCkpt(*backend, store->layout(), ns)->ckpt.checkpoint_snapshot_id;
+    const std::optional<RefTxnId> stale_checkpoint = readCkptOrFail(*backend, store->layout(), ns).checkpoint_snapshot_id;
     ASSERT_EQ(stale_checkpoint, first_snapshot);
 
     ASSERT_TRUE(store->trySnapshotPublishOnce(ns));
@@ -650,7 +665,7 @@ TEST(CasRefCkpt, CleanupPlannedBetweenTheBodyPutAndTheCkptCasCannotDeleteTheNewS
     EXPECT_FALSE(snapshotDeletableUnderCkpt(second_snapshot, stale_checkpoint));
     EXPECT_FALSE(snapshotDeletableUnderCkpt(first_snapshot, stale_checkpoint));
     /// Once the checkpoint is re-read, the older snapshot becomes reclaimable and the base does not.
-    const std::optional<RefTxnId> fresh_checkpoint = readCkpt(*backend, store->layout(), ns)->ckpt.checkpoint_snapshot_id;
+    const std::optional<RefTxnId> fresh_checkpoint = readCkptOrFail(*backend, store->layout(), ns).checkpoint_snapshot_id;
     EXPECT_TRUE(snapshotDeletableUnderCkpt(first_snapshot, fresh_checkpoint));
     EXPECT_FALSE(snapshotDeletableUnderCkpt(second_snapshot, fresh_checkpoint));
 }
@@ -680,7 +695,7 @@ TEST(CasRefCkpt, TheCheckpointIsWrittenOncePerPublicationAndNotOnIdleAttempts)
     EXPECT_FALSE(store->trySnapshotPublishOnce(ns));
     EXPECT_FALSE(store->trySnapshotPublishOnce(ns));
     EXPECT_EQ(backend->casPutCount(key), writes_after_publish);
-    EXPECT_EQ(readCkpt(*backend, store->layout(), ns)->ckpt, after_publish->ckpt);
+    EXPECT_EQ(readCkptOrFail(*backend, store->layout(), ns), after_publish->ckpt);
 }
 
 /// The interplay guard for the refusal T3/T4 landed: a POISONED table must never publish, and that
@@ -718,7 +733,7 @@ TEST(CasRefCkpt, APoisonedTableAdvancesNoCheckpoint)
     EXPECT_FALSE(store->trySnapshotPublishOnce(ns));
     EXPECT_EQ(backend->casPutCount(key), writes_before)
         << "the poison refusal must precede the checkpoint write, not follow it";
-    EXPECT_FALSE(readCkpt(*backend, store->layout(), ns)->ckpt.checkpoint_snapshot_id.has_value());
+    EXPECT_FALSE(readCkptOrFail(*backend, store->layout(), ns).checkpoint_snapshot_id.has_value());
 }
 
 /// A publish admitted under an incarnation that is replaced mid-attempt advances NOTHING, and does not
@@ -749,7 +764,7 @@ TEST(CasRefCkpt, APublishFencedOutMidAttemptDoesNotAdvanceTheCheckpoint)
     EXPECT_FALSE(store->trySnapshotPublishOnce(ns))
         << "a publish whose checkpoint could not be advanced must not report success";
     EXPECT_EQ(backend->casPutCount(ckpt_key), writes_before) << "nothing may be sent after the fence moved";
-    EXPECT_FALSE(readCkpt(*backend, store->layout(), ns)->ckpt.checkpoint_snapshot_id.has_value());
+    EXPECT_FALSE(readCkptOrFail(*backend, store->layout(), ns).checkpoint_snapshot_id.has_value());
     EXPECT_FALSE(store->newestPublishedSnapshotIdForTest(ns).has_value())
         << "the snapshot must not be adopted as the newest while its checkpoint is unpublished";
 }
