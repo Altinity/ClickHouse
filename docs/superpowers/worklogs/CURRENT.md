@@ -1527,3 +1527,7 @@ flight on lane G. No push.
 **2026-07-28 21:20 local watchdog** — lane L wrap-up: ASan build done (21:15), ASan gate running
 (log growing 21:19); lane G T8: red-first phase (hold-grammar test file written, red build at
 21:16). Both healthy. No push.
+
+**2026-07-28 21:4x local** — task 4 wrap-up in (both build classes green; ASan surfaced a
+pre-existing keeper-thread LOGICAL_ERROR abort — env-reachable, mini-fix mandated to a4).
+T8 red phase on lane G continues. No push.
