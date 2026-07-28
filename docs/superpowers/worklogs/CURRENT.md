@@ -1492,3 +1492,6 @@ side. No push.
 **2026-07-28 20:2x local** — lane G task 7 DONE (`03a84ea3cd9`, 10/10 + 1416/1416 + integration
 green; back-chain epoch crossing, self-found spin fixed); reviewer dispatched. Lane L mid-red
 (9 gate failures under its own triage — I5 code-shift churn + WIP). No push.
+
+**2026-07-28 20:20 local watchdog** — lane L: gate re-run #3 in progress (build6 done 20:18);
+lane G reviewer reading. No push.
