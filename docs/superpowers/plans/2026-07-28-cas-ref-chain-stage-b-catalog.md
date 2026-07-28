@@ -64,7 +64,8 @@ implementer at a time).
 
 **Files:**
 - Create: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/RefNamespaceId.h`
-- Modify: `.../ContentAddressed/CasLayout.h` — every ref-layer prefix/key/parser helper
+- Modify: `.../ContentAddressed/Formats/CasLayout.h` — the `Layout` class [path and type per
+  codex finding 18] — every ref-layer prefix/key/parser member helper
   (`refsNamespacePrefix`, `refLogKey`, `refSnapshotKey`, `refCkptKey` from Stage A, and the
   parsers `parseRefObjectKey`/`parseRefLogKey`) changes its namespace parameter to the new type;
   the `RootNamespace`-only overloads are DELETED (not deprecated — Constraint 4)
@@ -89,9 +90,10 @@ struct RefNamespaceId
 
 - [ ] **Step 1: Failing tests**: key round-trip through every helper; parser refuses a
   legacy-shaped key, a zero incarnation, a malformed hex; a compile-time assertion test that
-  the namespace-only overload set no longer exists (`static_assert` on
-  `!std::is_invocable_v<decltype(refLogKey), CasLayout, RootNamespace, RefTxnId>` — the
-  "cannot compile" half of spec §9 r9-5 #3).
+  the namespace-only overload set no longer exists — since `refLogKey` is a MEMBER of
+  `Layout`, express it as a dependent `requires`-expression concept check
+  (`static_assert(!requires(const Layout & l, RootNamespace ns, RefTxnId id) { l.refLogKey(ns, id); });`)
+  — the "cannot compile" half of spec §9 r9-5 #3 [codex finding 18].
 - [ ] **Step 2:** Run → FAIL. **Step 3:** Implement type + re-plumb until the tree compiles —
   mechanical, compiler-driven; in Stage B Task 1 the incarnation VALUE everywhere is a
   placeholder constant from the not-yet-landed catalog: introduce
@@ -164,13 +166,15 @@ struct RefCatalog                          /// one object, key `cas/ref_catalog`
 - Stale-`Creating` reconciliation: token-exact CAS AT THE CALL SITE, permitted ONLY after the
   creator's fence is terminal (TLA Task 3 obligation 1: the call-site is where token-exactness
   is enforced, with a stale-token fail-closed test).
-- **Three-site same-value obligation (TLA Task 5 concern 4, closed here):** the values rechecked
-  at the three §3 sites — slot-occupy (Stage A), `_ckpt` CAS (Stage A), catalog token-CAS
-  (this task) — are THE SAME captured `{admission fence generation, expected token}` pair,
-  plumbed from one capture point per operation; a shared
-  `struct RecheckContext { uint64_t admitted_generation; Token expected; }` makes divergence a
-  compile-visible smell. One test drives all three sites in one lifecycle op and fault-injects
-  a fence bump between each consecutive pair (3 tests): every later site must refuse.
+- **Same-value obligation, stated correctly** [codex finding 7 — the earlier draft conflated
+  two different credentials]: the proven THREE same-value sites are Stage A's trio —
+  slot-occupy, `_ckpt` CAS, recovery install — sharing ONE captured `admitted_generation`
+  (generation-only; Stage A Task 6 owns it). The CATALOG-ENTRY TOKEN is a SEPARATE credential:
+  the `ZombieGoLive` guard at `Creating → Live` combines the creator's admission GENERATION
+  with the OBSERVED entry token — two credentials at one site, not a third member of the trio.
+  Tests here: fence bump between `_ckpt` create and the `Creating → Live` CAS → refused by
+  generation; entry token changed under the creator (concurrent reconciliation) → refused by
+  token; both stale → refused (first check wins, either order acceptable).
 
 - [ ] **Step 1: Failing tests**: happy path (3 writes, entry Live, `_ckpt` exists, incarnation
   stable across the sequence); crash after write 1 → reconciliation by a NEW actor refused
@@ -196,10 +200,14 @@ struct RefCatalog                          /// one object, key `cas/ref_catalog`
 - Consumes: Tasks 1-3.
 - Produces: spec §5's fold shape — per round ONE catalog `GET`; cursors keyed by catalog
   entries `(ns, incarnation)`; unhinted namespaces carry verbatim; the frontier proof (Stage A
-  Task 9) now iterates EVERY `Live`/`Removing` entry — Stage A's universe residual is CLOSED;
-  recovery/fold/fsck/sweep construct `RefNamespaceId` from the catalog, live readers from their
-  handle (§2). `RefNamespaceId::stageATransition()` is DELETED; a tree-wide grep for it must
-  return zero (step-gated).
+  Task 9) now iterates EVERY `Live`/`Removing` entry — and with the universe authoritative,
+  **this task flips Stage A's `kUniverseAuthoritative` to `true`, re-enabling production
+  destruction** (the staging suppression's designed end): the Stage-A cross-namespace kill-shot
+  test flips from "zero deletes because suppressed" to "zero deletes because namespace `A` is
+  IN the catalog and its frontier is probed" — the same scenario now survives on proof, not on
+  suppression. Recovery/fold/fsck/sweep construct `RefNamespaceId` from the catalog, live
+  readers from their handle (§2). `RefNamespaceId::stageATransition()` is DELETED; a tree-wide
+  grep for it must return zero (step-gated).
 
 - [ ] **Step 1: Failing tests**: fold discovers a namespace with ZERO listable objects (hint
   fully blind) via the catalog and probes its frontier — the Stage-A residual test from
@@ -229,9 +237,13 @@ struct RefCatalog                          /// one object, key `cas/ref_catalog`
     owning mounted writer or a successor that claimed and fenced that server root; GC surfaces
     stuck removals (a durable counter + log per round observing a terminal-less `Removing`),
     NEVER appends.
-  - After the terminal record FOLDS: `_ckpt` deleted by exact token while `Removing`, then the
-    catalog entry deleted (entry LAST) — the entry vanishes immediately; no physical-empty
-    proof (surviving old-incarnation objects are structurally inert — foreign prefix).
+  - After the terminal record FOLDS: ONE explicitly BOUNDED, suppression-aware best-effort
+    cleanup attempt (spec INV-3's "best-effort cleanup runs" — codex finding 13: it sits
+    BETWEEN the terminal fold and the deletions; its failures defer to the janitor as leak-only
+    work), then `_ckpt` deleted by exact token while `Removing`, then the catalog entry deleted
+    (entry LAST) — the ordering asserted via the backend op journal; the entry vanishes without
+    a physical-empty proof (surviving old-incarnation objects are structurally inert — foreign
+    prefix).
   - Lazy janitor: whenever cleanup LISTING happens to return foreign-incarnation debris under a
     known namespace, delete it (omission = deferred cleanup, leak-only direction) — implemented
     inside `runNamespaceCleanupPasses`, gated by `suppress_destructive` like every destructive
@@ -265,21 +277,28 @@ struct RefCatalog                          /// one object, key `cas/ref_catalog`
 - Live readers hold `RefNamespaceId` handles and can never alias a new life (foreign prefix);
   a stale reader gets stale-or-`NotFound`, NEVER rejection (no fence/catalog read on hot
   paths — the read side pays zero new requests).
-- Destructive cleanup revalidates life and fence IMMEDIATELY before every delete (the janitor
-  and `cleanupRefObjects` re-read the catalog entry token right before their `deleteExact`
-  batches — one GET per batch, not per key).
+- Destructive cleanup revalidates life and fence IMMEDIATELY before every delete — and since
+  the backend exposes only PER-KEY `deleteExact` (no atomic batch delete), "before every
+  delete" means per key, not per planning batch [codex finding 14]: the janitor and
+  `cleanupRefObjects` re-read the catalog entry token and re-check the fence before EACH
+  `deleteExact`; the token/fence read may be cached only within a span where the check itself
+  proves nothing destructive-relevant can have changed (in practice: re-read per key; if a
+  measured hot spot ever demands batching, that is a protocol change needing its own review,
+  not an optimization).
 
 - [ ] **Step 1: Failing tests**: reader holding inc₁'s handle after drop+rebirth reads
   stale-or-`NotFound`, never inc₂ data (the alias test); hot read path performs ZERO catalog
-  requests (op-count assert); cleanup batch whose entry token changed between plan and delete →
-  batch refused, nothing deleted.
+  requests (op-count assert); entry token changed between plan and the FIRST delete → nothing
+  deleted; token changed BETWEEN two keys of one cleanup pass → the first key's delete lands,
+  the second is refused (the per-key revalidation race — codex finding 14).
 - [ ] **Step 2:** → FAIL. **Step 3:** Implement. **Step 4:** CA gate green.
 - [ ] **Step 5: Commit** `ca: ref — read-side contract: handle-scoped reads, pre-delete life revalidation`.
 
 ### Task 7: R5 — decommission duties {#task-7}
 
 **Files:**
-- Modify: `.../ContentAddressed/CasDecommission.cpp` (scoped-LIST discovery `~:116` replaced)
+- Modify: `.../ContentAddressed/Tools/CasDecommission.cpp` (scoped-LIST discovery `~:116`
+  replaced) [path per codex finding 18]
 - Create: `src/Disks/tests/gtest_cas_decommission_catalog_duties.cpp`
 
 **Interfaces (register R5 verbatim — same-rollout dependency of the catalog):**
@@ -307,10 +326,16 @@ root remains.
   `.../Gc/CasBlobInDegree.cpp` (the NEUTRAL nomination input — bypassing B2 ordinals and
   unmatched-remove accounting, `~:591` constraint), `.../Gc/CasGc.cpp` (adopting nominations in
   the round's `gc/state` CAS)
-- Modify: `docs/superpowers/models/CaRefWriterCleanupCore.tla` + configs (+ its runner),
-  `docs/superpowers/models/CaRefFoldClampRecoveryCore.tla` if the clamp interaction changes —
-  spec §9's "extended per register items when those land" clause; sabotage-first, name-asserted,
-  parenthesised ghosts (the phase conventions)
+- Modify: `docs/superpowers/models/CaRefWriterCleanupCore.tla` + configs (+ its runner) — R2's
+  duty queue and uncertain-grant guard; AND `docs/superpowers/models/CaRefFoldClampRecoveryCore.tla`
+  (or the fold model the audit shows owns the ordering — named, not conditional) — R3's
+  nomination REQUIRES its own model gate [codex finding 12]: a named sabotage/control pair, at
+  minimum `_sab_deletebeforeadoption` (exact-token delete issued before the nomination's
+  `gc/state` CAS adoption → RED on the ownership invariant) and
+  `_sab_nominationcontaminates` (nomination fed through B2 ordinals / unmatched-remove
+  accounting instead of the neutral input → RED on the accounting invariant), plus the green
+  control. Sabotage-first, name-asserted runners, parenthesised ghosts (the phase conventions);
+  model commits land BEFORE the C++ commits.
 - Create: `src/Disks/tests/gtest_cas_writer_duties_nomination.cpp`
 
 **Interfaces (register R2/R3 verbatim):**
@@ -354,27 +379,30 @@ root remains.
 - [ ] **Step 2:** Commit `ca: specs — verbatim-file life gate (R1) draft for review`. The spec
   goes to the user for review — implementation is OUT of this plan.
 
-### Task 10: TLA debt from the phase {#task-10}
+### Task 10: TLA debt from the phase — FOUR sub-tasks, each its own review unit {#task-10}
 
-**Files:**
-- Modify: `docs/superpowers/models/CaGcRootLocalPartManifestCore.tla` area (audit first),
-  the nine single-config drivers, the four runnerless models
-  (`CaGcLeaseCore`, `CaGcRoundDeferCore`, `CaGcShardIncarnationCore`, `CaB140DangleMerge`),
-  the five phase runners (classifier `[A-Za-z_]+` → `[A-Za-z0-9_]+`)
-- Create: expectation-asserting runners per the `run_mount.sh` convention
+[Codex finding 17: the original single-unit framing could hide an evidence-sensitive model
+retirement inside a mechanically enormous diff. Each sub-task below is dispatched, reviewed and
+committed INDEPENDENTLY, with its own before/after results artifact.]
 
-- [ ] **Step 1:** Audit `CaGcRootLocalPartManifestCore`'s `listedTok` (`:79`) + the skip gate
-  (`:866`) against v9: does the model's "discovery observes from LIST" premise survive
-  universe-from-catalog (Stage B Task 4)? Write the verdict into the model's RESULTS file; if
-  the premise died, the affected configs get rewritten or retired WITH the retirement recorded
-  (the phase's unaudited-residual section gets its answer).
-- [ ] **Step 2:** Author expectations for the 123 configs behind the nine single-config
-  drivers; build name-asserting runners (sabotages first, exact-name, `temporal` kind where
-  properties are liveness); runnerless models get runners or a recorded retirement decision.
-- [ ] **Step 3:** Fix the five phase runners' classifier pattern (the inert-today
-  `[A-Za-z_]+`); re-run all five end-to-end once (expect identical results; paste tails).
-- [ ] **Step 4:** Commit per model-family; final commit updates `models/README.md` +
-  `cas/06-tla-models.md`.
+**Task 10a — `listedTok` semantic audit.** Audit `CaGcRootLocalPartManifestCore`'s `listedTok`
+(`:79`) + the skip gate (`:866`) against v9: does the model's "discovery observes from LIST"
+premise survive universe-from-catalog (Stage B Task 4)? Verdict into the model's RESULTS file;
+if the premise died, affected configs get rewritten or retired WITH the retirement recorded
+(the phase's unaudited-residual section gets its answer). Commit alone.
+
+**Task 10b — driver expectations, by model family.** Author expectations for the 123 configs
+behind the nine single-config drivers; name-asserting runners per the `run_mount.sh` convention
+(sabotages first, exact-name, `temporal` kind where properties are liveness). One commit per
+model family, each with its runner output pasted.
+
+**Task 10c — runnerless models.** `CaGcLeaseCore`, `CaGcRoundDeferCore`,
+`CaGcShardIncarnationCore`, `CaB140DangleMerge` (4 `m_*.cfg` configs): each gets a runner or a
+RECORDED retirement decision. Commit alone.
+
+**Task 10d — phase-runner classifier.** Fix the five phase runners' inert `[A-Za-z_]+` →
+`[A-Za-z0-9_]+`; re-run all five end-to-end once (expect identical results; paste tails).
+Commit alone; final commit updates `models/README.md` + `cas/06-tla-models.md`.
 
 ### Task 11: Stage B gates {#task-11}
 
