@@ -526,6 +526,12 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         /// already do nothing" is a property of another file, and the content-delete site does not
         /// delegate its own gate. If the two ever disagree, the round deletes nothing rather than
         /// deleting on a frontier it cannot prove.
+        ///
+        /// WHAT THIS GUARD DOES AND DOES NOT COVER, measured rather than assumed: it stops the delete
+        /// I/O, and nothing else. `settleEntry`'s gate is the primary one because promoting an entry to
+        /// `redelete` also DROPS it from `still_retired` -- so a build with only this guard performs no
+        /// delete and still loses the entry from the pipeline, leaking the blob instead of reclaiming
+        /// it. Do not read this as a licence to relax the merge-side gate.
         static const std::vector<RetiredEntry> kNothingToDelete;
         const std::vector<RetiredEntry> & redelete_now =
             suppress_destructive ? kNothingToDelete : merge.redelete;
