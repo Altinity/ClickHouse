@@ -67,7 +67,8 @@ CONSTANTS
     SabotageBlindPut,                \* the lane PUTs unconditionally instead of conditional-create
     SabotageScanIsTruth,             \* the reader folds what the LIST hint returned, not the walk
     SabotageCleanupAboveCkpt,        \* cleanup deletes logs above `ckpt.base`
-    SabotageStaleCkptCorruption      \* cleanup deletes the snapshot `ckpt.base` still points at
+    SabotageStaleCkptCorruption,     \* cleanup deletes the snapshot `ckpt.base` still points at
+    SabotageSealClobbersBase         \* the sealer writes back its SAMPLED base instead of merging
 
 Seqs == 1..MaxSeq                    \* ids a writer may append
 Ids  == 1..(MaxSeq + 1)              \* + the slot a frontier seal may occupy
@@ -83,6 +84,16 @@ VARIABLES
     publishedEver, \* SUBSET Seqs    snapshot ids ever published
     snapCov,       \* [Ids -> state] frozen body captured at each snapshot publish
     ckpt,          \* [base |-> 0..MaxSeq, seal |-> 0..MaxSeq+1]  the _ckpt object; 0 = none
+                   \* `base` = checkpoint_snapshot_id, `seal` = last_epoch_seal. Both writers
+                   \* read-modify-write the WHOLE body and merge by semantic maximum per field
+                   \* (INV-4), so a stale reader-writer can regress a field it did not intend to
+                   \* touch — see `_sab_sealclobbersbase`. `seal` carries no proof obligation in
+                   \* THIS module and is deliberately write-only here: its consumers are a later
+                   \* mount locating the previous epoch's terminating record and the GC fold
+                   \* crossing epochs (spec §5), neither of which exists in a single-recoverer,
+                   \* single-namespace model. Its obligation belongs to `CaCasMountCore` (task 5)
+                   \* and `CaRefDeltaIntakeCore` (task 2). It is still merged and typed here so
+                   \* those models inherit a field that behaves correctly.
     pendingSlot,   \* 0..MaxSeq      the single in-flight append (0 = the lane is idle)
     ambiguousEver, \* SUBSET Seqs    slots that ever had an attempt of unknown outcome
     sealedIds,     \* SUBSET Ids     slots PHYSICALLY occupied by an EpochSeal
@@ -112,6 +123,15 @@ vars == << op, writtenEver, logs, snaps, publishedEver, snapCov, ckpt,
 MinOf(S) == CHOOSE x \in S : \A y \in S : x <= y
 MaxOf(S) == CHOOSE x \in S : \A y \in S : x >= y
 MaxOr0(S) == IF S = {} THEN 0 ELSE MaxOf(S)
+Max2(a, b) == IF a >= b THEN a ELSE b
+
+(* INV-4's ONE update algorithm, shared by both `_ckpt` writers (the snapshot publisher and the
+   sealer): read the whole body, merge by SEMANTIC MAXIMUM per field, token-CAS. Writing the whole
+   body is what makes a stale field dangerous — a writer that skips the merge and writes back the
+   value it sampled earlier silently regresses the OTHER writer's progress. Modelling it as a
+   record-valued merge rather than an `EXCEPT !.field` surgical update is deliberate: the surgical
+   form cannot express that regression, and the real code does not have it. *)
+CkptMerge(base, seal) == [base |-> Max2(ckpt.base, base), seal |-> Max2(ckpt.seal, seal)]
 
 (* Fold one op into the table state. birth/remove reset content; mut adds its id. Never invoked
    with "none" on the honest path (folds range only over durable ids); OTHER is an identity guard,
@@ -280,11 +300,12 @@ WriterPublishSnapshot ==
     /\ UNCHANGED << op, writtenEver, logs, ckpt >>
     /\ UNCHANGED laneVars /\ UNCHANGED sealVars /\ UNCHANGED ghostVars /\ UNCHANGED readerVars
 
-(* One update algorithm, merge by semantic maximum per field, token-CAS (INV-4). *)
+(* The publisher half of the one update algorithm: it knows a new base, knows nothing new about the
+   seal, and merges both (INV-4). *)
 WriterCkptAdvance ==
     /\ \E X \in snaps :
         /\ X > ckpt.base
-        /\ ckpt' = [ckpt EXCEPT !.base = X]
+        /\ ckpt' = CkptMerge(X, ckpt.seal)
     /\ UNCHANGED storeVars
     /\ UNCHANGED laneVars /\ UNCHANGED sealVars /\ UNCHANGED ghostVars /\ UNCHANGED readerVars
 
@@ -401,7 +422,13 @@ RSealSlot ==
     /\ ckpt.base < WalkNext
     /\ sealedIds' = IF SabotageNoSeal THEN sealedIds ELSE sealedIds \cup {WalkNext}
     /\ concludedEver' = concludedEver \cup {WalkNext}
-    /\ ckpt' = [ckpt EXCEPT !.seal = WalkNext]
+    (* The sealer half of the one update algorithm. Its knowledge of the base is `rBase`, sampled
+       at the START of this recovery, so the merge is what keeps a base another writer advanced
+       meanwhile from being dragged backwards. `SabotageSealClobbersBase` writes the sampled body
+       back verbatim — the read-modify-write with the merge left out. *)
+    /\ ckpt' = IF SabotageSealClobbersBase
+               THEN [base |-> rBase, seal |-> WalkNext]
+               ELSE CkptMerge(rBase, WalkNext)
     /\ rPhase' = "done"
     /\ UNCHANGED << rBase, rWalkPos, rTail, rScanPos, rSeenLogs, rRestarts >>
     /\ UNCHANGED storeVars /\ UNCHANGED laneVars /\ UNCHANGED ghostVars

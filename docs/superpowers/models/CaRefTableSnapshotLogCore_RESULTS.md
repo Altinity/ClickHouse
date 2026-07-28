@@ -7,9 +7,10 @@ seal), **INV-4** (`_ckpt` gating of deletion and of the recovery base) and §4 R
 the plan `2026-07-28-cas-ref-chain-tla-phase.md`; this is a phase-0 gate — it blocks the C++ work.
 
 Runner: `./run_refsnaplog.sh` (runs every config and checks its expected verdict, including *which*
-invariant a sabotage is required to break). TLC 2.19 (tla2tools, Java 21),
+invariant a sabotage is required to break; sabotages run FIRST, because a green is only evidence
+once the property it rests on has been seen red). TLC 2.19 (tla2tools, Java 21),
 `java -XX:+UseParallelGC -workers auto`, 32 workers. Every number below is real TLC output from the
-run of 2026-07-28, not an estimate. Whole harness: **96 s, 12/12 expectations met.**
+run of 2026-07-28, not an estimate. Whole harness: **129 s, 15/15 expectations met.**
 
 Constants unless the row says otherwise: `MaxSeq = 4`, `MaxRestarts = 2`.
 
@@ -22,14 +23,31 @@ Constants unless the row says otherwise: `MaxSeq = 4`, `MaxRestarts = 2`.
    INV-1 contiguity means a straggler is always at the frontier and can never land below a
    published snapshot at all, and INV-2's slot occupancy decides the frontier slot — adopt it if
    the PUT landed, fence it forever if it did not.
-2. **The flip is a controlled experiment, not an assumption.** `_sab_noseal` is the same
-   behaviour with the seal's *occupancy* removed while keeping its *conclusion*, and it is RED on
-   `INV_RECOVERY`. Removing the straggler from that same config (`LatePred = FALSE`, run as a
-   diagnostic) turns it GREEN again — so the red is caused by the straggler and cured by the seal,
-   with nothing else varying.
-3. **Every invariant has been seen red.** Six properties, six sabotages that break exactly one
-   apiece, plus a reachability witness. No property in this model is green for free.
-4. **The late PUT reaches no state the honest protocol does not.** `_v9_safe` and
+2. **The flip is a controlled experiment, not an assumption**, and all three arms are committed
+   configs so the claim stays executable:
+
+   | config | straggler | seal occupancy | verdict |
+   |---|---|---|---|
+   | `_v9_flip_latepred` | ON | ON | GREEN |
+   | `_sab_noseal` | ON | OFF | RED (`INV_RECOVERY`) |
+   | `_sab_noseal_nolate` | OFF | OFF | GREEN |
+
+   Exactly one variable moves between adjacent arms, so the red is caused by the straggler and
+   cured by the seal's occupancy — neither verdict can be explained by some third difference.
+   (`_sab_noseal_nolate` is the most expensive config in the harness at 26.1 M distinct states and
+   32 s: with no seal, no id is ever consumed by one, so the writer and successive mounts keep
+   finding room to interleave.)
+3. **Every invariant has been seen red.** Five safety properties plus `TypeOK`, and nine sabotage
+   configs between them — seven breaking exactly one property apiece, two more pinning the second
+   consequence of a sabotage whose first consequence would mask it — plus a reachability witness and
+   a green control. No property in this model is green for free.
+4. **A skipped `_ckpt` merge loses data silently, not loudly.** `_sab_sealclobbersbase` was
+   expected to end in the fail-closed corruption stop. It does — but that is not its *shortest*
+   consequence. TLC first finds a behaviour where the sealer's stale write-back regresses the base
+   to 0 ("no checkpoint") after the covered prefix has been legitimately cleaned, so the next mount
+   reconstructs an EMPTY namespace over live data and reports success (`INV_RECOVERY`). Both
+   branches are pinned, by `_sab_sealclobbersbase` and `_sab_sealclobbersbase_nofail`.
+5. **The late PUT reaches no state the honest protocol does not.** `_v9_safe` and
    `_v9_flip_latepred` have *identical* distinct-state counts — 1,701,470 at `MaxSeq = 4` and
    32,925,718 at `MaxSeq = 5` — while `LatePredecessorPut` contributes 105,366 extra transitions.
    The straggler is no longer a distinct hazard; it is the ordinary adoption path arriving early.
@@ -38,18 +56,21 @@ Constants unless the row says otherwise: `MaxSeq = 4`, `MaxRestarts = 2`.
 
 | cfg | expected | TLC verdict | states (gen / distinct) | depth | s |
 |---|---|---|---|---|---|
-| `_v9_safe` | green | **PASS** — `No error has been found` | 7,949,790 / 1,701,470 | 48 | 4 |
+| `_sab_reuseafterambiguous` | violation | **RED as required** — `INV_NO_PHANTOM` | 780 / 430 | 11 | 0 |
+| `_sab_gaponfail` | violation | **RED as required** — `INV_DENSE` | 470 / 282 | 10 | 1 |
+| `_sab_noseal` | violation | **RED as required** — `INV_RECOVERY` | 1,210 / 577 | 11 | 1 |
+| `_sab_blindput` | violation | **RED as required** — `INV_NO_GHOST` | 1,635 / 721 | 13 | 0 |
+| `_sab_scanistruth` | violation | **RED as required** — `INV_RECOVERY` | 6,440 / 2,688 | 13 | 1 |
+| `_sab_cleanupaboveckpt` | violation | **RED as required** — `INV_RECOVERY` | 1,862 / 891 | 11 | 1 |
+| `_sab_staleckptcorruption` | violation | **RED as required** — `INV_NOFAIL` | 4,452 / 1,965 | 13 | 0 |
+| `_sab_sealclobbersbase` | violation | **RED as required** — `INV_RECOVERY` | 111,113 / 38,038 | 17 | 1 |
+| `_sab_sealclobbersbase_nofail` | violation | **RED as required** — `INV_NOFAIL` | 912,773 / 262,523 | 22 | 2 |
+| `_witness_hintlie` | violation = evidence | **VIOLATED as required** — `W_NO_HINT_HOLE` | 9,457 / 3,821 | 14 | 0 |
+| `_sab_noseal_nolate` (the flip's control) | green | **PASS** — `No error has been found` | 129,363,412 / 26,118,591 | 72 | 32 |
+| `_v9_safe` | green | **PASS** — `No error has been found` | 7,949,790 / 1,701,470 | 48 | 3 |
 | `_v9_flip_latepred` | green | **PASS** — `No error has been found` | 8,055,156 / 1,701,470 | 48 | 3 |
-| `_v9_safe_deep` (`MaxSeq = 5`) | green | **PASS** — `No error has been found` | 177,992,259 / 32,925,718 | 61 | 43 |
-| `_v9_flip_latepred_deep` (`MaxSeq = 5`) | green | **PASS** — `No error has been found` | 180,199,737 / 32,925,718 | 61 | 41 |
-| `_sab_reuseafterambiguous` | violation | **RED as required** — `INV_NO_PHANTOM` | 575 / 322 | 10 | 0 |
-| `_sab_gaponfail` | violation | **RED as required** — `INV_DENSE` | 657 / 391 | 10 | 1 |
-| `_sab_noseal` | violation | **RED as required** — `INV_RECOVERY` | 1,226 / 583 | 12 | 1 |
-| `_sab_blindput` | violation | **RED as required** — `INV_NO_GHOST` | 2,738 / 1,104 | 12 | 0 |
-| `_sab_scanistruth` | violation | **RED as required** — `INV_RECOVERY` | 4,385 / 1,889 | 12 | 1 |
-| `_sab_cleanupaboveckpt` | violation | **RED as required** — `INV_RECOVERY` | 2,448 / 1,072 | 12 | 1 |
-| `_sab_staleckptcorruption` | violation | **RED as required** — `INV_NOFAIL` | 3,845 / 1,731 | 13 | 0 |
-| `_witness_hintlie` | violation = evidence | **VIOLATED as required** — `W_NO_HINT_HOLE` | 9,261 / 3,739 | 14 | 1 |
+| `_v9_safe_deep` (`MaxSeq = 5`) | green | **PASS** — `No error has been found` | 177,992,259 / 32,925,718 | 61 | 42 |
+| `_v9_flip_latepred_deep` (`MaxSeq = 5`) | green | **PASS** — `No error has been found` | 180,199,737 / 32,925,718 | 61 | 42 |
 
 Sabotage state counts are "explored before the violation was found" and vary a little between runs
 with parallel workers; the verdict does not.
@@ -132,13 +153,39 @@ shows an unchanged token, and the three-way revalidation is then obliged to decl
 This is the config that proves the *strictly below* in INV-4 is doing work: with the gate honest,
 `corrupt` is unreachable, because a stale pointer can only under-clean.
 
+**`_sab_sealclobbersbase` → `INV_RECOVERY`** (INV-4, the `_ckpt` semantic-max merge).
+`WAppendStart` → `WAttemptAmbiguous` → `ReaderStart` → `RReadCkpt` → `RFetchBase` →
+`RAdoptStraggler` → `WriterPublishSnapshot` → `WriterCkptAdvance` → `RWalkStep` → `GcCleanupLog` →
+`RSealSlot` → `ReaderReset` → `ReaderStart` → `RReadCkpt` → `RFetchBase` → `RSealSlot`,
+final state `ckpt = [base |-> 0, seal |-> 1]`, `writtenEver = {1}`, `logs = {}`, `rTail = {}`,
+`rPhase = "done"`.
+The sealer read `_ckpt` at the start of its recovery (`rBase = 0`), a concurrent publisher advanced
+the base to 1, cleanup legitimately deleted the now-covered log 1, and then the sealer wrote its
+sampled body back verbatim — regressing the base to 0, which means *no checkpoint at all*. The next
+mount finds no base to read, walks from 0, finds slot 1 absent because it was legitimately cleaned
+under a base that no longer exists, seals there and **reports success with an empty namespace over
+live data.** This is the finding worth carrying into the implementation: skipping the merge does not
+fail closed, it loses data quietly.
+
+**`_sab_sealclobbersbase_nofail` → `INV_NOFAIL`** (the same sabotage, second consequence).
+… → `WriterCkptAdvance` → `GcCleanupSnap` → `RWalkStep` → `RSealSlot` → `ReaderReset` →
+`ReaderStart` → `RReadCkpt` → `RFetchBase`, final state `ckpt = [base |-> 1, seal |-> 3]`,
+`snaps = {2}`, `publishedEver = {1,2}`, `rBase = 1`, `rPhase = "corrupt"`.
+Here the regressed base still names a real snapshot id — but one that snapshot-cleanup deleted while
+the base was 2, which was legal precisely because deletion is gated strictly below the *then-current*
+base. The next mount samples 1, its exact-key GET 404s, the `_ckpt` reread shows an unchanged token,
+and the three-way revalidation is obliged to declare corruption. This is the branch INV-4's merge
+obligation was written for; it is checked in its own narrowed config because `INV_RECOVERY` breaks
+first and shallower.
+
 **`_witness_hintlie` → `W_NO_HINT_HOLE`** (reachability witness; the violation is the evidence).
 `WAppendStart` → `WResolveDurable` → `WAppendStart` → `WResolveDurable` → `ReaderStart` →
-`RReadCkpt` → `RFetchBase` → `RScanStep` → `RScanInstall`, reaching
-`logs = {1,2}`, `rScanPos = 2`, `rSeenLogs = {2}`, `rTail = {}`.
+`RReadCkpt` → `RFetchBase` → `RScanStep` → `RScanInstall`, whose final state is
+`logs = {1,2}`, `writtenEver = {1,2}`, `rScanPos = 2`, `rSeenLogs = {2}`, `rBase = 0`,
+`rTail = {2}`, `rPhase = "done"`.
 The enumeration ran to the *end* of the key space — nothing remained after its cursor, so it looked
 complete — and still omitted log 1, which was present the whole time and which nothing ever
-deleted. That is the observed `0x1430c`/`0x1430d` shape
+deleted. The reader installed the fold of `{2}` alone over a two-record history. That is the observed `0x1430c`/`0x1430d` shape
 (`reports/2026-07-26-list-incompleteness-investigation.md`) reproduced formally, and it is why
 recovery may not consume a listing as truth.
 
@@ -157,6 +204,12 @@ Action coverage (`-coverage 1`) on `_v9_safe`, as `distinct-states-found : trans
 | `WAttemptAmbiguous` | 1,437 : 158,270 | 1,630 : 158,270 |
 | `ReaderReset` (a second mount walks across the seal) | 55,049 : 300,480 | 55,091 : 300,480 |
 | `WOrphanLands`, `RScanStep`, `RScanInstall` | **0 : 0** (sabotage-only, correctly unreachable) | 0 : 0 |
+
+Re-measured after the `_ckpt` merge was introduced: every *transition* count above is byte-identical
+to the run before it (25,638 / 300,480 / 284,871 / 337,228 / 159,922 / 204,776 / 305,342), and
+`_v9_safe` still generates 7,949,790 / 1,701,470. Replacing the field-surgical `EXCEPT` with the
+read-modify-write merge changed the honest state space by exactly nothing — which is the point: it
+adds no honest behaviour, it only makes the dishonest one expressible.
 
 So the greens exercise the whole protocol: recovery completes 267k times, the Occupied branch of
 `slot-occupy` fires, the vanish-restart path fires, the wedged lane meets a successor's seal, and
@@ -183,6 +236,29 @@ transitions still fire.
   the model gives the writer perfect knowledge of `writtenEver`; a writer-local view would be needed
   to model the byte-comparison branch of the wedge, and that belongs with `CaCasMountCore`'s
   wedge-retry work (plan task 5).
+- **Concurrent recoverers are unrepresentable here, so one INV-2 branch is never exercised.** The
+  model has a single reader phase (`rPhase`), so there is at most one recovery in flight at a time.
+  The consequence is specific: `slot-occupy` returning `Occupied` **with an `EpochSeal` in it** — a
+  second recoverer arriving at a frontier a first recoverer already closed, which INV-2 says
+  terminates the walk — cannot occur. What IS exercised is `Occupied` with a *straggler's record*
+  (`RAdoptStraggler`, 25,638 transitions) and a later mount consuming an *older* epoch's seal
+  mid-walk (`RWalkStep`, via `ReaderReset`). The missing branch is two recoverers racing for the
+  same slot, and it needs a model with per-actor recovery state. **Hand-off: `CaCasMountCore`
+  (task 5)**, which already models recovery generations and is where "an old-generation wedge or
+  recovery result returning after the successor sealed the slot is refused by a generation recheck"
+  (spec §9) belongs. This sits alongside the `INV_NO_PHANTOM` hand-off above; both are task 5's.
+- **Spec gap 2 — the seal grammar is not modelled and is a C++-test obligation.** INV-2 requires
+  that a seal transaction contain exactly one seal operation, and that `prev_epoch_seal` be present
+  on exactly sequence 1 of every non-genesis epoch and forbidden everywhere else. This module treats
+  a seal as an opaque slot occupant that folds as a no-op, so neither rule is expressible here and
+  neither is checked. They are structural encoding rules, best discharged by codec round-trip and
+  rejection tests in the implementation plan, not by TLC.
+- **`ckpt.seal` carries no proof obligation in this module, deliberately.** Its consumers — a later
+  mount locating the previous epoch's terminating record, and the GC fold crossing epochs (§5) — do
+  not exist in a single-recoverer, single-namespace model, so any invariant over it here would be
+  green by construction and unfalsifiable, which the house rule forbids. It is still merged by
+  semantic maximum and typed, so `CaCasMountCore` (task 5) and `CaRefDeltaIntakeCore` (task 2)
+  inherit a field that behaves correctly. The reason is recorded at its declaration in the module.
 - **Bounds.** `MaxSeq = 4` / `MaxRestarts = 2` as the plan requires, plus the two `_deep` configs at
   `MaxSeq = 5`. `ReaderStart` additionally requires `NextSlot <= MaxSeq + 1` so the frontier seal
   always fits inside the modelled id space; that is a bound, not a protocol rule.
@@ -209,7 +285,7 @@ frontier, and the `slot-occupy` conditional create denies it the frontier slot i
 ## Reproduce
 
 ```bash
-bash docs/superpowers/models/run_refsnaplog.sh          # 12 configs, ~96 s, exits nonzero on surprise
+bash docs/superpowers/models/run_refsnaplog.sh          # 15 configs, ~129 s, exits nonzero on surprise
 ```
 
 Logs land in `tmp/tlc_CaRefTableSnapshotLogCore_<cfg>.log`.

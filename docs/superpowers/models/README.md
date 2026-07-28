@@ -211,8 +211,9 @@ ordered scan and cleanup deletes only what it observed durable. The migration is
   that motivated v9 is reproduced only as a sabotage. **`LatePredecessorPut` is flipped from rev.4's
   expected-fail to a green proof**, with `_sab_noseal` keeping the old counterexample runnable as
   the control. Sabotages cover the every-attempt rule, rev.4's "safe id gap" allocator, seal
-  occupancy, conditional-create-as-fence, folding the hint, and both `_ckpt` deletion gates. Full
-  verdicts, traces and the retired rev.4/rev.6 configs: `CaRefTableSnapshotLogCore_RESULTS.md`.
+  occupancy, conditional-create-as-fence, folding the hint, both `_ckpt` deletion gates and the
+  `_ckpt` semantic-max merge — the last of which loses data SILENTLY when skipped. Full verdicts,
+  traces and the retired rev.4/rev.6 configs: `CaRefTableSnapshotLogCore_RESULTS.md`.
 - **`CaRefDeltaIntakeCore.tla`** — the GC's paginated intake of ref deltas: two tables sharing one
   lexically ordered keyspace, strictly increasing durable ids with at most one unresolved append.
   Proves resume-after-returned-key pagination misses nothing, cursor adoption is atomic with the

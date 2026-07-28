@@ -3,9 +3,8 @@
 # Model: v9 contiguous ref stream (spec 2026-07-27-cas-ref-chain-complete-cut-design.md,
 # §2 INV-1/INV-2/INV-4, §4 Recovery). Results and traces: CaRefTableSnapshotLogCore_RESULTS.md.
 #
-#   v9_safe                  -> GREEN     the honest protocol, no straggler
-#   v9_flip_latepred         -> GREEN     THE FLIP: rev.4's expected-fail is now a proof
-#   *_deep                   -> GREEN     the two greens again at MaxSeq = 5 (~41 s each)
+# Sabotages run FIRST: a green is only evidence once the property it rests on has been seen red.
+#
 #   sab_reuseafterambiguous  -> INV_NO_PHANTOM   every-attempt rule (INV-1)
 #   sab_gaponfail            -> INV_DENSE        contiguity (INV-1); rev.4's "safe id gap"
 #   sab_noseal               -> INV_RECOVERY     slot occupancy (INV-2); the flip's control
@@ -13,6 +12,14 @@
 #   sab_scanistruth          -> INV_RECOVERY     LIST is a zero-trust hint (§4/§5)
 #   sab_cleanupaboveckpt     -> INV_RECOVERY     log deletion gated at _ckpt.base (INV-4)
 #   sab_staleckptcorruption  -> INV_NOFAIL       snapshot deletion STRICTLY below base (INV-4)
+#   sab_sealclobbersbase     -> INV_RECOVERY     the _ckpt semantic-max merge (INV-4): a
+#                                                skipped merge loses data SILENTLY
+#   sab_sealclobbersbase_nofail -> INV_NOFAIL    the same merge, second consequence:
+#                                                regressed base -> deleted snapshot -> corrupt
+#   sab_noseal_nolate        -> GREEN     the flip's control: _sab_noseal minus the straggler
+#   v9_safe                  -> GREEN     the honest protocol, no straggler
+#   v9_flip_latepred         -> GREEN     THE FLIP: rev.4's expected-fail is now a proof
+#   *_deep                   -> GREEN     the two greens again at MaxSeq = 5
 #   witness_hintlie          -> W_NO_HINT_HOLE   reachability witness: a complete-LOOKING
 #                                                enumeration that omits a PRESENT log
 #                                                (the observed 0x1430c/0x1430d shape).
@@ -26,10 +33,6 @@ MODULE=CaRefTableSnapshotLogCore
 
 # name  expectation(green|violation)  expected-invariant(for the log line)
 CONFIGS=(
-  "v9_safe                 green      -"
-  "v9_flip_latepred        green      -"
-  "v9_safe_deep            green      -"
-  "v9_flip_latepred_deep   green      -"
   "sab_reuseafterambiguous violation  INV_NO_PHANTOM"
   "sab_gaponfail           violation  INV_DENSE"
   "sab_noseal              violation  INV_RECOVERY"
@@ -37,7 +40,14 @@ CONFIGS=(
   "sab_scanistruth         violation  INV_RECOVERY"
   "sab_cleanupaboveckpt    violation  INV_RECOVERY"
   "sab_staleckptcorruption violation  INV_NOFAIL"
+  "sab_sealclobbersbase    violation  INV_RECOVERY"
+  "sab_sealclobbersbase_nofail violation INV_NOFAIL"
   "witness_hintlie         violation  W_NO_HINT_HOLE"
+  "sab_noseal_nolate       green      -"
+  "v9_safe                 green      -"
+  "v9_flip_latepred        green      -"
+  "v9_safe_deep            green      -"
+  "v9_flip_latepred_deep   green      -"
 )
 
 overall=0
