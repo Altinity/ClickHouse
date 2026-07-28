@@ -1986,11 +1986,20 @@ TEST(RefWriterStalePrecommitSweep, BoundedBatchesAndInterruptionResumeAcrossMoun
     }
 
     /// The successor: a tight retry budget so ONE simulated ambiguous response wedges rather than
-    /// transparently retries away (mirrors the existing wedge-semantics tests in this file exactly).
+    /// transparently retries away. Ambiguity is guaranteed by `max_attempts = 1` ALONE — the
+    /// operation deadline must NOT also sit at `attempt_timeout_ms`: the controller's pre-send gate
+    /// (`putIfAbsentControlled`: `now + attempt_timeout > deadline` → Unresolved WITHOUT sending)
+    /// then passes only if zero milliseconds elapse between the deadline capture and the gate, and
+    /// this test uniquely burns that window encoding the ~1700-op removal chunk. On a loaded or
+    /// sanitizer-slow machine the gate fired first, the fault was never reached, the sweep failed
+    /// CLEAN (nothing sent → nothing ambiguous → correctly NO wedge), and the `refLaneWedgedForTest`
+    /// expectation below flipped — 5 of 6 sanitizer-lane runs across two CI rounds, reproduced
+    /// locally 14/14 under full CPU load. A wide deadline keeps the PUT always actually sent, so
+    /// the injected ambiguous fault — and the wedge — are deterministic on any machine.
     CasRequestBudget budget;
     budget.max_attempts = 1;
     budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = 100;
+    budget.operation_deadline_ms = 5000;
     budget.lease_safety_margin_ms = 100;
     PoolConfig config;
     config.cas_request_budget = budget;
