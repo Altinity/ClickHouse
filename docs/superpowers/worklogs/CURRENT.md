@@ -1288,3 +1288,6 @@ tla-task5 with findings verbatim + minors folded in. No push.
 
 **2026-07-28 12:4x UTC watchdog** — fix round 1 active: module fix in, full run_mount.sh battery
 re-running (live TLC on the sabotage sweep, logs seconds-fresh). No push.
+
+**2026-07-28 13:0x UTC watchdog** — fix round 1: battery deep in re-run (witness configs, one live
+TLC), report's fix-round section started. Commit pending. No push.
