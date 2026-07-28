@@ -1219,3 +1219,7 @@ the next tick shows no commit I ping the agent to wrap up. No push.
 **2026-07-28 06:0x UTC watchdog** — task 2 fix round 1 active: harness re-running after I1/I2 edits
 (fresh TLC logs 05:40), commit and fix report pending. Task-2 review verdict processed: gate stands,
 counterexample-fidelity fixes in flight; controller's G1 spec fix landed (33b301eacb8). No push.
+
+**2026-07-28 06:2x UTC watchdog** — task 2 fix round: full harness re-ran (greens done 05:53-55),
+now a coverage pass on `v9_hold` (M1 fix — reproducible coverage). Commit/report append pending,
+continuously productive. No push.
