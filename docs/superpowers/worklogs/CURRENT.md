@@ -1448,3 +1448,8 @@ dependency). Agent continuing with nextRefTxnId already drafted. No push.
 
 **2026-07-28 18:20 local watchdog** — task 3 deep in fallout repair: iterative builds impl4/impl5
 + semantic-bucket gtest runs, logs seconds-fresh. No commit yet. No push.
+
+**2026-07-28 18:4x local** — task 3 DONE (`4d6074c5136`+`ac5ce7c684d`, 1404/1404); reviewer
+running. ADOPTED user's parallelization: two lanes after T3 closes (L=ledger main tree,
+G=GC in new worktree lane-g w/ own build, setup in bg); mechanical work = edit-only worktrees;
+review pipelining on. No push.
