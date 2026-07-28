@@ -1453,3 +1453,6 @@ dependency). Agent continuing with nextRefTxnId already drafted. No push.
 running. ADOPTED user's parallelization: two lanes after T3 closes (L=ledger main tree,
 G=GC in new worktree lane-g w/ own build, setup in bg); mechanical work = edit-only worktrees;
 review pipelining on. No push.
+
+**2026-07-28 18:40 local watchdog** — lane-g setup mid-submodules (worktree at task-3 tip, alive);
+task 3 review in flight (no file yet). No push.
