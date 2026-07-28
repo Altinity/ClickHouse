@@ -1565,3 +1565,8 @@ closed. No push.
 **2026-07-28 23:0x local** — T8 fix round in re-review (question #1: was the arithmetic
 newest-seal confirm walk implemented, or does newest-ness trust the enumeration). L's final
 micro-round cycling. No push.
+
+**2026-07-28 23:2x local watchdog-adjacent** — T8 round 2 ruled: narrow-probe detection + hardened
+virgin verdict now; derivable adopted-seal alias ledgered as SPEC-AMENDMENT CANDIDATE (the true
+point-read closure; attempt component is non-dense today). L: micro-round gates cycling
+(build_debug first-ever DENY_ALLOCATIONS run + gate14). No push.
