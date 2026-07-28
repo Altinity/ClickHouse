@@ -1223,3 +1223,7 @@ counterexample-fidelity fixes in flight; controller's G1 spec fix landed (33b301
 **2026-07-28 06:2x UTC watchdog** — task 2 fix round: full harness re-ran (greens done 05:53-55),
 now a coverage pass on `v9_hold` (M1 fix — reproducible coverage). Commit/report append pending,
 continuously productive. No push.
+
+**2026-07-28 06:5x UTC watchdog** — task 2 CLOSED (2 fix rounds; grep-verified sweep; spec gained the
+temporal-lemma third arm + corruptgap residual along the way). Task 3 (`CaRefCatalogCore`, sonnet)
+dispatched minutes ago — reading phase, no artifacts yet, normal. No TLC/codex. No push.
