@@ -1262,3 +1262,6 @@ disjoint). 4/6 TLA tasks complete. Pipeline HOLDING before task 5 — user direc
 **2026-07-28 10:0x UTC watchdog** — course decision landed: full staged (main plan = Stage A streams
 + Stage B catalog, each soak-gated). Task 5 acked and in reading phase (~15 min; the 1027-line module
 + 3 hand-offs justify a long read — model files untouched yet, normal). No TLC/codex. No push.
+
+**2026-07-28 10:2x UTC watchdog** — task 5 in TLC phase: module extended (70→104 KB), sab_staleinstall
+cfg written, live TLC on the v9_recoverygen green (-workers 1 per convention). Healthy. No push.
