@@ -1595,3 +1595,7 @@ message crossing. Near-miss: lane agent's relative-path edit briefly touched mas
 **2026-07-29 00:0x local** — T8 round 3 in closing confirmation (step-down landed with the
 lying-vs-incomplete distinction; both RebuildReport verdict fields on the command row). T5
 coding on lane L. No push.
+
+**2026-07-28 23:00 local watchdog** — T5 deep in cycle: ckpt suite run + release gate running
+(logs seconds-fresh), format+ledger edits in working tree, no commit yet. T8 closing
+confirmation still reading. No push.
