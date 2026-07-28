@@ -887,10 +887,19 @@ and assert each expected outcome *by the name of the invariant or property it mu
 # incarnation core — main staged suite
 ./run_tlc.sh CaIncarnationCore_stage1.cfg
 # ... stages 2, 3, 4_small, 4_journaltree, 5_small, 6_registry, 6_evstale
-# sabotages (all MUST exit non-zero):
+# Sabotages: each MUST violate. Assert a NAMED violation, never a bare nonzero exit — TLC also exits
+# nonzero on a parse error, an unspecified successor state and a deadlock report, which is exactly how
+# a broken model masquerades as a working sabotage (2026-07-28: that is what hid a live parse bug in
+# CaBuildRootPrecommit; see models/2026-07-28-v9-phase-RESULTS.md {#fix-runners}). This prints the
+# invariant each sabotage actually broke — compare it against the entry for that config above.
 for c in nofence norecheckfold noretireview unconddelete reusedtag cascade \
          cutoverclaim noreobserve noregistry foldtimeuniverse noevreobserve; do
-  ./run_tlc.sh CaIncarnationCore_sab_$c.cfg && echo "UNEXPECTED PASS: $c"
+  ./run_tlc.sh CaIncarnationCore_sab_$c.cfg >/dev/null
+  broke=$(grep -oE '(Invariant|Property|Action property) [A-Za-z0-9_]+ is violated' \
+            ../../../tmp/tlc_CaIncarnationCore_sab_$c.log | head -1 \
+          | sed -E 's/.* ([A-Za-z0-9_]+) is violated/\1/')
+  [[ -n "$broke" ]] && echo "RED  $c -> $broke" \
+                    || echo "UNEXPECTED: $c reported no named violation (check the log, not the exit code)"
 done
 
 # build-root / precommit — whole suite, each expectation asserted by the name of the invariant or
@@ -911,10 +920,15 @@ java -XX:+UseParallelGC -cp ../../../tmp/tla2tools.jar tlc2.TLC -workers auto \
 # ack-floor GC round core — positive stage + witnesses
 ./run_ackfloor.sh CaGcAckFloorCore_stage1
 for w in delete spare recreate copyforward rebuild clamp; do ./run_ackfloor.sh CaGcAckFloorCore_witness_$w; done  # each MUST report reachable
-# sabotages (each MUST violate):
+# sabotages (each MUST violate) — same named-violation assertion as the incarnation sweep above:
 for s in ignorefloor ackwithoutread ackbeforedrain sleeperrearm skipshard adopttoken openbeforeload \
          rebuilddropedge rebuildkeepretired rebuildlowround clampnosuppress; do
-  ./run_ackfloor.sh CaGcAckFloorCore_sab_$s && echo "UNEXPECTED PASS: $s"
+  ./run_ackfloor.sh CaGcAckFloorCore_sab_$s >/dev/null
+  broke=$(grep -oE '(Invariant|Property|Action property) [A-Za-z0-9_]+ is violated' \
+            ../../../tmp/tlc_CaGcAckFloorCore_sab_$s.log | head -1 \
+          | sed -E 's/.* ([A-Za-z0-9_]+) is violated/\1/')
+  [[ -n "$broke" ]] && echo "RED  $s -> $broke" \
+                    || echo "UNEXPECTED: $s reported no named violation (check the log, not the exit code)"
 done
 
 # ack-floor two-leader delete_pending gate

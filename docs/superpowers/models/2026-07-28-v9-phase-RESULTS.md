@@ -1,5 +1,5 @@
 ---
-description: 'Phase gate for the v9 CAS ref-chain TLA+ effort: every model, every config, expected vs observed, plus the LIST-trust audit of the models the phase did not rewrite.'
+description: 'Phase gate for the v9 CAS ref-chain TLA+ effort: every model, every config, expected vs observed, plus a LIST-trust audit of six models the phase did not rewrite.'
 sidebar_label: 'v9 ref-chain TLA+ phase gate'
 sidebar_position: 2
 slug: /superpowers/models/2026-07-28-v9-phase-results
@@ -16,8 +16,8 @@ before any C++ lands, and every property must carry a `_sab_*` config proving it
 
 This file is the phase's single verdict. Per-model narrative, traces and state counts live in the
 five per-model RESULTS files; what is recorded here is the *whole battery*, run end to end from a
-clean `tmp/tlc-meta-*` state on 2026-07-28, plus the audit of the models the phase deliberately did
-NOT rewrite.
+clean `tmp/tlc-meta-*` state on 2026-07-28, plus a LIST-trust audit of six of the models the phase
+did not rewrite (scope stated exactly in [that section](#list-trust-audit)).
 
 ## Gate {#gate}
 
@@ -89,7 +89,7 @@ by ORDERING — are properties of *existing shipped code*, not of the v9 design,
 the main implementation plan's C++ tests. They are recorded here so their absence from the models is
 a stated choice, not a gap nobody noticed.
 
-## Harness output, verbatim {#harness}
+## Harness output {#harness}
 
 Every runner below was executed **sequentially** on 2026-07-28 from a cleared `tmp/tlc-meta-*` state
 (215 stale metadirs removed first), each into `tmp/task6_<runner>.log`, with `timeout 3600` per
@@ -191,14 +191,26 @@ a row here cannot disagree with the log it came from.
 | `CaErasureProof` | `_nogc_grace` | green | green | 1 | PASS |
 | `CaErasureProof` | `_fix_gclivegate` | green | green | 5 | PASS |
 | `CaErasureProof` | `_witness_promote` | violation | violation:NeverPromoted | 1 | PASS |
-| `CaRefFoldClampRecoveryCore` | `_sab_edgegranularity` | violation | violation:NoDeleteBehindClamp | 1 | PASS |
-| `CaRefFoldClampRecoveryCore` | `_safe` | green | green | 0 | PASS |
-| `CaRefWriterCleanupCore` | `_sab_retirebeforeremoval` | violation | violation:INV_RETIRE_AFTER_REMOVAL | 1 | PASS |
-| `CaRefWriterCleanupCore` | `_sab_successorcurrentepoch` | violation | violation:INV_NO_WRONGFUL_RECLAIM | 0 | PASS |
+| `CaRefFoldClampRecoveryCore` | `_sab_edgegranularity` | violation | violation:NoDeleteBehindClamp | 0 | PASS |
+| `CaRefFoldClampRecoveryCore` | `_safe` | green | green | 1 | PASS |
+| `CaRefWriterCleanupCore` | `_sab_retirebeforeremoval` | violation | violation:INV_RETIRE_AFTER_REMOVAL | 0 | PASS |
+| `CaRefWriterCleanupCore` | `_sab_successorcurrentepoch` | violation | violation:INV_NO_WRONGFUL_RECLAIM | 1 | PASS |
 | `CaRefWriterCleanupCore` | `_sab_cancelbeforedurable` | violation | violation:INV_NAMESPACE_REMOVAL_COMPLETE | 1 | PASS |
-| `CaRefWriterCleanupCore` | `_safe` | green | green | 1 | PASS |
+| `CaRefWriterCleanupCore` | `_safe` | green | green | 0 | PASS |
 
 ### Runner verdicts and wall times {#runner-verdicts}
+
+**This block is a normalized transcript, not a paste.** It joins two sources per row — the chain
+driver's `=== DONE … rc=… seconds=…` line (`tmp/task6_phase_chain.log`, `tmp/task6_old_chain.log`)
+and the runner's own final tally (`tmp/task6_<runner>.log`). The raw logs are the authority; the
+per-config table above is the load-bearing evidence and *is* byte-for-byte its generator's output.
+
+Provenance, per row, because "which version of the script produced this" is the whole point of
+recording it: the five **phase** runners ran exactly once, in one chain, and were never touched. The
+five **older** runners each report a re-run rather than the chain's first pass — all five after the
+classifier fix described below, and `run_foldclamp.sh` / `run_refwcleanup.sh` once more after the
+review's Minor-6/7 changes (which are classification-only: both came back with the same colours, the
+same names and the same totals).
 
 ```
 === DONE  run_refsnaplog.sh             rc=0 seconds=130   ALL EXPECTATIONS MET   (15/15)
@@ -206,30 +218,41 @@ a row here cannot disagree with the log it came from.
 === DONE  run_refcatalog.sh             rc=0 seconds=7     ALL EXPECTATIONS MET   (13/13)
 === DONE  run_nscleanup_staleleader.sh  rc=0 seconds=2     ALL EXPECTATIONS MET   (3/3)
 === DONE  run_mount.sh                  rc=0 seconds=583   ALL EXPECTATIONS MET   (22/22)
-PHASE_CHAIN_EXIT=0
+--- the five phase runners above ran once, in one chain; nothing was re-run ---
 === DONE  run_buildrootprecommit.sh     rc=0 seconds=90    ALL EXPECTATIONS MET   (8/8)
-=== DONE  run_disklifecycle.sh          rc=0 seconds=5     ALL EXPECTATIONS MET   (7/7)
+=== DONE  run_disklifecycle.sh          rc=0 seconds=5     ALL EXPECTATIONS MET   (7/7)   <- RE-RUN (rc=1 first pass)
 === DONE  run_erasureproof.sh           rc=0 seconds=9     ALL EXPECTATIONS MET   (6/6)
-=== DONE  run_foldclamp.sh              rc=0 seconds=1     ALL EXPECTATIONS MET   (2/2)
-=== DONE  run_refwcleanup.sh            rc=0 seconds=2     ALL EXPECTATIONS MET   (4/4)
-OLD_CHAIN_EXIT=0
+=== DONE  run_foldclamp.sh              rc=0 seconds=1     ALL EXPECTATIONS MET   (2/2)   <- + Minor-6 re-run
+=== DONE  run_refwcleanup.sh            rc=0 seconds=2     ALL EXPECTATIONS MET   (4/4)   <- + Minor-7 re-run
 ```
 
-The five older-model runners were re-run once after a classifier fix found by their own first pass —
-see [the digit-in-name note](#regex-digits) — so the table above and the scripts in the tree are the
-same thing. The five phase runners were not touched and their output is from the single end-to-end
-chain.
+**What `<- RE-RUN` means, stated here rather than only in adjacent prose.** In the chain,
+`run_disklifecycle.sh` exited **rc=1** — `tmp/task6_old_chain.log` still records
+`=== DONE run_disklifecycle.sh rc=1 seconds=5`, and that line is correct. Two of its configs came back
+`error` because of a classifier bug in the runner, not a defect in the model; see
+[the digit-in-name note](#regex-digits). The bug was fixed and **all five** older runners were then
+re-run (the other four were unaffected but were re-run anyway, so that every row here comes from the
+scripts as committed). The row above is that re-run.
 
-## Audit: LIST-trust in the models the phase did NOT rewrite {#list-trust-audit}
+Two lines that appeared in an earlier draft of this block have been dropped rather than explained:
+`PHASE_CHAIN_EXIT=0` and `OLD_CHAIN_EXIT=0` were unconditional `echo`s at the end of the driver
+scripts, not exit statuses — the second one was printed by a chain that contained the rc=1 runner
+above, so quoting either as evidence would have been misleading.
+
+## Audit: LIST-trust in six models the phase did not rewrite {#list-trust-audit}
 
 The v9 defect is *trusting an enumeration*: §1 — "GC folds what a listing returned and seals a cursor
 above what it OBSERVED; a hidden `-1` is a permanent leak, a hidden `+1` deletes acked data", root
 cause "absence is undecidable in a sparse id space". Any model that silently assumes a listing is
-complete could therefore be resting on the premise v9 exists to remove. Task 6 audited the six
-remaining models for that premise. Result: **one encodes no listing at all, one has an
-emptiness-`LIST` as its very subject, three assume a complete fold cut, and one models the
-incompleteness honestly** — and in every case the model's own subject is unaffected by v9, so none of
-the six is rewritten.
+complete could therefore be resting on the premise v9 exists to remove.
+
+**Scope, stated precisely: this is not a sweep of the tree.** The directory holds 23 modules; the
+phase rewrote or extended five, so eighteen were not rewritten, and Task 6's brief named **six** of
+those eighteen to audit. Those six are what this section covers. Result: **one encodes no listing at
+all, one has an emptiness-`LIST` as its very subject, three assume a complete fold cut, and one
+models the incompleteness honestly** — and in every case the model's own subject is unaffected by v9,
+so none of the six is rewritten. The other twelve are **deferred, not cleared**; the next audit
+target among them is named in [the residuals](#unaudited-residual) below, and it is not a small one.
 
 | model | LIST-trust encoded? | where, exactly | does v9 change its premise? |
 |---|---|---|---|
@@ -341,8 +364,9 @@ cost: both still reported their expected `INV_NO_DANGLE_COMMITTED` counterexampl
 reaches the invariant violation before it ever evaluates the bad disjunct. So the bug was **latent,
 not active** — but it was one exploration-order change away (a `-workers auto` run, a bound change, a
 new action ordered ahead of `Commit`) from turning a required red into a harness error, and the
-retired runner conventions would have counted that error as the expected red. Post-fix, both configs
-report the same counterexample, from the same 394-state / 117-distinct search.
+retired runner conventions would have counted that error as the expected red. Post-fix, each config
+reproduces its own pre-fix search exactly — `_buggy` 394 states / 117 distinct, `_buildrootonly`
+7,111 / 1,735 — same counterexample, same counts, both sides of the fix.
 
 A whole-directory scan for the pattern (`' =` followed by an unparenthesised ` \/ ` on the same line,
 plus the multi-line continuation shape) found **exactly one** live instance — this one. Every other
@@ -371,10 +395,22 @@ All five use `-workers 1` for determinism, per-config `-metadir` (so runners can
 
 - `temporal <Prop>` — TLC prints no name for a liveness counterexample
   (`Error: Temporal properties were violated.`), so the assertion is: a temporal violation happened,
-  **no** invariant violation happened, and the cfg declares **exactly** the one property named. That
-  is as strong as TLC's output allows, and it still refuses to let an unrelated red pass. Three
-  configs need it (`CaBuildRootPrecommit_lazyleak`, `CaDiskLifecycle_sab_nogcselfexit`, and the
-  classifier arm in `run_refwcleanup.sh`); everything else is an invariant with a name.
+  **no** invariant violation happened, and the cfg declares **exactly** the one property named
+  (derived from the cfg by a small `declared_properties` helper, never hardcoded, so the label cannot
+  go stale behind a property nobody updated the script for). That is as strong as TLC's output
+  allows, and it still refuses to let an unrelated red pass.
+
+  **Two** configs are *expected* to take this path — `CaBuildRootPrecommit_lazyleak` (the B199-S2
+  leak) and `CaDiskLifecycle_sab_nogcselfexit` (the pre-[C1] scheduler). Two more runners carry the
+  arm with no expectation reaching it (`run_foldclamp.sh`, `run_refwcleanup.sh`); `run_erasureproof.sh`
+  has none, and that is correct rather than an omission — not one of its six cfgs declares a
+  `PROPERTY` at all. An unreached arm is not decoration: `run_foldclamp.sh`'s sabotage breaks its
+  liveness property as well as its invariant, and the expectation names the invariant only because
+  that is what BFS reports first. Without the arm, a liveness-first report would land in `error` —
+  fail-closed, but reading as
+  a broken harness instead of "the same sabotage, the other property". Exercised with a liveness-only
+  probe (the sabotage cfg with its `INVARIANT` lines stripped, in a scratch tree): the classifier
+  returns `temporal:EventuallyFolded` rather than `error`.
 
 A timeout is also classified as its own outcome (`incomplete`, as `run_mount.sh` already does for
 `rev6_observe`) rather than falling into `error`, so a config that stops finishing cannot quietly
@@ -408,10 +444,35 @@ nothing by construction — `run_ackfloor`, `run_ackfloor_zombie`, `run_condemnm
 `run_gc_partmanifest`, `run_relinkconfirm`, `run_retiredinrun`, `run_tlc`,
 `run_foldabort_witness`. They have no expectation table to strengthen; turning each into an asserted
 suite means authoring expectations for 123 more configs across nine models (47 in
-`CaGcRootLocalPartManifestCore` alone), which is its own task, not a side effect of this one.
+`CaGcRootLocalPartManifestCore` alone), which is its own task, not a side effect of this one. The
+expectations for those configs currently live in the shell loops of
+[`cas/06-tla-models.md` § Running the models](../cas/06-tla-models.md#running-models), several of
+which still gate a sabotage on a bare nonzero exit code — that doc is where the work starts.
 Three further models have no runner at all (`CaGcLeaseCore`, `CaGcRoundDeferCore`,
-`CaGcShardIncarnationCore`) plus `CaB140DangleMerge`, which has no configs. Recorded as the
+`CaGcShardIncarnationCore`) plus `CaB140DangleMerge`, whose four configs use an `m_*.cfg` prefix
+instead of the usual `<Model>_*.cfg` one (so a conventional glob misses them). Recorded as the
 follow-up, not silently skipped.
+
+### The unaudited residual worth naming: `CaGcRootLocalPartManifestCore` {#unaudited-residual}
+
+Of the twelve models outside this audit's scope, one is squarely in the defect's blast radius and
+should be the next one audited — it is also the largest battery in the tree at 47 configs, and its
+README status is CURRENT (partial):
+
+`CaGcRootLocalPartManifestCore` carries a listing-derived guard in exactly the shape v9 demotes. Its
+`listedTok` variable is documented as "live root-shard token discovery observes **from LIST**"
+(`:79`), and the Phase-2 token-diff skip is gated on it (`:866`): *"A shard is skippable iff LIST
+surfaces a token (`TokenObservable`) AND the observed listed token equals the persisted folded
+token"*. That is a **skip decision gated on what a listing returned** — the same premise
+`CaGcAckFloorCore`'s `_sab_skipshard` sabotages, but here it is on the honest path, and the skip
+advances the durable fold cursor to the journal end while emitting no source edges. Whether v9's
+arithmetic frontier changes that model's premise (it very likely does, in the same
+assumption-becomes-mechanism direction as the three complete-cut models) is a real question this
+audit did **not** answer.
+
+Deferred deliberately: the brief named six files, and 47 configs behind a non-asserting driver is a
+task, not a footnote. It belongs with follow-up 2 in [the runner note](#fix-runners) — the same model,
+the same 47 configs — so whoever picks up either should pick up both.
 
 ## Method notes {#method}
 
@@ -423,7 +484,10 @@ follow-up, not silently skipped.
 - **`-workers 1`** in the phase runners that report numbers: parallel BFS visits states in a
   nondeterministic order, so depth, state counts and *which* shortest counterexample TLC prints all
   vary run to run, while the traces narrated in the RESULTS files are specific action sequences.
-- **Findings are not sabotages.** Three configs in this set are reds that report a defect rather than
-  validate a guard (`CaRefDeltaIntakeCore_witness_corruptgap`, `CaErasureProof_gc_asbuilt`,
-  `CaErasureProof_gc_promptliteral`) and one more is the historical witness
-  (`CaRelinkConfirmCore_sab_holeylist`). Each is labelled as such where it appears.
+- **Findings are not sabotages.** **Four** of the 93 battery configs are reds that report a defect
+  rather than validate a guard — `CaRefDeltaIntakeCore_witness_corruptgap`,
+  `CaErasureProof_gc_asbuilt`, `CaErasureProof_gc_promptliteral` and
+  `CaRefCatalogCore_finding_briefreconcileinv` — matching the count in [the gate](#gate)
+  (49 + 16 + 4 = 69). A fifth red of the same kind, `CaRelinkConfirmCore_sab_holeylist`, is the
+  historical witness and is **not** in any battery, so it is not in that arithmetic. Each is
+  labelled where it appears.

@@ -13,11 +13,14 @@
 #   sab_edgegranularity -> NoDeleteBehindClamp   commit a `-1` body token at EDGE granularity (the
 #                                                pre-fix bug) instead of on full log fold: the
 #                                                post-CAS delete reclaims A's body while its log is
-#                                                clamped, and every re-fold clamps forever (the cfg
-#                                                also declares EventuallyFolded, which the same
-#                                                sabotage breaks -- the invariant is what BFS reports
-#                                                first, and it is the safety half)
+#                                                clamped, and every re-fold clamps forever
 #   safe                -> GREEN                 per-log staging: NoDeleteBehindClamp + EventuallyFolded
+#
+# The sabotage breaks BOTH declared properties -- the safety invariant `NoDeleteBehindClamp` and the
+# liveness `EventuallyFolded` (a permanent freeze) -- and the expectation names the invariant because
+# that is what BFS reports first. The `temporal` classification arm below exists for the case where
+# it does not: without it a liveness-first report would land in `error`, which fails closed but
+# reads as a harness problem during triage rather than as "the same sabotage, the other property".
 #
 # Exits nonzero if any expectation is unmet.
 #
@@ -36,11 +39,24 @@ JAR=../../../tmp/tla2tools.jar
 [[ -f "$JAR" ]] || { echo "jar not found: $JAR" >&2; exit 3; }
 MODULE=CaRefFoldClampRecoveryCore
 
-# name  expectation(green|violation)  expected-invariant(asserted, not just logged)
+# name  expectation(green|violation|temporal)  expected-invariant/property(asserted, not just logged)
 CONFIGS=(
   "sab_edgegranularity  violation  NoDeleteBehindClamp"
   "safe                 green      -"
 )
+
+# The PROPERTY/PROPERTIES names a cfg declares, one per line (used by the `temporal` assertion).
+declared_properties() {
+  awk 'BEGIN { split("SPECIFICATION SPECIFICATIONS INIT NEXT INVARIANT INVARIANTS PROPERTY \
+                      PROPERTIES CONSTANT CONSTANTS CONSTRAINT CONSTRAINTS ACTION_CONSTRAINT \
+                      SYMMETRY VIEW CHECK_DEADLOCK ALIAS POSTCONDITION", k, " ")
+              for (i in k) kw[k[i]] = 1 }
+       { sub(/\\\*.*/, ""); if (NF == 0) next
+         if ($1 in kw) { inprop = ($1 == "PROPERTY" || $1 == "PROPERTIES")
+                         if (inprop) for (i = 2; i <= NF; i++) print $i
+                         next }
+         if (inprop) for (i = 1; i <= NF; i++) print $i }' "$1"
+}
 
 overall=0
 printf '%-22s %-11s %-40s %-8s %s\n' "CONFIG" "EXPECT" "RESULT" "SECONDS" "VERDICT"
@@ -61,6 +77,8 @@ for row in "${CONFIGS[@]}"; do
   elif grep -qE "(Invariant|Property|Action property) [A-Za-z0-9_]+ is violated" "$log"; then
     result="violation:$(grep -oE '(Invariant|Property|Action property) [A-Za-z0-9_]+ is violated' "$log" \
                         | head -1 | sed -E 's/.* ([A-Za-z0-9_]+) is violated/\1/')"
+  elif grep -q "Temporal properties were violated" "$log"; then
+    result="temporal:$(declared_properties "$cfg" | paste -sd, -)"
   elif [[ $rc -eq 124 ]]; then
     result="incomplete"
   else
@@ -71,6 +89,7 @@ for row in "${CONFIGS[@]}"; do
   case "$expect" in
     green)      [[ "$result" == "green" ]] && verdict="PASS" ;;
     violation)  [[ "$result" == "violation:${want}" ]] && verdict="PASS" ;;
+    temporal)   [[ "$result" == "temporal:${want}" ]] && verdict="PASS" ;;
   esac
   [[ "$verdict" == "FAIL" ]] && overall=1
 

@@ -59,6 +59,22 @@ CONFIGS=(
   "safe                       green      -"
 )
 
+# The PROPERTY/PROPERTIES names a cfg declares, one per line. No expectation in the table above is
+# `temporal` -- only `_safe` declares a property and it must hold -- so this only ever labels an
+# UNEXPECTED liveness red, which then fails (correctly). It is derived rather than hardcoded so the
+# label cannot go stale behind a second property nobody remembered to update this script for.
+declared_properties() {
+  awk 'BEGIN { split("SPECIFICATION SPECIFICATIONS INIT NEXT INVARIANT INVARIANTS PROPERTY \
+                      PROPERTIES CONSTANT CONSTANTS CONSTRAINT CONSTRAINTS ACTION_CONSTRAINT \
+                      SYMMETRY VIEW CHECK_DEADLOCK ALIAS POSTCONDITION", k, " ")
+              for (i in k) kw[k[i]] = 1 }
+       { sub(/\\\*.*/, ""); if (NF == 0) next
+         if ($1 in kw) { inprop = ($1 == "PROPERTY" || $1 == "PROPERTIES")
+                         if (inprop) for (i = 2; i <= NF; i++) print $i
+                         next }
+         if (inprop) for (i = 1; i <= NF; i++) print $i }' "$1"
+}
+
 overall=0
 printf '%-28s %-11s %-40s %-8s %s\n' "CONFIG" "EXPECT" "RESULT" "SECONDS" "VERDICT"
 for row in "${CONFIGS[@]}"; do
@@ -79,7 +95,7 @@ for row in "${CONFIGS[@]}"; do
     result="violation:$(grep -oE '(Invariant|Property|Action property) [A-Za-z0-9_]+ is violated' "$log" \
                         | head -1 | sed -E 's/.* ([A-Za-z0-9_]+) is violated/\1/')"
   elif grep -q "Temporal properties were violated" "$log"; then
-    result="temporal:StalePrecommitEventuallyGone"   # the only property any of these cfgs declares
+    result="temporal:$(declared_properties "$cfg" | paste -sd, -)"
   elif [[ $rc -eq 124 ]]; then
     result="incomplete"
   else
