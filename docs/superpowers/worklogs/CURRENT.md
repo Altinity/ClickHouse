@@ -1265,3 +1265,6 @@ disjoint). 4/6 TLA tasks complete. Pipeline HOLDING before task 5 — user direc
 
 **2026-07-28 10:2x UTC watchdog** — task 5 in TLC phase: module extended (70→104 KB), sab_staleinstall
 cfg written, live TLC on the v9_recoverygen green (-workers 1 per convention). Healthy. No push.
+
+**2026-07-28 10:4x UTC watchdog** — task 5: second timed run of the v9_recoverygen green (fresh
+metadir, timeout 1800 — the big module's state space needs measuring). Active. No push.
