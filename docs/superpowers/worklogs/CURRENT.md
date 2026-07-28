@@ -1610,3 +1610,7 @@ hazard prevented; life_epoch optional by red-proof); reviewer dispatched. T8 mer
 
 **2026-07-28 23:22 local watchdog** — combined post-T8-merge build green (EXIT=0), gate running;
 T9 in design (no logs yet); T5 reviewer reading. No push.
+
+**2026-07-28 23:4x local** — COMBINED GATE после мерджа T8: **1486/1486** (1460 + 26 lane-G,
+арифметика сходится). Main tree = tasks 0-5,7,8 merged and green. T5 wrap round (commit strays)
+in flight; T9 implementing. No push.
