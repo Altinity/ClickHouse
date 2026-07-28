@@ -1645,3 +1645,6 @@ gate3 done 00:37, ASan building, debug gate mid-run); T9 reviewer reading (no fi
 **2026-07-29 01:2x local** — T9 review: approved (discriminator decisively verified). One
 Important = evidence-marker hygiene (3rd lane case — "no quoted artifact a grep does not
 return" rule issued); small fix round dispatched. T6 finishing fixtures + gates. No push.
+
+**2026-07-29 01:00 local watchdog** — T6 on gate5 + build18 (converging, logs seconds-fresh);
+T9 fix round editing (no new commit yet). No push.
