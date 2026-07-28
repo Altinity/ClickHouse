@@ -1491,6 +1491,12 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     {
         if (!held_cov.hold)
             continue;
+        /// These keys come out of a DECODED seal, where a coverage map key is an arbitrary string, and
+        /// `parseCursorKey` is documented as undefined on anything `cursorKey` did not produce. Our
+        /// writer always emits a shard separator, so a key without one is debris in a corrupt seal:
+        /// skip it rather than read off the end of it.
+        if (held_key.find('/') == String::npos)
+            continue;
         const auto [held_ns, held_shard] = parseCursorKey(held_key);
         if (held_shard != 0 || ref_tables.contains(held_ns.string()))
             continue;
