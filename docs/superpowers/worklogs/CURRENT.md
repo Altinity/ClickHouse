@@ -1321,3 +1321,6 @@ plan per user directive. No push.
 **2026-07-28 12:4x local** — task 6 review in: Spec ✅ / approved + 1 Important (audit-scope wording;
 CaGcRootLocalPartManifestCore's listedTok named unaudited residual) + 7 minors. Fix round 1
 dispatched to tla-task6. No push.
+
+**2026-07-28 13:0x local watchdog** — task 6 fix round 1 active: foldclamp+refwcleanup re-run
+(12:37), report fix-round section started, one live TLC sanity run, commit pending. No push.
