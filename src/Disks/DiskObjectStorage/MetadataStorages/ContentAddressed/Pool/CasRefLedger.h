@@ -530,14 +530,21 @@ private:
     /// this table is idle.
     std::atomic<bool> shutting_down{false};
 
-    /// The id `rt`'s next transaction carries (INV-1): `nextRefTxnId` of the table's OWN
-    /// `greatest_applied` under the live writer epoch. There is no counter behind this -- the id is a
-    /// pure function of the state the transaction will be applied to, which buys two properties a
-    /// pool-wide counter could not:
+    /// The id `rt`'s next transaction carries (INV-1): `RefTableState::nextTxnId` of the table's OWN
+    /// state under the live writer epoch. There is no counter behind this -- the id is a pure function
+    /// of the state the transaction will be applied to, which buys two properties a pool-wide counter
+    /// could not:
     ///   - each namespace's ids are dense `1..T` within one epoch, so a reader holding a table's log
     ///     ids can tell a COMPLETE stream from a truncated one without consulting anything else;
     ///   - an attempt that provably sent nothing consumes nothing: the state it derived from is
     ///     unchanged, so the next caller derives the SAME id and no hole is left behind.
+    ///
+    /// "Provably sent nothing" is the premise of the second property, and one path breaks it: a
+    /// post-durable install failure SENT the transaction and it IS durable -- only the install that
+    /// would have recorded it threw (spec §A2's `Poisoned`). Deriving from `greatest_applied` alone
+    /// would re-derive that id and collide with our own durable object. `RefTableState::durable_floor`
+    /// is what keeps the derivation honest there, which is why this goes through `nextTxnId` rather
+    /// than reading `getGreatestApplied` itself.
     ///
     /// The epoch component is the live mount incarnation's writer epoch, not the open-time
     /// `process_epoch`: a self-remount allocates a strictly-greater durable writer_epoch, so every ref
@@ -550,7 +557,7 @@ private:
     /// table's successor, and the apply-side density check would (correctly) reject it.
     RefTxnId allocateRefTxnId(const RefTableRuntime & rt) const
     {
-        return nextRefTxnId(rt.state.getGreatestApplied(), live_epoch_fn());
+        return rt.state.nextTxnId(live_epoch_fn());
     }
 
     /// The CAS-owned retry controller this Pool's ref-log writer path uses for every

@@ -1426,9 +1426,27 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         const RootNamespace ns{ns_str};
         const String cursor_key = cursorKey(ns, /*shard*/0);
 
-        /// Parent cursor = the durable last_folded_ref_id this table folded to (absent => {0,0}). RefTxnId
-        /// is strictly increasing (writer_epoch primary), so a removed+recreated namespace's new logs carry
-        /// a greater id and fold normally -- no ABA / incarnation check is needed (id ordering subsumes it).
+        /// Parent cursor = the durable last_folded_ref_id this table folded to (absent => {0,0}).
+        ///
+        /// Id ordering NO LONGER subsumes remove+recreate. It used to: the sequence was pool-wide and
+        /// never re-derived, so a recreated namespace's first log always carried a greater id than
+        /// anything folded under it. Under INV-1 (`nextRefTxnId`) ids are derived per namespace from that
+        /// table's own state, so a namespace removed and recreated WITHIN ONE writer epoch -- after its
+        /// logs were cleaned and its runtime re-recovered from nothing -- restarts at `{E, 1}`, at or
+        /// below this cursor. The loop below skips ids `<= cursor`, so those edges would never fold and
+        /// the recreated refs' manifests would look unreferenced.
+        ///
+        /// Two things keep that from biting today. The cursor is dropped when the namespace vanishes: the
+        /// new seal's `per_ns_shard` is written ONLY for namespaces in THIS round's listing (see the
+        /// single write site below, and the abort path's carry, which both iterate `ref_tables`), so a
+        /// fully-deleted namespace leaves no cursor behind and a later recreation folds from `{0, 0}`.
+        /// The residual window is a recreation that lands before the round which would have dropped the
+        /// cursor -- and there Stage A is safe only because ALL destruction is suppressed
+        /// (`UniversePolicy`), i.e. nothing acts on the unfolded edges.
+        ///
+        /// The structural closure is Stage B's catalog incarnations: cursors keyed by
+        /// `(namespace, incarnation)` rather than by name, which makes a recreated namespace a different
+        /// key instead of the same key with re-derived ids. Do not "fix" it here by comparing ids.
         const auto cursor_it = parent_cursors.find(cursor_key);
         const RefTxnId cursor = cursor_it != parent_cursors.end()
             ? cursor_it->second.last_folded_ref_id : RefTxnId{};

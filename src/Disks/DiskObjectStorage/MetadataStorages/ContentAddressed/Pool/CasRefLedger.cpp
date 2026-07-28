@@ -1493,6 +1493,9 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
                         }
                         catch (...)
                         {
+                            /// `resolveByExactGet` proved this object durable one step above, so the same
+                            /// floor argument as `commitRefChunk`'s Committed install applies verbatim.
+                            rt->state.noteDurableIdNotApplied(wedge_copy->txn_id);
                             poisonApplyState(*rt, ns, "wedge-resolution install");
                             throw;
                         }
@@ -1780,7 +1783,7 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
             {
                 RefTableState shape_check = working;
                 applyRefLogTxn(shape_check, RefLogTxn{ns.string(),
-                    nextRefTxnId(shape_check.getGreatestApplied(), live_epoch_fn()), item_ops, std::nullopt});
+                    shape_check.nextTxnId(live_epoch_fn()), item_ops, std::nullopt});
             }
 
             for (const RefOp & op : item_ops)
@@ -1802,7 +1805,7 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
                 /// owner_transition) is validated -- both here and by admits's own preview -- against
                 /// a state that already reflects it, exactly as the real combined transaction will.
                 applyRefLogTxn(item_scratch, RefLogTxn{ns.string(),
-                    nextRefTxnId(item_scratch.getGreatestApplied(), live_epoch_fn()), {op}, std::nullopt});
+                    item_scratch.nextTxnId(live_epoch_fn()), {op}, std::nullopt});
             }
             /// Reserve the growth of BOTH accumulators BEFORE this item's effects are published. These
             /// reservations are the ONLY remaining throwing steps; once they succeed the publish below is
@@ -2017,11 +2020,16 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
         /// `putIfAbsentControlled` throws CORRUPTED_DATA when resolve-before-reissue observes a DIFFERENT
         /// object already at this txn's key -- a proven different-object conflict, not an unresolved PUT.
         /// Fail every survivor loudly and do NOT wedge (this is a conclusive rejection, not an uncertain
-        /// outcome): the cache is unchanged and the lane stays usable. The id is not consumed either --
-        /// but a foreign object sitting on this table's next key means the next attempt derives that
-        /// same id and hits the same conflict, which is the correct fail-closed behaviour: something
-        /// else is writing this table's log under our own epoch, and guessing a different id would only
-        /// hide a mount-exclusivity violation.
+        /// outcome): the cache is unchanged and nothing of ours is durable.
+        ///
+        /// This table's appends are now BLOCKED, and that is the intended contract. Under mount-lease
+        /// exclusivity this key is exclusively ours, so a different object at it is a write-ownership
+        /// violation -- corruption or a protocol breach, not a race. The id is not consumed, so the next
+        /// attempt derives the SAME id and hits the SAME conflict, loudly, until a remount-level recovery
+        /// (a fresh writer epoch is a fresh key namespace) clears it. Advancing past the occupant, which
+        /// is what the pool-wide allocator did, would have written this table's stream around a foreign
+        /// object and hidden the violation -- and produced the hole INV-1 exists to forbid. Neighbouring
+        /// namespaces are unaffected: ids are per-namespace, so nothing about this leaks out of it.
         /// Conclusive also means PROVEN NON-DURABLE for our bytes (the key is write-once and holds
         /// someone else's object), so no apply is owed and the marker goes back to `Clean` (spec §A2).
         clearApplyPending(*rt);
@@ -2074,6 +2082,13 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
                 }
                 catch (...)
                 {
+                    /// The `PUT` returned `Committed`, so this transaction IS durable and this state will
+                    /// never contain it. Record that BEFORE poisoning: without the floor the next append
+                    /// re-derives this very id from an unadvanced `greatest_applied` and collides with our
+                    /// own object -- reported as foreign interference, and unrecoverable for the runtime's
+                    /// life. The floor keeps the durable stream dense (the next transaction lands above
+                    /// this one) while `Poisoned` keeps saying, correctly, that this cache is missing it.
+                    rt->state.noteDurableIdNotApplied(id);
                     poisonApplyState(*rt, ns, "commitRefChunk install");
                     throw;
                 }
@@ -2231,6 +2246,13 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
                 }
                 catch (...)
                 {
+                    /// No `noteDurableIdNotApplied` here, unlike the other two regions: this arm's
+                    /// durability is UNPROVEN (that is what `Unresolved` means). Raising the floor over an
+                    /// id that may never have been written would skip it, and a skipped id that nothing
+                    /// durable occupies is precisely the hole INV-1 exists to forbid. The next append
+                    /// re-derives this id, which is correct on both branches -- if the object never
+                    /// landed the key is free, and if it did the collision is the loud, accurate report
+                    /// that this lane lost the wedge that was its only way to resolve it.
                     poisonApplyState(*rt, ns, "commitRefChunk wedge install");
                     throw;
                 }

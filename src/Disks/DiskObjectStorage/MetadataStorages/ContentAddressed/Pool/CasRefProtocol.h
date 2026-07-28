@@ -7,6 +7,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCowMap.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCowManifestSet.h>
 #include <base/types.h>
+#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -138,6 +139,24 @@ struct RefLedgerConfig
     uint64_t ref_table_cache_bytes = 256ULL << 20;
 };
 
+/// The ONE id-derivation rule (INV-1): the id that continues `greatest_applied`'s stream under
+/// `live_epoch`. Within an epoch a table's ids are dense -- the successor of the greatest applied one --
+/// and an epoch change restarts the sequence at 1, because density is a property of `(namespace, epoch)`
+/// and a fresh incarnation's stream is a fresh stream. There is no counter anywhere: the id is a pure
+/// function of the state it will be applied to, which is what makes an attempt that sent nothing
+/// consume nothing (the next caller derives the same id from the same unchanged state).
+///
+/// Both sides of the invariant call this: the writer to mint an id, and `applyTxnInPlace` to decide
+/// whether a transaction's id is admissible. Sharing the rule is deliberate -- an allocator and a
+/// checker that each spell it out separately can drift, and a drift here is either a durable hole or a
+/// table that refuses its own writes.
+///
+/// Total by construction (no throw): the one input it cannot serve, an exhausted `ref_sequence` under
+/// the live epoch, would need 2^64 transactions in one incarnation of one table. Should a corrupt
+/// persisted snapshot ever seed such a state, the wrap produces a `ref_sequence` of 0, which
+/// `applyTxnInPlace`'s strict-increase precondition rejects before anything is written.
+RefTxnId nextRefTxnId(RefTxnId greatest_applied, uint64_t live_epoch);
+
 /// The in-memory table state: `TableState = Replay(S_X.state, tail(X))`. This class, `applyRefLogTxn`, `snapshotOf`, and
 /// `replay` are the ONE shared implementation of that equation -- used verbatim by the writer, its
 /// own recovery path, `fsck`, and snapshot construction, so every consumer agrees on what a
@@ -165,6 +184,25 @@ public:
     const std::set<std::pair<String, ManifestRef>> & getPrecommits() const { return precommits; }
     uint64_t getSnapshotBodyBytes() const { return snapshot_body_bytes; }
     uint64_t getRemovalBodyBytes() const { return removal_body_bytes; }
+    const RefTxnId & getDurableFloor() const { return durable_floor; }
+
+    /// The id this state's next transaction must carry (INV-1) — the ONE derivation, called by the
+    /// writer to mint an id, by every trial preview to stamp its throwaway transaction, and by
+    /// `applyTxnInPlace` to decide whether a transaction's id is admissible. Three callers, one rule:
+    /// an allocator and a checker that each spell it out separately can drift, and a drift here is
+    /// either a durable hole or a table that refuses its own writes.
+    ///
+    /// The anchor is `max(greatest_applied, durable_floor)`, not `greatest_applied` alone. See
+    /// `durable_floor` for the one situation where they differ.
+    RefTxnId nextTxnId(uint64_t live_epoch) const
+    {
+        return nextRefTxnId(std::max(greatest_applied, durable_floor), live_epoch);
+    }
+
+    /// Records that `id` is DURABLE but is not (and will never be) applied to this state, raising the
+    /// floor monotonically. Allocation-free and non-throwing: the sole caller is a `catch` inside a
+    /// post-durable install region that is about to rethrow, where anything that could fail must not run.
+    void noteDurableIdNotApplied(const RefTxnId & id) noexcept { durable_floor = std::max(durable_floor, id); }
 
     /// State-install point only (once per ref-log flush, never per batch item): folds the committed
     /// map's and the owned-manifest index's COW overlays into their bases -- in place when the base is
@@ -187,6 +225,25 @@ private:
     RefLifecycle lifecycle = RefLifecycle::Removed;   /// see representation note above
     std::optional<RefTxnId> remove_txn_id;
     RefTxnId greatest_applied{};                       /// {0, 0} = no transaction applied yet
+
+    /// The greatest id known DURABLE but not applied here — `{0, 0}` in every healthy state, and raised
+    /// only by a post-durable install failure (spec §A2's `Poisoned` transition), where the object is
+    /// proven durable and the install that would have recorded it threw.
+    ///
+    /// It exists because INV-1 is a property of the DURABLE STREAM, not of one cache's view of it. The
+    /// id derivation would otherwise re-derive the stranded id from `greatest_applied`, and the writer
+    /// would collide with its OWN durable object — reported as foreign interference, and unrecoverable
+    /// for the runtime's life, which is a fence rather than the assert layer §A2 is meant to be. With
+    /// the floor, the next transaction lands ABOVE the stranded one and the durable stream stays dense;
+    /// only this cache is missing a transaction, which is exactly what `Poisoned` says.
+    ///
+    /// It is NOT raised by the wedge install (spec §A2's other region): there the object's durability is
+    /// UNPROVEN, so skipping its id could leave a genuine hole in the durable stream.
+    ///
+    /// Deliberately not part of the table's logical content: `snapshotOf` ignores it, no codec carries
+    /// it, and a fresh recovery starts at `{0, 0}` — the divergence it records is a property of one
+    /// live runtime, and re-deriving the state from the durable log is what actually clears it.
+    RefTxnId durable_floor{};
 
     RefCowMap committed;                                              /// keyed by ref_name
     std::set<std::pair<String, ManifestRef>> precommits;             /// (ref_name, manifest_ref)
@@ -346,24 +403,6 @@ RefTableState stateFromSnapshot(const RefTableSnapshot & snapshot);
 /// framing; a writer that wants a friendlier user-facing rejection for an ordinary attempted mutation
 /// (e.g. "ref already exists") checks its own business state before ever building the op.
 void applyRefLogTxn(RefTableState & state, const RefLogTxn & txn);
-
-/// The ONE id-derivation rule (INV-1): the id that continues `greatest_applied`'s stream under
-/// `live_epoch`. Within an epoch a table's ids are dense -- the successor of the greatest applied one --
-/// and an epoch change restarts the sequence at 1, because density is a property of `(namespace, epoch)`
-/// and a fresh incarnation's stream is a fresh stream. There is no counter anywhere: the id is a pure
-/// function of the state it will be applied to, which is what makes an attempt that sent nothing
-/// consume nothing (the next caller derives the same id from the same unchanged state).
-///
-/// Both sides of the invariant call this: the writer to mint an id, and `applyTxnInPlace` to decide
-/// whether a transaction's id is admissible. Sharing the rule is deliberate -- an allocator and a
-/// checker that each spell it out separately can drift, and a drift here is either a durable hole or a
-/// table that refuses its own writes.
-///
-/// Total by construction (no throw): the one input it cannot serve, an exhausted `ref_sequence` under
-/// the live epoch, would need 2^64 transactions in one incarnation of one table. Should a corrupt
-/// persisted snapshot ever seed such a state, the wrap produces a `ref_sequence` of 0, which
-/// `applyTxnInPlace`'s strict-increase precondition rejects before anything is written.
-RefTxnId nextRefTxnId(RefTxnId greatest_applied, uint64_t live_epoch);
 
 /// The canonical snapshot of `state` under `ns`: `committed` sorted by
 /// bytewise `ref_name` (guaranteed by `RefCowMap`'s sorted merge-iteration order,

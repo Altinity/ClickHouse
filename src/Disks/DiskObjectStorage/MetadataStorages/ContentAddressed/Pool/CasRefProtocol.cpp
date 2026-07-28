@@ -156,6 +156,7 @@ void RefTableState::swap(RefTableState & other) noexcept
     swap(lifecycle, other.lifecycle);
     swap(remove_txn_id, other.remove_txn_id);
     swap(greatest_applied, other.greatest_applied);
+    swap(durable_floor, other.durable_floor);
     committed.swap(other.committed);
     precommits.swap(other.precommits);
     owned_manifests.swap(other.owned_manifests);
@@ -448,21 +449,23 @@ void RefTableState::applyTxnInPlace(const RefLogTxn & txn)
             txn.txn_id.writer_epoch, txn.txn_id.ref_sequence,
             greatest_applied.writer_epoch, greatest_applied.ref_sequence);
 
-    /// INV-1: within `(namespace, epoch)` the durable ids are DENSE, so the only admissible id is the
-    /// one `nextRefTxnId` derives -- the same rule the writer mints with. This is what turns "these are
-    /// the log ids I can see" into "this is the whole stream": a reader that finds `1..T` knows nothing
-    /// was lost, which no amount of strict-increase checking could tell it. Enforcing it HERE, on the
-    /// read side, is deliberate -- a hole cannot become durable even if some future writer path forgets
-    /// the rule, because every apply (writer candidate, recovery replay, GC's own fold) runs it.
+    /// INV-1: within `(namespace, epoch)` the DURABLE ids are DENSE, so the only admissible id is the
+    /// one `nextTxnId` derives -- the same rule, on the same state, that the writer mints with. This is
+    /// what turns "these are the log ids I can see" into "this is the whole stream": a reader that finds
+    /// `1..T` knows nothing was lost, which no amount of strict-increase checking could tell it.
+    /// Enforcing it HERE, on the read side, is deliberate -- a hole cannot become durable even if some
+    /// future writer path forgets the rule, because every apply (writer candidate, recovery replay,
+    /// `fsck`'s oracle) runs it.
     ///
     /// The strict-increase check above is not subsumed by this one: it rejects an id under an OLDER
     /// epoch, whose sequence would still look like a legitimate fresh-epoch `1`.
-    if (const RefTxnId expected = nextRefTxnId(greatest_applied, txn.txn_id.writer_epoch); txn.txn_id != expected)
+    if (const RefTxnId expected = nextTxnId(txn.txn_id.writer_epoch); txn.txn_id != expected)
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "RefTableState: txn_id {}-{} does not continue the ref-log stream — the greatest applied id "
-            "is {}-{}, so the only contiguous successor is {}-{}",
+            "is {}-{} (durable floor {}-{}), so the only contiguous successor is {}-{}",
             txn.txn_id.writer_epoch, txn.txn_id.ref_sequence,
             greatest_applied.writer_epoch, greatest_applied.ref_sequence,
+            durable_floor.writer_epoch, durable_floor.ref_sequence,
             expected.writer_epoch, expected.ref_sequence);
 
     checkRemoveNamespaceOrdering(txn.ops);

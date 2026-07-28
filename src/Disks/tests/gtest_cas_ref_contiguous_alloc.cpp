@@ -11,9 +11,12 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPoolMetaFormat.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
+#include <Common/MemoryTracker.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <string>
@@ -41,6 +44,7 @@
 namespace DB::ErrorCodes
 {
 extern const int CORRUPTED_DATA;
+extern const int MEMORY_LIMIT_EXCEEDED;
 extern const int UNKNOWN_FORMAT_VERSION;
 }
 
@@ -313,6 +317,58 @@ TEST(CasRefContiguousAlloc, OldPoolFormatIsRefusedNamingRecreation)
                                                kContiguousRefStreamsGeneration - 1)), String::npos)
             << "the message must name the migration: " << e.message();
     }
+}
+
+/// The one path where "an attempt that provably sent nothing consumes nothing" does not hold, and the
+/// reason `RefTableState` carries a durable floor at all: a post-durable install failure (spec §A2's
+/// `Poisoned`) SENT its transaction and left it DURABLE — only the install that would have recorded it
+/// threw. Deriving the next id from `greatest_applied` alone would re-derive the stranded id and collide
+/// with our own object, which the controller reports as foreign interference: a fence, exactly where
+/// §A2 promises an assert layer. The floor makes the next transaction land ABOVE the stranded one, so
+/// the DURABLE stream stays dense (…, 5, 6, …) even though this cache is missing 5 — which is precisely
+/// what `Poisoned` says about it.
+TEST(CasRefContiguousAlloc, PostDurableInstallFailureAllocatesPastTheStrandedId)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPool(backend);
+    const uint64_t epoch = store->writerEpoch();
+    const RootNamespace ns{"srv1/contig_durable_floor"};
+
+    ASSERT_EQ(publishRef(store, ns, "ref_1", 1), (RefTxnId{epoch, 1}));
+
+    /// One-shot throw inside the post-durable install region: txn {epoch, 2} commits durably and is
+    /// never installed. The exception is built OUTSIDE the region (building it inside would trip
+    /// `DENY_ALLOCATIONS_IN_SCOPE` and test the guard instead of the poison).
+    auto planned = std::make_exception_ptr(DB::Exception(DB::ErrorCodes::MEMORY_LIMIT_EXCEEDED,
+        "simulated allocation failure inside the post-durable install region"));
+    auto fired = std::make_shared<std::atomic<bool>>(false);
+    store->setInstallRegionProbeForTest([planned, fired]
+    {
+        if (fired->exchange(true))
+            return;
+        ALLOW_ALLOCATIONS_IN_SCOPE;
+        std::rethrow_exception(planned);
+    });
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::MEMORY_LIMIT_EXCEEDED,
+        [&] { publishRef(store, ns, "ref_2", 2); });
+    store->setInstallRegionProbeForTest(nullptr);
+    ASSERT_EQ(store->applyStateForTest(ns), RefApplyState::Poisoned);
+
+    /// The next append lands at {epoch, 3} -- PAST the stranded {epoch, 2}, not on it -- and really
+    /// commits. Without the floor it would re-derive {epoch, 2} and fail on its own durable object.
+    EXPECT_EQ(publishRef(store, ns, "ref_3", 3), (RefTxnId{epoch, 3}))
+        << "the stranded transaction is durable, so the next id must be its successor, not itself";
+    EXPECT_TRUE(store->resolveRef(ns, "ref_3", /*allow_stale=*/false).has_value())
+        << "a poisoned table keeps ACCEPTING work (spec §A2: an assert layer, not a fence)";
+    EXPECT_EQ(store->applyStateForTest(ns), RefApplyState::Poisoned)
+        << "and the poison is terminal for this runtime";
+
+    /// The durable stream itself is dense: 1, 2 (stranded), 3 all exist as objects. Only this cache is
+    /// missing 2, which is what the poison marks -- so a fresh reader replaying the log sees no hole.
+    const String log_prefix = store->layout().refsNamespacePrefix(ns) + "_log/";
+    for (uint64_t seq = 1; seq <= 3; ++seq)
+        EXPECT_TRUE(backend->head(store->layout().refLogKey(ns, RefTxnId{epoch, seq})).exists)
+            << "log object " << epoch << "-" << seq << " must exist: the durable stream has no hole";
 }
 
 /// Recreation quiesce, refusal leg. Refusing to OPEN an old-format pool fences nothing: the server that

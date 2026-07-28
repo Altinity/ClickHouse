@@ -837,20 +837,20 @@ TEST(CasRefInstallSafety, WedgeInstallFailurePoisonsTheTable)
            "-- which is precisely why this region poisons despite durability being unproven";
 }
 
-/// The negative transition: `Poisoned` is TERMINAL for the runtime. Nothing a later flush does may
-/// clear it -- the earlier durable transaction is still missing from this cached state, and a marker
-/// that a later flush could wash away would report health that does not exist. Enforced by
-/// construction: both clearing transitions are CASes whose expected value is `Clean`/`ApplyPending`, so
-/// no code path can store over a poison; only a fresh recovery, which means a REPLACED runtime, starts
-/// over at `Clean`.
+/// The negative transition: `Poisoned` is TERMINAL for the runtime. A later flush that commits and
+/// installs perfectly must NOT clear it -- the earlier durable transaction is still missing from this
+/// cached state, and a marker that a successful flush could wash away would report health that does not
+/// exist. Enforced by construction: both clearing transitions are CASes whose expected value is
+/// `Clean`/`ApplyPending`, so no code path can store over a poison; only a fresh recovery, which means a
+/// REPLACED runtime, starts over at `Clean`.
 ///
-/// Under INV-1 the poison is no longer only an assert layer. The stranded transaction IS durable at the
-/// table's next id, and the next append derives that same id from the unchanged cached state -- so the
-/// protocol itself refuses, with a proven different-object conflict at that exact key, instead of
-/// minting a higher id and writing on past the hole. That refusal is the fix for exactly the divergence
-/// this file's header describes (a durable transaction the writer's own state does not know about, which
-/// recovery would then skip forever while GC still folded it): it can no longer be built upon.
-TEST(CasRefInstallSafety, PoisonedTableRefusesLaterAppendsAtTheStrandedId)
+/// It also pins the honest scope of §A2: a poisoned table keeps ACCEPTING work. That is intentional --
+/// this is an assert layer, not a fence (see `RefApplyState`), and safety comes from §A1 having made
+/// the poison unreachable in the first place. Under INV-1 that acceptance needs one extra thing to stay
+/// true, since ids are derived from the state and the stranded transaction is durable at the very id the
+/// unadvanced state would derive next: the failed install records it as `RefTableState`'s durable floor,
+/// so the append below lands ABOVE it instead of colliding with our own object.
+TEST(CasRefInstallSafety, PoisonedSurvivesALaterSuccessfulFlush)
 {
     auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
     auto store = openPool(backend);
@@ -864,21 +864,18 @@ TEST(CasRefInstallSafety, PoisonedTableRefusesLaterAppendsAtTheStrandedId)
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::MEMORY_LIMIT_EXCEEDED, [&] { store->dropRef(ns, "x"); });
     store->setInstallRegionProbeForTest(nullptr);
     ASSERT_EQ(store->applyStateForTest(ns), RefApplyState::Poisoned);
-    /// The cached table still resolves "x" -- it never recorded the drop, which is exactly what being
-    /// poisoned means. The durable object under the stranded id is what the append below collides with,
-    /// and that collision is the only observation of it this cache can make.
-    ASSERT_TRUE(store->resolveRef(ns, "x", /*allow_stale=*/false).has_value());
 
-    /// An ordinary append afterwards: it re-derives the SAME id (the cached state never moved) and finds
-    /// the stranded object sitting on it.
-    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { store->dropRef(ns, "y"); });
-    EXPECT_TRUE(store->resolveRef(ns, "y", /*allow_stale=*/false).has_value())
-        << "the refused append must not have taken effect";
+    /// A perfectly ordinary, fully successful append afterwards.
+    store->dropRef(ns, "y");
+    EXPECT_FALSE(store->resolveRef(ns, "y", /*allow_stale=*/false).has_value())
+        << "the later flush must really have committed AND installed -- otherwise the assertion below "
+           "would pass for the wrong reason";
 
     EXPECT_EQ(store->applyStateForTest(ns), RefApplyState::Poisoned)
-        << "the poison is terminal for this runtime: only a replaced runtime starts over at Clean";
+        << "a later successful flush must never clear a poison: the transaction stranded by the failed "
+           "install is still missing from this runtime's state";
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasRefApplyPoisoned].load() - poisoned_before, 1u)
-        << "the event counts TRANSITIONS, so the refused append must not have added another";
+        << "the event counts TRANSITIONS, so the successful flush must not have added another";
 }
 
 /// Part B review, BLOCKER 2: an UNCERTAIN `precommitAdd` must keep its cleanup owner and its body.
