@@ -1622,3 +1622,7 @@ implementing on lane G. 8 of 15 stage-A tasks closed. No push.
 
 **2026-07-28 23:41 local watchdog** — T9 iterating hard (builds 5-6, seconds-fresh); T6 reading
 (~10 min in, no logs yet, normal for a 97-line brief + 11 obligations). No push.
+
+**2026-07-29 00:00 local watchdog** — T9 COMMITTED on lane G (`c60911eecd7`, frontier proof +
+gates) with red/restore verification runs cycling; DONE message pending. T6 coding post-rulings
+(no logs yet). No push.
