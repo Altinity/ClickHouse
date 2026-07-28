@@ -446,8 +446,9 @@ nothing by construction — `run_ackfloor`, `run_ackfloor_zombie`, `run_condemnm
 suite means authoring expectations for 123 more configs across nine models (47 in
 `CaGcRootLocalPartManifestCore` alone), which is its own task, not a side effect of this one. The
 expectations for those configs currently live in the shell loops of
-[`cas/06-tla-models.md` § Running the models](../cas/06-tla-models.md#running-models), several of
-which still gate a sabotage on a bare nonzero exit code — that doc is where the work starts.
+[`cas/06-tla-models.md` § Running the models](../cas/06-tla-models.md#running-models); after this
+round's sweep none of them gates a sabotage on a bare nonzero exit code any more, but the surviving
+loops assert nothing at all (expectations live in comments only) — that doc is where the work starts.
 Three further models have no runner at all (`CaGcLeaseCore`, `CaGcRoundDeferCore`,
 `CaGcShardIncarnationCore`) plus `CaB140DangleMerge`, whose four configs use an `m_*.cfg` prefix
 instead of the usual `<Model>_*.cfg` one (so a conventional glob misses them). Recorded as the
