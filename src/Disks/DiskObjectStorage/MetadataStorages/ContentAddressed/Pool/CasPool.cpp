@@ -41,6 +41,7 @@ namespace ErrorCodes
 namespace ProfileEvents
 {
     extern const Event CasPartFolderManifestGets;
+    extern const Event CasRemountHeldTransient;
     extern const Event CasRefBatchFlushes;
     extern const Event CasRefBatchedMutations;
     extern const Event CasRefBatchScopeCuts;
@@ -1021,7 +1022,19 @@ bool Pool::tryRemountOnce()
                     mount_runtime.enterIdentityLost();
                 return false;
             case LifecycleGateVerdict::StayTransient:
-                /// Uncertain — remain transient and let the recovery loop retry.
+                /// Uncertain — remain transient and let the recovery loop retry. The probe's own reason is
+                /// the only account of WHY, and it is the difference between a transient store hiccup and
+                /// a pool this build can never open again: an undecodable `_pool_meta` is what a pool
+                /// predating the contiguous-ref-stream format floor looks like from here (`decodePoolMeta`
+                /// throws, the gate catches it), and silently retrying forever would leave that pool's
+                /// operator with a fenced mount and nothing to read. Say it, and count it.
+                ProfileEvents::increment(ProfileEvents::CasRemountHeldTransient);
+                LOG_WARNING(getLogger("CasPool"),
+                    "content-addressed pool '{}' (prefix '{}'): remount held TRANSIENT — {}. The mount "
+                    "stays fenced closed and the remount loop will retry. If this repeats, the pool "
+                    "metadata is unreadable to this build (a pool below its format floor must be "
+                    "recreated) rather than merely unavailable.",
+                    config.server_root_id, config.pool_prefix, gate.reason);
                 return false;
         }
     }

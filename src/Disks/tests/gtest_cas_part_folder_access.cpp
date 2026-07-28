@@ -366,11 +366,17 @@ TEST(CasPartFolderAccess, PublishEntriesAbandonsBuildOnPromoteFailure)
     /// succeed while a foreign object sits on its next log key (ids are derived from the table's own
     /// greatest applied id, so every attempt addresses exactly that key). What is still observable, and
     /// is what the regression guard actually needs, is that the cleanup RAN: `abandon`'s removal append
-    /// attempted its own create at the ref-log key, on top of the promote's. Delete the
-    /// `abandonBuildBestEffort` call from `publishEntries` and this count drops back to one.
-    EXPECT_GE(backend->matching_put_attempts, attempts_before + 2)
-        << "publishEntries must still abandon the build on a promote failure: exactly one ref-log create "
-           "attempt (the promote's) means the cleanup never ran";
+    /// attempted its own create at the ref-log key, on top of the precommitAdd's and the promote's.
+    ///
+    /// EXACTLY four, not "at least four": the counter increments BEFORE the skip/fault branch, so a
+    /// `>=` bound would pass in the world this guard exists to catch. The four are precommitAdd's own
+    /// append, the promote's faulted one, `promote`'s catch-abandon, and the handle destructor's
+    /// backstop abandon (which retries because the catch-abandon could not land). Removing the
+    /// catch-abandon from `PreparedPartWrite::promote` leaves only the destructor's, giving three --
+    /// verified by doing exactly that, and this assertion is what failed.
+    EXPECT_EQ(backend->matching_put_attempts, attempts_before + 4)
+        << "publishEntries must still abandon the build on a promote failure at the promote site: three "
+           "ref-log create attempts means only the destructor backstop ran";
 
     /// And nothing was written ABOVE the damage: the occupant is the GREATEST log id in the namespace
     /// (keys render the id in fixed-width hex, so lexical order is id order). An append that carved a

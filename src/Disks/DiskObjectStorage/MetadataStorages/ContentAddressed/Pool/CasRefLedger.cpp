@@ -2500,28 +2500,59 @@ bool CasRefLedger::trySnapshotPublishOnce(const RootNamespace & ns)
     const auto rt = getRefTableRuntime(ns);
     ensureRefTableRecovered(ns, *rt);
 
-    /// A poisoned table must never bake its divergence into a durable snapshot. `Poisoned` means a
-    /// transaction is durable in the log and missing from THIS cached state; once the durable floor lets
-    /// a later append land ABOVE the stranded id, `greatest_applied` -- the id a snapshot is LABELLED
-    /// with -- rises above it too. Publishing then would claim coverage of a transaction the body does
-    /// not contain, and every future recovery that selected that snapshot would skip the stranded
-    /// transaction forever: a divergence confined to one runtime's cache would become durable and
-    /// permanent, which is precisely the data-loss class the install ordering exists to prevent.
-    ///
-    /// Only `Poisoned` gates. `ApplyPending` is safe: the in-flight transaction is by construction ABOVE
-    /// `greatest_applied`, so a snapshot labelled with the latter does not claim to cover it and recovery
-    /// still replays it.
-    ///
-    /// Read before the lock deliberately -- the marker is one-way and terminal for this runtime, so the
-    /// only reading this can miss is a poison landing DURING the capture below, and that snapshot is
-    /// still sound: it is labelled `greatest_applied`, which at that instant is still strictly below the
-    /// stranded id. Any snapshot that could claim to cover the stranded id must come from an append that
-    /// committed after the poison, and such an attempt reads the marker here and refuses.
-    ///
-    /// The refusal is permanent for this runtime by design: only a replaced runtime (a remount, or the
-    /// recovery that re-derives this table from the durable log) can publish for it again. The publish
-    /// dispatcher's own exponential backoff bounds how often a poisoned table repeats this log line.
-    if (rt->apply_state.load(std::memory_order_relaxed) == RefApplyState::Poisoned)
+    /// ONE copy of the live state, at a transaction boundary -- no
+    /// replay, no per-entry retention. The tail counters are captured in the SAME critical section so
+    /// adoption below subtracts exactly what this attempt's candidate actually covers.
+    RefTableState candidate_state;
+    RefTxnId candidate_x;
+    uint64_t captured_count = 0;
+    uint64_t captured_bytes = 0;
+    bool poisoned = false;
+    {
+        std::lock_guard lock(rt->state_mutex);
+        /// A poisoned table must never bake its divergence into a durable snapshot. `Poisoned` means a
+        /// transaction is durable in the log and missing from THIS cached state; once the durable floor
+        /// lets a later append land ABOVE the stranded id, `greatest_applied` -- the id a snapshot is
+        /// LABELLED with -- rises above it too. Publishing then would claim coverage of a transaction the
+        /// body does not contain, and every future recovery that selected that snapshot would skip the
+        /// stranded transaction forever: a divergence confined to one runtime's cache would become
+        /// durable and permanent, which is precisely the data-loss class the install ordering prevents.
+        ///
+        /// Only `Poisoned` gates. `ApplyPending` is safe: the in-flight transaction is by construction
+        /// ABOVE `greatest_applied`, so a snapshot labelled with the latter does not claim to cover it
+        /// and recovery still replays it.
+        ///
+        /// Read INSIDE this critical section, with the capture, and that placement is the whole
+        /// correctness argument. Both poison sites set the marker under this same mutex, so no poison can
+        /// interleave between this read and the `greatest_applied` taken three lines below -- the state
+        /// captured is exactly the state this reading describes. Reading it before the lock would not be
+        /// equivalent: a publisher that observed `Clean` and then merely BLOCKED here (ordinary
+        /// contention, no timing assumption needed) could wake to find the leader had poisoned at X AND
+        /// committed X+1, and would capture `greatest_applied == X+1` over a body missing X -- publishing
+        /// the divergence this gate exists to stop.
+        ///
+        /// The refusal is permanent for this runtime by design: only a replaced runtime (a remount, or
+        /// the recovery that re-derives this table from the durable log) can publish for it again. The
+        /// publish dispatcher's own exponential backoff bounds how often a poisoned table repeats the log
+        /// line below.
+        if (rt->apply_state.load(std::memory_order_relaxed) == RefApplyState::Poisoned)
+            poisoned = true;
+        else if (rt->state.getLifecycle() != RefLifecycle::Live)
+            return false;   /// nothing to (re)publish here; dropNamespace publishes its own Removed snapshot
+        else if (rt->newest_snapshot_id && !(*rt->newest_snapshot_id < rt->state.getGreatestApplied()))
+            return false;   /// nothing above the newest snapshot
+        else
+        {
+            candidate_state = rt->state;
+            candidate_x = rt->state.getGreatestApplied();
+            captured_count = rt->tail_count_since_snapshot.load(std::memory_order_relaxed);
+            captured_bytes = rt->tail_bytes_since_snapshot.load(std::memory_order_relaxed);
+        }
+    }
+
+    /// Logged OUTSIDE the critical section: formatting allocates, and nothing about the decision needs
+    /// the lock once it is made (the marker is one-way, so it cannot have become clean again).
+    if (poisoned)
     {
         LOG_ERROR(getLogger("CasPool"),
             "CAS ref table '{}': refusing to publish a snapshot from a POISONED state — this cached "
@@ -2531,25 +2562,6 @@ bool CasRefLedger::trySnapshotPublishOnce(const RootNamespace & ns)
             "durable log) restores snapshot publication.",
             ns.string());
         return false;
-    }
-
-    /// ONE copy of the live state, at a transaction boundary -- no
-    /// replay, no per-entry retention. The tail counters are captured in the SAME critical section so
-    /// adoption below subtracts exactly what this attempt's candidate actually covers.
-    RefTableState candidate_state;
-    RefTxnId candidate_x;
-    uint64_t captured_count = 0;
-    uint64_t captured_bytes = 0;
-    {
-        std::lock_guard lock(rt->state_mutex);
-        if (rt->state.getLifecycle() != RefLifecycle::Live)
-            return false;   /// nothing to (re)publish here; dropNamespace publishes its own Removed snapshot
-        if (rt->newest_snapshot_id && !(*rt->newest_snapshot_id < rt->state.getGreatestApplied()))
-            return false;   /// nothing above the newest snapshot
-        candidate_state = rt->state;
-        candidate_x = rt->state.getGreatestApplied();
-        captured_count = rt->tail_count_since_snapshot.load(std::memory_order_relaxed);
-        captured_bytes = rt->tail_bytes_since_snapshot.load(std::memory_order_relaxed);
     }
 
     const RefTableSnapshot snap = snapshotOf(candidate_state, ns.string());

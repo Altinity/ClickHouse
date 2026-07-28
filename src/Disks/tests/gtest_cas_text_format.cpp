@@ -239,8 +239,12 @@ TEST(CasZstdArm, SealOpenPolicyAndCaps)
 {
     /// Always types compress regardless of size (no threshold — the .zst key must be
     /// constructible without knowing the body); a raw body is still readable (repair path).
-    /// `v:3` is deliberate and must NOT follow a future `G_BUILD` bump: any version <= G_BUILD passes
-    /// the header gate, which is the point — the BODY is what has to fail here.
+    /// `v:3` here is NOT the "any version <= G_BUILD passes" case the other negative bodies rely on:
+    /// `cas_ref_snap`'s own `changePoints` floor is generation 4, so a generation-3 ref snapshot is not
+    /// readable by this build in principle. It passes the header gate only because nothing consults
+    /// `changePoints` at decode time yet -- the gate is `v > G_BUILD` alone. Once a per-class floor is
+    /// wired in, this literal must move to `G_BUILD`; the test's subject is the truncated BODY, not the
+    /// version.
     const String small = "{\"type\":\"cas_ref_snap\",\"v\":3}\n{}\n";
     const String sealed_small = sealObject(FormatId::RefSnapshot, small);
     ASSERT_TRUE(looksZstd(sealed_small));
