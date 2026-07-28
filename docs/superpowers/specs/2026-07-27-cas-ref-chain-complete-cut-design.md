@@ -131,7 +131,14 @@ rematerializes from source (the exact-token delete cannot remove the new incarna
 TOKENLESS relink (`adoptEvidence`) performs no meta read and is safe by ORDERING — the receiver's
 `+1` is durable before the source releases its committed edge, so the blob inherits an unbroken
 ownership chain; `Creating` cannot publish; `Removing` cannot add ownership; a late terminal record
-only delays reclamation.
+only delays reclamation. **Third arm, found by the phase-0 model** (`CaRefDeltaIntakeCore`
+`_sab_deleteignoresindeg`, RED): a `+1` that lands after its namespace's probe but BEFORE
+condemnation hits a still-LIVE blob — no rematerialization triggers — and a later round folds it
+while the pending exact-token delete still fires; the closure is the DELETE-SITE in-degree re-read
+(the existing `deleteExact` liveness re-check), which is hereby NORMATIVE, not an optimization.
+The model also proves a listing can never be a witness source (it is a snapshot; a witness durable
+after the enumeration is invisible) — `_ckpt.checkpoint` doubles as the hint-independent second
+witness for the below-witness-404 hold, at zero cost (the fold already reads it for cleanup ranges).
 
 **The hold is durable and survives REBUILD.** `ShardCoverage::classification == 4` carries
 `{reason, offending position, retry/backoff}` per `(namespace, incarnation)` — a strict grammar:
