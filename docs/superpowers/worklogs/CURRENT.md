@@ -1207,3 +1207,7 @@ No push.
 **2026-07-28 04:5x UTC watchdog** — task 2 collecting non-vacuity evidence: coverage pass
 (`-coverage 1` under timeout 3600) on `v9_safe`; greens (`v9_hold`, `v9_hintomission`) done
 04:39-40. Final stretch, commit pending. No push.
+
+**2026-07-28 05:1x UTC watchdog** — task 2 on the final full-harness pass (`v9_hintomission` live),
+report updated 04:49. ~1h45m elapsed, continuously productive at every check — long but not wedged.
+No push.
