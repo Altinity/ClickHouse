@@ -1495,3 +1495,8 @@ green; back-chain epoch crossing, self-found spin fixed); reviewer dispatched. L
 
 **2026-07-28 20:20 local watchdog** — lane L: gate re-run #3 in progress (build6 done 20:18);
 lane G reviewer reading. No push.
+
+**2026-07-28 20:4x local** — lane L task 4 DONE (`0f895c6f40d`, 12/12 + 1418/1418); three
+rulings issued (mount-wide I5 approved; new non-fencing abandon-guard scenario ordered;
+LOGICAL_ERROR->CORRUPTED_DATA approved). Reviewer held for the follow-up commit. Lane G
+review in flight. No push.
