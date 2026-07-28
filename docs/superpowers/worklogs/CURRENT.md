@@ -1393,3 +1393,6 @@ unit_tests_dbms procs live — verification runs, possibly the other session's t
 **2026-07-28 15:2x local** — task 1 review: Spec ✅ / needs-fixes (decode-side pinning, chain
 direction rule, contextual early-return pin + minors). Fix round 1 dispatched; pse/pss ruled
 CRITICAL keys. No push.
+
+**2026-07-28 15:00 local watchdog** — task 1 fix round 1 active (live build/test procs; commit
+pending). No push.
