@@ -479,6 +479,11 @@ planted by a different recoverer than the one reading it unrepresentable.
 
 ### The bounds, and the measured sweep behind them {#v9-bounds}
 
+> **SUPERSEDED by fix round 1** — the state counts below predate the `<<actor, generation, op>>`
+> identity fix; the chosen configuration's current green-gate numbers are in `{#fix1-battery}`
+> (82,299,033 generated / 15,658,147 distinct). The sweep's *shape* (which bound dominates, why
+> `MaxAdmissions` saturates) is unchanged and still the justification of record.
+
 The six new configs run at `MaxClock = 2, MaxEpoch = 2, MaxToken = 4, TTL = 2, Drift = 0,
 MaxAdmissions = 3, Actors = {A, B}` — **smaller than `_stage1`'s**, which needs justifying rather
 than asserting. Every row below is a real `-workers 1` run of `_v9_recoverygen`'s invariant list on
@@ -658,8 +663,8 @@ ClaimOwnerEmpty -> ClaimMount -> WedgeAdmit -> WedgeRetryCreate -> WedgeAdmit ->
                acked   = {<<A, 0, 1>>, <<A, 0, 2>>}      <- op 2 acked, nothing ever wrote it
 ```
 
-Cost: the green gate goes from 9,762,979 to 15,658,147 distinct states (152 s to 247 s) — the price of
-a third identity component, paid once.
+Cost: the green gate goes from 9,762,979 to 15,658,147 distinct states (152 s to ~250 s; the
+`{#fix1-battery}` table's run recorded 253 s) — the price of a third identity component, paid once.
 
 ### Important 2 — five stale RED rows, and the process failure behind them {#fix1-numbers}
 
