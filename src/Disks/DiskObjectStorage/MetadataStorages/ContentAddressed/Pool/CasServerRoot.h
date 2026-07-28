@@ -620,10 +620,11 @@ protected:
     /// Re-reads a failed renewal and classifies it five ways -- fenced_by_gc, same_epoch_state_uncertain
     /// (this incarnation's own token was advanced past under our own (uuid, epoch): ambiguous, not
     /// proof of anything, and NOT fatal), superseded (a newer epoch), foreign_writer, and vanished
-    /// (the backing object disappeared) -- every branch stays terminal and fail closed, but only
-    /// `foreign_writer` constructs a `LOGICAL_ERROR`; the rest throw non-aborting exception codes
-    /// (`ABORTED`/`FILE_DOESNT_EXIST`) since each is reachable by an ordinary network timeout or
-    /// environmental condition, not a programming bug.
+    /// (the backing object disappeared) -- every branch stays terminal and fail closed, and NONE
+    /// constructs a `LOGICAL_ERROR`: they throw non-aborting codes (`ABORTED`/`FILE_DOESNT_EXIST`),
+    /// because each is reachable by an ordinary network timeout or environmental condition rather than
+    /// a programming bug -- and because this runs on the keeper's background thread, where an abort at
+    /// exception construction takes the whole process with it.
     void onRenewMismatch(const String & mismatched_key) override;
     /// Fence immediately only once our last CONFIRMED lease (the last successful
     /// `claim`/renew) has reached its safety-margin boundary -- `confirmed_deadline_ms - now <=
@@ -655,6 +656,12 @@ private:
     /// 0 = none yet (`claim` always sets this before `startBackground` can run, so
     /// `shouldFenceOnTransientRenewFailure` observing 0 is defensive, not an expected steady state).
     uint64_t confirmed_deadline_ms = 0;
+    /// Whether this runtime has observed its OWN deposition: renewal stopped on a mismatch and the write
+    /// fence latched (`onRenewFailed`). The release path reads it to tell two opposite situations apart
+    /// — a deposed writer meeting its successor in the slot (the expected end of a failover) from a
+    /// writer that still believed it owned the mount meeting a stranger there (single-writer exclusivity
+    /// broken). Atomic because the keeper's background thread sets it and teardown reads it.
+    std::atomic<bool> deposition_observed{false};
     /// Pre-I/O anchors of the CURRENT attempt, stashed by prepareRenew (which runs at the start of
     /// every doStart/renewOnce attempt, off the state lock) and consumed by the success hooks.
     /// `mutable` + no synchronization is safe: prepareRenew, claim, and the hooks all run on the

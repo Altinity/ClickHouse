@@ -34,6 +34,7 @@ extern const int NETWORK_ERROR;
 namespace ProfileEvents
 {
 extern const Event CasRefRecoverySealPublished;
+extern const Event CasMountExclusivityViolation;
 }
 
 using namespace DB::Cas;
@@ -1318,25 +1319,38 @@ TEST(CasPoolRemount, ForeignOwnerIsNeverTakenOver)
     fenceOutMount(*backend, mount_key);
     store.reset();
 
-    EXPECT_DEATH(
-        {
-            DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
+    /// A foreign owner is never taken over — at remount OR at release. This was an `EXPECT_DEATH`
+    /// pinning a `LOGICAL_ERROR` abort on the release half; the abort fired from `~Pool` and defeated
+    /// `finishTeardown`'s own catch by aborting at exception construction. The runtime never observed a
+    /// deposition (the slot was overwritten out of band), so the release takes the
+    /// exclusivity-violation arm: refuse, leave the foreign occupant untouched, and SURVIVE teardown.
+    auto foreign_backend = std::make_shared<InMemoryBackend>();
+    auto invalid_store = DB::Cas::tests::openPoolForTest(foreign_backend);
+    const String foreign_mount_key = invalid_store->layout().mountKey("test");
+    const auto foreign_got = foreign_backend->get(foreign_mount_key);
+    ASSERT_TRUE(foreign_got.has_value());
+    MountLease foreign_lease = decodeMountLease(foreign_got->bytes);
+    foreign_lease.server_uuid = foreign_lease.server_uuid + DB::UInt128(1);
+    foreign_lease.seq += 1;
+    ASSERT_EQ(
+        foreign_backend->putOverwrite(foreign_mount_key, encodeMountLease(foreign_lease), foreign_got->token).outcome,
+        DB::Cas::PutOutcome::Done);
+    const auto occupant_before = foreign_backend->get(foreign_mount_key);
+    ASSERT_TRUE(occupant_before.has_value());
 
-            auto death_backend = std::make_shared<InMemoryBackend>();
-            auto invalid_store = DB::Cas::tests::openPoolForTest(death_backend);
-            const String death_mount_key = invalid_store->layout().mountKey("test");
-            const auto death_got = death_backend->get(death_mount_key);
-            MountLease death_foreign = decodeMountLease(death_got->bytes);
-            death_foreign.server_uuid = death_foreign.server_uuid + DB::UInt128(1);
-            death_foreign.seq += 1;
-            ASSERT_EQ(
-                death_backend->putOverwrite(death_mount_key, encodeMountLease(death_foreign), death_got->token).outcome,
-                DB::Cas::PutOutcome::Done);
+    EXPECT_FALSE(invalid_store->tryRemountOnce()) << "a foreign owner is never taken over at remount";
 
-            EXPECT_FALSE(invalid_store->tryRemountOnce());
-            invalid_store.reset();
-        },
-        "release of key.*hit a foreign incarnation");
+    const uint64_t violations_before
+        = ProfileEvents::global_counters[ProfileEvents::CasMountExclusivityViolation].load();
+    invalid_store.reset();   /// must not abort, must not terminate
+
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasMountExclusivityViolation].load(),
+              violations_before + 1)
+        << "the release must report the broken single-writer guarantee rather than dying on it";
+    const auto occupant_after = foreign_backend->get(foreign_mount_key);
+    ASSERT_TRUE(occupant_after.has_value()) << "nor is it taken over at release";
+    EXPECT_EQ(occupant_after->bytes, occupant_before->bytes)
+        << "the slot must be left byte-for-byte as the foreign owner wrote it";
 }
 
 TEST(CasPoolRemount, ShutdownGuardRefusesToArmRemount)

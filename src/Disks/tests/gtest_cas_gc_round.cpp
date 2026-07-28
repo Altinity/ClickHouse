@@ -19,6 +19,7 @@ namespace ProfileEvents
 {
 extern const Event CasGcMetaOps;
 extern const Event CasGcEnumerationPages;
+extern const Event CasMountExclusivityViolation;
 }
 
 using namespace DB::Cas;
@@ -1532,20 +1533,34 @@ TEST(CasGcRound, OrphanManifestCursorSweepDeletesAndPersistsCursor)
     EXPECT_FALSE(manifestExists(*backend, store->layout(), ManifestId{ns, r1}));
     EXPECT_FALSE(manifestExists(*backend, store->layout(), ManifestId{ns, r2}));
 
-    /// Retain explicit coverage that replacing a live Pool's own mount with a synthetic foreign
-    /// watermark makes release fail closed. The complete invalid lifecycle is child-only.
-    EXPECT_DEATH(
-        {
-            DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
+    /// Replacing a live Pool's own mount with a synthetic foreign watermark must make release fail
+    /// CLOSED. This was an `EXPECT_DEATH` pinning a `LOGICAL_ERROR` abort; the abort was the defect
+    /// (it fires from `~Pool`, defeating `finishTeardown`'s own catch by aborting at exception
+    /// construction, and it fires in ASan builds on any deposed writer's shutdown). What it was really
+    /// protecting is asserted directly now: the runtime never had a failed renewal, so it still
+    /// believed it owned the mount, which makes this the exclusivity-violation arm — refuse, leave the
+    /// occupant byte-for-byte untouched, and SURVIVE the teardown.
+    std::shared_ptr<InMemoryBackend> foreign_backend;
+    PoolConfig foreign_config = config;
+    foreign_config.server_root_id = "test";
+    auto invalid_store = openTestPoolWithConfig(foreign_backend, std::move(foreign_config));
+    const String foreign_mount_key = invalid_store->layout().mountKey("test");
+    setWatermarkMinActive(*foreign_backend, invalid_store->layout(), "test", r1.writer_epoch, /*min_active*/6);
+    const auto occupant_before = foreign_backend->get(foreign_mount_key);
+    ASSERT_TRUE(occupant_before.has_value());
+    const uint64_t violations_before
+        = ProfileEvents::global_counters[ProfileEvents::CasMountExclusivityViolation].load();
 
-            std::shared_ptr<InMemoryBackend> death_backend;
-            PoolConfig death_config = config;
-            death_config.server_root_id = "test";
-            auto invalid_store = openTestPoolWithConfig(death_backend, std::move(death_config));
-            setWatermarkMinActive(*death_backend, invalid_store->layout(), "test", r1.writer_epoch, /*min_active*/6);
-            invalid_store.reset();
-        },
-        "release of key.*hit a foreign incarnation");
+    invalid_store.reset();   /// must not abort, must not terminate
+
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasMountExclusivityViolation].load(),
+              violations_before + 1)
+        << "a runtime that never observed a deposition must report the foreign occupant as a broken "
+           "single-writer guarantee";
+    const auto occupant_after = foreign_backend->get(foreign_mount_key);
+    ASSERT_TRUE(occupant_after.has_value()) << "the release must never delete another incarnation's lease";
+    EXPECT_EQ(occupant_after->bytes, occupant_before->bytes)
+        << "the release must leave the slot byte-for-byte untouched, never stamp our farewell over it";
 }
 
 /// Source-edge idempotency: re-folding the same blob activation does not double-count.

@@ -22,6 +22,8 @@
 namespace ProfileEvents
 {
     extern const Event CasMountLeaseLost;
+    extern const Event CasMountReleaseSkippedForeignOccupant;
+    extern const Event CasMountExclusivityViolation;
 }
 
 namespace DB
@@ -949,6 +951,10 @@ void MountLeaseKeeper::onRenewSucceeded()
 
 void MountLeaseKeeper::onRenewFailed()
 {
+    /// This is THE point at which this runtime stops believing it owns the mount, so it is where the
+    /// release path's arm-A/arm-B split is decided (see `terminate`). Set BEFORE the fence callback, so
+    /// a teardown racing this observation reads the conservative value.
+    deposition_observed.store(true, std::memory_order_release);
     /// Background renewal failed: `renewOnce` threw and the loop is stopping. Latch the local write
     /// fence to lost so no further mutation proceeds — fail closed. The mismatch itself was already
     /// classified and emitted by `onRenewMismatch` (fenced_by_gc / same_epoch_state_uncertain /
@@ -1083,10 +1089,9 @@ void MountLeaseKeeper::terminate()
     const PutResult res = backend->putOverwrite(key, body, last_token);
     if (res.outcome != PutOutcome::Done)
     {
-        /// A foreign incarnation on OUR release path has exactly one expected cause: GC fenced this
-        /// mount out after its lease expired (the `gc_fenced` stamp). That is a clean outcome — the
-        /// slot is already released-by-fence and there is nothing left to retire. Anything else on
-        /// this path is a genuine single-writer violation and stays loud.
+        /// A foreign incarnation on OUR release path has one clean cause: GC fenced this mount out
+        /// after its lease expired (the `gc_fenced` stamp). The slot is already released-by-fence and
+        /// there is nothing left to retire.
         if (const auto got = backend->get(key))
         {
             const MountLease current = decodeMountLease(got->bytes);
@@ -1096,8 +1101,57 @@ void MountLeaseKeeper::terminate()
                     "CAS mount-lease: '{}' was fenced out by GC (expired lease); release is a no-op", key);
                 return;
             }
-            throw Exception(ErrorCodes::LOGICAL_ERROR,
-                "CAS mount-lease: release of key '{}' hit a foreign incarnation — the world is broken", key);
+
+            /// Everything else used to be one arm raising `LOGICAL_ERROR` — "the world is broken". It
+            /// is TWO situations, they mean opposite things, and neither may abort: this runs from
+            /// `~Pool` via `finishTeardown`, whose `catch` a `LOGICAL_ERROR` defeats by aborting at
+            /// CONSTRUCTION, so an ordinary failover took the process down.
+            ///
+            /// ARM A — this runtime has already observed its own deposition (renewal stopped on a
+            /// mismatch and the write fence latched). A foreign occupant is then the EXPECTED end state
+            /// of failover: our successor owns the slot, and the farewell we were about to write would
+            /// stamp OUR identity over THEIRS. Skip it, leave the slot byte-for-byte untouched, and let
+            /// teardown finish quietly. Reached whenever a deposed writer shuts down.
+            if (deposition_observed.load(std::memory_order_acquire))
+            {
+                ProfileEvents::increment(ProfileEvents::CasMountReleaseSkippedForeignOccupant);
+                emitMountEvent(event_sink, CasEventType::MountRelease, srid, "deposed_foreign_occupant", &current,
+                    "mount slot is held by our successor and this incarnation was already deposed — "
+                    "skipping the farewell, slot left untouched");
+                LOG_WARNING(getLogger("CasMountLeaseKeeper"),
+                    "CAS mount-lease: '{}' is held by {} and this incarnation was already deposed — skipping "
+                    "the farewell rather than stamping our identity over the successor's; release is a no-op",
+                    key, describeMountHolder(current));
+                return;
+            }
+
+            /// ARM B — we never observed a deposition, so this runtime still believed it owned the mount
+            /// and a DIFFERENT one is in the slot. That is the single-writer guarantee broken, and it
+            /// stays maximally loud: named identities on both sides, its own counter, the write fence
+            /// latched so the runtime stops trusting itself, and NO write (the occupant is left exactly
+            /// as found — we do not retire someone else's lease).
+            ///
+            /// Loud, but still not abort-capable. Logical errors are exceptions here, not crashes, and
+            /// this verdict rests on a READ of the slot: a stale or adversarial backend can fabricate it
+            /// from the environment, which is precisely the input class that must never be able to kill
+            /// the server. There is deliberately no `chassert` either — it would abort exactly the
+            /// debug/ASan runs of the tests that now have to prove teardown SURVIVES this.
+            ProfileEvents::increment(ProfileEvents::CasMountExclusivityViolation);
+            emitMountEvent(event_sink, CasEventType::MountConflict, srid, "exclusivity_violation", &current,
+                "mount slot is held by a foreign incarnation although this runtime never observed a "
+                "deposition — single-writer exclusivity is broken; refusing the release and fencing");
+            LOG_ERROR(getLogger("CasMountLeaseKeeper"),
+                "CAS mount-lease: release of key '{}' found a FOREIGN incarnation ({}) while this runtime "
+                "(server_uuid={} writer_epoch={} seq={}) still believed it owned the mount — single-writer "
+                "exclusivity is broken. Refusing to retire another incarnation's lease; the slot is left "
+                "untouched and this runtime's write fence is latched.",
+                key, describeMountHolder(current), u128ToHex(server_uuid), writer_epoch, seq);
+            if (on_lost)
+                on_lost();
+            throw Exception(ErrorCodes::ABORTED,
+                "CAS mount-lease: release of key '{}' found a foreign incarnation ({}) while this runtime "
+                "still believed it owned the mount — single-writer exclusivity is broken; the slot is left "
+                "untouched and this runtime is fenced", key, describeMountHolder(current));
         }
         /// The lease object is ABSENT: the backing store was deleted under us (rm -rf of the pool
         /// dir -- the same environmental condition the renewal path classifies as "vanished").

@@ -20,6 +20,7 @@ namespace DB::ErrorCodes
 namespace ProfileEvents
 {
     extern const Event CasMountLeaseLost;
+    extern const Event CasMountExclusivityViolation;
 }
 
 using namespace DB::Cas;
@@ -738,32 +739,44 @@ TEST(CasMountStartup, StaleSelfMountReclaimedAfterWait)
     ASSERT_NE(a2, nullptr);
     EXPECT_GT(a2->writerEpoch(), e1);
 
-    /// Keep explicit release-guard coverage for the original live-object overlap. The first Pool and
-    /// the reclaiming Pool, the foreign-incarnation transition, and A's destruction all stay in the
-    /// child, so no invalid owner survives to teardown in the parent process.
-    EXPECT_DEATH(
-        {
-            DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
+    /// The original live-object overlap: a first Pool is still alive when a replacement reclaims its
+    /// slot, so the first one's release meets a stranger. This was an `EXPECT_DEATH` pinning a
+    /// `LOGICAL_ERROR` abort — which fires from `~Pool`, defeating `finishTeardown`'s own catch by
+    /// aborting at exception construction. The first Pool never observed a deposition (nothing failed
+    /// its renewal; the slot was reclaimed underneath it), so this is the exclusivity-violation arm:
+    /// refuse, leave the reclaimer's slot untouched, latch the fence, and SURVIVE.
+    auto overlap_backend = std::make_shared<InMemoryBackend>();
+    auto first = Pool::open(overlap_backend, PoolConfig{
+        .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r",
+        .mount_lease_ttl_ms = std::chrono::milliseconds(300),
+        .mount_renew_period = std::chrono::milliseconds(100),
+        .cas_request_budget = tiny_budget});
+    const String overlap_mount_key = first->layout().mountKey("r");
 
-            auto death_backend = std::make_shared<InMemoryBackend>();
-            auto first = Pool::open(death_backend, PoolConfig{
-                .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r",
-                .mount_lease_ttl_ms = std::chrono::milliseconds(300),
-                .mount_renew_period = std::chrono::milliseconds(100),
-                .cas_request_budget = tiny_budget});
+    uint64_t overlap_fake_boot = 0;
+    auto replacement = Pool::open(overlap_backend, PoolConfig{
+        .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r",
+        .mount_lease_ttl_ms = std::chrono::milliseconds(300),
+        .mount_renew_period = std::chrono::milliseconds(100),
+        .cas_request_budget = tiny_budget,
+        .boot_ms_fn = [&overlap_fake_boot] { return overlap_fake_boot; },
+        .wait_sleep_fn = [&overlap_fake_boot](uint64_t ms) { overlap_fake_boot += ms; }});
+    ASSERT_NE(replacement, nullptr);
 
-            uint64_t fake_boot = 0;
-            auto replacement = Pool::open(death_backend, PoolConfig{
-                .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r",
-                .mount_lease_ttl_ms = std::chrono::milliseconds(300),
-                .mount_renew_period = std::chrono::milliseconds(100),
-                .cas_request_budget = tiny_budget,
-                .boot_ms_fn = [&fake_boot] { return fake_boot; },
-                .wait_sleep_fn = [&fake_boot](uint64_t ms) { fake_boot += ms; }});
-            ASSERT_NE(replacement, nullptr);
-            first.reset();
-        },
-        "release of key.*hit a foreign incarnation");
+    const auto reclaimer_slot_before = overlap_backend->get(overlap_mount_key);
+    ASSERT_TRUE(reclaimer_slot_before.has_value());
+    const uint64_t overlap_violations_before
+        = ProfileEvents::global_counters[ProfileEvents::CasMountExclusivityViolation].load();
+
+    first.reset();   /// must not abort, must not terminate
+
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasMountExclusivityViolation].load(),
+              overlap_violations_before + 1);
+    const auto reclaimer_slot_after = overlap_backend->get(overlap_mount_key);
+    ASSERT_TRUE(reclaimer_slot_after.has_value());
+    EXPECT_EQ(reclaimer_slot_after->bytes, reclaimer_slot_before->bytes)
+        << "the deposed Pool's release must not retire the reclaimer's lease";
+    EXPECT_TRUE(replacement->mayMutate()) << "and must not disturb the live reclaimer";
 }
 
 TEST(CasMountLease, BodyCarriesFloorAndFence)
