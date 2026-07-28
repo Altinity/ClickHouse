@@ -12,6 +12,7 @@
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
 #include <Common/MemoryTracker.h>
+#include <Common/ProfileEvents.h>
 
 #include <atomic>
 #include <chrono>
@@ -22,6 +23,12 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+namespace ProfileEvents
+{
+extern const Event CasMountReleaseSkippedForeignOccupant;
+extern const Event CasMountExclusivityViolation;
+}
 
 /// Stage A task 3 (INV-1): ref-log transaction ids are PER-NAMESPACE and CONTIGUOUS.
 ///
@@ -516,4 +523,34 @@ TEST(CasRefContiguousAlloc, SurvivingWriterIsFencedByTheRecreatedPoolsMount)
 
     /// The recreated pool is unaffected and owns the stream from 1.
     EXPECT_EQ(publishRef(recreated, ns, "ref_1", 1), (RefTxnId{recreated->writerEpoch(), 1}));
+
+    /// The survivor's TEARDOWN is the other half, and it is asserted here rather than left to the
+    /// destructor at scope exit, because which arm of the release path it takes is exactly what a
+    /// regressed discriminator would get wrong — silently. A deposed writer meeting its successor in the
+    /// slot is the EXPECTED end of a failover (arm A: skip the farewell, leave the successor's slot
+    /// untouched); a writer that still believed it owned the mount meeting a stranger is
+    /// single-writer exclusivity BROKEN (arm B, must-always-be-zero). If `deposition_observed` ever stops
+    /// being set, every ordinary failover in production starts reporting itself as a broken guarantee —
+    /// and without the +0 assertion below, not one test would notice.
+    const String survivor_mount_key = recreated->layout().mountKey("test");
+    const auto successor_slot_before = backend->get(survivor_mount_key);
+    ASSERT_TRUE(successor_slot_before.has_value());
+    const uint64_t skipped_before
+        = ProfileEvents::global_counters[ProfileEvents::CasMountReleaseSkippedForeignOccupant].load();
+    const uint64_t violations_before
+        = ProfileEvents::global_counters[ProfileEvents::CasMountExclusivityViolation].load();
+
+    survivor.reset();
+
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasMountReleaseSkippedForeignOccupant].load(),
+              skipped_before + 1)
+        << "a deposed writer's release must take the skip-the-farewell arm";
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasMountExclusivityViolation].load(),
+              violations_before)
+        << "and must NOT report an exclusivity violation: this is a failover, not a broken guarantee";
+    const auto successor_slot_after = backend->get(survivor_mount_key);
+    ASSERT_TRUE(successor_slot_after.has_value());
+    EXPECT_EQ(successor_slot_after->bytes, successor_slot_before->bytes)
+        << "the deposed writer must not stamp its farewell over the successor's lease";
+    EXPECT_TRUE(recreated->mayMutate()) << "and must not disturb the live successor";
 }

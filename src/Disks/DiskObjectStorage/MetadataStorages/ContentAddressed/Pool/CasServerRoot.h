@@ -656,11 +656,18 @@ private:
     /// 0 = none yet (`claim` always sets this before `startBackground` can run, so
     /// `shouldFenceOnTransientRenewFailure` observing 0 is defensive, not an expected steady state).
     uint64_t confirmed_deadline_ms = 0;
-    /// Whether this runtime has observed its OWN deposition: renewal stopped on a mismatch and the write
-    /// fence latched (`onRenewFailed`). The release path reads it to tell two opposite situations apart
-    /// — a deposed writer meeting its successor in the slot (the expected end of a failover) from a
-    /// writer that still believed it owned the mount meeting a stranger there (single-writer exclusivity
-    /// broken). Atomic because the keeper's background thread sets it and teardown reads it.
+    /// Whether this runtime has STOPPED BELIEVING IT OWNS THE MOUNT. Set at `onRenewFailed`, which is
+    /// that one point and is deliberately broader than "a mismatch was classified": the background loop
+    /// also reaches it when a TRANSIENT renewal failure persists past the confirmed lease's
+    /// safety-margin boundary (`shouldFenceOnTransientRenewFailure`), where nothing was classified at
+    /// all and the write fence latches anyway. Both are the same fact for the reader below, and the
+    /// broader one is the SAFE one: what the release path needs to know is whether this runtime still
+    /// claims the slot, not why it stopped.
+    ///
+    /// The release path reads it to tell two opposite situations apart — a deposed writer meeting its
+    /// successor in the slot (the expected end of a failover) from a writer that still believed it owned
+    /// the mount meeting a stranger there (single-writer exclusivity broken). Atomic because the
+    /// keeper's background thread sets it and teardown reads it.
     std::atomic<bool> deposition_observed{false};
     /// Pre-I/O anchors of the CURRENT attempt, stashed by prepareRenew (which runs at the start of
     /// every doStart/renewOnce attempt, off the state lock) and consumed by the success hooks.

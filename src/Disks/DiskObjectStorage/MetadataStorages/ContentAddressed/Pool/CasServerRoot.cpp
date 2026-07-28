@@ -1107,11 +1107,17 @@ void MountLeaseKeeper::terminate()
             /// `~Pool` via `finishTeardown`, whose `catch` a `LOGICAL_ERROR` defeats by aborting at
             /// CONSTRUCTION, so an ordinary failover took the process down.
             ///
-            /// ARM A — this runtime has already observed its own deposition (renewal stopped on a
-            /// mismatch and the write fence latched). A foreign occupant is then the EXPECTED end state
-            /// of failover: our successor owns the slot, and the farewell we were about to write would
+            /// ARM A — this runtime has already stopped believing it owns the mount (renewal failed
+            /// and the write fence latched). A foreign occupant is then the EXPECTED end state of
+            /// failover: our successor owns the slot, and the farewell we were about to write would
             /// stamp OUR identity over THEIRS. Skip it, leave the slot byte-for-byte untouched, and let
             /// teardown finish quietly. Reached whenever a deposed writer shuts down.
+            ///
+            /// Nothing here is ABORT-CAPABLE, which is the property that matters on a destructor path —
+            /// not "nothing throws". `finishTeardown` wraps this call in a `catch` and logs, so a throw
+            /// is contained; what a `LOGICAL_ERROR` did instead was abort at CONSTRUCTION, before that
+            /// catch could ever run. This arm happens not to throw at all, but it is the exception CLASS
+            /// discipline, not the absence of a `throw`, that keeps teardown alive.
             if (deposition_observed.load(std::memory_order_acquire))
             {
                 ProfileEvents::increment(ProfileEvents::CasMountReleaseSkippedForeignOccupant);

@@ -197,9 +197,6 @@ TEST(CasHeartbeat, SupersededTouchIsFailClosedNotFatal)
     }
 }
 
-/// A FOREIGN uuid on our mount slot cannot arise from any protocol interleaving (the owner anchor
-/// refuses foreign claims at open; decommission impersonates the victim uuid). It stays a genuine
-/// invariant violation: loud, aborting in debug/ASan builds.
 /// A foreign server holding our mount slot must FAIL CLOSED — and must not take the process with it.
 ///
 /// This test used to be `ForeignUuidTouchStillDies`, an `EXPECT_DEATH` that pinned the abort. The abort
