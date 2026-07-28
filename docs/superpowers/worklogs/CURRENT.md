@@ -1333,3 +1333,7 @@ unchanged PASS 93/93. Scoped re-review dispatched. No push.
 fixed minor-9 stale clause, `1b091c335c9`). Gate = TLA PHASE: PASS, 93/93 across 10 batteries.
 Moving to the two-staged main implementation plan (Stage A streams / Stage B catalog+incarnations),
 all ledger obligations inherited. No push.
+
+**2026-07-28 14:0x local** — main-plan writing started (task #8): Stage A skeleton committed
+(constraints, staging contract w/ named residuals, 15-task map); Explore agent mapping the
+surgical sites' current signatures. Two plan files: stage-a-streams + stage-b-catalog. No push.
