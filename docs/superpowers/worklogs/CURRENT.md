@@ -1305,3 +1305,7 @@ committed. Ckpt-CAS/three-site obligations parked for main plan. Scoped re-revie
 `cbdf62811c5`; depth-7 aliasing counterexample confirmed independently). Task 6 (final: audit older
 models for LIST-trust + precedence-bug fix + phase gate summary + full end-to-end re-run) dispatched
 to fresh opus agent tla-task6, BASE `cbdf62811c5`. No push.
+
+**2026-07-28 12:3x local watchdog** — task 6 in audit phase (ACKed 12:1x; grep-stage over the six
+older models, no TLC batch yet — expected while Step 1/(A)/(B) are file work). Freshest tmp logs
+are the re-reviewer's leftovers (11:32). No push.
