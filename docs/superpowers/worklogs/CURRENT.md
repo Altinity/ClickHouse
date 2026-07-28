@@ -1619,3 +1619,6 @@ in flight; T9 implementing. No push.
 against committed diffs — the message crossing resolved itself, work was already done). T6
 (recovery CAS-walk, heaviest of the stage, 11-obligation dispatch) launched on lane L. T9
 implementing on lane G. 8 of 15 stage-A tasks closed. No push.
+
+**2026-07-28 23:41 local watchdog** — T9 iterating hard (builds 5-6, seconds-fresh); T6 reading
+(~10 min in, no logs yet, normal for a 97-line brief + 11 obligations). No push.
