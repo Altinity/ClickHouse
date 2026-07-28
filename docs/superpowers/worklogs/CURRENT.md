@@ -1414,3 +1414,7 @@ count was pgrep self-match — known trap), no commit. Status ping sent to impl-
 
 **2026-07-28 16:20 local watchdog** — task 2: suite 8/8 fixed, FULL GATE GREEN 1394/1394
 (1386+8, TEST_EXIT=0 at 16:15); report+commit pending (agent in write-up). No push.
+
+**2026-07-28 16:40 local watchdog** — task 2 stalled at finalization (gate green 16:15, no
+report/commit 25 min, two idles). Third nudge sent with an explicit two-step checklist +
+controller-finalize fallback announced. No push.
