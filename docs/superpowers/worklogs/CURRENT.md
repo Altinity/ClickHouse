@@ -1638,3 +1638,6 @@ T6 in red phase. No push.
 **2026-07-29 01:0x local** — T9 closed by implementer (15 reverted-build proofs; integration
 test asserts the Stage-A truth with a unique-signature discriminator); reviewer dispatched.
 BACKLOG entries for its two findings written by controller (`c936b380394`). T6 in gates. No push.
+
+**2026-07-29 00:40 local watchdog** — T6 running all three gate classes concurrently (release
+gate3 done 00:37, ASan building, debug gate mid-run); T9 reviewer reading (no file yet). No push.
