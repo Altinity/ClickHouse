@@ -1374,3 +1374,6 @@ boundaries, liar-test edit deferred wholly to 7b. Round 4 confirmation pass laun
 **2026-07-28 14:4x local** — STAGE 9 CLOSED (codex r4: approve-with-fixes; consistency sweeps
 grep-verified `d3f709aea1a`). Task #10 begins: SDD workspace for stage A, Task 0 preflight
 dispatch next. No push.
+
+**2026-07-28 14:00 local watchdog** — stage A task 0: baseline build running (ninja live,
+build/task0_build.log fresh). No push.
