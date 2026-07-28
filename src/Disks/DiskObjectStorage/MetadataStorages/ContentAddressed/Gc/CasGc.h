@@ -422,12 +422,26 @@ private:
     std::map<String, RefTxnId> readCheckpointWitnesses(const std::map<String, RefTableListing> & ref_tables,
                                                        const std::map<String, ShardCoverage> & parent_cursors);
 
-    /// The newest fold-seal OBJECT in the pool by `(generation, attempt)`, found by ENUMERATING
-    /// `gc/gen/` rather than by following `gc/state`. Absent => the pool has never sealed a baseline.
+    /// What ONE generation's prefix says about itself: whether the generation exists at all, and the
+    /// greatest attempt under it whose key is one `foldSealKey` would have produced.
+    struct GenerationSealProbe
+    {
+        bool generation_exists = false;
+        std::optional<uint64_t> seal_attempt;
+    };
+    GenerationSealProbe probeGenerationForSeal(uint64_t generation);
+
+    /// The newest fold-seal OBJECT in the pool by `(generation, attempt)`, or absent when the pool has
+    /// never sealed a baseline. Used whenever `gc/state` names no adopted baseline: holds live in the
+    /// SEAL, not in the pointer to it, so losing the POINTER must not silently produce a hold-free
+    /// baseline while an unreadable SEAL refuses.
     ///
-    /// Holds live in the seal, not in the pointer to it, so `rebuildBaseline` needs this whenever
-    /// `gc/state` names no adopted baseline: without it, losing the POINTER (the lesser corruption)
-    /// would silently produce a hold-free baseline while an unreadable SEAL (the greater one) refuses.
+    /// The pool-wide enumeration is a HINT that seeds a floor, never the answer: one that omitted the
+    /// true newest seal would hand back an older one and lose every hold detected since — the same hole
+    /// one layer up. Newest-ness is CONFIRMED by walking generations upward from that floor (they are
+    /// dense in minting) until one does not exist. See the implementation for why the per-generation
+    /// step is a narrow prefix query rather than an exact `GET`: the attempt component of the key is a
+    /// lease sequence number and has no arithmetic successor.
     std::optional<std::pair<uint64_t, uint64_t>> newestFoldSealRef();
 
     /// Read ONE part manifest named by `id`, validate it, and append sign*(+1) blob deltas for each

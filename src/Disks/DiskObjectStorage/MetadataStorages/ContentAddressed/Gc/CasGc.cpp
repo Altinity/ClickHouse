@@ -1028,43 +1028,102 @@ std::optional<std::pair<uint64_t, uint64_t>> Gc::newestFoldSealRef()
     const String gen_prefix = layout.gcGenPrefix(0);
     const String top = gen_prefix.substr(0, gen_prefix.size() - 2);   /// ".../gc/gen/"
 
-    std::optional<std::pair<uint64_t, uint64_t>> newest;
+    /// THE ENUMERATION IS A HINT HERE TOO, exactly as it is in the ref walk. Trusting it for
+    /// NEWEST-ness would reopen the same hole one layer up: an enumeration that omits the true newest
+    /// seal hands back an older one, and every hold detected since that older seal is silently lost --
+    /// an under-carry, which is the failure this whole path exists to prevent. So the broad LIST only
+    /// SEEDS a floor, and newest-ness is CONFIRMED by walking up from it.
+    uint64_t seeded_floor = 0;
     forEachListedKey(backend, top, [&](const ListedKey & k)
     {
-        /// Parse a candidate `(generation, attempt)` out of the path and then PROVE it by rebuilding
-        /// the key: only a string `foldSealKey` itself would have produced is a fold seal. Everything
-        /// else under `gc/gen` -- run objects, debris of a lost era -- must not get to decide which
-        /// baseline this pool's holds are read from.
         const size_t from = top.size();
         const size_t gen_end = k.key.find('/', from);
         if (gen_end == String::npos)
             return;
-        uint64_t generation = 0;
+        try
+        {
+            seeded_floor = std::max(seeded_floor,
+                                    static_cast<uint64_t>(std::stoull(k.key.substr(from, gen_end - from))));
+        }
+        catch (...) // NOLINT(bugprone-empty-catch)
+        {
+            /// Foreign key shape under `gc/gen` is debris, not a generation number.
+        }
+    }, 1000, onGcEnumerationPage);
+
+    /// THE CONFIRM WALK, and the shape it can honestly have. Generations ARE dense in minting -- a fold
+    /// mints `snap_generation + 1`, a rebuild `max_gen + 1` -- so `generation + 1` is computable and the
+    /// walk steps it exactly as the ref walk steps `cursor + 1`, stopping at the first generation that
+    /// does not exist. Absence therefore decides the top, and it is decided per generation rather than
+    /// read off the enumeration's maximum.
+    ///
+    /// The ATTEMPT component is NOT arithmetic and cannot be made so: it is `lease.seq`, a global lease
+    /// counter that advances on EVERY round including deferred ones, so consecutive generations carry
+    /// attempts separated by unbounded gaps and there is no `attempt + 1` to probe. A fold seal's key
+    /// needs both numbers, so the per-generation question is answered by listing ONE generation's
+    /// prefix instead of by an exact `GET`. That is a narrow, single-generation query rather than a
+    /// pool-wide enumeration whose maximum decides everything -- strictly stronger than trusting the
+    /// broad LIST, and honestly weaker than the ref walk's exact reads. Closing it completely needs an
+    /// attempt-free per-generation key to point-read, which is a format change (recorded in the report).
+    ///
+    /// Starting at `seeded_floor + 1` makes the virgin case fall out of the same loop: a pool the hint
+    /// says nothing about starts at generation 1, and an empty generation 1 IS the proof that no
+    /// baseline was ever sealed.
+    std::optional<std::pair<uint64_t, uint64_t>> newest;
+    if (seeded_floor > 0)
+        if (const auto seeded = probeGenerationForSeal(seeded_floor); seeded.seal_attempt)
+            newest = std::make_pair(seeded_floor, *seeded.seal_attempt);
+
+    for (uint64_t generation = seeded_floor + 1; ; ++generation)
+    {
+        const GenerationSealProbe probe = probeGenerationForSeal(generation);
+        if (!probe.generation_exists)
+            break;   /// the first absent generation: everything below it is all there is
+        /// A generation that exists but sealed nothing is a fold that died before its seal write. It
+        /// carries no holds, so it does not become the newest -- but the walk continues THROUGH it,
+        /// because a generation above it would still be the real top.
+        if (probe.seal_attempt)
+            newest = std::make_pair(generation, *probe.seal_attempt);
+    }
+    return newest;
+}
+
+Gc::GenerationSealProbe Gc::probeGenerationForSeal(uint64_t generation)
+{
+    Backend & backend = store->backend();
+    const Layout & layout = store->layout();
+
+    GenerationSealProbe probe;
+    forEachListedKey(backend, layout.gcGenPrefix(generation), [&](const ListedKey & k)
+    {
+        probe.generation_exists = true;   /// ANY object proves this generation was minted
+        /// Parse a candidate attempt out of the path and then PROVE it by rebuilding the key: only a
+        /// string `foldSealKey` itself would have produced is a fold seal. Everything else under a
+        /// generation -- run objects, outcome sets, debris of a lost era -- must not get to decide
+        /// which baseline this pool's holds are read from.
+        static constexpr std::string_view kAttempt = "/attempt/";
+        const size_t a_begin = k.key.find(kAttempt);
+        if (a_begin == String::npos)
+            return;
+        const size_t a_from = a_begin + kAttempt.size();
+        const size_t a_end = k.key.find('/', a_from);
+        if (a_end == String::npos)
+            return;
         uint64_t attempt = 0;
         try
         {
-            generation = std::stoull(k.key.substr(from, gen_end - from));
-            static constexpr std::string_view kAttempt = "/attempt/";
-            const size_t a_begin = k.key.find(kAttempt, gen_end);
-            if (a_begin == String::npos)
-                return;
-            const size_t a_from = a_begin + kAttempt.size();
-            const size_t a_end = k.key.find('/', a_from);
-            if (a_end == String::npos)
-                return;
             attempt = std::stoull(k.key.substr(a_from, a_end - a_from));
         }
         catch (...) // NOLINT(bugprone-empty-catch)
         {
-            return;   /// foreign key shape under `gc/gen` is debris, not a baseline
+            return;   /// foreign key shape is debris, not an attempt
         }
         if (layout.foldSealKey(generation, attempt) != k.key)
             return;
-        const auto candidate = std::make_pair(generation, attempt);
-        if (!newest || *newest < candidate)
-            newest = candidate;
+        if (!probe.seal_attempt || *probe.seal_attempt < attempt)
+            probe.seal_attempt = attempt;
     }, 1000, onGcEnumerationPage);
-    return newest;
+    return probe;
 }
 
 Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & report,

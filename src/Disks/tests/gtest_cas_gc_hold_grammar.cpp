@@ -911,6 +911,81 @@ TEST(CasGcHoldGrammar, RebuildRefusesWhenTheNewestSealIsUnreadableAndTheStateIsL
     }
 }
 
+/// NEWEST-NESS IS CONFIRMED, NOT ENUMERATED. Reading the newest seal off a pool-wide LIST would put
+/// the same hole one layer up: a listing that omits the true newest seal hands back an OLDER one, and
+/// every hold detected since that older seal is silently lost. So the listing only seeds a floor and
+/// the walk steps generations upward from it — they are dense in minting — until one does not exist.
+///
+/// The fixture is the production shape rather than a contrivance: the broad `gc/gen/` enumeration
+/// omits the newest generation's objects while a listing scoped to that generation still returns
+/// them — the same class of lie the arithmetic ref walk was built for one layer down.
+TEST(CasGcHoldGrammar, RebuildConfirmsTheNewestSealWhenTheBroadListingHidesIt)
+{
+    /// Omits keys from ONE enumeration prefix only. Every other query — including a listing scoped to
+    /// the generation itself — answers truthfully.
+    class BroadListHoleBackend : public InMemoryBackend
+    {
+    public:
+        String hide_under_prefix;
+        String hidden_key_infix;
+        size_t holes_served = 0;
+
+        ListPage list(const String & prefix, const String & cursor, size_t limit) override
+        {
+            ListPage page = InMemoryBackend::list(prefix, cursor, limit);
+            if (prefix != hide_under_prefix)
+                return page;
+            const size_t before = page.keys.size();
+            std::erase_if(page.keys,
+                          [&](const ListedKey & k) { return k.key.find(hidden_key_infix) != String::npos; });
+            if (page.keys.size() != before)
+                ++holes_served;
+            return page;
+        }
+    };
+
+    auto backend = std::make_shared<BroadListHoleBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/aa@cas@"};
+
+    publishAt(*backend, layout, ns, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(1), /*birth=*/true);
+    Gc gc(store, kGc);
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+    publishAt(*backend, layout, ns, RefTxnId{1, 2}, "ref_2", 2, DB::UInt128(2));
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+
+    const GcState st = decodeGcState(backend->get(layout.gcStateKey())->bytes);
+    ASSERT_GT(st.snap_generation, 1u) << "the fixture needs a newer generation to hide";
+    mutateAdoptedSeal(*backend, layout, [&](CasFoldSeal & seal)
+    {
+        ShardCoverage & cov = seal.per_ns_shard[cursorKeyForTest(ns, 0)];
+        cov.classification = 4;
+        cov.hold = plantedHold();
+    });
+
+    /// The pool-wide enumeration loses the newest generation entirely; the pointer to it is deleted.
+    const String gen_prefix = layout.gcGenPrefix(0);
+    backend->hide_under_prefix = gen_prefix.substr(0, gen_prefix.size() - 2);   /// ".../gc/gen/"
+    backend->hidden_key_infix = layout.gcGenPrefix(st.snap_generation);
+    const HeadResult sh = backend->head(layout.gcStateKey());
+    ASSERT_EQ(backend->deleteExact(layout.gcStateKey(), sh.token).kind, DeleteOutcome::Kind::Deleted);
+
+    Gc gc2(store, hexToU128("0000000000000000000000000000000b"));
+    const RebuildReport rep = gc2.rebuildBaseline(/*force=*/false);
+    ASSERT_TRUE(rep.performed) << rep.refusal;
+    ASSERT_GT(backend->holes_served, 0u) << "the broad listing never actually lied";
+
+    const auto rebuilt = newestSeal(*backend, layout);
+    ASSERT_TRUE(rebuilt.has_value());
+    const auto it = rebuilt->per_ns_shard.find(cursorKeyForTest(ns, 0));
+    ASSERT_NE(it, rebuilt->per_ns_shard.end());
+    ASSERT_TRUE(it->second.hold.has_value())
+        << "the rebuild believed the listing's maximum and carried an older seal's holds — the hold "
+           "recorded in the generation the listing omitted was lost";
+    EXPECT_EQ(*it->second.hold, plantedHold());
+}
+
 /// The virgin proof, pinned so the refusal can never grow to swallow a fresh pool: no `gc/state` AND
 /// no fold seal object anywhere means the pool never sealed a baseline, so there is no hold to lose
 /// and nothing to refuse over.
