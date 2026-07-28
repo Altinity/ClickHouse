@@ -522,6 +522,62 @@ TEST(CasGcFrontierGate, TheOrphanManifestSweepAndItsCursorAreInertUnderSuppressi
 
 /// ===================== QUIET NAMESPACES AND THE PROBE BUDGET =====================
 
+/// THE TALLY ARITHMETIC, at a PARTIAL budget — the case neither 0 nor the default reaches.
+///
+/// `frontier_namespaces` is the denominator an operator reads as "the round's universe", and the
+/// integration test reads it too. It has to describe the set the round actually SEALED: the walked
+/// namespaces plus the ones the budget skipped whose cursors were carried, and nothing else. With
+/// three quiet namespaces and a budget of one, the round probes exactly one of them, carries the other
+/// two verbatim, and the published tally must be 3 = 1 proven + 2 unprobed — a denominator strictly
+/// larger than the numerator, which is the shape that suppresses.
+TEST(CasGcFrontierGate, APartialProbeBudgetPublishesATallyThatMatchesTheSealedSet)
+{
+    auto backend = std::make_shared<HintHoleBackend>();
+    auto store = openPoolWithProbeBudget(backend, /*budget*/ 1);
+    const Layout & layout = store->layout();
+    const RootNamespace a{"00/quiet_a@cas@"};
+    const RootNamespace b{"00/quiet_b@cas@"};
+    const RootNamespace c{"00/quiet_c@cas@"};
+
+    for (const RootNamespace & ns : {a, b, c})
+        publish(*backend, layout, ns, "ref_1", 1, DB::UInt128(0x300 + ns.string().size()));
+
+    Gc gc(store, kGc);
+    runRegularRoundReclaiming(gc);
+    store->renewWatermarkOnce();
+    for (const RootNamespace & ns : {a, b, c})
+        ASSERT_NE(sealedCursorOf(*backend, layout, ns), (RefTxnId{})) << ns.string();
+
+    /// All three go unhinted at once, so the budget of one cannot cover them.
+    for (const RootNamespace & ns : {a, b, c})
+        backend->hidePrefix(layout.refsNamespacePrefix(ns));
+
+    std::map<String, UInt64> intake;
+    gc.setPhaseSink([&](const GcPhaseRecord & rec)
+    {
+        if (rec.phase == "fold_ref_intake")
+            intake = rec.metrics;
+    });
+    runRegularRoundReclaiming(gc);
+    gc.setPhaseSink({});
+
+    ASSERT_FALSE(intake.empty()) << "the intake phase must have emitted its row";
+    EXPECT_EQ(intake["unhinted_quiet_walked"], 1u) << "the budget permits exactly one probe";
+    EXPECT_EQ(intake["frontier_unprobed_budget"], 2u) << "the other two are not probed at all";
+    EXPECT_EQ(intake["frontier_proven"], 1u) << "only the probed namespace can be proven";
+    EXPECT_EQ(intake["frontier_namespaces"], 3u)
+        << "the denominator is the SEALED set: 1 walked + 2 carried. It is derived from the rows the "
+           "carry loop added, so it cannot describe a universe different from the seal";
+    EXPECT_LT(intake["frontier_proven"], intake["frontier_namespaces"])
+        << "a partial budget must leave the frontier incomplete";
+
+    /// And the seal really does carry all three rows — the denominator's claim, checked against the
+    /// object it describes rather than against another counter.
+    for (const RootNamespace & ns : {a, b, c})
+        EXPECT_NE(sealedCursorOf(*backend, layout, ns), (RefTxnId{}))
+            << "every namespace in the tally must have a sealed cursor: " << ns.string();
+}
+
 /// A namespace the hint has stopped mentioning but whose cursor the seal still carries costs exactly
 /// ONE exact `GET` -- at its expected-next position -- and that `GET` coming back absent IS its
 /// frontier proof.

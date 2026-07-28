@@ -835,11 +835,22 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
             new_referenced_generations.insert(r.generation);
 
         std::set<uint64_t> handed_off;   /// dedupe: multiple parent refs can share one generation
-        /// GATED like every other destructive site. Nothing is lost by skipping it: the hand-off is
-        /// already best-effort and already re-derived from the seal, so the next unsuppressed round whose
-        /// ref has moved off the generation reclaims it then. This is also the FIRST destructive site of
-        /// the post-CAS tail, which is why the gate is read before the tail begins rather than partway
+        /// GATED like every other destructive site, and it is also the FIRST destructive site of the
+        /// post-CAS tail -- which is why the gate is read before the tail begins rather than partway
         /// down it.
+        ///
+        /// UNLIKE EVERY OTHER GATED SITE, SUPPRESSION HERE LOSES THE WORK RATHER THAN POSTPONING IT.
+        /// The hand-off is a one-shot DIFFERENCE between the parent seal's runs and the new seal's, and
+        /// a suppressed round still FOLDS -- only the irreversible half stops -- so the ref moves off
+        /// the old generation on this very round and the next round's parent seal no longer names it.
+        /// Nothing revisits it: `snap_pruned_through` is already past that generation and the wholesale
+        /// prune only walks forward. The prefix is left to `fsck`, which is the same outcome this site
+        /// already documents for a crash in this window (see the PHASE 14/18 comment above) -- the
+        /// difference is that in Stage A every round is suppressed, so it is systematic rather than
+        /// incidental. Bounded and not a correctness problem; it stops when Stage B's Task 7b flips
+        /// `UniversePolicy::kDefault`. Filed: `docs/superpowers/cas/BACKLOG.md`
+        /// `{#suppressed-handoff-consumption}`; pinned by
+        /// `CasGcFrontierGate.TheHandOffReclaimIsInertUnderSuppression`, which asserts both halves.
         static const std::vector<RunRef> kNoRuns;
         const std::vector<RunRef> & handoff_candidates =
             suppress_destructive ? kNoRuns : parent_seal_runs;
@@ -2280,7 +2291,16 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// budget would hand the next round a namespace to re-fold from `{0,0}`, which is a far worse
     /// outcome than the unproven frontier this already is. They count toward the universe and NOT toward
     /// the proofs, which is what suppresses the round.
-    result.frontier_namespaces += intake_unprobed_budget;
+    ///
+    /// THE DENOMINATOR IS THE SEALED SET, BY CONSTRUCTION. `frontier_namespaces` is incremented by the
+    /// number of rows this loop actually ADDED to the seal, never by the count the skip loop predicted.
+    /// The two are the same set under the same filters, so they agree -- but agreeing "because both
+    /// filters were written the same way" is exactly the kind of coincidence that decays under editing,
+    /// and `frontier_namespaces` is the denominator an operator (and the integration test) reads as THE
+    /// universe. Deriving it from the seal removes the possibility of publishing a number that
+    /// describes a different universe than the round sealed. The `chassert` states the equality so a
+    /// future divergence surfaces in debug rather than silently; it is metric integrity, not a safety
+    /// gate, because both paths suppress the round either way.
     if (intake_unprobed_budget > 0)
     {
         uint64_t carried = 0;
@@ -2298,6 +2318,8 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             result.fold_seal.per_ns_shard[known_key] = known_cov;
             ++carried;
         }
+        chassert(carried == intake_unprobed_budget);
+        result.frontier_namespaces += carried;
         LOG_WARNING(logger,
             "CAS GC ref intake: the frontier-probe budget ({}) ran out with {} known namespace(s) "
             "unprobed; their cursors ride unchanged and ALL destructive work is suppressed this round",
