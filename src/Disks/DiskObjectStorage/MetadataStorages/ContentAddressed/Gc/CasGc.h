@@ -622,12 +622,6 @@ private:
     /// already-dead mount by one extra round (safe: never fences early).
     MountObservationMap mount_obs;
 
-    /// `reportLateLogsIfAny`'s one-shot in-memory dedup latch, owned by
-    /// THIS leader instance (see `LateLogDedup`'s doc comment) -- in-memory only, exactly like
-    /// `mount_obs` above: a fresh leader (after a steal or a process restart) starts empty, at worst
-    /// re-emitting one already-reported anomaly once.
-    LateLogDedup late_log_dedup;
-
     /// Bounded pool for the round's per-hash freshness-meta writes (condemn/spare/delete);
     /// sized from `PoolConfig::gc_meta_pool_size` (constructed in the ctor, after the null/id checks --
     /// never touches a possibly-null `store` at member-init time). A `unique_ptr` (not a plain member)

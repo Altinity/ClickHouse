@@ -105,95 +105,6 @@ RefTxnId sealedRefCursor(Pool & store, const RootNamespace & ns)
     return RefTxnId{};
 }
 
-/// A listed `_log` id strictly above the recovered seal's `sealed_from` and at or below the seal's own
-/// `snapshot_id` was materialized after the recovery `LIST` that produced the seal. This is a LIST-only
-/// classification: the id from the key is enough, so the detector never GETs the log body and cannot
-/// accidentally treat its operations as legitimate state. It reports a warning and one
-/// `RefLateLogDetected` event; ordinary covered-log cleanup removes the log once folding catches up.
-///
-/// Recovery may observe an empty dead region and publish no seal. There is then no per-namespace durable
-/// trace that can prove, after a process change, that a later dead-epoch log materialized after recovery's
-/// `LIST`; this cross-process case remains intentionally undetectable here. The same `Pool` instance can
-/// nevertheless identify the narrow safe case: if it recorded the unclean reclaim, has no snapshot at all,
-/// and lists a log from an epoch below its current epoch, that log is unambiguously late. The detector
-/// reports this case without reading or reviving the log.
-void reportLateLogsIfAny(Pool & store, const RootNamespace & ns, const RecoveredRefTable & recovered,
-                          const std::vector<RefTxnId> & logs, LateLogDedup * dedup)
-{
-    const Layout & layout = store.layout();
-
-    if (recovered.sealed_from)
-    {
-        for (const RefTxnId & id : logs)
-        {
-            if (!(*recovered.sealed_from < id))
-                continue;   /// id <= sealed_from: within the observed region, ordinary
-            if (recovered.newest_snapshot_id && *recovered.newest_snapshot_id < id)
-                continue;   /// id > the seal: not (yet) covered by it -- not provably late
-            /// The optional leader-owned latch prevents the same durable anomaly from being emitted on
-            /// every sweep pass while ordinary covered-log cleanup is still catching up.
-            if (dedup && !dedup->insert({ns.string(), renderRefTxnId(id)}).second)
-                continue;
-
-            LOG_WARNING(getLogger("CasOrphanManifestSweep"),
-                        "CAS T_mat violation: namespace {} log {} listed above the recovery seal's "
-                        "sealed_from {} and covered by its snapshot {} -- the store materialized a write "
-                        "after the recovery LIST; reporting only, never reviving (GC's ordinary "
-                        "covered-log cleanup removes it once folding catches up)",
-                        ns.string(), renderRefTxnId(id), renderRefTxnId(*recovered.sealed_from),
-                        renderRefTxnId(*recovered.newest_snapshot_id));
-
-            EventEmitter{store}.emit([&](CasEvent & e)
-            {
-                e.type = CasEventType::RefLateLogDetected;
-                e.namespace_ = ns.string();
-                e.at_version = id.ref_sequence;
-                e.reason = "T_mat violation: ref log listed above the recovery seal's sealed_from and "
-                           "covered by its snapshot -- reporting only, never reviving (resurrect invariant)";
-                e.detail = {{"log_id", renderRefTxnId(id)},
-                            {"key", layout.refLogKey(ns, id)},
-                            {"sealed_from", renderRefTxnId(*recovered.sealed_from)},
-                            {"seal_snapshot_id", renderRefTxnId(*recovered.newest_snapshot_id)}};
-            });
-        }
-        return;
-    }
-
-    if (recovered.newest_snapshot_id || !store.ownsAndSawUncleanBoundaryFor(ns))
-        return;   /// an ordinary (non-seal) snapshot exists, or no same-process signal available
-
-    const uint64_t my_epoch = store.liveWriterEpoch();
-    for (const RefTxnId & id : logs)
-    {
-        if (id.writer_epoch >= my_epoch)
-            continue;   /// not from a dead epoch relative to THIS incarnation
-        /// Apply the same optional leader-owned suppression as in the seal-based branch.
-        if (dedup && !dedup->insert({ns.string(), renderRefTxnId(id)}).second)
-            continue;
-
-        LOG_WARNING(getLogger("CasOrphanManifestSweep"),
-                    "CAS T_mat violation (empty-dead-region carve-out): namespace {} log {} is from a "
-                    "dead epoch (writer_epoch {} < live {}) with no snapshot at all to explain its "
-                    "presence -- this incarnation's own unclean-reclaim recovery found the namespace "
-                    "empty and published no seal, so the log must have materialized after that "
-                    "recovery's LIST; reporting only, never reviving",
-                    ns.string(), renderRefTxnId(id), id.writer_epoch, my_epoch);
-
-        EventEmitter{store}.emit([&](CasEvent & e)
-        {
-            e.type = CasEventType::RefLateLogDetected;
-            e.namespace_ = ns.string();
-            e.at_version = id.ref_sequence;
-            e.reason = "T_mat violation: ref log from a dead epoch with no covering snapshot at all "
-                       "(empty-dead-region carve-out, same-process detection) -- reporting only, "
-                       "never reviving (resurrect invariant)";
-            e.detail = {{"log_id", renderRefTxnId(id)},
-                        {"key", layout.refLogKey(ns, id)},
-                        {"live_writer_epoch", std::to_string(my_epoch)}};
-        });
-    }
-}
-
 /// The active manifest-object-key set for one namespace, built as the
 /// same complete view writer recovery uses:
 ///   owners in the newest snapshot + owner changes in every later log (== `recoverRefTable`'s committed
@@ -202,7 +113,7 @@ void reportLateLogsIfAny(Pool & store, const RootNamespace & ns, const Recovered
 /// Keys (not ManifestIds) so a listed object key can be tested directly. Throws on a corrupt snapshot /
 /// invalid transaction (via `recoverRefTable` / `decodeRefLogTxn`); the caller SKIPS the namespace's
 /// deletions on such a throw rather than substituting an empty owner set.
-std::set<String> activeManifestKeys(Pool & store, const RootNamespace & ns, LateLogDedup * dedup)
+std::set<String> activeManifestKeys(Pool & store, const RootNamespace & ns)
 {
     std::set<String> active;
     const Layout & layout = store.layout();
@@ -229,8 +140,6 @@ std::set<String> activeManifestKeys(Pool & store, const RootNamespace & ns, Late
             logs.push_back(parsed->txn_id);
     }, 1000, onGcEnumerationPage);
     std::sort(logs.begin(), logs.end());
-
-    reportLateLogsIfAny(store, ns, recovered, logs, dedup);
 
     for (const RefTxnId & id : logs)
     {
@@ -270,7 +179,7 @@ bool prefixEligible(Pool & store, const RootNamespace & ns, const BuildPrefix & 
 }
 
 uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefix & prefix,
-                        std::vector<String> * warnings, LateLogDedup * dedup)
+                        std::vector<String> * warnings)
 {
     if (!prefixEligible(store, ns, prefix))
         return 0;   /// not eligible by the durable watermark fact — delete nothing (controls #8/#9)
@@ -289,7 +198,7 @@ uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefi
     std::set<String> active;
     try
     {
-        active = activeManifestKeys(store, ns, dedup);
+        active = activeManifestKeys(store, ns);
     }
     catch (const Exception & e)
     {
@@ -343,8 +252,7 @@ ManifestSweepResult sweepManifestCursorPage(
     Pool & store,
     const String & cursor,
     uint64_t list_budget,
-    uint64_t delete_budget,
-    LateLogDedup * dedup)
+    uint64_t delete_budget)
 {
     ManifestSweepResult result;
     result.next_cursor = cursor;
@@ -396,7 +304,7 @@ ManifestSweepResult sweepManifestCursorPage(
             /// this namespace's deletions and surface the error; never substitute an empty owner set.
             try
             {
-                active_it->second = activeManifestKeys(store, parsed->ns, dedup);
+                active_it->second = activeManifestKeys(store, parsed->ns);
             }
             catch (const Exception & e)
             {

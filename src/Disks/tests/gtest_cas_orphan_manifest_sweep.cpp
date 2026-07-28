@@ -178,157 +178,18 @@ TEST(CasOrphanManifestSweep, CursorPageSkipsOwnedBody)
     EXPECT_TRUE(backend->head(store->layout().manifestKey(ManifestId{ns, r})).exists);
 }
 
-/// rev.6 Task 12 (spec §anomaly-policy): a `_log` id listed strictly above a recovery seal's
-/// `sealed_from` and at-or-below the seal's own `snapshot_id` provably materialized AFTER the
-/// recovery `LIST` that produced the seal -- a T_mat violation. The sweep (which already LISTs the
-/// `_log` region for orphan-manifest protection) must report it via one `RefLateLogDetected` event
-/// and NEVER GET its body to "revive" it (the resurrect invariant): no owner state is derived from
-/// it, and the sweep itself never deletes ref-log objects (GC's ordinary covered-log cleanup does,
-/// once folding catches up).
-TEST(CasSweepLateLog, LogBetweenSealedFromAndSealIdIsReportedNotRevived)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    const RootNamespace ns{"00/aa@cas@"};
-    const Layout layout("p");   // matches openPoolForTest's PoolConfig.pool_prefix
-    registerNamespaceRaw(*backend, layout, ns);
+/// The LIST-based late-log detector that lived here is RETIRED with the sentinel seal, and it is worth
+/// recording why rather than leaving a hole in this file's coverage story.
+///
+/// It existed because the old seal was a SNAPSHOT at a synthetic `{E-1, UINT64_MAX}` id: that object
+/// occupied no `_log` key, so a dying predecessor's in-flight PUT could still land in the dead epoch and
+/// the only possible response was to notice it afterwards and report it. INV-2's seal is a
+/// TRANSACTION at exactly `{E, T+1}` -- the key that ghost would take -- so the store's own write-once
+/// create refuses it. There is nothing left to detect at that shape: an id above the seal cannot be
+/// minted either, because ids are state-derived and a writer that could derive `{E, T+2}` would have had
+/// to observe the seal first.
+///
+/// `CasEventType::RefLateLogDetected` is deliberately KEPT in the event vocabulary (see its doc):
+/// retiring the event kind is a product-surface decision that also retires soak scenario S38, and it is
+/// not this task's to take.
 
-    /// A recovery seal: snapshot_id = {2, UINT64_MAX} (the epoch-closing upper bound recovery for
-    /// writer_epoch 3 publishes to close dead epoch 2), sealed_from = {2, 3} (the greatest id that
-    /// recovery's LIST actually observed).
-    RefTableSnapshot seal = minimalLiveSnapshot(ns.string(), RefTxnId{2, std::numeric_limits<uint64_t>::max()});
-    seal.sealed_from = RefTxnId{2, 3};
-    writeRefSnapshotRaw(*backend, layout, seal);
-
-    /// A late log at {2, 7}: sealed_from (3) < 7 <= snapshot_id (UINT64_MAX) -- provably late.
-    const RefTxnId late_log_id{2, 7};
-    writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), late_log_id, {}, std::nullopt});
-
-    setWatermarkMinActive(*backend, layout, kServerRoot, kWriterEpoch, /*min_active*/6);   // prefix eligible
-
-    /// Seed a fold-seal/gc-state fixture so `sealedRefCursor` (CasOrphanManifestSweep.cpp) sits AT
-    /// the late log's id. This isolates the no-GET assertion below from the pre-existing, UNRELATED
-    /// tail-removal-protection loop in `activeManifestKeys`, which GETs any log ABOVE the fold cursor
-    /// for orphan-manifest protection regardless of lateness -- with no such fixture that loop would
-    /// legitimately GET this exact log (a confound, not a detector bug). With the cursor at {2,7},
-    /// `!(cursor < id)` skips it there too, so the ONLY remaining way `late_log_id`'s body could be
-    /// read is a bug in the late-log detector itself.
-    CasFoldSeal fold_seal;
-    fold_seal.generation = 1;
-    ShardCoverage coverage;
-    coverage.last_folded_ref_id = late_log_id;
-    fold_seal.per_ns_shard[cursorKey(ns, /*shard*/0)] = coverage;
-    backend->putIfAbsent(layout.foldSealKey(/*generation*/1, /*attempt*/1), encodeFoldSeal(fold_seal));
-    GcState gc_state;
-    gc_state.snap_generation = 1;
-    gc_state.snap_attempt = 1;
-    backend->putIfAbsent(layout.gcStateKey(), encodeGcState(gc_state));
-
-    /// A delegating backend that counts GETs on the late log's exact key -- the
-    /// GetCountingBackend/INV-1 pattern from gtest_cas_part_write.cpp:602-660
-    /// (CasPartWriteTxn.PutBlobCondemnedDedupNeverGetsTheDyingObject).
-    struct GetCountingBackend final : public Backend
-    {
-        explicit GetCountingBackend(BackendPtr inner_, String watched_key_)
-            : inner(std::move(inner_)), watched_key(std::move(watched_key_)) {}
-        size_t get_count = 0;
-
-        HeadResult head(const String & k) override { return inner->head(k); }
-        std::optional<GetResult> get(const String & k, Range r) override
-        {
-            if (k == watched_key)
-                ++get_count;
-            return inner->get(k, r);
-        }
-        std::optional<GetStreamResult> getStream(const String & k, Range r) override { return inner->getStream(k, r); }
-        ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
-        PutResult putIfAbsent(const String & k, const String & bts, const ObjectMeta & m) override { return inner->putIfAbsent(k, bts, m); }
-        WriteSinkPtr putIfAbsentStream(const String & k, const ObjectMeta & m) override { return inner->putIfAbsentStream(k, m); }
-        PutResult putOverwrite(const String & k, const String & bts, const Token & e, const ObjectMeta & m) override { return inner->putOverwrite(k, bts, e, m); }
-        CasResult casPut(const String & k, const String & bts, const std::optional<Token> & e, const ObjectMeta & m) override { return inner->casPut(k, bts, e, m); }
-        DeleteOutcome deleteExact(const String & k, const Token & tok) override { return inner->deleteExact(k, tok); }
-        bool supportsListTokens() const override { return inner->supportsListTokens(); }
-    private:
-        BackendPtr inner;
-        String watched_key;
-    };
-
-    const String watched_key = layout.refLogKey(ns, late_log_id);
-    auto counting = std::make_shared<GetCountingBackend>(backend, watched_key);
-    /// The sink target must outlive the Pool: `~Pool` emits terminate events into the sink.
-    std::vector<CasEvent> events;
-    /// Restart over pre-seeded pool content: establish `_pool_meta` first (Task 7 zero-write bootstrap).
-    seedPoolMetaForRestart(*backend);
-    auto store = Pool::open(counting, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
-    store->setEventSink([&](const CasEvent & e) { events.push_back(e); });
-
-    sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5});
-
-    EXPECT_EQ(counting->get_count, 0u)
-        << "the late-log detector must never GET the log body to \"revive\" it -- the resurrect "
-           "invariant. (The fold-seal fixture above covers the late log at the cursor, so the "
-           "pre-existing tail-removal-protection loop -- unrelated to this detector -- does not "
-           "confound this assertion either.)";
-
-    ASSERT_EQ(events.size(), 1u);
-    EXPECT_EQ(events[0].type, CasEventType::RefLateLogDetected);
-    EXPECT_EQ(events[0].namespace_, ns.string());
-    EXPECT_EQ(events[0].at_version, 7u);
-    EXPECT_TRUE(backend->head(watched_key).exists)
-        << "the detector only reports the late log -- it must never delete it (that is GC's ordinary "
-           "covered-log cleanup's job once folding catches up)";
-}
-
-/// fix-round F9 (author-review: `reportLateLogsIfAny` re-emits the same warning + `RefLateLogDetected`
-/// event every sweep pass, with no dedup, until GC's ordinary covered-log cleanup removes the log --
-/// which can be many rounds later). Two passes over the SAME durably-late log: with a `LateLogDedup`
-/// latch threaded through, only the FIRST pass emits; without one (the default, `nullptr` -- every
-/// pre-existing caller), both passes emit, preserving the original always-report behaviour exactly.
-TEST(CasSweepLateLog, SecondPassSuppressedWithDedupLatchButNotWithoutOne)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    const RootNamespace ns{"00/aa@cas@"};
-    const Layout layout("p");
-    registerNamespaceRaw(*backend, layout, ns);
-
-    RefTableSnapshot seal = minimalLiveSnapshot(ns.string(), RefTxnId{2, std::numeric_limits<uint64_t>::max()});
-    seal.sealed_from = RefTxnId{2, 3};
-    writeRefSnapshotRaw(*backend, layout, seal);
-    const RefTxnId late_log_id{2, 7};
-    writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), late_log_id, {}, std::nullopt});
-    setWatermarkMinActive(*backend, layout, kServerRoot, kWriterEpoch, /*min_active*/6);
-
-    /// The sink target must outlive the Pool: `~Pool` emits terminate events into the sink.
-    std::vector<CasEvent> events;
-    /// Restart over pre-seeded pool content: establish `_pool_meta` first (Task 7 zero-write bootstrap).
-    seedPoolMetaForRestart(*backend);
-    auto store = openPoolForTest(backend);
-    store->setEventSink([&](const CasEvent & e) { events.push_back(e); });
-
-    /// Two passes WITH a dedup latch threaded through: the log is still durably there (nothing folds
-    /// or deletes it between passes), so without the fix this would emit twice.
-    LateLogDedup dedup;
-    sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5},
-                   /*warnings*/ nullptr, &dedup);
-    sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5},
-                   /*warnings*/ nullptr, &dedup);
-
-    size_t late_log_events = 0;
-    for (const CasEvent & e : events)
-        if (e.type == CasEventType::RefLateLogDetected)
-            ++late_log_events;
-    EXPECT_EQ(late_log_events, 1u)
-        << "a second pass over the SAME still-durable late log must not re-emit with a dedup latch";
-
-    /// Two MORE passes with NO latch (the default): the pre-existing always-report behaviour is
-    /// preserved exactly -- every pre-existing caller (none of them pass a latch) is unaffected.
-    events.clear();
-    sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5});
-    sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5});
-
-    late_log_events = 0;
-    for (const CasEvent & e : events)
-        if (e.type == CasEventType::RefLateLogDetected)
-            ++late_log_events;
-    EXPECT_EQ(late_log_events, 2u)
-        << "with no latch (every pre-existing caller), both passes must still emit -- unchanged default";
-}

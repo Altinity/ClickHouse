@@ -2656,11 +2656,8 @@ void Gc::runManifestSweepCursorPass(GcState & state, Token & state_token)
         return;
 
     const uint64_t delete_budget = store->poolConfig().manifest_sweep_delete_budget_keys;
-    /// `late_log_dedup` is this leader instance's own one-shot latch (see `LateLogDedup`'s
-    /// doc comment) -- threaded through so `reportLateLogsIfAny` stops re-emitting the SAME anomaly on
-    /// every pass that lists it.
     const ManifestSweepResult result = sweepManifestCursorPage(
-        *store, state.manifest_sweep_cursor, list_budget, delete_budget, &late_log_dedup);
+        *store, state.manifest_sweep_cursor, list_budget, delete_budget);
 
     if (result.next_cursor == state.manifest_sweep_cursor)
         return;

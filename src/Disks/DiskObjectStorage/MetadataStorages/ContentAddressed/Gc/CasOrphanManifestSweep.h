@@ -18,13 +18,6 @@ struct BuildPrefix
     uint64_t build_sequence = 0;
 };
 
-/// One-shot in-memory suppression for a late-reference-log report. The latch is keyed by namespace and
-/// rendered log id and is owned by one leader for the lifetime of its `Gc` instance. It is passed through
-/// the sweep to the LIST-only late-log detector, so a log that remains visible until ordinary covered-log
-/// cleanup catches up is reported once per leader rather than once per sweep pass. A new leader after
-/// leadership transfer or process restart starts with an empty latch and may report the same anomaly once.
-using LateLogDedup = std::set<std::pair<String, String>>;
-
 /// Counters returned by one bounded cursor page. `listed` counts keys in the backend page, `skipped`
 /// counts malformed, protected, ineligible, budget-exhausted, or race-spared keys, and `deleted` counts
 /// only successful exact-token deletions. `next_cursor` and `wrapped` describe the backend cursor; the
@@ -64,11 +57,8 @@ struct ManifestSweepResult
 /// per-key failure propagates as an exception (fail-close default), and the protection-view skip is
 /// log-only. `NotFound`/`TokenMismatch` delete outcomes stay silently spared either way — those are the
 /// normal "a fresh owner reclaimed it" race the periodic sweep expects, not a failure to warn about.
-/// `dedup`, when non-null, is threaded to `reportLateLogsIfAny` (see `LateLogDedup`'s own doc comment)
-/// -- `nullptr` (the default, every pre-existing caller) preserves the original behaviour exactly: no
-/// dedup, every provably-late log is reported on every pass that lists it.
 uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefix & prefix,
-                        std::vector<String> * warnings = nullptr, LateLogDedup * dedup = nullptr);
+                        std::vector<String> * warnings = nullptr);
 
 /// Whether `prefix` is sweep-eligible by the durable watermark fact alone. The floor is read from the
 /// mount lease identified by the namespace's server-root prefix, not inferred from the manifest key or a
@@ -83,7 +73,6 @@ ManifestSweepResult sweepManifestCursorPage(
     Pool & store,
     const String & cursor,
     uint64_t list_budget,
-    uint64_t delete_budget,
-    LateLogDedup * dedup = nullptr);
+    uint64_t delete_budget);
 
 }
