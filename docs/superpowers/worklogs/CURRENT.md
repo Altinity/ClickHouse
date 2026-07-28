@@ -1512,3 +1512,7 @@ Lane G fix round in progress. No push.
 
 **2026-07-28 20:40 local watchdog** — lane G fix round iterating (fix1 build2 + targeted runs,
 seconds-fresh); lane L follow-up-2 in edit phase (last logs 20:31 = rulings-round tail). No push.
+
+**2026-07-28 21:0x local** — task 7 CLOSED (re-review CLEAN; merge into main held until task-4
+review frees the build dir). Task 8 (holds grammar) dispatched on lane G. Task 4: follow-up-2
+landed (`0d866434dd8`, 1423/1423, all 8 findings); external reviewer running. No push.
