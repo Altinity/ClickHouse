@@ -450,20 +450,18 @@ RefTableState replay(const std::optional<RefTableSnapshot> & snapshot, std::span
 /// the install copies wholesale cannot silently lose a field (Codex review round 4, spec §5).
 ///
 /// `finish` populates the fields that are a pure function of `(base snapshot, replayed tail)`: `state`,
-/// `newest_snapshot_id`, `sealed_from`, `tail_count`, `tail_bytes`, and `base_snapshot_bytes`. The
+/// `newest_snapshot_id`, `tail_count`, `tail_bytes`, and `base_snapshot_bytes`. The
 /// remaining fields are recovery-context the streaming builder cannot know -- the writer's own recovery
-/// (`CasRefLedger::ensureRefTableRecovered`) fills `cleanup_markers`, the admission budgets and
-/// `needs_stale_precommit_sweep`, and applies the recovery-seal override to the snapshot-identity/tail/
-/// base fields, before installing the whole struct under `state_mutex` with `recovered` set last. The
-/// read-only consumers (`recoverRefTableDetailed` for the orphan sweep, fsck's snapshot oracle) read
-/// only `state` (plus `newest_snapshot_id`/`sealed_from` for the sweep) and leave the rest at default.
+/// (`CasRefLedger::ensureRefTableRecovered`) fills `cleanup_markers`, the admission budgets,
+/// `needs_stale_precommit_sweep` and `last_epoch_seal`, before installing the whole struct under
+/// `state_mutex` with `recovered` set last. The read-only consumers (`recoverRefTableDetailed` for the
+/// orphan sweep, fsck's snapshot oracle) read only `state` (plus `newest_snapshot_id` for the sweep) and
+/// leave the rest at default.
 struct RecoveryResult
 {
     RefTableState state;
     /// Identity of the base snapshot this recovery replayed from: `nullopt` for a never-born table.
     std::optional<RefTxnId> newest_snapshot_id;
-    /// Set only when the base is a recovery seal -- the upper bound of what that recovery's LIST saw.
-    std::optional<RefTxnId> sealed_from;
     /// Applied transactions strictly newer than `newest_snapshot_id`, and the sum of their stored
     /// (sealed) object byte sizes -- the tail-since-snapshot accounting the runtime tracks.
     uint64_t tail_count = 0;
@@ -476,6 +474,12 @@ struct RecoveryResult
     uint64_t snapshot_budget = 0;
     uint64_t removal_budget = 0;
     bool needs_stale_precommit_sweep = false;
+    /// The `EpochSeal` that closed the last dead epoch the recovery CAS-walk crossed -- minted by it,
+    /// adopted from a concurrent recoverer, or read out of the durable tail. It is the `prev_epoch_seal`
+    /// this table's next sequence-1 append must carry, and `nullopt` means GENESIS exactly (see
+    /// `CasRefLedger::RefTableRuntime::last_epoch_seal`). Recovery-context rather than replay-derived
+    /// because only the walk knows which epochs were dead.
+    std::optional<RefTxnId> last_epoch_seal;
 };
 
 /// The streaming generalisation of `replay` (spec §5): owns a PRIVATE candidate `RefTableState` and
@@ -698,16 +702,12 @@ RefCleanupPlan planRefCleanup(const RefTableListing & listing, const RefTxnId & 
                               const std::set<RefTxnId> & removal_logs_blocked,
                               std::optional<RefTxnId> completed_removal_snapshot = std::nullopt);
 
-/// The result of `recoverRefTableDetailed`: the replayed table state plus the two facts the late-log
-/// detector needs about the snapshot recovery actually selected: its id and, when it is a
-/// recovery seal, the `sealed_from` upper bound of what that recovery's `LIST` actually observed. Both
-/// are `nullopt` exactly when recovery found no snapshot at all; `sealed_from` alone is `nullopt`
-/// whenever the selected snapshot is an ordinary published one (only a seal ever sets it).
+/// The result of `recoverRefTableDetailed`: the replayed table state plus the identity of the snapshot
+/// recovery actually selected as its base (`nullopt` when it found no snapshot at all).
 struct RecoveredRefTable
 {
     RefTableState state;
     std::optional<RefTxnId> newest_snapshot_id;
-    std::optional<RefTxnId> sealed_from;
 };
 
 /// Recover one table's state via the shared recovery equation:

@@ -812,9 +812,15 @@ public:
     /// or published), or `nullopt` if none. Recovers the table (idempotent) if not already cached.
     std::optional<RefTxnId> newestPublishedSnapshotIdForTest(const RootNamespace & ns);
 
-    /// test seam: the `sealed_from` installed with `newestPublishedSnapshotIdForTest` -- the recovery
-    /// seal's observed-region upper bound when the newest snapshot is a seal, else `nullopt`.
-    std::optional<RefTxnId> sealedFromForTest(const RootNamespace & ns);
+    /// test seam: whether `ns` has a RECOVERED cached runtime, WITHOUT forcing a recovery to find out.
+    bool refTableRecoveredForTest(const RootNamespace & ns);
+    /// test seam: whether the self-remount barrier's cancellation request is visible for `ns`.
+    bool refRecoveryCancelRequestedForTest(const RootNamespace & ns);
+
+    /// The self-remount's cancel-or-join barrier over in-flight ref-table recoveries (spec §3).
+    /// `tryRemountOnce` runs it immediately before quiescing the tables and re-arming the mount fence;
+    /// exposed so the barrier itself can be driven directly by a test.
+    void cancelRefRecoveriesAndAwaitQuiescence();
 
     /// test seam: count of applied txns retained above `newestPublishedSnapshotIdForTest` (the
     /// tail a snapshot candidate would replay from).

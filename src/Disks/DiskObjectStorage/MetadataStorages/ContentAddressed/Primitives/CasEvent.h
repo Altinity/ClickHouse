@@ -43,11 +43,17 @@ enum class CasEventType
     /// reaction records the anomaly and fails the local write path closed; it does not treat the
     /// foreign bytes as valid ref-log state.
     ForeignInterference,
-    /// Report-only result of the orphan sweep's LIST-based detection of a late ref-log object: its
-    /// id is above a recovery seal's `sealed_from` and at or below the seal's `snapshot_id`, so the
-    /// object was materialized after the LIST that produced the seal. The sweep does not GET the
-    /// body and accidentally revive its operations, and does not delete the object itself; GC's
-    /// ordinary covered-log cleanup removes it after folding catches up.
+    /// Report-only late-ref-log anomaly. NOTHING EMITS THIS TODAY, deliberately and pending a
+    /// decision: its emitter was the orphan sweep's LIST-based detector, whose whole premise was the
+    /// retired SENTINEL seal -- a synthetic snapshot that occupied no log key, so a dying
+    /// predecessor's in-flight PUT could still land and only an after-the-fact detector could notice.
+    /// INV-2's in-band seal occupies exactly that key, so the store's write-once create refuses the
+    /// ghost and there is no longer anything to detect at that shape.
+    ///
+    /// Kept rather than deleted because the vocabulary is a product surface (soak scenario S38 asserts
+    /// this kind) and because a DIFFERENT anomaly of the same family may want it: a listed dead-epoch
+    /// log id above that epoch's seal. Retire the two together, or re-target the detector -- do not
+    /// quietly re-point this at an unrelated condition.
     RefLateLogDetected,
     RefResolve, ReadMissing, DanglingAccess,
     CorruptDangle, CorruptDecode, SnapJournalIncoherent, Exception,

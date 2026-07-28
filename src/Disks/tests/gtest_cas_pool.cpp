@@ -33,7 +33,7 @@ extern const int NETWORK_ERROR;
 
 namespace ProfileEvents
 {
-extern const Event CasRefRecoverySealPublished;
+extern const Event CasRefRecoveryEpochSealed;
 extern const Event CasMountExclusivityViolation;
 }
 
@@ -1802,16 +1802,19 @@ TEST(CasRemountTmat, UnresolvedWedgePaysGraceAndMarksBoundaryUnclean)
     EXPECT_TRUE(store->uncleanEpochBoundarySeenForTest());
 }
 
-/// rev.6 fix-round F2(a): the pre-fix `unclean_epoch_boundary_seen` was a STICKY bool -- once ANY
-/// remount in this incarnation's life was unclean, EVERY later table recovery (including a table
-/// touched for the first time under a LATER, perfectly clean epoch boundary -- `tryRemountOnce`'s own
-/// `quiesceRefTablesForRemount` clears the whole ref-table cache on every remount, so this is the
-/// COMMON case, not an edge case) got a parasitic seal attempt. The fix compares the specific epoch a
-/// reclaim was marked unclean for against the table's own recovery epoch, not "was any transition ever
-/// unclean". This drives TWO self-remounts (unclean, then clean) and proves a table recovered for the
-/// first time strictly after both does NOT seal, even though its own data predates the FIRST (unclean)
-/// boundary and `dead_region_nonempty` is true for it.
-TEST(CasRemountTmat, CleanRemountAfterEarlierUncleanOneDoesNotSealALateTouchedTable)
+/// Sealing is decided by ARITHMETIC -- `epoch < live_epoch` -- and by nothing else. This test used to
+/// pin the opposite ("a table recovered under a later CLEAN boundary must not seal"), which was the
+/// right rule while a seal was a synthetic SNAPSHOT published only to close an unclean handover: such a
+/// seal after a clean shutdown was pure parasitic cost, so it was gated on the per-epoch unclean flag.
+///
+/// INV-2's seal is not that object. It is the chain link that makes a MISSING epoch detectable across a
+/// transition, and a chain that skips every epoch whose mount happened to shut down cleanly is not a
+/// chain -- the next sequence-1 transaction would have no `prev_epoch_seal` to name, and no reader could
+/// tell "epoch 2 was empty" from "epoch 2's records are gone". So a late-touched table now closes EVERY
+/// dead epoch below the live one, however its predecessors died, and this test pins that plus the two
+/// things that must still be true: the seals land IN-BAND (at log keys, at the slot a straggler would
+/// have taken) and no synthetic seal SNAPSHOT is written anywhere.
+TEST(CasRemountTmat, ALateTouchedTableClosesEveryDeadEpochInBandHoweverItsPredecessorsDied)
 {
     CasRequestBudget budget;
     budget.max_attempts = 1;
@@ -1863,18 +1866,22 @@ TEST(CasRemountTmat, CleanRemountAfterEarlierUncleanOneDoesNotSealALateTouchedTa
     ASSERT_EQ(store->liveWriterEpoch(), 3u);
 
     using ProfileEvents::global_counters;
-    const auto sealed_before = global_counters[ProfileEvents::CasRefRecoverySealPublished].load();
+    const auto sealed_before = global_counters[ProfileEvents::CasRefRecoveryEpochSealed].load();
 
     /// ns2's FIRST recovery under this incarnation happens now, at epoch 3 -- strictly after both
-    /// remounts. `dead_region_nonempty` is true for it (its only data is at epoch 1 < 3).
+    /// remounts. Its only data is at epoch 1, so epochs 1 and 2 are both dead for it.
     EXPECT_EQ(store->listRefs(ns2).size(), 1u);
 
-    EXPECT_EQ(global_counters[ProfileEvents::CasRefRecoverySealPublished].load(), sealed_before)
-        << "a table recovered for the first time under a LATER, clean epoch boundary must not seal, "
-           "even though an EARLIER, unrelated boundary in this incarnation's life was unclean";
-    const RefTxnId stale_seal_id{2, std::numeric_limits<uint64_t>::max()};
-    EXPECT_FALSE(backend->get(layout.refSnapshotKey(ns2, stale_seal_id)).has_value())
-        << "no seal must have been published at the STALE (epoch-2) boundary for ns2";
+    EXPECT_EQ(global_counters[ProfileEvents::CasRefRecoveryEpochSealed].load(), sealed_before + 2)
+        << "both dead epochs must be closed -- the chain link is what a later reader needs to tell an "
+           "EMPTY epoch from a LOST one, and that is independent of how each mount ended";
+    EXPECT_TRUE(backend->get(layout.refLogKey(ns2, RefTxnId{1, 2})).has_value())
+        << "epoch 1 closes at the slot right after its last durable id, in-band";
+    EXPECT_TRUE(backend->get(layout.refLogKey(ns2, RefTxnId{2, 1})).has_value())
+        << "empty epoch 2 closes at its own sequence 1, chained to the epoch-1 seal";
+    const RefTxnId retired_sentinel_id{2, std::numeric_limits<uint64_t>::max()};
+    EXPECT_FALSE(backend->get(layout.refSnapshotKey(ns2, retired_sentinel_id)).has_value())
+        << "and NO synthetic seal snapshot is written: that shape is retired";
 }
 
 TEST(CasPool, ReadManifestSharedReturnsSharedDecodeWithoutCopy)

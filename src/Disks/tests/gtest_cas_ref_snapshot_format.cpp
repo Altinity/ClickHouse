@@ -145,38 +145,24 @@ TEST(CasRefSnapshotCodec, RoundTripPrecommitsSameNameDifferentManifest)
 }
 
 /// ===================================================================================
-/// Recovery seal (rev.6): a Live snapshot with `sealed_from` set at a synthetic
-/// `snapshot_id = {my_epoch-1, UINT64_MAX}` -- proves UINT64_MAX round-trips as a decimal STRING.
+/// Large ids
 /// ===================================================================================
 
-TEST(CasRefSnapshotFormat, SealedFromRoundTrips)
+/// `ref_sequence` is a 64-bit counter and the codec writes it as a decimal STRING, so the top of the
+/// range survives a round trip without JSON's number semantics getting involved. This used to be pinned
+/// through the retired sentinel seal, whose synthetic `{E-1, UINT64_MAX}` id was the only place such a
+/// value arose; the representation guarantee is what actually mattered and it is pinned directly here.
+TEST(CasRefSnapshotFormat, MaximalRefSequenceRoundTripsAsADecimalString)
 {
     RefTableSnapshot m;
     m.ns = "ns";
-    m.snapshot_id = RefTxnId{5, std::numeric_limits<uint64_t>::max()};   /// synthetic epoch-closing seal id
+    m.snapshot_id = RefTxnId{5, std::numeric_limits<uint64_t>::max()};
     m.lifecycle = RefLifecycle::Live;
-    m.sealed_from = RefTxnId{5, 42};   /// <= snapshot_id
 
     const String text = encodeRefTableSnapshot(m);
     const RefTableSnapshot back = decodeRefTableSnapshot(text, m.ns, m.snapshot_id);
-    EXPECT_EQ(back.sealed_from, m.sealed_from);
     EXPECT_EQ(back.snapshot_id.ref_sequence, std::numeric_limits<uint64_t>::max());
-    /// UINT64_MAX must serialize as a decimal STRING, not a JSON number.
     EXPECT_NE(text.find("\"rs\":\"18446744073709551615\""), String::npos);
-}
-
-/// CORRUPTED_DATA (not LOGICAL_ERROR): checkSnapshotInvariants runs on BOTH encode (in-memory state)
-/// and decode (data read back from the backend, which can be corrupted) -- this is data-integrity
-/// validation, the same class as the 4 sibling checks in that function, not an internal invariant
-/// that can only be violated by a bug in this code. A catchable exception, not a process abort.
-TEST(CasRefSnapshotFormat, RejectsSnapshotIdBelowSealedFrom)
-{
-    RefTableSnapshot bad;
-    bad.ns = "ns";
-    bad.snapshot_id = RefTxnId{5, 42};
-    bad.lifecycle = RefLifecycle::Live;
-    bad.sealed_from = RefTxnId{5, 100};   /// > snapshot_id: the seal upper-bound invariant is violated
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefTableSnapshot(bad); });
 }
 
 /// ===================================================================================

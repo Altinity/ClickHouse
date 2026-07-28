@@ -12,7 +12,6 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int CORRUPTED_DATA;
-    extern const int NOT_IMPLEMENTED;
 }
 }
 
@@ -349,16 +348,25 @@ void RefTableState::applyOp(const RefOp & op, const RefTxnId & txn_id)
             return;
         }
         case RefOpKind::EpochSeal:
-            /// Stage A task 1 scope boundary: the codec now accepts `EpochSeal` (grammar +
-            /// round trip only), but the apply layer's seal handling -- INV-2's contextual grammar
-            /// and the slot-occupy integration -- is wired by a later task. NOT reachable from any
-            /// writer in this build (nothing yet mints an `EpochSeal` op), but IS reachable from a
-            /// foreign or hand-crafted `_log` object replayed through `RefTableState::replay` -- the
-            /// decoder now accepts one, so a storage-controlled body can drive this switch. That is
-            /// exactly why this throws `NOT_IMPLEMENTED` rather than `LOGICAL_ERROR`: the latter aborts
-            /// under sanitizer/CI abort-on-logical-error settings, which would let storage-controlled
-            /// input crash the server; this fails loudly without that hazard.
-            throw Exception(ErrorCodes::NOT_IMPLEMENTED, "RefTableState: EpochSeal apply is not yet implemented");
+            /// INV-2's in-band epoch closure. A seal carries NO table content, and that is its whole
+            /// design: its effect is that it OCCUPIES `{E, T+1}` -- the exact key a dying predecessor's
+            /// in-flight PUT would have taken, so the store's own write-once create becomes the fence --
+            /// and that it advances `greatest_applied`, which `applyTxnInPlace` does after this switch.
+            /// There is deliberately nothing to do here: a seal that changed a row would be a seal that
+            /// can lose one.
+            ///
+            /// `Live` is required because a seal closes the epoch of a LIVE stream. A never-born
+            /// namespace has no stream to close, and a `Removed` one already closed its own with the
+            /// terminal record -- in both cases a seal is a statement about a stream that does not
+            /// exist, i.e. an object built against a different table's history. Recovery's CAS-walk
+            /// enforces the identical gate on the minting side, so this is the read half of ONE rule
+            /// rather than a second one that can drift from it.
+            if (lifecycle != RefLifecycle::Live)
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "RefTableState: epoch_seal at {}-{} while the namespace is not Live -- a seal closes the "
+                    "epoch of a live stream, and this table has none",
+                    txn_id.writer_epoch, txn_id.ref_sequence);
+            return;
     }
     /// Reachable only through a hand-corrupted RefOpKind (mirrors CasRefLogCodec.cpp's
     /// exhaustive-switch-then-throw shape); every named enumerator returns above.
@@ -556,7 +564,6 @@ RefReplayBuilder::RefReplayBuilder(std::optional<RefTableSnapshot> base, uint64_
     if (base)
     {
         result.newest_snapshot_id = base->snapshot_id;
-        result.sealed_from = base->sealed_from;
         result.base_snapshot_bytes = base_encoded_bytes;
         expected_ns = base->ns;
         candidate = stateFromSnapshot(*base);   /// full snapshot revalidation, exactly as `replay`
@@ -595,11 +602,11 @@ RecoveryResult RefReplayBuilder::finish() &&
 
 uint64_t encodedSnapshotBudgetSize(const RefTableState & state)
 {
-    /// snapshotOf uses snapshot_id = state.greatest_applied, empty ns, sealed_from unset, and the
-    /// state's own lifecycle/remove_txn_id -- match that framing exactly, then add the running body sum.
+    /// snapshotOf uses snapshot_id = state.greatest_applied, empty ns, and the state's own
+    /// lifecycle/remove_txn_id -- match that framing exactly, then add the running body sum.
     const uint64_t rows = state.getCommitted().size() + state.getPrecommits().size();
     return snapshotFramingSize("", state.getGreatestApplied(), state.getLifecycle(),
-                               state.getRemoveTxnId(), /*sealed_from*/std::nullopt, rows)
+                               state.getRemoveTxnId(), rows)
         + state.getSnapshotBodyBytes();
 }
 
@@ -860,7 +867,7 @@ RecoveredRefTable recoverRefTableDetailed(Backend & backend, const Layout & layo
         }
 
         RecoveryResult result = std::move(builder).finish();
-        return RecoveredRefTable{std::move(result.state), result.newest_snapshot_id, result.sealed_from};
+        return RecoveredRefTable{std::move(result.state), result.newest_snapshot_id};
     }
 }
 

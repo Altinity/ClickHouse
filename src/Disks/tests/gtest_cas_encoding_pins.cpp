@@ -61,13 +61,12 @@ TEST(CasEncodingPins, RefLogTxnAllOpKinds)
     EXPECT_EQ(encodeRefLogTxn(txn), expected);
 }
 
-TEST(CasEncodingPins, RefSnapshotLiveWithSealedFrom)
+TEST(CasEncodingPins, RefSnapshotLive)
 {
     RefTableSnapshot snap;
     snap.ns = "roots/pin";
     snap.snapshot_id = RefTxnId{7, 9};
     snap.lifecycle = RefLifecycle::Live;
-    snap.sealed_from = RefTxnId{7, 8};
 
     RefCommittedRow row;
     row.ref_name = "20260101_0_1_1_1";
@@ -79,7 +78,7 @@ TEST(CasEncodingPins, RefSnapshotLiveWithSealedFrom)
 
     const String expected =
         "{\"type\":\"cas_ref_snap\",\"v\":4}\n"
-        "{\"ns\":\"roots/pin\",\"we\":\"7\",\"rs\":\"9\",\"lc\":\"live\",\"sfe\":\"7\",\"sfs\":\"8\"}\n"
+        "{\"ns\":\"roots/pin\",\"we\":\"7\",\"rs\":\"9\",\"lc\":\"live\"}\n"
         "{\"k\":\"c\",\"rn\":\"20260101_0_1_1_1\",\"me\":\"1\",\"mb\":\"2\",\"mo\":3,\"ts\":5}\n"
         "{\"k\":\"p\",\"rn\":\"20260102_0_2_2_2\",\"me\":\"4\",\"mb\":\"5\",\"mo\":6}\n"
         "{\"n\":2}\n";

@@ -269,28 +269,6 @@ TEST(CasObservability, CaInspectDecodesRefSnapshotToJson)
     EXPECT_NE(json.find("\"lifecycle\""), String::npos);
     EXPECT_NE(json.find("Live"), String::npos);
     EXPECT_NE(json.find("all_0_0_0"), String::npos);
-    EXPECT_NE(json.find("\"sealed_from\":null"), String::npos)
-        << "an ordinary (non-seal) snapshot must render sealed_from as null";
-}
-
-/// fix-round F10 (author-review): a recovery seal (rev.6 §recovery-seal) is otherwise
-/// indistinguishable from an ordinary snapshot in clickhouse-disks/inspect -- `sealed_from` must render
-/// when set, so an operator investigating a `RefLateLogDetected` event (whose detail cites this same
-/// field) can see the observation horizon it was measured against.
-TEST(CasObservability, CaInspectRendersSealedFromWhenSet)
-{
-    using DB::Cas::tests::minimalLiveSnapshot;
-    Layout layout("p");
-    const RootNamespace ns{"srv/tbl@cas@"};
-    const RefTxnId seal_id{2, std::numeric_limits<uint64_t>::max()};
-    RefTableSnapshot seal = minimalLiveSnapshot(ns.string(), seal_id);
-    seal.sealed_from = RefTxnId{2, 3};
-    const String key = layout.refSnapshotKey(ns, seal_id);
-    const String json = caInspectToJson(layout, key, encodeRefTableSnapshot(seal));
-    EXPECT_NE(json.find("ref_snapshot"), String::npos);
-    EXPECT_EQ(json.find("\"sealed_from\":null"), String::npos)
-        << "a seal's sealed_from must NOT render as null";
-    EXPECT_NE(json.find("\"sealed_from\""), String::npos);
 }
 
 /// ...and a `_log/<txn-id>` renders as a ref-transaction log.

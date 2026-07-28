@@ -59,7 +59,6 @@ namespace ProfileEvents
     extern const Event CasRefSnapshotTailLogs;
     extern const Event CasRefSnapshotPublishDispatched;
     extern const Event CasRefSnapshotPublishBackoff;
-    extern const Event CasRefRecoverySealPublished;
     extern const Event CasDedupCacheHits;
     extern const Event CasDedupCacheMisses;
 }
@@ -192,7 +191,6 @@ Pool::Pool(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
           [this] (uint64_t gen) { mount_runtime.checkFenceOrThrow(gen); },
           [this] { return bootMsNow(); },
           [this] { return mayMutate(); },
-          [this] { return mount_runtime.uncleanEpochBoundarySeenAtRelaxed(); },
           [this] (const String & key, const String & reason, const std::optional<String> & offending_ns)
               { reportImpossibleInterference(key, reason, offending_ns); },
           [this] { return std::static_pointer_cast<void>(shared_from_this()); },
@@ -1118,10 +1116,18 @@ bool Pool::tryRemountOnce()
         ///    accessors) equal to it.
         mount_runtime.setLiveWriterEpoch(writer_epoch);
         mount_runtime.setProcessEpoch(writer_epoch, std::memory_order_release);
-        /// 2. Drain publishers and drop the cached tables so each re-recovers under the new epoch on next
+        /// 2. CANCEL OR JOIN every in-flight ref-table recovery, and BLOCK here until none is left (spec
+        ///    §3: "self-remount cancels or waits out recovery before rearming"). A recovery admitted under
+        ///    the outgoing incarnation WRITES -- its seal CAS-walk mints epoch seals and advances the
+        ///    `_ckpt` -- so it must be stopped at this boundary rather than caught one site at a time
+        ///    after the incarnation has already changed underneath it. Strictly before the quiesce below
+        ///    so a cancelled walk unwinds while its runtime is still attached, and strictly before the
+        ///    re-arm so no old-generation write can straddle it.
+        ref_ledger.cancelRecoveriesAndAwaitQuiescence();
+        /// 3. Drain publishers and drop the cached tables so each re-recovers under the new epoch on next
         ///    touch (and any leader still holding an orphaned runtime fails closed). While the fence is lost.
         ref_ledger.quiesceRefTablesForRemount();
-        /// 3. Re-open the gate. Anchored at the claim attempt's pre-I/O instant (`remount_anchor_boot_ms`),
+        /// 4. Re-open the gate. Anchored at the claim attempt's pre-I/O instant (`remount_anchor_boot_ms`),
         ///    never at response time -- see the comment above `keeperStart()`. From here appends allocate
         ///    ids under the new epoch and touch fresh runtimes.
         mount_runtime.armMountFence(our_uuid, writer_epoch, remount_anchor_boot_ms + ttl_ms);
@@ -1644,9 +1650,19 @@ std::optional<RefTxnId> Pool::newestPublishedSnapshotIdForTest(const RootNamespa
     return ref_ledger.newestPublishedSnapshotIdForTest(ns);
 }
 
-std::optional<RefTxnId> Pool::sealedFromForTest(const RootNamespace & ns)
+bool Pool::refTableRecoveredForTest(const RootNamespace & ns)
 {
-    return ref_ledger.sealedFromForTest(ns);
+    return ref_ledger.refTableRecoveredForTest(ns);
+}
+
+bool Pool::refRecoveryCancelRequestedForTest(const RootNamespace & ns)
+{
+    return ref_ledger.refRecoveryCancelRequestedForTest(ns);
+}
+
+void Pool::cancelRefRecoveriesAndAwaitQuiescence()
+{
+    ref_ledger.cancelRecoveriesAndAwaitQuiescence();
 }
 
 size_t Pool::tailSinceSnapshotCountForTest(const RootNamespace & ns)

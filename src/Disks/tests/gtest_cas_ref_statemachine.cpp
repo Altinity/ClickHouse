@@ -1298,7 +1298,7 @@ TEST(CasRefSnapshotSizeHelpers, FramingPlusRowsEqualsFullEncode)
     const size_t full = encodeRefTableSnapshot(snap).size();
 
     size_t rebuilt = snapshotFramingSize("", snap.snapshot_id, snap.lifecycle,
-                                         snap.remove_txn_id, snap.sealed_from,
+                                         snap.remove_txn_id,
                                          snap.committed.size() + snap.precommits.size());
     for (const RefCommittedRow & row : snap.committed)
         rebuilt += committedRowEncodedSize(row);

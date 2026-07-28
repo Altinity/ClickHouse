@@ -42,11 +42,14 @@ enum class ResolveAudit : uint8_t { Emit, Deferred };
 ///                     installed (or once it is PROVEN that nothing became durable). It is also the
 ///                     steady state of a wedged lane, which is exactly "may be durable, not applied";
 ///   `Poisoned`     -- an install failed although its object may already be durable, i.e. the cached
-///                     state can be MISSING a durable transaction. TERMINAL for the runtime: no later
-///                     flush clears it, only a fresh recovery (which means a REPLACED runtime -- a
-///                     runtime is never re-recovered in place). Enforced by construction: every
-///                     transition out of it would have to be a `Clean`/`ApplyPending` CAS whose
-///                     expected value is not `Poisoned`, and there is no plain store anywhere.
+///                     state can be MISSING a durable transaction. Terminal for the STATE it describes:
+///                     no flush clears it, because no flush can supply a transaction this runtime never
+///                     saw. Exactly ONE thing clears it, and only by making the reading false --
+///                     `installRecoveryResult`, publishing a state RE-DERIVED from the durable log,
+///                     which is why a poisoned table re-recovers on its next touch
+///                     (`ensureRefTableRecovered`). Every other transition out of it would have to be a
+///                     `Clean`/`ApplyPending` CAS whose expected value is not `Poisoned`, and there is
+///                     no plain store anywhere else.
 ///
 /// It is deliberately an ASSERT LAYER, NOT an operational fence: nothing refuses work because a table
 /// is `Poisoned`. Safety rests on §A1. Turning this into a fence (the spec's "ordering caveat") would
@@ -111,7 +114,6 @@ public:
         std::function<void(uint64_t)> check_fence_or_throw_,
         std::function<uint64_t()> boot_ms_now_fn_,
         std::function<bool()> may_mutate_,
-        std::function<uint64_t()> unclean_boundary_epoch_,
         std::function<void(const String &, const String &, const std::optional<String> &)> on_impossible_interference_,
         std::function<std::shared_ptr<void>()> pin_owner_,
         std::function<void(const RootNamespace &)> cancel_inflight_builds_);
@@ -199,6 +201,24 @@ public:
     /// discard runtimes; `quiesceRefTablesForRemount` performs that state transition.
     bool refLanesSettledForRemount();
 
+    /// The self-remount's CANCEL-OR-JOIN barrier over in-flight recoveries (spec §3: "self-remount
+    /// cancels or waits out recovery before rearming"). Requests cancellation on every cached table,
+    /// then WAITS until no recovery attempt is in flight anywhere, then clears the request. Returns only
+    /// once that is true, so the caller may re-arm the mount fence knowing no recovery straddles it.
+    ///
+    /// Why this exists on top of the install recheck: the recheck protects the INSTALL, the barrier
+    /// protects the WINDOW. A recovery admitted under the outgoing incarnation would otherwise keep
+    /// issuing writes (its seal CAS-walk WRITES) across the whole re-arm, and each one would have to be
+    /// caught individually at its own site; here it is stopped once, at the boundary, before the
+    /// incarnation changes underneath it.
+    ///
+    /// The narrow window it does NOT close -- a recovery that starts after this returns and before the
+    /// fence is re-armed -- is closed by the other two members of the same guard: the re-arm bumps the
+    /// generation, so that recovery's `_ckpt` CAS and its install both refuse; and
+    /// `quiesceRefTablesForRemount` (which the caller runs next, BEFORE the re-arm) publishes
+    /// `superseded_by_remount`, which the walk polls at every I/O boundary.
+    void cancelRecoveriesAndAwaitQuiescence();
+
     /// Closes admission, snapshots the current table set, and waits up to `wait_budget_ms` for queued
     /// mutations and leaders to finish. The check and enqueue paths share `ref_queue_mutex`, so no new
     /// mutation can appear after shutdown has taken its snapshot.
@@ -267,9 +287,15 @@ public:
     int pendingSnapshotPublishesForTest(const RootNamespace & ns);
     /// Returns the newest snapshot id adopted by the cached runtime, if any.
     std::optional<RefTxnId> newestPublishedSnapshotIdForTest(const RootNamespace & ns);
-    /// Returns the `sealed_from` installed alongside `newestPublishedSnapshotIdForTest`: the seal's
-    /// observed-region upper bound when the newest snapshot is a recovery seal, else `nullopt`.
-    std::optional<RefTxnId> sealedFromForTest(const RootNamespace & ns);
+    /// Whether `ns` currently has a RECOVERED cached runtime -- WITHOUT forcing a recovery, unlike every
+    /// other seam here. That is the whole point: the fail-closed tests assert that a refused recovery
+    /// installed nothing, and a seam that recovered on demand would answer its own question.
+    bool refTableRecoveredForTest(const RootNamespace & ns);
+    /// Whether the self-remount barrier has PUBLISHED its cancellation request for `ns` (also without
+    /// forcing a recovery). The barrier-blocks test needs this as a handshake: it must not release the
+    /// parked recovery until the request is actually visible to it, or the recovery races past a flag
+    /// that was set a moment too late and the test observes a completion instead of a cancellation.
+    bool refRecoveryCancelRequestedForTest(const RootNamespace & ns);
     /// Returns the number of applied transactions newer than the adopted snapshot.
     size_t tailSinceSnapshotCountForTest(const RootNamespace & ns);
     /// Returns the number of committed entries in the mutable overlay, when the COW representation has one.
@@ -394,7 +420,6 @@ private:
     std::function<void(uint64_t)> check_fence_or_throw;
     std::function<uint64_t()> boot_ms_now_fn;
     std::function<bool()> may_mutate;
-    std::function<uint64_t()> unclean_boundary_epoch;
     std::function<void(const String &, const String &, const std::optional<String> &)> on_impossible_interference;
     std::function<std::shared_ptr<void>()> pin_owner;
     std::function<void(const RootNamespace &)> cancel_inflight_builds;
@@ -457,6 +482,17 @@ private:
         /// Both this flag and the condition variable are guarded by `state_mutex`.
         bool recovery_in_progress = false;
         std::condition_variable recovery_cv;
+        /// The self-remount cancellation request (spec §3: "self-remount cancels or waits out recovery
+        /// before rearming"). Set by `cancelRecoveriesAndAwaitQuiescence` from the remount thread and
+        /// polled by the recovery walk at EVERY I/O boundary; a recovery that observes it abandons its
+        /// attempt having written nothing and installed nothing.
+        ///
+        /// ATOMIC, not `state_mutex`-guarded like its two neighbours, and that is the point: the
+        /// canceller must be able to publish the request WITHOUT queueing behind the very recovery it is
+        /// trying to stop. The condition variable is still the acknowledgment channel -- the canceller
+        /// waits for `recovery_in_progress` to fall under the mutex -- so the request is lock-free and
+        /// only the JOIN takes the lock.
+        std::atomic<bool> recovery_cancel_requested{false};
         /// Test-only count of callers currently waiting for recovery; guarded by `state_mutex` so tests
         /// can observe that a concurrent caller reached the wait without depending on scheduling.
         uint64_t recovery_waiters_for_test = 0;
@@ -509,14 +545,6 @@ private:
         std::atomic<uint64_t> tail_count_since_snapshot{0};
         std::atomic<uint64_t> tail_bytes_since_snapshot{0};
         std::optional<RefTxnId> newest_snapshot_id;
-        /// The `sealed_from` of the snapshot at `newest_snapshot_id`, when that snapshot is a recovery
-        /// seal: the upper bound of what that recovery's LIST actually observed (`nullopt` for an
-        /// ordinary snapshot or a never-published table). Installed here so the recovered runtime carries
-        /// the COMPLETE `RecoveryResult` inventory rather than dropping one field (the drift-proof
-        /// publication invariant, Codex round 4 §5). The GC orphan sweep obtains `sealed_from`
-        /// independently via its own `recoverRefTableDetailed`, so this copy has no hot-read consumer in
-        /// the ledger today; it is kept for inventory completeness and introspection.
-        std::optional<RefTxnId> sealed_from;
         /// Whole-table cache-weight bookkeeping for `enforceRefTableCacheBudget`.
         /// `base_snapshot_bytes` is the encoded body size of the snapshot
         /// at `newest_snapshot_id` (0 for a never-published table), captured for free from the
@@ -574,6 +602,13 @@ private:
     /// A failed recovery-seal `PUT` is separate: it leaves `recovered` false and the next touch starts
     /// a fresh LIST/replay/seal attempt rather than resuming this bounded vanish-retry loop.
     static constexpr size_t kRefRecoveryMaxRestarts = 3;
+    /// How many times the CAS-walk may lose the SAME dead epoch's seal slot to a straggler before it
+    /// fails closed. Not an arbitrary round number: INV-1's every-attempt rule permits AT MOST ONE
+    /// in-flight conditional create per (table, writer), and there is one writer per mount, so an honest
+    /// run needs ONE retry. The margin covers a dying writer whose lane held several attempts across
+    /// distinct incarnations; anything beyond it is a store that keeps materializing objects underneath
+    /// a walk, which is a fact to report, never one to keep looping on.
+    static constexpr size_t kRefRecoveryMaxSlotAttemptsPerEpoch = 64;
     /// Fixed safety margin subtracted (alongside the per-table `4 + ns.size()` overhead) from
     /// the raw `ref_snapshot_max_bytes`/`ref_removal_max_bytes` hard limits before calling `admits`.
     static constexpr uint64_t kRefAdmissionSafetyMargin = 4096;
@@ -662,10 +697,40 @@ private:
     /// Returns the cached runtime for `ns`, creating an empty unrecovered runtime when needed.
     std::shared_ptr<RefTableRuntime> getRefTableRuntime(const RootNamespace & ns);
 
-    /// Lazily recovers `ns` by listing and replaying its snapshot/log objects. It does not expose the
-    /// table as recovered until any required recovery seal is durable; concurrent callers serialize
-    /// across the unlocked seal I/O through `recovery_in_progress`.
+    /// Lazily recovers `ns` per spec §4: `_ckpt` -> exact-key base snapshot -> ARITHMETIC tail -> seal
+    /// CAS-walk -> `_ckpt` CAS -> install. It does not expose the table as recovered until every dead
+    /// epoch it discovered is durably closed; concurrent callers serialize across the whole unlocked I/O
+    /// window through `recovery_in_progress`.
     void ensureRefTableRecovered(const RootNamespace & ns, RefTableRuntime & rt);
+
+    /// What ONE recovery attempt produced: the replayed candidate plus the chain link the walk ended on.
+    struct RecoveryWalk
+    {
+        RecoveryResult result;
+        /// The seal that closed the last epoch below the live one -- minted, adopted from a concurrent
+        /// recoverer, or read out of the durable tail. `nullopt` means GENESIS and means it exactly.
+        std::optional<RefTxnId> last_epoch_seal;
+    };
+
+    /// ONE attempt of the recovery walk, run with NO lock held (the candidate is private; nothing
+    /// touches `rt` until the install). `nullopt` REQUESTS A RESTART from a fresh listing -- the two
+    /// innocent explanations, a base that vanished under a checkpoint that moved and a hole a racing
+    /// cleanup could account for. Everything terminal throws.
+    ///
+    /// `admitted_generation` is the ONE fence generation this whole recovery was admitted under: the
+    /// walk presents it to every `slotOccupy` and to the `_ckpt` CAS, and the caller presents the same
+    /// value once more immediately before installing.
+    std::optional<RecoveryWalk> runRecoveryWalkOnce(
+        const RootNamespace & ns, RefTableRuntime & rt, uint64_t admitted_generation, uint64_t live_epoch,
+        std::optional<String> & hole_detail);
+
+    /// The I/O-boundary poll of the walk: is this recovery still entitled to continue? Three independent
+    /// facts, each of which alone disqualifies it -- a self-remount asked it to stop, a self-remount
+    /// already detached its runtime, or the mount incarnation that admitted it has moved. Throws;
+    /// cancellation raises the retry-later class and latches so the caller's transient loop does not
+    /// re-drive it.
+    void checkRecoveryStillAdmitted(const RootNamespace & ns, RefTableRuntime & rt,
+                                    uint64_t admitted_generation, bool & cancelled) const;
 
     /// Publishes a completed streaming recovery into the runtime in one atomic step: copies EVERY field
     /// `RecoveryResult` carries into `rt` and sets `recovered` LAST, so a waiter woken after this returns

@@ -294,11 +294,6 @@ public:
     /// predecessor. This relaxed per-epoch high-water mark is compared for exact equality by the ref-table
     /// recovery seal gate; zero means no such boundary has been observed.
     void setUncleanEpochBoundarySeenAt(uint64_t v);
-    uint64_t uncleanEpochBoundarySeenAtRelaxed() const
-    {
-        return unclean_epoch_boundary_seen_at.load(std::memory_order_relaxed);
-    }
-
     /// Return whether any writable claim or self-remount in this runtime's lifetime crossed an unclean
     /// predecessor boundary. This sticky diagnostic is intentionally coarser than the per-epoch value
     /// used by the seal-gating decision.

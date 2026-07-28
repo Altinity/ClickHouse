@@ -182,11 +182,6 @@ String renderRefTableSnapshot(const RefTableSnapshot & s)
         .add("snapshot_id", renderRefTxnIdObj(s.snapshot_id))
         .add("lifecycle", jsonEscape(refLifecycleName(s.lifecycle)))
         .add("remove_txn_id", s.remove_txn_id ? renderRefTxnIdObj(*s.remove_txn_id) : "null")
-        /// A recovery seal records the greatest transaction id observed by the recovery `LIST`.
-        /// This value is the lower boundary for identifying a log that materialized after that
-        /// `LIST` but is covered by the seal; it is also needed by `RefLateLogDetected` diagnostics.
-        /// Ordinary snapshots do not establish such an observation boundary and therefore use `null`.
-        .add("sealed_from", s.sealed_from ? renderRefTxnIdObj(*s.sealed_from) : "null")
         .add("committed", jsonArray(committed))
         .add("precommits", jsonArray(precommits))
         .str();

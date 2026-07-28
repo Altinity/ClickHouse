@@ -66,7 +66,11 @@ namespace ProfileEvents
     extern const Event CasRefCkptPublished;
     extern const Event CasRefCkptIdenticalSkip;
     extern const Event CasRefCkptNotAdvanced;
-    extern const Event CasRefRecoverySealPublished;
+    extern const Event CasRefRecoveryEpochSealed;
+    extern const Event CasRefRecoveryEpochSealAdopted;
+    extern const Event CasRefRecoveryStragglerAdopted;
+    extern const Event CasRefRecoveryCancelled;
+    extern const Event CasRefRecoveryStreamHole;
 }
 
 namespace DB::Cas
@@ -114,6 +118,29 @@ enum class Occupant : uint8_t
 /// normalises every malformed-input class to `CORRUPTED_DATA` and passes `UNKNOWN_FORMAT_VERSION`
 /// through (an object this build cannot read is still not a seal it can consume). Everything else
 /// propagates, leaving the caller's lane exactly as it was.
+/// The epoch-closing transaction INV-2 places at `{E, T+1}`: exactly one `EpochSeal` op, no table
+/// content, and the chain link on -- and only on -- sequence 1, where the grammar requires it.
+///
+/// The seal carries nothing about the table because its entire effect is POSITIONAL: it occupies the
+/// one key a dying predecessor's in-flight PUT would have taken, so the store's write-once create is
+/// what fences the ghost, rather than a detector noticing it afterwards.
+RefLogTxn makeEpochSealTxn(const RootNamespace & ns, const RefTxnId & id, const std::optional<RefTxnId> & prev_epoch_seal)
+{
+    RefLogTxn seal;
+    seal.ns = ns.string();
+    seal.txn_id = id;
+    RefOp op;
+    op.kind = RefOpKind::EpochSeal;
+    seal.ops.push_back(op);
+    /// Required IFF this is sequence 1 of a non-genesis epoch. The walk never mints a sequence-1 seal
+    /// in a namespace's own genesis epoch -- its first dead epoch always already holds the birth
+    /// transaction, so its seal sits at sequence >= 2 -- which is why "sequence 1 => chain it" is the
+    /// complete rule here and needs no `life_epoch` of its own.
+    if (id.ref_sequence == 1)
+        seal.prev_epoch_seal = prev_epoch_seal;
+    return seal;
+}
+
 Occupant classifyRefLogOccupant(const RootNamespace & ns, const RefTxnId & id, const String & occupant_bytes,
                                 const String & expected_bytes)
 {
@@ -146,7 +173,6 @@ CasRefLedger::CasRefLedger(
     std::function<void(uint64_t)> check_fence_or_throw_,
     std::function<uint64_t()> boot_ms_now_fn_,
     std::function<bool()> may_mutate_,
-    std::function<uint64_t()> unclean_boundary_epoch_,
     std::function<void(const String &, const String &, const std::optional<String> &)> on_impossible_interference_,
     std::function<std::shared_ptr<void>()> pin_owner_,
     std::function<void(const RootNamespace &)> cancel_inflight_builds_)
@@ -161,7 +187,6 @@ CasRefLedger::CasRefLedger(
     , check_fence_or_throw(std::move(check_fence_or_throw_))
     , boot_ms_now_fn(std::move(boot_ms_now_fn_))
     , may_mutate(std::move(may_mutate_))
-    , unclean_boundary_epoch(std::move(unclean_boundary_epoch_))
     , on_impossible_interference(std::move(on_impossible_interference_))
     , pin_owner(std::move(pin_owner_))
     , cancel_inflight_builds(std::move(cancel_inflight_builds_))
@@ -446,278 +471,557 @@ std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::getRefTableRuntime(
     return slot;
 }
 
+void CasRefLedger::checkRecoveryStillAdmitted(const RootNamespace & ns, RefTableRuntime & rt,
+                                              uint64_t admitted_generation, bool & cancelled) const
+{
+    /// Polled at EVERY I/O boundary of the walk, because every one of them is a point at which this
+    /// recovery may already have lost the right to continue -- and the walk WRITES, so "continue" is not
+    /// a read-only proposition.
+    ///
+    /// Cancellation is checked FIRST and reported as its own outcome: a self-remount asking recovery to
+    /// stop is an orderly hand-off, not a failure of the store, and the caller must not re-drive it
+    /// through the transient-retry loop the way it would an S3 blip.
+    if (rt.recovery_cancel_requested.load(std::memory_order_acquire))
+    {
+        cancelled = true;
+        ProfileEvents::increment(ProfileEvents::CasRefRecoveryCancelled);
+        throwCasWriteRetryLater(fmt::format(
+            "CAS ref-table recovery for namespace '{}' was cancelled by a self-remount before the mount "
+            "fence was re-armed; nothing was written and nothing installed — the next touch recovers under "
+            "the fresh incarnation", ns.string()));
+    }
+
+    /// The remount's OTHER publication, ordered before the fence re-arm: this runtime is detached, so
+    /// whatever it recovers belongs to a dead incarnation's cache. Checked separately from the
+    /// generation because the two are independent facts, exactly as `resolveWedgeOnce` checks them.
+    if (rt.superseded_by_remount.load(std::memory_order_acquire))
+        throwCasWriteRetryLater(fmt::format(
+            "CAS ref-table recovery for namespace '{}': this cached table was superseded by a self-remount "
+            "mid-recovery — retry against the fresh mount incarnation", ns.string()));
+
+    /// The generation this recovery was admitted under, presented back. Throws `INVALID_STATE`, which is
+    /// deliberately NOT in `isTransientRecoveryError`: a moved incarnation can never be recovered from by
+    /// retrying under the SAME captured generation, so burning the retry budget on it would be a lie.
+    check_fence_or_throw(admitted_generation);
+}
+
+std::optional<CasRefLedger::RecoveryWalk> CasRefLedger::runRecoveryWalkOnce(
+    const RootNamespace & ns, RefTableRuntime & rt, uint64_t admitted_generation, uint64_t live_epoch,
+    std::optional<String> & hole_detail)
+{
+    /// Spec §4, one attempt. Runs with NO lock held: everything below is either read-only I/O or a
+    /// conditional create at a key this namespace owns, and the replayed candidate is PRIVATE until the
+    /// caller installs it. `recovery_in_progress` (not `state_mutex`) is what keeps a second caller for
+    /// this same table from racing an independent walk -- see its doc comment.
+    bool cancelled = false;
+
+    /// ---- Step 2: the checkpoint ----
+    /// `nullopt` means the namespace has published nothing yet (a birth whose `_ckpt` create did not
+    /// land, or a table seeded outside the append lane). It is not an error; it costs the walk its
+    /// LIST-independent grounding, and the grounding rule below says exactly what it falls back to.
+    const std::optional<CkptSample> sampled_ckpt = readCkpt(backend, layout, ns);
+    checkRecoveryStillAdmitted(ns, rt, admitted_generation, cancelled);
+
+    /// ---- Step 3: ONE hint LIST ----
+    /// A HINT, and nothing more. It seeds the base-snapshot candidate, supplies the `_cleanup` markers
+    /// (which have no arithmetic derivation at all), and offers witnesses for the hole check below. Its
+    /// COMPLETENESS is never assumed: every id the walk cares about is fetched by exact key, so an
+    /// omission costs one `GET` and changes no outcome.
+    std::optional<RefTxnId> greatest_listed_snapshot;
+    std::vector<RefTxnId> hint_log_ids;
+    std::set<RefTxnId> cleanup_markers;
+    {
+        const String prefix = layout.refsNamespacePrefix(ns);
+        String cursor;
+        for (;;)
+        {
+            const ListPage page = backend.list(prefix, cursor, /*limit=*/1000);
+            for (const ListedKey & lk : page.keys)
+            {
+                const auto parsed = layout.parseRefObjectKey(lk.key);
+                if (!parsed)
+                    continue;   /// not a ref-object key (the namespace's own `_ckpt`, for one)
+                /// Trust the parsed `ns` only when it names EXACTLY this namespace -- the same
+                /// checkNamespace-level guarantee the key builders enforce, not position math (the scoped
+                /// LIST prefix already implies this in practice, but a listed key is untrusted input and
+                /// is treated as such).
+                if (parsed->ns != ns)
+                    continue;
+                switch (parsed->kind)
+                {
+                    case RefObjectKind::Cleanup:
+                        cleanup_markers.insert(parsed->txn_id);
+                        break;
+                    case RefObjectKind::Log:
+                        hint_log_ids.push_back(parsed->txn_id);
+                        break;
+                    case RefObjectKind::Snap:
+                        if (!greatest_listed_snapshot || *greatest_listed_snapshot < parsed->txn_id)
+                            greatest_listed_snapshot = parsed->txn_id;
+                        break;
+                }
+            }
+            if (page.next_cursor.empty())
+                break;
+            cursor = page.next_cursor;
+        }
+        std::sort(hint_log_ids.begin(), hint_log_ids.end());
+    }
+    checkRecoveryStillAdmitted(ns, rt, admitted_generation, cancelled);
+
+    /// ---- Step 4: the base, by EXACT KEY ----
+    /// The greater of what the hint offered and what the checkpoint names. The checkpoint is what makes
+    /// this robust against a cleaned prefix: `_ckpt.checkpoint` names a snapshot that is, by INV-4's
+    /// deletion gate, NOT deletable, so it can always be fetched even when no listing mentions it.
+    std::optional<RefTxnId> base_id = greatest_listed_snapshot;
+    if (sampled_ckpt && sampled_ckpt->ckpt.checkpoint_snapshot_id
+        && (!base_id || *base_id < *sampled_ckpt->ckpt.checkpoint_snapshot_id))
+        base_id = sampled_ckpt->ckpt.checkpoint_snapshot_id;
+
+    std::optional<RefTableSnapshot> base_snapshot;
+    uint64_t base_snapshot_bytes = 0;
+    if (base_id)
+    {
+        const auto got = backend.get(layout.refSnapshotKey(ns, *base_id));
+        if (!got)
+        {
+            /// INV-4's three-way revalidation, consumed from `CasRefCkpt` rather than re-derived: the
+            /// same rule at every call site is the point of the helper existing.
+            if (!sampled_ckpt)
+                return std::nullopt;   /// no checkpoint to adjudicate against: the plain vanish restart
+
+            const std::optional<CkptSample> current = readCkpt(backend, layout, ns);
+            if (classifyMissingSampledBase(sampled_ckpt->token,
+                                           current ? std::optional<Token>(current->token) : std::nullopt)
+                == MissingBaseVerdict::RestartRecovery)
+                return std::nullopt;   /// the checkpoint advanced under us; restart from the newer base
+
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS ref-table recovery for namespace '{}': the base snapshot {}-{} is absent while the "
+                "checkpoint that names it is unchanged. A snapshot is deletable only STRICTLY BELOW the "
+                "checkpoint, so this one could not have been cleaned — a live base was deleted",
+                ns.string(), base_id->writer_epoch, base_id->ref_sequence);
+        }
+        base_snapshot = decodeRefTableSnapshot(openObject(FormatId::RefSnapshot, got->bytes), ns.string(), *base_id);
+        base_snapshot_bytes = got->bytes.size();
+    }
+    checkRecoveryStillAdmitted(ns, rt, admitted_generation, cancelled);
+
+    /// ---- The walk's starting position ----
+    /// With a base, arithmetic is exact: the stream continues at the base id's successor. Without one,
+    /// the stream begins at the namespace's BIRTH, and the walk has to be told where that is -- which is
+    /// the one question no amount of arithmetic answers.
+    ///
+    ///   1. `_ckpt.life_epoch` is the authoritative, listing-independent answer, and every namespace
+    ///      born through the append lane has it (the birth creates its `_ckpt` before the durable PUT).
+    ///   2. Failing that, the hint's SMALLEST log id. This is the one place the listing is load-bearing,
+    ///      and it is self-checking rather than trusted: starting above the true first id makes the very
+    ///      first apply non-contiguous (`{E,2}` on an empty state) or illegal (a non-birth op on a
+    ///      never-born table), both of which are `CORRUPTED_DATA`, not a quietly shorter table.
+    ///   3. Neither, and no listed log: the namespace is never-born, and the empty state IS the answer.
+    ///
+    /// Deliberately NOT `life_epoch.value_or(...)`: a fabricated `life_epoch` of 0 or 1 would make every
+    /// sequence-1 transaction require a `prev_epoch_seal` and would reject a genesis birth outright.
+    std::optional<RefTxnId> walk_from;
+    if (base_id)
+        walk_from = RefTxnId{base_id->writer_epoch, base_id->ref_sequence + 1};
+    else if (sampled_ckpt && sampled_ckpt->ckpt.life_epoch)
+        walk_from = RefTxnId{*sampled_ckpt->ckpt.life_epoch, 1};
+    else if (!hint_log_ids.empty())
+        walk_from = RefTxnId{hint_log_ids.front().writer_epoch, 1};
+
+    RefReplayBuilder builder(std::move(base_snapshot), base_snapshot_bytes);
+
+    /// The chain link, threaded through the whole walk: the greatest seal this recovery has SEEN,
+    /// whether it read it out of the durable tail, adopted it from a concurrent recoverer, or minted it.
+    /// It is what a sequence-1 seal must name, and what the table's next sequence-1 append must name.
+    std::optional<RefTxnId> last_epoch_seal;
+
+    /// The greatest id in `epoch` that the hint claims exists above `above_sequence`, if any -- a
+    /// CANDIDATE witness for the hole check, never a verdict: the caller confirms it by exact `GET`,
+    /// because a listing that can omit a key can equally well name one that is gone.
+    const auto witness_candidate = [&](uint64_t epoch, uint64_t above_sequence) -> std::optional<RefTxnId>
+    {
+        std::optional<RefTxnId> best;
+        for (const RefTxnId & id : hint_log_ids)
+            if (id.writer_epoch == epoch && id.ref_sequence > above_sequence && (!best || *best < id))
+                best = id;
+        /// `_ckpt.last_epoch_seal` is a second, hint-INDEPENDENT witness, free because the checkpoint is
+        /// already read: a namespace whose checkpoint records a seal at `{E, S}` had a durable object
+        /// there, and a hole below it is a hole regardless of what any listing says.
+        if (sampled_ckpt && sampled_ckpt->ckpt.last_epoch_seal
+            && sampled_ckpt->ckpt.last_epoch_seal->writer_epoch == epoch
+            && sampled_ckpt->ckpt.last_epoch_seal->ref_sequence > above_sequence
+            && (!best || *best < *sampled_ckpt->ckpt.last_epoch_seal))
+            best = sampled_ckpt->ckpt.last_epoch_seal;
+        return best;
+    };
+
+    /// Applies one decoded transaction to the private candidate, accounting its resident footprint to
+    /// the streaming-recovery memory probe for exactly the span it is held (no-op in production).
+    const auto apply_one = [&](RefLogTxn && txn, uint64_t encoded_bytes)
+    {
+        const int64_t footprint = static_cast<int64_t>(decodedRefLogTxnFootprint(txn));
+        reportReplayMemoryDelta(footprint);
+        SCOPE_EXIT({ reportReplayMemoryDelta(-footprint); });
+        if (refLogTxnIsEpochSeal(txn))
+            last_epoch_seal = txn.txn_id;
+        builder.applyOne(std::move(txn), encoded_bytes);
+    };
+
+    /// ---- Steps 5 and 6: the arithmetic tail and the seal CAS-walk, as ONE loop ----
+    /// They are the same walk seen from two sides. Reading `{E, S}` and finding it present is the tail;
+    /// finding it ABSENT is a decision point: the live epoch's stream simply ends there, while a DEAD
+    /// epoch's must be closed at that exact slot before this table may be trusted. Writing them as one
+    /// loop is not brevity -- it is what makes "the seal goes where the ghost's PUT would have gone"
+    /// true by construction rather than by two functions agreeing on an index.
+    if (walk_from)
+    {
+        uint64_t epoch = walk_from->writer_epoch;
+        uint64_t sequence = walk_from->ref_sequence;
+        size_t slot_attempts_this_epoch = 0;
+
+        for (;;)
+        {
+            checkRecoveryStillAdmitted(ns, rt, admitted_generation, cancelled);
+            const RefTxnId id{epoch, sequence};
+
+            if (const auto got = backend.get(layout.refLogKey(ns, id)))
+            {
+                RefLogTxn txn = decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), id);
+                const bool is_seal = refLogTxnIsEpochSeal(txn);
+                apply_one(std::move(txn), got->bytes.size());
+                if (is_seal)
+                {
+                    /// This epoch is closed. Its stream cannot continue, so the next durable id of this
+                    /// namespace is sequence 1 of the next epoch -- including when that epoch is at or
+                    /// above our own live one, which is what a mount deposed by a higher-epoch successor
+                    /// sees. Reading on is honest (the transactions ARE this namespace's) and harmless:
+                    /// our own appends then collide with the seal and are conclusively rejected, which is
+                    /// exactly how INV-2 tells a deposed writer it has been deposed.
+                    ++epoch;
+                    sequence = 1;
+                    slot_attempts_this_epoch = 0;
+                }
+                else
+                    ++sequence;
+                continue;
+            }
+
+            /// ---- Absent. Hole, end of the live stream, or a dead epoch to close ----
+            if (const std::optional<RefTxnId> witness = witness_candidate(epoch, sequence))
+            {
+                if (backend.get(layout.refLogKey(ns, *witness)))
+                {
+                    /// A 404 BELOW a CONFIRMED durable same-epoch id. Ids are dense `1..T` within
+                    /// `(namespace, epoch)` (INV-1), so this is not the end of anything -- it is a hole,
+                    /// and folding what we have would silently drop every transaction above it. Restart
+                    /// once (a cleanup racing our read is the innocent explanation the restart budget
+                    /// exists for); the caller turns an exhausted budget into `CORRUPTED_DATA`.
+                    ProfileEvents::increment(ProfileEvents::CasRefRecoveryStreamHole);
+                    hole_detail = fmt::format(
+                        "id {}-{} is absent while {}-{} in the same epoch is durable — the ref-log stream is "
+                        "dense by construction (INV-1), so this is a hole, not the end of the stream",
+                        id.writer_epoch, id.ref_sequence, witness->writer_epoch, witness->ref_sequence);
+                    return std::nullopt;
+                }
+            }
+
+            if (epoch >= live_epoch)
+                break;   /// the LIVE epoch's stream ends here: this is where the next append goes
+
+            /// A DEAD epoch, unclosed. Everything that can throw is prepared BEFORE the conditional
+            /// create, so a failure here happens while the slot is provably untouched.
+            if (++slot_attempts_this_epoch > kRefRecoveryMaxSlotAttemptsPerEpoch)
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "CAS ref-table recovery for namespace '{}': the seal slot of dead epoch {} was taken by a "
+                    "straggler {} times running. INV-1 permits at most one in-flight append per table per "
+                    "writer, so a store that keeps materializing objects underneath this walk is not a race "
+                    "this recovery may keep chasing",
+                    ns.string(), epoch, slot_attempts_this_epoch - 1);
+
+            const RefLogTxn seal_txn = makeEpochSealTxn(ns, id, last_epoch_seal);
+            /// The CONTEXTUAL half of the seal grammar, checked only when this recovery actually LEARNED
+            /// the namespace's `life_epoch`. There is no `value_or` here on purpose (task 5's interface
+            /// note): a substituted 0 would demand a `prev_epoch_seal` on every sequence-1 transaction
+            /// and reject a genesis birth. Unknown `life_epoch` therefore means the structural grammar
+            /// alone -- which `encodeRefLogTxn` enforces unconditionally on the very next line -- and the
+            /// walk's own construction rule, which is provably equivalent here (see `makeEpochSealTxn`).
+            if (sampled_ckpt && sampled_ckpt->ckpt.life_epoch)
+                validateEpochSealGrammarContextual(seal_txn, *sampled_ckpt->ckpt.life_epoch);
+            const String seal_bytes = sealObject(FormatId::RefLog, encodeRefLogTxn(seal_txn));
+
+            /// Presented on EVERY attempt: the generation this recovery was admitted under, never the
+            /// current one. A seal written by an incarnation that no longer owns the namespace is a write
+            /// from a dead mount, and refusing pre-attempt leaves the slot provably untouched.
+            const auto admitted_fence_ok = [this, &rt, admitted_generation]
+            {
+                return fence_ok_fn()
+                    && !rt.superseded_by_remount.load(std::memory_order_acquire)
+                    && fence_generation_fn() == admitted_generation;
+            };
+
+            const SlotOccupyResult occupied =
+                ref_request_controller->slotOccupy(layout.refLogKey(ns, id), seal_bytes, admitted_fence_ok);
+
+            switch (occupied.kind)
+            {
+                case SlotOccupyResult::Kind::Created:
+                {
+                    /// The epoch is ours to close and now IS closed. Apply our own seal to the candidate:
+                    /// it is a durable transaction of this stream like any other, and the next recovery
+                    /// will read it back exactly where we put it.
+                    RefLogTxn applied = seal_txn;
+                    apply_one(std::move(applied), seal_bytes.size());
+                    ProfileEvents::increment(ProfileEvents::CasRefRecoveryEpochSealed);
+                    ++epoch;
+                    sequence = 1;
+                    slot_attempts_this_epoch = 0;
+                    break;
+                }
+                case SlotOccupyResult::Kind::Occupied:
+                {
+                    /// Someone reached this slot first. A DECODE FAILURE here propagates: an object at a
+                    /// key this namespace owns that is not a transaction of this namespace at this id is
+                    /// corruption or a protocol breach, and the one thing recovery must not do is guess
+                    /// past it.
+                    RefLogTxn occupant = decodeRefLogTxn(
+                        openObject(FormatId::RefLog, occupied.occupant_bytes), ns.string(), id);
+                    const bool occupant_is_seal = refLogTxnIsEpochSeal(occupant);
+                    apply_one(std::move(occupant), occupied.occupant_bytes.size());
+                    if (occupant_is_seal)
+                    {
+                        /// A concurrent recoverer closed this epoch (or our own earlier attempt did, and
+                        /// its acknowledgment was lost). Either way the epoch is closed by a seal that is
+                        /// as good as ours -- adopt it and continue. Contesting a peer's CORRECT write is
+                        /// how two recoverers of the same table turn a designed race into an incident.
+                        ProfileEvents::increment(ProfileEvents::CasRefRecoveryEpochSealAdopted);
+                        ++epoch;
+                        sequence = 1;
+                        slot_attempts_this_epoch = 0;
+                    }
+                    else
+                    {
+                        /// A STRAGGLER: an ordinary transaction of the dead epoch landed at `T+1` between
+                        /// our read and our create. Adopt it, advance `T` by exactly ONE, and try the seal
+                        /// again at the NEW `T+1`. Never mint `T+2` around it: ids are state-derived
+                        /// (INV-1/INV-2), and writing past an occupied slot puts a hole in the durable
+                        /// stream that no later reader can distinguish from a lost object.
+                        ProfileEvents::increment(ProfileEvents::CasRefRecoveryStragglerAdopted);
+                        ++sequence;
+                    }
+                    break;
+                }
+                case SlotOccupyResult::Kind::Unresolved:
+                {
+                    /// The store will not say whether our seal landed. There is no honest way to continue:
+                    /// exposing the table would publish a dead epoch that may or may not be closed, and
+                    /// re-deriving the slot later needs a fresh read anyway. Fail this attempt into the
+                    /// caller's transient-retry loop, which either succeeds on a later attempt or spends
+                    /// its budget and leaves the table unrecovered.
+                    throwCasWriteRetryLater(fmt::format(
+                        "CAS ref-table recovery for namespace '{}': the epoch seal at {}-{} is UNRESOLVED "
+                        "({}); the table stays unrecovered rather than being exposed with a dead epoch that "
+                        "may or may not be closed",
+                        ns.string(), id.writer_epoch, id.ref_sequence,
+                        unresolvedProvesNothingWasSent(occupied.unresolved_reason)
+                            ? "nothing was sent" : "the outcome of the attempt is unknown"));
+                }
+            }
+        }
+    }
+
+    RecoveryWalk walk;
+    walk.result = std::move(builder).finish();
+    walk.last_epoch_seal = last_epoch_seal;
+
+    /// `finish` returns the candidate WITHOUT materializing: `stateFromSnapshot` loads every committed
+    /// row and owned-manifest entry into the COW OVERLAY, and no tail transaction materializes either.
+    /// This state is the table's long-lived working state, so fold both `committed` and `owned_manifests`
+    /// into fresh shared bases ONCE here -- rather than making the first flush's scratch copy (and every
+    /// per-item/shape-check copy on it) deep-copy an N-row overlay. The O(N) fold rides inside recovery,
+    /// which is already O(N).
+    walk.result.state.materializeCommitted();
+    walk.result.cleanup_markers = std::move(cleanup_markers);
+    /// Stale-precommit cleanup is dispatched once, from `appendRefOps`'s top level (never from here --
+    /// this call may itself be nested inside a queue leader's flush stack).
+    walk.result.needs_stale_precommit_sweep = true;
+    walk.result.last_epoch_seal = last_epoch_seal;
+    /// Per-table admission budgets pre-subtract this table's own wire overhead (`4 + ns.size()`, once in
+    /// a snapshot body and once in a removal txn body) plus a fixed safety margin from the raw hard
+    /// limits, once, here.
+    const uint64_t overhead = 4 + ns.string().size() + kRefAdmissionSafetyMargin;
+    walk.result.snapshot_budget = overhead < ref_snapshot_max_bytes ? ref_snapshot_max_bytes - overhead : 0;
+    walk.result.removal_budget = overhead < ref_removal_max_bytes ? ref_removal_max_bytes - overhead : 0;
+
+    /// ---- Step 7: the `_ckpt` contribution ----
+    /// The SEALER's half of INV-4, and this is the site that owes it: recovery is what MINTS seals, so it
+    /// is the only writer that can record where the chain now ends (TLA `RSealSlot`'s `CkptMerge`).
+    /// Contributed under the same admitted generation as the seals themselves, and only when this walk
+    /// actually has a seal to report -- a contribution of nothing but absences would be a write with no
+    /// content.
+    if (last_epoch_seal)
+    {
+        checkRecoveryStillAdmitted(ns, rt, admitted_generation, cancelled);
+        const RefCkpt contribution{.life_epoch = std::nullopt,
+                                   .checkpoint_snapshot_id = std::nullopt,
+                                   .last_epoch_seal = last_epoch_seal};
+        if (publishCkptContribution(ns, contribution, admitted_generation) == CkptPublishOutcome::FencedOut)
+            throwCasWriteRetryLater(fmt::format(
+                "CAS ref-table recovery for namespace '{}': the mount incarnation moved before the "
+                "checkpoint could record the epoch seal {}-{}; nothing was written and nothing is installed",
+                ns.string(), last_epoch_seal->writer_epoch, last_epoch_seal->ref_sequence));
+    }
+
+    return walk;
+}
+
 void CasRefLedger::ensureRefTableRecovered(const RootNamespace & ns, RefTableRuntime & rt)
 {
-    /// Held for the WHOLE recovery's LIST+replay: there is nothing safe to do with an unrecovered
-    /// table's `state` anyway, so a concurrent second caller for the SAME namespace blocking here is
-    /// correct, not a missed-concurrency opportunity -- and this only affects each table's FIRST touch
-    /// per mounted `Pool`: one `LIST` caches the resulting complete table state. The recovery seal's
-    /// encode and conditional `PUT` are the one exception and run below without the mutex --
-    /// `recovery_in_progress` (not the mutex) is what serializes concurrent callers across that window;
-    /// see its doc comment for why.
     {
     std::unique_lock lock(rt.state_mutex);
     /// Every touch, warm or cold,
     /// marks this table most-recently-used so `enforceRefTableCacheBudget` evicts idle tables first.
     rt.last_touch_tick = ref_table_access_tick.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (rt.recovered)
+
+    /// A recovered table is done -- with ONE exception, and it is the structural closure task 3 deferred
+    /// to here. A `Poisoned` table is one whose cache is missing a transaction that IS durable (spec
+    /// §A2): the durable floor bridges the allocator past it, but only a re-derivation from the durable
+    /// log actually repairs the view, and the arithmetic walk is exactly that re-derivation.
+    ///
+    /// Gated on there being no WEDGE, and that ordering is load-bearing: a wedge describes an object
+    /// whose durability is UNDECIDED, which no amount of reading can settle (that is the whole reason
+    /// the resolution is a conditional CREATE and not a GET). Re-recovering underneath one would also
+    /// wipe the floor the wedge's own reconciliation is about to read, leaving the lane re-applying a
+    /// transaction the fresh state already contains. `flushRefBatch` calls recovery BEFORE
+    /// `resolveWedgeOnce`, so a poisoned-and-wedged table retires its wedge on this flush and
+    /// re-recovers on the next one -- one extra touch, no hang, and never the two at once.
+    const auto needs_rerecovery = [&rt]
+    {
+        return rt.apply_state.load(std::memory_order_relaxed) == RefApplyState::Poisoned && !rt.wedge;
+    };
+    if (rt.recovered && !needs_rerecovery())
         return;
 
-    /// A concurrent second caller waits here rather than racing an independent
-    /// LIST+replay+seal attempt against the first caller's unlocked seal PUT below.
+    /// A concurrent second caller waits here rather than racing an independent walk against the first
+    /// caller's unlocked I/O.
     while (rt.recovery_in_progress)
     {
         ++rt.recovery_waiters_for_test;
         rt.recovery_cv.wait(lock);
         --rt.recovery_waiters_for_test;
     }
-    if (rt.recovered)
+    if (rt.recovered && !needs_rerecovery())
         return;   /// the caller we waited on already finished it
 
     rt.recovery_in_progress = true;
-    /// Cleared + broadcast on every exit from here, success or exception, so a waiter above is never
-    /// left hanging on an error that escapes the unlocked seal PUT.
+    /// Cleared + broadcast on every exit from here, success or exception -- so a parked waiter is never
+    /// left hanging, and so the self-remount barrier's JOIN completes on a failed attempt as surely as
+    /// on a successful one.
     SCOPE_EXIT({
         rt.recovery_in_progress = false;
         rt.recovery_cv.notify_all();
     });
 
-    /// Outer transient-retry loop (Layer 1 of the stuck-table-load fix): a whole recovery attempt
-    /// (LIST + snapshot/log GETs + seal PUT) that fails with a TRANSIENT object-store transport error
-    /// (`isTransientRecoveryError` -- `S3_ERROR`/socket/timeout from the direct LIST/GET backend calls,
-    /// or the seal PUT's controller `NETWORK_ERROR`) is retried with capped-exponential backoff until
-    /// `recovery_retry_budget_ms` is spent, instead of propagating and failing this table's async load
-    /// permanently. Non-transient errors (corruption, decode, logic, resource limits) fail fast; so does
-    /// the inner vanish-race brake below (which is `NETWORK_ERROR` too but DELIBERATELY terminal -- the
-    /// `vanish_brake_tripped` latch keeps the outer loop from re-driving it).
+    /// ---- Step 1: capture the admitted generation, ONCE ----
+    /// The trio (spec §3, codex finding 7): this ONE value is what the walk's every `slotOccupy` and its
+    /// `_ckpt` CAS present, and what the install below presents one final time. One capture point, three
+    /// checks, no re-derivation -- a value re-read midway would let a recovery that lost the mount
+    /// "recover" its right to write by observing a fresh incarnation it was never admitted under.
+    ///
+    /// Captured for the WHOLE call, not per attempt, for the same reason: the transient-retry loop below
+    /// exists for object-store blips, and a generation that moved is not one. The loop refuses to
+    /// re-drive under a moved generation (below), so the budget is never burned on a doomed retry.
+    const uint64_t admitted_generation = fence_generation_fn();
+    /// The live writer epoch, likewise captured once: it decides WHICH epochs are dead and therefore what
+    /// the walk may seal. Re-reading it mid-walk would let the boundary move under the decision.
+    const uint64_t live_epoch = live_epoch_fn();
+
+    /// Outer transient-retry loop (Layer 1 of the stuck-table-load fix): a whole recovery attempt that
+    /// fails with a TRANSIENT object-store transport error (`isTransientRecoveryError` -- `S3_ERROR`/
+    /// socket/timeout from the direct LIST/GET backend calls, or a controller `NETWORK_ERROR`) is retried
+    /// with capped-exponential backoff until `recovery_retry_budget_ms` is spent, instead of propagating
+    /// and failing this table's async load permanently. Non-transient errors (corruption, decode, a moved
+    /// fence, logic, resource limits) fail fast; so do the two LATCHED terminal cases below.
     const uint64_t recovery_start_ms = boot_ms_now_fn();
     uint64_t recovery_retry_num = 0;
     bool vanish_brake_tripped = false;
+    bool cancelled = false;
     for (;;)
     {
         try
         {
-
+            std::optional<String> hole_detail;
             for (uint64_t attempt = 0; ; ++attempt)
             {
                 if (attempt > 0)
                 {
                     if (attempt > kRefRecoveryMaxRestarts)
                     {
-                        /// Terminal, NOT a transient object-store outage: latch so the outer retry loop rethrows
-                        /// immediately instead of re-driving this pathological-cleanup-race brake for the budget.
+                        /// Terminal, NOT a transient object-store outage: latch so the outer retry loop
+                        /// rethrows immediately instead of re-driving this brake for the whole budget.
                         vanish_brake_tripped = true;
+                        if (hole_detail)
+                            /// A hole that SURVIVED every restart is no longer explainable by a racing
+                            /// cleanup. It is missing durable data, and it is reported as corruption
+                            /// rather than as a retryable outage: "fold what we have" is precisely how an
+                            /// acked transaction disappears for good.
+                            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                                "CAS ref-table recovery for namespace '{}' found a hole in the durable ref-log "
+                                "stream that persisted across {} re-reads: {}",
+                                ns.string(), attempt - 1, *hole_detail);
                         throwCasWriteRetryLater(fmt::format(
-                            "CAS ref-table recovery for namespace '{}' restarted {} times (a selected snapshot or "
-                            "log object kept vanishing between its LIST and GET) — giving up; this bound is a "
-                            "runaway brake against a pathological cleanup race, not an expected steady state",
-                            ns.string(), attempt - 1));
+                            "CAS ref-table recovery for namespace '{}' restarted {} times (a selected snapshot "
+                            "kept vanishing between the checkpoint that named it and its GET) — giving up; this "
+                            "bound is a runaway brake against a pathological cleanup race, not an expected "
+                            "steady state", ns.string(), attempt - 1));
                     }
                     ++rt.recovery_restarts;
                     ProfileEvents::increment(ProfileEvents::CasRefRecoveryRestarts);
                 }
 
-                /// One namespace `LIST` returns every surviving snapshot, log,
-                /// and `_cleanup` marker key.
-                std::optional<RefTxnId> greatest_snapshot;
-                std::vector<RefTxnId> log_ids;
-                std::set<RefTxnId> cleanup_markers;
-                const String prefix = layout.refsNamespacePrefix(ns);
-                String cursor;
-                for (;;)
+                /// The whole walk runs UNLOCKED. Nothing it touches is shared: the candidate is private
+                /// and `rt` is read only through atomics the poll consults. Unlocking is what keeps a
+                /// recovery's full I/O envelope from stalling every reader of this table -- and what lets
+                /// the self-remount barrier take the lock promptly to JOIN us.
+                lock.unlock();
+                std::optional<RecoveryWalk> walk;
+                try
                 {
-                    const ListPage page = backend.list(prefix, cursor, /*limit=*/1000);
-                    for (const ListedKey & lk : page.keys)
-                    {
-                        const auto parsed = layout.parseRefObjectKey(lk.key);
-                        if (!parsed)
-                            continue;   /// not a ref-object key (for example, a legacy shard-number key)
-                        /// Trust the parsed `ns` only when it names EXACTLY this
-                        /// namespace -- the same checkNamespace-level guarantee the key builders enforce, not
-                        /// position math (the scoped LIST prefix already implies this in practice, but a listed
-                        /// key is untrusted input and is treated as such).
-                        if (parsed->ns != ns)
-                            continue;
-                        switch (parsed->kind)
-                        {
-                            case RefObjectKind::Cleanup:
-                                cleanup_markers.insert(parsed->txn_id);
-                                break;
-                            case RefObjectKind::Log:
-                                log_ids.push_back(parsed->txn_id);
-                                break;
-                            case RefObjectKind::Snap:
-                                if (!greatest_snapshot || *greatest_snapshot < parsed->txn_id)
-                                    greatest_snapshot = parsed->txn_id;
-                                break;
-                        }
-                    }
-                    if (page.next_cursor.empty())
-                        break;
-                    cursor = page.next_cursor;
+                    walk = runRecoveryWalkOnce(ns, rt, admitted_generation, live_epoch, hole_detail);
                 }
-                std::sort(log_ids.begin(), log_ids.end());
-
-                /// The greatest transaction id this attempt's `LIST` observed across
-                /// BOTH snapshots and logs -- used below to decide whether a dead-epoch region exists to seal.
-                /// Recomputed fresh on every restart-on-vanish attempt, exactly like `greatest_snapshot`/`log_ids`.
-                std::optional<RefTxnId> greatest_listed_id = greatest_snapshot;
-                if (!log_ids.empty() && (!greatest_listed_id || *greatest_listed_id < log_ids.back()))
-                    greatest_listed_id = log_ids.back();
-
-                bool vanished = false;
-                std::optional<RefTableSnapshot> snapshot;
-                uint64_t snapshot_body_bytes = 0;   /// weight of the recovered base; 0 = never-born base
-                if (greatest_snapshot)
+                catch (...)
                 {
-                    const auto got = backend.get(layout.refSnapshotKey(ns, *greatest_snapshot));
-                    if (!got)
-                        vanished = true;   /// covered by a newer snapshot published-before-delete; restart
-                    else
-                    {
-                        snapshot = decodeRefTableSnapshot(openObject(FormatId::RefSnapshot, got->bytes), ns.string(), *greatest_snapshot);
-                        snapshot_body_bytes = got->bytes.size();
-                    }
-                }
-
-                /// Stream the post-snapshot tail through one builder: GET -> decode -> applyOne ->
-                /// discard, one transaction at a time into a PRIVATE candidate, so a long tail of
-                /// (post-op-cap) up-to-20-MiB transactions never materializes as a whole-tail vector. The
-                /// candidate never touches `rt.state`; it is published atomically as one `RecoveryResult`
-                /// (`installRecoveryResult`) only after the whole tail -- and any seal -- succeeds.
-                RefReplayBuilder builder(std::move(snapshot), snapshot_body_bytes);
-                if (!vanished)
-                {
-                    for (const RefTxnId & id : log_ids)
-                    {
-                        if (greatest_snapshot && !(*greatest_snapshot < id))
-                            continue;   /// at or below the selected snapshot: already covered
-                        const auto got = backend.get(layout.refLogKey(ns, id));
-                        if (!got)
-                        {
-                            vanished = true;
-                            break;
-                        }
-                        RefLogTxn txn = decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), id);
-                        /// Account the decoded transaction's resident footprint to the memory probe for
-                        /// exactly this iteration (see `reportReplayMemoryDelta`): the streaming loop holds
-                        /// one at a time. No-op in production.
-                        const int64_t footprint = static_cast<int64_t>(decodedRefLogTxnFootprint(txn));
-                        reportReplayMemoryDelta(footprint);
-                        SCOPE_EXIT({ reportReplayMemoryDelta(-footprint); });
-                        builder.applyOne(std::move(txn), got->bytes.size());
-                    }
-                }
-
-                if (vanished)
-                    continue;   /// the selected object vanished; retry from a fresh listing (candidate discarded)
-
-                RecoveryResult result = std::move(builder).finish();
-                /// `finish` returns the candidate WITHOUT materializing: `stateFromSnapshot` loads every
-                /// committed row and owned-manifest entry into the COW OVERLAY, and no tail transaction
-                /// materializes either. This state is the table's long-lived working state, so fold both
-                /// `committed` and `owned_manifests` into fresh shared bases ONCE here -- rather than making
-                /// the first flush's scratch copy (and every per-item/shape-check copy on it) deep-copy an
-                /// N-row overlay. The O(N) fold rides inside recovery, which is already O(N).
-                result.state.materializeCommitted();
-                result.cleanup_markers = std::move(cleanup_markers);
-                /// Stale-precommit cleanup is dispatched once, from `appendRefOps`'s top level (never from
-                /// here -- this call may itself be nested inside a queue leader's flush stack).
-                result.needs_stale_precommit_sweep = true;
-                /// Per-table admission budgets pre-subtract this table's own wire overhead
-                /// (`4 + ns.size()`, once in a snapshot body and once in a removal txn body) plus a fixed
-                /// safety margin from the raw hard limits, once, here.
-                const uint64_t overhead = 4 + ns.string().size() + kRefAdmissionSafetyMargin;
-                result.snapshot_budget = overhead < ref_snapshot_max_bytes ? ref_snapshot_max_bytes - overhead : 0;
-                result.removal_budget = overhead < ref_removal_max_bytes ? ref_removal_max_bytes - overhead : 0;
-
-                /// At an UNCLEAN mount, close every dead epoch this recovery discovered with an immediate
-                /// snapshot -- the seal -- published BEFORE the table is installed as recovered. A failed
-                /// seal PUT throws here, leaving the table unrecovered, so the NEXT touch restarts recovery
-                /// from scratch (fresh LIST, fresh replay, fresh seal attempt) rather than exposing a table
-                /// whose dead-epoch region was never closed; recovery therefore fails closed.
-                /// The encode and conditional `PUT` run OUTSIDE `state_mutex` (unlocked/relocked just below,
-                /// mirroring `trySnapshotPublishOnce`'s copy-under-lock/PUT-outside shape) -- it is the one
-                /// part of recovery that can run the full ~90s retry envelope, and holding the mutex across
-                /// it stalls every other touch of this table plus `wedgedRefLaneCount`'s whole-store walk
-                /// (which locks each table's `state_mutex` in turn). `recovery_in_progress` (set above), not
-                /// the mutex, keeps a concurrent second caller for this SAME table from redoing this work
-                /// during the unlocked window -- see its doc comment. The seal reads the PRIVATE candidate
-                /// (`result.state`), not `rt.state`: nothing installs into the runtime before the single
-                /// atomic `installRecoveryResult` at the end, so no observer ever sees a half-published
-                /// table (`rt` itself cannot be destroyed underneath us -- the caller's own `shared_ptr`
-                /// keeps it alive, which is also what protects it from `enforceRefTableCacheBudget`).
-                ///
-                /// `seal_id` is the UPPER BOUND of the dead-epoch region, not the greatest listed id: the
-                /// wedge discipline places the predecessor's one possible in-flight PUT strictly above
-                /// everything it resolved, so only the epoch-closing bound is guaranteed to dominate it --
-                /// any later materialization from a dead epoch is born covered (`<=` seal_id) for every
-                /// observer, forever. `sealed_from` records the greatest id this recovery actually listed.
-                const uint64_t my_epoch = live_epoch_fn();
-                const RefTxnId seal_id{my_epoch - 1, std::numeric_limits<uint64_t>::max()};
-                const bool dead_region_nonempty =
-                    greatest_listed_id.has_value() && greatest_listed_id->writer_epoch < my_epoch;
-                const bool already_sealed =
-                    result.newest_snapshot_id.has_value() && !(*result.newest_snapshot_id < seal_id);
-                /// Compare against the SPECIFIC epoch a reclaim was marked unclean for, not a
-                /// sticky "ever" bool -- a table recovered for the first time (or reloaded after LRU eviction)
-                /// under a LATER, perfectly clean epoch boundary must not get a parasitic seal just because
-                /// SOME earlier, unrelated boundary in this incarnation's life was unclean.
-                if (unclean_boundary_epoch() == my_epoch && my_epoch >= 2
-                    && dead_region_nonempty && !already_sealed && result.state.getLifecycle() == RefLifecycle::Live)
-                {
-                    RefTableSnapshot seal = snapshotOf(result.state, ns.string());
-                    seal.snapshot_id = seal_id;                            /// upper bound of the covered region
-                    seal.sealed_from = result.state.getGreatestApplied();  /// == greatest_listed_id: nothing else was applied
-                    const String seal_bytes = sealObject(FormatId::RefSnapshot, encodeRefTableSnapshot(seal));
-                    const auto fence_ok = [this] { return fence_ok_fn(); };
-                    /// The `SCOPE_EXIT` above mutates
-                    /// `recovery_in_progress` and notifies `recovery_cv`, and it MUST run with `state_mutex`
-                    /// held. `putIfAbsentControlled` can THROW (its contract: `CORRUPTED_DATA` when it
-                    /// observes DIFFERENT valid bytes at the key -- a cross-process seal conflict, which
-                    /// `recovery_in_progress` cannot serialize); if that exception escaped between `unlock`
-                    /// and `lock`, the unwind would run the `SCOPE_EXIT` UNLOCKED -- a data race on the plain
-                    /// bool and an unlocked notify. So re-acquire the lock before letting any exception
-                    /// propagate. NOTE this obligation is NEW relative to `trySnapshotPublishOnce` (the
-                    /// pattern this mirrors): that precedent has no scope-exit spanning its unlocked call and
-                    /// no cross-caller flag to clean up -- do not weaken this by analogy to it.
-                    lock.unlock();
-                    CasWriteOutcome outcome{};
-                    try
-                    {
-                        outcome = ref_request_controller->putIfAbsentControlled(
-                            layout.refSnapshotKey(ns, seal_id), seal_bytes, fence_ok);
-                    }
-                    catch (...)
-                    {
-                        lock.lock();
-                        throw;
-                    }
+                    /// Re-acquire BEFORE letting anything propagate: the SCOPE_EXIT above mutates
+                    /// `recovery_in_progress` and notifies `recovery_cv`, and it MUST run with
+                    /// `state_mutex` held -- unwinding through it unlocked would be a data race on the
+                    /// plain bool and an unlocked notify.
                     lock.lock();
-                    if (outcome != CasWriteOutcome::Committed)
-                        throwCasWriteRetryLater(fmt::format(
-                            "CAS recovery seal PUT for namespace '{}' did not commit; failing recovery closed "
-                            "(the table stays unrecovered/non-writable; the next touch restarts recovery and "
-                            "re-seals)", ns.string()));
-                    ProfileEvents::increment(ProfileEvents::CasRefRecoverySealPublished);
-
-                    /// The seal now covers everything replayed so far: fold it into the publication as if it
-                    /// were the recovered snapshot and the tail were empty -- exactly what a fresh recovery
-                    /// against the now-durable seal would find. `sealed_from` must move to the seal's own
-                    /// value too: leaving the (pre-seal) base's `sealed_from` behind would describe the new
-                    /// seal with the predecessor's observed-region bound.
-                    result.newest_snapshot_id = seal_id;
-                    result.sealed_from = seal.sealed_from;
-                    result.tail_count = 0;
-                    result.tail_bytes = 0;
-                    result.base_snapshot_bytes = seal_bytes.size();
+                    throw;
                 }
+                lock.lock();
+
+                if (!walk)
+                    continue;   /// restart requested (vanished base, or a hole worth one more reading)
+
+                /// ---- Step 8: the install recheck, the LAST member of the trio ----
+                /// Under the re-acquired lock and IMMEDIATELY before the install, present the admitted
+                /// generation one final time. Everything above ran on I/O that took an unbounded amount
+                /// of time to come back, and a recovery whose window straddled a fence bump describes a
+                /// mount incarnation that no longer owns this namespace. It must publish NOTHING: the
+                /// table stays unrecovered and the next touch recovers it properly.
+                check_fence_or_throw(admitted_generation);
+                if (rt.superseded_by_remount.load(std::memory_order_acquire))
+                    throwCasWriteRetryLater(fmt::format(
+                        "CAS ref-table recovery for namespace '{}': this cached table was superseded by a "
+                        "self-remount while the walk was in flight — nothing is installed",
+                        ns.string()));
 
                 /// One atomic publication under `state_mutex`: `installRecoveryResult` copies every seeded
-                /// field from `result` and sets `recovered` LAST, so no waiter (woken only by the
+                /// field from the result and sets `recovered` LAST, so no waiter (woken only by the
                 /// function-scope SCOPE_EXIT's `recovery_cv` notify, which runs after this returns) ever
                 /// observes a partially-installed table.
-                installRecoveryResult(rt, std::move(result));
+                installRecoveryResult(rt, std::move(walk->result));
                 break;
             }
             break;   /// recovery succeeded -> exit the outer retry loop
@@ -729,16 +1033,21 @@ void CasRefLedger::ensureRefTableRecovered(const RootNamespace & ns, RefTableRun
             /// a `catch (const Exception &)` would not even see. `getCurrentExceptionCode()` normalises
             /// every exception (DB, Poco, std) to a code so the transient classifier can decide.
             const int code = getCurrentExceptionCode();
-            if (vanish_brake_tripped || !isTransientRecoveryError(code))
-                throw;   /// the terminal vanish brake, or a non-transient failure -- fail fast
+            /// `cancelled` is latched by the poll itself: a self-remount's cancellation uses the
+            /// retry-later class (the caller should retry, against the FRESH incarnation), so without the
+            /// latch this loop would read it as a transient blip and re-drive the very work the remount
+            /// just stopped.
+            if (vanish_brake_tripped || cancelled || !isTransientRecoveryError(code))
+                throw;   /// a latched terminal case, or a non-transient failure -- fail fast
 
             const uint64_t elapsed_ms = boot_ms_now_fn() - recovery_start_ms;
-            /// Fail closed BEFORE sleeping: budget spent, mount fence lost, or this runtime superseded by
-            /// a self-remount (mirrors `appendRefOps`' fence gate -- recovery must not re-drive on an
-            /// orphaned, pre-remount runtime).
+            /// Fail closed BEFORE sleeping: budget spent, mount fence lost, this runtime superseded by a
+            /// self-remount, or the incarnation that admitted this recovery has moved (retrying under a
+            /// generation that is already stale can only ever be refused at the install).
             if (elapsed_ms >= cas_request_budget.recovery_retry_budget_ms
                 || !fence_ok_fn()
-                || rt.superseded_by_remount.load(std::memory_order_acquire))
+                || rt.superseded_by_remount.load(std::memory_order_acquire)
+                || fence_generation_fn() != admitted_generation)
                 throw;
 
             /// Saturating `initial << recovery_retry_num` (mirrors `CasRequestController::backoffBefore
@@ -760,7 +1069,7 @@ void CasRefLedger::ensureRefTableRecovered(const RootNamespace & ns, RefTableRun
             lock.unlock();
             /// Re-acquire the lock before letting any exception from the sleep unwind, so the SCOPE_EXIT
             /// (which mutates `recovery_in_progress` + notifies `recovery_cv` and MUST run under
-            /// `state_mutex`) never runs unlocked -- same obligation as the seal-PUT window above.
+            /// `state_mutex`) never runs unlocked -- same obligation as the walk's window above.
             try
             {
                 recovery_retry_sleep_fn(backoff_ms);
@@ -773,12 +1082,14 @@ void CasRefLedger::ensureRefTableRecovered(const RootNamespace & ns, RefTableRun
             lock.lock();
             /// The fence/supersession/budget can all change during the unlocked sleep -- re-check before
             /// starting the next full attempt so we never re-drive recovery on an orphaned runtime, past
-            /// the budget, or under a lost fence (the sliced sleep may have woken early on fence loss).
+            /// the budget, or under a lost or moved fence (the sliced sleep may have woken early on fence
+            /// loss).
             if (boot_ms_now_fn() - recovery_start_ms >= cas_request_budget.recovery_retry_budget_ms
                 || !fence_ok_fn()
-                || rt.superseded_by_remount.load(std::memory_order_acquire))
+                || rt.superseded_by_remount.load(std::memory_order_acquire)
+                || fence_generation_fn() != admitted_generation)
                 throw;
-            /// loop: re-run recovery from a fresh LIST (fresh snapshot/log/replay/seal)
+            /// loop: re-run recovery from a fresh checkpoint read, listing, replay and walk
         }
     }
     }
@@ -799,18 +1110,56 @@ void CasRefLedger::installRecoveryResult(RefTableRuntime & rt, RecoveryResult &&
     rt.state = std::move(result.state);
     rt.cleanup_markers = std::move(result.cleanup_markers);
     rt.newest_snapshot_id = result.newest_snapshot_id;
-    /// `sealed_from` pairs with `newest_snapshot_id`: when the newest snapshot is a recovery seal this
-    /// is the seal's `sealed_from`, otherwise `nullopt`. Copied for a complete, drift-proof inventory --
-    /// the ledger has no hot-read consumer for it (see the field's doc comment), but leaving it out would
-    /// make the "copies EVERY field" contract false.
-    rt.sealed_from = result.sealed_from;
+    /// The chain link the CAS-walk ended on -- the `prev_epoch_seal` this table's next sequence-1 append
+    /// must name. This is the PRODUCTION producer of `last_epoch_seal` (the two writer-side arms record
+    /// only what they happened to observe): a real epoch change arrives with a self-remount, which
+    /// discards every cached runtime, so the fresh one gets its link from exactly here.
+    rt.last_epoch_seal = result.last_epoch_seal;
     rt.tail_count_since_snapshot.store(result.tail_count, std::memory_order_relaxed);
     rt.tail_bytes_since_snapshot.store(result.tail_bytes, std::memory_order_relaxed);
     rt.base_snapshot_bytes.store(result.base_snapshot_bytes, std::memory_order_relaxed);
     rt.snapshot_budget = result.snapshot_budget;
     rt.removal_budget = result.removal_budget;
     rt.needs_stale_precommit_sweep = result.needs_stale_precommit_sweep;
+    /// The install is also what CLEARS a poison, and only a completed install may: `Poisoned` says this
+    /// cache is missing a durable transaction, and the state being installed is a fresh re-derivation
+    /// from the durable log that contains it. Nothing else in the runtime carries the divergence -- the
+    /// durable floor lives on the state, and this state's is `{0,0}` -- so clearing the marker here is
+    /// what makes the repair complete rather than merely likely.
+    rt.apply_state.store(RefApplyState::Clean, std::memory_order_relaxed);
     rt.recovered = true;   /// set LAST
+}
+
+void CasRefLedger::cancelRecoveriesAndAwaitQuiescence()
+{
+    /// Snapshot the runtimes (the copies keep them alive across the wait, exactly as
+    /// `quiesceRefTablesForRemount` does).
+    std::vector<std::shared_ptr<RefTableRuntime>> tables;
+    {
+        std::lock_guard<std::mutex> qlock(ref_queue_mutex);
+        tables.reserve(ref_tables.size());
+        for (auto & [name, rt] : ref_tables)
+            tables.push_back(rt);
+    }
+
+    /// Publish the request to EVERY table first, then wait -- never table-by-table. Requesting and
+    /// waiting in one pass would let a recovery start on table B while we are still parked on table A,
+    /// and we would then join work that began after the cancellation was already under way.
+    for (auto & rt : tables)
+        rt->recovery_cancel_requested.store(true, std::memory_order_release);
+
+    for (auto & rt : tables)
+    {
+        std::unique_lock<std::mutex> slock(rt->state_mutex);
+        rt->recovery_cv.wait(slock, [&] { return !rt->recovery_in_progress; });
+    }
+
+    /// Released once nothing is in flight. Clearing here rather than after the fence re-arm keeps this a
+    /// self-contained barrier with no obligation on the caller to unwind: the window it opens (a recovery
+    /// starting between here and the re-arm) is closed twice over by the re-arm's own generation bump and
+    /// by `quiesceRefTablesForRemount`'s `superseded_by_remount`, both of which the walk polls.
+    for (auto & rt : tables)
+        rt->recovery_cancel_requested.store(false, std::memory_order_release);
 }
 
 
@@ -2944,12 +3293,24 @@ std::optional<RefTxnId> CasRefLedger::newestPublishedSnapshotIdForTest(const Roo
     return rt->newest_snapshot_id;
 }
 
-std::optional<RefTxnId> CasRefLedger::sealedFromForTest(const RootNamespace & ns)
+bool CasRefLedger::refRecoveryCancelRequestedForTest(const RootNamespace & ns)
 {
-    const auto rt = getRefTableRuntime(ns);
-    ensureRefTableRecovered(ns, *rt);
-    std::lock_guard lock(rt->state_mutex);
-    return rt->sealed_from;
+    std::lock_guard<std::mutex> qlock(ref_queue_mutex);
+    const auto it = ref_tables.find(ns.string());
+    return it != ref_tables.end() && it->second->recovery_cancel_requested.load(std::memory_order_acquire);
+}
+
+bool CasRefLedger::refTableRecoveredForTest(const RootNamespace & ns)
+{
+    /// Deliberately does NOT call `ensureRefTableRecovered`, unlike every sibling seam: the fail-closed
+    /// tests ask "did that refused recovery install anything", and a seam that recovered on demand would
+    /// answer its own question with a yes.
+    std::lock_guard<std::mutex> qlock(ref_queue_mutex);
+    const auto it = ref_tables.find(ns.string());
+    if (it == ref_tables.end())
+        return false;
+    std::lock_guard lock(it->second->state_mutex);
+    return it->second->recovered;
 }
 
 size_t CasRefLedger::tailSinceSnapshotCountForTest(const RootNamespace & ns)
@@ -3212,12 +3573,6 @@ bool CasRefLedger::trySnapshotPublishOnce(const RootNamespace & ns)
         /// logs-per-table-after-snapshot: the tail this publish compacted.
         ProfileEvents::increment(ProfileEvents::CasRefSnapshotTailLogs, captured_count);
         rt->newest_snapshot_id = candidate_x;
-        /// `sealed_from` pairs with `newest_snapshot_id` (CasRefLedger.h): it is the newest snapshot's own
-        /// seal bound, `nullopt` for an ordinary Live snapshot. Take it from the snapshot just published
-        /// (`snap`, always `nullopt` here) so this later publication CLEARS any predecessor recovery seal's
-        /// `sealed_from` -- leaving it would describe this non-seal snapshot with the seal's observed-region
-        /// bound, a false introspection contract.
-        rt->sealed_from = snap.sealed_from;
         /// The new cache-weight base is exactly the snapshot
         /// we just encoded and PUT, so its body size is the fresh base weight -- no re-encode needed.
         rt->base_snapshot_bytes.store(bytes.size(), std::memory_order_relaxed);
@@ -3432,10 +3787,6 @@ void CasRefLedger::publishRemovedSnapshotNow(const RootNamespace & ns)
 
     std::lock_guard lock(rt->state_mutex);
     rt->newest_snapshot_id = remove_id;
-    /// A Removed snapshot is never a recovery seal; take `sealed_from` from it (`nullopt`) so this
-    /// publication CLEARS any predecessor seal's `sealed_from`, keeping the runtime field paired with
-    /// `newest_snapshot_id` (CasRefLedger.h).
-    rt->sealed_from = removed_snap.sealed_from;
     rt->tail_count_since_snapshot.store(0, std::memory_order_relaxed);
     rt->tail_bytes_since_snapshot.store(0, std::memory_order_relaxed);
 }

@@ -67,9 +67,9 @@ void checkPrecommitsSorted(const std::vector<RefOwnerBinding> & rows)
 }
 
 /// Whole-object validation: transaction IDs must be nonzero, lifecycle determines whether removal
-/// metadata and rows are allowed, `sealed_from` must not be later than `snapshot_id`, and both row
-/// vectors must be strictly sorted. Applying the same checks before encoding and after decoding
-/// keeps malformed caller state and malformed stored data subject to the same contract.
+/// metadata and rows are allowed, and both row vectors must be strictly sorted. Applying the same
+/// checks before encoding and after decoding keeps malformed caller state and malformed stored data
+/// subject to the same contract.
 void checkSnapshotInvariants(const RefTableSnapshot & snapshot)
 {
     checkTxnIdNonzero(snapshot.snapshot_id, "snapshot_id");
@@ -86,16 +86,6 @@ void checkSnapshotInvariants(const RefTableSnapshot & snapshot)
     }
     else if (snapshot.remove_txn_id)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableSnapshot: Live snapshot must not carry remove_txn_id");
-
-    if (snapshot.sealed_from)
-    {
-        checkTxnIdNonzero(*snapshot.sealed_from, "sealed_from");
-        if (snapshot.snapshot_id < *snapshot.sealed_from)
-            throw Exception(ErrorCodes::CORRUPTED_DATA,
-                "RefTableSnapshot: sealed_from {}-{} exceeds snapshot_id {}-{}",
-                snapshot.sealed_from->writer_epoch, snapshot.sealed_from->ref_sequence,
-                snapshot.snapshot_id.writer_epoch, snapshot.snapshot_id.ref_sequence);
-    }
 
     checkCommittedSorted(snapshot.committed);
     checkPrecommitsSorted(snapshot.precommits);
@@ -148,8 +138,6 @@ void writeSnapshotMeta(CasJsonWriter & out, const RefTableSnapshot & snapshot)
     writeStringValue(out, lifecycleToWord(snapshot.lifecycle));
     if (snapshot.lifecycle == RefLifecycle::Removed)
         writeRefTxnIdFields(out, first, "rte", "rts", *snapshot.remove_txn_id);
-    if (snapshot.sealed_from)
-        writeRefTxnIdFields(out, first, "sfe", "sfs", *snapshot.sealed_from);
     closeObject(out, first);
     writeChar('\n', out);
 }
@@ -215,8 +203,6 @@ RefTableSnapshot decodeRefTableSnapshot(
         bool saw_lc = false;
         std::optional<uint64_t> rte;
         std::optional<uint64_t> rts;
-        std::optional<uint64_t> sfe;
-        std::optional<uint64_t> sfs;
         String key;
         while (r.nextKey(key))
         {
@@ -226,8 +212,6 @@ RefTableSnapshot decodeRefTableSnapshot(
             else if (key == "lc") { snapshot.lifecycle = lifecycleFromWord(r.readString()); saw_lc = true; }
             else if (key == "rte") rte = r.readU64String();
             else if (key == "rts") rts = r.readU64String();
-            else if (key == "sfe") sfe = r.readU64String();
-            else if (key == "sfs") sfs = r.readU64String();
             else r.skipUnknown(key);
         }
         if (!saw_ns || !saw_we || !saw_rs || !saw_lc)
@@ -237,12 +221,6 @@ RefTableSnapshot decodeRefTableSnapshot(
             if (!rte || !rts)
                 throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableSnapshot: remove_txn_id needs both rte and rts");
             snapshot.remove_txn_id = RefTxnId{*rte, *rts};
-        }
-        if (sfe || sfs)
-        {
-            if (!sfe || !sfs)
-                throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableSnapshot: sealed_from needs both sfe and sfs");
-            snapshot.sealed_from = RefTxnId{*sfe, *sfs};
         }
         if (!meta_buf.eof())
             throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableSnapshot: junk after meta line");
@@ -350,15 +328,13 @@ size_t precommitRowEncodedSize(const RefOwnerBinding & binding)
 }
 
 size_t snapshotFramingSize(const String & ns, const RefTxnId & snapshot_id, RefLifecycle lifecycle,
-                           const std::optional<RefTxnId> & remove_txn_id,
-                           const std::optional<RefTxnId> & sealed_from, uint64_t row_count)
+                           const std::optional<RefTxnId> & remove_txn_id, uint64_t row_count)
 {
     RefTableSnapshot meta_only;
     meta_only.ns = ns;
     meta_only.snapshot_id = snapshot_id;
     meta_only.lifecycle = lifecycle;
     meta_only.remove_txn_id = remove_txn_id;
-    meta_only.sealed_from = sealed_from;
 
     CasJsonWriter out(256);
     writeHeaderLine(out, FormatId::RefSnapshot);

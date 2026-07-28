@@ -588,10 +588,11 @@ TEST(CasRecoveryStreaming, RecoveryResultInventoryComplete)
     /// newest snapshot identity: the recovered base id, no seal on this clean mount.
     EXPECT_EQ(store->newestPublishedSnapshotIdForTest(ns), std::optional<RefTxnId>(base.snapshot_id));
 
-    /// sealed_from: the base is an ordinary snapshot (not a recovery seal) and this mount is clean, so
-    /// the installed inventory carries no seal upper bound. Pins that the field IS part of the published
-    /// inventory (the unclean-seal counterpart lives in RefWriterRecoverySeal.RuntimeInventoryCarriesSealSealedFrom).
-    EXPECT_EQ(store->sealedFromForTest(ns), std::nullopt);
+    /// last_epoch_seal: this mount's live epoch is the one the seeded stream was written in, so the
+    /// CAS-walk crossed no epoch transition and installed no chain link. Pins that the field IS part of
+    /// the published inventory (its non-empty counterpart lives in
+    /// `CasRefRecoveryCasWalk.DeadEpochIsClosedByOurOwnSealAtTPlusOne`).
+    EXPECT_EQ(store->lastEpochSealForTest(ns), std::nullopt);
 
     /// stale-precommit sweep: recovery always arms it (asserted BEFORE any read-side sweep runs).
     EXPECT_TRUE(store->needsStalePrecommitSweepForTest(ns));

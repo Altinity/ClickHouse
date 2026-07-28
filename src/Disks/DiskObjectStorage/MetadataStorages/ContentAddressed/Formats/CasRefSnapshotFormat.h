@@ -17,11 +17,14 @@ namespace DB::Cas
 /// family: callers store the encoded text as an Always/`.zst` object. Its canonical text consists of
 /// a header, a metadata line, committed and precommit row lines, and a `{"n":count}` trailer.
 ///
-/// A recovery seal is represented by the same snapshot type: it is a Live snapshot whose
-/// `sealed_from` is set and whose `snapshot_id` is the synthetic `{my_epoch - 1, UINT64_MAX}`. All
-/// `RefTxnId` components are encoded as decimal strings so this sentinel value round-trips. Rows are
+/// There is no such thing as a "seal snapshot". An epoch is closed IN-BAND, by an `EpochSeal`
+/// transaction the recovery CAS-walk places at `{E, T+1}` in the `_log` stream (INV-2) -- the exact key
+/// a dying predecessor's in-flight PUT would have taken, so the store's write-once create is the fence.
+/// The retired alternative was a synthetic snapshot at `{E-1, UINT64_MAX}` carrying a `sealed_from`
+/// bound: it occupied no log key, so it fenced nothing and needed a separate after-the-fact detector for
+/// the writes it let through. All `RefTxnId` components are still encoded as decimal strings. Rows are
 /// emitted in canonical order, making re-encoding deterministic by construction; these objects are
-/// still published through the ordinary single-owner `putIfAbsentControlled` path, not a
+/// published through the ordinary single-owner `putIfAbsentControlled` path, not a
 /// `putDeterministicArtifact` byte-adoption gate.
 
 /// Whether a table is currently populated or has been removed.
@@ -44,9 +47,8 @@ struct RefCommittedRow
 
 /// The complete state of one namespace's ref table in one canonical snapshot object. `precommits`
 /// reuses `RefOwnerBinding` from `CasRefWireVocab.h`; every entry's `kind` must be `Precommit`.
-/// A Removed snapshot carries its nonzero `remove_txn_id` and no rows. A Live snapshot has no
-/// `remove_txn_id`; when `sealed_from` is present it is nonzero and no later than `snapshot_id`.
-/// Both row vectors must already be strictly sorted by their documented keys, because the codec
+/// A Removed snapshot carries its nonzero `remove_txn_id` and no rows; a Live snapshot has no
+/// `remove_txn_id`. Both row vectors must already be strictly sorted by their documented keys, because the codec
 /// validates and emits the caller-provided order rather than sorting it.
 struct RefTableSnapshot
 {
@@ -54,8 +56,6 @@ struct RefTableSnapshot
     RefTxnId snapshot_id;
     RefLifecycle lifecycle = RefLifecycle::Live;
     std::optional<RefTxnId> remove_txn_id;      /// present iff lifecycle == Removed
-    std::optional<RefTxnId> sealed_from;        /// recovery seal upper bound;
-                                                 /// if present, `*sealed_from <= snapshot_id`
     std::vector<RefCommittedRow> committed;     /// sorted by canonical bytewise ref_name, no duplicates
     std::vector<RefOwnerBinding> precommits;    /// sorted by (ref_name, manifest_ref), no duplicates
 
@@ -69,9 +69,9 @@ inline constexpr size_t ref_snapshot_max_bytes = ref_removal_max_bytes;
 /// Encode to the canonical text (not sealed): the caller compresses via
 /// `sealObject(FormatId::RefSnapshot, …)` on the persist path (Always/`.zst`), and the in-memory
 /// validation / `admits` size-estimate / `fsck` oracle callers use the uncompressed text. Throws
-/// CORRUPTED_DATA on: a zero `snapshot_id`/`remove_txn_id`/`sealed_from` field; the Live/Removed
-/// coupling broken (Live with `remove_txn_id`, or Removed without it / with rows); `snapshot_id <
-/// *sealed_from`; a non-canonical `ref_name`; an out-of-range `manifest_ref`; non-strictly-ascending
+/// CORRUPTED_DATA on: a zero `snapshot_id`/`remove_txn_id` field; the Live/Removed coupling broken
+/// (Live with `remove_txn_id`, or Removed without it / with rows); a non-canonical `ref_name`; an
+/// out-of-range `manifest_ref`; non-strictly-ascending
 /// `committed` / `precommits`; a `precommits` entry not `Precommit`; or an over-budget object.
 String encodeRefTableSnapshot(const RefTableSnapshot & snapshot);
 
@@ -93,7 +93,6 @@ size_t precommitRowEncodedSize(const RefOwnerBinding & binding);
 /// row count, excluding all row lines. `snapshotFramingSize(...) + Σ committedRowEncodedSize +
 /// Σ precommitRowEncodedSize` equals `encodeRefTableSnapshot(...).size()` exactly.
 size_t snapshotFramingSize(const String & ns, const RefTxnId & snapshot_id, RefLifecycle lifecycle,
-                           const std::optional<RefTxnId> & remove_txn_id,
-                           const std::optional<RefTxnId> & sealed_from, uint64_t row_count);
+                           const std::optional<RefTxnId> & remove_txn_id, uint64_t row_count);
 
 }
