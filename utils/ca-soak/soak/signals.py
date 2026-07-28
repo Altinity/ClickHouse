@@ -243,14 +243,17 @@ def preflight_signals(cluster, events=CAS_SIGNAL_EVENTS, *, timeout: float = 30.
 #   fold_ref_list.probe_a_holes      — ids missing from one of two independent enumerations of the ref
 #                                      prefix, below the other's own maximum id. An append cannot make
 #                                      that shape.
-#   fold_ref_intake.logs_intended    — logs the intake meant to apply this round …
+#   fold_ref_intake.logs_accounted   — ref-log POSITIONS the round's sealed cut declares covered,
+#                                      counted arithmetically per epoch entered (renamed from
+#                                      `logs_intended` when the fold stopped deriving the cut from the
+#                                      LIST) …
 #   fold_ref_intake.logs_applied     — … versus logs that reached the single cursor-advance site.
 #                                      Inequality means the cursor advanced over unapplied work.
 #   fold_reduce.txns_unapplied       — folded+merged transactions whose blob deltas never reached a
 #                                      shard reducer. The fail-closed twin of CasGcUnappliedFoldedTxns.
 DETECTOR_METRICS = (
     ("fold_ref_list", "probe_a_holes"),
-    ("fold_ref_intake", "logs_intended"),
+    ("fold_ref_intake", "logs_accounted"),
     ("fold_ref_intake", "logs_applied"),
     ("fold_reduce", "txns_unapplied"),
     # Not a detector value but the verdict the detectors drive: the round refused to fold.
@@ -260,7 +263,7 @@ DETECTOR_METRICS = (
 # Scalar columns pulled out of `phase_metrics` by name. `map['absent']` is a DEFINED zero for a
 # ClickHouse Map, so these columns are exact whatever the aggregate does with absent keys — unlike
 # reading them back out of a summed map, whose zero-key behaviour we would be depending on.
-_DETECTOR_COLUMNS = ("probe_a_holes", "logs_intended", "logs_applied", "txns_unapplied",
+_DETECTOR_COLUMNS = ("probe_a_holes", "logs_accounted", "logs_applied", "txns_unapplied",
                      "ref_folding_aborted")
 
 
@@ -337,9 +340,12 @@ def summarize_phases(rows, *, top_n: int = 5) -> dict:
       `<phase>.<metric>`. Absent (not zero) when the owning phase never ran in the window: a round
       that never led emits no `fold_*` phase at all, and calling that "0 holes" would be a claim the
       data does not support.
-    * `intake_mismatch` — `logs_intended - logs_applied`, the one derived value worth naming, because
-      the identity it checks (every intended log reaches the single cursor-advance site) is the whole
-      reason the pair is emitted.
+    * `intake_mismatch` — `logs_accounted - logs_applied`, the one derived value worth naming, because
+      the identity it checks (every position the sealed cut covers reached the single cursor-advance
+      site) is the whole reason the pair is emitted.
+
+    Raises `SignalsUnsupported` when a phase that RAN did not carry one of its own detector metrics —
+    see the presence check below.
 
     Pure function: `rows` is whatever `parse_phase_summary` produced."""
     by_phase = {r["phase"]: r for r in rows}
@@ -347,12 +353,28 @@ def summarize_phases(rows, *, top_n: int = 5) -> dict:
     detector = {}
     for phase, metric in DETECTOR_METRICS:
         r = by_phase.get(phase)
-        if r is not None:
-            detector[f"{phase}.{metric}"] = r[metric]
+        if r is None:
+            continue
+        # FAIL-CLOSED ON A RENAMED PHASE METRIC — the `system.events` discipline at the top of this
+        # module, applied to the other half of the reader. `sum(phase_metrics['x'])` is a DEFINED zero
+        # for an absent key, so a metric that gets renamed in the server does not raise here: it
+        # reports 0 forever, and `intake_mismatch` silently becomes `-logs_applied` on every healthy
+        # round. That is exactly the silent-degradation failure this module exists to avoid, and it
+        # already happened once (`logs_intended` -> `logs_accounted`). The summed `metrics` map carries
+        # only keys some row actually had, so it is the presence oracle the scalar column cannot be:
+        # a phase that RAN emits its own detector metrics unconditionally, so an absent key means the
+        # name moved, not that the value was zero.
+        if metric not in r["metrics"]:
+            raise SignalsUnsupported(
+                f"the GC phase {phase!r} ran ({r['calls']} rows) but its `phase_metrics` map carries "
+                f"no {metric!r} key. The metric was renamed or removed in the server; the detector "
+                f"column would read a permanent silent zero. Known keys on this phase: "
+                f"{sorted(r['metrics'])}")
+        detector[f"{phase}.{metric}"] = r[metric]
     intake = by_phase.get("fold_ref_intake")
     mismatch = None
     if intake is not None:
-        mismatch = intake["logs_intended"] - intake["logs_applied"]
+        mismatch = intake["logs_accounted"] - intake["logs_applied"]
     return {
         "phases": len(rows),
         "rounds": max((r["rounds"] for r in rows), default=0),
@@ -378,7 +400,7 @@ def format_phase_summary(summary: dict) -> str:
     mm_s = "n/a" if mm is None else str(mm)
     return (f"GC PHASES rounds={summary['rounds']} phases={summary['phases']} "
             f"total={summary['total_us'] / 1000.0:.1f}ms | slowest: {slow} | detector: {det} "
-            f"| logs_intended-logs_applied={mm_s}")
+            f"| logs_accounted-logs_applied={mm_s}")
 
 
 def read_phase_summary(node, since_ts: int, *, timeout: float = 120.0, flush: bool = True):

@@ -637,21 +637,51 @@ TEST(CasRefGc, InvalidRefLogBodyHoldsNamespaceNoPartialDelta)
     const ManifestRef r = mref(1);
     writeBlobBody(*backend, layout, DB::UInt128(1));
     writeManifestRaw(*backend, layout, ns, r, {blobEntryFor("a", DB::UInt128(1))});
-    const uint64_t good = publishCommittedTransition(*backend, layout, ns, "tbl", std::nullopt, r);
-
-    /// A canonical `_log` key (groupRefKeys accepts it) at the walk's very next position, whose body
-    /// cannot be decoded: the fold GETs it and `decodeRefLogTxn` throws.
-    backend->putIfAbsent(layout.refLogKey(ns, RefTxnId{1, good + 1}), "garbage-not-a-valid-reflog-body");
+    publishCommittedTransition(*backend, layout, ns, "tbl", std::nullopt, r);
 
     Gc gc(store, kGc);
-    ASSERT_NO_THROW(gc.runRegularRound());   /// the round catches the hold internally and survives
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+    ASSERT_EQ(inDegreeOf(*backend, layout, DB::UInt128(1)), 1) << "published and folded";
 
-    EXPECT_EQ(inDegreeOf(*backend, layout, DB::UInt128(1)), 1)
-        << "the complete transaction below the invalid body folded; holding a namespace is not unfolding it";
-    EXPECT_EQ(foldCursorOf(*backend, layout, ns, 0), good)
+    /// Now DROP the ref, so the blob is genuinely unreferenced once that record folds, and only then
+    /// plant the invalid body at the walk's very next position. This ordering is what makes the
+    /// suppression assertion below mean something: asserting that a LIVE blob survives a held round
+    /// proves nothing, since a live blob is never reclaimable in the first place.
+    const uint64_t dropped = dropRefTransition(*backend, layout, ns, "tbl", r);
+
+    /// A canonical `_log` key (groupRefKeys accepts it) whose body cannot be decoded: the fold GETs it
+    /// and `decodeRefLogTxn` throws.
+    const String garbage_key = layout.refLogKey(ns, RefTxnId{1, dropped + 1});
+    backend->putIfAbsent(garbage_key, "garbage-not-a-valid-reflog-body");
+
+    /// Eight rounds under the hold. Each one catches the hold internally and survives.
+    for (int i = 0; i < 8; ++i)
+    {
+        ASSERT_NO_THROW(gc.runRegularRound());
+        store->renewWatermarkOnce();
+    }
+
+    EXPECT_EQ(foldCursorOf(*backend, layout, ns, 0), dropped)
         << "the durable cursor must stop BELOW the invalid record, and never advance past it";
+    EXPECT_EQ(inDegreeOf(*backend, layout, DB::UInt128(1)), 0)
+        << "the complete transaction below the invalid body folded -- the drop applied, so the blob is "
+           "unreferenced and would be reclaimed by any unsuppressed round";
     EXPECT_TRUE(blobPresent(*backend, layout, DB::UInt128(1)))
-        << "the held namespace's anomaly suppresses every destructive step of the round";
+        << "the held namespace's anomaly suppresses graduation and pending deletes: an unreferenced "
+           "blob is NOT reclaimed while any namespace is held, because the unfolded tail behind the "
+           "hold may still name it";
+
+    /// Release the hold by removing the undecodable object. The walk then reaches a plain frontier
+    /// (nothing listed above it), records no anomaly, and destruction resumes.
+    const HeadResult h = backend->head(garbage_key);
+    ASSERT_TRUE(h.exists);
+    ASSERT_EQ(backend->deleteExact(garbage_key, h.token).kind, DeleteOutcome::Kind::Deleted);
+
+    ASSERT_TRUE(runToFixpoint(store, gc) < 64u) << "the released namespace must converge";
+    EXPECT_EQ(foldCursorOf(*backend, layout, ns, 0), dropped) << "cursor unchanged: nothing new to fold";
+    EXPECT_FALSE(blobPresent(*backend, layout, DB::UInt128(1)))
+        << "once the hold clears, the unreferenced blob is reclaimed -- so the survival above was the "
+           "suppression doing its job, not the blob being unreclaimable";
 }
 
 /// Coverage gap (Task 13a): the per-table baseline guard (spec §Offline Recovery) has no positive-trip

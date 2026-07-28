@@ -1425,10 +1425,12 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     ///                                           durable record was lost: HOLD the namespace at
     ///                                           classification 4 with its cursor unmoved.
     ///
-    /// Epochs are crossed ONLY by consuming the `EpochSeal` that closes one (INV-2): the seal folds as an
-    /// applied table no-op (probe B2 `produced=false`) and the next epoch's start is `{E', 1}`, reached
-    /// through the `prev_epoch_seal` back-chain rather than guessed -- so an epoch the hint omits entirely
-    /// is still walked, and a crossing with no consumed seal behind it is an impossible shape that holds.
+    /// Epochs are crossed only over a consumed `EpochSeal` (INV-2): the seal folds as an applied table
+    /// no-op (probe B2 `produced=false`) and the next epoch's start is `{E', 1}`, reached through the
+    /// `prev_epoch_seal` back-chain rather than guessed -- so an epoch the hint omits entirely is still
+    /// walked, and a crossing with no consumed seal behind it is an impossible shape that holds. Read
+    /// `crossFromSeal` for what that is proved FROM: within a round the seal's kind is checked outright,
+    /// across rounds it rests on the chain until Task 8 carries the kind in the durable cursor.
     ///
     /// PER-NAMESPACE FAILURES ARE PER-NAMESPACE (spec §5): an unreadable or undecodable body belongs to
     /// exactly one namespace and clamps only it. The whole-round abort survives ONLY for a key that cannot
@@ -1468,7 +1470,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         /// anything folded under it. Under INV-1 (`nextRefTxnId`) ids are derived per namespace from that
         /// table's own state, so a namespace removed and recreated WITHIN ONE writer epoch -- after its
         /// logs were cleaned and its runtime re-recovered from nothing -- restarts at `{E, 1}`, at or
-        /// below this cursor. The loop below skips ids `<= cursor`, so those edges would never fold and
+        /// below this cursor. The walk below starts at `cursor + 1`, so those edges would never fold and
         /// the recreated refs' manifests would look unreferenced.
         ///
         /// Two things keep that from biting today. The cursor is dropped when the namespace vanishes: the
@@ -1553,22 +1555,38 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         /// no sequence 1, an undecodable one, a genesis record (no `prev_epoch_seal`) above a consumed
         /// seal, or a chain that skips our position -- is the unconsumed-seal crossing, and holds.
         ///
+        /// WHAT THE CHAIN PROVES, EXACTLY: the IDENTITY of the position the next epoch chains from, not
+        /// its KIND. Those come apart when a writer names an ordinary record as `prev_epoch_seal`, and the
+        /// damage is the one the seal exists to prevent -- epoch `E` declared closed while its writer may
+        /// still append, so a later `{E, k}` lands permanently below the cursor. So the kind is checked
+        /// wherever it is knowable: `seal_proven` carries `refLogTxnIsEpochSeal` of the record THIS round
+        /// applied at `from_seal` (free -- the body was decoded to apply it). It is `nullopt` only when the
+        /// walk applied nothing this round, i.e. `from_seal` is the cursor a PREVIOUS round sealed; that
+        /// record may since have been cleaned, so its kind is unknowable by any amount of reading here and
+        /// the crossing rests on chain-trust. Closing that half needs the kind carried in the durable
+        /// cursor -- Task 8's hold/cursor grammar -- not more I/O.
+        ///
         /// Terminates: `validateEpochSealGrammarStructural` guarantees `prev_epoch_seal->writer_epoch <
         /// txn_id.writer_epoch`, so `target_epoch` strictly decreases and the loop is bounded below by
         /// `from_seal`'s own epoch. The record it proves is read once more by the walk itself: one
         /// redundant GET per epoch crossed, and crossings happen once per writer-epoch change.
-        const auto crossFromSeal = [&](const RefTxnId & from_seal, const RefTxnId & witness)
-            -> std::optional<RefTxnId>
+        const auto crossFromSeal = [&](const RefTxnId & from_seal, const std::optional<bool> & seal_proven,
+                                       const RefTxnId & witness) -> std::optional<RefTxnId>
         {
             if (from_seal == RefTxnId{})
                 return std::nullopt;   /// nothing consumed yet: there is no seal to cross from
+            if (seal_proven && !*seal_proven)
+                return std::nullopt;   /// this round applied that record and it is NOT a seal
             uint64_t target_epoch = witness.writer_epoch;
             while (target_epoch > from_seal.writer_epoch)
             {
                 const RefTxnId start{target_epoch, 1};
                 const auto body = backend.get(layout.refLogKey(ns, start));
                 if (!body)
+                {
+                    ++intake_absent_probes;   /// a failed crossing pays this read too; count it
                     return std::nullopt;
+                }
                 ProfileEvents::increment(ProfileEvents::CasRefLogBodyGets);
                 RefLogTxn head;
                 try
@@ -1592,12 +1610,16 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
 
         /// The first position to read. A never-folded namespace has no arithmetic predecessor, so its
         /// genesis comes from the hint's own floor -- the one hint role arithmetic cannot replace in
-        /// Stage A. Its residual is narrow and pre-existing: a hint that omits the very FIRST surviving
-        /// record of a never-folded namespace starts the walk one record too high, exactly as the
-        /// listing-driven loop did. Stage B closes it structurally by reading `_ckpt.life_epoch` (the
-        /// namespace's genesis epoch) from the catalog, which makes the start `{life_epoch, 1}` and
-        /// arithmetic like every other step. Do NOT close it here by scanning down from `{E, 1}`: below a
-        /// lost cursor the cleaned range is unbounded, so the scan has no bound either.
+        /// Stage A. The residual is PRE-EXISTING but not cosmetic: a hint that omits the very FIRST
+        /// surviving record of a never-folded namespace starts the walk one record too high, and the
+        /// round then seals a cursor ABOVE a record it never folded -- the same unrecoverable shape this
+        /// walk removes everywhere else, since nothing ever re-reads below the cursor. It is exactly what
+        /// the listing-driven loop did, and it is bounded to a namespace's FIRST fold. Stage B closes it
+        /// structurally by reading `_ckpt.life_epoch` (the namespace's genesis epoch) from the catalog,
+        /// which makes the start `{life_epoch, 1}` and arithmetic like every other step. Do NOT close it
+        /// here by scanning down from `{E, 1}`: below a lost cursor the cleaned range is unbounded, so the
+        /// scan has no bound either, and a namespace whose early logs were legitimately cleaned would 404
+        /// below its own witness and hold every round.
         std::optional<RefTxnId> expected;
         if (cursor == RefTxnId{})
         {
@@ -1606,6 +1628,11 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         }
         else
             expected = RefTxnId{cursor.writer_epoch, cursor.ref_sequence + 1};
+
+        /// Whether the record this round last applied (the one `resolved_through` names) was an
+        /// `EpochSeal`. `nullopt` = this round has applied nothing yet, so `resolved_through` is still
+        /// the inherited cursor and its kind is not knowable here -- see `crossFromSeal`.
+        std::optional<bool> last_applied_is_seal;
 
         /// Probe B1's per-epoch contiguous run: opened at the first position walked in an epoch, closed
         /// when the walk leaves that epoch or stops.
@@ -1638,11 +1665,12 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                     break;
                 }
 
-                const auto crossed = crossFromSeal(resolved_through, *witness);
+                const auto crossed = crossFromSeal(resolved_through, last_applied_is_seal, *witness);
                 if (!crossed)
                 {
                     hold(*expected, "ref intake: a later epoch's records are reachable but this epoch's "
-                                    "closing seal was never consumed -- the crossing has no proof");
+                                    "closing seal was never consumed (or the position they chain from is "
+                                    "not one) -- the crossing has no proof");
                     break;
                 }
                 /// Every iteration must move `expected` strictly forward. A crossing that lands back on
@@ -1778,6 +1806,11 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             if (!segment_first)
                 segment_first = log_id;    /// this epoch's contiguous run opens at the first applied id
             resolved_through = log_id;     /// this log fully folded
+            /// The KIND of the record the cursor now sits on, remembered for the crossing below: the
+            /// chain check proves the identity of the position an epoch chains from, never that that
+            /// position is a seal, and this is the one place the answer is free (the body is decoded and
+            /// in hand). See the crossing's own comment for the half of this that cannot be re-checked.
+            last_applied_is_seal = refLogTxnIsEpochSeal(txn);
             ++logs_applied;                /// probe B1: the SINGLE cursor-advance site
             table_changed = true;
 
@@ -1834,12 +1867,17 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// It counts the CUT ARITHMETICALLY, not by listed ids. Under arithmetic intake a listed-id count is
     /// not even the right question: a hint hole means a round legitimately applies records the listing
     /// never mentioned, so the old recomputation would report fewer logs than folded and fail every
-    /// healthy round on a lying store. What the cut declares is the contiguous run of POSITIONS each
-    /// namespace's cursor moved over -- `last - first + 1` per epoch entered -- and the last run is
-    /// measured against the DURABLE seal (`per_ns_shard`), which is the value the next round will trust.
-    /// So the identity still asserts exactly what it always did, and now says it about the thing that can
-    /// actually go wrong here: a cursor that moved over a position nothing applied (a skipped hole)
-    /// inflates this count above `logs_applied` and fails the round closed.
+    /// healthy round on a lying store -- it would have made this task's own fix unshippable.
+    ///
+    /// BE HONEST ABOUT WHAT IS LEFT. The old formula could disagree with reality because it was derived
+    /// from a different source (the listing) than the counter. This one is derived from the runs the
+    /// single advance site produced, so for the current code shape it is close to tautological, and B1's
+    /// discriminating power went DOWN with this change rather than up. What it still asserts is worth
+    /// keeping and is not free: THE SEALED CURSOR IS THE WALK'S CURSOR. The last run of each namespace is
+    /// measured against the DURABLE `per_ns_shard` value the next round will trust, not against the
+    /// walk's own end, so a cursor sealed from anywhere other than this walk -- a stale carry, a mutated
+    /// coverage row, a future edit that advances the cursor away from the advance site -- either fails
+    /// the epoch/order check below or lands as a count that no longer matches `logs_applied`.
     logs_accounted_this_round = 0;
     logs_applied_this_round = 0;
     if (!ref_folding_aborted)
@@ -1881,10 +1919,11 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     intake_timer->metric("tables_changed", intake_tables_changed);
     intake_timer->metric("tables_clamped", intake_tables_clamped);
     intake_timer->metric("dead_precommits_skipped", intake_dead_precommits_skipped);
-    /// The exact reads arithmetic intake pays that the listing-driven loop did not: every expected-next
-    /// that came back absent (at least one per namespace walked -- the absent expected-next IS the
-    /// frontier proof), plus one epoch-start read per crossing. Both are on the row so the cost shows up
-    /// where it is spent.
+    /// The exact reads arithmetic intake pays that the listing-driven loop did not. `absent_probes`
+    /// counts EVERY read that came back absent: the expected-next of each namespace walked (at least one
+    /// -- the absent expected-next IS the frontier proof) and the epoch-start read of a crossing that
+    /// failed, which a namespace that holds every round pays every round. `epoch_crossings` counts the
+    /// successful ones. Both are on the row so the cost shows up where it is spent.
     intake_timer->metric("absent_probes", intake_absent_probes);
     intake_timer->metric("epoch_crossings", intake_epoch_crossings);
     intake_timer->metric("namespace_removals", new_removals.size());

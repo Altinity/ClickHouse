@@ -16,14 +16,18 @@ from soak.run import capture_checkpoint_signals, capture_phase_summary
 from soak.signals import CAS_SIGNAL_EVENTS, PhaseCoverage, SignalTracker
 
 
+# The `metrics` maps carry each phase's own detector keys, exactly as the server's `sumMap` does — the
+# presence guard in `summarize_phases` reads them to tell "the value is zero" from "the name moved".
 PHASE_ROWS = "\n".join([
     json.dumps({"phase": "fold_ref_list", "rounds": "2", "calls": "2", "total_us": "5000",
-                "max_us": "3000", "probe_a_holes": "1", "logs_intended": "0", "logs_applied": "0",
+                "max_us": "3000", "probe_a_holes": "1", "logs_accounted": "0", "logs_applied": "0",
                 "txns_unapplied": "0", "ref_folding_aborted": "0",
-                "metrics": {"ref_keys_listed": "12"}, "events": {"S3ListObjects": "6"}}),
+                "metrics": {"ref_keys_listed": "12", "probe_a_holes": "1", "ref_folding_aborted": "0"},
+                "events": {"S3ListObjects": "6"}}),
     json.dumps({"phase": "fold_ref_intake", "rounds": "2", "calls": "2", "total_us": "800",
-                "max_us": "500", "probe_a_holes": "0", "logs_intended": "9", "logs_applied": "9",
-                "txns_unapplied": "0", "ref_folding_aborted": "0", "metrics": {}, "events": {}}),
+                "max_us": "500", "probe_a_holes": "0", "logs_accounted": "9", "logs_applied": "9",
+                "txns_unapplied": "0", "ref_folding_aborted": "0",
+                "metrics": {"logs_accounted": "9", "logs_applied": "9"}, "events": {}}),
 ])
 
 
