@@ -69,7 +69,7 @@ size_t runToFixpoint(const PoolPtr & s, Gc & gc, size_t max_rounds = 64)
     size_t rounds = 0;
     for (; rounds < max_rounds; ++rounds)
     {
-        const RoundReport rep = gc.runRegularRound();
+        const RoundReport rep = runAuthoritativeRound(gc);
         if (!rep.acquired_lease)
             continue;
         s->renewWatermarkOnce();
@@ -444,7 +444,7 @@ TEST(CasRefGc, RemoveNamespaceCompletesAndPublishesMarkerDeterministically)
     bool marker_seen = false;
     for (int i = 0; i < 24 && !marker_seen; ++i)
     {
-        gc.runRegularRound();
+        runAuthoritativeRound(gc);
         store->renewWatermarkOnce();
         /// The marker key is `_cleanup/<remove_txn_id>`; discover it by listing the cleanup subtree.
         const ListPage page = backend->list(layout.refsNamespacePrefix(ns) + "_cleanup/", "", 100);
@@ -573,7 +573,7 @@ TEST(CasRefGc, RemovedNamespaceCoveredLogsCleanedByCompletingRound)
     bool completed = false;
     for (int i = 0; i < 32 && !completed; ++i)
     {
-        gc.runRegularRound();
+        runAuthoritativeRound(gc);
         store->renewWatermarkOnce();
         completed = countKind(RefObjectKind::Cleanup) > 0;
     }
@@ -640,7 +640,7 @@ TEST(CasRefGc, InvalidRefLogBodyHoldsNamespaceNoPartialDelta)
     publishCommittedTransition(*backend, layout, ns, "tbl", std::nullopt, r);
 
     Gc gc(store, kGc);
-    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+    ASSERT_TRUE(runAuthoritativeRound(gc).acquired_lease);
     ASSERT_EQ(inDegreeOf(*backend, layout, DB::UInt128(1)), 1) << "published and folded";
 
     /// Now DROP the ref, so the blob is genuinely unreferenced once that record folds, and only then
@@ -657,7 +657,7 @@ TEST(CasRefGc, InvalidRefLogBodyHoldsNamespaceNoPartialDelta)
     /// Eight rounds under the hold. Each one catches the hold internally and survives.
     for (int i = 0; i < 8; ++i)
     {
-        ASSERT_NO_THROW(gc.runRegularRound());
+        ASSERT_NO_THROW(runAuthoritativeRound(gc));
         store->renewWatermarkOnce();
     }
 
@@ -683,7 +683,7 @@ TEST(CasRefGc, InvalidRefLogBodyHoldsNamespaceNoPartialDelta)
 
     for (int i = 0; i < 4; ++i)
     {
-        ASSERT_NO_THROW(gc.runRegularRound());
+        ASSERT_NO_THROW(runAuthoritativeRound(gc));
         store->renewWatermarkOnce();
     }
     EXPECT_TRUE(blobPresent(*backend, layout, DB::UInt128(1)))
@@ -893,7 +893,7 @@ TEST(CasRefGc, RecreatedNamespaceRetiresCleanupItemAndStopsChurn)
     RefTxnId remove_txn{};
     for (int i = 0; i < 32 && remove_txn == RefTxnId{}; ++i)
     {
-        gc.runRegularRound();
+        runAuthoritativeRound(gc);
         store->renewWatermarkOnce();
         const ListPage m = backend->list(layout.refsNamespacePrefix(ns) + "_cleanup/", "", 10);
         if (!m.keys.empty())
@@ -921,7 +921,7 @@ TEST(CasRefGc, RecreatedNamespaceRetiresCleanupItemAndStopsChurn)
     backend->resetCounts();
     for (int i = 0; i < 6; ++i)
     {
-        gc.runRegularRound();
+        runAuthoritativeRound(gc);
         store->renewWatermarkOnce();
     }
 
@@ -964,7 +964,7 @@ TEST(CasRefGc, CompletedItemRepublishesCrashLostRemovedSnapshotThenRetires)
     RefTxnId remove_txn{};
     for (int i = 0; i < 32 && remove_txn == RefTxnId{}; ++i)
     {
-        gc.runRegularRound();
+        runAuthoritativeRound(gc);
         store->renewWatermarkOnce();
         const ListPage m = backend->list(layout.refsNamespacePrefix(ns) + "_cleanup/", "", 10);
         if (!m.keys.empty())
@@ -984,12 +984,12 @@ TEST(CasRefGc, CompletedItemRepublishesCrashLostRemovedSnapshotThenRetires)
     ASSERT_FALSE(backend->head(removed_snap_key).exists);
 
     backend->resetCounts();
-    gc.runRegularRound();   /// the Completed branch republishes the lost snapshot (absent AND not superseded)
+    runAuthoritativeRound(gc);   /// the Completed branch republishes the lost snapshot (absent AND not superseded)
     store->renewWatermarkOnce();
     EXPECT_TRUE(backend->head(removed_snap_key).exists) << "a crash-lost Removed snapshot is repaired";
     EXPECT_EQ(backend->putCount(removed_snap_key), 1u) << "republished exactly once (idempotent, not churned)";
 
-    gc.runRegularRound();   /// now the artifacts are durably observed -> the item retires
+    runAuthoritativeRound(gc);   /// now the artifacts are durably observed -> the item retires
     store->renewWatermarkOnce();
     const uint64_t gen = currentGenerationOf(*backend, layout);
     const uint64_t attempt = currentAttemptOf(*backend, layout);

@@ -511,18 +511,33 @@ inline bool blobAbsent(DB::Cas::Backend & backend, const DB::Cas::Layout & layou
     return !backend.head(layout.blobKey(DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(hash)})).exists;
 }
 
+/// ONE round that is allowed to destroy. The destructive gate refuses to act on a universe it cannot
+/// enumerate, and Stage A never can (`UniversePolicy`), so a round left on the production default
+/// reclaims NOTHING. A test whose subject is reclamation therefore has to say so, and this is where it
+/// says it: the test asserts that the universe IT built is closed, which for a unit test over an
+/// `InMemoryBackend` is true by construction -- the test wrote every object in the pool.
+///
+/// It is a spelled-out call, not a seam: production reaches `runRegularRound` with no third argument
+/// and there is no other way in. Tests that are NOT about reclamation should keep calling
+/// `gc.runRegularRound()` plainly -- on the production default they exercise the gate itself.
+inline DB::Cas::RoundReport runAuthoritativeRound(DB::Cas::Gc & gc)
+{
+    return gc.runRegularRound({}, /*allow_steal*/true, DB::Cas::UniversePolicy::AuthoritativeForTest);
+}
+
 /// Reclaim loop (the canonical retired-cursor pipeline driver): run regular rounds, renewing the store's
 /// own heartbeat after each round (`renewWatermarkOnce` — keeps the lease + build-watermark floor
 /// current; unrelated to graduation, which paces on GC rounds alone). A blob condemned at round K is
 /// deleted by round K+2 (condemn at K -> graduate to delete_pending at K+1, unconditionally -> physical
-/// delete at K+2). Returns true as soon as the blob became absent.
+/// delete at K+2). Returns true as soon as the blob became absent. Reclamation is the whole point of the
+/// loop, so every round it drives is an authoritative one.
 inline bool runRoundsUntilAbsent(
     const DB::Cas::PoolPtr & store, DB::Cas::Gc & gc, DB::Cas::Backend & backend,
     const DB::Cas::Layout & layout, const DB::UInt128 & hash, int max_rounds = 8)
 {
     for (int i = 0; i < max_rounds; ++i)
     {
-        gc.runRegularRound();
+        runAuthoritativeRound(gc);
         store->renewWatermarkOnce();
         if (blobAbsent(backend, layout, hash))
             return true;
@@ -994,9 +1009,47 @@ public:
         return InMemoryBackend::putIfAbsent(key, bytes, meta);
     }
 
+    /// Every ATTEMPTED delete is counted, whatever the backend answers. The destructive gate's tests
+    /// assert that a suppressed round issues NONE, and an attempt that came back `NotFound` is still an
+    /// attempt -- counting only successful ones would let a gate that leaks deletes over already-absent
+    /// keys read as green.
+    DB::Cas::DeleteOutcome deleteExact(const String & key, const DB::Cas::Token & token) override
+    {
+        {
+            std::lock_guard lock(count_mutex);
+            ++delete_counts[key];
+            ++delete_total;
+        }
+        return InMemoryBackend::deleteExact(key, token);
+    }
+
     uint64_t headCount(const String & key) const { return lookup(head_counts, key); }
     uint64_t getCount(const String & key) const { return lookup(get_counts, key); }
     uint64_t putCount(const String & key) const { return lookup(put_counts, key); }
+    uint64_t deleteCount(const String & key) const { return lookup(delete_counts, key); }
+    uint64_t deleteTotal() const { std::lock_guard lock(count_mutex); return delete_total; }
+    /// Attempted deletes against any key whose path CONTAINS `substr` — the per-site assertion the
+    /// destructive-gate tests make ("the generation prune deleted nothing", "the sweep deleted nothing").
+    uint64_t deleteCountForKeysContaining(const String & substr) const
+    {
+        std::lock_guard lock(count_mutex);
+        uint64_t total = 0;
+        for (const auto & [key, n] : delete_counts)
+            if (key.find(substr) != String::npos)
+                total += n;
+        return total;
+    }
+    /// Every key this backend was ever asked to delete, in sorted order — so a failing zero-delete
+    /// assertion names the sites that leaked instead of just reporting a count.
+    std::vector<String> deletedKeys() const
+    {
+        std::lock_guard lock(count_mutex);
+        std::vector<String> keys;
+        keys.reserve(delete_counts.size());
+        for (const auto & [key, n] : delete_counts)
+            keys.push_back(key);
+        return keys;
+    }
     uint64_t getStreamCount(const String & key) const { return lookup(get_stream_counts, key); }
     uint64_t listCount(const String & prefix) const { return lookup(list_counts, prefix); }
     /// The max ranged-get window length observed for `key` (0 if only whole-object gets, or none).
@@ -1033,9 +1086,10 @@ public:
         put_counts.clear();
         get_stream_counts.clear();
         list_counts.clear();
+        delete_counts.clear();
         max_ranged_get_len.clear();
         whole_get_counts.clear();
-        head_total = get_total = put_total = get_stream_total = list_total = 0;
+        head_total = get_total = put_total = get_stream_total = list_total = delete_total = 0;
     }
 
 private:
@@ -1052,6 +1106,7 @@ private:
     std::map<String, uint64_t> put_counts;
     std::map<String, uint64_t> get_stream_counts;
     std::map<String, uint64_t> list_counts;
+    std::map<String, uint64_t> delete_counts;
     std::map<String, uint64_t> max_ranged_get_len;
     std::map<String, uint64_t> whole_get_counts;
     uint64_t head_total = 0;
@@ -1059,6 +1114,7 @@ private:
     uint64_t put_total = 0;
     uint64_t get_stream_total = 0;
     uint64_t list_total = 0;
+    uint64_t delete_total = 0;
 };
 
 /// A `CountingBackend` that can fault selected PUTs by key substring (skip the first `fault_skip`

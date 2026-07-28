@@ -67,7 +67,7 @@ size_t runGcToFixpoint(const PoolPtr & s, Gc & gc, size_t max_rounds = 64)
     size_t rounds = 0;
     for (; rounds < max_rounds; ++rounds)
     {
-        const RoundReport rep = gc.runRegularRound();
+        const RoundReport rep = runAuthoritativeRound(gc);
         if (!rep.acquired_lease)
             continue;
         s->renewWatermarkOnce();
@@ -132,7 +132,7 @@ TEST(CasGcAttempt, DeposedFoldAttemptDoesNotWedge)
 
     // Round 1 (honest): fold the +1 so the blob is pinned in the in-degree generation, and adopt the
     // first (snap_generation, snap_attempt).
-    gc.runRegularRound();
+    runAuthoritativeRound(gc);
     EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 1) << "blob pinned by the committed ref";
     const auto after_fold = decodeGcState(backend->get(store->layout().gcStateKey())->bytes);
     ASSERT_EQ(after_fold.snap_attempt, after_fold.lease.seq);
@@ -146,7 +146,7 @@ TEST(CasGcAttempt, DeposedFoldAttemptDoesNotWedge)
     // its single round-commit CAS is DENIED (lease lost mid-round). The round must throw and must NOT
     // advance the adopted (snap_generation, snap_attempt).
     backend->arm_interrupt = true;
-    EXPECT_ANY_THROW(gc.runRegularRound());   // ABORTED: round-commit CAS denied
+    EXPECT_ANY_THROW(runAuthoritativeRound(gc));   // ABORTED: round-commit CAS denied
     backend->arm_interrupt = false;
 
     const auto after_deposed = decodeGcState(backend->get(store->layout().gcStateKey())->bytes);

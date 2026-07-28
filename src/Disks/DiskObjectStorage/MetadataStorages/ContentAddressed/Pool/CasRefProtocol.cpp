@@ -729,7 +729,8 @@ std::map<String, RefTableListing> groupRefKeys(const Layout & layout, const std:
 
 RefCleanupPlan planRefCleanup(const RefTableListing & listing, const RefTxnId & durable_cursor,
                               const std::set<RefTxnId> & removal_logs_blocked,
-                              std::optional<RefTxnId> completed_removal_snapshot)
+                              std::optional<RefTxnId> completed_removal_snapshot,
+                              std::optional<RefTxnId> checkpoint)
 {
     RefCleanupPlan plan;
 
@@ -745,11 +746,19 @@ RefCleanupPlan planRefCleanup(const RefTableListing & listing, const RefTxnId & 
     if (!newest_snapshot)
         return plan;
 
+    /// The SNAPSHOT boundary, `min(X, checkpoint)`. A snapshot is deletable only STRICTLY BELOW it, so
+    /// the snapshot at the boundary -- the newest covering one, or the one the checkpoint names when the
+    /// checkpoint is the tighter of the two -- always survives.
+    const RefTxnId snapshot_boundary =
+        checkpoint && *checkpoint < *newest_snapshot ? *checkpoint : *newest_snapshot;
+
     for (const RefTxnId & log_id : listing.logs)
     {
         if (*newest_snapshot < log_id)     /// L > X: not covered by any durable snapshot
             continue;
         if (durable_cursor < log_id)       /// L > cursor: its edge delta is not yet durable
+            continue;
+        if (checkpoint && *checkpoint < log_id)   /// L > checkpoint: above the namespace's own durable tail
             continue;
         if (removal_logs_blocked.contains(log_id))   /// remove_namespace log whose item is not Completed
             continue;
@@ -760,7 +769,7 @@ RefCleanupPlan planRefCleanup(const RefTableListing & listing, const RefTxnId & 
     /// first published this round is not in `listing.snapshots`, so it is never scheduled for deletion,
     /// and once it later appears in the scan it is the newest and is retained here.
     for (const RefTxnId & snapshot_id : listing.snapshots)
-        if (snapshot_id < *newest_snapshot)
+        if (snapshot_id < snapshot_boundary)
             plan.deletable_snapshots.push_back(snapshot_id);
 
     return plan;

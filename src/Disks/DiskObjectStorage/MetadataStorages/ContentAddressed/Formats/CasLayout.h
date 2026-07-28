@@ -147,6 +147,16 @@ public:
         return refsNamespacePrefix(ns) + "_cleanup/" + renderRefTxnId(id);
     }
 
+    /// The namespace's checkpoint object (spec INV-4) at `<prefix>/cas/refs/<ns>/_ckpt`. UNLIKE every
+    /// other ref object it is MUTABLE (token-CAS), carries no transaction id, and therefore lives
+    /// directly under the namespace prefix rather than in a `_log`/`_snap`/`_cleanup` kind directory --
+    /// which is also why `parseRefObjectKey` does not recognize it. Stage A shape; Stage B re-keys it
+    /// under the namespace's incarnation.
+    String refCkptKey(const RootNamespace & ns) const
+    {
+        return refsNamespacePrefix(ns) + "_ckpt";
+    }
+
     /// Inverse of `refLogKey`/`refSnapshotKey`/`refCleanupMarkerKey`: classifies a LISTED key under
     /// `casRefsPrefix()` by its kind directory (`_cleanup`, `_log`, `_snap`) and parses the trailing
     /// `RefTxnId`. Strict: returns `std::nullopt` -- never throws -- for anything that is not one of

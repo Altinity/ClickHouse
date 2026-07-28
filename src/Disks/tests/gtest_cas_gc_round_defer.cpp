@@ -244,11 +244,11 @@ TEST(CasGcRoundDefer, DueGraduationForcesFoldAndSparesReReferencedBlob)
     publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r1);
     Gc gc(store, kGc);
 
-    gc.runRegularRound();                 /// folds the +1; blob referenced
+    runAuthoritativeRound(gc);                 /// folds the +1; blob referenced
     store->renewWatermarkOnce();
     dropRefTransition(*backend, store->layout(), ns, "tbl", r1);   /// the -1 condemns it
 
-    gc.runRegularRound();                 /// the condemning round
+    runAuthoritativeRound(gc);                 /// the condemning round
     store->renewWatermarkOnce();
 
     /// Drive rounds until the entry graduates (published delete_pending) -- mirrors
@@ -257,7 +257,7 @@ TEST(CasGcRoundDefer, DueGraduationForcesFoldAndSparesReReferencedBlob)
     bool saw_pending = false;
     for (int i = 0; i < 6 && !saw_pending; ++i)
     {
-        gc.runRegularRound();
+        runAuthoritativeRound(gc);
         store->renewWatermarkOnce();
         for (const RetiredEntry & e : currentRetiredSet(*backend, store->layout(), /*shard*/0))
             if (e.ref == DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(blob)} && e.delete_pending)
@@ -274,7 +274,7 @@ TEST(CasGcRoundDefer, DueGraduationForcesFoldAndSparesReReferencedBlob)
 
     /// The next pass would otherwise execute B's pending exact-token delete; graduationDue must force
     /// a FOLD (never a DEFER) so the +1 is folded in and the blob is spared, not deleted.
-    const RoundReport rep = gc.runRegularRound();
+    const RoundReport rep = runAuthoritativeRound(gc);
     EXPECT_FALSE(rep.deferred) << "a due graduation must force a fold, never defer";
     EXPECT_FALSE(blobAbsent(*backend, store->layout(), blob)) << "the re-referenced blob must survive";
 

@@ -411,6 +411,22 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
         e.marker_confirmed = r.marker_confirmed;
         return e;
     };
+    /// THE DELETE-SITE IN-DEGREE RE-READ IS NORMATIVE (spec §5, third arm). It is not an optimization
+    /// and not defense-in-depth: it is the last of the three things that keep a delete from racing a
+    /// live edge, and the only one that acts on THIS pass's freshly merged view.
+    ///
+    ///   1. the round-paced floor: a blob condemned in round R cannot graduate before R+1, so a `+1`
+    ///      that lands in the same round as the condemnation is always folded before any delete;
+    ///   2. the exact-token delete: a writer that resurrected the blob replaced its incarnation, so a
+    ///      stale token's delete finds a TokenMismatch and removes nothing;
+    ///   3. THIS: the entry is settled against `indeg` recomputed by the merge that just ran, so an edge
+    ///      folded after the condemnation but before the delete pass spares the blob outright --
+    ///      `indeg > 0` wins over `delete_pending`, unconditionally and past the floor.
+    ///
+    /// Arms 1 and 2 bound WHEN and WHAT a delete may remove; only this one asks whether the blob is
+    /// still referenced at the moment the pass decides. Removing it -- or reordering the branches so
+    /// that `delete_pending` is checked first -- silently deletes re-referenced blobs on exactly the
+    /// interleaving the other two arms do not cover. Any change here needs a test that fails without it.
     auto settleEntry = [&](const RetiredEntry & e, uint64_t indeg)
     {
         chassert(e.kind == ObjectKind::Blob);   /// the in-degree merge settles Blob entries only

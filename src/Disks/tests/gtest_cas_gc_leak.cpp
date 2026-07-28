@@ -63,7 +63,7 @@ size_t runGcToFixpoint(const PoolPtr & s, Gc & gc, size_t max_rounds = 64)
     size_t rounds = 0;
     for (; rounds < max_rounds; ++rounds)
     {
-        const RoundReport rep = gc.runRegularRound();
+        const RoundReport rep = DB::Cas::tests::runAuthoritativeRound(gc);
         if (!rep.acquired_lease)
             continue;
         s->renewWatermarkOnce();
@@ -322,7 +322,7 @@ TEST(CasGcLeak, ResurrectReplacedIncarnationReclaimed)
 
     /// 3. ONE GC round: A transitions to in-degree 0 and is condemned (retired), NOT yet deleted.
     Gc gc(s, hexToU128("00000000000000000000000000000004"));
-    gc.runRegularRound();
+    DB::Cas::tests::runAuthoritativeRound(gc);
     {
         const auto lm = DB::Cas::tests::loadMetaForTest(*b, s->layout(), u128Of(P));
         ASSERT_TRUE(lm.has_value() && lm->meta.state == MetaState::Condemned)
@@ -372,7 +372,7 @@ TEST(CasGcLeak, ResurrectReplacedReclaimIsIdempotent)
 
     /// 2. ONE GC round: A transitions to in-degree 0 and is condemned (retired), NOT yet deleted.
     Gc gc(s, hexToU128("00000000000000000000000000000005"));
-    gc.runRegularRound();
+    DB::Cas::tests::runAuthoritativeRound(gc);
 
     /// 3. RESURRECT: r2 dedup-hits P while A is condemned -> mints a fresh incarnation B.
     publishOneBlobPart(s, ns, "r2", P);
@@ -387,7 +387,7 @@ TEST(CasGcLeak, ResurrectReplacedReclaimIsIdempotent)
     /// re-condemn it (that would be the churn/duplicate-entry bug) and must not resurrect any debris.
     for (int round = 0; round < 3; ++round)
     {
-        const RoundReport r = gc.runRegularRound();
+        const RoundReport r = DB::Cas::tests::runAuthoritativeRound(gc);
         if (r.acquired_lease)
             EXPECT_EQ(r.condemned, 0u) << "no re-condemn of an already-reclaimed hash on extra round " << round;
         s->renewWatermarkOnce();

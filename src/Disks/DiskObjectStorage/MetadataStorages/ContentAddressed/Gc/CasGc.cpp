@@ -281,7 +281,7 @@ void Gc::forgetCondemnMarker(const BlobRef & ref, const Token & token)
     condemn_markers_confirmed.erase({ref, token.value});
 }
 
-RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool allow_steal)
+RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool allow_steal, UniversePolicy policy)
 {
     RoundReport report;
     GcState state;
@@ -479,7 +479,13 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
 
     /// The pass performs discovery, windowing, and the three-cursor merge (spare / graduate / condemn).
     /// It emits phases 5..10 of its own.
-    FoldResult folded = fold(state, state_token, report, new_round, pre_scan);
+    FoldResult folded = fold(state, state_token, report, new_round, pre_scan, policy);
+
+    /// THE ROUND'S DESTRUCTIVE GATE, read once, here, and consulted at EVERY destructive site below.
+    /// It is available this early because `fold` computes it (see `FoldResult::suppress_destructive`),
+    /// and it has to be: the first destructive site of the post-CAS tail is the hand-off reclaim, which
+    /// used to run before this value was ever read.
+    const bool suppress_destructive = folded.suppress_destructive;
 
     EventEmitter{*store}.emit([&](CasEvent & e)
     {
@@ -512,7 +518,18 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     for (uint64_t shard = 0; shard < folded.retired_merge.size(); ++shard)
     {
         RetiredMergeResult & merge = folded.retired_merge[shard];
-        for (const RetiredEntry & entry : merge.redelete)
+        /// The gate, stated at the site, and scoped to the DELETES alone: the spare / graduate / replace
+        /// bookkeeping below is not destructive and must still run on a suppressed round (a suppressed
+        /// round still condemns, spares and carries -- only irreversible work stops). A suppressed pass
+        /// produces an EMPTY `redelete` by construction (`settleEntry` carries every pending entry
+        /// unchanged instead of promoting it), so this loop would already do nothing -- but "would
+        /// already do nothing" is a property of another file, and the content-delete site does not
+        /// delegate its own gate. If the two ever disagree, the round deletes nothing rather than
+        /// deleting on a frontier it cannot prove.
+        static const std::vector<RetiredEntry> kNothingToDelete;
+        const std::vector<RetiredEntry> & redelete_now =
+            suppress_destructive ? kNothingToDelete : merge.redelete;
+        for (const RetiredEntry & entry : redelete_now)
         {
             DeleteOutcome del = backend.deleteExact(layout.blobKey(entry.ref), entry.token);
             if (del.created_delete_marker)
@@ -766,7 +783,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// imply -- an accepted forensics-window slack, not a data-loss risk: every still-reachable
     /// run/blob is independently protected via `referenced_generations` (captured pre-fold above).
     const uint64_t pruned_through_before = state.snap_pruned_through;
-    pruneSupersededGenerations(generation, attempt, next, referenced_generations);
+    pruneSupersededGenerations(generation, attempt, next, referenced_generations, suppress_destructive);
     round_commit_timer->metric("generations_visited", next.snap_pruned_through - pruned_through_before);
     round_commit_timer->metric("pruned_through", next.snap_pruned_through);
     round_commit_timer->metric("generations_referenced", referenced_generations.size());
@@ -812,7 +829,15 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
             new_referenced_generations.insert(r.generation);
 
         std::set<uint64_t> handed_off;   /// dedupe: multiple parent refs can share one generation
-        for (const RunRef & old_ref : parent_seal_runs)
+        /// GATED like every other destructive site. Nothing is lost by skipping it: the hand-off is
+        /// already best-effort and already re-derived from the seal, so the next unsuppressed round whose
+        /// ref has moved off the generation reclaims it then. This is also the FIRST destructive site of
+        /// the post-CAS tail, which is why the gate is read before the tail begins rather than partway
+        /// down it.
+        static const std::vector<RunRef> kNoRuns;
+        const std::vector<RunRef> & handoff_candidates =
+            suppress_destructive ? kNoRuns : parent_seal_runs;
+        for (const RunRef & old_ref : handoff_candidates)
         {
             /// Only generations the wholesale prune already passed AND that no live ref still pins.
             if (old_ref.generation > state.snap_pruned_through)
@@ -831,6 +856,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         }
         t.metric("generations_reclaimed", handed_off.size());
         t.metric("objects_reclaimed", objects_reclaimed);
+        t.metric("suppressed", suppress_destructive ? 1 : 0);
     }
 
     /// Post-CAS: owner-removed manifest bodies — deleted ONLY now, after their decrements were
@@ -841,7 +867,15 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     {
         GcPhaseTimer t(phase_sink, "manifest_deletes");
         const uint64_t manifests_deleted_before = report.manifests_deleted;
-        for (const auto & [id, token] : folded.mf_cleanup)
+        /// GATED. A manifest body is content the ref graph still describes until its decrements are both
+        /// sealed AND taken on a round that could prove its frontier -- an unprovable round's `-1` may
+        /// itself be the observation that is missing an owner elsewhere, so deleting the body on it is
+        /// exactly the irreversible step the gate exists to withhold. The bodies are re-derived from the
+        /// next round's own fold, and the orphan sweep is the backstop for the crash case.
+        static const std::map<ManifestId, Token> kNoManifestCleanup;
+        const std::map<ManifestId, Token> & mf_cleanup_now =
+            suppress_destructive ? kNoManifestCleanup : folded.mf_cleanup;
+        for (const auto & [id, token] : mf_cleanup_now)
         {
             const DeleteOutcome mdel = backend.deleteExact(layout.manifestKey(id), token);   /// NotFound/TokenMismatch tolerated
             const DeleteClass mdel_class = classifyDeleteOutcome(mdel);
@@ -860,8 +894,9 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
                 e.reason = "owner-removed manifest body; exact-token delete after decrements adopted";
             });
         }
-        t.metric("attempted", folded.mf_cleanup.size());
+        t.metric("attempted", mf_cleanup_now.size());
         t.metric("deleted", report.manifests_deleted - manifests_deleted_before);
+        t.metric("suppressed", suppress_destructive ? 1 : 0);
     }
 
     /// Ref-object cleanup + namespace-cleanup item passes, post-CAS so the durable fold
@@ -877,7 +912,6 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// (the previous order) left the completing round unable to see its own just-published snapshot, so a
     /// removed namespace's covered logs persisted as debris until some later fold -- which never comes on
     /// a quiesced pool.
-    const bool suppress_destructive = folded.suppress_destructive;
     /// PHASE 16/18 `namespace_cleanup`.
     {
         GcPhaseTimer t(phase_sink, "namespace_cleanup");
@@ -908,9 +942,15 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     {
         GcPhaseTimer t(phase_sink, "orphan_sweep");
         const String sweep_cursor_before = state.manifest_sweep_cursor;
+        /// GATED, and the cursor stays put with it. The sweep decides a body is an orphan from the
+        /// SAME durable watermark/ownership view the fold just failed to prove complete, so an
+        /// unprovable round is exactly the round whose orphan verdicts cannot be trusted. Advancing the
+        /// cursor without sweeping would be worse than not running at all -- the skipped range is never
+        /// revisited -- so the whole pass is skipped, cursor included.
         try
         {
-            runManifestSweepCursorPass(state, state_token);
+            if (!suppress_destructive)
+                runManifestSweepCursorPass(state, state_token);
         }
         catch (const Exception & e)
         {
@@ -918,6 +958,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         }
         t.metric("cursor_advanced", state.manifest_sweep_cursor != sweep_cursor_before ? 1 : 0);
         t.metric("list_budget_keys", store->poolConfig().manifest_sweep_list_budget_keys);
+        t.metric("suppressed", suppress_destructive ? 1 : 0);
     }
 
     return report;
@@ -1192,7 +1233,7 @@ Gc::GenerationSealProbe Gc::probeGenerationForSeal(uint64_t generation)
 }
 
 Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & report,
-                        uint64_t current_round, const RefScanSummary & pre_scan)
+                        uint64_t current_round, const RefScanSummary & pre_scan, UniversePolicy policy)
 {
     Backend & backend = store->backend();
     const Layout & layout = store->layout();
@@ -1651,37 +1692,69 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     const std::map<String, RefTxnId> checkpoint_witness =
         readCheckpointWitnesses(ref_tables, parent_cursors);
 
-    /// WHICH NAMESPACES THIS ROUND WALKS: every namespace the hint names, PLUS every namespace the
-    /// parent seal left HELD. A hold must force an exact retry of its offending position even when the
-    /// hint omits the namespace entirely (spec §5) -- otherwise a store that simply stops listing a
-    /// namespace clears its hold, which is precisely the failure the hold exists to prevent. A held
-    /// namespace with no hint entry walks against an EMPTY listing: it has no hint witnesses, but it
-    /// still reads its offending position by exact key, and the carried hold itself supplies the
-    /// witness that keeps an absent below that position from reading as a frontier.
+    /// WHICH NAMESPACES THIS ROUND WALKS -- i.e. THE ROUND'S UNIVERSE, the set the destructive gate owes
+    /// a frontier proof for (spec §5; `UniversePolicy` for why Stage A refuses to trust it):
+    ///
+    ///     (every namespace this round's hint names) ∪ (every namespace the adopted seal carries a
+    ///     shard-0 cursor for)
+    ///
+    /// The second half is a UNION, and that direction is the whole point: `discoverUniverse` is a hint
+    /// and its mechanism has not changed, but a hint that goes quiet about a namespace can now only ADD
+    /// nothing -- it can no longer SHRINK the obligation, because the cursor keeps the namespace in the
+    /// set. A held namespace was already carried for a narrower reason (a hold must force an exact retry
+    /// of its offending position even when the hint omits the namespace entirely -- otherwise a store
+    /// that stops listing a namespace clears its hold, precisely the failure the hold exists to
+    /// prevent); the union generalizes that from held namespaces to every known one.
+    ///
+    /// A namespace with no hint entry walks against an EMPTY listing: it has no hint witnesses, but it
+    /// still reads its expected-next by exact key -- ONE `GET`, whose absence IS the frontier proof and
+    /// whose PRESENCE means the namespace was wrongly quiet and gets walked properly this round. A
+    /// carried hold additionally supplies the witness that keeps an absent below its position from
+    /// reading as a frontier.
+    ///
+    /// COST: held namespaces are always walked (their retry is a liveness obligation, not a budgeted
+    /// nicety); the merely-QUIET ones are bounded by `gc_frontier_probe_budget`, and the ones the budget
+    /// does not reach are simply unproven, which suppresses the round's destruction. In a healthy pool
+    /// that budget is never touched -- a namespace that legitimately went away leaves its `_cleanup`
+    /// marker behind, so it stays in the hint and is walked as a hinted target anyway.
     static const RefTableListing kNoListing;
     std::vector<std::pair<String, const RefTableListing *>> walk_targets;
     for (const auto & [ns_str, listing] : ref_tables)
         walk_targets.emplace_back(ns_str, &listing);
     uint64_t intake_unhinted_held = 0;
-    for (const auto & [held_key, held_cov] : parent_cursors)
+    uint64_t intake_unhinted_quiet = 0;
+    uint64_t frontier_probe_budget = store->poolConfig().gc_frontier_probe_budget;
+    uint64_t intake_unprobed_budget = 0;
+    for (const auto & [known_key, known_cov] : parent_cursors)
     {
-        if (!held_cov.hold)
-            continue;
         /// These keys come out of a DECODED seal, where a coverage map key is an arbitrary string, and
         /// `parseCursorKey` is documented as undefined on anything `cursorKey` did not produce. So
         /// parse loosely and then PROVE it by rebuilding the key. The round trip is what a separator
         /// check alone would miss: `parseCursorKey` resolves "ns/xyz" to shard 0 (its `from_chars`
         /// simply fails and leaves the value), and this walk would then fold a namespace under a shard
         /// the key never named.
-        if (held_key.find('/') == String::npos)
+        if (known_key.find('/') == String::npos)
             continue;
-        const auto [held_ns, held_shard] = parseCursorKey(held_key);
-        if (cursorKey(held_ns, held_shard) != held_key)
+        const auto [known_ns, known_shard] = parseCursorKey(known_key);
+        if (cursorKey(known_ns, known_shard) != known_key)
             continue;
-        if (held_shard != 0 || ref_tables.contains(held_ns.string()))
+        if (known_shard != 0 || ref_tables.contains(known_ns.string()))
             continue;
-        walk_targets.emplace_back(held_ns.string(), &kNoListing);
-        ++intake_unhinted_held;
+        if (known_cov.hold)
+        {
+            walk_targets.emplace_back(known_ns.string(), &kNoListing);
+            ++intake_unhinted_held;
+            continue;
+        }
+        /// Merely quiet: known, unhinted, unheld. One exact probe, budget permitting.
+        if (frontier_probe_budget == 0)
+        {
+            ++intake_unprobed_budget;
+            continue;
+        }
+        --frontier_probe_budget;
+        walk_targets.emplace_back(known_ns.string(), &kNoListing);
+        ++intake_unhinted_quiet;
     }
 
     for (const auto & [ns_str, listing_ptr] : walk_targets)
@@ -1747,6 +1820,14 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         ShardCoverage cov;
         cov.classification = 0;
         bool table_changed = false;
+        /// THE FRONTIER PROOF for this namespace, and there is exactly one thing that establishes it:
+        /// the walk read the expected-next position by exact key, found it ABSENT, and no witness put
+        /// anything above it. That is the honest end of the record stream. Every other way out of the
+        /// loop leaves the namespace unproven -- a hold (this round's or a carried one), and the walk
+        /// that never started because a never-folded namespace's hint offered no genesis position to
+        /// start from (the Stage B `_ckpt.life_epoch` gap documented at the `expected` initialization
+        /// below: no probe was taken, so nothing was proved, and fail-closed says unproven).
+        bool frontier_proven = false;
         /// The hold THIS round detected, at the position it stopped. It IS the clamp signal: there is
         /// no separate boolean that could disagree with it about whether the namespace stopped.
         std::optional<RefHold> fired;
@@ -1920,7 +2001,10 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                 ++intake_absent_probes;
                 const auto witness = witnessAbove(*expected);
                 if (!witness)
+                {
+                    frontier_proven = true;
                     break;   /// nothing above: this is the namespace's frontier this round
+                }
 
                 if (witness->writer_epoch == expected->writer_epoch)
                 {
@@ -2163,11 +2247,19 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             cov.hold = effective;
             cov.classification = 4;
             ++intake_tables_held;
+            /// A held namespace is unproven BY DEFINITION -- the hold names a position the walk could
+            /// not resolve, so everything at or above it is unaccounted. Stated here rather than left to
+            /// the loop's control flow: a carried hold rides forward on a round whose own walk ended
+            /// quietly, and that quiet end must not be mistaken for a proof.
+            frontier_proven = false;
         }
         else
             cov.classification = table_changed ? 2 : 1;
 
         result.fold_seal.per_ns_shard[cursor_key] = cov;
+        ++result.frontier_namespaces;
+        if (frontier_proven)
+            ++result.frontier_proven;
         if (table_changed)
         {
             folded_any = true;
@@ -2175,6 +2267,35 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         }
         if (fired)
             ++intake_tables_clamped;
+    }
+
+    /// Namespaces the round KNOWS about but never probed, because the frontier-probe budget ran out
+    /// before reaching them. Their cursors ride VERBATIM -- dropping a cursor because a round ran out of
+    /// budget would hand the next round a namespace to re-fold from `{0,0}`, which is a far worse
+    /// outcome than the unproven frontier this already is. They count toward the universe and NOT toward
+    /// the proofs, which is what suppresses the round.
+    result.frontier_namespaces += intake_unprobed_budget;
+    if (intake_unprobed_budget > 0)
+    {
+        uint64_t carried = 0;
+        for (const auto & [known_key, known_cov] : parent_cursors)
+        {
+            if (result.fold_seal.per_ns_shard.contains(known_key))
+                continue;
+            if (known_key.find('/') == String::npos)
+                continue;
+            const auto [known_ns, known_shard] = parseCursorKey(known_key);
+            if (cursorKey(known_ns, known_shard) != known_key || known_shard != 0)
+                continue;
+            if (ref_tables.contains(known_ns.string()))
+                continue;
+            result.fold_seal.per_ns_shard[known_key] = known_cov;
+            ++carried;
+        }
+        LOG_WARNING(logger,
+            "CAS GC ref intake: the frontier-probe budget ({}) ran out with {} known namespace(s) "
+            "unprobed; their cursors ride unchanged and ALL destructive work is suppressed this round",
+            store->poolConfig().gc_frontier_probe_budget, carried);
     }
 
     /// All-or-nothing: a malformed key/body anywhere aborts the round's ref folding. Discard
@@ -2187,6 +2308,9 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         result.mf_cleanup.clear();
         folded_any = false;
         result.fold_seal.per_ns_shard.clear();
+        /// An abort discards this round's walk, so it discards its proofs with it: nothing this round
+        /// observed may be offered as a frontier proof to the destructive gate.
+        result.frontier_proven = 0;
         for (const auto & [ns_str, listing_ptr] : walk_targets)
         {
             const String cursor_key = cursorKey(RootNamespace{ns_str}, /*shard*/0);
@@ -2276,6 +2400,15 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// used to clear a hold silently.
     intake_timer->metric("tables_held", intake_tables_held);
     intake_timer->metric("unhinted_held_walked", intake_unhinted_held);
+    /// THE FRONTIER OBLIGATION, on the row that explains a round which reclaimed nothing:
+    /// `frontier_namespaces` is the round's universe (hint ∪ sealed cursors), `frontier_proven` the part
+    /// of it that reached an honest end-of-stream, and the two remaining columns say where the rest
+    /// went -- walked because the hint had gone quiet about them, or not walked at all because the
+    /// probe budget ran out.
+    intake_timer->metric("frontier_namespaces", result.frontier_namespaces);
+    intake_timer->metric("frontier_proven", result.frontier_proven);
+    intake_timer->metric("unhinted_quiet_walked", intake_unhinted_quiet);
+    intake_timer->metric("frontier_unprobed_budget", intake_unprobed_budget);
     intake_timer->metric("dead_precommits_skipped", intake_dead_precommits_skipped);
     /// The exact reads arithmetic intake pays that the listing-driven loop did not. `absent_probes`
     /// counts EVERY read that came back absent: the expected-next of each namespace walked (at least one
@@ -2288,9 +2421,14 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     intake_timer->metric("ref_folding_aborted", ref_folding_aborted ? 1 : 0);
     intake_timer.reset();   /// emits the `fold_ref_intake` row
 
+    result.frontier_unprobed_budget = intake_unprobed_budget;
+
     /// Reuse the round's single ref LIST for post-CAS ref-object cleanup: one LIST serves
     /// intake AND cleanup planning).
     result.ref_tables = ref_tables;
+    /// Same reuse for the checkpoints: the intake walk already paid for them as its second witness, and
+    /// the cleanup ranges below are the other consumer of the same fact.
+    result.checkpoints = checkpoint_witness;
 
     /// Namespace-cleanup items: carry the parent generation's items forward, add a Pending
     /// item for each remove_namespace transaction folded this round (skipped on a ref-folding abort), and
@@ -2452,15 +2590,60 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     const uint64_t deltas_in = deltas.size();
     const uint64_t condemned_before = report.condemned;
     uint64_t shards_pure_carry = 0;
-    result.suppress_destructive = !report.anomalies.empty();
+    /// ============================ THE DESTRUCTIVE GATE ============================
+    ///
+    /// Computed ONCE, here, from three independent terms, and consulted at every destructive site of
+    /// the round (see `FoldResult::suppress_destructive`). It sits at this point in the fold because
+    /// every input is final: the coverage rows the seal will carry are written, the anomalies are
+    /// recorded, and the frontier tally is closed.
+    ///
+    /// Term 2 is STRUCTURAL. Today every hold also records an anomaly, so term 1 happens to imply it --
+    /// but that is a property of the current code, not the invariant, and a gate that relies on a
+    /// coincidence opens the day the coincidence stops holding. The hold SET is the invariant, so the
+    /// gate reads the seal it is about to make durable.
+    const std::vector<std::pair<String, RefHold>> carried_holds = result.carriedHolds();
+
+    /// Term 3, the universe seam. `AuthoritativeForTest` means the CALLER has constructed a closed
+    /// universe and the per-namespace proofs may decide on their own; anything else -- which in
+    /// production is the only possibility -- refuses, because Stage A cannot enumerate the namespaces
+    /// the proofs would have to cover. See `UniversePolicy`.
+    const bool universe_authoritative = policy == UniversePolicy::AuthoritativeForTest;
+    result.frontier_complete = universe_authoritative
+        && result.frontier_proven == result.frontier_namespaces;
+    const bool frontier_incomplete = !result.frontier_complete;
+
+    result.suppress_destructive =
+        !report.anomalies.empty() || !carried_holds.empty() || frontier_incomplete;
     const bool suppress_destructive = result.suppress_destructive;
     if (suppress_destructive)
     {
         ProfileEvents::increment(ProfileEvents::CasGcClampSuppressedPasses);
-        LOG_WARNING(logger,
-            "CAS GC fold: {} clamp anomaly(ies) this pass — graduations and pending deletes are "
-            "SUPPRESSED (carried) until a clamp-free pass; landed events may be unfolded behind "
-            "the clamps", report.anomalies.size());
+        /// LEVEL SPLIT, deliberately. A pass suppressed by an anomaly, a hold, or an exhausted probe
+        /// budget has a per-round cause an operator can chase, and that is a WARNING. A pass suppressed
+        /// ONLY by the Stage-A universe constant is a static property of the build -- true on every
+        /// round of every pool -- so warning about it would emit one alarm per round forever and train
+        /// operators to ignore the channel that carries the real ones. It is still reported, at Info,
+        /// with the same numbers.
+        const bool per_round_cause = !report.anomalies.empty() || !carried_holds.empty()
+            || result.frontier_proven != result.frontier_namespaces;
+        const char * const universe_note =
+            universe_authoritative ? "" : "; the universe itself is not provable this stage";
+        if (per_round_cause)
+            LOG_WARNING(logger,
+                "CAS GC fold: destructive work SUPPRESSED this pass — {} anomaly(ies), {} held "
+                "namespace(s), frontier {} ({} of {} namespace(s) proven{}). Graduations and pending "
+                "deletes are carried; nothing irreversible runs until a pass that clears all three.",
+                report.anomalies.size(), carried_holds.size(),
+                result.frontier_complete ? "complete" : "INCOMPLETE",
+                result.frontier_proven, result.frontier_namespaces, universe_note);
+        else
+            LOG_INFO(logger,
+                "CAS GC fold: destructive work SUPPRESSED this pass — {} anomaly(ies), {} held "
+                "namespace(s), frontier {} ({} of {} namespace(s) proven{}). Graduations and pending "
+                "deletes are carried; nothing irreversible runs until a pass that clears all three.",
+                report.anomalies.size(), carried_holds.size(),
+                result.frontier_complete ? "complete" : "INCOMPLETE",
+                result.frontier_proven, result.frontier_namespaces, universe_note);
     }
 
     if (state.gc_shards == 1)
@@ -2755,12 +2938,26 @@ void Gc::cleanupRefObjects(const FoldResult & folded, bool suppress_destructive)
         if (const auto cit = completed_removals.find(ns_str); cit != completed_removals.end())
             completed_removal_snapshot = cit->second;
 
-        const RefCleanupPlan plan =
-            planRefCleanup(listing, durable_cursor, removal_logs_blocked, completed_removal_snapshot);
+        /// The namespace's own durable tail, which TIGHTENS both delete boundaries and can never widen
+        /// either -- see `planRefCleanup`. Absent here in Stage A (the `_ckpt` object is Task 5's and the
+        /// witness read returns nothing until it lands), which degrades both boundaries to exactly what
+        /// they were before.
+        std::optional<RefTxnId> checkpoint;
+        if (const auto ckit = folded.checkpoints.find(ns_str); ckit != folded.checkpoints.end())
+            checkpoint = ckit->second;
+
+        const RefCleanupPlan plan = planRefCleanup(listing, durable_cursor, removal_logs_blocked,
+                                                   completed_removal_snapshot, checkpoint);
         for (const RefTxnId & log_id : plan.deletable_logs)
             deleteRefObject(layout.refLogKey(ns, log_id));
         for (const RefTxnId & snap_id : plan.deletable_snapshots)
+        {
+            /// Task 5's rule, asserted where it is acted on rather than only where it is computed: the
+            /// snapshot the checkpoint names is the one a recovering reader will sample, so it must
+            /// survive every cleanup that the same checkpoint authorized.
+            chassert(!checkpoint || snap_id < *checkpoint);
             deleteRefObject(layout.refSnapshotKey(ns, snap_id));
+        }
     }
 }
 
@@ -2852,6 +3049,29 @@ void Gc::runNamespaceCleanupPasses(const CasFoldSeal & seal, const std::map<Stri
                     cursor = page.next_cursor;
                 }
             }
+
+            /// THE `_ckpt` BACKSTOP. The removed namespace's checkpoint object is the one ref object
+            /// nothing else reclaims: the covered-log cleanup deletes logs and snapshots, the two
+            /// physical passes above cover `cas/manifests/<ns>/` and the verbatim files, and
+            /// `namespacePhysicallyEmpty` -- which decides Pending -> Completed -- does not look under
+            /// `cas/refs/` at all. A leaked `_ckpt` is therefore invisible to the completion condition
+            /// while remaining visible to `serverRootSubtreeEmpty`, which leaves a fully drained server
+            /// root permanently unreclaimable (`claimOwnerOrThrow` refuses it as CORRUPTED_DATA).
+            ///
+            /// KNOWN KEY, not a prefix pass: the key is derived from the namespace alone, so this is one
+            /// HEAD and one exact-token delete -- no enumeration under `cas/refs/`, which is deliberate
+            /// (an enumerate-and-delete there could reach a recreated incarnation's live objects). It
+            /// sits under the SAME per-key marker guard as every delete above, for the same reason: the
+            /// marker's presence is the exact precondition for any recreation, and a recreated namespace
+            /// publishes a fresh `_ckpt` at this very key.
+            ///
+            /// Stage B's lifecycle owns the ordinary delete of this object by exact token; this is the
+            /// GC-side backstop for the incarnation that never got one.
+            if (!round_still_ours() || backend.head(marker_key).exists)
+                return;
+            const String ckpt_key = layout.refCkptKey(item.ns);
+            if (const HeadResult ckpt_head = backend.head(ckpt_key); ckpt_head.exists)
+                backend.deleteExact(ckpt_key, ckpt_head.token);   /// NotFound/TokenMismatch tolerated
         }
         else
         {
@@ -2936,8 +3156,16 @@ uint64_t deletePrefixWholesale(Backend & backend, const String & prefix, uint64_
 }
 
 void Gc::pruneSupersededGenerations(uint64_t adopted_generation, uint64_t attempt, GcState & next,
-                                    const std::set<uint64_t> & referenced_generations)
+                                    const std::set<uint64_t> & referenced_generations,
+                                    bool suppress_destructive)
 {
+    /// GATED, and `snap_pruned_through` stays where it is. The cursor is a monotone high-water mark the
+    /// wholesale prune never revisits, so advancing it over a generation this round declined to delete
+    /// would strand that generation's whole prefix with no reclaimer left (the hand-off only covers
+    /// generations a LIVE ref moved off, not ones skipped for suppression).
+    if (suppress_destructive)
+        return;
+
     const uint64_t keep = store->poolConfig().gc_snap_generations_to_keep;
     if (keep == 0)
         return;   /// keep ALL (debug/forensics — replay GC's in-degree view as-of a past round)

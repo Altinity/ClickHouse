@@ -133,7 +133,7 @@ void runGcToFixpoint(const PoolPtr & s, Gc & gc, size_t max_rounds = 64)
 {
     for (size_t r = 0; r < max_rounds; ++r)
     {
-        const RoundReport rep = gc.runRegularRound();
+        const RoundReport rep = DB::Cas::tests::runAuthoritativeRound(gc);
         if (!rep.acquired_lease)
             continue;
         s->renewWatermarkOnce();
