@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasInspect.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCkptFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
@@ -149,4 +150,41 @@ TEST(CasInspect, RendersBlobTargetRunEdgeAndCondemnedRows)
     EXPECT_NE(json.find(R"("edges":1)"), String::npos) << json;
     EXPECT_NE(json.find(R"("condemned":1)"), String::npos) << json;
     EXPECT_NE(json.find(R"("zero_markers":0)"), String::npos) << json;
+}
+
+/// Stage A task 5 (spec INV-4): the `_ckpt` renders as its own object kind. It is the one ref object
+/// with no transaction id in its key, so before this branch existed the `cas/refs/` dispatch threw
+/// `BAD_ARGUMENTS` for it -- and it is precisely the object an operator reaches for when asking "what
+/// is recovery's base" or "why is cleanup not reclaiming anything".
+TEST(CasInspect, RendersRefCkptWithEveryFieldPresent)
+{
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/db/tbl"};
+
+    const RefCkpt ckpt{.life_epoch = std::optional<uint64_t>{7},
+                       .checkpoint_snapshot_id = RefTxnId{7, 9},
+                       .last_epoch_seal = RefTxnId{6, 4}};
+
+    const String json = caInspectToJson(layout, layout.refCkptKey(ns), encodeRefCkpt(ckpt));
+    EXPECT_NE(json.find(R"("object":"ref_ckpt")"), String::npos) << json;
+    /// The namespace comes from the KEY: a `_ckpt` body does not name it.
+    EXPECT_NE(json.find(R"("ns":"srv1/db/tbl")"), String::npos) << json;
+    EXPECT_NE(json.find(R"("life_epoch":7)"), String::npos) << json;
+    EXPECT_NE(json.find(R"("writer_epoch":7,"ref_sequence":9)"), String::npos) << json;
+    EXPECT_NE(json.find(R"("writer_epoch":6,"ref_sequence":4)"), String::npos) << json;
+}
+
+/// The absences are the interesting readings, so they render as explicit `null`s rather than missing
+/// keys: no checkpoint means recovery has no base AND nothing is deletable, which is a very different
+/// report from "the key is there and I could not tell you what is in it".
+TEST(CasInspect, RendersRefCkptAbsencesAsExplicitNulls)
+{
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/db/fresh"};
+
+    const String json = caInspectToJson(layout, layout.refCkptKey(ns), encodeRefCkpt(RefCkpt{}));
+    EXPECT_NE(json.find(R"("object":"ref_ckpt")"), String::npos) << json;
+    EXPECT_NE(json.find(R"("life_epoch":null)"), String::npos) << json;
+    EXPECT_NE(json.find(R"("checkpoint_snapshot_id":null)"), String::npos) << json;
+    EXPECT_NE(json.find(R"("last_epoch_seal":null)"), String::npos) << json;
 }

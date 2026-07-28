@@ -5,6 +5,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCkptFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
@@ -188,6 +189,25 @@ String renderRefTableSnapshot(const RefTableSnapshot & s)
         .add("sealed_from", s.sealed_from ? renderRefTxnIdObj(*s.sealed_from) : "null")
         .add("committed", jsonArray(committed))
         .add("precommits", jsonArray(precommits))
+        .str();
+}
+
+/// The namespace's checkpoint (spec INV-4). Every field is optional and each absence means something
+/// different an operator needs to see: no `life_epoch` means no writer that knew this namespace's
+/// genesis epoch has written here yet, no `checkpoint_snapshot_id` means recovery has no base and
+/// NOTHING is deletable, and no `last_epoch_seal` means no epoch of this namespace has been closed.
+/// They are rendered as explicit `null`s rather than omitted keys so the three cases are visible.
+/// `ns` comes from the KEY -- unlike the log and snapshot objects, a `_ckpt` body does not name its
+/// namespace, so there is no key-to-body binding to cross-check here.
+String renderRefCkpt(const RootNamespace & ns, const RefCkpt & c)
+{
+    return JsonObj()
+        .add("object", jsonEscape("ref_ckpt"))
+        .add("ns", jsonEscape(ns.string()))
+        .add("life_epoch", c.life_epoch ? jsonUInt(*c.life_epoch) : "null")
+        .add("checkpoint_snapshot_id",
+             c.checkpoint_snapshot_id ? renderRefTxnIdObj(*c.checkpoint_snapshot_id) : "null")
+        .add("last_epoch_seal", c.last_epoch_seal ? renderRefTxnIdObj(*c.last_epoch_seal) : "null")
         .str();
 }
 
@@ -564,6 +584,13 @@ String caInspectToJson(const Layout & layout, const String & key, std::string_vi
 
     if (key.starts_with(layout.casRefsPrefix()))
     {
+        /// The `_ckpt` carries no transaction id and lives directly under the namespace prefix rather
+        /// than in a kind directory, so `parseRefObjectKey` cannot recognize it. Classify it FIRST or
+        /// the throw below would reject the one ref object an operator is most likely to inspect by
+        /// hand -- it is what decides recovery's base and what cleanup may delete.
+        if (const auto ckpt_ns = layout.parseRefCkptKey(key))
+            return renderRefCkpt(*ckpt_ns, decodeRefCkpt(bytes));
+
         const auto parsed = layout.parseRefObjectKey(key);
         if (!parsed)
             throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,

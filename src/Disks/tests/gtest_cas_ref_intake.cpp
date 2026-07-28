@@ -190,6 +190,7 @@ TEST(CasRefIntake, GroupRefKeys)
         layout.refLogKey(ns, rid(1, 5)),
         layout.refLogKey(ns, rid(1, 3)),
         layout.refCleanupMarkerKey(ns, rid(1, 2)),
+        layout.refCkptKey(ns),        /// the checkpoint (spec INV-4): a ref object with no txn id
         "p/cas/manifests/db/t/foo",   /// outside the ref prefix -> ignored
     };
     const auto grouped = groupRefKeys(layout, keys);
@@ -198,8 +199,20 @@ TEST(CasRefIntake, GroupRefKeys)
     EXPECT_EQ(t.logs, (std::vector<RefTxnId>{rid(1, 3), rid(1, 5)}));
     EXPECT_EQ(t.snapshots, (std::vector<RefTxnId>{rid(1, 4)}));
     EXPECT_EQ(t.cleanup_markers, (std::vector<RefTxnId>{rid(1, 2)}));
+    /// The checkpoint carries no transaction id, so it cannot join the three id vectors -- but it IS
+    /// one of the table's ref objects, and a listing that dropped it would report a table with a
+    /// checkpoint as indistinguishable from one without.
+    EXPECT_TRUE(t.has_ckpt);
+
+    /// And a table with no checkpoint says so, rather than defaulting to the same answer.
+    const auto no_ckpt = groupRefKeys(layout, {layout.refLogKey(ns, rid(1, 1))});
+    ASSERT_EQ(no_ckpt.size(), 1u);
+    EXPECT_FALSE(no_ckpt.at("db/t").has_ckpt);
 
     /// A key under the ref prefix that is not a valid ref object aborts (a leftover old-format shard key).
+    /// This is what makes the `_ckpt` arm above load-bearing rather than cosmetic: without it the
+    /// checkpoint would land HERE, and the first namespace to get one would abort ref folding for the
+    /// whole round, in every round, pool-wide.
     EXPECT_THROW(groupRefKeys(layout, {"p/cas/refs/db/t/0"}), DB::Exception);
     /// A malformed namespace (empty segment) under a valid kind directory aborts.
     EXPECT_THROW(groupRefKeys(layout, {"p/cas/refs/db//_log/" + renderRefTxnId(rid(1, 1))}), DB::Exception);

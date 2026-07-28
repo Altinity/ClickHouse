@@ -281,8 +281,11 @@ TEST(CasLayout, ParseRefObjectKeyRejections)
     EXPECT_FALSE(l.parseRefObjectKey("p/cas/refs/srv1/tbl@cas@/_log/"
         "0000000000000007-000000000000008E").has_value());
     EXPECT_FALSE(l.parseRefObjectKey("p/cas/refs/srv1/tbl@cas@/_log/7-8e").has_value());
-    /// `_snap` without its `.proto` suffix, and WITH a stray suffix, are both rejected.
-    EXPECT_FALSE(l.parseRefObjectKey(snap_key.substr(0, snap_key.size() - String(".proto").size())).has_value());
+    /// `_snap` without its stored suffix, and WITH a stray one, are both rejected. The suffix is taken
+    /// from the registry rather than spelled out: it was `.proto` when this test was written and is
+    /// `.zst` today, and stripping the wrong number of characters would have tested nothing.
+    const String snap_suffix{storedSuffix(FormatId::RefSnapshot)};
+    EXPECT_FALSE(l.parseRefObjectKey(snap_key.substr(0, snap_key.size() - snap_suffix.size())).has_value());
     EXPECT_FALSE(l.parseRefObjectKey(log_key + ".proto").has_value());
     /// `_cleanup`/`_log` ids never carry an extension.
     EXPECT_FALSE(l.parseRefObjectKey(l.refCleanupMarkerKey(ns, id) + ".bin").has_value());
@@ -291,6 +294,54 @@ TEST(CasLayout, ParseRefObjectKeyRejections)
     EXPECT_FALSE(l.parseRefObjectKey(snap_key + "/extra").has_value());
     /// Missing namespace segment entirely.
     EXPECT_FALSE(l.parseRefObjectKey("p/cas/refs/_log/" + renderRefTxnId(id)).has_value());
+    /// The `_ckpt` (spec INV-4) has no kind directory and no transaction id, so the id-bearing parser
+    /// must not claim it. Every sweep over the ref prefix has to consult `parseRefCkptKey` as well --
+    /// `groupRefKeys` treats a key neither parser recognizes as corruption that aborts ref folding.
+    EXPECT_FALSE(l.parseRefObjectKey(l.refCkptKey(ns)).has_value());
+}
+
+/// Stage A task 5 (spec INV-4): `refCkptKey` and `parseRefCkptKey` are inverses, and the `_ckpt`
+/// parser is exactly as strict as its id-bearing sibling -- it claims OUR checkpoint keys and nothing
+/// else. It returns `std::nullopt` rather than throwing for the same reason `parseRefObjectKey` does:
+/// classifying an untrusted listed key is an ordinary "is this ours" question.
+TEST(CasLayout, RefCkptKeyRoundTripsAndRejectsEverythingElse)
+{
+    Layout l("p");
+    const RootNamespace ns{"srv1/tbl@cas@"};
+    const RefTxnId id{7, 0x8e};
+
+    /// Stage A shape: the namespace prefix plus the bare leaf, with no compression suffix (the format
+    /// is raw), so the key is exactly `<ns>/_ckpt`.
+    EXPECT_EQ(l.refCkptKey(ns), l.refsNamespacePrefix(ns) + "_ckpt");
+    EXPECT_EQ(l.parseRefCkptKey(l.refCkptKey(ns)), ns);
+    /// A namespace with slashes in it round-trips whole: everything before the leaf is the namespace.
+    EXPECT_EQ(l.parseRefCkptKey("p/cas/refs/a/b/c/_ckpt"), RootNamespace{"a/b/c"});
+
+    /// Foreign pool prefix.
+    EXPECT_FALSE(l.parseRefCkptKey("q/cas/refs/srv1/tbl@cas@/_ckpt").has_value());
+    /// The three id-bearing kinds are not checkpoints.
+    EXPECT_FALSE(l.parseRefCkptKey(l.refLogKey(ns, id)).has_value());
+    EXPECT_FALSE(l.parseRefCkptKey(l.refSnapshotKey(ns, id)).has_value());
+    EXPECT_FALSE(l.parseRefCkptKey(l.refCleanupMarkerKey(ns, id)).has_value());
+    /// A suffix the registry does not put there, and trailing garbage.
+    EXPECT_FALSE(l.parseRefCkptKey(l.refCkptKey(ns) + ".zst").has_value());
+    EXPECT_FALSE(l.parseRefCkptKey(l.refCkptKey(ns) + "/extra").has_value());
+    /// A near-miss leaf name.
+    EXPECT_FALSE(l.parseRefCkptKey(l.refsNamespacePrefix(ns) + "_ckp").has_value());
+    EXPECT_FALSE(l.parseRefCkptKey(l.refsNamespacePrefix(ns) + "_ckpt2").has_value());
+    /// Missing namespace segment entirely.
+    EXPECT_FALSE(l.parseRefCkptKey("p/cas/refs/_ckpt").has_value());
+    /// The mirror of the rejection above: `_ckpt` is not a canonical `RefTxnId` render, so a key that
+    /// puts it inside a kind directory is claimed by NEITHER parser.
+    EXPECT_FALSE(l.parseRefObjectKey(l.refsNamespacePrefix(ns) + "_log/_ckpt").has_value());
+    /// It IS claimed by this one, as a checkpoint of the namespace `srv1/tbl@cas@/_log`. That is not a
+    /// hole: a namespace is an OPAQUE multi-segment string (the wiring composes "srv1/<uuid>",
+    /// "shadow/<backup>/<uuid>"), so nothing in a key can distinguish a deeper real namespace from a
+    /// shallower one with a stray segment. Reading it as a checkpoint of the longer name is the only
+    /// answer available, and it is inert: the table it names has no logs and no snapshots, so the fold
+    /// does nothing for it.
+    EXPECT_EQ(l.parseRefCkptKey(l.refsNamespacePrefix(ns) + "_log/_ckpt"),
+              RootNamespace{ns.string() + "/_log"});
 }
 
 /// C3: blobKey/parseBlobKey are inverses; pins the grammar before relocating the definitions
