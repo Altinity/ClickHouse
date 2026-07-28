@@ -1352,3 +1352,8 @@ growing, deep in source verification; no marker yet. Monitor armed. No push.
 **2026-07-28 13:20 local watchdog** — codex plans review alive: log 1.07 MB, seconds-fresh
 writes, xhigh mid-reasoning, no marker yet. (Correcting earlier worklog stamps: previous two
 ticks mislabeled +2h — clock now taken from `date` directly.) No push.
+
+**2026-07-28 13:5x local** — codex plans review r1: REJECT, 2 blockers + 10 major + 6 minor, all
+legitimate. Both plans revised (headline: Stage A destruction globally suppressed until Stage B's
+catalog — the pool-wide in-degree argument killed the standalone-deletion claim; prev_epoch_seal
+now populated on the ordinary writer path). Round 2 review running. No push.
