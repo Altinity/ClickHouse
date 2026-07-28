@@ -26,6 +26,9 @@ Constants unless the row says otherwise: `Receivers = {r1}`, `MaxId = 5`, `MaxRo
    BACKLOG release-blocker `{#list-as-journal-dataloss-2026-07-25}` reproduced formally, and the
    confirm protocol cannot repair it. `_main` therefore runs with `MaxHoles = 0`, i.e. it
    **assumes** LIST completeness — an assumption the shipped code does not establish.
+   *(2026-07-28: that assumption is what the v9 design removes; this model is deliberately not
+   rewritten and `_sab_holeylist` stays red as the historical witness — see
+   [What v9 does to this finding](#v9-holeylist-status).)*
 
 ## Summary table
 
@@ -226,6 +229,37 @@ completeness**. Until codex's fix items 1–2 land (an authoritative per-namespa
 chain, and destructive GC conditional on an exact cut meet with global suppression on any
 unprovable namespace), `_main` should be read as "the confirm protocol adds no new dangle path",
 not as "a confirmed relink cannot dangle".
+
+### What v9 does to this finding — and why this model is NOT rewritten {#v9-holeylist-status}
+
+*Added 2026-07-28 by the v9 ref-chain TLA phase audit (`2026-07-28-v9-phase-RESULTS.md`).*
+
+The v9 design `2026-07-27-cas-ref-chain-complete-cut-design.md` is the fix for exactly the defect
+`_sab_holeylist` reproduces. **This model is deliberately left as it stands**, for two reasons:
+
+1. **Its subject is unchanged.** What `CaRelinkConfirmCore` gates is the publish-then-confirm relink
+   protocol — a durable `+1` before the confirm, gate 1's six rules, three-phase graduation. v9
+   changes none of that. Rewriting the fold cursor here would re-verify v9's fold in a model whose
+   confirm machinery makes the state space large, and would delete the one place where the
+   historical defect is written down as an executable trace.
+2. **`_sab_holeylist` is the historical defect witness and stays red.** It is the formal record of
+   what the shipped GC does today, kept so the regression can never be re-litigated as prose. Its
+   `MaxHoles = 1` adversary is the *pre-v9* discovery mechanism by construction, so its red says
+   nothing about v9 and must not be read as a v9 failure.
+
+**The fold-side flip lives in the two new-in-phase models, and they form the regression pair:**
+
+| config | colour | what it pins |
+|---|---|---|
+| `CaRefTableSnapshotLogCore_sab_scanistruth` | **RED** (`INV_RECOVERY`) | the pre-v9 premise — a listing/scan treated as truth — still breaks recovery. The defect class is still detectable. |
+| `CaRefDeltaIntakeCore_v9_hintomission` | **GREEN** (all invariants incl. `NoAckedLoss`) | under v9 the same omission is harmless: the enumeration is a zero-trust HINT, fold work advances by arithmetic (`cursor + 1`), and destructive work needs the per-namespace frontier proof. |
+
+Read together: the red proves the property is not vacuous and the green proves v9 closes it. Neither
+alone would be evidence — a green whose sabotage was never seen red is a green for free, and a red
+with no green beside it is a defect with no fix. The `_main` caveat recorded above ("read as *the
+confirm protocol adds no new dangle path*, not as *a confirmed relink cannot dangle*") therefore
+stands **for the shipped code** and is lifted only for the pool the v9 chain governs, once the v9
+implementation lands — the models gate the design, not the code.
 
 ## Modelling decisions, and what the bounds cost
 

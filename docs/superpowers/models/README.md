@@ -29,11 +29,16 @@ behind each is told in prose below.
   produce a counterexample; an unexpected pass means the model lost its teeth.
 - `_witness_*` — negated reachability: TLC reporting a "violation" means the state IS reachable
   (non-vacuity check).
-- `run_*.sh` — thin TLC/Apalache wrappers; TLC jar expected at `../../../tmp/tla2tools.jar`
-  (v2.19), Apalache at `../../../tmp/apalache/bin/apalache-mc` (0.58.0+).
+- `run_*.sh` — TLC/Apalache runners; TLC jar expected at `../../../tmp/tla2tools.jar`
+  (v2.19), Apalache at `../../../tmp/apalache/bin/apalache-mc` (0.58.0+). Two shapes exist: a
+  **suite runner** owns its model's whole config list and asserts each expected outcome *by the name
+  of the invariant or property it must break* (`run_mount.sh` is the reference), while the rest are
+  single-config drivers taking a cfg as `$1` and asserting nothing. Prefer the first shape: a colour
+  nothing checks is a colour that rots.
 - `states/`, `tmp/`, `_apalache-out/` — tool scratch output, gitignored / untracked.
 - `*_RESULTS.md` — supplementary raw TLC run evidence (state counts, counterexample traces) for
-  the matching model.
+  the matching model. `<date>-*-RESULTS.md` — a whole-phase gate across several models
+  (`2026-07-28-v9-phase-RESULTS.md` is the v9 ref-chain one).
 
 Status legend:
 
@@ -78,7 +83,7 @@ of `CaGcRootLocalPartManifestCore`.
 | Model | Proves / gates | Status | Runner |
 |---|---|---|---|
 | `CaIncarnationCore.tla` | canonical incarnation-token GC core (fold → retire → fence → recheck → exact-token delete → cascade → trim) | CURRENT (safety spine; concrete journal/fence structure superseded) | `run_tlc.sh` |
-| `CaBuildRootPrecommit.tla` | adopted-blob dangle fix: precommit-first build-root reachability + fail-closed commit + inline closure recording | CURRENT conclusion (inline-closure + presence-gate mechanisms drifted → lazy-fold+clamp-barrier + owner-liveness) | (inline TLC) |
+| `CaBuildRootPrecommit.tla` | adopted-blob dangle fix: precommit-first build-root reachability + fail-closed commit + inline closure recording | CURRENT conclusion (inline-closure + presence-gate mechanisms drifted → lazy-fold+clamp-barrier + owner-liveness) | `run_buildrootprecommit.sh` |
 | `CaGcLeaseCore.tla` | GC leader lease: epoch-fence safety, advisory heartbeat against false steals | CURRENT | (inline TLC) |
 | `CaCasMountCore.tla` | mount ownership: sticky owner, monotone epoch, observation-based lease reclaim, and the v9 recovery-generation layer (a generation captured at admission and rechecked post-I/O before every publication; a successor's `EpochSeal` as a conclusive rejection; the acked-then-lost byte comparison) | CURRENT (v9 extension 2026-07-28; gates the ref-chain implementation's `slot-occupy` / `_ckpt` / install changes) | `run_mount.sh` |
 | `CaGcRootLocalPartManifestCore.tla` | root-local part-manifest GC: fold, manifest cleanup, orphan sweep, attempt scoping | CURRENT (partial: fence/recheck phases superseded by the ack-floor round) | `run_gc_partmanifest.sh` |

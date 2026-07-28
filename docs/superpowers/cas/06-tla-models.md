@@ -873,8 +873,15 @@ counterexamples found during EBR model development encoded the four load-bearing
 ## Running the models {#running-models}
 
 All models run from `docs/superpowers/models/`. TLC jar expected at `../../../tmp/tla2tools.jar`
-(v2.19). Shell wrappers: `run_tlc.sh`, `run_gc_partmanifest.sh`, `run_mount.sh`,
-`run_apalache.sh`. Apalache binary at `../../../tmp/apalache/bin/apalache-mc` (v0.58.0+).
+(v2.19). Apalache binary at `../../../tmp/apalache/bin/apalache-mc` (v0.58.0+).
+
+Runners come in two shapes. **Suite runners** take no arguments, own their model's whole config list
+and assert each expected outcome *by the name of the invariant or property it must break*:
+`run_refsnaplog.sh`, `run_deltaintake.sh`, `run_refcatalog.sh`, `run_nscleanup_staleleader.sh`,
+`run_mount.sh`, `run_buildrootprecommit.sh`, `run_disklifecycle.sh`, `run_erasureproof.sh`,
+`run_foldclamp.sh`, `run_refwcleanup.sh`. The rest (`run_tlc.sh`, `run_gc_partmanifest.sh`,
+`run_ackfloor.sh`, …) are single-config drivers: they take a cfg as `$1`, run it, and assert nothing
+— the loops below supply the expectation, so read their comments before trusting a colour.
 
 ```bash
 # incarnation core — main staged suite
@@ -886,11 +893,10 @@ for c in nofence norecheckfold noretireview unconddelete reusedtag cascade \
   ./run_tlc.sh CaIncarnationCore_sab_$c.cfg && echo "UNEXPECTED PASS: $c"
 done
 
-# build-root / precommit
-for cfg in buggy buildrootonly failclosedonly fixed inlineclosure lazyleak inlineclosure_b2; do
-  java -XX:+UseParallelGC -cp ../../../tmp/tla2tools.jar tlc2.TLC -workers auto \
-    -config CaBuildRootPrecommit_$cfg.cfg CaBuildRootPrecommit.tla
-done
+# build-root / precommit — whole suite, each expectation asserted by the name of the invariant or
+# property it must break (2026-07-28: replaced a hand-run loop that checked no colours at all, and
+# silently omitted the b2 witness)
+./run_buildrootprecommit.sh
 
 # part-manifest GC
 ./run_gc_partmanifest.sh stage3

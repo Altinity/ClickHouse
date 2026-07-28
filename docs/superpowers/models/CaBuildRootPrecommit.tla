@@ -297,7 +297,11 @@ Commit(bld, t) ==
     /\ uploaded'  = [uploaded EXCEPT ![t] = TRUE]
     /\ tableRefs' = tableRefs \cup {t}
     /\ committed' = committed \cup {t}
-    /\ everDangle' = everDangle \/ (\E c \in Children(t) : ~present[c])
+    (* The parentheses are load-bearing: `x' = a \/ cond` parses as `(x' = a) \/ cond`, so with
+       FailClosedCommit = FALSE (the only setting under which the right disjunct can be true here)
+       TLC takes the right disjunct and leaves everDangle' unspecified -- "successor state not
+       completely specified". Every ghost latch in this model set wraps its disjunction. *)
+    /\ everDangle' = (everDangle \/ (\E c \in Children(t) : ~present[c]))
     /\ everSnapped' = everSnapped \cup Reach(t)   \* committed table ref is expanded -> snapped
     /\ UNCHANGED << owner, precommit, buildLive, judgedDead, aborted, adopted, closure, staged >>
 
