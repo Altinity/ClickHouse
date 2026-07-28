@@ -1273,3 +1273,7 @@ metadir, timeout 1800 — the big module's state space needs measuring). Active.
 (09:44-49), report drafted 09:54 (15.5 KB), commit pending. Foreign commit `374cde434f4` (tests:
 DenyGuard macro gate) from the other live session sharing this worktree — noted, not mine, not
 interfering per standing practice. No push.
+
+**2026-07-28 11:1x UTC watchdog** — task 5 DONE (`d7a73ec85d2`, 18/18 run_mount expectations: 3 new
+sabotages RED with exact names, v9_recoverygen green). Review package generated (task-commit-only
+span, excluding foreign/worklog interleave), opus reviewer dispatched. No push.
