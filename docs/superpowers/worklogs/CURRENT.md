@@ -1481,3 +1481,6 @@ revert). Re-review-2 running. LANE-G READY (LANEG_SETUP=done). Briefs 4+7 cut. N
 **2026-07-28 19:5x local** — TASK 3 CLOSED (re-review-2 CLEAN, 5 commits, gate 1406/1406).
 TWO-LANE PHASE OPEN: T4 wedge (impl-a4, main tree) + T7 arithmetic fold (impl-g7, lane-g
 worktree) running in parallel, both opus, scope-fenced. No push.
+
+**2026-07-28 19:40 local watchdog** — lane G: baseline gate run complete (19:33); lane L: reading
+phase (no artifacts yet, ~15 min in — normal for the wedge brief's obligation load). No push.
