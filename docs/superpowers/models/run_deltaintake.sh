@@ -11,8 +11,9 @@
 #                                               takes the shared blob's in-degree to zero
 #   sab_cleanupignorescursor -> NoAckedLoss     ref cleanup without cursor coverage manufactures a
 #                                               quiet-looking namespace
-#   fix_ckptwitness          -> GREEN   the same broken cleanup with one PROPOSED extra witness
-#                                       source (`_ckpt` coverage): the loss becomes a hold
+#   fix_ckptwitness          -> GREEN   the same broken cleanup with the second witness source this
+#                                       model proposed and spec §5 adopted (`_ckpt` coverage):
+#                                       the loss becomes a hold
 #   sab_adoptbeforecommit    -> NoMissedFold    (LosingCommitAdoptsNothing falls in the same behaviour)
 #                                               cursor adoption must be atomic with the fold commit
 #   sab_destroyunderhold     -> HoldSuppresses  a carried hold must suppress every destructive site

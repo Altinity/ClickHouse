@@ -40,8 +40,9 @@
    The residual exposure this makes executable (`_witness_corruptgap`, RED and committed as such):
    the impossible shape is detectable only in a round whose listing returns an id ABOVE the gap, so
    a namespace whose above-cursor record was lost before any such round ran, and which the listing
-   then never mentions, is indistinguishable from a quiet one. `CkptWitness` is a PROPOSED, not
-   specified, second witness source and `_fix_ckptwitness` is what it buys.
+   then never mentions, is indistinguishable from a quiet one. `CkptWitness` is the second witness
+   source that closes part of it: it began as this model's proposal and is now spec text (§5,
+   commits `abd77cd4738` / `33b301eacb8`). `_fix_ckptwitness` is what it buys, and what it does not.
 
    Each Sabotage* toggle breaks exactly one load-bearing rule and must yield a counterexample.
    `HintSilent`, `HintComplete` and `EnableHiddenHole` are adversaries, not sabotages, and are
@@ -53,7 +54,7 @@ CONSTANTS
     EdgeOf,                       \* [AllKeys -> {"add","rem","none"}]: each record's blob edge
     HintSilent,                   \* adversary: the LIST hint returns NOTHING, ever
     HintComplete,                 \* the LIST hint is an HONEST listing (no omission) — the control
-    CkptWitness,                  \* PROPOSED fix: `_ckpt` coverage is a hint-independent witness
+    CkptWitness,                  \* spec §5: `_ckpt` coverage as a hint-independent witness
     EnableHiddenHole,             \* fault: one above-cursor durable log is invisible to point reads
     SabotageSkipQuietProbe,       \* destruction runs without a frontier proof (the r7-1 blocker)
     SabotageRebuildDropsHold,     \* REBUILD rebuilds cursors but forgets holds (the r8 blocker)
