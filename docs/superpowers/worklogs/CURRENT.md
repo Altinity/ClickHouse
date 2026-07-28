@@ -1561,3 +1561,7 @@ main, T5 dispatches. G's T8 fix round still cycling. No push.
 **2026-07-28 22:5x local** — mount-pair review all-PASS; final micro-round (4 doc/test touches +
 first build_debug gate — the only class arming the alloc-free guards). Task 4 one commit from
 closed. No push.
+
+**2026-07-28 23:0x local** — T8 fix round in re-review (question #1: was the arithmetic
+newest-seal confirm walk implemented, or does newest-ness trust the enumeration). L's final
+micro-round cycling. No push.
