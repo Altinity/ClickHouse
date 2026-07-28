@@ -1,7 +1,5 @@
 # CAS ref contiguous streams — Stage A (streams) Implementation Plan
 
-> **DRAFT MARKER: being elaborated — do not execute until this line is removed.**
-
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development
 > (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use
 > checkbox (`- [ ]`) syntax for tracking.
@@ -463,7 +461,10 @@ plants the detection point and a plain `classification = 4` clamp as today).
 - [ ] **Step 3:** Implement. The three existing non-gap failure shapes keep their semantics at
   the new sites: body vanished mid-walk → abort `:1474` analog; invalid body → abort `:1495`
   analog; missing manifest body → per-table clamp `:1570` analog (dead-precommit escape
-  `:1531-1550` preserved).
+  `:1531-1550` preserved). Whole-round abort (`:1610-1626` discard) NARROWS per spec §5: it
+  remains ONLY for a key unattributable to any namespace; every per-namespace failure is a
+  per-namespace clamp/hold, never a round abort (add one test: a corrupt body in `ns_a` clamps
+  `ns_a` while `ns_b` folds and seals normally).
 - [ ] **Step 4:** New filter PASS + full CA gate + the CA-s3 integration lane
   `test_content_addressed_gc_s3` locally (`with_rustfs`) green, log to `<build>/task7_integration.log`.
 - [ ] **Step 5: Commit** `ca: gc — arithmetic fold intake; hint demoted; seals cross epochs (B2 no-op)`.
@@ -557,7 +558,9 @@ have (`CasBlobInDegree.cpp:443-446` pattern). The delete-site in-degree re-read
   suppression (assert per-site); late `+1` folded AFTER condemnation but BEFORE the delete
   pass → `settleEntry` spares it (`indeg > 0`) — the normative third-arm regression;
   covered-log cleanup deletes exactly the computable range under
-  `min(_ckpt.checkpoint, cursor)` and nothing above (ranges, not listings).
+  `min(_ckpt.checkpoint, cursor)` and nothing above (ranges, not listings); snapshot cleanup
+  deletes only STRICTLY BELOW `_ckpt.checkpoint` — a snapshot AT the checkpoint survives
+  (Task 5's rule, asserted at the delete site).
 - [ ] **Step 2:** `--gtest_filter='CasGcFrontierGate*'` → FAIL.
 - [ ] **Step 3:** Implement. `discoverUniverse` (`:2393`) is UNCHANGED in mechanism (still the
   hint) but its result now only ADDS to the known-namespace set (union with `gc/state` cursors);
