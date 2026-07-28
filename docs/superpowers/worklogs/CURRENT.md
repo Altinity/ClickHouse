@@ -1570,3 +1570,8 @@ micro-round cycling. No push.
 virgin verdict now; derivable adopted-seal alias ledgered as SPEC-AMENDMENT CANDIDATE (the true
 point-read closure; attempt component is non-dense today). L: micro-round gates cycling
 (build_debug first-ever DENY_ALLOCATIONS run + gate14). No push.
+
+**2026-07-28 23:4x local** — TASK 4 CLOSED (7 commits, three build classes unfiltered green,
+DENY_ALLOCATIONS genuinely armed for the first time). T7 MERGED into cas-gc-rebuild
+(`48c912303fc`, ort clean, 11 files); combined build+gate running in bg. T8 round-2 cycling
+on lane G. Next: combined gate green -> T5 dispatch (lane L). No push.
