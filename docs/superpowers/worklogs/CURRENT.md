@@ -1437,3 +1437,7 @@ No push.
 
 **2026-07-28 17:5x local** — task 2 CLOSED (re-review CLEAN; R4 minors settled, `14f93f46326`).
 Task 3 (contiguous allocator + format floor + quiesce) dispatched to impl-a3 on OPUS. No push.
+
+**2026-07-28 18:1x local** — task 3: dependency map in; 3 controller rulings issued (fail-close
+replaces lane-stays-usable; floor-precedes-replay proof required; GC ABA comment = stage-B
+dependency). Agent continuing with nextRefTxnId already drafted. No push.
