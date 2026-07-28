@@ -614,12 +614,11 @@ def test_export_part_column_count_mismatch_source_fewer_is_rejected(cluster):
     node.query(f"DROP TABLE IF EXISTS {iceberg}")
 
 
-def test_export_part_with_renamed_destination_column_rejected(cluster):
+def test_export_part_with_renamed_destination_column(cluster):
     """
     Source has column `id`, destination has the same shape but the column is
-    named `renamed_id`.  Columns are matched by position, while the partition
-    machinery resolves them by name, so a name mismatch must be rejected
-    synchronously rather than exporting values under a different name.
+    named `renamed_id`.  Positional matching must accept the export and the
+    data must land in the destination under the new name.
     """
     node = cluster.instances["node1"]
     sfx = unique_suffix()
@@ -632,14 +631,20 @@ def test_export_part_with_renamed_destination_column_rejected(cluster):
     node.query(f"INSERT INTO {mt} VALUES (1, 2020), (2, 2020), (3, 2020)")
     part_2020 = get_part(node, mt, "2020")
 
-    error = node.query_and_get_error(
-        f"ALTER TABLE {mt} EXPORT PART '{part_2020}' TO TABLE {iceberg} "
-        f"SETTINGS allow_experimental_export_merge_tree_part = 1, "
-        f"allow_experimental_insert_into_iceberg = 1"
+    export_part(node, mt, part_2020, iceberg)
+    wait_for_export_part(node, mt, part_2020)
+
+    count = int(node.query(f"SELECT count() FROM {iceberg}").strip())
+    assert count == 3, f"Expected 3 rows in Iceberg table after export, got {count}"
+
+    result = node.query(
+        f"SELECT renamed_id, year FROM {iceberg} ORDER BY renamed_id"
+    ).strip()
+    assert result == "1\t2020\n2\t2020\n3\t2020", (
+        f"Unexpected data under renamed column:\n{result}"
     )
-    assert "INCOMPATIBLE_COLUMNS" in error and "renamed_id" in error, (
-        f"Expected INCOMPATIBLE_COLUMNS naming 'renamed_id', got: {error!r}"
-    )
+
+    assert_part_log(node, mt, part_2020)
 
     node.query(f"DROP TABLE IF EXISTS {mt} SYNC")
     node.query(f"DROP TABLE IF EXISTS {iceberg}")

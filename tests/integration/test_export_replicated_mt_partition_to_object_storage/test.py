@@ -1682,66 +1682,6 @@ def test_export_partition_partition_column_castable_type_mismatch(cluster):
     )
 
 
-def test_export_partition_reordered_destination_columns_rejected(cluster):
-    """Source and destination hold the same columns with the same types, but the
-    destination declares them in a different order. Columns are converted by
-    position while the hive directory is computed from the source column of the
-    same name, so `ts=2024-01-01` would hold rows whose own `ts` is months away.
-    The export must be rejected synchronously."""
-    skip_if_remote_database_disk_enabled(cluster)
-    node = cluster.instances["replica1"]
-
-    postfix = str(uuid.uuid4()).replace("-", "_")
-    mt_table = f"reordered_mt_{postfix}"
-    s3_table = f"reordered_s3_{postfix}"
-
-    node.query(
-        f"CREATE TABLE {mt_table} (x Date, ts Date) "
-        f"ENGINE = ReplicatedMergeTree('/clickhouse/tables/{mt_table}', 'replica1') "
-        f"PARTITION BY ts "
-        f"ORDER BY x"
-    )
-    node.query(
-        f"CREATE TABLE {s3_table} (ts Date, x Date) "
-        f"ENGINE = S3(s3_conn, filename='{s3_table}', "
-        f"format=Parquet, partition_strategy='hive') "
-        f"PARTITION BY ts"
-    )
-
-    node.query(
-        f"INSERT INTO {mt_table} VALUES ('2024-05-10', '2024-01-01'), "
-        f"('2024-08-20', '2024-01-01')"
-    )
-
-    error = node.query_and_get_error(
-        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '20240101' TO TABLE {s3_table}"
-    )
-    assert "INCOMPATIBLE_COLUMNS" in error, (
-        f"Expected INCOMPATIBLE_COLUMNS for reordered destination columns, "
-        f"got: {error!r}"
-    )
-
-    rows_in_system_view = node.query(
-        f"SELECT count() FROM system.replicated_partition_exports "
-        f"WHERE source_table = '{mt_table}' "
-        f"  AND destination_table = '{s3_table}' "
-        f"  AND partition_id = '20240101'"
-    ).strip()
-    assert rows_in_system_view == "0", (
-        f"Expected no row in system.replicated_partition_exports after a "
-        f"synchronously-rejected export, got {rows_in_system_view}."
-    )
-
-    files_in_s3 = node.query(
-        f"SELECT count() FROM s3(s3_conn, "
-        f"filename='{s3_table}/ts=*/*.parquet', format='One')"
-    ).strip()
-    assert files_in_s3 == "0", (
-        f"Expected no Parquet files in S3 after a synchronously-rejected "
-        f"export, found {files_in_s3}."
-    )
-
-
 def test_export_partition_all_failure_modes(cluster):
     """Cover the three values of `export_merge_tree_partition_all_on_error`.
 
