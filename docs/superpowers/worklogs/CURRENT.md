@@ -1441,3 +1441,7 @@ Task 3 (contiguous allocator + format floor + quiesce) dispatched to impl-a3 on 
 **2026-07-28 18:1x local** — task 3: dependency map in; 3 controller rulings issued (fail-close
 replaces lane-stays-usable; floor-precedes-replay proof required; GC ABA comment = stage-B
 dependency). Agent continuing with nextRefTxnId already drafted. No push.
+
+**2026-07-28 18:00 local watchdog** — task 3 mid-triage: gate re-run finished 17:59 (logs fresh),
+30-failure fallout triage in progress per agent's own status; no commit yet, no live procs
+(between rounds). No push.
