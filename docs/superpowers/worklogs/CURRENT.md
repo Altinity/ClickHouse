@@ -1328,3 +1328,8 @@ dispatched to tla-task6. No push.
 **2026-07-28 13:2x local** — task 6 fix round 1 committed (`fb7f481a718`: audit-scope arithmetic,
 unaudited-residual section, honest transcript, runner parity incl. the ack-floor twin). Gate
 unchanged PASS 93/93. Scoped re-review dispatched. No push.
+
+**2026-07-28 13:4x local** — TLA PHASE COMPLETE: task 6 closed (re-review all-resolved; controller
+fixed minor-9 stale clause, `1b091c335c9`). Gate = TLA PHASE: PASS, 93/93 across 10 batteries.
+Moving to the two-staged main implementation plan (Stage A streams / Stage B catalog+incarnations),
+all ledger obligations inherited. No push.
