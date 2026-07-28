@@ -145,7 +145,7 @@ general case: a gap above `_ckpt.checkpoint` in a namespace the hint never menti
 CORRUPTION before any round observed a witness above it, and the hint never mentions the namespace,
 the exact `GET cursor+1` honestly answers absent, the frontier proof is granted, and a `-1`
 elsewhere can delete a blob an intact acked `+1` above the gap still names. The precondition
-(silent loss of a durable object to point reads) is outside §2's trust model; the residual is
+(silent loss of a durable object to point reads) is outside §1's trust model; the residual is
 recorded here so it is a named exposure, not a silent one — the structural closure remains the
 head-CAS alternative (§10 north star).
 
