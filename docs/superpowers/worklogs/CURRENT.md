@@ -1296,3 +1296,7 @@ TLC), report's fix-round section started. Commit pending. No push.
 alive doing rapid short TLC probes (0s-etime spawns, tmp logs quiet 10 min) with no DONE yet —
 status ping sent. Note: earlier worklog stamps drifted (+2h vs local); switching to local stamps.
 No push.
+
+**2026-07-28 11:4x local** — fix round 1 DONE (`a7de5b1ea14`, 22/22): identity <<actor,gen,op>>,
+aliasing half now the PRIMARY sab_slotnocompare counterexample (depth 7); StrictOrderMount
+committed. Ckpt-CAS/three-site obligations parked for main plan. Scoped re-review dispatched. No push.
