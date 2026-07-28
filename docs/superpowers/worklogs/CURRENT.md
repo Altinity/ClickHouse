@@ -1237,3 +1237,7 @@ fresh on opus (tla-task3b), original abandoned. Ledger updated. No push.
 
 **2026-07-28 07:5x UTC watchdog** — task 3b (opus redispatch) productive: module 28 KB written,
 churn configs + witness configs running through TLC (07:17-20). No commit yet. No push.
+
+**2026-07-28 08:1x UTC watchdog** — task 3 reviewed (Approved, 2 Important: zombie-GoLive gating gap,
+orphaneaten witness weaker than claimed); fix round 1 dispatched minutes ago, agent in edit phase —
+no new TLC yet, normal. No push.
