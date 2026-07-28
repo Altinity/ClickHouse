@@ -1203,3 +1203,7 @@ No push.
 (`ctl_deleteignoresindeg`, `ctl_holdsuppresses`) done, harness on greens (`v9_safe` live). Commit
 pending. (Watchdog note: a typo'd `cat >>` without heredoc hung the previous tick's commit — retried.)
 No push.
+
+**2026-07-28 04:5x UTC watchdog** — task 2 collecting non-vacuity evidence: coverage pass
+(`-coverage 1` under timeout 3600) on `v9_safe`; greens (`v9_hold`, `v9_hintomission`) done
+04:39-40. Final stretch, commit pending. No push.
