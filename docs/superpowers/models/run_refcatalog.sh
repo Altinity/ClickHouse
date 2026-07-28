@@ -9,6 +9,10 @@
 #   sab_janitoreatsnewborn     -> INV_NEWBORN_SAFE     the janitor must stay incarnation-scoped; the
 #                                                      damage is the `Live` entry its victim's
 #                                                      creator publishes afterwards
+#   sab_zombiegolive           -> INV_NEWBORN_SAFE     the same invariant from the opposite end: a
+#                                                      fenced-out / token-stale creator's install
+#                                                      must be refused by BOTH credentials (§3 fence
+#                                                      generation, INV-3 catalog token-CAS)
 #   sab_reconcilelivecreator   -> INV_RECONCILE_SAFE   reconcile only after the creator's fence is
 #                                                      terminal (spec §3)
 #   sab_reconcilestaletoken    -> INV_RECONCILE_SAFE   reconcile only by TOKEN-EXACT CAS: on a stale
@@ -43,10 +47,18 @@
 #                                                       (its own red stops at `OrphanWrite`)
 # Exits nonzero if any expectation is unmet.
 #
+# `-workers 1`, NOT `-workers auto`, and that is deliberate. Parallel BFS visits states in a
+# nondeterministic order, so with `auto` the reported depth, the abort runs' state counts and — the
+# part that matters — WHICH shortest counterexample TLC prints all vary between identical runs (three
+# consecutive `auto` runs of `_safe` reported depth 19, 19, 20). Every trace narrated in the cfg
+# headers and in RESULTS is a specific action sequence, so the run that produces them has to be
+# reproducible. The whole suite is seconds either way. Override with TLC_WORKERS=auto if you only
+# want a verdict and not the numbers.
+#
 # BOUND=<n> re-runs the whole suite with MaxInc overridden to <n>, to show the bound is not doing the
-# work. Every expectation above holds unchanged at BOUND=5 (still under a second per config; 14653
-# distinct states for `churn`), so MaxInc = 3 is a convenience, not a load-bearing constant. Note
-# that `witness_churn3` scales with the bound by construction (`lives = MaxInc`).
+# work. Every expectation above holds unchanged at BOUND=5, so MaxInc = 3 is a convenience, not a
+# load-bearing constant. Note that `witness_churn3` scales with the bound by construction
+# (`lives = MaxInc`), and that at BOUND=5 `safe` and `churn` become the same run.
 set -uo pipefail
 cd "$(dirname "$0")"
 JAR=../../../tmp/tla2tools.jar
@@ -56,6 +68,7 @@ MODULE=CaRefCatalogCore
 # name  expectation(green|violation)  expected-invariant(asserted, not just logged)
 CONFIGS=(
   "sab_janitoreatsnewborn     violation  INV_NEWBORN_SAFE"
+  "sab_zombiegolive           violation  INV_NEWBORN_SAFE"
   "sab_reconcilelivecreator   violation  INV_RECONCILE_SAFE"
   "sab_reconcilestaletoken    violation  INV_RECONCILE_SAFE"
   "sab_entrybeforeckptdelete  violation  INV_CKPT_ORDER"
@@ -77,8 +90,9 @@ for row in "${CONFIGS[@]}"; do
   log="../../../tmp/tlc_${MODULE}_${name}.log"
   meta="../../../tmp/tlc-meta-refcatalog-${name}"
   if [[ -n "${BOUND:-}" ]]; then
-    # A cfg TLC accepts must sit beside the module, so the override is written there and removed.
-    cfg="${MODULE}_bound_${name}.cfg"
+    # Written to the scratch tree, never beside the module: `-config` takes a path, so a BOUND run
+    # leaves nothing behind in the tracked directory even if it is interrupted.
+    cfg="../../../tmp/${MODULE}_bound${BOUND}_${name}.cfg"
     sed -E "s/MaxInc = [0-9]+/MaxInc = ${BOUND}/" "${MODULE}_${name}.cfg" > "$cfg"
     log="../../../tmp/tlc_${MODULE}_bound${BOUND}_${name}.log"
     meta="../../../tmp/tlc-meta-refcatalog-bound${BOUND}-${name}"
@@ -86,9 +100,8 @@ for row in "${CONFIGS[@]}"; do
   rm -rf "$meta"
   start=$SECONDS
   /usr/bin/java -XX:+UseParallelGC ${TLC_JAVA_OPTS:-} -cp "$JAR" tlc2.TLC \
-    -metadir "$meta" -workers auto -config "$cfg" "$MODULE.tla" >"$log" 2>&1
+    -metadir "$meta" -workers "${TLC_WORKERS:-1}" -config "$cfg" "$MODULE.tla" >"$log" 2>&1
   elapsed=$((SECONDS - start))
-  [[ -n "${BOUND:-}" ]] && rm -f "$cfg"
 
   if grep -q "No error has been found" "$log"; then
     result="green"

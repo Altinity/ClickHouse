@@ -92,7 +92,7 @@ of `CaGcRootLocalPartManifestCore`.
 | `CaRetiredInRunFoldAbortWitness.tla` | GC freshness meta is add-only: a spare never clears a condemned marker | CURRENT | `run_foldabort_witness.sh` |
 | `CaRefTableSnapshotLogCore.tla` | v9 contiguous ref stream: state-derived dense ids, every-attempt reuse rule, `_ckpt`-based recovery base + arithmetic walk, in-band `slot-occupy` epoch seal — `LatePredecessorPut` FLIPPED from rev.4 expected-fail to green, with `_sab_noseal` as the control | CURRENT (v9 rewrite 2026-07-28; gates the ref-chain implementation) | `run_refsnaplog.sh` |
 | `CaRefDeltaIntakeCore.tla` | pool-wide GC fold: arithmetic walk, destructive-round frontier proof, durable hold | CURRENT | `run_deltaintake.sh` |
-| `CaRefCatalogCore.tla` | v9 namespace catalog: create/reconcile/remove lifecycles, ref-layer incarnations (debris is inert, so `EntryDelete` needs no physical-empty proof), `_ckpt`-before-entry removal ordering, and the O(`Creating`+`Live`+`Removing`) bound under create/drop churn | CURRENT (new 2026-07-28; gates the ref-chain implementation) | `run_refcatalog.sh` |
+| `CaRefCatalogCore.tla` | v9 namespace catalog: create/reconcile/remove lifecycles, ref-layer incarnations (debris is inert, so `EntryDelete` needs no physical-empty proof), the admission fence + catalog token-CAS that refuse a fenced-out creator's late install, `_ckpt`-before-entry removal ordering, and the O(`Creating`+`Live`+`Removing`) bound under create/drop churn | CURRENT (new 2026-07-28; gates the ref-chain implementation) | `run_refcatalog.sh` |
 | `CaRefFoldClampRecoveryCore.tla` | fold clamp always recoverable: per-log cleanup staging | CURRENT | `run_foldclamp.sh` |
 | `CaRefNsCleanupStaleLeaderCore.tla` | stale-leader namespace-cleanup pass aborts on completed-marker observation | CURRENT | `run_nscleanup_staleleader.sh` |
 | `CaRefWriterCleanupCore.tla` | ref-table writer ownership lifecycle: precommit, promote, fence, successor cleanup | CURRENT | `run_refwcleanup.sh` |
@@ -231,9 +231,13 @@ ordered scan and cleanup deletes only what it observed durable. The migration is
   life's first read lands in a dead life's footprint. Also gates creation's three-write order, the
   `_ckpt`-before-entry removal ordering, and BOTH of reconciliation's preconditions (token-exact CAS
   and a terminal creator fence) — the token-exact half being the one that, when dropped, lets a
-  stale reconciler delete a `Live` entry and hand the janitor a running namespace to collect. The
-  `seq_floor` alternative the user rejected is committed as a runnable counterexample. Full verdicts
-  and traces: `CaRefCatalogCore_RESULTS.md`.
+  stale reconciler delete a `Live` entry and hand the janitor a running namespace to collect. A
+  creator is FENCED by losing its entry, not erased: it keeps its incarnation, fence and `_ckpt` ack
+  and will finish creation blind, so the model carries the admission fence generation and the
+  catalog token-CAS as explicit conjuncts of the install and proves both load-bearing — that route
+  aliases a `Live` name onto a swept prefix with no incarnation reuse at all. The `seq_floor`
+  alternative the user rejected is committed as a runnable counterexample. Full verdicts and traces:
+  `CaRefCatalogCore_RESULTS.md`.
 - **`CaRefFoldClampRecoveryCore.tla`** — a clamped fold (a log held back at an unreadable body)
   must stay recoverable: body tokens named by a log's removal records may join the round's cleanup
   set only once the WHOLE log folds, and a clamp discards the log's staged tokens. Committing at

@@ -3,8 +3,8 @@
    §2 INV-3 (`cas/ref_catalog`, ref-layer-scoped incarnations, structural inertness, the
    O(`Creating` + `Live` + `Removing`) churn bound), §2 INV-4 (`_ckpt`; removal deletes it by exact
    token while the entry is `Removing`, catalog entry LAST), §3 Lifecycles (creation's three
-   conditional writes, reconciliation of a stale `Creating`, removal and its terminal record).
-   TLA+ phase (gate), Task 3.
+   conditional writes, the admission fence generation required on each of them, reconciliation of a
+   stale `Creating`, removal and its terminal record). TLA+ phase (gate), Task 3.
 
    ONE logical namespace name, lived over and over. That is the whole point of this module: the
    question v9 has to answer is not what one life does but what SURVIVES a life and what the next
@@ -12,6 +12,17 @@
    — and the oracle is not "is the pool tidy" (it never is: cleanup is best-effort and the janitor is
    driven by the same zero-trust listing §1 distrusts) but "did a new life ever touch an old life's
    bytes, and did the catalog ever keep a record a name no longer has".
+
+   THE CREATOR IS A SEPARATE ACTOR FROM ITS CATALOG ENTRY, and the two are deliberately not tied
+   together. A creator captures `(incarnation, mount-fence generation, catalog token)` at admission
+   and thereafter writes BLIND — three conditional writes with no re-read (spec §3). Deleting its
+   catalog entry therefore does not delete IT: reconciliation, removal and a successor's `Create`
+   FENCE the creator out, they do not erase it, and what stops a fenced-out creator from finishing
+   its creation on top of whatever the catalog now holds is that its two captured credentials no
+   longer validate. `GoLive` carries both checks and `ZombieGoLive` is what happens without them.
+   An earlier revision of this module collapsed the creator into its entry, which made that whole
+   failure mode unrepresentable and let a fence-terminal creator publish; the fix round that split
+   them is the reason `creatorInc`, `creatorStale` and `installed` exist.
 
    What the incarnation buys, stated as the thing this module must prove:
 
@@ -31,11 +42,13 @@
    leaves remnants nondeterministically (cleanup is best-effort), the janitor fires
    nondeterministically per object and may omit any object FOREVER (LIST is a zero-trust hint, §1;
    omission is deferred cleanup, the leak-only direction), and the owning writer's fence may go
-   terminal at any moment (`CreatorDies`).
+   terminal at any moment (`CreatorDies` — which fences the writer, it does not stop it).
 
    Each Sabotage* toggle breaks exactly one load-bearing rule and must yield a counterexample:
 
      SabotageJanitorEatsNewborn      the janitor's incarnation scope (INV-3)     -> INV_NEWBORN_SAFE
+     SabotageZombieGoLive            the install's fence generation AND catalog token-CAS (§3,
+                                     INV-3 "token-CAS like `gc/state`")          -> INV_NEWBORN_SAFE
      SabotageReconcileLiveCreator    reconciliation's fence-terminal precondition (§3)
                                                                                  -> INV_RECONCILE_SAFE
      SabotageReconcileStaleToken     reconciliation's token-exact CAS (§3)       -> INV_RECONCILE_SAFE
@@ -62,6 +75,7 @@ EXTENDS Integers, FiniteSets
 CONSTANTS
     MaxInc,                         \* incarnations mintable in one run; also the churn-cycle bound
     SabotageJanitorEatsNewborn,     \* the janitor also eats the CURRENT incarnation while `Creating`
+    SabotageZombieGoLive,           \* a fenced-out / token-stale creator's install is not refused
     SabotageReconcileLiveCreator,   \* reconcile a stale `Creating` without its fence being terminal
     SabotageReconcileStaleToken,    \* reconcile on a STALE sample: an unconditional delete, not a CAS
     SabotageEntryBeforeCkptDelete,  \* delete the catalog entry while its `_ckpt` still exists
@@ -76,15 +90,7 @@ States == {"absent", "creating", "live", "removing"}
 VARIABLES
     (* ---- `cas/ref_catalog`: the record for THE one namespace name ---- *)
     entry,         \* [state: States, inc: 0..MaxInc]; "absent" <=> inc = 0
-    creatorAlive,  \* BOOLEAN: the owning writer's mount fence is still live. Named for the creation
-                   \* case (§3: a stale `Creating` is reconciled only after its creator's fence is
-                   \* terminal) but held for the whole life, because `Live` and `Removing` entries
-                   \* are owned by that same fence.
-    ckptDone,      \* BOOLEAN: THIS life's own `_ckpt` conditional create returned success. Distinct
-                   \* from `entry.inc \in ckptOf` (does the object exist NOW) on purpose: creation is
-                   \* three blind conditional writes with no re-read, so the creator goes `Live` on
-                   \* its own PUT's ack, and that gap is exactly where an eaten newborn hides.
-    terminal,      \* BOOLEAN: this life's terminal record has folded
+    terminal,      \* BOOLEAN: the `Removing` life's terminal record has folded
     nextInc,       \* 1..MaxInc+1: fresh-incarnation allocator. Random 128-bit in reality; a counter
                    \* here because the only property ever used is FRESHNESS, never ordering.
     lastInc,       \* 0..MaxInc: the most recent life's incarnation (the rebirth sabotage's source)
@@ -92,6 +98,22 @@ VARIABLES
                    \* completed a life and does not count)
     floors,        \* SUBSET Incs: dead-name records the REJECTED `seq_floor` catalog retains. Empty
                    \* under every honest transition; the sabotage is what fills it.
+    (* ---- the creator: captured at admission, and NOT erased when it is fenced out ---- *)
+    creatorInc,    \* 0..MaxInc: the incarnation this creator was admitted for. Distinct from
+                   \* `entry.inc` on purpose — they diverge exactly when the creator has been fenced
+                   \* out, which is the case the install has to refuse.
+    creatorAlive,  \* BOOLEAN: its mount-fence generation is still valid (spec §3: captured at
+                   \* admission, required on every `slot-occupy`, `_ckpt` CAS and install). FALSE
+                   \* means FENCED, not gone: the process may still issue every write it planned.
+    creatorStale,  \* BOOLEAN: the catalog was written since admission, so the token it captured no
+                   \* longer matches and its install's token-CAS must fail (INV-3: `ref_catalog` is
+                   \* token-CAS "like `gc/state`").
+    ckptDone,      \* BOOLEAN: its own `_ckpt` conditional create returned success. Distinct from
+                   \* `creatorInc \in ckptOf` (does the object exist NOW) on purpose: creation is
+                   \* three blind conditional writes with no re-read, so the creator goes `Live` on
+                   \* its own PUT's ack, and that gap is exactly where an eaten newborn hides.
+    installed,     \* BOOLEAN: this creator has made its ONE install attempt (successful or zombie).
+                   \* Bounds the model — without it a zombie could resurrect the name indefinitely.
     (* ---- the ref layer, keyed by incarnation ---- *)
     objects,       \* SUBSET Incs: incarnations whose `_log`/`_snap` objects exist
     ckptOf,        \* SUBSET Incs: incarnations whose `_ckpt` object exists
@@ -100,7 +122,7 @@ VARIABLES
     obsStale,      \* BOOLEAN: the catalog was written since that sample -- i.e. its token no longer
                    \* matches, so a token-exact CAS would now FAIL. Cheaper than a token counter and
                    \* exactly as strong: token equality is precisely "unwritten since sampled".
-    orphanInc,     \* 0..MaxInc: a still-running life whose catalog entry a reconciliation destroyed
+    orphanInc,     \* 0..MaxInc: a still-running life whose catalog entry someone else destroyed
     orphanAlive,   \* BOOLEAN: that orphan's fence is still live
     (* ---- ghosts ---- *)
     aliased,          \* sticky: a new life read an old life's object at its own prefix
@@ -111,17 +133,23 @@ VARIABLES
                       \* route to `aliased` and BFS therefore never reports it.
     reconcileHarm,    \* sticky: an orphaned running life's bytes were destroyed, or it wrote bytes
                       \* nothing in the catalog can ever name
-    orphanEaten,      \* sticky, a STRICT SUBSET of `reconcileHarm`: the severe arm — the janitor
-                      \* actually deleted a RUNNING life's bytes. Same reason for the separate
-                      \* witness: `OrphanWrite` reaches `reconcileHarm` one step sooner.
-    ckptOrphaned      \* sticky: a catalog entry was destroyed while its `_ckpt` survived
+    orphanDataEaten,  \* sticky, a STRICT SUBSET of `reconcileHarm`: the severe arm — the janitor
+                      \* deleted a running life's `_log`/`_snap` DATA, not merely its `_ckpt`. Same
+                      \* reason for the separate witness: `OrphanWrite` reaches `reconcileHarm` one
+                      \* step sooner, and the `_ckpt`-only deletion one step sooner than that.
+    ckptOrphaned      \* sticky: a REMOVAL deleted the catalog entry while its `_ckpt` survived
+                      \* (INV-4's ordering). Scoped to the removal path deliberately: reconciliation
+                      \* also destroys an entry with a `_ckpt` behind it, but that is not an ordering
+                      \* violation — a reconciled `Creating` never reached `Removing`, so no
+                      \* exact-token delete was ever owed. See Scoping in the RESULTS document.
 
-catVars   == << entry, creatorAlive, ckptDone, terminal, nextInc, lastInc, lives, floors >>
-objVars   == << objects, ckptOf >>
-recVars   == << obsArmed, obsStale, orphanInc, orphanAlive >>
-ghostVars == << aliased, aliasedOnRemnant, reconcileHarm, orphanEaten, ckptOrphaned >>
+entryVars   == << entry, terminal, nextInc, lastInc, lives, floors >>
+creatorVars == << creatorInc, creatorAlive, creatorStale, ckptDone, installed >>
+objVars     == << objects, ckptOf >>
+recVars     == << obsArmed, obsStale, orphanInc, orphanAlive >>
+ghostVars   == << aliased, aliasedOnRemnant, reconcileHarm, orphanDataEaten, ckptOrphaned >>
 
-vars == << catVars, objVars, recVars, ghostVars >>
+vars == << entryVars, creatorVars, objVars, recVars, ghostVars >>
 
 (* Any write to `cas/ref_catalog` invalidates an outstanding sample's token. *)
 StaleAfterWrite == (obsStale \/ obsArmed)
@@ -138,13 +166,16 @@ Foreign(i) == (entry.state = "absent") \/ (i # entry.inc)
 
 Init ==
     /\ entry = [state |-> "absent", inc |-> 0]
-    /\ creatorAlive = FALSE
-    /\ ckptDone = FALSE
     /\ terminal = FALSE
     /\ nextInc = 1
     /\ lastInc = 0
     /\ lives = 0
     /\ floors = {}
+    /\ creatorInc = 0
+    /\ creatorAlive = FALSE
+    /\ creatorStale = FALSE
+    /\ ckptDone = FALSE
+    /\ installed = FALSE
     /\ objects = {}
     /\ ckptOf = {}
     /\ obsArmed = FALSE
@@ -154,22 +185,28 @@ Init ==
     /\ aliased = FALSE
     /\ aliasedOnRemnant = FALSE
     /\ reconcileHarm = FALSE
-    /\ orphanEaten = FALSE
+    /\ orphanDataEaten = FALSE
     /\ ckptOrphaned = FALSE
 
 (* ---- Creation: three conditional writes at DDL rate (spec §3) ---- *)
 
-(* Write 1 of 3: the catalog CAS that mints the incarnation and reserves the name. `Creating`
-   forbids publication, so nothing but `_ckpt` may be written under the new prefix yet. *)
+(* Write 1 of 3: the catalog CAS that mints the incarnation and reserves the name, and the admission
+   at which the creator captures its incarnation, its mount-fence generation and its catalog token.
+   `Creating` forbids publication, so nothing but `_ckpt` may be written under the new prefix yet.
+
+   One creator slot: a new admission overwrites the previous creator's captured state. See Scoping. *)
 Create ==
     /\ entry.state = "absent"
     /\ nextInc <= MaxInc
     /\ entry' = [state |-> "creating", inc |-> NewInc]
     /\ lastInc' = NewInc
     /\ nextInc' = nextInc + 1
-    /\ creatorAlive' = TRUE
-    /\ ckptDone' = FALSE
     /\ terminal' = FALSE
+    /\ creatorInc' = NewInc
+    /\ creatorAlive' = TRUE
+    /\ creatorStale' = FALSE
+    /\ ckptDone' = FALSE
+    /\ installed' = FALSE
     /\ obsStale' = StaleAfterWrite
     /\ UNCHANGED << lives, floors, objVars, obsArmed, orphanInc, orphanAlive, ghostVars >>
 
@@ -191,29 +228,73 @@ ReadOwn ==
     /\ ~ckptDone
     /\ aliased' = (aliased \/ (entry.inc \in (objects \cup ckptOf)))
     /\ aliasedOnRemnant' = (aliasedOnRemnant \/ (entry.inc \in objects))
-    /\ UNCHANGED << catVars, objVars, recVars, reconcileHarm, orphanEaten, ckptOrphaned >>
+    /\ UNCHANGED << entryVars, creatorVars, objVars, recVars, reconcileHarm, orphanDataEaten,
+                    ckptOrphaned >>
 
-(* Write 2 of 3: `<ns>/<inc>/_ckpt`, a conditional create. A conflict is fail-closed — the creator
-   cannot ack a `_ckpt` it did not write, so it never reaches `GoLive` and the name stays reserved
-   in `Creating` until a reconciler takes it. *)
+(* Write 2 of 3: `<ns>/<inc>/_ckpt`, a conditional create carrying the admission fence generation
+   (spec §3). A fence-terminal creator is REFUSED here — that refusal is the reason a reconciled
+   creator cannot go on to manufacture a `_ckpt` for a name someone else now owns. A key conflict is
+   fail-closed too: the creator cannot ack a `_ckpt` it did not write, so it never reaches `GoLive`
+   and the name stays reserved in `Creating` until a reconciler takes it. *)
 CkptCreate ==
     /\ entry.state = "creating"
+    /\ creatorAlive
     /\ ~ckptDone
-    /\ entry.inc \notin ckptOf
+    /\ creatorInc \notin ckptOf
     /\ ckptDone' = TRUE
-    /\ ckptOf' = ckptOf \cup {entry.inc}
-    /\ UNCHANGED << entry, creatorAlive, terminal, nextInc, lastInc, lives, floors, objects,
+    /\ ckptOf' = ckptOf \cup {creatorInc}
+    /\ UNCHANGED << entryVars, creatorInc, creatorAlive, creatorStale, installed, objects,
                     recVars, ghostVars >>
 
-(* Write 3 of 3: the catalog CAS to `Live`. It consults `ckptDone` — this creator's own ack — and
-   NOT the store, because spec §3 buys creation for three conditional writes with no re-read. *)
+(* Write 3 of 3: the catalog CAS to `Live`, carrying BOTH credentials — the admission fence
+   generation (§3) and the catalog token (INV-3: `ref_catalog` is token-CAS "like `gc/state`").
+   It consults `ckptDone`, this creator's own ack, and NOT the store, because spec §3 buys creation
+   for three conditional writes with no re-read. `ZombieGoLive` below is the same install with those
+   two conjuncts removed, and is the whole reason they are written out separately here. *)
 GoLive ==
-    /\ entry.state = "creating"
     /\ ckptDone
-    /\ entry' = [entry EXCEPT !.state = "live"]
+    /\ ~installed
+    /\ creatorAlive
+    /\ ~creatorStale
+    /\ entry.state = "creating"
+    /\ entry.inc = creatorInc
+    /\ entry' = [state |-> "live", inc |-> creatorInc]
+    /\ installed' = TRUE
+    /\ creatorStale' = TRUE
     /\ obsStale' = StaleAfterWrite
-    /\ UNCHANGED << creatorAlive, ckptDone, terminal, nextInc, lastInc, lives, floors, objVars,
-                    obsArmed, orphanInc, orphanAlive, ghostVars >>
+    /\ UNCHANGED << terminal, nextInc, lastInc, lives, floors, creatorInc, creatorAlive, ckptDone,
+                    objVars, obsArmed, orphanInc, orphanAlive, ghostVars >>
+
+(* THE ZOMBIE INSTALL. A creator that holds a `_ckpt` ack but has been fenced out — its mount fence
+   went terminal, or the catalog was written by someone it never saw (a reconciliation, a removal) —
+   still has an install to make, and it makes it BLIND. v9 refuses it twice over and this action
+   drops both refusals at once, because a design that relied on only one of them would be gated by
+   neither config.
+
+   The damage does not need incarnation reuse. The install republishes the name as `Live` pointing at
+   an incarnation whose life is over, and the pool is entitled to have cleaned that prefix already —
+   the janitor's honest rule licensed it the moment the catalog stopped naming it. So the catalog
+   ends up advertising `Live` over a prefix that has been swept: `INV_NEWBORN_SAFE`, from the other
+   direction. If the install lands on top of a DIFFERENT running life it also orphans it, which is
+   the same `reconcileHarm` damage a bad reconciliation causes; with one creator slot that variant
+   is not reachable here (Scoping). *)
+ZombieGoLive ==
+    /\ SabotageZombieGoLive
+    /\ ckptDone
+    /\ ~installed
+    /\ creatorInc # 0
+    /\ (~creatorAlive \/ creatorStale)        \* EXACTLY the case `GoLive` refuses
+    /\ entry # [state |-> "live", inc |-> creatorInc]
+    /\ LET victimRunning == entry.state \in {"live", "removing"} /\ entry.inc # creatorInc
+       IN /\ orphanInc'   = (IF victimRunning THEN entry.inc ELSE orphanInc)
+          /\ orphanAlive' = (victimRunning \/ orphanAlive)
+    /\ entry' = [state |-> "live", inc |-> creatorInc]
+    /\ terminal' = FALSE
+    /\ installed' = TRUE
+    /\ creatorStale' = TRUE
+    /\ obsStale' = StaleAfterWrite
+    /\ UNCHANGED << nextInc, lastInc, lives, floors, creatorInc, creatorAlive, ckptDone,
+                    objVars, obsArmed, ghostVars >>
 
 (* Ordinary ref-layer work: an appended `_log` or an installed `_snap`. `Creating` forbids
    publication (spec §3); `Removing` still appends (its terminal record is a `_log` object). *)
@@ -221,14 +302,19 @@ WriteObject ==
     /\ entry.state \in {"live", "removing"}
     /\ entry.inc \notin objects
     /\ objects' = objects \cup {entry.inc}
-    /\ UNCHANGED << catVars, ckptOf, recVars, ghostVars >>
+    /\ UNCHANGED << entryVars, creatorVars, ckptOf, recVars, ghostVars >>
 
 (* The owning writer's mount fence goes terminal — a crash, an unmount, a lost lease. Free to happen
-   at any point of any life; it is the precondition reconciliation must WAIT for, not an anomaly. *)
+   at any point of any life; it is the precondition reconciliation must WAIT for, not an anomaly.
+
+   It FENCES the writer, it does not stop it. Everything the writer captured at admission survives
+   this step, and the writer may still attempt every write it had planned; what changes is that those
+   writes must now be refused. Conflating the two is what makes zombie writers invisible to a model,
+   so `CkptCreate` and `GoLive` carry the check explicitly and `ZombieGoLive` exists to drop it. *)
 CreatorDies ==
     /\ creatorAlive
     /\ creatorAlive' = FALSE
-    /\ UNCHANGED << entry, ckptDone, terminal, nextInc, lastInc, lives, floors, objVars, recVars,
+    /\ UNCHANGED << entryVars, creatorInc, creatorStale, ckptDone, installed, objVars, recVars,
                     ghostVars >>
 
 (* ---- Reconciliation of a stale `Creating` (spec §3) ---- *)
@@ -239,7 +325,7 @@ ReconcileObserve ==
     /\ entry.state = "creating"
     /\ obsArmed' = TRUE
     /\ obsStale' = FALSE
-    /\ UNCHANGED << catVars, objVars, orphanInc, orphanAlive, ghostVars >>
+    /\ UNCHANGED << entryVars, creatorVars, objVars, orphanInc, orphanAlive, ghostVars >>
 
 (* Spec §3, both preconditions: "a stale `Creating` is reconciled by TOKEN-EXACT CAS only AFTER its
    creator's fence is terminal".
@@ -249,6 +335,10 @@ ReconcileObserve ==
    `SabotageReconcileStaleToken` turns the CAS into an unconditional delete, which is the more
    dangerous of the two — the victim is then whatever the catalog holds NOW, up to and including a
    `Live` successor's entry.
+
+   This deletes the catalog ENTRY and nothing else. The creator it reclaims the name from keeps its
+   incarnation, its fence and its `_ckpt` ack; all it loses is its catalog token, and that is
+   precisely the credential whose absence must make its later install fail (`ZombieGoLive`).
 
    The damage is not recorded here as "a precondition was violated". It is recorded as an ORPHAN: a
    life that is still running while nothing in the catalog names its incarnation. That state is
@@ -266,12 +356,12 @@ ReconcileCreating ==
        IN /\ orphanInc'   = (IF victimRunning THEN entry.inc ELSE orphanInc)
           /\ orphanAlive' = (victimRunning \/ orphanAlive)
     /\ entry' = [state |-> "absent", inc |-> 0]
-    /\ creatorAlive' = FALSE
-    /\ ckptDone' = FALSE
     /\ terminal' = FALSE
+    /\ creatorStale' = TRUE
     /\ obsArmed' = FALSE
     /\ obsStale' = FALSE
-    /\ UNCHANGED << nextInc, lastInc, lives, floors, objVars, ghostVars >>
+    /\ UNCHANGED << nextInc, lastInc, lives, floors, creatorInc, creatorAlive, ckptDone, installed,
+                    objVars, ghostVars >>
 
 (* The orphan's fence finally goes terminal. After this its debris is ordinary garbage and the
    janitor may take it without harm — which is what keeps `reconcileHarm` about DESTROYING RUNNING
@@ -279,7 +369,7 @@ ReconcileCreating ==
 OrphanDies ==
     /\ orphanAlive
     /\ orphanAlive' = FALSE
-    /\ UNCHANGED << catVars, objVars, obsArmed, obsStale, orphanInc, ghostVars >>
+    /\ UNCHANGED << entryVars, creatorVars, objVars, obsArmed, obsStale, orphanInc, ghostVars >>
 
 (* The orphan does not know its entry is gone: it captured `(namespace, incarnation)` at admission
    and its writes are blind conditional PUTs under that prefix. Every byte it writes now is
@@ -290,8 +380,8 @@ OrphanWrite ==
     /\ orphanInc # 0
     /\ objects' = objects \cup {orphanInc}
     /\ reconcileHarm' = TRUE
-    /\ UNCHANGED << catVars, ckptOf, recVars, aliased, aliasedOnRemnant, orphanEaten,
-                    ckptOrphaned >>
+    /\ UNCHANGED << entryVars, creatorVars, ckptOf, recVars, aliased, aliasedOnRemnant,
+                    orphanDataEaten, ckptOrphaned >>
 
 (* ---- Removal (spec §3 + INV-4's ordering) ---- *)
 
@@ -299,17 +389,19 @@ OrphanWrite ==
 Drop ==
     /\ entry.state = "live"
     /\ entry' = [entry EXCEPT !.state = "removing"]
+    /\ creatorStale' = TRUE
     /\ obsStale' = StaleAfterWrite
-    /\ UNCHANGED << creatorAlive, ckptDone, terminal, nextInc, lastInc, lives, floors, objVars,
-                    obsArmed, orphanInc, orphanAlive, ghostVars >>
+    /\ UNCHANGED << terminal, nextInc, lastInc, lives, floors, creatorInc, creatorAlive, ckptDone,
+                    installed, objVars, obsArmed, orphanInc, orphanAlive, ghostVars >>
 
 (* The terminal record folds, and best-effort cleanup runs.
 
-   ACTOR (spec §3, stated because it is a rule this module enforces by construction rather than
-   tests): the terminal record is appended ONLY by the owning mounted writer, or by a successor that
-   has claimed and fenced that server root. GC surfaces stuck removals and NEVER appends one — so GC
-   has no appending action anywhere in this module, and a `Removing` entry whose owner never returns
-   simply stays `Removing`, which is the intended (and bounded — one entry) outcome.
+   ACTOR (spec §3): the terminal record is appended ONLY by the owning mounted writer, or by a
+   successor that has claimed and fenced that server root. GC surfaces stuck removals and NEVER
+   appends one. This module has no GC actor at all, so that rule is enforced by construction rather
+   than tested — which is a modelling artifact, not evidence, and is recorded as such in Scoping.
+   No fence conjunct here for the same reason: the action abstracts over "the owner, or a fenced
+   successor", and at least one of those is always available.
 
    Cleanup is best-effort by design: the remnant branch is not a fault, it is the ordinary case that
    INV-3's inertness argument has to survive, and `_churn`/`_witness_churn3` deliberately run three
@@ -319,8 +411,8 @@ TerminalFoldAndCleanup ==
     /\ ~terminal
     /\ terminal' = TRUE
     /\ objects' \in {objects, objects \ {entry.inc}}
-    /\ UNCHANGED << entry, creatorAlive, ckptDone, nextInc, lastInc, lives, floors, ckptOf,
-                    recVars, ghostVars >>
+    /\ UNCHANGED << entry, nextInc, lastInc, lives, floors, creatorVars, ckptOf, recVars,
+                    ghostVars >>
 
 (* INV-4: `_ckpt` is deleted BY EXACT TOKEN WHILE THE ENTRY IS `Removing`. The entry is what names
    the incarnation and authorizes the delete, which is precisely why it must outlive the object. *)
@@ -328,7 +420,7 @@ RemovalCkptDelete ==
     /\ entry.state = "removing"
     /\ entry.inc \in ckptOf
     /\ ckptOf' = ckptOf \ {entry.inc}
-    /\ UNCHANGED << catVars, objects, recVars, ghostVars >>
+    /\ UNCHANGED << entryVars, creatorVars, objects, recVars, ghostVars >>
 
 (* INV-3/INV-4: the catalog entry goes LAST, and it goes with NO PHYSICAL-EMPTY PROOF — note what is
    NOT in this guard. `objects` may still hold this life's remnants and the entry is deleted anyway;
@@ -346,14 +438,14 @@ EntryDelete ==
     /\ (SabotageEntryBeforeCkptDelete \/ entry.inc \notin ckptOf)
     /\ ckptOrphaned' = (ckptOrphaned \/ (entry.inc \in ckptOf))
     /\ entry' = [state |-> "absent", inc |-> 0]
-    /\ creatorAlive' = FALSE
-    /\ ckptDone' = FALSE
     /\ terminal' = FALSE
     /\ lives' = lives + 1
     /\ floors' = (IF SabotageFloorRetainsDeadName THEN floors \cup {entry.inc} ELSE floors)
+    /\ creatorStale' = TRUE
     /\ obsStale' = StaleAfterWrite
-    /\ UNCHANGED << nextInc, lastInc, objVars, obsArmed, orphanInc, orphanAlive, aliased,
-                    aliasedOnRemnant, reconcileHarm, orphanEaten >>
+    /\ UNCHANGED << nextInc, lastInc, creatorInc, creatorAlive, ckptDone, installed, objVars,
+                    obsArmed, orphanInc, orphanAlive, aliased, aliasedOnRemnant, reconcileHarm,
+                    orphanDataEaten >>
 
 (* ---- the lazy janitor (INV-3) ---- *)
 
@@ -362,22 +454,26 @@ EntryDelete ==
    leak-only direction. Its scope is the load-bearing part — an incarnation the catalog does not
    currently name — and `SabotageJanitorEatsNewborn` widens it to the entry's OWN incarnation while
    the entry is `Creating`, the classic shape of GC eating a newborn between its `_ckpt` create and
-   its `Live` CAS. *)
+   its `Live` CAS.
+
+   `orphanDataEaten` requires `i \in objects` and not merely `i \in objects \cup ckptOf`: eating an
+   orphan's `_ckpt` is bad, but eating its `_log`/`_snap` is the DATA loss, and the witness that
+   claims data loss has to be the one that observed it. *)
 Janitor(i) ==
     /\ i \in (objects \cup ckptOf)
     /\ \/ Foreign(i)
        \/ (SabotageJanitorEatsNewborn /\ entry.state = "creating" /\ i = entry.inc)
+    /\ reconcileHarm'   = (reconcileHarm \/ (orphanAlive /\ i = orphanInc))
+    /\ orphanDataEaten' = (orphanDataEaten \/ (orphanAlive /\ i = orphanInc /\ i \in objects))
     /\ objects' = objects \ {i}
     /\ ckptOf' = ckptOf \ {i}
-    /\ reconcileHarm' = (reconcileHarm \/ (orphanAlive /\ i = orphanInc))
-    /\ orphanEaten' = (orphanEaten \/ (orphanAlive /\ i = orphanInc))
-    /\ UNCHANGED << catVars, recVars, aliased, aliasedOnRemnant, ckptOrphaned >>
+    /\ UNCHANGED << entryVars, creatorVars, recVars, aliased, aliasedOnRemnant, ckptOrphaned >>
 
 (* Self-loop so bounded counters exhausting is not a TLC deadlock (house pattern). *)
 NoOp == UNCHANGED vars
 
 Next ==
-    \/ Create \/ ReadOwn \/ CkptCreate \/ GoLive \/ WriteObject \/ CreatorDies
+    \/ Create \/ ReadOwn \/ CkptCreate \/ GoLive \/ ZombieGoLive \/ WriteObject \/ CreatorDies
     \/ ReconcileObserve \/ ReconcileCreating \/ OrphanDies \/ OrphanWrite
     \/ Drop \/ TerminalFoldAndCleanup \/ RemovalCkptDelete \/ EntryDelete
     \/ \E i \in Incs : Janitor(i)
@@ -396,9 +492,12 @@ TypeOK ==
     /\ nextInc \in 1..(MaxInc + 1)
     /\ lastInc \in 0..MaxInc
     /\ lives \in 0..MaxInc
+    /\ creatorInc \in 0..MaxInc
     /\ orphanInc \in 0..MaxInc
     /\ creatorAlive \in BOOLEAN
+    /\ creatorStale \in BOOLEAN
     /\ ckptDone \in BOOLEAN
+    /\ installed \in BOOLEAN
     /\ terminal \in BOOLEAN
     /\ obsArmed \in BOOLEAN
     /\ obsStale \in BOOLEAN
@@ -406,18 +505,25 @@ TypeOK ==
     /\ aliased \in BOOLEAN
     /\ aliasedOnRemnant \in BOOLEAN
     /\ reconcileHarm \in BOOLEAN
-    /\ orphanEaten \in BOOLEAN
+    /\ orphanDataEaten \in BOOLEAN
     /\ ckptOrphaned \in BOOLEAN
     /\ (orphanAlive => orphanInc # 0)
+    (* Each life is installed at most once, so completed lives never outrun minted incarnations —
+       this is what keeps `lives` bounded even when a zombie install resurrects a name. *)
+    /\ (lives <= nextInc - 1)
     (* The two witness ghosts are strict subsets of the invariants they refine, asserted here so a
        future edit cannot let a witness go red without its invariant going red too. *)
     /\ (aliasedOnRemnant => aliased)
-    /\ (orphanEaten => reconcileHarm)
+    /\ (orphanDataEaten => reconcileHarm)
 
 (* INV-3, incarnation inertness. A life never touches bytes another life wrote. This is the property
    that lets `EntryDelete` skip the physical-empty proof: debris is not dangerous because it is not
-   REACHABLE from any future life, so there is no need to prove it gone. Broken only by minting a
-   used incarnation. *)
+   REACHABLE from any future life, so there is no need to prove it gone.
+
+   In THIS model the only route to `aliased` is minting a used incarnation, and that is a statement
+   about the model's reach, not a theorem: the adjacent way for a catalog to end up naming a dead
+   life's prefix — a fenced-out creator's late install — is representable here too, and it is caught
+   by `INV_NEWBORN_SAFE` rather than by this invariant. *)
 INV_NO_ALIAS == ~aliased
 
 (* Spec §3, the creation ORDER: `_ckpt` create precedes the catalog `Live` CAS, so a `Live` entry
@@ -425,7 +531,9 @@ INV_NO_ALIAS == ~aliased
    of eating a newborn is not the deletion (a `Creating` life that never goes `Live` loses nothing
    worth having) but the moment its creator publishes `Live` on the strength of an ack for an object
    the pool no longer holds — INV-4's "a cleaned prefix plus a hidden snapshot is indistinguishable
-   from empty", entered through the front door. *)
+   from empty", entered through the front door. Two sabotages reach it from opposite ends: the
+   janitor deleting the object under a live creator, and a fenced-out creator installing over a
+   prefix the janitor had every right to have swept. *)
 INV_NEWBORN_SAFE == (entry.state = "live") => (entry.inc \in ckptOf)
 
 (* INV-3's own sentence: the catalog is O(`Creating` + `Live` + `Removing`) under any create/drop
@@ -478,9 +586,10 @@ WITNESS_CHURN == ~(lives = MaxInc /\ objects # {})
 WITNESS_ALIAS_REMNANT == ~aliasedOnRemnant
 
 (* The severe arm of `INV_RECONCILE_SAFE`, which its own counterexample skips: not "the orphan wrote
-   unattributable bytes" (`OrphanWrite`, one step past the sabotage) but "the janitor DELETED a
-   running life's bytes", licensed by its honest rule the moment the catalog stopped naming that
-   incarnation. Checked in `_witness_orphaneaten`. *)
-WITNESS_ORPHAN_EATEN == ~orphanEaten
+   unattributable bytes" (`OrphanWrite`, one step past the sabotage) and not the janitor taking only
+   the orphan's `_ckpt`, but the janitor DELETING a running life's `_log`/`_snap` data, licensed by
+   its honest rule the moment the catalog stopped naming that incarnation. Checked in
+   `_witness_orphaneaten`. *)
+WITNESS_ORPHAN_EATEN == ~orphanDataEaten
 
 =============================================================================
