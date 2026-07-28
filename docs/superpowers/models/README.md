@@ -94,7 +94,7 @@ of `CaGcRootLocalPartManifestCore`.
 | `CaRefDeltaIntakeCore.tla` | pool-wide GC fold: arithmetic walk, destructive-round frontier proof, durable hold | CURRENT | `run_deltaintake.sh` |
 | `CaRefCatalogCore.tla` | v9 namespace catalog: create/reconcile/remove lifecycles, ref-layer incarnations (debris is inert, so `EntryDelete` needs no physical-empty proof), the admission fence + catalog token-CAS that refuse a fenced-out creator's late install, `_ckpt`-before-entry removal ordering, and the O(`Creating`+`Live`+`Removing`) bound under create/drop churn | CURRENT (new 2026-07-28; gates the ref-chain implementation) | `run_refcatalog.sh` |
 | `CaRefFoldClampRecoveryCore.tla` | fold clamp always recoverable: per-log cleanup staging | CURRENT | `run_foldclamp.sh` |
-| `CaRefNsCleanupStaleLeaderCore.tla` | stale-leader namespace-cleanup pass aborts on completed-marker observation | CURRENT | `run_nscleanup_staleleader.sh` |
+| `CaRefNsCleanupStaleLeaderCore.tla` | v9 rewrite: a stale GC leader's physical-delete pass targets only the incarnation captured at deposition, never re-derived, so recreation's fresh incarnation makes rebirth safety structural (no marker, no round re-check) | CURRENT (v9 rewrite 2026-07-28; gates the ref-chain implementation) | `run_nscleanup_staleleader.sh` |
 | `CaRefWriterCleanupCore.tla` | ref-table writer ownership lifecycle: precommit, promote, fence, successor cleanup | CURRENT | `run_refwcleanup.sh` |
 | `CaRelinkConfirmCore.tla` | publish-then-confirm relink: gate 1 (exact-`ManifestRef` equality, lane quiescence, poison, mount fence) and the publish-before-confirm order, each proven load-bearing — **plus the finding that the theorem is violable independently of the protocol under an honest fold cursor** | CURRENT (gates unlanded Part B; `_main` is CONDITIONAL on `LIST` completeness) | `run_relinkconfirm.sh` |
 | `CaErasureProof.tla` | rev.7 natural `Vanished(erased)` proof soundness: writer paths closed by op-gate + guard counter + LIST-reset + grace ([D1] grace proven load-bearing); two GC-side windows found — evidence in the decision to excise the natural-erasure stack from v1 | HISTORICAL (design excised before activation) | `run_erasureproof.sh` |
@@ -243,12 +243,17 @@ ordered scan and cleanup deletes only what it observed durable. The migration is
   set only once the WHOLE log folds, and a clamp discards the log's staged tokens. Committing at
   edge granularity instead deletes a body the clamped log still needs, and every later re-fold
   then clamps on the missing body — a permanent, pool-wide destructive freeze.
-- **`CaRefNsCleanupStaleLeaderCore.tla`** — a GC leader that stalls mid-round while owing a
-  namespace-cleanup delete pass must not resume blind: a successor may have completed the cleanup
-  and a writer may have recreated the namespace at the same keys. The pass must re-read the GC
-  state (abort unless its round is still current), abort on the cleanup-completed marker, and
-  epoch-filter its deletes; dropping those guards lets the straggler reclaim the recreated
-  namespace's live objects.
+- **`CaRefNsCleanupStaleLeaderCore.tla`** — rewritten for v9: a GC leader that stalls while owing a
+  namespace-cleanup physical-delete pass must not reclaim a namespace reborn while it slept. The old
+  design's guard (re-read the GC round, abort on a `_cleanup` marker, epoch-filter the deletes) has
+  no v9 analogue — it is deleted outright, not hardened — because the ref layer is now
+  incarnation-qualified (`<ns>/<inc>/...`) and the pass is UNCONDITIONAL: safety is structural,
+  resting on two independent facts instead. (1) Recreation always mints a fresh incarnation, so a
+  pass scoped to the incarnation it captured before deposition can never reach a reborn life's data
+  (`_sab_noincarnation` reuses the incarnation and breaks it). (2) The pass always uses that captured
+  incarnation, never one re-read from the current catalog entry at resume time — spec §3's rule that
+  a cleanup item's scope is fixed at deposition (`_sab_rederive` re-derives it and breaks it). Files
+  are out of scope here and keep today's `_cleanup`-marker gate unchanged (register R1, pre-existing).
 - **`CaRefWriterCleanupCore.tla`** — the writer-side ownership lifecycle for one table: a build
   precommits (owns its precommit record), promote atomically removes the precommit and installs
   the committed owner, gated on the current epoch; failed builds are cleaned in the order

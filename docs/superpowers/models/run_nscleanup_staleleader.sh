@@ -2,20 +2,26 @@
 # Run every CaRefNsCleanupStaleLeaderCore config and print a one-line PASS/FAIL verdict per config.
 # Model: v9's stale-leader straggler safety after the `_cleanup`-marker/round-recheck gate is deleted
 # for the ref layer (spec 2026-07-27-cas-ref-chain-complete-cut-design.md, §2 INV-3 ref-layer-scoped
-# incarnations + structural inertness, §3 Lifecycles). Results and traces:
+# incarnations + structural inertness, §3 the deposit-time-capture rule). Results and traces:
 # CaRefNsCleanupStaleLeaderCore_RESULTS.md.
 #
-# Sabotage runs FIRST: a green is only evidence once the property it rests on has been seen red.
+# Sabotages run FIRST: a green is only evidence once the property it rests on has been seen red.
 #
 #   sab_noincarnation -> NoLiveDataDeleted   recreation reuses the incarnation instead of minting
 #                                            fresh: the SAME unconditional, unguarded stale-pass
-#                                            delete then reaches the reborn life's own data -- the
-#                                            model-level proof that incarnation freshness, not a
-#                                            live guard, carries rebirth safety
-#   safe              -> GREEN               honest rebirth: recreation always mints fresh, so the
+#                                            delete then reaches the reborn life's own data
+#   sab_rederive       -> NoLiveDataDeleted   the resumed pass resolves its target from the CURRENT
+#                                            catalog entry instead of the incarnation captured at
+#                                            deposition (spec §3's deposit-time-capture rule): once
+#                                            reborn, "current" simply IS the live incarnation
+#   safe               -> GREEN               honest rebirth AND honest deposit-time capture: the
 #                                            straggler's delete -- scoped only to what it captured
-#                                            before deposition, never re-checked -- structurally
-#                                            cannot reach it
+#                                            before deposition, never re-checked or re-derived --
+#                                            structurally cannot reach live data
+#
+# Both sabotages hit the same invariant by independent, isolated routes (see the cfg headers) --
+# together they are the model-level proof that incarnation freshness AND deposit-time capture are
+# each independently load-bearing, not that either alone would do.
 #
 # Exits nonzero if any expectation is unmet.
 #
@@ -23,6 +29,10 @@
 # states in a nondeterministic order, so the reported depth and which trace TLC prints are not
 # reproducible run to run with `auto`). Override with TLC_WORKERS=auto if you only want a verdict and
 # not the numbers.
+#
+# COVERAGE=1 additionally re-runs `safe` under `-coverage 1`, which is where the RESULTS
+# per-action invocation table comes from -- the machine-checked non-vacuity witness (M2). Off by
+# default because it changes no verdict and only adds noise to the normal PASS/FAIL run.
 set -uo pipefail
 cd "$(dirname "$0")"
 JAR=../../../tmp/tla2tools.jar
@@ -32,6 +42,7 @@ MODULE=CaRefNsCleanupStaleLeaderCore
 # name               expectation(green|violation)  expected-invariant(asserted, not just logged)
 CONFIGS=(
   "sab_noincarnation  violation  NoLiveDataDeleted"
+  "sab_rederive       violation  NoLiveDataDeleted"
   "safe               green      -"
 )
 
@@ -65,6 +76,18 @@ for row in "${CONFIGS[@]}"; do
 
   printf '%-20s %-10s %-28s %-8s %s\n' "$name" "$expect" "$result" "$elapsed" "$verdict"
 done
+
+if [[ "${COVERAGE:-0}" == "1" ]]; then
+  echo
+  echo "COVERAGE=1: re-running the non-vacuity green with -coverage 1"
+  log="../../../tmp/tlc_cov_${MODULE}_safe.log"
+  meta="../../../tmp/tlc-meta-cov-nscleanup-safe"
+  rm -rf "$meta"
+  /usr/bin/java -XX:+UseParallelGC ${TLC_JAVA_OPTS:-} -cp "$JAR" tlc2.TLC \
+    -metadir "$meta" -workers "${TLC_WORKERS:-1}" -coverage 1 \
+    -config "${MODULE}_safe.cfg" "$MODULE.tla" >"$log" 2>&1
+  echo "  coverage safe: $log"
+fi
 
 echo
 if [[ $overall -eq 0 ]]; then echo "ALL EXPECTATIONS MET"; else echo "SOME EXPECTATIONS UNMET"; fi
