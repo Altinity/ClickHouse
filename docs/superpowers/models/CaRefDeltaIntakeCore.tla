@@ -1,239 +1,476 @@
 -------------------- MODULE CaRefDeltaIntakeCore --------------------
-(* GC ref-intake core — spec 2026-07-11-cas-ref-table-snapshot-log-design.md
-   §gc-step-enumerate-once (the three-premise proof), §gc-step-produce-manifest-edge-delta,
-   §gc-step-clean-ref-objects, §writer-side-linearization, §late-predecessor-put.
+(* GC ref-intake core, POOL-WIDE — spec 2026-07-27-cas-ref-chain-complete-cut-design.md (v9),
+   §1 (blob in-degree is pool-wide), §5 (fold rules, the destructive-round frontier proof, the
+   durable hold), §7 (REBUILD preserves holds). TLA+ phase (gate), Task 2.
 
-   Two tables (T1, T2) share one lexically ordered key space: every T1 key sorts below every T2
-   key, and within a table keys sort by id (KeyOrd). This is premise 3, prefix contiguity, and it
-   is baked into KeyOrd rather than sabotaged — no key of one table can ever fall between two keys
-   of the other.
+   Two namespaces (T1, T2) append contiguous ref records; ONE blob is shared between them. That is
+   the whole point of this module: per-namespace cursor immobility is worthless when in-degree and
+   deletion are pool-wide, so the oracle here is not "did the cursor pass an unfolded log" (that is
+   `NoMissedFold`, retained) but "was an acked `+1` still unaccounted when the blob was deleted"
+   (`NoAckedLoss`, new, and the reason the frontier proof and the hold exist).
 
-   The writer append rule (premise 1 — strictly increasing durable ids per table, at most one
-   unresolved append, wedge until resolved) is likewise never sabotaged here: pendingId enforces
-   the wedge structurally. What this model stresses is premise 2 (resume-after-returned-key
-   pagination) and the two protocol rules built on top of the three premises: cursor adoption is
-   atomic with the fold commit, and cleanup requires BOTH cursor and snapshot coverage.
+   What v9 changes versus rev.4, and therefore what this rewrite changes:
 
-   One round at a time: BeginRound -> repeated PageStep -> ScanComplete -> FoldCommitWin/Lose ->
-   idle. The candidate cursor `cand[t]` is the greatest key returned this round for table `t`;
-   `csnap` is the cursor snapshotted at round start, used to decide which returned keys are "new"
-   (this round's delta) versus already folded. A GC round's commit may lose; on loss the previous
-   cursor and folded set remain authoritative (I3).
+   - The LIST hint is CONSUMED NOWHERE for correctness. `HintReturn` may return any subset of the
+     present logs, in any prefix of increasing id order, or nothing at all — omission is the NORM,
+     not a sabotage. What the hint is still good for is naming which namespaces look active and
+     — the one load-bearing use — being the only way a WITNESS above the frontier is ever observed.
+   - The fold advances by ARITHMETIC (`WalkStep`: point-read `cand[t] + 1`). Contiguity (INV-1) makes
+     an absent expected-next decidable, so the walk terminates at a real frontier instead of at
+     "whatever the listing stopped returning". Epochs are crossed by consuming seals: a seal occupies
+     a slot, folds as an applied no-op, and the walk continues over it (uniform consumption).
+   - A round may run DESTRUCTIVE work (condemn, delete) only while holding a frontier proof for
+     EVERY namespace, obtained in that round, and only if its own fold commit WON — a losing round
+     adopted nothing, so it may destroy nothing.
+   - An IMPOSSIBLE shape — an exact `GET` returning absent at `cand[t] + 1` while this round's hint
+     returned a higher id for the same namespace — HOLDS the namespace, durably, at its offending
+     position. A hold suppresses ALL destruction pool-wide and clears ONLY by folding through that
+     exact position and adopting the result. REBUILD carries holds verbatim (§7).
+
+   The store's exact point read is HONEST here (spec §1: point reads and conditional writes are the
+   operations the store performed honestly even while its LIST lied) — with one bounded FAULT,
+   `EnableHiddenHole`, which makes one above-cursor durable log invisible to point reads. That fault
+   is not a protocol sabotage and not an admitted store behaviour; it is the corruption / deposed-
+   leader-cleanup shape spec §5 names ("a 404 below a same-epoch witness"), and it is the ONLY way
+   the impossible shape is reachable at all — under v9's own invariants no honest action can create
+   a gap below a witness, which is exactly why the hold must DETECT one rather than tolerate it.
+   `RevealLog` lets the fault be transient as well as permanent, so both the "hold clears by folding
+   through" path and the "hold never clears, destruction suppressed forever" path are explored.
+
+   The residual exposure this makes executable (`_witness_corruptgap`, RED and committed as such):
+   the impossible shape is detectable only in a round whose listing returns an id ABOVE the gap, so
+   a namespace whose above-cursor record was lost before any such round ran, and which the listing
+   then never mentions, is indistinguishable from a quiet one. `CkptWitness` is a PROPOSED, not
+   specified, second witness source and `_fix_ckptwitness` is what it buys.
 
    Each Sabotage* toggle breaks exactly one load-bearing rule and must yield a counterexample.
-   EnableLatePredecessorPut gates the documented open limitation (an old-epoch log that never
-   became durable in this process shows up after the cursor has already passed it) — it is a
-   separate, expected-fail configuration, never enabled alongside the Sabotage* toggles. *)
-EXTENDS Integers
+   `HintSilent`, `HintComplete` and `EnableHiddenHole` are adversaries, not sabotages, and are
+   enabled in GREEN configurations too. *)
+EXTENDS Integers, FiniteSets
 
 CONSTANTS
     T1, T2, MaxSeq,
-    SabotageResumeSkip,           \* a page may advance past a durable key without returning it
+    EdgeOf,                       \* [AllKeys -> {"add","rem","none"}]: each record's blob edge
+    HintSilent,                   \* adversary: the LIST hint returns NOTHING, ever
+    HintComplete,                 \* the LIST hint is an HONEST listing (no omission) — the control
+    CkptWitness,                  \* PROPOSED fix: `_ckpt` coverage is a hint-independent witness
+    EnableHiddenHole,             \* fault: one above-cursor durable log is invisible to point reads
+    SabotageSkipQuietProbe,       \* destruction runs without a frontier proof (the r7-1 blocker)
+    SabotageRebuildDropsHold,     \* REBUILD rebuilds cursors but forgets holds (the r8 blocker)
+    SabotageClearHoldOnAbsent,    \* a hold clears on a second absent probe instead of by folding
+    SabotageDestroyUnderHold,     \* destruction ignores a carried hold
+    SabotageDeleteIgnoresIndeg,   \* the pending delete skips its liveness re-check
     SabotageAdoptBeforeCommit,    \* cursor becomes visible to cleanup before the commit's win/lose
-    SabotageCleanupIgnoresCursor, \* cleanup requires only snapshot coverage, not cursor coverage
-    EnableLatePredecessorPut      \* gates the documented cross-epoch counterexample (expected-fail)
+    SabotageCleanupIgnoresCursor  \* cleanup requires only snapshot coverage, not cursor coverage
 
 ASSUME T1 # T2
-ASSUME MaxSeq \in Nat /\ MaxSeq >= 1
+ASSUME MaxSeq \in Nat /\ MaxSeq >= 3
 
 Tables == {T1, T2}
 Ids == 1..MaxSeq
 AllKeys == { [t |-> t, i |-> i] : t \in Tables, i \in Ids }
 
-(* Table index fixes lexical order: every T1 key sorts below every T2 key (premise 3). *)
-TabIdx(t) == IF t = T1 THEN 0 ELSE 1
-KeyOrd(k) == (TabIdx(k.t) * (MaxSeq + 1)) + k.i
+(* ---- the shared blob's edges (spec §1: in-degree is POOL-WIDE) ----
 
-(* The one old-epoch id that may arrive late in the _latepred configuration; unrelated to any
-   Sabotage* toggle and never enabled alongside them. *)
-LateId == 2
+   The r7-1 scenario, laid out as constants so the counterexample is not an accident of the search:
+   the blob starts with one already-folded edge (`BaseIndeg`, namespace T2's earlier life), T2's
+   record `RemId` REMOVES it, and T1's record `AddId` is the acknowledged `+1` that a hint omission
+   or a dropped hold can hide. `AddId > 1` deliberately: proving T1's frontier requires walking
+   through a record BELOW the add, which is the position the hidden-hole fault attacks.
+
+   `EdgeRoles` is the value every configuration binds to the CONSTANT `EdgeOf` (`EdgeOf <-
+   EdgeRoles`): a cfg cannot spell a function literal, and fixing the roles in the module keeps the
+   scenario identical across configurations, which is what makes the sabotage/green pairs
+   controlled experiments. A configuration wanting different roles overrides to another operator. *)
+AddId == 2
+RemId == 1
+BaseIndeg == 1
+EdgeRoles ==
+    [ k \in AllKeys |-> IF      k.t = T1 /\ k.i = AddId THEN "add"
+                        ELSE IF k.t = T2 /\ k.i = RemId THEN "rem"
+                        ELSE "none" ]
+
+ASSUME EdgeOf \in [AllKeys -> {"add", "rem", "none"}]
+(* Non-negative in-degree by construction: at most `BaseIndeg` removals exist in the whole key
+   space, so no fold order can drive the count below zero. TypeOK asserts the consequence. *)
+ASSUME Cardinality({ k \in AllKeys : EdgeOf[k] = "rem" }) <= BaseIndeg
 
 VARIABLES
-    durable,       \* SUBSET AllKeys: currently durable logs (deletable by Cleanup)
-    everDurable,   \* SUBSET AllKeys: every key ever made durable (monotonic; the I1 oracle)
-    nextId,        \* [Tables -> 1..MaxSeq+1]: per-table allocation counter (gaps allowed)
+    durable,       \* SUBSET AllKeys: present _log objects (deletable by Cleanup)
+    everDurable,   \* SUBSET AllKeys: every key ever made durable (monotonic; the acked oracle)
+    hidden,        \* SUBSET AllKeys: FAULT — durable logs an exact GET currently fails to return
+    sealed,        \* [Tables -> SUBSET Ids]: slots occupied by an EpochSeal (folds as a no-op)
     pendingId,     \* [Tables -> 0..MaxSeq]: in-flight append id, 0 = no unresolved append (wedge)
+    snap,          \* [Tables -> 0..MaxSeq]: abstract published snapshot coverage (_ckpt.checkpoint)
     cursor,        \* [Tables -> 0..MaxSeq]: durable, adopted last_folded_ref_id
-    cand,          \* [Tables -> 0..MaxSeq]: this round's candidate cursor (greatest key returned)
+    cand,          \* [Tables -> 0..MaxSeq]: this round's candidate cursor (the arithmetic walk head)
     csnap,         \* [Tables -> 0..MaxSeq]: cursor snapshotted at this round's BeginRound
-    snap,          \* [Tables -> 0..MaxSeq]: abstract writer-published snapshot coverage
-    delta,         \* SUBSET AllKeys: keys > csnap[t] returned so far this round (candidate fold)
-    folded,        \* SUBSET AllKeys: durably adopted deltas (the reachability fold input)
-    scanPos,       \* current global scan position (KeyOrd value); 0 = below all keys
+    maxSeen,       \* [Tables -> 0..MaxSeq]: greatest id this round's HINT returned (witness oracle)
+    frontier,      \* [Tables -> BOOLEAN]: this round proved an absent expected-next for the table
+    delta,         \* SUBSET AllKeys: keys walked this round above csnap (this round's candidate fold)
+    folded,        \* SUBSET AllKeys: durably adopted deltas (the in-degree fold input)
     gcPhase,       \* "idle" | "scanning" | "complete"
     roundOutcome,  \* "none" | "won" | "lost" -- outcome of the current/last round's commit
-    dupFlag,       \* sticky: a commit tried to adopt a key already in folded (I2 oracle)
-    lateFired      \* sticky: LatePredecessorPut has already fired (fires at most once)
+    dupFlag,       \* sticky ghost: a commit tried to adopt a key already in folded (I2 oracle)
+    hold,          \* [Tables -> BOOLEAN]: the namespace is held on an impossible shape
+    holdPos,       \* [Tables -> 0..(MaxSeq+1)]: the hold's offending position (0 = not held)
+    holdDebt,      \* [Tables -> 0..(MaxSeq+1)]: ghost — a hold's position released WITHOUT folding
+                   \* through it. Sabotage-only; the debt is what makes the two hold sabotages'
+                   \* counterexamples consequential rather than tautological: the flag below is set
+                   \* by DESTRUCTION happening while a debt is outstanding, not by the drop itself.
+    condemned,     \* the shared blob is condemned (in-degree reached zero)
+    deleted,       \* the shared blob's bytes are gone
+    rsc,           \* 0..1: rounds since condemnation (the two-phase pacing floor)
+    destroyedUnderHold  \* sticky ghost: a destructive step ran while a hold was live or in debt
 
-vars == << durable, everDurable, nextId, pendingId, cursor, cand, csnap, snap, delta, folded,
-           scanPos, gcPhase, roundOutcome, dupFlag, lateFired >>
+storeVars == << durable, everDurable, hidden, sealed >>
+laneVars  == << pendingId, snap >>
+roundVars == << cand, csnap, maxSeen, frontier, delta, gcPhase, roundOutcome >>
+foldVars  == << cursor, folded, dupFlag >>
+holdVars  == << hold, holdPos, holdDebt >>
+blobVars  == << condemned, deleted, rsc, destroyedUnderHold >>
+
+vars == << storeVars, laneVars, roundVars, foldVars, holdVars, blobVars >>
+
+MaxOf(S) == CHOOSE x \in S : \A y \in S : x >= y
+MaxOr0(S) == IF S = {} THEN 0 ELSE MaxOf(S)
+
+IdsOf(S, t) == { k.i : k \in { kk \in S : kk.t = t } }
+DurableIds(t) == IdsOf(durable, t)
+EverIds(t) == IdsOf(everDurable, t)
+
+(* INV-1: the next id is derived from STATE — greatest applied id (a seal applies too) plus one.
+   `everDurable`, not `durable`: cleanup deleting a covered log must not free its id for reuse. *)
+MaxDurable(t) == MaxOr0(EverIds(t) \cup sealed[t])
+
+(* An exact point read. Honest except for the `hidden` fault; a seal occupies its slot and answers
+   the read (spec §5: epochs are crossed by consuming seals). *)
+Present(t, i) ==
+    \/ ([t |-> t, i |-> i] \in durable /\ [t |-> t, i |-> i] \notin hidden)
+    \/ i \in sealed[t]
+
+(* Evidence that an id ABOVE `i` exists for `t`, which under contiguity (INV-1) proves `i` itself
+   must exist — so an absent `i` is the IMPOSSIBLE SHAPE of spec §5.
+
+   As the spec is written there is exactly ONE source: the round's hint returned a higher id
+   ("a 404 below a same-epoch witness" — a witness is something the round observed). The hint is
+   zero-trust and may omit the namespace entirely, so this evidence is available in some rounds and
+   not others, which is precisely why spec §5 makes the resulting hold DURABLE — `_sab_rebuilddropshold`
+   is the r8 blocker built on exactly that asymmetry. It is also why `_witness_corruptgap` is red:
+   a namespace the hint never mentions is indistinguishable from a quiet one.
+
+   `HintComplete` is an IDEALIZATION, used by exactly one configuration (`_v9_hold`) to isolate the
+   hold mechanism from the detection problem: it reads the store directly, so the witness is
+   observed the instant it exists. No listing can do that — even a listing that omits nothing is a
+   SNAPSHOT, and `_v9_hold` was red until this was made explicit, because a witness that becomes
+   durable after the round's enumeration is invisible to it. Treat `_v9_hold` as the upper bound:
+   IF detection were perfect, the hold makes corruption survivable. It is not, and
+   `_witness_corruptgap` is the lower bound.
+
+   `CkptWitness` is a PROPOSED addition, not spec text, kept behind a constant so it cannot silently
+   strengthen the model: `_ckpt.checkpoint` (`snap[t]`) covering `i` also proves `i` was durable, and
+   a log ABOVE the cursor is never legitimately cleanable (`Cleanup` needs `i <= cursor[t]`), so a
+   covered-but-absent id above the cursor cannot be honest either. It is hint-independent, free (the
+   fold already reads `_ckpt` for cleanup ranges) and, unlike a listing, not a stale snapshot.
+   `_fix_ckptwitness` shows what it buys. *)
+WitnessAbove(t, i) ==
+    \/ maxSeen[t] > i
+    \/ (HintComplete /\ \E j \in DurableIds(t) : j > i)
+    \/ (CkptWitness /\ snap[t] >= i)
+
+(* Pool-wide in-degree of the shared blob over the ADOPTED fold — never over `delta`, which a losing
+   commit throws away. *)
+Indeg == BaseIndeg + Cardinality({ k \in folded : EdgeOf[k] = "add" })
+                   - Cardinality({ k \in folded : EdgeOf[k] = "rem" })
+
+AnyHold == \E t \in Tables : hold[t]
+AnyDebt == \E t \in Tables : holdDebt[t] # 0
+Encumbered == AnyHold \/ AnyDebt
 
 Init ==
     /\ durable = {}
     /\ everDurable = {}
-    /\ nextId = [t \in Tables |-> 1]
+    /\ hidden = {}
+    /\ sealed = [t \in Tables |-> {}]
     /\ pendingId = [t \in Tables |-> 0]
+    /\ snap = [t \in Tables |-> 0]
     /\ cursor = [t \in Tables |-> 0]
     /\ cand = [t \in Tables |-> 0]
     /\ csnap = [t \in Tables |-> 0]
-    /\ snap = [t \in Tables |-> 0]
+    /\ maxSeen = [t \in Tables |-> 0]
+    /\ frontier = [t \in Tables |-> FALSE]
     /\ delta = {}
     /\ folded = {}
-    /\ scanPos = 0
     /\ gcPhase = "idle"
     /\ roundOutcome = "none"
     /\ dupFlag = FALSE
-    /\ lateFired = FALSE
+    /\ hold = [t \in Tables |-> FALSE]
+    /\ holdPos = [t \in Tables |-> 0]
+    /\ holdDebt = [t \in Tables |-> 0]
+    /\ condemned = FALSE
+    /\ deleted = FALSE
+    /\ rsc = 0
+    /\ destroyedUnderHold = FALSE
 
-(* ---- writer actions (premise 1: never sabotaged) ---- *)
+(* ---- writer actions (INV-1: never sabotaged here; the ambiguity split is Task 1's subject) ---- *)
 
+(* At most one unresolved append per namespace (the wedge), at the state-derived next id. *)
 WAppendStart(t) ==
     /\ pendingId[t] = 0
-    /\ nextId[t] <= MaxSeq
-    /\ pendingId' = [pendingId EXCEPT ![t] = nextId[t]]
-    /\ nextId' = [nextId EXCEPT ![t] = @ + 1]
-    /\ UNCHANGED << durable, everDurable, cursor, cand, csnap, snap, delta, folded,
-                    scanPos, gcPhase, roundOutcome, dupFlag, lateFired >>
+    /\ MaxDurable(t) + 1 <= MaxSeq
+    /\ pendingId' = [pendingId EXCEPT ![t] = MaxDurable(t) + 1]
+    /\ UNCHANGED << storeVars, snap, roundVars, foldVars, holdVars, blobVars >>
 
-(* Resolution by success: the id becomes durable and unwedges the table's append lane. *)
+(* Resolution by success. Spec §5 temporal lemma, writer-side closure (r9-2 variant (a)): a writer
+   adding a ref to a blob whose meta says `Condemned` — or that a round already deleted — does not
+   inherit the corpse; it REMATERIALIZES from source, a fresh re-upload the old exact-token delete
+   cannot touch. Modelled at the moment the add becomes durable, which is the moment the acked `+1`
+   starts to matter. Without this the late-arrival window would be a false counterexample; with it,
+   the window that remains is the one the frontier proof has to close. *)
 WAppendDurable(t) ==
     /\ pendingId[t] # 0
-    /\ LET id == pendingId[t] IN
-         /\ durable' = durable \cup { [t |-> t, i |-> id] }
-         /\ everDurable' = everDurable \cup { [t |-> t, i |-> id] }
+    /\ pendingId[t] \notin sealed[t]        \* a successor's seal is a conclusive rejection
+    /\ LET key == [t |-> t, i |-> pendingId[t]] IN
+         /\ durable' = durable \cup {key}
+         /\ everDurable' = everDurable \cup {key}
+         /\ condemned' = IF EdgeOf[key] = "add" THEN FALSE ELSE condemned
+         /\ deleted' = IF EdgeOf[key] = "add" THEN FALSE ELSE deleted
     /\ pendingId' = [pendingId EXCEPT ![t] = 0]
-    /\ UNCHANGED << nextId, cursor, cand, csnap, snap, delta, folded,
-                    scanPos, gcPhase, roundOutcome, dupFlag, lateFired >>
+    /\ UNCHANGED << hidden, sealed, snap, roundVars, foldVars, holdVars, rsc, destroyedUnderHold >>
 
-(* Resolution WITHOUT durability: the id never becomes durable, the lane is not wedged, and the id
-   remains a safe gap (premise 1 allows gaps; only strict increase is required).
-
-   TWO implementation paths reach this action, and they are the same transition here because they
-   are the same fact — nothing became durable:
-     - `DefiniteFailure`: the attempt was sent and PROVEN never applied;
-     - `CasUnresolvedReason::NoAttemptSent` (finding #37 defect 3): both pre-attempt gates rejected
-       before the first request, so the attempt was never sent at all.
-   Only a genuinely ambiguous outcome — an attempt that MAY have landed — keeps `pendingId` set, and
-   that is `WAppendStart` with no resolution yet. So the Task-18 behaviour needs no new action: it
-   widens which C++ paths reach `WAppendAbandon`, not what the model admits. *)
+(* Resolution WITHOUT durability: nothing landed, so the slot is reusable and NO GAP is created —
+   the next `WAppendStart` derives the same id again. Contiguity is why the fold can decide absence
+   arithmetically at all. *)
 WAppendAbandon(t) ==
     /\ pendingId[t] # 0
     /\ pendingId' = [pendingId EXCEPT ![t] = 0]
-    /\ UNCHANGED << durable, everDurable, nextId, cursor, cand, csnap, snap, delta, folded,
-                    scanPos, gcPhase, roundOutcome, dupFlag, lateFired >>
+    /\ UNCHANGED << storeVars, snap, roundVars, foldVars, holdVars, blobVars >>
 
-DurableIds(t) == { k.i : k \in { kk \in durable : kk.t = t } }
+(* INV-2: a writer-epoch transition is closed in-band — the successor occupies the frontier slot.
+   The occupant is a real object: the fold's walk READS it and continues (uniform consumption), and
+   it applies as a no-op, contributing no edge. *)
+EpochSeal(t) ==
+    /\ pendingId[t] = 0
+    /\ MaxDurable(t) + 1 <= MaxSeq
+    /\ sealed' = [sealed EXCEPT ![t] = @ \cup {MaxDurable(t) + 1}]
+    /\ UNCHANGED << durable, everDurable, hidden, laneVars, roundVars, foldVars, holdVars, blobVars >>
 
-(* Abstract writer-published snapshot: may be raised to any currently durable id of the table;
-   may exceed the adopted cursor (spec §gc-step-create-snapshots). *)
+(* Abstract snapshot publication (`_ckpt.checkpoint`): may cover any present id of the table. *)
 WRaiseSnap(t) ==
     /\ \E i \in DurableIds(t) :
          /\ i > snap[t]
          /\ snap' = [snap EXCEPT ![t] = i]
-    /\ UNCHANGED << durable, everDurable, nextId, pendingId, cursor, cand, csnap, delta, folded,
-                    scanPos, gcPhase, roundOutcome, dupFlag, lateFired >>
+    /\ UNCHANGED << storeVars, pendingId, roundVars, foldVars, holdVars, blobVars >>
 
-(* ---- GC round: scan, fold commit ---- *)
+(* ---- the fault: an above-cursor log the store stops answering for ----
+
+   Bounded to one key at a time, above the cursor (a covered log below the cursor is already
+   folded, so its loss is a cleanup question, not an accounting one) and only where a HIGHER
+   durable id exists — i.e. only in the shape the protocol can in principle detect. *)
+HideLog(t, i) ==
+    /\ EnableHiddenHole
+    /\ hidden = {}
+    /\ [t |-> t, i |-> i] \in durable
+    /\ i > cursor[t]
+    /\ \E j \in DurableIds(t) : j > i
+    /\ hidden' = { [t |-> t, i |-> i] }
+    /\ UNCHANGED << durable, everDurable, sealed, laneVars, roundVars, foldVars, holdVars, blobVars >>
+
+RevealLog ==
+    /\ hidden # {}
+    /\ hidden' = {}
+    /\ UNCHANGED << durable, everDurable, sealed, laneVars, roundVars, foldVars, holdVars, blobVars >>
+
+(* ---- GC round: hint, arithmetic walk, frontier proof, fold commit ---- *)
 
 BeginRound ==
     /\ gcPhase = "idle"
     /\ gcPhase' = "scanning"
-    /\ scanPos' = 0
     /\ csnap' = cursor
     /\ cand' = cursor
+    (* The round's ONE enumeration, sampled here. `HintComplete` is the honest-listing control:
+       every present id is visible, so the impossible shape is detectable in EVERY round. With it
+       FALSE the listing is omission-capable and `HintReturn` dribbles ids in — which is the
+       ordinary case, and the reason a detection must be made DURABLE the moment it happens. *)
+    /\ maxSeen' = [t \in Tables |-> IF HintComplete THEN MaxOr0(DurableIds(t)) ELSE 0]
+    /\ frontier' = [t \in Tables |-> FALSE]
     /\ delta' = {}
     /\ roundOutcome' = "none"
-    /\ UNCHANGED << durable, everDurable, nextId, pendingId, cursor, snap, folded, dupFlag, lateFired >>
+    /\ rsc' = IF condemned THEN 1 ELSE 0          \* the two-phase pacing tick
+    /\ UNCHANGED << storeVars, laneVars, foldVars, holdVars, condemned, deleted, destroyedUnderHold >>
 
-Cands == { k \in durable : KeyOrd(k) > scanPos }
-
-(* One page, page size 1. Honestly the smallest surviving durable key strictly greater than the
-   scan position (resume-after-returned-key, premise 2). SabotageResumeSkip drops the
-   "must be the minimum" constraint, letting a page jump ahead and permanently skip a durable key
-   that never gets returned this round -- the opaque-continuation-token-over-scan hazard. *)
-PageStep ==
+(* ONE strict hint enumeration per round (spec §5) — and it is a ZERO-TRUST hint. It may return any
+   present log with an id above the last it returned, and it may stop at any time, including
+   immediately: `ScanComplete` has no exhaustion guard, because there is nothing to exhaust. The
+   hint feeds NOTHING into `delta`; folding a hinted key directly would fold a record whose
+   predecessors are unproven, which is the defect v9 exists to remove. Its only consumers are
+   "which namespaces look active" and `maxSeen`, the witness the hold detector needs. *)
+HintReturn(t) ==
+    /\ ~HintSilent /\ ~HintComplete
     /\ gcPhase = "scanning"
-    /\ Cands # {}
-    /\ \E key \in Cands :
-         /\ (~SabotageResumeSkip => \A other \in Cands : KeyOrd(key) <= KeyOrd(other))
-         /\ scanPos' = KeyOrd(key)
-         /\ IF key.i > csnap[key.t]
-            THEN /\ delta' = delta \cup {key}
-                 /\ cand' = [cand EXCEPT ![key.t] = IF key.i > cand[key.t] THEN key.i ELSE cand[key.t]]
-            ELSE UNCHANGED << delta, cand >>
-    /\ UNCHANGED << durable, everDurable, nextId, pendingId, cursor, csnap, snap, folded,
-                    gcPhase, roundOutcome, dupFlag, lateFired >>
+    /\ \E i \in DurableIds(t) :
+         /\ i > maxSeen[t]
+         /\ maxSeen' = [maxSeen EXCEPT ![t] = i]
+    /\ UNCHANGED << storeVars, laneVars, cand, csnap, frontier, delta, gcPhase, roundOutcome,
+                    foldVars, holdVars, blobVars >>
 
-(* Scan exhausted. Honestly the cursor stays untouched until the commit actually wins (I3).
-   SabotageAdoptBeforeCommit instead makes the candidate cursor live here, before the commit's
-   win/lose is decided -- "cursor visible to cleanup before the commit action". *)
+(* The fold's real advance: point-read the expected next id. A seal advances the walk without
+   producing a delta record; a log above the round's starting cursor becomes a candidate. *)
+WalkStep(t) ==
+    /\ gcPhase = "scanning"
+    /\ LET nxt == cand[t] + 1
+           key == [t |-> t, i |-> nxt]
+       IN /\ nxt <= MaxSeq
+          /\ Present(t, nxt)
+          /\ cand' = [cand EXCEPT ![t] = nxt]
+          /\ delta' = IF key \in durable /\ nxt > csnap[t] THEN delta \cup {key} ELSE delta
+    /\ UNCHANGED << storeVars, laneVars, csnap, maxSeen, frontier, gcPhase, roundOutcome,
+                    foldVars, holdVars, blobVars >>
+
+(* The exact `GET cursor+1` of spec §5. Absent at the expected next id is the ONLY thing that
+   proves a frontier — a hinted-active namespace walks to it, a quiet one pays one exact 404 for it.
+
+   Absent BELOW a witness this round's hint returned is the impossible shape: contiguity says it
+   cannot happen, so the store is lying or corrupt, and whatever sits behind the gap may be an acked
+   `+1`. The namespace is HELD at that position — and a hold is not a frontier proof.
+
+   SabotageClearHoldOnAbsent is the r9-5 rule inverted: it treats a second absent probe as evidence
+   that the hold may go, which spec §5 forbids ("clears ONLY by folding through that position ...
+   never by observing another absent"). *)
+ProbeAbsent(t) ==
+    /\ gcPhase = "scanning"
+    /\ LET nxt == cand[t] + 1 IN
+       /\ ~Present(t, nxt)
+       /\ IF WitnessAbove(t, nxt)
+          THEN IF SabotageClearHoldOnAbsent /\ hold[t]
+               THEN /\ hold' = [hold EXCEPT ![t] = FALSE]
+                    /\ holdPos' = [holdPos EXCEPT ![t] = 0]
+                    /\ holdDebt' = [holdDebt EXCEPT ![t] = holdPos[t]]
+                    /\ frontier' = [frontier EXCEPT ![t] = TRUE]
+               ELSE /\ hold' = [hold EXCEPT ![t] = TRUE]
+                    /\ holdPos' = [holdPos EXCEPT ![t] = nxt]
+                    /\ UNCHANGED << holdDebt, frontier >>
+          ELSE /\ frontier' = [frontier EXCEPT ![t] = TRUE]
+               /\ UNCHANGED holdVars
+    /\ UNCHANGED << storeVars, laneVars, cand, csnap, maxSeen, delta, gcPhase, roundOutcome,
+                    foldVars, blobVars >>
+
+(* Honestly the cursor stays untouched until the commit actually wins. SabotageAdoptBeforeCommit
+   makes the candidate cursor live here, before the win/lose is decided. *)
 ScanComplete ==
     /\ gcPhase = "scanning"
-    /\ Cands = {}
     /\ gcPhase' = "complete"
     /\ cursor' = IF SabotageAdoptBeforeCommit THEN cand ELSE cursor
-    /\ UNCHANGED << durable, everDurable, nextId, pendingId, cand, csnap, snap, delta, folded,
-                    scanPos, roundOutcome, dupFlag, lateFired >>
+    /\ UNCHANGED << storeVars, laneVars, cand, csnap, maxSeen, frontier, delta, roundOutcome,
+                    folded, dupFlag, holdVars, blobVars >>
 
+(* The round's single `gc/state` CAS. Cursor adoption, the fold and hold clearing are ONE atomic
+   step: spec §5 clears a hold by folding through its offending position AND ADOPTING that result,
+   so a hold cannot be released by a round whose commit is about to lose. *)
 FoldCommitWin ==
     /\ gcPhase = "complete"
     /\ cursor' = cand
-    /\ dupFlag' = dupFlag \/ ((delta \cap folded) # {})
+    /\ dupFlag' = (dupFlag \/ ((delta \cap folded) # {}))
     /\ folded' = folded \cup delta
+    /\ LET adopted == folded \cup delta
+           cleared == { t \in Tables : hold[t] /\ [t |-> t, i |-> holdPos[t]] \in adopted }
+           settled == { t \in Tables : holdDebt[t] # 0
+                                       /\ [t |-> t, i |-> holdDebt[t]] \in adopted }
+       IN /\ hold' = [t \in Tables |-> hold[t] /\ t \notin cleared]
+          /\ holdPos' = [t \in Tables |-> IF t \in cleared THEN 0 ELSE holdPos[t]]
+          /\ holdDebt' = [t \in Tables |-> IF t \in settled THEN 0 ELSE holdDebt[t]]
     /\ roundOutcome' = "won"
     /\ gcPhase' = "idle"
-    /\ UNCHANGED << durable, everDurable, nextId, pendingId, cand, csnap, snap, delta,
-                    scanPos, lateFired >>
+    /\ UNCHANGED << storeVars, laneVars, cand, csnap, maxSeen, frontier, delta, blobVars >>
 
-(* A losing commit adopts nothing: cursor and folded carry over unchanged from before this
-   round (I3). Under honest/S1/S3 the cursor already held that value throughout the round; under
-   S2 it may already have been bumped at ScanComplete, so I3 is checked against `csnap`, the
-   value captured at BeginRound, not against "cursor before this action". *)
+(* A losing commit adopts nothing: cursor, fold and holds carry over from before this round (I3).
+   Checked against `csnap` rather than "cursor before this action" because under
+   SabotageAdoptBeforeCommit the cursor may already have been bumped at ScanComplete. *)
 FoldCommitLose ==
     /\ gcPhase = "complete"
     /\ roundOutcome' = "lost"
     /\ gcPhase' = "idle"
-    /\ UNCHANGED << durable, everDurable, nextId, pendingId, cursor, cand, csnap, snap, delta,
-                    folded, scanPos, dupFlag, lateFired >>
+    /\ UNCHANGED << storeVars, laneVars, cand, csnap, maxSeen, frontier, delta,
+                    foldVars, holdVars, blobVars >>
 
 (* ---- ref-object cleanup: storage housekeeping only, no fold-account effect ---- *)
 
-(* Honestly requires BOTH: the adopted cursor covers the id (its delta cannot be lost) AND an
-   observed snapshot covers it. SabotageCleanupIgnoresCursor drops the cursor requirement,
-   letting cleanup delete an unfolded log the moment a snapshot claims to cover it. *)
+(* Honestly requires BOTH: the adopted cursor covers the id (its delta cannot be lost) AND a
+   published snapshot covers it. SabotageCleanupIgnoresCursor drops the cursor requirement, so
+   cleanup may delete a log the fold has never accounted — under v9 that does not merely lose a
+   delta, it manufactures a quiet-looking namespace. *)
 Cleanup(t, i) ==
     /\ [t |-> t, i |-> i] \in durable
     /\ i <= snap[t]
     /\ (SabotageCleanupIgnoresCursor \/ i <= cursor[t])
     /\ durable' = durable \ { [t |-> t, i |-> i] }
-    /\ UNCHANGED << everDurable, nextId, pendingId, cursor, cand, csnap, snap, delta, folded,
-                    scanPos, gcPhase, roundOutcome, dupFlag, lateFired >>
+    /\ hidden' = hidden \ { [t |-> t, i |-> i] }
+    /\ UNCHANGED << everDurable, sealed, laneVars, roundVars, foldVars, holdVars, blobVars >>
 
-(* ---- documented open limitation: Late Predecessor PUT (spec §late-predecessor-put) ---- *)
+(* ---- destructive work: the frontier proof, the hold, two-phase pacing ---- *)
 
-(* An unfinished predecessor request for table T1's id LateId, never durable during this process's
-   recovery LIST, completes only after the cursor has already advanced past LateId (i.e. some
-   higher id was folded while LateId sat as an apparent gap). This is not reachable through any
-   ordinary writer/scanner/cleanup action above; it is the acknowledged cross-epoch hole, gated by
-   EnableLatePredecessorPut so it never contaminates the safe or Sabotage* configurations. *)
-LatePredecessorPut ==
-    /\ ~lateFired
-    /\ cursor[T1] >= LateId
-    /\ [t |-> T1, i |-> LateId] \notin everDurable
-    /\ durable' = durable \cup { [t |-> T1, i |-> LateId] }
-    /\ everDurable' = everDurable \cup { [t |-> T1, i |-> LateId] }
-    /\ lateFired' = TRUE
-    /\ UNCHANGED << nextId, pendingId, cursor, cand, csnap, snap, delta, folded,
-                    scanPos, gcPhase, roundOutcome, dupFlag >>
+(* Destruction is the post-commit tail of a round that WON its CAS: `roundOutcome = "won"` with the
+   round's proofs (`frontier`) still in hand, reset by the next BeginRound. A losing round destroys
+   nothing — it adopted nothing, so it accounted nothing. *)
+Proven == \A t \in Tables : frontier[t]
+DestructiveGate ==
+    /\ gcPhase = "idle"
+    /\ roundOutcome = "won"
+    /\ (Proven \/ SabotageSkipQuietProbe)
+    /\ (~AnyHold \/ SabotageDestroyUnderHold)
 
-(* Self-loop so bounded counters (nextId, cursor) exhausting is not a TLC deadlock (house pattern). *)
+Condemn ==
+    /\ DestructiveGate
+    /\ Indeg = 0
+    /\ ~condemned /\ ~deleted
+    /\ condemned' = TRUE
+    /\ rsc' = 0
+    /\ destroyedUnderHold' = (destroyedUnderHold \/ Encumbered)
+    /\ UNCHANGED << storeVars, laneVars, roundVars, foldVars, holdVars, deleted >>
+
+(* Two-phase pacing (`rsc >= 1`) plus the liveness re-check. The re-check is the SECOND half of
+   spec §5's temporal lemma, and `_sab_deleteignoresindeg` shows the first half does not cover the
+   whole window: an acked `+1` landing after its namespace's probe but BEFORE condemnation is
+   invisible to that round (so in-degree reaches zero) and is folded normally by the NEXT round (so
+   in-degree is back above zero when the delete runs). Writer-side rematerialization cannot help —
+   the blob was LIVE when the writer added its ref. Only re-reading in-degree here stops it. *)
+Delete ==
+    /\ DestructiveGate
+    /\ condemned /\ ~deleted
+    /\ rsc >= 1
+    /\ (Indeg = 0 \/ SabotageDeleteIgnoresIndeg)
+    /\ deleted' = TRUE
+    /\ destroyedUnderHold' = (destroyedUnderHold \/ Encumbered)
+    /\ UNCHANGED << storeVars, laneVars, roundVars, foldVars, holdVars, condemned, rsc >>
+
+(* ---- REBUILD (spec §7) ----
+
+   Honest REBUILD rebuilds cursors and edges from catalog + `_ckpt` + arithmetic tails, condemns
+   nothing and CARRIES EVERY HOLD VERBATIM — on this model's state that is the identity, so it is
+   modelled only through its sabotaged form. `SabotageRebuildDropsHold` is the r8 blocker: the
+   rebuilt baseline keeps the cursors and forgets the holds, and a later round whose hint no longer
+   returns the witness reads the same gap as an honest frontier. *)
+Rebuild ==
+    /\ SabotageRebuildDropsHold
+    /\ gcPhase = "idle"
+    /\ AnyHold
+    /\ hold' = [t \in Tables |-> FALSE]
+    /\ holdPos' = [t \in Tables |-> 0]
+    /\ holdDebt' = [t \in Tables |-> IF hold[t] THEN holdPos[t] ELSE holdDebt[t]]
+    /\ UNCHANGED << storeVars, laneVars, roundVars, foldVars, blobVars >>
+
+(* Self-loop so bounded counters exhausting is not a TLC deadlock (house pattern). *)
 NoOp == UNCHANGED vars
 
 Next ==
-    \/ \E t \in Tables : WAppendStart(t) \/ WAppendDurable(t) \/ WAppendAbandon(t) \/ WRaiseSnap(t)
-    \/ \E t \in Tables, i \in Ids : Cleanup(t, i)
-    \/ BeginRound \/ PageStep \/ ScanComplete \/ FoldCommitWin \/ FoldCommitLose
-    \/ (EnableLatePredecessorPut /\ LatePredecessorPut)
+    \/ \E t \in Tables :
+         \/ WAppendStart(t) \/ WAppendDurable(t) \/ WAppendAbandon(t)
+         \/ EpochSeal(t) \/ WRaiseSnap(t)
+         \/ HintReturn(t) \/ WalkStep(t) \/ ProbeAbsent(t)
+    \/ \E t \in Tables, i \in Ids : Cleanup(t, i) \/ HideLog(t, i)
+    \/ RevealLog
+    \/ BeginRound \/ ScanComplete \/ FoldCommitWin \/ FoldCommitLose
+    \/ Condemn \/ Delete \/ Rebuild
     \/ NoOp
 
 Spec == Init /\ [][Next]_vars
@@ -244,24 +481,59 @@ TypeOK ==
     /\ durable \subseteq AllKeys
     /\ everDurable \subseteq AllKeys
     /\ durable \subseteq everDurable
+    /\ hidden \subseteq durable
+    /\ sealed \in [Tables -> SUBSET Ids]
+    /\ \A t \in Tables : EverIds(t) \cap sealed[t] = {}   \* no slot is both a log and a seal
     /\ delta \subseteq AllKeys
     /\ folded \subseteq AllKeys
-    /\ nextId \in [Tables -> 1..(MaxSeq + 1)]
     /\ pendingId \in [Tables -> 0..MaxSeq]
+    /\ snap \in [Tables -> 0..MaxSeq]
     /\ cursor \in [Tables -> 0..MaxSeq]
     /\ cand \in [Tables -> 0..MaxSeq]
     /\ csnap \in [Tables -> 0..MaxSeq]
-    /\ snap \in [Tables -> 0..MaxSeq]
-    /\ scanPos \in 0..(2 * (MaxSeq + 1))
+    /\ maxSeen \in [Tables -> 0..MaxSeq]
+    /\ frontier \in [Tables -> BOOLEAN]
     /\ gcPhase \in {"idle", "scanning", "complete"}
     /\ roundOutcome \in {"none", "won", "lost"}
     /\ dupFlag \in BOOLEAN
-    /\ lateFired \in BOOLEAN
+    /\ hold \in [Tables -> BOOLEAN]
+    /\ holdPos \in [Tables -> 0..(MaxSeq + 1)]
+    /\ holdDebt \in [Tables -> 0..(MaxSeq + 1)]
+    /\ \A t \in Tables : hold[t] <=> (holdPos[t] # 0)
+    /\ condemned \in BOOLEAN
+    /\ deleted \in BOOLEAN
+    /\ rsc \in 0..1
+    /\ destroyedUnderHold \in BOOLEAN
+    /\ Indeg >= 0                    \* the cfg's EdgeOf keeps honest in-degree non-negative
 
 (* (I1) The adopted cursor never passes a durable-but-unfolded log, even if that log was later
-   deleted -- everDurable (not durable) is the oracle, exactly the property the three-premise
-   proof in spec §gc-step-enumerate-once establishes. *)
+   deleted -- everDurable, not durable, is the oracle. *)
 NoMissedFold == \A k \in everDurable : (k.i <= cursor[k.t]) => (k \in folded)
+
+(* (I4, the pool-wide one) The shared blob's bytes are never deleted while an acknowledged `+1`
+   names it. This model's `EdgeOf` gives the blob exactly one removal — T2's, matching the
+   pre-existing base edge — so an acked add is never legitimately retracted: once one is durable,
+   deleting the blob IS the data loss, whether or not the fold happens to have accounted it.
+
+   Stronger than "acked but unfolded", deliberately. The weaker form cannot see the case where a
+   `+1` landed after condemnation and WAS folded, yet a pending exact-token delete still fired —
+   which is the whole subject of the delete-time liveness re-check. This is the property the
+   frontier proof, the hold and the two-phase pacing exist to buy, and the one no per-namespace
+   invariant can see. *)
+NoAckedLoss == deleted => (\A k \in everDurable : EdgeOf[k] # "add")
+
+(* (I5) No destructive step ever ran while a namespace was ENCUMBERED — held, or carrying a debt: a
+   hold whose offending position was released without folding through it (spec §5: a hold "clears
+   ONLY by folding through that position and adopting the result ... never by observing another
+   absent"; §7: REBUILD carries every hold verbatim).
+
+   Stated over a sticky ghost rather than the shape `(\E t : hold[t]) => ~deleted`, because that
+   shape is not the property: a hold SET after a legitimate deletion would falsify it, and a hold
+   DROPPED before an illegitimate one — which is exactly the r8 blocker — would satisfy it. What
+   must never happen is the destructive STEP, taken while the namespace's accounting is open. The
+   debt is carried rather than flagged at the drop so that the two hold sabotages must actually
+   reach a destructive step to be caught, instead of being red by definition. *)
+HoldSuppresses == ~destroyedUnderHold
 
 (* (I2) Every key is adopted into folded[] at most once. *)
 ExactlyOnce == ~dupFlag

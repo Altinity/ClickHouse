@@ -91,7 +91,7 @@ of `CaGcRootLocalPartManifestCore`.
 | `CaRetiredInRun.tla` | retired list folded into the snapshot run (two-cursor merge, coverage coherence) | CURRENT | `run_retiredinrun.sh` |
 | `CaRetiredInRunFoldAbortWitness.tla` | GC freshness meta is add-only: a spare never clears a condemned marker | CURRENT | `run_foldabort_witness.sh` |
 | `CaRefTableSnapshotLogCore.tla` | v9 contiguous ref stream: state-derived dense ids, every-attempt reuse rule, `_ckpt`-based recovery base + arithmetic walk, in-band `slot-occupy` epoch seal — `LatePredecessorPut` FLIPPED from rev.4 expected-fail to green, with `_sab_noseal` as the control | CURRENT (v9 rewrite 2026-07-28; gates the ref-chain implementation) | `run_refsnaplog.sh` |
-| `CaRefDeltaIntakeCore.tla` | GC ref-intake pagination; cursor adoption atomic with the fold commit | CURRENT | `run_refintake.sh` |
+| `CaRefDeltaIntakeCore.tla` | pool-wide GC fold: arithmetic walk, destructive-round frontier proof, durable hold | CURRENT | `run_deltaintake.sh` |
 | `CaRefFoldClampRecoveryCore.tla` | fold clamp always recoverable: per-log cleanup staging | CURRENT | `run_foldclamp.sh` |
 | `CaRefNsCleanupStaleLeaderCore.tla` | stale-leader namespace-cleanup pass aborts on completed-marker observation | CURRENT | `run_nscleanup_staleleader.sh` |
 | `CaRefWriterCleanupCore.tla` | ref-table writer ownership lifecycle: precommit, promote, fence, successor cleanup | CURRENT | `run_refwcleanup.sh` |
@@ -214,11 +214,14 @@ ordered scan and cleanup deletes only what it observed durable. The migration is
   occupancy, conditional-create-as-fence, folding the hint, both `_ckpt` deletion gates and the
   `_ckpt` semantic-max merge — the last of which loses data SILENTLY when skipped. Full verdicts,
   traces and the retired rev.4/rev.6 configs: `CaRefTableSnapshotLogCore_RESULTS.md`.
-- **`CaRefDeltaIntakeCore.tla`** — the GC's paginated intake of ref deltas: two tables sharing one
-  lexically ordered keyspace, strictly increasing durable ids with at most one unresolved append.
-  Proves resume-after-returned-key pagination misses nothing, cursor adoption is atomic with the
-  fold commit, and cleanup requires BOTH cursor and snapshot coverage — each rule broken
-  individually produces a counterexample.
+- **`CaRefDeltaIntakeCore.tla`** — the GC's fold over ref deltas, POOL-WIDE (v9): two namespaces
+  with contiguous ids share one blob, so the oracle is "was an acked `+1` still unaccounted when
+  the blob was deleted", which no per-namespace invariant can see. The LIST is a zero-trust hint
+  consumed nowhere for correctness; the fold advances by arithmetic point reads; a destructive
+  round needs a frontier proof for EVERY namespace; an impossible shape HOLDS the namespace
+  durably, and REBUILD must carry the hold. Reproduces the r7-1 (cross-namespace hidden `+1`) and
+  r8 (REBUILD forgets the hold) blockers as counterexamples, and records one residual exposure of
+  v9 as a runnable witness. Full verdicts and traces: `CaRefDeltaIntakeCore_RESULTS.md`.
 - **`CaRefFoldClampRecoveryCore.tla`** — a clamped fold (a log held back at an unreadable body)
   must stay recoverable: body tokens named by a log's removal records may join the round's cleanup
   set only once the WHOLE log folds, and a clamp discards the log's staged tokens. Committing at
