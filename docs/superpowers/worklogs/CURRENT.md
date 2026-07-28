@@ -1427,3 +1427,6 @@ own-landed-bytes adoption input); fix round 1 dispatched, one-turn framing. No p
 
 **2026-07-28 17:00 local watchdog** — task 2 fix round: source edits landing (16:57-16:59,
 control-layer + test file), build not yet started. No push.
+
+**2026-07-28 17:20 local watchdog** — task 2 fix round stalled again post-edit (20 min quiet, no
+build). Final nudge sent with controller-finalize ultimatum. No push.
