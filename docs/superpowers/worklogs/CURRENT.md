@@ -1198,3 +1198,8 @@ to first commit). Next tick without artifacts → ping the agent. No TLC/codex r
 sabotage logs (skipquietprobe, cleanupignorescursor) written 04:00, extra witness configs appearing
 (`witness_corruptgap`) — the agent is iterating config expectations, healthy. No report/commit yet.
 No push.
+
+**2026-07-28 04:3x UTC watchdog** — task 2 finishing: report drafted (04:05), control configs
+(`ctl_deleteignoresindeg`, `ctl_holdsuppresses`) done, harness on greens (`v9_safe` live). Commit
+pending. (Watchdog note: a typo'd `cat >>` without heredoc hung the previous tick's commit — retried.)
+No push.
