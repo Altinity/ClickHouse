@@ -12,6 +12,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int CORRUPTED_DATA;
+    extern const int NOT_IMPLEMENTED;
 }
 }
 
@@ -346,6 +347,13 @@ void RefTableState::applyOp(const RefOp & op, const RefTxnId & txn_id)
             remove_txn_id = txn_id;
             return;
         }
+        case RefOpKind::EpochSeal:
+            /// Stage A task 1 scope boundary: the codec now accepts `EpochSeal` (grammar +
+            /// round trip only), but the apply layer's seal handling -- INV-2's contextual grammar
+            /// and the slot-occupy integration -- is wired by a later task. Unreachable today (nothing
+            /// yet mints an `EpochSeal` op), so failing loudly beats a silent no-op if that assumption
+            /// is ever violated before the real handling lands.
+            throw Exception(ErrorCodes::NOT_IMPLEMENTED, "RefTableState: EpochSeal apply is not yet implemented");
     }
     /// Reachable only through a hand-corrupted RefOpKind (mirrors CasRefLogCodec.cpp's
     /// exhaustive-switch-then-throw shape); every named enumerator returns above.

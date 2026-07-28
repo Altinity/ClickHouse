@@ -201,7 +201,7 @@ TEST(CasSweepLateLog, LogBetweenSealedFromAndSealIdIsReportedNotRevived)
 
     /// A late log at {2, 7}: sealed_from (3) < 7 <= snapshot_id (UINT64_MAX) -- provably late.
     const RefTxnId late_log_id{2, 7};
-    writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), late_log_id, {}});
+    writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), late_log_id, {}, std::nullopt});
 
     setWatermarkMinActive(*backend, layout, kServerRoot, kWriterEpoch, /*min_active*/6);   // prefix eligible
 
@@ -294,7 +294,7 @@ TEST(CasSweepLateLog, SecondPassSuppressedWithDedupLatchButNotWithoutOne)
     seal.sealed_from = RefTxnId{2, 3};
     writeRefSnapshotRaw(*backend, layout, seal);
     const RefTxnId late_log_id{2, 7};
-    writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), late_log_id, {}});
+    writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), late_log_id, {}, std::nullopt});
     setWatermarkMinActive(*backend, layout, kServerRoot, kWriterEpoch, /*min_active*/6);
 
     /// The sink target must outlive the Pool: `~Pool` emits terminate events into the sink.

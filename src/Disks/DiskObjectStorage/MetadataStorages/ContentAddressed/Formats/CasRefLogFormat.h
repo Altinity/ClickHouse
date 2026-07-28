@@ -13,11 +13,19 @@ namespace DB::Cas
 
 /// Text codec for `cas_ref_log`, the immutable object stored at `_log/<txn_id>`. Each object contains
 /// exactly one committed transaction: its namespace, transaction id, and the batch of `RefOp`s applied
-/// by that commit. The body has a header, a meta line `{"ns","we","rs"}`, one JSON record per op,
-/// and a `{"n":count}` trailer. Records are emitted in the transaction's stored order and contain no
-/// codec-generated timestamps, so encoding the same value is byte-identical. This determinism is a
-/// property of the representation, not an adoption gate: ref commits use `putIfAbsentControlled`, and
-/// the caller applies the `Always`/`.zst` storage policy by sealing the returned text.
+/// by that commit. The body has a header, a meta line `{"ns","we","rs",["pse","pss"]}`, one JSON
+/// record per op, and a `{"n":count}` trailer. Records are emitted in the transaction's stored order
+/// and contain no codec-generated timestamps, so encoding the same value is byte-identical. This
+/// determinism is a property of the representation, not an adoption gate: ref commits use
+/// `putIfAbsentControlled`, and the caller applies the `Always`/`.zst` storage policy by sealing the
+/// returned text.
+///
+/// `RefOpKind::EpochSeal` closes an epoch transition in-band (spec INV-2): a seal transaction contains
+/// exactly that one op, and the meta line's optional `prev_epoch_seal` (wire fields `pse`/`pss`) chains
+/// to the transaction id of the seal that closed the PRECEDING epoch. `prev_epoch_seal` is required on
+/// exactly sequence 1 of every epoch above the namespace's genesis (`life_epoch`, the writer epoch of
+/// its `NamespaceBirth`) and forbidden elsewhere -- see `validateEpochSealGrammarStructural` and
+/// `validateEpochSealGrammarContextual`.
 
 /// One operation kind in a ref transaction log. The numeric values are part of the in-memory and
 /// serialized representation; unknown values are rejected by the decoder.
@@ -27,13 +35,16 @@ enum class RefOpKind : uint8_t
     OwnerTransition = 2,
     SetPublishedAt = 3,
     RemoveNamespace = 4,
+    EpochSeal = 5,
 };
 
 /// One operation inside a `RefLogTxn`. Only the fields documented next to `kind` are meaningful for
 /// that kind, and the codec never reads or writes the others. `OwnerTransition` optionally removes
 /// `old_binding` and/or installs `new_binding`; `SetPublishedAt` carries the expected manifest and the
 /// publication timestamp. `RefOwnerBinding` is shared with the snapshot format through
-/// `CasRefWireVocab.h`.
+/// `CasRefWireVocab.h`. `NamespaceBirth`, `RemoveNamespace`, and `EpochSeal` carry none of `RefOp`'s
+/// fields -- `EpochSeal`'s only payload, `prev_epoch_seal`, lives on the containing `RefLogTxn`, not
+/// here (it is a property of the transaction's position in the log, not of the op).
 struct RefOp
 {
     RefOpKind kind = RefOpKind::NamespaceBirth;
@@ -56,6 +67,18 @@ struct RefLogTxn
     String ns;
     RefTxnId txn_id;
     std::vector<RefOp> ops;
+    /// The id of the `EpochSeal` transaction that closed the PRECEDING epoch (spec INV-2's genesis
+    /// contract): required iff `txn_id.ref_sequence == 1` and `txn_id.writer_epoch` is above the
+    /// namespace's `life_epoch` (its `NamespaceBirth` writer epoch), forbidden at every other
+    /// sequence. Populated by both the recovery-minted seal that closes an empty epoch and the first
+    /// ordinary transaction a writer appends after a transition -- see
+    /// `validateEpochSealGrammarStructural` / `validateEpochSealGrammarContextual`. Declared LAST (not
+    /// grouped with `txn_id`) to keep it a strict append to `RefLogTxn`'s field order. This project's
+    /// `-Wmissing-field-initializers`/`-Wmissing-designated-field-initializers` still require every
+    /// pre-existing positional `RefLogTxn{ns, txn_id, ops}` aggregate-init call site across the tree to
+    /// spell out an explicit trailing `std::nullopt` -- appending is still the smaller, purely
+    /// mechanical diff (one token per call site) compared to inserting a field in the middle.
+    std::optional<RefTxnId> prev_epoch_seal;
 
     bool operator==(const RefLogTxn &) const = default;
 };
@@ -118,5 +141,30 @@ size_t encodedOpSize(const RefOp & op);
 /// `ref_txn_max_bytes`) or exempts an item from the normal-class op/per-op caps must call this, not
 /// re-derive its own predicate.
 bool refLogTxnIsRemovalClass(const std::vector<RefOp> & ops);
+
+/// True iff `txn` is exactly a well-formed epoch-seal transaction: one operation, and that operation
+/// is `EpochSeal`. Unlike `refLogTxnIsRemovalClass` (a class predicate that tolerates other ops
+/// alongside `RemoveNamespace`), a seal transaction's grammar forbids any companion op (spec INV-2),
+/// so this checks the exact shape rather than mere presence -- callers that decode untrusted bytes
+/// and branch on "is this a seal" (Task 2's slot-occupy walk) get a precise answer.
+bool refLogTxnIsEpochSeal(const RefLogTxn & txn);
+
+/// The context-free half of the INV-2 seal grammar: a transaction carrying an `EpochSeal` op contains
+/// EXACTLY that one op, and `prev_epoch_seal`, when present, is well-formed (both `RefTxnId`
+/// components nonzero) and appears ONLY at `txn_id.ref_sequence == 1`. Called by both
+/// `encodeRefLogTxn` and `decodeRefLogTxn`, so a caller-built transaction and a decoded one are held
+/// to the identical rule. Throws CORRUPTED_DATA on violation. Does NOT check the required-iff rule --
+/// that needs `life_epoch`, which the codec never sees; see `validateEpochSealGrammarContextual`.
+void validateEpochSealGrammarStructural(const RefLogTxn & txn);
+
+/// The contextual half of the INV-2 seal grammar: `prev_epoch_seal` is required on exactly
+/// `txn_id.ref_sequence == 1` of every epoch with `txn_id.writer_epoch > life_epoch` (a namespace's
+/// `life_epoch` is the writer epoch of its `NamespaceBirth` record -- its genesis, which may be above
+/// 1 for a namespace born after earlier epoch transitions) and forbidden at
+/// `txn_id.writer_epoch <= life_epoch`; a no-op for `txn_id.ref_sequence != 1` (the unconditional
+/// "forbidden elsewhere" half of the rule is `validateEpochSealGrammarStructural`'s job, not this
+/// function's). Callers own `life_epoch`: the apply layer and the writer-side encode call sites that
+/// mint a sequence-1 transaction. Throws CORRUPTED_DATA on violation.
+void validateEpochSealGrammarContextual(const RefLogTxn & txn, uint64_t life_epoch);
 
 }

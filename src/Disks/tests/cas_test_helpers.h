@@ -258,7 +258,8 @@ inline DB::Cas::RefOp ownerTransitionOp(
 /// for the removed mutable-shard `appendOwnerEvent`. LIST the table's ref prefix, find the greatest
 /// existing log/snapshot `ref_sequence` (and whether ANY log or snapshot exists at all), prepend a
 /// `namespace_birth` op iff the table has none yet, allocate `txn_id = {writer_epoch=1, greatest+1}`,
-/// and write `RefLogTxn{ns, txn_id, ops}` via `writeRefLogTxnRaw`. Returns the allocated `ref_sequence`.
+/// and write `RefLogTxn{ns, txn_id, ops}` (no `prev_epoch_seal` -- this fixture never crosses an
+/// epoch transition) via `writeRefLogTxnRaw`. Returns the allocated `ref_sequence`.
 /// `ops` must form a REPLAY-VALID transaction: `fsck`/recovery replay them through the same state
 /// machine the writer uses, and the GC edge extractor reads their manifest edges. The bytes are real
 /// wire-format (the same codec `Pool`'s recovery reads) -- never hand-rolled.

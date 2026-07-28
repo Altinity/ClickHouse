@@ -28,6 +28,7 @@ std::string_view opKindToWord(RefOpKind k)
         case RefOpKind::OwnerTransition: return "owner_transition";
         case RefOpKind::SetPublishedAt:  return "set_published_at";
         case RefOpKind::RemoveNamespace: return "remove_namespace";
+        case RefOpKind::EpochSeal:       return "epoch_seal";
     }
     throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: unknown op kind {}", static_cast<uint8_t>(k));
 }
@@ -38,6 +39,7 @@ RefOpKind opKindFromWord(std::string_view w)
     if (w == "owner_transition")  return RefOpKind::OwnerTransition;
     if (w == "set_published_at")  return RefOpKind::SetPublishedAt;
     if (w == "remove_namespace")  return RefOpKind::RemoveNamespace;
+    if (w == "epoch_seal")        return RefOpKind::EpochSeal;
     throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: unknown op kind '{}'", w);
 }
 
@@ -94,6 +96,7 @@ void writeOp(CasJsonWriter & out, const RefOp & op)
     {
         case RefOpKind::NamespaceBirth:
         case RefOpKind::RemoveNamespace:
+        case RefOpKind::EpochSeal:
             break;
         case RefOpKind::OwnerTransition:
             if (op.old_binding)
@@ -152,9 +155,12 @@ struct BindingFields
     }
 };
 
-/// The log transaction's header-object meta line (ns + txn_id). Shared by `encodeRefLogTxn` and
-/// `removalFramingSize` so the two never disagree by a byte.
-void writeLogMeta(CasJsonWriter & out, const String & ns, const RefTxnId & txn_id)
+/// The log transaction's header-object meta line (ns + txn_id + the optional `prev_epoch_seal`
+/// chain). Shared by `encodeRefLogTxn` and `removalFramingSize` so the two never disagree by a byte;
+/// `removalFramingSize` always passes `std::nullopt` -- a removal transaction is never a sequence-1
+/// epoch-transition record. Additive: the "pse"/"pss" pair is emitted only when `prev_epoch_seal` is
+/// set, so a body without it is byte-identical to the pre-EpochSeal wire shape.
+void writeLogMeta(CasJsonWriter & out, const String & ns, const RefTxnId & txn_id, const std::optional<RefTxnId> & prev_epoch_seal)
 {
     bool first = true;
     writeKey(out, "ns", first);
@@ -163,6 +169,13 @@ void writeLogMeta(CasJsonWriter & out, const String & ns, const RefTxnId & txn_i
     writeU64StringValue(out, txn_id.writer_epoch);
     writeKey(out, "rs", first);
     writeU64StringValue(out, txn_id.ref_sequence);
+    if (prev_epoch_seal)
+    {
+        writeKey(out, "pse", first);
+        writeU64StringValue(out, prev_epoch_seal->writer_epoch);
+        writeKey(out, "pss", first);
+        writeU64StringValue(out, prev_epoch_seal->ref_sequence);
+    }
     closeObject(out, first);
     writeChar('\n', out);
 }
@@ -213,6 +226,7 @@ RefOp readOpRecord(JsonObjectReader & r, RefOpKind kind)
     {
         case RefOpKind::NamespaceBirth:
         case RefOpKind::RemoveNamespace:
+        case RefOpKind::EpochSeal:
             break;
         case RefOpKind::OwnerTransition:
             if (ob.any())
@@ -234,14 +248,57 @@ RefOp readOpRecord(JsonObjectReader & r, RefOpKind kind)
 
 }
 
+bool refLogTxnIsEpochSeal(const RefLogTxn & txn)
+{
+    return txn.ops.size() == 1 && txn.ops.front().kind == RefOpKind::EpochSeal;
+}
+
+void validateEpochSealGrammarStructural(const RefLogTxn & txn)
+{
+    const bool has_seal_op = std::any_of(txn.ops.begin(), txn.ops.end(),
+        [](const RefOp & op) { return op.kind == RefOpKind::EpochSeal; });
+    if (has_seal_op && txn.ops.size() != 1)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "RefLogTxn: a transaction carrying an EpochSeal op must contain exactly that one op, got {} ops",
+            txn.ops.size());
+
+    if (txn.prev_epoch_seal)
+    {
+        checkTxnIdNonzero(*txn.prev_epoch_seal);
+        if (txn.txn_id.ref_sequence != 1)
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "RefLogTxn: prev_epoch_seal is only allowed at sequence 1, got txn_id {}-{}",
+                txn.txn_id.writer_epoch, txn.txn_id.ref_sequence);
+    }
+}
+
+void validateEpochSealGrammarContextual(const RefLogTxn & txn, uint64_t life_epoch)
+{
+    /// The unconditional "forbidden outside sequence 1" half of the rule is
+    /// `validateEpochSealGrammarStructural`'s job; this function only owns the required-iff rule,
+    /// which is meaningless off sequence 1.
+    if (txn.txn_id.ref_sequence != 1)
+        return;
+    const bool required = txn.txn_id.writer_epoch > life_epoch;
+    if (required && !txn.prev_epoch_seal)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "RefLogTxn: sequence-1 txn at writer_epoch {} (life_epoch {}) must carry prev_epoch_seal",
+            txn.txn_id.writer_epoch, life_epoch);
+    if (!required && txn.prev_epoch_seal)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "RefLogTxn: sequence-1 txn at writer_epoch {} (life_epoch {}) must not carry prev_epoch_seal",
+            txn.txn_id.writer_epoch, life_epoch);
+}
+
 String encodeRefLogTxn(const RefLogTxn & txn)
 {
     checkTxnIdNonzero(txn.txn_id);
+    validateEpochSealGrammarStructural(txn);
 
     CasJsonWriter out(512);
     writeHeaderLine(out, FormatId::RefLog);
 
-    writeLogMeta(out, txn.ns, txn.txn_id);
+    writeLogMeta(out, txn.ns, txn.txn_id, txn.prev_epoch_seal);
 
     for (const RefOp & op : txn.ops)
         writeOp(out, op);
@@ -268,16 +325,28 @@ RefLogTxn decodeRefLogTxn(std::string_view data, const String & expected_ns, con
         bool saw_ns = false;
         bool saw_we = false;
         bool saw_rs = false;
+        std::optional<uint64_t> pse;
+        std::optional<uint64_t> pss;
         String key;
         while (r.nextKey(key))
         {
             if (key == "ns") { txn.ns = r.readString(); saw_ns = true; }
             else if (key == "we") { txn.txn_id.writer_epoch = r.readU64String(); saw_we = true; }
             else if (key == "rs") { txn.txn_id.ref_sequence = r.readU64String(); saw_rs = true; }
+            else if (key == "pse") pse = r.readU64String();
+            else if (key == "pss") pss = r.readU64String();
             else r.skipUnknown(key);
         }
         if (!saw_ns || !saw_we || !saw_rs)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: meta line missing ns/we/rs");
+        /// Both-or-neither: `nextKey` already rejects a repeated "pse"/"pss" (duplicate-key check), so
+        /// this only guards against a body carrying exactly one of the pair.
+        if (pse || pss)
+        {
+            if (!pse || !pss)
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: prev_epoch_seal needs both pse and pss");
+            txn.prev_epoch_seal = RefTxnId{*pse, *pss};
+        }
         if (!m.eof())
             throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: junk after meta line");
     }
@@ -322,6 +391,10 @@ RefLogTxn decodeRefLogTxn(std::string_view data, const String & expected_ns, con
             throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: junk after op record");
     }
 
+    /// Finalization: `txn.ops` is now complete, so the context-free seal grammar (which needs the
+    /// full op list) can run. Both directions of the codec enforce the identical rule -- see
+    /// `encodeRefLogTxn`.
+    validateEpochSealGrammarStructural(txn);
     checkBudget(txn.ops, data.size());
     return txn;
 }
@@ -357,7 +430,7 @@ size_t removalFramingSize(const String & ns, const RefTxnId & txn_id, uint64_t o
     /// including the remove_namespace op (i.e. committed + precommits + 1).
     CasJsonWriter out(256);
     writeHeaderLine(out, FormatId::RefLog);
-    writeLogMeta(out, ns, txn_id);
+    writeLogMeta(out, ns, txn_id, std::nullopt);
     RefOp remove_op;
     remove_op.kind = RefOpKind::RemoveNamespace;
     writeOp(out, remove_op);

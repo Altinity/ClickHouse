@@ -1793,7 +1793,7 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
                 RefTableState shape_check = working;
                 RefTxnId shape_probe_id = trial_id;
                 shape_probe_id.ref_sequence += 1;
-                applyRefLogTxn(shape_check, RefLogTxn{ns.string(), shape_probe_id, item_ops});
+                applyRefLogTxn(shape_check, RefLogTxn{ns.string(), shape_probe_id, item_ops, std::nullopt});
             }
 
             for (const RefOp & op : item_ops)
@@ -1815,7 +1815,7 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
                 /// owner_transition) is validated -- both here and by admits's own preview -- against
                 /// a state that already reflects it, exactly as the real combined transaction will.
                 trial_id.ref_sequence += 1;
-                applyRefLogTxn(item_scratch, RefLogTxn{ns.string(), trial_id, {op}});
+                applyRefLogTxn(item_scratch, RefLogTxn{ns.string(), trial_id, {op}, std::nullopt});
             }
             /// Reserve the growth of BOTH accumulators BEFORE this item's effects are published. These
             /// reservations are the ONLY remaining throwing steps; once they succeed the publish below is
@@ -1938,7 +1938,7 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
     }
 
     const RefTxnId id = allocateRefTxnId();
-    const RefLogTxn chunk_txn{ns.string(), id, chunk_ops};
+    const RefLogTxn chunk_txn{ns.string(), id, chunk_ops, std::nullopt};
 
     /// Build the candidate state BEFORE the PUT (spec §A1), so that the region between "this chunk's
     /// object is durable" and "the runtime records it" is allocation-free and therefore cannot throw.

@@ -199,6 +199,7 @@ String refOpKindName(RefOpKind k)
         case RefOpKind::OwnerTransition: return "OwnerTransition";
         case RefOpKind::SetPublishedAt: return "SetPublishedAt";
         case RefOpKind::RemoveNamespace: return "RemoveNamespace";
+        case RefOpKind::EpochSeal: return "EpochSeal";
     }
     return "Unknown";
 }
@@ -227,6 +228,7 @@ String renderRefLogTxn(const RefLogTxn & t)
         .add("ns", jsonEscape(t.ns))
         .add("txn_id", renderRefTxnIdObj(t.txn_id))
         .add("ops", jsonArray(ops))
+        .add("prev_epoch_seal", t.prev_epoch_seal ? renderRefTxnIdObj(*t.prev_epoch_seal) : "null")
         .str();
 }
 

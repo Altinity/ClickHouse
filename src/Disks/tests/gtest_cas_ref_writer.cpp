@@ -452,7 +452,7 @@ TEST(RefWriterRecovery, BirthOnlyLogNoSnapshotRecoversToEmptyLiveTable)
     const Layout layout("p");
     const RootNamespace ns{"srv1/birth_only"};
 
-    writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{1, 1}, {namespaceBirthOp()}});
+    writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{1, 1}, {namespaceBirthOp()}, std::nullopt});
 
     auto store = openPool(backend);
     EXPECT_TRUE(store->listRefs(ns).empty());
@@ -468,9 +468,9 @@ TEST(RefWriterRecovery, BirthPlusPrecommitPromoteAcrossTwoLogsNoSnapshot)
     const ManifestRef m1 = manifestRef(1, 1, 1);
 
     writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{1, 1},
-        {namespaceBirthOp(), publishCommittedOps("part_1", m1)[0]}});
+        {namespaceBirthOp(), publishCommittedOps("part_1", m1)[0]}, std::nullopt});
     writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{1, 2},
-        {publishCommittedOps("part_1", m1)[1]}});
+        {publishCommittedOps("part_1", m1)[1]}, std::nullopt});
 
     auto store = openPool(backend);
     const auto resolved = store->resolveRef(ns, "part_1");
@@ -498,7 +498,7 @@ TEST(RefWriterRecovery, SnapshotPlusTailRecovery)
     /// A stale log BELOW the snapshot id would, if wrongly replayed, try to add "a" a second time
     /// (the snapshot already contains it) and throw -- proving it must be ignored, not merely benign.
     writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{1, 3},
-        {namespaceBirthOp(), publishCommittedOps("a", ma)[0], publishCommittedOps("a", ma)[1]}});
+        {namespaceBirthOp(), publishCommittedOps("a", ma)[0], publishCommittedOps("a", ma)[1]}, std::nullopt});
     writeRefSnapshotRaw(*backend, layout, minimalLiveSnapshot(ns.string(), RefTxnId{1, 5}, {committedRow("a", ma)}));
 
     std::vector<RefOp> tail_ops;
@@ -506,7 +506,7 @@ TEST(RefWriterRecovery, SnapshotPlusTailRecovery)
         op.old_binding = RefOwnerBinding{RefOwnerKind::Committed, "a", ma}; return op; }());
     tail_ops.push_back(publishCommittedOps("b", mb)[0]);
     tail_ops.push_back(publishCommittedOps("b", mb)[1]);
-    writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{1, 6}, tail_ops});
+    writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{1, 6}, tail_ops, std::nullopt});
 
     auto store = openPool(backend);
     EXPECT_FALSE(store->resolveRef(ns, "a").has_value());
@@ -1972,7 +1972,7 @@ TEST(RefWriterStalePrecommitSweep, BoundedBatchesAndInterruptionResumeAcrossMoun
             op.new_binding = RefOwnerBinding{RefOwnerKind::Precommit, "stale_" + std::to_string(i), manifestRef(e1, static_cast<uint64_t>(i) + 1, 1)};
             ops1.push_back(op);
         }
-        writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{e1, 1}, ops1});
+        writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{e1, 1}, ops1, std::nullopt});
 
         std::vector<RefOp> ops2;
         for (int i = 700; i < kTotalStale; ++i)
@@ -1982,7 +1982,7 @@ TEST(RefWriterStalePrecommitSweep, BoundedBatchesAndInterruptionResumeAcrossMoun
             op.new_binding = RefOwnerBinding{RefOwnerKind::Precommit, "stale_" + std::to_string(i), manifestRef(e1, static_cast<uint64_t>(i) + 1, 1)};
             ops2.push_back(op);
         }
-        writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{e1, 2}, ops2});
+        writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{e1, 2}, ops2, std::nullopt});
     }
 
     /// The successor: a tight retry budget so ONE simulated ambiguous response wedges rather than

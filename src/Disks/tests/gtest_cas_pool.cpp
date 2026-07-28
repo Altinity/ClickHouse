@@ -658,7 +658,7 @@ TEST(CasPool, ReadManifestValidatesBodyAndFailsClosed)
         const ManifestRef missing_ref = manifestRefFor("never-staged");
         DB::Cas::tests::writeRefLogTxnRaw(*b, layout, RefLogTxn{ns.string(), RefTxnId{1, 1},
             {DB::Cas::tests::namespaceBirthOp(), DB::Cas::tests::publishCommittedOps("part_dangle", missing_ref)[0],
-             DB::Cas::tests::publishCommittedOps("part_dangle", missing_ref)[1]}});
+             DB::Cas::tests::publishCommittedOps("part_dangle", missing_ref)[1]}, std::nullopt});
 
         auto r = s->resolveRef(ns, "part_dangle");
         ASSERT_TRUE(r.has_value());
@@ -788,7 +788,7 @@ TEST(CasPool, ManifestDecodeCacheIsByteBounded)
         std::vector<DB::Cas::RefOp> ops = i == 0 ? birth_ops : std::vector<DB::Cas::RefOp>{};
         const auto committed_ops = DB::Cas::tests::publishCommittedOps(ref_name, ref);
         ops.insert(ops.end(), committed_ops.begin(), committed_ops.end());
-        DB::Cas::tests::writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{1, static_cast<uint64_t>(i + 1)}, ops});
+        DB::Cas::tests::writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{1, static_cast<uint64_t>(i + 1)}, ops, std::nullopt});
     }
 
     DB::Cas::PoolConfig config{.pool_prefix = "p", .server_root_id = "test"};
@@ -870,7 +870,7 @@ TEST(CasPool, ListRefsMergesAllShards)
         const auto committed_ops = DB::Cas::tests::publishCommittedOps(ref, manifestRefFor("manifest-" + ref));
         ops.insert(ops.end(), committed_ops.begin(), committed_ops.end());
     }
-    DB::Cas::tests::writeRefLogTxnRaw(*b, layout, RefLogTxn{ns.string(), RefTxnId{1, 1}, ops});
+    DB::Cas::tests::writeRefLogTxnRaw(*b, layout, RefLogTxn{ns.string(), RefTxnId{1, 1}, ops, std::nullopt});
 
     auto refs = s->listRefs(ns);
     ASSERT_EQ(refs.size(), 8u);
@@ -924,7 +924,7 @@ TEST(CasPool, ListRefsReturnsSameContentAsBefore)
         const auto committed_ops = DB::Cas::tests::publishCommittedOps(ref, manifestRefFor("manifest-" + ref));
         ops.insert(ops.end(), committed_ops.begin(), committed_ops.end());
     }
-    DB::Cas::tests::writeRefLogTxnRaw(*b, layout, RefLogTxn{ns.string(), RefTxnId{1, 1}, ops});
+    DB::Cas::tests::writeRefLogTxnRaw(*b, layout, RefLogTxn{ns.string(), RefTxnId{1, 1}, ops, std::nullopt});
 
     auto refs = s->listRefs(ns);
 
@@ -951,7 +951,7 @@ TEST(CasPool, ListRefsSkipsForeignKeys)
     const ManifestRef mref = manifestRefFor("manifest-" + ref);
     DB::Cas::tests::writeRefLogTxnRaw(*b, layout, RefLogTxn{ns.string(), RefTxnId{1, 1},
         {DB::Cas::tests::namespaceBirthOp(), DB::Cas::tests::publishCommittedOps(ref, mref)[0],
-         DB::Cas::tests::publishCommittedOps(ref, mref)[1]}});
+         DB::Cas::tests::publishCommittedOps(ref, mref)[1]}, std::nullopt});
 
     /// A stray key directly under the namespace's ref-object prefix that is not `_cleanup`/`_log`/
     /// `_snap` shaped (also covers the legacy shard-number layout GC/dropNamespace still write).
@@ -1873,7 +1873,7 @@ TEST(CasPool, ReadManifestSharedReturnsSharedDecodeWithoutCopy)
         {DB::Cas::tests::blobEntryFor("data.bin", DB::UInt128(7))});
     DB::Cas::tests::writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{1, 1},
         {DB::Cas::tests::namespaceBirthOp(), DB::Cas::tests::publishCommittedOps("part_1", ref)[0],
-         DB::Cas::tests::publishCommittedOps("part_1", ref)[1]}});
+         DB::Cas::tests::publishCommittedOps("part_1", ref)[1]}, std::nullopt});
 
     /// Restart over pre-seeded pool content: establish `_pool_meta` first (Task 7 zero-write bootstrap).
     DB::Cas::tests::seedPoolMetaForRestart(*backend);
