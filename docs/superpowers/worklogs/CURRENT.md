@@ -1317,3 +1317,7 @@ instructed. No push.
 **2026-07-28 12:2x local... (13:2x?) watchdog** — task 6 reviewer mid-flight (one live TLC = its
 spot-run; review file not yet written). Retirement-sweep obligation added to ledger for the main
 plan per user directive. No push.
+
+**2026-07-28 12:4x local** — task 6 review in: Spec ✅ / approved + 1 Important (audit-scope wording;
+CaGcRootLocalPartManifestCore's listedTok named unaudited residual) + 7 minors. Fix round 1
+dispatched to tla-task6. No push.
