@@ -29,6 +29,48 @@ struct RunRef
     bool operator==(const RunRef &) const = default;
 };
 
+/// Why one namespace is held below its ref-log frontier. A BOUNDED enum: every value is a shape the
+/// fold can name exactly, so an operator reading a seal learns what stopped the namespace without
+/// correlating logs. Persisted as a word, so an unknown word is `CORRUPTED_DATA` rather than a silently
+/// reinterpreted integer.
+///
+/// THESE ARE WIRE VALUES, AND THEY ARE APPEND-ONLY. A durable seal written by one build is read by
+/// another, so a renumbered value or a reused word makes an older seal describe a hold that is not the
+/// one it recorded — and a hold's whole job is to say truthfully what stopped a namespace and where.
+/// Add new reasons at the end; never renumber, never repurpose a retired word.
+enum class HoldReason : uint8_t
+{
+    GapBelowWitness = 1,        /// 404 at the expected id with a durable witness above it, same epoch
+    UnconsumedSealCrossing = 2, /// a later epoch is reachable but this epoch's closing seal was never consumed
+    WitnessDisappeared = 3,     /// an above-cursor record stopped answering GETs — corruption, never clearance
+    BodyUndecodable = 4,        /// the ref-log body at the position is present but cannot be decoded/extracted
+    ManifestBodyMissing = 5,    /// a part-manifest body the position's edges name is absent (the fold barrier)
+};
+
+/// The durable hold on one namespace. It rides `ShardCoverage` across rounds and across `REBUILD`, and
+/// clears ONLY by folding through `offending_position` and adopting the result in `gc/state` — never by
+/// observing another absent, because an absent is exactly the observation a lying store produces.
+struct RefHold
+{
+    HoldReason reason = HoldReason::GapBelowWitness;
+
+    /// The exact position the fold must resolve before this namespace may advance. A carried hold makes
+    /// the next round read this key even when the round's hint omits the namespace entirely.
+    RefTxnId offending_position{};
+
+    /// How many rounds have retried `offending_position` without resolving it. Purely observational:
+    /// it is what distinguishes a transient barrier (a writer still uploading a manifest body) from a
+    /// namespace that has been stuck for hours.
+    uint32_t retry_count = 0;
+
+    /// The first round that retries `offending_position`. The fold retries every round today (a hold
+    /// costs one exact `GET`, and a transient barrier must clear the moment its body lands), so this is
+    /// always `current_round + 1`; it exists so a future backoff policy needs no format change.
+    uint64_t next_retry_round = 0;
+
+    bool operator==(const RefHold &) const = default;
+};
+
 /// Records what the current round did for one namespace and shard. `classification` is a persisted byte:
 /// 0 means absent, 1 means unchanged, 2 means all records through the observed cursor were folded, and 4
 /// means folding was clamped below the ref-log cursor. A clamped entry must be read again even if its
@@ -44,6 +86,14 @@ struct ShardCoverage
     /// `{0, 0}` means that no transaction has been folded yet. A clamp leaves the cursor below the
     /// offending transaction so the complete transaction is retried rather than partially applied.
     RefTxnId last_folded_ref_id{};
+
+    /// STRICT GRAMMAR: present if and only if `classification == 4`. Both directions enforce it — the
+    /// encoder refuses to write a classification-4 row without a hold (a clamp whose reason was lost is
+    /// indistinguishable from a clean cursor once it is durable) and refuses to write a hold on any
+    /// other classification; the decoder rejects both shapes as `CORRUPTED_DATA`. The pairing lives in
+    /// the type, not only in the codec, so no producer can construct the forbidden combination by
+    /// forgetting a field.
+    std::optional<RefHold> hold = std::nullopt;
 
     bool operator==(const ShardCoverage &) const = default;
 };
@@ -101,9 +151,31 @@ struct CasFoldSeal
     bool operator==(const CasFoldSeal &) const = default;
 };
 
+/// The two byte caps a fold seal is measured against, read from the format registry so the writer's
+/// gate and its boundary tests can never drift from the reader's limits.
+struct FoldSealCaps
+{
+    uint64_t line_cap;     /// longest decodable record, excluding the '\n' terminator
+    uint64_t object_cap;   /// largest whole seal object
+};
+FoldSealCaps foldSealCaps();
+
+/// PRE-PUT GATE. A seal larger than the object cap is writable but not readable — nothing enforces the
+/// cap on the fold-seal read path, so an oversized PUT would leave the pool with a durable seal that no
+/// later round can decode, which is unrecoverable. `encodeFoldSeal` therefore refuses BEFORE returning
+/// any bytes, which is before either PUT site can issue its write. `LIMIT_EXCEEDED`, not
+/// `CORRUPTED_DATA`: the bytes are well formed, the round is over budget, and the round fails closed and
+/// retries. Equality fits; one byte more does not.
+void checkFoldSealObjectBytes(uint64_t encoded_bytes);
+
 /// Encodes a fold seal as a strict, raw text control object. The header and meta lines are followed by
 /// tagged records in the fixed `cov`/`btr`/`cnd`/`nsc` order and a record-count trailer. Map iteration and
 /// run references are sorted so retries produce byte-identical output for write-once adoption.
+///
+/// Enforces the strict classification-4 hold grammar and BOTH byte caps: every emitted line against
+/// `line_cap` — header, meta, records and trailer alike, with no exception — and the whole object
+/// against `object_cap`. Both PUT sites go through this function, so the gate cannot be bypassed by
+/// adding a third one.
 String encodeFoldSeal(const CasFoldSeal & seal);
 
 /// Decodes and validates a fold seal, rejecting unknown fields, malformed records, trailing bytes, and

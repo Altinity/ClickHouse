@@ -64,6 +64,17 @@ struct RebuildReport
     uint64_t unowned_alive_manifests = 0;
     uint64_t edges = 0;
     uint64_t clamped_shards = 0;
+    /// This rebuild concluded FROM ENUMERATION ALONE that the pool had never sealed a baseline, and so
+    /// carried NO durable hold forward. It is the single route by which a hold can still be dropped
+    /// silently, so the hand-run disaster command REPORTS it rather than leaving it to a log line: on a
+    /// pool that has ever completed a GC round, a 1 here means the enumeration lied.
+    bool virgin_by_enumeration = false;
+    /// WHICH generation's fold seal this rebuild carried holds from; 0 when it carried none. The two
+    /// verdicts this command reaches about the pool's history are then both on its own row — whether a
+    /// baseline was found at all, and which one it was. Grepping that out of the logs is the thing an
+    /// operator should not have to do in the middle of a disaster, and it is also how a step-down past
+    /// a crashed newest generation becomes visible rather than invisible.
+    uint64_t adopted_seal_generation = 0;
 };
 
 /// Counters and diagnostics returned by one `runRegularRound`. These values describe work attempted or
@@ -305,6 +316,19 @@ public:
 
     void setRebuildEdgeBudgetForTest(uint64_t n) { rebuild_edge_budget_override = n; }
 
+    /// INTEGRATION SEAM — the second, hint-independent witness (`_ckpt.checkpoint`, Lane L Task 5).
+    ///
+    /// The listing cannot be the sole witness source: it is a snapshot, so a record that became durable
+    /// after the enumeration is invisible to that round's probes, and an absent expected-next then reads
+    /// as a frontier when it is really a gap. `_ckpt.checkpoint` is the namespace's own durable tail,
+    /// read by the fold anyway for cleanup ranges, and it decides the same question without asking the
+    /// listing anything.
+    ///
+    /// `_ckpt` does not exist yet, so `readCheckpointWitnesses` returns this map verbatim: EMPTY in
+    /// production (the walk is hint-only, exactly as before) and seeded by the hold tests. Task 5 lands
+    /// by replacing that one function body with the real per-namespace read; nothing else moves.
+    void setCheckpointWitnessesForTest(std::map<String, RefTxnId> w) { checkpoint_witness_override = std::move(w); }
+
     /// TEST SEAM: disable the round's journal trim so a folded event stays in the journal
     /// across rounds — exactly the lazy-trim / partial-trim-after-crash condition under which the
     /// next round's fold MUST recover the exact sealed cursor (else it re-folds the event and double-counts
@@ -350,6 +374,25 @@ private:
         /// once in fold() and threaded here so the merge-side reducers and the post-CAS ref/namespace
         /// cleanup share one value, so they cannot desynchronise.
         bool suppress_destructive = false;
+
+        /// Every hold this round SEALED, as `(cursor key, hold)` — both the ones it detected and the
+        /// ones it carried from the parent seal because their offending position is still unresolved.
+        /// It reads the seal that is about to become durable, so it is the round's final answer rather
+        /// than an intermediate one.
+        ///
+        /// This is the input to the destructive-round suppression rule (`suppress_destructive` =
+        /// current anomalies OR every carried hold): a hold means some namespace's frontier is
+        /// unproven, and no frontier proof taken this round can license destruction while one stands.
+        /// Every hold the fold seals also records an anomaly today, so the two agree; the accessor
+        /// exists because that coincidence is not the invariant — the hold set is.
+        std::vector<std::pair<String, RefHold>> carriedHolds() const
+        {
+            std::vector<std::pair<String, RefHold>> out;
+            for (const auto & [key, cov] : fold_seal.per_ns_shard)
+                if (cov.hold)
+                    out.emplace_back(key, *cov.hold);
+            return out;
+        }
     };
 
     /// Per changed root shard, stream the one ordered
@@ -379,6 +422,47 @@ private:
     /// compares it against its own enumeration of the same prefix — probe A.
     FoldResult fold(GcState & state, Token & state_token, RoundReport & report, uint64_t current_round,
                     const RefScanSummary & pre_scan);
+
+    /// The round's `_ckpt.checkpoint` witness per namespace — see `setCheckpointWitnessesForTest` for
+    /// what it decides and why the listing alone cannot decide it. ONE call site, in the fold, right
+    /// where the hint is grouped; Lane L Task 5 lands by filling this body in.
+    ///
+    /// It takes BOTH of the round's namespace sources because it owes a witness to both: `ref_tables`
+    /// is the hint, and `parent_cursors` is where a carried hold names a namespace the hint may have
+    /// stopped mentioning — precisely the namespace whose witness matters most.
+    std::map<String, RefTxnId> readCheckpointWitnesses(const std::map<String, RefTableListing> & ref_tables,
+                                                       const std::map<String, ShardCoverage> & parent_cursors);
+
+    /// What ONE generation's prefix says about itself: whether the generation exists at all, and the
+    /// greatest attempt under it whose key is one `foldSealKey` would have produced.
+    struct GenerationSealProbe
+    {
+        bool generation_exists = false;
+        std::optional<uint64_t> seal_attempt;
+    };
+    GenerationSealProbe probeGenerationForSeal(uint64_t generation);
+
+    /// The newest fold-seal OBJECT in the pool by `(generation, attempt)`, or absent when the pool has
+    /// never sealed a baseline. Used whenever `gc/state` names no adopted baseline: holds live in the
+    /// SEAL, not in the pointer to it, so losing the POINTER must not silently produce a hold-free
+    /// baseline while an unreadable SEAL refuses.
+    ///
+    /// The pool-wide enumeration is a HINT, never the answer: one that omitted the true newest seal
+    /// would hand back an older one and lose every hold detected since — the same hole one layer up.
+    /// Two NARROW single-generation probes above the listing's maximum ask whether it lied, and a seal
+    /// found there THROWS a refusal rather than being adopted; a store that misreports its own
+    /// enumeration during disaster recovery does not get a second guess.
+    ///
+    /// That is DETECTION, not proof, and the implementation says so at the site: the generation half of
+    /// the question is arithmetic (generations are dense in minting), while the attempt half is an
+    /// enumeration within ONE directory, because a seal key's attempt component is a lease sequence
+    /// number with no arithmetic successor to point-read.
+    ///
+    /// THROWS `CORRUPTED_DATA` on that refusal, and on a pool whose enumeration yielded no seal but
+    /// which is not provably new. Returning `nullopt` is the VIRGIN verdict — logged at WARNING with
+    /// its evidence enumerated and counted by `CasGcRebuildVirginByEnumeration`, because it rests on
+    /// enumeration alone and no point read can prove it.
+    std::optional<std::pair<uint64_t, uint64_t>> newestFoldSealRef();
 
     /// Read ONE part manifest named by `id`, validate it, and append sign*(+1) blob deltas for each
     /// blob entry to `deltas`. On sign<0 queue (id -> token) into mf_cleanup. Returns whether a body was
@@ -507,6 +591,9 @@ private:
     /// comment) so multi-disk processes can attribute GC logs to the disk/srid that produced them.
     LoggerPtr logger;
     uint64_t rebuild_edge_budget_override = 0;   /// tests force tiny batches
+    /// See `setCheckpointWitnessesForTest`: the `_ckpt.checkpoint` witness per namespace, empty until
+    /// Lane L Task 5 lands the object that supplies it.
+    std::map<String, RefTxnId> checkpoint_witness_override;
     std::function<uint64_t()> now_ms_fn;   /// wall-clock ms; injected (tests), defaults to system_clock
     /// The heartbeat gate's own observation clock —
     /// monotonic on this process, injected (tests), defaults to `Pool::bootMs()`. Never compared

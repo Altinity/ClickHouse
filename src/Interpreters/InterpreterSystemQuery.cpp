@@ -2388,6 +2388,12 @@ ColumnsDescription contentAddressedGcRebuildColumns()
         {"unowned_alive_manifests", std::make_shared<DataTypeUInt64>()},
         {"edges", std::make_shared<DataTypeUInt64>()},
         {"clamped_shards", std::make_shared<DataTypeUInt64>()},
+        /// 1 => the rebuild found no fold seal at all and carried NO durable hold forward, having
+        /// concluded from enumeration alone that the pool never sealed a baseline. On a pool that has
+        /// ever completed a GC round this means the object listing lied.
+        {"virgin_by_enumeration", std::make_shared<DataTypeUInt8>()},
+        /// Which generation's fold seal the rebuild carried holds from; 0 when it carried none.
+        {"adopted_seal_generation", std::make_shared<DataTypeUInt64>()},
     }};
 }
 
@@ -2405,6 +2411,8 @@ void appendContentAddressedGcRebuildRow(MutableColumns & res_columns, const Stri
     res_columns[i++]->insert(rep.unowned_alive_manifests);
     res_columns[i++]->insert(rep.edges);
     res_columns[i++]->insert(rep.clamped_shards);
+    res_columns[i++]->insert(static_cast<UInt8>(rep.virgin_by_enumeration));
+    res_columns[i++]->insert(rep.adopted_seal_generation);
 }
 
 /// SYSTEM CONTENT ADDRESSED FSCK's one-row-per-disk summary (Task 7). Per the brief: named UInt64
@@ -2503,9 +2511,11 @@ BlockIO InterpreterSystemQuery::runContentAddressedGcRebuild(const String & disk
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "CAS GC rebuild refused: {}", rep.refusal);
     LOG_INFO(log,
         "CAS GC rebuild on disk '{}' completed: round={} generation={} namespaces={} shards={} "
-        "committed_refs={} live_precommits={} unowned_alive_manifests={} edges={} clamped_shards={}",
+        "committed_refs={} live_precommits={} unowned_alive_manifests={} edges={} clamped_shards={} "
+        "virgin_by_enumeration={} adopted_seal_generation={}",
         disk_name, rep.round, rep.generation, rep.namespaces, rep.shards, rep.committed_refs,
-        rep.live_precommits, rep.unowned_alive_manifests, rep.edges, rep.clamped_shards);
+        rep.live_precommits, rep.unowned_alive_manifests, rep.edges, rep.clamped_shards,
+        rep.virgin_by_enumeration, rep.adopted_seal_generation);
 
     ColumnsDescription columns = contentAddressedGcRebuildColumns();
     Block sample_block;
