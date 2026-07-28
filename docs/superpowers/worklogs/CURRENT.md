@@ -1348,3 +1348,7 @@ review of plans + models (pipeline stage 9). No push.
 
 **2026-07-28 15:2x local watchdog** — codex plans review (sol xhigh) active: log 187 KB and
 growing, deep in source verification; no marker yet. Monitor armed. No push.
+
+**2026-07-28 13:20 local watchdog** — codex plans review alive: log 1.07 MB, seconds-fresh
+writes, xhigh mid-reasoning, no marker yet. (Correcting earlier worklog stamps: previous two
+ticks mislabeled +2h — clock now taken from `date` directly.) No push.
