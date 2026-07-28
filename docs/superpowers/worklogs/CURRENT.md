@@ -1268,3 +1268,8 @@ cfg written, live TLC on the v9_recoverygen green (-workers 1 per convention). H
 
 **2026-07-28 10:4x UTC watchdog** — task 5: second timed run of the v9_recoverygen green (fresh
 metadir, timeout 1800 — the big module's state space needs measuring). Active. No push.
+
+**2026-07-28 11:0x UTC watchdog** — task 5 finalizing: greens + staleinstall sabotage through TLC
+(09:44-49), report drafted 09:54 (15.5 KB), commit pending. Foreign commit `374cde434f4` (tests:
+DenyGuard macro gate) from the other live session sharing this worktree — noted, not mine, not
+interfering per standing practice. No push.
