@@ -305,6 +305,19 @@ public:
 
     void setRebuildEdgeBudgetForTest(uint64_t n) { rebuild_edge_budget_override = n; }
 
+    /// INTEGRATION SEAM — the second, hint-independent witness (`_ckpt.checkpoint`, Lane L Task 5).
+    ///
+    /// The listing cannot be the sole witness source: it is a snapshot, so a record that became durable
+    /// after the enumeration is invisible to that round's probes, and an absent expected-next then reads
+    /// as a frontier when it is really a gap. `_ckpt.checkpoint` is the namespace's own durable tail,
+    /// read by the fold anyway for cleanup ranges, and it decides the same question without asking the
+    /// listing anything.
+    ///
+    /// `_ckpt` does not exist yet, so `readCheckpointWitnesses` returns this map verbatim: EMPTY in
+    /// production (the walk is hint-only, exactly as before) and seeded by the hold tests. Task 5 lands
+    /// by replacing that one function body with the real per-namespace read; nothing else moves.
+    void setCheckpointWitnessesForTest(std::map<String, RefTxnId> w) { checkpoint_witness_override = std::move(w); }
+
     /// TEST SEAM: disable the round's journal trim so a folded event stays in the journal
     /// across rounds — exactly the lazy-trim / partial-trim-after-crash condition under which the
     /// next round's fold MUST recover the exact sealed cursor (else it re-folds the event and double-counts
@@ -350,6 +363,25 @@ private:
         /// once in fold() and threaded here so the merge-side reducers and the post-CAS ref/namespace
         /// cleanup share one value, so they cannot desynchronise.
         bool suppress_destructive = false;
+
+        /// Every hold this round SEALED, as `(cursor key, hold)` — both the ones it detected and the
+        /// ones it carried from the parent seal because their offending position is still unresolved.
+        /// It reads the seal that is about to become durable, so it is the round's final answer rather
+        /// than an intermediate one.
+        ///
+        /// This is the input to the destructive-round suppression rule (`suppress_destructive` =
+        /// current anomalies OR every carried hold): a hold means some namespace's frontier is
+        /// unproven, and no frontier proof taken this round can license destruction while one stands.
+        /// Every hold the fold seals also records an anomaly today, so the two agree; the accessor
+        /// exists because that coincidence is not the invariant — the hold set is.
+        std::vector<std::pair<String, RefHold>> carriedHolds() const
+        {
+            std::vector<std::pair<String, RefHold>> out;
+            for (const auto & [key, cov] : fold_seal.per_ns_shard)
+                if (cov.hold)
+                    out.emplace_back(key, *cov.hold);
+            return out;
+        }
     };
 
     /// Per changed root shard, stream the one ordered
@@ -379,6 +411,11 @@ private:
     /// compares it against its own enumeration of the same prefix — probe A.
     FoldResult fold(GcState & state, Token & state_token, RoundReport & report, uint64_t current_round,
                     const RefScanSummary & pre_scan);
+
+    /// The round's `_ckpt.checkpoint` witness per namespace — see `setCheckpointWitnessesForTest` for
+    /// what it decides and why the listing alone cannot decide it. ONE call site, in the fold, right
+    /// where the hint is grouped; Lane L Task 5 lands by filling this body in.
+    std::map<String, RefTxnId> readCheckpointWitnesses(const std::map<String, RefTableListing> & ref_tables);
 
     /// Read ONE part manifest named by `id`, validate it, and append sign*(+1) blob deltas for each
     /// blob entry to `deltas`. On sign<0 queue (id -> token) into mf_cleanup. Returns whether a body was
@@ -507,6 +544,9 @@ private:
     /// comment) so multi-disk processes can attribute GC logs to the disk/srid that produced them.
     LoggerPtr logger;
     uint64_t rebuild_edge_budget_override = 0;   /// tests force tiny batches
+    /// See `setCheckpointWitnessesForTest`: the `_ckpt.checkpoint` witness per namespace, empty until
+    /// Lane L Task 5 lands the object that supplies it.
+    std::map<String, RefTxnId> checkpoint_witness_override;
     std::function<uint64_t()> now_ms_fn;   /// wall-clock ms; injected (tests), defaults to system_clock
     /// The heartbeat gate's own observation clock —
     /// monotonic on this process, injected (tests), defaults to `Pool::bootMs()`. Never compared

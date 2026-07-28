@@ -1003,6 +1003,19 @@ bool Gc::foldManifestEdges(const ManifestId & id, int sign, std::vector<BlobDelt
     return true;
 }
 
+std::map<String, RefTxnId> Gc::readCheckpointWitnesses(const std::map<String, RefTableListing> & ref_tables)
+{
+    /// LANE L TASK 5 LANDS HERE. `_ckpt` does not exist yet, so there is no second witness to read and
+    /// production runs hint-only — the behaviour before this task, unchanged. When `_ckpt` lands, this
+    /// body becomes the per-namespace read of `_ckpt.checkpoint` (a `GET` the fold already owes for
+    /// cleanup ranges), keyed by namespace string; every consumer above is already written against the
+    /// map, so nothing else in the fold moves. `ref_tables` is the round's hint: Task 5 reads the
+    /// checkpoint of each namespace it names, PLUS each namespace a carried hold names (the walk visits
+    /// those too, and their witness matters most).
+    (void)ref_tables;
+    return checkpoint_witness_override;
+}
+
 Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & report,
                         uint64_t current_round, const RefScanSummary & pre_scan)
 {
@@ -1447,6 +1460,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     intake_timer.emplace(phase_sink, "fold_ref_intake");
     uint64_t intake_tables_changed = 0;
     uint64_t intake_tables_clamped = 0;
+    uint64_t intake_tables_held = 0;
     uint64_t intake_dead_precommits_skipped = 0;
     uint64_t intake_absent_probes = 0;
     uint64_t intake_epoch_crossings = 0;
@@ -1456,8 +1470,37 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// compares it with the counter the advance site incremented -- so a cursor that moved over a position
     /// nothing applied inflates the first number and fails the round closed.
     std::map<String, std::vector<std::pair<RefTxnId, RefTxnId>>> walked_segments;
-    for (auto & [ns_str, listing] : ref_tables)
+
+    /// The round's SECOND witness source, independent of the listing -- see `readCheckpointWitnesses`
+    /// for what it decides and why a listing alone cannot decide it.
+    const std::map<String, RefTxnId> checkpoint_witness = readCheckpointWitnesses(ref_tables);
+
+    /// WHICH NAMESPACES THIS ROUND WALKS: every namespace the hint names, PLUS every namespace the
+    /// parent seal left HELD. A hold must force an exact retry of its offending position even when the
+    /// hint omits the namespace entirely (spec §5) -- otherwise a store that simply stops listing a
+    /// namespace clears its hold, which is precisely the failure the hold exists to prevent. A held
+    /// namespace with no hint entry walks against an EMPTY listing: it has no hint witnesses, but it
+    /// still reads its offending position by exact key, and the carried hold itself supplies the
+    /// witness that keeps an absent below that position from reading as a frontier.
+    static const RefTableListing kNoListing;
+    std::vector<std::pair<String, const RefTableListing *>> walk_targets;
+    for (const auto & [ns_str, listing] : ref_tables)
+        walk_targets.emplace_back(ns_str, &listing);
+    uint64_t intake_unhinted_held = 0;
+    for (const auto & [held_key, held_cov] : parent_cursors)
     {
+        if (!held_cov.hold)
+            continue;
+        const auto [held_ns, held_shard] = parseCursorKey(held_key);
+        if (held_shard != 0 || ref_tables.contains(held_ns.string()))
+            continue;
+        walk_targets.emplace_back(held_ns.string(), &kNoListing);
+        ++intake_unhinted_held;
+    }
+
+    for (const auto & [ns_str, listing_ptr] : walk_targets)
+    {
+        const RefTableListing & listing = *listing_ptr;
         if (ref_folding_aborted)
             break;
         const RootNamespace ns{ns_str};
@@ -1475,8 +1518,12 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         ///
         /// Two things keep that from biting today. The cursor is dropped when the namespace vanishes: the
         /// new seal's `per_ns_shard` is written ONLY for namespaces in THIS round's listing (see the
-        /// single write site below, and the abort path's carry, which both iterate `ref_tables`), so a
+        /// single write site below, and the abort path's carry, which both iterate `walk_targets`), so a
         /// fully-deleted namespace leaves no cursor behind and a later recreation folds from `{0, 0}`.
+        /// The ONE exception is a HELD namespace, whose cursor and hold ride forward even unlisted --
+        /// deliberately, because a store that stops listing a namespace must not thereby clear its
+        /// hold. It does not widen the recreation window: a held namespace suppresses all destruction
+        /// by definition, so nothing acts on its cursor either way.
         /// The residual window is a recreation that lands before the round which would have dropped the
         /// cursor -- and there Stage A is safe only because ALL destruction is suppressed
         /// (`UniversePolicy`), i.e. nothing acts on the unfolded edges.
@@ -1505,36 +1552,66 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                     ns_str, renderRefTxnId(newest_snapshot));
         }
 
+        /// The hold the PARENT seal left on this namespace, if any. It is three things at once: the
+        /// position this round must retry by exact key, a durable witness (see `witnessAbove`), and the
+        /// hold that rides forward unless this round resolves that position.
+        const std::optional<RefHold> carried_hold =
+            cursor_it != parent_cursors.end() ? cursor_it->second.hold : std::nullopt;
+
         ShardCoverage cov;
         cov.classification = 0;
         bool table_changed = false;
-        bool clamped = false;
+        /// The hold THIS round detected, at the position it stopped. It IS the clamp signal: there is
+        /// no separate boolean that could disagree with it about whether the namespace stopped.
+        std::optional<RefHold> fired;
         RefTxnId resolved_through = cursor;   /// advances per fully-folded log; a clamp keeps it below the log
 
-        /// The hint's witness role: the smallest LISTED id strictly above `id`, if any. An absent
-        /// expected-next means "frontier" without one and "impossible shape" with one.
-        const auto witnessAbove = [&listing](const RefTxnId & id) -> std::optional<RefTxnId>
+        /// The witness role: the smallest id strictly above `id` that SOMETHING says exists. An absent
+        /// expected-next means "frontier" without a witness and "impossible shape" with one, so the
+        /// witness set decides whether the walk stops quietly or holds. THREE independent sources, none
+        /// of them authoritative alone:
+        ///   * the hint, which may omit durable records (that is the whole reason intake is arithmetic);
+        ///   * `_ckpt.checkpoint`, the namespace's own durable tail -- a listing is a SNAPSHOT, so a
+        ///     record durable after the enumeration is invisible to that round's probes, and this one
+        ///     is not (phase-0 model `_fix_ckptwitness`);
+        ///   * the CARRIED HOLD's offending position, which is durable proof that a previous round
+        ///     reached that position. Under contiguity everything at or below it must exist, so an
+        ///     absent below it is a gap. This is what makes "retry the exact offending position" work
+        ///     for a hold that sits above an epoch boundary: the crossing needs a witness to aim at,
+        ///     and without this the walk would stop one position short and never re-read it.
+        /// The SMALLEST wins, because the nearest witness is the one that decides same-epoch gap versus
+        /// epoch crossing.
+        const auto witnessAbove = [&](const RefTxnId & id) -> std::optional<RefTxnId>
         {
+            std::optional<RefTxnId> nearest;
+            const auto consider = [&](const RefTxnId & w)
+            {
+                if (id < w && (!nearest || w < *nearest))
+                    nearest = w;
+            };
             const auto it = std::upper_bound(listing.logs.begin(), listing.logs.end(), id);
-            if (it == listing.logs.end())
-                return std::nullopt;
-            return *it;
+            if (it != listing.logs.end())
+                consider(*it);
+            if (const auto ck = checkpoint_witness.find(ns_str); ck != checkpoint_witness.end())
+                consider(ck->second);
+            if (carried_hold)
+                consider(carried_hold->offending_position);
+            return nearest;
         };
 
         /// Record the position an impossible shape was detected at, hold the namespace, and stop walking
-        /// it. `clamped` is the existing classification-4 signal; the strict durable hold grammar
-        /// (reason / offending position / backoff, carried across rounds and REBUILD) is a later task, so
-        /// the offending position travels in the anomaly and the event for now.
-        const auto hold = [&](const RefTxnId & at, const char * reason)
+        /// it. The reason is a BOUNDED enum because it is persisted in the seal: an operator reading a
+        /// held row learns what stopped the namespace and exactly where, without correlating logs.
+        const auto hold = [&](const RefTxnId & at, HoldReason reason, const char * message)
         {
-            report.recordAnomaly(ns, 0, ManifestId{ns, {}}, reason);
+            report.recordAnomaly(ns, 0, ManifestId{ns, {}}, message);
             EventEmitter{*store}.emit([&](CasEvent & ev)
             {
                 ev.type = CasEventType::GcFoldClamp;
                 ev.namespace_ = ns_str;
                 ev.object_kind = CasEventObjectKind::Root;
                 ev.outcome = "held";
-                ev.reason = reason;
+                ev.reason = message;
                 ev.detail = {{"expected", renderRefTxnId(at)},
                              {"resolved_through",
                               resolved_through == RefTxnId{} ? "none" : renderRefTxnId(resolved_through)}};
@@ -1542,9 +1619,10 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             LOG_ERROR(logger,
                 "CAS GC ref intake: namespace {} HELD at {} -- {}. The cursor stays at {} and this "
                 "namespace folds nothing further this round.",
-                ns_str, renderRefTxnId(at), reason,
+                ns_str, renderRefTxnId(at), message,
                 resolved_through == RefTxnId{} ? "none" : renderRefTxnId(resolved_through));
-            clamped = true;
+            fired = RefHold{.reason = reason, .offending_position = at,
+                            .retry_count = 0, .next_retry_round = 0};   /// retry fields filled in at the seal below
         };
 
         /// Cross into the epoch that follows the one `from_seal` closed. The hint only NOMINATES a
@@ -1660,17 +1738,19 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
 
                 if (witness->writer_epoch == expected->writer_epoch)
                 {
-                    hold(*expected, "ref intake: expected next id absent below a same-epoch witness -- "
-                                    "contiguity says this cannot happen, so a durable record is missing");
+                    hold(*expected, HoldReason::GapBelowWitness,
+                         "ref intake: expected next id absent below a same-epoch witness -- "
+                         "contiguity says this cannot happen, so a durable record is missing");
                     break;
                 }
 
                 const auto crossed = crossFromSeal(resolved_through, last_applied_is_seal, *witness);
                 if (!crossed)
                 {
-                    hold(*expected, "ref intake: a later epoch's records are reachable but this epoch's "
-                                    "closing seal was never consumed (or the position they chain from is "
-                                    "not one) -- the crossing has no proof");
+                    hold(*expected, HoldReason::UnconsumedSealCrossing,
+                         "ref intake: a later epoch's records are reachable but this epoch's "
+                         "closing seal was never consumed (or the position they chain from is "
+                         "not one) -- the crossing has no proof");
                     break;
                 }
                 /// Every iteration must move `expected` strictly forward. A crossing that lands back on
@@ -1679,8 +1759,15 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                 /// under us. Treat it as the impossible shape it is.
                 if (!(*expected < *crossed))
                 {
-                    hold(*expected, "ref intake: the epoch crossing resolved back to the position that "
-                                    "just read absent -- the epoch-start record is not stably readable");
+                    /// The record at `*crossed` answered the crossing's GET and then stopped answering
+                    /// the walk's: an ABOVE-CURSOR object that vanished under us. Nothing may
+                    /// legitimately remove one, so this is corruption, and it is the one hold shape no
+                    /// amount of waiting clears -- which is exactly why it must be named durably. A
+                    /// later round that read the namespace as merely quiet would otherwise grant it a
+                    /// frontier proof and license destruction against a cut that is missing records.
+                    hold(*expected, HoldReason::WitnessDisappeared,
+                         "ref intake: the epoch crossing resolved back to the position that "
+                         "just read absent -- the epoch-start record is not stably readable");
                     break;
                 }
                 ++intake_epoch_crossings;
@@ -1712,7 +1799,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             {
                 LOG_WARNING(logger, "CAS GC ref intake: log {} invalid: {}",
                             layout.refLogKey(ns, log_id), e.message());
-                hold(log_id, "ref log body invalid: namespace held below it");
+                hold(log_id, HoldReason::BodyUndecodable, "ref log body invalid: namespace held below it");
                 break;
             }
 
@@ -1783,11 +1870,19 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                                  {"resolved_through",
                                   resolved_through == RefTxnId{} ? "none" : renderRefTxnId(resolved_through)}};
                 });
-                clamped = true;
+                /// The barrier is a HOLD like any other -- same durable shape, same clearing rule (fold
+                /// through `log_id`), and the same suppression consequence. Its reason is the one whose
+                /// ordinary cause is benign (a writer that appended its record before finishing the
+                /// manifest upload), and naming it durably is what lets an operator tell that apart
+                /// from a namespace that has been stuck for hours. The anomaly and event were already
+                /// emitted above with the manifest identity, which `hold` cannot carry, so this site
+                /// sets the hold directly instead of calling it.
+                fired = RefHold{.reason = HoldReason::ManifestBodyMissing, .offending_position = log_id,
+                                .retry_count = 0, .next_retry_round = 0};
                 break;   /// stop folding this log's edges; the cursor stays at resolved_through (< log_id)
             }
 
-            if (clamped)
+            if (fired)
                 break;   /// discard the staged log_deltas / log_mf_cleanup (never merged) and stop this table
 
             /// The whole log folded: merge its staged transaction into the round buffers.
@@ -1825,14 +1920,74 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             walked_segments[ns_str] = std::move(segments);
 
         cov.last_folded_ref_id = resolved_through;
-        cov.classification = clamped ? 4 : (table_changed ? 2 : 1);
+
+        /// THE CLEARING RULE (spec §5), and the only place it is decided. A hold clears by exactly one
+        /// event: this walk RESOLVING the offending position -- folding through it and sealing a cursor
+        /// at or above it. It never clears by observing another absent, because an absent is precisely
+        /// what a lying store produces and precisely what made the hold necessary; and it never clears
+        /// by the hint going quiet, because a quiet hint is not evidence about anything.
+        ///
+        /// Three cases, total and in order:
+        ///   * this round detected a hold -- adopt it. It sits at or above the cursor, so any carried
+        ///     hold at a HIGHER position is simply not reached yet and will be re-detected once this
+        ///     one clears; a carried hold at a LOWER position was folded through, which is its
+        ///     clearance.
+        ///   * no new hold, but the walk stopped BELOW a carried hold's position -- it did not resolve
+        ///     it, so the hold rides VERBATIM (same reason, same position).
+        ///   * otherwise -- either there was no hold, or the walk folded through it. Cleared.
+        std::optional<RefHold> effective;
+        if (fired)
+            effective = fired;
+        else if (carried_hold && resolved_through < carried_hold->offending_position)
+        {
+            effective = carried_hold;
+            /// The round produced no anomaly of its own for this namespace (the walk ended quietly),
+            /// yet the namespace IS held: record one so this round's destructive work is suppressed on
+            /// today's `anomalies`-based rule as well as on the hold set itself. Without it a hold
+            /// carried through a quiet round would suppress nothing, which is the hole the carry exists
+            /// to close.
+            report.recordAnomaly(ns, 0, ManifestId{ns, {}},
+                "ref intake: namespace still held below an unresolved position");
+            EventEmitter{*store}.emit([&](CasEvent & ev)
+            {
+                ev.type = CasEventType::GcFoldClamp;
+                ev.namespace_ = ns_str;
+                ev.object_kind = CasEventObjectKind::Root;
+                ev.outcome = "held";
+                ev.reason = "carried hold: the offending position did not resolve this round";
+                ev.detail = {{"expected", renderRefTxnId(carried_hold->offending_position)},
+                             {"resolved_through",
+                              resolved_through == RefTxnId{} ? "none" : renderRefTxnId(resolved_through)},
+                             {"retry_count", std::to_string(carried_hold->retry_count)}};
+            });
+        }
+
+        if (effective)
+        {
+            /// Retry bookkeeping. The count belongs to a POSITION, so it continues only while the hold
+            /// stays at the same one; a hold that moved is a different stop and starts over. The count
+            /// saturates rather than wrapping -- a wrapped counter would report a namespace stuck for
+            /// four billion rounds as freshly held.
+            const bool same_position = carried_hold
+                && carried_hold->offending_position == effective->offending_position;
+            effective->retry_count = same_position && carried_hold->retry_count < UINT32_MAX
+                ? carried_hold->retry_count + 1
+                : (same_position ? UINT32_MAX : 0);
+            effective->next_retry_round = current_round + 1;
+            cov.hold = effective;
+            cov.classification = 4;
+            ++intake_tables_held;
+        }
+        else
+            cov.classification = table_changed ? 2 : 1;
+
         result.fold_seal.per_ns_shard[cursor_key] = cov;
         if (table_changed)
         {
             folded_any = true;
             ++intake_tables_changed;
         }
-        if (clamped)
+        if (fired)
             ++intake_tables_clamped;
     }
 
@@ -1846,13 +2001,23 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         result.mf_cleanup.clear();
         folded_any = false;
         result.fold_seal.per_ns_shard.clear();
-        for (const auto & [ns_str, listing] : ref_tables)
+        for (const auto & [ns_str, listing_ptr] : walk_targets)
         {
             const String cursor_key = cursorKey(RootNamespace{ns_str}, /*shard*/0);
             ShardCoverage cov;
             cov.classification = 1;
             if (const auto pit = parent_cursors.find(cursor_key); pit != parent_cursors.end())
+            {
                 cov.last_folded_ref_id = pit->second.last_folded_ref_id;
+                /// An abort discards this round's work; it does not resolve anything, so a hold it
+                /// found in the parent seal rides forward untouched -- not even the retry count moves,
+                /// because nothing was retried.
+                if (pit->second.hold)
+                {
+                    cov.hold = pit->second.hold;
+                    cov.classification = 4;
+                }
+            }
             result.fold_seal.per_ns_shard[cursor_key] = cov;
         }
     }
@@ -1918,6 +2083,13 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     intake_timer->metric("tables_scanned", ref_tables.size());
     intake_timer->metric("tables_changed", intake_tables_changed);
     intake_timer->metric("tables_clamped", intake_tables_clamped);
+    /// `tables_held` counts the coverage rows this round SEALED held -- the ones it detected plus the
+    /// ones it carried. It is what `suppress_destructive` keys on, so a round that reclaims nothing has
+    /// this column to explain itself. `unhinted_held_walked` is the subset the hint never mentioned:
+    /// nonzero means the store stopped listing a namespace that is still held, which is the shape that
+    /// used to clear a hold silently.
+    intake_timer->metric("tables_held", intake_tables_held);
+    intake_timer->metric("unhinted_held_walked", intake_unhinted_held);
     intake_timer->metric("dead_precommits_skipped", intake_dead_precommits_skipped);
     /// The exact reads arithmetic intake pays that the listing-driven loop did not. `absent_probes`
     /// counts EVERY read that came back absent: the expected-next of each namespace walked (at least one
@@ -2763,50 +2935,89 @@ RebuildReport Gc::rebuildBaseline(bool force)
     /// Health check BEFORE the lease (the lease acquire on an absent state CREATES a bootstrap
     /// body, which must not make scenario (а) look healthy). Healthy = decodes AND, when a baseline
     /// is claimed, the seal + every referenced run + every retired list are HEAD-present.
+    /// The prior seal, when `gc/state` claims one. It is the ONLY place holds live, so the rebuild
+    /// either reads it and carries every hold forward, or refuses (see the refusal below).
+    std::optional<CasFoldSeal> prior_seal;
     bool healthy = false;
     {
         const auto got = backend.get(layout.gcStateKey());
+        /// The state's own decode stays inside its own try: an undecodable `gc/state` IS scenario (а),
+        /// the disaster this command exists for. The prior-seal refusal below must NOT be swallowed by
+        /// that catch, so the seal is read outside it.
+        std::optional<GcState> decoded;
         if (got)
         {
             try
             {
-                const GcState st = decodeGcState(got->bytes);
-                healthy = true;
-                if (st.snap_generation == 0)
+                decoded = decodeGcState(got->bytes);
+            }
+            catch (...) // NOLINT(bugprone-empty-catch)
+            {
+                /// undecodable state = scenario (а)
+            }
+        }
+        if (decoded)
+        {
+            const GcState & st = *decoded;
+            healthy = true;
+            if (st.snap_generation == 0)
+            {
+                /// A gen-0 state (possibly a bootstrap body minted by a lease acquire AFTER the real
+                /// state was lost) is healthy ONLY when no table proves cleaned logs -- the ref baseline
+                /// guard: a snapshot with no surviving log at or below it (its covered logs were cleaned
+                /// by a now-lost cursor).
+                for (const auto & [ns, root_shard] : discoverUniverse())
                 {
-                    /// A gen-0 state (possibly a bootstrap body minted by a lease acquire AFTER the real
-                    /// state was lost) is healthy ONLY when no table proves cleaned logs -- the ref baseline
-                    /// guard: a snapshot with no surviving log at or below it (its covered logs were cleaned
-                    /// by a now-lost cursor).
-                    for (const auto & [ns, root_shard] : discoverUniverse())
+                    std::vector<String> table_keys;
+                    forEachListedKey(backend, layout.refsNamespacePrefix(ns),
+                        [&](const ListedKey & lk) { table_keys.push_back(lk.key); }, 1000, onGcEnumerationPage);
+                    const auto grouped = groupRefKeys(layout, table_keys);
+                    const auto git = grouped.find(ns.string());
+                    if (git != grouped.end() && !git->second.snapshots.empty()
+                        && (git->second.logs.empty() || git->second.snapshots.back() < git->second.logs.front()))
                     {
-                        std::vector<String> table_keys;
-                        forEachListedKey(backend, layout.refsNamespacePrefix(ns),
-                            [&](const ListedKey & lk) { table_keys.push_back(lk.key); }, 1000, onGcEnumerationPage);
-                        const auto grouped = groupRefKeys(layout, table_keys);
-                        const auto git = grouped.find(ns.string());
-                        if (git != grouped.end() && !git->second.snapshots.empty()
-                            && (git->second.logs.empty() || git->second.snapshots.back() < git->second.logs.front()))
-                        {
-                            healthy = false;
-                            break;
-                        }
+                        healthy = false;
+                        break;
                     }
                 }
-                if (st.snap_generation > 0)
-                {
-                    const auto seal = readFoldSeal(st.snap_generation, st.snap_attempt);
-                    if (!seal)
-                        healthy = false;
-                    else
-                        for (const RunRef & r : seal->blob_target_runs)
-                            if (!backend.head(r.key).exists)
-                                healthy = false;
-                }
             }
-            catch (...)
+            if (st.snap_generation > 0)
             {
-                healthy = false;   /// undecodable state = scenario (а)
+                /// THE REFUSAL (spec r9-1). The prior seal is where every hold lives, and a rebuild
+                /// rewrites coverage from owner state -- so with no readable seal it would hand back a
+                /// baseline that LOOKS proven while silently discarding holds it cannot even enumerate.
+                /// The alternative, a "pool-wide hold" on the rebuilt baseline, is not representable:
+                /// every hold names a position the fold must fold THROUGH, and a pool-wide one would
+                /// need an invented position nothing could ever resolve. So the honest branch is the
+                /// already-safe one -- refuse, and name pool recreation. FORCE does not buy past this:
+                /// force means "rebuild deliberately", never "drop the holds". It THROWS rather than
+                /// returning `rep.refusal` because, unlike every other refusal here, no flag and no
+                /// retry makes it succeed.
+                std::optional<CasFoldSeal> seal;
+                try
+                {
+                    seal = readFoldSeal(st.snap_generation, st.snap_attempt);
+                }
+                catch (const Exception & e)
+                {
+                    throw Exception(ErrorCodes::CORRUPTED_DATA,
+                        "CAS GC rebuild: the prior fold seal (generation {}, attempt {}) is UNDECODABLE "
+                        "({}), so the holds it carries cannot be read. A rebuild that dropped them would "
+                        "bless a baseline whose frontier is unproven. GC refuses to rebuild; this pool "
+                        "must be recreated.",
+                        st.snap_generation, st.snap_attempt, e.message());
+                }
+                if (!seal)
+                    throw Exception(ErrorCodes::CORRUPTED_DATA,
+                        "CAS GC rebuild: the prior fold seal (generation {}, attempt {}) is MISSING under "
+                        "a gc/state that claims it, so the holds it carries cannot be read. A rebuild "
+                        "that dropped them would bless a baseline whose frontier is unproven. GC refuses "
+                        "to rebuild; this pool must be recreated.",
+                        st.snap_generation, st.snap_attempt);
+                for (const RunRef & r : seal->blob_target_runs)
+                    if (!backend.head(r.key).exists)
+                        healthy = false;
+                prior_seal = std::move(seal);
             }
         }
     }
@@ -2960,14 +3171,54 @@ RebuildReport Gc::rebuildBaseline(bool force)
                 ++rep.live_precommits;
             else
             {
+                /// A bodiless live precommit leaves the rebuilt baseline INCOMPLETE for this namespace:
+                /// nothing can enumerate the blobs it pins, so nothing can protect them. That is a
+                /// durable hold, not a report field -- and it is the one hold the rebuild has to invent
+                /// a position for, because it derives edges from owner STATE and cannot name the log
+                /// that introduced the precommit (that log is below the rebuilt cursor and no round
+                /// re-reads it). It holds at the FIRST POSITION THE NEXT ROUND WILL READ, which makes a
+                /// quiet namespace stay held indefinitely -- the fail-close answer while the body is
+                /// still missing -- and clears once the namespace makes durable progress.
+                /// RESIDUAL, named rather than hidden: progress unrelated to this precommit also clears
+                /// it, and the precommit's edges stay missing until another rebuild.
                 cov.classification = 4;   /// Clamped
+                cov.hold = RefHold{.reason = HoldReason::ManifestBodyMissing,
+                                   .offending_position = RefTxnId{cov.last_folded_ref_id.writer_epoch,
+                                                                 cov.last_folded_ref_id.ref_sequence + 1},
+                                   .retry_count = 0,
+                                   .next_retry_round = 0};   /// set below, once `round` is minted
                 ++rep.clamped_shards;
             }
         }
         route_deltas(deltas);
+
+        /// HOLDS RIDE THROUGH A REBUILD VERBATIM (spec §5/§7). The rebuild derives coverage from owner
+        /// state, which knows nothing about a ref-log position that would not resolve -- so without
+        /// this every held row would be overwritten by a clean one and the rebuilt baseline would claim
+        /// a frontier proof it does not have. `retry_count` and `next_retry_round` ride unchanged too:
+        /// the rebuild retried nothing, so it must not reset the count that says how long the namespace
+        /// has been stuck. The ordinary clearing rule then applies from the next round on.
+        if (prior_seal)
+        {
+            const auto pit = prior_seal->per_ns_shard.find(cursorKey(ns, /*shard*/0));
+            if (pit != prior_seal->per_ns_shard.end() && pit->second.hold)
+            {
+                cov.classification = 4;
+                cov.hold = pit->second.hold;
+            }
+        }
         seal.per_ns_shard[cursorKey(ns, /*shard*/0)] = cov;
     }
     rep.namespaces = seen_ns.size();
+
+    /// A hold on a namespace the universe scan did NOT rediscover is the one that must not be dropped:
+    /// a held namespace can be exactly the one whose ref objects the store has stopped listing. Its
+    /// whole coverage row rides forward -- hold AND cursor -- so the next round walks it from where the
+    /// hold left it rather than from `{0, 0}`.
+    if (prior_seal)
+        for (const auto & [key, prior_cov] : prior_seal->per_ns_shard)
+            if (prior_cov.hold && !seal.per_ns_shard.contains(key))
+                seal.per_ns_shard[key] = prior_cov;
 
     /// Trimmed-but-live precommits: a build alive across trim has NO journal
     /// evidence; its manifests look unowned. Include edges of every manifest that is unowned AND
@@ -3036,6 +3287,14 @@ RebuildReport Gc::rebuildBaseline(bool force)
     /// Numbering, part 2: the round above every surviving fence/state/generation number (also the
     /// condemn_round stamped on the full-traversal condemns folded into the runs below).
     const uint64_t round = std::max({max_fence_round, state.round, max_gen}) + 1;
+
+    /// Stamp the retry round on the holds THIS rebuild created (the bodiless-precommit ones, left at 0
+    /// because the round was not minted yet). Carried holds are already stamped and must not be
+    /// touched: their `next_retry_round` and `retry_count` ride verbatim, since a rebuild retries
+    /// nothing.
+    for (auto & [key, cov] : seal.per_ns_shard)
+        if (cov.hold && cov.hold->next_retry_round == 0)
+            cov.hold->next_retry_round = round + 1;
 
     /// Publish the per-hash condemn marker for EVERY full-traversal condemn SYNCHRONOUSLY (the rebuild
     /// is an offline/administrative path — no bounded-pool async model here). The marker is the

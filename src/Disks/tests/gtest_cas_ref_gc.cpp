@@ -671,17 +671,40 @@ TEST(CasRefGc, InvalidRefLogBodyHoldsNamespaceNoPartialDelta)
            "blob is NOT reclaimed while any namespace is held, because the unfolded tail behind the "
            "hold may still name it";
 
-    /// Release the hold by removing the undecodable object. The walk then reaches a plain frontier
-    /// (nothing listed above it), records no anomaly, and destruction resumes.
+    /// DELETING THE EVIDENCE DOES NOT RELEASE THE HOLD. The hold is durable and clears by exactly one
+    /// event -- the fold resolving its offending position -- so an object that stops answering does not
+    /// turn the gap into a frontier. It is the same observation a lying store produces, and it is
+    /// precisely what made the hold necessary; if an absent could clear it, the whole mechanism would
+    /// be defeated by the corruption it exists to survive. (Before durable holds this delete DID
+    /// release the namespace, which is the hole Task 8 closed.)
     const HeadResult h = backend->head(garbage_key);
     ASSERT_TRUE(h.exists);
     ASSERT_EQ(backend->deleteExact(garbage_key, h.token).kind, DeleteOutcome::Kind::Deleted);
 
+    for (int i = 0; i < 4; ++i)
+    {
+        ASSERT_NO_THROW(gc.runRegularRound());
+        store->renewWatermarkOnce();
+    }
+    EXPECT_TRUE(blobPresent(*backend, layout, DB::UInt128(1)))
+        << "the hold still stands: nothing resolved the offending position, an absent proved nothing";
+
+    /// REPAIR is the release: a DECODABLE record at the offending position. The fold reads it, folds
+    /// through it, seals a cursor above it -- and only then does the namespace stop being held and
+    /// destruction resume. `publishCommittedTransition` allocates the freed id, which is exactly the
+    /// position the hold names.
+    const ManifestRef r2 = mref(2);
+    writeBlobBody(*backend, layout, DB::UInt128(2));
+    writeManifestRaw(*backend, layout, ns, r2, {blobEntryFor("b", DB::UInt128(2))});
+    ASSERT_EQ(publishCommittedTransition(*backend, layout, ns, "tbl2", std::nullopt, r2), dropped + 1)
+        << "the repair must land ON the held position, not above it";
+
     ASSERT_TRUE(runToFixpoint(store, gc) < 64u) << "the released namespace must converge";
-    EXPECT_EQ(foldCursorOf(*backend, layout, ns, 0), dropped) << "cursor unchanged: nothing new to fold";
+    EXPECT_EQ(foldCursorOf(*backend, layout, ns, 0), dropped + 1) << "the walk folded through the hold";
     EXPECT_FALSE(blobPresent(*backend, layout, DB::UInt128(1)))
         << "once the hold clears, the unreferenced blob is reclaimed -- so the survival above was the "
            "suppression doing its job, not the blob being unreclaimable";
+    EXPECT_TRUE(blobPresent(*backend, layout, DB::UInt128(2))) << "the repair's own blob is referenced";
 }
 
 /// Coverage gap (Task 13a): the per-table baseline guard (spec §Offline Recovery) has no positive-trip
