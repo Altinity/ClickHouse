@@ -37,6 +37,8 @@ TEST(CasBlobMetaFormat, CondemnedRoundTripAllFields)
 TEST(CasBlobMetaFormat, FailsClosedOnUnknownStateAndTruncation)
 {
     /// Unknown state word -> CORRUPTED_DATA (mirrors the old `state > Condemned` reject).
+    /// `v:3` is deliberate and must NOT follow a future `G_BUILD` bump: any version <= G_BUILD passes
+    /// the header gate, which is the point — the BODY is what has to fail here.
     const String bad_state = "{\"type\":\"cas_blob_meta\",\"v\":3}\n{\"st\":\"zombie\",\"cr\":\"0\",\"sz\":\"0\"}\n";
     EXPECT_THROW(decodeBlobMeta(bad_state), DB::Exception);
     /// Missing state key -> CORRUPTED_DATA.

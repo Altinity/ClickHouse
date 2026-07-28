@@ -86,10 +86,12 @@ uint32_t currentCompatibilityVersion();
 /// the object in the exception message.
 void checkCompatibility(uint32_t compatibility_version, std::string_view what);
 
-/// One append-only entry in a class's format history. At `generation`, the class's serialization
-/// changed, and a reader must understand at least `min_reader` to read an object written at that
-/// generation. Additive changes retain the previous reader floor; breaking changes set the floor to
-/// the change generation itself.
+/// One append-only entry in a class's format history. At `generation`, the class's ENCODING or the
+/// MEANING of what it encodes changed, and a reader must understand at least `min_reader` to read an
+/// object written at that generation. Additive changes retain the previous reader floor; breaking
+/// changes set the floor to the change generation itself. Generation 4's ref-stream entry is the
+/// worked example of the second kind: not one byte of `cas_ref_log` moved, but its ids became dense,
+/// so an older stream is unreadable to this build and the floor is the change generation.
 struct FormatChangePoint
 {
     uint16_t generation;

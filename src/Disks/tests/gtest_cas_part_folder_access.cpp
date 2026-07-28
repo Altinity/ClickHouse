@@ -137,11 +137,15 @@ public:
     String fault_key_substr;
     int skip = 0;
     int fault_count = 0;
+    /// Every create ATTEMPTED at a matching key, faulted or not. It is how a test observes that a
+    /// cleanup path ran its ref-log append at all, on a table where that append can no longer succeed.
+    int matching_put_attempts = 0;
 
     Cas::PutResult putIfAbsent(const String & key, const String & bytes, const Cas::ObjectMeta & meta) override
     {
         if (!fault_key_substr.empty() && key.find(fault_key_substr) != String::npos)
         {
+            ++matching_put_attempts;
             if (skip > 0)
                 --skip;
             else if (fault_count > 0)
@@ -348,6 +352,7 @@ TEST(CasPartFolderAccess, PublishEntriesAbandonsBuildOnPromoteFailure)
     backend->fault_key_substr = store->layout().refsNamespacePrefix(ns) + "_log/";
     backend->skip = 1;         /// let precommitAdd's own ref-log append land normally
     backend->fault_count = 1;  /// fault exactly promote's ref-log append
+    const int attempts_before = backend->matching_put_attempts;
 
     /// republishRef(src, dst) drives publishEntries(dst, ...): precommitAdd succeeds, promote's
     /// appendRefOps observes a proven conflict and throws CORRUPTED_DATA -- publishEntries's catch must
@@ -355,18 +360,45 @@ TEST(CasPartFolderAccess, PublishEntriesAbandonsBuildOnPromoteFailure)
     expectThrowsCode(ErrorCodes::CORRUPTED_DATA, [&] { access.republishRef({ns, "src"}, {ns, "dst"}); });
     EXPECT_FALSE(access.existsRef({ns, "dst"}, Cas::Freshness::ForceFresh)) << "the failed promote never committed dst";
 
-    /// `publishEntries` really did try to clean up: its `abandon()` ran (it is best-effort and swallows
-    /// its own failure, which is why the CORRUPTED_DATA above is still the promote's). Whether the
-    /// removal LANDED is a different question, and under INV-1 it cannot have: ref-log ids are derived
-    /// from the table's own greatest applied id, so abandon's removal append addresses the very key the
-    /// foreign object took and hits the same proven conflict -- it does not skip to a fresh id and leave
-    /// a hole in this table's stream. The same is true of any further append here, which is what this
-    /// probe now pins: a table whose next log key holds a foreign object is corrupt, and recovers under a
-    /// fresh mount incarnation's writer epoch (a new key namespace), never by writing past the damage.
-    auto rebuild = store->beginPartWrite(Cas::PartWriteInfo{.intended_ref = ns.string() + "/dst",
-                                                  .intended_namespace = ns, .op = Cas::ProvenanceOp::Other});
-    const Cas::ManifestId rebuild_id = rebuild->stageManifest({inlineEntry("f", "same")});
-    expectThrowsCode(ErrorCodes::CORRUPTED_DATA, [&] { rebuild->precommitAdd(ns, "dst", rebuild_id); });
+    /// The property this test exists for -- `publishEntries` does not walk away from a live precommit
+    /// binding -- restated for the fail-closed contract. It used to be proven by a fresh `precommitAdd`
+    /// succeeding, which needed one more append on this table; under INV-1 no append on this table can
+    /// succeed while a foreign object sits on its next log key (ids are derived from the table's own
+    /// greatest applied id, so every attempt addresses exactly that key). What is still observable, and
+    /// is what the regression guard actually needs, is that the cleanup RAN: `abandon`'s removal append
+    /// attempted its own create at the ref-log key, on top of the promote's. Delete the
+    /// `abandonBuildBestEffort` call from `publishEntries` and this count drops back to one.
+    EXPECT_GE(backend->matching_put_attempts, attempts_before + 2)
+        << "publishEntries must still abandon the build on a promote failure: exactly one ref-log create "
+           "attempt (the promote's) means the cleanup never ran";
+
+    /// And nothing was written ABOVE the damage: the occupant is the GREATEST log id in the namespace
+    /// (keys render the id in fixed-width hex, so lexical order is id order). An append that carved a
+    /// fresh id to get past the foreign object would sort above it.
+    String greatest_key;
+    size_t foreign_objects = 0;
+    for (String cursor;;)
+    {
+        const Cas::ListPage page = backend->list(backend->fault_key_substr, cursor, 1000);
+        for (const auto & listed : page.keys)
+        {
+            if (listed.key > greatest_key)
+                greatest_key = listed.key;
+            const auto body = backend->get(listed.key);
+            if (body && body->bytes.find("_FOREIGN_DIFFERENT") != String::npos)
+                ++foreign_objects;
+        }
+        if (page.next_cursor.empty())
+            break;
+        cursor = page.next_cursor;
+    }
+    EXPECT_EQ(foreign_objects, 1u) << "the foreign object must still own the key it took";
+    ASSERT_FALSE(greatest_key.empty());
+    const auto greatest_body = backend->get(greatest_key);
+    ASSERT_TRUE(greatest_body.has_value());
+    EXPECT_NE(greatest_body->bytes.find("_FOREIGN_DIFFERENT"), String::npos)
+        << "the foreign occupant must still be the highest id in this table's stream: a log object above "
+           "it would mean an append carved a fresh id around the damage instead of failing closed";
 }
 
 

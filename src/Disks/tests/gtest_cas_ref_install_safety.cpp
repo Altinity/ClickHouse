@@ -683,7 +683,7 @@ TEST(CasRefInstallSafety, DefiniteFailureClearsTheApplyMarker)
 
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { publishEmptyPart(store, ns, "part_a"); });
 
-    EXPECT_FALSE(store->refLaneWedgedForTest(ns)) << "a definite failure is a safe gap and must not wedge";
+    EXPECT_FALSE(store->refLaneWedgedForTest(ns)) << "a definite failure is proven non-durable and must not wedge";
     EXPECT_EQ(store->applyStateForTest(ns), RefApplyState::Clean)
         << "a definitively rejected PUT is proven non-durable, so no apply is owed";
 #endif

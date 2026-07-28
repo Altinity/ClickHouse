@@ -705,7 +705,7 @@ TEST(RefWriterChunkedFlush, ChunkFailureDefinite)
     ASSERT_TRUE(out.leader.err == nullptr) << "chunk-1 caller must observe success even though chunk 2 failed";
     ASSERT_TRUE(out.follower.err != nullptr) << "chunk-2 caller must observe the definite failure";
     EXPECT_FALSE(out.store->refLaneWedgedForTest(RootNamespace{"srv1/chunk_fail_definite"}))
-        << "a definite failure is a safe gap and must NOT wedge the lane";
+        << "a definite failure is proven non-durable and must NOT wedge the lane";
 
     const auto logs = listLogTxns(*out.backend, out.store->layout(), RootNamespace{"srv1/chunk_fail_definite"});
     bool saw_chunk1 = false;

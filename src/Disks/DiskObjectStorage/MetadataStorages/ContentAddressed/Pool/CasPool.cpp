@@ -399,9 +399,22 @@ PoolPtr Pool::open(BackendPtr backend, PoolConfig config)
                 /// still has queued writes; if the operator answers the residual message below by
                 /// clearing the prefix and recreating, that writer's next flush lands its old-format
                 /// transactions inside the NEW pool. So a non-terminal slot fails closed with its own
-                /// message: stop the writer first. Once the slot IS terminal, recreation proceeds and the
-                /// fresh mount's ordinary lease claim is what fences any straggler -- its next renewal
+                /// message: stop the writer first.
+                ///
+                /// This gate is the PRIMARY defence, not a nicety, because the mount fence cannot be
+                /// relied on to catch a straggler afterwards. Clearing the prefix also destroys the
+                /// durable writer-epoch counter, so a recreation by the SAME server uuid is handed the
+                /// very `(uuid, epoch)` the survivor still holds -- and the two are then indistinguishable
+                /// to the lease protocol, which reads the survivor's renewal as its own keeper adopting a
+                /// refreshed body. The fence only bites when the recreating mount is DISTINGUISHABLE (a
+                /// different server uuid, or a surviving epoch counter): then the survivor's next renewal
                 /// finds a slot it cannot hold and its local fence latches shut.
+                ///
+                /// What catches the ambiguous case is INV-1, after the fact: the straggler's append lands
+                /// at `{E, 1}`-relative ids in a table the recreated pool sees as empty, and the first
+                /// recovery of that namespace refuses the stream as non-contiguous rather than absorbing
+                /// it. That is a loud post-mortem, not prevention -- which is why the refusal here, BEFORE
+                /// anything is cleared, is the one that matters.
                 ///
                 /// Only on this arm: `EmptyOrProbeOnly` proves there is no slot object to read (a mount
                 /// lease is itself residual), and `PoolMetaPresent` is not a recreation at all -- neither

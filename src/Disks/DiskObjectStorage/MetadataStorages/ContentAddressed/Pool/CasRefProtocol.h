@@ -146,10 +146,12 @@ struct RefLedgerConfig
 /// function of the state it will be applied to, which is what makes an attempt that sent nothing
 /// consume nothing (the next caller derives the same id from the same unchanged state).
 ///
-/// Both sides of the invariant call this: the writer to mint an id, and `applyTxnInPlace` to decide
-/// whether a transaction's id is admissible. Sharing the rule is deliberate -- an allocator and a
-/// checker that each spell it out separately can drift, and a drift here is either a durable hole or a
-/// table that refuses its own writes.
+/// This is the rule itself, applied to an ANCHOR. Callers do not choose the anchor: they go through
+/// `RefTableState::nextTxnId`, which supplies `max(greatest_applied, durable_floor)` -- the writer to
+/// mint an id, every trial preview to stamp its throwaway transaction, and `applyTxnInPlace` to decide
+/// whether a transaction's id is admissible. Sharing one rule is deliberate: an allocator and a checker
+/// that each spell it out separately can drift, and a drift here is either a durable hole or a table
+/// that refuses its own writes.
 ///
 /// Total by construction (no throw): the one input it cannot serve, an exhausted `ref_sequence` under
 /// the live epoch, would need 2^64 transactions in one incarnation of one table. Should a corrupt
@@ -184,7 +186,6 @@ public:
     const std::set<std::pair<String, ManifestRef>> & getPrecommits() const { return precommits; }
     uint64_t getSnapshotBodyBytes() const { return snapshot_body_bytes; }
     uint64_t getRemovalBodyBytes() const { return removal_body_bytes; }
-    const RefTxnId & getDurableFloor() const { return durable_floor; }
 
     /// The id this state's next transaction must carry (INV-1) — the ONE derivation, called by the
     /// writer to mint an id, by every trial preview to stamp its throwaway transaction, and by
@@ -355,9 +356,11 @@ RefTableState stateFromSnapshot(const RefTableSnapshot & snapshot);
 ///
 /// Enforced preconditions:
 ///  - `txn.txn_id` must be strictly greater than `state.greatest_applied` AND must be exactly the
-///    contiguous successor `nextRefTxnId` derives (INV-1): the next sequence number within the same
-///    writer epoch, or 1 under a greater one. A hole in a table's durable stream is corruption, not a
-///    tolerated allocation artefact.
+///    contiguous successor `RefTableState::nextTxnId` derives (INV-1): the next sequence number within
+///    the same writer epoch, or 1 under a greater one, counted from `max(greatest_applied,
+///    durable_floor)`. A hole in a table's DURABLE stream is corruption, not a tolerated allocation
+///    artefact; the floor is why a transaction already durable but never applied here does not read as
+///    one (see `durable_floor`).
 ///  - `remove_namespace`, if present, must be the transaction's FINAL operation, and every earlier
 ///    operation must be an exact owner-removal `owner_transition` (`old_binding` set, `new_binding`
 ///    empty). The codec does not check this shape; this is the one place

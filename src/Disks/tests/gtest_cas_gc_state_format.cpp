@@ -83,6 +83,8 @@ TEST(CasGcStateFormat, DefaultsRoundTrip)
 
 TEST(CasGcStateFormat, RejectsZeroGcShards)
 {
+    /// `v:3` is deliberate and must NOT follow a future `G_BUILD` bump: any version <= G_BUILD passes
+    /// the header gate, which is the point — the BODY is what has to fail here.
     const String bad = "{\"type\":\"cas_gc_state\",\"v\":3}\n"
                        "{\"rnd\":\"0\",\"gcs\":0,\"sg\":\"0\",\"spt\":\"0\",\"sa\":\"0\",\"msc\":\"\","
                        "\"lo\":\"00000000000000000000000000000000\",\"ls\":\"0\"}\n";
@@ -123,6 +125,8 @@ TEST(CasGcStateFormat, RejectsAbsentGcShards)
 {
     /// An absent gcs key must fail closed (the writer always emits it) rather than silently defaulting
     /// to the struct's gc_shards = 1 — a missing shard count means a corrupt object, not "use the floor".
+    /// `v:3` is deliberate and must NOT follow a future `G_BUILD` bump: any version <= G_BUILD passes
+    /// the header gate, which is the point — the BODY is what has to fail here.
     const String bad = "{\"type\":\"cas_gc_state\",\"v\":3}\n"
                        "{\"rnd\":\"0\",\"sg\":\"0\",\"spt\":\"0\",\"sa\":\"0\",\"msc\":\"\","
                        "\"lo\":\"00000000000000000000000000000000\",\"ls\":\"0\"}\n";
@@ -153,6 +157,8 @@ TEST(CasGcHeartbeatFormat, RoundTripAndBoundaries)
 
 TEST(CasGcHeartbeatFormat, RejectsMissingIdentityFields)
 {
+    /// `v:3` is deliberate and must NOT follow a future `G_BUILD` bump: any version <= G_BUILD passes
+    /// the header gate, which is the point — the BODY is what has to fail here.
     const String header = "{\"type\":\"cas_gc_hb\",\"v\":3}\n";
 
     const auto expectCorrupted = [](const String & data)

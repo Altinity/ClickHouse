@@ -194,16 +194,14 @@ TEST(CasRefContiguousAlloc, PreAttemptRefusalConsumesNoId)
     store->setMountDeadline(FENCE_DEADLINE_REFUSES_ATTEMPT_MS);
     ASSERT_TRUE(store->mayMutate()) << "the flush must still be ADMITTED, or this exercises the "
                                        "top-of-flush gate instead of the pre-attempt one";
-    bool refused = false;
-    try
-    {
-        publishRef(store, ns, "ref_2", 2);
-    }
-    catch (const DB::Exception &)
-    {
-        refused = true;
-    }
-    ASSERT_TRUE(refused) << "the pre-attempt gate must refuse this append";
+    const String refusal = messageOfThrow([&] { publishRef(store, ns, "ref_2", 2); });
+    ASSERT_NE(refusal, String()) << "the pre-attempt gate must refuse this append";
+    /// Pin WHICH refusal this is. The id-reuse below is only meaningful for a refusal that proves
+    /// nothing was sent; a different failure (an ambiguous PUT, say) would be free to have landed, and
+    /// re-deriving its id would then be a collision rather than the no-gap property under test.
+    EXPECT_NE(refusal.find("was refused BEFORE any request was sent"), String::npos)
+        << "this test is about the provably-sent-nothing refusal specifically: " << refusal;
+    EXPECT_NE(refusal.find("the txn id is not consumed"), String::npos) << refusal;
     ASSERT_FALSE(store->refLaneWedgedForTest(ns)) << "a refusal that sent nothing must not wedge";
 
     store->setMountDeadline(FENCE_DEADLINE_HEALTHY_MS);
@@ -365,10 +363,53 @@ TEST(CasRefContiguousAlloc, PostDurableInstallFailureAllocatesPastTheStrandedId)
 
     /// The durable stream itself is dense: 1, 2 (stranded), 3 all exist as objects. Only this cache is
     /// missing 2, which is what the poison marks -- so a fresh reader replaying the log sees no hole.
-    const String log_prefix = store->layout().refsNamespacePrefix(ns) + "_log/";
     for (uint64_t seq = 1; seq <= 3; ++seq)
         EXPECT_TRUE(backend->head(store->layout().refLogKey(ns, RefTxnId{epoch, seq})).exists)
             << "log object " << epoch << "-" << seq << " must exist: the durable stream has no hole";
+}
+
+/// The other half of the poisoned contract: a poisoned table keeps ACCEPTING appends, but it must never
+/// PUBLISH. Its `greatest_applied` is now above the stranded transaction (the durable floor moved the
+/// next append past it), so a snapshot labelled with it would claim to cover a transaction its body does
+/// not contain -- and every future recovery selecting that snapshot would skip the stranded transaction
+/// forever. A divergence confined to one runtime's cache would become durable and permanent.
+TEST(CasRefContiguousAlloc, PoisonedTableRefusesToPublishASnapshot)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPool(backend);
+    const uint64_t epoch = store->writerEpoch();
+    const RootNamespace ns{"srv1/contig_poison_publish"};
+
+    ASSERT_EQ(publishRef(store, ns, "ref_1", 1), (RefTxnId{epoch, 1}));
+    ASSERT_TRUE(store->trySnapshotPublishOnce(ns)) << "a healthy table must publish, or the refusal "
+                                                     "asserted below would prove nothing";
+    const auto published_before = store->newestPublishedSnapshotIdForTest(ns);
+    ASSERT_TRUE(published_before.has_value());
+
+    auto planned = std::make_exception_ptr(DB::Exception(DB::ErrorCodes::MEMORY_LIMIT_EXCEEDED,
+        "simulated allocation failure inside the post-durable install region"));
+    auto fired = std::make_shared<std::atomic<bool>>(false);
+    store->setInstallRegionProbeForTest([planned, fired]
+    {
+        if (fired->exchange(true))
+            return;
+        ALLOW_ALLOCATIONS_IN_SCOPE;
+        std::rethrow_exception(planned);
+    });
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::MEMORY_LIMIT_EXCEEDED,
+        [&] { publishRef(store, ns, "ref_2", 2); });
+    store->setInstallRegionProbeForTest(nullptr);
+    ASSERT_EQ(store->applyStateForTest(ns), RefApplyState::Poisoned);
+
+    /// The table still takes work (the §A2 contract), and its state advances past the stranded id --
+    /// which is exactly what would make a published snapshot a lie.
+    EXPECT_EQ(publishRef(store, ns, "ref_3", 3), (RefTxnId{epoch, 3}));
+
+    EXPECT_FALSE(store->trySnapshotPublishOnce(ns))
+        << "a poisoned table must refuse to publish: the snapshot would be labelled above a durable "
+           "transaction its body is missing";
+    EXPECT_EQ(store->newestPublishedSnapshotIdForTest(ns), published_before)
+        << "and nothing may have been written -- the refusal is not a retry, it is a fail-close";
 }
 
 /// Recreation quiesce, refusal leg. Refusing to OPEN an old-format pool fences nothing: the server that

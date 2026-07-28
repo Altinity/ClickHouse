@@ -1757,14 +1757,15 @@ namespace
 /// `RefWriterTestBackend::corrupt_key_substr` (gtest_cas_ref_writer.cpp, reproduced locally because
 /// that class lives in a different translation unit): landing a DIFFERENT object at the intended key
 /// makes `putIfAbsentControlled`'s resolve-before-reissue observe a real conflict and throw
-/// CORRUPTED_DATA -- a CONCLUSIVE rejection (CasRefLedger.cpp's `flushRefBatch`, "do NOT wedge... the
-/// id is a safe gap, the cache is unchanged, and the lane stays usable"), unlike a genuinely-ambiguous
-/// timeout, which would instead WEDGE the whole table's append lane (`rt->wedge`) until the SAME key
-/// resolves durable -- a state a one-shot fault can never itself clear, since wedge resolution only
-/// re-GETs the intended key and never re-PUTs it (proven by
-/// `RefWriterAppendLane.WedgedLaneBlocksSameTableWhileOtherTableProceeds`). A conflict, by contrast,
-/// leaves the cached ref-table state untouched, so the SAME logical retry (abandon()'s second call)
-/// carves a fresh id and lands normally once the fault is one-shot-consumed.
+/// CORRUPTED_DATA -- a CONCLUSIVE rejection ("do NOT wedge: the cache is unchanged and nothing of ours
+/// is durable", CasRefLedger.cpp's `commitRefChunk`), unlike a genuinely-ambiguous timeout, which would
+/// instead WEDGE the whole table's append lane (`rt->wedge`) until the SAME key resolves durable -- a
+/// state a one-shot fault can never itself clear, since wedge resolution only re-GETs the intended key
+/// and never re-PUTs it (proven by
+/// `RefWriterAppendLane.WedgedLaneBlocksSameTableWhileOtherTableProceeds`). A conflict leaves the cached
+/// ref-table state untouched, so the SAME logical retry reaches its append again -- and under INV-1 that
+/// retry re-derives the SAME id from that unchanged state, so it meets the same occupant rather than
+/// carving a fresh id around it.
 class RefLogConflictOnceBackend final : public InMemoryBackend
 {
 public:
@@ -1818,6 +1819,36 @@ TEST(CasPartWriteTxn, AbandonRetryableAfterAppendFailure)
     /// fresh mount incarnation's writer epoch, which starts a new key namespace -- not by writing past
     /// the damage.)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { build->abandon(); });
+
+    /// The removal never landed, and nothing was written around the occupant: the precommit binding this
+    /// build owns is still live, exactly where the failed abandon left it. That is the honest end state
+    /// under the fail-closed contract -- the old proof (a fresh `precommitAdd` for the same ref
+    /// succeeding, which showed the binding gone) needed one more successful append on a table that can
+    /// no longer take one.
+    String greatest_key;
+    size_t foreign_objects = 0;
+    for (String cursor;;)
+    {
+        const ListPage page = b->list(b->corrupt_key_substr, cursor, 1000);
+        for (const auto & listed : page.keys)
+        {
+            if (listed.key > greatest_key)
+                greatest_key = listed.key;
+            const auto body = b->get(listed.key);
+            if (body && body->bytes.find("_FOREIGN_DIFFERENT") != String::npos)
+                ++foreign_objects;
+        }
+        if (page.next_cursor.empty())
+            break;
+        cursor = page.next_cursor;
+    }
+    EXPECT_EQ(foreign_objects, 1u) << "the foreign object must still own the key it took";
+    ASSERT_FALSE(greatest_key.empty());
+    const auto greatest_body = b->get(greatest_key);
+    ASSERT_TRUE(greatest_body.has_value());
+    EXPECT_NE(greatest_body->bytes.find("_FOREIGN_DIFFERENT"), String::npos)
+        << "the foreign occupant must still be the highest id in this table's stream: a log object above "
+           "it would mean an append carved a fresh id around the damage instead of failing closed";
 }
 
 /// ------------------------------------------------------------------------------------------------

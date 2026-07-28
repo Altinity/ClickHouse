@@ -131,6 +131,8 @@ TEST(CasFoldSeal, FoldSealCondemnedSummaryRoundTrips)
 TEST(CasFoldSeal, RejectsOutOfRangeFoldedTokenType)
 {
     /// Decode alone is the enforcement point: a cov record with an unknown token-type word fails closed.
+    /// `v:3` is deliberate and must NOT follow a future `G_BUILD` bump: any version <= G_BUILD passes
+    /// the header gate, which is the point — the BODY is what has to fail here.
     const String bad = "{\"type\":\"cas_fold_seal\",\"v\":3}\n"
                        "{\"g\":\"1\",\"pg\":\"0\"}\n"
                        "{\"k\":\"cov\",\"key\":\"n/0\",\"cls\":2,\"tt\":\"bogus\",\"tv\":\"x\",\"lfe\":\"0\",\"lfs\":\"0\"}\n"
@@ -148,6 +150,8 @@ TEST(CasFoldSeal, RejectsOutOfRangeFoldedTokenType)
 
 TEST(CasFoldSeal, RejectsOutOfRangeNsCleanupState)
 {
+    /// `v:3` is deliberate and must NOT follow a future `G_BUILD` bump: any version <= G_BUILD passes
+    /// the header gate, which is the point — the BODY is what has to fail here.
     const String bad = "{\"type\":\"cas_fold_seal\",\"v\":3}\n"
                        "{\"g\":\"1\",\"pg\":\"0\"}\n"
                        "{\"k\":\"nsc\",\"ns\":\"x\",\"rte\":\"1\",\"rts\":\"1\",\"st\":\"bogus\"}\n"

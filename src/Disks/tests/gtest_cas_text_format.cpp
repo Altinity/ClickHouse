@@ -201,6 +201,8 @@ TEST(CasTextHeader, WriteExpectSniffGate)
     EXPECT_FALSE(sniffHeaderLine("PAR1 not a cas object").has_value());
 
     /// wrong type -> CORRUPTED_DATA; future v -> UNKNOWN_FORMAT_VERSION
+    /// `v:3` is deliberate and must NOT follow a future `G_BUILD` bump: any version <= G_BUILD passes
+    /// the header gate, which is the point — the BODY is what has to fail here.
     const String wrong = "{\"type\":\"cas_owner\",\"v\":3}\n";
     DB::ReadBufferFromMemory in2(wrong.data(), wrong.size());
     expectCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { expectHeaderLine(in2, FormatId::PoolMeta); });
@@ -237,6 +239,8 @@ TEST(CasZstdArm, SealOpenPolicyAndCaps)
 {
     /// Always types compress regardless of size (no threshold — the .zst key must be
     /// constructible without knowing the body); a raw body is still readable (repair path).
+    /// `v:3` is deliberate and must NOT follow a future `G_BUILD` bump: any version <= G_BUILD passes
+    /// the header gate, which is the point — the BODY is what has to fail here.
     const String small = "{\"type\":\"cas_ref_snap\",\"v\":3}\n{}\n";
     const String sealed_small = sealObject(FormatId::RefSnapshot, small);
     ASSERT_TRUE(looksZstd(sealed_small));
