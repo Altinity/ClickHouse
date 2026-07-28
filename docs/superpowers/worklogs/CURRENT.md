@@ -1549,3 +1549,7 @@ twice-applied env-reachable principle — flagged for visibility. No push.
 **2026-07-28 22:2x local** — T8 review: Spec ✅ / needs-fixes (headline: missing gc/state
 bypasses the REBUILD refusal -> hold-free baseline; fix = refuse-unless-proven-virgin). Fix
 round dispatched. Lane L implementing the two-armed terminate ruling. No push.
+
+**2026-07-28 22:00 local watchdog** — both lanes deep in their rounds, logs seconds-fresh:
+L = terminate-ruling cycle (ASan build6 + release gate13 concurrently); G = genuine red runs
+for I1 (fix1_red_run.log). No push.
