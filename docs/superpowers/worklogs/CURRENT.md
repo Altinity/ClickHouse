@@ -1248,3 +1248,9 @@ its late wake — models/ clean, no clobber. No push.
 
 **2026-07-28 08:5x UTC watchdog** — task 4 productive: module rewritten (12 KB), safe +
 noincarnation configs through TLC (08:18-19). Commit/report pending. No push.
+
+**2026-07-28 09:1x UTC watchdog** — task 4 fix round active (`_sab_rederive` already through TLC
+08:41 — the third config exists and runs), commit pending. PIPELINE GATE: the user raised a
+direction-check question; my assessment + off-ramps delivered (recommend full course with a
+two-stage main plan). In-flight task 4 completes per the allowed-to-finish precedent; tasks 5-6 and
+the main plan HOLD until the user answers. No push.
