@@ -37,6 +37,7 @@ namespace ProfileEvents
     extern const Event CasGcMetaWriteAnomaly;
     extern const Event CasGcMetaOps;
     extern const Event CasGcEnumerationPages;
+    extern const Event CasGcRebuildVirginByEnumeration;
     extern const Event CasGcRefScanDisagreements;
     extern const Event CasGcUnappliedFoldedTxns;
     extern const Event CasRefGlobalListPages;
@@ -1028,64 +1029,99 @@ std::optional<std::pair<uint64_t, uint64_t>> Gc::newestFoldSealRef()
     const String gen_prefix = layout.gcGenPrefix(0);
     const String top = gen_prefix.substr(0, gen_prefix.size() - 2);   /// ".../gc/gen/"
 
-    /// THE ENUMERATION IS A HINT HERE TOO, exactly as it is in the ref walk. Trusting it for
+    /// THE WIDE ENUMERATION IS A HINT HERE TOO, exactly as it is in the ref walk. Trusting it for
     /// NEWEST-ness would reopen the same hole one layer up: an enumeration that omits the true newest
     /// seal hands back an older one, and every hold detected since that older seal is silently lost --
-    /// an under-carry, which is the failure this whole path exists to prevent. So the broad LIST only
-    /// SEEDS a floor, and newest-ness is CONFIRMED by walking up from it.
-    uint64_t seeded_floor = 0;
+    /// an under-carry, which is the failure this whole path exists to prevent.
+    uint64_t listed_max_generation = 0;
+    bool listed_anything = false;
+    std::optional<std::pair<uint64_t, uint64_t>> newest;
     forEachListedKey(backend, top, [&](const ListedKey & k)
     {
+        listed_anything = true;
         const size_t from = top.size();
         const size_t gen_end = k.key.find('/', from);
         if (gen_end == String::npos)
             return;
+        uint64_t generation = 0;
         try
         {
-            seeded_floor = std::max(seeded_floor,
-                                    static_cast<uint64_t>(std::stoull(k.key.substr(from, gen_end - from))));
+            generation = std::stoull(k.key.substr(from, gen_end - from));
         }
         catch (...) // NOLINT(bugprone-empty-catch)
         {
-            /// Foreign key shape under `gc/gen` is debris, not a generation number.
+            return;   /// foreign key shape under `gc/gen` is debris, not a generation number
         }
+        listed_max_generation = std::max(listed_max_generation, generation);
     }, 1000, onGcEnumerationPage);
 
-    /// THE CONFIRM WALK, and the shape it can honestly have. Generations ARE dense in minting -- a fold
-    /// mints `snap_generation + 1`, a rebuild `max_gen + 1` -- so `generation + 1` is computable and the
-    /// walk steps it exactly as the ref walk steps `cursor + 1`, stopping at the first generation that
-    /// does not exist. Absence therefore decides the top, and it is decided per generation rather than
-    /// read off the enumeration's maximum.
-    ///
-    /// The ATTEMPT component is NOT arithmetic and cannot be made so: it is `lease.seq`, a global lease
-    /// counter that advances on EVERY round including deferred ones, so consecutive generations carry
-    /// attempts separated by unbounded gaps and there is no `attempt + 1` to probe. A fold seal's key
-    /// needs both numbers, so the per-generation question is answered by listing ONE generation's
-    /// prefix instead of by an exact `GET`. That is a narrow, single-generation query rather than a
-    /// pool-wide enumeration whose maximum decides everything -- strictly stronger than trusting the
-    /// broad LIST, and honestly weaker than the ref walk's exact reads. Closing it completely needs an
-    /// attempt-free per-generation key to point-read, which is a format change (recorded in the report).
-    ///
-    /// Starting at `seeded_floor + 1` makes the virgin case fall out of the same loop: a pool the hint
-    /// says nothing about starts at generation 1, and an empty generation 1 IS the proof that no
-    /// baseline was ever sealed.
-    std::optional<std::pair<uint64_t, uint64_t>> newest;
-    if (seeded_floor > 0)
-        if (const auto seeded = probeGenerationForSeal(seeded_floor); seeded.seal_attempt)
-            newest = std::make_pair(seeded_floor, *seeded.seal_attempt);
+    if (listed_max_generation > 0)
+        if (const auto listed = probeGenerationForSeal(listed_max_generation); listed.seal_attempt)
+            newest = std::make_pair(listed_max_generation, *listed.seal_attempt);
 
-    for (uint64_t generation = seeded_floor + 1; ; ++generation)
+    /// DETECTION, NOT PROOF -- and labelled as such deliberately, in the same spirit as probe A. Two
+    /// NARROW single-generation probes above the wide listing's maximum ask whether that maximum was a
+    /// lie. The generation half of the question is arithmetic (generations are dense in minting: a fold
+    /// takes `snap_generation + 1`, a rebuild `max_gen + 1`), but the attempt half is not and cannot be
+    /// made so -- `attempt` is `lease.seq`, a global counter that advances on EVERY round including
+    /// deferred ones, so consecutive generations carry attempts separated by unbounded gaps and there is
+    /// no `attempt + 1` to point-read. So the step is an enumeration WITHIN ONE DIRECTORY: strictly
+    /// narrower than the pool-wide listing whose maximum it is checking, and honestly not the exact
+    /// read the ref walk gets.
+    ///
+    /// A seal found above the maximum means the wide listing lied about the very thing this path is
+    /// deciding, so the answer is REFUSAL, not adoption of the newer seal: a store that misreports its
+    /// own enumeration DURING DISASTER RECOVERY does not get a second guess, and silently adopting
+    /// whatever the second query returned would just move the trust one query along.
+    static constexpr uint64_t kProbeGenerationsAbove = 2;
+    for (uint64_t above = 1; above <= kProbeGenerationsAbove; ++above)
     {
+        const uint64_t generation = listed_max_generation + above;
         const GenerationSealProbe probe = probeGenerationForSeal(generation);
-        if (!probe.generation_exists)
-            break;   /// the first absent generation: everything below it is all there is
-        /// A generation that exists but sealed nothing is a fold that died before its seal write. It
-        /// carries no holds, so it does not become the newest -- but the walk continues THROUGH it,
-        /// because a generation above it would still be the real top.
-        if (probe.seal_attempt)
-            newest = std::make_pair(generation, *probe.seal_attempt);
+        if (!probe.seal_attempt)
+            continue;
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS GC rebuild: a fold seal exists at generation {} (attempt {}) while the pool-wide "
+            "enumeration of {} reported nothing above generation {}. The enumeration this rebuild "
+            "would have taken its baseline from is demonstrably incomplete, so the holds it carries "
+            "cannot be trusted to be all of them. GC refuses to rebuild; this pool must be recreated.",
+            generation, *probe.seal_attempt, top, listed_max_generation);
     }
-    return newest;
+
+    if (newest)
+        return newest;
+
+    /// THE VIRGIN VERDICT, and everything it rests on. `gc/state` is already known absent or
+    /// unreadable (the caller's precondition); the wide listing found nothing; and one narrow probe of
+    /// generation 1 -- the first generation any pool would ever mint -- also finds nothing. That is
+    /// three pieces of ENUMERATION evidence and no point read, because the seal key's attempt component
+    /// has no arithmetic successor to probe.
+    ///
+    /// NAMED RESIDUAL: an enumeration that hid EVERY seal, generation 1 included, on a lived-in pool
+    /// still reads virgin here, and this grants that pool a clean slate with no holds. No closure
+    /// exists in the current key shapes; it needs a derivable per-generation alias that can be
+    /// point-read (see the report). Anything the listing DOES show above generation 1 is caught by the
+    /// refusal above instead.
+    const GenerationSealProbe genesis = probeGenerationForSeal(1);
+    if (listed_anything || genesis.generation_exists)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS GC rebuild: the pool-wide enumeration of {} yielded no fold seal, yet {} -- so the "
+            "pool is NOT provably new and its holds cannot be enumerated. GC refuses to rebuild; this "
+            "pool must be recreated.",
+            top,
+            listed_anything ? "that enumeration did return objects under it"
+                            : "a narrow probe of generation 1 found objects the wide listing omitted");
+
+    ProfileEvents::increment(ProfileEvents::CasGcRebuildVirginByEnumeration);
+    LOG_WARNING(logger,
+        "CAS GC rebuild: treating this pool as having NEVER sealed a baseline, so no durable hold is "
+        "carried forward. Virgin by: wide LIST of {} empty, narrow generation-1 probe empty, gc/state "
+        "absent or unreadable. This verdict rests on ENUMERATION ALONE -- no point read can prove it, "
+        "because a fold seal key needs an attempt component that is a lease sequence number. If this "
+        "pool has ever completed a GC round, the enumeration is lying and this rebuild is about to "
+        "grant it a clean slate it does not have.",
+        top);
+    return std::nullopt;
 }
 
 Gc::GenerationSealProbe Gc::probeGenerationForSeal(uint64_t generation)
@@ -3152,8 +3188,15 @@ RebuildReport Gc::rebuildBaseline(bool force)
         /// So find the newest fold seal OBJECT by enumeration and carry ITS holds. This keeps the
         /// pool's disaster recovery intact -- losing `gc/state` on a lived-in pool is the scenario this
         /// command exists for -- while making a hold-free baseline over a pool that had holds
-        /// unreachable. An unadopted deposed-leader attempt can be the newest object; carrying its
-        /// holds over-holds at worst, which is the safe direction.
+        /// unreachable.
+        ///
+        /// An unadopted deposed-leader attempt can be the newest object, and carrying its holds
+        /// over-holds RATHER THAN under-holds -- but that claim needs its qualifier, because it is not
+        /// universal. It holds outside the lying-store corner. The exception is a deposed attempt that
+        /// FOLDED THROUGH a position on a read that was transient: its seal records the hold as
+        /// cleared, the adopted leader's seal still holds it, and adopting the deposed one loses that
+        /// hold. Bounded by the refusal above (a seal above the listing's maximum refuses outright) and
+        /// by the fact that both attempts walked the same cursor state.
         if (!decoded || decoded->snap_generation == 0)
         {
             if (const auto newest = newestFoldSealRef())

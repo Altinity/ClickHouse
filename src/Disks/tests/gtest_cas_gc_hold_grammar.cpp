@@ -7,6 +7,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcShardPlan.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
+#include <Common/ProfileEvents.h>
 #include "cas_test_helpers.h"
 
 #include <cstring>
@@ -47,6 +48,11 @@ namespace DB::ErrorCodes
 {
 extern const int CORRUPTED_DATA;
 extern const int LIMIT_EXCEEDED;
+}
+
+namespace ProfileEvents
+{
+extern const Event CasGcRebuildVirginByEnumeration;
 }
 
 namespace
@@ -911,15 +917,19 @@ TEST(CasGcHoldGrammar, RebuildRefusesWhenTheNewestSealIsUnreadableAndTheStateIsL
     }
 }
 
-/// NEWEST-NESS IS CONFIRMED, NOT ENUMERATED. Reading the newest seal off a pool-wide LIST would put
-/// the same hole one layer up: a listing that omits the true newest seal hands back an OLDER one, and
-/// every hold detected since that older seal is silently lost. So the listing only seeds a floor and
-/// the walk steps generations upward from it — they are dense in minting — until one does not exist.
+/// NEWEST-NESS IS NOT READ OFF A LISTING. Taking the newest seal from the pool-wide enumeration would
+/// put the same hole one layer up: a listing that omits the true newest seal hands back an OLDER one,
+/// and every hold detected since that older seal is silently lost. Two narrow single-generation probes
+/// above the listing's maximum ask whether it lied.
+///
+/// And when it did lie, the answer is REFUSAL, not adoption of the newer seal. A store that misreports
+/// its own enumeration DURING DISASTER RECOVERY does not get a second guess: adopting whatever the
+/// second query happened to return would move the same trust one query along and prove nothing.
 ///
 /// The fixture is the production shape rather than a contrivance: the broad `gc/gen/` enumeration
 /// omits the newest generation's objects while a listing scoped to that generation still returns
 /// them — the same class of lie the arithmetic ref walk was built for one layer down.
-TEST(CasGcHoldGrammar, RebuildConfirmsTheNewestSealWhenTheBroadListingHidesIt)
+TEST(CasGcHoldGrammar, RebuildRefusesWhenANarrowProbeFindsASealAboveTheListingMaximum)
 {
     /// Omits keys from ONE enumeration prefix only. Every other query — including a listing scoped to
     /// the generation itself — answers truthfully.
@@ -972,24 +982,25 @@ TEST(CasGcHoldGrammar, RebuildConfirmsTheNewestSealWhenTheBroadListingHidesIt)
     ASSERT_EQ(backend->deleteExact(layout.gcStateKey(), sh.token).kind, DeleteOutcome::Kind::Deleted);
 
     Gc gc2(store, hexToU128("0000000000000000000000000000000b"));
-    const RebuildReport rep = gc2.rebuildBaseline(/*force=*/false);
-    ASSERT_TRUE(rep.performed) << rep.refusal;
+    for (const bool force : {false, true})
+    {
+        SCOPED_TRACE(force ? "force" : "plain");
+        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { gc2.rebuildBaseline(force); });
+    }
     ASSERT_GT(backend->holes_served, 0u) << "the broad listing never actually lied";
 
-    const auto rebuilt = newestSeal(*backend, layout);
-    ASSERT_TRUE(rebuilt.has_value());
-    const auto it = rebuilt->per_ns_shard.find(cursorKeyForTest(ns, 0));
-    ASSERT_NE(it, rebuilt->per_ns_shard.end());
-    ASSERT_TRUE(it->second.hold.has_value())
-        << "the rebuild believed the listing's maximum and carried an older seal's holds — the hold "
-           "recorded in the generation the listing omitted was lost";
-    EXPECT_EQ(*it->second.hold, plantedHold());
+    /// Nothing was adopted: the refusal fires before the lease, so the pool is exactly as it was.
+    EXPECT_FALSE(backend->head(layout.gcStateKey()).exists)
+        << "a refused rebuild must not mint a baseline, nor a bootstrap body";
 }
 
-/// The virgin proof, pinned so the refusal can never grow to swallow a fresh pool: no `gc/state` AND
-/// no fold seal object anywhere means the pool never sealed a baseline, so there is no hold to lose
-/// and nothing to refuse over.
-TEST(CasGcHoldGrammar, RebuildProceedsOnAPoolThatNeverSealedABaseline)
+/// The virgin verdict, pinned so the refusal can never grow to swallow a fresh pool — and pinned as
+/// what it actually is. It rests on THREE pieces of enumeration evidence (wide LIST empty, narrow
+/// generation-1 probe empty, no `gc/state`) and on no point read at all, so it is COUNTED: an operator
+/// reading a disaster-recovery run needs to see that the clean slate came from enumeration rather than
+/// from proof. `CasGcRebuildVirginByEnumeration` on a pool that has ever completed a round means the
+/// enumeration lied.
+TEST(CasGcHoldGrammar, RebuildProceedsOnAPoolThatNeverSealedABaselineAndCountsTheVerdict)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -1000,7 +1011,12 @@ TEST(CasGcHoldGrammar, RebuildProceedsOnAPoolThatNeverSealedABaseline)
     publishAt(*backend, layout, ns, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(1), /*birth=*/true);
     ASSERT_FALSE(backend->head(layout.gcStateKey()).exists);
 
+    using ProfileEvents::global_counters;
+    const auto virgin_before = global_counters[ProfileEvents::CasGcRebuildVirginByEnumeration].load();
+
     Gc gc(store, kGc);
     const RebuildReport rep = gc.rebuildBaseline(/*force=*/false);
     EXPECT_TRUE(rep.performed) << rep.refusal;
+    EXPECT_GT(global_counters[ProfileEvents::CasGcRebuildVirginByEnumeration].load(), virgin_before)
+        << "a clean slate granted from enumeration alone must be visible to whoever reads the run";
 }

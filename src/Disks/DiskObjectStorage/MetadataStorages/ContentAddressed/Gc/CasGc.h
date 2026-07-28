@@ -436,12 +436,21 @@ private:
     /// SEAL, not in the pointer to it, so losing the POINTER must not silently produce a hold-free
     /// baseline while an unreadable SEAL refuses.
     ///
-    /// The pool-wide enumeration is a HINT that seeds a floor, never the answer: one that omitted the
-    /// true newest seal would hand back an older one and lose every hold detected since — the same hole
-    /// one layer up. Newest-ness is CONFIRMED by walking generations upward from that floor (they are
-    /// dense in minting) until one does not exist. See the implementation for why the per-generation
-    /// step is a narrow prefix query rather than an exact `GET`: the attempt component of the key is a
-    /// lease sequence number and has no arithmetic successor.
+    /// The pool-wide enumeration is a HINT, never the answer: one that omitted the true newest seal
+    /// would hand back an older one and lose every hold detected since — the same hole one layer up.
+    /// Two NARROW single-generation probes above the listing's maximum ask whether it lied, and a seal
+    /// found there THROWS a refusal rather than being adopted; a store that misreports its own
+    /// enumeration during disaster recovery does not get a second guess.
+    ///
+    /// That is DETECTION, not proof, and the implementation says so at the site: the generation half of
+    /// the question is arithmetic (generations are dense in minting), while the attempt half is an
+    /// enumeration within ONE directory, because a seal key's attempt component is a lease sequence
+    /// number with no arithmetic successor to point-read.
+    ///
+    /// THROWS `CORRUPTED_DATA` on that refusal, and on a pool whose enumeration yielded no seal but
+    /// which is not provably new. Returning `nullopt` is the VIRGIN verdict — logged at WARNING with
+    /// its evidence enumerated and counted by `CasGcRebuildVirginByEnumeration`, because it rests on
+    /// enumeration alone and no point read can prove it.
     std::optional<std::pair<uint64_t, uint64_t>> newestFoldSealRef();
 
     /// Read ONE part manifest named by `id`, validate it, and append sign*(+1) blob deltas for each
