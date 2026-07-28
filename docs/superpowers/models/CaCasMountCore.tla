@@ -153,6 +153,15 @@
 (*      (`WedgeRetryCreate`) is generation-guarded; `SabWedgeRetryOldGen`  *)
 (*      drops that guard, so a dead lane injects its bytes into the        *)
 (*      successor incarnation's live stream.                               *)
+(*   - `wedgeOp` -- the lane's OPERATION IDENTITY, from the monotone       *)
+(*      `admissions` counter. Added in fix round 1: identifying an         *)
+(*      operation by `<< actor, generation >>` alone aliased two distinct  *)
+(*      operations admitted at the same generation, which let the HONEST   *)
+(*      configuration ack the second on the first one's bytes with         *)
+(*      `AckedOpsAreDurable` structurally unable to see it. The compare    *)
+(*      was therefore only proving its GENERATION half load-bearing; the   *)
+(*      same-generation half -- INV-1's "each later caller's flush" --     *)
+(*      is now modelled and is the shortest counterexample.                *)
 (*   - `slot` -- the frontier key, i.e. this model's `slot-occupy` result  *)
 (*      (`None` = `Created`; `seal = FALSE` = `Occupied(bytes)`; `seal =   *)
 (*      TRUE` = `Occupied(EpochSeal)`). `WedgeRetryOccupied` resolves      *)
@@ -324,24 +333,48 @@ VARIABLES
                   \* result outstanding for this actor. This IS the model's whole representation of
                   \* recovery: `RecoveryStart` issues it, `Install` re-presents it under the install
                   \* lock, `RecoveryRefused` drops it when the recheck refuses.
+    wedgeOp,      \* [Actors -> (1..MaxAdmissions) \cup {None}]; 2026-07-28 fix round 1 -- the OPERATION
+                  \* IDENTITY of whatever the wedged lane is carrying, drawn from the monotone
+                  \* `admissions` counter so every operation admitted in a behavior gets a DISTINCT id.
+                  \* None exactly when `wedgeGen[a] = None`.
+                  \*
+                  \* Why this exists (review finding "Important 1"): the first cut identified an
+                  \* operation by `<< actor, generation >>` alone, which ALIASES two distinct
+                  \* operations admitted at the same generation -- and `WedgeAdmit` is re-enabled the
+                  \* moment a lane resolves. In the HONEST configuration that made `mine` true for a
+                  \* SECOND operation on the strength of the FIRST one's bytes at depth 6
+                  \* (`WedgeAdmit -> WedgeRetryCreate -> WedgeAdmit`), i.e. exactly the
+                  \* acked-then-lost damage this layer exists to catch -- and `AckedOpsAreDurable`
+                  \* could not see it, because both operations collapsed to one identity that was
+                  \* already in `durable`, so the union was a no-op and `acked` did not even grow.
+                  \* The byte compare was therefore only ever proving its GENERATION half
+                  \* load-bearing. With a distinct op id the SAME-GENERATION half -- INV-1's "each
+                  \* later caller's flush", which is explicitly about multiple callers WITHIN one
+                  \* incarnation -- is modelled too, and it is now the shortest counterexample
+                  \* `_sab_slotnocompare.cfg` finds.
     wedgeGen,     \* [Actors -> (0..MaxEpoch) \cup {None}]; the generation a WEDGED lane stored at
                   \* its own admission (INV-1: "the wedge stores its admission fence generation").
                   \* None = no wedged lane. Kept DISJOINT from `recGen`: they are two independent
                   \* consumers of the same generation, and collapsing them into one variable would
                   \* let one sabotage's counterexample stand in for the other's.
-    slot,         \* None, or [by |-> Actor, gen |-> Nat, seal |-> BOOLEAN]; ONE modeled frontier key
-                  \* -- the `slot-occupy` primitive's subject. `None` is `Created` (absent, so a
-                  \* conditional create lands); `seal = FALSE` is `Occupied(bytes)` where the bytes'
-                  \* identity is the operation `<< by, gen >>` that wrote them, BOUND AT ADMISSION
-                  \* and never re-tagged; `seal = TRUE` is `Occupied(EpochSeal)` planted by `by`'s
-                  \* recovery at generation `gen`. Nothing ever deletes or overwrites the key: a seal
-                  \* only ever occupies an ABSENT one (INV-2), which is why `durable` below is
-                  \* monotone. ONE key, not a walk -- see the `slot` bound note in _RESULTS.md.
-    acked,        \* SUBSET (Actors \X (0..MaxEpoch)); operations whose SUCCESS was reported to their
-                  \* caller. Monotone.
-    durable,      \* SUBSET (Actors \X (0..MaxEpoch)); operations whose bytes ever became durable at
-                  \* the frontier key. Monotone (see `slot`). `acked \subseteq durable` is
-                  \* `AckedOpsAreDurable`, the acked-then-lost property.
+    slot,         \* None, or [by |-> Actor, gen |-> Nat, op |-> Nat \cup {None}, seal |-> BOOLEAN];
+                  \* ONE modeled frontier key -- the `slot-occupy` primitive's subject. `None` is
+                  \* `Created` (absent, so a conditional create lands); `seal = FALSE` is
+                  \* `Occupied(bytes)` where the bytes' identity is the operation
+                  \* `<< by, gen, op >>` that wrote them, BOUND AT ADMISSION and never re-tagged;
+                  \* `seal = TRUE` is `Occupied(EpochSeal)` planted by `by`'s recovery at generation
+                  \* `gen`, and carries `op = None` because a seal is not an operation. Nothing ever
+                  \* deletes or overwrites the key: a seal only ever occupies an ABSENT one (INV-2),
+                  \* which is why `durable` below is monotone. ONE key, not a walk -- see the `slot`
+                  \* bound note in _RESULTS.md.
+    acked,        \* SUBSET (Actors \X (0..MaxEpoch) \X (1..MaxAdmissions)); operations whose SUCCESS
+                  \* was reported to their caller. Monotone.
+    durable,      \* SUBSET (Actors \X (0..MaxEpoch) \X (1..MaxAdmissions)); operations whose bytes
+                  \* ever became durable at the frontier key. Monotone (see `slot`).
+                  \* `acked \subseteq durable` is `AckedOpsAreDurable`, the acked-then-lost property.
+                  \* The third component is the op id -- see `wedgeOp` for why identifying an
+                  \* operation by `<< actor, generation >>` alone made this invariant blind to the
+                  \* same-generation half of the damage.
     staleRefusedEver, \* history: TRUE once a post-I/O generation recheck actually REFUSED a
                       \* returning result (at either site). Non-vacuity for the honest recheck: a
                       \* green gate whose recheck never fired would prove nothing.
@@ -357,7 +390,7 @@ vars == << owner, epoch, epochCeiling, epochWiped, mount, mtoken, clock, localEp
            adoptObs, fencedEpochs, wedged, wrote, rootEmpty, firstOwner,
            lostThenWrote, reclaimed, remountedAfterFence,
            fenceUntil, obsToken, obsSince, observedReclaimEver, supersededThenWrote,
-           recGen, wedgeGen, slot, acked, durable, admissions, staleRefusedEver,
+           recGen, wedgeGen, wedgeOp, slot, acked, durable, admissions, staleRefusedEver,
            sealRejectedEver >>
 
 \* 2026-07-28: the recovery-generation layer's own variables as one tuple, so each of the 19
@@ -365,7 +398,7 @@ vars == << owner, epoch, epochCeiling, epochWiped, mount, mtoken, clock, localEp
 \* (already long) UNCHANGED tuple retyped. An edit that touches 19 multi-line tuples is exactly
 \* where a silent omission lives, and TLC would report the omission as a spurious nondeterminism
 \* rather than an error.
-rgVars == << recGen, wedgeGen, slot, acked, durable, admissions, staleRefusedEver,
+rgVars == << recGen, wedgeGen, wedgeOp, slot, acked, durable, admissions, staleRefusedEver,
               sealRejectedEver >>
 
 Init ==
@@ -396,6 +429,7 @@ Init ==
     /\ supersededThenWrote = FALSE
     /\ recGen = [a \in Actors |-> None]
     /\ wedgeGen = [a \in Actors |-> None]
+    /\ wedgeOp = [a \in Actors |-> None]
     /\ slot = None
     /\ acked = {}
     /\ durable = {}
@@ -1098,7 +1132,7 @@ RecoveryStart(a) ==
                     localLost, crashed, rejected, adoptObs, fencedEpochs, wedged, wrote, rootEmpty,
                     firstOwner, lostThenWrote, reclaimed, remountedAfterFence, fenceUntil,
                     obsToken, obsSince, observedReclaimEver, supersededThenWrote,
-                    wedgeGen, slot, acked, durable, staleRefusedEver, sealRejectedEver >>
+                    wedgeGen, wedgeOp, slot, acked, durable, staleRefusedEver, sealRejectedEver >>
 
 \* SealSlot(a): the recovery walk finds the key `Created` (absent) and the seal OCCUPIES it --
 \* INV-2's "`Created` -> the seal occupies `(E, T+1)` and the `Late Predecessor PUT` ghost can
@@ -1114,12 +1148,12 @@ SealSlot(a) ==
     /\ owner = a
     /\ clock < fenceUntil
     /\ slot = None
-    /\ slot' = [by |-> a, gen |-> recGen[a], seal |-> TRUE]
+    /\ slot' = [by |-> a, gen |-> recGen[a], op |-> None, seal |-> TRUE]
     /\ UNCHANGED << owner, epoch, epochCeiling, epochWiped, mount, mtoken, clock, localEpoch,
                     localLost, crashed, rejected, adoptObs, fencedEpochs, wedged, wrote, rootEmpty,
                     firstOwner, lostThenWrote, reclaimed, remountedAfterFence, fenceUntil,
                     obsToken, obsSince, observedReclaimEver, supersededThenWrote,
-                    admissions, recGen, wedgeGen, acked, durable, staleRefusedEver, sealRejectedEver >>
+                    admissions, recGen, wedgeGen, wedgeOp, acked, durable, staleRefusedEver, sealRejectedEver >>
 
 \* Install(a): the recovery result RETURNS FROM I/O and is published. §9 r9-5 puts the generation
 \* recheck exactly here -- "post-I/O, immediately before every install/unwedge/`_ckpt`
@@ -1153,7 +1187,7 @@ Install(a) ==
                     localLost, crashed, rejected, adoptObs, fencedEpochs, wedged, firstOwner,
                     reclaimed, remountedAfterFence, fenceUntil, obsToken, obsSince,
                     observedReclaimEver,
-                    admissions, wedgeGen, slot, acked, durable, staleRefusedEver, sealRejectedEver >>
+                    admissions, wedgeGen, wedgeOp, slot, acked, durable, staleRefusedEver, sealRejectedEver >>
 
 \* RecoveryRefused(a): the honest r9-5 outcome -- the post-I/O recheck finds the captured
 \* generation stale and the result is DISCARDED (nothing published). Also the layer's anti-dead-end
@@ -1171,7 +1205,7 @@ RecoveryRefused(a) ==
                     localLost, crashed, rejected, adoptObs, fencedEpochs, wedged, wrote, rootEmpty,
                     firstOwner, lostThenWrote, reclaimed, remountedAfterFence, fenceUntil,
                     obsToken, obsSince, observedReclaimEver, supersededThenWrote,
-                    admissions, wedgeGen, slot, acked, durable, sealRejectedEver >>
+                    admissions, wedgeGen, wedgeOp, slot, acked, durable, sealRejectedEver >>
 
 \* --- the wedged lane (INV-1's every-attempt rule) --------------------------------------------
 \* WedgeAdmit(a): an operation is admitted into `a`'s lane and its send comes back AMBIGUOUS, so
@@ -1189,6 +1223,7 @@ WedgeAdmit(a) ==
     /\ admissions < MaxAdmissions        \* state-space bound only -- see `MaxAdmissions`
     /\ admissions' = admissions + 1
     /\ wedgeGen' = [wedgeGen EXCEPT ![a] = localEpoch[a]]
+    /\ wedgeOp' = [wedgeOp EXCEPT ![a] = admissions + 1]   \* DISTINCT per admission -- see `wedgeOp`
     /\ UNCHANGED << owner, epoch, epochCeiling, epochWiped, mount, mtoken, clock, localEpoch,
                     localLost, crashed, rejected, adoptObs, fencedEpochs, wedged, wrote, rootEmpty,
                     firstOwner, lostThenWrote, reclaimed, remountedAfterFence, fenceUntil,
@@ -1213,13 +1248,14 @@ StragglerLands(a) ==
     /\ RecoveryGenOn
     /\ wedgeGen[a] # None
     /\ slot = None
-    /\ slot' = [by |-> a, gen |-> wedgeGen[a], seal |-> FALSE]
-    /\ durable' = durable \union {<< a, wedgeGen[a] >>}
+    /\ slot' = [by |-> a, gen |-> wedgeGen[a], op |-> wedgeOp[a], seal |-> FALSE]
+    /\ durable' = durable \union {<< a, wedgeGen[a], wedgeOp[a] >>}
     /\ UNCHANGED << owner, epoch, epochCeiling, epochWiped, mount, mtoken, clock, localEpoch,
                     localLost, crashed, rejected, adoptObs, fencedEpochs, wedged, wrote, rootEmpty,
                     firstOwner, lostThenWrote, reclaimed, remountedAfterFence, fenceUntil,
                     obsToken, obsSince, observedReclaimEver, supersededThenWrote,
-                    admissions, recGen, wedgeGen, acked, staleRefusedEver, sealRejectedEver >>
+                    admissions, recGen, wedgeGen, wedgeOp, acked, staleRefusedEver,
+                    sealRejectedEver >>
 
 \* WedgeRetryCreate(a): the lane's ONE bounded same-(key, bytes) conditional create (INV-1: "each
 \* later caller's flush performs at most one bounded same-(key, bytes) conditional create under
@@ -1244,10 +1280,11 @@ WedgeRetryCreate(a) ==
     /\ clock < fenceUntil
     /\ (SabWedgeRetryOldGen \/ GenerationCurrent(a, wedgeGen[a]))
     /\ slot = None
-    /\ slot' = [by |-> a, gen |-> wedgeGen[a], seal |-> FALSE]
-    /\ durable' = durable \union {<< a, wedgeGen[a] >>}
-    /\ acked' = acked \union {<< a, wedgeGen[a] >>}
+    /\ slot' = [by |-> a, gen |-> wedgeGen[a], op |-> wedgeOp[a], seal |-> FALSE]
+    /\ durable' = durable \union {<< a, wedgeGen[a], wedgeOp[a] >>}
+    /\ acked' = acked \union {<< a, wedgeGen[a], wedgeOp[a] >>}
     /\ wedgeGen' = [wedgeGen EXCEPT ![a] = None]
+    /\ wedgeOp' = [wedgeOp EXCEPT ![a] = None]
     /\ wrote' = wrote \union {<< a, wedgeGen[a] >>}
     /\ rootEmpty' = FALSE
     /\ lostThenWrote' = (lostThenWrote \/ localLost[a])
@@ -1280,15 +1317,25 @@ WedgeRetryCreate(a) ==
 \*
 \* `SabSlotNoByteCompare` merges branch 3 into branch 2: it acks without comparing. That is the
 \* acked-then-lost branch task 1 could not express (its writer has perfect knowledge of
-\* `writtenEver`), and `AckedOpsAreDurable` is what catches it. "Someone else" here is a DIFFERENT
-\* INCARNATION of the same uuid -- this module's established idiom for a second writer (see
-\* `CaCasMountCore_sab_epochwipelive.cfg`'s note on the actor-equals-uuid structure); the
-\* operation identity is `<< actor, generation >>`, so a different generation IS different bytes.
+\* `writtenEver`), and `AckedOpsAreDurable` is what catches it.
+\*
+\* "SOMEONE ELSE" IS BOTH KINDS OF OTHER, and getting that right took a review round (see `wedgeOp`).
+\* The operation identity is `<< actor, generation, op >>`:
+\*   - a different GENERATION is a different incarnation of this uuid -- this module's established
+\*     idiom for a second writer, since actors ARE uuids and only the sticky owner holds the slot
+\*     (the same substitution `CaCasMountCore_sab_epochwipelive.cfg` documents);
+\*   - a different OP at the SAME generation is INV-1's "each later caller's flush", which is
+\*     explicitly about multiple callers within ONE incarnation.
+\* The first cut had only the generation component, which ALIASED the second kind: `mine` came out
+\* TRUE for a second operation sitting on the first one's bytes, and the invariant could not see the
+\* resulting phantom ack because both operations shared one identity. That is now the shortest
+\* counterexample `_sab_slotnocompare.cfg` finds.
 WedgeRetryOccupied(a) ==
-    \* `slot # None` is repeated inside the LET (not merely conjoined below) for the same reason
-    \* `AdoptWrite`'s `selfCaused` does it: a record access guarded only by evaluation order is a
-    \* trap for the next editor who reorders the conjuncts.
-    LET mine == slot # None /\ slot.by = a /\ slot.gen = wedgeGen[a]
+    \* `slot # None` and `~slot.seal` are repeated inside the LET (not merely relied on via the
+    \* branch order below) for the same reason `AdoptWrite`'s `selfCaused` does it: a record access
+    \* guarded only by evaluation order is a trap for the next editor who reorders the conjuncts.
+    LET mine == /\ slot # None /\ ~slot.seal
+                /\ slot.by = a /\ slot.gen = wedgeGen[a] /\ slot.op = wedgeOp[a]
     IN
     /\ RecoveryGenOn
     /\ ~rejected[a] /\ ~wedged[a] /\ ~crashed[a]
@@ -1296,6 +1343,7 @@ WedgeRetryOccupied(a) ==
     /\ owner = a
     /\ slot # None
     /\ wedgeGen' = [wedgeGen EXCEPT ![a] = None]
+    /\ wedgeOp' = [wedgeOp EXCEPT ![a] = None]
     /\ IF slot.seal
        THEN \* The REJECTION is generation-independent (any seal at the key is conclusive). The
             \* WITNESS flag is not: it counts only a seal planted under a STRICTLY LATER
@@ -1308,7 +1356,7 @@ WedgeRetryOccupied(a) ==
             /\ UNCHANGED acked
        ELSE /\ UNCHANGED sealRejectedEver
             /\ IF mine \/ SabSlotNoByteCompare
-               THEN acked' = acked \union {<< a, wedgeGen[a] >>}
+               THEN acked' = acked \union {<< a, wedgeGen[a], wedgeOp[a] >>}
                ELSE UNCHANGED acked
     /\ UNCHANGED << owner, epoch, epochCeiling, epochWiped, mount, mtoken, clock, localEpoch,
                     localLost, crashed, rejected, adoptObs, fencedEpochs, wedged, wrote, rootEmpty,
@@ -1327,6 +1375,7 @@ WedgeAbandonStale(a) ==
     /\ wedgeGen[a] # None
     /\ ~GenerationCurrent(a, wedgeGen[a])
     /\ wedgeGen' = [wedgeGen EXCEPT ![a] = None]
+    /\ wedgeOp' = [wedgeOp EXCEPT ![a] = None]
     /\ staleRefusedEver' = TRUE
     /\ UNCHANGED << owner, epoch, epochCeiling, epochWiped, mount, mtoken, clock, localEpoch,
                     localLost, crashed, rejected, adoptObs, fencedEpochs, wedged, wrote, rootEmpty,
@@ -1400,12 +1449,14 @@ TypeOK ==
     /\ supersededThenWrote \in BOOLEAN
     /\ recGen \in [Actors -> (0..MaxEpoch) \union {None}]
     /\ wedgeGen \in [Actors -> (0..MaxEpoch) \union {None}]
+    /\ wedgeOp \in [Actors -> (1..MaxAdmissions) \union {None}]
     /\ \/ slot = None
        \/ /\ slot.by \in Actors
           /\ slot.gen \in 0..MaxEpoch
+          /\ slot.op \in (1..MaxAdmissions) \union {None}
           /\ slot.seal \in BOOLEAN
-    /\ acked \subseteq (Actors \X (0..MaxEpoch))
-    /\ durable \subseteq (Actors \X (0..MaxEpoch))
+    /\ acked \subseteq (Actors \X (0..MaxEpoch) \X (1..MaxAdmissions))
+    /\ durable \subseteq (Actors \X (0..MaxEpoch) \X (1..MaxAdmissions))
     /\ admissions \in 0..MaxAdmissions
     /\ staleRefusedEver \in BOOLEAN
     /\ sealRejectedEver \in BOOLEAN
@@ -1470,6 +1521,19 @@ SupersededWriterMakesNoMutation ==
 \* lands after global truth already superseded it. Round 8: this is now THE regression
 \* guard for reclaim-body faithfulness -- `_rev6_observe.cfg`'s GREEN under this invariant
 \* (with `ObservedReclaim` enabled) supersedes the retired `_sab_supersededwrites` canary.
+\*
+\* 2026-07-28 v9 -- THE AUTHORITATIVE READING IS NOW PER-OPERATION, NOT PER-ACTOR (review fix round
+\* 1, Minor 4). The paragraph above describes `Write`'s booking site, which compares `epoch` against
+\* the writer's own `localEpoch[a]`. The two v9 booking sites compare it against the CAPTURED
+\* generation of the mutation being published -- `epoch > recGen[a]` in `Install` and
+\* `epoch > wedgeGen[a]` in `WedgeRetryCreate` -- because a recovery result and a wedged lane's
+\* bytes belong to the incarnation that ADMITTED them, not to whatever incarnation the process is
+\* running now. In both new sabotage counterexamples `localEpoch[A] = epoch` at the violating step,
+\* so the ACTOR is not superseded under the older per-actor reading; only the OPERATION is. Read the
+\* invariant as: "no mutation is ever published under a generation the durable counter has already
+\* passed", of which `Write`'s per-actor form is the special case where the mutation's generation is
+\* the writer's current one. The extension only ADDS ways to set the flag, so no pre-existing green
+\* is weakened by it -- `_stage1` and `_rev6_observe` keep the layer off entirely.
 GlobalSupersededWriterMakesNoMutation ==
     ~supersededThenWrote
 
@@ -1497,8 +1561,17 @@ NoPermanentWedge ==
 \* write the caller was told had failed becoming durable. The dangerous direction, a writer that
 \* sees `Occupied` at its key, SKIPS the byte comparison and acks its own operation while someone
 \* else's bytes are there, needs a WRITER-LOCAL view of the frontier; that is what the
-\* `wedgeGen` + `slot` pair provides. `SabSlotNoByteCompare` must violate this, and the honest
-\* configs must not.
+\* `wedgeGen` + `wedgeOp` + `slot` triple provides. `SabSlotNoByteCompare` must violate this, and
+\* the honest configs must not.
+\*
+\* THE GRANULARITY IS LOAD-BEARING and was wrong in the first cut (review fix round 1, Important 1):
+\* with the operation identified by `<< actor, generation >>` alone, two operations admitted at the
+\* same generation shared one identity, so the honest configuration could ack a SECOND operation on
+\* the FIRST one's bytes and this invariant stayed green -- the union was a no-op on a set that
+\* already contained the shared identity. The op id (`wedgeOp`, from the monotone `admissions`
+\* counter) is what makes the same-generation half of the compare -- INV-1's "each later caller's
+\* flush", i.e. multiple callers within ONE incarnation -- visible at all. Non-vacuity of `acked`
+\* itself in the green gate is pinned by `_witness_ackhappened.cfg`, not left to the coverage table.
 AckedOpsAreDurable ==
     acked \subseteq durable
 
@@ -1559,4 +1632,35 @@ W_GenerationRefused ==
 \* two recoverers racing. Tightened, and the trace is now the cross-generation one.
 W_SealRejectedRetry ==
     ~sealRejectedEver
+
+\* 2026-07-28 v9 fix round 1 (review Minor 5): an operation is ever ACKED at all in the honest
+\* configuration. `AckedOpsAreDurable` is an inclusion, so it is trivially true while `acked` is
+\* empty; before this witness existed, "the green gate actually acks something" rested only on the
+\* `-coverage 1` table's `WedgeRetryCreate` row. The other two new properties each got a dedicated
+\* witness, so this one should not be the exception -- one cheap config closes it.
+W_AckHappened ==
+    acked = {}
+
+----------------------------------------------------------------------------
+\* STATE CONSTRAINTS (referenced from cfgs via `CONSTRAINT`, never from `Next`).
+
+\* 2026-07-28 v9 fix round 1 (review recommendation): prune the model's PRE-EXISTING epoch-0
+\* bootstrap mount. `ClaimMount` permits `mount = None /\ localEpoch[a] >= epoch` at genesis, so a
+\* mount can exist at generation 0 before any `AllocEpoch` ever ran -- whereas the product's STRICT
+\* ORDER (`CasStore.cpp:312-316`: claim owner -> allocate the durable writer_epoch -> claim the mount
+\* lease) allocates the epoch FIRST and therefore never reaches that state.
+\*
+\* This matters for how much this round's reds mean, not merely for tidiness: BFS finds the
+\* generation 0 -> 1 transition first, so the shortest counterexample of every v9 sabotage runs
+\* through a mount the product cannot have. The `_strictorder` cfgs re-run each sabotage under this
+\* constraint, forcing an `AllocEpoch`-first mount and a 1 -> 2 transition. All three stay RED
+\* against the same invariant, which is what establishes that they are about a generation TRANSITION
+\* rather than about the bootstrap value. Round 1 verified this in an uncommitted scratch tree; the
+\* review's point was that unverifiable prose is not evidence, so the constraint now lives here.
+\*
+\* `Init` satisfies it (`mount = None`), and it is a STATE constraint, not a protocol rule: TLC
+\* prunes the states it excludes rather than forbidding the transitions, so it can only remove
+\* counterexamples, never invent one.
+StrictOrderMount ==
+    mount = None \/ mount.epoch > 0
 =============================================================================

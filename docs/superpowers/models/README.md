@@ -309,13 +309,21 @@ ordered scan and cleanup deletes only what it observed durable. The migration is
   ever wrote (`_sab_slotnocompare` → the one new invariant, `AckedOpsAreDurable`). It also carries
   two hand-offs from `CaRefTableSnapshotLogCore`, which is structurally unable to express either:
   that acked-then-lost direction, and INV-2's "`Occupied` with an `EpochSeal` terminates the walk"
-  branch reached by a *concurrent* recoverer (`_witness_sealrejected`).
+  branch reached by a *concurrent* recoverer (`_witness_sealrejected`). An operation's identity is
+  `(actor, generation, op)` — the op component is load-bearing and was added in a review fix round:
+  without it two operations admitted at the same generation aliased, and the honest configuration
+  could ack the second on the first one's bytes with the invariant unable to see it, so the compare
+  only ever proved its *generation* half. The three `_sab_*_strictorder` variants re-run each
+  sabotage under a state constraint pruning the model's pre-existing epoch-0 bootstrap mount (a state
+  the product's strict order never reaches), which is what shows these reds are about a generation
+  *transition* rather than about the bootstrap value.
   Configs: `_stage1` (legacy green gate), `_v9_recoverygen` (the v9 green gate), `_rev6_observe`
   (drift-aware, known not to complete in an interactive budget — pre-existing, `SLOW=1`),
   `_sab_adoptwedge`, `_sab_epochreset`, `_sab_fenceresurrect`, `_sab_foreigntakeover`,
   `_sab_wallclockreclaim`, `_sab_epochwipelive`, `_sab_decomblindbypass`, `_sab_staleinstall`,
-  `_sab_wedgeretryoldgen`, `_sab_slotnocompare`, and six `_witness_*` reachability checks. Run
-  evidence, state counts and traces: `CaCasMountCore_RESULTS.md`.
+  `_sab_wedgeretryoldgen`, `_sab_slotnocompare`, their three `_strictorder` variants, and seven
+  `_witness_*` reachability checks. Run evidence, state counts and traces:
+  `CaCasMountCore_RESULTS.md`.
 
 ### rev.7/rev.8 disk lifecycle: FORGET protocol (+ the excised erasure proof) {#group-rev7-lifecycle}
 

@@ -432,6 +432,11 @@ runner therefore pins `-workers 1`.)
 
 ### Counterexample traces {#v9-traces}
 
+> **SUPERSEDED, 2026-07-28 fix round 1.** These traces are pre-fix. The operation-identity fix
+> changes the shortest counterexample of `_sab_slotnocompare` outright (depth 12 -> depth 7, and
+> from the cross-generation case to the same-generation one). Current traces: `{#fix1-traces}`.
+
+
 **`_sab_staleinstall` — depth 10.** `A` claims the root and mounts; the clock reaches the deadline;
 `RecoveryStart` captures `recGen[A] = 0`; `ClearExpiredMount` retires the record; `AllocEpoch` mints
 generation 1 (`epoch = 1`, `localEpoch[A] = 1`); `ClaimMount` re-arms with a FRESH
@@ -517,27 +522,18 @@ property that carries the evidence.
 
 ### The new configs — full battery {#v9-battery}
 
-`bash docs/superpowers/models/run_mount.sh`, `-workers 1`, uncontended. The six new configs, with
-`_stage1` repeated for comparison:
-
-| cfg | exit | colour | invariant / witness reported | generated | distinct | s |
-|---|---|---|---|---|---|---|
-| `sab_staleinstall` (NEW) | 12 | RED (target) | `GlobalSupersededWriterMakesNoMutation` | 206,083 | 65,968 | 3 |
-| `sab_wedgeretryoldgen` (NEW) | 12 | RED (target) | `GlobalSupersededWriterMakesNoMutation` | 204,854 | 66,055 | 2 |
-| `sab_slotnocompare` (NEW) | 12 | RED (target) | `AckedOpsAreDurable` | 1,560,369 | 470,659 | 4 |
-| `v9_recoverygen` (NEW) | 0 | **GREEN** | — (all 7 listed invariants hold) | 50,885,769 | 9,762,979 | 152 |
-| `witness_genrefused` (NEW) | 12 | RED (reachable, as intended) | `W_GenerationRefused` | 63,755 | 22,377 | 1 |
-| `witness_sealrejected` (NEW) | 12 | RED (reachable, as intended) | `W_SealRejectedRetry` | 1,538,207 | 463,567 | 3 |
-| `stage1` (legacy gate) | 0 | GREEN | — | 51,231,925 | 10,616,665 | 146 |
-
-`v9_recoverygen` reports **0 states left on queue** — exhaustive, not truncated. Note the two greens
-cost almost exactly the same wall time (152 s vs 146 s) at their respective bounds, which is the
-practical point of `_stage1` keeping the layer off: the suite did not get slower for anyone.
-
-The three sabotage counts are abort-run numbers and are reproducible only because the runner pins
-`-workers 1`; see the `-workers` note in `run_mount.sh`'s header.
+> **SUPERSEDED, 2026-07-28 fix round 1.** The table this section originally carried was transcribed
+> from a pre-final revision of the model and did not match the committed one — caught by review. Both
+> the numbers and the model have since changed (the operation-identity fix below alters the reachable
+> state set of every layer-on config), so the authoritative battery table is
+> `{#fix1-battery}`. Nothing here was re-transcribed in place, because the configs it described no
+> longer exist in that form; the lesson is recorded at `{#fix1-numbers}`.
 
 ### `MaxAdmissions` is not doing the work {#v9-admissions-not-load-bearing}
+
+> **SUPERSEDED, 2026-07-28 fix round 1** — numbers are pre-fix; the claim is re-established with
+> current ones at `{#fix1-admissions}`.
+
 
 `ADMISSIONS=5 bash run_mount.sh` re-runs the whole suite with the bound raised. The green gate stays
 **GREEN and exhaustive** at 5, at roughly twice the cost:
@@ -554,6 +550,10 @@ not change the answer. The whole suite was re-run this way — `ADMISSIONS=5 bas
 reachable — so no config's colour depends on the bound's value.
 
 ### Per-action coverage — the green gate is not vacuous {#v9-coverage}
+
+> **SUPERSEDED, 2026-07-28 fix round 1** — counts are pre-fix; current ones at `{#fix1-coverage}`.
+> Fix round 1 also keeps the `-coverage 1` log as an artifact, which this round did not.
+
 
 `COVERAGE=1 bash run_mount.sh` re-runs `_v9_recoverygen` under `-coverage 1`. All nine new actions
 fire, with the distinct-states : transitions counts below. This is the machine-checked answer to
@@ -592,6 +592,9 @@ no verdict can no longer masquerade as a green one, because the runner now names
 
 ### Verdict {#v9-verdict}
 
+> **Round-1 verdict, superseded by `{#fix1-verdict}`** (same colour, different numbers and two
+> more properties). The two caveats at the end of this section still stand verbatim.
+
 **GREEN** — the gate this task exists to produce. `bash run_mount.sh` → **18/18 expectations met**.
 The three new sabotages are each red against their named target, the two new witnesses are each
 reachable, the new green gate is exhaustive over seven invariants, all twelve pre-existing configs
@@ -608,3 +611,223 @@ Two things this gate does NOT establish, stated so the plan does not over-claim 
 - **The catalog-token half of the zombie install stays with `CaRefCatalogCore`.** This module owns
   the generation credential's lifecycle; the install must present BOTH that and the catalog
   token-CAS, and only the first is proven here.
+
+## 2026-07-28 — fix round 1 (review of the v9 recovery-generation layer) {#fix-round-1}
+
+Review: `.superpowers/sdd/2026-07-28-cas-ref-chain-tla-phase/task-5-review.md`. Verdict was
+**Spec ✅ / Quality needs-fixes**: two Important items and five minor ones. Everything below is the
+result of addressing them. The colours of the round did not change; one of them now means
+considerably more than it did.
+
+### Important 1 — the operation identity aliased distinct same-generation operations {#fix1-identity}
+
+The round-1 model identified an operation by `<< actor, generation >>`. `WedgeAdmit` is re-enabled the
+moment a lane resolves, so a **second, distinct** operation admitted at the **same** generation got the
+**same** identity as the first. The reviewer found this reachable in the HONEST configuration at
+depth 6 — `ClaimOwnerEmpty -> ClaimMount -> WedgeAdmit -> WedgeRetryCreate -> WedgeAdmit` leaves
+`slot = [by |-> A, gen |-> 0, ...]` with `wedgeGen[A] = 0`, so `WedgeRetryOccupied`'s `mine` is TRUE
+and the second operation is acked on the strength of the first one's bytes. That is precisely the
+acked-then-lost damage `_sab_slotnocompare` exists to catch, and `AckedOpsAreDurable` was
+**structurally unable to see it**: both operations collapsed to one identity already in `durable`, so
+the union was a no-op and `acked` did not even grow.
+
+Consequence, stated plainly because it changes what the gate licensed: the compare the round proved
+load-bearing was only its **generation** half. The same-generation half — INV-1's "each later
+caller's flush performs at most one bounded same-`(key, bytes)` conditional create", which is
+explicitly about multiple callers **within one incarnation** — was not modelled at all.
+Round 1's report concern 3 also got the direction wrong: it called the single-key bound "safe in
+direction (no ack, no phantom)", whereas the aliasing **hides** an ack rather than suppressing one.
+
+**Fix (the reviewer's preferred option, and the honest one):** a distinct operation id. New variable
+`wedgeOp` — `[Actors -> (1..MaxAdmissions) \cup {None}]`, drawn from the already-monotone `admissions`
+counter at `WedgeAdmit`, so every operation admitted in a behaviour has a distinct id. `slot` gains an
+`op` field (`None` for a seal, which is not an operation); `acked` and `durable` become sets of
+`<< actor, generation, op >>`; `mine` compares all three (and now also carries `~slot.seal`
+explicitly rather than relying on branch order). The invariant itself is untouched — the fix makes the
+model able to express the damage, it does not weaken what is asserted.
+
+**Result:** the honest configuration stays GREEN and no longer acks a phantom on that trace, and
+`_sab_slotnocompare`'s shortest counterexample becomes the SAME-GENERATION case at **depth 7** —
+shorter than the cross-generation one it used to find at depth 12, i.e. the newly-modelled half is
+now the primary evidence:
+
+```
+ClaimOwnerEmpty -> ClaimMount -> WedgeAdmit -> WedgeRetryCreate -> WedgeAdmit -> WedgeRetryOccupied
+  final state: slot    = [by |-> A, gen |-> 0, op |-> 1, seal |-> FALSE]
+               durable = {<<A, 0, 1>>}
+               acked   = {<<A, 0, 1>>, <<A, 0, 2>>}      <- op 2 acked, nothing ever wrote it
+```
+
+Cost: the green gate goes from 9,762,979 to 15,658,147 distinct states (152 s to 247 s) — the price of
+a third identity component, paid once.
+
+### Important 2 — five stale RED rows, and the process failure behind them {#fix1-numbers}
+
+The round-1 `{#v9-battery}` table's five RED rows did not match the committed model. The reviewer
+reproduced all five independently and my own post-commit runner logs agreed with the reviewer, not
+with the table: the numbers had been transcribed from a pre-final revision (before the
+`slot.gen > wedgeGen[a]` tightening, which changes when `sealRejectedEver` is set and therefore the
+reachable state set of *every* layer-on config) and never refreshed after the last model edit. In a
+file whose own text calls those counts "reproducible", that is a defect and not a typo.
+
+Both the model and the numbers have moved again in this round, so the round-1 table is marked
+SUPERSEDED rather than patched, and `{#fix1-battery}` below is the authoritative one. The durable
+lesson, recorded because it is the kind of thing that recurs: **a results table must be transcribed
+from the log of a run made after the final model edit, never from an earlier run or from memory** —
+and the cheapest enforcement is to write the table only from a fresh full-suite log, which is what
+was done here.
+
+### Minor items {#fix1-minors}
+
+- **Minor 3 (depth inconsistencies).** Resolved by construction: every depth in this section is read
+  off the fresh logs of the run recorded at `{#fix1-battery}`, and the pre-fix prose that disagreed
+  with itself is superseded.
+- **Minor 4 (`GlobalSupersededWriterMakesNoMutation`'s stale comment).** The invariant's own comment
+  described it purely per-actor (`epoch > localEpoch[a]`, `Write`'s booking site) while the two v9
+  booking sites compare against the mutation's CAPTURED generation. Since in both new counterexamples
+  `localEpoch[A] = epoch` at the violating step, the actor is not superseded under the old reading —
+  only the operation is. The comment now states the authoritative per-operation reading and notes that
+  the extension only adds ways to set the flag, so no pre-existing green is weakened.
+- **Minor 5 (`AckedOpsAreDurable` non-vacuity).** `AckedOpsAreDurable` is a set inclusion and is
+  trivially true while `acked` is empty; its non-vacuity rested only on the coverage table, while the
+  round's other two new properties each had a dedicated witness. Added
+  `CaCasMountCore_witness_ackhappened.cfg` → `W_AckHappened == acked = {}`, reachable at depth 5
+  (`ClaimOwnerEmpty -> ClaimMount -> WedgeAdmit -> WedgeRetryCreate`).
+- **Minor 6 (one-directional `incomplete` expectation).** `run_mount.sh` would have reported FAIL if
+  `rev6_observe` ever improved to green under `SLOW=1`. It now accepts a green for an `incomplete`
+  expectation and prints `green (now completes: tighten the expectation)`, so an improvement reads as
+  an improvement.
+- **Minor 7 (commit subject).** Round 1's subject added `/ byte-compare sabotages` to the prescribed
+  text, to name the third sabotage. Recorded for the audit trail; not changed.
+
+### The strict-order constraint is now a committed config, not prose {#fix1-strictorder}
+
+Round 1 checked, in an uncommitted scratch tree, that its counterexamples survive without the model's
+pre-existing epoch-0 bootstrap mount. The review's objection was exact: unverifiable prose is not
+evidence, and this is the one claim that materially affects how much the reds mean — `ClaimMount`
+permits a mount at generation 0 before any `AllocEpoch`, whereas the product's STRICT ORDER
+(`CasStore.cpp:312-316`) allocates the durable writer epoch first and never reaches that state, and
+BFS finds the generation 0 -> 1 transition first in every v9 sabotage.
+
+The constraint now lives in the module as `StrictOrderMount == mount = None \/ mount.epoch > 0`, with
+three configs referencing it via `CONSTRAINT`. All three stay RED against the same invariant, on an
+`AllocEpoch`-first mount and a 1 -> 2 transition — one step deeper, same shape, same target:
+
+| cfg | target | depth | trace |
+|---|---|---|---|
+| `sab_staleinstall_strictorder` | `GlobalSupersededWriterMakesNoMutation` | 11 | `ClaimOwnerEmpty -> AllocEpoch -> ClaimMount -> Tick -> Tick -> RecoveryStart -> ClearExpiredMount -> AllocEpoch -> ClaimMount -> Install` |
+| `sab_wedgeretryoldgen_strictorder` | `GlobalSupersededWriterMakesNoMutation` | 11 | same with `WedgeAdmit` / `WedgeRetryCreate` in place of `RecoveryStart` / `Install` |
+| `sab_slotnocompare_strictorder` | `AckedOpsAreDurable` | 8 | `ClaimOwnerEmpty -> AllocEpoch -> ClaimMount -> WedgeAdmit -> WedgeRetryCreate -> WedgeAdmit -> WedgeRetryOccupied` |
+
+So the three reds are about a generation TRANSITION, not about the bootstrap value — now
+reproducible from the repository rather than asserted.
+
+### Authoritative battery — fix round 1 {#fix1-battery}
+
+`bash docs/superpowers/models/run_mount.sh` → **22/22 expectations met**, `rc=0`. Every number below
+is transcribed from the log of THAT run (`tmp/tlc_CaCasMountCore_<name>.log`), which is the whole
+point of `{#fix1-numbers}`. `-workers 1`, so the abort-run counts are reproducible.
+
+| cfg | colour | invariant / witness reported | depth | generated | distinct | queue | s |
+|---|---|---|---|---|---|---|---|
+| `sab_epochreset` | RED | `WriterEpochMonotoneUnique` | — | 539 | 321 | — | 1 |
+| `sab_foreigntakeover` | RED | `ForeignUuidNeverAutoTakesOver` | — | 585 | 339 | — | 0 |
+| `sab_adoptwedge` | RED | `NoPermanentWedge` | — | 669 | 372 | — | 1 |
+| `sab_fenceresurrect` | RED | `FenceCostsEpoch` | — | 2,551 | 1,088 | — | 1 |
+| `sab_wallclockreclaim` | RED | `GlobalSupersededWriterMakesNoMutation` | — | 111,240 | 24,905 | — | 1 |
+| `sab_epochwipelive` | RED | `SupersededWriterMakesNoMutation` | — | 21,920 | 8,606 | — | 1 |
+| `sab_decomblindbypass` | RED | `FenceCostsEpoch` | — | 1,755,204 | 528,248 | — | 6 |
+| `sab_staleinstall` | RED | `GlobalSupersededWriterMakesNoMutation` | 10 | 183,007 | 54,878 | 34,670 | 1 |
+| `sab_wedgeretryoldgen` | RED | `GlobalSupersededWriterMakesNoMutation` | 10 | 181,242 | 54,956 | 34,720 | 1 |
+| `sab_slotnocompare` | RED | `AckedOpsAreDurable` | **7** | 5,300 | 2,276 | 1,682 | 1 |
+| `sab_staleinstall_strictorder` (NEW) | RED | `GlobalSupersededWriterMakesNoMutation` | 11 | 219,350 | 63,123 | 39,811 | 1 |
+| `sab_wedgeretryoldgen_strictorder` (NEW) | RED | `GlobalSupersededWriterMakesNoMutation` | 11 | 217,299 | 63,188 | 39,850 | 2 |
+| `sab_slotnocompare_strictorder` (NEW) | RED | `AckedOpsAreDurable` | 8 | 6,520 | 2,660 | 1,965 | 1 |
+| `stage1` | **GREEN** | — | — | 51,231,925 | 10,616,665 | **0** | 140 |
+| `v9_recoverygen` | **GREEN** | — (all 7 listed invariants hold) | — | 82,299,033 | 15,658,147 | **0** | 253 |
+| `witness_reclaim` | RED (reachable) | `W_SameUuidReclaimsExpired` | — | 584 | 338 | — | 1 |
+| `witness_remountafterfence` | RED (reachable) | `W_RemountAfterFence` | — | 7,749 | 3,266 | — | 1 |
+| `witness_observedreclaim` | RED (reachable) | `W_ObservedReclaim` | — | 287,089 | 59,375 | — | 1 |
+| `witness_recoveryafterobservedreclaim` | RED (reachable) | `W_RecoveryAfterObservedReclaim` | — | 78,998,500 | 12,981,026 | — | 171 |
+| `witness_genrefused` | RED (reachable) | `W_GenerationRefused` | 9 | 59,473 | 20,209 | 13,632 | 1 |
+| `witness_sealrejected` | RED (reachable) | `W_SealRejectedRetry` | 12 | 1,082,395 | 295,419 | 161,651 | 5 |
+| `witness_ackhappened` (NEW) | RED (reachable) | `W_AckHappened` | 5 | 213 | 140 | 105 | 0 |
+
+Both greens report **0 states left on queue** — exhaustive, not truncated. The twelve pre-existing
+configs still carry byte-identical counts to the 2026-07-24 baseline and to round 1's before/after
+comparison at `{#cost-neutrality}`, which is the `RecoveryGenOn = FALSE` freeze holding across a
+second round of layer changes — including one that added a variable and widened two set types.
+
+The layer-on numbers all moved relative to round 1, in both directions, and both directions have the
+same cause: the op-identity component enlarges `acked`/`durable` (so the green grows, 9.76 M → 15.66 M
+distinct) while making the byte-compare violation reachable much sooner (so `_sab_slotnocompare`
+shrinks, 470,659 → 2,276 distinct at depth 7 instead of 12).
+
+### Traces — fix round 1 {#fix1-traces}
+
+Only `_sab_slotnocompare` changed shape; the others are the round-1 traces, re-read from the fresh
+logs. Full narration of the unchanged ones is at `{#v9-traces}` (superseded only for its numbers and
+for this one trace).
+
+| cfg | depth | trace |
+|---|---|---|
+| `sab_staleinstall` | 10 | `ClaimOwnerEmpty -> ClaimMount -> Tick -> Tick -> RecoveryStart -> ClearExpiredMount -> AllocEpoch -> ClaimMount -> Install` |
+| `sab_wedgeretryoldgen` | 10 | same with `WedgeAdmit` / `WedgeRetryCreate` for `RecoveryStart` / `Install` |
+| `sab_slotnocompare` | **7** | `ClaimOwnerEmpty -> ClaimMount -> WedgeAdmit -> WedgeRetryCreate -> WedgeAdmit -> WedgeRetryOccupied` — the SAME-GENERATION case (see `{#fix1-identity}`) |
+| `witness_genrefused` | 9 | `ClaimOwnerEmpty -> ClaimMount -> Tick -> Tick -> RecoveryStart -> ClearExpiredMount -> AllocEpoch -> RecoveryRefused` |
+| `witness_sealrejected` | 12 | `ClaimOwnerEmpty -> ClaimMount -> Tick -> Tick -> WedgeAdmit -> ClearExpiredMount -> AllocEpoch -> ClaimMount -> RecoveryStart -> SealSlot -> WedgeRetryOccupied` |
+| `witness_ackhappened` (NEW) | 5 | `ClaimOwnerEmpty -> ClaimMount -> WedgeAdmit -> WedgeRetryCreate` |
+
+The three `_strictorder` traces are in `{#fix1-strictorder}`.
+
+### `MaxAdmissions` still is not doing the work — fix round 1 {#fix1-admissions}
+
+The op id is drawn from the `admissions` counter, so raising `MaxAdmissions` now widens the op-id
+range as well as the admission count — a strictly harsher test of the bound than round 1's was, and a
+much more expensive one. It still holds:
+
+| run | outcome | generated | distinct | queue |
+|---|---|---|---|---|
+| `_v9_recoverygen`, `MaxAdmissions = 3` (default) | GREEN, exhaustive | 82,299,033 | 15,658,147 | 0 |
+| `_v9_recoverygen`, `MaxAdmissions = 5` | GREEN, exhaustive | 231,519,697 | 43,330,107 | 0 |
+
+`ADMISSIONS=5 bash run_mount.sh` re-runs the whole suite at the higher bound: every sabotage red
+against the same target, every witness still reachable, both greens still green. So no config's
+colour depends on the bound's value — the bound buys a verdict, not an answer.
+
+### Per-action coverage — fix round 1 {#fix1-coverage}
+
+`COVERAGE=1 bash run_mount.sh` (log kept this round at `tmp/f1_cov_v9.log`, which round 1 did not do —
+review "cannot verify" item 3). The coverage run reproduces the gate exactly: 82,299,033 / 15,658,147,
+0 left on queue. Counts are `distinct states : transitions` from the final statistics block.
+
+| action | states | transitions |
+|---|---|---|
+| `RecoveryStart` | 743,768 | 1,215,904 |
+| `SealSlot` | 208,176 | 406,904 |
+| `Install` | 546,752 | 1,994,968 |
+| `RecoveryRefused` | 1,124,864 | 3,089,480 |
+| `WedgeAdmit` | 1,152,936 | 1,152,936 |
+| `StragglerLands` | 2,169,464 | 2,169,464 |
+| `WedgeRetryCreate` | 304,344 | 447,536 |
+| `WedgeRetryOccupied` | 921,336 | 3,394,688 |
+| `WedgeAbandonStale` | 1,178,376 | 3,836,568 |
+
+All nine new actions fire, and both generation-recheck sites (`RecoveryRefused`, `WedgeAbandonStale`)
+do — the specific thing coverage is needed for, since `W_GenerationRefused` is driven by one flag set
+at both. `SabResetEpoch` and `WallClockReclaim` report `0:0`, correctly disabled by their FALSE flags,
+which is the sanity check in the other direction. Non-vacuity of `acked` no longer relies on this
+table at all: `_witness_ackhappened.cfg` pins it directly (review Minor 5).
+
+### Verdict — fix round 1 {#fix1-verdict}
+
+**GREEN.** `bash run_mount.sh` → **22/22 expectations met** (19 pre-existing rows plus the three
+`_strictorder` sabotages and `_witness_ackhappened`; `_rev6_observe` remains behind `SLOW=1`). Both
+Important findings are addressed at the mechanism, not in prose: the operation identity now
+distinguishes same-generation operations, so the byte compare is proven load-bearing in **both** its
+halves and the shortest counterexample is the half that was previously invisible; and every number in
+this section is transcribed from the logs of the single full-suite run that produced the verdict.
+
+The two caveats round 1 recorded at `{#v9-verdict}` are unchanged and still limit what the gate
+licenses: the `_ckpt` CAS is not one of the sites modelled here, and the catalog-token half of the
+zombie install stays with `CaRefCatalogCore`.

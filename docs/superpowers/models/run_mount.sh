@@ -53,6 +53,14 @@
 #                                                        own operation while someone ELSE's bytes
 #                                                        are at the key (acked-then-lost)
 #
+#   The three `*_strictorder` rows re-run the three sabotages above under the `StrictOrderMount`
+#   state constraint, which prunes the model's pre-existing epoch-0 bootstrap mount (a state the
+#   product's STRICT ORDER never reaches, `CasStore.cpp:312-316`). BFS finds the generation 0 -> 1
+#   transition first, so without the constraint every shortest counterexample runs through that
+#   mount; under it each sabotage must stay RED on an `AllocEpoch`-first mount. Same target
+#   invariant, same bounds -- what changes is only which counterexample is shortest, which is the
+#   point: these reds are about a generation TRANSITION, not about the bootstrap value.
+#
 # The first two v9 sabotages target the SAME pre-existing invariant, deliberately: an old-generation
 # publication IS a mutation by a superseded incarnation, which is what that invariant already says,
 # and inventing a parallel property per sabotage is how a suite ends up with six near-duplicates.
@@ -76,6 +84,9 @@
 #   witness_sealrejected                -> W_SealRejectedRetry   an old generation's lane really
 #                                          meets a SUCCESSOR's EpochSeal and is conclusively
 #                                          rejected -- plan task 1's concurrent-recoverer hand-off
+#   witness_ackhappened                 -> W_AckHappened        an operation is ever acked at all,
+#                                          so `AckedOpsAreDurable` (a set inclusion, trivially true
+#                                          on an empty `acked`) is not vacuous in the green gate
 #
 # NOT in the default suite: CaCasMountCore_rev6_observe.cfg. It does not complete in an interactive
 # budget and that is PRE-EXISTING, confirmed against the pre-2026-07-24 committed model (Drift = 2
@@ -123,6 +134,9 @@ CONFIGS=(
   "sab_staleinstall                      violation  GlobalSupersededWriterMakesNoMutation"
   "sab_wedgeretryoldgen                  violation  GlobalSupersededWriterMakesNoMutation"
   "sab_slotnocompare                     violation  AckedOpsAreDurable"
+  "sab_staleinstall_strictorder          violation  GlobalSupersededWriterMakesNoMutation"
+  "sab_wedgeretryoldgen_strictorder      violation  GlobalSupersededWriterMakesNoMutation"
+  "sab_slotnocompare_strictorder         violation  AckedOpsAreDurable"
   "stage1                                green      -"
   "v9_recoverygen                        green      -"
   "witness_reclaim                       violation  W_SameUuidReclaimsExpired"
@@ -131,6 +145,7 @@ CONFIGS=(
   "witness_recoveryafterobservedreclaim  violation  W_RecoveryAfterObservedReclaim"
   "witness_genrefused                    violation  W_GenerationRefused"
   "witness_sealrejected                  violation  W_SealRejectedRetry"
+  "witness_ackhappened                   violation  W_AckHappened"
 )
 [[ "${SLOW:-0}" == "1" ]] && CONFIGS+=("rev6_observe  incomplete  -")
 
@@ -171,7 +186,12 @@ for row in "${CONFIGS[@]}"; do
   case "$expect" in
     green)      [[ "$result" == "green" ]] && verdict="PASS" ;;
     violation)  [[ "$result" == "violation:${want}" ]] && verdict="PASS" ;;
-    incomplete) [[ "$result" == "incomplete" ]] && verdict="KNOWN" ;;
+    incomplete)
+      # A config expected not to finish must not read as a REGRESSION if it starts finishing --
+      # accept a green (loudly, so the expectation gets tightened) as well as the expected timeout.
+      [[ "$result" == "incomplete" ]] && verdict="KNOWN"
+      [[ "$result" == "green" ]] && { verdict="KNOWN"; result="green (now completes: tighten the expectation)"; }
+      ;;
   esac
   [[ "$verdict" == "FAIL" ]] && overall=1
 
