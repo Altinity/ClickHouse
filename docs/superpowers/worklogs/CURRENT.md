@@ -1500,3 +1500,7 @@ lane G reviewer reading. No push.
 rulings issued (mount-wide I5 approved; new non-fencing abandon-guard scenario ordered;
 LOGICAL_ERROR->CORRUPTED_DATA approved). Reviewer held for the follow-up commit. Lane G
 review in flight. No push.
+
+**2026-07-28 21:0x local** — lane G review: approved w/ 2 Important (seal-kind check at crossing;
+soak B1 detector killed by rename) — fix round dispatched. Lane L: follow-up commit awaited
+(rulings + self-review). No push.
