@@ -1581,3 +1581,6 @@ T5 (_ckpt) dispatched to impl-a5 on lane L. T8 re-review-2 running on lane G. No
 
 **2026-07-28 22:40 local watchdog** — T5 in design/reading after the sealer-site ruling (no files
 yet, normal); T8 final polish editing (no commit yet). Both within latency. No push.
+
+**2026-07-28 23:0x local** — T8 combined end-state (r2-on-1b, refuse-on-above semantics) in
+final verification. T5 designing on lane L. No push.
