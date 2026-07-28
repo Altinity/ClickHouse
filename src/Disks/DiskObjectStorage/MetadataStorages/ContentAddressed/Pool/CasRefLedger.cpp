@@ -51,6 +51,9 @@ namespace ProfileEvents
     extern const Event CasRefAppendPreAttemptRefused;
     extern const Event CasRefAppendUnwedged;
     extern const Event CasRefAppendDefiniteFailure;
+    extern const Event CasRefAppendSealRejected;
+    extern const Event CasRefAppendOccupantUnreadable;
+    extern const Event CasRefWedgeFloorReconciled;
     extern const Event CasRefApplyPoisoned;
     extern const Event CasRefSweepDeferred;
     extern const Event CasRefSweepRearmed;
@@ -1424,6 +1427,7 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
     }
     if (result.kind == WedgeResolution::FloorReconciled)
     {
+        ProfileEvents::increment(ProfileEvents::CasRefWedgeFloorReconciled);
         LOG_WARNING(getLogger("CasPool"), "CAS ref-log append for namespace '{}': the wedged txn {}-{} is "
             "already recorded as durable-but-not-applied by this table's floor (its adoption install could "
             "not record it), so the wedge is retired without re-applying it. The table stays POISONED: its "
@@ -2415,6 +2419,13 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
             /// acknowledge a deposition we did not observe. The id is not consumed and nothing is
             /// recorded, so the next append re-derives the same id, meets the same conflict, and
             /// classifies again -- deferring costs one round trip and decides nothing wrongly.
+            ///
+            /// It must be COUNTED, because deferring is the one arm here that is quiet by construction:
+            /// the loud interference report is only reached once the occupant can be read, so a real
+            /// breach whose occupant keeps failing to read would otherwise show up as nothing but a
+            /// throttled log line under load. Sustained growth on this counter is the signal that the
+            /// loud path is being starved.
+            ProfileEvents::increment(ProfileEvents::CasRefAppendOccupantUnreadable);
             complete_error(chunk_survivors, makeCasWriteRetryLaterExceptionPtr(fmt::format(
                 "CAS ref-log append for namespace '{}': a DIFFERENT object occupies the id {}-{} this table "
                 "derived, and reading it to tell a successor's epoch seal from foreign interference did not "
@@ -2427,6 +2438,9 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
             /// Conclusive rejection, identical in meaning to the wedge site's: our bytes provably never
             /// landed and never can, the operation was never acknowledged, and the seal IS this
             /// namespace's epoch-closing record. No anomaly, no fence -- this is the protocol working.
+            /// Counted anyway: "the protocol working" here means THIS writer was deposed, and a lane that
+            /// keeps landing on this arm is a mount that has lost its lease and does not know it yet.
+            ProfileEvents::increment(ProfileEvents::CasRefAppendSealRejected);
             {
                 std::lock_guard lock(rt->state_mutex);
                 rt->last_epoch_seal = id;
@@ -2487,6 +2501,13 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
                     /// which is precisely what the floor and `Poisoned` are for: the floor keeps the
                     /// next id above the stranded one, and the marker keeps saying, correctly, that this
                     /// cache is missing a transaction.
+                    ///
+                    /// `LOGICAL_ERROR` here, where the wedge site's identical refusal reports the
+                    /// retry-later class, and the asymmetry is deliberate: THIS one is reachable only by
+                    /// a second writer inside one process -- a bug in this build, which a debug build
+                    /// should abort on and shout about. The wedge site's is reachable by an ordinary
+                    /// remount racing a slow resolution, which is a retryable fact about the world, not a
+                    /// bug. Same refusal, different provenance, so different loudness.
                     rt->state.noteDurableIdNotApplied(id);
                     poisonApplyState(*rt, ns, "commitRefChunk install");
                     complete_error(chunk_survivors, std::make_exception_ptr(Exception(ErrorCodes::LOGICAL_ERROR,
@@ -2622,11 +2643,15 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
             /// `putIfAbsentControlled` reports only when a pre-attempt gate -- the mount fence or the
             /// operation deadline -- rejected while `attempts_sent == 0`, i.e. strictly before the first
             /// `backend->putIfAbsent`. Nothing reached the network, so the key is provably unwritten:
-            /// there is nothing for a wedge to resolve, and wedging is not merely pointless but harmful.
-            /// A wedge over a key that was never written can NEVER clear -- `resolveByExactGet` reads the
-            /// key absent and reports `Unresolved` forever -- so it blocks every ref append for this table
-            /// on this replica, inserts included, until a remount. A transient fence blip in the
-            /// pre-attempt gate would cost the table its write availability.
+            /// there is nothing for a wedge to resolve, and wedging is pointless.
+            ///
+            /// It is no longer HARMFUL, and the difference is worth stating because the old comment here
+            /// rested on it: a wedge over a never-written key used to be unclearable, because resolution
+            /// was a bare read and a read can only ever report absent. The every-attempt rule replaced
+            /// that with a conditional CREATE, so such a wedge now clears on the next caller's flush by
+            /// landing the transaction. What remains is that this lane would be blocked until then for no
+            /// reason at all -- a transient fence blip in the pre-attempt gate would cost the table its
+            /// write availability, and buy nothing, since there is provably nothing to resolve.
             ///
             /// The counterexample this argument deliberately excludes: a fence lost or a deadline reached
             /// AFTER at least one attempt is `FenceLostMidWay`/`DeadlineMidWay`, and an attempt that

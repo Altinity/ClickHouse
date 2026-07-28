@@ -11,6 +11,7 @@
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
 #include <Common/MemoryTracker.h>
+#include <Common/ProfileEvents.h>
 
 #include <Poco/Exception.h>
 
@@ -44,6 +45,13 @@
 ///     so it becomes the `prev_epoch_seal` the next sequence-1 append carries. `nullopt` means
 ///     genesis, and means it exactly.
 /// ================================================================================================
+
+namespace ProfileEvents
+{
+extern const Event CasRefWedgeFloorReconciled;
+extern const Event CasRefAppendSealRejected;
+extern const Event CasRefAppendOccupantUnreadable;
+}
 
 namespace DB::ErrorCodes
 {
@@ -709,7 +717,7 @@ TEST(CasRefWedgeEveryAttempt, ResultReleasedAfterTheWedgeIdentityChangedIsInert)
 /// must recognise that the transaction is already accounted for and clear the wedge WITHOUT
 /// re-applying it. Re-applying is not merely wasteful: the id now sits AT the floor, so the candidate
 /// apply would reject it and the lane would stay wedged for the runtime's life.
-TEST(CasRefWedgeEveryAttempt, WedgedIdAlreadyCoveredByTheDurableFloorIsTreatedAsAdopted)
+TEST(CasRefWedgeEveryAttempt, WedgedIdAlreadyCoveredByTheDurableFloorIsFloorReconciled)
 {
     auto backend = std::make_shared<LandedButAckLostOnceBackend>();
     backend->fired = true;   /// disarmed while the fixture is built (see the adoption test above)
@@ -737,7 +745,14 @@ TEST(CasRefWedgeEveryAttempt, WedgedIdAlreadyCoveredByTheDurableFloorIsTreatedAs
     ASSERT_EQ(store->tailSinceSnapshotCountForTest(ns), tail_before) << "and installed nothing";
 
     /// The next flush reconciles against the floor instead of re-applying, and the lane runs again.
+    /// The OUTCOME itself is asserted, not just its side effects: `FloorReconciled` is a distinct
+    /// resolution from `Adopted` precisely because nothing is installed and no tail counter moves, so a
+    /// test that checked only "unwedged and not applied" would pass just as well if the arm had been
+    /// folded back into the adoption path.
+    const uint64_t reconciled_before = ProfileEvents::global_counters[ProfileEvents::CasRefWedgeFloorReconciled].load();
     EXPECT_NO_THROW(store->dropRef(ns, "y"));
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasRefWedgeFloorReconciled].load(), reconciled_before + 1)
+        << "the wedge must be retired through the FloorReconciled outcome, not adopted";
 
     EXPECT_FALSE(store->refLaneWedgedForTest(ns)) << "the wedge is retired: the floor already accounts for it";
     EXPECT_TRUE(store->resolveRef(ns, "x").has_value())
@@ -767,6 +782,7 @@ TEST(CasRefWedgeEveryAttempt, AppendSiteMeetingASuccessorSealIsAConclusiveReject
     const RefTxnId next{epoch, 3};
     ASSERT_EQ(store->lastEpochSealForTest(ns), std::nullopt);
     const uint64_t remounts_before = store->scheduleRemountCallCountForTest();
+    const uint64_t sealed_before = ProfileEvents::global_counters[ProfileEvents::CasRefAppendSealRejected].load();
 
     /// The successor's seal lands at exactly the id this table's next append derives.
     backend->conflict_substr = layout.refLogKey(ns, next);
@@ -781,6 +797,9 @@ TEST(CasRefWedgeEveryAttempt, AppendSiteMeetingASuccessorSealIsAConclusiveReject
         << "the observed seal IS this namespace's epoch-closing record, whichever site observed it";
     EXPECT_TRUE(store->mayMutate()) << "the designed path must not fence the mount";
     EXPECT_EQ(store->scheduleRemountCallCountForTest(), remounts_before) << "nor schedule a remount";
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasRefAppendSealRejected].load(), sealed_before + 1)
+        << "a deposed writer must still be COUNTED: this is the protocol working, and also the signal "
+           "that this mount has lost its lease and does not know it";
 }
 
 /// The same conflict, but the read that would tell a seal from a breach fails. We must then decide
@@ -806,8 +825,11 @@ TEST(CasRefWedgeEveryAttempt, AppendSiteDefersWhenTheOccupantCannotBeRead)
     backend->fail_get_skip = 1;
     backend->fail_get_count = 1;
 
+    const uint64_t deferred_before = ProfileEvents::global_counters[ProfileEvents::CasRefAppendOccupantUnreadable].load();
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
 
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasRefAppendOccupantUnreadable].load(), deferred_before + 1)
+        << "the deferral is the one quiet arm here -- it must be counted or a starved loud path is invisible";
     EXPECT_TRUE(store->mayMutate()) << "an unread occupant must not fence the mount on a guess";
     EXPECT_EQ(store->scheduleRemountCallCountForTest(), remounts_before) << "nor schedule a remount";
     EXPECT_EQ(store->lastEpochSealForTest(ns), std::nullopt)

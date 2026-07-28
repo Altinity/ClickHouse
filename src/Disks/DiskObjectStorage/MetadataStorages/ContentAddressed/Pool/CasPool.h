@@ -479,10 +479,19 @@ public:
     /// `namespace_birth`, which the flush forces automatically whenever the cached state is not `Live`).
     ///
     /// Wedge semantics: at most one unresolved `PUT` per table. An
-    /// `Unresolved` outcome wedges this namespace's lane -- no later id is allocated until the SAME
-    /// (key, bytes) resolves durable (applied to cache before the next id), or the process unmounts.
-    /// Every item in the failing batch receives the SAME uncertainty exception (ABORTED); items already
-    /// wedged from an EARLIER flush are retried by the NEXT call into this namespace's queue.
+    /// `Unresolved` outcome wedges this namespace's lane -- no later id is allocated until that SAME
+    /// (key, bytes) reaches a conclusive outcome. There are exactly three, and the middle one is the
+    /// reason a wedge is no longer a one-way door:
+    ///   it resolves DURABLE -- either an earlier attempt landed, or the bounded retry's own
+    ///     conditional create lands it now -- and is applied to the cache before the next id;
+    ///   a successor's `EpochSeal` occupies the key, which PROVES our bytes never landed and never can:
+    ///     the wedge clears, its callers fail permanently (they were never acknowledged), and the lane
+    ///     resumes only under a later writer epoch;
+    ///   or the process unmounts.
+    /// Every item in the failing batch receives the SAME uncertainty exception (`NETWORK_ERROR`, the
+    /// retry-later class); items already wedged from an EARLIER flush are retried by the NEXT call into
+    /// this namespace's queue -- at most one bounded attempt per flush, under the fence generation the
+    /// wedge was ADMITTED under, never the current one.
     ///
     /// `skip_stale_precommit_sweep`:
     /// suppresses the hoisted `maybeSweepStalePrecommits` call below for THIS call only. Set ONLY by
