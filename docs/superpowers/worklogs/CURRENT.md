@@ -1421,3 +1421,6 @@ controller-finalize fallback announced. No push.
 
 **2026-07-28 16:5x local** — task 2 DONE after third nudge (`f5699b50015`, 8/8 + 1394/1394);
 reviewer dispatched (raw-ness audit + three concerns to adjudicate). No push.
+
+**2026-07-28 17:0x local** — task 2 review: approved w/ 2 Important test gaps (fence_ok pin,
+own-landed-bytes adoption input); fix round 1 dispatched, one-turn framing. No push.
