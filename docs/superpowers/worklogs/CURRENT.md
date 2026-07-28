@@ -1411,3 +1411,6 @@ fix (task2_build.log fresh at 15:37, 3 live procs), no commit yet. No push.
 
 **2026-07-28 16:00 local watchdog** — task 2: build log 23 min stale, no live real procs (earlier
 count was pgrep self-match — known trap), no commit. Status ping sent to impl-a2. No push.
+
+**2026-07-28 16:20 local watchdog** — task 2: suite 8/8 fixed, FULL GATE GREEN 1394/1394
+(1386+8, TEST_EXIT=0 at 16:15); report+commit pending (agent in write-up). No push.
