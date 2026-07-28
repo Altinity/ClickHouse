@@ -1231,3 +1231,6 @@ dispatched minutes ago — reading phase, no artifacts yet, normal. No TLC/codex
 **2026-07-28 07:1x UTC watchdog** — task 3: ZERO artifacts after ~25 min (module, logs, report all
 absent) — crossed the escalation threshold; pinged the agent for status/blockers. Everything else
 quiet. No push.
+
+**2026-07-28 07:3x UTC watchdog** — task 3 agent silent 45 min, no ping response → re-dispatched
+fresh on opus (tla-task3b), original abandoned. Ledger updated. No push.
