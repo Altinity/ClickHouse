@@ -1630,3 +1630,7 @@ gates) with red/restore verification runs cycling; DONE message pending. T6 codi
 **2026-07-29 00:20 local watchdog** — T6 mid-red (walk suite iterating, 3 failing incl. the
 ckpt-CAS-before-install bump case; one 371MB test log = heavy retry logging, finished not
 runaway); T9 final gate running. Both healthy. No push.
+
+**2026-07-29 00:4x local** — T9 complete pending final commit (13 reverted-build proofs; 4
+self-caught defects; 1465/1465). Rulings retransmitted (4th; delivery failures systematic).
+T6 in red phase. No push.
