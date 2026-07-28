@@ -1517,18 +1517,46 @@ TEST(CasGcRound, OrphanManifestCursorSweepDeletesAndPersistsCursor)
     writeManifestRaw(*backend, store->layout(), ns, r2, {blobEntryFor("b", DB::UInt128(2))});
     setWatermarkMinActive(*backend, store->layout(), "test", r1.writer_epoch, /*min_active*/6);
 
+    /// The §6 deletion premise is a second precondition on every sweep deletion: a manifest of an
+    /// epoch-`E` build is deletable only once the namespace's sealed fold cursor sits in an epoch
+    /// STRICTLY above `E`. The debris above is epoch 1, so the fixture must put a cursor in epoch 2.
+    ///
+    /// IT IS SEEDED, NOT FOLDED, and that is forced rather than chosen: producing such a cursor
+    /// honestly needs a real epoch crossing, i.e. an `EpochSeal` record in the namespace's log -- and
+    /// `RefTableState::apply` still throws `NOT_IMPLEMENTED` on one (a deliberate Stage-A task-1 scope
+    /// boundary; no writer mints a seal yet). The sweep builds its protection view through that replay,
+    /// so a seal in the tail makes the view unavailable and the sweep skips the namespace entirely. The
+    /// two cannot both be exercised until seal-apply lands; this test keeps the sweep's subject and
+    /// seeds the durable fact the premise reads.
+    ///
+    /// It is seeded AFTER the first round because a pre-created `gc/state` makes the FIRST lease
+    /// acquire back off (`acquireOrRenewLease` only creates-and-owns when the object is absent).
+
     Gc gc(store, kGc);
     ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
-    const GcState after_first = readState(*backend, *store);
-    EXPECT_FALSE(after_first.manifest_sweep_cursor.empty());
+    EXPECT_TRUE(manifestExists(*backend, store->layout(), ManifestId{ns, r1}))
+        << "with no sealed cursor the premise retains: nothing proves epoch 1 closed";
+    EXPECT_TRUE(manifestExists(*backend, store->layout(), ManifestId{ns, r2}));
 
-    const bool first_exists = manifestExists(*backend, store->layout(), ManifestId{ns, r1});
-    const bool second_exists = manifestExists(*backend, store->layout(), ManifestId{ns, r2});
-    EXPECT_NE(first_exists, second_exists);
+    seedFoldCursorForTest(*backend, store->layout(), ns, RefTxnId{r1.writer_epoch + 1, 1},
+                          /*hold*/std::nullopt,
+                          currentGenerationOf(*backend, store->layout()),
+                          currentAttemptOf(*backend, store->layout()));
 
-    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
-    const GcState after_second = readState(*backend, *store);
-    EXPECT_TRUE(after_second.manifest_sweep_cursor.empty());
+    /// The round above already persisted a mid-circuit cursor while deleting nothing, which is the
+    /// cursor half of this test's subject: the sweep examined a key, retained it, and durably recorded
+    /// where it got to.
+    EXPECT_FALSE(readState(*backend, *store).manifest_sweep_cursor.empty())
+        << "the sweep persisted the cursor it examined to, even having deleted nothing";
+
+    /// The list budget is one key per round, so reclaiming both debris bodies takes a circuit.
+    for (int round = 0; round < 8; ++round)
+    {
+        ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease) << "round " << round;
+        if (!manifestExists(*backend, store->layout(), ManifestId{ns, r1})
+            && !manifestExists(*backend, store->layout(), ManifestId{ns, r2}))
+            break;
+    }
     EXPECT_FALSE(manifestExists(*backend, store->layout(), ManifestId{ns, r1}));
     EXPECT_FALSE(manifestExists(*backend, store->layout(), ManifestId{ns, r2}));
 

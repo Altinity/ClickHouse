@@ -18,6 +18,19 @@ namespace ErrorCodes
 namespace DB::Cas
 {
 
+std::string_view holdReasonToWord(HoldReason r)
+{
+    switch (r)
+    {
+        case HoldReason::GapBelowWitness:        return "gap_below_witness";
+        case HoldReason::UnconsumedSealCrossing: return "unconsumed_seal_crossing";
+        case HoldReason::WitnessDisappeared:     return "witness_disappeared";
+        case HoldReason::BodyUndecodable:        return "body_undecodable";
+        case HoldReason::ManifestBodyMissing:    return "manifest_body_missing";
+    }
+    throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: unknown hold reason {}", static_cast<int>(r));
+}
+
 namespace
 {
 
@@ -36,19 +49,6 @@ RefNsCleanupState nsCleanupStateFromWord(std::string_view w)
     if (w == "pending")   return RefNsCleanupState::Pending;
     if (w == "completed") return RefNsCleanupState::Completed;
     throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: unknown ns-cleanup state '{}'", w);
-}
-
-std::string_view holdReasonToWord(HoldReason r)
-{
-    switch (r)
-    {
-        case HoldReason::GapBelowWitness:        return "gap_below_witness";
-        case HoldReason::UnconsumedSealCrossing: return "unconsumed_seal_crossing";
-        case HoldReason::WitnessDisappeared:     return "witness_disappeared";
-        case HoldReason::BodyUndecodable:        return "body_undecodable";
-        case HoldReason::ManifestBodyMissing:    return "manifest_body_missing";
-    }
-    throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: unknown hold reason {}", static_cast<int>(r));
 }
 
 HoldReason holdReasonFromWord(std::string_view w)

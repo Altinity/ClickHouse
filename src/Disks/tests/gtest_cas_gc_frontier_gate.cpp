@@ -492,6 +492,14 @@ TEST(CasGcFrontierGate, TheOrphanManifestSweepAndItsCursorAreInertUnderSuppressi
     writeManifestRaw(*backend, layout, ns, r1, {blobEntryFor("a", DB::UInt128(0xa1))});
     writeManifestRaw(*backend, layout, ns, r2, {blobEntryFor("b", DB::UInt128(0xb2))});
     setWatermarkMinActive(*backend, layout, "test", r1.writer_epoch, /*min_active*/ 0xCA03);
+    /// The §6 deletion premise is a second precondition on the CONTROL arm below: a manifest of an
+    /// epoch-`E` build is deletable only once the namespace's sealed fold cursor sits in an epoch
+    /// strictly above `E`. Sealing that cursor here is what keeps this test about the GATE — without it
+    /// the control arm would stop deleting for the premise's reason, and a removed gate would no longer
+    /// show up as a difference between the two arms. A real round rewrites this row with the same cursor
+    /// (the namespace is known, quiet and unheld, so the walk probes `cursor+1`, finds the frontier and
+    /// carries the cursor), so the seeded fact survives every round below.
+    seedFoldCursorForTest(*backend, layout, ns, RefTxnId{r1.writer_epoch + 1, 1});
 
     Gc gc(store, kGc);
     backend->resetCounts();

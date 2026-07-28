@@ -820,6 +820,57 @@ inline String cursorKeyForTest(const DB::Cas::RootNamespace & ns, uint64_t shard
     return ns.string() + "/" + std::to_string(shard);
 }
 
+/// Seed the ADOPTED fold seal's shard-0 coverage row for `ns` and point `gc/state` at it, bypassing a
+/// real round. This is the durable fact the sweep's §6 deletion premise reads
+/// (`CasOrphanManifestSweep.cpp`): `cursor` is the namespace's `last_folded_ref_id`, and a manifest of
+/// an epoch-`E` build is deletable only once that cursor sits in an epoch STRICTLY above `E`.
+/// `hold`, when set, makes the row classification 4 — the strict grammar `encodeFoldSeal` enforces in
+/// both directions, so a hold and a non-4 classification cannot be seeded together.
+inline void seedFoldCursorForTest(
+    DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RootNamespace & ns,
+    DB::Cas::RefTxnId cursor, std::optional<DB::Cas::RefHold> hold = std::nullopt,
+    uint64_t generation = 1, uint64_t attempt = 1)
+{
+    const String seal_key = layout.foldSealKey(generation, attempt);
+    DB::Cas::CasFoldSeal seal;
+    const auto existing = backend.get(seal_key);
+    if (existing)
+        seal = DB::Cas::decodeFoldSeal(existing->bytes);
+    seal.generation = generation;
+
+    DB::Cas::ShardCoverage cov;
+    cov.classification = hold ? 4 : 2;
+    cov.last_folded_ref_id = cursor;
+    cov.hold = hold;
+    seal.per_ns_shard[cursorKeyForTest(ns, /*shard*/0)] = cov;
+
+    DB::Cas::GcState gc_state;
+    const DB::Cas::HeadResult head = backend.head(layout.gcStateKey());
+    if (head.exists)
+        gc_state = DB::Cas::decodeGcState(backend.get(layout.gcStateKey())->bytes);
+
+    /// Totality over `gc_shards`: a later REAL round adopts this seal as its parent and refuses a seal
+    /// that is missing any shard's `condemned_summary` entry (`CasGc.cpp`, "the seal is not total over
+    /// gc_shards"). A fixture that seeds only a coverage row would therefore wedge every round after it.
+    const uint64_t gc_shards = gc_state.gc_shards ? gc_state.gc_shards : 1;
+    for (uint64_t s = 0; s < gc_shards; ++s)
+        seal.condemned_summary.emplace(s, DB::Cas::CondemnedSummary{});
+
+    const String seal_bytes = DB::Cas::encodeFoldSeal(seal);
+    if (existing)
+        backend.putOverwrite(seal_key, seal_bytes, existing->token);
+    else
+        backend.putIfAbsent(seal_key, seal_bytes);
+
+    gc_state.snap_generation = generation;
+    gc_state.snap_attempt = attempt;
+    const String state = DB::Cas::encodeGcState(gc_state);
+    if (!head.exists)
+        backend.putIfAbsent(layout.gcStateKey(), state);
+    else
+        backend.putOverwrite(layout.gcStateKey(), state, head.token);
+}
+
 /// The folded cursor sealed for (ns, shard) by the latest fold seal, or 0 when absent. After a COMPLETE
 /// round the gc/state generation pointer is the recheck's COMPLETION generation (G+2 for a round started
 /// at G), but the fold seal is written at the FOLD generation (G+1) — recheck writes a completion seal,
