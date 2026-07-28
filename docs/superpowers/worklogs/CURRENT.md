@@ -1575,3 +1575,6 @@ point-read closure; attempt component is non-dense today). L: micro-round gates 
 DENY_ALLOCATIONS genuinely armed for the first time). T7 MERGED into cas-gc-rebuild
 (`48c912303fc`, ort clean, 11 files); combined build+gate running in bg. T8 round-2 cycling
 on lane G. Next: combined gate green -> T5 dispatch (lane L). No push.
+
+**2026-07-29 00:0x local** — COMBINED GATE GREEN 1435/1435 (first joint build of both lanes).
+T5 (_ckpt) dispatched to impl-a5 on lane L. T8 re-review-2 running on lane G. No push.
