@@ -1434,3 +1434,6 @@ build). Final nudge sent with controller-finalize ultimatum. No push.
 **2026-07-28 17:3x local** — task 2 fix round finalized BY CONTROLLER (agent stalled at commit
 3rd time; work itself green: 10/10 + 1396/1396, committed `1f8bad75270`). Re-review dispatched.
 No push.
+
+**2026-07-28 17:5x local** — task 2 CLOSED (re-review CLEAN; R4 minors settled, `14f93f46326`).
+Task 3 (contiguous allocator + format floor + quiesce) dispatched to impl-a3 on OPUS. No push.
