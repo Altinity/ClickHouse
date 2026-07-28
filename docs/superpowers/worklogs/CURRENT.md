@@ -1657,3 +1657,6 @@ T6 converging on gates. No push.
 sealed set). T10 (sweep §6 premise) dispatched on lane G. T6 on ASan+debug gates with 3
 verdicts issued (derivation approved — handles rebirth free; local refusal must keep the
 conclusive-rejection terminal). No push.
+
+**2026-07-29 01:20 local watchdog** — T6 ASan gate 3rd iteration running (log growing); T10 in
+reading/red-design phase (no logs yet, ~15 min in). No push.
