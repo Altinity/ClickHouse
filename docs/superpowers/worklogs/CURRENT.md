@@ -1399,3 +1399,6 @@ pending). No push.
 
 **2026-07-28 15:1x local** — task 1 fix round 1 landed (`34398a42fde`, gate 1386/1386); scoped
 re-review dispatched (incl. byte-identity audit of the shared wire-vocab lift). No push.
+
+**2026-07-28 15:3x local** — task 1 CLOSED (re-review CLEAN; wire-vocab byte-identity
+machine-proven). Task 2 (slotOccupy raw primitive) dispatched to impl-a2. No push.
