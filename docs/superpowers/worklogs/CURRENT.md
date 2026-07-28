@@ -1584,3 +1584,6 @@ yet, normal); T8 final polish editing (no commit yet). Both within latency. No p
 
 **2026-07-28 23:0x local** — T8 combined end-state (r2-on-1b, refuse-on-above semantics) in
 final verification. T5 designing on lane L. No push.
+
+**2026-07-28 23:2x local** — T8 round 3: step-down fix for the plain-crash liveness regression
+(refuse-on-above stays terminal); RebuildReport fields; superseded-mark. T5 designing. No push.
