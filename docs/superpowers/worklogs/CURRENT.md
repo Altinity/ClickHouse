@@ -1185,3 +1185,8 @@ package, no output yet — expected. No TLC/codex processes, nothing wedged. No 
 **2026-07-28 03:1x UTC watchdog** — TLA task 1 fix round 1 in flight: reviewer verdict (spec OK,
 3 Important) dispatched to the implementer; TLC harness re-ran 02:55-02:57, report appended 03:00,
 commit not yet landed — active, not wedged. No codex. No push.
+
+**2026-07-28 03:3x UTC watchdog** — TLA task 1 COMPLETE (fix round 1 clean, 15/15 configs; bonus:
+seal-clobber sabotage proved both damage shapes). Task 2 implementer (opus, `CaRefDeltaIntakeCore`)
+dispatched ~15 min ago — no artifacts yet, within normal reading/drafting time (task 1 took ~30 min
+to first commit). Next tick without artifacts → ping the agent. No TLC/codex running. No push.
