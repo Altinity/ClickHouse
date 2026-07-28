@@ -1345,3 +1345,6 @@ sites from the Explore map (allocator fetch_add:541, recovery no-fence-recheck g
 **2026-07-28 15:1x local** — BOTH main plans written and committed (stage A 15 tasks / stage B
 12 tasks); all ledger obligations mapped in their self-review checklists. Next: codex xhigh
 review of plans + models (pipeline stage 9). No push.
+
+**2026-07-28 15:2x local watchdog** — codex plans review (sol xhigh) active: log 187 KB and
+growing, deep in source verification; no marker yet. Monitor armed. No push.
