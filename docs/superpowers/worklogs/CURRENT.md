@@ -1539,3 +1539,9 @@ pending. No push.
 **2026-07-28 21:5x local** — T8 DONE (both rulings issued: no-release-on-absent = spec letter;
 sticky suppression intended, stage-B soak obligation + operator-story BACKLOG candidate).
 T8 reviewer dispatched (same lane reviewer, warm T7 context). L minifix still cycling. No push.
+
+**2026-07-28 22:1x local** — task 4 minifix hit a DEEPER pre-existing abort (terminate's foreign-
+occupant LOGICAL_ERROR, pinned by 3 deliberate death tests). Ruled: two-armed fail-closed-never-
+abort (deposed = expected failover end-state; owned = loud mutex-broken, still non-aborting);
+3 death tests rewritten to pin the real protections. This overturns a tested contract on the
+twice-applied env-reachable principle — flagged for visibility. No push.
