@@ -1470,3 +1470,6 @@ No push.
 
 **2026-07-28 19:4x local** — task 3 re-review: 3 important remain (counter discriminator, a REAL
 pre-lock marker-read race, StayTransient loud signal ruled in); fix round 2 dispatched. No push.
+
+**2026-07-28 19:20 local watchdog** — lane-g initial build 17037/17040 (nearly done); task 3
+fix round 2 mid-cycle (fix2 build log 19:01). No push.
