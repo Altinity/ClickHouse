@@ -1463,3 +1463,7 @@ gaps, W1 poisoned-snapshot-publish gate + minors). Lane-g setup continues. No pu
 
 **2026-07-28 19:00 local watchdog** — lane-g initial build 8.9k/17k steps (ccache-warm, alive);
 task 3 fix round editing (no logs yet). No push.
+
+**2026-07-28 19:2x local** — task 3 fix round 1 done in one turn (`b04358e72ea`, 1406/1406);
+re-review dispatched (W1's two safety arguments to adjudicate). Lane-g build past halfway.
+No push.
