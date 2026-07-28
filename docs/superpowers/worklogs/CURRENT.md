@@ -1477,3 +1477,7 @@ fix round 2 mid-cycle (fix2 build log 19:01). No push.
 **2026-07-28 19:3x local** — task 3 fix round 2 landed one-turn (`ee0f1ae7fcf`; R1 deepened to
 +4 w/ destructor backstop; R2 in-lock read; R3 ProfileEvent; both R4 reds proven via scratch
 revert). Re-review-2 running. LANE-G READY (LANEG_SETUP=done). Briefs 4+7 cut. No push.
+
+**2026-07-28 19:5x local** — TASK 3 CLOSED (re-review-2 CLEAN, 5 commits, gate 1406/1406).
+TWO-LANE PHASE OPEN: T4 wedge (impl-a4, main tree) + T7 arithmetic fold (impl-g7, lane-g
+worktree) running in parallel, both opus, scope-fenced. No push.
