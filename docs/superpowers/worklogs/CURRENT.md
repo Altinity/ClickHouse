@@ -1545,3 +1545,7 @@ occupant LOGICAL_ERROR, pinned by 3 deliberate death tests). Ruled: two-armed fa
 abort (deposed = expected failover end-state; owned = loud mutex-broken, still non-aborting);
 3 death tests rewritten to pin the real protections. This overturns a tested contract on the
 twice-applied env-reachable principle — flagged for visibility. No push.
+
+**2026-07-28 22:2x local** — T8 review: Spec ✅ / needs-fixes (headline: missing gc/state
+bypasses the REBUILD refusal -> hold-free baseline; fix = refuse-unless-proven-virgin). Fix
+round dispatched. Lane L implementing the two-armed terminate ruling. No push.
