@@ -142,11 +142,16 @@ SEQUENTIALLY (never two implementers in one worktree).
   - helpers `bool refLogTxnIsEpochSeal(const RefLogTxn &)` and the grammar validator
     `void validateEpochSealGrammar(const RefLogTxn &)` (throws `CORRUPTED_DATA`)
 
-Grammar (spec INV-2, verbatim rules): a seal txn contains EXACTLY ONE op and it is `EpochSeal`;
-`prev_epoch_seal` is REQUIRED on exactly sequence 1 of every non-genesis epoch (including a
-sequence-1 seal closing an empty epoch) and FORBIDDEN elsewhere; the seal's own id is
-`{closing_writer_epoch, T+1}` where `T` = greatest applied sequence of the epoch being closed
-(so an empty dead epoch is closed by a seal at sequence 1 carrying `prev_epoch_seal`).
+Grammar (spec INV-2, with the genesis contract made explicit — codex r2 finding 2): "genesis"
+is PER-NAMESPACE — the namespace's `life_epoch` (the writer epoch of its `NamespaceBirth`
+record; a brand-new namespace born at global epoch `E > 1` is at ITS genesis). The validator is
+therefore CONTEXTUAL: `void validateEpochSealGrammar(const RefLogTxn &, uint64_t life_epoch)`.
+Rules: a seal txn contains EXACTLY ONE op and it is `EpochSeal`; `prev_epoch_seal` is REQUIRED
+on exactly sequence 1 of every epoch with `writer_epoch > life_epoch` (including a sequence-1
+seal closing an empty epoch) and FORBIDDEN elsewhere — in particular FORBIDDEN at
+`{life_epoch, 1}`; the seal's own id is `{closing_writer_epoch, T+1}` where `T` = greatest
+applied sequence of the epoch being closed (an empty dead epoch closes with a sequence-1 seal
+carrying `prev_epoch_seal`).
 
 **The field is populated by BOTH writers** [codex finding 2 — blocker]: recovery seals (Task 6)
 AND every ORDINARY `{E, 1}` transaction a writer appends after an epoch transition. Recovery
@@ -161,9 +166,11 @@ path lands in Task 4 Step 1 (it needs the writer runtime).
   round-trip of a seal txn (encode → decode → fields equal, incl. `prev_epoch_seal`);
   strict rejections, one test each, all expecting `CORRUPTED_DATA`:
   seal txn with 2 ops; seal txn with a second non-seal op; non-seal txn carrying
-  `prev_epoch_seal` at sequence 2; sequence-1 txn of a non-genesis epoch WITHOUT
-  `prev_epoch_seal`; genesis-epoch sequence-1 txn WITH `prev_epoch_seal`; unknown op word
-  (existing behavior still intact — regression guard).
+  `prev_epoch_seal` at sequence 2; sequence-1 txn with `writer_epoch > life_epoch` WITHOUT
+  `prev_epoch_seal`; sequence-1 txn AT `life_epoch` WITH `prev_epoch_seal` (both directions of
+  the contextual rule); `life_epoch > 1` birth: `{life_epoch = 5, seq 1}` without the field is
+  VALID (the r2-finding-2 case); unknown op word (existing behavior still intact — regression
+  guard).
 - [ ] **Step 2:** Run: `unit_tests_dbms --gtest_filter='CasRefEpochSealFormat*'` → FAIL (kind not defined).
 - [ ] **Step 3:** Implement: add the enum value + word mapping (`"epoch_seal"`), the optional
   meta field (additive encode: emit only when set; decode: accept once, reject duplicates),
@@ -341,7 +348,12 @@ Behavior (spec INV-1/INV-2 verbatim):
   the slot → I/O released with a stale result → the post-I/O recheck makes the superseded
   runtime act on NOTHING (no ack, no unwedge, no install — assert all three); ordinary
   `{E, 1}` append after a sealed transition carries the exact `prev_epoch_seal` and round-trips
-  (the blocker-2 test, here because it needs the writer runtime) [codex finding 2].
+  (the blocker-2 test, here because it needs the writer runtime) [codex finding 2]; GENESIS
+  INITIALIZATION [codex r2 finding 2]: `RefTableRuntime::last_epoch_seal` is `none` exactly for
+  a namespace whose recovered state contains no seal and whose `greatest_applied.writer_epoch ==
+  life_epoch` — first birth at global epoch 5 appends `{5, 1}` with NO `prev_epoch_seal`; that
+  namespace's FIRST transition (5 → 6) then seals `{5, T+1}` and the `{6, 1}` append carries it
+  (both tested).
 - [ ] **Step 2:** Run `--gtest_filter='CasRefWedgeEveryAttempt*'` → FAIL.
 - [ ] **Step 3:** Implement. The wedge hard-contract `chassert` at `:1918-1938` stays; extend it
   to also refuse NEW allocations while a wedge is unresolved (the lane rule — one in-flight PUT
@@ -385,9 +397,13 @@ enum class CkptPublishOutcome : uint8_t { Published, IdenticalSkip, FencedOut };
 /// read → validate → merge → (identical ⇒ skip without CAS) → token-CAS; retried on token
 /// conflict only until `deadline`; every attempt re-runs checkFenceOrThrow(admitted_generation)
 /// AFTER its read and BEFORE its CAS (the §3 recheck discipline — same value at every site).
-CkptPublishOutcome publishCkpt(Backend &, const CasLayout &, const RootNamespace &,
+CkptPublishOutcome publishCkpt(Backend &, const Layout &, const RootNamespace &,
                                const RefCkpt & contribution, uint64_t admitted_generation,
-                               const CasMountRuntime &, Deadline deadline);
+                               const std::function<void(uint64_t)> & check_fence_or_throw,
+                               Deadline deadline);
+/// check_fence_or_throw is the PLUMBED callback (CasPool wires it from CasMountRuntime the way
+/// CasPlainObjects gets fence_generation_fn at CasPool.cpp:171) — the ledger never owns a
+/// CasMountRuntime [codex r2 finding 18].
 ```
 - Snapshot-deletability rule this object enables (consumed by Task 9): snapshots are deletable
   only STRICTLY BELOW `checkpoint_snapshot_id` — a stale pointer can only under-clean.
@@ -492,10 +508,17 @@ REARM may not complete while a recovery attempt is in flight — remount either 
   reseal at new `T+1`); two consecutive burned empty epochs → two chained sequence-1 seals with
   correct `prev_epoch_seal`; fence bumped during the walk → install refused (throws), state NOT
   installed, retry under the new generation succeeds; `_ckpt` names a snapshot the hint lost →
-  step-4 three-way behavior; **remount barrier** [codex finding 10]: recovery paused at an I/O
-  fault seam → self-remount initiated → fence rearm BLOCKS until the recovery acknowledges
-  cancellation; after release the cancelled recovery performs ZERO `_ckpt` CASes and ZERO
-  installs (op-journal assert).
+  step-4 three-way behavior; **the trio's deterministic bump points** [codex r2 finding 7]:
+  fence bumped AFTER slot-occupy succeeded but BEFORE the `_ckpt` CAS → `_ckpt` CAS refuses,
+  no install; fence bumped AFTER the `_ckpt` CAS but BEFORE install → install refuses (state
+  not published, `_ckpt` advance harmless — semantic-max is idempotent for the retry); plus the
+  generic mid-walk bump (any earlier point) → refused at the next site; **remount barrier**
+  [codex finding 10]: recovery paused at an I/O fault seam → self-remount initiated → fence
+  rearm BLOCKS until the recovery acknowledges cancellation; after release the cancelled
+  recovery performs ZERO `_ckpt` CASes and ZERO installs (op-journal assert); **genesis
+  recovery** [codex r2 finding 2]: recovery of a namespace born at epoch 5 starts its walk at
+  `life_epoch = 5` (no phantom seals for epochs 1-4 are expected or written) and installs
+  `last_epoch_seal = none` when no transition ever happened.
 - [ ] **Step 2:** Run `--gtest_filter='CasRefRecoveryCasWalk*'` → FAIL.
 - [ ] **Step 3:** Implement, DELETING: the sentinel-seal writer block `:601-659`, the
   `sealed_from` field + sentinel doc in `CasRefSnapshotFormat.h`, and the reconciliation's
@@ -639,7 +662,12 @@ destructive site. **The Stage-A universe seam:** `frontier_incomplete` is comput
 `!kUniverseAuthoritative || <per-namespace proofs missing>` where
 `constexpr bool kUniverseAuthoritative = false;` in Stage A (staging contract; the comment cites
 codex finding 1's cross-namespace scenario verbatim); gtests reach the per-namespace logic via a
-test seam (`GcTestHooks::force_universe_authoritative`) that constructs CLOSED universes.
+test seam (`GcTestHooks::force_universe_authoritative`) that constructs CLOSED universes — and
+the seam is PRODUCTION-UNREACHABLE [codex r2 finding 1]: `GcTestHooks` is declared in a
+test-only header compiled solely into `unit_tests_dbms` (no production translation unit
+includes it), and the production read of the constant is a bare `constexpr bool` with NO
+runtime override path — flipping it in production is a Stage-B source change (the dedicated
+enablement task), not a configuration.
 **Destructive-site inventory is a STEP, not an assumption** [codex finding 6]: before wiring,
 run a tree-wide inventory of every `deleteExact`/`deletePrefixWholesale`/delete-marker call
 reachable from GC and list each with its gate status in the task report — the known un-gated
