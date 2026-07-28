@@ -301,4 +301,270 @@ Behavior (spec INV-1/INV-2 verbatim):
   `gtest_cas_ref_chunked_flush.cpp` around gap expectations — fix and report each).
 - [ ] **Step 5: Commit** `ca: ref — every-attempt wedge with admission fence; seal is a conclusive rejection`.
 
+### Task 5: `_ckpt` object — shared semantic-max merge + fence-recheck discipline {#task-5}
+
+**Files:**
+- Create: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCkptFormat.h` / `.cpp`
+- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.cpp` (registry — add `FormatId::RefCkpt`, Control/Strict, modest caps: 64 KiB object / 4 KiB line)
+- Modify: `.../ContentAddressed/CasLayout.h` (+`String refCkptKey(const RootNamespace &)` — Stage A shape `<ns>/_ckpt`; Stage B re-keys under the incarnation)
+- Create: `.../ContentAddressed/Pool/CasRefCkpt.h` / `.cpp` (the write algorithm)
+- Create: `src/Disks/tests/gtest_cas_ref_ckpt.cpp`
+
+**Interfaces:**
+- Consumes: `casPut` (token-CAS, `Backend/CasBackend.h:250`), `checkFenceOrThrow` (`Pool/CasMountRuntime.h:151`).
+- Produces (Tasks 6/8/9 consume — names verbatim):
+```cpp
+struct RefCkpt
+{
+    uint64_t life_epoch = 0;                      /// namespace birth epoch (Stage A: from NamespaceBirth)
+    std::optional<RefTxnId> checkpoint_snapshot_id;
+    std::optional<RefTxnId> last_epoch_seal;
+};
+
+/// THE one merge — both writers use it; per-field semantic maximum (spec INV-4).
+RefCkpt mergeCkpt(const RefCkpt & a, const RefCkpt & b);
+
+enum class CkptPublishOutcome : uint8_t { Published, IdenticalSkip, FencedOut };
+/// read → validate → merge → (identical ⇒ skip without CAS) → token-CAS; retried on token
+/// conflict only until `deadline`; every attempt re-runs checkFenceOrThrow(admitted_generation)
+/// AFTER its read and BEFORE its CAS (the §3 recheck discipline — same value at every site).
+CkptPublishOutcome publishCkpt(Backend &, const CasLayout &, const RootNamespace &,
+                               const RefCkpt & contribution, uint64_t admitted_generation,
+                               const CasMountRuntime &, Deadline deadline);
+```
+- Snapshot-deletability rule this object enables (consumed by Task 9): snapshots are deletable
+  only STRICTLY BELOW `checkpoint_snapshot_id` — a stale pointer can only under-clean.
+- Missing-sampled-base revalidation (consumed by Task 6): reader samples `_ckpt`, GETs the
+  named snapshot, gets 404 → reread `_ckpt`: token advanced → restart; token unchanged →
+  `CORRUPTED_DATA` (three-way rule, spec INV-4 verbatim).
+
+- [ ] **Step 1: Failing tests** in `gtest_cas_ref_ckpt.cpp`:
+  `mergeCkpt` per-field table (each field independently newer on either side — 6 cases; both
+  none; equal bodies); codec round-trip + strict rejections (unknown key, duplicate key,
+  truncation → `CORRUPTED_DATA`); `publishCkpt` over InMemoryBackend: create-if-absent when no
+  object; token conflict (concurrent writer advanced it) → re-read → merge → second CAS wins;
+  identical merged body → `IdenticalSkip` and NO write issued (assert backend op count);
+  fence bumped between read and CAS → `FencedOut`, nothing written; deadline exhausted on
+  persistent conflict → throws retry-later (fail closed, no partial state).
+- [ ] **Step 2:** Run `--gtest_filter='CasRefCkpt*'` → FAIL.
+- [ ] **Step 3:** Implement format (strict grammar: all three keys, optionals encoded-when-set,
+  duplicates rejected), registry entry, layout key, `mergeCkpt` (ONE function — the ledger
+  obligation from TLA Task 1: "one shared semantic-max helper + per-field unit test"), and
+  `publishCkpt`.
+- [ ] **Step 4:** New filter PASS + full CA gate no regressions.
+- [ ] **Step 5: Commit** `ca: ref — _ckpt object: strict codec, shared semantic-max merge, fence-rechecked CAS`.
+
+### Task 6: Recovery CAS-walk; install-lock generation recheck; retire the sentinel seal {#task-6}
+
+**Files:**
+- Modify: `.../Pool/CasRefLedger.cpp` — `ensureRefTableRecovered` `:394-727` (the whole recovery
+  sequence), `installRecoveryResult` `:738`; DELETE the sentinel-seal writer `:601-659`
+- Modify: `.../Formats/CasRefSnapshotFormat.h` — retire the sentinel-seal shape (`:20-25` doc,
+  `sealed_from` `:57`, the `snapshot_id < *sealed_from` check `:74`): `sealed_from` is REMOVED
+  from the format; a decoded snapshot carrying it (old pool) is unreachable behind Task 3's
+  format floor, so the field is deleted outright, not tolerated (Constraint 4)
+- Create: `src/Disks/tests/gtest_cas_ref_recovery_cas_walk.cpp`
+
+**Interfaces:**
+- Consumes: Task 1 grammar (`prev_epoch_seal`, `validateEpochSealGrammar`), Task 2 `slotOccupy`,
+  Task 4 wedge adoption, Task 5 `publishCkpt` + three-way revalidation,
+  `checkFenceOrThrow` (`CasMountRuntime.cpp:105`).
+- Produces: recovery per spec §4 — the sequence Stage B extends with the catalog step.
+
+New `ensureRefTableRecovered` sequence (replaces the LIST-reconciliation core; the outer
+transient-retry loop `:441`, restart budget `kRefRecoveryMaxRestarts` `:446-460`, and the
+`recovery_in_progress`/`recovery_cv` serialization `:413-428` all STAY):
+1. Capture `admitted_generation = mount_runtime.fenceGeneration()` at entry.
+2. Read `_ckpt` (may be absent for a namespace born before its first publication this stage —
+   then all fields none).
+3. ONE hint LIST of the namespace prefix (today's `:472-503` — kept as a HINT: it seeds the
+   snapshot candidate and the tail id set; its completeness is NEVER assumed).
+4. Exact-key GET of the chosen snapshot (greatest of hint ∪ `_ckpt.checkpoint`); on 404 apply
+   Task 5's three-way rule (restart vs `CORRUPTED_DATA`).
+5. Arithmetic tail: from `snapshot_id + 1` upward, exact-key GET each id — ids the hint
+   mentioned AND the holes it did not (a hint omission is fetched by exact key, found or not);
+   first absent id ends the epoch's dense region. A 404 at an id BELOW a durable same-epoch
+   higher id (a hint entry that GETs successfully, or `_ckpt.checkpoint`) → vanish-restart
+   (`:557` pattern), budget-bounded, then FAIL CLOSED (`CORRUPTED_DATA`) — never "fold what we
+   have".
+6. Epoch transitions: CAS-walk. For each dead epoch `E` from the recovered position to
+   `live_epoch - 1`: `slotOccupy(refLogKey(ns, {E, T_E + 1}), encoded EpochSeal txn, fence_ok)`
+   where the seal txn carries `prev_epoch_seal` per grammar (chained across burned/empty epochs —
+   `CasPool.cpp:576-611` mints unreclaimed epochs, so consecutive empty seals are NORMAL);
+   `Created` → epoch closed by us; `Occupied` + seal bytes → a concurrent recoverer closed it —
+   adopt and continue (the `CaCasMountCore` Occupied-seal branch); `Occupied` + non-seal bytes →
+   a straggler landed at `T_E + 1` — ADOPT it (apply the txn), `T_E += 1`, retry the seal at the
+   NEW `T_E + 1` (never mint `T_E + 2` blindly — state-derived ids, INV-2); `Unresolved` →
+   transient-retry path (outer loop), fail closed on budget.
+7. `publishCkpt` with `last_epoch_seal = max(walked seals)` under `admitted_generation`.
+8. Re-acquire `rt.state_mutex` (`:638-641` pattern), then — NEW, the r9-5 #4 site —
+   `mount_runtime.checkFenceOrThrow(admitted_generation)` IMMEDIATELY BEFORE
+   `installRecoveryResult` `:665`: a recovery whose I/O window overlapped a fence bump must
+   never install (today there is NO such recheck — the site map confirms the gap).
+
+- [ ] **Step 1: Failing tests** in `gtest_cas_ref_recovery_cas_walk.cpp`:
+  hint omits a middle id that exists (arithmetic finds it by exact GET — recovery result
+  identical to a complete hint; TODAY the reconciliation replay misses it: this is THE blocker's
+  recovery face); hint omits the TAIL id (same); 404 below a durable higher id → restart then
+  fail closed after budget; dead epoch closed by our seal (`Created`), by a concurrent
+  recoverer's seal (`Occupied` seal — adopt), straggler at `T+1` (`Occupied` non-seal — adopt,
+  reseal at new `T+1`); two consecutive burned empty epochs → two chained sequence-1 seals with
+  correct `prev_epoch_seal`; fence bumped during the walk → install refused (throws), state NOT
+  installed, retry under the new generation succeeds; `_ckpt` names a snapshot the hint lost →
+  step-4 three-way behavior.
+- [ ] **Step 2:** Run `--gtest_filter='CasRefRecoveryCasWalk*'` → FAIL.
+- [ ] **Step 3:** Implement, DELETING: the sentinel-seal writer block `:601-659`, the
+  `sealed_from` field + sentinel doc in `CasRefSnapshotFormat.h`, and the reconciliation's
+  trust in `greatest_listed_id` as a completeness bound (`:509-511` — the variable may survive
+  as the hint seed, its AUTHORITY does not). Each deletion is Constraint-3 material: the
+  replacement is the arithmetic walk, not a quieter fallback.
+- [ ] **Step 4:** New filter PASS + full CA gate; expect fallout in recovery-adjacent gtests
+  (`RefSnapshotCodec*`, seal-related cases) — fix, report each.
+- [ ] **Step 5: Commit** `ca: ref — recovery = ckpt + arithmetic tail + seal CAS-walk; install-lock fence recheck; sentinel seal retired`.
+
+### Task 7: Fold arithmetic intake; seals cross epochs; B1/B2 accounting {#task-7}
+
+**Files:**
+- Modify: `.../Gc/CasGc.cpp` — intake loop `:1420-1605` (cursor-advance site `:1590-1596`),
+  B1 identity recomputation `:1636-1655`, the B1 enforcement `:2004-2008`
+- Create: `src/Disks/tests/gtest_cas_gc_arithmetic_intake.cpp`
+
+**Interfaces:**
+- Consumes: Task 1 (`refLogTxnIsEpochSeal`), Task 3 (density invariant), the round's hint
+  enumeration (`groupRefKeys` `:1049` — UNCHANGED this task; it becomes purely a hint).
+- Produces: per-namespace arithmetic advance — the `CaRefDeltaIntakeCore` `WalkStep` in C++;
+  vocabulary for Tasks 8/9: `expected_next(cursor) = cursor.ref_sequence + 1` within the
+  cursor's epoch.
+
+Behavior (spec §5): the per-namespace loop no longer iterates `listing.logs` (`:1457-1459`) —
+it steps `expected = cursor + 1`, GETs the exact key (the per-record GET was always owed — §8
+cost table), applies, advances (`:1590` site). The hint's only roles: (a) namespace membership
+in `ref_tables`, (b) a witness set for Task 8's impossible-shape detection. A hint hole at an id
+the GET finds — the observed `0x1430c`/`0x1430d` shape — folds through UNNOTICED (no anomaly, no
+abort: this is the blocker becoming a non-event). A 404 at `expected` with no witness above =
+the namespace's frontier this round (normal end). Epochs are crossed ONLY by consuming a seal at
+`expected`: apply as a table no-op, count it applied (B2 `produced=false`), cursor := seal id,
+continue at `{next_epoch_with_records_or_seal, 1}` — the seal's `prev_epoch_seal` chain makes
+the next epoch's start arithmetic, not guessed. A record of a LATER epoch reachable while the
+current epoch lacks its consumed seal is an impossible shape → held (mechanism Task 8; this task
+plants the detection point and a plain `classification = 4` clamp as today).
+
+- [ ] **Step 1: Failing tests** in `gtest_cas_gc_arithmetic_intake.cpp` (InMemoryBackend, a
+  ledger writer producing real records, fold run against a CONTROLLED hint set):
+  hint omits two middle records that exist → fold applies ALL records, cursor = true tail
+  (TODAY fails: listed-only iteration skips them and seals past — the blocker reproduced as a
+  unit test); hint omits the entire namespace → Task 9 covers (frontier), here: cursor
+  untouched, no destruction interplay asserted yet; seal at `T+1` → crossed, `logs_applied`
+  counts it, `produced=false` (B2), cursor lands on the seal; two chained empty-epoch seals →
+  both consumed in one round; record above an unconsumed seal position visible in hint while
+  `expected` GET 404s → classification 4 (clamp), cursor NOT advanced past the gap; B1
+  `logs_accounted == logs_applied` holds over a seal-crossing cut (regression for `:2004-2008`).
+- [ ] **Step 2:** Run `--gtest_filter='CasGcArithmeticIntake*'` → FAIL.
+- [ ] **Step 3:** Implement. The three existing non-gap failure shapes keep their semantics at
+  the new sites: body vanished mid-walk → abort `:1474` analog; invalid body → abort `:1495`
+  analog; missing manifest body → per-table clamp `:1570` analog (dead-precommit escape
+  `:1531-1550` preserved).
+- [ ] **Step 4:** New filter PASS + full CA gate + the CA-s3 integration lane
+  `test_content_addressed_gc_s3` locally (`with_rustfs`) green, log to `<build>/task7_integration.log`.
+- [ ] **Step 5: Commit** `ca: gc — arithmetic fold intake; hint demoted; seals cross epochs (B2 no-op)`.
+
+### Task 8: Holds — classification-4 strict grammar, checkpoint witness, REBUILD carry {#task-8}
+
+**Files:**
+- Modify: `.../Formats/CasFoldSealFormat.h` / `.cpp` — `ShardCoverage` `:37` gains the hold
+  fields; encode `:83` / decode `:189` region; the writer's pre-PUT size gate
+- Modify: `.../Gc/CasGc.cpp` — hold creation (Task 7's detection points), hold carry in the
+  round CAS, REBUILD carry (`rebuildBaseline` `:2488`), seal-bytes measurement `:2014`
+- Create: `src/Disks/tests/gtest_cas_gc_hold_grammar.cpp`
+
+**Interfaces:**
+- Consumes: Task 7's detection points; Task 5's `_ckpt` (checkpoint = hint-independent second
+  witness); `putDeterministicArtifact` (`Gc/CasBlobInDegree.h:136`) for seal writes (unchanged).
+- Produces (Task 9/11 consume):
+```cpp
+enum class HoldReason : uint8_t   /// bounded ENUM — strict grammar, spec r9-4
+{
+    GapBelowWitness = 1,        /// 404 at expected, durable same-epoch witness above
+    UnconsumedSealCrossing = 2, /// later-epoch record reachable, current epoch's seal not consumed
+    WitnessDisappeared = 3,     /// an above-cursor witness stopped GETting — corruption, never clearance
+    BodyUndecodable = 4,
+};
+/// ShardCoverage extension — fields REQUIRED iff classification == 4, FORBIDDEN otherwise:
+///   HoldReason hold_reason; RefTxnId offending_position; uint32_t retry_count; uint64_t next_retry_round;
+```
+- The clearing rule: a hold clears ONLY by folding through `offending_position` and adopting the
+  result in `gc/state` — NEVER by observing another absent (spec §5; the
+  `CaRefDeltaIntakeCore` hold/holdDebt semantics).
+- A witness that disappears while the gap remains → `WitnessDisappeared`, still held (an
+  above-cursor witness cannot be legitimately cleaned — its disappearance is corruption).
+
+- [ ] **Step 1: Failing codec tests** in `gtest_cas_gc_hold_grammar.cpp`: round-trip all four
+  reasons; classification 2 carrying a hold field → `CORRUPTED_DATA`; classification 4 missing
+  any hold field → `CORRUPTED_DATA`; duplicate hold keys → `CORRUPTED_DATA`; boundary AND
+  boundary-plus-one byte-reservation tests: a seal at the 64 KiB line cap
+  (`Formats/CasFormat.cpp:102` registry) with the maximal hold row (max enum, max numerics,
+  worst-case escaping) encodes; one byte over → the writer's NEW pre-PUT gate throws
+  retry-later BEFORE the PUT (today `CasGc.cpp:2014` measures only — the gate is new; spec
+  INV-3's `encodeFoldSeal(...).size()` check lands here for the hold rows).
+- [ ] **Step 2:** `--gtest_filter='CasGcHoldGrammar*'` → FAIL.
+- [ ] **Step 3: Behavior tests** (same file): gap-below-witness (hint witness) → hold with exact
+  `offending_position`; gap below `_ckpt.checkpoint` with hint SILENT about the namespace's tail
+  → SAME hold (checkpoint is the second witness — `_fix_ckptwitness`'s C++ twin); hold carried
+  verbatim across a round where the hint omits the namespace entirely; hold forces an exact
+  retry of `offending_position` even when unhinted; clears only by folding through (plant the
+  record → next round folds → classification back to 2); witness disappears, gap remains →
+  `WitnessDisappeared`, held; REBUILD (`rebuildBaseline`) carries every hold VERBATIM into the
+  rebuilt baseline; REBUILD with a missing prior fold seal → REFUSES (throws, names pool
+  recreation — spec r9-1); undecodable prior seal → same refusal.
+- [ ] **Step 4:** Implement; new filter PASS + full CA gate.
+- [ ] **Step 5: Commit** `ca: gc — durable holds: strict classification-4 grammar, ckpt witness, REBUILD carry + refusal`.
+
+### Task 9: Frontier proof — `suppress_destructive` before EVERY destructive site {#task-9}
+
+**Files:**
+- Modify: `.../Gc/CasGc.cpp` — the destructive-gate computation (`:1833` site), the three
+  UN-gated sites from the audit map: manifest-body deletes `:841-864`, generation prune
+  `:2316`/`deletePrefixWholesale` `:2282`, orphan-sweep invocation `:912`; cleanup ranges in
+  `cleanupRefObjects` `:2075`
+- Modify: `.../Gc/CasBlobInDegree.cpp` — `settleEntry` `:414-469` (normative comment + metric)
+- Create: `src/Disks/tests/gtest_cas_gc_frontier_gate.cpp`
+
+**Interfaces:**
+- Consumes: Task 7 (walk-to-absent = frontier proof for hinted-active namespaces), Task 8
+  (holds), `FoldResult::suppress_destructive` (`Gc/CasGc.h:352`).
+- Produces: the `DestructiveGate` (model vocabulary): a round performs destructive work ONLY
+  holding a frontier proof for EVERY known namespace — Stage A's universe = (namespaces in
+  `gc/state` cursors) ∪ (this round's hint); the Stage-B catalog swaps the universe source
+  under the SAME gate.
+
+Behavior (spec §5): quiet namespaces (known, unhinted or hinted-inactive) each get ONE exact
+`GET expected_next(cursor)`: absent → frontier proven; present → the namespace was WRONGLY
+quiet → walk it this round (Task 7 loop). Budget exhausted before every proof lands → cursor
+advances may still seal, ALL destruction suppressed this round. `suppress_destructive` becomes
+`anomalies present OR any hold carried OR frontier incomplete`, and is CONSULTED at every
+destructive site — the three sites the audit found un-gated get the same check the gated ones
+have (`CasBlobInDegree.cpp:443-446` pattern). The delete-site in-degree re-read
+(`settleEntry` `:414-469` sparing `indeg > 0`, then `deleteExact` `:516`) is hereby NORMATIVE
+(spec §5 third arm) — it gets the comment saying so and a regression test, not new code.
+
+- [ ] **Step 1: Failing tests** in `gtest_cas_gc_frontier_gate.cpp`:
+  a hidden `+1` in a KNOWN-but-unhinted namespace while a `-1` elsewhere is ready to graduate →
+  destruction suppressed (the cross-namespace hidden-`+1` control — the load-bearing RED of the
+  whole phase, now C++); same round, the quiet-probe GET finds the `+1` → namespace walked,
+  fold adopts it, destruction proceeds NEXT round; frontier budget exhausted → seals happen,
+  zero deletes (assert backend delete-op count == 0); each of the three newly-gated sites
+  individually: manifest-body delete, generation prune, orphan sweep — all inert under
+  suppression (assert per-site); late `+1` folded AFTER condemnation but BEFORE the delete
+  pass → `settleEntry` spares it (`indeg > 0`) — the normative third-arm regression;
+  covered-log cleanup deletes exactly the computable range under
+  `min(_ckpt.checkpoint, cursor)` and nothing above (ranges, not listings).
+- [ ] **Step 2:** `--gtest_filter='CasGcFrontierGate*'` → FAIL.
+- [ ] **Step 3:** Implement. `discoverUniverse` (`:2393`) is UNCHANGED in mechanism (still the
+  hint) but its result now only ADDS to the known-namespace set (union with `gc/state` cursors);
+  it can no longer shrink the frontier obligation.
+- [ ] **Step 4:** New filter PASS + full CA gate + `test_content_addressed_gc_s3` local lane green.
+- [ ] **Step 5: Commit** `ca: gc — destructive-round frontier proof; suppress_destructive at every destructive site`.
+
+
+
 
