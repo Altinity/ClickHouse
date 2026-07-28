@@ -1660,3 +1660,8 @@ conclusive-rejection terminal). No push.
 
 **2026-07-29 01:20 local watchdog** — T6 ASan gate 3rd iteration running (log growing); T10 in
 reading/red-design phase (no logs yet, ~15 min in). No push.
+
+**2026-07-29 01:40 local watchdog** — T6: both sanitizer-class gates FINISHED (ASan 01:21,
+debug 01:13, complete sizes); DONE report pending (~18 min — write-up window, nudge next tick
+if silent). T10 already red→green (premise + FoldSealFormat edits), full lane gate running.
+No push.
