@@ -1634,3 +1634,7 @@ runaway); T9 final gate running. Both healthy. No push.
 **2026-07-29 00:4x local** — T9 complete pending final commit (13 reverted-build proofs; 4
 self-caught defects; 1465/1465). Rulings retransmitted (4th; delivery failures systematic).
 T6 in red phase. No push.
+
+**2026-07-29 01:0x local** — T9 closed by implementer (15 reverted-build proofs; integration
+test asserts the Stage-A truth with a unique-signature discriminator); reviewer dispatched.
+BACKLOG entries for its two findings written by controller (`c936b380394`). T6 in gates. No push.
