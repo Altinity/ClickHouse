@@ -615,4 +615,72 @@ CasOverwriteResult CasRequestController::putIfAbsentControlledMutable(
     return {CasOverwriteOutcome::Unresolved, {}};   /// attempt budget exhausted without a definite outcome
 }
 
+SlotOccupyResult CasRequestController::slotOccupy(
+    std::string_view key, std::string_view bytes, const std::function<bool()> & fence_ok)
+{
+    const String key_s{key};
+    const String bytes_s{bytes};
+    const uint64_t deadline_ms = now_ms() + budget.operation_deadline_ms;
+
+    /// Pre-attempt gate ONLY -- the same two checks every controlled op runs before its first (here,
+    /// only) attempt: the mount fence must still hold, and there must be enough of the operation's own
+    /// deadline left for one attempt to plausibly complete. Neither check sends anything to the
+    /// backend, so a refusal here PROVES the key is untouched by this call. UNLIKE every sibling
+    /// controlled op, there is no post-write recheck below: fence_ok is evaluated once per attempt, and
+    /// the stronger post-I/O consistency check (fence generation together with wedge/txn identity) is
+    /// the CALLER's contract (Task 4/6's re-acquire-lock-and-checkFenceOrThrow step), not this raw
+    /// primitive's.
+    if (!fence_ok() || now_ms() + budget.attempt_timeout_ms > deadline_ms)
+        return {.kind = SlotOccupyResult::Kind::Unresolved, .occupant_bytes = {}, .occupant_token = {},
+                .unresolved_reason = CasUnresolvedReason::NoAttemptSent};
+
+    std::optional<PutResult> put;
+    try
+    {
+        put = backend->putIfAbsent(key_s, bytes_s);
+    }
+    catch (const std::exception & e)
+    {
+        /// Same rethrow convention as putOverwriteControlled/putIfAbsentControlledMutable: a
+        /// deterministic local bug, or a whitelisted synchronous rejection that PROVES the request was
+        /// never applied, surfaces unchanged -- SlotOccupyResult::Kind has no DefiniteFailure member to
+        /// carry either one. Anything else is ambiguous: fall through to the raw resolve GET below,
+        /// exactly like a clean PreconditionFailed -- this primitive cannot and does not distinguish
+        /// the two.
+        if (const auto * db_e = dynamic_cast<const Exception *>(&e); db_e && isDeterministicLocalFailure(db_e->code()))
+            throw;
+        if (classifyConditionalWriteResult(e) == CasWriteOutcome::DefiniteFailure)
+            throw;
+    }
+
+    if (put && put->outcome == PutOutcome::Done)
+        return {.kind = SlotOccupyResult::Kind::Created, .occupant_bytes = {}, .occupant_token = {},
+                .unresolved_reason = CasUnresolvedReason::NotUnresolved};
+
+    /// Ambiguous attempt or a clean conflict: resolve with exactly ONE raw exact GET -- no byte-compare,
+    /// no throw on a different occupant [codex finding 3: this is a DEDICATED slot operation, not
+    /// putIfAbsentControlled (which retries the same (key, bytes) internally) or resolveByExactGet
+    /// (which compares against an expected body and throws CORRUPTED_DATA on a mismatch) composed
+    /// together]. Adjudicating whether the occupant is "mine" is entirely the CALLER's job (the
+    /// CaCasMountCore `mine` contract), never this primitive's.
+    std::optional<GetResult> got;
+    try
+    {
+        got = backend->get(key_s);
+    }
+    catch (const std::exception &)
+    {
+        got.reset();   /// the GET itself failed: still unresolved -- a one-shot primitive never retries
+    }
+
+    if (!got)
+        /// The occupant that caused the conflict vanished before this GET (or the GET itself failed):
+        /// the outcome is unknowable right now -- NEVER a fabricated Created.
+        return {.kind = SlotOccupyResult::Kind::Unresolved, .occupant_bytes = {}, .occupant_token = {},
+                .unresolved_reason = CasUnresolvedReason::AttemptsExhausted};
+
+    return {.kind = SlotOccupyResult::Kind::Occupied, .occupant_bytes = std::move(got->bytes),
+            .occupant_token = got->token, .unresolved_reason = CasUnresolvedReason::NotUnresolved};
+}
+
 }

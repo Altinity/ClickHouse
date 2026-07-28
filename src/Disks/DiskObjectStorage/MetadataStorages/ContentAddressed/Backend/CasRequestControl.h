@@ -317,6 +317,36 @@ struct CasOverwriteResult
     Token token;   /// set ONLY on Committed
 };
 
+/// Result of one `CasRequestController::slotOccupy` operation — a WRITE-ONCE conditional create whose
+/// body is content-addressed or otherwise not byte-comparable across separate CALLS the way
+/// `putOverwriteControlled`'s deterministic marker is (each caller of `slotOccupy` — an epoch seal, a
+/// wedge retry — mints its own attempt and decides for itself, from `Occupied`'s bytes, whether the
+/// occupant is its own earlier write or something else entirely; see the adjudication note below).
+///   - Created:    this call's OWN conditional create committed — the key held nothing before it.
+///   - Occupied:   the key already holds an object, observed by ONE raw exact `GET` after the create
+///     conflicted — `occupant_bytes`/`occupant_token` name exactly what is there NOW. The primitive
+///     never compares these bytes against what this call attempted and never throws on a mismatch:
+///     unlike `resolveByExactGet` (whose caller supplies ONE expected body across every retry of the
+///     SAME logical attempt), `slotOccupy` never retries, so there is no "our earlier attempt" to
+///     distinguish from a genuine foreign occupant — that adjudication (the `CaCasMountCore` `mine`
+///     contract: an occupant is this caller's write only if the BYTES match, never a generation/shape
+///     match alone) is entirely the CALLER's job.
+///   - Unresolved: the outcome is unknowable right now — a pre-attempt gate refused (fence lost /
+///     deadline exhausted, `unresolved_reason == NoAttemptSent`, nothing was sent), or the conditional
+///     create was itself ambiguous (a transient exception) and the follow-up resolve GET found nothing
+///     (the occupant that caused the conflict vanished before the GET, or the GET itself failed) — NEVER
+///     fabricated into a false `Created`.
+struct SlotOccupyResult
+{
+    enum class Kind : uint8_t { Created, Occupied, Unresolved };
+    Kind kind = Kind::Unresolved;
+    /// Occupied only: the occupant, fetched by exact GET after the conditional create conflicted.
+    String occupant_bytes;
+    Token occupant_token;
+    /// Unresolved only: why the attempt outcome is unknowable right now.
+    CasUnresolvedReason unresolved_reason{};
+};
+
 /// CAS-owned retry controller: the only place that decides whether a conditional-write attempt may be
 /// reissued. It does not touch a writer cache or return ACK. Callers update their cache and acknowledge
 /// the operation only after this controller has resolved the outcome and performed its final fence
@@ -452,6 +482,38 @@ public:
     /// Same DefiniteFailure/deterministic-local-failure rethrow convention as `putOverwriteControlled`.
     CasOverwriteResult putIfAbsentControlledMutable(std::string_view key, std::string_view bytes,
                                                     const std::function<bool()> & fence_ok);
+
+    /// A DEDICATED RAW slot-occupy primitive [codex finding 3]: exactly ONE fence/deadline-gated
+    /// conditional create of `bytes` at `key`; on conflict, exactly ONE raw exact `GET` of the
+    /// occupant. NEVER retries internally, NEVER lists, and NEVER composes `putIfAbsentControlled`
+    /// (which retries the SAME (key, bytes) internally) or `resolveByExactGet` (which compares against
+    /// an expected body and throws `CORRUPTED_DATA` on a mismatch) — both contradict "one conditional
+    /// create" and `Occupied(bytes, token)` respectively. This is the primitive every seal writer and
+    /// wedge retry uses (spec INV-2): each CALL is one bounded attempt, and a caller that wants to keep
+    /// trying calls this again later, under its OWN fence/deadline/backoff discipline.
+    ///
+    /// Pre-attempt gate ONLY: `fence_ok` and the operation deadline are checked ONCE, before the (only)
+    /// attempt — a refusal there sends nothing and reports `Unresolved`/`NoAttemptSent`, exactly like
+    /// every other controlled op's FIRST iteration. UNLIKE `putIfAbsentControlled` /
+    /// `conditionalCreateControlled` / `putOverwriteControlled` / `putIfAbsentControlledMutable`, there
+    /// is deliberately no POST-write fence recheck here: `fence_ok` is evaluated once per attempt, and
+    /// since this primitive makes exactly one attempt, admission-fence discipline across an outer
+    /// caller-driven retry (including verifying a `Created`/`Occupied` result is still relevant after
+    /// the I/O) is the CALLER's contract (Task 6's post-I/O recheck under its own state lock).
+    ///
+    /// A whitelisted synchronous rejection (`classifyConditionalWriteResult`'s `DefiniteFailure`) or a
+    /// deterministic local failure (`isDeterministicLocalFailure`) RETHROWS the original exception
+    /// unchanged — the same convention as `conditionalCreateControlled`/`putOverwriteControlled`/
+    /// `putIfAbsentControlledMutable` (`SlotOccupyResult::Kind` has no `DefiniteFailure` member to carry
+    /// it). Any other exception, or a clean `PreconditionFailed`, is ambiguous and falls through to the
+    /// resolve GET identically — this primitive cannot and does not distinguish the two.
+    ///
+    /// Op-count contract (asserted by every `gtest_cas_slot_occupy.cpp` test): `Created` costs exactly
+    /// one backend op (the create); `Occupied` costs exactly two (the create, then the resolve GET);
+    /// `Unresolved` costs at most two (zero when a pre-attempt gate refuses, otherwise the create plus
+    /// a resolve GET that came up empty or failed).
+    SlotOccupyResult slotOccupy(std::string_view key, std::string_view bytes,
+                                const std::function<bool()> & fence_ok);
 
     /// Test-only: replace the inter-attempt backoff sleep (e.g. with a no-op) on an already-constructed
     /// controller — for tests that reach the controller only through a fully-wired Pool/disk and cannot

@@ -112,6 +112,17 @@ public:
     /// Injects a one-shot artificial `Conflict` on the next `casPut` for `key`.
     void failNextCasPut(const String & key);
 
+    /// Injects a one-shot AMBIGUOUS outcome on the next `putIfAbsent` for `key`: instead of attempting
+    /// the write, that call throws a plain (non-`DB::Exception`) exception -- classified `Unresolved`,
+    /// never `DefiniteFailure`, by `classifyConditionalWriteResult` regardless of build flags -- and the
+    /// store is left exactly as it was. Models a request whose own HTTP attempt outcome is lost (a
+    /// timeout, a dropped connection) rather than a clean `PreconditionFailed`, for tests of controlled
+    /// ops (`CasRequestController::slotOccupy` and its callers) that must exercise the "ambiguous
+    /// attempt, resolve before deciding" path without a live network. One-shot, mirroring
+    /// `failNextCasPut`'s contract: consumed by the first matching `putIfAbsent` call, whether the key
+    /// was already present or not.
+    void injectAmbiguousPutIfAbsent(const String & key);
+
     /// Enables or disables token checks for delete, overwrite, and CAS operations. Disabling checks
     /// models a backend that reports every expected token as matching.
     void setEnforceTokens(bool enforce);
@@ -154,6 +165,7 @@ private:
     bool hold_deletes_ = false;
     std::vector<PendingDelete> pending_deletes_;
     std::set<String> fail_next_cas_;
+    std::set<String> ambiguous_put_keys_;
     bool enforce_tokens_ = true;
     bool simulate_delete_markers_ = false;
 };

@@ -4,6 +4,7 @@
 #include <Common/Exception.h>
 #include <base/defines.h>
 #include <algorithm>
+#include <stdexcept>
 
 namespace DB
 {
@@ -131,6 +132,17 @@ HeadResult InMemoryBackend::head(const String & key)
 PutResult InMemoryBackend::putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta)
 {
     std::lock_guard lock(mutex_);
+
+    // One-shot injected ambiguous outcome: throw WITHOUT touching the store, modeling a request whose
+    // own attempt outcome never reached the caller (see the header doc for the classification this
+    // must produce).
+    auto ambiguous_it = ambiguous_put_keys_.find(key);
+    if (ambiguous_it != ambiguous_put_keys_.end())
+    {
+        ambiguous_put_keys_.erase(ambiguous_it);
+        throw std::runtime_error("InMemoryBackend: injected ambiguous putIfAbsent outcome for '" + key + "'");
+    }
+
     if (store_.contains(key))
         return {PutOutcome::PreconditionFailed, {}};
 
@@ -384,6 +396,12 @@ void InMemoryBackend::failNextCasPut(const String & key)
 {
     std::lock_guard lock(mutex_);
     fail_next_cas_.insert(key);
+}
+
+void InMemoryBackend::injectAmbiguousPutIfAbsent(const String & key)
+{
+    std::lock_guard lock(mutex_);
+    ambiguous_put_keys_.insert(key);
 }
 
 void InMemoryBackend::setEnforceTokens(bool enforce)
