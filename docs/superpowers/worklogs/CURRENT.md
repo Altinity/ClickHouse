@@ -1245,3 +1245,6 @@ no new TLC yet, normal. No push.
 **2026-07-28 08:3x UTC watchdog** — task 3 fix round 1 landed (c34fa479490: ZombieGoLive route,
 13/13 + BOUND=5); re-reviewer (sonnet) reading the 113 KB diff. Zombie tla-task3 stood down after
 its late wake — models/ clean, no clobber. No push.
+
+**2026-07-28 08:5x UTC watchdog** — task 4 productive: module rewritten (12 KB), safe +
+noincarnation configs through TLC (08:18-19). Commit/report pending. No push.
