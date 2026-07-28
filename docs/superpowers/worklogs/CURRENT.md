@@ -1484,3 +1484,7 @@ worktree) running in parallel, both opus, scope-fenced. No push.
 
 **2026-07-28 19:40 local watchdog** — lane G: baseline gate run complete (19:33); lane L: reading
 phase (no artifacts yet, ~15 min in — normal for the wedge brief's obligation load). No push.
+
+**2026-07-28 20:00 local watchdog** — both lanes iterating healthily: L on task4 debug builds +
+second suite run (19:58-59), G on build3 + targeted refgc runs (20:00). No commits yet either
+side. No push.
