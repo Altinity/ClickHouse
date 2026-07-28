@@ -1357,3 +1357,6 @@ ticks mislabeled +2h — clock now taken from `date` directly.) No push.
 legitimate. Both plans revised (headline: Stage A destruction globally suppressed until Stage B's
 catalog — the pool-wide in-degree argument killed the standalone-deletion claim; prev_epoch_seal
 now populated on the ordinary writer path). Round 2 review running. No push.
+
+**2026-07-28 13:40 local watchdog** — codex r2 active (log 451 KB, seconds-fresh), no marker yet.
+No push.
