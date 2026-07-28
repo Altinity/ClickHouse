@@ -24,8 +24,8 @@
 ///
 /// The id an append persists is not drawn from a counter at all -- it is DERIVED from the table's own
 /// durable state: `{live_epoch, greatest_applied.ref_sequence + 1}` within one epoch, `{live_epoch, 1}`
-/// at an epoch change. Two consequences this suite pins, both of which the pool-wide
-/// `next_ref_sequence` counter made impossible:
+/// at an epoch change. Two consequences this suite pins, both of which the pool-wide counter this
+/// replaced made impossible:
 ///
 ///   1. namespaces are independent -- a busy table cannot push another table's ids up, so `(namespace,
 ///      epoch)` ids are dense `1..T` and a reader can tell "this stream is complete" from the ids alone;
