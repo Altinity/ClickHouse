@@ -1599,3 +1599,7 @@ coding on lane L. No push.
 **2026-07-28 23:00 local watchdog** — T5 deep in cycle: ckpt suite run + release gate running
 (logs seconds-fresh), format+ledger edits in working tree, no commit yet. T8 closing
 confirmation still reading. No push.
+
+**2026-07-29 00:2x local** — T8 CLOSED (11 lane commits; deepest review of the stage). T9
+dispatched on lane G (10-obligation list). T8->main merge deferred until T5's commit frees
+ProfileEvents.cpp. No push.
