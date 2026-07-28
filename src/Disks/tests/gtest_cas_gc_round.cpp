@@ -145,7 +145,7 @@ size_t driveToFixpoint(InMemoryBackend & backend, const PoolPtr & store, Gc & gc
     size_t working_rounds = 0;
     for (size_t r = 0; r < 64; ++r)
     {
-        const RoundReport rep = runAuthoritativeRound(gc);
+        const RoundReport rep = runRegularRoundReclaiming(gc);
         if (!rep.acquired_lease)
             continue;
         store->renewWatermarkOnce();
@@ -625,11 +625,11 @@ TEST(CasGcRound, PreviewReportsCondemnedRowsAndIsWriteFree)
     publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
 
     Gc gc(store, kGc);
-    runAuthoritativeRound(gc);                 /// round 1: folds the +1; blob referenced
+    runRegularRoundReclaiming(gc);                 /// round 1: folds the +1; blob referenced
     EXPECT_TRUE(gc.previewDeletes().empty()) << "a live-referenced blob is never previewed for deletion";
 
     dropRefTransition(*backend, store->layout(), ns, "tbl", r);
-    runAuthoritativeRound(gc);                 /// condemning round: -1 => in-degree 0 => kCondemned row (not pending)
+    runRegularRoundReclaiming(gc);                 /// condemning round: -1 => in-degree 0 => kCondemned row (not pending)
 
     /// Write-free contract: a full key->token snapshot must be identical across the previewDeletes call.
     const auto before = snapshotKeyTokens(*backend);
@@ -644,14 +644,14 @@ TEST(CasGcRound, PreviewReportsCondemnedRowsAndIsWriteFree)
     EXPECT_FALSE(awaiting[0].token.value.empty()) << "must carry the stored condemn-time token";
     EXPECT_GT(awaiting[0].condemn_round, 0u) << "must carry the stored condemn round";
 
-    runAuthoritativeRound(gc);                 /// graduation round: entry becomes delete_pending (blob still present)
+    runRegularRoundReclaiming(gc);                 /// graduation round: entry becomes delete_pending (blob still present)
     const std::vector<Gc::PreviewEntry> pending = gc.previewDeletes();
     ASSERT_EQ(pending.size(), 1u);
     EXPECT_EQ(pending[0].ref, (DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(blob)}));
     EXPECT_EQ(pending[0].reason, "delete_pending");
     EXPECT_FALSE(pending[0].token.value.empty());
 
-    runAuthoritativeRound(gc);                 /// redelete round: exact-token delete; entry dropped; blob gone
+    runRegularRoundReclaiming(gc);                 /// redelete round: exact-token delete; entry dropped; blob gone
     EXPECT_FALSE(blobExists(*backend, store->layout(), blob));
     EXPECT_TRUE(gc.previewDeletes().empty()) << "nothing to preview once the blob is redeleted";
 }
@@ -777,7 +777,7 @@ TEST(CasGcRound, RoundSummaryCountsManifestBodyDeletes)
     uint64_t total_blob_deleted = 0;
     for (size_t i = 0; i < 64; ++i)
     {
-        const RoundReport rep = runAuthoritativeRound(gc);
+        const RoundReport rep = runRegularRoundReclaiming(gc);
         if (!rep.acquired_lease)
             continue;
         store->renewWatermarkOnce();
@@ -1003,13 +1003,13 @@ TEST(CasGcRound, SplitBrainLeadersOnlyDuplicateWork)
     Gc gc2(store, kGcB);
 
     /// gc1 leads; fold the publish edge.
-    ASSERT_TRUE(runAuthoritativeRound(gc1).acquired_lease);
+    ASSERT_TRUE(runRegularRoundReclaiming(gc1).acquired_lease);
     EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 1);
 
     /// The ref is dropped; gc1 stalls. gc2 observes the frozen lease twice and STEALS (new epoch).
     dropRefTransition(*backend, store->layout(), ns, "tbl", r);
-    EXPECT_FALSE(runAuthoritativeRound(gc2).acquired_lease);   /// obs #1
-    ASSERT_TRUE(runAuthoritativeRound(gc2).acquired_lease);    /// obs #2 => steal
+    EXPECT_FALSE(runRegularRoundReclaiming(gc2).acquired_lease);   /// obs #1
+    ASSERT_TRUE(runRegularRoundReclaiming(gc2).acquired_lease);    /// obs #2 => steal
 
     /// Both leaders now drive rounds. The blob is collected exactly once; duplicate attempts are
     /// harmless. No round throws.
@@ -1088,7 +1088,7 @@ TEST(CasGcSnapRetention, PrunesOldGenerationsKeepingLastThree)
     /// Several quiescent rounds, each advancing the generation pointer (fold + completion). Enough to
     /// push generations below the floor.
     for (int i = 0; i < 8; ++i)
-        ASSERT_TRUE(runAuthoritativeRound(gc).acquired_lease);
+        ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
 
     const GcState st = readState(*backend, *store);
     const uint64_t keep = 3;
@@ -1138,7 +1138,7 @@ TEST(CasGcSnapRetention, WholesalePruneReclaimsAllAttemptsIncludingRetiredOutcom
     Gc gc(store, kGc);
     /// One round to establish the first completed generation and learn its adopted attempt (derive both
     /// from gc/state — never hardcode a generation; the round folds and completes, so it is > 1).
-    ASSERT_TRUE(runAuthoritativeRound(gc).acquired_lease);
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
     const GcState st1 = readState(*backend, *store);
     ASSERT_GT(st1.snap_generation, 0u);
     const uint64_t old_gen = st1.snap_generation;
@@ -1163,7 +1163,7 @@ TEST(CasGcSnapRetention, WholesalePruneReclaimsAllAttemptsIncludingRetiredOutcom
 
     /// Age generation 1 well past the retention floor (keep=3): several more quiescent rounds.
     for (int i = 0; i < 8; ++i)
-        ASSERT_TRUE(runAuthoritativeRound(gc).acquired_lease);
+        ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
 
     const GcState st = readState(*backend, *store);
     ASSERT_GT(st.snap_generation, old_gen + 3) << "generation 1 must be below the retention floor";
@@ -1209,8 +1209,8 @@ TEST(CasGcSnapRetention, ReclaimsNonAdoptedCurrentGenAttemptViaRetention)
 
     Gc gc(store, kGc);
     /// Drive a couple of rounds so snap_attempt is comfortably above 0 (a low orphan seq exists below it).
-    ASSERT_TRUE(runAuthoritativeRound(gc).acquired_lease);
-    ASSERT_TRUE(runAuthoritativeRound(gc).acquired_lease);
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
     const GcState st = readState(*backend, *store);
     ASSERT_GT(st.snap_attempt, 0u) << "need snap_attempt > 0 so a strictly-older orphan attempt exists";
 
@@ -1225,7 +1225,7 @@ TEST(CasGcSnapRetention, ReclaimsNonAdoptedCurrentGenAttemptViaRetention)
 
     /// One more round folds into `orphan_gen` and completes. The orphan must SURVIVE this round — there
     /// is no current-generation sweep; retention has not yet reached `orphan_gen`.
-    ASSERT_TRUE(runAuthoritativeRound(gc).acquired_lease);
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
     EXPECT_TRUE(backend->head(orphan_seal).exists)
         << "orphan must survive its own round — there is no per-round current-gen sweep";
 
@@ -1233,7 +1233,7 @@ TEST(CasGcSnapRetention, ReclaimsNonAdoptedCurrentGenAttemptViaRetention)
     /// wholesale generation-retention prune then reclaims the WHOLE `gc/gen/<orphan_gen>/` subtree,
     /// including this non-adopted attempt's debris.
     for (int i = 0; i < 8; ++i)
-        ASSERT_TRUE(runAuthoritativeRound(gc).acquired_lease);
+        ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
 
     const GcState st_after = readState(*backend, *store);
     ASSERT_GT(st_after.snap_generation, orphan_gen + 3) << "orphan_gen must be below the retention floor";
@@ -1268,7 +1268,7 @@ TEST(CasGcRetention, PruneRetainsLiveReferencedRun)
     publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
 
     Gc gc(store, kGc);
-    runAuthoritativeRound(gc);   // gen 1: the blob's run is sealed under gen-1's key namespace
+    runRegularRoundReclaiming(gc);   // gen 1: the blob's run is sealed under gen-1's key namespace
     const GcState st1 = readState(*backend, *store);
     const uint64_t ref_gen = st1.snap_generation;
 
@@ -1285,7 +1285,7 @@ TEST(CasGcRetention, PruneRetainsLiveReferencedRun)
     /// and, once adopted_generation > keep, drives the retention prune forward. gen-1 is referenced every
     /// round, so it is SKIPPED (retained) even as `snap_pruned_through` climbs past it.
     for (int i = 0; i < 6; ++i)
-        ASSERT_TRUE(runAuthoritativeRound(gc).acquired_lease);
+        ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
 
     const GcState st = readState(*backend, *store);
     /// The cursor has advanced strictly past the referenced generation (the retention prune SKIPPED it
@@ -1327,7 +1327,7 @@ TEST(CasGcRetention, HandOffDeletesSupersededRef)
     publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r1);
 
     Gc gc(store, kGc);
-    runAuthoritativeRound(gc);   // gen 1: run sealed under gen-1
+    runRegularRoundReclaiming(gc);   // gen 1: run sealed under gen-1
     const GcState st1 = readState(*backend, *store);
     const uint64_t old_gen = st1.snap_generation;
     const String old_prefix = store->layout().gcGenPrefix(old_gen);
@@ -1337,7 +1337,7 @@ TEST(CasGcRetention, HandOffDeletesSupersededRef)
     /// does, a normal prune could still reclaim gen-1 when the ref moves — the hand-off is only load-
     /// bearing once gen-1 is BEHIND the cursor.
     for (int i = 0; i < 6; ++i)
-        ASSERT_TRUE(runAuthoritativeRound(gc).acquired_lease);
+        ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
     ASSERT_GT(readState(*backend, *store).snap_pruned_through, old_gen)
         << "gen-1 must be behind the retention cursor before the hand-off is exercised";
     /// gen-1 is retained (referenced) even though the cursor passed it.
@@ -1351,7 +1351,7 @@ TEST(CasGcRetention, HandOffDeletesSupersededRef)
     writeManifestRaw(*backend, store->layout(), ns, r2, {blobEntryFor("b", DB::UInt128(2))});
     publishCommittedTransition(*backend, store->layout(), ns, "tbl", r1, r2);
 
-    ASSERT_TRUE(runAuthoritativeRound(gc).acquired_lease);   // folds through the carried ref; ref leaves gen-1
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);   // folds through the carried ref; ref leaves gen-1
 
     /// The seal no longer references gen-1 ...
     const GcState st_after = readState(*backend, *store);
@@ -1518,7 +1518,7 @@ TEST(CasGcRound, OrphanManifestCursorSweepDeletesAndPersistsCursor)
     setWatermarkMinActive(*backend, store->layout(), "test", r1.writer_epoch, /*min_active*/6);
 
     Gc gc(store, kGc);
-    ASSERT_TRUE(runAuthoritativeRound(gc).acquired_lease);
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
     const GcState after_first = readState(*backend, *store);
     EXPECT_FALSE(after_first.manifest_sweep_cursor.empty());
 
@@ -1526,7 +1526,7 @@ TEST(CasGcRound, OrphanManifestCursorSweepDeletesAndPersistsCursor)
     const bool second_exists = manifestExists(*backend, store->layout(), ManifestId{ns, r2});
     EXPECT_NE(first_exists, second_exists);
 
-    ASSERT_TRUE(runAuthoritativeRound(gc).acquired_lease);
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
     const GcState after_second = readState(*backend, *store);
     EXPECT_TRUE(after_second.manifest_sweep_cursor.empty());
     EXPECT_FALSE(manifestExists(*backend, store->layout(), ManifestId{ns, r1}));

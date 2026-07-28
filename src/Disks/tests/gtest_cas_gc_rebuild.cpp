@@ -93,9 +93,9 @@ TEST(CasGcRebuild, RecoversLostStateAndConverges)
     publishCommittedTransition(*backend, store->layout(), ns, "tbl_live", std::nullopt, live_r);
     publishCommittedTransition(*backend, store->layout(), ns, "tbl_dead", std::nullopt, dead_r);
     Gc gc(store, kGc);
-    runAuthoritativeRound(gc);
+    runRegularRoundReclaiming(gc);
     dropRefTransition(*backend, store->layout(), ns, "tbl_dead", dead_r);
-    runAuthoritativeRound(gc);   /// -1 folds; eager trim cuts the journal
+    runRegularRoundReclaiming(gc);   /// -1 folds; eager trim cuts the journal
     store->renewWatermarkOnce();   /// renews the lease + build-watermark floor
 
     /// Capture the round reached before gc/state is destroyed (the rebuild must mint strictly above it).
@@ -110,7 +110,7 @@ TEST(CasGcRebuild, RecoversLostStateAndConverges)
     /// double-applied. That first round also re-mints a superficially-healthy gc/state (snap_generation 0),
     /// so the recovery is a DELIBERATE force-rebuild (the auto-rebuild correctly refuses to discard a
     /// state that "looks healthy" without the operator's force).
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { runAuthoritativeRound(gc2); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { runRegularRoundReclaiming(gc2); });
 
     const RebuildReport rep = gc2.rebuildBaseline(/*force*/ true);
     ASSERT_TRUE(rep.performed) << rep.refusal;

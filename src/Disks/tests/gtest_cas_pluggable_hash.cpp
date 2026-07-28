@@ -770,13 +770,13 @@ TEST(CasPluggableHash, TwoAlgoOrphansBothFullyReclaimed)
     /// minted round; the VERY NEXT round graduates them (unconditionally, round-paced); the round
     /// after that executes the exact-token delete for both.
     {
-        const RoundReport rep1 = runAuthoritativeRound(gc);
+        const RoundReport rep1 = runRegularRoundReclaiming(gc);
         EXPECT_EQ(rep1.graduated, 2u) << "both algos' orphans must graduate together in one round";
         EXPECT_TRUE(backend->head(ch_key).exists);   // pending: still present this pass
         EXPECT_TRUE(backend->head(sh_key).exists);
     }
     {
-        const RoundReport rep2 = runAuthoritativeRound(gc);
+        const RoundReport rep2 = runRegularRoundReclaiming(gc);
         EXPECT_EQ(rep2.redeleted, 2u) << "both algos' pending deletes must execute together in one round";
     }
 
@@ -870,7 +870,7 @@ TEST(CasPluggableHash, SameDigestDifferentAlgoDistinctBodiesAndSettlement)
     /// Distinct settlement (in-degree per ref, keyed on the FULL `BlobRef` pair -- never the shared
     /// bare digest, which would alias the two rows into one).
     Gc gc(store, UInt128(1));
-    runAuthoritativeRound(gc);
+    runRegularRoundReclaiming(gc);
     {
         const GcState st = decodeGcState(backend->get(store->layout().gcStateKey())->bytes);
         const CasFoldSeal seal = decodeFoldSeal(
@@ -882,9 +882,9 @@ TEST(CasPluggableHash, SameDigestDifferentAlgoDistinctBodiesAndSettlement)
     /// Dropping ONLY `part_a`'s committed ref condemns+reclaims ONLY `ch128:X`; `xxh3:X` (the SAME
     /// digest value, a DIFFERENT algo) stays referenced and fully readable throughout.
     store->dropRef(ns, "part_a");
-    runAuthoritativeRound(gc);   // condemns ch128:X (in-degree drops to 0); xxh3:X is untouched (still ref'd)
-    runAuthoritativeRound(gc);   // graduates ch128:X
-    runAuthoritativeRound(gc);   // executes the exact-token delete for ch128:X
+    runRegularRoundReclaiming(gc);   // condemns ch128:X (in-degree drops to 0); xxh3:X is untouched (still ref'd)
+    runRegularRoundReclaiming(gc);   // graduates ch128:X
+    runRegularRoundReclaiming(gc);   // executes the exact-token delete for ch128:X
 
     EXPECT_FALSE(backend->head(key_ch).exists) << "ch128:X must be reclaimed once its ref is dropped";
     EXPECT_TRUE(backend->head(key_xx).exists)

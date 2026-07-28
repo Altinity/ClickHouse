@@ -537,7 +537,7 @@ TEST(CasGcFold, RoundSideAnomalySuppressesNamespaceAndRefLogCleanupToo)
     const ManifestRef b = ref("srv-a:2", 2, 0xBB);
     writeManifestRaw(*backend, layout, ns_clamp, a, {blobEntryFor("a", DB::UInt128(1))});
     publishCommittedTransition(*backend, layout, ns_clamp, "r1", std::nullopt, a);
-    runAuthoritativeRound(gc);   /// folds A cleanly; establishes the baseline before the clamp
+    runRegularRoundReclaiming(gc);   /// folds A cleanly; establishes the baseline before the clamp
 
     /// Namespace 2: a namespace mid-removal -- a `Pending` cleanup item (a bare `remove_namespace` op, no
     /// committed refs at all, so there is no owner-removal edge and hence no `mf_cleanup` entry that would
@@ -573,7 +573,7 @@ TEST(CasGcFold, RoundSideAnomalySuppressesNamespaceAndRefLogCleanupToo)
         {ownerTransitionOp(RefOwnerBinding{RefOwnerKind::Committed, "r1", a}, std::nullopt),
          ownerTransitionOp(std::nullopt, RefOwnerBinding{RefOwnerKind::Precommit, "r2", b})});
 
-    const RoundReport rep = runAuthoritativeRound(gc);
+    const RoundReport rep = runRegularRoundReclaiming(gc);
     ASSERT_TRUE(rep.hasAnomaly(ns_clamp, /*shard*/0)) << "the missing B body must clamp this round";
     EXPECT_EQ(rep.deleted, 0u);
     EXPECT_EQ(rep.redeleted, 0u);
@@ -590,7 +590,7 @@ TEST(CasGcFold, RoundSideAnomalySuppressesNamespaceAndRefLogCleanupToo)
     /// Heal the clamp and run a clean round: NOW both passes reclaim their targets, proving the setup was
     /// genuinely cleanup-eligible and not vacuously untouched.
     writeManifestRaw(*backend, layout, ns_clamp, b, {blobEntryFor("b", DB::UInt128(2))});
-    const RoundReport clean_rep = runAuthoritativeRound(gc);
+    const RoundReport clean_rep = runRegularRoundReclaiming(gc);
     EXPECT_FALSE(clean_rep.hasAnomaly(ns_clamp, /*shard*/0));
     EXPECT_FALSE(backend->head(debris_key).exists) << "a clamp-free round reclaims the removed namespace's debris";
     EXPECT_FALSE(backend->head(covered_log_key).exists) << "a clamp-free round cleans the covered ref-log";

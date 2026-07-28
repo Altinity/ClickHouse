@@ -40,7 +40,7 @@ size_t runGcToFixpoint(const PoolPtr & s, Gc & gc, size_t max_rounds = 64)
     size_t rounds = 0;
     for (; rounds < max_rounds; ++rounds)
     {
-        const RoundReport rep = runAuthoritativeRound(gc);
+        const RoundReport rep = runRegularRoundReclaiming(gc);
         if (!rep.acquired_lease)
             continue;
         s->renewWatermarkOnce();
@@ -105,7 +105,7 @@ TEST(CasGcReplay, FreshAttemptRerunCompletes)
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
     publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
     Gc gc(store, kGc);
-    runAuthoritativeRound(gc);
+    runRegularRoundReclaiming(gc);
     store->renewWatermarkOnce();
     dropRefTransition(*backend, store->layout(), ns, "tbl", r);
 
@@ -115,7 +115,7 @@ TEST(CasGcReplay, FreshAttemptRerunCompletes)
     EXPECT_FALSE(blobExists(*backend, store->layout(), DB::UInt128(1)));
 
     // Re-running again is a clean no-op (idempotent): the blob stays gone, no throw.
-    EXPECT_NO_THROW(runAuthoritativeRound(gc));
+    EXPECT_NO_THROW(runRegularRoundReclaiming(gc));
     EXPECT_FALSE(blobExists(*backend, store->layout(), DB::UInt128(1)));
 }
 
@@ -137,7 +137,7 @@ TEST(CasGcReplay, DeposedRoundRerunsUnderFreshAttempt)
 
     // First leader folds + adopts the first (snap_generation, snap_attempt).
     Gc gc1(store, hexToU128("00000000000000000000000000000001"));
-    runAuthoritativeRound(gc1);
+    runRegularRoundReclaiming(gc1);
     store->renewWatermarkOnce();
     const auto after_fold = decodeGcState(backend->get(store->layout().gcStateKey())->bytes);
     ASSERT_EQ(after_fold.snap_attempt, after_fold.lease.seq);
@@ -148,7 +148,7 @@ TEST(CasGcReplay, DeposedRoundRerunsUnderFreshAttempt)
     // but the commit never adopted them — pure unadopted debris. gc/state is unchanged.
     dropRefTransition(*backend, store->layout(), ns, "tbl", r);
     backend->arm_interrupt = true;
-    EXPECT_THROW(runAuthoritativeRound(gc1), DB::Exception);
+    EXPECT_THROW(runRegularRoundReclaiming(gc1), DB::Exception);
     backend->arm_interrupt = false;
 
     const auto after_interrupt = decodeGcState(backend->get(store->layout().gcStateKey())->bytes);
@@ -166,7 +166,7 @@ TEST(CasGcReplay, DeposedRoundRerunsUnderFreshAttempt)
     // stealing: the first round only observes and defers; the second steals and re-runs the round from
     // scratch under its own fresh attempt.
     Gc gc2(store, hexToU128("00000000000000000000000000000002"));
-    EXPECT_NO_THROW(runAuthoritativeRound(gc2));   // observe-and-defer (lease not yet provably stalled)
+    EXPECT_NO_THROW(runRegularRoundReclaiming(gc2));   // observe-and-defer (lease not yet provably stalled)
     store->renewWatermarkOnce();
 
     // From here gc2 owns the lease; drive it to a fixpoint. It must drain the unreachable blob WITHOUT
@@ -179,6 +179,6 @@ TEST(CasGcReplay, DeposedRoundRerunsUnderFreshAttempt)
     EXPECT_NE(after_drain.snap_attempt, deposed_attempt) << "the drained round never adopted the deposed attempt";
 
     // A further round is a clean no-op.
-    EXPECT_NO_THROW(runAuthoritativeRound(gc2));
+    EXPECT_NO_THROW(runRegularRoundReclaiming(gc2));
     EXPECT_FALSE(blobExists(*backend, store->layout(), DB::UInt128(1)));
 }

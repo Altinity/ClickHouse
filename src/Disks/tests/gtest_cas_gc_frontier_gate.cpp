@@ -314,14 +314,14 @@ DB::UInt128 buildPoolWithWorkAtEverySite(const std::shared_ptr<CountingBackend> 
     for (uint64_t i = 1; i <= 4; ++i)
     {
         publish(*backend, layout, live, "ref_" + std::to_string(i), i, DB::UInt128(0x1000 + i));
-        runAuthoritativeRound(gc);
+        runRegularRoundReclaiming(gc);
         store->renewWatermarkOnce();
     }
 
     /// The condemnable blob: published in `doomed`, then dropped. Its manifest body becomes
     /// owner-removed cleanup work at the same time.
     const ManifestRef mref = publish(*backend, layout, doomed, "doomed_ref", 9, blob);
-    runAuthoritativeRound(gc);
+    runRegularRoundReclaiming(gc);
     store->renewWatermarkOnce();
     dropRefTransition(*backend, layout, doomed, "doomed_ref", mref);
     return blob;
@@ -378,7 +378,7 @@ TEST(CasGcFrontierGate, ASuppressedRoundDoesNotAdvanceTheGenerationPruneCursor)
     for (uint64_t i = 1; i <= 6; ++i)
     {
         publish(*backend, layout, ns, "ref_" + std::to_string(i), i, DB::UInt128(0x2000 + i));
-        runAuthoritativeRound(gc);
+        runRegularRoundReclaiming(gc);
         store->renewWatermarkOnce();
     }
     const uint64_t pruned_through_before =
@@ -416,7 +416,7 @@ TEST(CasGcFrontierGate, TheHandOffReclaimIsInertUnderSuppression)
     const ManifestRef r1 = publish(*backend, layout, ns, "tbl", 1, DB::UInt128(0xa1));
 
     Gc gc(store, kGc);
-    runAuthoritativeRound(gc);
+    runRegularRoundReclaiming(gc);
     store->renewWatermarkOnce();
     const uint64_t old_gen = decodeGcState(backend->get(layout.gcStateKey())->bytes).snap_generation;
     const String old_prefix = layout.gcGenPrefix(old_gen);
@@ -426,7 +426,7 @@ TEST(CasGcFrontierGate, TheHandOffReclaimIsInertUnderSuppression)
     /// ordinary prune could still reclaim it and the hand-off would not be the load-bearing path.
     for (int i = 0; i < 6; ++i)
     {
-        runAuthoritativeRound(gc);
+        runRegularRoundReclaiming(gc);
         store->renewWatermarkOnce();
     }
     ASSERT_GT(decodeGcState(backend->get(layout.gcStateKey())->bytes).snap_pruned_through, old_gen)
@@ -463,7 +463,7 @@ TEST(CasGcFrontierGate, TheHandOffReclaimIsInertUnderSuppression)
     ///
     /// The hand-off itself is not going untested: `CasGcRetention.HandOffDeletesSupersededRef` drives
     /// the same transition on an authoritative round and asserts the prefix IS reclaimed.
-    runAuthoritativeRound(gc);
+    runRegularRoundReclaiming(gc);
     EXPECT_FALSE(backend->list(old_prefix, "", 1000).keys.empty())
         << "the hand-off is a one-shot difference: the suppressed round consumed it, so the prefix is "
            "now fsck's problem rather than a later round's";
@@ -512,7 +512,7 @@ TEST(CasGcFrontierGate, TheOrphanManifestSweepAndItsCursorAreInertUnderSuppressi
     /// The control: the same orphans ARE swept once the universe is authoritative.
     for (int i = 0; i < 4; ++i)
     {
-        runAuthoritativeRound(gc);
+        runRegularRoundReclaiming(gc);
         store->renewWatermarkOnce();
     }
     EXPECT_FALSE(backend->head(layout.manifestKey(ManifestId{ns, r1})).exists);
@@ -535,7 +535,7 @@ TEST(CasGcFrontierGate, AQuietKnownNamespaceCostsExactlyOneExactGet)
     publish(*backend, layout, quiet, "ref_1", 1, DB::UInt128(0x11));
 
     Gc gc(store, kGc);
-    runAuthoritativeRound(gc);
+    runRegularRoundReclaiming(gc);
     store->renewWatermarkOnce();
 
     const RefTxnId sealed = sealedCursorOf(*backend, layout, quiet);
@@ -544,7 +544,7 @@ TEST(CasGcFrontierGate, AQuietKnownNamespaceCostsExactlyOneExactGet)
     /// Now the store stops listing the namespace entirely.
     backend->hidePrefix(layout.refsNamespacePrefix(quiet));
     backend->resetCounts();
-    runAuthoritativeRound(gc);
+    runRegularRoundReclaiming(gc);
 
     const String expected_next =
         layout.refLogKey(quiet, RefTxnId{sealed.writer_epoch, sealed.ref_sequence + 1});
@@ -565,7 +565,7 @@ TEST(CasGcFrontierGate, AWronglyQuietNamespaceIsWalkedTheSameRound)
     publish(*backend, layout, quiet, "ref_1", 1, DB::UInt128(0x11));
 
     Gc gc(store, kGc);
-    runAuthoritativeRound(gc);
+    runRegularRoundReclaiming(gc);
     store->renewWatermarkOnce();
     const RefTxnId sealed_before = sealedCursorOf(*backend, layout, quiet);
 
@@ -573,7 +573,7 @@ TEST(CasGcFrontierGate, AWronglyQuietNamespaceIsWalkedTheSameRound)
     publish(*backend, layout, quiet, "ref_2", 2, late_blob);
     backend->hidePrefix(layout.refsNamespacePrefix(quiet));
 
-    runAuthoritativeRound(gc);
+    runRegularRoundReclaiming(gc);
 
     EXPECT_LT(sealed_before, sealedCursorOf(*backend, layout, quiet))
         << "the probe found the hidden record, so the walk folded it and the cursor advanced";
@@ -598,7 +598,7 @@ TEST(CasGcFrontierGate, AnExhaustedProbeBudgetSealsCursorsAndDeletesNothing)
     const ManifestRef mref = publish(*backend, layout, busy, "busy_ref", 2, blob);
 
     Gc gc(store, kGc);
-    runAuthoritativeRound(gc);
+    runRegularRoundReclaiming(gc);
     store->renewWatermarkOnce();
     const RefTxnId quiet_cursor = sealedCursorOf(*backend, layout, quiet);
     ASSERT_NE(quiet_cursor, (RefTxnId{}));
@@ -656,7 +656,7 @@ TEST(CasGcFrontierGate, ACarriedHoldSuppressesOnARoundThatDetectedNothing)
     writeRefLogTxnRaw(*backend, layout, txn);
 
     Gc gc(store, kGc);
-    runAuthoritativeRound(gc);
+    runRegularRoundReclaiming(gc);
     store->renewWatermarkOnce();
     ASSERT_EQ(sealedCursorOf(*backend, layout, held), (RefTxnId{1, 2}))
         << "round 1 must stop below the gap and hold there";
@@ -697,12 +697,12 @@ TEST(CasGcFrontierGate, ABlobCondemnedThisRoundIsNeverDeletedThisRound)
 
     const ManifestRef mref = publish(*backend, layout, ns, "ref_1", 1, blob);
     Gc gc(store, kGc);
-    runAuthoritativeRound(gc);
+    runRegularRoundReclaiming(gc);
     store->renewWatermarkOnce();
 
     dropRefTransition(*backend, layout, ns, "ref_1", mref);
     backend->resetCounts();
-    runAuthoritativeRound(gc);
+    runRegularRoundReclaiming(gc);
 
     EXPECT_TRUE(backend->head(blobKeyOf(layout, blob)).exists)
         << "the condemning round must not also delete";
@@ -725,14 +725,14 @@ TEST(CasGcFrontierGate, ALateEdgeSparesADeletePendingBlobAtTheDeleteSite)
 
     const ManifestRef mref = publish(*backend, layout, ns, "ref_1", 1, blob);
     Gc gc(store, kGc);
-    runAuthoritativeRound(gc);
+    runRegularRoundReclaiming(gc);
     store->renewWatermarkOnce();
 
     /// Condemn it, then graduate it to delete_pending.
     dropRefTransition(*backend, layout, ns, "ref_1", mref);
-    runAuthoritativeRound(gc);            /// condemn
+    runRegularRoundReclaiming(gc);            /// condemn
     store->renewWatermarkOnce();
-    runAuthoritativeRound(gc);            /// graduate: delete_pending published
+    runRegularRoundReclaiming(gc);            /// graduate: delete_pending published
     store->renewWatermarkOnce();
 
     /// A new owner appears BEFORE the delete pass. The pass recomputes the in-degree from the merge it
@@ -741,7 +741,7 @@ TEST(CasGcFrontierGate, ALateEdgeSparesADeletePendingBlobAtTheDeleteSite)
     writeManifestRaw(*backend, layout, ns, revived, {blobEntryFor("data.bin", blob)});
     publishCommittedTransition(*backend, layout, ns, "revived_ref", std::nullopt, revived);
 
-    runAuthoritativeRound(gc);
+    runRegularRoundReclaiming(gc);
     store->renewWatermarkOnce();
 
     EXPECT_TRUE(backend->head(blobKeyOf(layout, blob)).exists)
@@ -779,12 +779,12 @@ TEST(CasGcFrontierGate, AResurrectedIncarnationSurvivesTheDelayedStaleTokenDelet
     publishCommittedTransition(*backend, layout, ns, "ref_1", std::nullopt, mref);
 
     Gc gc(store, kGc);
-    runAuthoritativeRound(gc);
+    runRegularRoundReclaiming(gc);
     store->renewWatermarkOnce();
     dropRefTransition(*backend, layout, ns, "ref_1", mref);
-    runAuthoritativeRound(gc);            /// condemn: writes the durable Condemned meta
+    runRegularRoundReclaiming(gc);            /// condemn: writes the durable Condemned meta
     store->renewWatermarkOnce();
-    runAuthoritativeRound(gc);            /// graduate: publishes delete_pending against THIS token
+    runRegularRoundReclaiming(gc);            /// graduate: publishes delete_pending against THIS token
     store->renewWatermarkOnce();
 
     const Token condemned_token = backend->head(key).token;
@@ -827,7 +827,7 @@ TEST(CasGcFrontierGate, ATokenlessRelinkMakesTheReceiverEdgeDurableBeforeTheSour
 
     const ManifestRef source_ref = publish(*backend, layout, source, "part_1", 1, blob);
     Gc gc(store, kGc);
-    runAuthoritativeRound(gc);
+    runRegularRoundReclaiming(gc);
     store->renewWatermarkOnce();
     ASSERT_GT(inDegreeOf(*backend, layout, blob), 0);
 
@@ -839,7 +839,7 @@ TEST(CasGcFrontierGate, ATokenlessRelinkMakesTheReceiverEdgeDurableBeforeTheSour
     publishCommittedTransition(*backend, layout, receiver, "part_1", std::nullopt, receiver_ref);
 
     /// The round that observes ONLY the receiver's `+1` -- the exact midpoint of the schedule.
-    runAuthoritativeRound(gc);
+    runRegularRoundReclaiming(gc);
     store->renewWatermarkOnce();
     EXPECT_GE(inDegreeOf(*backend, layout, blob), 2)
         << "at the midpoint both owners are durable; the handoff never dips to zero";
@@ -917,7 +917,7 @@ TEST(CasGcFrontierGate, ThePendingCleanupPassDeletesTheRemovedNamespaceCheckpoin
     const RootNamespace live{"00/live@cas@"};
 
     Gc gc(store, kGc);
-    runAuthoritativeRound(gc);
+    runRegularRoundReclaiming(gc);
     const GcState st = decodeGcState(backend->get(layout.gcStateKey())->bytes);
 
     /// Both namespaces have a `_ckpt`; only one of them is being removed.
@@ -946,7 +946,7 @@ TEST(CasGcFrontierGate, TheCheckpointDeleteIsHeldBySuppressionLikeEveryOtherSite
     const RootNamespace removed{"00/removed@cas@"};
 
     Gc gc(store, kGc);
-    runAuthoritativeRound(gc);
+    runRegularRoundReclaiming(gc);
     const GcState st = decodeGcState(backend->get(layout.gcStateKey())->bytes);
     backend->putIfAbsent(layout.refCkptKey(removed), "checkpoint-body");
 
@@ -972,7 +972,7 @@ TEST(CasGcFrontierGate, TheCheckpointDeleteAbortsOnTheRecreationMarker)
     const RootNamespace removed{"00/removed@cas@"};
 
     Gc gc(store, kGc);
-    runAuthoritativeRound(gc);
+    runRegularRoundReclaiming(gc);
     const GcState st = decodeGcState(backend->get(layout.gcStateKey())->bytes);
 
     const RefTxnId remove_txn{1, 5};

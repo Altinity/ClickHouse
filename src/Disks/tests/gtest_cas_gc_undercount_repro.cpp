@@ -103,7 +103,7 @@ TEST(CasGcUndercount, H2DuplicateCommittedRemovalIsIdempotentNoUnderflow)
     /// v1: publish r1 (owner: none -> committed(r1)). Fold it so blobs 1 and 2 are each pinned at 1.
     publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r1);
     Gc gc(store, kGc);
-    ASSERT_TRUE(runAuthoritativeRound(gc).acquired_lease);
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
     ASSERT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 1);
     ASSERT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(2)), 1);
 
@@ -120,7 +120,7 @@ TEST(CasGcUndercount, H2DuplicateCommittedRemovalIsIdempotentNoUnderflow)
     ASSERT_NO_THROW({
         for (int i = 0; i < 12; ++i)
         {
-            runAuthoritativeRound(gc);
+            runRegularRoundReclaiming(gc);
             store->renewWatermarkOnce();
         }
     }) << "H2 regression: duplicate removal of an already-removed committed ref must NOT underflow; "
@@ -188,7 +188,7 @@ TEST(CasGcUndercount, H1DrainAfterDeposedRemovalFoldDoesNotUnderflow)
 
     Gc gc(store, kGc);
     /// Round 1 (honest): fold +1, pin blob 1.
-    ASSERT_TRUE(runAuthoritativeRound(gc).acquired_lease);
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
     store->renewWatermarkOnce();
     ASSERT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 1);
 
@@ -199,7 +199,7 @@ TEST(CasGcUndercount, H1DrainAfterDeposedRemovalFoldDoesNotUnderflow)
     /// Round 2 (DEPOSED): fold the -1, then the round-commit CAS is denied (ABORTED). The adopted
     /// (snap_generation, snap_attempt) must NOT advance.
     backend->arm_interrupt = true;
-    EXPECT_ANY_THROW(runAuthoritativeRound(gc));
+    EXPECT_ANY_THROW(runRegularRoundReclaiming(gc));
     backend->arm_interrupt = false;
 
     /// Honest drive to fixpoint (advancing the mount ack each round). H1 predicts the re-fold of the -1
@@ -209,7 +209,7 @@ TEST(CasGcUndercount, H1DrainAfterDeposedRemovalFoldDoesNotUnderflow)
     {
         for (int i = 0; i < 32; ++i)
         {
-            runAuthoritativeRound(gc);
+            runRegularRoundReclaiming(gc);
             store->renewWatermarkOnce();
         }
     }
@@ -295,7 +295,7 @@ TEST(CasGcUndercount, H1bFenceWindowRemovalReFoldedNextRoundUnderflows)
 
     Gc gc(store, kGc);
     /// Round 1 (honest): fold +1, pin blob 1 at in-degree 1. Cursor sealed at v1.
-    ASSERT_TRUE(runAuthoritativeRound(gc).acquired_lease);
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
     store->renewWatermarkOnce();
     ASSERT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 1);
 
@@ -308,7 +308,7 @@ TEST(CasGcUndercount, H1bFenceWindowRemovalReFoldedNextRoundUnderflows)
     {
         dropRefTransition(*backend, store->layout(), ns, "tbl", r);
     };
-    ASSERT_TRUE(runAuthoritativeRound(gc).acquired_lease);
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
     backend->arm_drop = false;
 
     /// CORRECT behaviour: the concurrently-dropped blob is reclaimed exactly once and GC stays quiescent —
@@ -317,7 +317,7 @@ TEST(CasGcUndercount, H1bFenceWindowRemovalReFoldedNextRoundUnderflows)
     EXPECT_NO_THROW({
         for (int i = 0; i < 12; ++i)
         {
-            runAuthoritativeRound(gc);
+            runRegularRoundReclaiming(gc);
             store->renewWatermarkOnce();
         }
     }) << "undercount: a concurrent-drop removal was re-folded and drove the blob in-degree < 0";
@@ -357,7 +357,7 @@ TEST(CasGcUndercount, UnrecognizedOwnerTransitionShapeAbortsRoundNeverDeletes)
     /// deletes it.
     publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r1);
     Gc gc(store, kGc);
-    ASSERT_TRUE(runAuthoritativeRound(gc).acquired_lease);
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
     store->renewWatermarkOnce();
     ASSERT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(9)), 1);
     dropRefTransition(*backend, store->layout(), ns, "tbl", r1);
@@ -368,7 +368,7 @@ TEST(CasGcUndercount, UnrecognizedOwnerTransitionShapeAbortsRoundNeverDeletes)
     bool condemned = false;
     for (int i = 0; i < 12 && !condemned; ++i)
     {
-        ASSERT_TRUE(runAuthoritativeRound(gc).acquired_lease);
+        ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
         store->renewWatermarkOnce();
         condemned = (inDegreeOf(*backend, store->layout(), DB::UInt128(9)) == 0);
     }
@@ -398,7 +398,7 @@ TEST(CasGcUndercount, UnrecognizedOwnerTransitionShapeAbortsRoundNeverDeletes)
     for (int i = 0; i < 20; ++i)
     {
         RoundReport rep;
-        ASSERT_NO_THROW(rep = runAuthoritativeRound(gc))
+        ASSERT_NO_THROW(rep = runRegularRoundReclaiming(gc))
             << "round " << i << ": an unrecognized owner_transition shape must abort ref folding, "
                "never throw out of the round";
         store->renewWatermarkOnce();

@@ -219,7 +219,7 @@ void runRounds(const PoolPtr & s, Gc & gc, int rounds)
 {
     for (int i = 0; i < rounds; ++i)
     {
-        DB::Cas::tests::runAuthoritativeRound(gc);
+        DB::Cas::tests::runRegularRoundReclaiming(gc);
         s->renewWatermarkOnce();
     }
 }

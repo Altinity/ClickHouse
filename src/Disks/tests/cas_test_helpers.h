@@ -511,16 +511,19 @@ inline bool blobAbsent(DB::Cas::Backend & backend, const DB::Cas::Layout & layou
     return !backend.head(layout.blobKey(DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(hash)})).exists;
 }
 
-/// ONE round that is allowed to destroy. The destructive gate refuses to act on a universe it cannot
-/// enumerate, and Stage A never can (`UniversePolicy`), so a round left on the production default
-/// reclaims NOTHING. A test whose subject is reclamation therefore has to say so, and this is where it
-/// says it: the test asserts that the universe IT built is closed, which for a unit test over an
-/// `InMemoryBackend` is true by construction -- the test wrote every object in the pool.
+/// ONE round that is allowed to RECLAIM -- the name is the point, so that grepping for the tests whose
+/// subject is reclamation finds exactly them.
+///
+/// The destructive gate refuses to act on a universe it cannot enumerate, and Stage A never can
+/// (`UniversePolicy`), so a round left on the production default reclaims NOTHING. A test whose subject
+/// is reclamation therefore has to say so, and this is where it says it: it asserts that the universe
+/// IT built is closed, which for a unit test over an `InMemoryBackend` is true by construction -- the
+/// test wrote every object in the pool.
 ///
 /// It is a spelled-out call, not a seam: production reaches `runRegularRound` with no third argument
 /// and there is no other way in. Tests that are NOT about reclamation should keep calling
 /// `gc.runRegularRound()` plainly -- on the production default they exercise the gate itself.
-inline DB::Cas::RoundReport runAuthoritativeRound(DB::Cas::Gc & gc)
+inline DB::Cas::RoundReport runRegularRoundReclaiming(DB::Cas::Gc & gc)
 {
     return gc.runRegularRound({}, /*allow_steal*/true, DB::Cas::UniversePolicy::AuthoritativeForTest);
 }
@@ -537,7 +540,7 @@ inline bool runRoundsUntilAbsent(
 {
     for (int i = 0; i < max_rounds; ++i)
     {
-        runAuthoritativeRound(gc);
+        runRegularRoundReclaiming(gc);
         store->renewWatermarkOnce();
         if (blobAbsent(backend, layout, hash))
             return true;

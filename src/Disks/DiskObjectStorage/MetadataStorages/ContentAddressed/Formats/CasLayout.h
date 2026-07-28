@@ -152,6 +152,13 @@ public:
     /// directly under the namespace prefix rather than in a `_log`/`_snap`/`_cleanup` kind directory --
     /// which is also why `parseRefObjectKey` does not recognize it. Stage A shape; Stage B re-keys it
     /// under the namespace's incarnation.
+    ///
+    /// MERGE NOTE: duplicate of Task 5's `refCkptKey`, added here because GC's `_ckpt` leak backstop
+    /// needs the key and Task 5 lands in another lane. KEEP TASK 5's AT MERGE -- the two produce
+    /// BYTE-IDENTICAL strings by construction: Task 5 writes `_ckpt` + `storedSuffix(FormatId::RefCkpt)`,
+    /// and `RefCkpt` is registered `CompressionPolicy::Never`, whose stored suffix is empty. This body
+    /// spells that empty suffix out rather than depending on `FormatId::RefCkpt`, which does not exist
+    /// in this lane yet.
     String refCkptKey(const RootNamespace & ns) const
     {
         return refsNamespacePrefix(ns) + "_ckpt";
