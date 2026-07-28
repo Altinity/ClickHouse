@@ -1234,3 +1234,6 @@ quiet. No push.
 
 **2026-07-28 07:3x UTC watchdog** — task 3 agent silent 45 min, no ping response → re-dispatched
 fresh on opus (tla-task3b), original abandoned. Ledger updated. No push.
+
+**2026-07-28 07:5x UTC watchdog** — task 3b (opus redispatch) productive: module 28 KB written,
+churn configs + witness configs running through TLC (07:17-20). No commit yet. No push.
