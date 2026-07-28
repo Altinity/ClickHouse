@@ -64,6 +64,11 @@ struct RebuildReport
     uint64_t unowned_alive_manifests = 0;
     uint64_t edges = 0;
     uint64_t clamped_shards = 0;
+    /// This rebuild concluded FROM ENUMERATION ALONE that the pool had never sealed a baseline, and so
+    /// carried NO durable hold forward. It is the single route by which a hold can still be dropped
+    /// silently, so the hand-run disaster command REPORTS it rather than leaving it to a log line: on a
+    /// pool that has ever completed a GC round, a 1 here means the enumeration lied.
+    bool virgin_by_enumeration = false;
 };
 
 /// Counters and diagnostics returned by one `runRegularRound`. These values describe work attempted or

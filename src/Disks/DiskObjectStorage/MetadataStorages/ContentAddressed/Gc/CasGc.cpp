@@ -1097,11 +1097,18 @@ std::optional<std::pair<uint64_t, uint64_t>> Gc::newestFoldSealRef()
     /// three pieces of ENUMERATION evidence and no point read, because the seal key's attempt component
     /// has no arithmetic successor to probe.
     ///
-    /// NAMED RESIDUAL: an enumeration that hid EVERY seal, generation 1 included, on a lived-in pool
-    /// still reads virgin here, and this grants that pool a clean slate with no holds. No closure
-    /// exists in the current key shapes; it needs a derivable per-generation alias that can be
-    /// point-read (see the report). Anything the listing DOES show above generation 1 is caught by the
-    /// refusal above instead.
+    /// NAMED RESIDUAL, and the generation-1 probe NARROWS it rather than closing it. On a pool that has
+    /// been pruned, generation 1 LEGITIMATELY does not exist -- `pruneSupersededGenerations` deletes
+    /// whole old generation prefixes once they age past `gc_snap_generations_to_keep` -- so an empty
+    /// generation-1 probe proves nothing there. A total enumeration blackout on a lived-in, pruned pool
+    /// therefore still reads virgin here, and grants it a clean slate with no holds. What the probe
+    /// does buy is the un-pruned case: a young pool whose seals the wide listing hid is caught.
+    ///
+    /// No closure exists in the current key shapes, because a fold seal cannot be point-read from its
+    /// generation alone. The fix is a derivable per-generation marker that CAN be point-read, and it
+    /// would survive the blackout precisely because it needs no enumeration (see the report and
+    /// `docs/superpowers/cas/BACKLOG.md`). Anything the listing DOES show above its own maximum is
+    /// caught by the refusal above instead.
     const GenerationSealProbe genesis = probeGenerationForSeal(1);
     if (listed_anything || genesis.generation_exists)
         throw Exception(ErrorCodes::CORRUPTED_DATA,
@@ -1114,12 +1121,14 @@ std::optional<std::pair<uint64_t, uint64_t>> Gc::newestFoldSealRef()
 
     ProfileEvents::increment(ProfileEvents::CasGcRebuildVirginByEnumeration);
     LOG_WARNING(logger,
-        "CAS GC rebuild: treating this pool as having NEVER sealed a baseline, so no durable hold is "
-        "carried forward. Virgin by: wide LIST of {} empty, narrow generation-1 probe empty, gc/state "
-        "absent or unreadable. This verdict rests on ENUMERATION ALONE -- no point read can prove it, "
-        "because a fold seal key needs an attempt component that is a lease sequence number. If this "
-        "pool has ever completed a GC round, the enumeration is lying and this rebuild is about to "
-        "grant it a clean slate it does not have.",
+        "CAS GC rebuild PROCEEDING AS NEVER-SEALED: no fold seal was found by the broad listing of {} "
+        "or by the generation-1 probe, and gc/state is absent or unreadable, so NO durable hold is "
+        "carried forward. IMPLICATION: if this pool HAS sealed and then pruned, generation 1 is gone "
+        "legitimately and this verdict rests on a total enumeration blackout -- holds may be lost and "
+        "GC may reclaim blobs a held namespace still protects. The verdict rests on ENUMERATION ALONE: "
+        "no point read can prove it, because a fold seal key needs an attempt component that is a "
+        "lease sequence number. Verify with the store operator that the object listing is complete "
+        "before trusting this rebuild.",
         top);
     return std::nullopt;
 }
@@ -3199,7 +3208,13 @@ RebuildReport Gc::rebuildBaseline(bool force)
         /// by the fact that both attempts walked the same cursor state.
         if (!decoded || decoded->snap_generation == 0)
         {
-            if (const auto newest = newestFoldSealRef())
+            const auto newest = newestFoldSealRef();
+            /// Absent here is the VIRGIN verdict, and it is the one path left on which a durable hold
+            /// can still be dropped without anything failing. It is REPORTED on the command's own row,
+            /// not merely logged: this command is run by hand during a disaster, and its operator is
+            /// exactly the person who needs to know the clean slate was inferred rather than proved.
+            rep.virgin_by_enumeration = !newest.has_value();
+            if (newest)
             {
                 std::optional<CasFoldSeal> seal;
                 try
