@@ -81,7 +81,7 @@ public:
 /// (the Task-4 adoption input: plan's "Occupied + bytes == wedge.bytes -> an earlier attempt landed ->
 /// adopt"). Distinct from InMemoryBackend::injectAmbiguousPutIfAbsent, which never touches the store at
 /// all -- that hook models an attempt that did NOT land; this one models an attempt that DID.
-/// One-shot per key: review finding I2 asked specifically for a ~10-line local backend rather than
+/// One-shot per backend instance: review finding I2 asked specifically for a ~10-line local backend rather than
 /// reusing ChunkFaultBackend::Mode::LandedThenLost, which also arms a one-shot lost-GET fault that would
 /// obscure whether slotOccupy's OWN immediate resolve (not just a later caller's retry) is correct too.
 class LandedButAckLostOnceBackend : public CountingBackend

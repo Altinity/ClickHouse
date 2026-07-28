@@ -341,8 +341,10 @@ struct CasOverwriteResult
 ///     this case — it reads "the attempt budget was exhausted", which is misleading for a primitive
 ///     with no retry budget, and it silently folds "the resolve GET found nothing" together with "the
 ///     occupant that caused the conflict was DELETED under a live epoch" (a GC-invariant alarm, not
-///     routine contention) into the same generic wording. Log the slot key plus which of the two
-///     actually happened.
+///     routine contention) into the same generic wording. `SlotOccupyResult` carries no discriminator
+///     between those two sub-cases — log the slot key plus "the resolve read found nothing"; the day a
+///     caller NEEDS the split is the trigger for adding a dedicated `CasUnresolvedReason` value (a
+///     gated protocol decision, not a drive-by).
 struct SlotOccupyResult
 {
     enum class Kind : uint8_t { Created, Occupied, Unresolved };
