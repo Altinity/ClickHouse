@@ -1607,3 +1607,6 @@ ProfileEvents.cpp. No push.
 **2026-07-29 00:5x local** — T5 DONE (1460/1460 + ASan 1464/1464; groupRefKeys pool-wide-abort
 hazard prevented; life_epoch optional by red-proof); reviewer dispatched. T8 merged to main
 (`5f7343cf9b9`, clean); combined gate running. T9 implementing on lane G. No push.
+
+**2026-07-28 23:22 local watchdog** — combined post-T8-merge build green (EXIT=0), gate running;
+T9 in design (no logs yet); T5 reviewer reading. No push.
