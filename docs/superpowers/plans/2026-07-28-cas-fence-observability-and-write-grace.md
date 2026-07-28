@@ -11,12 +11,15 @@ failing instantly (Part B).
 
 **Architecture:** Spec
 `docs/superpowers/specs/2026-07-28-cas-fence-observability-and-write-grace-design.md`. Two parts:
-- **Part A** — add the genuinely-missing lifecycle log lines (runtime fence-arm + self-remount
-  begin/retry/complete, and the classified fence reason at the keeper) plus three `ProfileEvents`
-  (`CasMountFenceArmed`, `CasSelfRemountCompleted`, `CasSelfRemountMicroseconds`). The base-class
-  renewal-failure lines already exist and are left alone. Rate-limit only the one repeatable line
-  (self-remount retry) with `LogFrequencyLimiter` (per-message), never `LogSeriesLimiter` (per-logger
-  — the aggregate gotcha). Part A lands first because its counters are how Part B is measured.
+- **Part A** — make BOTH fence-loss modes observable. **Mode 1** (throwing renewal → self-remount):
+  fence-arm + self-remount begin/complete lines and the classified fence reason at the keeper, plus
+  `CasMountFenceArmed`/`CasSelfRemountCompleted`/`CasSelfRemountMicroseconds`. **Mode 2** (the dominant
+  real incident: a hung renewal whose deadline silently expires then re-arms — no throw, no remount,
+  zero logging today): an expiry `Warning` detected at the admission site (off the hot `mayMutate`
+  path), a re-arm `Information` with the outage in `setMountDeadline`, a slow-renewal-landed line in
+  `onRenewSucceeded`, plus `CasMountFenceExpired`/`CasMountFenceExpiredMicroseconds`. No new
+  rate-limiter is needed (every line is edge-triggered); the base-class throwing-mode lines already
+  exist and are left alone. Part A lands first because its counters are how Part B is measured.
 - **Part B** — one disk setting `write_grace_ms` (default 0 = off = today's behavior), one new
   event-driven wait primitive `CasMountRuntime::waitForWriteGrace` (dedicated CV, bounded, wakes on
   `armMountFence` / teardown / terminal), inserted at the two write-admission ENTRY gates (plain
@@ -52,10 +55,10 @@ failing instantly (Part B).
 
 Part A first (its counters measure Part B), then Part B (setting → primitive → the two surfaces):
 
-1. **Task 1 — Part A ProfileEvents + runtime fence/remount lifecycle logging** (`CasMountRuntime` +
-   `ProfileEvents.cpp`): A3 (fence armed), A4 (remount begin), A5 (remount retry, rate-limited), A6
-   (remount complete + duration), and the three counters. gtest: counters move through a real
-   fence→remount.
+1. **Task 1 — Part A ProfileEvents + fence lifecycle logging, both modes** (`CasMountRuntime` +
+   `CasPool` + `CasServerRoot` + `ProfileEvents.cpp`): Mode 1 = A3/A4/A6 + three counters; Mode 2 =
+   M1 expiry (admission-site) / M2 slow-renewal / M3 re-arm (`setMountDeadline`) + two counters.
+   gtest: counters move through a real Mode-1 fence→remount AND a Mode-2 silent expiry→re-arm.
 2. **Task 2 — Part A classified fence reason at the keeper** (`MountLeaseKeeper` A2 line). gtest: the
    classified reason reaches text/the stored member.
 3. **Task 3 — Part B setting `write_grace_ms`** (declare + wire through to `MountConfig`). gtest/build:
@@ -75,15 +78,18 @@ Each task is TDD: write the failing test first, run it red, implement, run it gr
 ### Task 1: Part A — ProfileEvents + fence/remount lifecycle logging (A3, A4, A6) {#task-1}
 
 **Files:**
-- Modify: `src/Common/ProfileEvents.cpp` (three counters after the CAS block at `:893-895`)
+- Modify: `src/Common/ProfileEvents.cpp` (five counters after the CAS block at `:893-895`)
 - Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.h`
-  (a `fence_tripped_boot_ms` member + a getter)
+  (a `fence_tripped_boot_ms` member + getter; a `fence_expiry_reported_boot_ms` latch)
 - Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.cpp`
-  (A3 line + `CasMountFenceArmed` + stamp in `tripMountLost` at `:87`)
+  (Mode 1: A3 line + `CasMountFenceArmed` + stamp in `tripMountLost` `:87`; Mode 2: M1 expiry
+  detection in `checkFenceOrThrow` `:98`; M3 re-arm detection in `setMountDeadline` `:128`)
 - Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp`
   (A4 begin line at `tryRemountOnce` entry `~:988`; A6 duration + two counters at the completion
   line `:1072`/`:1086`)
-- Test: `src/Disks/tests/gtest_cas_pool.cpp` (new `CasPoolObservability` test)
+- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp`
+  (Mode 2: M2 slow-renewal-landed line in `MountLeaseKeeper::onRenewSucceeded` `:883`)
+- Test: `src/Disks/tests/gtest_cas_pool.cpp` (`CasPoolObservability` — Mode 1 and Mode 2)
 
 **Interfaces:**
 - Consumes: `ProfileEvents::increment`, `CasMountRuntime::bootMsNow` (`CasMountRuntime.h:132`),
@@ -117,9 +123,41 @@ TEST(CasPoolObservability, FenceTripAndSelfRemountMoveProfileEvents)
               500u * 1000u);
 }
 ```
-Add `#include <Common/ProfileEvents.h>` and the `extern const Event` declarations to the test file's
-`ProfileEvents` namespace block (mirror how `gtest_cas_heartbeat.cpp` declares `extern const int`
-error codes) if not already present.
+And the Mode-2 (silent expiry / non-remount recovery) counters — driven entirely by the injectable
+boot clock and the `setMountDeadline`/`checkFenceOrThrow` Pool forwarders, no remount:
+
+```cpp
+TEST(CasPoolObservability, SilentDeadlineExpiryAndReArmMoveProfileEvents)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    uint64_t fake_boot = 1000;
+    auto s = Pool::open(backend, PoolConfig{
+        .pool_prefix = "p", .server_root_id = "test",
+        .boot_ms_fn = [&] { return fake_boot; }});
+
+    // Arm a real deadline, then let boot time pass it WITHOUT a trip/remount (the Mode-2 hang shape).
+    s->setMountDeadline(fake_boot + 1000);          // live until boot 2000
+    const uint64_t g0 = s->fenceGeneration();
+    fake_boot = 2500;                               // deadline passed (1500 ms overdue) -> mayMutate false
+    ASSERT_FALSE(s->mayMutate());
+
+    ProfileEvents::Counters::Snapshot before = ProfileEvents::global_counters.getPartiallyAtomicSnapshot();
+    EXPECT_THROW(s->checkFenceOrThrow(g0), DB::Exception);   // M1: refused write -> CasMountFenceExpired +1
+    fake_boot = 3000;
+    s->setMountDeadline(fake_boot + 1000);          // M3: late renewal re-arms; outage = 3000 - 2000 = 1000 ms
+    ProfileEvents::Counters::Snapshot after = ProfileEvents::global_counters.getPartiallyAtomicSnapshot();
+
+    EXPECT_EQ(after[ProfileEvents::CasMountFenceExpired] - before[ProfileEvents::CasMountFenceExpired], 1);
+    EXPECT_EQ(after[ProfileEvents::CasMountFenceExpiredMicroseconds] - before[ProfileEvents::CasMountFenceExpiredMicroseconds],
+              1000u * 1000u);
+    EXPECT_EQ(s->fenceGeneration(), g0) << "Mode-2 re-arm must NOT bump the fence generation";
+    EXPECT_TRUE(s->mayMutate());
+}
+```
+The expiry stamp is `deadline_boot_ms` (2000), so the outage is measured from the true expiry instant
+(3000 − 2000 = 1000 ms), not from the first refused write. Add `#include <Common/ProfileEvents.h>` and
+the `extern const Event` declarations to the test file's `ProfileEvents` namespace block (mirror how
+`gtest_cas_heartbeat.cpp` declares `extern const int` error codes) if not already present.
 
 - [ ] **Step 2: Build the test target, run — must FAIL to compile (the events don't exist yet).**
 
@@ -131,11 +169,13 @@ new-symbol test.
 
 - [ ] **Step 3: Implement.**
 
-3a. `src/Common/ProfileEvents.cpp`, after `:895`:
+3a. `src/Common/ProfileEvents.cpp`, after `:895` (five counters — three Mode-1, two Mode-2):
 ```cpp
-    M(CasMountFenceArmed, "Counts CAS local write-fence trips: the mount lease could not be confirmed and the runtime latched its write fence lost (durable writes are refused until a self-remount re-admits this node). This is the runtime-side counterpart of CasMountLeaseLost (which counts the keeper-side classification).", ValueType::Number) \
-    M(CasSelfRemountCompleted, "Counts successful CAS self-remounts: after a fence trip the node reclaimed the mount under a fresh writer_epoch and durable writes resumed.", ValueType::Number) \
-    M(CasSelfRemountMicroseconds, "Total wall time (CLOCK_BOOTTIME) CAS durable writes were refused across all self-remounts. Divide by CasSelfRemountCompleted for the average fence-window length.", ValueType::Microseconds) \
+    M(CasMountFenceArmed, "Counts CAS local write-fence trips (Mode 1): a renewal threw, the runtime latched its write fence lost, and a self-remount follows. Runtime-side counterpart of CasMountLeaseLost.", ValueType::Number) \
+    M(CasSelfRemountCompleted, "Counts successful CAS self-remounts (Mode 1): after a fence trip the node reclaimed the mount under a fresh writer_epoch and durable writes resumed.", ValueType::Number) \
+    M(CasSelfRemountMicroseconds, "Total time (CLOCK_BOOTTIME) CAS durable writes were refused across Mode-1 self-remounts. Divide by CasSelfRemountCompleted for the average window.", ValueType::Microseconds) \
+    M(CasMountFenceExpired, "Counts CAS Mode-2 fence-expiry episodes: the mount-lease deadline passed WITHOUT a lost-latch/remount (a hung renewal), first observed at a refused durable write. The dominant real fence-window shape; recovery is a late renewal landing, not a remount.", ValueType::Number) \
+    M(CasMountFenceExpiredMicroseconds, "Total time (CLOCK_BOOTTIME) CAS durable writes were refused across Mode-2 (non-remount) recoveries. Divide by CasMountFenceExpired for the average silent-outage length. This is the path the opt-in write_grace_ms feature most often rides.", ValueType::Microseconds) \
 ```
 
 3b. `CasMountRuntime.h`: add a private member and a getter (near `mount_fence`):
@@ -186,6 +226,72 @@ Reset the stamp after reading it so the next episode measures fresh: in `noteRem
 `extern const Event` block to `CasPool.cpp`'s `ProfileEvents` namespace and `#include <Common/ProfileEvents.h>`
 if absent.
 
+3f. **Mode 2 — the silent expiry/re-arm path (spec §A.5).** `CasMountRuntime.h`, add a latch member
+next to `fence_tripped_boot_ms`:
+```cpp
+    /// Mode-2 expiry latch (Part A §A.5): the true expiry instant (deadline_boot_ms) of an
+    /// unreported silent fence-deadline expiry, or 0. CAS'd 0->deadline at the admission site that
+    /// first refuses a write; read+reset by setMountDeadline on the late-renewal re-arm.
+    std::atomic<uint64_t> fence_expiry_reported_boot_ms{0};
+```
+`CasMountRuntime.cpp` `checkFenceOrThrow` (`:98`), inside the refusal branch BEFORE the throw, detect
+a Mode-2 expiry (fence not lost, deadline passed) and report it once — this is the M1 line and it is
+NOT on the hot `mayMutate` read path (it runs only when a durable write is being refused):
+```cpp
+    if (!mayMutate() || fenceGeneration() != admitted_generation)
+    {
+        const uint64_t deadline = mount_fence.deadline_boot_ms.load(std::memory_order_acquire);
+        if (!mount_fence.lost.load(std::memory_order_acquire) && bootMsNow() >= deadline)
+        {
+            uint64_t expected = 0;
+            if (fence_expiry_reported_boot_ms.compare_exchange_strong(expected, deadline,
+                    std::memory_order_acq_rel, std::memory_order_acquire))
+            {
+                ProfileEvents::increment(ProfileEvents::CasMountFenceExpired);
+                LOG_WARNING(getLogger("CasMountLease"),
+                    "CAS mount fence deadline expired for server root '{}' (writer_epoch={}): durable "
+                    "writes are refused; the lease renewer has not confirmed within the renew period and "
+                    "the deadline passed {} ms ago — the object store is likely slow or unreachable (no "
+                    "self-remount; recovery is a late renewal landing)",
+                    server_root_id, mount_fence.writer_epoch, bootMsNow() - deadline);
+            }
+        }
+        throw Exception(ErrorCodes::INVALID_STATE, ...unchanged message...);
+    }
+```
+`CasMountRuntime.cpp` `setMountDeadline` (`:128`), detect the M3 re-arm and record the outage:
+```cpp
+void CasMountRuntime::setMountDeadline(uint64_t deadline_boot_ms)
+{
+    mount_fence.deadline_boot_ms.store(deadline_boot_ms, std::memory_order_release);
+    const uint64_t expired_at = fence_expiry_reported_boot_ms.exchange(0, std::memory_order_acq_rel);
+    if (expired_at != 0)
+    {
+        const uint64_t outage_ms = bootMsNow() - expired_at;
+        ProfileEvents::increment(ProfileEvents::CasMountFenceExpiredMicroseconds, outage_ms * 1000);
+        LOG_INFO(getLogger("CasMountLease"),
+            "CAS mount fence re-armed for server root '{}' after a {} ms expiry window (a late lease "
+            "renewal landed; recovered without a self-remount)", server_root_id, outage_ms);
+    }
+    /// Task 4 also adds write_grace_cv.notify_all() here (the Mode-2 grace wake).
+}
+```
+
+3g. **M2 — slow renewal landed.** `CasServerRoot.cpp` `MountLeaseKeeper::onRenewSucceeded` (`:883`),
+after the existing body, log when the just-landed renewal exceeded the renew period. The keeper has
+`last_attempt_boot_ms` (`:637`) and `ttl`; the renew period is `ttl/3` by convention, so pass the
+period into the keeper or compare against a fraction of `ttl`. Minimal form using the existing members:
+```cpp
+    const uint64_t elapsed = boot_ms_fn() - last_attempt_boot_ms;
+    if (elapsed > static_cast<uint64_t>(ttl.count()) / 3)
+        LOG_INFO(getLogger("CasMountLeaseKeeper"),
+            "CAS mount-lease renewal for server root '{}' landed after {} ms — the object store was slow",
+            srid, elapsed);
+```
+
+Add the `extern const Event CasMountFenceExpired; extern const Event CasMountFenceExpiredMicroseconds;`
+declarations to the `ProfileEvents` namespace block of `CasMountRuntime.cpp`.
+
 - [ ] **Step 4: Build and run green.**
 ```bash
 ninja -C build > build/ninja_task1_impl.log 2>&1; echo "exit=$?"
@@ -196,13 +302,18 @@ Expected: both exit 0. (Have a subagent summarize each log.)
 
 - [ ] **Step 5: Commit.**
 ```bash
-git add src/Common/ProfileEvents.cpp src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.h src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.cpp src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp src/Disks/tests/gtest_cas_pool.cpp
-git commit -m "ca: Part A — fence/remount lifecycle ProfileEvents + fence-arm & remount-begin logging
+git add src/Common/ProfileEvents.cpp src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.h src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.cpp src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp src/Disks/tests/gtest_cas_pool.cpp
+git commit -m "ca: Part A — fence/remount lifecycle observability (Mode 1 remount + Mode 2 silent expiry)
 
-New CasMountFenceArmed / CasSelfRemountCompleted / CasSelfRemountMicroseconds;
-A3 fence-arm WARNING in tripMountLost; A4 self-remount-begin INFO; A6 existing
-recover line gains the fenced-window duration. Boot-clock stamp so the window
-is measurable and NTP/suspend-proof.
+Mode 1 (throwing renewal -> self-remount): CasMountFenceArmed /
+CasSelfRemountCompleted / CasSelfRemountMicroseconds; A3 fence-arm WARNING in
+tripMountLost; A4 self-remount-begin INFO; A6 recover line gains the fenced
+duration. Mode 2 (the dominant real incident: a hung renewal whose deadline
+silently expired then re-armed with no log, no remount): CasMountFenceExpired /
+CasMountFenceExpiredMicroseconds; M1 expiry WARNING detected at the admission
+site (off the hot mayMutate path); M3 re-arm INFO + outage in setMountDeadline;
+M2 slow-renewal-landed INFO in onRenewSucceeded. Boot-clock stamps so windows
+are measurable and NTP/suspend-proof.
 
 Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01GKmSZa7T87WbRGKkNkSXky"
@@ -486,7 +597,45 @@ TEST(CasPoolWriteGrace, WaitIsNoOpWhenDisabled)
     EXPECT_LT(std::chrono::duration_cast<std::chrono::milliseconds>(
                   std::chrono::steady_clock::now() - t0).count(), 1000);
 }
+
+/// (6) Mode-2 (the DOMINANT real path): the fence deadline expires with NO trip and NO remount, and a
+/// late renewal re-arms via setMountDeadline. The waiter must wake on that re-arm — not on
+/// armMountFence — and proceed with an UNCHANGED fence generation (spec §A.5, §B.4). This is the path
+/// the whole feature exists for (the msan incident).
+TEST(CasPoolWriteGrace, WaitRidesOutSilentDeadlineExpiryWithoutRemount)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    uint64_t fake_boot = 1000;
+    auto s = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test",
+                                            .write_grace_ms = 5000,
+                                            .boot_ms_fn = [&] { return fake_boot; }});
+    s->setMountDeadline(fake_boot + 1000);          // live until boot 2000
+    const uint64_t g0 = s->fenceGeneration();
+    fake_boot = 2500;                               // Mode-2 silent expiry: mayMutate false, no trip
+    ASSERT_FALSE(s->mayMutate());
+
+    std::atomic<bool> returned{false};
+    std::thread w([&] { s->waitForWriteGrace(); returned = true; });
+    // A late renewal lands and re-arms (setMountDeadline) — the ONLY signaler on this path.
+    fake_boot = 3000;
+    s->setMountDeadline(fake_boot + 1000);
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!returned.load() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    EXPECT_TRUE(returned.load()) << "the Mode-2 re-arm (setMountDeadline) must wake the grace wait";
+    EXPECT_TRUE(s->mayMutate());
+    EXPECT_EQ(s->fenceGeneration(), g0) << "Mode-2 re-arm preserves the generation; the waited write "
+                                           "admits under the same still-valid incarnation";
+    w.join();
+}
 ```
+Faithful-integration variant (optional, same assertion): instead of driving `setMountDeadline`
+directly, open writable with `background_watermark = true` and a fault backend whose `putOverwrite`
+on the mount key BLOCKS on a releasable latch (rather than throwing) — the real keeper's renewal hangs,
+the injected boot clock is advanced past the deadline, the waiter blocks, and releasing the latch lets
+the hung PUT land → `onRenewSucceeded → setMountDeadline` re-arms and wakes the waiter. The direct
+form above is the deterministic primary; this variant reproduces the exact incident mechanics.
 
 - [ ] **Step 2: Build + run — FAIL (no `waitForWriteGrace`).**
 ```bash
@@ -525,7 +674,10 @@ void CasMountRuntime::waitForWriteGrace() const
 Add `<condition_variable>` if not already included (the header already includes it).
 
 3c. Signal the CV (one line each) at every site that changes what the predicate observes:
-- `armMountFence` (`:133`), after clearing `lost`: `write_grace_cv.notify_all();`
+- **`setMountDeadline` (`:128`) — the Mode-2 re-arm, the MOST IMPORTANT signaler** (a hung renewal
+  landed and extended the deadline; §A.5 / Task 1 step 3f already edits this function). Without it a
+  waiter sleeps out its whole bound through exactly the dominant incident. `write_grace_cv.notify_all();`
+- `armMountFence` (`:133`) — the Mode-1 re-arm, after clearing `lost`: `write_grace_cv.notify_all();`
 - `stopRemountThread` (`:486`) after latching `remount_shutting_down`, and `finishTeardown` (`:504`)
   start: `write_grace_cv.notify_all();`
 - `enterVanished` (`:372`), `enterIdentityLost` (`:337`), `publishVanishedIntent` (`:421`), after
@@ -678,11 +830,15 @@ trailers).
 
 ## Plan self-review checklist {#self-review}
 
-- Coverage vs. spec: Part A = Tasks 1–2 (A2/A3/A4 + A6 duration + 3 counters); Part B = Tasks 3–6
-  (setting → primitive → surface 1 → surface 2). Every spec §B-tests scenario maps to a Task-4 test;
-  every §A test maps to Task-1/Task-2.
+- Coverage vs. spec: Part A = Tasks 1–2 (Mode 1 A2/A3/A4/A6 + Mode 2 M1/M2/M3 + 5 counters);
+  Part B = Tasks 3–6 (setting → primitive → surface 1 → surface 2). Every spec §B-tests scenario maps
+  to a Task-4 test (incl. the Mode-2 ride-out); every §A / §A.5 line maps to Task-1/Task-2.
 - Names match the spec exactly: `write_grace_ms`, `waitForWriteGrace`, `CasMountFenceArmed`,
-  `CasSelfRemountCompleted`, `CasSelfRemountMicroseconds`, `fence_tripped_boot_ms`.
+  `CasSelfRemountCompleted`, `CasSelfRemountMicroseconds`, `CasMountFenceExpired`,
+  `CasMountFenceExpiredMicroseconds`, `fence_tripped_boot_ms`, `fence_expiry_reported_boot_ms`.
+- rev.2 (silent-expiry path): Mode 2 is covered in Task 1 (M1/M2/M3 + 2 counters) and the
+  `setMountDeadline` signaler + Mode-2 ride-out test are in Task 4. The `setMountDeadline` signaler is
+  the load-bearing addition — without it Part B never wakes on the dominant path.
 - No placeholders, no "TBD"; every task has exact files, complete snippets, commands, and a commit.
 - Sanitizer discipline: no test `EXPECT_THROW`s a `LOGICAL_ERROR`; Part B failures are
   `INVALID_STATE`/`NETWORK_ERROR` (safe to `EXPECT_THROW`).
