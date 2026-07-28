@@ -165,6 +165,17 @@ std::optional<ShardCoverage> coverageOf(Backend & backend, const Layout & layout
     return it->second;
 }
 
+/// The cursor `ns` was sealed at, or `{0, 0}` when the round sealed NO row for it at all. It never
+/// dereferences a disengaged optional: a test that aborts the process takes every test after it in the
+/// binary down with it, and "there is no coverage row" is exactly the shape a regression in the hold
+/// carry produces — so it has to read as a failed expectation, not as a crash that hides the rest.
+RefTxnId sealedCursorOf(Backend & backend, const Layout & layout, const RootNamespace & ns)
+{
+    const auto cov = coverageOf(backend, layout, ns);
+    EXPECT_TRUE(cov.has_value()) << "no coverage row for " << ns.string();
+    return cov ? cov->last_folded_ref_id : RefTxnId{};
+}
+
 /// The coverage row a round MUST have sealed for `ns`, held. Fails the test rather than returning an
 /// empty optional, so every caller below reads a real hold.
 RefHold holdOf(Backend & backend, const Layout & layout, const RootNamespace & ns)
@@ -435,7 +446,7 @@ TEST(CasGcHoldGrammar, GapBelowWitnessNamesTheExactAbsentPosition)
     EXPECT_EQ(hold.offending_position, (RefTxnId{1, 3}));
     EXPECT_EQ(hold.retry_count, 0u) << "the round that creates a hold has retried nothing yet";
     EXPECT_GT(hold.next_retry_round, 0u);
-    EXPECT_EQ(coverageOf(*backend, layout, ns)->last_folded_ref_id, (RefTxnId{1, 2}));
+    EXPECT_EQ(sealedCursorOf(*backend, layout, ns), (RefTxnId{1, 2}));
 }
 
 TEST(CasGcHoldGrammar, UnconsumedSealCrossingNamesTheAbsentPosition)
@@ -458,7 +469,7 @@ TEST(CasGcHoldGrammar, UnconsumedSealCrossingNamesTheAbsentPosition)
     const RefHold hold = holdOf(*backend, layout, ns);
     EXPECT_EQ(hold.reason, HoldReason::UnconsumedSealCrossing);
     EXPECT_EQ(hold.offending_position, (RefTxnId{1, 2})) << "the hold names the position that read absent";
-    EXPECT_EQ(coverageOf(*backend, layout, ns)->last_folded_ref_id, (RefTxnId{1, 1}));
+    EXPECT_EQ(sealedCursorOf(*backend, layout, ns), (RefTxnId{1, 1}));
     EXPECT_EQ(inDegreeOf(*backend, layout, DB::UInt128(2)), 0)
         << "nothing beyond the unproven boundary may fold";
 }
@@ -503,7 +514,7 @@ TEST(CasGcHoldGrammar, MissingManifestBodyBarrierIsADurableHold)
     const RefHold hold = holdOf(*backend, layout, ns);
     EXPECT_EQ(hold.reason, HoldReason::ManifestBodyMissing);
     EXPECT_EQ(hold.offending_position, (RefTxnId{1, 2})) << "the hold names the LOG whose edges could not fold";
-    EXPECT_EQ(coverageOf(*backend, layout, ns)->last_folded_ref_id, (RefTxnId{1, 1}));
+    EXPECT_EQ(sealedCursorOf(*backend, layout, ns), (RefTxnId{1, 1}));
 }
 
 /// An above-cursor record that answered one GET and then stopped answering is CORRUPTION, not a
@@ -551,7 +562,7 @@ TEST(CasGcHoldGrammar, AWitnessThatStopsAnsweringIsWitnessDisappeared)
     /// The walk crossed into epoch 2 on the record's first answer and then could not read it: the hold
     /// names {2,1}, the position that stopped being readable, and the cursor stays on the seal below it.
     EXPECT_EQ(hold.offending_position, (RefTxnId{2, 1}));
-    EXPECT_EQ(coverageOf(*backend, layout, ns)->last_folded_ref_id, (RefTxnId{1, 2}));
+    EXPECT_EQ(sealedCursorOf(*backend, layout, ns), (RefTxnId{1, 2}));
 }
 
 /// ===================== THE SECOND WITNESS: `_ckpt.checkpoint` =====================
@@ -643,7 +654,7 @@ TEST(CasGcHoldGrammar, HoldRidesARoundWhoseHintOmitsTheNamespace)
     const RefHold second = holdOf(*backend, store->layout(), ns);
     EXPECT_EQ(second.reason, first.reason) << "a quiet hint must not rewrite why the namespace is held";
     EXPECT_EQ(second.offending_position, first.offending_position);
-    EXPECT_EQ(coverageOf(*backend, store->layout(), ns)->last_folded_ref_id, (RefTxnId{1, 2}))
+    EXPECT_EQ(sealedCursorOf(*backend, store->layout(), ns), (RefTxnId{1, 2}))
         << "the cursor may not advance while the hold stands";
     /// The one field that moves, and the reason it exists: it counts the rounds that retried and failed.
     EXPECT_EQ(second.retry_count, first.retry_count + 1);
@@ -821,4 +832,100 @@ TEST(CasGcHoldGrammar, RebuildRefusesWithAnUndecodablePriorSeal)
                           backend->head(seal_key).token);
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { gc.rebuildBaseline(/*force=*/true); });
+}
+
+/// LOSING THE POINTER IS NOT WEAKER THAN LOSING THE SEAL. `gc/state` names the adopted seal, and it is
+/// the seal that carries the holds — so if the refusal only covered an unreadable seal, the *lesser*
+/// corruption (the pointer is gone, every seal intact) would be treated more permissively than the
+/// greater one, and the rebuild would write a baseline with no hold in it at all.
+///
+/// That matters because holds are not re-derivable by the next walk. `WitnessDisappeared` names a
+/// record that is *gone*: the next round reads a clean frontier and would hand the namespace exactly
+/// the frontier proof the hold exists to deny. Same for any hold whose only witness was the checkpoint
+/// or the hold itself.
+///
+/// So with no adopted baseline named, the rebuild finds the newest fold seal OBJECT by enumeration and
+/// carries its holds. This keeps the pool's disaster recovery intact — losing `gc/state` on a
+/// lived-in pool is the scenario `REBUILD` exists for — while making it impossible to write a
+/// hold-free baseline over a pool that had holds.
+TEST(CasGcHoldGrammar, RebuildWithLostStateStillCarriesHoldsFromTheNewestSeal)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/aa@cas@"};
+
+    publishAt(*backend, layout, ns, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(1), /*birth=*/true);
+    Gc gc(store, kGc);
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+    mutateAdoptedSeal(*backend, layout, [&](CasFoldSeal & seal)
+    {
+        ShardCoverage & cov = seal.per_ns_shard[cursorKeyForTest(ns, 0)];
+        cov.classification = 4;
+        cov.hold = plantedHold();
+    });
+
+    /// The pointer vanishes; every seal object survives.
+    const HeadResult sh = backend->head(layout.gcStateKey());
+    ASSERT_TRUE(sh.exists);
+    ASSERT_EQ(backend->deleteExact(layout.gcStateKey(), sh.token).kind, DeleteOutcome::Kind::Deleted);
+
+    Gc gc2(store, hexToU128("00000000000000000000000000000009"));
+    const RebuildReport rep = gc2.rebuildBaseline(/*force=*/false);
+    ASSERT_TRUE(rep.performed) << rep.refusal;
+
+    const auto rebuilt = newestSeal(*backend, layout);
+    ASSERT_TRUE(rebuilt.has_value());
+    const auto it = rebuilt->per_ns_shard.find(cursorKeyForTest(ns, 0));
+    ASSERT_NE(it, rebuilt->per_ns_shard.end());
+    ASSERT_TRUE(it->second.hold.has_value())
+        << "the rebuild blessed a baseline with no hold in it, having read no seal at all";
+    EXPECT_EQ(*it->second.hold, plantedHold());
+}
+
+/// ...and when that newest seal cannot be read either, there is nothing left to carry and no way to
+/// know what was lost, so the rebuild refuses exactly as it does for an unreadable adopted seal.
+TEST(CasGcHoldGrammar, RebuildRefusesWhenTheNewestSealIsUnreadableAndTheStateIsLost)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/aa@cas@"};
+
+    publishAt(*backend, layout, ns, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(1), /*birth=*/true);
+    Gc gc(store, kGc);
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+
+    const GcState st = decodeGcState(backend->get(layout.gcStateKey())->bytes);
+    const String seal_key = layout.foldSealKey(st.snap_generation, st.snap_attempt);
+    backend->putOverwrite(seal_key, "{\"type\":\"cas_fold_seal\",\"v\":4}\nthis is not a seal body\n",
+                          backend->head(seal_key).token);
+    const HeadResult sh = backend->head(layout.gcStateKey());
+    ASSERT_EQ(backend->deleteExact(layout.gcStateKey(), sh.token).kind, DeleteOutcome::Kind::Deleted);
+
+    Gc gc2(store, hexToU128("0000000000000000000000000000000a"));
+    for (const bool force : {false, true})
+    {
+        SCOPED_TRACE(force ? "force" : "plain");
+        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { gc2.rebuildBaseline(force); });
+    }
+}
+
+/// The virgin proof, pinned so the refusal can never grow to swallow a fresh pool: no `gc/state` AND
+/// no fold seal object anywhere means the pool never sealed a baseline, so there is no hold to lose
+/// and nothing to refuse over.
+TEST(CasGcHoldGrammar, RebuildProceedsOnAPoolThatNeverSealedABaseline)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/aa@cas@"};
+
+    /// No round has run, so there is no `gc/state` and no seal — only owner state to rebuild from.
+    publishAt(*backend, layout, ns, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(1), /*birth=*/true);
+    ASSERT_FALSE(backend->head(layout.gcStateKey()).exists);
+
+    Gc gc(store, kGc);
+    const RebuildReport rep = gc.rebuildBaseline(/*force=*/false);
+    EXPECT_TRUE(rep.performed) << rep.refusal;
 }

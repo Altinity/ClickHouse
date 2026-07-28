@@ -172,9 +172,10 @@ void checkFoldSealObjectBytes(uint64_t encoded_bytes);
 /// tagged records in the fixed `cov`/`btr`/`cnd`/`nsc` order and a record-count trailer. Map iteration and
 /// run references are sorted so retries produce byte-identical output for write-once adoption.
 ///
-/// Enforces the strict classification-4 hold grammar and BOTH byte caps (every emitted line against
-/// `line_cap`, the whole object against `object_cap`). Both PUT sites go through this function, so the
-/// gate cannot be bypassed by adding a third one.
+/// Enforces the strict classification-4 hold grammar and BOTH byte caps: every emitted line against
+/// `line_cap` — header, meta, records and trailer alike, with no exception — and the whole object
+/// against `object_cap`. Both PUT sites go through this function, so the gate cannot be bypassed by
+/// adding a third one.
 String encodeFoldSeal(const CasFoldSeal & seal);
 
 /// Decodes and validates a fold seal, rejecting unknown fields, malformed records, trailing bytes, and

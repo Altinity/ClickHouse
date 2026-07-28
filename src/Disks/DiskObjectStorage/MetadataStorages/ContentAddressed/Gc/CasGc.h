@@ -415,7 +415,20 @@ private:
     /// The round's `_ckpt.checkpoint` witness per namespace — see `setCheckpointWitnessesForTest` for
     /// what it decides and why the listing alone cannot decide it. ONE call site, in the fold, right
     /// where the hint is grouped; Lane L Task 5 lands by filling this body in.
-    std::map<String, RefTxnId> readCheckpointWitnesses(const std::map<String, RefTableListing> & ref_tables);
+    ///
+    /// It takes BOTH of the round's namespace sources because it owes a witness to both: `ref_tables`
+    /// is the hint, and `parent_cursors` is where a carried hold names a namespace the hint may have
+    /// stopped mentioning — precisely the namespace whose witness matters most.
+    std::map<String, RefTxnId> readCheckpointWitnesses(const std::map<String, RefTableListing> & ref_tables,
+                                                       const std::map<String, ShardCoverage> & parent_cursors);
+
+    /// The newest fold-seal OBJECT in the pool by `(generation, attempt)`, found by ENUMERATING
+    /// `gc/gen/` rather than by following `gc/state`. Absent => the pool has never sealed a baseline.
+    ///
+    /// Holds live in the seal, not in the pointer to it, so `rebuildBaseline` needs this whenever
+    /// `gc/state` names no adopted baseline: without it, losing the POINTER (the lesser corruption)
+    /// would silently produce a hold-free baseline while an unreadable SEAL (the greater one) refuses.
+    std::optional<std::pair<uint64_t, uint64_t>> newestFoldSealRef();
 
     /// Read ONE part manifest named by `id`, validate it, and append sign*(+1) blob deltas for each
     /// blob entry to `deltas`. On sign<0 queue (id -> token) into mf_cleanup. Returns whether a body was

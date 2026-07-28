@@ -97,21 +97,29 @@ String encodeFoldSeal(const CasFoldSeal & seal)
 {
     const FoldSealCaps caps = foldSealCaps();
     CasJsonWriter out(256);
-    writeHeaderLine(out, FormatId::FoldSeal);
 
-    /// Every record is measured against the LINE cap AS IT IS CLOSED, on the bytes that were actually
-    /// emitted — escaping, framing and all — rather than on an estimate of them. A record that does not
-    /// fit is not a large record, it is an unreadable one: `readLine` refuses it, so the whole object
-    /// would be lost. Refuse here, where nothing is durable yet.
+    /// EVERY line this encoder emits is measured against the LINE cap, on the bytes actually emitted --
+    /// escaping, framing and all -- rather than on an estimate of them. A line that does not fit is not
+    /// a large line, it is an UNREADABLE one: `readLine` refuses it, so the whole object is lost.
+    /// Refuse here, where nothing is durable yet. The header and trailer are measured too, even though
+    /// their lengths are bounded by construction — a gate with an unstated exception is one that a
+    /// later edit widens without noticing.
+    const auto checkLineBytes = [&](uint64_t bytes, std::string_view what)
+    {
+        if (!fitsLineCap(bytes, caps.line_cap))
+            throw Exception(ErrorCodes::LIMIT_EXCEEDED,
+                "CAS fold seal: the {} line encodes to {} bytes, over the {}-byte line cap; a longer "
+                "line cannot be read back, so the seal is refused before it is written",
+                what, bytes, caps.line_cap);
+    };
+
+    writeHeaderLine(out, FormatId::FoldSeal);   /// emits its own terminator
+    checkLineBytes(out.size() - 1, "header");
+
     size_t line_start = out.size();
     const auto closeLine = [&](std::string_view what)
     {
-        const uint64_t bytes = out.size() - line_start;
-        if (!fitsLineCap(bytes, caps.line_cap))
-            throw Exception(ErrorCodes::LIMIT_EXCEEDED,
-                "CAS fold seal: a {} record encodes to {} bytes, over the {}-byte line cap; a longer "
-                "line cannot be read back, so the seal is refused before it is written",
-                what, bytes, caps.line_cap);
+        checkLineBytes(out.size() - line_start, what);
         writeChar('\n', out);
         line_start = out.size();
     };
@@ -199,7 +207,10 @@ String encodeFoldSeal(const CasFoldSeal & seal)
         ++n;
     }
 
-    writeTrailerLine(out, n);
+    const size_t trailer_start = out.size();
+    writeTrailerLine(out, n);   /// emits its own terminator
+    checkLineBytes(out.size() - trailer_start - 1, "trailer");
+
     String text = std::move(out).take();
     checkFoldSealObjectBytes(text.size());
     return text;

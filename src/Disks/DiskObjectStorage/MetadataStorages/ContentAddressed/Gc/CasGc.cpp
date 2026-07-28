@@ -1003,17 +1003,68 @@ bool Gc::foldManifestEdges(const ManifestId & id, int sign, std::vector<BlobDelt
     return true;
 }
 
-std::map<String, RefTxnId> Gc::readCheckpointWitnesses(const std::map<String, RefTableListing> & ref_tables)
+std::map<String, RefTxnId> Gc::readCheckpointWitnesses(const std::map<String, RefTableListing> & ref_tables,
+                                                       const std::map<String, ShardCoverage> & parent_cursors)
 {
     /// LANE L TASK 5 LANDS HERE. `_ckpt` does not exist yet, so there is no second witness to read and
     /// production runs hint-only — the behaviour before this task, unchanged. When `_ckpt` lands, this
     /// body becomes the per-namespace read of `_ckpt.checkpoint` (a `GET` the fold already owes for
-    /// cleanup ranges), keyed by namespace string; every consumer above is already written against the
-    /// map, so nothing else in the fold moves. `ref_tables` is the round's hint: Task 5 reads the
-    /// checkpoint of each namespace it names, PLUS each namespace a carried hold names (the walk visits
-    /// those too, and their witness matters most).
+    /// cleanup ranges), keyed by namespace string; every consumer is already written against the map,
+    /// so nothing else in the fold moves.
+    ///
+    /// Read the checkpoint of every namespace `ref_tables` names, PLUS every namespace a HELD row in
+    /// `parent_cursors` names. Both are parameters for that reason: the walk visits both sets, and the
+    /// held-but-unhinted namespace is the one whose second witness matters MOST, because the hint has
+    /// stopped supplying it one at all.
     (void)ref_tables;
+    (void)parent_cursors;
     return checkpoint_witness_override;
+}
+
+std::optional<std::pair<uint64_t, uint64_t>> Gc::newestFoldSealRef()
+{
+    Backend & backend = store->backend();
+    const Layout & layout = store->layout();
+    const String gen_prefix = layout.gcGenPrefix(0);
+    const String top = gen_prefix.substr(0, gen_prefix.size() - 2);   /// ".../gc/gen/"
+
+    std::optional<std::pair<uint64_t, uint64_t>> newest;
+    forEachListedKey(backend, top, [&](const ListedKey & k)
+    {
+        /// Parse a candidate `(generation, attempt)` out of the path and then PROVE it by rebuilding
+        /// the key: only a string `foldSealKey` itself would have produced is a fold seal. Everything
+        /// else under `gc/gen` -- run objects, debris of a lost era -- must not get to decide which
+        /// baseline this pool's holds are read from.
+        const size_t from = top.size();
+        const size_t gen_end = k.key.find('/', from);
+        if (gen_end == String::npos)
+            return;
+        uint64_t generation = 0;
+        uint64_t attempt = 0;
+        try
+        {
+            generation = std::stoull(k.key.substr(from, gen_end - from));
+            static constexpr std::string_view kAttempt = "/attempt/";
+            const size_t a_begin = k.key.find(kAttempt, gen_end);
+            if (a_begin == String::npos)
+                return;
+            const size_t a_from = a_begin + kAttempt.size();
+            const size_t a_end = k.key.find('/', a_from);
+            if (a_end == String::npos)
+                return;
+            attempt = std::stoull(k.key.substr(a_from, a_end - a_from));
+        }
+        catch (...) // NOLINT(bugprone-empty-catch)
+        {
+            return;   /// foreign key shape under `gc/gen` is debris, not a baseline
+        }
+        if (layout.foldSealKey(generation, attempt) != k.key)
+            return;
+        const auto candidate = std::make_pair(generation, attempt);
+        if (!newest || *newest < candidate)
+            newest = candidate;
+    }, 1000, onGcEnumerationPage);
+    return newest;
 }
 
 Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & report,
@@ -1473,7 +1524,8 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
 
     /// The round's SECOND witness source, independent of the listing -- see `readCheckpointWitnesses`
     /// for what it decides and why a listing alone cannot decide it.
-    const std::map<String, RefTxnId> checkpoint_witness = readCheckpointWitnesses(ref_tables);
+    const std::map<String, RefTxnId> checkpoint_witness =
+        readCheckpointWitnesses(ref_tables, parent_cursors);
 
     /// WHICH NAMESPACES THIS ROUND WALKS: every namespace the hint names, PLUS every namespace the
     /// parent seal left HELD. A hold must force an exact retry of its offending position even when the
@@ -1492,12 +1544,16 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         if (!held_cov.hold)
             continue;
         /// These keys come out of a DECODED seal, where a coverage map key is an arbitrary string, and
-        /// `parseCursorKey` is documented as undefined on anything `cursorKey` did not produce. Our
-        /// writer always emits a shard separator, so a key without one is debris in a corrupt seal:
-        /// skip it rather than read off the end of it.
+        /// `parseCursorKey` is documented as undefined on anything `cursorKey` did not produce. So
+        /// parse loosely and then PROVE it by rebuilding the key. The round trip is what a separator
+        /// check alone would miss: `parseCursorKey` resolves "ns/xyz" to shard 0 (its `from_chars`
+        /// simply fails and leaves the value), and this walk would then fold a namespace under a shard
+        /// the key never named.
         if (held_key.find('/') == String::npos)
             continue;
         const auto [held_ns, held_shard] = parseCursorKey(held_key);
+        if (cursorKey(held_ns, held_shard) != held_key)
+            continue;
         if (held_shard != 0 || ref_tables.contains(held_ns.string()))
             continue;
         walk_targets.emplace_back(held_ns.string(), &kNoListing);
@@ -3026,6 +3082,49 @@ RebuildReport Gc::rebuildBaseline(bool force)
                 prior_seal = std::move(seal);
             }
         }
+
+        /// NO ADOPTED BASELINE IS NAMED: `gc/state` is absent, undecodable, or sits at generation 0.
+        /// The holds live in the SEAL, not in the pointer to it, so stopping here would make losing the
+        /// pointer -- the LESSER corruption -- produce a hold-free baseline, while an unreadable seal
+        /// refuses. That asymmetry is inverted, and it matters because holds are not re-derivable:
+        /// `WitnessDisappeared` names a record that is gone, so the next walk reads a clean frontier
+        /// and hands the namespace exactly the proof the hold exists to deny.
+        ///
+        /// So find the newest fold seal OBJECT by enumeration and carry ITS holds. This keeps the
+        /// pool's disaster recovery intact -- losing `gc/state` on a lived-in pool is the scenario this
+        /// command exists for -- while making a hold-free baseline over a pool that had holds
+        /// unreachable. An unadopted deposed-leader attempt can be the newest object; carrying its
+        /// holds over-holds at worst, which is the safe direction.
+        if (!decoded || decoded->snap_generation == 0)
+        {
+            if (const auto newest = newestFoldSealRef())
+            {
+                std::optional<CasFoldSeal> seal;
+                try
+                {
+                    seal = readFoldSeal(newest->first, newest->second);
+                }
+                catch (const Exception & e)
+                {
+                    throw Exception(ErrorCodes::CORRUPTED_DATA,
+                        "CAS GC rebuild: gc/state names no adopted baseline and the newest fold seal "
+                        "(generation {}, attempt {}) is UNDECODABLE ({}), so the holds this pool carries "
+                        "cannot be read. A rebuild that dropped them would bless a baseline whose "
+                        "frontier is unproven. GC refuses to rebuild; this pool must be recreated.",
+                        newest->first, newest->second, e.message());
+                }
+                if (!seal)
+                    throw Exception(ErrorCodes::CORRUPTED_DATA,
+                        "CAS GC rebuild: gc/state names no adopted baseline and the newest fold seal "
+                        "(generation {}, attempt {}) vanished between the enumeration and the read, so "
+                        "the holds this pool carries cannot be read. GC refuses to rebuild; this pool "
+                        "must be recreated.",
+                        newest->first, newest->second);
+                prior_seal = std::move(seal);
+            }
+            /// else: no fold seal object anywhere. That is the ONE proof that dropping nothing is safe
+            /// -- a pool that never sealed a baseline has no hold to lose.
+        }
     }
     if (healthy && !force)
     {
@@ -3132,6 +3231,9 @@ RebuildReport Gc::rebuildBaseline(bool force)
     CasFoldSeal seal;
     seal.generation = generation;
     seal.parent_generation = state.snap_generation;
+    /// Cursor keys whose hold this rebuild MINTED (see `minted_here`); they are stamped with the retry
+    /// round once it is known, and nothing else is touched.
+    std::set<String> minted_hold_keys;
     uint64_t max_fence_round = 0;
     std::map<ManifestId, Token> mf_cleanup_unused;
 
@@ -3148,6 +3250,11 @@ RebuildReport Gc::rebuildBaseline(bool force)
         ShardCoverage cov;
         cov.classification = 2;   /// Folded (full coverage) unless a bodiless precommit clamps
         cov.last_folded_ref_id = st.getGreatestApplied();
+        /// Whether the hold on this row was minted BY THIS REBUILD (and so still owes a retry round)
+        /// rather than carried from the prior seal. Tracked explicitly instead of by looking for a
+        /// `next_retry_round` of 0: 0 is a perfectly good wire value, and a carried hold that happened
+        /// to hold it would have its backoff silently rewritten by the stamping pass.
+        bool minted_here = false;
 
         std::vector<BlobDelta> deltas;
 
@@ -3192,7 +3299,8 @@ RebuildReport Gc::rebuildBaseline(bool force)
                                    .offending_position = RefTxnId{cov.last_folded_ref_id.writer_epoch,
                                                                  cov.last_folded_ref_id.ref_sequence + 1},
                                    .retry_count = 0,
-                                   .next_retry_round = 0};   /// set below, once `round` is minted
+                                   .next_retry_round = 0};   /// stamped below, once `round` is minted
+                minted_here = true;
                 ++rep.clamped_shards;
             }
         }
@@ -3211,9 +3319,13 @@ RebuildReport Gc::rebuildBaseline(bool force)
             {
                 cov.classification = 4;
                 cov.hold = pit->second.hold;
+                minted_here = false;   /// a carried hold rides VERBATIM; its retry fields are not ours
             }
         }
-        seal.per_ns_shard[cursorKey(ns, /*shard*/0)] = cov;
+        const String rebuilt_cursor_key = cursorKey(ns, /*shard*/0);
+        if (minted_here)
+            minted_hold_keys.insert(rebuilt_cursor_key);
+        seal.per_ns_shard[rebuilt_cursor_key] = cov;
     }
     rep.namespaces = seen_ns.size();
 
@@ -3294,13 +3406,13 @@ RebuildReport Gc::rebuildBaseline(bool force)
     /// condemn_round stamped on the full-traversal condemns folded into the runs below).
     const uint64_t round = std::max({max_fence_round, state.round, max_gen}) + 1;
 
-    /// Stamp the retry round on the holds THIS rebuild created (the bodiless-precommit ones, left at 0
-    /// because the round was not minted yet). Carried holds are already stamped and must not be
+    /// Stamp the retry round on the holds THIS rebuild minted (the bodiless-precommit ones, left unset
+    /// because the round was not minted yet). Carried holds are named by no key here and are not
     /// touched: their `next_retry_round` and `retry_count` ride verbatim, since a rebuild retries
     /// nothing.
-    for (auto & [key, cov] : seal.per_ns_shard)
-        if (cov.hold && cov.hold->next_retry_round == 0)
-            cov.hold->next_retry_round = round + 1;
+    for (const String & key : minted_hold_keys)
+        if (const auto it = seal.per_ns_shard.find(key); it != seal.per_ns_shard.end() && it->second.hold)
+            it->second.hold->next_retry_round = round + 1;
 
     /// Publish the per-hash condemn marker for EVERY full-traversal condemn SYNCHRONOUSLY (the rebuild
     /// is an offline/administrative path — no bounded-pool async model here). The marker is the
