@@ -43,13 +43,15 @@ task here. Additional Stage-B constraints:
 | 5 | Removal lifecycle: terminal record, janitor, deposited-incarnation cleanup | §3 | 3,4 |
 | 6 | Read-side contract: handles + pre-delete life/fence revalidation | §2 | 4 |
 | 7 | R5 decommission duties | register R5 | 4,5 |
+| 7b | Destruction enablement: flip `kUniverseAuthoritative` | staging contract | 4,5,6,7 |
 | 8 | R2+R3: writer duty queue + orphan-blob nomination (one coherent change) + model extensions | register R2/R3, §9 | 4 |
 | 9 | R1 spec (verbatim-file rebirth aliasing) — spec only | register R1 | — |
 | 10 | TLA debt: `listedTok` audit, unasserted drivers, runnerless models, classifier | phase follow-ups | — |
 | 11 | Stage B gates: battery + churn/rebirth/decommission soak + verdict | §9 | all |
 
 Tasks 9 and 10 are independent of the code chain and may be scheduled at any point (still one
-implementer at a time).
+implementer at a time). Task 11's soak REQUIRES Task 7b (destruction enabled) — a soak with
+destruction still suppressed does not exercise Stage B's claims.
 
 ---
 
@@ -90,10 +92,15 @@ struct RefNamespaceId
 
 - [ ] **Step 1: Failing tests**: key round-trip through every helper; parser refuses a
   legacy-shaped key, a zero incarnation, a malformed hex; a compile-time assertion test that
-  the namespace-only overload set no longer exists — since `refLogKey` is a MEMBER of
-  `Layout`, express it as a dependent `requires`-expression concept check
-  (`static_assert(!requires(const Layout & l, RootNamespace ns, RefTxnId id) { l.refLogKey(ns, id); });`)
-  — the "cannot compile" half of spec §9 r9-5 #3 [codex finding 18].
+  the namespace-only overload set no longer exists — via a GENUINELY TEMPLATED concept so the
+  negative check is a substitution failure, not a hard error [codex r2 finding 18]:
+```cpp
+template <class L>
+concept HasNamespaceOnlyRefLogKey =
+    requires(const L & l, const RootNamespace & ns, const RefTxnId & id) { l.refLogKey(ns, id); };
+static_assert(!HasNamespaceOnlyRefLogKey<Layout>);
+```
+  — the "cannot compile" half of spec §9 r9-5 #3 (repeat the concept per deleted helper).
 - [ ] **Step 2:** Run → FAIL. **Step 3:** Implement type + re-plumb until the tree compiles —
   mechanical, compiler-driven; in Stage B Task 1 the incarnation VALUE everywhere is a
   placeholder constant from the not-yet-landed catalog: introduce
@@ -130,13 +137,15 @@ struct RefCatalog                          /// one object, key `cas/ref_catalog`
     std::vector<CatalogEntry> entries;     /// canonical order: by ns bytes; duplicates illegal
 };
 ```
-- Capacity admission (INV-3, both halves): namespace names get a byte bound
-  (`kMaxNamespaceBytes = 512`); the creation CAS checks the ADDITIVE predicate — encoded
-  catalog size + every entry's worst-case cursor/cleanup/hold reservation must fit BOTH the
-  catalog object cap AND the fold-seal cap (Stage A Task 8's boundary arithmetic is the
-  reservation's source of truth — reuse its constants, do not re-derive). Admission over the
-  bound refuses loudly (`LIMIT_EXCEEDED` naming the namespace and both budgets); removal is
-  never refused (Constraint 13).
+- Capacity admission (INV-3, both halves) — TWO INDEPENDENT predicates [codex r2 finding 9],
+  computed by Stage A Task 8's shared byte-arithmetic helper (its constants are the source of
+  truth — do not re-derive):
+  (1) `encoded_catalog_bytes <= catalog_object_cap` — the catalog's own size;
+  (2) `fold_fixed_bytes + Σ worst_case_entry_reservation <= fold_seal_object_cap` — the
+  fold-seal reservation for every admitted entry.
+  Namespace names get a byte bound (`kMaxNamespaceBytes = 512`). EQUALITY IS ACCEPTED on both
+  predicates; cap + 1 refuses. Admission failure is loud (`LIMIT_EXCEEDED` naming the
+  namespace and WHICH predicate); removal is never refused (Constraint 13).
 
 - [ ] **Step 1: Failing tests**: codec round-trip all three states; strict rejections
   (duplicate ns; `creator` present on `Live`; `creator` absent on `Creating`; zero incarnation;
@@ -200,14 +209,13 @@ struct RefCatalog                          /// one object, key `cas/ref_catalog`
 - Consumes: Tasks 1-3.
 - Produces: spec §5's fold shape — per round ONE catalog `GET`; cursors keyed by catalog
   entries `(ns, incarnation)`; unhinted namespaces carry verbatim; the frontier proof (Stage A
-  Task 9) now iterates EVERY `Live`/`Removing` entry — and with the universe authoritative,
-  **this task flips Stage A's `kUniverseAuthoritative` to `true`, re-enabling production
-  destruction** (the staging suppression's designed end): the Stage-A cross-namespace kill-shot
-  test flips from "zero deletes because suppressed" to "zero deletes because namespace `A` is
-  IN the catalog and its frontier is probed" — the same scenario now survives on proof, not on
-  suppression. Recovery/fold/fsck/sweep construct `RefNamespaceId` from the catalog, live
-  readers from their handle (§2). `RefNamespaceId::stageATransition()` is DELETED; a tree-wide
-  grep for it must return zero (step-gated).
+  Task 9) now iterates EVERY `Live`/`Removing` entry. **`kUniverseAuthoritative` stays FALSE in
+  this task** [codex r2 finding 1 — flipping here would open a deletion-capable window before
+  the removal lifecycle (Task 5) and read-side/pre-delete contracts (Task 6) exist]; the flip
+  is Task 7b's, after Tasks 5/6/7 are green. Recovery/fold/fsck/sweep construct
+  `RefNamespaceId` from the catalog, live readers from their handle (§2).
+  `RefNamespaceId::stageATransition()` remains for the READER paths until Task 6 replumbs them
+  — ITS deletion and the tree-wide zero-grep gate move to Task 6 [codex r2 finding 1].
 
 - [ ] **Step 1: Failing tests**: fold discovers a namespace with ZERO listable objects (hint
   fully blind) via the catalog and probes its frontier — the Stage-A residual test from
@@ -317,6 +325,27 @@ root remains.
 - [ ] **Step 2:** → FAIL. **Step 3:** Implement. **Step 4:** CA gate +
   `test_content_addressed_drop_pool_member` lane green.
 - [ ] **Step 5: Commit** `ca: decommission — catalog-exact duties; retirement fenced on owned entries`.
+
+### Task 7b: Destruction enablement — flip `kUniverseAuthoritative` {#task-7b}
+
+**Files:**
+- Modify: the Stage-A constant's translation unit (`Gc/CasGc.h` region — the constexpr from
+  Stage A Task 9) — `false` → `true`, comment updated to cite THIS task
+- Test: the Stage-A cross-namespace kill-shot test in `gtest_cas_list_liar_end_to_end.cpp`
+
+[Codex r2 finding 1: this flip is deliberately AFTER the removal lifecycle (Task 5), the
+read-side/pre-delete contracts (Task 6), and the same-rollout decommission duties (Task 7).]
+
+- [ ] **Step 1:** Flip the constant. The kill-shot test's expectations change: "zero deletes
+  because suppressed" becomes "zero deletes because namespace `A` is IN the catalog and its
+  frontier is probed" — the same scenario now survives on PROOF, not suppression; the
+  seam-forced variant (constant already true) collapses into the production case and is
+  removed. This is the ONE intentional Stage-B edit of that Stage-A test (the reviewer expects
+  exactly this diff).
+- [ ] **Step 2:** Full CA gate + both CA-s3 lanes + `test_content_addressed_gc_s3` green —
+  destruction now ACTIVE for the first time on the new universe; watch the delete families'
+  metrics in the lane logs (nonzero deletes expected, zero anomalies).
+- [ ] **Step 3: Commit** `ca: gc — universe authoritative: production destruction enabled (Stage B)`.
 
 ### Task 8: R2+R3 — writer duty queue + orphan nomination, one coherent change {#task-8}
 
@@ -433,9 +462,11 @@ Commit alone; final commit updates `models/README.md` + `cas/06-tla-models.md`.
    universe → T4; register: R2/R3 → T8, R5 → T7, R1 → T9 (spec only), R6 accepted (no task —
    by design), R7 done in Stage A T12, R8 done during the phase.
 2. Ledger obligations mapped: token-exact reconciliation at call site → T3; creator install
-   generation+token → T3; three-site same-value → T3 (completing Stage A's two sites);
-   deposited incarnation + capture-time correctness → T5; `listedTok` audit + drivers +
-   runnerless + classifier → T10.
+   generation+token → T3; the generation-only three-site trio (slot-occupy/`_ckpt`/install) is
+   COMPLETED IN STAGE A Task 6 with its deterministic bump tests — Stage B Task 3 adds the
+   SEPARATE two-credential catalog site, not a trio member [codex r2 finding 7]; deposited
+   incarnation + capture-time correctness → T5; `listedTok` audit + drivers + runnerless +
+   classifier → T10a-d; destruction enablement ordering → T7b.
 3. Every task name-checks its TLA counterpart where one exists; model edits follow phase
    conventions and are grouped in T8 (register models) and T10 (debt) — the five PHASE models
    stay sealed except T10's classifier-only runner fix.
