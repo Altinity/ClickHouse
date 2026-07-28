@@ -1360,3 +1360,8 @@ now populated on the ordinary writer path). Round 2 review running. No push.
 
 **2026-07-28 13:40 local watchdog** — codex r2 active (log 451 KB, seconds-fresh), no marker yet.
 No push.
+
+**2026-07-28 14:1x local** — codex r2: 13/18 RESOLVED, REJECT held on 5 (genesis contract,
+flip ordering, trio tests, capacity predicates, type/callback precision). All five fixed
+(`791bdc26037` stage A, `eda60649e7d` stage B — incl. NEW Task 7b destruction-enablement after
+lifecycles). Round 3 scoped re-review launched. No push.
