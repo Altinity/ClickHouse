@@ -1445,3 +1445,6 @@ dependency). Agent continuing with nextRefTxnId already drafted. No push.
 **2026-07-28 18:00 local watchdog** — task 3 mid-triage: gate re-run finished 17:59 (logs fresh),
 30-failure fallout triage in progress per agent's own status; no commit yet, no live procs
 (between rounds). No push.
+
+**2026-07-28 18:20 local watchdog** — task 3 deep in fallout repair: iterative builds impl4/impl5
++ semantic-bucket gtest runs, logs seconds-fresh. No commit yet. No push.
