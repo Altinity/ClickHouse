@@ -1523,3 +1523,7 @@ landed (`0d866434dd8`, 1423/1423, all 8 findings); external reviewer running. No
 **2026-07-28 21:2x local** — task 4 review: APPROVED zero-important; wrap-up round dispatched
 (LOW comments/observability + ASan full-gate to honor the both-build-classes claim). T8 in
 flight on lane G. No push.
+
+**2026-07-28 21:20 local watchdog** — lane L wrap-up: ASan build done (21:15), ASan gate running
+(log growing 21:19); lane G T8: red-first phase (hold-grammar test file written, red build at
+21:16). Both healthy. No push.
