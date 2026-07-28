@@ -1313,3 +1313,7 @@ are the re-reviewer's leftovers (11:32). No push.
 **2026-07-28 13:0x local watchdog** — task 6 in Step-3 end-to-end re-run: refcatalog + ns-cleanup
 runners done (11:57), run_mount in progress (11:59, live TLC). Logs fresh, sequential as
 instructed. No push.
+
+**2026-07-28 12:2x local... (13:2x?) watchdog** — task 6 reviewer mid-flight (one live TLC = its
+spot-run; review file not yet written). Retirement-sweep obligation added to ledger for the main
+plan per user directive. No push.
