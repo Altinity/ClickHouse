@@ -1430,3 +1430,7 @@ control-layer + test file), build not yet started. No push.
 
 **2026-07-28 17:20 local watchdog** — task 2 fix round stalled again post-edit (20 min quiet, no
 build). Final nudge sent with controller-finalize ultimatum. No push.
+
+**2026-07-28 17:3x local** — task 2 fix round finalized BY CONTROLLER (agent stalled at commit
+3rd time; work itself green: 10/10 + 1396/1396, committed `1f8bad75270`). Re-review dispatched.
+No push.
