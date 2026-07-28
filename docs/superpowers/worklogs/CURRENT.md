@@ -1300,3 +1300,8 @@ No push.
 **2026-07-28 11:4x local** — fix round 1 DONE (`a7de5b1ea14`, 22/22): identity <<actor,gen,op>>,
 aliasing half now the PRIMARY sab_slotnocompare counterexample (depth 7); StrictOrderMount
 committed. Ckpt-CAS/three-site obligations parked for main plan. Scoped re-review dispatched. No push.
+
+**2026-07-28 12:1x local** — task 5 CLOSED (re-review clean but two doc minors — fixed by controller,
+`cbdf62811c5`; depth-7 aliasing counterexample confirmed independently). Task 6 (final: audit older
+models for LIST-trust + precedence-bug fix + phase gate summary + full end-to-end re-run) dispatched
+to fresh opus agent tla-task6, BASE `cbdf62811c5`. No push.
