@@ -1380,3 +1380,6 @@ build/task0_build.log fresh). No push.
 
 **2026-07-28 14:5x local** — task 0 CLOSED (gate verified; baseline 1357/1357). Task 1
 (EpochSeal format + grammar, TDD) dispatched to impl-a1. No push.
+
+**2026-07-28 14:20 local watchdog** — task 1 active: failing-tests file written (10 KB),
+TDD build running (task1_build.log fresh, 2 live build procs). No push.
