@@ -2065,6 +2065,65 @@ def test_export_partition_truncate_type_change_rejected(cluster):
     )
 
 
+def test_export_partition_value_preserving_cast_not_order_preserving_rejected(cluster):
+    """Int64 -> String keeps every value, but not their order: 2 and 29 are the endpoints of the
+    source partition, yet the interior value 10 casts to a string that sorts outside them. The
+    endpoints truncate to '2' while 10 truncates to '1', so the partition spans two destination
+    buckets and must be rejected instead of being waved through as a lossless cast."""
+    node = cluster.instances["replica1"]
+
+    uid = unique_suffix()
+    mt_table = f"mt_cast_order_{uid}"
+    iceberg_table = f"iceberg_cast_order_{uid}"
+
+    make_rmt(node, mt_table, "id Int64, k Int64", "intDiv(k, 100)",
+             replica_name="replica1")
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 2), (2, 10), (3, 29)")
+
+    make_iceberg_s3(node, iceberg_table, "id Int64, k String",
+                    partition_by="icebergTruncate(1, k)")
+
+    pid = first_partition_id(node, mt_table)
+    error = node.query_and_get_error(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {iceberg_table}",
+        settings={"allow_insert_into_iceberg": 1},
+    )
+    assert "BAD_ARGUMENTS" in error, (
+        f"Expected BAD_ARGUMENTS for a non-order-preserving cast, got: {error!r}"
+    )
+
+
+def test_export_partition_order_preserving_cast_accepted(cluster):
+    """The same shape as the rejected case, but with all values sharing a digit count: Int64 ->
+    String is order-preserving over [20, 29], so the endpoints do bound the interior and the whole
+    source partition truncates to the single destination bucket '2'."""
+    node = cluster.instances["replica1"]
+
+    uid = unique_suffix()
+    mt_table = f"mt_cast_order_ok_{uid}"
+    iceberg_table = f"iceberg_cast_order_ok_{uid}"
+
+    make_rmt(node, mt_table, "id Int64, k Int64", "intDiv(k, 100)",
+             replica_name="replica1")
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 20), (2, 25), (3, 29)")
+
+    make_iceberg_s3(node, iceberg_table, "id Int64, k String",
+                    partition_by="icebergTruncate(1, k)")
+
+    pid = first_partition_id(node, mt_table)
+    node.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {iceberg_table}",
+        settings={"allow_insert_into_iceberg": 1},
+    )
+    wait_for_export_status(node, mt_table, iceberg_table, pid, "COMPLETED")
+
+    src = node.query(f"SELECT id, toString(k) FROM {mt_table} ORDER BY id").strip()
+    dst = node.query(f"SELECT id, k FROM {iceberg_table} ORDER BY id").strip()
+    assert src == dst, f"destination rows differ from source:\n{src}\n---\n{dst}"
+
+    assert_iceberg_partition_metadata(node, iceberg_table, uid, [("k", "icebergTruncate(1, k)")])
+
+
 def test_export_partition_timezone_mismatch_rejected(cluster):
     """A source partitioned by day in one timezone must not be treated as structurally identical to a
     destination day computed in another timezone. The source uses Asia/Tokyo (UTC+9) and the

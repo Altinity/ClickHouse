@@ -721,22 +721,22 @@ namespace
                 "Cannot export partition: destination column '{}' not found.", column);
         const auto destination_type = destination_sample.getByName(column).type;
 
-        /// The written value is transform(cast(source)). A value-preserving cast is order-preserving, so
-        /// the endpoints bound every interior row; a lossy cast may wrap, so require it monotonic over the
-        /// partition's actual range, otherwise the endpoints prove nothing about the interior.
-        bool cast_is_monotonic = canBeSafelyCast(source_type, destination_type);
-        if (!cast_is_monotonic)
+        /// The written value is transform(cast(source)), and the endpoints only bound the interior rows if
+        /// the cast preserves order. Preserving every value is not enough: Int -> String loses nothing, yet
+        /// "10" sorts before "2", so an interior row can fall outside the endpoints. Without a cast the
+        /// order holds trivially; otherwise CAST must prove it over the partition's actual range.
+        const bool is_cast_needed = !source_type->equals(*destination_type);
+        if (is_cast_needed)
         {
             const auto cast_function
                 = createInternalCast({source_type, column}, destination_type, CastType::nonAccurate, {}, context);
-            cast_is_monotonic = cast_function->hasInformationAboutMonotonicity()
-                && cast_function->getMonotonicityForRange(*source_type, min_value, max_value).is_monotonic;
+            if (!cast_function->hasInformationAboutMonotonicity()
+                || !cast_function->getMonotonicityForRange(*source_type, min_value, max_value).is_monotonic)
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "Cannot export partition '{}': values of column '{}' cross a non-monotonic cast boundary to "
+                    "the destination type {}, so it spans multiple destination partitions.",
+                    partition_id, column, destination_type->getName());
         }
-        if (!cast_is_monotonic)
-            throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                "Cannot export partition '{}': values of column '{}' cross a non-monotonic cast boundary to "
-                "the destination type {}, so it spans multiple destination partitions.",
-                partition_id, column, destination_type->getName());
 
         auto values_column = source_type->createColumn();
         values_column->insert(min_value);
