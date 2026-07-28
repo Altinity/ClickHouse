@@ -1553,3 +1553,7 @@ round dispatched. Lane L implementing the two-armed terminate ruling. No push.
 **2026-07-28 22:00 local watchdog** — both lanes deep in their rounds, logs seconds-fresh:
 L = terminate-ruling cycle (ASan build6 + release gate13 concurrently); G = genuine red runs
 for I1 (fix1_red_run.log). No push.
+
+**2026-07-28 22:3x local** — terminate ruling landed: both gates UNFILTERED green (ASan 1427/1427
+zero reports). Mount-pair scoped review dispatched; on clean = task 4 closes, T7 merges into
+main, T5 dispatches. G's T8 fix round still cycling. No push.
