@@ -565,6 +565,231 @@ have (`CasBlobInDegree.cpp:443-446` pattern). The delete-site in-degree re-read
 - [ ] **Step 4:** New filter PASS + full CA gate + `test_content_addressed_gc_s3` local lane green.
 - [ ] **Step 5: Commit** `ca: gc — destructive-round frontier proof; suppress_destructive at every destructive site`.
 
+### Task 10: Sweep §6 deletion premise {#task-10}
+
+**Files:**
+- Modify: `.../Gc/CasOrphanManifestSweep.cpp` — `sweepNamespace` `:272` (delete decision around
+  `:316-327`), `sweepManifestCursorPage` `:342` (delete decision around `:434`),
+  `prefixEligible` `:252`
+- Create: `src/Disks/tests/gtest_cas_sweep_deletion_premise.cpp`
+
+**Interfaces:**
+- Consumes: Task 7 (cursor semantics: "epoch `E`'s seal consumed" ⇔ cursor has crossed a seal
+  with `writer_epoch >= E`), Task 9 (`suppress_destructive` — the sweep is already behind the
+  frontier gate after Task 9; this task adds the PER-MANIFEST premise).
+- Produces: the two §6 rules, verbatim from the spec, as ONE predicate both sweep paths call:
+```cpp
+/// A manifest of an epoch-E build is deletable only when:
+///   (1) the namespace cursor has consumed epoch E's seal, AND
+///   (2) no unconsumed tail record above the cursor names it as a removal target
+///       (removals cross epochs; grants do not).
+/// ANY uncertainty — unreached frontier, budget exhaustion, hold — means retain.
+bool manifestDeletionPremise(const NamespaceFoldView &, const ManifestKey &, String * retain_reason);
+```
+
+This task deliberately does NOT implement register R3 (nomination path) or R2 (writer duty
+queue) — those are Stage B scope as one coherent sweep change; the premise here is the SAFETY
+floor that must hold regardless. `retain_reason` feeds the existing `warnings` out-param
+(`sweepNamespace`'s `std::vector<String> * warnings`) — retained-manifest decisions are visible,
+not silent (Constraint 10).
+
+- [ ] **Step 1: Failing tests** in `gtest_cas_sweep_deletion_premise.cpp`:
+  manifest of epoch `E`, seal of `E` NOT yet consumed → retained with reason; seal consumed, an
+  unconsumed tail removal above the cursor names the manifest → retained; seal consumed, tail
+  clean → deleted (exact token — the existing `deleteExact` path `:327`/`:434`); hold present
+  on the namespace → retained (uncertainty rule); budget exhausted mid-page → remaining
+  candidates retained, cursor does NOT skip them.
+- [ ] **Step 2:** `--gtest_filter='CasSweepDeletionPremise*'` → FAIL.
+- [ ] **Step 3:** Implement the predicate + wire both call sites; `prefixEligible` (`:252`)
+  keeps its watermark logic and ADDITIONALLY requires the premise (belt over suspenders is fine
+  here — the watermark is an eligibility hint, the premise is the safety floor).
+- [ ] **Step 4:** New filter PASS + full CA gate.
+- [ ] **Step 5: Commit** `ca: sweep — §6 deletion premise: seal-consumed + no-tail-removal, retain on uncertainty`.
+
+### Task 11: REBUILD condemn-nothing; fsck arithmetic streams {#task-11}
+
+**Files:**
+- Modify: `.../Gc/CasGc.cpp` — `rebuildBaseline` `:2488`: DELETE the condemnation block
+  `:2739-2800` (the blobs-prefix LIST `:2756`, `edge_bearing` skip `:2762`, HEAD `:2764`,
+  `zero_condemned` insertion `:2767-2774`, synchronous condemn markers `:2783-2800`)
+- Modify: the fsck implementation (locate via `grep -rn "chain-broken\|unchecked" src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/` — the fsck entry point and its summary/exit-code plumbing; the Task-0 tree makes this unambiguous)
+- Create: `src/Disks/tests/gtest_cas_rebuild_condemn_nothing.cpp`
+
+**Interfaces:**
+- Consumes: Task 8 (hold carry through REBUILD + refusal — already landed there), Task 7
+  (arithmetic streams).
+- Produces: REBUILD per spec §7 — rebuilds cursors and edges from `_ckpt` + arithmetic tails,
+  **condemns nothing**; fsck per §7 — streams by arithmetic, `chain-broken` fatal in summary
+  AND exit code, tails above `_ckpt.checkpoint`, `unchecked` reserved for the genuinely
+  unproven, healthy pool returns clean.
+
+The removed condemnation is the r5-finding-4 data-loss vector (hidden live manifest + listed
+blob ⇒ acked data condemned). Its ABSENCE creates the NAMED Stage-A residual (staging contract):
+manifest-less orphan blobs are unreclaimable until register R4's build/upload registry — the
+task's report and the stage summary both restate this residual explicitly; no quiet substitute
+reclamation is added (Constraint 3: no fallback).
+
+- [ ] **Step 1: Failing tests** in `gtest_cas_rebuild_condemn_nothing.cpp`:
+  a durable blob whose manifest the hint HIDES from REBUILD's traversal → after REBUILD the blob
+  is NOT condemned (today FAILS — `:2767` condemns it: the data-loss vector, now a regression
+  test); REBUILD output carries pre-existing holds verbatim (Task 8's test extended to the
+  full-rebuild path); fsck on a healthy arithmetic pool → clean, exit 0; fsck with a planted
+  mid-chain 404 below a witness → `chain-broken` in summary AND nonzero exit; fsck tail above
+  `_ckpt.checkpoint` → walked, reported, not `unchecked`; fsck `unchecked` appears ONLY for the
+  genuinely unproven class (a namespace with a hold), never as a default.
+- [ ] **Step 2:** `--gtest_filter='CasRebuildCondemnNothing*'` → FAIL.
+- [ ] **Step 3:** Implement (delete + fsck rework).
+- [ ] **Step 4:** New filter PASS + full CA gate + `test_content_addressed_gc_s3` lane green.
+- [ ] **Step 5: Commit** `ca: gc — REBUILD condemns nothing; fsck walks arithmetic streams (chain-broken fatal)`.
+
+### Task 12: Retirement sweep — retire-or-justify with verdicts {#task-12}
+
+**Files:**
+- Modify (per verdict): `.../Gc/CasGc.cpp` probe A `:1062-1205`; `.../Pool/CasPool.cpp`
+  `materialization_grace` `:1018-1029` (+ config plumbing `CasPool.h:152`,
+  `ContentAddressedSettings.cpp:91`, `ContentAddressedMetadataStorage.cpp:287,740`, open-path
+  `:679`/`:703`); `.../Pool/CasRefLedger.cpp` residual reconciliation leftovers
+- Create: `src/Disks/tests/gtest_cas_retirement_sweep.cpp`
+- Create: `docs/superpowers/cas/2026-07-28-stage-a-retirement-verdicts.md` (the verdict table —
+  one row per item: premise / verdict (a|b|c) / replacement / test)
+
+**Interfaces:**
+- Consumes: everything landed in Tasks 3-9 (the premises' killers).
+- Produces: the verdict document + the code changes it mandates. THE RULE (user directive,
+  ledger `MAIN-PLAN OBLIGATION`): (a) premise dead → REMOVE + fail-close assert in its place;
+  (b) premise transformed → re-derive; (c) premise alive → keep with documented reason.
+  **No (c) by inertia** — every row cites the Stage-A mechanism that was checked against it.
+
+Item-by-item, with the expected verdict to VERIFY (not assume — the implementer's analysis may
+overturn any of these with evidence, which then goes to the controller as a question):
+1. **Probe A** (`:1062-1205`) — expected (b): its hole-detection premise (two listings disagree)
+   is subsumed by arithmetic intake; its ABORT effect (`ref_folding_aborted` `:1193-1195`)
+   contradicts the new design (a hint hole is a non-event; a real gap is a HOLD, not an abort).
+   Re-derive as spec §5 mandates: a SAMPLED store-quality detector, deterministic cadence,
+   durable due/performed/skipped observability, **aborts nothing, gates nothing** (register R7's
+   demotion). The pre-fold second enumeration (`preFoldRefScan`) retires with it → the round has
+   ONE strict hint enumeration (spec §5's stated shape).
+2. **`materialization_grace` / T_mat wait** (`:1018-1029`, open path `:679`/`:703`) — expected
+   (a) for the ref layer: its premise ("an unresolved ref-log conditional PUT from the dying
+   epoch lands after recovery trusts its LISTINGS") dies — recovery no longer trusts listings
+   for completeness, and the in-band seal at `T+1` fences stragglers deterministically
+   (Task 6). Verify the wait guards NOTHING ELSE (the site map ties it to
+   `refLanesSettledForRemount` + `unclean_boundary_epoch`, both ref-layer); if the analysis
+   confirms, DELETE the wait + `unclean_boundary_epoch` coupling (`CasRefLedger.cpp:611` gate
+   died with Task 6's sentinel-seal removal; `:921` doc updated), keep the SETTING parsed but
+   inert-with-a-deprecation-log for one release only if removing it breaks config files —
+   otherwise delete the setting too (pre-release: delete).
+3. **Recovery LIST-reconciliation trust** — verdict (a) ALREADY EXECUTED in Task 6 (listed here
+   so the table is complete; row cites Task 6's commit).
+4. **Fold listed-only iteration** — (a) executed in Task 7 (row cites commit).
+5. **`greatest_listed_id` as authority** — (a) executed in Task 6.
+6. **404-never-throw during GC fold** — (c) KEEP: its reason (concurrent legitimate deletion,
+   record-and-continue) is about CONCURRENT DELETES, not LIST trust — unchanged by v9. Row
+   documents this.
+7. **Re-hash identity / HEAD-before-PUT / condemned-never-revived** — (c) KEEP: adversary-model
+   primitives, explicitly out of scope of any "optimization" (Constraint 5). Row documents.
+
+- [ ] **Step 1:** Write the verdict document with the table above as its skeleton; for rows
+  1-2 perform the code-level analysis FIRST (read every consumer; the config plumbing list
+  above is the map's complete set) and record evidence per row.
+- [ ] **Step 2: Failing tests** in `gtest_cas_retirement_sweep.cpp`:
+  probe A no longer aborts folding on a planted hint hole (fold completes, hole folds through);
+  probe A's detector still REPORTS the hole (observability retained: due/performed/skipped
+  counters present and durable); remount with an unresolved dying-epoch lane completes WITHOUT
+  the T_mat sleep and the straggler is fenced by the seal (fault-injected straggler PUT after
+  recovery → conditional create loses to the occupied slot — assert the straggler's PUT
+  conflicts); the deleted wait's site has the fail-close replacement (whatever the analysis
+  mandates — e.g. `chassert(ref_lanes_settled || wedged)` shape).
+- [ ] **Step 3:** Implement per verdicts; run new filter + full CA gate + BOTH local CA-s3
+  lanes (`test_content_addressed_s3`, `test_content_addressed_gc_s3`).
+- [ ] **Step 4:** Self-check the verdict doc against the ledger rule (no row without a cited
+  mechanism; no (c) without a reason that survives v9).
+- [ ] **Step 5: Commit** `ca: retirement — probe A demoted to detector; T_mat wait retired; verdict table`.
+
+### Task 13: LIST-liar fault injection — the blocker's end-to-end regression {#task-13}
+
+**Files:**
+- Modify: `.../Backend/CasInMemoryBackend.{h,cpp}` (`list` — add the liar hook) and, if the
+  emulated single-process backend's `list` is a distinct path
+  (`CasObjectStorageBackend.cpp` emu arm), the same hook there
+- Create: `src/Disks/tests/gtest_cas_list_liar_end_to_end.cpp`
+
+**Interfaces:**
+- Consumes: everything (this is the integration regression of the whole stage).
+- Produces: `void setListOmissions(std::vector<String> hidden_keys)` on the test backends —
+  enumeration omits the named keys while `get`/`head`/`putIfAbsent`/`casPut`/`deleteExact`
+  serve them honestly (EXACTLY the RustFS defect shape from
+  `reports/2026-07-26-list-incompleteness-proof/`: durable objects invisible to LIST while a
+  LATER key is visible).
+
+- [ ] **Step 1: Failing tests** (they fail before Stage A only if run against pre-Stage-A code —
+  on the completed branch they must PASS; the "failing first" step here is running each against
+  a deliberately broken toggle, see Step 3):
+  **(the blocker, full pipeline)** writer appends ids 1..5; LIST hides 3 and 4 (returns 1,2,5);
+  GC folds → all five folded, cursor at 5, zero anomalies (the `0x1430c`/`0x1430d` shape as a
+  non-event); recovery under the same lie → recovered state identical to truth; **(the
+  data-loss arm)** a `-1` for a blob rides id 3 (hidden) while its blob's last other `+1` is
+  visible → blob NOT deleted this round (in-degree correct after arithmetic fold); **(the
+  leak arm)** a `+1` rides the hidden id → blob's in-degree includes it, later legitimate `-1`
+  does not strand it; **(new-namespace residual, DOCUMENTED not asserted-away)** a namespace
+  whose ONLY record is hidden AND absent from `gc/state` → this stage does NOT see it — the
+  test asserts the DOCUMENTED behavior (no destruction of its blobs can occur because no other
+  namespace's proof covers them — blob condemnation requires an observed `-1`/zero transition,
+  which cannot exist for never-folded grants) and cross-references the staging-contract
+  residual; **(fsck)** fsck under the lie → clean (arithmetic streams don't consult LIST
+  completeness).
+- [ ] **Step 2:** Wire the hook (test-only; production `list` untouched).
+- [ ] **Step 3:** Prove each test CAN fail: temporarily revert the Task 7 intake commit in a
+  scratch worktree (`git worktree add` — do NOT touch the main tree) and run the suite there —
+  the blocker test must FAIL under listed-only intake. Record the failure output in the report
+  (this is the plan's "seen red" discipline applied to C++).
+- [ ] **Step 4:** Full CA gate + both CA-s3 lanes green.
+- [ ] **Step 5: Commit** `ca: tests — LIST-liar fault injection; the 2026-07-25 blocker as a permanent regression`.
+
+### Task 14: Stage A gates — full battery + soak + stage summary {#task-14}
+
+**Files:**
+- Create: `docs/superpowers/cas/2026-07-28-stage-a-RESULTS.md`
+
+**Interfaces:**
+- Consumes: all prior tasks.
+- Produces: the Stage-A gate verdict line — `STAGE A: PASS` / `FAIL` — the precondition of
+  Stage B's Task 0 AND of any user-facing "the blocker is closed" claim.
+
+- [ ] **Step 1:** Full CA gtest gate (Task 0's filter) — record counts vs Task 0 baseline;
+  every intentional test change already itemized in task reports.
+- [ ] **Step 2:** Integration: ALL CA lanes locally (`with_rustfs` set:
+  `test_content_addressed_s3`, `test_content_addressed_gc_s3`, `test_content_addressed_shared_pool`,
+  `test_content_addressed_drop_pool_member`, `test_content_addressed_ref_snaplog`,
+  `test_cas_replicated_relink`, `test_cas_lazy_load_recovery`, `test_cas_insert_fault_recovery`,
+  `test_cas_file_cache`) via `python -m ci.praktika run "integration" --test <selectors>`;
+  one log per lane in the build dir; a subagent summarizes each log.
+- [ ] **Step 3:** Soak: `utils/ca-soak` phase 3 `--duration 90m` (the REAL soak — phase 1
+  `--ops` finishes ~10× faster and is NOT a substitute), plus the adversarial scenarios lane
+  relevant to this stage (at minimum: the GC concurrent-leader scenarios and S30's
+  dangling-precommit shape from `utils/ca-soak/scenarios/`). PASS criteria: zero data-loss
+  events, zero wedged-forever lanes, fsck clean at end, no unbounded `unaccounted` growth, no
+  ERROR-severity log lines that are not test-injected.
+- [ ] **Step 4:** Write `2026-07-28-stage-a-RESULTS.md`: battery table (every gate, expected vs
+  observed), the residual restatement (staging contract verbatim), and the verdict line.
+  `STAGE A: PASS` requires every row green; anything else is `FAIL` with the failing row named
+  (no partial credit — the `no known reds` rule).
+- [ ] **Step 5: Commit** `ca: stage A — gate battery results + verdict`.
+
+---
+
+## Self-review checklist (run at plan-completion, before removing the DRAFT marker) {#self-review}
+
+1. Spec coverage: INV-1 → T3/T4; INV-2 → T1/T2/T4/T6/T7; INV-4 → T5 (+T8 witness, T9 ranges);
+   §4 → T6; §5 → T7/T8/T9; §6 → T10; §7 → T11; §8 cost ceilings → constraint 8; §9 C++ side →
+   T13 + per-task seen-red steps. INV-3/§3 catalog rows → Stage B plan (staging contract).
+2. Placeholder scan; type consistency across task Interfaces blocks.
+3. Ledger obligations mapped: ckpt shared merge helper → T5; three-site same-value recheck →
+   T5/T6 (Stage-A sites; catalog site joins in B); install-lock recheck → T6; retirement rule →
+   T12; deleteExact normative → T9; capacity byte-half boundary tests → T8 (seal); LIST-liar →
+   T13.
+
+
 
 
 
