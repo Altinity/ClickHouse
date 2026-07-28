@@ -1648,3 +1648,7 @@ return" rule issued); small fix round dispatched. T6 finishing fixtures + gates.
 
 **2026-07-29 01:00 local watchdog** — T6 on gate5 + build18 (converging, logs seconds-fresh);
 T9 fix round editing (no new commit yet). No push.
+
+**2026-07-29 01:4x local** — T9 fix round in re-review (marker discipline's first catch = a
+load-sensitive lane-A test, RCA'd not dropped; deadline-widening ledgered to convergence).
+T6 converging on gates. No push.
