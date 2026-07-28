@@ -1172,3 +1172,8 @@ commits ahead. No long run under test, no signals to observe, nothing scheduled.
 
 **15:56 UTC watchdog** — idle for my work: nothing of mine running, 319G, load 0.77, 0 uncommitted, 88
 commits ahead. No long run under test, no signals to observe, nothing scheduled.
+
+**2026-07-28 02:1x UTC watchdog** — ref-rework pipeline: spec v9 CONVERGED (r9 APPROVE-WITH-FIXES,
+`4d6f720c206`); TLA-phase plan committed (`62812c99ccd`); SDD ledger live; Task 1 implementer
+(opus, `CaRefTableSnapshotLogCore` v9 rewrite) dispatched minutes ago — no report/model mtime yet,
+expected (reading phase). No codex, no TLC running. Nothing wedged, nothing to advance. No push.
