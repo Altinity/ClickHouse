@@ -1652,3 +1652,8 @@ T9 fix round editing (no new commit yet). No push.
 **2026-07-29 01:4x local** — T9 fix round in re-review (marker discipline's first catch = a
 load-sensitive lane-A test, RCA'd not dropped; deadline-widening ledgered to convergence).
 T6 converging on gates. No push.
+
+**2026-07-29 02:0x local** — T9 CLOSED (8 commits, re-review CLEAN — denominator now IS the
+sealed set). T10 (sweep §6 premise) dispatched on lane G. T6 on ASan+debug gates with 3
+verdicts issued (derivation approved — handles rebirth free; local refusal must keep the
+conclusive-rejection terminal). No push.
