@@ -1603,3 +1603,7 @@ confirmation still reading. No push.
 **2026-07-29 00:2x local** — T8 CLOSED (11 lane commits; deepest review of the stage). T9
 dispatched on lane G (10-obligation list). T8->main merge deferred until T5's commit frees
 ProfileEvents.cpp. No push.
+
+**2026-07-29 00:5x local** — T5 DONE (1460/1460 + ASan 1464/1464; groupRefKeys pool-wide-abort
+hazard prevented; life_epoch optional by red-proof); reviewer dispatched. T8 merged to main
+(`5f7343cf9b9`, clean); combined gate running. T9 implementing on lane G. No push.
