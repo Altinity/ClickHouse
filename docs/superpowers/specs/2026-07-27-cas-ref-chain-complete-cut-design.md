@@ -97,7 +97,11 @@ after its creator's fence is terminal. **Removal:** catalog `Live → Removing` 
 mounted writer or a successor that has claimed and fenced that server root; GC surfaces stuck
 removals, never appends. The decommission actor's exact duties (catalog-exact enumeration, the
 `_ckpt`-present/absent resumption branches, no slot retirement with owned entries) are register item
-R5 — a same-rollout dependency on the decommission spec. **Recovery ownership:** the mount-fence
+R5 — a same-rollout dependency on the decommission spec. **The namespace-cleanup item carries the
+incarnation captured at deposition, and a resumed pass NEVER re-derives it from the catalog** — a
+re-derivation resolves a reborn name to the NEW life's incarnation and deletes live data (phase-0
+model `CaRefNsCleanupStaleLeaderCore`); §2's "derive it from the catalog" applies to discovering
+current lives, never to a deposited cleanup scope. **Recovery ownership:** the mount-fence
 generation is captured at admission and required on every `slot-occupy`, `_ckpt` CAS and install;
 self-remount cancels or waits out recovery before rearming. **Migration: recreate-only.** The pool
 format bumps (writer generation AND backward floor); old-format startup fails closed naming pool
