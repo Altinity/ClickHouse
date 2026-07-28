@@ -6,6 +6,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
+#include <Poco/Exception.h>
 
 using namespace DB::Cas;
 using DB::Cas::tests::CountingBackend;
@@ -75,6 +76,32 @@ public:
     }
 };
 
+/// Delegates the FIRST putIfAbsent for a key to CountingBackend -- so the write actually LANDS -- and
+/// only THEN throws an ambiguous exception, modelling "our own PUT committed but its response was lost"
+/// (the Task-4 adoption input: plan's "Occupied + bytes == wedge.bytes -> an earlier attempt landed ->
+/// adopt"). Distinct from InMemoryBackend::injectAmbiguousPutIfAbsent, which never touches the store at
+/// all -- that hook models an attempt that did NOT land; this one models an attempt that DID.
+/// One-shot per key: review finding I2 asked specifically for a ~10-line local backend rather than
+/// reusing ChunkFaultBackend::Mode::LandedThenLost, which also arms a one-shot lost-GET fault that would
+/// obscure whether slotOccupy's OWN immediate resolve (not just a later caller's retry) is correct too.
+class LandedButAckLostOnceBackend : public CountingBackend
+{
+public:
+    using CountingBackend::putIfAbsent;
+    bool fired = false;
+
+    PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta) override
+    {
+        if (!fired)
+        {
+            fired = true;
+            CountingBackend::putIfAbsent(key, bytes, meta);   /// the write LANDS
+            throw Poco::TimeoutException("LandedButAckLostOnceBackend: simulated lost PUT response");
+        }
+        return CountingBackend::putIfAbsent(key, bytes, meta);
+    }
+};
+
 }
 
 /// ---- Step 1 required scenarios ----
@@ -114,6 +141,7 @@ TEST(CasSlotOccupy, PreExistingKeyOccupiedWithExactBytesAndTokenTwoOps)
 
     EXPECT_EQ(backend->putCount("k"), 1u);
     EXPECT_EQ(backend->getCount("k"), 1u);
+    EXPECT_EQ(backend->headCount("k"), 0u) << "exactly PUT+GET -- a HEAD-then-GET implementation must fail this";
 
     /// A conflict never overwrites or appends -- the pre-existing object is untouched.
     const auto current = backend->get("k");
@@ -155,6 +183,10 @@ TEST(CasSlotOccupy, ConflictThenVanishResolvesUnresolved)
 
     EXPECT_EQ(backend->putCount("k"), 1u);
     EXPECT_EQ(backend->getCount("k"), 1u);
+    /// No headCount assertion here (unlike the sibling Occupied test above): VanishOnConflictBackend's
+    /// OWN fixture issues a HEAD internally (to fetch the token before deleteExact) -- that HEAD belongs
+    /// to the test's vanish mechanism, not to slotOccupy, so asserting headCount==0 would be wrong, not
+    /// stronger. slotOccupy itself never calls head(); only put+get are its own ops.
     EXPECT_FALSE(backend->head("k").exists) << "the occupant vanished between the conflict and the resolve GET";
 }
 
@@ -195,13 +227,19 @@ TEST(CasSlotOccupy, OperationDeadlineExhaustedRefusesPreAttempt)
     EXPECT_EQ(result.kind, SlotOccupyResult::Kind::Unresolved);
     EXPECT_EQ(result.unresolved_reason, CasUnresolvedReason::NoAttemptSent);
     EXPECT_EQ(backend->putTotal(), 0u);
+    EXPECT_EQ(backend->getTotal(), 0u) << "zero ops total -- the deadline gate must refuse before any I/O, same as the fence gate";
 }
 
 /// A whitelisted synchronous rejection (classifyConditionalWriteResult's DefiniteFailure) PROVES the
 /// request was never applied -- slotOccupy must surface it unchanged rather than resolving or folding
-/// it into Unresolved. ChunkFaultBackend::Mode::Definite throws an S3-classified error when USE_AWS_S3
-/// is on, and a plain CORRUPTED_DATA DB::Exception otherwise -- either way, SOME DB::Exception must
-/// escape with no resolve GET issued.
+/// it into Unresolved. Guarded to USE_AWS_S3 builds ONLY [review M6]: DefiniteFailure classification is
+/// structurally unreachable without it (classifyConditionalWriteResult's whitelist is entirely inside
+/// its own `#if USE_AWS_S3`), so on a no-S3 build ChunkFaultBackend::Mode::Definite instead throws a
+/// plain CORRUPTED_DATA DB::Exception -- which is in isDeterministicLocalFailure's set, meaning this
+/// test would silently exercise the SAME slotOccupy branch as DeterministicLocalFailurePropagatesWithoutResolve
+/// below rather than the DefiniteFailure branch it claims to cover. Better a visibly-absent test on that
+/// config than a passing one that isn't testing what its name says.
+#if USE_AWS_S3
 TEST(CasSlotOccupy, DefiniteFailurePropagatesWithoutResolve)
 {
     auto backend = std::make_shared<ChunkFaultBackend>();
@@ -217,6 +255,7 @@ TEST(CasSlotOccupy, DefiniteFailurePropagatesWithoutResolve)
     EXPECT_EQ(backend->fault_count, 0);
     EXPECT_EQ(backend->getCount("k"), 0u) << "a whitelisted definite rejection must never trigger a resolve GET";
 }
+#endif
 
 /// A deterministic LOCAL failure (isDeterministicLocalFailure's set) is the OTHER rethrow path --
 /// distinct from DefiniteFailure above, and checked first in the implementation, so it needs its own
@@ -242,4 +281,66 @@ TEST(CasSlotOccupy, DeterministicLocalFailurePropagatesWithoutResolve)
     /// own proof the attempt was made.
     EXPECT_FALSE(backend->fail_once);
     EXPECT_EQ(backend->getCount("k"), 0u);
+}
+
+/// ---- Fix round 1 (review findings I1, I2): the two gaps the reviewer required landed before Task 4
+/// consumes this primitive. Both guard the design decisions the review approved -- see
+/// task-2-review.md concern (a) and finding I2's Task-4-adoption note. ----
+
+/// I1: pins the single-fence_ok()-call design (concern (a)) so a future contributor cannot silently
+/// "fix the inconsistency" by re-adding the sibling ops' post-write fence recheck -- that change would
+/// break Task 4's old-generation-retry semantics (resolveWedgeOnce deliberately calls slotOccupy under
+/// the wedge's ORIGINAL admitted_fence_generation, and relies on ITS OWN post-I/O checkFenceOrThrow,
+/// not a second internal check here, to decide whether the result is still relevant). A counting
+/// fence_ok that only answers true on its FIRST call: if slotOccupy ever called it again after the
+/// write landed, this test would see Unresolved instead of Created, OR (if the outcome happened to
+/// still read Created some other way) the call-count assertion below would catch the extra invocation
+/// either way.
+TEST(CasSlotOccupy, CreatedNeverRechecksFenceAfterTheWrite)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    CasRequestController controller(backend, CasRequestBudget{});
+
+    int fence_calls = 0;
+    const auto fence_ok = [&fence_calls]
+    {
+        ++fence_calls;
+        return fence_calls == 1;
+    };
+
+    const auto result = controller.slotOccupy("k", "payload", fence_ok);
+    EXPECT_EQ(result.kind, SlotOccupyResult::Kind::Created);
+    EXPECT_EQ(fence_calls, 1) << "slotOccupy must call fence_ok() exactly ONCE (pre-attempt only) -- "
+                                 "a post-write recheck would falsely report Unresolved here (fence_calls's "
+                                 "SECOND answer is false) and would break Task 4's old-generation-retry design";
+}
+
+/// I2: proves Occupied is reachable for an occupant that is OUR OWN earlier ambiguous write, not only
+/// for a foreign pre-seeded one (PreExistingKeyOccupiedWithExactBytesAndTokenTwoOps above always seeds
+/// via a plain, unambiguous putIfAbsent). This is the exact input shape Task 4's resolveWedgeOnce
+/// adjudicates: "Occupied + bytes == wedge.bytes -> an earlier attempt landed -> adopt" (plan :329).
+TEST(CasSlotOccupy, OwnLandedAmbiguousWriteObservedAsOccupiedOnRetry)
+{
+    auto backend = std::make_shared<LandedButAckLostOnceBackend>();
+    CasRequestController controller(backend, CasRequestBudget{});
+
+    /// Call 1 -- the original attempt: the PUT's own response is lost, but the write DID commit, and
+    /// THIS call's own resolve GET (unfaulted) observes it immediately -- Occupied with OUR bytes,
+    /// proving the same-call resolve path works for a landed ambiguous write, not only a foreign one.
+    const auto first = controller.slotOccupy("k", "my-bytes", [] { return true; });
+    EXPECT_EQ(first.kind, SlotOccupyResult::Kind::Occupied);
+    EXPECT_EQ(first.occupant_bytes, "my-bytes");
+    EXPECT_EQ(backend->putCount("k"), 1u);
+    EXPECT_EQ(backend->getCount("k"), 1u);
+
+    /// Call 2 -- Task 4's resolveWedgeOnce pattern: a LATER caller's flush resolving the SAME logical
+    /// attempt via a FRESH slotOccupy call. The fault is already consumed (one-shot), so this PUT
+    /// conflicts cleanly (PreconditionFailed) and the resolve GET observes OUR OWN earlier bytes again --
+    /// the exact adoption input Task 4 is built on, and the SAME incarnation both calls saw.
+    const auto second = controller.slotOccupy("k", "my-bytes", [] { return true; });
+    EXPECT_EQ(second.kind, SlotOccupyResult::Kind::Occupied);
+    EXPECT_EQ(second.occupant_bytes, "my-bytes");
+    EXPECT_EQ(second.occupant_token, first.occupant_token) << "both calls must observe the SAME landed incarnation";
+    EXPECT_EQ(backend->putCount("k"), 2u);
+    EXPECT_EQ(backend->getCount("k"), 2u);
 }

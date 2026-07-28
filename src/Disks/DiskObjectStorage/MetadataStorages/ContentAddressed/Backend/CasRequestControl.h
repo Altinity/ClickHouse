@@ -332,10 +332,17 @@ struct CasOverwriteResult
 ///     contract: an occupant is this caller's write only if the BYTES match, never a generation/shape
 ///     match alone) is entirely the CALLER's job.
 ///   - Unresolved: the outcome is unknowable right now — a pre-attempt gate refused (fence lost /
-///     deadline exhausted, `unresolved_reason == NoAttemptSent`, nothing was sent), or the conditional
-///     create was itself ambiguous (a transient exception) and the follow-up resolve GET found nothing
-///     (the occupant that caused the conflict vanished before the GET, or the GET itself failed) — NEVER
-///     fabricated into a false `Created`.
+///     deadline exhausted, `unresolved_reason == NoAttemptSent`, nothing was sent — `unresolvedProvesNothingWasSent`
+///     is TRUE only for this case), or the conditional create was itself ambiguous (a transient
+///     exception) and the follow-up resolve GET found nothing (the occupant that caused the conflict
+///     vanished before the GET, or the GET itself failed — BOTH of these report `unresolved_reason ==
+///     AttemptsExhausted`, for which `unresolvedProvesNothingWasSent` is FALSE) — NEVER fabricated into
+///     a false `Created`. CALLERS: do not log a bare `describeUnresolvedReason(AttemptsExhausted)` for
+///     this case — it reads "the attempt budget was exhausted", which is misleading for a primitive
+///     with no retry budget, and it silently folds "the resolve GET found nothing" together with "the
+///     occupant that caused the conflict was DELETED under a live epoch" (a GC-invariant alarm, not
+///     routine contention) into the same generic wording. Log the slot key plus which of the two
+///     actually happened.
 struct SlotOccupyResult
 {
     enum class Kind : uint8_t { Created, Occupied, Unresolved };
@@ -499,7 +506,15 @@ public:
     /// is deliberately no POST-write fence recheck here: `fence_ok` is evaluated once per attempt, and
     /// since this primitive makes exactly one attempt, admission-fence discipline across an outer
     /// caller-driven retry (including verifying a `Created`/`Occupied` result is still relevant after
-    /// the I/O) is the CALLER's contract (Task 6's post-I/O recheck under its own state lock).
+    /// the I/O) is the CALLER's contract (Task 4/6's post-I/O recheck under its own state lock).
+    ///
+    /// CONSEQUENCE, stated bluntly because it is the OPPOSITE of every sibling op's behavior: a
+    /// `Created` or `Occupied` returned here may come from a call whose fence was lost WHILE the PUT or
+    /// GET was in flight — this primitive does not know and does not check. Acting on either result
+    /// (adopting, acknowledging, installing) without the caller's OWN post-I/O
+    /// `checkFenceOrThrow(admitted_generation)` under its own lock is a correctness bug, not a missed
+    /// diagnostic — see Task 4's `resolveWedgeOnce` and Task 6's recovery CAS-walk in the plan for the
+    /// exact recheck shape.
     ///
     /// A whitelisted synchronous rejection (`classifyConditionalWriteResult`'s `DefiniteFailure`) or a
     /// deterministic local failure (`isDeterministicLocalFailure`) RETHROWS the original exception

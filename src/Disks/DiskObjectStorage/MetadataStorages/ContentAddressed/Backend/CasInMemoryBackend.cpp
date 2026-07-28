@@ -135,7 +135,12 @@ PutResult InMemoryBackend::putIfAbsent(const String & key, const String & bytes,
 
     // One-shot injected ambiguous outcome: throw WITHOUT touching the store, modeling a request whose
     // own attempt outcome never reached the caller (see the header doc for the classification this
-    // must produce).
+    // must produce). std::runtime_error, not DB::Exception, is deliberate: it dodges BOTH
+    // classification paths in BOTH build configurations -- dynamic_cast<const Exception *> fails (so
+    // isDeterministicLocalFailure is never consulted), and classifyConditionalWriteResult falls through
+    // to its Unresolved default because it isn't an S3Exception. A DB::Exception would have been
+    // fragile: picking a code outside isDeterministicLocalFailure's set is a landmine for the next
+    // person who extends that set.
     auto ambiguous_it = ambiguous_put_keys_.find(key);
     if (ambiguous_it != ambiguous_put_keys_.end())
     {

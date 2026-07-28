@@ -663,6 +663,16 @@ SlotOccupyResult CasRequestController::slotOccupy(
     /// (which compares against an expected body and throws CORRUPTED_DATA on a mismatch) composed
     /// together]. Adjudicating whether the occupant is "mine" is entirely the CALLER's job (the
     /// CaCasMountCore `mine` contract), never this primitive's.
+    ///
+    /// WHOLE-OBJECT read, unlike conditionalCreateControlled's occupancy resolve (see that method's doc
+    /// in the header), which deliberately uses HEAD instead of GET because a blob body "may be
+    /// multi-GB". That reasoning does not apply here: slotOccupy is scoped by its callers (Task 4/6,
+    /// spec INV-2) to small, write-once CONTROL slots -- ref-log transactions and epoch seals -- whose
+    /// size is bounded by their own format's registry cap (the strict-grammar object caps
+    /// CasRefLogFormat/CasRefCkptFormat enforce on decode), never a data blob. slotOccupy itself stays
+    /// format-agnostic (it takes a raw key/bytes pair, per the "Interface handed to Stage B" contract in
+    /// the plan) and does not encode any format's cap here -- the size bound is a property of what
+    /// callers are allowed to pass it, enforced where the returned bytes are decoded, not by this seam.
     std::optional<GetResult> got;
     try
     {
