@@ -1424,3 +1424,6 @@ reviewer dispatched (raw-ness audit + three concerns to adjudicate). No push.
 
 **2026-07-28 17:0x local** — task 2 review: approved w/ 2 Important test gaps (fence_ok pin,
 own-landed-bytes adoption input); fix round 1 dispatched, one-turn framing. No push.
+
+**2026-07-28 17:00 local watchdog** — task 2 fix round: source edits landing (16:57-16:59,
+control-layer + test file), build not yet started. No push.
