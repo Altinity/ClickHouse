@@ -1177,3 +1177,7 @@ commits ahead. No long run under test, no signals to observe, nothing scheduled.
 `4d6f720c206`); TLA-phase plan committed (`62812c99ccd`); SDD ledger live; Task 1 implementer
 (opus, `CaRefTableSnapshotLogCore` v9 rewrite) dispatched minutes ago — no report/model mtime yet,
 expected (reading phase). No codex, no TLC running. Nothing wedged, nothing to advance. No push.
+
+**2026-07-28 02:5x UTC watchdog** — TLA task 1 landed green (`4eaada34f5a`, 12/12 configs, flip
+proven by identical state counts + `_sab_noseal` control); reviewer (opus) in flight on the 110 KB
+package, no output yet — expected. No TLC/codex processes, nothing wedged. No push.
