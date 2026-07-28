@@ -1626,3 +1626,7 @@ implementing on lane G. 8 of 15 stage-A tasks closed. No push.
 **2026-07-29 00:00 local watchdog** — T9 COMMITTED on lane G (`c60911eecd7`, frontier proof +
 gates) with red/restore verification runs cycling; DONE message pending. T6 coding post-rulings
 (no logs yet). No push.
+
+**2026-07-29 00:20 local watchdog** — T6 mid-red (walk suite iterating, 3 failing incl. the
+ckpt-CAS-before-install bump case; one 371MB test log = heavy retry logging, finished not
+runaway); T9 final gate running. Both healthy. No push.
