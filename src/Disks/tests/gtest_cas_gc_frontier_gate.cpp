@@ -167,17 +167,24 @@ PoolPtr buildCrossNamespaceScenario(const std::shared_ptr<HintHoleBackend> & bac
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
     const Layout & layout = store->layout();
 
-    publish(*backend, layout, hidden, "kept_ref", 1, blob);
-
     if (fold_hidden_first)
     {
-        /// Let ONE round fold the hidden namespace so it acquires a sealed cursor. After this it is in
-        /// the universe via `gc/state` even once the hint stops mentioning it.
+        /// Give the hidden namespace a sealed cursor, WITHOUT folding the edge under test. It publishes
+        /// an unrelated blob and one round folds that; from then on the namespace is in the universe via
+        /// its cursor even after the hint stops naming it.
+        ///
+        /// The unrelated blob is what makes this arm mean anything: if the shared blob's `+1` had
+        /// already been folded by the seeding round, the blob would survive on the DURABLE in-degree and
+        /// the test would pass whether or not the round probes anything. Publishing it only AFTER the
+        /// seal puts it strictly above the cursor, so the probe is the one and only thing that can find
+        /// it.
+        publish(*backend, layout, hidden, "seed_ref", 7, DB::UInt128(0x5eed));
         Gc seed(store, kGc);
         seed.runRegularRound();
         store->renewWatermarkOnce();
     }
 
+    publish(*backend, layout, hidden, "kept_ref", 1, blob);
     backend->hidePrefix(layout.refsNamespacePrefix(hidden));
 
     const ManifestRef dropped = publish(*backend, layout, visible, "dropped_ref", 2, blob);
@@ -490,47 +497,62 @@ TEST(CasGcFrontierGate, AnExhaustedProbeBudgetSealsCursorsAndDeletesNothing)
         << "the round still commits; only its destructive half is withheld";
 }
 
-/// ===================== A CARRIED HOLD SUPPRESSES, ON ITS OWN TERMS =====================
+/// ===================== A CARRIED HOLD SUPPRESSES, STRUCTURALLY =====================
 ///
-/// The structural term. A namespace held below an unresolved position keeps the whole round
-/// non-destructive even when the universe is declared authoritative and every OTHER namespace is
-/// proven -- because a hold means some namespace's records are unaccounted, and no proof taken
-/// elsewhere can make up for that.
-TEST(CasGcFrontierGate, ACarriedHoldSuppressesEvenUnderAnAuthoritativeUniverse)
+/// The gate's second term reads the HOLD SET off the seal it is about to make durable, instead of
+/// relying on the fact that a hold also happens to record an anomaly. Proving that takes the one shape
+/// where the two come apart: a hold DETECTED by an earlier round and merely CARRIED by this one, on a
+/// round whose own walk ended quietly and recorded nothing.
+///
+/// Reaching it takes the lying store. Round 1 sees the gap at {1,3} below a LISTED {1,4} -- impossible
+/// under contiguity -- and holds there. The store then stops listing {1,4}. Round 2's walk finds
+/// nothing above the absent {1,3} (the carried hold sits AT {1,3}, and a position is not a witness
+/// strictly above itself), so it reads an honest frontier and detects nothing at all. The hold rides
+/// forward regardless, because a hold clears only by RESOLVING its position -- and it is the hold set,
+/// not that round's silence, that has to keep the round from destroying.
+TEST(CasGcFrontierGate, ACarriedHoldSuppressesOnARoundThatDetectedNothing)
 {
-    auto backend = std::make_shared<CountingBackend>();
+    auto backend = std::make_shared<HintHoleBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
     const Layout & layout = store->layout();
     const RootNamespace held{"00/held@cas@"};
     const RootNamespace busy{"00/busy@cas@"};
     const DB::UInt128 blob(0xbeef);
 
-    /// `held` gets a gap below a listed witness: {1,3} never existed while {1,4} is durable and listed,
-    /// which is impossible under contiguity, so the walk holds at {1,3} and never resolves it.
+    /// {1,3} never existed while {1,4} is durable and listed.
     publish(*backend, layout, held, "ref_1", 1, DB::UInt128(0x21));
     publish(*backend, layout, held, "ref_2", 2, DB::UInt128(0x22));
-    const RefTxnId orphan{1, 4};
+    const ManifestRef orphan_ref{.writer_epoch = 1, .build_sequence = 4, .manifest_ordinal = 1};
+    writeBlobBody(*backend, layout, DB::UInt128(0x24));
+    writeManifestRaw(*backend, layout, held, orphan_ref, {blobEntryFor("data.bin", DB::UInt128(0x24))});
     RefLogTxn txn;
     txn.ns = held.string();
-    txn.txn_id = orphan;
-    txn.ops = publishCommittedOps("ref_4", ManifestRef{.writer_epoch = 1, .build_sequence = 4,
-                                                       .manifest_ordinal = 1});
-    writeBlobBody(*backend, layout, DB::UInt128(0x24));
-    writeManifestRaw(*backend, layout, held, ManifestRef{.writer_epoch = 1, .build_sequence = 4,
-                                                          .manifest_ordinal = 1},
-                     {blobEntryFor("data.bin", DB::UInt128(0x24))});
+    txn.txn_id = RefTxnId{1, 4};
+    txn.ops = publishCommittedOps("ref_4", orphan_ref);
     writeRefLogTxnRaw(*backend, layout, txn);
 
+    Gc gc(store, kGc);
+    runAuthoritativeRound(gc);
+    store->renewWatermarkOnce();
+    ASSERT_EQ(sealedCursorOf(*backend, layout, held), (RefTxnId{1, 2}))
+        << "round 1 must stop below the gap and hold there";
+
+    /// The witness goes quiet. From here the walk of `held` detects nothing whatsoever.
+    backend->hidePrefix(layout.refLogKey(held, RefTxnId{1, 4}));
+
+    /// Meanwhile a blob elsewhere becomes condemnable, so the round has real destructive work to decline.
     const ManifestRef mref = publish(*backend, layout, busy, "busy_ref", 9, blob);
     dropRefTransition(*backend, layout, busy, "busy_ref", mref);
 
-    Gc gc(store, kGc);
     backend->resetCounts();
     drive(store, gc, /*rounds*/ 5, UniversePolicy::AuthoritativeForTest);
 
     EXPECT_EQ(backend->deleteTotal(), 0u)
-        << "one held namespace suppresses the whole round. Deleted:" << deletedKeysMessage(*backend);
+        << "a hold the seal still carries suppresses the round even when the round itself saw nothing. "
+           "Deleted:" << deletedKeysMessage(*backend);
     EXPECT_TRUE(backend->head(blobKeyOf(layout, blob)).exists);
+    EXPECT_EQ(sealedCursorOf(*backend, layout, held), (RefTxnId{1, 2}))
+        << "and the quiet has not cleared the hold -- its position is still unresolved";
 }
 
 /// ===================== THE TEMPORAL LEMMA, ALL THREE ARMS =====================
