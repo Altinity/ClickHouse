@@ -1460,3 +1460,6 @@ task 3 review in flight (no file yet). No push.
 **2026-07-28 19:1x local** — task 3 review in (reviewer raced the ruling commit — content
 correct); fix round 1 dispatched (quiesce comment truth, precommit-binding coverage, report
 gaps, W1 poisoned-snapshot-publish gate + minors). Lane-g setup continues. No push.
+
+**2026-07-28 19:00 local watchdog** — lane-g initial build 8.9k/17k steps (ccache-warm, alive);
+task 3 fix round editing (no logs yet). No push.
