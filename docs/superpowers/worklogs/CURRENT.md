@@ -1456,3 +1456,7 @@ review pipelining on. No push.
 
 **2026-07-28 18:40 local watchdog** — lane-g setup mid-submodules (worktree at task-3 tip, alive);
 task 3 review in flight (no file yet). No push.
+
+**2026-07-28 19:1x local** — task 3 review in (reviewer raced the ruling commit — content
+correct); fix round 1 dispatched (quiesce comment truth, precommit-binding coverage, report
+gaps, W1 poisoned-snapshot-publish gate + minors). Lane-g setup continues. No push.
