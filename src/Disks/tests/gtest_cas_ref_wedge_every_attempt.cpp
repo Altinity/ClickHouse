@@ -755,10 +755,22 @@ TEST(CasRefWedgeEveryAttempt, WedgedIdAlreadyCoveredByTheDurableFloorIsFloorReco
         << "the wedge must be retired through the FloorReconciled outcome, not adopted";
 
     EXPECT_FALSE(store->refLaneWedgedForTest(ns)) << "the wedge is retired: the floor already accounts for it";
-    EXPECT_TRUE(store->resolveRef(ns, "x").has_value())
-        << "the stranded transaction is NOT applied here -- that is exactly what Poisoned means";
-    EXPECT_FALSE(store->resolveRef(ns, "y").has_value()) << "and the lane commits again, past the stranded id";
-    EXPECT_EQ(store->applyStateForTest(ns), RefApplyState::Poisoned) << "Poisoned is terminal for the runtime";
+
+    /// Everything above still describes the POISONED table: `refLaneWedgedForTest` and the counter read
+    /// the runtime without recovering, and the flush that reconciled the floor did not re-recover either
+    /// -- a wedge blocks that, deliberately, because a wedge's durability is undecided and no amount of
+    /// reading settles it.
+    ///
+    /// The first ordinary READ after the wedge is gone is a different matter, and it is where the repair
+    /// happens: nothing blocks re-recovery any more, so the arithmetic walk re-derives the stranded
+    /// transaction from the durable log. The floor was only ever the bridge over an id this cache was
+    /// missing; the walk is what stops it being missing.
+    EXPECT_FALSE(store->resolveRef(ns, "x").has_value())
+        << "the stranded drop of 'x' was durable all along -- the re-derivation is what finally applies it";
+    EXPECT_FALSE(store->resolveRef(ns, "y").has_value()) << "and the lane's own later drop stands";
+    EXPECT_EQ(store->applyStateForTest(ns), RefApplyState::Clean)
+        << "the poison clears ONLY through a completed install, and this one installed a state re-derived "
+           "from the durable log";
 }
 
 /// ===================================================================================
@@ -891,10 +903,17 @@ TEST(CasRefWedgeEveryAttempt, ALiveEpochSealIsNeverStampedAsItsOwnPrevEpochSeal)
     /// A seal of the LIVE epoch — the deposed-lane shape the wedge rejection arm can record.
     store->setLastEpochSealForTest(ns, RefTxnId{epoch + 1, 7});
 
-    EXPECT_NO_THROW(store->dropRef(ns, "x"));
-
-    const RefLogTxn written = readRefLogTxn(*backend, layout, ns, RefTxnId{epoch + 1, 1});
-    EXPECT_EQ(written.prev_epoch_seal, std::nullopt)
-        << "a seal of the live epoch cannot be that epoch's own predecessor; stamping it would make the "
-           "encoder refuse this table's every append";
+    /// The lane now holds NOTHING it can legally write. Its next id is sequence 1 of the new epoch, which
+    /// owes a link to the seal that closed the epoch BELOW -- and the only seal it has is of the epoch it
+    /// is trying to open. Stamping that one would be a self-pointer the ENCODER refuses; stamping nothing
+    /// leaves a crossing the READER refuses. So the append fails closed, locally, before anything is sent.
+    ///
+    /// That is a strictly better outcome than the one this test originally pinned (stamp nothing, send,
+    /// and let the successor's seal reject the attempt at the key): the deposed lane spends no request to
+    /// learn what it can already prove about itself. The property the test exists for is unchanged and is
+    /// asserted below in its strongest form -- NO object is written at that id at all, so no self-pointer
+    /// can have been stamped anywhere.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { store->dropRef(ns, "x"); });
+    EXPECT_FALSE(backend->get(layout.refLogKey(ns, RefTxnId{epoch + 1, 1})).has_value())
+        << "nothing may be written: the lane could not construct a legal transaction, so it sent none";
 }

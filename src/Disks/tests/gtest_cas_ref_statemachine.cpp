@@ -640,7 +640,14 @@ TEST(CasRefStateMachine, ContiguousTxnIdsRejectEqualLowerAndSkipped)
     /// The successor applies; then the next epoch's first id does.
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 2}, {addPrecommitOp("a", manifestRef(1, 1, 1))}));
     EXPECT_EQ(state.getGreatestApplied(), (RefTxnId{1, 2}));
-    applyRefLogTxn(state, makeTxn(kNs, RefTxnId{2, 1}, {addPrecommitOp("b", manifestRef(2, 1, 1))}));
+
+    /// Crossing into a new epoch needs INV-2's chain link as well as INV-1's id: without it the reader
+    /// cannot tell an EMPTY epoch from a lost one, so a sequence-1 transaction that names no seal is
+    /// refused on a Live table. Both halves are pinned, since either alone would be silently weaker.
+    RefLogTxn crossing = makeTxn(kNs, RefTxnId{2, 1}, {addPrecommitOp("b", manifestRef(2, 1, 1))});
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { applyRefLogTxn(state, crossing); });
+    crossing.prev_epoch_seal = RefTxnId{1, 3};   /// the seal that closed epoch 1, one past its last id
+    applyRefLogTxn(state, crossing);
     EXPECT_EQ(state.getGreatestApplied(), (RefTxnId{2, 1}));
 }
 

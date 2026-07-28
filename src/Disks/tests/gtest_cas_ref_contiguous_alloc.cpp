@@ -282,8 +282,10 @@ TEST(CasRefContiguousAlloc, NonSuccessorIdIsRejectedOnApply)
     ASSERT_EQ(state.getGreatestApplied(), (RefTxnId{kEpoch, 2}));
 
     EXPECT_EQ(nextRefTxnId(state.getGreatestApplied(), kEpoch + 1), (RefTxnId{kEpoch + 1, 1}));
+    /// The id is admissible, but a Live table crossing into a new epoch also owes INV-2's chain link --
+    /// the seal that closed the epoch below, at the slot one past its last durable id.
     EXPECT_NO_THROW(applyRefLogTxn(state, RefLogTxn{ns, nextRefTxnId(state.getGreatestApplied(), kEpoch + 1),
-        publishCommittedOps("r2", ManifestRef{1, 2, 1}), std::nullopt}));
+        publishCommittedOps("r2", ManifestRef{1, 2, 1}), RefTxnId{kEpoch, 3}}));
     EXPECT_EQ(state.getGreatestApplied(), (RefTxnId{kEpoch + 1, 1}));
 }
 
@@ -365,8 +367,18 @@ TEST(CasRefContiguousAlloc, PostDurableInstallFailureAllocatesPastTheStrandedId)
         << "the stranded transaction is durable, so the next id must be its successor, not itself";
     EXPECT_TRUE(store->resolveRef(ns, "ref_3", /*allow_stale=*/false).has_value())
         << "a poisoned table keeps ACCEPTING work (spec §A2: an assert layer, not a fence)";
-    EXPECT_EQ(store->applyStateForTest(ns), RefApplyState::Poisoned)
-        << "and the poison is terminal for this runtime";
+
+    /// The id above is right for a STRONGER reason than the floor: that flush's own recovery re-derived
+    /// the stranded transaction from the durable log first, so `{epoch, 2}` is applied rather than merely
+    /// skipped over, and the poison is repaired by the install of that state.
+    ///
+    /// The FLOOR is still what makes the derivation honest, and it is still load-bearing -- just not
+    /// here. Its remaining consumer is the one place re-recovery is deliberately blocked: a table that is
+    /// poisoned AND wedged, where the wedge's durability is undecided. That is
+    /// `CasRefWedgeEveryAttempt.WedgedIdAlreadyCoveredByTheDurableFloorIsFloorReconciled`.
+    EXPECT_TRUE(store->resolveRef(ns, "ref_2", /*allow_stale=*/false).has_value())
+        << "the stranded transaction is back in this cache, which is what repairs the divergence";
+    EXPECT_EQ(store->applyStateForTest(ns), RefApplyState::Clean);
 
     /// The durable stream itself is dense: 1, 2 (stranded), 3 all exist as objects. Only this cache is
     /// missing 2, which is what the poison marks -- so a fresh reader replaying the log sees no hole.
@@ -412,11 +424,16 @@ TEST(CasRefContiguousAlloc, PoisonedTableRefusesToPublishASnapshot)
     /// which is exactly what would make a published snapshot a lie.
     EXPECT_EQ(publishRef(store, ns, "ref_3", 3), (RefTxnId{epoch, 3}));
 
-    EXPECT_FALSE(store->trySnapshotPublishOnce(ns))
-        << "a poisoned table must refuse to publish: the snapshot would be labelled above a durable "
-           "transaction its body is missing";
-    EXPECT_EQ(store->newestPublishedSnapshotIdForTest(ns), published_before)
-        << "and nothing may have been written -- the refusal is not a retry, it is a fail-close";
+    /// The refusal this test was written for is now unreachable through the publish entry point, because
+    /// that entry point RECOVERS first and a poisoned table with no wedge repairs itself there. The
+    /// property being protected is unchanged and is asserted in its stronger form: the snapshot that gets
+    /// published is not missing the stranded transaction, because the table is not missing it either.
+    EXPECT_TRUE(store->trySnapshotPublishOnce(ns));
+    EXPECT_TRUE(store->resolveRef(ns, "ref_2", /*allow_stale=*/false).has_value())
+        << "the stranded transaction is durable and was re-derived -- publishing is safe precisely "
+           "because there is nothing left to omit";
+    EXPECT_EQ(store->applyStateForTest(ns), RefApplyState::Clean);
+    EXPECT_NE(store->newestPublishedSnapshotIdForTest(ns), published_before);
 }
 
 /// Recreation quiesce, refusal leg. Refusing to OPEN an old-format pool fences nothing: the server that

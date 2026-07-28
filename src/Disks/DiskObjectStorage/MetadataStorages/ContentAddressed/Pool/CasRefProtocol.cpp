@@ -476,6 +476,30 @@ void RefTableState::applyTxnInPlace(const RefLogTxn & txn)
             durable_floor.writer_epoch, durable_floor.ref_sequence,
             expected.writer_epoch, expected.ref_sequence);
 
+    /// INV-2's CONTEXTUAL seal grammar, on the read side. `prev_epoch_seal` is required on exactly
+    /// sequence 1 of a NON-genesis epoch and forbidden everywhere else; the structural half (shape,
+    /// well-formedness, strictly-earlier epoch) is the codec's, and this is the half that needs to know
+    /// whether this transaction OPENS a life or CONTINUES one across a transition.
+    ///
+    /// The answer is derivable from the state itself, exactly, so no `life_epoch` has to be plumbed in
+    /// and there is no optional to substitute a zero for (which would demand a chain link on every
+    /// sequence-1 transaction and reject every genesis birth -- the trap task 5's interface note names):
+    ///
+    ///   - NOT `Live` (never-born, or `Removed`) => this transaction can only be a birth, so the epoch it
+    ///     lands in IS the life's genesis epoch and a chain link is FORBIDDEN. A link here would name a
+    ///     seal of a previous life this state has no trace of;
+    ///   - `Live` => the namespace demonstrably existed at `greatest_applied.writer_epoch`, which is
+    ///     strictly below this transaction's epoch (the density check above just proved the epoch
+    ///     changed), so its real `life_epoch` is at or below that and this transition is non-genesis: a
+    ///     chain link is REQUIRED. Passing `greatest_applied.writer_epoch` gives the shared validator the
+    ///     same verdict the true `life_epoch` would, for every value the true one can hold.
+    ///
+    /// Both arms go through the ONE shared validator rather than re-deriving its rule, so the writer's
+    /// encode-side check and this one cannot drift.
+    if (txn.txn_id.ref_sequence == 1)
+        validateEpochSealGrammarContextual(
+            txn, lifecycle == RefLifecycle::Live ? greatest_applied.writer_epoch : txn.txn_id.writer_epoch);
+
     checkRemoveNamespaceOrdering(txn.ops);
 
     /// Apply every op, in array order, IN PLACE. A throw leaves `*this` PARTIALLY APPLIED ("poisoned").

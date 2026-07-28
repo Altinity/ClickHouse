@@ -141,6 +141,23 @@ RefLogTxn makeEpochSealTxn(const RootNamespace & ns, const RefTxnId & id, const 
     return seal;
 }
 
+/// The `prev_epoch_seal` a transaction at `id` carries, given what this table knows about the seal that
+/// closed its previous epoch. INV-2's grammar in one place, because there are now FOUR constructions of
+/// the same transaction -- the real one and its three previews -- and the read side REJECTS a mismatch:
+/// a preview built without the link previews a transaction the writer would never send.
+///
+/// The epoch comparison is not belt-and-braces, it is the DEPOSED-LANE case. A successor that seals an
+/// EMPTY epoch writes its record at `{E, 1}`, and a lane still live at E re-derives exactly `{E, 1}`.
+/// Stamping the seal there would produce a self-pointer, which `validateEpochSealGrammarStructural`
+/// refuses at ENCODE: the lane would fail with a self-inflicted `CORRUPTED_DATA` on every attempt and
+/// never reach the collision that is supposed to fence it. Stamping nothing lets the attempt go out and
+/// meet the seal, which is the intended conclusive rejection.
+std::optional<RefTxnId> chainLinkFor(const RefTxnId & id, const std::optional<RefTxnId> & last_epoch_seal)
+{
+    return id.ref_sequence == 1 && last_epoch_seal && last_epoch_seal->writer_epoch < id.writer_epoch
+        ? last_epoch_seal : std::nullopt;
+}
+
 Occupant classifyRefLogOccupant(const RootNamespace & ns, const RefTxnId & id, const String & occupant_bytes,
                                 const String & expected_bytes)
 {
@@ -472,7 +489,7 @@ std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::getRefTableRuntime(
 }
 
 void CasRefLedger::checkRecoveryStillAdmitted(const RootNamespace & ns, RefTableRuntime & rt,
-                                              uint64_t admitted_generation, bool & cancelled) const
+                                              bool & cancelled) const
 {
     /// Polled at EVERY I/O boundary of the walk, because every one of them is a point at which this
     /// recovery may already have lost the right to continue -- and the walk WRITES, so "continue" is not
@@ -493,34 +510,39 @@ void CasRefLedger::checkRecoveryStillAdmitted(const RootNamespace & ns, RefTable
 
     /// The remount's OTHER publication, ordered before the fence re-arm: this runtime is detached, so
     /// whatever it recovers belongs to a dead incarnation's cache. Checked separately from the
-    /// generation because the two are independent facts, exactly as `resolveWedgeOnce` checks them.
+    /// cancellation because the two are independent facts, exactly as `resolveWedgeOnce` checks them.
     if (rt.superseded_by_remount.load(std::memory_order_acquire))
         throwCasWriteRetryLater(fmt::format(
             "CAS ref-table recovery for namespace '{}': this cached table was superseded by a self-remount "
             "mid-recovery — retry against the fresh mount incarnation", ns.string()));
 
-    /// The generation this recovery was admitted under, presented back. Throws `INVALID_STATE`, which is
-    /// deliberately NOT in `isTransientRecoveryError`: a moved incarnation can never be recovered from by
-    /// retrying under the SAME captured generation, so burning the retry budget on it would be a lie.
-    check_fence_or_throw(admitted_generation);
+    /// The FENCE is deliberately NOT checked here, and the omission is the point. `checkFenceOrThrow`
+    /// asks two things at once -- "is the fence held right now" and "is the generation still mine" -- and
+    /// the first has no business gating a READ. Most of this walk is reads, and a mount that has
+    /// transiently lost its lease can still honestly serve them from durable data; refusing at every GET
+    /// would turn a lease blip into "this table cannot be read at all".
+    ///
+    /// The fence gates exactly the three sites that spend it, which is the trio: every `slotOccupy`
+    /// (through its own `admitted_fence_ok`), the `_ckpt` CAS (inside `publishCkpt`), and the install.
+    /// A walk that keeps reading after the generation moved simply wastes its own I/O and is then refused
+    /// at the first of those -- bounded, and strictly better than refusing the reads themselves.
 }
 
-std::optional<CasRefLedger::RecoveryWalk> CasRefLedger::runRecoveryWalkOnce(
+std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
     const RootNamespace & ns, RefTableRuntime & rt, uint64_t admitted_generation, uint64_t live_epoch,
-    std::optional<String> & hole_detail)
+    std::optional<String> & hole_detail, bool & cancelled)
 {
     /// Spec §4, one attempt. Runs with NO lock held: everything below is either read-only I/O or a
     /// conditional create at a key this namespace owns, and the replayed candidate is PRIVATE until the
     /// caller installs it. `recovery_in_progress` (not `state_mutex`) is what keeps a second caller for
     /// this same table from racing an independent walk -- see its doc comment.
-    bool cancelled = false;
 
     /// ---- Step 2: the checkpoint ----
     /// `nullopt` means the namespace has published nothing yet (a birth whose `_ckpt` create did not
     /// land, or a table seeded outside the append lane). It is not an error; it costs the walk its
     /// LIST-independent grounding, and the grounding rule below says exactly what it falls back to.
     const std::optional<CkptSample> sampled_ckpt = readCkpt(backend, layout, ns);
-    checkRecoveryStillAdmitted(ns, rt, admitted_generation, cancelled);
+    checkRecoveryStillAdmitted(ns, rt, cancelled);
 
     /// ---- Step 3: ONE hint LIST ----
     /// A HINT, and nothing more. It seeds the base-snapshot candidate, supplies the `_cleanup` markers
@@ -567,7 +589,7 @@ std::optional<CasRefLedger::RecoveryWalk> CasRefLedger::runRecoveryWalkOnce(
         }
         std::sort(hint_log_ids.begin(), hint_log_ids.end());
     }
-    checkRecoveryStillAdmitted(ns, rt, admitted_generation, cancelled);
+    checkRecoveryStillAdmitted(ns, rt, cancelled);
 
     /// ---- Step 4: the base, by EXACT KEY ----
     /// The greater of what the hint offered and what the checkpoint names. The checkpoint is what makes
@@ -605,7 +627,7 @@ std::optional<CasRefLedger::RecoveryWalk> CasRefLedger::runRecoveryWalkOnce(
         base_snapshot = decodeRefTableSnapshot(openObject(FormatId::RefSnapshot, got->bytes), ns.string(), *base_id);
         base_snapshot_bytes = got->bytes.size();
     }
-    checkRecoveryStillAdmitted(ns, rt, admitted_generation, cancelled);
+    checkRecoveryStillAdmitted(ns, rt, cancelled);
 
     /// ---- The walk's starting position ----
     /// With a base, arithmetic is exact: the stream continues at the base id's successor. Without one,
@@ -683,7 +705,7 @@ std::optional<CasRefLedger::RecoveryWalk> CasRefLedger::runRecoveryWalkOnce(
 
         for (;;)
         {
-            checkRecoveryStillAdmitted(ns, rt, admitted_generation, cancelled);
+            checkRecoveryStillAdmitted(ns, rt, cancelled);
             const RefTxnId id{epoch, sequence};
 
             if (const auto got = backend.get(layout.refLogKey(ns, id)))
@@ -851,9 +873,7 @@ std::optional<CasRefLedger::RecoveryWalk> CasRefLedger::runRecoveryWalkOnce(
         }
     }
 
-    RecoveryWalk walk;
-    walk.result = std::move(builder).finish();
-    walk.last_epoch_seal = last_epoch_seal;
+    RecoveryResult result = std::move(builder).finish();
 
     /// `finish` returns the candidate WITHOUT materializing: `stateFromSnapshot` loads every committed
     /// row and owned-manifest entry into the COW OVERLAY, and no tail transaction materializes either.
@@ -861,18 +881,18 @@ std::optional<CasRefLedger::RecoveryWalk> CasRefLedger::runRecoveryWalkOnce(
     /// into fresh shared bases ONCE here -- rather than making the first flush's scratch copy (and every
     /// per-item/shape-check copy on it) deep-copy an N-row overlay. The O(N) fold rides inside recovery,
     /// which is already O(N).
-    walk.result.state.materializeCommitted();
-    walk.result.cleanup_markers = std::move(cleanup_markers);
+    result.state.materializeCommitted();
+    result.cleanup_markers = std::move(cleanup_markers);
     /// Stale-precommit cleanup is dispatched once, from `appendRefOps`'s top level (never from here --
     /// this call may itself be nested inside a queue leader's flush stack).
-    walk.result.needs_stale_precommit_sweep = true;
-    walk.result.last_epoch_seal = last_epoch_seal;
+    result.needs_stale_precommit_sweep = true;
+    result.last_epoch_seal = last_epoch_seal;
     /// Per-table admission budgets pre-subtract this table's own wire overhead (`4 + ns.size()`, once in
     /// a snapshot body and once in a removal txn body) plus a fixed safety margin from the raw hard
     /// limits, once, here.
     const uint64_t overhead = 4 + ns.string().size() + kRefAdmissionSafetyMargin;
-    walk.result.snapshot_budget = overhead < ref_snapshot_max_bytes ? ref_snapshot_max_bytes - overhead : 0;
-    walk.result.removal_budget = overhead < ref_removal_max_bytes ? ref_removal_max_bytes - overhead : 0;
+    result.snapshot_budget = overhead < ref_snapshot_max_bytes ? ref_snapshot_max_bytes - overhead : 0;
+    result.removal_budget = overhead < ref_removal_max_bytes ? ref_removal_max_bytes - overhead : 0;
 
     /// ---- Step 7: the `_ckpt` contribution ----
     /// The SEALER's half of INV-4, and this is the site that owes it: recovery is what MINTS seals, so it
@@ -882,7 +902,7 @@ std::optional<CasRefLedger::RecoveryWalk> CasRefLedger::runRecoveryWalkOnce(
     /// content.
     if (last_epoch_seal)
     {
-        checkRecoveryStillAdmitted(ns, rt, admitted_generation, cancelled);
+        checkRecoveryStillAdmitted(ns, rt, cancelled);
         const RefCkpt contribution{.life_epoch = std::nullopt,
                                    .checkpoint_snapshot_id = std::nullopt,
                                    .last_epoch_seal = last_epoch_seal};
@@ -893,7 +913,7 @@ std::optional<CasRefLedger::RecoveryWalk> CasRefLedger::runRecoveryWalkOnce(
                 ns.string(), last_epoch_seal->writer_epoch, last_epoch_seal->ref_sequence));
     }
 
-    return walk;
+    return result;
 }
 
 void CasRefLedger::ensureRefTableRecovered(const RootNamespace & ns, RefTableRuntime & rt)
@@ -1000,15 +1020,19 @@ void CasRefLedger::ensureRefTableRecovered(const RootNamespace & ns, RefTableRun
                     ProfileEvents::increment(ProfileEvents::CasRefRecoveryRestarts);
                 }
 
+                /// Each attempt re-derives its own restart reason: carrying a hole seen two attempts
+                /// ago into a message about a vanish would misreport what actually exhausted the budget.
+                hole_detail.reset();
+
                 /// The whole walk runs UNLOCKED. Nothing it touches is shared: the candidate is private
                 /// and `rt` is read only through atomics the poll consults. Unlocking is what keeps a
                 /// recovery's full I/O envelope from stalling every reader of this table -- and what lets
                 /// the self-remount barrier take the lock promptly to JOIN us.
                 lock.unlock();
-                std::optional<RecoveryWalk> walk;
+                std::optional<RecoveryResult> walked;
                 try
                 {
-                    walk = runRecoveryWalkOnce(ns, rt, admitted_generation, live_epoch, hole_detail);
+                    walked = runRecoveryWalkOnce(ns, rt, admitted_generation, live_epoch, hole_detail, cancelled);
                 }
                 catch (...)
                 {
@@ -1021,7 +1045,7 @@ void CasRefLedger::ensureRefTableRecovered(const RootNamespace & ns, RefTableRun
                 }
                 lock.lock();
 
-                if (!walk)
+                if (!walked)
                     continue;   /// restart requested (vanished base, or a hole worth one more reading)
 
                 /// ---- Step 8: the install recheck, the LAST member of the trio ----
@@ -1041,7 +1065,7 @@ void CasRefLedger::ensureRefTableRecovered(const RootNamespace & ns, RefTableRun
                 /// field from the result and sets `recovered` LAST, so no waiter (woken only by the
                 /// function-scope SCOPE_EXIT's `recovery_cv` notify, which runs after this returns) ever
                 /// observes a partially-installed table.
-                installRecoveryResult(rt, std::move(walk->result));
+                installRecoveryResult(rt, std::move(*walked));
                 break;
             }
             break;   /// recovery succeeded -> exit the outer retry loop
@@ -2270,10 +2294,34 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
     /// before carving (unlike a per-item property, which would need speculative undo).
     RefTableState working;
     bool table_live = false;
+    /// Captured in the SAME hold as `working`, for the same reason the id is derived there: a preview
+    /// must describe the transaction the writer will actually send, and INV-2's read side rejects one
+    /// that carries the wrong chain link as hard as it rejects a hole.
+    std::optional<RefTxnId> preview_epoch_seal;
     {
         std::lock_guard lock(rt->state_mutex);
         working = rt->state;
         table_live = rt->state.getLifecycle() == RefLifecycle::Live;
+        preview_epoch_seal = rt->last_epoch_seal;
+    }
+
+    /// The supersession gate again, and this is NOT the same check as the one at the top of the flush.
+    /// A self-remount does not wait for leaders, so it can land in the window between them -- and after
+    /// it does, this runtime's cached view belongs to a dead incarnation while `live_epoch_fn` already
+    /// reports the NEW epoch. Everything derived below is then a transaction of an epoch this state has
+    /// no chain link for, which INV-2's read side (correctly) calls corruption.
+    ///
+    /// Checking here is what keeps that from being how an ORDINARY remount is reported. The condition is
+    /// a routine, retryable fact about the world -- the fresh runtime the next touch recovers has both
+    /// the epoch and the link -- so it must surface as the retry-safe supersession error, not as a
+    /// `CORRUPTED_DATA` about a stale premise this lane was never entitled to use.
+    if (rt->superseded_by_remount.load(std::memory_order_acquire))
+    {
+        complete_error(carve_all_pending(), makeCasWriteRetryLaterExceptionPtr(fmt::format(
+            "CAS ref-log append for server_root '{}': this cached table was superseded by a self-remount "
+            "before its batch was carved — retry against the fresh mount incarnation",
+            config.server_root_id)));
+        return;
     }
 
     /// Two-phase carve (spec §2). The old carve popped from `pending` while interleaving the allocating
@@ -2453,6 +2501,7 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
             {
                 std::lock_guard lock(rt->state_mutex);
                 working = rt->state;
+                preview_epoch_seal = rt->last_epoch_seal;
             }
             final_ops.clear();
             survivors.clear();
@@ -2482,8 +2531,9 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
             if (!item_ops.empty())
             {
                 RefTableState shape_check = working;
-                applyRefLogTxn(shape_check, RefLogTxn{ns.string(),
-                    shape_check.nextTxnId(live_epoch_fn()), item_ops, std::nullopt});
+                const RefTxnId shape_id = shape_check.nextTxnId(live_epoch_fn());
+                applyRefLogTxn(shape_check, RefLogTxn{ns.string(), shape_id, item_ops,
+                                                      chainLinkFor(shape_id, preview_epoch_seal)});
             }
 
             for (const RefOp & op : item_ops)
@@ -2504,8 +2554,9 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
                 /// the SAME item (e.g. namespace_birth immediately followed by its first
                 /// owner_transition) is validated -- both here and by admits's own preview -- against
                 /// a state that already reflects it, exactly as the real combined transaction will.
-                applyRefLogTxn(item_scratch, RefLogTxn{ns.string(),
-                    item_scratch.nextTxnId(live_epoch_fn()), {op}, std::nullopt});
+                const RefTxnId trial_id = item_scratch.nextTxnId(live_epoch_fn());
+                applyRefLogTxn(item_scratch, RefLogTxn{ns.string(), trial_id, {op},
+                                                       chainLinkFor(trial_id, preview_epoch_seal)});
             }
             /// Reserve the growth of BOTH accumulators BEFORE this item's effects are published. These
             /// reservations are the ONLY remaining throwing steps; once they succeed the publish below is
@@ -2678,18 +2729,7 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
     /// a genesis birth at sequence 1 finds nothing to name -- which is what makes "no seal" a fact about
     /// the stream rather than a defaulted field.
     ///
-    /// The epoch comparison is not belt-and-braces, it is the DEPOSED-LANE case. A successor that seals
-    /// an EMPTY epoch writes its record at `{E, 1}`, and this lane -- still live at E, because nothing
-    /// has told it otherwise -- re-derives exactly `{E, 1}`. Stamping the seal there would produce a
-    /// self-pointer, which `validateEpochSealGrammarStructural` (strictly-less by construction) refuses
-    /// at ENCODE: the lane would then fail with a self-inflicted `CORRUPTED_DATA` on every attempt and
-    /// never reach the collision that is supposed to fence it. Stamping nothing lets the attempt go out
-    /// and meet the seal, which is the intended conclusive rejection.
-    const bool carries_prev_epoch_seal = id.ref_sequence == 1
-        && last_epoch_seal.has_value()
-        && last_epoch_seal->writer_epoch < id.writer_epoch;
-    const RefLogTxn chunk_txn{ns.string(), id, chunk_ops,
-                              carries_prev_epoch_seal ? last_epoch_seal : std::nullopt};
+    const RefLogTxn chunk_txn{ns.string(), id, chunk_ops, chainLinkFor(id, last_epoch_seal)};
     try
     {
         applyRefLogTxn(*candidate, chunk_txn);
@@ -3430,6 +3470,13 @@ bool CasRefLedger::trySnapshotPublishOnce(const RootNamespace & ns)
         /// Only `Poisoned` gates. `ApplyPending` is safe: the in-flight transaction is by construction
         /// ABOVE `greatest_applied`, so a snapshot labelled with the latter does not claim to cover it
         /// and recovery still replays it.
+        ///
+        /// NARROWED, not retired, by the recovery walk. This function recovers before it publishes, and
+        /// `ensureRefTableRecovered` now RE-DERIVES a poisoned table -- so on the ordinary path the
+        /// divergence is repaired before the capture below and this arm never fires. It stays because one
+        /// shape still reaches it: a table that is poisoned AND WEDGED, where re-recovery is deliberately
+        /// blocked (a wedge's durability is undecided, and no amount of reading settles it). Do not delete
+        /// it as dead code -- and do not expect a test to cover it through this entry point.
         ///
         /// Read INSIDE this critical section, with the capture, and that placement is the whole
         /// correctness argument. Both poison sites set the marker under this same mutex, so no poison can

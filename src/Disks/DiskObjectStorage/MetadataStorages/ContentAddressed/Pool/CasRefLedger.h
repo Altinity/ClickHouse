@@ -703,15 +703,6 @@ private:
     /// window through `recovery_in_progress`.
     void ensureRefTableRecovered(const RootNamespace & ns, RefTableRuntime & rt);
 
-    /// What ONE recovery attempt produced: the replayed candidate plus the chain link the walk ended on.
-    struct RecoveryWalk
-    {
-        RecoveryResult result;
-        /// The seal that closed the last epoch below the live one -- minted, adopted from a concurrent
-        /// recoverer, or read out of the durable tail. `nullopt` means GENESIS and means it exactly.
-        std::optional<RefTxnId> last_epoch_seal;
-    };
-
     /// ONE attempt of the recovery walk, run with NO lock held (the candidate is private; nothing
     /// touches `rt` until the install). `nullopt` REQUESTS A RESTART from a fresh listing -- the two
     /// innocent explanations, a base that vanished under a checkpoint that moved and a hole a racing
@@ -720,17 +711,22 @@ private:
     /// `admitted_generation` is the ONE fence generation this whole recovery was admitted under: the
     /// walk presents it to every `slotOccupy` and to the `_ckpt` CAS, and the caller presents the same
     /// value once more immediately before installing.
-    std::optional<RecoveryWalk> runRecoveryWalkOnce(
+    /// `cancelled` is the CALLER's latch, threaded in rather than kept locally: a cancellation is
+    /// reported through the retry-later class (the caller should retry, against the FRESH incarnation),
+    /// so without it the transient loop reads the stop as a blip and re-drives the very work the remount
+    /// just stopped -- while the barrier blocks waiting for that recovery to finish.
+    std::optional<RecoveryResult> runRecoveryWalkOnce(
         const RootNamespace & ns, RefTableRuntime & rt, uint64_t admitted_generation, uint64_t live_epoch,
-        std::optional<String> & hole_detail);
+        std::optional<String> & hole_detail, bool & cancelled);
 
-    /// The I/O-boundary poll of the walk: is this recovery still entitled to continue? Three independent
-    /// facts, each of which alone disqualifies it -- a self-remount asked it to stop, a self-remount
-    /// already detached its runtime, or the mount incarnation that admitted it has moved. Throws;
-    /// cancellation raises the retry-later class and latches so the caller's transient loop does not
-    /// re-drive it.
-    void checkRecoveryStillAdmitted(const RootNamespace & ns, RefTableRuntime & rt,
-                                    uint64_t admitted_generation, bool & cancelled) const;
+    /// The I/O-boundary poll of the walk: is this recovery still entitled to continue? Two independent
+    /// facts, each of which alone disqualifies it -- a self-remount asked it to stop, or a self-remount
+    /// already detached its runtime. Throws; cancellation raises the retry-later class and LATCHES
+    /// through `cancelled` so the caller's transient loop does not re-drive it.
+    ///
+    /// The FENCE is deliberately absent: it gates the three sites that spend it (every `slotOccupy`, the
+    /// `_ckpt` CAS, the install), not every read. See the definition for why.
+    void checkRecoveryStillAdmitted(const RootNamespace & ns, RefTableRuntime & rt, bool & cancelled) const;
 
     /// Publishes a completed streaming recovery into the runtime in one atomic step: copies EVERY field
     /// `RecoveryResult` carries into `rt` and sets `recovered` LAST, so a waiter woken after this returns

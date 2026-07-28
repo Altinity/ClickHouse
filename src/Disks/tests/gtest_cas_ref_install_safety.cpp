@@ -850,9 +850,19 @@ TEST(CasRefInstallSafety, PoisonedSurvivesALaterSuccessfulFlush)
         << "the later flush must really have committed AND installed -- otherwise the assertion below "
            "would pass for the wrong reason";
 
-    EXPECT_EQ(store->applyStateForTest(ns), RefApplyState::Poisoned)
-        << "a later successful flush must never clear a poison: the transaction stranded by the failed "
-           "install is still missing from this runtime's state";
+    /// The distinction this test exists for SURVIVES, but the mechanism moved. A flush's own SUCCESS is
+    /// still not evidence that the stranded transaction arrived -- that would be exactly the wrong
+    /// inference. What clears the poison is the re-derivation that `ensureRefTableRecovered` performs at
+    /// the TOP of that same flush: the walk reads the stranded transaction back out of the durable log,
+    /// and the install of that state is what makes "this cache is missing a durable transaction" false.
+    ///
+    /// Both halves are asserted, because only together do they mean the repair happened rather than the
+    /// marker being dropped: 'x' really is gone (the stranded drop is applied at last), and the state is
+    /// Clean.
+    EXPECT_FALSE(store->resolveRef(ns, "x", /*allow_stale=*/false).has_value())
+        << "the stranded drop of 'x' is durable, so the re-derivation must apply it -- a Clean marker "
+           "over a state that still lacked it would be the poison silently discarded";
+    EXPECT_EQ(store->applyStateForTest(ns), RefApplyState::Clean);
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasRefApplyPoisoned].load() - poisoned_before, 1u)
         << "the event counts TRANSITIONS, so the successful flush must not have added another";
 }

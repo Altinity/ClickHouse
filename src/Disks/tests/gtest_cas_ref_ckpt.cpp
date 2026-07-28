@@ -735,10 +735,23 @@ TEST(CasRefCkpt, APoisonedTableAdvancesNoCheckpoint)
     store->setInstallRegionProbeForTest(nullptr);
     ASSERT_EQ(store->applyStateForTest(ns), RefApplyState::Poisoned);
 
-    EXPECT_FALSE(store->trySnapshotPublishOnce(ns));
-    EXPECT_EQ(backend->casPutCount(key), writes_before)
-        << "the poison refusal must precede the checkpoint write, not follow it";
-    EXPECT_FALSE(readCkptOrFail(*backend, store->layout(), ns).checkpoint_snapshot_id.has_value());
+    /// The publish entry point RECOVERS before it publishes, and a poisoned table with no wedge
+    /// re-derives itself there -- so by the time the publisher looks, the divergence the poison marked is
+    /// gone and there is no lie left to refuse. That is a stronger guarantee than the refusal this test
+    /// used to pin, and it is asserted as such: the publish succeeds, and the snapshot it wrote really
+    /// does cover the transaction that was stranded.
+    EXPECT_TRUE(store->trySnapshotPublishOnce(ns));
+    EXPECT_TRUE(store->resolveRef(ns, "ref_2", /*allow_stale=*/false).has_value())
+        << "the stranded transaction is durable; the re-derivation must have applied it";
+    EXPECT_EQ(store->applyStateForTest(ns), RefApplyState::Clean);
+    EXPECT_GT(backend->casPutCount(key), writes_before)
+        << "and the checkpoint advances -- truthfully, over a snapshot that is not missing anything";
+    EXPECT_TRUE(readCkptOrFail(*backend, store->layout(), ns).checkpoint_snapshot_id.has_value());
+
+    /// The refusal itself is NOT retired in production: `trySnapshotPublishOnce` still refuses to publish
+    /// from a `Poisoned` state, and it is still reachable -- by a table that is poisoned AND wedged, where
+    /// the wedge blocks the re-derivation. It is unreachable through THIS entry point, which is why this
+    /// test can no longer be the thing that covers it.
 }
 
 /// A publish admitted under an incarnation that is replaced mid-attempt advances NOTHING, and does not

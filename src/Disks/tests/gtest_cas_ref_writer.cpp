@@ -191,6 +191,12 @@ public:
 
     String fault_key_substr;
     int fault_count = 0;
+    /// Let the first `fault_skip` matching PUTs through untouched before `fault_count` starts faulting.
+    /// Needed now that recovery's in-band epoch seal (INV-2) shares the `_log/` prefix with every other
+    /// write under a namespace: a test that wants to fault something LATER in the same prefix (e.g. the
+    /// stale-precommit sweep's removal chunk) must skip past recovery's own seal writes first. Same
+    /// seam as `ChunkFaultBackend::fault_skip` in `cas_test_helpers.h`.
+    int fault_skip = 0;
     std::optional<std::pair<String, String>> pending_delayed_write;
 
     /// (I1) On a matching `putIfAbsent`, a FOREIGN writer lands a DIFFERENT object at the exact key and
@@ -246,11 +252,18 @@ public:
                 key, corrupt_foreign_bytes.empty() ? bytes + String("\x01_FOREIGN_DIFFERENT") : corrupt_foreign_bytes);
             throw Poco::TimeoutException("RefWriterTestBackend: a foreign different object landed; response lost");
         }
-        if (fault_count > 0 && !fault_key_substr.empty() && key.find(fault_key_substr) != String::npos)
+        if (!fault_key_substr.empty() && key.find(fault_key_substr) != String::npos)
         {
-            --fault_count;
-            pending_delayed_write = {key, bytes};
-            throw Poco::TimeoutException("RefWriterTestBackend: simulated ambiguous result (response lost)");
+            if (fault_skip > 0)
+            {
+                --fault_skip;
+            }
+            else if (fault_count > 0)
+            {
+                --fault_count;
+                pending_delayed_write = {key, bytes};
+                throw Poco::TimeoutException("RefWriterTestBackend: simulated ambiguous result (response lost)");
+            }
         }
         {
             std::unique_lock lk(block_mutex);
@@ -1953,6 +1966,11 @@ TEST(RefWriterStalePrecommitSweep, BoundedBatchesAndInterruptionResumeAcrossMoun
     auto successor = openPoolWithConfig(backend, config);
 
     backend->fault_key_substr = layout.refsNamespacePrefix(ns) + "_log/";
+    /// The successor's own recovery runs first and mints one in-band seal for the dead predecessor
+    /// epoch `e1` (its durable ids are `{e1,1}` and `{e1,2}`, so the seal lands at `{e1,3}`) -- that PUT
+    /// shares this same `_log/` prefix, so it would eat the fault before the sweep ever gets a chance.
+    /// Skip it and land the fault on the sweep's FIRST removal chunk's PUT, as intended.
+    backend->fault_skip = 1;
     backend->fault_count = 1;   /// hits exactly the sweep's FIRST removal chunk's PUT
 
     /// The sweep is piggybacked on this mount's very first touch; its (uncertain) failure is INSULATED
@@ -1988,8 +2006,12 @@ TEST(RefWriterStalePrecommitSweep, BoundedBatchesAndInterruptionResumeAcrossMoun
     EXPECT_EQ(final_state.getLifecycle(), RefLifecycle::Live);
     EXPECT_TRUE(final_state.getPrecommits().empty()) << "every stale precommit must eventually be swept";
 
-    /// Bounded batches: exactly two NEW removal transactions (epoch > e1) were needed for kTotalStale
-    /// items -- never one (would violate the 1000-op cap) and never kTotalStale individual ones.
+    /// Bounded batches: exactly THREE NEW `_log/` objects (epoch > e1) were needed -- never kTotalStale
+    /// individual removals, and one more than before INV-2 went in-band. In order: `{e1+1,1}` the
+    /// successor's own (delayed-delivered) FIRST removal chunk; `{e1+1,2}` the epoch seal that closes
+    /// the successor's own epoch once IT becomes dead in turn -- minted by `resumer`'s recovery, since
+    /// `successor` was abandoned mid-sweep without a clean farewell and never sealed itself; and
+    /// `{e1+2,1}` the resumer's own SECOND removal chunk, finishing the remaining stale precommits.
     size_t new_log_objects = 0;
     {
         String cursor;
@@ -2007,7 +2029,7 @@ TEST(RefWriterStalePrecommitSweep, BoundedBatchesAndInterruptionResumeAcrossMoun
             cursor = page.next_cursor;
         }
     }
-    EXPECT_EQ(new_log_objects, 2u);
+    EXPECT_EQ(new_log_objects, 3u);
 }
 
 /// S13 regression fix (triage `.superpowers/sdd/s13-triage-report.md`, run 20260713T172032_S13_seed42):
@@ -2061,6 +2083,11 @@ TEST(RefWriterStalePrecommitSweep, FailedSweepRearmsAndRetriesUntilClean)
     successor->setEventSink([&](const CasEvent & e) { seen.push_back(e); });
 
     backend->fault_key_substr = layout.refsNamespacePrefix(ns) + "_log/";
+    /// The successor's own recovery runs first and mints one in-band seal for the predecessor's now-dead
+    /// epoch (its three precommits are its only durable ids, so the seal takes the very next slot) --
+    /// that PUT shares this same `_log/` prefix, so it would eat the fault before the sweep gets a turn.
+    /// Skip it and land the fault on the sweep's FIRST removal chunk's PUT, as intended.
+    backend->fault_skip = 1;
     backend->fault_count = 1;   /// hits exactly the sweep's FIRST removal chunk's PUT
 
     /// FIRST trigger (read path): the sweep's removal PUT is uncertain -> the lane wedges; the read
@@ -2186,13 +2213,35 @@ std::optional<RefTxnId> listGreatestLogIdForTest(Backend & backend, const Layout
 /// Seed a same-uuid TWIN incarnation that bumped the durable writer_epoch and durably DROPPED `ref_name`
 /// (its committed binding `old_ref`) at `{twin_epoch, 1}` -- an id that sorts strictly above every log a
 /// Pool wrote under its own (lower) open-time epoch. Returns the twin's epoch.
+/// `prev_epoch_seal` is NOT optional decoration here. The twin's drop is sequence 1 of a new epoch, so
+/// INV-2's grammar requires it to name the seal that closed the epoch below -- and the reader enforces
+/// that, so a twin seeded without it describes a stream with an uncertified epoch boundary, which is
+/// exactly what recovery must refuse. The link names the id the recovering pool's own CAS-walk will mint
+/// for the dead epoch: one past that epoch's greatest durable id, which is what `seal_of_previous_epoch`
+/// derives by listing rather than hard-coding, so the fixture cannot drift from the walk's arithmetic.
 uint64_t seedTwinDrop(Backend & backend, const Layout & layout, const RootNamespace & ns,
                       const String & ref_name, const ManifestRef & old_ref)
 {
+    uint64_t greatest_in_previous_epoch = 0;
+    uint64_t previous_epoch = 0;
+    forEachListedKey(backend, layout.refsNamespacePrefix(ns), [&](const ListedKey & lk)
+    {
+        const auto parsed = layout.parseRefObjectKey(lk.key);
+        if (!parsed || parsed->kind != RefObjectKind::Log)
+            return;
+        if (parsed->txn_id.writer_epoch > previous_epoch
+            || (parsed->txn_id.writer_epoch == previous_epoch && parsed->txn_id.ref_sequence > greatest_in_previous_epoch))
+        {
+            previous_epoch = parsed->txn_id.writer_epoch;
+            greatest_in_previous_epoch = parsed->txn_id.ref_sequence;
+        }
+    }, 1000);
+
     const uint64_t twin_epoch = allocateWriterEpoch(backend, layout, "test");
     RefLogTxn twin;
     twin.ns = ns.string();
     twin.txn_id = RefTxnId{twin_epoch, 1};
+    twin.prev_epoch_seal = RefTxnId{previous_epoch, greatest_in_previous_epoch + 1};
     RefOp drop;
     drop.kind = RefOpKind::OwnerTransition;
     drop.old_binding = RefOwnerBinding{RefOwnerKind::Committed, ref_name, old_ref};
@@ -2748,6 +2797,10 @@ void seedSealFixtureDeadEpochs(Backend & backend, const Layout & layout, const R
     RefLogTxn mut;
     mut.ns = ns.string();
     mut.txn_id = RefTxnId{2, 1};
+    /// Sequence 1 of a new epoch names the seal that closed the one below -- `{1,2}`, the slot right
+    /// after epoch 1's only durable id, which is where the recovering mount's CAS-walk puts it. The seal
+    /// OBJECT is deliberately not seeded: this fixture's subject is a recovery that has to mint it.
+    mut.prev_epoch_seal = RefTxnId{1, 2};
     mut.ops = {publishCommittedOps("b", manifestRef(2, 1, 1))[0],
                publishCommittedOps("b", manifestRef(2, 1, 1))[1]};
     writeRefLogTxnRaw(backend, layout, mut);
@@ -2921,8 +2974,10 @@ TEST(RefWriterRecoveryRetry, TransientFailureLongerThanBudgetPropagates)
     ASSERT_TRUE(store);
     store->setCasRetrySleepForTest([&fake_now](uint64_t ms) { fake_now += ms; });
 
-    const RefTxnId seal_id{2, UINT64_MAX};
-    backend->fault_key_substr = layout.refSnapshotKey(ns, seal_id);
+    /// The seal is an in-band LOG transaction at the slot after the dead epoch's last durable id, not a
+    /// snapshot at a synthetic id: epoch 1 closes at `{1,2}`, which is the FIRST write the walk attempts.
+    const RefTxnId seal_id{1, 2};
+    backend->fault_key_substr = layout.refLogKey(ns, seal_id);
     backend->fault_count = 1000;   /// never stops failing within the budget
 
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->listRefs(ns); });
@@ -2951,8 +3006,8 @@ TEST(RefWriterRecoveryRetry, NonNetworkErrorIsNotRetried)
 
     /// A foreign writer lands DIFFERENT valid bytes at the seal key; resolve-before-reissue then throws
     /// CORRUPTED_DATA (a real cross-process seal conflict), which must NOT be retried.
-    const RefTxnId seal_id{2, UINT64_MAX};
-    backend->corrupt_key_substr = layout.refSnapshotKey(ns, seal_id);
+    const RefTxnId seal_id{1, 2};
+    backend->corrupt_key_substr = layout.refLogKey(ns, seal_id);
     backend->corrupt_count = 1;
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { store->listRefs(ns); });
@@ -3029,8 +3084,8 @@ TEST(RefWriterRecoveryRetry, ThrowingBackoffSleepDoesNotWedgeRecovery)
         if (sleep_should_throw)
             throw std::runtime_error("injected backoff-sleep failure");
     });
-    const RefTxnId seal_id{2, UINT64_MAX};
-    backend->fault_key_substr = layout.refSnapshotKey(ns, seal_id);
+    const RefTxnId seal_id{1, 2};
+    backend->fault_key_substr = layout.refLogKey(ns, seal_id);
     backend->fault_count = 1;
 
     EXPECT_ANY_THROW(store->listRefs(ns));   /// the sleep failure propagates

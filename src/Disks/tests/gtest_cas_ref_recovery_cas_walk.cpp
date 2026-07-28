@@ -13,6 +13,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
+#include <Common/MemoryTracker.h>
 #include <Common/ProfileEvents.h>
 
 #include <atomic>
@@ -816,9 +817,20 @@ TEST(CasRefRecoveryCasWalk, PoisonedTableReRecoversTheStrandedTxnAndClearsThePoi
         RootMutationOrigin::Writer, RootMutationKind::Publish));
 
     /// Built OUTSIDE the region (building it inside would trip the allocation guard instead of testing
-    /// the poison) -- the documented way to reach `Poisoned`.
+    /// the poison) -- the documented way to reach `Poisoned`. One-shot, and re-allowing allocations for
+    /// the duration of the throw: `std::rethrow_exception` allocates through libc++'s
+    /// `__cxa_rethrow_primary_exception`, which the debug build's `DENY_ALLOCATIONS_IN_SCOPE` aborts on.
+    /// (Found by the debug gate -- the first cut of this probe took the whole binary down there.) Same
+    /// shape as `gtest_cas_ref_install_safety.cpp`'s `armOneShotInstallFailure`.
     auto poison = std::make_exception_ptr(DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "install probe"));
-    store->setInstallRegionProbeForTest([poison] { std::rethrow_exception(poison); });
+    auto fired = std::make_shared<std::atomic<bool>>(false);
+    store->setInstallRegionProbeForTest([poison, fired]
+    {
+        if (fired->exchange(true))
+            return;
+        ALLOW_ALLOCATIONS_IN_SCOPE;
+        std::rethrow_exception(poison);
+    });
     EXPECT_ANY_THROW(store->appendRefOps(ns, MutationScope::ref("b"),
         [](const RefTableState &) { return publishCommittedOps("b", manifestRef(1, 2, 1)); },
         RootMutationOrigin::Writer, RootMutationKind::Publish));

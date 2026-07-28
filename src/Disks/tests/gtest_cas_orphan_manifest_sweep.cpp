@@ -189,7 +189,9 @@ TEST(CasOrphanManifestSweep, CursorPageSkipsOwnedBody)
 /// minted either, because ids are state-derived and a writer that could derive `{E, T+2}` would have had
 /// to observe the seal first.
 ///
-/// `CasEventType::RefLateLogDetected` is deliberately KEPT in the event vocabulary (see its doc):
-/// retiring the event kind is a product-surface decision that also retires soak scenario S38, and it is
-/// not this task's to take.
+/// `CasEventType::RefLateLogDetected` is retired WITH the detector -- pre-release, so a vocabulary entry
+/// nothing can emit is just dead surface. Soak scenario S38 (`s38_late_put_injection.py`) keeps its
+/// injection and FLIPS its assertion: from "the detection fired" to "the fence held" -- the late PUT's
+/// conditional create must LOSE to the occupied slot, with zero data loss and the namespace folding
+/// normally.
 
