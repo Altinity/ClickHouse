@@ -1241,3 +1241,7 @@ churn configs + witness configs running through TLC (07:17-20). No commit yet. N
 **2026-07-28 08:1x UTC watchdog** — task 3 reviewed (Approved, 2 Important: zombie-GoLive gating gap,
 orphaneaten witness weaker than claimed); fix round 1 dispatched minutes ago, agent in edit phase —
 no new TLC yet, normal. No push.
+
+**2026-07-28 08:3x UTC watchdog** — task 3 fix round 1 landed (c34fa479490: ZombieGoLive route,
+13/13 + BOUND=5); re-reviewer (sonnet) reading the 113 KB diff. Zombie tla-task3 stood down after
+its late wake — models/ clean, no clobber. No push.
