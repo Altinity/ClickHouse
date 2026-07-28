@@ -1281,3 +1281,7 @@ span, excluding foreign/worklog interleave), opus reviewer dispatched. No push.
 **2026-07-28 11:3x UTC watchdog** — task 5 reviewer (opus) still reading (no review file yet; the
 package is 158 KB + working-tree module context, long read phase expected). No stray processes.
 One more tick before a ping. No push.
+
+**2026-07-28 12:0x UTC watchdog-adjacent** — task 5 review: Spec ✅, Quality needs-fixes (op-identity
+aliasing blinds `AckedOpsAreDurable`; five stale RED state-count rows). Fix round 1 dispatched to
+tla-task5 with findings verbatim + minors folded in. No push.
