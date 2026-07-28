@@ -1389,3 +1389,7 @@ dispatched (mechanical -Werror overrun + two judgment calls to adjudicate). No p
 
 **2026-07-28 14:40 local watchdog** — task 1 reviewer mid-read (no review file yet; some
 unit_tests_dbms procs live — verification runs, possibly the other session's too). No push.
+
+**2026-07-28 15:2x local** — task 1 review: Spec ✅ / needs-fixes (decode-side pinning, chain
+direction rule, contextual early-return pin + minors). Fix round 1 dispatched; pse/pss ruled
+CRITICAL keys. No push.
