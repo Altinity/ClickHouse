@@ -27,6 +27,11 @@ constexpr FormatChangePoint BASELINE[] = {{1, 1}};
 /// floor is therefore the change generation itself.
 constexpr FormatChangePoint REF_STREAM[] = {{1, 1}, {kContiguousRefStreamsGeneration, kContiguousRefStreamsGeneration}};
 
+/// `cas_ref_ckpt` is BORN at generation 4, so it has no generation-1 baseline to inherit: there is no
+/// such thing as a generation-1 `_ckpt` object, and claiming one would say a generation-1 reader could
+/// read it. Its single change point is its birth, and the reader floor is that same generation.
+constexpr FormatChangePoint REF_CKPT[] = {{kContiguousRefStreamsGeneration, kContiguousRefStreamsGeneration}};
+
 }
 
 std::span<const FormatChangePoint> changePoints(FormatId id)
@@ -36,6 +41,8 @@ std::span<const FormatChangePoint> changePoints(FormatId id)
         case FormatId::RefLog:
         case FormatId::RefSnapshot:
             return REF_STREAM;
+        case FormatId::RefCkpt:
+            return REF_CKPT;
         case FormatId::Blob:
         case FormatId::GcState:
         case FormatId::PoolMeta:
@@ -102,6 +109,13 @@ constexpr FormatTraits TRAITS[] =
     {FormatId::PoolMeta,     "cas_pool_meta",     TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Never,     1 * kMiB,   64 * kKiB},
     {FormatId::RefLog,       "cas_ref_log",       TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Always,    64 * kMiB,  64 * kMiB},
     {FormatId::RefSnapshot,  "cas_ref_snap",      TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Always,    64 * kMiB,  64 * kMiB},
+    /// `cas_ref_ckpt` is a three-field mutable singleton read by a point GET on every recovery and on
+    /// every cleanup decision, so its caps are deliberately TIGHT (64 KiB / 4 KiB rather than the
+    /// megabyte scale its Control-family siblings use): nothing legitimate approaches them, and the cap
+    /// is the first thing that fires if a foreign object ever lands at the key. STRICT for the same
+    /// reason its decoder is -- every field changes what cleanup may delete, so nothing in it may be
+    /// skipped. Raw (`Never`): a small singleton, and `publishCkpt` re-encodes it on every attempt.
+    {FormatId::RefCkpt,      "cas_ref_ckpt",      TextFamily::Control,       KeyStrictness::Strict,   CompressionPolicy::Never,     64 * kKiB,  4 * kKiB},
     {FormatId::PartManifest, "cas_part_manifest", TextFamily::PayloadHybrid, KeyStrictness::Tolerant, CompressionPolicy::Always,    256 * kMiB, 64 * kKiB},
     {FormatId::RunFile,      "cas_run",           TextFamily::RecordStream,  KeyStrictness::Strict,   CompressionPolicy::PinnedRaw, 0,          4 * kKiB},
     {FormatId::FoldSeal,     "cas_fold_seal",     TextFamily::Control,       KeyStrictness::Strict,   CompressionPolicy::PinnedRaw, 256 * kMiB, 64 * kKiB},

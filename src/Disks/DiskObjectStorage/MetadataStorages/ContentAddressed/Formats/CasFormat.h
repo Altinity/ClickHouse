@@ -71,6 +71,7 @@ enum class FormatId : uint16_t
     RefSnapshot = 20,     /// cas_ref_snap    — complete per-namespace ref table
     BlobMeta = 21,        /// cas_blob_meta   — per-blob freshness sidecar
     GcHeartbeat = 22,     /// cas_gc_hb       — GC leader heartbeat
+    RefCkpt = 23,         /// cas_ref_ckpt    — per-namespace checkpoint (INV-4)
 };
 
 /// Returns the writer generation stamped on newly written objects. The current pre-roster writer

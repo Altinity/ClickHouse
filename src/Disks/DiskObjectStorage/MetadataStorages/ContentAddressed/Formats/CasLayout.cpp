@@ -147,6 +147,28 @@ std::optional<ParsedRefObjectKey> Layout::parseRefObjectKey(std::string_view key
     return ParsedRefObjectKey{RootNamespace{String(ns_part)}, kind, *txn_id};
 }
 
+std::optional<RootNamespace> Layout::parseRefCkptKey(std::string_view key) const
+{
+    const String base = casRefsPrefix();
+    if (!key.starts_with(base))
+        return std::nullopt;
+    std::string_view rest = key;
+    rest.remove_prefix(base.size());
+
+    /// `<ns>/_ckpt<suffix>` -- the leaf is the fixed name plus whatever the registry's compression
+    /// policy appends, and everything before it is the namespace. Built from the same pieces
+    /// `refCkptKey` uses, so the two cannot drift apart.
+    const String leaf = "_ckpt" + String(storedSuffix(FormatId::RefCkpt));
+    const size_t leaf_sep = rest.rfind('/');
+    if (leaf_sep == std::string_view::npos || rest.substr(leaf_sep + 1) != leaf)
+        return std::nullopt;
+    const std::string_view ns_part = rest.substr(0, leaf_sep);
+    if (ns_part.empty())
+        return std::nullopt;
+
+    return RootNamespace{String(ns_part)};
+}
+
 std::optional<ManifestId> Layout::parseManifestKey(std::string_view key) const
 {
     const String base = casManifestsPrefix();

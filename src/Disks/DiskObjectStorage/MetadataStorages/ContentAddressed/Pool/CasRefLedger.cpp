@@ -63,6 +63,9 @@ namespace ProfileEvents
     extern const Event CasRefSnapshotTailLogs;
     extern const Event CasRefSnapshotPublishDispatched;
     extern const Event CasRefSnapshotPublishBackoff;
+    extern const Event CasRefCkptPublished;
+    extern const Event CasRefCkptIdenticalSkip;
+    extern const Event CasRefCkptNotAdvanced;
     extern const Event CasRefRecoverySealPublished;
 }
 
@@ -2328,6 +2331,42 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
         return false;
     }
 
+    /// INV-4's FIRST `_ckpt` writer, and the ONLY writer anywhere that knows this namespace's
+    /// `life_epoch`: it is the writer epoch of its `namespace_birth`, which is this transaction. No
+    /// later writer can recover it (a table recovered from a snapshot never replays the birth), so if
+    /// it is not recorded here it is not recorded at all. Spec §3 orders creation `_ckpt` first, THEN
+    /// the namespace becoming Live, which is exactly this placement -- before the durable `PUT`, where
+    /// a failure is an ORDINARY pre-durability rejection: the id is not consumed, nothing landed, and
+    /// the next attempt re-derives the same id. A `_ckpt` for a birth that then failed is inert debris
+    /// (it names no checkpoint, so nothing is deletable and recovery has no base to prefer), and the
+    /// next attempt's merge adopts it unchanged.
+    ///
+    /// `FencedOut` is a rejection here rather than a shrug: unlike the publisher's, this contribution
+    /// carries the one fact nothing else can supply, so proceeding without it would put the namespace
+    /// Live with its genesis epoch permanently unknown.
+    if (std::any_of(chunk_ops.begin(), chunk_ops.end(),
+                    [](const RefOp & op) { return op.kind == RefOpKind::NamespaceBirth; }))
+    {
+        try
+        {
+            if (publishCkptContribution(ns, RefCkpt{.life_epoch = std::optional<uint64_t>{id.writer_epoch},
+                                                    .checkpoint_snapshot_id = std::nullopt,
+                                                    .last_epoch_seal = std::nullopt},
+                                        admitted_fence_generation) == CkptPublishOutcome::FencedOut)
+            {
+                complete_error(chunk_survivors, makeCasWriteRetryLaterExceptionPtr(fmt::format(
+                    "CAS ref-log append for namespace '{}': the mount fence moved while creating the "
+                    "namespace's _ckpt, so the birth transaction was not sent", ns.string())));
+                return false;
+            }
+        }
+        catch (...)
+        {
+            complete_error(chunk_survivors, std::current_exception());
+            return false;
+        }
+    }
+
     /// Preconstruct the COMPLETE wedge here, BEFORE the PUT (spec §A1 site 3), and let the request read
     /// its key and body straight out of it. The `Unresolved` arm below used to build
     /// `RefAppendWedge{id, key, bytes}` AFTER the PUT, which copies two `String`s: an allocation failure
@@ -2962,10 +3001,32 @@ void clampedCounterSub(std::atomic<uint64_t> & counter, uint64_t amount)
 }
 
 
+CkptPublishOutcome CasRefLedger::publishCkptContribution(const RootNamespace & ns, const RefCkpt & contribution,
+                                                         uint64_t admitted_generation)
+{
+    /// The retry window is the SAME budget every other CAS operation of this ledger rides, measured on
+    /// the ledger's own injectable boot clock -- so a test drives the exhaustion arm without sleeping,
+    /// and a VM suspend cannot shorten it.
+    const CkptDeadline deadline{boot_ms_now_fn, boot_ms_now_fn() + cas_request_budget.operation_deadline_ms};
+    const CkptPublishOutcome outcome = publishCkpt(backend, layout, ns, contribution, admitted_generation,
+                                                   check_fence_or_throw, deadline);
+    if (outcome == CkptPublishOutcome::Published)
+        ProfileEvents::increment(ProfileEvents::CasRefCkptPublished);
+    else if (outcome == CkptPublishOutcome::IdenticalSkip)
+        ProfileEvents::increment(ProfileEvents::CasRefCkptIdenticalSkip);
+    return outcome;
+}
+
 bool CasRefLedger::trySnapshotPublishOnce(const RootNamespace & ns)
 {
     const auto rt = getRefTableRuntime(ns);
     ensureRefTableRecovered(ns, *rt);
+
+    /// This attempt's ADMISSION token, captured once, before any of its I/O: which mount incarnation
+    /// allowed this publish. It is presented back on every `_ckpt` CAS attempt below (spec §3's
+    /// recheck discipline -- the same value at every site), so a publish admitted under an incarnation
+    /// that has since been replaced can advance nothing.
+    const uint64_t admitted_generation = fence_generation_fn();
 
     /// ONE copy of the live state, at a transaction boundary -- no
     /// replay, no per-entry retention. The tail counters are captured in the SAME critical section so
@@ -3077,6 +3138,50 @@ bool CasRefLedger::trySnapshotPublishOnce(const RootNamespace & ns)
         return false;
     }
     ProfileEvents::increment(ProfileEvents::CasRefSnapshotPutBytes, bytes.size());   /// account published bytes
+
+    /// INV-4's SECOND `_ckpt` writer, at exactly the point the spec puts it: the snapshot body is
+    /// durable, and it becomes CLEANUP-AUTHORITATIVE only once the checkpoint names it. Ordering the
+    /// two this way is what makes the intervening race harmless -- cleanup planned between the body PUT
+    /// and this CAS still reads the OLD checkpoint, and the deletion gate is "strictly below" it, so it
+    /// cannot delete the snapshot just published.
+    ///
+    /// The contribution is the checkpoint ALONE. A publisher does not know this namespace's
+    /// `life_epoch` (it may have recovered the table from a snapshot that never replayed the birth), so
+    /// it contributes NOTHING for it and the semantic-max merge preserves whatever a writer that did
+    /// know has already recorded -- in either order.
+    ///
+    /// A checkpoint that does NOT advance leaves the attempt unadopted: the backoff is armed and this
+    /// returns false, so a later trigger re-runs the whole publish. The re-run's body PUT resolves to
+    /// `Committed` against its own identical bytes, so retrying costs one conditional PUT and not a
+    /// second snapshot. Adopting instead would mark this snapshot as the newest -- suppressing every
+    /// later publish for it -- while the checkpoint still pointed below it, leaving recovery replaying
+    /// from an older base with nothing scheduled to fix it.
+    bool ckpt_advanced = false;
+    try
+    {
+        ckpt_advanced = publishCkptContribution(ns, RefCkpt{.life_epoch = std::nullopt,
+                                                            .checkpoint_snapshot_id = candidate_x,
+                                                            .last_epoch_seal = std::nullopt},
+                                                admitted_generation) != CkptPublishOutcome::FencedOut;
+    }
+    catch (...)
+    {
+        /// Swallowed deliberately, and ONLY here: the snapshot body is already durable, so there is
+        /// nothing to undo and nothing for a caller to decide -- `trySnapshotPublishOnce` is one
+        /// best-effort attempt whose every other failure arm also returns false with a backoff. The
+        /// counter and the log line are what keep it from being silent.
+        tryLogCurrentException(getLogger("CasPool"),
+            "CAS ref table '" + ns.string() + "': the snapshot body is durable but its _ckpt checkpoint "
+            "could not be advanced; the snapshot is not yet cleanup-authoritative and the publish will "
+            "be retried");
+    }
+    if (!ckpt_advanced)
+    {
+        ProfileEvents::increment(ProfileEvents::CasRefCkptNotAdvanced);
+        std::lock_guard lock(rt->state_mutex);
+        advancePublishBackoff(*rt);
+        return false;
+    }
 
     {
         std::lock_guard lock(rt->state_mutex);

@@ -994,7 +994,22 @@ public:
         return InMemoryBackend::putIfAbsent(key, bytes, meta);
     }
 
+    /// Counted separately from `putIfAbsent`: a token-CAS is a DIFFERENT op with a different cost, and
+    /// the `_ckpt` no-op contract ("identical merged body issues no write") is asserted on exactly this
+    /// counter -- a create-if-absent count would not see the replace path at all.
+    DB::Cas::CasResult casPut(const String & key, const String & bytes,
+                              const std::optional<DB::Cas::Token> & expected, const DB::Cas::ObjectMeta & meta) override
+    {
+        {
+            std::lock_guard lock(count_mutex);
+            ++cas_put_counts[key];
+            ++cas_put_total;
+        }
+        return InMemoryBackend::casPut(key, bytes, expected, meta);
+    }
+
     uint64_t headCount(const String & key) const { return lookup(head_counts, key); }
+    uint64_t casPutCount(const String & key) const { return lookup(cas_put_counts, key); }
     uint64_t getCount(const String & key) const { return lookup(get_counts, key); }
     uint64_t putCount(const String & key) const { return lookup(put_counts, key); }
     uint64_t getStreamCount(const String & key) const { return lookup(get_stream_counts, key); }
@@ -1007,6 +1022,7 @@ public:
     uint64_t headTotal() const { std::lock_guard lock(count_mutex); return head_total; }
     uint64_t getTotal() const { std::lock_guard lock(count_mutex); return get_total; }
     uint64_t putTotal() const { std::lock_guard lock(count_mutex); return put_total; }
+    uint64_t casPutTotal() const { std::lock_guard lock(count_mutex); return cas_put_total; }
     uint64_t getStreamTotal() const { std::lock_guard lock(count_mutex); return get_stream_total; }
     uint64_t listTotal() const { std::lock_guard lock(count_mutex); return list_total; }
 
@@ -1031,11 +1047,12 @@ public:
         head_counts.clear();
         get_counts.clear();
         put_counts.clear();
+        cas_put_counts.clear();
         get_stream_counts.clear();
         list_counts.clear();
         max_ranged_get_len.clear();
         whole_get_counts.clear();
-        head_total = get_total = put_total = get_stream_total = list_total = 0;
+        head_total = get_total = put_total = cas_put_total = get_stream_total = list_total = 0;
     }
 
 private:
@@ -1050,6 +1067,7 @@ private:
     std::map<String, uint64_t> head_counts;
     std::map<String, uint64_t> get_counts;
     std::map<String, uint64_t> put_counts;
+    std::map<String, uint64_t> cas_put_counts;
     std::map<String, uint64_t> get_stream_counts;
     std::map<String, uint64_t> list_counts;
     std::map<String, uint64_t> max_ranged_get_len;
@@ -1057,6 +1075,7 @@ private:
     uint64_t head_total = 0;
     uint64_t get_total = 0;
     uint64_t put_total = 0;
+    uint64_t cas_put_total = 0;
     uint64_t get_stream_total = 0;
     uint64_t list_total = 0;
 };

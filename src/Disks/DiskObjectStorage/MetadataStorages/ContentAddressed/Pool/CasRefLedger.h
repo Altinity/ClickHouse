@@ -4,6 +4,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCkpt.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
 #include <atomic>
 #include <condition_variable>
@@ -794,6 +795,21 @@ private:
     /// Schedules best-effort background publication when tail thresholds and backoff permit. The
     /// dispatch is fenced and the detached task retains the owner pin until it finishes.
     void maybeScheduleSnapshotPublish(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt);
+
+    /// Merges one contribution into `ns`'s `_ckpt` (spec INV-4), presenting `admitted_generation` back
+    /// through the pool's fence callback on every CAS attempt. The ledger owns no `CasMountRuntime`, so
+    /// this is only the place that assembles the deadline from the ledger's own injectable boot clock
+    /// and CAS budget; the algorithm itself is `publishCkpt`, shared verbatim with every other writer.
+    ///
+    /// TWO call sites, the two writers INV-4 names, and they contribute DISJOINT fields:
+    ///   - `commitRefChunk`'s namespace-birth transaction contributes `life_epoch` -- it is the only
+    ///     writer that knows it (this transaction's own writer epoch), and spec §3 has the `_ckpt`
+    ///     created before the namespace becomes Live;
+    ///   - `trySnapshotPublishOnce` contributes `checkpoint_snapshot_id` once the snapshot body is
+    ///     durable, and contributes NOTHING about `life_epoch` (an absence, which the semantic-max
+    ///     merge leaves alone) because the publisher does not know it and must never guess.
+    CkptPublishOutcome publishCkptContribution(const RootNamespace & ns, const RefCkpt & contribution,
+                                               uint64_t admitted_generation);
 
     /// The Live + single-in-flight-gate + backoff + tail-threshold admission decision, factored out so
     /// both the trigger (`maybeScheduleSnapshotPublish`) and the settlement re-evaluation share ONE

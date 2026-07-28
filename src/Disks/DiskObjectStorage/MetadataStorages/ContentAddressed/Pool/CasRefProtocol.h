@@ -650,13 +650,19 @@ struct RefTableListing
     std::vector<RefTxnId> logs;
     std::vector<RefTxnId> snapshots;
     std::vector<RefTxnId> cleanup_markers;
+    /// Whether this table's `_ckpt` (spec INV-4) was present in the same listing. It carries no
+    /// transaction id, so it cannot join the three id vectors -- but it IS one of the table's ref
+    /// objects, and a listing that did not record it would report a table with a checkpoint as
+    /// indistinguishable from one without.
+    bool has_ckpt = false;
 
     bool operator==(const RefTableListing &) const = default;
 };
 
 /// Parse and group a global `LIST` of keys under `layout.casRefsPrefix()` by table. Every
-/// key is expected to be one of the three ref-object kinds; a key under the ref prefix that
-/// `Layout::parseRefObjectKey` does not recognize, or whose reconstructed namespace is malformed
+/// key is expected to be one of the three id-bearing ref-object kinds or the table's `_ckpt`; a key
+/// under the ref prefix that neither `Layout::parseRefObjectKey` nor `Layout::parseRefCkptKey`
+/// recognizes, or whose reconstructed namespace is malformed
 /// (`parseRefObjectKey` does not re-validate the namespace, so this does), is a malformed
 /// ref key and throws `CORRUPTED_DATA` -- the round catches it and aborts ref folding for the round
 /// (a malformed key cannot produce a partial ref delta or authorize destructive work).

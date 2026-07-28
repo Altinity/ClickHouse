@@ -692,6 +692,17 @@ std::map<String, RefTableListing> groupRefKeys(const Layout & layout, const std:
         if (!key.starts_with(base))
             continue;
 
+        /// The `_ckpt` (spec INV-4) is a ref object with no transaction id, so it is classified FIRST
+        /// and separately: `parseRefObjectKey` cannot recognize it (it lives directly under the
+        /// namespace prefix, not in a kind directory), and reaching the throw below with a perfectly
+        /// legitimate `_ckpt` would abort ref folding for every round of every pool that has one.
+        if (const auto ckpt_ns = layout.parseRefCkptKey(key))
+        {
+            layout.validateNamespace(*ckpt_ns);
+            out[ckpt_ns->string()].has_ckpt = true;
+            continue;
+        }
+
         const auto parsed = layout.parseRefObjectKey(key);
         if (!parsed)
             throw Exception(ErrorCodes::CORRUPTED_DATA,

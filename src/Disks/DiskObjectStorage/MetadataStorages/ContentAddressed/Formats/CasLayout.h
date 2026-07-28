@@ -140,6 +140,26 @@ public:
         return refsNamespacePrefix(ns) + "_snap/" + renderRefTxnId(id) + String(storedSuffix(FormatId::RefSnapshot));
     }
 
+    /// The namespace's checkpoint object (spec INV-4) at `<prefix>/cas/refs/<ns>/_ckpt`. UNLIKE every
+    /// other ref object it is MUTABLE (token-CAS), carries no transaction id, and therefore lives
+    /// directly under the namespace prefix rather than in a `_log`/`_snap`/`_cleanup` kind directory --
+    /// which is also why `parseRefObjectKey` does not recognize it and `parseRefCkptKey` exists.
+    /// Stage A shape; Stage B re-keys it under the namespace's incarnation.
+    String refCkptKey(const RootNamespace & ns) const
+    {
+        return refsNamespacePrefix(ns) + "_ckpt" + String(storedSuffix(FormatId::RefCkpt));
+    }
+
+    /// Inverse of `refCkptKey`: returns the namespace when `key` is exactly one of OUR `_ckpt` keys,
+    /// and `std::nullopt` for anything else -- never throws, for the same reason `parseRefObjectKey`
+    /// does not: classifying an untrusted listed key is an ordinary "is this ours" question. The
+    /// namespace is syntactically parsed here; a caller that will USE it must `validateNamespace` first.
+    ///
+    /// Every sweep over `casRefsPrefix()` must consult BOTH this and `parseRefObjectKey` before calling
+    /// a key unrecognized: a `_ckpt` is a legitimate ref object, and `groupRefKeys` treats an
+    /// unrecognized one as corruption that aborts ref folding for the whole round.
+    std::optional<RootNamespace> parseRefCkptKey(std::string_view key) const;
+
     /// Namespace-removal completion marker: a zero-byte object at
     /// `.../_cleanup/<render>` that GC publishes once the exact removal durably reaches `Completed`.
     String refCleanupMarkerKey(const RootNamespace & ns, const RefTxnId & id) const
