@@ -839,9 +839,9 @@ overturn any of these with evidence, which then goes to the controller as a ques
    (Task 6). Verify the wait guards NOTHING ELSE (the site map ties it to
    `refLanesSettledForRemount` + `unclean_boundary_epoch`, both ref-layer); if the analysis
    confirms, DELETE the wait + `unclean_boundary_epoch` coupling (`CasRefLedger.cpp:611` gate
-   died with Task 6's sentinel-seal removal; `:921` doc updated), keep the SETTING parsed but
-   inert-with-a-deprecation-log for one release only if removing it breaks config files —
-   otherwise delete the setting too (pre-release: delete).
+   died with Task 6's sentinel-seal removal; `:921` doc updated) AND delete the setting
+   outright — no parsed-but-inert period, no deprecation log: the feature never shipped, there
+   are no configs to protect (user directive 2026-07-28; recreate-only, Constraint 4).
 3. **Recovery LIST-reconciliation trust** — verdict (a) ALREADY EXECUTED in Task 6 (listed here
    so the table is complete; row cites Task 6's commit).
 4. **Fold listed-only iteration** — (a) executed in Task 7 (row cites commit).
