@@ -1641,3 +1641,7 @@ BACKLOG entries for its two findings written by controller (`c936b380394`). T6 i
 
 **2026-07-29 00:40 local watchdog** — T6 running all three gate classes concurrently (release
 gate3 done 00:37, ASan building, debug gate mid-run); T9 reviewer reading (no file yet). No push.
+
+**2026-07-29 01:2x local** — T9 review: approved (discriminator decisively verified). One
+Important = evidence-marker hygiene (3rd lane case — "no quoted artifact a grep does not
+return" rule issued); small fix round dispatched. T6 finishing fixtures + gates. No push.
