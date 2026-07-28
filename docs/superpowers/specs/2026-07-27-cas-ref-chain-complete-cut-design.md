@@ -211,8 +211,10 @@ blob, in-degree, condemnation phases, catalog sample, holds** — so the cross-n
 sabotage, the temporal lemma's variants and the hold-then-`FORCE REBUILD` scenario are expressible;
 `CaRelinkConfirmCore`'s `_sab_holeylist` becomes the fix's permanent regression witness;
 `CaRefNsCleanupStaleLeaderCore` rewritten around catalog states + incarnations;
-`CaRefCatalogCore` NEW (lifecycles, additive capacity, `_ckpt` ordering, incarnation inertness,
-under-clean-only); `CaCasMountCore` extended (recovery generations; wedge-retry vs successor-seal);
+`CaRefCatalogCore` NEW (lifecycles, the ENTRY-COUNT half of capacity — the byte-arithmetic half is
+the plan's boundary tests; `_ckpt` ordering, incarnation inertness; under-clean-only is gated in the
+Task-1 module's `ckpt` rules, not here); `CaCasMountCore` extended (recovery generations; wedge-retry
+vs successor-seal);
 `CaRefWriterCleanupCore`/`CaRefFoldClampRecoveryCore` extended per register items when those land.
 
 RED-first fault-injected controls, the load-bearing set: the cross-namespace hidden-`+1` vs visible
