@@ -257,8 +257,13 @@ TEST(CasRefCkpt, RegistryRowIsControlStrictWithTightCaps)
     EXPECT_EQ(traits.object_cap, 64u * 1024u);
     EXPECT_EQ(traits.line_cap, 4u * 1024u);
     EXPECT_EQ(traitsForType("cas_ref_ckpt"), &traits);
-    /// Raw, so the key has no suffix -- the Stage A shape is exactly `<ns>/_ckpt`.
+    /// Raw, so the key has no suffix -- the Stage A shape is exactly `<ns>/_ckpt`. This line is also
+    /// the TRIPWIRE for the codec's shortcut: `encodeRefCkpt`/`decodeRefCkpt` hand bytes to and from
+    /// the backend directly, bypassing `sealObject`/`openObject` because both are the identity under
+    /// `CompressionPolicy::Never`. Flip the policy to `Always` and that bypass would silently write
+    /// uncompressed bodies under a `.zst` key -- which this assertion catches first.
     EXPECT_EQ(storedSuffix(FormatId::RefCkpt), "");
+    EXPECT_EQ(traits.compression, CompressionPolicy::Never);
 }
 
 /// ---------------------------------------------------------------------------------------------

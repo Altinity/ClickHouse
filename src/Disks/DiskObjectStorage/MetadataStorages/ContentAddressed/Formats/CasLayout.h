@@ -158,6 +158,18 @@ public:
     /// Every sweep over `casRefsPrefix()` must consult BOTH this and `parseRefObjectKey` before calling
     /// a key unrecognized: a `_ckpt` is a legitimate ref object, and `groupRefKeys` treats an
     /// unrecognized one as corruption that aborts ref folding for the whole round.
+    ///
+    /// DELIBERATE WEAKENING OF THAT CORRUPTION DETECTOR, in the fail-safe direction. Anything of the
+    /// shape `<something>/_ckpt` parses, so a key with a stray segment -- say
+    /// `<prefix>/cas/refs/<ns>/_log/_ckpt` -- is read as the checkpoint of a namespace literally named
+    /// `<ns>/_log` instead of being reported as the malformed key it probably is. That is not fixable
+    /// here: a namespace is an OPAQUE multi-segment string (the wiring composes `srv1/<uuid>`,
+    /// `shadow/<backup>/<uuid>`), so nothing in a key distinguishes a deeper real namespace from a
+    /// shallower one with a stray segment, and reading it as the longer name is the only answer
+    /// available. The cost is bounded: the phantom table it names has no logs and no snapshots, so the
+    /// fold does nothing for it, and `groupRefKeys` still runs `validateNamespace` on the result, so a
+    /// malformed namespace throws exactly as before. Do NOT "tighten" this by rejecting segment names
+    /// that look reserved -- that would reject real namespaces the wiring is free to compose.
     std::optional<RootNamespace> parseRefCkptKey(std::string_view key) const;
 
     /// Namespace-removal completion marker: a zero-byte object at

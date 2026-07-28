@@ -99,8 +99,11 @@ struct FormatChangePoint
     uint16_t min_reader;
 };
 
-/// Returns the append-only change-point history for `id`, oldest first. Every class currently has the
-/// frozen generation-1 baseline `{1, 1}`; future changes append entries without editing old ones.
+/// Returns the append-only change-point history for `id`, oldest first. A class's history begins at
+/// the generation it was BORN in, not at 1: the classes that existed from the start carry the frozen
+/// `{1, 1}` baseline, while `RefCkpt` — introduced at generation 4 — begins at `{4, 4}`, because there
+/// is no such thing as a generation-1 `_ckpt` and claiming one would say a generation-1 reader could
+/// read it. Future changes append entries without editing old ones.
 std::span<const FormatChangePoint> changePoints(FormatId id);
 
 /// The text-format registry has one row per decodable persisted object. Each row is the single source

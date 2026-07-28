@@ -60,6 +60,12 @@ struct RefCkpt
 /// runs here first, so a struct this build would refuse to read can never be written by it either
 /// (`CORRUPTED_DATA`). Encoding is canonical and deterministic, which is what lets `publishCkpt`
 /// compare a merged result against what it read.
+///
+/// These bytes go to and come from the backend DIRECTLY: this pair bypasses `sealObject`/`openObject`,
+/// which are the identity under this class's `CompressionPolicy::Never` and would add nothing. A
+/// policy flip to `Always` therefore breaks this silently -- and is caught, because `storedSuffix`
+/// would stop being empty and the registry test asserting `storedSuffix(FormatId::RefCkpt) == ""`
+/// fails. That assertion is the tripwire for this shortcut, not an incidental check of the key shape.
 String encodeRefCkpt(const RefCkpt & ckpt);
 
 /// Decode a complete `cas_ref_ckpt` text object. STRICT (`KeyStrictness::Strict`): an unknown ordinary
