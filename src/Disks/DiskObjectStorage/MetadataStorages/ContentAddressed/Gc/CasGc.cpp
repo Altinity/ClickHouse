@@ -1066,10 +1066,12 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     ///   an id present in one enumeration, absent from the other, and STRICTLY BELOW the other
     ///   enumeration's maximum id for that same namespace CANNOT be a concurrent append.
     ///
-    /// That is the only unambiguous signal available: a bare gap in the id sequence is LEGITIMATE
-    /// (an append refused before any network attempt leaves a safe gap by design), and the interval
-    /// between two ids is unbounded across a `writer_epoch` change, so the missing ids cannot be
-    /// enumerated and probed. This check makes no assumption about WHY an enumeration was incomplete
+    /// That is the signal this probe rests on, and it is deliberately independent of id density: the
+    /// interval between two ids is unbounded across a `writer_epoch` change, so a probe that reasoned
+    /// from the sequence alone could not enumerate the missing ids at an epoch boundary. (Since INV-1
+    /// the ids WITHIN one `(namespace, epoch)` are contiguous, so a hole there is detectable and is
+    /// corruption rather than an allocation artefact — consuming that is a separate change, not this
+    /// probe's job.) This check makes no assumption about WHY an enumeration was incomplete
     /// -- a backend page, continuation behaviour, the iterator, or a mis-parse all surface identically.
     /// It therefore detects the EFFECT (a record one walk saw and the other did not) and not any one
     /// hypothesised mechanism.

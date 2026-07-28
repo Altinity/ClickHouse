@@ -442,7 +442,8 @@ TEST(CasRefStateMachine, OwnerTransitionRejectsInvalidCombinations)
     }
 
     /// A promote-shaped op (Precommit -> Committed) with mismatched ref_name is not a legal promote.
-    applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 3}, {addPrecommitOp("a", manifestRef(1, 1, 1))}));
+    /// The rejected transaction above left `greatest_applied` untouched, so THIS one is still {1, 2}.
+    applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 2}, {addPrecommitOp("a", manifestRef(1, 1, 1))}));
     {
         RefOp op;
         op.kind = RefOpKind::OwnerTransition;
@@ -450,7 +451,7 @@ TEST(CasRefStateMachine, OwnerTransitionRejectsInvalidCombinations)
         op.new_binding = RefOwnerBinding{RefOwnerKind::Committed, "b", manifestRef(1, 1, 1)};
         const RefTableState before = state;
         expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-            [&] { applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 4}, {op})); });
+            [&] { applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 3}, {op})); });
         expectStatesEqual(before, state);
     }
 
@@ -461,7 +462,7 @@ TEST(CasRefStateMachine, OwnerTransitionRejectsInvalidCombinations)
         op.old_binding = RefOwnerBinding{RefOwnerKind::Committed, "a", manifestRef(1, 1, 1)};
         op.new_binding = RefOwnerBinding{RefOwnerKind::Precommit, "a", manifestRef(1, 1, 1)};
         expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-            [&] { applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 5}, {op})); });
+            [&] { applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 3}, {op})); });
     }
 }
 
@@ -604,30 +605,43 @@ TEST(CasRefStateMachine, WholeTxnAtomicityLastOpFailureLeavesStateUntouched)
 }
 
 /// ===================================================================================
-/// Strictly increasing txn ids
+/// Contiguous txn ids (INV-1)
 /// ===================================================================================
 
-TEST(CasRefStateMachine, StrictlyIncreasingTxnIdsRejectsEqualAndLower)
+/// A table's durable ids are DENSE within `(namespace, epoch)`: the only admissible id is the one
+/// `nextRefTxnId` derives from `greatest_applied`, which is also the only id the writer ever mints.
+/// Equal, lower, and skipped ids are all corruption -- the last of those is what makes "I can see ids
+/// 1..T" mean "nothing is missing", the property the whole invariant exists to provide.
+TEST(CasRefStateMachine, ContiguousTxnIdsRejectEqualLowerAndSkipped)
 {
     RefTableState state;
-    applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 5}, {birthOp()}));
+    applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {birthOp()}));
     const RefTableState before = state;
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-        [&] { applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 5}, {addPrecommitOp("a", manifestRef(1, 1, 1))})); });
-    expectStatesEqual(before, state);
-
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-        [&] { applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 4}, {addPrecommitOp("a", manifestRef(1, 1, 1))})); });
+        [&] { applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {addPrecommitOp("a", manifestRef(1, 1, 1))})); });
     expectStatesEqual(before, state);
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
         [&] { applyRefLogTxn(state, makeTxn(kNs, RefTxnId{0, 999}, {addPrecommitOp("a", manifestRef(1, 1, 1))})); });
     expectStatesEqual(before, state);
 
-    /// A gap is fine -- only strict increase is required (spec §Ordered Ref Transaction Identifier).
-    applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 100}, {addPrecommitOp("a", manifestRef(1, 1, 1))}));
-    EXPECT_EQ(state.getGreatestApplied(), (RefTxnId{1, 100}));
+    /// Strictly greater but SKIPPED: admitted before INV-1, corruption now.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 3}, {addPrecommitOp("a", manifestRef(1, 1, 1))})); });
+    expectStatesEqual(before, state);
+
+    /// A new epoch restarts the sequence, so it must start at 1 -- carrying the previous epoch's
+    /// numbering forward would read exactly like a lost first transaction of the new stream.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { applyRefLogTxn(state, makeTxn(kNs, RefTxnId{2, 2}, {addPrecommitOp("a", manifestRef(1, 1, 1))})); });
+    expectStatesEqual(before, state);
+
+    /// The successor applies; then the next epoch's first id does.
+    applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 2}, {addPrecommitOp("a", manifestRef(1, 1, 1))}));
+    EXPECT_EQ(state.getGreatestApplied(), (RefTxnId{1, 2}));
+    applyRefLogTxn(state, makeTxn(kNs, RefTxnId{2, 1}, {addPrecommitOp("b", manifestRef(2, 1, 1))}));
+    EXPECT_EQ(state.getGreatestApplied(), (RefTxnId{2, 1}));
 }
 
 /// ===================================================================================

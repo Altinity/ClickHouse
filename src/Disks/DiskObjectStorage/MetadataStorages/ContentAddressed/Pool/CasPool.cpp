@@ -390,11 +390,42 @@ PoolPtr Pool::open(BackendPtr backend, PoolConfig config)
             case BootstrapResidual::EmptyOrProbeOnly:
                 break;   /// authoritative pool present, or a provably empty prefix — safe to proceed.
             case BootstrapResidual::ResidualWithoutMeta:
+            {
+                /// RECREATION QUIESCE. Reaching here means the prefix holds objects but no authoritative
+                /// `_pool_meta` -- the shape a pool recreation leaves behind. Before telling the operator
+                /// anything about residual data, ask the one question whose answer changes the remedy: is
+                /// a writer still entitled to this prefix? Refusing an OLD-FORMAT open fences nothing --
+                /// a server that mounted before the erase is still running, still holds its lease, and
+                /// still has queued writes; if the operator answers the residual message below by
+                /// clearing the prefix and recreating, that writer's next flush lands its old-format
+                /// transactions inside the NEW pool. So a non-terminal slot fails closed with its own
+                /// message: stop the writer first. Once the slot IS terminal, recreation proceeds and the
+                /// fresh mount's ordinary lease claim is what fences any straggler -- its next renewal
+                /// finds a slot it cannot hold and its local fence latches shut.
+                ///
+                /// Only on this arm: `EmptyOrProbeOnly` proves there is no slot object to read (a mount
+                /// lease is itself residual), and `PoolMetaPresent` is not a recreation at all -- neither
+                /// pays for the scan.
+                const std::vector<NonTerminalMountSlot> held = probeNonTerminalMountSlots(*backend, layout);
+                if (!held.empty())
+                {
+                    String detail;
+                    for (const NonTerminalMountSlot & slot : held)
+                        detail += fmt::format("\n  server root '{}': {}", slot.server_root_id, slot.detail);
+                    throw Exception(ErrorCodes::INVALID_STATE,
+                        "content-addressed pool '{}' (prefix '{}'): missing _pool_meta, but {} mount "
+                        "lease(s) under this prefix are still held — refusing to recreate the pool while "
+                        "a writer may still be using it. Stop (or decommission) the holder(s) so their "
+                        "mount slots become terminal, then retry; do NOT clear the prefix first, which "
+                        "would leave the surviving writer appending into the new pool.{}",
+                        config.server_root_id, config.pool_prefix, held.size(), detail);
+                }
                 throw Exception(ErrorCodes::INVALID_STATE,
                     "content-addressed pool '{}' (prefix '{}'): missing _pool_meta over a non-empty pool "
                     "prefix — refusing to bootstrap over residual data; recreate the pool or restore "
                     "_pool_meta. The pool prefix is exclusively CAS-owned.",
                     config.server_root_id, config.pool_prefix);
+            }
             case BootstrapResidual::Indeterminate:
                 throw Exception(ErrorCodes::INVALID_STATE,
                     "content-addressed pool '{}' (prefix '{}'): could not authoritatively list the pool "

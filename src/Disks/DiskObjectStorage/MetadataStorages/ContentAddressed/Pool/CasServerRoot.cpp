@@ -659,6 +659,64 @@ HeartbeatFloor computeHeartbeatFloor(Backend & b, const Layout & l, uint64_t now
     return floor;
 }
 
+std::vector<NonTerminalMountSlot> probeNonTerminalMountSlots(Backend & b, const Layout & l)
+{
+    std::vector<NonTerminalMountSlot> slots;
+
+    /// Same enumeration as `computeHeartbeatFloor`'s gate -- LIST the server-roots subtree, keep the
+    /// `/mount` bodies -- but read-only and without any observation state: this answers "is anyone
+    /// still entitled to write here", not "may I fence them out".
+    const String prefix = l.serverRootsPrefix();
+    String cursor;
+    while (true)
+    {
+        const ListPage page = b.list(prefix, cursor, /*limit*/ 1000);
+        for (const auto & listed : page.keys)
+        {
+            static constexpr std::string_view mount_suffix = "/mount";
+            if (!listed.key.ends_with(mount_suffix))
+                continue;   /// `/owner` and `/epoch` share the subtree; only the lease says "live".
+
+            const String srid = listed.key.substr(prefix.size(),
+                listed.key.size() - prefix.size() - mount_suffix.size());
+
+            const auto got = b.get(listed.key);
+            if (!got)
+                continue;   /// raced away between LIST and GET -- there is no slot to be held.
+
+            MountLease m;
+            try
+            {
+                m = decodeMountLease(got->bytes);
+            }
+            catch (...)
+            {
+                /// An undecodable lease is the WORST case for a recreation, not an ignorable one: it is
+                /// what a slot written by a format this build does not understand looks like, and the
+                /// holder of that slot is exactly the writer we must not run over.
+                slots.push_back(NonTerminalMountSlot{srid, fmt::format(
+                    "mount lease could not be decoded by this build ({})",
+                    getCurrentExceptionMessage(/*with_stacktrace=*/false))});
+                continue;
+            }
+
+            if (m.gc_fenced || m.min_active == std::numeric_limits<uint64_t>::max())
+                continue;   /// terminal: fenced out by GC, or the holder's own graceful farewell.
+
+            slots.push_back(NonTerminalMountSlot{srid, fmt::format(
+                "held by server uuid {} (writer_epoch {}, host '{}', pid {}, lease seq {}, stamped "
+                "expiry {} ms) with neither a graceful farewell nor a GC fence-out",
+                u128ToHex(m.server_uuid), m.writer_epoch, m.hostname, m.pid, m.seq, m.expires_at_ms)});
+        }
+
+        if (page.next_cursor.empty())
+            break;
+        cursor = page.next_cursor;
+    }
+
+    return slots;
+}
+
 std::vector<MountInfo> listMounts(Backend & backend, const Layout & layout, uint64_t now_ms, uint64_t skew_margin_ms)
 {
     std::vector<MountInfo> out;

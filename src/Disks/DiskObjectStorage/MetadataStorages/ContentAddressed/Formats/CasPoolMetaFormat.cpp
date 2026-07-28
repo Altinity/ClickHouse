@@ -102,15 +102,16 @@ PoolMeta decodePoolMeta(std::string_view data)
     ReadBufferFromMemory in(data.data(), data.size());
     const TextHeader header = expectHeaderLine(in, FormatId::PoolMeta);
 
-    /// Ref state before the snapshot+log model used mutable per-namespace ref-shard objects. That
-    /// representation was removed, so this build has no decoder with which to interpret such a pool;
-    /// reject it before reading the metadata body. Writers always emit the current generation, while
+    /// An older pool's ref-log ids came from a pool-wide counter, so its per-namespace streams have
+    /// legitimate holes — which this build reads as a truncated (corrupt) stream, and its own writers
+    /// could not extend without producing one. There is no decoder that can reconcile the two, so reject
+    /// the pool before reading the metadata body. Writers always emit the current generation, while
     /// `expectHeaderLine` separately rejects a future generation that this build cannot understand.
-    if (header.v < kRefSnapshotLogGeneration)
+    if (header.v < kContiguousRefStreamsGeneration)
         throw Exception(ErrorCodes::UNKNOWN_FORMAT_VERSION,
-            "CAS pool meta: pool was written with the removed pre-generation-3 ref-shard format "
-            "(generation {}); this build reads only the snapshot+log ref format (generation {}+). "
-            "CAS is pre-release — recreate the pool.", header.v, kRefSnapshotLogGeneration);
+            "CAS pool format {} predates contiguous ref streams; recreate the pool. This build reads "
+            "only per-namespace contiguous ref-log ids (generation {}+), and CAS is pre-release: there "
+            "is no in-place migration.", header.v, kContiguousRefStreamsGeneration);
 
     const String body = readLine(in, traitsFor(FormatId::PoolMeta).line_cap, "pool meta");
     ReadBufferFromMemory body_in(body.data(), body.size());

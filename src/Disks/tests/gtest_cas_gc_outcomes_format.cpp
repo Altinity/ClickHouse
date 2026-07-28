@@ -39,7 +39,7 @@ TEST(CasFormatBattery, GcOutcomes)
     runFormatBattery({FormatId::GcOutcomes,
         [&] { return sealObject(FormatId::GcOutcomes, encodeOutcomeLog(log)); },
         [](std::string_view d) { decodeOutcomeLog(std::string(openObject(FormatId::GcOutcomes, d))); },
-        "{\"type\":\"cas_gc_outcomes\",\"v\":3}\n"
+        "{\"type\":\"cas_gc_outcomes\",\"v\":4}\n"
         "{\"k\":\"blob\",\"ha\":\"ch128\",\"h\":\"00112233445566778899aabbccddeeff\","
         "\"tt\":\"etag\",\"tv\":\"e-1\",\"oc\":\"deleted\"}\n{\"n\":1}\n"});
 }

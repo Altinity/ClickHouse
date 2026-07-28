@@ -282,8 +282,8 @@ RefTableState stateFromSnapshot(const RefTableSnapshot & snapshot);
 
 /// Applies the COMPLETE transaction to `state`, or throws `CORRUPTED_DATA` (each transition shape
 /// below has exactly one precondition enforced here) -- with the STRONG exception guarantee: a throw
-/// anywhere leaves `state` byte-for-byte unchanged. The two txn-wide preconditions
-/// (strictly-increasing `txn_id`, `remove_namespace` ordering) are checked before any mutation, and the
+/// anywhere leaves `state` byte-for-byte unchanged. The txn-wide preconditions (a `txn_id` that is the
+/// contiguous successor, `remove_namespace` ordering) are checked before any mutation, and the
 /// whole apply runs two-phase against a scratch copy that replaces `state` only once the WHOLE
 /// transaction has succeeded, so no intra-transaction intermediate state (e.g. a manifest with its
 /// precommit already gone but its committed binding not yet installed) is ever observable to a caller
@@ -297,8 +297,10 @@ RefTableState stateFromSnapshot(const RefTableSnapshot & snapshot);
 /// to select the poisoning path.
 ///
 /// Enforced preconditions:
-///  - `txn.txn_id` must be strictly greater than `state.greatest_applied`
-///    ("only strict increase is required").
+///  - `txn.txn_id` must be strictly greater than `state.greatest_applied` AND must be exactly the
+///    contiguous successor `nextRefTxnId` derives (INV-1): the next sequence number within the same
+///    writer epoch, or 1 under a greater one. A hole in a table's durable stream is corruption, not a
+///    tolerated allocation artefact.
 ///  - `remove_namespace`, if present, must be the transaction's FINAL operation, and every earlier
 ///    operation must be an exact owner-removal `owner_transition` (`old_binding` set, `new_binding`
 ///    empty). The codec does not check this shape; this is the one place
@@ -344,6 +346,24 @@ RefTableState stateFromSnapshot(const RefTableSnapshot & snapshot);
 /// framing; a writer that wants a friendlier user-facing rejection for an ordinary attempted mutation
 /// (e.g. "ref already exists") checks its own business state before ever building the op.
 void applyRefLogTxn(RefTableState & state, const RefLogTxn & txn);
+
+/// The ONE id-derivation rule (INV-1): the id that continues `greatest_applied`'s stream under
+/// `live_epoch`. Within an epoch a table's ids are dense -- the successor of the greatest applied one --
+/// and an epoch change restarts the sequence at 1, because density is a property of `(namespace, epoch)`
+/// and a fresh incarnation's stream is a fresh stream. There is no counter anywhere: the id is a pure
+/// function of the state it will be applied to, which is what makes an attempt that sent nothing
+/// consume nothing (the next caller derives the same id from the same unchanged state).
+///
+/// Both sides of the invariant call this: the writer to mint an id, and `applyTxnInPlace` to decide
+/// whether a transaction's id is admissible. Sharing the rule is deliberate -- an allocator and a
+/// checker that each spell it out separately can drift, and a drift here is either a durable hole or a
+/// table that refuses its own writes.
+///
+/// Total by construction (no throw): the one input it cannot serve, an exhausted `ref_sequence` under
+/// the live epoch, would need 2^64 transactions in one incarnation of one table. Should a corrupt
+/// persisted snapshot ever seed such a state, the wrap produces a `ref_sequence` of 0, which
+/// `applyTxnInPlace`'s strict-increase precondition rejects before anything is written.
+RefTxnId nextRefTxnId(RefTxnId greatest_applied, uint64_t live_epoch);
 
 /// The canonical snapshot of `state` under `ns`: `committed` sorted by
 /// bytewise `ref_name` (guaranteed by `RefCowMap`'s sorted merge-iteration order,

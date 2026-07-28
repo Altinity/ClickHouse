@@ -530,15 +530,28 @@ private:
     /// this table is idle.
     std::atomic<bool> shutting_down{false};
 
-    /// Pool-wide strictly-increasing sequence shared by every table of this mounted writer. A new mount
-    /// epoch starts the sequence at one.
-    std::atomic<uint64_t> next_ref_sequence{1};
+    /// The id `rt`'s next transaction carries (INV-1): `nextRefTxnId` of the table's OWN
+    /// `greatest_applied` under the live writer epoch. There is no counter behind this -- the id is a
+    /// pure function of the state the transaction will be applied to, which buys two properties a
+    /// pool-wide counter could not:
+    ///   - each namespace's ids are dense `1..T` within one epoch, so a reader holding a table's log
+    ///     ids can tell a COMPLETE stream from a truncated one without consulting anything else;
+    ///   - an attempt that provably sent nothing consumes nothing: the state it derived from is
+    ///     unchanged, so the next caller derives the SAME id and no hole is left behind.
+    ///
     /// The epoch component is the live mount incarnation's writer epoch, not the open-time
     /// `process_epoch`: a self-remount allocates a strictly-greater durable writer_epoch, so every ref
     /// transaction stamped after the remount sorts strictly ABOVE any (dead-incarnation or twin) log
     /// still durable under an older epoch. `RefTxnId` compares epoch first, so the epoch bump alone
     /// guarantees that a new log is never inserted at or below an already durable table log id.
-    RefTxnId allocateRefTxnId() { return RefTxnId{live_epoch_fn(), next_ref_sequence.fetch_add(1)}; }
+    ///
+    /// MUST be called with `rt.state_mutex` held, and the caller must apply the transaction to the SAME
+    /// state it read here: an id derived from one snapshot of a table and applied to another is not that
+    /// table's successor, and the apply-side density check would (correctly) reject it.
+    RefTxnId allocateRefTxnId(const RefTableRuntime & rt) const
+    {
+        return nextRefTxnId(rt.state.getGreatestApplied(), live_epoch_fn());
+    }
 
     /// The CAS-owned retry controller this Pool's ref-log writer path uses for every
     /// conditional log/snapshot `PUT` and uncertain-result resolution. Also shared (via the PartWriteTxn

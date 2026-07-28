@@ -1656,26 +1656,14 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
     /// reseeded live state (spec §3 chunked flush): one tenure may emit several transactions.
     std::vector<RefOp> final_ops;
     std::vector<std::shared_ptr<RefMutationItem>> survivors;
-    /// The trial epoch is ALWAYS `live_epoch_fn()` -- the SAME source `allocateRefTxnId` stamps the
-    /// real id with, so the trial preview and the persisted id never disagree on epoch. The trial
-    /// sequence continues `greatest_applied`'s counter only when its epoch already matches the live
-    /// one (an ordinary same-incarnation append); otherwise -- a never-born table's `{0, 0}`, or a
-    /// recovery seal's `{dead_epoch, UINT64_MAX}` -- the live epoch alone already
-    /// dominates `greatest_applied` (mount exclusivity guarantees `live_epoch_fn() >=
-    /// greatest_applied.writer_epoch`), so the sequence starts fresh at 0. This also keeps the `+= 1`
-    /// previews below overflow-safe: a seal's sequence field is `UINT64_MAX`, which would otherwise wrap
-    /// to 0 and be rejected as not strictly increasing. These trial ids are never persisted or compared
-    /// outside this loop; after each committed chunk they are RESEEDED from the now-live `working` so a
-    /// later zero-op item is never completed against a trial id from a discarded speculative chunk.
-    RefTxnId trial_id;
-    const auto reseed_trial_id = [&]
-    {
-        trial_id.writer_epoch = live_epoch_fn();
-        trial_id.ref_sequence = (working.getGreatestApplied().writer_epoch == trial_id.writer_epoch)
-            ? working.getGreatestApplied().ref_sequence
-            : 0;
-    };
-    reseed_trial_id();
+    /// Every preview below stamps its throwaway transaction with `nextRefTxnId` of the state it is about
+    /// to be applied to, under `live_epoch_fn()` -- the SAME rule and the same epoch source
+    /// `allocateRefTxnId` uses for the real id, so a preview can never be rejected for an id shape the
+    /// persisted transaction would have been given. Deriving each preview id from ITS OWN state, rather
+    /// than carrying a running counter across the loop, is what makes failure isolation hold under
+    /// INV-1: an item that throws part-way through its per-op previews leaves `working` untouched, and
+    /// the next item's preview is still the successor of `working` rather than of the abandoned item's
+    /// last trial id. These ids are never persisted or compared outside this loop.
     for (size_t item_index = 0; item_index < batch.size(); ++item_index)
     {
         const auto & it = batch[item_index];
@@ -1750,19 +1738,19 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
                     "flush did not commit — this item was not attempted and can be retried", ns.string())));
                 return;
             }
-            /// Reseed `working` and the trial-id high-water mark from the now-live state: the speculative
-            /// `working` with trial ids from the just-committed chunk is discarded, so a later zero-op
-            /// item is completed against the REAL committed id, never a trial id that never persisted. A
-            /// throw at the boundary -- the injected `ChunkReseed` fault, or a genuine reseed allocation
-            /// failure -- propagates to `appendRefOps`' tenure-containment catch, which preserves the
-            /// already-committed chunk's callers' success.
+            /// Reseed `working` from the now-live state: the speculative `working` with trial ids from
+            /// the just-committed chunk is discarded, so a later zero-op item is completed against the
+            /// REAL committed id, never a trial id that never persisted. The preview ids need no reseed
+            /// of their own -- each is derived from the state it is applied to, so re-seating `working`
+            /// re-seats them. A throw at the boundary -- the injected `ChunkReseed` fault, or a genuine
+            /// reseed allocation failure -- propagates to `appendRefOps`' tenure-containment catch, which
+            /// preserves the already-committed chunk's callers' success.
             if (carve_hook_for_test)
                 carve_hook_for_test(CarvePhaseForTest::ChunkReseed);
             {
                 std::lock_guard lock(rt->state_mutex);
                 working = rt->state;
             }
-            reseed_trial_id();
             final_ops.clear();
             survivors.clear();
         }
@@ -1791,9 +1779,8 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
             if (!item_ops.empty())
             {
                 RefTableState shape_check = working;
-                RefTxnId shape_probe_id = trial_id;
-                shape_probe_id.ref_sequence += 1;
-                applyRefLogTxn(shape_check, RefLogTxn{ns.string(), shape_probe_id, item_ops, std::nullopt});
+                applyRefLogTxn(shape_check, RefLogTxn{ns.string(),
+                    nextRefTxnId(shape_check.getGreatestApplied(), live_epoch_fn()), item_ops, std::nullopt});
             }
 
             for (const RefOp & op : item_ops)
@@ -1814,8 +1801,8 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
                 /// the SAME item (e.g. namespace_birth immediately followed by its first
                 /// owner_transition) is validated -- both here and by admits's own preview -- against
                 /// a state that already reflects it, exactly as the real combined transaction will.
-                trial_id.ref_sequence += 1;
-                applyRefLogTxn(item_scratch, RefLogTxn{ns.string(), trial_id, {op}, std::nullopt});
+                applyRefLogTxn(item_scratch, RefLogTxn{ns.string(),
+                    nextRefTxnId(item_scratch.getGreatestApplied(), live_epoch_fn()), {op}, std::nullopt});
             }
             /// Reserve the growth of BOTH accumulators BEFORE this item's effects are published. These
             /// reservations are the ONLY remaining throwing steps; once they succeed the publish below is
@@ -1896,8 +1883,8 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
     /// the whole fence-loss + remount window, then resume after `armMountFence`. Allocating {new_epoch,
     /// seq} now and PUTting it (its live `fence_ok` would pass) would persist a transaction validated
     /// against this orphaned runtime's STALE cache -- the C1 data-loss class. `superseded_by_remount` is
-    /// published before the fence re-arm, so failing closed here (no id, no PUT, no wedge -- a safe gap,
-    /// cache unchanged) keeps the durable log free of any stale-view transaction. The append `fence_ok`
+    /// published before the fence re-arm, so failing closed here (no id, no PUT, no wedge, cache
+    /// unchanged) keeps the durable log free of any stale-view transaction. The append `fence_ok`
     /// (which also checks the flag) is the airtight backstop for the narrow window past this point.
     if (rt->superseded_by_remount.load(std::memory_order_acquire))
     {
@@ -1937,33 +1924,42 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
         }
     }
 
-    const RefTxnId id = allocateRefTxnId();
-    const RefLogTxn chunk_txn{ns.string(), id, chunk_ops, std::nullopt};
-
     /// Build the candidate state BEFORE the PUT (spec §A1), so that the region between "this chunk's
     /// object is durable" and "the runtime records it" is allocation-free and therefore cannot throw.
     /// It used to be the other way round -- PUT, then `applyRefLogTxn(rt->state, chunk_txn)` -- and that
     /// apply CAN throw on an allocation failure (the COW containers allocate their overlays), which left
-    /// the transaction durable but invisible to the writer: a later transaction only needs
-    /// `greatest_applied < its id` (contiguity is not checked), and a snapshot published afterwards is
-    /// labelled with THAT id, so recovery skips the stranded transaction forever while GC, which folds
-    /// the ref LOGS, still applies it. That divergence is a data-loss class, not a stale cache.
+    /// the transaction durable but invisible to the writer: the apply check of the day admitted any
+    /// strictly greater id, so a later transaction sailed over the hole and a snapshot published
+    /// afterwards was labelled with THAT id -- recovery then skips the stranded transaction forever
+    /// while GC, which folds the ref LOGS, still applies it. That divergence is a data-loss class, not a
+    /// stale cache. INV-1 now refuses the same hole from the read side too, so the accident this
+    /// ordering prevents would also have to survive the density check to do any damage.
     ///
     /// A throw HERE, by contrast, is a clean PRE-durability failure -- the same class as an ordinary
-    /// validation reject: no object exists yet, the cache is untouched, and the id is a safe gap.
+    /// validation reject: no object exists yet, the cache is untouched, and the id is simply never used
+    /// (the next attempt re-derives it from this same unchanged state).
     ///
     /// The copy is cheap because it SHARES the live state's COW bases; the apply allocates only the
     /// overlay. The candidate is deliberately NOT materialized here: a state that shares its base cannot
     /// fold in place, so folding now would rebuild the whole base (O(table) per chunk). The install
     /// below restores unique base ownership before the existing post-install fold, which therefore stays
     /// O(overlay), exactly as it is today.
+    ///
+    /// The id is derived in the SAME critical section that snapshots the state (INV-1): it is a function
+    /// of `greatest_applied`, so reading it at a different instant than the state the transaction is
+    /// applied to would be deriving this chunk's id from a different stream. Only this leader mutates
+    /// `rt->state`, so the two reads cannot disagree today -- taking them together is what keeps that
+    /// from being an invariant a future edit has to rediscover.
     std::optional<RefTableState> candidate;
     RefTxnId candidate_base_id;
+    RefTxnId id;
     {
         std::lock_guard lock(rt->state_mutex);
         candidate.emplace(rt->state);
         candidate_base_id = rt->state.getGreatestApplied();
+        id = allocateRefTxnId(*rt);
     }
+    const RefLogTxn chunk_txn{ns.string(), id, chunk_ops, std::nullopt};
     try
     {
         applyRefLogTxn(*candidate, chunk_txn);
@@ -2021,7 +2017,11 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
         /// `putIfAbsentControlled` throws CORRUPTED_DATA when resolve-before-reissue observes a DIFFERENT
         /// object already at this txn's key -- a proven different-object conflict, not an unresolved PUT.
         /// Fail every survivor loudly and do NOT wedge (this is a conclusive rejection, not an uncertain
-        /// outcome): the id is a safe gap, the cache is unchanged, and the lane stays usable.
+        /// outcome): the cache is unchanged and the lane stays usable. The id is not consumed either --
+        /// but a foreign object sitting on this table's next key means the next attempt derives that
+        /// same id and hits the same conflict, which is the correct fail-closed behaviour: something
+        /// else is writing this table's log under our own epoch, and guessing a different id would only
+        /// hide a mount-exclusivity violation.
         /// Conclusive also means PROVEN NON-DURABLE for our bytes (the key is write-once and holds
         /// someone else's object), so no apply is owed and the marker goes back to `Clean` (spec §A2).
         clearApplyPending(*rt);
@@ -2147,7 +2147,7 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
             ProfileEvents::increment(ProfileEvents::CasRefAppendDefiniteFailure);
             complete_error(chunk_survivors, makeCasWriteRetryLaterExceptionPtr(fmt::format(
                 "CAS ref-log append for namespace '{}' definitively failed (non-retryable rejection); "
-                "cached state is unchanged and txn id {}-{} is a safe gap",
+                "cached state is unchanged and txn id {}-{} was never used (a retry re-derives it)",
                 ns.string(), id.writer_epoch, id.ref_sequence)));
             return false;
         }
@@ -2186,14 +2186,16 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
                 /// happened". A separate event keeps both readings available: the wedge counter now means
                 /// only genuinely ambiguous appends, and this one means availability preserved.
                 ProfileEvents::increment(ProfileEvents::CasRefAppendPreAttemptRefused);
-                /// The allocated id is left as a safe gap: ids are not required to be contiguous
-                /// (`CasRefProtocol.cpp` enforces strict increase only), and nothing was written under it.
+                /// The id is not consumed (INV-1): it was derived from `greatest_applied`, which this
+                /// refusal leaves exactly as it was, so the next caller on this table derives the SAME id
+                /// and the durable stream keeps no trace of the refusal. That is the free half of the
+                /// every-attempt rule -- an attempt that provably sent nothing owes nothing.
                 /// `prepared_wedge` is simply discarded -- building it before the PUT costs nothing here
                 /// and is what makes the genuinely ambiguous path below allocation-free.
                 complete_error(chunk_survivors, makeCasWriteRetryLaterExceptionPtr(fmt::format(
                     "CAS ref-log append for namespace '{}' txn {}-{} was refused BEFORE any request was "
                     "sent ({}) — the append lane is NOT wedged (nothing can be durable, so there is "
-                    "nothing to resolve) and the txn id is a safe gap",
+                    "nothing to resolve) and the txn id is not consumed (a retry re-derives it)",
                     ns.string(), id.writer_epoch, id.ref_sequence,
                     describeUnresolvedReason(unresolved_reason))));
                 return false;

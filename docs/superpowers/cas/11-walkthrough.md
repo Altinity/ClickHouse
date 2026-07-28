@@ -1309,10 +1309,13 @@ Three immutable object kinds under `cas/refs/<ns>/`:
 | cleanup marker | `…/_cleanup/<epoch-hex>-<seq-hex>` | zero bytes — GC's proof that a namespace removal physically completed |
 
 `RefTxnId = {writer_epoch, ref_sequence}` is rendered as two fixed-width 16-hex fields, so
-**lexical key order equals tuple order**. Ids are **not contiguous and not per-namespace**:
-`ref_sequence` is a pool-wide counter shared by every table of the mount, restarting at 1 each mount
-epoch, with `writer_epoch` as the primary ordering component. Gaps are normal and expected — a
-refused or failed attempt leaves a safe gap.
+**lexical key order equals tuple order**. Ids are **per-namespace and contiguous** (INV-1): within one
+`(namespace, writer_epoch)` they run `1, 2, 3, …` with no holes, and a new mount epoch restarts the
+sequence at 1, with `writer_epoch` as the primary ordering component. There is no counter — each id is
+derived from the table's own greatest applied id (`nextRefTxnId`), so two namespaces of the same mount
+both count from 1 independently and an attempt that provably sent nothing consumes no id. A hole is
+therefore not an allocation artefact but corruption, and `applyRefLogTxn` rejects a non-successor id as
+`CORRUPTED_DATA` — which is what lets a reader conclude "I can see `1..T`, so nothing is missing".
 
 The op vocabulary is deliberately tiny: `NamespaceBirth`, `OwnerTransition{old?, new?}`,
 `SetPublishedAt`, `RemoveNamespace`. There are exactly **four** legal `OwnerTransition` shapes —
@@ -1353,7 +1356,7 @@ flowchart TD
     PREP --> ARM["armApplyPending"]
     ARM --> PUT["<b>putIfAbsent(refLogKey(ns, id), bytes)</b>"]
     PUT -->|Committed| OK["allocation-free install region:<br/>state.swap(candidate), bump counters,<br/>clear apply-pending, complete waiters"]
-    PUT -->|DefiniteFailure| GAP["fail survivors; the id is a safe gap"]
+    PUT -->|DefiniteFailure| GAP["fail survivors; the id is not consumed<br/>(a retry re-derives it)"]
     PUT -->|"Unresolved, provably nothing sent"| NOSEND["do NOT wedge; clear apply-pending"]
     PUT -->|"Unresolved, anything else"| WEDGE["<b>install the prepared wedge</b><br/>survivors fail with UNCERTAIN, not failure"]
     OK --> SNAP["maybe schedule a snapshot publish"]

@@ -1809,19 +1809,15 @@ TEST(CasPartWriteTxn, AbandonRetryableAfterAppendFailure)
     /// exact key (a proven conflict) -> CORRUPTED_DATA propagates.
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { build->abandon(); });
 
-    /// The fault was one-shot: the SAME object's second abandon() call carves a fresh id and lands
-    /// normally -- this is the retryability the fix provides (today, without it, this would instead
-    /// throw LOGICAL_ERROR "has been abandoned").
-    EXPECT_NO_THROW(build->abandon());
-
-    /// The precommit binding really is gone now: a fresh precommitAdd for the ref succeeds (it would
-    /// throw CORRUPTED_DATA "already exists" had the removal never landed). The probe manifest is
-    /// freshly staged BY `rebuild` itself, not `mid` (staged by `build`, a different transaction) -- A3
-    /// mint-tightening now refuses a foreign id unconditionally, so re-using `mid` would no longer
-    /// isolate the property under test.
-    auto rebuild = startBuildFor(s, ns, "part_1");
-    const ManifestId rebuild_mid = rebuild->stageManifest({blobManifestEntry("data.bin", "kept")});
-    EXPECT_NO_THROW(rebuild->precommitAdd(ns, "part_1", rebuild_mid));
+    /// The retryability under test: the SAME object accepts a second abandon() -- `alive` was not
+    /// flipped by the failed append, so this is NOT the LOGICAL_ERROR "has been abandoned" the unfixed
+    /// code produced. It reaches the append and fails there, on the same proven conflict: under INV-1 the
+    /// ref-log id is derived from the table's own greatest applied id, so the retry addresses the very
+    /// key the foreign object took, rather than skipping to a fresh id and leaving a hole in this
+    /// table's stream. (A table whose next log key holds a foreign object is corrupt; it recovers under a
+    /// fresh mount incarnation's writer epoch, which starts a new key namespace -- not by writing past
+    /// the damage.)
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { build->abandon(); });
 }
 
 /// ------------------------------------------------------------------------------------------------

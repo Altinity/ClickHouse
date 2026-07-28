@@ -355,13 +355,18 @@ TEST(CasPartFolderAccess, PublishEntriesAbandonsBuildOnPromoteFailure)
     expectThrowsCode(ErrorCodes::CORRUPTED_DATA, [&] { access.republishRef({ns, "src"}, {ns, "dst"}); });
     EXPECT_FALSE(access.existsRef({ns, "dst"}, Cas::Freshness::ForceFresh)) << "the failed promote never committed dst";
 
-    /// No live precommit binding was leaked for dst: a fresh build can precommitAdd the SAME (ns, "dst")
-    /// ref without hitting "add precommit ... already exists" -- proven exactly like
-    /// CasPartWriteTxn.AbandonAppendsPrecommitRemovalAndKeepsLivePrecommitBody (gtest_cas_part_write.cpp).
+    /// `publishEntries` really did try to clean up: its `abandon()` ran (it is best-effort and swallows
+    /// its own failure, which is why the CORRUPTED_DATA above is still the promote's). Whether the
+    /// removal LANDED is a different question, and under INV-1 it cannot have: ref-log ids are derived
+    /// from the table's own greatest applied id, so abandon's removal append addresses the very key the
+    /// foreign object took and hits the same proven conflict -- it does not skip to a fresh id and leave
+    /// a hole in this table's stream. The same is true of any further append here, which is what this
+    /// probe now pins: a table whose next log key holds a foreign object is corrupt, and recovers under a
+    /// fresh mount incarnation's writer epoch (a new key namespace), never by writing past the damage.
     auto rebuild = store->beginPartWrite(Cas::PartWriteInfo{.intended_ref = ns.string() + "/dst",
                                                   .intended_namespace = ns, .op = Cas::ProvenanceOp::Other});
     const Cas::ManifestId rebuild_id = rebuild->stageManifest({inlineEntry("f", "same")});
-    EXPECT_NO_THROW(rebuild->precommitAdd(ns, "dst", rebuild_id));
+    expectThrowsCode(ErrorCodes::CORRUPTED_DATA, [&] { rebuild->precommitAdd(ns, "dst", rebuild_id); });
 }
 
 

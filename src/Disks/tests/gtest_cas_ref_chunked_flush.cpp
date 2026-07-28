@@ -347,16 +347,9 @@ TEST(RefWriterChunkedFlush, DropNamespaceOverOpCapSucceeds)
     auto store = openPool(backend);
     const uint64_t epoch = store->writerEpoch();
 
-    /// `allocateRefTxnId`'s sequence counter is POOL-WIDE (one counter per writer incarnation, shared
-    /// across every namespace it touches, `CasRefLedger.h:399`), not per-namespace, and starts fresh on
-    /// a virgin mount -- so the very first id it allocates, on ANY namespace, is `{epoch, 1}`. A snapshot
-    /// seeded directly at `{epoch, 1}` for `ns` would collide with that very first allocation once
-    /// `dropNamespace` (below) asks for a real id, since the same id can't be both the seeded
-    /// `greatest_applied` and the newly allocated one. Consume the first two allocations on an unrelated
-    /// throwaway namespace first, so `ns`'s seeded `greatest_applied` sits safely below whatever
-    /// `dropNamespace` allocates later.
-    publishEmptyPart(store, RootNamespace{"srv1/_seq_bump_for_dropns_over_cap"}, "bump");
-
+    /// Ids are PER-NAMESPACE and derived from the table's own `greatest_applied` (INV-1), so seeding
+    /// `ns` at `{epoch, 1}` is all this fixture has to do: the `dropNamespace` below derives `{epoch, 2}`
+    /// from the seeded snapshot, and no other namespace's traffic can move it.
     std::vector<RefCommittedRow> committed;
     committed.reserve(kTotalRefs);
     for (size_t i = 0; i < kTotalRefs; ++i)

@@ -486,6 +486,32 @@ HeartbeatFloor computeHeartbeatFloor(Backend & b, const Layout & l, uint64_t now
                                      uint64_t mono_now_ms, uint64_t stable_threshold_ms,
                                      MountObservationMap & obs);
 
+/// One `gc/server-roots/<srid>/mount` slot whose holder is not provably finished with the prefix.
+struct NonTerminalMountSlot
+{
+    String server_root_id;
+    /// What was read: the lease's identifying fields, or why the body could not be interpreted.
+    String detail;
+};
+
+/// Read-only scan of every mount slot under the pool prefix, answering ONE question: is some writer
+/// still entitled to this prefix? A slot counts as terminal on exactly the two clock-free certificates
+/// the mount protocol already recognises (`computeHeartbeatFloor`'s own classification): `gc_fenced`
+/// (the GC leader fenced that incarnation out, and a fence costs an epoch, so its keeper can never
+/// renew again) and `min_active == UINT64_MAX` (the holder's own graceful farewell). Everything else is
+/// reported, INCLUDING a body this build cannot decode -- an unreadable lease of some other format
+/// generation is precisely the case that must block, not the one to wave through.
+///
+/// Deliberately no wall-clock judgement: `expires_at_ms` alone never proves death (comparing another
+/// node's stamp against our clock is exactly what `claimMount` refuses to do), and this is not the
+/// place to run an observation window either -- the answer to "someone may still be writing here" is
+/// for the operator to stop that writer, not for us to wait it out.
+///
+/// The caller is pool RECREATION (`Pool::open`'s bootstrap over a prefix with no authoritative
+/// `_pool_meta`): minting a fresh pool identity while a live writer still holds a slot would leave that
+/// writer appending its old-format transactions into the new pool. Writes nothing.
+std::vector<NonTerminalMountSlot> probeNonTerminalMountSlots(Backend & b, const Layout & l);
+
 /// A read-only snapshot of one server's mount slot, for introspection (`system.content_addressed_mounts`).
 /// state: `live` (lease within TTL+skew), `expired` (lease ran out; the next GC round's heartbeat floor
 /// will fence it), `terminated` (clean farewell: `min_active == UINT64_MAX`), `fenced` (`gc_fenced`),

@@ -448,6 +448,23 @@ void RefTableState::applyTxnInPlace(const RefLogTxn & txn)
             txn.txn_id.writer_epoch, txn.txn_id.ref_sequence,
             greatest_applied.writer_epoch, greatest_applied.ref_sequence);
 
+    /// INV-1: within `(namespace, epoch)` the durable ids are DENSE, so the only admissible id is the
+    /// one `nextRefTxnId` derives -- the same rule the writer mints with. This is what turns "these are
+    /// the log ids I can see" into "this is the whole stream": a reader that finds `1..T` knows nothing
+    /// was lost, which no amount of strict-increase checking could tell it. Enforcing it HERE, on the
+    /// read side, is deliberate -- a hole cannot become durable even if some future writer path forgets
+    /// the rule, because every apply (writer candidate, recovery replay, GC's own fold) runs it.
+    ///
+    /// The strict-increase check above is not subsumed by this one: it rejects an id under an OLDER
+    /// epoch, whose sequence would still look like a legitimate fresh-epoch `1`.
+    if (const RefTxnId expected = nextRefTxnId(greatest_applied, txn.txn_id.writer_epoch); txn.txn_id != expected)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "RefTableState: txn_id {}-{} does not continue the ref-log stream — the greatest applied id "
+            "is {}-{}, so the only contiguous successor is {}-{}",
+            txn.txn_id.writer_epoch, txn.txn_id.ref_sequence,
+            greatest_applied.writer_epoch, greatest_applied.ref_sequence,
+            expected.writer_epoch, expected.ref_sequence);
+
     checkRemoveNamespaceOrdering(txn.ops);
 
     /// Apply every op, in array order, IN PLACE. A throw leaves `*this` PARTIALLY APPLIED ("poisoned").
@@ -464,6 +481,13 @@ void RefTableState::applyTxnInPlace(const RefLogTxn & txn)
     /// owned-manifest index are consistent -- the invariant this cross-check defends.
     debugAssertBodyCounters();
 #endif
+}
+
+RefTxnId nextRefTxnId(RefTxnId greatest_applied, uint64_t live_epoch)
+{
+    return greatest_applied.writer_epoch == live_epoch
+        ? RefTxnId{live_epoch, greatest_applied.ref_sequence + 1}
+        : RefTxnId{live_epoch, 1};
 }
 
 void applyRefLogTxn(RefTableState & state, const RefLogTxn & txn)

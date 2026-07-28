@@ -20,17 +20,23 @@ namespace DB::Cas
 /// pool but cannot decode its GC state. Pool admission CAS-raises `min_reader_generation` to this
 /// build's own floor (`G_BUILD`), and a persisted floor above `G_BUILD` fails closed.
 ///
-/// Generation 3 replaces mutable ref-shard objects with immutable `_log` and `_snap` objects. The
-/// per-object forward gate cannot reject an old pool whose version is still at most 3, so pool-meta
-/// decoding also applies `kRefSnapshotLogGeneration` as a backward floor. Pools below that floor
-/// contain refs this build cannot decode and must be recreated; there is no migration path in the
-/// pre-release format.
-constexpr uint32_t G_BUILD = 3;
+/// Generation 3 replaced mutable ref-shard objects with immutable `_log` and `_snap` objects.
+///
+/// Generation 4 makes each namespace's ref-log ids per-namespace and CONTIGUOUS within a writer epoch
+/// (INV-1). The bytes of a `_log`/`_snap` object did not change, but their MEANING did: a generation-3
+/// pool's ids were drawn from a pool-wide counter and are full of legitimate holes, which this build
+/// reads as a truncated -- i.e. corrupt -- stream. The per-object forward gate cannot reject such a
+/// pool (its version is not in the future), so pool-meta decoding applies
+/// `kContiguousRefStreamsGeneration` as a backward floor. Pools below the floor must be recreated;
+/// there is no migration path in the pre-release format.
+constexpr uint32_t G_BUILD = 4;
 
-/// The pool-format generation at which ref state became immutable snapshot+log objects. Pool metadata
-/// below this value cannot be opened because its refs use the removed mutable ref-shard format; the
-/// backward-floor check is applied by `decodePoolMeta`.
-constexpr uint32_t kRefSnapshotLogGeneration = 3;
+/// The pool-format generation at which ref-log ids became per-namespace and contiguous. Pool metadata
+/// below this value cannot be opened, because its ref streams carry holes this build reports as
+/// corruption; the backward-floor check is applied by `decodePoolMeta`. Named separately from `G_BUILD`
+/// so a later generation that CAN still read a generation-4 pool does not silently move the floor with
+/// it.
+constexpr uint32_t kContiguousRefStreamsGeneration = 4;
 
 /// Stable identifiers for every self-describing persisted object class. The text registry uses the
 /// corresponding `type` string as the on-disk identity. Numeric values are part of the format history:

@@ -68,7 +68,7 @@ std::vector<SourceEdgeRecord> decodeRun(const String & bytes)
 TEST(CasRecordStream, EmptyRunRoundTripsAndChecksumMatches)
 {
     const String bytes = encodeRun({});
-    EXPECT_EQ(bytes, "{\"type\":\"cas_run\",\"v\":3,\"kind\":\"source_edge\"}\n{\"n\":0}\n");
+    EXPECT_EQ(bytes, "{\"type\":\"cas_run\",\"v\":4,\"kind\":\"source_edge\"}\n{\"n\":0}\n");
 
     ReadBufferFromMemory in(bytes.data(), bytes.size());
     SourceEdgeRunReader reader(in);
@@ -224,7 +224,7 @@ TEST(CasRecordStream, HeaderGates)
     }
     /// Future version -> UNKNOWN_FORMAT_VERSION.
     {
-        const String s = "{\"type\":\"cas_run\",\"v\":4,\"kind\":\"source_edge\"}\n{\"n\":0}\n";
+        const String s = "{\"type\":\"cas_run\",\"v\":5,\"kind\":\"source_edge\"}\n{\"n\":0}\n";
         ReadBufferFromMemory in(s.data(), s.size());
         try
         {

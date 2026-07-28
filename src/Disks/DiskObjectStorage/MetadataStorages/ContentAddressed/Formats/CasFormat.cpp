@@ -21,14 +21,21 @@ namespace
 /// new generation as the floor. Existing entries are immutable history.
 constexpr FormatChangePoint BASELINE[] = {{1, 1}};
 
+/// The two ref classes changed at generation 4 (INV-1, per-namespace contiguous ids). The change is
+/// BREAKING even though not one byte of the encoding moved: a generation-3 stream's ids came from a
+/// pool-wide counter and legitimately skip, which a generation-4 reader reports as corruption. The
+/// floor is therefore the change generation itself.
+constexpr FormatChangePoint REF_STREAM[] = {{1, 1}, {kContiguousRefStreamsGeneration, kContiguousRefStreamsGeneration}};
+
 }
 
 std::span<const FormatChangePoint> changePoints(FormatId id)
 {
-    /// All classes currently share the generation-1 baseline. When a class evolves, give it a
-    /// class-specific static array and select it by `id` here.
     switch (id)
     {
+        case FormatId::RefLog:
+        case FormatId::RefSnapshot:
+            return REF_STREAM;
         case FormatId::Blob:
         case FormatId::GcState:
         case FormatId::PoolMeta:
@@ -40,8 +47,6 @@ std::span<const FormatChangePoint> changePoints(FormatId id)
         case FormatId::Owner:
         case FormatId::ServerEpoch:
         case FormatId::MountLease:
-        case FormatId::RefLog:
-        case FormatId::RefSnapshot:
         case FormatId::BlobMeta:
         case FormatId::GcHeartbeat:
             return BASELINE;

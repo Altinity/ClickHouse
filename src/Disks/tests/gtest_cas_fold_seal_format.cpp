@@ -34,7 +34,7 @@ TEST(CasFormatBattery, FoldSeal)
     runFormatBattery({FormatId::FoldSeal,
         [&] { return sealObject(FormatId::FoldSeal, encodeFoldSeal(seal)); },
         [](std::string_view s) { decodeFoldSeal(std::string(openObject(FormatId::FoldSeal, s))); },
-        "{\"type\":\"cas_fold_seal\",\"v\":3}\n"
+        "{\"type\":\"cas_fold_seal\",\"v\":4}\n"
         "{\"g\":\"5\",\"pg\":\"4\"}\n"
         "{\"k\":\"cov\",\"key\":\"ns1/0\",\"cls\":2,\"tt\":\"etag\",\"tv\":\"t-1\",\"lfe\":\"7\",\"lfs\":\"11\"}\n"
         "{\"k\":\"btr\",\"key\":\"r0\",\"ck\":\"0000000000000000000000000000000f\",\"shard\":0,\"gen\":\"5\"}\n"

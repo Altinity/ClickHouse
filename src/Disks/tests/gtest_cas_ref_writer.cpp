@@ -886,10 +886,18 @@ TEST(RefWriterAppendLane, WedgedRefLaneCountTracksExactlyTheWedgedTableThroughIt
 /// ===================================================================================
 
 /// Append-site CORRUPTED_DATA: the offending caller gets the error, the lane is NOT wedged (a proven
-/// different-object conflict is conclusive, not uncertain), and both a later SAME-table append and an
-/// independent-table append complete promptly -- proven by a bounded wait, so a hang fails the test
-/// instead of stalling it.
-TEST(RefWriterAppendLane, I1AppendCorruptionSurfacesAndLaneStaysUsable)
+/// different-object conflict is conclusive, not uncertain), and no caller HANGS -- the queue's leader
+/// bookkeeping is restored, proven by a bounded wait on both a same-table and an independent-table
+/// append.
+///
+/// What the two appends then DO differs, and the difference is INV-1. The foreign object is durable at
+/// this table's next id, and ids are derived from the table's own `greatest_applied`, so the same-table
+/// retry re-derives that very id and hits the same proven conflict -- it fails, promptly and loudly,
+/// rather than minting a higher id and appending past a hole in its own stream. (The table recovers the
+/// only way a corrupted log stream can: a fresh mount incarnation, whose new writer epoch starts a new
+/// key namespace.) The independent table shares nothing with it and is completely unaffected -- which is
+/// the other half of per-namespace ids.
+TEST(RefWriterAppendLane, I1AppendCorruptionSurfacesAndOnlyBlocksItsOwnTable)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend);
@@ -907,18 +915,19 @@ TEST(RefWriterAppendLane, I1AppendCorruptionSurfacesAndLaneStaysUsable)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { store->dropRef(ns, "x"); });
     EXPECT_FALSE(store->refLaneWedgedForTest(ns)) << "a proven different-object conflict must not wedge the lane";
 
-    /// The lane is usable, not hung: a later same-table append and an independent-table append both
-    /// complete within a bounded wait (a real cv hang would time out here rather than pass).
+    /// Not hung: the retry RETURNS within the bounded wait (a real cv hang would time out here) -- and
+    /// returns the same conclusive conflict, because the foreign object still occupies this table's next id.
     auto same = std::async(std::launch::async, [&] { store->dropRef(ns, "x"); });
     ASSERT_EQ(same.wait_for(std::chrono::seconds(10)), std::future_status::ready)
         << "the same-table append hung -- the queue's leader bookkeeping was not restored";
-    same.get();
-    EXPECT_FALSE(store->resolveRef(ns, "x").has_value());
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { same.get(); });
+    EXPECT_TRUE(store->resolveRef(ns, "x").has_value()) << "the refused drop must not have taken effect";
 
     auto indep = std::async(std::launch::async, [&] { store->dropRef(other, "z"); });
     ASSERT_EQ(indep.wait_for(std::chrono::seconds(10)), std::future_status::ready);
     indep.get();
-    EXPECT_FALSE(store->resolveRef(other, "z").has_value());
+    EXPECT_FALSE(store->resolveRef(other, "z").has_value())
+        << "an unrelated table's stream is independent and must be entirely unaffected";
 }
 
 /// Wedge-resolve-site foreign interference: a wedged lane whose key a foreign writer overwrote must
@@ -3398,9 +3407,10 @@ TEST(RefWriterRecoverySeal, SealPutThrowsMidFlightSecondParkedCallerDoesNotHang)
 /// the epoch was exactly 0, so the seal's dead epoch survived into the trial id and its `+= 1` shape
 /// probe wrapped `UINT64_MAX` to 0 -- `applyRefLogTxn` then rejected the wrapped id as not strictly
 /// greater than the seal, throwing `CORRUPTED_DATA` for every retry (an unbounded merge-retry loop in
-/// production). The REAL persisted id (`allocateRefTxnId`, always `liveWriterEpoch()`-based) was never
-/// affected -- the bug was confined to this preview. This test recovers a table from exactly such a
-/// seal and asserts an ordinary mutation afterwards commits instead of overflowing.
+/// production). The REAL persisted id was never affected -- the bug was confined to this preview.
+/// Both sides now derive every id, real and preview, through the one `nextRefTxnId` rule, whose epoch
+/// component is always the LIVE writer epoch -- so a dead epoch can no longer leak into either. This
+/// test recovers a table from exactly such a seal and asserts an ordinary mutation afterwards commits.
 TEST(RefWriterRecoverySeal, WriteAfterSealSelectedAsGreatestSnapshotCommits)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
