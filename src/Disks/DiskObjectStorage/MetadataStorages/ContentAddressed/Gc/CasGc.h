@@ -69,6 +69,12 @@ struct RebuildReport
     /// silently, so the hand-run disaster command REPORTS it rather than leaving it to a log line: on a
     /// pool that has ever completed a GC round, a 1 here means the enumeration lied.
     bool virgin_by_enumeration = false;
+    /// WHICH generation's fold seal this rebuild carried holds from; 0 when it carried none. The two
+    /// verdicts this command reaches about the pool's history are then both on its own row — whether a
+    /// baseline was found at all, and which one it was. Grepping that out of the logs is the thing an
+    /// operator should not have to do in the middle of a disaster, and it is also how a step-down past
+    /// a crashed newest generation becomes visible rather than invisible.
+    uint64_t adopted_seal_generation = 0;
 };
 
 /// Counters and diagnostics returned by one `runRegularRound`. These values describe work attempted or

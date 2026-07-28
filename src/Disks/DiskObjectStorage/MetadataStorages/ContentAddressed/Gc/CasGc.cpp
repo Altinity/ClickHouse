@@ -1033,7 +1033,7 @@ std::optional<std::pair<uint64_t, uint64_t>> Gc::newestFoldSealRef()
     /// NEWEST-ness would reopen the same hole one layer up: an enumeration that omits the true newest
     /// seal hands back an older one, and every hold detected since that older seal is silently lost --
     /// an under-carry, which is the failure this whole path exists to prevent.
-    uint64_t listed_max_generation = 0;
+    std::set<uint64_t> listed_generations;
     bool listed_anything = false;
     std::optional<std::pair<uint64_t, uint64_t>> newest;
     forEachListedKey(backend, top, [&](const ListedKey & k)
@@ -1052,12 +1052,32 @@ std::optional<std::pair<uint64_t, uint64_t>> Gc::newestFoldSealRef()
         {
             return;   /// foreign key shape under `gc/gen` is debris, not a generation number
         }
-        listed_max_generation = std::max(listed_max_generation, generation);
+        listed_generations.insert(generation);
     }, 1000, onGcEnumerationPage);
+    const uint64_t listed_max_generation = listed_generations.empty() ? 0 : *listed_generations.rbegin();
 
-    if (listed_max_generation > 0)
-        if (const auto listed = probeGenerationForSeal(listed_max_generation); listed.seal_attempt)
-            newest = std::make_pair(listed_max_generation, *listed.seal_attempt);
+    /// STEP DOWN THROUGH THE GENERATIONS THE LISTING ITSELF REPORTED until one carries a seal. The
+    /// newest generation routinely exists WITHOUT one: a round writes its runs during the reduce phase
+    /// and its fold seal only at phase 10/18, so an ordinary crash in between leaves exactly that
+    /// shape. Stopping at the maximum would then refuse a pool whose holds are sitting readable one
+    /// generation down -- turning a plain crash into "recreate the pool".
+    ///
+    /// Stepping down costs no trust that has not already been spent: these are the generations the wide
+    /// listing reported, and its maximum -- which the probes above are checking -- is one of them. What
+    /// is NOT weakened is the refusal above: a seal found ABOVE the maximum stays terminal, because
+    /// that is the listing being caught in a lie rather than merely being incomplete about seals.
+    ///
+    /// "Never step PAST an unreadable seal" falls out of returning the FIRST generation that carries
+    /// one: the caller decodes it and refuses if it cannot, so an undecodable seal ends the search
+    /// instead of being skipped over in favour of an older, readable one.
+    for (auto it = listed_generations.rbegin(); it != listed_generations.rend(); ++it)
+    {
+        if (const auto probe = probeGenerationForSeal(*it); probe.seal_attempt)
+        {
+            newest = std::make_pair(*it, *probe.seal_attempt);
+            break;
+        }
+    }
 
     /// DETECTION, NOT PROOF -- and labelled as such deliberately, in the same spirit as probe A. Two
     /// NARROW single-generation probes above the wide listing's maximum ask whether that maximum was a
@@ -3184,6 +3204,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
                     if (!backend.head(r.key).exists)
                         healthy = false;
                 prior_seal = std::move(seal);
+                rep.adopted_seal_generation = st.snap_generation;
             }
         }
 
@@ -3238,6 +3259,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
                         "must be recreated.",
                         newest->first, newest->second);
                 prior_seal = std::move(seal);
+                rep.adopted_seal_generation = newest->first;
             }
             /// else: no fold seal object anywhere. That is the ONE proof that dropping nothing is safe
             /// -- a pool that never sealed a baseline has no hold to lose.

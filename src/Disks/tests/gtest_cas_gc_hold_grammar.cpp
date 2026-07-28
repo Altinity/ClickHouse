@@ -720,6 +720,18 @@ TEST(CasGcHoldGrammar, HoldClearsOnlyByFoldingThroughTheOffendingPosition)
 namespace
 {
 
+/// Rewrite the fold seal at an EXACT `(generation, attempt)`, applying `mutate` to it. Needed where
+/// the seal under test is not the adopted one — a step-down test plants its hold in a generation the
+/// pool has already moved past.
+void mutateSealAt(Backend & backend, const Layout & layout, uint64_t generation, uint64_t attempt,
+                  const std::function<void(CasFoldSeal &)> & mutate)
+{
+    const String key = layout.foldSealKey(generation, attempt);
+    CasFoldSeal seal = decodeFoldSeal(backend.get(key)->bytes);
+    mutate(seal);
+    backend.putOverwrite(key, encodeFoldSeal(seal), backend.head(key).token);
+}
+
 /// Rewrite the adopted fold seal, applying `mutate` to it. Used to plant a hold that the rebuild must
 /// then carry: planting it directly (rather than by holding a real round) keeps the REBUILD tests about
 /// the carry, not about how the hold arose.
@@ -786,6 +798,71 @@ TEST(CasGcHoldGrammar, RebuildCarriesEveryHoldVerbatim)
     ASSERT_TRUE(vanished->second.hold.has_value());
     EXPECT_EQ(vanished->second.hold->offending_position, (RefTxnId{2, 3}));
     EXPECT_EQ(vanished->second.last_folded_ref_id, (RefTxnId{2, 2})) << "its cursor rides with it";
+}
+
+/// AN ORDINARY CRASH IS NOT A CORRUPT POOL. A round writes its runs during the reduce phase and its
+/// fold seal only at phase 10/18, so a crash in between leaves the newest generation existing WITHOUT
+/// a seal — the commonest shape there is. If discovery stopped at the listing's maximum it would find
+/// no seal there, conclude it could enumerate nothing, and refuse — telling the operator to recreate a
+/// pool whose holds are sitting readable one generation down.
+///
+/// So discovery steps DOWN through the generations the listing itself reported until one carries a
+/// seal. That spends no trust the maximum had not already been given. What it does NOT weaken is the
+/// refusal above the maximum: that one stays terminal, because a seal found there is the listing
+/// caught lying, not merely being incomplete about seals.
+TEST(CasGcHoldGrammar, RebuildStepsDownPastACrashedNewestGenerationToTheSealBelowIt)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/aa@cas@"};
+
+    publishAt(*backend, layout, ns, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(1), /*birth=*/true);
+    Gc gc(store, kGc);
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+    const GcState after_first = decodeGcState(backend->get(layout.gcStateKey())->bytes);
+    const uint64_t older_generation = after_first.snap_generation;
+    const uint64_t older_attempt = after_first.snap_attempt;
+
+    publishAt(*backend, layout, ns, RefTxnId{1, 2}, "ref_2", 2, DB::UInt128(2));
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+    const GcState after_second = decodeGcState(backend->get(layout.gcStateKey())->bytes);
+    ASSERT_GT(after_second.snap_generation, older_generation) << "the fixture needs two generations";
+
+    /// The older generation is the one holding the pool's durable hold.
+    mutateSealAt(*backend, layout, older_generation, older_attempt, [&](CasFoldSeal & seal)
+    {
+        ShardCoverage & cov = seal.per_ns_shard[cursorKeyForTest(ns, 0)];
+        cov.classification = 4;
+        cov.hold = plantedHold();
+    });
+
+    /// THE CRASH: the newest generation's run objects are there, its seal never got written. Then
+    /// `gc/state` is lost, which is this path's whole premise.
+    const String newest_seal = layout.foldSealKey(after_second.snap_generation, after_second.snap_attempt);
+    const HeadResult seal_head = backend->head(newest_seal);
+    ASSERT_TRUE(seal_head.exists);
+    ASSERT_EQ(backend->deleteExact(newest_seal, seal_head.token).kind, DeleteOutcome::Kind::Deleted);
+    ASSERT_TRUE(backend->list(layout.gcGenPrefix(after_second.snap_generation), "", 1).keys.size() > 0)
+        << "the crashed generation must still hold objects, or it is not the shape being modelled";
+    const HeadResult sh = backend->head(layout.gcStateKey());
+    ASSERT_EQ(backend->deleteExact(layout.gcStateKey(), sh.token).kind, DeleteOutcome::Kind::Deleted);
+
+    Gc gc2(store, hexToU128("0000000000000000000000000000000c"));
+    const RebuildReport rep = gc2.rebuildBaseline(/*force=*/false);
+    ASSERT_TRUE(rep.performed) << rep.refusal;
+    EXPECT_FALSE(rep.virgin_by_enumeration) << "a pool with a readable seal is not virgin";
+    EXPECT_EQ(rep.adopted_seal_generation, older_generation)
+        << "the report must name WHICH generation the holds came from, so a step-down is visible";
+
+    const auto rebuilt = newestSeal(*backend, layout);
+    ASSERT_TRUE(rebuilt.has_value());
+    const auto it = rebuilt->per_ns_shard.find(cursorKeyForTest(ns, 0));
+    ASSERT_NE(it, rebuilt->per_ns_shard.end());
+    ASSERT_TRUE(it->second.hold.has_value())
+        << "a crash between the run writes and the seal write turned into 'recreate the pool', and the "
+           "hold readable one generation down was thrown away with it";
+    EXPECT_EQ(*it->second.hold, plantedHold());
 }
 
 /// With no readable prior seal there is nothing to carry, and the holds it may have contained are
