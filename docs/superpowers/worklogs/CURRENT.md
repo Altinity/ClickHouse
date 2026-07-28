@@ -1531,3 +1531,7 @@ flight on lane G. No push.
 **2026-07-28 21:4x local** — task 4 wrap-up in (both build classes green; ASan surfaced a
 pre-existing keeper-thread LOGICAL_ERROR abort — env-reachable, mini-fix mandated to a4).
 T8 red phase on lane G continues. No push.
+
+**2026-07-28 21:40 local watchdog** — L: minifix mid-cycle (build19 done, gate11 running);
+G: T8 COMMITTED (`950d2de9276`) with post-commit style+build checks running, DONE message
+pending. No push.
