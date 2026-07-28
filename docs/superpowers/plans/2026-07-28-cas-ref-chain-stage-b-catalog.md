@@ -105,7 +105,8 @@ static_assert(!HasNamespaceOnlyRefLogKey<Layout>);
   mechanical, compiler-driven; in Stage B Task 1 the incarnation VALUE everywhere is a
   placeholder constant from the not-yet-landed catalog: introduce
   `RefNamespaceId::stageATransition()` (a named constant incarnation) used ONLY by this task's
-  plumbing and DELETED by Task 4 (grep-clean gate in Task 4's steps).
+  plumbing; it is DELETED by Task 6 (after the reader replumb), with the tree-wide zero-grep
+  gate in Task 6's steps [codex r3 finding 1].
 - [ ] **Step 4:** Full CA gate green. **Step 5: Commit**
   `ca: ref — RefNamespaceId{ns, incarnation}; namespace-only key helpers deleted`.
 
@@ -150,9 +151,12 @@ struct RefCatalog                          /// one object, key `cas/ref_catalog`
 - [ ] **Step 1: Failing tests**: codec round-trip all three states; strict rejections
   (duplicate ns; `creator` present on `Live`; `creator` absent on `Creating`; zero incarnation;
   non-canonical order; name over byte bound); token-CAS create/update/conflict-retry over
-  InMemoryBackend; admission refused exactly AT the additive-predicate boundary and accepted
-  one entry below (boundary + boundary-plus-one — Constraint 7); removal (`Live→Removing` CAS)
-  succeeds at a full catalog (never refused).
+  InMemoryBackend; PER-PREDICATE boundary tests [codex r3 finding 9]: predicate (1)
+  `encoded_catalog_bytes <= catalog_object_cap` accepted at EXACT equality and refused at
+  cap + 1 while predicate (2) holds slack, and predicate (2)
+  `fold_fixed_bytes + Σ reservation <= fold_seal_object_cap` accepted at equality / refused at
+  cap + 1 while (1) holds slack — each refusal message asserts the NAMED failing predicate;
+  removal (`Live→Removing` CAS) succeeds at a full catalog (never refused).
 - [ ] **Step 2:** Run → FAIL. **Step 3:** Implement. **Step 4:** Full CA gate green.
 - [ ] **Step 5: Commit** `ca: ref — ref_catalog object: states, incarnations, additive capacity admission`.
 
@@ -181,17 +185,18 @@ struct RefCatalog                          /// one object, key `cas/ref_catalog`
   (generation-only; Stage A Task 6 owns it). The CATALOG-ENTRY TOKEN is a SEPARATE credential:
   the `ZombieGoLive` guard at `Creating → Live` combines the creator's admission GENERATION
   with the OBSERVED entry token — two credentials at one site, not a third member of the trio.
-  Tests here: fence bump between `_ckpt` create and the `Creating → Live` CAS → refused by
-  generation; entry token changed under the creator (concurrent reconciliation) → refused by
-  token; both stale → refused (first check wins, either order acceptable).
+  Tests here (the catalog site's OWN three cases, not the Stage-A trio [codex r3 finding 7]):
+  generation-stale (fence bump between `_ckpt` create and the `Creating → Live` CAS) → refused
+  by generation; token-stale (entry token changed under the creator by concurrent
+  reconciliation) → refused by token; both-stale → refused (first check wins, either order
+  acceptable).
 
 - [ ] **Step 1: Failing tests**: happy path (3 writes, entry Live, `_ckpt` exists, incarnation
   stable across the sequence); crash after write 1 → reconciliation by a NEW actor refused
   while creator fence is live, succeeds token-exactly after fence terminal; stale token at
   reconciliation → fail closed; publication attempted while `Creating` → refused;
   fenced-out between `_ckpt` create and the `Creating→Live` CAS → the CAS refuses (the
-  zombie-install C++ twin — `CaRefCatalogCore` `ZombieGoLive` red); the three
-  fence-bump-between-sites tests.
+  zombie-install C++ twin — `CaRefCatalogCore` `ZombieGoLive` red).
 - [ ] **Step 2:** → FAIL. **Step 3:** Implement. **Step 4:** CA gate green.
 - [ ] **Step 5: Commit** `ca: ref — namespace creation lifecycle; token-exact reconciliation; three-site recheck`.
 
@@ -217,11 +222,11 @@ struct RefCatalog                          /// one object, key `cas/ref_catalog`
   `RefNamespaceId::stageATransition()` remains for the READER paths until Task 6 replumbs them
   — ITS deletion and the tree-wide zero-grep gate move to Task 6 [codex r2 finding 1].
 
-- [ ] **Step 1: Failing tests**: fold discovers a namespace with ZERO listable objects (hint
-  fully blind) via the catalog and probes its frontier — the Stage-A residual test from
-  `gtest_cas_list_liar_end_to_end.cpp` FLIPS from "documented gap" to "covered" (edit that test
-  — the one intentional Stage-B edit of a Stage-A test, called out here so the reviewer expects
-  it); a `Creating` entry is NOT folded, NOT frontier-required (no publication can exist);
+- [ ] **Step 1: Failing tests**: a NEW test in `gtest_cas_universe_from_catalog.cpp` — fold
+  discovers a namespace with ZERO listable objects (hint fully blind) via the catalog and
+  probes its frontier (this does NOT touch the Stage-A liar test: the ONLY edit of
+  `gtest_cas_list_liar_end_to_end.cpp` in Stage B belongs to Task 7b [codex r3 NEW-1]);
+  a `Creating` entry is NOT folded, NOT frontier-required (no publication can exist);
   a `Removing` entry IS frontier-required; keys of a dead incarnation are refused by parsers
   (foreign-prefix inertness — the fold works only off catalog entries); old-format pool open →
   fail closed naming recreation (bump B).
@@ -299,6 +304,9 @@ struct RefCatalog                          /// one object, key `cas/ref_catalog`
   requests (op-count assert); entry token changed between plan and the FIRST delete → nothing
   deleted; token changed BETWEEN two keys of one cleanup pass → the first key's delete lands,
   the second is refused (the per-key revalidation race — codex finding 14).
+- [ ] **Step 1b: Retire the transition constant** [codex r3 finding 1]: with the reader paths
+  replumbed to handles, DELETE `RefNamespaceId::stageATransition()`; gate: a tree-wide grep
+  for `stageATransition` returns zero build-input hits (recorded in the report).
 - [ ] **Step 2:** → FAIL. **Step 3:** Implement. **Step 4:** CA gate green.
 - [ ] **Step 5: Commit** `ca: ref — read-side contract: handle-scoped reads, pre-delete life revalidation`.
 

@@ -139,8 +139,16 @@ SEQUENTIALLY (never two implementers in one worktree).
 - Produces (verbatim names later tasks use):
   - `RefOpKind::EpochSeal = 5`
   - txn-meta field `std::optional<RefTxnId> prev_epoch_seal;` on the decoded txn struct
-  - helpers `bool refLogTxnIsEpochSeal(const RefLogTxn &)` and the grammar validator
-    `void validateEpochSealGrammar(const RefLogTxn &)` (throws `CORRUPTED_DATA`)
+  - helpers `bool refLogTxnIsEpochSeal(const RefLogTxn &)` and the grammar validators, SPLIT
+    by what context they need [codex r3 finding 2]:
+    `void validateEpochSealGrammarStructural(const RefLogTxn &)` — the context-free rules
+    (exactly-one-op seal txn; `prev_epoch_seal` well-formed and at sequence 1 only), called by
+    BOTH `encodeRefLogTxn` and the decode path (`readOpRecord` finalization);
+    `void validateEpochSealGrammarContextual(const RefLogTxn &, uint64_t life_epoch)` — the
+    required-iff rule (`prev_epoch_seal` present iff `writer_epoch > life_epoch`), called where
+    `life_epoch` is KNOWN: the apply layer (`CasRefProtocol` — Task 3 wires it) and the two
+    encode call sites (`commitRefChunk` Task 4, recovery sealer Task 6). The codec itself never
+    sees `life_epoch` — its callers own the contextual check. Both throw `CORRUPTED_DATA`.
 
 Grammar (spec INV-2, with the genesis contract made explicit — codex r2 finding 2): "genesis"
 is PER-NAMESPACE — the namespace's `life_epoch` (the writer epoch of its `NamespaceBirth`
@@ -665,9 +673,13 @@ codex finding 1's cross-namespace scenario verbatim); gtests reach the per-names
 test seam (`GcTestHooks::force_universe_authoritative`) that constructs CLOSED universes — and
 the seam is PRODUCTION-UNREACHABLE [codex r2 finding 1]: `GcTestHooks` is declared in a
 test-only header compiled solely into `unit_tests_dbms` (no production translation unit
-includes it), and the production read of the constant is a bare `constexpr bool` with NO
-runtime override path — flipping it in production is a Stage-B source change (the dedicated
-enablement task), not a configuration.
+includes it), and the injection is a PARAMETER, not an override [codex r3 finding 1 — a test-only header cannot
+override a `constexpr` compiled into production code]: the destructive-gate computation takes
+`UniversePolicy policy = UniversePolicy::kDefault` where `kDefault` is `StageA_Suppressed`
+(this stage) and the enum's only other value `AuthoritativeForTest` is passed EXPLICITLY by
+gtests at the fold-entry call; the single production call site passes nothing. No config, no
+env, no runtime flag reads the policy — Stage B's Task 7b changes `kDefault` itself (a source
+change), which is the entire flip.
 **Destructive-site inventory is a STEP, not an assumption** [codex finding 6]: before wiring,
 run a tree-wide inventory of every `deleteExact`/`deletePrefixWholesale`/delete-marker call
 reachable from GC and list each with its gate status in the task report — the known un-gated
