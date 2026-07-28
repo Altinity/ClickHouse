@@ -1591,3 +1591,7 @@ final verification. T5 designing on lane L. No push.
 **2026-07-28 23:4x local** — T8: polish + BACKLOG landed; round-3 (step-down) nudged after a
 message crossing. Near-miss: lane agent's relative-path edit briefly touched master's BACKLOG
 (caught pre-commit, reverted; absolute-paths lesson added to dispatch boilerplate). No push.
+
+**2026-07-29 00:0x local** — T8 round 3 in closing confirmation (step-down landed with the
+lying-vs-incomplete distinction; both RebuildReport verdict fields on the command row). T5
+coding on lane L. No push.
