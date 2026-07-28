@@ -44,6 +44,7 @@ class ClickHouseProc:
     MINIO_LOG = f"{temp_dir}/minio.log"
     AZURITE_LOG = f"{temp_dir}/azurite.log"
     KAFKA_LOG = f"{temp_dir}/kafka.log"
+    RUSTFS_LOG = f"{temp_dir}/rustfs.log"
     LOGS_SAVER_CLIENT_OPTIONS = "--max_memory_usage 10G --max_threads 1 --max_rows_to_read=0 --max_result_rows 0 --max_result_bytes 0 --max_bytes_to_read 0 --max_execution_time 0 --max_execution_time_leaf 0 --max_estimated_execution_time 0"
     DMESG_LOG = f"{temp_dir}/dmesg.log"
     # TODO: run servers in  dedicated wds to keep trash localised
@@ -212,12 +213,20 @@ class ClickHouseProc:
         # Client GET/PUT/LIST/DELETE do not depend on either service, so disabling them is safe.
         # Env names: RUSTFS_SCANNER_ENABLED/RUSTFS_HEAL_ENABLED (the RUSTFS_ENABLE_* forms are
         # deprecated in 1.0.0-beta.8).
+        # Raise the open-files limit before launching, exactly as start_azurite does and for the
+        # same reason: the server under parallel load holds thousands of S3 connections (observed
+        # 10k+ active Disk-group sessions on the sanitizer CA lanes), and with the default soft
+        # limit (1024) rustfs runs out of fds and refuses new TCP connections in bursts. On the
+        # msan CA-s3 lane those bursts (`Connection refused`, e.code() = 111) recurred for the
+        # whole run, and the one that overlapped the mount-lease renewal window tripped the mount
+        # fence and failed every writing test for minutes.
         command = (
+            "(ulimit -n 1048576 2>/dev/null || ulimit -n $(ulimit -Hn)) && "
             f"RUSTFS_SCANNER_ENABLED=false RUSTFS_HEAL_ENABLED=false "
             f"{rustfs_bin} server --address 0.0.0.0:11121 "
             f"--access-key clickhouse --secret-key clickhouse {data_dir}"
         )
-        with open(f"{temp_dir}/rustfs.log", "w") as log_file:
+        with open(self.RUSTFS_LOG, "w") as log_file:
             self.rustfs_proc = subprocess.Popen(
                 command, stdout=log_file, stderr=subprocess.STDOUT, shell=True
             )
@@ -1014,6 +1023,8 @@ fi
                     res.append(self.AZURITE_LOG)
                 if Path(self.KAFKA_LOG).exists():
                     res.append(self.KAFKA_LOG)
+                if Path(self.RUSTFS_LOG).exists():
+                    res.append(self.RUSTFS_LOG)
                 if Path(self.DMESG_LOG).exists():
                     res.append(self.DMESG_LOG)
                 if Path(self.CH_LOCAL_ERR_LOG).exists():
