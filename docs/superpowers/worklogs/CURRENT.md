@@ -1535,3 +1535,7 @@ T8 red phase on lane G continues. No push.
 **2026-07-28 21:40 local watchdog** — L: minifix mid-cycle (build19 done, gate11 running);
 G: T8 COMMITTED (`950d2de9276`) with post-commit style+build checks running, DONE message
 pending. No push.
+
+**2026-07-28 21:5x local** — T8 DONE (both rulings issued: no-release-on-absent = spec letter;
+sticky suppression intended, stage-B soak obligation + operator-story BACKLOG candidate).
+T8 reviewer dispatched (same lane reviewer, warm T7 context). L minifix still cycling. No push.
