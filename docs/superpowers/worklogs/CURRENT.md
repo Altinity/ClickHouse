@@ -1614,3 +1614,8 @@ T9 in design (no logs yet); T5 reviewer reading. No push.
 **2026-07-28 23:4x local** — COMBINED GATE после мерджа T8: **1486/1486** (1460 + 26 lane-G,
 арифметика сходится). Main tree = tasks 0-5,7,8 merged and green. T5 wrap round (commit strays)
 in flight; T9 implementing. No push.
+
+**2026-07-29 01:1x local** — T5 CLOSED (4 commits, final 1490/1490; all wrap items verified
+against committed diffs — the message crossing resolved itself, work was already done). T6
+(recovery CAS-walk, heaviest of the stage, 11-obligation dispatch) launched on lane L. T9
+implementing on lane G. 8 of 15 stage-A tasks closed. No push.
