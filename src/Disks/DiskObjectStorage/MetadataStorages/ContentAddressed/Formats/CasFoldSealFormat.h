@@ -33,6 +33,11 @@ struct RunRef
 /// fold can name exactly, so an operator reading a seal learns what stopped the namespace without
 /// correlating logs. Persisted as a word, so an unknown word is `CORRUPTED_DATA` rather than a silently
 /// reinterpreted integer.
+///
+/// THESE ARE WIRE VALUES, AND THEY ARE APPEND-ONLY. A durable seal written by one build is read by
+/// another, so a renumbered value or a reused word makes an older seal describe a hold that is not the
+/// one it recorded — and a hold's whole job is to say truthfully what stopped a namespace and where.
+/// Add new reasons at the end; never renumber, never repurpose a retired word.
 enum class HoldReason : uint8_t
 {
     GapBelowWitness = 1,        /// 404 at the expected id with a durable witness above it, same epoch
