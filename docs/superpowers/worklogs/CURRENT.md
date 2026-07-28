@@ -1504,3 +1504,8 @@ review in flight. No push.
 **2026-07-28 21:0x local** — lane G review: approved w/ 2 Important (seal-kind check at crossing;
 soak B1 detector killed by rename) — fix round dispatched. Lane L: follow-up commit awaited
 (rulings + self-review). No push.
+
+**2026-07-28 21:2x local** — lane L: rulings follow-up in (abandon guard red-verified; gate
+1419/1419; x25 no-flake) but the 8-finding diff review had not reached the agent — relayed as
+follow-up-2 mandate (OOM-laundering + seal 3-way + self-pointer brick top). Reviewer still held.
+Lane G fix round in progress. No push.
