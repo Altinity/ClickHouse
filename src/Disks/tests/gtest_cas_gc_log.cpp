@@ -414,7 +414,7 @@ TEST(CasGcLog, FoldingRoundEmitsEveryPhaseInOrder)
     /// Probe B1's identity, as an OBSERVABLE property of the table rather than an assumption in a
     /// comment: the round sealed coverage over exactly the logs it folded.
     const auto intake = metricsOf(rows, 0, "fold_ref_intake");
-    EXPECT_EQ(intake.at("logs_intended"), intake.at("logs_applied"));
+    EXPECT_EQ(intake.at("logs_accounted"), intake.at("logs_applied"));
     EXPECT_GT(intake.at("logs_applied"), 0u);
     EXPECT_GT(intake.at("deltas_emitted"), 0u);
 
