@@ -1181,3 +1181,7 @@ expected (reading phase). No codex, no TLC running. Nothing wedged, nothing to a
 **2026-07-28 02:5x UTC watchdog** — TLA task 1 landed green (`4eaada34f5a`, 12/12 configs, flip
 proven by identical state counts + `_sab_noseal` control); reviewer (opus) in flight on the 110 KB
 package, no output yet — expected. No TLC/codex processes, nothing wedged. No push.
+
+**2026-07-28 03:1x UTC watchdog** — TLA task 1 fix round 1 in flight: reviewer verdict (spec OK,
+3 Important) dispatched to the implementer; TLC harness re-ran 02:55-02:57, report appended 03:00,
+commit not yet landed — active, not wedged. No codex. No push.
