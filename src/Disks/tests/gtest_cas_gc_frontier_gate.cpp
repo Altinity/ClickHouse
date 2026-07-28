@@ -396,6 +396,130 @@ TEST(CasGcFrontierGate, ASuppressedRoundDoesNotAdvanceTheGenerationPruneCursor)
         << "the retention cursor is a high-water mark; it may not pass a generation nothing deleted";
 }
 
+/// THE HAND-OFF RECLAIM, WHICH THE INVENTORY TEST ABOVE CANNOT REACH. This site only fires for a
+/// generation the wholesale prune SKIPPED while a live ref still pinned it (so the retention cursor
+/// moved past it and will never revisit it) and which a later round's ref then moves off. Building that
+/// takes a deliberately idle shard and a retention cursor driven past it, which is why it gets its own
+/// test rather than riding on the inventory pool.
+///
+/// It is reachable under suppression precisely because FOLDING still happens on a suppressed round: the
+/// ref moves off the old generation exactly as it would otherwise, and only the reclaim is withheld.
+TEST(CasGcFrontierGate, TheHandOffReclaimIsInertUnderSuppression)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = Pool::open(backend,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "test",
+                   .gc_snap_generations_to_keep = 1, .gc_fold_max_defer_rounds = 0});
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/aa@cas@"};
+
+    const ManifestRef r1 = publish(*backend, layout, ns, "tbl", 1, DB::UInt128(0xa1));
+
+    Gc gc(store, kGc);
+    runAuthoritativeRound(gc);
+    store->renewWatermarkOnce();
+    const uint64_t old_gen = decodeGcState(backend->get(layout.gcStateKey())->bytes).snap_generation;
+    const String old_prefix = layout.gcGenPrefix(old_gen);
+    ASSERT_FALSE(backend->list(old_prefix, "", 1000).keys.empty());
+
+    /// Idle-carry the ref until the retention cursor is strictly PAST its generation. Until then an
+    /// ordinary prune could still reclaim it and the hand-off would not be the load-bearing path.
+    for (int i = 0; i < 6; ++i)
+    {
+        runAuthoritativeRound(gc);
+        store->renewWatermarkOnce();
+    }
+    ASSERT_GT(decodeGcState(backend->get(layout.gcStateKey())->bytes).snap_pruned_through, old_gen)
+        << "the generation must be behind the retention cursor before the hand-off is exercised";
+    ASSERT_FALSE(backend->list(old_prefix, "", 1000).keys.empty())
+        << "and still retained, because a live ref pins it";
+
+    /// A real delta moves the shard's run off the old generation. This is the round the hand-off would
+    /// reclaim it on -- and it runs on the production default.
+    const ManifestRef r2{.writer_epoch = 1, .build_sequence = 2, .manifest_ordinal = 1};
+    writeBlobBody(*backend, layout, DB::UInt128(0xb2));
+    writeManifestRaw(*backend, layout, ns, r2, {blobEntryFor("data.bin", DB::UInt128(0xb2))});
+    publishCommittedTransition(*backend, layout, ns, "tbl", r1, r2);
+
+    backend->resetCounts();
+    gc.runRegularRound();
+
+    EXPECT_EQ(backend->deleteCountForKeysContaining("/gc/gen/"), 0u)
+        << "a suppressed round hands nothing off. Deleted:" << deletedKeysMessage(*backend);
+    EXPECT_FALSE(backend->list(old_prefix, "", 1000).keys.empty())
+        << "the superseded generation's prefix survives a suppressed round intact";
+
+    /// AND THE OPPORTUNITY IS CONSUMED, NOT DEFERRED -- the one place in this task where the gate
+    /// costs something permanent, so it is asserted here rather than left to be discovered later.
+    ///
+    /// The hand-off is a one-shot DIFFERENCE: it compares the PARENT seal's runs against the new
+    /// seal's, and the suppressed round above already folded the delta, so the next round's parent
+    /// seal no longer mentions the old generation. Nothing revisits it -- the retention cursor is
+    /// already past it and the prune never goes back. The prefix is left to `fsck`, which is exactly
+    /// the outcome the site's own doc comment already records for a crash in the same window ("the
+    /// cursor already advanced, so a plain retry will NOT re-attempt it; fsck is the backstop").
+    /// Bounded (one small run per shard per occurrence) and not a correctness problem -- but in
+    /// Stage A every round is suppressed, so every such transition leaks rather than one in a crash.
+    ///
+    /// The hand-off itself is not going untested: `CasGcRetention.HandOffDeletesSupersededRef` drives
+    /// the same transition on an authoritative round and asserts the prefix IS reclaimed.
+    runAuthoritativeRound(gc);
+    EXPECT_FALSE(backend->list(old_prefix, "", 1000).keys.empty())
+        << "the hand-off is a one-shot difference: the suppressed round consumed it, so the prefix is "
+           "now fsck's problem rather than a later round's";
+}
+
+/// THE ORPHAN-MANIFEST SWEEP, which the inventory pool above also cannot reach: it only deletes bodies
+/// that no ref names AND whose build is provably dead by the durable watermark floor, so it needs a
+/// pool seeded with exactly that -- orphan bodies and a floor above them.
+///
+/// It is gated with its CURSOR, not just its deletes. The cursor paces a cold-prefix enumeration and
+/// nothing revisits a range it passed, so advancing it on a round that swept nothing would silently
+/// skip that range forever. A suppressed round therefore declines the whole pass.
+TEST(CasGcFrontierGate, TheOrphanManifestSweepAndItsCursorAreInertUnderSuppression)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = Pool::open(backend,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "gc-runner",
+                   .manifest_sweep_list_budget_keys = 1, .manifest_sweep_delete_budget_keys = 1,
+                   .gc_fold_max_defer_rounds = 0});
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"test/aa@cas@"};
+
+    /// Two manifest bodies no ref ever named, under a build the durable floor has already passed.
+    const ManifestRef r1{.writer_epoch = 5, .build_sequence = 0xCA01, .manifest_ordinal = 1};
+    const ManifestRef r2{.writer_epoch = 5, .build_sequence = 0xCA02, .manifest_ordinal = 1};
+    writeManifestRaw(*backend, layout, ns, r1, {blobEntryFor("a", DB::UInt128(0xa1))});
+    writeManifestRaw(*backend, layout, ns, r2, {blobEntryFor("b", DB::UInt128(0xb2))});
+    setWatermarkMinActive(*backend, layout, "test", r1.writer_epoch, /*min_active*/ 0xCA03);
+
+    Gc gc(store, kGc);
+    backend->resetCounts();
+    for (int i = 0; i < 4; ++i)
+    {
+        gc.runRegularRound();
+        store->renewWatermarkOnce();
+    }
+
+    EXPECT_EQ(backend->deleteCountForKeysContaining("/cas/manifests/"), 0u)
+        << "a suppressed round sweeps nothing. Deleted:" << deletedKeysMessage(*backend);
+    EXPECT_TRUE(backend->head(layout.manifestKey(ManifestId{ns, r1})).exists);
+    EXPECT_TRUE(backend->head(layout.manifestKey(ManifestId{ns, r2})).exists);
+    EXPECT_TRUE(decodeGcState(backend->get(layout.gcStateKey())->bytes).manifest_sweep_cursor.empty())
+        << "the sweep cursor must not advance over a range the round declined to sweep -- nothing "
+           "revisits it";
+
+    /// The control: the same orphans ARE swept once the universe is authoritative.
+    for (int i = 0; i < 4; ++i)
+    {
+        runAuthoritativeRound(gc);
+        store->renewWatermarkOnce();
+    }
+    EXPECT_FALSE(backend->head(layout.manifestKey(ManifestId{ns, r1})).exists);
+    EXPECT_FALSE(backend->head(layout.manifestKey(ManifestId{ns, r2})).exists);
+}
+
+
 /// ===================== QUIET NAMESPACES AND THE PROBE BUDGET =====================
 
 /// A namespace the hint has stopped mentioning but whose cursor the seal still carries costs exactly
