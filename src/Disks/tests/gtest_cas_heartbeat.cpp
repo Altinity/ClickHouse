@@ -5,6 +5,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
+#include <base/scope_guard.h>
 
 #include <atomic>
 #include <limits>
@@ -199,7 +200,21 @@ TEST(CasHeartbeat, SupersededTouchIsFailClosedNotFatal)
 /// A FOREIGN uuid on our mount slot cannot arise from any protocol interleaving (the owner anchor
 /// refuses foreign claims at open; decommission impersonates the victim uuid). It stays a genuine
 /// invariant violation: loud, aborting in debug/ASan builds.
-TEST(CasHeartbeat, ForeignUuidTouchStillDies)
+/// A foreign server holding our mount slot must FAIL CLOSED — and must not take the process with it.
+///
+/// This test used to be `ForeignUuidTouchStillDies`, an `EXPECT_DEATH` that pinned the abort. The abort
+/// was the defect: the arm raised `LOGICAL_ERROR`, which aborts at CONSTRUCTION in debug/ASan builds,
+/// and it does so on the keeper's BACKGROUND thread — so an environment-reachable condition (clear the
+/// prefix, recreate under a different server id, and the survivor's next renewal lands there; see
+/// `CasRefContiguousAlloc.SurvivingWriterIsFencedByTheRecreatedPoolsMount`, which drives exactly that)
+/// took the whole server down, and took the ASan gate down with it.
+///
+/// What must NOT change is the outcome, which is what this test now pins: `renewOnce` throws, the throw
+/// carries the foreign holder's identity, and it is classified `ABORTED` — the same mount-lost class the
+/// sibling fencing arms use, which the background loop turns into a latched write fence. The
+/// `abort_on_logical_error` arming is deliberately kept: with it ON, a `LOGICAL_ERROR` would still abort,
+/// so reaching the `EXPECT_THROW` at all is the proof that this condition is no longer classified as one.
+TEST(CasHeartbeat, ForeignUuidTouchFailsClosedWithoutAborting)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     Layout layout("pool");
@@ -219,12 +234,29 @@ TEST(CasHeartbeat, ForeignUuidTouchStillDies)
     foreign.writer_epoch = 1;
     foreign.seq = 1;
     backend->putOverwrite(layout.mountKey(srid), encodeMountLease(foreign), h.token);
-    EXPECT_DEATH(
-        {
-            DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
-            keeper.renewOnce();
-        },
-        "held by a foreign server");
+
+    /// Restored on every exit: this flag is process-global and every later test in this binary would
+    /// inherit it.
+    const bool armed_before = DB::abort_on_logical_error.load(std::memory_order_relaxed);
+    DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
+    SCOPE_EXIT({ DB::abort_on_logical_error.store(armed_before, std::memory_order_relaxed); });
+
+    String message;
+    int code = 0;
+    try
+    {
+        keeper.renewOnce();
+        FAIL() << "a foreign holder must fail the renewal closed, not be silently taken over";
+    }
+    catch (const DB::Exception & e)
+    {
+        message = e.message();
+        code = e.code();
+    }
+    EXPECT_NE(message.find("held by a foreign server"), String::npos) << message;
+    EXPECT_EQ(code, DB::ErrorCodes::ABORTED)
+        << "the mount-lost class the background loop latches the write fence on -- and, critically, not "
+           "LOGICAL_ERROR, which would abort this keeper thread and the whole process with it";
 }
 
 /// Mount-slot writer audit (the P1 "foreign writer" instrument): every mount-slot WRITE and every

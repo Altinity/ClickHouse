@@ -964,8 +964,8 @@ void MountLeaseKeeper::onRenewMismatch(const String & mismatched_key)
 {
     /// The base contract's PreconditionFailed just means "our token didn't match" — re-read the
     /// CURRENT body and classify. All four body-present cases and the absent case are covered
-    /// below, each fail-closed and none (except the protocol-unreachable foreign_writer)
-    /// constructing a LOGICAL_ERROR, which aborts debug/ASan builds at exception construction
+    /// below, each fail-closed and NONE constructing a `LOGICAL_ERROR`, which aborts debug/ASan
+    /// builds at exception construction — on this KEEPER THREAD, taking the whole process with it
     /// (STID 3982-3b48; parts 1a/1b covered vanished/absent-at-release, this covers the rest).
     const auto got = backend->get(mismatched_key);
     if (got)
@@ -1014,13 +1014,32 @@ void MountLeaseKeeper::onRenewMismatch(const String & mismatched_key)
                 mismatched_key, describeMountHolder(current));
         }
 
-        /// current.server_uuid != server_uuid — the one genuinely protocol-unreachable case
-        /// (the owner anchor refuses foreign claims at open; decommission impersonates the victim
-        /// uuid, it never manufactures a foreign one). Deliberately still LOGICAL_ERROR-loud.
+        /// `current.server_uuid != server_uuid` — a DIFFERENT server holds the slot we thought was ours.
+        /// The owner anchor refuses foreign claims at open and decommission impersonates the victim uuid
+        /// rather than manufacturing a foreign one, so this is not something a healthy protocol run
+        /// produces. It is still ENVIRONMENT-REACHABLE, and this comment used to claim otherwise: clear
+        /// the pool prefix and recreate under a different server id — an operator `rm -rf`, or a
+        /// recreation over a reused prefix — and the surviving writer's very next renewal lands exactly
+        /// here. `CasRefContiguousAlloc.SurvivingWriterIsFencedByTheRecreatedPoolsMount` drives it
+        /// deliberately, which is the plainest possible refutation of "unreachable".
+        ///
+        /// So it must not be a `LOGICAL_ERROR`. That class aborts debug/ASan builds at CONSTRUCTION, and
+        /// this runs on the keeper's background thread, so a condition the environment can create took
+        /// the whole process down. `ABORTED` instead — the same class the two sibling fencing arms above
+        /// use, and one the storage layer already treats as a retry-safe mount-lost signal. The OUTCOME
+        /// is unchanged and is the whole point: renewal stops, `onRenewFailed` latches the write fence,
+        /// and this incarnation never takes over the foreign holder's slot.
+        ///
+        /// NOT yet done at the RELEASE path (`terminate` below): its foreign-incarnation arm has the
+        /// same defect and is reached by the same test at teardown, but three `EXPECT_DEATH` tests
+        /// (`CasGcRound.OrphanManifestCursorSweepDeletesAndPersistsCursor`,
+        /// `CasMountStartup.StaleSelfMountReclaimedAfterWait`,
+        /// `CasPoolRemount.ForeignOwnerIsNeverTakenOver`) deliberately pin that abort, so changing it is
+        /// a ruled decision rather than a local fix.
         ProfileEvents::increment(ProfileEvents::CasMountLeaseLost);
         emitMountEvent(event_sink, CasEventType::MountConflict, srid, "foreign_writer", &current,
             "mount slot is held by a foreign server — failing closed, never taking over");
-        throw Exception(ErrorCodes::LOGICAL_ERROR,
+        throw Exception(ErrorCodes::ABORTED,
             "CAS mount-lease: key '{}' is held by a foreign server ({}) — failing closed, never taking over",
             mismatched_key, describeMountHolder(current));
     }
