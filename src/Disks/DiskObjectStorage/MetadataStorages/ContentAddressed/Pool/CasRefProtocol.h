@@ -507,6 +507,12 @@ public:
     /// `CORRUPTED_DATA` (the non-transient class recovery fails fast on), discarding the candidate.
     void applyOne(RefLogTxn && txn, uint64_t encoded_bytes);
 
+    /// The candidate's lifecycle AS OF the transactions applied so far. Recovery's CAS-walk needs it at
+    /// each epoch boundary it reaches, and it must be the LIVE reading rather than one taken from the
+    /// base snapshot: a removal transaction in the replayed tail is exactly the case where the two
+    /// differ, and it is the case that decides whether the epoch below gets a seal.
+    RefLifecycle lifecycle() const { return candidate.getLifecycle(); }
+
     /// Materialises nothing extra (matches `replay`: the writer's recovery folds the COW overlays via
     /// `materializeCommitted` on the result; the read-only consumers do not) and returns the replay-derived
     /// `RecoveryResult` fields, moving the candidate out. The builder must not be used afterwards.

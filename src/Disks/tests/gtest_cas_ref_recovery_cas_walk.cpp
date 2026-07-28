@@ -268,6 +268,15 @@ RefLogTxn makeOrdinaryTxn(const RootNamespace & ns, RefTxnId id, const String & 
     return txn;
 }
 
+/// The terminal `remove_namespace` op (this project's warning set requires every field named, so it is
+/// built field-by-field rather than by designated init).
+RefOp removeNamespaceOp()
+{
+    RefOp op;
+    op.kind = RefOpKind::RemoveNamespace;
+    return op;
+}
+
 /// One EPOCH SEAL transaction at `id` -- what a concurrent recoverer leaves behind.
 RefLogTxn makeSealTxn(const RootNamespace & ns, RefTxnId id,
                       std::optional<RefTxnId> prev_epoch_seal = std::nullopt)
@@ -996,4 +1005,52 @@ TEST(CasRefRecoveryCasWalk, ASecondCallerWaitsForTheWalkInsteadOfRacingIt)
     const auto seal = readLogTxn(*backend, layout, ns, RefTxnId{1, 2});
     ASSERT_TRUE(seal.has_value());
     EXPECT_TRUE(refLogTxnIsEpochSeal(*seal));
+}
+
+/// A REMOVED namespace's dead epoch is NOT sealed, and the walk keeps going past it.
+///
+/// Found by the gate, not by design: the first cut sealed every dead epoch unconditionally and then
+/// refused to APPLY its own seal, because a seal is a statement about a live stream and `applyOp`
+/// rejects one over a Removed table. That combination is the worst of both -- the object was already
+/// durable when the apply threw, so the namespace was permanently unrecoverable. The two sides of the
+/// rule now agree, and this pins both halves plus the reason skipping the write must not mean skipping
+/// the walk: a namespace removed in one epoch and RECREATED in a later one still has durable
+/// transactions above the dead life, and stopping at the removal would silently truncate them.
+TEST(CasRefRecoveryCasWalk, ARemovedNamespaceIsNotSealedAndTheWalkContinuesToItsRecreation)
+{
+    auto backend = std::make_shared<HidingListBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/removed_then_reborn"};
+
+    burnEpochsUpTo(*backend, layout, /*target_live_epoch=*/3);
+    seedCkpt(*backend, layout, ns, lifeEpochCkpt(1));
+    seedTxn(*backend, layout, ns, RefTxnId{1, 1}, "a", /*birth=*/true);
+
+    /// Epoch 1 ends with the terminal record: the ref is removed, then the namespace.
+    RefLogTxn removal;
+    removal.ns = ns.string();
+    removal.txn_id = RefTxnId{1, 2};
+    removal.ops = {DB::Cas::tests::ownerTransitionOp(
+                       RefOwnerBinding{RefOwnerKind::Committed, "a", manifestRef(1, 1, 1u)}, std::nullopt),
+                   removeNamespaceOp()};
+    writeRefLogTxnRaw(*backend, layout, removal);
+
+    /// A RECREATION in epoch 2 -- above the dead life, and the reason the walk must not stop at the
+    /// removal. Its birth is sequence 1 of its own genesis epoch, so it carries no chain link.
+    seedTxn(*backend, layout, ns, RefTxnId{2, 1}, "reborn", /*birth=*/true);
+
+    auto store = openWalkPool(backend);
+    ASSERT_TRUE(store);
+    ASSERT_EQ(store->liveWriterEpoch(), 3u);
+
+    const auto refs = store->listRefs(ns);
+    EXPECT_EQ(refs.size(), 1u);
+    EXPECT_TRUE(refs.contains("reborn")) << "the walk must reach the recreated life above the removal";
+
+    EXPECT_FALSE(readLogTxn(*backend, layout, ns, RefTxnId{1, 3}).has_value())
+        << "epoch 1 died Removed: no seal, because a seal closes the epoch of a LIVE stream";
+    const auto seal2 = readLogTxn(*backend, layout, ns, RefTxnId{2, 2});
+    ASSERT_TRUE(seal2.has_value()) << "epoch 2 IS live again by the time it dies, so it closes normally";
+    EXPECT_TRUE(refLogTxnIsEpochSeal(*seal2));
+    EXPECT_EQ(seal2->prev_epoch_seal, std::nullopt) << "sequence 2 carries no chain link";
 }

@@ -730,6 +730,26 @@ std::optional<CasRefLedger::RecoveryWalk> CasRefLedger::runRecoveryWalkOnce(
             if (epoch >= live_epoch)
                 break;   /// the LIVE epoch's stream ends here: this is where the next append goes
 
+            /// A seal closes the epoch of a LIVE stream, and a namespace that is Removed (or never
+            /// born) has none: its terminal record already closed its history, and `applyOp` refuses a
+            /// seal over it -- correctly, since such an object would be a statement about a stream that
+            /// does not exist. Both sides of that rule live here and in `applyOp`, and they have to
+            /// agree: minting a seal this build then cannot replay would leave a durable object that
+            /// makes the namespace permanently unrecoverable.
+            ///
+            /// Advance to the next epoch WITHOUT writing. Skipping the write is not skipping the walk:
+            /// a namespace removed at epoch 5 and RECREATED at epoch 7 still has durable transactions
+            /// above, and stopping here would silently truncate them. The recreation's chain link comes
+            /// from its own `life_epoch` (its birth is sequence 1 of its genesis epoch, where the
+            /// grammar forbids a `prev_epoch_seal`), not from a seal over the dead life.
+            if (builder.lifecycle() != RefLifecycle::Live)
+            {
+                ++epoch;
+                sequence = 1;
+                slot_attempts_this_epoch = 0;
+                continue;
+            }
+
             /// A DEAD epoch, unclosed. Everything that can throw is prepared BEFORE the conditional
             /// create, so a failure here happens while the slot is provably untouched.
             if (++slot_attempts_this_epoch > kRefRecoveryMaxSlotAttemptsPerEpoch)
