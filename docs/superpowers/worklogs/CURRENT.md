@@ -1285,3 +1285,6 @@ One more tick before a ping. No push.
 **2026-07-28 12:0x UTC watchdog-adjacent** — task 5 review: Spec ✅, Quality needs-fixes (op-identity
 aliasing blinds `AckedOpsAreDurable`; five stale RED state-count rows). Fix round 1 dispatched to
 tla-task5 with findings verbatim + minors folded in. No push.
+
+**2026-07-28 12:4x UTC watchdog** — fix round 1 active: module fix in, full run_mount.sh battery
+re-running (live TLC on the sabotage sweep, logs seconds-fresh). No push.
