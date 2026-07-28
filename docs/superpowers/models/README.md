@@ -90,7 +90,7 @@ of `CaGcRootLocalPartManifestCore`.
 | `CaEdgeBeforeObserve.tla` | with edge-before-observe write order, promote-time revalidation of tokened leaves is redundant | CURRENT for order + K1; K3Head/K3AdoptCheck drifted (tokenless leaf now manifest-trusted) | `run_ebo.sh` |
 | `CaRetiredInRun.tla` | retired list folded into the snapshot run (two-cursor merge, coverage coherence) | CURRENT | `run_retiredinrun.sh` |
 | `CaRetiredInRunFoldAbortWitness.tla` | GC freshness meta is add-only: a spare never clears a condemned marker | CURRENT | `run_foldabort_witness.sh` |
-| `CaRefTableSnapshotLogCore.tla` | ref-table snapshot + append-only log protocol; coverage-at-birth mount seal | CURRENT | `run_refsnaplog.sh` |
+| `CaRefTableSnapshotLogCore.tla` | v9 contiguous ref stream: state-derived dense ids, every-attempt reuse rule, `_ckpt`-based recovery base + arithmetic walk, in-band `slot-occupy` epoch seal — `LatePredecessorPut` FLIPPED from rev.4 expected-fail to green, with `_sab_noseal` as the control | CURRENT (v9 rewrite 2026-07-28; gates the ref-chain implementation) | `run_refsnaplog.sh` |
 | `CaRefDeltaIntakeCore.tla` | GC ref-intake pagination; cursor adoption atomic with the fold commit | CURRENT | `run_refintake.sh` |
 | `CaRefFoldClampRecoveryCore.tla` | fold clamp always recoverable: per-log cleanup staging | CURRENT | `run_foldclamp.sh` |
 | `CaRefNsCleanupStaleLeaderCore.tla` | stale-leader namespace-cleanup pass aborts on completed-marker observation | CURRENT | `run_nscleanup_staleleader.sh` |
@@ -203,16 +203,16 @@ append-only log of ref transactions with strictly increasing ids; a reader recov
 ordered scan and cleanup deletes only what it observed durable. The migration is shipped
 (`Pool/CasRefProtocol.*`, `Formats/CasRefLogFormat.*`, `CasRefSnapshotFormat.*`, `CasRefLedger.*`).
 
-- **`CaRefTableSnapshotLogCore.tla`** — the core protocol for one table: the true history is the
-  id-ordered sequence of immutable transactions; a snapshot captures a replay prefix; recovery is
-  a single ordered scan (log before snapshot, resume after the last returned key, bounded restart
-  on a vanished object); a removed table may be recreated only after a durable Completed marker.
-  A later extension seals a successor's mount coverage at birth against a stale predecessor's
-  late-landing write: the late object still lands physically but is provably folded out of every
-  reader started after the drop. Sabotages cover deleting before the snapshot is durable, treating
-  a vanished object as corruption, recreating before the Completed marker, and remounting with the
-  old epoch. The `_latepred` configs document the pre-seal cross-epoch limitation as an expected
-  fail.
+- **`CaRefTableSnapshotLogCore.tla`** — the core protocol for one namespace, rewritten for v9
+  (spec `2026-07-27-cas-ref-chain-complete-cut-design.md`): ids are per-namespace CONTIGUOUS and
+  derived from state, an id is freed only under the every-attempt rule, recovery point-reads its
+  base from `_ckpt` and walks the tail by arithmetic, and the walk ends by OCCUPYING the next slot
+  with an in-band epoch seal. Because a listing is never consumed as truth, the hidden-hole defect
+  that motivated v9 is reproduced only as a sabotage. **`LatePredecessorPut` is flipped from rev.4's
+  expected-fail to a green proof**, with `_sab_noseal` keeping the old counterexample runnable as
+  the control. Sabotages cover the every-attempt rule, rev.4's "safe id gap" allocator, seal
+  occupancy, conditional-create-as-fence, folding the hint, and both `_ckpt` deletion gates. Full
+  verdicts, traces and the retired rev.4/rev.6 configs: `CaRefTableSnapshotLogCore_RESULTS.md`.
 - **`CaRefDeltaIntakeCore.tla`** — the GC's paginated intake of ref deltas: two tables sharing one
   lexically ordered keyspace, strictly increasing durable ids with at most one unresolved append.
   Proves resume-after-returned-key pagination misses nothing, cursor adoption is atomic with the
