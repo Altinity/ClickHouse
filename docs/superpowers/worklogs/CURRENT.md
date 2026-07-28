@@ -1377,3 +1377,6 @@ dispatch next. No push.
 
 **2026-07-28 14:00 local watchdog** — stage A task 0: baseline build running (ninja live,
 build/task0_build.log fresh). No push.
+
+**2026-07-28 14:5x local** — task 0 CLOSED (gate verified; baseline 1357/1357). Task 1
+(EpochSeal format + grammar, TDD) dispatched to impl-a1. No push.
