@@ -476,11 +476,17 @@ private:
         /// at global epoch 5 therefore appends `{5, 1}` with NO `prev_epoch_seal`; its first transition
         /// (5 -> 6) seals `{5, T+1}`, and the `{6, 1}` that follows carries that seal.
         ///
-        /// Two producers set it: the wedge resolution, when a successor's seal is found occupying the
-        /// wedged key (`resolveWedgeOnce`'s conclusive-rejection arm -- the seal it observed IS this
-        /// namespace's epoch-closing record), and recovery's CAS-walk, which installs the last seal of
-        /// the chain it walked (Task 6). Nothing else writes it: a seal is durable evidence, never a
-        /// local guess.
+        /// THREE producers set it, and only one of them is the one `commitRefChunk` normally reads from.
+        /// Recovery's CAS-walk installs the last seal of the chain it walked (Task 6): that is the
+        /// production path, because a real epoch change arrives with a self-remount, which DISCARDS every
+        /// cached runtime (`quiesceRefTablesForRemount`) and hands the fresh one its chain link through
+        /// recovery. The other two are the conclusive-rejection arms -- `resolveWedgeOnce`'s and
+        /// `commitRefChunk`'s -- which record a seal this runtime observed with its own eyes at a key it
+        /// owns. Within THIS runtime that record is mostly introspection (the seal it saw closes the
+        /// epoch it is still living in, so the stamp guard correctly suppresses it); it is written anyway
+        /// because it is durable evidence nothing else holds, and because it becomes the right answer the
+        /// moment the live epoch advances past the seal's. Nothing else writes it: a seal is durable
+        /// evidence, never a local guess.
         std::optional<RefTxnId> last_epoch_seal;
         /// The post-durable install marker (spec §A2; see `RefApplyState` for the state machine and for
         /// why it is an assert layer rather than a fence). Atomic and RELAXED because it is written
@@ -694,11 +700,17 @@ private:
     /// `survivor_error` and returns, because the lane is either still uncertain or deliberately closed.
     enum class WedgeResolution : uint8_t
     {
-        NoWedge,      /// nothing was wedged -- the ordinary flush
-        Adopted,      /// the wedged transaction is durable; it is installed and the lane is clear
-        Rejected,     /// a successor's `EpochSeal` occupies the key: the operation never landed and never will
-        StillWedged,  /// unresolved, refused pre-attempt, or superseded -- the wedge is intact
-        Corrupted,    /// a foreign non-seal object occupies the key -- impossible under mount exclusivity
+        NoWedge,          /// nothing was wedged -- the ordinary flush
+        Adopted,          /// the wedged transaction is durable; it is installed and the lane is clear
+        /// The wedged id was ALREADY accounted for by `RefTableState::durable_floor`, so the wedge is
+        /// retired without any I/O and WITHOUT an install: this table is `Poisoned` and its cached view
+        /// will never contain that transaction. Distinct from `Adopted` because nothing was applied and
+        /// no tail counter moved -- calling it an adoption would make the flush's follow-up work (the
+        /// snapshot-publish trigger) look justified when it has nothing to publish.
+        FloorReconciled,
+        Rejected,         /// a successor's `EpochSeal` occupies the key: the operation never landed and never will
+        StillWedged,      /// unresolved, refused pre-attempt, superseded, or uninstallable -- the wedge is intact
+        Corrupted,        /// a foreign non-seal object occupies the key -- impossible under mount exclusivity
     };
 
     struct WedgeResolutionResult

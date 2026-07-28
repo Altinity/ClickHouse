@@ -102,6 +102,7 @@ class WedgeTestBackend : public CountingBackend
 {
 public:
     using CountingBackend::putIfAbsent;
+    using CountingBackend::get;
 
     /// One-shot ambiguity that writes NOTHING: the response is lost and the key stays absent, which is
     /// the input that makes a later `slotOccupy` report `Created`.
@@ -113,6 +114,34 @@ public:
     /// for the S3 `DefiniteFailure` shape, which needs `USE_AWS_S3`; both are "proven never applied".
     String definite_substr;
     int definite_count = 0;
+
+    /// A SUCCESSOR lands `conflict_bytes` at the key and only then is our response lost, so the
+    /// controller's resolve-before-reissue reads a different object and proves the conflict. This is how
+    /// the ordinary append site meets an occupant at the id it derived.
+    String conflict_substr;
+    int conflict_count = 0;
+    String conflict_bytes;
+
+    /// Fail GETs of matching keys after skipping the first `fail_get_skip` of them -- the resolve read
+    /// that PROVES the conflict must succeed, so only the adjudication read that follows it is faulted.
+    String fail_get_substr;
+    int fail_get_skip = 0;
+    int fail_get_count = 0;
+
+    std::optional<GetResult> get(const String & key, Range range) override
+    {
+        if (fail_get_count > 0 && !fail_get_substr.empty() && key.find(fail_get_substr) != String::npos)
+        {
+            if (fail_get_skip > 0)
+                --fail_get_skip;
+            else
+            {
+                --fail_get_count;
+                throw Poco::TimeoutException("WedgeTestBackend: simulated lost GET (read response never arrived)");
+            }
+        }
+        return CountingBackend::get(key, range);
+    }
 
     /// Park a matching PUT until `releaseBlock()`, notifying `awaitBlockEntered()` on arrival, so a
     /// test can drive a fence bump or a successor's write into the exact I/O window.
@@ -159,6 +188,12 @@ public:
         {
             --definite_count;
             throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "WedgeTestBackend: scripted deterministic local failure");
+        }
+        if (conflict_count > 0 && !conflict_substr.empty() && key.find(conflict_substr) != String::npos)
+        {
+            --conflict_count;
+            CountingBackend::putIfAbsent(key, conflict_bytes, meta);
+            throw Poco::TimeoutException("WedgeTestBackend: a successor's object landed; our response was lost");
         }
         {
             std::unique_lock lk(block_mutex);
@@ -400,14 +435,21 @@ TEST(CasRefWedgeEveryAttempt, SuccessorSealAtTheWedgedKeyRejectsConclusivelyAndS
     /// INV-2's fence, stated as behaviour: a dying lane that observed the seal keeps deriving the SAME
     /// `T+1` and keeps colliding with it -- it never mints `T+2` and writes its stream past the record
     /// that closed its epoch. Ids are state-derived, so this falls out rather than being enforced.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { store->dropRef(ns, "y"); });
+    ///
+    /// And the collision is adjudicated as the CONCLUSIVE REJECTION it is, not as foreign interference:
+    /// this is the designed path, so it must not fence the mount or raise an anomaly. The append site
+    /// reads the occupant and tells a seal of this namespace from a genuine breach, exactly as the
+    /// wedge-resolve site does.
+    const uint64_t remounts_before = store->scheduleRemountCallCountForTest();
+    expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&] { store->dropRef(ns, "y"); });
     EXPECT_EQ(backend->get(layout.refLogKey(ns, RefTxnId{epoch, seal_id.ref_sequence + 1})), std::nullopt)
         << "nothing of ours may exist above the seal in the closed epoch";
+    EXPECT_TRUE(store->mayMutate()) << "meeting a successor's seal is the protocol working, not an anomaly";
+    EXPECT_EQ(store->scheduleRemountCallCountForTest(), remounts_before)
+        << "and must not schedule a remount";
 
     /// The lane resumes in the successor epoch's terms: the next id is the seal's successor there,
     /// i.e. sequence 1 of the new epoch -- and it carries the seal on the wire (the INV-2 chain).
-    /// (The collision above fenced the mount closed through the anomaly route; the re-arm below is what
-    /// a real self-remount would do, minus the recovery this task does not own.)
     bumpFenceGeneration(store, epoch + 1);
     EXPECT_NO_THROW(store->dropRef(ns, "y"));
 
@@ -603,6 +645,10 @@ TEST(CasRefWedgeEveryAttempt, ResultReleasedAfterAFenceBumpAndSuccessorSealIsIne
     resolver.join();
 
     ASSERT_TRUE(caller_error != nullptr) << "no acknowledgement: the caller must not be told this succeeded";
+    /// And it must be the RETRY-SAFE class. A moved incarnation is usually a routine lease blip, and the
+    /// storage layer classifies retry-safety on exactly `ABORTED || NETWORK_ERROR` — surfacing the fence
+    /// check's own `INVALID_STATE` here would turn every blip into a hard failure for the caller.
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { std::rethrow_exception(caller_error); });
     EXPECT_TRUE(store->refLaneWedgedForTest(ns)) << "no unwedge";
     EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), tail_before) << "no install";
     EXPECT_TRUE(store->resolveRef(ns, "x").has_value()) << "no install: the wedged drop is still unapplied";
@@ -698,4 +744,135 @@ TEST(CasRefWedgeEveryAttempt, WedgedIdAlreadyCoveredByTheDurableFloorIsTreatedAs
         << "the stranded transaction is NOT applied here -- that is exactly what Poisoned means";
     EXPECT_FALSE(store->resolveRef(ns, "y").has_value()) << "and the lane commits again, past the stranded id";
     EXPECT_EQ(store->applyStateForTest(ns), RefApplyState::Poisoned) << "Poisoned is terminal for the runtime";
+}
+
+/// ===================================================================================
+/// The append site owes the SAME three-way adjudication as the wedge site
+/// ===================================================================================
+
+/// No wedge is involved here at all: an ordinary append derives its next id and finds a successor's
+/// epoch seal sitting on it. That is not interference — it is INV-2's designed outcome for a lane that
+/// has been deposed without being told, and the lane will keep re-deriving that same id forever. So it
+/// must be adjudicated as the conclusive rejection it is: a permanent error for the callers, the seal
+/// recorded as this namespace's epoch-closing record, and NO fence and NO remount.
+TEST(CasRefWedgeEveryAttempt, AppendSiteMeetingASuccessorSealIsAConclusiveRejectionNotInterference)
+{
+    auto backend = std::make_shared<WedgeTestBackend>();
+    auto store = openPool(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/append_site_seal"};
+    publishEmptyPart(store, ns, "x");
+
+    const uint64_t epoch = store->liveWriterEpoch();
+    const RefTxnId next{epoch, 3};
+    ASSERT_EQ(store->lastEpochSealForTest(ns), std::nullopt);
+    const uint64_t remounts_before = store->scheduleRemountCallCountForTest();
+
+    /// The successor's seal lands at exactly the id this table's next append derives.
+    backend->conflict_substr = layout.refLogKey(ns, next);
+    backend->conflict_bytes = epochSealBytes(ns, next);
+    backend->conflict_count = 1;
+
+    expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&] { store->dropRef(ns, "x"); });
+
+    EXPECT_FALSE(store->refLaneWedgedForTest(ns)) << "a conclusive rejection is not an uncertain outcome";
+    EXPECT_TRUE(store->resolveRef(ns, "x").has_value()) << "the rejected transaction never applied";
+    EXPECT_EQ(store->lastEpochSealForTest(ns), std::make_optional(next))
+        << "the observed seal IS this namespace's epoch-closing record, whichever site observed it";
+    EXPECT_TRUE(store->mayMutate()) << "the designed path must not fence the mount";
+    EXPECT_EQ(store->scheduleRemountCallCountForTest(), remounts_before) << "nor schedule a remount";
+}
+
+/// The same conflict, but the read that would tell a seal from a breach fails. We must then decide
+/// NEITHER: fencing the mount would be a guess, and reporting a conclusive rejection would acknowledge
+/// a deposition nobody observed. The id is not consumed, so the next attempt re-derives it and
+/// classifies again — deferring costs one round trip and decides nothing wrongly.
+TEST(CasRefWedgeEveryAttempt, AppendSiteDefersWhenTheOccupantCannotBeRead)
+{
+    auto backend = std::make_shared<WedgeTestBackend>();
+    auto store = openPool(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/append_site_unreadable"};
+    publishEmptyPart(store, ns, "x");
+
+    const RefTxnId next{store->liveWriterEpoch(), 3};
+    const uint64_t remounts_before = store->scheduleRemountCallCountForTest();
+
+    backend->conflict_substr = layout.refLogKey(ns, next);
+    backend->conflict_bytes = epochSealBytes(ns, next);
+    backend->conflict_count = 1;
+    /// Skip the resolve read that PROVES the conflict; fail only the adjudication read after it.
+    backend->fail_get_substr = layout.refLogKey(ns, next);
+    backend->fail_get_skip = 1;
+    backend->fail_get_count = 1;
+
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
+
+    EXPECT_TRUE(store->mayMutate()) << "an unread occupant must not fence the mount on a guess";
+    EXPECT_EQ(store->scheduleRemountCallCountForTest(), remounts_before) << "nor schedule a remount";
+    EXPECT_EQ(store->lastEpochSealForTest(ns), std::nullopt)
+        << "nor record a deposition that was never actually observed";
+    EXPECT_FALSE(store->refLaneWedgedForTest(ns)) << "nothing of ours became durable, so nothing is wedged";
+
+    /// The id was not consumed: the retry re-derives it, reads the occupant successfully this time, and
+    /// reaches the verdict the first attempt deferred.
+    expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&] { store->dropRef(ns, "x"); });
+    EXPECT_EQ(store->lastEpochSealForTest(ns), std::make_optional(next));
+}
+
+/// A WELL-FORMED ref-log transaction of this namespace at this id, which simply is not a seal, must be
+/// adjudicated `Foreign` on CONTENT — not because it failed to decode. The sibling test above reaches
+/// the same verdict through an undecodable body, so without this one the classifier could be deciding
+/// "foreign" purely from decode failures and nothing would notice.
+TEST(CasRefWedgeEveryAttempt, WellFormedNonSealOccupantIsStillForeign)
+{
+    auto backend = std::make_shared<WedgeTestBackend>();
+    auto store = openPool(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/append_site_wellformed_foreign"};
+    publishEmptyPart(store, ns, "x");
+
+    const RefTxnId next{store->liveWriterEpoch(), 3};
+    const uint64_t remounts_before = store->scheduleRemountCallCountForTest();
+
+    /// A perfectly decodable transaction for this exact namespace and id — just not an epoch seal.
+    RefOp birth;
+    birth.kind = RefOpKind::NamespaceBirth;
+    const RefLogTxn foreign_txn{ns.string(), next, {birth}, std::nullopt};
+    backend->conflict_substr = layout.refLogKey(ns, next);
+    backend->conflict_bytes = sealObject(FormatId::RefLog, encodeRefLogTxn(foreign_txn));
+    backend->conflict_count = 1;
+
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { store->dropRef(ns, "x"); });
+
+    EXPECT_GT(store->scheduleRemountCallCountForTest(), remounts_before)
+        << "a well-formed non-seal occupant is still a breach of write-exclusivity";
+    EXPECT_EQ(store->lastEpochSealForTest(ns), std::nullopt) << "and is emphatically not an epoch seal";
+}
+
+/// The deposed-lane self-pointer. A successor that seals an EMPTY epoch writes its record at sequence 1
+/// of that epoch, and a lane still live there re-derives exactly that id. Stamping the seal as its own
+/// `prev_epoch_seal` would be a self-pointer, which the structural grammar (strictly-less by
+/// construction) refuses at ENCODE — so the lane would fail with a self-inflicted `CORRUPTED_DATA` on
+/// every attempt and never reach the seal collision that is supposed to fence it. The stamp is
+/// therefore conditioned on the seal's epoch being strictly BELOW the id's.
+TEST(CasRefWedgeEveryAttempt, ALiveEpochSealIsNeverStampedAsItsOwnPrevEpochSeal)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPool(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/live_epoch_seal"};
+    publishEmptyPart(store, ns, "x");
+
+    const uint64_t epoch = store->liveWriterEpoch();
+    bumpFenceGeneration(store, epoch + 1);
+    /// A seal of the LIVE epoch — the deposed-lane shape the wedge rejection arm can record.
+    store->setLastEpochSealForTest(ns, RefTxnId{epoch + 1, 7});
+
+    EXPECT_NO_THROW(store->dropRef(ns, "x"));
+
+    const RefLogTxn written = readRefLogTxn(*backend, layout, ns, RefTxnId{epoch + 1, 1});
+    EXPECT_EQ(written.prev_epoch_seal, std::nullopt)
+        << "a seal of the live epoch cannot be that epoch's own predecessor; stamping it would make the "
+           "encoder refuse this table's every append";
 }
