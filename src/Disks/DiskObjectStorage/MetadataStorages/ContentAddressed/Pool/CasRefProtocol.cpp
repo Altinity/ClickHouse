@@ -350,9 +350,13 @@ void RefTableState::applyOp(const RefOp & op, const RefTxnId & txn_id)
         case RefOpKind::EpochSeal:
             /// Stage A task 1 scope boundary: the codec now accepts `EpochSeal` (grammar +
             /// round trip only), but the apply layer's seal handling -- INV-2's contextual grammar
-            /// and the slot-occupy integration -- is wired by a later task. Unreachable today (nothing
-            /// yet mints an `EpochSeal` op), so failing loudly beats a silent no-op if that assumption
-            /// is ever violated before the real handling lands.
+            /// and the slot-occupy integration -- is wired by a later task. NOT reachable from any
+            /// writer in this build (nothing yet mints an `EpochSeal` op), but IS reachable from a
+            /// foreign or hand-crafted `_log` object replayed through `RefTableState::replay` -- the
+            /// decoder now accepts one, so a storage-controlled body can drive this switch. That is
+            /// exactly why this throws `NOT_IMPLEMENTED` rather than `LOGICAL_ERROR`: the latter aborts
+            /// under sanitizer/CI abort-on-logical-error settings, which would let storage-controlled
+            /// input crash the server; this fails loudly without that hazard.
             throw Exception(ErrorCodes::NOT_IMPLEMENTED, "RefTableState: EpochSeal apply is not yet implemented");
     }
     /// Reachable only through a hand-corrupted RefOpKind (mirrors CasRefLogCodec.cpp's

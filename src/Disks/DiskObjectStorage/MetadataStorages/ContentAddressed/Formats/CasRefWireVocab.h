@@ -44,4 +44,12 @@ std::string_view refOwnerKindToWord(RefOwnerKind k);
 /// `CORRUPTED_DATA` exception. Unknown words are rejected rather than treated as a default kind.
 RefOwnerKind refOwnerKindFromWord(std::string_view w, std::string_view what);
 
+/// Append two flat `RefTxnId` fields -- its `writer_epoch` and `ref_sequence` components -- to an
+/// in-progress JSON object, both as decimal STRINGS (`ref_sequence` reaches `UINT64_MAX` for a
+/// recovery seal). `epoch_key`/`seq_key` name the two fields, letting each format distinguish its
+/// primary id from any secondary id it embeds (`cas_ref_log`'s `we`/`rs` vs its `prev_epoch_seal`
+/// pair; `cas_ref_snap`'s `we`/`rs` vs `remove_txn_id` vs `sealed_from`) while sharing one writer so
+/// the formats can never disagree on the representation.
+void writeRefTxnIdFields(CasJsonWriter & out, bool & first, std::string_view epoch_key, std::string_view seq_key, const RefTxnId & id);
+
 }

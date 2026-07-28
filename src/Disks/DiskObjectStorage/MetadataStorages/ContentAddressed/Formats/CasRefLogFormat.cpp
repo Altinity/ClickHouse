@@ -43,11 +43,11 @@ RefOpKind opKindFromWord(std::string_view w)
     throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: unknown op kind '{}'", w);
 }
 
-void checkTxnIdNonzero(const RefTxnId & id)
+void checkTxnIdNonzero(const RefTxnId & id, std::string_view what)
 {
     if (id.writer_epoch == 0 || id.ref_sequence == 0)
         throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "RefLogTxn: txn_id fields must both be nonzero, got {}-{}", id.writer_epoch, id.ref_sequence);
+            "RefLogTxn: {} fields must both be nonzero, got {}-{}", what, id.writer_epoch, id.ref_sequence);
 }
 
 /// Byte budget over the encoded text. A removal-class transaction uses the larger complete-table
@@ -158,24 +158,20 @@ struct BindingFields
 /// The log transaction's header-object meta line (ns + txn_id + the optional `prev_epoch_seal`
 /// chain). Shared by `encodeRefLogTxn` and `removalFramingSize` so the two never disagree by a byte;
 /// `removalFramingSize` always passes `std::nullopt` -- a removal transaction is never a sequence-1
-/// epoch-transition record. Additive: the "pse"/"pss" pair is emitted only when `prev_epoch_seal` is
-/// set, so a body without it is byte-identical to the pre-EpochSeal wire shape.
+/// epoch-transition record. Additive: the `"!pse"`/`"!pss"` pair is emitted only when
+/// `prev_epoch_seal` is set, so a body without it is byte-identical to the pre-EpochSeal wire shape.
+/// `!`-prefixed: `prev_epoch_seal` is INV-2 chain evidence, not cosmetic metadata -- a decoder that
+/// doesn't understand it must refuse the object rather than silently drop the chain link while
+/// otherwise passing the structural grammar (`JsonObjectReader::skipUnknown` rejects any unrecognized
+/// `!`-key with `UNKNOWN_FORMAT_VERSION`, tolerant or not; see task-1 review finding M4).
 void writeLogMeta(CasJsonWriter & out, const String & ns, const RefTxnId & txn_id, const std::optional<RefTxnId> & prev_epoch_seal)
 {
     bool first = true;
     writeKey(out, "ns", first);
     writeStringValue(out, ns);
-    writeKey(out, "we", first);
-    writeU64StringValue(out, txn_id.writer_epoch);
-    writeKey(out, "rs", first);
-    writeU64StringValue(out, txn_id.ref_sequence);
+    writeRefTxnIdFields(out, first, "we", "rs", txn_id);
     if (prev_epoch_seal)
-    {
-        writeKey(out, "pse", first);
-        writeU64StringValue(out, prev_epoch_seal->writer_epoch);
-        writeKey(out, "pss", first);
-        writeU64StringValue(out, prev_epoch_seal->ref_sequence);
-    }
+        writeRefTxnIdFields(out, first, "!pse", "!pss", *prev_epoch_seal);
     closeObject(out, first);
     writeChar('\n', out);
 }
@@ -264,11 +260,20 @@ void validateEpochSealGrammarStructural(const RefLogTxn & txn)
 
     if (txn.prev_epoch_seal)
     {
-        checkTxnIdNonzero(*txn.prev_epoch_seal);
+        checkTxnIdNonzero(*txn.prev_epoch_seal, "prev_epoch_seal");
         if (txn.txn_id.ref_sequence != 1)
             throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "RefLogTxn: prev_epoch_seal is only allowed at sequence 1, got txn_id {}-{}",
                 txn.txn_id.writer_epoch, txn.txn_id.ref_sequence);
+        /// Chain-direction (review finding I3): a seal closing epoch E has id {E, T+1}, and the
+        /// transaction chaining to it lives at {E', 1} with E' > E -- so prev_epoch_seal's writer_epoch
+        /// must be strictly less than this transaction's own. A self- or forward-pointer is precisely
+        /// the corrupted shape a chain walk (Tasks 2/6) must not have to defend against itself; this is
+        /// a context-free property of a single transaction, so it belongs here, not in the walker.
+        if (txn.prev_epoch_seal->writer_epoch >= txn.txn_id.writer_epoch)
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "RefLogTxn: prev_epoch_seal writer_epoch {} must be strictly less than this "
+                "transaction's writer_epoch {}", txn.prev_epoch_seal->writer_epoch, txn.txn_id.writer_epoch);
     }
 }
 
@@ -292,7 +297,7 @@ void validateEpochSealGrammarContextual(const RefLogTxn & txn, uint64_t life_epo
 
 String encodeRefLogTxn(const RefLogTxn & txn)
 {
-    checkTxnIdNonzero(txn.txn_id);
+    checkTxnIdNonzero(txn.txn_id, "txn_id");
     validateEpochSealGrammarStructural(txn);
 
     CasJsonWriter out(512);
@@ -333,25 +338,25 @@ RefLogTxn decodeRefLogTxn(std::string_view data, const String & expected_ns, con
             if (key == "ns") { txn.ns = r.readString(); saw_ns = true; }
             else if (key == "we") { txn.txn_id.writer_epoch = r.readU64String(); saw_we = true; }
             else if (key == "rs") { txn.txn_id.ref_sequence = r.readU64String(); saw_rs = true; }
-            else if (key == "pse") pse = r.readU64String();
-            else if (key == "pss") pss = r.readU64String();
+            else if (key == "!pse") pse = r.readU64String();
+            else if (key == "!pss") pss = r.readU64String();
             else r.skipUnknown(key);
         }
         if (!saw_ns || !saw_we || !saw_rs)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: meta line missing ns/we/rs");
-        /// Both-or-neither: `nextKey` already rejects a repeated "pse"/"pss" (duplicate-key check), so
+        /// Both-or-neither: `nextKey` already rejects a repeated "!pse"/"!pss" (duplicate-key check), so
         /// this only guards against a body carrying exactly one of the pair.
         if (pse || pss)
         {
             if (!pse || !pss)
-                throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: prev_epoch_seal needs both pse and pss");
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: prev_epoch_seal needs both !pse and !pss");
             txn.prev_epoch_seal = RefTxnId{*pse, *pss};
         }
         if (!m.eof())
             throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: junk after meta line");
     }
 
-    checkTxnIdNonzero(txn.txn_id);
+    checkTxnIdNonzero(txn.txn_id, "txn_id");
     /// The namespace and transaction id are duplicated in the body because the object key is the
     /// source of truth for which transaction is being read. Reject a valid body copied under a
     /// different key before accepting any of its operations.

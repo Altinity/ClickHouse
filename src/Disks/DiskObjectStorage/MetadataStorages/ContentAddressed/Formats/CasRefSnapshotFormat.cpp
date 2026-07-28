@@ -101,15 +101,6 @@ void checkSnapshotInvariants(const RefTableSnapshot & snapshot)
     checkPrecommitsSorted(snapshot.precommits);
 }
 
-void writeIdFields(CasJsonWriter & out, bool & first, std::string_view epoch_key, std::string_view seq_key, const RefTxnId & id)
-{
-    /// Both fields decimal STRINGS: ref_sequence reaches UINT64_MAX for a recovery seal.
-    writeKey(out, epoch_key, first);
-    writeU64StringValue(out, id.writer_epoch);
-    writeKey(out, seq_key, first);
-    writeU64StringValue(out, id.ref_sequence);
-}
-
 void writeCommittedRow(CasJsonWriter & out, const RefCommittedRow & row)
 {
     checkCanonicalRefName(row.ref_name, "RefTableSnapshot", "committed ref_name");
@@ -152,13 +143,13 @@ void writeSnapshotMeta(CasJsonWriter & out, const RefTableSnapshot & snapshot)
     bool first = true;
     writeKey(out, "ns", first);
     writeStringValue(out, snapshot.ns);
-    writeIdFields(out, first, "we", "rs", snapshot.snapshot_id);
+    writeRefTxnIdFields(out, first, "we", "rs", snapshot.snapshot_id);
     writeKey(out, "lc", first);
     writeStringValue(out, lifecycleToWord(snapshot.lifecycle));
     if (snapshot.lifecycle == RefLifecycle::Removed)
-        writeIdFields(out, first, "rte", "rts", *snapshot.remove_txn_id);
+        writeRefTxnIdFields(out, first, "rte", "rts", *snapshot.remove_txn_id);
     if (snapshot.sealed_from)
-        writeIdFields(out, first, "sfe", "sfs", *snapshot.sealed_from);
+        writeRefTxnIdFields(out, first, "sfe", "sfs", *snapshot.sealed_from);
     closeObject(out, first);
     writeChar('\n', out);
 }

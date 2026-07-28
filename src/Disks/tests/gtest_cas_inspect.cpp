@@ -53,6 +53,30 @@ TEST(CasInspect, RendersSetPublishedAtOpWithNoPayloadSizeKey)
     EXPECT_EQ(json.find("payload"), String::npos) << json;
 }
 
+/// Task-1 review finding M5: `cas inspect` renders the new `EpochSeal` op kind and the txn-level
+/// `prev_epoch_seal` chain field, needed to debug INV-2 seal chains without a raw byte dump.
+TEST(CasInspect, RendersEpochSealTxnWithPrevEpochSeal)
+{
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/db/tbl"};
+    const RefTxnId id{3, 1};
+
+    RefLogTxn txn;
+    txn.ns = ns.string();
+    txn.txn_id = id;
+    txn.prev_epoch_seal = RefTxnId{2, 9};
+    RefOp op;
+    op.kind = RefOpKind::EpochSeal;
+    txn.ops.push_back(op);
+
+    const String key = layout.refLogKey(ns, id);
+    const String bytes = sealObject(FormatId::RefLog, encodeRefLogTxn(txn));
+
+    const String json = caInspectToJson(layout, key, bytes);
+    EXPECT_NE(json.find(R"("kind":"EpochSeal")"), String::npos) << json;
+    EXPECT_NE(json.find(R"("prev_epoch_seal":{"writer_epoch":2,"ref_sequence":9})"), String::npos) << json;
+}
+
 TEST(CasInspect, RendersCommittedRowWithNoPayloadSizeKey)
 {
     const Layout layout("p");

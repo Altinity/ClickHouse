@@ -13,7 +13,7 @@ namespace DB::Cas
 
 /// Text codec for `cas_ref_log`, the immutable object stored at `_log/<txn_id>`. Each object contains
 /// exactly one committed transaction: its namespace, transaction id, and the batch of `RefOp`s applied
-/// by that commit. The body has a header, a meta line `{"ns","we","rs",["pse","pss"]}`, one JSON
+/// by that commit. The body has a header, a meta line `{"ns","we","rs",["!pse","!pss"]}`, one JSON
 /// record per op, and a `{"n":count}` trailer. Records are emitted in the transaction's stored order
 /// and contain no codec-generated timestamps, so encoding the same value is byte-identical. This
 /// determinism is a property of the representation, not an adoption gate: ref commits use
@@ -21,11 +21,14 @@ namespace DB::Cas
 /// returned text.
 ///
 /// `RefOpKind::EpochSeal` closes an epoch transition in-band (spec INV-2): a seal transaction contains
-/// exactly that one op, and the meta line's optional `prev_epoch_seal` (wire fields `pse`/`pss`) chains
-/// to the transaction id of the seal that closed the PRECEDING epoch. `prev_epoch_seal` is required on
-/// exactly sequence 1 of every epoch above the namespace's genesis (`life_epoch`, the writer epoch of
-/// its `NamespaceBirth`) and forbidden elsewhere -- see `validateEpochSealGrammarStructural` and
-/// `validateEpochSealGrammarContextual`.
+/// exactly that one op, and the meta line's optional `prev_epoch_seal` (wire fields `!pse`/`!pss`,
+/// CRITICAL -- an unrecognized `!`-key fails closed with `UNKNOWN_FORMAT_VERSION` rather than being
+/// silently skipped, since dropping it would lose INV-2's chain evidence while still passing the
+/// structural grammar) chains to the transaction id of the seal that closed the PRECEDING epoch, and
+/// its own `writer_epoch` is strictly below the referencing transaction's. `prev_epoch_seal` is
+/// required on exactly sequence 1 of every epoch above the namespace's genesis (`life_epoch`, the
+/// writer epoch of its `NamespaceBirth`) and forbidden elsewhere -- see
+/// `validateEpochSealGrammarStructural` and `validateEpochSealGrammarContextual`.
 
 /// One operation kind in a ref transaction log. The numeric values are part of the in-memory and
 /// serialized representation; unknown values are rejected by the decoder.
@@ -151,10 +154,13 @@ bool refLogTxnIsEpochSeal(const RefLogTxn & txn);
 
 /// The context-free half of the INV-2 seal grammar: a transaction carrying an `EpochSeal` op contains
 /// EXACTLY that one op, and `prev_epoch_seal`, when present, is well-formed (both `RefTxnId`
-/// components nonzero) and appears ONLY at `txn_id.ref_sequence == 1`. Called by both
-/// `encodeRefLogTxn` and `decodeRefLogTxn`, so a caller-built transaction and a decoded one are held
-/// to the identical rule. Throws CORRUPTED_DATA on violation. Does NOT check the required-iff rule --
-/// that needs `life_epoch`, which the codec never sees; see `validateEpochSealGrammarContextual`.
+/// components nonzero), appears ONLY at `txn_id.ref_sequence == 1`, and names a STRICTLY earlier
+/// epoch (`prev_epoch_seal->writer_epoch < txn_id.writer_epoch`) -- a self- or forward-pointer is
+/// rejected even though it cannot arise from `writeLogMeta`'s own writer, because Tasks 2/6 walk this
+/// pointer backwards over untrusted decoded bodies. Called by both `encodeRefLogTxn` and
+/// `decodeRefLogTxn`, so a caller-built transaction and a decoded one are held to the identical rule.
+/// Throws CORRUPTED_DATA on violation. Does NOT check the required-iff rule -- that needs
+/// `life_epoch`, which the codec never sees; see `validateEpochSealGrammarContextual`.
 void validateEpochSealGrammarStructural(const RefLogTxn & txn);
 
 /// The contextual half of the INV-2 seal grammar: `prev_epoch_seal` is required on exactly
