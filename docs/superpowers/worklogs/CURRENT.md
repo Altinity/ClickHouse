@@ -1254,3 +1254,7 @@ noincarnation configs through TLC (08:18-19). Commit/report pending. No push.
 direction-check question; my assessment + off-ramps delivered (recommend full course with a
 two-stage main plan). In-flight task 4 completes per the allowed-to-finish precedent; tasks 5-6 and
 the main plan HOLD until the user answers. No push.
+
+**2026-07-28 09:3x UTC** — task 4 CLOSED (re-review clean; rederive/reuse counterexamples proven
+disjoint). 4/6 TLA tasks complete. Pipeline HOLDING before task 5 — user direction question open
+(full staged course / pause after TLA / stage-A only). Nothing running. No push.
