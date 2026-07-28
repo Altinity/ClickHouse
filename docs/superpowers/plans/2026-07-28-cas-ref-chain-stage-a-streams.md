@@ -61,10 +61,22 @@ shape (`<ns>/_log/...`, `<ns>/_snap/...`, `<ns>/_ckpt`); namespace DISCOVERY sti
 mechanisms (hint enumeration + `gc/state` cursors) — but every per-namespace decision (fold
 advance, deletion safety, recovery completeness) becomes arithmetic/point-read/CAS.
 
+**Stage A is NOT deletion-capable — destruction is globally suppressed until Stage B.**
+Blob in-degree is POOL-WIDE (spec §1): an acked hidden `+1` in a namespace absent from both the
+hint and `gc/state` can coexist with a visible `-1` elsewhere, and no per-known-namespace
+frontier proof can exclude it — the catalog universe (Stage B Task 4) is LOAD-BEARING for the
+acked-loss closure. Therefore Stage A hard-wires `frontier_incomplete = true` at the universe
+seam (a named constant `kUniverseAuthoritative = false` with a comment citing this paragraph),
+so `suppress_destructive` holds on EVERY round: folds, seals, cursors, holds, recovery and
+`_ckpt` all run for real; every delete family stays inert. Stage B flips the constant when the
+catalog becomes the universe. Deletion-path CORRECTNESS is still fully tested in Stage A gtests
+(tests construct closed universes where the constant is overridden through the test seam); only
+production destruction waits. [Codex plans-review finding 1 — the original "new-namespace
+residual" argument was FALSE and is retired.]
+
 **Named Stage-A residuals (closed by Stage B, honest until then):**
-- A namespace absent from BOTH the hint and `gc/state` has no frontier entry (the universe is not
-  yet authoritative — INV-3's job). New-namespace creation is DDL-rate; the observed blocker class
-  (existing-namespace hidden records) is closed by Stage A.
+- No production destruction (above) — GC debris accumulates until Stage B lands; the soak gate's
+  criteria account for this (Task 14).
 - Verbatim-file rebirth aliasing (register R1) — pre-existing, untouched here.
 - Manifest-less orphan blobs after REBUILD goes condemn-nothing (register R4) — a NAMED leak, not
   a regression: today's REBUILD condemnation of acked data is the thing being removed.
@@ -136,6 +148,15 @@ sequence-1 seal closing an empty epoch) and FORBIDDEN elsewhere; the seal's own 
 `{closing_writer_epoch, T+1}` where `T` = greatest applied sequence of the epoch being closed
 (so an empty dead epoch is closed by a seal at sequence 1 carrying `prev_epoch_seal`).
 
+**The field is populated by BOTH writers** [codex finding 2 — blocker]: recovery seals (Task 6)
+AND every ORDINARY `{E, 1}` transaction a writer appends after an epoch transition. Recovery
+therefore installs the exact last-seal id into the writer runtime
+(`RefTableRuntime::last_epoch_seal`, set by `installRecoveryResult` — Task 6 produces it), and
+`commitRefChunk` copies it into every non-genesis sequence-1 txn it encodes (Task 4 wires
+this). Without that, the first normal append after any transition would fail this task's own
+encoder grammar. This task defines the field + validator; the round-trip test for the ordinary
+path lands in Task 4 Step 1 (it needs the writer runtime).
+
 - [ ] **Step 1: Write the failing codec tests** in `gtest_cas_ref_epoch_seal_format.cpp`:
   round-trip of a seal txn (encode → decode → fields equal, incl. `prev_epoch_seal`);
   strict rejections, one test each, all expecting `CORRUPTED_DATA`:
@@ -193,11 +214,17 @@ SlotOccupyResult slotOccupy(std::string_view key, std::string_view bytes,
   fence flip mid-call → the controlled layer's refusal surfaces as `Unresolved`
   with the pre-attempt reason (never a lie of `Created`).
 - [ ] **Step 2:** Run `--gtest_filter='CasSlotOccupy*'` → FAIL (symbol undefined).
-- [ ] **Step 3:** Implement `slotOccupy` in `CasRequestControl.cpp` composing
-  `putIfAbsentControlled` + on `PreconditionFailed`/`Conflict` one `resolveByExactGet`.
-  Extend `InMemoryBackend` with the minimal fault hook the tests need (an injected
-  "ambiguous outcome" toggle for `putIfAbsent`) if one does not already exist — test-only
-  surface, Allman braces, no sleeps.
+- [ ] **Step 3:** Implement `slotOccupy` in `CasRequestControl.cpp` as a DEDICATED RAW slot
+  operation [codex finding 3 — the naive composition is wrong: `putIfAbsentControlled` retries
+  internally and `resolveByExactGet` compares-against-expected and throws `CORRUPTED_DATA` on a
+  different occupant, contradicting both "one conditional create, never retries internally" and
+  `Occupied(bytes, token)`]: exactly ONE fence/deadline-gated backend `putIfAbsent`, then — only
+  when resolution is required — exactly ONE raw exact `GET` returning the occupant's bytes and
+  token WITHOUT compare-and-throw (adjudication is the caller's, per the Interfaces block). Add
+  backend operation-count assertions to every Step-1 test (Created = 1 op; Occupied = 2 ops;
+  Unresolved ≤ 2 ops). Extend `InMemoryBackend` with the minimal fault hook the tests need (an
+  injected "ambiguous outcome" toggle for `putIfAbsent`) if one does not already exist —
+  test-only surface, Allman braces, no sleeps.
 - [ ] **Step 4:** New filter PASS + full CA gate no regressions.
 - [ ] **Step 5: Commit** `ca: backend — slotOccupy primitive (Created|Occupied(bytes)|Unresolved)`.
 
@@ -241,6 +268,17 @@ the wedged half is Task 4).
   closed with an exception message naming pool recreation as the migration
   (`"CAS pool format <old> predates contiguous ref streams; recreate the pool"` — exact message in
   the test).
+- [ ] **Step 3b: Recreation quiesce enforcement** [codex finding 11 — rejecting old-format
+  OPEN does not fence an already-RUNNING old binary that keeps writing the reused prefix]. The
+  spec's migration rule ("recreation must be quiesced so no old writer touches the reused
+  prefix") gets teeth: pool recreation onto a prefix with a live mount lease of ANY format
+  generation REFUSES until the existing owner slots are terminal (the mount-claim machinery
+  already knows how to read them — reuse it read-only), and the recreated pool's first mount
+  fences via the normal claim path so a surviving old writer's next controlled write dies on
+  the fence. Integration test (goes into the Task 14 battery, defined here): old-binary-shaped
+  writer holds the lease → recreation attempt refused; owner terminalized → recreation
+  proceeds → a delayed write from the old writer's queue is refused by the fence. Stage A
+  cannot take `STAGE A: PASS` without this test green.
 - [ ] **Step 4:** New filter PASS; full CA gate: expect and FIX fallout in tests that relied on
   pool-wide monotonicity across namespaces (report each such edit explicitly — reviewer checks
   the list against `git diff --stat`).
@@ -278,6 +316,14 @@ Behavior (spec INV-1/INV-2 verbatim):
   fail loud, Constraint 3);
   `Unresolved` → stay wedged (no deadline reset, no background loop — register R6 is ACCEPTED
   behavior: a permanently quiet wedged namespace retries on its next caller or remount).
+- **Post-I/O recheck under the install lock** [codex finding 8 — the r9-5 rule applies to the
+  wedge, not only to recovery]: the outcome adjudication above happens on I/O results; BEFORE
+  acting on them (adopt / acknowledge / unwedge / fail-survivors), re-acquire `state_mutex` and
+  compare the exact stored `(admitted_fence_generation, wedge txn identity, wedge bytes)`
+  against the wedge still installed AND `checkFenceOrThrow(admitted_fence_generation)` — a
+  result returning after a fence bump/rearm or a successor's seal must be INERT for the
+  superseded runtime (the successor's seal remains the conclusive rejection of the OPERATION;
+  the superseded runtime just may not be the one to act on it).
 - NO background retry thread exists or is added.
 
 - [ ] **Step 1: Failing tests** in `gtest_cas_ref_wedge_every_attempt.cpp` (InMemoryBackend +
@@ -290,7 +336,12 @@ Behavior (spec INV-1/INV-2 verbatim):
   (`ambiguous-then-definite`); occupant with foreign non-seal bytes → throws `CORRUPTED_DATA`;
   fence generation bumped between wedge creation and retry → retry refused pre-attempt
   (`Unresolved`, wedge intact) — the old-generation-retry-inert rule
-  (`_sab_wedgeretryoldgen`'s C++ twin).
+  (`_sab_wedgeretryoldgen`'s C++ twin); **deterministic blocked-I/O race** [codex finding 8]:
+  retry's `slotOccupy` blocked at the fault seam → fence bumped + rearmed and a successor seals
+  the slot → I/O released with a stale result → the post-I/O recheck makes the superseded
+  runtime act on NOTHING (no ack, no unwedge, no install — assert all three); ordinary
+  `{E, 1}` append after a sealed transition carries the exact `prev_epoch_seal` and round-trips
+  (the blocker-2 test, here because it needs the writer runtime) [codex finding 2].
 - [ ] **Step 2:** Run `--gtest_filter='CasRefWedgeEveryAttempt*'` → FAIL.
 - [ ] **Step 3:** Implement. The wedge hard-contract `chassert` at `:1918-1938` stays; extend it
   to also refuse NEW allocations while a wedge is unresolved (the lane rule — one in-flight PUT
@@ -304,8 +355,16 @@ Behavior (spec INV-1/INV-2 verbatim):
 **Files:**
 - Create: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCkptFormat.h` / `.cpp`
 - Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.cpp` (registry — add `FormatId::RefCkpt`, Control/Strict, modest caps: 64 KiB object / 4 KiB line)
-- Modify: `.../ContentAddressed/CasLayout.h` (+`String refCkptKey(const RootNamespace &)` — Stage A shape `<ns>/_ckpt`; Stage B re-keys under the incarnation)
+- Modify: `.../ContentAddressed/Formats/CasLayout.h` — the `Layout` class (+ member
+  `String refCkptKey(const RootNamespace &) const` — Stage A shape `<ns>/_ckpt`; Stage B
+  re-keys under the incarnation) [path per codex finding 18]
 - Create: `.../ContentAddressed/Pool/CasRefCkpt.h` / `.cpp` (the write algorithm)
+- Modify: `.../ContentAddressed/Pool/CasRefLedger.cpp` — `trySnapshotPublishOnce` (the snapshot
+  publisher is INV-4's SECOND writer [codex finding 4]: after the snapshot body PUT commits and
+  BEFORE the snapshot is treated as cleanup-authoritative, it calls the same `publishCkpt` with
+  `checkpoint_snapshot_id = <published id>`), + the constructor/callback plumbing for the
+  generation capture the call needs (the ledger does not own a `CasMountRuntime` — plumb a
+  `fence_generation_fn`/`check_fence_fn` pair the way `CasPlainObjects` does via `CasPool.cpp:171`)
 - Create: `src/Disks/tests/gtest_cas_ref_ckpt.cpp`
 
 **Interfaces:**
@@ -343,7 +402,12 @@ CkptPublishOutcome publishCkpt(Backend &, const CasLayout &, const RootNamespace
   object; token conflict (concurrent writer advanced it) → re-read → merge → second CAS wins;
   identical merged body → `IdenticalSkip` and NO write issued (assert backend op count);
   fence bumped between read and CAS → `FencedOut`, nothing written; deadline exhausted on
-  persistent conflict → throws retry-later (fail closed, no partial state).
+  persistent conflict → throws retry-later (fail closed, no partial state); **at the REAL
+  snapshot-publisher call site** [codex finding 4]: a committed snapshot publish advances
+  `checkpoint_snapshot_id`; the body-PUT/cleanup/`_ckpt` race (cleanup planned between body PUT
+  and `_ckpt` CAS cannot delete the just-published snapshot — the deletability rule reads the
+  ADVANCED checkpoint); identical-body no-op, token conflict, and stale-generation refusal all
+  exercised through `trySnapshotPublishOnce`, not only through the helper directly.
 - [ ] **Step 2:** Run `--gtest_filter='CasRefCkpt*'` → FAIL.
 - [ ] **Step 3:** Implement format (strict grammar: all three keys, optionals encoded-when-set,
   duplicates rejected), registry entry, layout key, `mergeCkpt` (ONE function — the ledger
@@ -357,6 +421,8 @@ CkptPublishOutcome publishCkpt(Backend &, const CasLayout &, const RootNamespace
 **Files:**
 - Modify: `.../Pool/CasRefLedger.cpp` — `ensureRefTableRecovered` `:394-727` (the whole recovery
   sequence), `installRecoveryResult` `:738`; DELETE the sentinel-seal writer `:601-659`
+- Modify: `.../Pool/CasPool.cpp` — the self-remount path (`tryRemountOnce`, `:1018` region):
+  the cancel-or-join barrier before fence rearm [codex finding 10]
 - Modify: `.../Formats/CasRefSnapshotFormat.h` — retire the sentinel-seal shape (`:20-25` doc,
   `sealed_from` `:57`, the `snapshot_id < *sealed_from` check `:74`): `sealed_from` is REMOVED
   from the format; a decoded snapshot carrying it (old pool) is unreachable behind Task 3's
@@ -400,6 +466,23 @@ transient-retry loop `:441`, restart budget `kRefRecoveryMaxRestarts` `:446-460`
    `installRecoveryResult` `:665`: a recovery whose I/O window overlapped a fence bump must
    never install (today there is NO such recheck — the site map confirms the gap).
 
+**The three same-value sites are generation-only** [codex finding 7]: the ONE captured
+`admitted_generation` from step 1 is what slot-occupy's `fence_ok` (step 6), the `_ckpt` CAS
+(step 7) and the install recheck (step 8) all present — one capture point, three checks, no
+re-derivation. (Tokens are per-object credentials — the `_ckpt` token in step 7 and, in Stage
+B, the catalog-entry token — and are NOT part of this trio.) `installRecoveryResult` also
+records the walked chain's last seal id into `RefTableRuntime::last_epoch_seal` (the
+blocker-2 hand-off Task 4 consumes).
+
+**Self-remount barrier** [codex finding 10 — spec §3: "self-remount cancels or waits out
+recovery before rearming"]: the install-lock recheck alone is not the remount rule. Add the
+orchestration in `CasPool.cpp`'s remount path (`tryRemountOnce` area, `:1018` region) + a
+cancel-or-join primitive on the recovery state (`recovery_in_progress`/`recovery_cv` `:413-428`
+extended with a `cancel_requested` flag the recovery loop polls at each I/O boundary): fence
+REARM may not complete while a recovery attempt is in flight — remount either cancels it (flag
++ cv wait for acknowledgment) or joins its completion; either way no old-`admitted_generation`
+`_ckpt` CAS or install can follow the rearm.
+
 - [ ] **Step 1: Failing tests** in `gtest_cas_ref_recovery_cas_walk.cpp`:
   hint omits a middle id that exists (arithmetic finds it by exact GET — recovery result
   identical to a complete hint; TODAY the reconciliation replay misses it: this is THE blocker's
@@ -409,7 +492,10 @@ transient-retry loop `:441`, restart budget `kRefRecoveryMaxRestarts` `:446-460`
   reseal at new `T+1`); two consecutive burned empty epochs → two chained sequence-1 seals with
   correct `prev_epoch_seal`; fence bumped during the walk → install refused (throws), state NOT
   installed, retry under the new generation succeeds; `_ckpt` names a snapshot the hint lost →
-  step-4 three-way behavior.
+  step-4 three-way behavior; **remount barrier** [codex finding 10]: recovery paused at an I/O
+  fault seam → self-remount initiated → fence rearm BLOCKS until the recovery acknowledges
+  cancellation; after release the cancelled recovery performs ZERO `_ckpt` CASes and ZERO
+  installs (op-journal assert).
 - [ ] **Step 2:** Run `--gtest_filter='CasRefRecoveryCasWalk*'` → FAIL.
 - [ ] **Step 3:** Implement, DELETING: the sentinel-seal writer block `:601-659`, the
   `sealed_from` field + sentinel doc in `CasRefSnapshotFormat.h`, and the reconciliation's
@@ -502,11 +588,17 @@ enum class HoldReason : uint8_t   /// bounded ENUM — strict grammar, spec r9-4
 - [ ] **Step 1: Failing codec tests** in `gtest_cas_gc_hold_grammar.cpp`: round-trip all four
   reasons; classification 2 carrying a hold field → `CORRUPTED_DATA`; classification 4 missing
   any hold field → `CORRUPTED_DATA`; duplicate hold keys → `CORRUPTED_DATA`; boundary AND
-  boundary-plus-one byte-reservation tests: a seal at the 64 KiB line cap
-  (`Formats/CasFormat.cpp:102` registry) with the maximal hold row (max enum, max numerics,
-  worst-case escaping) encodes; one byte over → the writer's NEW pre-PUT gate throws
-  retry-later BEFORE the PUT (today `CasGc.cpp:2014` measures only — the gate is new; spec
-  INV-3's `encodeFoldSeal(...).size()` check lands here for the hold rows).
+  boundary-plus-one byte-reservation tests — with the TWO caps kept distinct [codex finding 9]:
+  (a) PER-ROW framing vs the 64 KiB LINE cap (`Formats/CasFormat.cpp:102` registry): the
+  maximal hold row (max enum, max numerics, worst-case escaping) encodes within a line; one
+  byte of payload growth over → strict decode rejects; (b) WHOLE-SEAL size vs the 256 MiB
+  OBJECT cap: a seal built to land EXACTLY at the object cap is ACCEPTED (equality passes);
+  cap + 1 → the writer's NEW pre-PUT gate throws retry-later BEFORE the PUT (today
+  `CasGc.cpp:2014` measures only). One shared byte-arithmetic helper computes both predicates
+  (`encoded row <= line_cap`; `fold_fixed_bytes + Σ worst_case_entry_reservation <= object_cap`)
+  — Stage B Task 2 reuses THIS helper for the catalog's additive predicate. The pre-PUT gate
+  guards BOTH seal write sites: the regular fold write (`CasGc.cpp:2018` region) and REBUILD's
+  second `encodeFoldSeal` PUT (`:2861` region).
 - [ ] **Step 2:** `--gtest_filter='CasGcHoldGrammar*'` → FAIL.
 - [ ] **Step 3: Behavior tests** (same file): gap-below-witness (hint witness) → hold with exact
   `offending_position`; gap below `_ckpt.checkpoint` with hint SILENT about the namespace's tail
@@ -543,21 +635,46 @@ Behavior (spec §5): quiet namespaces (known, unhinted or hinted-inactive) each 
 quiet → walk it this round (Task 7 loop). Budget exhausted before every proof lands → cursor
 advances may still seal, ALL destruction suppressed this round. `suppress_destructive` becomes
 `anomalies present OR any hold carried OR frontier incomplete`, and is CONSULTED at every
-destructive site — the three sites the audit found un-gated get the same check the gated ones
-have (`CasBlobInDegree.cpp:443-446` pattern). The delete-site in-degree re-read
-(`settleEntry` `:414-469` sparing `indeg > 0`, then `deleteExact` `:516`) is hereby NORMATIVE
-(spec §5 third arm) — it gets the comment saying so and a regression test, not new code.
+destructive site. **The Stage-A universe seam:** `frontier_incomplete` is computed as
+`!kUniverseAuthoritative || <per-namespace proofs missing>` where
+`constexpr bool kUniverseAuthoritative = false;` in Stage A (staging contract; the comment cites
+codex finding 1's cross-namespace scenario verbatim); gtests reach the per-namespace logic via a
+test seam (`GcTestHooks::force_universe_authoritative`) that constructs CLOSED universes.
+**Destructive-site inventory is a STEP, not an assumption** [codex finding 6]: before wiring,
+run a tree-wide inventory of every `deleteExact`/`deletePrefixWholesale`/delete-marker call
+reachable from GC and list each with its gate status in the task report — the known un-gated
+set is manifest-body deletes `:841-864`, generation prune `:2316`/`:2282`, orphan-sweep
+invocation `:912`, AND the post-CAS `handoff_reclaim` wholesale generation-prefix delete
+`:793-833` (which today runs BEFORE `suppress_destructive` is even assigned at `:879` — the
+gate must be computed and transported ahead of it); the inventory may find more — every found
+site gets the gate and its own zero-delete-under-suppression test.
+The delete-site in-degree re-read (`settleEntry` `:414-469` sparing `indeg > 0`, then
+`deleteExact` `:516`) is hereby NORMATIVE (spec §5 third arm) — it gets the comment saying so
+and a regression test; to prove the guard ITSELF can fail, the test uses a test-only seam that
+bypasses the final in-degree read, records the targeted test RED, restores the guard, records
+GREEN [codex finding 16].
 
 - [ ] **Step 1: Failing tests** in `gtest_cas_gc_frontier_gate.cpp`:
   a hidden `+1` in a KNOWN-but-unhinted namespace while a `-1` elsewhere is ready to graduate →
   destruction suppressed (the cross-namespace hidden-`+1` control — the load-bearing RED of the
-  whole phase, now C++); same round, the quiet-probe GET finds the `+1` → namespace walked,
-  fold adopts it, destruction proceeds NEXT round; frontier budget exhausted → seals happen,
-  zero deletes (assert backend delete-op count == 0); each of the three newly-gated sites
-  individually: manifest-body delete, generation prune, orphan sweep — all inert under
-  suppression (assert per-site); late `+1` folded AFTER condemnation but BEFORE the delete
-  pass → `settleEntry` spares it (`indeg > 0`) — the normative third-arm regression;
-  covered-log cleanup deletes exactly the computable range under
+  whole phase, now C++; runs under the test seam with a closed universe); same round, the
+  quiet-probe GET finds the `+1` → namespace walked, fold adopts it, destruction proceeds NEXT
+  round; frontier budget exhausted → seals happen, zero deletes (assert backend delete-op
+  count == 0); every inventoried destructive site individually (at minimum: manifest-body
+  delete, generation prune, orphan sweep, `handoff_reclaim`) — all inert under suppression
+  (assert per-site, delete-op count == 0 each) [codex finding 6]; production default
+  (`kUniverseAuthoritative == false`) → destruction inert even with every constructed proof
+  green; late `+1` folded AFTER condemnation but BEFORE the delete
+  pass → `settleEntry` spares it (`indeg > 0`) — the normative third-arm regression (with the
+  seam-RED proof, above); **the temporal lemma's OTHER arms, pinned in C++** [codex finding 5]:
+  (a) a post-probe `+1` followed by SAME-round condemnation → the newly condemned blob is not
+  deleted in that round (the not-same-round rule directly asserted); (b) SOURCE-BACKED/TOKENED
+  adoption of an already-delete-pending blob → reads `Condemned` meta, rematerializes from
+  source as a fresh incarnation, and the delayed old-token `deleteExact` cannot remove the new
+  object (token mismatch asserted); (c) TOKENLESS relink (`adoptEvidence`) → an operation
+  journal proves the receiver's `+1` is durable BEFORE the source releases its committed edge,
+  and no interleaving in the test's schedule produces a window where the blob has zero durable
+  owners; covered-log cleanup deletes exactly the computable range under
   `min(_ckpt.checkpoint, cursor)` and nothing above (ranges, not listings); snapshot cleanup
   deletes only STRICTLY BELOW `_ckpt.checkpoint` — a snapshot AT the checkpoint survives
   (Task 5's rule, asserted at the delete site).
@@ -734,12 +851,14 @@ overturn any of these with evidence, which then goes to the controller as a ques
   data-loss arm)** a `-1` for a blob rides id 3 (hidden) while its blob's last other `+1` is
   visible → blob NOT deleted this round (in-degree correct after arithmetic fold); **(the
   leak arm)** a `+1` rides the hidden id → blob's in-degree includes it, later legitimate `-1`
-  does not strand it; **(new-namespace residual, DOCUMENTED not asserted-away)** a namespace
-  whose ONLY record is hidden AND absent from `gc/state` → this stage does NOT see it — the
-  test asserts the DOCUMENTED behavior (no destruction of its blobs can occur because no other
-  namespace's proof covers them — blob condemnation requires an observed `-1`/zero transition,
-  which cannot exist for never-folded grants) and cross-references the staging-contract
-  residual; **(fsck)** fsck under the lie → clean (arithmetic streams don't consult LIST
+  does not strand it; **(the cross-namespace kill shot — the staging suppression's regression)**
+  namespace `A` absent from BOTH hint and `gc/state`, its acked `+1` on a shared blob hidden,
+  while namespace `B`'s visible `-1` drives the blob's observable in-degree to zero → REQUIRED
+  VERDICT: ZERO deletes (`kUniverseAuthoritative = false` holds destruction); the SAME test with
+  the seam forcing the constant true and `A` absent from the constructed universe MUST delete
+  the blob — proving the suppression is the only thing between Stage A and this data loss, i.e.
+  the constant is load-bearing and Stage B's catalog is its honest replacement [codex finding 1];
+  **(fsck)** fsck under the lie → clean (arithmetic streams don't consult LIST
   completeness).
 - [ ] **Step 2:** Wire the hook (test-only; production `list` untouched).
 - [ ] **Step 3:** Prove each test CAN fail: temporarily revert the Task 7 intake commit in a
@@ -771,7 +890,12 @@ overturn any of these with evidence, which then goes to the controller as a ques
   `--ops` finishes ~10× faster and is NOT a substitute), plus the adversarial scenarios lane
   relevant to this stage (at minimum: the GC concurrent-leader scenarios and S30's
   dangling-precommit shape from `utils/ca-soak/scenarios/`). PASS criteria: zero data-loss
-  events, zero wedged-forever lanes, fsck clean at end, no unbounded `unaccounted` growth, no
+  events, no wedge that SURVIVES a foreground-flush or remount resolution opportunity (a
+  permanently quiet unacknowledged wedge with no such opportunity is ALLOWED and reported, per
+  register R6 — and the soak asserts NO background deadline-resetting retry loop exists) [codex
+  finding 15], fsck clean at end, `unaccounted` growth bounded by the suppressed-destruction
+  debris model (destruction is OFF in Stage A — the criterion is "every unaccounted object is
+  attributable to a suppressed delete family", not "zero growth"), no
   ERROR-severity log lines that are not test-injected.
 - [ ] **Step 4:** Write `2026-07-28-stage-a-RESULTS.md`: battery table (every gate, expected vs
   observed), the residual restatement (staging contract verbatim), and the verdict line.
