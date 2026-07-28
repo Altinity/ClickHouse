@@ -1324,3 +1324,7 @@ dispatched to tla-task6. No push.
 
 **2026-07-28 13:0x local watchdog** — task 6 fix round 1 active: foldclamp+refwcleanup re-run
 (12:37), report fix-round section started, one live TLC sanity run, commit pending. No push.
+
+**2026-07-28 13:2x local** — task 6 fix round 1 committed (`fb7f481a718`: audit-scope arithmetic,
+unaudited-residual section, honest transcript, runner parity incl. the ack-floor twin). Gate
+unchanged PASS 93/93. Scoped re-review dispatched. No push.
