@@ -1403,22 +1403,59 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// Each fully-folded remove_namespace transaction seeds a namespace-cleanup item.
     std::vector<std::pair<RootNamespace, RefTxnId>> new_removals;
 
-    /// 2-3. Ref-log intake: for each table,
-    /// GET every log with id > its durable cursor in ascending id order, decode+validate the body, and
-    /// fold each explicit owner-change into `foldManifestEdges` (which reads the manifest body and appends
-    /// per-blob `BlobDelta`s to `deltas`). The durable cursor advances per FULLY folded log; a missing
-    /// manifest body clamps this table below the log (barrier, re-read next round) while other tables keep
-    /// folding. One transaction = one key, so logs of one table fold in strict id order.
+    /// 2-3. Ref-log intake, by ARITHMETIC (spec §5). For each table the walk steps
+    /// `expected = cursor + 1` WITHIN the cursor's epoch and reads that exact key: under INV-1 the ids of
+    /// one `(namespace, writer_epoch)` are dense `1..T`, so the next record's id is computable and the
+    /// round never asks the listing what to read. Each body is decoded+validated and every explicit
+    /// owner-change folds into `foldManifestEdges` (which reads the manifest body and appends per-blob
+    /// `BlobDelta`s to `deltas`). The durable cursor advances per FULLY folded log; a missing manifest body
+    /// clamps this table below the log (barrier, re-read next round) while other tables keep folding.
     ///
-    /// PHASE 7/18 `fold_ref_intake`: one GET per new ref log plus one HEAD+GET per manifest edge, which
-    /// on a busy pool is where the round's object-read budget goes. It also carries probe B1's two
-    /// numbers -- reported on EVERY healthy round, so "logs_intended always equals logs_applied" becomes
-    /// an observable property of the table rather than a claim in a comment.
+    /// THE LISTING IS A HINT, and demoting it is the point of this loop. It used to be the source of
+    /// truth for which records exist, so a store that omitted a durable key from an enumeration -- the
+    /// observed `0x1430c`/`0x1430d` shape -- made the round skip those records' owner edges and then seal
+    /// a cursor ABOVE them, which is unrecoverable (a record below the cursor is never re-read). Under
+    /// arithmetic intake such an omission is a NON-EVENT: the exact GET finds the record anyway. The hint
+    /// keeps exactly two jobs here:
+    ///   (a) the genesis start of a never-folded namespace (`cursor == {0,0}` has no arithmetic
+    ///       predecessor; Stage B's `_ckpt.life_epoch` is what finally supplies it -- see below), and
+    ///   (b) the WITNESS set that makes an absent expected-next decidable:
+    ///         absent, no listed id above it  => this namespace's frontier this round (normal end);
+    ///         absent, a listed id above it   => impossible under contiguity, so the store is lying or a
+    ///                                           durable record was lost: HOLD the namespace at
+    ///                                           classification 4 with its cursor unmoved.
+    ///
+    /// Epochs are crossed only over a consumed `EpochSeal` (INV-2): the seal folds as an applied table
+    /// no-op (probe B2 `produced=false`) and the next epoch's start is `{E', 1}`, reached through the
+    /// `prev_epoch_seal` back-chain rather than guessed -- so an epoch the hint omits entirely is still
+    /// walked, and a crossing with no consumed seal behind it is an impossible shape that holds. Read
+    /// `crossFromSeal` for what that is proved FROM: within a round the seal's kind is checked outright,
+    /// across rounds it rests on the chain until Task 8 carries the kind in the durable cursor.
+    ///
+    /// PER-NAMESPACE FAILURES ARE PER-NAMESPACE (spec §5): an unreadable or undecodable body belongs to
+    /// exactly one namespace and clamps only it. The whole-round abort survives ONLY for a key that cannot
+    /// be attributed to any namespace at all (`groupRefKeys` above), which is why nothing in this loop
+    /// sets `ref_folding_aborted` anymore.
+    ///
+    /// PHASE 7/18 `fold_ref_intake`: one GET per record (always owed -- the round read every body anyway),
+    /// plus one exact 404 probe per namespace to prove its frontier, one extra GET per epoch crossed, and
+    /// one HEAD+GET per manifest edge, which on a busy pool is where the round's object-read budget goes.
+    /// It also carries probe B1's two numbers -- reported on EVERY healthy round, so
+    /// "logs_accounted always equals logs_applied" becomes an observable property of the table rather than
+    /// a claim in a comment.
     std::optional<GcPhaseTimer> intake_timer;
     intake_timer.emplace(phase_sink, "fold_ref_intake");
     uint64_t intake_tables_changed = 0;
     uint64_t intake_tables_clamped = 0;
     uint64_t intake_dead_precommits_skipped = 0;
+    uint64_t intake_absent_probes = 0;
+    uint64_t intake_epoch_crossings = 0;
+
+    /// Probe B1's raw material: per namespace, the CONTIGUOUS runs of ids this round walked, one per epoch
+    /// entered, recorded as `[first, last]`. The recomputation below turns them back into a count and
+    /// compares it with the counter the advance site incremented -- so a cursor that moved over a position
+    /// nothing applied inflates the first number and fails the round closed.
+    std::map<String, std::vector<std::pair<RefTxnId, RefTxnId>>> walked_segments;
     for (auto & [ns_str, listing] : ref_tables)
     {
         if (ref_folding_aborted)
@@ -1433,7 +1470,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         /// anything folded under it. Under INV-1 (`nextRefTxnId`) ids are derived per namespace from that
         /// table's own state, so a namespace removed and recreated WITHIN ONE writer epoch -- after its
         /// logs were cleaned and its runtime re-recovered from nothing -- restarts at `{E, 1}`, at or
-        /// below this cursor. The loop below skips ids `<= cursor`, so those edges would never fold and
+        /// below this cursor. The walk below starts at `cursor + 1`, so those edges would never fold and
         /// the recreated refs' manifests would look unreferenced.
         ///
         /// Two things keep that from biting today. The cursor is dropped when the namespace vanishes: the
@@ -1474,28 +1511,189 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         bool clamped = false;
         RefTxnId resolved_through = cursor;   /// advances per fully-folded log; a clamp keeps it below the log
 
-        for (const RefTxnId & log_id : listing.logs)
+        /// The hint's witness role: the smallest LISTED id strictly above `id`, if any. An absent
+        /// expected-next means "frontier" without one and "impossible shape" with one.
+        const auto witnessAbove = [&listing](const RefTxnId & id) -> std::optional<RefTxnId>
         {
-            if (!(cursor < log_id))
-                continue;   /// id <= cursor: already folded in a prior round
-            if (clamped)
-                break;
+            const auto it = std::upper_bound(listing.logs.begin(), listing.logs.end(), id);
+            if (it == listing.logs.end())
+                return std::nullopt;
+            return *it;
+        };
+
+        /// Record the position an impossible shape was detected at, hold the namespace, and stop walking
+        /// it. `clamped` is the existing classification-4 signal; the strict durable hold grammar
+        /// (reason / offending position / backoff, carried across rounds and REBUILD) is a later task, so
+        /// the offending position travels in the anomaly and the event for now.
+        const auto hold = [&](const RefTxnId & at, const char * reason)
+        {
+            report.recordAnomaly(ns, 0, ManifestId{ns, {}}, reason);
+            EventEmitter{*store}.emit([&](CasEvent & ev)
+            {
+                ev.type = CasEventType::GcFoldClamp;
+                ev.namespace_ = ns_str;
+                ev.object_kind = CasEventObjectKind::Root;
+                ev.outcome = "held";
+                ev.reason = reason;
+                ev.detail = {{"expected", renderRefTxnId(at)},
+                             {"resolved_through",
+                              resolved_through == RefTxnId{} ? "none" : renderRefTxnId(resolved_through)}};
+            });
+            LOG_ERROR(logger,
+                "CAS GC ref intake: namespace {} HELD at {} -- {}. The cursor stays at {} and this "
+                "namespace folds nothing further this round.",
+                ns_str, renderRefTxnId(at), reason,
+                resolved_through == RefTxnId{} ? "none" : renderRefTxnId(resolved_through));
+            clamped = true;
+        };
+
+        /// Cross into the epoch that follows the one `from_seal` closed. The hint only NOMINATES a
+        /// candidate epoch (`witness`); the proof is the back-chain, because the target epoch's sequence-1
+        /// record names the seal that must have been consumed before it (INV-2). If it names a seal ABOVE
+        /// `from_seal`, an epoch sits in between that the hint omitted -- follow the chain back and take
+        /// that one instead, which is what makes a crossing independent of the listing. Anything else --
+        /// no sequence 1, an undecodable one, a genesis record (no `prev_epoch_seal`) above a consumed
+        /// seal, or a chain that skips our position -- is the unconsumed-seal crossing, and holds.
+        ///
+        /// WHAT THE CHAIN PROVES, EXACTLY: the IDENTITY of the position the next epoch chains from, not
+        /// its KIND. Those come apart when a writer names an ordinary record as `prev_epoch_seal`, and the
+        /// damage is the one the seal exists to prevent -- epoch `E` declared closed while its writer may
+        /// still append, so a later `{E, k}` lands permanently below the cursor. So the kind is checked
+        /// wherever it is knowable: `seal_proven` carries `refLogTxnIsEpochSeal` of the record THIS round
+        /// applied at `from_seal` (free -- the body was decoded to apply it). It is `nullopt` only when the
+        /// walk applied nothing this round, i.e. `from_seal` is the cursor a PREVIOUS round sealed; that
+        /// record may since have been cleaned, so its kind is unknowable by any amount of reading here and
+        /// the crossing rests on chain-trust. Closing that half needs the kind carried in the durable
+        /// cursor -- Task 8's hold/cursor grammar -- not more I/O.
+        ///
+        /// Terminates: `validateEpochSealGrammarStructural` guarantees `prev_epoch_seal->writer_epoch <
+        /// txn_id.writer_epoch`, so `target_epoch` strictly decreases and the loop is bounded below by
+        /// `from_seal`'s own epoch. The record it proves is read once more by the walk itself: one
+        /// redundant GET per epoch crossed, and crossings happen once per writer-epoch change.
+        const auto crossFromSeal = [&](const RefTxnId & from_seal, const std::optional<bool> & seal_proven,
+                                       const RefTxnId & witness) -> std::optional<RefTxnId>
+        {
+            if (from_seal == RefTxnId{})
+                return std::nullopt;   /// nothing consumed yet: there is no seal to cross from
+            if (seal_proven && !*seal_proven)
+                return std::nullopt;   /// this round applied that record and it is NOT a seal
+            uint64_t target_epoch = witness.writer_epoch;
+            while (target_epoch > from_seal.writer_epoch)
+            {
+                const RefTxnId start{target_epoch, 1};
+                const auto body = backend.get(layout.refLogKey(ns, start));
+                if (!body)
+                {
+                    ++intake_absent_probes;   /// a failed crossing pays this read too; count it
+                    return std::nullopt;
+                }
+                ProfileEvents::increment(ProfileEvents::CasRefLogBodyGets);
+                RefLogTxn head;
+                try
+                {
+                    head = decodeRefLogTxn(openObject(FormatId::RefLog, body->bytes), ns_str, start);
+                }
+                catch (const Exception & e)
+                {
+                    LOG_WARNING(logger, "CAS GC ref intake: epoch-start log {} invalid: {}",
+                                layout.refLogKey(ns, start), e.message());
+                    return std::nullopt;
+                }
+                if (!head.prev_epoch_seal || *head.prev_epoch_seal < from_seal)
+                    return std::nullopt;
+                if (*head.prev_epoch_seal == from_seal)
+                    return start;   /// proved: `from_seal` is exactly the seal this epoch chains to
+                target_epoch = head.prev_epoch_seal->writer_epoch;
+            }
+            return std::nullopt;
+        };
+
+        /// The first position to read. A never-folded namespace has no arithmetic predecessor, so its
+        /// genesis comes from the hint's own floor -- the one hint role arithmetic cannot replace in
+        /// Stage A. The residual is PRE-EXISTING but not cosmetic: a hint that omits the very FIRST
+        /// surviving record of a never-folded namespace starts the walk one record too high, and the
+        /// round then seals a cursor ABOVE a record it never folded -- the same unrecoverable shape this
+        /// walk removes everywhere else, since nothing ever re-reads below the cursor. It is exactly what
+        /// the listing-driven loop did, and it is bounded to a namespace's FIRST fold. Stage B closes it
+        /// structurally by reading `_ckpt.life_epoch` (the namespace's genesis epoch) from the catalog,
+        /// which makes the start `{life_epoch, 1}` and arithmetic like every other step. Do NOT close it
+        /// here by scanning down from `{E, 1}`: below a lost cursor the cleaned range is unbounded, so the
+        /// scan has no bound either, and a namespace whose early logs were legitimately cleaned would 404
+        /// below its own witness and hold every round.
+        std::optional<RefTxnId> expected;
+        if (cursor == RefTxnId{})
+        {
+            if (!listing.logs.empty())
+                expected = listing.logs.front();
+        }
+        else
+            expected = RefTxnId{cursor.writer_epoch, cursor.ref_sequence + 1};
+
+        /// Whether the record this round last applied (the one `resolved_through` names) was an
+        /// `EpochSeal`. `nullopt` = this round has applied nothing yet, so `resolved_through` is still
+        /// the inherited cursor and its kind is not knowable here -- see `crossFromSeal`.
+        std::optional<bool> last_applied_is_seal;
+
+        /// Probe B1's per-epoch contiguous run: opened at the first position walked in an epoch, closed
+        /// when the walk leaves that epoch or stops.
+        std::optional<RefTxnId> segment_first;
+        std::vector<std::pair<RefTxnId, RefTxnId>> segments;
+        const auto closeSegment = [&]()
+        {
+            if (segment_first)
+                segments.emplace_back(*segment_first, resolved_through);
+            segment_first.reset();
+        };
+
+        while (expected)
+        {
+            /// GET + decode the expected record. Absence is the decision point of the whole walk, and
+            /// an invalid body is a per-namespace hold: the key belongs to exactly one namespace, so it
+            /// can never be grounds for discarding another namespace's fold.
+            const auto got = backend.get(layout.refLogKey(ns, *expected));
+            if (!got)
+            {
+                ++intake_absent_probes;
+                const auto witness = witnessAbove(*expected);
+                if (!witness)
+                    break;   /// nothing above: this is the namespace's frontier this round
+
+                if (witness->writer_epoch == expected->writer_epoch)
+                {
+                    hold(*expected, "ref intake: expected next id absent below a same-epoch witness -- "
+                                    "contiguity says this cannot happen, so a durable record is missing");
+                    break;
+                }
+
+                const auto crossed = crossFromSeal(resolved_through, last_applied_is_seal, *witness);
+                if (!crossed)
+                {
+                    hold(*expected, "ref intake: a later epoch's records are reachable but this epoch's "
+                                    "closing seal was never consumed (or the position they chain from is "
+                                    "not one) -- the crossing has no proof");
+                    break;
+                }
+                /// Every iteration must move `expected` strictly forward. A crossing that lands back on
+                /// the position just read as absent makes no progress and would spin: the epoch-start
+                /// record answered a GET inside `crossFromSeal` and then not here, so it is vanishing
+                /// under us. Treat it as the impossible shape it is.
+                if (!(*expected < *crossed))
+                {
+                    hold(*expected, "ref intake: the epoch crossing resolved back to the position that "
+                                    "just read absent -- the epoch-start record is not stably readable");
+                    break;
+                }
+                ++intake_epoch_crossings;
+                closeSegment();
+                expected = *crossed;
+                continue;
+            }
+            const RefTxnId log_id = *expected;
 
             /// Probe B2: open this transaction's ledger entry. A clamped log is opened but never
             /// committed, so it is correctly not reported unapplied.
             const uint32_t txn_ordinal = ledger.open(ns, log_id);
 
-            /// GET + decode the new log body. A missing or invalid log body aborts ref folding for the whole
-            /// round: the listed key was durable, so absence is input-visibility ambiguity,
-            /// never a partial ref delta.
-            const auto got = backend.get(layout.refLogKey(ns, log_id));
-            if (!got)
-            {
-                ref_folding_aborted = true;
-                report.recordAnomaly(ns, 0, ManifestId{ns, {}},
-                                     "ref log body vanished mid-fold: ref folding aborted this round");
-                break;
-            }
             ProfileEvents::increment(ProfileEvents::CasRefLogBodyGets);   /// one body GET per new log
             RefLogTxn txn;
             std::vector<RefManifestEdge> edges;
@@ -1505,18 +1703,16 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                 /// Extraction shares the decode try-block: an unrecognized owner_transition shape
                 /// (`manifestEdgesOfTxn` -> `classifyOwnerTransitionShape`, Pool/CasRefProtocol.cpp) is
                 /// exactly as untrustworthy as an undecodable body -- both mean this log cannot be
-                /// folded -- so both get the SAME "ref folding aborted this round" treatment below. Do
+                /// folded -- so both get the SAME per-namespace hold below. Do
                 /// NOT widen this catch over `foldManifestEdges` -- only intake, not the fold itself,
                 /// shares this discipline.
                 edges = manifestEdgesOfTxn(txn);
             }
             catch (const Exception & e)
             {
-                ref_folding_aborted = true;
-                report.recordAnomaly(ns, 0, ManifestId{ns, {}},
-                                     "ref log body invalid: ref folding aborted this round");
                 LOG_WARNING(logger, "CAS GC ref intake: log {} invalid: {}",
                             layout.refLogKey(ns, log_id), e.message());
+                hold(log_id, "ref log body invalid: namespace held below it");
                 break;
             }
 
@@ -1607,10 +1803,26 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             /// namespace-cleanup item; its owner-removal edges were folded above.
             if (const auto removal = removalTxnId(txn))
                 new_removals.emplace_back(ns, *removal);
+            if (!segment_first)
+                segment_first = log_id;    /// this epoch's contiguous run opens at the first applied id
             resolved_through = log_id;     /// this log fully folded
+            /// The KIND of the record the cursor now sits on, remembered for the crossing below: the
+            /// chain check proves the identity of the position an epoch chains from, never that that
+            /// position is a seal, and this is the one place the answer is free (the body is decoded and
+            /// in hand). See the crossing's own comment for the half of this that cannot be re-checked.
+            last_applied_is_seal = refLogTxnIsEpochSeal(txn);
             ++logs_applied;                /// probe B1: the SINGLE cursor-advance site
             table_changed = true;
+
+            /// The next position is arithmetic within this epoch. An `EpochSeal` needs no special case
+            /// here: it is applied like any other record (its edge list is empty, so it produces nothing
+            /// -- probe B2's `produced=false`), and the walk simply finds nothing at the position after it
+            /// and crosses through the seal chain above.
+            expected = RefTxnId{log_id.writer_epoch, log_id.ref_sequence + 1};
         }
+        closeSegment();
+        if (!segments.empty())
+            walked_segments[ns_str] = std::move(segments);
 
         cov.last_folded_ref_id = resolved_through;
         cov.classification = clamped ? 4 : (table_changed ? 2 : 1);
@@ -1646,35 +1858,60 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     }
 
     /// PROBE B1's recomputation, taken HERE rather than at the seal write: every input it reads
-    /// (`ref_tables`, `parent_cursors`, the sealed `per_ns_shard`) is final as of this line, and nothing
+    /// (`walked_segments`, the sealed `per_ns_shard`) is final as of this line, and nothing
     /// between here and the seal write touches any of them. Computing it inside the intake phase is what
     /// lets the `fold_ref_intake` row carry both numbers; the comparison and its fail-closed throw stay
     /// where they were, just before the seal write. Both stay 0 on a ref-folding abort -- that path
     /// discards every cursor advance and carries the parent cursors, so the identity does not apply.
-    logs_intended_this_round = 0;
+    ///
+    /// It counts the CUT ARITHMETICALLY, not by listed ids. Under arithmetic intake a listed-id count is
+    /// not even the right question: a hint hole means a round legitimately applies records the listing
+    /// never mentioned, so the old recomputation would report fewer logs than folded and fail every
+    /// healthy round on a lying store -- it would have made this task's own fix unshippable.
+    ///
+    /// BE HONEST ABOUT WHAT IS LEFT. The old formula could disagree with reality because it was derived
+    /// from a different source (the listing) than the counter. This one is derived from the runs the
+    /// single advance site produced, so for the current code shape it is close to tautological, and B1's
+    /// discriminating power went DOWN with this change rather than up. What it still asserts is worth
+    /// keeping and is not free: THE SEALED CURSOR IS THE WALK'S CURSOR. The last run of each namespace is
+    /// measured against the DURABLE `per_ns_shard` value the next round will trust, not against the
+    /// walk's own end, so a cursor sealed from anywhere other than this walk -- a stale carry, a mutated
+    /// coverage row, a future edit that advances the cursor away from the advance site -- either fails
+    /// the epoch/order check below or lands as a count that no longer matches `logs_applied`.
+    logs_accounted_this_round = 0;
     logs_applied_this_round = 0;
     if (!ref_folding_aborted)
     {
-        uint64_t logs_intended = 0;
-        for (const auto & [ns_str, listing] : ref_tables)
+        uint64_t logs_accounted = 0;
+        for (const auto & [ns_str, segments] : walked_segments)
         {
             const String cursor_key = cursorKey(RootNamespace{ns_str}, /*shard*/0);
-            RefTxnId cursor_prev{};
-            if (const auto pit = parent_cursors.find(cursor_key); pit != parent_cursors.end())
-                cursor_prev = pit->second.last_folded_ref_id;
             RefTxnId sealed{};
             if (const auto sit = result.fold_seal.per_ns_shard.find(cursor_key);
                 sit != result.fold_seal.per_ns_shard.end())
                 sealed = sit->second.last_folded_ref_id;
-            for (const RefTxnId & id : listing.logs)
-                if (cursor_prev < id && !(sealed < id))
-                    ++logs_intended;
+
+            for (size_t i = 0; i < segments.size(); ++i)
+            {
+                const auto & [first, last] = segments[i];
+                /// The final run must end exactly where the seal says this namespace stopped, in the same
+                /// epoch. A disagreement is a sealed cursor that did not come from this walk, so it fails
+                /// closed here rather than travelling into the next round's baseline.
+                const RefTxnId end = i + 1 == segments.size() ? sealed : last;
+                if (end.writer_epoch != first.writer_epoch || end < first)
+                    throw Exception(ErrorCodes::CORRUPTED_DATA,
+                        "CAS GC fold: namespace {} sealed a cursor at {} that does not close the run it "
+                        "walked (opened at {}). GC refuses to commit the round; recover with "
+                        "SYSTEM CONTENT ADDRESSED GC REBUILD.",
+                        ns_str, end == RefTxnId{} ? "none" : renderRefTxnId(end), renderRefTxnId(first));
+                logs_accounted += end.ref_sequence - first.ref_sequence + 1;
+            }
         }
-        logs_intended_this_round = logs_intended;
+        logs_accounted_this_round = logs_accounted;
         logs_applied_this_round = logs_applied;
     }
 
-    intake_timer->metric("logs_intended", logs_intended_this_round);
+    intake_timer->metric("logs_accounted", logs_accounted_this_round);
     intake_timer->metric("logs_applied", logs_applied_this_round);
     intake_timer->metric("deltas_emitted", deltas.size());
     intake_timer->metric("txns_opened", ledger.txns.size());
@@ -1682,6 +1919,13 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     intake_timer->metric("tables_changed", intake_tables_changed);
     intake_timer->metric("tables_clamped", intake_tables_clamped);
     intake_timer->metric("dead_precommits_skipped", intake_dead_precommits_skipped);
+    /// The exact reads arithmetic intake pays that the listing-driven loop did not. `absent_probes`
+    /// counts EVERY read that came back absent: the expected-next of each namespace walked (at least one
+    /// -- the absent expected-next IS the frontier proof) and the epoch-start read of a crossing that
+    /// failed, which a namespace that holds every round pays every round. `epoch_crossings` counts the
+    /// successful ones. Both are on the row so the cost shows up where it is spent.
+    intake_timer->metric("absent_probes", intake_absent_probes);
+    intake_timer->metric("epoch_crossings", intake_epoch_crossings);
     intake_timer->metric("namespace_removals", new_removals.size());
     intake_timer->metric("ref_folding_aborted", ref_folding_aborted ? 1 : 0);
     intake_timer.reset();   /// emits the `fold_ref_intake` row
@@ -2020,12 +2264,12 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// recomputation there, which is also what the `fold_ref_intake` row reports) and are 0 on a
     /// ref-folding abort, where the identity does not apply -- so the inequality below can only fire on
     /// a round that actually folded.
-    if (logs_intended_this_round != logs_applied_this_round)
+    if (logs_accounted_this_round != logs_applied_this_round)
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "CAS GC fold: the round sealed coverage over {} ref log(s) but only {} fully folded -- "
             "a cursor advanced past a log this round never applied. GC refuses to commit the round; "
             "recover with SYSTEM CONTENT ADDRESSED GC REBUILD.",
-            logs_intended_this_round, logs_applied_this_round);
+            logs_accounted_this_round, logs_applied_this_round);
 
     /// PHASE 10/18 `fold_seal_write`: one PUT (or, on a deterministic replay, a byte-compare GET).
     {

@@ -845,7 +845,7 @@ def capture_phase_summary(cluster, label, *, since_ts, coverage, conn=None, ts=N
 
     The eighteen `event_type = 'Phase'` rows a folding round emits are the only artifact that can
     answer "where did this round spend its time"; they are also where the four detector values now
-    surface (`fold_ref_list.probe_a_holes`, `fold_ref_intake.logs_intended`/`logs_applied`,
+    surface (`fold_ref_list.probe_a_holes`, `fold_ref_intake.logs_accounted`/`logs_applied`,
     `fold_reduce.txns_unapplied`). They are captured PER CHECKPOINT rather than only printed because
     the load study that comes next needs them after the run has ended.
 

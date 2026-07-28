@@ -61,7 +61,7 @@ ColumnsDescription ContentAddressedGarbageCollectionLogElement::getColumnsDescri
         {"phase_duration_us", std::make_shared<DataTypeUInt64>(),
             "Wall-clock duration of this phase in microseconds (Phase rows only). Microseconds because several phases are routinely sub-millisecond and the point is to see when they are not. Phase durations do not sum to the round's `duration_ms`: the round also does untimed bookkeeping between phases."},
         {"phase_metrics", std::make_shared<DataTypeMap>(lc_string, std::make_shared<DataTypeUInt64>()),
-            "Phase-specific semantic counts a phase computes for itself and no ProfileEvent can supply (Phase rows only) — for example `changed_shards` on defer_decision, `probe_a_holes` on fold_ref_list, `logs_intended`/`logs_applied` on fold_ref_intake, `txns_unapplied` on fold_reduce, `jobs_scheduled`/`jobs_completed` on meta_pool_wait. The verb counts ride the `ProfileEvents` column of the same row."},
+            "Phase-specific semantic counts a phase computes for itself and no ProfileEvent can supply (Phase rows only) — for example `changed_shards` on defer_decision, `probe_a_holes` on fold_ref_list, `logs_accounted`/`logs_applied` on fold_ref_intake, `txns_unapplied` on fold_reduce, `jobs_scheduled`/`jobs_completed` on meta_pool_wait. The verb counts ride the `ProfileEvents` column of the same row."},
     };
 }
 

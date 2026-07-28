@@ -14,6 +14,7 @@ import pytest
 from soak.cluster import QueryError
 from soak.signals import (
     CAS_SIGNAL_EVENTS,
+    DETECTOR_METRICS,
     PhaseCoverage,
     SignalTracker,
     SignalsUnsupported,
@@ -164,7 +165,7 @@ def _phase_row(phase, **kw):
         "total_us": "1000",
         "max_us": "600",
         "probe_a_holes": "0",
-        "logs_intended": "0",
+        "logs_accounted": "0",
         "logs_applied": "0",
         "txns_unapplied": "0",
         "ref_folding_aborted": "0",
@@ -172,6 +173,12 @@ def _phase_row(phase, **kw):
         "events": {},
     }
     row.update(kw)
+    if "metrics" not in kw:
+        # A phase that RAN emits its own detector metrics unconditionally, so a realistic summed map
+        # carries them. `summarize_phases` reads exactly this to tell an absent key (renamed metric)
+        # from a zero value, so a fixture with an empty map would be an unrealistic row that trips the
+        # guard rather than the behaviour under test.
+        row["metrics"] = {m: row[m] for p, m in DETECTOR_METRICS if p == phase}
     return json.dumps(row)
 
 
@@ -182,7 +189,7 @@ def test_phase_summary_sql_scopes_to_phase_rows_and_the_window():
     # round_id, not `round`: `round` is 0 on Start and nonexistent on a non-leader round, i.e. absent
     # from exactly the rounds worth correlating.
     assert "uniqExact(round_id)" in sql
-    for detector in ("probe_a_holes", "logs_intended", "logs_applied", "txns_unapplied"):
+    for detector in ("probe_a_holes", "logs_accounted", "logs_applied", "txns_unapplied"):
         assert f"phase_metrics['{detector}']" in sql
 
 
@@ -213,16 +220,31 @@ def test_summarize_ranks_the_slowest_phases():
 def test_summarize_surfaces_the_detector_values():
     text = "\n".join([
         _phase_row("fold_ref_list", probe_a_holes="4", ref_folding_aborted="1"),
-        _phase_row("fold_ref_intake", logs_intended="10", logs_applied="7"),
+        _phase_row("fold_ref_intake", logs_accounted="10", logs_applied="7"),
         _phase_row("fold_reduce", txns_unapplied="3"),
     ])
     s = summarize_phases(parse_phase_summary(text))
     assert s["detector"]["fold_ref_list.probe_a_holes"] == 4
     assert s["detector"]["fold_ref_list.ref_folding_aborted"] == 1
     assert s["detector"]["fold_reduce.txns_unapplied"] == 3
-    # The identity the intake pair exists to check: everything intended reached the cursor-advance site.
+    # The identity the intake pair exists to check: every position the sealed cut covers reached the
+    # single cursor-advance site.
     assert s["intake_mismatch"] == 3
     assert "probe_a_holes=4" in format_phase_summary(s)
+
+
+def test_a_renamed_phase_metric_fails_closed_instead_of_reading_zero():
+    """`sum(phase_metrics['x'])` is a DEFINED zero for an absent key, so a metric renamed in the server
+    would report 0 forever and `intake_mismatch` would silently become `-logs_applied` on every healthy
+    round. That already happened once (`logs_intended` -> `logs_accounted`) and nothing caught it. A
+    phase that RAN emits its own detector metrics unconditionally, so an absent key in the summed map
+    means the NAME moved — fail closed, exactly as an unknown `system.events` counter does."""
+    text = _phase_row("fold_ref_intake", logs_accounted="0", logs_applied="7",
+                      metrics={"logs_applied": "7", "some_future_name": "7"})
+    with pytest.raises(SignalsUnsupported) as e:
+        summarize_phases(parse_phase_summary(text))
+    assert "logs_accounted" in str(e.value)
+    assert "some_future_name" in str(e.value), "the message must name the keys that ARE there"
 
 
 def test_a_phase_that_never_ran_is_absent_not_zero():

@@ -571,12 +571,14 @@ private:
     /// profile event, which `fold` increments by the same amount.
     uint64_t probe_a_holes_this_round = 0;
 
-    /// Probe B1's two numbers for the round: the ref logs the sealed coverage declares covered, and the
-    /// ref logs that actually folded. They are EQUAL on every committed round (the fold throws
-    /// otherwise) -- carrying them is what turns "they are always equal" from an assumption into an
-    /// observable property once the per-phase GC row emitter reports them on the `fold_ref_intake` row.
+    /// Probe B1's two numbers for the round: the ref-log POSITIONS the sealed coverage declares covered
+    /// (counted arithmetically over each namespace's cut -- not by listed ids, which under arithmetic
+    /// intake say nothing about what was applied), and the ref logs that actually folded. They are EQUAL
+    /// on every committed round (the fold throws otherwise) -- carrying them is what turns "they are
+    /// always equal" from an assumption into an observable property once the per-phase GC row emitter
+    /// reports them on the `fold_ref_intake` row.
     /// Both stay 0 on a ref-folding abort, where the identity does not apply.
-    uint64_t logs_intended_this_round = 0;
+    uint64_t logs_accounted_this_round = 0;
     uint64_t logs_applied_this_round = 0;
 
     /// Probe B2's verdict for the round: ref transactions the round folded and merged but whose blob
