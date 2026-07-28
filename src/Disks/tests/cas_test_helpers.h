@@ -1061,6 +1061,72 @@ private:
     uint64_t list_total = 0;
 };
 
+/// Stand in for the self-remount that `Pool::reportImpossibleInterference` schedules. That reaction
+/// trips the local write fence closed AND schedules a remount; a unit-test Pool runs no background
+/// remount (`background_watermark` is off by design there), so without this the fence stays closed and
+/// every later mutation is refused at the gate -- which is a test-harness artifact, not the production
+/// behaviour. Re-arming directly is the smallest faithful stand-in: it restores writability without the
+/// claim machinery and without discarding the cached ref runtimes, so a test can observe what happens
+/// AFTER the reaction. It bumps the fence GENERATION, exactly as a real re-arm does.
+inline void rearmMountFenceAfterAnomalyForTest(const DB::Cas::PoolPtr & store)
+{
+    store->armMountFence(DB::UInt128{0, 1}, store->liveWriterEpoch(), store->bootMsNow() + 600000);
+}
+
+/// Delegates the FIRST matching `putIfAbsent` to `CountingBackend` -- so the write actually LANDS --
+/// and only THEN throws an ambiguous exception, modelling "our own PUT committed but its response was
+/// lost". Every later call behaves normally, so a caller that retries the SAME (key, bytes) meets its
+/// OWN earlier write as the occupant: the exact input the every-attempt rule's adoption arm adjudicates
+/// (`slotOccupy` reports `Occupied` with bytes equal to the attempt's own).
+///
+/// `key_substr` empty means "the first putIfAbsent of any key"; set it to scope the fault to one key
+/// family when the caller drives a whole Pool (whose bootstrap PUTs would otherwise consume the fault).
+///
+/// Shared rather than TU-local because two suites need exactly this shape: `gtest_cas_slot_occupy.cpp`
+/// pins the primitive's same-call resolve, and `gtest_cas_ref_wedge_every_attempt.cpp` drives the
+/// writer's wedge adoption through it.
+class LandedButAckLostOnceBackend : public CountingBackend
+{
+public:
+    using CountingBackend::putIfAbsent;
+    using CountingBackend::get;
+    String key_substr;
+    bool fired = false;
+    /// Also lose the caller's IMMEDIATE resolve read of the same key, once. Needed only by a caller
+    /// whose conditional-write layer resolves before reissuing (`putIfAbsentControlled`): without it
+    /// that resolve proves the object durable inside the very same attempt and reports `Committed`, so
+    /// no wedge over a DURABLE object can ever form. `slotOccupy` needs no such thing -- it has no
+    /// retry loop -- which is why this defaults off and this file's original caller is unaffected.
+    bool lose_resolve_read = false;
+
+    DB::Cas::PutResult putIfAbsent(const String & key, const String & bytes, const DB::Cas::ObjectMeta & meta) override
+    {
+        if (!fired && (key_substr.empty() || key.find(key_substr) != String::npos))
+        {
+            fired = true;
+            CountingBackend::putIfAbsent(key, bytes, meta);   /// the write LANDS
+            if (lose_resolve_read)
+                fail_get_once_key = key;
+            throw Poco::TimeoutException("LandedButAckLostOnceBackend: simulated lost PUT response");
+        }
+        return CountingBackend::putIfAbsent(key, bytes, meta);
+    }
+
+    std::optional<DB::Cas::GetResult> get(const String & key, DB::Cas::Range range) override
+    {
+        if (!fail_get_once_key.empty() && key == fail_get_once_key)
+        {
+            fail_get_once_key.clear();
+            throw Poco::TimeoutException(
+                "LandedButAckLostOnceBackend: simulated lost GET (read response never arrived)");
+        }
+        return CountingBackend::get(key, range);
+    }
+
+private:
+    String fail_get_once_key;
+};
+
 /// A `CountingBackend` that can fault selected PUTs by key substring (skip the first `fault_skip`
 /// matches, then fault the next `fault_count`), and can latch a matching PUT mid-flight. Same class of
 /// seam as the wedge tests in `gtest_cas_ref_writer.cpp` use

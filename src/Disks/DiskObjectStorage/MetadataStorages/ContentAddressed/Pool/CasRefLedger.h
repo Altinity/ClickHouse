@@ -97,6 +97,17 @@ public:
         /// Callbacks into mount and watermark state owned by `Pool`, bound for this ledger's lifetime:
         std::function<uint64_t()> live_epoch_fn_,
         std::function<bool()> fence_ok_fn_,
+        /// The two fence-GENERATION primitives (`CasMountRuntime::fenceGeneration`/`checkFenceOrThrow`),
+        /// injected exactly as `CasPlainObjects` takes them. `fence_ok_fn` above answers "may this mount
+        /// write AT ALL, right now"; these two answer the different question an append lane must ask
+        /// across an I/O window: "is this still the SAME mount incarnation that admitted the transaction
+        /// I am about to act on?" A wedge captures the generation at admission and presents it back on
+        /// every later retry and before every install, so a result that returns after a fence loss or a
+        /// re-arm is inert for the superseded runtime instead of installing a stale view (spec §3,
+        /// "the mount-fence generation is captured at admission and required on every slot-occupy and
+        /// install").
+        std::function<uint64_t()> fence_generation_fn_,
+        std::function<void(uint64_t)> check_fence_or_throw_,
         std::function<uint64_t()> boot_ms_now_fn_,
         std::function<bool()> may_mutate_,
         std::function<uint64_t()> unclean_boundary_epoch_,
@@ -228,9 +239,21 @@ public:
     bool refLaneWedgedForTest(const RootNamespace & ns);
     /// Returns the object key retained for the unresolved append of `ns`.
     String wedgedKeyForTest(const RootNamespace & ns);
+    /// Returns the fence generation retained with the unresolved append of `ns` (0 when not wedged).
+    uint64_t wedgedAdmittedGenerationForTest(const RootNamespace & ns);
     /// Installs a synthetic unresolved append for `ns` so callers can exercise resolution and blocking.
+    /// `admitted_generation` defaults to the CURRENT fence generation, which is what a real wedge born
+    /// now would carry; pass an explicit value to model a wedge admitted under an older incarnation.
     void forceWedgeForTest(const RootNamespace & ns, uint64_t writer_epoch, uint64_t ref_sequence,
-                           const String & key, const String & bytes);
+                           const String & key, const String & bytes,
+                           std::optional<uint64_t> admitted_generation = std::nullopt);
+    /// Returns the seal that closed `ns`'s previous writer epoch -- the `prev_epoch_seal` its next
+    /// sequence-1 append will carry (`nullopt` at genesis). See `RefTableRuntime::last_epoch_seal`.
+    std::optional<RefTxnId> lastEpochSealForTest(const RootNamespace & ns);
+    /// Installs `seal` as `ns`'s last epoch seal, standing in for the recovery CAS-walk that produces it
+    /// in production (Task 6). Lets a writer-side test drive the ordinary post-transition append without
+    /// a whole recovery.
+    void setLastEpochSealForTest(const RootNamespace & ns, const std::optional<RefTxnId> & seal);
     /// Returns the post-durable install marker of `ns` (spec §A2; see `RefApplyState`). Reads the
     /// runtime's atomic directly -- no lock, and no recovery is forced beyond the runtime materialization
     /// every other seam here already performs.
@@ -366,6 +389,8 @@ private:
     CasRequestBudget cas_request_budget;
     std::function<uint64_t()> live_epoch_fn;
     std::function<bool()> fence_ok_fn;
+    std::function<uint64_t()> fence_generation_fn;
+    std::function<void(uint64_t)> check_fence_or_throw;
     std::function<uint64_t()> boot_ms_now_fn;
     std::function<bool()> may_mutate;
     std::function<uint64_t()> unclean_boundary_epoch;
@@ -380,11 +405,25 @@ private:
 
     /// Describes the one conditional `PUT` whose outcome is still uncertain for a table. It remains in
     /// the runtime until the object is confirmed durable and applied to the cache, or definitely rejected.
+    ///
+    /// The four fields together are the wedge's IDENTITY, and all four are compared before any later
+    /// result is acted on (`resolveWedgeOnce`'s post-I/O recheck). Comparing the id alone -- or the
+    /// admission generation alone -- is the aliasing bug the phase-0 model found: two attempts of the
+    /// same table can carry the same id under the same generation and describe DIFFERENT bytes, and
+    /// installing one attempt's candidate because the other's key resolved is precisely the
+    /// acked-then-lost class this every-attempt rule exists to close.
     struct RefAppendWedge
     {
         RefTxnId txn_id;
         String key;
         String bytes;
+        /// `CasMountRuntime::fenceGeneration()` as read at this transaction's ADMISSION -- the same
+        /// critical section that snapshotted the state and derived the id, i.e. one atomic reading of
+        /// "what this attempt was allowed to do". Every later `slotOccupy` retry is gated on THIS value
+        /// (never the current one), and every install is preceded by presenting it back through
+        /// `checkFenceOrThrow`: a retry admitted under a dead incarnation must send nothing, and a
+        /// result that returns after a fence bump/re-arm must install nothing.
+        uint64_t admitted_fence_generation = 0;
     };
 
     /// One queued append caller. `build_ops` is invoked at most once by the flush leader and returns the
@@ -425,6 +464,24 @@ private:
         /// checks.
         std::set<RefTxnId> cleanup_markers;
         std::optional<RefAppendWedge> wedge;
+        /// The `EpochSeal` transaction that closed this namespace's PREVIOUS writer epoch -- exactly the
+        /// `prev_epoch_seal` that this table's next sequence-1 transaction must carry (INV-2's grammar:
+        /// required on sequence 1 of every epoch above the namespace's genesis, forbidden everywhere
+        /// else). Guarded by `state_mutex`, and read in the SAME hold that derives the id, so the field
+        /// and the sequence number it qualifies are one reading.
+        ///
+        /// `nullopt` means GENESIS, and it means it exactly: the namespace's recovered state contains no
+        /// seal and its `greatest_applied.writer_epoch` is its own `life_epoch`, so its first
+        /// transaction opens the stream rather than continuing one across a transition. A namespace born
+        /// at global epoch 5 therefore appends `{5, 1}` with NO `prev_epoch_seal`; its first transition
+        /// (5 -> 6) seals `{5, T+1}`, and the `{6, 1}` that follows carries that seal.
+        ///
+        /// Two producers set it: the wedge resolution, when a successor's seal is found occupying the
+        /// wedged key (`resolveWedgeOnce`'s conclusive-rejection arm -- the seal it observed IS this
+        /// namespace's epoch-closing record), and recovery's CAS-walk, which installs the last seal of
+        /// the chain it walked (Task 6). Nothing else writes it: a seal is durable evidence, never a
+        /// local guess.
+        std::optional<RefTxnId> last_epoch_seal;
         /// The post-durable install marker (spec §A2; see `RefApplyState` for the state machine and for
         /// why it is an assert layer rather than a fence). Atomic and RELAXED because it is written
         /// inside the install regions, which must not allocate and must not take another lock -- and
@@ -631,6 +688,47 @@ private:
     /// tenure via `commitRefChunk` -- each a complete commit boundary.
     void flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt,
                        std::vector<std::shared_ptr<RefMutationItem>> & owned_items);
+
+    /// What one bounded wedge-resolution attempt decided. `Adopted` is the ONLY outcome that lets the
+    /// flush proceed to carve a new batch; every other one fails the whole carve with
+    /// `survivor_error` and returns, because the lane is either still uncertain or deliberately closed.
+    enum class WedgeResolution : uint8_t
+    {
+        NoWedge,      /// nothing was wedged -- the ordinary flush
+        Adopted,      /// the wedged transaction is durable; it is installed and the lane is clear
+        Rejected,     /// a successor's `EpochSeal` occupies the key: the operation never landed and never will
+        StillWedged,  /// unresolved, refused pre-attempt, or superseded -- the wedge is intact
+        Corrupted,    /// a foreign non-seal object occupies the key -- impossible under mount exclusivity
+    };
+
+    struct WedgeResolutionResult
+    {
+        WedgeResolution kind = WedgeResolution::NoWedge;
+        /// The error every queued caller of THIS flush receives, for every kind except `NoWedge` and
+        /// `Adopted`. Built by `resolveWedgeOnce`, which is the only place that knows which of the
+        /// several very different reasons applied.
+        std::exception_ptr survivor_error;
+    };
+
+    /// ONE bounded resolution attempt for `rt`'s outstanding wedge (spec INV-1's every-attempt rule):
+    /// at most one `slotOccupy(wedge.key, wedge.bytes, ...)` per calling flush, gated on the wedge's
+    /// ORIGINAL `admitted_fence_generation` rather than the current one. There is deliberately NO
+    /// background retry thread and no deadline-resetting loop: a permanently quiet wedged namespace
+    /// waits for its next caller or for a remount, which is acceptable precisely because the wedged
+    /// operation was never acknowledged.
+    ///
+    /// The conditional CREATE is what makes the rule "every attempt has its own conclusive rejection"
+    /// affordable: the ref-log key is write-once, so a create either lands our exact bytes (the
+    /// transaction is durable -- and it is the SAME transaction, byte for byte) or conflicts with
+    /// whatever is there, which the follow-up read then names. A read alone could only ever report
+    /// "absent", which is not a rejection: the earlier ambiguous attempt could still land afterwards.
+    ///
+    /// Post-I/O recheck: the outcome is adjudicated on an I/O result, so before ANY action follows from
+    /// it (adopt, acknowledge, unwedge, fail the survivors) this re-acquires `state_mutex`, presents
+    /// `admitted_fence_generation` back through `checkFenceOrThrow`, and compares the full wedge
+    /// identity against what is still installed. A result that returns after a fence bump/re-arm, or
+    /// after the wedge it belonged to was replaced, is INERT for this runtime.
+    WedgeResolutionResult resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt);
 
     /// Commits ONE chunk of a `flushRefBatch` tenure as a complete ref-log transaction: allocates the
     /// real transaction id, applies `chunk_ops` to a CANDIDATE copy of `rt->state`, encodes and durably

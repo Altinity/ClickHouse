@@ -188,6 +188,8 @@ Pool::Pool(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
           config.boot_ms_fn,
           [this] { return liveWriterEpoch(); },
           [this] { return refAppendFenceOk(); },
+          [this] { return mount_runtime.fenceGeneration(); },
+          [this] (uint64_t gen) { mount_runtime.checkFenceOrThrow(gen); },
           [this] { return bootMsNow(); },
           [this] { return mayMutate(); },
           [this] { return mount_runtime.uncleanEpochBoundarySeenAtRelaxed(); },
@@ -1596,9 +1598,25 @@ String Pool::wedgedKeyForTest(const RootNamespace & ns)
 }
 
 void Pool::forceWedgeForTest(const RootNamespace & ns, uint64_t writer_epoch, uint64_t ref_sequence,
-                              const String & key, const String & bytes)
+                              const String & key, const String & bytes,
+                              std::optional<uint64_t> admitted_generation)
 {
-    ref_ledger.forceWedgeForTest(ns, writer_epoch, ref_sequence, key, bytes);
+    ref_ledger.forceWedgeForTest(ns, writer_epoch, ref_sequence, key, bytes, admitted_generation);
+}
+
+uint64_t Pool::wedgedAdmittedGenerationForTest(const RootNamespace & ns)
+{
+    return ref_ledger.wedgedAdmittedGenerationForTest(ns);
+}
+
+std::optional<RefTxnId> Pool::lastEpochSealForTest(const RootNamespace & ns)
+{
+    return ref_ledger.lastEpochSealForTest(ns);
+}
+
+void Pool::setLastEpochSealForTest(const RootNamespace & ns, const std::optional<RefTxnId> & seal)
+{
+    ref_ledger.setLastEpochSealForTest(ns, seal);
 }
 
 RefApplyState Pool::applyStateForTest(const RootNamespace & ns)

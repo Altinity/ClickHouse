@@ -205,6 +205,18 @@ public:
     /// post-durable install region that is about to rethrow, where anything that could fail must not run.
     void noteDurableIdNotApplied(const RefTxnId & id) noexcept { durable_floor = std::max(durable_floor, id); }
 
+    /// Whether `id` is already accounted for by the durable floor, i.e. whether a previous
+    /// `noteDurableIdNotApplied` already recorded it (or a later id) as durable-but-never-applied here.
+    ///
+    /// The one caller is the wedge resolution's floor reconciliation: a wedge-resolution install that
+    /// threw raised the floor over the wedged id AND left the wedge in place, so the NEXT resolution of
+    /// that same wedge must recognise that the transaction is already accounted for and clear the wedge
+    /// without re-applying it. Without that, the retry rebuilds a candidate whose id sits AT the floor,
+    /// which `applyTxnInPlace` (correctly) rejects -- and the lane stays wedged for the runtime's life.
+    /// A predicate rather than a getter on purpose: "is this id below the floor" is the only question
+    /// anyone outside this class may ask, and it cannot be misused to reconstruct an allocator.
+    bool durableFloorCovers(const RefTxnId & id) const noexcept { return !(durable_floor < id); }
+
     /// State-install point only (once per ref-log flush, never per batch item): folds the committed
     /// map's and the owned-manifest index's COW overlays into their bases -- in place when the base is
     /// uniquely owned (the production flush case), else into a fresh base (see each container's

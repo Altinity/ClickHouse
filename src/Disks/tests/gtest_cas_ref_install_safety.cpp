@@ -348,8 +348,14 @@ TEST(CasRefInstallSafety, PreAttemptRefusalAfterAWedgeResolutionLeavesTheLaneCle
     ASSERT_EQ(store->tailSinceSnapshotCountForTest(ns), tail_after_seed);
 
     backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::None;
-    store->setMountDeadline(FENCE_DEADLINE_REFUSES_ATTEMPT_MS);
+    /// The wedge resolution is itself a conditional CREATE under the every-attempt rule, so it is
+    /// fence-gated like any other write: shortening the lease BEFORE the flush would refuse the
+    /// resolution too, and there would be no "after a wedge resolution" left to test. Shorten it
+    /// BETWEEN the two instead -- the pre-carve hook fires exactly there, after the wedge block and
+    /// before the batch is carved.
+    store->setRefPreCarveHookForTest([&] { store->setMountDeadline(FENCE_DEADLINE_REFUSES_ATTEMPT_MS); });
     const String message = retryLaterMessageOf([&] { store->dropRef(ns, "y"); });
+    store->setRefPreCarveHookForTest(nullptr);
 
     EXPECT_NE(message.find("no attempt was sent"), String::npos) << message;
     EXPECT_FALSE(store->refLaneWedgedForTest(ns))
@@ -391,10 +397,12 @@ TEST(CasRefInstallSafety, AmbiguousChunkAfterAWedgeResolutionRewedgesTheLane)
     const String first_wedged_key = store->wedgedKeyForTest(ns);
     ASSERT_FALSE(first_wedged_key.empty());
 
-    /// The resolving GET of the wedged key is NOT faulted (the fault modes intercept `putIfAbsent`, and
-    /// `LandedThenLost`'s one-shot lost read was consumed inside the previous attempt), so the wedge
-    /// resolves `Committed`; the fault below then hits this flush's OWN chunk PUT.
+    /// The resolution is a conditional CREATE at the wedged key now, and that key already holds our
+    /// own landed object, so it conflicts and the follow-up read adopts it (`LandedThenLost`'s one-shot
+    /// lost read was consumed inside the previous attempt, so this read succeeds). `fault_skip` lets
+    /// that create through and puts the fault on this flush's OWN chunk PUT, which is the subject.
     backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::Unresolved;
+    backend->fault_skip = 1;
     backend->fault_count = 1;
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "y"); });
 
@@ -694,12 +702,11 @@ TEST(CasRefInstallSafety, DefiniteFailureClearsTheApplyMarker)
 /// plain "absent" verdict -- absent or unreadable is `Unresolved`, since another attempt may still be
 /// legal -- so this arm is the whole of "a resolution that proves the key is not ours".
 ///
-/// Release-only, with the death twin below: the anomaly reaction raises `LOGICAL_ERROR`, which aborts
-/// the process in debug/sanitizer builds instead of behaving like a catchable exception (same split as
-/// `CasAnomalyPolicy.ForeignBytesAtWedgeKeyTripFenceAndRemount`, whose fence/audit assertions this test
-/// deliberately does not repeat). The marker is cleared BEFORE that reaction, so the ordering is not
-/// what makes this release-only -- the abort is.
-#ifndef DEBUG_OR_SANITIZER_BUILD
+/// Runs in every build: the arm reports `CORRUPTED_DATA` (storage-controlled input must never be able
+/// to abort the server), where it used to raise the process-aborting `LOGICAL_ERROR` and this test had
+/// to be release-only with a death-test twin standing in. The marker is cleared BEFORE the anomaly
+/// reaction, which is what this test pins; the fence/audit half is
+/// `CasAnomalyPolicy.ForeignBytesAtWedgeKeyTripFenceAndRemount`'s.
 TEST(CasRefInstallSafety, WedgeResolutionProvenForeignClearsTheApplyMarker)
 {
     auto backend = std::make_shared<DB::Cas::tests::ChunkFaultBackend>();
@@ -722,7 +729,7 @@ TEST(CasRefInstallSafety, WedgeResolutionProvenForeignClearsTheApplyMarker)
     ASSERT_FALSE(wedged_key.empty());
     ASSERT_EQ(backend->putIfAbsent(wedged_key, "a-different-object").outcome, PutOutcome::Done);
 
-    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&] { store->dropRef(ns, "y"); });
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { store->dropRef(ns, "y"); });
 
     EXPECT_TRUE(store->refLaneWedgedForTest(ns))
         << "foreign interference keeps the wedge for inspection (fail closed)";
@@ -730,34 +737,6 @@ TEST(CasRefInstallSafety, WedgeResolutionProvenForeignClearsTheApplyMarker)
         << "our transaction provably never landed at that write-once key, so no apply is owed -- this is "
            "the one state where a wedged lane is legitimately not ApplyPending";
 }
-#endif
-
-#if defined(DEBUG_OR_SANITIZER_BUILD)
-TEST(CasRefInstallSafetyDeathTest, WedgeResolutionProvenForeignAborts)
-{
-    auto backend = std::make_shared<DB::Cas::tests::ChunkFaultBackend>();
-    auto store = openPoolSingleAttempt(backend);
-    const RootNamespace ns{"srv1/apply_state_foreign_wedge"};
-
-    publishEmptyPart(store, ns, "x");
-    publishEmptyPart(store, ns, "y");
-
-    backend->fault_substr = store->layout().refsNamespacePrefix(ns) + "_log/";
-    backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::Unresolved;
-    backend->fault_count = 1;
-    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
-
-    backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::None;
-    const String wedged_key = store->wedgedKeyForTest(ns);
-    ASSERT_FALSE(wedged_key.empty());
-    ASSERT_EQ(backend->putIfAbsent(wedged_key, "a-different-object").outcome, PutOutcome::Done);
-
-    /// The release build's marker assertion cannot be made here -- there is no post-abort state to
-    /// inspect. This twin only pins that the anomaly still aborts, so the `#ifndef` above is not
-    /// silently skipping a test that would otherwise pass.
-    EXPECT_DEATH({ store->dropRef(ns, "y"); }, "");
-}
-#endif
 
 /// `ApplyPending -> Poisoned` at install region 1 (`commitRefChunk`'s candidate install). Unreachable
 /// in production with §A1 landed -- the region allocates nothing -- so the probe seam is what simulates

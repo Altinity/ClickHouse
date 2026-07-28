@@ -24,7 +24,9 @@ namespace DB
 {
 namespace ErrorCodes
 {
+    extern const int CORRUPTED_DATA;
     extern const int FILE_DOESNT_EXIST;
+    extern const int INVALID_STATE;
     extern const int LIMIT_EXCEEDED;
     extern const int LOGICAL_ERROR;
     extern const int NETWORK_ERROR;
@@ -93,6 +95,8 @@ CasRefLedger::CasRefLedger(
     std::function<uint64_t()> controller_boot_ms_fn,
     std::function<uint64_t()> live_epoch_fn_,
     std::function<bool()> fence_ok_fn_,
+    std::function<uint64_t()> fence_generation_fn_,
+    std::function<void(uint64_t)> check_fence_or_throw_,
     std::function<uint64_t()> boot_ms_now_fn_,
     std::function<bool()> may_mutate_,
     std::function<uint64_t()> unclean_boundary_epoch_,
@@ -106,6 +110,8 @@ CasRefLedger::CasRefLedger(
     , cas_request_budget(cas_request_budget_)
     , live_epoch_fn(std::move(live_epoch_fn_))
     , fence_ok_fn(std::move(fence_ok_fn_))
+    , fence_generation_fn(std::move(fence_generation_fn_))
+    , check_fence_or_throw(std::move(check_fence_or_throw_))
     , boot_ms_now_fn(std::move(boot_ms_now_fn_))
     , may_mutate(std::move(may_mutate_))
     , unclean_boundary_epoch(std::move(unclean_boundary_epoch_))
@@ -961,13 +967,39 @@ String CasRefLedger::wedgedKeyForTest(const RootNamespace & ns)
     return rt->wedge ? rt->wedge->key : String{};
 }
 
-void CasRefLedger::forceWedgeForTest(const RootNamespace & ns, uint64_t writer_epoch, uint64_t ref_sequence,
-                              const String & key, const String & bytes)
+uint64_t CasRefLedger::wedgedAdmittedGenerationForTest(const RootNamespace & ns)
+{
+    const auto rt = getRefTableRuntime(ns);
+    std::lock_guard lock(rt->state_mutex);
+    return rt->wedge ? rt->wedge->admitted_fence_generation : 0;
+}
+
+std::optional<RefTxnId> CasRefLedger::lastEpochSealForTest(const RootNamespace & ns)
+{
+    const auto rt = getRefTableRuntime(ns);
+    std::lock_guard lock(rt->state_mutex);
+    return rt->last_epoch_seal;
+}
+
+void CasRefLedger::setLastEpochSealForTest(const RootNamespace & ns, const std::optional<RefTxnId> & seal)
 {
     const auto rt = getRefTableRuntime(ns);
     ensureRefTableRecovered(ns, *rt);
     std::lock_guard lock(rt->state_mutex);
-    rt->wedge = RefAppendWedge{RefTxnId{writer_epoch, ref_sequence}, key, bytes};
+    rt->last_epoch_seal = seal;
+}
+
+void CasRefLedger::forceWedgeForTest(const RootNamespace & ns, uint64_t writer_epoch, uint64_t ref_sequence,
+                              const String & key, const String & bytes,
+                              std::optional<uint64_t> admitted_generation)
+{
+    const auto rt = getRefTableRuntime(ns);
+    ensureRefTableRecovered(ns, *rt);
+    /// Read outside `state_mutex`: it is an atomic load on the mount runtime, and taking it here keeps
+    /// the seam's default identical to what a wedge born at this instant would carry.
+    const uint64_t generation = admitted_generation.value_or(fence_generation_fn());
+    std::lock_guard lock(rt->state_mutex);
+    rt->wedge = RefAppendWedge{RefTxnId{writer_epoch, ref_sequence}, key, bytes, generation};
     /// A wedge -- synthetic or not -- IS "a ref-log object that may be durable and is not applied", so
     /// the seam reproduces the whole runtime state the production `Unresolved` arm leaves behind, marker
     /// included. Nothing reads the marker to make a decision (spec §A2: assert layer, not fence), so this
@@ -1292,6 +1324,379 @@ void CasRefLedger::poisonApplyState(RefTableRuntime & rt, const RootNamespace & 
     }
 }
 
+CasRefLedger::WedgeResolutionResult
+CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt)
+{
+    WedgeResolutionResult result;
+
+    /// ---- Read the wedge and prepare EVERYTHING that can throw, before any I/O (spec §A1, site 2) ----
+    RefAppendWedge wedge;
+    std::optional<RefTableState> candidate;
+    RefTxnId candidate_base_id;
+    {
+        std::lock_guard lock(rt->state_mutex);
+        if (!rt->wedge)
+            return result;   /// NoWedge -- the ordinary flush pays nothing for any of this
+
+        /// DURABLE-FLOOR RECONCILIATION. The floor is raised over an id by exactly one thing: a
+        /// post-durable install that threw after its object was PROVEN durable -- and the wedge
+        /// resolution's own install is one of the two places that can do it. That failure leaves this
+        /// exact state behind: the transaction is durable, the floor records it, the table is
+        /// `Poisoned` (so this cache will never contain it), and the wedge is still installed because
+        /// the swap that would have cleared it never ran.
+        ///
+        /// Re-resolving it would be worse than pointless. The candidate rebuilt below would carry an id
+        /// AT the floor, which `applyTxnInPlace` (correctly) refuses as non-contiguous -- so every later
+        /// flush would throw in the same place and the lane would stay wedged for the runtime's life.
+        /// The transaction is already accounted for: retire the wedge and let the lane run, which the
+        /// floor already makes safe by placing the next id ABOVE the stranded one.
+        if (rt->state.durableFloorCovers(rt->wedge->txn_id))
+        {
+            LOG_WARNING(getLogger("CasPool"), "CAS ref-log append for namespace '{}': the wedged txn {}-{} is "
+                "already recorded as durable-but-not-applied by this table's floor (its adoption install "
+                "failed), so the wedge is retired without re-applying it. The table stays POISONED: its "
+                "cached view is missing that transaction until a recovery re-derives it from the log.",
+                ns.string(), rt->wedge->txn_id.writer_epoch, rt->wedge->txn_id.ref_sequence);
+            rt->wedge.reset();
+            /// A no-op on a `Poisoned` table (the transition is terminal and this is a CAS), which is
+            /// what this table is by construction here; called for the same reason every other resolved
+            /// path calls it -- "no apply is owed" is stated by the marker, never assumed.
+            clearApplyPending(*rt);
+            result.kind = WedgeResolution::Adopted;
+            return result;
+        }
+
+        wedge = *rt->wedge;
+        candidate.emplace(rt->state);
+        candidate_base_id = rt->state.getGreatestApplied();
+    }
+
+    /// Decode and apply BEFORE the I/O. The wedge carries the encoded body, so this costs no extra
+    /// round trip -- only the decode and the overlay build, both of which can throw (allocation) and
+    /// both of which MUST NOT run after the object is proven durable. A throw here happens while the
+    /// outcome is still unknown and the wedge is still set, i.e. it is indistinguishable from "the
+    /// resolution has not been attempted yet": the lane stays wedged and a later flush retries the whole
+    /// thing. It propagates to `appendRefOps`' catch, which completes every survivor.
+    ///
+    /// The candidate is deliberately NOT cached in the wedge across attempts: a wedge can live until a
+    /// remount, and retaining a full state copy for that long is a real memory cost on a path that is
+    /// rare by construction. Recomputing it per attempt is the cheaper trade.
+    const RefLogTxn wedged_txn = decodeRefLogTxn(
+        openObject(FormatId::RefLog, wedge.bytes), ns.string(), wedge.txn_id);
+    applyRefLogTxn(*candidate, wedged_txn);
+
+    /// ---- ONE bounded attempt, admitted under the wedge's ORIGINAL generation ----
+    /// Never the CURRENT generation: a retry that "passes" because the mount was re-armed under a new
+    /// lease incarnation is a write from an incarnation that never admitted this transaction. Refusing
+    /// pre-attempt leaves the key provably untouched, which is the only state a later recovery can
+    /// reason about.
+    const auto admitted_fence_ok = [this, &rt, admitted = wedge.admitted_fence_generation]
+    {
+        return fence_ok_fn()
+            && !rt->superseded_by_remount.load(std::memory_order_acquire)
+            && fence_generation_fn() == admitted;
+    };
+
+    SlotOccupyResult occupied;
+    try
+    {
+        occupied = ref_request_controller->slotOccupy(wedge.key, wedge.bytes, admitted_fence_ok);
+    }
+    catch (...)
+    {
+        /// `ambiguous-then-definite`, the model-proven control. `slotOccupy` rethrows only a definite
+        /// refusal of THIS attempt (a whitelisted synchronous rejection, or a deterministic local
+        /// failure) -- and a definite refusal of a LATER attempt proves nothing whatsoever about the
+        /// EARLIER ambiguous one, which may still be in flight or may already have landed. So the lane
+        /// stays wedged: unwedging here is exactly how an acked-then-lost transaction gets written
+        /// around. The id is not consumed either, so the next attempt re-derives the SAME one.
+        result.kind = WedgeResolution::StillWedged;
+        result.survivor_error = makeCasWriteRetryLaterExceptionPtr(fmt::format(
+            "CAS ref-log append for namespace '{}': the bounded retry of wedged txn {}-{} was definitively "
+            "refused ({}), which says nothing about the earlier ambiguous attempt — the lane stays wedged",
+            ns.string(), wedge.txn_id.writer_epoch, wedge.txn_id.ref_sequence,
+            getCurrentExceptionMessage(/*with_stacktrace*/ false)));
+        return result;
+    }
+
+    /// ---- Classify the occupant OFF the lock: pure, and the decode allocates ----
+    /// The three-way `mine | successor's seal | foreign` adjudication is the CALLER's job by
+    /// construction (`slotOccupy` never compares bytes), and "mine" means BYTE EQUALITY -- never a
+    /// shape or generation match, which is the aliasing the phase-0 model rejected.
+    enum class Occupant : uint8_t { NotOccupied, Ours, SuccessorSeal, Foreign };
+    Occupant occupant = Occupant::NotOccupied;
+    if (occupied.kind == SlotOccupyResult::Kind::Occupied)
+    {
+        if (occupied.occupant_bytes == wedge.bytes)
+            occupant = Occupant::Ours;
+        else
+        {
+            occupant = Occupant::Foreign;
+            try
+            {
+                occupant = refLogTxnIsEpochSeal(decodeRefLogTxn(
+                            openObject(FormatId::RefLog, occupied.occupant_bytes), ns.string(), wedge.txn_id))
+                    ? Occupant::SuccessorSeal : Occupant::Foreign;
+            }
+            catch (...)   // NOLINT(bugprone-empty-catch)
+            {
+                /// Undecodable, or decodable but not addressed to this namespace and id: either way it
+                /// is not a seal of ours, which is precisely the `Foreign` arm's fail-loud subject. The
+                /// decode failure is not itself the report -- the arm below carries the full one.
+            }
+        }
+    }
+
+    /// ---- POST-I/O RECHECK, then act, in ONE hold of `state_mutex` ----
+    /// Everything above ran on an I/O result that took an unbounded amount of time to come back. Before
+    /// ANY consequence follows from it -- adopting, acknowledging, unwedging, failing the survivors --
+    /// this runtime must still be the one the attempt was admitted for. Two independent things can have
+    /// made it not: the mount fence moved (a loss, or a re-arm under a fresh lease incarnation), or the
+    /// wedge itself was replaced. Both are checked; neither implies the other.
+    {
+        std::lock_guard lock(rt->state_mutex);
+
+        /// Throws `INVALID_STATE` when the incarnation moved. That propagates out of `flushRefBatch`
+        /// into `appendRefOps`' catch, which completes every survivor with it -- an error, never an
+        /// acknowledgement -- and leaves the wedge exactly as it is for whoever recovers the lane under
+        /// the live incarnation. Nothing is installed and nothing is unwedged on that path, which is
+        /// the whole meaning of INERT here.
+        check_fence_or_throw(wedge.admitted_fence_generation);
+
+        /// The remount half of the same question, checked separately because the two are independent
+        /// facts even though today's ordering makes one imply the other: `quiesceRefTablesForRemount`
+        /// detaches this runtime BEFORE the fence is re-armed, so a detached runtime always has a moved
+        /// generation and the check above would already have thrown. Relying on that ordering silently
+        /// is how a future edit to the remount sequence turns into a stale install.
+        if (rt->superseded_by_remount.load(std::memory_order_acquire))
+        {
+            result.kind = WedgeResolution::StillWedged;
+            result.survivor_error = makeCasWriteRetryLaterExceptionPtr(fmt::format(
+                "CAS ref-log append for namespace '{}': the resolution of txn {}-{} returned for a table "
+                "that a self-remount had already detached — the result is inert; the fresh incarnation "
+                "re-derives this table from the durable log",
+                ns.string(), wedge.txn_id.writer_epoch, wedge.txn_id.ref_sequence));
+            return result;
+        }
+
+        const bool same_wedge = rt->wedge
+            && rt->wedge->txn_id == wedge.txn_id
+            && rt->wedge->bytes == wedge.bytes
+            && rt->wedge->admitted_fence_generation == wedge.admitted_fence_generation;
+        if (!same_wedge)
+        {
+            /// All three components, because none of them alone identifies the attempt: two attempts of
+            /// one table can share an id and a generation and describe DIFFERENT bytes, and installing
+            /// one attempt's candidate because the other's key resolved is the acked-then-lost class
+            /// itself. One leader per table makes this unreachable today; it is checked, not assumed,
+            /// because the cost is a comparison and the failure mode is silent data loss.
+            result.kind = WedgeResolution::StillWedged;
+            result.survivor_error = makeCasWriteRetryLaterExceptionPtr(fmt::format(
+                "CAS ref-log append for namespace '{}': the resolution of txn {}-{} returned for a wedge "
+                "that is no longer installed — the result is inert and the lane keeps whatever wedge it has",
+                ns.string(), wedge.txn_id.writer_epoch, wedge.txn_id.ref_sequence));
+            return result;
+        }
+
+        switch (occupied.kind)
+        {
+            case SlotOccupyResult::Kind::Created:
+                /// Our own conditional create landed the wedge's exact bytes: the transaction is durable
+                /// NOW, whatever became of the earlier ambiguous attempt. Same adoption as `Ours`.
+                break;
+            case SlotOccupyResult::Kind::Occupied:
+                if (occupant == Occupant::SuccessorSeal)
+                {
+                    /// THE conclusive rejection (spec INV-2). The ref-log key is write-once and a
+                    /// successor put its epoch-closing record there, so our bytes provably never landed
+                    /// and never can. The operation was never acknowledged, so nothing is lost by
+                    /// failing it permanently -- and it must be permanent, not "retry later": no later
+                    /// attempt in this epoch can ever succeed.
+                    ///
+                    /// The seal IS this namespace's epoch-closing record, so it is also the
+                    /// `prev_epoch_seal` the first transaction of the next epoch must name. Recording it
+                    /// here is what lets a lane that observed its own deposition still write a
+                    /// well-formed chain link if it is re-armed under a later epoch.
+                    ///
+                    /// The durable floor is deliberately NOT raised over the seal's id. Under a live
+                    /// epoch the next id must keep deriving the SAME `T+1` and keep colliding with the
+                    /// seal -- that collision is the fence (INV-2: "a dying lane that observes the seal
+                    /// retries T+1, never mints T+2"). Raising the floor would mint `T+2` and write this
+                    /// table's stream past the record that closed its epoch.
+                    rt->wedge.reset();
+                    rt->last_epoch_seal = wedge.txn_id;
+                    /// PROVEN non-durable for our bytes, so no apply is owed (spec §A2).
+                    clearApplyPending(*rt);
+                    result.kind = WedgeResolution::Rejected;
+                    result.survivor_error = std::make_exception_ptr(Exception(ErrorCodes::INVALID_STATE,
+                        "CAS ref-log append for namespace '{}': writer epoch {} was CLOSED by a successor's "
+                        "epoch seal at {}-{}, which conclusively rejects the wedged transaction (it was "
+                        "never acknowledged). This mount's append lane resumes only under a later epoch",
+                        ns.string(), wedge.txn_id.writer_epoch,
+                        wedge.txn_id.writer_epoch, wedge.txn_id.ref_sequence));
+                    return result;
+                }
+                if (occupant == Occupant::Foreign)
+                {
+                    /// Impossible under mount-lease exclusivity: this key is exclusively ours, so a
+                    /// third object at it is corruption or a protocol breach, not a race. Fail closed
+                    /// LOUDLY and KEEP the wedge -- the lane is left explicitly wedged for inspection
+                    /// rather than hanging every future caller -- and let the reaction below fence the
+                    /// mount and schedule the remount that re-derives this table from the durable log.
+                    /// This is the one state where a wedged lane is not `ApplyPending`: our bytes
+                    /// provably never landed, so no apply is owed. The report itself is built after
+                    /// this lock is released -- it allocates, and `on_impossible_interference` fences
+                    /// the mount and may spawn a remount, neither of which belongs under `state_mutex`.
+                    clearApplyPending(*rt);
+                    result.kind = WedgeResolution::Corrupted;
+                    break;
+                }
+                break;
+            case SlotOccupyResult::Kind::Unresolved:
+            {
+                /// Still uncertain. Do NOT clear the wedge: it describes an object that may well be
+                /// durable, and clearing it on a failed read is the one thing this path must never do.
+                /// There is no deadline reset and no background loop -- the next caller of this
+                /// namespace, or a remount, retries. That is register R6's ACCEPTED behaviour: a
+                /// permanently quiet wedged namespace waits, which costs nothing, because the wedged
+                /// operation was never acknowledged.
+                ///
+                /// The message never prints a bare `describeUnresolvedReason` for this primitive (the
+                /// `SlotOccupyResult` doc's explicit call-site rule): `AttemptsExhausted` reads "the
+                /// retry budget ran out", which is nonsense for a primitive with no retry budget, and it
+                /// folds two very different observations together. Both are named instead.
+                const bool nothing_sent = unresolvedProvesNothingWasSent(occupied.unresolved_reason);
+                result.kind = WedgeResolution::StillWedged;
+                /// The admission-generation half of a pre-attempt refusal never reaches this message:
+                /// the recheck above presents the same generation to `checkFenceOrThrow` and throws
+                /// first. What is left are the two causes that leave the generation intact -- the lease
+                /// is not currently healthy enough to start a write, or the operation deadline is
+                /// exhausted.
+                result.survivor_error = makeCasWriteRetryLaterExceptionPtr(nothing_sent
+                    ? fmt::format(
+                        "CAS ref-log append for namespace '{}': the bounded retry of wedged txn {}-{} was "
+                        "refused BEFORE any request was sent — the mount lease is not healthy enough to "
+                        "start a write, or the operation deadline is exhausted — so the slot '{}' is "
+                        "provably untouched by this attempt and the lane stays wedged",
+                        ns.string(), wedge.txn_id.writer_epoch, wedge.txn_id.ref_sequence, wedge.key)
+                    : fmt::format(
+                        "CAS ref-log append for namespace '{}': the bounded retry of wedged txn {}-{} was sent "
+                        "and the resolve read found NOTHING at slot '{}' — either the read itself failed, or "
+                        "the occupant that rejected the create was DELETED under a live epoch, which is a GC "
+                        "invariant alarm rather than routine contention. The lane stays wedged until the SAME "
+                        "slot resolves durable or a conclusive rejection is observed",
+                        ns.string(), wedge.txn_id.writer_epoch, wedge.txn_id.ref_sequence, wedge.key));
+                return result;
+            }
+        }
+
+        /// A foreign occupant must NOT fall through into the adoption below: its reaction and its
+        /// survivors' error are built after this lock is released (both allocate, and
+        /// `on_impossible_interference` fences the mount and may spawn a remount -- neither belongs
+        /// under `state_mutex`).
+        if (result.kind != WedgeResolution::Corrupted)
+        {
+            /// ---- ADOPTION: `Created`, or `Occupied` with our own bytes ----
+            /// Only this leader mutates `rt->state`, and the attempt above ran without the lock, so this is
+            /// the assertion that nothing advanced the state underneath the candidate during that round
+            /// trip. Evaluated one statement before the region and asserted inside it under a SHORT name:
+            /// `chassert` stringifies its condition, so a long condition would heap-allocate ON FAILURE
+            /// inside the very region that must not allocate.
+            [[maybe_unused]] const bool state_unchanged = rt->state.getGreatestApplied() == candidate_base_id;
+            /// Receives the resolved wedge so it is destroyed OUTSIDE the region: clearing `rt->wedge` in
+            /// place would free its two `String` bodies there, and the region's contract is that it touches
+            /// no allocator at all.
+            std::optional<RefAppendWedge> displaced_wedge;
+            static_assert(std::is_nothrow_swappable_v<std::optional<RefAppendWedge>>,
+                "the wedge hand-off below must be non-throwing: it runs after the wedged object is proven "
+                "durable, where a throw would re-apply the transaction on the next resolution");
+            /// Post-durable install region 2 of 3 (spec §A2). The `catch` cannot fire while §A1 holds -- the
+            /// body below allocates nothing -- and is what makes a violation of §A1 VISIBLE rather than
+            /// silent: the attempt proved the object durable, so an install that does not complete leaves
+            /// this table's cached state missing it. It rethrows unchanged, so the lane's error handling is
+            /// exactly what it was; only the marker and the metric are added.
+            try
+            {
+                DENY_ALLOCATIONS_IN_SCOPE;
+                /// The negative control (`setInstallRegionProbeForTest`), fired with the guard already
+                /// armed, exactly as in `commitRefChunk`'s region.
+                if (install_region_probe_for_test)
+                    install_region_probe_for_test();
+                chassert(state_unchanged);
+                /// The install, allocation-free by construction: a member-wise swap of pointers and PODs,
+                /// two atomic increments, and a second swap of pointers. The object is durable, so the
+                /// transaction MUST be recorded -- and recording it MUST be inseparable from clearing the
+                /// wedge, or a failure between them leaves the transaction applied with the wedge still set
+                /// and the next resolution re-applies it. A wedge-resolved transaction is a commit like any
+                /// other: it joins the applied-above-newest-snapshot tail counters exactly as the ordinary
+                /// commit arm's does, or the snapshot-publish threshold and the resident-weight estimate
+                /// undercount by one transaction per resolved wedge until the next recovery reseeds.
+                rt->state.swap(*candidate);
+                rt->tail_count_since_snapshot.fetch_add(1, std::memory_order_relaxed);
+                rt->tail_bytes_since_snapshot.fetch_add(wedge.bytes.size(), std::memory_order_relaxed);
+                rt->wedge.swap(displaced_wedge);
+                /// Last statement of the install, in the SAME allocation-free region as the swap that
+                /// performs it: "the transaction is recorded" and "no apply is owed" become true together or
+                /// not at all (spec §A2). A relaxed CAS on a `uint8_t` -- it cannot allocate and cannot throw.
+                clearApplyPending(*rt);
+            }
+            catch (...)
+            {
+                /// The attempt above proved this object durable, so the same floor argument as
+                /// `commitRefChunk`'s Committed install applies verbatim -- and the floor is exactly what
+                /// this function's own reconciliation at the top will read on the next flush.
+                rt->state.noteDurableIdNotApplied(wedge.txn_id);
+                poisonApplyState(*rt, ns, "wedge-resolution install");
+                throw;
+            }
+            /// `candidate` now holds the DISPLACED state, which still shares the COW bases `rt->state` uses;
+            /// destroying it here restores unique base ownership so the fold below keeps its O(overlay)
+            /// in-place path instead of rebuilding the whole base. Both `reset`s only destroy: they allocate
+            /// nothing and cannot throw.
+            candidate.reset();
+            displaced_wedge.reset();
+            /// Fold the just-installed overlay back into the base right here, exactly as the ordinary commit
+            /// arm does at its install point, so `rt->state` returns to "base + empty overlay" and the next
+            /// flush's trial copies stay cheap. Cheap: no scratch copy shares the base at this point in the
+            /// flush (`working` is not taken until later), so this is the O(overlay) in-place fold.
+            /// Coherent-on-throw (see `CasRefCowMap.cpp`), and SWALLOWING, symmetrically with the ordinary
+            /// commit arm: the transaction is durable, installed and unwedged before this runs, so a mid-fold
+            /// allocation failure merely defers the fold to the next flush -- it must not unwind past a
+            /// completed install.
+            try
+            {
+                rt->state.materializeCommitted();
+            }
+            catch (...)
+            {
+                tryLogCurrentException(getLogger("CasPool"), fmt::format(
+                    "CAS ref-log append for namespace '{}': wedged txn {}-{} resolved durable and was installed, "
+                    "but the post-install overlay fold failed and was retained coherently for the next flush",
+                    ns.string(), wedge.txn_id.writer_epoch, wedge.txn_id.ref_sequence));
+            }
+        }
+    }
+
+    if (result.kind == WedgeResolution::Corrupted)
+    {
+        on_impossible_interference(wedge.key,
+            fmt::format("ref-log wedge resolution for namespace '{}' txn {}-{} observed a foreign object at "
+                "the wedged slot: neither this attempt's own bytes nor an epoch seal of this namespace",
+                ns.string(), wedge.txn_id.writer_epoch, wedge.txn_id.ref_sequence),
+            ns.string());
+        result.survivor_error = std::make_exception_ptr(Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS ref-log append for namespace '{}': impossible foreign interference observed at the wedged "
+            "slot '{}' — the mount is fenced closed and a remount is scheduled; the lane is deliberately left "
+            "wedged for inspection. See the anomaly diagnostics log",
+            ns.string(), wedge.key));
+        return result;
+    }
+
+    ProfileEvents::increment(ProfileEvents::CasRefAppendUnwedged);
+    result.kind = WedgeResolution::Adopted;
+    return result;
+}
+
 void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt,
                                  std::vector<std::shared_ptr<RefMutationItem>> & owned_items)
 {
@@ -1357,209 +1762,30 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
         return;
     }
 
-    /// Resolve an outstanding wedge FIRST: "It does not start a later
-    /// ref-log PUT for that table until the earlier result is resolved."
+    /// Resolve an outstanding wedge FIRST (spec INV-1): "It does not start a later ref-log PUT for
+    /// that table until the earlier result is resolved." One bounded attempt per flush, and the only
+    /// outcome that lets this flush continue is an adoption -- everything else either leaves the lane
+    /// uncertain or closes it deliberately, and in both cases every queued caller is told so.
     {
-        std::optional<RefAppendWedge> wedge_copy;
-        /// Prepared in the SAME hold that reads the wedge, for the same reason `commitRefChunk` prepares
-        /// its candidate before the PUT (spec §A1, here site 2): a successful `resolveByExactGet` PROVES
-        /// the wedged object is durable, so everything between that proof and "the runtime records it"
-        /// must be incapable of throwing. The COW copy is cheap -- it shares the live state's bases -- and
-        /// is only taken when there is actually a wedge to resolve, so the ordinary flush pays nothing.
-        std::optional<RefTableState> candidate;
-        RefTxnId candidate_base_id;
+        const WedgeResolutionResult resolution = resolveWedgeOnce(ns, rt);
+        switch (resolution.kind)
         {
-            std::lock_guard lock(rt->state_mutex);
-            wedge_copy = rt->wedge;
-            if (wedge_copy)
-            {
-                candidate.emplace(rt->state);
-                candidate_base_id = rt->state.getGreatestApplied();
-            }
-        }
-        if (wedge_copy)
-        {
-            /// Decode and apply BEFORE the resolving GET. The wedge carries the encoded body, so this
-            /// costs no extra I/O -- only the decode and the overlay build, both of which can throw
-            /// (allocation) and both of which used to run AFTER the GET had already proved the object
-            /// durable. A throw here now happens while the outcome is still UNKNOWN and the wedge is
-            /// still set, i.e. it is indistinguishable from "the resolve has not been attempted yet": the
-            /// lane stays wedged and a later flush retries the whole resolution. It propagates to
-            /// `appendRefOps`' catch exactly as the old post-durable apply did.
-            ///
-            /// The candidate is deliberately NOT cached in the wedge across attempts: a wedge can live
-            /// until remount, and retaining a full state copy for that long is a real memory cost on a
-            /// path that is rare by construction. Recomputing it per attempt is the cheaper trade.
-            const RefLogTxn wedged_txn = decodeRefLogTxn(
-                openObject(FormatId::RefLog, wedge_copy->bytes), ns.string(), wedge_copy->txn_id);
-            applyRefLogTxn(*candidate, wedged_txn);
-
-            CasWriteOutcome resolved{};
-            try
-            {
-                resolved = ref_request_controller->resolveByExactGet(wedge_copy->key, wedge_copy->bytes);
-            }
-            catch (...)
-            {
-                /// `resolveByExactGet` throws CORRUPTED_DATA when the wedged key holds a DIFFERENT object
-                /// than this attempt intended. The mount lease makes this key exclusively ours,
-                /// so this is not a possible protocol outcome -- it is the anomaly policy's incidental
-                /// detection case: fail closed LOUDLY (LOGICAL_ERROR, routed through
-                /// `reportImpossibleInterference`) to every queued caller and KEEP the wedge, so the lane is
-                /// left explicitly wedged for inspection rather than hanging every future caller.
-                ///
-                /// The one wedge resolution that is CONCLUSIVELY NEGATIVE, and therefore the third
-                /// "nothing became durable, no apply is owed" clear (spec §A2). The ref-log key is
-                /// write-once: a DIFFERENT object sitting at it proves OUR body never landed there --
-                /// our `putIfAbsent` would have been rejected. (`resolveByExactGet` never reports a
-                /// plain absent verdict: an absent or unreadable key returns `Unresolved`, since
-                /// another attempt may still be legal. This foreign-bytes arm is the only shape in
-                /// which a resolution proves the transaction is not durable.) Cleared BEFORE the
-                /// anomaly reaction below, whose `LOGICAL_ERROR` aborts the process outright in
-                /// debug/sanitizer builds. The wedge is deliberately KEPT for inspection, so this is
-                /// the one state where a wedged lane is not `ApplyPending`; the lane is fenced closed
-                /// and headed for a remount anyway.
-                clearApplyPending(*rt);
-                on_impossible_interference(wedge_copy->key,
-                    fmt::format("ref-log wedge resolution for namespace '{}' txn {}-{} observed foreign bytes "
-                        "at the wedged key ({})", ns.string(), wedge_copy->txn_id.writer_epoch,
-                        wedge_copy->txn_id.ref_sequence, getCurrentExceptionMessage(/*with_stacktrace*/ false)),
-                    ns.string());
-                complete_error(carve_all_pending(), std::make_exception_ptr(Exception(ErrorCodes::LOGICAL_ERROR,
-                    "CAS ref-log append for namespace '{}': impossible foreign interference observed at the "
-                    "wedged key '{}' -- mount fenced closed and remount scheduled; see the anomaly "
-                    "diagnostics log", ns.string(), wedge_copy->key)));
-                return;
-            }
-            if (resolved == CasWriteOutcome::Committed)
-            {
-                {
-                    std::lock_guard lock(rt->state_mutex);
-                    /// Install BEFORE unwedging ("a wedged append later observed durable is applied to
-                    /// cache before unwedging"). Guard against a re-entrant double-apply: only if this is
-                    /// still the SAME wedge (single leader per table makes a mismatch impossible, but the
-                    /// check costs nothing and documents the invariant).
-                    if (rt->wedge && rt->wedge->txn_id == wedge_copy->txn_id)
-                    {
-                        /// Only this leader mutates `rt->state`, and the resolving GET above ran without
-                        /// the lock, so this is the assertion that nothing advanced the state underneath
-                        /// the candidate during that round trip -- the same argument (and the same reason
-                        /// for hoisting it out of the region under a SHORT name) as in `commitRefChunk`:
-                        /// `chassert` stringifies its condition, so a long condition would heap-allocate
-                        /// ON FAILURE inside the very region that must not allocate.
-                        [[maybe_unused]] const bool state_unchanged = rt->state.getGreatestApplied() == candidate_base_id;
-                        /// Receives the resolved wedge so it is destroyed OUTSIDE the region: clearing
-                        /// `rt->wedge` in place would free its two `String` bodies there, and the region's
-                        /// contract is that it touches no allocator at all.
-                        std::optional<RefAppendWedge> displaced_wedge;
-                        static_assert(std::is_nothrow_swappable_v<std::optional<RefAppendWedge>>,
-                            "the wedge hand-off below must be non-throwing: it runs after the wedged object "
-                            "is proven durable, where a throw would re-apply the transaction on the next "
-                            "resolution");
-                        /// Post-durable install region 2 of 3 (spec §A2). The `catch` cannot fire while
-                        /// §A1 holds -- the body below allocates nothing -- and is what makes a
-                        /// violation of §A1 VISIBLE rather than silent: the GET proved the object
-                        /// durable, so an install that does not complete leaves this table's cached
-                        /// state missing it. It rethrows unchanged, so the lane's error handling is
-                        /// exactly what it was; only the marker and the metric are added.
-                        try
-                        {
-                            DENY_ALLOCATIONS_IN_SCOPE;
-                            /// The negative control (`setInstallRegionProbeForTest`), fired with the
-                            /// guard already armed, exactly as in `commitRefChunk`'s region.
-                            if (install_region_probe_for_test)
-                                install_region_probe_for_test();
-                            chassert(state_unchanged);
-                            /// The install, allocation-free by construction: a member-wise swap of
-                            /// pointers and PODs, two atomic increments, and a second swap of pointers.
-                            /// The GET proved the object durable, so the transaction MUST be recorded --
-                            /// and recording it MUST be inseparable from clearing the wedge. It was not:
-                            /// the apply and the `materializeCommitted` fold used to sit between them
-                            /// WITHOUT the ordinary commit arm's swallow, so a fold failure left the
-                            /// transaction applied and the wedge still set, and the next resolution
-                            /// re-applied the same transaction and double-bumped these very counters.
-                            /// A wedge-resolved transaction is a commit like any other: it joins the
-                            /// applied-above-newest-snapshot tail counters exactly as the ordinary
-                            /// Committed arm's does, or the snapshot-publish threshold and the
-                            /// resident-weight estimate undercount by one transaction per resolved wedge
-                            /// until the next recovery reseeds.
-                            rt->state.swap(*candidate);
-                            rt->tail_count_since_snapshot.fetch_add(1, std::memory_order_relaxed);
-                            rt->tail_bytes_since_snapshot.fetch_add(wedge_copy->bytes.size(), std::memory_order_relaxed);
-                            rt->wedge.swap(displaced_wedge);
-                            /// Last statement of the install, in the SAME allocation-free region as the
-                            /// swap that performs it: "the transaction is recorded" and "no apply is
-                            /// owed" become true together or not at all (spec §A2). A relaxed CAS on a
-                            /// `uint8_t` -- it cannot allocate and cannot throw.
-                            clearApplyPending(*rt);
-                        }
-                        catch (...)
-                        {
-                            /// `resolveByExactGet` proved this object durable one step above, so the same
-                            /// floor argument as `commitRefChunk`'s Committed install applies verbatim.
-                            rt->state.noteDurableIdNotApplied(wedge_copy->txn_id);
-                            poisonApplyState(*rt, ns, "wedge-resolution install");
-                            throw;
-                        }
-                        /// `candidate` now holds the DISPLACED state, which still shares the COW bases
-                        /// `rt->state` uses; destroying it here restores unique base ownership so the fold
-                        /// below keeps its O(overlay) in-place path instead of rebuilding the whole base.
-                        /// Both `reset`s only destroy: they allocate nothing and cannot throw.
-                        candidate.reset();
-                        displaced_wedge.reset();
-                        /// Fold the just-installed overlay back into the base right here, exactly as the
-                        /// ordinary Committed arm does at its install point, so `rt->state` returns to
-                        /// "base + empty overlay" and the next flush's trial copies stay cheap. Cheap: no
-                        /// scratch copy shares the base at this point in the flush (`working` is not taken
-                        /// until below), so this is the O(overlay) in-place fold. Coherent-on-throw (see
-                        /// `CasRefCowMap.cpp`), and now SWALLOWING, symmetrically with the ordinary commit
-                        /// arm: the transaction is durable, installed and unwedged before this runs, so a
-                        /// mid-fold allocation failure merely defers the fold to the next flush -- it must
-                        /// not unwind past a completed install.
-                        try
-                        {
-                            rt->state.materializeCommitted();
-                        }
-                        catch (...)
-                        {
-                            tryLogCurrentException(getLogger("CasPool"), fmt::format(
-                                "CAS ref-log append for namespace '{}': wedged txn {}-{} resolved durable and "
-                                "was installed, but the post-install overlay fold failed and was retained "
-                                "coherently for the next flush",
-                                ns.string(), wedge_copy->txn_id.writer_epoch, wedge_copy->txn_id.ref_sequence));
-                        }
-                    }
-                    ProfileEvents::increment(ProfileEvents::CasRefAppendUnwedged);
-                }
-                /// The wedge's tail bump above may have crossed the snapshot-publish threshold. This flush
-                /// can still return early below WITHOUT reaching the post-commit scheduler -- an empty
-                /// carve, or an all-no-op survivor batch (every survivor's `build_ops` contributes zero
-                /// ops), both of which return before `maybeScheduleSnapshotPublish`. Trigger it HERE so a
-                /// resolved wedge never leaves the table over-threshold until some later unrelated
-                /// mutation happens to arrive. Idempotent with the post-commit call below (single-in-flight
-                /// gate), and off-lock as that call requires.
+            case WedgeResolution::NoWedge:
+                break;
+            case WedgeResolution::Adopted:
+                /// The adoption's tail bump may have crossed the snapshot-publish threshold, and this
+                /// flush can still return early below WITHOUT reaching the post-commit scheduler -- an
+                /// empty carve, or an all-no-op survivor batch, both return before it. Trigger it HERE
+                /// so a resolved wedge never leaves the table over-threshold until some later unrelated
+                /// mutation happens to arrive. Idempotent with the post-commit call below (the
+                /// single-in-flight gate), and off-lock as that call requires.
                 maybeScheduleSnapshotPublish(ns, rt);
-            }
-            else
-            {
-                /// Still Unresolved: fail every CURRENTLY queued item with the SAME uncertainty
-                /// exception and do not allocate a new id. A later call into this namespace's queue
-                /// retries the resolve -- rebuilding the candidate from scratch, which is why nothing of
-                /// it is kept in the wedge (see the candidate build above).
-                ///
-                /// There is deliberately NO `NoAttemptSent` counterpart to `commitRefChunk`'s arm here,
-                /// and the asymmetry is not an oversight: this `Unresolved` comes from
-                /// `resolveByExactGet`, which has no pre-attempt gate at all -- it always issues its GET,
-                /// and reports `Unresolved` for "absent" and "the read failed" alike. So a resolution can
-                /// never mean "nothing was sent", and more to the point the wedge it would skip ALREADY
-                /// EXISTS and describes an object that may well be durable. Clearing it on a failed read
-                /// is the one thing this path must never do.
-                complete_error(carve_all_pending(), makeCasWriteRetryLaterExceptionPtr(fmt::format(
-                    "CAS ref-log append for namespace '{}' txn {}-{} is still UNCERTAIN — the append lane "
-                    "stays wedged until the SAME key resolves durable or a conclusive rejection is observed",
-                    ns.string(), wedge_copy->txn_id.writer_epoch, wedge_copy->txn_id.ref_sequence)));
+                break;
+            case WedgeResolution::Rejected:
+            case WedgeResolution::StillWedged:
+            case WedgeResolution::Corrupted:
+                complete_error(carve_all_pending(), resolution.survivor_error);
                 return;
-            }
         }
     }
 
@@ -1955,16 +2181,32 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
     /// applied to would be deriving this chunk's id from a different stream. Only this leader mutates
     /// `rt->state`, so the two reads cannot disagree today -- taking them together is what keeps that
     /// from being an invariant a future edit has to rediscover.
+    ///
+    /// The fence GENERATION and `last_epoch_seal` are read in the same hold for the same reason. The
+    /// generation is this transaction's ADMISSION token: one atomic reading of "which mount incarnation
+    /// allowed this attempt", which the wedge then carries and every later retry and install presents
+    /// back. The seal is what qualifies the id's sequence number, so reading it at a different instant
+    /// than the id would be describing a different transition.
     std::optional<RefTableState> candidate;
     RefTxnId candidate_base_id;
     RefTxnId id;
+    uint64_t admitted_fence_generation = 0;
+    std::optional<RefTxnId> last_epoch_seal;
     {
         std::lock_guard lock(rt->state_mutex);
         candidate.emplace(rt->state);
         candidate_base_id = rt->state.getGreatestApplied();
         id = allocateRefTxnId(*rt);
+        admitted_fence_generation = fence_generation_fn();
+        last_epoch_seal = rt->last_epoch_seal;
     }
-    const RefLogTxn chunk_txn{ns.string(), id, chunk_ops, std::nullopt};
+    /// INV-2's chain link, stamped exactly where the grammar requires it: sequence 1 of an epoch above
+    /// this namespace's genesis names the seal that closed the previous one, and nothing else carries it.
+    /// `last_epoch_seal` is `nullopt` precisely at genesis (see `RefTableRuntime::last_epoch_seal`), so
+    /// the sequence test alone is the whole rule -- a genesis birth at sequence 1 finds nothing to name,
+    /// which is what makes "no seal" a fact about the stream rather than a defaulted field.
+    const RefLogTxn chunk_txn{ns.string(), id, chunk_ops,
+                              id.ref_sequence == 1 ? last_epoch_seal : std::nullopt};
     try
     {
         applyRefLogTxn(*candidate, chunk_txn);
@@ -1989,6 +2231,7 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
     RefAppendWedge prepared_wedge;
     prepared_wedge.txn_id = id;
     prepared_wedge.key = layout.refLogKey(ns, id);
+    prepared_wedge.admitted_fence_generation = admitted_fence_generation;
     try
     {
         prepared_wedge.bytes = sealObject(FormatId::RefLog, encodeRefLogTxn(chunk_txn));
@@ -2035,6 +2278,26 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
         /// Conclusive also means PROVEN NON-DURABLE for our bytes (the key is write-once and holds
         /// someone else's object), so no apply is owed and the marker goes back to `Clean` (spec §A2).
         clearApplyPending(*rt);
+        /// Route it through the anomaly policy, exactly as the wedge-resolution site does for the
+        /// identical observation [review I5]. Failing closed is right, but failing closed FOREVER is
+        /// not: without this the mount stays blocked on this table until somebody notices and remounts
+        /// by hand, while the wedge site -- which reaches the same impossibility by a different path --
+        /// fences and schedules a remount that re-derives the table from the durable log. One
+        /// impossibility, one reaction. The report is deliberately BEFORE the survivors are completed,
+        /// so the fence is closed by the time any caller wakes and can retry.
+        ///
+        /// Gated on the CODE, not merely on "something was thrown": the reaction fences the whole mount
+        /// and schedules a remount, which is right for a write-ownership violation and badly wrong for,
+        /// say, an allocation failure that happened to escape here. `putIfAbsentControlled` is
+        /// documented to fold every unproven error into `Unresolved` and to throw only for a proven
+        /// different object, so this is a narrowing of an assumption the surrounding code already
+        /// makes -- not a new one.
+        if (getCurrentExceptionCode() == ErrorCodes::CORRUPTED_DATA)
+            on_impossible_interference(prepared_wedge.key,
+                fmt::format("ref-log append for namespace '{}' txn {}-{} observed a DIFFERENT object already at "
+                    "the id it derived ({})", ns.string(), id.writer_epoch, id.ref_sequence,
+                    getCurrentExceptionMessage(/*with_stacktrace*/ false)),
+                ns.string());
         complete_error(chunk_survivors, std::current_exception());
         return false;
     }

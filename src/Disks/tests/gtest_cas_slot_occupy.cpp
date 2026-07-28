@@ -11,6 +11,7 @@
 using namespace DB::Cas;
 using DB::Cas::tests::CountingBackend;
 using DB::Cas::tests::ChunkFaultBackend;
+using DB::Cas::tests::LandedButAckLostOnceBackend;
 
 namespace DB::ErrorCodes
 {
@@ -76,6 +77,10 @@ public:
     }
 };
 
+/// (`LandedButAckLostOnceBackend` -- "the write LANDS, then the ack is lost" -- was lifted into
+/// `cas_test_helpers.h` for Task 4, whose wedge-adoption tests need the identical seam through a whole
+/// Pool. Its `key_substr` defaults to empty, which is exactly this file's original behaviour: fault the
+/// first `putIfAbsent` of any key.)
 /// Delegates the FIRST putIfAbsent for a key to CountingBackend -- so the write actually LANDS -- and
 /// only THEN throws an ambiguous exception, modelling "our own PUT committed but its response was lost"
 /// (the Task-4 adoption input: plan's "Occupied + bytes == wedge.bytes -> an earlier attempt landed ->
@@ -84,23 +89,6 @@ public:
 /// One-shot per backend instance: review finding I2 asked specifically for a ~10-line local backend rather than
 /// reusing ChunkFaultBackend::Mode::LandedThenLost, which also arms a one-shot lost-GET fault that would
 /// obscure whether slotOccupy's OWN immediate resolve (not just a later caller's retry) is correct too.
-class LandedButAckLostOnceBackend : public CountingBackend
-{
-public:
-    using CountingBackend::putIfAbsent;
-    bool fired = false;
-
-    PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta) override
-    {
-        if (!fired)
-        {
-            fired = true;
-            CountingBackend::putIfAbsent(key, bytes, meta);   /// the write LANDS
-            throw Poco::TimeoutException("LandedButAckLostOnceBackend: simulated lost PUT response");
-        }
-        return CountingBackend::putIfAbsent(key, bytes, meta);
-    }
-};
 
 }
 

@@ -360,23 +360,28 @@ TEST(CasPartFolderAccess, PublishEntriesAbandonsBuildOnPromoteFailure)
     expectThrowsCode(ErrorCodes::CORRUPTED_DATA, [&] { access.republishRef({ns, "src"}, {ns, "dst"}); });
     EXPECT_FALSE(access.existsRef({ns, "dst"}, Cas::Freshness::ForceFresh)) << "the failed promote never committed dst";
 
-    /// The property this test exists for -- `publishEntries` does not walk away from a live precommit
-    /// binding -- restated for the fail-closed contract. It used to be proven by a fresh `precommitAdd`
-    /// succeeding, which needed one more append on this table; under INV-1 no append on this table can
-    /// succeed while a foreign object sits on its next log key (ids are derived from the table's own
-    /// greatest applied id, so every attempt addresses exactly that key). What is still observable, and
-    /// is what the regression guard actually needs, is that the cleanup RAN: `abandon`'s removal append
-    /// attempted its own create at the ref-log key, on top of the precommitAdd's and the promote's.
+    /// EXACTLY two ref-log create attempts reach the store: precommitAdd's own append and the promote's
+    /// faulted one. Both of the cleanup appends that follow -- `promote`'s catch-abandon and the handle
+    /// destructor's backstop -- are refused at the mount-fence gate before they reach the store, because
+    /// proving a different object at our own key now fences the mount closed and schedules a remount
+    /// (review I5: the append site self-heals like the wedge-resolve site instead of leaving this table
+    /// blocked until a manual remount).
     ///
-    /// EXACTLY four, not "at least four": the counter increments BEFORE the skip/fault branch, so a
-    /// `>=` bound would pass in the world this guard exists to catch. The four are precommitAdd's own
-    /// append, the promote's faulted one, `promote`'s catch-abandon, and the handle destructor's
-    /// backstop abandon (which retries because the catch-abandon could not land). Removing the
-    /// catch-abandon from `PreparedPartWrite::promote` leaves only the destructor's, giving three --
-    /// verified by doing exactly that, and this assertion is what failed.
-    EXPECT_EQ(backend->matching_put_attempts, attempts_before + 4)
-        << "publishEntries must still abandon the build on a promote failure at the promote site: three "
-           "ref-log create attempts means only the destructor backstop ran";
+    /// COVERAGE NOTE, deliberately explicit: this count no longer DISCRIMINATES whether the catch-abandon
+    /// ran. It used to (four attempts with it, three without), and that only worked because the
+    /// catch-abandon could still reach the store and fail there, making the destructor retry. With the
+    /// fence closed both cleanups are refused identically and unobservably, so the assertion below is a
+    /// shape check, not the regression guard it was. The guard cannot be restored in THIS scenario --
+    /// nothing the cleanup does is observable once the mount is fenced -- and it is not silently
+    /// dropped: the property it protected is stated here, and reclaiming the binding is now the
+    /// scheduled remount's job (a fresh incarnation re-derives the table and the stale-precommit sweep
+    /// reclaims), not this best-effort abandon's.
+    EXPECT_EQ(backend->matching_put_attempts, attempts_before + 2)
+        << "only precommitAdd's append and the promote's faulted one may reach the store; every cleanup "
+           "append after the anomaly is refused at the fence";
+    EXPECT_FALSE(store->mayMutate()) << "the proven conflict must fence this mount closed";
+    EXPECT_EQ(store->scheduleRemountCallCountForTest(), 1u)
+        << "and must schedule exactly one remount -- the self-heal that replaces the manual one";
 
     /// And nothing was written ABOVE the damage: the occupant is the GREATEST log id in the namespace
     /// (keys render the id in fixed-width hex, so lexical order is id order). An append that carved a

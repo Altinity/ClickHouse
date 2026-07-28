@@ -1810,6 +1810,12 @@ TEST(CasPartWriteTxn, AbandonRetryableAfterAppendFailure)
     /// exact key (a proven conflict) -> CORRUPTED_DATA propagates.
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { build->abandon(); });
 
+    /// The proven conflict fences the mount closed and schedules a remount (the append site routes
+    /// through the anomaly policy exactly as the wedge-resolve site does), so stand in for that remount
+    /// -- a unit-test Pool runs none -- or the second abandon below would be refused at the fence gate
+    /// instead of reaching the append, and this test would stop exercising what it is about.
+    DB::Cas::tests::rearmMountFenceAfterAnomalyForTest(s);
+
     /// The retryability under test: the SAME object accepts a second abandon() -- `alive` was not
     /// flipped by the failed append, so this is NOT the LOGICAL_ERROR "has been abandoned" the unfixed
     /// code produced. It reaches the append and fails there, on the same proven conflict: under INV-1 the

@@ -585,6 +585,13 @@ public:
     /// after a GC fence-out) — a `PartWriteTxn` minted under an older epoch fails closed on its next step.
     uint64_t liveWriterEpoch() const { return mount_runtime.liveWriterEpoch(); }
 
+    /// Test seam: publish a new live-incarnation writer epoch WITHOUT running a self-remount -- the
+    /// epoch half of what `tryRemountOnce` does alongside its fence re-arm. Lets a test drive an epoch
+    /// transition's WRITER-side effects (INV-2's `prev_epoch_seal` on the first append of the new epoch)
+    /// without the claim machinery and, deliberately, without `quiesceRefTablesForRemount`, so the
+    /// cached ref runtimes survive the transition and the effect under test is isolated from recovery.
+    void setLiveWriterEpochForTest(uint64_t writer_epoch) { mount_runtime.setLiveWriterEpoch(writer_epoch); }
+
     /// Self-remount after a GC fence-out (liveness counterpart of the fence-out safety rule): the
     /// OLD incarnation may never write again (the keeper never re-mints), but a FRESH incarnation —
     /// durable writer_epoch bump + mount reclaim + re-armed write fence — is exactly what a server
@@ -758,7 +765,15 @@ public:
     /// the new-id-allocation point) -- combine with `setRefPreCarveHookForTest` to install it AFTER the
     /// top-of-flush wedge-resolution check has already run clean but BEFORE the batch is carved.
     void forceWedgeForTest(const RootNamespace & ns, uint64_t writer_epoch, uint64_t ref_sequence,
-                           const String & key, const String & bytes);
+                           const String & key, const String & bytes,
+                           std::optional<uint64_t> admitted_generation = std::nullopt);
+    /// test seam: the fence generation the current wedge was ADMITTED under (0 when not wedged) -- the
+    /// value every later retry of that wedge is gated on. See `CasRefLedger::RefAppendWedge`.
+    uint64_t wedgedAdmittedGenerationForTest(const RootNamespace & ns);
+    /// test seams: this table's `prev_epoch_seal` source -- the seal that closed its previous writer
+    /// epoch, `nullopt` at genesis. The setter stands in for the recovery CAS-walk that produces it.
+    std::optional<RefTxnId> lastEpochSealForTest(const RootNamespace & ns);
+    void setLastEpochSealForTest(const RootNamespace & ns, const std::optional<RefTxnId> & seal);
     /// test seam: this table's post-durable install marker (spec §A2) -- `Clean`, `ApplyPending`
     /// (a durable `PUT` is in flight, or the lane is wedged), or the terminal `Poisoned`. See
     /// `RefApplyState` for why it is an assert layer and not a fence.
