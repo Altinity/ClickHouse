@@ -1190,3 +1190,6 @@ commit not yet landed — active, not wedged. No codex. No push.
 seal-clobber sabotage proved both damage shapes). Task 2 implementer (opus, `CaRefDeltaIntakeCore`)
 dispatched ~15 min ago — no artifacts yet, within normal reading/drafting time (task 1 took ~30 min
 to first commit). Next tick without artifacts → ping the agent. No TLC/codex running. No push.
+
+**2026-07-28 03:5x UTC watchdog** — task 2 actively writing: `CaRefDeltaIntakeCore.tla` rewritten
+03:40 (13.7→27.7 KB), configs/TLC/report pending — healthy mid-implementation. No push.
