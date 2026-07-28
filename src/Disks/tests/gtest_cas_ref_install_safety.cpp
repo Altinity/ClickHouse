@@ -497,15 +497,16 @@ TEST(CasRefInstallSafety, WedgeResolutionInstallsExactlyOnce)
 }
 
 /// Negative control, part 1 of 2: does `DENY_ALLOCATIONS_IN_SCOPE` actually fire on an allocation in
-/// THIS binary? Deliberately split by build type instead of always asserting death, because the two
-/// build flavours turn the guard's `LOGICAL_ERROR` into different observable outcomes:
-/// `DEBUG_OR_SANITIZER_BUILD` aborts at Exception construction (`Exception.cpp:74-92`), while a build
-/// with only `MEMORY_TRACKER_DEBUG_CHECKS` — e.g. a plain Debug build, which does NOT define the
-/// former — merely throws. An earlier version of this control asserted death unconditionally and
-/// failed in the latter: the guard had fired correctly, the throw was simply caught by the ref lane's
-/// own error handling instead of killing the process. Same split shape as
-/// `CasGcStateFormat`/`CasGcStateFormatDeathTest`.
-#if defined(DEBUG_OR_SANITIZER_BUILD)
+/// THIS binary? Gated on `MEMORY_TRACKER_DEBUG_CHECKS`, because that is the macro the guard itself is
+/// gated on (`MemoryTracker.h`: defined only under `!NDEBUG`, i.e. plain debug builds; everywhere else
+/// `DENY_ALLOCATIONS_IN_SCOPE` compiles to `static_assert(true)` and there is nothing to observe).
+/// An earlier version dispatched on `DEBUG_OR_SANITIZER_BUILD` instead — but sanitizer builds define
+/// NDEBUG, so the guard is a no-op there and the death test "failed to die" on all three sanitizer CI
+/// lanes. Note the implication chain: `MEMORY_TRACKER_DEBUG_CHECKS` ⇒ `!NDEBUG` ⇒
+/// `DEBUG_OR_SANITIZER_BUILD`, so whenever the guard exists its `LOGICAL_ERROR` aborts at Exception
+/// construction (`Exception.cpp`) — death is the only observable outcome, and a throw-only variant is
+/// dead code.
+#if defined(MEMORY_TRACKER_DEBUG_CHECKS)
 TEST(CasRefInstallSafetyDeathTest, DenyGuardStopsAnAllocation)
 {
     EXPECT_DEATH(
@@ -515,15 +516,6 @@ TEST(CasRefInstallSafetyDeathTest, DenyGuardStopsAnAllocation)
             (void)p;
         },
         "");
-}
-#elif defined(MEMORY_TRACKER_DEBUG_CHECKS)
-TEST(CasRefInstallSafety, DenyGuardStopsAnAllocation)
-{
-    EXPECT_ANY_THROW({
-        DENY_ALLOCATIONS_IN_SCOPE;
-        volatile auto * p = new char[64];
-        (void)p;
-    });
 }
 #endif
 
