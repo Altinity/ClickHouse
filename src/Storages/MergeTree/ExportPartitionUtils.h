@@ -83,6 +83,10 @@ namespace ExportPartitionUtils
         const std::string & exception_message,
         const LoggerPtr & log);
 
+    /// Verifies the source columns can be exported into the destination: same column count, matching
+    /// names at every position, and value-preserving casts unless lossy casts are allowed. Names must
+    /// match because the export converts columns by position while the partition machinery resolves
+    /// them by name; a mismatch would place one column's values under another column's name.
     void verifyExportSchemaCastable(
         const StorageMetadataPtr & source_metadata,
         const StorageMetadataPtr & destination_metadata,

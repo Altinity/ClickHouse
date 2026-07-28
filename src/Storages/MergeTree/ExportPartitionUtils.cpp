@@ -976,6 +976,28 @@ namespace
             ActionsDAG::MatchColumnsMode::Position,
             context);
 
+        /*
+            Names must also match because of the following:
+
+            source table = (x DateTime64, ts DateTime64), partition by ts
+            destination table (ts DateTime64, x DateTime64), partition by ts
+
+            insert into source (2020-x, 2025-x), (2021-x, 2025-x)
+        */
+        for (size_t i = 0; i < destination_columns.size(); ++i)
+        {
+            if (source_columns[i].name == destination_columns[i].name)
+                continue;
+
+            throw Exception(ErrorCodes::INCOMPATIBLE_COLUMNS,
+                "Cannot export to {}: the column at position {} is named '{}' in the source table but "
+                "'{}' in the destination. Columns are matched by position, so their names must match.",
+                destination_storage_id.getFullTableName(),
+                i + 1,
+                source_columns[i].name,
+                destination_columns[i].name);
+        }
+
         /// Lossy casts may silently change values, so reject them unless the user opts in.
         if (context->getSettingsRef()[Setting::export_merge_tree_part_allow_lossy_cast])
             return;

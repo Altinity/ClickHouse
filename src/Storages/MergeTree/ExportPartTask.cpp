@@ -114,8 +114,9 @@ namespace
 
     /// Mirrors `InterpreterInsertQuery::addInsertToSelectPipeline`: positional match,
     /// destination header = `getSampleBlockNonMaterialized()`, all type bridging is done
-    /// by the CAST inside `makeConvertingActions`. No pre-validation, no per-column
-    /// lossy/non-lossy classification — restrictions are exactly what INSERT SELECT enforces.
+    /// by the CAST inside `makeConvertingActions`. Unlike INSERT SELECT, `verifyExportSchemaCastable`
+    /// additionally requires the names to match at every position, because the partition machinery
+    /// resolves source columns by name.
     void addExportConvertingActions(
         QueryPlan & plan_for_part,
         const IStorage & destination_storage,

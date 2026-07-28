@@ -1,6 +1,6 @@
 -- Tags: no-parallel, no-fasttest
 
-DROP TABLE IF EXISTS 03572_mt_table, 03572_invalid_schema_table, 03572_ephemeral_mt_table, 03572_matching_ephemeral_s3_table, 03572_partition_type_mismatch_mt, 03572_partition_type_mismatch_s3, 03572_lossy_mt, 03572_lossy_s3, 03572_lossless_mt, 03572_lossless_s3, 03572_coarser_source_mt, 03572_finer_dest_s3;
+DROP TABLE IF EXISTS 03572_mt_table, 03572_invalid_schema_table, 03572_ephemeral_mt_table, 03572_matching_ephemeral_s3_table, 03572_partition_type_mismatch_mt, 03572_partition_type_mismatch_s3, 03572_lossy_mt, 03572_lossy_s3, 03572_lossless_mt, 03572_lossless_s3, 03572_coarser_source_mt, 03572_finer_dest_s3, 03572_reordered_mt, 03572_reordered_s3;
 
 SET allow_experimental_export_merge_tree_part=1;
 
@@ -10,9 +10,9 @@ INSERT INTO 03572_mt_table VALUES (1, 2020);
 
 -- Create a table partitioned by a column that is not part of the source partition key. The unified
 -- plain-storage partition gate rejects it because the destination partition column is not covered by
--- the source partition key (schema compat follows INSERT SELECT positional semantics, so the column
--- shape matches and the partition-compatibility check is what fires).
-CREATE TABLE 03572_invalid_schema_table (id UInt64, x UInt16) ENGINE = S3(s3_conn, filename='03572_invalid_schema_table', format='Parquet', partition_strategy='hive') PARTITION BY x;
+-- the source partition key (the column names line up, so the partition-compatibility check is what
+-- fires rather than the schema check).
+CREATE TABLE 03572_invalid_schema_table (id UInt64, year UInt16) ENGINE = S3(s3_conn, filename='03572_invalid_schema_table', format='Parquet', partition_strategy='hive') PARTITION BY id;
 
 ALTER TABLE 03572_mt_table EXPORT PART '2020_1_1_0' TO TABLE 03572_invalid_schema_table
 SETTINGS allow_experimental_export_merge_tree_part = 1; -- {serverError BAD_ARGUMENTS}
@@ -80,4 +80,18 @@ INSERT INTO 03572_coarser_source_mt VALUES (1, '2024-03-05'), (2, '2024-03-20');
 ALTER TABLE 03572_coarser_source_mt EXPORT PART '202403_1_1_0' TO TABLE 03572_finer_dest_s3
 SETTINGS allow_experimental_export_merge_tree_part = 1; -- {serverError BAD_ARGUMENTS}
 
-DROP TABLE IF EXISTS 03572_mt_table, 03572_invalid_schema_table, 03572_ephemeral_mt_table, 03572_matching_ephemeral_s3_table, 03572_partition_type_mismatch_mt, 03572_partition_type_mismatch_s3, 03572_lossy_mt, 03572_lossy_s3, 03572_lossless_mt, 03572_lossless_s3, 03572_coarser_source_mt, 03572_finer_dest_s3;
+-- Columns are converted by position while the hive directory is computed from the source column of
+-- the same name, so a destination that declares the same columns in a different order would write
+-- one column's values under another column's name. Rejected even with lossy casts allowed.
+CREATE TABLE 03572_reordered_mt (x Date, ts Date) ENGINE = MergeTree() PARTITION BY ts ORDER BY x;
+CREATE TABLE 03572_reordered_s3 (ts Date, x Date) ENGINE = S3(s3_conn, filename='03572_reordered_s3', format='Parquet', partition_strategy='hive') PARTITION BY ts;
+
+INSERT INTO 03572_reordered_mt VALUES ('2024-05-10', '2024-01-01'), ('2024-08-20', '2024-01-01');
+
+ALTER TABLE 03572_reordered_mt EXPORT PART '20240101_1_1_0' TO TABLE 03572_reordered_s3
+SETTINGS allow_experimental_export_merge_tree_part = 1; -- {serverError INCOMPATIBLE_COLUMNS}
+
+ALTER TABLE 03572_reordered_mt EXPORT PART '20240101_1_1_0' TO TABLE 03572_reordered_s3
+SETTINGS allow_experimental_export_merge_tree_part = 1, export_merge_tree_part_allow_lossy_cast = 1; -- {serverError INCOMPATIBLE_COLUMNS}
+
+DROP TABLE IF EXISTS 03572_mt_table, 03572_invalid_schema_table, 03572_ephemeral_mt_table, 03572_matching_ephemeral_s3_table, 03572_partition_type_mismatch_mt, 03572_partition_type_mismatch_s3, 03572_lossy_mt, 03572_lossy_s3, 03572_lossless_mt, 03572_lossless_s3, 03572_coarser_source_mt, 03572_finer_dest_s3, 03572_reordered_mt, 03572_reordered_s3;

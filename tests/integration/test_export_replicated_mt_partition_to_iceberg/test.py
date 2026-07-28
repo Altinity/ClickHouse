@@ -1563,11 +1563,12 @@ def test_export_partition_column_count_mismatch_source_fewer_is_rejected(cluster
     )
 
 
-def test_export_partition_with_renamed_destination_column(cluster):
+def test_export_partition_with_renamed_destination_column_rejected(cluster):
     """
     Source has column `id`, destination has the same shape but the column is
-    named `renamed_id`.  Positional matching must accept the export and the
-    data must land in the destination under the new name.
+    named `renamed_id`.  Columns are matched by position, while the partition
+    machinery resolves them by name, so a name mismatch must be rejected
+    synchronously rather than exporting values under a different name.
     """
     node = cluster.instances["replica1"]
 
@@ -1581,20 +1582,54 @@ def test_export_partition_with_renamed_destination_column(cluster):
     make_iceberg_s3(node, iceberg_table, "renamed_id Int64, year Int32",
                     partition_by="year")
 
-    node.query(
+    error = node.query_and_get_error(
         f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}",
         settings={"allow_insert_into_iceberg": 1},
     )
-    wait_for_export_status(node, mt_table, iceberg_table, "2020", "COMPLETED")
+    assert "INCOMPATIBLE_COLUMNS" in error and "renamed_id" in error, (
+        f"Expected INCOMPATIBLE_COLUMNS naming 'renamed_id', got: {error!r}"
+    )
 
     count = int(node.query(f"SELECT count() FROM {iceberg_table}").strip())
-    assert count == 3, f"Expected 3 rows in Iceberg table after export, got {count}"
+    assert count == 0, (
+        f"Expected 0 rows in Iceberg table after rejected export, got {count}"
+    )
 
-    result = node.query(
-        f"SELECT renamed_id, year FROM {iceberg_table} ORDER BY renamed_id"
-    ).strip()
-    assert result == "1\t2020\n2\t2020\n3\t2020", (
-        f"Unexpected data under renamed column:\n{result}"
+
+def test_export_partition_reordered_destination_columns_rejected(cluster):
+    """
+    Source and destination hold the same columns with the same types, but the
+    destination declares them in a different order.  Positional matching would
+    feed source `x` into destination `ts` while the partition value is derived
+    from the source column named `ts`, placing rows in a partition they do not
+    belong to, so the export must be rejected synchronously.
+    """
+    node = cluster.instances["replica1"]
+
+    uid = unique_suffix()
+    mt_table = f"mt_reordered_{uid}"
+    iceberg_table = f"iceberg_reordered_{uid}"
+
+    make_rmt(node, mt_table, "x Date, ts Date", "ts", replica_name="replica1",
+             order_by="x")
+    node.query(
+        f"INSERT INTO {mt_table} VALUES ('2024-05-10', '2024-01-01'), "
+        f"('2024-08-20', '2024-01-01')"
+    )
+
+    make_iceberg_s3(node, iceberg_table, "ts Date, x Date", partition_by="ts")
+
+    error = node.query_and_get_error(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '20240101' TO TABLE {iceberg_table}",
+        settings={"allow_insert_into_iceberg": 1},
+    )
+    assert "INCOMPATIBLE_COLUMNS" in error, (
+        f"Expected INCOMPATIBLE_COLUMNS for reordered destination columns, got: {error!r}"
+    )
+
+    count = int(node.query(f"SELECT count() FROM {iceberg_table}").strip())
+    assert count == 0, (
+        f"Expected 0 rows in Iceberg table after rejected export, got {count}"
     )
 
 
