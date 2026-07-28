@@ -1277,3 +1277,7 @@ interfering per standing practice. No push.
 **2026-07-28 11:1x UTC watchdog** — task 5 DONE (`d7a73ec85d2`, 18/18 run_mount expectations: 3 new
 sabotages RED with exact names, v9_recoverygen green). Review package generated (task-commit-only
 span, excluding foreign/worklog interleave), opus reviewer dispatched. No push.
+
+**2026-07-28 11:3x UTC watchdog** — task 5 reviewer (opus) still reading (no review file yet; the
+package is 158 KB + working-tree module context, long read phase expected). No stray processes.
+One more tick before a ping. No push.
