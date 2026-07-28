@@ -1557,3 +1557,7 @@ for I1 (fix1_red_run.log). No push.
 **2026-07-28 22:3x local** — terminate ruling landed: both gates UNFILTERED green (ASan 1427/1427
 zero reports). Mount-pair scoped review dispatched; on clean = task 4 closes, T7 merges into
 main, T5 dispatches. G's T8 fix round still cycling. No push.
+
+**2026-07-28 22:5x local** — mount-pair review all-PASS; final micro-round (4 doc/test touches +
+first build_debug gate — the only class arming the alloc-free guards). Task 4 one commit from
+closed. No push.
