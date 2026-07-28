@@ -53,8 +53,20 @@ every sabotage/control pair is like-for-like (see Scoping for why 4 did not fit)
    above the gap still names. The precondition sits outside spec §1's trust model (exact point reads
    honest), but the damage exceeds the corruption itself, so both bounds are committed as runnable
    configurations rather than argued away. The fix direction is a DURABLE witness rather than an
-   enumeration: `_fix_ckptwitness` makes `_ckpt.checkpoint` one and is green.
-6. **A latent TLA+ precedence bug was found in the module this rewrite replaces.**
+   enumeration: `_fix_ckptwitness` makes `_ckpt.checkpoint` one and is green. **Spec §5 adopted
+   this after the gate ran** (commits `abd77cd4738`, `33b301eacb8`), including its limit.
+6. **Fix round 1 corrected two counterexample-FIDELITY defects** — both greens and reds were
+   unchanged by them, but the traces were reaching their verdicts by shortcuts rather than by the
+   scenarios the sabotages exist to model. (a) A hold did not revoke the frontier proof it
+   contradicts, so a proof granted earlier in the SAME round, at the same position, before the hint
+   disclosed the witness, survived and authorized destruction; `ProbeAbsent`'s hold branch now
+   clears `frontier[t]`. (b) `Rebuild` inherited the round's `roundOutcome = "won"` and its proofs,
+   so the r8 counterexample destroyed in the same idle tail rather than "one round later"; a rebuild
+   now resets both. With the shortcuts closed, `_sab_destroyunderhold` and `_sab_rebuilddropshold`
+   take the intended two-round path — detect via the hint's witness, carry the hold, then destroy in
+   a later round whose hint omits it — and their state spaces grew from 1.1 M / 2.0 M distinct to
+   5.3 M / 7.3 M at depth 21. The narratives below were rewritten against the new traces.
+7. **A latent TLA+ precedence bug was found in the module this rewrite replaces.**
    `dupFlag' = dupFlag \/ (...)` parses as `(dupFlag' = dupFlag) \/ (...)`, so the moment the
    duplicate condition became true the ghost was simply not assigned. TLC reports that as
    `Successor state is not completely specified`, i.e. a harness *error*, not an invariant
@@ -69,22 +81,22 @@ every sabotage/control pair is like-for-like (see Scoping for why 4 did not fit)
 
 | cfg | expected | TLC verdict | states (gen / distinct) | depth |
 |---|---|---|---|---|
-| `_sab_skipquietprobe` (THE r7-1 blocker) | violation | **RED as required** — `NoAckedLoss` | 1,812,868 / 406,228 | 16 |
-| `_sab_cleanupignorescursor` | violation | **RED as required** — `NoAckedLoss` | 66,695,799 / 12,028,740 | 22 |
-| `_fix_ckptwitness` (the proposed mitigation) | green | **PASS** — `No error has been found` | 965,553,461 / 131,941,172 | 47 |
-| `_sab_adoptbeforecommit` | violation | **RED as required** — `NoMissedFold` | 2,747 / 1,154 | 9 |
-| `_sab_destroyunderhold` | violation | **RED as required** — `HoldSuppresses` | 5,465,086 / 1,096,291 | 17 |
-| `_sab_rebuilddropshold` (THE r8 blocker) | violation | **RED as required** — `HoldSuppresses` | 10,146,299 / 1,962,570 | 19 |
-| `_sab_clearholdonabsent` | violation | **RED as required** — `HoldSuppresses` | 5,655,585 / 1,142,785 | 17 |
-| `_witness_corruptgap` (FINDING: violation = evidence) | violation = evidence | **VIOLATED as required** — `NoAckedLoss` | 50,003,552 / 8,929,285 | 22 |
-| `_ctl_holdsuppresses` (control for the three hold sabotages) | green | **PASS** — `No error has been found` | 1,569,440,282 / 200,720,938 | 56 |
-| `_sab_deleteignoresindeg` (the late-+1 window, second half) | violation | **RED as required** — `NoAckedLoss` | 32,256,210 / 6,224,494 | 23 |
+| `_sab_skipquietprobe` (THE r7-1 blocker) | violation | **RED as required** — `NoAckedLoss` | 1,956,320 / 440,447 | 17 |
+| `_sab_cleanupignorescursor` | violation | **RED as required** — `NoAckedLoss` | 61,252,490 / 11,119,725 | 22 |
+| `_fix_ckptwitness` (the `_ckpt` witness, now spec §5) | green | **PASS** — `No error has been found` | 869,656,192 / 117,412,972 | 47 |
+| `_sab_adoptbeforecommit` | violation | **RED as required** — `NoMissedFold` | 2,508 / 1,052 | 9 |
+| `_sab_destroyunderhold` | violation | **RED as required** — `HoldSuppresses` | 29,407,049 / 5,319,021 | 21 |
+| `_sab_rebuilddropshold` (THE r8 blocker) | violation | **RED as required** — `HoldSuppresses` | 40,807,540 / 7,288,633 | 21 |
+| `_sab_clearholdonabsent` | violation | **RED as required** — `HoldSuppresses` | 5,341,737 / 1,080,030 | 18 |
+| `_witness_corruptgap` (FINDING: violation = evidence) | violation = evidence | **VIOLATED as required** — `NoAckedLoss` | 44,813,087 / 7,957,869 | 22 |
+| `_ctl_holdsuppresses` (control for the three hold sabotages) | green | **PASS** — `No error has been found` | 1,563,304,998 / 199,946,482 | 56 |
+| `_sab_deleteignoresindeg` (the late-+1 window, second half) | violation | **RED as required** — `NoAckedLoss` | 36,211,139 / 6,887,580 | 23 |
 | `_v9_safe` (THE GATE) | green | **PASS** — `No error has been found` | 304,739,033 / 46,930,936 | 44 |
 | `_v9_hintomission` (the listing returns nothing, ever) | green | **PASS** — `No error has been found` | 36,648,716 / 6,011,454 | 42 |
-| `_v9_hold` (corruption + an IDEALIZED detector; upper bound) | green | **PASS** — `No error has been found` | 503,634,646 / 71,461,063 | 46 |
+| `_v9_hold` (corruption + an IDEALIZED detector; upper bound) | green | **PASS** — `No error has been found` | 467,180,743 / 66,503,845 | 46 |
 
 Sabotage state counts are "explored before the violation was found" and vary a little between runs
-with parallel workers; the verdict does not. Whole harness: **869 s, 13/13 expectations met.**
+with parallel workers; the verdict does not. Whole harness: **834 s, 13/13 expectations met.**
 
 ## The properties
 
@@ -116,12 +128,19 @@ folding through it). Carrying the debt rather than flagging the drop is what mak
 hold-dropping sabotages produce real multi-step behaviours instead of tautologies — each must
 actually reach a `Condemn` or `Delete` to be caught.
 
+Stated plainly so the greens are not over-read: **`HoldSuppresses` is structurally implied by
+`DestructiveGate` in every honest configuration** — the gate's own `~AnyHold` conjunct, plus (since
+the fix round) a hold revoking `frontier[t]`, means no honest run can reach a destructive step while
+encumbered. Its green rows are therefore a consistency check, not a discovery. The property earns
+its keep entirely through its three sabotages, each of which removes a different one of those
+guards and immediately produces a counterexample.
+
 ## The counterexamples, one per sabotage
 
 Each row is the exact action sequence TLC reported.
 
 **`_sab_skipquietprobe` -> `NoAckedLoss`**
-`WAppendStart` -> `EpochSeal` -> `WAppendStart` -> `WAppendDurable` -> `WAppendDurable` -> `BeginRound` -> `WalkStep` -> `ScanComplete` -> `FoldCommitWin` -> `Condemn` -> `BeginRound` -> `ScanComplete` -> `FoldCommitWin` -> `Delete`
+`WAppendStart` -> `EpochSeal` -> `WAppendStart` -> `WAppendDurable` -> `BeginRound` -> `WAppendDurable` -> `WalkStep` -> `ScanComplete` -> `FoldCommitWin` -> `Condemn` -> `BeginRound` -> `ScanComplete` -> `FoldCommitWin` -> `Delete`
 
 T1's slot 1 is an epoch seal and slot 2 is the acknowledged `+1`; T2 appends its `-1`. The round
 walks T2 only — nothing forces it to touch T1, because the sabotage lets destruction proceed with
@@ -130,12 +149,13 @@ next round deletes. This is r7-1 verbatim: per-namespace cursor immobility is wo
 in-degree is pool-wide.
 
 **`_sab_cleanupignorescursor` -> `NoAckedLoss`**
-`WAppendStart` -> `WAppendStart` -> `WAppendDurable` -> `WAppendStart` -> `WRaiseSnap` -> `WAppendDurable` -> `Cleanup` -> `WAppendDurable` -> `BeginRound` -> `ProbeAbsent` -> `WalkStep` -> `ProbeAbsent` -> `ScanComplete` -> `FoldCommitWin` -> `Condemn` -> `BeginRound` -> `ProbeAbsent` -> `ProbeAbsent` -> `ScanComplete` -> `FoldCommitWin` -> `Delete`
+`WAppendStart` -> `WAppendDurable` -> `WAppendStart` -> `WRaiseSnap` -> `WAppendDurable` -> `WAppendStart` -> `Cleanup` -> `BeginRound` -> `ProbeAbsent` -> `WAppendDurable` -> `WalkStep` -> `ProbeAbsent` -> `ScanComplete` -> `FoldCommitWin` -> `Condemn` -> `BeginRound` -> `ProbeAbsent` -> `ProbeAbsent` -> `ScanComplete` -> `FoldCommitWin` -> `Delete`
 
 Cleanup deletes T1's log 1 on snapshot coverage alone, while the cursor is still 0. That does not
 merely lose a delta — it MANUFACTURES a quiet namespace: the exact `GET cursor+1` now answers
 absent, the frontier proof is granted, and the acked `+1` at T1:2 sits behind a gap nothing will
-ever walk.
+ever walk. `_fix_ckptwitness` is the same configuration with `_ckpt` coverage admitted as a
+witness, and it is green — the loss becomes a hold.
 
 **`_sab_adoptbeforecommit` -> `NoMissedFold`**
 `WAppendStart` -> `BeginRound` -> `WAppendDurable` -> `WalkStep` -> `ScanComplete`
@@ -144,36 +164,43 @@ The shortest counterexample in the harness (9 states deep): the candidate cursor
 `ScanComplete`, so a durable log is already below the cursor before any commit adopted it.
 
 **`_sab_destroyunderhold` -> `HoldSuppresses`**
-`WAppendStart` -> `WAppendStart` -> `WAppendDurable` -> `WAppendDurable` -> `WAppendStart` -> `WAppendDurable` -> `HideLog` -> `BeginRound` -> `ProbeAbsent` -> `HintReturn` -> `ProbeAbsent` -> `WalkStep` -> `ProbeAbsent` -> `ScanComplete` -> `FoldCommitWin` -> `Condemn`
+`WAppendStart` -> `WAppendStart` -> `WAppendDurable` -> `WAppendStart` -> `WAppendDurable` -> `WAppendDurable` -> `HideLog` -> `BeginRound` -> `HintReturn` -> `ProbeAbsent` -> `WalkStep` -> `ScanComplete` -> `FoldCommitWin` -> `BeginRound` -> `ProbeAbsent` -> `ProbeAbsent` -> `ScanComplete` -> `FoldCommitWin` -> `Condemn`
 
-The hold is established from the hint's witness, then a later probe in the same round grants a
-frontier proof for the OTHER namespace and the sabotage lets `Condemn` ignore the live hold. The
-honest gate refuses; `_ctl_holdsuppresses` is the identical configuration without the toggle.
+**Two rounds, and that is the point.** Round 1 (states 9-14): the hint returns the witness, the
+probe finds the gap below it and HOLDS the namespace — which also revokes the frontier proof that
+same absent read had granted. Round 2 (15-20): the hint says nothing about that namespace, so the
+identical absent probe now reads as an honest frontier and every namespace is "proven". The hold
+is still live and is the only thing standing between that proof and the blob; this toggle removes
+it. The hold's value is precisely that it OUTLIVES the round in which detection was possible.
 
 **`_sab_rebuilddropshold` -> `HoldSuppresses`**
-`WAppendStart` -> `WAppendStart` -> `WAppendDurable` -> `WAppendStart` -> `WAppendDurable` -> `HideLog` -> `WAppendDurable` -> `BeginRound` -> `ProbeAbsent` -> `HintReturn` -> `ProbeAbsent` -> `WalkStep` -> `ProbeAbsent` -> `ScanComplete` -> `FoldCommitWin` -> `Rebuild` -> `Condemn`
+`WAppendStart` -> `WAppendStart` -> `WAppendDurable` -> `WAppendStart` -> `WAppendDurable` -> `HideLog` -> `WAppendDurable` -> `BeginRound` -> `HintReturn` -> `ProbeAbsent` -> `WalkStep` -> `ScanComplete` -> `FoldCommitWin` -> `Rebuild` -> `BeginRound` -> `ProbeAbsent` -> `ProbeAbsent` -> `ScanComplete` -> `FoldCommitWin` -> `Condemn`
 
-The r8 blocker. Round 1's hint returns the witness, the impossible shape is detected and T1 is
-held. `Rebuild` then rebuilds cursors and drops the hold, and the very next destructive step runs
-with the gap still there and nothing recording it. Spec §7's "REBUILD carries every hold
-verbatim" is exactly what is missing here.
+**The r8 blocker, and now genuinely one round later.** Round 1 (9-14) detects the shape from the
+hint's witness and holds. `Rebuild` (15) drops the hold — recording a debt — and, being its own
+operation rather than a step inside a round, discards that round's destructive authorization.
+Round 2 (16-21) starts clean, its hint no longer mentions the namespace, the same 404 reads as an
+honest frontier, and `Condemn` runs over a gap nothing records any more. Spec §7's "REBUILD
+carries every hold verbatim" is exactly the missing rule.
 
 **`_sab_clearholdonabsent` -> `HoldSuppresses`**
-`WAppendStart` -> `WAppendStart` -> `WAppendDurable` -> `WAppendStart` -> `WAppendDurable` -> `WAppendDurable` -> `HideLog` -> `BeginRound` -> `HintReturn` -> `ProbeAbsent` -> `WalkStep` -> `ProbeAbsent` -> `ProbeAbsent` -> `ScanComplete` -> `FoldCommitWin` -> `Condemn`
+`WAppendStart` -> `WAppendStart` -> `WAppendDurable` -> `WAppendStart` -> `WAppendDurable` -> `WAppendDurable` -> `HideLog` -> `BeginRound` -> `HintReturn` -> `ProbeAbsent` -> `ProbeAbsent` -> `WalkStep` -> `ProbeAbsent` -> `ScanComplete` -> `FoldCommitWin` -> `Condemn`
 
-Two probes at the same offending position: the first sets the hold, the second finds it absent
-AGAIN and the sabotage reads that as permission to clear. Spec §5 (r9-5) says the opposite — a
-hold clears only by folding through the position, never by observing another absent.
+Two probes at the same offending position within one round: the first sets the hold, the second
+finds it absent AGAIN and the sabotage reads that as permission to clear — restoring the frontier
+proof it had revoked. Spec §5 (r9-5) says the opposite: a hold clears only by folding through the
+position, never by observing another absent.
 
 **`_witness_corruptgap` -> `NoAckedLoss`**
 `WAppendStart` -> `WAppendStart` -> `WAppendDurable` -> `WAppendStart` -> `WAppendDurable` -> `WAppendDurable` -> `HideLog` -> `BeginRound` -> `ProbeAbsent` -> `WalkStep` -> `ProbeAbsent` -> `ScanComplete` -> `FoldCommitWin` -> `Condemn` -> `BeginRound` -> `ProbeAbsent` -> `ProbeAbsent` -> `ScanComplete` -> `FoldCommitWin` -> `Delete`
 
 No `HintReturn` appears in the trace at all: T1 is simply never mentioned by the listing. The
-hidden log is unobservable, no witness is ever seen, and the namespace is indistinguishable from
-a quiet one. This is the residual exposure, not a sabotage — every protocol rule is honest here.
+hidden log is unobservable, no witness is ever seen, no hold is ever set, and the namespace is
+indistinguishable from a quiet one. This is the residual exposure, not a sabotage — every protocol
+rule is honest here.
 
 **`_sab_deleteignoresindeg` -> `NoAckedLoss`**
-`WAppendStart` -> `EpochSeal` -> `WAppendStart` -> `WAppendDurable` -> `BeginRound` -> `WalkStep` -> `ProbeAbsent` -> `WAppendDurable` -> `WalkStep` -> `ProbeAbsent` -> `ScanComplete` -> `FoldCommitWin` -> `Condemn` -> `BeginRound` -> `WalkStep` -> `ProbeAbsent` -> `ProbeAbsent` -> `ScanComplete` -> `FoldCommitWin` -> `Delete`
+`WAppendStart` -> `EpochSeal` -> `WAppendStart` -> `BeginRound` -> `WalkStep` -> `ProbeAbsent` -> `WAppendDurable` -> `WAppendDurable` -> `WalkStep` -> `ProbeAbsent` -> `ScanComplete` -> `FoldCommitWin` -> `Condemn` -> `BeginRound` -> `WalkStep` -> `ProbeAbsent` -> `ProbeAbsent` -> `ScanComplete` -> `FoldCommitWin` -> `Delete`
 
 The late-`+1` window. `ProbeAbsent` grants T1's frontier proof, and only THEN does the acked `+1`
 become durable — against a LIVE blob, so writer-side rematerialization never triggers. Round 1
@@ -183,49 +210,51 @@ only the strengthened `NoAckedLoss` sees it.
 
 ## Non-vacuity of the green runs
 
-Action coverage (`-coverage 1`) on the two greens that matter, as `distinct-states-found : transitions`:
+Action coverage on the two greens that matter, as `distinct-states-found : transitions`. Reproduce
+with `COVERAGE=1 bash docs/superpowers/models/run_deltaintake.sh`, which re-runs exactly these two
+configurations under `-coverage 1` after the ordinary pass (off by default: it roughly doubles their
+runtime and changes no verdict). Logs land in `tmp/tlc_cov_<cfg>.log`.
 
 | action | `_v9_safe` | `_v9_hold` |
 |---|---|---|
-| `BeginRound` | 65,693 : 9,946,953 | 200,477 : 36,499,761 |
-| `Cleanup` | 3,860,998 : 14,796,327 | 10,348,633 : 48,100,669 |
-| `Condemn` | 313,662 : 357,795 | 463,313 : 660,657 |
-| `Delete` | 22,019 : 24,229 | 153,046 : 198,447 |
-| `EpochSeal` | 476,547 : 7,770,103 | 632,560 : 15,244,552 |
-| `FoldCommitLose` | 4,651,879 : 4,854,410 | 15,744,765 : 17,480,651 |
-| `FoldCommitWin` | 4,659,428 : 4,854,292 | 10,069,242 : 17,480,651 |
-| `HideLog` | 0 : 0 | 7,823,335 : 32,259,603 |
-| `HintReturn` | 1,306,798 : 9,771,548 | 0 : 0 |
+| `BeginRound` | 79,786 : 27,063,720 | 202,193 : 34,325,141 |
+| `Cleanup` | 10,431,692 : 44,355,096 | 9,921,956 : 46,266,996 |
+| `Condemn` | 590,312 : 895,672 | 461,596 : 660,657 |
+| `Delete` | 224,221 : 291,688 | 151,333 : 198,447 |
+| `EpochSeal` | 675,887 : 12,335,700 | 571,250 : 14,405,741 |
+| `FoldCommitLose` | 9,222,404 : 9,933,608 | 14,743,365 : 16,089,352 |
+| `FoldCommitWin` | 9,208,036 : 9,933,608 | 9,703,742 : 16,089,352 |
+| `HideLog` | 0 : 0 | 6,873,090 : 28,649,063 |
+| `HintReturn` | 1,781,512 : 16,824,484 | 0 : 0 |
 | `Init` | 1 : 1 | 1 : 1 |
-| `NoOp` | 0 : 20,493,091 | 0 : 71,461,063 |
-| `ProbeAbsent` | 1,345,162 : 5,211,058 | 3,309,493 : 18,163,836 |
+| `NoOp` | 0 : 46,930,936 | 0 : 66,503,845 |
+| `ProbeAbsent` | 2,212,827 : 10,250,760 | 3,063,496 : 17,194,478 |
 | `Rebuild` | 0 : 0 | 0 : 0 |
-| `RevealLog` | 0 : 0 | 2,144,078 : 40,188,858 |
-| `ScanComplete` | 4,837,583 : 5,690,421 | 13,279,920 : 17,480,651 |
-| `WAppendAbandon` | 0 : 6,912,313 | 2 : 15,244,552 |
-| `WAppendDurable` | 718,991 : 6,912,192 | 1,413,330 : 15,244,552 |
-| `WAppendStart` | 164,908 : 7,769,340 | 216,011 : 15,244,552 |
-| `WRaiseSnap` | 456,992 : 32,432,341 | 1,177,714 : 125,884,124 |
-| `WalkStep` | 1,572,975 : 6,169,640 | 4,485,143 : 16,797,466 |
+| `RevealLog` | 0 : 0 | 1,503,887 : 37,016,737 |
+| `ScanComplete` | 8,110,000 : 9,933,608 | 12,681,401 : 16,089,352 |
+| `WAppendAbandon` | 0 : 12,335,700 | 0 : 14,405,741 |
+| `WAppendDurable` | 1,296,791 : 12,335,700 | 1,369,682 : 14,405,741 |
+| `WAppendStart` | 225,635 : 12,335,700 | 178,603 : 14,405,741 |
+| `WRaiseSnap` | 723,870 : 69,366,596 | 1,000,648 : 115,490,132 |
+| `WalkStep` | 2,147,962 : 9,616,456 | 4,077,602 : 14,984,226 |
 
 What this rules out:
 
-- **The greens are not green because nothing happens.** `_v9_safe` reaches `Delete` 22,019 times and
-  `Condemn` 313,662 times: the pipeline runs to completion over and over, and `NoAckedLoss` holds
-  anyway. `_v9_hold` destroys MORE (153,046 `Delete`), because the fault gives it more reachable
-  states — so its green is not "the hold suppressed everything", it is "the hold suppressed exactly
-  the rounds it had to".
-- **Both commit outcomes are exercised in equal measure** (`FoldCommitWin` 4,659,428 vs
-  `FoldCommitLose` 4,651,879 in `_v9_safe`), so `LosingCommitAdoptsNothing` is checked against real
-  losing rounds rather than a corner.
-- **The fault fires and un-fires.** In `_v9_hold`, `HideLog` contributes 7,823,335 distinct states
-  and `RevealLog` 2,144,078 — so both the permanent-corruption path and the transient one (where the
+- **The greens are not green because nothing happens.** `_v9_safe` reaches `Delete` 224,221 times
+  and `Condemn` 590,312 times: the pipeline runs to completion over and over, and `NoAckedLoss`
+  holds anyway. `_v9_hold` still destroys 151,333 times WITH corruption present — so its green is
+  not "the hold suppressed everything", it is "the hold suppressed exactly the rounds it had to".
+- **Both commit outcomes are exercised in equal measure** (`FoldCommitWin` 9,208,036 vs
+  `FoldCommitLose` 9,222,404 in `_v9_safe`), so `LosingCommitAdoptsNothing` is checked against real
+  losing rounds rather than a corner — even though no sabotage falsifies it.
+- **The fault fires and un-fires.** In `_v9_hold`, `HideLog` contributes 6,873,090 distinct states
+  and `RevealLog` 1,503,887 — both the permanent-corruption path and the transient one (where the
   hold clears by folding through) are explored.
 - **Sabotage-only actions are correctly unreachable.** `Rebuild` is 0 : 0 in both, `HideLog` /
-  `RevealLog` are 0 : 0 in `_v9_safe`, and `HintReturn` is 0 : 0 in `_v9_hold` because `HintComplete`
-  replaces the dribbling enumeration with the idealized detector.
-- **The scan is exercised as a hint, not as truth.** `_v9_safe` takes `HintReturn` 1,306,798 times
-  and `WalkStep` 1,572,975 times, and the fold's output depends only on the latter.
+  `RevealLog` are 0 : 0 in `_v9_safe`, and `HintReturn` is 0 : 0 in `_v9_hold` because
+  `HintComplete` replaces the dribbling enumeration with the idealized detector.
+- **The scan is exercised as a hint, not as truth.** `_v9_safe` takes `HintReturn` 1,781,512 times
+  and `WalkStep` 2,147,962 times, and the fold's output depends only on the latter.
 
 ## What the model is
 
@@ -316,7 +345,7 @@ departs from the brief's sketch:
 Two further departures are additive rather than corrective: `_sab_destroyunderhold` and
 `_ctl_holdsuppresses` exist because `HoldSuppresses` would otherwise be a guard nobody had seen
 fail, and `_fix_ckptwitness` exists because the finding below deserves a demonstrated mitigation
-rather than a paragraph.
+rather than a paragraph — the spec has since adopted that mitigation.
 
 ## The residual exposure, stated plainly
 
@@ -339,12 +368,14 @@ increasing cost:
   trust model as "exact point reads are honest"; a record that is *gone* is not a dishonest read.
   The extra damage — a blob deleted out from under an intact acked `+1` above the gap — is the part
   that is not covered by that argument.
-- **`_fix_ckptwitness` (cheap, partial, GREEN in this model).** Make `_ckpt.checkpoint` a second,
-  hint-independent witness: a log above the cursor that `_ckpt` covers cannot have been legitimately
-  cleaned, so its absence is the impossible shape. Free — the fold already reads `_ckpt` for cleanup
-  ranges — and it converts the entire premature-cleanup class from data loss into a hold. It does
-  NOT close the general case: a gap above `_ckpt.checkpoint` in a namespace the hint never mentions
-  is still invisible.
+- **`_fix_ckptwitness` (cheap, partial, GREEN in this model) — now spec §5.** Make
+  `_ckpt.checkpoint` a second, hint-independent witness: a log above the cursor that `_ckpt` covers
+  cannot have been legitimately cleaned, so its absence is the impossible shape. Free — the fold
+  already reads `_ckpt` for cleanup ranges — and it converts the entire premature-cleanup class from
+  data loss into a hold. It does NOT close the general case: a gap above `_ckpt.checkpoint` in a
+  namespace the hint never mentions is still invisible. This model proposed it; the spec adopted it
+  in `abd77cd4738` / `33b301eacb8`, limit included. The constant stays so both arms remain separable
+  evidence: `_sab_cleanupignorescursor` (off) RED, `_fix_ckptwitness` (on) GREEN.
 - **The head-CAS alternative (§10).** An authoritative per-namespace head is the only witness that
   is both durable and always above the frontier. Already recorded there as the north star; this is
   one more entry on its side of the ledger.
@@ -362,6 +393,12 @@ object, never an enumeration.** Both mitigations above satisfy it; no listing di
   a no-op contributing no edge (spec §5 B1/B2, uniform consumption). Seal *grammar* (exactly one seal
   operation per transaction, `prev_epoch_seal` on exactly sequence 1) remains a C++ codec obligation,
   as Task 1 recorded.
+- **Two properties are UNFALSIFIED and must be cited as such.** `ExactlyOnce` and
+  `LosingCommitAdoptsNothing` are checked in nine and thirteen configurations respectively and have
+  never been reported violated — no sabotage in this harness breaks either. `LosingCommitAdoptsNothing`
+  is *almost* falsified: `_sab_adoptbeforecommit` does violate it, but `NoMissedFold` breaks one step
+  shallower and is what TLC reports, so the red is never attributed to it. Treat both as consistency
+  checks rather than as evidence, and do not let the main plan cite them as proven-load-bearing.
 - **`ExactlyOnce` has no dedicated sabotage.** It is a secondary oracle that no modelled rule
   breaks: `WalkStep` admits an id into `delta` only when it is above the round's starting cursor, and
   `csnap` is captured atomically at `BeginRound`. It is checked in nine configurations and is the

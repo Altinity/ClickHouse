@@ -30,6 +30,10 @@
 #   v9_hold                  -> GREEN   corruption + an IDEALIZED (store-reading) detector: the hold
 #                                       fires and holds. An upper bound, not a claim about listings
 # Exits nonzero if any expectation is unmet.
+#
+# COVERAGE=1 additionally re-runs the two greens that carry the non-vacuity argument
+# (`v9_safe`, `v9_hold`) under `-coverage 1`, which is where the RESULTS action-coverage table comes
+# from. Off by default because it roughly doubles their runtime and changes no verdict.
 set -uo pipefail
 cd "$(dirname "$0")"
 JAR=../../../tmp/tla2tools.jar
@@ -83,6 +87,20 @@ for row in "${CONFIGS[@]}"; do
 
   printf '%-26s %-10s %-32s %-8s %s\n' "$name" "$expect" "$result" "$elapsed" "$verdict"
 done
+
+if [[ "${COVERAGE:-0}" == "1" ]]; then
+  echo
+  echo "COVERAGE=1: re-running the non-vacuity greens with -coverage 1"
+  for name in v9_safe v9_hold; do
+    log="../../../tmp/tlc_cov_${name}.log"
+    meta="../../../tmp/tlc-meta-cov-${name}"
+    rm -rf "$meta"
+    /usr/bin/java -XX:+UseParallelGC ${TLC_JAVA_OPTS:-} -cp "$JAR" tlc2.TLC \
+      -metadir "$meta" -workers auto -coverage 1 \
+      -config "${MODULE}_${name}.cfg" "$MODULE.tla" >"$log" 2>&1
+    echo "  coverage ${name}: $log"
+  done
+fi
 
 echo
 if [[ $overall -eq 0 ]]; then echo "ALL EXPECTATIONS MET"; else echo "SOME EXPECTATIONS UNMET"; fi

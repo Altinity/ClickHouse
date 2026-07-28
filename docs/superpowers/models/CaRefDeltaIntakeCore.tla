@@ -81,7 +81,13 @@ AllKeys == { [t |-> t, i |-> i] : t \in Tables, i \in Ids }
    `EdgeRoles` is the value every configuration binds to the CONSTANT `EdgeOf` (`EdgeOf <-
    EdgeRoles`): a cfg cannot spell a function literal, and fixing the roles in the module keeps the
    scenario identical across configurations, which is what makes the sabotage/green pairs
-   controlled experiments. A configuration wanting different roles overrides to another operator. *)
+   controlled experiments. A configuration wanting different roles overrides to another operator —
+   but note what the roles are load-bearing FOR: `NoAckedLoss` below is the strong form ("no acked
+   add exists at all when the blob is deleted"), which is only the honest statement of the damage
+   because no `rem` in this key space ever retracts the `add`. An override that pairs a removal with
+   the add makes deletion legitimate and turns that invariant into a false alarm; the second ASSUME
+   below is the guard that catches the specific case of over-many removals, not this one. Such an
+   override must weaken `NoAckedLoss` to the "acked but unfolded" form in the same change. *)
 AddId == 2
 RemId == 1
 BaseIndeg == 1
@@ -167,12 +173,15 @@ Present(t, i) ==
    IF detection were perfect, the hold makes corruption survivable. It is not, and
    `_witness_corruptgap` is the lower bound.
 
-   `CkptWitness` is a PROPOSED addition, not spec text, kept behind a constant so it cannot silently
-   strengthen the model: `_ckpt.checkpoint` (`snap[t]`) covering `i` also proves `i` was durable, and
-   a log ABOVE the cursor is never legitimately cleanable (`Cleanup` needs `i <= cursor[t]`), so a
-   covered-but-absent id above the cursor cannot be honest either. It is hint-independent, free (the
-   fold already reads `_ckpt` for cleanup ranges) and, unlike a listing, not a stale snapshot.
-   `_fix_ckptwitness` shows what it buys. *)
+   `CkptWitness` began as this model's PROPOSAL and is now spec text: §5 adopted `_ckpt.checkpoint`
+   as the hint-independent second witness after this gate ran. It stays behind a constant anyway, so
+   the two arms remain separable evidence rather than an assumption — `_sab_cleanupignorescursor`
+   (off) is RED and `_fix_ckptwitness` (on) is GREEN, which is what shows the rule earns its place.
+   The mechanism: `_ckpt.checkpoint` (`snap[t]`) covering `i` proves `i` was durable, and a log ABOVE
+   the cursor is never legitimately cleanable (`Cleanup` needs `i <= cursor[t]`), so a
+   covered-but-absent id above the cursor cannot be honest either. It is free (the fold already reads
+   `_ckpt` for cleanup ranges) and, unlike a listing, not a stale snapshot. It does NOT close the
+   general case — a gap above `_ckpt.checkpoint` in an unmentioned namespace is still invisible. *)
 WitnessAbove(t, i) ==
     \/ maxSeen[t] > i
     \/ (HintComplete /\ \E j \in DurableIds(t) : j > i)
@@ -226,10 +235,15 @@ WAppendStart(t) ==
    inherit the corpse; it REMATERIALIZES from source, a fresh re-upload the old exact-token delete
    cannot touch. Modelled at the moment the add becomes durable, which is the moment the acked `+1`
    starts to matter. Without this the late-arrival window would be a false counterexample; with it,
-   the window that remains is the one the frontier proof has to close. *)
+   the window that remains is the one the frontier proof has to close.
+
+   The successor-seal-as-conclusive-rejection rule of INV-1 is NOT modelled here and cannot be: a
+   seal is only placed at `MaxDurable(t) + 1` with the lane idle (`EpochSeal` requires
+   `pendingId[t] = 0`), and an in-flight id is derived the same way, so the pending slot is never a
+   sealed slot in this module. The wedge meeting a successor's seal needs a writer-local view of the
+   store, which is `CaRefTableSnapshotLogCore`'s `WResolveSealRejected` (task 1). *)
 WAppendDurable(t) ==
     /\ pendingId[t] # 0
-    /\ pendingId[t] \notin sealed[t]        \* a successor's seal is a conclusive rejection
     /\ LET key == [t |-> t, i |-> pendingId[t]] IN
          /\ durable' = durable \cup {key}
          /\ everDurable' = everDurable \cup {key}
@@ -332,7 +346,13 @@ WalkStep(t) ==
 
    Absent BELOW a witness this round's hint returned is the impossible shape: contiguity says it
    cannot happen, so the store is lying or corrupt, and whatever sits behind the gap may be an acked
-   `+1`. The namespace is HELD at that position — and a hold is not a frontier proof.
+   `+1`. The namespace is HELD at that position — and a hold is not a frontier proof: setting one
+   REVOKES `frontier[t]`, because the evidence that granted the proof (an absent expected-next) is
+   the very evidence now known to be a lie. Without that revocation a proof granted earlier in the
+   SAME round, at the same position, before the hint disclosed the witness, would survive the
+   contradiction and authorize destruction — and it did, until this was fixed: it was how
+   `_sab_destroyunderhold` and `_sab_rebuilddropshold` reached their counterexamples, which made
+   both traces less realistic than the paths those sabotages exist to model.
 
    SabotageClearHoldOnAbsent is the r9-5 rule inverted: it treats a second absent probe as evidence
    that the hold may go, which spec §5 forbids ("clears ONLY by folding through that position ...
@@ -349,7 +369,8 @@ ProbeAbsent(t) ==
                     /\ frontier' = [frontier EXCEPT ![t] = TRUE]
                ELSE /\ hold' = [hold EXCEPT ![t] = TRUE]
                     /\ holdPos' = [holdPos EXCEPT ![t] = nxt]
-                    /\ UNCHANGED << holdDebt, frontier >>
+                    /\ frontier' = [frontier EXCEPT ![t] = FALSE]
+                    /\ UNCHANGED holdDebt
           ELSE /\ frontier' = [frontier EXCEPT ![t] = TRUE]
                /\ UNCHANGED holdVars
     /\ UNCHANGED << storeVars, laneVars, cand, csnap, maxSeen, delta, gcPhase, roundOutcome,
@@ -448,8 +469,14 @@ Delete ==
    Honest REBUILD rebuilds cursors and edges from catalog + `_ckpt` + arithmetic tails, condemns
    nothing and CARRIES EVERY HOLD VERBATIM — on this model's state that is the identity, so it is
    modelled only through its sabotaged form. `SabotageRebuildDropsHold` is the r8 blocker: the
-   rebuilt baseline keeps the cursors and forgets the holds, and a later round whose hint no longer
-   returns the witness reads the same gap as an honest frontier. *)
+   rebuilt baseline keeps the cursors and forgets the holds, and a LATER round whose hint no longer
+   returns the witness reads the same gap as an honest frontier.
+
+   A rebuild is its own operation, not a step inside a fold round: it discards the round's
+   destructive authorization (`roundOutcome`) and its frontier proofs. Without that, REBUILD
+   inherited the authorization of whatever round it interrupted and the counterexample destroyed in
+   the SAME idle tail — which is not the r8 scenario, and contradicted every narrative written
+   around it. The scenario needs a fresh round to grant a fresh, now-uncontradicted proof. *)
 Rebuild ==
     /\ SabotageRebuildDropsHold
     /\ gcPhase = "idle"
@@ -457,7 +484,10 @@ Rebuild ==
     /\ hold' = [t \in Tables |-> FALSE]
     /\ holdPos' = [t \in Tables |-> 0]
     /\ holdDebt' = [t \in Tables |-> IF hold[t] THEN holdPos[t] ELSE holdDebt[t]]
-    /\ UNCHANGED << storeVars, laneVars, roundVars, foldVars, blobVars >>
+    /\ roundOutcome' = "none"
+    /\ frontier' = [t \in Tables |-> FALSE]
+    /\ UNCHANGED << storeVars, laneVars, cand, csnap, maxSeen, delta, gcPhase,
+                    foldVars, blobVars >>
 
 (* Self-loop so bounded counters exhausting is not a TLC deadlock (house pattern). *)
 NoOp == UNCHANGED vars
