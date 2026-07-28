@@ -1467,3 +1467,6 @@ task 3 fix round editing (no logs yet). No push.
 **2026-07-28 19:2x local** — task 3 fix round 1 done in one turn (`b04358e72ea`, 1406/1406);
 re-review dispatched (W1's two safety arguments to adjudicate). Lane-g build past halfway.
 No push.
+
+**2026-07-28 19:4x local** — task 3 re-review: 3 important remain (counter discriminator, a REAL
+pre-lock marker-read race, StayTransient loud signal ruled in); fix round 2 dispatched. No push.
