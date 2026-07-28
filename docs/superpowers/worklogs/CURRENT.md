@@ -1341,3 +1341,7 @@ surgical sites' current signatures. Two plan files: stage-a-streams + stage-b-ca
 **2026-07-28 14:4x local** — Stage A plan fully drafted: 15 tasks, all elaborated with exact
 sites from the Explore map (allocator fetch_add:541, recovery no-fence-recheck gap confirmed,
 3 un-gated destructive sites enumerated). Self-review + Stage B plan next. No push.
+
+**2026-07-28 15:1x local** — BOTH main plans written and committed (stage A 15 tasks / stage B
+12 tasks); all ledger obligations mapped in their self-review checklists. Next: codex xhigh
+review of plans + models (pipeline stage 9). No push.
