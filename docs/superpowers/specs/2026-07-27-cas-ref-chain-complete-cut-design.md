@@ -136,9 +136,18 @@ only delays reclamation. **Third arm, found by the phase-0 model** (`CaRefDeltaI
 condemnation hits a still-LIVE blob — no rematerialization triggers — and a later round folds it
 while the pending exact-token delete still fires; the closure is the DELETE-SITE in-degree re-read
 (the existing `deleteExact` liveness re-check), which is hereby NORMATIVE, not an optimization.
-The model also proves a listing can never be a witness source (it is a snapshot; a witness durable
-after the enumeration is invisible) — `_ckpt.checkpoint` doubles as the hint-independent second
-witness for the below-witness-404 hold, at zero cost (the fold already reads it for cleanup ranges).
+The model also proves a listing cannot be the SOLE witness source (it is a snapshot; a witness
+durable after the enumeration is invisible to that round's probes) — `_ckpt.checkpoint` doubles as a
+hint-independent second witness for the below-witness-404 hold, at zero cost (the fold already reads
+it for cleanup ranges), closing the premature-cleanup class (`_fix_ckptwitness` green) but NOT the
+general case: a gap above `_ckpt.checkpoint` in a namespace the hint never mentions stays invisible.
+**Named residual (`_witness_corruptgap`, committed RED):** if an above-cursor record is lost to
+CORRUPTION before any round observed a witness above it, and the hint never mentions the namespace,
+the exact `GET cursor+1` honestly answers absent, the frontier proof is granted, and a `-1`
+elsewhere can delete a blob an intact acked `+1` above the gap still names. The precondition
+(silent loss of a durable object to point reads) is outside §2's trust model; the residual is
+recorded here so it is a named exposure, not a silent one — the structural closure remains the
+head-CAS alternative (§10 north star).
 
 **The hold is durable and survives REBUILD.** `ShardCoverage::classification == 4` carries
 `{reason, offending position, retry/backoff}` per `(namespace, incarnation)` — a strict grammar:
