@@ -127,6 +127,87 @@
 (* `WallClockReclaim` is the deliberate sabotage this suite exists to       *)
 (* catch. `rev6_observe.cfg` is now fully GREEN and EXHAUSTIVE -- the       *)
 (* matrix is trustworthy against this class BY AUDIT, not by luck.          *)
+(*                                                                         *)
+(* 2026-07-28 v9 RECOVERY-GENERATION layer (spec                           *)
+(* 2026-07-27-cas-ref-chain-complete-cut-design.md, §3 "Recovery           *)
+(* ownership" and §9's r9-5 sabotage; plan task 5).                        *)
+(* This module ALREADY owned the mount-fence GENERATION                    *)
+(* itself -- the durable writer epoch (`epoch`, its per-actor view         *)
+(* `localEpoch`, and `fencedEpochs`). v9 adds the CONSUMER side: an        *)
+(* operation captures that generation AT ADMISSION and must re-present it  *)
+(* on every later write, with a recheck POST-I/O immediately before every  *)
+(* publication. Three hand-offs from plan tasks 1 and 3 land here, each    *)
+(* named at the construct that discharges it:                              *)
+(*                                                                         *)
+(*   - `recGen` -- the generation captured when a RECOVERY is admitted;    *)
+(*      `Install` re-presents it under the install lock.                   *)
+(*      `SabStaleInstall` drops that recheck, so an old recovery's result  *)
+(*      returns after a self-remount and publishes anyway. This is task    *)
+(*      3's zombie-install residual (`CaRefCatalogCore_RESULTS.md`         *)
+(*      Scoping, task-3 report concern 7): that module treats "the         *)
+(*      generation still validates" as an ORACLE (`creatorAlive`) and      *)
+(*      hands the generation's own issuance / observation / recheck        *)
+(*      lifecycle here.                                                    *)
+(*   - `wedgeGen` -- the generation STORED BY A WEDGED LANE (INV-1's       *)
+(*      every-attempt rule). Its ONE bounded conditional create            *)
+(*      (`WedgeRetryCreate`) is generation-guarded; `SabWedgeRetryOldGen`  *)
+(*      drops that guard, so a dead lane injects its bytes into the        *)
+(*      successor incarnation's live stream.                               *)
+(*   - `slot` -- the frontier key, i.e. this model's `slot-occupy` result  *)
+(*      (`None` = `Created`; `seal = FALSE` = `Occupied(bytes)`; `seal =   *)
+(*      TRUE` = `Occupied(EpochSeal)`). `WedgeRetryOccupied` resolves      *)
+(*      `Occupied` BY BYTES; `SabSlotNoByteCompare` drops the comparison   *)
+(*      and acks the lane's own operation while someone ELSE's bytes are   *)
+(*      at the key -- the ACKED-THEN-LOST branch                           *)
+(*      `CaRefTableSnapshotLogCore` cannot express (it grants the writer   *)
+(*      perfect knowledge of `writtenEver`; task-1 report concern 1 hands  *)
+(*      it here). Caught by the ONE new invariant this round adds,         *)
+(*      `AckedOpsAreDurable`.                                              *)
+(*                                                                         *)
+(* The seal also discharges task 1's SECOND hand-off. With a single        *)
+(* `rPhase` that module has at most one recovery in flight, so INV-2's     *)
+(* "`Occupied` with an `EpochSeal` terminates the walk" branch is never    *)
+(* exercised there. Here it is: `SealSlot` is planted by the SUCCESSOR     *)
+(* incarnation's recovery, and `WedgeRetryOccupied`'s first branch is the  *)
+(* OLD generation's lane meeting it -- INV-1's "a successor's `EpochSeal`  *)
+(* found at the key is a conclusive rejection". `W_SealRejectedRetry` pins *)
+(* that the branch is reachable rather than decorative.                    *)
+(*                                                                         *)
+(* Two structural decisions, stated because either could have produced a   *)
+(* falsely-green gate:                                                     *)
+(*                                                                         *)
+(*   1. §3 says "self-remount cancels OR WAITS OUT recovery before         *)
+(*      rearming". `ClaimMount` deliberately does NOT clear                *)
+(*      `recGen`/`wedgeGen`. Modeling the CANCEL arm would make the        *)
+(*      recheck unfalsifiable -- the stale result could never return --    *)
+(*      and r9-5 explicitly targets the POST-I/O return, an attempt whose  *)
+(*      I/O was already outstanding when the remount happened, which no    *)
+(*      cancel can recall. So the modeled arm is refuse-on-return          *)
+(*      (`RecoveryRefused` / `WedgeAbandonStale`), the load-bearing one.   *)
+(*      Same reasoning as `CaDiskLifecycle`'s [M1] step-0 intent-bail: it  *)
+(*      stops NEW attempts, not one mid-flight.                            *)
+(*   2. The generation guard sits on the MUTATING branches only. Reading   *)
+(*      the key is not a mutation, so a stale lane's read happens          *)
+(*      regardless -- which is exactly what lets the seal do its own,      *)
+(*      generation-INDEPENDENT rejecting. v9 has BOTH defenses, and the    *)
+(*      model must not let one hide the other.                             *)
+(*                                                                         *)
+(* A third decision, forced by measurement rather than by the spec: this   *)
+(* layer's variables are ORTHOGONAL to the mount machinery, so they        *)
+(* MULTIPLY its state space instead of extending it. At `_stage1`'s bounds *)
+(* the honest gate had no verdict at all (46 M distinct at depth 19,       *)
+(* queue still growing), and smaller numeric bounds barely helped. Hence   *)
+(* `MaxAdmissions` -- a bound on how many operations/recoveries a          *)
+(* behavior admits, in the declared spirit of `epochWiped`'s one-shot      *)
+(* `WipeEpoch` guard: a state-space bound, not a safety claim. See its own *)
+(* comment, and the `_v9_recoverygen.cfg` header for the chosen bounds.    *)
+(*                                                                        *)
+(* `RecoveryGenOn = FALSE` in every PRE-EXISTING cfg keeps this layer      *)
+(* wholly inert: every new variable holds its `Init` value forever, so no  *)
+(* legacy cfg's state space changes (verified against a same-machine,      *)
+(* same-`-workers` baseline of the committed model -- see                  *)
+(* `CaCasMountCore_RESULTS.md`). The layer is exercised only by the new    *)
+(* cfgs.                                                                   *)
 (***************************************************************************)
 EXTENDS Integers, FiniteSets
 
@@ -145,9 +226,45 @@ CONSTANTS
     SabWallClockReclaim,  \* FALSE = honest observation-based reclaim; TRUE = trust the stamp (rev.6 bug)
     SabEpochGuardOff,     \* FALSE = honest (epoch re-mint from 0 requires mount = None); TRUE drops
                           \* that guard -- models the pre-fix allocateWriterEpoch
-    SabDecomBlindBypass   \* FALSE = honest (decommission re-mint requires a TERMINAL mount); TRUE =
+    SabDecomBlindBypass,  \* FALSE = honest (decommission re-mint requires a TERMINAL mount); TRUE =
                           \* the rejected blind bypass -- mint epoch 1 regardless of mount liveness
                           \* (the round-3 finding-1 bug)
+    RecoveryGenOn,        \* 2026-07-28 v9: FEATURE GATE (not a sabotage) for the recovery-generation
+                          \* layer below. FALSE in every PRE-EXISTING cfg: every new action is
+                          \* disabled, every new variable is frozen at its `Init` value, and the
+                          \* legacy state spaces are therefore unchanged (the module's biggest cfgs
+                          \* already do not complete -- `rev6_observe` -- so making the new layer
+                          \* free for them is a hard requirement, not a nicety). TRUE only in the
+                          \* four new cfgs.
+    SabStaleInstall,      \* 2026-07-28 v9 (§9 r9-5): FALSE = honest -- `Install` rechecks, under the
+                          \* install lock, that the generation captured at admission is still the
+                          \* current one. TRUE drops the recheck: an old recovery's result returns
+                          \* after a self-remount and publishes anyway.
+    SabWedgeRetryOldGen,  \* 2026-07-28 v9 (INV-1 + §9 r9-5): FALSE = honest -- a wedged lane's one
+                          \* bounded conditional create only fires while its STORED generation is
+                          \* still current. TRUE lets the retry fire under the NEW generation
+                          \* unchecked, so a dead lane's bytes land in the successor's live stream.
+    SabSlotNoByteCompare, \* 2026-07-28 v9 (INV-2 slot-occupy resolution, task-1 hand-off): FALSE =
+                          \* honest -- an `Occupied` result is resolved BY COMPARING BYTES, and only
+                          \* the lane's OWN bytes let it ack. TRUE skips the comparison and acks
+                          \* regardless: acked-then-lost.
+    MaxAdmissions         \* 2026-07-28 v9: STATE-SPACE BOUND -- how many operations/recoveries may be
+                          \* admitted per behavior in total (`RecoveryStart` + `WedgeAdmit`). NOT a
+                          \* safety claim, in the identical spirit to `epochWiped`'s one-shot
+                          \* `WipeEpoch` guard (see its own comment): without a bound, `recGen` and
+                          \* `wedgeGen` re-admit and resolve without limit at every clock value and
+                          \* every mount state, multiplying the pre-existing space by a large
+                          \* constant per lane with no new KIND of scenario for these invariants to
+                          \* distinguish -- measured, not assumed: at MaxAdmissions unbounded the
+                          \* v9 green gate passed 46 M distinct states at depth 19 with a still-
+                          \* growing queue and no verdict (numbers in `CaCasMountCore_RESULTS.md`).
+                          \* It is also the faithful direction: a wedged lane holds ONE operation and
+                          \* a fresh incarnation runs ONE recovery, so a handful of admissions is
+                          \* what the product actually produces, not an artificial cut. Every cfg
+                          \* records its value and the runner's `ADMISSIONS=<n>` override re-runs the
+                          \* whole suite at another value to show the bound is not doing the work.
+                          \* 0 in every pre-existing cfg (where `RecoveryGenOn = FALSE` already
+                          \* disables both admission actions).
 
 VARIABLES
     owner,        \* Actors \cup {None}; sticky once non-None
@@ -198,14 +315,58 @@ VARIABLES
     obsToken,     \* rev.6: reclaimer's observation -- mtoken value first seen (None = unarmed)
     obsSince,     \* rev.6: clock tick at which obsToken was first observed
     observedReclaimEver, \* rev.6 history: TRUE once ObservedReclaim has ever completed (witness)
-    supersededThenWrote \* rev.6 history: TRUE if Write ever fired while `epoch` (GLOBAL truth,
+    supersededThenWrote, \* rev.6 history: TRUE if Write ever fired while `epoch` (GLOBAL truth,
                         \* the durable counter) had already advanced past the writer's OWN
                         \* `localEpoch[a]` -- i.e. a completed reclaim the writer did not know about
+    \* --- 2026-07-28 v9 recovery-generation layer (all frozen when RecoveryGenOn = FALSE) --------
+    recGen,       \* [Actors -> (0..MaxEpoch) \cup {None}]; the mount-fence generation captured when
+                  \* a RECOVERY was admitted (spec §3 "captured at admission"). None = no recovery
+                  \* result outstanding for this actor. This IS the model's whole representation of
+                  \* recovery: `RecoveryStart` issues it, `Install` re-presents it under the install
+                  \* lock, `RecoveryRefused` drops it when the recheck refuses.
+    wedgeGen,     \* [Actors -> (0..MaxEpoch) \cup {None}]; the generation a WEDGED lane stored at
+                  \* its own admission (INV-1: "the wedge stores its admission fence generation").
+                  \* None = no wedged lane. Kept DISJOINT from `recGen`: they are two independent
+                  \* consumers of the same generation, and collapsing them into one variable would
+                  \* let one sabotage's counterexample stand in for the other's.
+    slot,         \* None, or [by |-> Actor, gen |-> Nat, seal |-> BOOLEAN]; ONE modeled frontier key
+                  \* -- the `slot-occupy` primitive's subject. `None` is `Created` (absent, so a
+                  \* conditional create lands); `seal = FALSE` is `Occupied(bytes)` where the bytes'
+                  \* identity is the operation `<< by, gen >>` that wrote them, BOUND AT ADMISSION
+                  \* and never re-tagged; `seal = TRUE` is `Occupied(EpochSeal)` planted by `by`'s
+                  \* recovery at generation `gen`. Nothing ever deletes or overwrites the key: a seal
+                  \* only ever occupies an ABSENT one (INV-2), which is why `durable` below is
+                  \* monotone. ONE key, not a walk -- see the `slot` bound note in _RESULTS.md.
+    acked,        \* SUBSET (Actors \X (0..MaxEpoch)); operations whose SUCCESS was reported to their
+                  \* caller. Monotone.
+    durable,      \* SUBSET (Actors \X (0..MaxEpoch)); operations whose bytes ever became durable at
+                  \* the frontier key. Monotone (see `slot`). `acked \subseteq durable` is
+                  \* `AckedOpsAreDurable`, the acked-then-lost property.
+    staleRefusedEver, \* history: TRUE once a post-I/O generation recheck actually REFUSED a
+                      \* returning result (at either site). Non-vacuity for the honest recheck: a
+                      \* green gate whose recheck never fired would prove nothing.
+    admissions,   \* 0..MaxAdmissions; how many operations/recoveries have been admitted so far.
+                  \* Purely a state-space bound (see `MaxAdmissions`): it appears in no safety guard
+                  \* and no invariant, only in the two admission actions' enabling conditions.
+    sealRejectedEver  \* history: TRUE once a lane's retry met a SUCCESSOR generation's `EpochSeal`
+                      \* at the key and was conclusively rejected -- INV-2's walk-terminating
+                      \* branch, task 1's second hand-off. Note SUCCESSOR: a seal planted under the
+                      \* lane's OWN generation does not set this. See `WedgeRetryOccupied`.
 
 vars == << owner, epoch, epochCeiling, epochWiped, mount, mtoken, clock, localEpoch, localLost, crashed, rejected,
            adoptObs, fencedEpochs, wedged, wrote, rootEmpty, firstOwner,
            lostThenWrote, reclaimed, remountedAfterFence,
-           fenceUntil, obsToken, obsSince, observedReclaimEver, supersededThenWrote >>
+           fenceUntil, obsToken, obsSince, observedReclaimEver, supersededThenWrote,
+           recGen, wedgeGen, slot, acked, durable, admissions, staleRefusedEver,
+           sealRejectedEver >>
+
+\* 2026-07-28: the recovery-generation layer's own variables as one tuple, so each of the 19
+\* PRE-EXISTING actions declares them unchanged with a SINGLE extra conjunct instead of having its
+\* (already long) UNCHANGED tuple retyped. An edit that touches 19 multi-line tuples is exactly
+\* where a silent omission lives, and TLC would report the omission as a spurious nondeterminism
+\* rather than an error.
+rgVars == << recGen, wedgeGen, slot, acked, durable, admissions, staleRefusedEver,
+              sealRejectedEver >>
 
 Init ==
     /\ owner = None
@@ -233,6 +394,14 @@ Init ==
     /\ obsSince = 0
     /\ observedReclaimEver = FALSE
     /\ supersededThenWrote = FALSE
+    /\ recGen = [a \in Actors |-> None]
+    /\ wedgeGen = [a \in Actors |-> None]
+    /\ slot = None
+    /\ acked = {}
+    /\ durable = {}
+    /\ admissions = 0
+    /\ staleRefusedEver = FALSE
+    /\ sealRejectedEver = FALSE
 
 ----------------------------------------------------------------------------
 \* Claim an empty, unowned server_root: first-writer-wins, sticky from here on.
@@ -246,6 +415,7 @@ ClaimOwnerEmpty(a) ==
                     adoptObs, fencedEpochs, wedged, wrote, rootEmpty,
                     lostThenWrote, reclaimed, remountedAfterFence,
                     fenceUntil, obsToken, obsSince, observedReclaimEver, supersededThenWrote >>
+    /\ UNCHANGED rgVars
 
 \* A foreign uuid hits an already-owned root: fail closed, permanently rejected.
 RejectForeignOwner(a) ==
@@ -257,6 +427,7 @@ RejectForeignOwner(a) ==
                     adoptObs, fencedEpochs, wedged, wrote, rootEmpty, firstOwner,
                     lostThenWrote, reclaimed, remountedAfterFence,
                     fenceUntil, obsToken, obsSince, observedReclaimEver, supersededThenWrote >>
+    /\ UNCHANGED rgVars
 
 \* The owner bumps the durable epoch counter and records it as its live epoch.
 \* rev.6 round 5: guarded against firing while `a`'s own mount record is still UNFENCED --
@@ -296,6 +467,7 @@ AllocEpoch(a) ==
                     adoptObs, fencedEpochs, wedged, wrote, rootEmpty, firstOwner,
                     lostThenWrote, reclaimed, remountedAfterFence,
                     fenceUntil, obsToken, obsSince, observedReclaimEver, supersededThenWrote >>
+    /\ UNCHANGED rgVars
 
 \* Claim/reclaim the mount lease (the free-function `claimMount`, ONE atomic CAS in the
 \* model: its real get+putOverwrite failure mode is a clean LiveDoubleStart retry, not
@@ -348,6 +520,14 @@ AllocEpoch(a) ==
 \* regardless of `expired`, `fencedReclaim` already covers fenced+diff-epoch regardless of
 \* `expired`, and the only way to reach unfenced+diff-epoch is a completed reclaim that has
 \* already advanced `epoch` past `a`'s own `localEpoch[a]` -- which `strictOK` then blocks.
+\*
+\* 2026-07-28 v9: this action IS the self-remount spec §3 names, and it deliberately does NOT
+\* clear `recGen[a]`/`wedgeGen[a]` (`UNCHANGED rgVars` below). §3 offers two arms -- "self-remount
+\* cancels OR WAITS OUT recovery before rearming" -- and the cancel arm cannot be the safety
+\* mechanism: r9-5's scenario is a result whose I/O was ALREADY OUTSTANDING at remount time, which
+\* no cancellation can recall. Modeling the cancel here would make the post-I/O generation recheck
+\* unfalsifiable (the stale result could never return), so the modeled arm is refuse-on-return --
+\* see `Install`/`RecoveryRefused`/`WedgeAbandonStale` and the module header's decision 1.
 ClaimMount(a) ==
     LET expired    == (mount # None) /\ (mount.deadline <= clock)
         ownExpired == expired /\ (mount.uuid = a)
@@ -377,6 +557,7 @@ ClaimMount(a) ==
     /\ UNCHANGED << epochCeiling, epochWiped, owner, epoch, clock, localEpoch, rejected, fencedEpochs, wedged,
                     wrote, rootEmpty, firstOwner, lostThenWrote,
                     obsToken, obsSince, observedReclaimEver, supersededThenWrote >>
+    /\ UNCHANGED rgVars
 
 \* The mount holder renews -- possibly LATE (the beat-blocked renewal: no expiry guard,
 \* a renewal may fire after the deadline passed and after a GcFence landed).
@@ -410,6 +591,7 @@ Renew(a) ==
     /\ UNCHANGED << epochCeiling, epochWiped, owner, epoch, clock, localEpoch, crashed, rejected, adoptObs, fencedEpochs,
                     wedged, wrote, rootEmpty, firstOwner, lostThenWrote, reclaimed,
                     remountedAfterFence, obsToken, obsSince, observedReclaimEver, supersededThenWrote >>
+    /\ UNCHANGED rgVars
 
 \* The pool's GC fences an EXPIRED, unfenced mount (computeHeartbeatFloor's token-guarded
 \* fence-out): gc_fenced = true, uuid/epoch/deadline preserved, token bumped. The fence is
@@ -461,6 +643,7 @@ GcFence ==
     /\ UNCHANGED << epochCeiling, epochWiped, owner, epoch, clock, localEpoch, localLost, crashed, rejected, adoptObs,
                     wedged, wrote, rootEmpty, firstOwner, lostThenWrote, reclaimed,
                     remountedAfterFence, fenceUntil, obsToken, obsSince, observedReclaimEver, supersededThenWrote >>
+    /\ UNCHANGED rgVars
 
 \* --- The keeper's NON-ATOMIC adopt (MountLeaseKeeper::claim: GET, decide, CAS) --------
 \* AdoptRead: observe our own same-epoch slot and remember the token. The FIXED protocol
@@ -484,6 +667,7 @@ AdoptRead(a) ==
                     fencedEpochs, wedged, wrote, rootEmpty, firstOwner,
                     lostThenWrote, reclaimed, remountedAfterFence,
                     fenceUntil, obsToken, obsSince, observedReclaimEver, supersededThenWrote >>
+    /\ UNCHANGED rgVars
 
 \* AdoptWrite: the CAS against the observed token. The GcFence may land between AdoptRead
 \* and AdoptWrite -- THE S13 window.
@@ -550,6 +734,7 @@ AdoptWrite(a) ==
     /\ UNCHANGED << epochCeiling, epochWiped, owner, epoch, clock, localEpoch, crashed, rejected, fencedEpochs, wrote,
                     rootEmpty, firstOwner, lostThenWrote, reclaimed, remountedAfterFence,
                     obsToken, obsSince, observedReclaimEver, supersededThenWrote >>
+    /\ UNCHANGED rgVars
 
 \* Abstract time advances (so a deadline can pass -> fence + reclaim reachable).
 Tick ==
@@ -559,6 +744,7 @@ Tick ==
                     adoptObs, fencedEpochs, wedged, wrote, rootEmpty, firstOwner,
                     lostThenWrote, reclaimed, remountedAfterFence,
                     fenceUntil, obsToken, obsSince, observedReclaimEver, supersededThenWrote >>
+    /\ UNCHANGED rgVars
 
 \* A server process crashes: later Ticks pass the deadline without the holder renewing.
 \* An in-flight adopt observation dies with the process. rev.6 round 3: this sets
@@ -574,6 +760,7 @@ Die(a) ==
                     fencedEpochs, wedged, wrote, rootEmpty, firstOwner,
                     lostThenWrote, reclaimed, remountedAfterFence,
                     fenceUntil, obsToken, obsSince, observedReclaimEver, supersededThenWrote >>
+    /\ UNCHANGED rgVars
 
 \* A mutation under the mount. rev.6 round 8 (P2, consult/review-reconciled): `Write` is now
 \* a PURE LOCAL check, matching the product's actual write path exactly --
@@ -628,6 +815,7 @@ Write(a) ==
     /\ UNCHANGED << epochCeiling, epochWiped, owner, epoch, mount, mtoken, clock, localEpoch, localLost, crashed, rejected,
                     adoptObs, fencedEpochs, wedged, firstOwner, reclaimed,
                     remountedAfterFence, fenceUntil, obsToken, obsSince, observedReclaimEver >>
+    /\ UNCHANGED rgVars
 
 \* SABOTAGE action (only enabled under SabEpochReset): zero the durable epoch
 \* counter when the mount is cleared. Breaks epoch monotonicity.
@@ -640,6 +828,7 @@ SabResetEpoch ==
                     adoptObs, fencedEpochs, wedged, wrote, rootEmpty, firstOwner,
                     lostThenWrote, reclaimed, remountedAfterFence,
                     fenceUntil, obsToken, obsSince, observedReclaimEver, supersededThenWrote >>
+    /\ UNCHANGED rgVars
 
 \* Clear an expired UNFENCED mount (lets SabResetEpoch fire; also a benign honest step).
 \* A fenced slot is never cleared: in the implementation mount objects persist, and the
@@ -666,6 +855,7 @@ ClearExpiredMount ==
                     adoptObs, fencedEpochs, wedged, wrote, rootEmpty, firstOwner,
                     lostThenWrote, reclaimed, remountedAfterFence,
                     fenceUntil, obsToken, obsSince, observedReclaimEver, supersededThenWrote >>
+    /\ UNCHANGED rgVars
 
 \* --- rev.6: observation-based reclaim vs wall-clock sabotage -------------------------
 \* StartObservation: a reclaimer (GC leader, or a same-uuid successor probing an
@@ -681,6 +871,7 @@ StartObservation ==
                     adoptObs, fencedEpochs, wedged, wrote, rootEmpty, firstOwner,
                     lostThenWrote, reclaimed, remountedAfterFence, fenceUntil,
                     observedReclaimEver, supersededThenWrote >>
+    /\ UNCHANGED rgVars
 
 \* ObservedReclaim: the FIXED protocol -- the SUCCESSOR reclaim (epoch-advancing), NOT the
 \* GC fence-out (`GcFence`, non-epoch-advancing, `gc_fenced=TRUE`, uuid/epoch preserved).
@@ -729,6 +920,7 @@ ObservedReclaim ==
     /\ UNCHANGED << owner, epochWiped, clock, localEpoch, localLost, crashed, rejected,
                     adoptObs, fencedEpochs, wedged, wrote, rootEmpty, firstOwner, lostThenWrote,
                     reclaimed, remountedAfterFence, fenceUntil, obsSince, supersededThenWrote >>
+    /\ UNCHANGED rgVars
 
 \* WallClockReclaim: the SABOTAGE. Trusts the stamp directly (clock > mount.deadline)
 \* with NO observation wait at all -- exactly the old cross-node wall-clock comparison
@@ -763,6 +955,7 @@ WallClockReclaim ==
                     adoptObs, fencedEpochs, wedged, wrote, rootEmpty, firstOwner, lostThenWrote,
                     reclaimed, remountedAfterFence, fenceUntil, obsToken, obsSince,
                     observedReclaimEver, supersededThenWrote >>
+    /\ UNCHANGED rgVars
 
 \* --- 2026-07-24 fence-not-rescue gate (spec rev.4): the epoch-wipe twin + re-mint guard ---
 \* WipeEpoch: environmental sabotage-adjacent action (always enabled, subject to the
@@ -790,6 +983,7 @@ WipeEpoch ==
                     adoptObs, fencedEpochs, wedged, wrote, rootEmpty, firstOwner,
                     lostThenWrote, reclaimed, remountedAfterFence,
                     fenceUntil, obsToken, obsSince, observedReclaimEver, supersededThenWrote >>
+    /\ UNCHANGED rgVars
 
 \* RemintEpoch: the code's absent-epoch branch of `allocateWriterEpoch` -- distinct from
 \* `AllocEpoch` above, which models the CAS bump over a PRESENT epoch object. Fires only when
@@ -815,6 +1009,7 @@ RemintEpoch(a) ==
                     adoptObs, fencedEpochs, wedged, wrote, rootEmpty, firstOwner,
                     lostThenWrote, reclaimed, remountedAfterFence,
                     fenceUntil, obsToken, obsSince, observedReclaimEver, supersededThenWrote >>
+    /\ UNCHANGED rgVars
 
 \* RemintEpochDecom: Phase C's `DecommissionRecovery` branch -- also re-mints over a lost
 \* (epoch = 0) durable counter, but ONLY when a mount record still exists (`mount # None`,
@@ -862,6 +1057,282 @@ RemintEpochDecom(a) ==
                     adoptObs, fencedEpochs, wedged, wrote, rootEmpty, firstOwner,
                     lostThenWrote, reclaimed, remountedAfterFence,
                     fenceUntil, obsToken, obsSince, observedReclaimEver, supersededThenWrote >>
+    /\ UNCHANGED rgVars
+
+\* --- 2026-07-28 v9 recovery-generation layer (spec §3 "Recovery ownership", §9 r9-5) ---------
+\* Every action below is gated on `RecoveryGenOn`, so the whole layer is inert in every
+\* pre-existing cfg (see the module header). Read the section top-to-bottom: it is a lifecycle --
+\* the generation is ISSUED at admission, OBSERVED across an I/O, and RECHECKED immediately before
+\* every publication.
+
+\* `GenerationCurrent(a, g)`: is the generation `a` captured still THE current one, from `a`'s own
+\* LOCAL point of view? `localEpoch[a]` is the module's per-actor view of the mount-fence
+\* generation and is bumped by exactly the actions that re-arm a mount (`AllocEpoch`,
+\* `RemintEpoch`, `RemintEpochDecom`), so `g = localEpoch[a]` is precisely "no self-remount has
+\* happened since `g` was captured" -- the product's cached-generation-vs-current-generation
+\* comparison under the install lock, a LOCAL check.
+\*
+\* Deliberately NOT a read of `epoch`, `mount` or `mtoken`: the round-8 P2 discipline (see
+\* `Write`'s header) is that a publication-time check reads NO shared state -- `Store::mayMutate`
+\* is two local atomics. Reading global truth here would be a guard that copies
+\* `GlobalSupersededWriterMakesNoMutation`'s own predicate, which would make that invariant
+\* unfalsifiable-by-construction instead of proved. The mechanical liveness half is carried, as
+\* everywhere else in this module, by `clock < fenceUntil` at each call site.
+GenerationCurrent(a, g) == g = localEpoch[a]
+
+\* RecoveryStart(a): ADMISSION. A recovery is admitted only by a mounted writer holding a LIVE,
+\* unfenced mount at its own current generation, and it captures that generation (spec §3, "the
+\* mount-fence generation is captured at admission"). One outstanding recovery per actor: a second
+\* admission would overwrite the first's captured generation, which is exactly the bookkeeping
+\* r9-5 says must never be lost.
+RecoveryStart(a) ==
+    /\ RecoveryGenOn
+    /\ ~rejected[a] /\ ~wedged[a] /\ ~crashed[a]
+    /\ recGen[a] = None
+    /\ owner = a
+    /\ mount # None /\ mount.uuid = a /\ mount.epoch = localEpoch[a] /\ ~mount.fenced
+    /\ admissions < MaxAdmissions        \* state-space bound only -- see `MaxAdmissions`
+    /\ admissions' = admissions + 1
+    /\ recGen' = [recGen EXCEPT ![a] = localEpoch[a]]
+    /\ UNCHANGED << owner, epoch, epochCeiling, epochWiped, mount, mtoken, clock, localEpoch,
+                    localLost, crashed, rejected, adoptObs, fencedEpochs, wedged, wrote, rootEmpty,
+                    firstOwner, lostThenWrote, reclaimed, remountedAfterFence, fenceUntil,
+                    obsToken, obsSince, observedReclaimEver, supersededThenWrote,
+                    wedgeGen, slot, acked, durable, staleRefusedEver, sealRejectedEver >>
+
+\* SealSlot(a): the recovery walk finds the key `Created` (absent) and the seal OCCUPIES it --
+\* INV-2's "`Created` -> the seal occupies `(E, T+1)` and the `Late Predecessor PUT` ghost can
+\* never land: the store's conditional create is the fence". `slot = None` IS that conditional
+\* create. Carries the captured generation per §3's "required on every `slot-occupy`".
+\* Once this lands, `StragglerLands` below can never fire again -- that is the structural half of
+\* v9's defense, independent of any generation recheck.
+SealSlot(a) ==
+    /\ RecoveryGenOn
+    /\ ~rejected[a] /\ ~wedged[a] /\ ~crashed[a]
+    /\ recGen[a] # None
+    /\ GenerationCurrent(a, recGen[a])
+    /\ owner = a
+    /\ clock < fenceUntil
+    /\ slot = None
+    /\ slot' = [by |-> a, gen |-> recGen[a], seal |-> TRUE]
+    /\ UNCHANGED << owner, epoch, epochCeiling, epochWiped, mount, mtoken, clock, localEpoch,
+                    localLost, crashed, rejected, adoptObs, fencedEpochs, wedged, wrote, rootEmpty,
+                    firstOwner, lostThenWrote, reclaimed, remountedAfterFence, fenceUntil,
+                    obsToken, obsSince, observedReclaimEver, supersededThenWrote,
+                    admissions, recGen, wedgeGen, acked, durable, staleRefusedEver, sealRejectedEver >>
+
+\* Install(a): the recovery result RETURNS FROM I/O and is published. §9 r9-5 puts the generation
+\* recheck exactly here -- "post-I/O, immediately before every install/unwedge/`_ckpt`
+\* publication". `SabStaleInstall` drops it.
+\*
+\* The publication is a MUTATION, so it is booked like every other mutation in this module: into
+\* `wrote`, and into the two superseded-writer witnesses. It is tagged by the CAPTURED generation
+\* `recGen[a]`, not by whatever is current -- the recovery result was computed under `recGen[a]`
+\* and belongs to that incarnation, which is the whole point.
+\*
+\* Why the honest guard is load-bearing rather than decorative, and why `clock < fenceUntil` does
+\* not already do its work: a bare GC fence-out cannot get here (`GcFence` fires only once
+\* `mount.deadline + Drift <= clock`, which implies `clock >= fenceUntil`, so `Install` is
+\* mutually exclusive with it by the same construction proof `Write` relies on). What DOES get
+\* here is a self-remount: `ClaimMount` installs a FRESH `fenceUntil`, so the mechanical liveness
+\* check passes again while `epoch` has meanwhile advanced past `recGen[a]`. That is precisely
+\* §3's "self-remount ... before rearming" case, and the recheck is the only thing standing in it.
+Install(a) ==
+    /\ RecoveryGenOn
+    /\ ~rejected[a] /\ ~wedged[a] /\ ~crashed[a]
+    /\ recGen[a] # None
+    /\ owner = a
+    /\ clock < fenceUntil
+    /\ (SabStaleInstall \/ GenerationCurrent(a, recGen[a]))
+    /\ recGen' = [recGen EXCEPT ![a] = None]
+    /\ wrote' = wrote \union {<< a, recGen[a] >>}
+    /\ rootEmpty' = FALSE
+    /\ lostThenWrote' = (lostThenWrote \/ localLost[a])
+    /\ supersededThenWrote' = (supersededThenWrote \/ (epoch > recGen[a]))
+    /\ UNCHANGED << owner, epoch, epochCeiling, epochWiped, mount, mtoken, clock, localEpoch,
+                    localLost, crashed, rejected, adoptObs, fencedEpochs, wedged, firstOwner,
+                    reclaimed, remountedAfterFence, fenceUntil, obsToken, obsSince,
+                    observedReclaimEver,
+                    admissions, wedgeGen, slot, acked, durable, staleRefusedEver, sealRejectedEver >>
+
+\* RecoveryRefused(a): the honest r9-5 outcome -- the post-I/O recheck finds the captured
+\* generation stale and the result is DISCARDED (nothing published). Also the layer's anti-dead-end
+\* escape: without it a refused recovery would pin `recGen[a]` forever and `a` could never admit
+\* another one, turning a correct refusal into a modeling artifact that looks like a wedge.
+\* Not gated on `~crashed[a]`: dropping a result is not a mutation, and a dead process's
+\* outstanding result is exactly what the successor's install lock refuses.
+RecoveryRefused(a) ==
+    /\ RecoveryGenOn
+    /\ recGen[a] # None
+    /\ ~GenerationCurrent(a, recGen[a])
+    /\ recGen' = [recGen EXCEPT ![a] = None]
+    /\ staleRefusedEver' = TRUE
+    /\ UNCHANGED << owner, epoch, epochCeiling, epochWiped, mount, mtoken, clock, localEpoch,
+                    localLost, crashed, rejected, adoptObs, fencedEpochs, wedged, wrote, rootEmpty,
+                    firstOwner, lostThenWrote, reclaimed, remountedAfterFence, fenceUntil,
+                    obsToken, obsSince, observedReclaimEver, supersededThenWrote,
+                    admissions, wedgeGen, slot, acked, durable, sealRejectedEver >>
+
+\* --- the wedged lane (INV-1's every-attempt rule) --------------------------------------------
+\* WedgeAdmit(a): an operation is admitted into `a`'s lane and its send comes back AMBIGUOUS, so
+\* the lane wedges (INV-1: "an id is freed only when nothing was sent or every sent attempt has
+\* its own conclusive rejection; a definite rejection AFTER an ambiguous attempt keeps the lane
+\* wedged"). Admission captures the generation, same rule and same preconditions as
+\* `RecoveryStart`. Nothing is acked: the caller got no answer, which is why the lane is wedged
+\* and why dropping the operation later is safe.
+WedgeAdmit(a) ==
+    /\ RecoveryGenOn
+    /\ ~rejected[a] /\ ~wedged[a] /\ ~crashed[a]
+    /\ wedgeGen[a] = None
+    /\ owner = a
+    /\ mount # None /\ mount.uuid = a /\ mount.epoch = localEpoch[a] /\ ~mount.fenced
+    /\ admissions < MaxAdmissions        \* state-space bound only -- see `MaxAdmissions`
+    /\ admissions' = admissions + 1
+    /\ wedgeGen' = [wedgeGen EXCEPT ![a] = localEpoch[a]]
+    /\ UNCHANGED << owner, epoch, epochCeiling, epochWiped, mount, mtoken, clock, localEpoch,
+                    localLost, crashed, rejected, adoptObs, fencedEpochs, wedged, wrote, rootEmpty,
+                    firstOwner, lostThenWrote, reclaimed, remountedAfterFence, fenceUntil,
+                    obsToken, obsSince, observedReclaimEver, supersededThenWrote,
+                    recGen, slot, acked, durable, staleRefusedEver, sealRejectedEver >>
+
+\* StragglerLands(a): the ambiguous attempt's IN-FLIGHT PUT actually lands. This is the model's
+\* `Late Predecessor PUT` (`CaRefTableSnapshotLogCore`'s `LatePredecessorPut`, flipped in v9 from
+\* counterexample to ordinary adoption path) and the reason INV-2's `Occupied` branch exists at
+\* all. Three properties are deliberate:
+\*   - `slot = None`: the store's conditional create IS the fence. After a `SealSlot` this action
+\*     is dead -- the ghost "can never land", INV-2's exact claim.
+\*   - no `clock < fenceUntil`, no `~crashed[a]`: this is the STORE's outstanding I/O, not a
+\*     decision by a live process. A ghost that only lands while its writer is healthy would be no
+\*     ghost at all.
+\*   - bytes are tagged `wedgeGen[a]` -- bound at ADMISSION, never re-tagged -- and nothing is
+\*     acked, and neither superseded-writer witness is touched. The protocol's answer to a
+\*     straggler is ADOPTION (INV-2), not exclusion; `supersededThenWrote` tracks a writer
+\*     DECIDING to mutate, which is what `Install`/`WedgeRetryCreate` model. Booking the straggler
+\*     there would turn v9's honest adoption path into a false alarm.
+StragglerLands(a) ==
+    /\ RecoveryGenOn
+    /\ wedgeGen[a] # None
+    /\ slot = None
+    /\ slot' = [by |-> a, gen |-> wedgeGen[a], seal |-> FALSE]
+    /\ durable' = durable \union {<< a, wedgeGen[a] >>}
+    /\ UNCHANGED << owner, epoch, epochCeiling, epochWiped, mount, mtoken, clock, localEpoch,
+                    localLost, crashed, rejected, adoptObs, fencedEpochs, wedged, wrote, rootEmpty,
+                    firstOwner, lostThenWrote, reclaimed, remountedAfterFence, fenceUntil,
+                    obsToken, obsSince, observedReclaimEver, supersededThenWrote,
+                    admissions, recGen, wedgeGen, acked, staleRefusedEver, sealRejectedEver >>
+
+\* WedgeRetryCreate(a): the lane's ONE bounded same-(key, bytes) conditional create (INV-1: "each
+\* later caller's flush performs at most one bounded same-(key, bytes) conditional create under
+\* that generation (no background deadline-resetting loop)"). `slot = None` is the create
+\* succeeding; it lands the lane's bytes and RESOLVES the lane, so the caller is acked.
+\*
+\* This is a MUTATION, so §3's "required on every `slot-occupy`" applies and the retry must present
+\* a generation that is still current. `SabWedgeRetryOldGen` drops that: a lane belonging to a dead
+\* incarnation then creates in the SUCCESSOR's live id space, which is the injection r9-5 names.
+\* Note what the sabotage does NOT get: once the successor has SEALED the key, `slot = None` is
+\* false and the create is refused by the store no matter what generation the retry presents. The
+\* sabotage's whole reachable damage is therefore the pre-seal window -- and that is exactly why
+\* the recheck has to come FIRST rather than lean on the seal.
+\*
+\* Bytes stay tagged `wedgeGen[a]` in both cases: the operation belongs to the incarnation that
+\* admitted it, and re-tagging it would hide the violation inside the encoding.
+WedgeRetryCreate(a) ==
+    /\ RecoveryGenOn
+    /\ ~rejected[a] /\ ~wedged[a] /\ ~crashed[a]
+    /\ wedgeGen[a] # None
+    /\ owner = a
+    /\ clock < fenceUntil
+    /\ (SabWedgeRetryOldGen \/ GenerationCurrent(a, wedgeGen[a]))
+    /\ slot = None
+    /\ slot' = [by |-> a, gen |-> wedgeGen[a], seal |-> FALSE]
+    /\ durable' = durable \union {<< a, wedgeGen[a] >>}
+    /\ acked' = acked \union {<< a, wedgeGen[a] >>}
+    /\ wedgeGen' = [wedgeGen EXCEPT ![a] = None]
+    /\ wrote' = wrote \union {<< a, wedgeGen[a] >>}
+    /\ rootEmpty' = FALSE
+    /\ lostThenWrote' = (lostThenWrote \/ localLost[a])
+    /\ supersededThenWrote' = (supersededThenWrote \/ (epoch > wedgeGen[a]))
+    /\ UNCHANGED << owner, epoch, epochCeiling, epochWiped, mount, mtoken, clock, localEpoch,
+                    localLost, crashed, rejected, adoptObs, fencedEpochs, wedged, firstOwner,
+                    reclaimed, remountedAfterFence, fenceUntil, obsToken, obsSince,
+                    observedReclaimEver,
+                    admissions, recGen, staleRefusedEver, sealRejectedEver >>
+
+\* WedgeRetryOccupied(a): the retry's `slot-occupy` returns `Occupied`. NO generation guard on this
+\* action: reading the key is not a mutation, and r9-5 puts the recheck POST-I/O -- a stale lane
+\* does perform its read, and what it finds is what resolves it. Three branches, in the order the
+\* resolution must take them:
+\*
+\*   1. `Occupied(EpochSeal)` -- a SUCCESSOR closed this frontier. INV-1: "a successor's
+\*      `EpochSeal` found at the key is a conclusive rejection"; INV-2: the seal "terminates the
+\*      walk". The lane resolves DEFINITIVELY FAILED with no ack, and this is
+\*      GENERATION-INDEPENDENT -- the structural half of the defense, which no sabotage in this
+\*      round touches, so the two halves cannot mask each other. This is task 1's second hand-off:
+\*      that module's single `rPhase` admits at most one recovery, so it can never reach a seal
+\*      planted by a DIFFERENT recoverer; here the successor incarnation's `SealSlot` plants it and
+\*      the old generation's lane meets it (`W_SealRejectedRetry`).
+\*   2. `Occupied(bytes)` and THE BYTES ARE OURS -- our own ambiguous attempt did land
+\*      (`StragglerLands`). Adopt and replay it, and only now ack the caller: the operation IS
+\*      durable, so the ack is honest.
+\*   3. `Occupied(bytes)` and the bytes are SOMEONE ELSE'S -- our operation is NOT at this key.
+\*      No ack. Whatever else happens, the caller must not be told an operation succeeded that
+\*      nothing ever wrote.
+\*
+\* `SabSlotNoByteCompare` merges branch 3 into branch 2: it acks without comparing. That is the
+\* acked-then-lost branch task 1 could not express (its writer has perfect knowledge of
+\* `writtenEver`), and `AckedOpsAreDurable` is what catches it. "Someone else" here is a DIFFERENT
+\* INCARNATION of the same uuid -- this module's established idiom for a second writer (see
+\* `CaCasMountCore_sab_epochwipelive.cfg`'s note on the actor-equals-uuid structure); the
+\* operation identity is `<< actor, generation >>`, so a different generation IS different bytes.
+WedgeRetryOccupied(a) ==
+    \* `slot # None` is repeated inside the LET (not merely conjoined below) for the same reason
+    \* `AdoptWrite`'s `selfCaused` does it: a record access guarded only by evaluation order is a
+    \* trap for the next editor who reorders the conjuncts.
+    LET mine == slot # None /\ slot.by = a /\ slot.gen = wedgeGen[a]
+    IN
+    /\ RecoveryGenOn
+    /\ ~rejected[a] /\ ~wedged[a] /\ ~crashed[a]
+    /\ wedgeGen[a] # None
+    /\ owner = a
+    /\ slot # None
+    /\ wedgeGen' = [wedgeGen EXCEPT ![a] = None]
+    /\ IF slot.seal
+       THEN \* The REJECTION is generation-independent (any seal at the key is conclusive). The
+            \* WITNESS flag is not: it counts only a seal planted under a STRICTLY LATER
+            \* generation, i.e. r9-5's "returning after the SUCCESSOR sealed the slot" and task 1's
+            \* concurrent-recoverer hand-off. Without the `>` the first draft of
+            \* `W_SealRejectedRetry` was satisfied by a degenerate route BFS finds sooner -- one
+            \* generation sealing the key and its OWN lane then meeting it (depth 8) -- which is the
+            \* ordinary self-walk, not the cross-generation race that module could not express.
+            /\ sealRejectedEver' = (sealRejectedEver \/ slot.gen > wedgeGen[a])
+            /\ UNCHANGED acked
+       ELSE /\ UNCHANGED sealRejectedEver
+            /\ IF mine \/ SabSlotNoByteCompare
+               THEN acked' = acked \union {<< a, wedgeGen[a] >>}
+               ELSE UNCHANGED acked
+    /\ UNCHANGED << owner, epoch, epochCeiling, epochWiped, mount, mtoken, clock, localEpoch,
+                    localLost, crashed, rejected, adoptObs, fencedEpochs, wedged, wrote, rootEmpty,
+                    firstOwner, lostThenWrote, reclaimed, remountedAfterFence, fenceUntil,
+                    obsToken, obsSince, observedReclaimEver, supersededThenWrote,
+                    admissions, recGen, slot, durable, staleRefusedEver >>
+
+\* WedgeAbandonStale(a): the post-I/O recheck refuses the lane's publication -- its captured
+\* generation is no longer current, so it can neither create nor unwedge, and the successor
+\* incarnation owns the key from here. INV-1's own disposition: "A permanently quiet wedged
+\* namespace retries on its next caller or an independently occurring remount -- acceptable: the
+\* operation was never acknowledged." Dropped WITHOUT an ack, for exactly that reason. The
+\* `RecoveryRefused` twin, and the same anti-dead-end role.
+WedgeAbandonStale(a) ==
+    /\ RecoveryGenOn
+    /\ wedgeGen[a] # None
+    /\ ~GenerationCurrent(a, wedgeGen[a])
+    /\ wedgeGen' = [wedgeGen EXCEPT ![a] = None]
+    /\ staleRefusedEver' = TRUE
+    /\ UNCHANGED << owner, epoch, epochCeiling, epochWiped, mount, mtoken, clock, localEpoch,
+                    localLost, crashed, rejected, adoptObs, fencedEpochs, wedged, wrote, rootEmpty,
+                    firstOwner, lostThenWrote, reclaimed, remountedAfterFence, fenceUntil,
+                    obsToken, obsSince, observedReclaimEver, supersededThenWrote,
+                    admissions, recGen, slot, acked, durable, sealRejectedEver >>
 
 Next ==
     \/ Tick
@@ -883,6 +1354,16 @@ Next ==
     \/ WipeEpoch
     \/ \E a \in Actors : RemintEpoch(a)
     \/ \E a \in Actors : RemintEpochDecom(a)
+    \* 2026-07-28 v9 recovery-generation layer (all inert when RecoveryGenOn = FALSE)
+    \/ \E a \in Actors : RecoveryStart(a)
+    \/ \E a \in Actors : SealSlot(a)
+    \/ \E a \in Actors : Install(a)
+    \/ \E a \in Actors : RecoveryRefused(a)
+    \/ \E a \in Actors : WedgeAdmit(a)
+    \/ \E a \in Actors : StragglerLands(a)
+    \/ \E a \in Actors : WedgeRetryCreate(a)
+    \/ \E a \in Actors : WedgeRetryOccupied(a)
+    \/ \E a \in Actors : WedgeAbandonStale(a)
 
 Spec == Init /\ [][Next]_vars
 
@@ -917,6 +1398,17 @@ TypeOK ==
     /\ obsSince \in 0..MaxClock
     /\ observedReclaimEver \in BOOLEAN
     /\ supersededThenWrote \in BOOLEAN
+    /\ recGen \in [Actors -> (0..MaxEpoch) \union {None}]
+    /\ wedgeGen \in [Actors -> (0..MaxEpoch) \union {None}]
+    /\ \/ slot = None
+       \/ /\ slot.by \in Actors
+          /\ slot.gen \in 0..MaxEpoch
+          /\ slot.seal \in BOOLEAN
+    /\ acked \subseteq (Actors \X (0..MaxEpoch))
+    /\ durable \subseteq (Actors \X (0..MaxEpoch))
+    /\ admissions \in 0..MaxAdmissions
+    /\ staleRefusedEver \in BOOLEAN
+    /\ sealRejectedEver \in BOOLEAN
 
 \* Owner is sticky: once set it never transitions to a different non-None value.
 NoTwoServerUuidsOwnSameServerRoot ==
@@ -992,6 +1484,24 @@ FenceCostsEpoch ==
 NoPermanentWedge ==
     \A a \in Actors : ~wedged[a]
 
+\* 2026-07-28 v9, the ONE invariant this round adds (spec §2 INV-1's every-attempt rule + INV-2's
+\* `slot-occupy` resolution): every operation whose SUCCESS was reported to its caller is durably
+\* present at the key it claimed. `acked` and `durable` are both monotone, so this is a genuine
+\* safety property over the whole behavior, not a snapshot coincidence -- and it is a STRUCTURAL
+\* inclusion, not a ghost flag: the counterexample is a real ack of an operation nothing ever
+\* wrote.
+\*
+\* Why this invariant lives HERE and not in `CaRefTableSnapshotLogCore`: that module (plan task 1,
+\* see its `_RESULTS.md` Scoping and the task-1 report's concern 1) gives the writer perfect
+\* knowledge of `writtenEver`, so its `INV_NO_PHANTOM` can only express the OPPOSITE damage -- a
+\* write the caller was told had failed becoming durable. The dangerous direction, a writer that
+\* sees `Occupied` at its key, SKIPS the byte comparison and acks its own operation while someone
+\* else's bytes are there, needs a WRITER-LOCAL view of the frontier; that is what the
+\* `wedgeGen` + `slot` pair provides. `SabSlotNoByteCompare` must violate this, and the honest
+\* configs must not.
+AckedOpsAreDurable ==
+    acked \subseteq durable
+
 ----------------------------------------------------------------------------
 \* LIVENESS WITNESSES (asserted as invariants in dedicated cfgs so TLC reports them
 \* VIOLATED when the good state is REACHABLE).
@@ -1024,4 +1534,29 @@ W_ObservedReclaim ==
 \* incarnation writes again.
 W_RecoveryAfterObservedReclaim ==
     ~(observedReclaimEver /\ (\E a \in Actors : remountedAfterFence[a]))
+
+\* 2026-07-28 v9: the honest post-I/O generation recheck actually REFUSES a returning result at
+\* least once. Without this, `_v9_recoverygen`'s green would be consistent with a recheck that
+\* never had anything to reject -- the recheck would be green by unreachability, which is the
+\* failure mode the house rule about unfalsifiable invariants exists to prevent. The refusal is
+\* reachable at either site (`RecoveryRefused` or `WedgeAbandonStale`); COVERAGE=1 in the runner
+\* reports the per-action counts that show BOTH fire.
+W_GenerationRefused ==
+    ~staleRefusedEver
+
+\* 2026-07-28 v9: a lane's retry actually MEETS A SUCCESSOR GENERATION'S `EpochSeal` at the key and
+\* is conclusively rejected by it -- INV-1's "a successor's `EpochSeal` found at the key is a
+\* conclusive rejection", INV-2's walk-terminating branch. This is plan task 1's second hand-off
+\* made reachable: `CaRefTableSnapshotLogCore` has a single `rPhase`, so a seal planted by a
+\* DIFFERENT recoverer than the one reading it is unrepresentable there
+\* (`CaRefTableSnapshotLogCore_RESULTS.md` Scoping, "Concurrent recoverers"). Here the successor
+\* incarnation's `SealSlot` plants it and the OLD generation's wedged lane meets it.
+\*
+\* The word SUCCESSOR is load-bearing and is enforced in `WedgeRetryOccupied` (`slot.gen >
+\* wedgeGen[a]`), not merely intended: the first draft of this witness counted ANY seal, and BFS
+\* satisfied it at depth 8 with one generation sealing the key and its OWN lane then meeting it --
+\* the ordinary self-walk, which the sibling module already covers and which proves nothing about
+\* two recoverers racing. Tightened, and the trace is now the cross-generation one.
+W_SealRejectedRetry ==
+    ~sealRejectedEver
 =============================================================================

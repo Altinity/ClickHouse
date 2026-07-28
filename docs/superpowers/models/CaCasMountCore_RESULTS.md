@@ -288,3 +288,323 @@ RED against their intended targets. The full pre-existing battery (10 cfgs) keep
 intended finding rather than the newly-reachable, accepted, unrelated residual-gap false
 alarm — documented above, not silently dropped. `CaCasMountCore_rev6_observe.cfg` alone did
 not complete in-session; confirmed pre-existing/orthogonal to this task, not blocking.
+
+## 2026-07-28 — v9 recovery-generation layer (spec `2026-07-27-cas-ref-chain-complete-cut-design.md`) {#2026-07-28-recovery-generation}
+
+Task 5 of the v9 ref-chain TLA+ phase. Spec authority: §3 "Recovery ownership" (the mount-fence
+generation is captured at admission and required on every `slot-occupy`, `_ckpt` CAS and install;
+self-remount cancels or waits out recovery before rearming) and §9's r9-5 sabotage ("an
+old-generation wedge or recovery result returning after the successor sealed the slot is refused by a
+generation recheck under the install lock — post-I/O, immediately before every install/unwedge/`_ckpt`
+publication"). This is the gate the main implementation plan cites before touching the
+`slot-occupy` / `_ckpt` / install code.
+
+This module already owned the mount-fence generation *itself* — the durable writer epoch (`epoch`,
+its per-actor view `localEpoch`, the fenced-pair set `fencedEpochs`), which is why §9 assigns the
+generation's lifecycle here rather than to `CaRefCatalogCore` (which treats "the generation still
+validates" as an oracle, `creatorAlive`) or `CaRefTableSnapshotLogCore` (single-recoverer). What v9
+adds is the CONSUMER side.
+
+### Naming: the brief's sketch vs the module's own vocabulary {#name-mapping}
+
+The brief's action/flag names were adapted to this module's conventions, as it instructed. The
+mapping, for anyone reading the brief and the model side by side:
+
+| brief | module | why |
+|---|---|---|
+| `SabotageStaleInstall` | `SabStaleInstall` | every flag here is `Sab*` |
+| `SabotageWedgeRetryOldGen` | `SabWedgeRetryOldGen` | ditto |
+| `WedgeRetry` | `WedgeRetryCreate` + `WedgeRetryOccupied` | split by what `slot-occupy` returned; the split is what makes the seal's rejection reachable on the honest path (see "Findings" #1) |
+| "current fence generation" | `GenerationCurrent(a, g) == g = localEpoch[a]` | `localEpoch` IS this module's per-actor view of the mount-fence generation |
+| "¬superseded" | `clock < fenceUntil` | the module's own mechanical liveness check, as used by `Write` since round 8's P2 — deliberately NOT a read of `epoch`, which would make `GlobalSupersededWriterMakesNoMutation` unfalsifiable by construction |
+| — | `SabSlotNoByteCompare` (added) | plan task 1's first hand-off, which the brief asks for in prose but does not name |
+
+### What was added to the model {#additions}
+
+Four constants: `RecoveryGenOn` (a FEATURE GATE, not a sabotage — FALSE in every pre-existing cfg),
+`SabStaleInstall`, `SabWedgeRetryOldGen`, `SabSlotNoByteCompare`, plus the state-space bound
+`MaxAdmissions`.
+
+Eight variables: `recGen` / `wedgeGen` (the generation captured at admission by a recovery and by a
+wedged lane, kept deliberately DISJOINT so one sabotage's counterexample cannot stand in for the
+other's), `slot` (ONE frontier key — `None` = `Created`, `seal = FALSE` = `Occupied(bytes)`,
+`seal = TRUE` = `Occupied(EpochSeal)`), `acked` / `durable` (both monotone), `admissions`, and the
+two history flags `staleRefusedEver` / `sealRejectedEver`.
+
+Nine actions: `RecoveryStart`, `SealSlot`, `Install`, `RecoveryRefused`, `WedgeAdmit`,
+`StragglerLands`, `WedgeRetryCreate`, `WedgeRetryOccupied`, `WedgeAbandonStale`.
+
+ONE new invariant, `AckedOpsAreDurable == acked \subseteq durable`. Both sabotages the brief names
+target PRE-EXISTING invariants instead (see the next section). Two new witnesses,
+`W_GenerationRefused` and `W_SealRejectedRetry`.
+
+Every pre-existing action gained a single `UNCHANGED rgVars` conjunct rather than having its
+already-long `UNCHANGED` tuple retyped — an edit touching 19 multi-line tuples is exactly where a
+silent omission lives.
+
+### Reused invariants, and the one that had to be new {#invariant-reuse}
+
+Per the brief, no parallel invariant was invented where an existing one already says the thing:
+
+- **`GlobalSupersededWriterMakesNoMutation`** (pre-existing, `~supersededThenWrote`) is the target of
+  BOTH `_sab_staleinstall` and `_sab_wedgeretryoldgen`. An old recovery result publishing after a
+  self-remount, and a dead lane's conditional create landing in the successor's id space, are both
+  "a mutation by an incarnation the durable `epoch` counter has already passed", which is precisely
+  what that invariant says. The two cfgs share a target deliberately and each header names it; the
+  ROUTES are independent (a returning recovery RESULT vs a lane's own CREATE), which is where the
+  evidence lives. It is also the same invariant `_sab_wallclockreclaim` targets, by a third route.
+- **`AckedOpsAreDurable`** had to be new. `wrote`, `supersededThenWrote` and `lostThenWrote` all
+  record what a writer DID; acked-then-lost is a divergence between that and what its CALLER WAS
+  TOLD, and nothing in the module recorded the latter. It is a structural set inclusion over two
+  monotone sets, not a ghost flag.
+- `SupersededWriterMakesNoMutation` and `NoPermanentWedge` are carried in the green gate unchanged —
+  the new layer must not manufacture a knowledge-based violation or a wedge, and it does not.
+- `WriterEpochMonotoneUnique` and `FenceCostsEpoch` are dropped from `_v9_recoverygen.cfg` for causes
+  that PREDATE this round and are analysed in full in "Accepted residual gap" above (the ungated
+  `WipeEpoch`; `RemintEpoch`'s hardcoded literal `1`). `_stage1.cfg` remains where that gap is
+  recorded.
+
+### Cost neutrality of the legacy battery — verified, not asserted {#cost-neutrality}
+
+`RecoveryGenOn = FALSE` in every pre-existing cfg freezes all eight new variables at their `Init`
+values, so no legacy behaviour gains a state. Checked by running the full legacy battery twice on
+the same machine with the same `-workers 1`: once against the pre-task committed `.tla`
+(`git show HEAD:...`, in a scratch tree) and once against the modified one. **All twelve are
+byte-identical in both state counts**, and the two that the earlier round recorded numbers for
+(`stage1`, `witness_recoveryafterobservedreclaim`) also match this file's 2026-07-24 table exactly:
+
+| cfg | result | states generated | distinct | baseline s | after s |
+|---|---|---|---|---|---|
+| `sab_epochreset` | RED `WriterEpochMonotoneUnique` | 539 | 321 | 0 | 1 |
+| `sab_foreigntakeover` | RED `ForeignUuidNeverAutoTakesOver` | 585 | 339 | 1 | 1 |
+| `sab_adoptwedge` | RED `NoPermanentWedge` | 669 | 372 | 1 | 0 |
+| `sab_fenceresurrect` | RED `FenceCostsEpoch` | 2,551 | 1,088 | 0 | 1 |
+| `sab_wallclockreclaim` | RED `GlobalSupersededWriterMakesNoMutation` | 111,240 | 24,905 | 1 | 1 |
+| `sab_epochwipelive` | RED `SupersededWriterMakesNoMutation` | 21,920 | 8,606 | 0 | 0 |
+| `sab_decomblindbypass` | RED `FenceCostsEpoch` | 1,755,204 | 528,248 | 5 | 6 |
+| `witness_reclaim` | RED `W_SameUuidReclaimsExpired` | 584 | 338 | 1 | 0 |
+| `witness_remountafterfence` | RED `W_RemountAfterFence` | 7,749 | 3,266 | 0 | 1 |
+| `witness_observedreclaim` | RED `W_ObservedReclaim` | 287,089 | 59,375 | 2 | 2 |
+| `witness_recoveryafterobservedreclaim` | RED `W_RecoveryAfterObservedReclaim` | 78,998,500 | 12,981,026 | 132 | 168 |
+| `stage1` | **GREEN**, exhaustive | 51,231,925 | 10,616,665 | 111 | 136 |
+
+(The RED counts differ from the 2026-07-24 table because that round used `-workers auto`; parallel
+BFS explores in a nondeterministic order, so an aborted run's counts are not reproducible. The two
+GREEN/exhaustive runs match exactly, which is the comparison that carries information. This round's
+runner therefore pins `-workers 1`.)
+
+### Findings — three things that had to change after TLC disagreed {#findings}
+
+1. **`W_SealRejectedRetry`'s first draft was satisfiable by a degenerate route, and would have
+   claimed to discharge a hand-off it did not.** As first written it counted ANY seal met by a lane's
+   retry. BFS satisfied it at depth 7 with ONE generation sealing the key and its OWN lane then
+   meeting it — the ordinary self-walk, which `CaRefTableSnapshotLogCore` already covers and which
+   says nothing about two recoverers racing (the actual hand-off). Fixed by making the flag count
+   only a seal planted under a STRICTLY LATER generation (`slot.gen > wedgeGen[a]`) while leaving the
+   REJECTION itself generation-independent, because in the protocol any seal at the key is
+   conclusive. The trace is now the cross-generation one (depth 11, below).
+2. **The green gate had no verdict at all without a bound on admissions, so `MaxAdmissions` was
+   added.** At `_stage1`'s bounds the honest layer passed 46 M distinct states at depth 19 with a
+   still-growing queue after 9 minutes and no verdict — and smaller numeric bounds barely helped
+   (`MaxClock = 3, MaxEpoch = 2, MaxToken = 5` was at 14.5 M and still growing), because the layer's
+   variables are ORTHOGONAL to the mount machinery and multiply it rather than extend it.
+   `MaxAdmissions` caps how many operations/recoveries a behaviour admits in total. It is a
+   state-space bound in the same declared spirit as `epochWiped`'s one-shot `WipeEpoch` guard from
+   the 2026-07-24 round — not a safety claim — and it is faithful in direction: a wedged lane holds
+   ONE operation and a fresh incarnation runs ONE recovery, so a handful of admissions is what the
+   product produces. `ADMISSIONS=<n>` in `run_mount.sh` re-runs the suite at another value.
+3. **The first counterexamples all used the model's PRE-EXISTING epoch-0 bootstrap mount, which the
+   product's strict order never reaches — so they were re-checked without it.** `ClaimMount` permits
+   `mount = None /\ localEpoch[a] >= epoch` at genesis, so a mount can exist at generation 0 before
+   any `AllocEpoch`, whereas `CasStore.cpp:312-316`'s STRICT ORDER allocates the writer epoch BEFORE
+   claiming the lease. BFS naturally found the 0→1 transition first. Re-run in a scratch tree with
+   the state constraint `mount = None \/ mount.epoch > 0` (module copy and constraint NOT committed —
+   it exists only to answer this question), **all three sabotages stay red with an `AllocEpoch`-first
+   mount**, on the 1→2 transition:
+   - `_sab_staleinstall`: `ClaimOwnerEmpty → AllocEpoch → ClaimMount → Tick → Tick → RecoveryStart →
+     ClearExpiredMount → AllocEpoch → ClaimMount → Install`
+   - `_sab_wedgeretryoldgen`: same prefix with `WedgeAdmit` in place of `RecoveryStart` and
+     `WedgeRetryCreate` in place of `Install`
+   - `_sab_slotnocompare`: `ClaimOwnerEmpty → AllocEpoch → ClaimMount → Tick → WedgeAdmit →
+     WedgeRetryCreate → Tick → ClearExpiredMount → AllocEpoch → ClaimMount → WedgeAdmit →
+     WedgeRetryOccupied`
+   The counterexamples are therefore about a generation TRANSITION, not about the bootstrap value.
+
+### Counterexample traces {#v9-traces}
+
+**`_sab_staleinstall` — depth 10.** `A` claims the root and mounts; the clock reaches the deadline;
+`RecoveryStart` captures `recGen[A] = 0`; `ClearExpiredMount` retires the record; `AllocEpoch` mints
+generation 1 (`epoch = 1`, `localEpoch[A] = 1`); `ClaimMount` re-arms with a FRESH
+`fenceUntil = 4`. The stale recovery result now returns and, with the recheck dropped, `Install`
+publishes under `recGen[A] = 0` while `epoch = 1` → `wrote = {<<A, 0>>}`,
+`supersededThenWrote = TRUE`. Note what did NOT stop it: `clock < fenceUntil` passes, because the
+REMOUNT re-armed the fence. That is exactly §3's "self-remount ... before rearming" window, and the
+generation recheck is the only thing in it. (A bare GC fence-out cannot reach `Install` at all —
+`GcFence` requires `mount.deadline + Drift <= clock`, which implies `clock >= fenceUntil`; the same
+mutual-exclusion construction `Write` has relied on since round 9.)
+
+**`_sab_wedgeretryoldgen` — depth 10.** Identical shape with the wedged lane in place of the
+recovery: `WedgeAdmit` stores generation 0, the mount is retired and re-armed at generation 1, and
+the generation-0 lane's conditional create then lands while `epoch = 1`. What the sabotage cannot
+reach is worth recording: once the successor's `SealSlot` has occupied the key, `slot # None` and the
+store refuses the create whatever generation is presented (INV-1's conclusive rejection). The
+sabotage's entire reachable damage is the PRE-SEAL window — which is why the recheck has to come
+first rather than lean on the seal.
+
+**`_sab_slotnocompare` — depth 12.** `A` admits a wedged operation at generation 0 and its retry's
+create lands, so the key holds the bytes of operation `<<A, 0>>` (`durable = acked = {<<A,0>>}`). The
+mount is then retired and re-armed at generation 1, and `A` admits a NEW operation, `<<A, 1>>`. Its
+retry finds the key `Occupied`; with the comparison skipped it concludes "mine landed" and acks
+`<<A, 1>>`, while `durable` still holds only `<<A, 0>>` → `acked = {<<A,0>>, <<A,1>>}` ⊄ `durable`.
+A caller has been told an operation succeeded that nothing ever wrote. This is the branch
+`CaRefTableSnapshotLogCore` structurally cannot express (it grants the writer perfect knowledge of
+`writtenEver`; task-1 report concern 1), handed here and discharged.
+
+**`_witness_genrefused` — depth 9, reachable as intended.** `RecoveryStart` captures generation 0,
+the mount is retired, `AllocEpoch` moves the local generation to 1, and `RecoveryRefused` drops the
+returning result. The honest recheck really does refuse something, so the green gate is not green by
+unreachability.
+
+**`_witness_sealrejected` — depth 12, reachable as intended.** `WedgeAdmit` stores generation 0 →
+`ClearExpiredMount` → `AllocEpoch` (generation 1) → `ClaimMount` → `RecoveryStart` (`recGen[A] = 1`)
+→ `SealSlot` occupies the `Created` key with the SUCCESSOR generation's `EpochSeal` → the
+generation-0 lane's `WedgeRetryOccupied` meets it and resolves definitively failed with no ack.
+This is plan task 1's concurrent-recoverer hand-off: that module's single `rPhase` makes a seal
+planted by a different recoverer than the one reading it unrepresentable.
+
+### The bounds, and the measured sweep behind them {#v9-bounds}
+
+The six new configs run at `MaxClock = 2, MaxEpoch = 2, MaxToken = 4, TTL = 2, Drift = 0,
+MaxAdmissions = 3, Actors = {A, B}` — **smaller than `_stage1`'s**, which needs justifying rather
+than asserting. Every row below is a real `-workers 1` run of `_v9_recoverygen`'s invariant list on
+this machine; the runs marked *abandoned* were killed by hand to free CPU and are reported as
+"no verdict by then", not as timeouts.
+
+| admissions | actors | MaxClock/Epoch/Token | outcome | generated | distinct |
+|---|---|---|---|---|---|
+| unbounded | `{A,B}` | 4 / 3 / 7 (`_stage1`'s) | no verdict, depth 19, queue growing (abandoned ~9 min) | 195,903,650 | 46,547,519 |
+| unbounded | `{A,B}` | 3 / 2 / 5 | no verdict, depth 19, queue growing (abandoned) | 68,183,359 | 14,479,883 |
+| unbounded | `{A}` | 4 / 3 / 7 | no verdict, depth 19, queue growing (abandoned) | 72,278,162 | 18,124,829 |
+| 3 | `{A,B}` | 4 / 3 / 7 | no verdict, depth 17 (abandoned ~4 min) | 63,268,900 | 16,717,686 |
+| 3 | `{A,B}` | 3 / 2 / 5 | no verdict by 600 s (abandoned) | — | — |
+| 3 | `{A}` | 3 / 3 / 5 | no verdict by 600 s (abandoned) | — | — |
+| 3 | `{A}` | 3 / 2 / 4 | **GREEN**, exhaustive | 38,448,343 | 7,834,854 |
+| 3 | `{A}` | 2 / 2 / 4 | **GREEN**, exhaustive | 11,501,074 | 2,440,747 |
+| **3** | **`{A,B}`** | **2 / 2 / 4** | **GREEN, exhaustive — the chosen configuration** | **50,885,769** | **9,762,979** |
+
+Three things this sweep establishes, none of which was obvious before running it:
+
+- **`MaxAdmissions` alone was not enough, and neither were smaller numeric bounds alone.** The
+  unbounded rows and the `3 / 4-3-7` row are both without a verdict. The layer's variables are
+  orthogonal to the mount machinery, so they multiply its space; only cutting both dimensions gets a
+  verdict.
+- **`MaxToken` is the sharp lever, not `MaxClock`.** `{A}` at `3 / 2 / 4` is green while `{A}` at
+  `3 / 3 / 5` is not, and `{A,B}` at `3 / 2 / 5` is not. `MaxToken` bounds how many times the mount
+  record may be written, which is what drives the pre-existing space this layer multiplies. Anyone
+  tuning these bounds later should reach for `MaxToken` first.
+- **`Actors = {A, B}` costs ~4× over `{A}` and is kept anyway**, so that
+  `NoTwoServerUuidsOwnSameServerRoot` and `ForeignUuidNeverAutoTakesOver` stay non-vacuous in the v9
+  gate rather than only in `_stage1`. The second actor contributes nothing to the new layer itself
+  (every new action requires `owner = a`).
+
+What the chosen bounds still contain: `TTL = 2` against `MaxClock = 2` is one complete
+expire-and-remount cycle, which is exactly the shape every counterexample in this round needs (each
+is a generation TRANSITION with an outstanding result or lane); `MaxEpoch = 2` allows two
+transitions; `MaxToken = 4` allows four mount writes against a longest trace using two. All three
+sabotages and both witnesses are red **at these same bounds** — first found at `_stage1`'s wider
+ones and re-confirmed here — so the green and the reds are directly comparable, which is the
+property that carries the evidence.
+
+### The new configs — full battery {#v9-battery}
+
+`bash docs/superpowers/models/run_mount.sh`, `-workers 1`, uncontended. The six new configs, with
+`_stage1` repeated for comparison:
+
+| cfg | exit | colour | invariant / witness reported | generated | distinct | s |
+|---|---|---|---|---|---|---|
+| `sab_staleinstall` (NEW) | 12 | RED (target) | `GlobalSupersededWriterMakesNoMutation` | 206,083 | 65,968 | 3 |
+| `sab_wedgeretryoldgen` (NEW) | 12 | RED (target) | `GlobalSupersededWriterMakesNoMutation` | 204,854 | 66,055 | 2 |
+| `sab_slotnocompare` (NEW) | 12 | RED (target) | `AckedOpsAreDurable` | 1,560,369 | 470,659 | 4 |
+| `v9_recoverygen` (NEW) | 0 | **GREEN** | — (all 7 listed invariants hold) | 50,885,769 | 9,762,979 | 152 |
+| `witness_genrefused` (NEW) | 12 | RED (reachable, as intended) | `W_GenerationRefused` | 63,755 | 22,377 | 1 |
+| `witness_sealrejected` (NEW) | 12 | RED (reachable, as intended) | `W_SealRejectedRetry` | 1,538,207 | 463,567 | 3 |
+| `stage1` (legacy gate) | 0 | GREEN | — | 51,231,925 | 10,616,665 | 146 |
+
+`v9_recoverygen` reports **0 states left on queue** — exhaustive, not truncated. Note the two greens
+cost almost exactly the same wall time (152 s vs 146 s) at their respective bounds, which is the
+practical point of `_stage1` keeping the layer off: the suite did not get slower for anyone.
+
+The three sabotage counts are abort-run numbers and are reproducible only because the runner pins
+`-workers 1`; see the `-workers` note in `run_mount.sh`'s header.
+
+### `MaxAdmissions` is not doing the work {#v9-admissions-not-load-bearing}
+
+`ADMISSIONS=5 bash run_mount.sh` re-runs the whole suite with the bound raised. The green gate stays
+**GREEN and exhaustive** at 5, at roughly twice the cost:
+
+| run | outcome | generated | distinct | s |
+|---|---|---|---|---|
+| `_v9_recoverygen`, `MaxAdmissions = 3` (default) | GREEN, exhaustive | 50,885,769 | 9,762,979 | 152 |
+| `_v9_recoverygen`, `MaxAdmissions = 5` | GREEN, exhaustive | 101,723,633 | 19,209,187 | 333 |
+| `_v9_recoverygen`, `MaxAdmissions = 5`, `Actors = {A}` | GREEN, exhaustive | 23,029,764 | 4,802,299 | 64 |
+
+So the bound buys a verdict, not a colour: it is what makes the search terminate, and raising it does
+not change the answer. The whole suite was re-run this way — `ADMISSIONS=5 bash run_mount.sh` →
+**18/18 expectations met**, every sabotage red against the same target and every witness still
+reachable — so no config's colour depends on the bound's value.
+
+### Per-action coverage — the green gate is not vacuous {#v9-coverage}
+
+`COVERAGE=1 bash run_mount.sh` re-runs `_v9_recoverygen` under `-coverage 1`. All nine new actions
+fire, with the distinct-states : transitions counts below. This is the machine-checked answer to
+"does the honest configuration actually exercise the layer, or is it green because nothing happened":
+
+| action | states | transitions |
+|---|---|---|
+| `RecoveryStart` | 380,304 | 972,632 |
+| `SealSlot` | 113,208 | 269,088 |
+| `Install` | 289,744 | 1,214,264 |
+| `RecoveryRefused` | 580,648 | 1,975,184 |
+| `WedgeAdmit` | 982,112 | 985,472 |
+| `StragglerLands` | 1,180,288 | 1,180,288 |
+| `WedgeRetryCreate` | 157,000 | 264,248 |
+| `WedgeRetryOccupied` | 694,128 | 1,812,376 |
+| `WedgeAbandonStale` | 787,824 | 1,937,184 |
+
+`RecoveryRefused` **and** `WedgeAbandonStale` both fire, which is the specific thing coverage was
+needed for: `W_GenerationRefused` is driven by ONE flag set at both sites, so the witness alone
+cannot show that both rechecks are exercised. They are. As a sanity check in the other direction, the
+same run reports `SabResetEpoch` and `WallClockReclaim` at `0:0` — correctly disabled by their FALSE
+flags in this cfg.
+
+### Runner change {#v9-runner}
+
+`run_mount.sh` was a single-cfg wrapper taking a basename. It is now a whole-suite runner with
+asserted violation NAMES, matching `run_refcatalog.sh` / `run_nscleanup_staleleader.sh` — a per-cfg
+colour that nothing checks is a colour that rots. Env knobs: `TLC_WORKERS` (default 1, deliberately),
+`ADMISSIONS=<n>`, `COVERAGE=1`, `SLOW=1`. The raw `java` invocation for running one config by hand is
+in the script header.
+
+`_rev6_observe` is excluded from the default suite and appended only under `SLOW=1`, where it is
+expected to report `incomplete` and does not fail the run. Its non-completion is **pre-existing** and
+already analysed above (`{#rev6-observe-not-completed}`); what this round adds is that a config with
+no verdict can no longer masquerade as a green one, because the runner now names the state.
+
+### Verdict {#v9-verdict}
+
+**GREEN** — the gate this task exists to produce. `bash run_mount.sh` → **18/18 expectations met**.
+The three new sabotages are each red against their named target, the two new witnesses are each
+reachable, the new green gate is exhaustive over seven invariants, all twelve pre-existing configs
+keep their colour with byte-identical state counts, and the green survives raising the one bound the
+round had to add.
+
+Two things this gate does NOT establish, stated so the plan does not over-claim them:
+
+- **The `_ckpt` CAS is not one of the sites modelled here.** §3 requires the generation on
+  `slot-occupy`, the `_ckpt` CAS **and** the install; `slot-occupy` and the install are carried here,
+  while `_ckpt`'s own writers live in `CaRefTableSnapshotLogCore` and `CaRefCatalogCore`, which
+  carry the generation on their writes but treat its validity as an oracle. Nothing in the model set
+  proves the three sites present the SAME rechecked value — that is a plan obligation.
+- **The catalog-token half of the zombie install stays with `CaRefCatalogCore`.** This module owns
+  the generation credential's lifecycle; the install must present BOTH that and the catalog
+  token-CAS, and only the first is proven here.

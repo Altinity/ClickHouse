@@ -80,7 +80,7 @@ of `CaGcRootLocalPartManifestCore`.
 | `CaIncarnationCore.tla` | canonical incarnation-token GC core (fold → retire → fence → recheck → exact-token delete → cascade → trim) | CURRENT (safety spine; concrete journal/fence structure superseded) | `run_tlc.sh` |
 | `CaBuildRootPrecommit.tla` | adopted-blob dangle fix: precommit-first build-root reachability + fail-closed commit + inline closure recording | CURRENT conclusion (inline-closure + presence-gate mechanisms drifted → lazy-fold+clamp-barrier + owner-liveness) | (inline TLC) |
 | `CaGcLeaseCore.tla` | GC leader lease: epoch-fence safety, advisory heartbeat against false steals | CURRENT | (inline TLC) |
-| `CaCasMountCore.tla` | mount ownership: sticky owner, monotone epoch, observation-based lease reclaim | CURRENT | `run_mount.sh` |
+| `CaCasMountCore.tla` | mount ownership: sticky owner, monotone epoch, observation-based lease reclaim, and the v9 recovery-generation layer (a generation captured at admission and rechecked post-I/O before every publication; a successor's `EpochSeal` as a conclusive rejection; the acked-then-lost byte comparison) | CURRENT (v9 extension 2026-07-28; gates the ref-chain implementation's `slot-occupy` / `_ckpt` / install changes) | `run_mount.sh` |
 | `CaGcRootLocalPartManifestCore.tla` | root-local part-manifest GC: fold, manifest cleanup, orphan sweep, attempt scoping | CURRENT (partial: fence/recheck phases superseded by the ack-floor round) | `run_gc_partmanifest.sh` |
 | `CaGcAckFloorCore.tla` | one-pass GC round, clamp suppression, disaster-recovery rebuild | MIXED: graduation gate (writer-ack floor) superseded by round-only pacing; `GRebuild` + clamp-suppression still match | `run_ackfloor.sh` |
 | `CaGcAckFloorZombie.tla` | two-leader `delete_pending` two-phase graduation | CURRENT (partial: same caveat) | `run_ackfloor_zombie.sh` |
@@ -294,9 +294,28 @@ ordered scan and cleanup deletes only what it observed durable. The migration is
   observation-based — the reclaimer must observe a stable holder token over a full lease-plus-
   drift window measured on its OWN clock (one sabotage reproduces the bug of trusting the foreign
   wall clock in the mount object), and the reclaim installs the successor's own body, matching the
-  shipped `CasServerRoot.cpp`. Configs: `_stage1`, `_rev6_observe` (main green gate),
+  shipped `CasServerRoot.cpp`. Extended again for the 2026-07-24 fence-not-rescue gate (an ungated
+  `WipeEpoch` losing the durable epoch object, plus the guarded re-mint branches
+  `RemintEpoch`/`RemintEpochDecom`).
+  **Extended 2026-07-28 for the v9 recovery-generation layer** (spec
+  `2026-07-27-cas-ref-chain-complete-cut-design.md` §3 "Recovery ownership", §9's r9-5): this module
+  already owned the mount-fence generation itself, and v9 adds the consumer side — an operation
+  captures the generation at admission (`recGen` for a recovery, `wedgeGen` for a wedged lane per
+  INV-1's every-attempt rule) and must re-present it, with a recheck post-I/O immediately before
+  every publication. Proves three things the rest of the suite could not: an old recovery's result
+  returning after a self-remount is refused (`_sab_staleinstall`); a dead lane's conditional create
+  cannot be admitted under the successor's generation (`_sab_wedgeretryoldgen`); and an `Occupied`
+  `slot-occupy` result must be resolved BY COMPARING BYTES, or the lane acks an operation nothing
+  ever wrote (`_sab_slotnocompare` → the one new invariant, `AckedOpsAreDurable`). It also carries
+  two hand-offs from `CaRefTableSnapshotLogCore`, which is structurally unable to express either:
+  that acked-then-lost direction, and INV-2's "`Occupied` with an `EpochSeal` terminates the walk"
+  branch reached by a *concurrent* recoverer (`_witness_sealrejected`).
+  Configs: `_stage1` (legacy green gate), `_v9_recoverygen` (the v9 green gate), `_rev6_observe`
+  (drift-aware, known not to complete in an interactive budget — pre-existing, `SLOW=1`),
   `_sab_adoptwedge`, `_sab_epochreset`, `_sab_fenceresurrect`, `_sab_foreigntakeover`,
-  `_sab_wallclockreclaim`, and four `_witness_*` reachability checks.
+  `_sab_wallclockreclaim`, `_sab_epochwipelive`, `_sab_decomblindbypass`, `_sab_staleinstall`,
+  `_sab_wedgeretryoldgen`, `_sab_slotnocompare`, and six `_witness_*` reachability checks. Run
+  evidence, state counts and traces: `CaCasMountCore_RESULTS.md`.
 
 ### rev.7/rev.8 disk lifecycle: FORGET protocol (+ the excised erasure proof) {#group-rev7-lifecycle}
 
