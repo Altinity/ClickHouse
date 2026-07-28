@@ -774,7 +774,7 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
     const bool effective_need_only_count = need_only_count;
 #endif
 
-    const bool can_use_count_cache = effective_need_only_count && headers_requested
+    const bool can_use_count_cache = effective_need_only_count && !headers_requested
         && context_->getSettingsRef()[Setting::use_cache_for_count_from_files]
         && canUseCountFromFilesCache(object_info);
 
