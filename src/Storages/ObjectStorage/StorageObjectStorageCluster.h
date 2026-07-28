@@ -222,6 +222,8 @@ private:
     const String engine_name;
     StorageObjectStorageConfigurationPtr configuration;
     const ObjectStoragePtr object_storage;
+    /// True when cluster name comes from SETTINGS (s3()/iceberg() alternative syntax, or
+    /// ENGINE ... SETTINGS object_storage_cluster / DataLake database setting), not from *Cluster arg.
     bool cluster_name_in_settings;
     bool cluster_name_from_function_argument = false;
 

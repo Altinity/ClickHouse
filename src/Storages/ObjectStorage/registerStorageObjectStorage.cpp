@@ -87,7 +87,7 @@ createStorageObjectStorage(const StorageFactory::Arguments & args, StorageObject
     ContextMutablePtr context_copy = Context::createCopy(args.getContext());
     Settings settings_copy = args.getLocalContext()->getSettingsCopy();
     context_copy->setSettings(settings_copy);
-    return std::make_shared<StorageObjectStorageCluster>(
+    auto storage = std::make_shared<StorageObjectStorageCluster>(
         cluster_name,
         configuration,
         // We only want to perform write actions (e.g. create a container in Azure) when the table is being created,
@@ -107,6 +107,10 @@ createStorageObjectStorage(const StorageFactory::Arguments & args, StorageObject
         /* is_datalake_query */ false,
         /* is_table_function */ false,
         /* lazy_init */ false);
+    /// Same as s3(...)/iceberg() alternative syntax: cluster name comes from SETTINGS, not *Cluster argument.
+    if (!cluster_name.empty())
+        storage->setClusterNameInSettings(true);
+    return storage;
 }
 
 #endif
