@@ -1587,3 +1587,7 @@ final verification. T5 designing on lane L. No push.
 
 **2026-07-28 23:2x local** — T8 round 3: step-down fix for the plain-crash liveness regression
 (refuse-on-above stays terminal); RebuildReport fields; superseded-mark. T5 designing. No push.
+
+**2026-07-28 23:4x local** — T8: polish + BACKLOG landed; round-3 (step-down) nudged after a
+message crossing. Near-miss: lane agent's relative-path edit briefly touched master's BACKLOG
+(caught pre-commit, reverted; absolute-paths lesson added to dispatch boilerplate). No push.
