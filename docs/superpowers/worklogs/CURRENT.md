@@ -1405,3 +1405,6 @@ machine-proven). Task 2 (slotOccupy raw primitive) dispatched to impl-a2. No pus
 
 **2026-07-28 15:20 local watchdog** — task 2 early phase: reading the control-layer sources
 (no test file yet), build procs live. No push.
+
+**2026-07-28 15:40 local watchdog** — task 2 iterating: rebuild after the designated-initializer
+fix (task2_build.log fresh at 15:37, 3 live procs), no commit yet. No push.
