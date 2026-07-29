@@ -345,6 +345,24 @@ surface, plus the one requirement Task 1 did not have (no implicit conversion to
   `roots/<ns>/<inc>/_files/<relative-name>`; the `RootNamespace`-only overloads are DELETED
   (Constraint 4); the header's key-shape documentation block (`:73`) is updated. `mountpointObjectKey`
   (`:281`) is NOT touched — loose mountpoint objects stay unqualified (Constraint 12)
+- Modify: `.../Pool/CasPool.cpp` — `listNamespaces` carries TWO parse hazards in ONE function, both
+  discharged here because the function is being edited anyway (leaving a known fsck-killer in a
+  function you are already touching is worse than a marginally wider task; split the commit if the
+  diff grows). Found by the Task-1c scouting pass and by Task 1's re-review:
+  (a) the `_files` recovery SPLITS THE STRING on `"/_files/"` (`:~1449`) and takes everything before
+  it as the namespace — once files are life-keyed that silently yields `<ns>/<inc>` as the namespace.
+  Teach it the segment via `parseNamespaceFileKey` and make it fail closed, exactly as Task 1 did for
+  ref keys. §required-tests' "rejection of legacy unqualified ref and `_files` keys" lands here;
+  (b) the REF-key parse (`:1421`) is UNGUARDED, so the life-less-key refusal Task 1 introduced escapes
+  into `CasFsck`'s loop HEADERS (`CasFsck.cpp:548`, `:846`, `:1027`) — outside the per-namespace
+  "RECORD AND CONTINUE, NEVER WEDGE" try at `:560`, and `runFsck` rethrows everything but
+  `TIMEOUT_EXCEEDED` — so ONE malformed key makes fsck produce NO report at all, including about the
+  healthy namespaces it never reached. That is the forensic tool an operator reaches for after seeing
+  the new GC anomaly, so it dying first is the wrong failure order (Task-1 re-review IMPORTANT-A,
+  tracked return-item). Same exposure from `removeRecursive` (`ContentAddressedTransaction.cpp:1063`)
+  and decommission (`CasDecommission.cpp:119`). Use Task 1's absorb-and-continue shape at the
+  enumeration, or hoist the guard into the fsck loop headers — decide from the code, say which and
+  why in the report
 - Create (in `CasLayout.h`/`.cpp`): `parseNamespaceFileKey` — the `_files` mirror of
   `parseRefObjectKey`, returning `(NamespaceLifeId, relative-name)`; the janitor (Task 5) needs it to
   classify what `namespaceAllLivesPrefix` returns
@@ -423,6 +441,19 @@ static_assert(!std::is_default_constructible_v<NamespaceLifeId>);
   `parseNamespaceFileKey` refuses a legacy `roots/<ns>/_files/x` key, a zero incarnation, malformed
   or upper-case hex — each `CORRUPTED_DATA` naming the key; the `:106-112` relative-name rejections
   (empty, leading/trailing `/`, `//`, `..`) still hold under the new signature.
+- [ ] **Step 0 (ORDERING-CRITICAL — must precede any key change):** capture the pre-change
+  namespace-file REQUEST-COUNT GOLDENS from the current tree — per-key backend request counts for
+  rewrite, append (`ContentAddressedTransaction.cpp:822`), remove, and one dedup-log ROTATION
+  sequence — and paste them into the guard test as LITERALS, so the guard fails if incarnation
+  qualification perturbs the profile. Re-deriving expectations after the change would measure the
+  change against itself; this is the same hard ordering constraint Task 1b's equivalence fences hit.
+  Task 4b's Constraint-16 gate EXTENDS this file rather than re-deriving its numbers.
+- [ ] **Step 1c: Failing tests — `listNamespaces`' two hazards.** A life-keyed `_files` key is
+  recovered with the namespace ONLY (never `<ns>/<inc>`); a legacy `roots/<ns>/_files/x` key is
+  REFUSED with the key named; and a life-less REF key under `cas/refs/` does not abort the
+  enumeration — with `ca-fsck` still producing a report that names the healthy namespaces (the
+  IMPORTANT-A regression). If the fsck fixture is too heavy for this TU, assert the enumeration's own
+  outcome and state the substitution in the report rather than dropping the claim.
 - [ ] **Step 2:** Run → FAIL. **Step 3:** Rename + widen until the tree compiles. **Step 4:** Full
   CA gate green (expect the Task-1 delta: renamed suites, +new file-key cases). **Step 5: Commit**
   `ca: ref — NamespaceLifeId over refs and namespace files; namespace-only file overloads deleted`.
