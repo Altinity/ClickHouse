@@ -1299,6 +1299,26 @@ public:
         hidden_keys.insert(key);
     }
 
+    /// Make the store's enumeration omit EXACTLY `keys` and nothing else -- the whole omission set in
+    /// one call, replacing whatever was hidden before.
+    ///
+    /// This is the RustFS defect reproduced as an interface: every one of these keys stays durable and
+    /// honestly served by `get` / `head` / `putIfAbsent` / `casPut` / `deleteExact`, and only
+    /// enumeration pretends they are not there. Stating the omission as a SET is what lets a test say
+    /// the thing the defect report says -- "ids 3 and 4 are invisible while the LATER id 5 is visible"
+    /// -- in one line, instead of assembling it from repeated single-key calls whose combined effect a
+    /// reader has to reconstruct.
+    ///
+    /// A setter rather than an adder: the omission set is the store's declared behaviour for the rest
+    /// of the test, so a second call REPLACES it (pass `{}` to stop lying, same as `revealAll`).
+    void setListOmissions(std::vector<String> keys)
+    {
+        std::lock_guard lock(hide_mutex);
+        hidden_keys.clear();
+        hidden_prefixes.clear();
+        hidden_keys.insert(keys.begin(), keys.end());
+    }
+
     /// How many LIST pages actually had a key erased. Every test that hides a key asserts this, so a
     /// mistyped key cannot let the test pass vacuously -- the hole has to have been SERVED.
     size_t holesServed() const
