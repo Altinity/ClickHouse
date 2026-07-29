@@ -1782,3 +1782,5 @@ defensive scaffolding formally dies. T13+T14 remain. No push.
 probe-A premise re-check + T_mat consumer sweep). No builds yet; nothing wedged. T13/T14 queued.
 **2026-07-29 07:20 local** — watchdog: T12 mid-edit (CasGc/Settings touched 07:15-07:16 — probe-A
 demotion + T_mat deletion in progress; verdict doc not yet created). No commits/builds yet; live.
+**2026-07-29 07:40 local** — watchdog: T12 live — source edits done (07:15-16), verdict doc
+`2026-07-28-stage-a-retirement-verdicts.md` being written (07:37). No build/commit yet.
