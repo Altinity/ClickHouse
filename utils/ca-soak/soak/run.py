@@ -74,6 +74,7 @@ from soak.checker import (
 from soak.fsck import run_fsck, run_dryrun, FsckTimeout, stale_edge_verdict
 from soak.signals import (
     CAS_SIGNAL_EVENTS,
+    LatePutFencing,
     PhaseCoverage,
     SignalTracker,
     format_phase_summary,
@@ -821,7 +822,7 @@ def checkpoint(driver, cluster, model, phase, *, strict_unreachable=False):
     return now, exp, n1, n2, f, dr
 
 
-def capture_checkpoint_signals(cluster, label, *, tracker, log_fn=log):
+def capture_checkpoint_signals(cluster, label, *, tracker, fencing=None, log_fn=log):
     """Read the CAS signal counters at a checkpoint, FAIL-CLOSED, and report them.
 
     Distinct from the ticker's read in one way that matters: a checkpoint has already waited for both
@@ -830,13 +831,32 @@ def capture_checkpoint_signals(cluster, label, *, tracker, log_fn=log):
     never as zeros) because a node can go down between the health gate and this read, but a query
     FAILURE propagates and the counters are never invented.
 
-    REPORTED, NOT GATED (Task 21 step 3). Their benign rates are uncharacterised as of 2026-07-26:
-    `CasRefAppendPreAttemptRefused` is EXPECTED to be nonzero under chaos -- that is the availability
-    fix working -- and `CasGcUnmatchedRemoveDeltas` should be zero in a healthy pool but may not be for
-    reasons nobody has enumerated. A threshold goes in once several runs agree on a rate, not before."""
+    MOSTLY REPORTED, NOT GATED (Task 21 step 3). The benign rates in `UNCHARACTERISED_SIGNALS` are
+    uncharacterised as of 2026-07-26: `CasRefAppendPreAttemptRefused` is EXPECTED to be nonzero under
+    chaos -- that is the availability fix working -- and `CasGcUnmatchedRemoveDeltas` should be zero in
+    a healthy pool but may not be for reasons nobody has enumerated. A threshold goes in once several
+    runs agree on a rate, not before.
+
+    The ONE gated family is the late-PUT-loses invariant, when a `fencing` tracker is supplied. It
+    needs no characterisation: every counter it gates on is documented as always-zero in
+    `ProfileEvents.cpp`, so a nonzero DELTA over the run's own preflight baseline is a durable
+    transaction gone missing, a fold cursor advanced past work, or a stream that stopped being dense --
+    none of which a soak may finish green having seen. This is a checkpoint gate rather than a ticker
+    gate for the same reason the fsck is: the ticker is observability and runs through chaos windows,
+    the checkpoint is the correctness assertion and runs on the main thread with both replicas up."""
+    violations = []
     for node in cluster.nodes():
-        tracker.observe(repr(node), read_signal_events(node))
+        values = read_signal_events(node)
+        tracker.observe(repr(node), values)
+        if fencing is not None:
+            violations += [f"[{node!r}] {v}" for v in fencing.observe(repr(node), values, label=label)]
     log_fn(f"{label} CAS SIGNALS: {tracker.format_latest()}")
+    if violations:
+        raise CheckpointFailure(
+            f"{label} LATE-PUT FENCING VIOLATION — a counter that must stay zero moved: "
+            + "; ".join(violations)
+            + ". The invariant is that a fenced predecessor's PUT never materializes below coverage "
+              "its successor already declared; these counters are how that failing looks from outside")
 
 
 def capture_phase_summary(cluster, label, *, since_ts, coverage, conn=None, ts=None, log_fn=log):
@@ -1424,6 +1444,9 @@ def run_phase3(args):
         log(f"CAS SIGNALS baseline {node_name}: "
             + " ".join(f"{k}={values[k]}" for k in CAS_SIGNAL_EVENTS))
     signal_tracker = SignalTracker()
+    # Seeded with the preflight reading so an inherited nonzero counter on a reused container is not
+    # charged to this run: what this run did is the delta.
+    fencing = LatePutFencing(signal_baseline)
     phase_coverage = PhaseCoverage()
     # Start of the first per-phase GC-log window. Advanced to each checkpoint's own time afterwards so
     # consecutive checkpoints report disjoint windows.
@@ -1511,7 +1534,7 @@ def run_phase3(args):
         ticker.tick_once(checkpoint_ts, fsck=f)
         # The two signal families the driver could not see before 2026-07-26. Both are read here
         # fail-closed (the cluster is quiesced and health-gated) and reported, not gated.
-        capture_checkpoint_signals(cluster, label, tracker=signal_tracker)
+        capture_checkpoint_signals(cluster, label, tracker=signal_tracker, fencing=fencing)
         capture_phase_summary(cluster, label, since_ts=phase_window_start["ts"],
                               coverage=phase_coverage, conn=conn, ts=checkpoint_ts)
         phase_window_start["ts"] = checkpoint_ts
@@ -1697,6 +1720,8 @@ def run_phase3(args):
     # read is blind, not green. These two blocks are what makes that checkable from the run log.
     for line in signal_tracker.report_lines():
         log(line)
+    for line in fencing.report_lines():
+        log(line)
     for line in phase_coverage.report_lines():
         log(line)
     print("PHASE3 OK")
@@ -1792,9 +1817,10 @@ def main(argv=None):
         args.seed, args.phase, args.ops, args.workers, args.checkpoint_every)
 
     # Same preflight as phase 3: refuse to start a run that cannot read its own signals.
-    preflight_signals(cluster)
+    signal_baseline = preflight_signals(cluster)
     log(f"CAS SIGNALS preflight OK: {len(CAS_SIGNAL_EVENTS)} counters present on all nodes")
     signal_tracker = SignalTracker()
+    fencing = LatePutFencing(signal_baseline)
     phase_coverage = PhaseCoverage()
     phase_window_start = {"ts": int(time.time())}
 
@@ -1860,7 +1886,7 @@ def main(argv=None):
             f"(fold backlog / AwaitingGc) dangling={f.get('dangling')} stale_edge={_stale_edge_display(f)} "
             f"dryrun_count={dr.get('count')}")
         checkpoint_ts = int(time.time())
-        capture_checkpoint_signals(cluster, label, tracker=signal_tracker)
+        capture_checkpoint_signals(cluster, label, tracker=signal_tracker, fencing=fencing)
         # Phase 1/2 has no metrics db, so the phase summary is logged only (conn=None).
         capture_phase_summary(cluster, label, since_ts=phase_window_start["ts"],
                               coverage=phase_coverage, conn=None, ts=checkpoint_ts)
@@ -1965,6 +1991,8 @@ def main(argv=None):
 
     log(f"ABORTED-retried INSERT attempts (B137 race fired and was handled): {driver.aborted_retries}")
     for line in signal_tracker.report_lines():
+        log(line)
+    for line in fencing.report_lines():
         log(line)
     for line in phase_coverage.report_lines():
         log(line)

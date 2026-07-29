@@ -63,9 +63,13 @@ CAS_SIGNAL_EVENT_NOTES = (
     ("CasRefAppendWedged",
      "Ref-log append lanes that exhausted retries after an UNCERTAIN put. Ref-log progress may be "
      "stalled on that lane."),
-    ("CasRefApplyPoisoned",
-     "Ref tables whose cached state may be MISSING a durable transaction. Its own description says it "
-     "must always be zero; a nonzero value means that writer's view is untrustworthy until remount."),
+    ("CasGcProbeADue",
+     "GC rounds on which the sampled ref-prefix store-quality detector was DUE by its deterministic "
+     "cadence (`gc_probe_a_period`). Watched together with CasGcProbeAPerformed because a "
+     "disagreement count can only be read against how many rounds were actually sampled."),
+    ("CasGcProbeAPerformed",
+     "GC rounds on which that detector actually compared two independent enumerations, at one extra "
+     "full ref-prefix LIST each. Zero here with CasGcProbeADue nonzero means every sample failed."),
     ("CasGcClampSuppressedPasses",
      "GC passes that deferred graduation and deletion because reachability was uncertain — GC held "
      "back. Fail-closed behaviour, but a steady rate means GC is not converging."),
@@ -75,20 +79,76 @@ CAS_SIGNAL_EVENT_NOTES = (
     ("CasGcRefScanDisagreements",
      "Ref-log ids on which a round's two independent enumerations of the ref prefix disagreed below "
      "the other enumeration's own maximum id. An append cannot produce that shape: it means the store "
-     "answered inconsistently about a durable prefix, or a deposed leader deleted ref objects. The "
-     "round aborts ref folding when nonzero (the `e01b5cd82be` detector)."),
-    ("CasGcUnappliedFoldedTxns",
-     "Ref transactions a round folded and merged but whose blob deltas never reached a shard reducer. "
-     "Always 0 on a healthy round; nonzero fails the round closed, because the round would otherwise "
-     "advance its fold cursor past a transaction it never applied (the `e01b5cd82be` detector)."),
+     "answered inconsistently about a durable prefix, or a deposed leader deleted ref objects. A "
+     "STORE-QUALITY READING ONLY since the sampled detector landed: the round's ref intake reads by "
+     "exact key, so a nonzero value no longer aborts the round or suppresses any step. It can only "
+     "move on a round the detector sampled — read it against CasGcProbeAPerformed."),
 )
 
-CAS_SIGNAL_EVENTS = tuple(name for name, _ in CAS_SIGNAL_EVENT_NOTES)
+# The late-PUT-loses invariant, as counters. Two families, and the difference between them is the
+# whole point: the first is what the protocol WORKING looks like, the second is what it FAILING looks
+# like, and a soak that only watched the second could not tell "the invariant held" from "the code
+# path was never reached".
+#
+# A dying writer epoch can have a PUT in flight for the id its successor's recovery is about to seal.
+# Recovery closes the dead epoch by writing an EpochSeal at that exact id as a CONDITIONAL CREATE, so
+# the two possible orders both end well: the seal lands first and the straggler's create is refused
+# (`CasRefAppendSealRejected` — the late PUT LOSES, and it was never acknowledged), or the straggler
+# lands first and recovery adopts it and reseals at the new T+1 (`CasRefRecoveryStragglerAdopted` —
+# the write was real, so it is kept). What must NEVER happen is a late transaction materializing
+# BELOW coverage the successor has already declared: that is a durable write the fold has walked past.
+LATE_PUT_EVIDENCE_NOTES = (
+    ("CasRefRecoveryEpochSealed",
+     "Epoch seals MINTED by a recovery CAS-walk, one per dead writer epoch closed. This is the "
+     "fencing mechanism itself: zero over a whole chaos run means no epoch ever changed hands under "
+     "recovery, so the run did not exercise the invariant at all and its silence proves nothing."),
+    ("CasRefAppendSealRejected",
+     "Ref-log transactions conclusively rejected by a successor's epoch seal occupying the id they "
+     "derived. THE late PUT losing, counted: the deposed writer's operation was never acknowledged. "
+     "Expected to be nonzero under chaos and never a failure on its own."),
+    ("CasRefRecoveryStragglerAdopted",
+     "Stragglers a recovery CAS-walk met at the slot it tried to seal, adopted and resealed at the "
+     "new T+1. The other legal order of the same race — the write won the slot fairly, so it is kept "
+     "rather than fenced. Also never a failure on its own."),
+)
+
+# The violation half. Each one is a counter whose OWN registry description says it must be zero, and
+# each is a distinct way the invariant could break: a durable transaction missing from a writer's
+# view, a fold cursor advanced past work, a stream that is no longer dense.
+LATE_PUT_VIOLATION_NOTES = (
+    ("CasRefApplyPoisoned",
+     "A ref table whose cached state may be MISSING a durable transaction — an install failed while "
+     "its ref-log object may already be durable. The LOSS half of the invariant: acknowledged work "
+     "that the writer's own view no longer contains."),
+    ("CasGcUnappliedFoldedTxns",
+     "Ref transactions a round folded and merged but whose blob deltas never reached a shard reducer. "
+     "The FOLD half: the round would advance its cursor past a transaction it never applied. The "
+     "product already fails such a round closed; the soak must not finish green having seen one."),
+    ("CasRefRecoveryStreamHole",
+     "A 404 BELOW a durable same-epoch witness — ids are dense 1..T within (namespace, epoch) by "
+     "INV-1, so this is a hole and folding what is above it would drop transactions silently. The "
+     "DENSITY half."),
+)
+
+CAS_SIGNAL_EVENTS = tuple(
+    name for name, _ in CAS_SIGNAL_EVENT_NOTES + LATE_PUT_EVIDENCE_NOTES + LATE_PUT_VIOLATION_NOTES)
+
+LATE_PUT_EVIDENCE_EVENTS = tuple(name for name, _ in LATE_PUT_EVIDENCE_NOTES)
+LATE_PUT_VIOLATION_EVENTS = tuple(name for name, _ in LATE_PUT_VIOLATION_NOTES)
 
 # Signals whose benign rate is uncharacterised as of 2026-07-26 and which therefore must NOT gate a
 # run yet (Task 21 step 3: "report the counters; do NOT fail on them"). Recorded here so the intent is
 # in the code rather than only in a plan: a threshold goes in once several runs agree on a rate.
-UNCHARACTERISED_SIGNALS = CAS_SIGNAL_EVENTS
+# The late-PUT families are NOT in it: the evidence counters are expected to move and are never a
+# failure, and the violation counters need no characterisation because their benign rate is zero by
+# construction, stated in their own `ProfileEvents.cpp` descriptions.
+UNCHARACTERISED_SIGNALS = tuple(name for name, _ in CAS_SIGNAL_EVENT_NOTES)
+
+# A name listed in two families would be read twice, validated twice and tracked in one dict key —
+# silently halving the accounting rather than failing. Cheap to rule out at import.
+if len(set(CAS_SIGNAL_EVENTS)) != len(CAS_SIGNAL_EVENTS):
+    _dupes = sorted({e for e in CAS_SIGNAL_EVENTS if CAS_SIGNAL_EVENTS.count(e) > 1})
+    raise AssertionError(f"duplicate watched counter(s) across the signal families: {_dupes}")
 
 GC_LOG = "system.content_addressed_garbage_collection_log"
 
@@ -483,6 +543,110 @@ class SignalTracker:
             gated = "reported-not-gated" if e in UNCHARACTERISED_SIGNALS else "gated"
             lines.append(f"CAS SIGNALS:   {e} peak={self.peak[e]} "
                          f"nonzero_in={self.nonzero_reads[e]}/{self.reads} reads ({gated})")
+        return lines
+
+
+class LatePutFencingViolation(RuntimeError):
+    """A counter that carries the late-PUT-loses invariant moved off zero.
+
+    Raised where the soak can still say WHERE it happened. Not an availability complaint: every counter
+    behind it is documented as always-zero, so a nonzero reading is a durable transaction that went
+    missing, a fold cursor that advanced past work, or a stream that stopped being dense."""
+
+
+def check_late_put_fencing(values, *, baseline=None) -> list:
+    """Evaluate the violation half of the late-PUT-loses invariant against ONE node's reading.
+
+    Pure. Returns a list of human-readable violation strings (empty when the invariant holds). `values`
+    is what `read_signal_events` returned, or `None` for a legitimate probe gap — a gap yields no
+    violations, because a node that could not be read has said nothing, which is not the same as
+    saying zero.
+
+    `baseline` is the node's preflight reading, subtracted when supplied. The counters are cumulative
+    per process, and a soak stand can legitimately reuse a container that already carried a nonzero
+    value from an earlier run; charging that to this run would be an inherited red. What this run did
+    is the DELTA."""
+    if values is None:
+        return []
+    violations = []
+    for event, why in LATE_PUT_VIOLATION_NOTES:
+        now = values.get(event)
+        if now is None:
+            continue
+        was = (baseline or {}).get(event, 0)
+        delta = now - was
+        if delta > 0:
+            violations.append(f"{event}={delta} (cumulative {now}, baseline {was}): {why}")
+    return violations
+
+
+class LatePutFencing:
+    """Run-level accounting for the late-PUT-loses invariant: a fenced predecessor's PUT never
+    materializes below coverage its successor has already declared.
+
+    Two halves, and the report states both, because either one alone is misleading:
+
+    * **evidence** — did the run reach the fencing path at all (`LATE_PUT_EVIDENCE_EVENTS`)? A chaos
+      soak in which no epoch was ever sealed did not test this invariant, and saying so is the
+      difference between "held" and "never asked". Reported, never a failure.
+    * **violations** — did any always-zero counter move (`LATE_PUT_VIOLATION_EVENTS`)? GATED: the
+      caller turns a nonzero delta into a checkpoint failure. This is the assertion.
+
+    Same shape as `SignalTracker` on purpose (`observe` per node per read, `report_lines` at the end),
+    and just as pure — the caller does the I/O and decides what a violation costs."""
+
+    def __init__(self, baseline=None):
+        # {node_repr: {event: value}} from `preflight_signals`, so an inherited nonzero counter on a
+        # reused container is not charged to this run.
+        self.baseline = dict(baseline or {})
+        self.reads = 0
+        self.gaps = 0
+        self.evidence_peak = {e: 0 for e in LATE_PUT_EVIDENCE_EVENTS}
+        self.violation_peak = {e: 0 for e in LATE_PUT_VIOLATION_EVENTS}
+        self.violations = []          # [(node_repr, label, violation string)] — every one ever seen
+
+    def observe(self, node_name: str, values, *, label: str = "") -> list:
+        """Fold one node's reading in and return the violations it carries (empty when clean)."""
+        if values is None:
+            self.gaps += 1
+            return []
+        self.reads += 1
+        base = self.baseline.get(node_name, {})
+        for e in LATE_PUT_EVIDENCE_EVENTS:
+            v = values.get(e)
+            if v is not None:
+                delta = v - base.get(e, 0)
+                if delta > self.evidence_peak[e]:
+                    self.evidence_peak[e] = delta
+        for e in LATE_PUT_VIOLATION_EVENTS:
+            v = values.get(e)
+            if v is not None:
+                delta = v - base.get(e, 0)
+                if delta > self.violation_peak[e]:
+                    self.violation_peak[e] = delta
+        found = check_late_put_fencing(values, baseline=base)
+        for v in found:
+            self.violations.append((node_name, label, v))
+        return found
+
+    @property
+    def exercised(self) -> bool:
+        """True when the run actually reached the fencing path — at least one epoch seal was minted."""
+        return self.evidence_peak.get("CasRefRecoveryEpochSealed", 0) > 0
+
+    def report_lines(self) -> list:
+        lines = [f"LATE-PUT FENCING: {self.reads} readings, {self.gaps} probe gaps; "
+                 f"{len(self.violations)} violation readings"]
+        lines.append("LATE-PUT FENCING:   evidence (deltas over the run, never a failure): "
+                     + " ".join(f"{e}={self.evidence_peak[e]}" for e in LATE_PUT_EVIDENCE_EVENTS))
+        lines.append("LATE-PUT FENCING:   violations (gated, must all be 0): "
+                     + " ".join(f"{e}={self.violation_peak[e]}" for e in LATE_PUT_VIOLATION_EVENTS))
+        if not self.exercised:
+            lines.append("LATE-PUT FENCING: WARNING — no epoch seal was minted in this run "
+                         "(CasRefRecoveryEpochSealed stayed 0), so the fencing path was never reached. "
+                         "The zero violations below are the absence of a test, not a passing one.")
+        for node_name, label, v in self.violations:
+            lines.append(f"LATE-PUT FENCING:   VIOLATION [{node_name}]{' ' + label if label else ''}: {v}")
         return lines
 
 

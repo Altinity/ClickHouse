@@ -15,6 +15,11 @@ from soak.cluster import QueryError
 from soak.signals import (
     CAS_SIGNAL_EVENTS,
     DETECTOR_METRICS,
+    LATE_PUT_EVIDENCE_EVENTS,
+    LATE_PUT_VIOLATION_EVENTS,
+    LatePutFencing,
+    UNCHARACTERISED_SIGNALS,
+    check_late_put_fencing,
     PhaseCoverage,
     SignalTracker,
     SignalsUnsupported,
@@ -327,3 +332,70 @@ def test_phase_coverage_report_warns_when_never_captured():
     c = PhaseCoverage()
     c.observe(None)
     assert "NEVER captured" in "\n".join(c.report_lines())
+
+
+# ---------------------------------------------------------------------------
+# The late-PUT-loses invariant
+# ---------------------------------------------------------------------------
+
+def test_evidence_and_violation_families_are_disjoint_and_all_watched():
+    """The split is the whole design: the evidence counters are the protocol WORKING and must never
+    fail a run, the violation counters are it failing. A name in both would be read twice and gated on
+    its own evidence."""
+    assert not set(LATE_PUT_EVIDENCE_EVENTS) & set(LATE_PUT_VIOLATION_EVENTS)
+    for e in LATE_PUT_EVIDENCE_EVENTS + LATE_PUT_VIOLATION_EVENTS:
+        assert e in CAS_SIGNAL_EVENTS      # so preflight proves the binary has it
+    # ... and none of them is excused as uncharacterised: the evidence half is never a failure, the
+    # violation half needs no rate because its benign rate is zero by construction.
+    assert not set(LATE_PUT_EVIDENCE_EVENTS + LATE_PUT_VIOLATION_EVENTS) & set(UNCHARACTERISED_SIGNALS)
+
+
+def test_a_probe_gap_is_not_a_passing_invariant():
+    """A node that could not be read has said nothing. Folding that to "no violations" is the exact
+    silent-degradation defect this module exists to avoid, so the gap must not be a clean reading."""
+    f = LatePutFencing()
+    assert f.observe("n1", None) == []
+    assert f.reads == 0 and f.gaps == 1
+    assert not f.exercised
+
+
+def test_the_late_put_losing_is_evidence_not_a_violation():
+    """`CasRefAppendSealRejected` is a deposed writer being told so — the mechanism working. A run that
+    fenced a hundred stragglers is a run that tested the invariant, not one that broke it."""
+    f = LatePutFencing()
+    assert f.observe("n1", {"CasRefRecoveryEpochSealed": 4, "CasRefAppendSealRejected": 100,
+                            "CasRefRecoveryStragglerAdopted": 2, "CasRefApplyPoisoned": 0,
+                            "CasGcUnappliedFoldedTxns": 0, "CasRefRecoveryStreamHole": 0}) == []
+    assert f.exercised
+    assert f.evidence_peak["CasRefAppendSealRejected"] == 100
+    text = "\n".join(f.report_lines())
+    assert "VIOLATION" not in text and "WARNING" not in text
+
+
+def test_each_violation_counter_is_reported_by_name():
+    f = LatePutFencing()
+    for event in LATE_PUT_VIOLATION_EVENTS:
+        found = f.observe("n1", {event: 1})
+        assert len(found) == 1 and event in found[0]
+    assert len(f.violations) == len(LATE_PUT_VIOLATION_EVENTS)
+    assert "VIOLATION" in "\n".join(f.report_lines())
+
+
+def test_an_inherited_counter_is_not_charged_to_this_run():
+    """Soak stands reuse containers. The counters are cumulative per process, so a value carried in
+    from an earlier run would otherwise red this one before it did anything."""
+    baseline = {"n1": {"CasRefApplyPoisoned": 7}}
+    assert check_late_put_fencing({"CasRefApplyPoisoned": 7}, baseline=baseline["n1"]) == []
+    f = LatePutFencing(baseline)
+    assert f.observe("n1", {"CasRefApplyPoisoned": 7}) == []
+    found = f.observe("n1", {"CasRefApplyPoisoned": 8})
+    assert len(found) == 1 and "CasRefApplyPoisoned=1" in found[0]
+
+
+def test_a_run_that_never_sealed_an_epoch_says_so_rather_than_passing():
+    """Zero violations because nothing ever happened is the absence of a test, and a report that reads
+    identically to a real pass would launder it into one."""
+    f = LatePutFencing()
+    f.observe("n1", {e: 0 for e in LATE_PUT_EVIDENCE_EVENTS + LATE_PUT_VIOLATION_EVENTS})
+    text = "\n".join(f.report_lines())
+    assert "WARNING" in text and "never reached" in text
