@@ -1720,3 +1720,7 @@ promises. No push.
 **2026-07-29 04:00 local watchdog** — convergence: all six stitches committed (last:
 `ee3170eace2`); final release gate 1526/1526; ASan gate still running (live procs). Final
 report pending. No push.
+
+**2026-07-29 04:20 local watchdog** — convergence ASan run went out UNFILTERED and hung on a
+non-CAS socket test (SilkFiberSocket throttler, environmental); directed impl-conv to kill +
+re-run with the CA filter. Release gate already green 1526/1526. No push.
