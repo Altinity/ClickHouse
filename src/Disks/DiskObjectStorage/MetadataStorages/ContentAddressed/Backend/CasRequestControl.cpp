@@ -138,10 +138,22 @@ void validateCasRequestBudget(const CasRequestBudget & budget, uint64_t mount_le
             "strictly less than the mount lease TTL ({} ms). A writable mount refuses to open with "
             "this budget.",
             budget.attempt_timeout_ms, budget.lease_safety_margin_ms, mount_lease_ttl_ms);
-    if (!(budget.attempt_timeout_ms <= budget.operation_deadline_ms))
+    /// STRICTLY less, and the strictness is the load-bearing half. `attempt_timeout_ms >
+    /// operation_deadline_ms` is the obvious error — a single attempt cannot outlast the logical
+    /// operation it belongs to. EQUALITY is the subtle one, and it is worse than useless: the deadline
+    /// is captured as `now + operation_deadline_ms` and every pre-send gate below asks
+    /// `now + attempt_timeout_ms > deadline_ms`, so equal values collapse that to `now_2 > now_1` and
+    /// ONE elapsed millisecond between the two clock reads refuses the operation having sent NOTHING.
+    /// The resulting behaviour is "mostly works, occasionally refuses with nothing sent", decided by
+    /// the scheduler rather than by the budget — exactly the flakiness this validation exists to catch,
+    /// and observed three times in tests before it was forbidden. A caller that wants one attempt says
+    /// `max_attempts = 1`; the equality adds only the race.
+    if (!(budget.attempt_timeout_ms < budget.operation_deadline_ms))
         throw Exception(ErrorCodes::BAD_ARGUMENTS,
-            "CAS request budget rejected: attempt_timeout_ms ({}) must not exceed operation_deadline_ms "
-            "({}) — a single attempt cannot outlast the logical operation it belongs to.",
+            "CAS request budget rejected: attempt_timeout_ms ({}) must be strictly less than "
+            "operation_deadline_ms ({}) — equality turns the pre-send gate into a wall-clock race that "
+            "refuses after a single elapsed tick, having sent nothing. Use max_attempts to bound the "
+            "number of attempts.",
             budget.attempt_timeout_ms, budget.operation_deadline_ms);
     if (!(budget.retry_initial_backoff_ms <= budget.retry_max_backoff_ms))
         throw Exception(ErrorCodes::BAD_ARGUMENTS,

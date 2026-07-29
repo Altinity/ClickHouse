@@ -190,8 +190,14 @@ struct CasRequestBudget
 /// silently falling back to an unbounded or unsafe retry policy. Throws
 /// `BAD_ARGUMENTS` unless ALL hold:
 ///   attempt_timeout_ms + lease_safety_margin_ms < mount_lease_ttl_ms
-///   attempt_timeout_ms <= operation_deadline_ms
+///   attempt_timeout_ms < operation_deadline_ms          (STRICTLY — see below)
 ///   retry_initial_backoff_ms <= retry_max_backoff_ms
+///
+/// The middle one is strict on purpose. Equality does not mean "one attempt's worth of budget": the
+/// deadline is captured as `now + operation_deadline_ms` and each pre-send gate asks
+/// `now + attempt_timeout_ms > deadline_ms`, so equal values reduce it to `now_2 > now_1` and a single
+/// elapsed millisecond refuses the operation having sent NOTHING. Bound the attempt COUNT with
+/// `max_attempts`, never by starving the deadline.
 /// `mount_renew_period_ms` takes no part in the inequality (the renewer keeps the fence deadline
 /// refreshed well ahead of the TTL by construction) — it is accepted only so the effective-values log
 /// line records the full picture in one place.

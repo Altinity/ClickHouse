@@ -677,7 +677,7 @@ TEST(CasMountStartup, RefusesWritableOpenWithInconsistentCasRequestBudget)
     /// attempt_timeout_ms + lease_safety_margin_ms == mount_lease_ttl_ms below (30000): not STRICTLY
     /// less, so this must be rejected.
     const CasRequestBudget bad_budget{
-        .attempt_timeout_ms = 25000, .operation_deadline_ms = 25000, .max_attempts = 3, .lease_safety_margin_ms = 5000};
+        .attempt_timeout_ms = 25000, .operation_deadline_ms = 30000, .max_attempts = 3, .lease_safety_margin_ms = 5000};
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS, [&]
     {
         Pool::open(b, PoolConfig{
@@ -699,7 +699,7 @@ TEST(CasMountStartup, StaleSelfMountReclaimedAfterWait)
     /// lease TTL), so it also scales down cas_request_budget to fit — the budget itself is not
     /// exercised here, only Pool::open's validateCasRequestBudget startup gate.
     const CasRequestBudget tiny_budget{
-        .attempt_timeout_ms = 50, .operation_deadline_ms = 50, .max_attempts = 1, .lease_safety_margin_ms = 50};
+        .attempt_timeout_ms = 50, .operation_deadline_ms = 500, .max_attempts = 1, .lease_safety_margin_ms = 50};
     auto a = Pool::open(b, PoolConfig{
         .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r",
         .mount_lease_ttl_ms = std::chrono::milliseconds(300),

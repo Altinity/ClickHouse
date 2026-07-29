@@ -1495,7 +1495,7 @@ TEST(CasPoolShutdown, UnresolvedWedgeSkipsFarewell)
     CasRequestBudget budget;
     budget.max_attempts = 1;
     budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = 100;
+    budget.operation_deadline_ms = 5000;   /// strictly above attempt_timeout_ms: equality is a wall-clock race (validateCasRequestBudget)
     budget.lease_safety_margin_ms = 100;
 
     auto backend = std::make_shared<UnresolvedPutBackend>();
@@ -1551,7 +1551,7 @@ TEST(CasMountTmat, UncleanOpenWaitsMaterializationGrace)
     /// cas-s3-timeout-retry-control §required-timeout-model requires attempt_timeout + safety_margin <
     /// lease TTL), so scale the budget down to fit -- mirrors `CasMountStartup::StaleSelfMountReclaimedAfterWait`.
     const CasRequestBudget tiny_budget{
-        .attempt_timeout_ms = 50, .operation_deadline_ms = 50, .max_attempts = 1, .lease_safety_margin_ms = 50};
+        .attempt_timeout_ms = 50, .operation_deadline_ms = 500, .max_attempts = 1, .lease_safety_margin_ms = 50};
 
     uint64_t fake_boot = 0;
     std::vector<uint64_t> waits;
@@ -1621,7 +1621,7 @@ TEST(CasMountTmat, FencedPriorPaysOnlyTmat)
 
     /// See UncleanOpenWaitsMaterializationGrace above: a 500ms TTL needs a scaled-down budget too.
     const CasRequestBudget tiny_budget{
-        .attempt_timeout_ms = 50, .operation_deadline_ms = 50, .max_attempts = 1, .lease_safety_margin_ms = 50};
+        .attempt_timeout_ms = 50, .operation_deadline_ms = 500, .max_attempts = 1, .lease_safety_margin_ms = 50};
 
     /// Restart over a pre-planted mount lease: establish `_pool_meta` first (Task 7 zero-write bootstrap).
     DB::Cas::tests::seedPoolMetaForRestart(*b);
@@ -1760,7 +1760,7 @@ TEST(CasRemountTmat, UnresolvedWedgePaysGraceAndMarksBoundaryUnclean)
     CasRequestBudget budget;
     budget.max_attempts = 1;
     budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = 100;
+    budget.operation_deadline_ms = 5000;   /// strictly above attempt_timeout_ms: equality is a wall-clock race (validateCasRequestBudget)
     budget.lease_safety_margin_ms = 100;
 
     auto backend = std::make_shared<UnresolvedPutBackend>();
@@ -1819,7 +1819,7 @@ TEST(CasRemountTmat, ALateTouchedTableClosesEveryDeadEpochInBandHoweverItsPredec
     CasRequestBudget budget;
     budget.max_attempts = 1;
     budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = 100;
+    budget.operation_deadline_ms = 5000;   /// strictly above attempt_timeout_ms: equality is a wall-clock race (validateCasRequestBudget)
     budget.lease_safety_margin_ms = 100;
 
     auto backend = std::make_shared<UnresolvedPutBackend>();

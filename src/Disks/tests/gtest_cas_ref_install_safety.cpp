@@ -142,7 +142,7 @@ PoolPtr openPoolFenceControlled(const BackendPtr & backend)
     CasRequestBudget budget;
     budget.max_attempts = 1;
     budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = 100;
+    budget.operation_deadline_ms = 5000;   /// strictly above attempt_timeout_ms: equality is a wall-clock race (validateCasRequestBudget)
     budget.lease_safety_margin_ms = 100;
     cfg.cas_request_budget = budget;
     return Pool::open(backend, cfg);

@@ -241,7 +241,7 @@ public:
 CasRequestBudget tinyBudget()
 {
     return CasRequestBudget{
-        .attempt_timeout_ms = 50, .operation_deadline_ms = 50, .max_attempts = 1, .lease_safety_margin_ms = 50};
+        .attempt_timeout_ms = 50, .operation_deadline_ms = 500, .max_attempts = 1, .lease_safety_margin_ms = 50};
 }
 
 PoolConfig walkTestConfig()
