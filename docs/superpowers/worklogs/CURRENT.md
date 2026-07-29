@@ -1968,3 +1968,6 @@ hard; manifest-leak allowed only as the counted gated-delete family; restore at 
 real (wipe != recreation; product DROP/CREATE required). Soak-stop deviation accepted.
 Obligation E discharged vs real store (HTTP 412 fence proof). Fix round 1 dispatched:
 framework fix + S43 rewrite + re-runs + verdict recompute (target: PENDING(T15)).
+**2026-07-29 13:42 local** — watchdog: T14 fix round 1 mid-flight — codex F3+F4 card fixes
+committed (43379185ef4), lane verify+verify2 passes ran 13:19-13:32, scenario framework edits
+uncommitted in tree (assert_no_leftovers ruling being implemented). Load 2.0, nothing wedged.
