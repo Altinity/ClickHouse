@@ -2738,6 +2738,15 @@ fail-closed design behaving correctly under a fault class the card was not even 
 
 ## Environment: two non-CAS reds that block an UNFILTERED `unit_tests_dbms` run (2026-07-29) {#unfiltered-unit-test-env-reds}
 
+USER RULINGS (2026-07-29 evening): (1) `contrib/silk` fiber assert — OUT OF SCOPE, ignore
+(no upstream action from this effort; keep the ASan exclusion filter). (2) root-owned
+`./logs` — DELETED by the user; unfiltered runs from the repo root are unblocked.
+CLOSED as attention items. Related audit note: `CANNOT_PARSE_INPUT_ASSERTION_FAILED` (28,170
+in `system.errors`, zero log lines) is EXPLAINED by the user — noise from `toDateTime(...)`
+inside `INSERT ... VALUES` (the fast VALUES parser fails on expressions and falls back to SQL
+evaluation, counting the error each time); not a defect, removed from the audit addendum's
+open questions.
+
 Neither is ours and neither affects the CA gate, which is filtered. Both were hit while running the
 convergence's ASan gate and are recorded so the next person does not re-diagnose them.
 
