@@ -1810,3 +1810,8 @@ a named 7b precondition. Arithmetic pass unaffected — T7 holds. Revert proof n
 **2026-07-29 08:40 local** — watchdog: T13 deep in flight — new suite green (SUITE_EXIT=0),
 full CA gate GREEN (GATE_EXIT=0, 242 suites), scratch-worktree revert build running (1.4MB
 log, live ninja) + main binary rebuild for the s3 lanes. Nothing wedged.
+**2026-07-29 08:5x local** — T13 DONE_WITH_CONCERNS (`00972f128b6`: 8 tests, gate 1548/1548,
+lanes 2/2+1/1, revert-proof RED 6/8 honestly classified). Controller rulings: brief's
+data-loss/leak edges were TRANSPOSED (ruled plan typo — mechanics-first arms accepted);
+setListOmissions on HintHoleBackendOn accepted conditional on single-mechanism; emu arm
+un-hooked per brief conditional; HidingListBackend convergence deferred. Review dispatched.
