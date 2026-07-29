@@ -145,6 +145,7 @@ class JobConfigs:
                 ArtifactNames.TGZ_AMD_RELEASE,
             ],
             runs_on=RunnerLabels.BUILDER_AMD,
+            timeout=3600 * 4,
         ),
         Job.ParamSet(
             parameter=BuildTypes.AMD_ASAN,
