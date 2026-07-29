@@ -154,12 +154,12 @@ namespace ExportPartitionUtils
         /// Only look at the parts being exported. These parts are guaranteed to map to a single partition.
         /// Parts that were later inserted shall be ignored
         const std::unordered_set<String> exported(exported_part_names.begin(), exported_part_names.end());
-        MergeTreeData::DataPartsVector exported_parts;
+        IMergeTreeDataPart::MinMaxIndex minmax;
         for (const auto & part : parts)
-            if (exported.contains(part->name) && part->minmax_idx && part->minmax_idx->initialized)
-                exported_parts.push_back(part);
+            if (exported.contains(part->name) && part->minmax_idx)
+                minmax.merge(*part->minmax_idx);
 
-        if (exported_parts.empty())
+        if (!minmax.initialized)
             throw Exception(ErrorCodes::NO_SUCH_DATA_PART,
                 "Cannot find any of the exported parts for partition_id '{}' to derive Iceberg partition "
                 "values. They may have been merged and cleaned up before this commit, or are not present "
@@ -171,32 +171,19 @@ namespace ExportPartitionUtils
         const auto minmax_column_names = MergeTreeData::getMinMaxColumnsNames(partition_key);
         const auto minmax_column_types = MergeTreeData::getMinMaxColumnsTypes(partition_key);
 
+        if (minmax.hyperrectangle.size() != minmax_column_types.size())
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "Cannot derive Iceberg partition values: the exported parts of partition '{}' hold min/max "
+                "statistics for {} columns, but the partition key has {}.",
+                partition_id, minmax.hyperrectangle.size(), minmax_column_types.size());
 
-        /// Grab the min/ max value from the partition. When the query was scheduled, we validated that
-        /// dst_expression(min) == dst_expression(max). Therefore, we can use only the min value, no need for the max.
+        /// When the query was scheduled, we validated that dst_expression(min) == dst_expression(max).
+        /// Therefore, we can use only the min value, no need for the max.
         Block block;
         for (size_t i = 0; i < minmax_column_types.size(); ++i)
         {
-            std::optional<Field> min_value;
-            for (const auto & part : exported_parts)
-            {
-                if (i >= part->minmax_idx->hyperrectangle.size())
-                    continue;
-                auto range = part->minmax_idx->hyperrectangle[i];
-                range.shrinkToIncludedIfPossible();
-                if (!min_value || range.left < min_value)
-                {
-                    min_value = range.left;
-                }
-            }
-
-            if (!min_value)
-                throw Exception(ErrorCodes::LOGICAL_ERROR,
-                    "Cannot derive Iceberg partition value: no min/max statistics for partition-key column "
-                    "'{}' in any exported part of partition '{}'.", minmax_column_names[i], partition_id);
-
             auto column = minmax_column_types[i]->createColumn();
-            column->insert(*min_value);
+            column->insert(minmax.hyperrectangle[i].left);
             block.insert(ColumnWithTypeAndName(column->getPtr(), minmax_column_types[i], minmax_column_names[i]));
         }
 
@@ -655,32 +642,6 @@ namespace
         return terms;
     }
 
-    std::optional<std::pair<Field, Field>> calculatePartitionColumnMinMax(
-        const MergeTreeData::DataPartsVector & parts, size_t slot)
-    {
-        std::optional<std::pair<Field, Field>> bounds;
-        for (const auto & part : parts)
-        {
-            if (!part->minmax_idx || !part->minmax_idx->initialized || slot >= part->minmax_idx->hyperrectangle.size())
-                continue;
-            auto range = part->minmax_idx->hyperrectangle[slot];
-            range.shrinkToIncludedIfPossible();
-            if (!bounds)
-            {
-                bounds.emplace(range.left, range.right);
-            }
-            else
-            {
-                if (range.left < bounds->first)
-                    bounds->first = range.left;
-                if (bounds->second < range.right)
-                    bounds->second = range.right;
-            }
-        }
-        return bounds;
-    }
-
-
     /// asserts that the source column maps to a single destination partition by checking the monotonicity on the min/max ranges
     void verifyColumnMapsToSinglePartition(
         const String & column,
@@ -690,7 +651,7 @@ namespace
         const Names & minmax_column_names,
         const DataTypes & minmax_column_types,
         const Block & destination_sample,
-        const MergeTreeData::DataPartsVector & parts,
+        const IMergeTreeDataPart::MinMaxIndex & minmax,
         const String & partition_id,
         const ContextPtr & context)
     {
@@ -709,12 +670,12 @@ namespace
                 "Cannot export partition: column '{}' is Nullable, so a NULL forms a separate destination "
                 "partition; partition the source by the matching destination partition expression.", column);
 
-        const auto bounds = calculatePartitionColumnMinMax(parts, slot);
-        if (!bounds)
+        if (!minmax.initialized || slot >= minmax.hyperrectangle.size())
             throw Exception(ErrorCodes::BAD_ARGUMENTS,
                 "Cannot export partition: no min/max statistics available for column '{}' in partition "
                 "'{}'; cannot validate partitioning.", column, partition_id);
-        const auto & [min_value, max_value] = *bounds;
+        const auto & min_value = minmax.hyperrectangle[slot].left;
+        const auto & max_value = minmax.hyperrectangle[slot].right;
 
         if (!destination_sample.has(column))
             throw Exception(ErrorCodes::BAD_ARGUMENTS,
@@ -825,13 +786,20 @@ namespace
         const auto minmax_column_types = MergeTreeData::getMinMaxColumnsTypes(source_partition_key);
         const auto destination_sample = destination_metadata->getSampleBlockNonMaterialized();
 
+        /// The bounds of the whole partition are the union of its parts' bounds, so fold them once here
+        /// rather than per term.
+        IMergeTreeDataPart::MinMaxIndex minmax;
+        for (const auto & part : parts)
+            if (part->minmax_idx)
+                minmax.merge(*part->minmax_idx);
+
         for (const auto & term : destination_terms)
         {
             if (sourceHasMatchingPartitionTerm(term, source_terms, minmax_column_names, minmax_column_types, destination_sample))
                 continue;
 
             verifyColumnMapsToSinglePartition(term.column, term.function, term.argument, term.time_zone,
-                minmax_column_names, minmax_column_types, destination_sample, parts, partition_id, context);
+                minmax_column_names, minmax_column_types, destination_sample, minmax, partition_id, context);
         }
     }
 }
