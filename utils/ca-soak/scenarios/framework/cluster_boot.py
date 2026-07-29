@@ -36,7 +36,7 @@ _VARIANT_FILE = {
     "s3listproxy": "docker-compose-s3faultproxy.yml",
     # S38: a published RustFS port (18121) for direct object-store injection (the late-PUT test).
     # It also used to raise materialization_grace_ms (T_mat); that setting is retired (Stage A task
-    # 12, `ff9f36a056f`) and the card is held for its T14 rewrite.
+    # 12, `ff9f36a056f`) and the card now asserts the epoch-seal fence instead of a wait.
     "s38": "docker-compose-s38.yml",
     # S36/S37: local+CA (and local+local+CA) multi-disk storage policies (ca_local / ca_local3)
     # alongside the same shared CA disk, for MOVE PART/PARTITION and policy-driven tiering tests.

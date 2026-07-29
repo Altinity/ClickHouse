@@ -1,72 +1,61 @@
-"""S38 unclean handover, recovery seal, and late-PUT injection (P0). RETIRED PREMISE — HELD FOR T14.
+"""S38 unclean handover and the late-PUT-loses fence (P0).
 
-THIS CARD CANNOT PASS AND FAILS AT ENTRY. Everything it asserts on (the T_mat wait and its log line,
-`unclean_epoch_boundary_seen`, the sentinel recovery seal, the LIST-based late-ref-log detector) was
-retired by Stage A tasks 6 and 12 — see `S38.RETIRED_PREMISE` below for the per-step mapping and the
-commits. The body is preserved verbatim as `_run_retired_body` because T14's rewrite (detection ->
-fence-held) needs to see what the card was actually testing; the description below is therefore a
-record of the OLD mechanism, not of current behaviour.
+**A fenced predecessor's PUT never materializes below coverage its successor has already declared.**
+That is the whole card. The injection shape is unchanged from the pre-Stage-A version — kill `ch1`
+mid append-storm, restart it, then push a dead-epoch `_log` object straight into the pool with
+`boto3`, exactly as a straggling out-of-band PUT from the dead predecessor would look on the wire —
+but what is asserted flipped from DETECTION to FENCING.
 
-End-to-end soak card for the rev.6 ref-lease-exclusivity plan (task 14, final task of the 14-task
-plan; tasks 1-13 landed through `c1693936a3f`). Exercises the whole unclean-handover story on a real
-2-node cluster against the built server binary:
+The old card asserted that a late log was *noticed*: a `materialization grace` wait in the log, an
+`unclean_epoch_boundary_seen` flag, a sentinel recovery seal, a `ref_late_log_detected` event from a
+LIST-based sweep. Stage A retired all four (tasks 6 and 12) and replaced the whole family with one
+in-band object: recovery closes a dead epoch by writing an `EpochSeal` at the exact log id the dying
+predecessor's next PUT would take, as a CONDITIONAL CREATE. Nothing waits and nothing is watched for,
+because the seal makes the late PUT *lose* rather than merely *visible*.
 
-  1. `kill -9` `ch1` mid append-storm, restart it. Assert from `system.text_log` on `ch1`: the
-     mount-claim OBSERVATION wait fires (`CasStore.cpp`'s `on_wait_start`, "a stale-looking mount
-     lease is held ... observing its write-token"), the `materialization_grace_ms` (T_mat) wait fires
-     ("... follows an unclean predecessor; waiting {} ms (materialization grace) ..."), and NO
-     `delete_pending retired entry recovered in-degree` sparing warning appears (`CasBlobInDegree.cpp`)
-     — that class of warning means a delete-pending entry's in-degree was recovered non-structurally,
-     which this clean unclean-recovery path must never trigger. A SEPARATE, quiesced
-     `docker restart` (graceful `SIGTERM`, `MountPriorState::Clean` farewell) must pay NO
-     `materialization grace` wait — the log line's absence is the assertion. This clean-restart check
-     runs LAST in the card (after steps 2/3 below), not here: `unclean_epoch_boundary_seen` is a flag
-     of the CURRENT live mount only (`CasStore.cpp:487`), so an intervening clean restart would mount
-     a fresh epoch with the flag false again and the step-2 seal would never publish.
+So the assertions are now about that seal, in three layers:
 
-  2. Recovery seal: the lazy per-namespace recovery (`CasStore.cpp` ~line 1227-1270) — because
-     `unclean_epoch_boundary_seen` was latched by the T_mat wait — publishes a recovery seal covering
-     `{my_epoch-1, MAX}` and increments the `CasRefRecoverySealPublished` ProfileEvent. In practice
-     this fires during ch1's own startup (table ATTACH already enumerates the CA table's committed
-     manifest set), strictly BEFORE `/ping` ever answers — confirmed empirically; this card asserts
-     the counter is nonzero on the freshly-restarted process rather than bracketing an explicit touch.
+  1. **It exists.** An unclean restart's recovery mints one per dead epoch it closes
+     (`CasRefRecoveryEpochSealed`), and this card reads the object back out of the pool and checks it
+     really is an `epoch_seal` transaction sitting at the top of the dead epoch's stream. A CLEAN
+     restart mints one too — sealing is decided by arithmetic (every epoch below the live one is
+     closed, however its mount died), not by an unclean-boundary flag, and the clean-restart step at
+     the end is what pins that. Its predecessor is the old card's "a clean stop/start pays no T_mat
+     wait" check, inverted by the same commit that deleted the wait.
 
-  3. Late-PUT injection: a dead-epoch `_log` object is injected DIRECTLY into the RustFS pool via
-     `boto3` (bypassing the writer entirely — this is what a straggling / out-of-band PUT from the
-     dead predecessor, arriving after the recovery seal was already published, looks like on the
-     wire). The injected object's `RefTxnId` is `{dead_epoch, huge_seq}`: same epoch as the sealed
-     region, a sequence number far above anything the storm could have allocated — so it is
-     `sealed_from < id <= seal.snapshot_id`, the exact `reportLateLogsIfAny` (`CasOrphanManifestSweep.cpp`
-     :108-150) "T_mat violation" classification. Driving GC exercises `runManifestSweepCursorPass`
-     (`CasGc.cpp:1343`) -> `sweepManifestCursorPage` -> `activeManifestKeys` ->
-     `reportLateLogsIfAny`, which must emit exactly one `ref_late_log_detected` CA-log event and
-     NEVER apply the injected log's (zero) ops to live state — the resurrect invariant
-     ([[feedback_ca_resurrect_invariant]]) for ref-log txns, not just blobs. The table's checksum is
-     asserted unchanged by the injection ("queries return only sealed truth").
+  2. **It wins the slot.** The straggler's PUT is replayed with the same primitive the writer uses, a
+     conditional create at the id the seal took, and must be REFUSED by the store. This is the fence
+     itself, tested at the level where it lives: a plain overwrite would prove nothing, since no
+     protocol survives a store that lets one client clobber another's committed object.
 
-  NOTE on timing vs. the literal task brief: the brief describes injecting "while the successor is
-  inside its T_mat wait". Reading `Store::open` (`CasStore.cpp:480-494`) and the lazy per-namespace
-  seal (`CasStore.cpp:1227-1270`) together shows T_mat is specifically the window during which a
-  late predecessor PUT is safely ABSORBED into the recovery LIST (born-covered, no anomaly) — an
-  object landing DURING that window is exactly what T_mat exists to make safe, not a violation.
-  `reportLateLogsIfAny` only fires for a log whose id is ABOVE `sealed_from`, i.e. one that lands
-  AFTER the per-namespace recovery LIST already ran (which happens lazily, on first touch, strictly
-  AFTER `Store::open` and its T_mat wait return). This card therefore injects AFTER the first
-  post-restart touch (once the seal is durable, confirmed via `CasRefRecoverySealPublished` and a
-  direct pool listing) rather than literally during the mount-time wait — that is the only timing
-  that can mechanically produce a `RefLateLogDetected` event, per the cited source. The long T_mat
-  configured for this variant (`docker-compose-s38.yml`, 45s vs the 30s default) is kept anyway so
-  step 1's wait assertions are long and unambiguous in the logs.
+  3. **It covers the region above it.** A raw, unconditional PUT then lands at
+     `{dead_epoch, huge_seq}` — inside the sealed region, above the seal, where nothing legitimate can
+     ever be. This is the out-of-band materialization the invariant is really about, and the assertion
+     is that it has NO observable effect: the table's checksum does not move, the replicas still
+     agree, a full restart re-recovers the namespace from the durable stream with the object sitting
+     there and still returns the same data, and the counters that carry "a durable transaction went
+     missing" / "the fold advanced past work" / "the stream stopped being dense"
+     (`CasRefApplyPoisoned`, `CasGcUnappliedFoldedTxns`, `CasRefRecoveryStreamHole`) all stay at zero
+     across driven GC rounds. The recovery walk reads the dead epoch by exact key, meets the seal and
+     advances to the next epoch, so an id above the seal is unreachable by construction — the
+     injected object is not "tolerated", it is not on any path.
 
-  4. Regression sweep (driven by the caller as a separate step, not by this card): S13/S15/S18 once
-     each on a fresh cluster, since this plan touched the fence/remount and shard-lifecycle paths
-     those cards exercise.
+The one mechanism from the old card that Stage A did NOT retire is the mount-claim OBSERVATION wait,
+and step 1 still asserts it: an unclean predecessor's lease is observed rather than assumed dead.
+
+The injected body is built by taking a real ref-log object the server itself wrote in that epoch and
+rewriting only its sequence number, then dropping the ops. That keeps the card honest about a wire
+format it does not own — everything but `rs` comes from a body the product produced — while an
+op-count of zero means the transaction can never poison a real later fold even if some path does GET
+and decode it (`manifestEdgesOfTxn` of an empty op list is empty). The body duplicates the id, and
+`decodeRefLogTxn` rejects a body whose id does not match the key it was read from, which is why the
+rewrite is necessary rather than a verbatim copy.
 
 Dev scale is deliberately small (a couple dozen small inserts) so a developer run finishes in a few
-minutes despite the long T_mat wait baked into the `s38` compose variant; ci/full scale up the storm.
+minutes; ci/full scale up the storm.
 """
 
-import struct
+import json
 import threading
 import time
 
@@ -85,34 +74,56 @@ _S3_ENDPOINT = "http://localhost:18121"
 _S3_BUCKET = "test"
 _POOL_PREFIX = "soak_pool"   # matches observe.POOL_DIR / storage_conf.xml's endpoint sub-path
 
-# One below the seal's own `std::numeric_limits<uint64_t>::max()` sentinel (`CasStore.cpp:1241`) —
-# comfortably above anything a dev-scale storm could allocate as a real `ref_sequence`, while still
-# satisfying `id <= seal.snapshot_id` (same epoch, ordinal component below the MAX sentinel).
+# Far above anything a dev-scale storm could allocate as a real `ref_sequence`, so the injected object
+# is unambiguously INSIDE the region the seal closed and above every real transaction in it. One below
+# the u64 maximum, which several code paths use as an open-ended sentinel.
 _HUGE_SEQ = 0xFFFFFFFFFFFFFFFE
 
+# Counters that carry the violation half of the invariant. Each is documented in `ProfileEvents.cpp`
+# as always-zero; the soak driver gates on the same three (`soak/signals.py`
+# LATE_PUT_VIOLATION_NOTES), and this card asserts them around the injection specifically.
+_VIOLATION_EVENTS = ("CasRefApplyPoisoned", "CasGcUnappliedFoldedTxns", "CasRefRecoveryStreamHole")
 
-# ---------------------------------------------------------------------------
-# RefLogTxn wire encoding (CasRefLogCodec.cpp encodeRefLogTxn/decodeRefLogTxn):
-#   u32 format_version=1 | u32 ns_len + ns bytes | u64 writer_epoch | u64 ref_sequence | u32 op_count
-# little-endian throughout; op_count=0 is a fully valid, decodable, side-effect-free transaction (no
-# RefOp is written) — chosen deliberately so the injected object can never poison a REAL later fold
-# (manifestEdgesOfTxn of an empty op list is empty) even though several GC/orphan-sweep code paths do
-# GET+decode any log above their cursor.
-# ---------------------------------------------------------------------------
-
-def _encode_ref_log_txn(ns: str, writer_epoch: int, ref_sequence: int) -> bytes:
-    ns_b = ns.encode()
-    out = struct.pack("<I", 1)                      # format_version
-    out += struct.pack("<I", len(ns_b)) + ns_b       # ns (len-prefixed)
-    out += struct.pack("<Q", writer_epoch)
-    out += struct.pack("<Q", ref_sequence)
-    out += struct.pack("<I", 0)                      # op_count = 0
-    return out
+_REF_LEAF_NAMES = {"_log", "_snap", "_cleanup"}
 
 
 def _render_ref_txn_id(writer_epoch: int, ref_sequence: int) -> str:
     """Mirrors `renderRefTxnId` (CasRefIds.h): two 16-digit lowercase hex fields joined by '-'."""
     return f"{writer_epoch:016x}-{ref_sequence:016x}"
+
+
+def _parse_ref_txn_id(leaf: str):
+    """Inverse of `_render_ref_txn_id`. Returns `(writer_epoch, ref_sequence)` or None."""
+    parts = leaf.split("-")
+    if len(parts) != 2 or not all(len(p) == 16 for p in parts):
+        return None
+    try:
+        return int(parts[0], 16), int(parts[1], 16)
+    except ValueError:
+        return None
+
+
+def _restamp_ref_log_txn(body: bytes, ref_sequence: int) -> bytes:
+    """Rewrite a real ref-log object's sequence number and strip its ops.
+
+    The format is line-oriented JSON (`CasTextFormat.cpp`): a header line, a meta line carrying
+    `ns`/`we`/`rs` (u64 as decimal STRINGS, `readU64String`), then one line per op, then a trailer
+    `{"n": <op count>}`. Only `rs` and the op list change here, so the header (with its compatibility
+    version) and the namespace come from a body the server wrote — this card does not encode the
+    format, it edits one field of it.
+    """
+    lines = body.decode().splitlines()
+    if len(lines) < 3:
+        raise ValueError(f"ref-log body has {len(lines)} lines, expected at least 3 (header/meta/trailer)")
+    meta = json.loads(lines[1])
+    if "rs" not in meta or "ns" not in meta or "we" not in meta:
+        raise ValueError(f"ref-log meta line lacks ns/we/rs: {lines[1][:200]}")
+    meta["rs"] = str(ref_sequence)
+    # `!pse` is a chain link, legal only at sequence 1; the restamped id is not sequence 1, so a
+    # copied link would be rejected by the seal grammar for a reason unrelated to this card.
+    meta.pop("!pse", None)
+    meta.pop("!pss", None)
+    return ("\n".join([lines[0], json.dumps(meta, separators=(",", ":")), '{"n":0}']) + "\n").encode()
 
 
 def _s3_client():
@@ -129,16 +140,26 @@ def _list_common_prefixes(s3, prefix: str) -> list:
     return [p["Prefix"] for p in resp.get("CommonPrefixes", [])]
 
 
+def _list_keys(s3, prefix: str) -> list:
+    keys = []
+    token = None
+    while True:
+        kw = {"Bucket": _S3_BUCKET, "Prefix": prefix}
+        if token:
+            kw["ContinuationToken"] = token
+        resp = s3.list_objects_v2(**kw)
+        keys += [o["Key"] for o in resp.get("Contents", [])]
+        if not resp.get("IsTruncated"):
+            return keys
+        token = resp.get("NextContinuationToken")
+
+
 # `RootNamespace` is per-SERVER (`server_root_id`, e.g. "ca_soak_ch1"), not per-table: a bare
 # `cas/refs/<server_root_id>/` LIST shows only ONE child, "store/" — the actual per-table namespace
-# nests further, `store/<uuid-shard3>/<uuid>@cas@/`, ending in the `_log`/`_snap`/`_cleanup` siblings
-# (confirmed empirically against a live pool: `cas/refs/ca_soak_ch1/store/b73/<uuid>@cas@/_log/`).
+# nests further, `store/<uuid-shard3>/<uuid>@cas@/`, ending in the `_log`/`_snap`/`_cleanup` siblings.
 # Walk down while each level has exactly one child (true for a single-table pool) until a level's
 # children include one of the three ref-object leaf names; that walked path IS the namespace string
 # `refsNamespacePrefix` expects. Returns None (ambiguous/unexpected shape) rather than guessing.
-_REF_LEAF_NAMES = {"_log", "_snap", "_cleanup"}
-
-
 def _discover_table_namespace(s3, server_root_id: str, max_depth: int = 8):
     cur = f"{_POOL_PREFIX}/cas/refs/{server_root_id}/"
     for _ in range(max_depth):
@@ -165,10 +186,24 @@ def _text_log_count(node, since: str, needle: str) -> int:
         return -1   # probe failure is distinct from a genuine 0 — caller treats <0 as inconclusive
 
 
+def _violation_counters(cluster) -> dict:
+    """Peak value of each always-zero counter across the cluster. A node that cannot be read is
+    skipped rather than counted as zero."""
+    peak = {e: 0 for e in _VIOLATION_EVENTS}
+    for node in cluster.nodes():
+        try:
+            ev = observe.events_snapshot(node)
+        except Exception:
+            continue
+        for e in _VIOLATION_EVENTS:
+            peak[e] = max(peak[e], int(ev.get(e, 0) or 0))
+    return peak
+
+
 @register
 class S38(Scenario):
     name = "S38"
-    title = "unclean handover, recovery seal, late-PUT injection"
+    title = "unclean handover: the epoch seal makes a late predecessor PUT lose"
     priority = "P0"
     compose_variant = "s38"
     param_table = {
@@ -177,39 +212,10 @@ class S38(Scenario):
         "ci": {"storm_inserts": 60, "rows_per_insert": 300, "payload_bytes": 1024,
                "kill_delay_s": 2.0, "kill_down_s": 4, "heal_timeout_s": 240},
         "full": {"storm_inserts": 150, "rows_per_insert": 1000, "payload_bytes": 2048,
-                  "kill_delay_s": 3.0, "kill_down_s": 5, "heal_timeout_s": 300},
+                 "kill_delay_s": 3.0, "kill_down_s": 5, "heal_timeout_s": 300},
     }
 
-    # The premise this card was written against no longer exists. Raised as the FIRST statement of
-    # `run`, before the card touches the cluster: the runner turns a raised exception into a FAIL, so
-    # this is loud and it is not a skip. It is deliberately NOT `needs_infra` (that yields
-    # INCONCLUSIVE, i.e. a silent skip, which the house rule forbids) and deliberately not a late
-    # assertion — a card that boots, runs a storm, restarts a node and only then fails on a log line
-    # that can never appear reads like a product bug, which is a worse state than failing at entry.
-    RETIRED_PREMISE = (
-        "S38's premise was retired by Stage A. This card asserts on mechanisms that no longer exist, "
-        "so it CANNOT pass and must not be read as a product failure:\n"
-        "  - the `materialization grace` (T_mat) LOG_INFO line of step 1 — the wait itself, and its "
-        "`materialization_grace_ms` setting, were retired OUTRIGHT by Stage A task 12 "
-        "(`ff9f36a056f`); recovery fences a dying epoch's straggler with an in-band EpochSeal "
-        "written as a conditional create instead of waiting for it;\n"
-        "  - `unclean_epoch_boundary_seen`, the flag step 1 latches and step 2 depends on — retired "
-        "by the same commit (sealing is decided by arithmetic: every epoch below the live one is "
-        "closed, however its mount died);\n"
-        "  - `CasRefRecoverySealPublished` and the sentinel recovery seal of step 2 — retired "
-        "EARLIER, by Stage A task 6 (`6f06ba05815`);\n"
-        "  - `reportLateLogsIfAny` / the `ref_late_log_detected` event of step 3 — the LIST-based "
-        "late-ref-log detector, retired by task 6's `d74c726ef9e`.\n"
-        "So this card was already broken before task 12; task 12 only moved the failure earlier. "
-        "The rewrite (detection -> fence-held) is T14's; until then this entry guard is the "
-        "disposition. Do not 'fix' it by deleting assertions — the scenario it describes still needs "
-        "an equivalent, and T14 owes it."
-    )
-
     def run(self, ctx, result):
-        raise RuntimeError(self.RETIRED_PREMISE)
-
-    def _run_retired_body(self, ctx, result):
         cl = ctx.cluster
         p = ctx.params
         storm_inserts = int(p["storm_inserts"])
@@ -221,9 +227,9 @@ class S38(Scenario):
         result.observations["scale"] = {
             "storm_inserts": storm_inserts, "rows_per_insert": rows, "payload_bytes": payload,
             "note": "DEV-scale: a couple dozen small inserts before the kill; ci/full scale up the "
-                    "storm. The T_mat wait itself (45s, docker-compose-s38.yml) is FIXED across "
-                    "scales — it is a config knob of the variant, not a workload-size parameter.",
-        }
+                    "storm. Nothing in this card waits on a timer any more — the fence is an object, "
+                    "not a grace period — so scale only changes how much real stream the dead epoch "
+                    "has under its seal."}
 
         sql.create_ca_table(cl.node1, _TABLE, columns="id UInt64, payload String", order_by="id",
                             wide=True)
@@ -231,7 +237,8 @@ class S38(Scenario):
                             wide=True)
 
         # =====================================================================================
-        # Step 1: kill -9 ch1 mid append-storm, restart, assert observation + T_mat wait lines.
+        # Step 1: kill -9 ch1 mid append-storm, restart. The dying epoch leaves a stream that ends
+        # wherever the kill landed — which is what gives the successor a dead epoch to close.
         # =====================================================================================
         since_kill = cl.node1.scalar("SELECT toString(now())")
         stop = threading.Event()
@@ -262,19 +269,17 @@ class S38(Scenario):
         result.add(Verdict.check(
             "ch1 recovers after kill -9", "healthy within heal_timeout_s",
             f"healthy={healthy}", healthy,
-            "" if healthy else "ch1 did not answer /ping within the heal timeout — the T_mat wait "
-                               "(45s) plus observation wait must both fit inside it"))
+            "" if healthy else "ch1 did not answer /ping within the heal timeout"))
         if not healthy:
-            # Cannot proceed meaningfully; still run the common end checkpoint so the pool is left
-            # observable, and stop here (every remaining verdict would be spurious).
             _common.standard_end(ctx, result, [_TABLE])
             return
 
+        # The one mechanism of the pre-Stage-A card that was NOT retired: the successor OBSERVES the
+        # stale-looking lease's write-token rather than assuming its holder is dead.
         obs_n = _text_log_count(cl.node1, since_kill, "stale-looking mount lease")
-        tmat_n = _text_log_count(cl.node1, since_kill, "materialization grace")
         sparing_n = _text_log_count(cl.node1, since_kill, "delete_pending retired entry recovered in-degree")
         result.observations["unclean_restart_log_counts"] = {
-            "observation_wait": obs_n, "t_mat_wait": tmat_n, "in_degree_sparing_warning": sparing_n}
+            "observation_wait": obs_n, "in_degree_sparing_warning": sparing_n}
         result.add(Verdict.check(
             "observation wait line appears (unclean restart)",
             ">0 'stale-looking mount lease' rows in system.text_log since kill",
@@ -282,186 +287,179 @@ class S38(Scenario):
             "" if obs_n > 0 else "ch1's restart did not log the mount-claim observation wait — "
                                  "either the predecessor's death looked clean, or the log is missing"))
         result.add(Verdict.check(
-            "T_mat (materialization grace) wait line appears (unclean restart)",
-            ">0 'materialization grace' rows in system.text_log since kill",
-            tmat_n, tmat_n > 0,
-            "" if tmat_n > 0 else "ch1's restart did not pay/log the T_mat wait after an unclean kill"))
-        result.add(Verdict.check(
             "no in-degree sparing warning (delete_pending retired entry recovered)",
             "0 'delete_pending retired entry recovered in-degree' rows",
             sparing_n, sparing_n == 0,
             "" if sparing_n == 0 else "the unclean-handover recovery triggered a "
-                                     "delete_pending/in-degree sparing warning — unexpected on a "
-                                     "clean append-storm kill with no prior GC condemnation"))
-
-        # NOTE on ordering: the clean stop/start check (below, "must pay no T_mat wait") is
-        # deliberately run AFTER step 2, not here. `unclean_epoch_boundary_seen` is a flag of the
-        # CURRENT live mount (CasStore.cpp:487), latched true only by THIS restart's unclean
-        # predecessor observation; a further clean restart in between would mount a fresh epoch with
-        # the flag false again, and the lazy per-namespace seal (gated on that flag,
-        # CasStore.cpp:1245) would then never publish when the table is first touched. Step 2 must
-        # therefore touch the table while still on the epoch this unclean restart just mounted.
+                                      "delete_pending/in-degree sparing warning — unexpected on a "
+                                      "clean append-storm kill with no prior GC condemnation"))
 
         # =====================================================================================
-        # Step 2: recovery seal, then late-PUT injection + sweep assertion (still on the epoch this
-        # unclean restart just mounted — see the ordering note above).
+        # Step 2: the seal exists. Touching the table drives the lazy per-namespace recovery, whose
+        # CAS-walk closes every epoch below the live one.
         # =====================================================================================
-        # `CasRefRecoverySealPublished` is a ProfileEvents counter -- reset to 0 whenever the server
-        # process restarts (system.events is in-memory, per-process). A first dry run bracketing an
-        # explicit post-healthy touch (before/after around a manual SELECT) found the counter ALREADY
-        # at 1 on the "before" side: table ATTACH during ch1's own startup (loading its databases and
-        # tables, which requires enumerating this CA-backed MergeTree's committed manifest set)
-        # already triggers the lazy per-namespace ref recovery, BEFORE the HTTP server even opens for
-        # `/ping`. So the right assertion is simply "the freshly-restarted process's counter is > 0"
-        # -- there is no meaningful "before" to bracket against once the process has restarted.
         pre_inject_checksum = cl.node1.query(sql.table_checksum_query(_TABLE)).strip()
-        seal_events_after = observe.events_snapshot(cl.node1).get("CasRefRecoverySealPublished", 0)
-        seal_published = seal_events_after > 0
-        result.observations["recovery_seal"] = {"CasRefRecoverySealPublished": seal_events_after}
+        sealed = observe.events_snapshot(cl.node1).get("CasRefRecoveryEpochSealed", 0)
+        result.observations["recovery_seal"] = {"CasRefRecoveryEpochSealed": sealed}
         result.add(Verdict.check(
-            "recovery seal published by the unclean restart",
-            "CasRefRecoverySealPublished > 0 (system.events, fresh since this process's start)",
-            seal_events_after, seal_published,
-            "" if seal_published else "no CasRefRecoverySealPublished increment since ch1 restarted "
-                                      "— either the unclean-epoch boundary was not latched, or the "
-                                      "table's dead region was empty (the storm inserts never landed)"))
-
-        if not seal_published:
-            # Nothing to inject against meaningfully; record why and skip straight to the common end.
-            result.add(Verdict.inconclusive(
-                "RefLateLogDetected fires for an injected dead-epoch late log",
-                ">0 ref_late_log_detected CA-log events after injection + driven GC",
-                "no recovery seal was published — skipping the injection (it targets the sealed "
-                "region and has nothing to be 'late' relative to)"))
+            "the unclean restart's recovery sealed the dead epoch",
+            "CasRefRecoveryEpochSealed > 0 (system.events, fresh since this process's start)",
+            sealed, sealed > 0,
+            "" if sealed > 0 else "no epoch seal was minted since ch1 restarted — the CAS-walk closes "
+                                  "every epoch below the live one by arithmetic, so a zero here means "
+                                  "the walk never ran or the namespace has no dead epoch at all"))
+        if not sealed:
             _common.standard_end(ctx, result, [_TABLE])
             return
 
         s3 = _s3_client()
-        # RootNamespace is per-SERVER (server_root_id="ca_soak_ch1" for ch1, storage_conf_s38_ch1.xml)
-        # with the per-table path nested underneath it — walk down to the actual ref-object leaf.
         ns = _discover_table_namespace(s3, "ca_soak_ch1")
         result.observations["discovered_namespace"] = ns
         if ns is None:
             result.add(Verdict.inconclusive(
                 "namespace discovered for injection",
                 "a walk from cas/refs/ca_soak_ch1/ reaches a _log/_snap/_cleanup leaf",
-                "namespace walk did not resolve to an unambiguous single leaf (see cas/refs/ "
-                "listing in the run log)"))
+                "namespace walk did not resolve to an unambiguous single leaf"))
             _common.standard_end(ctx, result, [_TABLE])
             return
 
-        manifest_prefixes = _list_common_prefixes(s3, f"{_POOL_PREFIX}/cas/manifests/{ns}/")
-        epochs = []
-        for mp in manifest_prefixes:
-            leaf = mp.rstrip("/").rsplit("/", 1)[-1]
-            if "-" in leaf:
-                hi = leaf.split("-", 1)[0]
-                try:
-                    epochs.append(int(hi, 16))
-                except ValueError:
-                    pass
-        dead_epoch = min(epochs) if epochs else None
-        result.observations["manifest_build_prefixes"] = manifest_prefixes
-        result.observations["dead_epoch"] = dead_epoch
-        if dead_epoch is None:
+        log_prefix = f"{_POOL_PREFIX}/cas/refs/{ns}/_log/"
+        ids = [i for i in (_parse_ref_txn_id(k[len(log_prefix):]) for k in _list_keys(s3, log_prefix))
+               if i is not None]
+        epochs = sorted({e for e, _ in ids})
+        result.observations["ref_log_epochs"] = epochs
+        if len(epochs) < 2:
             result.add(Verdict.inconclusive(
-                "dead epoch discovered for injection", "at least one cas/manifests/<ns>/<epoch>-.../ prefix",
-                f"none found under manifests for ns={ns!r}: {manifest_prefixes}"))
+                "a dead epoch exists to be sealed",
+                ">= 2 writer epochs in the ref-log stream (one dead, one live)",
+                f"epochs present: {epochs} — the storm did not span the restart"))
             _common.standard_end(ctx, result, [_TABLE])
             return
 
+        dead_epoch = epochs[0]
+        seal_seq = max(s for e, s in ids if e == dead_epoch)
+        seal_id = _render_ref_txn_id(dead_epoch, seal_seq)
+        seal_key = f"{log_prefix}{seal_id}"
+        seal_body = s3.get_object(Bucket=_S3_BUCKET, Key=seal_key)["Body"].read()
+        is_seal = b'"epoch_seal"' in seal_body
+        result.observations["seal"] = {
+            "dead_epoch": dead_epoch, "seal_txn_id": seal_id, "key": seal_key,
+            "body": seal_body.decode(errors="replace")[:400]}
+        result.add(Verdict.check(
+            "the top of the dead epoch's stream IS an epoch seal",
+            "the object at the dead epoch's highest ref-log id carries an `epoch_seal` op",
+            f"{seal_id} -> {seal_body[:120]!r}", is_seal,
+            "" if is_seal else "the highest id of the dead epoch is an ordinary transaction, not a "
+                               "seal — the epoch was never closed, so nothing fences a straggler"))
+
+        # =====================================================================================
+        # Step 3: the seal WINS THE SLOT. Replay the straggler's PUT with the writer's own primitive.
+        # =====================================================================================
+        straggler_body = _restamp_ref_log_txn(seal_body, seal_seq)
+        refused = None
+        try:
+            s3.put_object(Bucket=_S3_BUCKET, Key=seal_key, Body=straggler_body, IfNoneMatch="*")
+            refused = False
+        except Exception as e:
+            code = getattr(e, "response", {}).get("Error", {}).get("Code", type(e).__name__)
+            status = getattr(e, "response", {}).get("ResponseMetadata", {}).get("HTTPStatusCode")
+            refused = True
+            result.observations["conditional_create_refusal"] = {"code": code, "http_status": status}
+        result.add(Verdict.check(
+            "a straggler's conditional create at the sealed id is REFUSED",
+            "the store rejects a create at an id the seal already occupies",
+            f"refused={refused} ({result.observations.get('conditional_create_refusal')})", refused,
+            "" if refused else "the conditional create SUCCEEDED at the sealed id — either it "
+                               "overwrote the seal or the store is not honouring the precondition; "
+                               "the whole fence rests on this being impossible"))
+        after_refusal = s3.get_object(Bucket=_S3_BUCKET, Key=seal_key)["Body"].read()
+        result.add(Verdict.check(
+            "the seal object is byte-for-byte unchanged by the refused create",
+            "GET of the sealed id returns exactly the seal that was there before",
+            f"{len(after_refusal)} bytes, identical={after_refusal == seal_body}",
+            after_refusal == seal_body,
+            "" if after_refusal == seal_body else "the seal's bytes CHANGED — the late PUT won"))
+
+        # =====================================================================================
+        # Step 4: the seal COVERS THE REGION ABOVE IT. A raw PUT lands above the seal, inside the
+        # closed epoch, and must be inert: the walk meets the seal and advances, so this id is on no
+        # path at all.
+        # =====================================================================================
         injected_id = _render_ref_txn_id(dead_epoch, _HUGE_SEQ)
-        injected_key = f"{_POOL_PREFIX}/cas/refs/{ns}/_log/{injected_id}"
-        injected_body = _encode_ref_log_txn(ns, dead_epoch, _HUGE_SEQ)
-        ctx.log(f"S38: injecting dead-epoch late log at s3://{_S3_BUCKET}/{injected_key} "
-                f"({len(injected_body)} bytes)")
+        injected_key = f"{log_prefix}{injected_id}"
+        injected_body = _restamp_ref_log_txn(seal_body, _HUGE_SEQ)
+        ctx.log(f"S38: injecting a late dead-epoch log ABOVE the seal at "
+                f"s3://{_S3_BUCKET}/{injected_key} ({len(injected_body)} bytes)")
         s3.put_object(Bucket=_S3_BUCKET, Key=injected_key, Body=injected_body)
-        result.observations["injected_log"] = {"ns": ns, "key": injected_key, "txn_id": injected_id}
+        result.observations["injected_log"] = {
+            "ns": ns, "key": injected_key, "txn_id": injected_id,
+            "body": injected_body.decode(errors="replace")}
 
         since_inject = cl.node1.scalar("SELECT toString(now())")
-        # Attempt-2 (2026-07-14 run 20260714T115429) found this loop drove GC ONLY on node_index=0
-        # (ch1) — but ch1 was NotALeader for the CA GC lease across the entire run (ch2 held it
-        # throughout, confirmed via `system.content_addressed_garbage_collection_log`: 339/339 ch1
-        # attempts NotALeader). Drive BOTH nodes every cycle so whichever actually holds the lease
-        # makes progress, and track REAL successful-round count (not just "attempts issued") for a
-        # round-completion-aware budget instead of a bare wall-clock cutoff.
-        late_log_count = 0
-        attempts = 0
-        real_rounds_seen = 0
-        deadline = time.monotonic() + 240
-        min_real_rounds = 5   # keep polling until we've observed this many real Success rounds pool-wide
-        while time.monotonic() < deadline:
+        violations_before = _violation_counters(cl)
+        for _ in range(3):
             for idx in range(len(cl.nodes())):
                 gc_mod.gc_drive_round(cl, log_fn=ctx.log, node_index=idx)
-            attempts += 1
-            gc_all = observe.gc_log_all(cl, since_inject)
-            real_rounds_seen = gc_all.get("summary", {}).get("success", 0)
-            ca_events = observe.ca_event_counts_all(cl, since_inject)
-            late_log_count = sum(
-                int(c.get("by_event_type", {}).get("ref_late_log_detected", 0) or 0)
-                for c in ca_events.get("per_node", {}).values())
-            if late_log_count > 0:
-                break
-            if real_rounds_seen >= min_real_rounds and attempts >= min_real_rounds:
-                break   # gave the sweep a generous, confirmed number of real rounds; stop waiting
-            time.sleep(6)
-        result.observations["late_log_detection"] = {
-            "poll_attempts": attempts, "real_success_rounds_since_inject": real_rounds_seen,
-            "count": late_log_count}
+        gc_summary = observe.gc_log_all(cl, since_inject).get("summary", {})
+        violations_after = _violation_counters(cl)
+        moved = {e: violations_after[e] - violations_before[e]
+                 for e in _VIOLATION_EVENTS if violations_after[e] > violations_before[e]}
+        result.observations["violation_counters"] = {
+            "before": violations_before, "after": violations_after, "gc_rounds": gc_summary}
         result.add(Verdict.check(
-            "RefLateLogDetected fires for an injected dead-epoch late log",
-            ">0 ref_late_log_detected CA-log events after injection + driven GC",
-            late_log_count, late_log_count > 0,
-            "" if late_log_count > 0 else
-            f"no ref_late_log_detected event after {attempts} poll cycles driving both nodes "
-            f"({real_rounds_seen} confirmed real Success rounds pool-wide since injection) — the "
-            "manifest sweep cursor pass did not report the injected id as late within this budget; "
-            "see reportLateLogsIfAny, CasOrphanManifestSweep.cpp. If this reproduces with a confirmed "
-            "healthy multi-round GC leader window, treat as a product observation (a structurally "
-            "narrow/slow detection window), not a card defect — do not keep re-extending the budget"))
-
-        tmat_violation_n = _text_log_count(cl.node1, since_inject, "CAS T_mat violation")
-        result.observations["t_mat_violation_log_rows"] = tmat_violation_n
-        result.add(Verdict(
-            "T_mat violation warning logged", "'CAS T_mat violation' row corroborates the CA-log event",
-            tmat_violation_n, "pass" if tmat_violation_n > 0 else "inconclusive",
-            "" if tmat_violation_n > 0 else "no corroborating text_log row (non-fatal; the CA-log "
-                                            "event above is the authoritative assertion)"))
+            "no always-zero counter moved across the injection and driven GC",
+            f"all of {', '.join(_VIOLATION_EVENTS)} unchanged",
+            moved or "unchanged", not moved,
+            "" if not moved else f"counters moved: {moved} — a durable transaction went missing, the "
+                                 "fold advanced past work, or the stream stopped being dense"))
 
         post_inject_checksum = cl.node1.query(sql.table_checksum_query(_TABLE)).strip()
         unaffected = post_inject_checksum == pre_inject_checksum
         result.observations["checksums"] = {
             "pre_inject": pre_inject_checksum, "post_inject": post_inject_checksum}
         result.add(Verdict.check(
-            "queries return only sealed truth (injection has no observable effect)",
+            "queries return only sealed truth (the injection has no observable effect)",
             "table checksum unchanged by the injected dead-epoch log",
             f"pre={pre_inject_checksum!r} post={post_inject_checksum!r}", unaffected,
-            "" if unaffected else "the table's queryable state CHANGED after injecting a dead-epoch "
-                                  "log — it must never be applied/revived (resurrect invariant)"))
-
+            "" if unaffected else "the table's queryable state CHANGED after injecting a log above "
+                                  "the seal — it must never be applied (resurrect invariant)"))
         _common.assert_replicas_agree(result, cl, sql.table_checksum_query(_TABLE),
-                                      name="S38 replica agreement")
+                                      name="S38 replica agreement after injection")
 
         # =====================================================================================
-        # Step 1 (continued): clean stop/start pays NO T_mat wait. Run LAST (see the ordering note
-        # above step 2) — the injected late log has already been swept-and-reported by now, so a
-        # further mount here cannot disturb those assertions.
+        # Step 5: a CLEAN restart seals too, and re-recovers from the durable stream with the injected
+        # object present. Sealing is arithmetic — every epoch below the live one is closed, however
+        # its mount died — so this step is the inverted successor of the old card's "a clean stop/start
+        # pays no T_mat wait", which died with the wait itself.
         # =====================================================================================
-        since_clean = cl.node1.scalar("SELECT toString(now())")
-        ctx.log("S38: graceful `docker restart` ch1 (clean farewell) — must pay no T_mat wait")
+        ctx.log("S38: graceful `docker restart` ch1 — re-recovers with the injected object in place")
         apply_fault(Fault(t_offset=0, target=FaultTarget.CH1, action=FaultAction.RESTART, duration_s=0))
         healthy_clean = cluster_boot.wait_healthy(cl, timeout_s=heal_timeout_s, log_fn=ctx.log)
-        clean_tmat_n = _text_log_count(cl.node1, since_clean, "materialization grace") if healthy_clean else -1
-        result.observations["clean_restart"] = {"healthy": healthy_clean, "t_mat_wait_rows": clean_tmat_n}
         result.add(Verdict.check(
-            "clean stop/start pays no T_mat wait", "0 'materialization grace' rows since the clean restart",
-            clean_tmat_n, clean_tmat_n == 0,
-            "" if clean_tmat_n == 0 else
-            ("clean restart did not become healthy" if not healthy_clean else
-             "a graceful docker restart still paid the T_mat wait — the drained clean-release "
-             "farewell (Task 5) should make MountPriorState::Clean, skipping the wait entirely")))
+            "ch1 recovers after a clean restart", "healthy within heal_timeout_s",
+            f"healthy={healthy_clean}", healthy_clean, ""))
         if not healthy_clean:
             _common.standard_end(ctx, result, [_TABLE])
             return
+
+        rerecovered_checksum = cl.node1.query(sql.table_checksum_query(_TABLE)).strip()
+        still_unaffected = rerecovered_checksum == pre_inject_checksum
+        clean_sealed = observe.events_snapshot(cl.node1).get("CasRefRecoveryEpochSealed", 0)
+        result.observations["clean_restart"] = {
+            "healthy": healthy_clean, "CasRefRecoveryEpochSealed": clean_sealed,
+            "checksum": rerecovered_checksum}
+        result.add(Verdict.check(
+            "re-recovery from the durable stream still ignores the injected log",
+            "checksum after a full restart equals the pre-injection checksum",
+            f"pre={pre_inject_checksum!r} re-recovered={rerecovered_checksum!r}", still_unaffected,
+            "" if still_unaffected else "a from-scratch recovery ABSORBED the injected log — the "
+                                        "seal did not cover the region above it"))
+        result.add(Verdict.check(
+            "a CLEAN restart seals its predecessor's epoch too",
+            "CasRefRecoveryEpochSealed > 0 on the cleanly-restarted process",
+            clean_sealed, clean_sealed > 0,
+            "" if clean_sealed > 0 else "the cleanly-restarted process minted no seal — sealing must "
+                                        "be decided by arithmetic (every epoch below the live one is "
+                                        "closed), not by an unclean-boundary flag"))
 
         _common.standard_end(ctx, result, [_TABLE])

@@ -1,10 +1,11 @@
-# CA soak S38 variant (rev.6 Task 14 e2e: unclean handover, recovery seal, late-PUT injection).
+# CA soak S38 variant (unclean handover; the epoch seal makes a late predecessor PUT lose).
 # Identical to docker-compose.yml except:
 #   - ch1/ch2 mount storage_conf_s38_ch{1,2}.xml. These USED to raise materialization_grace_ms
 #     (T_mat) to 45s so an unclean-handover restart's wait was long and unambiguous; that setting was
 #     retired outright by Stage A task 12 (`ff9f36a056f`) and the key is gone from both configs, so
-#     this variant now differs from the default only by the published RustFS port below. The S38 card
-#     itself is held for its T14 rewrite (see scenarios/cards/s38_late_put_injection.py).
+#     this variant now differs from the default only by the published RustFS port below. The card no
+#     longer needs a widened window at all: it asserts that the epoch seal makes a late PUT LOSE, and
+#     a seal is an object rather than a grace period, so there is nothing to be inside of.
 #   - rustfs1 additionally PUBLISHES its S3 port to the host (18121 -> 11121) so the scenario card
 #     can inject a raw object directly into the pool via boto3 from the host process (the late-PUT
 #     injection), without needing an extra throwaway container on the compose network.
