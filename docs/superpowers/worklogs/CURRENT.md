@@ -1774,3 +1774,7 @@ likely the tee-captured ca-fsck rerun preparing). No push.
 
 **2026-07-29 07:2x local** — T11 fix round landed (evidence by reproduction script; SQL row
 completeness rule). Closing confirmation dispatched; T12 next. No push.
+
+**2026-07-29 07:4x local** — T11 CLOSED (cross-footed live evidence; the withdrawn reviewer
+sentence restored). T12 (retirement sweep) dispatched — the task where the old world's
+defensive scaffolding formally dies. T13+T14 remain. No push.
