@@ -2098,3 +2098,7 @@ re-ordered with PIDs named.
 warm-by-construction backed by the MRU code fact; naming in the endpoint family with the
 nonce-in-URL cache bonus; wire names honestly 5->5, grammars 2->0. Codex ROUND 2 launched on
 the final. Still awaiting a14's flip commit (nudged with PIDs).
+**2026-07-29 17:4x local** — flip path re-ruled to (a)-with-deadline: a14 verified the
+checkpoint is BOUNDED (band-settling + scaled timeout, inserts paused) — my (b) premise was
+wrong; criteria strengthening (37 rounds). Hard deadline t+120m -> auto-(b). One reviewable
+flip commit on return.
