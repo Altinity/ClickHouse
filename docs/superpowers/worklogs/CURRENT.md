@@ -2008,3 +2008,6 @@ queue: per-ref pass, then Stage B.
 doc/citation class; 14/17 rows verified beyond claims; the gating row 12c cites NO artifact —
 the sharpest find). Fix round dispatched (report §8 + citations + honesty marks); M2 fixed
 controller-side (7e4de57374c: Stage B Task 0 knows PENDING). a16 RED-1 still building.
+**2026-07-29 15:02 local** — watchdog: a16's RED-1 build DONE at 14:51 (NINJA_EXIT=0) but no
+red-run followed in 11 min — armed monitor didn't fire (known class); woke the agent with the
+marker facts. a14 in doc fix round; T14 re-review queues after it.
