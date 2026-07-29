@@ -9,7 +9,7 @@ doc_type: 'reference'
 
 # CAS relink re-offer: retiring the confirm endpoint {#cas-relink-reoffer-redesign}
 
-**Date:** 2026-07-29. **Status:** DESIGN (**v11 — final pre-plan**), approved except the TLA gate. **Branch:** `cas-gc-rebuild`.
+**Date:** 2026-07-29. **Status:** DESIGN (**v12 — final pre-plan**), approved except the TLA gate. **Branch:** `cas-gc-rebuild`.
 Spec only; no code landed.
 
 **Line citations are as of `af0b2825613`.** This branch is worked by several sessions at once and
@@ -190,7 +190,7 @@ argued. Deletions are measured against the tree; additions are estimated.
 | Fields the receiver must round-trip | 6, parsed | **16 opaque bytes**, parsed by nobody |
 | Bespoke wire names | 5 | **5** — unchanged, and §4.1 says so plainly |
 | Proof obligations answered per outcome | 2 | **3** — codex r2 exposed a missing one, *does it leak retention?* |
-| Where release cleanup is observed | implicit, nowhere | **1 place** — the handle's destructor, one predicate (§6.5) |
+| Where release cleanup is observed | implicit, nowhere | **1 place** — the TRANSACTION destructor, one predicate (§6.5) |
 | Content-addressed identifiers in `src/Storages/MergeTree/` | **6** | **4** |
 | Seam methods serving the confirm | `confirmExactRef` + `ownsNamespace` | **0** |
 | Lane mutexes held to answer | 2, in a bespoke snapshot | **1**, the ordinary read path |
@@ -884,7 +884,7 @@ added after codex round 2 found it missing — *does it leak retention?*
 Release cleanup — whether a staged `+1` was provably released — is deliberately **not part of this
 machine**. Two drafts tried to make it one (a fifth state in v5, an exit attribute in v6) and both
 were wrong for the same reason: the receiver cannot observe it, because its classification happens
-before the last release attempt. §6.5 moves the observation to the handle that owns it. **No state
+before the last release attempt. §6.5 moves the observation to the transaction that outlives it. **No state
 below carries release plumbing, and no state's action depends on it.**
 
 ### 6.1 S0 — PUBLICATION PROVEN ABSENT {#s0-not-staged}
@@ -899,8 +899,8 @@ precommit, precommit no longer the live owner, ref conflict), and a `promote` th
 `CaRelinkPromote::MechanismFallbackAllowed`.
 
 **Both of those last two entries can leave a staged `+1` behind**, and neither this state nor the
-receiver does anything about it: whether the release completed is observed by the handle that owns
-it, once, at destruction (§6.5). No entry condition here consults it, and no action here depends
+receiver does anything about it: whether the release completed is observed once, at TRANSACTION
+destruction, by the object that outlives every release attempt (§6.5). No entry condition here consults it, and no action here depends
 on it.
 
 **Action:** return `nullptr`; the caller byte-fetches from the same sender, with the recursion
@@ -911,7 +911,7 @@ brake (`allow_ca_relink=false`) set.
   and a staged precommit is not a committed ref: a later byte fetch publishes the same ref name
   over it without conflict.
 - *No retention leak?* Not this state's question. A staged `+1` may survive here; whether it was
-  released is observed and counted by the handle at destruction (§6.5), and the answer changes
+  released is observed and counted at transaction destruction (§6.5), and the answer changes
   nothing about this state's action.
 
 ### 6.2 S1 — STAGED {#s1-staged}
@@ -1005,8 +1005,8 @@ one does.
 ### 6.5 Release cleanup is the seam's, not this machine's {#release-incomplete}
 
 **The receiver carries no release plumbing.** Whether a staged `+1` was provably released is
-observed once, by the transaction handle that owns the last attempt, and is specified in its own
-document: `2026-07-29-cas-part-write-release-seam.md`. Nothing in §6.1-§6.4 consults it, and no state's action depends on it.
+observed once, at transaction destruction — the handle owns the last release ATTEMPT, the
+transaction owns the last WORD — and is specified in its own document: `2026-07-29-cas-part-write-release-seam.md`. Nothing in §6.1-§6.4 consults it, and no state's action depends on it.
 
 That separation is the outcome of four review rounds, and it is worth one sentence of why. The
 receiver cannot observe the release — its classification necessarily happens BEFORE the last
@@ -1040,7 +1040,7 @@ part / publish it twice": seven answers, once per row, become four, once per sta
 two, since codex round 2 showed the retention question was never being asked — and every new exit
 added later inherits its state's answers instead of needing a new row. Release cleanup, which
 v6 tried to model as a fifth outcome and then as an exit attribute, turns out not to belong to this
-machine at all: it is observed once by the handle that owns it (§6.5). **Legacy row 6** ("any other
+machine at all: it is observed once at transaction destruction (§6.5). **Legacy row 6** ("any other
 exception") maps to whichever state the receiver is in when the exception propagates — S0 before
 staging, S1 after — and needs no row of its own for the same reason. Rows 1 and 2 collapse into
 S0 because they differ only in provenance, and the token and quiescence classes disappear

@@ -190,15 +190,28 @@ Consumers inherit the channel without doing anything: the receiver-side staging 
 
 ### 4.3 Three properties the shape depends on {#channel-properties}
 
-- **An item cannot span chunks — and the reason is a mechanism, not a convention.** Two properties
-  compose: the per-item op-count cap refuses any item whose own ops exceed `ref_txn_max_ops` BEFORE
-  any object is created (`CasRefLedger.cpp:2441-2447`, `LIMIT_EXCEEDED`), so no item is larger than
-  one chunk can hold; and the chunk boundary ROLLS before admitting — an item that would push the
-  current non-empty chunk over the cap commits that chunk first and starts a fresh one
-  (`:2465-2470`). Together an item always lands whole in exactly one chunk, so a per-item mark is
-  well-defined. **The plan must carry the assertion that a split item is unrepresentable**, not
-  merely that different items land in different chunks: the weaker form would stay green if
-  splitting were ever introduced.
+- **An item cannot span chunks — by two DIFFERENT mechanisms, one per item class.** The naive
+  reading ("the op cap plus the roll") covers only half the batch, because the cap is explicitly
+  conditional on `!removal_class` (`CasRefLedger.cpp:2441`).
+
+  **Normal-class items** are bounded then rolled: an item whose own ops exceed `ref_txn_max_ops` is
+  refused with `LIMIT_EXCEEDED` **before any object is created** (`:2441-2447`), so no item is
+  larger than a chunk can hold; and an item that would push the current non-empty chunk over the cap
+  makes the builder COMMIT that chunk first and start a fresh one (`:2470-2472`).
+
+  **Removal-class items are EXEMPT from that cap** and cannot split for an unrelated reason: they
+  are `WholeShard`-scoped, and a whole-shard mutation **carves solo** — it may only be the first and
+  then only item of its batch (`:2352-2354`). Being alone in its chunk, it cannot be split by a
+  boundary that never arrives; its size is bounded instead by the larger `ref_removal_max_bytes`
+  budget in `checkBudget`. One subtlety the code flags and the plan must respect:
+  `refLogTxnIsRemovalClass` (built ops contain `RemoveNamespace`) is the canonical discriminator and
+  `WholeShard` scope is NOT a substitute — the stale-precommit reclaim sweep is also
+  `WholeShard`-scoped without being removal-class. The solo carve keys on SCOPE, so it covers
+  removal-class items as a subset; the cap exemption keys on CLASS.
+
+  **The plan must assert that a split item is unrepresentable, discharged per class** — not merely
+  that different items land in different chunks, which would stay green if splitting were ever
+  introduced, and not by the op cap alone, which would leave removal-class items unaccounted for.
 - **Retries must not reset it.** It is set before the FIRST attempt and cleared only by the proof
   above, so the controller's internal retries and a later wedge resolution both keep it true.
 - **A process death between the mark and the send over-reports.** Accepted, and the fail-closed
@@ -260,8 +273,12 @@ audit of the file's **fifteen** `armApplyPending`/`clearApplyPending`/`poisonApp
 claimed. Most are already inside the install region; the production calls currently made with NO
 lock held are **`:2808`, `:2827`, `:3072`, `:3112`**, and those are the ones the audit must bring
 under `state_mutex`. **Under 20 lines, one file, no control-flow or signature change.** Runtime
-cost: one uncontended mutex acquire **per ATTEMPTED chunk** — not per committed chunk, since the
-arm precedes the `PUT` and so is paid even by a chunk that fails.
+cost, stated exactly rather than roundly: **one arm-side acquire per ATTEMPTED chunk** — not per
+committed chunk, since the arm precedes the `PUT` and is paid even by a chunk that fails — **plus
+one clear-side acquire per non-success resolution**, because the clear paths that are currently
+unlocked (`:2827`, `:3072`, `:3112`) each gain one too. A chunk that commits pays one; a chunk that
+fails or is refused pays two. Both are uncontended acquires against a network round trip, so the
+conclusion is unchanged, but "one per chunk" was not true.
 
 ## 7. Retention, and why no fsck class {#retention}
 
@@ -293,7 +310,9 @@ statement about an unmounted namespace rather than about this seam.
 | S3 | A successful late release is silent | fail the first removal attempts, let the DESTRUCTOR retry succeed | `precommitState` reaches `Settled`, so **neither half** fires: no counter, no ERROR line of the authoritative class. Intermediate INFO lines are EXPECTED and must not fail the assertion (§5) |
 | S4 | Proven non-transmission is silent | drive the marked no-send exits — at minimum the shutdown drain (row 1), a lost fence (row 2), and BOTH controller pre-attempt checks (rows 11a and 11b) | `attempted` stays false (or is cleared), the state downgrades to `NotAttempted`, nothing is emitted |
 | S5 | A transmitted attempt is NOT downgraded | let the PUT be sent, then fail ambiguously | `attempted` is true, the state stays `Uncertain`, the emission STANDS. The fail-closed half of S4 — without it a channel bug that never marks anything would silence the counter and look like success |
-| S6 | An item cannot span chunks | submit an item at the op-count cap boundary so admitting it would overflow the current non-empty chunk | the builder ROLLS — the accumulated chunk commits and the item lands WHOLE in the fresh one (`CasRefLedger.cpp:2465-2470`); an item whose own ops exceed the cap is refused outright before any object is created (`:2441-2447`). Assert the mechanism, not merely that two items landed in two chunks: the weaker assertion stays green if splitting is ever introduced (§4.3) |
+| S6a | Normal-class item AT the cap boundary | submit an item whose ops would overflow the current non-empty chunk | the builder ROLLS: the accumulated chunk commits and the item lands WHOLE in the fresh one (`CasRefLedger.cpp:2470-2472`) |
+| S6b | Normal-class item OVER the cap | submit a single item whose own ops exceed `ref_txn_max_ops` | **refused with `LIMIT_EXCEEDED` before any object is created** (`:2441-2447`), and the neighbours in its batch are unaffected. The rejection is the assertion — S6a alone never exercises it |
+| S6c | Removal-class item | submit a removal-class (`WholeShard`, `RemoveNamespace`) item in a batch with others | it carves SOLO (`:2352-2354`) — alone in its chunk, so no boundary can split it — and is NOT subject to the op cap it is exempt from. Without this row the invariant is discharged for only half the item classes (§4.3) |
 | S7 | Marker synchronization | a reader taking `state_mutex` between the arm and the install | observes `ApplyPending` and refuses; never a stale `Clean` (§6) |
 | S8 | Both no-send sources are covered | drive the controller's pre-attempt FENCE check and its DEADLINE check separately (rows 11a/11b) | each reports `NoAttemptSent`, each clears `attempted`, neither emits |
 
