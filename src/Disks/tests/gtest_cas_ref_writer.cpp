@@ -66,6 +66,31 @@ using DB::Cas::tests::writeRefSnapshotRaw;
 namespace
 {
 
+/// The operation deadline every SINGLE-ATTEMPT fixture in this file uses, and the reason it is
+/// deliberately NOT `attempt_timeout_ms`.
+///
+/// Those fixtures exist to make one injected ambiguous response conclusive, and `max_attempts = 1`
+/// alone achieves that: with retries allowed the controller would resolve-before-reissue and report a
+/// definite outcome instead. The deadline contributes nothing to that -- but setting it EQUAL to the
+/// attempt timeout collapses the controller's pre-send gate into a race. The deadline is captured as
+/// `now + operation_deadline_ms` and the gate asks `now + attempt_timeout_ms > deadline`
+/// (`CasRequestControl.cpp`), so equal values reduce it to `now_2 > now_1`: ONE elapsed millisecond
+/// between the two clock reads refuses the operation with NOTHING SENT, the injected fault is never
+/// reached, and the product correctly does not wedge -- flipping every wedge expectation downstream.
+///
+/// That is not hypothetical. It took down
+/// `RefWriterStalePrecommitSweep.BoundedBatchesAndInterruptionResumeAcrossMounts` on 5 of 6 sanitizer
+/// CI runs (fixed in `8f9e63c7a19`), `CasRefInstallSafety.UncertainPrecommitKeepsItsCleanupOwnerAndItsBody`
+/// under parallel-build load, and `RefWriterAppendLane.WedgedLaneBlocksSameTableWhileOtherTableProceeds`
+/// in a full-binary ASan run -- the last one with the mechanism named verbatim in the thrown message
+/// ("refused BEFORE any request was sent ... the operation deadline rejected before the first request").
+///
+/// A wide deadline keeps the request always actually sent, so what the test observes is the fault it
+/// injected rather than the machine it ran on. A fixture that genuinely wants the pre-send REFUSAL
+/// must drive it deterministically with a frozen clock (see `gtest_cas_ref_install_safety.cpp`'s
+/// `openPoolFenceControlled`), never by racing the wall clock.
+constexpr uint64_t kSingleAttemptDeadlineMs = 5000;
+
 PoolPtr openPool(const BackendPtr & backend, CasRequestBudget budget = {})
 {
     /// Recovery tests seed ref-log/snapshot residue before opening; a pool with such residue always has a
@@ -724,7 +749,7 @@ TEST(RefWriterAppendLane, WedgedLaneBlocksSameTableWhileOtherTableProceeds)
     CasRequestBudget budget;
     budget.max_attempts = 1;
     budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = 100;
+    budget.operation_deadline_ms = kSingleAttemptDeadlineMs;
     budget.lease_safety_margin_ms = 100;
 
     auto backend = std::make_shared<RefWriterTestBackend>();
@@ -762,7 +787,7 @@ TEST(RefWriterAppendLane, WedgedAppendObservedDurableAppliesBeforeNextId)
     CasRequestBudget budget;
     budget.max_attempts = 1;
     budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = 100;
+    budget.operation_deadline_ms = kSingleAttemptDeadlineMs;
     budget.lease_safety_margin_ms = 100;
 
     auto backend = std::make_shared<RefWriterTestBackend>();
@@ -802,7 +827,7 @@ TEST(RefWriterAppendLane, WedgeResolutionJoinsTailCountersAndFoldsOverlay)
     CasRequestBudget budget;
     budget.max_attempts = 1;
     budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = 100;
+    budget.operation_deadline_ms = kSingleAttemptDeadlineMs;
     budget.lease_safety_margin_ms = 100;
 
     auto backend = std::make_shared<RefWriterTestBackend>();
@@ -846,7 +871,7 @@ TEST(RefWriterAppendLane, WedgedRefLaneCountTracksExactlyTheWedgedTableThroughIt
     CasRequestBudget budget;
     budget.max_attempts = 1;
     budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = 100;
+    budget.operation_deadline_ms = kSingleAttemptDeadlineMs;
     budget.lease_safety_margin_ms = 100;
 
     auto backend = std::make_shared<RefWriterTestBackend>();
@@ -961,7 +986,7 @@ TEST(RefWriterAppendLane, I1WedgeResolveCorruptionSurfacesAndKeepsWedge)
     CasRequestBudget budget;
     budget.max_attempts = 1;
     budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = 100;
+    budget.operation_deadline_ms = kSingleAttemptDeadlineMs;
     budget.lease_safety_margin_ms = 100;
 
     auto backend = std::make_shared<RefWriterTestBackend>();
@@ -1025,7 +1050,7 @@ TEST(CasAnomalyPolicy, ForeignBytesAtWedgeKeyTripFenceAndRemount)
     CasRequestBudget budget;
     budget.max_attempts = 1;
     budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = 100;
+    budget.operation_deadline_ms = kSingleAttemptDeadlineMs;
     budget.lease_safety_margin_ms = 100;
 
     auto backend = std::make_shared<RefWriterTestBackend>();
@@ -1255,7 +1280,7 @@ TEST(RefTableCacheEviction, WedgedTableIsNeverEvicted)
     CasRequestBudget budget;
     budget.max_attempts = 1;
     budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = 100;
+    budget.operation_deadline_ms = kSingleAttemptDeadlineMs;
     budget.lease_safety_margin_ms = 100;
 
     auto backend = std::make_shared<RefWriterTestBackend>();
@@ -1695,7 +1720,7 @@ TEST(RefWriterSnapshotPublish, C4LatchBoundedUnderSustainedNonCommittedPublish)
     CasRequestBudget budget;   /// one attempt per publish so a failure is a single PUT
     budget.max_attempts = 1;
     budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = 100;
+    budget.operation_deadline_ms = kSingleAttemptDeadlineMs;
     budget.lease_safety_margin_ms = 100;
 
     uint64_t fake_now = 1'000'000;
@@ -1767,7 +1792,7 @@ TEST(RefWriterSnapshotPublish, C4BackoffDefersThenRetriesAndPublishes)
     CasRequestBudget budget;
     budget.max_attempts = 1;
     budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = 100;
+    budget.operation_deadline_ms = kSingleAttemptDeadlineMs;
     budget.lease_safety_margin_ms = 100;
 
     uint64_t fake_now = 1'000'000;
@@ -1946,20 +1971,14 @@ TEST(RefWriterStalePrecommitSweep, BoundedBatchesAndInterruptionResumeAcrossMoun
     }
 
     /// The successor: a tight retry budget so ONE simulated ambiguous response wedges rather than
-    /// transparently retries away. Ambiguity is guaranteed by `max_attempts = 1` ALONE — the
-    /// operation deadline must NOT also sit at `attempt_timeout_ms`: the controller's pre-send gate
-    /// (`putIfAbsentControlled`: `now + attempt_timeout > deadline` → Unresolved WITHOUT sending)
-    /// then passes only if zero milliseconds elapse between the deadline capture and the gate, and
-    /// this test uniquely burns that window encoding the ~1700-op removal chunk. On a loaded or
-    /// sanitizer-slow machine the gate fired first, the fault was never reached, the sweep failed
-    /// CLEAN (nothing sent → nothing ambiguous → correctly NO wedge), and the `refLaneWedgedForTest`
-    /// expectation below flipped — 5 of 6 sanitizer-lane runs across two CI rounds, reproduced
-    /// locally 14/14 under full CPU load. A wide deadline keeps the PUT always actually sent, so
-    /// the injected ambiguous fault — and the wedge — are deterministic on any machine.
+    /// transparently retries away. This test is where `kSingleAttemptDeadlineMs` was first needed and
+    /// it remains the worst case for it — it burns the capture-to-gate window encoding the ~1700-op
+    /// removal chunk, which is why it, and not its siblings, failed 5 of 6 sanitizer-lane runs across
+    /// two CI rounds (reproduced locally 14/14 under full CPU load) before `8f9e63c7a19`.
     CasRequestBudget budget;
     budget.max_attempts = 1;
     budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = 5000;
+    budget.operation_deadline_ms = kSingleAttemptDeadlineMs;
     budget.lease_safety_margin_ms = 100;
     PoolConfig config;
     config.cas_request_budget = budget;
@@ -2071,7 +2090,7 @@ TEST(RefWriterStalePrecommitSweep, FailedSweepRearmsAndRetriesUntilClean)
     CasRequestBudget budget;
     budget.max_attempts = 1;
     budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = 100;
+    budget.operation_deadline_ms = kSingleAttemptDeadlineMs;
     budget.lease_safety_margin_ms = 100;
     PoolConfig config;
     config.cas_request_budget = budget;
@@ -2322,7 +2341,7 @@ TEST(RefWriterRemount, DiscardsWedgeAndLaneRemainsUsable)
     CasRequestBudget budget;
     budget.max_attempts = 1;
     budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = 100;
+    budget.operation_deadline_ms = kSingleAttemptDeadlineMs;
     budget.lease_safety_margin_ms = 100;
 
     auto backend = std::make_shared<RefWriterTestBackend>();
@@ -2601,7 +2620,7 @@ TEST(RefWriterNamespaceRemoval, RemovalAppendFailureLeavesBuildAliveAndNamespace
     CasRequestBudget budget;
     budget.max_attempts = 1;
     budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = 100;
+    budget.operation_deadline_ms = kSingleAttemptDeadlineMs;
     budget.lease_safety_margin_ms = 100;
 
     auto backend = std::make_shared<RefWriterTestBackend>();
@@ -2823,7 +2842,8 @@ void seedUncleanPredecessorMount(Backend & backend, const Layout & layout, uint6
 CasRequestBudget sealTestTinyBudget()
 {
     return CasRequestBudget{
-        .attempt_timeout_ms = 50, .operation_deadline_ms = 50, .max_attempts = 1, .lease_safety_margin_ms = 50};
+        .attempt_timeout_ms = 50, .operation_deadline_ms = kSingleAttemptDeadlineMs, .max_attempts = 1,
+        .lease_safety_margin_ms = 50};
 }
 
 }
