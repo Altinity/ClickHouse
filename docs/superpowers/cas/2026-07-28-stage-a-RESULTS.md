@@ -26,9 +26,9 @@ partial credit — the house rule is that a known red is a red.
 traced to one thing that is not a product defect: Stage A deliberately turned destruction off, and a
 large part of the test estate still asserted that destruction happens. That is now resolved — the
 assertions were NARROWED to the gated-delete family rather than disabled, and nine of nine lanes plus
-three of four scenarios pass as a result. Two things remain. One is a real regression this gate
-measured and is the reason the verdict is gated rather than clean: under a live writer the GC fold does
-not complete a round at all, now Task 15. The other is W3, which has never been answered anywhere. Four integration lanes, all four adversarial scenarios and one
+three of four scenarios pass as a result. One thing remains, and it is the reason the verdict is gated
+rather than clean: a real regression this gate measured, where under a live writer the GC fold does not
+complete a round at all — now Task 15. W3, open since task 6, is answered here. Four integration lanes, all four adversarial scenarios and one
 soak criterion are written against a reclaiming pool and are being run against a suppressed one. Task 9
 met this problem, solved it correctly for the one lane it was gating on, and left the rest — which
 nobody noticed, because the per-task gate ran two of the nine lanes.
@@ -61,7 +61,7 @@ the BACKLOG as `[FSCK-SCALE-TIMEOUT]`.
 | 12b | soak — CRITERIA GATE (3 workers / 8 GB) | zero data loss; no surviving wedge; bounded `unaccounted`; no uninjected ERROR; and — per the 2026-07-29 controller amendment — complete audits at auditable scale plus soak fsck gates reported UNARMED with reason, replacing "fsck clean at end" | zero data loss (2,942,315 == 2,942,315); no violation counter moved; epoch seal minted on both replicas; 2 of 28 scheduled chaos faults fired; fsck gates reported unarmed with reason; complete audits supplied by 05020 and by three PASSING scenario end checkpoints | GREEN against the amended criterion, with one NAMED DEVIATION: I stopped it at minute 95 of its scheduled 90, before the final converge checkpoint. The clause it would have exercised (the data-loss oracle) was run directly instead |
 | 12c | fold-round liveness under load | GC rounds complete while a writer is live | **0 completed folding rounds in 42 minutes** on the leader (`CasRefManifestBodyFoldGets` climbing at ~313/s past 1,087,385; peer logged 162× `NotALeader`) | **FAIL** -> fix = Task 15 {#task-15}, re-validation pending |
 | 13 | S38 late-PUT fence | the fence holds | **19/19 verdicts pass, `status=PASS`, `FIX2_EXIT=0`**; store returned HTTP 412 | GREEN |
-| 14 | S43 (W3) same-uuid recreation | the survivor's write is not absorbed | 8/12; the pool is now released THROUGH the product (`vanished(forgotten)` on both nodes), 30 objects wiped, a 2-op survivor planted and read back — then the servers still do not answer `/ping` after the restart | **OPEN** — the card reaches everything except its own question; W3 remains unanswered |
+| 14 | S43 (W3) same-uuid recreation | the survivor's write is not absorbed | **16/16 verdicts pass, `status=PASS`, `FIX3_EXIT=0`** — the recreated pool REFUSES to bootstrap over the planted survivor (`healthy=false`, `refusal_logged=true`), removing that one object lets the same prefix bootstrap, and life 2 comes up empty (`0\t0` vs life 1's `200\t18123181848219261492`) | GREEN — W3 answered |
 | 15 | S33 concurrent GC leaders | no leak | **10/10 verdicts pass, `status=PASS`, `FIX2_EXIT=0`** | GREEN |
 | 16 | S30 create/drop churn | bounded fanout, no leftovers | **8/8 verdicts pass, `status=PASS`, `FIX2_EXIT=0`** | GREEN |
 | 17 | 05020 through the stateless harness | live fsck rows | `[ OK ] 1.85 sec`, `T05020_EXIT=0`, full 18-column row emitted | GREEN |
@@ -421,26 +421,40 @@ is reported) and S30's D1 fanout check, which has two halves of which Stage A su
 unchanged, while RECLAIMING the tombstone is gated, so `CasRootGet` grew 18 → 82 and could not do
 otherwise.
 
-### S43 (W3) — everything except its own question {#scenario-s43}
+### S43 (W3) — answered, and the answer is stronger than predicted {#scenario-s43}
 
-**8 of 12, and W3 remains unanswered.** What now works, and did not before: the pool is released THROUGH
-the product rather than by yanking bytes — `SYSTEM CONTENT ADDRESSED FORGET` on every node, with
-`system.content_addressed_mounts` asserted to report `vanished(forgotten)` on each before the prefix is
-touched at all — 30 objects wiped, and a survivor carrying **2 real ops** planted at
-`.../_log/0000000000000001-0000000000000002.zst` and read back. The pinned uuid lands in the namespace
-path, so the prefix really is reused.
+**16 of 16 verdicts pass; `status=PASS`, `FIX3_EXIT=0`. W3 is answered.**
 
-Then the servers do not answer `/ping` after the restart, and the card's actual question — does the
-recreated life ABSORB the survivor's `{1,2}`? — is still never asked.
+Task 6 named this scenario and expected the recreated pool's first RECOVERY to refuse the survivor's
+stream — a non-contiguous apply, or a non-birth op on a never-born table, both `CORRUPTED_DATA`. What
+actually happens is earlier and stronger: **the recreated pool never bootstraps at all.**
 
-The first diagnosis (that emptying a prefix under a stopped server is not a recreated pool) was right
-and was fixed; it was not the whole cause. What is NOT established is why the restart fails, and this
-document declines to guess: the leading hypothesis, that `FORGET`'s vanished state persists across a
-restart, looks WRONG on inspection — `PoolLifecycle` is an in-memory runtime enum
-(`Pool/CasMountRuntime.h:39`), so a restart should yield a fresh mount. The next step is to capture the
-server's startup log for that window, which the new pre-teardown dump makes routine for future runs but
-cannot do retroactively (the host-mounted log files are `syslog`-owned and unreadable by the harness
-user).
+The card releases the pool through the product (`SYSTEM CONTENT ADDRESSED FORGET` on every node, with
+`system.content_addressed_mounts` asserted `vanished(forgotten)` on each), reuses the prefix, and plants
+a survivor carrying two real ops at `.../_log/0000000000000001-0000000000000002.zst`. The prefix then
+holds that object and no `_pool_meta`, which is residual data, and `CasPool.cpp:439` declines it
+outright:
+
+```
+Code: 668. content-addressed pool 'ca_soak_ch1' (prefix 'soak_pool'): missing _pool_meta over a
+non-empty pool prefix — refusing to bootstrap over residual data; recreate the pool or restore
+_pool_meta.
+```
+
+Both servers exit rather than mount (`healthy_with_survivor_planted=false`, `refusal_logged=true`), so
+there is no life 2 for the survivor's `{1,2}` to be absorbed into and the recovery-level defence is
+never even reached.
+
+The card proves CAUSATION rather than correlation: remove that one planted object, change nothing else,
+restart, and the same prefix bootstraps cleanly (`healthy_after_removing_survivor=true`). Life 2 is then
+created as the control and comes up empty — checksum `0\t0` against life 1's
+`200\t18123181848219261492`.
+
+Reaching this took four runs and cost two earlier diagnoses that were each right and each incomplete:
+emptying a prefix under a stopped server is not a recreated pool (fixed by going through `FORGET`), and
+the remaining unhealthy restart was not a defect at all but the guard doing its job. The refusal is read
+through a throwaway container, because the server writes its error log as root/syslog and the harness
+user cannot open it — the same fact that motivated the pre-teardown dump.
 
 ### The framework-level conflict, resolved {#scenario-framework-conflict}
 
@@ -601,44 +615,39 @@ sequencing flips `kDefault`.
 
 ## Verdict {#verdict}
 
-Fifteen of seventeen rows green. One row (12a) is a scale probe rather than a gate. Two are not green:
-row 12c, the fold-round liveness regression, which is the designated gate; and row 14, W3, which is
-open.
+Sixteen of seventeen rows green. One row (12a) is a scale probe rather than a gate. Exactly one row is
+not green: row 12c, the fold-round liveness regression, which is the designated gate.
 
 STAGE A: PENDING (T15 re-validation)
 
-**The gate is row 12c.** Under a live writer the GC leader completed ZERO folding rounds in 42 minutes,
-diagnosed to Task 7's arithmetic intake replacing a LIST-snapshot-bounded work set with
-walk-while-exists. It is being fixed as Task 15, whose re-validation soak runs at the DEFAULT instrument
-(6 workers / 40 GB) — its point is rounds completing under the load that broke them, so its pass
-criterion is round-completion counters, not the fsck gates, which will hit the scale wall harder there
-and are expected to report UNARMED. Printing `PASS` before that lands would certify a stage whose GC
-does not converge under its own workload.
+**The gate is row 12c, and it is the only thing standing between this and a pass.** Under a live writer
+the GC leader completed ZERO folding rounds in 42 minutes, diagnosed to Task 7's arithmetic intake
+replacing a LIST-snapshot-bounded work set with walk-while-exists. It is being fixed as Task 15, whose
+re-validation soak runs at the DEFAULT instrument (6 workers / 40 GB) — its point is rounds completing
+under the load that broke them, so its pass criterion is round-completion counters, not the fsck gates,
+which will hit the scale wall harder there and are expected to report UNARMED. Printing `PASS` before
+that lands would certify a stage whose GC does not converge under its own workload.
 
-**Row 14 is open, and I am flagging the scoring rather than deciding it.** S43 now does everything but
-ask its question: the pool is released through the product, the prefix is genuinely reused, and a
-two-op survivor is planted and read back — then the servers do not come back on the restart. W3 has
-never been answered anywhere; task 6 named it as not reached, and this gate did not reach it either. I
-have scored it OPEN rather than RED because it is an unanswered obligation rather than a measured
-regression, but a strict reading of the standing matrix makes any surviving non-green row a `FAIL` with
-that row named. **If the stage owner wants the strict reading, this line becomes `STAGE A: FAIL` with
-row 14 named — that is a one-line change and I am not going to make it unilaterally in either
-direction.**
+Everything else the stage owes is measured and green:
 
-Outstanding, in the order the work should be done:
+- both unit batteries, reconciled to their baselines by arithmetic;
+- nine of nine integration lanes, four of them adapted to the Stage-A posture on Task 9's own pattern
+  and then verified;
+- all four adversarial scenarios — S38 19/19, S43 16/16, S33 10/10, S30 8/8 — including the late-PUT
+  fence proven against a real object store with an HTTP 412 and a byte-identical seal, and W3 answered;
+- 05020 through the stateless harness with a live-disk fsck row;
+- the soak's criteria gate against the amended criterion, with one named deviation (I stopped attempt 2
+  at minute 95 of its scheduled 90; the data-loss oracle it would have run was run directly instead).
 
-1. ~~Verify the four adapted lanes.~~ **DONE** — all four pass.
-2. ~~Decide the framework-level question.~~ **DONE** — `assert_no_leftovers` and
-   `assert_reclaimable_drained` are narrowed, not disabled; S38, S33 and S30 all pass as a result.
-3. **Task 15's fix and its re-validation soak** (row 12c). This is the gate on the verdict line.
-4. **Finish W3** (row 14). The remaining unknown is why the servers do not answer `/ping` after a
-   FORGET + prefix reuse + restart. Capture the startup log for that window — the pre-teardown dump
-   makes this routine now.
+Outstanding:
+
+1. ~~Verify the four adapted lanes.~~ **DONE.**
+2. ~~Decide the framework-level question.~~ **DONE** — narrowed, not disabled.
+3. ~~Finish W3.~~ **DONE** — answered, and the answer is that the pool refuses to bootstrap over the
+   survivor at all.
+4. **Task 15's fix and its re-validation soak** (row 12c). The gate on the verdict line.
 5. **Re-run the soak's final converge checkpoint** (row 12b's named deviation), whenever a soak next
    runs to completion.
 
-Only item 3 touches the ref chain. Everything else was the test estate catching up with a posture the
-stage adopted deliberately — and where the chain itself was measured, it held: both unit batteries
-green, nine of nine integration lanes green, the late-PUT fence proven against a real object store with
-an HTTP 412 and a byte-identical seal, three of four adversarial scenarios passing outright, and both
-soak runs ending with the replicas holding identical, model-matching row counts.
+Only item 4 touches the ref chain. Everything else was the test estate catching up with a posture the
+stage adopted deliberately — and where the chain itself was measured, it held.
