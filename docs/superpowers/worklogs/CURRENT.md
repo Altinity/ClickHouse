@@ -1716,3 +1716,7 @@ test). Lane-g retired. T11-T14 remain. No push.
 **2026-07-29 03:40 local watchdog** — convergence final phase: stitches 3-5 committed, ASan
 gate running (log growing), integration lane logged. Stitch-6 sweep found zero remaining stale
 promises. No push.
+
+**2026-07-29 04:00 local watchdog** — convergence: all six stitches committed (last:
+`ee3170eace2`); final release gate 1526/1526; ASan gate still running (live procs). Final
+report pending. No push.
