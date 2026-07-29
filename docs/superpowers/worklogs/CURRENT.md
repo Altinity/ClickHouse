@@ -1743,3 +1743,6 @@ No push.
 **2026-07-29 05:20 local watchdog** — stitch-7 confirmation ASan rerun live (exclusion-filtered
 full binary, running from a scratch cwd per the ./logs workaround — output lands there, hence
 quiet build_asan logs). No push.
+
+**2026-07-29 05:4x local** — convergence DONE-minus-stitch-7 (ruling retransmitted after the
+6th delivery loss). ASan red closed to the test. On stitch 7: T11 dispatches. No push.
