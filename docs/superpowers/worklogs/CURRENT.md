@@ -2026,3 +2026,6 @@ after the absent branch is the safety property). Pre-merge polish ordered (folde
 assert + 2 doc notes). Merge sequence set: T16 runbook -> merge T15 -> rebuild ->
 EXCLUSIVE re-validation soak (T16 review reads during) -> merge T16 -> verdict flip ->
 final review.
+**2026-07-29 15:22 local** — watchdog: woke a16 again (RED-2 build NINJA_EXIT=0 at 15:04,
+monitor missed 2nd time — told it to stop parking on monitors); RED-1 tests were red as
+planned (RED1_TESTS_EXIT=1). a15 polish commit pending. T15 review CLOSED-approved earlier.
