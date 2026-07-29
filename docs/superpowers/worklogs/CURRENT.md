@@ -1757,3 +1757,6 @@ battery run; log mtimes show a clock skew artifact — activity real). No push.
 
 **2026-07-29 06:00 local watchdog** — T11 in red-proof phase (red build + red run at 05:54-55,
 one live proc). No push.
+
+**2026-07-29 06:20 local watchdog** — T11 finalizing: 05020-reference update + release build
+running (logs seconds-fresh). No push.
