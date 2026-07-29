@@ -1701,3 +1701,7 @@ complete through T6). Awaiting g10's two-line hash => lane G complete => GRAND M
 **2026-07-29 04:0x local** — GRAND MERGE DONE (`9d6689a7182`): lane G (12 commits, T9+T10)
 merged per the §3b recipe, 4 conflicts resolved as predicted. Combined release gate running;
 lanes converged — single-tree execution resumes (T11-T14 remain). No push.
+
+**2026-07-29 02:5x local watchdog** — GM validation: marker discipline caught the stale-binary
+false-green (build failed on the auto-kept refCkptKey duplicate; its own MERGE NOTE named the
+fix). Deduped (`649d6f572ea`), GM2 build+gate rerunning. No push.
