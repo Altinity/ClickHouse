@@ -1729,3 +1729,9 @@ re-run with the CA filter. Release gate already green 1526/1526. No push.
 filter 1530/1530, AND the full-binary unfiltered ASan 11032/11032 EXIT=0 (the hung Silk test
 passed on isolated rerun — environmental, as attributed). Report written 04:28; DONE message
 pending. No push.
+
+**2026-07-29 05:0x local** — convergence + stitch 7 ruled (validateBudget equality rejection —
+the razor class dies at the validator). USER ACTION ITEMS surfaced: root-owned ./logs dir
+(docker debris, needs sudo to remove; trips unfiltered unit-test runs from repo root) and a
+contrib/silk fiber scheduler assertion (CAS-independent, aborts SilkFiberSocketTest/1 under
+ASan). Neither affects our filtered gates. No push.
