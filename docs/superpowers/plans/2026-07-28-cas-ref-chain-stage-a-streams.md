@@ -946,6 +946,56 @@ overturn any of these with evidence, which then goes to the controller as a ques
   (no partial credit — the `no known reds` rule).
 - [ ] **Step 5: Commit** `ca: stage A — gate battery results + verdict`.
 
+### Task 15: bounded fold walk — fix the unbounded-round liveness regression {#task-15}
+
+**Added 2026-07-29 (user directive "надо чинить") after the T14 soak measured the regression:
+zero completed GC rounds in 42 minutes on a hot ~30 GiB pool.** Root cause: Task 7's
+arithmetic intake replaced the old bounded work-set (`nextListedAbove` — the walk stepped only
+through ids the round-start LIST enumerated) with `expected = {epoch, seq+1}` walk-while-exists;
+on a namespace whose writer appends concurrently the walk chases the tail, so round time went
+from `backlog/walker_rate` (independent of concurrent writes) to `backlog/(walker−writer)` —
+unbounded as the writer approaches walker throughput (~444 logs/s measured). Downstream: probe
+A never samples (round-based cadence), fold seal/cursor never advance, ref backlog grows
+without bound, fsck O(backlog) blows its budgets. Secondary cost: `foldManifestEdges` pays
+HEAD+GET (2 serial RTTs) per manifest-edge fold where GET alone carries the same absence signal.
+
+**Files:**
+- Modify: `.../Gc/CasGc.cpp` (intake walk loop ~:1876, `foldManifestEdges` ~:1008)
+- Modify: `.../Pool/CasPool.h` (new `PoolConfig` knob)
+- Test: `src/Disks/tests/gtest_cas_gc_bounded_walk.cpp` (new)
+
+**Interfaces:**
+- Produces: `PoolConfig::gc_walk_max_logs_per_namespace` (uint64_t, default 10000, 0 = unbounded)
+  — per-namespace per-round intake budget counted in FOLDED LOGS (cut only at log boundaries,
+  never mid-log; atomic-log rule untouched).
+
+- [ ] **Step 1: Failing tests** (red first, against the current unbounded walk):
+  (a) *bounded-round*: plant `budget + K` contiguous logs in one namespace; run one round with
+  the knob at `budget`; assert the round COMPLETES, coverage row seals at exactly
+  `last_folded_ref_id = {E, budget}` (a voluntary cut is NOT a hold: `classification != 4`,
+  `hold == nullopt`), `fold_ref_intake` metrics carry `walk_budget_cuts = 1` and
+  `frontier_proven` excludes the cut namespace; the NEXT round continues from `budget+1` and
+  reaches the frontier.
+  (b) *liveness under a live writer*: appender thread keeps publishing while the round runs;
+  assert the round returns within the budget (bounded logs folded) rather than chasing.
+  (c) *suppression unchanged*: the cut namespace keeps `frontier_complete == false` ⇒
+  `suppress_destructive` stays true under `AuthoritativeForTest` with a cut present — the cut
+  must never widen destruction.
+  (d) *HEAD elimination*: fold of N edges performs exactly N GETs and 0 HEADs on manifest keys
+  (count via the test backend), and an absent body still takes the record-and-continue path.
+- [ ] **Step 2:** Implement the budget: count logs folded per namespace inside the walk loop;
+  on reaching the budget, `closeSegment()`, break WITHOUT hold, mark the namespace cut (excluded
+  from `frontier_proven`), emit `walk_budget_cuts` in the `fold_ref_intake` phase row. Implement
+  the `foldManifestEdges` HEAD removal (GET directly; `!got` keeps the existing absent semantics).
+- [ ] **Step 3:** Full CA gate (release) green; run the two prior liar/hold suites that pin walk
+  semantics (`gtest_cas_list_liar_end_to_end.cpp`, `gtest_cas_gc_hold_grammar.cpp`) explicitly.
+- [ ] **Step 4:** Focused re-validation soak: 30 min phase 3 with the default budget; PASS =
+  the leader COMPLETES ≥ 3 folding rounds under load (vs 0 in the T14 measurement), probe A
+  `Due > 0`, no CheckpointFailure, no new ERROR classes.
+- [ ] **Step 5: Commit** `ca: gc — bounded fold walk (walk budget + single-GET edge folds)`.
+  The stage verdict line in `2026-07-28-stage-a-RESULTS.md` may print `STAGE A: PASS` only
+  after this task's re-validation is green (the T14 doc states this dependency explicitly).
+
 ---
 
 ## Self-review checklist (run at plan-completion, before removing the DRAFT marker) {#self-review}
