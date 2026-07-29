@@ -2120,3 +2120,7 @@ trace (CA log + part_log + text_log) per broken part, captured LIVE.
 **2026-07-29 17:40 local** — watchdog: soak driver alive in the bounded fixpoint (deadline
 ~18:05); a14 mid-RCA (new_error_class.txt captured 17:31; three-table trace in progress);
 relink v5 fix round at the design agent. Nothing wedged.
+**2026-07-29 18:1x local** — relink v5 done: item-1 generalized (noexcept abort shares the
+exposure -> third obligation + guarded S0' + isTerminal impl duty); FreshCertifiedResponse
+named; two must-red sabotages; zero user-blocking questions. Targeted r3 on §6 launched;
+memory rewritten. Soak deadline ~18:05 + RCA in flight at a14.
