@@ -1065,17 +1065,45 @@ correctness-регрессии" (Constraint 18).]
 **Files:**
 - Modify: `.../Gc/CasGc.h` — DELETE `sampleRefListQuality` (`:668`) and its two documentation blocks
   (`:206` the gating verdict, `:657-667` the detector's contract)
-- Modify: `.../Gc/CasGc.cpp` — DELETE the definition (`:3522`) and the single call site (`:460`,
-  `sampleRefListQuality(ref_scan, new_round)`); update the stale comment at `:1351` ("…is due and on
-  no others (`sampleRefListQuality`). The intake does not need a second opinion about…")
+- Modify: `.../Gc/CasGc.cpp` — DELETE the definition (`:3522-3709`, including its
+  `GcPhaseTimer t(phase_sink, "ref_list_probe")` at `:3549`, the setting read at `:3550`, the five
+  ProfileEvents increments at `:3562`/`:3576`/`:3640-3641`/`:3699`/`:3702`, and the per-hole
+  `gc_anomaly` audit emission with `ev.detail = {{"probe","A"}, …}` at `:3647-3663`), the single call
+  site (`:460`, `sampleRefListQuality(ref_scan, new_round)`) and its comment (`:456-459`); update the
+  stale comment at `:1351`. **The phases are NOT an enum — they are ordered `const char *` literals
+  numbered only in comments as `PHASE N/19`, so deleting phase 4 means renumbering phases 5-19 down to
+  4-18 and changing every `/19` to `/18`** (the phase list, in order: `lease` `:293`,
+  `heartbeat_floor` `:338`, `defer_decision` `:394`, **`ref_list_probe` `:456` ← deleted**,
+  `parent_seal_read` `:478`, `fold_ref_group` `:1355`, `fold_seal_read` `:1399`, `fold_ref_intake`
+  `:1620`, `fold_ns_cleanup_scan` `:2532`, `fold_reduce` `:2677`, `fold_seal_write` `:2908`,
+  `pending_deletes` `:519`, `meta_pool_wait` `:749`, `round_commit` `:776`, `handoff_reclaim` `:839`,
+  `manifest_deletes` `:893`, `namespace_cleanup` `:942`, `ref_object_cleanup` `:955`, `orphan_sweep`
+  `:968`). A stale `N/19` is the kind of thing that survives for a year.
+- Also stale-comment sites, five of them, none inside the deleted block: `Gc/CasGc.h:206`
+  (`RefScanSummary` doc), `Gc/CasGc.cpp:1226` (`newestFoldSealRef` "in the same spirit as probe A"),
+  `Gc/CasGc.cpp:1558` (**the B1 doc — "probe A covers the listing, probe B2 covers everything below the
+  intake"; B1 STAYS, only the probe-A half of the sentence goes**),
+  `src/Disks/tests/cas_test_helpers.h:1272` (`HintHoleBackend` doc),
+  `src/Disks/tests/gtest_cas_gc_arithmetic_intake.cpp:48`
 - Modify: `.../Pool/CasPool.h` — DELETE `PoolConfig::gc_probe_a_period` (`:119`, default 16) and its
-  doc block (`:110`); grep every config/XML that sets it (tests and templates included)
+  doc block (`:109-118`). **It is a `PoolConfig` struct field only, NOT a user-facing setting** — no
+  `DECLARE(...)` entry in `ContentAddressedSettings.cpp` the way `gc_shards` and
+  `gc_snap_generations_to_keep` have, and no XML/DDL/config-template binding anywhere in the tree. So
+  there is nothing to remove from the settings surface and no config-compat question; verify with the
+  Step-1 inventory rather than assuming either way
+- Modify: `utils/ca-soak/soak/signals.py` (`:53-85`) — **a LIVE consumer, not a comment**: the soak
+  harness watches `CasGcProbeAHolePresent`/`HoleAbsent`/`Due`/`Performed` BY NAME. Left alone it
+  silently watches counters that no longer exist, which is worse than a build error because the soak
+  keeps reporting green. This is the one non-C++ code dependency of the deletion
 - Modify: `src/Common/ProfileEvents.cpp` — DELETE the SIX events at `:885-890`:
   `CasGcRefScanDisagreements` (probe-A-only: "taken by a SAMPLED GC round"), `CasGcProbeADue`,
   `CasGcProbeAPerformed`, `CasGcProbeASkipped`, `CasGcProbeAHolePresent`, `CasGcProbeAHoleAbsent`
 - Modify: `src/Interpreters/ContentAddressedGarbageCollectionLog.cpp` — DELETE the `ref_list_probe`
   phase from the enum and from the execution-order column comment (`:60`), and the
-  `due`/`performed`/`skipped`/`holes` example from the phase-metrics column comment (`:64`)
+  `due`/`performed`/`skipped`/`holes` example from the phase-metrics column comment (`:64`). The
+  generic phase plumbing itself is untouched: `GcPhaseTimer` → `GcPhaseRecord` → `Gc::phase_sink` →
+  `CasGcScheduler.cpp:154-158` → `makeGcRoundLogger` (`ContentAddressedMetadataStorage.cpp:455-510`)
+  serves all phases and only loses one row kind
 - Modify: `docs/en/operations/system-tables/content_addressed_garbage_collection_log.md` — **DELETE
   the `ref_list_probe` row (`:75`)**, whose cost column literally reads "one full ref-prefix `LIST` on
   a due round, none otherwise". This is a USER-FACING documented phase of
@@ -1083,13 +1111,33 @@ correctness-регрессии" (Constraint 18).]
   this commit; a phase documented but never emitted is worse than either
 - Delete: `src/Disks/tests/gtest_cas_holey_list_detector.cpp` (389 lines, 3 `TEST`s — the detector's
   own file). Verify all three are probe-A-only before deleting the file rather than the tests
-- Modify: `src/Disks/tests/gtest_cas_retirement_sweep.cpp` — DELETE
-  `ProbeAReportsAHintHoleAndTheRoundFoldsThroughItAnyway` (`:249`), the `gc_probe_a_period` configs
-  (`:255`, `:339`, `:392`) and the `gc_probe_a_period = 0` disable test (`:415`'s assertion)
+- Modify: `src/Disks/tests/gtest_cas_retirement_sweep.cpp` — THREE probe-A tests here, and they do
+  NOT all get the same treatment (verify names/anchors at execution; the file's "item 1: probe A,
+  demoted" section starts `:240`):
+  (i) `ProbeAReportsAHintHoleAndTheRoundFoldsThroughItAnyway` (`:249`) — DELETE;
+  (ii) `TheDetectorsCadenceIsOnEveryFoldingRoundsRow` (`:421`) — DELETE (there is no cadence left);
+  (iii) **`TheRoundEnumeratesTheRefPrefixOnceAndTheDetectorAddsTheSecond` (`:384`) — CONVERT, DO NOT
+  DELETE.** It already counts ref-prefix enumerations per round and varies `gc_probe_a_period`
+  (`:392`), including the `= 0` disable assertion (`:415`) — it is the existing proof of the
+  two-LIST claim, which makes it the natural home for Step 3's criterion and the before/after
+  anchor Task 12 needs. Rewrite it to assert ONE enumeration unconditionally and rename it
+  accordingly (e.g. `TheRoundEnumeratesTheRefPrefixExactlyOnce`). Deleting it would discard the only
+  test that ever measured what this task claims to improve
 - Modify: `src/Disks/tests/gtest_cas_gc_log.cpp` — the phase-order expectation list (`:383`) and the
   `metricsOf(rows, 0, "ref_list_probe")` assertion (`:413`)
 - Modify: `docs/superpowers/cas/2026-07-28-ref-rework-adjacent-findings.md` — R7's supersession note
   (**already written 2026-07-30 with the plan amendment; verify it still matches what was deleted**)
+- Modify: `docs/superpowers/cas/todo-20260726.md` — **item 1 (near `:110`) records an OLD proposal to
+  "Remove probe B1 — self-declared blind to the suspected defect". The directive says "Сохранить
+  B1/B2", so that proposal is OVERRIDDEN and must be marked so.** Left as-is it reads like standing
+  intent, and the next reader deletes B1 believing it was agreed. Its probe-A paragraph (`:120`) is
+  also now history
+- Modify (doc sweep, same commit — the deletion is not done while the tree still describes the
+  detector as live): `docs/superpowers/cas/BACKLOG.md` (`:167`),
+  `docs/superpowers/cas/2026-07-28-stage-a-RESULTS.md` (several),
+  `docs/superpowers/cas/2026-07-28-stage-a-retirement-verdicts.md` (`:74` — the verdict that DEMOTED
+  probe A; it becomes the history of a deleted detector, not a live policy),
+  `docs/superpowers/cas/11-walkthrough.md` (`:1879`)
 - Modify: `docs/superpowers/specs/2026-07-27-cas-ref-chain-complete-cut-design.md` — §5's "Probe A:
   sampled, deterministic cadence, durable due/performed/skipped observability; aborts nothing; the
   mount-time store gate (#23) is separate." That sentence is accurate TODAY and false the moment this
@@ -1123,10 +1171,15 @@ correctness-регрессии" (Constraint 18).]
   to give the detector a second, independent enumeration, or keep it with a comment saying what else
   justifies it. Do not leave the question unasked.
 - [ ] **Step 3: the result criterion, asserted** (directive: "после удаления probe A нет второго
-  полного ref LIST"): a test that a folding round performs EXACTLY ONE full enumeration of
-  `cas/refs/` — and, critically, on EVERY round including the ones that used to be sampled (with the
-  old cadence, round 16 would have been the one to catch this; a test that only checks round 1 proves
-  nothing). Assert by LIST count attributed to the ref prefix, not by wall time.
+  полного ref LIST"): the CONVERTED test (iii) above asserts a folding round performs EXACTLY ONE full
+  enumeration of `cas/refs/` — and, critically, on EVERY round including the ones that used to be
+  sampled (with the old cadence, round 16 would have been the one to catch this; a test that only
+  checks round 1 proves nothing). Assert by LIST count attributed to the ref prefix, not by wall time.
+  The claim is verifiable rather than merely plausible because `Gc::enumerateRefPrefix`
+  (`CasGc.cpp:3462`) has exactly two callers tree-wide — `listRefPrefix` (`:3505`, the round's own
+  scan) and the detector (`:3570`) — and the round's other `backend.list` calls (`:3004`, `:3147`,
+  `:3263`) target manifest and generation prefixes, not `cas/refs/`. Re-verify that call-site count in
+  Step 1's inventory: if a third caller has appeared, the criterion needs re-derivation, not a pass.
 - [ ] **Step 4: Full CA gate — EXPECT THE COUNT TO GO DOWN**, and record the exact expected delta in
   the report before running: 3 tests + 1 suite from the deleted detector file, plus the tests removed
   from `gtest_cas_retirement_sweep.cpp`. A gate comparison that only ever tolerates growth would read
@@ -1176,6 +1229,21 @@ suppressed"), and errors enter as `anomalies`. So this formula is the Stage-A/§
 this task changes only what `frontier_complete` is ALLOWED to become: catalog-proven true instead of
 hard-wired false. Nothing about the gate is weakened here — if the flip requires touching any term of
 that expression, the flip is wrong and the task raises instead of landing.
+
+Exact anchors, so "unchanged" is checkable rather than asserted: the gate is computed ONCE at
+`Gc/CasGc.cpp:2708-2709` — `result.suppress_destructive = !report.anomalies.empty() ||
+!carried_holds.empty() || frontier_incomplete;`, under the header comment "THE DESTRUCTIVE GATE"
+(`:2685`) — with `frontier_complete = universe_authoritative && result.frontier_proven ==
+result.frontier_namespaces` at `:2704` and `universe_authoritative = policy ==
+UniversePolicy::AuthoritativeForTest` at `:2703`. The enum is `Gc/CasGc.h:53-63` with `kDefault` at
+`:62`, and `Gc::runRegularRound`'s default parameter (`Gc/CasGc.h:325`) is the only production entry —
+the scheduler passes no policy at all, which is why this is a one-line flip and not a rewrite.
+
+**One naming consequence the flip forces:** the authoritative enumerator is literally named
+`AuthoritativeForTest`. Pointing `kDefault` at it makes the PRODUCTION value's name a lie, and the
+next reader will "fix" the obvious mistake of a test-only value being the default. Rename the
+enumerator to `Authoritative` as part of this task — a mechanical, compiler-enumerated rename. It is
+in scope precisely because leaving it invites a revert.
 
 - [ ] **Step 1:** Change `kDefault` (the source-level flip — no other seam exists). The
   kill-shot test's expectations change: "zero deletes
@@ -1344,6 +1412,20 @@ Commit alone; final commit updates `models/README.md` + `cas/06-tla-models.md`.
   ref-object cleanup; namespace cleanup; generation pruning; and time plus number of ROUNDS to
   fixpoint. Report per line: invocation count, S3 operation counts by verb, wall time, and share of
   round time.
+  **No new instrumentation is needed for six of the seven, and one has no row of its own — know which
+  before you start.** `GcPhaseTimer` is always on ("no setting, deliberately") and already emits a
+  duration + phase-metrics row per phase into
+  `system.content_addressed_garbage_collection_log`, so five inventory lines read straight off
+  existing phase rows: `pending_deletes` (metrics `redeleted`/`graduated`/`deleted`/`absent`/
+  `replaced`/`spared`), `manifest_deletes` (`attempted`/`deleted`), `orphan_sweep` (its
+  `ManifestSweepResult` retention breakdown), `ref_object_cleanup` (`Gc::cleanupRefObjects`), and
+  `namespace_cleanup` (`items`/`items_pending`/`items_completed`). **Generation pruning is the
+  exception: `Gc::pruneSupersededGenerations` runs INSIDE the `round_commit` phase with no row of its
+  own**, so its cost is currently entangled with commit cost — measure it by its own metrics
+  (`generations_visited`/`pruned_through`/`generations_referenced`) plus the shared
+  `deletePrefixWholesale` primitive it uses, and if that still cannot separate it, it goes into Task
+  12's un-timed-spans list by name rather than being estimated. Rounds-to-fixpoint comes from the
+  round sequence itself.
 - [ ] **Step 3d: the six result criteria, as gate rows.** Each is PASS/FAIL on evidence; a row
   without a measurement is a FAIL, not a blank:
 
