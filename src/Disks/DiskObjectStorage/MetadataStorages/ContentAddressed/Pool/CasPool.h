@@ -636,22 +636,6 @@ public:
     /// bool. This stays as the test/observability seam.
     bool uncleanEpochBoundarySeenForTest() const { return mount_runtime.uncleanEpochBoundarySeenForTest(); }
 
-    /// TRUE iff `ns` is scoped under THIS Pool's own mounted `server_root_id` AND
-    /// this incarnation's live epoch's predecessor died uncleanly (the per-epoch high-water-mark).
-    /// A narrow, same-process, NEVER-false-positive signal: `reportLateLogsIfAny`'s empty-dead-region
-    /// extension ("seal skipped on an empty dead-region ... detector blind in that
-    /// hole") uses it to catch a first-ever, in-flight-at-crash txn even though no seal was published
-    /// for it -- but ONLY when the SAME Pool instance that observed the reclaim is also the one
-    /// running the check (the common single-leader-affinity case). A GC leader sweeping a FOREIGN
-    /// srid's namespace, or a wholly separate process (`clickhouse-disks fsck`), gets nothing from
-    /// this -- that residual gap is the documented carve-out: no cross-process durable marker exists
-    /// for the empty-dead-region case (unlike a non-empty one, which the recovery seal covers), and
-    /// the finding itself rates the gap double-rare and self-healing (closed by this namespace's own
-    /// first real snapshot of the new epoch).
-    bool ownsAndSawUncleanBoundaryFor(const RootNamespace & ns) const
-    {
-        return mount_runtime.ownsAndSawUncleanBoundaryFor(ns);
-    }
 
     /// Known-present blob-hash cache. A HINT only — correctness never
     /// depends on it: a hit just makes putBlob go HEAD-first, and a stale hit is caught by that HEAD.

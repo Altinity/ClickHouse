@@ -118,6 +118,12 @@ enum class Occupant : uint8_t
 /// normalises every malformed-input class to `CORRUPTED_DATA` and passes `UNKNOWN_FORMAT_VERSION`
 /// through (an object this build cannot read is still not a seal it can consume). Everything else
 /// propagates, leaving the caller's lane exactly as it was.
+std::optional<RefTxnId> chainLinkFor(const RefTxnId & id, const std::optional<RefTxnId> & last_epoch_seal)
+{
+    return id.ref_sequence == 1 && last_epoch_seal && last_epoch_seal->writer_epoch < id.writer_epoch
+        ? last_epoch_seal : std::nullopt;
+}
+
 /// The epoch-closing transaction INV-2 places at `{E, T+1}`: exactly one `EpochSeal` op, no table
 /// content, and the chain link on -- and only on -- sequence 1, where the grammar requires it.
 ///
@@ -132,12 +138,13 @@ RefLogTxn makeEpochSealTxn(const RootNamespace & ns, const RefTxnId & id, const 
     RefOp op;
     op.kind = RefOpKind::EpochSeal;
     seal.ops.push_back(op);
-    /// Required IFF this is sequence 1 of a non-genesis epoch. The walk never mints a sequence-1 seal
-    /// in a namespace's own genesis epoch -- its first dead epoch always already holds the birth
-    /// transaction, so its seal sits at sequence >= 2 -- which is why "sequence 1 => chain it" is the
-    /// complete rule here and needs no `life_epoch` of its own.
-    if (id.ref_sequence == 1)
-        seal.prev_epoch_seal = prev_epoch_seal;
+    /// Through `chainLinkFor`, NOT a local `ref_sequence == 1` test, so this is not a fifth site of a
+    /// rule whose four-site drift is what let the writer preview a transaction it would never send. The
+    /// two conditions happen to coincide for every id the walk can reach here -- its first dead epoch
+    /// always already holds the birth transaction, so that seal sits at sequence >= 2, and every later
+    /// dead epoch's seal is at sequence 1 with a strictly-lower held seal -- but "happen to coincide" is
+    /// exactly the property that rots silently. One rule, one caller shape.
+    seal.prev_epoch_seal = chainLinkFor(id, prev_epoch_seal);
     return seal;
 }
 
@@ -152,12 +159,6 @@ RefLogTxn makeEpochSealTxn(const RootNamespace & ns, const RefTxnId & id, const 
 /// refuses at ENCODE: the lane would fail with a self-inflicted `CORRUPTED_DATA` on every attempt and
 /// never reach the collision that is supposed to fence it. Stamping nothing lets the attempt go out and
 /// meet the seal, which is the intended conclusive rejection.
-std::optional<RefTxnId> chainLinkFor(const RefTxnId & id, const std::optional<RefTxnId> & last_epoch_seal)
-{
-    return id.ref_sequence == 1 && last_epoch_seal && last_epoch_seal->writer_epoch < id.writer_epoch
-        ? last_epoch_seal : std::nullopt;
-}
-
 Occupant classifyRefLogOccupant(const RootNamespace & ns, const RefTxnId & id, const String & occupant_bytes,
                                 const String & expected_bytes)
 {
@@ -2349,16 +2350,23 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
         const RefTxnId next_id = working.nextTxnId(live_epoch_fn());
         if (next_id.ref_sequence == 1 && !chainLinkFor(next_id, preview_epoch_seal))
         {
+            /// The two causes are reported SEPARATELY. They are different facts about the world and the
+            /// message must not assert the one it did not observe: holding a seal OF this epoch is
+            /// positive evidence that a successor closed it, while holding no seal at all says only that
+            /// this runtime has no chain link -- a deposition may or may not have happened. The behaviour
+            /// is identical either way (a `Live` table at sequence 1 with no usable link can construct
+            /// nothing legal), so only the diagnosis differs, and only the diagnosis is at risk of
+            /// being wrong.
+            const String cause = preview_epoch_seal
+                ? fmt::format("the only seal it holds, {}-{}, is of that SAME epoch — a successor already "
+                              "closed it", preview_epoch_seal->writer_epoch, preview_epoch_seal->ref_sequence)
+                : String("it holds no epoch seal at all, so it has no chain link to name");
             complete_error(carve_all_pending(), std::make_exception_ptr(Exception(ErrorCodes::INVALID_STATE,
                 "CAS ref-log append for namespace '{}': writer epoch {} cannot be opened by this mount — its "
-                "next transaction would be {}-{}, sequence 1 of an epoch this lane holds no closing seal "
-                "BELOW (the only seal it has, {}, is of that same epoch, i.e. a successor already closed "
-                "it). Nothing legal can be written here and nothing was sent. This mount's append lane "
-                "resumes only under a later epoch",
-                ns.string(), next_id.writer_epoch, next_id.writer_epoch, next_id.ref_sequence,
-                preview_epoch_seal
-                    ? fmt::format("{}-{}", preview_epoch_seal->writer_epoch, preview_epoch_seal->ref_sequence)
-                    : String("none"))));
+                "next transaction would be {}-{}, sequence 1 of an epoch it holds no closing seal BELOW: {}. "
+                "Nothing legal can be written here and nothing was sent. This mount's append lane resumes "
+                "only under a later epoch",
+                ns.string(), next_id.writer_epoch, next_id.writer_epoch, next_id.ref_sequence, cause)));
             ProfileEvents::increment(ProfileEvents::CasRefAppendSealRejected);
             return;
         }

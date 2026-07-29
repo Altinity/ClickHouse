@@ -207,10 +207,18 @@ public:
     using HidingListBackend::get;
 
     String watched_substr;
+
+    /// Assigned from the test thread and read from whatever thread the recovery runs on, so the
+    /// read-and-move below is guarded. Today's tests all assign before starting the recovery thread and
+    /// clear after joining it, so there is no race to fix -- but this is the same seam that already
+    /// produced one use-after-free, and "the current tests happen not to race" is not a property a
+    /// future test author can see. The mutex makes the constraint enforced rather than remembered.
+    std::mutex hook_mutex;
     std::function<void(const String &)> on_key;
 
     std::optional<GetResult> get(const String & key, Range range) override
     {
+        std::unique_lock hook_lock(hook_mutex);
         if (on_key && !watched_substr.empty() && key.find(watched_substr) != String::npos)
         {
             /// ONE-SHOT by moving the callback OUT before invoking it, and that is a correctness
@@ -221,6 +229,9 @@ public:
             /// it as a `heap-use-after-free` while a hook was parked on a condition variable.
             auto hook = std::move(on_key);
             on_key = nullptr;
+            /// Released before the hook runs: it parks on a condition variable, and holding the seam's
+            /// own mutex across that would deadlock the very thread meant to release it.
+            hook_lock.unlock();
             hook(key);
         }
         return HidingListBackend::get(key, range);

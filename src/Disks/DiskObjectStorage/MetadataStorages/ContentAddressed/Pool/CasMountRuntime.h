@@ -302,16 +302,6 @@ public:
         return unclean_epoch_boundary_seen_at.load(std::memory_order_relaxed) != 0;
     }
 
-    /// Return whether `ns` belongs to this server root and the current live epoch is exactly the epoch
-    /// that reclaimed an unclean predecessor.
-    bool ownsAndSawUncleanBoundaryFor(const RootNamespace & ns) const
-    {
-        const String & prefix = server_root_id;
-        const String & full = ns.string();
-        return full.size() > prefix.size() && full.starts_with(prefix)
-            && full[prefix.size()] == '/'
-            && unclean_epoch_boundary_seen_at.load(std::memory_order_relaxed) == liveWriterEpoch();
-    }
 
     /// ---- self-remount recovery ----
     /// On a lost lease, arm a recovery thread when background operation is enabled. It retries the
