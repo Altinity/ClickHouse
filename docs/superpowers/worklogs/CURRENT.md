@@ -1975,3 +1975,9 @@ uncommitted in tree (assert_no_leftovers ruling being implemented). Load 2.0, no
 Slot-0 items proven (dump script end-to-end incl. self-caught manifest bug). Fix-round items
 1-3 restated (crossed messages): suppression-aware leftovers, W3 product-recreation, re-runs.
 a15 BUILD SLOT OPENED (docker drained); scenarios queue behind it, then a16.
+**2026-07-29 14:1x local** — T15 gate GREEN in its slot: 1556/1556 (243 suites, +8/+1 =
+exactly its file), liar/holdgrammar identical to baselines, bounded-walk 8/8. Self-caught
+test-window bug (capability probe's _probe/ deletes) fixed test-only + the aphorism worth
+keeping: "a red proves the assertion FIRES, not that it measures the right thing". Slot
+closed; a14 scenarios GO; a16 next; then reviews -> merge -> main rebuild -> re-validation
+soak on the PATCHED binary.
