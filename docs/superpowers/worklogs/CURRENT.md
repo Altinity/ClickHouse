@@ -1881,3 +1881,7 @@ round when all unchanged. No knob, no new state (cursor IS the remembered tail â
 makes the tail a sufficient summary). Liar still beaten: middle-hide = exact-key non-event,
 tail-hide = caught by quiet-probe. Plan rewritten (2be38b2b98a), brief regenerated, impl-a15
 redirected mid-read.
+**2026-07-29 10:5x local** â€” two red lanes = pre-suppression drain asserts vs Stage-A posture
+-> adapt per T9 option-a pattern (T14). T15 five-way rule confirmed w/ held-bounded amendment
++ verbatim-row-carry test (f); tail-only-hide residual accepted (Stage-B self-heals at
+destructive probes).
