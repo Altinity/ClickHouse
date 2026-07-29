@@ -450,6 +450,14 @@ restart, and the same prefix bootstraps cleanly (`healthy_after_removing_survivo
 created as the control and comes up empty — checksum `0\t0` against life 1's
 `200\t18123181848219261492`.
 
+**One nuance the RCA exposed, recorded because it is adjacent and not because it is a Stage-A red.**
+The refusal is raised during metadata loading and propagates out of it, so the SERVER EXITS rather than
+starting with that one disk marked unusable (`Application: Caught exception while loading metadata:
+Code: 668 ... (INVALID_STATE)`, container exit 156, reproduced twice — 12:26 by hand and 12:31 from the
+card). Refusing the pool is right; taking the whole node down for one residual CA prefix is a design
+question worth a BACKLOG item. It is pre-existing bootstrap behaviour, not something Stage A
+introduced, and it is not what row 14 turns on.
+
 Reaching this took four runs and cost two earlier diagnoses that were each right and each incomplete:
 emptying a prefix under a stopped server is not a recreated pool (fixed by going through `FORGET`), and
 the remaining unhealthy restart was not a defect at all but the guard doing its job. The refusal is read
@@ -561,6 +569,23 @@ stay invisible until the gate task. **A per-task battery must cover the lane set
 certifies**, and a posture flip needs a full assertion sweep, not just the lanes that happen to be in
 the loop.
 
+**Two of my own fixes were wrong, and the re-runs caught them — which is the argument for re-running
+rather than committing and reporting.** The first is a house-grade lesson that `soak/signals.py`
+already knew and the cards did not: my fail-closed counter guard treated a MISSING counter as an
+error, and `system.events` omits every counter that has never incremented — so an always-zero counter
+is absent exactly when the invariant HOLDS, and the guard failed the runs it existed to protect. It now
+asks with `system_events_show_zero_values = 1`, which makes the binary enumerate its whole registry, so
+a name still missing really is missing. The second was smaller and dumber: S43 called `_zstd_decompress`
+without importing it, after the FORGET and the wipe had both already succeeded.
+
+**Why the S30 assertion was SPLIT rather than narrowed.** The other three adaptations narrow a single
+claim to a permitted family. D1's fanout claim is not one claim: `dropNamespace` tombstoning the shard
+(so `root_dirs` stays bounded) and GC RECLAIMING that tombstone (so per-round cost tracks live tables)
+are separate mechanisms, and Stage A suppresses only the second. Narrowing would have meant weakening
+both halves; splitting keeps the first asserted exactly as before — `root_dirs` 2 → 2 in the run — and
+excuses only the half that suppression makes impossible, where `CasRootGet` grew 18 → 82 because every
+round keeps re-reading tombstones nothing is allowed to reclaim.
+
 **Contamination, and how it was ruled out.** Two of the three lane passes were run on a machine that
 was not mine alone — first a dead soak's GC fold, then another agent's full build at load ~41. Only the
 third pass, on an idle box, is cited as evidence. Timing-sensitive gates need exclusive machine time,
@@ -619,6 +644,14 @@ Sixteen of seventeen rows green. One row (12a) is a scale probe rather than a ga
 not green: row 12c, the fold-round liveness regression, which is the designated gate.
 
 STAGE A: PENDING (T15 re-validation)
+
+**Row 14 was ruled PENDING alongside row 12c on 2026-07-29, with the caveat that it would become a
+measured RED — and the line `FAIL` — if the no-ping-after-restart turned out to be a real product
+defect.** The RCA that ruling ordered has since landed and resolved the caveat in the other direction:
+the no-ping is the residual-data guard firing exactly as designed (`CasPool.cpp:439`), proven by a
+causation control in the card itself, and S43 now measures 16/16 `status=PASS`. Row 14 is therefore
+discharged rather than pending, and the verdict names one gate rather than two. **If the stage owner
+reads the caveat differently, restoring `+ row 14 W3` to the line above is a one-line change.**
 
 **The gate is row 12c, and it is the only thing standing between this and a pass.** Under a live writer
 the GC leader completed ZERO folding rounds in 42 minutes, diagnosed to Task 7's arithmetic intake
