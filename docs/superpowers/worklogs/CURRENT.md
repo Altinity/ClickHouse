@@ -1803,3 +1803,7 @@ T13 (LIST-liar fault injection, the blocker end-to-end).
 **2026-07-29 08:20 local** — watchdog: T13 live (worktree tmp/t13-revert created ~5 min after
 ACK). Quarantined STALE t13_*.log files from an earlier session into build/stale_t13_pre20260729/
 (marker-collision hazard vs impl-a13's namespace); agent notified.
+**2026-07-29 08:4x local** — T13 interim: 8/8 arms green; fsck arm surfaced a REAL residual —
+free-function `recoverRefTable` is still LIST-driven (fsck replay blind/false-clean under the
+lie; orphan-sweep deletion premise shares it). BACKLOG'd as `[RECOVER-REF-TABLE-LIST-RESIDUAL]`,
+a named 7b precondition. Arithmetic pass unaffected — T7 holds. Revert proof next.
