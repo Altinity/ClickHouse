@@ -1688,3 +1688,6 @@ running (fix_build3 done). Both converging. No push.
 **2026-07-29 02:4x local** — T6 review: approved, 8 findings all LOW/INFO; reviewer self-
 corrected two of its own citations and retracted a wrong inference — the evidence culture
 holding both directions. Polish round dispatched. T10 fix gate running. No push.
+
+**2026-07-29 03:0x local** — T10 fix round landed (per-reason counters; class/prose decoupling
+via out-param); closing confirmation dispatched. T6 polish round in progress. No push.
