@@ -47,6 +47,29 @@
 >   (`WedgeRetryCreated`, `WedgeResolveInstall`, `WedgeResolveRejected`, `WedgeResolveCorrupted`,
 >   `WedgeResolveStale`, `FloorReconcile`).
 >
+> THE AUTHOR'S OWN POST-MORTEM, kept because it makes resumption cheaper and states the method rule:
+> - **Why the product argument was wrong**, in their words: `WedgeResolution` is the RESULT of the
+>   occupant adjudication, `Reason` is a REFINEMENT of one `WedgeResolution` value, and neither is
+>   independent of `SlotOccupyResult::Kind`. "A product of cardinalities bounds a cross-product of
+>   INDEPENDENT choices; this machine composes, so the product bounds nothing. My 'exhaustive by
+>   construction' claim was a category error dressed as rigour, and it is worse than the
+>   inspection-based enumeration it replaced, because it READS as a proof."
+> - **The `Created`-then-inert-recheck row is an UNDER-approximation**, which this plan's own Global
+>   Constraints already condemn ("an over-approximation is the safe side; an under-approximation is a
+>   defect"). The rule caught it; row 5 was classified inert BEFORE the `Created` arm existed and was
+>   never re-derived afterwards.
+> - **THE WITNESS FIX, one variable:** `sawRetryCreatedAdopt' = … \/ H(TRUE)` carries no provenance,
+>   and `WedgeResolveInstall` is reachable from row 10 as well as row 11 — since TLC reports the
+>   SHORTEST counterexample, the witness fires RELIABLY on the row-10 route, so it is guaranteed
+>   vacuous rather than flaky. Fix: set a `retryCreatedThisWedge` flag in `WedgeRetryCreated`, clear
+>   it wherever the wedge clears, and gate the history conjunct on `H(retryCreatedThisWedge[m])`.
+> - **`_sab_nopoison`'s rule, generalized:** trace-checking was required of `_sab_nowedge` and not of
+>   `_sab_nopoison`, which was then permitted a red through the very row-9 arm the mapping labels an
+>   over-approximation. The rule to carry: **a red may not rest SOLELY on an over-approximated route.**
+> - **THE METHOD RULE worth more than this plan:** a cardinality argument is only a BOUND when the
+>   dimensions are INDEPENDENT, and the cheapest way to find out is to ask which of them is computed
+>   FROM another.
+>
 > WHAT r4 CONFIRMED SOUND, and it is most of the document: `WedgeRetryCreated`'s state transition and
 > guards; the licensing contract quote; `MaxId = 6` sufficiency; B1(b) (both exception exits modelled
 > as inert, `RefusedPreAttempt` correctly attributed to an `Unresolved` RESULT); the `sApplyOwed`
