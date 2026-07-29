@@ -1780,3 +1780,5 @@ sentence restored). T12 (retirement sweep) dispatched — the task where the old
 defensive scaffolding formally dies. T13+T14 remain. No push.
 **2026-07-29 07:00 local** — watchdog: T12 in flight (impl-a12 ACKed 06:59, analysis phase —
 probe-A premise re-check + T_mat consumer sweep). No builds yet; nothing wedged. T13/T14 queued.
+**2026-07-29 07:20 local** — watchdog: T12 mid-edit (CasGc/Settings touched 07:15-07:16 — probe-A
+demotion + T_mat deletion in progress; verdict doc not yet created). No commits/builds yet; live.
