@@ -1764,3 +1764,7 @@ running (logs seconds-fresh). No push.
 **2026-07-29 06:4x local** — T11 DONE (REBUILD condemn-nothing landed; fsck arithmetic +
 record-not-throw; live ca-fsck verified; 1534/1534 + ASan 1538/1538); reviewer dispatched.
 T12-T14 remain. No push.
+
+**2026-07-29 07:0x local** — T11 approved w/ evidence fix round (the lane's 4th
+unbacked-figure case — re-run-with-tee or delete, no middle ground). T14 inherits: 05020 live
+leg + the aggregate nothing-reclaims paragraph. No push.
