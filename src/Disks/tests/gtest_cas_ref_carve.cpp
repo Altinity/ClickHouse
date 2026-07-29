@@ -93,11 +93,11 @@ std::optional<RefLogTxn> newestLogTxn(DB::Cas::Backend & backend, const DB::Cas:
     String cursor;
     for (;;)
     {
-        const ListPage page = backend.list(layout.refsNamespacePrefix(ns), cursor, 1000);
+        const ListPage page = backend.list(layout.refsNamespacePrefix(RefNamespaceId::stageATransition(ns)), cursor, 1000);
         for (const ListedKey & lk : page.keys)
         {
             const auto parsed = layout.parseRefObjectKey(lk.key);
-            if (parsed && parsed->ns == ns && parsed->kind == RefObjectKind::Log
+            if (parsed && parsed->id.ns == ns && parsed->kind == RefObjectKind::Log
                 && (!newest || *newest < parsed->txn_id))
                 newest = parsed->txn_id;
         }
@@ -107,7 +107,7 @@ std::optional<RefLogTxn> newestLogTxn(DB::Cas::Backend & backend, const DB::Cas:
     }
     if (!newest)
         return std::nullopt;
-    const auto got = backend.get(layout.refLogKey(ns, *newest));
+    const auto got = backend.get(layout.refLogKey(RefNamespaceId::stageATransition(ns), *newest));
     if (!got)
         return std::nullopt;
     return decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), *newest);
@@ -122,13 +122,13 @@ size_t committedRemovalCountForRef(DB::Cas::Backend & backend, const DB::Cas::La
     String cursor;
     for (;;)
     {
-        const ListPage page = backend.list(layout.refsNamespacePrefix(ns), cursor, 1000);
+        const ListPage page = backend.list(layout.refsNamespacePrefix(RefNamespaceId::stageATransition(ns)), cursor, 1000);
         for (const ListedKey & lk : page.keys)
         {
             const auto parsed = layout.parseRefObjectKey(lk.key);
-            if (!parsed || parsed->ns != ns || parsed->kind != RefObjectKind::Log)
+            if (!parsed || parsed->id.ns != ns || parsed->kind != RefObjectKind::Log)
                 continue;
-            const auto got = backend.get(layout.refLogKey(ns, parsed->txn_id));
+            const auto got = backend.get(layout.refLogKey(RefNamespaceId::stageATransition(ns), parsed->txn_id));
             if (!got)
                 continue;
             const RefLogTxn txn = decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), parsed->txn_id);

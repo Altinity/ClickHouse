@@ -124,7 +124,8 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
             ++report.namespaces_already_removed;
             continue;
         }
-        const auto ref_objects = admin->backend().list(admin->layout().refsNamespacePrefix(ns), /*cursor=*/"", /*limit=*/1);
+        const auto ref_objects = admin->backend().list(
+            admin->layout().refsNamespacePrefix(RefNamespaceId::stageATransition(ns)), /*cursor=*/"", /*limit=*/1);
         if (ref_objects.keys.empty())
             continue;   /// A roots-only listing entry is not a table namespace.
 

@@ -105,7 +105,7 @@ String publishAtReturningManifestKey(
 /// a fixture that owns the whole namespace states the checkpoint outright.
 void writeCkptRaw(Backend & backend, const Layout & layout, const RootNamespace & ns, const RefCkpt & ckpt)
 {
-    backend.putIfAbsent(layout.refCkptKey(ns), encodeRefCkpt(ckpt));
+    backend.putIfAbsent(layout.refCkptKey(RefNamespaceId::stageATransition(ns)), encodeRefCkpt(ckpt));
 }
 
 /// The table state after applying exactly `ids`, through the same builder the writer and the oracle
@@ -116,7 +116,7 @@ RefTableState stateAfter(Backend & backend, const Layout & layout, const RootNam
     RefReplayBuilder builder(std::nullopt);
     for (const RefTxnId & id : ids)
     {
-        const auto got = backend.get(layout.refLogKey(ns, id));
+        const auto got = backend.get(layout.refLogKey(RefNamespaceId::stageATransition(ns), id));
         if (!got)
             throw std::runtime_error("stateAfter: fixture log " + std::to_string(id.writer_epoch) + "-"
                                      + std::to_string(id.ref_sequence) + " is missing");
@@ -176,11 +176,11 @@ TEST(CasRebuildCondemnNothing, HiddenLiveManifestBlobIsNotCondemned)
     /// HIDDEN owner: ref_b pins blob 2, and neither its record nor its manifest is ever listed.
     const String hidden_manifest =
         publishAtReturningManifestKey(*backend, layout, kNsA, RefTxnId{1, 2}, "ref_b", /*build_sequence=*/2, DB::UInt128(2));
-    backend->hide(layout.refLogKey(kNsA, RefTxnId{1, 2}));
+    backend->hide(layout.refLogKey(RefNamespaceId::stageATransition(kNsA), RefTxnId{1, 2}));
     backend->hide(hidden_manifest);
 
     /// Precondition: both objects really are durable and really are hidden.
-    ASSERT_TRUE(backend->get(layout.refLogKey(kNsA, RefTxnId{1, 2})).has_value());
+    ASSERT_TRUE(backend->get(layout.refLogKey(RefNamespaceId::stageATransition(kNsA), RefTxnId{1, 2})).has_value());
     ASSERT_TRUE(backend->get(hidden_manifest).has_value());
 
     Gc gc(store, kGc);
@@ -314,7 +314,7 @@ TEST(CasRebuildCondemnNothingFsck, MidChainHoleBelowAWitnessIsChainBroken)
     publishAt(*backend, layout, kNsA, RefTxnId{1, 3}, "ref_c", 3, DB::UInt128(3));
 
     /// Punch the hole: {1,2} is gone while {1,3} stays durable and listed.
-    const String holed = layout.refLogKey(kNsA, RefTxnId{1, 2});
+    const String holed = layout.refLogKey(RefNamespaceId::stageATransition(kNsA), RefTxnId{1, 2});
     const HeadResult h = backend->head(holed);
     ASSERT_TRUE(h.exists);
     backend->deleteExact(holed, h.token);
@@ -356,8 +356,8 @@ TEST(CasRebuildCondemnNothingFsck, TailAboveTheCheckpointIsWalkedNotUnchecked)
                  RefCkpt{.life_epoch = 1, .checkpoint_snapshot_id = RefTxnId{1, 2}, .last_epoch_seal = std::nullopt});
 
     /// The store stops listing the tail. It stays perfectly readable by exact key.
-    backend->hide(layout.refLogKey(kNsA, RefTxnId{1, 3}));
-    backend->hide(layout.refLogKey(kNsA, RefTxnId{1, 4}));
+    backend->hide(layout.refLogKey(RefNamespaceId::stageATransition(kNsA), RefTxnId{1, 3}));
+    backend->hide(layout.refLogKey(RefNamespaceId::stageATransition(kNsA), RefTxnId{1, 4}));
 
     const FsckReport rep = runFsck(*store, /*detail=*/true);
     ASSERT_GT(backend->holesServed(), 0u) << "the tail was never actually hidden from a LIST";
@@ -454,7 +454,7 @@ TEST(CasRebuildCondemnNothingFsck, OneBadNamespaceDoesNotAbortTheAudit)
     publishAt(*backend, layout, kNsA, RefTxnId{1, 1}, "ref_a", 1, DB::UInt128(1), /*birth=*/true);
     publishAt(*backend, layout, kNsA, RefTxnId{1, 2}, "ref_b", 2, DB::UInt128(2));
     publishAt(*backend, layout, kNsA, RefTxnId{1, 3}, "ref_c", 3, DB::UInt128(3));
-    const String holed = layout.refLogKey(kNsA, RefTxnId{1, 2});
+    const String holed = layout.refLogKey(RefNamespaceId::stageATransition(kNsA), RefTxnId{1, 2});
     const HeadResult h = backend->head(holed);
     ASSERT_TRUE(h.exists);
     backend->deleteExact(holed, h.token);

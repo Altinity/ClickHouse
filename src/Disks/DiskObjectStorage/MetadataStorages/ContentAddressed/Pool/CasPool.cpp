@@ -1402,9 +1402,11 @@ std::vector<String> Pool::listNamespaces(const String & prefix)
     /// RustFS: to confirm in soak.
     std::unordered_set<String> found;
 
-    /// `cas/refs/`: ref-object keys are `<pool_prefix>/cas/refs/<ns>/_log|_snap|_cleanup/<txn-id>`.
+    /// `cas/refs/`: ref-object keys are `<pool_prefix>/cas/refs/<ns>/<inc>/_log|_snap|_cleanup/<txn-id>`.
     /// `parseRefObjectKey` recognizes them and yields the owning namespace; any key it does not
-    /// recognize is skipped (it is not one of this pool's ref objects).
+    /// recognize is skipped (it is not one of this pool's ref objects). A key that IS a ref object but
+    /// names no life is refused instead of skipped, so an un-incarnated object cannot hide a namespace
+    /// from this enumeration.
     {
         const String base = pool_layout.casRefsPrefix() + prefix;
         String cursor;
@@ -1418,8 +1420,8 @@ std::vector<String> Pool::listNamespaces(const String & prefix)
                     continue;
                 if (const auto parsed = pool_layout.parseRefObjectKey(key))
                 {
-                    if (parsed->ns.string().starts_with(prefix))
-                        found.insert(parsed->ns.string());
+                    if (parsed->id.ns.string().starts_with(prefix))
+                        found.insert(parsed->id.ns.string());
                 }
             }
             if (page.next_cursor.empty())

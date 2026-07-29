@@ -103,7 +103,7 @@ uint64_t refLogGetsFor(const CountingBackend & backend, const Layout & layout, c
 {
     uint64_t total = 0;
     for (uint64_t i = first; i <= last; ++i)
-        total += backend.getCount(layout.refLogKey(ns, RefTxnId{epoch, i}));
+        total += backend.getCount(layout.refLogKey(RefNamespaceId::stageATransition(ns), RefTxnId{epoch, i}));
     return total;
 }
 
@@ -159,7 +159,7 @@ public:
         auto result = CountingBackend::get(key, range);
         if (!layout || appending || published >= limit)
             return result;
-        if (key != layout->refLogKey(ns, RefTxnId{1, published}))
+        if (key != layout->refLogKey(RefNamespaceId::stageATransition(ns), RefTxnId{1, published}))
             return result;
 
         /// The walk just consumed the tail; the writer answers with the next record. Guarded against
@@ -266,7 +266,7 @@ TEST(CasGcBoundedWalk, AnUnchangedNamespaceFoldsNothingAndPaysExactlyOneProbe)
 
     EXPECT_EQ(refLogGetsFor(*backend, layout, still, 1, 8), 1u)
         << "an unchanged namespace costs its one frontier probe and nothing else";
-    EXPECT_EQ(backend->getCount(layout.refLogKey(still, RefTxnId{1, 3})), 1u)
+    EXPECT_EQ(backend->getCount(layout.refLogKey(RefNamespaceId::stageATransition(still), RefTxnId{1, 3})), 1u)
         << "and that one read is at the arithmetic successor of its sealed cursor";
     EXPECT_EQ(metric(intake, "tails_unchanged"), 1u);
     EXPECT_EQ(metric(intake, "tails_advanced"), 1u);
@@ -393,7 +393,7 @@ TEST(CasGcBoundedWalk, AListHiddenTailIsCaughtAndFoldedByTheQuietProbePath)
     /// A third record lands and the store stops listing the namespace at the same moment: its listed
     /// tail is now nothing at all, while `{1, 3}` is durable and readable by exact key.
     publishAt(*backend, layout, ns, RefTxnId{1, 3}, "ref_3", 3, DB::UInt128(0x1a3));
-    backend->hidePrefix(layout.refsNamespacePrefix(ns));
+    backend->hidePrefix(layout.refsNamespacePrefix(RefNamespaceId::stageATransition(ns)));
 
     const std::map<String, UInt64> intake = runRoundCapturingIntake(gc);
     EXPECT_EQ(cursorOf(*backend, layout, ns), (RefTxnId{1, 3}))

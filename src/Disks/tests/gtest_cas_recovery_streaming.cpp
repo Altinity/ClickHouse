@@ -291,7 +291,7 @@ TEST(CasRecoveryStreaming, MaterializingControlExceedsMemoryBound)
     int64_t held = 0;
     for (size_t t = 1; t <= kTxns; ++t)
     {
-        const auto got = backend->get(layout.refLogKey(ns, RefTxnId{1, t}));
+        const auto got = backend->get(layout.refLogKey(RefNamespaceId::stageATransition(ns), RefTxnId{1, t}));
         ASSERT_TRUE(got.has_value());
         RefLogTxn txn = decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), RefTxnId{1, t});
         const int64_t footprint = static_cast<int64_t>(decodedRefLogTxnFootprint(txn));
@@ -331,8 +331,8 @@ TEST(CasRecoveryStreaming, MidTailVanishedObjectReLists)
     ASSERT_LT(seq2, seq3);
 
     auto store = openPoolForTest(backend);
-    backend->refs_prefix = layout.refsNamespacePrefix(ns);
-    backend->target_log_key = layout.refLogKey(ns, RefTxnId{1, seq2});   /// vanish a mid-tail object
+    backend->refs_prefix = layout.refsNamespacePrefix(RefNamespaceId::stageATransition(ns));
+    backend->target_log_key = layout.refLogKey(RefNamespaceId::stageATransition(ns), RefTxnId{1, seq2});   /// vanish a mid-tail object
     backend->armed = true;
 
     const auto refs = store->listRefs(ns);
@@ -367,8 +367,8 @@ TEST(CasRecoveryStreaming, CorruptObjectFailsFast)
     backend->corrupt_bytes = sealObject(FormatId::RefLog, encodeRefLogTxn(foreign));
 
     auto store = openPoolForTest(backend);
-    backend->refs_prefix = layout.refsNamespacePrefix(ns);
-    backend->target_log_key = layout.refLogKey(ns, RefTxnId{1, seq2});
+    backend->refs_prefix = layout.refsNamespacePrefix(RefNamespaceId::stageATransition(ns));
+    backend->target_log_key = layout.refLogKey(RefNamespaceId::stageATransition(ns), RefTxnId{1, seq2});
     backend->armed = true;
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { store->resolveRef(ns, "a"); });
@@ -394,7 +394,7 @@ TEST(CasRecoveryStreaming, ConcurrentWaiterUnblockedOnce)
     publishCommittedTransition(*backend, layout, ns, "y", std::nullopt, mref(2));
 
     auto store = openPoolForTest(backend);
-    backend->refs_prefix = layout.refsNamespacePrefix(ns);
+    backend->refs_prefix = layout.refsNamespacePrefix(RefNamespaceId::stageATransition(ns));
 
     /// Gate the retry-backoff sleep: the first recovering caller parks HERE (state_mutex released),
     /// which is the only window in which a second caller can reach `recovery_cv`.
@@ -554,7 +554,7 @@ TEST(CasRecoveryStreaming, RecoveryResultInventoryComplete)
     base.committed = {committedRow("c_one", mref(11)), committedRow("c_two", mref(12))};
     base.precommits = {RefOwnerBinding{RefOwnerKind::Precommit, "p_stale", mref(13)}};
     writeRefSnapshotRaw(*backend, layout, base);
-    const auto base_got = backend->get(layout.refSnapshotKey(ns, base.snapshot_id));
+    const auto base_got = backend->get(layout.refSnapshotKey(RefNamespaceId::stageATransition(ns), base.snapshot_id));
     ASSERT_TRUE(base_got.has_value());
     const uint64_t base_stored_bytes = base_got->bytes.size();
 
@@ -570,12 +570,12 @@ TEST(CasRecoveryStreaming, RecoveryResultInventoryComplete)
     t7.ops = publishCommittedOps("c_four", mref(22));
     writeRefLogTxnRaw(*backend, layout, t7);
 
-    const uint64_t tail6 = backend->get(layout.refLogKey(ns, RefTxnId{1, 6}))->bytes.size();
-    const uint64_t tail7 = backend->get(layout.refLogKey(ns, RefTxnId{1, 7}))->bytes.size();
+    const uint64_t tail6 = backend->get(layout.refLogKey(RefNamespaceId::stageATransition(ns), RefTxnId{1, 6}))->bytes.size();
+    const uint64_t tail7 = backend->get(layout.refLogKey(RefNamespaceId::stageATransition(ns), RefTxnId{1, 7}))->bytes.size();
 
     /// A completed-removal `_cleanup` marker recovery must retain for namespace-recreation checks.
     const RefTxnId cleanup_id{1, 3};
-    backend->putIfAbsent(layout.refCleanupMarkerKey(ns, cleanup_id), "");
+    backend->putIfAbsent(layout.refCleanupMarkerKey(RefNamespaceId::stageATransition(ns), cleanup_id), "");
 
     auto store = openPoolForTest(backend);
 

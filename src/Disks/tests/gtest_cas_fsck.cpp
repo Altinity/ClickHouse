@@ -429,7 +429,7 @@ TEST(CasFsckSnapshotOracle, CleanedLogsSkipOracleWithoutFalsePositive)
     /// Publish the correct snapshot, then delete the log it covers (as GC cleanup would once covered).
     const RefTableState st = recoverRefTable(*backend, store->layout(), ns);
     writeRefSnapshotRaw(*backend, store->layout(), snapshotOf(st, ns.string()));
-    const String log_key = store->layout().refLogKey(ns, RefTxnId{1, seq});
+    const String log_key = store->layout().refLogKey(RefNamespaceId::stageATransition(ns), RefTxnId{1, seq});
     const HeadResult h = backend->head(log_key);
     ASSERT_TRUE(h.exists);
     backend->deleteExact(log_key, h.token);

@@ -675,7 +675,9 @@ struct RefTableListing
 /// recognizes, or whose reconstructed namespace is malformed
 /// (`parseRefObjectKey` does not re-validate the namespace, so this does), is a malformed
 /// ref key and throws `CORRUPTED_DATA` -- the round catches it and aborts ref folding for the round
-/// (a malformed key cannot produce a partial ref delta or authorize destructive work).
+/// (a malformed key cannot produce a partial ref delta or authorize destructive work). One case
+/// reaches that same outcome from one level down: a key that IS a ref object but names no life (the
+/// un-incarnated shape) is refused by the parser itself, with the same code.
 /// A key OUTSIDE `casRefsPrefix()` is ignored: the caller lists only the ref prefix, and a foreign key
 /// is not this format's concern.
 std::map<String, RefTableListing> groupRefKeys(const Layout & layout, const std::vector<String> & listed_keys);

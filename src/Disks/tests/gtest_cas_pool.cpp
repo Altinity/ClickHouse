@@ -956,7 +956,7 @@ TEST(CasPool, ListRefsSkipsForeignKeys)
 
     /// A stray key directly under the namespace's ref-object prefix that is not `_cleanup`/`_log`/
     /// `_snap` shaped (also covers the legacy shard-number layout GC/dropNamespace still write).
-    b->putIfAbsent(layout.refsNamespacePrefix(ns) + "garbage", "not-a-ref-object");
+    b->putIfAbsent(layout.refsNamespacePrefix(RefNamespaceId::stageATransition(ns)) + "garbage", "not-a-ref-object");
 
     std::map<String, Resolved> refs;
     EXPECT_NO_THROW(refs = s->listRefs(ns));
@@ -1507,7 +1507,7 @@ TEST(CasPoolShutdown, UnresolvedWedgeSkipsFarewell)
 
     /// Force the ref-log append the drop below performs into the Unresolved/wedge outcome (as in the
     /// wedge tests in gtest_cas_ref_writer.cpp): the single attempt the budget allows fails ambiguously.
-    backend->fault_key_substr = layout.refsNamespacePrefix(ns) + "_log/";
+    backend->fault_key_substr = layout.refsNamespacePrefix(RefNamespaceId::stageATransition(ns)) + "_log/";
     backend->fault_count = 1;
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
@@ -1807,7 +1807,7 @@ TEST(CasRemountWaits, UnresolvedWedgeRemountPaysNoWaitEither)
     /// Force the ref-log append `dropRef` below performs into the Unresolved/wedge outcome (as in
     /// `CasPoolShutdown.UnresolvedWedgeSkipsFarewell`): the single attempt the budget allows fails
     /// ambiguously.
-    backend->fault_key_substr = layout.refsNamespacePrefix(ns) + "_log/";
+    backend->fault_key_substr = layout.refsNamespacePrefix(RefNamespaceId::stageATransition(ns)) + "_log/";
     backend->fault_count = 1;
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
@@ -1870,7 +1870,7 @@ TEST(CasRemountWaits, ALateTouchedTableClosesEveryDeadEpochInBandHoweverItsPrede
 
     /// Force ns1's ref-log append into the Unresolved/wedge outcome (mirrors
     /// `UnresolvedWedgeRemountPaysNoWaitEither` above).
-    backend->fault_key_substr = layout.refsNamespacePrefix(ns1) + "_log/";
+    backend->fault_key_substr = layout.refsNamespacePrefix(RefNamespaceId::stageATransition(ns1)) + "_log/";
     backend->fault_count = 1;
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns1, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns1));
@@ -1898,12 +1898,12 @@ TEST(CasRemountWaits, ALateTouchedTableClosesEveryDeadEpochInBandHoweverItsPrede
     EXPECT_EQ(global_counters[ProfileEvents::CasRefRecoveryEpochSealed].load(), sealed_before + 2)
         << "both dead epochs must be closed -- the chain link is what a later reader needs to tell an "
            "EMPTY epoch from a LOST one, and that is independent of how each mount ended";
-    EXPECT_TRUE(backend->get(layout.refLogKey(ns2, RefTxnId{1, 2})).has_value())
+    EXPECT_TRUE(backend->get(layout.refLogKey(RefNamespaceId::stageATransition(ns2), RefTxnId{1, 2})).has_value())
         << "epoch 1 closes at the slot right after its last durable id, in-band";
-    EXPECT_TRUE(backend->get(layout.refLogKey(ns2, RefTxnId{2, 1})).has_value())
+    EXPECT_TRUE(backend->get(layout.refLogKey(RefNamespaceId::stageATransition(ns2), RefTxnId{2, 1})).has_value())
         << "empty epoch 2 closes at its own sequence 1, chained to the epoch-1 seal";
     const RefTxnId retired_sentinel_id{2, std::numeric_limits<uint64_t>::max()};
-    EXPECT_FALSE(backend->get(layout.refSnapshotKey(ns2, retired_sentinel_id)).has_value())
+    EXPECT_FALSE(backend->get(layout.refSnapshotKey(RefNamespaceId::stageATransition(ns2), retired_sentinel_id)).has_value())
         << "and NO synthetic seal snapshot is written: that shape is retired";
 }
 

@@ -383,7 +383,7 @@ TEST(CasRefContiguousAlloc, PostDurableInstallFailureAllocatesPastTheStrandedId)
     /// The durable stream itself is dense: 1, 2 (stranded), 3 all exist as objects. Only this cache is
     /// missing 2, which is what the poison marks -- so a fresh reader replaying the log sees no hole.
     for (uint64_t seq = 1; seq <= 3; ++seq)
-        EXPECT_TRUE(backend->head(store->layout().refLogKey(ns, RefTxnId{epoch, seq})).exists)
+        EXPECT_TRUE(backend->head(store->layout().refLogKey(RefNamespaceId::stageATransition(ns), RefTxnId{epoch, seq})).exists)
             << "log object " << epoch << "-" << seq << " must exist: the durable stream has no hole";
 }
 

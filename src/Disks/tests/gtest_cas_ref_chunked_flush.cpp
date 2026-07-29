@@ -458,11 +458,11 @@ std::vector<RefLogTxn> listLogTxns(DB::Cas::Backend & backend, const DB::Cas::La
     String cursor;
     for (;;)
     {
-        const ListPage page = backend.list(layout.refsNamespacePrefix(ns), cursor, 1000);
+        const ListPage page = backend.list(layout.refsNamespacePrefix(RefNamespaceId::stageATransition(ns)), cursor, 1000);
         for (const ListedKey & lk : page.keys)
         {
             const auto parsed = layout.parseRefObjectKey(lk.key);
-            if (parsed && parsed->ns == ns && parsed->kind == RefObjectKind::Log)
+            if (parsed && parsed->id.ns == ns && parsed->kind == RefObjectKind::Log)
                 ids.push_back(parsed->txn_id);
         }
         if (page.next_cursor.empty())
@@ -473,7 +473,7 @@ std::vector<RefLogTxn> listLogTxns(DB::Cas::Backend & backend, const DB::Cas::La
     std::vector<RefLogTxn> txns;
     for (const RefTxnId & id : ids)
     {
-        const auto got = backend.get(layout.refLogKey(ns, id));
+        const auto got = backend.get(layout.refLogKey(RefNamespaceId::stageATransition(ns), id));
         if (!got)
             continue;
         try
@@ -661,7 +661,7 @@ ChunkFailureOutcome runChunkFailureCase(const String & ns_suffix, ChunkFaultBack
 
     /// Fault ONLY chunk 2's `_log/` PUT: skip chunk 1's (the first match), fault the second. Armed AFTER
     /// the seed so only the flush's two log PUTs are counted.
-    backend->fault_substr = layout.refsNamespacePrefix(ns) + "_log/";
+    backend->fault_substr = layout.refsNamespacePrefix(RefNamespaceId::stageATransition(ns)) + "_log/";
     backend->mode = mode;
     backend->fault_skip = 1;
     backend->fault_count = 1;
@@ -728,7 +728,7 @@ TEST(RefWriterChunkedFlush, ChunkFailureWedge)
     EXPECT_TRUE(out.store->refLaneWedgedForTest(ns)) << "chunk 2's unresolved PUT must wedge the lane";
     RefTxnId chunk2_id = out.chunk1_id;
     ++chunk2_id.ref_sequence;
-    EXPECT_EQ(out.store->wedgedKeyForTest(ns), out.store->layout().refLogKey(ns, chunk2_id))
+    EXPECT_EQ(out.store->wedgedKeyForTest(ns), out.store->layout().refLogKey(RefNamespaceId::stageATransition(ns), chunk2_id))
         << "the wedge must contain ONLY chunk 2's key";
 
     const auto logs = listLogTxns(*out.backend, out.store->layout(), ns);
@@ -844,7 +844,7 @@ TEST(RefWriterChunkedFlush, SnapshotPublisherLatchedAcrossChunks)
 
     /// Latch the FIRST `_snap/` PUT (chunk 1's publisher) at its conditional PUT -- i.e. AFTER it has
     /// captured chunk 1's prefix under state_mutex.
-    backend->armBlock(layout.refsNamespacePrefix(ns) + "_snap/");
+    backend->armBlock(layout.refsNamespacePrefix(RefNamespaceId::stageATransition(ns)) + "_snap/");
     /// Gate the leader at the chunk boundary until that publisher has parked on its PUT, so its captured
     /// candidate is EXACTLY chunk 1's prefix (not chunk 1 + chunk 2).
     store->setCarveHookForTest([backend](CasRefLedger::CarvePhaseForTest ph)
