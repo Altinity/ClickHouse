@@ -1754,3 +1754,6 @@ No push.
 
 **2026-07-29 05:40 local watchdog** — T11 deep in cycle (comment-wave build, unit build, CA
 battery run; log mtimes show a clock skew artifact — activity real). No push.
+
+**2026-07-29 06:00 local watchdog** — T11 in red-proof phase (red build + red run at 05:54-55,
+one live proc). No push.
