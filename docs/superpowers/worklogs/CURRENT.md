@@ -2011,3 +2011,8 @@ controller-side (7e4de57374c: Stage B Task 0 knows PENDING). a16 RED-1 still bui
 **2026-07-29 15:02 local** — watchdog: a16's RED-1 build DONE at 14:51 (NINJA_EXIT=0) but no
 red-run followed in 11 min — armed monitor didn't fire (known class); woke the agent with the
 marker facts. a14 in doc fix round; T14 re-review queues after it.
+**2026-07-29 15:4x local** — user directives folded (eedd55ae591): [GC-FULL-TIME-ACCOUNTING]
+(close ALL un-timed round spans + unaccounted_ms self-check + progress-row) and relink
+Unknown = transient-state semantics + precise unhappy-path test per refusal class. T14 fix
+round landed (a1f59e4b402: 11 items, self-verified figures — clamp actually 12); evidence
+dirs stay untracked per convention; scoped re-review dispatched. a16 in RED-2.
