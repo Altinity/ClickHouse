@@ -1735,3 +1735,7 @@ the razor class dies at the validator). USER ACTION ITEMS surfaced: root-owned .
 (docker debris, needs sudo to remove; trips unfiltered unit-test runs from repo root) and a
 contrib/silk fiber scheduler assertion (CAS-independent, aborts SilkFiberSocketTest/1 under
 ASan). Neither affects our filtered gates. No push.
+
+**2026-07-29 05:00 local watchdog** — stitch 7 in flight: validator test run (conv_test7 04:42),
+release gate re-run done (04:45), load run (04:47), ASan rebuild going (05:00, live procs).
+No push.
