@@ -46,6 +46,7 @@ from . import _common
 
 from .s38_late_put_injection import (
     _POOL_PREFIX,
+    _REF_LOG_SUFFIX,
     _S3_BUCKET,
     _discover_table_namespace,
     _list_keys,
@@ -174,7 +175,7 @@ class S43(Scenario):
         result.observations["pool_wipe"] = {"objects_deleted": wiped}
 
         survivor_id = _render_ref_txn_id(_SURVIVOR_EPOCH, _SURVIVOR_SEQ)
-        survivor_key = f"{log_prefix}{survivor_id}"
+        survivor_key = f"{log_prefix}{survivor_id}{_REF_LOG_SUFFIX}"
         survivor_body = _restamp_ref_log_txn(donor_body, _SURVIVOR_SEQ, writer_epoch=_SURVIVOR_EPOCH)
         s3.put_object(Bucket=_S3_BUCKET, Key=survivor_key, Body=survivor_body)
         ctx.log(f"S43: injected the survivor's queued write at {survivor_id} into the recreated pool")

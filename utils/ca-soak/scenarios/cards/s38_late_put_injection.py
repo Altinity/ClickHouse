@@ -92,8 +92,18 @@ def _render_ref_txn_id(writer_epoch: int, ref_sequence: int) -> str:
     return f"{writer_epoch:016x}-{ref_sequence:016x}"
 
 
+# `Layout::refLogKey` is `<ns prefix>_log/<render>` + `storedSuffix(FormatId::RefLog)`, and RefLog is
+# `CompressionPolicy::Always` (`CasFormat.cpp:110`), so every ref-log object's key ends `.zst` and its
+# BODY is zstd. Both facts bit the first run of this card: the listing parsed to zero ids because the
+# suffix broke the id parse, and the body would not have decoded as text either.
+_REF_LOG_SUFFIX = ".zst"
+
+
 def _parse_ref_txn_id(leaf: str):
-    """Inverse of `_render_ref_txn_id`. Returns `(writer_epoch, ref_sequence)` or None."""
+    """Inverse of `_render_ref_txn_id`. Returns `(writer_epoch, ref_sequence)` or None. Tolerates the
+    stored suffix, and anything nested deeper than one level under `_log/` simply fails to parse."""
+    if leaf.endswith(_REF_LOG_SUFFIX):
+        leaf = leaf[: -len(_REF_LOG_SUFFIX)]
     parts = leaf.split("-")
     if len(parts) != 2 or not all(len(p) == 16 for p in parts):
         return None
@@ -112,7 +122,7 @@ def _restamp_ref_log_txn(body: bytes, ref_sequence: int, writer_epoch: int | Non
     compatibility version) and the namespace come from a body the server wrote — this card does not
     encode the format, it edits two fields of it. `writer_epoch` defaults to the donor's own.
     """
-    lines = body.decode().splitlines()
+    lines = _zstd_decompress(body).decode().splitlines()
     if len(lines) < 3:
         raise ValueError(f"ref-log body has {len(lines)} lines, expected at least 3 (header/meta/trailer)")
     meta = json.loads(lines[1])
@@ -125,7 +135,22 @@ def _restamp_ref_log_txn(body: bytes, ref_sequence: int, writer_epoch: int | Non
     # copied link would be rejected by the seal grammar for a reason unrelated to this card.
     meta.pop("!pse", None)
     meta.pop("!pss", None)
-    return ("\n".join([lines[0], json.dumps(meta, separators=(",", ":")), '{"n":0}']) + "\n").encode()
+    return _zstd_compress(
+        ("\n".join([lines[0], json.dumps(meta, separators=(",", ":")), '{"n":0}']) + "\n").encode())
+
+
+def _zstd_decompress(data: bytes) -> bytes:
+    import zstandard
+    # `stream_reader`, not `decompress`: ClickHouse's frames need not carry the decompressed size, and
+    # the one-shot API refuses those.
+    import io
+    with zstandard.ZstdDecompressor().stream_reader(io.BytesIO(data)) as r:
+        return r.read()
+
+
+def _zstd_compress(data: bytes) -> bytes:
+    import zstandard
+    return zstandard.ZstdCompressor().compress(data)
 
 
 def _s3_client():
@@ -341,9 +366,9 @@ class S38(Scenario):
         dead_epoch = epochs[0]
         seal_seq = max(s for e, s in ids if e == dead_epoch)
         seal_id = _render_ref_txn_id(dead_epoch, seal_seq)
-        seal_key = f"{log_prefix}{seal_id}"
+        seal_key = f"{log_prefix}{seal_id}{_REF_LOG_SUFFIX}"
         seal_body = s3.get_object(Bucket=_S3_BUCKET, Key=seal_key)["Body"].read()
-        is_seal = b'"epoch_seal"' in seal_body
+        is_seal = b'"epoch_seal"' in _zstd_decompress(seal_body)
         result.observations["seal"] = {
             "dead_epoch": dead_epoch, "seal_txn_id": seal_id, "key": seal_key,
             "body": seal_body.decode(errors="replace")[:400]}
@@ -395,7 +420,7 @@ class S38(Scenario):
         # path at all.
         # =====================================================================================
         injected_id = _render_ref_txn_id(dead_epoch, _HUGE_SEQ)
-        injected_key = f"{log_prefix}{injected_id}"
+        injected_key = f"{log_prefix}{injected_id}{_REF_LOG_SUFFIX}"
         injected_body = _restamp_ref_log_txn(seal_body, _HUGE_SEQ)
         ctx.log(f"S38: injecting a late dead-epoch log ABOVE the seal at "
                 f"s3://{_S3_BUCKET}/{injected_key} ({len(injected_body)} bytes)")
