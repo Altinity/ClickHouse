@@ -1835,3 +1835,7 @@ detector commit `51db43f484d` (EVIDENCE/VIOLATIONS split, no-seal=untested); S38
 rewrite `1cfb14bcb7c` (seal exists/wins/covers, clean-restart inverted). Soak detached 09:24
 ETA ~10:55. KEY RULING: praktika local post_hooks PRUNE docker — all docker work serialized
 behind the soak (memory saved). No reds.
+**2026-07-29 09:50 local** — user asked for trace_log bottleneck watch + end-of-soak GC perf
+audit. First pass done (baseline clean: waits=S3 sockets, CPU=memcpy/LZ4/CityHash128); five
+watch-items ledgered (mutex 57k samples, local-file churn, libunwind, parse-assert errors 28k,
+GC lease locality). Audit agent dispatch scheduled for the ~10:40 tick.
