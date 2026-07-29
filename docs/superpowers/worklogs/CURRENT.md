@@ -2105,3 +2105,10 @@ flip commit on return.
 **2026-07-29 17:21 local** — watchdog: codex r2 running (575KB); soak driver alive inside its
 bounded fixpoint (deadline t+120m armed at a14); verdict still PENDING pending natural
 return. All other lanes parked. Nothing wedged.
+**2026-07-29 17:5x local** — CRITERION 4 CAUGHT A REAL ONE: transient CA lease loss collapsed
+into "part looks broken" + destructive-shaped remediation by the part-check thread (13+14
+events, exact per-minute correlation; self-healed via healthy peer; double-blip/single-replica
+= the loss shapes). Verdict HELD un-flipped; BACKLOG [LEASE-BLIP-PART-CHECK-COLLAPSE] filed
+stage-gating; RCA running in parallel (keeper renewal reason, checkPartImpl taxonomy + blame
+pre-existence, loss boundary, fsck-pressure trigger). Run continues to deadline for the
+capture.
