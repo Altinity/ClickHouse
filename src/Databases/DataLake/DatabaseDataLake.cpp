@@ -720,7 +720,6 @@ StoragePtr DatabaseDataLake::tryGetTableImpl(const String & name, ContextPtr con
     const UUID table_uuid = catalog_uuid ? parseFromString<UUID>(*catalog_uuid) : UUIDHelpers::Nil;
 
     std::string cluster_name = configuration->isClusterSupported() ? settings[DatabaseDataLakeSetting::object_storage_cluster].value : "";
-    const bool cluster_name_from_object_storage_cluster_setting = !cluster_name.empty();
 
     if (cluster_name.empty() && can_use_parallel_replicas && !is_secondary_query)
         cluster_name = parallel_replicas_cluster_name;
@@ -745,9 +744,6 @@ StoragePtr DatabaseDataLake::tryGetTableImpl(const String & name, ContextPtr con
         /// because this table is actually stateless like a table function.
         /* is_table_function */true,
         /* lazy_init */true);
-
-    if (cluster_name_from_object_storage_cluster_setting)
-        storage_cluster->setClusterNameInSettings(true);
 
     storage_cluster->startup();
     return storage_cluster;

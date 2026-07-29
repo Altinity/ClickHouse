@@ -109,7 +109,6 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
         cluster_name_, table_id_, getLogger(fmt::format("{}({})", configuration_->getEngineName(), table_id_.table_name)))
     , configuration{configuration_}
     , object_storage(object_storage_)
-    , cluster_name_in_settings(false)
 {
     configuration->initPartitionStrategy(partition_by, columns_in_table_or_function_definition, context_);
 
@@ -432,7 +431,7 @@ void StorageObjectStorageCluster::updateQueryToSendIfNeeded(
     const ContextPtr & context,
     bool make_cluster_function)
 {
-    bool cluster_name_added_to_settings = updateQueryForDistributedEngineIfNeeded(query, context, make_cluster_function);
+    updateQueryForDistributedEngineIfNeeded(query, context, make_cluster_function);
 
     auto * table_function = extractTableFunctionFromSelectQuery(query);
     if (!table_function)
@@ -457,7 +456,8 @@ void StorageObjectStorageCluster::updateQueryToSendIfNeeded(
     }
 
     ASTPtr object_storage_type_arg;
-    configuration->extractDynamicStorageType(args, context, &object_storage_type_arg, !cluster_name_in_settings && !cluster_name_added_to_settings);
+    configuration->extractDynamicStorageType(
+        args, context, &object_storage_type_arg, cluster_name_from_function_argument);
 
     ASTPtr settings_temporary_storage = nullptr;
     for (auto it = args.begin(); it != args.end(); ++it)
@@ -471,7 +471,7 @@ void StorageObjectStorageCluster::updateQueryToSendIfNeeded(
         }
     }
 
-    if (cluster_name_in_settings || cluster_name_added_to_settings || !endsWith(table_function->name, "Cluster"))
+    if (!cluster_name_from_function_argument || !endsWith(table_function->name, "Cluster"))
     {
         configuration->addStructureAndFormatToArgsIfNeeded(args, structure, configuration->getFormat(), context, /*with_structure=*/true);
 

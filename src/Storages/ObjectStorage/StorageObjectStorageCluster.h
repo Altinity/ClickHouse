@@ -62,7 +62,6 @@ public:
 
     std::optional<UInt64> totalRows(ContextPtr query_context) const override;
     std::optional<UInt64> totalBytes(ContextPtr query_context) const override;
-    void setClusterNameInSettings(bool cluster_name_in_settings_) { cluster_name_in_settings = cluster_name_in_settings_; }
 
     void setClusterNameFromFunctionArgument(bool cluster_name_from_function_argument_)
     {
@@ -222,9 +221,7 @@ private:
     const String engine_name;
     StorageObjectStorageConfigurationPtr configuration;
     const ObjectStoragePtr object_storage;
-    /// True when cluster name comes from SETTINGS (s3()/iceberg() alternative syntax, or
-    /// ENGINE ... SETTINGS object_storage_cluster / DataLake database setting), not from *Cluster arg.
-    bool cluster_name_in_settings;
+    /// True for explicit *Cluster(...); false for SETTINGS / ENGINE / DataLake paths.
     bool cluster_name_from_function_argument = false;
 
     /// non-clustered storage to fall back on pure realisation if needed
