@@ -2004,3 +2004,7 @@ a15 parked. All lanes nominal.
 **2026-07-29 15:0x local** — USER APPROVED the relink per-ref confirm design pass, scheduled
 right after Stage A close (BACKLOG+draft updated 718af8830e1, memory written). Post-stage
 queue: per-ref pass, then Stage B.
+**2026-07-29 15:2x local** — T14 review: spec PASS / quality needs-fixes (3I+6M, all
+doc/citation class; 14/17 rows verified beyond claims; the gating row 12c cites NO artifact —
+the sharpest find). Fix round dispatched (report §8 + citations + honesty marks); M2 fixed
+controller-side (7e4de57374c: Stage B Task 0 knows PENDING). a16 RED-1 still building.
