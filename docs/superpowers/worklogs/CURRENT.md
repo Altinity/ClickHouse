@@ -2086,3 +2086,6 @@ evidence cited from soak2+scenarios). Then: a16 slot, final whole-branch review,
 budget cut to MINIMAL (work cap + tiny global limit; segmentation/token-bucket rejected as
 overengineering — warm-by-construction); knob = YAGNI; naming delegated. Closing round
 ordered on top of v4. Meanwhile: a14 executing stop-capture-flip.
+**2026-07-29 17:00 local** — watchdog: a14 executing stop-capture-flip (~10 min in; cluster
+still up = capture phase presumably; no flip commit yet). relink closing-round in flight at
+the design agent. Nudge threshold: next tick.
