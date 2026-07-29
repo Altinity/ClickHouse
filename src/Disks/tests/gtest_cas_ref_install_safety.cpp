@@ -71,9 +71,26 @@ PoolPtr openPoolSingleAttempt(const BackendPtr & backend)
     DB::Cas::tests::seedPoolMetaForRestart(*backend);
     PoolConfig cfg{.pool_prefix = "p", .server_root_id = "test"};
     CasRequestBudget budget;
+    /// ONE attempt is the whole mechanism these tests need: it is what turns an injected lost
+    /// acknowledgement into `Unresolved` instead of a transparent retry, and it does so independently of
+    /// how fast the machine is.
+    ///
+    /// The operation deadline must therefore NOT sit at `attempt_timeout_ms`, which is where it used to.
+    /// The controller's pre-send gate (`putIfAbsentControlled`: `now + attempt_timeout > deadline`
+    /// returns `Unresolved` WITHOUT sending) is then a zero-width race that passes only if no
+    /// millisecond tick elapses between the deadline capture and the gate. Under parallel-build load it
+    /// loses: the gate fires first, nothing is sent, the injected fault is never reached, and the flush
+    /// fails CLEAN -- so the product correctly does NOT wedge the lane and the wedge expectations flip.
+    /// `UncertainPrecommitKeepsItsCleanupOwnerAndItsBody` was observed failing exactly that way (Task 9,
+    /// `refLaneWedgedForTest` false at the wedge assertion), and every test on this fixture carries the
+    /// same razor. Same root cause and same fix as `8f9e63c7a19` for the sweep-interruption test.
+    ///
+    /// A WIDE deadline keeps the request always actually sent, so the injected fault decides the outcome
+    /// rather than the scheduler. Tests that want the pre-send REFUSAL instead use
+    /// `openPoolFenceControlled`, where a frozen clock makes that refusal deterministic rather than raced.
     budget.max_attempts = 1;
     budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = 100;
+    budget.operation_deadline_ms = 5000;
     budget.lease_safety_margin_ms = 100;
     cfg.cas_request_budget = budget;
     return Pool::open(backend, cfg);
@@ -87,8 +104,9 @@ PoolPtr openPoolSingleAttempt(const BackendPtr & backend)
 ///   `refAppendFenceOk`  -- additionally `attempt_timeout_ms + lease_safety_margin_ms < deadline - now`,
 ///                          i.e. "there is room for one whole controlled attempt"; the `fence_ok`
 ///                          `commitRefChunk` hands to `putIfAbsentControlled`.
-/// With the single-attempt budget below that margin is 100 + 100 = 200 ms, so a 100 ms remaining lease
-/// sits BETWEEN them: the flush is admitted and then its very first pre-attempt gate refuses. That is
+/// With `openPoolFenceControlled`'s budget below that margin is 100 + 100 = 200 ms, so a 100 ms
+/// remaining lease sits BETWEEN them: the flush is admitted and then its very first pre-attempt gate
+/// refuses. That is
 /// exactly the production shape this task is about (a lease too short to start a write, not a lost
 /// one), and it needs no fault injection at all -- which is the point: nothing is sent.
 constexpr uint64_t FENCE_DEADLINE_HEALTHY_MS = 30000;

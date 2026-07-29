@@ -381,6 +381,43 @@ TEST(CasRequestController, OperationDeadlineExhaustionReturnsUnresolvedBeforeMax
     EXPECT_EQ(backend->put_attempts.load(), 2u);   /// cut off well before the 10-attempt budget
 }
 
+/// THE RAZOR a test budget falls onto when it sets `attempt_timeout_ms == operation_deadline_ms`,
+/// pinned where the mechanism lives rather than where it bites.
+///
+/// The deadline is captured as `now + operation_deadline_ms` and the pre-send gate asks
+/// `now + attempt_timeout_ms > deadline`. Equal values collapse that to `now_2 > now_1`: ONE elapsed
+/// millisecond between the capture and the gate refuses the whole operation with NOTHING SENT. A
+/// fixture shaped that way stops testing what it claims to -- whether a request reaches the backend at
+/// all becomes a property of the machine's scheduler, so any downstream expectation about what the
+/// request DID flips under load. Two tests have been fixed for exactly this (`8f9e63c7a19`, and
+/// `gtest_cas_ref_install_safety.cpp`'s single-attempt fixture); this is the property both relied on.
+TEST(CasRequestController, EqualAttemptTimeoutAndDeadlineRefuseAfterASingleTick)
+{
+    auto backend = std::make_shared<ScriptedControllerBackend>();
+
+    /// The smallest possible passage of time: one millisecond per clock read.
+    uint64_t clock = 0;
+    auto now_ms = [&clock]() -> uint64_t { const uint64_t t = clock; clock += 1; return t; };
+
+    CasRequestBudget budget;
+    budget.max_attempts = 1;
+    budget.attempt_timeout_ms = 100;
+    budget.operation_deadline_ms = 100;
+    CasRequestController razor(backend, budget, now_ms);
+    EXPECT_EQ(razor.putIfAbsentControlled("k", "payload", [] { return true; }), CasWriteOutcome::Unresolved);
+    EXPECT_EQ(backend->put_attempts.load(), 0u)
+        << "the refusal came from the clock, not from the backend: nothing was sent at all";
+
+    /// The SAME budget with a deadline that is not its own attempt timeout sends the request over the
+    /// same one-tick clock -- so what the widening removes is the razor, not the fixture's ability to
+    /// reach the backend.
+    clock = 0;
+    budget.operation_deadline_ms = 5000;
+    CasRequestController wide(backend, budget, now_ms);
+    EXPECT_EQ(wide.putIfAbsentControlled("k", "payload", [] { return true; }), CasWriteOutcome::Committed);
+    EXPECT_EQ(backend->put_attempts.load(), 1u);
+}
+
 TEST(CasRequestController, OverwriteAmbiguousResolvesIntendedBytesAsCommitted)
 {
     auto backend = std::make_shared<ScriptedControllerBackend>();
