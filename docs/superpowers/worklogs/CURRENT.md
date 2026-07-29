@@ -1724,3 +1724,8 @@ report pending. No push.
 **2026-07-29 04:20 local watchdog** — convergence ASan run went out UNFILTERED and hung on a
 non-CAS socket test (SilkFiberSocket throttler, environmental); directed impl-conv to kill +
 re-run with the CA filter. Release gate already green 1526/1526. No push.
+
+**2026-07-29 04:40 local watchdog** — convergence gates ALL green: release 1526/1526, ASan CA
+filter 1530/1530, AND the full-binary unfiltered ASan 11032/11032 EXIT=0 (the hung Silk test
+passed on isolated rerun — environmental, as attributed). Report written 04:28; DONE message
+pending. No push.
