@@ -3100,3 +3100,73 @@ than to an error.
 - **Run:** 20260726T205952_S42_seed42
 - **Observed:** GC log has 2 real (non-benign) Error finish row(s)
 
+## S38-20260729T104557-1: forced GC left 20 UNCONDEMNED orphan object(s) (unreachable/dangling blobs/_mani
+
+- **Logged (UTC):** 2026-07-29T10:49:50
+- **Severity:** suspected-bug
+- **Run:** 20260729T104557_S38_seed20260729
+- **Observed:** forced GC left 20 UNCONDEMNED orphan object(s) (unreachable/dangling blobs/_manifests): {'_manifests': 20}. These are NOT in the two-phase pipeline (that would be pending-gc). If explicit GC was driven concurrently with background GC (or on both replicas), this is likely the known GC-CONCURRENT-LEADER-LEAK (see BACKLOG): a divergent-fold abort orphans owner-removal events.
+
+## S43-20260729T104950-1: scenario raised: 'utf-8' codec can't decode byte 0xb5 in position 1: invalid sta
+
+- **Logged (UTC):** 2026-07-29T10:50:13
+- **Severity:** suspected-bug
+- **Run:** 20260729T104950_S43_seed20260729
+- **Observed:** scenario raised: 'utf-8' codec can't decode byte 0xb5 in position 1: invalid start byte
+
+## S33-20260729T105013-1: forced GC left 87 UNCONDEMNED orphan object(s) (unreachable/dangling blobs/_mani
+
+- **Logged (UTC):** 2026-07-29T10:53:35
+- **Severity:** suspected-bug
+- **Run:** 20260729T105013_S33_seed20260729
+- **Observed:** forced GC left 87 UNCONDEMNED orphan object(s) (unreachable/dangling blobs/_manifests): {'_manifests': 87}. These are NOT in the two-phase pipeline (that would be pending-gc). If explicit GC was driven concurrently with background GC (or on both replicas), this is likely the known GC-CONCURRENT-LEADER-LEAK (see BACKLOG): a divergent-fold abort orphans owner-removal events.
+
+## S33-20260729T105013-2: S33 REGRESSION of fixed BACKLOG GC-CONCURRENT-LEADER-LEAK: 87 RECLAIMABLE unreac
+
+- **Logged (UTC):** 2026-07-29T10:53:35
+- **Severity:** suspected-bug
+- **Run:** 20260729T105013_S33_seed20260729
+- **Observed:** S33 REGRESSION of fixed BACKLOG GC-CONCURRENT-LEADER-LEAK: 87 RECLAIMABLE unreachable object(s) (blobs/_manifests) permanently orphaned by concurrent explicit GC leaders (safety held: dangling=0); full residual by_prefix={'_manifests': 87}. The attempt-scoped generation fix should make a deposed leader's fold seal invisible and let the next honest round drain — a nonzero reclaimable residual means that invariant broke.
+
+## S33-20260729T105013-3: forced GC left 87 unreachable RECLAIMABLE object(s) (blobs/_manifests) — possibl
+
+- **Logged (UTC):** 2026-07-29T10:53:35
+- **Severity:** suspected-bug
+- **Run:** 20260729T105013_S33_seed20260729
+- **Observed:** forced GC left 87 unreachable RECLAIMABLE object(s) (blobs/_manifests) — possible GC leak; full residual by prefix: {'_manifests': 87}. bookkeeping-only residual (other=0) is expected and bounded.
+
+## S30-20260729T105335-1: S30 REGRESSION vs D1: GC per-round fanout (roots/<ns> dir count and/or CasRootGe
+
+- **Logged (UTC):** 2026-07-29T10:56:58
+- **Severity:** suspected-bug
+- **Run:** 20260729T105335_S30_seed20260729
+- **Observed:** S30 REGRESSION vs D1: GC per-round fanout (roots/<ns> dir count and/or CasRootGet) grew across create/drop iterations though no table stayed live — the D1 registry-removal / dropped-shard-reclaim guarantee is violated.
+
+## S30-20260729T105335-2: forced GC left 98 UNCONDEMNED orphan object(s) (unreachable/dangling blobs/_mani
+
+- **Logged (UTC):** 2026-07-29T10:56:58
+- **Severity:** suspected-bug
+- **Run:** 20260729T105335_S30_seed20260729
+- **Observed:** forced GC left 98 UNCONDEMNED orphan object(s) (unreachable/dangling blobs/_manifests): {'_manifests': 98}. These are NOT in the two-phase pipeline (that would be pending-gc). If explicit GC was driven concurrently with background GC (or on both replicas), this is likely the known GC-CONCURRENT-LEADER-LEAK (see BACKLOG): a divergent-fold abort orphans owner-removal events.
+
+## S38-20260729T105718-1: forced GC left 20 UNCONDEMNED orphan object(s) (unreachable/dangling blobs/_mani
+
+- **Logged (UTC):** 2026-07-29T11:01:17
+- **Severity:** suspected-bug
+- **Run:** 20260729T105718_S38_seed20260729
+- **Observed:** forced GC left 20 UNCONDEMNED orphan object(s) (unreachable/dangling blobs/_manifests): {'_manifests': 20}. These are NOT in the two-phase pipeline (that would be pending-gc). If explicit GC was driven concurrently with background GC (or on both replicas), this is likely the known GC-CONCURRENT-LEADER-LEAK (see BACKLOG): a divergent-fold abort orphans owner-removal events.
+
+## S43-20260729T110117-1: quiescence failed: <urlopen error [Errno 111] Connection refused>
+
+- **Logged (UTC):** 2026-07-29T11:06:04
+- **Severity:** suspected-bug
+- **Run:** 20260729T110117_S43_seed20260729
+- **Observed:** quiescence failed: <urlopen error [Errno 111] Connection refused>
+
+## S38-20260729T110740-1: forced GC left 45 UNCONDEMNED orphan object(s) (unreachable/dangling blobs/_mani
+
+- **Logged (UTC):** 2026-07-29T11:11:40
+- **Severity:** suspected-bug
+- **Run:** 20260729T110740_S38_seed20260729
+- **Observed:** forced GC left 45 UNCONDEMNED orphan object(s) (unreachable/dangling blobs/_manifests): {'_manifests': 45}. These are NOT in the two-phase pipeline (that would be pending-gc). If explicit GC was driven concurrently with background GC (or on both replicas), this is likely the known GC-CONCURRENT-LEADER-LEAK (see BACKLOG): a divergent-fold abort orphans owner-removal events.
+
