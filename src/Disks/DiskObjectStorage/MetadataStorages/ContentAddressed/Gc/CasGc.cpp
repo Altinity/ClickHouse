@@ -1899,8 +1899,12 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         ///     record durable after the enumeration is invisible to that round's probes, and this one
         ///     is not (phase-0 model `_fix_ckptwitness`);
         ///   * the CARRIED HOLD's offending position, which is durable proof that a previous round
-        ///     reached that position. Under contiguity everything at or below it must exist, so an
-        ///     absent below it is a gap. This is what makes "retry the exact offending position" work
+        ///     reached that position -- with ONE exception, `CheckpointUndecodable`, the only hold
+        ///     minted before the walk reads anything: its position is the walk's OWN next position, so
+        ///     the strict comparison below never lets it witness against a position this walk goes on
+        ///     to read. It weakens nothing, because a hold that proves nothing also claims nothing.
+        ///     Under contiguity everything at or below a REACHED position must exist, so an absent
+        ///     below it is a gap. This is what makes "retry the exact offending position" work
         ///     for a hold that sits above an epoch boundary: the crossing needs a witness to aim at,
         ///     and without this the walk would stop one position short and never re-read it.
         /// The SMALLEST wins, because the nearest witness is the one that decides same-epoch gap versus

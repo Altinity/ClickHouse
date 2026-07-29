@@ -1065,8 +1065,11 @@ TEST(CasGcHoldGrammar, AnUndecodableCheckpointWithNoWalkPositionRecordsAnAnomaly
     /// The anomaly is the whole carrier here: it is what shuts the round's destructive gate, and the
     /// gate is what keeps `cleanupRefObjects` from computing this namespace's delete range from an
     /// ABSENT checkpoint — which is the WIDEST reading, not the safest.
-    /// Matched on its REASON, not merely on the namespace: "some anomaly exists for this namespace" is
-    /// a pin any future unrelated anomaly would satisfy, and this test would then stop testing anything.
+    /// Located by namespace and shard, then CHECKED ON ITS REASON. Asserting only that "some anomaly
+    /// exists for this namespace" is a pin any future unrelated anomaly would satisfy, and this test
+    /// would then stop testing anything; the reason check is what keeps it pinned to this arm. Note it
+    /// is also stricter than searching BY reason would be — it requires the FIRST anomaly recorded for
+    /// this namespace to be this one, not merely that one of them somewhere is.
     const auto anomaly = std::find_if(report.anomalies.begin(), report.anomalies.end(),
         [&](const RoundAnomaly & a) { return a.ns.string() == phantom.string() && a.shard == 0; });
     ASSERT_NE(anomaly, report.anomalies.end())

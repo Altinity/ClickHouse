@@ -408,7 +408,8 @@ private:
         /// The round's per-namespace `_ckpt.checkpoint`, read ONCE by the intake walk (its second,
         /// hint-independent witness) and reused post-CAS by `cleanupRefObjects` for its delete ranges --
         /// the same DRY reason `ref_tables` is carried here rather than re-listed. A namespace whose
-        /// `_ckpt` is present but UNDECODABLE has no entry, and the walk held it instead: an absent entry
+        /// `_ckpt` is present but UNDECODABLE has no entry, and the walk either HELD it or -- when it
+        /// offered no position to walk from -- RECORDED AN ANOMALY for it. Either way an absent entry
         /// widens the delete boundaries, so only the shut destructive gate makes that absence safe.
         std::map<String, RefTxnId> checkpoints;
         /// THE DESTRUCTIVE GATE for this round, computed ONCE in `fold()` and threaded everywhere so no
@@ -424,6 +425,15 @@ private:
         /// namespace's frontier is unproven, and no proof taken elsewhere can license destruction while
         /// one stands. Reading the seal directly is what keeps a future change to anomaly recording from
         /// silently opening the gate.
+        ///
+        /// STAGE B'S NARROWING OF THIS GATE TO PER-NAMESPACE MUST CARRY TWO THINGS, NOT ONE. The first
+        /// is the hold-set term just described. The second is the namespace whose `_ckpt` is
+        /// undecodable AND which offers the walk no position to hold at: it mints no hold on purpose (a
+        /// fabricated `offending_position` would become a durable false witness), so its fail-close
+        /// rests on `recordAnomaly` plus `frontier_incomplete` and on nothing else -- the only
+        /// per-namespace failure in this file whose gate rests entirely on that pair. A per-namespace
+        /// gate that carried only the hold set would license destruction against a namespace whose own
+        /// checkpoint could not be read.
         bool suppress_destructive = false;
 
         /// Whether EVERY namespace in this round's universe reached a proven frontier — see
