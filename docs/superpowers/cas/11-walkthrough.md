@@ -1554,9 +1554,10 @@ Every row leaks; no row loses data or dangles. That is the asymmetry from §3.3,
 
 ## 12. The part-fetch protocol (fetch by relink) {#part-fetch}
 
-When two replicas share a pool, a fetch should move **no bytes**. The mechanism is a three-trip
+When two replicas share a pool, a fetch should move **no bytes**. The mechanism is a three-phase
 handshake between the receiver (R) and the sender (Snd), gated on both sides proving they mean the
-same pool.
+same pool. Only two of the three phases are round trips to the sender — the offer and the confirm;
+the publish and the promote are the receiver's own writes to the pool.
 
 ```mermaid
 sequenceDiagram
