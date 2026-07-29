@@ -32,6 +32,28 @@ the eviction code (§4.3); `CaRelinkPromote::MechanismFallbackAllowed` gets its 
 the TLA gate gains three expressiveness requirements (§12.5); and the §1.1 arithmetic is corrected
 against a grep rather than against the design.
 
+**v12 (Codex round 8 — 0 blocker, 1 major, 2 minor).** The major was an invariant discharged for
+only half the batch: the per-item op cap is conditional on `!removal_class`, so removal-class items
+are exempt and cannot split for a different reason — they carve SOLO as `WholeShard` mutations. The
+chunk-integrity invariant now names both mechanisms per item class, and its test splits into S6a
+(roll at the boundary), S6b (over-cap REFUSAL, which S6a never exercised) and S6c (removal-class
+solo carve). Minors: the marker-sync cost is stated exactly — one arm-side acquire per attempted
+chunk PLUS one clear-side acquire per non-success resolution, since the unlocked clear paths gain
+one too — and five spots in this document that still assigned the release observation to the HANDLE
+are reassigned to the transaction, matching v11's attempt-versus-word split.
+
+**v11 (Codex round 7 — 0 blocker, 4 major, 4 minor).** The emitter moved from `~PreparedPartWrite`
+to `~PartWriteTxn`: the staging exit has no handle, so a handle-owned emission would have been
+silent on exactly the exit with no other backstop. The two destructors are ordered rather than
+competing — the handle's body makes the last release ATTEMPT, and releasing its `PartWriteTxnPtr`
+member then runs the transaction destructor, which owns the last WORD. Also: relink rows 19/20 now
+assert action and emission together instead of splitting a scenario across two documents; §6.3 stops
+claiming a retention bound that observation does not provide; the marker audit is corrected to
+sixteen writes with the four unlocked production sites named; the controller's second
+`NoAttemptSent` source is covered; and §5.1.2 states what it REQUIRES of the marker fix, so a later
+weakening of the seam surfaces as a stated requirement rather than an invisible one. Line citations
+were re-derived against `af0b2825613` after a concurrent commit shifted `CasRefLedger.cpp`.
+
 **v10 — THE WRITE-RELEASE SEAM IS EXTRACTED (user direction).** Everything §6.5 carried about
 `PartWriteTxn` / `PreparedPartWrite` / caller-guard ownership now lives in its own document,
 `2026-07-29-cas-part-write-release-seam.md`, together with the apply-marker prerequisite that was §5.1.2. The reason is the reason those
