@@ -26,7 +26,7 @@ partial credit — the house rule is that a known red is a red.
 traced to one thing that is not a product defect: Stage A deliberately turned destruction off, and a
 large part of the test estate still asserted that destruction happens. That is now resolved — the
 assertions were NARROWED to the gated-delete family rather than disabled, and nine of nine lanes plus
-three of four scenarios pass as a result. One thing remains, and it is the reason the verdict is gated
+all four scenarios pass as a result. One thing remains, and it is the reason the verdict is gated
 rather than clean: a real regression this gate measured, where under a live writer the GC fold does not
 complete a round at all — now Task 15. W3, open since task 6, is answered here. Four integration lanes, all four adversarial scenarios and one
 soak criterion are written against a reclaiming pool and are being run against a suppressed one. Task 9
@@ -59,9 +59,9 @@ the BACKLOG as `[FSCK-SCALE-TIMEOUT]`.
 | 11 | `test_cas_replicated_relink` | pass | red (1 failed), then **11 passed**, `VERIFY2_EXIT=0` | GREEN — adapted-to-Stage-A-posture (Task 9 option-a pattern), green after adaptation |
 | 12a | soak — SCALE PROBE (defaults, 6 workers / 40 GB) | not a criteria gate | died at 49 min on a 180 s crash-recovery bound; found the T15 fold-round liveness regression and both harness-budget mismatches; 49 minutes of counters are evidence of record | PROBE (not a pass/fail row) |
 | 12b | soak — CRITERIA GATE (3 workers / 8 GB) | zero data loss; no surviving wedge; bounded `unaccounted`; no uninjected ERROR; and — per the 2026-07-29 controller amendment — complete audits at auditable scale plus soak fsck gates reported UNARMED with reason, replacing "fsck clean at end" | zero data loss (2,942,315 == 2,942,315); no violation counter moved; epoch seal minted on both replicas; 2 of 28 scheduled chaos faults fired; fsck gates reported unarmed with reason; complete audits supplied by 05020 and by three PASSING scenario end checkpoints | GREEN against the amended criterion, with one NAMED DEVIATION: I stopped it at minute 95 of its scheduled 90, before the final converge checkpoint. The clause it would have exercised (the data-loss oracle) was run directly instead |
-| 12c | fold-round liveness under load | GC rounds complete while a writer is live | **0 completed folding rounds in 42 minutes** on the leader (`CasRefManifestBodyFoldGets` climbing at ~313/s past 1,087,385; peer logged 162× `NotALeader`) | **FAIL** -> fix = Task 15 {#task-15}, re-validation pending |
+| 12c | fold-round liveness under load | GC rounds complete while a writer is live | **0 completed folding rounds in 42 minutes** on the leader (`CasRefManifestBodyFoldGets` climbing at ~313/s past 1,087,385; peer logged 162× `NotALeader`) | **FAIL** -> fix = Task 15 {#task-15}, re-validation pending. Evidence and provenance in `build/t14_gc_liveness/`: LIVE-PASS readings against a cluster that no longer exists, ledgered there as unreproducible rather than presented as greppable. **T15's re-validation inherits a hypothesis whose specimen was LOST** — that cluster was torn down undumped — so it cannot re-read the original fold; drive it through `utils/ca-soak/scripts/run_soak.sh` so its own specimen survives |
 | 13 | S38 late-PUT fence | the fence holds | **19/19 verdicts pass, `status=PASS`, `FIX2_EXIT=0`**; store returned HTTP 412 | GREEN |
-| 14 | S43 (W3) same-uuid recreation | the survivor's write is not absorbed | **16/16 verdicts pass, `status=PASS`, `FIX3_EXIT=0`** — the recreated pool REFUSES to bootstrap over the planted survivor (`healthy=false`, `refusal_logged=true`), removing that one object lets the same prefix bootstrap, and life 2 comes up empty (`0\t0` vs life 1's `200\t18123181848219261492`) | GREEN — W3 answered |
+| 14 | S43 (W3) same-uuid recreation | the survivor's write is not absorbed | **16/16 verdicts pass, `status=PASS`, `FIX3_EXIT=0`** — the recreated pool REFUSES to bootstrap over the planted survivor (`healthy=false`, `refusal_logged=true`), removing that one object lets the same prefix bootstrap, and life 2 comes up empty (`0\t0` vs life 1's `200\t18123181848219261492`) | GREEN — W3 answered. Extracts in `build/t14_w3_evidence/` (the 668 refusal line, key observations, the run's `report.json`) |
 | 15 | S33 concurrent GC leaders | no leak | **10/10 verdicts pass, `status=PASS`, `FIX2_EXIT=0`** | GREEN |
 | 16 | S30 create/drop churn | bounded fanout, no leftovers | **8/8 verdicts pass, `status=PASS`, `FIX2_EXIT=0`** | GREEN |
 | 17 | 05020 through the stateless harness | live fsck rows | `[ OK ] 1.85 sec`, `T05020_EXIT=0`, full 18-column row emitted | GREEN |
@@ -243,9 +243,21 @@ a number, and the checkpoint printed `OK` over it.
 
 Both bounds were fixed rather than worked around (`ca: soak — a slow gate beats a skipped one; record
 the skips`): the crash-recovery bound is 600 s with the measurement above written into its docstring,
-the summary-fsck budget became a named `FSCK_SUMMARY_TIMEOUT_S = 600` at all seven call sites, and every
-skipped gate is now recorded and reported at end of run, so a run whose correctness gates skipped
-themselves can no longer read like a run that passed them.
+the summary-fsck budget became a named `FSCK_SUMMARY_TIMEOUT_S = 600` at all seven call sites, every
+skipped gate is recorded, the per-checkpoint line renders **GATE-SKIPPED** with `not-measured` fields
+instead of `OK` with zeros, and an end-of-run banner names the skips. Precisely: that machinery is NOT
+yet observed working end to end — attempt 1 predates it, and attempt 2 never reached the end-of-run path
+because I stopped the run. This document says UNARMED for the STATE of a gate that did not run and
+`GATE-SKIPPED` for the string the code prints; they are the same condition.
+
+**Two specimen losses, and what they cost row 12c.** Attempt 1's cluster was torn down before anyone
+queried it, and later the diagnostic cluster I drove by hand for the W3 RCA went the same way — the
+second loss. Row 12c's figures therefore exist only as live-pass readings (ledgered in
+`build/t14_gc_liveness/`), and **Task 15's re-validation inherits a hypothesis whose specimen is gone**:
+it cannot go back and re-read the fold that produced the regression. The remedy is committed rather than
+promised — `utils/ca-soak/scripts/run_soak.sh <label> <args…>` captures a soak's specimen the instant
+the run returns, and the scenario runner now dumps before every reset and once more at end of batch. The
+re-validation soak should be driven through that wrapper.
 
 ### Attempt 2 — the reported run {#soak-attempt-2}
 
@@ -273,7 +285,18 @@ What the run established:
 - **Probe A sampled exactly once**, on the first round after the restart, out of 17 successful rounds:
   `CasGcProbeADue=1`, `CasGcProbeAPerformed=1`, `CasGcProbeASkipped=0`, `CasGcRefScanDisagreements=0`,
   `CasGcProbeAHolePresent=0`, `CasGcProbeAHoleAbsent=0`.
-- **`CasGcClampSuppressedPasses` reached 4** and was the only other watched counter to move.
+- **`CasGcClampSuppressedPasses` reached 12** — the maximum in `build/t14_soak2.log`
+  (`grep -ao 'CasGcClampSuppressedPasses=[0-9]*'`, rolled up in
+  `build/t14_gc_liveness/attempt2_clamp_values.txt`) — and was the only other watched counter to move.
+  An earlier draft said 4, which was a mid-run tick quoted as if it were the final value.
+
+**A limitation of the end-state artifact, stated rather than glossed.** `build/t14_soak2_final_state.log`
+is TRUNCATED: 606 bytes, ch1's counter dump only, ending mid-token at `CasRefS`, because the capture was
+interrupted when I stopped the run. What it DOES carry is intact and is the load-bearing part — both
+replica row counts, `node 8123: 2942315` and `node 8124: 2942315`, which is the data-loss oracle and is
+exact. The per-node COUNTER readings quoted above were taken by live query while the cluster was up and
+are NOT reproducible from that file; every per-node counter claim in this document should be read as a
+live-pass reading.
 
 What the run did NOT establish, stated plainly: its fsck gates were never armed — the entry-gate
 `ca-fsck` timed out at the raised 600 s budget — and **I stopped the run at minute 95, five minutes past
@@ -352,7 +375,10 @@ samples when round duration is unbounded, which makes this STRUCTURAL rather tha
 no value of `gc_probe_a_period` fixes a broken sampling unit. Tracked as BACKLOG
 `[PROBE-A-CADENCE-UNIT]` with the candidate redesigns (a time-based due rule, or an intra-round probe).
 It is also downstream of Task 15 {#task-15}: bounded rounds are what make any round-based cadence
-meaningful again, so the two must be read together.
+meaningful again, so the two must be read together. **The decision point is T15's re-validation soak** —
+once rounds complete under load, re-read `CasGcProbeADue`/`CasGcProbeAPerformed` there and settle
+`[PROBE-A-CADENCE-UNIT]` on that measurement. This gate measured the cadence WANTING, but against rounds
+that never finished, which is not the condition the default was designed for.
 
 **3. fsck runtime versus backlog, and the Task 11 cost model taken to its breaking point.** Three
 measurements, two instruments:
@@ -418,8 +444,9 @@ card up one verdict, and the two remaining card-visible assertions were narrowed
 `assert_reclaimable_drained` (blobs must still drain to 0; `_manifests` cannot, and the retained count
 is reported) and S30's D1 fanout check, which has two halves of which Stage A suppresses one:
 `dropNamespace` still tombstones the shard so `root_dirs` stays bounded and that half is asserted
-unchanged, while RECLAIMING the tombstone is gated, so `CasRootGet` grew 18 → 82 and could not do
-otherwise.
+unchanged, while RECLAIMING the tombstone is gated, so `CasRootGet` grew 10 → 74 in the passing run
+and could not do otherwise (the earlier FAILING run's figures were 18 → 82; same reasoning, different
+runs).
 
 ### S43 (W3) — answered, and the answer is stronger than predicted {#scenario-s43}
 
@@ -458,7 +485,8 @@ card). Refusing the pool is right; taking the whole node down for one residual C
 question worth a BACKLOG item. It is pre-existing bootstrap behaviour, not something Stage A
 introduced, and it is not what row 14 turns on.
 
-Reaching this took four runs and cost two earlier diagnoses that were each right and each incomplete:
+Reaching this took FIVE S43 attempts (`utils/ca-soak/scenarios/runs/*_S43_*`) and cost two earlier
+diagnoses that were each right and each incomplete:
 emptying a prefix under a stopped server is not a recreated pool (fixed by going through `FORGET`), and
 the remaining unhealthy restart was not a defect at all but the guard doing its job. The refusal is read
 through a throwaway container, because the server writes its error log as root/syslog and the harness
@@ -583,8 +611,8 @@ claim to a permitted family. D1's fanout claim is not one claim: `dropNamespace`
 (so `root_dirs` stays bounded) and GC RECLAIMING that tombstone (so per-round cost tracks live tables)
 are separate mechanisms, and Stage A suppresses only the second. Narrowing would have meant weakening
 both halves; splitting keeps the first asserted exactly as before — `root_dirs` 2 → 2 in the run — and
-excuses only the half that suppression makes impossible, where `CasRootGet` grew 18 → 82 because every
-round keeps re-reading tombstones nothing is allowed to reclaim.
+excuses only the half that suppression makes impossible, where `CasRootGet` grew 10 → 74 in the passing
+run because every round keeps re-reading tombstones nothing is allowed to reclaim.
 
 **Contamination, and how it was ruled out.** Two of the three lane passes were run on a machine that
 was not mine alone — first a dead soak's GC fold, then another agent's full build at load ~41. Only the
@@ -644,6 +672,14 @@ Sixteen of seventeen rows green. One row (12a) is a scale probe rather than a ga
 not green: row 12c, the fold-round liveness regression, which is the designated gate.
 
 STAGE A: PENDING (T15 re-validation)
+
+**On the third value.** This document opens by saying the verdict is `PASS` or `FAIL`, and then delivers
+neither. That is a controller ruling of 2026-07-29, recorded here rather than left as an inconsistency:
+the matrix's "any surviving red ⇒ FAIL" governs MEASURED regressions, and row 12c is one — with a
+chartered fix already in flight. `FAIL` would name nine green rows alongside it and read as a stage that
+did not work; `PASS` would certify a stage whose GC does not converge under its own workload. `PENDING`,
+with the one gate named, is the only form that describes what was measured. Stage B's Task 0 documents
+the value on its side.
 
 **Row 14 was ruled PENDING alongside row 12c on 2026-07-29, with the caveat that it would become a
 measured RED — and the line `FAIL` — if the no-ping-after-restart turned out to be a real product
