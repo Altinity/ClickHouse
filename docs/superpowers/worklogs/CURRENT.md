@@ -1885,3 +1885,12 @@ redirected mid-read.
 -> adapt per T9 option-a pattern (T14). T15 five-way rule confirmed w/ held-bounded amendment
 + verbatim-row-carry test (f); tail-only-hide residual accepted (Stage-B self-heals at
 destructive probes).
+**2026-07-29 10:40 local** — watchdog+pipeline: CODEX PHASE-A DONE — 1 BLOCKER (fold-seal
+decode can erase a durable hold) + 3 MAJOR (every-attempt verdict aggregation; S43 vacuous
+absorption; P0 cards launder counter failures) + containment audit PASSED. Triage: F1+F2 ->
+Task 16 (impl-a16, 2nd isolated worktree, ACKed); F3+F4 -> a14's cards pre-run. Lane ruling
+extended to 4 files (ref_snaplog + relink soundness guard). T15 contradiction resolved:
+bound-the-fold-not-the-read RATIFIED (zero-GET skip provably = permanent suppression; 1-probe
+peek keeps frontier liveness) — USER-VISIBLE DEVIATION from literal "вообще не трогаем".
+GC audit agent dispatched (snapshot-first; a14 holds teardown). All 9 lanes ran; retry of
+adapted lane started.
