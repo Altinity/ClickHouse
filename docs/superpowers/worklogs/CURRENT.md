@@ -1839,3 +1839,7 @@ behind the soak (memory saved). No reds.
 audit. First pass done (baseline clean: waits=S3 sockets, CPU=memcpy/LZ4/CityHash128); five
 watch-items ledgered (mutex 57k samples, local-file churn, libunwind, parse-assert errors 28k,
 GC lease locality). Audit agent dispatch scheduled for the ~10:40 tick.
+**2026-07-29 09:42 local** — watchdog: soak healthy (tick #14, pool 10.6GB, signals 2/2,
+throttle 0->1s pacing engaged; one None-metrics tick during a chaos window computed nan% —
+framework pre-existing quirk, noted for the audit agent). All 4 containers up. T14 in soak
+window drafting RESULTS.
