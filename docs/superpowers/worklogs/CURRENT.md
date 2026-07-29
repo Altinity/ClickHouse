@@ -1669,3 +1669,7 @@ No push.
 **2026-07-29 02:00 local watchdog** — T6 silent ~45 min post-gates/post-verdicts (4 commits, no
 verdict-items commit, no report) — finalization nudge sent with the explicit 4-item remainder.
 T10 gate running. No push.
+
+**2026-07-29 02:2x local** — T10 DONE (1475/1475; lying-fixture instinct = premise catching its
+exact target class; decommission ruling: ship-as-is + Stage-B R5 completion path). Reviewer
+dispatched. T6 finalization nudged earlier — still awaiting DONE. No push.
