@@ -1961,3 +1961,10 @@ lanes, four scenarios, one soak criterion written against a reclaiming pool). Ca
 scenario re-runs still SCENARIO_EXIT=1 (S43, S38); adapted-lane verification RUNNING
 (ref_snaplog VERIFY_EXIT=0 green, drop_pool_member in flight). Awaiting a14's DONE report —
 verdict-vs-PENDING ruling reconciliation happens at the task review, not mid-run.
+**2026-07-29 13:3x local** — T14 DONE: STAGE A: FAIL as committed (6 red rows) BUT 4 of them
+= one framework assertion (assert_no_leftovers fails on Stage A's guaranteed steady state —
+gated manifest deletes never condemn). RULED: suppression-aware form (blob leaks == 0 stays
+hard; manifest-leak allowed only as the counted gated-delete family; restore at 7b). W3 gap
+real (wipe != recreation; product DROP/CREATE required). Soak-stop deviation accepted.
+Obligation E discharged vs real store (HTTP 412 fence proof). Fix round 1 dispatched:
+framework fix + S43 rewrite + re-runs + verdict recompute (target: PENDING(T15)).
