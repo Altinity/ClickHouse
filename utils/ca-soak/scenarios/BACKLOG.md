@@ -3226,3 +3226,10 @@ than to an error.
 - **Run:** 20260729T121529_S30_seed20260729
 - **Observed:** S30 REGRESSION vs D1: GC per-round fanout (roots/<ns> dir count and/or CasRootGet) grew across create/drop iterations though no table stayed live — the D1 registry-removal / dropped-shard-reclaim guarantee is violated.
 
+## S43-20260729T123126-1: quiescence failed: Node(localhost:8123) HTTP 400: Code: 36. DB::Exception: Table
+
+- **Logged (UTC):** 2026-07-29T12:33:31
+- **Severity:** finding
+- **Run:** 20260729T123126_S43_seed20260729
+- **Observed:** quiescence failed: Node(localhost:8123) HTTP 400: Code: 36. DB::Exception: Table default.w3_recreated (3e1f0a2b-4c5d-4e6f-8a9b-0c1d2e3f4a5b) is not replicated. (BAD_ARGUMENTS) (version 26.6.1.20000.altinityantalya) | sql=SYSTEM SYNC REPLICA w3_recreated
+
