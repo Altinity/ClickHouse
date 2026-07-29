@@ -959,34 +959,59 @@ A never samples (round-based cadence), fold seal/cursor never advance, ref backl
 without bound, fsck O(backlog) blows its budgets. Secondary cost: `foldManifestEdges` pays
 HEAD+GET (2 serial RTTs) per manifest-edge fold where GET alone carries the same absence signal.
 
+**Design (USER-DIRECTED 2026-07-29, replaces the earlier budget-knob draft):** freeze the
+round's work-set at the round-start LIST tail. The round already enumerates the ref prefix
+once; derive each namespace's LISTED TAIL (max `RefTxnId`, epoch-major order) from that same
+listing. Compare against the namespace's fold cursor (`last_folded_ref_id` — the "remembered
+tail"; contiguity INV-1 is what makes the tail alone a sufficient summary, no full-listing
+comparison needed, and a round that reaches its frozen tail leaves cursor == tail, so NO new
+persistent state exists):
+- `tail_listed > cursor` → walk STRICTLY `cursor+1 .. tail_listed` by exact key and STOP
+  there, however much the writer appends meanwhile (round time is now `O(round-start backlog)`,
+  independent of concurrent writes);
+- `tail_listed == cursor` → do not touch the namespace at all (no walk, no GETs);
+- `tail_listed < cursor` → skip + count (listing stale/lying below the cursor — the cursor is
+  the truth; probe A's disagreement detector is the observer of this class);
+- ALL namespaces unchanged AND no holds due → skip the fold entirely this round.
+Unchanged machinery: held namespaces are always walked (retry obligation); quiet-namespace
+frontier probes keep their existing budget and are the mechanism that both PROVES frontiers
+and CATCHES a namespace whose new records LIST persistently hides (the exact-key probe at
+`cursor+1` sees what LIST omits — the liar stays defeated); reaching the frozen tail is NOT a
+frontier proof (the namespace simply stops being walked; its proof comes from a later quiet
+probe). A LIST omission in the MIDDLE stays a non-event (the walk GETs by exact key, not by
+listing). Fold-seal grammar untouched: stopping at the tail is the ordinary "folded through X"
+coverage row, no hold, classification unchanged.
+
 **Files:**
-- Modify: `.../Gc/CasGc.cpp` (intake walk loop ~:1876, `foldManifestEdges` ~:1008)
-- Modify: `.../Pool/CasPool.h` (new `PoolConfig` knob)
+- Modify: `.../Gc/CasGc.cpp` (tail derivation in the regrouping/intake plan; intake walk loop
+  ~:1876 stop-at-frozen-tail; skip-unchanged + skip-round logic; `foldManifestEdges` ~:1008)
 - Test: `src/Disks/tests/gtest_cas_gc_bounded_walk.cpp` (new)
 
 **Interfaces:**
-- Produces: `PoolConfig::gc_walk_max_logs_per_namespace` (uint64_t, default 10000, 0 = unbounded)
-  — per-namespace per-round intake budget counted in FOLDED LOGS (cut only at log boundaries,
-  never mid-log; atomic-log rule untouched).
+- Produces: per-namespace frozen-tail round semantics (no new config, no new persisted state);
+  `fold_ref_intake` phase metrics gain `tails_advanced`, `tails_unchanged`, `tails_below_cursor`;
+  the all-unchanged skip shows in the existing defer/fold metrics.
 
 - [ ] **Step 1: Failing tests** (red first, against the current unbounded walk):
-  (a) *bounded-round*: plant `budget + K` contiguous logs in one namespace; run one round with
-  the knob at `budget`; assert the round COMPLETES, coverage row seals at exactly
-  `last_folded_ref_id = {E, budget}` (a voluntary cut is NOT a hold: `classification != 4`,
-  `hold == nullopt`), `fold_ref_intake` metrics carry `walk_budget_cuts = 1` and
-  `frontier_proven` excludes the cut namespace; the NEXT round continues from `budget+1` and
-  reaches the frontier.
-  (b) *liveness under a live writer*: appender thread keeps publishing while the round runs;
-  assert the round returns within the budget (bounded logs folded) rather than chasing.
-  (c) *suppression unchanged*: the cut namespace keeps `frontier_complete == false` ⇒
-  `suppress_destructive` stays true under `AuthoritativeForTest` with a cut present — the cut
-  must never widen destruction.
-  (d) *HEAD elimination*: fold of N edges performs exactly N GETs and 0 HEADs on manifest keys
-  (count via the test backend), and an absent body still takes the record-and-continue path.
-- [ ] **Step 2:** Implement the budget: count logs folded per namespace inside the walk loop;
-  on reaching the budget, `closeSegment()`, break WITHOUT hold, mark the namespace cut (excluded
-  from `frontier_proven`), emit `walk_budget_cuts` in the `fold_ref_intake` phase row. Implement
-  the `foldManifestEdges` HEAD removal (GET directly; `!got` keeps the existing absent semantics).
+  (a) *frozen-tail round*: plant N contiguous logs; start a round; while it runs, append K
+  more (test-hook appender or pre-planted "appears mid-round" backend hook); assert the round
+  COMPLETES having folded exactly through the round-start tail (`last_folded_ref_id = {E, N}`),
+  no hold, `tails_advanced = 1`; the NEXT round folds the K stragglers.
+  (b) *skip-unchanged*: two namespaces, one advanced one not; assert the unchanged one performs
+  ZERO ref-log GETs this round (count via test backend) and `tails_unchanged = 1`.
+  (c) *skip-round*: no namespace advanced, no holds → the fold performs no per-namespace walks
+  at all; a subsequent append un-skips.
+  (d) *tail-not-a-frontier-proof*: a walked-to-tail namespace is NOT counted `frontier_proven`
+  this round ⇒ `suppress_destructive` stays true under `AuthoritativeForTest`; the LIST-hidden-
+  tail namespace (tail_listed == cursor while `cursor+1` exists durably) is caught and folded
+  by the quiet-probe path, not lost.
+  (e) *HEAD elimination*: fold of N edges performs exactly N GETs and 0 HEADs on manifest keys,
+  and an absent body still takes the record-and-continue path.
+- [ ] **Step 2:** Implement: derive per-namespace listed tails during regrouping; thread the
+  frozen tail into the walk loop as a strict stop bound (`expected > frozen_tail` → close
+  segment, done — distinct from the absent/hold/crossing exits); implement skip-unchanged and
+  skip-round; emit the three new metrics. Implement the `foldManifestEdges` HEAD removal (GET
+  directly; `!got` keeps the existing absent semantics).
 - [ ] **Step 3:** Full CA gate (release) green; run the two prior liar/hold suites that pin walk
   semantics (`gtest_cas_list_liar_end_to_end.cpp`, `gtest_cas_gc_hold_grammar.cpp`) explicitly.
 - [ ] **Step 4:** Focused re-validation soak: 30 min phase 3 with the default budget; PASS =
