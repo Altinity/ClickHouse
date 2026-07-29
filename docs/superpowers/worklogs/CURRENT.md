@@ -1867,3 +1867,8 @@ TASK 15 appended to plan (875c386823d): gc_walk_max_logs_per_namespace voluntary
 (cut != hold, excluded from frontier_proven) + single-GET edge folds; 4 red-first tests;
 STAGE VERDICT GATED on T15 re-validation soak. impl-a15 dispatched in ISOLATED WORKTREE
 (no collision with a14's tree/docker); a14 told to write verdict as PENDING if all else green.
+**2026-07-29 10:3x local** — soak RED at both-kill: 180s health bound vs slow-but-correct
+MergeTree startup over 74k-generation Outdated set; CA recovery clean (sealed, no holes).
+Ruled harness-not-product; bounds 180->600 + skip registry landed (b67b00aef31), per-line
+GATE-SKIPPED rendering still owed; 3/12 re-run approved as criteria gate, 6/40 run kept as
+scale probe; T15 re-validation stays at 6/40. Lane 1/9 green.
