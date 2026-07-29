@@ -9,9 +9,10 @@ doc_type: 'reference'
 
 # Relink confirm: per-ref rule 3 — draft context for the design pass {#relink-confirm-per-ref-draft}
 
-STATUS: DRAFT (2026-07-29). Not a spec. Input to a user-gated mini design pass; the protocol
-rule it refines is spec-surface (`§confirm-primitive`), so nothing here is implementable
-without that pass concluding. Companion BACKLOG item: `[RELINK-CONFIRM-BUSY-LANE]`
+STATUS: APPROVED FOR DESIGN PASS (user, 2026-07-29: "одобряю дизайн-пасс per-ref confirm,
+планируй после Stage A"). Scheduled immediately after Stage A close: brainstorm/spec -> TLA
+or exhaustive unit matrix (per §5 item 4) -> plan -> implementation. The quick wins of §7 ride
+in the same effort's first commit. Not implementable before the pass concludes. Companion BACKLOG item: `[RELINK-CONFIRM-BUSY-LANE]`
 {#relink-confirm-busy-lane}.
 
 ## 1. Context: what the confirm is and why it exists {#context}
