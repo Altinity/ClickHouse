@@ -1859,3 +1859,11 @@ budget vs 29GiB pool) = harness issue, not product red; post-soak 1800s fsck = c
 evidence; honesty patch ordered (GATE-SKIPPED, never OK-with-zeros). C.2 answered
 STRUCTURALLY: zero completed GC rounds in 42min (fold O(pool), 1M+ manifest-body GETs) ->
 probe never samples; cadence UNIT broken -> BACKLOG. Fold-cost data routed to the GC audit.
+**2026-07-29 10:2x local** — USER: "надо чинить" the degradation -> DIAGNOSED to root cause:
+T7 arithmetic intake = walk-while-exists (old walk was LIST-snapshot-bounded, proven from the
+T13 revert artifact); no walk budget; round unbounded under live writer (0 rounds/42min);
++ HEAD+GET double-RTT per edge fold. Downstream: probe never fires, fsck O(backlog) timeout.
+TASK 15 appended to plan (875c386823d): gc_walk_max_logs_per_namespace voluntary-cut budget
+(cut != hold, excluded from frontier_proven) + single-GET edge folds; 4 red-first tests;
+STAGE VERDICT GATED on T15 re-validation soak. impl-a15 dispatched in ISOLATED WORKTREE
+(no collision with a14's tree/docker); a14 told to write verdict as PENDING if all else green.
