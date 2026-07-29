@@ -1914,3 +1914,8 @@ copied to shared SDD.
 flatlines, zero errors, manifests grow 9->54 post-drop (suppressed-consumption signature).
 FAIL direction overruled -> adapted lanes are the gate rows; falsifiable escape unmet.
 Soak2 (3/8) live, ETA 12:39; a15/a16 parked; dump-script order pending at a14.
+**2026-07-29 11:3x local** — GC audit interim COMPLETE (2afd821f309): zero-rounds proven by
+absence; relink storm measured 248k/32min peak 9,219/min; soak death explained = CA log
+tables' 299 Outdated parts + lease wait vs 180s gate (NOT GC, NOT user tables). Two new
+BACKLOG entries + numbers folded in (e614330d78f). Audit addendum deferred to T15
+re-validation specimen.
