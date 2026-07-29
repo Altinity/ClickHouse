@@ -608,7 +608,7 @@ def checkpoint(driver, cluster, model, phase, *, strict_unreachable=False):
     try:
         residual = drive_gc_to_fixpoint(
             cluster,
-            lambda: run_fsck(FSCK_CONTAINER, detail=False, timeout_s=180, partial=True)["unreachable"],
+            lambda: run_fsck(FSCK_CONTAINER, detail=False, timeout_s=FSCK_SUMMARY_TIMEOUT_S, partial=True)["unreachable"],
             pool_bytes_fn=lambda: pool_size()[1],
             drain_interval_s=METRICS_INTERVAL_S,
             log_fn=log,
@@ -630,8 +630,9 @@ def checkpoint(driver, cluster, model, phase, *, strict_unreachable=False):
     # If even the summary fsck times out here (B146/B154), we log a LOUD warning and skip this
     # checkpoint's fsck asserts entirely — a slow fsck must never wedge or fail the soak.
     try:
-        f = run_fsck(FSCK_CONTAINER, detail=False, timeout_s=180, partial=True)
+        f = run_fsck(FSCK_CONTAINER, detail=False, timeout_s=FSCK_SUMMARY_TIMEOUT_S, partial=True)
     except FsckTimeout as _e:
+        note_skipped_fsck_gate("post-GC summary fsck", _e)
         log(f"WARNING [B146/B154] post-GC summary fsck timed out ({_e}); "
             f"SKIPPING fsck/dryrun asserts for this checkpoint — dangling==0 gate unavailable; "
             f"soak continues (primary purpose: live workload exercise, fsck is best-effort oracle)")
@@ -677,7 +678,7 @@ def checkpoint(driver, cluster, model, phase, *, strict_unreachable=False):
         if phase == 2:
             try:
                 f = wait_for_pool_consistent(
-                    lambda: run_fsck(FSCK_CONTAINER, timeout_s=180)
+                    lambda: run_fsck(FSCK_CONTAINER, timeout_s=FSCK_SUMMARY_TIMEOUT_S)
                 )
                 _fsck_is_detail = True   # run_fsck defaults to detail=True
             except FsckTimeout as _e:
@@ -748,6 +749,7 @@ def checkpoint(driver, cluster, model, phase, *, strict_unreachable=False):
     # The dryrun is also bounded at 600s; FsckTimeout skips the subset assert (best-effort oracle).
     if _detail_fsck_skipped:
         dr = {"count": 0, "entries": []}
+        note_skipped_fsck_gate("dryrun-subset assert", "fsck timed out above")
         log("WARNING [B146/B154] dryrun-subset assert SKIPPED this checkpoint (fsck timed out above)")
     else:
         try:
@@ -892,14 +894,50 @@ def capture_phase_summary(cluster, label, *, since_ts, coverage, conn=None, ts=N
     return written
 
 
-def wait_for_healthy(cluster, *, timeout_s: float = 180.0, settle_s: float = 2.0,
+# A summary `ca-fsck` is O(backlog). At 180 s -- the value until 2026-07-29 -- it began timing out on a
+# ~29 GiB soak pool, and every timeout SKIPS that checkpoint's `dangling == 0` and dryrun-subset
+# assertions while the checkpoint still prints OK with zeros that are the skip rather than a reading.
+# A slow gate is far better than a skipped one, so the budget is 600 s and every skip is recorded in
+# `SKIPPED_FSCK_GATES` and reported at the end of the run.
+FSCK_SUMMARY_TIMEOUT_S = 600
+
+SKIPPED_FSCK_GATES = []
+
+
+def note_skipped_fsck_gate(label: str, reason: str) -> None:
+    SKIPPED_FSCK_GATES.append((label, str(reason)[:200]))
+
+
+def skipped_gate_report_lines() -> list:
+    """End-of-run block. A run whose correctness gates skipped themselves must not read like a run that
+    passed them, which is the same rule the signal trackers apply to counters nobody read."""
+    if not SKIPPED_FSCK_GATES:
+        return ["FSCK GATES: every checkpoint's fsck/dryrun assertions ran (0 skipped)"]
+    lines = [f"FSCK GATES: WARNING — {len(SKIPPED_FSCK_GATES)} checkpoint gate(s) SKIPPED because fsck "
+             f"timed out. The zeros those checkpoints printed are the skip, not a measurement; this run "
+             f"did NOT assert dangling==0 at them."]
+    for label, reason in SKIPPED_FSCK_GATES:
+        lines.append(f"FSCK GATES:   {label}: {reason}")
+    return lines
+
+
+def wait_for_healthy(cluster, *, timeout_s: float = 600.0, settle_s: float = 2.0,
                      sleep_fn=time.sleep, monotonic_fn=time.monotonic):
     """Block until BOTH replicas answer `/ping` with HTTP 200, then settle briefly. Used by the
     Phase-2 recovery wait after a fault window: a killed/restarted node must be HTTP-healthy again
     BEFORE the checkpoint quiesces (else SYSTEM SYNC REPLICA / aggregates would hit a still-down node
     and the checkpoint would spuriously fail). FAILS LOUDLY (CheckpointFailure) if a node never
     returns within the bound -- a restarted node that never comes back IS a crash-recovery failure,
-    not something to swallow."""
+    not something to swallow.
+
+    The bound is 600 s, raised from 180 s on 2026-07-29 after a 90-minute phase-3 run failed here with
+    both nodes answering `/ping` and neither reporting `ca_stress` loaded. They were not failing: the
+    table had accumulated tens of thousands of Outdated parts on a CA disk, and MergeTree startup was
+    still emitting `Loading Outdated part ...` three minutes after the process came up; the data was
+    intact and both replicas converged to the model's exact row count once loading finished. A bound
+    that turns slow-but-correct crash recovery into a reported "crash-recovery failure" is measuring
+    the harness, not the product -- while still being a real bound, because a node that never comes
+    back still trips it."""
     deadline = monotonic_fn() + timeout_s
     def tables_loaded(node) -> bool:
         # /ping turns 200 BEFORE async table load completes. A real read is the robust gate: it proves
@@ -1519,7 +1557,7 @@ def run_phase3(args):
             # Entry gate only needs dangling/exit_code -> cheap summary fsck (detail=False).
             # Each poll is bounded at 180s; FsckTimeout degrades to a logged skip (B146/B154).
             try:
-                wait_for_pool_consistent(lambda: run_fsck(FSCK_CONTAINER, detail=False, timeout_s=180))
+                wait_for_pool_consistent(lambda: run_fsck(FSCK_CONTAINER, detail=False, timeout_s=FSCK_SUMMARY_TIMEOUT_S))
             except FsckTimeout as _e:
                 log(f"WARNING [B146/B154] {label}: entry-gate fsck timed out ({_e}); "
                     f"proceeding to checkpoint without pool-consistent gate — soak continues")
@@ -1675,7 +1713,7 @@ def run_phase3(args):
         # Quiesce-before-dump: do NOT record a bare fsck on a still-churning pool (it false-positives
         # transient `dangling` — B141/B144/B145). Settle to a stable `dangling==0` (or label the
         # verdict transient/persistent) before recording it.
-        f, fsck_status = settle_fsck_for_dump(lambda: run_fsck(FSCK_CONTAINER, timeout_s=180))
+        f, fsck_status = settle_fsck_for_dump(lambda: run_fsck(FSCK_CONTAINER, timeout_s=FSCK_SUMMARY_TIMEOUT_S))
         op_id = last_op.op_id if last_op is not None else None
         last_op_d = last_op.__dict__ if last_op is not None else None
         payload = write_failure(
@@ -1723,6 +1761,8 @@ def run_phase3(args):
     for line in signal_tracker.report_lines():
         log(line)
     for line in fencing.report_lines():
+        log(line)
+    for line in skipped_gate_report_lines():
         log(line)
     for line in phase_coverage.report_lines():
         log(line)
@@ -1876,7 +1916,7 @@ def main(argv=None):
                 # PERSISTENT dangling>0 past the bound is escalated as a REAL durability finding.
                 # Each poll is bounded at 180s; FsckTimeout degrades to a logged skip (B146/B154).
                 try:
-                    wait_for_pool_consistent(lambda: run_fsck(FSCK_CONTAINER, timeout_s=180))
+                    wait_for_pool_consistent(lambda: run_fsck(FSCK_CONTAINER, timeout_s=FSCK_SUMMARY_TIMEOUT_S))
                 except FsckTimeout as _e:
                     log(f"WARNING [B146/B154] {label}: entry-gate fsck timed out ({_e}); "
                         f"proceeding to checkpoint without pool-consistent gate — soak continues")
@@ -1973,7 +2013,7 @@ def main(argv=None):
             n1 = n2 = None
         # Quiesce-before-dump: settle the fsck to a stable `dangling==0` (or label it transient/
         # persistent) rather than recording a bare fsck on a churning pool (B141/B144/B145).
-        f, fsck_status = settle_fsck_for_dump(lambda: run_fsck(FSCK_CONTAINER, timeout_s=180))
+        f, fsck_status = settle_fsck_for_dump(lambda: run_fsck(FSCK_CONTAINER, timeout_s=FSCK_SUMMARY_TIMEOUT_S))
         op_id = last_op.op_id if last_op is not None else None
         last_op_d = last_op.__dict__ if last_op is not None else None
         payload = write_failure(
@@ -1995,6 +2035,8 @@ def main(argv=None):
     for line in signal_tracker.report_lines():
         log(line)
     for line in fencing.report_lines():
+        log(line)
+    for line in skipped_gate_report_lines():
         log(line)
     for line in phase_coverage.report_lines():
         log(line)
