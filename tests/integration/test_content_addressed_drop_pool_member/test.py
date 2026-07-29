@@ -197,17 +197,51 @@ def test_drop_dead_pool_member_heals_the_pool():
     #     either. Then a read-only fsck over the drained pool must report clean (no dangling, no
     #     unaccounted objects).
     node1.query("DROP TABLE t1 SYNC")
-    final = _count(BLOBS_PREFIX)
-    for _ in range(RECLAIM_RETRIES):
-        final = _count(BLOBS_PREFIX)
-        if final <= blobs_baseline:
-            break
-        time.sleep(RECLAIM_SLEEP)
+    at_drop = _count(BLOBS_PREFIX)
 
-    assert final <= blobs_baseline, (
-        "pool did not drain node2's content within {}s after decommission: "
-        "baseline={}, final={}".format(
-            int(RECLAIM_RETRIES * RECLAIM_SLEEP), blobs_baseline, final
+    # ##################################################################################
+    # ###  STAGE-A CONTRACT.  RESTORE THE RECLAMATION ASSERTIONS AT STAGE B TASK 7b.  ###
+    # ##################################################################################
+    # This USED to poll until the pool drained and assert `final <= blobs_baseline`. It cannot, and must not,
+    # assert that today: a GC round may destroy only while holding a frontier proof for EVERY namespace
+    # that can hold a live edge, Stage A cannot enumerate that set, so `UniversePolicy::kDefault` is
+    # `StageA_Suppressed` (`Gc/CasGc.h`) and production GC reclaims NOTHING for the whole of Stage A,
+    # by design. AT TASK 7b: restore the early-exit poll and the `final <= blobs_baseline` assertion, and delete
+    # the suppression-evidence block below. Until then this asserts the Stage-A truth WITH EVIDENCE
+    # rather than by observing an absence — a wedged GC, a lost lease or a crashed background thread
+    # also reclaim nothing, and those are bugs. Same treatment as Task 9's
+    # `test_content_addressed_gc_s3.py::test_stage_a_gc_is_suppressed_and_says_so` (`afa08749a47`).
+    for _ in range(RECLAIM_RETRIES):
+        time.sleep(RECLAIM_SLEEP)
+    final = _count(BLOBS_PREFIX)
+
+    assert final >= at_drop, (
+        "Stage A must reclaim NOTHING, but the pool shrank: baseline={}, at_drop={}, final={}".format(
+            blobs_baseline, at_drop, final
+        )
+    )
+
+    # …AND THE SUPPRESSION IS EVIDENCED: the rounds ran and deleted nothing, which is what separates
+    # "GC declined, by design" from "GC was wedged, crashed, or never held the lease".
+    node1.query("SYSTEM FLUSH LOGS")
+    rounds = int(
+        node1.query(
+            "SELECT count() FROM system.content_addressed_garbage_collection_log "
+            "WHERE event_type = 'Finish' AND outcome = 'Success'"
+        ).strip()
+        or 0
+    )
+    assert rounds > 0, "no successful GC round ran at all — this is not suppression, it is a wedge"
+    deleted = int(
+        node1.query(
+            "SELECT sum(objects_deleted + manifests_deleted + entries_redeleted) "
+            "FROM system.content_addressed_garbage_collection_log WHERE event_type = 'Finish'"
+        ).strip()
+        or 0
+    )
+    assert deleted == 0, (
+        "GC's own bookkeeping reports {} deletion(s) while Stage A suppression is in force".format(
+            deleted
         )
     )
 

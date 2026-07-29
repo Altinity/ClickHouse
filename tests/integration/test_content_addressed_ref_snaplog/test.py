@@ -120,40 +120,84 @@ def test_ref_snaplog_lifecycle_reclaims_and_fsck_clean():
     #     removed namespace's physical @cas@ prefixes (part manifests + verbatim files).
     node.query("DROP TABLE ref_t1_renamed SYNC")
     node.query("DROP TABLE ref_t2 SYNC")
+    # The content count at the moment the refs are unlinked. Under Stage A suppression this is the
+    # floor the pool must never fall below, so it is captured before any waiting happens.
+    after_drop_content = _content_objects()
 
-    # (5) Poll until the pool's CONTENT (blobs + part manifests) drains back to baseline: the
-    #     authoritative "no content leftovers" proof of the fold + condemn/delete + namespace-cleanup
-    #     lifecycle on real rustfs.
+    # (5) ##############################################################################
+    #     ###  STAGE-A CONTRACT.  RESTORE THE RECLAMATION ASSERTIONS AT STAGE B TASK 7b.   ###
+    #     ##############################################################################
     #
-    #     NOTE (known limitation, escalated in the Task 13 report): the immutable ref LOG objects under
-    #     cas/refs/ of a removed namespace are NOT asserted to drain here. `Gc::cleanupRefObjects` runs
-    #     only on FOLD rounds and BEFORE the round republishes the `Removed` snapshot, so on a fully
-    #     quiesced pool (no further FOLD rounds after the drops fold) those covered logs persist as debris.
-    #     Content reclamation (the data-safety-critical path) is unaffected and is what this test pins.
-    final = _content_objects()
+    #     This step USED to poll until the pool's CONTENT (blobs + part manifests) drained back to
+    #     baseline, and assert `final <= content_baseline`. It cannot, and must not, assert that today.
+    #
+    #     A GC round may destroy only while holding a frontier proof for EVERY namespace that can hold
+    #     a live edge, and Stage A cannot enumerate that set — so `UniversePolicy::kDefault` is
+    #     `StageA_Suppressed` (`Gc/CasGc.h`) and production GC reclaims NOTHING for the whole of
+    #     Stage A, by design. Task 9's nine-site destructive inventory gates every delete call reachable
+    #     from GC, each with its own zero-delete-under-suppression test.
+    #
+    #     AT TASK 7b, three edits: restore the early-exit poll and `assert final <= content_baseline`
+    #     here, delete the suppression-evidence block below, and restore step (6)'s
+    #     `preview_deletes=0` expectation to whatever the reclaiming pool then produces.
+    #
+    #     Until then this asserts the Stage-A truth, and asserts it WITH EVIDENCE rather than by
+    #     observing an absence — an absence of reclamation is also what a wedged GC, a lost lease or a
+    #     crashed background thread would produce, and those are bugs. Same treatment, and same
+    #     reasoning, as `test_content_addressed_gc_s3.py::test_stage_a_gc_is_suppressed_and_says_so`
+    #     (Task 9, `afa08749a47`).
     for _ in range(RECLAIM_RETRIES):
-        final = _content_objects()
-        if final <= content_baseline:
-            break
         time.sleep(RECLAIM_SLEEP)
+    final = _content_objects()
 
-    assert final <= content_baseline, (
-        "background GC did not reclaim dropped content within {}s: baseline={}, final={} "
-        "(blobs={}, manifests={})".format(
-            int(RECLAIM_RETRIES * RECLAIM_SLEEP),
+    # Stated as `>= after_drop_content` rather than `> content_baseline` because it is the stronger
+    # claim: not "some of it survived" but "none of it went".
+    assert final >= after_drop_content, (
+        "Stage A must reclaim NOTHING, but the pool's content shrank: baseline={}, "
+        "at_drop={}, final={} (blobs={}, manifests={}). If Task 7b has landed, this test is the "
+        "thing to update — see the comment above.".format(
             content_baseline,
+            after_drop_content,
             final,
             _count(BLOBS_PREFIX),
             _count(MANIFESTS_PREFIX),
         )
     )
 
-    # (6) Read-only consumers on the reclaimed pool: fsck still reports no dangling and no snapshot-oracle
-    #     divergence (the lingering ref logs are debris, never a dangle or an oracle mismatch), and
-    #     ca-gc-dryrun runs and reports no pending content deletes.
+    # …AND THE SUPPRESSION IS EVIDENCED, which is what separates "GC declined, by design" from "GC was
+    # wedged, crashed, or never held the lease" — all of which also reclaim nothing.
+    node.query("SYSTEM FLUSH LOGS")
+    rounds = int(
+        node.query(
+            "SELECT count() FROM system.content_addressed_garbage_collection_log "
+            "WHERE event_type = 'Finish' AND outcome = 'Success'"
+        ).strip()
+    )
+    assert rounds > 0, "no successful GC round ran at all — this is not suppression, it is a wedge"
+
+    deleted = int(
+        node.query(
+            "SELECT sum(objects_deleted + manifests_deleted + entries_redeleted) "
+            "FROM system.content_addressed_garbage_collection_log WHERE event_type = 'Finish'"
+        ).strip()
+        or 0
+    )
+    assert deleted == 0, (
+        "GC's own bookkeeping reports {} deletion(s) while Stage A suppression is in force".format(
+            deleted
+        )
+    )
+
+    # (6) Read-only consumers on the RETAINED pool. The two invariants below hold whether or not
+    #     reclamation is suppressed, and they are the ones that matter: unreferenced content that GC has
+    #     not removed is retention, never a dangle, and never an oracle divergence.
     final_fsck = _disks(node, "ca-fsck")
     assert "dangling=0" in final_fsck, final_fsck
     assert "snapshot_oracle_mismatches=0" in final_fsck, final_fsck
 
+    #     `ca-gc-dryrun` must still RUN and answer. Its `preview_deletes` count is deliberately NOT
+    #     pinned during Stage A: the preview describes the reclamation that suppression withholds, so
+    #     the number it reports is a statement about what a Stage-B round would do, not about this one.
+    #     AT TASK 7b: restore `assert "preview_deletes=0" in dryrun`.
     dryrun = _disks(node, "ca-gc-dryrun")
-    assert "preview_deletes=0" in dryrun, dryrun
+    assert "preview_deletes=" in dryrun, dryrun

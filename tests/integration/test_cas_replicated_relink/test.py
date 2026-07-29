@@ -873,18 +873,43 @@ def test_stalled_publish_protects_source_blobs_and_commits_nothing():
         summary = fsck(node)
         assert summary["dangling"] == "0", "{} fsck: {}".format(node.name, summary)
 
-    # SOUNDNESS GUARD. The part is gone from both replicas and the stalled attempt was abandoned, so the
-    # blobs that were unique to it are now unreachable. GC must reclaim at least one of them — proving
-    # this configuration's GC really can delete blobs of this part, and that their survival during the
-    # stall was the pin and not GC inactivity.
-    deadline = time.time() + 180
-    while not (part_blobs - blob_keys()):
-        assert time.time() < deadline, (
-            "GC never reclaimed any of the {} blobs that only the abandoned relink attempt had "
-            "protected, so their survival during the stall proves nothing".format(len(part_blobs))
-        )
+    # ##################################################################################
+    # ###  STAGE-A CONTRACT.  RESTORE THE SOUNDNESS GUARD AT STAGE B TASK 7b.        ###
+    # ##################################################################################
+    # This USED to be a soundness guard: with the part gone from both replicas and the stalled attempt
+    # abandoned, its unique blobs are unreachable, so GC reclaiming at least one of them proved that
+    # their survival DURING the stall was the pin and not GC inactivity.
+    #
+    # That guard cannot run under Stage A, and the honest thing is to say what is lost rather than to
+    # quietly drop it. `UniversePolicy::kDefault` is `StageA_Suppressed` (`Gc/CasGc.h`), so GC reclaims
+    # nothing for any reason — which means NO observation in this configuration can distinguish
+    # "the blobs survived because the relink pin held them" from "the blobs survived because
+    # destruction is globally off". **While Stage A is in force, this test's stall-pin claim is
+    # unproven, and the assertions that remain above are the ones that still carry weight**: nothing
+    # was committed by the stalled attempt, no dangling reference exists from either mounter, and the
+    # replicas agree on the row count.
+    #
+    # AT TASK 7b: delete this block and restore the reclaim-at-least-one loop verbatim; it is the thing
+    # that makes the rest of the test mean what it says.
+    #
+    # What CAN still be asserted is that GC ran and declined, rather than never running — the failure
+    # mode that would make even a Stage-B guard misleading.
+    for _ in range(3):
         gc_round(node1)
         gc_round(node2)
-        time.sleep(2)
+    node1.query("SYSTEM FLUSH LOGS")
+    rounds = int(
+        node1.query(
+            "SELECT count() FROM system.content_addressed_garbage_collection_log "
+            "WHERE event_type = 'Finish' AND outcome = 'Success'"
+        ).strip()
+        or 0
+    )
+    assert rounds > 0, "no successful GC round ran at all — this is not suppression, it is a wedge"
+    assert not (part_blobs - blob_keys()), (
+        "Stage A must reclaim NOTHING, but {} of the abandoned attempt's blobs were deleted".format(
+            len(part_blobs - blob_keys())
+        )
+    )
 
     drop_everywhere(table)

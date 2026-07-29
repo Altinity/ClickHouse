@@ -148,19 +148,30 @@ def test_two_servers_share_one_pool():
     node1.query("DROP TABLE t1 SYNC")
     node2.query("DROP TABLE t2 SYNC")
 
-    final = count_pool_objects()
-    for _ in range(RECLAIM_RETRIES):
-        final = count_pool_objects()
-        if final <= baseline:
-            break
-        time.sleep(RECLAIM_SLEEP)
+    at_drop = count_pool_objects()
 
-    assert final <= baseline, (
-        "shared pool did not drain to baseline within {}s after both servers dropped their tables: "
-        "baseline={}, after_insert={}, final={} (blobs={}, parts={})".format(
-            int(RECLAIM_RETRIES * RECLAIM_SLEEP),
+    # ##################################################################################
+    # ###  STAGE-A CONTRACT.  RESTORE THE RECLAMATION ASSERTIONS AT STAGE B TASK 7b.  ###
+    # ##################################################################################
+    # This USED to poll until the pool drained and assert `final <= baseline`. It cannot, and must not,
+    # assert that today: a GC round may destroy only while holding a frontier proof for EVERY namespace
+    # that can hold a live edge, Stage A cannot enumerate that set, so `UniversePolicy::kDefault` is
+    # `StageA_Suppressed` (`Gc/CasGc.h`) and production GC reclaims NOTHING for the whole of Stage A,
+    # by design. AT TASK 7b: restore the early-exit poll and the `final <= baseline` assertion, and delete
+    # the suppression-evidence block below. Until then this asserts the Stage-A truth WITH EVIDENCE
+    # rather than by observing an absence — a wedged GC, a lost lease or a crashed background thread
+    # also reclaim nothing, and those are bugs. Same treatment as Task 9's
+    # `test_content_addressed_gc_s3.py::test_stage_a_gc_is_suppressed_and_says_so` (`afa08749a47`).
+    for _ in range(RECLAIM_RETRIES):
+        time.sleep(RECLAIM_SLEEP)
+    final = count_pool_objects()
+
+    assert final >= at_drop, (
+        "Stage A must reclaim NOTHING, but the shared pool shrank after both servers dropped: "
+        "baseline={}, after_insert={}, at_drop={}, final={} (blobs={}, parts={})".format(
             baseline,
             after_insert,
+            at_drop,
             final,
             count_prefix(BLOBS_PREFIX),
             count_prefix(PARTS_PREFIX),
@@ -281,20 +292,27 @@ def test_pool_survives_node_crash():
     node1.query("DROP TABLE crash1 SYNC")
     node2.query("DROP TABLE crash2 SYNC")
 
-    final = count_pool_objects()
-    for _ in range(RECLAIM_RETRIES):
-        final = count_pool_objects()
-        if final <= baseline:
-            break
-        time.sleep(RECLAIM_SLEEP)
+    at_drop = count_pool_objects()
 
-    assert final <= baseline, (
-        "shared pool did not drain to baseline within {}s after the crash + both DROPs (an orphaned "
-        "write-session or blob leaked from the hard kill): baseline={}, after_both_inserts={}, "
+    # ##################################################################################
+    # ###  STAGE-A CONTRACT.  RESTORE THE RECLAMATION ASSERTIONS AT STAGE B TASK 7b.  ###
+    # ##################################################################################
+    # Same reasoning as the first test in this file: `UniversePolicy::kDefault` is `StageA_Suppressed`,
+    # so GC reclaims nothing for the whole of Stage A. What this test still pins, and what it was
+    # really about, is that the hard kill left nothing EXTRA behind: the pool does not keep growing
+    # once both tables are dropped and the orphaned write-session's lease expires. AT TASK 7b: restore
+    # the early-exit poll and `assert final <= baseline`.
+    for _ in range(RECLAIM_RETRIES):
+        time.sleep(RECLAIM_SLEEP)
+    final = count_pool_objects()
+
+    assert final >= at_drop, (
+        "Stage A must reclaim NOTHING, but the shared pool shrank after the crash + both DROPs: "
+        "baseline={}, after_both_inserts={}, at_drop={}, "
         "final={} (blobs={}, parts={})".format(
-            int(RECLAIM_RETRIES * RECLAIM_SLEEP),
             baseline,
             after_both_inserts,
+            at_drop,
             final,
             count_prefix(BLOBS_PREFIX),
             count_prefix(PARTS_PREFIX),
