@@ -1760,3 +1760,7 @@ one live proc). No push.
 
 **2026-07-29 06:20 local watchdog** — T11 finalizing: 05020-reference update + release build
 running (logs seconds-fresh). No push.
+
+**2026-07-29 06:4x local** — T11 DONE (REBUILD condemn-nothing landed; fsck arithmetic +
+record-not-throw; live ca-fsck verified; 1534/1534 + ASan 1538/1538); reviewer dispatched.
+T12-T14 remain. No push.
