@@ -2082,3 +2082,7 @@ probe due@16 — cadence unit vindicated; 1.000 GET/edge — HEAD drop measured)
 stop driver (wrapper captures the addendum specimen), named-deviation stop, row 12c green,
 VERDICT -> STAGE A: PASS, [PROBE-A-CADENCE-UNIT] closes. Chaos 0/11 stated plainly (fencing
 evidence cited from soak2+scenarios). Then: a16 slot, final whole-branch review, stage close.
+**2026-07-29 17:1x local** — USER closed the remaining relink questions: marker fix approved;
+budget cut to MINIMAL (work cap + tiny global limit; segmentation/token-bucket rejected as
+overengineering — warm-by-construction); knob = YAGNI; naming delegated. Closing round
+ordered on top of v4. Meanwhile: a14 executing stop-capture-flip.
