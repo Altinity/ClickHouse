@@ -96,7 +96,7 @@ createStorageObjectStorage(const StorageFactory::Arguments & args, StorageObject
     /// `{_partition_id}` tables as wildcard (see `initPartitionStrategy`).
     configuration->is_create_query = args.mode == LoadingStrictnessLevel::CREATE;
 
-    auto storage = std::make_shared<StorageObjectStorageCluster>(
+    return std::make_shared<StorageObjectStorageCluster>(
         cluster_name,
         configuration,
         // We only want to perform write actions (e.g. create a container in Azure) when the table is being created,
@@ -116,10 +116,6 @@ createStorageObjectStorage(const StorageFactory::Arguments & args, StorageObject
         /* is_datalake_query */ false,
         /* is_table_function */ false,
         /* lazy_init */ false);
-    /// Same as s3(...)/iceberg() alternative syntax: cluster name comes from SETTINGS, not *Cluster argument.
-    if (!cluster_name.empty())
-        storage->setClusterNameInSettings(true);
-    return storage;
 }
 
 #endif
