@@ -1691,3 +1691,6 @@ holding both directions. Polish round dispatched. T10 fix gate running. No push.
 
 **2026-07-29 03:0x local** — T10 fix round landed (per-reason counters; class/prose decoupling
 via out-param); closing confirmation dispatched. T6 polish round in progress. No push.
+
+**2026-07-29 03:2x local** — T10 CLEAN (closes on a two-line touch); lane G one hash from
+complete. Grand-merge sequence planned in ledger. T6 polish in progress. No push.
