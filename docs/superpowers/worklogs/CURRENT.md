@@ -1751,3 +1751,6 @@ quiet build_asan logs). No push.
 fixtures — sweep-then-validate order vindicated; my ASan-hang call corrected to false alarm,
 watchdog heuristic updated). T11 (REBUILD condemn-nothing + fsck) dispatched. T12-T14 remain.
 No push.
+
+**2026-07-29 05:40 local watchdog** — T11 deep in cycle (comment-wave build, unit build, CA
+battery run; log mtimes show a clock skew artifact — activity real). No push.
