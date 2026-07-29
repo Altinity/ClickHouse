@@ -618,6 +618,56 @@ TEST(CasRefGc, MalformedRefKeyAbortsRefFoldingNoPartialDelta)
         << "the durable cursor must not advance on an aborted round";
 }
 
+/// (8b) The un-incarnated (Stage A) key shape is the OTHER way a ref key can be malformed, and it must
+/// land on exactly the path (8) pins -- abort ref folding, record the anomaly, COMPLETE the round.
+///
+/// It gets its own test because the failure mode is worse than a lost round. The parser REFUSES this
+/// shape by name rather than returning `std::nullopt`, so it is the one malformed key that can throw
+/// from the round's global `cas/refs/` enumeration, which runs in `defer_decision` -- before the fold,
+/// and outside the fold's catch. Escaping there does not merely fail one round: GC is the only thing
+/// that could ever delete the key, so a round that dies on it dies on it again every time, forever.
+/// The enumeration must therefore absorb the refusal per key and leave the key unindexed in
+/// `scan.keys`, exactly as it already does for every other malformed shape, and let `groupRefKeys`
+/// raise it once where the round is ready to catch it.
+TEST(CasRefGc, UnIncarnatedRefKeyAbortsRefFoldingWithoutWedgingTheRound)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/aa@cas@"};
+
+    const ManifestRef r = mref(1);
+    writeManifestRaw(*backend, layout, ns, r, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, layout, ns, "tbl", std::nullopt, r);
+
+    /// A ref log at the un-incarnated Stage A shape `<ns>/_log/<id>.zst`. Built by hand because no
+    /// helper can mint one any more -- which is the point: only a foreign or corrupt writer can put
+    /// this key here, and the pool must survive finding it.
+    const String un_incarnated =
+        layout.casRefsPrefix() + ns.string() + "/_log/" + renderRefTxnId(RefTxnId{1, 1}) + ".zst";
+    ASSERT_EQ(backend->putIfAbsent(un_incarnated, "garbage").outcome, PutOutcome::Done);
+
+    Gc gc(store, kGc);
+    RoundReport rep;
+    ASSERT_NO_THROW(rep = gc.runRegularRound())
+        << "the round must COMPLETE: a key GC alone could remove must never abort the round that would";
+    EXPECT_TRUE(rep.hasAnomaly(RootNamespace{}, /*shard*/ 0))
+        << "the refusal must surface as the fold's abort anomaly, not vanish";
+    EXPECT_EQ(rep.deleted, 0u);
+    EXPECT_EQ(rep.redeleted, 0u);
+
+    /// Same fail-close as (8): no partial delta, no cursor advance.
+    EXPECT_EQ(inDegreeOf(*backend, layout, DB::UInt128(1)), 0)
+        << "an aborted ref fold must land no partial ref delta";
+    EXPECT_EQ(foldCursorOf(*backend, layout, ns, 0), 0u)
+        << "the durable cursor must not advance on an aborted round";
+
+    /// The wedge is only visible over time: the key is still there (nothing deletes it), so a second
+    /// round meets it again. It must survive that one too.
+    ASSERT_TRUE(backend->head(un_incarnated).exists) << "precondition: nothing removed the key";
+    ASSERT_NO_THROW(gc.runRegularRound()) << "a round that dies on this key would die on it forever";
+}
+
 /// Coverage gap (Task 13a): a ref log at a CANONICAL key but with an undecodable BODY -- distinct from a
 /// malformed *key* (which aborts earlier at the group step, above). This exercises the
 /// GET-then-decode-throw path.

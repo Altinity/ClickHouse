@@ -3372,6 +3372,37 @@ std::optional<CasFoldSeal> Gc::readFoldSeal(uint64_t generation, uint64_t attemp
     return std::nullopt;
 }
 
+namespace
+{
+
+/// `Layout::parseRefObjectKey` for a key coming from a GLOBAL `cas/refs/` enumeration, with the one
+/// refusal it can raise absorbed into the ordinary "unrecognized" answer.
+///
+/// A ref object naming no life (the un-incarnated shape) is the single malformed key the parser
+/// REFUSES by name instead of classifying as debris, and both global enumerations run OUTSIDE the
+/// fold's catch. Letting the refusal escape one of them would not merely lose a round: GC is the only
+/// thing that could ever delete the key, so every future round would die on it too, with nothing able
+/// to clear it. Absorbed here, the key stays in the enumeration's raw key list, unindexed, exactly
+/// like every other malformed shape, and `groupRefKeys` raises it once inside the fold's catch --
+/// louder than before (an anomaly plus `suppress_destructive`), and without the wedge.
+///
+/// Only `CORRUPTED_DATA` is absorbed: any other exception is a real failure of the enumeration itself.
+std::optional<ParsedRefObjectKey> parseRefObjectKeyForEnumeration(const Layout & layout, const String & key)
+{
+    try
+    {
+        return layout.parseRefObjectKey(key);
+    }
+    catch (const Exception & e)
+    {
+        if (e.code() != ErrorCodes::CORRUPTED_DATA)
+            throw;
+        return std::nullopt;
+    }
+}
+
+}
+
 std::vector<std::pair<RootNamespace, uint64_t>> Gc::discoverUniverse()
 {
     /// LIST-based table discovery: the discovery authority rests on LIST(cas/refs/).
@@ -3383,7 +3414,7 @@ std::vector<std::pair<RootNamespace, uint64_t>> Gc::discoverUniverse()
     std::set<String> namespaces;
     forEachListedKey(backend, layout.casRefsPrefix(), [&](const ListedKey & lk)
     {
-        if (const auto parsed = layout.parseRefObjectKey(lk.key))
+        if (const auto parsed = parseRefObjectKeyForEnumeration(layout, lk.key))
             namespaces.insert(parsed->id.ns.string());
     }, 1000, onGcEnumerationPage);
     std::vector<std::pair<RootNamespace, uint64_t>> universe;
@@ -3433,8 +3464,9 @@ RefScanSummary Gc::enumerateRefPrefix()
     /// ONE full enumeration of `cas/refs/`: the raw keys, plus a lenient per-namespace index of the
     /// Log-kind ids among them. Lenient is deliberate — a malformed key is kept in `keys` and left
     /// unindexed, so the STRICT validation (and the round-abort it can raise) happens exactly once, in
-    /// the fold's `groupRefKeys`. A ref object naming no life is the exception: `parseRefObjectKey`
-    /// refuses it outright (`CORRUPTED_DATA`), and the refusal propagates from here.
+    /// the fold's `groupRefKeys`. That holds for EVERY malformed shape: the one the parser refuses by
+    /// name is absorbed per key by `parseRefObjectKeyForEnumeration`, which is what keeps this
+    /// enumeration -- which runs before the fold, outside its catch -- unable to wedge the round.
     const Layout & layout = store->layout();
     Backend & backend = store->backend();
 
@@ -3444,7 +3476,7 @@ RefScanSummary Gc::enumerateRefPrefix()
     forEachListedKey(backend, layout.casRefsPrefix(), [&](const ListedKey & lk)
     {
         scan.keys.push_back(lk.key);
-        const auto parsed = layout.parseRefObjectKey(lk.key);
+        const auto parsed = parseRefObjectKeyForEnumeration(layout, lk.key);
         if (parsed && parsed->kind == RefObjectKind::Log)
         {
             const String ns_str = parsed->id.ns.string();

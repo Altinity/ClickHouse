@@ -237,6 +237,35 @@ TEST(CasRebuildCondemnNothing, OrphanBlobIsRetainedNotCondemned)
         << "the residual is RETENTION: an orphan is kept, not quietly reclaimed by a substitute pass";
 }
 
+/// The rebuild is the `gc/state` disaster-recovery command, so it is the LAST thing that may refuse to
+/// run over a pool holding one bad key. Its universe comes from `discoverUniverse`, which parses every
+/// key under `cas/refs/`; a ref object at the un-incarnated (Stage A) shape is REFUSED by name there,
+/// and an unabsorbed refusal would make the recovery command unusable on exactly the damaged pool it
+/// exists for. The key must be skipped from the universe -- it names no life, so no catalog entry can
+/// ever claim it -- and the rebuild must complete.
+TEST(CasRebuildCondemnNothing, UnIncarnatedRefKeyDoesNotAbortTheRebuild)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+
+    publishAt(*backend, layout, kNsA, RefTxnId{1, 1}, "ref_a", /*build_sequence=*/1, DB::UInt128(1), /*birth=*/true);
+
+    /// Hand-built: no helper can mint this shape any more.
+    const String un_incarnated =
+        layout.casRefsPrefix() + kNsA.string() + "/_log/" + renderRefTxnId(RefTxnId{1, 1}) + ".zst";
+    ASSERT_EQ(backend->putIfAbsent(un_incarnated, "garbage").outcome, PutOutcome::Done);
+
+    Gc gc(store, kGc);
+    RebuildReport rep;
+    ASSERT_NO_THROW(rep = gc.rebuildBaseline(/*force=*/true))
+        << "the recovery command must not be taken out by the damage it exists to recover from";
+    ASSERT_TRUE(rep.performed) << rep.refusal;
+
+    /// The live namespace was still discovered and folded -- the bad key was skipped, not the pool.
+    EXPECT_EQ(rep.committed_refs, 1u) << "the un-incarnated key must not hide the live namespace";
+}
+
 /// Removing the condemnation must not disturb the other thing a rebuild owes: every hold in the prior
 /// seal rides through VERBATIM (Task 8). Asserted together with the condemn-nothing rule because the
 /// two used to be produced by the same pass, and a hold dropped here would hand back a baseline that
