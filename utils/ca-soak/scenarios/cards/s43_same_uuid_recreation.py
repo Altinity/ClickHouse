@@ -91,16 +91,7 @@ def _wipe_pool(s3, log_fn) -> int:
     return len(keys)
 
 
-def _violation_counters(cluster) -> dict:
-    peak = {e: 0 for e in _VIOLATION_EVENTS}
-    for node in cluster.nodes():
-        try:
-            ev = observe.events_snapshot(node)
-        except Exception:
-            continue
-        for e in _VIOLATION_EVENTS:
-            peak[e] = max(peak[e], int(ev.get(e, 0) or 0))
-    return peak
+from .s38_late_put_injection import _violation_counters  # fail-aware; see its docstring
 
 
 @register
@@ -170,13 +161,31 @@ class S43(Scenario):
         stop_rc = cluster_boot.compose_run(self.compose_variant, "stop", "ch1", "ch2",
                                           log_fn=ctx.log)
         result.observations["compose_stop_rc"] = stop_rc
+        result.add(Verdict.check(
+            "the servers stopped for the pool wipe", "compose stop returns 0", stop_rc, stop_rc == 0,
+            "" if stop_rc == 0 else "the wipe would have run underneath LIVE servers, which tests "
+                                    "something else entirely"))
         time.sleep(3)
         wiped = _wipe_pool(s3, ctx.log)
         result.observations["pool_wipe"] = {"objects_deleted": wiped}
 
         survivor_id = _render_ref_txn_id(_SURVIVOR_EPOCH, _SURVIVOR_SEQ)
         survivor_key = f"{log_prefix}{survivor_id}{_REF_LOG_SUFFIX}"
-        survivor_body = _restamp_ref_log_txn(donor_body, _SURVIVOR_SEQ, writer_epoch=_SURVIVOR_EPOCH)
+        # THE PLANTED TRANSACTION MUST CARRY OPS. A zero-op survivor is undetectable by construction:
+        # absorbing it would change nothing, so "life 2 exposes no rows" would pass whether the fence
+        # held or not. Keeping the donor's ops means absorption has an observable consequence — the
+        # recreated life would carry a binding to a manifest the wipe removed, which shows up as rows
+        # it should not have AND as a dangling reference in the end checkpoint's fsck.
+        survivor_body = _restamp_ref_log_txn(donor_body, _SURVIVOR_SEQ, writer_epoch=_SURVIVOR_EPOCH,
+                                             keep_ops=True)
+        survivor_ops = len(_zstd_decompress(survivor_body).decode().splitlines()) - 3
+        result.observations["survivor_op_count"] = survivor_ops
+        result.add(Verdict.check(
+            "the planted survivor carries observable operations",
+            ">0 ops, so absorption would have a visible consequence",
+            survivor_ops, survivor_ops > 0,
+            "" if survivor_ops > 0 else "a zero-op survivor makes this card vacuous: absorbing it "
+                                        "would change nothing, so the absorption check could not fail"))
         s3.put_object(Bucket=_S3_BUCKET, Key=survivor_key, Body=survivor_body)
         ctx.log(f"S43: injected the survivor's queued write at {survivor_id} into the recreated pool")
         result.observations["survivor"] = {
@@ -191,6 +200,8 @@ class S43(Scenario):
         start_rc = cluster_boot.compose_run(self.compose_variant, "start", "ch1", "ch2",
                                            log_fn=ctx.log)
         result.observations["compose_start_rc"] = start_rc
+        result.add(Verdict.check(
+            "the servers were started again", "compose start returns 0", start_rc, start_rc == 0, ""))
         healthy = cluster_boot.wait_healthy(cl, timeout_s=heal_timeout_s, log_fn=ctx.log)
         result.add(Verdict.check(
             "the servers come back on the recreated pool", "healthy within heal_timeout_s",
@@ -202,7 +213,7 @@ class S43(Scenario):
         # =====================================================================================
         # Life 2: same uuid, same namespace path, and a foreign transaction already sitting at {1,2}.
         # =====================================================================================
-        before = _violation_counters(cl)
+        before = _violation_counters(cl, _VIOLATION_EVENTS)
         create_error = None
         try:
             _create(cl.node1, _TABLE, _UUID)
@@ -219,7 +230,7 @@ class S43(Scenario):
             except QueryError as e:
                 touch_error = str(e)[:400]
 
-        after = _violation_counters(cl)
+        after = _violation_counters(cl, _VIOLATION_EVENTS)
         result.observations["life2"] = {
             "create_error": create_error, "touch_error": touch_error, "rows": life2_rows,
             "checksum": life2_checksum, "life1_checksum": life1_checksum,
@@ -230,6 +241,9 @@ class S43(Scenario):
 
         # THE assertion. Refusing loudly and starting clean are both safe; returning the previous
         # life's data is the one outcome that is not.
+        # Absorption keys on the OBSERVABLE the planted ops would produce, not only on a row count:
+        # life 2 exposing rows at all, or the end-state audit finding a reference to something the wipe
+        # removed. Either is absorption; neither can be produced by a fence that held.
         absorbed = life2_rows is not None and life2_rows > 0
         result.add(Verdict.check(
             "the recreated table does not absorb the previous life's state",
@@ -246,10 +260,14 @@ class S43(Scenario):
                 f"life1={life1_checksum!r} life2={life2_checksum!r}",
                 life2_checksum != life1_checksum or life1_rows == 0, ""))
 
-        moved = {e: after[e] - before[e] for e in _VIOLATION_EVENTS if after[e] > before[e]}
+        measured = sorted(set(before) & set(after))
+        moved = {e: after[e] - before[e] for e in measured if after[e] > before[e]}
+        unmeasured = [e for e in _VIOLATION_EVENTS if e not in measured]
         result.add(Verdict.check(
             "no always-zero counter moved across the recreation",
-            f"all of {', '.join(_VIOLATION_EVENTS)} unchanged", moved or "unchanged", not moved,
+            f"all of {', '.join(_VIOLATION_EVENTS)} read on every node and unchanged",
+            {"moved": moved, "unmeasured": unmeasured} if (moved or unmeasured) else "unchanged",
+            not moved and not unmeasured,
             "" if not moved else f"counters moved: {moved}"))
 
         _common.standard_end(ctx, result, [_TABLE])

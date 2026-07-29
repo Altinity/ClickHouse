@@ -113,7 +113,8 @@ def _parse_ref_txn_id(leaf: str):
         return None
 
 
-def _restamp_ref_log_txn(body: bytes, ref_sequence: int, writer_epoch: int | None = None) -> bytes:
+def _restamp_ref_log_txn(body: bytes, ref_sequence: int, writer_epoch: int | None = None,
+                         keep_ops: bool = False) -> bytes:
     """Rewrite a real ref-log object's id and strip its ops.
 
     The format is line-oriented JSON (`CasTextFormat.cpp`): a header line, a meta line carrying
@@ -135,8 +136,16 @@ def _restamp_ref_log_txn(body: bytes, ref_sequence: int, writer_epoch: int | Non
     # copied link would be rejected by the seal grammar for a reason unrelated to this card.
     meta.pop("!pse", None)
     meta.pop("!pss", None)
-    return _zstd_compress(
-        ("\n".join([lines[0], json.dumps(meta, separators=(",", ":")), '{"n":0}']) + "\n").encode())
+    # `keep_ops=False` is the S38 shape: an op-count of zero can never poison a real later fold, which
+    # is what you want when the point is that the object is never READ. S43 needs the opposite — an
+    # object whose absorption would be OBSERVABLE — so it keeps the donor's ops and the trailer that
+    # counts them (the op lines sit between the meta line and the trailer).
+    if keep_ops:
+        ops = lines[2:-1]
+        out = [lines[0], json.dumps(meta, separators=(",", ":"))] + ops + ['{"n":%d}' % len(ops)]
+    else:
+        out = [lines[0], json.dumps(meta, separators=(",", ":")), '{"n":0}']
+    return _zstd_compress(("\n".join(out) + "\n").encode())
 
 
 def _zstd_decompress(data: bytes) -> bytes:
@@ -213,16 +222,28 @@ def _text_log_count(node, since: str, needle: str) -> int:
         return -1   # probe failure is distinct from a genuine 0 — caller treats <0 as inconclusive
 
 
-def _violation_counters(cluster) -> dict:
-    """Peak value of each always-zero counter across the cluster. A node that cannot be read is
-    skipped rather than counted as zero."""
-    peak = {e: 0 for e in _VIOLATION_EVENTS}
+def _violation_counters(cluster, events):
+    """Peak value of each always-zero counter across the cluster.
+
+    FAIL-AWARE, deliberately. The first version caught every exception and SKIPPED the node, so a probe
+    that failed on both nodes returned a dict of clean zeros and the invariant "nothing moved" passed
+    while nothing had been read — the same laundering the soak's own `SignalTracker` was written to
+    prevent. A read failure on a required node is a CARD FAILURE, raised here, because a counter that
+    cannot be read is not a counter that is quiet."""
+    peak = {e: 0 for e in events}
     for node in cluster.nodes():
         try:
             ev = observe.events_snapshot(node)
-        except Exception:
-            continue
-        for e in _VIOLATION_EVENTS:
+        except Exception as exc:
+            raise RuntimeError(
+                f"counter probe FAILED on {node!r} ({type(exc).__name__}: {str(exc)[:160]}) — refusing "
+                f"to report the always-zero invariant as held on an unread node") from exc
+        missing = [e for e in events if e not in ev]
+        if missing:
+            raise RuntimeError(
+                f"counter probe on {node!r} did not return {missing} — the binary does not have these "
+                f"counters, or the query shape changed; refusing to treat absence as zero")
+        for e in events:
             peak[e] = max(peak[e], int(ev.get(e, 0) or 0))
     return peak
 
@@ -441,20 +462,26 @@ class S38(Scenario):
             "body": injected_body.decode(errors="replace")}
 
         since_inject = cl.node1.scalar("SELECT toString(now())")
-        violations_before = _violation_counters(cl)
+        violations_before = _violation_counters(cl, _VIOLATION_EVENTS)
         for _ in range(3):
             for idx in range(len(cl.nodes())):
                 gc_mod.gc_drive_round(cl, log_fn=ctx.log, node_index=idx)
         gc_summary = observe.gc_log_all(cl, since_inject).get("summary", {})
-        violations_after = _violation_counters(cl)
+        violations_after = _violation_counters(cl, _VIOLATION_EVENTS)
+        # An EMPTY delta map is only meaningful if both readings actually covered every counter; the
+        # fail-aware probe above guarantees that, so `measured` can never be silently partial.
+        measured = sorted(set(violations_before) & set(violations_after))
         moved = {e: violations_after[e] - violations_before[e]
-                 for e in _VIOLATION_EVENTS if violations_after[e] > violations_before[e]}
+                 for e in measured if violations_after[e] > violations_before[e]}
+        unmeasured = [e for e in _VIOLATION_EVENTS if e not in measured]
         result.observations["violation_counters"] = {
-            "before": violations_before, "after": violations_after, "gc_rounds": gc_summary}
+            "before": violations_before, "after": violations_after, "measured": measured,
+            "unmeasured": unmeasured, "gc_rounds": gc_summary}
         result.add(Verdict.check(
             "no always-zero counter moved across the injection and driven GC",
-            f"all of {', '.join(_VIOLATION_EVENTS)} unchanged",
-            moved or "unchanged", not moved,
+            f"all of {', '.join(_VIOLATION_EVENTS)} read on every node and unchanged",
+            {"moved": moved, "unmeasured": unmeasured} if (moved or unmeasured) else "unchanged",
+            not moved and not unmeasured,
             "" if not moved else f"counters moved: {moved} — a durable transaction went missing, the "
                                  "fold advanced past work, or the stream stopped being dense"))
 
