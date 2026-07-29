@@ -15,11 +15,17 @@ before the prefix is reused, so no such transaction can still be in flight. This
 defence too, by injecting the survivor's transaction directly into the recreated pool with `boto3`,
 and then asks what the recreated pool's FIRST recovery of that namespace does with it.
 
-The required answer is that it REFUSES the stream rather than absorbing it — task 6's analysis of
-genesis grounding says a recovery that starts above the true first id meets either a non-contiguous
-apply or a non-birth op on a never-born table, and both are `CORRUPTED_DATA` rather than a quietly
-shorter table. The unacceptable answer is silent absorption: the recreated table exposing, or
-pointing at, a previous life's state.
+THE ANSWER, measured 2026-07-29, and it arrives EARLIER than task 6 predicted. Task 6 expected the
+recreated pool's first RECOVERY to refuse the stream (a non-contiguous apply, or a non-birth op on a
+never-born table, both `CORRUPTED_DATA`). What actually happens is stronger: the recreated pool never
+bootstraps at all. A prefix holding the survivor's object but no `_pool_meta` is residual data, and
+`CasPool.cpp:439` refuses it outright — `missing _pool_meta over a non-empty pool prefix — refusing to
+bootstrap over residual data`. The servers exit rather than mount, so there is no life 2 to absorb
+anything. The recovery-level defence task 6 described is never even reached.
+
+This card therefore asserts the refusal, and then proves the survivor CAUSED it: remove that one
+planted object, change nothing else, restart again, and the same prefix bootstraps cleanly. Life 2 is
+then created as the control and must be empty.
 
 The card asserts the safety property in the form that does not depend on WHICH refusal fires:
 
@@ -79,6 +85,26 @@ def _create(node, name: str, table_uuid: str) -> None:
         f"ENGINE = MergeTree ORDER BY (id) "
         f"SETTINGS storage_policy='ca', min_bytes_for_wide_part=0, min_rows_for_wide_part=0, "
         f"search_orphaned_parts_disks='local'")
+
+
+def _server_err_contains(node_dir: str, needle: str) -> bool:
+    """True if `logs/<node_dir>/clickhouse-server.err.log` contains `needle`.
+
+    Read through a throwaway container: the file is written by the server as root/syslog and the
+    harness user cannot open it — the same fact that motivated the pre-teardown dump. Uses the image
+    the compose already pulls, so this adds no new dependency. Returns False on any failure; the
+    caller pairs it with a behavioural check, so it can only ever weaken a claim, never invent one."""
+    import subprocess
+    log_dir = str((cluster_boot.CA_SOAK_DIR / "logs" / node_dir).resolve())
+    try:
+        pr = subprocess.run(
+            ["docker", "run", "--rm", "-v", f"{log_dir}:/l:ro",
+             "clickhouse/clickhouse-server:25.8",
+             "grep", "-a", "-c", needle, "/l/clickhouse-server.err.log"],
+            capture_output=True, text=True, timeout=120)
+        return pr.returncode == 0 and int((pr.stdout or "0").strip() or 0) > 0
+    except Exception:
+        return False
 
 
 def _wipe_pool(s3, log_fn) -> int:
@@ -228,16 +254,49 @@ class S43(Scenario):
         result.observations["compose_start_rc"] = start_rc
         result.add(Verdict.check(
             "the servers were started again", "compose start returns 0", start_rc, start_rc == 0, ""))
-        healthy = cluster_boot.wait_healthy(cl, timeout_s=heal_timeout_s, log_fn=ctx.log)
+        # =====================================================================================
+        # THE ANSWER, and it arrives earlier than task 6 predicted. The prefix now holds exactly one
+        # object — the survivor's — and no `_pool_meta`, because the recreation removed it. That is a
+        # shape the product REFUSES outright: `CasPool.cpp:439` declines to bootstrap a pool over a
+        # non-empty prefix whose `_pool_meta` is missing, "refusing to bootstrap over residual data".
+        # So the survivor's `{1,2}` is never absorbed, for a reason STRONGER than a recovery declining
+        # the stream: the recreated pool never comes up at all while that object is there.
+        # =====================================================================================
+        healthy = cluster_boot.wait_healthy(cl, timeout_s=90, log_fn=ctx.log)
+        refusal = any(_server_err_contains(n, "refusing to bootstrap over residual data")
+                      for n in ("ch1", "ch2"))
+        result.observations["bootstrap_refusal"] = {
+            "healthy_with_survivor_planted": healthy, "refusal_logged": refusal}
         result.add(Verdict.check(
-            "the servers come back on the recreated pool", "healthy within heal_timeout_s",
-            f"healthy={healthy}", healthy, ""))
-        if not healthy:
+            "the recreated pool REFUSES to bootstrap over the survivor's residual write",
+            "servers do not come up, and the log names the residual-data refusal",
+            f"healthy={healthy} refusal_logged={refusal}", (not healthy) and refusal,
+            "" if ((not healthy) and refusal) else
+            ("the servers came up over a prefix holding a foreign ref-log object and no _pool_meta — "
+             "the residual-data guard did not fire" if healthy else
+             "the servers did not come up, but the residual-data refusal is NOT in the log, so this "
+             "card cannot claim that guard is the reason")))
+
+        # CAUSATION, not correlation: remove that one planted object and nothing else, restart again,
+        # and the pool must bootstrap. The only difference between the two restarts is the survivor.
+        s3.delete_object(Bucket=_S3_BUCKET, Key=survivor_key)
+        cluster_boot.compose_run(self.compose_variant, "restart", "ch1", "ch2", log_fn=ctx.log)
+        healthy_after = cluster_boot.wait_healthy(cl, timeout_s=heal_timeout_s, log_fn=ctx.log)
+        result.observations["healthy_after_removing_survivor"] = healthy_after
+        result.add(Verdict.check(
+            "and the refusal is caused by the planted survivor, nothing else",
+            "removing that one object lets the same prefix bootstrap",
+            f"healthy={healthy_after}", healthy_after,
+            "" if healthy_after else "the pool still refuses with an empty prefix, so the refusal "
+                                     "above cannot be attributed to the planted object"))
+        if not healthy_after:
             _common.standard_end(ctx, result, [_TABLE])
             return
 
         # =====================================================================================
-        # Life 2: same uuid, same namespace path, and a foreign transaction already sitting at {1,2}.
+        # Life 2, as the control: same uuid, same namespace path, on a pool that has now legitimately
+        # bootstrapped over the reused prefix. It must be EMPTY — nothing of life 1 survives, and the
+        # survivor is gone rather than absorbed.
         # =====================================================================================
         before = _violation_counters(cl, _VIOLATION_EVENTS)
         create_error = None
