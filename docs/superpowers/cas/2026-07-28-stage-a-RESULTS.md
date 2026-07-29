@@ -803,16 +803,18 @@ a real object store with an HTTP 412, W3 answered, and GC liveness restored and 
 ## Addendum — gate figures at the final head {#final-head-gates}
 
 The battery table's rows 1-2 record the Task-11-era counts at the head where that battery ran. The
-stage's FINAL head is `25ce1d3531a` (T15 + T16 merged, then T16b merged after the verdict commit
-`3f7b35c7ce1` — a deletion-only change, controller-mini-reviewed, that could not affect the verdict's
-subject matter). The gates at that final head, copied from the named artifacts:
+stage's FINAL head is `d4ddc736949` — after the verdict commit `3f7b35c7ce1` two more reviewed
+merges landed, neither touching the verdict's subject matter: `25ce1d3531a` (T16b, a deletion-only
+vestige removal) and `d4ddc736949` (the final-review I1/M1/M2 fixes: corrupt-`_ckpt` per-namespace
+hold + two new tests, scoped-re-review APPROVED). The gates at that final head:
 
 | gate | observed at final head | artifact |
 |---|---|---|
-| CA gtest gate, release | **1564/1564** from 243 suites (= merged 1565 − exactly the one deleted vacuous test) | a16's `build/t16b_gate_release.log`, recorded in `task-16-report.md` §T16b |
-| CA gtest gate, ASan | **1568/1568** from 256 suites (= merged 1569 − 1), `GATE_EXIT=0`, zero sanitizer findings | `build_asan/t16b_gate_asan.log` |
+| CA gtest gate, release | **1566/1566** from 243 suites (= 1564 at `25ce1d3531a` + exactly the two new hold-grammar tests) | `fix_i1_gate_release.log` (fix worktree), arithmetic in the merge commit `d4ddc736949` |
+| CA gtest gate, ASan | **1570/1570** from 256 suites (= 1568 + 2), `GATE_EXIT=0`, **zero** sanitizer findings | `build_asan/i1fix_gate_asan.log` |
 
-The count deltas between rows 1-2 and this table are the reviewed additions of Tasks 12-16 plus the
-T16b deletion, each reconciled by arithmetic at its merge (ledger entries carry the per-merge
-arithmetic). No re-verdict: this addendum exists so the stage record names its final head explicitly
-(final-review finding I2).
+Independent check on the +2: `git diff 25ce1d3531a..d4ddc736949 -- src/Disks/tests/` contains
+exactly two added `TEST(` macros. The count deltas between rows 1-2 and this table are the reviewed
+additions of Tasks 12-17 plus the T16b deletion, each reconciled by arithmetic at its merge (the
+merge commit messages carry the per-merge arithmetic). No re-verdict: this addendum exists so the
+stage record names its final head explicitly (final-review finding I2).
