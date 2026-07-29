@@ -24,7 +24,10 @@ Constraints 1-11 of the Stage A plan
 (`2026-07-28-cas-ref-chain-stage-a-streams.md {#global-constraints}`) apply VERBATIM to every
 task here. Additional Stage-B constraints:
 
-12. The incarnation qualifies THE REF LAYER ONLY (`<ns>/<inc>/{_log,_snap,_ckpt}`); manifests
+12. The incarnation qualifies THE REF LAYER ONLY (`<ns>/<inc>/{_log,_snap,_cleanup,_ckpt}` —
+    `_cleanup` added by Task-1 review Important-2: the cleanup marker builds through the same
+    life-scoped prefix and is one of `parseRefObjectKey`'s three kinds; a marker surviving into
+    the next life would fake a completed removal, the exact rebirth alias INV-3 closes); manifests
     keep `(namespace, mount-epoch, build-sequence)` identity; verbatim FILES stay unqualified
     (their hazard is R1 — Task 9 writes its spec, nothing here touches file keys).
 13. Catalog admission refuses loudly; removal is NEVER refused (spec INV-3).
