@@ -1940,3 +1940,7 @@ load 3.9, no builds. ETA 12:39. All agents in assigned states.
 **2026-07-29 12:20 local** — watchdog: soak2 tick #58 (~71 min), pool ~23.9GB, signals 2/2,
 clamp counter 11, no CheckpointFailure; archived pre-t14b log dirs intact. ETA 12:39; a14's
 dump+scenarios queue next. Load 3.3, quiet. Idle otherwise.
+**2026-07-29 12:40 local** — watchdog: soak2 in overtime wrap-up (tick #74, ~24.3GB), TWO
+good signals moving: CasGcProbeADue=1 (probe came due — post-restart rounds completing) and
+CasRefRecoveryEpochSealed=1 (the fencing seal fired on the chaos restart — obligation D
+evidence). No CheckpointFailure. Awaiting PHASE3 end + manual predown dump.
