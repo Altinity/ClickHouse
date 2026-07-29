@@ -1521,13 +1521,19 @@ TEST(CasGcRound, OrphanManifestCursorSweepDeletesAndPersistsCursor)
     /// epoch-`E` build is deletable only once the namespace's sealed fold cursor sits in an epoch
     /// STRICTLY above `E`. The debris above is epoch 1, so the fixture must put a cursor in epoch 2.
     ///
-    /// IT IS SEEDED, NOT FOLDED, and that is forced rather than chosen: producing such a cursor
-    /// honestly needs a real epoch crossing, i.e. an `EpochSeal` record in the namespace's log -- and
-    /// `RefTableState::apply` still throws `NOT_IMPLEMENTED` on one (a deliberate Stage-A task-1 scope
-    /// boundary; no writer mints a seal yet). The sweep builds its protection view through that replay,
-    /// so a seal in the tail makes the view unavailable and the sweep skips the namespace entirely. The
-    /// two cannot both be exercised until seal-apply lands; this test keeps the sweep's subject and
-    /// seeds the durable fact the premise reads.
+    /// IT IS SEEDED, NOT FOLDED, and that is a WORKAROUND WITH AN EXPIRY, not the intended shape.
+    /// Producing such a cursor honestly needs a real epoch crossing, i.e. an `EpochSeal` record in the
+    /// namespace's log -- and on this branch `RefTableState::apply` still throws `NOT_IMPLEMENTED` on
+    /// one. The sweep builds its protection view through that replay, so a seal in the tail makes the
+    /// view unavailable and the sweep skips the namespace entirely; the two cannot both be exercised
+    /// here.
+    ///
+    /// OWED AT MERGE: that stub is stale. The apply layer enforces INV-2's seal chain as of
+    /// `8e546671123`, so once this branch merges, REPLACE the seeding below with a folded crossing
+    /// (publish at `{1,1}`, `seal{1,2}`, publish at `{2,1}` chaining to it) and let the round's own
+    /// arithmetic intake seal the cursor. That also becomes the composition test the premise is
+    /// missing: a protection view that replays a sealed tail, and a premise that admits the delete on
+    /// the crossed epoch.
     ///
     /// It is seeded AFTER the first round because a pre-created `gc/state` makes the FIRST lease
     /// acquire back off (`acquireOrRenewLease` only creates-and-owns when the object is absent).
