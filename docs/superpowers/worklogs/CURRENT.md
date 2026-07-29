@@ -1944,3 +1944,8 @@ dump+scenarios queue next. Load 3.3, quiet. Idle otherwise.
 good signals moving: CasGcProbeADue=1 (probe came due — post-restart rounds completing) and
 CasRefRecoveryEpochSealed=1 (the fencing seal fired on the chaos restart — obligation D
 evidence). No CheckpointFailure. Awaiting PHASE3 end + manual predown dump.
+**2026-07-29 12:5x local** — soak2 DONE at min 95: ORACLE GREEN (2,942,315 rows == both
+replicas, zero data loss), fencing seal fired, probe came due. But the trace_log specimen for
+the 24-min-round question died at teardown (predown dump ran only as mini final-state — 2nd
+loss; hard rule issued + dry-run proof ordered). User's thread-trace method -> addendum
+verbatim. Scenarios started (S38 12:47).
