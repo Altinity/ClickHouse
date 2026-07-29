@@ -1800,3 +1800,6 @@ signal). Reviewer praised §6 correction + marker discipline as the model.
 **2026-07-29 08:2x local** — T12 CLOSED CLEAN (fix f9c5beebc9d; re-reviewer re-derived the
 sweep + confirmed S38 was already dead pre-T12 — T14 rewrite = premise re-derivation). Next:
 T13 (LIST-liar fault injection, the blocker end-to-end).
+**2026-07-29 08:20 local** — watchdog: T13 live (worktree tmp/t13-revert created ~5 min after
+ACK). Quarantined STALE t13_*.log files from an earlier session into build/stale_t13_pre20260729/
+(marker-collision hazard vs impl-a13's namespace); agent notified.
