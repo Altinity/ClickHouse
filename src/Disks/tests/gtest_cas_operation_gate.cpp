@@ -6,6 +6,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcScheduler.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/tests/cas_test_helpers.h>
+#include <Storages/MergeTree/checkDataPart.h>
 #include <Common/Exception.h>
 
 #include <chrono>
@@ -29,6 +30,7 @@
 namespace DB::ErrorCodes
 {
 extern const int INVALID_STATE;
+extern const int NETWORK_ERROR;
 extern const int FILE_DOESNT_EXIST;
 }
 
@@ -76,6 +78,22 @@ std::string messageOf(const std::function<void()> & fn)
     catch (const Exception & e)
     {
         return std::string(e.message());
+    }
+    ADD_FAILURE() << "expected a DB::Exception";
+    return {};
+}
+
+/// The thrown exception itself, for the tests that assert against an upstream CLASSIFIER rather than
+/// against an error code.
+std::exception_ptr exceptionOf(const std::function<void()> & fn)
+{
+    try
+    {
+        fn();
+    }
+    catch (...)
+    {
+        return std::current_exception();
     }
     ADD_FAILURE() << "expected a DB::Exception";
     return {};
@@ -176,45 +194,104 @@ TEST(CasOperationGate, ContentReadOnVanishedThrowsTypedPerReasonMessage)
               std::string::npos);
 }
 
-/// (d) Every class but Factory throws 668 on BOTH TransientNotLive AND IdentityLost. The 668 message
-/// distinguishes the two: a transient blip reads "mount lease not held" (auto-recovering); IdentityLost
-/// gets its own richer, non-auto-recovering [D5] diagnosis ("identity lost … restart or FORGET").
-TEST(CasOperationGate, EveryClassThrows668OnTransientAndIdentityLost)
+/// (d1) Every class but Factory refuses on `TransientNotLive` — and the refusal carries the TRANSIENT
+/// class (`NETWORK_ERROR`), not the terminal 668. The split from `IdentityLost` (test d2) is the whole
+/// point: a lease blip is unavailability, an identity loss is damage, and consumers outside CAS act on
+/// the difference. `ReplicatedMergeTreePartCheckThread` declares a part broken and detaches it for any
+/// refusal its `isRetryableException` hatch does not recognise, so coding a blip 668 made healthy parts
+/// look corrupt (BACKLOG {#lease-blip-part-check-collapse};
+/// `docs/superpowers/reports/2026-07-29-ca-transient-classifier-audit.md`).
+TEST(CasOperationGate, EveryClassThrowsRetryableTransientOnTransientNotLive)
 {
-    for (const auto lc : {PoolLifecycle::TransientNotLive, PoolLifecycle::IdentityLost})
+    auto storage = openGateStorage();
+    commitOnePart(*storage);
+    storage->store()->setLifecycleForTest(PoolLifecycle::TransientNotLive);   /// one force from Live
+
+    /// Probe
+    Cas::tests::expectThrowsCode(ErrorCodes::NETWORK_ERROR, [&] { storage->existsFile(kPartFile); });
+    Cas::tests::expectThrowsCode(ErrorCodes::NETWORK_ERROR, [&] { storage->existsDirectory(kPartDir); });
+    Cas::tests::expectThrowsCode(ErrorCodes::NETWORK_ERROR, [&] { storage->listDirectory(kTableDir); });
+    Cas::tests::expectThrowsCode(ErrorCodes::NETWORK_ERROR, [&] { storage->isDirectoryEmpty(kTableDir); });
+    /// ContentRead
+    Cas::tests::expectThrowsCode(ErrorCodes::NETWORK_ERROR, [&] { storage->getFileSize(kPartFile); });
+    Cas::tests::expectThrowsCode(ErrorCodes::NETWORK_ERROR, [&] { storage->getStorageObjects(kPartFile); });
+    /// Write (via a transaction)
+    Cas::tests::expectThrowsCode(ErrorCodes::NETWORK_ERROR, [&] {
+        auto tx = storage->createTransaction();
+        auto & ca_tx = dynamic_cast<ContentAddressedTransaction &>(*tx);
+        ca_tx.writeFile(kTableDir + "/tmp_x/data.bin", 65536, WriteMode::Rewrite, {});
+    });
+    /// Remove (via a transaction)
+    Cas::tests::expectThrowsCode(ErrorCodes::NETWORK_ERROR, [&] {
+        auto tx = storage->createTransaction();
+        tx->removeRecursive(kTableDir, /*should_remove_objects=*/nullptr);
+    });
+    /// Admin
+    Cas::tests::expectThrowsCode(ErrorCodes::NETWORK_ERROR, [&] { storage->runOneGcRoundForTest(); });
+
+    /// The coarser code buys retryability at the cost of precision, so the MESSAGE carries the whole
+    /// truth: which CA condition, and that it is transient rather than an error of record.
+    const std::string msg = messageOf([&] { storage->getFileSize(kPartFile); });
+    EXPECT_NE(msg.find("mount lease not held"), std::string::npos) << msg;
+    EXPECT_NE(msg.find("TRANSIENT"), std::string::npos) << msg;
+    EXPECT_NE(msg.find("recovers to Live"), std::string::npos) << msg;
+}
+
+/// (d2) `IdentityLost` is TERMINAL — the sentinels are gone, nothing auto-recovers — so it keeps the 668
+/// (`INVALID_STATE`) class and its own richer [D5] diagnosis ("identity lost … restart or FORGET").
+/// Nothing about the transient re-coding may leak here: a terminal state that read as retryable would
+/// make every consumer spin forever on a disk that will never come back.
+TEST(CasOperationGate, EveryClassThrows668OnIdentityLost)
+{
+    auto storage = openGateStorage();
+    commitOnePart(*storage);
+    storage->store()->setLifecycleForTest(PoolLifecycle::IdentityLost);   /// one force from Live
+
+    /// Probe
+    Cas::tests::expectThrowsCode(ErrorCodes::INVALID_STATE, [&] { storage->existsFile(kPartFile); });
+    Cas::tests::expectThrowsCode(ErrorCodes::INVALID_STATE, [&] { storage->existsDirectory(kPartDir); });
+    Cas::tests::expectThrowsCode(ErrorCodes::INVALID_STATE, [&] { storage->listDirectory(kTableDir); });
+    Cas::tests::expectThrowsCode(ErrorCodes::INVALID_STATE, [&] { storage->isDirectoryEmpty(kTableDir); });
+    /// ContentRead
+    Cas::tests::expectThrowsCode(ErrorCodes::INVALID_STATE, [&] { storage->getFileSize(kPartFile); });
+    Cas::tests::expectThrowsCode(ErrorCodes::INVALID_STATE, [&] { storage->getStorageObjects(kPartFile); });
+    /// Write (via a transaction)
+    Cas::tests::expectThrowsCode(ErrorCodes::INVALID_STATE, [&] {
+        auto tx = storage->createTransaction();
+        auto & ca_tx = dynamic_cast<ContentAddressedTransaction &>(*tx);
+        ca_tx.writeFile(kTableDir + "/tmp_x/data.bin", 65536, WriteMode::Rewrite, {});
+    });
+    /// Remove (via a transaction)
+    Cas::tests::expectThrowsCode(ErrorCodes::INVALID_STATE, [&] {
+        auto tx = storage->createTransaction();
+        tx->removeRecursive(kTableDir, /*should_remove_objects=*/nullptr);
+    });
+    /// Admin
+    Cas::tests::expectThrowsCode(ErrorCodes::INVALID_STATE, [&] { storage->runOneGcRoundForTest(); });
+
+    EXPECT_NE(messageOf([&] { storage->getFileSize(kPartFile); }).find("identity lost"), std::string::npos);
+}
+
+/// (d3) The contract the d1/d2 split exists to satisfy, asserted against upstream's OWN predicate instead
+/// of a code number: `isRetryableException` is what `ReplicatedMergeTreePartCheckThread::checkPartImpl`
+/// consults before declaring a part broken. A transient CA refusal must satisfy it (the part stays
+/// queued); a terminal one must not (the disk is genuinely unusable and must surface). Pinning the
+/// predicate rather than `NETWORK_ERROR` keeps this test meaningful if upstream's list ever moves.
+TEST(CasOperationGate, TransientRefusalIsUpstreamRetryableTerminalIsNot)
+{
     {
         auto storage = openGateStorage();
         commitOnePart(*storage);
-        storage->store()->setLifecycleForTest(lc);   /// one force from Live; no later store() call
-
-        /// Probe
-        Cas::tests::expectThrowsCode(ErrorCodes::INVALID_STATE, [&] { storage->existsFile(kPartFile); });
-        Cas::tests::expectThrowsCode(ErrorCodes::INVALID_STATE, [&] { storage->existsDirectory(kPartDir); });
-        Cas::tests::expectThrowsCode(ErrorCodes::INVALID_STATE, [&] { storage->listDirectory(kTableDir); });
-        Cas::tests::expectThrowsCode(ErrorCodes::INVALID_STATE, [&] { storage->isDirectoryEmpty(kTableDir); });
-        /// ContentRead
-        Cas::tests::expectThrowsCode(ErrorCodes::INVALID_STATE, [&] { storage->getFileSize(kPartFile); });
-        Cas::tests::expectThrowsCode(ErrorCodes::INVALID_STATE, [&] { storage->getStorageObjects(kPartFile); });
-        /// Write (via a transaction)
-        Cas::tests::expectThrowsCode(ErrorCodes::INVALID_STATE, [&] {
-            auto tx = storage->createTransaction();
-            auto & ca_tx = dynamic_cast<ContentAddressedTransaction &>(*tx);
-            ca_tx.writeFile(kTableDir + "/tmp_x/data.bin", 65536, WriteMode::Rewrite, {});
-        });
-        /// Remove (via a transaction)
-        Cas::tests::expectThrowsCode(ErrorCodes::INVALID_STATE, [&] {
-            auto tx = storage->createTransaction();
-            tx->removeRecursive(kTableDir, /*should_remove_objects=*/nullptr);
-        });
-        /// Admin
-        Cas::tests::expectThrowsCode(ErrorCodes::INVALID_STATE, [&] { storage->runOneGcRoundForTest(); });
-
-        /// The 668 message names the ACTUAL sub-state (not a uniform string): transient vs IdentityLost.
-        const std::string msg = messageOf([&] { storage->getFileSize(kPartFile); });
-        if (lc == PoolLifecycle::TransientNotLive)
-            EXPECT_NE(msg.find("mount lease not held"), std::string::npos) << msg;
-        else
-            EXPECT_NE(msg.find("identity lost"), std::string::npos) << msg;
+        storage->store()->setLifecycleForTest(PoolLifecycle::TransientNotLive);
+        EXPECT_TRUE(isRetryableException(exceptionOf([&] { storage->getFileSize(kPartFile); })))
+            << "a lease blip must not read as part damage to the part-check thread";
+    }
+    {
+        auto storage = openGateStorage();
+        commitOnePart(*storage);
+        storage->store()->setLifecycleForTest(PoolLifecycle::IdentityLost);
+        EXPECT_FALSE(isRetryableException(exceptionOf([&] { storage->getFileSize(kPartFile); })))
+            << "a terminal identity loss must NOT be retried forever as if it were transient";
     }
 }
 
@@ -231,8 +308,9 @@ TEST(CasOperationGate, FactoryClassWorksOnVanished)
     EXPECT_NO_THROW((void)storage->isContentAddressed());
 }
 
-/// (f) `tryGetInManifestBytes` PROPAGATES the typed 668 on a terminal disk rather than converting it into
-/// a silent-absent `std::nullopt` (the narrowed catch). RED before the narrowing.
+/// (f) `tryGetInManifestBytes` PROPAGATES the typed refusal — terminal 668 on a `Vanished` disk, the
+/// transient class in a lease gap — rather than converting either into a silent-absent `std::nullopt`
+/// (the narrowed catch). RED before the narrowing.
 TEST(CasOperationGate, TryGetInManifestBytesPropagatesTypedError)
 {
     auto storage = openGateStorage();
@@ -246,7 +324,7 @@ TEST(CasOperationGate, TryGetInManifestBytesPropagatesTypedError)
     });
 
     pool->setLifecycleForTest(PoolLifecycle::TransientNotLive);
-    Cas::tests::expectThrowsCode(ErrorCodes::INVALID_STATE, [&] {
+    Cas::tests::expectThrowsCode(ErrorCodes::NETWORK_ERROR, [&] {
         storage->tryGetInManifestBytes(kTableDir + "/format_version.txt");
     });
 }
@@ -283,7 +361,7 @@ TEST(CasOperationGate, GcEntryPointsRefuseOnNotLive)
     EXPECT_NE(messageOf([&] { storage->runOneGcRoundForTest(); }).find("foreign pool"), std::string::npos);
 
     pool->setLifecycleForTest(PoolLifecycle::TransientNotLive);
-    Cas::tests::expectThrowsCode(ErrorCodes::INVALID_STATE, [&] { storage->runOneGcRoundForTest(); });
+    Cas::tests::expectThrowsCode(ErrorCodes::NETWORK_ERROR, [&] { storage->runOneGcRoundForTest(); });
 }
 
 /// (i) `CasGcScheduler::isQuiescent` reflects the round-in-flight flag: a round in flight => not quiescent.
@@ -302,7 +380,7 @@ TEST(CasOperationGate, GcSchedulerIsQuiescentReflectsRoundInFlight)
 }
 
 /// (j) (acceptance matrix — transient auto-recovery / DROP-drain round-trip) The full §4 recovery arc on ONE
-/// storage: a Remove-class op (the DROP shape) throws the typed 668 while the mount lease is transiently
+/// storage: a Remove-class op (the DROP shape) throws the typed transient refusal while the mount lease is
 /// lost, then SUCCEEDS and actually drains once the disk self-remounts back to Live — no operator action,
 /// no restart. Where test (d) forces `TransientNotLive` via the setter to pin the gap, this drives a REAL
 /// transient→Live recovery (`tripMountLost` → fence-out → `tryRemountOnce`) so the throw-then-drain is one
@@ -321,13 +399,13 @@ TEST(CasOperationGate, RemoveThrowsDuringTransientAndDrainsAfterRecovery)
     pool->tripMountLost();
     ASSERT_EQ(pool->lifecycle(), PoolLifecycle::TransientNotLive);
 
-    /// In the gap, EVERY store-class access throws the typed 668 — the Remove (DROP shape) included, and a
-    /// content read too. Nothing is answered benign, nothing is silently dropped.
-    Cas::tests::expectThrowsCode(ErrorCodes::INVALID_STATE, [&] {
+    /// In the gap, EVERY store-class access throws the typed transient refusal — the Remove (DROP shape)
+    /// included, and a content read too. Nothing is answered benign, nothing is silently dropped.
+    Cas::tests::expectThrowsCode(ErrorCodes::NETWORK_ERROR, [&] {
         auto tx = storage->createTransaction();
         tx->removeRecursive(kTableDir, /*should_remove_objects=*/nullptr);
     });
-    Cas::tests::expectThrowsCode(ErrorCodes::INVALID_STATE, [&] { storage->getFileSize(kPartFile); });
+    Cas::tests::expectThrowsCode(ErrorCodes::NETWORK_ERROR, [&] { storage->getFileSize(kPartFile); });
     const std::string gap_msg = messageOf([&] { storage->getFileSize(kPartFile); });
     EXPECT_NE(gap_msg.find("mount lease not held"), std::string::npos)
         << "the gap message must name the transient (auto-recovering) condition: " << gap_msg;

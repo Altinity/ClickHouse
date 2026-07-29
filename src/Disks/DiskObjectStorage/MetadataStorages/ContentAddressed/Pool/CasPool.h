@@ -348,8 +348,8 @@ public:
     /// async, potentially long-running upload. `CasPlainObjects` reaches the same primitives via
     /// injected callbacks (see its own constructor).
     uint64_t fenceGeneration() const { return mount_runtime.fenceGeneration(); }
-    /// Throws the typed transient error (`INVALID_STATE`) unless the fence is currently held AND still
-    /// at `admitted_generation`.
+    /// Throws the typed transient refusal (`throwCasTransientUnavailable`) unless the fence is currently
+    /// held AND still at `admitted_generation`.
     void checkFenceOrThrow(uint64_t admitted_generation) const { mount_runtime.checkFenceOrThrow(admitted_generation); }
 
     /// ---- pool lifecycle condition (rev.7 §1; owned by `mount_runtime`) ----

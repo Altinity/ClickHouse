@@ -677,7 +677,7 @@ BlobUploadResult PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef &
     /// durable-effect writes left outside Task 4's fence-generation gate. Capture the mount fence
     /// generation now, at the displacement DECISION, and re-check it (and `mayMutate()`) immediately before
     /// whichever raw write we issue: a lease lost — or re-armed under a fresh incarnation — since we
-    /// observed the condemned state aborts with the typed transient error (`INVALID_STATE`) before any
+    /// observed the condemned state aborts with the typed transient refusal before any
     /// stale-incarnation displacement can land. Mirrors `CasPlainObjects::casPutObject`'s
     /// capture-at-admission-then-check-before-the-durable-write shape.
     const uint64_t displace_admitted_generation = store->fenceGeneration();

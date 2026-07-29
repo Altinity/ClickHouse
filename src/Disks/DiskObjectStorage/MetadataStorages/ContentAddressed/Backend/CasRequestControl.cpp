@@ -200,6 +200,16 @@ std::exception_ptr makeCasWriteRetryLaterExceptionPtr(const String & why)
         Exception(ErrorCodes::NETWORK_ERROR, "CAS write could not be committed ({}); retrying later", why));
 }
 
+[[noreturn]] void throwCasTransientUnavailable(const String & subject, const String & condition)
+{
+    /// The code is coarse (it shares a `system.errors` row with socket failures), so the MESSAGE must
+    /// carry the whole truth: which CA condition refused, and that the refusal is a state rather than
+    /// damage. Consumers key on the code; operators read this line.
+    throw Exception(ErrorCodes::NETWORK_ERROR,
+        "{} -- {}; TRANSIENT unavailability, not damage -- the operation is admitted again once the disk "
+        "recovers to Live", subject, condition);
+}
+
 CasRequestController::CasRequestController(BackendPtr backend_, CasRequestBudget budget_, std::function<uint64_t()> now_ms_,
                                            std::function<void(uint64_t)> sleep_ms_)
     : backend(std::move(backend_))

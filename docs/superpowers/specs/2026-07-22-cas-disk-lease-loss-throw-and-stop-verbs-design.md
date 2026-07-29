@@ -53,9 +53,10 @@ Dormant/UNMOUNT spec (Task 4–8 rollback per §9; Part 1 KEPT). Companion:
 - The minimal storage-level lifecycle `Constructing → Started → ShutDown` stays (null-pool fail-loud).
 
 **Operation classes — SIX (unchanged from the as-built T8 gate):** Factory (always works) / Probe /
-ContentRead / Write / Remove / Admin. Live → all pass; transient/`IdentityLost` → all but Factory throw 668
-(transient: "mount lease not held — backing may be temporarily unreachable; retry once the disk recovers to
-Live"; `IdentityLost`: its own message — no auto-recovery, cure = restart or `FORGET`); `Vanished` →
+ContentRead / Write / Remove / Admin. Live → all pass; transient/`IdentityLost` → all but Factory throw,
+in DIFFERENT classes (transient: `throwCasTransientUnavailable`, i.e. `NETWORK_ERROR`, "mount lease not
+held — backing may be temporarily unreachable", so no consumer reads unavailability as damage;
+`IdentityLost`: 668 and its own message — no auto-recovery, cure = restart or `FORGET`); `Vanished` →
 Probe answers truthful absent/empty, Remove is no-op success (a vanished-disk table's `DROP` completes),
 ContentRead/Write/Admin throw the typed [D5] message.
 

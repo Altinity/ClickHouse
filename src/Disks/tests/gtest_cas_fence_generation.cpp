@@ -14,15 +14,16 @@
 
 namespace DB::ErrorCodes
 {
-    extern const int INVALID_STATE;
+    extern const int NETWORK_ERROR;
 }
 
 /// Task 4 (spec §1 "Gate lifetime [C2]"): every durable-effect path on the plain-object surface
 /// (`CasPlainObjects::casPutObject`/`casRemoveObject`), the S3-native staging-buffer finalize
 /// (`Cas::CaContentWriteBuffer`), and the part-write condemned-displacement raw writes capture the mount
 /// runtime's fence generation at admission and re-check it -- and `mayMutate()` -- immediately before their
-/// durable backend call, throwing the typed transient error (`INVALID_STATE`, 668) on a mismatch instead
-/// of letting a stale-incarnation write land.
+/// durable backend call, throwing the typed transient error (`NETWORK_ERROR` -- the upstream-retryable
+/// class every CA write-plane transient uses) on a mismatch instead of letting a stale-incarnation write
+/// land.
 ///
 /// These tests drive a real `Cas::Pool` over `InMemoryBackend` (the "Emulated"-style in-memory
 /// backend) via `Pool::open`, exactly like `gtest_cas_mount.cpp`/`gtest_cas_s3_staging.cpp` -- the
@@ -179,7 +180,7 @@ BlobSource serverSideCopySource(const std::string & staging_key, uint64_t size)
 }
 
 /// (a) `casPutObject` (reached via `Pool::putNamespaceFile`) with the fence tripped BETWEEN admission
-/// and the durable PUT: typed 668, and the object is never actually written.
+/// and the durable PUT: the typed transient refusal, and the object is never actually written.
 TEST(CasFenceGeneration, PlainObjectPutAbortsWhenFenceTripsBetweenAdmissionAndDurableCall)
 {
     auto backend = std::make_shared<TripOnHeadBackend>();
@@ -189,7 +190,7 @@ TEST(CasFenceGeneration, PlainObjectPutAbortsWhenFenceTripsBetweenAdmissionAndDu
     const RootNamespace ns{"test/ns"};
     backend->trigger = [&] { store->tripMountLost(); };
 
-    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&]
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
     {
         store->putNamespaceFile(ns, "somefile", "hello");
     });
@@ -212,7 +213,7 @@ TEST(CasFenceGeneration, PlainObjectRemoveAbortsWhenFenceTripsBetweenAdmissionAn
 
     backend->trigger = [&] { store->tripMountLost(); };
 
-    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&]
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
     {
         store->removeNamespaceFile(ns, "victim");
     });
@@ -238,7 +239,7 @@ TEST(CasFenceGeneration, PlainObjectPutRechecksFenceOnEveryRetryIterationNotJust
     backend->fail_first_put = true;
     backend->trigger = [&] { store->tripMountLost(); };
 
-    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&]
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
     {
         store->putNamespaceFile(ns, "somefile", "hello");
     });
@@ -282,7 +283,7 @@ TEST(CasFenceGeneration, S3StagingFinalizeAbortsWhenFenceTripsBeforeDurableCall)
     /// fence trips before `finalize()` runs.
     store->tripMountLost();
 
-    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&] { buf->finalize(); });
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { buf->finalize(); });
 
     EXPECT_FALSE(on_finalized_called);
     EXPECT_FALSE(sink_ptr->wasFinalizedForTest());
@@ -339,8 +340,9 @@ TEST(CasFenceGeneration, HappyPathS3StagingFinalizeUnaffected)
 /// (I2, backlog {#c2-resurrect-putoverwrite-fence-check}) The condemned-displacement `putOverwrite` branch
 /// of `PartWriteTxn::uploadFromSource` -- a RAW backend write outside the request controller's fence gate,
 /// the last durable write left uncovered by Task 4. Seed a PRESENT, CONDEMNED blob, then trip the fence on
-/// the head() that precedes the displacement decision: the [C2] `checkFenceOrThrow` must abort with 668
-/// BEFORE `putOverwrite`, leaving the condemned incarnation untouched (no stale-incarnation displacement).
+/// the head() that precedes the displacement decision: the [C2] `checkFenceOrThrow` must abort with the
+/// typed transient refusal BEFORE `putOverwrite`, leaving the condemned incarnation untouched (no
+/// stale-incarnation displacement).
 TEST(CasFenceGeneration, CondemnedPutOverwriteAbortsWhenFenceTripsBeforeDurableCall)
 {
     auto backend = std::make_shared<TripOnHeadDisplacementBackend>();
@@ -371,7 +373,7 @@ TEST(CasFenceGeneration, CondemnedPutOverwriteAbortsWhenFenceTripsBeforeDurableC
     backend->resurrect_staged_calls = 0;
     backend->trigger = [&] { store->tripMountLost(); };
 
-    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&]
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
     {
         build->putBlob(id, BlobSource::fromString(payload));
     });
@@ -387,7 +389,8 @@ TEST(CasFenceGeneration, CondemnedPutOverwriteAbortsWhenFenceTripsBeforeDurableC
 /// (I2, backlog {#c2-resurrect-putoverwrite-fence-check}) The S3-native-staging sibling: the condemned
 /// displacement `resurrectStaged` branch (`BlobSource::server_side_copy_from` set) is the same RAW,
 /// controller-uncoupled backend write. Same setup + fence trip -> the [C2] `checkFenceOrThrow` aborts with
-/// 668 BEFORE `resurrectStaged`, so no unconditional server-side copy displaces the condemned incarnation.
+/// the typed transient refusal BEFORE `resurrectStaged`, so no unconditional server-side copy displaces
+/// the condemned incarnation.
 TEST(CasFenceGeneration, CondemnedResurrectStagedAbortsWhenFenceTripsBeforeDurableCall)
 {
     auto backend = std::make_shared<TripOnHeadDisplacementBackend>();
@@ -419,7 +422,7 @@ TEST(CasFenceGeneration, CondemnedResurrectStagedAbortsWhenFenceTripsBeforeDurab
     backend->resurrect_staged_calls = 0;
     backend->trigger = [&] { store->tripMountLost(); };
 
-    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&]
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
     {
         build->putBlob(id, serverSideCopySource(staging_key, payload.size()));
     });

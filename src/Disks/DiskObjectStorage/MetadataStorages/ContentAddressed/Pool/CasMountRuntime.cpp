@@ -14,7 +14,6 @@ namespace DB
 {
 namespace ErrorCodes
 {
-    extern const int INVALID_STATE;
     extern const int LOGICAL_ERROR;
 }
 }
@@ -100,15 +99,17 @@ void CasMountRuntime::checkFenceOrThrow(uint64_t admitted_generation) const
     /// [D5]: tell only what is known here. A tripped fence (or a bumped generation) means this node no
     /// longer holds the mount incarnation the caller was admitted under -- but this same guard trips for a
     /// transient lease blip AND for a deliberate terminal decommission (FORGET) or a lost identity, and this
-    /// code cannot tell them apart. So it must NOT promise recovery ("temporarily unreachable" would
-    /// misdiagnose the terminal case); it names both possibilities and points at the authoritative lifecycle.
+    /// code cannot tell them apart. So the CONDITION must NOT promise recovery ("temporarily unreachable"
+    /// would misdiagnose the terminal case); it names both possibilities and points at the authoritative
+    /// lifecycle. The CLASS is the write plane's uniform transient one (its 32 sibling write-transient sites
+    /// already mint it): under genuine ambiguity the refusal must be retried, never consumed as damage.
     if (!mayMutate() || fenceGeneration() != admitted_generation)
-        throw Exception(ErrorCodes::INVALID_STATE,
-            "content-addressed pool '{}' — mount fence tripped: the durable write is refused because this "
-            "node no longer holds the mount incarnation it was admitted under. This may be transient (a lease "
-            "loss the disk auto-recovers from) or terminal (a FORGET decommission or a lost identity, which "
-            "does NOT recover) — consult system.content_addressed_mounts for the disk's lifecycle before retrying",
-            server_root_id);
+        throwCasTransientUnavailable(
+            fmt::format("content-addressed pool '{}'", server_root_id),
+            "mount fence tripped: the durable write is refused because this node no longer holds the mount "
+            "incarnation it was admitted under -- either a lease loss the disk auto-recovers from, or a "
+            "FORGET decommission / lost identity that does NOT recover; consult "
+            "system.content_addressed_mounts for the disk's lifecycle before retrying");
 }
 
 bool CasMountRuntime::refAppendFenceOk() const

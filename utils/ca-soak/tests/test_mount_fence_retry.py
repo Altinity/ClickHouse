@@ -14,6 +14,7 @@ import pytest
 
 from soak.cluster import (
     QueryError,
+    classify_retry_error,
     is_mount_fenced,
     is_node_down,
     retry_on_transport,
@@ -24,6 +25,18 @@ from soak.cluster import (
 def mount_fenced_error(node="Node(localhost:8123)"):
     body = ("Code: 236. DB::Exception: CAS mount lost / lease expired — refusing to mutate ref shard "
             "for server_root 'ca_soak_ch1'. (ABORTED) (version 26.6.1.1)")
+    return QueryError(node, 500, body, "INSERT INTO ca_stress VALUES")
+
+
+def lease_not_held_error(node="Node(localhost:8123)"):
+    # The OTHER shape of the same condition: the disk-lifecycle gate refuses a read/write outright
+    # instead of aborting a ref mutation. It carries NETWORK_ERROR (210) -- CAS mints its transient
+    # refusals in the class upstream already treats as retry-later, so a lease blip is never read as
+    # damage. The harness must recognise it here or a routine chaos-window fence becomes a WORKLOAD
+    # FAILURE (it did once, and killed a 2.5h soak).
+    body = ("Code: 210. DB::Exception: content-addressed disk 'ca' -- mount lease not held; backing may "
+            "be temporarily unreachable; TRANSIENT unavailability, not damage -- the operation is "
+            "admitted again once the disk recovers to Live. (NETWORK_ERROR) (version 26.6.1.1)")
     return QueryError(node, 500, body, "INSERT INTO ca_stress VALUES")
 
 
@@ -48,6 +61,25 @@ def test_mount_fence_is_not_node_down():
     e = mount_fenced_error()
     assert e.is_node_down is False
     assert is_node_down(e) is False
+
+
+def test_lease_not_held_is_fenced_and_labelled_mount_fenced():
+    e = lease_not_held_error()
+    assert e.is_aborted is False
+    assert e.is_mount_fenced is True
+    assert is_mount_fenced(e) is True
+    # NETWORK_ERROR is also a NODE_DOWN code, so the two classifiers overlap on this body. Harmless:
+    # both prescribe reroute-to-the-peer, and the availability label is decided most-specific-first.
+    assert classify_retry_error(e) == "mount_fenced"
+
+
+def test_plain_network_error_is_not_mount_fenced():
+    # Sharing the code is the price of the retryable class -- so the MESSAGE decides. A real socket
+    # failure must not be booked as a mount fence.
+    e = QueryError("Node(x:1)", 500, "Code: 210. DB::Exception: I/O error: Broken pipe. (NETWORK_ERROR)",
+                   "INSERT INTO t VALUES")
+    assert e.is_mount_fenced is False
+    assert is_mount_fenced(e) is False
 
 
 def test_b137_aborted_is_not_mount_fenced():

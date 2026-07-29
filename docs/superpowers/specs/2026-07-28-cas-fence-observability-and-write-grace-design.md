@@ -381,7 +381,7 @@ incarnation-tied work yet. It deliberately does NOT wrap the mid-operation re-ch
 (`CasPartWriteTxn.cpp:705`, `:747`), where a moved generation legitimately means "your staged
 displacement work is stale, abort" — those keep failing immediately.
 
-**Surface 1 — plain-object / staging-finalize (668).** Callers capture
+**Surface 1 — plain-object / staging-finalize (`throwCasTransientUnavailable`).** Callers capture
 `admitted_generation = pool->fenceGeneration()` and later call `checkFenceOrThrow(admitted_generation)`
 before the durable write (e.g. `ContentAddressedTransaction.cpp:887,901`). Insert the wait
 **immediately before the generation is captured**:

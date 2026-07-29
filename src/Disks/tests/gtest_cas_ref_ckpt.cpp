@@ -40,7 +40,6 @@
 namespace DB::ErrorCodes
 {
 extern const int CORRUPTED_DATA;
-extern const int INVALID_STATE;
 extern const int MEMORY_LIMIT_EXCEEDED;
 extern const int NETWORK_ERROR;
 extern const int UNKNOWN_FORMAT_VERSION;
@@ -492,10 +491,11 @@ TEST(CasRefCkpt, AFenceBumpBetweenTheReadAndTheCasWritesNothing)
     const uint64_t writes_before = backend->casPutCount(key);
 
     /// The callback the pool wires from `CasMountRuntime::checkFenceOrThrow`: it throws when the
-    /// generation moved since admission.
+    /// generation moved since admission. Mirrors the real site's class (the transient, upstream-retryable
+    /// one) so the stub cannot drift into testing a shape production never produces.
     const auto moved_fence = [](uint64_t admitted)
     {
-        throw DB::Exception(DB::ErrorCodes::INVALID_STATE,
+        throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR,
             "fence generation moved since admission ({})", admitted);
     };
 

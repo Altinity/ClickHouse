@@ -277,6 +277,32 @@ void validateCasRequestBudget(const CasRequestBudget & budget, uint64_t mount_le
 /// construction internally, so the error code / message shape has exactly one place that decides it.
 std::exception_ptr makeCasWriteRetryLaterExceptionPtr(const String & why);
 
+/// Throw the recoverable "this content-addressed disk cannot serve the request right now" condition.
+/// Sibling of `throwCasWriteRetryLater`, same class for the same reasons (see the long rationale above),
+/// differing only in what it describes: that one names a WRITE whose commit did not land, this one names
+/// a DISK STATE that refused the request before it started -- on either plane.
+///
+/// The class is load-bearing beyond CAS. `ReplicatedMergeTreePartCheckThread::checkPartImpl` rethrows
+/// (leaving the part queued for a later check) exactly when `checkDataPart::isRetryableException`
+/// recognises the error, and otherwise declares the part broken -- detach and re-fetch.
+/// `INVALID_STATE` is absent from that classifier, so a lease blip used to read as part corruption
+/// (BACKLOG `{#lease-blip-part-check-collapse}`; audit
+/// `docs/superpowers/reports/2026-07-29-ca-transient-classifier-audit.md`). Re-coding the CA transients
+/// was chosen over widening the upstream classifier because `INVALID_STATE` is broad: widening it would
+/// also reclassify 18 unrelated TERMINAL sites, CA and non-CA alike.
+///
+/// SCOPE, narrow by design: only a refusal naming an AUTO-RECOVERING disk condition routes here.
+/// Terminal CA states -- `IdentityLost`, both `Vanished` flavours, a storage that is not started, an
+/// unbootstrappable prefix, a closed writer epoch -- keep `INVALID_STATE`. A terminal state that read as
+/// retryable would make every consumer retry forever against a disk that is never coming back.
+///
+/// `subject` names the refusing disk or pool (e.g. "content-addressed disk 'ca'") and `condition` states
+/// the CA condition truthfully; the transient classification is appended HERE so it cannot drift between
+/// call sites. Unlike `throwCasWriteRetryLater` this deliberately does not log: these sites fire once per
+/// refused operation (tens of thousands within a single observed lease gap) and every caller already
+/// reports the exception it receives.
+[[noreturn]] void throwCasTransientUnavailable(const String & subject, const String & condition);
+
 /// Outcome of a controlled CONTENT-ADDRESSED conditional create (`conditionalCreateControlled`):
 ///   - Committed:  an attempt's own request completed (2xx) and the final fence check held — `token`
 ///     names the created incarnation.

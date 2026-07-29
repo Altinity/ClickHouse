@@ -144,9 +144,9 @@ public:
     /// Fence-generation admission check for every durable CAS/PUT/DELETE (the plain-object surface,
     /// staging-buffer finalize): the caller captures `fenceGeneration()` once at admission and passes it
     /// back here immediately before its durable backend call -- and again before EVERY conditional-retry
-    /// iteration, not just the first attempt. Throws the typed transient error (`INVALID_STATE`) when the
-    /// fence is not currently held or the generation moved since admission; the caller's write must never
-    /// reach the backend in either case.
+    /// iteration, not just the first attempt. Throws the typed transient refusal
+    /// (`throwCasTransientUnavailable`) when the fence is not currently held or the generation moved since
+    /// admission; the caller's write must never reach the backend in either case.
     void checkFenceOrThrow(uint64_t admitted_generation) const;
 
     /// ---- pool lifecycle condition (rev.7 §1, spec §§1-3); enum at namespace scope below ----

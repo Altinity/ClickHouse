@@ -5,6 +5,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasProbe.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasSentinelProbe.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/StaticDirectoryIterator.h>
@@ -1103,15 +1104,17 @@ CasOpAdmission ContentAddressedMetadataStorage::checkOpAdmitted(CasOpClass op) c
         return CasOpAdmission::Proceed;
 
     if (lc == Cas::PoolLifecycle::TransientNotLive)
-        /// A lease blip: uncertain but AUTO-RECOVERING. No class but Factory proceeds; one uniform 668
-        /// ("temporarily unreachable"). `IdentityLost` gets its own richer message below -- it does NOT
-        /// auto-recover, so "temporarily unreachable" would misdiagnose it. The wait-and-retry guidance is
-        /// actionable for every caller here, and specifically for `SYSTEM CONTENT ADDRESSED GC START` run
-        /// mid-recovery by an operator who STOPped GC pre-maintenance: this is a wait, not a dead end.
-        throw Exception(ErrorCodes::INVALID_STATE,
-            "content-addressed disk '{}' -- mount lease not held; backing may be temporarily unreachable; "
-            "retry once the disk recovers to Live",
-            disk_name);
+        /// A lease blip: uncertain but AUTO-RECOVERING. No class but Factory proceeds, and the refusal is
+        /// minted TRANSIENT -- this is the READ plane, where a consumer that cannot tell unavailability
+        /// from damage acts destructively: `ReplicatedMergeTreePartCheckThread` detaches a part whose read
+        /// throws an error its retryable-classifier does not list. `IdentityLost` gets its own richer,
+        /// TERMINAL 668 below -- it does not auto-recover, so both "temporarily unreachable" and the
+        /// retryable class would misdiagnose it. The wait-and-retry guidance is actionable for every caller
+        /// here, and specifically for `SYSTEM CONTENT ADDRESSED GC START` run mid-recovery by an operator
+        /// who STOPped GC pre-maintenance: this is a wait, not a dead end.
+        Cas::throwCasTransientUnavailable(
+            fmt::format("content-addressed disk '{}'", disk_name),
+            "mount lease not held; backing may be temporarily unreachable");
 
     /// `IdentityLost` and the terminal `Vanished*` states carry the typed per-reason [D5] message the pool
     /// owns (single source). A SETTLED `Vanished` pool answers `Probe`/`Remove` truthfully without touching
@@ -1158,12 +1161,14 @@ void ContentAddressedMetadataStorage::confirmPoolIdentityForEmptyEnumeration(con
                 disk_name, path);
         case Cas::ProbeOutcome::AccessDenied:
         case Cas::ProbeOutcome::Indeterminate:
-            /// Absence was NEVER established (a transport/permission fault). Fail closed and retryable --
-            /// never promote an unproven probe into an empty answer.
-            throw Exception(ErrorCodes::INVALID_STATE,
-                "content-addressed disk '{}' -- pool identity object could not be confirmed while "
-                "enumerating '{}' (transport or permission fault) -- refusing the empty answer; retry",
-                disk_name, path);
+            /// Absence was NEVER established (a transport/permission fault). Fail closed and TRANSIENT --
+            /// never promote an unproven probe into an empty answer, and never let a consumer read an
+            /// unreachable pool identity as damage. The arm above, where absence IS proven, keeps its
+            /// terminal 668: an erased backing does not heal by retrying.
+            Cas::throwCasTransientUnavailable(
+                fmt::format("content-addressed disk '{}'", disk_name),
+                fmt::format("pool identity object could not be confirmed while enumerating '{}' "
+                            "(transport or permission fault) -- refusing the empty answer", path));
     }
 }
 

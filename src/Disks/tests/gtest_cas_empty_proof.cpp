@@ -24,6 +24,7 @@
 namespace DB::ErrorCodes
 {
 extern const int INVALID_STATE;
+extern const int NETWORK_ERROR;
 }
 
 using namespace DB;
@@ -249,8 +250,10 @@ TEST(CasEmptyProof, DeeperPartDirEmptyAnswerIsNotGated)
         << "only the TableDir/DetachedContainer roots are gated -- deeper part-dirs are not";
 }
 
-/// (f) A probe that cannot establish absence (transport/permission fault) throws the typed transient 668,
-/// never an empty answer. The fault is injected through the empty-proof override seam.
+/// (f) A probe that cannot establish absence (transport/permission fault) throws the typed TRANSIENT
+/// refusal, never an empty answer. Unproven absence is unavailability, so the refusal carries the
+/// upstream-retryable class -- unlike the `KeyAbsent`/`ContainerAbsent` arm, where absence IS proven and
+/// the 668 stands. The fault is injected through the empty-proof override seam.
 TEST(CasEmptyProof, IndeterminateProbeThrowsTransientNeverEmpty)
 {
     auto storage = openStorage();
@@ -258,7 +261,7 @@ TEST(CasEmptyProof, IndeterminateProbeThrowsTransientNeverEmpty)
         [] { return SentinelProbeResult{ProbeOutcome::Indeterminate, std::nullopt}; });
 
     storage->resetEmptyProofProbeCountForTest();
-    Cas::tests::expectThrowsCode(ErrorCodes::INVALID_STATE, [&] { storage->listDirectory(kEmptyTableDir); });
+    Cas::tests::expectThrowsCode(ErrorCodes::NETWORK_ERROR, [&] { storage->listDirectory(kEmptyTableDir); });
     EXPECT_EQ(storage->emptyProofProbeCountForTest(), 1u);
 
     /// The transient message names the fault (a retryable condition), distinct from the erased message.
@@ -272,4 +275,5 @@ TEST(CasEmptyProof, IndeterminateProbeThrowsTransientNeverEmpty)
         msg = std::string(e.message());
     }
     EXPECT_NE(msg.find("transport or permission fault"), std::string::npos) << msg;
+    EXPECT_NE(msg.find("TRANSIENT"), std::string::npos) << msg;
 }
