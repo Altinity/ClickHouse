@@ -1949,3 +1949,9 @@ replicas, zero data loss), fencing seal fired, probe came due. But the trace_log
 the 24-min-round question died at teardown (predown dump ran only as mini final-state — 2nd
 loss; hard rule issued + dry-run proof ordered). User's thread-trace method -> addendum
 verbatim. Scenarios started (S38 12:47).
+**2026-07-29 13:00 local** — watchdog: scenario phase DONE, all four RED on VERDICTS (S38
+9/11, S43 ?, S33 ?, S30 6/8; full runs w/ forensics, not early aborts). Failing-verdict
+pattern incl. UNTOUCHED cards (S33/S30) + "common assertions" suggests the shared
+end-checkpoint asserting reclaim/unreachable invariants under suppression — the drain class
+in the scenario framework's common block. Awaiting a14's RCA (last card finished 12:56).
+Load 0.99.
