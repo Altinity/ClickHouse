@@ -3170,3 +3170,59 @@ than to an error.
 - **Run:** 20260729T110740_S38_seed20260729
 - **Observed:** forced GC left 45 UNCONDEMNED orphan object(s) (unreachable/dangling blobs/_manifests): {'_manifests': 45}. These are NOT in the two-phase pipeline (that would be pending-gc). If explicit GC was driven concurrently with background GC (or on both replicas), this is likely the known GC-CONCURRENT-LEADER-LEAK (see BACKLOG): a divergent-fold abort orphans owner-removal events.
 
+## S38-20260729T115218-1: scenario raised: counter probe on Node(localhost:8123) did not return ['CasRefAp
+
+- **Logged (UTC):** 2026-07-29T11:53:26
+- **Severity:** suspected-bug
+- **Run:** 20260729T115218_S38_seed20260729
+- **Observed:** scenario raised: counter probe on Node(localhost:8123) did not return ['CasRefApplyPoisoned', 'CasGcUnappliedFoldedTxns', 'CasRefRecoveryStreamHole'] — the binary does not have these counters, or the query shape changed; refusing to treat absence as zero
+
+## S43-20260729T115326-1: scenario raised: name '_zstd_decompress' is not defined
+
+- **Logged (UTC):** 2026-07-29T11:53:42
+- **Severity:** suspected-bug
+- **Run:** 20260729T115326_S43_seed20260729
+- **Observed:** scenario raised: name '_zstd_decompress' is not defined
+
+## S33-20260729T115342-1: S33 REGRESSION of fixed BACKLOG GC-CONCURRENT-LEADER-LEAK: 84 RECLAIMABLE unreac
+
+- **Logged (UTC):** 2026-07-29T11:57:08
+- **Severity:** suspected-bug
+- **Run:** 20260729T115342_S33_seed20260729
+- **Observed:** S33 REGRESSION of fixed BACKLOG GC-CONCURRENT-LEADER-LEAK: 84 RECLAIMABLE unreachable object(s) (blobs/_manifests) permanently orphaned by concurrent explicit GC leaders (safety held: dangling=0); full residual by_prefix={'_manifests': 84}. The attempt-scoped generation fix should make a deposed leader's fold seal invisible and let the next honest round drain — a nonzero reclaimable residual means that invariant broke.
+
+## S33-20260729T115342-2: forced GC left 84 unreachable RECLAIMABLE object(s) (blobs/_manifests) — possibl
+
+- **Logged (UTC):** 2026-07-29T11:57:08
+- **Severity:** suspected-bug
+- **Run:** 20260729T115342_S33_seed20260729
+- **Observed:** forced GC left 84 unreachable RECLAIMABLE object(s) (blobs/_manifests) — possible GC leak; full residual by prefix: {'_manifests': 84}. bookkeeping-only residual (other=0) is expected and bounded.
+
+## S30-20260729T115708-1: S30 REGRESSION vs D1: GC per-round fanout (roots/<ns> dir count and/or CasRootGe
+
+- **Logged (UTC):** 2026-07-29T12:00:43
+- **Severity:** suspected-bug
+- **Run:** 20260729T115708_S30_seed20260729
+- **Observed:** S30 REGRESSION vs D1: GC per-round fanout (roots/<ns> dir count and/or CasRootGet) grew across create/drop iterations though no table stayed live — the D1 registry-removal / dropped-shard-reclaim guarantee is violated.
+
+## S43-20260729T120731-1: quiescence failed: <urlopen error [Errno 111] Connection refused>
+
+- **Logged (UTC):** 2026-07-29T12:12:08
+- **Severity:** suspected-bug
+- **Run:** 20260729T120731_S43_seed20260729
+- **Observed:** quiescence failed: <urlopen error [Errno 111] Connection refused>
+
+## S33-20260729T121208-1: S33 REGRESSION of fixed BACKLOG GC-CONCURRENT-LEADER-LEAK: 84 RECLAIMABLE unreac
+
+- **Logged (UTC):** 2026-07-29T12:15:29
+- **Severity:** finding
+- **Run:** 20260729T121208_S33_seed20260729
+- **Observed:** S33 REGRESSION of fixed BACKLOG GC-CONCURRENT-LEADER-LEAK: 84 RECLAIMABLE unreachable object(s) (blobs/_manifests) permanently orphaned by concurrent explicit GC leaders (safety held: dangling=0); full residual by_prefix={'_manifests': 84}. The attempt-scoped generation fix should make a deposed leader's fold seal invisible and let the next honest round drain — a nonzero reclaimable residual means that invariant broke.
+
+## S30-20260729T121529-1: S30 REGRESSION vs D1: GC per-round fanout (roots/<ns> dir count and/or CasRootGe
+
+- **Logged (UTC):** 2026-07-29T12:18:55
+- **Severity:** finding
+- **Run:** 20260729T121529_S30_seed20260729
+- **Observed:** S30 REGRESSION vs D1: GC per-round fanout (roots/<ns> dir count and/or CasRootGet) grew across create/drop iterations though no table stayed live — the D1 registry-removal / dropped-shard-reclaim guarantee is violated.
+
