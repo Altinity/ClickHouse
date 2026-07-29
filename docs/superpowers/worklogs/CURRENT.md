@@ -1902,3 +1902,7 @@ audit addendum rides T15's 6/40 re-validation. Old text logs archived.
 pass -> exclusive 3/8 soak -> scenarios/05020 -> serial a15/a16 builds -> T15 6/40 re-
 validation). Four red lanes = drain class (expected-red, adaptation pending), not starvation.
 Product finding BACKLOG'd: ca-fsck DNF at 29GiB (EXIT=159 @731s, empty) — [FSCK-SCALE-TIMEOUT].
+**2026-07-29 11:00 local** — watchdog: quiet-slot schedule WORKING — load 1.84 (was 37-43),
+T15 red build done (10:55) + red markers landing (bounded_walk 10:58, liar/holdgrammar 11:00);
+a14 in Slot A running the adapted-lane clean pass (shared_pool 10:59, drop_pool_member
+started). Nothing wedged.
