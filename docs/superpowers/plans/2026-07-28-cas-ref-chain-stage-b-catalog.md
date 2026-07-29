@@ -82,6 +82,10 @@ destruction still suppressed does not exercise Stage B's claims.
 
 **Files:**
 - Create: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/RefNamespaceId.h`
+  (EXECUTED 2026-07-29 as `Primitives/CasRefNamespaceId.h` — controller-accepted deviation: the
+  type is pure vocabulary beside `RootNamespace`/`RefTxnId`, and `Formats/CasLayout.h` including
+  `Pool/` would have been the tree's first violation of the documented include direction
+  `Primitives → Formats → … → Pool`. Type name unchanged; later tasks reference the TYPE.)
 - Modify: `.../ContentAddressed/Formats/CasLayout.h` — the `Layout` class [path and type per
   codex finding 18] — every ref-layer prefix/key/parser member helper
   (`refsNamespacePrefix`, `refLogKey`, `refSnapshotKey`, `refCkptKey` from Stage A, and the
@@ -255,6 +259,14 @@ struct RefCatalog                          /// one object, key `cas/ref_catalog`
   `ca: ref — incarnation-keyed layer; universe from catalog; format bump B`.
 
 ### Task 5: Removal lifecycle — terminal record, janitor, deposited incarnation {#task-5}
+
+**INTERFACE NOTE from Task 1 (2026-07-29, controller-ledgered):** Task 1 deleted
+`refsNamespacePrefix(RootNamespace)` — the only all-lives LIST prefix — per Constraint 4, and it
+STAYS deleted. The lazy janitor here needs a NEW, differently-named helper (suggested:
+`refsAllLivesPrefix(const RootNamespace &)`) to enumerate foreign-incarnation debris under a
+known namespace. Do NOT "restore" the old overload — the deleted-overload concept checks in
+`gtest_cas_ref_namespace_id.cpp` will (correctly) fail the build if you do; add the new name
+with its own tests instead.
 
 **Files:**
 - Modify: `.../Pool/CasRefCatalog.cpp`, `.../Pool/CasRefLedger.cpp` (terminal append path),
