@@ -51,6 +51,7 @@ from .s38_late_put_injection import (
     _render_ref_txn_id,
     _restamp_ref_log_txn,
     _s3_client,
+    _zstd_decompress,
 )
 
 _TABLE = "w3_recreated"
