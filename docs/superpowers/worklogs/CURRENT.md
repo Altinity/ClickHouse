@@ -1854,3 +1854,8 @@ rule-3 per-ref refinement = user-gated design pass). Data converges; correctness
 **2026-07-29 10:00 local** — watchdog: soak tick #27 (pool 30.9GB, 2/2 signals, throttle
 back to 0); codex phase-A review alive (log 2.8MB, running); 4 containers up. Relink-storm
 ruling landed earlier this window. GC audit dispatch still scheduled ~10:40.
+**2026-07-29 10:1x local** — soak finding 2 ruled: checkpoint fsck vacuous-OK at scale (180s
+budget vs 29GiB pool) = harness issue, not product red; post-soak 1800s fsck = criterion
+evidence; honesty patch ordered (GATE-SKIPPED, never OK-with-zeros). C.2 answered
+STRUCTURALLY: zero completed GC rounds in 42min (fold O(pool), 1M+ manifest-body GETs) ->
+probe never samples; cadence UNIT broken -> BACKLOG. Fold-cost data routed to the GC audit.
