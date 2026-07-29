@@ -1998,3 +1998,6 @@ fail-close one layer EARLIER than task-6 predicted; causation proven by single-o
 removal). 4/4 scenarios PASS; verdict = PENDING (T15 re-validation), single gate row 12c.
 T14 task review DISPATCHED (81 commits, 404KB package). Predown wiring flip ordered before
 the re-validation soak. a16 RED-1 build running.
+**2026-07-29 14:40 local** — watchdog: a16 RED-1 building (configure+revert markers 14:23,
+ninja live); T14 review in flight (reviewer transcript fresh 14:37). a14 holding post-W3;
+a15 parked. All lanes nominal.
