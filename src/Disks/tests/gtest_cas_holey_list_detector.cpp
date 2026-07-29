@@ -49,11 +49,12 @@ namespace
 /// deliberately NOT modelled (no page split, no cursor games) — the detector under test must not
 /// depend on how the hole was produced.
 ///
-/// WHICH call is explicit and load-bearing. A GC round enumerates the ref prefix TWICE:
-/// `Gc::changedShardCount` (the defer signal) and then `Gc::fold`. Only a hole in the FOLD's walk makes
-/// the fold skip the record, which is the defect being reproduced; a hole in the pre-fold walk alone
-/// changes nothing today. `nth` counts, from the moment `omitFromNthListCall` is called, only those
-/// `list` calls that WOULD have returned the key — so unrelated prefix enumerations do not shift it.
+/// WHICH call is explicit and load-bearing. A GC round enumerates the ref prefix ONCE, in
+/// `Gc::listRefPrefix`, and the fold regroups that same enumeration -- so `nth = 0` is the walk whose
+/// hole the fold would have to survive, and it is the one every test here arms. (On a round the sampled
+/// store-quality detector is due, `nth = 1` is its own extra enumeration.) `nth` counts, from the moment
+/// `omitFromNthListCall` is called, only those `list` calls that WOULD have returned the key — so
+/// unrelated prefix enumerations do not shift it.
 /// Arm the sabotage AFTER every seeding write: the writer's own sequence allocation lists the
 /// namespace prefix and would otherwise consume a qualifying call.
 ///
@@ -107,10 +108,14 @@ private:
     bool served = false;
 };
 
-PoolPtr openHoleyPool(std::shared_ptr<HoleyListBackend> & out_backend)
+/// `probe_a_period` is per-test on purpose: the two tests below whose subject is the WALK leave the
+/// production default (the detector does not sample, and cannot colour the result), while the one whose
+/// subject is the detector's verdict sets 1 so every round samples.
+PoolPtr openHoleyPool(std::shared_ptr<HoleyListBackend> & out_backend, uint64_t probe_a_period = 16)
 {
     out_backend = std::make_shared<HoleyListBackend>();
-    return Pool::open(out_backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    return Pool::open(out_backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test",
+                                              .gc_probe_a_period = probe_a_period});
 }
 
 /// A `ManifestEntry` for a Blob leaf at `path` referencing `payload`'s content hash.
@@ -226,9 +231,11 @@ void runRounds(const PoolPtr & s, Gc & gc, int rounds)
 
 }
 
-/// RETENTION DIRECTION (the RCA's primary reproduction). A ref-log record omitted from ONE listing
-/// sorts at or below the cursor forever, so restoring the listing cannot recover it: the blob's `-1`
-/// never folds and the blob is retained permanently.
+/// RETENTION DIRECTION (the RCA's primary reproduction). A ref-log record omitted from a listing used to
+/// sort at or below the cursor forever, so restoring the listing could not recover it: the blob's `-1`
+/// never folded and the blob was retained permanently. Under arithmetic intake the omitted record is
+/// reached by exact key on the very round that was lied to, so the removal folds and the blob dies on
+/// the normal schedule — no abort, and no waiting for the store to become honest again.
 TEST(CasHoleyListDetector, OmittedRemoveRecordIsSkippedForever)
 {
     std::shared_ptr<HoleyListBackend> b;
@@ -258,25 +265,21 @@ TEST(CasHoleyListDetector, OmittedRemoveRecordIsSkippedForever)
     publishOneBlobPart(s, ns, "part_h", "harmless-payload");
     s->renewWatermarkOnce();   /// advance the floor so the dropped closure is not spared as in-flight
 
-    /// nth = 1: the round's SECOND qualifying walk is `Gc::fold`'s own enumeration (the first is the
-    /// pre-fold defer scan). Only a hole there makes the fold skip the record. Armed LAST, after every
-    /// seeding write, so no writer-side namespace listing consumes a qualifying call.
-    b->omitFromNthListCall(remove_key, /*nth=*/1);
+    /// nth = 0: the round's own enumeration of the ref prefix — the one the fold regroups, and the only
+    /// walk whose hole the intake has to survive. Armed LAST, after every seeding write, so no
+    /// writer-side namespace listing consumes a qualifying call.
+    b->omitFromNthListCall(remove_key, /*nth=*/0);
 
-    const uint64_t holes_before = probeAHoles();
     runRounds(s, gc, 1);
     ASSERT_TRUE(b->holeServed()) << "the sabotage never fired — the omitted key was never listed";
-    EXPECT_GT(probeAHoles() - holes_before, 0u)
-        << "probe A did not fire on the round that served the hole";
 
-    /// The listing is whole again from here on. Drive to a fixpoint. With probe A landed, the round
-    /// that served the hole aborted ref folding, so the cursor never advanced past the omitted record
-    /// and the next round's complete enumeration folds it normally.
+    /// Drive to the reclaim. The point is that the FIRST of these rounds — the one served the hole —
+    /// already folded the removal; the rest are the condemn/graduate/delete pacing.
     runRounds(s, gc, 12);
 
     EXPECT_FALSE(blobPresent(b, layout, payload))
-        << "the removal was never folded even after the listing recovered — probe A recorded the "
-           "disagreement but the cursor advanced anyway";
+        << "the removal was hidden from one enumeration and never folded — the cursor advanced past a "
+           "record the round never applied, which is the skipped-transaction defect itself";
 }
 
 /// DELETION DIRECTION (the mirror safety test from the RCA). Two owners share ONE deduplicated blob.
@@ -312,23 +315,21 @@ TEST(CasHoleyListDetector, OmittedActivationNeverPermitsDeletingALiveBlob)
     s->dropRef(ns, "part_1");
     s->renewWatermarkOnce();   /// advance the floor so the removed closure is not spared as in-flight
 
-    /// nth = 1: the fold's own walk (see the note in the retention test). Armed LAST so the writer's
+    /// nth = 0: the round's own walk (see the note in the retention test). Armed LAST so the writer's
     /// own namespace listings cannot shift the count.
-    b->omitFromNthListCall(m2_key, /*nth=*/1);
+    b->omitFromNthListCall(m2_key, /*nth=*/0);
 
-    const uint64_t holes_before = probeAHoles();
     runRounds(s, gc, 12);   /// condemn -> graduate -> delete needs several rounds
+    /// The anti-vacuity check, and it is the RIGHT one now: a run that merely happened not to delete the
+    /// blob must not pass for the wrong reason, and what makes this run non-trivial is that the hole was
+    /// actually SERVED to the enumeration the fold works from. (It used to be "and the detector fired",
+    /// which was only ever a proxy for that — and is now a property of a different, sampled mechanism,
+    /// pinned in `CasRetirementSweep`.)
     ASSERT_TRUE(b->holeServed()) << "the sabotage never fired — the omitted key was never listed";
 
     EXPECT_TRUE(blobPresent(b, layout, payload))
         << "GC deleted a blob that manifest " << manifestRefDebugString(m2.ref)
         << " still references — the skipped-transaction DATA-LOSS class, reproduced";
-
-    /// Assert the DETECTOR, not just the outcome: a run that merely happened not to delete the blob
-    /// must not pass for the wrong reason.
-    EXPECT_GT(probeAHoles() - holes_before, 0u)
-        << "the live blob survived, but probe A never fired — this test may be passing for the wrong "
-           "reason";
 }
 
 /// The detector must not merely COUNT a disagreement — it must say WHICH defect it saw, at the moment it
@@ -345,7 +346,8 @@ TEST(CasHoleyListDetector, OmittedActivationNeverPermitsDeletingALiveBlob)
 TEST(CasHoleyListDetector, TheHoleVerdictDistinguishesAMissedObjectFromAPhantomKey)
 {
     std::shared_ptr<HoleyListBackend> b;
-    auto s = openHoleyPool(b);
+    /// This test's subject IS the detector, so every round must sample.
+    auto s = openHoleyPool(b, /*probe_a_period=*/1);
     const Layout & layout = s->layout();
     const RootNamespace ns{"test/tbl"};
     const String payload = "verdict-payload";
@@ -362,9 +364,12 @@ TEST(CasHoleyListDetector, TheHoleVerdictDistinguishesAMissedObjectFromAPhantomK
         refLogKeyEmittingEdge(*b, layout, ns, addedKeys(before_drop, after_drop), part, -1);
     ASSERT_FALSE(remove_key.empty());
 
+    /// `part_h` is not decoration: the detector's rule needs a WITNESS above the missing id in the other
+    /// enumeration, and a hidden record that is merely the greatest one could always be a concurrent
+    /// append.
     publishOneBlobPart(s, ns, "part_h", "harmless-payload");
     s->renewWatermarkOnce();
-    b->omitFromNthListCall(remove_key, /*nth=*/1);
+    b->omitFromNthListCall(remove_key, /*nth=*/0);
 
     const uint64_t holes_before = probeAHoles();
     const uint64_t present_before = probeAHolesPresent();

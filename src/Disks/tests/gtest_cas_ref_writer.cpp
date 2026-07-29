@@ -1412,7 +1412,7 @@ TEST(RefWriterSnapshotPublish, MountTimeTriggerPublishesAfterRecoveryReplaysLarg
 /// rev.6 Task 10 (spec §publish-from-live): the grace-window machinery
 /// (`snapshot_min_log_age_ms`, the tail-replay-from-`snapshot_base_state` copy-once path,
 /// `CasRefLatePredecessorObserved`) is DELETED. The Task 8 recovery-seal plus the Task 6
-/// materialization wait already make a late-arriving predecessor write born-covered for every
+/// recovery seal already makes a late-arriving predecessor write born-covered for every
 /// observer by the time this writer could ever see it, so a young committed txn has nothing left to
 /// wait out -- it is immediately publish-eligible, with no time manipulation anywhere below.
 /// ===================================================================================
@@ -2011,9 +2011,9 @@ TEST(RefWriterStalePrecommitSweep, BoundedBatchesAndInterruptionResumeAcrossMoun
     /// the remaining stale precommits in exactly one further chunk (<= 1000 remain). `successor` was
     /// abandoned mid-wedge above -- Task 5's drain fails closed on an unresolved PUT, so no clean
     /// farewell was written -> this reclaim is `MountPriorState::UncleanObserved` (rev.6 Task 4), which
-    /// already paid a real ~36.5s token-stability observation wait here even before Task 6 added
-    /// `materialization_grace_ms` on top. Inject a fake `boot_ms_fn` + `wait_sleep_fn` (mirroring
-    /// `CasMountTmat.UncleanOpenWaitsMaterializationGrace`) so BOTH waits resolve instantly.
+    /// pays a real ~36.5s token-stability observation wait here. Inject a fake `boot_ms_fn` +
+    /// `wait_sleep_fn` (mirroring `CasMountOpenWaits.UncleanOpenPaysOnlyTheObservationWindow`) so it
+    /// resolves instantly.
     uint64_t resumer_fake_boot = 0;
     PoolConfig resumer_config;
     resumer_config.boot_ms_fn = [&resumer_fake_boot] { return resumer_fake_boot; };
@@ -2332,10 +2332,9 @@ TEST(RefWriterRemount, PostRemountAppendCarriesLiveEpochSortingAboveTwinLogs)
 
 /// C1 (wedge disposition): a wedged append lane's runtime (and its wedge) is dropped on a self-remount,
 /// the next touch re-recovers a clean lane, and appends resume without hanging. The unfixed code kept the
-/// wedged runtime cached across the remount. rev.6 Task 7: `tryRemountOnce` consults the wedge via
-/// `refLanesSettledForRemount` BEFORE this drop happens (paying `materialization_grace_ms` for it below),
-/// so the drop itself is a plain cache detach, not the wedge's disposition -- see `quiesceRefTablesForRemount`'s
-/// doc comment (`CasPool.h`) for the retired "accepted Late Predecessor case" framing this replaces.
+/// wedged runtime cached across the remount. The drop is a plain cache detach and needs to certify
+/// nothing: the undecided PUT the wedge describes is settled by the seal the next recovery writes into
+/// its slot -- see `quiesceRefTablesForRemount`'s doc comment (`CasPool.h`).
 TEST(RefWriterRemount, DiscardsWedgeAndLaneRemainsUsable)
 {
     CasRequestBudget budget;
@@ -2345,10 +2344,9 @@ TEST(RefWriterRemount, DiscardsWedgeAndLaneRemainsUsable)
     budget.lease_safety_margin_ms = 100;
 
     auto backend = std::make_shared<RefWriterTestBackend>();
-    /// rev.6 Task 7: the self-remount below now pays `materialization_grace_ms` for the wedge this test
-    /// deliberately leaves behind (`refLanesSettledForRemount` reports unsettled) -- inject a fake
-    /// `boot_ms_fn`/`wait_sleep_fn` (mirroring `CasRemountTmat.UnresolvedWedgePaysGraceAndMarksBoundaryUnclean`,
-    /// `gtest_cas_pool.cpp`) so the wait resolves instantly instead of blocking this test for ~30 real seconds.
+    /// The self-remount below blocks on nothing (see
+    /// `CasRemountWaits.UnresolvedWedgeRemountPaysNoWaitEither`, `gtest_cas_pool.cpp`); the injected
+    /// `boot_ms_fn`/`wait_sleep_fn` keep this test off the real clock anyway.
     uint64_t fake_boot = 0;
     PoolConfig config;
     config.cas_request_budget = budget;
@@ -2388,15 +2386,10 @@ TEST(RefWriterRemount, DiscardsWedgeAndLaneRemainsUsable)
 TEST(RefWriterRemount, SupersededLeaderMidFlushFailsClosedCreatesNoObject)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
-    /// rev.6 Task 7: this test parks a flush leader (`leader_active` stays true) across the ENTIRE
-    /// `tryRemountOnce` call below by construction (`release` is only set AFTER `tryRemountOnce`
-    /// returns), so `refLanesSettledForRemount`'s own drain-wait -- bounded by
-    /// `attempt_timeout_ms + lease_safety_margin_ms`, on a real `steady_clock` deadline never routed
-    /// through `wait_sleep_fn` (same as its `drainRefLanesForShutdown` sibling) -- is guaranteed to run out
-    /// its full budget. Shrink that budget to the file's usual tiny-wedge-test values so the unavoidable
-    /// real wait stays well under a second, and inject a fake `boot_ms_fn`/`wait_sleep_fn` so the
-    /// subsequent `materialization_grace_ms` wait (the drain reports unsettled either way) resolves
-    /// instantly on top.
+    /// This test parks a flush leader (`leader_active` stays true) across the ENTIRE `tryRemountOnce`
+    /// call below by construction (`release` is only set AFTER `tryRemountOnce` returns). Keep the
+    /// request budget at the file's usual tiny-wedge-test values so every bounded wait on that path
+    /// stays well under a second.
     CasRequestBudget budget;
     budget.attempt_timeout_ms = 100;
     budget.lease_safety_margin_ms = 100;
@@ -2826,7 +2819,7 @@ void seedSealFixtureDeadEpochs(Backend & backend, const Layout & layout, const R
 }
 
 /// Plants a same-uuid, UNCLEAN (crash-style, no farewell) predecessor mount lease at `epoch`: a bare
-/// `claimMount` followed by a GC fence-out -- mirrors `CasMountTmat.FencedPriorPaysOnlyTmat`. A fenced
+/// `claimMount` followed by a GC fence-out -- mirrors `CasMountOpenWaits.FencedPriorReclaimsWithoutAnyWait`. A fenced
 /// prior is an immediate certificate of death (`claimMountAwaitingExpiry` reclaims it on its FIRST
 /// attempt, no observation polling), so a fake-clocked successor `Pool::open` above it becomes
 /// unclean deterministically, without any real sleep.
@@ -2838,7 +2831,7 @@ void seedUncleanPredecessorMount(Backend & backend, const Layout & layout, uint6
 
 /// The budget every seal test's successor `Pool::open` uses: a 500ms lease TTL needs a scaled-down
 /// budget (RFC cas-s3-timeout-retry-control §required-timeout-model: attempt_timeout + safety_margin <
-/// lease TTL) -- mirrors `CasMountTmat.FencedPriorPaysOnlyTmat` exactly.
+/// lease TTL) -- mirrors `CasMountOpenWaits.FencedPriorReclaimsWithoutAnyWait` exactly.
 CasRequestBudget sealTestTinyBudget()
 {
     return CasRequestBudget{
@@ -2893,7 +2886,6 @@ TEST(RefWriterRecoveryRetry, TransientSealFailureIsRetriedThenSucceeds)
     config.cas_request_budget.recovery_retry_budget_ms = 120000;
     config.cas_request_budget.recovery_retry_initial_backoff_ms = 1000;
     config.cas_request_budget.recovery_retry_max_backoff_ms = 30000;
-    config.materialization_grace_ms = 1000;
     config.boot_ms_fn = [&fake_now] { return fake_now; };
     config.wait_sleep_fn = [](uint64_t) {};
     auto store = openPoolWithConfig(backend, config);
@@ -2945,7 +2937,6 @@ TEST(RefWriterRecoveryRetry, TransientListFailureIsRetriedThenSucceeds)
     config.mount_lease_ttl_ms = std::chrono::milliseconds(500);
     config.cas_request_budget = sealTestTinyBudget();
     config.cas_request_budget.recovery_retry_budget_ms = 120000;
-    config.materialization_grace_ms = 1000;
     config.boot_ms_fn = [&fake_now] { return fake_now; };
     config.wait_sleep_fn = [](uint64_t) {};
     auto store = openPoolWithConfig(backend, config);
@@ -2987,7 +2978,6 @@ TEST(RefWriterRecoveryRetry, TransientFailureLongerThanBudgetPropagates)
     config.cas_request_budget.recovery_retry_budget_ms = 5000;   /// small, deterministic
     config.cas_request_budget.recovery_retry_initial_backoff_ms = 1000;
     config.cas_request_budget.recovery_retry_max_backoff_ms = 30000;
-    config.materialization_grace_ms = 1000;
     config.boot_ms_fn = [&fake_now] { return fake_now; };
     config.wait_sleep_fn = [](uint64_t) {};
     auto store = openPoolWithConfig(backend, config);
@@ -3016,7 +3006,6 @@ TEST(RefWriterRecoveryRetry, NonNetworkErrorIsNotRetried)
     config.server_id = UInt128(1);
     config.mount_lease_ttl_ms = std::chrono::milliseconds(500);
     config.cas_request_budget = sealTestTinyBudget();
-    config.materialization_grace_ms = 1000;
     config.wait_sleep_fn = [](uint64_t) {};
     auto store = openPoolWithConfig(backend, config);
     ASSERT_TRUE(store);
@@ -3092,7 +3081,6 @@ TEST(RefWriterRecoveryRetry, ThrowingBackoffSleepDoesNotWedgeRecovery)
     config.mount_lease_ttl_ms = std::chrono::milliseconds(500);
     config.cas_request_budget = sealTestTinyBudget();
     config.cas_request_budget.recovery_retry_budget_ms = 120000;
-    config.materialization_grace_ms = 1000;
     config.wait_sleep_fn = [](uint64_t) {};
     auto store = openPoolWithConfig(backend, config);
     ASSERT_TRUE(store);

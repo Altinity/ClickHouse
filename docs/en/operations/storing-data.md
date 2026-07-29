@@ -548,8 +548,6 @@ disk, none of the keys below carry a redundant `cas_`/`ca_` prefix.
 - `gc_meta_pool_size` — `16` by default. Bounded thread-pool size for the GC's per-hash freshness-meta
   writes (condemn/spare/delete), so a mass `DROP` condemning millions of blobs does not run fully
   sequentially.
-- `materialization_grace_ms` — `30000` by default. Conditional post-reclaim wait that `Pool::open`
-  pays over an unclean predecessor incarnation before materializing.
 - `skip_access_check` — `false` by default. Skips the disk's startup access check ("start now, fix
   later"), unlike the generic disk-wide startup flag.
 

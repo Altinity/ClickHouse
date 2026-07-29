@@ -194,19 +194,21 @@ struct GcPhaseRecord
 /// elsewhere (a unit test driving `Gc` directly emits nothing).
 using GcPhaseSink = std::function<void(const GcPhaseRecord &)>;
 
-/// The pre-fold enumeration of `cas/refs/`, retained rather than discarded. Two independent uses:
-/// the DEFER signal (`changed_shards`, unchanged semantics), and the round's SECOND witness for the
-/// skipped-transaction detector — `Gc::fold` performs its own full enumeration of the same prefix a
-/// moment later, and disagreement between two enumerations of an append-only prefix is the only
-/// unambiguous evidence available (a bare GAP in the id sequence is legitimate by design: an append
-/// refused before any network attempt leaves one).
+/// THE ROUND'S ONE HINT ENUMERATION of `cas/refs/`, taken before the defer decision and consumed by
+/// everything downstream: the DEFER signal (`changed_shards`), and — on a folding round — the strict
+/// grouping the fold works from (`keys`, regrouped by `groupRefKeys`).
 ///
-/// KEEPING THE TWO WALKS SEPARATE IS LOAD-BEARING. Merging them into one enumeration — an otherwise
-/// obvious optimisation, since the round lists the same prefix twice — silently makes probe A vacuous.
-/// `CasGcRound.EnumerationPagesCountedEvenWithSweepBudgetZeroed` pins that both walks happen.
+/// It is a HINT, never a census. The fold's intake walks the ref stream ARITHMETICALLY by exact key
+/// (`cursor + 1`, epoch crossings proved through the seal chain), so an id this enumeration omits is
+/// still folded, and the round listing the prefix a second time would buy the intake nothing. The
+/// second enumeration this round used to perform — kept deliberately separate so the two could be
+/// compared — now happens only on the rounds the sampled store-quality detector is due
+/// (`PoolConfig::gc_probe_a_period`, `Gc::sampleRefListQuality`), and its result reaches nothing but
+/// the detector's own report.
 struct RefScanSummary
 {
     size_t changed_shards = 0;                          /// tables with a log above their sealed cursor
+    std::vector<String> keys;                           /// every listed key, verbatim, for the fold's strict grouping
     std::map<String, std::set<RefTxnId>> logs_by_ns;    /// Log-kind ids only, per namespace
     std::map<String, RefTxnId> max_log_by_ns;           /// greatest Log-kind id per namespace
 };
@@ -478,10 +480,10 @@ private:
     /// graduates once `condemn_round < current_round`, i.e. it survived at least one full round after
     /// being condemned. The fold no longer CASes gc/state — it sets (snap_generation, snap_attempt)
     /// in-memory; the SINGLE round CAS commits them.
-    /// `pre_scan` is the round's OWN pre-fold enumeration of `cas/refs/` (see `RefScanSummary`); the fold
-    /// compares it against its own enumeration of the same prefix — probe A.
+    /// `ref_scan` is the round's ONE enumeration of `cas/refs/` (see `RefScanSummary`); the fold regroups
+    /// its keys strictly rather than listing the prefix again.
     FoldResult fold(GcState & state, Token & state_token, RoundReport & report, uint64_t current_round,
-                    const RefScanSummary & pre_scan, UniversePolicy policy);
+                    const RefScanSummary & ref_scan, UniversePolicy policy);
 
     /// The round's `_ckpt.checkpoint` witness per namespace — the SECOND, hint-independent witness the
     /// walk decides its absents against. ONE call site, in the fold, right where the hint is grouped.
@@ -613,13 +615,30 @@ private:
     /// path surfaces it); a round must never silently defer on corrupt bookkeeping.
     bool graduationDue(const GcState & state, uint64_t current_round);
 
-    /// One full enumeration of `cas/refs/`, producing BOTH the pre-fold DEFER signal
+    /// One full enumeration of `cas/refs/`: the raw keys plus a lenient per-namespace index of the
+    /// Log-kind ids among them. A malformed key lands in `keys` and is not indexed; `groupRefKeys` in
+    /// the fold does the strict validation and the round-abort. `parseRefObjectKey` never throws.
+    RefScanSummary enumerateRefPrefix();
+
+    /// The round's ONE hint enumeration (`enumerateRefPrefix`) plus the DEFER signal computed from it
     /// (`RefScanSummary::changed_shards` -- the number of tables with at least one ref log above their
     /// sealed durable cursor, compared against the per-table cursors in the adopted fold seal at
-    /// `state.snap_generation`/`snap_attempt`) and the detector's first witness. Lenient parse: a
-    /// malformed key is not counted here; `groupRefKeys` in the fold does the strict validation and
-    /// round-abort. `parseRefObjectKey` never throws.
-    RefScanSummary preFoldRefScan(const GcState & state);
+    /// `state.snap_generation`/`snap_attempt`).
+    RefScanSummary listRefPrefix(const GcState & state);
+
+    /// THE STORE-QUALITY DETECTOR (historically "probe A"). SAMPLED on a deterministic cadence
+    /// (`PoolConfig::gc_probe_a_period`): on a due round it performs ONE extra full enumeration of
+    /// `cas/refs/` and compares it against the round's own (`round_scan`).
+    ///
+    ///   an id present in one enumeration, absent from the other, and STRICTLY BELOW the other
+    ///   enumeration's maximum id for that same namespace CANNOT be a concurrent append.
+    ///
+    /// It ABORTS NOTHING AND GATES NOTHING: it records no anomaly (an anomaly would suppress the
+    /// round's destructive steps), holds no namespace, and moves no cursor. The signal it carries is
+    /// about the STORE, and the fold is immune to it by construction — the intake reads by exact key.
+    /// Its whole output is a report: the `ref_list_probe` phase row (`due`/`performed`/`skipped`/
+    /// `holes`), `gc_anomaly` audit rows, `CasGcProbeA*` ProfileEvents, and the text log.
+    void sampleRefListQuality(const RefScanSummary & round_scan, uint64_t current_round);
 
     /// (reclaimDroppedShards was removed with the snapshot+log ref model: there is no mutable per-namespace
     /// shard object to tombstone+reclaim; physical namespace reclamation is the namespace-cleanup item.)
@@ -745,12 +764,6 @@ private:
     std::mutex condemn_marker_mutex;
     std::set<std::pair<BlobRef, String>> condemn_markers_confirmed;
 
-    /// Probe A's per-round count of ref-log ids on which the round's two independent enumerations of
-    /// `cas/refs/` disagreed. Written by `fold`; the per-phase GC row emitter surfaces it as the
-    /// `fold_ref_list` phase metric. The always-available reading is the `CasGcRefScanDisagreements`
-    /// profile event, which `fold` increments by the same amount.
-    uint64_t probe_a_holes_this_round = 0;
-
     /// Probe B1's two numbers for the round: the ref-log POSITIONS the sealed coverage declares covered
     /// (counted arithmetically over each namespace's cut -- not by listed ids, which under arithmetic
     /// intake say nothing about what was applied), and the ref logs that actually folded. They are EQUAL
@@ -782,10 +795,10 @@ public:
         return graduationDue(state, current_round);
     }
 
-    /// Test-only access to the pre-fold ref scan (its `changed_shards` is the defer signal).
-    RefScanSummary preFoldRefScanForTest(const GcState & state)
+    /// Test-only access to the round's ref-prefix enumeration (its `changed_shards` is the defer signal).
+    RefScanSummary listRefPrefixForTest(const GcState & state)
     {
-        return preFoldRefScan(state);
+        return listRefPrefix(state);
     }
 
     /// TEST SEAM: drive one namespace-cleanup pass directly so a test can

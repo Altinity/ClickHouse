@@ -380,8 +380,8 @@ TEST(CasGcLog, FoldingRoundEmitsEveryPhaseInOrder)
     ASSERT_TRUE(sched.runOneRoundNow(Rec::Trigger::Manual).acquired_lease);
 
     const std::vector<String> expected = {
-        "lease", "heartbeat_floor", "defer_decision", "parent_seal_read",
-        "fold_ref_list", "fold_seal_read", "fold_ref_intake", "fold_ns_cleanup_scan",
+        "lease", "heartbeat_floor", "defer_decision", "ref_list_probe", "parent_seal_read",
+        "fold_ref_group", "fold_seal_read", "fold_ref_intake", "fold_ns_cleanup_scan",
         "fold_reduce", "fold_seal_write",
         "pending_deletes", "meta_pool_wait", "round_commit", "handoff_reclaim",
         "manifest_deletes", "namespace_cleanup", "ref_object_cleanup", "orphan_sweep"};
@@ -403,12 +403,18 @@ TEST(CasGcLog, FoldingRoundEmitsEveryPhaseInOrder)
     EXPECT_EQ(defer.at("fold_seal_reads"), 2u);
     EXPECT_GT(defer.at("namespaces_seen"), 0u);
 
-    /// Probe A's per-round hole count is reported on EVERY round, healthy or not -- a value that is
-    /// always 0 is what makes the one round where it is not stand out.
-    const auto ref_list = metricsOf(rows, 0, "fold_ref_list");
-    EXPECT_EQ(ref_list.at("probe_a_holes"), 0u);
-    EXPECT_EQ(ref_list.at("ref_folding_aborted"), 0u);
-    EXPECT_GT(ref_list.at("ref_keys_listed"), 0u);
+    const auto ref_group = metricsOf(rows, 0, "fold_ref_group");
+    EXPECT_EQ(ref_group.at("ref_folding_aborted"), 0u);
+    EXPECT_GT(ref_group.at("ref_keys_listed"), 0u);
+
+    /// The store-quality detector's cadence is reported on EVERY folding round, due or not -- a
+    /// detector that has silently stopped running must not be indistinguishable from one that keeps
+    /// finding nothing. Round 1 with the default period (16) is not a sampling round.
+    const auto probe = metricsOf(rows, 0, "ref_list_probe");
+    EXPECT_EQ(probe.at("due"), 0u);
+    EXPECT_EQ(probe.at("performed"), 0u);
+    EXPECT_EQ(probe.at("skipped"), 0u);
+    EXPECT_EQ(probe.at("holes"), 0u);
 
     /// Probe B1's identity, as an OBSERVABLE property of the table rather than an assumption in a
     /// comment: the round sealed coverage over exactly the logs it folded.

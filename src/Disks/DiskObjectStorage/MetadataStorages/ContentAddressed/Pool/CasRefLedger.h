@@ -197,10 +197,6 @@ public:
     /// orphaned runtime therefore fail closed instead of mutating state from the previous epoch.
     void quiesceRefTablesForRemount();
 
-    /// Returns whether every cached append lane has settled sufficiently for remount. It does not
-    /// discard runtimes; `quiesceRefTablesForRemount` performs that state transition.
-    bool refLanesSettledForRemount();
-
     /// The self-remount's CANCEL-OR-JOIN barrier over in-flight recoveries (spec §3: "self-remount
     /// cancels or waits out recovery before rearming"). Requests cancellation on every cached table,
     /// then WAITS until no recovery attempt is in flight anywhere, then clears the request. Returns only

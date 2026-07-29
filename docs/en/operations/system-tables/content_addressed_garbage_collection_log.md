@@ -71,9 +71,10 @@ The phases, in execution order:
 |---|---|---|
 | `lease` | Acquire, renew, or observe the GC lease. The only phase a `NotALeader` round emits. | `gc/state` `GET` + `CAS` |
 | `heartbeat_floor` | Classify every mount slot and fence out the dead ones. | `LIST` of the mount prefix, one `GET` per mount, one `PUT` per fence |
-| `defer_decision` | The skip-unchanged decision: graduation check plus the pre-fold enumeration of the ref prefix. | one full ref-prefix `LIST`, two fold-seal `GET`s |
+| `defer_decision` | The skip-unchanged decision: graduation check plus the round's one enumeration of the ref prefix. | one full ref-prefix `LIST`, two fold-seal `GET`s |
+| `ref_list_probe` | The sampled ref-prefix store-quality detector. Emitted on every folding round; it only enumerates anything on the rounds its cadence makes due, and it aborts and gates nothing. | one full ref-prefix `LIST` on a due round, none otherwise |
 | `parent_seal_read` | Capture the pre-fold seal's run refs for the hand-off reclaim. | one fold-seal `GET` |
-| `fold_ref_list` | The fold's own enumeration of the ref prefix, its grouping, and the two-enumeration disagreement check. | one full ref-prefix `LIST` |
+| `fold_ref_group` | Regroup the round's enumeration into per-table listings — what this round will fold. | none |
 | `fold_seal_read` | The adopted fold seal, read twice at the same generation and attempt. | two fold-seal `GET`s |
 | `fold_ref_intake` | Read and fold every new ref log and the manifest bodies its edges name. | one `GET` per new log, one `HEAD`+`GET` per manifest edge |
 | `fold_ns_cleanup_scan` | Advance the namespace-cleanup items by testing physical emptiness. | two prefix `LIST`s per unfinished item |

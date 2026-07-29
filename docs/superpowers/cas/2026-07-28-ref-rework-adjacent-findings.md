@@ -71,12 +71,15 @@ caller or an independently occurring remount (r8 finding 8). Accepted as-is: the
 operation was never acknowledged. Recorded so nobody later "fixes" it with a background
 deadline-resetting loop (refused in r7 finding 8).
 
-## R7. Probe A gating policy — [today, decision open] {#r7-probe-a-gating}
+## R7. Probe A gating policy — [DECIDED and EXECUTED, Stage A task 12] {#r7-probe-a-gating}
 
-`todo-20260726.md` §0's open decision (should probe A gate a soak), now with the core demoting
-probe A to a sampled store-quality detector with deterministic cadence and durable
-due/performed/skipped observability. The mount-time LIST probe (#23) is the store GATE and remains
-separate work.
+`todo-20260726.md` §0's open decision (should probe A gate a soak) is answered: it gates NOTHING.
+Probe A is a sampled store-quality detector — deterministic cadence (`PoolConfig::gc_probe_a_period`,
+default 16), durable `due`/`performed`/`skipped` observability on the `ref_list_probe` phase row and in
+`CasGcProbeA*`, aborting no round and recording no anomaly. The round enumerates `cas/refs/` once; the
+second enumeration is the detector's own, on the rounds it samples. Reasoning and evidence:
+`2026-07-28-stage-a-retirement-verdicts.md` (item 1). The mount-time LIST probe (#23) is the store GATE
+and remains separate work.
 
 ## R8. Register hygiene {#r8-hygiene}
 

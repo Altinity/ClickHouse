@@ -1283,60 +1283,6 @@ void CasRefLedger::enforceRefTableCacheBudget(const RootNamespace & keep_ns)
 }
 
 
-bool CasRefLedger::refLanesSettledForRemount()
-{
-    /// Same wait mechanics as `drainRefLanesForShutdown`, without its `shutting_down` admission latch --
-    /// self-remount mutations are already refused by the freshly-tripped mount fence, not an admission
-    /// check, so there is nothing to latch here. Budget is exactly one attempt's worth: long enough for
-    /// an in-flight leader to observe the tripped fence and settle, never unbounded.
-    const uint64_t wait_budget_ms =
-        cas_request_budget.attempt_timeout_ms + cas_request_budget.lease_safety_margin_ms;
-
-    std::vector<std::shared_ptr<RefTableRuntime>> runtimes;
-    {
-        std::lock_guard<std::mutex> g(ref_queue_mutex);
-        runtimes.reserve(ref_tables.size());
-        for (const auto & [_, rt] : ref_tables)
-            runtimes.push_back(rt);
-    }
-
-    /// Wait for every table's queue to go idle (no pending item, no active leader), bounded overall by
-    /// `wait_budget_ms` -- mirrors `drainRefLanesForShutdown`'s own wait loop exactly (see its comments).
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(wait_budget_ms);
-    bool timed_out = false;
-    {
-        std::unique_lock<std::mutex> lk(ref_queue_mutex);
-        for (const auto & rt : runtimes)
-        {
-            while (!(rt->pending.empty() && !rt->leader_active))
-            {
-                if (rt->cv.wait_until(lk, deadline) == std::cv_status::timeout
-                    && !(rt->pending.empty() && !rt->leader_active))
-                {
-                    timed_out = true;
-                    break;
-                }
-            }
-            if (timed_out)
-                break;
-        }
-    }
-
-    /// A queue going idle does NOT by itself prove no PUT is in flight -- see `drainRefLanesForShutdown`'s
-    /// identical comment on this same check. Every table is checked regardless of `timed_out`, purely for
-    /// a complete diagnostic; the return value already fails closed on either condition alone.
-    bool any_wedge = false;
-    for (const auto & rt : runtimes)
-    {
-        std::lock_guard<std::mutex> lock(rt->state_mutex);
-        if (rt->wedge.has_value())
-            any_wedge = true;
-    }
-
-    return !timed_out && !any_wedge;
-}
-
-
 void CasRefLedger::quiesceRefTablesForRemount()
 {
     /// Snapshot the current runtimes (copies keep them alive across the drain). New dispatches are
@@ -1366,9 +1312,11 @@ void CasRefLedger::quiesceRefTablesForRemount()
     /// Queued callers self-drain -- each `flushRefBatch` for a superseded runtime completes its whole
     /// carved batch with a retry error, so no caller hangs; the next touch creates a fresh runtime that
     /// re-recovers from the durable snapshot+log objects under `live_writer_epoch`. Dropping the map slot
-    /// discards each runtime's in-memory wedge; `refLanesSettledForRemount` already consulted it above
-    /// and `tryRemountOnce` paid `materialization_grace_ms` when it was unresolved, so nothing about this
-    /// drop needs to be certified here.
+    /// discards each runtime's in-memory wedge, and nothing about that drop needs to be certified here:
+    /// the undecided `PUT` the wedge describes is settled by the durable protocol rather than by
+    /// bookkeeping this process carries across the boundary. Recovery closes the dead epoch with an
+    /// in-band `EpochSeal` written as a conditional create, so the wedged write either already landed
+    /// (and the arithmetic walk reads it) or loses its own create to the seal.
     std::vector<std::shared_ptr<RefTableRuntime>> detached;
     {
         std::lock_guard<std::mutex> qlock(ref_queue_mutex);

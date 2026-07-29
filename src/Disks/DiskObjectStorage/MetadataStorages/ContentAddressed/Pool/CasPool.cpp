@@ -574,8 +574,8 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
         1, static_cast<uint64_t>(store->config.mount_renew_period.count()) / 2);
     /// routes through `mount_runtime.waitSleep` (which itself routes through
     /// `config.wait_sleep_fn` when a test injected one) rather than a bare `sleep_for` directly, so
-    /// a test intercepting `wait_sleep_fn` observes every wait `open` can block on -- this
-    /// observation poll AND the `materialization_grace_ms` wait below.
+    /// a test intercepting `wait_sleep_fn` observes every wait `open` can block on -- and since the
+    /// post-reclaim materialization grace was retired, this observation poll is the only one left.
     const auto sleep_ms = [s = store.get()](uint64_t ms) { s->mount_runtime.waitSleep(ms); };
     /// Operator-visible log the moment startup decides to watch a stale-looking self-mount (the
     /// disk-open path blocks up to ~threshold_ms here, so a silent block would be confusing). May
@@ -617,11 +617,11 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
     /// races a fence between its GET and CAS (`MountFencedException` from `start()`).
     /// which certificate of death (if any) justified the reclaim FINALLY adopted below
     /// (the last iteration's `claim` before `break` -- `claim` itself is loop-scoped). Read after the
-    /// loop to decide the materialization-grace wait.
+    /// loop to classify (and log) an unclean reclaim.
     MountPriorState claimed_prior = MountPriorState::None;
     /// The pre-I/O boot-clock instant of the claim attempt FINALLY adopted below -- survives the
-    /// `break` so the arm after the materialization grace (below) can detect a grace that consumed
-    /// the lease TTL and re-anchor before arming (rev.4 Phase B, round-3 finding 2).
+    /// `break` so the arm below can detect a claim that consumed the lease TTL and re-anchor before
+    /// arming (rev.4 Phase B, round-3 finding 2).
     uint64_t claim_anchor_boot_ms = 0;
     constexpr int max_fence_recoveries = 3;
     for (int fence_recovery = 0; ; ++fence_recovery)
@@ -698,14 +698,22 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
         break;
     }
 
-    /// a reclaim over a predecessor whose death was NOT
-    /// proven clean may still have a conditional PUT from that predecessor in flight when this
-    /// incarnation starts trusting its recovery listings -- `Fenced` and `UncleanObserved` are
-    /// exactly the two `MountPriorState`s with no such proof (`Clean`, drained farewell,
-    /// and `None`, a fresh mount / same-epoch refresh with nothing to hand over, pay nothing).
+    /// A reclaim over a predecessor whose death was NOT proven clean may still have a conditional PUT
+    /// from that predecessor in flight -- `Fenced` and `UncleanObserved` are exactly the two
+    /// `MountPriorState`s with no such proof (`Clean`, drained farewell, and `None`, a fresh mount /
+    /// same-epoch refresh with nothing to hand over, are the proven ones).
     /// An EXHAUSTIVE switch, not a positive allowlist -- a future `MountPriorState`
     /// enumerator with no proof of clean death must fail the BUILD (a missing `-Wswitch` case), never
-    /// silently fall through to "clean" and under-seal.
+    /// silently fall through to "clean".
+    ///
+    /// THIS NO LONGER WAITS. The `materialization_grace_ms` (`T_mat`) sleep that used to sit here bought
+    /// one thing: time for that straggler to land (or exhaust its retries) BEFORE this incarnation began
+    /// trusting its recovery LISTINGS. Recovery does not trust listings any more. It walks each ref
+    /// stream arithmetically from `_ckpt` and closes every dead epoch with an in-band `EpochSeal` at
+    /// `{E, T+1}`, written as a conditional create -- so the straggler's own conditional create loses to
+    /// an occupied slot no matter when it arrives, and a wait can only make startup slower, never safer.
+    /// What survives is the CLASSIFICATION and saying it out loud: an unclean predecessor is worth an
+    /// operator-visible line, and the exhaustive switch is worth keeping as the build-time guard.
     bool unclean_reclaim = false;
     switch (claimed_prior)
     {
@@ -720,32 +728,33 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
     }
     if (unclean_reclaim)
     {
-        store->mount_runtime.setUncleanEpochBoundarySeenAt(writer_epoch);
-        const uint64_t t_mat = store->config.materialization_grace_ms;
         LOG_INFO(getLogger("CasPool"),
-            "Content-addressed mount {} follows an unclean predecessor; waiting {} ms "
-            "(materialization grace) for the store to finalize or drop its accepted "
-            "requests before trusting recovery listings", srid, t_mat);
-        store->mount_runtime.waitSleep(t_mat);
+            "Content-addressed mount {} follows a predecessor whose death was not proven clean "
+            "(writer_epoch {}). Opening without a grace period: a still-in-flight conditional PUT from "
+            "that predecessor is fenced by the recovery seal, whenever it arrives.", srid, writer_epoch);
     }
 
     /// Arm the local write fence: cache (uuid, epoch) and set the boottime deadline at the claim
-    /// attempt's anchor + ttl (NOT `bootMsNow()` here -- the materialization grace above can run
-    /// unboundedly long, and arming from the post-grace instant would authorize mutations under a
-    /// deadline the durable lease never actually backs). From here ordinary ref mutations
-    /// (appendRefOps) are fence-gated via mayMutate.
+    /// attempt's anchor + ttl (NOT `bootMsNow()` here -- arming from a post-I/O instant would authorize
+    /// mutations under a deadline the durable lease never actually backs). From here ordinary ref
+    /// mutations (appendRefOps) are fence-gated via mayMutate.
     const uint64_t ttl_ms_u = static_cast<uint64_t>(store->config.mount_lease_ttl_ms.count());
     if (store->bootMsNow() >= claim_anchor_boot_ms + ttl_ms_u)
     {
-        /// The materialization grace consumed the lease TTL: the claim's anchor can no longer
-        /// authorize an armed fence (a successor may have legally started reclaiming). Re-anchor
-        /// with ONE fresh conditional lease write -- it fails closed (Phase A classification) if
-        /// anything took the slot meanwhile -- and arm from the new attempt's anchor (rev.4
-        /// Phase B, round-3 finding 2).
+        /// The claim path outlived the lease TTL: its anchor can no longer authorize an armed fence (a
+        /// successor may have legally started reclaiming). Re-anchor with ONE fresh conditional lease
+        /// write -- it fails closed (Phase A classification) if anything took the slot meanwhile -- and
+        /// arm from the new attempt's anchor (rev.4 Phase B, round-3 finding 2).
+        ///
+        /// The unbounded operator-configured wait this guard was written for (`T_mat`) is gone, so
+        /// reaching it now means the CLAIM ITSELF -- `keeperStart`'s GET+CAS -- outran the whole lease
+        /// TTL, which `validateCasRequestBudget` already refuses to configure. It stays because a stalled
+        /// socket can still outlive a budget, and its recovery is one conditional write that fails closed;
+        /// it is LOUD rather than fatal because a slow open under a healthy protocol is not a reason to
+        /// refuse to start.
         LOG_WARNING(getLogger("CasPool"),
-            "Content-addressed mount {}: materialization grace ({} ms) consumed the lease TTL "
-            "({} ms); re-writing the lease before arming the write fence", srid,
-            store->config.materialization_grace_ms, ttl_ms_u);
+            "Content-addressed mount {}: the mount claim consumed the lease TTL ({} ms) before the write "
+            "fence could be armed; re-writing the lease first", srid, ttl_ms_u);
         claim_anchor_boot_ms = store->bootMsNow();
         store->mount_runtime.keeperRenewOnce();
     }
@@ -1072,18 +1081,21 @@ bool Pool::tryRemountOnce()
             return false;
         }
 
-        /// pay `materialization_grace_ms` only when this incarnation's
-        /// own ref lanes did NOT provably settle before the fence tripped -- an unresolved (still-wedged)
-        /// ref-log conditional `PUT` from the dying epoch could still land after recovery starts trusting
-        /// its listings. The common case (no in-flight `PUT` when the fence tripped) skips the wait.
-        if (!ref_ledger.refLanesSettledForRemount())
-        {
-            mount_runtime.setUncleanEpochBoundarySeenAt(writer_epoch);
-            LOG_INFO(getLogger("CasPool"),
-                "Self-remount of content-addressed mount {} with an unresolved ref-log PUT; waiting {} ms "
-                "(materialization grace) before re-listing", srid, config.materialization_grace_ms);
-            mount_runtime.waitSleep(config.materialization_grace_ms);
-        }
+        /// NO WAIT HERE, AND THE ASSERT IS WHAT REPLACES IT. This used to pay `materialization_grace_ms`
+        /// whenever this incarnation's own ref lanes had not provably settled before the fence tripped:
+        /// an unresolved (still-wedged) ref-log conditional `PUT` from the dying epoch could otherwise
+        /// land after recovery began trusting its listings. Recovery no longer trusts listings — it walks
+        /// arithmetically and closes every epoch below the live one with an in-band `EpochSeal` at
+        /// `{E, T+1}`, so the wedged `PUT` loses its own conditional create to that seal and the wait
+        /// bought nothing but latency on every fence recovery.
+        ///
+        /// That replacement has ONE precondition, and it is this one: the incarnation we are about to
+        /// install must outrank the dying one. If the epoch did not strictly advance, the straggler's
+        /// slot is not "below the live epoch", nothing seals it, and the hole the wait used to paper over
+        /// reopens silently. `allocateWriterEpoch` mints from a durable monotone counter, so this holds by
+        /// construction — which is exactly why it is worth asserting rather than assuming: it fails the
+        /// build's own tests the moment someone reuses an epoch across a remount.
+        chassert(writer_epoch > mount_runtime.liveWriterEpoch());
 
         /// Swap the keeper for the new incarnation. The old keeper's renewal loop already stopped on
         /// its failed renew; never run its terminal op (the slot now belongs to the new claim).
@@ -1095,14 +1107,11 @@ bool Pool::tryRemountOnce()
         mount_runtime.installKeeper(our_uuid, writer_epoch, now_ms);
         /// Pre-I/O anchor of this remount's claim attempt (mirrors `mountWritable`'s
         /// `claim_anchor_boot_ms`, captured at the identical point -- right after `installKeeper`,
-        /// right before the keeper's own adopt write). No UNBOUNDED wait can land between this anchor
-        /// and the arm below, so no TTL-consumed redo is needed here: the anchor alone suffices (rev.4
-        /// Phase B, round-3 finding 2; the redo lives in `mountWritable`, whose materialization-grace
-        /// wait runs AFTER its own anchor -- on THIS path that (conditional) grace wait already ran
-        /// above, the `refLanesSettledForRemount` check, strictly BEFORE this anchor is taken).
+        /// right before the keeper's own adopt write). No wait can land between this anchor and the arm
+        /// below, so no TTL-consumed redo is needed here: the anchor alone suffices (rev.4 Phase B,
+        /// round-3 finding 2; the redo lives in `mountWritable`, which keeps it for a claim that stalls).
         /// `quiesceRefTablesForRemount` below IS a wait, but a bounded one -- bounded by the same
-        /// `cas_request_budget` that `validateCasRequestBudget` already guarantees fits under
-        /// `ttl_ms`, never an unbounded operator-configured wait like `materialization_grace_ms`.
+        /// `cas_request_budget` that `validateCasRequestBudget` already guarantees fits under `ttl_ms`.
         const uint64_t remount_anchor_boot_ms = mount_runtime.bootMsNow();
         mount_runtime.keeperStart();
 

@@ -525,7 +525,7 @@ TEST(CasHeartbeat, SuccessfulRenewExtendsTransientRetryDeadline)
 }
 
 /// Fence-not-rescue round follow-up #1: the redo site in `CasPool.cpp`'s `mountWritable` (the
-/// materialization-grace-consumed-the-TTL branch) calls `renewOnce` DIRECTLY -- never through
+/// claim-consumed-the-TTL branch) calls `renewOnce` DIRECTLY -- never through
 /// `onRenewSucceeded` (that hook is only ever invoked by `backgroundLoop`). Before this fix, only
 /// `onRenewSucceeded` refreshed `confirmed_deadline_ms`, so a direct `renewOnce` call left the wall
 /// deadline stale at the pre-redo anchor. A successful renewal must refresh the deadline regardless

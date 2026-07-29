@@ -110,7 +110,7 @@ TEST(CasGcRoundDefer, GraduationDueFalseOnAllZeroSummary)
         << "a summary not total over gc_shards is corrupt => fail-closed force-fold";
 }
 
-/// `preFoldRefScan`'s `changed_shards`: with the fold seal covering shard s at its current token, a quiescent pool reports
+/// `listRefPrefix`'s `changed_shards`: with the fold seal covering shard s at its current token, a quiescent pool reports
 /// 0; after one publish to a ref in shard s, it reports 1.
 TEST(CasGcRoundDefer, ChangedShardCountIsZeroWhenQuiescent)
 {
@@ -133,7 +133,7 @@ TEST(CasGcRoundDefer, ChangedShardCountIsZeroWhenQuiescent)
                                                          /// captures the shard's actual current token.
 
     const GcState quiescent_state = decodeGcState(backend->get(layout.gcStateKey())->bytes);
-    EXPECT_EQ(gc.preFoldRefScanForTest(quiescent_state).changed_shards, 0u)
+    EXPECT_EQ(gc.listRefPrefixForTest(quiescent_state).changed_shards, 0u)
         << "a quiescent shard (listed token == sealed token) must not count as changed";
 
     /// Publish a second ref into the SAME shard: its LISTED token now differs from what
@@ -143,7 +143,7 @@ TEST(CasGcRoundDefer, ChangedShardCountIsZeroWhenQuiescent)
     writeManifestRaw(*backend, layout, ns, r2, {blobEntryFor("b", UInt128(2))});
     publishCommittedTransition(*backend, layout, ns, "tbl2", std::nullopt, r2);
 
-    EXPECT_EQ(gc.preFoldRefScanForTest(quiescent_state).changed_shards, 1u)
+    EXPECT_EQ(gc.listRefPrefixForTest(quiescent_state).changed_shards, 1u)
         << "one shard whose token advanced since the sealed generation must count as changed";
 }
 
@@ -206,7 +206,7 @@ TEST(CasGcRoundDefer, IdleRoundDefersAndReadsNoGeneration)
 }
 
 /// The same idle-defer property under a sharded blob-target GC (gc_shards=2): graduationDue's loop
-/// over state.retired_refs and `preFoldRefScan`'s discovery must both settle to "nothing due" once
+/// over state.retired_refs and `listRefPrefix`'s discovery must both settle to "nothing due" once
 /// quiesced, regardless of how many gc-shards partition the retired bookkeeping.
 TEST(CasGcRoundDefer, IdleRoundDefersUnderShardedGc)
 {

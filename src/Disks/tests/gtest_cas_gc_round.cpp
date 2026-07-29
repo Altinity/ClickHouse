@@ -807,7 +807,7 @@ TEST(CasGcRound, RoundSummaryCountsManifestBodyDeletes)
 
 /// §0 introspection follow-up: `CasGcEnumerationPages` must not depend on the orphan-manifest sweep alone
 /// (`manifest_sweep_list_budget_keys` zeroed below disables that pass entirely). The mandatory per-round
-/// `cas/refs/` scans -- `preFoldRefScan`'s pre-fold DEFER signal and `Gc::fold`'s Step-1 global
+/// `cas/refs/` scans -- `listRefPrefix`'s pre-fold DEFER signal and `Gc::fold`'s Step-1 global
 /// enumeration, both unconditional every round -- must still land at least one page each round.
 TEST(CasGcRound, EnumerationPagesCountedEvenWithSweepBudgetZeroed)
 {
@@ -823,7 +823,7 @@ TEST(CasGcRound, EnumerationPagesCountedEvenWithSweepBudgetZeroed)
     const auto pages_before = ProfileEvents::global_counters[ProfileEvents::CasGcEnumerationPages].load();
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
     EXPECT_GE(ProfileEvents::global_counters[ProfileEvents::CasGcEnumerationPages].load() - pages_before, 1)
-        << "the round's own cas/refs/ scans (preFoldRefScan + fold) must count pages independent of "
+        << "the round's own cas/refs/ scans (one enumeration, in defer_decision) must count pages independent of "
            "the orphan sweep";
 }
 

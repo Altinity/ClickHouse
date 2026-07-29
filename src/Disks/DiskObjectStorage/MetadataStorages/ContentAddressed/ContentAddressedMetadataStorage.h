@@ -594,8 +594,6 @@ private:
     const bool blob_hash_allow_new;
     /// Per-disk `<skip_access_check>` policy passed to `Cas::PoolConfig`.
     const bool skip_access_check;
-    /// Grace period for materialization after an unclean predecessor, passed to `Cas::PoolConfig`.
-    const uint64_t materialization_grace_ms;
     /// Policy controlling when retained part-folder views revalidate their manifest body.
     const Cas::PartFolderValidate part_folder_validate;
     /// Set by the mount-time conditional-copy capability probe — not const because the result is

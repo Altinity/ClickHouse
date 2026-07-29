@@ -68,7 +68,6 @@ namespace ContentAddressedSetting
     extern const ContentAddressedSettingsUInt64 gc_meta_pool_size;
     extern const ContentAddressedSettingsBool blob_hash_allow_new;
     extern const ContentAddressedSettingsBool skip_access_check;
-    extern const ContentAddressedSettingsUInt64 materialization_grace_ms;
 }
 
 namespace
@@ -284,7 +283,6 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , blob_hash_algo(settings_.blobHashAlgo())
     , blob_hash_allow_new(settings_[ContentAddressedSetting::blob_hash_allow_new].value)
     , skip_access_check(settings_[ContentAddressedSetting::skip_access_check].value)
-    , materialization_grace_ms(settings_[ContentAddressedSetting::materialization_grace_ms].value)
     , part_folder_validate(settings_.partFolderValidate())
 {
 }
@@ -737,7 +735,6 @@ ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openP
     pool_config.manifest_sweep_list_budget_keys = manifest_sweep_list_budget_keys;
     pool_config.manifest_sweep_delete_budget_keys = manifest_sweep_delete_budget_keys;
     pool_config.gc_meta_pool_size = gc_meta_pool_size;
-    pool_config.materialization_grace_ms = materialization_grace_ms;
     pool_config.event_sink = makeCasEventSink();
 
     PoolView view;

@@ -106,6 +106,17 @@ struct PoolConfig
     /// Liveness bound for batching: force a FOLD after this many consecutive DEFER rounds even below
     /// the threshold. Inert at gc_fold_threshold == 1 (an idle defer has nothing to fold). Default 8.
     uint64_t gc_fold_max_defer_rounds = 8;
+    /// Deterministic sampling cadence of the ref-prefix store-quality detector ("probe A",
+    /// `Gc::sampleRefListQuality`): a folding round samples when `round % gc_probe_a_period == 0`.
+    /// 0 disables the detector entirely.
+    ///
+    /// SAMPLED because the comparison is no longer free. The detector's whole method is to enumerate
+    /// `cas/refs/` a SECOND time and compare, and since the round now enumerates that prefix exactly
+    /// once for its own purposes, that second LIST is a cost the detector alone owes. It buys a reading
+    /// about the STORE, never about this round's correctness — the ref intake reads by exact key and is
+    /// immune to what any listing omits — so paying it every round would be paying a full prefix LIST
+    /// for a diagnostic nothing downstream consumes.
+    uint64_t gc_probe_a_period = 16;
     /// gc-rebuild: max in-memory edges per gc-shard batch during rebuildBaseline
     /// (~32 B each => default ~256 MB); each full batch folds into the next attempt number with the
     /// previous attempt's runs as priors, so memory is O(budget), never O(edges).
@@ -150,20 +161,17 @@ struct PoolConfig
     /// boot clock (`Pool::bootMs`); injected by tests to drive the fence deadline deterministically.
     std::function<uint64_t()> boot_ms_fn = {};
 
-    /// the CONDITIONAL
-    /// wait `Pool::open` pays after reclaiming a mount whose predecessor's death was NOT proven clean
-    /// (`MountClaimResult::prior` is `Fenced` or `UncleanObserved`) -- long enough for a still-in-flight
-    /// conditional PUT from that predecessor to either land or be dropped by its own exhausted retry
-    /// budget before this incarnation trusts its recovery listings. A `Clean` farewell (drained
-    /// dtor) already proves no such write can still be in flight, so it pays nothing; lowering this
-    /// value increases the risk that a late-materializing predecessor write is dropped or observed
-    /// inconsistently by a reader racing this incarnation's early mutations.
-    uint64_t materialization_grace_ms = 30000;   /// T_mat; lowering increases the risk that a
-                                                  /// late-materializing predecessor write is dropped
-    /// Test hook for open/remount waits: `Pool::waitSleep` -- the mount-claim observation loop's poll
-    /// AND the `materialization_grace_ms` wait above -- routes through this function when set instead
-    /// of a real `std::this_thread::sleep_for`, so a test observes every wait without actually
-    /// blocking. Empty (the production default) sleeps for real.
+    /// Test hook for open/remount waits: `Pool::waitSleep` -- the mount-claim observation loop's poll --
+    /// routes through this function when set instead of a real `std::this_thread::sleep_for`, so a test
+    /// observes every wait without actually blocking. Empty (the production default) sleeps for real.
+    ///
+    /// That poll is now the ONLY wait either path can block on. The post-reclaim materialization grace
+    /// (`T_mat`) that used to sit beside it is gone: it existed so a straggler conditional `PUT` from a
+    /// dying epoch would land (or exhaust its retries) before the successor started trusting its recovery
+    /// LISTINGS, and recovery does not trust listings any more -- it walks the stream arithmetically and
+    /// closes every dead epoch with an in-band `EpochSeal` at `{E, T+1}`, written as a conditional
+    /// create. The straggler's own conditional create then LOSES against that occupied slot, whenever it
+    /// arrives. Waiting for a race that the protocol already decides is not caution, it is latency.
     std::function<void(uint64_t)> wait_sleep_fn = {};   /// test hook for open/remount waits
 
     /// a table becomes a publish candidate once its retained
@@ -171,9 +179,9 @@ struct PoolConfig
     /// either threshold (their count / the sum of their encoded bytes), or right after recovery replays
     /// a tail already above one (the mount-time trigger). Publication is background and never blocks an
     /// append (see `Pool::maybeScheduleSnapshotPublish`). The grace-age holdback this trigger used to
-    /// apply is gone by design: the recovery-seal plus the
-    /// materialization wait (`materialization_grace_ms` above) already make a late-arriving predecessor
-    /// write born-covered for every observer, so a young txn has nothing left to wait out.
+    /// apply is gone by design: the recovery seal decides a late-arriving predecessor write outright --
+    /// its conditional create loses to the seal already occupying the slot -- so a young txn has nothing
+    /// left to wait out.
     /// The count default trades write-side PUT volume against read-side cold-fold cost: every publish
     /// re-encodes and PUTs the FULL snapshot, so a low threshold under sustained load degenerates into
     /// a near-continuous full-snapshot PUT stream, while on the read side a cold fold pays one GET per
@@ -236,7 +244,6 @@ struct PoolConfig
         return MountConfig{
             .mount_lease_ttl_ms = mount_lease_ttl_ms,
             .mount_renew_period = mount_renew_period,
-            .materialization_grace_ms = materialization_grace_ms,
             .background_watermark = background_watermark,
             .boot_ms_fn = boot_ms_fn,
             .wait_sleep_fn = wait_sleep_fn,
@@ -637,13 +644,6 @@ public:
     /// Test seam: latch `remount_shutting_down` exactly as `~Pool()` does at its top, WITHOUT tearing
     /// the Pool down, so a test can assert `scheduleRemount` refuses to spawn once teardown has begun.
     void beginShutdownForTest();
-
-    /// True once ANY writable `open`/self-remount of this incarnation's lifetime reclaimed a mount over
-    /// an unclean predecessor (`MountPriorState::Fenced` or `UncleanObserved` -- see
-    /// `materialization_grace_ms`). This is a lifetime diagnostic signal. The seal-gating decision does
-    /// NOT use it: `unclean_epoch_boundary_seen_at` is a per-epoch high-water mark, not a forever-sticky
-    /// bool. This stays as the test/observability seam.
-    bool uncleanEpochBoundarySeenForTest() const { return mount_runtime.uncleanEpochBoundarySeenForTest(); }
 
 
     /// Known-present blob-hash cache. A HINT only — correctness never

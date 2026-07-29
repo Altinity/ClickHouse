@@ -721,11 +721,10 @@ TEST(CasMountStartup, StaleSelfMountReclaimedAfterWait)
 
     /// A restart of the SAME server (same uuid) must NOT abort: it waits out the stale lease (<= ~300ms)
     /// and reclaims the mount, coming up with a strictly higher durable writer_epoch. The replayed live
-    /// body hides A's clean farewell, so the reclaim is
-    /// `MountPriorState::UncleanObserved`, so `Pool::open` (rev.6 Task 6) ALSO pays a
-    /// `materialization_grace_ms` wait after the observation window; inject a fake `boot_ms_fn` +
-    /// `wait_sleep_fn` (mirroring `CasMountTmat.UncleanOpenWaitsMaterializationGrace`) so BOTH waits
-    /// resolve instantly instead of blocking this test on ~30 real seconds.
+    /// body hides A's clean farewell, so the reclaim is `MountPriorState::UncleanObserved`. Inject a
+    /// fake `boot_ms_fn` + `wait_sleep_fn` (mirroring
+    /// `CasMountOpenWaits.UncleanOpenPaysOnlyTheObservationWindow`) so the observation window resolves
+    /// instantly instead of blocking this test on real time.
     uint64_t a2_fake_boot = 0;
     PoolPtr a2;
     EXPECT_NO_THROW(

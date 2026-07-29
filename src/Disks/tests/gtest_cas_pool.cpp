@@ -1179,10 +1179,9 @@ TEST(CasPoolMountFence, OpenRecoversFromFenceInAdoptWindowWithFreshEpoch)
     fencing->fence_key = layout.mountKey("test");
 
     /// The retry that recovers from the fence reclaims a same-uuid, different-epoch, `gc_fenced` body
-    /// -> `MountPriorState::Fenced` (rev.6 Task 4/6) -> `Pool::open` pays `materialization_grace_ms`
-    /// (zero observation polling either way: a fenced prior is reclaimed on the first attempt). Inject
-    /// a no-op `wait_sleep_fn` (+ a fake `boot_ms_fn`, matching `CasMountTmat.FencedPriorPaysOnlyTmat`)
-    /// so the wait resolves instantly instead of blocking this test on ~30 real seconds.
+    /// -> `MountPriorState::Fenced` (a fenced prior is reclaimed on the first attempt, with no
+    /// observation polling -- see `CasMountOpenWaits.FencedPriorReclaimsWithoutAnyWait`). The injected
+    /// `boot_ms_fn`/`wait_sleep_fn` below keep this test off the real clock regardless.
     uint64_t fake_boot = 0;
     DB::Cas::PoolPtr store;
     ASSERT_NO_THROW(
@@ -1531,9 +1530,17 @@ TEST(CasPoolShutdown, UnresolvedWedgeSkipsFarewell)
     EXPECT_EQ(claim.kind, MountClaimResult::LiveDoubleStart);
 }
 
-/// ==== rev.6 Task 6: materialization_grace_ms (T_mat) wait on unclean mount open ====
+/// ==== What a writable mount open may block on ====
+///
+/// Exactly one thing: the token-stability observation window, and only when the predecessor's death
+/// has to be OBSERVED rather than certified. The post-reclaim materialization grace (`T_mat`) that
+/// used to run beside it is retired -- it existed so a straggler conditional `PUT` from the dying
+/// epoch would settle before the successor trusted its recovery LISTINGS, and recovery does not trust
+/// listings any more (it walks arithmetically and fences the straggler with an in-band `EpochSeal`).
+/// These three tests pin the surviving shape from all three directions: observed-dead, certified-dead,
+/// and cleanly departed.
 
-TEST(CasMountTmat, UncleanOpenWaitsMaterializationGrace)
+TEST(CasMountOpenWaits, UncleanOpenPaysOnlyTheObservationWindow)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout l{"p"};
@@ -1565,23 +1572,25 @@ TEST(CasMountTmat, UncleanOpenWaitsMaterializationGrace)
             .mount_renew_period = std::chrono::milliseconds(100),
             .cas_request_budget = tiny_budget,
             .boot_ms_fn = [&] { return fake_boot; },
-            .materialization_grace_ms = 30000,
             .wait_sleep_fn = [&](uint64_t ms) { fake_boot += ms; waits.push_back(ms); },
         }));
     ASSERT_TRUE(store);
 
-    /// The token-stability observation window (>= the 500ms ttl) AND a separate, distinct 30000ms T_mat
-    /// wait must both have been recorded.
-    EXPECT_NE(std::find(waits.begin(), waits.end(), uint64_t{30000}), waits.end())
-        << "the materialization_grace_ms wait must be among the recorded waits";
+    /// The token-stability observation window (>= the 500ms ttl) is paid, because this predecessor's
+    /// death was never certified -- only observed.
     uint64_t total = 0;
     for (uint64_t w : waits)
         total += w;
-    EXPECT_GE(total - 30000, 500u) << "the observation window must ALSO have been paid, on top of T_mat";
-    EXPECT_TRUE(store->uncleanEpochBoundarySeenForTest());
+    EXPECT_GE(total, 500u) << "the observation window must have been paid";
+    /// And NOTHING is paid on top of it. Every recorded wait is a poll of that window, bounded by the
+    /// lease TTL; a wait longer than the whole window can only be a reintroduced grace period.
+    for (uint64_t w : waits)
+        EXPECT_LE(w, 500u)
+            << "an unclean reclaim must not block on any wait beyond the observation poll -- the "
+               "straggler it used to wait out is fenced by the recovery seal instead";
 }
 
-TEST(CasMountTmat, CleanOpenSkipsAllWaits)
+TEST(CasMountOpenWaits, CleanOpenSkipsAllWaits)
 {
     auto b = std::make_shared<InMemoryBackend>();
     /// Predecessor released cleanly (drain + farewell from Task 5): open, then reset() drives ~Pool(),
@@ -1595,17 +1604,15 @@ TEST(CasMountTmat, CleanOpenSkipsAllWaits)
     ASSERT_NO_THROW(
         successor = Pool::open(b, PoolConfig{
             .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "test",
-            .materialization_grace_ms = 30000,
             .wait_sleep_fn = [&](uint64_t ms) { waits.push_back(ms); },
         }));
     ASSERT_TRUE(successor);
 
     EXPECT_TRUE(waits.empty())
-        << "a clean farewell (Task 5) needs neither the observation window nor T_mat";
-    EXPECT_FALSE(successor->uncleanEpochBoundarySeenForTest());
+        << "a clean farewell (Task 5) needs no observation window";
 }
 
-TEST(CasMountTmat, FencedPriorPaysOnlyTmat)
+TEST(CasMountOpenWaits, FencedPriorReclaimsWithoutAnyWait)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout l{"p"};
@@ -1619,7 +1626,7 @@ TEST(CasMountTmat, FencedPriorPaysOnlyTmat)
     /// fence-out does (preserve the body, gc_fenced = true, seq + 1, token-guarded).
     fenceOutMount(*b, l.mountKey("test"));
 
-    /// See UncleanOpenWaitsMaterializationGrace above: a 500ms TTL needs a scaled-down budget too.
+    /// See UncleanOpenPaysOnlyTheObservationWindow above: a 500ms TTL needs a scaled-down budget too.
     const CasRequestBudget tiny_budget{
         .attempt_timeout_ms = 50, .operation_deadline_ms = 500, .max_attempts = 1, .lease_safety_margin_ms = 50};
 
@@ -1632,46 +1639,57 @@ TEST(CasMountTmat, FencedPriorPaysOnlyTmat)
             .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "test",
             .mount_lease_ttl_ms = std::chrono::milliseconds(500),
             .cas_request_budget = tiny_budget,
-            .materialization_grace_ms = 30000,
             .wait_sleep_fn = [&](uint64_t ms) { waits.push_back(ms); },
         }));
     ASSERT_TRUE(store);
 
     /// A GC-fenced prior is a terminal, already-threshold-gated certificate of death -- reclaimed on the
-    /// FIRST attempt, no observation polling -- so exactly one wait (T_mat) is recorded.
-    ASSERT_EQ(waits.size(), 1u);
-    EXPECT_EQ(waits[0], 30000u);
-    EXPECT_TRUE(store->uncleanEpochBoundarySeenForTest());
+    /// FIRST attempt, with no observation polling. It is also an UNCLEAN prior, which used to mean it
+    /// paid the materialization grace; nothing is owed now, so this open blocks on nothing at all.
+    EXPECT_TRUE(waits.empty())
+        << "a certified-dead predecessor needs neither the observation window nor any grace period";
 }
 
 namespace
 {
-/// Counts putOverwrite calls on the MOUNT key that happen at-or-after the materialization grace
-/// (the flag is flipped by the wait_sleep_fn hook below) — observable proof of the Phase B redo.
-class MountWriteAfterGraceCountingBackend final : public DB::Cas::InMemoryBackend
+/// Stalls the CLAIM ITSELF past the lease TTL, and counts what the open writes afterwards.
+///
+/// The mount key is written twice before the write fence arms: once by `claimMount`'s reclaim, then
+/// once by the keeper's adopt -- and the fence's anchor is taken BETWEEN them. So advancing the
+/// injected boot clock on the SECOND write models exactly the thing the Phase B redo exists for: the
+/// claim's own I/O outliving the lease it is about to arm a fence under. (This used to be modelled by
+/// a materialization grace long enough to consume the TTL; that wait is retired, and the guard it
+/// motivated is not -- a stalled socket can still outlive a validated request budget.)
+class StalledMountClaimBackend final : public DB::Cas::InMemoryBackend
 {
 public:
     String mount_key;
-    std::atomic<bool> grace_ran{false};
-    std::atomic<int> mount_writes_after_grace{0};
+    std::function<void()> on_second_mount_write;
+    std::atomic<int> mount_writes{0};
+    std::atomic<int> mount_writes_after_stall{0};
 
     DB::Cas::PutResult putOverwrite(const String & k, const String & b, const DB::Cas::Token & e,
                                     const DB::Cas::ObjectMeta & m) override
     {
-        if (grace_ran.load() && k == mount_key)
-            ++mount_writes_after_grace;
+        if (k == mount_key)
+        {
+            const int n = ++mount_writes;
+            if (n == 2 && on_second_mount_write)
+                on_second_mount_write();
+            else if (n > 2)
+                ++mount_writes_after_stall;
+        }
         return InMemoryBackend::putOverwrite(k, b, e, m);
     }
 };
 }
 
-/// Phase B startup-arm (spec rev.4, codex round-3 finding 2): an unclean predecessor triggers the
-/// materialization grace; a grace that consumed the lease TTL must force ONE fresh conditional
-/// lease write before arming — the fence must never arm from a pre-grace anchor that has already
-/// expired (a successor could have legally reclaimed during the wait).
-TEST(CasPool, StartupArmRedoesLeaseWriteWhenGraceConsumesTtl)
+/// Phase B startup-arm (spec rev.4, codex round-3 finding 2): a claim path that consumed the lease TTL
+/// must force ONE fresh conditional lease write before arming — the fence must never arm from an anchor
+/// that has already expired (a successor could have legally reclaimed meanwhile).
+TEST(CasPool, StartupArmRedoesLeaseWriteWhenTheClaimConsumesTtl)
 {
-    auto backend = std::make_shared<MountWriteAfterGraceCountingBackend>();
+    auto backend = std::make_shared<StalledMountClaimBackend>();
     DB::Cas::Layout layout("pool");
     const String srid = "s";
     const DB::UInt128 uuid(0x42);
@@ -1681,8 +1699,9 @@ TEST(CasPool, StartupArmRedoesLeaseWriteWhenGraceConsumesTtl)
     /// `FencedPriorPaysOnlyTmat`'s convention). The durable epoch object seeded a few lines below
     /// carries `next_writer_epoch = 8`, so THIS pool's own first-allocated `writer_epoch` is 8 --
     /// non-colliding with the seeded epoch-7 prior by construction. With no collision the first
-    /// (and only) claim attempt reclaims directly with MountPriorState::Fenced -> unclean_reclaim =
-    /// true -> the grace wait runs, with no silent FencedSelf fence-recovery detour to account for.
+    /// (and only) claim attempt reclaims directly with MountPriorState::Fenced, with no silent
+    /// FencedSelf fence-recovery detour to account for -- so the mount key is written exactly twice
+    /// before the arm, which is what the stall hook counts on.
     {
         DB::Cas::MountLease prior;
         prior.server_uuid = uuid;
@@ -1698,7 +1717,7 @@ TEST(CasPool, StartupArmRedoesLeaseWriteWhenGraceConsumesTtl)
     backend->putIfAbsent(layout.epochKey(srid), DB::Cas::encodeServerEpoch(DB::Cas::ServerEpoch{.next_writer_epoch = 8}));
     /// The mount-lease seed above makes the pool prefix non-empty before `Pool::open` runs its own
     /// bootstrap check; establish `_pool_meta` first (Task 7 zero-write bootstrap), exactly as the
-    /// other pre-seeded-mount tests in this file do (e.g. `FencedPriorPaysOnlyTmat`).
+    /// other pre-seeded-mount tests in this file do (e.g. `FencedPriorReclaimsWithoutAnyWait`).
     DB::Cas::tests::seedPoolMetaForRestart(*backend, "pool");
 
     uint64_t fake_boot_ms = 10'000;
@@ -1707,25 +1726,33 @@ TEST(CasPool, StartupArmRedoesLeaseWriteWhenGraceConsumesTtl)
     cfg.server_id = uuid;
     cfg.server_root_id = srid;
     cfg.mount_lease_ttl_ms = std::chrono::milliseconds(30'000);
-    cfg.materialization_grace_ms = 40'000;   /// grace > TTL -> the redo must trigger
     cfg.boot_ms_fn = [&] { return fake_boot_ms; };
-    cfg.wait_sleep_fn = [&](uint64_t ms)
-    {
-        fake_boot_ms += ms;               /// the grace advances the fake boot clock past the TTL
-        backend->grace_ran.store(true);
-    };
+    /// The keeper's adopt write stalls for 40 s of boot clock -- past the 30 s TTL the anchor a few
+    /// microseconds earlier was taken against.
+    backend->on_second_mount_write = [&] { fake_boot_ms += 40'000; };
 
     auto store = DB::Cas::Pool::open(backend, cfg);
     ASSERT_NE(store, nullptr);
 
-    EXPECT_EQ(backend->mount_writes_after_grace.load(), 1)
-        << "a TTL-consuming grace must be followed by exactly ONE fresh conditional lease write "
+    ASSERT_EQ(backend->mount_writes.load(), 3)
+        << "the fixture assumes exactly two mount writes before the redo (the reclaim and the keeper's "
+           "adopt, with the fence anchor between them); a different sequence would make the stall land "
+           "somewhere else and this test would stop testing the redo";
+    EXPECT_EQ(backend->mount_writes_after_stall.load(), 1)
+        << "a TTL-consuming claim must be followed by exactly ONE fresh conditional lease write "
            "(the re-anchoring redo) before the write fence arms";
 }
 
-/// ==== rev.6 Task 7: conditional T_mat on self-remount (`refLanesSettledForRemount`) ====
+/// ==== What a self-remount may block on ====
+///
+/// Nothing an operator configures. The remount used to consult `refLanesSettledForRemount` and pay the
+/// materialization grace whenever a ref lane still held an undecided `PUT`; both are retired, because
+/// the undecided `PUT` is settled by the protocol rather than waited out — recovery closes the dead
+/// epoch with an in-band `EpochSeal` written as a conditional create, and the straggler's own create
+/// loses to it. `gtest_cas_retirement_sweep.cpp` proves that conflict directly; these two pin that the
+/// wait is gone from both the drained and the still-wedged path.
 
-TEST(CasRemountTmat, DrainedRemountSkipsGrace)
+TEST(CasRemountWaits, DrainedRemountPaysNoWait)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     uint64_t fake_boot = 1'000'000;
@@ -1734,7 +1761,6 @@ TEST(CasRemountTmat, DrainedRemountSkipsGrace)
         .pool_prefix = "p", .server_root_id = "test",
         .mount_lease_ttl_ms = std::chrono::milliseconds(30000),
         .boot_ms_fn = [&] { return fake_boot; },
-        .materialization_grace_ms = 30000,
         .wait_sleep_fn = [&](uint64_t ms) { fake_boot += ms; waits.push_back(ms); },
     });
     ASSERT_TRUE(store);
@@ -1746,16 +1772,14 @@ TEST(CasRemountTmat, DrainedRemountSkipsGrace)
     fake_boot += 30001;
     fenceOutMount(*backend, store->layout().mountKey("test"));
 
-    /// No in-flight ref-log PUT: `refLanesSettledForRemount` finds an empty ref-table cache and reports
-    /// settled immediately, so no T_mat is owed.
+    /// No in-flight ref-log PUT at all -- the easy direction.
     ASSERT_TRUE(store->tryRemountOnce());
 
     EXPECT_TRUE(waits.empty())
-        << "a drained self-remount (no unresolved ref-log PUT) must pay no materialization-grace wait";
-    EXPECT_FALSE(store->uncleanEpochBoundarySeenForTest());
+        << "a drained self-remount must pay no wait";
 }
 
-TEST(CasRemountTmat, UnresolvedWedgePaysGraceAndMarksBoundaryUnclean)
+TEST(CasRemountWaits, UnresolvedWedgeRemountPaysNoWaitEither)
 {
     CasRequestBudget budget;
     budget.max_attempts = 1;
@@ -1771,7 +1795,6 @@ TEST(CasRemountTmat, UnresolvedWedgePaysGraceAndMarksBoundaryUnclean)
         .mount_lease_ttl_ms = std::chrono::milliseconds(30000),
         .cas_request_budget = budget,
         .boot_ms_fn = [&] { return fake_boot; },
-        .materialization_grace_ms = 30000,
         .wait_sleep_fn = [&](uint64_t ms) { fake_boot += ms; waits.push_back(ms); },
     });
     ASSERT_TRUE(store);
@@ -1793,13 +1816,15 @@ TEST(CasRemountTmat, UnresolvedWedgePaysGraceAndMarksBoundaryUnclean)
     fake_boot += 30001;
     fenceOutMount(*backend, store->layout().mountKey("test"));
 
-    /// The wedge left behind by the failed `dropRef` above makes `refLanesSettledForRemount` report
-    /// unsettled: exactly one materialization-grace wait must be recorded, and the boundary is unclean.
+    /// THE HARD DIRECTION, and the one the retired wait existed for: a ref lane that still holds an
+    /// UNDECIDED conditional PUT when the fence trips. It used to buy a 30 s grace. It buys nothing now
+    /// -- the remount proceeds straight through, and the undecided PUT is decided by the seal the next
+    /// recovery writes into its slot.
     ASSERT_TRUE(store->tryRemountOnce());
 
-    ASSERT_EQ(waits.size(), 1u);
-    EXPECT_EQ(waits[0], 30000u);
-    EXPECT_TRUE(store->uncleanEpochBoundarySeenForTest());
+    EXPECT_TRUE(waits.empty())
+        << "an unresolved ref-lane wedge must not make the remount block: the straggler it describes is "
+           "fenced by the recovery seal, not waited out";
 }
 
 /// Sealing is decided by ARITHMETIC -- `epoch < live_epoch` -- and by nothing else. This test used to
@@ -1814,7 +1839,7 @@ TEST(CasRemountTmat, UnresolvedWedgePaysGraceAndMarksBoundaryUnclean)
 /// dead epoch below the live one, however its predecessors died, and this test pins that plus the two
 /// things that must still be true: the seals land IN-BAND (at log keys, at the slot a straggler would
 /// have taken) and no synthetic seal SNAPSHOT is written anywhere.
-TEST(CasRemountTmat, ALateTouchedTableClosesEveryDeadEpochInBandHoweverItsPredecessorsDied)
+TEST(CasRemountWaits, ALateTouchedTableClosesEveryDeadEpochInBandHoweverItsPredecessorsDied)
 {
     CasRequestBudget budget;
     budget.max_attempts = 1;
@@ -1829,7 +1854,6 @@ TEST(CasRemountTmat, ALateTouchedTableClosesEveryDeadEpochInBandHoweverItsPredec
         .mount_lease_ttl_ms = std::chrono::milliseconds(30000),
         .cas_request_budget = budget,
         .boot_ms_fn = [&] { return fake_boot; },
-        .materialization_grace_ms = 30000,
         .wait_sleep_fn = [&](uint64_t ms) { fake_boot += ms; },
     });
     ASSERT_TRUE(store);
@@ -1845,7 +1869,7 @@ TEST(CasRemountTmat, ALateTouchedTableClosesEveryDeadEpochInBandHoweverItsPredec
     publishPart(store, ns2.string(), "y", "payload-b");
 
     /// Force ns1's ref-log append into the Unresolved/wedge outcome (mirrors
-    /// `UnresolvedWedgePaysGraceAndMarksBoundaryUnclean` above).
+    /// `UnresolvedWedgeRemountPaysNoWaitEither` above).
     backend->fault_key_substr = layout.refsNamespacePrefix(ns1) + "_log/";
     backend->fault_count = 1;
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns1, "x"); });
@@ -1856,10 +1880,9 @@ TEST(CasRemountTmat, ALateTouchedTableClosesEveryDeadEpochInBandHoweverItsPredec
     fenceOutMount(*backend, store->layout().mountKey("test"));
     ASSERT_TRUE(store->tryRemountOnce());
     ASSERT_EQ(store->liveWriterEpoch(), 2u);
-    ASSERT_TRUE(store->uncleanEpochBoundarySeenForTest());
 
     /// Self-remount #2: CLEAN (no wedge left behind -- `quiesceRefTablesForRemount` already cleared the
-    /// cache, so `refLanesSettledForRemount` finds an empty ref-table cache). Epoch 2 -> 3.
+    /// cache). Epoch 2 -> 3.
     fake_boot += 30001;
     fenceOutMount(*backend, store->layout().mountKey("test"));
     ASSERT_TRUE(store->tryRemountOnce());

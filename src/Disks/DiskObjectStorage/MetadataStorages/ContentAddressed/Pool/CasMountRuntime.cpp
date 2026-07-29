@@ -273,11 +273,6 @@ void CasMountRuntime::keeperStopBackground()
     mount_keeper->stopBackground();
 }
 
-void CasMountRuntime::setUncleanEpochBoundarySeenAt(uint64_t v)
-{
-    unclean_epoch_boundary_seen_at.store(v, std::memory_order_relaxed);
-}
-
 bool CasMountRuntime::isVanished() const
 {
     const PoolLifecycle s = lifecycle();

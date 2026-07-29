@@ -52,7 +52,6 @@ struct MountConfig
 {
     std::chrono::milliseconds mount_lease_ttl_ms{30000};
     std::chrono::milliseconds mount_renew_period{10000};
-    uint64_t materialization_grace_ms = 30000;
     /// When false, tests drive `renewWatermarkOnce` explicitly. In production this flag enables both
     /// the merged mount-lease/build-watermark heartbeat and self-remount recovery.
     bool background_watermark = false;
@@ -290,18 +289,6 @@ public:
     void keeperStopBackground();
     bool hasKeeper() const { return static_cast<bool>(mount_keeper); }
 
-    /// Record the `writer_epoch` of a writable claim or self-remount that reclaimed an unclean
-    /// predecessor. This relaxed per-epoch high-water mark is compared for exact equality by the ref-table
-    /// recovery seal gate; zero means no such boundary has been observed.
-    void setUncleanEpochBoundarySeenAt(uint64_t v);
-    /// Return whether any writable claim or self-remount in this runtime's lifetime crossed an unclean
-    /// predecessor boundary. This sticky diagnostic is intentionally coarser than the per-epoch value
-    /// used by the seal-gating decision.
-    bool uncleanEpochBoundarySeenForTest() const
-    {
-        return unclean_epoch_boundary_seen_at.load(std::memory_order_relaxed) != 0;
-    }
-
 
     /// ---- self-remount recovery ----
     /// On a lost lease, arm a recovery thread when background operation is enabled. It retries the
@@ -431,13 +418,6 @@ private:
     /// `lifecycleSinceWallS`). Set at every lifecycle edge with a release-store ordered before the
     /// `pool_lifecycle` transition it accompanies.
     std::atomic<int64_t> lifecycle_since_wall_s{0};
-
-    /// The `writer_epoch` that most recently reclaimed an unclean predecessor, or zero if none did. This
-    /// is a per-epoch high-water mark rather than a sticky boolean: ref-table recovery seals only when
-    /// its own epoch exactly matches this value, so a table is sealed only for the specific transition
-    /// whose dead region it recovered. `uncleanEpochBoundarySeenForTest` exposes the coarser lifetime
-    /// diagnostic.
-    std::atomic<uint64_t> unclean_epoch_boundary_seen_at{0};
 };
 
 }

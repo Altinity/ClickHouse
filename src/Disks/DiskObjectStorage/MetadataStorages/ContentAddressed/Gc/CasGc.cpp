@@ -46,6 +46,9 @@ namespace ProfileEvents
     extern const Event CasRefManifestBodyFoldGets;
     extern const Event CasGcProbeAHolePresent;
     extern const Event CasGcProbeAHoleAbsent;
+    extern const Event CasGcProbeADue;
+    extern const Event CasGcProbeAPerformed;
+    extern const Event CasGcProbeASkipped;
     extern const Event CasRefEmittedEdges;
     extern const Event CasRefCleanupObjectsDeleted;
 }
@@ -287,7 +290,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     RoundReport report;
     GcState state;
     Token state_token;
-    /// PHASE 1/18 `lease`. Also the ONLY phase a `NotALeader` round emits, which is why the phase rows
+    /// PHASE 1/19 `lease`. Also the ONLY phase a `NotALeader` round emits, which is why the phase rows
     /// are correlated by `round_id` and not by the round number a follower never learns.
     {
         GcPhaseTimer t(phase_sink, "lease");
@@ -332,7 +335,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     const uint64_t stable_threshold_ms = mountObservationThresholdMs(
         ttl_ms, static_cast<uint64_t>(store->poolConfig().mount_renew_period.count()));
 
-    /// PHASE 2/18 `heartbeat_floor`: one LIST of `gc/server-roots/`, one GET per mount slot, and a fence
+    /// PHASE 2/19 `heartbeat_floor`: one LIST of `gc/server-roots/`, one GET per mount slot, and a fence
     /// PUT per newly-fenced mount.
     {
         GcPhaseTimer t(phase_sink, "heartbeat_floor");
@@ -384,37 +387,37 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// slow idle/small-delta round no longer rebuilds the whole in-degree snapshot. Safety: a due
     /// graduation forces a FOLD (graduationDue), so no destructive decision runs on a stale snapshot.
     ///
-    /// `preFoldRefScan` is the round's FIRST full enumeration of `cas/refs/`. Its result is RETAINED
-    /// (rather than discarded once the defer decision is taken) so `fold` can compare it against its
-    /// own enumeration of the same prefix — probe A, at zero additional backend calls. A deferred round
-    /// simply drops it.
+    /// `listRefPrefix` is the round's ONE full enumeration of `cas/refs/`. Its result is RETAINED
+    /// (rather than discarded once the defer decision is taken) because `fold` regroups the very same
+    /// keys instead of listing the prefix again. A deferred round simply drops it.
     ///
-    /// PHASE 3/18 `defer_decision`. `pre_scan` OUTLIVES the timer because the fold consumes it, and
+    /// PHASE 3/19 `defer_decision`. `ref_scan` OUTLIVES the timer because the fold consumes it, and
     /// `report.deferred` is set INSIDE the scope so the row already reflects the verdict when the
     /// timer's destructor fires on the deferred round's early return. This phase also performs TWO of
-    /// the round's reads of the adopted fold seal (`graduationDue` and `preFoldRefScan` each read the
+    /// the round's reads of the adopted fold seal (`graduationDue` and `listRefPrefix` each read the
     /// same key) -- see `fold_seal_reads` below.
-    RefScanSummary pre_scan;
+    RefScanSummary ref_scan;
     {
         GcPhaseTimer t(phase_sink, "defer_decision");
         const bool graduation_due = graduationDue(state, new_round);
-        pre_scan = preFoldRefScan(state);
-        const size_t changed = pre_scan.changed_shards;
+        ref_scan = listRefPrefix(state);
+        const size_t changed = ref_scan.changed_shards;
         const bool defer = shouldDeferRound(changed, graduation_due, rounds_since_last_fold_,
                                             store->poolConfig().gc_fold_threshold,
                                             store->poolConfig().gc_fold_max_defer_rounds);
         uint64_t ref_log_keys = 0;
-        for (const auto & [scanned_ns, ids] : pre_scan.logs_by_ns)
+        for (const auto & [scanned_ns, ids] : ref_scan.logs_by_ns)
             ref_log_keys += ids.size();
         t.metric("changed_shards", changed);
-        t.metric("namespaces_seen", pre_scan.max_log_by_ns.size());
+        t.metric("namespaces_seen", ref_scan.max_log_by_ns.size());
         t.metric("ref_log_keys_listed", ref_log_keys);
+        t.metric("ref_keys_listed", ref_scan.keys.size());
         t.metric("graduation_due", graduation_due ? 1 : 0);
         t.metric("deferred", defer ? 1 : 0);
         /// The number of consecutive rounds already deferred BEFORE this one (this round's own verdict is
         /// `deferred` above), so the pair reads unambiguously against `gc_fold_max_defer_rounds`.
         t.metric("rounds_deferred_before", rounds_since_last_fold_);
-        /// `graduationDue` and `preFoldRefScan` each GET the adopted fold seal at the SAME
+        /// `graduationDue` and `listRefPrefix` each GET the adopted fold seal at the SAME
         /// (generation, attempt). Recorded, not fixed -- see the `fold_seal_read` phase, which records
         /// the other duplicate pair; the round GETs that one key FIVE times on a folding round.
         t.metric("fold_seal_reads", 2);
@@ -450,6 +453,12 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         rounds_since_last_fold_ = 0;   /// this round folds
     }
 
+    /// PHASE 4/19 `ref_list_probe`. The sampled store-quality detector, and the only thing in the round
+    /// that ever enumerates `cas/refs/` a second time. Its placement here — OUTSIDE `fold`, with a `void`
+    /// return — is the structural statement that it gates nothing: there is no value for a fold decision
+    /// to read even by accident.
+    sampleRefListQuality(ref_scan, new_round);
+
     /// Emit that the round's single pass begins.
     EventEmitter{*store}.emit([&](CasEvent & e)
     {
@@ -466,8 +475,8 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// wholesale prune skipped it while it was still referenced and its cursor advanced past it), and
     /// hand-off delete that generation's now-unreferenced leftover. Absent parent seal => empty.
     ///
-    /// PHASE 4/18 `parent_seal_read`: the round's THIRD GET of the adopted fold seal (`graduationDue`
-    /// and `preFoldRefScan` already read it in `defer_decision`, and `fold` reads it twice more). One
+    /// PHASE 5/19 `parent_seal_read`: the round's THIRD GET of the adopted fold seal (`graduationDue`
+    /// and `listRefPrefix` already read it in `defer_decision`, and `fold` reads it twice more). One
     /// small GET, given its own row rather than left untimed, because "the same key, five times a round"
     /// is only actionable if each read is attributable to a phase.
     std::vector<RunRef> parent_seal_runs;
@@ -480,7 +489,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
 
     /// The pass performs discovery, windowing, and the three-cursor merge (spare / graduate / condemn).
     /// It emits phases 5..10 of its own.
-    FoldResult folded = fold(state, state_token, report, new_round, pre_scan, policy);
+    FoldResult folded = fold(state, state_token, report, new_round, ref_scan, policy);
 
     /// THE ROUND'S DESTRUCTIVE GATE, read once, here, and consulted at EVERY destructive site below.
     /// It is available this early because `fold` computes it (see `FoldResult::suppress_destructive`),
@@ -507,7 +516,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// durable state and safe at any leader staleness), plus outcome bookkeeping for
     /// every settled entry. THE SINGLE CONTENT-DELETE SITE.
     ///
-    /// PHASE 11/18 `pending_deletes`, covering both the exact-token delete loop and the outcome-log
+    /// PHASE 12/19 `pending_deletes`, covering both the exact-token delete loop and the outcome-log
     /// writes it feeds. Held in an `optional` rather than a `{ }` scope purely so this long, delicate
     /// block is not reindented wholesale; `reset()` below is what emits the row, and an exception
     /// escaping before it still emits from the destructor.
@@ -737,7 +746,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// durable no later than the ledger it is paired with. `wait()` never throws here: every scheduled job
     /// already caught its own exception (see `scheduleMetaJob`).
     ///
-    /// PHASE 12/18 `meta_pool_wait`, AND THE ONE HONEST GAP IN THIS INSTRUMENTATION: the work being
+    /// PHASE 13/19 `meta_pool_wait`, AND THE ONE HONEST GAP IN THIS INSTRUMENTATION: the work being
     /// waited on runs on `meta_pool` threads, so none of it appears in this thread's `ProfileEvents`
     /// delta and the row's `ProfileEvents` map is EMPTY BY CONSTRUCTION. That is not a phase with no
     /// cost -- it is a phase whose cost this mechanism cannot see, so it carries explicit job counts
@@ -764,7 +773,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
 
     /// The SINGLE round CAS publishes the round, adopted (generation, attempt), and retention cursor.
     ///
-    /// PHASE 13/18 `round_commit`. It deliberately covers BOTH the retention prune (heavy: LISTs and
+    /// PHASE 14/19 `round_commit`. It deliberately covers BOTH the retention prune (heavy: LISTs and
     /// wholesale deletes, bounded at 64 generations a round) and the single `gc/state` CAS (trivial),
     /// because the prune's writes are only safe as a pre-CAS action and splitting the two would suggest
     /// they are independently retryable. `generations_visited` vs the prune's actual deletes is what
@@ -827,7 +836,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// a crash between the CAS and here leaks the prefix to fsck (single-crash window, no permanent leak —
     /// but note the cursor already advanced, so a plain retry will NOT re-attempt it; fsck is the backstop).
     ///
-    /// PHASE 14/18 `handoff_reclaim`.
+    /// PHASE 15/19 `handoff_reclaim`.
     {
         GcPhaseTimer t(phase_sink, "handoff_reclaim");
         uint64_t objects_reclaimed = 0;
@@ -846,7 +855,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         /// the old generation on this very round and the next round's parent seal no longer names it.
         /// Nothing revisits it: `snap_pruned_through` is already past that generation and the wholesale
         /// prune only walks forward. The prefix is left to `fsck`, which is the same outcome this site
-        /// already documents for a crash in this window (see the PHASE 14/18 comment above) -- the
+        /// already documents for a crash in this window (see the PHASE 15/19 comment above) -- the
         /// difference is that in Stage A every round is suppressed, so it is systematic rather than
         /// incidental. Bounded and not a correctness problem; it stops when Stage B's Task 7b flips
         /// `UniversePolicy::kDefault`. Filed: `docs/superpowers/cas/BACKLOG.md`
@@ -881,7 +890,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// ADOPTED by the round CAS (delete-after-sealed-decrements). Best-effort: a crash
     /// here leaks bodies to the orphan sweep, never a dangle.
     ///
-    /// PHASE 15/18 `manifest_deletes`.
+    /// PHASE 16/19 `manifest_deletes`.
     {
         GcPhaseTimer t(phase_sink, "manifest_deletes");
         const uint64_t manifests_deleted_before = report.manifests_deleted;
@@ -930,7 +939,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// (the previous order) left the completing round unable to see its own just-published snapshot, so a
     /// removed namespace's covered logs persisted as debris until some later fold -- which never comes on
     /// a quiesced pool.
-    /// PHASE 16/18 `namespace_cleanup`.
+    /// PHASE 17/19 `namespace_cleanup`.
     {
         GcPhaseTimer t(phase_sink, "namespace_cleanup");
         uint64_t pending = 0;
@@ -943,7 +952,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         t.metric("items_completed", completed);
         t.metric("suppressed", suppress_destructive ? 1 : 0);
     }
-    /// PHASE 17/18 `ref_object_cleanup`. Emitted even when the whole pass is skipped (`trim_enabled` is
+    /// PHASE 18/19 `ref_object_cleanup`. Emitted even when the whole pass is skipped (`trim_enabled` is
     /// a test seam, `suppressed` gates the deletes), because "this phase did nothing and why" is exactly
     /// what a reader of a round that reclaimed nothing needs to see.
     {
@@ -956,7 +965,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     }
 
     /// Bounded orphan-manifest backstop: cleanup-only cursor progress; never fails the round.
-    /// PHASE 18/18 `orphan_sweep`.
+    /// PHASE 19/19 `orphan_sweep`.
     {
         GcPhaseTimer t(phase_sink, "orphan_sweep");
         const String sweep_cursor_before = state.manifest_sweep_cursor;
@@ -1299,40 +1308,27 @@ Gc::GenerationSealProbe Gc::probeGenerationForSeal(uint64_t generation)
 }
 
 Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & report,
-                        uint64_t current_round, const RefScanSummary & pre_scan, UniversePolicy policy)
+                        uint64_t current_round, const RefScanSummary & ref_scan, UniversePolicy policy)
 {
     Backend & backend = store->backend();
     const Layout & layout = store->layout();
     FoldResult result;
 
-    /// 1. One global paginated LIST of cas/refs/, grouped into per-table (log / snapshot / cleanup-marker)
-    /// listings. This single enumeration serves BOTH ref-log intake and
-    /// ref-object cleanup planning. Resume is by explicit last-returned-key (`ListPage::next_cursor`).
+    /// 1. Group the round's ONE enumeration of `cas/refs/` (taken before the defer decision) into
+    /// per-table (log / snapshot / cleanup-marker) listings. That single enumeration serves the defer
+    /// signal, the ref-log intake, and ref-object cleanup planning alike.
     ///
-    /// PHASE 5/18 `fold_ref_list`, covering the LIST, `groupRefKeys`, and probe A -- everything that
-    /// decides WHAT this round will fold, before it reads a single body. This is the round's SECOND full
-    /// enumeration of `cas/refs/` (the first is `defer_decision`'s), and having the two as separate rows
-    /// is how the cost of listing the prefix twice becomes visible instead of hiding inside one blob.
+    /// THE ROUND LISTS THIS PREFIX ONCE. It used to list it twice, so the two walks could be compared;
+    /// that comparison is now the sampled store-quality detector's own extra LIST, paid on the rounds it
+    /// is due and on no others (`sampleRefListQuality`). The intake does not need a second opinion about
+    /// the listing because it does not consult the listing for completeness at all -- it walks by exact
+    /// key from the cursor.
+    ///
+    /// PHASE 6/19 `fold_ref_group`: the strict regrouping -- what this round will fold, decided before it
+    /// reads a single body. No I/O: the keys are already in hand.
     std::optional<GcPhaseTimer> ref_list_timer;
-    ref_list_timer.emplace(phase_sink, "fold_ref_list");
-    std::vector<String> ref_object_keys;
-    {
-        static constexpr size_t kListPageLimit = 1000;
-        size_t count_in_page = 0;
-        forEachListedKey(backend, layout.casRefsPrefix(), [&](const ListedKey & lk)
-        {
-            ref_object_keys.push_back(lk.key);
-            if (++count_in_page == kListPageLimit)
-            {
-                count_in_page = 0;
-                ProfileEvents::increment(ProfileEvents::CasRefGlobalListPages);
-            }
-        }, kListPageLimit, onGcEnumerationPage);
-        /// The walk's `backend.list` lands at least once even for an empty/undersized final page --
-        /// count it, mirroring the original per-page loop (one increment per physical LIST call).
-        if (count_in_page > 0 || ref_object_keys.empty())
-            ProfileEvents::increment(ProfileEvents::CasRefGlobalListPages);
-    }
+    ref_list_timer.emplace(phase_sink, "fold_ref_group");
+    const std::vector<String> & ref_object_keys = ref_scan.keys;
 
     /// A malformed ref-object key or namespace aborts ref folding for the whole round: the
     /// round produces no ref delta, advances no cursor, and authorizes no destructive work -- recorded as
@@ -1354,152 +1350,13 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     for (const auto & [ns_str, listing] : ref_tables)
         result.root_shards.emplace_back(RootNamespace{ns_str}, 0);
 
-    /// PROBE A — "the store lied". Compare this round's TWO independent full enumerations of
-    /// `cas/refs/` (the pre-fold scan and the one just performed above). The ref log per namespace is
-    /// append-only with strictly increasing ids, so:
-    ///
-    ///   an id present in one enumeration, absent from the other, and STRICTLY BELOW the other
-    ///   enumeration's maximum id for that same namespace CANNOT be a concurrent append.
-    ///
-    /// That is the signal this probe rests on, and it is deliberately independent of id density: the
-    /// interval between two ids is unbounded across a `writer_epoch` change, so a probe that reasoned
-    /// from the sequence alone could not enumerate the missing ids at an epoch boundary. (Since INV-1
-    /// the ids WITHIN one `(namespace, epoch)` are contiguous, so a hole there is detectable and is
-    /// corruption rather than an allocation artefact — consuming that is a separate change, not this
-    /// probe's job.) This check makes no assumption about WHY an enumeration was incomplete
-    /// -- a backend page, continuation behaviour, the iterator, or a mis-parse all surface identically.
-    /// It therefore detects the EFFECT (a record one walk saw and the other did not) and not any one
-    /// hypothesised mechanism.
-    ///
-    /// The one benign explanation is a DELETION between the two walks. Only `cleanupRefObjects`
-    /// deletes ref logs and it runs post-CAS, so this round cannot be the deleter -- but a DEPOSED
-    /// leader still finishing its own post-CAS cleanup can be. That is itself a reason not to advance
-    /// this round's cursors, so it takes the same path, with the alternative named in the log.
-    ///
-    /// PLACEMENT IS LOAD-BEARING: this sits before the parent-cursor read and the intake loop, so a
-    /// disagreement suppresses the CURSOR ADVANCE, not merely the deletions. Suppressing deletion while
-    /// still advancing the cursor would leave the permanent half of the damage in place -- a record
-    /// sealed below the cursor can never be folded by a later complete enumeration.
-    probe_a_holes_this_round = 0;
-    if (!ref_folding_aborted)
-    {
-        uint64_t holes = 0;
-        const std::set<RefTxnId> no_logs;   /// the "this namespace was not in the pre-scan" stand-in
-        for (const auto & [ns_str, listing] : ref_tables)
-        {
-            const std::set<RefTxnId> fold_logs(listing.logs.begin(), listing.logs.end());
-            const auto pre_it = pre_scan.logs_by_ns.find(ns_str);
-            const std::set<RefTxnId> & pre_logs =
-                pre_it != pre_scan.logs_by_ns.end() ? pre_it->second : no_logs;
-
-            RefTxnId fold_max{};
-            if (!fold_logs.empty())
-                fold_max = *fold_logs.rbegin();
-            RefTxnId pre_max{};
-            if (const auto mit = pre_scan.max_log_by_ns.find(ns_str); mit != pre_scan.max_log_by_ns.end())
-                pre_max = mit->second;
-
-            /// Emit at most this many `gc_anomaly` rows per round. One firing has been observed with
-            /// 244,939 holes; the diagnostic value is in the FIRST few (with their HEAD verdicts), and a
-            /// quarter-million audit rows would be a self-inflicted outage. The cap and the true total
-            /// both travel in every row, so a truncated report can never read as a complete one.
-            static constexpr uint64_t kAnomalyRowCap = 32;
-
-            const auto reportHole = [&](const RefTxnId & id, const char * which)
-            {
-                ++holes;
-                /// THE DECISIVE OBSERVATION, taken while the disagreement still exists rather than
-                /// reconstructed from a log afterwards. Two verdicts, two different defects:
-                ///   present -> one enumeration MISSED a durable object; the listing was incomplete.
-                ///   absent  -> the other enumeration returned a key that is not there; a phantom, which
-                ///              indicts the client/iterator and NOT list completeness.
-                /// Reconstructing this after the fact is impossible: by the time anyone reads the log the
-                /// object has legitimately been deleted either way. One HEAD per reported hole, bounded by
-                /// the row cap above.
-                const char * head_verdict = "not_probed";
-                if (holes <= kAnomalyRowCap)
-                {
-                    try
-                    {
-                        const bool present = backend.head(layout.refLogKey(RootNamespace{ns_str}, id)).exists;
-                        head_verdict = present ? "present" : "absent";
-                        /// Also a counter, not only an audit row and a log line: the audit sink is
-                        /// optional (`EventEmitter` no-ops without one) and the text log is rotated and
-                        /// root-owned, so a counter is the one form of this verdict that every consumer
-                        /// -- soak harness, CI scrape, an operator's `system.events` -- can actually read.
-                        ProfileEvents::increment(present ? ProfileEvents::CasGcProbeAHolePresent
-                                                         : ProfileEvents::CasGcProbeAHoleAbsent);
-                    }
-                    catch (...)
-                    {
-                        /// A probe that throws must not convert a diagnostic into a round failure.
-                        head_verdict = "probe_failed";
-                    }
-                    EventEmitter{*store}.emit([&](CasEvent & ev)
-                    {
-                        ev.type = CasEventType::GcAnomaly;
-                        ev.namespace_ = ns_str;
-                        ev.object_kind = CasEventObjectKind::Root;
-                        ev.outcome = "ref_folding_aborted";
-                        ev.reason = "ref-prefix enumerations disagree about a durable ref log";
-                        ev.detail = {{"probe", "A"},
-                                     {"log", renderRefTxnId(id)},
-                                     {"direction", which},
-                                     {"head", head_verdict},
-                                     {"fold_max", renderRefTxnId(fold_max)},
-                                     {"pre_max", renderRefTxnId(pre_max)},
-                                     {"hole_ordinal", std::to_string(holes)},
-                                     {"row_cap", std::to_string(kAnomalyRowCap)}};
-                    });
-                }
-                LOG_ERROR(logger,
-                    "CAS GC probe A: ref log {} of namespace {} was returned by one enumeration of {} "
-                    "and NOT by the other ({}), below that enumeration's own maximum id for the "
-                    "namespace -- an append cannot explain this. A HEAD of the key right now says '{}'. "
-                    "Either the object store gave two different answers about the same durable prefix, or "
-                    "a deposed leader is deleting ref objects concurrently. Ref folding is ABORTED this "
-                    "round: no cursor advances and no destructive action runs.",
-                    renderRefTxnId(id), ns_str, layout.casRefsPrefix(), which, head_verdict);
-            };
-
-            for (const RefTxnId & id : pre_logs)
-                if (id < fold_max && !fold_logs.contains(id))
-                    reportHole(id, "missing from the fold's own scan");
-            for (const RefTxnId & id : fold_logs)
-                if (id < pre_max && !pre_logs.contains(id))
-                    reportHole(id, "missing from the pre-fold scan");
-        }
-        /// STATED LIMITATION, not an oversight. The rule needs a WITNESS above the missing id in the
-        /// other enumeration, so two shapes stay invisible: (a) a hole that reproduces IDENTICALLY in
-        /// both enumerations (nothing cheap catches that), and (b) a namespace one enumeration dropped
-        /// WHOLESALE -- it has no `ref_tables` entry, so the loop above never visits it, and the fold's
-        /// side offers no id to witness against. Widening (b) to use the pre-scan's OWN maximum as the
-        /// witness was considered and rejected: it inverts the rule's justification and would fire on a
-        /// namespace whose logs were legitimately all cleaned between the two walks, and a false
-        /// positive here blocks the cursor advance for good rather than for one round.
-        if (holes > 0)
-        {
-            /// NO SILENT CAPS: if the row cap truncated the per-hole detail, say so on the round record,
-            /// so a reader of `gc_anomaly` can never mistake 32 rows for 32 holes.
-            if (holes > 32)
-                LOG_ERROR(logger,
-                    "CAS GC probe A: {} holes this round; only the first 32 carry a `gc_anomaly` row with "
-                    "a HEAD verdict (row cap). The remaining {} are counted, not detailed.",
-                    holes, holes - 32);
-            ProfileEvents::increment(ProfileEvents::CasGcRefScanDisagreements, holes);
-            ref_folding_aborted = true;
-            report.recordAnomaly(RootNamespace{}, 0, ManifestId{},
-                                 "ref-prefix enumerations disagree: ref folding aborted this round");
-        }
-        probe_a_holes_this_round = holes;
-    }
     ref_list_timer->metric("ref_keys_listed", ref_object_keys.size());
     ref_list_timer->metric("namespaces_seen", ref_tables.size());
-    /// Probe A's per-round verdict, on every round, healthy or not: a column that is always 0 is what
-    /// makes the one round where it is not stand out. See `Gc::probe_a_holes_this_round`.
-    ref_list_timer->metric("probe_a_holes", probe_a_holes_this_round);
+    /// The round's only remaining whole-round ref abort: a key attributable to no namespace. Reported on
+    /// every round, healthy or not — a column that is always 0 is what makes the one round where it is
+    /// not stand out.
     ref_list_timer->metric("ref_folding_aborted", ref_folding_aborted ? 1 : 0);
-    ref_list_timer.reset();   /// emits the `fold_ref_list` row
+    ref_list_timer.reset();   /// emits the `fold_ref_group` row
 
     /// Parent cursors — the per-(ns,shard) cursors a prior round sealed. One-pass round: read them from
     /// the fold seal at the adopted (snap_generation, snap_attempt) (the fold seal IS the coverage record).
@@ -1511,7 +1368,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// protected. NOTE the distinction from a PRESENT seal with an empty per_ns_shard (a legitimate
     /// empty-universe generation) — the audit keys on object absence, not coverage emptiness.
     ///
-    /// PHASE 6/18 `fold_seal_read`. The scope reaches down to `discover_ref_seal` below, because that is
+    /// PHASE 7/19 `fold_seal_read`. The scope reaches down to `discover_ref_seal` below, because that is
     /// a SECOND GET of the SAME key at the SAME (generation, attempt) -- the two reads belong on one row
     /// or the redundancy is invisible. Everything between them is I/O-free (a `resize`, three lambda
     /// DEFINITIONS, and plain assignments), so the duration is honestly the two GETs and their decodes.
@@ -1683,7 +1540,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// SECOND read of the key `adopted_seal` already holds: same generation, same attempt, same bytes
     /// (nothing between the two touches `state.snap_generation` / `snap_attempt` or writes that key).
     /// One redundant GET per folding round, and the round's FIFTH GET of this one key overall --
-    /// `graduationDue` and `preFoldRefScan` make two in `defer_decision`, `parent_seal_read` a third,
+    /// `graduationDue` and `listRefPrefix` make two in `defer_decision`, `parent_seal_read` a third,
     /// `adopted_seal` above a fourth. Recorded on this row, not fixed here.
     CasFoldSeal discover_ref_seal;
     if (const auto fold_seal = readFoldSeal(state.snap_generation, state.snap_attempt))
@@ -1732,7 +1589,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// be attributed to any namespace at all (`groupRefKeys` above), which is why nothing in this loop
     /// sets `ref_folding_aborted` anymore.
     ///
-    /// PHASE 7/18 `fold_ref_intake`: one GET per record (always owed -- the round read every body anyway),
+    /// PHASE 8/19 `fold_ref_intake`: one GET per record (always owed -- the round read every body anyway),
     /// plus one exact 404 probe per namespace to prove its frontier, one extra GET per epoch crossed, and
     /// one HEAD+GET per manifest edge, which on a busy pool is where the round's object-read budget goes.
     /// It also carries probe B1's two numbers -- reported on EVERY healthy round, so
@@ -2473,7 +2330,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// files) are empty. The Pending->Completed transition depends only on physical emptiness, so a carried
     /// item still advances even on an abort.
     ///
-    /// PHASE 8/18 `fold_ns_cleanup_scan`: TWO prefix LISTs per not-yet-Completed item
+    /// PHASE 9/19 `fold_ns_cleanup_scan`: TWO prefix LISTs per not-yet-Completed item
     /// (`namespacePhysicallyEmpty`), which is the phase's whole cost and the reason it is separated from
     /// the intake it sits next to.
     std::optional<GcPhaseTimer> ns_scan_timer;
@@ -2618,7 +2475,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// and sparing continue). Deletes resume on the first clamp-free pass. This is the honest-mode
     /// counterpart of the model's SabotageSkipChangedShard counterexample.
     ///
-    /// PHASE 9/18 `fold_reduce`: the prior-run streaming GETs, one HEAD per zero-transition candidate,
+    /// PHASE 10/19 `fold_reduce`: the prior-run streaming GETs, one HEAD per zero-transition candidate,
     /// and the run PUTs -- the heaviest phase of a folding round on a pool with churn. It also carries
     /// probe B2's verdict (`txns_unapplied`), which is 0 on every committed round because a nonzero
     /// value throws a few lines below; the row is therefore the forensic record of a round that failed.
@@ -2849,7 +2706,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             "recover with SYSTEM CONTENT ADDRESSED GC REBUILD.",
             logs_accounted_this_round, logs_applied_this_round);
 
-    /// PHASE 10/18 `fold_seal_write`: one PUT (or, on a deterministic replay, a byte-compare GET).
+    /// PHASE 11/19 `fold_seal_write`: one PUT (or, on a deterministic replay, a byte-compare GET).
     {
         GcPhaseTimer t(phase_sink, "fold_seal_write");
         const String seal_body = encodeFoldSeal(result.fold_seal);
@@ -3372,23 +3229,21 @@ bool Gc::graduationDue(const GcState & state, uint64_t current_round)
     return false;
 }
 
-RefScanSummary Gc::preFoldRefScan(const GcState & state)
+RefScanSummary Gc::enumerateRefPrefix()
 {
-    /// One full enumeration of `cas/refs/`. It yields the pre-fold DEFER signal (the number of tables
-    /// with at least one ref log above their sealed cursor) AND the id set probe A compares against the
-    /// fold's own enumeration of the same prefix. Lenient parse: a malformed key is simply not counted
-    /// here; the fold's own `groupRefKeys` does the strict validation and round-abort.
-    /// `parseRefObjectKey` never throws.
+    /// ONE full enumeration of `cas/refs/`: the raw keys, plus a lenient per-namespace index of the
+    /// Log-kind ids among them. Lenient is deliberate — a malformed key is kept in `keys` and left
+    /// unindexed, so the STRICT validation (and the round-abort it can raise) happens exactly once, in
+    /// the fold's `groupRefKeys`. `parseRefObjectKey` never throws.
     const Layout & layout = store->layout();
     Backend & backend = store->backend();
 
-    std::map<String, ShardCoverage> cursors;
-    if (const auto seal = readFoldSeal(state.snap_generation, state.snap_attempt))
-        cursors = seal->per_ns_shard;
-
     RefScanSummary scan;
+    static constexpr size_t kListPageLimit = 1000;
+    size_t count_in_page = 0;
     forEachListedKey(backend, layout.casRefsPrefix(), [&](const ListedKey & lk)
     {
+        scan.keys.push_back(lk.key);
         const auto parsed = layout.parseRefObjectKey(lk.key);
         if (parsed && parsed->kind == RefObjectKind::Log)
         {
@@ -3398,7 +3253,28 @@ RefScanSummary Gc::preFoldRefScan(const GcState & state)
             if (g < parsed->txn_id)
                 g = parsed->txn_id;
         }
-    }, 1000, onGcEnumerationPage);
+        if (++count_in_page == kListPageLimit)
+        {
+            count_in_page = 0;
+            ProfileEvents::increment(ProfileEvents::CasRefGlobalListPages);
+        }
+    }, kListPageLimit, onGcEnumerationPage);
+    /// The walk's `backend.list` lands at least once even for an empty/undersized final page --
+    /// count it (one increment per physical LIST call).
+    if (count_in_page > 0 || scan.keys.empty())
+        ProfileEvents::increment(ProfileEvents::CasRefGlobalListPages);
+    return scan;
+}
+
+RefScanSummary Gc::listRefPrefix(const GcState & state)
+{
+    /// The round's ONE hint enumeration, plus the DEFER signal computed from it (the number of tables
+    /// with at least one ref log above their sealed cursor).
+    RefScanSummary scan = enumerateRefPrefix();
+
+    std::map<String, ShardCoverage> cursors;
+    if (const auto seal = readFoldSeal(state.snap_generation, state.snap_attempt))
+        cursors = seal->per_ns_shard;
 
     for (const auto & [ns_str, greatest] : scan.max_log_by_ns)
     {
@@ -3409,6 +3285,195 @@ RefScanSummary Gc::preFoldRefScan(const GcState & state)
             ++scan.changed_shards;
     }
     return scan;
+}
+
+void Gc::sampleRefListQuality(const RefScanSummary & round_scan, uint64_t current_round)
+{
+    /// THE STORE-QUALITY DETECTOR — "the store lied". Compare two independent full enumerations of
+    /// `cas/refs/`: the round's own (`round_scan`) and one taken here. The ref log per namespace is
+    /// append-only with strictly increasing ids, so:
+    ///
+    ///   an id present in one enumeration, absent from the other, and STRICTLY BELOW the other
+    ///   enumeration's maximum id for that same namespace CANNOT be a concurrent append.
+    ///
+    /// That is the whole signal, and it is deliberately independent of id density: the interval between
+    /// two ids is unbounded across a `writer_epoch` change, so a rule reasoning from the sequence alone
+    /// could not enumerate the missing ids at an epoch boundary. It makes no assumption about WHY an
+    /// enumeration was incomplete -- a backend page, continuation behaviour, the iterator, or a mis-parse
+    /// all surface identically. It therefore detects the EFFECT (a record one walk saw and the other did
+    /// not) and not any one hypothesised mechanism.
+    ///
+    /// WHAT IT NO LONGER DOES, and why. It used to ABORT ref folding for the round on any disagreement,
+    /// because the fold iterated the listing and a hole in it meant a record was about to be skipped
+    /// forever. The intake walks ARITHMETICALLY now (exact `GET` of `cursor + 1`, epoch crossings proved
+    /// through the seal chain), so a listing hole is folded through and is a NON-EVENT for the fold. A
+    /// detector that still aborted would be stopping a round that is provably doing the right thing --
+    /// pure harm. So it records no anomaly (which would suppress every destructive step of the round),
+    /// holds no namespace, and touches no cursor. It reports, and that is all.
+    ///
+    /// SAMPLED, because it is no longer free. The comparison needs a SECOND enumeration of the whole ref
+    /// prefix, and the round now performs exactly one for its own purposes; the extra LIST is this
+    /// detector's entire cost, and it is paid only on the rounds `gc_probe_a_period` makes it due.
+    GcPhaseTimer t(phase_sink, "ref_list_probe");
+    const uint64_t period = store->poolConfig().gc_probe_a_period;
+    const bool due = period != 0 && current_round % period == 0;
+    t.metric("due", due ? 1 : 0);
+    if (!due)
+    {
+        /// Reported on every folding round, due or not: a cadence nobody can see is a cadence nobody
+        /// can tell from a detector that silently stopped running.
+        t.metric("performed", 0);
+        t.metric("skipped", 0);
+        t.metric("holes", 0);
+        return;
+    }
+    ProfileEvents::increment(ProfileEvents::CasGcProbeADue);
+
+    Backend & backend = store->backend();
+    const Layout & layout = store->layout();
+
+    RefScanSummary probe_scan;
+    try
+    {
+        probe_scan = enumerateRefPrefix();
+    }
+    catch (...)
+    {
+        /// A detector that throws must never convert a diagnostic into a round failure. The round owes
+        /// this enumeration nothing, so a failed sample is SKIPPED and said so out loud.
+        ProfileEvents::increment(ProfileEvents::CasGcProbeASkipped);
+        t.metric("performed", 0);
+        t.metric("skipped", 1);
+        t.metric("holes", 0);
+        tryLogCurrentException(logger,
+            "CAS GC probe A: the detector's own enumeration of the ref prefix failed; the sample is "
+            "skipped for this round (the round itself is unaffected)");
+        return;
+    }
+
+    uint64_t holes = 0;
+    /// Emit at most this many `gc_anomaly` rows per round. One firing has been observed with 244,939
+    /// holes; the diagnostic value is in the FIRST few (with their HEAD verdicts), and a quarter-million
+    /// audit rows would be a self-inflicted outage. The cap and the true total both travel in every row,
+    /// so a truncated report can never read as a complete one.
+    static constexpr uint64_t kAnomalyRowCap = 32;
+
+    /// Every namespace either enumeration mentions, so both directions are asked about every namespace.
+    std::set<String> namespaces;
+    for (const auto & [ns_str, ids] : round_scan.logs_by_ns)
+        namespaces.insert(ns_str);
+    for (const auto & [ns_str, ids] : probe_scan.logs_by_ns)
+        namespaces.insert(ns_str);
+
+    const std::set<RefTxnId> no_logs;   /// the "this namespace was not in that enumeration" stand-in
+
+    for (const String & ns_str : namespaces)
+    {
+        const auto round_it = round_scan.logs_by_ns.find(ns_str);
+        const std::set<RefTxnId> & round_logs =
+            round_it != round_scan.logs_by_ns.end() ? round_it->second : no_logs;
+        const auto probe_it = probe_scan.logs_by_ns.find(ns_str);
+        const std::set<RefTxnId> & probe_logs =
+            probe_it != probe_scan.logs_by_ns.end() ? probe_it->second : no_logs;
+
+        RefTxnId round_max{};
+        if (const auto mit = round_scan.max_log_by_ns.find(ns_str); mit != round_scan.max_log_by_ns.end())
+            round_max = mit->second;
+        RefTxnId probe_max{};
+        if (const auto mit = probe_scan.max_log_by_ns.find(ns_str); mit != probe_scan.max_log_by_ns.end())
+            probe_max = mit->second;
+
+        const auto reportHole = [&](const RefTxnId & id, const char * which)
+        {
+            ++holes;
+            /// THE DECISIVE OBSERVATION, taken while the disagreement still exists rather than
+            /// reconstructed from a log afterwards. Two verdicts, two different defects:
+            ///   present -> one enumeration MISSED a durable object; the listing was incomplete.
+            ///   absent  -> the other enumeration returned a key that is not there; a phantom, which
+            ///              indicts the client/iterator and NOT list completeness.
+            /// Reconstructing this after the fact is impossible: by the time anyone reads the log the
+            /// object has legitimately been deleted either way. One HEAD per reported hole, bounded by
+            /// the row cap above.
+            const char * head_verdict = "not_probed";
+            if (holes <= kAnomalyRowCap)
+            {
+                try
+                {
+                    const bool present = backend.head(layout.refLogKey(RootNamespace{ns_str}, id)).exists;
+                    head_verdict = present ? "present" : "absent";
+                    /// Also a counter, not only an audit row and a log line: the audit sink is
+                    /// optional (`EventEmitter` no-ops without one) and the text log is rotated and
+                    /// root-owned, so a counter is the one form of this verdict that every consumer
+                    /// -- soak harness, CI scrape, an operator's `system.events` -- can actually read.
+                    ProfileEvents::increment(present ? ProfileEvents::CasGcProbeAHolePresent
+                                                     : ProfileEvents::CasGcProbeAHoleAbsent);
+                }
+                catch (...)
+                {
+                    head_verdict = "probe_failed";
+                }
+                EventEmitter{*store}.emit([&](CasEvent & ev)
+                {
+                    ev.type = CasEventType::GcAnomaly;
+                    ev.namespace_ = ns_str;
+                    ev.object_kind = CasEventObjectKind::Root;
+                    ev.outcome = "detected";
+                    ev.reason = "ref-prefix enumerations disagree about a durable ref log "
+                                "(store-quality detector; the round is unaffected)";
+                    ev.detail = {{"probe", "A"},
+                                 {"log", renderRefTxnId(id)},
+                                 {"direction", which},
+                                 {"head", head_verdict},
+                                 {"round_max", renderRefTxnId(round_max)},
+                                 {"probe_max", renderRefTxnId(probe_max)},
+                                 {"hole_ordinal", std::to_string(holes)},
+                                 {"row_cap", std::to_string(kAnomalyRowCap)}};
+                });
+            }
+            LOG_ERROR(logger,
+                "CAS GC probe A: ref log {} of namespace {} was returned by one enumeration of {} "
+                "and NOT by the other ({}), below that enumeration's own maximum id for the "
+                "namespace -- an append cannot explain this. A HEAD of the key right now says '{}'. "
+                "Either the object store gave two different answers about the same durable prefix, or "
+                "a deposed leader is deleting ref objects concurrently. THIS IS A DETECTOR ONLY: the "
+                "round folds this namespace by exact key regardless, so no cursor is held back and no "
+                "destructive step is suppressed on account of this reading.",
+                renderRefTxnId(id), ns_str, layout.casRefsPrefix(), which, head_verdict);
+        };
+
+        for (const RefTxnId & id : probe_logs)
+            if (id < round_max && !round_logs.contains(id))
+                reportHole(id, "missing from the round's own enumeration");
+        for (const RefTxnId & id : round_logs)
+            if (id < probe_max && !probe_logs.contains(id))
+                reportHole(id, "missing from the detector's enumeration");
+    }
+    /// STATED LIMITATION, not an oversight. The rule needs a WITNESS above the missing id in the
+    /// other enumeration, so two shapes stay invisible: (a) a hole that reproduces IDENTICALLY in
+    /// both enumerations (nothing cheap catches that), and (b) a namespace one enumeration dropped
+    /// WHOLESALE -- the other side offers no id to witness against. Widening (b) to use the same
+    /// enumeration's OWN maximum as the witness was considered and rejected: it inverts the rule's
+    /// justification and would fire on a namespace whose logs were legitimately all cleaned between the
+    /// two walks.
+    if (holes > 0)
+    {
+        /// NO SILENT CAPS: if the row cap truncated the per-hole detail, say so on the round record,
+        /// so a reader of `gc_anomaly` can never mistake 32 rows for 32 holes.
+        if (holes > kAnomalyRowCap)
+            LOG_ERROR(logger,
+                "CAS GC probe A: {} holes this round; only the first {} carry a `gc_anomaly` row with "
+                "a HEAD verdict (row cap). The remaining {} are counted, not detailed.",
+                holes, kAnomalyRowCap, holes - kAnomalyRowCap);
+        ProfileEvents::increment(ProfileEvents::CasGcRefScanDisagreements, holes);
+    }
+
+    ProfileEvents::increment(ProfileEvents::CasGcProbeAPerformed);
+    t.metric("performed", 1);
+    t.metric("skipped", 0);
+    /// The verdict on every sampled round, healthy or not: a column that is always 0 is what makes the
+    /// one round where it is not stand out.
+    t.metric("holes", holes);
+    t.metric("keys_listed", probe_scan.keys.size());
 }
 
 RebuildReport Gc::rebuildBaseline(bool force)
