@@ -2001,3 +2001,6 @@ the re-validation soak. a16 RED-1 build running.
 **2026-07-29 14:40 local** — watchdog: a16 RED-1 building (configure+revert markers 14:23,
 ninja live); T14 review in flight (reviewer transcript fresh 14:37). a14 holding post-W3;
 a15 parked. All lanes nominal.
+**2026-07-29 15:0x local** — USER APPROVED the relink per-ref confirm design pass, scheduled
+right after Stage A close (BACKLOG+draft updated 718af8830e1, memory written). Post-stage
+queue: per-ref pass, then Stage B.
