@@ -15,6 +15,62 @@ or exhaustive unit matrix (per §5 item 4) -> plan -> implementation. The quick 
 in the same effort's first commit. Not implementable before the pass concludes. Companion BACKLOG item: `[RELINK-CONFIRM-BUSY-LANE]`
 {#relink-confirm-busy-lane}.
 
+## 0. DECISION (user, 2026-07-29 evening) {#decision}
+
+**(ii) re-offer is CHOSEN; (i) the per-ref MutationScope index is RETIRED pre-ship — not a
+stopgap, not shipped at all.** Rationale: the branch is being sliced into reviewable PRs, and
+(i) would add an index to the very protocol surface both reviews marked worst on
+complexity-per-guarantee — a concept the PR series would carry only to delete two steps later
+(patch accretion instead of invariant rediscovery). Affordable because the storm is an
+availability/waste cost, not a correctness one (unproven ⇒ retry-later). Mechanically (i)
+could live inside (ii) as a warm fast path — rejected: it resurrects the index and eats (ii)'s
+surface-deletion win. §4 below is retained as HISTORICAL CONTEXT of the rejected variant.
+
+Constraints fixed with the decision:
+
+1. **"No-maintenance" cannot mean "no-recovery".** For a cold table, recovery IS the answer
+   path. Split: `ensureRefTableRecovered` = MANDATORY (it computes the answer);
+   `sweepStalePrecommitsForRead` + `maybeScheduleSnapshotPublish` = DISCRETIONARY (background
+   work a remote peer's question must not schedule). Spec wording: "a peer-initiated read
+   performs exactly what is needed to answer, and schedules nothing beyond."
+2. **DoS re-assessment: a new class, not a doubling.** A peer can force recovery of a COLD
+   table (full LIST + log replay — orders beyond a HEAD), and the LRU eviction budget
+   (`ref_table_cache_bytes`, 256 MiB) is an AMPLIFIER: cycling confirms across many
+   namespaces makes every answer cold — a self-sustaining recovery storm through eviction.
+   MITIGATION (cheap, in-protocol-spirit): a BUDGET on remote-confirm-initiated recovery;
+   over budget ⇒ `Unknown` (soft: Unknown already means retry-later); the warm path never
+   touches the budget. The DoS contract survives reformulated: "everything a peer can make us
+   do is bounded above." Observability requirement: budget-refusals get their OWN counter,
+   distinct from every other Unknown — the rule-3 storm took a live cluster to diagnose
+   precisely because refusal reasons were indistinguishable.
+3. **Axis (iii), recorded as REJECTED so it is not re-proposed:** the receiver could verify
+   by reading the sender's ref state directly from the pool (`recoverRefTableDetailed` is a
+   free function; the token names namespace/ref/manifest). Clarifies the axis — WHO PAYS:
+   in (iii) DoS vanishes as a class (the beneficiary pays; an abusive receiver harms only
+   itself) — but it is LIST+replay per confirm, and it inherits the LIST-trust questions the
+   v9 chain exists to close. Rejected on cost; the who-pays axis is worth remembering.
+4. **TLA decomposition with a NAMED assumption.** Dangle-freedom moves to the v9 chain model;
+   the confirm model proves the custody-chain property (receiver's durable edge at T1, sender
+   certificate at T2 > T1 ⇒ no unprotected instant) under an EXPLICITLY NAMED assumption
+   "committed edges are GC-visible" — named so that weakening the chain model breaks this
+   proof VISIBLY instead of leaving it silently vacuous.
+5. **Layering recorded:** the confirm certifies the sender's committed binding; the GC
+   contract (v9-conditional) is what turns that into blob liveness. Layered, not defective.
+6. **Fire-and-forget stays; structural expiry is a PRINCIPLE for future mechanisms** — the
+   factual note: the retention pin is ABSENT from the current tree (displaced by v11's
+   publish-confirm); do not cite it as live code.
+7. **Failure taxonomy under (ii) is rebuilt from the new state set** (token- and
+   quiescence-classes disappear); the transient-Unknown semantics + per-class unhappy-path
+   tests (user directives) are rebuilt against THAT list, not transplanted line by line.
+8. **Measurements, priority order:** (1st, DECISIVE) share of confirms hitting a COLD table —
+   decides whether the recovery budget is theoretical insurance or load-bearing structure
+   (prior expectation: steady-state confirms are warm almost by definition — the sender of a
+   part being fetched is writing that namespace; cold bursts cluster around node recovery,
+   exactly when the sender is busiest — which is why the budget exists at all); (2nd) how
+   often `ManifestRef` actually changes between offer and confirm (how often confirm can even
+   say No — calibrates machinery); then the earlier three (relink width distribution,
+   proven-path cost share, post-fix confirm rate).
+
 ## 1. Context: what the confirm is and why it exists {#context}
 
 Fetch-by-relink (protocol v11, `260a6f81169`, 2026-07-25) lets a replica adopt another
@@ -78,7 +134,7 @@ carries exactly the needed admission-time knowledge:
 So "which refs can the pending window touch" is knowable per item, at admission, with zero
 new protocol state and zero I/O.
 
-## 4. The refinement {#refinement}
+## 4. The refinement — SUPERSEDED by §0's decision; historical context of variant (i) {#refinement}
 
 Replace rule 3's three table-scoped terms with:
 
