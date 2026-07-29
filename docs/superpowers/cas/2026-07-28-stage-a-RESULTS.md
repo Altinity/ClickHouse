@@ -61,7 +61,7 @@ the BACKLOG as `[FSCK-SCALE-TIMEOUT]`.
 | 12a | soak — SCALE PROBE (defaults, 6 workers / 40 GB) | not a criteria gate | died at 49 min on a 180 s crash-recovery bound; found the T15 fold-round liveness regression and both harness-budget mismatches; 49 minutes of counters are evidence of record | PROBE (not a pass/fail row) |
 | 12b | soak — CRITERIA GATE (3 workers / 8 GB) | zero data loss; no surviving wedge; bounded `unaccounted`; no uninjected ERROR; and — per the 2026-07-29 controller amendment — complete audits at auditable scale plus soak fsck gates reported UNARMED with reason, replacing "fsck clean at end" | zero data loss (2,942,315 == 2,942,315); no violation counter moved; epoch seal minted on both replicas; 2 of 28 scheduled chaos faults fired; fsck gates reported unarmed with reason; complete audits supplied by 05020 and by three PASSING scenario end checkpoints | GREEN against the amended criterion, with one NAMED DEVIATION: I stopped it at minute 95 of its scheduled 90, before the final converge checkpoint. The clause it would have exercised (the data-loss oracle) was run directly instead |
 | 12c | fold-round liveness under load | GC rounds complete while a writer is live | T14: **0 completed folding rounds in 42 minutes** (live-pass readings ledgered in `build/t14_gc_liveness/`). T15 re-validation on the merged binary: **64 `Success` rounds**, avg 100.7 s, min 2.8 s, max 433.5 s (`build/t14_revalidation/criteria_evidence.txt`) | **GREEN — the regression is fixed and rounds are BOUNDED**, which is the property that failed: the old defect was a round that never ended, not a slow one |
-| 12d | T15 re-validation, criterion 4: no new ERROR classes | none beyond the documented exclusions | **VIOLATED** — `Part <id> looks broken. Removing it and will try to fetch.` on BOTH nodes (13 on ch1, 14 on ch2), caused by `checkPartImpl: Code: 668 … mount lease not held … (INVALID_STATE)`; per-minute correlation exact (`build/t14_revalidation/new_error_class.txt`). No data lost — replicas equal at 978,381 rows | **RED — new finding, blocks certification** |
+| 12d | T15 re-validation, criterion 4: no new ERROR classes | none beyond the documented exclusions | `Part 20260729_0_32549_46_32552 looks broken. Removing it and will try to fetch.` — **ONE distinct part**, re-checked in a ~5 s loop over 3.5 min (15 events ch1, 21 ch2). RCA: `isRetryableException` (`checkDataPart.cpp:70`) omits `INVALID_STATE`, which is what the CA disk raises for a transient lease gap (`ContentAddressedMetadataStorage.cpp:1112`, commit `21d207734095`, **2026-07-23 — six days before the merge**). Part is DETACHED, not deleted; replicas ended equal at 978,381 rows (`build/t14_revalidation/rca_lease_blip_part_check.md`) | **PRE-EXISTING interaction, not merged-code-new** — criterion 4 violated by the letter; fix chartered, destructive shape stated |
 | 13 | S38 late-PUT fence | the fence holds | **19/19 verdicts pass, `status=PASS`, `FIX2_EXIT=0`**; store returned HTTP 412 | GREEN |
 | 14 | S43 (W3) same-uuid recreation | the survivor's write is not absorbed | **16/16 verdicts pass, `status=PASS`, `FIX3_EXIT=0`** — the recreated pool REFUSES to bootstrap over the planted survivor (`healthy=false`, `refusal_logged=true`), removing that one object lets the same prefix bootstrap, and life 2 comes up empty (`0\t0` vs life 1's `200\t18123181848219261492`) | GREEN — W3 answered. Extracts in `build/t14_w3_evidence/` (the 668 refusal line, key observations, the run's `report.json`) |
 | 15 | S33 concurrent GC leaders | no leak | **10/10 verdicts pass, `status=PASS`, `FIX2_EXIT=0`** | GREEN |
@@ -734,26 +734,34 @@ from the Task 14 battery remains green.
 
 But the re-validation surfaced a NEW finding, and it is not certifiable as-is.
 
-STAGE A: PENDING (row 12d — new ERROR class under mount-lease loss)
+STAGE A: PENDING (row 12d — pre-existing lease-blip/part-check collapse, fix chartered)
 
-**Row 12d.** During the re-validation both nodes logged
-`Part <id> looks broken. Removing it and will try to fetch.` — 13 on ch1, 14 on ch2 — driven by
-`checkPartImpl: Code: 668 … mount lease not held … (INVALID_STATE)`. The per-minute correlation is
-exact: the class appears only while the lease is not held and stops when it returns. **No data was
-lost** — the replicas ended equal at 978,381 rows, because a healthy peer held every part.
+**Row 12d, with the RCA now done and one correction to my own first report.** It is **ONE part**, not
+27 — `20260729_0_32549_46_32552`, re-checked in a ~5-second loop over 3.5 minutes (15 events on ch1, 21
+on ch2). The event count was a retry loop, not a blast radius.
 
-Why it blocks rather than being noted and passed over: a transient AVAILABILITY blip on the CA disk is
-being read as part CORRUPTION, and the remediation it triggers is destructive-shaped — remove the part,
-re-fetch it. It self-healed here. The shapes it did not meet are the ones that worry: both mounts losing
-their lease together (both nodes logged the class in this very run), or a single-replica pool, where
-"remove and re-fetch" has no source. "Unreadable right now" and "corrupt" are different facts and the
-part-check thread is currently collapsing them.
+The mechanism is a missing taxonomy entry. `ReplicatedMergeTreePartCheckThread` already has the right
+escape hatch — `if (isRetryableException(...)) throw;` — but `isRetryableException`
+(`checkDataPart.cpp:70`) lists NETWORK_ERROR, SOCKET_TIMEOUT, ABORTED and friends and **not
+`INVALID_STATE`**, which is exactly what the CA disk raises for a transient lease gap, in a message that
+says so: *"backing may be temporarily unreachable; retry once the disk recovers to Live"*.
 
-What is NOT established, and is deliberately not asserted: whether the merged Task 15/16 code introduced
-this. The class is absent from soak attempt 1's archived log, but that run died at 49 minutes without
-ever reaching a lease-loss window, so its absence may be coverage rather than behaviour. Nor is the
-lease loss itself explained — the 668s visible are the part-check thread CONSUMING the not-Live state,
-not the lease-keeper's own renewal failure.
+**It is PRE-EXISTING.** `git blame` dates the CA throw site to `21d207734095`, 2026-07-23 — six days
+before the Task 15/16 merge. The re-validation did not introduce the collapse; it produced the
+conditions in which it fires. Soak 1's absence of the class could never have settled that, since that
+run died at 49 minutes without reaching a lease blip.
+
+The destructive shape, stated rather than softened: the remediation DETACHES the part (bytes preserved
+under `detached/`), removes it from ZooKeeper and queues a fetch. On a double blip — which nearly
+happened, since both nodes hit the same part — or on a single-replica pool, that fetch has no source
+and the part is missing from the table until someone re-attaches it. Availability and manual recovery,
+not silent loss. Here it self-healed: the part range's lineage continues past the window and the
+replicas ended equal at 978,381 rows.
+
+Open: the ref-plane question — whether the remove-broken path dropped CAS refs and whether a re-publish
+followed — is unanswerable for this run, because `system.part_log` and `system.content_addressed_log`
+died with the container and neither was in the predown dump's content list. That omission was mine and
+is now fixed.
 
 Outstanding:
 
