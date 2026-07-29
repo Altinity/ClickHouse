@@ -1830,3 +1830,8 @@ controller's older duplicate merged away). T14 running (recon phase).
 (GATE_RELEASE_EXIT=0), ASan 1552/1552 (GATE_ASAN_EXIT=0, matches predicted 1538+14). Agent
 now on the soak-python code work (signals.py/run.py — late-PUT detector) before launching the
 90m soak. Untracked ca-soak compose/profiling files = old debris (Jul 17-18), not impl-a14's.
+**2026-07-29 09:3x local** — T14 interim: batteries green w/ name-level +4 delta explanation;
+detector commit `51db43f484d` (EVIDENCE/VIOLATIONS split, no-seal=untested); S38 fence-held
+rewrite `1cfb14bcb7c` (seal exists/wins/covers, clean-restart inverted). Soak detached 09:24
+ETA ~10:55. KEY RULING: praktika local post_hooks PRUNE docker — all docker work serialized
+behind the soak (memory saved). No reds.
