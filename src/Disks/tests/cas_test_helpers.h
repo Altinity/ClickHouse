@@ -826,6 +826,20 @@ inline String cursorKeyForTest(const DB::Cas::RootNamespace & ns, uint64_t shard
 /// an epoch-`E` build is deletable only once that cursor sits in an epoch STRICTLY above `E`.
 /// `hold`, when set, makes the row classification 4 — the strict grammar `encodeFoldSeal` enforces in
 /// both directions, so a hold and a non-4 classification cannot be seeded together.
+///
+/// SHARP EDGE, HANDLED HERE SO NO CALLER HAS TO KNOW IT: a fold seal must carry a `condemned_summary`
+/// entry for EVERY shard in `0..gc_shards-1`. A later real round adopts this object as its PARENT and
+/// throws `CORRUPTED_DATA` — "parent fold seal (generation G, attempt A) lacks a condemned_summary
+/// entry for gc-shard N — the seal is not total over gc_shards" — on a seal that is missing one. The
+/// symptom is nowhere near the cause: the round fails at fold time, or (if it fails before taking the
+/// lease) merely reports `acquired_lease == false`, so a test that seeds a partial seal looks like a
+/// leadership problem. This helper fills the map from `gc/state`'s own `gc_shards`, so seeding a
+/// coverage row is safe to combine with real rounds.
+///
+/// One thing it does NOT do: create `gc/state` in a state a first-ever `Gc` round can take the lease
+/// over. `acquireOrRenewLease` only creates-and-owns when `gc/state` is ABSENT, so seeding before the
+/// first round makes that round back off. Seed AFTER the first round (passing that round's
+/// `currentGenerationOf`/`currentAttemptOf`) when a test drives real rounds.
 inline void seedFoldCursorForTest(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RootNamespace & ns,
     DB::Cas::RefTxnId cursor, std::optional<DB::Cas::RefHold> hold = std::nullopt,
@@ -849,9 +863,7 @@ inline void seedFoldCursorForTest(
     if (head.exists)
         gc_state = DB::Cas::decodeGcState(backend.get(layout.gcStateKey())->bytes);
 
-    /// Totality over `gc_shards`: a later REAL round adopts this seal as its parent and refuses a seal
-    /// that is missing any shard's `condemned_summary` entry (`CasGc.cpp`, "the seal is not total over
-    /// gc_shards"). A fixture that seeds only a coverage row would therefore wedge every round after it.
+    /// Totality over `gc_shards` — see the doc comment's SHARP EDGE note for what throws without it.
     const uint64_t gc_shards = gc_state.gc_shards ? gc_state.gc_shards : 1;
     for (uint64_t s = 0; s < gc_shards; ++s)
         seal.condemned_summary.emplace(s, DB::Cas::CondemnedSummary{});

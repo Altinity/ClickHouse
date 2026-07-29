@@ -287,15 +287,49 @@ NamespaceFoldView namespaceFoldView(Pool & store, const RootNamespace & ns)
     return view;
 }
 
-bool manifestDeletionPremise(const NamespaceFoldView & view, const ManifestKey & manifest,
-                             String * retain_reason)
+std::string_view sweepRetainClassName(SweepRetainClass c)
 {
-    const auto retain = [&](String why)
+    switch (c)
+    {
+        case SweepRetainClass::None:           return "none";
+        case SweepRetainClass::NoCoverage:     return "no_coverage";
+        case SweepRetainClass::Hold:           return "hold";
+        case SweepRetainClass::UnconsumedSeal: return "unconsumed_seal";
+        case SweepRetainClass::TailRemoval:    return "tail_removal";
+    }
+    return "unknown";
+}
+
+std::pair<SweepRetainClass, uint64_t> ManifestSweepResult::topRetainReason() const
+{
+    /// Enum order, so a tie resolves the same way on every pass and an unchanged pool keeps reporting
+    /// the same verdict instead of alternating between two equally-large classes.
+    const std::pair<SweepRetainClass, uint64_t> candidates[] = {
+        {SweepRetainClass::NoCoverage, retained_no_coverage},
+        {SweepRetainClass::Hold, retained_hold},
+        {SweepRetainClass::UnconsumedSeal, retained_unconsumed_seal},
+        {SweepRetainClass::TailRemoval, retained_tail_removal},
+    };
+    std::pair<SweepRetainClass, uint64_t> top{SweepRetainClass::None, 0};
+    for (const auto & c : candidates)
+        if (c.second > top.second)
+            top = c;
+    return top;
+}
+
+bool manifestDeletionPremise(const NamespaceFoldView & view, const ManifestKey & manifest,
+                             String * retain_reason, SweepRetainClass * retain_class)
+{
+    const auto retain = [&](SweepRetainClass klass, String why)
     {
         if (retain_reason)
             *retain_reason = std::move(why);
+        if (retain_class)
+            *retain_class = klass;
         return false;
     };
+    if (retain_class)
+        *retain_class = SweepRetainClass::None;
     const String build_epoch = std::to_string(manifest.prefix.writer_epoch);
 
     /// UNCERTAINTY, and it comes first because it is the case where the predicate knows NOTHING. With no
@@ -303,7 +337,8 @@ bool manifestDeletionPremise(const NamespaceFoldView & view, const ManifestKey &
     /// seal can be shown consumed. The sweep's own protection view cannot stand in for the missing
     /// proof: that view is assembled from the very enumeration arithmetic intake distrusts.
     if (!view.coverage)
-        return retain("no sealed fold coverage for the namespace: no round has folded a ref cursor for "
+        return retain(SweepRetainClass::NoCoverage,
+                      "no sealed fold coverage for the namespace: no round has folded a ref cursor for "
                       "it, so epoch " + build_epoch + "'s closing seal cannot be shown consumed");
 
     const ShardCoverage & cov = *view.coverage;
@@ -314,15 +349,17 @@ bool manifestDeletionPremise(const NamespaceFoldView & view, const ManifestKey &
     /// even though the seal's strict grammar pairs them: the thing standing between a clamped namespace
     /// and an irreversible delete must not be a codec invariant enforced somewhere else.
     if (cov.hold)
-        return retain("namespace held at " + renderRefTxnId(cov.hold->offending_position) + " ("
+        return retain(SweepRetainClass::Hold, "namespace held at " + renderRefTxnId(cov.hold->offending_position) + " ("
                       + String{holdReasonToWord(cov.hold->reason)} + ", retried "
                       + std::to_string(cov.hold->retry_count) + " round(s)): every record at or above "
                       "that position is unaccounted for");
     if (cov.classification == 4)
-        return retain("namespace coverage is classified clamped (4) with no hold recorded: whatever "
+        return retain(SweepRetainClass::Hold,
+                      "namespace coverage is classified clamped (4) with no hold recorded: whatever "
                       "stopped the fold was not carried, so nothing above its cursor is accounted for");
     if (cov.classification == 0)
-        return retain("namespace coverage is classified absent (0): no round folded it, so its cursor "
+        return retain(SweepRetainClass::NoCoverage,
+                      "namespace coverage is classified absent (0): no round folded it, so its cursor "
                       "is not the result of any walk");
 
     /// RULE 1 (spec §6). Grants do not cross epochs, so every `+1` that could name an epoch-`E` build
@@ -336,7 +373,8 @@ bool manifestDeletionPremise(const NamespaceFoldView & view, const ManifestKey &
     /// one more round and resolves itself -- the next epoch's first record crosses the seal, and the
     /// round after that sweeps the build.
     if (!(manifest.prefix.writer_epoch < cov.last_folded_ref_id.writer_epoch))
-        return retain("epoch " + build_epoch + "'s closing seal is not consumed: the sealed cursor is at "
+        return retain(SweepRetainClass::UnconsumedSeal,
+                      "epoch " + build_epoch + "'s closing seal is not consumed: the sealed cursor is at "
                       + renderRefTxnId(cov.last_folded_ref_id) + ", so a grant naming this build may "
                       "still be unfolded above it");
 
@@ -351,7 +389,8 @@ bool manifestDeletionPremise(const NamespaceFoldView & view, const ManifestKey &
     /// rule (1) exists to stop trusting. Rule (1) is what makes the tail decidable; this makes the
     /// decision explicit.
     if (view.tail_removal_targets.contains(manifest.key))
-        return retain("an unconsumed tail record above the cursor names this manifest as a removal "
+        return retain(SweepRetainClass::TailRemoval,
+                      "an unconsumed tail record above the cursor names this manifest as a removal "
                       "target: its `-1` has not folded, so the fold still needs the body");
 
     if (retain_reason)
@@ -586,10 +625,23 @@ ManifestSweepResult sweepManifestCursorPage(
         /// THE §6 SAFETY FLOOR, the same predicate `sweepNamespace` calls, under the same watermark
         /// eligibility. A refusal is recorded rather than silent (Constraint 10).
         String retain_reason;
-        if (!manifestDeletionPremise(view_it->second, ManifestKey{parsed->key, parsed->prefix}, &retain_reason))
+        SweepRetainClass retain_class = SweepRetainClass::None;
+        if (!manifestDeletionPremise(view_it->second, ManifestKey{parsed->key, parsed->prefix},
+                                     &retain_reason, &retain_class))
         {
+            /// The sentence goes to the debug log for whoever is chasing ONE object; the class goes to
+            /// a counter, which is the only form in which this path can report itself (see
+            /// `ManifestSweepResult`). Both come from the predicate; neither is derived from the other.
             LOG_DEBUG(getLogger("CasOrphanManifestSweep"),
                       "CAS orphan sweep: retaining {} -- {}", parsed->key, retain_reason);
+            switch (retain_class)
+            {
+                case SweepRetainClass::NoCoverage:     ++result.retained_no_coverage; break;
+                case SweepRetainClass::Hold:           ++result.retained_hold; break;
+                case SweepRetainClass::UnconsumedSeal: ++result.retained_unconsumed_seal; break;
+                case SweepRetainClass::TailRemoval:    ++result.retained_tail_removal; break;
+                case SweepRetainClass::None:           break;   /// unreachable: the premise refused
+            }
             ++result.skipped;
             decided_through = listed.key;
             continue;

@@ -211,6 +211,64 @@ TEST(CasSweepDeletionPremise, DebrisUnderANamespaceTheFoldNeverWalksIsRetainedIn
     EXPECT_EQ(warnings.size(), 3u) << "every pass reports the retention rather than going quiet";
 }
 
+/// RETENTION IS VISIBLE ON THE PATH THAT ACTUALLY SWEEPS. `sweepManifestCursorPage` has no `warnings`
+/// out-param -- the background sweep answers to nobody but its phase row -- so the premise's refusals
+/// have to leave the process as COUNTERS or not at all. In Stage A that is nearly the whole story of
+/// the sweep, because rule (1) is satisfiable only for a closed-and-folded epoch.
+///
+/// Non-vacuous by construction: two namespaces on ONE page are retained for DIFFERENT reasons, so a
+/// counter wired to the wrong class, or one bucket catching everything, changes the answer. A
+/// single-reason page would pass against a single mislabelled counter.
+TEST(CasSweepDeletionPremise, DistinctRetainReasonsLandInDistinctCounters)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+
+    /// Namespace A: a cursor still INSIDE the build's epoch -> rule (1), `unconsumed_seal`.
+    const RootNamespace ns_a{"00/aa@cas@"};
+    const ManifestRef ref_a = ref(5, 0xA1);
+    writeManifestRaw(*backend, layout, ns_a, ref_a, {blobEntryFor("a", DB::UInt128(1))});
+    seedFoldCursorForTest(*backend, layout, ns_a, RefTxnId{kBuildEpoch, 3});
+
+    /// Namespace B: a HELD row whose cursor is well above the build's epoch, so rule (1) is satisfied
+    /// and the hold is demonstrably what retained it.
+    const RootNamespace ns_b{"00/bb@cas@"};
+    const ManifestRef ref_b = ref(5, 0xB1);
+    writeManifestRaw(*backend, layout, ns_b, ref_b, {blobEntryFor("b", DB::UInt128(2))});
+    const RefHold hold{.reason = HoldReason::BodyUndecodable,
+                       .offending_position = RefTxnId{kBuildEpoch + 1, 9},
+                       .retry_count = 1, .next_retry_round = 4};
+    seedFoldCursorForTest(*backend, layout, ns_b, RefTxnId{kBuildEpoch + 1, 8}, hold);
+
+    setWatermarkMinActive(*backend, layout, kServerRoot, kBuildEpoch, /*min_active*/6);
+
+    const ManifestSweepResult result = sweepManifestCursorPage(*store, "", /*list_budget*/100, /*delete_budget*/10);
+
+    EXPECT_EQ(result.deleted, 0u);
+    EXPECT_EQ(result.retained_unconsumed_seal, 1u) << "namespace A's cursor is inside its build's epoch";
+    EXPECT_EQ(result.retained_hold, 1u) << "namespace B is held";
+    EXPECT_EQ(result.retained_no_coverage, 0u);
+    EXPECT_EQ(result.retained_tail_removal, 0u);
+    EXPECT_GE(result.skipped, 2u) << "both retentions are also ordinary skips";
+
+    /// The rollup an operator reads. The two classes tie at one each and the tie resolves by enum
+    /// order, which is what keeps an unchanged pool reporting an unchanged verdict pass after pass.
+    const auto top = result.topRetainReason();
+    EXPECT_EQ(top.second, 1u);
+    EXPECT_EQ(top.first, SweepRetainClass::Hold);
+    EXPECT_EQ(String{sweepRetainClassName(SweepRetainClass::UnconsumedSeal)}, "unconsumed_seal");
+
+    /// A page with no candidates reports nothing: the counters carry the premise's own refusals, not
+    /// ordinary skips.
+    auto empty_backend = std::make_shared<InMemoryBackend>();
+    auto empty_store = openPoolForTest(empty_backend);
+    const ManifestSweepResult nothing =
+        sweepManifestCursorPage(*empty_store, "", /*list_budget*/100, /*delete_budget*/10);
+    EXPECT_EQ(nothing.topRetainReason().first, SweepRetainClass::None);
+    EXPECT_EQ(nothing.topRetainReason().second, 0u);
+}
+
 /// STAGE B SEAM (registers R2/R3). The premise is the per-manifest SAFETY floor and nothing else: it
 /// says when a body may go, never who nominates it or when. The sweep's own rework -- the writer duty
 /// queue that reclaims its own live epoch's debris, and the nomination path -- attaches here, and must

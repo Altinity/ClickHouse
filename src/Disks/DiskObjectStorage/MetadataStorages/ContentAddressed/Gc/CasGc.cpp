@@ -964,10 +964,11 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         /// unprovable round is exactly the round whose orphan verdicts cannot be trusted. Advancing the
         /// cursor without sweeping would be worse than not running at all -- the skipped range is never
         /// revisited -- so the whole pass is skipped, cursor included.
+        ManifestSweepResult sweep;
         try
         {
             if (!suppress_destructive)
-                runManifestSweepCursorPass(state, state_token);
+                sweep = runManifestSweepCursorPass(state, state_token);
         }
         catch (const Exception & e)
         {
@@ -976,6 +977,18 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         t.metric("cursor_advanced", state.manifest_sweep_cursor != sweep_cursor_before ? 1 : 0);
         t.metric("list_budget_keys", store->poolConfig().manifest_sweep_list_budget_keys);
         t.metric("suppressed", suppress_destructive ? 1 : 0);
+        t.metric("listed", sweep.listed);
+        t.metric("deleted", sweep.deleted);
+        t.metric("skipped", sweep.skipped);
+        /// THE §6 PREMISE'S SHARE OF `skipped`, BY REASON CLASS. In Stage A these four are very nearly
+        /// the whole story of the sweep: rule (1) is satisfiable only for a closed-and-folded epoch, so
+        /// the ordinary outcome of a healthy pass is that everything examined was RETAINED, and without
+        /// these numbers that is indistinguishable on the row from a pass that found nothing to do.
+        /// A row where `deleted` is 0 and all four are 0 means the sweep genuinely had no candidates.
+        t.metric("retained_no_coverage", sweep.retained_no_coverage);
+        t.metric("retained_hold", sweep.retained_hold);
+        t.metric("retained_unconsumed_seal", sweep.retained_unconsumed_seal);
+        t.metric("retained_tail_removal", sweep.retained_tail_removal);
     }
 
     return report;
@@ -2860,11 +2873,11 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     return result;
 }
 
-void Gc::runManifestSweepCursorPass(GcState & state, Token & state_token)
+ManifestSweepResult Gc::runManifestSweepCursorPass(GcState & state, Token & state_token)
 {
     const uint64_t list_budget = store->poolConfig().manifest_sweep_list_budget_keys;
     if (list_budget == 0)
-        return;
+        return {};
 
     const uint64_t delete_budget = store->poolConfig().manifest_sweep_delete_budget_keys;
     /// `late_log_dedup` is this leader instance's own one-shot latch (see `LateLogDedup`'s
@@ -2873,8 +2886,13 @@ void Gc::runManifestSweepCursorPass(GcState & state, Token & state_token)
     const ManifestSweepResult result = sweepManifestCursorPage(
         *store, state.manifest_sweep_cursor, list_budget, delete_budget, &late_log_dedup);
 
+    /// THE RETENTION ROLLUP, before any cursor bookkeeping, because it must be reported whether or not
+    /// the cursor moved: a pass that retains everything it examined legitimately leaves the cursor
+    /// where it was, and that is exactly the pass an operator most needs to hear about.
+    reportSweepRetention(result);
+
     if (result.next_cursor == state.manifest_sweep_cursor)
-        return;
+        return result;
 
     GcState next = state;
     next.manifest_sweep_cursor = result.next_cursor;
@@ -2883,12 +2901,44 @@ void Gc::runManifestSweepCursorPass(GcState & state, Token & state_token)
     {
         state = std::move(next);
         state_token = res.token;
-        return;
+        return result;
     }
 
     LOG_DEBUG(logger,
         "CAS gc orphan sweep cursor progress discarded because gc/state moved (listed {}, deleted {}, skipped {})",
         result.listed, result.deleted, result.skipped);
+    return result;
+}
+
+void Gc::reportSweepRetention(const ManifestSweepResult & result)
+{
+    const auto top = result.topRetainReason();
+    if (top.second == 0)
+    {
+        /// Nothing retained by the premise. Re-arm, so that the next retention -- however far off --
+        /// is reported as the change it is rather than swallowed by a repeat counter.
+        last_retain_rollup.reset();
+        retain_rollup_passes_since_report = 0;
+        return;
+    }
+
+    const bool changed = !last_retain_rollup || *last_retain_rollup != top;
+    if (!changed && ++retain_rollup_passes_since_report < kRetainRollupRepeatPasses)
+        return;
+
+    /// INFO, not WARNING: in Stage A retention is the CORRECT outcome (rule (1) is satisfiable only for
+    /// a closed-and-folded epoch), so warning here would raise an alarm on every healthy round. It is
+    /// still the operator's answer to "why is manifest debris not shrinking?", which is why it is not
+    /// left at DEBUG with the per-object sentences.
+    LOG_INFO(logger,
+        "CAS gc orphan sweep: retained {} manifest body(ies) this pass, most of them ({} of {}) for "
+        "'{}' -- see the fold seal's coverage for that namespace; deleted {}, listed {}",
+        result.retained_no_coverage + result.retained_hold + result.retained_unconsumed_seal
+            + result.retained_tail_removal,
+        top.second, result.skipped, sweepRetainClassName(top.first), result.deleted, result.listed);
+
+    last_retain_rollup = top;
+    retain_rollup_passes_since_report = 0;
 }
 
 bool Gc::namespacePhysicallyEmpty(const RootNamespace & ns)

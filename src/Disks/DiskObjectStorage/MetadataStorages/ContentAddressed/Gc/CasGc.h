@@ -586,8 +586,15 @@ private:
     bool namespacePhysicallyEmpty(const RootNamespace & ns);
 
     /// Best-effort cursor-paced orphan part-manifest sweep. This is cleanup-only state: a lost CAS only
-    /// discards cursor progress and must not fail the already-completed GC round.
-    void runManifestSweepCursorPass(GcState & state, Token & state_token);
+    /// discards cursor progress and must not fail the already-completed GC round. Returns the page's
+    /// counters so the `orphan_sweep` phase row can report what the pass actually did — including the
+    /// §6 premise's per-reason retention classes, which on this path are the only report there is.
+    ManifestSweepResult runManifestSweepCursorPass(GcState & state, Token & state_token);
+
+    /// Emit the sweep's per-pass retention rollup, throttled (see `last_retain_rollup`). Separate from
+    /// the pass itself so the phase row and the log line read the SAME counters rather than two
+    /// independently-derived views of the page.
+    void reportSweepRetention(const ManifestSweepResult & result);
 
     /// Discover the present (namespace, shard) pairs from LIST(cas/refs/); shared by the fold and the
     /// resume re-fence. Returns only shards that have a backend object (absent shards not included).
@@ -717,6 +724,17 @@ private:
     /// `mount_obs` above: a fresh leader (after a steal or a process restart) starts empty, at worst
     /// re-emitting one already-reported anomaly once.
     LateLogDedup late_log_dedup;
+
+    /// Throttle for the orphan sweep's retention rollup. In Stage A the premise retains on nearly every
+    /// pass, so an unconditional `LOG_INFO` would emit the same sentence every round forever and train
+    /// operators to filter out the channel carrying the answer they need. It is reported when the
+    /// verdict CHANGES (a different top reason class, or a different count), and otherwise re-stated
+    /// every `kRetainRollupRepeatPasses` passes so a newly-arrived operator is never left with silence
+    /// they would have to read as "nothing to report". Leader-owned and in-memory, like the latch
+    /// above: a fresh leader re-states once, which is the harmless direction.
+    static constexpr uint64_t kRetainRollupRepeatPasses = 64;
+    std::optional<std::pair<SweepRetainClass, uint64_t>> last_retain_rollup;
+    uint64_t retain_rollup_passes_since_report = 0;
 
     /// Bounded pool for the round's per-hash freshness-meta writes (condemn/spare/delete);
     /// sized from `PoolConfig::gc_meta_pool_size` (constructed in the ctor, after the null/id checks --
