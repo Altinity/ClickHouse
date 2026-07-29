@@ -2016,3 +2016,7 @@ marker facts. a14 in doc fix round; T14 re-review queues after it.
 Unknown = transient-state semantics + precise unhappy-path test per refusal class. T14 fix
 round landed (a1f59e4b402: 11 items, self-verified figures — clamp actually 12); evidence
 dirs stay untracked per convention; scoped re-review dispatched. a16 in RED-2.
+**2026-07-29 15:5x local** — T14 CLOSED (re-review CLEAN; in-place-marking crowned the house
+form). T15 review dispatched (worktree package, 2 commits, ruling checklist a-f). a16 RED-2
+in flight. Remaining chain: T16 gate -> reviews close -> merges -> rebuild -> re-validation
+soak -> verdict flip -> final whole-branch review.
