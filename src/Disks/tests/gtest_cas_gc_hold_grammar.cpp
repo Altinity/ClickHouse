@@ -1027,6 +1027,70 @@ TEST(CasGcHoldGrammar, AnUndecodableCheckpointHoldsOnlyItsOwnNamespace)
             << "ref log " << renderRefTxnId(id) << " of the held namespace was deleted";
 }
 
+/// THE OTHER ARM OF THE SAME RULE, and the one that must NOT mint a hold.
+///
+/// A namespace can carry an undecodable `_ckpt` and offer the walk NO POSITION TO READ: never folded
+/// (no sealed cursor) and no listed log. Two ways to get there, both real. A writer publishes the
+/// object around its namespace's birth, so a `_ckpt` that lands before the birth log is durable is
+/// exactly this shape. And `parseRefCkptKey` deliberately resolves anything of the form
+/// `<something>/_ckpt`, so a key with a stray segment names the checkpoint of a table that has no logs
+/// and no snapshots and never will (`CasLayout.h`, "the phantom table it names ... the fold does
+/// nothing for it") — which is precisely the object that used to halt GC for the entire pool.
+///
+/// NO HOLD IS MINTED, and that is a positive design choice rather than a shortfall. A hold is not just
+/// a stop flag: its `offending_position` is read by every later round as a DURABLE WITNESS that some
+/// round once reached that position, which turns an absent below it into a gap rather than a frontier.
+/// The walk here reached nothing, so any position would be invented — `{0, 0}` is rejected outright by
+/// both codecs, and any canonical value would plant a permanent false witness under a namespace whose
+/// records legitimately do not exist. The anomaly carries it instead, which is enough because it shuts
+/// the same round-wide destructive gate a hold would, and because everything the checkpoint gates is a
+/// no-op for a namespace the walk cannot even start on: nothing to fold, and an empty delete plan.
+TEST(CasGcHoldGrammar, AnUndecodableCheckpointWithNoWalkPositionRecordsAnAnomalyAndMintsNoHold)
+{
+    const RootNamespace phantom{"00/aa@cas@"};
+    const RootNamespace good{"00/bb@cas@"};
+
+    auto backend = std::make_shared<HintHoleCountingBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    Gc gc(store, kGc);
+
+    /// A lone `_ckpt` with an undecodable body, and NOTHING else under that namespace.
+    backend->putIfAbsent(layout.refCkptKey(phantom), "this is not a cas_ref_ckpt");
+    publishAt(*backend, layout, good, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(11), /*birth=*/true);
+
+    const RoundReport report = gc.runRegularRound();
+    ASSERT_TRUE(report.acquired_lease);
+
+    /// The anomaly is the whole carrier here: it is what shuts the round's destructive gate, and the
+    /// gate is what keeps `cleanupRefObjects` from computing this namespace's delete range from an
+    /// ABSENT checkpoint — which is the WIDEST reading, not the safest.
+    /// Matched on its REASON, not merely on the namespace: "some anomaly exists for this namespace" is
+    /// a pin any future unrelated anomaly would satisfy, and this test would then stop testing anything.
+    const auto anomaly = std::find_if(report.anomalies.begin(), report.anomalies.end(),
+        [&](const RoundAnomaly & a) { return a.ns.string() == phantom.string() && a.shard == 0; });
+    ASSERT_NE(anomaly, report.anomalies.end())
+        << "an unreadable `_ckpt` must be surfaced even when there is no walk to stop";
+    EXPECT_NE(anomaly->reason.find("_ckpt"), String::npos)
+        << "the anomaly must say WHAT stopped the namespace, not merely that something did";
+
+    const auto cov = coverageOf(*backend, layout, phantom);
+    ASSERT_TRUE(cov.has_value());
+    EXPECT_FALSE(cov->hold.has_value()) << "a hold here could only name a position no round ever read";
+    EXPECT_EQ(cov->classification, 1) << "nothing was folded, so the row is `unchanged`";
+    EXPECT_EQ(cov->last_folded_ref_id, (RefTxnId{}));
+
+    /// Same isolation as the held arm: the pool keeps working.
+    const auto good_cov = coverageOf(*backend, layout, good);
+    ASSERT_TRUE(good_cov.has_value());
+    EXPECT_FALSE(good_cov->hold.has_value());
+    EXPECT_EQ(good_cov->last_folded_ref_id, (RefTxnId{1, 1}));
+
+    /// The unreadable object itself is never deleted as debris — repairing it is the operator's move,
+    /// and GC removing it would erase the only evidence of what stopped the namespace.
+    EXPECT_TRUE(backend->head(layout.refCkptKey(phantom)).exists);
+}
+
 /// ===================== THE HOLD IS DURABLE =====================
 
 namespace
