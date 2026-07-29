@@ -9,7 +9,7 @@ doc_type: 'reference'
 
 # CAS relink re-offer: retiring the confirm endpoint {#cas-relink-reoffer-redesign}
 
-**Date:** 2026-07-29. **Status:** DESIGN (**v8 — final pre-plan**), approved except the TLA gate. **Branch:** `cas-gc-rebuild`.
+**Date:** 2026-07-29. **Status:** DESIGN (**v9 — final pre-plan**), approved except the TLA gate. **Branch:** `cas-gc-rebuild`.
 Spec only; no code landed.
 
 **v2:** the confirm is expressed as an HTTP conditional request (`ETag` / `If-None-Match`), with
@@ -27,6 +27,24 @@ second defence (§4.1.3); the **budget is redesigned** after its one-line mitiga
 the eviction code (§4.3); `CaRelinkPromote::MechanismFallbackAllowed` gets its transition (§6.2);
 the TLA gate gains three expressiveness requirements (§12.5); and the §1.1 arithmetic is corrected
 against a grep rather than against the design.
+
+**v9 (Codex round 6 — 0 blocker, 2 major; the v8 sweep verified closed).** Both majors were depth
+on v8's routes, and both changed the mechanism rather than the wording. **The proof channel is
+inverted:** v8 asked each refusal site to prove it sent nothing, which is not implementable — the
+proof is erased into a generic `NETWORK_ERROR` before `precommitAdd` can read it
+(`CasRefLedger.cpp:3105-3126`), `RefMutationItem` carries no such field
+(`CasRefLedger.h:454-463`), and there are NINE no-send exits, not two. v9 marks the single
+TRANSMISSION point instead: `RefMutationItem` gains `attempted`, set beside `armApplyPending`
+(`:2806`) immediately before the PUT, so all nine exits prove themselves by never reaching it, and
+the one exit that is marked-but-unsent is cleared by the existing hardened
+`unresolvedProvesNothingWasSent`. One set-site, one clear-site, one read-site, with a nine-row
+mapping table in §6.5. **The log fix widened:** moving the destructor's ERROR line is necessary but
+not sufficient — three more sites log before the final attempt. They are DEMOTED to INFO with
+transient wording rather than deferred, because "this attempt failed" is true when written and only
+the severity is wrong. Per-site, and they do not all get the same answer: two demote, and
+`logCasWriteRetryLater` stays untouched because it is the generic CAS-write retry line, not a
+release claim — which in turn NARROWS the settled-late assertion to the authoritative message class
+rather than to severity globally.
 
 **v8 (Codex round 5 — 1 blocker, 2 major; the v7 inversion HELD).** The blocker was textual: v6's
 plumbing was still normatively REQUIRED in prose §6.5 had already deleted, so an implementer faced
@@ -1041,27 +1059,82 @@ nothing. Ownership is then PROVEN absent while the state still says `Uncertain` 
 "emit iff `Uncertain` or `Durable`" floods the counter during fencing and shutdown, which are
 precisely the moments an operator reads it.
 
-**Fix at the source, not in the emit rule: a site that can PROVE nothing was transmitted downgrades
-the state to `NotAttempted` before propagating.** That is not a new sub-state — it is what
-`NotAttempted` already means ("`precommitAdd` never reached its append; nothing can be owned").
-Proof, never inference:
+**Fix at the source: a site that can PROVE nothing was transmitted downgrades the state to
+`NotAttempted` before propagating.** That is not a new sub-state — it is what `NotAttempted`
+already means ("`precommitAdd` never reached its append; nothing can be owned"). The question is
+how the proof reaches `precommitAdd`, and an earlier draft got that wrong by proposing to prove it
+at each refusal site. There are **nine** such sites, and the proof is erased before the caller can
+read it: `RefMutationItem` carries only `done`/`error`/`committed_id`
+(`CasRefLedger.h:454-463`), and the one arm that already HAS the proof throws it away one line
+later, collapsing into a generic `NETWORK_ERROR` (`CasRefLedger.cpp:3105-3126`).
 
-- for a request-level outcome, the predicate already exists and is already hardened for exactly
-  this question — `unresolvedProvesNothingWasSent` (`Backend/CasRequestControl.h:76`), which the
-  ref lane already consumes at `CasRefLedger.cpp:1893` and `:3105`;
-- for a lane-level pre-admission refusal (the shutdown drain above), the refusal must carry the
-  same proof out to `precommitAdd` so the downgrade is available there too. **This is the one piece
-  of new plumbing v8 asks for**, and it is a fact the refusal site already knows.
+**So do not enumerate the refusals — mark the single TRANSMISSION point instead.**
+`RefMutationItem` gains one field, `attempted`, set for every survivor of a chunk immediately
+before `putIfAbsentControlled` — adjacent to `armApplyPending` (`CasRefLedger.cpp:2806`), which is
+already documented as "the last statement that still runs while nothing of this transaction can
+possibly be durable". It is the same record-intent-before-the-ambiguous-act discipline
+`PrecommitState` itself uses (`CasPartWriteTxn.cpp:965-971`). Every exit that happens before that
+line leaves `attempted` false, with no per-site work at all:
 
-Absent proof the state stays `Uncertain` and the emission stands — the rule stays fail-closed, and
-only a proven negative silences it.
+| No-send exit | Site | Proven by |
+| --- | --- | --- |
+| shutdown drain refuses admission | `CasRefLedger.cpp:1546-1549` | never enqueued ⇒ never marked |
+| lost fence | `:2179-2184` | pre-PUT ⇒ never marked |
+| supersession (3 sites) | `:2193-2200`, `:2267-2274`, `:2639-2646` | pre-PUT ⇒ never marked |
+| prior wedge | `:2206-2233` | pre-PUT ⇒ never marked |
+| deposition | `:2296-2319` | pre-PUT ⇒ never marked |
+| item validation (2 sites) | `:2425-2460`, `:2513-2577` | pre-PUT ⇒ never marked |
+| unattempted chunk remainder | `:2482-2486` | its chunk never reached the PUT |
+| pre-PUT construction | `:2688-2797` | pre-PUT ⇒ never marked |
+| deadline exhausted with nothing sent | `:3105` | marked, then **cleared** — see below |
 
-**The log must move after the final release attempt.** Today `~PreparedPartWrite` logs its ERROR
-line FIRST and calls `abandonBuildBestEffort` after (`PartFolderAccess.cpp:412-415`), while a
-successful retry writes `Settled` later still (`CasPartWriteTxn.cpp:1380`). So a transaction that
-is released late keeps a false ERROR line while correctly suppressing the counter — the two halves
-of one emission disagreeing. **Required:** attempt the final release first, then emit BOTH halves
-— counter and log — only if it failed. A settled-late exit must produce neither.
+The last row is the one case where the mark is set and still nothing was sent, and it is exactly
+the case the existing hardened predicate decides: `unresolvedProvesNothingWasSent`
+(`Backend/CasRequestControl.h:76`). That arm already computes it and already counts it
+(`CasRefAppendPreAttemptRefused`); it additionally clears `attempted`. **One set-site, one
+proof-gated clear-site, one read-site** — against nine special cases.
+
+`appendRefOps` surfaces the item's `attempted` to its caller on both the normal and the throwing
+path, and `precommitAdd` downgrades to `NotAttempted` iff the append failed and `attempted` is
+false. The receiver-side staging path needs no separate work: `prepareAdoptFromManifest` reaches
+`precommitAdd` through `prepareEntries`, so it inherits the same channel.
+
+Three properties to hold the implementation to, because the shape depends on them:
+
+- **Chunking must not split an item.** The mark is per-item, so an item whose ops landed in a
+  transmitted chunk must read `attempted` even if a later chunk of the same flush was refused. This
+  holds today — the batch builder admits at most one mutation per ref name per flush — and the plan
+  must assert it rather than assume it.
+- **Retries must not reset it.** The mark is set before the FIRST attempt and never re-cleared
+  except by the proof above, so the controller's internal retries and a later wedge resolution both
+  keep it true.
+- **A crash between the mark and the send over-reports.** That is the fail-closed direction and is
+  accepted: the rule stays "emit unless non-transmission is PROVEN", and a lost proof is a louder
+  counter, never a silent leak.
+
+**One authoritative emission, and the intermediate lines are demoted rather than deferred.**
+Today `~PreparedPartWrite` logs its ERROR line FIRST and calls `abandonBuildBestEffort` after
+(`PartFolderAccess.cpp:412-415`), while a successful retry writes `Settled` later still
+(`CasPartWriteTxn.cpp:1380`) — so a transaction released late keeps a false ERROR line while
+correctly suppressing the counter, the two halves of one emission disagreeing. Moving that one line
+is necessary but not sufficient: three other sites log before the final attempt.
+
+The intermediate lines are not FALSE — "this attempt failed" is true when written. They are at the
+wrong SEVERITY, claiming a leak before the last word is in. So they are demoted, not deleted, with
+transient-state wording, per the standing directive that a protocol's own expected uncertainty must
+not present as an error. Each site was checked separately, and they do not get the same answer:
+
+| Site | Verdict |
+| --- | --- |
+| `abandonBuildBestEffort` (`PartFolderAccess.cpp:378-381`) | **Demote to INFO.** It reports ONE attempt and is called from three places, one of which is the destructor — so it must NOT carry the authoritative line, or the final word would be indistinguishable from an intermediate one. The destructor emits its own line after its attempt fails. |
+| receiver scope-guard `abort` (`ContentAddressedMetadataStorage.cpp:2116-2123`) | **Demote to INFO, unconditionally** — and this contradicts a caution worth recording. The concern was that this site also fires on real aborts that are not release-unproven. It does not: `abort` early-returns when `write.isTerminal()`, and the catch is reachable ONLY when `write.abort()` threw, which is exactly a failed removal append. A successful abort logs nothing, so every line this site emits is an intermediate attempt failure. No conditional and no message split needed. |
+| `logCasWriteRetryLater` (`Backend/CasRequestControl.cpp:183-186`) | **LEAVE IT.** It is not a release-unproven claim and not release-specific: it is the generic "CAS write could not be committed; retrying later" line every CAS write path shares, already rate-limited by a `LogSeriesLimiter`. Demoting it would change unrelated paths to buy nothing, and its statement is true regardless of how the release resolves. |
+
+**Required:** attempt the final release first; then emit BOTH halves of the authoritative
+emission — counter and ERROR line — only if it failed. A settled-late exit produces neither.
+Because the third site above is out of scope, **the settled-late assertion is scoped to the
+authoritative message class**, not to "no WARNING anywhere": a generic retry-later warning may
+still appear and is correct.
 
 **What this deletes:** the carrier struct and out-parameter, the observation-point rule, the
 `isTerminal` guard (never a release bit anyway — it is also set immediately after a durable commit,
@@ -1349,8 +1422,9 @@ Rebuilt from the state machine of §6, not transplanted from the old row list:
 | 19 | **Release observed on the promote path** | `promote` → `MechanismFallbackAllowed`, and **every** removal attempt fails — the promote-internal abandon, the receiver's scope guard, and the destructor retry — so `precommitState` is still `Durable`/`Uncertain` at destruction | the action is UNCHANGED (byte fetch, part published exactly once) and `CasPrecommitReleaseUnproven` increments **exactly once**, from the destructor |
 | 20 | **Release observed on the STAGING path** | fail `precommitAdd` uncertainly and fail the `prepareEntries` abandon — the path that returns NO handle (`PartFolderAccess.cpp:491-493`) | same single emission, proving the observation does not depend on a handle reaching the receiver. Regression test for codex-r3 B1 |
 | 21 | **Release never changes the action** | force every removal attempt to fail on S1's `Unknown` exit and on S2's `Unresolved` exit; for S2 run BOTH promote-landed and promote-not-landed variants so the outcome is pinned rather than nondeterministic | all variants still throw retry-later and **none byte-fetches**; exactly ONE emission per transaction in each. Regression test for codex-r3 B2 — S2 is where a byte fetch would double-publish |
-| 22 | **A successful late release emits nothing** | fail the first removal attempts but let the DESTRUCTOR retry succeed | `precommitState` reaches `Settled`, so **neither half** of the emission fires: the counter does not increment AND no ERROR/WARNING line is logged. Both are asserted — logging before the final attempt is exactly the defect this row pins |
-| 23 | **Proven non-transmission is silent** | refuse the `precommitAdd` append at the shutdown drain (`CasRefLedger.cpp:1546-1549`), so nothing is sent | the state is downgraded to `NotAttempted` and the destructor emits nothing. Without this the counter floods during fencing and shutdown |
+| 22 | **A successful late release emits nothing** | fail the first removal attempts but let the DESTRUCTOR retry succeed | `precommitState` reaches `Settled`, so **neither half** of the authoritative emission fires: the counter does not increment AND no ERROR line of the release-unproven class is logged. Intermediate INFO lines from the earlier attempts are EXPECTED and must not fail the assertion — the scope is the authoritative message class, not severity globally (§6.5) |
+| 23 | **Proven non-transmission is silent** | drive each of the marked no-send exits — at minimum the shutdown drain (`CasRefLedger.cpp:1546-1549`), a lost fence, and the deadline-exhausted arm (`:3105`) | `attempted` stays false (or is cleared, for the last), the state is downgraded to `NotAttempted`, and the destructor emits nothing. Without this the counter floods during fencing and shutdown |
+| 24 | **A transmitted attempt is NOT downgraded** | let the PUT be sent and then fail ambiguously | `attempted` is true, so the state stays `Uncertain` and the emission STANDS. The fail-closed half of row 23 — without it, a channel bug that never marks anything would silence the counter entirely and look like success |
 
 The existing failpoint `cas_relink_receiver_pause_before_confirm` is the seam that opens the T1→T2
 window and stays (renamed for accuracy); it is what makes 2–7 reachable at all, since none of them
