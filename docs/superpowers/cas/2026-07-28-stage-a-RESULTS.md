@@ -49,10 +49,10 @@ the BACKLOG as `[FSCK-SCALE-TIMEOUT]`.
 | 5 | `test_cas_file_cache` | pass | `LANE_EXIT=0` | GREEN |
 | 6 | `test_cas_insert_fault_recovery` | pass | `LANE_EXIT=0` | GREEN |
 | 7 | `test_cas_lazy_load_recovery` | pass | `LANE_EXIT=0` | GREEN |
-| 8 | `test_content_addressed_shared_pool` | pass | 2 failed, idle-box reproducible | **RED** — reclamation assertions vs suppression; adapted, unverified |
-| 9 | `test_content_addressed_drop_pool_member` | pass | 1 failed, 1 passed | **RED** — same; adapted, unverified |
-| 10 | `test_content_addressed_ref_snaplog` | pass | 1 failed | **RED** — same; adapted, unverified |
-| 11 | `test_cas_replicated_relink` | pass | 1 failed, 10 passed | **RED** — same; adapted, unverified |
+| 8 | `test_content_addressed_shared_pool` | pass | red (2 failed), then **2 passed** after adaptation, `VERIFY2_EXIT=0` | GREEN (adapted + verified) |
+| 9 | `test_content_addressed_drop_pool_member` | pass | red (1 failed), then **2 passed**, `VERIFY_EXIT=0` | GREEN (adapted + verified) |
+| 10 | `test_content_addressed_ref_snaplog` | pass | red (1 failed), then **1 passed**, `VERIFY_EXIT=0` | GREEN (adapted + verified) |
+| 11 | `test_cas_replicated_relink` | pass | red (1 failed), then **11 passed**, `VERIFY2_EXIT=0` | GREEN (adapted + verified) |
 | 12 | soak, phase 3 `--duration 90m` | zero data loss; no surviving wedge; bounded `unaccounted`; no uninjected ERROR; and — per the stage owner's 2026-07-29 amendment — complete audits at auditable scale plus soak fsck gates reported UNARMED with reason, rather than "fsck clean at end" | attempt 1 died at 49 min (harness bound, fixed); attempt 2 zero data loss, no violation counter moved, epoch seal minted on both replicas, fsck gates reported unarmed with reason, complete audits supplied by 05020 and the scenario end checkpoints | **RED** on one point only: I stopped attempt 2 at minute 95 of 90, before the final converge checkpoint, against an instruction to run it to completion. Every other clause of the amended criterion is met |
 | 13 | S38 late-PUT fence | the fence holds | 18/19 verdicts pass, store returned HTTP 412 | **RED** by the shared end-checkpoint only; every fence assertion GREEN |
 | 14 | S43 (W3) same-uuid recreation | the survivor's write is not absorbed | 5/9; injection reached, servers did not remount on the wiped prefix | **RED** — question not reached |
@@ -171,6 +171,18 @@ by the pin rather than by GC inactivity, and under blanket suppression no observ
 those — so the block now states that the stall-pin claim is UNPROVEN while Stage A is in force, and asks
 for the guard back verbatim at 7b. Silently weakening it would have traded a red for a blind spot,
 which is worse than the red.
+
+**And the adaptation is VERIFIED, not merely committed.** All four lanes now pass on an idle machine:
+`test_content_addressed_ref_snaplog` 1 passed, `test_content_addressed_drop_pool_member` 2 passed,
+`test_content_addressed_shared_pool` 2 passed, `test_cas_replicated_relink` 11 passed
+(`build/t14_verify_*.marker`, `build/t14_verify2_*.marker`, all exit 0).
+
+Verifying caught a real defect in the adaptation itself, which is the argument for verifying: two lanes
+still failed on the assertion I had just added — `no successful GC round ran at all — this is not
+suppression, it is a wedge`, with `rounds = 0`. The assertion was right and its INPUT was wrong: exactly
+one server holds the GC lease for a shared pool and it need not be node1, so asking node1 alone reports
+zero rounds whenever node2 is the leader — the same shape the soak showed when one replica logged 162
+consecutive `NotALeader` finishes. Both now sum the CA GC log across every server in the pool.
 
 ## The 90-minute soak {#soak}
 
@@ -500,21 +512,19 @@ sequencing flips `kDefault`.
 
 ## Verdict {#verdict}
 
-Seven rows green, ten red. Every red is explained and none is a newly-discovered product defect, but
+Eleven rows green, six red. Every red is explained and none is a newly-discovered product defect, but
 the house rule has no partial credit and "explained" is not "green".
 
 STAGE A: FAIL
 
-The failing rows, named as the rule requires: rows 8, 9, 10 and 11 (the four CA integration lanes);
-row 12 (the soak — not for its fsck gates, whose criterion the stage owner has since amended, but
+The failing rows, named as the rule requires: row 12 (the soak — not for its fsck gates, whose criterion the stage owner has since amended, but
 because I stopped attempt 2 at minute 95 of 90 instead of letting the final converge checkpoint run);
 and rows 13, 14, 15 and 16 (all four adversarial scenarios, every
 one of them failing the shared `assert_no_leftovers`).
 
 What would turn this to PASS, in the order the work should be done:
 
-1. **Verify the four adapted lanes.** They are committed (`c7acc572b13`, `9c769f55eaf`) following Task
-   9's own precedent and have not been run since. That is one serial pass on an idle machine.
+1. ~~Verify the four adapted lanes.~~ **DONE** — all four pass (`build/t14_verify*_*.marker`).
 2. **Decide the framework-level question**: `assert_no_leftovers` fails on unreachable-and-uncondemned
    residue, which is Stage A's guaranteed steady state, so it fails every card that drops a table. It
    needs the same treatment the lanes got — assert the Stage-A truth, evidence the suppression, restore
