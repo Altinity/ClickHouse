@@ -2038,3 +2038,9 @@ pin confirmed alive — user stop-check came back clean: nothing was mid-flight,
 **2026-07-29 15:40 local** — watchdog: T16 review mid-write (review file appeared 15:40,
 reviewer transcript fresh 15:36). Everything else parked by design. Verdict expected shortly;
 then the merge sequence begins.
+**2026-07-29 15:5x local** — T16 review APPROVED (3 minor, ledgered; wide-check-before-
+narrowing crowned as THE fix; naive attempts_sent variant explicitly avoided). T16 CLOSED.
+MERGES EXECUTED CLEAN: 7a38fed5987 (T15, 3 commits) + 993dad3e641 (T16) — zero conflicts,
+CasGc exit placement verified in the merged tree (bound after the absent branch, before
+decode). Merged release build+gate running detached (expect 1565 = 1548+8+9); ASan gate next;
+then the exclusive re-validation soak via run_soak.sh.
