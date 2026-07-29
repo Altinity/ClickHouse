@@ -1894,3 +1894,7 @@ bound-the-fold-not-the-read RATIFIED (zero-GET skip provably = permanent suppres
 peek keeps frontier liveness) — USER-VISIBLE DEVIATION from literal "вообще не трогаем".
 GC audit agent dispatched (snapshot-first; a14 holds teardown). All 9 lanes ran; retry of
 adapted lane started.
+**2026-07-29 11:0x local** — audit specimen LOST (no compose volumes; system tables died with
+teardown — structural gap). Salvage: interim text-log-scoped report now + controller live-pass
+figures (unreproducible-marked); harness gains a permanent pre-teardown dump step (a14);
+audit addendum rides T15's 6/40 re-validation. Old text logs archived.
