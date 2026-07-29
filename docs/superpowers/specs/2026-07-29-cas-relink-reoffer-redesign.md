@@ -9,7 +9,7 @@ doc_type: 'reference'
 
 # CAS relink re-offer: retiring the confirm endpoint {#cas-relink-reoffer-redesign}
 
-**Date:** 2026-07-29. **Status:** DESIGN (**v3.1**), awaiting approval. **Branch:** `cas-gc-rebuild`.
+**Date:** 2026-07-29. **Status:** DESIGN (**v4 — final pre-plan**), approved except the TLA gate. **Branch:** `cas-gc-rebuild`.
 Spec only; no code landed.
 
 **v2:** the confirm is expressed as an HTTP conditional request (`ETag` / `If-None-Match`), with
@@ -28,10 +28,18 @@ the eviction code (§4.3); `CaRelinkPromote::MechanismFallbackAllowed` gets its 
 the TLA gate gains three expressiveness requirements (§12.5); and the §1.1 arithmetic is corrected
 against a grep rather than against the design.
 
+**v4 (final user rulings):** the apply-marker fix is **approved**; the recovery budget is cut to
+**minimal protection** — a per-recovery work cap plus a hard-coded concurrency limit — after the
+three-bound design was rejected as overengineering against the warm-by-construction argument
+(§4.3, §14); **no configuration knob** (§4.3.1); wire names settled on the endpoint's existing
+`content_addressed_*` family (§4.1); and §9 now requires the sender to log the hashed COMPONENTS
+beside the digests, since a digest says *mismatch* but not *which side moved*. §15 has no blocking
+questions left.
+
 **v3.1 (user directions):** the 304/503 status mapping is **decided against** — the value encoding
 stands, so the answer always rides in an explicit header value on a 200 (§4.1.6). And the standard
 conditional vocabulary goes with it: `ETag`/`If-None-Match` are replaced by **private
-`X-ClickHouse-CAS-*` headers**, because a standard conditional header does not merely describe our
+private `content_addressed_*` request parameters and response cookies**, because a standard conditional header does not merely describe our
 intent, it *invites* an RFC-conforming intermediary to evaluate the condition and answer 304 from
 its own copy — the forged-certificate shape arriving through a conforming component (§4.1.1). That
 reverses this design's own earlier verdict on axis 1 of §4.1.6, and the reversal is recorded there
@@ -71,12 +79,15 @@ answer enum crossing the replication seam — is deleted, and because the mount 
 FIRST rather than last, a `No` becomes authoritative knowledge the receiver can act on instead of
 a refusal it must retry.
 
-**Two gates, both of which can stop this design, stated up front rather than discovered late:**
+**Two gates, stated up front rather than discovered late. The first is approved; the second is
+still open and can still stop this design:**
 
 1. **The apply-pending marker must be made synchronized before the lane-quiescence refusal can be
-   removed** (§5.1.2). The refusal this design deletes is currently the *properly locked* guard on
-   the durable-but-unapplied window; the marker meant to replace it is a relaxed atomic written
-   outside any lock. This is a real change to the ref-lane append path, not to the relink path.
+   removed** (§5.1.2) — **APPROVED (user, 2026-07-29); ships as specced.** The refusal this design
+   deletes is currently the *properly locked* guard on the durable-but-unapplied window; the marker
+   meant to replace it is a relaxed atomic written outside any lock. This is a real change to the
+   ref-lane append path, not to the relink path, which is why it was raised as a gate — scoped at
+   under 20 lines in one file with no control-flow change.
 2. **The TLA model must be refined and must then pass** (§12.3, §12.5). As it stands the model
    refutes this design — correctly, given what it represents. The refinement is what distinguishes
    "the deleted terms were redundant" from "the deleted terms were load-bearing", and if the
@@ -95,21 +106,21 @@ argued. Deletions are measured against the tree; additions are estimated.
 | Receiver outcomes to reason about | 7 taxonomy rows | **4 states** |
 | Interserver actions on the endpoint | 2 (fetch + confirm) | **1** — the confirm IS an offer |
 | Fields the receiver must round-trip | 6, parsed | **16 opaque bytes**, parsed by nobody |
-| Bespoke wire names | 5 | **4**, all private (§4.1.6 axis 1) |
+| Bespoke wire names | 5 | **5** — unchanged, and §4.1 says so plainly |
 | Content-addressed identifiers in `src/Storages/MergeTree/` | **6** | **4** |
 | Seam methods serving the confirm | `confirmExactRef` + `ownsNamespace` | **0** |
 | Lane mutexes held to answer | 2, in a bespoke snapshot | **1**, the ordinary read path |
 | Reversible codecs on the path | 1 (~170 lines) | **0** |
-| Wire grammars to parse and defend | the codec's + `If-None-Match`'s | **0** — one opaque token, compared byte-wise |
+| Wire grammars to parse and defend | the codec's + `If-None-Match`'s | **0** — every value compared byte-wise, none parsed |
 
 | Lines | Deleted | Added |
 | --- | --- | --- |
-| Shared (`DataPartsExchange.cpp`/`.h`) | 317 | ≈177 |
-| Content-addressed (incl. the **~170-line token codec, whole file**) | 450 | ≈159 |
+| Shared (`DataPartsExchange.cpp`/`.h`) | 317 | ≈181 |
+| Content-addressed (incl. the **~170-line token codec, whole file**) | 450 | ≈124 |
 | Apply-marker synchronization (§5.1.2) | — | **≈20, no control-flow change** |
-| **Net production** | | **≈−410** |
+| **Net production** | | **≈−440** |
 | Tests made moot / added (§11) | ≈250 | ≈80 |
-| **Net overall** | | **≈−580** |
+| **Net overall** | | **≈−610** |
 
 Two honesty notes, because both numbers moved after review and a spec whose arithmetic drifts is
 worse than one with no arithmetic. **(1)** The identifier row is 6→4, not the 5→2 an earlier draft
@@ -117,10 +128,10 @@ claimed: `CasRelinkSourceToken` and `encodeCasRelinkSourceToken` never appear in
 at all (only the decoder does), so the earlier table counted a concept that was not there. The
 four that remain after are `IContentAddressedExchange`, `ICaPreparedRelink`, `CaRelinkPrepare`,
 `CaRelinkPromote`; the two that go are `CasConfirmAnswer` and `decodeCasRelinkSourceToken`.
-**(2)** The added column grew: the recovery budget (§4.3) is now a real ~60-line design rather
-than a one-liner, and would reach ~100 if its cache-segmentation half ships. That is the largest
-single addition here, it materially offsets the deletion, and §4.3 gates it on measurement rather
-than assuming it.
+**(2)** The added column moved twice. Codex round 1 grew it — the recovery budget became a
+~100-line three-bound design — and the user then rejected that as overengineering (§14), leaving
+~25 lines of minimal protection. The net deletion is better for it, and the episode is the reason
+§4.3 now leads with why a confirm is warm rather than with machinery.
 
 Everything else either removes something or discharges a stated obligation, named in one sentence
 where it is introduced: §4.1 (the digest — deletes the codec), §4.1.3 (the certified answer —
@@ -215,35 +226,43 @@ six-field token and its codec, and it is what makes precise mismatch logging pos
 shape does NOT need is `ETag` and `If-None-Match`, and §4.1.1 is why using them would be actively
 harmful rather than merely ornamental.
 
-Every name below is ours. The `X-ClickHouse-` prefix follows the convention already established in
-the tree (`X-ClickHouse-Query-Id`, `X-ClickHouse-Summary`, `X-ClickHouse-Exception-Code`, and a
-dozen more); RFC 6648 deprecates `X-` prefixes for headers that might one day be standardized,
-which these never will be, so house consistency wins and the deviation is deliberate.
+Every name is ours, and they follow the channel and prefix this endpoint already uses rather than
+introducing a second convention beside it: **request values are query parameters, response values
+are cookies, everything is `content_addressed_`-prefixed** — exactly as
+`content_addressed_pool_uuid` and `content_addressed_relink` are today. That also means no new
+client plumbing: `getResponseCookie` is the accessor the receiver already calls.
 
-| Header | Direction | Meaning |
+| Name | Channel | Meaning |
 | --- | --- | --- |
-| `X-ClickHouse-CAS-Expected-Identity` | request | The validator the receiver adopted at T1. **Its presence selects confirm mode**: answer about the binding, send no manifest body and no bytes. |
-| `X-ClickHouse-CAS-Confirm-Nonce` | request | A fresh per-confirm nonce (§4.1.4). |
-| `X-ClickHouse-CAS-Identity` | response | The sender's current validator for `part`. Set on **both** the offer and the confirm; absent on the confirm when there is no binding. |
-| `X-ClickHouse-CAS-Answer` | response | The CERTIFIED answer: `proven`, `changed`, or `unknown:<reason>`. Emitted **only** by the confirm path (§4.1.3). |
-| `X-ClickHouse-CAS-Confirm-Nonce` | response | The nonce echoed back (§4.1.4). |
+| `content_addressed_confirm` | request param | **Presence selects confirm mode** — answer about the binding, send no manifest body and no bytes — and its VALUE is the per-confirm nonce (§4.1.4). |
+| `content_addressed_expected` | request param | The validator the receiver adopted at T1. |
+| `content_addressed_identity` | response cookie | The sender's current validator for `part`. Set on **both** the offer and the confirm; absent on the confirm when there is no binding. |
+| `content_addressed_answer` | response cookie | The CERTIFIED answer: `proven`, `changed`, or `unknown:<reason>`. Emitted **only** by the confirm path (§4.1.3). |
+| `content_addressed_nonce` | response cookie | The nonce echoed back (§4.1.4). |
 | `Cache-Control: no-store` | response | Pinned on both responses — see §4.1.5. |
 
-**Four bespoke names, against five today — and that count is the wrong metric, so here is the
-right one.** Going private costs one name relative to the standard-vocabulary draft and buys the
-elimination of an entire inherited grammar. `If-None-Match` brings wildcards, comma-separated
-lists and weak/strong comparison with it; every one of those is a shape a sender must recognize
-and refuse, and one of them (`*`) is a forged-certificate hole (§4.1.1). A private header carries
-one opaque token compared byte-wise: **no wildcard semantics, no list semantics, no weak form, no
-grammar, nothing to parse and therefore nothing to get wrong.** Parsing obligations on the path go
-to zero, which is the property the 170-line codec deletion was really about.
+**Five names, against five today — so the honest headline is that the name count does not move at
+all.** It is worth saying plainly, because two earlier drafts of this section claimed a reduction
+that does not survive counting. What changes is what the names CARRY. Today's five are an action
+parameter, a six-field token needing a 170-line reversible codec, an answer cookie and two magic
+values. The five above are each single-purpose and single-valued, and **not one of them is parsed
+beyond a byte comparison**: the receiver compares `content_addressed_identity` to what it holds,
+compares `content_addressed_answer` to the literal `proven`, compares the nonce to what it sent,
+and logs anything else verbatim without interpreting it. Even `unknown:<reason>` is never split —
+it is one opaque token that fails both equality tests and gets logged.
+
+Choosing private names over `If-None-Match`/`ETag` also declines an inherited grammar: wildcards,
+comma-separated lists and weak comparison are each a shape a sender would have to recognize and
+refuse, and one of them (`*`) is a forged-certificate hole (§4.1.1). **Grammars on the path: one
+codec plus one standard header's, down to zero.** That, not the name count, is what the codec
+deletion was always about.
 
 **The validator is a digest over the QUALIFIED binding**, not over the `ManifestRef` alone — see
 §3 for why the bare tuple is not an identity:
 
 ```text
 validator = hex( digest( pool_uuid ‖ disk_name ‖ root_namespace ‖ ref_name ‖ manifest_ref_text ) )
-X-ClickHouse-CAS-Identity: 3f2a…c1
+content_addressed_identity=3f2a…c1
 ```
 
 Each field is **length-prefixed** before hashing. That is not pedantry: without unambiguous
@@ -326,27 +345,27 @@ identity validator, by construction.
 
 #### 4.1.2 What the sender does with the condition {#sender-condition}
 
-The sender evaluates `X-ClickHouse-CAS-Expected-Identity` itself, under the fence-first ordering of §4.2, and this
+The sender evaluates `content_addressed_expected` itself, under the fence-first ordering of §4.2, and this
 placement is deliberate: it keeps the comparison in the shape `confirmExactRef` already has (rule
 5's exact equality plus rule 6's fence become the conditional evaluation), and it puts the
 receiver's EXPECTED validator on the sender, where a mismatch can be logged as
 expected-versus-actual by the node that knows which rule produced it. The receiver still compares
-the returned `X-ClickHouse-CAS-Identity` too — that comparison is what it acts on — but the sender is no longer
+the returned `content_addressed_identity` too — that comparison is what it acts on — but the sender is no longer
 answering a question it cannot see.
 
 #### 4.1.3 The certified answer must not be confusable with an offer {#certified-answer}
 
-The `X-ClickHouse-CAS-Identity` alone is not enough, and the reason is sharp: **the offer response carries the same
+The `content_addressed_identity` alone is not enough, and the reason is sharp: **the offer response carries the same
 validator, and the offer path is not gated.** `getRelinkOffer` resolves through the ordinary read
 path; it applies none of §4.2's fence, wedge or apply-state checks, because an offer is a
 proposal, not a certificate. So if the identity-only parameter is stripped, ignored by an older
-peer, or misdispatched, the sender answers with an ordinary OFFER — whose `X-ClickHouse-CAS-Identity` may well equal
+peer, or misdispatched, the sender answers with an ordinary OFFER — whose `content_addressed_identity` may well equal
 the receiver's held validator — and a receiver comparing validators alone would read that as
 `Yes` and promote on an ungated resolve.
 
 Two independent defences, because this one is worth over-covering:
 
-1. **STRUCTURAL — the certified answer is a different header.** `X-ClickHouse-CAS-Answer`
+1. **STRUCTURAL — the certified answer is a different header.** `content_addressed_answer`
    is emitted only by the confirm path, after §4.2's ordering has run. An offer never carries it,
    so a stripped flag cannot produce one. The receiver requires `proven` and treats its absence as
    `Unknown`, never as an inference.
@@ -355,7 +374,7 @@ Two independent defences, because this one is worth over-covering:
    requirement with a test (§11 row 15), not a preference** — an earlier draft carried it as an
    open question, which understated it.
 
-This is also why the answer is EXPLICIT rather than inferred from a missing `X-ClickHouse-CAS-Identity`. Absence is a
+This is also why the answer is EXPLICIT rather than inferred from a missing `content_addressed_identity`. Absence is a
 weak signal: a stripped header, a misroute and a genuinely absent binding are three different
 facts, and only the last of them is the sender speaking. The `unknown:<reason>` form carries the
 refusing rule (`fence`, `unrecovered`, `wedge`, `poison`, `budget`, `no-such-part`) — **diagnostic
@@ -366,8 +385,8 @@ lies in the reason field changes nothing but its own logs.
 
 `no-store` is policy, and policy does not bind a reverse proxy the receiver never configured. The
 structural guard is a **nonce**: the receiver generates 16 random bytes per confirm, sends them as
-the value of `X-ClickHouse-CAS-Expected-Identity`, and requires them echoed in
-`X-ClickHouse-CAS-Confirm-Nonce`. A mismatch or an absence is `Unknown`.
+the value of `content_addressed_expected`, and requires them echoed in
+`content_addressed_nonce`. A mismatch or an absence is `Unknown`.
 
 This closes the replay class that `no-store` only discourages: an intermediary replaying an
 earlier identity response for the same URL — a response that may PREDATE T1, and therefore
@@ -491,7 +510,7 @@ as an exception. The answer rides in an explicit tri-state header value on a 200
 absence of anything, with `assertEOF` normative. Both the status mapping and the standard
 conditional vocabulary are recorded here as analysed and rejected, each with its own evidence —
 the former on `assertResponseIsOk` and the cache-forgery asymmetry, the latter on §4.1.1's
-invitation argument. This closes what was open question 2.
+invitation argument. Both are decided; §15 carries the full ledger.
 
 The one piece of real functionality the 503 spelling would add is `Retry-After` — sender-paced
 backoff instead of the queue's fixed one. It is deliberately NOT adopted here as a consolation
@@ -503,14 +522,14 @@ own change with its own evidence, not as a rider on this one.
 
 Three outcomes, and — unlike today — two of them are knowledge.
 
-| `X-ClickHouse-CAS-Answer` | `X-ClickHouse-CAS-Identity` | Outcome | What the sender is asserting |
+| `content_addressed_answer` | `content_addressed_identity` | Outcome | What the sender is asserting |
 | --- | --- | --- | --- |
-| `proven` | equal to `X-ClickHouse-CAS-Expected-Identity` | **Yes** | *"I hold the mount fence, and this ref still names exactly that binding."* |
+| `proven` | equal to `content_addressed_expected` | **Yes** | *"I hold the mount fence, and this ref still names exactly that binding."* |
 | `changed` | present, different | **No** — authoritative | *"I hold the mount fence, and this ref names a different binding now."* |
 | `unknown:<reason>` | absent | **Unknown** | *"I cannot speak for this binding right now, and here is which rule stopped me."* |
 | absent / anything else | — | **Unknown** | Not an answer at all: a stripped header, a misroute, an older peer, an offer that reached the wrong branch. |
 
-The answer and the validator must BOTH agree before a promote: `proven` with a non-matching `X-ClickHouse-CAS-Identity`
+The answer and the validator must BOTH agree before a promote: `proven` with a non-matching `content_addressed_identity`
 is a contradiction, not a `Yes`, and it is treated as `Unknown`. Each is separately sufficient to
 fail closed.
 
@@ -547,8 +566,8 @@ The order of the sender's evaluation, therefore:
 4. **Apply state.** Anything other than `RefApplyState::Clean` ⇒ `Unknown`. `ApplyPending` means a
    transaction is in flight between its `PUT` and its install; `Poisoned` means this cache is
    known to be missing a durable transaction.
-5. **The row.** The committed row for the ref: present ⇒ emit its validator as the `X-ClickHouse-CAS-Identity` and
-   compare it with `X-ClickHouse-CAS-Expected-Identity`; absent ⇒ emit no `X-ClickHouse-CAS-Identity`. The emitted validator is
+5. **The row.** The committed row for the ref: present ⇒ emit its validator as the `content_addressed_identity` and
+   compare it with `content_addressed_expected`; absent ⇒ emit no `content_addressed_identity`. The emitted validator is
    authoritative, because 1–4 established that this view is neither stale nor unentitled.
 
 Rules 1, 3, 4 and 5 are today's rules 6, 3a, 4 and 5 with the fence hoisted. **Rules 2's
@@ -584,81 +603,68 @@ it is a `ReadMaintenance` parameter on `resolveRef` (`Full` for local callers,
 `AnswerOnly` for this one) rather than a parallel resolve implementation — one resolve, one
 recovery preamble, one place where the committed row is read.
 
-**A budget on peer-initiated recovery.** *This is the one mechanism in the design that deletes
-nothing; it exists solely to discharge a named safety obligation — that a remote peer cannot
-drive unbounded work on this writer — which §4.3's removal of the zero-I/O contract would
-otherwise leave undischarged.* Recovery is a full `LIST` plus log replay, orders of
-magnitude beyond the `HEAD`-free query it replaces, and the LRU eviction budget is an
-**amplifier**: with `ref_table_cache_bytes` at 256 MiB (`CasPool.h:221`), a peer cycling confirms
-across many namespaces makes every answer cold, and each cold answer evicts a table the writer
-was using — a self-sustaining recovery storm driven entirely by a remote peer.
+**Minimal protection on peer-initiated recovery.** *This is the only mechanism in the design that
+deletes nothing; it exists to discharge a named safety obligation — that a remote peer cannot drive
+UNBOUNDED work on this writer — which removing the zero-I/O contract would otherwise leave
+undischarged.* An earlier draft of this section specified three bounds and ran to ~100 lines. It
+was **rejected as overengineering** (user, 2026-07-29), and the reason it was wrong is worth
+stating because it is structural rather than a matter of taste.
 
-**An earlier draft proposed a one-line fix — don't mark a peer-initiated recovery
-most-recently-used — and it does not work.** `ensureRefTableRecovered` calls
-`enforceRefTableCacheBudget(ns)`, and that function *excludes the just-recovered `keep_ns` from the
-candidate set* (`CasRefLedger.cpp:1247-1248`). So the hostile recovery is protected during the very
-pass it triggers, and leaving its tick unbumped cannot stop it evicting somebody else's idle table;
-it only decides who goes on the NEXT pass. The second half is worse: a table kept hot ONLY by
-legitimate confirms would never be touched either, so it sorts first among candidates and a peer
-alternating between two namespaces can keep a legitimately-hot table permanently cold. The
-mechanism helps the attacker and hurts the honest path. It is withdrawn.
+**The confirm is warm by construction.** It follows the offer by seconds, and the offer was
+answered by this same sender for this same namespace: `getRelinkOffer` routes the part and resolves
+its ref, which runs the ordinary read preamble, which calls `ensureRefTableRecovered` — and that
+call **marks the table most-recently-used** (`CasRefLedger.cpp:925`). So at confirm time the table
+is not merely warm, it is the *last* candidate the LRU pass would evict. For a confirm to be cold,
+the table must have been evicted within those seconds despite being the most recently touched one
+in the cache. That is a corner, not a load; the confirm is not a hot path in the sense that would
+justify machinery; and the corner's outcome is `Unknown` ⇒ retry, which is the softest failure this
+protocol has.
 
-The bound has to cover three distinct quantities, and a cap on any one of them leaves the other
-two open:
+What survives is the smallest thing that still bounds the unbounded:
 
-**(a) DISPLACEMENT — a class-segmented cache.** Peer-initiated recoveries get their own small
-quota inside the ref-table cache. A table first materialized by a peer-initiated read is tagged
-`peer` class; any LOCAL read or write of it promotes it to `local` class permanently. Eviction
-prefers `peer`-class tables whenever the peer quota is exceeded, and only then falls back to the
-normal LRU over `local`. Effect: a hostile peer churns inside its own quota and can never displace
-the writer's working set, while a legitimately-confirmed table — which in the steady state is one
-the sender is actively WRITING (§10 measurement 1) — graduates to `local` on its first local touch
-and stops being preferentially evicted. This answers both halves of the refutation above.
+1. **A per-recovery work cap.** A single namespace's `LIST` plus replay has no natural bound, so
+   this is the one bound whose absence is a real hazard rather than a theoretical one. A
+   peer-initiated recovery carries a work budget (pages listed / transactions replayed / elapsed
+   deadline); exceeding it ABANDONS the recovery and answers `Unknown`. Safe because recovery
+   installs its result atomically — abandoning before the install leaves nothing partial — and it
+   applies **only** to the peer-initiated class, since a local recovery must always be allowed to
+   complete or the writer could starve itself.
+2. **A hard-coded global concurrency limit** of one or two peer-initiated recoveries at a time.
+   Over the limit ⇒ `Unknown`, with its own counter. Checked before any I/O and only when the
+   table is not already warm, so the ordinary path never touches it.
 
-**(b) RATE — a token bucket, not a concurrency cap.** A concurrency cap bounds simultaneous
-recoveries and nothing else; one peer can refill every slot the instant it frees and starve every
-legitimate cold confirm indefinitely. The bound must be on cumulative rate: a pool-global token
-bucket over peer-initiated recoveries, refilled at a fixed rate. Empty bucket ⇒ `Unknown`.
-
-**(c) PER-RECOVERY WORK — a cap on one recovery.** A single namespace's `LIST` plus replay is
-unbounded in principle, so rate alone does not bound work. A peer-initiated recovery carries a
-work budget (pages listed / transactions replayed / elapsed deadline); exceeding it ABANDONS the
-recovery and answers `Unknown`. Two properties make this safe rather than a new failure mode:
-recovery installs its result atomically, so abandoning before the install leaves nothing partial;
-and the cap applies **only** to the peer-initiated class — a local recovery must always be allowed
-to complete, or the writer would be able to starve itself.
-
-All three are checked BEFORE any I/O and only when the table is not already warm: **a warm answer
-never touches the budget at all**, which is the case §10 measurement 1 says dominates.
+Both are constants in the source. There is **no configuration knob** (see §4.3.1), no token bucket,
+no cache segmentation and no fairness machinery; §14 records why those were dropped.
 
 The DoS contract survives, reformulated: it was *"a peer can make this writer do no I/O at all"*
 and becomes ***"everything a peer can make this writer do is bounded above"*** — bounded in
-concurrency, in rate, in per-request work, and in cache displacement. That weakening is real and
-is the one structural property this design trades away; it is stated here rather than buried.
+per-request work and in concurrency. That weakening is real and is the one structural property this
+design trades away; it is stated here rather than buried.
 
-**Complexity gate, because this section is now the largest addition in the design.** (a)–(c)
-together are roughly 100 lines, which materially offsets the deletion this effort exists for.
-§10 measurement 1 decides how much of it ships: if cold confirms are rare in steady state — the
-prior expectation, since the sender of a part being fetched is writing that namespace — then
-**(b) and (c) alone discharge the obligation** (bounded rate × bounded work = bounded damage,
-including the displacement, just less gracefully), and (a) is deferred as an optimization for the
-honest path. Ship the smallest set that closes the obligation; escalate to (a) on evidence.
+**Observability requirement, from the decision:** refusals from either bound get their OWN
+counter, distinct from every other `Unknown`. The rule-3 storm took a live cluster to diagnose
+precisely because refusal reasons were indistinguishable on the wire and unlogged on the sender.
 
-**Observability requirement, from the decision:** budget refusals get their OWN counter, distinct
-from every other `Unknown`. The rule-3 storm took a live cluster to diagnose precisely because
-refusal reasons were indistinguishable on the wire and unlogged on the sender.
+#### 4.3.1 No configuration knob {#no-knob}
+
+YAGNI, decided (user, 2026-07-29): the work cap and the concurrency limit are hard-coded constants
+with **no operator surface at all**. `ref_table_cache_bytes` is already a struct default with no XML
+plumbing (`CasPool.h:221`), so this introduces no inconsistency. A knob is a documentation,
+support and compatibility obligation forever; it arrives only if §10 measurement 1 ever contradicts
+the warm-by-construction premise, and that measurement exists precisely as the tripwire for
+revisiting this.
 
 ### 4.4 The receiver's comparison, and the byte-fetch fast path {#receiver-comparison}
 
 The receiver holds the validator from the first offer. It re-issues the offer with
-`X-ClickHouse-CAS-Expected-Identity: <that validator>` and `X-ClickHouse-CAS-Confirm-Nonce: <fresh nonce>`, then
+`content_addressed_expected=<that validator>` and `content_addressed_confirm=<fresh nonce>`, then
 promotes **only if all four of these hold**:
 
 1. the response body is empty (`assertEOF`, §4.1.3) — it is a confirm, not an offer;
-2. `X-ClickHouse-CAS-Confirm-Nonce` echoes the nonce (§4.1.4) — it is THIS confirm, not a replay;
-3. `X-ClickHouse-CAS-Answer` is `proven` (§4.1.3) — the sender certified, under §4.2's
+2. `content_addressed_nonce` echoes the nonce (§4.1.4) — it is THIS confirm, not a replay;
+3. `content_addressed_answer` is `proven` (§4.1.3) — the sender certified, under §4.2's
    ordering, rather than merely resolved;
-4. the `X-ClickHouse-CAS-Identity` equals the held validator (§4.1) — the certified binding is the adopted one.
+4. the `content_addressed_identity` equals the held validator (§4.1) — the certified binding is the adopted one.
 
 Any single failure is `Unknown`. The four are deliberately independent: each covers a different
 way the answer could fail to be an answer, and none of them is inferred from the absence of
@@ -666,7 +672,7 @@ another.
 
 The other two outcomes:
 
-- `changed` with a present, different `X-ClickHouse-CAS-Identity` ⇒ `abort` the prepared relink, then **fetch the bytes
+- `changed` with a present, different `content_addressed_identity` ⇒ `abort` the prepared relink, then **fetch the bytes
   from the same sender**;
 - everything else (refusal, older peer, no such part, transport failure, timeout — one outcome, as
   today) ⇒ `abort`, then throw the retry-later `NETWORK_ERROR`.
@@ -812,7 +818,7 @@ every path that reaches it, instead of once per row.
 ### 6.1 S0 — NOT STAGED {#s0-not-staged}
 
 Nothing of this relink is durable at the receiver — either never staged, or staged and provably
-released. Reached by: no `X-ClickHouse-CAS-Identity` on the offer (a peer that predates this design), an unrecognized
+released. Reached by: no `content_addressed_identity` on the offer (a peer that predates this design), an unrecognized
 relink cookie value, a reservation that landed outside the advertised pool, an undecodable
 manifest, the retryable staging class (`CaRelinkPrepare::MechanismFallbackAllowed` — body-absent
 precommit, precommit no longer the live owner, ref conflict), **and a `promote` that returned
@@ -956,16 +962,16 @@ Line counts are measured against the current tree.
 | `Service` confirm declarations | `DataPartsExchange.h:55-74` | 20 |
 | `enum class CasConfirmAnswer` opaque forward declaration | `DataPartsExchange.h:33-36` | 4 |
 
-Replaced by: an identity-only answer branch (≈35), four private header names (≈16), one
-protocol-version constant (≈5), the confirm request block including the nonce and the
-four-condition check (≈60), the four-state machine comment (≈55), one `Service` declaration (≈8).
-**Net: 703 → ≈564 CA-attributable lines in the two shared files, ≈−139 (−20%).**
+Replaced by: an identity-only answer branch (≈35), five wire names (≈20), one protocol-version
+constant (≈5), the confirm request block including the nonce and the four-condition check (≈60),
+the four-state machine comment (≈55), one `Service` declaration (≈8). **Net: 703 → ≈567
+CA-attributable lines in the two shared files, ≈−136 (−19%).**
 
-The wire-name row is a substitution with a small discount — five bespoke names become four — not
-the near-total deletion an earlier draft claimed. What actually goes to zero is the number of
-GRAMMARS on the path: the 170-line reversible codec is deleted, and no standard header's grammar
-(wildcards, lists, weak comparison) is inherited in its place (§4.1.1). One opaque token compared
-byte-wise is the entire parsing surface.
+The wire-name row is a straight substitution — five names for five — and NOT the near-total
+deletion two earlier drafts claimed. What actually goes to zero is the number of GRAMMARS on the
+path: the 170-line reversible codec is deleted, and no standard header's grammar (wildcards,
+lists, weak comparison) is inherited in its place (§4.1.1). Every value on the wire is compared
+byte-wise and none is parsed; that is the entire parsing surface.
 
 ### 8.2 Content-addressed surface {#deletions-ca}
 
@@ -978,9 +984,9 @@ byte-wise is the entire parsing surface.
 | `Cas::ConfirmAnswer` + its declaration | `CasRefLedger.h` | ≈40 |
 
 Replaced by an identity-only mode on `getRelinkOffer` (≈18), a peer-facing resolve on the ledger
-(≈45), their declarations (≈31), the validator digest (≈5, §4.1) and the recovery budget's
-shipped minimum (≈60, §4.3(b)+(c); ≈100 if (a) also ships). **Net ≈ −291.** Combined with §8.1
-and the ≈20-line marker fix: **≈ −410 production lines**, plus the test delta of §11.
+(≈45), their declarations (≈31), the validator digest (≈5, §4.1) and §4.3's minimal protection —
+a per-recovery work cap plus a hard-coded concurrency limit (≈25). **Net ≈ −326.** Combined with
+§8.1 and the ≈20-line marker fix: **≈ −440 production lines**, plus the test delta of §11.
 
 ### 8.3 Concepts that stop crossing the seam {#deletions-concepts}
 
@@ -1048,17 +1054,28 @@ confirm counter at all.
 sender-side `LOG_DEBUG` must name the rule that produced the refusal (fence / unrecovered /
 wedge / poison / budget / no-such-part) — the same value it now also puts on the wire.
 
-The conditional form improves this materially and for free: because the expectation header puts the
-receiver's EXPECTED validator on the sender, a mismatch can be logged as
-**expected-versus-actual on the node that knows why**, rather than as a bare "unproven" that
-tells the reader nothing about which of the two sides moved. That was impossible with the old
-token, where the sender learned the expectation only as one of six fields it had to decode first.
+The conditional form improves this materially and for free: because `content_addressed_expected`
+puts the receiver's EXPECTED validator on the sender, a mismatch can be logged as
+**expected-versus-actual on the node that knows why**, rather than as a bare "unproven" that tells
+the reader nothing about which of the two sides moved. That was impossible with the old token,
+where the sender learned the expectation only as one of six fields it had to decode first.
+
+**The digest costs readability, so the log must pay it back.** The old token was plain text: a
+human reading a refusal saw the namespace, the ref and the manifest reference directly. Two
+sixteen-byte hex strings say only *match* or *mismatch*. Therefore the sender's mismatch log MUST
+emit **the components it hashed** — namespace, ref name, `ManifestRef`, disk — alongside the two
+digests. The digests establish that something moved; the components are what say WHICH thing moved,
+and that is the whole diagnostic value the plain-text form used to give away for free.
 
 ## 10. Measurements {#measurements}
 
 In priority order; the first is decisive for whether §4.3's budget is insurance or structure.
 
-1. **Share of re-offers hitting a COLD table.** Prior expectation: steady-state confirms are warm
+1. **Share of confirms hitting a COLD table — now the TRIPWIRE for a decided design, not an input
+   to an open one.** §4.3's minimal protection rests on the claim that a confirm is warm by
+   construction; this measurement is what would falsify it. A materially non-zero cold share in
+   steady state is the signal to revisit §14's rejected bounds.
+   *(Original framing:)* **Share of re-offers hitting a COLD table.** Prior expectation: steady-state confirms are warm
    almost by definition — the sender of a part being fetched is writing that namespace. Cold
    bursts should cluster around node recovery, which is exactly when the sender is busiest, which
    is why the budget exists at all. If the cold share is non-trivial in steady state, the budget
@@ -1082,19 +1099,19 @@ Rebuilt from the state machine of §6, not transplanted from the old row list:
 | --- | --- | --- | --- |
 | 1 | S1 → Yes | ordinary busy writer, sustained inserts | promote; **availability is not degraded by a busy lane** — the direct regression test for §2 |
 | 2 | S1 → No, repointed | repoint the source ref inside the pause window | authoritative `No`; byte fetch to the SAME sender; part converges |
-| 3 | S1 → Unknown, part gone | drop/merge the source part inside the pause window | no `X-ClickHouse-CAS-Identity`; retry-later; no promote; no double publish; **no byte re-request** |
-| 4 | S1 → Unknown, fence lost | revoke the sender's mount fence | no `X-ClickHouse-CAS-Identity`; INFO severity; transient-state message; retry-later; **no byte re-request** |
+| 3 | S1 → Unknown, part gone | drop/merge the source part inside the pause window | no `content_addressed_identity`; retry-later; no promote; no double publish; **no byte re-request** |
+| 4 | S1 → Unknown, fence lost | revoke the sender's mount fence | no `content_addressed_identity`; INFO severity; transient-state message; retry-later; **no byte re-request** |
 | 5 | S1 → Unknown, wedge | wedge the sender's append lane | as 4 |
 | 6 | S1 → Unknown, poisoned | poison the sender's apply state | as 4 |
 | 7 | S1 → Unknown, budget | exhaust the peer-initiated recovery budget | as 4, plus `CasRelinkRecoveryBudgetRefused` increments and no other `Unknown` counter does |
 | 8 | S0 | `cas_relink_receiver_force_mechanism_failure` | byte fetch; recursion brake bounds it to one attempt |
 | 9 | S2 | promote forced to `Unresolved` | retry-later; **never** a byte fetch |
 | 10 | Cross-pool | receiver in a different pool | no offer; bytes; unchanged |
-| 11 | Version mix | peer advertising the pre-redesign version | no `X-ClickHouse-CAS-Identity` ⇒ S0 ⇒ bytes |
+| 11 | Version mix | peer advertising the pre-redesign version | no `content_addressed_identity` ⇒ S0 ⇒ bytes |
 | 12 | Sender-side answer contract | direct ledger test | discretionary maintenance is NOT scheduled by a peer-initiated read; recovery IS |
 | 13 | **Cache safety** | inspect both responses | offer AND confirm carry `Cache-Control: no-store` (§4.1.5) |
 | 14 | **No standard conditional machinery** | send `If-None-Match` (both matching and `*`), `If-Modified-Since`, and a two-valued list | ALL are ignored — they select nothing and certify nothing; neither response ever carries `ETag` or `Last-Modified`; no promote is reachable through any of them (§4.1.1) |
-| 15 | **Stripped mode header ⇒ offer, not answer** | issue the confirm with `X-ClickHouse-CAS-Expected-Identity` removed | the sender replies with a full offer; the receiver rejects it — no `X-ClickHouse-CAS-Answer` header AND non-empty body — and promotes NOTHING even though the `X-ClickHouse-CAS-Identity` matches. Asserts both defences of §4.1.3 independently, by disabling each in turn |
+| 15 | **Stripped mode header ⇒ offer, not answer** | issue the confirm with `content_addressed_expected` removed | the sender replies with a full offer; the receiver rejects it — no `content_addressed_answer` header AND non-empty body — and promotes NOTHING even though the `content_addressed_identity` matches. Asserts both defences of §4.1.3 independently, by disabling each in turn |
 | 16 | **Replay** | replay a captured earlier confirm response for the same part and validator | nonce mismatch ⇒ `Unknown`; no promote (§4.1.4) |
 | 17 | **Cross-mount collision** | two same-pool CA disks, same `server_root_id`, same table; offer from disk A, `MOVE ... TO DISK` to B, force B to hold the same `ManifestRef` tuple for that ref | validators DIFFER (the digest is mount-qualified), so the answer is `changed`, never `proven`. This is B1's shape and the direct regression test for §3 |
 | 18 | **S1 → S0 via promote** | force `promote` to `MechanismFallbackAllowed` | byte fetch to the same sender; no double publish; distinct from row 9's `Unresolved`, which must NOT byte-fetch |
@@ -1229,7 +1246,7 @@ single `..._WITH_CA_RELINK = 12`, and the two pre-release constants 10 and 11 ar
 one line of historical note, because no released build ever advertised them:
 
 - a v12 sender offers a relink only to a receiver advertising ≥ 12;
-- a v12 receiver talking to an older sender receives an offer with no `X-ClickHouse-CAS-Identity`, which is
+- a v12 receiver talking to an older sender receives an offer with no `content_addressed_identity`, which is
   state S0 — the capability gate — and byte-fetches;
 - an older receiver never advertises ≥ 12, so it is never offered a relink.
 
@@ -1249,6 +1266,21 @@ the storm is an availability and waste cost, not a correctness one (unproven ⇒
 Mechanically (i) could live inside (ii) as a warm fast path; also rejected, because it resurrects
 the index and eats (ii)'s surface-deletion win — which is the whole point of (ii).
 
+**The token bucket and the cache-class segmentation** (rejected 2026-07-29 by the user as
+overengineering). An earlier §4.3 specified three bounds: a per-recovery work cap, a pool-global
+rate token bucket, and a peer/local cache-class segmentation of the ref-table budget, with per-peer
+fairness as a follow-on question. Only the work cap and a hard-coded concurrency limit survive. The
+rationale is §4.3's warm-by-construction argument, in the user's words: *"confirm отстоит от
+начального fetch на секунды — вряд ли он будет холодным, поэтому это не hot path; можно какую-то
+минимальную защиту добавить, но точно не стоит того чтобы из-за этого сильно усложнять код."* The
+rate bucket and the segmentation both defend a cold-confirm storm, and a confirm arriving seconds
+after an offer that just marked its table most-recently-used is not cold except in a corner —
+whose outcome is `Unknown` ⇒ retry. Roughly 60 lines and an entire cache-classification concept
+were bought for a corner. Per-peer fairness and reservations die with them, since there is no
+longer a shared allowance to be unfair about. **Tripwire:** §10 measurement 1 measures the cold
+share directly; if it ever contradicts the premise, this is the entry to revisit, and the design is
+written down here rather than discarded so revisiting is cheap.
+
 **(iii) Receiver-pays verification.** The receiver could verify by reading the sender's ref state
 directly from the shared pool: `recoverRefTableDetailed` is a free function and the offer names
 the namespace and ref. Recorded as rejected so it is not re-proposed, but the axis it clarifies is
@@ -1259,49 +1291,29 @@ exists to close, which is precisely the property §12 has just reassigned to tho
 
 ## 15. Open questions {#open-questions}
 
-Six. Two that stood here in earlier drafts are now **decided** and recorded where they belong:
-the 304/503 status mapping and the standard conditional vocabulary are both settled in §4.1.6
-(value encoding stands, private headers), and `assertEOF` is normative in §4.1.3 rather than a
-preference.
+**None blocking. Every question this spec raised has been answered**, and the answers live in the
+sections they belong to rather than in a list at the end. Recorded here so a reader can see that
+the list is empty by decision and not by omission:
 
-1. **The apply-marker synchronization (§5.1.2) touches the append hot path — is that acceptable,
-   and is the mutex the right instrument?** The alternative is to keep a cheap synchronized
-   in-flight indicator instead of promoting the marker: retain `leader_active` in the answer but
-   NOT `pending`, which costs a `ref_queue_mutex` acquire on the answer path and leaves a wider
-   refusal window than the design targets (a tenure is longer than a chunk). Recommendation is the
-   marker fix, because it removes a conflation rather than trimming one; but it is a change to
-   code this design otherwise does not touch, and that deserves an explicit decision. Scoped in
-   §5.1.2 at **under 20 lines, one file, no control-flow change**. *(Its former sub-question is
-   answered, not asked: the lock goes at the call site, because `forceWedgeForTest` already calls
-   `armApplyPending` holding `state_mutex` and a self-locking version would deadlock there.)*
-2. **How much of the budget ships now?** §4.3 specifies three bounds — (a) cache-class
-   segmentation, (b) a rate token bucket, (c) a per-recovery work cap — and recommends shipping
-   (b)+(c) first, with (a) gated on §10 measurement 1. (b)+(c) discharge the DoS obligation on
-   their own; (a) protects the HONEST path from preferential eviction and costs ~40 more lines.
-   Ship the minimum and escalate on evidence, or take all three now so the cache behaviour is
-   settled once? Defaults for the bucket rate and the work cap also need choosing.
-3. **Budget fairness: global, per-peer, or reserved?** §4.3's bounds are pool-global, which means
-   one abusive peer consumes the whole allowance and starves legitimate cold confirms from every
-   other replica — the bound holds, the fairness does not. Per-peer buckets fix that and cost
-   per-peer state keyed by something the peer supplies (so it is itself spoofable within the
-   interserver trust boundary); a reservation for local recoveries fixes the worst symptom more
-   cheaply. Recommendation: global first, since the peer set inside one cluster is small and
-   mutually trusted, and revisit if measurement 1 shows cold confirms matter at all. Confirm, or
-   choose per-peer now?
-4. **Config knob, or none at all?** `ref_table_cache_bytes` is currently a struct default
-   (`CasPool.h:221`) with no XML plumbing. Recommendation is global-first — one pool-wide setting
-   — but if the budget turns out to be theoretical insurance (measurement 1), a hard-coded
-   constant with no operator surface is one fewer knob to document and support. Which?
-5. **Header names.** Four private names, all `X-ClickHouse-CAS-` prefixed per the tree's existing
-   convention: `-Expected-Identity` (request, also the mode selector), `-Confirm-Nonce` (both
-   ways), `-Identity` (response), `-Answer` (response). Descriptive but long, and the prefix is
-   RFC 6648-deprecated in general while being this codebase's house style. Keep, shorten, or drop
-   the `X-`?
-6. **Does the confirm-mode branch dispatch before or after `findPart`?** This spec dispatches it
-   early (as the confirm does today at `DataPartsExchange.cpp:308`) so a vanished part is ANSWERED
-   — `unknown:no-such-part`, with no identity header — rather than thrown as `NO_SUCH_DATA_PART`,
-   preserving "a question is answered, never thrown". **B1 changed what this question is about.**
-   It used to carry the routing problem; the mount-and-namespace-qualified validator (§3, §4.1)
-   now settles routing on its own, and a mount that did not make the offer cannot produce a
-   matching validator whichever side of `findPart` the branch sits on. What remains is purely the
-   answered-versus-thrown style choice, which is why it is last and lightest.
+| Was asked | Answer | Where |
+| --- | --- | --- |
+| Apply-marker synchronization — acceptable on the append path? | **APPROVED**, ships as specced (~20 lines, one file) | §5.1.2 |
+| 304/503 status mapping? | **Rejected** — value encoding stands | §4.1.6 |
+| Standard `ETag`/`If-None-Match` vocabulary? | **Rejected** — a standard header invites intermediaries to answer | §4.1.1, §4.1.6 |
+| `assertEOF` strictness — wanted? | **Normative**, with a test; it is one of two defences against a stripped mode parameter | §4.1.3, §11 row 15 |
+| Split the authoritative `No`? | **Dissolved** — a vanished part has no validator, so it lands in `Unknown` and retry-later, which is the correct action | §4.2 |
+| How much of the recovery budget ships? | **Minimal only** — work cap + hard-coded concurrency limit; token bucket and cache segmentation rejected as overengineering | §4.3, §14 |
+| Budget fairness — global, per-peer, reserved? | **Dissolved** with the shared allowance it would have divided | §14 |
+| Configuration knob? | **No knob** — hard-coded constants, no operator surface | §4.3.1 |
+| Wire naming? | **Decided** — `content_addressed_*` request parameters and response cookies, matching the endpoint's existing family | §4.1 |
+| Dispatch before or after `findPart`? | **Decided** — early, so a vanished part is answered rather than thrown; the routing half was settled by the qualified validator | §4.2, §3 |
+
+Two items remain, and neither needs a decision now because neither is answerable from a document:
+
+- **The TLA gate (§12.3, §12.5)** — the model must be refined and must then pass. This is the one
+  thing that can still stop the design, and it is settled by running TLC, not by choosing.
+- **§10 measurement 1 (cold-confirm share)** — the tripwire for §4.3's warm-by-construction
+  premise. It validates a decision already taken; it does not gate the work.
+
+Everything else is implementation-time detail: the exact work-cap and concurrency constants, and
+the enumeration of `apply_state` writers §5.1.2 requires the plan to audit.
