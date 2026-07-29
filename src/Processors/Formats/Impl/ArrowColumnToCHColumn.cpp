@@ -446,18 +446,6 @@ static ColumnWithTypeAndName readColumnWithDurationData(const std::shared_ptr<ar
         /// buffers[0] is a null bitmap and buffers[1] are actual values
         const auto * raw_data = getValidatedBuffer<Int64>(*chunk, column_name);
         column_data.insert_assume_reserved(raw_data, raw_data + chunk->length());
-
-        /// Values at null positions are not guaranteed to be initialized in the source buffer.
-        /// Zero them out because downstream code (type conversions, serialization) may read all values.
-        if (chunk->null_count() > 0)
-        {
-            size_t start = column_data.size() - chunk->length();
-            for (int64_t i = 0; i < chunk->length(); ++i)
-            {
-                if (chunk->IsNull(i))
-                    column_data[start + i] = {};
-            }
-        }
     }
 
     return {std::move(internal_column), std::move(internal_type), column_name};
@@ -2055,7 +2043,6 @@ static ColumnWithTypeAndName readNonNullableColumnFromArrowColumn(
             {
                 array_type = std::make_shared<DataTypeArray>(nested_column.type);
             }
-<<<<<<< HEAD
             /// Validate that the last offset matches the nested column size before constructing
             /// ColumnArray.  ColumnArray's constructor skips data->size() == last_offset when
             /// data->empty() (the && !data->empty() short-circuit), so a crafted Arrow file
@@ -2069,8 +2056,6 @@ static ColumnWithTypeAndName readNonNullableColumnFromArrowColumn(
                         "Arrow List column '{}': last offset {} does not match nested column size {}",
                         column_name, off.back(), array_data_column->size());
             }
-=======
->>>>>>> 57b8b335336 (Merge pull request #1802 from Altinity/feature/antalya-26.3/ClickHouse-ClickHouse-pr-101272)
             auto array_column = ColumnArray::create(array_data_column, offsets_column);
             return {std::move(array_column), array_type, column_name};
         }
