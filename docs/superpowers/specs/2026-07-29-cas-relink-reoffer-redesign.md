@@ -1,5 +1,5 @@
 ---
-description: 'Design: the CAS fetch-by-relink confirm is re-expressed as a second, identity-only OFFER against the same endpoint. The separate confirm action, its six-field source token and its percent-encoding codec, the `CasConfirmAnswer` enum crossing the replication seam, the namespace-routing predicate and the lane-quiescence refusal all disappear; the mount fence moves first so a `No` becomes authoritative knowledge.'
+description: 'Design: the CAS fetch-by-relink confirm is re-expressed as a second, identity-only OFFER against the same endpoint, made conditional on a strong `ETag` derived from the `ManifestRef`. The separate confirm action, its six-field source token and its percent-encoding codec, the `CasConfirmAnswer` enum crossing the replication seam, the namespace-routing predicate and the lane-quiescence refusal all disappear; the mount fence moves first so a `No` becomes authoritative knowledge.'
 sidebar_label: 'CAS relink re-offer redesign'
 sidebar_position: 20260729
 slug: /superpowers/specs/cas-relink-reoffer-redesign
@@ -35,9 +35,11 @@ untrusted strings to one of its disks, filters it through the parts set, and ans
 `yes`/`unproven` out of a bespoke six-rule snapshot taken across both ref-lane mutexes with zero
 object-store I/O. Under this design the receiver instead **asks the same question the offer
 already answered, a second time**: it re-issues the ORIGINAL offer request — same endpoint, same
-`part` parameter, same advertised pool identity — with one added flag meaning *"answer with the
-binding's identity only; send no manifest body"*. The sender answers from its ordinary committed
-view. The receiver compares two opaque strings. Everything that existed only to carry a question
+`part` parameter, same advertised pool identity — **made conditional on the binding it adopted**.
+The offer carries a strong `ETag` derived from the `ManifestRef`; the confirm is that same request
+back with `If-None-Match` and a flag meaning *"answer about the binding only; send no manifest
+body"*. The sender answers from its ordinary committed view. Everything that existed only to carry
+a question
 without its context — the token, its codec, the routing predicate, the parts-set proof gate, the
 answer enum crossing the replication seam — is deleted, and because the mount fence is evaluated
 FIRST rather than last, a `No` becomes authoritative knowledge the receiver can act on instead of
@@ -112,38 +114,153 @@ receiver keeps it and compares it itself.
 
 ## 4. The mechanism {#mechanism}
 
-### 4.1 Wire protocol {#wire-protocol}
+### 4.1 Wire protocol: the confirm is a conditional request {#wire-protocol}
 
-One request parameter and one response cookie replace the five confirm names.
+**The confirm is an HTTP conditional request.** The offer carries a STRONG VALIDATOR for the
+binding it is offering; the confirm is the same request back, made conditional on that validator.
+This is not decoration — it is what lets the six-field token and its bespoke codec be replaced by
+**one standard header pair**, and it gives the sender the receiver's expectation on the wire,
+which is what makes precise mismatch logging possible at all.
 
 | Name | Direction | Meaning |
 | --- | --- | --- |
-| `content_addressed_relink_identity_only` | request | *"Answer with the binding identity for `part`; send no manifest body and no bytes."* Present only on the second request. |
-| `content_addressed_manifest_id` | response | The sender's binding identity for `part`: the canonical `writer_epoch:build_sequence:manifest_ordinal` text, or the literal `none`. Absent means the sender did not answer. |
+| `ETag` | response | The strong validator of the sender's current binding for `part`. Set on **both** the offer and the confirm. |
+| `If-None-Match` | request | The validator the receiver adopted at T1. Present only on the confirm. |
+| `content_addressed_relink_identity_only` | request | *"Answer about the binding only; send no manifest body and no bytes."* Present only on the confirm. |
+| `Cache-Control: no-store` | response | Pinned on both responses — see §4.1.3. |
 
-Set on **both** responses — the first offer and the re-offer — because that is what makes the
-comparison a comparison of like with like. `content_addressed_source_token` is deleted.
+`content_addressed_source_token` and all five confirm names are deleted.
 
-The identity is **opaque to the receiver**: it is stored and compared byte-exactly and never
-parsed. This is not a style preference, it removes an obligation — today the canonical form is
-parsed from untrusted peer input on the sender (`tryParseManifestRef`, whose comment documents
-exactly that hazard); under this design no peer-supplied manifest reference is ever parsed by
-anyone. `none` cannot collide with a real identity: the canonical form is three colon-separated
-decimal fields, and the ordinal `0` is a reserved invalid sentinel that is never emitted.
+**The validator is the canonical `ManifestRef` text**, quoted: `ETag: "12:34:56"` for
+`writer_epoch:build_sequence:manifest_ordinal`. Every character of that form is a legal `etagc`,
+so no encoding layer is needed — which is the whole point, since an encoding layer is exactly what
+is being deleted. A hash of it would work equally well and buys nothing: the receiver already
+learns the `ManifestRef` from the offer body, so there is no secrecy to protect.
 
-The receiver's pool identity (`content_addressed_pool_uuid`) rides on the re-offer exactly as it
-rides on the first offer, so the same-pool gate at `DataPartsExchange.cpp:410` applies unchanged
-and needs no restatement.
+It is a **strong** validator and the design depends on that. `precommitAdd` mint-tightening
+(superseded spec §A3) guarantees that every repoint and every recreate mints a FRESH `ManifestRef`,
+so validator equality is exact identity with no ABA to defend against. Weak validators (`W/"..."`)
+are **forbidden in both directions**: weak comparison admits "semantically equivalent"
+representations, and this protocol has no notion of equivalence — only identity. A receiver must
+never send one and a sender must answer `Unknown` if it ever sees one.
+
+The validator is **opaque to the receiver**: stored and compared byte-exactly, never parsed. That
+removes an obligation rather than adding one — today the canonical form is parsed from untrusted
+peer input on the sender (`tryParseManifestRef`, whose comment documents exactly that hazard).
+Under this design no peer-supplied manifest reference is parsed by anyone.
+
+The receiver's pool identity (`content_addressed_pool_uuid`) rides on the confirm exactly as it
+rides on the offer, so the same-pool gate at `DataPartsExchange.cpp:410` applies unchanged.
+
+#### 4.1.1 `If-Modified-Since` is rejected {#no-modified-since}
+
+Explicitly, so it is never proposed: **bindings change IDENTITY, not time.**
+
+The temptation is real and close at hand — `RefCommittedRow` already carries a `published_at_ms`
+that `resolveRef` returns to every caller, so a `Last-Modified` header is one field access away.
+It must not be used. A time-based validator would reintroduce clock trust into a decision that
+today depends on no clock at all, and, worse, it cannot express the property this confirm exists
+to establish: two manifests can be published within the same millisecond, and a binding that is
+repointed away and back would look unmodified to any time-based comparison. `ManifestRef` plus
+mint-tightening is a perfect strong validator precisely because it makes both cases impossible by
+construction. **No `Last-Modified` is emitted on these responses at all**, so there is nothing for
+a peer to condition on by mistake, and `If-Modified-Since` on a request is answered `Unknown`
+rather than honoured.
+
+Two more validator-hygiene rules, both of which are forged-certificate holes if omitted:
+
+- **`If-None-Match: *` is refused** (answered `Unknown`). The wildcard means "if any
+  representation exists", which would let a peer obtain an affirmative answer **without naming a
+  binding at all** — a liveness certificate for a manifest it never identified.
+- **A multi-valued `If-None-Match` is refused.** The header grammar permits a list, and a list
+  match means "one of these", which is not this protocol's semantics. Exactly one validator, or
+  `Unknown`.
+
+#### 4.1.2 What the sender does with the condition {#sender-condition}
+
+The sender evaluates `If-None-Match` itself, under the fence-first ordering of §4.2, and this
+placement is deliberate: it keeps the comparison in the shape `confirmExactRef` already has (rule
+5's exact equality plus rule 6's fence become the conditional evaluation), and it puts the
+receiver's EXPECTED validator on the sender, where a mismatch can be logged as
+expected-versus-actual by the node that knows which rule produced it. The receiver still compares
+the returned `ETag` too — that comparison is what it acts on — but the sender is no longer
+answering a question it cannot see.
+
+#### 4.1.3 NEW RISK: a cached affirmative answer is a forged liveness certificate {#cache-risk}
+
+Conditional responses are exactly what intermediary caches are built to serve. An affirmative
+confirm served from a cache would be a **forged liveness certificate**: the receiver would promote
+n blobs on the strength of an assertion no live writer made, which is a direct violation of §7's
+invariant. Interserver traffic should not traverse shared caches — but the spec must not rest on
+"should not".
+
+Mitigations, in order of strength:
+
+1. **Structural.** The affirmative answer is carried by the **ETag VALUE**, not by a status code.
+   A cache can synthesize a "still current" *status* from its own stored copy — that is its job —
+   but it cannot synthesize an origin's current validator value. This is why §4.1.4's status-based
+   variant is a genuinely riskier encoding and not merely a different spelling.
+2. **`Cache-Control: no-store`** pinned on both the offer and the confirm responses. Not
+   `no-cache`, which permits storage with revalidation; `no-store` forbids storage at all.
+3. **The interserver authentication path**, which the shared handler applies before it dispatches
+   to any endpoint.
+
+The test matrix (§11) gains an assertion that both responses carry `no-store`.
+
+#### 4.1.4 VARIANT (analysed, not chosen): the 304/503 status mapping {#status-variant}
+
+The natural full-HTTP spelling maps the three answers onto status codes: **304 Not Modified** =
+Yes, **200 with a different ETag** = authoritative No, **503 + `Retry-After`** = Unknown. It is a
+better-looking protocol and it lands exactly on our three-answer semantics. It is recorded here as
+a variant rather than the design because verification turned up a concrete blocker and a risk.
+
+**The blocker is in the shared HTTP client.** `assertResponseIsOk` (`src/IO/HTTPCommon.cpp:71-90`)
+accepts **only** 200, 201, 202, 206 and redirects; every other status is turned into a thrown
+`HTTPException`. So under the status mapping, **304 and 503 both arrive as C++ exceptions** — the
+receiver would have to catch and inspect `getHTTPStatus`, which is the pattern
+`http_skip_not_found_url` already uses for 404 (`ReadWriteBufferFromHTTP.cpp:482`). Two
+consequences:
+
+- **The protocol's SUCCESS path becomes an exception.** The refusal storm this whole effort exists
+  to remove costs ~23 symbolized frames per event (§2); making the *affirmative* answer pay that
+  is the wrong direction, and it is the same directive — an expected protocol outcome must not
+  present as an error — applied to the happy path.
+- **Avoiding that means changing shared IO code.** 304 cannot simply be added to
+  `assertResponseIsOk`'s global accept list: for an ordinary `url` read, which sends no
+  conditional request, a 304 is a protocol violation and must stay an error. It would have to be
+  an opt-in flag threaded through `ReadWriteBufferFromHTTP`'s constructor, its builder and
+  `assertResponseIsOk` — three or four files of shared upstream IO, for an encoding whose benefit
+  over §4.1 is aesthetic. That is a direct trade against goal 2.
+
+**The risk** is §4.1.3's: a 304 is precisely what an intermediary synthesizes from its own stored
+copy, so under the status mapping the affirmative answer is the one thing a cache can forge, and
+`no-store` becomes load-bearing policy rather than a second line of defence.
+
+**Recommendation:** adopt the conditional-request FORM — which is the substance: strong validator,
+`If-None-Match`, no timestamps, the token deleted, precise sender-side logging — and keep the
+transport status at 200, carrying the answer in the validator. `Retry-After` remains available on
+the refusal path as a response header if the sender wants to pace a retry, which is the one piece
+of real functionality the 503 spelling would otherwise add. See open question 2.
 
 ### 4.2 Answer vocabulary and the fence-first reordering {#answer-vocabulary}
 
 Three outcomes, and — unlike today — two of them are knowledge.
 
-| Cookie | Outcome | What the sender is asserting |
+| Response `ETag` | Outcome | What the sender is asserting |
 | --- | --- | --- |
-| identity equal to the held one | **Yes** | *"I hold the mount fence, and this ref still names exactly that manifest."* |
-| identity present but different, or `none` | **No** — authoritative | *"I hold the mount fence, and this ref does not name that manifest (any more)."* |
-| absent | **Unknown** | *"I cannot speak for this namespace right now."* |
+| equal to the receiver's `If-None-Match` | **Yes** | *"I hold the mount fence, and this ref still names exactly that manifest."* |
+| present and different | **No** — authoritative | *"I hold the mount fence, and this ref names a different manifest now."* |
+| absent | **Unknown** | *"I cannot speak for this binding right now."* |
+
+Note what the third row absorbs, because it closes a question the earlier draft of this design left
+open. A part that has been merged or dropped away entirely has no binding and therefore no
+validator, so it lands in **Unknown**, not in `No` — and that is the correct action rather than a
+concession: there is nothing to byte-fetch from a sender that no longer has the part, so
+retry-later, which re-executes the queue entry and recomputes the covering-part discovery, is
+exactly what should happen. The authoritative-`No` byte-fetch payoff (§4.4) applies to the case
+where it actually pays — a repoint, where the sender demonstrably still has a part under that
+name. No sentinel value is needed on the wire, so the `none` literal an identity-cookie encoding
+would have required does not exist.
 
 The fence check moves from LAST to FIRST. `CasConfirmAnswer`'s own comment already prescribes the
 reorder for anyone who wants to distinguish `No` (`ContentAddressedExchange.h:19-26`): "Any code
@@ -163,7 +280,8 @@ The order of the sender's evaluation, therefore:
 4. **Apply state.** Anything other than `RefApplyState::Clean` ⇒ `Unknown`. `ApplyPending` means a
    transaction is in flight between its `PUT` and its install; `Poisoned` means this cache is
    known to be missing a durable transaction.
-5. **The row.** The committed row for the ref: present ⇒ its identity; absent ⇒ `none`. Both are
+5. **The row.** The committed row for the ref: present ⇒ emit its validator as the `ETag` and
+   compare it with `If-None-Match`; absent ⇒ emit no `ETag`. The emitted validator is
    authoritative, because 1–4 established that this view is neither stale nor unentitled.
 
 Rules 1, 3, 4 and 5 are today's rules 6, 3a, 4 and 5 with the fence hoisted. **Rules 2's
@@ -227,14 +345,15 @@ refusal reasons were indistinguishable on the wire and unlogged on the sender.
 
 ### 4.4 The receiver's comparison, and the byte-fetch fast path {#receiver-comparison}
 
-The receiver holds the identity from the first offer. It re-issues the offer with
-`content_addressed_relink_identity_only`, reads the cookie, and compares:
+The receiver holds the validator from the first offer. It re-issues the offer with
+`If-None-Match: <that validator>` and the identity-only flag, reads the response `ETag`, and
+compares:
 
 - **equal** ⇒ promote (T3), exactly as today;
-- **different or `none`** ⇒ `abort` the prepared relink, then **fetch the bytes from the same
+- **present and different** ⇒ `abort` the prepared relink, then **fetch the bytes from the same
   sender**;
-- **absent** (refusal, older peer, transport failure, timeout — one outcome, as today) ⇒ `abort`,
-  then throw the retry-later `NETWORK_ERROR`.
+- **absent** (refusal, older peer, no such part, transport failure, timeout — one outcome, as
+  today) ⇒ `abort`, then throw the retry-later `NETWORK_ERROR`.
 
 The middle line is new and is the payoff of the fence-first reordering. Today it is forbidden:
 row 3's ban on a same-sender byte re-request exists because *"a byte re-request goes back to the
@@ -363,7 +482,7 @@ every path that reaches it, instead of once per row.
 
 ### 6.1 S0 — NOT STAGED {#s0-not-staged}
 
-Nothing of this relink is durable at the receiver. Reached by: no identity cookie on the offer (a
+Nothing of this relink is durable at the receiver. Reached by: no `ETag` on the offer (a
 peer that predates this design), an unrecognized relink cookie value, a reservation that landed
 outside the advertised pool, an undecodable manifest, or the retryable staging class
 (`CaRelinkPrepare::MechanismFallbackAllowed` — body-absent precommit, precommit no longer the live
@@ -482,10 +601,15 @@ Line counts are measured against the current tree.
 | `Service` confirm declarations | `DataPartsExchange.h:55-74` | 20 |
 | `enum class CasConfirmAnswer` opaque forward declaration | `DataPartsExchange.h:33-36` | 4 |
 
-Replaced by: an identity-only answer branch (≈35), two wire names (≈12), one protocol-version
-constant (≈5), the re-offer request block (≈50), the four-state machine comment (≈55), one
-`Service` declaration (≈8). **Net: 703 → ≈556 CA-attributable lines in the two shared files, −147
-(−21%).**
+Replaced by: an identity-only answer branch (≈35), **one** request-parameter constant — the
+validator and the cache directive are standard `ETag` / `If-None-Match` / `Cache-Control` headers,
+not names this codebase invents (≈8) — one protocol-version constant (≈5), the confirm request
+block (≈50), the four-state machine comment (≈55), one `Service` declaration (≈8). **Net: 703 →
+≈550 CA-attributable lines in the two shared files, ≈−150 (−21%).**
+
+The conditional-request encoding is what makes the wire-name row a near-total deletion rather than
+a substitution: five bespoke names become one flag plus three headers that every HTTP stack, proxy
+and packet capture already understands.
 
 ### 8.2 Content-addressed surface {#deletions-ca}
 
@@ -545,11 +669,16 @@ confirm counter at all.
 | `CasRelinkUnknown` | the sender could not speak; retry-later |
 | `CasRelinkRecoveryBudgetRefused` | **its own counter**, per the decision: an `Unknown` caused by the peer-initiated recovery budget, distinguishable from every other `Unknown` |
 
-**Which rule refused.** Today an `Unknown` maps silently through
+**Which rule refused, and what was expected.** Today an `Unknown` maps silently through
 `ContentAddressedMetadataStorage.cpp:1996`, and diagnosing rule 3 took a live cluster. The
 sender-side `LOG_DEBUG` must name the rule that produced the refusal (fence / unrecovered /
-wedge / poison / budget) — the answer stays binary on the wire, the diagnosis stays where the
-rule that produced it can be named.
+wedge / poison / budget) — the diagnosis stays where the rule that produced it can be named.
+
+The conditional form improves this materially and for free: because `If-None-Match` puts the
+receiver's EXPECTED validator on the sender, a mismatch can be logged as
+**expected-versus-actual on the node that knows why**, rather than as a bare "unproven" that
+tells the reader nothing about which of the two sides moved. That was impossible with the old
+token, where the sender learned the expectation only as one of six fields it had to decode first.
 
 ## 10. Measurements {#measurements}
 
@@ -579,16 +708,18 @@ Rebuilt from the state machine of §6, not transplanted from the old row list:
 | --- | --- | --- | --- |
 | 1 | S1 → Yes | ordinary busy writer, sustained inserts | promote; **availability is not degraded by a busy lane** — the direct regression test for §2 |
 | 2 | S1 → No, repointed | repoint the source ref inside the pause window | authoritative `No`; byte fetch to the SAME sender; part converges |
-| 3 | S1 → No, absent | drop/merge the source part inside the pause window | authoritative `No`; no promote; no double publish |
-| 4 | S1 → Unknown, fence lost | revoke the sender's mount fence | absent cookie; INFO severity; transient-state message; retry-later; **no byte re-request** |
+| 3 | S1 → Unknown, part gone | drop/merge the source part inside the pause window | no `ETag`; retry-later; no promote; no double publish; **no byte re-request** |
+| 4 | S1 → Unknown, fence lost | revoke the sender's mount fence | no `ETag`; INFO severity; transient-state message; retry-later; **no byte re-request** |
 | 5 | S1 → Unknown, wedge | wedge the sender's append lane | as 4 |
 | 6 | S1 → Unknown, poisoned | poison the sender's apply state | as 4 |
 | 7 | S1 → Unknown, budget | exhaust the peer-initiated recovery budget | as 4, plus `CasRelinkRecoveryBudgetRefused` increments and no other `Unknown` counter does |
 | 8 | S0 | `cas_relink_receiver_force_mechanism_failure` | byte fetch; recursion brake bounds it to one attempt |
 | 9 | S2 | promote forced to `Unresolved` | retry-later; **never** a byte fetch |
 | 10 | Cross-pool | receiver in a different pool | no offer; bytes; unchanged |
-| 11 | Version mix | peer advertising the pre-redesign version | no identity cookie ⇒ S0 ⇒ bytes |
+| 11 | Version mix | peer advertising the pre-redesign version | no `ETag` ⇒ S0 ⇒ bytes |
 | 12 | Sender-side answer contract | direct ledger test | discretionary maintenance is NOT scheduled by a peer-initiated read; recovery IS |
+| 13 | **Cache safety** | inspect both responses | offer AND confirm carry `Cache-Control: no-store` (§4.1.3) |
+| 14 | **Validator hygiene** | send `If-None-Match: *`, a two-valued list, a weak `W/"..."`, and an `If-Modified-Since` | each answered `Unknown`; **none** of them can yield a promote; no `Last-Modified` is emitted |
 
 The existing failpoint `cas_relink_receiver_pause_before_confirm` is the seam that opens the T1→T2
 window and stays (renamed for accuracy); it is what makes 2–7 reachable at all, since none of them
@@ -614,6 +745,17 @@ configurations: `_main`, `_main2r`, five `_sab_*` sabotages, four `_witness_*`, 
 `_sab_holeylist`. `_main` checks `TypeOK`, `GraduationIsPhased`, `ConfirmedRelinkNeverDangles` and
 `PromotedNeverDangles`. This design changes what the model is responsible for, what it must be
 refined to represent, and what it must be re-derived against.
+
+**Disposition:** `CaRelinkConfirmCore` is **kept as the historical witness** of the v11 protocol
+and is not edited in place — its `_sab_*` results are the evidence that v11's rules were each
+load-bearing, and rewriting it would destroy that record. The redesign gets its **own** model,
+covering the custody chain under the named assumption of §12.2.
+
+**The conditional-request encoding does not change the state space.** `ETag`/`If-None-Match` is a
+wire spelling of the same three answers the model already has (`"yes"` / `"no"` / `"unknown"` in
+`Gate1Answer`), so nothing in §12.3's refinement or §12.4's re-derivation depends on which
+spelling §4.1 versus §4.1.4 wins. That independence is worth stating because it means the
+encoding question can be settled after the model work starts, not before it.
 
 ### 12.1 Dangle-freedom is reassigned {#tla-dangle-reassign}
 
@@ -691,7 +833,7 @@ single `..._WITH_CA_RELINK = 12`, and the two pre-release constants 10 and 11 ar
 one line of historical note, because no released build ever advertised them:
 
 - a v12 sender offers a relink only to a receiver advertising ≥ 12;
-- a v12 receiver talking to an older sender receives an offer with no identity cookie, which is
+- a v12 receiver talking to an older sender receives an offer with no `ETag`, which is
   state S0 — the capability gate — and byte-fetches;
 - an older receiver never advertises ≥ 12, so it is never offered a relink.
 
@@ -730,12 +872,19 @@ exists to close, which is precisely the property §12 has just reassigned to tho
    code this design otherwise does not touch, and that deserves an explicit decision. Related
    question: should `armApplyPending` keep its `noexcept` allocation-free contract by taking the
    lock at the call site rather than inside itself?
-2. **Split the authoritative `No`?** §4.4 sends both `No` shapes to a byte fetch. The wire already
-   distinguishes them, so routing `none` (the sender has no such ref) to retry-later instead —
-   letting the queue re-select a source rather than issuing a byte request that will fail with
-   `NO_SUCH_DATA_PART` — is free in wire terms and costs one branch on the receiver. It saves one
-   doomed request in a case whose frequency measurement 2 will tell us. Ship the simple version
-   and revisit, or take the branch now?
+2. **The 304/503 status mapping (§4.1.4) — accept the analysis, or overrule it?** The
+   conditional-request FORM is adopted either way; the question is only whether the three answers
+   ride on status codes or on the validator value. Recommendation: the validator, because
+   `assertResponseIsOk` (`src/IO/HTTPCommon.cpp:75-79`) accepts only 200/201/202/206/redirects, so
+   the status spelling delivers **the protocol's success path as a C++ exception** unless three or
+   four files of shared upstream IO gain an opt-in flag — and because a 304 is the one answer an
+   intermediary cache can forge, whereas a validator value it cannot. If the status mapping is
+   wanted regardless, the shared-IO change needs its own consultation under the upstream rule
+   before anything is written.
+   *(This question replaces an earlier one about splitting the authoritative `No`, which the
+   conditional encoding resolved on its own: a vanished part simply has no validator, so it lands
+   in `Unknown` and retry-later — which is the correct action, since there is nothing to
+   byte-fetch. See §4.2.)*
 3. **Budget shape and default.** §4.3 recommends a pool-global concurrency cap plus the LRU
    non-promotion. Is a rate ceiling (a leaky bucket) needed in addition, or does concurrency plus
    non-promotion bound it adequately? Default value?
@@ -743,14 +892,18 @@ exists to close, which is precisely the property §12 has just reassigned to tho
    (`CasPool.h:221`) with no XML plumbing. Recommendation is global-first — one pool-wide setting
    — but if the budget turns out to be theoretical insurance (measurement 1), a hard-coded
    constant with no operator surface is one fewer knob to document and support. Which?
-5. **Does the re-offer keep the `assertEOF` strictness?** The identity-only response has an empty
-   body by construction, exactly as the confirm's did, so requiring EOF before reading the cookie
-   keeps a misrouted or desynchronized reply "unproven" rather than half-parsed. Confirm this is
-   wanted on the re-offer path too.
-6. **Naming.** `content_addressed_relink_identity_only` / `content_addressed_manifest_id` are
-   descriptive but long. Preference?
+5. **Does the confirm keep the `assertEOF` strictness?** The identity-only response has an empty
+   body by construction, exactly as the confirm's does today, so requiring EOF before reading the
+   `ETag` keeps a misrouted or desynchronized reply "unproven" rather than half-parsed. Confirm
+   this is wanted on the conditional path too.
+6. **Naming.** `content_addressed_relink_identity_only` is the only bespoke name left on the wire
+   — descriptive but long. Preference? (The validator, condition and cache directive are all
+   standard headers and need no name of ours.)
 7. **Does the identity-only branch dispatch before or after `findPart`?** This spec dispatches it
-   early (as the confirm is today at `DataPartsExchange.cpp:308`) so a vanished part can be
-   ANSWERED with `none` rather than thrown as `NO_SUCH_DATA_PART` — preserving "a question is
-   answered, never thrown". Worth confirming that is the preferred shape, since it is the one
-   place the re-offer is not literally an ordinary fetch request.
+   early (as the confirm is today at `DataPartsExchange.cpp:308`) so a vanished part is ANSWERED
+   — a 200 carrying no validator — rather than thrown as `NO_SUCH_DATA_PART`, preserving "a
+   question is answered, never thrown". Worth confirming that is the preferred shape, since it is
+   the one place the confirm is not literally an ordinary fetch request. (Under §4.1.4's status
+   mapping this question changes character: a thrown `NO_SUCH_DATA_PART` would surface as a 404,
+   which the receiver would then have to classify — one more status to interpret, and one more
+   reason the validator-carried answer is simpler.)
