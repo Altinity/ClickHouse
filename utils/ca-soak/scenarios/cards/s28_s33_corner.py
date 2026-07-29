@@ -399,18 +399,32 @@ class S30(Scenario):
             monotone = grew_dirs or grew_get
             result.observations["fanout_first_vs_last"] = {"first": first, "last": last}
             # POST-D1 (registry removed + dropNamespace tombstones the shard + GC reclaims it): per-round
-            # GC cost must track LIVE tables, not EVER-created ones. Bounded fanout is now the PASS
-            # condition; growth across create/drop iterations is a REGRESSION of D1 (the old monotone-
-            # registry-fanout bug returning). This verdict flipped when D1 landed — see S34 (the D1 win).
+            # GC cost must track LIVE tables, not EVER-created ones. This verdict flipped when D1
+            # landed — see S34 (the D1 win).
+            #
+            # ##################################################################################
+            # ###  STAGE-A CONTRACT.  RESTORE THE FULL BOUND AT STAGE B TASK 7b.            ###
+            # ##################################################################################
+            # D1 has two halves and Stage A suppresses one of them. `dropNamespace` still tombstones
+            # the shard — so `root_dirs` stays bounded, and that half is asserted here unchanged. But
+            # RECLAIMING the tombstoned shard is a gated destructive site under
+            # `UniversePolicy::kDefault = StageA_Suppressed`, so the tombstones survive and every round
+            # keeps reading them: `CasRootGet` grows with ever-created namespaces and cannot do
+            # otherwise. Asserting the growth half today would be asserting that suppression is off.
+            #
+            # AT TASK 7b: delete the split below and restore `not monotone` as the whole condition.
             result.add(Verdict.check(
                 "GC fanout bounded across ever-created namespaces (D1 registry removal)",
-                "root_dirs / CasRootGet do NOT grow with ever-created (dropped) tables",
+                "root_dirs does NOT grow with ever-created (dropped) tables — the half of D1 that "
+                "does not depend on reclamation",
                 f"root_dirs {first.get('root_dirs')} -> {last.get('root_dirs')}; "
-                f"CasRootGet {first.get('CasRootGet')} -> {last.get('CasRootGet')}",
-                not monotone,
-                "" if not monotone else
-                "REGRESSION vs D1: GC per-round fanout grew across create/drop iterations even though no "
-                "table stayed live — D1 (registry removal + dropped-shard reclaim) must keep it bounded"))
+                f"CasRootGet {first.get('CasRootGet')} -> {last.get('CasRootGet')} "
+                f"(GET growth is Stage-A-expected: dropped-shard reclaim is gated)",
+                not grew_dirs,
+                "" if not grew_dirs else
+                "REGRESSION vs D1: the number of root dirs grew across create/drop iterations even "
+                "though no table stayed live — `dropNamespace` must tombstone the shard regardless of "
+                "whether reclamation is suppressed"))
             if monotone:
                 result.note_anomaly(
                     "S30 REGRESSION vs D1: GC per-round fanout (roots/<ns> dir count and/or CasRootGet) "

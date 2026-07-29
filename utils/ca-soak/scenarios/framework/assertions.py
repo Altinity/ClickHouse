@@ -359,6 +359,24 @@ def assert_reclaimable_drained(result, verdict_name, residual, fsck_detail_res: 
         "residual_total": residual, "reclaimable": reclaimable,
         "by_prefix": buckets, "bookkeeping": bookkeeping}
 
+    # ##########################################################################################
+    # ###  STAGE-A CONTRACT.  RESTORE DRAIN-TO-ZERO AT STAGE B TASK 7b.                      ###
+    # ##########################################################################################
+    # Same narrowing, and the same reason, as `assert_no_leftovers`: manifest bodies are deleted at a
+    # site `UniversePolicy::kDefault = StageA_Suppressed` gates, and are never condemned first, so
+    # under Stage A `_manifests` CANNOT drain — while `blobs` still must, and a blob residual is still
+    # the leak this assertion was written to catch. The permitted count is reported in the verdict,
+    # never silent. AT TASK 7b: delete this block and let `reclaimable` speak for itself again.
+    _blobs_left = buckets.get("blobs", 0)
+    _manifests_left = buckets.get("_manifests", 0)
+    if _blobs_left == 0 and _manifests_left > 0:
+        return [result.add(Verdict(
+            verdict_name, "blobs drained; manifests retained by Stage-A suppression",
+            f"blobs=0, _manifests={_manifests_left} retained (by_prefix={buckets})", "pass",
+            f"STAGE-A CONTRACT: {_manifests_left} unreachable manifest object(s) cannot drain because "
+            f"their deletion site is gated. Blobs DID drain to 0, which is the half this assertion "
+            f"still proves. AT TASK 7b this becomes a FAILURE again."))]
+
     if residual == 0 or reclaimable == 0:
         note = ""
         if residual > 0 and bookkeeping:
