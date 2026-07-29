@@ -49,8 +49,8 @@ the BACKLOG as `[FSCK-SCALE-TIMEOUT]`.
 
 | # | gate | expected | observed | verdict |
 |---|---|---|---|---|
-| 1 | CA gtest gate, release | 1534+6+8 = 1548 pass | 1548/1548, `GATE_RELEASE_EXIT=0` | GREEN |
-| 2 | CA gtest gate, ASan | 1538+14 = 1552 pass | 1552/1552, `GATE_ASAN_EXIT=0` | GREEN |
+| 1 | CA gtest gate, release | 1534+6+8 = 1548 pass | 1548/1548, `GATE_RELEASE_EXIT=0` — **final head: see the addendum below** | GREEN |
+| 2 | CA gtest gate, ASan | 1538+14 = 1552 pass | 1552/1552, `GATE_ASAN_EXIT=0` — **final head: see the addendum below** | GREEN |
 | 3 | `test_content_addressed_s3` | pass | `LANE_EXIT=0` | GREEN |
 | 4 | `test_content_addressed_gc_s3` | pass | `LANE_EXIT=0` | GREEN |
 | 5 | `test_cas_file_cache` | pass | `LANE_EXIT=0` | GREEN |
@@ -799,3 +799,20 @@ Outstanding:
 Everything the stage set out to establish is measured and holding: both unit batteries green, nine of
 nine integration lanes green, all four adversarial scenarios passing, the late-PUT fence proven against
 a real object store with an HTTP 412, W3 answered, and GC liveness restored and bounded.
+
+## Addendum — gate figures at the final head {#final-head-gates}
+
+The battery table's rows 1-2 record the Task-11-era counts at the head where that battery ran. The
+stage's FINAL head is `25ce1d3531a` (T15 + T16 merged, then T16b merged after the verdict commit
+`3f7b35c7ce1` — a deletion-only change, controller-mini-reviewed, that could not affect the verdict's
+subject matter). The gates at that final head, copied from the named artifacts:
+
+| gate | observed at final head | artifact |
+|---|---|---|
+| CA gtest gate, release | **1564/1564** from 243 suites (= merged 1565 − exactly the one deleted vacuous test) | a16's `build/t16b_gate_release.log`, recorded in `task-16-report.md` §T16b |
+| CA gtest gate, ASan | **1568/1568** from 256 suites (= merged 1569 − 1), `GATE_EXIT=0`, zero sanitizer findings | `build_asan/t16b_gate_asan.log` |
+
+The count deltas between rows 1-2 and this table are the reviewed additions of Tasks 12-16 plus the
+T16b deletion, each reconciled by arithmetic at its merge (ledger entries carry the per-merge
+arithmetic). No re-verdict: this addendum exists so the stage record names its final head explicitly
+(final-review finding I2).
