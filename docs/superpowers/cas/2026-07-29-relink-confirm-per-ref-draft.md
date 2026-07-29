@@ -137,11 +137,19 @@ refinement of one rule plus one in-memory index.
 
 ## 7. Independent quick wins (non-protocol, can precede the pass) {#quick-wins}
 
-- Demote the receiver's abandon from ERROR to INFO/DEBUG + a `ProfileEvents` pair
-  (proven/refused) — the storm becomes a metric instead of log spam (measured: ~5-9k
-  lines/min, ~23-frame unwind each).
+- USER DIRECTIVE (2026-07-29): an `Unknown` that is our own uncertainty and part of the
+  protocol must not present as an error. Demote the receiver's abandon from ERROR to
+  INFO/DEBUG AND rewrite the message to name a TRANSIENT state ("an expected, transient
+  outcome while the source lane is busy; the fetch is re-queued and will retry") + a
+  `ProfileEvents` pair (proven/refused) — the storm becomes a metric instead of log spam
+  (measured: ~5-9k lines/min, ~23-frame unwind each).
 - Sender-side: log WHICH rule refused (today `Unknown` maps silently through
   `ContentAddressedMetadataStorage.cpp:1996` — diagnosing rule 3 took a live cluster).
+- THE UNHAPPY PATH GETS ITS OWN PRECISE TEST (user directive): deliberately drive each
+  refusal class (a pending item scoped to the target name; a wedge; a lost fence) and assert
+  the severity, the transient-state message class, that no byte re-request goes to the same
+  source, and that the retry cycle converges. This test is part of the design pass's
+  deliverables, not optional hardening.
 
 ## 8. Expected outcome {#expected-outcome}
 
