@@ -2117,3 +2117,6 @@ uniqueness; one real find — best-effort abandon can fail => S0 invariant too s
 consistency class incl. the nonce-in-wrong-param paragraph and the surviving withdrawn-LRU
 line). v5 final fix round dispatched. USER extended the lease-blip RCA: full three-table
 trace (CA log + part_log + text_log) per broken part, captured LIVE.
+**2026-07-29 17:40 local** — watchdog: soak driver alive in the bounded fixpoint (deadline
+~18:05); a14 mid-RCA (new_error_class.txt captured 17:31; three-table trace in progress);
+relink v5 fix round at the design agent. Nothing wedged.
