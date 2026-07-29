@@ -375,6 +375,25 @@ surface, plus the one requirement Task 1 did not have (no implicit conversion to
   {#ckpt-failed-birth-debris}), and the remaining two get the disposition their own call sites argue
   for. If surfacing turns out not to be expressible at the producer, hoisting wins — say so with the
   code reason rather than forcing the preferred shape
+- Modify (SAME AUDIT, placed by the placement sweep 2026-07-30 — do NOT split it across tasks, since
+  splitting is how the first half got missed): `Gc/CasGc.cpp`'s `rebuildBaseline` gen-0 health check
+  (`:3756` vicinity) hands per-life keys straight to `groupRefKeys` with no catch, so a NESTED-shape
+  corrupt key (`<ns>/<inc>/x/_log/<id>.zst`) refuses at `namespaceLifeOf` and kills the recovery
+  COMMAND — "the recovery command must not be taken out by the damage it exists to recover from",
+  which is the new test's own argument turned on its author. Task 1 newly exposed it (before the
+  re-key such a key parsed as an opaque deeper namespace and did not throw). Narrow reachability
+  (needs `snap_generation == 0` plus a foreign nested key), so a guard plus one test row, not a
+  redesign. This is Task-1 re-review MINOR-B, previously adjudicated to "the Task 6 family" and never
+  written into any task.
+- **RE-OPENED RULING, and the reason is that its evidence base changed after it was made:** Task 1's
+  review minor 2 ruled the `listNamespaces` DDL-path `CORRUPTED_DATA` "acceptable — loud and bounded".
+  That ruling predates IMPORTANT-A, which showed the SAME escape kills fsck entirely. The DDL consumer
+  is `removeRecursive`, so one stray key makes a **DROP fail — and the drop is what would have removed
+  the offending namespace.** That is the self-perpetuating shape (the operation that would clear the
+  obstacle is the one the obstacle blocks) which upgraded IMPORTANT-A from usability to blocking, and
+  it applies here for the same reason. Since this task must give ALL FOUR consumers a disposition
+  anyway, decide the DDL consumer's here on the new evidence rather than inheriting a ruling made
+  without it. Flagged by the implementer against their own earlier under-rating of the fsck half.
 - Create (in `CasLayout.h`/`.cpp`): `parseNamespaceFileKey` — the `_files` mirror of
   `parseRefObjectKey`, returning `(NamespaceLifeId, relative-name)`; the janitor (Task 5) needs it to
   classify what `namespaceAllLivesPrefix` returns
@@ -530,6 +549,20 @@ struct RefCatalog                          /// one object, key `cas/ref_catalog`
   path (today's `NamespaceBirth` writer — locate from `RefOpKind::NamespaceBirth` usages)
 - Create: `src/Disks/tests/gtest_cas_ns_creation_lifecycle.cpp`
 
+**PLACED HERE BY THE PLACEMENT SWEEP (2026-07-30), previously an unplaced deferral:**
+`[CKPT-FAILED-BIRTH-DEBRIS]` (BACKLOG `{#ckpt-failed-birth-debris}`) names a "STAGE-B LIFECYCLE
+OWNER" and its own one-line closure — a lifecycle-owned `_ckpt` delete for NEVER-BORN namespaces —
+but no task executed it; the plan's only mention was a precedent citation in Task 1c, and a citation
+is not an executor. This task owns the birth sequence and is the only place that knows a birth did
+not complete, so the closure lands here: when a birth is abandoned or fails after its `_ckpt` was
+published, the lifecycle deletes that `_ckpt`. Effect if it stays unplaced is operator-visible:
+permanent debris that makes a drained server root REFUSE decommission (`claimOwnerOrThrow` →
+`CORRUPTED_DATA`). NOTE the partial overlap so nobody assumes it is already closed: Task 1b's
+extraction NARROWED this — a birth refused by the structural grammar no longer leaves an inert
+`_ckpt`, because the seal now runs before the publish — but a birth whose ref-log `PUT` fails AFTER
+the `_ckpt` published still leaks, and that is the case this task must close. Test it as its own row
+in `gtest_cas_ns_creation_lifecycle.cpp`.
+
 **Interfaces:**
 - Consumes: Task 2 catalog; Stage A `publishCkpt`; `checkFenceOrThrow`.
 - Produces the §3 creation sequence (three conditional writes, DDL-rate):
@@ -567,6 +600,25 @@ struct RefCatalog                          /// one object, key `cas/ref_catalog`
 - [ ] **Step 5: Commit** `ca: ref — namespace creation lifecycle; token-exact reconciliation; three-site recheck`.
 
 ### Task 4: Re-key under `<ns>/<inc>/`; universe from catalog; format bump B {#task-4}
+
+**TWO ITEMS PLACED HERE BY THE PLACEMENT SWEEP (2026-07-30), both previously unplaced:**
+
+1. **REGISTER ITEM R9** (`2026-07-28-ref-rework-adjacent-findings.md {#r9-neverborn-fence}`) had
+   ZERO mentions anywhere in this plan — the only R-item with none, which is what a late addition
+   looks like. The register says "Stage B incarnations close it structurally / Owner: Stage B
+   incarnation work", and **a structural closure that nothing asserts is a claim, not a closure**:
+   today a two-birth stream leaves a namespace permanently HELD (`UnconsumedSealCrossing`) until an
+   operator intervenes. Discharge it HERE, as a test: a straggler birth `PUT` arriving at a DEAD
+   incarnation cannot collide with a live re-birth, because the incarnation segment makes the two
+   key spaces disjoint. If that proves impractical to drive, the fallback is Task 11's residual list
+   with the reason — but the default is the test, and an untested structural claim needs the
+   controller's explicit sign-off, not silence. Same family as Task 3's `[CKPT-FAILED-BIRTH-DEBRIS]`:
+   both are births that do not land.
+2. **The bump-B VERIFICATION**, deferred by Task 1's review as minor 8 to a "final-review triage"
+   that does not exist in this plan (`grep -ci "final review"` = 0), so it would simply never have
+   been performed. It is one line and it is load-bearing, because Tasks 1/1c re-key AHEAD of the
+   bump and Constraint 14 says there is exactly ONE: **confirm this task actually performs format
+   bump B, and that Task 4b rides it rather than adding a second.** Assert it, do not eyeball it.
 
 **Files:**
 - Modify: `.../CasLayout.h` — NOTE the executed state: Task 1 ALREADY migrated these helpers to
@@ -1239,6 +1291,17 @@ correctness-регрессии" (Constraint 18).]
   updated to cite THIS task
 - Test: the Stage-A cross-namespace kill-shot test in `gtest_cas_list_liar_end_to_end.cpp`
 
+**PLACED HERE BY THE PLACEMENT SWEEP (2026-07-30), previously an unplaced deferral:**
+`[CKPT-DAMAGE-NO-REPAIR-PATH]` residual (a) — a single unrepaired `_ckpt` HOLDS its namespace and
+therefore shuts the ROUND-WIDE destructive gate, so one damaged 4 KiB object stops ALL reclamation
+pool-wide. The BACKLOG entry names the code comment that "names the set the flip must carry"
+(`CasGc.cpp:2515`), and this is the task that narrows that gate — so the narrowing must CARRY the
+hold set, or this flip ships the very stall it was meant to relieve. Concretely: when `kDefault`
+becomes authoritative, a held namespace must suppress destruction FOR ITSELF and not for the round,
+and the anomaly-arm term (the undecodable-`_ckpt` namespace with no walk position, which mints no
+hold by design) must be carried too — those are the TWO things the `CasGc.h` "MUST CARRY TWO THINGS"
+paragraph enumerates. Assert both: a pool with one held namespace still reclaims in the others.
+
 [Codex r2 finding 1: this flip is deliberately AFTER the removal lifecycle (Task 5), the
 read-side/pre-delete contracts (Task 6), and the same-rollout decommission duties (Task 7).]
 
@@ -1425,6 +1488,16 @@ Commit alone; final commit updates `models/README.md` + `cas/06-tla-models.md`.
 
 **Files:**
 - Create: `docs/superpowers/cas/2026-07-XX-stage-b-RESULTS.md`
+- **RESIDUAL-CLEANUP GATE ROW, placed by the placement sweep (2026-07-30).** Several review findings
+  were deferred to a "final-review triage" that this plan does not contain, so they had no executor:
+  Task 1's review minors 1-7 (its minor 8 — the bump-B verification — moved to Task 4 instead,
+  because a deferred VERIFICATION is simply not performed), and the Task-1 re-review's MINOR-B plus
+  NITs C-F. Their home is here, as an explicit gate row rather than a hope: before the verdict, walk
+  that list, fix what is still true, and record each as fixed / no-longer-applicable / accepted with
+  one line of why. A cosmetic finding with no executor is what the sweep was run to find; this row is
+  where the cosmetic ones die. NOTE the one exception already re-homed: MINOR-B (`rebuildBaseline`'s
+  gen-0 nested-shape exposure) goes to Task 1c beside IMPORTANT-A, because it is the SAME CLASS at a
+  different site and splitting one audit across two tasks is how the first half got missed.
 - **PRESERVE (not create): the destructive soak's ARTIFACTS.** Task 12 does performance research on
   this soak, and the predecessor report
   (`docs/superpowers/reports/2026-07-29-gc-perf-audit-soak.md {#specimen-lost}`) exists partly to

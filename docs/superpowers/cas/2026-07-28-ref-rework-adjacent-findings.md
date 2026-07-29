@@ -14,6 +14,17 @@ matters once the core lands; severity is the reviewer's.
 
 ## R1. Verbatim-file rebirth aliasing — [today, major] {#r1-verbatim-alias}
 
+> **SUPERSEDED IN PART, 2026-07-30** (recorded because R7 carried its supersession note and this one
+> did not, so the register disagreed with itself about whether it reflects the amendment): the
+> NAMESPACE-FILE half of this hazard is closed structurally by
+> `docs/superpowers/specs/2026-07-29-cas-stage-b-namespace-life-amendments.md` §2 — files move to
+> `roots/<ns>/<inc>/_files/<relative-name>`, so an old-incarnation file is foreign-keyed by
+> construction and cannot become visible to a re-born namespace. What survives of R1 is anything
+> OUTSIDE that re-key (loose mountpoint objects keep today's identity by design), and the body below
+> still describes the pre-amendment boundary — read it as the historical statement of the problem,
+> not as the current contract. Stage B Task 9 is now a CLOSURE NOTE recording where each sub-hazard
+> went, not a spec-writing task.
+
 Verbatim files are keyed `{namespace, file_name}` only (`CasLayout.h` ~:175; `CasPlainObjects` has
 no incarnation parameter). Rebirth is gated by the `_cleanup` marker, whose "physically empty" proof
 comes from LIST — a hidden old-life file survives into the reborn namespace and can be read as its
