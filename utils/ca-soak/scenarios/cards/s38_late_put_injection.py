@@ -103,14 +103,14 @@ def _parse_ref_txn_id(leaf: str):
         return None
 
 
-def _restamp_ref_log_txn(body: bytes, ref_sequence: int) -> bytes:
-    """Rewrite a real ref-log object's sequence number and strip its ops.
+def _restamp_ref_log_txn(body: bytes, ref_sequence: int, writer_epoch: int | None = None) -> bytes:
+    """Rewrite a real ref-log object's id and strip its ops.
 
     The format is line-oriented JSON (`CasTextFormat.cpp`): a header line, a meta line carrying
     `ns`/`we`/`rs` (u64 as decimal STRINGS, `readU64String`), then one line per op, then a trailer
-    `{"n": <op count>}`. Only `rs` and the op list change here, so the header (with its compatibility
-    version) and the namespace come from a body the server wrote — this card does not encode the
-    format, it edits one field of it.
+    `{"n": <op count>}`. Only the id fields and the op list change here, so the header (with its
+    compatibility version) and the namespace come from a body the server wrote — this card does not
+    encode the format, it edits two fields of it. `writer_epoch` defaults to the donor's own.
     """
     lines = body.decode().splitlines()
     if len(lines) < 3:
@@ -119,6 +119,8 @@ def _restamp_ref_log_txn(body: bytes, ref_sequence: int) -> bytes:
     if "rs" not in meta or "ns" not in meta or "we" not in meta:
         raise ValueError(f"ref-log meta line lacks ns/we/rs: {lines[1][:200]}")
     meta["rs"] = str(ref_sequence)
+    if writer_epoch is not None:
+        meta["we"] = str(writer_epoch)
     # `!pse` is a chain link, legal only at sequence 1; the restamped id is not sequence 1, so a
     # copied link would be rejected by the seal grammar for a reason unrelated to this card.
     meta.pop("!pse", None)

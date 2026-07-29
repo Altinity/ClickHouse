@@ -16,3 +16,4 @@ from . import s39_lease_fault_tolerance  # noqa: F401
 from . import s40_insert_dedup_outage  # noqa: F401
 from . import s41_wide_insert_baseline  # noqa: F401
 from . import s42_alloc_faults  # noqa: F401
+from . import s43_same_uuid_recreation  # noqa: F401
