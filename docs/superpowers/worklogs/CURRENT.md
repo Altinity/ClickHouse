@@ -2048,3 +2048,7 @@ then the exclusive re-validation soak via run_soak.sh.
 suites). ASan merged gate launched. folded_token: USER RULED DELETE (origin = discover-era
 token-diff, subsumed by INV-1) — T16b dispatched to a16 (edits now, build after the soak).
 Next: ASan green -> exclusive re-validation soak via run_soak.sh on the merged binary.
+**2026-07-29 16:1x local** — USER ordered the relink-redesign brainstorm: relink-design
+(opus) dispatched (spec from the §0 decision set; goals = simplification + measured
+upstream-impact minimization + safe relink); codex sol-xhigh review follows the spec commit.
+Parallel: ASan merged gate running; soak next; a16 editing T16b.
