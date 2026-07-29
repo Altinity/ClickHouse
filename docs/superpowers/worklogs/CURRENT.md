@@ -2020,3 +2020,9 @@ dirs stay untracked per convention; scoped re-review dispatched. a16 in RED-2.
 form). T15 review dispatched (worktree package, 2 commits, ruling checklist a-f). a16 RED-2
 in flight. Remaining chain: T16 gate -> reviews close -> merges -> rebuild -> re-validation
 soak -> verdict flip -> final whole-branch review.
+**2026-07-29 16:1x local** — T15 review APPROVED (3 minor, no important; epoch-major
+comparator traced; red (d) independently reproduced; merge caution: the exit's PLACEMENT
+after the absent branch is the safety property). Pre-merge polish ordered (folded_token
+assert + 2 doc notes). Merge sequence set: T16 runbook -> merge T15 -> rebuild ->
+EXCLUSIVE re-validation soak (T16 review reads during) -> merge T16 -> verdict flip ->
+final review.
