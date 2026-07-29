@@ -1971,3 +1971,7 @@ framework fix + S43 rewrite + re-runs + verdict recompute (target: PENDING(T15))
 **2026-07-29 13:42 local** — watchdog: T14 fix round 1 mid-flight — codex F3+F4 card fixes
 committed (43379185ef4), lane verify+verify2 passes ran 13:19-13:32, scenario framework edits
 uncommitted in tree (assert_no_leftovers ruling being implemented). Load 2.0, nothing wedged.
+**2026-07-29 13:5x local** — T14 consolidation: verdict now PENDING(T15) @RESULTS:614; all
+Slot-0 items proven (dump script end-to-end incl. self-caught manifest bug). Fix-round items
+1-3 restated (crossed messages): suppression-aware leftovers, W3 product-recreation, re-runs.
+a15 BUILD SLOT OPENED (docker drained); scenarios queue behind it, then a16.
