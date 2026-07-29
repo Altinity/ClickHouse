@@ -1520,35 +1520,28 @@ TEST(CasGcRound, OrphanManifestCursorSweepDeletesAndPersistsCursor)
 
     /// The §6 deletion premise is a second precondition on every sweep deletion: a manifest of an
     /// epoch-`E` build is deletable only once the namespace's sealed fold cursor sits in an epoch
-    /// STRICTLY above `E`. The debris above is epoch 1, so the fixture must put a cursor in epoch 2.
+    /// STRICTLY above `E`. The debris above is epoch 1, so the namespace's own ref log has to cross
+    /// into epoch 2 and the ROUND has to fold that crossing.
     ///
-    /// IT IS SEEDED, NOT FOLDED, and that is a WORKAROUND WITH AN EXPIRY, not the intended shape.
-    /// Producing such a cursor honestly needs a real epoch crossing, i.e. an `EpochSeal` record in the
-    /// namespace's log -- and on this branch `RefTableState::apply` still throws `NOT_IMPLEMENTED` on
-    /// one. The sweep builds its protection view through that replay, so a seal in the tail makes the
-    /// view unavailable and the sweep skips the namespace entirely; the two cannot both be exercised
-    /// here.
+    /// The crossing is written record by record and folded by the round's own arithmetic intake, which
+    /// makes this the composition of the whole chain in one test: a real `EpochSeal` is minted at
+    /// `{1,2}`, `RefTableState::apply` consumes it as INV-2's chain link when the epoch-2 record names
+    /// it in `prev_epoch_seal`, the walk CROSSES on that back-chain, the round seals a cursor in epoch
+    /// 2, and the premise then admits a deletion for the crossed epoch. Nothing here is seeded: an
+    /// injected cursor would prove only that the premise reads a number, not that the number can be
+    /// produced.
     ///
-    /// OWED AT MERGE: that stub is stale. The apply layer enforces INV-2's seal chain as of
-    /// `8e546671123`, so once this branch merges, REPLACE the seeding below with a folded crossing
-    /// (publish at `{1,1}`, `seal{1,2}`, publish at `{2,1}` chaining to it) and let the round's own
-    /// arithmetic intake seal the cursor. That also becomes the composition test the premise is
-    /// missing: a protection view that replays a sealed tail, and a premise that admits the delete on
-    /// the crossed epoch.
-    ///
-    /// It is seeded AFTER the first round because a pre-created `gc/state` makes the FIRST lease
-    /// acquire back off (`acquireOrRenewLease` only creates-and-owns when the object is absent).
+    /// The live publications use build sequences ABOVE the watermark's `min_active`, so the only
+    /// sweep-ELIGIBLE manifests in the namespace remain the two debris bodies -- the premise, not the
+    /// watermark, is what this test varies.
+    publishAt(*backend, store->layout(), ns, RefTxnId{1, 1}, "tbl", /*build_sequence=*/7,
+              DB::UInt128(0xB10B1), /*birth=*/true);
 
     Gc gc(store, kGc);
     ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
     EXPECT_TRUE(manifestExists(*backend, store->layout(), ManifestId{ns, r1}))
-        << "with no sealed cursor the premise retains: nothing proves epoch 1 closed";
+        << "a cursor still INSIDE epoch 1 proves nothing about epoch 1's closing seal: the premise retains";
     EXPECT_TRUE(manifestExists(*backend, store->layout(), ManifestId{ns, r2}));
-
-    seedFoldCursorForTest(*backend, store->layout(), ns, RefTxnId{r1.writer_epoch + 1, 1},
-                          /*hold*/std::nullopt,
-                          currentGenerationOf(*backend, store->layout()),
-                          currentAttemptOf(*backend, store->layout()));
 
     /// The round above already persisted a mid-circuit cursor while deleting nothing, which is the
     /// cursor half of this test's subject: the sweep examined a key, retained it, and durably recorded
@@ -1556,8 +1549,13 @@ TEST(CasGcRound, OrphanManifestCursorSweepDeletesAndPersistsCursor)
     EXPECT_FALSE(readState(*backend, *store).manifest_sweep_cursor.empty())
         << "the sweep persisted the cursor it examined to, even having deleted nothing";
 
+    /// Close epoch 1 and open epoch 2 over the seal it consumed.
+    writeSealAt(*backend, store->layout(), ns, RefTxnId{1, 2});
+    publishAt(*backend, store->layout(), ns, RefTxnId{2, 1}, "tbl2", /*build_sequence=*/7,
+              DB::UInt128(0xB10B2), /*birth=*/false, /*prev_epoch_seal=*/RefTxnId{1, 2});
+
     /// The list budget is one key per round, so reclaiming both debris bodies takes a circuit.
-    for (int round = 0; round < 8; ++round)
+    for (int round = 0; round < 12; ++round)
     {
         ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease) << "round " << round;
         if (!manifestExists(*backend, store->layout(), ManifestId{ns, r1})
@@ -1566,6 +1564,20 @@ TEST(CasGcRound, OrphanManifestCursorSweepDeletesAndPersistsCursor)
     }
     EXPECT_FALSE(manifestExists(*backend, store->layout(), ManifestId{ns, r1}));
     EXPECT_FALSE(manifestExists(*backend, store->layout(), ManifestId{ns, r2}));
+
+    /// What ADMITTED those deletions, stated rather than inferred: the round folded the crossing itself
+    /// and sealed a cursor in the epoch above the debris. Without this the two expectations above would
+    /// still pass if the premise ever stopped consulting the cursor at all.
+    {
+        const GcState st = readState(*backend, *store);
+        const CasFoldSeal seal = decodeFoldSeal(
+            backend->get(store->layout().foldSealKey(st.snap_generation, st.snap_attempt))->bytes);
+        const auto it = seal.per_ns_shard.find(cursorKeyForTest(ns, /*shard*/0));
+        ASSERT_NE(it, seal.per_ns_shard.end()) << "the round must have sealed a coverage row";
+        EXPECT_FALSE(it->second.hold.has_value()) << "a held namespace can never reach the premise";
+        EXPECT_EQ(it->second.last_folded_ref_id, (RefTxnId{2, 1}))
+            << "the cursor must sit in the epoch ABOVE the debris, reached by folding the seal at {1,2}";
+    }
 
     /// Replacing a live Pool's own mount with a synthetic foreign watermark must make release fail
     /// CLOSED. This was an `EXPECT_DEATH` pinning a `LOGICAL_ERROR` abort; the abort was the defect

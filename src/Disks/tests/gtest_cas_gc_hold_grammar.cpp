@@ -100,52 +100,6 @@ private:
     size_t served = 0;
 };
 
-RefOp epochSealOp()
-{
-    RefOp op;
-    op.kind = RefOpKind::EpochSeal;
-    return op;
-}
-
-/// Write ONE ref-log transaction at an EXACT id, through the real codec.
-void writeTxnAt(
-    Backend & backend, const Layout & layout, const RootNamespace & ns, const RefTxnId & id,
-    std::vector<RefOp> ops, std::optional<RefTxnId> prev_epoch_seal = std::nullopt)
-{
-    RefLogTxn txn;
-    txn.ns = ns.string();
-    txn.txn_id = id;
-    txn.ops = std::move(ops);
-    txn.prev_epoch_seal = prev_epoch_seal;
-    writeRefLogTxnRaw(backend, layout, txn);
-}
-
-void writeSealAt(
-    Backend & backend, const Layout & layout, const RootNamespace & ns, const RefTxnId & id,
-    std::optional<RefTxnId> prev_epoch_seal = std::nullopt)
-{
-    writeTxnAt(backend, layout, ns, id, {epochSealOp()}, prev_epoch_seal);
-}
-
-/// Publish `ref_name` -> a fresh manifest pinning `blob`, as ONE transaction at exactly `id`.
-void publishAt(
-    Backend & backend, const Layout & layout, const RootNamespace & ns, const RefTxnId & id,
-    const String & ref_name, uint64_t build_sequence, const DB::UInt128 & blob,
-    bool birth = false, std::optional<RefTxnId> prev_epoch_seal = std::nullopt)
-{
-    const ManifestRef mref{.writer_epoch = id.writer_epoch, .build_sequence = build_sequence,
-                           .manifest_ordinal = 1};
-    writeBlobBody(backend, layout, blob);
-    writeManifestRaw(backend, layout, ns, mref, {blobEntryFor("data.bin", blob)});
-
-    std::vector<RefOp> ops;
-    if (birth)
-        ops.push_back(namespaceBirthOp());
-    for (const RefOp & op : publishCommittedOps(ref_name, mref))
-        ops.push_back(op);
-    writeTxnAt(backend, layout, ns, id, std::move(ops), prev_epoch_seal);
-}
-
 /// Write the namespace's `_ckpt` naming `checkpoint` as its snapshot base, through the real codec — the
 /// fold's second witness source is a decode of exactly these bytes, so a hand-rolled body would prove
 /// nothing about the object the writers actually publish.

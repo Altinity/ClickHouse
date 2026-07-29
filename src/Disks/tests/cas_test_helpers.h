@@ -982,6 +982,66 @@ inline DB::Cas::RefOp namespaceBirthOp()
     return op;
 }
 
+/// An `epoch_seal` op — the record that CLOSES an epoch (INV-2). A seal transaction carries exactly
+/// this op and nothing else (grammar enforced by the codec in both directions). The next epoch's first
+/// transaction names the seal it consumed in `prev_epoch_seal`, and that back-chain is what lets a fold
+/// cross epochs without trusting a listing.
+inline DB::Cas::RefOp epochSealOp()
+{
+    DB::Cas::RefOp op;
+    op.kind = DB::Cas::RefOpKind::EpochSeal;
+    return op;
+}
+
+/// Write ONE ref-log transaction at an EXACT id. `appendRefLogSeed` and the wrappers above ALLOCATE
+/// ids arithmetically inside writer epoch 1, so anything that needs a chosen id — a gap, an
+/// out-of-order arrival, or an epoch CROSSING — writes through here instead. The bytes go through the
+/// real codec, so every grammar rule the fold's decoder enforces is enforced here too.
+inline void writeTxnAt(
+    DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RootNamespace & ns,
+    const DB::Cas::RefTxnId & id, std::vector<DB::Cas::RefOp> ops,
+    std::optional<DB::Cas::RefTxnId> prev_epoch_seal = std::nullopt)
+{
+    DB::Cas::RefLogTxn txn;
+    txn.ns = ns.string();
+    txn.txn_id = id;
+    txn.ops = std::move(ops);
+    txn.prev_epoch_seal = prev_epoch_seal;
+    writeRefLogTxnRaw(backend, layout, txn);
+}
+
+/// Close an epoch at exactly `id`.
+inline void writeSealAt(
+    DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RootNamespace & ns,
+    const DB::Cas::RefTxnId & id, std::optional<DB::Cas::RefTxnId> prev_epoch_seal = std::nullopt)
+{
+    writeTxnAt(backend, layout, ns, id, {epochSealOp()}, prev_epoch_seal);
+}
+
+/// Publish `ref_name` -> a fresh manifest pinning `blob`, as ONE transaction at exactly `id`
+/// (add-precommit + promote, the only shape that reaches a committed owner). `birth` prepends the
+/// `namespace_birth` op the table's first transaction owes; `prev_epoch_seal` is required on sequence 1
+/// of every epoch above the namespace's genesis. The manifest's prefix is
+/// `{id.writer_epoch, build_sequence}`, so a caller controlling `build_sequence` also controls whether
+/// the orphan sweep's watermark considers that manifest eligible.
+inline void publishAt(
+    DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RootNamespace & ns,
+    const DB::Cas::RefTxnId & id, const String & ref_name, uint64_t build_sequence, const DB::UInt128 & blob,
+    bool birth = false, std::optional<DB::Cas::RefTxnId> prev_epoch_seal = std::nullopt)
+{
+    const DB::Cas::ManifestRef mref{.writer_epoch = id.writer_epoch, .build_sequence = build_sequence,
+                                    .manifest_ordinal = 1};
+    writeBlobBody(backend, layout, blob);
+    writeManifestRaw(backend, layout, ns, mref, {blobEntryFor("data.bin", blob)});
+
+    std::vector<DB::Cas::RefOp> ops;
+    if (birth)
+        ops.push_back(namespaceBirthOp());
+    for (const DB::Cas::RefOp & op : publishCommittedOps(ref_name, mref))
+        ops.push_back(op);
+    writeTxnAt(backend, layout, ns, id, std::move(ops), prev_epoch_seal);
+}
+
 /// The two ops a fixture transaction needs to go straight from nothing to a committed ref (spec
 /// §State Transitions has no direct "add committed" shape — only precommit -> promote): an
 /// `owner_transition` add-precommit followed by an `owner_transition` promote of the SAME

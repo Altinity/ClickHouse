@@ -97,60 +97,6 @@ private:
     size_t served = 0;
 };
 
-/// One `epoch_seal` op. A seal transaction carries exactly this op and nothing else (INV-2 grammar,
-/// enforced by the codec in both directions).
-RefOp epochSealOp()
-{
-    RefOp op;
-    op.kind = RefOpKind::EpochSeal;
-    return op;
-}
-
-/// Write ONE ref-log transaction at an EXACT id (the raw fixtures allocate `{1, next}` and so cannot
-/// express epochs or seals). The bytes go through the real codec, so every grammar rule the fold's
-/// decoder enforces is enforced here too.
-void writeTxnAt(
-    Backend & backend, const Layout & layout, const RootNamespace & ns, const RefTxnId & id,
-    std::vector<RefOp> ops, std::optional<RefTxnId> prev_epoch_seal = std::nullopt)
-{
-    RefLogTxn txn;
-    txn.ns = ns.string();
-    txn.txn_id = id;
-    txn.ops = std::move(ops);
-    txn.prev_epoch_seal = prev_epoch_seal;
-    writeRefLogTxnRaw(backend, layout, txn);
-}
-
-/// The `EpochSeal` transaction closing `id.writer_epoch` at `id`.
-void writeSealAt(
-    Backend & backend, const Layout & layout, const RootNamespace & ns, const RefTxnId & id,
-    std::optional<RefTxnId> prev_epoch_seal = std::nullopt)
-{
-    writeTxnAt(backend, layout, ns, id, {epochSealOp()}, prev_epoch_seal);
-}
-
-/// Publish `ref_name` -> a fresh manifest pinning `blob`, as ONE transaction at exactly `id`
-/// (add-precommit + promote, the only shape that reaches a committed owner). `birth` prepends the
-/// `namespace_birth` op the table's first transaction owes; `prev_epoch_seal` is required on sequence 1
-/// of every epoch above the namespace's genesis.
-void publishAt(
-    Backend & backend, const Layout & layout, const RootNamespace & ns, const RefTxnId & id,
-    const String & ref_name, uint64_t build_sequence, const DB::UInt128 & blob,
-    bool birth = false, std::optional<RefTxnId> prev_epoch_seal = std::nullopt)
-{
-    const ManifestRef mref{.writer_epoch = id.writer_epoch, .build_sequence = build_sequence,
-                           .manifest_ordinal = 1};
-    writeBlobBody(backend, layout, blob);
-    writeManifestRaw(backend, layout, ns, mref, {blobEntryFor("data.bin", blob)});
-
-    std::vector<RefOp> ops;
-    if (birth)
-        ops.push_back(namespaceBirthOp());
-    for (const RefOp & op : publishCommittedOps(ref_name, mref))
-        ops.push_back(op);
-    writeTxnAt(backend, layout, ns, id, std::move(ops), prev_epoch_seal);
-}
-
 /// The `ShardCoverage` the newest fold seal recorded for `ns` (shard 0), or nullopt when the seal has
 /// no entry for it. Scans downward from the adopted generation for the most recent fold seal, mirroring
 /// `foldCursorOf`'s reasoning (a completed round's gc/state points at the recheck generation).
