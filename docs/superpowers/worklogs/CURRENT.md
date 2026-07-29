@@ -1778,3 +1778,5 @@ completeness rule). Closing confirmation dispatched; T12 next. No push.
 **2026-07-29 07:4x local** — T11 CLOSED (cross-footed live evidence; the withdrawn reviewer
 sentence restored). T12 (retirement sweep) dispatched — the task where the old world's
 defensive scaffolding formally dies. T13+T14 remain. No push.
+**2026-07-29 07:00 local** — watchdog: T12 in flight (impl-a12 ACKed 06:59, analysis phase —
+probe-A premise re-check + T_mat consumer sweep). No builds yet; nothing wedged. T13/T14 queued.
