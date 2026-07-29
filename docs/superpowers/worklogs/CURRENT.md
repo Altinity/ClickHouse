@@ -1768,3 +1768,6 @@ T12-T14 remain. No push.
 **2026-07-29 07:0x local** — T11 approved w/ evidence fix round (the lane's 4th
 unbacked-figure case — re-run-with-tee or delete, no middle ground). T14 inherits: 05020 live
 leg + the aggregate nothing-reclaims paragraph. No push.
+
+**2026-07-29 06:40 local watchdog** — T11 fix round early phase (~10 min in; live processes up —
+likely the tee-captured ca-fsck rerun preparing). No push.
