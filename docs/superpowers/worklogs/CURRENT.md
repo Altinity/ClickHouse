@@ -1910,3 +1910,7 @@ started). Nothing wedged.
 the measured chase (46 folded vs 6 planned + frontier PROVEN with a record above the tail);
 patched walk stops at tail, claims no proof. Gate build embargoed until its slot. Report
 copied to shared SDD.
+**2026-07-29 11:2x local** — lane RCA corroborated the drain ruling: byte-identical LIST
+flatlines, zero errors, manifests grow 9->54 post-drop (suppressed-consumption signature).
+FAIL direction overruled -> adapted lanes are the gate rows; falsifiable escape unmet.
+Soak2 (3/8) live, ETA 12:39; a15/a16 parked; dump-script order pending at a14.
