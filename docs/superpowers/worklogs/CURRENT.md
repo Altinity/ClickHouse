@@ -2066,3 +2066,9 @@ CA names in Storages/MergeTree 5->2, ~-516 lines net. Codex sol-xhigh review LAU
 re-validation soak in flight (4 containers, ch1/ch2 logs live since 16:04, a14 driving via
 wrapper). a16 compile-free staged; T15/T16 merged+gated. Awaiting soak landing for the
 verdict flip.
+**2026-07-29 16:4x local** — relink spec v2 (ccf16cde7c7): conditional-request form ADOPTED;
+literal 304/503 status mapping blocked by assertResponseIsOk (success path would pay the
+unwind) + the forgery ASYMMETRY argument (304-form makes caches active participants; value
+form structurally immune + no-store). Two INM header holes closed (wildcard, multi-value).
+Vanished-part dissolves into Unknown naturally — the none sentinel died. Codex v1 still
+running (1.4MB); focused v2 delta pass follows.
