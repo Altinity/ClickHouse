@@ -2029,3 +2029,9 @@ final review.
 **2026-07-29 15:22 local** — watchdog: woke a16 again (RED-2 build NINJA_EXIT=0 at 15:04,
 monitor missed 2nd time — told it to stop parking on monitors); RED-1 tests were red as
 planned (RED1_TESTS_EXIT=1). a15 polish commit pending. T15 review CLOSED-approved earlier.
+**2026-07-29 15:4x local** — relink redesign DECIDED and recorded (563f3f8dfd5): (ii)
+re-offer chosen, (i) retired pre-ship; draft §0 carries the full decision set incl. the
+remote-recovery budget vs the LRU amplifier and the rejected who-pays axis. T16 DONE
+(46495aee70e: 9 shapes red->green, gate 1557/1557=1548+9); concerns ruled (btr/cnd family ->
+BACKLOG follow-up; post-merge ASan gate on the merge checklist); review dispatched (reviewer
+pin confirmed alive — user stop-check came back clean: nothing was mid-flight, zero orphans).
