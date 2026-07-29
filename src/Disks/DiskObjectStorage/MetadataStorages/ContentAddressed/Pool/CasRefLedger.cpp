@@ -2324,6 +2324,46 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
         return;
     }
 
+    /// THE DEPOSED LANE, recognised BEFORE spending a request on it (spec INV-2).
+    ///
+    /// The shape: this table's next id is sequence 1 of the live epoch, and the only seal this runtime
+    /// holds is of THAT epoch -- a successor closed it while we still believed we were writing in it.
+    /// There is then no legal transaction to construct at all. Stamping the seal we hold would be a
+    /// self-pointer the ENCODER refuses; stamping nothing leaves an uncertified epoch crossing the
+    /// READER refuses. Both are dead ends, and both are provable from what this lane already knows.
+    ///
+    /// The OUTCOME here must be the same one the collision produced, not merely "an error". Before this
+    /// gate the lane sent its create, met the successor's seal at the key, and took the conclusive
+    /// rejection arm; skipping the request must not skip the CONCLUSION. So this is a permanent
+    /// rejection in the same class and the same words -- the operation was never acknowledged, no later
+    /// attempt in this epoch can ever succeed, and the lane resumes only under a later epoch, which is
+    /// what tells the caller (and the operator) that this mount has been deposed rather than merely
+    /// delayed. A retry-later class here would be the real bug: every caller would re-derive the same
+    /// impossible transaction forever, and the deposition would never be visible anywhere.
+    ///
+    /// Deliberately NOT a remount trigger, exactly as the collision arm is not: a successor closing our
+    /// epoch is a legitimate handover, and the mount lease is what resolves it. See `resolveWedgeOnce`'s
+    /// `SuccessorSeal` arm, whose reasoning this mirrors.
+    if (table_live)
+    {
+        const RefTxnId next_id = working.nextTxnId(live_epoch_fn());
+        if (next_id.ref_sequence == 1 && !chainLinkFor(next_id, preview_epoch_seal))
+        {
+            complete_error(carve_all_pending(), std::make_exception_ptr(Exception(ErrorCodes::INVALID_STATE,
+                "CAS ref-log append for namespace '{}': writer epoch {} cannot be opened by this mount — its "
+                "next transaction would be {}-{}, sequence 1 of an epoch this lane holds no closing seal "
+                "BELOW (the only seal it has, {}, is of that same epoch, i.e. a successor already closed "
+                "it). Nothing legal can be written here and nothing was sent. This mount's append lane "
+                "resumes only under a later epoch",
+                ns.string(), next_id.writer_epoch, next_id.writer_epoch, next_id.ref_sequence,
+                preview_epoch_seal
+                    ? fmt::format("{}-{}", preview_epoch_seal->writer_epoch, preview_epoch_seal->ref_sequence)
+                    : String("none"))));
+            ProfileEvents::increment(ProfileEvents::CasRefAppendSealRejected);
+            return;
+        }
+    }
+
     /// Two-phase carve (spec §2). The old carve popped from `pending` while interleaving the allocating
     /// `seen_refs`/`batch` growth and only recorded the batch into `owned_items` afterwards, so any throw
     /// after the first pop stranded already-popped items -- neither in `pending` nor in `owned_items` --

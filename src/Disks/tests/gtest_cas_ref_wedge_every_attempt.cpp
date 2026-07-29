@@ -913,7 +913,43 @@ TEST(CasRefWedgeEveryAttempt, ALiveEpochSealIsNeverStampedAsItsOwnPrevEpochSeal)
     /// learn what it can already prove about itself. The property the test exists for is unchanged and is
     /// asserted below in its strongest form -- NO object is written at that id at all, so no self-pointer
     /// can have been stamped anywhere.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { store->dropRef(ns, "x"); });
+    /// The refusal must reach the SAME TERMINAL OUTCOME the collision produced, not merely "an error".
+    /// Skipping the request must not skip the conclusion, so all four halves are pinned:
+    ///
+    ///   1. the class is INVALID_STATE -- the conclusive-rejection class the successor-seal arm uses,
+    ///      NOT the retry-later class. This is the one that matters most: a retryable error here would
+    ///      have every caller re-derive the same impossible transaction forever, and the deposition
+    ///      would never surface anywhere;
+    ///   2. the message says the lane resumes only under a later epoch -- that IS the deposition,
+    ///      reported to the caller and the operator in the same words the collision reported it;
+    ///   3. NOTHING is written, so no self-pointer can have been stamped and no request was spent;
+    ///   4. a SECOND flush behaves identically instead of looping or degrading.
+    const uint64_t remounts_before = store->scheduleRemountCallCountForTest();
+    const size_t puts_before = backend->putCount(layout.refLogKey(ns, RefTxnId{epoch + 1, 1}));
+    try
+    {
+        store->dropRef(ns, "x");
+        FAIL() << "the deposed lane must reject conclusively, not succeed";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::INVALID_STATE) << "got: " << e.message();
+        EXPECT_NE(e.message().find("resumes only under a later epoch"), String::npos)
+            << "the deposition must be surfaced, not just the failure: " << e.message();
+    }
     EXPECT_FALSE(backend->get(layout.refLogKey(ns, RefTxnId{epoch + 1, 1})).has_value())
         << "nothing may be written: the lane could not construct a legal transaction, so it sent none";
+    EXPECT_EQ(backend->putCount(layout.refLogKey(ns, RefTxnId{epoch + 1, 1})), puts_before)
+        << "and no request was spent learning what the lane could already prove about itself";
+
+    /// The second flush: same conclusive answer, still no traffic. A lane that re-derived and re-sent
+    /// here would be exactly the spin this arm exists to prevent.
+    expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&] { store->dropRef(ns, "x"); });
+    EXPECT_EQ(backend->putCount(layout.refLogKey(ns, RefTxnId{epoch + 1, 1})), puts_before);
+
+    /// NO remount is scheduled, matching the collision arm exactly. A successor closing our epoch is a
+    /// legitimate handover, not an anomaly to react to: the mount lease is what resolves it, and
+    /// scheduling a remount from here would turn every ordinary deposition into a self-inflicted
+    /// re-claim storm.
+    EXPECT_EQ(store->scheduleRemountCallCountForTest(), remounts_before);
 }

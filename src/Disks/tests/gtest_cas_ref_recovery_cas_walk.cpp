@@ -212,7 +212,17 @@ public:
     std::optional<GetResult> get(const String & key, Range range) override
     {
         if (on_key && !watched_substr.empty() && key.find(watched_substr) != String::npos)
-            on_key(key);
+        {
+            /// ONE-SHOT by moving the callback OUT before invoking it, and that is a correctness
+            /// requirement rather than a convenience. A hook that cleared `on_key` from inside its own
+            /// body would destroy the `std::function` whose closure it is still executing, and every
+            /// by-reference capture it touched afterwards would read freed heap. That is not
+            /// theoretical: it is what the first version of these tests did, and the ASan gate caught
+            /// it as a `heap-use-after-free` while a hook was parked on a condition variable.
+            auto hook = std::move(on_key);
+            on_key = nullptr;
+            hook(key);
+        }
         return HidingListBackend::get(key, range);
     }
 };
@@ -730,9 +740,10 @@ TEST(CasRefRecoveryCasWalk, RemountBarrierBlocksUntilAPausedRecoveryAcknowledges
     bool release_recovery = false;
 
     backend->watched_substr = "_log/";
+    /// `GetSeamBackend` moves the hook out before calling it, so this parks exactly once without the
+    /// hook having to clear itself -- see its `get` for why self-clearing is a use-after-free.
     backend->on_key = [&](const String &)
     {
-        backend->on_key = nullptr;   /// park exactly once
         std::unique_lock lock(m);
         recovery_parked = true;
         cv.notify_all();
@@ -979,7 +990,6 @@ TEST(CasRefRecoveryCasWalk, ASecondCallerWaitsForTheWalkInsteadOfRacingIt)
     backend->watched_substr = "_log/";
     backend->on_key = [&](const String &)
     {
-        backend->on_key = nullptr;
         std::unique_lock lock(m);
         parked = true;
         cv.notify_all();

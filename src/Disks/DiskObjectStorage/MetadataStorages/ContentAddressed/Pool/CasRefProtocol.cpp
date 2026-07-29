@@ -481,18 +481,30 @@ void RefTableState::applyTxnInPlace(const RefLogTxn & txn)
     /// well-formedness, strictly-earlier epoch) is the codec's, and this is the half that needs to know
     /// whether this transaction OPENS a life or CONTINUES one across a transition.
     ///
-    /// The answer is derivable from the state itself, exactly, so no `life_epoch` has to be plumbed in
-    /// and there is no optional to substitute a zero for (which would demand a chain link on every
-    /// sequence-1 transaction and reject every genesis birth -- the trap task 5's interface note names):
+    /// THE EQUIVALENCE ARGUMENT, because this is the load-bearing part. The answer is DERIVED from the
+    /// state, exactly and totally -- no `life_epoch` is plumbed in, and there is no optional to
+    /// substitute a zero for (which would demand a chain link on every sequence-1 transaction and reject
+    /// every genesis birth -- the trap task 5's interface note names):
     ///
-    ///   - NOT `Live` (never-born, or `Removed`) => this transaction can only be a birth, so the epoch it
-    ///     lands in IS the life's genesis epoch and a chain link is FORBIDDEN. A link here would name a
-    ///     seal of a previous life this state has no trace of;
-    ///   - `Live` => the namespace demonstrably existed at `greatest_applied.writer_epoch`, which is
-    ///     strictly below this transaction's epoch (the density check above just proved the epoch
-    ///     changed), so its real `life_epoch` is at or below that and this transition is non-genesis: a
-    ///     chain link is REQUIRED. Passing `greatest_applied.writer_epoch` gives the shared validator the
-    ///     same verdict the true `life_epoch` would, for every value the true one can hold.
+    ///   - state NOT `Live` (never-born, or `Removed`) <=> this transaction can only be a BIRTH <=> the
+    ///     epoch it lands in IS this life's genesis epoch, so a chain link is FORBIDDEN. A link here
+    ///     would name a seal of a previous life this state has no trace of;
+    ///   - state `Live` <=> a prior life is PROVEN to exist below this epoch -- the namespace was applied
+    ///     at `greatest_applied.writer_epoch`, and the density check immediately above just proved this
+    ///     transaction's epoch is above it -- so the transition is non-genesis and a chain link is
+    ///     REQUIRED. Passing `greatest_applied.writer_epoch` yields the same verdict the true
+    ///     `life_epoch` would for EVERY value the true one can hold, since the true one is at or below it
+    ///     and the rule only compares "strictly above / at or below".
+    ///
+    /// The derivation is exact for every reachable state and no default exists anywhere in it.
+    ///
+    /// It is also STRICTLY BETTER than a plumbed-in `life_epoch` would be, and not only because it needs
+    /// no plumbing: `life_epoch` is a property of a LIFE, and a namespace can be removed and recreated.
+    /// A single global value carried alongside the table would answer for the wrong life after a
+    /// rebirth -- it would demand a chain link from a recreated namespace's very first transaction,
+    /// which by definition has none. Reading the lifecycle instead makes per-life semantics fall out for
+    /// free: a `Removed` state receiving a birth makes THAT epoch the NEW life's genesis, with no
+    /// catalog and no extra field to keep in step.
     ///
     /// Both arms go through the ONE shared validator rather than re-deriving its rule, so the writer's
     /// encode-side check and this one cannot drift.
