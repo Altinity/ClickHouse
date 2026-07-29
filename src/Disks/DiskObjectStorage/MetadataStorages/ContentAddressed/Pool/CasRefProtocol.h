@@ -702,8 +702,9 @@ std::map<String, RefTableListing> groupRefKeys(const Layout & layout, const std:
 /// two boundaries -- a log must additionally satisfy `L <= checkpoint`, and a snapshot must be STRICTLY
 /// BELOW it, so the snapshot the checkpoint itself names always survives. It can never widen either:
 /// a checkpoint AHEAD of what this round observed names durable objects the scan did not return, and
-/// this plan acts only on keys the scan DID return. Absent (Stage A, before the `_ckpt` object exists)
-/// leaves both boundaries exactly as they were.
+/// this plan acts only on keys the scan DID return. Absent -- a namespace whose `_ckpt` does not exist
+/// yet, or exists without a `checkpoint_snapshot_id` because only its other fields have ever been
+/// published -- leaves both boundaries at the cursor and the newest covering snapshot alone.
 struct RefCleanupPlan
 {
     std::vector<RefTxnId> deletable_logs;
