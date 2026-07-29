@@ -2094,3 +2094,7 @@ RFC caches LICENSED to answer 304, both legs already POST = standard vocab was a
 benefit; wildcard/list/weak hazards DELETE; final-rulings round queued next). a14 nudged:
 soak driver still running ~20min post-ruling (late delivery suspected) — stop-capture-flip
 re-ordered with PIDs named.
+**2026-07-29 17:3x local** — relink v4-FINAL (070fc0817ad): zero user-blocking questions;
+warm-by-construction backed by the MRU code fact; naming in the endpoint family with the
+nonce-in-URL cache bonus; wire names honestly 5->5, grammars 2->0. Codex ROUND 2 launched on
+the final. Still awaiting a14's flip commit (nudged with PIDs).
