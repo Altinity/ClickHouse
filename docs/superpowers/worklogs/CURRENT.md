@@ -1875,3 +1875,9 @@ scale probe; T15 re-validation stays at 6/40. Lane 1/9 green.
 **2026-07-29 10:21 local** — watchdog: lanes 2/9 green (s3, gc_s3 both LANE_EXIT=0); codex
 phase-A review alive (4.4MB log); impl-a15 fresh in its worktree (no build yet — just ACKed,
 reading phase). Soak re-run queued behind lanes. Nothing wedged.
+**2026-07-29 10:3x local** — USER redesigned T15: frozen-tail rounds replace the budget knob —
+walk STRICTLY cursor+1..round-start-LIST-tail; untouched namespaces at tail==cursor; skip
+round when all unchanged. No knob, no new state (cursor IS the remembered tail — contiguity
+makes the tail a sufficient summary). Liar still beaten: middle-hide = exact-key non-event,
+tail-hide = caught by quiet-probe. Plan rewritten (2be38b2b98a), brief regenerated, impl-a15
+redirected mid-read.
