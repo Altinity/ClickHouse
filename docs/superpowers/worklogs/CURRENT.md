@@ -1919,3 +1919,7 @@ absence; relink storm measured 248k/32min peak 9,219/min; soak death explained =
 tables' 299 Outdated parts + lease wait vs 180s gate (NOT GC, NOT user tables). Two new
 BACKLOG entries + numbers folded in (e614330d78f). Audit addendum deferred to T15
 re-validation specimen.
+**2026-07-29 11:20 local** — watchdog: soak2 tick #9 healthy (4.7GB, 2/2, expected
+CasGcClampSuppressedPasses=1). Load 27 = the soak's own stack (rustfs 325% + 2 servers) plus
+a TRANSIENT git auto-repack (3.5 min in) — ruled let-finish now, during the pre-chaos build-up
+phase, rather than risk it re-triggering inside a chaos window. No agent builds running.
