@@ -1823,3 +1823,6 @@ fixed in report text; appendix re-derived the gates independently). T14 DISPATCH
 opus): dual batteries, 9 lanes, 90m soak + observables, S38 fence-held REWRITE, W3 same-uuid
 e2e, 05020 harness, late-PUT python detector, four-layer aggregate paragraph, RESULTS doc w/
 exact `STAGE A: PASS`/`FAIL` verdict string.
+**2026-07-29 09:2x local** — T13 CLOSED (corrections re-derived from artifacts; agent
+self-found a 3rd stale-figure instance + named the TEMPORAL root cause — memories written,
+controller's older duplicate merged away). T14 running (recon phase).
