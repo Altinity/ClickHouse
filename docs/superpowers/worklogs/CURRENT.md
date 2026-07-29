@@ -1797,3 +1797,6 @@ sentence letter-false; M2 S38 double-break needs fail-fast entry guard). M4 alre
 controller. Fix round 1 dispatched to impl-a12 (docs/configs only, no gate re-run). WARN-2
 upgraded T14 obligation: aggregate posture paragraph now FOUR layers (+ sampled store-quality
 signal). Reviewer praised §6 correction + marker discipline as the model.
+**2026-07-29 08:2x local** — T12 CLOSED CLEAN (fix f9c5beebc9d; re-reviewer re-derived the
+sweep + confirmed S38 was already dead pre-T12 — T14 rewrite = premise re-derivation). Next:
+T13 (LIST-liar fault injection, the blocker end-to-end).
