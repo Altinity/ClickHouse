@@ -3868,9 +3868,10 @@ RebuildReport Gc::rebuildBaseline(bool force)
     next.round = round;
     next.snap_generation = generation;
     next.snap_attempt = seal_attempt;
-    /// Retired-in-snapshot: the orphan condemns now live as `kCondemned` rows IN the rebuilt runs
-    /// (folded into the single flush above) — there is no separate `RetiredSet` object family, so the
-    /// rebuild mints none.
+    /// No retired set to publish: a rebuild condemns nothing (the deletion above), so there is nothing
+    /// to retire in the first place. Retired-in-snapshot removed the separate `RetiredSet` object
+    /// family independently of that, and the two reasons are stated apart on purpose — a future reader
+    /// must not take this line as evidence that REBUILD still produces condemnations somewhere.
     next.manifest_sweep_cursor = "";
     const CasResult res = backend.casPut(layout.gcStateKey(), encodeGcState(next), state_token);
     if (res.outcome != CasOutcome::Committed)

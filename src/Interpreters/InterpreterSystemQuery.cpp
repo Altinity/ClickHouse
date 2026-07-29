@@ -2415,10 +2415,11 @@ void appendContentAddressedGcRebuildRow(MutableColumns & res_columns, const Stri
     res_columns[i++]->insert(rep.adopted_seal_generation);
 }
 
-/// SYSTEM CONTENT ADDRESSED FSCK's one-row-per-disk summary (Task 7). Per the brief: named UInt64
-/// columns only, no DETAIL keyword yet (YAGNI -- the offline `clickhouse-disks fsck --detail` applet
-/// already covers per-object listing). Field order/names mirror `Cas::FsckReport` exactly, restricted
-/// to the subset the brief calls out (see also `CommandFsck.cpp`'s summary line for the same fields).
+/// SYSTEM CONTENT ADDRESSED FSCK's one-row-per-disk summary. Named UInt64 columns only, no DETAIL
+/// keyword (YAGNI -- the offline `clickhouse-disks ca-fsck --detail` applet already covers per-object
+/// listing). Field order/names mirror `Cas::FsckReport`; the row was a deliberate SUBSET of it until
+/// 2026-07-29, and is no longer one where findings are concerned -- see the rule stated at
+/// `stale_edge` below. `CommandFsck.cpp`'s `formatFsckSummary` line carries the same fields.
 ColumnsDescription contentAddressedFsckColumns()
 {
     return ColumnsDescription{NamesAndTypesList{
@@ -2429,12 +2430,27 @@ ColumnsDescription contentAddressedFsckColumns()
         {"pending_gc", std::make_shared<DataTypeUInt64>()},
         {"awaiting_gc", std::make_shared<DataTypeUInt64>()},
         {"unaccounted", std::make_shared<DataTypeUInt64>()},
+        /// EVERY TERM OF `FsckReport::clean` APPEARS HERE. This row is the only view of a report a SQL
+        /// consumer ever gets, so a hard finding the row omits is a finding no query can see — the same
+        /// shape that hid `corrupted_runs` from the text summary for months, which is why
+        /// `formatFsckSummary` carries the identical rule in its doc comment. The row was a deliberate
+        /// subset until 2026-07-29 and `stale_edge`/`corrupted_runs`/`snapshot_oracle_mismatches` were
+        /// invisible from SQL while `clickhouse-disks ca-fsck` exited nonzero on all three; if a term is
+        /// ever added to `clean`, it is added here in the same change.
+        ///
+        /// `stale_edge` is nonzero only in `detail` mode and this row is built from a summary scan, so it
+        /// reads 0 here always — present because "absent" and "zero" are different facts to a consumer,
+        /// and a column that appears the day the scan gains detail is a schema change nobody asked for.
+        {"stale_edge", std::make_shared<DataTypeUInt64>()},
+        {"corrupted_runs", std::make_shared<DataTypeUInt64>()},
+        {"snapshot_oracle_mismatches", std::make_shared<DataTypeUInt64>()},
+        {"snapshot_oracle_checked", std::make_shared<DataTypeUInt64>()},
         /// The ref-stream verdicts (spec §7). `chain_broken` is a HARD finding — it belongs on the row
-        /// for the same reason `dangling` does, and a subset that omitted it would be a finding no SQL
-        /// consumer could ever see. `unchecked` is its honest companion: namespaces the audit could not
-        /// prove either way, so a zero here is what makes the other zeros mean something.
+        /// for the same reason `dangling` does. `unchecked` is its honest companion: namespaces the audit
+        /// could not prove either way, so a zero here is what makes the other zeros mean something.
         {"chain_broken", std::make_shared<DataTypeUInt64>()},
         {"unchecked", std::make_shared<DataTypeUInt64>()},
+        {"ref_records_walked", std::make_shared<DataTypeUInt64>()},
         {"physical_bytes", std::make_shared<DataTypeUInt64>()},
         {"referenced_logical_bytes", std::make_shared<DataTypeUInt64>()},
         {"distinct_blobs", std::make_shared<DataTypeUInt64>()},
@@ -2452,8 +2468,13 @@ void appendContentAddressedFsckRow(MutableColumns & res_columns, const String & 
     res_columns[i++]->insert(rep.pending_gc);
     res_columns[i++]->insert(rep.awaiting_gc);
     res_columns[i++]->insert(rep.unaccounted);
+    res_columns[i++]->insert(rep.stale_edge);
+    res_columns[i++]->insert(rep.corrupted_runs);
+    res_columns[i++]->insert(rep.snapshot_oracle_mismatches);
+    res_columns[i++]->insert(rep.snapshot_oracle_checked);
     res_columns[i++]->insert(rep.chain_broken);
     res_columns[i++]->insert(rep.unchecked);
+    res_columns[i++]->insert(rep.ref_records_walked);
     res_columns[i++]->insert(rep.physical_bytes);
     res_columns[i++]->insert(rep.referenced_logical_bytes);
     res_columns[i++]->insert(rep.distinct_blobs);
