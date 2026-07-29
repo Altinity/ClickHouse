@@ -318,7 +318,8 @@ leaders) and S30 (create/drop namespace churn).
 ### S38 — the fence, proven end to end {#scenario-s38}
 
 **18 of 19 verdicts pass**, and every assertion the rewrite exists to make is among them
-(`build/t14_scenario3_S38.log`, run `20260729T110740_S38_seed20260729`):
+(`build/t14_scenario3_S38.log` for the run line, and the per-verdict evidence below in
+`utils/ca-soak/scenarios/runs/20260729T110740_S38_seed20260729/report.json`):
 
 - the unclean restart's recovery sealed the dead epoch, and the object at the top of that epoch's
   stream really carries an `epoch_seal` op — `{1, 0x2f}`;
