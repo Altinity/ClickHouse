@@ -26,9 +26,10 @@ partial credit — the house rule is that a known red is a red.
 traced to one thing that is not a product defect: Stage A deliberately turned destruction off, and a
 large part of the test estate still asserted that destruction happens. That is now resolved — the
 assertions were NARROWED to the gated-delete family rather than disabled, and nine of nine lanes plus
-all four scenarios pass as a result. One thing remains, and it is the reason the verdict is gated
-rather than clean: a real regression this gate measured, where under a live writer the GC fold does not
-complete a round at all — now Task 15. W3, open since task 6, is answered here. Four integration lanes, all four adversarial scenarios and one
+all four scenarios pass as a result. The regression this gate measured — a GC fold that never completed a round
+under a live writer — is FIXED and re-validated at 64 completed rounds. What now gates the verdict is a
+different thing, found by that re-validation: a transient mount-lease loss makes the part-check thread
+declare parts broken and remove them. W3, open since task 6, is answered here. Four integration lanes, all four adversarial scenarios and one
 soak criterion are written against a reclaiming pool and are being run against a suppressed one. Task 9
 met this problem, solved it correctly for the one lane it was gating on, and left the rest — which
 nobody noticed, because the per-task gate ran two of the nine lanes.
@@ -59,7 +60,8 @@ the BACKLOG as `[FSCK-SCALE-TIMEOUT]`.
 | 11 | `test_cas_replicated_relink` | pass | red (1 failed), then **11 passed**, `VERIFY2_EXIT=0` | GREEN — adapted-to-Stage-A-posture (Task 9 option-a pattern), green after adaptation |
 | 12a | soak — SCALE PROBE (defaults, 6 workers / 40 GB) | not a criteria gate | died at 49 min on a 180 s crash-recovery bound; found the T15 fold-round liveness regression and both harness-budget mismatches; 49 minutes of counters are evidence of record | PROBE (not a pass/fail row) |
 | 12b | soak — CRITERIA GATE (3 workers / 8 GB) | zero data loss; no surviving wedge; bounded `unaccounted`; no uninjected ERROR; and — per the 2026-07-29 controller amendment — complete audits at auditable scale plus soak fsck gates reported UNARMED with reason, replacing "fsck clean at end" | zero data loss (2,942,315 == 2,942,315); no violation counter moved; epoch seal minted on both replicas; 2 of 28 scheduled chaos faults fired; fsck gates reported unarmed with reason; complete audits supplied by 05020 and by three PASSING scenario end checkpoints | GREEN against the amended criterion, with one NAMED DEVIATION: I stopped it at minute 95 of its scheduled 90, before the final converge checkpoint. The clause it would have exercised (the data-loss oracle) was run directly instead |
-| 12c | fold-round liveness under load | GC rounds complete while a writer is live | **0 completed folding rounds in 42 minutes** on the leader (`CasRefManifestBodyFoldGets` climbing at ~313/s past 1,087,385; peer logged 162× `NotALeader`) | **FAIL** -> fix = Task 15 {#task-15}, re-validation pending. Evidence and provenance in `build/t14_gc_liveness/`: LIVE-PASS readings against a cluster that no longer exists, ledgered there as unreproducible rather than presented as greppable. **T15's re-validation inherits a hypothesis whose specimen was LOST** — that cluster was torn down undumped — so it cannot re-read the original fold; drive it through `utils/ca-soak/scripts/run_soak.sh` so its own specimen survives |
+| 12c | fold-round liveness under load | GC rounds complete while a writer is live | T14: **0 completed folding rounds in 42 minutes** (live-pass readings ledgered in `build/t14_gc_liveness/`). T15 re-validation on the merged binary: **64 `Success` rounds**, avg 100.7 s, min 2.8 s, max 433.5 s (`build/t14_revalidation/criteria_evidence.txt`) | **GREEN — the regression is fixed and rounds are BOUNDED**, which is the property that failed: the old defect was a round that never ended, not a slow one |
+| 12d | T15 re-validation, criterion 4: no new ERROR classes | none beyond the documented exclusions | **VIOLATED** — `Part <id> looks broken. Removing it and will try to fetch.` on BOTH nodes (13 on ch1, 14 on ch2), caused by `checkPartImpl: Code: 668 … mount lease not held … (INVALID_STATE)`; per-minute correlation exact (`build/t14_revalidation/new_error_class.txt`). No data lost — replicas equal at 978,381 rows | **RED — new finding, blocks certification** |
 | 13 | S38 late-PUT fence | the fence holds | **19/19 verdicts pass, `status=PASS`, `FIX2_EXIT=0`**; store returned HTTP 412 | GREEN |
 | 14 | S43 (W3) same-uuid recreation | the survivor's write is not absorbed | **16/16 verdicts pass, `status=PASS`, `FIX3_EXIT=0`** — the recreated pool REFUSES to bootstrap over the planted survivor (`healthy=false`, `refusal_logged=true`), removing that one object lets the same prefix bootstrap, and life 2 comes up empty (`0\t0` vs life 1's `200\t18123181848219261492`) | GREEN — W3 answered. Extracts in `build/t14_w3_evidence/` (the 668 refusal line, key observations, the run's `report.json`) |
 | 15 | S33 concurrent GC leaders | no leak | **10/10 verdicts pass, `status=PASS`, `FIX2_EXIT=0`** | GREEN |
@@ -404,6 +406,49 @@ meeting an O(backlog) audit (measured, Task 11). The fsck-clean evidence in this
 comes from the pools small enough to complete an audit: 05020 and the scenario end-checkpoints. Stage
 B's flip relieves this on its own — reclamation resumes, the pool shrinks, the audit fits again.
 
+## The Task 15 re-validation soak {#t15-revalidation}
+
+Run on the MERGED binary at the DEFAULT instrument (phase 3, 6 workers, `--max-pool-gb 40`,
+`--duration 30m`), driven through `scripts/run_soak.sh` so the specimen was captured automatically.
+Evidence: `build/t14_revalidation/criteria_evidence.txt` and the wrapper's dump at
+`utils/ca-soak/logs/predown/*/soak_t15_revalidation/`.
+
+**Before anything ran, the binary was checked and was NOT current** — see §method. The merge build had
+targeted `unit_tests_dbms` only, so the run would otherwise have measured the pre-fix fold.
+
+| criterion | result |
+|---|---|
+| leader completes >= 3 folding rounds | **64 `Success`**, avg 100.7 s, min 2.8 s, max 433.5 s, plus 4 `Deferred` — against 0 in 42 minutes before the fix |
+| `CasGcProbeADue` > 0 | **Due=4, Performed=4, Skipped=0**, `CasGcRefScanDisagreements=0`, holes 0/0 |
+| no `CheckpointFailure` | **0** |
+| no new ERROR classes | **VIOLATED** — row 12d |
+
+Supporting: every always-zero counter stayed zero (`CasRefApplyPoisoned`, `CasGcUnappliedFoldedTxns`,
+`CasRefRecoveryStreamHole`); the replicas ended equal at 978,381 rows; `CasRefManifestBodyFoldGets`
+equalled `CasRefEmittedEdges` exactly at 661,322, i.e. **1.000 GET per edge**, which is the HEAD drop
+measured rather than asserted; `fold_ref_intake` tails_advanced=16 / tails_unchanged=28.
+
+**Probe A settles the C.2 question in the fix's favour.** It came due four times on the cadence,
+performed every time, and found zero disagreements. Task 14 measured the one-in-sixteen rule wanting
+only because rounds never completed — the sampling UNIT was fine and liveness was the bug, so
+`gc_probe_a_period` stays 16.
+
+### Two things this run did not do, stated plainly {#t15-caveats}
+
+**Chaos never fired: 0 of 11 scheduled faults.** The GC checkpoint entered at t+630s and held the driver
+for the rest of the run, its entry-gate `ca-fsck` timing out at the 600 s budget on a pool that grew
+past 13 GB. So this run carries no crash-recovery or fencing coverage; that evidence lives in soak
+attempt 2 (`CasRefRecoveryEpochSealed=1` on both replicas after the `both kill`) and in the scenario
+battery (S38's HTTP 412 fence proof, S43's 668 refusal with its causation control).
+
+**NAMED DEVIATION: I stopped the driver at t+120m against a scheduled 30m.** The workload window had
+completed long before; what remained was a checkpoint waiting on an fsck that cannot finish at this
+pool size — the same structurally-unreachable criterion the fsck amendment already ruled on. Criteria 1,
+2 and 4 are monotonic and were satisfied well before the stop; criterion 3 was never exposed to a fault
+window, because there was none. The stop was ordered with a hard deadline rather than taken
+unilaterally, `SIGTERM` went to the driver alone so the wrapper survived to capture the specimen, and
+the soak's own exit code is preserved as `REVAL_SOAK_EXIT=143`.
+
 ## Adversarial scenarios {#scenarios}
 
 Four cards were run at `dev` scale, each against a freshly reset pool:
@@ -614,6 +659,21 @@ both halves; splitting keeps the first asserted exactly as before — `root_dirs
 excuses only the half that suppression makes impossible, where `CasRootGet` grew 10 → 74 in the passing
 run because every round keeps re-reading tombstones nothing is allowed to reclaim.
 
+**Binary freshness, and the run it saved.** This lesson recurs across the task and its closing instance
+is the sharpest. The T15 re-validation was ordered on the stated premise that the merged release binary
+was current. It was not: `build/programs/clickhouse` still carried my 09:14 build while the merge commit
+was 15:42, because the merge build's log ends at `[170/173] Linking CXX executable src/unit_tests_dbms`
+— `clickhouse` was never one of its targets. **Both merge gates could therefore be green over a stale
+server binary, because 1565/1569 are unit-test numbers and the unit tests were freshly built.**
+`find src -newer build/programs/clickhouse` named `Gc/CasGc.cpp`, `Backend/CasRequestControl.cpp` and
+`Formats/CasFoldSealFormat.cpp` — precisely the changed sources.
+
+Had the soak launched on that premise it would have measured the PRE-FIX fold against Task 15's own
+criteria, almost certainly reproduced the 0-completed-rounds signature, and produced a false RED on the
+fix followed by an RCA of a regression that had never been in the binary under test. The check that
+caught it costs one `ls` and one `find`, and the rule it enforces is simply: **a gate's greenness is
+evidence about the artifact that gate ran, and nothing else.**
+
 **Contamination, and how it was ruled out.** Two of the three lane passes were run on a machine that
 was not mine alone — first a dead soak's GC fold, then another agent's full build at load ~41. Only the
 third pass, on an idle box, is cited as evidence. Timing-sensitive gates need exclusive machine time,
@@ -668,55 +728,43 @@ sequencing flips `kDefault`.
 
 ## Verdict {#verdict}
 
-Sixteen of seventeen rows green. One row (12a) is a scale probe rather than a gate. Exactly one row is
-not green: row 12c, the fold-round liveness regression, which is the designated gate.
+Task 15's fix is validated: row 12c, the gate this verdict hung on, is GREEN — **64 completed folding
+rounds against 0 in 42 minutes**, and bounded, which is the property that had failed. Every other row
+from the Task 14 battery remains green.
 
-STAGE A: PENDING (T15 re-validation)
+But the re-validation surfaced a NEW finding, and it is not certifiable as-is.
 
-**On the third value.** This document opens by saying the verdict is `PASS` or `FAIL`, and then delivers
-neither. That is a controller ruling of 2026-07-29, recorded here rather than left as an inconsistency:
-the matrix's "any surviving red ⇒ FAIL" governs MEASURED regressions, and row 12c is one — with a
-chartered fix already in flight. `FAIL` would name nine green rows alongside it and read as a stage that
-did not work; `PASS` would certify a stage whose GC does not converge under its own workload. `PENDING`,
-with the one gate named, is the only form that describes what was measured. Stage B's Task 0 documents
-the value on its side.
+STAGE A: PENDING (row 12d — new ERROR class under mount-lease loss)
 
-**Row 14 was ruled PENDING alongside row 12c on 2026-07-29, with the caveat that it would become a
-measured RED — and the line `FAIL` — if the no-ping-after-restart turned out to be a real product
-defect.** The RCA that ruling ordered has since landed and resolved the caveat in the other direction:
-the no-ping is the residual-data guard firing exactly as designed (`CasPool.cpp:439`), proven by a
-causation control in the card itself, and S43 now measures 16/16 `status=PASS`. Row 14 is therefore
-discharged rather than pending, and the verdict names one gate rather than two. **If the stage owner
-reads the caveat differently, restoring `+ row 14 W3` to the line above is a one-line change.**
+**Row 12d.** During the re-validation both nodes logged
+`Part <id> looks broken. Removing it and will try to fetch.` — 13 on ch1, 14 on ch2 — driven by
+`checkPartImpl: Code: 668 … mount lease not held … (INVALID_STATE)`. The per-minute correlation is
+exact: the class appears only while the lease is not held and stops when it returns. **No data was
+lost** — the replicas ended equal at 978,381 rows, because a healthy peer held every part.
 
-**The gate is row 12c, and it is the only thing standing between this and a pass.** Under a live writer
-the GC leader completed ZERO folding rounds in 42 minutes, diagnosed to Task 7's arithmetic intake
-replacing a LIST-snapshot-bounded work set with walk-while-exists. It is being fixed as Task 15, whose
-re-validation soak runs at the DEFAULT instrument (6 workers / 40 GB) — its point is rounds completing
-under the load that broke them, so its pass criterion is round-completion counters, not the fsck gates,
-which will hit the scale wall harder there and are expected to report UNARMED. Printing `PASS` before
-that lands would certify a stage whose GC does not converge under its own workload.
+Why it blocks rather than being noted and passed over: a transient AVAILABILITY blip on the CA disk is
+being read as part CORRUPTION, and the remediation it triggers is destructive-shaped — remove the part,
+re-fetch it. It self-healed here. The shapes it did not meet are the ones that worry: both mounts losing
+their lease together (both nodes logged the class in this very run), or a single-replica pool, where
+"remove and re-fetch" has no source. "Unreadable right now" and "corrupt" are different facts and the
+part-check thread is currently collapsing them.
 
-Everything else the stage owes is measured and green:
-
-- both unit batteries, reconciled to their baselines by arithmetic;
-- nine of nine integration lanes, four of them adapted to the Stage-A posture on Task 9's own pattern
-  and then verified;
-- all four adversarial scenarios — S38 19/19, S43 16/16, S33 10/10, S30 8/8 — including the late-PUT
-  fence proven against a real object store with an HTTP 412 and a byte-identical seal, and W3 answered;
-- 05020 through the stateless harness with a live-disk fsck row;
-- the soak's criteria gate against the amended criterion, with one named deviation (I stopped attempt 2
-  at minute 95 of its scheduled 90; the data-loss oracle it would have run was run directly instead).
+What is NOT established, and is deliberately not asserted: whether the merged Task 15/16 code introduced
+this. The class is absent from soak attempt 1's archived log, but that run died at 49 minutes without
+ever reaching a lease-loss window, so its absence may be coverage rather than behaviour. Nor is the
+lease loss itself explained — the 668s visible are the part-check thread CONSUMING the not-Live state,
+not the lease-keeper's own renewal failure.
 
 Outstanding:
 
 1. ~~Verify the four adapted lanes.~~ **DONE.**
 2. ~~Decide the framework-level question.~~ **DONE** — narrowed, not disabled.
-3. ~~Finish W3.~~ **DONE** — answered, and the answer is that the pool refuses to bootstrap over the
-   survivor at all.
-4. **Task 15's fix and its re-validation soak** (row 12c). The gate on the verdict line.
-5. **Re-run the soak's final converge checkpoint** (row 12b's named deviation), whenever a soak next
-   runs to completion.
+3. ~~Finish W3.~~ **DONE** — the pool refuses to bootstrap over the survivor.
+4. ~~Task 15's fix and its re-validation.~~ **DONE** — row 12c green.
+5. **Rule on row 12d**: is the availability-blip-as-corruption path a Stage-A blocker, a BACKLOG item
+   for the mount-lease/part-check owner, or a pre-existing behaviour to be excluded like the relink
+   shape? Answering that is what moves this line to `PASS`.
 
-Only item 4 touches the ref chain. Everything else was the test estate catching up with a posture the
-stage adopted deliberately — and where the chain itself was measured, it held.
+Everything the stage set out to establish is measured and holding: both unit batteries green, nine of
+nine integration lanes green, all four adversarial scenarios passing, the late-PUT fence proven against
+a real object store with an HTTP 412, W3 answered, and GC liveness restored and bounded.
