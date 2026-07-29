@@ -1843,3 +1843,6 @@ GC lease locality). Audit agent dispatch scheduled for the ~10:40 tick.
 throttle 0->1s pacing engaged; one None-metrics tick during a chaos window computed nan% —
 framework pre-existing quirk, noted for the audit agent). All 4 containers up. T14 in soak
 window drafting RESULTS.
+**2026-07-29 09:46 local** — user ordered whole-Phase-A codex review (sol xhigh) during the
+soak wait: launched detached, read-only sandbox, 204-commit range, 8 hunt priorities, unique
+exit marker. Poll on ticks.
