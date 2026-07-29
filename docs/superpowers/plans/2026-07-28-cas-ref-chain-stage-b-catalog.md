@@ -360,9 +360,21 @@ surface, plus the one requirement Task 1 did not have (no implicit conversion to
   healthy namespaces it never reached. That is the forensic tool an operator reaches for after seeing
   the new GC anomaly, so it dying first is the wrong failure order (Task-1 re-review IMPORTANT-A,
   tracked return-item). Same exposure from `removeRecursive` (`ContentAddressedTransaction.cpp:1063`)
-  and decommission (`CasDecommission.cpp:119`). Use Task 1's absorb-and-continue shape at the
-  enumeration, or hoist the guard into the fsck loop headers — decide from the code, say which and
-  why in the report
+  and decommission (`CasDecommission.cpp:119`). SHAPE, decided 2026-07-30 after the implementer
+  surfaced the consumer asymmetry: absorb AT THE ENUMERATION (Task 1's shape) rather than hoisting
+  into fsck's headers, because `listNamespaces` has FOUR independent consumers — `removeRecursive`,
+  the metadata-storage scope enumeration, `ca-fsck` and `ca-decommission` — so guarding the producer
+  fixes all four while guarding fsck fixes one. **But the producer must SURFACE the skip as DATA,
+  never swallow it, and it must not decide policy**: a silently short namespace list is WORSE than a
+  loud abort for `ca-decommission`, which RETIRES SLOTS — it could conclude "drained" over a
+  namespace the listing omitted, which is data loss, not a usability wrinkle. So the enumeration
+  returns the skipped keys (count + keys, or a per-key error list) and each consumer disposes of them
+  per its own stakes: **fsck RECORDS-AND-CONTINUES** (it must still report the healthy namespaces —
+  that is the whole point), **decommission REFUSES fail-close** (an incomplete universe cannot
+  license retiring a slot; same stance as the drained-root refusal in BACKLOG
+  {#ckpt-failed-birth-debris}), and the remaining two get the disposition their own call sites argue
+  for. If surfacing turns out not to be expressible at the producer, hoisting wins — say so with the
+  code reason rather than forcing the preferred shape
 - Create (in `CasLayout.h`/`.cpp`): `parseNamespaceFileKey` — the `_files` mirror of
   `parseRefObjectKey`, returning `(NamespaceLifeId, relative-name)`; the janitor (Task 5) needs it to
   classify what `namespaceAllLivesPrefix` returns
@@ -1568,6 +1580,12 @@ document is what justifies them).]
    parity incl. dedup-log rotation), T5 (stale cleanup resumed after a new incarnation),
    T5b (recovery equivalence under full/empty/partial/reordered LIST; missing `_ckpt` for
    `Live`), T4c (conflicting `_ckpt.life_epoch`), T6 (stale reader; delayed writer finalized
+   — **the delayed-writer test is REQUIRED, not representative**: the finalize lambda captures
+   `this`, so a future edit can re-derive a life AT FINALIZE TIME and still compile, and two
+   `NamespaceLifeId` values are indistinguishable to the type system, so no compile-time fence can
+   catch it. That test is the only guard between such an edit and a silent regression. A wrapper type
+   for "life captured at admission" WOULD make it type-checkable and is deliberately rejected as
+   over-engineering for one call site — which is exactly why the test may not be dropped or weakened
    after rebirth; zero catalog GETs on namespace-file hot paths); `ApplyPending` follow-up →
    `{#follow-ups}`, implemented by nobody.
 5. **GC directive coverage (2026-07-30), element by element:** §Sequence-1 delete probe A → **T7a**
