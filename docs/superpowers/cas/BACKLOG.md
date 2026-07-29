@@ -144,24 +144,6 @@ this round unless something new argues for it.
 
 ## 3. GC correctness / observability follow-ups {#gc-followups}
 
-### Stage-A suppressed rounds CONSUME the hand-off reclaim {#suppressed-handoff-consumed-2026-07-29}
-
-Found by Task 9 (frontier gate; report §12): a suppressed round consumes the hand-off reclaim
-rather than deferring it — the reclaim is a one-shot seal difference, and the retention cursor is
-already past the generation, so the prefix falls through to fsck. Bounded, but under Stage A
-(destruction suppressed pool-wide) EVERY epoch transition leaks one such prefix, not only one per
-crash. Revisit at Stage B Task 7b (destruction enablement): either the reclaim must defer under
-suppression, or the leak class gets an owner (fsck-driven cleanup). Cross-ref: task-9-report §12.
-
-### HARD CONSTRAINT: 7b flip requires incarnation-keyed cursors {#seven-b-needs-incarnation-cursors-2026-07-29}
-
-Found by Task 9: the frontier universe is the UNION of gc/state cursors and the round's hint, and
-union can only add — so a namespace with no ref objects at all keeps its cursor riding permanently.
-Flipping `UniversePolicy::kDefault` (Stage B Task 7b) before Stage B's incarnation-keyed cursors
-land would widen the same-epoch remove-then-recreate residual from one round to PERMANENT.
-Already enforced by the B-plan dependency chain (7b depends on Task 4), recorded here so the
-dependency's REASON survives replanning. Cross-ref: task-9-report §12; stage-A ledger.
-
 - **[GC round progress observability] round-duration watchdog + fold-window events** — HARD — A long/wedged round is only visible after the fact; emit a round-duration watchdog, LIST/fold-window progress events, and an alert on an unbalanced `gc_fold_begin`/`gc_fold_end` pair.
 - **[ack-floor soak validation] 3 scenario cards** — TEST — SIGSTOP-a-writer holds-then-releases the floor; hard-KILL-writer → fence-out → fsck no-dangle; O(delta)+O(servers) request-count regression guard. Note: floor semantics changed under freshness-v3 (round-paced, per-hash `.meta`) — update the cards. Implemented + unit/TLA-covered; not soak-validated.
 - **[F3] `ca-gc-dryrun` reachability under-counts vs real GC/fsck** — HARD — Systematic across S18/S25/S26/S33; real GC always safe (dangling=0). Fix: dryrun uses the SAME reachability walk as GC/fsck; assert `dryrun ⊆ (unreachable ∪ pending-gc)`.
