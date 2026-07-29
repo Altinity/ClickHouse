@@ -1818,3 +1818,8 @@ un-hooked per brief conditional; HidingListBackend convergence deferred. Review 
 **2026-07-29 09:01 local** — watchdog: T13 review in flight (reviewer transcript fresh at
 08:58, no verdict file yet); impl-a13 holding. BACKLOG residual item sharpened earlier this
 window (bc110369a9c). Nothing wedged.
+**2026-07-29 09:1x local** — T13 review APPROVED (4 Minor — two misquoted figures ordered
+fixed in report text; appendix re-derived the gates independently). T14 DISPATCHED (impl-a14,
+opus): dual batteries, 9 lanes, 90m soak + observables, S38 fence-held REWRITE, W3 same-uuid
+e2e, 05020 harness, late-PUT python detector, four-layer aggregate paragraph, RESULTS doc w/
+exact `STAGE A: PASS`/`FAIL` verdict string.
