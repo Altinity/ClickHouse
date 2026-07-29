@@ -81,6 +81,17 @@ second enumeration is the detector's own, on the rounds it samples. Reasoning an
 `2026-07-28-stage-a-retirement-verdicts.md` (item 1). The mount-time LIST probe (#23) is the store GATE
 and remains separate work.
 
+## R9. Never-born namespaces have no late-PUT fence — [final review M4, fail-closed retention] {#r9-neverborn-fence}
+
+The recovery walk deliberately skips sealing dead epochs of non-Live streams (`CasRefLedger.cpp:768`
+vicinity), so an ambiguous BIRTH PUT that lands very late — after a remount and a successful re-birth
+at a higher epoch — produces a two-birth stream that permanently HOLDS the namespace
+(`UnconsumedSealCrossing`). Never loss: the hold is fail-closed retention plus suppressed destruction.
+Stage B incarnations close it structurally (an incarnation-keyed birth cannot collide with a dead
+predecessor's straggler). Until then it is a named residual: a namespace wedged this way stays held
+until an operator intervenes. Owner: Stage B incarnation work; found by the Stage A final
+whole-branch review (finding M4).
+
 ## R8. Register hygiene {#r8-hygiene}
 
 The eight rounds' findings files and the blinded consult's design live under `tmp/` — copy
