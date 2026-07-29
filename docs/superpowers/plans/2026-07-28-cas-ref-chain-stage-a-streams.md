@@ -1021,6 +1021,42 @@ coverage row, no hold, classification unchanged.
   The stage verdict line in `2026-07-28-stage-a-RESULTS.md` may print `STAGE A: PASS` only
   after this task's re-validation is green (the T14 doc states this dependency explicitly).
 
+### Task 16: codex phase-A findings — fold-seal strict decode + every-attempt verdict {#task-16}
+
+**Added 2026-07-29 from the codex sol-xhigh whole-phase review (1 blocker / 3 major; F3/F4 are
+scenario-card fixes owned by Task 14; this task fixes F1+F2).**
+
+**Files:**
+- Modify: `.../Formats/CasFoldSealFormat.cpp` (decode ~:289/:312/:329, encode ~:145)
+- Modify: `.../Backend/CasRequestControl.cpp` (~:341 verdict aggregation) + `.h` if the attempt
+  record needs a resolved-flag
+- Test: extend `src/Disks/tests/gtest_cas_gc_hold_grammar.cpp` (decode shapes) and
+  `src/Disks/tests/gtest_cas_ref_wedge_every_attempt.cpp` (one-call ordering)
+
+**Interfaces:**
+- Consumes: `ShardCoverage` grammar (classification ∈ {0,1,2,4}; 4 ⇔ hold present);
+  `CasUnresolvedReason` / `unresolvedProvesNothingWasSent` from the controller.
+- Produces: decode/encode that FAIL CLOSED on malformed seals; a controller verdict that can
+  never report `DefiniteFailure` while an earlier attempt of the same call remains unresolved.
+
+- [ ] **Step 1: Failing tests (F1, decode/encode hardening — each shape red first):**
+  (a) classification outside {0,1,2,4} (e.g. 3, 255, and a wide integer that truncates into
+  range — the uint8 truncation must be caught BEFORE narrowing) ⇒ decode throws CORRUPTED_DATA;
+  (b) classification-4 hold with `offending_position == {0,0}` ⇒ CORRUPTED_DATA;
+  (c) duplicate coverage rows for the same (namespace, shard) — held row first, clean second ⇒
+  CORRUPTED_DATA (never silent last-wins);
+  (d) encoder refuses the same three shapes with LOGICAL_ERROR (our writer producing them is a
+  bug, not corruption).
+- [ ] **Step 2: Failing test (F2, one-call ordering):** inside a SINGLE `putIfAbsentControlled`
+  call with `max_attempts >= 2`: attempt 1 ambiguous (timeout, resolution GET sees absent),
+  attempt 2 definite-failure ⇒ the call's verdict is AMBIGUOUS (wedge path), never
+  `DefiniteFailure`; ledger-side twin: the id is NOT declared never-used (`ApplyPending` stands
+  until resolved).
+- [ ] **Step 3:** Implement: strict decode/encode; verdict aggregation = `DefiniteFailure` only
+  when EVERY attempt of the call is definite (any unresolved ambiguous attempt dominates).
+- [ ] **Step 4:** Release CA gate green + both named suites explicitly.
+- [ ] **Step 5: Commit** `ca: fold-seal strict decode + every-attempt verdict aggregation (codex F1/F2)`.
+
 ---
 
 ## Self-review checklist (run at plan-completion, before removing the DRAFT marker) {#self-review}
