@@ -1955,3 +1955,9 @@ pattern incl. UNTOUCHED cards (S33/S30) + "common assertions" suggests the share
 end-checkpoint asserting reclaim/unreachable invariants under suppression — the drain class
 in the scenario framework's common block. Awaiting a14's RCA (last card finished 12:56).
 Load 0.99.
+**2026-07-29 13:20 local** — watchdog: a14 committed RESULTS (4376fde1ec8 + 2 follow-ups,
+525 lines) with verdict `STAGE A: FAIL` — reason framed as posture-vs-test-estate (four
+lanes, four scenarios, one soak criterion written against a reclaiming pool). Card fixes +
+scenario re-runs still SCENARIO_EXIT=1 (S43, S38); adapted-lane verification RUNNING
+(ref_snaplog VERIFY_EXIT=0 green, drop_pool_member in flight). Awaiting a14's DONE report —
+verdict-vs-PENDING ruling reconciliation happens at the task review, not mid-run.
