@@ -2429,6 +2429,12 @@ ColumnsDescription contentAddressedFsckColumns()
         {"pending_gc", std::make_shared<DataTypeUInt64>()},
         {"awaiting_gc", std::make_shared<DataTypeUInt64>()},
         {"unaccounted", std::make_shared<DataTypeUInt64>()},
+        /// The ref-stream verdicts (spec §7). `chain_broken` is a HARD finding — it belongs on the row
+        /// for the same reason `dangling` does, and a subset that omitted it would be a finding no SQL
+        /// consumer could ever see. `unchecked` is its honest companion: namespaces the audit could not
+        /// prove either way, so a zero here is what makes the other zeros mean something.
+        {"chain_broken", std::make_shared<DataTypeUInt64>()},
+        {"unchecked", std::make_shared<DataTypeUInt64>()},
         {"physical_bytes", std::make_shared<DataTypeUInt64>()},
         {"referenced_logical_bytes", std::make_shared<DataTypeUInt64>()},
         {"distinct_blobs", std::make_shared<DataTypeUInt64>()},
@@ -2446,6 +2452,8 @@ void appendContentAddressedFsckRow(MutableColumns & res_columns, const String & 
     res_columns[i++]->insert(rep.pending_gc);
     res_columns[i++]->insert(rep.awaiting_gc);
     res_columns[i++]->insert(rep.unaccounted);
+    res_columns[i++]->insert(rep.chain_broken);
+    res_columns[i++]->insert(rep.unchecked);
     res_columns[i++]->insert(rep.physical_bytes);
     res_columns[i++]->insert(rep.referenced_logical_bytes);
     res_columns[i++]->insert(rep.distinct_blobs);

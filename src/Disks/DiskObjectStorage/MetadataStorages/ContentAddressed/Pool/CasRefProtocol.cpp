@@ -829,6 +829,63 @@ RefCleanupPlan planRefCleanup(const RefTableListing & listing, const RefTxnId & 
     return plan;
 }
 
+EpochCrossResult crossEpochFromSeal(Backend & backend, const Layout & layout, const RootNamespace & ns,
+                                    const RefTxnId & from_seal, std::optional<bool> seal_proven,
+                                    const RefTxnId & witness)
+{
+    EpochCrossResult result;
+    if (from_seal == RefTxnId{})
+    {
+        result.outcome = EpochCrossOutcome::NothingConsumed;
+        return result;
+    }
+    if (seal_proven && !*seal_proven)
+    {
+        result.outcome = EpochCrossOutcome::NotASeal;
+        return result;
+    }
+
+    uint64_t target_epoch = witness.writer_epoch;
+    while (target_epoch > from_seal.writer_epoch)
+    {
+        const RefTxnId start{target_epoch, 1};
+        result.probed = start;
+        const auto body = backend.get(layout.refLogKey(ns, start));
+        if (!body)
+        {
+            ++result.absent_probes;
+            result.outcome = EpochCrossOutcome::StartAbsent;
+            return result;
+        }
+        ++result.body_gets;
+        RefLogTxn head;
+        try
+        {
+            head = decodeRefLogTxn(openObject(FormatId::RefLog, body->bytes), ns.string(), start);
+        }
+        catch (const Exception & e)
+        {
+            result.outcome = EpochCrossOutcome::StartInvalid;
+            result.detail = e.message();
+            return result;
+        }
+        if (!head.prev_epoch_seal || *head.prev_epoch_seal < from_seal)
+        {
+            result.outcome = EpochCrossOutcome::ChainDoesNotReach;
+            return result;
+        }
+        if (*head.prev_epoch_seal == from_seal)
+        {
+            result.outcome = EpochCrossOutcome::Proved;
+            result.start = start;
+            return result;
+        }
+        target_epoch = head.prev_epoch_seal->writer_epoch;
+    }
+    result.outcome = EpochCrossOutcome::ChainDoesNotReach;
+    return result;
+}
+
 RecoveredRefTable recoverRefTableDetailed(Backend & backend, const Layout & layout, const RootNamespace & ns,
                                           const std::function<void()> & on_page_fetched, unsigned max_restarts)
 {

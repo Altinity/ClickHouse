@@ -1958,65 +1958,25 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                             .retry_count = 0, .next_retry_round = 0};   /// retry fields filled in at the seal below
         };
 
-        /// Cross into the epoch that follows the one `from_seal` closed. The hint only NOMINATES a
-        /// candidate epoch (`witness`); the proof is the back-chain, because the target epoch's sequence-1
-        /// record names the seal that must have been consumed before it (INV-2). If it names a seal ABOVE
-        /// `from_seal`, an epoch sits in between that the hint omitted -- follow the chain back and take
-        /// that one instead, which is what makes a crossing independent of the listing. Anything else --
-        /// no sequence 1, an undecodable one, a genesis record (no `prev_epoch_seal`) above a consumed
-        /// seal, or a chain that skips our position -- is the unconsumed-seal crossing, and holds.
+        /// Cross into the epoch that follows the one `from_seal` closed. The rule itself is
+        /// `crossEpochFromSeal` (Pool/CasRefProtocol.cpp) -- read its doc comment for what the back-chain
+        /// proves and why the hint may only NOMINATE the target epoch. It lives there rather than here
+        /// because fsck's audit walks the same streams: if the round and the audit could disagree about
+        /// when an epoch boundary is proved, they would disagree about which records a cut contains.
         ///
-        /// WHAT THE CHAIN PROVES, EXACTLY: the IDENTITY of the position the next epoch chains from, not
-        /// its KIND. Those come apart when a writer names an ordinary record as `prev_epoch_seal`, and the
-        /// damage is the one the seal exists to prevent -- epoch `E` declared closed while its writer may
-        /// still append, so a later `{E, k}` lands permanently below the cursor. So the kind is checked
-        /// wherever it is knowable: `seal_proven` carries `refLogTxnIsEpochSeal` of the record THIS round
-        /// applied at `from_seal` (free -- the body was decoded to apply it). It is `nullopt` only when the
-        /// walk applied nothing this round, i.e. `from_seal` is the cursor a PREVIOUS round sealed; that
-        /// record may since have been cleaned, so its kind is unknowable by any amount of reading here and
-        /// the crossing rests on chain-trust. Closing that half needs the kind carried in the durable
-        /// cursor -- Task 8's hold/cursor grammar -- not more I/O.
-        ///
-        /// Terminates: `validateEpochSealGrammarStructural` guarantees `prev_epoch_seal->writer_epoch <
-        /// txn_id.writer_epoch`, so `target_epoch` strictly decreases and the loop is bounded below by
-        /// `from_seal`'s own epoch. The record it proves is read once more by the walk itself: one
-        /// redundant GET per epoch crossed, and crossings happen once per writer-epoch change.
+        /// This wrapper adds only the round's own accounting -- the reads the crossing performed land on
+        /// the row that spent them, and an undecodable epoch-start record is logged with the key.
         const auto crossFromSeal = [&](const RefTxnId & from_seal, const std::optional<bool> & seal_proven,
                                        const RefTxnId & witness) -> std::optional<RefTxnId>
         {
-            if (from_seal == RefTxnId{})
-                return std::nullopt;   /// nothing consumed yet: there is no seal to cross from
-            if (seal_proven && !*seal_proven)
-                return std::nullopt;   /// this round applied that record and it is NOT a seal
-            uint64_t target_epoch = witness.writer_epoch;
-            while (target_epoch > from_seal.writer_epoch)
-            {
-                const RefTxnId start{target_epoch, 1};
-                const auto body = backend.get(layout.refLogKey(ns, start));
-                if (!body)
-                {
-                    ++intake_absent_probes;   /// a failed crossing pays this read too; count it
-                    return std::nullopt;
-                }
-                ProfileEvents::increment(ProfileEvents::CasRefLogBodyGets);
-                RefLogTxn head;
-                try
-                {
-                    head = decodeRefLogTxn(openObject(FormatId::RefLog, body->bytes), ns_str, start);
-                }
-                catch (const Exception & e)
-                {
-                    LOG_WARNING(logger, "CAS GC ref intake: epoch-start log {} invalid: {}",
-                                layout.refLogKey(ns, start), e.message());
-                    return std::nullopt;
-                }
-                if (!head.prev_epoch_seal || *head.prev_epoch_seal < from_seal)
-                    return std::nullopt;
-                if (*head.prev_epoch_seal == from_seal)
-                    return start;   /// proved: `from_seal` is exactly the seal this epoch chains to
-                target_epoch = head.prev_epoch_seal->writer_epoch;
-            }
-            return std::nullopt;
+            const EpochCrossResult crossing =
+                crossEpochFromSeal(backend, layout, ns, from_seal, seal_proven, witness);
+            intake_absent_probes += crossing.absent_probes;   /// a failed crossing pays its reads too
+            ProfileEvents::increment(ProfileEvents::CasRefLogBodyGets, crossing.body_gets);
+            if (crossing.outcome == EpochCrossOutcome::StartInvalid)
+                LOG_WARNING(logger, "CAS GC ref intake: epoch-start log {} invalid: {}",
+                            layout.refLogKey(ns, crossing.probed), crossing.detail);
+            return crossing.proved() ? std::optional<RefTxnId>(crossing.start) : std::nullopt;
         };
 
         /// The first position to read. A never-folded namespace has no arithmetic predecessor, so its
@@ -3662,14 +3622,10 @@ RebuildReport Gc::rebuildBaseline(bool force)
     std::vector<std::vector<BlobDelta>> buckets(gc_shards);
     std::vector<std::vector<RunRef>> prior_runs(gc_shards);
     std::vector<uint64_t> attempt_of(gc_shards, 0);
-    /// Retired-in-snapshot: the final flush folds the orphan condemn synth deltas ALONGSIDE the
-    /// edges into one run, so `condemn_seed_head` (the captured tokens/sizes) and `condemn_round_stamp`
-    /// are set after the pipeline-blindness LIST/HEAD below and consumed by the LAST `flush_shard` per
-    /// shard. Empty/0 until then keeps mid-traversal budget flushes behavior-identical to the legacy
-    /// edge-only fold (`foldDeltasIntoGeneration` defaults: no head_blob condemns, current_round 0
-    /// graduates nothing).
-    std::function<std::optional<HeadResult>(const BlobRef &)> condemn_seed_head;
-    uint64_t condemn_round_stamp = 0;
+    /// The fold is EDGE-ONLY here: a rebuild condemns nothing (spec §7, and the deletion below), so no
+    /// condemn round is stamped and no head source is supplied. `current_round` 0 graduates nothing and
+    /// `condemn_round` 0 with an empty `head_blob` mints no `kCondemned` row -- this call is
+    /// `foldDeltasIntoGeneration`'s pure edge form.
     auto flush_shard = [&](uint64_t shard)
     {
         if (buckets[shard].empty())
@@ -3677,7 +3633,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
         std::vector<RunRef> out;
         foldDeltasIntoGeneration(backend, layout, prior_runs[shard], generation, ++attempt_of[shard],
                                  shard, std::move(buckets[shard]), out,
-                                 /*current_round*/0, /*condemn_round*/condemn_round_stamp, condemn_seed_head,
+                                 /*current_round*/0, /*condemn_round*/0, /*head_blob*/{},
                                  /*peek_head*/{}, /*confirm_condemned_marker*/{},
                                  /*out_retired*/nullptr, /*suppress_destructive*/false,
                                  /// Probe B2 does not apply to the rebuild: it derives edges from raw
@@ -3688,17 +3644,11 @@ RebuildReport Gc::rebuildBaseline(bool force)
         buckets[shard].clear();
         prior_runs[shard] = std::move(out);
     };
-    /// `edge_bearing` is `BlobRef`-keyed natively; the pipeline-blindness LIST/HEAD
-    /// sweep below derives each listed key's `BlobRef` from its OWN `<algo>` path segment
-    /// (`Layout::parseBlobKey`), so a mixed-algo pool's blobs under EVERY admitted algo are
-    /// recognized in one sweep, not just the pool's node-local write algo.
-    std::unordered_set<BlobRef, BlobRefHash> edge_bearing;   /// O(distinct blobs) — maintenance op
     auto route_deltas = [&](std::vector<BlobDelta> & deltas)
     {
         rep.edges += deltas.size();
         for (BlobDelta & d : deltas)
         {
-            edge_bearing.insert(d.ref);
             const uint64_t shard = blobShard(d.ref, gc_shards);
             buckets[shard].push_back(std::move(d));
             if (buckets[shard].size() >= budget)
@@ -3852,41 +3802,26 @@ RebuildReport Gc::rebuildBaseline(bool force)
         }, 1000, onGcEnumerationPage);
     }
 
-    /// Pipeline blindness repair (found by the convergence test): the fold discovers candidates by
-    /// TRANSITIONS to zero, but a blob whose edges are entirely gone by rebuild time has NO row in
-    /// the rebuilt baseline — it would never transition and never be reclaimed. The rebuild holds
-    /// FULL-TRAVERSAL knowledge, so it condemns them itself: every physically-present blob with
-    /// zero rebuilt edges is condemned at the minted round. Graduation still waits for every mount to
-    /// ack past that round (the normal floor) — in model terms this is exactly the GComplete
-    /// condemnation the next pass would perform if the fold were omniscient. This LIST/HEAD sweep runs
-    /// BEFORE the run flush (retired-in-snapshot): the orphans are folded into the SAME single flush
-    /// pass as the edges (no separate second fold, no orphan attempt run), so it needs the COMPLETE
-    /// `edge_bearing` set from the traversal above.
-    std::vector<std::vector<RetiredEntry>> zero_condemned(gc_shards);
-    {
-        /// Path-derived BlobRef: every listed key under `blobsPrefix()` -- across EVERY
-        /// admitted algo, not just the pool's node-local write algo -- is classified by parsing its
-        /// OWN `<algo>` path segment. `.meta` siblings and any foreign/malformed key shape parse to
-        /// `std::nullopt` and are skipped as debris, mirroring the pre-mixed-algo sweep's identical
-        /// `catch (...) continue` contract.
-        forEachListedKey(backend, layout.blobsPrefix(), [&](const ListedKey & k)
-        {
-            const std::optional<BlobRef> parsed = layout.parseBlobKey(k.key);
-            if (!parsed)
-                return;   /// foreign key shape (`.meta` sibling, unknown algo, wrong width) — not ours to condemn
-            const BlobRef & ref = *parsed;
-            if (edge_bearing.contains(ref))
-                return;
-            const HeadResult hr = backend.head(k.key);
-            if (!hr.exists)
-                return;
-            zero_condemned[blobShard(ref, gc_shards)].push_back(RetiredEntry{
-                .kind = ObjectKind::Blob, .ref = ref, .token = hr.token, .size = hr.size});
-        }, 1000, onGcEnumerationPage);
-    }
-
-    /// Numbering, part 2: the round above every surviving fence/state/generation number (also the
-    /// condemn_round stamped on the full-traversal condemns folded into the runs below).
+    /// A REBUILD CONDEMNS NOTHING (spec §7).
+    ///
+    /// It used to end here with a LIST of `blobs/`, condemning every listed body its traversal had not
+    /// reached ("pipeline blindness repair": the fold discovers candidates by TRANSITIONS to zero, so a
+    /// blob whose edges were already gone by rebuild time would have no row and never be reclaimed).
+    /// The premise was that a full traversal knows every live blob. It does not. BOTH legs of the
+    /// traversal above are listing-driven -- the owner replay reads the ref prefix, the trimmed-but-live
+    /// pass reads the manifest prefix -- so a store that omits a durable key from one enumeration hides
+    /// a LIVE owner, and this pass would then condemn the very blob that owner pins. That is
+    /// r5-finding-4: one lying enumeration, and acked data is scheduled for deletion. Hiding is not
+    /// hypothetical here; it is the observed `0x1430c` shape that made every ref walk arithmetic.
+    ///
+    /// THE NAMED RESIDUAL this leaves (Stage-A staging contract, register R4): a blob whose manifest no
+    /// longer exists anywhere is unreclaimable -- nothing can enumerate it safely -- until the
+    /// build/upload registry can say which uploads are in flight. It is retention, not loss, and it is
+    /// bounded by that registry landing. NO substitute reclamation is added in its place: any cheaper
+    /// rule that reclaims from an enumeration is the same vector wearing a different hat, and a
+    /// fallback that deletes on incomplete evidence is precisely what "fail closed" forbids.
+    ///
+    /// Numbering, part 2: the round above every surviving fence/state/generation number.
     const uint64_t round = std::max({max_fence_round, state.round, max_gen}) + 1;
 
     /// Stamp the retry round on the holds THIS rebuild minted (the bodiless-precommit ones, left unset
@@ -3897,58 +3832,8 @@ RebuildReport Gc::rebuildBaseline(bool force)
         if (const auto it = seal.per_ns_shard.find(key); it != seal.per_ns_shard.end() && it->second.hold)
             it->second.hold->next_retry_round = round + 1;
 
-    /// Publish the per-hash condemn marker for EVERY full-traversal condemn SYNCHRONOUSLY (the rebuild
-    /// is an offline/administrative path — no bounded-pool async model here). The marker is the
-    /// writer's adopt gate, and graduation of these entries is gated on confirmed durable Condemned
-    /// evidence (triage 2026-07-17 §3.4): a rebuild that skipped the markers would make the
-    /// swallowed-marker hazard systematic, not a race. A failed write is recorded as an anomaly and the
-    /// entry enters the retired set UNCONFIRMED — the graduation gate then carries it (and retries the
-    /// marker) instead of fail-open deleting; a per-entry failure never aborts the rebuild.
     for (uint64_t shard = 0; shard < gc_shards; ++shard)
-    {
-        for (const RetiredEntry & e : zero_condemned[shard])
-        {
-            try
-            {
-                if (writeCondemnedMeta(*store, e.ref, round, e.size))
-                    noteCondemnMarkerDurable(e.ref, e.token);
-            }
-            catch (...)
-            {
-                ProfileEvents::increment(ProfileEvents::CasGcMetaWriteAnomaly);
-                tryLogCurrentException(logger,
-                    "CAS gc rebuild: condemn-marker write failed; the entry enters the retired set "
-                    "unconfirmed (carried at graduation, never fail-open deleted)");
-            }
-        }
-    }
-
-    /// Retired-in-snapshot seeding: append each full-traversal condemn's synthetic +edge/-edge
-    /// pair (reserved `source_id = UInt128{1}`, net in-degree 0 — the pair cancels) into its shard's
-    /// bucket, and expose the already-captured exact token/size through `condemn_seed_head`. The SINGLE
-    /// `flush_shard` below then folds these alongside the real edges: the fold's own fresh-condemn path
-    /// mints a `kCondemned` sentinel row at `round` for each. The condemn set is disjoint from
-    /// edge-bearing blobs by construction, so no real edge is perturbed. The next regular round settles
-    /// each row FROM THE RUN (the fold no longer takes a separate retired-set input).
-    std::unordered_map<BlobRef, HeadResult, BlobRefHash> condemn_seeded;
-    for (uint64_t shard = 0; shard < gc_shards; ++shard)
-    {
-        for (const RetiredEntry & e : zero_condemned[shard])
-        {
-            condemn_seeded.emplace(e.ref, HeadResult{.exists = true, .size = e.size, .token = e.token, .attributes = {}});
-            buckets[shard].push_back(BlobDelta{.ref = e.ref, .source_id = UInt128{1}, .remove = false});
-            buckets[shard].push_back(BlobDelta{.ref = e.ref, .source_id = UInt128{1}, .remove = true});
-        }
-    }
-    condemn_seed_head = [&condemn_seeded](const BlobRef & ref) -> std::optional<HeadResult>
-    {
-        const auto it = condemn_seeded.find(ref);
-        return it == condemn_seeded.end() ? std::nullopt : std::optional<HeadResult>(it->second);
-    };
-    condemn_round_stamp = round;
-
-    for (uint64_t shard = 0; shard < gc_shards; ++shard)
-        flush_shard(shard);   /// single pass: real-edge rows AND the orphan kCondemned rows
+        flush_shard(shard);   /// real-edge rows only: a rebuild condemns nothing, so it seeds nothing
 
     for (uint64_t shard = 0; shard < gc_shards; ++shard)
         for (const RunRef & r : prior_runs[shard])
@@ -3966,16 +3851,11 @@ RebuildReport Gc::rebuildBaseline(bool force)
 
     /// Retired-in-snapshot: the rebuilt seal's `condemned_summary` must be TOTAL over gc_shards so a
     /// subsequent regular round reads graduation/carry decisions zero-I/O off it (and its `carryParentRefs`
-    /// totality check does not fail closed). The full-traversal condemns seeded above are all fresh and
-    /// non-pending, condemned at `round`.
+    /// totality check does not fail closed). Every entry is EMPTY -- a rebuild condemns nothing -- and
+    /// the totality is still owed: an ABSENT row and a zero row are different claims, and the round that
+    /// reads this seal fails closed on the absent one.
     for (uint64_t shard = 0; shard < gc_shards; ++shard)
-    {
-        CondemnedSummary cs;
-        cs.condemned_total = zero_condemned[shard].size();
-        if (!zero_condemned[shard].empty())
-            cs.oldest_nonpending_condemn_round = round;
-        seal.condemned_summary[shard] = cs;
-    }
+        seal.condemned_summary[shard] = CondemnedSummary{};
 
     /// Seal (deterministic artifact) + the single state CAS. attempt = the max per-shard attempt
     /// (>= 1 so the seal key is stable даже for an empty universe).
@@ -3992,9 +3872,6 @@ RebuildReport Gc::rebuildBaseline(bool force)
     /// (folded into the single flush above) — there is no separate `RetiredSet` object family, so the
     /// rebuild mints none.
     next.manifest_sweep_cursor = "";
-    uint64_t zero_total = 0;
-    for (uint64_t shard = 0; shard < gc_shards; ++shard)
-        zero_total += zero_condemned[shard].size();
     const CasResult res = backend.casPut(layout.gcStateKey(), encodeGcState(next), state_token);
     if (res.outcome != CasOutcome::Committed)
     {
@@ -4020,7 +3897,6 @@ RebuildReport Gc::rebuildBaseline(bool force)
                     {"unowned_alive_manifests", std::to_string(rep.unowned_alive_manifests)},
                     {"edges", std::to_string(rep.edges)},
                     {"clamped_shards", std::to_string(rep.clamped_shards)},
-                    {"zero_condemned", std::to_string(zero_total)},
                     {"force", force ? "1" : "0"}};
     });
     return rep;

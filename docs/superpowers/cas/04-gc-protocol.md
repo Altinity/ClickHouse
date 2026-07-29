@@ -543,12 +543,16 @@ bricks; no new scanner or merge class:
 5. **`foldDeltasIntoGeneration`**, attempt-iterated per gc-shard bucket (empty priors, budget-bounded
    memory — the same primitive the regular round's three-cursor merge uses), builds the rebuilt
    in-degree runs and the fold seal.
-6. **Zero-edge condemnation** — a blob with a rebuilt in-degree of zero has no transition to trigger
-   the normal condemn path (the fold discovers candidates by transition-to-zero, and a rebuild-time
-   zero-edge blob never transitions). The rebuild condemns it directly: every physically-present blob
-   outside the rebuilt edge set enters the retired list with a **head-captured exact token at the
-   minted round**. Graduation still waits for every mount to ack past that round — the normal
-   two-phase floor (§3.5), not a shortcut.
+6. **A rebuild condemns nothing** (spec `2026-07-27` §7). It rebuilds cursors and edges; it reclaims
+   no object of any kind. Earlier builds ended the pass with a `LIST(blobs/)` that condemned every
+   physically-present body outside the rebuilt edge set — the reasoning being that a blob whose edges
+   were already gone by rebuild time never transitions to zero and so has no row the fold could ever
+   settle. The premise was that a full traversal knows every live blob, and it is false: **both** legs
+   of the traversal (step 4's owner replay and the trimmed-but-live manifest pass below) are
+   listing-driven, so a store that omits a durable key from one enumeration hides a **live** owner and
+   the same pass then condemns the blob that owner pins. That is r5-finding-4 — one lying enumeration,
+   and acked data is scheduled for deletion. Omission is not hypothetical: it is the observed
+   `0x1430c` shape that made every ref walk arithmetic in the first place.
 7. **Round mint** — `round = max(heartbeat-floor max_ack, max shard fence_round seen, the old
    state.round, max_gen) + 1`. Minting above every surviving mount ack (not just the old round) closes
    a skew hazard: a stale mount's ack could otherwise float a fresh condemnation past its own floor

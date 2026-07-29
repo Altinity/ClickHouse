@@ -1264,6 +1264,88 @@ private:
     uint64_t delete_total = 0;
 };
 
+/// A backend whose LIST permanently omits every key under a chosen prefix while those keys stay fully
+/// readable by exact key -- the lying-store shape observed in production (`0x1430c`/`0x1430d`), and the
+/// premise of every arithmetic-walk test: a record a listing never mentions is still THERE, so a walk
+/// that computes the id finds it and a walk that enumerates does not.
+///
+/// PERMANENT (not nth-call) omission is deliberate: GC's probe A compares the round's two independent
+/// enumerations, and a hole reproduced identically in both is invisible to it by the probe's own stated
+/// limitation. That keeps these fixtures about the walk rather than about the probe.
+///
+/// Erasing keys from a page cannot disturb pagination: `ListPage::next_cursor` is computed by the base
+/// backend before the erase, so the next page still resumes strictly after the last key it returned.
+///
+/// Templated on the base so a suite that also needs request COUNTS composes it over `CountingBackend`
+/// without a second copy of the hiding rule (which is a rule about what the store may legally do, and
+/// must therefore read the same everywhere it is modelled).
+template <typename Base>
+class HintHoleBackendOn : public Base
+{
+public:
+    /// Hide every key under `prefix` from LIST -- a whole namespace, including objects a later publish
+    /// adds.
+    void hidePrefix(const String & prefix)
+    {
+        std::lock_guard lock(hide_mutex);
+        hidden_prefixes.push_back(prefix);
+    }
+
+    /// Hide exactly one key. Call AFTER seeding: a fixture that allocates ids by listing would
+    /// otherwise allocate over a hidden record.
+    void hide(const String & key)
+    {
+        std::lock_guard lock(hide_mutex);
+        hidden_keys.insert(key);
+    }
+
+    /// How many LIST pages actually had a key erased. Every test that hides a key asserts this, so a
+    /// mistyped key cannot let the test pass vacuously -- the hole has to have been SERVED.
+    size_t holesServed() const
+    {
+        std::lock_guard lock(hide_mutex);
+        return served;
+    }
+
+    /// The store stops lying: everything hidden is listed again.
+    void revealAll()
+    {
+        std::lock_guard lock(hide_mutex);
+        hidden_keys.clear();
+        hidden_prefixes.clear();
+    }
+
+    DB::Cas::ListPage list(const String & prefix, const String & cursor, size_t limit) override
+    {
+        DB::Cas::ListPage page = Base::list(prefix, cursor, limit);
+        std::lock_guard lock(hide_mutex);
+        if (hidden_keys.empty() && hidden_prefixes.empty())
+            return page;
+        const size_t before = page.keys.size();
+        std::erase_if(page.keys, [&](const DB::Cas::ListedKey & k)
+        {
+            if (hidden_keys.contains(k.key))
+                return true;
+            for (const String & hidden : hidden_prefixes)
+                if (k.key.starts_with(hidden))
+                    return true;
+            return false;
+        });
+        if (page.keys.size() != before)
+            ++served;
+        return page;
+    }
+
+private:
+    mutable std::mutex hide_mutex;
+    std::set<String> hidden_keys;
+    std::vector<String> hidden_prefixes;
+    size_t served = 0;
+};
+
+/// The plain form, over a bare `InMemoryBackend`.
+using HintHoleBackend = HintHoleBackendOn<DB::Cas::InMemoryBackend>;
+
 /// Stand in for the self-remount that `Pool::reportImpossibleInterference` schedules. That reaction
 /// trips the local write fence closed AND schedules a remount; a unit-test Pool runs no background
 /// remount (`background_watermark` is off by design there), so without this the fence stays closed and

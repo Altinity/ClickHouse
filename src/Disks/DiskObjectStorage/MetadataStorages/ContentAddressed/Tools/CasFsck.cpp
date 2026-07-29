@@ -177,6 +177,251 @@ bool manifestStillReferenced(Backend & backend, const Layout & layout, const Roo
 }
 
 /// For the newest published snapshot `X` of `ns`, independently reconstruct
+/// One namespace's ref-object ids from a SINGLE `LIST` of its prefix, ascending.
+///
+/// A HINT, and nothing more. The arithmetic walk reads every id it cares about by exact key, so an
+/// omission costs one `GET` and changes no verdict; this supplies the walk's witness set and the
+/// oracle's snapshot candidates. Both consumers share one listing rather than each taking their own,
+/// which is also what keeps a namespace's audit at one enumeration.
+struct NsRefListing
+{
+    std::vector<RefTxnId> logs;
+    std::vector<RefTxnId> snapshots;
+};
+
+NsRefListing listNsRefObjects(Backend & backend, const Layout & layout, const RootNamespace & ns)
+{
+    NsRefListing out;
+    forEachListedKey(backend, layout.refsNamespacePrefix(ns), [&](const ListedKey & lk)
+    {
+        const auto parsed = layout.parseRefObjectKey(lk.key);
+        if (!parsed || parsed->ns != ns)
+            return;
+        if (parsed->kind == RefObjectKind::Snap)
+            out.snapshots.push_back(parsed->txn_id);
+        else if (parsed->kind == RefObjectKind::Log)
+            out.logs.push_back(parsed->txn_id);
+    });
+    std::sort(out.logs.begin(), out.logs.end());
+    std::sort(out.snapshots.begin(), out.snapshots.end());
+    return out;
+}
+
+String renderId(const RefTxnId & id)
+{
+    return std::to_string(id.writer_epoch) + "-" + std::to_string(id.ref_sequence);
+}
+
+/// Per-NAMESPACE verdicts of the stream audit. Both counters count namespaces, not rows: a namespace
+/// has exactly one answer about its stream even when several checks reach it.
+///
+/// A namespace PROVEN broken is never also counted `unchecked`. "Proved broken" and "could not prove"
+/// are different answers, and letting the second overwrite or accompany the first would turn a fatal
+/// into an ambiguity — the recovery path throws on a holed stream, so a chain-broken namespace reliably
+/// produces a downstream failure too, and that failure must not dilute the verdict that explains it.
+struct NsVerdicts
+{
+    std::set<String> chain_broken;
+    std::set<String> unchecked;
+
+    void recordChainBroken(FsckReport & report, const RootNamespace & ns, const String & key, String note)
+    {
+        chain_broken.insert(ns.string());
+        unchecked.erase(ns.string());
+        push(report, key, FsckClass::ChainBroken, std::move(note));
+    }
+
+    void recordUnchecked(FsckReport & report, const RootNamespace & ns, const String & key, String note)
+    {
+        if (chain_broken.contains(ns.string()))
+            return;
+        unchecked.insert(ns.string());
+        push(report, key, FsckClass::Unchecked, std::move(note));
+    }
+
+    /// Both classes are emitted in EVERY mode, not just `detail`: they are namespace verdicts, bounded
+    /// by the namespace count, and a summary run that hid them would report a number nobody could act on.
+    void push(FsckReport & report, const String & key, FsckClass cls, String note) const
+    {
+        FsckObject o;
+        o.key = key;
+        o.kind = ObjectKind::Blob;   /// ref objects have no ObjectKind; reuse Blob as the generic kind
+        o.size = 0;
+        o.cls = cls;
+        o.reachable_from = {std::move(note)};
+        report.objects.push_back(std::move(o));
+    }
+
+    void publish(FsckReport & report) const
+    {
+        report.chain_broken = chain_broken.size();
+        report.unchecked = unchecked.size();
+    }
+};
+
+/// THE ARITHMETIC STREAM WALK (spec §7). Read-only, one namespace.
+///
+/// fsck may not rest a verdict on an enumeration any more than the fold may. Ids are dense `1..T`
+/// within `(namespace, writer_epoch)` (INV-1), so the next id is COMPUTABLE and every position is read
+/// by exact key from `_ckpt.checkpoint`'s successor upward. An absent expected-next is the decision
+/// point, and there are exactly three answers:
+///
+///   * nothing above it            => the namespace's FRONTIER. Proven, silent, the healthy case.
+///   * a CONFIRMED durable id in the SAME epoch above it => `chain-broken`. Under contiguity this
+///     cannot be the end of anything: a durable record is missing and every transaction above it is
+///     unreachable. The witness is confirmed by its own exact `GET` before it may convict — a listing
+///     that can omit a key can equally well name one that is gone, and this verdict costs an exit code.
+///   * only LATER-epoch ids above it => attempt the crossing, which is PROVED through the next epoch's
+///     `prev_epoch_seal` back-chain (`crossEpochFromSeal`, shared with the fold) or else reported
+///     `unchecked`.
+///
+/// It writes nothing and mints nothing. The writer's recovery closes a dead epoch by putting a seal in
+/// the slot it walked to; an auditor has no business doing that, so a stream whose epoch was never
+/// closed reads as unprovable rather than being repaired into provable.
+void checkRefStream(Backend & backend, const Layout & layout, const RootNamespace & ns,
+                    const NsRefListing & listing, const Deadline & deadline,
+                    FsckReport & report, NsVerdicts & verdicts)
+{
+    checkDeadline(deadline, "ref stream");
+    const std::optional<CkptSample> sampled_ckpt = readCkpt(backend, layout, ns);
+
+    /// The base: the greater of what the listing offered and what the checkpoint NAMES. The checkpoint
+    /// is what makes this robust against a cleaned prefix — INV-4 forbids deleting the snapshot it
+    /// names, so that one is fetchable even when no listing mentions it.
+    std::optional<RefTxnId> base_id;
+    if (!listing.snapshots.empty())
+        base_id = listing.snapshots.back();
+    if (sampled_ckpt && sampled_ckpt->ckpt.checkpoint_snapshot_id
+        && (!base_id || *base_id < *sampled_ckpt->ckpt.checkpoint_snapshot_id))
+        base_id = sampled_ckpt->ckpt.checkpoint_snapshot_id;
+
+    /// Where the tail starts, by the same grounding rule recovery uses (spec §4) minus its writes: the
+    /// base's successor, else the namespace's birth epoch, else the listing's floor. A namespace with
+    /// none of the three was never born, and the empty stream IS its proof — not an `unchecked`.
+    std::optional<RefTxnId> expected;
+    if (base_id)
+        expected = RefTxnId{base_id->writer_epoch, base_id->ref_sequence + 1};
+    else if (sampled_ckpt && sampled_ckpt->ckpt.life_epoch)
+        expected = RefTxnId{*sampled_ckpt->ckpt.life_epoch, 1};
+    else if (!listing.logs.empty())
+        expected = RefTxnId{listing.logs.front().writer_epoch, 1};
+    if (!expected)
+        return;
+
+    /// The GREATEST candidate in `epoch` strictly above `above_sequence` — the one most likely to still
+    /// be durable, so a hole is caught with a single confirming read. `_ckpt.last_epoch_seal` joins the
+    /// listing as a second, listing-INDEPENDENT witness: a checkpoint that records a seal at `{E, S}`
+    /// had a durable object there, whatever any enumeration says.
+    const auto greatestSameEpochAbove = [&](uint64_t epoch, uint64_t above_sequence) -> std::optional<RefTxnId>
+    {
+        std::optional<RefTxnId> best;
+        const auto consider = [&](const RefTxnId & w)
+        {
+            if (w.writer_epoch == epoch && w.ref_sequence > above_sequence && (!best || *best < w))
+                best = w;
+        };
+        for (const RefTxnId & id : listing.logs)
+            consider(id);
+        if (sampled_ckpt && sampled_ckpt->ckpt.last_epoch_seal)
+            consider(*sampled_ckpt->ckpt.last_epoch_seal);
+        return best;
+    };
+
+    /// The NEAREST candidate in a LATER epoch — the epoch a crossing would aim at. Nearest rather than
+    /// greatest: the crossing proves its way back down the chain, so aiming at the closest epoch that
+    /// something claims exists is both sufficient and cheapest.
+    const auto nearestLaterEpochAbove = [&](const RefTxnId & id) -> std::optional<RefTxnId>
+    {
+        std::optional<RefTxnId> best;
+        const auto consider = [&](const RefTxnId & w)
+        {
+            if (w.writer_epoch > id.writer_epoch && (!best || w < *best))
+                best = w;
+        };
+        for (const RefTxnId & l : listing.logs)
+            consider(l);
+        if (sampled_ckpt && sampled_ckpt->ckpt.last_epoch_seal)
+            consider(*sampled_ckpt->ckpt.last_epoch_seal);
+        return best;
+    };
+
+    RefTxnId resolved_through{};
+    std::optional<bool> last_applied_is_seal;
+
+    for (;;)
+    {
+        checkDeadline(deadline, "ref stream");
+        const auto got = backend.get(layout.refLogKey(ns, *expected));
+        if (got)
+        {
+            bool is_seal = false;
+            try
+            {
+                is_seal = refLogTxnIsEpochSeal(
+                    decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), *expected));
+            }
+            catch (const Exception & e)
+            {
+                verdicts.recordUnchecked(report, ns, layout.refLogKey(ns, *expected),
+                    "ref stream: the record at " + renderId(*expected) + " could not be decoded, so nothing "
+                    "above it can be proved either: " + e.message());
+                return;
+            }
+            ++report.ref_records_walked;
+            resolved_through = *expected;
+            last_applied_is_seal = is_seal;
+            /// A seal gets NO special case: it advances the position like any other record, the walk
+            /// then finds nothing at the position after it, and the crossing below is what proves where
+            /// the stream continues. Jumping to `{epoch + 1, 1}` here would be a guess.
+            expected = RefTxnId{expected->writer_epoch, expected->ref_sequence + 1};
+            continue;
+        }
+
+        /// ---- Absent: hole, frontier, or an epoch boundary ----
+        if (const auto witness = greatestSameEpochAbove(expected->writer_epoch, expected->ref_sequence))
+        {
+            if (backend.get(layout.refLogKey(ns, *witness)))
+            {
+                verdicts.recordChainBroken(report, ns, layout.refLogKey(ns, *expected),
+                    "ref stream: id " + renderId(*expected) + " is absent while " + renderId(*witness)
+                    + " in the same epoch is durable — the stream is dense by construction (INV-1), so this "
+                      "is a HOLE, not the end of the stream, and every record above it is unreachable");
+                return;
+            }
+            /// The listing named a key that is not there. That convicts nobody; fall through and let a
+            /// later-epoch witness (if any) decide whether there is a crossing to attempt.
+        }
+
+        const auto later = nearestLaterEpochAbove(*expected);
+        if (!later)
+            return;   /// frontier: nothing above claims to exist, and the walk proved everything below it
+
+        const EpochCrossResult crossing =
+            crossEpochFromSeal(backend, layout, ns, resolved_through, last_applied_is_seal, *later);
+        if (!crossing.proved())
+        {
+            verdicts.recordUnchecked(report, ns, layout.refLogKey(ns, *expected),
+                "ref stream: records of a later epoch are reachable but this epoch's closing seal was "
+                "never consumed (or the position they chain from is not one), so the crossing at "
+                + renderId(*expected) + " has no proof"
+                + (crossing.detail.empty() ? "" : ": " + crossing.detail));
+            return;
+        }
+        /// Every iteration must move strictly forward. A crossing that lands back on the position just
+        /// read as absent means the epoch-start record answered the crossing's `GET` and then stopped
+        /// answering ours — an above-cursor object vanishing under the walk, which nothing may
+        /// legitimately do. Unprovable, and reported as such rather than spun on.
+        if (!(*expected < crossing.start))
+        {
+            verdicts.recordUnchecked(report, ns, layout.refLogKey(ns, *expected),
+                "ref stream: the epoch crossing resolved back to " + renderId(crossing.start)
+                + ", the position that just read absent — the epoch-start record is not stably readable");
+            return;
+        }
+        expected = crossing.start;
+    }
+}
+
 /// the table state AT `X` from an EARLIER base (the greatest snapshot below `X`, or the empty state) plus
 /// the surviving logs in `(base, X]`, re-encode it deterministically, and byte-compare to the published
 /// `X` object. Byte-determinism of the codec (canonical sort, verified in the codec's own gtests) makes
@@ -190,27 +435,14 @@ bool manifestStillReferenced(Backend & backend, const Layout & layout, const Roo
 /// oracle therefore validates freshly-published snapshots and any table whose `GC` cleanup is still
 /// behind; it uses only the shared `replay`/`snapshotOf` state machine, never a second copy.
 void checkSnapshotOracle(Backend & backend, const Layout & layout, const RootNamespace & ns,
-                         bool detail, const Deadline & deadline, FsckReport & report)
+                         const NsRefListing & listing, bool detail, const Deadline & deadline, FsckReport & report)
 {
     checkDeadline(deadline, "snapshot oracle");
 
-    /// One LIST of the table prefix; gather snapshot and log ids.
-    std::vector<RefTxnId> snap_ids;
-    std::vector<RefTxnId> log_ids;
-    forEachListedKey(backend, layout.refsNamespacePrefix(ns), [&](const ListedKey & lk)
-    {
-        const auto parsed = layout.parseRefObjectKey(lk.key);
-        if (!parsed || parsed->ns != ns)
-            return;
-        if (parsed->kind == RefObjectKind::Snap)
-            snap_ids.push_back(parsed->txn_id);
-        else if (parsed->kind == RefObjectKind::Log)
-            log_ids.push_back(parsed->txn_id);
-    });
+    const std::vector<RefTxnId> & snap_ids = listing.snapshots;
+    const std::vector<RefTxnId> & log_ids = listing.logs;
     if (snap_ids.empty())
         return;   /// no published snapshot: recovering from logs alone is valid, nothing to oracle
-    std::sort(snap_ids.begin(), snap_ids.end());
-    std::sort(log_ids.begin(), log_ids.end());
 
     const RefTxnId snapshot_x = snap_ids.back();
     const auto got_x = backend.get(layout.refSnapshotKey(ns, snapshot_x));
@@ -311,82 +543,111 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
     std::unordered_map<String, std::vector<String>> blob_labels;
 
     uint64_t refs_walked = 0;
+    NsVerdicts verdicts;
+    SCOPE_EXIT({ verdicts.publish(report); });
     for (const String & ns_str : store.listNamespaces(namespace_prefix))
     {
         const RootNamespace ns{ns_str};
-        /// Fresh recovery (LIST + replay), not the mounted Pool's cached `listRefs`: fsck is a read-only
-        /// audit that must see the authoritative durable ref state, including any external write.
-        const RefTableState table = recoverRefTable(backend, layout, ns);
-        /// Snapshot integrity oracle: verify this table's newest published
-        /// snapshot is byte-identical to an independent replay of its own logs. Fails closed (records a
-        /// mismatch, making the report not `clean()`) on a genuine divergence; skips silently when the
-        /// covered logs were already cleaned or an object vanished mid-check.
-        checkSnapshotOracle(backend, layout, ns, detail, deadline, report);
-        for (const auto [ref_name, row] : table.getCommitted())
+        /// RECORD AND CONTINUE, NEVER WEDGE. Everything below is per-namespace, and every one of these
+        /// steps can raise `CORRUPTED_DATA` on a namespace whose stream is damaged — the replay refuses a
+        /// non-contiguous tail, the codecs refuse an invalid body. For RECOVERY that throw is the correct
+        /// fail-close; for a read-only diagnostic it is a bug, because the audit then reports NOTHING
+        /// about the namespaces it never reached, including the healthy ones. So one namespace's failure
+        /// becomes that namespace's verdict and the sweep goes on.
+        ///
+        /// `TIMEOUT_EXCEEDED` is deliberately NOT caught: the deadline is a property of the whole scan,
+        /// and `runFsck`'s `partial` handling owns it.
+        try
         {
-            const ManifestId id{ns, row.manifest_ref};
-            const String mkey = layout.manifestKey(id);
-            owned_manifest_keys.insert(mkey);
-            const String label = ns_str + "/" + ref_name;
+            /// One listing of the namespace's ref prefix, shared by the stream walk and the oracle.
+            const NsRefListing listing = listNsRefObjects(backend, layout, ns);
 
-            const auto got = backend.get(mkey);
-            if (!got)
+            /// The arithmetic stream audit runs FIRST, so a holed stream gets the verdict that EXPLAINS
+            /// it (`chain-broken`) rather than the downstream `CORRUPTED_DATA` the replay below would
+            /// raise about the same hole.
+            checkRefStream(backend, layout, ns, listing, deadline, report, verdicts);
+
+            /// Fresh recovery (LIST + replay), not the mounted Pool's cached `listRefs`: fsck is a read-only
+            /// audit that must see the authoritative durable ref state, including any external write.
+            const RefTableState table = recoverRefTable(backend, layout, ns);
+            /// Snapshot integrity oracle: verify this table's newest published
+            /// snapshot is byte-identical to an independent replay of its own logs. Fails closed (records a
+            /// mismatch, making the report not `clean()`) on a genuine divergence; skips silently when the
+            /// covered logs were already cleaned or an object vanished mid-check.
+            checkSnapshotOracle(backend, layout, ns, listing, detail, deadline, report);
+            for (const auto [ref_name, row] : table.getCommitted())
             {
-                /// A committed ref naming a missing manifest body would be an INV-NO-DANGLE violation —
-                /// but the per-ref GET runs later than the namespace's ref recovery, so a stale captured
-                /// row plus a legitimate GC delete of a since-superseded manifest can masquerade as one,
-                /// and a bare GET can lag a present object. Revalidate exactly like the blob `Dangling`
-                /// recheck below: HEAD the exact object AND re-resolve the exact ref freshly. Count the
-                /// dangle ONLY when the exact object is HEAD-absent AND a CURRENT ref still names THIS
-                /// exact manifest — otherwise it is LIST/GET lag or a phantom stale-row, never a loss.
-                if (!backend.head(mkey).exists
-                    && manifestStillReferenced(backend, layout, ns, ref_name, mkey, deadline))
+                const ManifestId id{ns, row.manifest_ref};
+                const String mkey = layout.manifestKey(id);
+                owned_manifest_keys.insert(mkey);
+                const String label = ns_str + "/" + ref_name;
+
+                const auto got = backend.get(mkey);
+                if (!got)
+                {
+                    /// A committed ref naming a missing manifest body would be an INV-NO-DANGLE violation —
+                    /// but the per-ref GET runs later than the namespace's ref recovery, so a stale captured
+                    /// row plus a legitimate GC delete of a since-superseded manifest can masquerade as one,
+                    /// and a bare GET can lag a present object. Revalidate exactly like the blob `Dangling`
+                    /// recheck below: HEAD the exact object AND re-resolve the exact ref freshly. Count the
+                    /// dangle ONLY when the exact object is HEAD-absent AND a CURRENT ref still names THIS
+                    /// exact manifest — otherwise it is LIST/GET lag or a phantom stale-row, never a loss.
+                    if (!backend.head(mkey).exists
+                        && manifestStillReferenced(backend, layout, ns, ref_name, mkey, deadline))
+                    {
+                        ++report.dangling;
+                        FsckObject o;
+                        o.key = mkey;
+                        o.kind = ObjectKind::Blob;   /// manifests have no ObjectKind; reuse Blob as the generic kind
+                        o.size = 0;
+                        o.cls = FsckClass::Dangling;
+                        o.reachable_from = {label};
+                        report.objects.push_back(std::move(o));
+                    }
+                    /// A present object (GET lag) or a ref that moved away (stale-walk artifact) is not a
+                    /// dangle; the manifest's blobs are re-walked under the ref's CURRENT manifest elsewhere.
+                    ++refs_walked;
+                    continue;
+                }
+
+                PartManifest body = decodePartManifest(openObject(FormatId::PartManifest, got->bytes));
+                if (!refMatchesBody(id.ref, body) || !manifestNamespaceMatches(id.root_namespace, body))
                 {
                     ++report.dangling;
                     FsckObject o;
                     o.key = mkey;
-                    o.kind = ObjectKind::Blob;   /// manifests have no ObjectKind; reuse Blob as the generic kind
-                    o.size = 0;
+                    o.kind = ObjectKind::Blob;
+                    o.size = got->bytes.size();
                     o.cls = FsckClass::Dangling;
                     o.reachable_from = {label};
                     report.objects.push_back(std::move(o));
-                }
-                /// A present object (GET lag) or a ref that moved away (stale-walk artifact) is not a
-                /// dangle; the manifest's blobs are re-walked under the ref's CURRENT manifest elsewhere.
-                ++refs_walked;
-                continue;
-            }
-
-            PartManifest body = decodePartManifest(openObject(FormatId::PartManifest, got->bytes));
-            if (!refMatchesBody(id.ref, body) || !manifestNamespaceMatches(id.root_namespace, body))
-            {
-                ++report.dangling;
-                FsckObject o;
-                o.key = mkey;
-                o.kind = ObjectKind::Blob;
-                o.size = got->bytes.size();
-                o.cls = FsckClass::Dangling;
-                o.reachable_from = {label};
-                report.objects.push_back(std::move(o));
-                ++refs_walked;
-                continue;
-            }
-
-            for (const ManifestEntry & e : body.entries)
-            {
-                if (e.placement != EntryPlacement::Blob)
+                    ++refs_walked;
                     continue;
-                const String bkey = layout.blobKey(e.ref);
-                reachable_blobs.insert(bkey);
-                ++report.total_blob_refs;
-                report.referenced_logical_bytes += e.blob_size;
-                blob_labels[bkey].push_back(label);
-            }
+                }
 
-            ++refs_walked;
-            checkDeadline(deadline, "walking refs");
-            if (on_progress && refs_walked % 64 == 0)
-                on_progress("walking refs", reachable_blobs.size(), refs_walked);
+                for (const ManifestEntry & e : body.entries)
+                {
+                    if (e.placement != EntryPlacement::Blob)
+                        continue;
+                    const String bkey = layout.blobKey(e.ref);
+                    reachable_blobs.insert(bkey);
+                    ++report.total_blob_refs;
+                    report.referenced_logical_bytes += e.blob_size;
+                    blob_labels[bkey].push_back(label);
+                }
+
+                ++refs_walked;
+                checkDeadline(deadline, "walking refs");
+                if (on_progress && refs_walked % 64 == 0)
+                    on_progress("walking refs", reachable_blobs.size(), refs_walked);
+            }
+        }
+        catch (const Exception & e)
+        {
+            if (e.code() == ErrorCodes::TIMEOUT_EXCEEDED)
+                throw;
+            verdicts.recordUnchecked(report, ns, layout.refsNamespacePrefix(ns),
+                "fsck could not examine this namespace: " + e.message());
         }
     }
     report.distinct_blobs = reachable_blobs.size();
@@ -832,6 +1093,9 @@ String formatFsckSummary(const FsckReport & report)
         << " unaccounted=" << report.unaccounted
         << " stale_edge=" << report.stale_edge
         << " corrupted_runs=" << report.corrupted_runs
+        << " chain_broken=" << report.chain_broken
+        << " unchecked=" << report.unchecked
+        << " ref_records_walked=" << report.ref_records_walked
         << " snapshot_oracle_mismatches=" << report.snapshot_oracle_mismatches
         << " snapshot_oracle_checked=" << report.snapshot_oracle_checked
         << " physical_bytes=" << report.physical_bytes

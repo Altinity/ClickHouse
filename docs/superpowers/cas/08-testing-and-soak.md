@@ -64,12 +64,48 @@ pool reachability:
    - `unreachable` remains the class of pre-precommit manifest debris rows (labeled
      `reclaimable-/in-flight-pre-precommit`); the summary `unreachable=` counter is the TOTAL of
      all present-but-unreferenced objects, so residual-settling loops keep one monotone number.
-4. Reports `dedup_ratio` = `referenced_bytes / physical_bytes` (logical bytes referenced across all
+4. **Audits each namespace's ref stream by ARITHMETIC** (spec `2026-07-27` §7). fsck may not rest a
+   verdict on an enumeration any more than the fold may: ids are dense `1..T` within
+   `(namespace, writer_epoch)` (INV-1), so it reads every position by exact key from
+   `_ckpt.checkpoint`'s successor upward and never from a listing. An absent expected-next has
+   exactly three answers, and the walk reports one verdict per namespace:
+   - nothing above it → the namespace's **frontier**. Proven, silent, the healthy case.
+   - a **confirmed durable** id of the same epoch above it → `chain-broken`. Contiguity makes this
+     impossible without a lost record, so the transactions above the hole are unreachable. The
+     witness is confirmed by its own exact `GET` before it may convict — a listing that can omit a
+     key can equally well name one that is gone, and this verdict costs an exit code.
+   - only later-epoch ids above it → the crossing is **proved** through the next epoch's
+     `prev_epoch_seal` back-chain (the same `crossEpochFromSeal` the fold uses), or reported
+     `unchecked`.
+
+   `ref_records_walked` counts the positions actually read and proved — what makes "the tail above
+   the checkpoint was walked" observable rather than inferred from the absence of a complaint. The
+   walk writes nothing: the writer's recovery closes a dead epoch by putting a seal in the slot it
+   walked to, and an auditor has no business doing that, so an unclosed epoch reads as unprovable
+   rather than being repaired into provable.
+5. Reports `dedup_ratio` = `referenced_bytes / physical_bytes` (logical bytes referenced across all
    parts, divided by distinct blob bytes on disk).
 
-**Exit code** is nonzero iff `dangling > 0`. The tool prints de-alarm `note:` lines when
-`pending_gc`/`awaiting_gc` are nonzero ("inside the normal GC deletion pipeline — expected") and a
-re-run hint when `unaccounted` is nonzero — beta testers should never have to interpret raw counters.
+**`unchecked` is the honest third answer**, and it is reserved for it: a namespace the audit could not
+prove **either way** — an unprovable epoch crossing, an unreadable record, or a namespace whose
+examination raised at all. It is COVERAGE, not a finding: it does not make a report unclean and does
+not exit nonzero, exactly like `partial`. A healthy pool reports `chain_broken=0 unchecked=0`, so
+`unchecked` is never a resting state, and a namespace PROVEN broken is never also counted `unchecked`
+("proved broken" and "could not prove" are different answers).
+
+**Record and continue, never wedge.** Every per-namespace step can raise `CORRUPTED_DATA` on a damaged
+stream — the replay refuses a non-contiguous tail, the codecs refuse an invalid body. For *recovery*
+that throw is the correct fail-close; for a read-only diagnostic it is a bug, because an fsck that dies
+on the first bad namespace reports **nothing** about the ones it never reached, including the healthy
+ones. So one namespace's failure becomes that namespace's verdict and the sweep goes on. (`--timeout`
+is the exception: the deadline is a property of the whole scan and still aborts it, or yields
+`partial=1` under `--partial`.)
+
+**Exit code** is nonzero when `dangling`, `chain_broken`, `snapshot_oracle_mismatches` or
+`corrupted_runs` is nonzero — i.e. on every term of the report's `clean()`. The tool prints de-alarm
+`note:` lines when `pending_gc`/`awaiting_gc` are nonzero ("inside the normal GC deletion pipeline —
+expected"), a re-run hint when `unaccounted` is nonzero, and a coverage note when `unchecked` is
+nonzero — beta testers should never have to interpret raw counters.
 
 `--detail` adds a per-object row (tab-separated `class, key, size[, reachable_from...]`) after the
 summary line. `--timeout <seconds>` aborts the scan with a clear error instead of hanging (default
@@ -127,6 +163,15 @@ rounds as the ack-floor pipeline drains `pending-gc`/`awaiting-gc`. A rebuilt ba
 conservative — it may over-protect a trimmed-but-live build's manifest (design delta 2 in
 `04-gc-protocol.md §gc-rebuild`), so a small, bounded, `ca-fsck`-visible `unaccounted`/leaked set settling
 over a rebuild-to-rebuild window is expected, not a regression.
+
+**A rebuild RECLAIMS NOTHING** (`04-gc-protocol.md §gc-rebuild` step 6). It rebuilds cursors and edges
+only, so a blob that no surviving manifest names gets no row in the rebuilt baseline and the
+incremental pipeline can never reach it. Such blobs are **retained** — they show up as `unaccounted` and
+stay there. This is deliberate: the condemnation that used to catch them was derived from a listing,
+and a listing that omits a durable key hides a live owner, which made that pass condemn acked data.
+Retention until the build/upload registry can enumerate in-flight uploads safely is the named residual
+of that removal, and there is no substitute reclamation — an `unaccounted` count that does not drain
+after a disaster rebuild is expected, and is not licence to delete from an enumeration.
 
 ## 2. Audit log tables {#audit-logs}
 

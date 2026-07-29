@@ -64,8 +64,9 @@ def stale_edge_verdict(fsck_result: dict, *, detail: bool) -> tuple:
     pool, so the matching `-1` can never fold: its in-degree is pinned above zero for good and the
     incremental GC will never reclaim it. It looks exactly like an `AwaitingGc` backlog, which is the
     label that used to hide it — so the soak asserts it, and `ca-fsck` itself does NOT: `CommandFsck`
-    throws (nonzero exit) only on `dangling` and `snapshot_oracle_mismatches`, which means the
-    harness's existing `exit_code != 0` gate does not cover this class at all.
+    throws (nonzero exit) on `dangling`, `chain_broken`, `snapshot_oracle_mismatches` and
+    `corrupted_runs`, but not on this class, which means the harness's existing `exit_code != 0` gate
+    does not cover it at all.
 
     Returns `(verdict, message)` with verdict one of:
 

@@ -87,6 +87,15 @@ public:
                          "exist: their in-degree can never reach zero, so the incremental GC will never "
                          "reclaim them — NOT expected, investigate (a rebuild of the in-degree state is the "
                          "only way to clear them)\n";
+        /// `unchecked` is not a finding and does not exit nonzero — it says the audit could not PROVE
+        /// those namespaces either way, which is a statement about coverage. Saying so out loud is the
+        /// whole point: a silent verdict of "no complaints" would read as a clean bill of health.
+        if (report.unchecked > 0)
+            std::cout << "note: " << report.unchecked
+                      << " namespace(s) could NOT be proved either way (an unprovable epoch crossing, an "
+                         "unreadable record, or a namespace the scan could not examine) — this run says "
+                         "nothing about them; the per-namespace reason is listed as an `unchecked` row "
+                         "under --detail\n";
         if (report.unaccounted > 0)
             std::cout << "note: " << report.unaccounted
                       << " object(s) are outside the current GC view — normal only as a transient "
@@ -109,6 +118,8 @@ public:
                     case Cas::FsckClass::StaleEdge:   c = "stale-edge"; break;
                     case Cas::FsckClass::SnapshotOracleMismatch: c = "snapshot-oracle-mismatch"; break;
                     case Cas::FsckClass::CorruptedRun: c = "corrupted-run"; break;
+                    case Cas::FsckClass::ChainBroken: c = "chain-broken"; break;
+                    case Cas::FsckClass::Unchecked:   c = "unchecked"; break;
                 }
                 std::cout << c << "\t" << o.key << "\t" << o.size;
                 for (const auto & r : o.reachable_from)
@@ -120,6 +131,17 @@ public:
         if (report.dangling > 0)
             throw Exception(
                 ErrorCodes::BAD_ARGUMENTS, "ca-fsck: {} reachable object(s) MISSING (INV-NO-LOSS violation)", report.dangling);
+        /// A hole in a ref stream is loss of a different kind: the records above it are unreachable, so
+        /// the table's own history is truncated wherever recovery next reads it. Fatal in the summary AND
+        /// in the exit code (spec §7) — a verdict only a `--detail` reader would notice is a verdict no
+        /// automation acts on.
+        if (report.chain_broken > 0)
+            throw Exception(
+                ErrorCodes::BAD_ARGUMENTS,
+                "ca-fsck: {} namespace(s) have a HOLE in their ref-log stream — an id is absent below a "
+                "durable id of the same epoch, which contiguity (INV-1) makes impossible without a lost "
+                "record; every transaction above the hole is unreachable (positions are listed as "
+                "`chain-broken` rows under --detail)", report.chain_broken);
         if (report.snapshot_oracle_mismatches > 0)
             throw Exception(
                 ErrorCodes::BAD_ARGUMENTS,

@@ -1,7 +1,7 @@
 3
 0 0 0
-disk	reachable	dangling	unreachable	pending_gc	awaiting_gc	unaccounted	physical_bytes	referenced_logical_bytes	distinct_blobs	total_blob_refs
-<disk>	0	0	0	0	0	0	0	0	0	0
+disk	reachable	dangling	unreachable	pending_gc	awaiting_gc	unaccounted	chain_broken	unchecked	physical_bytes	referenced_logical_bytes	distinct_blobs	total_blob_refs
+<disk>	0	0	0	0	0	0	0	0	0	0	0	0
 fsck_non_ca_disk_rejected: 1
 fsck_requires_disk: 1
 second_forget_idempotent: vanished(forgotten)

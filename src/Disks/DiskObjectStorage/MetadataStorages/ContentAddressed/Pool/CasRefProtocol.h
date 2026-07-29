@@ -717,6 +717,60 @@ RefCleanupPlan planRefCleanup(const RefTableListing & listing, const RefTxnId & 
                               std::optional<RefTxnId> completed_removal_snapshot = std::nullopt,
                               std::optional<RefTxnId> checkpoint = std::nullopt);
 
+/// Why an epoch crossing failed, or that it was PROVED. See `crossEpochFromSeal`.
+enum class EpochCrossOutcome : uint8_t
+{
+    Proved,             /// `start` is sequence 1 of the epoch that chains from `from_seal`
+    NothingConsumed,    /// `from_seal` is `{0, 0}`: nothing has been consumed, so there is no seal to cross from
+    NotASeal,           /// the record at `from_seal` is KNOWN not to be an `EpochSeal`
+    StartAbsent,        /// an epoch-start record the back-chain needs is not there
+    StartInvalid,       /// an epoch-start record is undecodable (`detail` carries the codec's message)
+    ChainDoesNotReach,  /// the chain names no seal at `from_seal` -- a genesis record, or one that skips it
+};
+
+/// One epoch crossing's outcome plus what it cost, so a caller can attribute the reads it performed.
+struct EpochCrossResult
+{
+    EpochCrossOutcome outcome = EpochCrossOutcome::ChainDoesNotReach;
+    RefTxnId start{};            /// meaningful only on `Proved`
+    RefTxnId probed{};           /// the epoch-start id the walk last read -- names the object in a diagnostic
+    String detail;               /// the decode error, on `StartInvalid`
+    uint64_t body_gets = 0;      /// epoch-start bodies actually fetched
+    uint64_t absent_probes = 0;  /// epoch-start reads that came back absent
+
+    bool proved() const { return outcome == EpochCrossOutcome::Proved; }
+};
+
+/// Cross into the epoch that follows the one `from_seal` closed, and PROVE it rather than guess it.
+///
+/// A listing only NOMINATES a candidate epoch (`witness`). The proof is the back-chain: the target
+/// epoch's sequence-1 record names the seal that must have been consumed before it (INV-2). If it names
+/// a seal ABOVE `from_seal`, an epoch sits in between that the nomination omitted -- the chain is
+/// followed back one epoch and retried, which is what makes a crossing independent of any enumeration.
+/// Anything else -- no sequence 1, an undecodable one, a genesis record (no `prev_epoch_seal`) above a
+/// consumed seal, or a chain that skips the position -- is an unproven crossing and is reported as such.
+///
+/// WHAT THE CHAIN PROVES, EXACTLY: the IDENTITY of the position the next epoch chains from, not its
+/// KIND. Those come apart when a writer names an ordinary record as `prev_epoch_seal`, and the damage is
+/// the one the seal exists to prevent -- epoch `E` declared closed while its writer may still append, so
+/// a later `{E, k}` lands permanently below the cursor. So the kind is checked wherever it is knowable:
+/// `seal_proven` carries `refLogTxnIsEpochSeal` of the record the CALLER applied at `from_seal` (free --
+/// it decoded the body to apply it). Pass `nullopt` only when the caller applied nothing and `from_seal`
+/// is an inherited cursor whose record may since have been cleaned, so its kind is unknowable by any
+/// amount of reading here and the crossing rests on chain-trust.
+///
+/// Terminates: `validateEpochSealGrammarStructural` guarantees `prev_epoch_seal->writer_epoch <
+/// txn_id.writer_epoch`, so the target epoch strictly decreases and the loop is bounded below by
+/// `from_seal`'s own epoch. The record it proves is read once more by the caller's own walk: one
+/// redundant `GET` per epoch crossed, and crossings happen once per writer-epoch change.
+///
+/// READ-ONLY, and shared deliberately: the GC fold's intake and fsck's audit must not be able to
+/// disagree about when an epoch boundary has been proved -- a rule that says which records a cut
+/// contains cannot have two implementations.
+EpochCrossResult crossEpochFromSeal(Backend & backend, const Layout & layout, const RootNamespace & ns,
+                                    const RefTxnId & from_seal, std::optional<bool> seal_proven,
+                                    const RefTxnId & witness);
+
 /// The result of `recoverRefTableDetailed`: the replayed table state plus the identity of the snapshot
 /// recovery actually selected as its base (`nullopt` when it found no snapshot at all).
 struct RecoveredRefTable

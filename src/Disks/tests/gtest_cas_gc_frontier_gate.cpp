@@ -51,41 +51,12 @@ namespace
 
 const UInt128 kGc = hexToU128("00000000000000000000000000000001");
 
-/// A backend that serves every key by exact GET while HIDING selected keys from every LIST -- the
-/// observed lying-store shape, and the only way to build the cross-namespace scenario: the hidden
-/// namespace's records stay durable and readable, so a round that KNOWS to look for them finds them,
-/// while a round that only enumerates never learns they exist.
-class HintHoleBackend : public CountingBackend
-{
-public:
-    /// Hide every key under `prefix` from LIST. Prefix-based rather than per-key so a namespace can be
-    /// hidden wholesale, including the objects a later publish adds.
-    void hidePrefix(const String & prefix)
-    {
-        std::lock_guard lock(m);
-        hidden_prefixes.push_back(prefix);
-    }
-
-    ListPage list(const String & prefix, const String & cursor, size_t limit) override
-    {
-        ListPage page = CountingBackend::list(prefix, cursor, limit);
-        std::lock_guard lock(m);
-        if (hidden_prefixes.empty())
-            return page;
-        std::erase_if(page.keys, [&](const ListedKey & k)
-        {
-            for (const String & hidden : hidden_prefixes)
-                if (k.key.starts_with(hidden))
-                    return true;
-            return false;
-        });
-        return page;
-    }
-
-private:
-    mutable std::mutex m;
-    std::vector<String> hidden_prefixes;
-};
+/// The lying store, shared from `cas_test_helpers.h`: every key is served by exact GET while the
+/// selected ones are HIDDEN from every LIST. That is the only way to build the cross-namespace
+/// scenario -- the hidden namespace's records stay durable and readable, so a round that KNOWS to
+/// look for them finds them, while a round that only enumerates never learns they exist. Composed
+/// over `CountingBackend` because these tests also assert request counts.
+using CountingHintHoleBackend = DB::Cas::tests::HintHoleBackendOn<DB::Cas::tests::CountingBackend>;
 
 /// A pool whose GC frontier-probe budget is set explicitly. Everything else matches `openPoolForTest`.
 PoolPtr openPoolWithProbeBudget(std::shared_ptr<InMemoryBackend> backend, uint64_t budget)
@@ -160,7 +131,7 @@ namespace
 {
 /// Build the shared-blob scenario. `hidden` owns `blob` and is hidden from every LIST; `visible`
 /// publishes and drops it. Returns the pool.
-PoolPtr buildCrossNamespaceScenario(const std::shared_ptr<HintHoleBackend> & backend,
+PoolPtr buildCrossNamespaceScenario(const std::shared_ptr<CountingHintHoleBackend> & backend,
                                     const RootNamespace & hidden, const RootNamespace & visible,
                                     const DB::UInt128 & blob, bool fold_hidden_first)
 {
@@ -195,7 +166,7 @@ PoolPtr buildCrossNamespaceScenario(const std::shared_ptr<HintHoleBackend> & bac
 
 TEST(CasGcFrontierGate, HiddenPlusOneInAnUnknownNamespaceIsRefusedByTheProductionDefault)
 {
-    auto backend = std::make_shared<HintHoleBackend>();
+    auto backend = std::make_shared<CountingHintHoleBackend>();
     const RootNamespace hidden{"00/hidden@cas@"};
     const RootNamespace visible{"00/visible@cas@"};
     const DB::UInt128 blob(0x5ade);
@@ -220,7 +191,7 @@ TEST(CasGcFrontierGate, HiddenPlusOneInAnUnknownNamespaceIsRefusedByTheProductio
 /// unrelated reason would pass it too.
 TEST(CasGcFrontierGate, TheSameHiddenPlusOneIsDeletedOnceTheUniverseIsDeclaredAuthoritative)
 {
-    auto backend = std::make_shared<HintHoleBackend>();
+    auto backend = std::make_shared<CountingHintHoleBackend>();
     const RootNamespace hidden{"00/hidden@cas@"};
     const RootNamespace visible{"00/visible@cas@"};
     const DB::UInt128 blob(0x5ade);
@@ -242,7 +213,7 @@ TEST(CasGcFrontierGate, TheSameHiddenPlusOneIsDeletedOnceTheUniverseIsDeclaredAu
 /// record the listing hid, folds the `+1`, and the blob is never condemned.
 TEST(CasGcFrontierGate, AKnownNamespaceIsProbedByExactKeyAndItsHiddenEdgeSavesTheBlob)
 {
-    auto backend = std::make_shared<HintHoleBackend>();
+    auto backend = std::make_shared<CountingHintHoleBackend>();
     const RootNamespace hidden{"00/hidden@cas@"};
     const RootNamespace visible{"00/visible@cas@"};
     const DB::UInt128 blob(0x5ade);
@@ -540,7 +511,7 @@ TEST(CasGcFrontierGate, TheOrphanManifestSweepAndItsCursorAreInertUnderSuppressi
 /// larger than the numerator, which is the shape that suppresses.
 TEST(CasGcFrontierGate, APartialProbeBudgetPublishesATallyThatMatchesTheSealedSet)
 {
-    auto backend = std::make_shared<HintHoleBackend>();
+    auto backend = std::make_shared<CountingHintHoleBackend>();
     auto store = openPoolWithProbeBudget(backend, /*budget*/ 1);
     const Layout & layout = store->layout();
     const RootNamespace a{"00/quiet_a@cas@"};
@@ -591,7 +562,7 @@ TEST(CasGcFrontierGate, APartialProbeBudgetPublishesATallyThatMatchesTheSealedSe
 /// frontier proof.
 TEST(CasGcFrontierGate, AQuietKnownNamespaceCostsExactlyOneExactGet)
 {
-    auto backend = std::make_shared<HintHoleBackend>();
+    auto backend = std::make_shared<CountingHintHoleBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
     const Layout & layout = store->layout();
     const RootNamespace quiet{"00/quiet@cas@"};
@@ -620,7 +591,7 @@ TEST(CasGcFrontierGate, AQuietKnownNamespaceCostsExactlyOneExactGet)
 /// round, not next: the probe finds the record and the walk continues from it.
 TEST(CasGcFrontierGate, AWronglyQuietNamespaceIsWalkedTheSameRound)
 {
-    auto backend = std::make_shared<HintHoleBackend>();
+    auto backend = std::make_shared<CountingHintHoleBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
     const Layout & layout = store->layout();
     const RootNamespace quiet{"00/quiet@cas@"};
@@ -651,7 +622,7 @@ TEST(CasGcFrontierGate, AWronglyQuietNamespaceIsWalkedTheSameRound)
 /// re-fold from `{0, 0}`, which is far worse than the unproven frontier it already is.
 TEST(CasGcFrontierGate, AnExhaustedProbeBudgetSealsCursorsAndDeletesNothing)
 {
-    auto backend = std::make_shared<HintHoleBackend>();
+    auto backend = std::make_shared<CountingHintHoleBackend>();
     auto store = openPoolWithProbeBudget(backend, /*budget*/ 0);
     const Layout & layout = store->layout();
     const RootNamespace quiet{"00/quiet@cas@"};
@@ -700,7 +671,7 @@ TEST(CasGcFrontierGate, AnExhaustedProbeBudgetSealsCursorsAndDeletesNothing)
 /// not that round's silence, that has to keep the round from destroying.
 TEST(CasGcFrontierGate, ACarriedHoldSuppressesOnARoundThatDetectedNothing)
 {
-    auto backend = std::make_shared<HintHoleBackend>();
+    auto backend = std::make_shared<CountingHintHoleBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
     const Layout & layout = store->layout();
     const RootNamespace held{"00/held@cas@"};

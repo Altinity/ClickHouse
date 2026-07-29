@@ -44,58 +44,9 @@ namespace
 
 const UInt128 kGc = hexToU128("00000000000000000000000000000001");
 
-/// A backend whose LIST permanently omits a set of keys that remain fully readable by exact key --
-/// the observed store behaviour. PERMANENT (not nth-call) omission is what keeps probe A quiet: the
-/// probe compares the round's two independent enumerations, and a hole reproduced identically in both
-/// is, by its own stated limitation, invisible to it. That is deliberate here: these tests are about
-/// the intake walk, not about the probe (which stays untouched this task).
-///
-/// Erasing keys from a page cannot disturb pagination: `ListPage::next_cursor` is computed by the base
-/// backend before the erase, so the next page still resumes strictly after the last key it returned.
-class HintHoleBackend : public InMemoryBackend
-{
-public:
-    /// Hide `key` from every subsequent LIST. Call AFTER seeding: fixtures that allocate ids by listing
-    /// would otherwise allocate over a hidden record.
-    void hide(const String & key)
-    {
-        std::lock_guard lock(m);
-        hidden.insert(key);
-    }
-
-    /// How many LIST pages actually had a key erased -- every test that hides a key asserts this, so a
-    /// mistyped key cannot let a test pass vacuously.
-    size_t holesServed() const
-    {
-        std::lock_guard lock(m);
-        return served;
-    }
-
-    /// The store stops lying: every hidden key is listed again.
-    void revealAll()
-    {
-        std::lock_guard lock(m);
-        hidden.clear();
-    }
-
-    ListPage list(const String & prefix, const String & cursor, size_t limit) override
-    {
-        ListPage page = InMemoryBackend::list(prefix, cursor, limit);
-        std::lock_guard lock(m);
-        if (hidden.empty())
-            return page;
-        const size_t before = page.keys.size();
-        std::erase_if(page.keys, [&](const ListedKey & k) { return hidden.contains(k.key); });
-        if (page.keys.size() != before)
-            ++served;
-        return page;
-    }
-
-private:
-    mutable std::mutex m;
-    std::set<String> hidden;
-    size_t served = 0;
-};
+/// The lying store is `HintHoleBackend` from `cas_test_helpers.h`: LIST permanently omits keys that
+/// stay readable by exact key. Permanent (not nth-call) omission keeps GC's probe A quiet by its own
+/// stated limitation, so these tests exercise the intake walk and not the probe.
 
 /// The `ShardCoverage` the newest fold seal recorded for `ns` (shard 0), or nullopt when the seal has
 /// no entry for it. Scans downward from the adopted generation for the most recent fold seal, mirroring

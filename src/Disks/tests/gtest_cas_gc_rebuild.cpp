@@ -74,8 +74,15 @@ TEST(CasGcBaselineGuard, AbsentAdoptedSealFailsClosed)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { gc.runRegularRound(); });
 }
 
-/// (а): lose gc/state on a lived-in pool -> guard blocks rounds -> rebuild -> rounds converge:
-/// the dropped blob is reclaimed, the live blob intact, the round minted strictly above the last one seen.
+/// (а): lose gc/state on a lived-in pool -> guard blocks rounds -> rebuild -> rounds converge: the
+/// live blob intact, the round minted strictly above the last one seen, and the REBUILT baseline is a
+/// working one — a ref dropped AFTER it is still reclaimed by ordinary rounds.
+///
+/// A blob dropped BEFORE the rebuild is a different matter, and this test pins it: the rebuild derives
+/// edges from owner state, so a blob no owner names gets no row at all, and a rebuild CONDEMNS NOTHING
+/// (spec §7 — the condemnation that used to catch this case was the r5-finding-4 data-loss vector).
+/// Such a blob is retained until register R4's build/upload registry can enumerate it safely. That is
+/// the NAMED Stage-A residual, and it is asserted here rather than left to be discovered.
 TEST(CasGcRebuild, RecoversLostStateAndConverges)
 {
     auto backend = std::make_shared<InMemoryBackend>();
@@ -120,9 +127,29 @@ TEST(CasGcRebuild, RecoversLostStateAndConverges)
     /// Round strictly above the fence/state/generation numbers seen so far.
     EXPECT_GT(rep.round, pre_rebuild_round);
 
-    /// Regular rounds converge: blob 2 (unreferenced) reclaimed, blob 1 intact.
-    EXPECT_TRUE(runRoundsUntilAbsent(store, gc2, *backend, store->layout(), DB::UInt128(2)));
+    /// The live blob is intact, and blob 2 — dropped BEFORE the rebuild, so invisible to a baseline
+    /// derived from owner state — is RETAINED. Retention, not loss: the named residual above.
+    for (int i = 0; i < 4; ++i)
+    {
+        runRegularRoundReclaiming(gc2);
+        store->renewWatermarkOnce();
+    }
     EXPECT_TRUE(backend->head(store->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::UInt128(1))})).exists);
+    EXPECT_TRUE(backend->head(store->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::UInt128(2))})).exists)
+        << "a rebuild condemns nothing, so a pre-rebuild drop is retained — never reclaimed by a "
+           "substitute pass, and never lost";
+
+    /// The rebuilt baseline is a WORKING one: a ref published over it and then dropped still folds to
+    /// zero and is reclaimed by ordinary rounds. Without this the test would prove only that the
+    /// pipeline stopped deleting.
+    const ManifestRef post_r = ref(3, 0xA3);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(3));
+    writeManifestRaw(*backend, store->layout(), ns, post_r, {blobEntryFor("c", DB::UInt128(3))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl_post", std::nullopt, post_r);
+    runRegularRoundReclaiming(gc2);
+    dropRefTransition(*backend, store->layout(), ns, "tbl_post", post_r);
+    EXPECT_TRUE(runRoundsUntilAbsent(store, gc2, *backend, store->layout(), DB::UInt128(3)))
+        << "the rebuilt baseline must still reclaim what it can actually see";
 }
 
 /// (б): a run object named by a healthy state is lost -> the regular round fails closed -> the
@@ -348,92 +375,13 @@ TEST(CasGcRebuild, LeaseConflictRefuses)
     EXPECT_NE(rep.refusal.find("leader"), String::npos) << rep.refusal;
 }
 
-/// Retired-in-snapshot (T6): a physically-present blob with ZERO edges (an orphan — the
-/// pipeline-blindness case) is condemned DIRECTLY into the rebuilt run as a `kCondemned` row in
-/// the SAME single flush pass as the edge-bearing blobs — no separate `RetiredSet` object, no
-/// orphan attempt run. A subsequent regular round graduates then redeletes it through the run.
-TEST(CasGcRebuild, OrphanBlobCondemnedInRebuiltRun)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
-    const RootNamespace ns{"00/aa@cas@"};
-
-    /// An edge-bearing blob (committed ref) and an ORPHAN blob (a body with no owner at all) —
-    /// gc_shards defaults to 1, so BOTH land on shard 0: the merged flush must fold the edge row
-    /// AND the orphan's `kCondemned` row into one run (the both-edges-and-condemns shard).
-    const ManifestRef live_r = ref(1, 0xA1);
-    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
-    writeManifestRaw(*backend, store->layout(), ns, live_r, {blobEntryFor("a", DB::UInt128(1))});
-    publishCommittedTransition(*backend, store->layout(), ns, "tbl_live", std::nullopt, live_r);
-    writeBlobBody(*backend, store->layout(), DB::UInt128(2));   /// orphan: present, zero edges
-
-    Gc gc(store, kGc);
-    const RebuildReport rep = gc.rebuildBaseline(/*force*/ true);
-    ASSERT_TRUE(rep.performed) << rep.refusal;
-    EXPECT_EQ(rep.committed_refs, 1u);
-
-    const GcState st = decodeGcState(backend->get(store->layout().gcStateKey())->bytes);
-    const auto seal =
-        decodeFoldSeal(backend->get(store->layout().foldSealKey(st.snap_generation, st.snap_attempt))->bytes);
-
-    /// The orphan is a `kCondemned` row in the rebuilt run at the minted round; the edge blob is not.
-    bool found_orphan = false;
-    bool found_edge_condemned = false;
-    for (const RunRef & r : seal.blob_target_runs)
-    {
-        auto reader = openSourceEdgeRun(*backend, r.key);
-        String k;
-        String p;
-        while (reader.next(k, p))
-        {
-            BlobRef bh_ref;
-            UInt128 sid;
-            SourceEdgeKeyCodec::parse(k, bh_ref, sid);   // throws CORRUPTED_DATA on a malformed key (fail-closed)
-            const UInt128 bh = bh_ref.digest.toU128();
-            if (p.empty() || p[0] != kCondemned)
-                continue;
-            const CondemnedRow row = decodeCondemnedRow(p);
-            if (bh == DB::UInt128(2))
-            {
-                found_orphan = true;
-                EXPECT_EQ(row.condemn_round, rep.round);
-                EXPECT_FALSE(row.delete_pending);
-            }
-            if (bh == DB::UInt128(1))
-                found_edge_condemned = true;
-        }
-    }
-    EXPECT_TRUE(found_orphan) << "the orphan blob must be a kCondemned row in the rebuilt run";
-    EXPECT_FALSE(found_edge_condemned) << "an edge-bearing blob must never be condemned";
-
-    /// The seal's TOTAL `condemned_summary` counts the orphan (shard 0, at the minted round).
-    ASSERT_TRUE(seal.condemned_summary.contains(0));
-    EXPECT_EQ(seal.condemned_summary.at(0).condemned_total, 1u);
-    EXPECT_EQ(seal.condemned_summary.at(0).oldest_nonpending_condemn_round, rep.round);
-
-    /// No orphan attempt run: every `blob_target` run object under the rebuilt generation is
-    /// referenced by the seal (the merged single flush leaves no unreferenced attempt-A run).
-    std::set<String> sealed_keys;
-    for (const RunRef & r : seal.blob_target_runs)
-        sealed_keys.insert(r.key);
-    const String gen_prefix = store->layout().gcGenPrefix(st.snap_generation);
-    String cursor;
-    for (;;)
-    {
-        const ListPage page = backend->list(gen_prefix, cursor, 1000);
-        for (const auto & lk : page.keys)
-            if (lk.key.find("/blob_target/") != String::npos)
-                EXPECT_TRUE(sealed_keys.contains(lk.key)) << "orphan attempt run: " << lk.key;
-        if (page.next_cursor.empty())
-            break;
-        cursor = page.next_cursor;
-    }
-
-    /// End-to-end: regular rounds graduate then REDELETE the orphan through the run (the pipeline-
-    /// blindness repair works without a retired set); the edge-bearing blob stays intact.
-    EXPECT_TRUE(runRoundsUntilAbsent(store, gc, *backend, store->layout(), DB::UInt128(2)));
-    EXPECT_TRUE(backend->head(store->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::UInt128(1))})).exists);
-}
+/// A rebuild CONDEMNS NOTHING (spec §7). The zero-edge condemnation that used to live here — a
+/// `blobs/` LIST whose every unreached body was condemned into the rebuilt run — was the
+/// r5-finding-4 data-loss vector: the rebuild's own traversal is listing-driven, so a hidden
+/// durable owner made this pass condemn acked data. Its removal, the NAMED residual it leaves
+/// (manifest-less orphans are retained until register R4's build/upload registry), and the
+/// hold-carry that had to survive the removal are all covered by
+/// `gtest_cas_rebuild_condemn_nothing.cpp`.
 
 /// CLAMP SUPPRESSION regression (2026-07-03 night soak: 31 dangling blobs). A committed +1 for
 /// blob X lands on a shard whose fold cursor is CLAMPED (behind a bodiless precommit — the fold
@@ -513,72 +461,3 @@ TEST(CasGcClampSuppression, LandedEdgeBehindClampNeverDeleted)
     EXPECT_TRUE(runRoundsUntilAbsent(store, gc, *backend, store->layout(), DB::UInt128(5)));
 }
 
-/// ---- rebuild condemn markers (codex-review triage 2026-07-17 §3.4, №4) ----
-///
-/// The disaster-recovery rebuild used to write NO condemn markers at all, making the swallowed-marker
-/// hazard systematic after a rebuild rather than a race: every `zero_condemned` entry graduated and
-/// redeleted with an absent (= Clean-reading) meta a writer could adopt through. The rebuild must
-/// publish `writeCondemnedMeta` for every zero-edge entry synchronously (it is an offline
-/// administrative path) BEFORE any of them can graduate.
-
-/// After a rebuild, every zero-edge (orphan) entry carries a durable Condemned marker; edge-bearing
-/// blobs get none. The pipeline then reclaims the orphan through the normal confirmed-marker gate.
-TEST(CasGcRebuild, PublishesCondemnMarkersForZeroEdgeBlobs)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPoolForTest(backend);
-    const RootNamespace ns{"00/aa@cas@"};
-    const ManifestRef live_r = ref(1, 0xA1);
-    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
-    writeManifestRaw(*backend, store->layout(), ns, live_r, {blobEntryFor("a", DB::UInt128(1))});
-    publishCommittedTransition(*backend, store->layout(), ns, "tbl_live", std::nullopt, live_r);
-    writeBlobBody(*backend, store->layout(), DB::UInt128(2));   /// orphan: present, zero edges
-
-    Gc gc(store, kGc);
-    const RebuildReport rep = gc.rebuildBaseline(/*force*/ true);
-    ASSERT_TRUE(rep.performed) << rep.refusal;
-
-    const auto lm = loadMetaForTest(*backend, store->layout(), DB::UInt128(2));
-    ASSERT_TRUE(lm.has_value())
-        << "rebuild must publish the condemn marker for every zero-edge entry before graduation";
-    EXPECT_EQ(lm->meta.state, MetaState::Condemned);
-    EXPECT_EQ(lm->meta.condemn_round, rep.round);
-    EXPECT_FALSE(loadMetaForTest(*backend, store->layout(), DB::UInt128(1)).has_value())
-        << "an edge-bearing blob must not be marked condemned by the rebuild";
-
-    /// End-to-end: the marked orphan graduates + redeletes through regular rounds; the live blob stays.
-    EXPECT_TRUE(runRoundsUntilAbsent(store, gc, *backend, store->layout(), DB::UInt128(2)));
-    EXPECT_TRUE(backend->head(store->layout().blobKey(
-        BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::UInt128(1))})).exists);
-}
-
-/// A rebuild whose marker writes FAIL still publishes its baseline (per-entry failures never abort the
-/// administrative pass), but the affected entries enter the retired set UNCONFIRMED and are carried —
-/// not deleted — until the backend heals and a carry-time retry lands the marker.
-TEST(CasGcRebuild, SwallowedRebuildMarkerWriteCarriesEntryInsteadOfDeleting)
-{
-    auto backend = std::make_shared<MetaWriteFaultBackend>();
-    auto store = openPoolForTest(backend);
-    store->setCasRetrySleepForTest([](uint64_t) {});
-    writeBlobBody(*backend, store->layout(), DB::UInt128(2));   /// orphan: present, zero edges
-
-    Gc gc(store, kGc);
-    const RebuildReport rep = gc.rebuildBaseline(/*force*/ true);
-    ASSERT_TRUE(rep.performed) << rep.refusal;
-    ASSERT_FALSE(loadMetaForTest(*backend, store->layout(), DB::UInt128(2)).has_value())
-        << "precondition: the injected fault must have lost the rebuild's condemn-marker write";
-
-    /// Regular rounds with the marker still unwritable: the unconfirmed entry is carried, never deleted.
-    for (int i = 0; i < 4; ++i)
-    {
-        gc.runRegularRound();
-        store->renewWatermarkOnce();
-        EXPECT_TRUE(backend->head(store->layout().blobKey(
-            BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::UInt128(2))})).exists)
-            << "round " << i << " after rebuild: deleted without a durable condemn marker";
-    }
-
-    /// Heal: the carry-time retry publishes the marker and the pipeline reclaims the orphan.
-    backend->fail_meta_writes.store(false);
-    EXPECT_TRUE(runRoundsUntilAbsent(store, gc, *backend, store->layout(), DB::UInt128(2)));
-}

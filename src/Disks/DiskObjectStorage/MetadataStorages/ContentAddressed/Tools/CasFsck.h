@@ -47,6 +47,15 @@ enum class FsckClass : uint8_t
                    /// the stored bytes — cataloged so the read-only audit enumerates every finding in one
                    /// pass; deletion-deriving consumers (`fold`, `zeroInDegree`, `previewDeletes`) still
                    /// fail closed on the same mismatch. ERROR
+    /// The two verdicts of the arithmetic ref-stream walk (spec §7). They are about a NAMESPACE, not an
+    /// object, and the `key` of such a row is the ref-log key the walk stopped on.
+    ChainBroken,   /// a ref-log id is absent BELOW a confirmed durable same-epoch id. Ids are dense
+                   /// `1..T` within `(namespace, epoch)` (INV-1), so this is not the end of a stream —
+                   /// a durable record is missing and every transaction above it is unreachable. ERROR
+    Unchecked,     /// the walk could not prove this namespace's stream EITHER WAY (an unprovable epoch
+                   /// crossing, an undecodable body, an oracle that could not replay). Not a finding and
+                   /// not a clean bill of health: the honest third answer, reported so nobody reads a
+                   /// silence as a proof.
 };
 
 /// One object or integrity finding emitted in detailed mode, or emitted for every missing reachable
@@ -109,6 +118,23 @@ struct FsckReport
     /// enumerates all problems in one pass rather than aborting on the first corrupt run.
     uint64_t corrupted_runs = 0;
 
+    /// The arithmetic ref-stream walk (spec §7). fsck reads each namespace's stream by EXACT KEY from
+    /// `_ckpt.checkpoint`'s successor upward — never from a listing, which may omit durable records —
+    /// and reports one verdict per namespace.
+    ///
+    /// `chain_broken` counts namespaces with a proven hole (see `FsckClass::ChainBroken`) and is a HARD
+    /// ERROR: part of `clean`, and the command exits nonzero on it. `unchecked` counts namespaces the
+    /// walk (or the snapshot oracle) could not prove either way; it is COVERAGE, not a finding, so it
+    /// is reported and printed but does not make a report unclean — exactly like `partial`. A pool with
+    /// nothing wrong reads `chain_broken=0 unchecked=0`, so `unchecked` is never a resting state.
+    ///
+    /// `ref_records_walked` is how many ref-log records the walk actually read and proved, summed over
+    /// namespaces. It is what makes "the tail above the checkpoint was walked" observable rather than
+    /// inferred from the absence of a complaint.
+    uint64_t chain_broken = 0;
+    uint64_t unchecked = 0;
+    uint64_t ref_records_walked = 0;
+
     uint64_t physical_bytes = 0;
     uint64_t referenced_logical_bytes = 0;
     uint64_t total_blob_refs = 0;
@@ -130,9 +156,13 @@ struct FsckReport
     /// no finite hard horizon); a partial report only covers the visited subset. `stale_edge` is a hard
     /// finding, but it is only ever nonzero in `detail` mode — a clean summary report says nothing about
     /// stale edges, exactly as a partial report says nothing about the unvisited part of the pool.
+    /// `chain_broken` is a hard finding in every mode. `unchecked` deliberately is NOT one: it says the
+    /// walk proved nothing about those namespaces, which is a statement about COVERAGE, and folding it
+    /// in here would make "cannot prove" indistinguishable from "found broken".
     bool clean() const
     {
-        return dangling == 0 && snapshot_oracle_mismatches == 0 && corrupted_runs == 0 && stale_edge == 0;
+        return dangling == 0 && snapshot_oracle_mismatches == 0 && corrupted_runs == 0 && stale_edge == 0
+            && chain_broken == 0;
     }
 };
 

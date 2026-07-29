@@ -70,6 +70,57 @@ std::string makeMultiBlockPayload(size_t size = 5000)
     return s;
 }
 
+/// A blob written at its OWN algo's content key, plus the key it landed at.
+struct SeededBlob
+{
+    BlobRef ref;
+    String key;
+};
+
+/// Write a blob body of `algo` at its content key, reference it from a committed ref, and DROP that
+/// ref — so the blob reaches a folded in-degree of zero and the ORDINARY pipeline condemns it by
+/// transition-to-zero. The caller then runs the rounds that fold the `+1` and the `-1`.
+///
+/// These tests used to seed a blob no manifest ever named and lean on `rebuildBaseline`'s LIST/HEAD
+/// sweep, which was the only path that could condemn such a blob. That sweep is GONE (spec §7: a
+/// rebuild condemns nothing — it was the r5-finding-4 data-loss vector), and a blob nothing names is
+/// now retained by design. What these tests actually guard — that a blob is recognized under its OWN
+/// `<algo>` path segment by the fold's key codec, `previewDeletes`, the exact-token delete and fsck,
+/// rather than silently skipped as foreign — is unaffected, and lives on the PRODUCTION path, which is
+/// where it is now exercised. Reverting either per-algo port still turns these red.
+SeededBlob seedReferencedBlob(Pool & store, Backend & backend, const RootNamespace & ns, BlobHashAlgo algo,
+                              uint64_t build_sequence, size_t payload_size, const String & ref_name)
+{
+    const std::string payload = makeMultiBlockPayload(payload_size);
+    const BlobRef ref{algo, codecFor(algo).fromHex(blobHashHexOneShot(algo, payload))};
+    const String key = store.layout().blobKey(ref);
+
+    EnvelopeHeader header;
+    header.kind = ObjectKind::Blob;
+    header.incarnation_tag = UInt128(0x1234);
+    header.build_id = UInt128(0x5678);
+    backend.putIfAbsent(key, encodeEnvelopeHeader(header, static_cast<uint32_t>(store.poolMeta().blob_header_len)) + payload);
+
+    ManifestEntry entry;
+    entry.path = "data_" + std::to_string(build_sequence) + ".bin";
+    entry.placement = EntryPlacement::Blob;
+    entry.ref = ref;   /// the entry carries the blob's OWN algo, not the pool's write algo
+    entry.blob_size = 1;
+
+    const ManifestRef mref{.writer_epoch = 1, .build_sequence = build_sequence, .manifest_ordinal = 1};
+    writeManifestRaw(backend, store.layout(), ns, mref, {entry});
+    publishCommittedTransition(backend, store.layout(), ns, ref_name, std::nullopt, mref);
+    return SeededBlob{ref, key};
+}
+
+/// Drop the committed ref `seedReferencedBlob` published, so the blob's only edge disappears.
+void dropSeededRef(Pool & store, Backend & backend, const RootNamespace & ns, uint64_t build_sequence,
+                   const String & ref_name)
+{
+    const ManifestRef mref{.writer_epoch = 1, .build_sequence = build_sequence, .manifest_ordinal = 1};
+    dropRefTransition(backend, store.layout(), ns, ref_name, mref);
+}
+
 }
 
 TEST(CasPluggableHash, PoolMetaRoundTripsAlgosUsed)
@@ -288,8 +339,9 @@ TEST(CasPluggableHash, Xxh3BlobLandsUnderAlgoSegmentAndIsDiscoveredCleanByFsck)
 /// ============================================================================================
 /// CAS pluggable-blob-hash Phase 2 Task 5 -- THE CRUX (anti-silent-leak regression gate).
 ///
-/// Two sites classify a blob by parsing its object-key hex into a hash set: `CasGc.cpp`'s
-/// pipeline-blindness condemn sweep (inside `Gc::rebuildBaseline`) and `CasFsck.cpp`'s
+/// Two sites classify a blob by parsing its object-key hex into a hash set: `CasGc.cpp`'s condemn
+/// path (the fold's transition-to-zero, and — until spec §7 removed it — `Gc::rebuildBaseline`'s
+/// LIST/HEAD sweep) and `CasFsck.cpp`'s
 /// present-but-unreferenced classification. Both used to route through the bare, fixed-width
 /// `hexToU128` (32-hex-only) inside a `catch(...) continue` / no-catch-at-all — so a 64-hex `sha256`
 /// key either (a) fell into the "foreign key shape — not ours" catch and was silently treated as
@@ -301,12 +353,13 @@ TEST(CasPluggableHash, Xxh3BlobLandsUnderAlgoSegmentAndIsDiscoveredCleanByFsck)
 ///
 /// This test constructs a `sha256`-algo pool DIRECTLY via `PoolConfig` (this bypasses only the
 /// disk-config *factory* guard in `MetadataStorageFactory.cpp`, which Task 6 removes — `Pool::open`
-/// itself has never gated on algo) and writes an unreferenced blob body straight at its 64-hex
-/// content-addressed key (bypassing `PartWriteTxn::putBlob`, whose OWN internal `logical_hash` stays a
-/// fixed 128-bit representation until a later task — see the Task 5 report). It then drives BOTH
-/// crux sites and asserts the blob is CLASSIFIED, not silently skipped as foreign.
+/// itself has never gated on algo) and writes a blob body straight at its 64-hex content-addressed key
+/// (bypassing `PartWriteTxn::putBlob`, whose OWN internal `logical_hash` stays a fixed 128-bit
+/// representation until a later task — see the Task 5 report), references it, and drops the reference
+/// so the fold condemns it. It then drives BOTH crux sites and asserts the blob is CLASSIFIED, not
+/// silently skipped as foreign.
 ///
-/// MUST GO RED if either port is reverted to `hexToU128`: reverting `CasGc.cpp`'s sweep leaves
+/// MUST GO RED if either port is reverted to `hexToU128`: reverting `CasGc.cpp`'s fold leaves
 /// `condemned_total == 0` (never condemned) and `previewDeletes()` empty; reverting `CasFsck.cpp`'s
 /// sites either throws out of `runFsck` or leaves the blob unclassified/absent from `unreachable`.
 TEST(CasPluggableHash, Sha256BlobSeenByCondemnSweepAndFsckNotSilentlySkipped)
@@ -314,7 +367,7 @@ TEST(CasPluggableHash, Sha256BlobSeenByCondemnSweepAndFsckNotSilentlySkipped)
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Pool::open(backend,
         PoolConfig{.pool_prefix = "p", .server_root_id = "test",
-                   .blob_hash_algo = BlobHashAlgo::Sha256});
+                   .blob_hash_algo = BlobHashAlgo::Sha256, .gc_fold_max_defer_rounds = 0});
     ASSERT_EQ(blobHashLenFor(store->writeAlgo()), 32u) << "sha256 must derive a 32-byte digest width";
 
     const DigestCodec codec = codecFor(store->writeAlgo());
@@ -323,27 +376,23 @@ TEST(CasPluggableHash, Sha256BlobSeenByCondemnSweepAndFsckNotSilentlySkipped)
     ASSERT_EQ(hex.size(), 64u) << "sha256 renders 64 lowercase hex chars";
     const BlobDigest digest = codec.fromHex(hex);   // round-trip sanity: must not throw at width 32
 
-    /// Write the blob body DIRECTLY at its content key (mirrors `cas_test_helpers.h`'s `writeBlobRaw`,
-    /// widened to a 64-hex id) -- an unreferenced (orphan) blob, exactly the shape the pipeline-blindness
-    /// sweep and fsck's present-but-unreferenced pipeline exist to classify.
-    const BlobRef id{BlobHashAlgo::Sha256, digest};
-    const String blob_key = store->layout().blobKey(id);
-    EXPECT_NE(blob_key.find("/blobs/sha256/"), String::npos) << blob_key;
-    {
-        EnvelopeHeader header;
-        header.kind = ObjectKind::Blob;
-        header.incarnation_tag = UInt128(0x1234);
-        header.build_id = UInt128(0x5678);
-        backend->putIfAbsent(blob_key, encodeEnvelopeHeader(header, static_cast<uint32_t>(store->poolMeta().blob_header_len)) + payload);
-    }
-    ASSERT_TRUE(backend->head(blob_key).exists) << "the sha256 blob body must be present before the sweep";
-
-    /// ---- Site 1: the condemn sweep (Gc::rebuildBaseline's pipeline-blindness LIST/HEAD repair) ----
-    /// No manifest ever references this blob, so the universe scan's `edge_bearing` set never contains
-    /// its hash: the LIST/HEAD sweep over `blobsPrefix()` is the ONLY path that can ever condemn it.
+    /// Reference the blob from a committed ref, then drop that ref: the fold sees `+1` then `-1`, the
+    /// blob transitions to in-degree zero, and the ORDINARY condemn path claims it. Every per-algo
+    /// parse this test guards sits on that path.
+    const RootNamespace ns{"00/aa@cas@"};
     Gc gc(store, UInt128(1));
-    const RebuildReport rep = gc.rebuildBaseline(/*force*/ true);
-    ASSERT_TRUE(rep.performed) << rep.refusal;
+    const SeededBlob seeded = seedReferencedBlob(*store, *backend, ns, BlobHashAlgo::Sha256,
+                                                 /*build_sequence=*/1, /*payload_size=*/5000, "tbl_sha");
+    const BlobRef id = seeded.ref;
+    const String blob_key = seeded.key;
+    EXPECT_NE(blob_key.find("/blobs/sha256/"), String::npos) << blob_key;
+    ASSERT_TRUE(backend->head(blob_key).exists) << "the sha256 blob body must be present before the fold";
+    ASSERT_EQ(codecFor(store->writeAlgo()).fromHex(hex), digest) << "fixture sanity: the seeded digest is ours";
+
+    /// ---- Site 1: the fold's condemn path ----
+    runRegularRoundReclaiming(gc);   /// folds the +1
+    dropSeededRef(*store, *backend, ns, /*build_sequence=*/1, "tbl_sha");
+    runRegularRoundReclaiming(gc);   /// folds the -1: transition to zero => condemned
 
     const auto state_bytes = backend->get(store->layout().gcStateKey());
     ASSERT_TRUE(state_bytes.has_value());
@@ -354,8 +403,8 @@ TEST(CasPluggableHash, Sha256BlobSeenByCondemnSweepAndFsckNotSilentlySkipped)
     const CasFoldSeal seal = decodeFoldSeal(seal_bytes->bytes);
     ASSERT_TRUE(seal.condemned_summary.contains(0)) << "the seal's condemned_summary must be total over gc_shards";
     EXPECT_EQ(seal.condemned_summary.at(0).condemned_total, 1u)
-        << "THE CRUX: the sha256 orphan blob must be condemned by the pipeline-blindness sweep -- a "
-           "silent-leak regression (a reverted CasGc.cpp codec.fromHex port) leaves this at 0";
+        << "THE CRUX: the sha256 blob must be condemned by the fold -- a silent-leak regression (a "
+           "reverted CasGc.cpp codec.fromHex port) leaves this at 0";
 
     /// previewDeletes streams the SAME adopted seal via the run's own SourceEdgeKeyCodec (never pool
     /// meta) and must report exactly our blob, at its real 32-byte digest.
@@ -370,13 +419,13 @@ TEST(CasPluggableHash, Sha256BlobSeenByCondemnSweepAndFsckNotSilentlySkipped)
     /// physically account for the blob.
     FsckReport frep;
     ASSERT_NO_THROW(frep = runFsck(*store, /*detail=*/true));
-    EXPECT_EQ(frep.unreachable, 1u)
+    EXPECT_GE(frep.unreachable, 1u)
         << "THE CRUX: fsck's physical listing must count the sha256 blob as unreachable-but-present, "
            "not silently omit it";
     const auto oit = std::find_if(frep.objects.begin(), frep.objects.end(),
         [&](const FsckObject & o) { return o.key == blob_key; });
     ASSERT_NE(oit, frep.objects.end()) << "the sha256 blob must appear in fsck's detailed object list";
-    /// The rebuild above already condemned it into the GC snapshot, so fsck's GC-pipeline-view
+    /// The fold above already condemned it into the GC snapshot, so fsck's GC-pipeline-view
     /// classification (not the generic Unaccounted bucket -- reachable only by width-correctly pairing
     /// the fsck-side hash against the run's kCondemned row hash) must recognize it as known-to-GC.
     EXPECT_EQ(oit->cls, FsckClass::PendingGc)
@@ -550,17 +599,17 @@ TEST(CasPluggableHash, StaleAlgoRegistryRefreshOnMiss)
 
 /// spec §9.4 half: an object whose key names an algo THIS BUILD has never heard of (a genuinely
 /// foreign top-level segment, e.g. planted by a different/future tool) must never be treated as one
-/// of ours -- the condemn sweep must skip it (never condemn or delete it) and fsck must classify it
-/// the generic `Unaccounted` bucket (never throw, never silently drop it from the physical listing).
+/// of ours -- the GC must skip it (never condemn or delete it) and fsck must classify it into the
+/// generic `Unaccounted` bucket (never throw, never silently drop it from the physical listing).
 /// In the SAME pass, a 2-algo pool's OWN blobs under `blobs/ch128/` and `blobs/sha256/` must both
-/// still be classified normally -- the foreign segment must not make the sweep/fsck narrow to one
+/// still be classified normally -- the foreign segment must not make the fold/fsck narrow to one
 /// algo or blind them to the others.
 TEST(CasPluggableHash, ForeignAlgoSegmentIsDebrisNotOurs)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Pool::open(backend,
         PoolConfig{.pool_prefix = "p", .server_root_id = "test",
-                   .blob_hash_algo = BlobHashAlgo::CityHash128});
+                   .blob_hash_algo = BlobHashAlgo::CityHash128, .gc_fold_max_defer_rounds = 0});
     /// Admit sha256 into the SAME pool from a second mount, then pull the union into `store`'s cache.
     Pool::open(backend,
         PoolConfig{.pool_prefix = "p", .server_root_id = "test2",
@@ -568,34 +617,30 @@ TEST(CasPluggableHash, ForeignAlgoSegmentIsDebrisNotOurs)
     store->refreshAdmittedAlgos();
     ASSERT_TRUE(store->isAlgoAdmitted(BlobHashAlgo::Sha256));
 
-    /// Two OWN orphan blobs (unreferenced by any manifest) -- one per algo -- written directly at
-    /// their content keys (mirrors `Sha256BlobSeenByCondemnSweepAndFsckNotSilentlySkipped`'s fixture).
-    auto writeOwnOrphan = [&](BlobHashAlgo algo, size_t size) -> std::pair<BlobRef, String>
-    {
-        const std::string payload = makeMultiBlockPayload(size);
-        const BlobDigest digest = codecFor(algo).fromHex(blobHashHexOneShot(algo, payload));
-        const BlobRef ref{algo, digest};
-        const String key = store->layout().blobKey(ref);
-        EnvelopeHeader header;
-        header.kind = ObjectKind::Blob;
-        header.incarnation_tag = UInt128(0x1234);
-        header.build_id = UInt128(0x5678);
-        backend->putIfAbsent(key, encodeEnvelopeHeader(header, static_cast<uint32_t>(store->poolMeta().blob_header_len)) + payload);
-        return {ref, key};
-    };
-    const auto [ch_ref, ch_key] = writeOwnOrphan(BlobHashAlgo::CityHash128, 5001);
-    const auto [sh_ref, sh_key] = writeOwnOrphan(BlobHashAlgo::Sha256, 5002);
+    /// Two of the pool's OWN blobs -- one per algo -- each referenced by a committed ref that is then
+    /// DROPPED, so the fold condemns both by transition-to-zero.
+    const RootNamespace ns{"00/aa@cas@"};
+    Gc gc(store, UInt128(1));
+    const SeededBlob ch = seedReferencedBlob(*store, *backend, ns, BlobHashAlgo::CityHash128,
+                                             /*build_sequence=*/1, /*payload_size=*/5001, "tbl_ch");
+    const SeededBlob sh = seedReferencedBlob(*store, *backend, ns, BlobHashAlgo::Sha256,
+                                             /*build_sequence=*/2, /*payload_size=*/5002, "tbl_sh");
+    const BlobRef ch_ref = ch.ref;
+    const BlobRef sh_ref = sh.ref;
+    const String ch_key = ch.key;
+    const String sh_key = sh.key;
 
     /// A FOREIGN object under an algo segment `blobHashAlgoName` never renders ("md5") -- not one of
     /// ours under any circumstance.
     const String foreign_key = store->layout().blobsPrefix() + "md5/aa/" + std::string(32, 'a');
     backend->putIfAbsent(foreign_key, std::string("not a real envelope"));
 
-    Gc gc(store, UInt128(1));
-    const RebuildReport rep = gc.rebuildBaseline(/*force*/ true);
-    ASSERT_TRUE(rep.performed) << rep.refusal;
+    runRegularRoundReclaiming(gc);   /// folds both +1s
+    dropSeededRef(*store, *backend, ns, /*build_sequence=*/1, "tbl_ch");
+    dropSeededRef(*store, *backend, ns, /*build_sequence=*/2, "tbl_sh");
+    runRegularRoundReclaiming(gc);   /// folds both -1s: both transition to zero
 
-    /// The sweep condemns exactly the two OWN orphans -- never the foreign object.
+    /// The fold condemns exactly the two OWN blobs -- never the foreign object.
     const std::vector<Gc::PreviewEntry> preview = gc.previewDeletes();
     ASSERT_EQ(preview.size(), 2u);
     std::unordered_set<BlobRef, BlobRefHash> condemned_refs;
@@ -606,7 +651,7 @@ TEST(CasPluggableHash, ForeignAlgoSegmentIsDebrisNotOurs)
     }
     EXPECT_TRUE(condemned_refs.count(ch_ref));
     EXPECT_TRUE(condemned_refs.count(sh_ref));
-    EXPECT_TRUE(backend->head(foreign_key).exists) << "the foreign object must never be touched by the sweep";
+    EXPECT_TRUE(backend->head(foreign_key).exists) << "the foreign object must never be touched by the fold";
 
     const FsckReport frep = runFsck(*store, /*detail=*/true);
     /// The physical listing counts all THREE unreferenced objects (two ours + one foreign).
@@ -705,18 +750,18 @@ TEST(CasPluggableHash, ReaderGenerationIsRaisedToFour)
 /// The no-bare-digest grep gates (design Step 3) are run separately, not as gtest bodies.
 /// ============================================================================================
 
-/// spec §9.3 -- THE reclaim crux. A pool admits BOTH `ch128` and `sha256`; an orphan blob body is
+/// spec §9.3 -- THE reclaim crux. A pool admits BOTH `ch128` and `sha256`; a blob body is
 /// planted directly under EACH algo's segment (mirrors `Sha256BlobSeenByCondemnSweepAndFsckNotSilentlySkipped`'s
-/// fixture, widened to two algos). `rebuildBaseline(force)` must condemn BOTH into the SAME baseline
+/// fixture, widened to two algos). The fold must condemn BOTH into the SAME baseline
 /// (`previewDeletes` surfaces both refs), and driving the round-paced pipeline to completion (graduate,
 /// then the exact-token delete) must reclaim BOTH bodies -- the backend ends up holding ZERO blob
 /// bytes of EITHER algo, and fsck reports clean.
 ///
-/// MUST GO RED if any settlement/sweep/graduation/delete path silently narrows to one algo -- e.g. a
-/// condemn-sweep LIST that only walks `blobs/ch128/`, a graduation/delete loop that iterates a
-/// digest-only set and coalesces the two algos' entries, or an fsck reachability check that stops
-/// after the first algo it sees.
-TEST(CasPluggableHash, TwoAlgoOrphansBothFullyReclaimed)
+/// MUST GO RED if any settlement/graduation/delete path silently narrows to one algo -- e.g. a fold
+/// that only accounts `blobs/ch128/`, a graduation/delete loop that iterates a digest-only set and
+/// coalesces the two algos' entries, or an fsck reachability check that stops after the first algo it
+/// sees.
+TEST(CasPluggableHash, TwoAlgoBlobsBothFullyReclaimed)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Pool::open(backend,
@@ -730,48 +775,41 @@ TEST(CasPluggableHash, TwoAlgoOrphansBothFullyReclaimed)
     store->refreshAdmittedAlgos();
     ASSERT_TRUE(store->isAlgoAdmitted(BlobHashAlgo::Sha256));
 
-    /// Two orphan blobs -- one per algo -- written directly at their content keys: no manifest ever
-    /// references either, so the LIST/HEAD pipeline-blindness sweep is the ONLY path that can ever
-    /// condemn them.
-    auto writeOwnOrphan = [&](BlobHashAlgo algo, size_t size) -> std::pair<BlobRef, String>
-    {
-        const std::string payload = makeMultiBlockPayload(size);
-        const BlobDigest digest = codecFor(algo).fromHex(blobHashHexOneShot(algo, payload));
-        const BlobRef ref{algo, digest};
-        const String key = store->layout().blobKey(ref);
-        EnvelopeHeader header;
-        header.kind = ObjectKind::Blob;
-        header.incarnation_tag = UInt128(0x1234);
-        header.build_id = UInt128(0x5678);
-        backend->putIfAbsent(key, encodeEnvelopeHeader(header, static_cast<uint32_t>(store->poolMeta().blob_header_len)) + payload);
-        return {ref, key};
-    };
-    const auto [ch_ref, ch_key] = writeOwnOrphan(BlobHashAlgo::CityHash128, 5001);
-    const auto [sh_ref, sh_key] = writeOwnOrphan(BlobHashAlgo::Sha256, 5002);
+    /// Two of the pool's OWN blobs -- one per algo -- referenced then dropped, so the fold condemns
+    /// both by transition-to-zero.
+    const RootNamespace ns{"00/aa@cas@"};
+    Gc gc(store, UInt128(1));
+    const SeededBlob ch = seedReferencedBlob(*store, *backend, ns, BlobHashAlgo::CityHash128,
+                                             /*build_sequence=*/1, /*payload_size=*/5001, "tbl_ch");
+    const SeededBlob sh = seedReferencedBlob(*store, *backend, ns, BlobHashAlgo::Sha256,
+                                             /*build_sequence=*/2, /*payload_size=*/5002, "tbl_sh");
+    const String ch_key = ch.key;
+    const String sh_key = sh.key;
     ASSERT_TRUE(backend->head(ch_key).exists);
     ASSERT_TRUE(backend->head(sh_key).exists);
 
-    Gc gc(store, UInt128(1));
-    const RebuildReport rep = gc.rebuildBaseline(/*force*/ true);
-    ASSERT_TRUE(rep.performed) << rep.refusal;
+    runRegularRoundReclaiming(gc);   /// folds both +1s
+    dropSeededRef(*store, *backend, ns, /*build_sequence=*/1, "tbl_ch");
+    dropSeededRef(*store, *backend, ns, /*build_sequence=*/2, "tbl_sh");
+    runRegularRoundReclaiming(gc);   /// folds both -1s: both condemned in the same round
 
-    /// previewDeletes covers BOTH refs from the fresh baseline -- never just one algo.
+    /// previewDeletes covers BOTH refs from the adopted seal -- never just one algo.
     {
         const std::vector<Gc::PreviewEntry> preview = gc.previewDeletes();
         ASSERT_EQ(preview.size(), 2u);
         std::unordered_set<BlobRef, BlobRefHash> refs;
         for (const auto & p : preview)
             refs.insert(p.ref);
-        EXPECT_TRUE(refs.count(ch_ref));
-        EXPECT_TRUE(refs.count(sh_ref));
+        EXPECT_TRUE(refs.count(ch.ref));
+        EXPECT_TRUE(refs.count(sh.ref));
     }
 
-    /// Drive the round-paced pipeline to actual physical deletion: the rebuild condemned both at the
-    /// minted round; the VERY NEXT round graduates them (unconditionally, round-paced); the round
-    /// after that executes the exact-token delete for both.
+    /// Drive the round-paced pipeline to actual physical deletion: the fold condemned both at its
+    /// round; the VERY NEXT round graduates them (unconditionally, round-paced); the round after that
+    /// executes the exact-token delete for both.
     {
         const RoundReport rep1 = runRegularRoundReclaiming(gc);
-        EXPECT_EQ(rep1.graduated, 2u) << "both algos' orphans must graduate together in one round";
+        EXPECT_EQ(rep1.graduated, 2u) << "both algos' blobs must graduate together in one round";
         EXPECT_TRUE(backend->head(ch_key).exists);   // pending: still present this pass
         EXPECT_TRUE(backend->head(sh_key).exists);
     }
@@ -781,8 +819,8 @@ TEST(CasPluggableHash, TwoAlgoOrphansBothFullyReclaimed)
     }
 
     /// THE CRUX: after graduation the backend holds ZERO blob bodies of EITHER algo.
-    EXPECT_FALSE(backend->head(ch_key).exists) << "the ch128 orphan must be physically reclaimed";
-    EXPECT_FALSE(backend->head(sh_key).exists) << "the sha256 orphan must be physically reclaimed";
+    EXPECT_FALSE(backend->head(ch_key).exists) << "the ch128 blob must be physically reclaimed";
+    EXPECT_FALSE(backend->head(sh_key).exists) << "the sha256 blob must be physically reclaimed";
 
     const FsckReport frep = runFsck(*store, /*detail=*/true);
     EXPECT_TRUE(frep.clean());
