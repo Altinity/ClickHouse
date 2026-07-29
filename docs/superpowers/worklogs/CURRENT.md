@@ -1928,3 +1928,9 @@ means growth never reverses; end-of-run fsck measurability at risk AGAIN: run-1 
 EXIT=159 despite the 1800s wrapper = product-internal deadline). a14 warned to prep the
 deadline knob / partial_on_deadline form NOW. Lane adaptations landing (c7acc572b13 +
 9c769f55eaf). Load 7.5 (repack done). No agent builds.
+**2026-07-29 11:5x local** — finding 3 ruled: "fsck clean at end" STRUCTURALLY unreachable
+under Stage A on growing pools (3 measurements, 2 instruments; budget paces inserts, cannot
+shrink a never-reclaiming pool). Criterion's evidential form amended (user-veto-able):
+complete audits at auditable scale (05020 + scenario checkpoints) + soak fsck gates reported
+UNARMED w/ reason. No third soak. Soak2 to completion for chaos/recovery/fencing value w/
+honest fault-count caveat.
