@@ -1681,3 +1681,6 @@ also in flight. 10 closed + 2 in review of 15 stage-A tasks. No push.
 **2026-07-29 03:0x local** — T10 review: approved (budget arm fully verified); fix round =
 retention visibility on the background path (per-reason counters — in Stage A they are the
 sweep's entire story). T6 review still in flight. No push.
+
+**2026-07-29 02:20 local watchdog** — T6 review file being written (02:17); T10 fix-round gate
+running (fix_build3 done). Both converging. No push.
