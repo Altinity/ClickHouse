@@ -1705,3 +1705,7 @@ lanes converged — single-tree execution resumes (T11-T14 remain). No push.
 **2026-07-29 02:5x local watchdog** — GM validation: marker discipline caught the stale-binary
 false-green (build failed on the auto-kept refCkptKey duplicate; its own MERGE NOTE named the
 fix). Deduped (`649d6f572ea`), GM2 build+gate rerunning. No push.
+
+**2026-07-29 03:00 local watchdog** — GM2 GREEN 1524/1524 (true merged count). Convergence
+agent dispatched (6 stitches incl. the first end-to-end mint->apply->cross->premise-admit
+test). Lane-g retired. T11-T14 remain. No push.
