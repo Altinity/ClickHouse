@@ -104,12 +104,27 @@ loser is always the ghost.
 So the wait was buying a delay before an event whose outcome no longer depends on timing. Sleeping 30
 seconds on every unclean open and every fence recovery, for that, is latency and nothing else.
 
-**Deleted outright — setting and all.** No parsed-but-inert period, no deprecation log. The feature
-never shipped; there is no deployed config to protect (Constraint 4, recreate-only). The fail-close in
-its place is the one the settings layer already provides: `materialization_grace_ms` is gone from the
-settings table, so a config that still sets it fails the disk open with an unknown-key error rather
-than being silently ignored by a server that no longer honours it —
+**Deleted outright — setting and all.** No parsed-but-inert period, no deprecation log. There is no
+deployed config to protect — the feature never shipped and the pool is recreate-only (Constraint 4) —
+and the in-repo soak fixtures that DID set it are updated in the same change
+(`utils/ca-soak/configs/storage_conf_s38_ch1.xml`, `storage_conf_s38_ch2.xml`). A soak fixture is not
+a deployment, but it is a config in this tree, and the deletion is only safe once it stops setting a
+key the server will refuse.
+
+The fail-close in its place is the one the settings layer already provides: `materialization_grace_ms`
+is gone from the settings table, so a config that still sets it fails the disk open with an unknown-key
+error rather than being silently ignored by a server that no longer honours it —
 `CasRetirementSweep.AConfigStillAskingForTheMaterializationGraceIsRejected`.
+
+**S38, the scenario those fixtures belong to, is held rather than repaired, and it breaks in more than
+one place.** Removing the key lets its nodes boot again, but the card also asserts on the
+`"materialization grace"` `LOG_INFO` line that is now gone — and on three mechanisms Task 6 had already
+retired before this sweep touched anything (`unclean_epoch_boundary_seen`, the sentinel recovery seal
+behind `CasRefRecoverySealPublished`, and the LIST-based late-ref-log detector `reportLateLogsIfAny` /
+`ref_late_log_detected`, `d74c726ef9e`). So a config-only fix would produce the worst state available:
+a scenario that boots and then fails late on a log line that can never appear, which reads as a product
+bug. It fails at ENTRY instead, naming every retired mechanism, until T14 rewrites it from detection to
+fence-held.
 
 **And a fail-close assert where the wait stood.** At the self-remount site the replacement mechanism has
 exactly one precondition: the incarnation about to be installed must OUTRANK the dying one, or the

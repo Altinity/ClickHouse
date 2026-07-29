@@ -1992,7 +1992,6 @@ skip-list for keys owned by the generic object-storage layer.
 | `manifest_decode_cache_bytes` | 128 MiB | 0 disables caching but keeps HEAD+validate |
 | `part_folder_cache_bytes` / `…_max_entries` / `…_max_entry_bytes` | 64 MiB / 10000 / 16 MiB | view cache |
 | `part_folder_validate` | `always` | `always` / `never` / `age <seconds>` |
-| `materialization_grace_ms` | 30 s | wait when opening over an unclean predecessor |
 | `gcs_max_conditional_put_bytes` | 1 GiB | GCS single-PUT budget for conditional writes |
 | `skip_access_check` | `false` | skips the boot capability probe — start now, fix later |
 

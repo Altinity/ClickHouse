@@ -1,4 +1,11 @@
-"""S38 unclean handover, recovery seal, and late-PUT injection (P0).
+"""S38 unclean handover, recovery seal, and late-PUT injection (P0). RETIRED PREMISE — HELD FOR T14.
+
+THIS CARD CANNOT PASS AND FAILS AT ENTRY. Everything it asserts on (the T_mat wait and its log line,
+`unclean_epoch_boundary_seen`, the sentinel recovery seal, the LIST-based late-ref-log detector) was
+retired by Stage A tasks 6 and 12 — see `S38.RETIRED_PREMISE` below for the per-step mapping and the
+commits. The body is preserved verbatim as `_run_retired_body` because T14's rewrite (detection ->
+fence-held) needs to see what the card was actually testing; the description below is therefore a
+record of the OLD mechanism, not of current behaviour.
 
 End-to-end soak card for the rev.6 ref-lease-exclusivity plan (task 14, final task of the 14-task
 plan; tasks 1-13 landed through `c1693936a3f`). Exercises the whole unclean-handover story on a real
@@ -173,7 +180,36 @@ class S38(Scenario):
                   "kill_delay_s": 3.0, "kill_down_s": 5, "heal_timeout_s": 300},
     }
 
+    # The premise this card was written against no longer exists. Raised as the FIRST statement of
+    # `run`, before the card touches the cluster: the runner turns a raised exception into a FAIL, so
+    # this is loud and it is not a skip. It is deliberately NOT `needs_infra` (that yields
+    # INCONCLUSIVE, i.e. a silent skip, which the house rule forbids) and deliberately not a late
+    # assertion — a card that boots, runs a storm, restarts a node and only then fails on a log line
+    # that can never appear reads like a product bug, which is a worse state than failing at entry.
+    RETIRED_PREMISE = (
+        "S38's premise was retired by Stage A. This card asserts on mechanisms that no longer exist, "
+        "so it CANNOT pass and must not be read as a product failure:\n"
+        "  - the `materialization grace` (T_mat) LOG_INFO line of step 1 — the wait itself, and its "
+        "`materialization_grace_ms` setting, were retired OUTRIGHT by Stage A task 12 "
+        "(`ff9f36a056f`); recovery fences a dying epoch's straggler with an in-band EpochSeal "
+        "written as a conditional create instead of waiting for it;\n"
+        "  - `unclean_epoch_boundary_seen`, the flag step 1 latches and step 2 depends on — retired "
+        "by the same commit (sealing is decided by arithmetic: every epoch below the live one is "
+        "closed, however its mount died);\n"
+        "  - `CasRefRecoverySealPublished` and the sentinel recovery seal of step 2 — retired "
+        "EARLIER, by Stage A task 6 (`6f06ba05815`);\n"
+        "  - `reportLateLogsIfAny` / the `ref_late_log_detected` event of step 3 — the LIST-based "
+        "late-ref-log detector, retired by task 6's `d74c726ef9e`.\n"
+        "So this card was already broken before task 12; task 12 only moved the failure earlier. "
+        "The rewrite (detection -> fence-held) is T14's; until then this entry guard is the "
+        "disposition. Do not 'fix' it by deleting assertions — the scenario it describes still needs "
+        "an equivalent, and T14 owes it."
+    )
+
     def run(self, ctx, result):
+        raise RuntimeError(self.RETIRED_PREMISE)
+
+    def _run_retired_body(self, ctx, result):
         cl = ctx.cluster
         p = ctx.params
         storm_inserts = int(p["storm_inserts"])

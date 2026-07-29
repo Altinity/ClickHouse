@@ -1,12 +1,14 @@
 <clickhouse>
     <storage_configuration>
         <disks>
-            <!-- S38 (rev.6 lease-exclusivity soak card): identical to storage_conf_ch1.xml except
-                 materialization_grace_ms is raised well above the 30s default so an unclean-handover
-                 restart's T_mat wait is long and unambiguous in system.text_log (S38 asserts on the
-                 "materialization grace" LOG_INFO line), and so there is a comfortable window to
-                 complete the late-PUT injection + queries between the successor becoming healthy and
-                 the pool settling. -->
+            <!-- S38 (rev.6 lease-exclusivity soak card): identical to storage_conf_ch1.xml.
+                 It USED to raise materialization_grace_ms (T_mat) well above the 30s default, so an
+                 unclean-handover restart's wait was long and unambiguous in system.text_log and there
+                 was a comfortable window for the late-PUT injection. That setting was retired
+                 OUTRIGHT by Stage A task 12 (`ff9f36a056f`) — recovery fences a straggler with an
+                 in-band EpochSeal instead of waiting for it — and setting a removed key now refuses
+                 the disk open, so the key is gone from here too. The card itself is held for its T14
+                 rewrite; see scenarios/cards/s38_late_put_injection.py. -->
             <ca>
                 <type>object_storage</type>
                 <object_storage_type>s3</object_storage_type>
@@ -18,7 +20,6 @@
                 <gc_enabled>1</gc_enabled>
                 <gc_interval_sec>10</gc_interval_sec>
                 <expect_continue_min_bytes>65536</expect_continue_min_bytes>
-                <materialization_grace_ms>45000</materialization_grace_ms>
             </ca>
             <!-- ca_ro read-only fsck disk intentionally omitted from the server config — see
                  configs/fsck_only_ca.xml (F1: UNKNOWN_DISK on restart). -->
