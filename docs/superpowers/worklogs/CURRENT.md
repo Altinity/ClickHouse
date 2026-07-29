@@ -2124,3 +2124,7 @@ relink v5 fix round at the design agent. Nothing wedged.
 exposure -> third obligation + guarded S0' + isTerminal impl duty); FreshCertifiedResponse
 named; two must-red sabotages; zero user-blocking questions. Targeted r3 on §6 launched;
 memory rewritten. Soak deadline ~18:05 + RCA in flight at a14.
+**2026-07-29 18:2x local** — §6-targeted r3 (the pass the agent said to skip): 2 BLOCKERS
+real — prepare path shares the leak exposure; S0-prime's action permits S2's forbidden double
+publish -> release-incomplete becomes an orthogonal exit ATTRIBUTE (state machine returns to
+honest 4+1attr). v6 dispatched, r4 announced. Soak deadline passed — checking a14 next.
