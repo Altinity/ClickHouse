@@ -21,6 +21,10 @@ but nothing here is relink-specific, and the accounting deliberately is not reli
 (§3.4). It is prerequisite plumbing for
 `2026-07-29-cas-relink-reoffer-redesign.md`, and it stands on its own.
 
+**Provenance.** Extracted 2026-07-29 from `2026-07-29-cas-relink-reoffer-redesign.md` (its v10),
+where this material lived as §6.5 and §5.1.2. Everything here arrived through codex rounds 2-6
+against that document and is carried over unchanged in substance; only its home is new.
+
 **Why it is a separate document.** The relink spec carried this material through four review
 rounds, and every round found blockers in it. The reason was structural rather than analytical:
 one section was simultaneously repairing an ownership seam and specifying a protocol, so each fix

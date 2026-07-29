@@ -9,7 +9,7 @@ doc_type: 'reference'
 
 # CAS relink re-offer: retiring the confirm endpoint {#cas-relink-reoffer-redesign}
 
-**Date:** 2026-07-29. **Status:** DESIGN (**v9 — final pre-plan**), approved except the TLA gate. **Branch:** `cas-gc-rebuild`.
+**Date:** 2026-07-29. **Status:** DESIGN (**v10 — final pre-plan**), approved except the TLA gate. **Branch:** `cas-gc-rebuild`.
 Spec only; no code landed.
 
 **v2:** the confirm is expressed as an HTTP conditional request (`ETag` / `If-None-Match`), with
@@ -28,7 +28,7 @@ the eviction code (§4.3); `CaRelinkPromote::MechanismFallbackAllowed` gets its 
 the TLA gate gains three expressiveness requirements (§12.5); and the §1.1 arithmetic is corrected
 against a grep rather than against the design.
 
-**v9 — THE WRITE-RELEASE SEAM IS EXTRACTED (user direction).** Everything §6.5 carried about
+**v10 — THE WRITE-RELEASE SEAM IS EXTRACTED (user direction).** Everything §6.5 carried about
 `PartWriteTxn` / `PreparedPartWrite` / caller-guard ownership now lives in its own document,
 `2026-07-29-cas-part-write-release-seam.md`, together with the apply-marker prerequisite that was §5.1.2. The reason is the reason those
 sections kept failing review: they were repairing a general part-write seam inside a protocol spec,
