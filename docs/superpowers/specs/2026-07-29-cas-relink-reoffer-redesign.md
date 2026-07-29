@@ -28,7 +28,17 @@ the eviction code (§4.3); `CaRelinkPromote::MechanismFallbackAllowed` gets its 
 the TLA gate gains three expressiveness requirements (§12.5); and the §1.1 arithmetic is corrected
 against a grep rather than against the design.
 
-**v9 (Codex round 6 — 0 blocker, 2 major; the v8 sweep verified closed).** Both majors were depth
+**v9 — THE WRITE-RELEASE SEAM IS EXTRACTED (user direction).** Everything §6.5 carried about
+`PartWriteTxn` / `PreparedPartWrite` / caller-guard ownership now lives in its own document,
+`2026-07-29-cas-part-write-release-seam.md`, together with the apply-marker prerequisite that was §5.1.2. The reason is the reason those
+sections kept failing review: they were repairing a general part-write seam inside a protocol spec,
+so each fix arrived as contract mass in a document about something else. Their hazards — unproven
+releases, premature ERROR lines, nine scattered no-send exits — belong to EVERY part write, which
+this spec's own counter generalization had already conceded. **Relink now CONSUMES a contract
+instead of defining one:** §6.5 is a reference, §5.1.2 is a reference, and the seam's test rows move
+out, leaving §11 with only rows that exercise relink behaviour.
+
+**v9 content, unchanged by the move (Codex round 6 — 0 blocker, 2 major; the v8 sweep verified closed).** Both majors were depth
 on v8's routes, and both changed the mechanism rather than the wording. **The proof channel is
 inverted:** v8 asked each refusal site to prove it sent nothing, which is not implementable — the
 proof is erased into a generic `NETWORK_ERROR` before `precommitAdd` can read it
@@ -150,7 +160,7 @@ a refusal it must retry.
 still open and can still stop this design:**
 
 1. **The apply-pending marker must be made synchronized before the lane-quiescence refusal can be
-   removed** (§5.1.2) — **APPROVED (user, 2026-07-29); ships as specced.** The refusal this design
+   removed** (§5.1.2, specified in `2026-07-29-cas-part-write-release-seam.md` §6) — **APPROVED (user, 2026-07-29); ships as specced.** The refusal this design
    deletes is currently the *properly locked* guard on the durable-but-unapplied window; the marker
    meant to replace it is a relaxed atomic written outside any lock. This is a real change to the
    ref-lane append path, not to the relink path, which is why it was raised as a gate — scoped at
@@ -824,68 +834,23 @@ view too stale to know — and that is what rules 1–4 exclude, one by one.
 
 #### 5.1.2 PREREQUISITE: the apply marker must be synchronized {#apply-marker-synchronization}
 
-The paragraph above is a statement about program ORDER. It is not yet a statement about what a
-concurrent reader can OBSERVE, and today it is not one, because the marker is not synchronized
-against a reader:
+§5.1.1 is a statement about program ORDER. It is not yet one about what a concurrent reader can
+OBSERVE, and today it is not: `armApplyPending` performs a relaxed `compare_exchange_strong`
+(`CasRefLedger.cpp:1681`) called at `:2806` with no lock held, while the answer reads the committed
+row under `state_mutex`. A reader acquiring after the arm may still observe `Clean`. What carries
+the weight today is precisely the predicate this design deletes — `leader_active`, set and cleared
+under `ref_queue_mutex` (`:1588`, `:1668`). **Rule 3's terms are not merely redundant with rule 4;
+they are the properly synchronized guard, and rule 4 is a relaxed atomic riding along.**
 
-- `armApplyPending` performs a `compare_exchange_strong` with `std::memory_order_relaxed`
-  (`CasRefLedger.cpp:1681`) and is called at `:2806` **while no lock is held** — the preceding
-  `state_mutex` scope ends at `:2715`, and the install does not re-take it until `:2928`.
-- The answer reads the committed row under `state_mutex`.
+The superseded spec says both halves in its own voice: its rule 3 carries a *"Chunked-lane note"*
+assigning the partially-durable window to `leader_active`, and its §A2 introduces the marker as *"a
+cheap defense-in-depth marker"* warning *"Do not ship the marker as the only protection."* This
+design does exactly that, so it must first make the marker sufficient.
 
-So a reader can acquire `state_mutex` after the arm, in real time, and still be entitled by the
-memory model to observe `Clean` — there is no happens-before edge between the relaxed store and
-the reader's acquire. Today this is harmless because rule 3 carries the weight: `leader_active` is
-set under `ref_queue_mutex` at `CasRefLedger.cpp:1588` and cleared under it at `:1668`, it is TRUE
-for the whole tenure, and the confirm reads it under that same mutex. **Rule 3's terms are not
-merely redundant with rule 4 — they are the properly synchronized guard, and rule 4 is a relaxed
-atomic riding along.** Deleting rule 3 without fixing that would leave the durable-but-unapplied
-window guarded by an unsynchronized read: precisely the "stale cache" hazard the design is
-supposed to keep excluding.
-
-The superseded spec says both halves of this in its own voice, which is the strongest available
-evidence that the reading above is the intended one and not a misinterpretation. Its rule 3
-carries a *"Chunked-lane note"*: *"one tenure commits MULTIPLE durable transactions, so mid-tenure
-a table is partially durable; `leader_active` covers the whole tenure, so this is already
-unknown — a wider unknown window under load, not a hole."* And its §A2 introduces the marker as
-*"a cheap defense-in-depth marker (it is also the confirm's rule 4)"*, with an explicit ordering
-caveat warning: *"Do not ship the marker as the only protection."* This design does exactly that —
-makes the marker the only protection for this window — so it must first make the marker
-sufficient.
-
-**Required change, and it is small.** Arm the marker inside a `state_mutex` scope immediately
-before the `PUT`, and read it under `state_mutex` (which the answer path holds anyway, to read the
-committed row). Mutual exclusion then supplies the whole argument, in exactly the shape today's
-`ref_queue_mutex` argument has:
-
-- a reader that acquires `state_mutex` **after** the arm necessarily observes `ApplyPending` and
-  refuses;
-- a reader that acquires **before** the arm observes `Clean` — and at that instant the `PUT` has
-  not been issued, so nothing of that transaction can be durable, and the view it reads is
-  complete.
-
-**The lock goes at the CALL SITE, not inside `armApplyPending`** — and that is decided, not a
-preference. `forceWedgeForTest` (`CasRefLedger.cpp:1381-1397`) already calls `armApplyPending` at
-`:1396` **while holding `state_mutex`**, acquired at `:1390`. A self-locking `armApplyPending`
-would therefore self-deadlock on a non-recursive `std::mutex` at an existing call site. So
-`armApplyPending` keeps its `noexcept`, allocation-free, lock-free body and gains a documented
-PRECONDITION — "call with `state_mutex` held" — which that call site already satisfies for free.
-No memory-order change is needed either: with both the write and the read under the mutex, the
-mutex supplies the happens-before and the relaxed atomics stay as they are.
-
-**SIZE OF THIS CHANGE — it is an ordering upgrade, not a lane refactor.** One production call
-site is decisive: wrapping `armApplyPending(*rt)` at `CasRefLedger.cpp:2806` in a `state_mutex`
-scope, which is **two lines**. The obligation that generalizes it — all three writers of
-`apply_state` (`armApplyPending`, `clearApplyPending`, `poisonApplyState`) execute under
-`state_mutex`, so the marker is exactly as synchronized as the committed rows it guards — requires
-auditing the eight marker writes in the file and bringing any unlocked one into an existing scope.
-Most are already inside the install region. **Estimated total: under 20 lines, no control-flow
-change, no signature change, one file.** Cost at runtime: one uncontended mutex acquire per
-committed chunk, against a network `PUT`.
-
-**What it buys, stated so the addition is justified rather than assumed:** it is the enabling
-precondition for deleting rule 3's two terms, which is what restores relink availability from ~17%
-to ~100% minus true conflicts. It adds no state, no object, no configuration and no wire field.
+**The fix is specified in the seam document** (`2026-07-29-cas-part-write-release-seam.md` §6), because it is a property of the ref lane
+that every reader depends on rather than something relink can arrange for itself: arm under
+`state_mutex`, read under `state_mutex`, lock at the call site. **Approved by the user; under 20
+lines, one file, no control-flow change.** It is a gate on this design, and the seam owns it.
 
 ### 5.2 The cold/evicted refusal {#cold-refusal}
 
@@ -1020,167 +985,24 @@ one does.
   transaction.
 - *No retention leak?* None — the precommit became a committed ref; nothing is left staged.
 
-### 6.5 Release observation belongs to the handle, not to the exit {#release-incomplete}
+### 6.5 Release cleanup is the seam's, not this machine's {#release-incomplete}
 
-The wrong invariant behind three rounds of blockers was *the receiver classifies the exit, so the
-receiver reports the release*. It cannot: the receiver's classification necessarily happens BEFORE
-the last release attempt — its scope guard runs on the way out (`DataPartsExchange.cpp:1481`),
-`abort` returns `void`, and the destructor's retry reports to nobody
-(`PartFolderAccess.cpp:403-416`). No plumbing fixes an ordering that runs backwards.
+**The receiver carries no release plumbing.** Whether a staged `+1` was provably released is
+observed once, by the transaction handle that owns the last attempt, and is specified in its own
+document: `2026-07-29-cas-part-write-release-seam.md`. Nothing in §6.1-§6.4 consults it, and no state's action depends on it.
 
-**The owner of the LAST release attempt reports it.** That owner is the transaction handle, and it
-already knows everything required. `PartWriteTxn` maintains `PrecommitState` (`CasPartWriteTxn.h:280-299`) precisely for this
-question, and its own comment explains why it is a state rather than a bool: an `Unresolved`
-append MAY have landed, so the intent is recorded BEFORE the ambiguous append and settled either
-way afterwards.
+That separation is the outcome of four review rounds, and it is worth one sentence of why. The
+receiver cannot observe the release — its classification necessarily happens BEFORE the last
+attempt, since its scope guard runs on the way out (`DataPartsExchange.cpp:1481`) and `abort`
+returns `void`. Three drafts tried to route the fact to the receiver anyway (a fifth state, then
+an exit attribute, then a result carrier) and each added contract mass without fixing the ordering.
+The seam contract puts the observation where it can actually be made.
 
-| `PrecommitState` at destruction | Meaning | Emit? |
-| --- | --- | --- |
-| `NotAttempted` | nothing can be owned; the staged bodies are ordinary writer debris | no |
-| `Settled` | the owed terminal operation discharged the duty | no |
-| `Uncertain` | the append was **entered**, outcome unknown; the build OWES the removal *as if it were durable*. **Not the same as "attempted" — see below** | **yes**, unless non-transmission is proven |
-| `Durable` | the binding is this build's and was not released | **yes** |
-
-So the whole contract is one line: **at destruction, emit iff `precommitState` is `Uncertain` or
-`Durable`.** Once, in the destructor, `noexcept`, reusing the ERROR line `~PreparedPartWrite`
-already logs (`PartFolderAccess.cpp:412-415`) rather than adding a second one beside it. A
-destructor retry that SUCCEEDS moves the state to `Settled`, so it emits nothing — the asymmetry
-is preserved by the state machine rather than by a rule someone must remember.
-
-#### `Uncertain` is set BEFORE the append, so it over-reports {#uncertain-overreports}
-
-`precommitAdd` assigns `precommit_state = Uncertain` and only THEN calls `appendRefOps`
-(`CasPartWriteTxn.cpp:965-971`). That ordering is deliberate and must not be weakened — its comment
-records the bug it fixed, an object that "believed it had never precommitted" and so wrote-deleted a
-body a later wedge resolved as committed. But it means `Uncertain` is entered even when the append
-is refused before anything is transmitted: the shutdown drain refuses admission and throws before
-`pending.push_back` (`CasRefLedger.cpp:1546-1549`), and a pre-attempt refusal likewise sends
-nothing. Ownership is then PROVEN absent while the state still says `Uncertain` — so a naive
-"emit iff `Uncertain` or `Durable`" floods the counter during fencing and shutdown, which are
-precisely the moments an operator reads it.
-
-**Fix at the source: a site that can PROVE nothing was transmitted downgrades the state to
-`NotAttempted` before propagating.** That is not a new sub-state — it is what `NotAttempted`
-already means ("`precommitAdd` never reached its append; nothing can be owned"). The question is
-how the proof reaches `precommitAdd`, and an earlier draft got that wrong by proposing to prove it
-at each refusal site. There are **nine** such sites, and the proof is erased before the caller can
-read it: `RefMutationItem` carries only `done`/`error`/`committed_id`
-(`CasRefLedger.h:454-463`), and the one arm that already HAS the proof throws it away one line
-later, collapsing into a generic `NETWORK_ERROR` (`CasRefLedger.cpp:3105-3126`).
-
-**So do not enumerate the refusals — mark the single TRANSMISSION point instead.**
-`RefMutationItem` gains one field, `attempted`, set for every survivor of a chunk immediately
-before `putIfAbsentControlled` — adjacent to `armApplyPending` (`CasRefLedger.cpp:2806`), which is
-already documented as "the last statement that still runs while nothing of this transaction can
-possibly be durable". It is the same record-intent-before-the-ambiguous-act discipline
-`PrecommitState` itself uses (`CasPartWriteTxn.cpp:965-971`). Every exit that happens before that
-line leaves `attempted` false, with no per-site work at all:
-
-| No-send exit | Site | Proven by |
-| --- | --- | --- |
-| shutdown drain refuses admission | `CasRefLedger.cpp:1546-1549` | never enqueued ⇒ never marked |
-| lost fence | `:2179-2184` | pre-PUT ⇒ never marked |
-| supersession (3 sites) | `:2193-2200`, `:2267-2274`, `:2639-2646` | pre-PUT ⇒ never marked |
-| prior wedge | `:2206-2233` | pre-PUT ⇒ never marked |
-| deposition | `:2296-2319` | pre-PUT ⇒ never marked |
-| item validation (2 sites) | `:2425-2460`, `:2513-2577` | pre-PUT ⇒ never marked |
-| unattempted chunk remainder | `:2482-2486` | its chunk never reached the PUT |
-| pre-PUT construction | `:2688-2797` | pre-PUT ⇒ never marked |
-| deadline exhausted with nothing sent | `:3105` | marked, then **cleared** — see below |
-
-The last row is the one case where the mark is set and still nothing was sent, and it is exactly
-the case the existing hardened predicate decides: `unresolvedProvesNothingWasSent`
-(`Backend/CasRequestControl.h:76`). That arm already computes it and already counts it
-(`CasRefAppendPreAttemptRefused`); it additionally clears `attempted`. **One set-site, one
-proof-gated clear-site, one read-site** — against nine special cases.
-
-`appendRefOps` surfaces the item's `attempted` to its caller on both the normal and the throwing
-path, and `precommitAdd` downgrades to `NotAttempted` iff the append failed and `attempted` is
-false. The receiver-side staging path needs no separate work: `prepareAdoptFromManifest` reaches
-`precommitAdd` through `prepareEntries`, so it inherits the same channel.
-
-Three properties to hold the implementation to, because the shape depends on them:
-
-- **Chunking must not split an item.** The mark is per-item, so an item whose ops landed in a
-  transmitted chunk must read `attempted` even if a later chunk of the same flush was refused. This
-  holds today — the batch builder admits at most one mutation per ref name per flush — and the plan
-  must assert it rather than assume it.
-- **Retries must not reset it.** The mark is set before the FIRST attempt and never re-cleared
-  except by the proof above, so the controller's internal retries and a later wedge resolution both
-  keep it true.
-- **A process death between the mark and the send over-reports.** That is the fail-closed direction and is
-  accepted: the rule stays "emit unless non-transmission is PROVEN", and a lost proof is a louder
-  counter, never a silent leak.
-
-**One authoritative emission, and the intermediate lines are demoted rather than deferred.**
-Today `~PreparedPartWrite` logs its ERROR line FIRST and calls `abandonBuildBestEffort` after
-(`PartFolderAccess.cpp:412-415`), while a successful retry writes `Settled` later still
-(`CasPartWriteTxn.cpp:1380`) — so a transaction released late keeps a false ERROR line while
-correctly suppressing the counter, the two halves of one emission disagreeing. Moving that one line
-is necessary but not sufficient: three other sites log before the final attempt.
-
-The intermediate lines are not FALSE — "this attempt failed" is true when written. They are at the
-wrong SEVERITY, claiming a leak before the last word is in. So they are demoted, not deleted, with
-transient-state wording, per the standing directive that a protocol's own expected uncertainty must
-not present as an error. Each site was checked separately, and they do not get the same answer:
-
-| Site | Verdict |
-| --- | --- |
-| `abandonBuildBestEffort` (`PartFolderAccess.cpp:378-381`) | **Demote to INFO.** It reports ONE attempt and is called from three places, one of which is the destructor — so it must NOT carry the authoritative line, or the final word would be indistinguishable from an intermediate one. The destructor emits its own line after its attempt fails. |
-| receiver scope-guard `abort` (`ContentAddressedMetadataStorage.cpp:2116-2123`) | **Demote to INFO, unconditionally** — and this contradicts a caution worth recording. The concern was that this site also fires on real aborts that are not release-unproven. It does not: `abort` early-returns when `write.isTerminal()`, and the catch is reachable ONLY when `write.abort()` threw, which is exactly a failed removal append. A successful abort logs nothing, so every line this site emits is an intermediate attempt failure. No conditional and no message split needed. |
-| `logCasWriteRetryLater` (`Backend/CasRequestControl.cpp:183-186`) | **LEAVE IT.** It is not a release-unproven claim and not release-specific: it is the generic "CAS write could not be committed; retrying later" line every CAS write path shares, already rate-limited by a `LogSeriesLimiter`. Demoting it would change unrelated paths to buy nothing, and its statement is true regardless of how the release resolves. |
-
-**Required:** attempt the final release first; then emit BOTH halves of the authoritative
-emission — counter and ERROR line — only if it failed. A settled-late exit produces neither.
-Because the third site above is out of scope, **the settled-late assertion is scoped to the
-authoritative message class**, not to "no WARNING anywhere": a generic retry-later warning may
-still appear and is correct.
-
-**What this deletes:** the carrier struct and out-parameter, the observation-point rule, the
-`isTerminal` guard (never a release bit anyway — it is also set immediately after a durable commit,
-`PartFolderAccess.cpp:344-350`, so it means "committed OR released"), every release-result
-parameter on the exchange seam, and the receiver's involvement entirely. **The receiver carries no
-release plumbing; its actions stay purely outcome-driven.** §6.1-§6.4 are unchanged, which is the
-point — they never needed to know.
-
-**What it covers that no receiver-side scheme could:** the destructor runs on every path — enum
-outcomes, exceptions propagating before the receiver installs its guard (`prepareAdoptFromManifest`
-maps only two error codes and lets the rest through), the `prepareEntries` path that returns no
-handle at all (`PartFolderAccess.cpp:491-493`), and destructor-only exits. Earlier drafts had to
-enumerate those; this one cannot miss one.
-
-**What it costs, named rather than smuggled.** The handle does not know the write was a relink, so
-the counter is general — `CasPrecommitReleaseUnproven`, not a relink-specific one. That is the
-honest trade and, on reflection, the better metric: the hazard is a property of part writes, not of
-relink, and the receiver's own log line already names the part for correlation. Restoring relink
-attribution is the ONE thing that would need receiver-side plumbing back, and it is not worth it.
-
-**What the counter means.** *Not provably released* — which is strictly weaker than *leaked*. An
-`Uncertain` removal may in fact have landed and be settled later by the ref lane's wedge
-machinery; an `Unresolved` promote may have committed, in which case there is no precommit left at
-all. The counter is an **upper bound** on real residue, and must be read as one.
-
-**Retention bound, corrected.** An unreleased binding is not bounded by "the mount's epoch" as an
-earlier draft said. Epoch rollover makes it *eligible*: a successor incarnation's
-`sweepStalePrecommitsNow` removes bindings whose `writer_epoch` predates the live one
-(`CasRefLedger.cpp:3738-3745`). So the honest statement is **eligible at epoch rollover, reclaimed
-by a successor's sweep — unbounded only if no successor ever mounts that namespace, or if every
-sweep attempt fails.**
-
-**Why no fsck class is needed** — the v6 draft specified one, and re-derivation removed the need
-rather than fixing its discriminator. (That discriminator was also wrong: `retireBuildSeq` is
-called on the successful promote and abandon paths too, `CasPartWriteTxn.cpp:1250`, `:1313`,
-`:1413`, not only in the destructor, and it is an in-memory operation besides.) The cases
-partition cleanly:
-
-- **The process is alive** ⇒ the destructor ran ⇒ the residue is already counted and logged. Nothing
-  for fsck to discover.
-- **The process died first** ⇒ the binding's `writer_epoch` now predates the next incarnation ⇒ it
-  is exactly what `sweepStalePrecommitsNow` exists to reclaim, on the designed path.
-
-The only accepted blind spot is the second case while no successor has yet mounted, and that is a
-statement about an unmounted namespace rather than about this protocol.
-
+What relink relies on, and nothing more, is the consumer guarantee of that document: an unproven
+release is counted and logged exactly once, reflecting the FINAL attempt; a refusal that provably
+transmitted nothing stays silent; and the accounting never changes what this state machine does on
+any exit. The seam's own test rows cover the release half; §11 keeps only the rows that exercise
+relink behaviour.
 
 ### 6.6 What falls out of the taxonomy {#taxonomy-deltas}
 
@@ -1338,7 +1160,7 @@ confirm counter at all.
 | `CasRelinkChanged` | authoritative `No` — the binding changed; the receiver byte-fetches |
 | `CasRelinkUnknown` | the sender could not speak; retry-later |
 | `CasRelinkRecoveryBudgetRefused` | **its own counter**, per the decision: an `Unknown` caused by the peer-initiated recovery budget (§4.3), distinguishable from every other `Unknown` |
-| `CasPrecommitReleaseUnproven` | §6.5: a part-write transaction died with `precommitState` still `Uncertain` or `Durable`. **Not relink-specific** — it lives in the handle, which does not know why the write happened, and that is the honest trade §6.5 names. An UPPER BOUND on real residue, not a leak count: an `Uncertain` removal may yet be settled by the ref lane. Emitted once, in the destructor |
+| `CasPrecommitReleaseUnproven` | **Owned by `2026-07-29-cas-part-write-release-seam.md`**, not by relink — it is general to part writes and deliberately not relink-attributed. Listed here only so a reader of relink's counters knows it exists and what it is an upper bound on; the seam spec defines its meaning and emission |
 | `CasRelinkAnswerRejected` | the response failed one of §4.4's four conditions — empty body, nonce echo, explicit answer, validator match. **Must be ~0 in a healthy cluster**: a non-zero value means a stripped header, an intermediary, or a misroute, and that is exactly the class §4.1.3 and §4.1.4 exist to catch |
 
 **Which rule refused, and what was expected.** Today an `Unknown` maps silently through
@@ -1419,12 +1241,11 @@ Rebuilt from the state machine of §6, not transplanted from the old row list:
 | 16 | **Replay** | replay a captured earlier confirm response for the same part and validator | nonce mismatch ⇒ `Unknown`; no promote (§4.1.4) |
 | 17 | **Cross-mount collision** | two same-pool CA disks, same `server_root_id`, same table; offer from disk A, `MOVE ... TO DISK` to B, force B to hold the same `ManifestRef` tuple for that ref | validators DIFFER (the digest is mount-qualified), so the answer is `changed`, never `proven`. This is B1's shape and the direct regression test for §3 |
 | 18 | **S1 → S0 via promote** | force `promote` to `MechanismFallbackAllowed` **with the release succeeding** | byte fetch to the same sender; no double publish; distinct from row 9's `Unresolved`, which must NOT byte-fetch |
-| 19 | **Release observed on the promote path** | `promote` → `MechanismFallbackAllowed`, and **every** removal attempt fails — the promote-internal abandon, the receiver's scope guard, and the destructor retry — so `precommitState` is still `Durable`/`Uncertain` at destruction | the action is UNCHANGED (byte fetch, part published exactly once) and `CasPrecommitReleaseUnproven` increments **exactly once**, from the destructor |
-| 20 | **Release observed on the STAGING path** | fail `precommitAdd` uncertainly and fail the `prepareEntries` abandon — the path that returns NO handle (`PartFolderAccess.cpp:491-493`) | same single emission, proving the observation does not depend on a handle reaching the receiver. Regression test for codex-r3 B1 |
-| 21 | **Release never changes the action** | force every removal attempt to fail on S1's `Unknown` exit and on S2's `Unresolved` exit; for S2 run BOTH promote-landed and promote-not-landed variants so the outcome is pinned rather than nondeterministic | all variants still throw retry-later and **none byte-fetches**; exactly ONE emission per transaction in each. Regression test for codex-r3 B2 — S2 is where a byte fetch would double-publish |
-| 22 | **A successful late release emits nothing** | fail the first removal attempts but let the DESTRUCTOR retry succeed | `precommitState` reaches `Settled`, so **neither half** of the authoritative emission fires: the counter does not increment AND no ERROR line of the release-unproven class is logged. Intermediate INFO lines from the earlier attempts are EXPECTED and must not fail the assertion — the scope is the authoritative message class, not severity globally (§6.5) |
-| 23 | **Proven non-transmission is silent** | drive each of the marked no-send exits — at minimum the shutdown drain (`CasRefLedger.cpp:1546-1549`), a lost fence, and the deadline-exhausted arm (`:3105`) | `attempted` stays false (or is cleared, for the last), the state is downgraded to `NotAttempted`, and the destructor emits nothing. Without this the counter floods during fencing and shutdown |
-| 24 | **A transmitted attempt is NOT downgraded** | let the PUT be sent and then fail ambiguously | `attempted` is true, so the state stays `Uncertain` and the emission STANDS. The fail-closed half of row 23 — without it, a channel bug that never marks anything would silence the counter entirely and look like success |
+| 19 | **A failed release never changes the action** | force every removal attempt to fail on S1's `Unknown` exit and on S2's `Unresolved` exit; for S2 run BOTH promote-landed and promote-not-landed variants so the outcome is pinned rather than nondeterministic | all variants still throw retry-later and **none byte-fetches** — S2 is where a byte fetch would double-publish. This is the RELINK half; the emission itself is asserted by the seam spec's rows S1-S5 |
+
+Rows covering the release accounting itself — unproven-release emission, the settled-late silence,
+proven non-transmission, the fail-closed half, and marker synchronization — live in
+`2026-07-29-cas-part-write-release-seam.md` §8 and are not duplicated here.
 
 The existing failpoint `cas_relink_receiver_pause_before_confirm` is the seam that opens the T1→T2
 window and stays (renamed for accuracy); it is what makes 2–7 reachable at all, since none of them
