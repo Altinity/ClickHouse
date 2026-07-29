@@ -2134,3 +2134,8 @@ agent wrote the meta-lesson into the spec header itself and requested r4 — lau
 §6, incl. crash-window probing of the discriminator). SOAK RETURNED/STOPPED at the deadline
 (driver gone, criteria evidence updated 18:05) — awaiting a14's capture verification + RCA
 completion + verdict decision.
+**2026-07-29 18:5x local** — cluster gone at 18:07 (crossing #4): part_log + CA event log
+unrecoverable from this run; text content survives via host mounts; predown list lacked both
+tables (fix ordered). RCA continues cluster-free (archive grep first — S13/S39 = behavior
+pre-existence proof); induced-blip mini-run designed as the deterministic reproducer if
+table-level evidence still needed. a16 building.
