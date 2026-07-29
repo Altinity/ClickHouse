@@ -39,7 +39,7 @@ chunk-integrity invariant now names both mechanisms per item class, and its test
 (roll at the boundary), S6b (over-cap REFUSAL, which S6a never exercised) and S6c (removal-class
 solo carve). Minors: the marker-sync cost is stated exactly — one arm-side acquire per attempted
 chunk PLUS one clear-side acquire per non-success resolution, since the unlocked clear paths gain
-one too — and five spots in this document that still assigned the release observation to the HANDLE
+one too — and six spots in this document that still assigned the release observation to the HANDLE
 are reassigned to the transaction, matching v11's attempt-versus-word split.
 
 **v11 (Codex round 7 — 0 blocker, 4 major, 4 minor).** The emitter moved from `~PreparedPartWrite`
