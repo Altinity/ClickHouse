@@ -660,10 +660,28 @@ yet the two dumps agree almost exactly:
 | `epoll_wait` | 125,030 | 124,286 | 1.006 |
 
 Totals differ by 0.3% (51,748,981 vs 51,580,307 samples), consistent with the same population
-queried seconds apart rather than two distinct trace types. **Everything in these dumps must be read
-as wall time.** No conclusion in this addendum rests on a CPU/Real distinction, and the predown
-script's CPU-side `trace_type` predicate should be checked before the next run — this is a
-reporting bug, not a product one, and it would silently corrupt any future profile comparison.
+queried seconds apart rather than two distinct trace types.
+
+**Root-caused and fixed** in `52f110e94b3`, and the mechanism matters for how these files must be
+read. The dump's SELECT carried `'${tt}' AS trace_type`, which **shadows the table column**:
+ClickHouse resolves SELECT aliases in `WHERE`, and the alias wins, so `WHERE trace_type = '${tt}'`
+compared the literal with itself and never filtered. Proven on a live binary — a subquery using the
+alias returns every row for the matching literal and zero for the other.
+
+**So these dumps are not "wall time" either. They are an unfiltered MIX of every trace type enabled
+in the window** (Real + CPU + whatever else), which is worse than a mislabel: a thread that is
+on-CPU is sampled by *both* timers and therefore **double-counted relative to a blocked one**. The
+practical reading rule for anything taken from `trace_*` in this addendum:
+
+- *Relative rankings among blocking-dominated stacks survive* — they are all under-counted the same
+  way, so their order is intact.
+- *Any comparison of an on-CPU-heavy symbol against a blocked one is skewed ~2× in favour of the
+  on-CPU side* and must not be used to apportion time.
+
+No conclusion in this addendum rests on a CPU/Real distinction, and none apportions time between an
+on-CPU and a blocked symbol. This was a reporting bug rather than a product one, but it would have
+silently corrupted every future profile comparison, which is why it is recorded here in full rather
+than quietly dropped now that it is fixed.
 
 ### Before / after {#before-after}
 
@@ -715,8 +733,16 @@ predicted.** `pthread_mutex_lock` has 72,942 query-side samples in
 has it as its top frame**: the samples are fragmented across many distinct stacks, every one of them
 below the top-200 cutoff, which sits at 480 samples for stacks and 44,625 for frames. The dump now
 carries a `focus` parameter (`manifest.txt` header: `focus='(none)'`), so the closing move is a
-re-run with `focus=pthread_mutex_lock`. Note also that with the CPU/Real distinction broken, this
-count cannot currently be separated into contention versus blocking.
+re-run with `focus=pthread_mutex_lock`.
+
+**The 72,942 itself must not be treated as a magnitude.** Per the
+[trace-dump caveat](#addendum-method), this specimen's dumps are an unfiltered mix of trace types,
+so a thread that is on-CPU inside `pthread_mutex_lock` is counted twice. If the waits spend part of
+their time spinning — which is exactly what an adaptive mutex does before parking — then **up to half
+of that count is sampling duplication**. The direction is unknown and cannot be recovered from these
+files, because separating it is precisely the CPU/Real split the bug destroyed. That is a second,
+independent reason Q1 needs `focus=pthread_mutex_lock` on a **post-`52f110e94b3` specimen**: without
+the fix, neither the identity nor the size of this term is trustworthy.
 
 **2. "`CANNOT_PARSE_INPUT_ASSERTION_FAILED` provenance."** {#carry-2} — **ANSWERED, and it is not
 CAS.** From `errors.tsv` on both nodes, `last_error_message` is
@@ -751,7 +777,9 @@ survives."** — **NOT ANSWERABLE from this dump, and the reason is a cutoff, no
 `mkdir`, `create_directories`, `unlink`, `__open64` and `write` are all absent from the T15 top-200
 frames — but the top-200 cutoff here is **44,625 samples**, while the frame in question measured
 **404 samples** on the degraded specimen. The cutoff sits 110× above the signal, so absence proves
-nothing. Closing it needs either `focus=create_directories` or a deeper limit on the background side
+nothing — and the [trace-dump caveat](#addendum-method) only sharpens that: `mkdir` is on-CPU work,
+so the unfiltered mix would have *inflated* it roughly 2×, and it still does not clear the cutoff.
+Closing it needs either `focus=create_directories` or a deeper limit on the background side
 specifically, which is the same structural gap as carry 1: a global top-200 spends nearly all its
 rows on the query side (186 rows, 47.1M samples) and leaves the background side — where GC lives —
 just 14 frames (4.6M samples), all of them thread-pool scaffolding.
@@ -897,6 +925,7 @@ specimen:
    5,326 per node, still early-run-confined, still ERROR severity.
 4. **The follower lease regression**, 6.77 ms → 53.5 ms per round. Small in absolute terms; worth
    one look because nothing in the frozen-tail change explains it.
-5. **Fix the CPU trace dump** before the next specimen — a reporting bug, but one that makes every
-   future CPU/wall comparison silently wrong.
+5. **The CPU trace dump — DONE**, root-caused to a SELECT alias shadowing the `trace_type` column
+   and fixed in `52f110e94b3`. Kept in the list as a closed item because two of this addendum's
+   open questions (carry 1 and carry 4) can only be answered on a post-fix specimen.
 
