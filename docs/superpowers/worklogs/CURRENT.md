@@ -2044,3 +2044,7 @@ MERGES EXECUTED CLEAN: 7a38fed5987 (T15, 3 commits) + 993dad3e641 (T16) — zero
 CasGc exit placement verified in the merged tree (bound after the absent branch, before
 decode). Merged release build+gate running detached (expect 1565 = 1548+8+9); ASan gate next;
 then the exclusive re-validation soak via run_soak.sh.
+**2026-07-29 16:0x local** — merged RELEASE gate GREEN: 1565/1565 (=1548+8+9 exactly, 243
+suites). ASan merged gate launched. folded_token: USER RULED DELETE (origin = discover-era
+token-diff, subsumed by INV-1) — T16b dispatched to a16 (edits now, build after the soak).
+Next: ASan green -> exclusive re-validation soak via run_soak.sh on the merged binary.
