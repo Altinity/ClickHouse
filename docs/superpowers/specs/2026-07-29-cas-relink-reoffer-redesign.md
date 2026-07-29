@@ -9,8 +9,13 @@ doc_type: 'reference'
 
 # CAS relink re-offer: retiring the confirm endpoint {#cas-relink-reoffer-redesign}
 
-**Date:** 2026-07-29. **Status:** DESIGN, awaiting approval. **Branch:** `cas-gc-rebuild`.
+**Date:** 2026-07-29. **Status:** DESIGN (**v2**), awaiting approval. **Branch:** `cas-gc-rebuild`.
 Spec only; no code landed.
+
+**v2 changes:** the confirm is expressed as an HTTP conditional request (`ETag` /
+`If-None-Match`), with the two candidate forms reconciled head-on in §4.1.4; the simplification
+claim is quantified up front in §1.1; every mechanism now names what it deletes or which
+obligation it discharges; the §5.1.2 marker fix is scoped and sized.
 
 **Binding input, not relitigated here:**
 `docs/superpowers/cas/2026-07-29-relink-confirm-per-ref-draft.md` §0 DECISION — variant (ii)
@@ -55,6 +60,34 @@ a refusal it must retry.
    this design — correctly, given what it represents. The refinement is what distinguishes "the
    deleted terms were redundant" from "the deleted terms were load-bearing", and if the refined
    `_sab_stalecache` does not pass, the design is wrong and must not be implemented.
+
+### 1.1 The arithmetic {#arithmetic}
+
+This is a simplification effort, so the claim is stated as a number before anything else is
+argued. Deletions are measured against the tree; additions are estimated.
+
+| | Before | After |
+| --- | --- | --- |
+| Receiver outcomes to reason about | 7 taxonomy rows | **4 states** |
+| Interserver actions on the endpoint | 2 (fetch + confirm) | **1** — the confirm IS an offer |
+| Fields the receiver must round-trip | 6-field token | **1 standard validator** |
+| Bespoke wire names | 5 | **1** (+3 standard headers) |
+| Content-addressed names in `src/Storages/MergeTree/` | 5 | **2** |
+| Seam methods serving the confirm | `confirmExactRef` + `ownsNamespace` | **0** |
+| Lane mutexes held to answer | 2, in a bespoke snapshot | **1**, the ordinary read path |
+
+| Lines | Deleted | Added |
+| --- | --- | --- |
+| Shared (`DataPartsExchange.cpp`/`.h`) | 317 | ≈161 |
+| Content-addressed (incl. the **~170-line token codec, whole file**) | 450 | ≈94 |
+| Apply-marker synchronization (§5.1.2) | — | **≈20, no control-flow change** |
+| Tests made moot | ≈250 | — |
+| **Net** | | **≈−510 production, ≈−760 with tests** |
+
+The one thing this design ADDS that is not a deletion is the recovery budget, and it is there to
+discharge a named safety obligation (§4.3), not to add capability. Every other mechanism below
+either removes something or is required by a stated obligation; §4.1.3, §4.3 and §5.1.2 say which,
+in one sentence each.
 
 ## 2. The measured problem {#measured-problem}
 
@@ -207,12 +240,41 @@ Mitigations, in order of strength:
 
 The test matrix (§11) gains an assertion that both responses carry `no-store`.
 
-#### 4.1.4 VARIANT (analysed, not chosen): the 304/503 status mapping {#status-variant}
+#### 4.1.4 Reconciliation: the two candidate forms, and why this one {#status-variant}
 
-The natural full-HTTP spelling maps the three answers onto status codes: **304 Not Modified** =
-Yes, **200 with a different ETag** = authoritative No, **503 + `Retry-After`** = Unknown. It is a
-better-looking protocol and it lands exactly on our three-answer semantics. It is recorded here as
-a variant rather than the design because verification turned up a concrete blocker and a risk.
+Two forms were on the table, and they are cousins rather than rivals: **both carry an opaque
+strong validator derived from the `ManifestRef`, and neither trusts a timestamp.** An
+identity-cookie form (the sender states its current binding in a response cookie; the receiver
+compares) and the conditional-request form (the sender states it in an `ETag`; the receiver
+conditions on it with `If-None-Match`). They differ on three axes, and only the third is
+contentious.
+
+**Axis 1 — how the validator travels. Conditional form wins outright.** A cookie is a name this
+codebase invents, documents, versions and defends; `ETag` is a name every HTTP stack, proxy,
+packet capture and engineer already knows. Since the two carry the same bytes, "one more custom
+mechanism versus one standard header" decides it with nothing further to weigh. This is also what
+turns the wire-name row of §8.1 from a substitution into a near-total deletion.
+
+**Axis 2 — who compares. Both, and that is not redundancy.** The receiver's comparison of the
+returned `ETag` is what it ACTS on, and it is load-bearing. The sender's evaluation of
+`If-None-Match` is diagnostic, and it earns its place under a named obligation rather than as
+polish: §9's requirement — a directive, because the rule-3 storm took a live cluster to diagnose —
+is that a refusal be explainable, and expected-versus-actual can only be logged by a node that
+knows both values. The header has to be on the wire anyway for the conditional form to exist, so
+the sender either looks at it or wastes it. It costs one comparison.
+
+**Axis 3 — the response mapping.** The natural full-HTTP spelling puts the three answers on status
+codes: **304 Not Modified** = Yes, **200 with a different ETag** = authoritative No, **503 +
+`Retry-After` + a reason** = Unknown, including budget-refused. It is a better-looking protocol,
+it lands exactly on our three-answer semantics, and it expresses the transient-state directive in
+standard vocabulary instead of a custom message class. It is nevertheless recorded as a variant
+rather than the design, for a verified blocker and a risk.
+
+One hypothesis to retire first: the status mapping does **not** delete more custom code from the
+shared handler. On the sender both spellings are one line — set a header, or set a status. On the
+receiver the validator spelling is a header read plus a string comparison, while the status
+spelling needs exception handling for its success path plus a shared-IO change. It adds; it does
+not subtract.
 
 **The blocker is in the shared HTTP client.** `assertResponseIsOk` (`src/IO/HTTPCommon.cpp:71-90`)
 accepts **only** 200, 201, 202, 206 and redirects; every other status is turned into a thrown
@@ -238,9 +300,13 @@ copy, so under the status mapping the affirmative answer is the one thing a cach
 
 **Recommendation:** adopt the conditional-request FORM — which is the substance: strong validator,
 `If-None-Match`, no timestamps, the token deleted, precise sender-side logging — and keep the
-transport status at 200, carrying the answer in the validator. `Retry-After` remains available on
-the refusal path as a response header if the sender wants to pace a retry, which is the one piece
-of real functionality the 503 spelling would otherwise add. See open question 2.
+transport status at 200, carrying the answer in the validator. See open question 2.
+
+The one piece of real functionality the 503 spelling would add is `Retry-After` — sender-paced
+backoff instead of the queue's fixed one. It is deliberately NOT adopted here as a consolation
+header: it deletes nothing and discharges no stated obligation, and the queue's backoff is not
+currently a problem anyone has measured. If sender-paced backoff is wanted it should arrive as its
+own change with its own evidence, not as a rider on this one.
 
 ### 4.2 Answer vocabulary and the fence-first reordering {#answer-vocabulary}
 
@@ -267,6 +333,11 @@ reorder for anyone who wants to distinguish `No` (`ContentAddressedExchange.h:19
 that ever treats `No` as authoritative knowledge ... makes that ordering wrong and must hoist rule
 6 above the row comparison first." That is precisely what this design does, and it is what buys
 the payoff in §4.4.
+
+*What the reorder deletes:* the entire `No`-is-not-knowledge apparatus — the 24-line wire-constant
+comment arguing why `no` must never cross the wire, the deliberate binary-vocabulary collapse, and
+the taxonomy row that lumps four distinguishable outcomes into one action. Moving one check
+upward removes a doctrine, not just a line.
 
 The order of the sender's evaluation, therefore:
 
@@ -311,16 +382,23 @@ called. The governing sentence, to be reproduced in the code comment:
 
 > A peer-initiated read performs exactly what is needed to answer, and schedules nothing beyond.
 
-Mechanically this is a `ReadMaintenance` parameter on `resolveRef` (`Full` for local callers,
+*This is a parameter, not a mechanism, and that is the point: it is what keeps the answer path
+from becoming a second resolve implementation to maintain alongside `resolveRef`.* Mechanically
+it is a `ReadMaintenance` parameter on `resolveRef` (`Full` for local callers,
 `AnswerOnly` for this one) rather than a parallel resolve implementation — one resolve, one
 recovery preamble, one place where the committed row is read.
 
-**A budget on peer-initiated recovery.** Recovery is a full `LIST` plus log replay, orders of
+**A budget on peer-initiated recovery.** *This is the one mechanism in the design that deletes
+nothing; it exists solely to discharge a named safety obligation — that a remote peer cannot
+drive unbounded work on this writer — which §4.3's removal of the zero-I/O contract would
+otherwise leave undischarged.* Recovery is a full `LIST` plus log replay, orders of
 magnitude beyond the `HEAD`-free query it replaces, and the LRU eviction budget is an
-**amplifier**: with `ref_table_cache_bytes` at 256 MiB (`CasPool.h:221`), a peer cycling re-offers
+**amplifier**: with `ref_table_cache_bytes` at 256 MiB (`CasPool.h:221`), a peer cycling confirms
 across many namespaces makes every answer cold, and each cold answer evicts a table the writer
 was using — a self-sustaining recovery storm driven entirely by a remote peer. Two mitigations,
-in the order they should be implemented:
+which address **different halves** of that sentence and are therefore not alternatives: the first
+stops a peer's table from DISPLACING the writer's (the amplifier), the second bounds the I/O a
+peer can cause at all (the base rate). In the order they should be implemented:
 
 1. **Do not mark a peer-initiated recovery most-recently-used.** `ensureRefTableRecovered`
    bumps `last_touch_tick` so `enforceRefTableCacheBudget` evicts idle tables first
@@ -455,15 +533,28 @@ committed row). Mutual exclusion then supplies the whole argument, in exactly th
   not been issued, so nothing of that transaction can be durable, and the view it reads is
   complete.
 
-Cost: one uncontended mutex acquire per committed chunk, against a network `PUT`. `armApplyPending`
-stays `noexcept` and allocation-free; no OTHER lock is held at that call site, so introducing
-`state_mutex` there cannot invert the established order (`state_mutex` nests under
-`ref_queue_mutex`, never the reverse).
+**The lock goes at the CALL SITE, not inside `armApplyPending`** — and that is decided, not a
+preference. `forceWedgeForTest` (`CasRefLedger.cpp:1381-1397`) already calls `armApplyPending` at
+`:1396` **while holding `state_mutex`**, acquired at `:1390`. A self-locking `armApplyPending`
+would therefore self-deadlock on a non-recursive `std::mutex` at an existing call site. So
+`armApplyPending` keeps its `noexcept`, allocation-free, lock-free body and gains a documented
+PRECONDITION — "call with `state_mutex` held" — which that call site already satisfies for free.
+No memory-order change is needed either: with both the write and the read under the mutex, the
+mutex supplies the happens-before and the relaxed atomics stay as they are.
 
-**Implementation obligation:** every site that can produce a durable ref-log effect must arm under
-`state_mutex` before the effect. The plan must enumerate them exhaustively — `commitRefChunk` and
-the wedge-resolution install are the two known ones — because the argument above is only as strong
-as that enumeration.
+**SIZE OF THIS CHANGE — it is an ordering upgrade, not a lane refactor.** One production call
+site is decisive: wrapping `armApplyPending(*rt)` at `CasRefLedger.cpp:2806` in a `state_mutex`
+scope, which is **two lines**. The obligation that generalizes it — all three writers of
+`apply_state` (`armApplyPending`, `clearApplyPending`, `poisonApplyState`) execute under
+`state_mutex`, so the marker is exactly as synchronized as the committed rows it guards — requires
+auditing the eight marker writes in the file and bringing any unlocked one into an existing scope.
+Most are already inside the install region. **Estimated total: under 20 lines, no control-flow
+change, no signature change, one file.** Cost at runtime: one uncontended mutex acquire per
+committed chunk, against a network `PUT`.
+
+**What it buys, stated so the addition is justified rather than assumed:** it is the enabling
+precondition for deleting rule 3's two terms, which is what restores relink availability from ~17%
+to ~100% minus true conflicts. It adds no state, no object, no configuration and no wire field.
 
 ### 5.2 The cold/evicted refusal {#cold-refusal}
 
@@ -869,9 +960,11 @@ exists to close, which is precisely the property §12 has just reassigned to tho
    NOT `pending`, which costs a `ref_queue_mutex` acquire on the answer path and leaves a wider
    refusal window than the design targets (a tenure is longer than a chunk). Recommendation is the
    marker fix, because it removes a conflation rather than trimming one; but it is a change to
-   code this design otherwise does not touch, and that deserves an explicit decision. Related
-   question: should `armApplyPending` keep its `noexcept` allocation-free contract by taking the
-   lock at the call site rather than inside itself?
+   code this design otherwise does not touch, and that deserves an explicit decision. Scoped in
+   §5.1.2 at **under 20 lines, one file, no control-flow change**. *(A sub-question this once
+   carried is now answered rather than asked: the lock must go at the call site, because
+   `forceWedgeForTest` already calls `armApplyPending` holding `state_mutex` and a self-locking
+   version would deadlock there.)*
 2. **The 304/503 status mapping (§4.1.4) — accept the analysis, or overrule it?** The
    conditional-request FORM is adopted either way; the question is only whether the three answers
    ride on status codes or on the validator value. Recommendation: the validator, because
@@ -892,10 +985,12 @@ exists to close, which is precisely the property §12 has just reassigned to tho
    (`CasPool.h:221`) with no XML plumbing. Recommendation is global-first — one pool-wide setting
    — but if the budget turns out to be theoretical insurance (measurement 1), a hard-coded
    constant with no operator surface is one fewer knob to document and support. Which?
-5. **Does the confirm keep the `assertEOF` strictness?** The identity-only response has an empty
-   body by construction, exactly as the confirm's does today, so requiring EOF before reading the
-   `ETag` keeps a misrouted or desynchronized reply "unproven" rather than half-parsed. Confirm
-   this is wanted on the conditional path too.
+5. **Does the confirm keep the `assertEOF` strictness?** Live only for the chosen form, where the
+   answer rides in a header on a 200 whose body is empty by construction: requiring EOF before
+   reading the `ETag` keeps a misrouted or desynchronized reply "unproven" rather than
+   half-parsed, exactly as it does for today's confirm. *Under §4.1.4's status mapping the
+   question dissolves — a 304 must not carry a body at all, so the check would be enforcing what
+   the status already guarantees.* Confirm the strictness is wanted on the chosen path.
 6. **Naming.** `content_addressed_relink_identity_only` is the only bespoke name left on the wire
    — descriptive but long. Preference? (The validator, condition and cache directive are all
    standard headers and need no name of ours.)
