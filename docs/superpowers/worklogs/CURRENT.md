@@ -2072,3 +2072,8 @@ unwind) + the forgery ASYMMETRY argument (304-form makes caches active participa
 form structurally immune + no-store). Two INM header holes closed (wildcard, multi-value).
 Vanished-part dissolves into Unknown naturally — the none sentinel died. Codex v1 still
 running (1.4MB); focused v2 delta pass follows.
+**2026-07-29 16:56 local** — relink v3 landed (all 9 findings dispositioned; B1 worse than
+reported -> mount-qualified xxh3-128 digest validator; M6 withdrawn honestly; three-bound
+budget w/ ship-gate). Crossing #3: v3 predates the user's Q2-closure + custom-headers
+directives -> small v4 ordered. Soak cluster alive at 16:56 (~51 min since launch — likely
+the predown capture phase; nudge threshold = next tick). a16 still holding for its slot.
