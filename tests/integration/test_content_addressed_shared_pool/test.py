@@ -178,6 +178,30 @@ def test_two_servers_share_one_pool():
         )
     )
 
+    # …AND THE SUPPRESSION IS EVIDENCED: rounds ran and deleted nothing, which is what separates
+    # "GC declined, by design" from "GC was wedged, crashed, or never held the lease".
+    node1.query("SYSTEM FLUSH LOGS")
+    rounds = int(
+        node1.query(
+            "SELECT count() FROM system.content_addressed_garbage_collection_log "
+            "WHERE event_type = 'Finish' AND outcome = 'Success'"
+        ).strip()
+        or 0
+    )
+    assert rounds > 0, "no successful GC round ran at all — this is not suppression, it is a wedge"
+    deleted = int(
+        node1.query(
+            "SELECT sum(objects_deleted + manifests_deleted + entries_redeleted) "
+            "FROM system.content_addressed_garbage_collection_log WHERE event_type = 'Finish'"
+        ).strip()
+        or 0
+    )
+    assert deleted == 0, (
+        "GC's own bookkeeping reports {} deletion(s) while Stage A suppression is in force".format(
+            deleted
+        )
+    )
+
 
 # Crash-resilience uses a SMALLER, DISTINCT dataset per node. Distinct content => node1's blobs are
 # NOT deduped with node2's, so "node2's GC must not reclaim node1's blobs while node1 is down" is a
@@ -316,5 +340,29 @@ def test_pool_survives_node_crash():
             final,
             count_prefix(BLOBS_PREFIX),
             count_prefix(PARTS_PREFIX),
+        )
+    )
+
+    # …AND THE SUPPRESSION IS EVIDENCED: rounds ran and deleted nothing, which is what separates
+    # "GC declined, by design" from "GC was wedged, crashed, or never held the lease".
+    node1.query("SYSTEM FLUSH LOGS")
+    rounds = int(
+        node1.query(
+            "SELECT count() FROM system.content_addressed_garbage_collection_log "
+            "WHERE event_type = 'Finish' AND outcome = 'Success'"
+        ).strip()
+        or 0
+    )
+    assert rounds > 0, "no successful GC round ran at all — this is not suppression, it is a wedge"
+    deleted = int(
+        node1.query(
+            "SELECT sum(objects_deleted + manifests_deleted + entries_redeleted) "
+            "FROM system.content_addressed_garbage_collection_log WHERE event_type = 'Finish'"
+        ).strip()
+        or 0
+    )
+    assert deleted == 0, (
+        "GC's own bookkeeping reports {} deletion(s) while Stage A suppression is in force".format(
+            deleted
         )
     )
