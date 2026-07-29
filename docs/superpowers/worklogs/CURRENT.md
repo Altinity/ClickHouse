@@ -2128,3 +2128,9 @@ memory rewritten. Soak deadline ~18:05 + RCA in flight at a14.
 real — prepare path shares the leak exposure; S0-prime's action permits S2's forbidden double
 publish -> release-incomplete becomes an orthogonal exit ATTRIBUTE (state machine returns to
 honest 4+1attr). v6 dispatched, r4 announced. Soak deadline passed — checking a14 next.
+**2026-07-29 18:3x local** — v6 landed (95d99c15e3c: attribute remodel, staging-path guard w/
+per-origin bounds table, LeakedLivePrecommit discriminator VERIFIED exact, tests 19->22);
+agent wrote the meta-lesson into the spec header itself and requested r4 — launched (targeted
+§6, incl. crash-window probing of the discriminator). SOAK RETURNED/STOPPED at the deadline
+(driver gone, criteria evidence updated 18:05) — awaiting a14's capture verification + RCA
+completion + verdict decision.
