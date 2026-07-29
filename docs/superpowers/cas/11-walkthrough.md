@@ -422,7 +422,7 @@ sequenceDiagram
     TX->>TX: merge = committed entries − content_removed − restaged + staged deltas
     alt this txn also uploaded new blobs
         TX->>PF: stage + precommit a SCRATCH manifest (EDGE-BEFORE-OBSERVE cover)
-        Note over TX,PF: never promoted; abandoned after the repoint
+        Note over TX,PF: never promoted — abandoned after the repoint
     end
     TX->>PF: repointRef(ref, merged)
     PF->>PF: encode/decode round-trip compare vs committed manifest
@@ -849,7 +849,7 @@ sequenceDiagram
     end
 
     Note over GC: round n+1 — graduation
-    GC->>S3: re-verify in-degree; requires CONFIRMED Condemned<br/>evidence for the exact (hash, token)
+    GC->>S3: re-verify in-degree — requires CONFIRMED Condemned<br/>evidence for the exact (hash, token)
     Note over GC: publishes delete_pending only if still zero
 
     Note over GC: round n+2 — the single content-delete site
@@ -1469,7 +1469,7 @@ sequenceDiagram
     TX->>PW: promote()
     PW->>S3: GET + validate the precommit manifest body
     PW->>S3: append ref-log txn: [retire old committed] +<br/>Precommit→Committed + SetPublishedAt
-    Note over PW: commit_state = Durable; retireBuildSeq
+    Note over PW: commit_state = Durable, then retireBuildSeq
     end
 ```
 
@@ -1570,12 +1570,12 @@ sequenceDiagram
     Snd->>Snd: same disk pool uuid? (identity, never endpoint+prefix)
     Snd->>S3: getRelinkOffer: resolve the view ONCE →<br/>manifest bytes + confirm token from the SAME view
     Snd-->>R: cookie relink=part_manifest_v2,<br/>cookie source_token=<car1|…>, body = manifest bytes
-    Note over Snd: sender is fire-and-forget; it releases the part here
+    Note over Snd: sender is fire-and-forget — it releases the part here
 
     rect rgba(120,160,255,0.12)
     Note over R,S3: T1 — PUBLISH (the +1 lands FIRST)
     R->>S3: adopt entries by evidence (no HEAD, no bytes),<br/>stageManifest (fresh receiver-local id), precommitAdd
-    Note over R: the sender's ManifestRef / namespace / digest are IGNORED —<br/>only `entries` are used; the target (ns, ref) comes from R's OWN router
+    Note over R: the sender's ManifestRef / namespace / digest are IGNORED —<br/>only `entries` are used — the target (ns, ref) comes from R's OWN router
     end
 
     rect rgba(255,190,120,0.15)
