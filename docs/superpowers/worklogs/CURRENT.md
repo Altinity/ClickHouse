@@ -1784,3 +1784,10 @@ probe-A premise re-check + T_mat consumer sweep). No builds yet; nothing wedged.
 demotion + T_mat deletion in progress; verdict doc not yet created). No commits/builds yet; live.
 **2026-07-29 07:40 local** — watchdog: T12 live — source edits done (07:15-16), verdict doc
 `2026-07-28-stage-a-retirement-verdicts.md` being written (07:37). No build/commit yet.
+**2026-07-29 08:0x local** — T12 DONE (`ff9f36a056f`: probe A -> sampled detector outside fold,
+T_mat deleted end-to-end, 9-row verdict table; gates 1540/1540, integ 2/2+1/1). Controller:
+deviation at `mountWritable` ACCEPTED (measurement governs) -> BACKLOG
+`[MOUNT-CLAIM-EPOCH-REGRESSION]`; rev.6 + Late-Predecessor BACKLOG bullets groomed (LANDED /
+superseded). Pre-verified finding for the fix round: s38 configs still set the deleted
+`materialization_grace_ms` (fail-close now breaks S38 at disk open) — report claim falsified.
+Warm GC/fold reviewer dispatched on `review-6bcd66716ba..ff9f36a056f.diff`.
