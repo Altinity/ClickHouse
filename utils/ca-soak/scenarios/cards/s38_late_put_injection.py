@@ -355,20 +355,31 @@ class S38(Scenario):
                if i is not None]
         epochs = sorted({e for e, _ in ids})
         result.observations["ref_log_epochs"] = epochs
-        if len(epochs) < 2:
+
+        # The dead epoch is the one whose TOP object is a seal, not "the lowest of at least two".
+        # Requiring two epochs in the listing was wrong: a seal closing epoch N is written AT
+        # `{N, T+1}`, i.e. inside epoch N, and the live epoch N+1 need not have written anything yet —
+        # so the expected shape right after an unclean restart is a SINGLE listed epoch that ends in a
+        # seal. (Found by running the card: `ref_log_epochs = [1]` with a seal already minted.)
+        dead_epoch = seal_seq = seal_key = seal_body = None
+        for candidate in epochs:
+            top = max(sq for e, sq in ids if e == candidate)
+            key = f"{log_prefix}{_render_ref_txn_id(candidate, top)}{_REF_LOG_SUFFIX}"
+            body = s3.get_object(Bucket=_S3_BUCKET, Key=key)["Body"].read()
+            if b'"epoch_seal"' in _zstd_decompress(body):
+                dead_epoch, seal_seq, seal_key, seal_body = candidate, top, key, body
+                break
+        if dead_epoch is None:
             result.add(Verdict.inconclusive(
                 "a dead epoch exists to be sealed",
-                ">= 2 writer epochs in the ref-log stream (one dead, one live)",
-                f"epochs present: {epochs} — the storm did not span the restart"))
+                "one listed writer epoch whose highest ref-log id carries an `epoch_seal` op",
+                f"epochs present: {epochs}, none of them ends in a seal — the storm did not span the "
+                f"restart, or the seal has not been written yet"))
             _common.standard_end(ctx, result, [_TABLE])
             return
 
-        dead_epoch = epochs[0]
-        seal_seq = max(s for e, s in ids if e == dead_epoch)
         seal_id = _render_ref_txn_id(dead_epoch, seal_seq)
-        seal_key = f"{log_prefix}{seal_id}{_REF_LOG_SUFFIX}"
-        seal_body = s3.get_object(Bucket=_S3_BUCKET, Key=seal_key)["Body"].read()
-        is_seal = b'"epoch_seal"' in _zstd_decompress(seal_body)
+        is_seal = True
         result.observations["seal"] = {
             "dead_epoch": dead_epoch, "seal_txn_id": seal_id, "key": seal_key,
             "body": seal_body.decode(errors="replace")[:400]}
