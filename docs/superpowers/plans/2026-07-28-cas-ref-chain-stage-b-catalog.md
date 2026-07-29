@@ -58,13 +58,23 @@ destruction still suppressed does not exercise Stage B's claims.
 ### Task 0: Stage-A gate preflight {#task-0}
 
 - [ ] **Step 1:** `grep -n "STAGE A: PASS" docs/superpowers/cas/2026-07-28-stage-a-RESULTS.md`
-  (NOTE 2026-07-29: a THIRD verdict value exists — `STAGE A: PENDING (T15 re-validation)`,
-  controller-ruled during the gate task. The grep above correctly BLOCKS on it — PENDING is
-  not PASS — but the failure is intentional, not confusing: it means the Task 15 re-validation
-  soak has not yet turned the line to PASS. Do not proceed, do not treat as FAIL.)
-  — exactly one match, else BLOCKED.
+  (NOTE 2026-07-29 evening: the verdict flipped to PASS at commit `3f7b35c7ce1`; the earlier
+  PENDING note is history. The grep now matches — on the bare verdict line and in the header
+  prose. "Exactly one match" is amended to: the BARE line `STAGE A: PASS` exists — use
+  `grep -nx "STAGE A: PASS"` for the exact-line form.) — else BLOCKED.
 - [ ] **Step 2:** Re-run the CA gtest gate filter (Stage A Task 0's exact command); record
-  baseline counts in the report. No commit.
+  baseline counts in the report. Baselines at Stage A's final head `25ce1d3531a`:
+  release 1564/243 suites, ASan 1568/256 suites (RESULTS `{#final-head-gates}` addendum).
+  No commit.
+- [ ] **Step 3 (carried from the Stage A final review, rec 5):** verify the two capstone
+  tests are still RED-WHEN-FIXED sentinels and the residual they guard is still open:
+  `gtest_cas_list_liar_end_to_end.cpp` carries two tests (regions `:511`, `:561`) DELIBERATELY
+  written to go red when the `recoverRefTable` LIST residual dies, with the fix instruction in
+  the failure message; the residual itself is `[RECOVER-REF-TABLE-LIST-RESIDUAL]` in
+  `docs/superpowers/cas/BACKLOG.md` and is a 7b PRECONDITION. If those tests have gone red,
+  the residual was fixed — update the BACKLOG entry and adapt the tests per their own failure
+  text BEFORE any Stage B task touches recovery. This coupling is deliberate: the flip must
+  refuse until the residual dies.
 
 ### Task 1: `RefNamespaceId` — dropping the incarnation becomes unrepresentable {#task-1}
 
