@@ -1694,3 +1694,6 @@ via out-param); closing confirmation dispatched. T6 polish round in progress. No
 
 **2026-07-29 03:2x local** — T10 CLEAN (closes on a two-line touch); lane G one hash from
 complete. Grand-merge sequence planned in ledger. T6 polish in progress. No push.
+
+**2026-07-29 03:4x local** — T6 CLOSED (6 commits, three marker-gated gate classes; lane L
+complete through T6). Awaiting g10's two-line hash => lane G complete => GRAND MERGE. No push.
