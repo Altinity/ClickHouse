@@ -1771,3 +1771,6 @@ leg + the aggregate nothing-reclaims paragraph. No push.
 
 **2026-07-29 06:40 local watchdog** — T11 fix round early phase (~10 min in; live processes up —
 likely the tee-captured ca-fsck rerun preparing). No push.
+
+**2026-07-29 07:2x local** — T11 fix round landed (evidence by reproduction script; SQL row
+completeness rule). Closing confirmation dispatched; T12 next. No push.
