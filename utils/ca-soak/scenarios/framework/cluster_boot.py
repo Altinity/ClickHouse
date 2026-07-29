@@ -225,6 +225,19 @@ def check_host_headroom(log_fn=print, *, min_disk_gb=80, min_free_ram_gb=8) -> l
     return concerns
 
 
+def predown_dump(label: str, *, log_fn=print, timeout=600) -> int:
+    """Dump the servers' system tables to `logs/predown/<node>/<label>/` before a teardown.
+
+    See `scripts/predown_dump.sh` for what it captures and why. BEST-EFFORT: the return code is logged
+    and returned but never raised on, because a teardown must not be blocked by a cluster that is
+    already down — the script itself distinguishes a failed query from a legitimately empty answer."""
+    script = str((CA_SOAK_DIR / "scripts" / "predown_dump.sh").resolve())
+    rc = _run([script, label], timeout=timeout, log_fn=log_fn)
+    if rc != 0:
+        log_fn(f"predown_dump: exit {rc} (best-effort; see logs/predown/*/{label}/manifest.txt)")
+    return rc
+
+
 def reset_cluster(variant=None, *, archive_tag=None, log_fn=print, timeout_s=300, overrides=None) -> bool:
     """Hard reset to a fresh pool: down -v (current + variant), then up -d the chosen variant, then
     wait for ALL replicas healthy. Returns True iff healthy after bring-up. The 10-replica variant
@@ -239,6 +252,12 @@ def reset_cluster(variant=None, *, archive_tag=None, log_fn=print, timeout_s=300
     boot_timeout = max(timeout_s, 90 + 45 * n)
     if archive_tag:
         archive_server_logs(archive_tag, node_count=n, log_fn=log_fn)
+    # EVERY system table dies with the containers: the compose has no volume for /var/lib/clickhouse,
+    # only the binary, the configs and ./logs/chN are mounted. A GC performance audit lost its entire
+    # queryable specimen to exactly this on 2026-07-29 — the pool was gone before a single query ran.
+    # So dump the specimen BEFORE `down`. Best-effort by design: a cluster that is already gone, or
+    # never came up, must not stop a reset.
+    predown_dump(archive_tag or "reset", log_fn=log_fn)
     # Tear down regardless of which variant is currently up (same project/containers). Pass the
     # tenreplicas file too so ch3..ch10 (defined only there) are torn down when switching away.
     _run(compose_cmd("tenreplicas", "down", "-v", "--remove-orphans"), timeout=boot_timeout, log_fn=log_fn)

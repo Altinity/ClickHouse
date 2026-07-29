@@ -1766,6 +1766,13 @@ def run_phase3(args):
         log(line)
     for line in phase_coverage.report_lines():
         log(line)
+    # The system tables die with the containers (the compose mounts no /var/lib/clickhouse volume), so
+    # ANY teardown of this cluster must be preceded by `scripts/predown_dump.sh <label>` — the scenario
+    # framework calls it automatically from `reset_cluster`, but a soak is torn down by hand and the
+    # reminder belongs where the operator is looking when the run ends. A GC audit lost its whole
+    # specimen to this on 2026-07-29.
+    log("PHASE 3 finished — run `utils/ca-soak/scripts/predown_dump.sh <label>` BEFORE `docker compose "
+        "down`; the system tables do not survive the containers")
     print("PHASE3 OK")
     return 0
 
