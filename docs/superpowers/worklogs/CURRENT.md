@@ -1981,3 +1981,6 @@ test-window bug (capability probe's _probe/ deletes) fixed test-only + the aphor
 keeping: "a red proves the assertion FIRES, not that it measures the right thing". Slot
 closed; a14 scenarios GO; a16 next; then reviews -> merge -> main rebuild -> re-validation
 soak on the PATCHED binary.
+**2026-07-29 14:00 local** — watchdog: a14 got scenarios-GO ~5 min ago; cluster up (4
+containers), no new scenario markers yet (edits finalizing / boot). a15 parked green; a16
+parked awaiting slot. Load 2.2. Nothing wedged.
