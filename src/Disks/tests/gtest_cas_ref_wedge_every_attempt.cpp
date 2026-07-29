@@ -3,6 +3,7 @@
 #include "config.h"
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
@@ -17,6 +18,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -51,6 +53,8 @@ namespace ProfileEvents
 extern const Event CasRefWedgeFloorReconciled;
 extern const Event CasRefAppendSealRejected;
 extern const Event CasRefAppendOccupantUnreadable;
+extern const Event CasRefAppendWedged;
+extern const Event CasRefAppendDefiniteFailure;
 }
 
 namespace DB::ErrorCodes
@@ -88,6 +92,22 @@ CasRequestBudget singleAttemptBudget()
     return budget;
 }
 
+/// TWO attempts of one logical operation, with the inter-attempt backoff disabled. Everything about the
+/// call-level verdict rule lives BETWEEN two attempts of a single call, so it cannot be reached with the
+/// one-attempt budget the tests above use; the backoff is switched off because the schedule is
+/// `gtest_cas_request_control.cpp`'s subject and a real sleep here would only slow the suite.
+///
+/// `[[maybe_unused]]`: both of its callers need a real S3-classified rejection to script their second
+/// attempt, so they compile away entirely in a build without S3.
+[[maybe_unused]] CasRequestBudget twoAttemptBudget()
+{
+    CasRequestBudget budget = singleAttemptBudget();
+    budget.max_attempts = 2;
+    budget.retry_initial_backoff_ms = 0;
+    budget.retry_max_backoff_ms = 0;
+    return budget;
+}
+
 PartWriteTxnPtr startBuildFor(const PoolPtr & s, const RootNamespace & ns, const String & ref)
 {
     PartWriteInfo info;
@@ -122,6 +142,14 @@ public:
     /// for the S3 `DefiniteFailure` shape, which needs `USE_AWS_S3`; both are "proven never applied".
     String definite_substr;
     int definite_count = 0;
+
+    /// One-shot WHITELISTED SYNCHRONOUS REJECTION: the ONLY shape `classifyConditionalWriteResult`
+    /// answers `DefiniteFailure` for, and therefore the only way to drive the append lane's definite
+    /// arm. Distinct from `definite_substr` above on purpose -- that one is a deterministic LOCAL
+    /// failure, which `slotOccupy` rethrows but `putIfAbsentControlled` (no such special case) merely
+    /// classifies Unresolved, so it cannot script this arm at all.
+    String s3_definite_substr;
+    int s3_definite_count = 0;
 
     /// A SUCCESSOR lands `conflict_bytes` at the key and only then is our response lost, so the
     /// controller's resolve-before-reissue reads a different object and proves the conflict. This is how
@@ -196,6 +224,19 @@ public:
         {
             --definite_count;
             throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "WedgeTestBackend: scripted deterministic local failure");
+        }
+        /// AFTER the ambiguity seam, so arming both scripts one call's attempts in order: the first
+        /// attempt goes ambiguous, the reissue is definitively refused.
+        if (s3_definite_count > 0 && !s3_definite_substr.empty() && key.find(s3_definite_substr) != String::npos)
+        {
+            --s3_definite_count;
+#if USE_AWS_S3
+            throw DB::S3Exception("WedgeTestBackend: simulated malformed request",
+                                  Aws::S3::S3Errors::UNKNOWN, "MalformedXML");
+#else
+            throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
+                "WedgeTestBackend: DefiniteFailure requires S3 error classification (USE_AWS_S3 off)");
+#endif
         }
         if (conflict_count > 0 && !conflict_substr.empty() && key.find(conflict_substr) != String::npos)
         {
@@ -394,6 +435,104 @@ TEST(CasRefWedgeEveryAttempt, DefiniteRefusalOfARetryAttemptKeepsTheLaneWedged)
     EXPECT_NO_THROW(store->dropRef(ns, "y"));
     EXPECT_EQ(store->layout().parseRefObjectKey(store->layout().refLogKey(ns, wedged_id))->txn_id, wedged_id);
     EXPECT_FALSE(store->refLaneWedgedForTest(ns)) << "the create-based resolution still settles it afterwards";
+}
+
+/// The SAME rule one level down, and the level where it was actually broken. The test above splits the
+/// two attempts across two CALLS, which the wedge already handles. Inside ONE call the controller used
+/// to report the LAST attempt's outcome: an ambiguous attempt followed by a definitively refused reissue
+/// came back `DefiniteFailure` -- the verdict that means "the key is provably unwritten". It is not. The
+/// refusal proves only that the SECOND request never applied; the first may still be in flight and may
+/// still land, and `unresolvedProvesNothingWasSent` is false for exactly that reason. So the CALL is
+/// unresolved, and a definite verdict is only ever the whole call's.
+///
+/// The new reason lands on the fail-close side of the predicate the ledger acts on. Asserted at compile
+/// time, beside the behaviour, because a member added to the enum without classifying it is precisely
+/// how the wedge would silently stop happening.
+static_assert(!unresolvedProvesNothingWasSent(CasUnresolvedReason::DefiniteFailureAfterAmbiguity));
+
+TEST(CasRefWedgeEveryAttempt, ADefiniteRefusalCannotSpeakForAnEarlierAmbiguousAttemptOfTheSameCall)
+{
+#if !USE_AWS_S3
+    GTEST_SKIP() << "DefiniteFailure classification requires S3 error types (USE_AWS_S3 off)";
+#else
+    auto backend = std::make_shared<WedgeTestBackend>();
+    CasRequestController controller(backend, twoAttemptBudget());
+    const std::function<bool()> fence_ok = [] { return true; };
+
+    /// One call, two attempts: ambiguous, then definitively refused.
+    backend->ambiguous_substr = "key/";
+    backend->ambiguous_count = 1;
+    backend->s3_definite_substr = "key/";
+    backend->s3_definite_count = 1;
+
+    CasUnresolvedReason reason = CasUnresolvedReason::NotUnresolved;
+    const CasWriteOutcome outcome =
+        controller.putIfAbsentControlled("key/haunted", "bytes", fence_ok, /*out_token=*/nullptr, &reason);
+
+    EXPECT_EQ(outcome, CasWriteOutcome::Unresolved)
+        << "a definite refusal of the SECOND attempt cannot retire the first attempt's ambiguity";
+    EXPECT_EQ(reason, CasUnresolvedReason::DefiniteFailureAfterAmbiguity);
+    EXPECT_FALSE(unresolvedProvesNothingWasSent(reason))
+        << "the caller must keep protecting itself: an earlier attempt was sent and may yet land";
+    EXPECT_FALSE(backend->get("key/haunted").has_value())
+        << "and the key is still empty -- which is exactly why an absent read settles nothing";
+
+    /// THE CONTROL. Aggregation must not soften a definite refusal that speaks for the whole call: with
+    /// no ambiguous predecessor, the first attempt's whitelisted rejection is still `DefiniteFailure`,
+    /// and the ledger may still free the id on it.
+    backend->s3_definite_count = 1;
+    CasUnresolvedReason clean_reason = CasUnresolvedReason::NotUnresolved;
+    EXPECT_EQ(controller.putIfAbsentControlled("key/clean", "bytes", fence_ok, /*out_token=*/nullptr, &clean_reason),
+              CasWriteOutcome::DefiniteFailure);
+    EXPECT_EQ(clean_reason, CasUnresolvedReason::NotUnresolved);
+#endif
+}
+
+/// The ledger-side twin of the same call: what the append lane does with that verdict. On
+/// `DefiniteFailure` it clears the apply-pending marker and tells its callers the txn id was never used,
+/// so the next append re-derives that id -- which, with an earlier attempt still possibly in flight, is
+/// how an acked-then-lost transaction gets written around. The lane must wedge instead and stay pending
+/// until the key itself resolves.
+TEST(CasRefWedgeEveryAttempt, ADefiniteRefusalAfterAnAmbiguousAttemptOfTheSameCallStillWedgesTheLane)
+{
+#if !USE_AWS_S3
+    GTEST_SKIP() << "DefiniteFailure classification requires S3 error types (USE_AWS_S3 off)";
+#else
+    auto backend = std::make_shared<WedgeTestBackend>();
+    auto store = openPool(backend, twoAttemptBudget());
+    const RootNamespace ns{"srv1/wedge_one_call_ambiguous_then_definite"};
+    publishEmptyPart(store, ns, "x");
+    publishEmptyPart(store, ns, "y");
+
+    backend->ambiguous_substr = logPrefix(store, ns);
+    backend->ambiguous_count = 1;
+    backend->s3_definite_substr = logPrefix(store, ns);
+    backend->s3_definite_count = 1;
+
+    const uint64_t wedged_before = ProfileEvents::global_counters[ProfileEvents::CasRefAppendWedged].load();
+    const uint64_t definite_before = ProfileEvents::global_counters[ProfileEvents::CasRefAppendDefiniteFailure].load();
+
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
+
+    EXPECT_TRUE(store->refLaneWedgedForTest(ns))
+        << "one call whose first attempt is unresolved leaves an object that may become durable";
+    EXPECT_EQ(store->applyStateForTest(ns), RefApplyState::ApplyPending)
+        << "the id must NOT be declared never-used: the marker stands until the key itself resolves";
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasRefAppendDefiniteFailure].load(), definite_before)
+        << "this append was never definitively rejected -- only one of its attempts was";
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasRefAppendWedged].load(), wedged_before + 1);
+    EXPECT_TRUE(store->resolveRef(ns, "x").has_value()) << "nothing is applied while the lane is wedged";
+    const String wedged_key = store->wedgedKeyForTest(ns);
+    EXPECT_FALSE(backend->get(wedged_key).has_value()) << "and nothing became durable";
+
+    /// And it still recovers by the ordinary route: the next flush's bounded create lands the wedged
+    /// transaction and adopts it, so wedging costs availability only until the next caller arrives.
+    EXPECT_NO_THROW(store->dropRef(ns, "y"));
+    EXPECT_FALSE(store->refLaneWedgedForTest(ns));
+    EXPECT_FALSE(store->resolveRef(ns, "x").has_value()) << "the adopted wedge applied its drop";
+    EXPECT_FALSE(store->resolveRef(ns, "y").has_value());
+    EXPECT_EQ(store->applyStateForTest(ns), RefApplyState::Clean);
+#endif
 }
 
 /// ===================================================================================

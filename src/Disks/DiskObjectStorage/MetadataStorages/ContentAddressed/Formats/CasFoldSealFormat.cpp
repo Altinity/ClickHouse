@@ -5,6 +5,7 @@
 #include <Common/Exception.h>
 #include <IO/ReadBufferFromMemory.h>
 #include <algorithm>
+#include <utility>
 
 namespace DB
 {
@@ -12,6 +13,7 @@ namespace ErrorCodes
 {
     extern const int CORRUPTED_DATA;
     extern const int LIMIT_EXCEEDED;
+    extern const int LOGICAL_ERROR;
 }
 }
 
@@ -59,6 +61,41 @@ HoldReason holdReasonFromWord(std::string_view w)
     if (w == "body_undecodable")         return HoldReason::BodyUndecodable;
     if (w == "manifest_body_missing")    return HoldReason::ManifestBodyMissing;
     throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: unknown hold reason '{}'", w);
+}
+
+/// The classification set is CLOSED. Every consumer of a coverage row branches on exact values — the
+/// sweep's §6 deletion premise refuses a row by testing `== 4` and then `== 0` — so a value outside the
+/// set is not an unknown variant to be tolerated forward: it is a row that passes every refusal written
+/// in terms of the set and reaches the irreversible delete. One predicate, used by both directions, so
+/// the writer's self-check and the reader's fail-close can never name different sets.
+bool isKnownClassification(uint64_t classification)
+{
+    return classification == 0 || classification == 1 || classification == 2 || classification == 4;
+}
+
+/// A hold names a position the fold must resolve, and both components of that id are nonzero (the
+/// canonical `RefTxnId` rule `renderRefTxnId` enforces for every id that becomes a key). A zero
+/// component is not a weaker hold, it is a self-erasing one: no position sorts below `{0, 0}`, so the
+/// carry rule clears it on the first round that folds anything, and the durable evidence that the
+/// namespace ever stopped disappears without a single record having been resolved.
+bool isCanonicalHoldPosition(const RefTxnId & at)
+{
+    return at.writer_epoch != 0 && at.ref_sequence != 0;
+}
+
+/// Insert a decoded record under a key that must appear at most ONCE in the object. Plain
+/// `map[key] = value` is last-wins, and last-wins is not a lossy nicety here: a repeated coverage key
+/// lets a later, clean row overwrite the held one that a whole namespace's retention rests on, which is
+/// exactly how a forged or mis-merged seal would erase the only durable record of an unresolved
+/// position. One record per key, or the object is corrupt.
+template <typename Map, typename Key, typename Value>
+void insertRecordOnce(Map & map, const Key & key, Value && value, std::string_view what)
+{
+    if (!map.emplace(key, std::forward<Value>(value)).second)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS fold seal: a second {} record for '{}' — a key appears at most once, and accepting the "
+            "duplicate would silently overwrite the record already read",
+            what, key);
 }
 
 /// Emit one run record (`k` = "btr") WITHOUT its line terminator; the caller closes (and measures) the
@@ -138,15 +175,35 @@ String encodeFoldSeal(const CasFoldSeal & seal)
     /// coverage (std::map => key-sorted)
     for (const auto & [key, cov] : seal.per_ns_shard)
     {
-        /// THE STRICT GRAMMAR, enforced where the bytes are produced. A classification-4 row whose
-        /// hold was dropped is indistinguishable, once durable, from a namespace that stopped for no
-        /// reason — and a hold on any other classification claims a stop that did not happen. Neither
-        /// is a shape a later reader could repair, so neither is ever written.
+        /// THE STRICT GRAMMAR, enforced where the bytes are produced. Every refusal below is
+        /// `LOGICAL_ERROR`: this row came from our own fold, so an ill-formed one is a bug in this
+        /// process, not corruption arriving from a store — and none of these shapes is repairable once
+        /// durable, so none is ever written.
+        ///
+        /// A classification outside the closed set first, because the two checks after it are stated in
+        /// terms of the set and a row they cannot classify makes their answers meaningless.
+        if (!isKnownClassification(cov.classification))
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "CAS fold seal: coverage '{}' has classification {}, which is not one of the four the "
+                "fold grammar defines (0 absent, 1 unchanged, 2 folded, 4 clamped) — every consumer "
+                "branches on those exact values, so this row would pass refusals meant to stop it",
+                key, cov.classification);
+        /// A classification-4 row whose hold was dropped is indistinguishable, once durable, from a
+        /// namespace that stopped for no reason — and a hold on any other classification claims a stop
+        /// that did not happen.
         if ((cov.classification == 4) != cov.hold.has_value())
-            throw Exception(ErrorCodes::CORRUPTED_DATA,
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
                 "CAS fold seal: coverage '{}' has classification {} and {} hold — the hold fields are "
                 "required for classification 4 and forbidden otherwise",
                 key, cov.classification, cov.hold ? "a" : "no");
+        /// A hold that names no position resolves itself on the next round (nothing sorts below
+        /// `{0, 0}`) and cannot be rendered where the sweep reports why it retained a manifest.
+        if (cov.hold && !isCanonicalHoldPosition(cov.hold->offending_position))
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "CAS fold seal: coverage '{}' is held at {}-{} — a hold's offending position has both "
+                "components nonzero; a zero one would be cleared by the first record the next round "
+                "folds, erasing the only durable evidence that the namespace stopped",
+                key, cov.hold->offending_position.writer_epoch, cov.hold->offending_position.ref_sequence);
 
         bool first = true;
         writeKey(out, "k", first);    writeStringValue(out, "cov");
@@ -275,6 +332,11 @@ CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expect
             TokenType tt{};
             bool have_tt = false;
             ShardCoverage cov;
+            /// Read WIDE and validated before it is narrowed to the persisted byte. `cls` is the field
+            /// every consumer branches on, and a plain `static_cast<uint8_t>` maps 258 onto 2 ("all
+            /// records through the cursor were folded") and 256 onto 0 — a forged or damaged seal would
+            /// buy full coverage with an integer no reader ever sees.
+            std::optional<uint64_t> classification;
             /// The hold fields are read individually so the grammar can be checked on WHICH of them
             /// arrived, not merely on how many. `JsonObjectReader` already rejects a duplicate key, so
             /// a second `hr` can never quietly rewrite the reason.
@@ -286,7 +348,7 @@ CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expect
             while (r.nextKey(key))
             {
                 if (key == "key") map_key = r.readString();
-                else if (key == "cls") cov.classification = static_cast<uint8_t>(r.readU64Number());
+                else if (key == "cls") classification = r.readU64Number();
                 else if (key == "tt") { tt = tokenTypeFromWord(r.readString(), "fold seal"); have_tt = true; }
                 else if (key == "tv") tv = r.readString();
                 else if (key == "lfe") cov.last_folded_ref_id.writer_epoch = r.readU64String();
@@ -302,6 +364,17 @@ CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expect
                 throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: cov missing tt");
             cov.folded_token = Token{tv, tt};
 
+            /// `cls` is required, not defaulted: an absent one would read as 0 ("no round folded this
+            /// namespace"), which is a claim about a fold, not the absence of one.
+            if (!classification)
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: cov '{}' missing cls", map_key);
+            if (!isKnownClassification(*classification))
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "CAS fold seal: coverage '{}' has classification {}, which is not one of the four "
+                    "the fold grammar defines (0 absent, 1 unchanged, 2 folded, 4 clamped)",
+                    map_key, *classification);
+            cov.classification = static_cast<uint8_t>(*classification);   /// in range, so narrowing is exact
+
             /// The same strict grammar the encoder enforces, applied to bytes we did not write. A
             /// PARTIAL hold is corruption, never a hold with defaults: a hold whose offending position
             /// defaulted to `{0,0}` would be cleared by the very first record the next round folds.
@@ -316,6 +389,15 @@ CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expect
                         "CAS fold seal: coverage '{}' is held (classification 4) but its hold is "
                         "incomplete — reason, offending position, retry count and next retry round are "
                         "all required", map_key);
+                /// PRESENT is not enough: the position must be one a fold can actually retry. `{0, 0}`
+                /// (or either component zero) is the shape that quietly deletes the hold — the carry
+                /// rule keeps a hold only while the walk stops BELOW it, and nothing is below zero — and
+                /// it cannot be rendered where the sweep names the position it retained a manifest for.
+                if (!isCanonicalHoldPosition(RefTxnId{*hold_epoch, *hold_sequence}))
+                    throw Exception(ErrorCodes::CORRUPTED_DATA,
+                        "CAS fold seal: coverage '{}' is held at {}-{} — a hold's offending position has "
+                        "both components nonzero; a zero one clears itself on the next round",
+                        map_key, *hold_epoch, *hold_sequence);
                 cov.hold = RefHold{.reason = *hold_reason,
                                    .offending_position = RefTxnId{*hold_epoch, *hold_sequence},
                                    .retry_count = *hold_retry_count,
@@ -326,7 +408,7 @@ CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expect
                     "CAS fold seal: coverage '{}' carries hold fields at classification {} — they are "
                     "forbidden on anything but a held (classification 4) row",
                     map_key, cov.classification);
-            seal.per_ns_shard[map_key] = cov;
+            insertRecordOnce(seal.per_ns_shard, map_key, cov, "coverage");
         }
         else if (kind == "btr")
         {
@@ -353,7 +435,7 @@ CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expect
                 else if (key == "ocr") s.oldest_nonpending_condemn_round = r.readU64String();
                 else throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: unknown cnd key '{}'", key);
             }
-            seal.condemned_summary[shard] = s;
+            insertRecordOnce(seal.condemned_summary, shard, s, "condemned-summary");
         }
         else if (kind == "nsc")
         {
@@ -371,8 +453,18 @@ CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expect
             }
             if (!have_st)
                 throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: nsc missing st");
+            /// Checked before it is rendered, and reported as corruption: `renderRefTxnId` refuses a zero
+            /// component with `LOGICAL_ERROR`, which is an ABORT under a debug or sanitizer build — so an
+            /// omitted or zeroed `rte`/`rts` on the wire would take the process down inside a decode of
+            /// foreign bytes instead of failing this read closed.
+            if (txn.writer_epoch == 0 || txn.ref_sequence == 0)
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "CAS fold seal: ns-cleanup item for '{}' names removal transaction {}-{} — both "
+                    "components of the id are required and nonzero",
+                    ns, txn.writer_epoch, txn.ref_sequence);
             const String map_key = ns + "\n" + renderRefTxnId(txn);   /// mirrors the prior decoder's key
-            seal.ns_cleanup_items[map_key] = RefNsCleanupItem{RootNamespace{ns}, txn, st};
+            insertRecordOnce(seal.ns_cleanup_items, map_key,
+                             RefNsCleanupItem{RootNamespace{ns}, txn, st}, "ns-cleanup");
         }
         else
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: unknown record kind '{}'", kind);
