@@ -1815,3 +1815,6 @@ lanes 2/2+1/1, revert-proof RED 6/8 honestly classified). Controller rulings: br
 data-loss/leak edges were TRANSPOSED (ruled plan typo — mechanics-first arms accepted);
 setListOmissions on HintHoleBackendOn accepted conditional on single-mechanism; emu arm
 un-hooked per brief conditional; HidingListBackend convergence deferred. Review dispatched.
+**2026-07-29 09:01 local** — watchdog: T13 review in flight (reviewer transcript fresh at
+08:58, no verdict file yet); impl-a13 holding. BACKLOG residual item sharpened earlier this
+window (bc110369a9c). Nothing wedged.
