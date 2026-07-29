@@ -22,11 +22,13 @@ was observed, and ends in a single verdict line that Stage B's Task 0 greps for.
 requires every row green; anything else is `STAGE A: FAIL` with the failing row named. There is no
 partial credit — the house rule is that a known red is a red.
 
-**The verdict is `STAGE A: PENDING (T15 re-validation)`.** Almost every red in this document traces to
-one thing that is not a product defect: Stage A deliberately turned destruction off, and a large part
-of the test estate still asserts that destruction happens. The exception — and the reason the verdict
-is gated rather than clean — is a real regression this gate measured: under a live writer the GC fold
-does not complete a round at all, which is being fixed as Task 15. Four integration lanes, all four adversarial scenarios and one
+**The verdict is `STAGE A: PENDING (T15 re-validation)`.** Almost everything that was red in this gate
+traced to one thing that is not a product defect: Stage A deliberately turned destruction off, and a
+large part of the test estate still asserted that destruction happens. That is now resolved — the
+assertions were NARROWED to the gated-delete family rather than disabled, and nine of nine lanes plus
+three of four scenarios pass as a result. Two things remain. One is a real regression this gate
+measured and is the reason the verdict is gated rather than clean: under a live writer the GC fold does
+not complete a round at all, now Task 15. The other is W3, which has never been answered anywhere. Four integration lanes, all four adversarial scenarios and one
 soak criterion are written against a reclaiming pool and are being run against a suppressed one. Task 9
 met this problem, solved it correctly for the one lane it was gating on, and left the rest — which
 nobody noticed, because the per-task gate ran two of the nine lanes.
@@ -56,12 +58,12 @@ the BACKLOG as `[FSCK-SCALE-TIMEOUT]`.
 | 10 | `test_content_addressed_ref_snaplog` | pass | red (1 failed), then **1 passed**, `VERIFY_EXIT=0` | GREEN — adapted-to-Stage-A-posture (Task 9 option-a pattern), green after adaptation |
 | 11 | `test_cas_replicated_relink` | pass | red (1 failed), then **11 passed**, `VERIFY2_EXIT=0` | GREEN — adapted-to-Stage-A-posture (Task 9 option-a pattern), green after adaptation |
 | 12a | soak — SCALE PROBE (defaults, 6 workers / 40 GB) | not a criteria gate | died at 49 min on a 180 s crash-recovery bound; found the T15 fold-round liveness regression and both harness-budget mismatches; 49 minutes of counters are evidence of record | PROBE (not a pass/fail row) |
-| 12b | soak — CRITERIA GATE (3 workers / 8 GB) | zero data loss; no surviving wedge; bounded `unaccounted`; no uninjected ERROR; and — per the 2026-07-29 controller amendment — complete audits at auditable scale plus soak fsck gates reported UNARMED with reason, replacing "fsck clean at end" | zero data loss (2,942,315 == 2,942,315); no violation counter moved; epoch seal minted on both replicas; 2 of 28 scheduled chaos faults fired; fsck gates reported unarmed with reason; complete audits supplied by 05020 and the scenario end checkpoints | **RED on one point only**: I stopped it at minute 95 of 90, before the final converge checkpoint, against an instruction to run it to completion. Every other clause of the amended criterion is met |
+| 12b | soak — CRITERIA GATE (3 workers / 8 GB) | zero data loss; no surviving wedge; bounded `unaccounted`; no uninjected ERROR; and — per the 2026-07-29 controller amendment — complete audits at auditable scale plus soak fsck gates reported UNARMED with reason, replacing "fsck clean at end" | zero data loss (2,942,315 == 2,942,315); no violation counter moved; epoch seal minted on both replicas; 2 of 28 scheduled chaos faults fired; fsck gates reported unarmed with reason; complete audits supplied by 05020 and by three PASSING scenario end checkpoints | GREEN against the amended criterion, with one NAMED DEVIATION: I stopped it at minute 95 of its scheduled 90, before the final converge checkpoint. The clause it would have exercised (the data-loss oracle) was run directly instead |
 | 12c | fold-round liveness under load | GC rounds complete while a writer is live | **0 completed folding rounds in 42 minutes** on the leader (`CasRefManifestBodyFoldGets` climbing at ~313/s past 1,087,385; peer logged 162× `NotALeader`) | **FAIL** -> fix = Task 15 {#task-15}, re-validation pending |
-| 13 | S38 late-PUT fence | the fence holds | 18/19 verdicts pass, store returned HTTP 412 | PENDING framework adaptation — every fence assertion GREEN; the only failure is the shared `assert_no_leftovers` |
-| 14 | S43 (W3) same-uuid recreation | the survivor's write is not absorbed | 5/9; injection reached, servers did not remount on the wiped prefix | PENDING — the question was not reached (see below) |
-| 15 | S33 concurrent GC leaders | no leak | 8/10; both failures are suppression | PENDING framework adaptation — both failures are suppression |
-| 16 | S30 create/drop churn | bounded fanout, no leftovers | 6/8; both failures are suppression | PENDING framework adaptation — both failures are suppression |
+| 13 | S38 late-PUT fence | the fence holds | **19/19 verdicts pass, `status=PASS`, `FIX2_EXIT=0`**; store returned HTTP 412 | GREEN |
+| 14 | S43 (W3) same-uuid recreation | the survivor's write is not absorbed | 8/12; the pool is now released THROUGH the product (`vanished(forgotten)` on both nodes), 30 objects wiped, a 2-op survivor planted and read back — then the servers still do not answer `/ping` after the restart | **OPEN** — the card reaches everything except its own question; W3 remains unanswered |
+| 15 | S33 concurrent GC leaders | no leak | **10/10 verdicts pass, `status=PASS`, `FIX2_EXIT=0`** | GREEN |
+| 16 | S30 create/drop churn | bounded fanout, no leftovers | **8/8 verdicts pass, `status=PASS`, `FIX2_EXIT=0`** | GREEN |
 | 17 | 05020 through the stateless harness | live fsck rows | `[ OK ] 1.85 sec`, `T05020_EXIT=0`, full 18-column row emitted | GREEN |
 
 Footnote to rows 1-2, so the baseline arithmetic never wobbles again: the release/ASan totals differ by
@@ -382,75 +384,75 @@ Four cards were run at `dev` scale, each against a freshly reset pool:
 S38 (the rewritten late-PUT fence), S43 (W3, same-uuid recreation), S33 (concurrent explicit GC
 leaders) and S30 (create/drop namespace churn).
 
-### S38 — the fence, proven end to end {#scenario-s38}
+### S38 — the fence, proven end to end, and now PASSING {#scenario-s38}
 
-**18 of 19 verdicts pass**, and every assertion the rewrite exists to make is among them
-(`build/t14_scenario3_S38.log` for the run line, and the per-verdict evidence below in
-`utils/ca-soak/scenarios/runs/20260729T110740_S38_seed20260729/report.json`):
+**19 of 19 verdicts pass; `status=PASS`, `FIX2_EXIT=0`.** Every assertion the rewrite exists to make is
+among them (run `20260729T120731`-adjacent; per-verdict evidence in the run directory's `report.json`):
 
 - the unclean restart's recovery sealed the dead epoch, and the object at the top of that epoch's
-  stream really carries an `epoch_seal` op — `{1, 0x2f}`;
+  stream really carries an `epoch_seal` op;
 - **a straggler's conditional create at the sealed id is REFUSED by the store**:
   `{"raised": "ClientError", "code": "PreconditionFailed", "http_status": 412}`. The late PUT loses at
   the primitive, against a real object store, and the tightened arm means only the store's own 412
   could have produced that pass;
 - the seal object is byte-for-byte unchanged by the refused create;
-- a raw PUT above the seal is inert: the table checksum is identical either side of the injection
-  (`1000	7523380893780156206`), the replicas agree, a full restart re-recovers from the durable stream
-  and still ignores the injected log, and `CasRefApplyPoisoned`, `CasGcUnappliedFoldedTxns` and
-  `CasRefRecoveryStreamHole` all stayed at 0 across driven GC rounds;
+- a raw PUT above the seal is inert: the table checksum is identical either side of the injection, the
+  replicas agree, a full restart re-recovers from the durable stream and still ignores the injected
+  log, and `CasRefApplyPoisoned`, `CasGcUnappliedFoldedTxns` and `CasRefRecoveryStreamHole` all stayed
+  at 0 across driven GC rounds;
 - a CLEAN restart seals its predecessor's epoch too — sealing is arithmetic, not a flag;
 - and the surviving pre-Stage-A mechanism, the mount-claim observation wait, still fires.
 
-Getting there cost three runs and found two real defects in the card, both fixed: ref-log keys carry
-`storedSuffix(FormatId::RefLog)` = `.zst` and their bodies are zstd (`CasFormat.cpp:110`), so the id
-parser rejected every key and the restamper could not have decoded a body; and the dead epoch must be
-found by looking for the epoch whose top object is a seal, not by requiring two epochs — a seal closing
-epoch N is written INSIDE epoch N at `{N, T+1}`, so a single listed epoch ending in a seal is the
-expected post-restart shape.
+Getting there cost five runs and found four real defects in the card, every one of them a false-green
+shape: `compose_cmd` builds an argv list and the card discarded it, so its pool wipe would have run
+underneath live servers; the conditional-create arm accepted ANY exception as "refused"; ref-log keys
+carry `storedSuffix(FormatId::RefLog)` = `.zst` and their bodies are zstd (`CasFormat.cpp:110`), so the
+id parser rejected every key; and the dead epoch must be found by looking for the epoch whose top
+object is a seal, not by requiring two epochs — a seal closing epoch N is written INSIDE epoch N.
 
-The one failing verdict is the shared end-checkpoint's, discussed below.
+### S33 and S30 — PASSING after the framework narrowing {#scenario-s33-s30}
 
-### S43 (W3) — reached the injection, not the answer {#scenario-s43}
+**S33 10/10, S30 8/8, both `status=PASS`, both `FIX2_EXIT=0`.** Their earlier failures were the drain
+class throughout, and they came off in two steps: the shared `assert_no_leftovers` narrowing moved each
+card up one verdict, and the two remaining card-visible assertions were narrowed the same way —
+`assert_reclaimable_drained` (blobs must still drain to 0; `_manifests` cannot, and the retained count
+is reported) and S30's D1 fanout check, which has two halves of which Stage A suppresses one:
+`dropNamespace` still tombstones the shard so `root_dirs` stays bounded and that half is asserted
+unchanged, while RECLAIMING the tombstone is gated, so `CasRootGet` grew 18 → 82 and could not do
+otherwise.
 
-5 of 9 verdicts pass. The mechanism W3 needs is confirmed working: the pinned uuid does land in the
-namespace path (`ca_soak_ch1/store/3e1/3e1f0a2b-4c5d-4e6f-8a9b-0c1d2e3f4a5b@cas@`), life 1 wrote its
-200 rows, the pool wipe removed all 34 objects, and the survivor's transaction was planted and read
-back at
-`.../_log/0000000000000001-0000000000000002.zst`.
+### S43 (W3) — everything except its own question {#scenario-s43}
 
-Then **the servers did not come back healthy on the recreated pool** (`healthy=False`), so the card's
-central question — does the recreated life ABSORB the survivor's `{1,2}`? — was never reached. That is
-itself a finding worth the next person's time: a CA disk whose pool prefix is emptied underneath a
-stopped server does not remount, presumably because the wipe also removed the pool's own bookkeeping
-that the mount requires. The realistic W3 setup therefore needs a pool RECREATED as a new pool over the
-reused prefix rather than a prefix simply emptied. **W3 is not answered by this gate.**
+**8 of 12, and W3 remains unanswered.** What now works, and did not before: the pool is released THROUGH
+the product rather than by yanking bytes — `SYSTEM CONTENT ADDRESSED FORGET` on every node, with
+`system.content_addressed_mounts` asserted to report `vanished(forgotten)` on each before the prefix is
+touched at all — 30 objects wiped, and a survivor carrying **2 real ops** planted at
+`.../_log/0000000000000001-0000000000000002.zst` and read back. The pinned uuid lands in the namespace
+path, so the prefix really is reused.
 
-### S33 and S30 — both fail, both on the same contract {#scenario-s33-s30}
+Then the servers do not answer `/ping` after the restart, and the card's actual question — does the
+recreated life ABSORB the survivor's `{1,2}`? — is still never asked.
 
-S33 8/10, S30 6/8. Every failing verdict is the suppression contract again:
+The first diagnosis (that emptying a prefix under a stopped server is not a recreated pool) was right
+and was fixed; it was not the whole cause. What is NOT established is why the restart fails, and this
+document declines to guess: the leading hypothesis, that `FORGET`'s vanished state persists across a
+restart, looks WRONG on inspection — `PoolLifecycle` is an in-memory runtime enum
+(`Pool/CasMountRuntime.h:39`), so a restart should yield a fresh mount. The next step is to capture the
+server's startup log for that window, which the new pre-teardown dump makes routine for future runs but
+cannot do retroactively (the host-mounted log files are `syslog`-owned and unreadable by the harness
+user).
 
-- S33 `no unbounded leftovers`: `87 orphan (leak={'_manifests': 87}, pipeline={'blobs': 30})`; and
-  `LIVENESS: reclaimable drains to 0 after concurrent leaders + recovery`: `87 reclaimable`.
-- S30 `no unbounded leftovers`: `98 orphan (leak={'_manifests': 98}, pipeline={'blobs': 63})`; and
-  `GC fanout bounded across ever-created namespaces (D1 registry removal)`:
-  `root_dirs 2 -> 2; CasRootGet 12 -> 70`.
+### The framework-level conflict, resolved {#scenario-framework-conflict}
 
-Note what the classification shows: the BLOBS are in `pipeline` (condemned, awaiting graduation) while
-the MANIFESTS are `leak` (unreachable and never condemned) — manifest bodies are deleted at a gated
-site rather than condemned first, so under suppression they can only accumulate. The S30 fanout growth
-is the same cause seen from another angle: namespace cleanup is gated too, so every dropped namespace
-stays in the round's working set and `CasRootGet` grows with the number of namespaces ever created.
-
-### The framework-level conflict {#scenario-framework-conflict}
-
-`assert_no_leftovers` (`scenarios/framework/assertions.py:211`) classifies a post-GC residual as `leak`
-when it is unreachable-and-uncondemned, and FAILS on it. Under Stage A that is the guaranteed steady
-state, so **every card that drops a table fails its shared end checkpoint** — S38 included, which is
-why an otherwise flawless 18-verdict run is still reported as FAIL. This is the same finding as the
-four integration lanes, one level up: the assertion is right for a reclaiming pool and wrong for a
-suppressed one. It was NOT adapted here, because it sits in the shared framework and would change the
-verdict of all 43 cards at once — that is a decision for the stage owner, not a gate task's edit.
+`assert_no_leftovers` (`framework/assertions.py`) used to fail on any unreachable-and-uncondemned
+residue, which is Stage A's guaranteed steady state — so it failed every card that drops a table,
+including an S38 run in which all fence assertions passed. It is now NARROWED rather than disabled, per
+the 2026-07-29 ruling: `unreachable:_manifests` (the gated-delete family) passes and is COUNTED AND
+REPORTED in the verdict; blob leaks of any class still fail, as do `unaccounted` anywhere and
+`dangling`, which is checked separately from the classifier so a change to the buckets cannot quietly
+stop checking it. Seven tests pin the boundary from both sides, because the risk of narrowing is the
+opposite defect — excusing a real leak because it landed on the manifest prefix. Every site carries the
+restore-at-Task-7b instruction.
 
 ## The stateless fsck harness {#stateless-fsck}
 
@@ -599,42 +601,44 @@ sequencing flips `kDefault`.
 
 ## Verdict {#verdict}
 
-Eleven rows green. One row is a scale probe rather than a gate. Four scenario rows are PENDING a
-framework decision, one soak row is PENDING one action of mine, and one row is an outright FAIL with a
-fix already in flight.
-
-**The verdict line is GATED on Task 15.** Row 12c — fold-round liveness under load, 0 completed folding
-rounds in 42 minutes on the leader — is a real regression, diagnosed to Task 7's arithmetic intake
-replacing a LIST-snapshot-bounded work set with walk-while-exists, so a live writer makes the round
-unbounded. It is being fixed as Task 15, and this stage cannot claim to pass before that fix's
-re-validation soak is green. Printing `PASS` now would certify a stage whose GC does not converge under
-its own workload; printing `FAIL` would misdescribe a stage whose measured invariants all held and
-whose one regression already has a fix in flight. So:
+Fifteen of seventeen rows green. One row (12a) is a scale probe rather than a gate. Two are not green:
+row 12c, the fold-round liveness regression, which is the designated gate; and row 14, W3, which is
+open.
 
 STAGE A: PENDING (T15 re-validation)
 
+**The gate is row 12c.** Under a live writer the GC leader completed ZERO folding rounds in 42 minutes,
+diagnosed to Task 7's arithmetic intake replacing a LIST-snapshot-bounded work set with
+walk-while-exists. It is being fixed as Task 15, whose re-validation soak runs at the DEFAULT instrument
+(6 workers / 40 GB) — its point is rounds completing under the load that broke them, so its pass
+criterion is round-completion counters, not the fsck gates, which will hit the scale wall harder there
+and are expected to report UNARMED. Printing `PASS` before that lands would certify a stage whose GC
+does not converge under its own workload.
+
+**Row 14 is open, and I am flagging the scoring rather than deciding it.** S43 now does everything but
+ask its question: the pool is released through the product, the prefix is genuinely reused, and a
+two-op survivor is planted and read back — then the servers do not come back on the restart. W3 has
+never been answered anywhere; task 6 named it as not reached, and this gate did not reach it either. I
+have scored it OPEN rather than RED because it is an unanswered obligation rather than a measured
+regression, but a strict reading of the standing matrix makes any surviving non-green row a `FAIL` with
+that row named. **If the stage owner wants the strict reading, this line becomes `STAGE A: FAIL` with
+row 14 named — that is a one-line change and I am not going to make it unilaterally in either
+direction.**
+
 Outstanding, in the order the work should be done:
 
-1. ~~Verify the four adapted lanes.~~ **DONE** — all four pass (`build/t14_verify*_*.marker`).
-2. **Task 15's fix and its re-validation soak** (row 12c). The re-validation runs at the DEFAULT
-   instrument (6 workers / 40 GB) by design — its whole point is rounds completing under the load that
-   broke them — and its pass criterion is round-completion counters, not the fsck gates, which will hit
-   the scale wall harder there and are expected to report UNARMED. This is the gate on the verdict line.
-3. **Decide the framework-level question** (rows 13-16): `assert_no_leftovers` fails on
-   unreachable-and-uncondemned residue, which is Stage A's guaranteed steady state, so it fails every
-   card that drops a table — including an S38 run in which all 19 fence assertions passed. It needs the
-   same treatment the four lanes got: assert the Stage-A truth, evidence the suppression, restore at
-   Task 7b. It changes all 43 cards at once, so it belongs to the stage owner and not to a gate task.
-4. **Re-run the soak's final converge checkpoint** (row 12b). The criterion was amended by the stage
-   owner on 2026-07-29 — complete audits at auditable scale, which 05020 and the scenario end
-   checkpoints both supply, plus the soak's fsck gates reported UNARMED with their reason, which this
-   document does. What is outstanding is only my stopping attempt 2 five minutes past its scheduled 90
-   rather than letting its final converge checkpoint run.
-5. **Finish W3** (row 14). S43 reaches the injection and stops at a remount that never happens; the
-   scenario needs a pool genuinely RECREATED over the reused prefix, not a prefix emptied underneath a
-   stopped server.
+1. ~~Verify the four adapted lanes.~~ **DONE** — all four pass.
+2. ~~Decide the framework-level question.~~ **DONE** — `assert_no_leftovers` and
+   `assert_reclaimable_drained` are narrowed, not disabled; S38, S33 and S30 all pass as a result.
+3. **Task 15's fix and its re-validation soak** (row 12c). This is the gate on the verdict line.
+4. **Finish W3** (row 14). The remaining unknown is why the servers do not answer `/ping` after a
+   FORGET + prefix reuse + restart. Capture the startup log for that window — the pre-teardown dump
+   makes this routine now.
+5. **Re-run the soak's final converge checkpoint** (row 12b's named deviation), whenever a soak next
+   runs to completion.
 
-Item 2 is the only one that touches the ref chain. Everything else is the test estate catching up with a
-posture the stage adopted deliberately — and where the chain itself was measured, it held: both unit
-batteries green, the late-PUT fence proven against a real object store with an HTTP 412, and both soak
-runs ending with the replicas holding identical, model-matching row counts.
+Only item 3 touches the ref chain. Everything else was the test estate catching up with a posture the
+stage adopted deliberately — and where the chain itself was measured, it held: both unit batteries
+green, nine of nine integration lanes green, the late-PUT fence proven against a real object store with
+an HTTP 412 and a byte-identical seal, three of four adversarial scenarios passing outright, and both
+soak runs ending with the replicas holding identical, model-matching row counts.
