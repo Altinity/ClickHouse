@@ -1533,7 +1533,9 @@ def run_phase3(args):
         checkpoint_ts = int(time.time())
         ticker.tick_once(checkpoint_ts, fsck=f)
         # The two signal families the driver could not see before 2026-07-26. Both are read here
-        # fail-closed (the cluster is quiesced and health-gated) and reported, not gated.
+        # fail-closed (the cluster is quiesced and health-gated) and reported. One family inside them
+        # is also GATED: the late-PUT-loses violation counters fail the checkpoint (see
+        # `capture_checkpoint_signals`), because their benign rate is zero by construction.
         capture_checkpoint_signals(cluster, label, tracker=signal_tracker, fencing=fencing)
         capture_phase_summary(cluster, label, since_ts=phase_window_start["ts"],
                               coverage=phase_coverage, conn=conn, ts=checkpoint_ts)

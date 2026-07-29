@@ -166,7 +166,9 @@ class S43(Scenario):
         # =====================================================================================
         cl.node1.command(f"DROP TABLE {_TABLE} SYNC")
         ctx.log("S43: table dropped (quiesce — the defence this card is about to remove)")
-        cluster_boot.compose_cmd(self.compose_variant, "stop", "ch1", "ch2")
+        stop_rc = cluster_boot.compose_run(self.compose_variant, "stop", "ch1", "ch2",
+                                          log_fn=ctx.log)
+        result.observations["compose_stop_rc"] = stop_rc
         time.sleep(3)
         wiped = _wipe_pool(s3, ctx.log)
         result.observations["pool_wipe"] = {"objects_deleted": wiped}
@@ -185,7 +187,9 @@ class S43(Scenario):
             "a GET of the injected id returns the injected body",
             f"{len(planted)} bytes", planted == survivor_body, ""))
 
-        cluster_boot.compose_cmd(self.compose_variant, "start", "ch1", "ch2")
+        start_rc = cluster_boot.compose_run(self.compose_variant, "start", "ch1", "ch2",
+                                           log_fn=ctx.log)
+        result.observations["compose_start_rc"] = start_rc
         healthy = cluster_boot.wait_healthy(cl, timeout_s=heal_timeout_s, log_fn=ctx.log)
         result.add(Verdict.check(
             "the servers come back on the recreated pool", "healthy within heal_timeout_s",

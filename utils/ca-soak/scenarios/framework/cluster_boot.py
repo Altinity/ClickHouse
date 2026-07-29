@@ -105,6 +105,14 @@ def compose_cmd(variant, *args):
     return base + list(args)
 
 
+def compose_run(variant, *args, timeout=600, log_fn=print) -> int:
+    """Build AND run a `docker compose` command for `variant`, returning its exit code.
+
+    `compose_cmd` only builds the argv; a caller that forgets to run it gets a silently discarded
+    list, so cards that drive the cluster directly (S43's stop/start around a pool wipe) use this."""
+    return _run(compose_cmd(variant, *args), timeout=timeout, log_fn=log_fn)
+
+
 def _run(argv, timeout=600, log_fn=print):
     log_fn(f"$ {' '.join(argv)}")
     p = subprocess.run(argv, cwd=str(CA_SOAK_DIR), capture_output=True, text=True, timeout=timeout)
