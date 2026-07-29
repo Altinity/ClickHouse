@@ -1791,3 +1791,9 @@ deviation at `mountWritable` ACCEPTED (measurement governs) -> BACKLOG
 superseded). Pre-verified finding for the fix round: s38 configs still set the deleted
 `materialization_grace_ms` (fail-close now breaks S38 at disk open) — report claim falsified.
 Warm GC/fold reviewer dispatched on `review-6bcd66716ba..ff9f36a056f.diff`.
+**2026-07-29 08:05 local** — watchdog+pipeline: T12 review returned — spec PASS / quality
+needs-fixes (I1 s38 active keys break disk open; I2 walkthrough table row; I3 verdict-doc
+sentence letter-false; M2 S38 double-break needs fail-fast entry guard). M4 already fixed by
+controller. Fix round 1 dispatched to impl-a12 (docs/configs only, no gate re-run). WARN-2
+upgraded T14 obligation: aggregate posture paragraph now FOUR layers (+ sampled store-quality
+signal). Reviewer praised §6 correction + marker discipline as the model.
