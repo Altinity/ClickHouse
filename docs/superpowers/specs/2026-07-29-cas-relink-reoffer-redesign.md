@@ -1108,7 +1108,7 @@ Three properties to hold the implementation to, because the shape depends on the
 - **Retries must not reset it.** The mark is set before the FIRST attempt and never re-cleared
   except by the proof above, so the controller's internal retries and a later wedge resolution both
   keep it true.
-- **A crash between the mark and the send over-reports.** That is the fail-closed direction and is
+- **A process death between the mark and the send over-reports.** That is the fail-closed direction and is
   accepted: the rule stays "emit unless non-transmission is PROVEN", and a lost proof is a louder
   counter, never a silent leak.
 
