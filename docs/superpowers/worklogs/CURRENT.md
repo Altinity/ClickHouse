@@ -1826,3 +1826,7 @@ exact `STAGE A: PASS`/`FAIL` verdict string.
 **2026-07-29 09:2x local** — T13 CLOSED (corrections re-derived from artifacts; agent
 self-found a 3rd stale-figure instance + named the TEMPORAL root cause — memories written,
 controller's older duplicate merged away). T14 running (recon phase).
+**2026-07-29 09:20 local** — watchdog: T14 batteries BOTH GREEN already — release 1548/1548
+(GATE_RELEASE_EXIT=0), ASan 1552/1552 (GATE_ASAN_EXIT=0, matches predicted 1538+14). Agent
+now on the soak-python code work (signals.py/run.py — late-PUT detector) before launching the
+90m soak. Untracked ca-soak compose/profiling files = old debris (Jul 17-18), not impl-a14's.
