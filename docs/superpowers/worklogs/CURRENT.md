@@ -1934,3 +1934,6 @@ shrink a never-reclaiming pool). Criterion's evidential form amended (user-veto-
 complete audits at auditable scale (05020 + scenario checkpoints) + soak fsck gates reported
 UNARMED w/ reason. No third soak. Soak2 to completion for chaos/recovery/fencing value w/
 honest fault-count caveat.
+**2026-07-29 12:00 local** — watchdog: soak2 tick #42 (~51 min, inside the chaos window),
+pool plateaued at 23.57GB, signals 2/2, suppressed-clamp counter ticking as expected (5->6),
+load 3.9, no builds. ETA 12:39. All agents in assigned states.
