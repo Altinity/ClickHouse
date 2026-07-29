@@ -644,7 +644,12 @@ def checkpoint(driver, cluster, model, phase, *, strict_unreachable=False):
         # precisely the "check that passed while looking at nothing" failure. Tracked in BACKLOG
         # {#fsck-fabricated-clean-on-timeout}. With `partial=True` above this path is now rare: the scan
         # reports a lower bound instead of dying empty-handed.
-        f = {"dangling": 0, "unreachable": 0, "reachable": 0, "exit_code": 0, "detail": []}
+        # `_fabricated` is what lets the checkpoint LINE tell the truth as well. The comment above
+        # keeps asserts away from these zeros; without this key the summary line still printed
+        # `OK: ... reachable=0 dangling=0`, so a mid-log grep found a clean-looking OK for a gate that
+        # never ran, even though the WARNING two lines up said otherwise.
+        f = {"dangling": 0, "unreachable": 0, "reachable": 0, "exit_code": 0, "detail": [],
+             "_fabricated": True}
     else:
         if not _detail_fsck_skipped and (f.get("dangling", 0) != 0 or f.get("unreachable", 0) != 0):
             try:
@@ -919,6 +924,23 @@ def skipped_gate_report_lines() -> list:
     for label, reason in SKIPPED_FSCK_GATES:
         lines.append(f"FSCK GATES:   {label}: {reason}")
     return lines
+
+
+def render_checkpoint_result(label, now, exp, f, dr) -> str:
+    """The checkpoint's one-line verdict. A checkpoint whose fsck gate did not run must NOT render as
+    `OK` with zeros it never measured: the WARNING lines were always honest, but a reader grepping the
+    log for `OK` found a clean-looking line for a gate that was skipped. `f["_fabricated"]` marks the
+    placeholder dict the timeout path installs, and this renders GATE-SKIPPED with `not-measured`
+    fields instead of numbers."""
+    head = f"{label} OK: now={now} count={exp['count']}"
+    if f.get("_fabricated"):
+        return (f"{label} GATE-SKIPPED: now={now} count={exp['count']} fsck reachable=not-measured "
+                f"unreachable=not-measured dangling=not-measured stale_edge=not-measured "
+                f"dryrun_count=not-measured — the fsck gate did not run for this checkpoint, so its "
+                f"dangling==0 and dryrun-subset assertions were NOT evaluated")
+    return (f"{head} fsck reachable={f.get('reachable')} "
+            f"unreachable={f.get('unreachable')} (fold backlog / AwaitingGc) dangling={f.get('dangling')} "
+            f"stale_edge={_stale_edge_display(f)} dryrun_count={dr.get('count')}")
 
 
 def wait_for_healthy(cluster, *, timeout_s: float = 600.0, settle_s: float = 2.0,
@@ -1564,9 +1586,7 @@ def run_phase3(args):
             now, exp, n1, n2, f, dr = checkpoint(driver, cluster, model, 2, strict_unreachable=strict_unreachable)
         finally:
             checkpoint_active.clear()
-        log(f"{label} OK: now={now} count={exp['count']} fsck reachable={f.get('reachable')} "
-            f"unreachable={f.get('unreachable')} (fold backlog / AwaitingGc) dangling={f.get('dangling')} "
-            f"stale_edge={_stale_edge_display(f)} dryrun_count={dr.get('count')}")
+        log(render_checkpoint_result(label, now, exp, f, dr))
         # Record a checkpoint-tagged metrics tick carrying the fsck result (§2: include fsck at checkpoints).
         checkpoint_ts = int(time.time())
         ticker.tick_once(checkpoint_ts, fsck=f)
@@ -1930,10 +1950,7 @@ def main(argv=None):
             now, exp, n1, n2, f, dr = checkpoint(driver, cluster, model, args.phase)
         finally:
             checkpoint_active.clear()
-        log(f"{label} OK: now={now} count={exp['count']} "
-            f"fsck reachable={f.get('reachable')} unreachable={f.get('unreachable')} "
-            f"(fold backlog / AwaitingGc) dangling={f.get('dangling')} stale_edge={_stale_edge_display(f)} "
-            f"dryrun_count={dr.get('count')}")
+        log(render_checkpoint_result(label, now, exp, f, dr))
         checkpoint_ts = int(time.time())
         capture_checkpoint_signals(cluster, label, tracker=signal_tracker, fencing=fencing)
         # Phase 1/2 has no metrics db, so the phase summary is logged only (conn=None).
