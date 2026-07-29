@@ -12,6 +12,10 @@ doc_type: 'reference'
 **Date:** 2026-07-29. **Status:** DESIGN, awaiting approval. **Branch:** `cas-gc-rebuild`.
 Spec only; no code landed.
 
+**Line citations are as of `af0b2825613`.** This branch is worked by several sessions at once and
+the cited files move under the document; a number that has drifted by a few lines is drift, not an
+error — re-derive from the named symbol, which is why every citation names one.
+
 **This contract is RELINK-INDEPENDENT.** Every hazard it addresses belongs to part writes in
 general: any `PartWriteTxn` can end with a staged precommit whose release could not be proven, any
 of them can log an alarming line before the last attempt has run, and any reader of a committed
@@ -76,20 +80,38 @@ classification necessarily happens BEFORE the last release attempt.** Its scope 
 way out, `abort` returns `void`, and the destructor's own retry reports to nobody
 (`PartFolderAccess.cpp:403-416`). No amount of plumbing repairs an ordering that runs backwards.
 
-So the handle reports, at destruction, and the contract is one line:
+So a destructor reports, and the contract is one line:
 
-> **Emit iff `precommitState` is `Uncertain` or `Durable` at destruction**, after the final release
-> attempt has run.
+> **Emit iff `precommitState` is `Uncertain` (without proof of non-transmission) or `Durable`
+> uncommitted, evaluated once at TRANSACTION destruction**, after the final release attempt has run.
 
-`noexcept`, exactly once, reusing the ERROR line `~PreparedPartWrite` already logs rather than
-adding a second beside it. A destructor retry that SUCCEEDS moves the state to `Settled`, so it
-emits nothing — the asymmetry is carried by the state machine rather than by a rule someone has to
+`noexcept`, exactly once. A late release that SUCCEEDS moves the state to `Settled`, so it emits
+nothing — the asymmetry is carried by the state machine rather than by a rule someone must
 remember.
+
+**The emitter is `~PartWriteTxn`, not `~PreparedPartWrite`, and the difference is load-bearing.**
+The handle is the natural-looking choice and it is wrong for one reason: §3.2's staging exit has no
+handle at all. `prepareEntries` fails before a `PreparedPartWrite` is constructed
+(`PartFolderAccess.cpp:488-493`), so only the transaction is destroyed — and `~PartWriteTxn` today
+merely retires the build sequence (`CasPartWriteTxn.cpp:119-124`). A handle-owned emission would be
+SILENT on exactly the exit that has no other backstop, which is test S2.
+
+The two destructors are not competitors; they are ordered, and the order is what makes this work.
+`PreparedPartWrite` holds the transaction by value as a member — `PartWriteTxnPtr build`
+(`PartFolderAccess.h`, private members) — so C++ runs the handle's destructor BODY first, then
+destroys its members. The handle's body makes the last RELEASE ATTEMPT; releasing `build`
+afterwards runs `~PartWriteTxn`, which therefore observes the state that attempt produced. So:
+
+> **`~PreparedPartWrite` owns the last release ATTEMPT. `~PartWriteTxn` owns the last WORD.**
+
+That placement also restores what the v7 inversion argued for in the first place — the owner of the
+last attempt reports — and simply names the correct owner. It covers handled and no-handle exits
+with one emission point and no coordination between them.
 
 ### 3.2 It covers every exit by construction {#covers-every-exit}
 
-The destructor runs on all of them: enum outcomes; exceptions that propagate before a caller
-installs its guard (`prepareAdoptFromManifest` maps only two error codes and lets the rest
+The TRANSACTION destructor runs on all of them: enum outcomes; exceptions that propagate before a
+caller installs its guard (`prepareAdoptFromManifest` maps only two error codes and lets the rest
 through); the `prepareEntries` path that returns **no handle at all**
 (`PartFolderAccess.cpp:491-493`), whose own comment says the cleanup "cannot be deferred to one";
 and destructor-only exits. A caller-side scheme has to enumerate those and can miss one. This
@@ -128,11 +150,11 @@ state to `NotAttempted`.** That is not a new value; it is what `NotAttempted` al
 Proving it per refusal site does not work. There are **nine** such sites, and the proof is erased
 before the caller can read it: `RefMutationItem` carries only `done`/`error`/`committed_id`
 (`CasRefLedger.h:454-463`), and the one arm that already HAS the proof discards it a line later
-into a generic `NETWORK_ERROR` (`CasRefLedger.cpp:3105-3126`).
+into a generic `NETWORK_ERROR` (`CasRefLedger.cpp:3107-3128`).
 
 So mark the single transmission point instead. **`RefMutationItem` gains one field, `attempted`**,
 set for every survivor of a chunk immediately before `putIfAbsentControlled` — adjacent to
-`armApplyPending` (`CasRefLedger.cpp:2806`), already documented as "the last statement that still
+`armApplyPending` (`CasRefLedger.cpp:2808`), already documented as "the last statement that still
 runs while nothing of this transaction can possibly be durable". It is the same
 record-intent-before-the-ambiguous-act discipline `PrecommitState` itself uses.
 
@@ -148,13 +170,17 @@ record-intent-before-the-ambiguous-act discipline `PrecommitState` itself uses.
 | 8 | item validation | `:2425-2460`, `:2513-2577` | pre-PUT ⇒ never marked |
 | 9 | unattempted chunk remainder | `:2482-2486` | its chunk never reached the PUT |
 | 10 | pre-PUT construction | `:2688-2797` | pre-PUT ⇒ never marked |
-| 11 | deadline exhausted, nothing sent | `:3105` | marked, then **cleared** by `unresolvedProvesNothingWasSent` |
+| 11a | controller's pre-attempt FENCE check, nothing sent | `Backend/CasRequestControl.cpp:322-324` | marked, reached the controller, **cleared** — `NoAttemptSent` because `attempts_sent == 0` |
+| 11b | controller's pre-attempt DEADLINE check, nothing sent | `Backend/CasRequestControl.cpp:325-327` | as 11a; neither check sends anything to the backend |
 
 Rows 1-10 are free: they happen before the mark, so they prove themselves with no per-site work.
-Row 11 is the only exit that is marked and still sent nothing, and it is exactly the case the
-existing hardened predicate decides — `unresolvedProvesNothingWasSent`
-(`Backend/CasRequestControl.h:76`), which that arm already computes and already counts as
-`CasRefAppendPreAttemptRefused`. It additionally clears `attempted`.
+Rows 11a and 11b are the exits that are marked and still send nothing — the controller runs two
+pre-attempt checks, a mount fence and a remaining-deadline check, and **neither sends anything to
+the backend** (its own comment says so). Both report `NoAttemptSent` when `attempts_sent == 0`,
+which is exactly what the existing hardened predicate decides —
+`unresolvedProvesNothingWasSent` (`Backend/CasRequestControl.h:76`), already computed and already
+counted as `CasRefAppendPreAttemptRefused` at `CasRefLedger.cpp:3107`. That arm additionally clears
+`attempted`. Both are one clear-site, not two: the predicate covers the pair.
 
 **One set-site, one proof-gated clear-site, one read-site**, against nine special cases.
 `appendRefOps` surfaces the item's `attempted` to its caller on both the normal and the throwing
@@ -164,10 +190,15 @@ Consumers inherit the channel without doing anything: the receiver-side staging 
 
 ### 4.3 Three properties the shape depends on {#channel-properties}
 
-- **Chunking must not split an item.** The mark is per-item, so an item whose ops landed in a
-  transmitted chunk must read `attempted` even if a later chunk of the same flush was refused. This
-  holds today — the batch builder admits at most one mutation per ref name per flush — and the plan
-  must assert it rather than assume it.
+- **An item cannot span chunks — and the reason is a mechanism, not a convention.** Two properties
+  compose: the per-item op-count cap refuses any item whose own ops exceed `ref_txn_max_ops` BEFORE
+  any object is created (`CasRefLedger.cpp:2441-2447`, `LIMIT_EXCEEDED`), so no item is larger than
+  one chunk can hold; and the chunk boundary ROLLS before admitting — an item that would push the
+  current non-empty chunk over the cap commits that chunk first and starts a fresh one
+  (`:2465-2470`). Together an item always lands whole in exactly one chunk, so a per-item mark is
+  well-defined. **The plan must carry the assertion that a split item is unrepresentable**, not
+  merely that different items land in different chunks: the weaker form would stay green if
+  splitting were ever introduced.
 - **Retries must not reset it.** It is set before the FIRST attempt and cleared only by the proof
   above, so the controller's internal retries and a later wedge resolution both keep it true.
 - **A process death between the mark and the send over-reports.** Accepted, and the fail-closed
@@ -187,7 +218,7 @@ Each site was checked separately, and they do not all get the same answer:
 | Site | Verdict |
 | --- | --- |
 | `abandonBuildBestEffort` (`PartFolderAccess.cpp:378-381`) | **INFO.** It reports ONE attempt and is called from three places, one being the destructor — so it must not carry the authoritative line, or the final word becomes indistinguishable from an intermediate one. The destructor emits its own line after its attempt fails. |
-| caller scope-guard `abort` (`ContentAddressedMetadataStorage.cpp:2116-2123`) | **INFO, unconditionally.** A caution that this site also fires on real aborts does NOT hold: `abort` early-returns when `write.isTerminal()`, so the catch is reachable only when `write.abort()` threw — exactly a failed removal append. A successful abort logs nothing. No conditional, no message split. |
+| caller scope-guard `abort` (`ContentAddressedMetadataStorage.cpp:2110-2123`) | **INFO, unconditionally.** A caution that this site also fires on real aborts does NOT hold: `abort` early-returns when `write.isTerminal()`, so the catch is reachable only when `write.abort()` threw. That covers a failed removal APPEND and also a release that was IMPOSSIBLE to attempt — `requireAlive` can throw after a remount before any append is issued — but both are the same thing for this purpose: an attempt that did not discharge the duty, with the transaction destructor still to come. A successful abort logs nothing. No conditional, no message split. |
 | `logCasWriteRetryLater` (`Backend/CasRequestControl.cpp:183-186`) | **UNCHANGED.** Not a release claim and not release-specific: the generic "CAS write could not be committed; retrying later" line every CAS write path shares, already rate-limited by a `LogSeriesLimiter`. Its statement is true however the release resolves. |
 
 **Required:** attempt the final release first; then emit BOTH halves of the authoritative emission
@@ -203,8 +234,8 @@ every reader of a committed row depends on, not something a consumer can arrange
 **Already approved by the user.**
 
 `armApplyPending` performs a `compare_exchange_strong` with `std::memory_order_relaxed`
-(`CasRefLedger.cpp:1681`) and is called at `:2806` **while no lock is held** — the preceding
-`state_mutex` scope ends at `:2715` and the install does not re-take it until `:2928`. A reader
+(`CasRefLedger.cpp:1681`) and is called at `:2808` **while no lock is held** — the preceding
+`state_mutex` scope spans `:2717-:2723` and the install does not re-take it until `:2930`. A reader
 that acquires `state_mutex` after the arm is therefore still entitled by the memory model to
 observe `Clean`. Today that is harmless only because a separate, properly locked predicate carries
 the weight (`leader_active`, set and cleared under `ref_queue_mutex` at `:1588` and `:1668`). Any
@@ -223,17 +254,20 @@ site. `armApplyPending` keeps its `noexcept`, allocation-free, lock-free body an
 documented precondition that this call site already satisfies. No memory-order change is needed
 either: with both sides under the mutex, the mutex supplies the happens-before.
 
-**Size: an ordering upgrade, not a lane refactor.** Two lines at `CasRefLedger.cpp:2806`, plus an
-audit bringing the file's eight `apply_state` writes (`armApplyPending`, `clearApplyPending`,
-`poisonApplyState`) under `state_mutex`; most are already inside the install region. **Under 20
-lines, one file, no control-flow or signature change.** Runtime cost: one uncontended mutex
-acquire per committed chunk, against a network `PUT`.
+**Size: an ordering upgrade, not a lane refactor.** Two lines at `CasRefLedger.cpp:2808`, plus an
+audit of the file's **fifteen** `armApplyPending`/`clearApplyPending`/`poisonApplyState` call sites
+**plus the one direct store at `:1174`** — sixteen writes in total, not the eight an earlier draft
+claimed. Most are already inside the install region; the production calls currently made with NO
+lock held are **`:2808`, `:2827`, `:3072`, `:3112`**, and those are the ones the audit must bring
+under `state_mutex`. **Under 20 lines, one file, no control-flow or signature change.** Runtime
+cost: one uncontended mutex acquire **per ATTEMPTED chunk** — not per committed chunk, since the
+arm precedes the `PUT` and so is paid even by a chunk that fails.
 
 ## 7. Retention, and why no fsck class {#retention}
 
 An unreleased binding is **not** bounded by "the mount's epoch". Epoch rollover makes it
 *eligible*: a successor incarnation's `sweepStalePrecommitsNow` removes bindings whose
-`writer_epoch` predates the live one (`CasRefLedger.cpp:3738-3745`). The honest statement is
+`writer_epoch` predates the live one (`CasRefLedger.cpp:3743-3750`). The honest statement is
 **eligible at epoch rollover, reclaimed by a successor's sweep — unbounded only if no successor
 ever mounts that namespace, or if every sweep attempt fails.**
 
@@ -255,12 +289,13 @@ statement about an unmounted namespace rather than about this seam.
 | # | Class | Driven by | Asserts |
 | --- | --- | --- | --- |
 | S1 | Unproven release, promote path | every removal attempt fails — the promote-internal abandon, the caller's scope guard, and the destructor retry — so `precommitState` is `Durable`/`Uncertain` at destruction | `CasPrecommitReleaseUnproven` increments **exactly once**, from the destructor |
-| S2 | Unproven release, STAGING path | fail `precommitAdd` uncertainly and fail the `prepareEntries` abandon — the path that returns NO handle (`PartFolderAccess.cpp:491-493`) | the same single emission, proving the observation does not depend on a handle reaching a caller |
+| S2 | Unproven release, STAGING path | fail `precommitAdd` uncertainly and fail the `prepareEntries` abandon — the path that returns NO handle (`PartFolderAccess.cpp:488-493`) | the same single emission, **from `~PartWriteTxn`**, proving the observation does not depend on a handle existing at all (§3.1). This row is why the emitter is the transaction and not the handle |
 | S3 | A successful late release is silent | fail the first removal attempts, let the DESTRUCTOR retry succeed | `precommitState` reaches `Settled`, so **neither half** fires: no counter, no ERROR line of the authoritative class. Intermediate INFO lines are EXPECTED and must not fail the assertion (§5) |
-| S4 | Proven non-transmission is silent | drive the marked no-send exits — at minimum the shutdown drain (row 1), a lost fence (row 2), and the deadline-exhausted arm (row 11) | `attempted` stays false (or is cleared), the state downgrades to `NotAttempted`, nothing is emitted |
+| S4 | Proven non-transmission is silent | drive the marked no-send exits — at minimum the shutdown drain (row 1), a lost fence (row 2), and BOTH controller pre-attempt checks (rows 11a and 11b) | `attempted` stays false (or is cleared), the state downgrades to `NotAttempted`, nothing is emitted |
 | S5 | A transmitted attempt is NOT downgraded | let the PUT be sent, then fail ambiguously | `attempted` is true, the state stays `Uncertain`, the emission STANDS. The fail-closed half of S4 — without it a channel bug that never marks anything would silence the counter and look like success |
-| S6 | Chunking does not split the mark | a flush whose first chunk transmits and whose second is refused | the first chunk's items read `attempted`; the second chunk's do not (§4.3) |
+| S6 | An item cannot span chunks | submit an item at the op-count cap boundary so admitting it would overflow the current non-empty chunk | the builder ROLLS — the accumulated chunk commits and the item lands WHOLE in the fresh one (`CasRefLedger.cpp:2465-2470`); an item whose own ops exceed the cap is refused outright before any object is created (`:2441-2447`). Assert the mechanism, not merely that two items landed in two chunks: the weaker assertion stays green if splitting is ever introduced (§4.3) |
 | S7 | Marker synchronization | a reader taking `state_mutex` between the arm and the install | observes `ApplyPending` and refuses; never a stale `Clean` (§6) |
+| S8 | Both no-send sources are covered | drive the controller's pre-attempt FENCE check and its DEADLINE check separately (rows 11a/11b) | each reports `NoAttemptSent`, each clears `attempted`, neither emits |
 
 ## 9. What this contract guarantees to a consumer {#consumer-contract}
 

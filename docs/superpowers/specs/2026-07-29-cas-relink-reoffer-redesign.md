@@ -9,8 +9,12 @@ doc_type: 'reference'
 
 # CAS relink re-offer: retiring the confirm endpoint {#cas-relink-reoffer-redesign}
 
-**Date:** 2026-07-29. **Status:** DESIGN (**v10 — final pre-plan**), approved except the TLA gate. **Branch:** `cas-gc-rebuild`.
+**Date:** 2026-07-29. **Status:** DESIGN (**v11 — final pre-plan**), approved except the TLA gate. **Branch:** `cas-gc-rebuild`.
 Spec only; no code landed.
+
+**Line citations are as of `af0b2825613`.** This branch is worked by several sessions at once and
+the cited files move under the document; a number that has drifted by a few lines is drift, not an
+error — re-derive from the named symbol, which is why every citation names one.
 
 **v2:** the confirm is expressed as an HTTP conditional request (`ETag` / `If-None-Match`), with
 the two candidate forms reconciled in §4.1.6; the simplification claim is quantified in §1.1;
@@ -42,13 +46,13 @@ out, leaving §11 with only rows that exercise relink behaviour.
 on v8's routes, and both changed the mechanism rather than the wording. **The proof channel is
 inverted:** v8 asked each refusal site to prove it sent nothing, which is not implementable — the
 proof is erased into a generic `NETWORK_ERROR` before `precommitAdd` can read it
-(`CasRefLedger.cpp:3105-3126`), `RefMutationItem` carries no such field
+(`CasRefLedger.cpp:3107-3128`), `RefMutationItem` carries no such field
 (`CasRefLedger.h:454-463`), and there are NINE no-send exits, not two. v9 marks the single
 TRANSMISSION point instead: `RefMutationItem` gains `attempted`, set beside `armApplyPending`
-(`:2806`) immediately before the PUT, so all nine exits prove themselves by never reaching it, and
+(`:2808`) immediately before the PUT, so all nine exits prove themselves by never reaching it, and
 the one exit that is marked-but-unsent is cleared by the existing hardened
-`unresolvedProvesNothingWasSent`. One set-site, one clear-site, one read-site, with a nine-row
-mapping table in §6.5. **The log fix widened:** moving the destructor's ERROR line is necessary but
+`unresolvedProvesNothingWasSent`. One set-site, one clear-site, one read-site, with the exit
+mapping table now in the seam spec §4.2 (11 rows). **The log fix widened:** moving the destructor's ERROR line is necessary but
 not sufficient — three more sites log before the final attempt. They are DEMOTED to INFO with
 transient wording rather than deferred, because "this attempt failed" is true when written and only
 the severity is wrong. Per-site, and they do not all get the same answer: two demote, and
@@ -802,13 +806,13 @@ design changes code outside the relink path, and it must not be skipped.**
 
 #### 5.1.1 Why the terms are redundant in principle {#lane-quiescence-principle}
 
-Trace the append lane. `armApplyPending` is called at `CasRefLedger.cpp:2806`, and its comment
+Trace the append lane. `armApplyPending` is called at `CasRefLedger.cpp:2808`, and its comment
 fixes the placement: *"IMMEDIATELY before the `PUT` — the last statement that still runs while
 nothing of this transaction can possibly be durable."* `clearApplyPending` is the last statement
-of the install region at `CasRefLedger.cpp:2990`, in the same allocation-free scope as
+of the install region at `CasRefLedger.cpp:2992`, in the same allocation-free scope as
 `rt->state.swap(*candidate)`: *"'recorded' and 'no apply owed' become true together or not at
 all."* Every other exit either proves nothing was sent (marker back to `Clean`,
-`CasRefLedger.cpp:2825` and `:3110`) or leaves the table wedged or `Poisoned`.
+`CasRefLedger.cpp:2827` and `:3112`) or leaves the table wedged or `Poisoned`.
 
 The marker is armed and cleared **per chunk**, inside `commitRefChunk`, not per tenure. So the
 window *"durable but not visible in `committed`"* is, logically, **exactly** `apply_state !=
@@ -836,7 +840,7 @@ view too stale to know — and that is what rules 1–4 exclude, one by one.
 
 §5.1.1 is a statement about program ORDER. It is not yet one about what a concurrent reader can
 OBSERVE, and today it is not: `armApplyPending` performs a relaxed `compare_exchange_strong`
-(`CasRefLedger.cpp:1681`) called at `:2806` with no lock held, while the answer reads the committed
+(`CasRefLedger.cpp:1681`) called at `:2808` with no lock held, while the answer reads the committed
 row under `state_mutex`. A reader acquiring after the arm may still observe `Clean`. What carries
 the weight today is precisely the predicate this design deletes — `leader_active`, set and cleared
 under `ref_queue_mutex` (`:1588`, `:1668`). **Rule 3's terms are not merely redundant with rule 4;
@@ -850,7 +854,15 @@ design does exactly that, so it must first make the marker sufficient.
 **The fix is specified in the seam document** (`2026-07-29-cas-part-write-release-seam.md` §6), because it is a property of the ref lane
 that every reader depends on rather than something relink can arrange for itself: arm under
 `state_mutex`, read under `state_mutex`, lock at the call site. **Approved by the user; under 20
-lines, one file, no control-flow change.** It is a gate on this design, and the seam owns it.
+lines, one file, no control-flow change.**
+
+**What this design REQUIRES of that fix, stated here so the dependency is visible where the gate
+is:** the marker must be sufficient to close the observation window — a reader holding
+`state_mutex` must not be able to observe `Clean` while a transaction of that table is between its
+arm and its install. The remedy lives in the seam because its beneficiaries mostly never heard of
+relink; the requirement lives HERE because a gate whose justification sits in another document is
+a gate nobody re-checks, and because if the seam's fix is ever weakened this sentence is what turns
+the breakage into a stated requirement rather than an invisible one.
 
 ### 5.2 The cold/evicted refusal {#cold-refusal}
 
@@ -964,9 +976,14 @@ without a verdict, so the receiver's ref MAY be committed.
   precommit — so no committed ref is ever undone here. **This is the one state where a byte fetch
   would be a defect**, because it would publish the part a second time over a relink that may
   already be committed.
-- *No retention leak?* Bounded. The abandon is attempted and, if the promote in fact landed, is
-  REJECTED by the state machine rather than undoing a committed ref; if it did not land, the
-  precommit is released or §6.5's observation fires. **The action is unchanged either way** — S2 still throws retry-later and still never byte-fetches. This is the state where
+- *No retention leak?* **Not bounded by anything this state provides, and it must not claim to
+  be.** The abandon is attempted and, if the promote in fact landed, is REJECTED by the state
+  machine rather than undoing a committed ref; if it did not land, the precommit is either released
+  or left unreleased. In the latter case the residue is **loud and findable** — §6.5's observation
+  counts and logs it — which is a detection property, not a retention bound. The bound itself is
+  the seam's and it is weaker than an earlier draft implied: eligible at epoch rollover, reclaimed
+  by a successor's sweep, and **unbounded if no successor ever mounts that namespace or every sweep
+  attempt fails**. **The action is unchanged either way** — S2 still throws retry-later and still never byte-fetches. This is the state where
   treating a failed release as a reason to byte-fetch would permit exactly the double publish this
   section forbids.
 
@@ -1241,10 +1258,13 @@ Rebuilt from the state machine of §6, not transplanted from the old row list:
 | 16 | **Replay** | replay a captured earlier confirm response for the same part and validator | nonce mismatch ⇒ `Unknown`; no promote (§4.1.4) |
 | 17 | **Cross-mount collision** | two same-pool CA disks, same `server_root_id`, same table; offer from disk A, `MOVE ... TO DISK` to B, force B to hold the same `ManifestRef` tuple for that ref | validators DIFFER (the digest is mount-qualified), so the answer is `changed`, never `proven`. This is B1's shape and the direct regression test for §3 |
 | 18 | **S1 → S0 via promote** | force `promote` to `MechanismFallbackAllowed` **with the release succeeding** | byte fetch to the same sender; no double publish; distinct from row 9's `Unresolved`, which must NOT byte-fetch |
-| 19 | **A failed release never changes the action** | force every removal attempt to fail on S1's `Unknown` exit and on S2's `Unresolved` exit; for S2 run BOTH promote-landed and promote-not-landed variants so the outcome is pinned rather than nondeterministic | all variants still throw retry-later and **none byte-fetches** — S2 is where a byte fetch would double-publish. This is the RELINK half; the emission itself is asserted by the seam spec's rows S1-S5 |
+| 19 | **Failed release × `MechanismFallbackAllowed`** | `promote` → `MechanismFallbackAllowed` with EVERY removal attempt failing (promote-internal, scope guard, transaction destructor) | **both halves in one row:** the action is unchanged — byte fetch to the same sender, part published exactly once — AND `CasPrecommitReleaseUnproven` increments exactly once, per seam §8 row S1. Relink owns this combination end-to-end because the ACTION is relink's; it cites the seam only for what the emission means |
+| 20 | **Failed release × `Unknown` and × `Unresolved`** | force every removal attempt to fail on S1's `Unknown` exit and on S2's `Unresolved` exit; for S2 run BOTH promote-landed and promote-not-landed variants so the outcome is pinned rather than nondeterministic | all variants still throw retry-later and **none byte-fetches** — S2 is where a byte fetch would double-publish — AND exactly one emission per transaction in each variant (seam §8 rows S1/S5). The cross-product is asserted here, not split across two documents |
 
-Rows covering the release accounting itself — unproven-release emission, the settled-late silence,
-proven non-transmission, the fail-closed half, and marker synchronization — live in
+Rows 19 and 20 deliberately assert BOTH halves of their scenario — relink's action and the seam's
+emission — because a combined scenario split across two documents is a scenario neither owns. Rows
+covering the release accounting ALONE — the settled-late silence, proven non-transmission, the
+fail-closed half, chunk integrity and marker synchronization — live in
 `2026-07-29-cas-part-write-release-seam.md` §8 and are not duplicated here.
 
 The existing failpoint `cas_relink_receiver_pause_before_confirm` is the seam that opens the T1→T2
@@ -1464,6 +1484,6 @@ Two items remain, and neither needs a decision now because neither is answerable
   premise. It validates a decision already taken; it does not gate the work.
 
 Everything else is implementation-time detail: the exact work-cap and concurrency constants, the
-enumeration of `apply_state` writers §5.1.2 requires the plan to audit, and the single destructor
-emission §6.5 specifies (one predicate over `precommitState`, `noexcept`, logging only after the
-final release attempt).
+enumeration of `apply_state` writers the marker fix requires the plan to audit, and the release
+accounting — both specified in `2026-07-29-cas-part-write-release-seam.md` (§6 and §3), which this
+design consumes rather than restates.
