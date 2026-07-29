@@ -86,6 +86,16 @@ UInt64 metric(const std::map<String, UInt64> & row, const String & name)
     return it == row.end() ? 0 : it->second;
 }
 
+/// Every key the backend was asked to delete, so a failing zero-delete assertion names the site that
+/// leaked instead of only reporting a count.
+String deletedKeysMessage(const CountingBackend & backend)
+{
+    String out;
+    for (const String & key : backend.deletedKeys())
+        out += "\n    " + key;
+    return out.empty() ? String{" (none)"} : out;
+}
+
 /// Every `_log/` GET this round issued against `ns` over ids `first..last` -- the "read once, fold
 /// nothing" claim, made against the store rather than against a counter the fold keeps about itself.
 uint64_t refLogGetsFor(const CountingBackend & backend, const Layout & layout, const RootNamespace & ns,
@@ -337,6 +347,11 @@ TEST(CasGcBoundedWalk, AStopAtTheFrozenTailProvesNoFrontierAndTheRoundDestroysNo
     /// One record lands mid-round, above the frozen tail.
     backend->arm(&layout, ns, /*published_through*/ 3, /*max_appends*/ 1);
 
+    /// From HERE the deletes are the ROUND's. Opening the pool runs a capability probe that writes and
+    /// deletes its own `_probe/` keys, and counting those against the round would make this assertion
+    /// fail on debris that has nothing to do with the destructive gate.
+    backend->resetCounts();
+
     Gc gc(store, kGc);
     const std::map<String, UInt64> intake = runRoundCapturingIntake(gc, UniversePolicy::AuthoritativeForTest);
 
@@ -347,7 +362,8 @@ TEST(CasGcBoundedWalk, AStopAtTheFrozenTailProvesNoFrontierAndTheRoundDestroysNo
         << "the walk stopped on a PRESENT record above the tail, so it observed no end of stream";
     EXPECT_EQ(metric(intake, "frontier_namespaces"), 1u) << "it is still in the round's universe";
     EXPECT_EQ(backend->deleteTotal(), 0u)
-        << "an unproven frontier must suppress every destructive decision of the round";
+        << "an unproven frontier must suppress every destructive decision of the round. Deleted:"
+        << deletedKeysMessage(*backend);
     EXPECT_TRUE(backend->head(layout.blobKey(legacyMetaTestRef(blob))).exists);
 
     /// CONTROL: the writer stops. The probe now comes back absent, the frontier is proven, and the
