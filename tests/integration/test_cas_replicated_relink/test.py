@@ -897,14 +897,17 @@ def test_stalled_publish_protects_source_blobs_and_commits_nothing():
     for _ in range(3):
         gc_round(node1)
         gc_round(node2)
-    node1.query("SYSTEM FLUSH LOGS")
-    rounds = int(
-        node1.query(
-            "SELECT count() FROM system.content_addressed_garbage_collection_log "
-            "WHERE event_type = 'Finish' AND outcome = 'Success'"
-        ).strip()
-        or 0
-    )
+    # Pool-wide: the GC lease is held by ONE server and it need not be node1.
+    rounds = 0
+    for n in (node1, node2):
+        n.query("SYSTEM FLUSH LOGS")
+        rounds += int(
+            n.query(
+                "SELECT count() FROM system.content_addressed_garbage_collection_log "
+                "WHERE event_type = 'Finish' AND outcome = 'Success'"
+            ).strip()
+            or 0
+        )
     assert rounds > 0, "no successful GC round ran at all — this is not suppression, it is a wedge"
     assert not (part_blobs - blob_keys()), (
         "Stage A must reclaim NOTHING, but {} of the abandoned attempt's blobs were deleted".format(

@@ -59,6 +59,29 @@ def count_prefix(prefix):
     return len(list(objects))
 
 
+
+def _gc_bookkeeping(*nodes):
+    """Pool-wide (successful rounds, objects deleted) from the CA GC log. The GC lease is held by ONE
+    server per pool and which one is not fixed, so both must be asked."""
+    rounds = deleted = 0
+    for n in nodes:
+        n.query("SYSTEM FLUSH LOGS")
+        rounds += int(
+            n.query(
+                "SELECT count() FROM system.content_addressed_garbage_collection_log "
+                "WHERE event_type = 'Finish' AND outcome = 'Success'"
+            ).strip()
+            or 0
+        )
+        deleted += int(
+            n.query(
+                "SELECT sum(objects_deleted + manifests_deleted + entries_redeleted) "
+                "FROM system.content_addressed_garbage_collection_log WHERE event_type = 'Finish'"
+            ).strip()
+            or 0
+        )
+    return rounds, deleted
+
 def count_pool_objects():
     # The shared pool is empty only when BOTH content blobs and part footers are gone.
     return count_prefix(BLOBS_PREFIX) + count_prefix(PARTS_PREFIX)
@@ -179,23 +202,12 @@ def test_two_servers_share_one_pool():
     )
 
     # …AND THE SUPPRESSION IS EVIDENCED: rounds ran and deleted nothing, which is what separates
-    # "GC declined, by design" from "GC was wedged, crashed, or never held the lease".
-    node1.query("SYSTEM FLUSH LOGS")
-    rounds = int(
-        node1.query(
-            "SELECT count() FROM system.content_addressed_garbage_collection_log "
-            "WHERE event_type = 'Finish' AND outcome = 'Success'"
-        ).strip()
-        or 0
-    )
+    # "GC declined, by design" from "GC was wedged, crashed, or never held the lease". Counted
+    # POOL-WIDE: exactly one server holds the GC lease for a shared pool, and it need not be node1 —
+    # asking only node1 yields 0 rounds whenever node2 is the leader, which is how this assertion first
+    # failed.
+    rounds, deleted = _gc_bookkeeping(node1, node2)
     assert rounds > 0, "no successful GC round ran at all — this is not suppression, it is a wedge"
-    deleted = int(
-        node1.query(
-            "SELECT sum(objects_deleted + manifests_deleted + entries_redeleted) "
-            "FROM system.content_addressed_garbage_collection_log WHERE event_type = 'Finish'"
-        ).strip()
-        or 0
-    )
     assert deleted == 0, (
         "GC's own bookkeeping reports {} deletion(s) while Stage A suppression is in force".format(
             deleted
@@ -344,23 +356,12 @@ def test_pool_survives_node_crash():
     )
 
     # …AND THE SUPPRESSION IS EVIDENCED: rounds ran and deleted nothing, which is what separates
-    # "GC declined, by design" from "GC was wedged, crashed, or never held the lease".
-    node1.query("SYSTEM FLUSH LOGS")
-    rounds = int(
-        node1.query(
-            "SELECT count() FROM system.content_addressed_garbage_collection_log "
-            "WHERE event_type = 'Finish' AND outcome = 'Success'"
-        ).strip()
-        or 0
-    )
+    # "GC declined, by design" from "GC was wedged, crashed, or never held the lease". Counted
+    # POOL-WIDE: exactly one server holds the GC lease for a shared pool, and it need not be node1 —
+    # asking only node1 yields 0 rounds whenever node2 is the leader, which is how this assertion first
+    # failed.
+    rounds, deleted = _gc_bookkeeping(node1, node2)
     assert rounds > 0, "no successful GC round ran at all — this is not suppression, it is a wedge"
-    deleted = int(
-        node1.query(
-            "SELECT sum(objects_deleted + manifests_deleted + entries_redeleted) "
-            "FROM system.content_addressed_garbage_collection_log WHERE event_type = 'Finish'"
-        ).strip()
-        or 0
-    )
     assert deleted == 0, (
         "GC's own bookkeeping reports {} deletion(s) while Stage A suppression is in force".format(
             deleted
