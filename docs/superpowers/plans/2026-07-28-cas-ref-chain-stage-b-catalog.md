@@ -63,8 +63,10 @@ destruction still suppressed does not exercise Stage B's claims.
   prose. "Exactly one match" is amended to: the BARE line `STAGE A: PASS` exists — use
   `grep -nx "STAGE A: PASS"` for the exact-line form.) — else BLOCKED.
 - [ ] **Step 2:** Re-run the CA gtest gate filter (Stage A Task 0's exact command); record
-  baseline counts in the report. Baselines at Stage A's final head `25ce1d3531a`:
-  release 1564/243 suites, ASan 1568/256 suites (RESULTS `{#final-head-gates}` addendum).
+  baseline counts in the report. Baselines at Stage A's final head `d4ddc736949`:
+  release 1566/243 suites, ASan 1570/256 suites (RESULTS `{#final-head-gates}` addendum; the
+  earlier `25ce1d3531a`/1564/1568 figures predate the final-review I1-fix merge — Task 0's
+  first run caught this line being stale, 2026-07-29).
   No commit.
 - [ ] **Step 3 (carried from the Stage A final review, rec 5):** verify the two capstone
   tests are still RED-WHEN-FIXED sentinels and the residual they guard is still open:
