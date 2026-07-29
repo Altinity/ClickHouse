@@ -358,22 +358,29 @@ class S38(Scenario):
         # Step 3: the seal WINS THE SLOT. Replay the straggler's PUT with the writer's own primitive.
         # =====================================================================================
         straggler_body = _restamp_ref_log_txn(seal_body, seal_seq)
-        refused = None
+        # The refusal must be the STORE's, at the protocol's own status. Accepting any exception would
+        # let a client-side mistake — a botocore that does not know `IfNoneMatch`, a bad endpoint —
+        # pass as "the fence held", which is the one way this assertion could lie in the safe direction.
+        outcome = {"raised": None, "code": None, "http_status": None}
         try:
             s3.put_object(Bucket=_S3_BUCKET, Key=seal_key, Body=straggler_body, IfNoneMatch="*")
-            refused = False
         except Exception as e:
-            code = getattr(e, "response", {}).get("Error", {}).get("Code", type(e).__name__)
-            status = getattr(e, "response", {}).get("ResponseMetadata", {}).get("HTTPStatusCode")
-            refused = True
-            result.observations["conditional_create_refusal"] = {"code": code, "http_status": status}
+            resp = getattr(e, "response", None) or {}
+            outcome["raised"] = type(e).__name__
+            outcome["code"] = resp.get("Error", {}).get("Code")
+            outcome["http_status"] = resp.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        result.observations["conditional_create_outcome"] = outcome
+        refused_by_store = outcome["http_status"] in (409, 412)
         result.add(Verdict.check(
-            "a straggler's conditional create at the sealed id is REFUSED",
-            "the store rejects a create at an id the seal already occupies",
-            f"refused={refused} ({result.observations.get('conditional_create_refusal')})", refused,
-            "" if refused else "the conditional create SUCCEEDED at the sealed id — either it "
-                               "overwrote the seal or the store is not honouring the precondition; "
-                               "the whole fence rests on this being impossible"))
+            "a straggler's conditional create at the sealed id is REFUSED by the store",
+            "HTTP 412 (or 409) from a create at an id the seal already occupies",
+            outcome, refused_by_store,
+            "" if refused_by_store else
+            ("the conditional create SUCCEEDED at the sealed id — either it overwrote the seal or the "
+             "store is not honouring the precondition; the whole fence rests on this being impossible"
+             if outcome["raised"] is None else
+             f"the create failed with {outcome['raised']} rather than a precondition refusal — that is "
+             f"a CARD defect (or an unreachable endpoint), not evidence about the fence")))
         after_refusal = s3.get_object(Bucket=_S3_BUCKET, Key=seal_key)["Body"].read()
         result.add(Verdict.check(
             "the seal object is byte-for-byte unchanged by the refused create",
