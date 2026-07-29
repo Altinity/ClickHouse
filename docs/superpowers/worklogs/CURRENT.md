@@ -2077,3 +2077,8 @@ reported -> mount-qualified xxh3-128 digest validator; M6 withdrawn honestly; th
 budget w/ ship-gate). Crossing #3: v3 predates the user's Q2-closure + custom-headers
 directives -> small v4 ordered. Soak cluster alive at 16:56 (~51 min since launch — likely
 the predown capture phase; nudge threshold = next tick). a16 still holding for its slot.
+**2026-07-29 17:0x local** — RE-VALIDATION GREEN on all 4 criteria (23 bounded rounds vs 0;
+probe due@16 — cadence unit vindicated; 1.000 GET/edge — HEAD drop measured). Ruled (b):
+stop driver (wrapper captures the addendum specimen), named-deviation stop, row 12c green,
+VERDICT -> STAGE A: PASS, [PROBE-A-CADENCE-UNIT] closes. Chaos 0/11 stated plainly (fencing
+evidence cited from soak2+scenarios). Then: a16 slot, final whole-branch review, stage close.
