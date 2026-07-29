@@ -1923,3 +1923,8 @@ re-validation specimen.
 CasGcClampSuppressedPasses=1). Load 27 = the soak's own stack (rustfs 325% + 2 servers) plus
 a TRANSIENT git auto-repack (3.5 min in) — ruled let-finish now, during the pre-chaos build-up
 phase, rather than risk it re-triggering inside a chaos window. No agent builds running.
+**2026-07-29 11:40 local** — watchdog: soak2 tick #25 (21.7GB vs 8GB budget — suppression
+means growth never reverses; end-of-run fsck measurability at risk AGAIN: run-1 died at 731s
+EXIT=159 despite the 1800s wrapper = product-internal deadline). a14 warned to prep the
+deadline knob / partial_on_deadline form NOW. Lane adaptations landing (c7acc572b13 +
+9c769f55eaf). Load 7.5 (repack done). No agent builds.
