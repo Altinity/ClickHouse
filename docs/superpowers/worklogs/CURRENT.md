@@ -2052,3 +2052,7 @@ Next: ASan green -> exclusive re-validation soak via run_soak.sh on the merged b
 (opus) dispatched (spec from the §0 decision set; goals = simplification + measured
 upstream-impact minimization + safe relink); codex sol-xhigh review follows the spec commit.
 Parallel: ASan merged gate running; soak next; a16 editing T16b.
+**2026-07-29 16:2x local** — BOTH merged gates green (1565 release / 1569 ASan — exact
+arithmetic; watchdog's asan false alarm = markers in build_asan/ not build/). Re-validation
+soak launch ordered (a14, run_soak.sh, 6/40, 30m, >=3-rounds criterion). T16b adjudicated
+(a/b accept, c ordered). Stage close imminent: soak green -> verdict PASS -> final review.
