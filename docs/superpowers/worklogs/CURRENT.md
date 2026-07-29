@@ -2112,3 +2112,8 @@ events, exact per-minute correlation; self-healed via healthy peer; double-blip/
 stage-gating; RCA running in parallel (keeper renewal reason, checkPartImpl taxonomy + blame
 pre-existence, loss boundary, fsck-pressure trigger). Run continues to deadline for the
 capture.
+**2026-07-29 18:0x local** — codex r2: 0B/5M/3m (B1 confirmed closed w/ DiskSelector
+uniqueness; one real find — best-effort abandon can fail => S0 invariant too strong; rest =
+consistency class incl. the nonce-in-wrong-param paragraph and the surviving withdrawn-LRU
+line). v5 final fix round dispatched. USER extended the lease-blip RCA: full three-table
+trace (CA log + part_log + text_log) per broken part, captured LIVE.
