@@ -1712,3 +1712,7 @@ test). Lane-g retired. T11-T14 remain. No push.
 
 **2026-07-29 03:20 local watchdog** — convergence advancing fast: stitches 1 (seam fill) and 2
 (real-crossing un-seed) COMMITTED; iterating on the next (build3 running). No push.
+
+**2026-07-29 03:40 local watchdog** — convergence final phase: stitches 3-5 committed, ASan
+gate running (log growing), integration lane logged. Stitch-6 sweep found zero remaining stale
+promises. No push.
