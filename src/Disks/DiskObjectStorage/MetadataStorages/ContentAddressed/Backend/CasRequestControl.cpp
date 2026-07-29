@@ -297,6 +297,14 @@ CasWriteOutcome CasRequestController::putIfAbsentControlled(
     const uint64_t deadline_ms = now_ms() + budget.operation_deadline_ms;
     /// Diagnostic bookkeeping only -- nothing below branches on it (finding #37 defect 3).
     uint32_t attempts_sent = 0;
+    /// Does an EARLIER attempt of THIS call remain unresolved -- sent, and neither proven applied nor
+    /// proven refused? Set on the one path that produces exactly that state: an attempt whose outcome
+    /// was ambiguous and whose exact-key resolve came back absent or unreadable. The request may have
+    /// been received; an absent read now proves nothing about what materializes later, which is the
+    /// whole reason the reissue loop exists. This is NOT diagnostic: it decides the CALL's verdict at
+    /// the DefiniteFailure arm below. A pre-attempt gate refusal never sets it -- those return without
+    /// sending, so they leave nothing that could land.
+    bool earlier_attempt_unresolved = false;
     const auto unresolved = [&](CasUnresolvedReason reason)
     {
         if (out_reason)
@@ -339,7 +347,18 @@ CasWriteOutcome CasRequestController::putIfAbsentControlled(
         }
 
         if (attempt_outcome == CasWriteOutcome::DefiniteFailure)
-            return CasWriteOutcome::DefiniteFailure;   /// proven never applied — no resolve, no retry
+        {
+            /// THIS attempt is proven never applied — but the verdict belongs to the CALL. An earlier
+            /// attempt that is still unresolved may yet materialize at the key, and a caller reading
+            /// `DefiniteFailure` acts on "the key is unwritten": `CasRefLedger::commitRefChunk` clears
+            /// its apply-pending marker and reports the txn id never used, so the next append re-derives
+            /// that id and a late-landing predecessor becomes an acked-then-lost transaction. Ambiguity
+            /// dominates a definite refusal that came after it; the caller wedges and resolves the key
+            /// instead. No resolve and no retry either way — this attempt has nothing left to settle.
+            if (earlier_attempt_unresolved)
+                return unresolved(CasUnresolvedReason::DefiniteFailureAfterAmbiguity);
+            return CasWriteOutcome::DefiniteFailure;   /// every attempt of this call was proven never applied
+        }
 
         if (attempt_outcome == CasWriteOutcome::Unresolved)
         {
@@ -348,6 +367,10 @@ CasWriteOutcome CasRequestController::putIfAbsentControlled(
             attempt_outcome = resolveByExactGet(key_s, bytes_s, &committed_token);
             if (attempt_outcome == CasWriteOutcome::Unresolved)
             {
+                /// This attempt is now one that may still land: it was sent, and the resolve settled
+                /// nothing. Recorded BEFORE the exhaustion checks below so it is set no matter which of
+                /// them ends the loop, and read by the DefiniteFailure arm of every later attempt.
+                earlier_attempt_unresolved = true;
                 /// Absent/unreadable: another attempt of the SAME (key, bytes) may be legal — after the
                 /// fence-gated capped-exponential backoff (pauseBeforeReissue). No pause after the LAST
                 /// attempt: the budget is spent, sleeping would only delay the Unresolved verdict.

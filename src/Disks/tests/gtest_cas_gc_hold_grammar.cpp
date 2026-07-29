@@ -9,6 +9,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcShardPlan.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Common/ProfileEvents.h>
+#include <base/defines.h>
 #include "cas_test_helpers.h"
 
 #include <cstring>
@@ -16,6 +17,8 @@
 #include <limits>
 #include <mutex>
 #include <set>
+#include <utility>
+#include <vector>
 
 /// DURABLE HOLDS (spec 2026-07-27 "ref chain complete cut" §5).
 ///
@@ -49,6 +52,7 @@ namespace DB::ErrorCodes
 {
 extern const int CORRUPTED_DATA;
 extern const int LIMIT_EXCEEDED;
+extern const int LOGICAL_ERROR;
 }
 
 namespace ProfileEvents
@@ -201,6 +205,115 @@ CasFoldSeal holdSealWithCovLineOfExactly(uint64_t target_bytes)
     return maximalHoldSeal(probe_key + String(target_bytes - base, 'a'));
 }
 
+/// A one-row seal whose coverage is ordinary and CLEAN: folded through its cursor, nothing held.
+CasFoldSeal cleanSeal(const String & map_key)
+{
+    CasFoldSeal seal;
+    seal.generation = 3;
+    seal.parent_generation = 2;
+    ShardCoverage cov;
+    cov.classification = 2;
+    cov.folded_token = Token{"t", TokenType::ETag};
+    cov.last_folded_ref_id = RefTxnId{4, 5};
+    seal.per_ns_shard[map_key] = cov;
+    return seal;
+}
+
+/// A one-row seal whose coverage is HELD at an exact position — the row every erasure shape below is
+/// trying to make disappear.
+CasFoldSeal heldSeal(const String & map_key)
+{
+    CasFoldSeal seal = cleanSeal(map_key);
+    ShardCoverage & cov = seal.per_ns_shard[map_key];
+    cov.classification = 4;
+    cov.hold = RefHold{.reason = HoldReason::GapBelowWitness, .offending_position = RefTxnId{4, 6},
+                       .retry_count = 7, .next_retry_round = 99};
+    return seal;
+}
+
+/// The header and meta lines (1 and 2) of an encoded seal, terminators included.
+String headerAndMetaOf(const String & encoded)
+{
+    const size_t past_meta = encoded.find('\n', encoded.find('\n') + 1) + 1;
+    EXPECT_NE(past_meta, 0u);
+    return encoded.substr(0, past_meta);
+}
+
+/// Assemble a raw seal object from `records` (one record per element, no terminators), on `prototype`'s
+/// header and meta lines, closed by the trailer count those records imply. This is the ONLY way to put a
+/// repeated record key on the wire: `CasFoldSeal` stores keyed maps, so a duplicate is not a value any
+/// producer can hold — it is a shape a forged, truncated, or mis-merged object has.
+String sealTextWith(const String & prototype, const std::vector<String> & records)
+{
+    String text = headerAndMetaOf(prototype);
+    for (const String & record : records)
+        text += record + "\n";
+    return text + "{\"n\":" + std::to_string(records.size()) + "}\n";
+}
+
+/// Replace the coverage row's `cls` value with `raw`, VERBATIM. The point is to write integers no
+/// `ShardCoverage` can hold: the field is a byte in the struct, so a wide value exists only on the wire,
+/// which is exactly where a reader has to catch it. `cls` is never the last field of a `cov` record, so
+/// the value always ends at a comma.
+String withRawClassification(const String & encoded, std::string_view raw)
+{
+    const size_t at = encoded.find("\"cls\":");
+    EXPECT_NE(at, String::npos);
+    const size_t begin = at + strlen("\"cls\":");
+    const size_t end = encoded.find(',', begin);
+    EXPECT_NE(end, String::npos);
+    return encoded.substr(0, begin) + String{raw} + encoded.substr(end);
+}
+
+/// Replace the FIRST occurrence of `field` with `replacement` (both are whole `"key":value` fragments),
+/// so a test states the exact wire shape it is feeding the decoder.
+String withField(const String & encoded, const String & field, const String & replacement)
+{
+    const size_t at = encoded.find(field);
+    EXPECT_NE(at, String::npos) << "the encoder does not emit " << field;
+    return encoded.substr(0, at) + replacement + encoded.substr(at + field.size());
+}
+
+/// Every coverage row the ENCODER must refuse, each paired with why producing it would be a bug in our
+/// own fold rather than corruption arriving from a store. Shared by the two builds' assertions below so
+/// the release expectation and the sanitizer death expectation can never drift apart.
+std::vector<std::pair<const char *, CasFoldSeal>> illFormedSealsTheEncoderMustRefuse()
+{
+    std::vector<std::pair<const char *, CasFoldSeal>> out;
+
+    /// The pairing, both ways round.
+    CasFoldSeal hold_on_folded = heldSeal("ns/0");
+    hold_on_folded.per_ns_shard["ns/0"].classification = 2;
+    out.emplace_back("a hold on a folded (2) row claims a stop that did not happen", hold_on_folded);
+
+    CasFoldSeal clamped_without_hold = heldSeal("ns/0");
+    clamped_without_hold.per_ns_shard["ns/0"].hold.reset();
+    out.emplace_back("a clamped (4) row with no hold is indistinguishable from a clean cursor once "
+                     "durable", clamped_without_hold);
+
+    /// The closed set. 3 is the dangerous one: it passes the sweep's `== 4` and `== 0` refusals and
+    /// reaches the deletion premise, which is a refusal written in terms of the set.
+    CasFoldSeal classification_three = cleanSeal("ns/0");
+    classification_three.per_ns_shard["ns/0"].classification = 3;
+    out.emplace_back("classification 3 is not one of {0,1,2,4} and passes every refusal stated in terms "
+                     "of them", classification_three);
+
+    CasFoldSeal classification_max = cleanSeal("ns/0");
+    classification_max.per_ns_shard["ns/0"].classification = 255;
+    out.emplace_back("classification 255 is not one of {0,1,2,4}", classification_max);
+
+    /// The self-erasing hold, and its half-zero sibling.
+    CasFoldSeal hold_at_zero = heldSeal("ns/0");
+    hold_at_zero.per_ns_shard["ns/0"].hold->offending_position = RefTxnId{};
+    out.emplace_back("a hold at {0,0} is cleared by the first record the next round folds", hold_at_zero);
+
+    CasFoldSeal hold_zero_sequence = heldSeal("ns/0");
+    hold_zero_sequence.per_ns_shard["ns/0"].hold->offending_position = RefTxnId{7, 0};
+    out.emplace_back("a hold position with a zero component is not a renderable id", hold_zero_sequence);
+
+    return out;
+}
+
 }
 
 /// ===================== THE SHARED BYTE ARITHMETIC =====================
@@ -264,22 +377,45 @@ TEST(CasGcHoldGrammar, EveryHoldReasonRoundTrips)
     }
 }
 
-TEST(CasGcHoldGrammar, AHoldOnAnyOtherClassificationIsRefusedBothWays)
+/// THE ENCODER'S HALF OF THE GRAMMAR, in one place. Every shape here is OUR OWN fold handing the codec
+/// a row it must never make durable, so the refusal is `LOGICAL_ERROR` — the code `encodeGcState` raises
+/// for the same category of impossible input — and not the `CORRUPTED_DATA` reserved for bytes that
+/// arrived from a store. Under a debug or sanitizer build that code ABORTS at construction
+/// (`handle_error_code`), so the same table is asserted as a death expectation there; the contract
+/// ("these bytes are never produced") is what both forms pin.
+#ifndef DEBUG_OR_SANITIZER_BUILD
+TEST(CasGcHoldGrammar, TheEncoderRefusesEveryIllFormedCoverageRow)
+{
+    for (const auto & entry : illFormedSealsTheEncoderMustRefuse())
+    {
+        SCOPED_TRACE(entry.first);
+        expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&] { encodeFoldSeal(entry.second); });
+    }
+}
+#endif
+
+#if defined(DEBUG_OR_SANITIZER_BUILD)
+TEST(CasGcHoldGrammarDeathTest, TheEncoderRefusesEveryIllFormedCoverageRow)
+{
+    for (const auto & entry : illFormedSealsTheEncoderMustRefuse())
+    {
+        SCOPED_TRACE(entry.first);
+        EXPECT_DEATH({ (void)encodeFoldSeal(entry.second); }, "");
+    }
+}
+#endif
+
+TEST(CasGcHoldGrammar, AHoldOnAnyOtherClassificationIsRefusedByTheDecoder)
 {
     CasFoldSeal seal;
     seal.generation = 1;
     ShardCoverage cov;
-    cov.classification = 2;   /// folded — and yet carrying a hold
+
+    /// Bytes some other producer wrote. Built by demoting a legitimate held row's classification, so the
+    /// hold fields are exactly the ones the encoder emits.
+    cov.classification = 4;
     cov.hold = RefHold{.reason = HoldReason::GapBelowWitness, .offending_position = RefTxnId{1, 2},
                        .retry_count = 0, .next_retry_round = 1};
-    seal.per_ns_shard["ns/0"] = cov;
-
-    /// The ENCODER refuses: a durable seal must never contain the contradiction in the first place.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeFoldSeal(seal); });
-
-    /// And so does the DECODER, for bytes some other producer wrote. Built by demoting a legitimate
-    /// held row's classification, so the hold fields are exactly the ones the encoder emits.
-    cov.classification = 4;
     seal.per_ns_shard["ns/0"] = cov;
     String text = encodeFoldSeal(seal);
     const size_t at = text.find("\"cls\":4");
@@ -288,16 +424,13 @@ TEST(CasGcHoldGrammar, AHoldOnAnyOtherClassificationIsRefusedBothWays)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeFoldSeal(text); });
 }
 
-TEST(CasGcHoldGrammar, ClassificationFourWithoutAHoldIsRefusedBothWays)
+TEST(CasGcHoldGrammar, ClassificationFourWithoutAHoldIsRefusedByTheDecoder)
 {
     CasFoldSeal seal;
     seal.generation = 1;
     ShardCoverage cov;
     cov.classification = 4;
     cov.last_folded_ref_id = RefTxnId{1, 1};
-    seal.per_ns_shard["ns/0"] = cov;   /// held, with nothing saying why or where
-
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeFoldSeal(seal); });
 
     /// Every single hold field is REQUIRED: dropping any one of them is corruption, not a default.
     cov.hold = RefHold{.reason = HoldReason::BodyUndecodable, .offending_position = RefTxnId{1, 2},
@@ -351,6 +484,165 @@ TEST(CasGcHoldGrammar, UnknownHoldReasonWordIsCorruptedData)
     ASSERT_NE(at, String::npos);
     text.replace(at, strlen("gap_below_witness"), "gap_below_witnesX");
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeFoldSeal(text); });
+}
+
+/// ===================== THE THREE WAYS A SEAL CAN ERASE A HOLD =====================
+///
+/// The three shapes below are one finding, and it is about what a fold seal is FOR. The hold is the only
+/// durable record that a namespace stopped and where; everything downstream reads the seal and nothing
+/// re-derives the stop. So a seal that decodes into "no hold here" is not a lossy read, it is a licence
+/// to delete: the sweep's §6 refusals are stated as `classification == 4` / `== 0` / `hold.has_value()`,
+/// and a row that slips past all three reaches an irreversible delete of a manifest the fold never
+/// accounted for. Each shape gets past a DIFFERENT one of the decoder's checks, which is why they are
+/// pinned separately rather than as one "malformed seal" case.
+
+/// (1) The classification the reader never sees. `cls` is narrowed to a byte, so an integer on the wire
+/// is truncated first and validated (if at all) afterwards: 258 becomes 2, "everything through the
+/// cursor was folded". The value has to be judged WIDE, before the narrowing, or the wire can buy
+/// coverage that no fold ever performed.
+TEST(CasGcHoldGrammar, AClassificationOutsideTheGrammarIsCorruptedData)
+{
+    const String clean = encodeFoldSeal(cleanSeal("ns/0"));
+    ASSERT_EQ(decodeFoldSeal(clean).per_ns_shard.at("ns/0").classification, 2)
+        << "the unmodified row is the one every case below deviates from";
+
+    /// In-range bytes that are simply not classifications. 3 is the one the sweep's refusals miss.
+    for (const std::string_view raw : {"3", "5", "6", "255"})
+    {
+        SCOPED_TRACE(String{"cls="} + String{raw});
+        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+                         [&] { decodeFoldSeal(withRawClassification(clean, raw)); });
+    }
+
+    /// Wide integers whose LOW BYTE lands inside the grammar: 258 -> 2 (fully folded), 256 -> 0
+    /// (absent), 260 -> 4 (clamped). Each would decode as a row the fold never wrote.
+    for (const std::string_view raw : {"256", "258", "260", "18446744073709551615"})
+    {
+        SCOPED_TRACE(String{"cls="} + String{raw});
+        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+                         [&] { decodeFoldSeal(withRawClassification(clean, raw)); });
+    }
+}
+
+/// And the field itself is required: an absent `cls` reads as 0, which is not "nothing was said about
+/// this namespace" but the positive claim "no round folded it".
+TEST(CasGcHoldGrammar, ACoverageRowWithoutAClassificationIsCorruptedData)
+{
+    const String clean = encodeFoldSeal(cleanSeal("ns/0"));
+    const size_t at = clean.find("\"cls\":2,");
+    ASSERT_NE(at, String::npos);
+    String without = clean;
+    without.erase(at, strlen("\"cls\":2,"));
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeFoldSeal(without); });
+}
+
+/// (2) The hold that clears itself. `{0,0}` passes the completeness check — every field is present — and
+/// then the carry rule drops it on the next round, because a hold rides forward only while the walk
+/// stops BELOW its position and nothing is below zero. The namespace advances with no record that it was
+/// ever held. A zero in EITHER component is the same defect, and is additionally unnameable: the sweep
+/// renders the position when it reports what it retained, and `renderRefTxnId` refuses a zero component.
+TEST(CasGcHoldGrammar, AHoldWhoseOffendingPositionHasAZeroComponentIsCorruptedData)
+{
+    const String held = encodeFoldSeal(heldSeal("ns/0"));
+    ASSERT_TRUE(decodeFoldSeal(held).per_ns_shard.at("ns/0").hold.has_value());
+
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
+    {
+        decodeFoldSeal(withField(withField(held, "\"hpe\":\"4\"", "\"hpe\":\"0\""),
+                                 "\"hps\":\"6\"", "\"hps\":\"0\""));
+    });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+                     [&] { decodeFoldSeal(withField(held, "\"hpe\":\"4\"", "\"hpe\":\"0\"")); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+                     [&] { decodeFoldSeal(withField(held, "\"hps\":\"6\"", "\"hps\":\"0\"")); });
+}
+
+/// (3) The duplicate row. Two `cov` records for the same (namespace, shard) — held first, clean second —
+/// used to be accepted with last-wins, so a single appended line erased a hold without touching the one
+/// that recorded it. There is exactly one row per key, and a second one is corruption.
+TEST(CasGcHoldGrammar, ASecondCoverageRowForTheSameKeyIsCorruptedData)
+{
+    const String held_line = covLineOf(encodeFoldSeal(heldSeal("ns/0")));
+    const String clean_line = covLineOf(encodeFoldSeal(cleanSeal("ns/0")));
+    const String other_clean_line = covLineOf(encodeFoldSeal(cleanSeal("ns/1")));
+    const String prototype = encodeFoldSeal(heldSeal("ns/0"));
+
+    /// The CONTROL first: the same two-record assembly with DIFFERENT keys decodes, so the refusal below
+    /// is about the repeated key and not about the way these bytes are forged.
+    const CasFoldSeal two_keys = decodeFoldSeal(sealTextWith(prototype, {held_line, other_clean_line}));
+    ASSERT_EQ(two_keys.per_ns_shard.size(), 2u);
+    ASSERT_TRUE(two_keys.per_ns_shard.at("ns/0").hold.has_value());
+
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+                     [&] { decodeFoldSeal(sealTextWith(prototype, {held_line, clean_line})); });
+    /// Order does not redeem it: a clean row followed by a held one is the same broken object.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+                     [&] { decodeFoldSeal(sealTextWith(prototype, {clean_line, held_line})); });
+    /// Nor does repeating the identical row.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+                     [&] { decodeFoldSeal(sealTextWith(prototype, {held_line, held_line})); });
+
+    /// The ENCODER needs no matching check, and this is why: the seal stores keyed maps, so a second row
+    /// for a key is not a value any producer can construct — assigning it replaces the first.
+    CasFoldSeal seal = heldSeal("ns/0");
+    seal.per_ns_shard["ns/0"] = cleanSeal("ns/0").per_ns_shard.at("ns/0");
+    EXPECT_EQ(seal.per_ns_shard.size(), 1u);
+}
+
+/// The same one-record-per-key rule for the other two keyed record kinds. A repeated `cnd` row rewrites
+/// a shard's condemned totals (what graduation paces on) and a repeated `nsc` row rewrites a namespace
+/// cleanup's state — including `pending` -> `completed`, which retires the cleanup while objects may
+/// still be there.
+TEST(CasGcHoldGrammar, ASecondCondemnedSummaryOrNsCleanupRecordIsCorruptedData)
+{
+    CasFoldSeal seal = cleanSeal("ns/0");
+    seal.condemned_summary[0] = CondemnedSummary{.condemned_total = 5, .pending_total = 1,
+                                                 .oldest_nonpending_condemn_round = 3};
+    seal.ns_cleanup_items["ns\n" + renderRefTxnId(RefTxnId{2, 3})] =
+        RefNsCleanupItem{RootNamespace{"ns"}, RefTxnId{2, 3}, RefNsCleanupState::Pending};
+    const String encoded = encodeFoldSeal(seal);
+
+    /// Lines 3..5 are cov, cnd, nsc in the encoder's fixed order.
+    std::vector<String> lines;
+    for (size_t begin = headerAndMetaOf(encoded).size(); begin < encoded.size();)
+    {
+        const size_t end = encoded.find('\n', begin);
+        ASSERT_NE(end, String::npos);
+        lines.push_back(encoded.substr(begin, end - begin));
+        begin = end + 1;
+    }
+    ASSERT_EQ(lines.size(), 4u) << "cov, cnd, nsc and the trailer";
+    const String cov_line = lines[0];
+    const String cnd_line = lines[1];
+    const String nsc_line = lines[2];
+
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+                     [&] { decodeFoldSeal(sealTextWith(encoded, {cov_line, cnd_line, cnd_line})); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+                     [&] { decodeFoldSeal(sealTextWith(encoded, {cov_line, nsc_line, nsc_line})); });
+    /// The unduplicated assembly is the control.
+    const std::vector<String> one_of_each{cov_line, cnd_line, nsc_line};
+    EXPECT_NO_THROW(decodeFoldSeal(sealTextWith(encoded, one_of_each)));
+}
+
+/// An `nsc` record names a removal transaction, and that id becomes part of the item's key. A zero
+/// component there is corruption on the wire — but it used to reach `renderRefTxnId`, whose refusal is
+/// `LOGICAL_ERROR`: an ABORT under a debug or sanitizer build, taking the process down inside the decode
+/// of bytes that came from a store. Decoding foreign bytes must fail this read, never the process.
+TEST(CasGcHoldGrammar, AnNsCleanupItemWithAZeroRemovalIdIsCorruptedData)
+{
+    CasFoldSeal seal = cleanSeal("ns/0");
+    seal.ns_cleanup_items["ns\n" + renderRefTxnId(RefTxnId{2, 3})] =
+        RefNsCleanupItem{RootNamespace{"ns"}, RefTxnId{2, 3}, RefNsCleanupState::Pending};
+    const String encoded = encodeFoldSeal(seal);
+
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+                     [&] { decodeFoldSeal(withField(encoded, "\"rte\":\"2\"", "\"rte\":\"0\"")); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+                     [&] { decodeFoldSeal(withField(encoded, "\"rts\":\"3\"", "\"rts\":\"0\"")); });
+    /// Omitted entirely is the same thing: the fields default to zero.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+                     [&] { decodeFoldSeal(withField(encoded, "\"rte\":\"2\",", "")); });
 }
 
 /// ===================== THE TWO CAPS, KEPT DISTINCT =====================

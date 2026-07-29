@@ -61,6 +61,14 @@ struct RefHold
 
     /// The exact position the fold must resolve before this namespace may advance. A carried hold makes
     /// the next round read this key even when the round's hint omits the namespace entirely.
+    ///
+    /// A CANONICAL id: both components are nonzero, and both codecs enforce it. `{0, 0}` is not a
+    /// degenerate hold, it is a hold that ERASES ITSELF — every position compares at or above it, so the
+    /// first fold that reaches any record clears the hold as resolved, and the namespace advances with
+    /// nothing recording that it ever stopped. It is also unnameable: `renderRefTxnId` refuses a zero
+    /// component, so the sweep that retains a manifest "because the namespace is held at <position>"
+    /// cannot even state its reason. The decoder rejects it as `CORRUPTED_DATA` and the encoder as
+    /// `LOGICAL_ERROR`.
     RefTxnId offending_position{};
 
     /// How many rounds have retried `offending_position` without resolving it. Purely observational:
@@ -81,6 +89,13 @@ struct RefHold
 /// means folding was clamped below the ref-log cursor. A clamped entry must be read again even if its
 /// manifest token is unchanged, because an unfolded event may become foldable in the next round.
 /// `folded_token` is the manifest token observed when the entry was processed.
+///
+/// THE SET {0, 1, 2, 4} IS CLOSED, and both codecs enforce it (decode `CORRUPTED_DATA`, encode
+/// `LOGICAL_ERROR`). Every consumer branches on exact values — the sweep's §6 deletion premise refuses a
+/// row by testing `== 4` and `== 0` — so an unrecognized byte is not a variant to tolerate: it passes
+/// every refusal stated in terms of the set and reaches the delete. The decoder also validates BEFORE
+/// narrowing to the byte, because a wide integer on the wire (258, say) truncates into the set and would
+/// otherwise claim a coverage the fold never proved.
 struct ShardCoverage
 {
     uint8_t classification = 0;
@@ -95,9 +110,9 @@ struct ShardCoverage
     /// STRICT GRAMMAR: present if and only if `classification == 4`. Both directions enforce it — the
     /// encoder refuses to write a classification-4 row without a hold (a clamp whose reason was lost is
     /// indistinguishable from a clean cursor once it is durable) and refuses to write a hold on any
-    /// other classification; the decoder rejects both shapes as `CORRUPTED_DATA`. The pairing lives in
-    /// the type, not only in the codec, so no producer can construct the forbidden combination by
-    /// forgetting a field.
+    /// other classification (`LOGICAL_ERROR`); the decoder rejects both shapes as `CORRUPTED_DATA`. The
+    /// pairing lives in the type, not only in the codec, so no producer can construct the forbidden
+    /// combination by forgetting a field.
     std::optional<RefHold> hold = std::nullopt;
 
     bool operator==(const ShardCoverage &) const = default;
@@ -177,14 +192,23 @@ void checkFoldSealObjectBytes(uint64_t encoded_bytes);
 /// tagged records in the fixed `cov`/`btr`/`cnd`/`nsc` order and a record-count trailer. Map iteration and
 /// run references are sorted so retries produce byte-identical output for write-once adoption.
 ///
-/// Enforces the strict classification-4 hold grammar and BOTH byte caps: every emitted line against
+/// Enforces the whole coverage grammar — the closed classification set, the classification-4 hold
+/// pairing, and the hold's canonical offending position — and BOTH byte caps: every emitted line against
 /// `line_cap` — header, meta, records and trailer alike, with no exception — and the whole object
 /// against `object_cap`. Both PUT sites go through this function, so the gate cannot be bypassed by
 /// adding a third one.
+///
+/// A grammar violation here is `LOGICAL_ERROR`, not `CORRUPTED_DATA`: these bytes do not come from a
+/// store, they come from THIS process, so the seal it is about to make durable is a bug in our own
+/// writer — the same code `encodeGcState` raises for its own impossible input. The caps stay
+/// `LIMIT_EXCEEDED` (a well-formed seal, over budget). Nothing is returned on any refusal, so no PUT
+/// site can issue the write.
 String encodeFoldSeal(const CasFoldSeal & seal);
 
-/// Decodes and validates a fold seal, rejecting unknown fields, malformed records, trailing bytes, and
-/// a trailer count that differs from the records read. Invalid persisted data raises `CORRUPTED_DATA`.
+/// Decodes and validates a fold seal, rejecting unknown fields, malformed records, trailing bytes, a
+/// second record for a key already read, and a trailer count that differs from the records read.
+/// Invalid persisted data raises `CORRUPTED_DATA` — including every shape the encoder refuses, since
+/// these bytes may have been written by anything at all.
 CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expected_generation = std::nullopt);
 
 }

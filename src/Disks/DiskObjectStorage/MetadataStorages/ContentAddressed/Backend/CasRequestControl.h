@@ -50,6 +50,11 @@ enum class CasUnresolvedReason : uint8_t
     DeadlineMidWay,    /// >= 1 attempt was sent, then the operation deadline left no room for another
     FenceLostPostWrite,/// an attempt COMMITTED but the fence had dropped by the time it returned
     AttemptsExhausted, /// the genuine case the "retry budget exhausted" wording describes
+    /// A LATER attempt was definitively refused while an EARLIER one of the same call is still
+    /// unresolved. The refusal proves only its own attempt never applied; the earlier one may still
+    /// materialize at the key, so the CALL cannot report `DefiniteFailure` (see
+    /// `putIfAbsentControlled`). Reported instead of the definite verdict, never alongside it.
+    DefiniteFailureAfterAmbiguity,
 };
 
 /// Does this `Unresolved` PROVE that no attempt ever reached the network — i.e. that the key is
@@ -79,6 +84,8 @@ constexpr bool unresolvedProvesNothingWasSent(CasUnresolvedReason reason)
         case CasUnresolvedReason::DeadlineMidWay:
         case CasUnresolvedReason::FenceLostPostWrite:
         case CasUnresolvedReason::AttemptsExhausted:
+        /// The whole point of this value is that an earlier attempt WAS sent and may still land.
+        case CasUnresolvedReason::DefiniteFailureAfterAmbiguity:
             return false;
     }
     return false;
@@ -101,6 +108,10 @@ constexpr std::string_view describeUnresolvedReason(CasUnresolvedReason reason)
                                                              "dropped before it returned";
         case CasUnresolvedReason::AttemptsExhausted:  return "the attempt budget was exhausted without a "
                                                              "definite outcome";
+        case CasUnresolvedReason::DefiniteFailureAfterAmbiguity:
+                                                      return "a later attempt was definitively refused, but "
+                                                             "an earlier attempt of the same call is still "
+                                                             "unresolved and may yet land";
     }
     return "unspecified";
 }
@@ -394,6 +405,16 @@ public:
     /// Throws `CORRUPTED_DATA` if resolution ever observes DIFFERENT valid bytes at `key` — a real
     /// conflict, never collapsed into `Unresolved`/`DefiniteFailure`. Returns `Unresolved` (never
     /// throws) when the fence is lost or the budget is exhausted before a definite outcome is reached.
+    ///
+    /// THE VERDICT IS THE CALL'S, NOT THE LAST ATTEMPT'S. `DefiniteFailure` is returned only when EVERY
+    /// attempt this call sent was itself proven never applied. One attempt's whitelisted rejection
+    /// proves nothing about an EARLIER attempt of the same call that went ambiguous: that request may
+    /// have been received and may still materialize at `key` (an absent resolve GET is not evidence —
+    /// `unresolvedProvesNothingWasSent`). Any such attempt therefore dominates the result, which becomes
+    /// `Unresolved`/`DefiniteFailureAfterAmbiguity` — the wedge path — because a caller acting on
+    /// `DefiniteFailure` declares the key unwritten and reuses the id (`CasRefLedger::commitRefChunk`),
+    /// which an ambiguous predecessor can turn into an acked-then-lost transaction. Attempts a
+    /// pre-attempt gate refused never reach the backend, so they never make this call ambiguous.
     /// `out_token` (optional): set ONLY on a `Committed` return, to the committed incarnation's token —
     /// the attempt's own `PutResult` token, or the token the resolve GET observed when it proved an
     /// earlier ambiguous attempt landed. Lets audit emitters (e.g. `PartWriteTxn::stageManifest`'s
