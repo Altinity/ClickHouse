@@ -1872,3 +1872,6 @@ MergeTree startup over 74k-generation Outdated set; CA recovery clean (sealed, n
 Ruled harness-not-product; bounds 180->600 + skip registry landed (b67b00aef31), per-line
 GATE-SKIPPED rendering still owed; 3/12 re-run approved as criteria gate, 6/40 run kept as
 scale probe; T15 re-validation stays at 6/40. Lane 1/9 green.
+**2026-07-29 10:21 local** — watchdog: lanes 2/9 green (s3, gc_s3 both LANE_EXIT=0); codex
+phase-A review alive (4.4MB log); impl-a15 fresh in its worktree (no build yet — just ACKed,
+reading phase). Soak re-run queued behind lanes. Nothing wedged.
