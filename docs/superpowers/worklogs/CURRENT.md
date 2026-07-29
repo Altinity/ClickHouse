@@ -1988,3 +1988,8 @@ parked awaiting slot. Load 2.2. Nothing wedged.
 S43 edited 13:55, but NO scenario re-runs started (load 0.76, no markers) — nudged a14 (GO
 crossing suspected again). Chain: scenarios -> a16 slot -> reviews -> merge -> rebuild ->
 re-validation soak.
+**2026-07-29 14:3x local** — fix round 1 done: S38 19/19, S33 10/10, S30 8/8 (narrowing +
+two siblings: reclaimable_drained narrowed, S30 fanout SPLIT w/ CasRootGet 18->82); S43 8/12
+— W3 open: product-recreation works, servers dead on /ping post-restart (RCA continues w/
+docker-root log read; may be a REAL product defect -> row-14 flips to measured red). Verdict
+ruled: PENDING (T15 + row 14 W3). a16 slot opened. events-omits-zeros trap on record.
