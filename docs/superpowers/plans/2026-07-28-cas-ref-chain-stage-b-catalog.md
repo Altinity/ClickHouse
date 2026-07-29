@@ -58,6 +58,10 @@ destruction still suppressed does not exercise Stage B's claims.
 ### Task 0: Stage-A gate preflight {#task-0}
 
 - [ ] **Step 1:** `grep -n "STAGE A: PASS" docs/superpowers/cas/2026-07-28-stage-a-RESULTS.md`
+  (NOTE 2026-07-29: a THIRD verdict value exists — `STAGE A: PENDING (T15 re-validation)`,
+  controller-ruled during the gate task. The grep above correctly BLOCKS on it — PENDING is
+  not PASS — but the failure is intentional, not confusing: it means the Task 15 re-validation
+  soak has not yet turned the line to PASS. Do not proceed, do not treat as FAIL.)
   — exactly one match, else BLOCKED.
 - [ ] **Step 2:** Re-run the CA gtest gate filter (Stage A Task 0's exact command); record
   baseline counts in the report. No commit.
