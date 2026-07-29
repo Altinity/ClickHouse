@@ -14,8 +14,8 @@ CasFoldSeal sampleFoldSeal()
     CasFoldSeal seal;
     seal.generation = 7;
     seal.parent_generation = 6;
-    seal.per_ns_shard["ns1/0"] = ShardCoverage{.classification = 2, .folded_token = Token{"tok-a"}};
-    seal.per_ns_shard["ns1/1"] = ShardCoverage{.classification = 1, .folded_token = Token{}};
+    seal.per_ns_shard["ns1/0"] = ShardCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{3, 4}};
+    seal.per_ns_shard["ns1/1"] = ShardCoverage{.classification = 1};
     seal.blob_target_runs.push_back(RunRef{.key = "gc/gen/7/blob_target/0/0", .checksum = UInt128(0xABCDEF)});
     return seal;
 }
@@ -26,8 +26,7 @@ TEST(CasFormatBattery, FoldSeal)
     CasFoldSeal seal;
     seal.generation = 5;
     seal.parent_generation = 4;
-    seal.per_ns_shard["ns1/0"] = ShardCoverage{.classification = 2, .folded_token = Token{"t-1", TokenType::ETag},
-                                               .last_folded_ref_id = RefTxnId{7, 11}};
+    seal.per_ns_shard["ns1/0"] = ShardCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{7, 11}};
     seal.blob_target_runs.push_back(RunRef{.key = "r0", .checksum = UInt128(0x0f), .shard = 0, .generation = 5});
     seal.condemned_summary[0] = CondemnedSummary{.condemned_total = 3, .pending_total = 1,
                                                  .oldest_nonpending_condemn_round = 4};
@@ -36,7 +35,7 @@ TEST(CasFormatBattery, FoldSeal)
         [](std::string_view s) { decodeFoldSeal(std::string(openObject(FormatId::FoldSeal, s))); },
         "{\"type\":\"cas_fold_seal\",\"v\":4}\n"
         "{\"g\":\"5\",\"pg\":\"4\"}\n"
-        "{\"k\":\"cov\",\"key\":\"ns1/0\",\"cls\":2,\"tt\":\"etag\",\"tv\":\"t-1\",\"lfe\":\"7\",\"lfs\":\"11\"}\n"
+        "{\"k\":\"cov\",\"key\":\"ns1/0\",\"cls\":2,\"lfe\":\"7\",\"lfs\":\"11\"}\n"
         "{\"k\":\"btr\",\"key\":\"r0\",\"ck\":\"0000000000000000000000000000000f\",\"shard\":0,\"gen\":\"5\"}\n"
         "{\"k\":\"cnd\",\"shard\":0,\"ct\":3,\"pt\":1,\"ocr\":\"4\"}\n"
         "{\"n\":3}\n"});
@@ -51,7 +50,7 @@ TEST(CasFoldSealFormat, RoundTripsAllFields)
     EXPECT_EQ(out.parent_generation, in.parent_generation);
     ASSERT_EQ(out.per_ns_shard.size(), in.per_ns_shard.size());
     EXPECT_EQ(out.per_ns_shard.at("ns1/0").classification, 2);
-    EXPECT_EQ(out.per_ns_shard.at("ns1/0").folded_token.value, "tok-a");
+    EXPECT_EQ(out.per_ns_shard.at("ns1/0").last_folded_ref_id, (RefTxnId{3, 4}));
     ASSERT_EQ(out.blob_target_runs.size(), 1u);
     EXPECT_EQ(out.blob_target_runs[0].key, "gc/gen/7/blob_target/0/0");
     EXPECT_EQ(out.blob_target_runs[0].checksum, UInt128(0xABCDEF));
@@ -96,7 +95,7 @@ TEST(CasFoldSeal, RejectsEmptyAndBadMagic)
 TEST(CasFoldSeal, CoverageRecordsEveryDiscoveredShard)
 {
     CasFoldSeal in = sampleFoldSeal();
-    in.per_ns_shard["ns2/0"] = ShardCoverage{.classification = 0, .folded_token = Token{}};
+    in.per_ns_shard["ns2/0"] = ShardCoverage{.classification = 0};
     const CasFoldSeal out = decodeFoldSeal(encodeFoldSeal(in));
     EXPECT_TRUE(out.per_ns_shard.contains("ns2/0"));
     EXPECT_EQ(out.per_ns_shard.size(), 3u);
@@ -109,7 +108,7 @@ TEST(CasFoldSeal, FoldSealCondemnedSummaryRoundTrips)
     CasFoldSeal s;
     s.generation = 9;
     s.parent_generation = 8;
-    s.per_ns_shard["ns/0"] = ShardCoverage{.classification = 2, .folded_token = Token{"tok"}};
+    s.per_ns_shard["ns/0"] = ShardCoverage{.classification = 2};
     s.blob_target_runs.push_back(RunRef{.key = "gc/gen/9/blob_target/0/0", .checksum = UInt128(0x77),
                                         .shard = 0, .generation = 9});
     s.condemned_summary[0] = CondemnedSummary{.condemned_total = 3, .pending_total = 1,
@@ -126,26 +125,6 @@ TEST(CasFoldSeal, FoldSealCondemnedSummaryRoundTrips)
               std::numeric_limits<uint64_t>::max());   /// UINT64_MAX sentinel survives
 
     EXPECT_TRUE(decodeFoldSeal(encodeFoldSeal(CasFoldSeal{})).condemned_summary.empty());
-}
-
-TEST(CasFoldSeal, RejectsOutOfRangeFoldedTokenType)
-{
-    /// Decode alone is the enforcement point: a cov record with an unknown token-type word fails closed.
-    /// `v:3` is deliberate and must NOT follow a future `G_BUILD` bump: any version <= G_BUILD passes
-    /// the header gate, which is the point — the BODY is what has to fail here.
-    const String bad = "{\"type\":\"cas_fold_seal\",\"v\":3}\n"
-                       "{\"g\":\"1\",\"pg\":\"0\"}\n"
-                       "{\"k\":\"cov\",\"key\":\"n/0\",\"cls\":2,\"tt\":\"bogus\",\"tv\":\"x\",\"lfe\":\"0\",\"lfs\":\"0\"}\n"
-                       "{\"n\":1}\n";
-    try
-    {
-        decodeFoldSeal(bad);
-        FAIL() << "expected CORRUPTED_DATA for an out-of-range folded token type";
-    }
-    catch (const DB::Exception & e)
-    {
-        EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
-    }
 }
 
 TEST(CasFoldSeal, RejectsOutOfRangeNsCleanupState)

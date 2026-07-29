@@ -12,6 +12,7 @@
 #include <base/defines.h>
 #include "cas_test_helpers.h"
 
+#include <algorithm>
 #include <cstring>
 #include <functional>
 #include <limits>
@@ -166,8 +167,18 @@ RefHold holdOf(Backend & backend, const Layout & layout, const RootNamespace & n
     return cov->hold ? *cov->hold : RefHold{};
 }
 
-/// A seal carrying exactly one held coverage row, with every numeric at its maximum and a coverage key
-/// that needs JSON escaping — the worst case the per-row line reservation has to survive.
+/// A coverage key whose namespace part needs JSON escaping. Reachable, not contrived: a coverage key is
+/// `<namespace>/<shard>`, and `Layout::checkNamespace` constrains only the SEGMENT shape (non-empty, no
+/// empty segments, no reserved `_files`) — never the bytes; `checkCanonicalRefName` is equally permissive
+/// on the ref side. A RAW newline in such a key would split the record line in two, which is exactly what
+/// the escaper prevents. This is the fixture's escaping payload, and it belongs on the key: the line
+/// budget is measured on the bytes actually EMITTED (where one of these becomes two or six), never on
+/// the bytes of the value.
+const String kEscapingCoverageKey = "ns\"\\\n/0";
+
+/// A seal carrying exactly one held coverage row with every numeric at its maximum and a coverage key
+/// that needs escaping — the widest row the per-row line budget has to survive. The caller supplies the
+/// key, which is what the line-cap tests below grow byte by byte.
 CasFoldSeal maximalHoldSeal(const String & map_key)
 {
     CasFoldSeal seal;
@@ -175,7 +186,6 @@ CasFoldSeal maximalHoldSeal(const String & map_key)
     seal.parent_generation = std::numeric_limits<uint64_t>::max();
     ShardCoverage cov;
     cov.classification = 4;
-    cov.folded_token = Token{"\"\\\n", TokenType::ETag};   /// every byte of this token escapes
     cov.last_folded_ref_id = RefTxnId{std::numeric_limits<uint64_t>::max(),
                                       std::numeric_limits<uint64_t>::max()};
     cov.hold = RefHold{.reason = HoldReason::UnconsumedSealCrossing,   /// the longest reason word
@@ -195,11 +205,12 @@ String covLineOf(const String & encoded)
     return encoded.substr(begin, encoded.find('\n', begin) - begin);
 }
 
-/// A one-row seal whose `cov` line is EXACTLY `target_bytes` long, built by padding the coverage key
-/// with plain ASCII (one padding byte == one encoded byte).
+/// A one-row seal whose `cov` line is EXACTLY `target_bytes` long, built by padding the escaping
+/// coverage key with plain ASCII (one padding byte == one encoded byte, whatever the base key costs —
+/// the base is MEASURED by a real encode, so the escaped bytes are counted rather than assumed).
 CasFoldSeal holdSealWithCovLineOfExactly(uint64_t target_bytes)
 {
-    const String probe_key = "ns/0";
+    const String probe_key = kEscapingCoverageKey;
     const uint64_t base = covLineOf(encodeFoldSeal(maximalHoldSeal(probe_key))).size();
     EXPECT_LE(base, target_bytes) << "the unpadded maximal hold row already exceeds the target";
     return maximalHoldSeal(probe_key + String(target_bytes - base, 'a'));
@@ -213,7 +224,6 @@ CasFoldSeal cleanSeal(const String & map_key)
     seal.parent_generation = 2;
     ShardCoverage cov;
     cov.classification = 2;
-    cov.folded_token = Token{"t", TokenType::ETag};
     cov.last_folded_ref_id = RefTxnId{4, 5};
     seal.per_ns_shard[map_key] = cov;
     return seal;
@@ -364,7 +374,6 @@ TEST(CasGcHoldGrammar, EveryHoldReasonRoundTrips)
         seal.parent_generation = 2;
         ShardCoverage cov;
         cov.classification = 4;
-        cov.folded_token = Token{"t", TokenType::ETag};
         cov.last_folded_ref_id = RefTxnId{4, 5};
         cov.hold = RefHold{.reason = reason, .offending_position = RefTxnId{4, 6},
                            .retry_count = 7, .next_retry_round = 99};
@@ -655,15 +664,22 @@ TEST(CasGcHoldGrammar, MaximalHoldRowFitsTheLineCapAndOneMoreByteDoesNot)
     const uint64_t line_cap = foldSealCaps().line_cap;
     ASSERT_GT(line_cap, 0u);
 
-    /// AT the cap: accepted, and it round-trips — equality is inside the budget, on both sides.
+    /// AT the cap: accepted, and it round-trips — equality is inside the budget, on both sides. The
+    /// round-trip is over an ESCAPED coverage key, so it also proves the escaper and the unescaper agree
+    /// on a key carrying a quote, a backslash and a newline.
     const CasFoldSeal at_cap = holdSealWithCovLineOfExactly(line_cap);
     const String encoded = encodeFoldSeal(at_cap);
     ASSERT_EQ(covLineOf(encoded).size(), line_cap);
     EXPECT_EQ(decodeFoldSeal(encoded), at_cap);
+    EXPECT_EQ(std::count(encoded.begin(), encoded.end(), '\n'), 4)
+        << "header, meta, cov and trailer — the newline inside the coverage key must be ESCAPED, not "
+           "emitted raw, or the record would be split across two lines";
 
-    /// ONE byte of payload growth: the reader refuses the line...
+    /// ONE byte of payload growth and the reader refuses the line... The byte is inserted at the START
+    /// of the key value (one plain byte in, one emitted byte out) so the growth is independent of what
+    /// the key itself escapes to.
     String over = encoded;
-    over.insert(over.find("\"key\":\"ns/0") + 8, "a");
+    over.insert(over.find("\"key\":\"") + strlen("\"key\":\""), "a");
     ASSERT_EQ(covLineOf(over).size(), line_cap + 1);
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeFoldSeal(over); });
 

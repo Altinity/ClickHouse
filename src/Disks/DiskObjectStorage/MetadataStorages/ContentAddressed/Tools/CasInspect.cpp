@@ -368,7 +368,6 @@ String renderShardCoverage(const ShardCoverage & c)
 {
     return JsonObj()
         .add("classification", jsonUInt(c.classification))
-        .add("folded_token", renderToken(c.folded_token))
         .add("last_folded_ref_id", renderRefTxnIdObj(c.last_folded_ref_id))
         .str();
 }

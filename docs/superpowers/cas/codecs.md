@@ -405,8 +405,8 @@ contract.
 
 **Notes:**
 
-- `FoldShardCoverageProto.classification` and `folded_token_type` should be validated as enum domains
-  during decode.
+- `FoldShardCoverageProto.classification` should be validated as an enum domain during decode (the text
+  codec does: the set `{0, 1, 2, 4}` is closed and checked before the value is narrowed to its byte).
 - The `RunRefProto` checksum comments and writer behavior disagree; see `RunRef` below.
 
 ## Run Reference Subformat {#run-reference-subformat}
