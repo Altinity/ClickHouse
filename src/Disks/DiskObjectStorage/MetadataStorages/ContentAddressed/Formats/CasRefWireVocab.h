@@ -52,4 +52,14 @@ RefOwnerKind refOwnerKindFromWord(std::string_view w, std::string_view what);
 /// sharing one writer so the formats can never disagree on the representation.
 void writeRefTxnIdFields(CasJsonWriter & out, bool & first, std::string_view epoch_key, std::string_view seq_key, const RefTxnId & id);
 
+/// `RefTxnId`'s validity rule applied to ONE field of a decoded or about-to-be-encoded record: both
+/// components nonzero. `renderRefTxnId` refuses to build a key from anything else, so a half-zero id
+/// here would name an object that cannot exist -- `CORRUPTED_DATA`, in both directions.
+///
+/// Shared for the same reason `writeRefTxnIdFields` is: every ref format embeds ids besides its primary
+/// one (`cas_ref_log`'s `prev_epoch_seal`, `cas_ref_snap`'s `remove_txn_id`), and a per-format copy of
+/// the rule is a rule that can drift per format. `format` names the record kind and `field` the member,
+/// so each format keeps its own exception text without owning its own check.
+void checkRefTxnIdNonzero(const RefTxnId & id, std::string_view format, std::string_view field);
+
 }

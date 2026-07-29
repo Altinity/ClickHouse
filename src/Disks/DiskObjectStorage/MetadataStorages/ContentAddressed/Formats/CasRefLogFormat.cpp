@@ -43,13 +43,6 @@ RefOpKind opKindFromWord(std::string_view w)
     throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: unknown op kind '{}'", w);
 }
 
-void checkTxnIdNonzero(const RefTxnId & id, std::string_view what)
-{
-    if (id.writer_epoch == 0 || id.ref_sequence == 0)
-        throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "RefLogTxn: {} fields must both be nonzero, got {}-{}", what, id.writer_epoch, id.ref_sequence);
-}
-
 /// Byte budget over the encoded text. A removal-class transaction uses the larger complete-table
 /// budget and has neither an op-count nor a per-op cap; normal transactions are bounded by
 /// `ref_txn_max_ops` and, per op, by `ref_op_max_bytes` (checked via `encodedOpSize`, one op at a
@@ -260,7 +253,7 @@ void validateEpochSealGrammarStructural(const RefLogTxn & txn)
 
     if (txn.prev_epoch_seal)
     {
-        checkTxnIdNonzero(*txn.prev_epoch_seal, "prev_epoch_seal");
+        checkRefTxnIdNonzero(*txn.prev_epoch_seal, "RefLogTxn", "prev_epoch_seal");
         if (txn.txn_id.ref_sequence != 1)
             throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "RefLogTxn: prev_epoch_seal is only allowed at sequence 1, got txn_id {}-{}",
@@ -297,7 +290,7 @@ void validateEpochSealGrammarContextual(const RefLogTxn & txn, uint64_t life_epo
 
 String encodeRefLogTxn(const RefLogTxn & txn)
 {
-    checkTxnIdNonzero(txn.txn_id, "txn_id");
+    checkRefTxnIdNonzero(txn.txn_id, "RefLogTxn", "txn_id");
     validateEpochSealGrammarStructural(txn);
 
     CasJsonWriter out(512);
@@ -356,7 +349,7 @@ RefLogTxn decodeRefLogTxn(std::string_view data, const String & expected_ns, con
             throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: junk after meta line");
     }
 
-    checkTxnIdNonzero(txn.txn_id, "txn_id");
+    checkRefTxnIdNonzero(txn.txn_id, "RefLogTxn", "txn_id");
     /// The namespace and transaction id are duplicated in the body because the object key is the
     /// source of truth for which transaction is being read. Reject a valid body copied under a
     /// different key before accepting any of its operations.

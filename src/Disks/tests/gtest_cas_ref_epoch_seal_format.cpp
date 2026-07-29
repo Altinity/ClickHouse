@@ -234,7 +234,7 @@ TEST(CasRefEpochSealFormat, DecodeRejectsPrevEpochSealAtNonUnitSequenceSpliced)
 }
 
 /// Well-formedness (review finding M2): a zero component inside `prev_epoch_seal` is rejected the
-/// same way a zero component in the primary `txn_id` is (`checkTxnIdNonzero`, shared code path).
+/// same way a zero component in the primary `txn_id` is (`checkRefTxnIdNonzero`, shared code path).
 TEST(CasRefEpochSealFormat, EncodeRejectsPrevEpochSealWithZeroWriterEpoch)
 {
     RefLogTxn txn;

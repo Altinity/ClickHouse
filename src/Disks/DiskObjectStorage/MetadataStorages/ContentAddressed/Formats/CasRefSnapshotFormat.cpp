@@ -37,13 +37,6 @@ RefLifecycle lifecycleFromWord(std::string_view w)
     throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableSnapshot: unknown lifecycle '{}'", w);
 }
 
-void checkTxnIdNonzero(const RefTxnId & id, std::string_view what)
-{
-    if (id.writer_epoch == 0 || id.ref_sequence == 0)
-        throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "RefTableSnapshot: {} fields must both be nonzero, got {}-{}", what, id.writer_epoch, id.ref_sequence);
-}
-
 void checkCommittedSorted(const std::vector<RefCommittedRow> & rows)
 {
     for (size_t i = 1; i < rows.size(); ++i)
@@ -72,13 +65,13 @@ void checkPrecommitsSorted(const std::vector<RefOwnerBinding> & rows)
 /// subject to the same contract.
 void checkSnapshotInvariants(const RefTableSnapshot & snapshot)
 {
-    checkTxnIdNonzero(snapshot.snapshot_id, "snapshot_id");
+    checkRefTxnIdNonzero(snapshot.snapshot_id, "RefTableSnapshot", "snapshot_id");
 
     if (snapshot.lifecycle == RefLifecycle::Removed)
     {
         if (!snapshot.remove_txn_id)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableSnapshot: Removed snapshot is missing remove_txn_id");
-        checkTxnIdNonzero(*snapshot.remove_txn_id, "remove_txn_id");
+        checkRefTxnIdNonzero(*snapshot.remove_txn_id, "RefTableSnapshot", "remove_txn_id");
         if (!snapshot.committed.empty() || !snapshot.precommits.empty())
             throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "RefTableSnapshot: Removed snapshot must have zero committed/precommit rows, got {}/{}",

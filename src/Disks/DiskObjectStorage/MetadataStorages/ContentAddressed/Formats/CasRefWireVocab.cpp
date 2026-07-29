@@ -29,6 +29,13 @@ RefOwnerKind refOwnerKindFromWord(std::string_view w, std::string_view what)
     throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: unknown owner kind '{}'", what, w);
 }
 
+void checkRefTxnIdNonzero(const RefTxnId & id, std::string_view format, std::string_view field)
+{
+    if (id.writer_epoch == 0 || id.ref_sequence == 0)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "{}: {} fields must both be nonzero, got {}-{}", format, field, id.writer_epoch, id.ref_sequence);
+}
+
 void writeRefTxnIdFields(CasJsonWriter & out, bool & first, std::string_view epoch_key, std::string_view seq_key, const RefTxnId & id)
 {
     writeKey(out, epoch_key, first);
