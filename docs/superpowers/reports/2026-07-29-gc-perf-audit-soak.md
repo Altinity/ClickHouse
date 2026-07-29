@@ -629,3 +629,274 @@ row**, so the GC log could not report the very pathology it exists to report —
 periodic in-round progress row, independent of Task 15. And the CPU top-frame extract must record
 **which side each frame came from**: the query and global profilers sample 1000× apart, and without
 the split the counts cannot be turned into time shares (see [cautions](#cautions)).
+
+## Addendum — re-validation specimen (frozen-tail) {#addendum}
+
+### The specimen, and one caveat that must come first {#addendum-method}
+
+Source: `utils/ca-soak/logs/predown/{ch1,ch2}/soak_t15_revalidation/`, captured by the pre-teardown
+dump this report asked for, at `2026-07-29T18:04:46+02:00` (ch1) and `18:04:56` (ch2). Per node:
+`events.tsv` 1,487 counters, `gc_log.tsv` 1,368 rows (ch1) / 2,149 (ch2), `errors.tsv`,
+`text_log_error_shapes.tsv`, and four `trace_*` files of 201 lines each. Every figure below was
+re-read from these files while writing; the working script is
+`tmp/t14/gc_audit/addendum/accounting.py` and its output `tmp/t14/gc_audit/addendum/ch1_accounting.txt`.
+
+This run covers **7,123 s (118.7 min)**, 14:04:46 to 16:03:29, and inserted 26,838,445 rows over
+16,131 `INSERT` queries against 4,740 merges and 589,084,115 merged rows — a 21.9× write
+amplification (`events.tsv`). **It is not the same workload as the degraded specimen**, so
+volume-denominated comparisons below carry an explicit caveat and the structural ratios do the real
+work.
+
+**CAVEAT, and it invalidates a category of analysis: the `trace_CPU_*` dumps are not CPU-time
+profiles.** A thread blocked in `__poll` burns no CPU, so a genuine CPU profile cannot sample it —
+yet the two dumps agree almost exactly:
+
+| Frame | Real samples | CPU samples | ratio |
+|---|---|---|---|
+| `__poll` | 497,126 | 497,126 | **1.000** |
+| `pthread_mutex_lock` | 72,942 | 72,942 | **1.000** |
+| `pthread_cond_timedwait` | 72,411 | 72,405 | 1.000 |
+| `pthread_cond_wait` | 774,533 | 769,697 | 1.006 |
+| `epoll_wait` | 125,030 | 124,286 | 1.006 |
+
+Totals differ by 0.3% (51,748,981 vs 51,580,307 samples), consistent with the same population
+queried seconds apart rather than two distinct trace types. **Everything in these dumps must be read
+as wall time.** No conclusion in this addendum rests on a CPU/Real distinction, and the predown
+script's CPU-side `trace_type` predicate should be checked before the next run — this is a
+reporting bug, not a product one, and it would silently corrupt any future profile comparison.
+
+### Before / after {#before-after}
+
+Structural metrics first — these do not depend on the workloads matching:
+
+| Metric | Before (degraded 6/40) | After (T15 re-validation) | Verdict |
+|---|---|---|---|
+| Rounds completed | **0** in 41 min 32 s | **64 Success** + 4 Deferred in 118.7 min | FIXED |
+| Round duration | unbounded (≥41 min, killed in flight) | min 2.8 s, median 83.0 s, avg 100.7 s, max 433.5 s | BOUNDED |
+| S3 ops per manifest edge | 2 (1 HEAD + 1 GET, `CasGc.cpp:1007-1018`) | **1.000** (`CasRefManifestBodyFoldGets` 661,670 == `CasRefEmittedEdges` 661,670) | FIXED |
+| `CasGcHead`, whole run | 1 per edge by construction | **2** | FIXED |
+| Fold edge throughput | ~313 edges/s (= ~626 S3 ops/s) | **751 edges/s** (661,670 / 880.78 s) = 751 S3 ops/s | 2.40× edges |
+| Probe-A detector | `Due`/`Performed` = 0, never fired | `CasGcProbeADue` = 4, `CasGcProbeAPerformed` = 4 (1-in-16 of 64) | FIXED |
+| GC log rows for the long round | none — no Finish row ever written | 64 complete Start/Phase/Finish sets | FIXED |
+| Follower per-round lease cost | 6.77 ms (248 rounds, 1,678.5 ms) | **53.5 ms** (716 rounds, 38.33 s) | **REGRESSED 7.9×** |
+| GC busy fraction of wall | ~100% (one round, never ended) | **90.5%** (6,443.4 s of 7,123 s) | barely moved |
+| `defer_decision` share of GC time | not separable (no phase rows) | **79.11%** (5,096.4 s) | newly visible |
+| Anomalies / errors in GC rows | n/a | 0 across all 1,368 rows | clean |
+
+Volume-denominated, with the caveat that the workloads differ:
+
+| Metric | Before | After | Note |
+|---|---|---|---|
+| Relink refusals | 123,907 (ch1) / 124,493 (ch2) over ~32 min, peak 9,219/min | 5,742 (ch1) / 5,326 (ch2) over ~10.4 min | still present, still early-run-confined (14:05:28-14:15:54); **do not attribute the drop to the frozen-tail change** — different workload, and no shared denominator survives on the before side |
+| `NETWORK_ERROR` | 94,999 | 49,335 (ch1) / 49,191 (ch2) | same caveat |
+| `CANNOT_PARSE_INPUT_ASSERTION_FAILED` | 28,170 | 16,131 (ch1) / 16,192 (ch2) | now fully explained, see [carry 2](#carry-2) |
+
+**What the frozen-tail change did:** it made rounds terminate, and that is the whole of it — but it
+is enough to unblock everything keyed on round completion. Rounds now emit phase rows, so the GC is
+measurable for the first time; the probe-A detector fires; and the HEAD drop landed exactly, at
+1.000 GET per edge with only two HEADs in a two-hour run.
+
+**What it did not move, and this is the substance of the addendum:** the GC leader is still busy
+**90.5% of wall time**, and the reason is not folding. It is `defer_decision` — the phase that
+decides *whether* to fold — at 79.11% of all GC time. The round got a ceiling; the per-round cost
+did not get smaller.
+
+**One regression to log:** the follower's per-round lease check went from 6.77 ms to 53.5 ms, a 7.9×
+increase (ch2 `gc_log.tsv`: 716 `NotALeader` rounds, `lease` the only phase, 38.33 s total). It
+remains small in absolute terms — 38 s across two hours — so it is a note, not an alarm, but it moved
+the wrong way and no part of the frozen-tail change obviously explains it.
+
+### The five carry questions {#carry-answers}
+
+**1. "Which mutex. The top-stacks query retaining full symbolized stacks, filtered to
+`trace_type='Real'` and a `pthread_mutex_lock` top frame."** — **STILL OPEN, for exactly the reason
+predicted.** `pthread_mutex_lock` has 72,942 query-side samples in
+`ch1/soak_t15_revalidation/trace_Real_top_frames.tsv`, but **no stack in `trace_Real_top_stacks.tsv`
+has it as its top frame**: the samples are fragmented across many distinct stacks, every one of them
+below the top-200 cutoff, which sits at 480 samples for stacks and 44,625 for frames. The dump now
+carries a `focus` parameter (`manifest.txt` header: `focus='(none)'`), so the closing move is a
+re-run with `focus=pthread_mutex_lock`. Note also that with the CPU/Real distinction broken, this
+count cannot currently be separated into contention versus blocking.
+
+**2. "`CANNOT_PARSE_INPUT_ASSERTION_FAILED` provenance."** {#carry-2} — **ANSWERED, and it is not
+CAS.** From `errors.tsv` on both nodes, `last_error_message` is
+`Cannot parse input: expected ',' before: 'toDateTime64(1785337029,3),1,702,\'ce1…` — a `VALUES` row
+literal from the soak driver's own `INSERT`. The count settles it beyond argument:
+
+| Node | `CANNOT_PARSE_INPUT_ASSERTION_FAILED` | `InsertQuery` |
+|---|---|---|
+| ch1 | 16,131 | **16,131** |
+| ch2 | 16,192 | **16,192** |
+
+Exactly one per `INSERT`, on both nodes independently. This is the `VALUES` parser's fast-path probe
+failing on an expression and falling back to the full expression parser — a caught, counted,
+by-design control-flow exception in the workload generator. It has nothing to do with CAS, GC or the
+storage path. The interim's refusal to guess was right: the honest answer was reachable only with
+`last_error_message`, and the mechanism it revealed is one no CAS-shaped hypothesis would have found.
+
+**3. "The 949/s vs 327/s discrepancy… decides whether dropping the HEAD buys ~2× everywhere or only
+in the serial regime."** — **ANSWERED in the way that matters, and the original question is now
+moot.** Measured post-fix: 661,670 edges in 880.78 s of `fold_ref_intake` = **751 edges/s**, against
+the degraded run's ~313 edges/s — **2.40×**, slightly better than the 2× the serial model predicted.
+In S3-operation terms the fold went from ~626 ops/s (2 per edge) to 751 ops/s (1 per edge): the op
+rate barely moved while edge throughput more than doubled, which is precisely the signature of
+removing one of two serial round trips. The specific 949/s regime cannot be re-tested because the
+HEAD path no longer exists in the code. One caveat against over-reading the multiple: server-wide S3
+read latency in this run is 2.47 ms (`S3ReadMicroseconds` 10,385,095,403 / `S3ReadRequestsCount`
+4,206,530) versus the 1.53 ms measured on the degraded specimen's isolated lease phase, and the two
+are not measured the same way, so 2.40× is a throughput observation, not a controlled experiment.
+
+**4. "`mkdir` ← `create_directories` as the top non-idle background wall frame — whether that
+survives."** — **NOT ANSWERABLE from this dump, and the reason is a cutoff, not an absence.**
+`mkdir`, `create_directories`, `unlink`, `__open64` and `write` are all absent from the T15 top-200
+frames — but the top-200 cutoff here is **44,625 samples**, while the frame in question measured
+**404 samples** on the degraded specimen. The cutoff sits 110× above the signal, so absence proves
+nothing. Closing it needs either `focus=create_directories` or a deeper limit on the background side
+specifically, which is the same structural gap as carry 1: a global top-200 spends nearly all its
+rows on the query side (186 rows, 47.1M samples) and leaves the background side — where GC lives —
+just 14 frames (4.6M samples), all of them thread-pool scaffolding.
+
+**5. "Merge-churn to CA traffic."** — **ANSWERED from counters** (`ch1/events.tsv`; the original ask
+named `system.content_addressed_log`, which the dump does not carry, but the ProfileEvents give the
+ratios directly):
+
+| Ratio | Value |
+|---|---|
+| Manifest edges per merge | **139.6** (661,670 / 4,740) |
+| Ref repoints per merge | **7.21** (34,171 / 4,740) |
+| Edges per ref-log | **3.750** (661,670 / 176,441) — versus ~2.14 on the degraded specimen |
+| Merged rows per inserted row | **21.9×** (589,084,115 / 26,838,445) |
+| GC share of all S3 GETs | **0.18%** (`CasGcGet` 3,475 of `S3GetObject` 1,969,293) |
+
+The last row is worth pausing on: the GC's *own* backend GETs are negligible, because the fold's
+661,670 manifest-body reads are counted under `CasRefManifestBodyFoldGets`, not `CasGcGet`. Anyone
+sizing GC cost from `CasGc*` counters alone will under-count it by two orders of magnitude.
+
+### Q6 — where do the minutes live {#where-minutes-live}
+
+**Time accounting is 99.986% complete.** Across the 68 complete rounds, round wall summed to
+6,443.4 s and phase durations to 6,442.5 s, leaving **0.9 s unaccounted (0.014%)**
+(`tmp/t14/gc_audit/addendum/ch1_accounting.txt`). Phases are logged at their end with a duration and
+are disjoint, so a phase sum is directly comparable to the Start→Finish wall.
+
+Where the minutes live, all 68 rounds:
+
+| Phase | n | total | share | avg | max |
+|---|---|---|---|---|---|
+| `defer_decision` | 68 | **5,096.39 s** | **79.11%** | 74.95 s | 127.00 s |
+| `fold_ref_intake` | 64 | 880.78 s | 13.67% | 13.76 s | 329.29 s |
+| `ref_list_probe` | 64 | 326.16 s | 5.06% | 5.10 s | 83.54 s |
+| `fold_reduce` | 64 | 137.14 s | 2.13% | 2.14 s | 60.39 s |
+| `fold_ref_group` | 64 | 1.19 s | 0.02% | 0.019 s | 0.02 s |
+| `lease` | 68 | 0.33 s | 0.01% | 0.005 s | 0.14 s |
+| `heartbeat_floor` | 68 | 0.20 s | 0.00% | 0.003 s | 0.01 s |
+| the other 12 phases | 64 each | 0.36 s combined | 0.01% | — | ≤0.01 s |
+
+**The finding: the GC spends four fifths of its life deciding whether to work.** `defer_decision` is
+a full pool enumeration. Its metrics name the cost directly — the longest instance
+(127.00 s) reads `'ref_keys_listed':176891, 'ref_log_keys_listed':176204, 'changed_shards':0` — it
+listed 176,891 ref keys to conclude that **nothing had changed**. The distribution is flat
+(p25 78.22 s, median 81.50 s, p75 83.84 s), which is the signature of a cost tracking the key count
+rather than the work. The control case is decisive: the four `Deferred` rounds, before the workload
+started, have `'ref_keys_listed':0` and cost **744-829 µs** — five orders of magnitude less. All of
+`defer_decision`'s time is the LIST.
+
+Derived, and consistent across two counters: `CasRefGlobalListPages` = `CasGcEnumerationPages` =
+11,656 pages for 5,422.6 s of `defer_decision` + `ref_list_probe`, i.e. **~465 ms per LIST page**
+(~171 pages per round, ~1,035 keys per page) or **~461 µs per key listed**. There is no direct S3
+LIST-latency counter in the dump, so this is wall divided by pages, not a measured per-call latency.
+
+`ref_list_probe` compounds it: on the 4 rounds where the probe is due it performs **the same ~177k-key
+LIST again** (`'due':1,'performed':1,'keys_listed':176897`, ~78-84 s), on top of the enumeration
+`defer_decision` just finished. On a probe round the pool is listed twice, ~160 s of listing in one
+round. On the other 60 rounds the phase costs 1 µs.
+
+#### The 433.5 s round, decomposed {#round-433}
+
+Round 4, `round_id=d8bb4c1c08b42f17549f78237d8f08d4`, Start 14:10:18.030186, Finish 14:17:31.511797,
+`duration_ms=433481`:
+
+| Phase | Duration | Share | What its metrics say |
+|---|---|---|---|
+| `fold_ref_intake` | **329.286 s** | **75.96%** | `logs_applied` 78,887, `deltas_emitted` 3,122,956 |
+| `defer_decision` | **102.415 s** | **23.63%** | `ref_keys_listed` 111,901, `changed_shards` 2, `graduation_due` 1 |
+| `fold_reduce` | 1.732 s | 0.40% | `deltas_in` 3,122,956, `condemned` 758 |
+| `fold_ref_group` | 0.0137 s | 0.003% | `ref_keys_listed` 111,901 |
+| `heartbeat_floor` | 0.0044 s | 0.001% | `live` 2 |
+| `lease` | 0.0028 s | 0.001% | `acquired` 1 |
+| `fold_seal_read` | 0.0026 s | — | `seal_reads` 2 |
+| `pending_deletes` | 0.0018 s | — | `outcome_logs_written` 1 |
+| `parent_seal_read` | 0.0016 s | — | `parent_runs` 1 |
+| `round_commit` | 0.0014 s | — | `generation` 4 |
+| `fold_seal_write` | 0.0009 s | — | `seal_bytes` 507 |
+| 8 further phases | ≤3 µs each | — | all `suppressed:1` or zero-work |
+| **phases total** | **433.462 s** | 99.995% | |
+| **unaccounted** | **0.020 s** | 0.005% | 3 gaps, largest 14.3 ms |
+
+Two phases are the entire round. Note the inversion against the aggregate: this round is
+fold-dominated (76% intake) because it drained the startup backlog — it alone is 37% of all
+`fold_ref_intake` time in the run — whereas the *typical* round is decision-dominated. Both shapes
+share one property: the work that matters is preceded by a full pool LIST that costs 1.5-2 minutes
+regardless.
+
+Fold intake efficiency across the run: 176,439 logs applied emitting 10,733,848 deltas in 880.78 s =
+**4.99 ms per log, 60.8 deltas per log, 12,187 deltas/s**.
+
+#### The un-timed spans {#untimed-spans}
+
+For `[GC-FULL-TIME-ACCOUNTING]`, the complete list of spans inside a round that no phase covers.
+There are three, and together they are 0.85 s of 6,443 s:
+
+| Un-timed span | n | total | avg |
+|---|---|---|---|
+| between `lease` end and `heartbeat_floor` start | 68 | 0.146 s | 2.1 ms |
+| between the last phase (`orphan_sweep`) and the `Finish` row — the round epilogue | 63 | 0.696 s | 11.1 ms |
+| before `pending_deletes` | 3 | 0.006 s | 1.9 ms |
+
+**The trace-frame fallback cannot decompose these, and it is important to say why rather than to
+report a number from it.** Every span above is under 20 ms, while the background profiler samples at
+10 s — 500× coarser. No sampling profiler can resolve a 2 ms span at that period; the correct answer
+is that these spans are below the instrument's resolution and are also negligible. For the
+`unaccounted_ms` self-check the user has chartered, the practical shape is: the epilogue after
+`orphan_sweep` is the only span worth naming a phase for, and even it averages 11 ms.
+
+### Anomalies in the 1,368 GC rows — flagged, not investigated {#gc-row-anomalies}
+
+1. **Zero anomalies, zero errors.** The `anomalies` column reads `0` and `error` is empty on every
+   one of the 1,368 rows; all 69 rounds have `trigger=Scheduled`. Nothing self-reported.
+2. **The 4 `Deferred` rounds are all pre-workload** (14:04:46-14:05:16, `namespaces_seen:0`,
+   `ref_keys_listed:0`). Once the workload starts, **no round ever defers again** —
+   `rounds_deferred_before` is 0 in every later `defer_decision`. The deferral mechanism is
+   effectively inactive under load, which is worth a look given `[ADAPTIVE-GC-CADENCE]`.
+3. **No per-namespace skew is observable**, because there is nothing to skew across: `srid` is
+   `ca_soak_ch1` on all 1,367 non-header rows. The two namespaces the fold walks appear only inside
+   phase metrics (`namespaces_seen:2`), not as a row dimension. Per-namespace attribution would need
+   the phase metrics broken out per namespace.
+4. **Hold reasons never appear.** `orphan_sweep` ran 64 times at ≤1 µs with `listed:0`,
+   `retained_hold:0` — under Stage A's suppressed-reclaim posture there was nothing to retain, so
+   this specimen says nothing about retention behaviour either way.
+5. **A transient mount-lease loss at 15:27-15:28** shows on ch2 as `INVALID_STATE` ×22
+   (`content-addressed disk 'ca' -- mount lease not held`) alongside 9 × `Part … looks broken.
+   Removing it and will try to fetch.` This is already RCA'd as a pre-existing class in the Stage A
+   results document; flagged here only because it lands inside this specimen's window.
+
+### What this changes in the ranked opportunities {#revised-opportunities}
+
+Item 1 (bounded rounds) is **done and verified**. Item 3 (drop the HEAD) is **done and verified at
+1.000 GET/edge**, delivering 2.40× fold throughput. The ranking that remains is reordered by this
+specimen:
+
+1. **Kill the per-round pool enumeration.** 79.11% of GC time, listing ~177k keys per round at
+   ~465 ms/page to answer "did anything change?", sometimes answering "no" (`changed_shards:0`)
+   after a full 127 s LIST. This is precisely the change-signal `[Lever B]` describes, and it is now
+   measured rather than argued. **USER-GATED** — it changes what GC reads on the pool.
+2. **Stop `ref_list_probe` re-listing what `defer_decision` just listed.** ~78-84 s ×4 rounds here,
+   and it scales with pool size and probe cadence together. Sharing one enumeration between the two
+   phases is non-protocol if the probe's semantics are preserved.
+3. **The relink refusal** remains as filed (`[RELINK-CONFIRM-BUSY-LANE]`), still present at 5,742 /
+   5,326 per node, still early-run-confined, still ERROR severity.
+4. **The follower lease regression**, 6.77 ms → 53.5 ms per round. Small in absolute terms; worth
+   one look because nothing in the frozen-tail change explains it.
+5. **Fix the CPU trace dump** before the next specimen — a reporting bug, but one that makes every
+   future CPU/wall comparison silently wrong.
+
