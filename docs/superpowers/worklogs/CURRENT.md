@@ -1898,3 +1898,7 @@ adapted lane started.
 teardown — structural gap). Salvage: interim text-log-scoped report now + controller live-pass
 figures (unreproducible-marked); harness gains a permanent pre-teardown dump step (a14);
 audit addendum rides T15's 6/40 re-validation. Old text logs archived.
+**2026-07-29 11:1x local** — a14's machine-quiet request granted: slot schedule (adapted-lane
+pass -> exclusive 3/8 soak -> scenarios/05020 -> serial a15/a16 builds -> T15 6/40 re-
+validation). Four red lanes = drain class (expected-red, adaptation pending), not starvation.
+Product finding BACKLOG'd: ca-fsck DNF at 29GiB (EXIT=159 @731s, empty) — [FSCK-SCALE-TIMEOUT].
