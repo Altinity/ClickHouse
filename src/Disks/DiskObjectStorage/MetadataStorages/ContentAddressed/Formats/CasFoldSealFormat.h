@@ -86,9 +86,8 @@ struct RefHold
 
 /// Records what the current round did for one namespace and shard. `classification` is a persisted byte:
 /// 0 means absent, 1 means unchanged, 2 means all records through the observed cursor were folded, and 4
-/// means folding was clamped below the ref-log cursor. A clamped entry must be read again even if its
-/// manifest token is unchanged, because an unfolded event may become foldable in the next round.
-/// `folded_token` is the manifest token observed when the entry was processed.
+/// means folding was clamped below the ref-log cursor. A clamped entry must be read again in the next
+/// round, because an unfolded event may become foldable by then.
 ///
 /// THE SET {0, 1, 2, 4} IS CLOSED, and both codecs enforce it (decode `CORRUPTED_DATA`, encode
 /// `LOGICAL_ERROR`). Every consumer branches on exact values — the sweep's §6 deletion premise refuses a
@@ -99,7 +98,6 @@ struct RefHold
 struct ShardCoverage
 {
     uint8_t classification = 0;
-    Token folded_token;
 
     /// The greatest `RefTxnId` whose owner changes have contributed their manifest-edge deltas. There is
     /// one ref-log stream per namespace, so this cursor is stored in the namespace's shard-0 entry.

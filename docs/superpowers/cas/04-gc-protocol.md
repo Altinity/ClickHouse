@@ -191,7 +191,7 @@ gc/gen/<G_f>/attempt/<a>/retired/<round>/<shard>             // current retired 
 gc/gen/<G_f>/attempt/<a>/outcomes/<round>/<shard>            // per-entry delete/spare outcomes
 ```
 
-The `FoldSeal` records per-`(ns, shard)` coverage: `folded_token`, `folded_cursor`, and the produced run `RunRef`s (key + footer checksum). It is written **write-once** before the round CAS; it is a deterministic artifact and any colliding write must be byte-equal or `CORRUPTED_DATA`. Completion seals are a retired concept — the fold seal alone resolves cursors now.
+The `FoldSeal` records per-`(ns, shard)` coverage: `folded_cursor` and the produced run `RunRef`s (key + footer checksum). It is written **write-once** before the round CAS; it is a deterministic artifact and any colliding write must be byte-equal or `CORRUPTED_DATA`. Completion seals are a retired concept — the fold seal alone resolves cursors now.
 
 **Cursor advance:** the single `gc/state` CAS that advances `snap_generation` (§3.6) also advances `folded_cursor` per shard and publishes `retired_refs` and `round` — all atomically. A crash before the CAS leaves the prior generation and the prior retired list authoritative and the new attempt as invisible garbage; the next pass re-runs under a fresh attempt (§3.6 crash-resume).
 

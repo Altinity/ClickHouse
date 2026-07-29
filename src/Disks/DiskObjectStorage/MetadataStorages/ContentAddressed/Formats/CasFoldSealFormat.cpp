@@ -1,7 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasByteBudget.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasWireVocab.h>
 #include <Common/Exception.h>
 #include <IO/ReadBufferFromMemory.h>
 #include <algorithm>
@@ -209,7 +208,6 @@ String encodeFoldSeal(const CasFoldSeal & seal)
         writeKey(out, "k", first);    writeStringValue(out, "cov");
         writeKey(out, "key", first);  writeStringValue(out, key);
         writeKey(out, "cls", first);  writeIntText(static_cast<uint32_t>(cov.classification), out);
-        writeTokenFields(out, first, cov.folded_token);   /// tt + tv
         writeKey(out, "lfe", first);  writeU64StringValue(out, cov.last_folded_ref_id.writer_epoch);
         writeKey(out, "lfs", first);  writeU64StringValue(out, cov.last_folded_ref_id.ref_sequence);
         if (cov.hold)
@@ -328,9 +326,6 @@ CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expect
         if (kind == "cov")
         {
             String map_key;
-            String tv;
-            TokenType tt{};
-            bool have_tt = false;
             ShardCoverage cov;
             /// Read WIDE and validated before it is narrowed to the persisted byte. `cls` is the field
             /// every consumer branches on, and a plain `static_cast<uint8_t>` maps 258 onto 2 ("all
@@ -349,8 +344,6 @@ CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expect
             {
                 if (key == "key") map_key = r.readString();
                 else if (key == "cls") classification = r.readU64Number();
-                else if (key == "tt") { tt = tokenTypeFromWord(r.readString(), "fold seal"); have_tt = true; }
-                else if (key == "tv") tv = r.readString();
                 else if (key == "lfe") cov.last_folded_ref_id.writer_epoch = r.readU64String();
                 else if (key == "lfs") cov.last_folded_ref_id.ref_sequence = r.readU64String();
                 else if (key == "hr") hold_reason = holdReasonFromWord(r.readString());
@@ -360,9 +353,6 @@ CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expect
                 else if (key == "hnr") hold_next_retry_round = r.readU64String();
                 else throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: unknown cov key '{}'", key);
             }
-            if (!have_tt)
-                throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: cov missing tt");
-            cov.folded_token = Token{tv, tt};
 
             /// `cls` is required, not defaulted: an absent one would read as 0 ("no round folded this
             /// namespace"), which is a claim about a fold, not the absence of one.
