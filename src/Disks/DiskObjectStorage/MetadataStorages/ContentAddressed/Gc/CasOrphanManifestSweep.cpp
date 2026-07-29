@@ -84,26 +84,53 @@ std::optional<ListedManifestObject> parseListedManifestObject(const Layout & lay
         .key = key};
 }
 
-/// Reads the table's durable `last_folded_ref_id` from the adopted fold seal at
-/// `(snap_generation, snap_attempt)`. `{0, 0}` means that no seal covers the table yet, as for a fresh
-/// pool. A manifest removed by a log above this cursor has not had its `-1` decrement folded, so its body
-/// remains load-bearing until the fold catches up.
-RefTxnId sealedRefCursor(Pool & store, const RootNamespace & ns)
+/// The fold seal `gc/state` currently adopts, or `nullopt` when the pool has no `gc/state` or no seal
+/// at `(snap_generation, snap_attempt)` — a pool whose GC has never completed a round. It is read ONCE
+/// per sweep pass; every namespace the pass touches takes its coverage row out of the same object.
+std::optional<CasFoldSeal> readAdoptedFoldSeal(Pool & store)
 {
     const Layout & layout = store.layout();
     const auto state_got = store.backend().get(layout.gcStateKey());
     if (!state_got)
-        return RefTxnId{};
+        return std::nullopt;
     const GcState state = decodeGcState(state_got->bytes);
-    if (const auto got = store.backend().get(layout.foldSealKey(state.snap_generation, state.snap_attempt)))
-    {
-        const CasFoldSeal seal = decodeFoldSeal(got->bytes, state.snap_generation);
-        const auto it = seal.per_ns_shard.find(cursorKey(ns, /*shard*/0));
-        if (it != seal.per_ns_shard.end())
-            return it->second.last_folded_ref_id;
-    }
-    return RefTxnId{};
+    const auto got = store.backend().get(layout.foldSealKey(state.snap_generation, state.snap_attempt));
+    if (!got)
+        return std::nullopt;
+    return decodeFoldSeal(got->bytes, state.snap_generation);
 }
+
+
+/// One namespace's shard-0 coverage row out of an adopted seal. Absent means no round has sealed a
+/// cursor for the namespace, which the premise treats as "nothing about its ref stream is proven".
+std::optional<ShardCoverage> coverageOf(const std::optional<CasFoldSeal> & seal, const RootNamespace & ns)
+{
+    if (!seal)
+        return std::nullopt;
+    const auto it = seal->per_ns_shard.find(cursorKey(ns, /*shard*/0));
+    if (it == seal->per_ns_shard.end())
+        return std::nullopt;
+    return it->second;
+}
+
+/// The durable `last_folded_ref_id` of a coverage row, `{0, 0}` when there is none — as for a fresh
+/// pool. A manifest removed by a log above this cursor has not had its `-1` decrement folded, so its
+/// body remains load-bearing until the fold catches up.
+RefTxnId sealedRefCursor(const std::optional<ShardCoverage> & coverage)
+{
+    return coverage ? coverage->last_folded_ref_id : RefTxnId{};
+}
+
+/// One namespace's protection view: the manifest object keys the sweep must never delete, split so the
+/// §6 premise can test the removal half on its own. `active` is the pre-existing union the delete sites
+/// consult; `tail_removal_targets` is the subset the unconsumed tail above the cursor names as removal
+/// targets, which is what rule (2) is stated over.
+struct NamespaceProtection
+{
+    std::set<String> active;
+    std::set<String> tail_removal_targets;
+};
+
 
 /// The active manifest-object-key set for one namespace, built as the
 /// same complete view writer recovery uses:
@@ -113,9 +140,12 @@ RefTxnId sealedRefCursor(Pool & store, const RootNamespace & ns)
 /// Keys (not ManifestIds) so a listed object key can be tested directly. Throws on a corrupt snapshot /
 /// invalid transaction (via `recoverRefTable` / `decodeRefLogTxn`); the caller SKIPS the namespace's
 /// deletions on such a throw rather than substituting an empty owner set.
-std::set<String> activeManifestKeys(Pool & store, const RootNamespace & ns)
+NamespaceProtection activeManifestKeys(Pool & store, const RootNamespace & ns,
+                                       const std::optional<ShardCoverage> & coverage)
+
 {
-    std::set<String> active;
+    NamespaceProtection protection;
+    std::set<String> & active = protection.active;
     const Layout & layout = store.layout();
     Backend & backend = store.backend();
 
@@ -131,7 +161,7 @@ std::set<String> activeManifestKeys(Pool & store, const RootNamespace & ns)
     /// until its `-1` folds. LIST the table's logs, decode those above the cursor, and protect each
     /// removed manifest (a `-1` edge). A namespace-removal transaction names every removed owner explicitly,
     /// so this also protects a whole removed namespace's bodies until the fold catches up.
-    const RefTxnId cursor = sealedRefCursor(store, ns);
+    const RefTxnId cursor = sealedRefCursor(coverage);
     std::vector<RefTxnId> logs;
     forEachListedKey(backend, layout.refsNamespacePrefix(ns), [&](const ListedKey & lk)
     {
@@ -151,11 +181,133 @@ std::set<String> activeManifestKeys(Pool & store, const RootNamespace & ns)
         const RefLogTxn txn = decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), id);
         for (const RefManifestEdge & edge : manifestEdgesOfTxn(txn))
             if (edge.change < 0)
-                active.insert(layout.manifestKey(edge.manifest_id));
+            {
+                const String key = layout.manifestKey(edge.manifest_id);
+                active.insert(key);
+                protection.tail_removal_targets.insert(key);
+            }
     }
-    return active;
+    return protection;
 }
 
+}
+
+NamespaceFoldView namespaceFoldView(Pool & store, const RootNamespace & ns)
+{
+    NamespaceFoldView view;
+    view.coverage = coverageOf(readAdoptedFoldSeal(store), ns);
+    return view;
+}
+
+std::string_view sweepRetainClassName(SweepRetainClass c)
+{
+    switch (c)
+    {
+        case SweepRetainClass::None:           return "none";
+        case SweepRetainClass::NoCoverage:     return "no_coverage";
+        case SweepRetainClass::Hold:           return "hold";
+        case SweepRetainClass::UnconsumedSeal: return "unconsumed_seal";
+        case SweepRetainClass::TailRemoval:    return "tail_removal";
+    }
+    return "unknown";
+}
+
+std::pair<SweepRetainClass, uint64_t> ManifestSweepResult::topRetainReason() const
+{
+    /// Enum order, so a tie resolves the same way on every pass and an unchanged pool keeps reporting
+    /// the same verdict instead of alternating between two equally-large classes.
+    const std::pair<SweepRetainClass, uint64_t> candidates[] = {
+        {SweepRetainClass::NoCoverage, retained_no_coverage},
+        {SweepRetainClass::Hold, retained_hold},
+        {SweepRetainClass::UnconsumedSeal, retained_unconsumed_seal},
+        {SweepRetainClass::TailRemoval, retained_tail_removal},
+    };
+    std::pair<SweepRetainClass, uint64_t> top{SweepRetainClass::None, 0};
+    for (const auto & c : candidates)
+        if (c.second > top.second)
+            top = c;
+    return top;
+}
+
+bool manifestDeletionPremise(const NamespaceFoldView & view, const ManifestKey & manifest,
+                             String * retain_reason, SweepRetainClass * retain_class)
+{
+    const auto retain = [&](SweepRetainClass klass, String why)
+    {
+        if (retain_reason)
+            *retain_reason = std::move(why);
+        if (retain_class)
+            *retain_class = klass;
+        return false;
+    };
+    if (retain_class)
+        *retain_class = SweepRetainClass::None;
+    const String build_epoch = std::to_string(manifest.prefix.writer_epoch);
+
+    /// UNCERTAINTY, and it comes first because it is the case where the predicate knows NOTHING. With no
+    /// sealed coverage row, no round has folded a ref cursor for this namespace, so no epoch's closing
+    /// seal can be shown consumed. The sweep's own protection view cannot stand in for the missing
+    /// proof: that view is assembled from the very enumeration arithmetic intake distrusts.
+    if (!view.coverage)
+        return retain(SweepRetainClass::NoCoverage,
+                      "no sealed fold coverage for the namespace: no round has folded a ref cursor for "
+                      "it, so epoch " + build_epoch + "'s closing seal cannot be shown consumed");
+
+    const ShardCoverage & cov = *view.coverage;
+
+    /// UNCERTAINTY, hold arm. A hold names the exact position the fold could not resolve, and everything
+    /// at or above it is unaccounted -- including, for all this predicate can tell, the record that
+    /// grants or removes this very manifest. `classification == 4` is tested separately from the hold
+    /// even though the seal's strict grammar pairs them: the thing standing between a clamped namespace
+    /// and an irreversible delete must not be a codec invariant enforced somewhere else.
+    if (cov.hold)
+        return retain(SweepRetainClass::Hold, "namespace held at " + renderRefTxnId(cov.hold->offending_position) + " ("
+                      + String{holdReasonToWord(cov.hold->reason)} + ", retried "
+                      + std::to_string(cov.hold->retry_count) + " round(s)): every record at or above "
+                      "that position is unaccounted for");
+    if (cov.classification == 4)
+        return retain(SweepRetainClass::Hold,
+                      "namespace coverage is classified clamped (4) with no hold recorded: whatever "
+                      "stopped the fold was not carried, so nothing above its cursor is accounted for");
+    if (cov.classification == 0)
+        return retain(SweepRetainClass::NoCoverage,
+                      "namespace coverage is classified absent (0): no round folded it, so its cursor "
+                      "is not the result of any walk");
+
+    /// RULE 1 (spec §6). Grants do not cross epochs, so every `+1` that could name an epoch-`E` build
+    /// lives among epoch `E`'s own records; and an epoch is left ONLY over its consumed `EpochSeal`
+    /// (INV-2), so a sealed cursor in a STRICTLY HIGHER epoch is durable proof that every one of those
+    /// records has folded -- proof by arithmetic, which is what makes it independent of the listing.
+    ///
+    /// A cursor still INSIDE epoch `E` proves nothing of the sort, and that stays true even when it
+    /// happens to sit on `E`'s own seal: the durable cursor records a POSITION, never the KIND of the
+    /// record there, so "the cursor is the seal" is not a readable fact here. Retaining that case costs
+    /// one more round and resolves itself -- the next epoch's first record crosses the seal, and the
+    /// round after that sweeps the build.
+    if (!(manifest.prefix.writer_epoch < cov.last_folded_ref_id.writer_epoch))
+        return retain(SweepRetainClass::UnconsumedSeal,
+                      "epoch " + build_epoch + "'s closing seal is not consumed: the sealed cursor is at "
+                      + renderRefTxnId(cov.last_folded_ref_id) + ", so a grant naming this build may "
+                      "still be unfolded above it");
+
+    /// RULE 2 (spec §6). Removals DO cross epochs, so a record in a LATER epoch can name this build as a
+    /// removal target; deleting the body before that `-1` folds leaves the fold clamping forever on a
+    /// manifest it must read to emit the decrement (the GC-WEDGE-2026-07-10 shape).
+    ///
+    /// The sweep's protection set already spares a tail removal target before this predicate is
+    /// consulted, so this test is belt over suspenders BY DESIGN: the rule belongs to the premise, so
+    /// that a future sweep path that assembles its protection set differently cannot lose it. Note what
+    /// it is NOT: its negative direction is no proof, because the set comes from the same enumeration
+    /// rule (1) exists to stop trusting. Rule (1) is what makes the tail decidable; this makes the
+    /// decision explicit.
+    if (view.tail_removal_targets.contains(manifest.key))
+        return retain(SweepRetainClass::TailRemoval,
+                      "an unconsumed tail record above the cursor names this manifest as a removal "
+                      "target: its `-1` has not folded, so the fold still needs the body");
+
+    if (retain_reason)
+        retain_reason->clear();
+    return true;
 }
 
 bool prefixEligible(Pool & store, const RootNamespace & ns, const BuildPrefix & prefix)
@@ -195,10 +347,16 @@ uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefi
     /// -- not just the log -- so a decommission run does not silently report a clean drain that never
     /// happened; the log-only default stays exactly as before for every other caller, which treats this
     /// the same way the periodic sweep always has: skip and retry next round.
-    std::set<String> active;
+    /// The §6 premise's durable half, read before the protection view so both share one seal read.
+    NamespaceFoldView view;
+    view.coverage = coverageOf(readAdoptedFoldSeal(store), ns);
+
+    NamespaceProtection protection;
     try
     {
-        active = activeManifestKeys(store, ns);
+        protection = activeManifestKeys(store, ns, view.coverage);
+        view.tail_removal_targets = protection.tail_removal_targets;
+
     }
     catch (const Exception & e)
     {
@@ -219,8 +377,21 @@ uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefi
     uint64_t deleted = 0;
     forEachListedKey(backend, prefix_key, [&](const ListedKey & listed)
     {
-        if (active.contains(listed.key))
+        if (protection.active.contains(listed.key))
             return;   /// owned by a committed or precommit owner — never sweep
+
+        /// THE §6 SAFETY FLOOR, under the watermark eligibility already established above. The
+        /// watermark says the build is retired; the premise says the ref stream can be shown not to
+        /// name this body. A refusal is recorded rather than silent (Constraint 10).
+        String retain_reason;
+        if (!manifestDeletionPremise(view, ManifestKey{listed.key, prefix}, &retain_reason))
+        {
+            LOG_DEBUG(getLogger("CasOrphanManifestSweep"),
+                      "CAS orphan sweep: retaining {} -- {}", listed.key, retain_reason);
+            if (warnings)
+                warnings->push_back("CAS orphan sweep: retained " + listed.key + " -- " + retain_reason);
+            return;
+        }
 
         /// Exact-token delete: HEAD for the current token, then deleteExact. A 404 between HEAD and
         /// delete (or a TokenMismatch — a fresh owner reclaimed it) is tolerated (record-and-continue),
@@ -266,22 +437,52 @@ ManifestSweepResult sweepManifestCursorPage(
     /// call), so the metric increments once per call, not once per listed key.
     ProfileEvents::increment(ProfileEvents::CasGcEnumerationPages);
 
+    /// One seal read for the whole page; every namespace on it takes its coverage row from this object.
+    const std::optional<CasFoldSeal> adopted_seal = readAdoptedFoldSeal(store);
+
     std::map<String, bool> eligible_by_prefix;
+    std::map<String, NamespaceFoldView> view_by_ns;
     std::map<String, std::set<String>> active_by_ns;
     std::set<String> errored_namespaces;   /// protection view unavailable => skip, never delete
+
+    /// The key of the last candidate this page actually DECIDED on. The cursor resumes strictly after
+    /// it (`ListPage::next_cursor` is the last returned key), so a candidate the page never decided on
+    /// stays ahead of the cursor and is examined next pass. See the budget rule below.
+    String decided_through;
+    bool budget_exhausted = false;
+
     for (const ListedKey & listed : page.keys)
     {
         ++result.listed;
-        const auto parsed = parseListedManifestObject(layout, listed.key);
-        if (!parsed)
+
+        /// UNCERTAINTY, budget arm (§6). Once a NON-ZERO delete budget is used up, the page stops
+        /// deciding: the candidates behind it are retained AND the cursor does not step over them.
+        /// Advancing past a candidate nothing examined would turn "retained this round" into
+        /// "unexamined until the cursor wraps the whole `cas/manifests/` keyspace" -- the same trade
+        /// the round-level gate refuses when it freezes the cursor along with a suppressed sweep.
+        /// A budget of ZERO is not exhaustion but a list-only pass: nothing is ever deletable, so
+        /// freezing the cursor on it would make the sweep spin on one page forever. That pass keeps
+        /// its pre-existing behaviour and advances.
+        if (budget_exhausted || (delete_budget > 0 && result.deleted >= delete_budget))
         {
+            budget_exhausted = true;
             ++result.skipped;
             continue;
         }
 
-        if (result.deleted >= delete_budget)
+        const auto parsed = parseListedManifestObject(layout, listed.key);
+        if (!parsed)
         {
             ++result.skipped;
+            decided_through = listed.key;
+            continue;
+        }
+
+        if (delete_budget == 0)
+        {
+            /// The list-only pass: examined, not deletable, cursor advances (see the budget rule above).
+            ++result.skipped;
+            decided_through = listed.key;
             continue;
         }
 
@@ -294,17 +495,24 @@ ManifestSweepResult sweepManifestCursorPage(
         if (!eligible_it->second)
         {
             ++result.skipped;
+            decided_through = listed.key;
             continue;
         }
 
+        auto [view_it, view_inserted] = view_by_ns.emplace(parsed->ns.string(), NamespaceFoldView{});
         auto [active_it, inserted] = active_by_ns.emplace(parsed->ns.string(), std::set<String>{});
         if (inserted)
         {
+            view_it->second.coverage = coverageOf(adopted_seal, parsed->ns);
             /// A corrupt snapshot or invalid transaction means the protection view is unavailable. Skip
             /// this namespace's deletions and surface the error; never substitute an empty owner set.
             try
             {
-                active_it->second = activeManifestKeys(store, parsed->ns);
+                NamespaceProtection protection =
+                    activeManifestKeys(store, parsed->ns, view_it->second.coverage);
+                view_it->second.tail_removal_targets = std::move(protection.tail_removal_targets);
+                active_it->second = std::move(protection.active);
+
             }
             catch (const Exception & e)
             {
@@ -317,11 +525,38 @@ ManifestSweepResult sweepManifestCursorPage(
         if (errored_namespaces.contains(parsed->ns.string()))
         {
             ++result.skipped;
+            decided_through = listed.key;
             continue;
         }
         if (active_it->second.contains(parsed->key))
         {
             ++result.skipped;
+            decided_through = listed.key;
+            continue;
+        }
+
+        /// THE §6 SAFETY FLOOR, the same predicate `sweepNamespace` calls, under the same watermark
+        /// eligibility. A refusal is recorded rather than silent (Constraint 10).
+        String retain_reason;
+        SweepRetainClass retain_class = SweepRetainClass::None;
+        if (!manifestDeletionPremise(view_it->second, ManifestKey{parsed->key, parsed->prefix},
+                                     &retain_reason, &retain_class))
+        {
+            /// The sentence goes to the debug log for whoever is chasing ONE object; the class goes to
+            /// a counter, which is the only form in which this path can report itself (see
+            /// `ManifestSweepResult`). Both come from the predicate; neither is derived from the other.
+            LOG_DEBUG(getLogger("CasOrphanManifestSweep"),
+                      "CAS orphan sweep: retaining {} -- {}", parsed->key, retain_reason);
+            switch (retain_class)
+            {
+                case SweepRetainClass::NoCoverage:     ++result.retained_no_coverage; break;
+                case SweepRetainClass::Hold:           ++result.retained_hold; break;
+                case SweepRetainClass::UnconsumedSeal: ++result.retained_unconsumed_seal; break;
+                case SweepRetainClass::TailRemoval:    ++result.retained_tail_removal; break;
+                case SweepRetainClass::None:           break;   /// unreachable: the premise refused
+            }
+            ++result.skipped;
+            decided_through = listed.key;
             continue;
         }
 
@@ -334,6 +569,7 @@ ManifestSweepResult sweepManifestCursorPage(
             if (!head.exists)
             {
                 ++result.skipped;
+                decided_through = listed.key;
                 continue;
             }
             token = head.token;
@@ -345,6 +581,7 @@ ManifestSweepResult sweepManifestCursorPage(
             ++result.deleted;
         else
             ++result.skipped;
+        decided_through = listed.key;
 
         /// Every manifest-body deletion emits an audit row. The full raw key is used as `object_hash`, so
         /// namespace-qualified keys cannot collide when different namespaces use the same manifest-ref
@@ -360,6 +597,17 @@ ManifestSweepResult sweepManifestCursorPage(
             e.detail = {{"writer_epoch", std::to_string(parsed->prefix.writer_epoch)},
                         {"build_sequence", std::to_string(parsed->prefix.build_sequence)}};
         });
+    }
+
+    if (budget_exhausted)
+    {
+        /// Resume strictly after the last DECIDED key, leaving every undecided candidate ahead of the
+        /// cursor. `wrapped` stays false because this page did not reach the end of the keyspace — it
+        /// stopped early, and reporting a wrap would tell the caller the sweep had made a full circuit
+        /// over keys it never looked at.
+        result.next_cursor = decided_through;
+        result.wrapped = false;
+        return result;
     }
 
     result.next_cursor = page.next_cursor;

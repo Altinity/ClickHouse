@@ -89,7 +89,7 @@ size_t runGcToFixpoint(const PoolPtr & s, Gc & gc, size_t max_rounds = 64)
     size_t rounds = 0;
     for (; rounds < max_rounds; ++rounds)
     {
-        const RoundReport rep = gc.runRegularRound();
+        const RoundReport rep = DB::Cas::tests::runRegularRoundReclaiming(gc);
         if (!rep.acquired_lease)
             continue;
         s->renewWatermarkOnce();
@@ -130,7 +130,7 @@ TEST(CasTruncateReclaim, PerRefDropOfSharedBlobsReclaimsToZero)
         if (i % 5 == 4)
         {
             Gc gc(s, hexToU128("00000000000000000000000000000001"));
-            gc.runRegularRound();
+            DB::Cas::tests::runRegularRoundReclaiming(gc);
         }
     }
 
@@ -188,7 +188,7 @@ TEST(CasTruncateReclaim, TruncateThenKeepInsertingStillReclaims)
         if (i % 5 == 4)
         {
             Gc gc(s, hexToU128("00000000000000000000000000000001"));
-            gc.runRegularRound();
+            DB::Cas::tests::runRegularRoundReclaiming(gc);
         }
     }
 
@@ -204,7 +204,7 @@ TEST(CasTruncateReclaim, TruncateThenKeepInsertingStillReclaims)
         if (i % 5 == 4)
         {
             Gc gc(s, hexToU128("00000000000000000000000000000001"));
-            gc.runRegularRound();
+            DB::Cas::tests::runRegularRoundReclaiming(gc);
         }
     }
 
@@ -246,7 +246,7 @@ TEST(CasTruncateReclaim, DropNamespaceOfSharedBlobsReclaimsToZero)
         if (i % 5 == 4)
         {
             Gc gc(s, hexToU128("00000000000000000000000000000001"));
-            gc.runRegularRound();
+            DB::Cas::tests::runRegularRoundReclaiming(gc);
         }
     }
 

@@ -22,6 +22,46 @@
 namespace DB::Cas
 {
 
+/// WHOSE UNIVERSE THE DESTRUCTIVE GATE IS ALLOWED TO TRUST.
+///
+/// A round may destroy only while holding a FRONTIER PROOF for EVERY namespace that can hold a live
+/// edge — because reachability is a property of the whole pool, not of one namespace. The proof per
+/// namespace is cheap and exact (one `GET` at the cursor's arithmetic successor, `CasGc.cpp`'s intake
+/// walk). What Stage A cannot supply is the SET the proofs must cover: there is no catalog, so the
+/// round's universe is `(namespaces with a cursor in the adopted fold seal) ∪ (this round's LIST hint)`
+/// — two sources that can BOTH omit a namespace at once.
+///
+/// The scenario that makes this a correctness question rather than a tidiness one (codex finding 1,
+/// quoted): a hidden acked `+1` lands in a namespace absent from BOTH the hint and `gc/state`, while a
+/// visible `-1` elsewhere drives the shared blob's OBSERVABLE in-degree to zero. Every namespace the
+/// round knows about is walked to a proven frontier, every probe comes back clean, and the round would
+/// delete a blob a durable committed edge still owns. No amount of per-namespace proof detects it: the
+/// namespace is not in the set being proved.
+///
+/// So Stage A does not pretend. `StageA_Suppressed` makes `frontier_incomplete` unconditionally true,
+/// which suppresses every destructive site in the round — the pool leaks until Stage B, and that is the
+/// deliberate trade. Stage B's catalog makes the universe knowable; its Task 7b flips `kDefault` to a
+/// value that consults the per-namespace proofs, and that ONE LINE is the entire flip. Nothing else in
+/// the gate changes shape, which is why the per-namespace logic is written and tested now.
+///
+/// PRODUCTION-UNREACHABLE, BY CONSTRUCTION: the policy is a PARAMETER with a default, not an override.
+/// `AuthoritativeForTest` is passed EXPLICITLY by gtests at the round entry with a CLOSED universe they
+/// construct themselves; the single production call site (`CasGcScheduler`) passes nothing. There is no
+/// config key, no environment variable, no runtime flag, no settable member and no test-hook struct
+/// that can reach it — a test-only header cannot override a constant compiled into production code, so
+/// none is offered.
+enum class UniversePolicy : uint8_t
+{
+    /// The universe is not knowable this stage; every round suppresses all destruction.
+    StageA_Suppressed = 0,
+    /// The caller asserts that the universe it constructed is CLOSED, so the per-namespace frontier
+    /// proofs decide the gate on their own. Only gtests may assert this.
+    AuthoritativeForTest = 1,
+
+    /// STAGE B'S TASK 7b EDITS EXACTLY THIS LINE.
+    kDefault = StageA_Suppressed,
+};
+
 /// The logical (GC-bookkeeping) size of a retired object: a blob subtracts the pool's fixed
 /// blob_header_len (a blob OBJECT smaller than the fixed header is corrupt — CORRUPTED_DATA,
 /// fail closed, never a wrapped-around size). Sizes feed cost/health accounting only — no protocol
@@ -275,7 +315,12 @@ public:
     /// (e.g. a manual `SYSTEM ... GC` command, where two calls can land microseconds apart) must pass
     /// `false`: it may still acquire a FREE lease or renew ITS OWN, but never executes the steal CAS —
     /// dead-incumbent recovery stays the loop's job.
-    RoundReport runRegularRound(std::function<void()> on_lease_acquired = {}, bool allow_steal = true);
+    ///
+    /// `policy` is the destructive gate's universe seam — see `UniversePolicy`. Production passes
+    /// nothing; a gtest that has constructed a CLOSED universe passes `AuthoritativeForTest` here, and
+    /// this parameter is the ONLY way to reach the per-namespace frontier logic.
+    RoundReport runRegularRound(std::function<void()> on_lease_acquired = {}, bool allow_steal = true,
+                                UniversePolicy policy = UniversePolicy::kDefault);
 
     /// Advisory heartbeat: bump <prefix>/gc/hb to {gc_id, hb_seq+1}. Best-effort (a lost CAS is
     /// harmless — the next pulse retries). Touches NO Gc instance state. Static by design.
@@ -370,10 +415,38 @@ private:
         /// The round's one global ref LIST, grouped per table. Reused post-CAS for
         /// ref-object cleanup (covered logs / superseded snapshots) so a second LIST is never issued.
         std::map<String, RefTableListing> ref_tables;
-        /// The single suppress-deletes decision for this round (any clamp / ref-folding abort). Computed
-        /// once in fold() and threaded here so the merge-side reducers and the post-CAS ref/namespace
-        /// cleanup share one value, so they cannot desynchronise.
+
+        /// The round's per-namespace `_ckpt.checkpoint`, read ONCE by the intake walk (its second,
+        /// hint-independent witness) and reused post-CAS by `cleanupRefObjects` for its delete ranges --
+        /// the same DRY reason `ref_tables` is carried here rather than re-listed.
+        std::map<String, RefTxnId> checkpoints;
+        /// THE DESTRUCTIVE GATE for this round, computed ONCE in `fold()` and threaded everywhere so no
+        /// two destructive sites can disagree about it:
+        ///
+        ///     suppress_destructive = any anomaly this round
+        ///                         OR carriedHolds() is non-empty
+        ///                         OR the frontier is incomplete
+        ///
+        /// The second term is STRUCTURAL, not decorative. Every hold the fold seals also records an
+        /// anomaly today, so the first term happens to cover the second — but that is a coincidence of
+        /// the current code, not the invariant. The invariant is the HOLD SET: a hold means some
+        /// namespace's frontier is unproven, and no proof taken elsewhere can license destruction while
+        /// one stands. Reading the seal directly is what keeps a future change to anomaly recording from
+        /// silently opening the gate.
         bool suppress_destructive = false;
+
+        /// Whether EVERY namespace in this round's universe reached a proven frontier — see
+        /// `UniversePolicy` for what the universe is and why Stage A refuses to trust it. False under
+        /// `StageA_Suppressed` no matter what the per-namespace probes found.
+        bool frontier_complete = false;
+
+        /// The universe's size and how much of it this round proved, for the `fold_ref_intake` row: a
+        /// round that suppressed everything owes the reader the two numbers that explain why.
+        uint64_t frontier_namespaces = 0;
+        uint64_t frontier_proven = 0;
+        /// Namespaces the round KNEW about (a cursor in the adopted seal) but did not probe at all,
+        /// because the round's frontier-probe budget ran out first. Each one is an unproven frontier.
+        uint64_t frontier_unprobed_budget = 0;
 
         /// Every hold this round SEALED, as `(cursor key, hold)` — both the ones it detected and the
         /// ones it carried from the parent seal because their offending position is still unresolved.
@@ -421,7 +494,7 @@ private:
     /// `pre_scan` is the round's OWN pre-fold enumeration of `cas/refs/` (see `RefScanSummary`); the fold
     /// compares it against its own enumeration of the same prefix — probe A.
     FoldResult fold(GcState & state, Token & state_token, RoundReport & report, uint64_t current_round,
-                    const RefScanSummary & pre_scan);
+                    const RefScanSummary & pre_scan, UniversePolicy policy);
 
     /// The round's `_ckpt.checkpoint` witness per namespace — see `setCheckpointWitnessesForTest` for
     /// what it decides and why the listing alone cannot decide it. ONE call site, in the fold, right
@@ -485,6 +558,12 @@ private:
     /// made the `Removed` snapshot durable, and only on a clamp-free round (`suppress_destructive == false`).
     /// Acts only on keys THIS round's scan returned (reused via `folded.ref_tables`), so a covering snapshot
     /// -- observed or just-republished -- is always durable before any deletion it authorizes.
+    ///
+    /// The round's `folded.checkpoints` TIGHTENS both boundaries and can never widen either: a log is
+    /// deletable only at or below `min(newest covering snapshot, checkpoint, cursor)`, and a snapshot
+    /// only STRICTLY BELOW `min(newest covering snapshot, checkpoint)` -- so the snapshot the checkpoint
+    /// itself names always survives. Empty (Stage A, before Task 5's `_ckpt` object exists) degrades to
+    /// the cursor/snapshot boundaries alone, which is the behaviour that shipped before.
     void cleanupRefObjects(const FoldResult & folded, bool suppress_destructive);
 
     /// Namespace-cleanup item passes: for each item in the committed seal, a Pending item
@@ -507,12 +586,24 @@ private:
     bool namespacePhysicallyEmpty(const RootNamespace & ns);
 
     /// Best-effort cursor-paced orphan part-manifest sweep. This is cleanup-only state: a lost CAS only
-    /// discards cursor progress and must not fail the already-completed GC round.
-    void runManifestSweepCursorPass(GcState & state, Token & state_token);
+    /// discards cursor progress and must not fail the already-completed GC round. Returns the page's
+    /// counters so the `orphan_sweep` phase row can report what the pass actually did — including the
+    /// §6 premise's per-reason retention classes, which on this path are the only report there is.
+    ManifestSweepResult runManifestSweepCursorPass(GcState & state, Token & state_token);
+
+    /// Emit the sweep's per-pass retention rollup, throttled (see `last_retain_rollup`). Separate from
+    /// the pass itself so the phase row and the log line read the SAME counters rather than two
+    /// independently-derived views of the page.
+    void reportSweepRetention(const ManifestSweepResult & result);
 
     /// Discover the present (namespace, shard) pairs from LIST(cas/refs/); shared by the fold and the
     /// resume re-fence. Returns only shards that have a backend object (absent shards not included).
     /// Fresh pool (no shards yet) => empty result.
+    ///
+    /// This is a HINT and its mechanism is unchanged: a store that omits a namespace from the
+    /// enumeration still omits it here. What changed around it is that the fold UNIONS this result with
+    /// the namespaces the adopted seal already carries a cursor for, so a quiet hint can only ever ADD
+    /// to the frontier obligation, never shrink it.
     std::vector<std::pair<RootNamespace, uint64_t>> discoverUniverse();
 
     /// The two cheap pre-fold GC round-defer signals — both computed from
@@ -553,8 +644,14 @@ private:
     /// current-generation debris is bounded space that waits at most `keep` completion-advances for the
     /// wholesale prune to reclaim it. keep==0 prunes nothing (keep-all forensics mode). `attempt` is the
     /// adopted attempt (`next.snap_attempt`); it is currently unused (retention keys on generation alone).
+    ///
+    /// `suppress_destructive` is the round's gate: a suppressed round prunes NOTHING and leaves
+    /// `snap_pruned_through` where it was. The cursor must not advance either -- it is a monotone
+    /// high-water mark that the wholesale prune never revisits, so advancing it over a generation this
+    /// round declined to delete would strand that generation's whole prefix permanently.
     void pruneSupersededGenerations(uint64_t adopted_generation, uint64_t attempt, GcState & next,
-                                    const std::set<uint64_t> & referenced_generations);
+                                    const std::set<uint64_t> & referenced_generations,
+                                    bool suppress_destructive);
 
     /// Read the fold seal for (generation, attempt) (nullopt when absent). Used by resume + parent-cursor reads.
     std::optional<CasFoldSeal> readFoldSeal(uint64_t generation, uint64_t attempt);
@@ -621,6 +718,17 @@ private:
     /// leader (after a steal, or a process restart) starts empty, which only delays fencing an
     /// already-dead mount by one extra round (safe: never fences early).
     MountObservationMap mount_obs;
+
+    /// Throttle for the orphan sweep's retention rollup. In Stage A the premise retains on nearly every
+    /// pass, so an unconditional `LOG_INFO` would emit the same sentence every round forever and train
+    /// operators to filter out the channel carrying the answer they need. It is reported when the
+    /// verdict CHANGES (a different top reason class, or a different count), and otherwise re-stated
+    /// every `kRetainRollupRepeatPasses` passes so a newly-arrived operator is never left with silence
+    /// they would have to read as "nothing to report". Leader-owned and in-memory: a fresh leader
+    /// re-states once, which is the harmless direction.
+    static constexpr uint64_t kRetainRollupRepeatPasses = 64;
+    std::optional<std::pair<SweepRetainClass, uint64_t>> last_retain_rollup;
+    uint64_t retain_rollup_passes_since_report = 0;
 
     /// Bounded pool for the round's per-hash freshness-meta writes (condemn/spare/delete);
     /// sized from `PoolConfig::gc_meta_pool_size` (constructed in the ctor, after the null/id checks --

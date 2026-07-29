@@ -504,7 +504,7 @@ TEST(CasProtocol, NewNamespacePublishGatedByShardFenceFloor)
     Gc gc(s, hexToU128("00000000000000000000000000000001"));
     for (size_t r = 0; r < 16; ++r)
     {
-        const RoundReport rep = gc.runRegularRound();
+        const RoundReport rep = DB::Cas::tests::runRegularRoundReclaiming(gc);
         s->renewWatermarkOnce();
         if (!b->head(blob_key).exists)
             break;

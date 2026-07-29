@@ -19,6 +19,17 @@ ManifestRef ref(uint64_t seq, uint64_t inst)
 {
     return ManifestRef{.writer_epoch = kWriterEpoch, .build_sequence = seq, .manifest_ordinal = static_cast<uint32_t>(inst)};
 }
+
+/// The §6 deletion premise (`manifestDeletionPremise`) is a SECOND precondition on every deletion below,
+/// alongside the watermark eligibility these tests are about: a manifest of an epoch-`E` build is
+/// deletable only once the namespace's sealed fold cursor sits in an epoch strictly above `E`. Tests
+/// whose subject is the eligibility or ownership rule therefore have to establish it, or they would
+/// assert a deletion the premise (not the rule under test) prevented. Tests whose subject is RETENTION
+/// deliberately do NOT call this — see `CasSweepDeletionPremise` for the premise's own coverage.
+void seedConsumedSealCursor(InMemoryBackend & backend, const Layout & layout, const RootNamespace & ns)
+{
+    seedFoldCursorForTest(backend, layout, ns, RefTxnId{kWriterEpoch + 1, 1});
+}
 }
 
 /// A staged-but-unowned body in an ELIGIBLE prefix, absent from the owner view, is deleted (#7).
@@ -31,6 +42,7 @@ TEST(CasOrphanManifestSweep, EligibleAndUnownedIsDeleted)
     const ManifestRef r = ref(5, 0xAB);
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});   // body, no owner
     setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, /*min_active*/6);   // 6 > 5 => eligible
+    seedConsumedSealCursor(*backend, store->layout(), ns);
 
     sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5});
     EXPECT_FALSE(backend->head(store->layout().manifestKey(ManifestId{ns, r})).exists);
@@ -58,6 +70,14 @@ TEST(CasOrphanManifestSweep, OwnedBodyIsSkipped)
 /// deleted the body in the dropRef→fold window → the removal-fold then clamped FOREVER on the missing
 /// committed body → pool-wide GC stop. The pending-removal protection now covers COMMITTED (not only
 /// PRECOMMIT) removals.
+///
+/// SINCE THE §6 PREMISE, this shape is held by TWO independent facts: the tail-removal protection this
+/// test is named for, and the premise's rule (1) — the fixture seals no fold cursor, so epoch
+/// `kWriterEpoch`'s closing seal is not consumed either. They cannot be separated HERE: the removal log
+/// sits in a lower epoch than the build, so any cursor high enough to satisfy rule (1) would also sit
+/// above the log and stop the tail scan from reading it at all. The case where the tail-removal
+/// protection is the ONLY thing standing — a removal in a LATER epoch, which is the direction removals
+/// actually cross — is `CasSweepDeletionPremise.AnUnconsumedTailRemovalRetainsItsTarget`.
 TEST(CasOrphanManifestSweep, PendingCommittedRemovalBodyIsSkipped)
 {
     auto backend = std::make_shared<InMemoryBackend>();
@@ -84,7 +104,8 @@ TEST(CasOrphanManifestSweep, EmitsNoBlobDeltas)
     const ManifestRef r = ref(5, 0xAB);
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
     setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, 6);
-    // No GC state / no generation seal exists before the sweep; the sweep must not create one.
+    seedConsumedSealCursor(*backend, store->layout(), ns);
+    // The sweep must not advance the in-degree generation: capture it AFTER the fixture's own seal.
     const uint64_t gen_before = currentGenerationOf(*backend, store->layout());
 
     sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5});
@@ -137,6 +158,7 @@ TEST(CasOrphanManifestSweep, CursorPageDeletesEligibleUnownedBody)
     const ManifestRef r = ref(5, 0xAC);
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
     setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, 6);
+    seedConsumedSealCursor(*backend, store->layout(), ns);
 
     const ManifestSweepResult result = sweepManifestCursorPage(*store, "", /*list_budget*/100, /*delete_budget*/10);
     EXPECT_GE(result.listed, 1u);
@@ -155,6 +177,7 @@ TEST(CasOrphanManifestSweep, CursorPageRespectsDeleteBudget)
     writeManifestRaw(*backend, store->layout(), ns, r1, {blobEntryFor("a", DB::UInt128(1))});
     writeManifestRaw(*backend, store->layout(), ns, r2, {blobEntryFor("b", DB::UInt128(2))});
     setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, 6);
+    seedConsumedSealCursor(*backend, store->layout(), ns);
 
     const ManifestSweepResult result = sweepManifestCursorPage(*store, "", /*list_budget*/100, /*delete_budget*/1);
     EXPECT_EQ(result.deleted, 1u);

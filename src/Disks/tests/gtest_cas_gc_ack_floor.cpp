@@ -81,11 +81,11 @@ TEST(CasGcRetire, ManifestBodyDeletedAfterDecrementsSealed)
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
     publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
     Gc gc(store, kGc);
-    gc.runRegularRound();
+    runRegularRoundReclaiming(gc);
     EXPECT_TRUE(backend->head(store->layout().manifestKey(ManifestId{ns, r})).exists);
 
     dropRefTransition(*backend, store->layout(), ns, "tbl", r);
-    gc.runRegularRound();
+    runRegularRoundReclaiming(gc);
     EXPECT_FALSE(backend->head(store->layout().manifestKey(ManifestId{ns, r})).exists);
 }
 
@@ -388,9 +388,9 @@ TEST(CasGcRetire, AbandonedCopyForwardDropsEntryWithoutWrongTokenDelete)
     writeManifestRaw(*backend, store->layout(), ns, r1, {blobEntryFor("a", DB::UInt128(1))});
     publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r1);
     Gc gc(store, kGc);
-    gc.runRegularRound();
+    runRegularRoundReclaiming(gc);
     dropRefTransition(*backend, store->layout(), ns, "tbl", r1);
-    gc.runRegularRound();
+    runRegularRoundReclaiming(gc);
     ASSERT_TRUE(currentEntryFor(*backend, store->layout(), DB::UInt128(1)).has_value());
 
     const String blob_key = store->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::UInt128(1))});
@@ -402,7 +402,7 @@ TEST(CasGcRetire, AbandonedCopyForwardDropsEntryWithoutWrongTokenDelete)
     /// the (1, t0) entry graduates; its exact-token delete mismatches t1 and the entry drops.
     for (int i = 0; i < 6; ++i)
     {
-        gc.runRegularRound();
+        runRegularRoundReclaiming(gc);
         store->renewWatermarkOnce();
     }
     EXPECT_FALSE(currentEntryFor(*backend, store->layout(), DB::UInt128(1)).has_value())
@@ -505,13 +505,13 @@ TEST(CasGcAckFloor, CondemnThenGraduatesNextRoundThenDeletes)
     publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
     Gc gc(store, kGc);
 
-    gc.runRegularRound();                 // round 1: folds the +1; blob referenced
+    runRegularRoundReclaiming(gc);                 // round 1: folds the +1; blob referenced
     dropRefTransition(*backend, store->layout(), ns, "tbl", r);
 
     // The condemning round: the -1 drops in-degree to 0; the blob is condemned into the current retired
     // list but NOT deleted. The entry is present and NOT yet pending. report.condemned counts it.
     {
-        const RoundReport rep = gc.runRegularRound();
+        const RoundReport rep = runRegularRoundReclaiming(gc);
         EXPECT_EQ(rep.condemned, 1u);        // one blob condemned this round
         EXPECT_EQ(rep.graduated, 0u);        // must NOT graduate the same round it was condemned
         EXPECT_EQ(rep.redeleted, 0u);        // nothing pending to delete yet
@@ -523,7 +523,7 @@ TEST(CasGcAckFloor, CondemnThenGraduatesNextRoundThenDeletes)
 
     // The VERY NEXT round graduates it deterministically (no ack/heartbeat dependency).
     {
-        const RoundReport rep = gc.runRegularRound();
+        const RoundReport rep = runRegularRoundReclaiming(gc);
         EXPECT_EQ(rep.graduated, 1u);
         EXPECT_EQ(rep.redeleted, 0u);   // the delete lands on the NEXT pass, not this one
         const auto e = currentEntryFor(*backend, store->layout(), blob);
@@ -535,7 +535,7 @@ TEST(CasGcAckFloor, CondemnThenGraduatesNextRoundThenDeletes)
     // The pass AFTER the pending publish executes the exact-token delete; the blob becomes absent and the
     // entry is dropped from the current retired list. report.redeleted counts the executed pending delete.
     {
-        const RoundReport rep = gc.runRegularRound();
+        const RoundReport rep = runRegularRoundReclaiming(gc);
         EXPECT_EQ(rep.redeleted, 1u);        // the pending delete executed this round
         EXPECT_FALSE(blobExists(*backend, store->layout(), blob));
         EXPECT_FALSE(currentEntryFor(*backend, store->layout(), blob).has_value());
@@ -731,17 +731,17 @@ TEST(CasGcAckFloor, RecreatedBlobDeleteIsTokenMismatchOk)
     publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
     Gc gc(store, kGc);
 
-    gc.runRegularRound();
+    runRegularRoundReclaiming(gc);
     store->renewWatermarkOnce();
     dropRefTransition(*backend, store->layout(), ns, "tbl", r);
-    gc.runRegularRound();   // condemn (captures the ORIGINAL token)
+    runRegularRoundReclaiming(gc);   // condemn (captures the ORIGINAL token)
     store->renewWatermarkOnce();
 
     // Drive rounds until the entry is delete_pending (the token it holds is the original observation).
     bool pending = false;
     for (int i = 0; i < 6 && !pending; ++i)
     {
-        gc.runRegularRound();
+        runRegularRoundReclaiming(gc);
         store->renewWatermarkOnce();
         const auto e = currentEntryFor(*backend, store->layout(), blob);
         pending = e && e->delete_pending;
@@ -754,7 +754,7 @@ TEST(CasGcAckFloor, RecreatedBlobDeleteIsTokenMismatchOk)
 
     // The deleting pass issues deleteExact(entry.token) → TokenMismatch → Replaced. The fresh incarnation
     // survives; the entry is dropped.
-    const RoundReport rep = gc.runRegularRound();
+    const RoundReport rep = runRegularRoundReclaiming(gc);
     store->renewWatermarkOnce();
     EXPECT_EQ(rep.replaced, 1u);
     EXPECT_TRUE(blobExists(*backend, store->layout(), blob));   // the recreated incarnation is live
@@ -782,7 +782,7 @@ TEST(CasGcAckFloor, ResumeAfterCrashBetweenRetiredPutAndStateCas)
     // property: no wedging, each round completes under its own fresh attempt.
     {
         Gc gc(store, kGc);
-        gc.runRegularRound();
+        runRegularRoundReclaiming(gc);
         store->renewWatermarkOnce();
     }
     dropRefTransition(*backend, store->layout(), ns, "tbl", r);
@@ -792,7 +792,7 @@ TEST(CasGcAckFloor, ResumeAfterCrashBetweenRetiredPutAndStateCas)
     for (int i = 0; i < 6 && !pending; ++i)
     {
         Gc gc(store, kGc);
-        gc.runRegularRound();
+        runRegularRoundReclaiming(gc);
         store->renewWatermarkOnce();
         const auto e = currentEntryFor(*backend, store->layout(), blob);
         if (e && e->delete_pending)
@@ -811,7 +811,7 @@ TEST(CasGcAckFloor, ResumeAfterCrashBetweenRetiredPutAndStateCas)
 
     const uint64_t round_before = decodeGcState(backend->get(store->layout().gcStateKey())->bytes).round;
     Gc gc2(store, kGc);
-    const RoundReport rep = gc2.runRegularRound();
+    const RoundReport rep = runRegularRoundReclaiming(gc2);
     store->renewWatermarkOnce();
     EXPECT_EQ(rep.absent, 1u);   // the replayed delete found the object already gone
     const uint64_t round_after = decodeGcState(backend->get(store->layout().gcStateKey())->bytes).round;
@@ -837,10 +837,10 @@ TEST(CasGcAckFloor, TokenMismatchOnAbsentBlobSettlesAsAbsentAndDropsMeta)
     publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
 
     Gc gc(store, kGc);
-    gc.runRegularRound();
+    runRegularRoundReclaiming(gc);
     store->renewWatermarkOnce();
     dropRefTransition(*backend, store->layout(), ns, "tbl", r);
-    gc.runRegularRound();   // condemn
+    runRegularRoundReclaiming(gc);   // condemn
     store->renewWatermarkOnce();
 
     // Drive rounds until the entry is delete_pending, capturing its exact condemn-time token.
@@ -848,7 +848,7 @@ TEST(CasGcAckFloor, TokenMismatchOnAbsentBlobSettlesAsAbsentAndDropsMeta)
     bool pending = false;
     for (int i = 0; i < 6 && !pending; ++i)
     {
-        gc.runRegularRound();
+        runRegularRoundReclaiming(gc);
         store->renewWatermarkOnce();
         const auto e = currentEntryFor(*backend, store->layout(), blob);
         if (e && e->delete_pending)
@@ -875,7 +875,7 @@ TEST(CasGcAckFloor, TokenMismatchOnAbsentBlobSettlesAsAbsentAndDropsMeta)
     // The deleting pass replays deleteExact(entry.token): the backend answers TokenMismatch (quirk), but
     // the follow-up HEAD shows the object absent, so the fix disambiguates the outcome to Absent and still
     // runs the `.meta` cleanup.
-    const RoundReport rep = gc.runRegularRound();
+    const RoundReport rep = runRegularRoundReclaiming(gc);
     store->renewWatermarkOnce();
     EXPECT_EQ(rep.absent, 1u) << "the 412-on-absent quirk must settle as Absent, not Replaced";
     EXPECT_EQ(rep.replaced, 0u);
@@ -910,9 +910,9 @@ TEST(CasGcCondemnMarker, SwallowedMarkerWriteCarriesEntryInsteadOfDeleting)
     publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
     Gc gc(store, kGc);
 
-    gc.runRegularRound();   // +1 folds; blob referenced
+    runRegularRoundReclaiming(gc);   // +1 folds; blob referenced
     dropRefTransition(*backend, store->layout(), ns, "tbl", r);
-    gc.runRegularRound();   // the condemning round; the controlled marker write exhausts as Unresolved
+    runRegularRoundReclaiming(gc);   // the condemning round; the controlled marker write exhausts as Unresolved
     ASSERT_FALSE(loadMetaForTest(*backend, store->layout(), blob).has_value())
         << "precondition: the injected fault must have lost the condemn-marker write";
     ASSERT_TRUE(currentEntryFor(*backend, store->layout(), blob).has_value())
@@ -924,7 +924,7 @@ TEST(CasGcCondemnMarker, SwallowedMarkerWriteCarriesEntryInsteadOfDeleting)
         ProfileEvents::global_counters[ProfileEvents::CasGcCondemnMarkerUnconfirmedCarry].load();
     for (int i = 0; i < 4; ++i)
     {
-        gc.runRegularRound();
+        runRegularRoundReclaiming(gc);
         store->renewWatermarkOnce();
         EXPECT_TRUE(blobExists(*backend, store->layout(), blob))
             << "round " << i << " after condemn: deleted without a durable condemn marker";
@@ -960,18 +960,18 @@ TEST(CasGcCondemnMarker, DurableMarkerKeepsCanonicalGraduationSchedule)
     publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
     Gc gc(store, kGc);
 
-    gc.runRegularRound();
+    runRegularRoundReclaiming(gc);
     dropRefTransition(*backend, store->layout(), ns, "tbl", r);
 
     {
-        const RoundReport rep = gc.runRegularRound();   // condemn round K
+        const RoundReport rep = runRegularRoundReclaiming(gc);   // condemn round K
         EXPECT_EQ(rep.condemned, 1u);
         const auto lm = loadMetaForTest(*backend, store->layout(), blob);
         ASSERT_TRUE(lm.has_value());
         EXPECT_EQ(lm->meta.state, MetaState::Condemned);
     }
     {
-        const RoundReport rep = gc.runRegularRound();   // K+1: confirmed marker => graduates on schedule
+        const RoundReport rep = runRegularRoundReclaiming(gc);   // K+1: confirmed marker => graduates on schedule
         EXPECT_EQ(rep.graduated, 1u);
         const auto e = currentEntryFor(*backend, store->layout(), blob);
         ASSERT_TRUE(e.has_value());
@@ -980,7 +980,7 @@ TEST(CasGcCondemnMarker, DurableMarkerKeepsCanonicalGraduationSchedule)
         EXPECT_TRUE(blobExists(*backend, store->layout(), blob));
     }
     {
-        const RoundReport rep = gc.runRegularRound();   // K+2: the pending delete executes
+        const RoundReport rep = runRegularRoundReclaiming(gc);   // K+2: the pending delete executes
         EXPECT_EQ(rep.redeleted, 1u);
         EXPECT_FALSE(blobExists(*backend, store->layout(), blob));
     }
@@ -1008,9 +1008,9 @@ TEST(CasGcCondemnMarker, LoadMetaFallbackConfirmsGraduationAfterLeaderRestart)
         /// The first (soon-to-be-gone) leader: seeds the blob, condemns it, and lets the marker write
         /// land on the healthy backend. Its `condemn_markers_confirmed` registry dies with it.
         Gc gc(store, kGc);
-        gc.runRegularRound();
+        runRegularRoundReclaiming(gc);
         dropRefTransition(*backend, store->layout(), ns, "tbl", r);
-        const RoundReport rep = gc.runRegularRound();   // condemn round
+        const RoundReport rep = runRegularRoundReclaiming(gc);   // condemn round
         EXPECT_EQ(rep.condemned, 1u);
         store->renewWatermarkOnce();
     }
@@ -1024,7 +1024,7 @@ TEST(CasGcCondemnMarker, LoadMetaFallbackConfirmsGraduationAfterLeaderRestart)
     /// so the in-process confirmation path (`condemnMarkerConfirmedInProcess`) has nothing to return true
     /// for; only the `loadMeta` fallback can authorize graduation.
     Gc gc2(store, kGc);
-    const RoundReport rep = gc2.runRegularRound();
+    const RoundReport rep = runRegularRoundReclaiming(gc2);
     EXPECT_EQ(rep.graduated, 1u)
         << "the loadMeta fallback (leader-restart path) must authorize graduation from durable evidence "
            "alone";

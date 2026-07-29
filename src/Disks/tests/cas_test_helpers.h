@@ -511,18 +511,36 @@ inline bool blobAbsent(DB::Cas::Backend & backend, const DB::Cas::Layout & layou
     return !backend.head(layout.blobKey(DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(hash)})).exists;
 }
 
+/// ONE round that is allowed to RECLAIM -- the name is the point, so that grepping for the tests whose
+/// subject is reclamation finds exactly them.
+///
+/// The destructive gate refuses to act on a universe it cannot enumerate, and Stage A never can
+/// (`UniversePolicy`), so a round left on the production default reclaims NOTHING. A test whose subject
+/// is reclamation therefore has to say so, and this is where it says it: it asserts that the universe
+/// IT built is closed, which for a unit test over an `InMemoryBackend` is true by construction -- the
+/// test wrote every object in the pool.
+///
+/// It is a spelled-out call, not a seam: production reaches `runRegularRound` with no third argument
+/// and there is no other way in. Tests that are NOT about reclamation should keep calling
+/// `gc.runRegularRound()` plainly -- on the production default they exercise the gate itself.
+inline DB::Cas::RoundReport runRegularRoundReclaiming(DB::Cas::Gc & gc)
+{
+    return gc.runRegularRound({}, /*allow_steal*/true, DB::Cas::UniversePolicy::AuthoritativeForTest);
+}
+
 /// Reclaim loop (the canonical retired-cursor pipeline driver): run regular rounds, renewing the store's
 /// own heartbeat after each round (`renewWatermarkOnce` — keeps the lease + build-watermark floor
 /// current; unrelated to graduation, which paces on GC rounds alone). A blob condemned at round K is
 /// deleted by round K+2 (condemn at K -> graduate to delete_pending at K+1, unconditionally -> physical
-/// delete at K+2). Returns true as soon as the blob became absent.
+/// delete at K+2). Returns true as soon as the blob became absent. Reclamation is the whole point of the
+/// loop, so every round it drives is an authoritative one.
 inline bool runRoundsUntilAbsent(
     const DB::Cas::PoolPtr & store, DB::Cas::Gc & gc, DB::Cas::Backend & backend,
     const DB::Cas::Layout & layout, const DB::UInt128 & hash, int max_rounds = 8)
 {
     for (int i = 0; i < max_rounds; ++i)
     {
-        gc.runRegularRound();
+        runRegularRoundReclaiming(gc);
         store->renewWatermarkOnce();
         if (blobAbsent(backend, layout, hash))
             return true;
@@ -802,6 +820,69 @@ inline String cursorKeyForTest(const DB::Cas::RootNamespace & ns, uint64_t shard
     return ns.string() + "/" + std::to_string(shard);
 }
 
+/// Seed the ADOPTED fold seal's shard-0 coverage row for `ns` and point `gc/state` at it, bypassing a
+/// real round. This is the durable fact the sweep's §6 deletion premise reads
+/// (`CasOrphanManifestSweep.cpp`): `cursor` is the namespace's `last_folded_ref_id`, and a manifest of
+/// an epoch-`E` build is deletable only once that cursor sits in an epoch STRICTLY above `E`.
+/// `hold`, when set, makes the row classification 4 — the strict grammar `encodeFoldSeal` enforces in
+/// both directions, so a hold and a non-4 classification cannot be seeded together.
+///
+/// SHARP EDGE, HANDLED HERE SO NO CALLER HAS TO KNOW IT: a fold seal must carry a `condemned_summary`
+/// entry for EVERY shard in `0..gc_shards-1`. A later real round adopts this object as its PARENT and
+/// throws `CORRUPTED_DATA` — "parent fold seal (generation G, attempt A) lacks a condemned_summary
+/// entry for gc-shard N — the seal is not total over gc_shards" — on a seal that is missing one. The
+/// symptom is nowhere near the cause: the round fails at fold time, or (if it fails before taking the
+/// lease) merely reports `acquired_lease == false`, so a test that seeds a partial seal looks like a
+/// leadership problem. This helper fills the map from `gc/state`'s own `gc_shards`, so seeding a
+/// coverage row is safe to combine with real rounds.
+///
+/// One thing it does NOT do: create `gc/state` in a state a first-ever `Gc` round can take the lease
+/// over. `acquireOrRenewLease` only creates-and-owns when `gc/state` is ABSENT, so seeding before the
+/// first round makes that round back off. Seed AFTER the first round (passing that round's
+/// `currentGenerationOf`/`currentAttemptOf`) when a test drives real rounds.
+inline void seedFoldCursorForTest(
+    DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RootNamespace & ns,
+    DB::Cas::RefTxnId cursor, std::optional<DB::Cas::RefHold> hold = std::nullopt,
+    uint64_t generation = 1, uint64_t attempt = 1)
+{
+    const String seal_key = layout.foldSealKey(generation, attempt);
+    DB::Cas::CasFoldSeal seal;
+    const auto existing = backend.get(seal_key);
+    if (existing)
+        seal = DB::Cas::decodeFoldSeal(existing->bytes);
+    seal.generation = generation;
+
+    DB::Cas::ShardCoverage cov;
+    cov.classification = hold ? 4 : 2;
+    cov.last_folded_ref_id = cursor;
+    cov.hold = hold;
+    seal.per_ns_shard[cursorKeyForTest(ns, /*shard*/0)] = cov;
+
+    DB::Cas::GcState gc_state;
+    const DB::Cas::HeadResult head = backend.head(layout.gcStateKey());
+    if (head.exists)
+        gc_state = DB::Cas::decodeGcState(backend.get(layout.gcStateKey())->bytes);
+
+    /// Totality over `gc_shards` — see the doc comment's SHARP EDGE note for what throws without it.
+    const uint64_t gc_shards = gc_state.gc_shards ? gc_state.gc_shards : 1;
+    for (uint64_t s = 0; s < gc_shards; ++s)
+        seal.condemned_summary.emplace(s, DB::Cas::CondemnedSummary{});
+
+    const String seal_bytes = DB::Cas::encodeFoldSeal(seal);
+    if (existing)
+        backend.putOverwrite(seal_key, seal_bytes, existing->token);
+    else
+        backend.putIfAbsent(seal_key, seal_bytes);
+
+    gc_state.snap_generation = generation;
+    gc_state.snap_attempt = attempt;
+    const String state = DB::Cas::encodeGcState(gc_state);
+    if (!head.exists)
+        backend.putIfAbsent(layout.gcStateKey(), state);
+    else
+        backend.putOverwrite(layout.gcStateKey(), state, head.token);
+}
+
 /// The folded cursor sealed for (ns, shard) by the latest fold seal, or 0 when absent. After a COMPLETE
 /// round the gc/state generation pointer is the recheck's COMPLETION generation (G+2 for a round started
 /// at G), but the fold seal is written at the FOLD generation (G+1) — recheck writes a completion seal,
@@ -994,6 +1075,7 @@ public:
         return InMemoryBackend::putIfAbsent(key, bytes, meta);
     }
 
+
     /// Counted separately from `putIfAbsent`: a token-CAS is a DIFFERENT op with a different cost, and
     /// the `_ckpt` no-op contract ("identical merged body issues no write") is asserted on exactly this
     /// counter -- a create-if-absent count would not see the replace path at all.
@@ -1007,11 +1089,49 @@ public:
         }
         return InMemoryBackend::casPut(key, bytes, expected, meta);
     }
+    /// Every ATTEMPTED delete is counted, whatever the backend answers. The destructive gate's tests
+    /// assert that a suppressed round issues NONE, and an attempt that came back `NotFound` is still an
+    /// attempt -- counting only successful ones would let a gate that leaks deletes over already-absent
+    /// keys read as green.
+    DB::Cas::DeleteOutcome deleteExact(const String & key, const DB::Cas::Token & token) override
+    {
+        {
+            std::lock_guard lock(count_mutex);
+            ++delete_counts[key];
+            ++delete_total;
+        }
+        return InMemoryBackend::deleteExact(key, token);
+
+    }
 
     uint64_t headCount(const String & key) const { return lookup(head_counts, key); }
     uint64_t casPutCount(const String & key) const { return lookup(cas_put_counts, key); }
     uint64_t getCount(const String & key) const { return lookup(get_counts, key); }
     uint64_t putCount(const String & key) const { return lookup(put_counts, key); }
+    uint64_t deleteCount(const String & key) const { return lookup(delete_counts, key); }
+    uint64_t deleteTotal() const { std::lock_guard lock(count_mutex); return delete_total; }
+    /// Attempted deletes against any key whose path CONTAINS `substr` — the per-site assertion the
+    /// destructive-gate tests make ("the generation prune deleted nothing", "the sweep deleted nothing").
+    uint64_t deleteCountForKeysContaining(const String & substr) const
+    {
+        std::lock_guard lock(count_mutex);
+        uint64_t total = 0;
+        for (const auto & [key, n] : delete_counts)
+            if (key.find(substr) != String::npos)
+                total += n;
+        return total;
+    }
+    /// Every key this backend was ever asked to delete, in sorted order — so a failing zero-delete
+    /// assertion names the sites that leaked instead of just reporting a count.
+    std::vector<String> deletedKeys() const
+    {
+        std::lock_guard lock(count_mutex);
+        std::vector<String> keys;
+        keys.reserve(delete_counts.size());
+        for (const auto & [key, n] : delete_counts)
+            keys.push_back(key);
+        return keys;
+    }
     uint64_t getStreamCount(const String & key) const { return lookup(get_stream_counts, key); }
     uint64_t listCount(const String & prefix) const { return lookup(list_counts, prefix); }
     /// The max ranged-get window length observed for `key` (0 if only whole-object gets, or none).
@@ -1050,9 +1170,11 @@ public:
         cas_put_counts.clear();
         get_stream_counts.clear();
         list_counts.clear();
+        delete_counts.clear();
         max_ranged_get_len.clear();
         whole_get_counts.clear();
-        head_total = get_total = put_total = cas_put_total = get_stream_total = list_total = 0;
+        head_total = get_total = put_total = cas_put_total = get_stream_total = list_total = delete_total = 0;
+
     }
 
 private:
@@ -1070,6 +1192,7 @@ private:
     std::map<String, uint64_t> cas_put_counts;
     std::map<String, uint64_t> get_stream_counts;
     std::map<String, uint64_t> list_counts;
+    std::map<String, uint64_t> delete_counts;
     std::map<String, uint64_t> max_ranged_get_len;
     std::map<String, uint64_t> whole_get_counts;
     uint64_t head_total = 0;
@@ -1078,6 +1201,7 @@ private:
     uint64_t cas_put_total = 0;
     uint64_t get_stream_total = 0;
     uint64_t list_total = 0;
+    uint64_t delete_total = 0;
 };
 
 /// Stand in for the self-remount that `Pool::reportImpossibleInterference` schedules. That reaction

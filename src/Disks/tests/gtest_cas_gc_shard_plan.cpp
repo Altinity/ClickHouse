@@ -575,7 +575,7 @@ TEST(CasGcShardRetireDrain, ReclaimsDroppableBlobOwnedByNonZeroShard)
     {
         for (size_t r = 0; r < 64; ++r)
         {
-            const RoundReport rep = gc.runRegularRound();
+            const RoundReport rep = runRegularRoundReclaiming(gc);
             if (!rep.acquired_lease)
                 continue;
             store->renewWatermarkOnce();

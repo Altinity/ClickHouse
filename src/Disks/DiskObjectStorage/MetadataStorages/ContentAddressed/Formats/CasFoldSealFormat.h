@@ -47,6 +47,11 @@ enum class HoldReason : uint8_t
     ManifestBodyMissing = 5,    /// a part-manifest body the position's edges name is absent (the fold barrier)
 };
 
+/// The wire word one `HoldReason` is persisted as. Exported because the reason is operator-facing well
+/// beyond the codec — the sweep names it when the §6 deletion premise retains a manifest under a held
+/// namespace — and a second rendering of these words elsewhere would be a second place for them to drift.
+std::string_view holdReasonToWord(HoldReason r);
+
 /// The durable hold on one namespace. It rides `ShardCoverage` across rounds and across `REBUILD`, and
 /// clears ONLY by folding through `offending_position` and adopting the result in `gc/state` — never by
 /// observing another absent, because an absent is exactly the observation a lying store produces.

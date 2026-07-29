@@ -697,6 +697,13 @@ std::map<String, RefTableListing> groupRefKeys(const Layout & layout, const std:
 /// any delete this plan authorizes, preserving the "covering snapshot durable before deletion" invariant.
 /// It is never itself scheduled for deletion (it is not in `listing.snapshots` on the round it is first
 /// published; on a later round it appears in `listing.snapshots` as the newest and is retained there).
+///
+/// `checkpoint` (optional) is the namespace's own durable `_ckpt.checkpoint`. It only ever TIGHTENS the
+/// two boundaries -- a log must additionally satisfy `L <= checkpoint`, and a snapshot must be STRICTLY
+/// BELOW it, so the snapshot the checkpoint itself names always survives. It can never widen either:
+/// a checkpoint AHEAD of what this round observed names durable objects the scan did not return, and
+/// this plan acts only on keys the scan DID return. Absent (Stage A, before the `_ckpt` object exists)
+/// leaves both boundaries exactly as they were.
 struct RefCleanupPlan
 {
     std::vector<RefTxnId> deletable_logs;
@@ -706,7 +713,8 @@ struct RefCleanupPlan
 };
 RefCleanupPlan planRefCleanup(const RefTableListing & listing, const RefTxnId & durable_cursor,
                               const std::set<RefTxnId> & removal_logs_blocked,
-                              std::optional<RefTxnId> completed_removal_snapshot = std::nullopt);
+                              std::optional<RefTxnId> completed_removal_snapshot = std::nullopt,
+                              std::optional<RefTxnId> checkpoint = std::nullopt);
 
 /// The result of `recoverRefTableDetailed`: the replayed table state plus the identity of the snapshot
 /// recovery actually selected as its base (`nullopt` when it found no snapshot at all).

@@ -89,6 +89,15 @@ struct PoolConfig
     /// per completed GC round; the delete budget separately bounds exact-token destructive work.
     uint64_t manifest_sweep_list_budget_keys = 1000;
     uint64_t manifest_sweep_delete_budget_keys = 100;
+    /// Frontier probes: how many KNOWN-BUT-UNHINTED namespaces one round may walk to prove their
+    /// frontier. A namespace this round's LIST hint still mentions is walked regardless (the round owes
+    /// its edges anyway), and a HELD one is always walked (its hold must be retried by exact key, spec
+    /// §5), so this bounds only the extra exact `GET`s the universe union introduced -- normally zero,
+    /// because a namespace that legitimately went away leaves its `_cleanup` marker behind and therefore
+    /// stays hinted. Running out is NOT an error: the unprobed namespaces are simply unproven, which
+    /// suppresses all destruction for the round. 0 => probe none (the exhaustion path, which tests
+    /// drive directly).
+    uint64_t gc_frontier_probe_budget = 1024;
     /// skip-unchanged: a GC round may DEFER
     /// (re-adopt the sealed in-degree generation instead of rebuilding it) when fewer than this many
     /// shards changed since the last fold AND no destructive decision is due. Default 1 = fold as soon
