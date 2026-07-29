@@ -1673,3 +1673,7 @@ T10 gate running. No push.
 **2026-07-29 02:2x local** — T10 DONE (1475/1475; lying-fixture instinct = premise catching its
 exact target class; decommission ruling: ship-as-is + Stage-B R5 completion path). Reviewer
 dispatched. T6 finalization nudged earlier — still awaiting DONE. No push.
+
+**2026-07-29 02:4x local** — T6 DONE (5 commits; three marker-gated gate classes; DEBUG class
+= first armed exercise of install regions). Heaviest review of lane L dispatched. T10 review
+also in flight. 10 closed + 2 in review of 15 stage-A tasks. No push.
