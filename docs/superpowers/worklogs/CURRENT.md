@@ -2035,3 +2035,6 @@ remote-recovery budget vs the LRU amplifier and the rejected who-pays axis. T16 
 (46495aee70e: 9 shapes red->green, gate 1557/1557=1548+9); concerns ruled (btr/cnd family ->
 BACKLOG follow-up; post-merge ASan gate on the merge checklist); review dispatched (reviewer
 pin confirmed alive — user stop-check came back clean: nothing was mid-flight, zero orphans).
+**2026-07-29 15:40 local** — watchdog: T16 review mid-write (review file appeared 15:40,
+reviewer transcript fresh 15:36). Everything else parked by design. Verdict expected shortly;
+then the merge sequence begins.
