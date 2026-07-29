@@ -497,12 +497,20 @@ TEST(CasGcBoundedWalk, ANamespaceThatFoldedNothingKeepsItsSealedCursor)
     const auto after = coverageOf(*backend, layout, quiet);
     ASSERT_TRUE(after.has_value())
         << "the coverage row was DROPPED -- the next round would re-fold this namespace from {0,0}";
-    /// The CURSOR and the HOLD are what the next round trusts, and they ride unchanged. `classification`
-    /// legitimately moves from 2 ("this round folded records") to 1 ("unchanged"), because that is what
-    /// the round did.
+    /// The CURSOR, the HOLD and the FOLDED TOKEN are what the next round trusts, and all three ride
+    /// unchanged. `classification` legitimately moves from 2 ("this round folded records") to 1
+    /// ("unchanged"), because that is what the round did — it is the one field that may differ, so it is
+    /// the one field asserted loosely.
     EXPECT_EQ(after->last_folded_ref_id, before->last_folded_ref_id)
         << "a namespace that folded nothing must keep the cursor it had";
     EXPECT_EQ(after->hold, before->hold);
+    /// VACUOUS TODAY, ON PURPOSE. `Gc::fold` never assigns `folded_token` — the codec round-trips it
+    /// and `CasInspect` renders it, but no producer populates it, so both sides are the default `Token`.
+    /// The assertion is here because the row's carry contract covers every field the next round trusts,
+    /// and the day a producer starts filling this one it must ride with the cursor rather than be
+    /// re-derived. Do not read a green here as evidence that a populated token survives a quiet round.
+    EXPECT_EQ(after->folded_token, before->folded_token)
+        << "the observed manifest token must ride with the cursor it belongs to";
     EXPECT_NE(after->classification, 4) << "folding nothing is not a clamp";
     EXPECT_EQ(metric(intake, "frontier_namespaces"), 2u)
         << "it stays in the round's universe, so its proof is still owed";
