@@ -158,6 +158,14 @@ def main(argv=None):
                     variant_override=args.variant, log=print)
         results.append(r)
 
+    # END-OF-BATCH DUMP. `reset_cluster` dumps the cluster it is about to tear down, which captures
+    # every scenario EXCEPT the last one in a batch — nothing resets after it, so its cluster would
+    # survive un-captured until some later run destroyed it. That is how two GC-audit specimens were
+    # lost. The last cluster is still standing right here, so capture it now; if the batch already
+    # tore it down, the dump reports QUERY-FAILED rather than inventing empty files.
+    last = results[-1].scenario if results else "batch"
+    cluster_boot.predown_dump(f"{last}_end_of_batch", log_fn=print)
+
     print("\n=== SUITE SUMMARY ===")
     for r in results:
         print(f"  {r.scenario:5s} {r.status.upper():13s} {r.title}")

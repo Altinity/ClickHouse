@@ -1791,8 +1791,10 @@ def run_phase3(args):
     # framework calls it automatically from `reset_cluster`, but a soak is torn down by hand and the
     # reminder belongs where the operator is looking when the run ends. A GC audit lost its whole
     # specimen to this on 2026-07-29.
-    log("PHASE 3 finished — run `utils/ca-soak/scripts/predown_dump.sh <label>` BEFORE `docker compose "
-        "down`; the system tables do not survive the containers")
+    log("PHASE 3 finished — the system tables do NOT survive the containers, so capture the specimen "
+        "BEFORE any teardown: `utils/ca-soak/scripts/predown_dump.sh <label>`. Better, drive the whole "
+        "run through `utils/ca-soak/scripts/run_soak.sh <label> <args...>`, which does it for you the "
+        "instant the run returns")
     print("PHASE3 OK")
     return 0
 
