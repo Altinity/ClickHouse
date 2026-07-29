@@ -85,11 +85,16 @@ for spec in $NODES; do
       "$dir/gc_log.tsv"
 
     # (b) trace_log aggregates, per trace type, SPLIT BY SIDE and carrying the side per row.
+    # The label column is deliberately NOT named `trace_type`: ClickHouse resolves SELECT aliases in
+    # WHERE and the alias wins, so `'CPU' AS trace_type` + `WHERE trace_type = 'CPU'` compares the
+    # literal with itself and the filter never fires. That exact bug shipped every pre-2026-07-29
+    # specimen as an unfiltered mix of ALL trace types in both files (found by the GC audit: __poll
+    # with identical Real and CPU sample counts).
     for tt in CPU Real; do
         q "$port" "
             SELECT
                 multiIf(query_id = '', 'background', 'query') AS side,
-                '${tt}' AS trace_type,
+                '${tt}' AS dumped_trace_type,
                 count() AS samples,
                 arrayStringConcat(arrayMap(x -> demangle(addressToSymbol(x)), trace), '\n') AS stack
             FROM system.trace_log
@@ -103,7 +108,7 @@ for spec in $NODES; do
         q "$port" "
             SELECT
                 multiIf(query_id = '', 'background', 'query') AS side,
-                '${tt}' AS trace_type,
+                '${tt}' AS dumped_trace_type,
                 demangle(addressToSymbol(frame)) AS symbol,
                 count() AS samples
             FROM system.trace_log
@@ -118,7 +123,7 @@ for spec in $NODES; do
             q "$port" "
                 SELECT
                     multiIf(query_id = '', 'background', 'query') AS side,
-                    '${tt}' AS trace_type,
+                    '${tt}' AS dumped_trace_type,
                     count() AS samples,
                     arrayStringConcat(arrayMap(x -> demangle(addressToSymbol(x)), trace), '\n') AS stack
                 FROM system.trace_log
