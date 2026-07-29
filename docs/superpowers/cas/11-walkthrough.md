@@ -1875,7 +1875,7 @@ Per **folding** round, with `N` live mounts, `S` ref tables and `S_changed` tabl
 
 | Operation | Count | Note |
 |---|---|---|
-| LIST `cas/refs/` | **2 full enumerations** | `defer_decision` and `fold_ref_list`. Keeping them separate is deliberate: merging them makes the cross-check probe vacuous |
+| LIST `cas/refs/` | **1 full enumeration** | performed in `defer_decision` and *retained* for `fold_ref_list`. The store-quality detector ("probe A") adds a second enumeration, but only on sampled rounds — `gc_probe_a_period`, default every 16th |
 | LIST `gc/server-roots/` | 1 | plus 1 GET per mount |
 | GET the adopted fold seal | **5** | explicitly instrumented, not yet optimised |
 | GET ref logs | 1 per new log | |
