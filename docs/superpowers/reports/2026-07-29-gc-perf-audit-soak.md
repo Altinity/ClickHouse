@@ -1,5 +1,5 @@
 ---
-description: 'Performance audit of the CAS GC on the 2026-07-29 T14 soak specimen (6 workers, 40 GB budget, ~29 GiB pool). The GC leader completed zero folding rounds in 41.5 minutes; the run itself died of a 178.9 s startup against a 180 s health gate; and the dominant cost on the specimen was not GC at all but 248,400 relink-refusal exceptions in 32 minutes. Written from a post-mortem log salvage after the live cluster was destroyed before it could be sampled.'
+description: 'Interim performance audit of the CAS GC on the 2026-07-29 T14 soak specimen (6 workers, 40 GB budget, ~29 GiB pool). The GC leader completed zero folding rounds in 41.5 minutes, issuing ~2.17M manifest-side S3 requests in that one unfinished round at 96% of the serial HEAD+GET ceiling; the run itself died of a 178.9 s startup against a 180 s health gate; and the dominant cost on the specimen was not GC at all but 248,400 relink-refusal exceptions in 32 minutes. Built from a post-mortem log salvage plus a ledgered, unreproducible controller live-pass, after the cluster was destroyed before it could be sampled. An addendum follows the T15 re-validation run.'
 sidebar_label: 'GC perf audit — T14 soak specimen'
 sidebar_position: 21
 slug: /superpowers/reports/gc-perf-audit-soak
@@ -11,18 +11,47 @@ doc_type: 'reference'
 
 ## Scope, and the evidence rule {#scope}
 
-This audit was commissioned as a live sampling of the T14 soak cluster: `system.trace_log`
+**This is the interim report of a two-phase audit.** It is scoped to the evidence that survived the
+specimen, and it is deliberately published now rather than held. An **addendum** follows the T15
+re-validation run at 6/40, which is the better specimen anyway: default instrumentation plus bounded
+rounds landed, answering the question this report cannot — *what remains slow after the fix*.
+
+The audit was commissioned as a live sampling of the T14 soak cluster: `system.trace_log`
 aggregates, the per-round per-phase rows of `system.content_addressed_garbage_collection_log`,
-`system.events`, `system.errors`. **None of that was obtained** — the cluster was destroyed before
-the first query could run (see [below](#specimen-lost)). What follows is built from a salvage of the
-artifacts that outlived the containers.
+`system.events`, `system.errors`. **This author obtained none of it** — the cluster was destroyed
+before the first query could run (see [below](#specimen-lost)). What follows is built from two
+sources, kept rigorously distinct:
 
-Every figure below names the file it came from, and every named file is in
-`tmp/t14/gc_audit/` (scratch, deliberately not committed). Where a question cannot be answered from
-those files, this report says so instead of estimating. Three of the commissioned questions are in
-that category and are marked **UNANSWERABLE** in place.
+1. **Salvage** — artifacts that outlived the containers, re-derivable at will from the archived
+   logs. Every such figure names a file in `tmp/t14/gc_audit/`.
+2. **Controller live-pass** — system-table figures the controller and impl-a14 queried against the
+   *running* cluster at ~07:45 UTC, before it died. These are **unreproducible**; they are ledgered
+   verbatim in `tmp/t14/gc_audit/controller_live_pass_20260729.txt` and every figure taken from them
+   is marked *(controller live-pass, unreproducible — ledgered 2026-07-29)* at the point of use. They
+   are cited, never re-derived, and never silently blended with salvage numbers.
 
-Two systematic cautions apply to every number derived from the server text logs:
+Where a question cannot be answered from either source, this report says so instead of estimating,
+and marks it **UNANSWERABLE-UNTIL-ADDENDUM** in place with the query the addendum must run.
+
+### Method: the gap that made this necessary, and its fix {#method-gap}
+
+The reason a four-hour instrumented run produced a partly-unanswerable question set is a single
+missing harness step: nothing dumped the system tables before `compose down`. That gap is now
+**closed** — impl-a14 is adding a pre-teardown dump (GC log full TSV, `trace_log` top-stack
+aggregates, `events`, `errors` → `utils/ca-soak/logs/`) to the harness, so the 3/12 re-run and the
+T15 re-validation run both produce full-fidelity dumps. This audit does not touch
+`utils/ca-soak`, which is impl-a14's surface.
+
+### Three cautions that apply throughout {#cautions}
+
+**The two profilers sample 1000× apart.** The query profiler runs at 10 ms and the global
+(background) profiler at 10 s, so a query-side sample is worth 10 ms of thread time and a background
+sample 10 s. **Raw counts are not comparable across sides.** Weighted, the 15-minute window holds
+~332 s of query-side CPU (33,190 × 10 ms) against ~11,790 s of background CPU (1,179 × 10 s) — a
+~36:1 ratio in the opposite direction to the raw counts. Any share computed by dividing one side's
+frame count by a cross-side total is wrong, and this report does not compute one.
+
+Two more apply to every number derived from the server text logs:
 
 - **Trace-level S3 lines are rate-limited.** `WriteBufferFromS3` Trace lines carry a
   `LogSeriesLimiter` annotation, so any S3 operation count derived by counting log lines is a
@@ -118,7 +147,19 @@ on a lock.
 
 Corroboration from the other node: `tmp/t14/gc_audit/gc_phases.tsv` records ch2 at **248 rounds,
 `acquired=0`, `steal_allowed=248`** — 248 consecutive rounds in which ch2 was allowed to steal the
-lease and never could, because ch1 held it continuously without completing a round.
+lease and never could, because ch1 held it continuously without completing a round. (impl-a14's
+earlier reading of 162 rounds, all NotALeader, is the same monotonic counter sampled sooner.)
+
+Third source, agreeing: the controller's live read of ch1's GC log at 07:45 *(controller live-pass,
+unreproducible — ledgered 2026-07-29)* found **only 7 non-fold rounds, phase rows ~0 ms, and no row
+at all for the long fold round.** Against the text log's three round-outcome lines the counts differ,
+and the likely reconciliation is that the GC log counts *rows*: `runRoundLogged` emits a Start and a
+Finish row per round (`CasGcScheduler.cpp:287-288`), so three completed rounds = six rows, plus the
+in-flight fold round's Start row = seven. That reading is a hypothesis, not a verified fact. What
+does not depend on it is the load-bearing agreement between all three sources: **the fold round never
+wrote a Finish row, and no round completed after it began.** It also makes the observability point
+concrete — a round that never ends writes no row, so the GC log is structurally unable to report the
+pathology it most needs to report.
 
 Note also that the heartbeat did **not** starve, which rules out the tempting explanation that a long
 round blocks the lease beat. `tmp/t14/gc_audit/ch1_derived_facts.txt` records 100 `soak_pool/gc/hb`
@@ -154,23 +195,41 @@ common case where the body exists — it exists only to distinguish "absent body
 and the `get` already returns falsy on a 404 (the very next branch). This is the redundancy Task 15
 removes.
 
-**UNANSWERABLE: the absolute GET volume and rate.** The controller's live observation of
-`CasRefManifestBodyFoldGets` exceeding 1M at 313-950 gets/s, and the ~2.14 manifest-body GETs per
-log, came from `system.events` queries against the running server. `system.events` is gone, and no
-surviving file contains those counter values — `grep -r CasRefManifestBodyFoldGets tmp/t14/gc_audit/`
-returns only the *text of the queries* the controller ran, echoed in
-`tmp/t14/gc_audit/ch1_cas_lines.txt` (`SELECT value FROM system.events WHERE
-event='CasRefManifestBod...'`), never a result. Those figures are recorded here as the controller's
-live observation and are **not independently verified by this audit**. The same applies to any
-per-log or per-edge ratio.
+**Measured, from the controller live-pass** *(unreproducible — ledgered 2026-07-29 in
+`tmp/t14/gc_audit/controller_live_pass_20260729.txt`)*. A 30 s walker window just after the restart
+gives the fold's two read classes and their ratio:
 
-**Measurable, as a lower bound on serial RTT.** The one exact S3 timing that survives is ch2's lease
-phase (`tmp/t14/gc_audit/gc_phases_events_json.json`): 496 `S3GetObject` + 496 `S3HeadObject` =
-992 `S3ReadRequestsCount` costing `S3ReadMicroseconds=1515499`, i.e. **~1.53 ms per S3 read round
-trip** against in-container rustfs. At that RTT, the 1:1 HEAD:GET pairing in `foldManifestEdges`
-costs ~3.05 ms of serial latency per manifest edge, and a fold over N edges cannot beat ~3.05 ms × N
-however fast the storage is, because the two calls are strictly sequential and the loop is serial.
-Removing the HEAD halves that floor.
+| Counter | Δ over 30 s | Rate |
+|---|---|---|
+| `CasRefManifestBodyFoldGets` | +28,462 | ~949/s |
+| `CasRefLogBodyGets` | +13,327 | ~444/s |
+
+The ratio is **2.136 manifest-body GETs per ref-log body GET**, which is the ~2.14 edges-per-log
+figure independently reported by impl-a14 arriving from a second direction. Cumulatively the counter
+reached **1,087,385+ before the kill**, in a *single round that never finished*. Because
+`foldManifestEdges` pairs one HEAD with every GET, that one incomplete round issued
+**≈2.17 million S3 requests on the manifest side alone** (1,087,385 GETs + as many HEADs) — the
+cleanest one-line statement of what an unbounded round costs.
+
+**Derived: the fold is RTT-bound and the loop really is serial.** The one exact S3 timing that
+survives in salvage is ch2's lease phase (`tmp/t14/gc_audit/gc_phases_events_json.json`): 496
+`S3GetObject` + 496 `S3HeadObject` = 992 `S3ReadRequestsCount` costing `S3ReadMicroseconds=1515499`,
+i.e. **~1.53 ms per S3 read round trip** against in-container rustfs. A strictly serial HEAD+GET
+loop at that RTT has a hard ceiling of `1 / (2 × 1.53 ms)` = **~327 edges/s**. The controller's
+earlier-window measurement of **~313/s** is 96% of that ceiling.
+
+That agreement is close enough to be worth stating as a finding: **the fold's throughput in that
+window is explained almost entirely by two serial round trips per edge**, with essentially no
+headroom attributable to anything else — not CPU, not decode, not the delta bookkeeping. It is the
+strongest available evidence that removing the HEAD would roughly double fold throughput, and it is
+an inference from two independently-sourced numbers rather than a direct measurement, so it is
+labelled as one.
+
+**One tension, left open rather than smoothed.** The post-restart window's ~949/s is 2.9× the serial
+ceiling, so that window cannot have been a purely serial HEAD+GET loop at 1.53 ms. Either the fold
+has concurrency on some paths, or post-restart conditions differed (warm connection pool, a
+different edge mix, cached bodies). Resolving which is an addendum item — it decides whether the
+HEAD removal in item 3 buys ~2× everywhere or only in the serial regime.
 
 ### Where this lands in the fix landscape {#fix-landscape}
 
@@ -190,24 +249,73 @@ The stall is the O(pool) one-pass fold meeting a ~29 GiB hot pool, which is prec
 
 ## 2. The five watch-items {#watch-items}
 
-### (a) `pthread_mutex_lock` wall samples — UNANSWERABLE {#watch-mutex}
+Items (a) through (d) rest on the controller live-pass *(unreproducible — ledgered 2026-07-29 in
+`tmp/t14/gc_audit/controller_live_pass_20260729.txt`)*, which moves three of them from
+unanswerable to answered or partly answered; item (e) is answered from salvage alone. Each residual
+is marked **UNANSWERABLE-UNTIL-ADDENDUM** with the query that closes it.
 
-The ~57k query-side wall samples were read from `system.trace_log`, which did not survive. Nothing in
-the salvaged files attributes wall time to a mutex, and there is no way to identify the mutex from
-deeper frames without the stacks. This question needs the next specimen.
+### (a) `pthread_mutex_lock` wall samples — magnitude answered, identity not {#watch-mutex}
 
-### (b) Local-file churn (`open64`/`unlink`/`mkdir`) — UNANSWERABLE as a share {#watch-file-churn}
+**Answered: the magnitude, and it is not alarming.** `pthread_mutex_lock` accounts for **57,114 of
+1,735,653 query-side Real samples = 3.3%**. It sits fifth in a wall profile whose top four entries
+are all *waiting*, not contending:
 
-Quantifying its share of CPU/wall requires `trace_log`. What the salvage does show is that the churn
-is real and that its largest single source is not the CA staging path: `tmp/t14/gc_audit/ch1_rollup.txt`
-records `CachedPartFolderAccess` as the 6th-hottest logger at 54,586 lines and `FakeDiskTransaction`
-at 5,556, against 1,155,235 for the table's own logger. A share-of-CPU figure cannot be derived from
-log-line counts and is not offered.
+| Query-side Real stack | Samples | Share |
+|---|---|---|
+| `__poll` ← `SocketImpl::receiveBytes` | 739,724 | 42.6% |
+| `pthread_cond_wait` | 490,740 | 28.3% |
+| `epoll_wait` ← `Epoll::getManyReady` | 222,009 | 12.8% |
+| `pthread_cond_timedwait` | 105,893 | 6.1% |
+| `pthread_mutex_lock` | 57,114 | **3.3%** |
+| `__read` ← `ReadBufferFromFileDescriptor` | 23,927 | 1.4% |
+| `__open64` ← `WriteBufferFromFile` ctor | 8,597 | 0.5% |
 
-### (c) libunwind frames — mechanism identified and quantified, CPU share UNANSWERABLE {#watch-libunwind}
+Idle waiting (the first four) is **89.8%** of query-side wall, which is the expected shape for a
+server's wall-clock profile and means the 57k figure should not be read as a hot spot. A wall profile
+counts a thread parked on a socket exactly the same as a thread burning CPU.
 
-The CPU share needs `trace_log`, but the *cause* of libunwind in a CPU profile is now unambiguous,
-and it is large enough that it would dominate any profile taken on this specimen.
+**UNANSWERABLE-UNTIL-ADDENDUM: which mutex.** The live-pass extract recorded only the top frame for
+this entry — unlike `__poll` and `epoll_wait`, no caller frame was captured — so the contended mutex
+cannot be named. The addendum needs the full symbolized stack, i.e. the same top-stacks query
+retaining `arrayStringConcat(arrayMap(a -> demangle(addressToSymbol(a)), trace), ';')` for
+`trace_type='Real'` filtered to stacks whose top frame is `pthread_mutex_lock`.
+
+### (b) Local-file churn (`open64`/`unlink`/`mkdir`) — answered, and it is small {#watch-file-churn}
+
+**On CPU**, the file-syscall frames are `unlink` 622, `__open64` 572 and `write` 473 — **1,667
+samples**, against a top-10 CPU list whose leaders are `memcpy` 1,479 and
+`LZ4_compress_fast_extState` 1,417. File churn is real but is not a leading CPU term, and it is
+outweighed by compression and memory movement.
+
+**On background wall**, the picture is sharper and more interesting:
+`mkdir` ← `std::filesystem::create_directories` is the **top background Real frame after
+`pthread_cond_wait`**, at 404 samples against `cond_wait`'s 57,963 — i.e. the largest *non-idle*
+background wall entry, ahead of `write` (271), `__poll` (266), `__open64` (230) and `LZ4` (208).
+Directory creation leading the non-idle background wall is a genuine signal about the staging and
+part-folder layout path, and it is the file-churn thread worth pulling in the addendum.
+
+**Deliberately not computed: a percentage of total CPU.** The CPU top-frame list in the live-pass
+extract does not record which side each frame came from, and the two profilers sample 1000× apart
+(see [cautions](#cautions)), so dividing these counts by any cross-side total would produce a
+meaningless number. What can be said from the counts alone: `memcpy` (1,479) and
+`LZ4_compress_fast_extState` (1,417) both exceed the *entire* background-CPU population (1,179), so
+those two are necessarily predominantly query-side. The rest cannot be attributed without the split.
+
+The salvage corroborates that the churn is real without sizing it:
+`tmp/t14/gc_audit/ch1_rollup.txt` records `CachedPartFolderAccess` as the 6th-hottest logger at
+54,586 lines and `FakeDiskTransaction` at 5,556.
+
+### (c) libunwind frames — mechanism identified, and now measured {#watch-libunwind}
+
+**Answered: libunwind is in the CPU top-10, at 516 samples for `getEncodedP`** — comparable to
+`CityHash128WithSeed` (571) and `__open64` (572), i.e. the same order as the pool's own hashing. That
+is a *floor*, not the unwinding total: `getEncodedP` is one function in libunwind's DWARF
+frame-description parsing, and the rest of the unwind machinery (`_Unwind_*`, personality routines)
+does not appear in a top-10 extract. So exception unwinding costs **at least** as much CPU as
+content hashing, and the true multiple is unknown.
+
+The *cause* is unambiguous and is measured from salvage, and it is large enough that it would
+dominate any profile taken on this specimen.
 
 `tmp/t14/gc_audit/ch1_rollup.txt` counts **622,148 stack-frame lines** and 27,240 Error-level lines in
 ch1's 53-minute log window. `tmp/t14/gc_audit/ch1_stack_frames.txt` shows those frames are one
@@ -229,29 +337,55 @@ node column of `tmp/t14/gc_audit/metrics.tsv` and ch1's own startup line `hostna
 `tmp/t14/gc_audit/ch1_relink_per_min.txt` gives the shape: the storm runs 07:24–07:56 and peaks at
 **9,219 per minute at 07:26** (~154/s on one node), decaying to 2 by 07:56.
 
+A third source agrees. The controller's pre-restart `system.errors` read *(controller live-pass,
+unreproducible — ledgered 2026-07-29)* has **`NETWORK_ERROR` at 94,999**, far above every other
+class. The relink refusal throws exactly `NETWORK_ERROR`, and the salvage log count on ch1 passes
+through ~90k at 07:36 and ~97k at 07:37 (`tmp/t14/gc_audit/ch1_relink_per_min.txt`), bracketing
+94,999. Two independently-collected instruments therefore agree that **the relink refusal is
+essentially the entire `NETWORK_ERROR` population** on this run.
+
 This is the already-tracked `[RELINK-CONFIRM-BUSY-LANE]` finding in `BACKLOG.md:175`, and this audit
 sharpens it: the BACKLOG records "~1000-3700/min, ~106k rows per 20 soak minutes", where the measured
 peak is 2.5× the top of that range and the per-node total is ~124k over 33 minutes. It is fail-closed
 and correct — `failure_t14.json` shows both replicas converged to identical `count`, `sum_fp` and
-`sum_version` — so the cost is CPU, log volume and lost dedup, not correctness.
+`sum_version` — so the cost is CPU, log volume and lost dedup, not correctness. The sender-side
+`CasRefBatchFlushes` of 168,955 pre-kill *(controller live-pass)* is the denominator that makes the
+BACKLOG's ~17% confirm-availability figure legible: the lane was essentially never quiescent.
 
 **This is the most important caveat in the audit: a CPU profile taken on this specimen would be
 measuring the relink storm, not the GC.** 248,400 exceptions with ~23 symbolized frames each, at
 ERROR severity, in ~32 minutes, is the explanation for libunwind in the CPU top, and it is unrelated
 to garbage collection.
 
-### (d) `CANNOT_PARSE_INPUT_ASSERTION_FAILED` — UNCONFIRMABLE, and absent from the logs {#watch-parse-errors}
+### (d) `CANNOT_PARSE_INPUT_ASSERTION_FAILED` — count confirmed, provenance UNANSWERABLE-UNTIL-ADDENDUM {#watch-parse-errors}
 
-The reported 28k pre-restart occurrences came from `system.errors`, which did not survive.
-Independently: `grep -c CANNOT_PARSE_INPUT_ASSERTION_FAILED` over ch1's full `err.log` returns **0**,
-and the string appears nowhere in `tmp/t14/gc_audit/ch2_error_codes.txt` either. The complete list of
-exception shapes seen on either node is in `ch1_error_codes.txt`/`ch2_error_codes.txt`: the relink
-refusal, then `Broken pipe` (16), `Write buffer has been canceled` (10), `Cannot execute query in
-readonly mode` (10), and a handful of syntax errors from the driver's own introspection queries.
+**Confirmed: 28,170 pre-restart** *(controller live-pass, unreproducible — ledgered 2026-07-29)*,
+the second-largest error class of the run:
 
-So the counter was incremented by a path that does not log at Warning or above — most plausibly a
-caught-and-counted parse failure — and its provenance **cannot be determined from the salvage**. It
-needs `system.errors` plus `query_log` on the next specimen.
+| `system.errors`, pre-restart | Count |
+|---|---|
+| `NETWORK_ERROR` | 94,999 |
+| `CANNOT_PARSE_INPUT_ASSERTION_FAILED` | **28,170** |
+| `NO_REPLICA_HAS_PART` | 14,685 |
+| `S3_ERROR` | 13,943 |
+
+**The provenance remains unknown, and the salvage makes that a positive finding rather than a gap.**
+`grep -c CANNOT_PARSE_INPUT_ASSERTION_FAILED` over ch1's full `err.log` returns **0**, and the string
+appears nowhere in `tmp/t14/gc_audit/ch2_error_codes.txt` either. The complete list of exception
+shapes on either node (`ch1_error_codes.txt`/`ch2_error_codes.txt`) is the relink refusal, then
+`Broken pipe` (16), `Write buffer has been canceled` (10), `Cannot execute query in readonly mode`
+(10), and a few syntax errors from the driver's own introspection queries.
+
+So 28,170 occurrences of a parse assertion were raised and counted **without a single line at
+Warning or above on either node** — they are caught internally somewhere on a hot path. A silent
+five-figure error class is worth resolving on its own merits, independent of GC.
+
+**What the addendum must run**, and it is nearly free: `system.errors` already carries
+`last_error_message` and `last_error_trace`, so
+`SELECT name, value, last_error_message, arrayStringConcat(arrayMap(a -> demangle(addressToSymbol(a)),
+last_error_trace), '\n') FROM system.errors WHERE name = 'CANNOT_PARSE_INPUT_ASSERTION_FAILED'`
+answers this in one query. The live pass captured only `name` and `value`; that is the whole reason
+this item is still open.
 
 ### (e) GC lease locality on ch2 — ANSWERED, and the cost is small {#watch-lease-locality}
 
@@ -370,8 +504,11 @@ writes and reads on the pool.
 `ch1_stack_frames.txt`), and with them the single largest distortion in any profile taken on a busy
 CA cluster. Also removes ~600k stack-frame lines per node per hour from the logs
 (`ch1_rollup.txt`: 622,148 frame lines in 53 min).
-**Evidence:** peak 9,219 refusals/min on one node (`ch1_relink_per_min.txt`); zero correctness
-consequence (`failure_t14.json`, replicas converged identically).
+**Evidence:** peak 9,219 refusals/min on one node (`ch1_relink_per_min.txt`), corroborated by
+`system.errors` `NETWORK_ERROR`=94,999 pre-restart *(controller live-pass)*; libunwind's
+`getEncodedP` sits in the CPU top-10 at 516 samples, on a par with `CityHash128WithSeed` (571), so
+the unwinding is a measured CPU term and not merely a plausible one; zero correctness consequence
+(`failure_t14.json`, replicas converged identically).
 **Maps to:** `[RELINK-CONFIRM-BUSY-LANE]`, `BACKLOG.md:175`, sub-items (b) and (c) — demote severity
 and add a `ProfileEvents` proven/refused pair so the rate is a metric rather than log spam.
 **Risk class:** the severity demotion and the counter pair are non-protocol and low risk. The
@@ -380,18 +517,23 @@ every ref — is **USER-GATED** (it changes what the handoff protocol will asser
 
 ### 3. Drop the HEAD in `foldManifestEdges` {#opp-fold-head}
 
-**Expected win:** halves the serial round trips in the fold's inner loop — from ~3.05 ms to
-~1.53 ms per manifest edge at the measured 1.53 ms RTT (`gc_phases_events_json.json`). On a fold
-whose cost is dominated by a serial per-edge loop, this is a ~2× reduction in the latency floor and
-a 50% cut in that request class.
+**Expected win:** ~2× fold throughput in the serial regime, and a 50% cut in the fold's largest
+request class. This is now the best-evidenced item in the list after item 1.
 **Evidence:** `Gc/CasGc.cpp:1007-1018` performs `head` then `get` per edge, and the `get` already
-returns falsy on a raced delete, making the HEAD redundant on the hit path; measured per-request S3
-read latency of 1.53 ms from ch2's lease phase.
+returns falsy on a raced delete, so the HEAD is redundant on the hit path. Three numbers from two
+independent sources agree that the loop is RTT-bound: the measured 1.53 ms per S3 read
+(`gc_phases_events_json.json`) puts a serial HEAD+GET ceiling at ~327 edges/s, and the observed
+~313/s *(controller live-pass)* is **96% of it**. The class is not small — `CasRefManifestBodyFoldGets`
+reached 1,087,385+ in the single unfinished round, so with the 1:1 pairing that round issued
+≈2.17M manifest-side S3 requests, half of them HEADs that the following GET makes redundant.
 **Maps to:** Task 15's scope as described in the commission (already in flight).
 **Risk class:** non-protocol — it removes a request, changes no object and no step ordering. The one
 behaviour to preserve is the absent-vs-raced-delete distinction the HEAD currently draws; the
 `!got` branch must keep fail-closing for committed bodies.
-**Caveat:** the absolute win cannot be sized without the GET counts, which did not survive.
+**Caveat:** the ~2× applies to the serial regime the ~313/s window demonstrates. The post-restart
+~949/s window exceeds the serial ceiling by 2.9× and is unexplained (see
+[the fold cost structure](#fold-cost-structure)); if that regime is common, the win there is smaller.
+Sizing it is an addendum item.
 
 ### 4. Stop the CA audit log from dominating restart {#opp-ca-log-restart}
 
@@ -430,6 +572,7 @@ All paths relative to `tmp/t14/gc_audit/`; line counts in `MANIFEST.txt`.
 
 | File | Lines | Provenance |
 |---|---|---|
+| `controller_live_pass_20260729.txt` | 70 | **UNREPRODUCIBLE** — system-table figures queried live at ~07:45 UTC by the controller and impl-a14, ledgered verbatim; the only surviving record of `trace_log`, `system.errors` and the walker counters |
 | `t14_soak.log` | 148 | copy of `build/t14_soak.log`, soak driver stdout |
 | `failure_t14.json` | 52 | copy of `utils/ca-soak/failure_t14.json` |
 | `soak_t14_stagea.db` | — | copy of `utils/ca-soak/soak_t14_stagea.db` (driver metrics DB) |
@@ -456,17 +599,33 @@ script above was re-run against that archive to confirm it reproduces
 The logs are `syslog:syslog 0640` and were read through a root container, the host account having no
 passwordless sudo — hence the `docker run` wrapper on every extraction rather than a plain `grep`.
 
-## What the next specimen needs {#next-specimen}
+## The addendum: what the T15 re-validation run must answer {#next-specimen}
 
-To answer the three UNANSWERABLE items and size opportunity 3, the next soak must, **before**
-teardown, dump to `utils/ca-soak/logs/`:
+The pre-teardown dump that would have made this report complete is being added to the harness by
+impl-a14 (see [method](#method-gap)), so the T15 re-validation run at 6/40 will carry the GC log in
+full, `trace_log` top-stack aggregates, `events` and `errors`. That run is the better specimen in any
+case: it has default instrumentation and bounded rounds landed, so it answers the question this
+report structurally cannot — **what remains slow once the round terminates.**
 
-1. `system.content_addressed_garbage_collection_log` in full — the per-round per-phase rows are the
-   only exact source of fold cost, and on this run ch1 never wrote one because the round never ended.
-   A round that never completes writes no row: **the GC log cannot observe the pathology it most
-   needs to report**, which is itself an argument for a periodic in-round progress row.
-2. `system.trace_log` aggregates (top stacks by count, split query-side/background, symbolized).
-3. `system.events` and `system.errors` full dumps, per node, before and after the fault window.
+Five items carry forward, four of them with the exact query that closes them:
 
-Items (a), (b) and (d) of the watch-list are unanswerable for exactly this reason and carry forward
-unchanged.
+1. **Which mutex.** The top-stacks query retaining full symbolized stacks, filtered to
+   `trace_type='Real'` and a `pthread_mutex_lock` top frame. ([watch-item a](#watch-mutex))
+2. **`CANNOT_PARSE_INPUT_ASSERTION_FAILED` provenance.** `SELECT name, value, last_error_message,
+   last_error_trace FROM system.errors` — the live pass captured only `name` and `value`, which is
+   the sole reason this is open. ([watch-item d](#watch-parse-errors))
+3. **The 949/s vs 327/s discrepancy.** Whether the fold has concurrency on some paths or the
+   post-restart window differed decides whether dropping the HEAD buys ~2× everywhere or only in the
+   serial regime — i.e. it sizes [opportunity 3](#opp-fold-head).
+4. **`mkdir` ← `create_directories` as the top non-idle background wall frame.** Whether that
+   survives bounded rounds and default instrumentation, and which layer creates the directories.
+   ([watch-item b](#watch-file-churn))
+5. **Merge-churn to CA traffic.** Manifest counts and repoint traffic per unit of merge churn, from
+   `system.content_addressed_log` — the one question in the original commission that neither source
+   can touch.
+
+Two structural notes for whoever writes the addendum. **A round that never completes writes no
+row**, so the GC log could not report the very pathology it exists to report — an argument for a
+periodic in-round progress row, independent of Task 15. And the CPU top-frame extract must record
+**which side each frame came from**: the query and global profilers sample 1000× apart, and without
+the split the counts cannot be turned into time shares (see [cautions](#cautions)).
