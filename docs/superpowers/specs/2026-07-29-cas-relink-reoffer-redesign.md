@@ -9,7 +9,7 @@ doc_type: 'reference'
 
 # CAS relink re-offer: retiring the confirm endpoint {#cas-relink-reoffer-redesign}
 
-**Date:** 2026-07-29. **Status:** DESIGN (**v4 — final pre-plan**), approved except the TLA gate. **Branch:** `cas-gc-rebuild`.
+**Date:** 2026-07-29. **Status:** DESIGN (**v5 — final pre-plan**), approved except the TLA gate. **Branch:** `cas-gc-rebuild`.
 Spec only; no code landed.
 
 **v2:** the confirm is expressed as an HTTP conditional request (`ETag` / `If-None-Match`), with
@@ -27,6 +27,14 @@ second defence (§4.1.3); the **budget is redesigned** after its one-line mitiga
 the eviction code (§4.3); `CaRelinkPromote::MechanismFallbackAllowed` gets its transition (§6.2);
 the TLA gate gains three expressiveness requirements (§12.5); and the §1.1 arithmetic is corrected
 against a grep rather than against the design.
+
+**v5 (Codex round 2 — 0 blocker, 5 major, 3 minor):** the `MechanismFallbackAllowed` → S0 edge is
+now **guarded by `isTerminal`**, because a failed release leaves a live-epoch precommit that
+nothing reclaims — S0′ (§6.2.1) — and that find exposed a **third proof obligation**, *does it leak
+retention?*, now answered by every state; the TLA section stops claiming the encoding is
+state-space-neutral and names a `FreshCertifiedResponse` assumption instead (§12.2); §12.5(i) now
+requires equal-namespace/different-disk mounts and a `_sab_nodiskqualification` sabotage; the nonce
+paragraph, test row 15, the stale LRU sentence and the endpoint/grammar counts are corrected.
 
 **v4 (final user rulings):** the apply-marker fix is **approved**; the recovery budget is cut to
 **minimal protection** — a per-recovery work cap plus a hard-coded concurrency limit — after the
@@ -103,15 +111,17 @@ argued. Deletions are measured against the tree; additions are estimated.
 
 | | Before | After |
 | --- | --- | --- |
-| Receiver outcomes to reason about | 7 taxonomy rows | **4 states** |
-| Interserver actions on the endpoint | 2 (fetch + confirm) | **1** — the confirm IS an offer |
+| Receiver outcomes to reason about | 7 taxonomy rows | **4 states + 1 guarded variant** (§6.2.1) |
+| Registered interserver endpoints | 1 | **1** — unchanged; the confirm was always a MODE of the parts endpoint, never a second one |
+| What the second mode costs to serve | its own token routing, parts-set gate and answer path | the offer's routing with the body suppressed |
 | Fields the receiver must round-trip | 6, parsed | **16 opaque bytes**, parsed by nobody |
 | Bespoke wire names | 5 | **5** — unchanged, and §4.1 says so plainly |
+| Proof obligations answered per outcome | 2 | **3** — codex r2 exposed a missing one, *does it leak retention?* |
 | Content-addressed identifiers in `src/Storages/MergeTree/` | **6** | **4** |
 | Seam methods serving the confirm | `confirmExactRef` + `ownsNamespace` | **0** |
 | Lane mutexes held to answer | 2, in a bespoke snapshot | **1**, the ordinary read path |
 | Reversible codecs on the path | 1 (~170 lines) | **0** |
-| Wire grammars to parse and defend | the codec's + `If-None-Match`'s | **0** — every value compared byte-wise, none parsed |
+| Wire grammars to parse and defend | **1** — the token codec's | **0** — every value compared byte-wise, none parsed |
 
 | Lines | Deleted | Added |
 | --- | --- | --- |
@@ -254,8 +264,10 @@ it is one opaque token that fails both equality tests and gets logged.
 Choosing private names over `If-None-Match`/`ETag` also declines an inherited grammar: wildcards,
 comma-separated lists and weak comparison are each a shape a sender would have to recognize and
 refuse, and one of them (`*`) is a forged-certificate hole (§4.1.1). **Grammars on the path: one
-codec plus one standard header's, down to zero.** That, not the name count, is what the codec
-deletion was always about.
+today — the token codec's — down to zero.** Stated against the shipped tree, which has no
+`If-None-Match` grammar in it; the standard-vocabulary draft would have ADDED one, and declining it
+avoids an addition rather than removing something that exists. That, not the name count, is what
+the codec deletion was always about.
 
 **The validator is a digest over the QUALIFIED binding**, not over the `ManifestRef` alone — see
 §3 for why the bare tuple is not an identity:
@@ -384,9 +396,11 @@ lies in the reason field changes nothing but its own logs.
 #### 4.1.4 Replay defence: the per-confirm nonce {#replay-nonce}
 
 `no-store` is policy, and policy does not bind a reverse proxy the receiver never configured. The
-structural guard is a **nonce**: the receiver generates 16 random bytes per confirm, sends them as
-the value of `content_addressed_expected`, and requires them echoed in
-`content_addressed_nonce`. A mismatch or an absence is `Unknown`.
+structural guard is a **nonce**: the receiver generates 16 random bytes per confirm and sends them
+as the VALUE of `content_addressed_confirm` — the mode-selecting parameter, per the wire table in
+§4.1, which is the single authoritative statement of what each name carries — and requires them
+echoed in `content_addressed_nonce`. A mismatch or an absence is `Unknown`. The validator travels
+separately, in `content_addressed_expected`; the two are never carried by the same name.
 
 This closes the replay class that `no-store` only discourages: an intermediary replaying an
 earlier identity response for the same URL — a response that may PREDATE T1, and therefore
@@ -395,10 +409,12 @@ nonce. Note why echoing the validator instead would not do: a replayed response 
 binding would echo the same validator and pass, since the validator says *which* binding, never
 *when*.
 
-*What it costs:* one request-parameter value (the parameter already had to exist to select the
-mode, so this adds no name — the same reasoning the deleted design used for its own action
-parameter, "an action without its token is not a question anyone can answer") and one response
-header. *What it discharges:* the replay obligation, structurally.
+*What it costs:* one request-parameter VALUE — the parameter already had to exist to select the
+mode, so this adds no name, the same reasoning the deleted design used for its own action parameter
+("an action without its token is not a question anyone can answer") — and one response cookie.
+*What it discharges:* the replay obligation, structurally. A side benefit falls out of putting it
+in the query string: every confirm has a UNIQUE URL, so no cache keyed on a previous URL can serve
+it at all.
 
 #### 4.1.5 NEW RISK: a forged or replayed affirmative answer {#cache-risk}
 
@@ -629,9 +645,20 @@ What survives is the smallest thing that still bounds the unbounded:
    installs its result atomically — abandoning before the install leaves nothing partial — and it
    applies **only** to the peer-initiated class, since a local recovery must always be allowed to
    complete or the writer could starve itself.
+   Two boundaries the implementation must respect. **The cap PRESERVES the existing failure
+   boundaries rather than inventing new ones:** recovery performs durable side-writes before it
+   installs — epoch seals and `_ckpt` updates (`CasRefLedger.cpp:807-819`, `:898-915`) — and those
+   are conditional and adoptable by construction, so abandoning a capped recovery leaves exactly
+   the states an interrupted recovery already leaves today, and no new abandon hazard is created.
+   **And the budget spans a whole recovery including all of its internal retries**, not one
+   attempt: a cap that reset per retry would bound nothing, since the retry envelope is where an
+   unbounded recovery actually spends its time.
 2. **A hard-coded global concurrency limit** of one or two peer-initiated recoveries at a time.
-   Over the limit ⇒ `Unknown`, with its own counter. Checked before any I/O and only when the
-   table is not already warm, so the ordinary path never touches it.
+   Over the limit ⇒ `Unknown`, with its own counter. Checked before any I/O and only when the table
+   is not already warm, so the ordinary path never touches it. **"Global" means process-wide** —
+   one counter across every endpoint, every table and every ledger in the server, not per-ledger or
+   per-table. A per-ledger limit would multiply by the number of mounted content-addressed disks
+   and bound nothing in aggregate.
 
 Both are constants in the source. There is **no configuration knob** (see §4.3.1), no token bucket,
 no cache segmentation and no fairness machinery; §14 records why those were dropped.
@@ -807,7 +834,8 @@ to ~100% minus true conflicts. It adds no state, no object, no configuration and
 (`CasRefLedger.cpp:410-416`). Removing that refusal is what §4.3's budget pays for, and it is a
 deliberate trade rather than an oversight: keeping it would mean a cold table can never answer,
 which for a peer whose entire question is about a cold table is the same availability hole in a
-different place. The mitigations are the LRU non-promotion and the global cap; the property that
+different place. The mitigations are §4.3's per-recovery work cap and its hard-coded global
+concurrency limit; the property that
 survives is boundedness, not zero.
 
 ## 6. The receiver's state machine {#state-machine}
@@ -844,21 +872,35 @@ This is the state the re-offer interrogates, and it has three exits, one per ans
 | No (authoritative) | `abort`, then byte-fetch from the same sender |
 | Unknown | `abort`, then throw the retry-later `NETWORK_ERROR` |
 
-`promote` has **three** outcomes, not two, and all three land in states this machine already has —
-which is why the reduction is still to four states and not five:
+`promote` has **three** outcomes, not two:
 
 | `CaRelinkPromote` | Lands in | Why |
 | --- | --- | --- |
 | `Committed` | **S3** | the ref is committed |
-| `MechanismFallbackAllowed` | **S0** | rejected BEFORE its ref-log append, so "nothing was committed" is proven, not assumed; a failed `promote` abandons its build on the way out, so the `+1` is released and the receiver is back to holding nothing durable — which is exactly S0's definition |
+| `MechanismFallbackAllowed` | **S0**, *iff the release completed* | rejected BEFORE its ref-log append, so "nothing was committed" is proven, not assumed. Whether the `+1` was actually released is a SEPARATE fact — see the guard below |
 | `Unresolved` | **S2** | the append was attempted without a verdict |
 
-The `MechanismFallbackAllowed` → S0 edge is the one an earlier draft of this design dropped. It
-matters because S0's action — byte-fetch from the same sender — is SOUND here for S0's own reason
-(nothing durable exists at the receiver, and the sender proved at T2 that it still holds the
-part), whereas taking S2's action instead would merely postpone a fetch that could have succeeded
-now. Its two proof obligations are answered by S0 unchanged: no part loss because the sender
-streams it, no double publish because nothing was committed and a precommit is not a committed ref.
+**That edge is GUARDED, and an earlier draft of this design got it wrong.** It asserted that "a
+failed `promote` abandons its build on the way out, so the `+1` is released". That holds only when
+the abandon SUCCEEDED. `PreparedPartWrite::promote`'s catch does
+`terminal = abandonBuildBestEffort(...)` (`PartFolderAccess.cpp:452`), and its own comment is
+explicit: *"The terminal flag flips only if the abandon actually landed: a failed abandon leaves
+the handle owing cleanup, which the destructor then retries."* But
+`PreparedRelinkOverPartWrite::promote` (`ContentAddressedMetadataStorage.cpp:2096-2102`) decides
+`MechanismFallbackAllowed` from the ERROR CODE alone and never consults `write.isTerminal()`
+(`PartFolderAccess.h:197`). So if the removal append AND the destructor's retry both fail, the
+receiver reports "nothing durable here" while a live-epoch precommit binding is still present —
+and a live-epoch precommit is reclaimed by nothing: the stale-precommit sweep is prior-epoch-scoped
+and GC never touches a live precommit (`PartFolderAccess.cpp:365-370`).
+
+**Required:** `promote` must consult `isTerminal` and report the release separately from the
+rejection. Only a COMPLETED release enters S0; an incomplete one is S0′ (§6.2.1).
+
+**The find also exposes a missing OBLIGATION.** Every state below now answers a third question —
+*does it leak retention?* — because the exposure is not special to this path: `abort` is `noexcept`
+and swallows a failed removal append too (`ContentAddressedMetadataStorage.cpp:2116-2123`). Three
+of the answers are trivial; the two that are not belong to exactly the states that stage a `+1` and
+release it outside a transaction.
 
 - *No part loss?* No. On `No` the bytes are fetched; on `Unknown` the queue stores the exception,
   backs off and re-executes, recomputing source and covering-part discovery. For the three
@@ -867,6 +909,33 @@ streams it, no double publish because nothing was committed and a precommit is n
 - *No double publish?* No. `abort` appends the exact precommit removal and no committed ref
   exists on either exit. `abort` never throws, by contract: it runs while the receiver's own
   retry-later error is already in flight.
+- *No retention leak?* **Not guaranteed** — `abort` is `noexcept` and swallows a failed removal
+  append (`ContentAddressedMetadataStorage.cpp:2116-2123`), leaving the handle non-terminal for its
+  destructor to retry. Same exposure and same bounds as §6.2.1.
+
+#### 6.2.1 S0′ — RELEASE INCOMPLETE {#s0-prime}
+
+A staged `+1` was NOT provably released: the removal append failed and the handle is still
+non-terminal. Reached from `promote` → `MechanismFallbackAllowed` with `isTerminal() == false`, and
+from any `abort` whose append failed.
+
+**Action: identical to S0** — byte-fetch from the same sender. Nothing about the correctness of that
+action changes, which is why this is a guarded variant and not a separate branch of the design.
+What changes is that the exit is **loud**: its own counter, a WARNING naming the namespace and ref,
+and an fsck-detectable residue.
+
+- *No part loss?* No — the sender streams the bytes, as in S0.
+- *No double publish?* No — a precommit is not a committed ref, so the later byte fetch publishes
+  the same ref name over it without conflict. The same argument taxonomy row 2 already made.
+- *No retention leak?* **NOT GUARANTEED, and that is the entire reason this state exists.** A
+  live-epoch precommit binding pins its manifest and the blobs beneath it. Three things bound it,
+  none of which is a proof: the handle's destructor retries the append, the ref lane's wedge
+  machinery is the durable backstop, and the binding dies with the mount's epoch. A leak with an
+  upper bound, not a correctness defect — but it must never be reported as S0.
+
+**Why a guarded state rather than a fifth peer.** It shares S0's action and S0's first two
+obligations verbatim, and differs only on the third. Promoting it to a peer would imply the
+receiver has a new decision to make; it does not.
 
 ### 6.3 S2 — PUBLISH UNCERTAIN {#s2-publish-uncertain}
 
@@ -881,6 +950,9 @@ without a verdict, so the receiver's ref MAY be committed.
   precommit — so no committed ref is ever undone here. **This is the one state where a byte fetch
   would be a defect**, because it would publish the part a second time over a relink that may
   already be committed.
+- *No retention leak?* Bounded. The abandon is attempted and, if the promote in fact landed, is
+  REJECTED by the state machine rather than undoing a committed ref; if it did not land, the
+  precommit is released or falls to S0′'s bounds.
 
 ### 6.4 S3 — COMMITTED {#s3-committed}
 
@@ -895,6 +967,7 @@ one does.
 - *No double publish?* No — `promote` is the handle's single terminal operation, the handle is
   released immediately after it, and a second call is rejected rather than re-driving a finished
   transaction.
+- *No retention leak?* None — the precommit became a committed ref; nothing is left staged.
 
 ### 6.5 What falls out of the taxonomy {#taxonomy-deltas}
 
@@ -908,7 +981,8 @@ And one row splits usefully: today's row 3 lumps `unproven`, an absent cookie, a
 and a timeout into one action. Under §4.2 the authoritative `No` separates from the rest and gets
 the byte fetch; everything else stays exactly one outcome.
 
-**The reduction, counted honestly.** Seven rows become four states, but not because three rows
+**The reduction, counted honestly.** Seven rows become four states plus one guarded variant
+(§6.2.1), but not because three rows
 were deleted — rows 4, 5, 5b and 6 all survive as TRANSITIONS into S3, S0, S2 and S0 respectively
 (§6.2). What actually shrinks is the number of places a reviewer must re-answer "does this lose a
 part / publish it twice": seven, once per row, becomes four, once per state, and every new exit
@@ -1047,6 +1121,7 @@ confirm counter at all.
 | `CasRelinkChanged` | authoritative `No` — the binding changed; the receiver byte-fetches |
 | `CasRelinkUnknown` | the sender could not speak; retry-later |
 | `CasRelinkRecoveryBudgetRefused` | **its own counter**, per the decision: an `Unknown` caused by the peer-initiated recovery budget (§4.3), distinguishable from every other `Unknown` |
+| `CasRelinkReleaseIncomplete` | S0′ (§6.2.1): a staged `+1` could not be provably released. **Must be ~0**; a non-zero value means live-epoch precommit bindings are accumulating and pinning manifests until their epoch ends |
 | `CasRelinkAnswerRejected` | the response failed one of §4.4's four conditions — empty body, nonce echo, explicit answer, validator match. **Must be ~0 in a healthy cluster**: a non-zero value means a stripped header, an intermediary, or a misroute, and that is exactly the class §4.1.3 and §4.1.4 exist to catch |
 
 **Which rule refused, and what was expected.** Today an `Unknown` maps silently through
@@ -1060,12 +1135,24 @@ puts the receiver's EXPECTED validator on the sender, a mismatch can be logged a
 the reader nothing about which of the two sides moved. That was impossible with the old token,
 where the sender learned the expectation only as one of six fields it had to decode first.
 
-**The digest costs readability, so the log must pay it back.** The old token was plain text: a
-human reading a refusal saw the namespace, the ref and the manifest reference directly. Two
-sixteen-byte hex strings say only *match* or *mismatch*. Therefore the sender's mismatch log MUST
-emit **the components it hashed** — namespace, ref name, `ManifestRef`, disk — alongside the two
-digests. The digests establish that something moved; the components are what say WHICH thing moved,
-and that is the whole diagnostic value the plain-text form used to give away for free.
+**The digest costs readability, so the log must pay it back — and it takes BOTH sides to do it.**
+The old token was plain text: a human reading a refusal saw the namespace, the ref and the manifest
+reference directly. Two sixteen-byte hex strings say only *match* or *mismatch*. The sender can
+only expand its own half — a digest is one-way, so nothing on the sender can say which component of
+the RECEIVER's expectation differs. Hence two log lines, one per side, correlated by part name:
+
+- **Sender, on mismatch:** the components it just hashed — `root_namespace`, `ref_name`,
+  `ManifestRef`, `disk_name` — beside both digests.
+- **Receiver, on abandon:** the sender-identity fields it already holds from T1, read out of the
+  transferred manifest body (`ManifestRef` and `root_namespace_id`) plus the part name.
+
+Together they name which component moved; separately neither can. **This costs no state retention
+on either side**, which matters because the sender remembering anything between the two requests is
+exactly the property the token was designed to avoid — a sender that had to correlate offers with
+confirms would need a table of them, and that is a worse trade than a second log line. Using the
+manifest's sender-identity fields for DIAGNOSTICS is not a trust violation: they are non-
+authoritative for adoption, and they remain non-authoritative here — nothing is decided from them,
+they are only printed.
 
 ## 10. Measurements {#measurements}
 
@@ -1111,10 +1198,11 @@ Rebuilt from the state machine of §6, not transplanted from the old row list:
 | 12 | Sender-side answer contract | direct ledger test | discretionary maintenance is NOT scheduled by a peer-initiated read; recovery IS |
 | 13 | **Cache safety** | inspect both responses | offer AND confirm carry `Cache-Control: no-store` (§4.1.5) |
 | 14 | **No standard conditional machinery** | send `If-None-Match` (both matching and `*`), `If-Modified-Since`, and a two-valued list | ALL are ignored — they select nothing and certify nothing; neither response ever carries `ETag` or `Last-Modified`; no promote is reachable through any of them (§4.1.1) |
-| 15 | **Stripped mode header ⇒ offer, not answer** | issue the confirm with `content_addressed_expected` removed | the sender replies with a full offer; the receiver rejects it — no `content_addressed_answer` header AND non-empty body — and promotes NOTHING even though the `content_addressed_identity` matches. Asserts both defences of §4.1.3 independently, by disabling each in turn |
+| 15 | **Stripped mode parameter ⇒ offer, not answer** | issue the confirm with **`content_addressed_confirm`** removed (the MODE selector — stripping `content_addressed_expected` instead leaves the sender in confirm mode and exercises neither defence) | the sender replies with a full OFFER; the receiver promotes NOTHING even though `content_addressed_identity` matches. Two subcases, each disabling the other defence, so neither can carry the test alone: **(a)** with the body check disabled, the missing `content_addressed_answer` cookie alone must prevent promotion; **(b)** with the answer check disabled, the non-empty offer body alone must prevent promotion via `assertEOF` |
 | 16 | **Replay** | replay a captured earlier confirm response for the same part and validator | nonce mismatch ⇒ `Unknown`; no promote (§4.1.4) |
 | 17 | **Cross-mount collision** | two same-pool CA disks, same `server_root_id`, same table; offer from disk A, `MOVE ... TO DISK` to B, force B to hold the same `ManifestRef` tuple for that ref | validators DIFFER (the digest is mount-qualified), so the answer is `changed`, never `proven`. This is B1's shape and the direct regression test for §3 |
-| 18 | **S1 → S0 via promote** | force `promote` to `MechanismFallbackAllowed` | byte fetch to the same sender; no double publish; distinct from row 9's `Unresolved`, which must NOT byte-fetch |
+| 18 | **S1 → S0 via promote** | force `promote` to `MechanismFallbackAllowed` **with the release succeeding** | byte fetch to the same sender; no double publish; distinct from row 9's `Unresolved`, which must NOT byte-fetch |
+| 19 | **S0′ — release incomplete** | force `promote` to `MechanismFallbackAllowed` **with the removal append failing**, so `isTerminal` stays false | the receiver still byte-fetches and still publishes exactly once, but the exit is reported as S0′ and NOT as S0: `CasRelinkReleaseIncomplete` increments, a WARNING names the namespace and ref, and fsck sees the residue. The direct regression test for the codex-r2 finding |
 
 The existing failpoint `cas_relink_receiver_pause_before_confirm` is the seam that opens the T1→T2
 window and stays (renamed for accuracy); it is what makes 2–7 reachable at all, since none of them
@@ -1146,11 +1234,28 @@ and is not edited in place — its `_sab_*` results are the evidence that v11's 
 load-bearing, and rewriting it would destroy that record. The redesign gets its **own** model,
 covering the custody chain under the named assumption of §12.2.
 
-**The wire encoding does not change the state space.** The identity/expectation header pair is a
-wire spelling of the same three answers the model already has (`"yes"` / `"no"` / `"unknown"` in
-`Gate1Answer`), so nothing in §12.3's refinement or §12.4's re-derivation depends on which
-spelling §4.1 versus §4.1.6 wins. That independence is worth stating because it means the
-encoding question can be settled after the model work starts, not before it.
+**The wire encoding does not change the ANSWER space — but it does add two transport hazards the
+model cannot express, and an earlier draft overstated this.** The three answers are the same
+(`"yes"` / `"no"` / `"unknown"` in `Gate1Answer`), so §12.3's refinement and §12.4's re-derivation
+are independent of the spelling. What is NOT independent: `RConfirm`
+(`CaRelinkConfirmCore.tla:265-287`) computes a FRESH `Gate1Answer` at the moment it fires, so the
+model literally cannot choose to deliver a pre-T1 response, and it has no notion of an offer
+response being mistaken for a confirm response. Replay (§4.1.4) and offer/confirm confusion
+(§4.1.3) are therefore outside what any refinement of this model would check.
+
+Rather than teach the model request/response generations — which would grow its state space to
+cover a transport property, for no gain over a direct test — this is recorded as a **named
+assumption**, in the same style as §12.5(iii):
+
+> ASSUME `FreshCertifiedResponse`: the response the receiver acts on was produced by the sender,
+> in reply to THIS request, after T1 — not replayed from an earlier exchange, and not an offer
+> response mistaken for a confirm.
+
+It is discharged by mechanism and by evidence, not by assertion: the nonce makes a replayed
+response detectable (§4.1.4, test row 16), and the confirm-only answer cookie plus normative
+`assertEOF` make an offer response unusable as a certificate (§4.1.3, test row 15 with both
+subcases). **If either of those test rows is weakened, this assumption goes with it** — which is
+the point of naming it.
 
 ### 12.1 Dangle-freedom is reassigned {#tla-dangle-reassign}
 
@@ -1227,7 +1332,7 @@ on each:
 
 | # | Shape | Verdict |
 | --- | --- | --- |
-| i | **Cross-mount collision** — a second mount whose bare `ManifestRef` collides with the first's (B1's shape, §3) | **MODEL IT.** This is the one that would have caught the v2 validator. Needs a second namespace/mount and a `Token` whose identity is the qualified tuple, not the bare ref. Sabotage `_sab_barevalidator` (validator qualified by ref only) MUST go red. |
+| i | **Cross-mount collision** — a second mount whose bare `ManifestRef` collides with the first's (B1's shape, §3) | **MODEL IT**, and specifically: two mounts with **EQUAL `root_namespace` and DIFFERENT `disk_name`**, which is the configuration §3 shows is legal and which namespace-qualification alone does NOT separate. Without that shape a model can pass while qualifying by namespace only. TWO sabotages must go RED: `_sab_barevalidator` (validator qualified by ref alone) and **`_sab_nodiskqualification`** (validator keeps the namespace, drops `disk_name`). The second is the one that pins B1's actual fix. |
 | ii | **Chunk-boundary tenure** — one `leader_active` tenure committing several durable transactions | **MODEL IT.** The design's central claim is that the marker, not the tenure, guards the durable-but-unapplied window; a single `SenderDurable`→`SenderApply` step cannot distinguish the two, so §12.3's green would be an artefact of the model having only one transaction per tenure. |
 | iii | **Unresolved promote (S2)** | **ASSUME, NAMED.** The receiver-side promote ambiguity is a local state-machine property with no GC interaction: `ASSUME UnresolvedPromoteNeverBytes` — an unresolved promote never leads to a byte fetch. Discharged by test row 9 rather than by the model, and named so that anyone weakening row 9 sees what it was holding up. |
 
@@ -1315,5 +1420,6 @@ Two items remain, and neither needs a decision now because neither is answerable
 - **§10 measurement 1 (cold-confirm share)** — the tripwire for §4.3's warm-by-construction
   premise. It validates a decision already taken; it does not gate the work.
 
-Everything else is implementation-time detail: the exact work-cap and concurrency constants, and
-the enumeration of `apply_state` writers §5.1.2 requires the plan to audit.
+Everything else is implementation-time detail: the exact work-cap and concurrency constants, the
+enumeration of `apply_state` writers §5.1.2 requires the plan to audit, and the `isTerminal`
+plumbing §6.2.1 requires so a failed release is reported as S0′ rather than as S0.
