@@ -4,7 +4,7 @@
 
 **Goal:** Discharge §12 of `docs/superpowers/specs/2026-07-29-cas-relink-reoffer-redesign.md` — build the refined model the redesign requires, run it, and answer the one question that can still stop the design: **does `_sab_stalecache` flip from RED to GREEN once the apply-pending marker is represented?** If it does not, the design does not ship.
 
-**Architecture:** One new TLA+ module, `docs/superpowers/models/CaRelinkReofferCore.tla`, which REFINES `CaRelinkConfirmCore` rather than editing it (§12's disposition ruling: the v11 model is kept as the historical witness of the v11 protocol and is not touched, because its `_sab_*` reds are the evidence that v11's rules were each load-bearing). The refinement adds five things the v11 model cannot express: the apply-pending marker with a *separate reader-visible value* (`sApply` / `sApplySeen` — the model-level twin of seam §6, including its wedge-retention and wedge-resolution states), an equal-namespace/different-`disk_name` mount pair (§12.5 row i, test row 17's B1 shape), a leader tenure that commits several durable chunks of *different kinds* (§12.5 row ii), a receiver whose acceptance is the *conjunction* of a certified answer and a returned identity (§4.2, §4.4), and a committed-relink fact that covers the landed-`Unresolved` publication as well as `Committed`. Around them, a 2×2 necessity matrix decides the gate, a cross-mount battery decides the validator's qualification, and the re-derived rule set decides that every retained rule is still load-bearing under the fence-first ordering. Cfg names are deliberately carried over from the v11 model so that the flip is greppable side by side: `CaRelinkConfirmCore_sab_stalecache` RED next to `CaRelinkReofferCore_sab_stalecache` GREEN.
+**Architecture:** One new TLA+ module, `docs/superpowers/models/CaRelinkReofferCore.tla`, which REFINES `CaRelinkConfirmCore` rather than editing it (§12's disposition ruling: the v11 model is kept as the historical witness of the v11 protocol and is not touched, because its `_sab_*` reds are the evidence that v11's rules were each load-bearing). The refinement adds five things the v11 model cannot express: the apply-pending marker with a *separate reader-visible value* (`sApply` / `sApplySeen` — the model-level twin of seam §6, including the full wedge lifecycle of `CasRefLedger::resolveWedgeOnce`), an equal-namespace/different-`disk_name` mount pair (§12.5 row i, test row 17's B1 shape), a leader tenure that commits several durable chunks of *different kinds* (§12.5 row ii), a receiver whose acceptance is the *conjunction* of a certified answer and a returned identity (§4.2, §4.4), and a committed-relink fact that covers the landed-`Unresolved` publication as well as `Committed`. Around them, a 2×2 necessity matrix decides the gate, a cross-mount battery decides the validator's qualification, and the re-derived rule set decides that every retained rule is still load-bearing under the fence-first ordering. Cfg names are deliberately carried over from the v11 model so that the flip is greppable side by side: `CaRelinkConfirmCore_sab_stalecache` RED next to `CaRelinkReofferCore_sab_stalecache` GREEN.
 
 **Tech Stack:** TLA+ / TLC 2 (`tmp/tla2tools.jar` → TLAToolbox 1.7.4, OpenJDK 21), invoked exactly as the existing `docs/superpowers/models/run_*.sh` harnesses do. No C++ in this phase.
 
@@ -13,14 +13,15 @@
 - Branch `cas-gc-rebuild`; commit after every task; **NEVER `git push`**.
 - Commit messages: `ca: tla — <what>` plus this session's standard trailer lines.
 - **NEVER weaken an existing invariant, or an existing model, to make a new config pass.** `CaRelinkConfirmCore.tla` and all twelve `CaRelinkConfirmCore_*.cfg` files are **read-only for this whole plan** — the only file of that family this plan may touch is `CaRelinkConfirmCore_RESULTS.md`, and only to append a pointer section (Task 4). If a new config only passes after an invariant is narrowed, that is a FAIL to record, not an edit to make.
-- **Every model transition must be traceable to a cited code site or to a spec sentence.** A sabotage that is red only because the model fabricated a state the code cannot reach is worthless — worse than absent, because it reads as evidence. Each sender-lane action in Task 1 carries its `CasRefLedger.cpp` citation in a comment, and the reviewer's job at the end of Task 1 is to check every one of them.
+- **Every model transition must be traceable to a cited code site or to a spec sentence.** A sabotage that is red only because the model fabricated a state the code cannot reach is worthless — worse than absent, because it reads as evidence. Each sender-lane action in Task 1 carries its `CasRefLedger.cpp` citation in a comment, the wedge block carries an explicit outcome→action mapping for every arm of `resolveWedgeOnce`, and the reviewer's job at the end of Task 1 is to check every one of them.
 - **Every cfg change is reviewed against its sabotage intent before it is run.** Each `_sab_*` cfg header states, in one sentence, which single rule it removes and which invariant that must break; a cfg whose observed red is a DIFFERENT invariant than the one named is a FAIL, not a pass — the runner asserts the invariant NAME, not the exit code.
-- **A green is only evidence once the property it rests on has been seen RED.** Sabotages run before greens, in every task and in the runner's config order. **`TypeOK` is not exempt**: `_sab_typeprobe` is its negative control and must be red before any green that lists `TypeOK` is trusted.
+- **A green is only evidence once the property it rests on has been seen RED — in the same task, not a later one.** Sabotages run before greens, in every task and in the runner's config order. Concretely: no green may list an invariant whose `_sab_*` config does not yet exist. `TypeOK` is not exempt (`_sab_typeprobe` is its control) and neither is `PromotedNeverDangles` (`_sab_publishafterconfirm` lives in Task 1 for exactly this reason).
+- **Structural exclusions are recorded, not asserted.** Where a hazardous state is made unrepresentable by an action guard rather than excluded by an invariant, the guard's comment says so and RESULTS lists it under structural exclusions. An invariant over a state the transition relation cannot enter would be green for free, which is the opposite of evidence.
 - **Every TLC run is logged with markers, and no two runs can collide.** The runner takes a `RUN_ID` (`date +%Y%m%dT%H%M%S`-plus-PID), puts every metadir under `tmp/tlc-meta-relinkreoffer/$RUN_ID/<cfg>` and every log under `tmp/tlc-runs/relinkreoffer/$RUN_ID/tlc_<cfg>.log`, and holds an `flock` on `tmp/.relinkreoffer.lock` for the whole battery so two invocations cannot interleave. Each invocation is bracketed by `=== TLC BEGIN <module>_<cfg> <ISO-8601> ===` / `=== TLC END <module>_<cfg> rc=<n> <ISO-8601> ===`. Stable convenience symlinks `tmp/tlc_CaRelinkReofferCore_<cfg>.log` point at the newest run; **RESULTS cites the per-run path, never the symlink**, so a row can always be re-read.
 - TLC invocation pattern (derived from `docs/superpowers/models/run_refcatalog.sh`): `/usr/bin/java -XX:+UseParallelGC ${TLC_JAVA_OPTS:-} -cp ../../../tmp/tla2tools.jar tlc2.TLC -metadir <per-run metadir> -workers "${TLC_WORKERS:-1}" -config <cfg>.cfg CaRelinkReofferCore.tla`. Verdict: `grep -q "No error has been found"` ⇒ green; `grep -q "is violated"` ⇒ violation, with the invariant name extracted by `grep -oE '(Invariant|Property) [A-Za-z_]+ is violated'`.
 - `-workers 1` by default, **not** `-workers auto`, following `run_refcatalog.sh`: parallel BFS makes WHICH shortest counterexample TLC prints nondeterministic between identical runs, and every trace this plan narrates in RESULTS is a specific action sequence. Override with `TLC_WORKERS=auto` when only a verdict is wanted.
-- **Every declared CONSTANT must be assigned in every `.cfg`.** Task 1 therefore declares the COMPLETE constants block — all twenty-two, including dials only exercised in Tasks 2 and 3 — and Task 1's configs set the unexercised ones to their honest value. Adding a constant later would force an edit to every previously written cfg; do not do that.
-- Model sizes: `MaxId = 6`, `MaxRound = 5`, `MaxChunks = 2`, `Receivers = {r1}`. These bounds were checked against the minimum trace depths of every sabotage before this plan was written (the deepest need two journal ids and three GC rounds; the two-chunk witness needs about eight transitions). If a config exceeds ~10 min under `-workers 1`, shrink `MaxId` then `MaxRound` — **never drop a property**. Record the bound actually used in RESULTS.
+- **Every declared CONSTANT must be assigned in every `.cfg`.** Task 1 declares the COMPLETE constants block — all twenty-two, including dials only exercised in Tasks 2 and 3 — and Task 1's configs set the unexercised ones to their honest value. Adding a constant later would force an edit to every previously written cfg; do not do that. **v3 note: the constants block is unchanged from v2 and is deliberately not touched.** The wedge fix of Task 1 step 4 is a new VARIABLE plus action guards, not a new dial, precisely so that no cfg has to churn.
+- Model sizes: `MaxId = 6`, `MaxRound = 5`, `MaxChunks = 2`, `Receivers = {r1}`. These bounds were checked against the minimum trace depths of every sabotage before this plan was written (the deepest need two journal ids and three GC rounds; the two-chunk witness needs about eight transitions; `_sab_publishafterconfirm` about ten). If a config exceeds ~10 min under `-workers 1`, shrink `MaxId` then `MaxRound` — **never drop a property**. Record the bound actually used in RESULTS.
 - The spec is the requirements source. Where this plan and spec §12 disagree, the spec wins and the discrepancy is reported rather than silently resolved.
 - **The gate can fail.** If Task 1 step 10 finds `_sab_stalecache` RED, STOP: do not start Task 2. Record the counterexample, write the RESULTS file with `RELINK TLA GATE: FAIL`, and report the design as refuted. That is a legitimate, successful outcome of this plan.
 
@@ -30,7 +31,7 @@
 
 | File | Responsibility |
 | --- | --- |
-| `docs/superpowers/models/CaRelinkReofferCore.tla` | NEW. The refined model: sender lane with the marker, its reader-visible twin, wedge retention and wedge resolution; two same-pool mounts; the fence-first answer as an (answer, identity) pair; the four-state receiver; GC. |
+| `docs/superpowers/models/CaRelinkReofferCore.tla` | NEW. The refined model: sender lane with the marker, its reader-visible twin, and every arm of the wedge lifecycle; two same-pool mounts; the fence-first answer as an (answer, identity) pair; the four-state receiver; GC. |
 | `docs/superpowers/models/CaRelinkReofferCore_*.cfg` | NEW, 31 configs: 14 sabotages, 7 greens, 10 witnesses. |
 | `docs/superpowers/models/run_relinkreoffer.sh` | NEW. Expected-verdict harness in the `run_refcatalog.sh` shape, with per-run metadirs, per-run logs, an `flock` guard, and BEGIN/END markers. |
 | `docs/superpowers/models/2026-07-29-relink-seam-tla-RESULTS.md` | NEW. The phase verdict: `RELINK TLA GATE: PASS|FAIL` plus the do-not-implement consequence. |
@@ -44,12 +45,17 @@ This is the task that can stop the design. Everything else in the plan is condit
 
 **Files:**
 - Create: `docs/superpowers/models/CaRelinkReofferCore.tla`
-- Create: `..._sab_noapplypending.cfg`, `..._sab_noapplypending_window.cfg`, `..._sab_relaxedmarker.cfg`, `..._sab_typeprobe.cfg`, `..._v11_baseline.cfg`, `..._ctl_v11nomarker.cfg`, `..._sab_stalecache.cfg`, `..._witness_busylane.cfg`, `..._witness_midtenure.cfg`, `..._witness_proven.cfg`, `..._witness_delete.cfg`, `..._witness_corruptwindow.cfg`
+- Create: `..._sab_noapplypending.cfg`, `..._sab_noapplypending_window.cfg`, `..._sab_relaxedmarker.cfg`, `..._sab_typeprobe.cfg`, `..._sab_publishafterconfirm.cfg`, `..._v11_baseline.cfg`, `..._ctl_v11nomarker.cfg`, `..._sab_stalecache.cfg`, `..._witness_busylane.cfg`, `..._witness_midtenure.cfg`, `..._witness_proven.cfg`, `..._witness_delete.cfg`, `..._witness_corruptwindow.cfg`
 - Create: `docs/superpowers/models/run_relinkreoffer.sh`
-- Read first: `docs/superpowers/models/CaRelinkConfirmCore.tla` (all 436 lines), `docs/superpowers/models/run_refcatalog.sh`, spec §12.3, §5.1.1, §5.1.2, seam §6, and **the three code sites below, in the file, before writing any wedge transition**:
-  - `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp` ≈`:3134-3145` — the `Unresolved` wedge install. Its comment is the contract: *"The marker deliberately STAYS `ApplyPending` on the success path: an `Unresolved` outcome is precisely 'an object that may be durable and is not applied' ... cleared only when the resolution installs the transaction or proves it never landed."*
-  - same file ≈`:1919-1934` — wedge resolution. The `Occupant::Foreign` arm calls `clearApplyPending` and **KEEPS the wedge**, with the comment: *"This is the one state where a wedged lane is not `ApplyPending`: our bytes provably never landed, so no apply is owed."* The sibling `Rejected` arm (our own epoch seal at the slot) clears both the wedge and the marker.
-  - same file ≈`:2050-2060` — the fence-closing reaction to `WedgeResolution::Corrupted`: *"the mount is fenced closed and a remount is scheduled; the lane is deliberately left wedged for inspection."* This runs AFTER the resolution, which is what creates the window Task 3's `_sab_nowedge` exploits.
+- Read first: `docs/superpowers/models/CaRelinkConfirmCore.tla` (all 436 lines), `docs/superpowers/models/run_refcatalog.sh`, spec §12.3, §5.1.1, §5.1.2, seam §6, and **`CasRefLedger::commitRefChunk` and `CasRefLedger::resolveWedgeOnce` in full, in the file, before writing any wedge transition.** The file is `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp`. The six sites the model is built against:
+  - ≈`:3134-3145` — the `Unresolved` wedge install. Its comment is the contract: *"The marker deliberately STAYS `ApplyPending` on the success path: an `Unresolved` outcome is precisely 'an object that may be durable and is not applied' ... cleared only when the resolution installs the transaction or proves it never landed."*
+  - ≈`:1745-1746` — `NoWedge`: the ordinary flush pays nothing for any of the resolution machinery.
+  - ≈`:1758-1766` — `FloorReconciled`. `durableFloorCovers(wedge->txn_id)` is checked FIRST, before a candidate is built: the transaction is durable, the floor records it, the table is `Poisoned`, and the wedge is still installed. The wedge is retired **without installing the transaction**, and the `clearApplyPending` call there is documented as *"A no-op on a `Poisoned` table (the transition is terminal and this is a CAS)"* — so `Poisoned` is RETAINED. Its log line: *"The table stays POISONED: its cached view is missing that transaction until a recovery re-derives it from the log."*
+  - ≈`:1919-1926` — `Rejected`: our own epoch seal occupies the slot ⇒ our bytes provably never landed ⇒ `wedge.reset()` + `clearApplyPending`.
+  - ≈`:1927-1934` — `Corrupted`: a FOREIGN occupant ⇒ `clearApplyPending` and **KEEP the wedge**, with the comment *"This is the one state where a wedged lane is not `ApplyPending`: our bytes provably never landed, so no apply is owed."*
+  - ≈`:1936-1950` — `StillWedged` / `Reason::StaleState`: the object is durable and this runtime cannot record it ⇒ `noteDurableIdNotApplied(wedge.txn_id)` raises the floor over the id, `poisonApplyState`, and *"The wedge is KEPT, so the next flush's floor reconciliation retires it instead of re-applying an id that now sits at the floor."*
+  - ≈`:2050-2060` — the fence-closing reaction to `Corrupted`: *"the mount is fenced closed and a remount is scheduled; the lane is deliberately left wedged for inspection."* It runs AFTER the resolution, which is what creates the window Task 3's `_sab_nowedge` exploits.
+  - ≈`:2062-2128` — the other `StillWedged` reasons (`FenceMoved`, `Superseded`, `WedgeReplaced`, `RefusedPreAttempt`, `ResolveFoundNothing`). Every one of them says *"the result is inert"* and the lane keeps whatever wedge it has.
 
 **Interfaces:**
 - Consumes: nothing (first task).
@@ -59,9 +65,9 @@ This is the task that can stop the design. Everything else in the plan is condit
 
 - [ ] **Step 1: Read the v11 model end to end, and write down the five things it cannot express.**
 
-Read `docs/superpowers/models/CaRelinkConfirmCore.tla` in full, then the three `CasRefLedger.cpp` sites above. Before writing any new TLA+, write these five sentences into a scratch note — they become the new module's header, and getting them wrong is how this task goes wrong:
+Read `CaRelinkConfirmCore.tla` in full, then the eight `CasRefLedger.cpp` sites above. Before writing any new TLA+, write these five sentences into a scratch note — they become the new module's header, and getting them wrong is how this task goes wrong:
 
-1. `SenderDurable` (`:180-189`) makes a transaction durable while leaving `sCacheRef` un-updated, and the ONLY predicate that refuses in that state is rule 3's `quiescent == SabotageStaleCache \/ (~sPending /\ ~sLeader)` (`:269`). `sPoison` is set only by `SenderPoison` — the apply-THREW case — so **the v11 model has no representation of the code's `ApplyPending` marker at all**, and no representation of its wedge-retained or wedge-resolved states.
+1. `SenderDurable` (`:180-189`) makes a transaction durable while leaving `sCacheRef` un-updated, and the ONLY predicate that refuses in that state is rule 3's `quiescent == SabotageStaleCache \/ (~sPending /\ ~sLeader)` (`:269`). `sPoison` is set only by `SenderPoison` — the apply-THREW case — so **the v11 model has no representation of the code's `ApplyPending` marker at all**, and therefore none of its wedge-retained, wedge-resolved or floor-reconciled states.
 2. The marker is a relaxed atomic written with no lock held, so **what a reader OBSERVES is a different value from what the writer STORED** — and the v11 model, having no marker, has neither.
 3. `NsS` is a single fixed sender namespace and `Token` identifies its blobs globally, so **a cross-mount validator collision is unrepresentable.**
 4. `SenderAdmit → SenderDurable → SenderApply` is one transaction per tenure and every transaction targets the tracked binding, so **`~sLeader` and "the marker is clear" coincide by construction** and cannot be told apart.
@@ -69,7 +75,7 @@ Read `docs/superpowers/models/CaRelinkConfirmCore.tla` in full, then the three `
 
 - [ ] **Step 2: Write the module's header, universe and named assumptions.**
 
-Create `docs/superpowers/models/CaRelinkReofferCore.tla`. The header comment MUST contain, in this order: (a) what is under test — the re-offer confirm of spec `2026-07-29-cas-relink-reoffer-redesign.md` §4.2's five-step fence-first ordering; (b) the five sentences from step 1, stated as what this module adds; (c) the loud `_sab_stalecache` note below; (d) the named-assumptions block below verbatim; (e) the scope notes below verbatim.
+Create `docs/superpowers/models/CaRelinkReofferCore.tla`. The header comment MUST contain, in this order: (a) what is under test — the re-offer confirm of spec `2026-07-29-cas-relink-reoffer-redesign.md` §4.2's five-step fence-first ordering; (b) the five sentences from step 1, stated as what this module adds; (c) the loud `_sab_stalecache` note below; (d) the named-assumptions block below verbatim; (e) the scope notes below verbatim. The wedge outcome→action mapping is a separate block written in step 4, immediately above the wedge actions.
 
 The `_sab_stalecache` note, verbatim — a fresh reader who misses this will misread the entire battery:
 
@@ -140,10 +146,11 @@ The scope notes, verbatim:
    unrepresentable here by construction: `RecoverForAnswer` installs the durable view ATOMICALLY,
    which is also how §4.3's "abandoning before the install leaves nothing partial" is encoded.
    The wedge-resolution tenure is out of scope as a TENURE question (§12.5); its marker states are
-   NOT out of scope and are modelled action by action against `CasRefLedger.cpp`. *)
+   NOT out of scope and every arm of `resolveWedgeOnce` is mapped to an action or to a stated
+   non-transition -- see the mapping block above the wedge actions. *)
 ```
 
-Now the universe:
+Now the universe. **Unchanged from v2 — do not churn it:**
 
 ```tla
 -------------------- MODULE CaRelinkReofferCore --------------------
@@ -204,6 +211,8 @@ Records    == [id: Ids, ns: Namespaces, blob: Blobs, src: Sources, op: {"add", "
 
 - [ ] **Step 3: Write the variables and `Init`.**
 
+One variable is new in v3: `sFloorCovers`, the model's `RefTableState::durableFloorCovers(wedge->txn_id)`. It is what makes the two-step stale resolution representable and the poisoned-to-clean install unrepresentable.
+
 ```tla
 VARIABLES
     round, present, condemned, pendingDelete, folded, cursor, gcPhase,   \* GC
@@ -214,6 +223,7 @@ VARIABLES
     sApply,           \* the marker as STORED
     sApplySeen,       \* the marker as a `state_mutex` reader OBSERVES it (seam §6)
     sApplyOwed,       \* GHOST: this mount has an own DURABLE transaction not yet installed
+    sFloorCovers,     \* the durable floor records the wedged txn as durable-but-not-applied
     sWedge, sForeign, sFence, sRecovered, sChunks, sTenureChunks,
     partMount,                                                           \* which mount holds the part
     rState, rAnswer, rIdentity, rAccepted, rCommitted, rDurableBefore,
@@ -223,8 +233,8 @@ VARIABLES
 
 gcVars     == << round, present, condemned, pendingDelete, folded, cursor, gcPhase >>
 senderVars == << sDurableRef, sCacheRef, sTarget, sKind, sPending, sLeader, sArmed, sApply,
-                 sApplySeen, sApplyOwed, sWedge, sForeign, sFence, sRecovered, sChunks,
-                 sTenureChunks >>
+                 sApplySeen, sApplyOwed, sFloorCovers, sWedge, sForeign, sFence, sRecovered,
+                 sChunks, sTenureChunks >>
 recvVars   == << rState, rAnswer, rIdentity, rAccepted, rCommitted, rDurableBefore,
                  rAnsweredFenced, rPublishes, rUnresolved >>
 logVars    == << journal, nextId >>
@@ -258,6 +268,7 @@ Init ==
     /\ sApply      = [m \in Mounts |-> "clean"]
     /\ sApplySeen  = [m \in Mounts |-> "clean"]
     /\ sApplyOwed  = [m \in Mounts |-> FALSE]
+    /\ sFloorCovers = [m \in Mounts |-> FALSE]
     /\ sWedge      = [m \in Mounts |-> FALSE]
     /\ sForeign    = [m \in Mounts |-> FALSE]
     /\ sFence      = [m \in Mounts |-> TRUE]
@@ -279,9 +290,9 @@ Init ==
     /\ sawColdRefused = FALSE /\ sawCollision = FALSE /\ sawCorruptWindow = FALSE
 ```
 
-- [ ] **Step 4: Write the sender lane — chunk kinds, the marker's two values, and the wedge lifecycle.**
+- [ ] **Step 4: Write the sender lane — chunk kinds, the marker's two values, and the FULL wedge lifecycle.**
 
-Every action below carries the code citation that licenses it. **The wedge block is the part a reviewer must check line by line against `CasRefLedger.cpp`** — an earlier draft of this plan had `SenderWedge*` clear the marker, which contradicts `:3134-3145` and made `_sab_nowedge` red for a state the code cannot reach.
+Every action carries the code citation that licenses it. **The wedge block is the part a reviewer must check arm by arm against `resolveWedgeOnce`** — two earlier drafts of this plan got it wrong in two different ways, first by clearing the marker on an unresolved PUT and then by omitting the floor-reconciliation step and leaving a poisoned-to-clean install enabled. The mapping block below is the antidote: every outcome of the function has a line, including the ones that are deliberately NOT transitions.
 
 ```tla
 (* ---- the sender's ref lane: ONE tenure, SEVERAL durable chunks of TWO kinds ------------------ *)
@@ -303,8 +314,8 @@ SenderAdmit(m, nb, k) ==
     /\ sTarget'  = [sTarget  EXCEPT ![m] = IF k = "tracked" THEN nb ELSE sTarget[m]]
     /\ sKind'    = [sKind    EXCEPT ![m] = k]
     /\ sTenureChunks' = [sTenureChunks EXCEPT ![m] = IF sLeader[m] THEN sTenureChunks[m] ELSE 0]
-    /\ UNCHANGED << sDurableRef, sCacheRef, sArmed, sApply, sApplySeen, sApplyOwed, sWedge,
-                    sForeign, sFence, sRecovered, sChunks >>
+    /\ UNCHANGED << sDurableRef, sCacheRef, sArmed, sApply, sApplySeen, sApplyOwed, sFloorCovers,
+                    sWedge, sForeign, sFence, sRecovered, sChunks >>
     /\ UNCHANGED << gcVars, recvVars, logVars, histVars, partMount >>
 
 (* THE ARM.  Seam §6: `armApplyPending` inside a `state_mutex` scope IMMEDIATELY before the PUT --
@@ -326,7 +337,7 @@ SenderArm(m) ==
            ELSE IF SabotageRelaxedMarker THEN sApplySeen[m]   \* the store is not published
            ELSE                              "pending"]
     /\ UNCHANGED << sDurableRef, sCacheRef, sTarget, sKind, sPending, sLeader, sApplyOwed,
-                    sWedge, sForeign, sFence, sRecovered, sChunks, sTenureChunks >>
+                    sFloorCovers, sWedge, sForeign, sFence, sRecovered, sChunks, sTenureChunks >>
     /\ UNCHANGED << gcVars, recvVars, logVars, histVars, partMount >>
 
 (* The conditional PUT is acked: DURABLE, GC can fold it, the committed row still lags.  NO durable
@@ -347,7 +358,7 @@ SenderDurable(m) ==
               /\ UNCHANGED sDurableRef
     /\ sApplyOwed' = [sApplyOwed EXCEPT ![m] = TRUE]
     /\ UNCHANGED << sCacheRef, sTarget, sKind, sPending, sLeader, sArmed, sApply, sApplySeen,
-                    sWedge, sForeign, sFence, sRecovered, sChunks, sTenureChunks >>
+                    sFloorCovers, sWedge, sForeign, sFence, sRecovered, sChunks, sTenureChunks >>
     /\ UNCHANGED << gcVars, recvVars, histVars, partMount >>
 
 (* THE INSTALL.  `clearApplyPending` is the last statement of the install region (`:2992`), in the
@@ -366,7 +377,8 @@ SenderInstall(m) ==
     /\ sPending'   = [sPending   EXCEPT ![m] = FALSE]
     /\ sChunks'       = [sChunks       EXCEPT ![m] = sChunks[m] + 1]
     /\ sTenureChunks' = [sTenureChunks EXCEPT ![m] = sTenureChunks[m] + 1]
-    /\ UNCHANGED << sDurableRef, sTarget, sKind, sLeader, sWedge, sForeign, sFence, sRecovered >>
+    /\ UNCHANGED << sDurableRef, sTarget, sKind, sLeader, sFloorCovers, sWedge, sForeign,
+                    sFence, sRecovered >>
     /\ UNCHANGED << gcVars, recvVars, logVars, histVars, partMount >>
 
 SenderCloseTenure(m) ==
@@ -374,7 +386,7 @@ SenderCloseTenure(m) ==
     /\ sLeader' = [sLeader EXCEPT ![m] = FALSE]
     /\ sTenureChunks' = [sTenureChunks EXCEPT ![m] = 0]
     /\ UNCHANGED << sDurableRef, sCacheRef, sTarget, sKind, sPending, sArmed, sApply, sApplySeen,
-                    sApplyOwed, sWedge, sForeign, sFence, sRecovered, sChunks >>
+                    sApplyOwed, sFloorCovers, sWedge, sForeign, sFence, sRecovered, sChunks >>
     /\ UNCHANGED << gcVars, recvVars, logVars, histVars, partMount >>
 
 (* The in-memory apply THREW although the object is durable.  The tenure closes -- the lane looks
@@ -387,11 +399,45 @@ SenderPoison(m) ==
     /\ sPending' = [sPending EXCEPT ![m] = FALSE]
     /\ sLeader'  = [sLeader  EXCEPT ![m] = FALSE]
     /\ sTenureChunks' = [sTenureChunks EXCEPT ![m] = 0]
-    /\ UNCHANGED << sDurableRef, sCacheRef, sTarget, sKind, sApplyOwed, sWedge, sForeign,
-                    sFence, sRecovered, sChunks >>
+    /\ UNCHANGED << sDurableRef, sCacheRef, sTarget, sKind, sApplyOwed, sFloorCovers, sWedge,
+                    sForeign, sFence, sRecovered, sChunks >>
     /\ UNCHANGED << gcVars, recvVars, logVars, histVars, partMount >>
 
-(* ---- the wedge lifecycle, transition by transition against CasRefLedger.cpp ------------------ *)
+(* ============================================================================================ *)
+(* ---- THE WEDGE LIFECYCLE: every arm of `CasRefLedger::resolveWedgeOnce`, mapped ------------- *)
+(* ============================================================================================ *)
+(*
+   OUTCOME (WedgeResolution / Reason)          SITE           MODEL
+   ------------------------------------------  -------------  ------------------------------------
+   the Unresolved PUT that CREATES the wedge   :3134-3145     SenderUnresolvedLanded /
+     -- the marker deliberately STAYS pending                   SenderUnresolvedNotLanded
+   NoWedge                                     :1745-1746     NO ACTION -- the absence of `sWedge`;
+                                                                the ordinary flush pays nothing
+   FloorReconciled                             :1758-1766     FloorReconcile -- wedge RETIRED, the
+     -- floor already records the txn; the                       txn NOT installed, Poisoned
+        `clearApplyPending` there is a                           RETAINED, `sApplyOwed` RETAINED
+        documented no-op on a Poisoned table
+   Rejected (own epoch seal at the slot)       :1919-1926     WedgeResolveRejected -- wedge reset,
+     -- proven non-durable, no apply owed                        marker clean
+   Corrupted (FOREIGN occupant)                :1927-1934     WedgeResolveCorrupted -- marker
+     -- the ONE state where a wedged lane        + reaction       cleared, wedge KEPT ...
+        is not ApplyPending                      :2050-2060     ... then CorruptFenceReaction, a
+                                                                SEPARATE step: fence closed
+   StillWedged / Reason::StaleState             :1936-1950     WedgeResolveStale -- floor raised
+     -- durable, cannot be recorded here:                        over the id (sFloorCovers),
+        floor + poison, wedge KEPT for the                       poisoned, wedge KEPT
+        next flush's floor reconciliation
+   adoption install (Created, or Occupied       :1953+         WedgeResolveInstall -- state.swap,
+        with our own bytes)                                      wedge cleared, marker clean.
+                                                                GUARDED by ~sFloorCovers and
+                                                                sApply # "poisoned": see below
+   StillWedged / FenceMoved, Superseded,        :2062-2128     NO ACTION -- every one of these is
+        WedgeReplaced, RefusedPreAttempt,                        INERT ("the result is inert and the
+        ResolveFoundNothing                                      lane keeps whatever wedge it has"),
+                                                                i.e. UNCHANGED vars, which `NoOp`
+                                                                already supplies.  Modelled as
+                                                                DELAY, not as a transition.
+*)
 
 (* UNRESOLVED (`:3134-3145`).  The PUT outcome is unknown, the wedge is installed, and *** the
    MARKER STAYS `ApplyPending` ***: its own comment says an `Unresolved` outcome is "precisely 'an
@@ -410,8 +456,8 @@ SenderUnresolvedLanded(m) ==
     /\ sPending' = [sPending EXCEPT ![m] = FALSE]
     /\ sLeader'  = [sLeader  EXCEPT ![m] = FALSE]
     /\ sTenureChunks' = [sTenureChunks EXCEPT ![m] = 0]
-    /\ UNCHANGED << sCacheRef, sTarget, sKind, sArmed, sApply, sApplySeen, sForeign, sFence,
-                    sRecovered, sChunks >>                \* sApply STAYS "pending" -- by contract
+    /\ UNCHANGED << sCacheRef, sTarget, sKind, sArmed, sApply, sApplySeen, sFloorCovers, sForeign,
+                    sFence, sRecovered, sChunks >>          \* sApply STAYS "pending" -- by contract
     /\ UNCHANGED << gcVars, recvVars, histVars, partMount >>
 
 SenderUnresolvedNotLanded(m) ==
@@ -421,15 +467,27 @@ SenderUnresolvedNotLanded(m) ==
     /\ sLeader'  = [sLeader  EXCEPT ![m] = FALSE]
     /\ sTenureChunks' = [sTenureChunks EXCEPT ![m] = 0]
     /\ UNCHANGED << sDurableRef, sCacheRef, sTarget, sKind, sArmed, sApply, sApplySeen,
-                    sApplyOwed, sForeign, sFence, sRecovered, sChunks >>
+                    sApplyOwed, sFloorCovers, sForeign, sFence, sRecovered, sChunks >>
     /\ UNCHANGED << gcVars, recvVars, logVars, histVars, partMount >>
 
-(* RESOLUTION, four outcomes (`:1919-1934` and the reaction at `:2050-2060`).  The discriminator is
-   `sApplyOwed` -- "did OUR bytes land?" -- which is exactly what the resolve read establishes. *)
-
-(* Durable and adoptable: install it.  The wedge clears and the apply is discharged. *)
+(* ADOPTION INSTALL (`:1953+`): durable, and the table has not advanced under the resolution, so it
+   can be recorded.  *** TWO GUARDS, AND BOTH ARE STRUCTURAL EXCLUSIONS, NOT DECORATION. ***
+     * `~sFloorCovers[m]` -- `durableFloorCovers` is tested FIRST in the real function (`:1758`),
+       before a candidate is even built, so a floor-covered wedge can only take the
+       `FloorReconciled` path.  An install here would re-apply an id that now sits AT the floor,
+       which `applyTxnInPlace` refuses as non-contiguous -- "every later flush would throw in the
+       same place and the lane would stay wedged for the runtime's life".
+     * `sApply[m] # "poisoned"` -- a poisoned cache is by definition missing a durable transaction
+       and may never be silently advanced to clean.  An earlier draft of this model guarded this
+       action on `sWedge /\ sApplyOwed` ALONE, which left a poisoned-to-clean install enabled
+       immediately after `WedgeResolveStale`: an impossible transition presented as a reachable one.
+   Neither guard has an invariant of its own, deliberately: they make the states UNREPRESENTABLE, and
+   an invariant over a state the transition relation cannot enter would be green for free.  They are
+   recorded as structural exclusions in `2026-07-29-relink-seam-tla-RESULTS.md`. *)
 WedgeResolveInstall(m) ==
     /\ sWedge[m] /\ sApplyOwed[m]
+    /\ ~sFloorCovers[m]
+    /\ sApply[m] # "poisoned"
     /\ sCacheRef'  = [sCacheRef  EXCEPT ![m] = sDurableRef[m]]
     /\ sApply'     = [sApply     EXCEPT ![m] = "clean"]
     /\ sApplySeen' = [sApplySeen EXCEPT ![m] = "clean"]
@@ -437,20 +495,21 @@ WedgeResolveInstall(m) ==
     /\ sWedge'     = [sWedge     EXCEPT ![m] = FALSE]
     /\ sArmed'     = [sArmed     EXCEPT ![m] = FALSE]
     /\ sChunks'    = [sChunks    EXCEPT ![m] = sChunks[m] + 1]
-    /\ UNCHANGED << sDurableRef, sTarget, sKind, sPending, sLeader, sForeign, sFence,
-                    sRecovered, sTenureChunks >>
+    /\ UNCHANGED << sDurableRef, sTarget, sKind, sPending, sLeader, sFloorCovers, sForeign,
+                    sFence, sRecovered, sTenureChunks >>
     /\ UNCHANGED << gcVars, recvVars, logVars, histVars, partMount >>
 
 (* REJECTED (`:1919-1926`): our own epoch seal occupies the slot, so our bytes PROVABLY never
-   landed.  "no apply is owed" -- the wedge resets and the marker clears together. *)
+   landed.  "no apply is owed" -- the wedge resets and the marker clears together.  Reached only
+   when the floor does NOT cover the id, because that test comes first. *)
 WedgeResolveRejected(m) ==
-    /\ sWedge[m] /\ ~sApplyOwed[m] /\ ~sForeign[m]
+    /\ sWedge[m] /\ ~sApplyOwed[m] /\ ~sForeign[m] /\ ~sFloorCovers[m]
     /\ sWedge'     = [sWedge     EXCEPT ![m] = FALSE]
     /\ sApply'     = [sApply     EXCEPT ![m] = "clean"]
     /\ sApplySeen' = [sApplySeen EXCEPT ![m] = "clean"]
     /\ sArmed'     = [sArmed     EXCEPT ![m] = FALSE]
     /\ UNCHANGED << sDurableRef, sCacheRef, sTarget, sKind, sPending, sLeader, sApplyOwed,
-                    sForeign, sFence, sRecovered, sChunks, sTenureChunks >>
+                    sFloorCovers, sForeign, sFence, sRecovered, sChunks, sTenureChunks >>
     /\ UNCHANGED << gcVars, recvVars, logVars, histVars, partMount >>
 
 (* CORRUPTED (`:1927-1934`) -- *** THE ONE STATE WHERE A WEDGED LANE IS NOT ApplyPending. ***  A
@@ -463,15 +522,15 @@ WedgeResolveRejected(m) ==
        which the lane is fence-live, marker-clean and wedged.  Rule 3 is the ONLY guard in it.
    This window is `_sab_nowedge`'s counterexample and `_witness_corruptwindow`'s subject. *)
 WedgeResolveCorrupted(m) ==
-    /\ sWedge[m] /\ ~sApplyOwed[m] /\ ~sForeign[m]
+    /\ sWedge[m] /\ ~sApplyOwed[m] /\ ~sForeign[m] /\ ~sFloorCovers[m]
     /\ sForeign'   = [sForeign   EXCEPT ![m] = TRUE]
     /\ sApply'     = [sApply     EXCEPT ![m] = "clean"]
     /\ sApplySeen' = [sApplySeen EXCEPT ![m] = "clean"]
     /\ sArmed'     = [sArmed     EXCEPT ![m] = FALSE]
     /\ sawCorruptWindow' = sawCorruptWindow \/ H(sFence[m])
     /\ UNCHANGED << sDurableRef, sCacheRef, sTarget, sKind, sPending, sLeader, sApplyOwed,
-                    sWedge, sFence, sRecovered, sChunks, sTenureChunks >>   \* wedge KEPT
-    /\ UNCHANGED << gcVars, recvVars, logVars, partMount >>
+                    sFloorCovers, sWedge, sFence, sRecovered, sChunks, sTenureChunks >>
+    /\ UNCHANGED << gcVars, recvVars, logVars, partMount >>       \* wedge KEPT
     /\ UNCHANGED << sawBusyProven, sawMidTenureProven, sawProvenCommitted, sawLandedS2,
                     sawChangedThenBytes, sawUnknown, sawColdRefused, sawCollision >>
 
@@ -480,18 +539,45 @@ CorruptFenceReaction(m) ==
     /\ sForeign[m] /\ sFence[m]
     /\ sFence' = [sFence EXCEPT ![m] = FALSE]
     /\ UNCHANGED << sDurableRef, sCacheRef, sTarget, sKind, sPending, sLeader, sArmed, sApply,
-                    sApplySeen, sApplyOwed, sWedge, sForeign, sRecovered, sChunks, sTenureChunks >>
+                    sApplySeen, sApplyOwed, sFloorCovers, sWedge, sForeign, sRecovered,
+                    sChunks, sTenureChunks >>
     /\ UNCHANGED << gcVars, recvVars, logVars, histVars, partMount >>
 
-(* STALE STATE (`:2113-2120`): durable, but the table advanced under the resolution, so it cannot
-   be installed without discarding that advance -- POISONED. *)
+(* STALE STATE (`:1936-1950`), STEP ONE OF TWO.  The object is proven durable and this runtime
+   cannot record it, "which is exactly what the floor and `Poisoned` are for":
+   `noteDurableIdNotApplied` raises the durable floor over the wedged id, `poisonApplyState` poisons
+   the table, and *** the WEDGE IS KEPT *** -- "so the next flush's floor reconciliation retires it
+   instead of re-applying an id that now sits at the floor".  `sApplyOwed` stays TRUE, which is the
+   truth: the transaction is durable and this cache does not contain it. *)
 WedgeResolveStale(m) ==
-    /\ sWedge[m] /\ sApplyOwed[m]
-    /\ sApply'     = [sApply     EXCEPT ![m] = "poisoned"]
-    /\ sApplySeen' = [sApplySeen EXCEPT ![m] = "poisoned"]
-    /\ sArmed'     = [sArmed     EXCEPT ![m] = FALSE]
+    /\ sWedge[m] /\ sApplyOwed[m] /\ ~sFloorCovers[m]
+    /\ sFloorCovers' = [sFloorCovers EXCEPT ![m] = TRUE]
+    /\ sApply'       = [sApply       EXCEPT ![m] = "poisoned"]
+    /\ sApplySeen'   = [sApplySeen   EXCEPT ![m] = "poisoned"]
+    /\ sArmed'       = [sArmed       EXCEPT ![m] = FALSE]
     /\ UNCHANGED << sDurableRef, sCacheRef, sTarget, sKind, sPending, sLeader, sApplyOwed,
                     sWedge, sForeign, sFence, sRecovered, sChunks, sTenureChunks >>
+    /\ UNCHANGED << gcVars, recvVars, logVars, histVars, partMount >>
+
+(* FLOOR RECONCILIATION (`:1758-1766`), STEP TWO OF TWO -- the transition an earlier draft of this
+   model omitted entirely.  The NEXT invocation sees `durableFloorCovers(wedge->txn_id)` and takes
+   this path before any candidate is built: the wedge is RETIRED and the transaction is NOT
+   installed.  Three things stay exactly as they were, and each is a code fact rather than a
+   modelling convenience:
+     * the cached row is NOT advanced -- "nothing is installed on this path";
+     * `Poisoned` is RETAINED -- the `clearApplyPending` call there is documented as "A no-op on a
+       `Poisoned` table (the transition is terminal and this is a CAS)";
+     * `sApplyOwed` is RETAINED -- "The table stays POISONED: its cached view is missing that
+       transaction until a recovery re-derives it from the log."
+   So `MarkerCoversDurableWindow` holds through both steps without any exclusion, and the lane is
+   stopped (every admission requires a clean marker) until a recovery re-derives the cache. *)
+FloorReconcile(m) ==
+    /\ sWedge[m] /\ sFloorCovers[m]
+    /\ sWedge' = [sWedge EXCEPT ![m] = FALSE]
+    /\ sArmed' = [sArmed EXCEPT ![m] = FALSE]
+    /\ UNCHANGED << sDurableRef, sCacheRef, sTarget, sKind, sPending, sLeader, sApply, sApplySeen,
+                    sApplyOwed, sFloorCovers, sForeign, sFence, sRecovered, sChunks,
+                    sTenureChunks >>
     /\ UNCHANGED << gcVars, recvVars, logVars, histVars, partMount >>
 
 (* ---- fence loss, the foreign writer, and rule 2's two arms ----------------------------------- *)
@@ -500,7 +586,8 @@ FenceLoss(m) ==
     /\ sFence[m] /\ ~sPending[m] /\ ~sArmed[m]
     /\ sFence' = [sFence EXCEPT ![m] = FALSE]
     /\ UNCHANGED << sDurableRef, sCacheRef, sTarget, sKind, sPending, sLeader, sArmed, sApply,
-                    sApplySeen, sApplyOwed, sWedge, sForeign, sRecovered, sChunks, sTenureChunks >>
+                    sApplySeen, sApplyOwed, sFloorCovers, sWedge, sForeign, sRecovered,
+                    sChunks, sTenureChunks >>
     /\ UNCHANGED << gcVars, recvVars, logVars, histVars, partMount >>
 
 (* Another writer removes the binding: durable, folded by GC, invisible to this mount's committed
@@ -516,29 +603,45 @@ ForeignRemove(m) ==
     /\ nextId' = nextId + 1
     /\ sDurableRef' = [sDurableRef EXCEPT ![m] = NoBinding]
     /\ UNCHANGED << sCacheRef, sTarget, sKind, sPending, sLeader, sArmed, sApply, sApplySeen,
-                    sApplyOwed, sWedge, sForeign, sFence, sRecovered, sChunks, sTenureChunks >>
+                    sApplyOwed, sFloorCovers, sWedge, sForeign, sFence, sRecovered, sChunks,
+                    sTenureChunks >>
     /\ UNCHANGED << gcVars, recvVars, histVars, partMount >>
 
+(* Eviction requires no IN-FLIGHT transaction, NOT a clean marker: a poisoned cache is exactly the
+   one you want evicted, and eviction plus recovery is how the code's "until a recovery re-derives
+   it from the log" is reached.  Without this the poisoned/floor-reconciled lane would be a dead end
+   whenever `ModelColdTable = FALSE`; with `ModelColdTable = FALSE` it still is, and that is
+   accepted -- a dead end is a state, not an error, and `NoOp` keeps TLC from reporting a
+   deadlock. *)
 EvictTable(m) ==
     /\ ModelColdTable /\ sRecovered[m]
-    /\ ~sPending[m] /\ ~sArmed[m] /\ ~sLeader[m] /\ ~sWedge[m] /\ sApply[m] = "clean"
+    /\ ~sPending[m] /\ ~sArmed[m] /\ ~sLeader[m] /\ ~sWedge[m] /\ sApply[m] # "pending"
     /\ sRecovered' = [sRecovered EXCEPT ![m] = FALSE]
     /\ UNCHANGED << sDurableRef, sCacheRef, sTarget, sKind, sPending, sLeader, sArmed, sApply,
-                    sApplySeen, sApplyOwed, sWedge, sForeign, sFence, sChunks, sTenureChunks >>
+                    sApplySeen, sApplyOwed, sFloorCovers, sWedge, sForeign, sFence, sChunks,
+                    sTenureChunks >>
     /\ UNCHANGED << gcVars, recvVars, logVars, histVars, partMount >>
 
 (* §4.3: recovery installs its result ATOMICALLY, so abandoning before the install leaves nothing
-   partial and a half-recovered view is unrepresentable. *)
+   partial and a half-recovered view is unrepresentable.  It is also the ONLY exit from the poisoned
+   state, and it clears the marker, the owed apply and the floor record together -- "a recovery
+   re-derives the cache from the log". *)
 RecoverForAnswer(m) ==
     /\ ~sRecovered[m] /\ ~sPending[m] /\ ~sArmed[m] /\ ~sWedge[m]
     /\ sRecovered' = [sRecovered EXCEPT ![m] = TRUE]
     /\ sCacheRef'  = [sCacheRef  EXCEPT ![m] = sDurableRef[m]]
-    /\ UNCHANGED << sDurableRef, sTarget, sKind, sPending, sLeader, sArmed, sApply, sApplySeen,
-                    sApplyOwed, sWedge, sForeign, sFence, sChunks, sTenureChunks >>
+    /\ sApply'     = [sApply     EXCEPT ![m] = "clean"]
+    /\ sApplySeen' = [sApplySeen EXCEPT ![m] = "clean"]
+    /\ sApplyOwed' = [sApplyOwed EXCEPT ![m] = FALSE]
+    /\ sFloorCovers' = [sFloorCovers EXCEPT ![m] = FALSE]
+    /\ UNCHANGED << sDurableRef, sTarget, sKind, sPending, sLeader, sArmed, sWedge, sForeign,
+                    sFence, sChunks, sTenureChunks >>
     /\ UNCHANGED << gcVars, recvVars, logVars, histVars, partMount >>
 ```
 
 - [ ] **Step 5: Write the validator, and the answer as an (answer, identity) PAIR.**
+
+**Unchanged from v2 — the reviewer verified every cited symbol here; do not churn it.**
 
 ```tla
 (* ---- the validator ---------------------------------------------------------------------------- *)
@@ -600,7 +703,7 @@ RAccepts(ans, idn) ==
 
 - [ ] **Step 6: Write the receiver, GC, `Next`, and Task 1's invariants and witnesses.**
 
-Task 1 needs only the minimum receiver that can reach a committed relink; Task 3 adds S0/S2 and the byte-fetch arms.
+Task 1 needs only the minimum receiver that can reach a committed relink; Task 3 adds S0/S2 and the byte-fetch arms. The receiver, GC, `Next` and witness blocks below are **unchanged from v2** apart from `sFloorCovers` in `TypeOK` and the three new wedge actions in `Next`.
 
 ```tla
 (* ---- the receiver (§6; S0 and S2 arrive in Task 3) ----------------------------------------- *)
@@ -727,7 +830,8 @@ GSettle ==
     /\ UNCHANGED << folded, cursor >>
     /\ UNCHANGED << senderVars, recvVars, logVars, histVars, partMount >>
 
-NoOp == UNCHANGED vars     \* house pattern; every cfg also sets CHECK_DEADLOCK FALSE
+NoOp == UNCHANGED vars     \* house pattern; every cfg also sets CHECK_DEADLOCK FALSE.  It is ALSO
+                           \* the model of every INERT `StillWedged` resolution (`:2062-2128`).
 
 Next ==
     \/ \E m \in Mounts :
@@ -736,7 +840,7 @@ Next ==
          \/ SenderPoison(m)
          \/ SenderUnresolvedLanded(m) \/ SenderUnresolvedNotLanded(m)
          \/ WedgeResolveInstall(m) \/ WedgeResolveRejected(m) \/ WedgeResolveCorrupted(m)
-         \/ WedgeResolveStale(m) \/ CorruptFenceReaction(m)
+         \/ WedgeResolveStale(m) \/ FloorReconcile(m) \/ CorruptFenceReaction(m)
          \/ FenceLoss(m) \/ ForeignRemove(m) \/ EvictTable(m) \/ RecoverForAnswer(m)
     \/ \E r \in Receivers : RStage(r) \/ RConfirm(r) \/ RPromoteCommit(r) \/ RAbort(r)
                             \/ TypeProbe(r)
@@ -769,6 +873,7 @@ TypeOK ==
     /\ sApply      \in [Mounts -> ApplyStates]
     /\ sApplySeen  \in [Mounts -> ApplyStates]
     /\ sApplyOwed  \in [Mounts -> BOOLEAN]
+    /\ sFloorCovers \in [Mounts -> BOOLEAN]
     /\ sWedge      \in [Mounts -> BOOLEAN]
     /\ sForeign    \in [Mounts -> BOOLEAN]
     /\ sFence      \in [Mounts -> BOOLEAN]
@@ -806,16 +911,17 @@ ConfirmedRelinkNeverDangles ==
             => AdoptedBlobs \subseteq LiveBlobs
 
 (* The antecedent-free form: broken by inverting the order, which leaves the guarded theorem
-   vacuously satisfied. *)
+   vacuously satisfied.  Its red is `_sab_publishafterconfirm`, which lives in THIS task because a
+   green may not list an invariant whose sabotage does not yet exist. *)
 PromotedNeverDangles ==
     \A r \in Receivers : rCommitted[r] => AdoptedBlobs \subseteq LiveBlobs
 
 (* SEAM §8 ROW S7, HALF ONE -- THE INTERVAL.  §5.1.2's requirement, stated as a model property:
    while an apply is OWED, the marker is not clean.  Note what it needs and does NOT need: the
    subject is this mount's OWN durable transaction (`sApplyOwed`), so no exclusion for the wedge and
-   none for the fence is required.  An earlier draft excluded `sWedge` wholesale and that exclusion
-   was hiding a modelling error, because it made the invariant true for a wedge that clears its
-   marker -- which the code does exactly once, and only when nothing was owed. *)
+   none for the fence is required, and none is added.  It holds through BOTH steps of the stale
+   resolution -- `WedgeResolveStale` poisons while keeping the apply owed, and `FloorReconcile`
+   retires the wedge while retaining both. *)
 MarkerCoversDurableWindow ==
     \A m \in Mounts : sApplyOwed[m] => (sApply[m] # "clean")
 
@@ -832,8 +938,7 @@ MarkerSeenMatchesMarker == \A m \in Mounts : sApplySeen[m] = sApply[m]
 W_BusyLaneProven == ~sawBusyProven
 
 (* §12.5 ii, and STRONGER than "two chunks exist": a `proven` is given mid-tenure, with the tenure
-   OPEN and a chunk of THAT tenure already installed.  Without this the flip could be an artefact of
-   one transaction per tenure. *)
+   OPEN and a chunk of THAT tenure already installed. *)
 W_MidTenureProven == ~sawMidTenureProven
 
 W_ProvenCommitted == ~sawProvenCommitted    \* non-vacuity of the theorem's antecedent
@@ -889,6 +994,7 @@ CONFIGS=(
   "sab_noapplypending        violation  ConfirmedRelinkNeverDangles"
   "sab_noapplypending_window violation  MarkerCoversDurableWindow"
   "sab_relaxedmarker         violation  MarkerSeenMatchesMarker"
+  "sab_publishafterconfirm   violation  PromotedNeverDangles"
   "v11_baseline              green      -"
   "ctl_v11nomarker           green      -"
   "sab_stalecache            green      -"
@@ -902,7 +1008,7 @@ CONFIGS=(
 
 Tasks 2 and 3 extend this array; the sabotage-before-green ordering is preserved as they do.
 
-- [ ] **Step 8: Write the four failing-first configs.**
+- [ ] **Step 8: Write the five failing-first configs.**
 
 The full constants block, given once — every later cfg in this plan is a delta against it:
 
@@ -940,17 +1046,19 @@ CHECK_DEADLOCK FALSE
 | `sab_noapplypending` | `SabotageNoApplyPending = TRUE` | `ConfirmedRelinkNeverDangles` | §12.3 step 2, first half: the marker is never armed while the design's deletion of v11 rule 3's lane-quiescence terms stands. TLC MUST report a counterexample — the confirm reads a committed row that lags a DURABLE removal, exactly the v11 `_sab_stalecache` trace. This is the guard doing real work. |
 | `sab_noapplypending_window` | `SabotageNoApplyPending = TRUE` | `MarkerCoversDurableWindow` | The same toggle's SECOND consequence, and the direct statement of §5.1.2's requirement on the seam fix. Seam §8 row S7, interval half. |
 | `sab_relaxedmarker` | `SabotageRelaxedMarker = TRUE` | `MarkerSeenMatchesMarker` | Seam §8 row S7, OBSERVATION half: the arm stores `ApplyPending` and the store is not published, which is what a relaxed `compare_exchange_strong` called with no lock held permits (`CasRefLedger.cpp:1681` called at `:2808`). **Distinct from `_sab_noapplypending` by construction, not by trace comparison:** there the marker's stored value never moves, here it does, and the two configs break DIFFERENT invariants. |
+| `sab_publishafterconfirm` | `SabotagePublishAfterConfirm = TRUE` | `PromotedNeverDangles` | The design's ORDER is inverted — confirm and promote BEFORE the receiver's `+1` is durable. The guarded theorem stays vacuously satisfied (`rDurableBefore` is FALSE), so the antecedent-free form is what must break. **It lives in Task 1, not Task 3, because Task 1's and Task 2's greens list `PromotedNeverDangles` and a green may not rest on an invariant whose red does not yet exist.** The alternative — dropping the invariant from the earlier greens and adding it in Task 3 — was rejected because it would run the 2×2 gate without the antecedent-free theorem, weakening the very cell that decides the design. §core-idea survives verbatim and this is its check. |
 
-- [ ] **Step 9: Run the four sabotages FIRST. All four MUST be red.**
+- [ ] **Step 9: Run the five sabotages FIRST. All five MUST be red.**
 
 ```bash
 bash /home/mfilimonov/workspace/ClickHouse/master/docs/superpowers/models/run_relinkreoffer.sh
 ```
-Expected: four `violation:<the named invariant>` PASS rows; the eight not-yet-written configs report `error` — expected, and why they are written next.
+Expected: five `violation:<the named invariant>` PASS rows; the eight not-yet-written configs report `error` — expected, and why they are written next.
 
 Read each counterexample and check it against the code, not just against the expectation:
-- `sab_noapplypending`'s trace must go `Admit(tracked) → Arm → Durable → GFold → GSettle×3 → Stage → Confirm → Promote`, i.e. the blob is deleted BEFORE the receiver's `+1` and the answer comes from the stale row. Minimum depth ≈ 12.
-- `sab_relaxedmarker`'s trace must reach a state with `sApply = "pending"` and `sApplySeen = "clean"` — depth 2 or 3. If it instead reports both values clean, the sabotage is wired into the wrong branch of `SenderArm`.
+- `sab_noapplypending`'s trace must go `Admit(tracked) → Arm → Durable → (GFold → GSettle)×3 → Stage → Confirm → PromoteCommit` — note the alternation: consecutive `GSettle`s are disabled by `gcPhase`, so each graduation phase costs a fold and a settle. The blob is deleted BEFORE the receiver's `+1` and the answer comes from the stale row. Minimum depth ≈ 12.
+- `sab_relaxedmarker`'s trace must reach a state with `sApply = "pending"` and `sApplySeen = "clean"` — depth 2 or 3. If it reports both values clean, the sabotage is wired into the wrong branch of `SenderArm`.
+- `sab_publishafterconfirm`'s trace must confirm from `"init"` and stage from `"S3"`. Minimum depth ≈ 10.
 
 If any sabotage comes back GREEN, fix the MODEL (never the invariant) and re-run.
 
@@ -992,15 +1100,26 @@ All five use the DESIGN's settings (`SabotageStaleCache = TRUE`, `SabotageNoAppl
 | `witness_delete` | `W_BlobDeleted` | GC physically deletes, so the consequent is not trivially true |
 | `witness_corruptwindow` | `W_CorruptWindow` | the fence-live, marker-clean, wedged window between a Corrupted resolution and the fence-closing reaction is reachable |
 
-Run the harness. Expected: 12 rows, `ALL EXPECTATIONS MET`.
+Run the harness. Expected: 13 rows, `ALL EXPECTATIONS MET`.
 
 Two witnesses are gate-critical, and a GREEN on either is to be treated exactly as a RED `_sab_stalecache` — stop and report:
 - `witness_busylane` green ⇒ the busy-lane `proven` is unreachable, so the flip's green is vacuous.
-- `witness_midtenure` green ⇒ the multi-chunk tenure is unreachable and the flip is the one-transaction artefact §12.5 ii warns about. The most likely cause is `SenderAdmit`'s `"tracked"` guard leaking onto the `"unrelated"` kind, or `sTenureChunks` not being reset by `SenderCloseTenure` / not being incremented by `SenderInstall`. Fix the model and re-run steps 9–11 in order.
+- `witness_midtenure` green ⇒ the multi-chunk tenure is unreachable and the flip is the one-transaction artefact §12.5 ii warns about. Most likely causes, in order: `SenderAdmit`'s `"tracked"` guard leaking onto the `"unrelated"` kind; `sTenureChunks` not reset by `SenderCloseTenure`; `sTenureChunks` not incremented by `SenderInstall`. Fix the model and re-run steps 9–11 in order.
 
 - [ ] **Step 12: Audit every sender action against its citation, then commit.**
 
-Before committing, walk the twelve sender-lane actions and confirm each matches the code site named in its comment. Specifically confirm: `SenderUnresolvedLanded` and `SenderUnresolvedNotLanded` leave `sApply` at `"pending"`; `WedgeResolveCorrupted` clears the marker and KEEPS `sWedge`; `CorruptFenceReaction` is a separate action from it; `SenderInstall` leaves `sLeader` UNCHANGED. These four are the ones a review already caught once.
+Before committing, walk the **eighteen** actions of `Next`'s mount disjunction — `SenderAdmit`, `SenderArm`, `SenderDurable`, `SenderInstall`, `SenderCloseTenure`, `SenderPoison`, `SenderUnresolvedLanded`, `SenderUnresolvedNotLanded`, `WedgeResolveInstall`, `WedgeResolveRejected`, `WedgeResolveCorrupted`, `WedgeResolveStale`, `FloorReconcile`, `CorruptFenceReaction`, `FenceLoss`, `ForeignRemove`, `EvictTable`, `RecoverForAnswer` — and confirm each matches the code site named in its comment. Then check the mapping block covers every arm of `resolveWedgeOnce`, including the two that map to NO action.
+
+Six of these have been caught wrong by review at least once; verify them individually:
+
+1. `SenderUnresolvedLanded` and `SenderUnresolvedNotLanded` leave `sApply` at `"pending"` (`:3134-3145`).
+2. `WedgeResolveCorrupted` clears the marker and KEEPS `sWedge` (`:1927-1934`).
+3. `CorruptFenceReaction` is a SEPARATE action from it (`:2050-2060`).
+4. `WedgeResolveStale` sets `sFloorCovers`, poisons, and KEEPS `sWedge` (`:1936-1950`).
+5. `FloorReconcile` exists, retires the wedge, installs NOTHING, and retains both `Poisoned` and `sApplyOwed` (`:1758-1766`).
+6. `WedgeResolveInstall` is guarded by `~sFloorCovers[m]` AND `sApply[m] # "poisoned"`, so a poisoned-to-clean install is unrepresentable.
+
+Finally, `grep -c 'sFloorCovers' CaRelinkReofferCore.tla` and confirm every action either writes it or lists it in an `UNCHANGED` — TLC will report a missing assignment, but an accidental `UNCHANGED` omission that happens to be in a tuple will not be caught for you.
 
 ```bash
 cd /home/mfilimonov/workspace/ClickHouse/master
@@ -1009,6 +1128,7 @@ git add docs/superpowers/models/CaRelinkReofferCore.tla \
         docs/superpowers/models/CaRelinkReofferCore_sab_noapplypending.cfg \
         docs/superpowers/models/CaRelinkReofferCore_sab_noapplypending_window.cfg \
         docs/superpowers/models/CaRelinkReofferCore_sab_relaxedmarker.cfg \
+        docs/superpowers/models/CaRelinkReofferCore_sab_publishafterconfirm.cfg \
         docs/superpowers/models/CaRelinkReofferCore_v11_baseline.cfg \
         docs/superpowers/models/CaRelinkReofferCore_ctl_v11nomarker.cfg \
         docs/superpowers/models/CaRelinkReofferCore_sab_stalecache.cfg \
@@ -1018,7 +1138,7 @@ git add docs/superpowers/models/CaRelinkReofferCore.tla \
         docs/superpowers/models/CaRelinkReofferCore_witness_delete.cfg \
         docs/superpowers/models/CaRelinkReofferCore_witness_corruptwindow.cfg \
         docs/superpowers/models/run_relinkreoffer.sh
-git commit -m "ca: tla — CaRelinkReofferCore: apply-marker refinement (stored vs observed, wedge lifecycle) and the 2x2 gate (_sab_stalecache FLIPS GREEN)"
+git commit -m "ca: tla — CaRelinkReofferCore: apply-marker refinement (stored vs observed, full wedge lifecycle) and the 2x2 gate (_sab_stalecache FLIPS GREEN)"
 ```
 
 ---
@@ -1065,9 +1185,9 @@ W_CollisionReached == ~sawCollision
 
 - [ ] **Step 2: Write the three must-red configs.**
 
-Deltas against Task 1 step 8's block. All three: `SecondMount = TRUE`, `EqualNamespaces = TRUE`, `INVARIANTS ConfirmedRelinkNeverDangles`.
+Deltas against Task 1 step 8's block. `INVARIANTS ConfirmedRelinkNeverDangles` in all three. **The mount setting differs between them, and deliberately:** the two validator sabotages need the second mount because a cross-mount collision is what they are about; `_sab_inferanswer` needs no second mount at all, because an ungated offer response is a single-mount hazard, and running it with one mount keeps its state space small.
 
-`sab_barevalidator` — `SabotageBareValidator = TRUE`:
+`sab_barevalidator` — `SecondMount = TRUE`, `EqualNamespaces = TRUE`, `SabotageBareValidator = TRUE`:
 
 ```
 \* SABOTAGE (§12.5 i): the validator is the bare ManifestRef, with no qualification at all -- the
@@ -1078,7 +1198,7 @@ Deltas against Task 1 step 8's block. All three: `SecondMount = TRUE`, `EqualNam
 \* and the receiver promotes over blobs nobody is protecting.
 ```
 
-`sab_nodiskqualification` — `SabotageNoDiskQual = TRUE`:
+`sab_nodiskqualification` — `SecondMount = TRUE`, `EqualNamespaces = TRUE`, `SabotageNoDiskQual = TRUE`:
 
 ```
 \* SABOTAGE (§12.5 i) -- *** THE ONE THAT PINS B1'S ACTUAL FIX. ***  The validator KEEPS the
@@ -1091,7 +1211,7 @@ Deltas against Task 1 step 8's block. All three: `SecondMount = TRUE`, `EqualNam
 \* shape is what makes this red.
 ```
 
-`sab_inferanswer` — `SabotageInferAnswer = TRUE` (and `SecondMount = FALSE`, since this hazard needs no second mount):
+`sab_inferanswer` — `SecondMount = FALSE`, `SabotageInferAnswer = TRUE`:
 
 ```
 \* SABOTAGE (§4.1.3 defence 1): the receiver INFERS the answer from a matching identity instead of
@@ -1100,7 +1220,8 @@ Deltas against Task 1 step 8's block. All three: `SecondMount = TRUE`, `EqualNam
 \* wedge or apply-state checks, because an offer is a proposal, not a certificate.  So a stripped
 \* mode parameter (§11 row 15) makes the sender reply with an ordinary OFFER whose identity may
 \* equal the held validator, and a receiver comparing validators alone promotes on an UNGATED
-\* resolve.  TLC MUST report a ConfirmedRelinkNeverDangles counterexample.
+\* resolve.  ONE MOUNT is enough: this hazard is about the offer path being ungated, not about
+\* mounts.  TLC MUST report a ConfirmedRelinkNeverDangles counterexample.
 ```
 
 - [ ] **Step 3: Run all three. All three MUST be red — this is the failing-first step.**
@@ -1115,7 +1236,7 @@ Add to `CONFIGS`, immediately after `sab_relaxedmarker`:
 
 Run. Expected: three `violation:ConfirmedRelinkNeverDangles`.
 
-If `sab_nodiskqualification` is GREEN the collision is unreachable: check, in this order, that `PartMove` is in `Next`; that mount B's row holds `Token` (`Init` over `Mounts`); that `MaxId` admits the trace (A's removal, the receiver's `+1` — two ids and three GC rounds suffice). If `sab_inferanswer` is GREEN, the offer-response arm of `RConfirm` is unreachable — most likely the disjunction collapsed because both arms were written into one conjunct list. Fix the model; do not touch the invariant.
+If `sab_nodiskqualification` is GREEN the collision is unreachable: check, in this order, that `PartMove` is in `Next`; that mount B's row holds `Token` (`Init` over `Mounts`); that `MaxId` admits the trace (A's removal and the receiver's `+1` — two ids and three GC rounds suffice). If `sab_inferanswer` is GREEN, the offer-response arm of `RConfirm` is unreachable — most likely the disjunction collapsed because both arms were written into one conjunct list. Fix the model; do not touch the invariant.
 
 - [ ] **Step 4: Write the two controls, whose GREEN is the result.**
 
@@ -1152,7 +1273,7 @@ If `sab_nodiskqualification` is GREEN the collision is unreachable: check, in th
 
 - [ ] **Step 6: Run the battery so far.**
 
-Extend `CONFIGS` with `"ctl_distinctns green -"` and `"ctl_skipidentity green -"` among the greens, and `"witness_collisionreached violation W_CollisionReached"` among the witnesses. Run. Expected: 18 rows, `ALL EXPECTATIONS MET`.
+Extend `CONFIGS` with `"ctl_distinctns green -"` and `"ctl_skipidentity green -"` among the greens, and `"witness_collisionreached violation W_CollisionReached"` among the witnesses. Run. Expected: 19 rows, `ALL EXPECTATIONS MET`.
 
 - [ ] **Step 7: Commit.**
 
@@ -1177,7 +1298,7 @@ git commit -m "ca: tla — cross-mount collision (equal-ns/different-disk) + the
 
 **Files:**
 - Modify: `docs/superpowers/models/CaRelinkReofferCore.tla` (split `RAbort`; add S0/S2 with a landed-`Unresolved` publication; add `NeverPublishedTwice`, `ChangedImpliesFenced` and four witnesses)
-- Create: `..._sab_nofence.cfg`, `..._sab_nofence_changed.cfg`, `..._sab_nopoison.cfg`, `..._sab_nowedge.cfg`, `..._sab_norowexact.cfg`, `..._sab_publishafterconfirm.cfg`, `..._sab_s2bytefetch.cfg`, `..._v12_design_full.cfg`, `..._v12_coldanswer.cfg`, `..._witness_changed.cfg`, `..._witness_unknown.cfg`, `..._witness_budgetunknown.cfg`, `..._witness_landeds2.cfg`
+- Create: `..._sab_nofence.cfg`, `..._sab_nofence_changed.cfg`, `..._sab_nopoison.cfg`, `..._sab_nowedge.cfg`, `..._sab_norowexact.cfg`, `..._sab_s2bytefetch.cfg`, `..._v12_design_full.cfg`, `..._v12_coldanswer.cfg`, `..._witness_changed.cfg`, `..._witness_unknown.cfg`, `..._witness_budgetunknown.cfg`, `..._witness_landeds2.cfg`
 - Modify: `docs/superpowers/models/run_relinkreoffer.sh`
 - Read first: spec §4.2, §4.4, §6.1–§6.4, §12.4.
 
@@ -1343,21 +1464,20 @@ W_ColdRefused == ~sawColdRefused
 W_LandedS2 == ~sawLandedS2
 ```
 
-- [ ] **Step 3: Write the seven must-red configs and run them FIRST.**
+- [ ] **Step 3: Write the six must-red configs and run them FIRST.**
 
-Deltas against Task 1 step 8's block, i.e. `SabotageStaleCache = TRUE` (every retained rule is re-derived against the SHIPPED gate, not against v11's) and everything else honest except the row's own toggle.
+Deltas against Task 1 step 8's block, i.e. `SabotageStaleCache = TRUE` (every retained rule is re-derived against the SHIPPED gate, not against v11's) and everything else honest except the row's own toggle. `_sab_publishafterconfirm` is NOT here — it landed in Task 1, where the invariant it protects is first listed by a green.
 
 | cfg | delta | `INVARIANTS` | one-line intent for the cfg header |
 | --- | --- | --- | --- |
 | `sab_nofence` | `SabotageNoFence = TRUE` | `ConfirmedRelinkNeverDangles` | rule 1, hoisted first, still load-bearing: a deposed instance answers `proven` about a namespace somebody else now writes |
 | `sab_nofence_changed` | `SabotageNoFence = TRUE` | `ChangedImpliesFenced` | the SECOND consequence of the same toggle: a fenced-out mount emits an authoritative `No`, which is what authorizes a same-sender byte fetch |
-| `sab_nopoison` | `SabotageNoPoison = TRUE` | `ConfirmedRelinkNeverDangles` | rule 4's Poisoned arm: after a poisoned apply the lane IS quiescent and the marker is not pending, so only this arm sees the permanently stale row |
+| `sab_nopoison` | `SabotageNoPoison = TRUE` | `ConfirmedRelinkNeverDangles` | rule 4's Poisoned arm: after a poisoned apply the lane IS quiescent and the marker is not pending, so only this arm sees the permanently stale row. **Two routes reach it and both are real — `SenderPoison` (the apply threw) and `WedgeResolveStale` (durable, unrecordable, floor-raised); note which one the trace takes.** |
 | `sab_nowedge` | `SabotageNoWedge = TRUE` | `ConfirmedRelinkNeverDangles` | rule 3, and its counterexample must run through the state `CasRefLedger.cpp:1927-1934` singles out: a Corrupted resolution has cleared the marker and KEPT the wedge, the fence-closing reaction has not run yet, and the foreign occupant that proved exclusivity was breached is free to remove the binding. In that window rule 3 is the only guard. **Check the trace: if it does not contain `WedgeResolveCorrupted`, the red is coming from somewhere else and the sabotage is not testing what it claims.** |
 | `sab_norowexact` | `SabotageNoRowExact = TRUE` | `ConfirmedRelinkNeverDangles` | rule 5's exactness (v11's `_sab_nogate1`, re-derived): presence instead of validator equality is an ABA |
-| `sab_publishafterconfirm` | `SabotagePublishAfterConfirm = TRUE` | `PromotedNeverDangles` | the ORDER is inverted; the guarded theorem stays vacuously satisfied, so the antecedent-free form is what must break. §core-idea survives verbatim and this is its check |
 | `sab_s2bytefetch` | `SabotageS2ByteFetch = TRUE` | `NeverPublishedTwice` | §6.3: S2 is the one state where a byte fetch double-publishes. The necessity half of `UnresolvedPromoteNeverBytes` |
 
-Add all seven to `CONFIGS` in the sabotage block and run. Expected: seven violations, each matching its named invariant. A red on a DIFFERENT invariant is a FAIL per the Global Constraints — investigate the trace, do not relabel the cfg.
+Add all six to `CONFIGS` in the sabotage block and run. Expected: six violations, each matching its named invariant. A red on a DIFFERENT invariant is a FAIL per the Global Constraints — investigate the trace, do not relabel the cfg.
 
 - [ ] **Step 4: Write the two remaining greens.**
 
@@ -1365,14 +1485,14 @@ Add all seven to `CONFIGS` in the sabotage block and run. Expected: seven violat
 
 ```
 \* THE DESIGN, WHOLE.  Two mounts (equal namespace, different disk), the marker armed, published and
-\* cleared, its wedge lifecycle, a tenure that commits several chunks of two kinds, the four-state
-\* receiver with the decoupled answer/identity pair, and v11 rule 3's terms deleted -- every
-\* mechanism switched on at once.  Every other green isolates one thing; this is the only place they
-\* are checked TOGETHER, which is what rules out a property that holds only when its neighbours are
-\* off.
+\* cleared, the full wedge lifecycle including both steps of the stale resolution, a tenure that
+\* commits several chunks of two kinds, the four-state receiver with the decoupled answer/identity
+\* pair, and v11 rule 3's terms deleted -- every mechanism switched on at once.  Every other green
+\* isolates one thing; this is the only place they are checked TOGETHER, which is what rules out a
+\* property that holds only when its neighbours are off.
 ```
 
-`v12_coldanswer` — identical except `SecondMount = FALSE` and `ModelColdTable = TRUE`, same seven invariants. Header: rule 2 is now on the answer path (§4.3's mandatory recovery, §12.4's revisit); this config runs eviction and peer-initiated recovery, and green means the atomic install leaves nothing partial for the gate to read.
+`v12_coldanswer` — identical except `SecondMount = FALSE` and `ModelColdTable = TRUE`, same seven invariants. Header: rule 2 is now on the answer path (§4.3's mandatory recovery, §12.4's revisit); this config runs eviction and peer-initiated recovery, and it is also the only place where the poisoned/floor-reconciled lane has an exit — `EvictTable` then `RecoverForAnswer`, which is the model of "until a recovery re-derives it from the log".
 
 Run. Expected: both green. If `v12_design_full` exceeds ~10 min at `-workers 1`, drop `MaxId` to 5, then `MaxRound` to 4 — and record the bound in RESULTS. Never drop an invariant to make it finish.
 
@@ -1399,6 +1519,7 @@ CONFIGS=(
   "sab_noapplypending        violation  ConfirmedRelinkNeverDangles"
   "sab_noapplypending_window violation  MarkerCoversDurableWindow"
   "sab_relaxedmarker         violation  MarkerSeenMatchesMarker"
+  "sab_publishafterconfirm   violation  PromotedNeverDangles"
   "sab_nofence               violation  ConfirmedRelinkNeverDangles"
   "sab_nofence_changed       violation  ChangedImpliesFenced"
   "sab_nopoison              violation  ConfirmedRelinkNeverDangles"
@@ -1407,7 +1528,6 @@ CONFIGS=(
   "sab_barevalidator         violation  ConfirmedRelinkNeverDangles"
   "sab_nodiskqualification   violation  ConfirmedRelinkNeverDangles"
   "sab_inferanswer           violation  ConfirmedRelinkNeverDangles"
-  "sab_publishafterconfirm   violation  PromotedNeverDangles"
   "sab_s2bytefetch           violation  NeverPublishedTwice"
   "v11_baseline              green      -"
   "ctl_v11nomarker           green      -"
@@ -1441,7 +1561,6 @@ git add docs/superpowers/models/CaRelinkReofferCore.tla \
         docs/superpowers/models/CaRelinkReofferCore_sab_nopoison.cfg \
         docs/superpowers/models/CaRelinkReofferCore_sab_nowedge.cfg \
         docs/superpowers/models/CaRelinkReofferCore_sab_norowexact.cfg \
-        docs/superpowers/models/CaRelinkReofferCore_sab_publishafterconfirm.cfg \
         docs/superpowers/models/CaRelinkReofferCore_sab_s2bytefetch.cfg \
         docs/superpowers/models/CaRelinkReofferCore_v12_design_full.cfg \
         docs/superpowers/models/CaRelinkReofferCore_v12_coldanswer.cfg \
@@ -1475,9 +1594,9 @@ The question: **is seam §8 row S7 — "a reader taking `state_mutex` between th
 
 The answer is settled by the two invariants and two configs the model already carries, and the step's job is to confirm each fact from its log rather than assume it:
 
-1. **The INTERVAL half is asserted.** `MarkerCoversDurableWindow` is green in `v11_baseline`, `sab_stalecache`, `v12_design_full`, `v12_coldanswer`; `_sab_noapplypending_window` breaks it. Confirm both from their logs.
+1. **The INTERVAL half is asserted.** `MarkerCoversDurableWindow` is green in `v11_baseline`, `sab_stalecache`, `v12_design_full`, `v12_coldanswer`; `_sab_noapplypending_window` breaks it. Confirm both from their logs. Confirm also that it holds through both steps of the stale resolution — the greens are the evidence, and `WedgeResolveStale`/`FloorReconcile` are the actions that would break it if either had cleared the marker or the owed apply.
 2. **The OBSERVATION half is asserted too.** `MarkerSeenMatchesMarker` is green in the same greens; `_sab_relaxedmarker` breaks it. Confirm both from their logs. This is the property the seam's mutex placement must DELIVER, stated over the reader-visible value the model carries explicitly.
-3. **`_sab_relaxedmarker` is retained, and the reason it is not duplicate evidence is structural, not empirical.** An earlier draft of this plan proposed discarding it if its counterexample matched `_sab_noapplypending`'s. That rule is unsound twice over and must not be used: (a) the two configs cannot produce identical state sequences, because `sApply` moves to `"pending"` in one and stays `"clean"` in the other by construction; (b) even an identical shortest ACTION trace at these bounds would not establish projection equivalence, nor rule out divergence at greater depth — a shortest counterexample is a fact about one bound, not a theorem about the state spaces. The sound argument is the one available for free: **the two configs are asserted against DIFFERENT invariants** — `ConfirmedRelinkNeverDangles`/`MarkerCoversDurableWindow` versus `MarkerSeenMatchesMarker` — so neither can stand in for the other, and no comparison is needed.
+3. **`_sab_relaxedmarker` is retained, and the reason it is not duplicate evidence is structural, not empirical.** An earlier draft of this plan proposed discarding it if its counterexample matched `_sab_noapplypending`'s. That rule is unsound twice over and must not be used: (a) the two configs cannot produce identical state sequences, because `sApply` moves to `"pending"` in one and stays `"clean"` in the other by construction; (b) even an identical shortest ACTION trace at these bounds would not establish projection equivalence, nor rule out divergence at greater depth — a shortest counterexample is a fact about one bound, not a theorem about the state spaces. The sound argument is the one available for free: **the two configs are asserted against DIFFERENT invariants**, so neither can stand in for the other, and no comparison is needed.
 4. **What remains code-level-only is the MECHANISM, not the property.** No untimed model can check a memory model. Seam §6's mutual-exclusion argument (arm under `state_mutex`, read under `state_mutex`, lock at the CALL SITE because `forceWedgeForTest` at `:1396` already holds it) plus seam §8 row S7's test are what establish that `sApplySeen = sApply` holds in the code. The model states the obligation; the seam discharges it.
 
 - [ ] **Step 2: Write the verdict into the module, beside the two marker invariants.**
@@ -1513,9 +1632,9 @@ Append one section, `## The v12 refinement, and why this file's _sab_stalecache 
 
 1. `CaRelinkConfirmCore.tla` and its twelve configs are UNCHANGED and will stay unchanged — §12's disposition: the model is the historical witness of the v11 protocol, and rewriting it would destroy the record that v11's rules were each load-bearing.
 2. The redesign's model is `CaRelinkReofferCore.tla`; its results live in `2026-07-29-relink-seam-tla-RESULTS.md`.
-3. **The flip, as a side-by-side line, because it is the whole evidence:** `CaRelinkConfirmCore_sab_stalecache` = **RED** (`ConfirmedRelinkNeverDangles` violated) is the v11 record; `CaRelinkReofferCore_sab_stalecache` = **GREEN** is the v12 result. The difference between the two runs is one thing — the second model represents the apply-pending marker, armed strictly before the durable PUT, published to a `state_mutex` reader, cleared atomically with the install, and retained across a wedge exactly as `CasRefLedger.cpp` retains it.
+3. **The flip, as a side-by-side line, because it is the whole evidence:** `CaRelinkConfirmCore_sab_stalecache` = **RED** (`ConfirmedRelinkNeverDangles` violated) is the v11 record; `CaRelinkReofferCore_sab_stalecache` = **GREEN** is the v12 result. The difference between the two runs is one thing — the second model represents the apply-pending marker: armed strictly before the durable PUT, published to a `state_mutex` reader, cleared atomically with the install, retained across an unresolved PUT, and cleared on exactly the one wedge arm where `CasRefLedger.cpp` clears it.
 4. `_sab_holeylist` keeps its meaning unchanged: the historical witness of BACKLOG `{#list-as-journal-dataloss-2026-07-25}`. §12.1 reassigns dangle-freedom's listing half to the v9 chain models, which is why `CaRelinkReofferCore` has no `MaxHoles` dial and names `CommittedEdgesAreGcVisible` instead.
-5. One sentence naming what the refinement found that the v11 model could not have: the wedge's marker retention (`CasRefLedger.cpp:3134-3145`) and its single clean-marker exception (`:1927-1934`) are states v11 had no variable for, and `_sab_nowedge`'s counterexample now runs through the second of them.
+5. One sentence naming what the refinement found that the v11 model could not have: the wedge's marker retention (`:3134-3145`), its single clean-marker exception (`:1927-1934`), and the two-step stale resolution (`:1936-1950` then `:1758-1766`, where the wedge is retired without installing and `Poisoned` survives) are states v11 had no variable for. `_sab_nowedge`'s counterexample runs through the second of them.
 
 - [ ] **Step 4: Verify the v11 family is untouched.**
 
@@ -1537,6 +1656,7 @@ RUN_ID="gate-final-$(date +%Y%m%dT%H%M%S)" bash ./run_relinkreoffer.sh \
 Expected: 31 rows, `ALL EXPECTATIONS MET`, exit 0. The first line prints the `RUN_ID` and the log directory — **record both; Task 5 cites that directory per row.** Keep `tmp/relinkreoffer_battery_final.txt` verbatim.
 
 Then confirm the v11 battery still behaves as recorded, since the flip is a claim about a PAIR of runs:
+
 ```bash
 cd /home/mfilimonov/workspace/ClickHouse/master/docs/superpowers/models
 ./run_relinkconfirm.sh CaRelinkConfirmCore_sab_stalecache
@@ -1649,18 +1769,53 @@ Follow the v9 phase file's honesty convention — break the reds down by class i
 
 - **§12.3 — the required refinement.** The 2×2 plus the two marker-shape reds; cross-reference §the-flip.
 - **§12.5 i — cross-mount collision.** `_sab_barevalidator` RED, `_sab_nodiskqualification` RED, `_ctl_distinctns` GREEN, `_witness_collisionreached` reachable. State the control's meaning in one sentence: the red next door is caused by the EQUAL-namespace configuration, which is what §12.5 i's "specifically" demands, and a model that ran only distinct namespaces would pass while the wire is unsafe.
-- **§12.5 ii — chunk-boundary tenure.** `MaxChunks = 2`, the `"tracked"`/`"unrelated"` chunk kinds, `_witness_midtenure` reachable at `proven /\ sLeader /\ sTenureChunks >= 1`, and the sentence that matters: without it, `_sab_stalecache`'s green would be an artefact of one transaction per tenure. Record that `sTenureChunks` resets on every tenure close, so the witness proves *same tenure* rather than *two chunks somewhere*.
-- **§12.4 — re-derivation.** Fence hoisted first (`ChangedImpliesFenced`, `_sab_nofence_changed` RED); `No` given its own successor (`RChangedThenBytes`) and shown unable to publish twice (`NeverPublishedTwice`, `_sab_s2bytefetch` RED); the answer/identity pair decoupled (`_sab_inferanswer` RED, `_ctl_skipidentity` GREEN-as-result); the landed-`Unresolved` publication brought inside both theorems via `rCommitted` (`_witness_landeds2` reachable); the two v11 witnesses re-derived (`_witness_changed`, `_witness_unknown`) with one line each on why the state is no longer the same one; rule 2 revisited (`_v12_coldanswer` green, `_witness_budgetunknown` reachable).
+- **§12.5 ii — chunk-boundary tenure.** `MaxChunks = 2`, the `"tracked"`/`"unrelated"` chunk kinds, `_witness_midtenure` reachable at `proven /\ sLeader /\ sTenureChunks >= 1`, and the sentence that matters: without it, `_sab_stalecache`'s green would be an artefact of one transaction per tenure. Record that `sTenureChunks` resets on every tenure close — including the poison and both unresolved arms — so the witness proves *same tenure* rather than *two chunks somewhere*.
+- **§12.4 — re-derivation.** Fence hoisted first (`ChangedImpliesFenced`, `_sab_nofence_changed` RED); `No` given its own successor (`RChangedThenBytes`) and shown unable to publish twice (`NeverPublishedTwice`, `_sab_s2bytefetch` RED); the answer/identity pair decoupled (`_sab_inferanswer` RED, `_ctl_skipidentity` GREEN-as-result); the landed-`Unresolved` publication brought inside both theorems via `rCommitted` (`_witness_landeds2` reachable); the two v11 witnesses re-derived (`_witness_changed`, `_witness_unknown`) with one line each on why the state is no longer the same one; rule 2 revisited (`_v12_coldanswer` green, `_witness_budgetunknown` reachable); the publish-then-confirm order still load-bearing (`_sab_publishafterconfirm` RED, and one line on why it sits in Task 1 rather than Task 3).
 
-- [ ] **Step 6: Write the assumptions, seam and scope sections.**
+- [ ] **Step 6: Write the assumptions and seam sections.**
 
-- **The three named assumptions**, each with its discharge mechanism and the sentence that makes weakening it visible: `CommittedEdgesAreGcVisible` (v9 chain models — name the exact configs), `UnresolvedPromoteNeverBytes` (spec §11 row 9, with `_sab_s2bytefetch` as the in-model necessity half), `FreshCertifiedResponse` (rows 15a/15b for the offer-confusion half, which IS partly modelled via `OfferIdentity` and `_sab_inferanswer`; row 16 for the replay half, which is not). State plainly that if any of those rows is weakened, the assumption goes with it — which is the point of naming them.
+- **The three named assumptions**, each with its discharge mechanism and the sentence that makes weakening it visible: `CommittedEdgesAreGcVisible` (v9 chain models — name the exact configs); `UnresolvedPromoteNeverBytes` (spec §11 row 9, with `_sab_s2bytefetch` as the in-model necessity half); `FreshCertifiedResponse` (rows 15a/15b for the offer-confusion half, which IS partly modelled via `OfferIdentity` and `_sab_inferanswer`; row 16 for the replay half, which is not). State plainly that if any of those rows is weakened, the assumption goes with it — which is the point of naming them.
 - **Seam §8 row S7**, with Task 4's ruling: both halves asserted, by `MarkerCoversDurableWindow` and `MarkerSeenMatchesMarker`; the mechanism (mutex-supplied happens-before) stays code-level because no untimed model checks a memory model; the two configs are non-duplicate structurally, and the trace-comparison rule an earlier draft proposed is recorded as rejected-as-unsound with its one-line reason.
 - **What the seam contributes and what it does not:** §3's emission point and §4's `attempted` mark are accounting with no safety content to gate (seam §3.3, §9 point 5), discharged by seam §8 rows S1–S6c and relink rows 19–20.
-- **The wedge lifecycle as a modelling result in its own right.** One short subsection: the v11 model had no marker variable, so it could not represent either the `Unresolved` retention (`CasRefLedger.cpp:3134-3145`) or its single clean-marker exception (`:1927-1934`) and the separate fence-closing reaction (`:2050-2060`). `_sab_nowedge`'s counterexample runs through the exception, and `_witness_corruptwindow` proves that window reachable — so rule 3's retention is justified by the state the code singles out rather than by a state the model invented. Record that an earlier draft cleared the marker on the wedge path, which would have made `_sab_nowedge` red for an unreachable reason, and that `MarkerCoversDurableWindow` consequently needs **no** wedge or fence exclusion once its subject is this mount's own owed apply.
-- **What this model dropped from v11 and why:** the `MaxHoles` / `NsNoise` holey-list machinery (§12.1 reassignment), with `_sab_holeylist` named as where the finding still lives.
 
-- [ ] **Step 7: Verify the verdict line is unique, then commit.**
+- [ ] **Step 7: Write the structural-exclusions section.**
+
+This section exists because the Global Constraints require a guard that makes a state unrepresentable to be *recorded* rather than asserted — otherwise a reader finds a guard with no evidence beside it and cannot tell whether it was checked or forgotten.
+
+```markdown
+## Structural exclusions — guards, not invariants {#structural-exclusions}
+
+Three hazards are excluded by an action guard rather than by an invariant. Each is listed with the
+code fact that licenses it and with the reason an invariant would have been worse than useless: an
+assertion over a state the transition relation cannot enter is green for free, which is the opposite
+of evidence.
+
+| Excluded state | Guard | Code fact |
+|---|---|---|
+| A floor-covered wedge is re-applied | `WedgeResolveInstall`'s `~sFloorCovers[m]` | `durableFloorCovers` is tested FIRST (`CasRefLedger.cpp:1758`), before a candidate is built, so a floor-covered wedge can only take the `FloorReconciled` path. Re-applying an id AT the floor is what `applyTxnInPlace` refuses as non-contiguous — "every later flush would throw in the same place and the lane would stay wedged for the runtime's life" |
+| A poisoned cache is advanced to clean | `WedgeResolveInstall`'s `sApply[m] # "poisoned"` | a `Poisoned` table is by definition missing a durable transaction; only a recovery may re-derive it (`:1758-1766`'s log line). An earlier draft of this model guarded the action on `sWedge /\ sApplyOwed` alone, which left this transition enabled immediately after `WedgeResolveStale` |
+| A durable byte with no prior arm | `SenderDurable`'s `sArmed[m]` | seam §6 / `:2808`: the arm is "the last statement that still runs while nothing of this transaction can possibly be durable". Making the ordering a guard rather than an invariant is what lets `SabotageNoApplyPending` remove the marker's VALUE without removing the ORDERING, which is what "drop the marker" means |
+
+Two arms of `resolveWedgeOnce` are likewise modelled as NON-transitions, and for the same kind of
+reason: `NoWedge` (`:1745-1746`) is the absence of `sWedge`, and every inert `StillWedged` reason
+(`:2062-2128`, each of which says "the result is inert and the lane keeps whatever wedge it has") is
+`UNCHANGED vars`, which `NoOp` already supplies. They are delay, not state change. The full
+outcome→action mapping is in the module, above the wedge actions.
+```
+
+- [ ] **Step 8: Write the "what this model dropped, and what it found" section.**
+
+Two short subsections.
+
+**Dropped from v11, deliberately:** the `MaxHoles` / `NsNoise` holey-list machinery, per §12.1's reassignment, with `_sab_holeylist` named as where that finding still lives and `CommittedEdgesAreGcVisible` named as what replaced it here.
+
+**Found by the refinement, and not findable in v11:** the wedge lifecycle as a modelling result in its own right. The v11 model had no marker variable, so it could not represent the `Unresolved` retention (`:3134-3145`), the single clean-marker exception (`:1927-1934`) with its separate fence-closing reaction (`:2050-2060`), or the two-step stale resolution (`:1936-1950` then `:1758-1766`). Record all three of these plainly, because each was a real defect in a draft of this model and the record is what stops the next draft repeating it:
+
+1. A draft cleared the marker on the unresolved PUT — which would have made `_sab_nowedge` red for a state the code cannot reach.
+2. A later draft omitted `FloorReconcile` entirely and left `WedgeResolveInstall` enabled on `sWedge /\ sApplyOwed`, admitting a poisoned-to-clean install.
+3. Both drafts carried a blanket `~sWedge` exclusion in `MarkerCoversDurableWindow`, which was hiding (1) rather than describing the code. Once the invariant's subject became this mount's own owed apply, **no exclusion is needed at all** — not for the wedge and not for the fence — and it holds through both steps of the stale resolution.
+
+- [ ] **Step 9: Verify the verdict line is unique, then commit.**
 
 ```bash
 cd /home/mfilimonov/workspace/ClickHouse/master
@@ -1675,28 +1830,29 @@ git commit -m "ca: tla — relink/seam gate RESULTS: RELINK TLA GATE verdict + t
 
 ---
 
-## Self-review notes (done at write time, revised after codex round 1)
+## Self-review notes (done at write time; revised after codex rounds 1 and 2)
 
-**Round-1 findings and where each is now addressed.**
+**Round-2 findings and where each is now addressed.**
 
 | # | Finding | Resolution |
 | --- | --- | --- |
-| B1 | Wedge transitions contradicted `commitRefChunk`: the model cleared the marker on an unresolved PUT | Task 1 step 4 rewritten against three cited sites. `SenderUnresolvedLanded`/`NotLanded` leave `sApply` at `"pending"` by contract; the four resolution outcomes (`Install`, `Rejected`, `Corrupted`, `Stale`) are separate actions; `CorruptFenceReaction` is separate from `WedgeResolveCorrupted`, which is what creates the fence-live/marker-clean/wedged window. `_sab_nowedge` now has that window as its counterexample and `_witness_corruptwindow` proves it reachable. `MarkerCoversDurableWindow`'s blanket wedge exclusion is **deleted**, replaced by a correct subject (`sApplyOwed` — this mount's own owed apply), which needs no exclusion at all. |
-| B2 | The second chunk of one tenure was unreachable, and `sChunks` never reset | `SenderAdmit` gains a `ChunkKinds` parameter; an `"unrelated"` chunk requires no tracked binding and leaves it alone. `sTenureChunks` counts per tenure and is reset by `SenderCloseTenure`, `SenderPoison` and both unresolved arms. The witness is strengthened to `proven /\ sLeader /\ sTenureChunks >= 1` and recorded in `RConfirm`, so it proves the answer is *given* in that state. `sLeader` still survives `SenderInstall` — confirmed correct by the review. |
-| M3 | A landed S2 publication escaped both dangle invariants | `rCommitted` is set by `RPromoteCommit` **and** `S2ResolveLanded`; both theorems quantify over it instead of `rState = "S3"`. `_witness_landeds2` proves the trace reachable, so the strengthening is not vacuous. |
-| M4 | Certified answer conflated with the returned validator | Three separate objects now: `SenderAnswer(m)`, `SenderIdentity(m)`, and `RAccepts(ans, idn)` as the receiver's conjunction. `OfferIdentity(m)` models §4.1.3's ungated offer response as an always-available transport outcome. `_sab_inferanswer` is must-red on it. `_ctl_skipidentity` is a green-as-result that measures why the other half is `FreshCertifiedResponse`'s scope rather than asserting it — and the assumption's text now states the confusion/replay split exactly. |
-| M5 | The "same trace ⇒ discard" rule for S7 was unsound | Replaced entirely. `sApplySeen` is an explicit reader-visible variable; `MarkerSeenMatchesMarker` asserts the observation half; `_sab_relaxedmarker` is **retained** and the non-duplication argument is structural (different invariants), not empirical. The unsound rule is recorded as rejected, with its reason, in both the module and RESULTS. Accounting updated to 31 configs throughout. |
-| m6 | `TypeOK` incomplete, and never seen red | `TypeOK` now covers every variable including all sender Boolean maps, all nine history flags, `rState`, `rDurableBefore`, `rAnsweredFenced`, `rUnresolved` and `rIdentity`. `SabotageTypeProbe` + `_sab_typeprobe` is its negative control, so no exemption clause is needed — the Global Constraints instead say explicitly that `TypeOK` is *not* exempt. |
-| m7 | Metadirs and logs unique per config, not per invocation | The runner takes a `RUN_ID`, puts metadirs under `tmp/tlc-meta-relinkreoffer/$RUN_ID/<cfg>` and logs under `tmp/tlc-runs/relinkreoffer/$RUN_ID/`, holds an `flock` so two batteries cannot interleave at all, and keeps stable symlinks for interactive use only. Task 4's wildcard `rm -rf` is gone — per-run paths make cleanliness structural. RESULTS cites per-run paths. |
-| Notes 8–11 | Confirmations | Kept as designed: `_ctl_v11nomarker` green and non-vacuous; `MaxId = 6` / `MaxRound = 5` / `MaxChunks = 2` sufficient (the corrected two-chunk witness needs ≈8 transitions); Task 2's symmetric field-dropping and restricted `_ctl_distinctns` claim unchanged; the publication counter's semantics unchanged — only its coverage of landed S2 was the defect, and M3 fixes that. |
+| B1 (narrowed, was NOT-ADDRESSED) | The stale-state path was modelled as a single step, and `WedgeResolveInstall` stayed enabled on `sWedge /\ sApplyOwed` alone, admitting a poisoned-to-clean install | Task 1 step 4 now models the **two-step** stale resolution against the code: `WedgeResolveStale` (`:1936-1950`) raises the floor via a new `sFloorCovers` variable, poisons, and RETAINS the wedge; `FloorReconcile` (`:1758-1766`) retires the wedge, installs NOTHING, and retains both `Poisoned` and `sApplyOwed` — because the `clearApplyPending` there is documented as a no-op on a Poisoned table. `WedgeResolveInstall` is guarded by `~sFloorCovers[m]` AND `sApply[m] # "poisoned"`, recorded as structural exclusions in RESULTS step 7 rather than as invariants. `WedgeResolveRejected` and `WedgeResolveCorrupted` gain `~sFloorCovers[m]`, since the floor test runs first. An **outcome→action mapping block** now sits above the wedge actions with one line per arm of `resolveWedgeOnce`, including the two arms that map to no transition. `EvictTable` relaxed to `sApply # "pending"` and `RecoverForAnswer` extended to clear the marker, the owed apply and the floor record, so the poisoned lane has the exit the code describes ("until a recovery re-derives it from the log") instead of being a dead end. |
+| MAJOR (new) | `PromotedNeverDangles` listed by Task 1's and Task 2's greens while its red first existed in Task 3 | `_sab_publishafterconfirm` **moved into Task 1** (config count 12→13 there, 13→12 in Task 3; total unchanged at 31). Reason stated in the cfg header and in Global Constraints: dropping the invariant from the earlier greens instead would run the 2×2 gate without the antecedent-free theorem, weakening the very cell that decides the design. The constraint itself is now worded as "in the same task, not a later one", with the concrete rule "no green may list an invariant whose `_sab_*` config does not yet exist". |
+| m1 | Task 2's prose said all three must-red configs use `SecondMount = TRUE`, contradicting `_sab_inferanswer` | Task 2 step 2's preamble now states the split and why: the two validator sabotages need the second mount because a cross-mount collision is what they are about; `_sab_inferanswer` needs none, because an ungated offer response is a single-mount hazard. Its cfg header says so too. |
+| m2 | The `_sab_noapplypending` trace suffix was written `GFold → GSettle×3` | Corrected to `(GFold → GSettle)×3` in Task 1 step 9, with the reason inline: consecutive settles are disabled by `gcPhase`, so each graduation phase costs a fold and a settle. |
+| m3 | Step 12 said "twelve sender-lane actions" | Corrected to **eighteen**, enumerated by name, with the six review-caught ones listed as individual verification items and a `grep -c 'sFloorCovers'` check added for the new variable's `UNCHANGED` coverage. |
 
-**Spec coverage.** §12.1 (listing reassigned — no `MaxHoles` dial; `CommittedEdgesAreGcVisible` named instead). §12.2 (that assumption named with discharge). §12.3 (the 2×2 plus the two marker-shape reds — the gate). §12.4 (fence-first, authoritative `No`, no double publish, landed-S2 coverage, witnesses re-derived, rule 2 revisited). §12.5 i (equal-namespace/different-disk mounts, both named reds, plus the control the "specifically" clause implies). §12.5 ii (chunk kinds, per-tenure counting, strengthened witness). §12.5 iii (`UnresolvedPromoteNeverBytes` named, with `_sab_s2bytefetch` as the necessity half). §12's `FreshCertifiedResponse` (named, with its modelled and unmodelled halves stated). Seam §8 S7 (both halves asserted; mechanism code-level). Seam §3/§4 (out of scope with the reason). §12's disposition ruling (v11 read-only, enforced by a `git status` check).
+**Round-1 findings, all confirmed addressed by round 2 and unchanged in v3:** B2 (chunk kinds, per-tenure counting, strengthened witness — verified by hand-traced minimal trace), M3 (`rCommitted` covering landed S2), M4 (answer/identity decoupled; `_sab_inferanswer` red, `_ctl_skipidentity` green-as-result), M5 (`sApplySeen`, `MarkerSeenMatchesMarker`, `_sab_relaxedmarker` retained on a structural argument), m6 (`TypeOK` complete + `_sab_typeprobe`), m7 (`RUN_ID`, per-run metadirs and logs, `flock`, per-run paths in RESULTS).
 
-**Three places this plan goes beyond the spec, deliberately, and says so.** (1) `_ctl_v11nomarker`, `_ctl_distinctns` and `_ctl_skipidentity` — controls the spec does not name, because a flip with no control is a coincidence and a green with no scoping statement is a silent gap. (2) `_sab_s2bytefetch` — the spec ASSUMES `UnresolvedPromoteNeverBytes`; this plan keeps the assumption assumed and models only its consequence. (3) The wedge lifecycle — the spec's §12 does not ask for it, but modelling rule 3 without it produced a sabotage that was red for an unreachable state, which is worse than no sabotage.
+**Deliberately byte-stable in v3.** The 22-constant block, the base cfg block, the validator and answer/identity section (step 5), the receiver, GC and witness blocks, the runner's isolation and marker code, and Tasks 4–5's structure are unchanged from v2 except where a finding required an edit. The only additions to previously-reviewed text are `sFloorCovers` in the variable list, `senderVars`, `Init`, `TypeOK` and every action's `UNCHANGED`, plus the three new wedge actions in `Next`.
 
-**Placeholder scan.** Every cfg's full constants block appears once (Task 1 step 8); every later cfg is a delta with exact toggles and an exact `INVARIANTS` list. Every module fragment is real TLA+. Nothing is deferred: the S7 question is answered on evidence the battery already produces, and the one previously open decision rule has been removed as unsound rather than left branching.
+**Spec coverage.** §12.1 (listing reassigned — no `MaxHoles` dial; `CommittedEdgesAreGcVisible` named instead). §12.2 (that assumption named with discharge). §12.3 (the 2×2 plus the two marker-shape reds — the gate). §12.4 (fence-first, authoritative `No`, no double publish, landed-S2 coverage, publish-then-confirm order, witnesses re-derived, rule 2 revisited). §12.5 i (equal-namespace/different-disk mounts, both named reds, plus the control the "specifically" clause implies). §12.5 ii (chunk kinds, per-tenure counting, strengthened witness). §12.5 iii (`UnresolvedPromoteNeverBytes` named, with `_sab_s2bytefetch` as the necessity half). §12's `FreshCertifiedResponse` (named, with its modelled and unmodelled halves stated). Seam §8 S7 (both halves asserted; mechanism code-level). Seam §3/§4 (out of scope with the reason). §12's disposition ruling (v11 read-only, enforced by a `git status` check).
 
-**Type consistency.** `sApply` and `sApplySeen` share the domain `ApplyStates`; the gate reads `sApplySeen`, the interval invariant reads `sApply`, and only `SenderArm` may separate them. `sApplyOwed` is the sole subject of `MarkerCoversDurableWindow` and is written by exactly four actions (`SenderDurable`, `SenderUnresolvedLanded` set it; `SenderInstall`, `WedgeResolveInstall` clear it). `rCommitted` is written by exactly two (`RPromoteCommit`, `S2ResolveLanded`) and is the antecedent of both theorems. `rAccepted` — not `rAnswer = "proven"` — is the theorem's certificate antecedent, so a sabotage that makes the receiver accept the wrong thing cannot escape by never producing the word `proven`. `rAnswer`'s domain includes `Absent` for the offer-response arm, and `TypeOK` lists it. Every `rState` value used in Tasks 1 and 3 appears in `TypeOK`'s enumeration.
+**Three places this plan goes beyond the spec, deliberately, and says so.** (1) `_ctl_v11nomarker`, `_ctl_distinctns` and `_ctl_skipidentity` — controls the spec does not name, because a flip with no control is a coincidence and a green with no scoping statement is a silent gap. (2) `_sab_s2bytefetch` — the spec ASSUMES `UnresolvedPromoteNeverBytes`; this plan keeps the assumption assumed and models only its consequence. (3) The wedge lifecycle in full — §12 does not ask for it, but two drafts proved that modelling rule 3 without it produces a sabotage that is red for an unreachable state, which is worse than no sabotage.
+
+**Placeholder scan.** Every cfg's full constants block appears once (Task 1 step 8); every later cfg is a delta with exact toggles and an exact `INVARIANTS` list. Every module fragment is real TLA+. Nothing is deferred: the S7 question is answered on evidence the battery already produces, and the one previously open decision rule was removed as unsound rather than left branching.
+
+**Type consistency.** `sApply` and `sApplySeen` share the domain `ApplyStates`; the gate reads `sApplySeen`, the interval invariant reads `sApply`, and only `SenderArm` may separate them. `sApplyOwed` is the sole subject of `MarkerCoversDurableWindow` and is written by exactly four actions (`SenderDurable` and `SenderUnresolvedLanded` set it; `SenderInstall`, `WedgeResolveInstall` clear it) plus `RecoverForAnswer`, which is the poisoned lane's only exit. `sFloorCovers` is written by exactly two (`WedgeResolveStale` sets it, `RecoverForAnswer` clears it) and read as a guard by four. `rCommitted` is written by exactly two (`RPromoteCommit`, `S2ResolveLanded`) and is the antecedent of both theorems. `rAccepted` — not `rAnswer = "proven"` — is the theorem's certificate antecedent, so a sabotage that makes the receiver accept the wrong thing cannot escape by never producing the word `proven`. `rAnswer`'s domain includes `Absent` for the offer-response arm, and `TypeOK` lists it. Every `rState` value used in Tasks 1 and 3 appears in `TypeOK`'s enumeration.
 
 ### Critical Files for Implementation
 
