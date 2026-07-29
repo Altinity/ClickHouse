@@ -1807,3 +1807,6 @@ ACK). Quarantined STALE t13_*.log files from an earlier session into build/stale
 free-function `recoverRefTable` is still LIST-driven (fsck replay blind/false-clean under the
 lie; orphan-sweep deletion premise shares it). BACKLOG'd as `[RECOVER-REF-TABLE-LIST-RESIDUAL]`,
 a named 7b precondition. Arithmetic pass unaffected — T7 holds. Revert proof next.
+**2026-07-29 08:40 local** — watchdog: T13 deep in flight — new suite green (SUITE_EXIT=0),
+full CA gate GREEN (GATE_EXIT=0, 242 suites), scratch-worktree revert build running (1.4MB
+log, live ninja) + main binary rebuild for the s3 lanes. Nothing wedged.
