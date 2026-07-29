@@ -2720,3 +2720,37 @@ Worth recording separately, because it is the interesting half: faced with mass 
 path returned `UNCERTAIN (retry budget exhausted)` to the client and **wedged the affected ref lanes rather
 than guessing**. Both lanes later unwedged. No data was lost and nothing was silently dropped. That is the
 fail-closed design behaving correctly under a fault class the card was not even aiming at.
+
+## Environment: two non-CAS reds that block an UNFILTERED `unit_tests_dbms` run (2026-07-29) {#unfiltered-unit-test-env-reds}
+
+Neither is ours and neither affects the CA gate, which is filtered. Both were hit while running the
+convergence's ASan gate and are recorded so the next person does not re-diagnose them.
+
+**1. `contrib/silk` fiber-scheduler assertion.** `SilkFiberSocketTest/1` (the `SecurePolicy`
+instantiation) aborts the whole binary with
+`contrib/silk/src/fibers/fiber.cpp:1010 assertion failed: !scheduler`. Proven CAS-independent: it
+reproduces with
+
+```
+<build>/src/unit_tests_dbms --gtest_filter='SilkFiberSocketTest*'
+```
+
+i.e. with no CAS code executing at all, and `contrib/silk` was last touched by a submodule bump long
+before this branch. Handling: exclude it from unfiltered runs
+(`--gtest_filter='-SilkFiberSocketTest/1.*'`), which is how the convergence's whole-binary ASan pass
+was obtained. Upstream-contrib issue; not on the CAS backlog to FIX, only to route around.
+
+**2. Root-owned `./logs` in the repository root.** `CoordinationTest/0.TestSummingRaft1` refuses to
+start (`Path ./logs already exists, remove it to run test`) and then terminates the binary when its
+own `remove_all` throws `Directory not empty`. The directory is root-owned, dated 2026-07-03, from a
+docker run, and untracked — **it needs the user's `sudo` to remove; do not attempt it from an agent
+session.** Until then, run unfiltered unit tests from a scratch working directory rather than the
+repository root. Filtered CA gates are unaffected (they never reach that test).
+
+**Log-reading trap in the same runs.** An unfiltered `unit_tests_dbms` log contains embedded NUL
+bytes AND can lose the head of its own redirected stdout (gtest's opening banner and thousands of
+early `[ OK ]` lines simply absent from a completed log). Two consequences: always `grep -a`, and
+never gate a waiter on `until grep -q "^MARKER=" "$log"` — plain `grep -q` returns 1 on such a file
+where `grep -aq` returns 0, so the waiter hangs forever. Write completion markers to a separate small
+text file, and count "did suite X run" DURING the run rather than from the finished file. The
+trailing gtest SUMMARY block always survives, so pass/fail totals stay trustworthy.
