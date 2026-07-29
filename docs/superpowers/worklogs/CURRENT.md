@@ -1906,3 +1906,7 @@ Product finding BACKLOG'd: ca-fsck DNF at 29GiB (EXIT=159 @731s, empty) — [FSC
 T15 red build done (10:55) + red markers landing (bounded_walk 10:58, liar/holdgrammar 11:00);
 a14 in Slot A running the adapted-lane clean pass (shared_pool 10:59, drop_pool_member
 started). Nothing wedged.
+**2026-07-29 11:1x local** — T15 code-complete in its worktree (a974c663d2d): 7/8 red incl.
+the measured chase (46 folded vs 6 planned + frontier PROVEN with a record above the tail);
+patched walk stops at tail, claims no proof. Gate build embargoed until its slot. Report
+copied to shared SDD.
