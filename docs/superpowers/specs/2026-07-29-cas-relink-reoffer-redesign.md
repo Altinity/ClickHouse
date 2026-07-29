@@ -850,8 +850,9 @@ released. Reached by: no `content_addressed_identity` on the offer (a peer that 
 relink cookie value, a reservation that landed outside the advertised pool, an undecodable
 manifest, the retryable staging class (`CaRelinkPrepare::MechanismFallbackAllowed` — body-absent
 precommit, precommit no longer the live owner, ref conflict), **and a `promote` that returned
-`CaRelinkPromote::MechanismFallbackAllowed`** (§6.2), which is the one entry that arrives from
-downstream rather than upstream.
+`CaRelinkPromote::MechanismFallbackAllowed` WITH its release completed** (§6.2) — the one entry
+that arrives from downstream rather than upstream, and the one that needs a guard: without the
+`isTerminal` check it would also admit the case where nothing was released, which is S0′ (§6.2.1).
 
 **Action:** return `nullptr`; the caller byte-fetches from the same sender, with the recursion
 brake (`allow_ca_relink=false`) set.
@@ -860,6 +861,8 @@ brake (`allow_ca_relink=false`) set.
 - *No double publish?* No — nothing was staged, so there is nothing to promote. For the staging
   class specifically: a precommit is not a committed ref, and a later byte fetch publishes the
   same ref name over it without conflict.
+- *No retention leak?* None — by this state's DEFINITION nothing durable remains, which is exactly
+  what the `isTerminal` guard on the entry above is there to make true rather than assumed.
 
 ### 6.2 S1 — STAGED {#s1-staged}
 
