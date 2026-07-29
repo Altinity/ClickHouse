@@ -1993,3 +1993,8 @@ two siblings: reclaimable_drained narrowed, S30 fanout SPLIT w/ CasRootGet 18->8
 — W3 open: product-recreation works, servers dead on /ping post-restart (RCA continues w/
 docker-root log read; may be a REAL product defect -> row-14 flips to measured red). Verdict
 ruled: PENDING (T15 + row 14 W3). a16 slot opened. events-omits-zeros trap on record.
+**2026-07-29 14:5x local** — W3 ANSWERED (668 bootstrap-refusal over residual prefix =
+fail-close one layer EARLIER than task-6 predicted; causation proven by single-object
+removal). 4/4 scenarios PASS; verdict = PENDING (T15 re-validation), single gate row 12c.
+T14 task review DISPATCHED (81 commits, 404KB package). Predown wiring flip ordered before
+the re-validation soak. a16 RED-1 build running.
