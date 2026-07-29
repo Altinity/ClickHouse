@@ -7,7 +7,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcPhaseTimer.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcShardPlan.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCkpt.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCkptFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.h>
@@ -1087,8 +1087,8 @@ bool Gc::foldManifestEdges(const ManifestId & id, int sign, std::vector<BlobDelt
     return true;
 }
 
-std::map<String, RefTxnId> Gc::readCheckpointWitnesses(const std::map<String, RefTableListing> & ref_tables,
-                                                       const std::map<String, ShardCoverage> & parent_cursors)
+Gc::CheckpointWitnesses Gc::readCheckpointWitnesses(const std::map<String, RefTableListing> & ref_tables,
+                                                    const std::map<String, ShardCoverage> & parent_cursors)
 {
     /// Read the checkpoint of every namespace `ref_tables` names, PLUS every namespace a HELD row in
     /// `parent_cursors` names. Both are parameters for that reason: the walk visits both sets, and the
@@ -1120,24 +1120,50 @@ std::map<String, RefTxnId> Gc::readCheckpointWitnesses(const std::map<String, Re
         witness_namespaces.insert(known_ns.string());
     }
 
-    std::map<String, RefTxnId> witnesses;
+    CheckpointWitnesses out;
     for (const String & ns_str : witness_namespaces)
     {
-        const std::optional<CkptSample> sample = readCkpt(backend, layout, RootNamespace{ns_str});
+        const RootNamespace ns{ns_str};
+        const String ckpt_key = layout.refCkptKey(ns);
+        /// THE GET AND THE DECODE ARE SPLIT HERE, rather than taken together through `readCkpt`, so the
+        /// catch below can scope to the DECODE ALONE. Wrapping the read too would turn a transport
+        /// failure -- which says nothing about this object and everything about the round's ability to
+        /// read anything -- into a per-namespace hold, silently narrowing a pool-wide outage to one
+        /// namespace. A backend throw still propagates and fails the round, exactly as it always did.
+        const std::optional<GetResult> got = backend.get(ckpt_key);
         /// ABSENT IS NORMAL AND IS NOT A WITNESS: a namespace has no `_ckpt` until its first snapshot
         /// publication commits, and one that 404s mid-round is a namespace being reclaimed. Neither says
         /// anything about which ids exist, so neither may hold the walk -- and neither may throw
         /// (a GC fold never fails a round on a 404).
-        if (!sample)
+        if (!got)
             continue;
-        /// A checkpoint without `checkpoint_snapshot_id` is likewise silent rather than empty: the object
-        /// exists because some OTHER field (`life_epoch`, `last_epoch_seal`) was published into it first.
-        /// An undecodable body, by contrast, already threw inside `readCkpt` -- this object gates
-        /// destructive cleanup, so "cannot read it" must fail the round closed, never degrade to no witness.
-        if (sample->ckpt.checkpoint_snapshot_id)
-            witnesses.emplace(ns_str, *sample->ckpt.checkpoint_snapshot_id);
+
+        RefCkpt ckpt;
+        try
+        {
+            /// Materialized read, then decode (`readCkpt`'s rule): the object is MUTABLE, so the body
+            /// must be fixed before it is parsed.
+            ckpt = decodeRefCkpt(got->bytes);
+        }
+        catch (const Exception & e)
+        {
+            /// PER-NAMESPACE, NEVER ROUND-WIDE (spec §5: every per-namespace failure is a clamp or a
+            /// hold). This object belongs to exactly one namespace, so it can never be grounds for
+            /// refusing to fold another one -- and refusing the whole round is what a single unreadable
+            /// 4 KiB object used to do, stopping every namespace's cursor, seal and cleanup for as long
+            /// as it stayed unrepaired. It is recorded, named, and left to the walk to hold.
+            ///
+            /// NAME THE OBJECT. The decode's own message says what is wrong with the bytes and nothing
+            /// about WHICH bytes, so without the key an operator cannot find the object to repair.
+            out.undecodable.emplace(ns_str, ckpt_key + ": " + e.message());
+            continue;
+        }
+        /// A checkpoint without `checkpoint_snapshot_id` is silent rather than empty: the object exists
+        /// because some OTHER field (`life_epoch`, `last_epoch_seal`) was published into it first.
+        if (ckpt.checkpoint_snapshot_id)
+            out.witnesses.emplace(ns_str, *ckpt.checkpoint_snapshot_id);
     }
-    return witnesses;
+    return out;
 }
 
 std::optional<std::pair<uint64_t, uint64_t>> Gc::newestFoldSealRef()
@@ -1613,9 +1639,10 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     std::map<String, std::vector<std::pair<RefTxnId, RefTxnId>>> walked_segments;
 
     /// The round's SECOND witness source, independent of the listing -- see `readCheckpointWitnesses`
-    /// for what it decides and why a listing alone cannot decide it.
-    const std::map<String, RefTxnId> checkpoint_witness =
-        readCheckpointWitnesses(ref_tables, parent_cursors);
+    /// for what it decides and why a listing alone cannot decide it. Its `undecodable` half names the
+    /// namespaces whose `_ckpt` is present and unreadable; each of those is HELD below, and only those.
+    const CheckpointWitnesses checkpoints = readCheckpointWitnesses(ref_tables, parent_cursors);
+    const std::map<String, RefTxnId> & checkpoint_witness = checkpoints.witnesses;
 
     /// WHICH NAMESPACES THIS ROUND WALKS -- i.e. THE ROUND'S UNIVERSE, the set the destructive gate owes
     /// a frontier proof for (spec §5; `UniversePolicy` for why Stage A refuses to trust it):
@@ -1872,8 +1899,12 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         ///     record durable after the enumeration is invisible to that round's probes, and this one
         ///     is not (phase-0 model `_fix_ckptwitness`);
         ///   * the CARRIED HOLD's offending position, which is durable proof that a previous round
-        ///     reached that position. Under contiguity everything at or below it must exist, so an
-        ///     absent below it is a gap. This is what makes "retry the exact offending position" work
+        ///     reached that position -- with ONE exception, `CheckpointUndecodable`, the only hold
+        ///     minted before the walk reads anything: its position is the walk's OWN next position, so
+        ///     the strict comparison below never lets it witness against a position this walk goes on
+        ///     to read. It weakens nothing, because a hold that proves nothing also claims nothing.
+        ///     Under contiguity everything at or below a REACHED position must exist, so an absent
+        ///     below it is a gap. This is what makes "retry the exact offending position" work
         ///     for a hold that sits above an epoch boundary: the crossing needs a witness to aim at,
         ///     and without this the walk would stop one position short and never re-read it.
         /// The SMALLEST wins, because the nearest witness is the one that decides same-epoch gap versus
@@ -1963,6 +1994,42 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         }
         else
             expected = RefTxnId{cursor.writer_epoch, cursor.ref_sequence + 1};
+
+        /// AN UNDECODABLE `_ckpt` QUARANTINES ITS OWN NAMESPACE AND NOTHING ELSE (spec §5). The object
+        /// belongs to exactly one namespace and both of its consumers are keyed by that namespace --
+        /// `witnessAbove` above, and `cleanupRefObjects`' delete boundaries via `result.checkpoints` --
+        /// so the damage is confinable, and confining it is the difference between one namespace waiting
+        /// for a repair and the whole pool's cursors, seals and cleanup stopping on one 4 KiB object.
+        ///
+        /// FOLD NOTHING FOR IT, rather than fold and merely refuse the frontier proof. The cursor
+        /// advance is the one irreversible thing the walk does (nothing ever re-reads below it), and
+        /// this namespace has just proved that a piece of its own durable state cannot be read. Spending
+        /// that irreversible step against a namespace in that condition buys reclamation latency and
+        /// costs recovery options; the hold costs only the latency.
+        ///
+        /// The hold sits at the position the walk WOULD have read, which is canonical by construction.
+        /// A namespace with no such position is a never-folded one whose listing shows no log -- the
+        /// `_ckpt`-only "phantom table" `parseRefCkptKey` deliberately admits is exactly this shape --
+        /// and there is no walk to stop; the anomaly alone carries it, because the other consumer is
+        /// `cleanupRefObjects`, whose boundaries an ABSENT checkpoint WIDENS, and only the round's
+        /// destructive gate keeps the snapshot this unreadable object names from being deleted.
+        if (const auto bad_ckpt = checkpoints.undecodable.find(ns_str);
+            bad_ckpt != checkpoints.undecodable.end())
+        {
+            LOG_WARNING(logger,
+                "CAS GC ref intake: namespace {} has an undecodable checkpoint -- {}. This namespace "
+                "folds nothing and reclaims nothing until that object is repaired; every other "
+                "namespace folds normally.",
+                ns_str, bad_ckpt->second);
+            if (expected)
+                hold(*expected, HoldReason::CheckpointUndecodable,
+                     "ref intake: the namespace's `_ckpt` is present but undecodable -- its durable "
+                     "checkpoint witness cannot be read, so nothing above the cursor is accountable");
+            else
+                report.recordAnomaly(ns, 0, ManifestId{ns, {}},
+                    "ref intake: the namespace's `_ckpt` is present but undecodable (no walk position)");
+            expected.reset();   /// the cursor rides verbatim into this round's seal
+        }
 
         /// Whether the record this round last applied (the one `resolved_through` names) was an
         /// `EpochSeal`. `nullopt` = this round has applied nothing yet, so `resolved_through` is still
@@ -2448,6 +2515,12 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     result.ref_tables = ref_tables;
     /// Same reuse for the checkpoints: the intake walk already paid for them as its second witness, and
     /// the cleanup ranges below are the other consumer of the same fact.
+    ///
+    /// An UNDECODABLE `_ckpt` contributes no entry here, which reads as "no checkpoint" and WIDENS this
+    /// namespace's delete boundaries. That is safe for exactly one reason, stated here because it is not
+    /// local: the walk above held (or recorded an anomaly for) every such namespace, so the round's
+    /// destructive gate is shut and `cleanupRefObjects` deletes nothing at all this round. Any future
+    /// change that narrows the gate from round-wide to per-namespace must carry this set with it.
     result.checkpoints = checkpoint_witness;
 
     /// Namespace-cleanup items: carry the parent generation's items forward, add a Pending

@@ -1701,8 +1701,10 @@ void CasRefLedger::poisonApplyState(RefTableRuntime & rt, const RootNamespace & 
             "CAS ref table '{}' is POISONED at {}: an install failed although its ref-log object may "
             "already be durable, so this cached table may be MISSING a durable transaction. The "
             "allocation-free install regions make this unreachable by construction, so reaching it is a "
-            "bug in that construction. The marker is terminal for this runtime -- only a remount, which "
-            "replaces the runtime, clears it.",
+            "bug in that construction. The marker clears when a recovery re-derives this table from the "
+            "durable log and installs it, which the next flush does; a table that is also wedged first "
+            "spends one flush retiring the wedge. A remount reaches the same state by replacing the "
+            "runtime.",
             ns.string(), region);
     }
     catch (...)   // NOLINT(bugprone-empty-catch)
@@ -3510,8 +3512,11 @@ bool CasRefLedger::trySnapshotPublishOnce(const RootNamespace & ns)
             "CAS ref table '{}': refusing to publish a snapshot from a POISONED state — this cached "
             "table may be missing a durable transaction, and a snapshot published from it could label "
             "itself as covering that transaction, hiding it from every future recovery. The table stays "
-            "writable; only a remount (which replaces the runtime and re-derives the table from the "
-            "durable log) restores snapshot publication.",
+            "writable and repairs itself: the next flush re-derives it from the durable log, which "
+            "restores snapshot publication. A table that is ALSO wedged takes one extra touch — the "
+            "flush that retires the wedge by floor reconciliation, then the flush that re-derives. A "
+            "remount reaches the same state by replacing the runtime, and is the answer only if this "
+            "line keeps repeating across flushes.",
             ns.string());
         return false;
     }

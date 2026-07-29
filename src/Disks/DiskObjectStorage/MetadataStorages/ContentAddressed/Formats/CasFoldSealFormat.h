@@ -45,6 +45,7 @@ enum class HoldReason : uint8_t
     WitnessDisappeared = 3,     /// an above-cursor record stopped answering GETs — corruption, never clearance
     BodyUndecodable = 4,        /// the ref-log body at the position is present but cannot be decoded/extracted
     ManifestBodyMissing = 5,    /// a part-manifest body the position's edges name is absent (the fold barrier)
+    CheckpointUndecodable = 6,  /// the namespace's `_ckpt` is present but its body cannot be decoded
 };
 
 /// The wire word one `HoldReason` is persisted as. Exported because the reason is operator-facing well
