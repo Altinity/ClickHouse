@@ -1709,3 +1709,6 @@ fix). Deduped (`649d6f572ea`), GM2 build+gate rerunning. No push.
 **2026-07-29 03:00 local watchdog** — GM2 GREEN 1524/1524 (true merged count). Convergence
 agent dispatched (6 stitches incl. the first end-to-end mint->apply->cross->premise-admit
 test). Lane-g retired. T11-T14 remain. No push.
+
+**2026-07-29 03:20 local watchdog** — convergence advancing fast: stitches 1 (seam fill) and 2
+(real-crossing un-seed) COMMITTED; iterating on the next (build3 running). No push.
