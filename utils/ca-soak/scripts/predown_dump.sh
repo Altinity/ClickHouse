@@ -7,7 +7,18 @@
 # single query ran against it, and the only survivors were the host-mounted text logs. This runs
 # BEFORE `docker compose down` and makes the specimen outlive its own cluster.
 #
-# Usage:  scripts/predown_dump.sh [label]
+# Usage:  scripts/predown_dump.sh [label] [--from 'YYYY-MM-DD HH:MM:SS'] [--to '...'] [--focus SYMBOL]
+#
+#   --from/--to   restrict every time-based extract to that `event_time` window. Run-wide aggregates
+#                 blend GC with insert, merge and fetch load — on the 2026-07-29 specimen that meant
+#                 124k relink exceptions per node drowning the signal — so once rounds are bounded and
+#                 a single round has a start and an end, pointing the aggregates at ONE round's window
+#                 is what makes "where did this round spend its time" answerable at all.
+#   --focus SYM   also emit `trace_<type>_focus_stacks.tsv`: the top stacks restricted to those whose
+#                 INNERMOST frame demangles to a symbol matching SYM. The plain top-200 is by whole
+#                 stack, so a hot leaf spread across many distinct stacks (`pthread_mutex_lock` with
+#                 57k query-side Real samples on that specimen) need never reach the list — you can see
+#                 the magnitude but not which mutex. This filter shows what sits beneath it.
 # Writes: logs/predown/<node>/<label>/*.tsv + manifest.txt   (host side, survives teardown)
 #
 # NOT inside logs/<node>/ — the container writes that directory as root/syslog and the harness user
@@ -23,7 +34,25 @@ set -u
 CA_SOAK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$CA_SOAK_DIR" || exit 90
 
-LABEL="${1:-$(date +%Y%m%dT%H%M%S)}"
+LABEL=""
+FROM_TS=""
+TO_TS=""
+FOCUS=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --from) FROM_TS="$2"; shift 2 ;;
+        --to)   TO_TS="$2";   shift 2 ;;
+        --focus) FOCUS="$2";  shift 2 ;;
+        *) [ -z "$LABEL" ] && LABEL="$1"; shift ;;
+    esac
+done
+LABEL="${LABEL:-$(date +%Y%m%dT%H%M%S)}"
+
+# One predicate, reused by every time-based extract, so a window can never be applied to some of them
+# and silently not others.
+WINDOW=""
+[ -n "$FROM_TS" ] && WINDOW="$WINDOW AND event_time >= '$FROM_TS'"
+[ -n "$TO_TS" ]   && WINDOW="$WINDOW AND event_time <= '$TO_TS'"
 NODES="${PREDOWN_NODES:-ch1:8123 ch2:8124}"
 MANIFEST_ROWS=""
 FAILED=0
@@ -52,7 +81,7 @@ for spec in $NODES; do
     curl -sS -m 120 -X POST --data-binary "SYSTEM FLUSH LOGS" "http://localhost:${port}/" >/dev/null 2>&1
 
     # (a) the whole GC log — small, and the audit's primary table.
-    q "$port" "SELECT * FROM system.content_addressed_garbage_collection_log FORMAT TSVWithNames" \
+    q "$port" "SELECT * FROM system.content_addressed_garbage_collection_log WHERE 1 ${WINDOW} FORMAT TSVWithNames" \
       "$dir/gc_log.tsv"
 
     # (b) trace_log aggregates, per trace type, SPLIT BY SIDE and carrying the side per row.
@@ -64,7 +93,7 @@ for spec in $NODES; do
                 count() AS samples,
                 arrayStringConcat(arrayMap(x -> demangle(addressToSymbol(x)), trace), '\n') AS stack
             FROM system.trace_log
-            WHERE trace_type = '${tt}'
+            WHERE trace_type = '${tt}' ${WINDOW}
             GROUP BY side, stack
             ORDER BY samples DESC
             LIMIT 200
@@ -79,11 +108,28 @@ for spec in $NODES; do
                 count() AS samples
             FROM system.trace_log
             ARRAY JOIN trace AS frame
-            WHERE trace_type = '${tt}'
+            WHERE trace_type = '${tt}' ${WINDOW}
             GROUP BY side, symbol
             ORDER BY samples DESC
             LIMIT 200
             FORMAT TSVWithNames ${INTRO}" "$dir/trace_${tt}_top_frames.tsv"
+        # Optional focus extract: the stacks whose INNERMOST frame is the symbol under investigation.
+        if [ -n "$FOCUS" ]; then
+            q "$port" "
+                SELECT
+                    multiIf(query_id = '', 'background', 'query') AS side,
+                    '${tt}' AS trace_type,
+                    count() AS samples,
+                    arrayStringConcat(arrayMap(x -> demangle(addressToSymbol(x)), trace), '\n') AS stack
+                FROM system.trace_log
+                WHERE trace_type = '${tt}' ${WINDOW}
+                  AND length(trace) > 0
+                  AND demangle(addressToSymbol(trace[1])) ILIKE '%${FOCUS}%'
+                GROUP BY side, stack
+                ORDER BY samples DESC
+                LIMIT 200
+                FORMAT TSVWithNames ${INTRO}" "$dir/trace_${tt}_focus_stacks.tsv"
+        fi
     done
 
     # (c) every counter, including the zeros — a counter that never moved is evidence too.
@@ -102,7 +148,7 @@ for spec in $NODES; do
             max(event_time) AS last_seen,
             replaceRegexpAll(substring(message, 1, 200), '[0-9a-f]{8,}|[0-9]{3,}', 'N') AS shape
         FROM system.text_log
-        WHERE level IN ('Error', 'Fatal')
+        WHERE level IN ('Error', 'Fatal') ${WINDOW}
         GROUP BY shape
         ORDER BY occurrences DESC
         LIMIT 200
@@ -117,6 +163,7 @@ for spec in $NODES; do
     #   QUERY-FAILED  — the query itself did not run. Only this fails the dump.
     {
         echo "# predown dump  node=${node}  label=${LABEL}  taken=$(date -Iseconds)"
+        echo "# window: from='${FROM_TS:-(none)}' to='${TO_TS:-(none)}'  focus='${FOCUS:-(none)}'"
         for f in "$dir"/*.tsv; do
             [ -e "$f" ] || continue
             lines=$(wc -l < "$f")
