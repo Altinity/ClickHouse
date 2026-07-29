@@ -1846,3 +1846,8 @@ window drafting RESULTS.
 **2026-07-29 09:46 local** — user ordered whole-Phase-A codex review (sol xhigh) during the
 soak wait: launched detached, read-only sandbox, 204-commit range, 8 hunt priorities, unique
 exit marker. Poll on ticks.
+**2026-07-29 09:5x local** — soak surfaced a relink-confirm storm (~106k ERROR/20min):
+fetch-by-relink ~17% available on a busy lane (rule 3 table-scoped refusal). Controller
+verified pre-existence at the ledger site (comment-only Stage-A hunk) and ruled: NOT a stage
+red, explicit named exception in RESULTS + BACKLOG [RELINK-CONFIRM-BUSY-LANE] (4 sub-points;
+rule-3 per-ref refinement = user-gated design pass). Data converges; correctness intact.
