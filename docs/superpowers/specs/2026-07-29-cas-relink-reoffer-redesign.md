@@ -9,7 +9,7 @@ doc_type: 'reference'
 
 # CAS relink re-offer: retiring the confirm endpoint {#cas-relink-reoffer-redesign}
 
-**Date:** 2026-07-29. **Status:** DESIGN (**v6 — final pre-plan**), approved except the TLA gate. **Branch:** `cas-gc-rebuild`.
+**Date:** 2026-07-29. **Status:** DESIGN (**v7 — final pre-plan**), approved except the TLA gate. **Branch:** `cas-gc-rebuild`.
 Spec only; no code landed.
 
 **v2:** the confirm is expressed as an HTTP conditional request (`ETag` / `If-None-Match`), with
@@ -27,6 +27,22 @@ second defence (§4.1.3); the **budget is redesigned** after its one-line mitiga
 the eviction code (§4.3); `CaRelinkPromote::MechanismFallbackAllowed` gets its transition (§6.2);
 the TLA gate gains three expressiveness requirements (§12.5); and the §1.1 arithmetic is corrected
 against a grep rather than against the design.
+
+**v7 (Codex round 4, §6-targeted — 2 blocker, 3 major, 1 minor, ALL in the §6.5 that v6
+introduced).** Re-derived rather than patched, on the house rule that review rounds which keep
+adding object kinds mean the invariant is wrong. **What DIED:** the `RELEASE-INCOMPLETE` exit
+attribute as a concept; the carrier struct and out-parameter; the observation-point rule against
+the retry chain; the `isTerminal` release guard (it was never a release bit — it is also set right
+after a durable commit); every release-result parameter on the exchange seam; the receiver's
+involvement in release reporting entirely; the `LeakedLivePrecommit` fsck class and its windowed
+discriminator (whose premise was false besides — `retireBuildSeq` also runs on the successful
+promote and abandon paths); and §6.5.1/§6.5.2 with them. **What replaced it:** one predicate in one
+place — at destruction, emit iff `PartWriteTxn::precommitState` is `Uncertain` or `Durable`
+(`CasPartWriteTxn.h:280-299`), a state the transaction already maintains for exactly this question.
+Also: S0 renamed to PUBLICATION PROVEN ABSENT (v6's "NOT STAGED" was wrong in precisely the way
+§6.5 is about), the counter generalized to `CasPrecommitReleaseUnproven` and re-scoped as an upper
+bound rather than a leak count, and the retention bound corrected from "the mount's epoch" to
+"eligible at epoch rollover, reclaimed by a successor's sweep".
 
 **v6 (Codex round 3, targeted at §6 — 2 blocker, 2 major, 1 minor):** release-incomplete is
 demoted from a state to an **orthogonal exit attribute** (§6.5) — as a state its single byte-fetch
@@ -122,13 +138,13 @@ argued. Deletions are measured against the tree; additions are estimated.
 
 | | Before | After |
 | --- | --- | --- |
-| Receiver outcomes to reason about | 7 taxonomy rows | **4 states + 1 orthogonal attribute** (§6.5) |
+| Receiver outcomes to reason about | 7 taxonomy rows | **4 states** — release observation is not a state at all (§6.5) |
 | Registered interserver endpoints | 1 | **1** — unchanged; the confirm was always a MODE of the parts endpoint, never a second one |
 | What the second mode costs to serve | its own token routing, parts-set gate and answer path | the offer's routing with the body suppressed |
 | Fields the receiver must round-trip | 6, parsed | **16 opaque bytes**, parsed by nobody |
 | Bespoke wire names | 5 | **5** — unchanged, and §4.1 says so plainly |
 | Proof obligations answered per outcome | 2 | **3** — codex r2 exposed a missing one, *does it leak retention?* |
-| Actions an exit can take | 1 per taxonomy row | **1 per state** — the attribute never changes it (§6.5) |
+| Where release cleanup is observed | implicit, nowhere | **1 place** — the handle's destructor, one predicate (§6.5) |
 | Content-addressed identifiers in `src/Storages/MergeTree/` | **6** | **4** |
 | Seam methods serving the confirm | `confirmExactRef` + `ownsNamespace` | **0** |
 | Lane mutexes held to answer | 2, in a bespoke snapshot | **1**, the ordinary read path |
@@ -856,16 +872,18 @@ Four states replace the seven taxonomy rows. Each answers **three** questions on
 that reaches it, instead of once per row: *does it lose a part?*, *does it publish twice?*, and —
 added after codex round 2 found it missing — *does it leak retention?*
 
-Orthogonal to the four states there is exactly **one exit ATTRIBUTE**, `RELEASE-INCOMPLETE`
-(§6.5). It can decorate any exit that tried to release a staged `+1` and could not prove it
-succeeded. **It never changes the state's action** — that is what makes it an attribute rather
-than a state, and codex round 3 caught an earlier draft getting this exactly wrong by modelling it
-as a state with an action of its own.
+Release cleanup — whether a staged `+1` was provably released — is deliberately **not part of this
+machine**. Two drafts tried to make it one (a fifth state in v5, an exit attribute in v6) and both
+were wrong for the same reason: the receiver cannot observe it, because its classification happens
+before the last release attempt. §6.5 moves the observation to the handle that owns it. **No state
+below carries release plumbing, and no state's action depends on it.**
 
-### 6.1 S0 — NOT STAGED {#s0-not-staged}
+### 6.1 S0 — PUBLICATION PROVEN ABSENT {#s0-not-staged}
 
-Nothing of this relink is durable at the receiver — either never staged, or staged and provably
-released. Reached by: no `content_addressed_identity` on the offer (a peer that predates this design), an unrecognized
+**No ref of this relink is published, and that is PROVEN rather than assumed** — the state is
+about publication, not about staging. It was called "NOT STAGED" through v6, which was wrong in
+exactly the way §6.5 is about: a staged precommit may still exist here if its release could not be
+proven. Nothing published; possibly something staged. Reached by: no `content_addressed_identity` on the offer (a peer that predates this design), an unrecognized
 relink cookie value, a reservation that landed outside the advertised pool, an undecodable
 manifest, the retryable staging class (`CaRelinkPrepare::MechanismFallbackAllowed` — body-absent
 precommit, precommit no longer the live owner, ref conflict), and a `promote` that returned
@@ -887,7 +905,8 @@ class can return `MechanismFallbackAllowed` while the `+1` is still live, and th
   followed by a failed abandon leaves a live precommit that **nothing** retries.
 
 Only an exit with a PROVEN release is a clean S0. Either path failing to prove it carries the
-`RELEASE-INCOMPLETE` attribute (§6.5) — same action, loud.
+§6.5's destructor observation — which changes nothing here, and is
+recorded there rather than by this state.
 
 **Action:** return `nullptr`; the caller byte-fetches from the same sender, with the recursion
 brake (`allow_ca_relink=false`) set.
@@ -898,7 +917,8 @@ brake (`allow_ca_relink=false`) set.
   same ref name over it without conflict.
 - *No retention leak?* None **when the entry is clean** — by this state's definition nothing
   durable remains, which is what the release guards above exist to make true rather than assumed.
-  An entry carrying `RELEASE-INCOMPLETE` answers this differently; see §6.5.
+  When a release could not be proven, the residue is observed and counted by the handle, not by
+  this state; see §6.5.
 
 ### 6.2 S1 — STAGED {#s1-staged}
 
@@ -951,8 +971,8 @@ staging path discards its release result entirely (§6.1).
 - *No retention leak?* **Not guaranteed on either non-`Yes` exit** — `abort` is `noexcept` and
   swallows a failed removal append (`ContentAddressedMetadataStorage.cpp:2116-2123`). Such an exit
   keeps its own action — byte-fetch after `No`, **retry-later throw after `Unknown`** — and carries
-  `RELEASE-INCOMPLETE` (§6.5). The action must NOT change: converting an `Unknown` into a byte
-  fetch because its cleanup failed would discard the very uncertainty that made it `Unknown`.
+  §6.5's observation. The action must NOT change: converting an `Unknown` into a byte fetch because
+  its cleanup failed would discard the very uncertainty that made it `Unknown`.
 
 ### 6.3 S2 — PUBLISH UNCERTAIN {#s2-publish-uncertain}
 
@@ -962,15 +982,15 @@ without a verdict, so the receiver's ref MAY be committed.
 **Action:** throw the retry-later `NETWORK_ERROR`. Never `nullptr`.
 
 - *No part loss?* No — retry-later; by re-execution the ref lane has resolved the ambiguity.
-- *No double publish?* No. Nothing is published on this exit, and the handle's abandon is
+- *No double publish?* No. This exit publishes NOTHING ITSELF — whether the earlier append landed
+  is precisely what is unknown, and the receiver adds nothing to it. The handle's abandon is
   REJECTED by the state machine if the promote in fact landed — a promoted binding is no longer a
   precommit — so no committed ref is ever undone here. **This is the one state where a byte fetch
   would be a defect**, because it would publish the part a second time over a relink that may
   already be committed.
 - *No retention leak?* Bounded. The abandon is attempted and, if the promote in fact landed, is
   REJECTED by the state machine rather than undoing a committed ref; if it did not land, the
-  precommit is released or the exit carries `RELEASE-INCOMPLETE`. **The action is unchanged either
-  way** — S2 still throws retry-later and still never byte-fetches. This is the state where
+  precommit is released or §6.5's observation fires. **The action is unchanged either way** — S2 still throws retry-later and still never byte-fetches. This is the state where
   treating a failed release as a reason to byte-fetch would permit exactly the double publish this
   section forbids.
 
@@ -989,89 +1009,78 @@ one does.
   transaction.
 - *No retention leak?* None — the precommit became a committed ref; nothing is left staged.
 
-### 6.5 The `RELEASE-INCOMPLETE` exit attribute {#release-incomplete}
+### 6.5 Release observation belongs to the handle, not to the exit {#release-incomplete}
 
-A staged `+1` was not provably released. **This is an attribute of an exit, not a state**, and the
-distinction is load-bearing rather than taxonomic: the attribute records a FACT about cleanup,
-while the state records what the receiver KNOWS about publication. Only the latter may decide the
-action, because only the latter is what a wrong action would corrupt.
+The wrong invariant behind three rounds of blockers was *the receiver classifies the exit, so the
+receiver reports the release*. It cannot: the receiver's classification necessarily happens BEFORE
+the last release attempt — its scope guard runs on the way out (`DataPartsExchange.cpp:1481`),
+`abort` returns `void`, and the destructor's retry reports to nobody
+(`PartFolderAccess.cpp:403-416`). No plumbing fixes an ordering that runs backwards.
 
-**The action is always the parent state's, unchanged.** S0 still byte-fetches, S1's `No` still
-byte-fetches, S1's `Unknown` still throws retry-later, S2 still throws retry-later and still never
-byte-fetches. An earlier draft modelled this as a state with a single byte-fetch action; applied to
-S2 that would have permitted precisely the double publish §6.3 forbids, and applied to S1's
-`Unknown` it would have discarded the uncertainty that made the exit `Unknown` in the first place.
+**The owner of the LAST release attempt reports it.** That owner is the transaction handle, and it
+already knows everything required. `PartWriteTxn` maintains `PrecommitState` (`CasPartWriteTxn.h:280-299`) precisely for this
+question, and its own comment explains why it is a state rather than a bool: an `Unresolved`
+append MAY have landed, so the intent is recorded BEFORE the ambiguous append and settled either
+way afterwards.
 
-What the attribute changes is loudness, and only that: the `CasRelinkReleaseIncomplete` counter, a
-WARNING naming the namespace and ref, and an fsck-detectable residue.
-
-**Its retention answer.** A live-epoch precommit binding pins its manifest and the blobs beneath
-it, and nothing reclaims it: the stale-precommit sweep is prior-epoch-scoped and GC never touches a
-live precommit (`PartFolderAccess.cpp:365-370`). The bounds differ by origin, and the difference
-matters because one of them has no retry at all:
-
-| Origin | Retry backstop | Terminal bound |
+| `PrecommitState` at destruction | Meaning | Emit? |
 | --- | --- | --- |
-| `promote` / `abort` (a handle exists) | `~PreparedPartWrite` re-appends the removal (`PartFolderAccess.cpp:403-416`) | the mount's epoch |
-| `prepareEntries` (**no handle**) | **none** — the comment says the cleanup "cannot be deferred to one", and `~PartWriteTxn` only retires the build sequence (`CasPartWriteTxn.cpp:119-124`) | the mount's epoch |
+| `NotAttempted` | nothing can be owned; the staged bodies are ordinary writer debris | no |
+| `Settled` | the owed terminal operation discharged the duty | no |
+| `Uncertain` | the append was attempted, outcome unknown; the build OWES the removal *as if it were durable* | **yes** |
+| `Durable` | the binding is this build's and was not released | **yes** |
 
-So: a leak with an upper bound, not a correctness defect — but on the staging path the only bound
-is the epoch, which is why the counter and the fsck rule below are the real mitigation rather than
-belt-and-braces.
+So the whole contract is one line: **at destruction, emit iff `precommitState` is `Uncertain` or
+`Durable`.** Once, in the destructor, `noexcept`, reusing the ERROR line `~PreparedPartWrite`
+already logs (`PartFolderAccess.cpp:412-415`) rather than adding a second one beside it. A
+destructor retry that SUCCEEDS moves the state to `Settled`, so it emits nothing — the asymmetry
+is preserved by the state machine rather than by a rule someone must remember.
 
-#### 6.5.1 The release-result contract {#release-contract}
+**What this deletes:** the carrier struct and out-parameter, the observation-point rule, the
+`isTerminal` guard (never a release bit anyway — it is also set immediately after a durable commit,
+`PartFolderAccess.cpp:344-350`, so it means "committed OR released"), every release-result
+parameter on the exchange seam, and the receiver's involvement entirely. **The receiver carries no
+release plumbing; its actions stay purely outcome-driven.** §6.1-§6.4 are unchanged, which is the
+point — they never needed to know.
 
-The attribute has to be implementable without anyone re-deriving it, so four things are fixed here.
+**What it covers that no receiver-side scheme could:** the destructor runs on every path — enum
+outcomes, exceptions propagating before the receiver installs its guard (`prepareAdoptFromManifest`
+maps only two error codes and lets the rest through), the `prepareEntries` path that returns no
+handle at all (`PartFolderAccess.cpp:491-493`), and destructor-only exits. Earlier drafts had to
+enumerate those; this one cannot miss one.
 
-**(i) Carrier.** `CaRelinkPromote` is a three-way enum and cannot carry an orthogonal bit without
-becoming a six-way one — which would re-merge the two facts this section just separated. The
-release result travels **beside** the outcome: `promote` and `prepareAdoptFromManifest` return a
-small struct — the existing outcome enum plus `bool release_completed` — or take an out-parameter.
-Either is fine; what is not fine is encoding it in the enum.
+**What it costs, named rather than smuggled.** The handle does not know the write was a relink, so
+the counter is general — `CasPrecommitReleaseUnproven`, not a relink-specific one. That is the
+honest trade and, on reflection, the better metric: the hazard is a property of part writes, not of
+relink, and the receiver's own log line already names the part for correlation. Restoring relink
+attribution is the ONE thing that would need receiver-side plumbing back, and it is not worth it.
 
-**(ii) Observation point.** `release_completed` is read **after the scope-guard abort has run**,
-not at the first failure: the caller-visible status must reflect every attempt the call itself
-makes, or a transient failure that the guard immediately repairs would be reported as a leak. The
-**destructor owns the final word**: if its own retry also fails, it emits the loud exit
-(`~PreparedPartWrite` already logs at ERROR there). The caller reports what it knows when it
-returns; the destructor corrects the record if the situation resolves or worsens afterwards.
+**What the counter means.** *Not provably released* — which is strictly weaker than *leaked*. An
+`Uncertain` removal may in fact have landed and be settled later by the ref lane's wedge
+machinery; an `Unresolved` promote may have committed, in which case there is no precommit left at
+all. The counter is an **upper bound** on real residue, and must be read as one.
 
-**(iii) Which outcomes carry it.** Every outcome that could leave a staged `+1` behind:
-`CaRelinkPrepare::MechanismFallbackAllowed`, `CaRelinkPromote::MechanismFallbackAllowed`, and the
-`abort` paths of S1 and S2. **`Unresolved` carries it too** — its abandon may be rejected because
-the promote landed (no leak) or may simply have failed (leak), and those are different facts that
-the outcome alone does not distinguish.
+**Retention bound, corrected.** An unreleased binding is not bounded by "the mount's epoch" as an
+earlier draft said. Epoch rollover makes it *eligible*: a successor incarnation's
+`sweepStalePrecommitsNow` removes bindings whose `writer_epoch` predates the live one
+(`CasRefLedger.cpp:3738-3745`). So the honest statement is **eligible at epoch rollover, reclaimed
+by a successor's sweep — unbounded only if no successor ever mounts that namespace, or if every
+sweep attempt fails.**
 
-**(iv) Emission points.** The counter and the WARNING are emitted **once per exit, by the
-receiver**, at the point it classifies the exit — not inside the storage layer, which cannot see
-which relink the handle belonged to and would double-count against the destructor's own ERROR line.
+**Why no fsck class is needed** — the v6 draft specified one, and re-derivation removed the need
+rather than fixing its discriminator. (That discriminator was also wrong: `retireBuildSeq` is
+called on the successful promote and abandon paths too, `CasPartWriteTxn.cpp:1250`, `:1313`,
+`:1413`, not only in the destructor, and it is an in-memory operation besides.) The cases
+partition cleanly:
 
-#### 6.5.2 The fsck contract {#fsck-contract}
+- **The process is alive** ⇒ the destructor ran ⇒ the residue is already counted and logged. Nothing
+  for fsck to discover.
+- **The process died first** ⇒ the binding's `writer_epoch` now predates the next incarnation ⇒ it
+  is exactly what `sweepStalePrecommitsNow` exists to reclaim, on the designed path.
 
-"fsck detects it" is only a backstop if fsck can name it. Today it cannot: fsck builds
-`owned_manifest_keys` from `table.getCommitted()` alone (`CasFsck.cpp:578`), so a leaked
-precommit's manifest is unowned and reports as a generic unreachable object — indistinguishable
-from ordinary debris.
+The only accepted blind spot is the second case while no successor has yet mounted, and that is a
+statement about an unmounted namespace rather than about this protocol.
 
-**Recognition rule: a precommit binding that is present while its build sequence is RETIRED.**
-
-The discriminator is exact, and it is exact because of the destructor's own contract. `build_seq`
-is retired only in `~PartWriteTxn` (`CasPartWriteTxn.cpp:119-124`), which runs when the
-transaction object dies — after any abandon the owning handle attempted. So:
-
-- an **in-flight** build holds a LIVE sequence, and its precommit is legitimate — not a finding;
-- a **successful** abandon removed the precommit, so nothing is present to match — not a finding;
-- a **successful** promote made the binding committed, so it is no longer a precommit — not a
-  finding;
-- a **failed** release leaves the precommit present while the sequence is retired — **the finding.**
-
-There is no ordering window to worry about: the abandon append is attempted before the transaction
-dies, and fsck reads durable state through a fresh `recoverRefTable` replay, so a removal that
-landed is already reflected when fsck observes the retired sequence.
-
-**Deliverable:** a dedicated fsck class for it (a `LeakedLivePrecommit` finding), reported
-separately from unreachable-object debris, because the operator action differs — debris is
-reclaimable, this is a binding that will pin data until its epoch ends.
 
 ### 6.6 What falls out of the taxonomy {#taxonomy-deltas}
 
@@ -1085,14 +1094,16 @@ And one row splits usefully: today's row 3 lumps `unproven`, an absent cookie, a
 and a timeout into one action. Under §4.2 the authoritative `No` separates from the rest and gets
 the byte fetch; everything else stays exactly one outcome.
 
-**The reduction, counted honestly.** Seven rows become four states plus one orthogonal attribute
-(§6.5), but not because three rows
+**The reduction, counted honestly.** Seven rows become four states, but not because three rows
 were deleted — rows 4, 5, 5b and 6 all survive as TRANSITIONS into S3, S0, S2 and S0 respectively
 (§6.2). What actually shrinks is the number of places a reviewer must re-answer "does this lose a
 part / publish it twice": seven answers, once per row, become four, once per state — now three questions each rather than
 two, since codex round 2 showed the retention question was never being asked — and every new exit
-added later inherits its state's answers instead of needing a new row. The attribute is what
-carries the one fact that is genuinely per-exit rather than per-state. Rows 1 and 2 collapse into
+added later inherits its state's answers instead of needing a new row. Release cleanup, which
+v6 tried to model as a fifth outcome and then as an exit attribute, turns out not to belong to this
+machine at all: it is observed once by the handle that owns it (§6.5). **Legacy row 6** ("any other
+exception") maps to whichever state the receiver is in when the exception propagates — S0 before
+staging, S1 after — and needs no row of its own for the same reason. Rows 1 and 2 collapse into
 S0 because they differ only in provenance, and the token and quiescence classes disappear
 outright.
 
@@ -1227,7 +1238,7 @@ confirm counter at all.
 | `CasRelinkChanged` | authoritative `No` — the binding changed; the receiver byte-fetches |
 | `CasRelinkUnknown` | the sender could not speak; retry-later |
 | `CasRelinkRecoveryBudgetRefused` | **its own counter**, per the decision: an `Unknown` caused by the peer-initiated recovery budget (§4.3), distinguishable from every other `Unknown` |
-| `CasRelinkReleaseIncomplete` | the `RELEASE-INCOMPLETE` attribute (§6.5): a staged `+1` could not be provably released. **Must be ~0**; a non-zero value means live-epoch precommit bindings are accumulating and pinning manifests until their epoch ends. Emitted once per exit by the receiver (§6.5.1 iv) |
+| `CasPrecommitReleaseUnproven` | §6.5: a part-write transaction died with `precommitState` still `Uncertain` or `Durable`. **Not relink-specific** — it lives in the handle, which does not know why the write happened, and that is the honest trade §6.5 names. An UPPER BOUND on real residue, not a leak count: an `Uncertain` removal may yet be settled by the ref lane. Emitted once, in the destructor |
 | `CasRelinkAnswerRejected` | the response failed one of §4.4's four conditions — empty body, nonce echo, explicit answer, validator match. **Must be ~0 in a healthy cluster**: a non-zero value means a stripped header, an intermediary, or a misroute, and that is exactly the class §4.1.3 and §4.1.4 exist to catch |
 
 **Which rule refused, and what was expected.** Today an `Unknown` maps silently through
@@ -1308,10 +1319,10 @@ Rebuilt from the state machine of §6, not transplanted from the old row list:
 | 16 | **Replay** | replay a captured earlier confirm response for the same part and validator | nonce mismatch ⇒ `Unknown`; no promote (§4.1.4) |
 | 17 | **Cross-mount collision** | two same-pool CA disks, same `server_root_id`, same table; offer from disk A, `MOVE ... TO DISK` to B, force B to hold the same `ManifestRef` tuple for that ref | validators DIFFER (the digest is mount-qualified), so the answer is `changed`, never `proven`. This is B1's shape and the direct regression test for §3 |
 | 18 | **S1 → S0 via promote** | force `promote` to `MechanismFallbackAllowed` **with the release succeeding** | byte fetch to the same sender; no double publish; distinct from row 9's `Unresolved`, which must NOT byte-fetch |
-| 19 | **`RELEASE-INCOMPLETE` on the promote path** | force `promote` to `MechanismFallbackAllowed` **with the removal append failing**, so `isTerminal` stays false | the action is UNCHANGED (byte fetch, published exactly once) and the exit is additionally marked: `CasRelinkReleaseIncomplete` increments and a WARNING names namespace and ref |
-| 20 | **`RELEASE-INCOMPLETE` on the STAGING path** | fail `precommitAdd` uncertainly and fail the `prepareEntries` abandon | same marking — and this is the path with NO destructor retry (`PartFolderAccess.cpp:491-493`, `CasPartWriteTxn.cpp:119-124`), so it is the one that most needs the counter. Regression test for codex-r3 B1 |
-| 21 | **The attribute never changes the action** | force a failed release on S1's `Unknown` exit and on S2's `Unresolved` exit | BOTH still throw retry-later and **neither byte-fetches**. Regression test for codex-r3 B2 — the S2 case is where a byte fetch would double-publish |
-| 22 | **fsck names the leak** | leave a leaked live precommit behind (row 20's state) | fsck reports it as `LeakedLivePrecommit` — precommit present with a RETIRED build sequence — and NOT as generic unreachable debris (§6.5.2) |
+| 19 | **Release observed on the promote path** | `promote` → `MechanismFallbackAllowed`, and **every** removal attempt fails — the promote-internal abandon, the receiver's scope guard, and the destructor retry — so `precommitState` is still `Durable`/`Uncertain` at destruction | the action is UNCHANGED (byte fetch, part published exactly once) and `CasPrecommitReleaseUnproven` increments **exactly once**, from the destructor |
+| 20 | **Release observed on the STAGING path** | fail `precommitAdd` uncertainly and fail the `prepareEntries` abandon — the path that returns NO handle (`PartFolderAccess.cpp:491-493`) | same single emission, proving the observation does not depend on a handle reaching the receiver. Regression test for codex-r3 B1 |
+| 21 | **Release never changes the action** | force every removal attempt to fail on S1's `Unknown` exit and on S2's `Unresolved` exit; for S2 run BOTH promote-landed and promote-not-landed variants so the outcome is pinned rather than nondeterministic | all variants still throw retry-later and **none byte-fetches**; exactly ONE emission per transaction in each. Regression test for codex-r3 B2 — S2 is where a byte fetch would double-publish |
+| 22 | **A successful late release emits nothing** | fail the first removal attempts but let the DESTRUCTOR retry succeed | `precommitState` reaches `Settled`, so the counter does **not** increment — the asymmetry §6.5 relies on, asserted rather than assumed |
 
 The existing failpoint `cas_relink_receiver_pause_before_confirm` is the seam that opens the T1→T2
 window and stays (renamed for accuracy); it is what makes 2–7 reachable at all, since none of them
@@ -1531,5 +1542,5 @@ Two items remain, and neither needs a decision now because neither is answerable
 
 Everything else is implementation-time detail: the exact work-cap and concurrency constants, the
 enumeration of `apply_state` writers §5.1.2 requires the plan to audit, and the `isTerminal`
-release-result plumbing §6.5.1 specifies (carrier, observation point, which outcomes carry it,
-where it is emitted), and the `LeakedLivePrecommit` fsck class of §6.5.2.
+single destructor emission §6.5 specifies (one predicate over `precommitState`, `noexcept`, reusing
+the ERROR line that already exists).
