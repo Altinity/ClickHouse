@@ -2056,3 +2056,9 @@ Parallel: ASan merged gate running; soak next; a16 editing T16b.
 arithmetic; watchdog's asan false alarm = markers in build_asan/ not build/). Re-validation
 soak launch ordered (a14, run_soak.sh, 6/40, 30m, >=3-rounds criterion). T16b adjudicated
 (a/b accept, c ordered). Stage close imminent: soak green -> verdict PASS -> final review.
+**2026-07-29 16:3x local** — relink re-offer SPEC committed (218305e6e64, 756 lines): token
+dies via cookie-opaque identity (parser leaves the trust boundary), LRU non-promotion defuses
+the amplifier, TWO self-found gates (marker-sync prerequisite; TLA refutes-as-written with the
+required sApplyPending split where _sab_stalecache must FLIP GREEN). Upstream measured:
+CA names in Storages/MergeTree 5->2, ~-516 lines net. Codex sol-xhigh review LAUNCHED
+(CODEXRELINK_EXIT marker). Soak still running.
