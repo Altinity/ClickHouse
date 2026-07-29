@@ -2930,12 +2930,17 @@ void Gc::reportSweepRetention(const ManifestSweepResult & result)
     /// a closed-and-folded epoch), so warning here would raise an alarm on every healthy round. It is
     /// still the operator's answer to "why is manifest debris not shrinking?", which is why it is not
     /// left at DEBUG with the per-object sentences.
+    /// The "X of Y" denominator is the RETAINED total, not `skipped`. `skipped` is a strictly larger
+    /// population -- it also counts malformed keys, ineligible prefixes, protected owners and
+    /// budget-deferred candidates -- so measuring the top class against it would understate the class's
+    /// share of the very number this sentence just reported.
+    const uint64_t retained = result.retained_no_coverage + result.retained_hold
+        + result.retained_unconsumed_seal + result.retained_tail_removal;
     LOG_INFO(logger,
         "CAS gc orphan sweep: retained {} manifest body(ies) this pass, most of them ({} of {}) for "
-        "'{}' -- see the fold seal's coverage for that namespace; deleted {}, listed {}",
-        result.retained_no_coverage + result.retained_hold + result.retained_unconsumed_seal
-            + result.retained_tail_removal,
-        top.second, result.skipped, sweepRetainClassName(top.first), result.deleted, result.listed);
+        "'{}' -- see the fold seal's coverage for that namespace; deleted {}, listed {}, skipped {}",
+        retained, top.second, retained, sweepRetainClassName(top.first),
+        result.deleted, result.listed, result.skipped);
 
     last_retain_rollup = top;
     retain_rollup_passes_since_report = 0;
