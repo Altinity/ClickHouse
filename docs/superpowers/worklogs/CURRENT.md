@@ -1984,3 +1984,7 @@ soak on the PATCHED binary.
 **2026-07-29 14:00 local** — watchdog: a14 got scenarios-GO ~5 min ago; cluster up (4
 containers), no new scenario markers yet (edits finalizing / boot). a15 parked green; a16
 parked awaiting slot. Load 2.2. Nothing wedged.
+**2026-07-29 14:20 local** — watchdog: framework narrowing commits landed (521f0d7a83a) +
+S43 edited 13:55, but NO scenario re-runs started (load 0.76, no markers) — nudged a14 (GO
+crossing suspected again). Chain: scenarios -> a16 slot -> reviews -> merge -> rebuild ->
+re-validation soak.
