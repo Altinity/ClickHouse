@@ -71,6 +71,18 @@ worst-case cursor/cleanup/hold reservation vs both the catalog and fold-seal cap
 the serialized admission ledger); `encodeFoldSeal(...).size()` is checked against the cap before
 every PUT. Admission refuses loudly; removal is never refused.
 
+> **SUPERSEDED 2026-07-29 — the "verbatim FILES stay unqualified" clause above.** Per the
+> authoritative directive
+> `docs/superpowers/specs/2026-07-29-cas-stage-b-namespace-life-amendments.md`, namespace files ARE
+> incarnation-qualified: `roots/<ns>/<inc>/_files/<relative-name>`, and one typed
+> `NamespaceLifeId{namespace, incarnation}` — replacing `RefNamespaceId` — is required by every ref
+> AND namespace-file key helper. Manifests and loose mountpoint objects keep exactly the boundary
+> this invariant states; they are explicitly unchanged. The `_cleanup` LIST-derived physical-empty
+> proof for `_files` is deleted: rebirth never waits for `_files` to be physically empty, and LIST
+> omission may only leak storage, never affect visibility, rebirth or deletion safety. Register item
+> R1's file half is therefore closed STRUCTURALLY instead of deferred. The rest of this invariant
+> stands as written.
+
 **INV-4 — `_ckpt`.** `<ns>/<inc>/_ckpt`, token-CAS,
 `{life_epoch, checkpoint_snapshot_id | none, last_epoch_seal | none}` — forced by prefix cleaning
 (a cleaned prefix plus a hidden snapshot is indistinguishable from empty). One update algorithm for

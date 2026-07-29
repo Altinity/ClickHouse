@@ -81,6 +81,19 @@ second enumeration is the detector's own, on the rounds it samples. Reasoning an
 `2026-07-28-stage-a-retirement-verdicts.md` (item 1). The mount-time LIST probe (#23) is the store GATE
 and remains separate work.
 
+**SUPERSEDED 2026-07-30 — probe A is DELETED, not re-gated.** The authoritative directive
+`docs/superpowers/specs/2026-07-30-cas-gc-destructive-baseline-directive.md` removes the detector
+entirely: its extra LIST, `PoolConfig::gc_probe_a_period`, the `ref_list_probe` phase row with its
+`due`/`performed`/`skipped` observability, `CasGcProbeA*`, its tests and the comments that describe
+it. The gating VERDICT above is not reversed — it gated nothing, and now there is nothing to gate.
+The reason it goes rather than stays: a sampled store-quality detector whose signal is "a LIST can
+be a liar" is obsolete once the catalog is the authoritative universe (Stage B Task 4) and recovery
+is LIST-independent (Task 5b) — correctness no longer rests on LIST fidelity, so paying a second
+full `cas/refs/` enumeration to measure it buys nothing. B1/B2 accounting and the mount-time
+capability probe (#23) are explicitly KEPT. Executes as plan Task 7a of
+`docs/superpowers/plans/2026-07-28-cas-ref-chain-stage-b-catalog.md`; the result criterion is that
+no round performs a second full ref LIST.
+
 ## R9. Never-born namespaces have no late-PUT fence — [final review M4, fail-closed retention] {#r9-neverborn-fence}
 
 The recovery walk deliberately skips sealing dead epochs of non-Live streams (`CasRefLedger.cpp:768`

@@ -32,6 +32,16 @@ stands. The amendment adds Tasks 1b, 1c, 4b, 4c, 5b, 6b; the pre-existing intege
 FROZEN (the SDD ledger, the Task-1 review rounds and Stage-A cross-references all cite it), so
 inserted work carries a letter suffix meaning "runs after N", exactly as Task 7b already does.
 
+**EXTENDED 2026-07-30** by a second authoritative user directive,
+`docs/superpowers/specs/2026-07-30-cas-gc-destructive-baseline-directive.md`, which charters the
+GC-focused tail of this plan: delete probe A (Task 7a), enable catalog-proven destructive GC against
+an unchanged gate formula (Task 7b), run a SEQUENTIAL-baseline destructive soak with a measured cost
+inventory (Task 11 Steps 3c/3d), and write the successor GC performance report (Task 12). Its
+sequencing rationale is binding and is recorded as Constraint 18: probe-A removal and destruction
+enablement are separate changes so that a performance effect can be told apart from a possible
+correctness regression, and no `MultiDelete` or delete concurrency enters this round at all — the
+soak's purpose is the honest baseline those optimizations will later be measured against.
+
 **Tech Stack:** identical to Stage A (same tree, same gates, same soak harness).
 
 ## Global Constraints {#global-constraints}
@@ -78,6 +88,16 @@ task here. Additional Stage-B constraints:
     goes with it, verbatim: "`Poisoned` is not equivalent to wedge: it means a durable transaction
     may be missing from the cached view, so it must continue to block snapshot publication and
     trigger re-recovery." A task that finds itself wanting any of these raises instead of landing.
+18. **[ADDED 2026-07-30 by the GC destructive-baseline directive] The destructive round stays
+    SEQUENTIAL for this whole series:** "Пока не добавлять MultiDelete и parallel deletes: сначала
+    получить честный baseline и понять реальные затраты". No `MultiDelete`/batch-delete API, no
+    parallel delete fan-out, no delete-side concurrency anywhere in Tasks 7a/7b/11/12 — the point of
+    the round is an honest per-operation cost baseline, and a batched or parallel implementation
+    measured against no baseline is unfalsifiable. Optimizations are the NEXT round's work and are
+    justified BY these numbers. The directive's sequencing rationale is binding for the same reason:
+    probe-A removal lands as its own change BEFORE destruction is enabled, "так легче отличить
+    performance effect от возможной correctness-регрессии" — two effects in one commit are two
+    effects nobody can separate afterwards.
 
 ## Task overview {#task-overview}
 
@@ -97,22 +117,31 @@ task here. Additional Stage-B constraints:
 | 6 | Read-side contract: handles, pre-delete revalidation, namespace-file read/write closure | §2 + directive | 4,4b |
 | 6b | `trySnapshotPublishOnce` → `tryPublishSnapshotAndAdvanceCheckpointOnce` | directive impl-3 | 4c,6 |
 | 7 | R5 decommission duties | register R5 | 4,5 |
-| 7b | Destruction enablement: `UniversePolicy::kDefault` → authoritative | staging contract | 4,5,6,7 |
+| 7a | DELETE probe A — the second full ref LIST and everything that serves it | GC directive §1 | 4,5b |
+| 7b | Destruction enablement: `UniversePolicy::kDefault` → authoritative | staging contract + GC directive §2 | 4,5,6,7,7a |
 | 8 | R2+R3: writer duty queue + orphan-blob nomination (one coherent change) + model extensions | register R2/R3, §9 | 4 |
 | 9 | R1 closure note (verbatim-file rebirth aliasing) — doc only, RE-SCOPED | register R1 | 4b,6 |
 | 10 | TLA debt: `listedTok` audit, unasserted drivers, runnerless models, classifier | phase follow-ups | — |
-| 11 | Stage B gates: battery + churn/rebirth/decommission soak + verdict | §9 | all |
+| 11 | Stage B gates: battery + churn/rebirth/decommission soak + the sequential-baseline destructive soak + verdict | §9 + GC directive §3 | all |
+| 12 | GC performance research on the destructive baseline + the successor report | GC directive deliverable | 11 |
 
 Task 10 is independent of the code chain and may be scheduled at any point (still one implementer
 at a time). Task 9 is doc-only but is no longer schedule-free: the re-key must exist before it can
 record where each R1 sub-hazard went. Task 11's soak REQUIRES Task 7b (destruction enabled) — a
-soak with destruction still suppressed does not exercise Stage B's claims.
+soak with destruction still suppressed does not exercise Stage B's claims. Task 12 requires Task 11's
+soak ARTIFACTS, not merely its verdict.
 
 **Recommended execution order** (a topological order of the column above; the directive's
 §Execution commit list is honored in its own relative order):
 
-`1b → 1c → 2 → 3 → 4 → 4b → 4c → 5 → 7 → 5b → 6 → 6b → 7b`, with Task 8 anywhere after Task 4,
-Task 9 after Task 6, Task 10 anywhere, Task 11 last.
+`1b → 1c → 2 → 3 → 4 → 4b → 4c → 5 → 7 → 5b → 6 → 6b → 7a → 7b`, with Task 8 anywhere after Task 4,
+Task 9 after Task 6, Task 10 anywhere, then Task 11 and finally Task 12.
+
+**The GC tail (Tasks 7a → 7b → 11's destructive soak → 12) is a SEQUENCE, not a set**, and the
+2026-07-30 directive's rationale is why: probe-A removal is a performance change, destruction
+enablement is a correctness change, and running them together makes the soak unable to attribute
+either. Constraint 18 keeps the implementation sequential so the soak produces a baseline the next
+round's `MultiDelete`/concurrency work can be measured against.
 
 Directive commit → task: (2) pure preparation → **1b**; (3) general namespace-life identity →
 **1c**; (4) ref and file re-keying → **4** (refs, already planned) + **4b** (files); (5)
@@ -1019,6 +1048,93 @@ invent one.]
   `test_content_addressed_drop_pool_member` lane green.
 - [ ] **Step 5: Commit** `ca: decommission — catalog-exact duties; retirement fenced on owned entries`.
 
+### Task 7a: delete probe A — the second full ref LIST goes {#task-7a}
+
+[2026-07-30 GC directive step 1: "Удалить probe A. Удалить дополнительный LIST, setting, counters,
+phase, tests и устаревшие комментарии. Сохранить B1/B2 и mount-time capability probe."
+**Rationale — why it goes rather than stays:** probe A is a sampled store-quality detector whose
+entire signal is "a LIST can be a liar". Under a catalog-authoritative universe (Task 4) and
+LIST-independent recovery (Task 5b), no correctness decision rests on LIST fidelity any more — the
+detector measures a property nothing depends on, and it pays one extra FULL enumeration of
+`cas/refs/` per sampled round to do it. Register R7 ("Probe A gating policy — DECIDED and EXECUTED")
+is superseded by this task, and its supersession note lands in the same commit. **This is its own
+commit, deliberately separate from Task 7b:** probe-A removal is a PERFORMANCE change and destruction
+enablement is a CORRECTNESS change — "так легче отличить performance effect от возможной
+correctness-регрессии" (Constraint 18).]
+
+**Files:**
+- Modify: `.../Gc/CasGc.h` — DELETE `sampleRefListQuality` (`:668`) and its two documentation blocks
+  (`:206` the gating verdict, `:657-667` the detector's contract)
+- Modify: `.../Gc/CasGc.cpp` — DELETE the definition (`:3522`) and the single call site (`:460`,
+  `sampleRefListQuality(ref_scan, new_round)`); update the stale comment at `:1351` ("…is due and on
+  no others (`sampleRefListQuality`). The intake does not need a second opinion about…")
+- Modify: `.../Pool/CasPool.h` — DELETE `PoolConfig::gc_probe_a_period` (`:119`, default 16) and its
+  doc block (`:110`); grep every config/XML that sets it (tests and templates included)
+- Modify: `src/Common/ProfileEvents.cpp` — DELETE the SIX events at `:885-890`:
+  `CasGcRefScanDisagreements` (probe-A-only: "taken by a SAMPLED GC round"), `CasGcProbeADue`,
+  `CasGcProbeAPerformed`, `CasGcProbeASkipped`, `CasGcProbeAHolePresent`, `CasGcProbeAHoleAbsent`
+- Modify: `src/Interpreters/ContentAddressedGarbageCollectionLog.cpp` — DELETE the `ref_list_probe`
+  phase from the enum and from the execution-order column comment (`:60`), and the
+  `due`/`performed`/`skipped`/`holes` example from the phase-metrics column comment (`:64`)
+- Modify: `docs/en/operations/system-tables/content_addressed_garbage_collection_log.md` — **DELETE
+  the `ref_list_probe` row (`:75`)**, whose cost column literally reads "one full ref-prefix `LIST` on
+  a due round, none otherwise". This is a USER-FACING documented phase of
+  `system.content_addressed_garbage_collection_log`, so the doc and the enum must change together in
+  this commit; a phase documented but never emitted is worse than either
+- Delete: `src/Disks/tests/gtest_cas_holey_list_detector.cpp` (389 lines, 3 `TEST`s — the detector's
+  own file). Verify all three are probe-A-only before deleting the file rather than the tests
+- Modify: `src/Disks/tests/gtest_cas_retirement_sweep.cpp` — DELETE
+  `ProbeAReportsAHintHoleAndTheRoundFoldsThroughItAnyway` (`:249`), the `gc_probe_a_period` configs
+  (`:255`, `:339`, `:392`) and the `gc_probe_a_period = 0` disable test (`:415`'s assertion)
+- Modify: `src/Disks/tests/gtest_cas_gc_log.cpp` — the phase-order expectation list (`:383`) and the
+  `metricsOf(rows, 0, "ref_list_probe")` assertion (`:413`)
+- Modify: `docs/superpowers/cas/2026-07-28-ref-rework-adjacent-findings.md` — R7's supersession note
+  (**already written 2026-07-30 with the plan amendment; verify it still matches what was deleted**)
+- Modify: `docs/superpowers/specs/2026-07-27-cas-ref-chain-complete-cut-design.md` — §5's "Probe A:
+  sampled, deterministic cadence, durable due/performed/skipped observability; aborts nothing; the
+  mount-time store gate (#23) is separate." That sentence is accurate TODAY and false the moment this
+  task lands; it is corrected HERE, not pre-emptively
+
+**KEEP — named so the deletion cannot over-reach:**
+- **B1 and B2 accounting.** B1 is `logs_accounted == logs_applied` on the `fold_ref_intake` phase row;
+  B2 is the ordinals/`produced=false` accounting. Neither has anything to do with the detector.
+- **The mount-time capability probe (#23):** `Backend/CasProbe.h` (the capability battery under the
+  reserved `<prefix>/_probe/` subtree) and `Backend/CasSentinelProbe.h`. Confirmed DISTINCT code from
+  probe A — different file, different purpose, different lifecycle.
+- **FALSE POSITIVES a name-grep will hand you — do not touch them:**
+  `gtest_cas_upload_fanout.cpp:914`'s `probe_acquired` (an upload-permit test) and
+  `gtest_cas_gc_shard_plan.cpp:236`'s local `probe_a` (a `ManifestId` variable). Neither is the
+  detector.
+
+- [ ] **Step 1: the removal, red-first in the only sense available.** A deletion has no failing test
+  to write, so the pre-condition is an INVENTORY: grep `probe_a|ProbeA|ref_list_probe|
+  sampleRefListQuality|RefScanDisagreements` across the whole tree (source, tests, configs, docs) and
+  paste the full hit list into the task report. Every hit is then either deleted, corrected, or
+  explicitly classified as a false positive with the reason. The report's after-grep must return only
+  the false positives.
+- [ ] **Step 2: dead data plumbing goes too** (Constraint 3 — no leftovers whose only consumer left):
+  inspect `RefScanSummary` for fields the detector was the sole consumer of, and delete those with it.
+  A struct that still carries a field nobody reads is the residue this step exists to prevent.
+  **And the enumeration split itself:** today `Gc::enumerateRefPrefix` (`CasGc.cpp:3462`) has exactly
+  two callers — `Gc::listRefPrefix` (`:3501`, "the round's ONE full enumeration of `cas/refs/`",
+  comment at `:390`) and the detector's `probe_scan = enumerateRefPrefix()` (`:3570`). Task 4 already
+  replaced `discoverUniverse`'s enumeration with one catalog `GET`, so after this deletion the helper
+  has a single caller. Decide and record: collapse it into `listRefPrefix` if the split existed only
+  to give the detector a second, independent enumeration, or keep it with a comment saying what else
+  justifies it. Do not leave the question unasked.
+- [ ] **Step 3: the result criterion, asserted** (directive: "после удаления probe A нет второго
+  полного ref LIST"): a test that a folding round performs EXACTLY ONE full enumeration of
+  `cas/refs/` — and, critically, on EVERY round including the ones that used to be sampled (with the
+  old cadence, round 16 would have been the one to catch this; a test that only checks round 1 proves
+  nothing). Assert by LIST count attributed to the ref prefix, not by wall time.
+- [ ] **Step 4: Full CA gate — EXPECT THE COUNT TO GO DOWN**, and record the exact expected delta in
+  the report before running: 3 tests + 1 suite from the deleted detector file, plus the tests removed
+  from `gtest_cas_retirement_sweep.cpp`. A gate comparison that only ever tolerates growth would read
+  this as a regression; Task 11's baseline comparison must use the post-7a number.
+- [ ] **Step 5: Commit** `ca: gc — delete probe A: no second full ref LIST per round` (+ the R7
+  supersession note and the spec §5 correction in the same commit — the register and the spec must
+  never describe a detector the code no longer has).
+
 ### Task 7b: Destruction enablement — `UniversePolicy::kDefault` → authoritative {#task-7b}
 
 **Files:**
@@ -1038,16 +1154,47 @@ been edited once in Stage B; this task's kill-shot edit is the second and last. 
 entry reads CLOSED (naming Task 5b's commit) before flipping the constant — if it does not, the flip
 is premature and this task BLOCKS, exactly as the coupling was designed to make it.]
 
+**Interfaces — the gate formula, VERBATIM from the 2026-07-30 GC directive.** What flipping
+`kDefault` must produce in a healthy round:
+```
+frontier_complete = true
+suppress_destructive = false
+```
+What the gate itself must REMAIN:
+```
+suppress_destructive =
+    anomalies ||
+    carried_holds ||
+    !frontier_complete
+```
+"То есть holds, budget exhaustion, incomplete frontier и ошибки по-прежнему запрещают удаления" —
+holds, budget exhaustion, an incomplete frontier and errors all still forbid deletion. **The
+reconciliation a reader will ask for:** the formula has three terms but names four forbidders because
+two of them enter through existing terms — budget exhaustion is precisely how `frontier_complete`
+becomes false (spec §5: "Budget exhausted first → cursor advances may seal, all destruction
+suppressed"), and errors enter as `anomalies`. So this formula is the Stage-A/§5 gate unchanged, and
+this task changes only what `frontier_complete` is ALLOWED to become: catalog-proven true instead of
+hard-wired false. Nothing about the gate is weakened here — if the flip requires touching any term of
+that expression, the flip is wrong and the task raises instead of landing.
+
 - [ ] **Step 1:** Change `kDefault` (the source-level flip — no other seam exists). The
   kill-shot test's expectations change: "zero deletes
   because suppressed" becomes "zero deletes because namespace `A` is IN the catalog and its
   frontier is probed" — the same scenario now survives on PROOF, not suppression; the
   explicit-`AuthoritativeForTest` variant collapses into the production case and is removed. This is the ONE intentional Stage-B edit of that Stage-A test (the reviewer expects
   exactly this diff).
+- [ ] **Step 1b: assert the formula, both halves.** A healthy round on a catalog universe yields
+  `frontier_complete == true` and `suppress_destructive == false` and performs real deletes; and each
+  of the three terms independently still suppresses — one anomaly alone, one carried hold alone, one
+  budget-exhausted round alone (the `!frontier_complete` arm), each with EVERY delete family inert.
+  Assert per-family inertness, not an aggregate delete count: an aggregate zero can hide one family
+  that ran while another did not.
 - [ ] **Step 2:** Full CA gate + both CA-s3 lanes + `test_content_addressed_gc_s3` green —
   destruction now ACTIVE for the first time on the new universe; watch the delete families'
   metrics in the lane logs (nonzero deletes expected, zero anomalies).
 - [ ] **Step 3: Commit** `ca: gc — universe authoritative: production destruction enabled (Stage B)`.
+  ONE commit for the flip alone — probe A left in Task 7a's commit, and no delete-side optimization
+  rides along (Constraint 18).
 
 ### Task 8: R2+R3 — writer duty queue + orphan nomination, one coherent change {#task-8}
 
@@ -1167,6 +1314,14 @@ Commit alone; final commit updates `models/README.md` + `cas/06-tla-models.md`.
 
 **Files:**
 - Create: `docs/superpowers/cas/2026-07-XX-stage-b-RESULTS.md`
+- **PRESERVE (not create): the destructive soak's ARTIFACTS.** Task 12 does performance research on
+  this soak, and the predecessor report
+  (`docs/superpowers/reports/2026-07-29-gc-perf-audit-soak.md {#specimen-lost}`) exists partly to
+  record that a specimen was destroyed before it could be sampled. So Step 3c's run is a SPECIMEN:
+  keep the server logs, the `content_addressed_log` / `content_addressed_garbage_collection_log`
+  tables (or their dumps), the profile artifacts and the harness output under a named directory, and
+  write that path into the results file. Do NOT tear the environment down at the end of Step 3c —
+  Task 12 samples it.
 
 - [ ] **Step 1:** Full CA gtest gate vs Task 0 baseline.
 - [ ] **Step 2:** All CA integration lanes local (Stage A Task 14's list) green.
@@ -1180,7 +1335,28 @@ Commit alone; final commit updates `models/README.md` + `cas/06-tla-models.md`.
   janitor without ever blocking a rebirth; (c) decommission scenario — victim with
   hidden `Removing` entries drained correctly (Task 7 at soak scale); plus phase 3
   `--duration 90m` general soak, same PASS criteria as Stage A.
-- [ ] **Step 3b (amendment, insert-path guard):** the dedup-log-bearing workload's namespace-file
+- [ ] **Step 3c (2026-07-30 GC directive): THE SEQUENTIAL-BASELINE DESTRUCTIVE SOAK.** This is a
+  distinct, REQUIRED soak, not a variant of (a)-(c): run the destructive round on **the current
+  sequential implementation** — no `MultiDelete`, no parallel deletes, no delete-side concurrency
+  (Constraint 18). Its purpose is an honest cost baseline; "faster" is explicitly not a goal here.
+  **Cost inventory — every line MEASURED, and a line that cannot be measured is named as un-timed
+  rather than estimated:** `pending_deletes`; owner-removed manifest deletion; orphan-manifest sweep;
+  ref-object cleanup; namespace cleanup; generation pruning; and time plus number of ROUNDS to
+  fixpoint. Report per line: invocation count, S3 operation counts by verb, wall time, and share of
+  round time.
+- [ ] **Step 3d: the six result criteria, as gate rows.** Each is PASS/FAIL on evidence; a row
+  without a measurement is a FAIL, not a blank:
+
+  | # | Criterion (directive §Критерии результата) | Measured by | PASS |
+  |---|---|---|---|
+  | 1 | Healthy rounds really do perform destructive work | per-family delete counts per round in `system.content_addressed_garbage_collection_log` | every family that has work nonzero on healthy rounds; no family silently inert |
+  | 2 | `ca-fsck --detail` finds no dangling / stale-edge | `ca-fsck --detail` at soak end AND at a mid-soak checkpoint | zero dangling, zero stale-edge, both runs |
+  | 3 | Backlog reaches zero STABLY | `pending_deletes` + cleanup backlog sampled per round to fixpoint | reaches zero and STAYS zero across ≥3 further rounds (a single zero sample is not stability) |
+  | 4 | Holds/anomalies still suppress every irreversible path | inject one hold and one anomaly during the soak | all delete families inert for those rounds, per family, and the round still completes |
+  | 5 | After probe-A removal there is no second full ref LIST | LIST counts per round attributed by prefix | exactly ONE full `cas/refs/` enumeration per round, on EVERY round including those probe A used to sample |
+  | 6 | Phase timings + S3 operation counts give the baseline | the Step-3c inventory | recorded as the explicit `MultiDelete`/concurrency baseline, with the un-timed spans named |
+
+- [ ] **Step 3e (namespace-life amendment, insert-path guard):** the dedup-log-bearing workload's namespace-file
   operation profile is UNCHANGED versus the Task-4b baseline (Constraint 16) — compare the
   per-operation backend request counts from the soak's `content_addressed_log`/ProfileEvents, not
   a micro-benchmark; any increase on that path is a Stage-B FAIL, not a note.
@@ -1188,8 +1364,56 @@ Commit alone; final commit updates `models/README.md` + `cas/06-tla-models.md`.
   the post-B residual list (what remains open: R4 registry, head-CAS north star §10, the
   `ApplyPending` debug-only evaluation from `{#follow-ups}`, and whatever Task 9 Step 2 concluded
   about loose mountpoint objects — R1 *implementation* is no longer on that list, the amendment
-  landed it).
+  landed it). Include the Step-3c/3d destructive-baseline table and the specimen path; the verdict
+  line stays `STAGE B: PASS`/`FAIL`.
 - [ ] **Step 5: Commit** `ca: stage B — gate battery results + verdict`.
+
+### Task 12: GC performance research on the destructive baseline {#task-12}
+
+[The 2026-07-30 GC directive's DELIVERABLE: "Провести исследование производительности GC на этом
+soak-е и написать новый документ вида `docs/superpowers/reports/2026-07-29-gc-perf-audit-soak.md`" —
+its successor for the destructive baseline. Research and write-up ONLY: this task implements no
+optimization (Constraint 18 — `MultiDelete` and concurrency are the next round's work, and this
+document is what justifies them).]
+
+**Files:**
+- Create: `docs/superpowers/reports/2026-07-XX-gc-destructive-baseline-perf.md` (date at execution) —
+  the successor report; it must link the predecessor
+  `docs/superpowers/reports/2026-07-29-gc-perf-audit-soak.md` and say which of its ranked
+  opportunities the destructive baseline confirms, refutes or leaves untouched
+- Modify: `docs/superpowers/cas/BACKLOG.md` — each ranked opportunity becomes a backlog entry, so the
+  report is actionable rather than admired
+
+**Interfaces — the report's required content, in the house shape the predecessor establishes:**
+- **Scope + the evidence rule** up front: which specimen, which artifacts, what the numbers can and
+  cannot answer (predecessor `{#scope}`).
+- **Phase decomposition** of the destructive round: per-phase wall time and S3 operations by verb,
+  covering every line of Task 11 Step 3c's inventory — `pending_deletes`, owner-removed manifest
+  deletion, orphan-manifest sweep, ref-object cleanup, namespace cleanup, generation pruning — plus
+  time and ROUNDS to fixpoint.
+- **Un-timed spans NAMED, never estimated silently** — the predecessor's
+  `{#fold-cost-structure}` "what is measurable and what is not" discipline. A span with no
+  instrumentation is listed as un-timed with the reason, and if it is load-bearing the report says
+  what instrumentation would answer it. An estimate presented as a measurement is the one failure
+  mode this section exists to prevent.
+- **Before / after where it is honest, and an explicit refusal where it is not.** Probe-A removal HAS
+  a before/after (LIST count and round time, pre- and post-Task-7a) and gets one. Destruction does
+  NOT: it never ran in production before Task 7b, so there is no "before" — say that instead of
+  manufacturing a comparison against a suppressed round, which measured a different workload.
+- **Ranked opportunities for the NEXT round**, each with the measurement that motivates it and a
+  falsification condition — specifically whether `MultiDelete` and delete concurrency are worth it,
+  which phase they would touch, and what the baseline says the ceiling is.
+- **Evidence index**: every figure traceable to an artifact path + query/command.
+
+- [ ] **Step 1:** Sample the preserved specimen (Task 11's artifact directory). Do NOT re-run the
+  soak to get numbers — a second run is a different specimen, and mixing the two is how the
+  predecessor's `{#cautions}` section came to exist.
+- [ ] **Step 2:** Write the report to the shape above.
+- [ ] **Step 3: re-read every figure from the artifacts AT WRITE TIME**, immediately before
+  committing — recalled numbers go stale as the analysis progresses, and a figure that was correct
+  when measured can be wrong by the time the sentence around it is finished. Any figure that cannot
+  be re-derived from the evidence index is removed, not softened.
+- [ ] **Step 4: Commit** `ca: reports — GC destructive-baseline performance research`.
 
 ---
 
@@ -1233,7 +1457,18 @@ Commit alone; final commit updates `models/README.md` + `cas/06-tla-models.md`.
    `Live`), T4c (conflicting `_ckpt.life_epoch`), T6 (stale reader; delayed writer finalized
    after rebirth; zero catalog GETs on namespace-file hot paths); `ApplyPending` follow-up →
    `{#follow-ups}`, implemented by nobody.
-5. Amendment interactions a reviewer must check on sight: the `stageATransition()` retirement gate
+5. **GC directive coverage (2026-07-30), element by element:** §Sequence-1 delete probe A → **T7a**
+   (+ R7's supersession note in the register and the spec §5 correction, both in T7a's commit);
+   §Sequence-2 destructive enablement with the gate formula VERBATIM → **T7b** (Interfaces block +
+   Step 1b's per-term suppression asserts; the formula is unchanged, only what `frontier_complete` may
+   become changes); §Sequence-3 sequential-baseline soak + the seven-line cost inventory → **T11 Step
+   3c** (+ the specimen-preservation obligation in T11's Files, because the predecessor report exists
+   partly to record a specimen destroyed before sampling); §Критерии результата, all six → **T11 Step
+   3d** as explicit PASS/FAIL gate rows; §Deliverable → **T12** (successor report, research only);
+   "no `MultiDelete`, no parallel deletes" + the two-separate-changes rationale → **Constraint 18**,
+   binding on T7a/T7b/T11/T12. The R7 register entry is the only cross-reference the directive named,
+   and it landed with the plan amendment rather than being deferred to execution.
+6. Amendment interactions a reviewer must check on sight: the `stageATransition()` retirement gate
    (T6 Step 1b) now covers the FILE call sites T1c/T4b introduce; `gtest_cas_list_liar_end_to_end.cpp`
    has TWO legitimate Stage-B editors after the amendment (T5b for the capstone sentinels it
    deliberately reds, T7b for the kill-shot) — Task 4's "only edit" line is amended in place;
