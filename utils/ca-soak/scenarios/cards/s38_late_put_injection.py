@@ -231,20 +231,39 @@ def _violation_counters(cluster, events):
     prevent. A read failure on a required node is a CARD FAILURE, raised here, because a counter that
     cannot be read is not a counter that is quiet."""
     peak = {e: 0 for e in events}
+    names = ", ".join(f"'{e}'" for e in events)
     for node in cluster.nodes():
+        # `system_events_show_zero_values = 1` is what makes the missing-counter check meaningful.
+        # Without it `system.events` OMITS every counter that has never incremented, so "the binary
+        # does not have this counter" and "this counter is zero" are the same observation — and a probe
+        # that treats absence as a hard error then fails on a perfectly healthy fresh cluster, which is
+        # exactly what happened on this card's first run. With it, the binary enumerates its whole
+        # registry, so a name still missing really is missing. Same technique as
+        # `soak/signals.py:read_signal_events`.
         try:
-            ev = observe.events_snapshot(node)
+            txt = node.query(
+                f"SELECT event, value FROM system.events WHERE event IN ({names}) "
+                f"FORMAT TabSeparated SETTINGS system_events_show_zero_values = 1")
         except Exception as exc:
             raise RuntimeError(
                 f"counter probe FAILED on {node!r} ({type(exc).__name__}: {str(exc)[:160]}) — refusing "
                 f"to report the always-zero invariant as held on an unread node") from exc
+        ev = {}
+        for line in txt.splitlines():
+            if "\t" in line:
+                k, v = line.split("\t", 1)
+                try:
+                    ev[k] = int(v)
+                except ValueError:
+                    pass
         missing = [e for e in events if e not in ev]
         if missing:
             raise RuntimeError(
-                f"counter probe on {node!r} did not return {missing} — the binary does not have these "
-                f"counters, or the query shape changed; refusing to treat absence as zero")
+                f"counter probe on {node!r} did not return {missing} even with "
+                f"system_events_show_zero_values=1 — this binary does not have those counters; "
+                f"refusing to treat absence as zero")
         for e in events:
-            peak[e] = max(peak[e], int(ev.get(e, 0) or 0))
+            peak[e] = max(peak[e], int(ev[e]))
     return peak
 
 

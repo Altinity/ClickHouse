@@ -17,10 +17,18 @@ from scenarios.cards.s38_late_put_injection import _VIOLATION_EVENTS, _violation
 
 
 class _Node:
+    """Answers `query` the way a server does: TSV, and — because the probe asks with
+    `system_events_show_zero_values = 1` — including the counters that are still zero."""
+
     def __init__(self, name, values=None, raises=None):
         self.name = name
         self.values = values
         self.raises = raises
+
+    def query(self, sql, **kw):
+        if self.raises is not None:
+            raise self.raises
+        return "".join(f"{k}\t{v}\n" for k, v in self.values.items())
 
     def __repr__(self):
         return self.name
@@ -32,19 +40,6 @@ class _Cluster:
 
     def nodes(self):
         return self._nodes
-
-
-@pytest.fixture(autouse=True)
-def _stub_events(monkeypatch):
-    """Route `observe.events_snapshot` at the node stubs above."""
-    from scenarios.cards import s38_late_put_injection as card
-
-    def fake(node):
-        if node.raises is not None:
-            raise node.raises
-        return dict(node.values)
-
-    monkeypatch.setattr(card.observe, "events_snapshot", fake)
 
 
 def _all_zero():
@@ -77,8 +72,10 @@ def test_partial_probe_failure_raises_too():
 
 
 def test_a_missing_counter_is_not_a_zero():
-    """`system.events` omits counters that never incremented, which makes "the binary lacks this
-    counter" and "this counter is zero" indistinguishable unless the probe refuses the ambiguity."""
+    """With `system_events_show_zero_values = 1` the binary enumerates its whole registry, so a name
+    still absent really is absent — a counter this build does not have, which must not read as zero.
+    (Without that setting the check would be wrong in the other direction and would fail on any fresh
+    cluster whose counters have not moved yet; that is how the first run of this card broke.)"""
     partial = _all_zero()
     partial.pop(_VIOLATION_EVENTS[0])
     cl = _Cluster(_Node("n1", partial))
