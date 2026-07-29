@@ -35,8 +35,6 @@ so a body at an id the new life has not reached yet is not on any path until the
 that far.
 """
 
-import time
-
 from soak.cluster import QueryError
 
 from ..framework import cluster_boot, observe, sql
@@ -56,6 +54,8 @@ from .s38_late_put_injection import (
 )
 
 _TABLE = "w3_recreated"
+# The CA disk these configs mount (storage_conf_s38_ch{1,2}.xml name the policy's single disk `ca`).
+_DISK = "ca"
 
 # Fixed so the two lives of the table share a namespace path. The whole scenario is that the second
 # life reuses the first life's prefix, which a fresh uuid would quietly avoid.
@@ -154,18 +154,40 @@ class S43(Scenario):
         result.observations["donor"] = {"key": donor_key, "bytes": len(donor_body)}
 
         # =====================================================================================
-        # Quiesce, then remove it: drop the table (the defence), stop the servers, recreate the pool.
+        # Quiesce, then remove it: drop the table (the defence), have the product RELEASE the pool,
+        # then reuse the prefix.
         # =====================================================================================
         cl.node1.command(f"DROP TABLE {_TABLE} SYNC")
         ctx.log("S43: table dropped (quiesce — the defence this card is about to remove)")
-        stop_rc = cluster_boot.compose_run(self.compose_variant, "stop", "ch1", "ch2",
-                                          log_fn=ctx.log)
-        result.observations["compose_stop_rc"] = stop_rc
+
+        # RECREATE THE POOL THROUGH THE PRODUCT, not by yanking bytes out from under a running mount.
+        # The first version of this card stopped the containers and emptied the prefix; the servers
+        # then never came back healthy, because a mounted disk whose pool bookkeeping simply vanished
+        # is not a recreated pool, it is a broken one — and the card never got to ask its question.
+        # `SYSTEM CONTENT ADDRESSED FORGET` is the product's own teardown: force-Vanish, node-local,
+        # stops and joins every CAS background thread for that disk. Only once BOTH mounts have
+        # forgotten the pool is the prefix genuinely free to be reused.
+        forgotten = {}
+        for node in cl.nodes():
+            try:
+                node.command(f"SYSTEM CONTENT ADDRESSED FORGET '{_DISK}'")
+                forgotten[repr(node)] = node.scalar(
+                    f"SELECT lifecycle || '(' || lifecycle_reason || ')' "
+                    f"FROM system.content_addressed_mounts WHERE disk = '{_DISK}'") or "(no row)"
+            except QueryError as e:
+                forgotten[repr(node)] = f"ERROR: {str(e)[:160]}"
+        result.observations["forget"] = forgotten
+        all_vanished = all("vanished" in v for v in forgotten.values())
         result.add(Verdict.check(
-            "the servers stopped for the pool wipe", "compose stop returns 0", stop_rc, stop_rc == 0,
-            "" if stop_rc == 0 else "the wipe would have run underneath LIVE servers, which tests "
-                                    "something else entirely"))
-        time.sleep(3)
+            "both mounts FORGOT the pool before its prefix was reused",
+            "system.content_addressed_mounts reports vanished(...) on every node",
+            forgotten, all_vanished,
+            "" if all_vanished else "a mount still holds the pool, so emptying the prefix would be "
+                                    "pulling bytes out from under it rather than recreating a pool"))
+        if not all_vanished:
+            _common.standard_end(ctx, result, [_TABLE])
+            return
+
         wiped = _wipe_pool(s3, ctx.log)
         result.observations["pool_wipe"] = {"objects_deleted": wiped}
 
@@ -197,8 +219,11 @@ class S43(Scenario):
             "a GET of the injected id returns the injected body",
             f"{len(planted)} bytes", planted == survivor_body, ""))
 
-        start_rc = cluster_boot.compose_run(self.compose_variant, "start", "ch1", "ch2",
-                                           log_fn=ctx.log)
+        # A restart re-mounts the (now empty) prefix as a FRESH pool: a new pool identity, and the
+        # writer-epoch counter starting from the beginning — which is the precondition the whole
+        # scenario rests on, because it is what leaves the survivor unfenced.
+        start_rc = cluster_boot.compose_run(self.compose_variant, "restart", "ch1", "ch2",
+                                            log_fn=ctx.log)
         result.observations["compose_start_rc"] = start_rc
         result.add(Verdict.check(
             "the servers were started again", "compose start returns 0", start_rc, start_rc == 0, ""))
