@@ -1937,3 +1937,6 @@ honest fault-count caveat.
 **2026-07-29 12:00 local** — watchdog: soak2 tick #42 (~51 min, inside the chaos window),
 pool plateaued at 23.57GB, signals 2/2, suppressed-clamp counter ticking as expected (5->6),
 load 3.9, no builds. ETA 12:39. All agents in assigned states.
+**2026-07-29 12:20 local** — watchdog: soak2 tick #58 (~71 min), pool ~23.9GB, signals 2/2,
+clamp counter 11, no CheckpointFailure; archived pre-t14b log dirs intact. ETA 12:39; a14's
+dump+scenarios queue next. Load 3.3, quiet. Idle otherwise.
