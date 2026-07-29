@@ -2102,3 +2102,6 @@ the final. Still awaiting a14's flip commit (nudged with PIDs).
 checkpoint is BOUNDED (band-settling + scaled timeout, inserts paused) — my (b) premise was
 wrong; criteria strengthening (37 rounds). Hard deadline t+120m -> auto-(b). One reviewable
 flip commit on return.
+**2026-07-29 17:21 local** — watchdog: codex r2 running (575KB); soak driver alive inside its
+bounded fixpoint (deadline t+120m armed at a14); verdict still PENDING pending natural
+return. All other lanes parked. Nothing wedged.
