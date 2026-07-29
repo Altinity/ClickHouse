@@ -1665,3 +1665,7 @@ reading/red-design phase (no logs yet, ~15 min in). No push.
 debug 01:13, complete sizes); DONE report pending (~18 min — write-up window, nudge next tick
 if silent). T10 already red→green (premise + FoldSealFormat edits), full lane gate running.
 No push.
+
+**2026-07-29 02:00 local watchdog** — T6 silent ~45 min post-gates/post-verdicts (4 commits, no
+verdict-items commit, no report) — finalization nudge sent with the explicit 4-item remainder.
+T10 gate running. No push.
