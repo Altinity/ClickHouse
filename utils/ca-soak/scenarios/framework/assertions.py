@@ -193,7 +193,7 @@ def _classify_residual(fsck_detail_res: dict) -> dict:
     """Split the non-reachable detail rows into: `leak` (uncondemned orphan blobs/_manifests — a real
     leak), `pipeline` (condemned pending-gc/awaiting-gc content in the deletion pipeline — expected),
     and `bookkeeping` (everything else: gc/ state, root objects, _pool_meta, verbatim _files)."""
-    leak, pipeline, bookkeeping = {}, {}, {}
+    leak, leak_by_class, pipeline, bookkeeping = {}, {}, {}, {}
     for r in (fsck_detail_res or {}).get("detail", []):
         cls = r.get("class")
         if cls == "reachable":
@@ -203,20 +203,35 @@ def _classify_residual(fsck_detail_res: dict) -> dict:
             pipeline[prefix] = pipeline.get(prefix, 0) + 1
         elif cls in _LEAK_CLASSES and prefix in RECLAIMABLE_UNREACHABLE_PREFIXES:
             leak[prefix] = leak.get(prefix, 0) + 1
+            # The same rows keyed by CLASS as well as prefix. `leak` alone cannot answer "is this the
+            # gated-delete family?", because that question is about the class (`unreachable`, i.e.
+            # never condemned) as much as the prefix.
+            leak_by_class[f"{cls}:{prefix}"] = leak_by_class.get(f"{cls}:{prefix}", 0) + 1
         else:  # unreachable/dangling on a bookkeeping prefix, or any other non-reachable class
             bookkeeping[f"{cls}:{prefix}"] = bookkeeping.get(f"{cls}:{prefix}", 0) + 1
-    return {"leak": leak, "pipeline": pipeline, "bookkeeping": bookkeeping}
+    return {"leak": leak, "leak_by_class": leak_by_class, "pipeline": pipeline,
+            "bookkeeping": bookkeeping}
 
 
 def assert_no_leftovers(result, fsck: dict, abandons: bool = False, residual_after_gc=None,
                         fsck_detail_res: dict = None):
-    """After forced GC, no reclaimable content is a genuine ORPHAN. The residual is split by fsck
-    class: `leak` (uncondemned unreachable/dangling `blobs/`/`_manifests/` — a real content leak, e.g.
-    the GC-CONCURRENT-LEADER-LEAK) FAILS; `pipeline` (condemned `pending-gc`/`awaiting-gc` content
-    awaiting ack-floor graduation) is EXPECTED and bounded — it PASSES (a create/insert/DROP at the
-    quiesced fixpoint always leaves the last drop's condemned blobs in the pipeline until the periodic
-    retired-view sync advances the floor); `bookkeeping` (GC state, root/namespace-registry objects)
-    also PASSES. Abandoning scenarios relax to recorded+classified (their own bound assertion governs).
+    """After forced GC, no reclaimable content is a genuine ORPHAN — narrowed, for Stage A only, by one
+    permitted family.
+
+    The residual is split by fsck class. `dangling` FAILS unconditionally and is checked separately,
+    because a missing referenced object is data loss and no posture excuses it. `pipeline` (condemned
+    `pending-gc`/`awaiting-gc` awaiting ack-floor graduation) PASSES — a create/insert/DROP at the
+    quiesced fixpoint always leaves the last drop's condemned blobs there. `bookkeeping` (GC state,
+    root/namespace-registry objects) PASSES.
+
+    Of the leak classes, EXACTLY ONE is permitted while `UniversePolicy::kDefault` is
+    `StageA_Suppressed`: `unreachable` on `_manifests`, the gated-delete family — manifest bodies are
+    deleted at a suppressed site and never condemned first, so they can only accumulate. It is counted
+    and reported in the verdict, never silent. Every other leak still FAILS, including blob leaks of
+    any class (the class this assertion was written for, and the one that catches
+    GC-CONCURRENT-LEADER-LEAK). AT TASK 7b the permitted family goes away and zero tolerance returns.
+
+    Abandoning scenarios relax to recorded+classified (their own bound assertion governs).
 
     Non-vacuity review (2026-07-25 sweep): `val is None` (fsck/residual unavailable) is guarded above
     into `inconclusive`. `val == 0` is a deliberate, legitimate PASS, not a vacuous one — it is a
@@ -239,25 +254,67 @@ def assert_no_leftovers(result, fsck: dict, abandons: bool = False, residual_aft
             "no unbounded leftovers", "no orphan content",
             f"residual={val} but fsck detail unavailable to classify by class"))]
 
-    leak_n = sum(parts["leak"].values())
     pipeline_n = sum(parts["pipeline"].values())
+
+    # ##########################################################################################
+    # ###  STAGE-A CONTRACT.  RESTORE ZERO-TOLERANCE AT STAGE B TASK 7b.                     ###
+    # ##########################################################################################
+    # `UniversePolicy::kDefault` is `StageA_Suppressed`, so every destructive site reachable from GC is
+    # gated and NOTHING is reclaimed. Manifest bodies are deleted at such a gated site and are never
+    # condemned first, so under Stage A they can only accumulate as `unreachable` — which this
+    # assertion used to call a leak, failing every card that drops a table.
+    #
+    # The contract is NARROWED, not disabled. Exactly one class is permitted: `unreachable` on
+    # `_manifests`, i.e. the gated-delete family. It is COUNTED and REPORTED in the verdict, never
+    # silent. Everything else still fails: blob leaks of any class (the class this assertion was
+    # written for, and the one that catches GC-CONCURRENT-LEADER-LEAK), `dangling` and `unaccounted`
+    # anywhere, and `unreachable` on `blobs`.
+    #
+    # AT TASK 7b: delete `_suppressed`/`_hard` below and restore `if leak_n > 0` — when `kDefault`
+    # flips, reclamation resumes and zero tolerance is correct again.
+    _suppressed = {k: v for k, v in parts["leak_by_class"].items() if k == "unreachable:_manifests"}
+    _hard = {k: v for k, v in parts["leak_by_class"].items() if k != "unreachable:_manifests"}
+    suppressed_n = sum(_suppressed.values())
+    hard_n = sum(_hard.values())
+
+    # `dangling` is data loss, not retention, and is asserted independently of the classifier so a
+    # future change to the buckets cannot quietly stop checking it.
+    dangling_n = (fsck or {}).get("dangling")
+    if dangling_n:
+        return [result.add(Verdict.check(
+            "no unbounded leftovers", "dangling == 0 (a referenced object is missing)",
+            f"dangling={dangling_n}", False,
+            "dangling is data loss and is NEVER excused by Stage-A suppression"))]
+
+    if hard_n > 0:
+        v = result.add(Verdict.check(
+            "no unbounded leftovers",
+            "no leak outside the Stage-A gated-delete family (unreachable:_manifests)",
+            f"{hard_n} orphan outside the permitted family (hard={_hard}, "
+            f"suppressed={_suppressed}, pipeline={parts['pipeline']})", False,
+            "uncondemned orphan objects remain that Stage-A suppression does NOT explain — a real "
+            "GC leak"))
+        result.note_anomaly(
+            f"forced GC left {hard_n} orphan object(s) OUTSIDE the Stage-A gated-delete family: "
+            f"{_hard}. Suppression explains `unreachable:_manifests` and nothing else, so this is not "
+            f"the posture — if explicit GC was driven concurrently with background GC (or on both "
+            f"replicas), this is likely the known GC-CONCURRENT-LEADER-LEAK (see BACKLOG).")
+        return [v]
+
+    if suppressed_n > 0:
+        return [result.add(Verdict(
+            "no unbounded leftovers",
+            "residual is the Stage-A gated-delete family, the condemned pipeline, and/or bookkeeping",
+            f"residual={val}: {suppressed_n} retained by Stage-A suppression ({_suppressed}), "
+            f"pipeline={parts['pipeline']}, bookkeeping={parts['bookkeeping']}", "pass",
+            f"STAGE-A CONTRACT: {suppressed_n} unreachable manifest object(s) retained because their "
+            f"deletion site is gated (`UniversePolicy::kDefault = StageA_Suppressed`). Counted and "
+            f"reported, never silent. AT TASK 7b this becomes a FAILURE again."))]
 
     if abandons:
         return [result.add(Verdict("leftovers (abandoning scenario)", "bounded+classified",
                                    f"residual={val} classes={parts}", "pass",
                                    "abandoning scenario — see scenario-specific bound assertion"))]
-
-    if leak_n > 0:
-        v = result.add(Verdict.check(
-            "no unbounded leftovers", "no uncondemned orphan blobs/manifests after forced GC",
-            f"{leak_n} orphan (leak={parts['leak']}, pipeline={parts['pipeline']})", False,
-            "uncondemned unreachable content/manifest objects remain — a real GC leak"))
-        result.note_anomaly(
-            f"forced GC left {leak_n} UNCONDEMNED orphan object(s) (unreachable/dangling blobs/_manifests): "
-            f"{parts['leak']}. These are NOT in the two-phase pipeline (that would be pending-gc). If explicit "
-            f"GC was driven concurrently with background GC (or on both replicas), this is likely the known "
-            f"GC-CONCURRENT-LEADER-LEAK (see BACKLOG): a divergent-fold abort orphans owner-removal events.")
-        return [v]
 
     # No orphan leak. Residual is the condemned deletion pipeline and/or bookkeeping — expected+bounded.
     return [result.add(Verdict(
