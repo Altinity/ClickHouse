@@ -35,8 +35,8 @@ def lease_not_held_error(node="Node(localhost:8123)"):
     # damage. The harness must recognise it here or a routine chaos-window fence becomes a WORKLOAD
     # FAILURE (it did once, and killed a 2.5h soak).
     body = ("Code: 210. DB::Exception: content-addressed disk 'ca' -- mount lease not held; backing may "
-            "be temporarily unreachable; TRANSIENT unavailability, not damage -- the operation is "
-            "admitted again once the disk recovers to Live. (NETWORK_ERROR) (version 26.6.1.1)")
+            "be temporarily unreachable; the operation is admitted again once the disk recovers to Live; "
+            "TRANSIENT unavailability, not damage. (NETWORK_ERROR) (version 26.6.1.1)")
     return QueryError(node, 500, body, "INSERT INTO ca_stress VALUES")
 
 

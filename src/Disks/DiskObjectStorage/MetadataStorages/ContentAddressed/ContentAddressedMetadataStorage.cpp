@@ -1114,7 +1114,8 @@ CasOpAdmission ContentAddressedMetadataStorage::checkOpAdmitted(CasOpClass op) c
         /// who STOPped GC pre-maintenance: this is a wait, not a dead end.
         Cas::throwCasTransientUnavailable(
             fmt::format("content-addressed disk '{}'", disk_name),
-            "mount lease not held; backing may be temporarily unreachable");
+            "mount lease not held; backing may be temporarily unreachable; the operation is admitted "
+            "again once the disk recovers to Live");
 
     /// `IdentityLost` and the terminal `Vanished*` states carry the typed per-reason [D5] message the pool
     /// owns (single source). A SETTLED `Vanished` pool answers `Probe`/`Remove` truthfully without touching
@@ -1164,11 +1165,13 @@ void ContentAddressedMetadataStorage::confirmPoolIdentityForEmptyEnumeration(con
             /// Absence was NEVER established (a transport/permission fault). Fail closed and TRANSIENT --
             /// never promote an unproven probe into an empty answer, and never let a consumer read an
             /// unreachable pool identity as damage. The arm above, where absence IS proven, keeps its
-            /// terminal 668: an erased backing does not heal by retrying.
+            /// terminal 668: an erased backing does not heal by retrying. This arm promises no particular
+            /// recovery either: `AccessDenied` is a credential/policy fault that a return to `Live` does
+            /// not clear, so "retry" is the only honest guidance for the pair.
             Cas::throwCasTransientUnavailable(
                 fmt::format("content-addressed disk '{}'", disk_name),
                 fmt::format("pool identity object could not be confirmed while enumerating '{}' "
-                            "(transport or permission fault) -- refusing the empty answer", path));
+                            "(transport or permission fault) -- refusing the empty answer; retry", path));
     }
 }
 
@@ -2210,10 +2213,14 @@ CaRelinkPrepare ContentAddressedMetadataStorage::prepareAdoptFromManifest(
     catch (const Exception & e)
     {
         /// `ABORTED` or `NETWORK_ERROR` means a body-absent precommit, a precommit binding that is no
-        /// longer the live owner, or a ref conflict: retryable, and the sender still has the part, so the
-        /// caller may fetch its bytes. `prepareEntries` abandons its own build before propagating, so
-        /// nothing is staged and no `+1` is left behind. Any other error propagates — an unclassified
-        /// local failure is not evidence that a byte fetch would do better.
+        /// longer the live owner, a ref conflict, or — since the transient-classifier round — this node's
+        /// own mount fence refusing the work (`throwCasTransientUnavailable`): all retryable, and the
+        /// sender still has the part, so the caller may fetch its bytes. `prepareEntries` abandons its own
+        /// build before propagating, so nothing is staged and no `+1` is left behind. The fence case needs
+        /// no special handling and stays fail-close by construction: the byte fetch it falls back to writes
+        /// through the SAME fenced disk and is refused in turn, so the fallback cannot smuggle a write past
+        /// a lost incarnation. Any other error propagates — an unclassified local failure is not evidence
+        /// that a byte fetch would do better.
         if (e.code() != ErrorCodes::ABORTED && e.code() != ErrorCodes::NETWORK_ERROR)
             throw;
         LOG_INFO(getLogger("ContentAddressedMetadataStorage"), "Relink of part {} deferred (body-absent precommit, "

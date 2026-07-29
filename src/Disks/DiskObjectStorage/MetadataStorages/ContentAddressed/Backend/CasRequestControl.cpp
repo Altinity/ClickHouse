@@ -205,9 +205,13 @@ std::exception_ptr makeCasWriteRetryLaterExceptionPtr(const String & why)
     /// The code is coarse (it shares a `system.errors` row with socket failures), so the MESSAGE must
     /// carry the whole truth: which CA condition refused, and that the refusal is a state rather than
     /// damage. Consumers key on the code; operators read this line.
+    ///
+    /// The shared suffix carries ONLY the classification, because that is the one claim true at every
+    /// site: retry-later is right even where the condition may turn out terminal, since the next attempt
+    /// re-decides against fresh state. Any promise about HOW the condition clears belongs in `condition`,
+    /// where the site that can actually prove it makes it -- `checkFenceOrThrow` provably cannot.
     throw Exception(ErrorCodes::NETWORK_ERROR,
-        "{} -- {}; TRANSIENT unavailability, not damage -- the operation is admitted again once the disk "
-        "recovers to Live", subject, condition);
+        "{} -- {}; TRANSIENT unavailability, not damage", subject, condition);
 }
 
 CasRequestController::CasRequestController(BackendPtr backend_, CasRequestBudget budget_, std::function<uint64_t()> now_ms_,

@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <stdexcept>
 #include <string>
 
 /// Task 8 (rev.7 spec §1): the central six-class operation gate (`checkOpAdmitted`), the `Vanished` truth
@@ -84,7 +85,11 @@ std::string messageOf(const std::function<void()> & fn)
 }
 
 /// The thrown exception itself, for the tests that assert against an upstream CLASSIFIER rather than
-/// against an error code.
+/// against an error code. NEVER returns a null `exception_ptr`: every consumer feeds the result to a
+/// classifier that rethrows it, and `std::rethrow_exception(nullptr)` is undefined behaviour that takes
+/// the whole binary down instead of failing one test. On the nothing-was-thrown path the failure is
+/// recorded and a SENTINEL is returned -- the test has already failed by then, and the sentinel merely
+/// keeps the assertion that follows harmless.
 std::exception_ptr exceptionOf(const std::function<void()> & fn)
 {
     try
@@ -95,8 +100,8 @@ std::exception_ptr exceptionOf(const std::function<void()> & fn)
     {
         return std::current_exception();
     }
-    ADD_FAILURE() << "expected a DB::Exception";
-    return {};
+    ADD_FAILURE() << "expected a DB::Exception, nothing was thrown";
+    return std::make_exception_ptr(std::runtime_error("exceptionOf sentinel: nothing was thrown"));
 }
 
 /// The Pool-level `server_root_id` a test mount uses (mirrors gtest_cas_lifecycle_condition.cpp).
@@ -290,6 +295,11 @@ TEST(CasOperationGate, TransientRefusalIsUpstreamRetryableTerminalIsNot)
         auto storage = openGateStorage();
         commitOnePart(*storage);
         storage->store()->setLifecycleForTest(PoolLifecycle::IdentityLost);
+        /// Pin WHICH error is being classified before classifying it: `EXPECT_FALSE` alone passes for any
+        /// non-retryable error, so a future regression that threw something else entirely here -- or threw
+        /// from the wrong site -- would slip through as a pass.
+        Cas::tests::expectThrowsCode(ErrorCodes::INVALID_STATE, [&] { storage->getFileSize(kPartFile); });
+        EXPECT_NE(messageOf([&] { storage->getFileSize(kPartFile); }).find("identity lost"), std::string::npos);
         EXPECT_FALSE(isRetryableException(exceptionOf([&] { storage->getFileSize(kPartFile); })))
             << "a terminal identity loss must NOT be retried forever as if it were transient";
     }

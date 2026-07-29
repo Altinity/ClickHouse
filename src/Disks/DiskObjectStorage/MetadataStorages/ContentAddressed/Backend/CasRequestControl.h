@@ -291,14 +291,20 @@ std::exception_ptr makeCasWriteRetryLaterExceptionPtr(const String & why);
 /// was chosen over widening the upstream classifier because `INVALID_STATE` is broad: widening it would
 /// also reclassify 18 unrelated TERMINAL sites, CA and non-CA alike.
 ///
-/// SCOPE, narrow by design: only a refusal naming an AUTO-RECOVERING disk condition routes here.
-/// Terminal CA states -- `IdentityLost`, both `Vanished` flavours, a storage that is not started, an
-/// unbootstrappable prefix, a closed writer epoch -- keep `INVALID_STATE`. A terminal state that read as
-/// retryable would make every consumer retry forever against a disk that is never coming back.
+/// SCOPE, narrow by design: a refusal routes here when it either names an AUTO-RECOVERING disk condition,
+/// or CANNOT ESTABLISH that its condition is terminal. `checkFenceOrThrow` is the second kind -- one guard
+/// trips for a lease blip and for a FORGET decommission alike and it cannot tell them apart -- and it is in
+/// scope for write-plane uniformity: its 32 sibling write-transient sites already mint this class, and an
+/// unproven condition must be retried rather than consumed as damage. What is NEVER in scope is a refusal
+/// whose condition is PROVEN terminal: `IdentityLost`, both `Vanished` flavours, a storage that is not
+/// started, an unbootstrappable prefix, a proven-absent pool identity, a closed writer epoch -- all keep
+/// `INVALID_STATE`. A proven-terminal state that read as retryable would make every consumer retry forever
+/// against a disk that is never coming back.
 ///
 /// `subject` names the refusing disk or pool (e.g. "content-addressed disk 'ca'") and `condition` states
-/// the CA condition truthfully; the transient classification is appended HERE so it cannot drift between
-/// call sites. Unlike `throwCasWriteRetryLater` this deliberately does not log: these sites fire once per
+/// the CA condition truthfully, INCLUDING any promise about how it clears -- only the site knows whether
+/// it can make one. What is appended HERE is the classification alone, so it cannot drift between call
+/// sites. Unlike `throwCasWriteRetryLater` this deliberately does not log: these sites fire once per
 /// refused operation (tens of thousands within a single observed lease gap) and every caller already
 /// reports the exception it receives.
 [[noreturn]] void throwCasTransientUnavailable(const String & subject, const String & condition);
