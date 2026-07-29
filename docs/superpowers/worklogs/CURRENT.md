@@ -2062,3 +2062,7 @@ the amplifier, TWO self-found gates (marker-sync prerequisite; TLA refutes-as-wr
 required sApplyPending split where _sab_stalecache must FLIP GREEN). Upstream measured:
 CA names in Storages/MergeTree 5->2, ~-516 lines net. Codex sol-xhigh review LAUNCHED
 (CODEXRELINK_EXIT marker). Soak still running.
+**2026-07-29 16:21 local** — watchdog: codex relink-spec review running (130KB log growing);
+re-validation soak in flight (4 containers, ch1/ch2 logs live since 16:04, a14 driving via
+wrapper). a16 compile-free staged; T15/T16 merged+gated. Awaiting soak landing for the
+verdict flip.
