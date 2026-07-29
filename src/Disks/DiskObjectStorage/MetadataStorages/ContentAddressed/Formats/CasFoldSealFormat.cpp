@@ -28,6 +28,7 @@ std::string_view holdReasonToWord(HoldReason r)
         case HoldReason::WitnessDisappeared:     return "witness_disappeared";
         case HoldReason::BodyUndecodable:        return "body_undecodable";
         case HoldReason::ManifestBodyMissing:    return "manifest_body_missing";
+        case HoldReason::CheckpointUndecodable:  return "checkpoint_undecodable";
     }
     throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: unknown hold reason {}", static_cast<int>(r));
 }
@@ -59,6 +60,7 @@ HoldReason holdReasonFromWord(std::string_view w)
     if (w == "witness_disappeared")      return HoldReason::WitnessDisappeared;
     if (w == "body_undecodable")         return HoldReason::BodyUndecodable;
     if (w == "manifest_body_missing")    return HoldReason::ManifestBodyMissing;
+    if (w == "checkpoint_undecodable")   return HoldReason::CheckpointUndecodable;
     throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: unknown hold reason '{}'", w);
 }
 

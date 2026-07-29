@@ -407,7 +407,9 @@ private:
 
         /// The round's per-namespace `_ckpt.checkpoint`, read ONCE by the intake walk (its second,
         /// hint-independent witness) and reused post-CAS by `cleanupRefObjects` for its delete ranges --
-        /// the same DRY reason `ref_tables` is carried here rather than re-listed.
+        /// the same DRY reason `ref_tables` is carried here rather than re-listed. A namespace whose
+        /// `_ckpt` is present but UNDECODABLE has no entry, and the walk held it instead: an absent entry
+        /// widens the delete boundaries, so only the shut destructive gate makes that absence safe.
         std::map<String, RefTxnId> checkpoints;
         /// THE DESTRUCTIVE GATE for this round, computed ONCE in `fold()` and threaded everywhere so no
         /// two destructive sites can disagree about it:
@@ -497,10 +499,23 @@ private:
     /// It takes BOTH of the round's namespace sources because it owes a witness to both: `ref_tables`
     /// is the hint, and `parent_cursors` is where a carried hold names a namespace the hint may have
     /// stopped mentioning — precisely the namespace whose witness matters most. An absent `_ckpt`, and a
-    /// present one with no `checkpoint_snapshot_id`, both contribute no entry; an undecodable one throws
-    /// `CORRUPTED_DATA` and fails the round closed.
-    std::map<String, RefTxnId> readCheckpointWitnesses(const std::map<String, RefTableListing> & ref_tables,
-                                                       const std::map<String, ShardCoverage> & parent_cursors);
+    /// present one with no `checkpoint_snapshot_id`, both contribute no entry.
+    struct CheckpointWitnesses
+    {
+        /// namespace -> `_ckpt.checkpoint_snapshot_id`, for the namespaces that published one.
+        std::map<String, RefTxnId> witnesses;
+
+        /// namespace -> the decode failure's message, for the namespaces whose `_ckpt` is PRESENT and
+        /// UNREADABLE. Separate from an absent entry because the two mean opposite things: an absent
+        /// entry says "this namespace published no checkpoint", which the walk may treat as no witness,
+        /// while an entry here says "this namespace HAS a checkpoint and we cannot read it", which it
+        /// may not — an unread witness is not an absent one. Both consumers of `witnesses` read it per
+        /// namespace, so the damage is confined to the namespace that owns the object: the walk holds it
+        /// (`HoldReason::CheckpointUndecodable`) and folds every other namespace normally.
+        std::map<String, String> undecodable;
+    };
+    CheckpointWitnesses readCheckpointWitnesses(const std::map<String, RefTableListing> & ref_tables,
+                                                const std::map<String, ShardCoverage> & parent_cursors);
 
     /// What ONE generation's prefix says about itself: whether the generation exists at all, and the
     /// greatest attempt under it whose key is one `foldSealKey` would have produced.

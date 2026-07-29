@@ -367,7 +367,7 @@ TEST(CasGcHoldGrammar, EveryHoldReasonRoundTrips)
 {
     for (const HoldReason reason : {HoldReason::GapBelowWitness, HoldReason::UnconsumedSealCrossing,
                                     HoldReason::WitnessDisappeared, HoldReason::BodyUndecodable,
-                                    HoldReason::ManifestBodyMissing})
+                                    HoldReason::ManifestBodyMissing, HoldReason::CheckpointUndecodable})
     {
         CasFoldSeal seal;
         seal.generation = 3;
@@ -957,6 +957,74 @@ TEST(CasGcHoldGrammar, CheckpointWitnessReachesAHeldNamespaceTheHintNoLongerName
         EXPECT_EQ(hold.offending_position, (RefTxnId{1, 5}));
         EXPECT_EQ(sealedCursorOf(*backend, layout, ns), (RefTxnId{1, 4}));
     }
+}
+
+/// The second witness can also be UNREADABLE, and that is a different answer from absent. An absent
+/// `_ckpt` says "this namespace published no checkpoint" and honestly contributes no witness; a present
+/// one that will not decode says "this namespace HAS a checkpoint and we cannot read it", which no walk
+/// may treat as no witness.
+///
+/// It is still ONE NAMESPACE'S object. The fold used to fail the whole round closed on it — every
+/// namespace's cursor, seal and cleanup stopped, every round, on one unreadable 4 KiB object, and the
+/// exception named neither the namespace nor the key. The rule is the one §5 states for every other
+/// per-namespace failure: hold the namespace that owns the object, fold everything else.
+TEST(CasGcHoldGrammar, AnUndecodableCheckpointHoldsOnlyItsOwnNamespace)
+{
+    const RootNamespace bad{"00/aa@cas@"};
+    const RootNamespace good{"00/bb@cas@"};
+
+    auto backend = std::make_shared<HintHoleCountingBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    Gc gc(store, kGc);
+
+    publishAt(*backend, layout, bad, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(1), /*birth=*/true);
+    publishAt(*backend, layout, bad, RefTxnId{1, 2}, "ref_2", 2, DB::UInt128(2));
+    publishAt(*backend, layout, good, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(11), /*birth=*/true);
+    writeCkptAt(*backend, layout, bad, RefTxnId{1, 2});
+    writeCkptAt(*backend, layout, good, RefTxnId{1, 1});
+
+    /// Round 1 is the BASELINE both namespaces are measured against: each folds its whole stream and
+    /// seals a cursor, and neither holds.
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+    ASSERT_EQ(sealedCursorOf(*backend, layout, bad), (RefTxnId{1, 2}));
+    ASSERT_EQ(sealedCursorOf(*backend, layout, good), (RefTxnId{1, 1}));
+    ASSERT_FALSE(coverageOf(*backend, layout, bad)->hold.has_value());
+
+    /// Corrupt EXACTLY ONE OBJECT: the first namespace's `_ckpt` body. Nothing else in the pool changes,
+    /// so everything the next round does differently is attributable to this one object.
+    const String bad_ckpt_key = layout.refCkptKey(bad);
+    const HeadResult ckpt_head = backend->head(bad_ckpt_key);
+    ASSERT_TRUE(ckpt_head.exists);
+    ASSERT_EQ(backend->putOverwrite(bad_ckpt_key, "this is not a cas_ref_ckpt", ckpt_head.token).outcome,
+              PutOutcome::Done);
+
+    /// Work only a round that COMPLETES can fold.
+    publishAt(*backend, layout, good, RefTxnId{1, 2}, "ref_2", 2, DB::UInt128(12));
+
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+
+    /// The namespace that owns the object is held, at the position its walk would have read next, and
+    /// its coverage row rides UNCHANGED — the cursor may not move while the hold stands.
+    const RefHold hold = holdOf(*backend, layout, bad);
+    EXPECT_EQ(hold.reason, HoldReason::CheckpointUndecodable);
+    EXPECT_EQ(hold.offending_position, (RefTxnId{1, 3}));
+    EXPECT_EQ(sealedCursorOf(*backend, layout, bad), (RefTxnId{1, 2}));
+
+    /// The other namespace folded its new record. This is the whole point of the finding: one corrupt
+    /// object must not stop the pool.
+    const auto good_cov = coverageOf(*backend, layout, good);
+    ASSERT_TRUE(good_cov.has_value());
+    EXPECT_FALSE(good_cov->hold.has_value()) << "the corrupt object belongs to the OTHER namespace";
+    EXPECT_EQ(good_cov->last_folded_ref_id, (RefTxnId{1, 2}));
+    EXPECT_EQ(good_cov->classification, 2);
+
+    /// And nothing was destroyed for the held namespace: a hold shuts the round's destructive gate, so
+    /// its ref objects — including the ones a cleanup range computed WITHOUT the unreadable checkpoint
+    /// would have widened onto — are all still there.
+    for (const RefTxnId & id : {RefTxnId{1, 1}, RefTxnId{1, 2}})
+        EXPECT_TRUE(backend->head(layout.refLogKey(bad, id)).exists)
+            << "ref log " << renderRefTxnId(id) << " of the held namespace was deleted";
 }
 
 /// ===================== THE HOLD IS DURABLE =====================
