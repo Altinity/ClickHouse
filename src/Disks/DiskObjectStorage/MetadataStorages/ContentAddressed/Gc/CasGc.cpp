@@ -7,6 +7,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcPhaseTimer.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcShardPlan.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCkpt.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.h>
@@ -1078,19 +1079,54 @@ bool Gc::foldManifestEdges(const ManifestId & id, int sign, std::vector<BlobDelt
 std::map<String, RefTxnId> Gc::readCheckpointWitnesses(const std::map<String, RefTableListing> & ref_tables,
                                                        const std::map<String, ShardCoverage> & parent_cursors)
 {
-    /// LANE L TASK 5 LANDS HERE. `_ckpt` does not exist yet, so there is no second witness to read and
-    /// production runs hint-only — the behaviour before this task, unchanged. When `_ckpt` lands, this
-    /// body becomes the per-namespace read of `_ckpt.checkpoint` (a `GET` the fold already owes for
-    /// cleanup ranges), keyed by namespace string; every consumer is already written against the map,
-    /// so nothing else in the fold moves.
-    ///
     /// Read the checkpoint of every namespace `ref_tables` names, PLUS every namespace a HELD row in
     /// `parent_cursors` names. Both are parameters for that reason: the walk visits both sets, and the
     /// held-but-unhinted namespace is the one whose second witness matters MOST, because the hint has
     /// stopped supplying it one at all.
-    (void)ref_tables;
-    (void)parent_cursors;
-    return checkpoint_witness_override;
+    ///
+    /// EXACT KEY, ALWAYS -- never `RefTableListing::has_ckpt`. Skipping the read because the listing did
+    /// not show a `_ckpt` would make the second witness a function of the first, which is precisely the
+    /// dependency it exists to break: the listing is a SNAPSHOT, and a `_ckpt` that became durable after
+    /// the enumeration is exactly the one whose namespace has records the same enumeration also missed.
+    Backend & backend = store->backend();
+    const Layout & layout = store->layout();
+
+    std::set<String> witness_namespaces;
+    for (const auto & [ns_str, listing] : ref_tables)
+        witness_namespaces.insert(ns_str);
+    for (const auto & [known_key, known_cov] : parent_cursors)
+    {
+        if (!known_cov.hold)
+            continue;
+        /// Parse loosely, then PROVE by rebuilding the key -- the same round trip, for the same reason,
+        /// as the walk's own pass over these keys: a coverage key in a decoded seal is an arbitrary
+        /// string, and `parseCursorKey` is undefined on anything `cursorKey` did not produce.
+        if (known_key.find('/') == String::npos)
+            continue;
+        const auto [known_ns, known_shard] = parseCursorKey(known_key);
+        if (known_shard != 0 || cursorKey(known_ns, known_shard) != known_key)
+            continue;
+        witness_namespaces.insert(known_ns.string());
+    }
+
+    std::map<String, RefTxnId> witnesses;
+    for (const String & ns_str : witness_namespaces)
+    {
+        const std::optional<CkptSample> sample = readCkpt(backend, layout, RootNamespace{ns_str});
+        /// ABSENT IS NORMAL AND IS NOT A WITNESS: a namespace has no `_ckpt` until its first snapshot
+        /// publication commits, and one that 404s mid-round is a namespace being reclaimed. Neither says
+        /// anything about which ids exist, so neither may hold the walk -- and neither may throw
+        /// (a GC fold never fails a round on a 404).
+        if (!sample)
+            continue;
+        /// A checkpoint without `checkpoint_snapshot_id` is likewise silent rather than empty: the object
+        /// exists because some OTHER field (`life_epoch`, `last_epoch_seal`) was published into it first.
+        /// An undecodable body, by contrast, already threw inside `readCkpt` -- this object gates
+        /// destructive cleanup, so "cannot read it" must fail the round closed, never degrade to no witness.
+        if (sample->ckpt.checkpoint_snapshot_id)
+            witnesses.emplace(ns_str, *sample->ckpt.checkpoint_snapshot_id);
+    }
+    return witnesses;
 }
 
 std::optional<std::pair<uint64_t, uint64_t>> Gc::newestFoldSealRef()
@@ -3019,9 +3055,9 @@ void Gc::cleanupRefObjects(const FoldResult & folded, bool suppress_destructive)
             completed_removal_snapshot = cit->second;
 
         /// The namespace's own durable tail, which TIGHTENS both delete boundaries and can never widen
-        /// either -- see `planRefCleanup`. Absent here in Stage A (the `_ckpt` object is Task 5's and the
-        /// witness read returns nothing until it lands), which degrades both boundaries to exactly what
-        /// they were before.
+        /// either -- see `planRefCleanup`. Absent for a namespace whose `_ckpt` does not exist yet or has
+        /// never carried a `checkpoint_snapshot_id`, which degrades both boundaries to the cursor and the
+        /// newest covering snapshot alone.
         std::optional<RefTxnId> checkpoint;
         if (const auto ckit = folded.checkpoints.find(ns_str); ckit != folded.checkpoints.end())
             checkpoint = ckit->second;

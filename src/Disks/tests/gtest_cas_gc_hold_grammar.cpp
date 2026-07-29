@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasByteBudget.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCkptFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcShardPlan.h>
@@ -143,6 +144,18 @@ void publishAt(
     for (const RefOp & op : publishCommittedOps(ref_name, mref))
         ops.push_back(op);
     writeTxnAt(backend, layout, ns, id, std::move(ops), prev_epoch_seal);
+}
+
+/// Write the namespace's `_ckpt` naming `checkpoint` as its snapshot base, through the real codec — the
+/// fold's second witness source is a decode of exactly these bytes, so a hand-rolled body would prove
+/// nothing about the object the writers actually publish.
+void writeCkptAt(
+    Backend & backend, const Layout & layout, const RootNamespace & ns, const RefTxnId & checkpoint)
+{
+    backend.putIfAbsent(layout.refCkptKey(ns),
+                        encodeRefCkpt(RefCkpt{.life_epoch = std::nullopt,
+                                              .checkpoint_snapshot_id = checkpoint,
+                                              .last_epoch_seal = std::nullopt}));
 }
 
 /// The newest fold seal, scanning downward from the adopted generation (a completed round's gc/state
@@ -604,17 +617,83 @@ TEST(CasGcHoldGrammar, CheckpointWitnessHoldsAGapTheHintIsSilentAbout)
 
     /// Same pool, same hint, plus the checkpoint: the gap becomes decidable and holds at the same
     /// position, with the same reason, as if the hint had shown the witness itself.
+    ///
+    /// The `_ckpt` object is hidden from every LIST as well, so the two pools' listings are byte-for-byte
+    /// the same and the only difference between them is an object reachable by EXACT KEY alone. That is
+    /// what makes this a proof of hint-INDEPENDENCE rather than of a richer hint.
     {
         auto backend = std::make_shared<HintHoleCountingBackend>();
         auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
-        seed(*backend, store->layout());
+        const Layout & layout = store->layout();
+        seed(*backend, layout);
+        writeCkptAt(*backend, layout, ns, RefTxnId{1, 4});
+        backend->hide(layout.refCkptKey(ns));
+
         Gc gc(store, kGc);
-        gc.setCheckpointWitnessesForTest({{ns.string(), RefTxnId{1, 4}}});
         ASSERT_TRUE(gc.runRegularRound().acquired_lease);
 
-        const RefHold hold = holdOf(*backend, store->layout(), ns);
+        const RefHold hold = holdOf(*backend, layout, ns);
         EXPECT_EQ(hold.reason, HoldReason::GapBelowWitness);
         EXPECT_EQ(hold.offending_position, (RefTxnId{1, 3}));
+    }
+}
+
+/// The namespace whose second witness matters MOST: one the hint has stopped mentioning entirely, kept
+/// in the round's universe by nothing but its CARRIED HOLD. Its checkpoint is why
+/// `readCheckpointWitnesses` takes the parent cursors as well as the hint — the hold alone witnesses only
+/// the position it stopped at, so a gap ABOVE that position, once the hold resolves, has no witness left.
+TEST(CasGcHoldGrammar, CheckpointWitnessReachesAHeldNamespaceTheHintNoLongerNames)
+{
+    const RootNamespace ns{"00/aa@cas@"};
+
+    /// Round 1 in both pools: held at {1,3} by a gap below the listed witness {1,4}. Then the hint goes
+    /// silent about every one of the namespace's objects, {1,3} becomes readable (so the hold resolves and
+    /// the walk runs on), and a durable-but-unlisted {1,6} leaves a fresh gap at {1,5}.
+    const auto seedPool = [&](HintHoleCountingBackend & backend, const Layout & layout, Gc & gc)
+    {
+        publishAt(backend, layout, ns, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(1), /*birth=*/true);
+        publishAt(backend, layout, ns, RefTxnId{1, 2}, "ref_2", 2, DB::UInt128(2));
+        publishAt(backend, layout, ns, RefTxnId{1, 4}, "ref_4", 4, DB::UInt128(4));
+        EXPECT_TRUE(gc.runRegularRound().acquired_lease);
+        EXPECT_EQ(holdOf(backend, layout, ns).offending_position, (RefTxnId{1, 3}));
+
+        publishAt(backend, layout, ns, RefTxnId{1, 3}, "ref_3", 3, DB::UInt128(3));
+        publishAt(backend, layout, ns, RefTxnId{1, 6}, "ref_6", 6, DB::UInt128(6));
+        for (const RefTxnId & id : {RefTxnId{1, 1}, RefTxnId{1, 2}, RefTxnId{1, 3}, RefTxnId{1, 4},
+                                    RefTxnId{1, 6}})
+            backend.hide(layout.refLogKey(ns, id));
+    };
+
+    /// Hold-witness only: it witnesses {1,3}, which the walk has now passed, so the absent {1,5} above it
+    /// is an honest frontier and the namespace comes out clean.
+    {
+        auto backend = std::make_shared<HintHoleCountingBackend>();
+        auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+        Gc gc(store, kGc);
+        seedPool(*backend, store->layout(), gc);
+
+        ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+        const auto cov = coverageOf(*backend, store->layout(), ns);
+        ASSERT_TRUE(cov.has_value());
+        EXPECT_FALSE(cov->hold.has_value()) << "a resolved hold witnesses nothing above itself";
+        EXPECT_EQ(cov->last_folded_ref_id, (RefTxnId{1, 4}));
+    }
+
+    /// Same pool, plus the checkpoint — read by exact key for a namespace THIS round's hint never names.
+    {
+        auto backend = std::make_shared<HintHoleCountingBackend>();
+        auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+        const Layout & layout = store->layout();
+        Gc gc(store, kGc);
+        seedPool(*backend, layout, gc);
+        writeCkptAt(*backend, layout, ns, RefTxnId{1, 6});
+        backend->hide(layout.refCkptKey(ns));
+
+        ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+        const RefHold hold = holdOf(*backend, layout, ns);
+        EXPECT_EQ(hold.reason, HoldReason::GapBelowWitness);
+        EXPECT_EQ(hold.offending_position, (RefTxnId{1, 5}));
+        EXPECT_EQ(sealedCursorOf(*backend, layout, ns), (RefTxnId{1, 4}));
     }
 }
 

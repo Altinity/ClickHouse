@@ -361,19 +361,6 @@ public:
 
     void setRebuildEdgeBudgetForTest(uint64_t n) { rebuild_edge_budget_override = n; }
 
-    /// INTEGRATION SEAM — the second, hint-independent witness (`_ckpt.checkpoint`, Lane L Task 5).
-    ///
-    /// The listing cannot be the sole witness source: it is a snapshot, so a record that became durable
-    /// after the enumeration is invisible to that round's probes, and an absent expected-next then reads
-    /// as a frontier when it is really a gap. `_ckpt.checkpoint` is the namespace's own durable tail,
-    /// read by the fold anyway for cleanup ranges, and it decides the same question without asking the
-    /// listing anything.
-    ///
-    /// `_ckpt` does not exist yet, so `readCheckpointWitnesses` returns this map verbatim: EMPTY in
-    /// production (the walk is hint-only, exactly as before) and seeded by the hold tests. Task 5 lands
-    /// by replacing that one function body with the real per-namespace read; nothing else moves.
-    void setCheckpointWitnessesForTest(std::map<String, RefTxnId> w) { checkpoint_witness_override = std::move(w); }
-
     /// TEST SEAM: disable the round's journal trim so a folded event stays in the journal
     /// across rounds — exactly the lazy-trim / partial-trim-after-crash condition under which the
     /// next round's fold MUST recover the exact sealed cursor (else it re-folds the event and double-counts
@@ -496,13 +483,20 @@ private:
     FoldResult fold(GcState & state, Token & state_token, RoundReport & report, uint64_t current_round,
                     const RefScanSummary & pre_scan, UniversePolicy policy);
 
-    /// The round's `_ckpt.checkpoint` witness per namespace — see `setCheckpointWitnessesForTest` for
-    /// what it decides and why the listing alone cannot decide it. ONE call site, in the fold, right
-    /// where the hint is grouped; Lane L Task 5 lands by filling this body in.
+    /// The round's `_ckpt.checkpoint` witness per namespace — the SECOND, hint-independent witness the
+    /// walk decides its absents against. ONE call site, in the fold, right where the hint is grouped.
+    ///
+    /// The listing cannot be the sole witness source: it is a snapshot, so a record that became durable
+    /// after the enumeration is invisible to that round's probes, and an absent expected-next then reads
+    /// as a frontier when it is really a gap. `_ckpt.checkpoint` is the namespace's own durable tail,
+    /// read by the fold anyway for cleanup ranges, and it decides the same question without asking the
+    /// listing anything — so it is read by EXACT KEY, never gated on `RefTableListing::has_ckpt`.
     ///
     /// It takes BOTH of the round's namespace sources because it owes a witness to both: `ref_tables`
     /// is the hint, and `parent_cursors` is where a carried hold names a namespace the hint may have
-    /// stopped mentioning — precisely the namespace whose witness matters most.
+    /// stopped mentioning — precisely the namespace whose witness matters most. An absent `_ckpt`, and a
+    /// present one with no `checkpoint_snapshot_id`, both contribute no entry; an undecodable one throws
+    /// `CORRUPTED_DATA` and fails the round closed.
     std::map<String, RefTxnId> readCheckpointWitnesses(const std::map<String, RefTableListing> & ref_tables,
                                                        const std::map<String, ShardCoverage> & parent_cursors);
 
@@ -562,8 +556,8 @@ private:
     /// The round's `folded.checkpoints` TIGHTENS both boundaries and can never widen either: a log is
     /// deletable only at or below `min(newest covering snapshot, checkpoint, cursor)`, and a snapshot
     /// only STRICTLY BELOW `min(newest covering snapshot, checkpoint)` -- so the snapshot the checkpoint
-    /// itself names always survives. Empty (Stage A, before Task 5's `_ckpt` object exists) degrades to
-    /// the cursor/snapshot boundaries alone, which is the behaviour that shipped before.
+    /// itself names always survives. A namespace with no entry (no `_ckpt` yet, or one that has never
+    /// carried a `checkpoint_snapshot_id`) degrades to the cursor/snapshot boundaries alone.
     void cleanupRefObjects(const FoldResult & folded, bool suppress_destructive);
 
     /// Namespace-cleanup item passes: for each item in the committed seal, a Pending item
@@ -688,9 +682,6 @@ private:
     /// comment) so multi-disk processes can attribute GC logs to the disk/srid that produced them.
     LoggerPtr logger;
     uint64_t rebuild_edge_budget_override = 0;   /// tests force tiny batches
-    /// See `setCheckpointWitnessesForTest`: the `_ckpt.checkpoint` witness per namespace, empty until
-    /// Lane L Task 5 lands the object that supplies it.
-    std::map<String, RefTxnId> checkpoint_witness_override;
     std::function<uint64_t()> now_ms_fn;   /// wall-clock ms; injected (tests), defaults to system_clock
     /// The heartbeat gate's own observation clock —
     /// monotonic on this process, injected (tests), defaults to `Pool::bootMs()`. Never compared
