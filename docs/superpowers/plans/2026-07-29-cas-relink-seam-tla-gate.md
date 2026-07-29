@@ -2,6 +2,58 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> ## ⛔ PLANNING STOPPED 2026-07-30 — DO NOT EXECUTE THIS PLAN AS IT STANDS {#planning-stopped}
+>
+> A pre-committed stopping rule fired. Four codex rounds each found that the model could not express
+> some arm of `CasRefLedger::resolveWedgeOnce`; round 4 found four more AND the structural reason the
+> approach kept failing: **the cited cardinalities are NESTED DECISIONS, not mutually exclusive
+> alternatives**, so six `WedgeResolution` values × three `SlotOccupyResult::Kind` × four occupant
+> classes × seven `Reason` × two exception exits does NOT imply twelve terminal paths, and an
+> enumeration built that way is neither disjoint nor complete. The conclusive finding is therefore not
+> "one more arm was missed" but "a faithful model of this machine keeps being out of reach, and the
+> reason is that the machine COMPOSES decisions rather than selecting among alternatives."
+>
+> Per the rule, the model goes AS-IS to the user-approved lane-state-machine restatement pass
+> (BACKLOG `{#lane-state-machine-restatement}`): simplifying the machine comes before gating anything
+> on it. **Do not resume this plan** until that pass reports; when it does, this document is the
+> starting point, not a document to be re-reviewed.
+>
+> ROUND-4 FINDINGS PRESERVED AS INPUT (so resumption is not from scratch):
+> 1. `classifyRefLogOccupant` (`CasRefLedger.cpp:162`, called `:1838`) can rethrow allocation /
+>    memory-limit / other non-corruption exceptions — an unenumerated path.
+> 2. **`slotOccupy` returns `Created` — the transaction is now DURABLE — and the subsequent recheck
+>    then reports `FenceMoved` / `Superseded` / `WedgeReplaced`, so the function returns
+>    `StillWedged`.** Mapping row 5 calls that "NO TRANSITION", which would LOSE the newly durable
+>    transaction; row 11 covers only `Created → Adopted`. The rows are neither disjoint nor
+>    one-per-path. This one is also a CODE observation worth the pass's attention: a
+>    durability-producing retry whose outcome is inert records the durable fact only in the
+>    wedge-plus-marker, never in the resolution's return value.
+> 3. The post-durable install catch (`:1997`) raises the floor, poisons, keeps the wedge and
+>    RETHROWS — intended unreachable under §A1, but a real throw path (reachable through the test
+>    probe) that must be enumerated or structurally excluded.
+> 4. Row 3 is too narrow: the pre-I/O candidate preparation (`wedge = *rt->wedge`,
+>    `candidate.emplace(rt->state)`) can throw BEFORE the named decode/apply calls.
+>
+> TWO REAL DEFECTS IN v4 to fix if the gate is ever resumed:
+> - **The gate-critical witness is broken.** `WedgeResolveInstall` sets `sawRetryCreatedAdopt`
+>   unconditionally (`H(TRUE)`), so the shorter route `Admit → Arm → SenderUnresolvedLanded →
+>   WedgeResolveInstall` violates `W_RetryCreatedAdopt` WITHOUT executing `WedgeRetryCreated` — the
+>   witness does not prove the happy path it exists to prove. That is the vacuity trap it was written
+>   to prevent, one level up.
+> - `_sab_nopoison` accepts a red through the stale route, which the mapping itself declares an
+>   intentional OVER-APPROXIMATION unreachable with today's one-leader machine — contradicting this
+>   plan's own rule that a sabotage driven by fabricated states is worthless.
+> - Minor: the self-review says `sFloorCovers` is read as a guard by five actions; six read it
+>   (`WedgeRetryCreated`, `WedgeResolveInstall`, `WedgeResolveRejected`, `WedgeResolveCorrupted`,
+>   `WedgeResolveStale`, `FloorReconcile`).
+>
+> WHAT r4 CONFIRMED SOUND, and it is most of the document: `WedgeRetryCreated`'s state transition and
+> guards; the licensing contract quote; `MaxId = 6` sufficiency; B1(b) (both exception exits modelled
+> as inert, `RefusedPreAttempt` correctly attributed to an `Unresolved` RESULT); the `sApplyOwed`
+> writer set; `MarkerCoversDurableWindow` holding in every relevant state (verified state by state);
+> the 32-config accounting with every green's red preceding it; and `_sab_nowedge`'s only-route
+> argument. The gate's STRUCTURE is not what failed — the machine's describability is.
+
 **Goal:** Discharge §12 of `docs/superpowers/specs/2026-07-29-cas-relink-reoffer-redesign.md` — build the refined model the redesign requires, run it, and answer the one question that can still stop the design: **does `_sab_stalecache` flip from RED to GREEN once the apply-pending marker is represented?** If it does not, the design does not ship.
 
 **Architecture:** One new TLA+ module, `docs/superpowers/models/CaRelinkReofferCore.tla`, which REFINES `CaRelinkConfirmCore` rather than editing it (§12's disposition ruling: the v11 model is kept as the historical witness of the v11 protocol and is not touched, because its `_sab_*` reds are the evidence that v11's rules were each load-bearing). The refinement adds five things the v11 model cannot express: the apply-pending marker with a *separate reader-visible value* (`sApply` / `sApplySeen` — the model-level twin of seam §6, including every arm of `CasRefLedger::resolveWedgeOnce`, whose bounded retry is itself a durability-producing event), an equal-namespace/different-`disk_name` mount pair (§12.5 row i, test row 17's B1 shape), a leader tenure that commits several durable chunks of *different kinds* (§12.5 row ii), a receiver whose acceptance is the *conjunction* of a certified answer and a returned identity (§4.2, §4.4), and a committed-relink fact that covers the landed-`Unresolved` publication as well as `Committed`. Around them, a 2×2 necessity matrix decides the gate, a cross-mount battery decides the validator's qualification, and the re-derived rule set decides that every retained rule is still load-bearing under the fence-first ordering. Cfg names are deliberately carried over from the v11 model so that the flip is greppable side by side: `CaRelinkConfirmCore_sab_stalecache` RED next to `CaRelinkReofferCore_sab_stalecache` GREEN.
