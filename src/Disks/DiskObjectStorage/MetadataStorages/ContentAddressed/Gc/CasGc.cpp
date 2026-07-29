@@ -1011,13 +1011,15 @@ bool Gc::foldManifestEdges(const ManifestId & id, int sign, std::vector<BlobDelt
     const Layout & layout = store->layout();
 
     const String key = layout.manifestKey(id);
-    const HeadResult head = backend.head(key);
-    if (!head.exists)
-        return false;   /// absent body: caller decides (missing-body precommit OK; committed => fail closed)
-
+    /// ONE ROUND TRIP PER EDGE. The GET alone carries the absence signal a HEAD would have carried, so
+    /// the HEAD that used to precede it bought nothing and cost a second serial round trip on the
+    /// hottest read path of the round (one per manifest edge, on every folded log). `!got` is the SAME
+    /// absent outcome the missing HEAD used to produce -- record-and-continue, and the caller decides
+    /// what an absent body means for that edge (a missing-body precommit is a barrier; a committed one
+    /// fails closed). Never a throw: a 404 during the fold is an observation, not an error.
     const auto got = backend.get(key);
     if (!got)
-        return false;   /// raced delete between HEAD and GET — record-and-continue (never throw on a 404)
+        return false;   /// absent body: caller decides (missing-body precommit OK; committed => fail closed)
     ProfileEvents::increment(ProfileEvents::CasRefManifestBodyFoldGets);   /// one body GET per manifest fold
 
     const PartManifest body = decodePartManifest(openObject(FormatId::PartManifest, got->bytes));
@@ -1591,7 +1593,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     ///
     /// PHASE 8/19 `fold_ref_intake`: one GET per record (always owed -- the round read every body anyway),
     /// plus one exact 404 probe per namespace to prove its frontier, one extra GET per epoch crossed, and
-    /// one HEAD+GET per manifest edge, which on a busy pool is where the round's object-read budget goes.
+    /// one GET per manifest edge, which on a busy pool is where the round's object-read budget goes.
     /// It also carries probe B1's two numbers -- reported on EVERY healthy round, so
     /// "logs_accounted always equals logs_applied" becomes an observable property of the table rather than
     /// a claim in a comment.
@@ -1640,10 +1642,114 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// does not reach are simply unproven, which suppresses the round's destruction. In a healthy pool
     /// that budget is never touched -- a namespace that legitimately went away leaves its `_cleanup`
     /// marker behind, so it stays in the hint and is walked as a hinted target anyway.
+
+    /// THE ROUND'S WORK-SET IS FROZEN AT THE ROUND-START LISTING, AND THAT IS WHAT MAKES A ROUND END.
+    ///
+    /// Arithmetic intake reads the next id by exact key, so on its own it walks WHILE RECORDS EXIST --
+    /// and a namespace whose writer appends concurrently therefore has no last record to reach. Round
+    /// time stopped being `backlog / walker_rate` and became `backlog / (walker_rate - writer_rate)`,
+    /// which diverges the moment a writer keeps up with the walker. Measured: zero completed rounds in
+    /// 42 minutes on a hot pool. Everything the round paces on rounds then stops too -- the fold seal and
+    /// its cursors, the sampled store-quality detector, ref-object cleanup -- so the backlog the round
+    /// was falling behind on grows without bound.
+    ///
+    /// The bound is the LISTING THE ROUND ALREADY TOOK. Its greatest listed id per namespace (the
+    /// LISTED TAIL, in `RefTxnId` epoch-major order) is a position that existed when the round started,
+    /// so folding up to it and stopping is finite work fixed at round start, whatever the writer does
+    /// meanwhile. Contiguity (INV-1) is what makes the tail ALONE a sufficient summary of the listing:
+    /// the ids between the cursor and the tail are exactly `cursor+1 .. tail`, so nothing about which
+    /// individual ids were listed matters, and a listing that omits ids in the MIDDLE stays the
+    /// non-event it became when intake went arithmetic -- the walk GETs them by computed key regardless.
+    ///
+    /// NO NEW PERSISTED STATE. A round that reaches its frozen tail seals `last_folded_ref_id == tail`,
+    /// so the cursor IS the remembered tail and the next round's comparison is against a number the seal
+    /// already carried.
+    ///
+    /// THE BOUND IS ON FOLDING, NOT ON READING, and that distinction is the whole design.
+    ///
+    /// The walk still reads its expected-next exactly as before -- one exact `GET` at `cursor + 1` --
+    /// because that read IS the frontier proof: an absent expected-next with no witness above it is the
+    /// ONLY thing anywhere that sets `frontier_proven`, and a namespace that stops being read stops being
+    /// provable. An unprovable namespace leaves `frontier_complete` false forever, which suppresses every
+    /// destructive decision, which stops ref-object cleanup, which means its listing never drains and it
+    /// never becomes provable by any other route either. So "skip reading a quiet namespace" is not a
+    /// cheaper version of this design; it is a GC that permanently reclaims nothing. The saving it
+    /// appears to offer is exactly one `GET` per namespace per round, and that `GET` is the proof.
+    ///
+    /// The bound therefore sits AFTER the read: a record found ABOVE the frozen tail arrived after this
+    /// round's listing, and the walk stops there WITHOUT folding it. At most one such record is read per
+    /// namespace per round -- the peek that discovers the writer moved -- and none is ever folded, which
+    /// is exactly what removes the chase. Reaching the tail is NOT a frontier proof (nothing was observed
+    /// absent), so the namespace is unproven and the round suppresses. Stopping early can only ever cost
+    /// reclamation latency, never safety.
+    ///
+    /// Three classes, reported on the phase row:
+    ///   * `tail > cursor` -- the round's real work: fold `cursor+1 .. tail`, then peek once;
+    ///   * `tail == cursor` -- the listing shows nothing new, so the walk folds nothing and its single
+    ///     read is the frontier probe. On a wide pool this is most namespaces, most rounds;
+    ///   * `tail < cursor` -- the listing's greatest id is BELOW a cursor we folded through. Cleanup
+    ///     deletes logs from the bottom up, so a listed log below the cursor with none at or above it is
+    ///     a stale or lying listing, not a shape cleanup produces. The cursor is the truth (the sampled
+    ///     store-quality detector is this class's observer).
+    /// A namespace with NO LISTED LOGS AT ALL has no tail to freeze and keeps the unbounded walk. That is
+    /// the quiescent shape (cleanup removes every log at or below `min(snapshot, cursor)`) and also the
+    /// shape a store that HIDES a namespace's records produces -- where reading past a tail the listing
+    /// refuses to admit to is the entire point, and where a bound would hand the liar the omission it was
+    /// hoping for.
+    ///
+    /// A HELD namespace's bound is `max(tail, offending_position)`, and the `max` is what keeps the
+    /// bound from contradicting the retry obligation: a hold clears only by resolving its offending
+    /// position by exact key (spec §5), and that position can sit above the listed tail (a crossing holds
+    /// at `{E', 1}` while the tail is still in `E`, and a hold whose record the listing omits is
+    /// precisely the case a bound must not hide). So the walk always reaches it, and once the hold CLEARS
+    /// the walk continues no further than the frozen tail -- without which a held-and-hot namespace would
+    /// resume chasing the tail the moment its hold cleared.
+    struct WalkTarget
+    {
+        String ns;
+        const RefTableListing * listing;
+        /// The greatest id this namespace may FOLD this round, or `nullopt` for an unbounded walk
+        /// (unhinted targets, and hinted ones whose listing carries no log at all). Reading is not
+        /// bounded -- see above for why the expected-next read must always happen.
+        std::optional<RefTxnId> frozen_tail;
+    };
+
     static const RefTableListing kNoListing;
-    std::vector<std::pair<String, const RefTableListing *>> walk_targets;
+    std::vector<WalkTarget> walk_targets;
+    /// The three buckets classify the hinted, UNHELD namespaces -- the ones whose tail comparison
+    /// decided how much they could fold. A held namespace folds up to a bound its HOLD also determines
+    /// and is reported by `tables_held`, so counting it here would make `tails_unchanged` stop meaning
+    /// "namespaces with no work this round", which is the number the row exists to publish.
+    uint64_t intake_tails_advanced = 0;
+    uint64_t intake_tails_unchanged = 0;
+    uint64_t intake_tails_below_cursor = 0;
     for (const auto & [ns_str, listing] : ref_tables)
-        walk_targets.emplace_back(ns_str, &listing);
+    {
+        if (listing.logs.empty())
+        {
+            walk_targets.push_back({ns_str, &listing, std::nullopt});
+            continue;
+        }
+
+        const RefTxnId tail = listing.logs.back();   /// `groupRefKeys` sorts; the tail is the greatest id
+        const auto cursor_it = parent_cursors.find(cursorKey(RootNamespace{ns_str}, /*shard*/0));
+        if (cursor_it != parent_cursors.end() && cursor_it->second.hold)
+        {
+            walk_targets.push_back({ns_str, &listing, std::max(tail, cursor_it->second.hold->offending_position)});
+            continue;
+        }
+
+        /// A never-folded namespace's cursor is below every real id, so it folds its whole listing.
+        const RefTxnId cursor =
+            cursor_it != parent_cursors.end() ? cursor_it->second.last_folded_ref_id : RefTxnId{};
+        if (cursor < tail)
+            ++intake_tails_advanced;
+        else if (cursor == tail)
+            ++intake_tails_unchanged;
+        else
+            ++intake_tails_below_cursor;
+        walk_targets.push_back({ns_str, &listing, tail});
+    }
     uint64_t intake_unhinted_held = 0;
     uint64_t intake_unhinted_quiet = 0;
     uint64_t frontier_probe_budget = store->poolConfig().gc_frontier_probe_budget;
@@ -1665,7 +1771,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             continue;
         if (known_cov.hold)
         {
-            walk_targets.emplace_back(known_ns.string(), &kNoListing);
+            walk_targets.push_back({known_ns.string(), &kNoListing, std::nullopt});
             ++intake_unhinted_held;
             continue;
         }
@@ -1676,13 +1782,14 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             continue;
         }
         --frontier_probe_budget;
-        walk_targets.emplace_back(known_ns.string(), &kNoListing);
+        walk_targets.push_back({known_ns.string(), &kNoListing, std::nullopt});
         ++intake_unhinted_quiet;
     }
 
-    for (const auto & [ns_str, listing_ptr] : walk_targets)
+    for (const WalkTarget & target : walk_targets)
     {
-        const RefTableListing & listing = *listing_ptr;
+        const String & ns_str = target.ns;
+        const RefTableListing & listing = *target.listing;
         if (ref_folding_aborted)
             break;
         const RootNamespace ns{ns_str};
@@ -1928,6 +2035,15 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                 expected = *crossed;
                 continue;
             }
+            /// THE FROZEN WORK-SET'S EDGE. This record is real and readable, and it is ABOVE the tail the
+            /// round's listing showed -- so it arrived after the round started. Stop without folding it:
+            /// that is what makes the round's work finite at round start however fast the writer appends,
+            /// and it costs exactly this one read per namespace per round. Deliberately distinct from
+            /// every other exit -- no anomaly, no hold, nothing wrong -- and it leaves `frontier_proven`
+            /// false, so the namespace is merely unproven this round and the round suppresses.
+            if (target.frozen_tail && *target.frozen_tail < *expected)
+                break;
+
             const RefTxnId log_id = *expected;
 
             /// Probe B2: open this transaction's ledger entry. A clamped log is opened but never
@@ -2205,9 +2321,9 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         /// An abort discards this round's walk, so it discards its proofs with it: nothing this round
         /// observed may be offered as a frontier proof to the destructive gate.
         result.frontier_proven = 0;
-        for (const auto & [ns_str, listing_ptr] : walk_targets)
+        for (const WalkTarget & target : walk_targets)
         {
-            const String cursor_key = cursorKey(RootNamespace{ns_str}, /*shard*/0);
+            const String cursor_key = cursorKey(RootNamespace{target.ns}, /*shard*/0);
             ShardCoverage cov;
             cov.classification = 1;
             if (const auto pit = parent_cursors.find(cursor_key); pit != parent_cursors.end())
@@ -2294,6 +2410,16 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// used to clear a hold silently.
     intake_timer->metric("tables_held", intake_tables_held);
     intake_timer->metric("unhinted_held_walked", intake_unhinted_held);
+    /// THE FROZEN WORK-SET, ON THE ROW THAT PAID FOR IT. `tails_advanced` is how many hinted namespaces
+    /// had records to fold this round because their listed tail sat above their cursor -- the round's
+    /// real work -- and `tails_unchanged` is how many folded NOTHING and paid only their single frontier
+    /// probe, which on a wide pool with a few hot namespaces is most of them and is the number that
+    /// explains a short round. `tails_below_cursor` is the anomaly of the three: cleanup deletes logs
+    /// from the bottom up, so a listing whose greatest id is below a cursor we folded through is stale or
+    /// lying, and a column that is normally 0 is what makes the pool where it is not stand out.
+    intake_timer->metric("tails_advanced", intake_tails_advanced);
+    intake_timer->metric("tails_unchanged", intake_tails_unchanged);
+    intake_timer->metric("tails_below_cursor", intake_tails_below_cursor);
     /// THE FRONTIER OBLIGATION, on the row that explains a round which reclaimed nothing:
     /// `frontier_namespaces` is the round's universe (hint ∪ sealed cursors), `frontier_proven` the part
     /// of it that reached an honest end-of-stream, and the two remaining columns say where the rest
