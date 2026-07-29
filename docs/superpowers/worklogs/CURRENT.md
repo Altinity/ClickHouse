@@ -2089,3 +2089,8 @@ ordered on top of v4. Meanwhile: a14 executing stop-capture-flip.
 **2026-07-29 17:00 local** — watchdog: a14 executing stop-capture-flip (~10 min in; cluster
 still up = capture phase presumably; no flip commit yet). relink closing-round in flight at
 the design agent. Nudge threshold: next tick.
+**2026-07-29 17:2x local** — relink v3.1 committed (private headers; both premises verified —
+RFC caches LICENSED to answer 304, both legs already POST = standard vocab was all risk no
+benefit; wildcard/list/weak hazards DELETE; final-rulings round queued next). a14 nudged:
+soak driver still running ~20min post-ruling (late delivery suspected) — stop-capture-flip
+re-ordered with PIDs named.
