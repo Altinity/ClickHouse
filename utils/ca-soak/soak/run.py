@@ -698,9 +698,11 @@ def checkpoint(driver, cluster, model, phase, *, strict_unreachable=False):
     # INV-NO-STALE-EDGE: no blob may be left whose every source edge names a manifest that no longer
     # exists. Such a blob's in-degree is pinned above zero forever, so the incremental GC will never
     # reclaim it -- and until the class existed it was reported as an `AwaitingGc` "expected, no action
-    # needed" backlog, which is what hid it. `ca-fsck` does NOT exit nonzero on it (only `dangling` and
-    # `snapshot_oracle_mismatches` throw in CommandFsck.cpp), so the `exit_code` gate above does not
-    # cover this and THIS assert is the only gate.
+    # needed" backlog, which is what hid it. `ca-fsck` does NOT exit nonzero on it -- `CommandFsck.cpp`
+    # throws on `dangling`, `chain_broken`, `snapshot_oracle_mismatches`, `corrupted_runs` and
+    # `lifeless_keys`, and `stale_edge` is the ONE `clean()` term deliberately left out (it is
+    # detail-mode-only) -- so the `exit_code` gate above does not cover this and THIS assert is the
+    # compensating half that licenses the exclusion.
     #
     # Asserted off the `--detail` result, never the summary: the cross-check is detail-gated in
     # `runFsck`, so a summary line's `stale_edge=0` is structural. `stale_edge_verdict` also fails
@@ -726,17 +728,16 @@ def checkpoint(driver, cluster, model, phase, *, strict_unreachable=False):
             f"{f['unknown_detail_classes']} — objects in those classes were DROPPED from the "
             f"checkpoint's view. Extend soak/fsck.py:known_classes.")
 
-    # `corrupted-run` (a GC source-edge run whose whole-file seal checksum disagrees with its bytes)
-    # is an ERROR class that nothing gates: `CommandFsck` does not throw on it, and -- unlike
-    # `stale_edge` -- it is not even PRINTED on the summary line, so `FsckReport::corrupted_runs` is
-    # invisible to any consumer of the applet. It is only observable as a `--detail` row, so that is
-    # what is counted here. Reported rather than asserted: fixing the missing summary field is a
-    # product change, outside this harness change's mandate.
+    # `corrupted-run` (a GC source-edge run whose whole-file seal checksum disagrees with its bytes) is
+    # an ERROR class. It once had no gate at all -- `CommandFsck` neither threw on it nor printed it --
+    # which is what this count was added for. Both product gaps are closed now: `corrupted_runs` is on
+    # the summary line and `CommandFsck::executeImpl` exits nonzero on it, so the `exit_code != 0` gate
+    # above covers the class. This detail-row count is kept as corroboration that names the rows.
     _corrupted = sum(1 for row in f.get("detail", []) if row["class"] == "corrupted-run")
     if _corrupted:
         log(f"WARNING [corrupted-run] {_corrupted} fsck detail row(s) in class `corrupted-run` — a GC "
-            f"source-edge run's seal checksum disagrees with its bytes. Gated by neither this "
-            f"checkpoint nor ca-fsck's exit code (and absent from its summary line); investigate.")
+            f"source-edge run's seal checksum disagrees with its bytes. ca-fsck's exit code gates this "
+            f"class, so a run reaching here with exit_code 0 is itself suspect; investigate.")
 
     # GC never plans to delete a REACHABLE object: {dryrun delete set} subset of {fsck deletion-pipeline}.
     # The "retired-in-snapshot" refactor made ca-gc-dryrun (previewDeletes) emit a SUPERSET: not only
