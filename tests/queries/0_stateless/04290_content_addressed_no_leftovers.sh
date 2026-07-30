@@ -99,7 +99,7 @@ PENDING=1
 for _ in $(seq 1 60); do
     PENDING=$($CLICKHOUSE_CLIENT --query "SYSTEM CONTENT ADDRESSED GC RUN '${DISK_NAME}'" --format TSVWithNames \
         | awk -F'\t' 'NR==1 { for (i = 1; i <= NF; i++) col[$i] = i; next }
-                      { print $col["pending_candidates"] + $col["pending_condemned"] + $col["pending_retired"] }')
+                      { print $col["pending_condemned"] }   # already candidates+retired per its doc in Gc/CasGc.h; summing all three double-counts')
     [ "${PENDING}" = "0" ] && break
     sleep 0.5
 done
