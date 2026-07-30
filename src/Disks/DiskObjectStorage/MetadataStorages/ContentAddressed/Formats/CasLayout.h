@@ -272,10 +272,9 @@ public:
     /// legitimate inhabitant of `roots/`, never damage), or nothing after the reserved segment.
     ///
     /// It THROWS `CORRUPTED_DATA` naming the key in the same one situation the ref parsers do: the key
-    /// IS one of our namespace files -- it carries the reserved segment -- but the segment where its
-    /// incarnation belongs is missing, non-canonical or zero. Behind Stage B's format bump that is the
-    /// un-incarnated (Stage A) shape, and classifying it as foreign debris would leave it sitting
-    /// unnoticed under a live namespace.
+    /// carries the reserved segment, but the segment where its incarnation belongs is missing,
+    /// non-canonical or zero. Behind Stage B's format bump that is the un-incarnated (Stage A) shape,
+    /// and classifying it as foreign debris would leave it sitting unnoticed under a live namespace.
     ///
     /// The FIRST `_files` segment is the one that separates the life from the relative name. That is
     /// unambiguous because `checkNamespace` rejects `_files` as a namespace segment, while a relative

@@ -194,9 +194,8 @@ std::optional<ParsedNamespaceFileKey> Layout::parseNamespaceFileKey(std::string_
     if (relative_name.empty())
         return std::nullopt;   /// the files prefix itself names no file
 
-    /// Only now, with the key positively identified as one of OUR namespace files, does a bad
-    /// incarnation segment become corruption rather than "not ours" -- see the refusal contract on the
-    /// declaration.
+    /// Only now, with the reserved `_files` segment found, does a bad incarnation segment become
+    /// corruption rather than "not ours" -- see the refusal contract on the declaration.
     return ParsedNamespaceFileKey{namespaceLifeOf(key, ns_and_incarnation), String(relative_name)};
 }
 
