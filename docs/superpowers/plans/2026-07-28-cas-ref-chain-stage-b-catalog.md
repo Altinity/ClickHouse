@@ -764,6 +764,22 @@ in `gtest_cas_ns_creation_lifecycle.cpp`.
 - [ ] **Step 2:** → FAIL. **Step 3:** Implement. **Step 4:** CA gate green.
 - [ ] **Step 5: Commit** `ca: ref — namespace creation lifecycle; token-exact reconciliation; three-site recheck`.
 
+**TWO MORE CARRIES FROM TASK 3, placed as steps rather than notes.**
+
+- [ ] **Give `isCreatorFenceTerminal` and `reconcileStaleCreator` a production caller.** Task 3 built and
+  tested both, but nothing calls `reconcileStaleCreator` outside its own tests: the trigger — something
+  noticing a stalled `Creating` entry — needs the catalog-backed discovery this task adds. A tested
+  function with no caller rots silently; this campaign already found one test hook that no test set
+  (`install_region_probe_for_test`). So wire it here, and pin the wiring with a test that drives
+  reconciliation through the discovery path rather than by calling the primitive directly.
+- [ ] **Re-check the birth-`_ckpt` cleanup's three branches against the NEW key shape.** Task 3's
+  `cleanupOrphanedBirthCkptBestEffort` deletes a never-born namespace's `_ckpt`, and its safety argument
+  is explicitly scoped to today's sentinel `_ckpt` keying. This task re-keys `_ckpt` to
+  `<ns>/<inc>/_ckpt`, which moves the object the argument is about. Re-derive the argument at the new
+  shape — do not assume it carries — and confirm the never-born-only guarantee still holds, including
+  the negative case (a `Live` namespace's `_ckpt` is never deleted by that path). `_ckpt` has no repair
+  path, so a wrong delete here is unrecoverable.
+
 **OBLIGATION CARRIED FROM TASK 3 (ruled 2026-07-30, so it has an executor rather than a citation).**
 Task 3 builds the creation lifecycle and enforces "`Creating` forbids publication" **at the catalog
 level only**. It is deliberately NOT enforced on the production ref-write path, and the reason is a
