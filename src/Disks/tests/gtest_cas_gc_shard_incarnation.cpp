@@ -150,9 +150,18 @@ TEST(CasGcShardIncarnation, IncarnationMismatchWithoutEntryAbsenceIsAnAnomaly)
     }
 
     const RoundReport report = gc.runRegularRound({}, /*allow_steal=*/true, UniversePolicy::AuthoritativeForTest);
-    EXPECT_FALSE(report.anomalies.empty())
+    /// Final review F4: `!anomalies.empty()` alone passes for any anomaly from any cause -- a future
+    /// change that raises a DIFFERENT anomaly for this same fixture (or moves the un-cataloged branch
+    /// to cover this shape instead of the detector) leaves this green while the detector itself is
+    /// dead. Assert the namespace AND a substring of the detector's own reason text.
+    const auto anomaly = std::find_if(report.anomalies.begin(), report.anomalies.end(),
+        [&](const RoundAnomaly & a) { return a.ns.string() == ns.string(); });
+    ASSERT_NE(anomaly, report.anomalies.end())
         << "a current incarnation with zero footprint next to a different incarnation's real objects "
            "must be refused, not read as a vacuously-complete frontier";
+    EXPECT_NE(anomaly->reason.find("DIFFERENT incarnation of the same name has listed ref objects"), String::npos)
+        << "the anomaly for this namespace must be the NEW-1 detector's own, not some other anomaly "
+           "that happens to also fire for this fixture: " << anomaly->reason;
 }
 
 /// Final review F2: the sibling above only asserts an anomaly IS raised, which passes for any anomaly

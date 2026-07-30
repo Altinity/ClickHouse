@@ -1036,8 +1036,8 @@ TEST(CasRefWedgeEveryAttempt, BirthCkptOfAnAlreadyLiveNamespaceSurvivesALaterCon
     const auto ckpt_after = backend->get(ckpt_key);
     ASSERT_TRUE(ckpt_after.has_value()) << "a Live namespace's _ckpt must never be deleted by this path";
     EXPECT_EQ(ckpt_after->bytes, ckpt_before->bytes)
-        << "not merely present but UNCHANGED -- this transaction was never a birth, so the cleanup call "
-           "is gated to a no-op and must not have touched the object at all";
+        << "not merely present but UNCHANGED -- no code anywhere on this path deletes _ckpt any more "
+           "(increment review Critical B), so it must not have been touched at all";
 }
 
 /// THE OTHER negative row (review C2): the AMBIGUOUS branch -- `Writing` -> `Wedged` -- is deliberately
@@ -1069,6 +1069,75 @@ TEST(CasRefWedgeEveryAttempt, BirthCkptSurvivesWhenTheGenesisTransactionIsAmbigu
         << "the birth's own _ckpt must SURVIVE an ambiguous outcome -- the ref-log bytes might still "
            "have landed, and this object is the only record of the genesis epoch nothing else could "
            "ever recover if it were deleted here";
+}
+
+/// Final review F5: the two other removed call sites, given their own genesis-birth survival rows.
+/// The reversed test above pins the `SuccessorSeal` branch; the sibling below it pins the ambiguous
+/// branch (never called it in the first place). The remaining two -- occupant-unreadable
+/// (`CORRUPTED_DATA` from a failed adjudication read) and genuine foreign interference -- had no
+/// genesis-birth row at all: `AppendSiteFaultsWhenTheOccupantCannotBeRead`,
+/// `ForeignNonSealOccupantIsCorruptedDataAndSchedulesARemount`, and `WellFormedNonSealOccupantIsStillForeign`
+/// all `publishEmptyPart` FIRST, so none of them ever carries a `birth_contribution` -- a reinstated
+/// GUARDED cleanup at either of these two sites would pass the whole suite with no genesis case to
+/// catch it. Mirrors `WellFormedNonSealOccupantIsStillForeign`'s occupant shape (a decodable, well-formed
+/// NON-seal transaction at the derived key), moved to sequence 1 of a namespace that has never had a
+/// `_ckpt` before, so this attempt's own PUT is its first.
+TEST(CasRefWedgeEveryAttempt, BirthCkptSurvivesWhenTheOccupantCannotBeRead)
+{
+    auto backend = std::make_shared<WedgeTestBackend>();
+    auto store = openPool(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/birth_ckpt_occupant_unreadable"};
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);
+
+    const RefTxnId genesis{store->liveWriterEpoch(), 1};
+    const String ckpt_key = layout.refCkptKey(NamespaceLifeId::stageATransition(ns));
+    ASSERT_FALSE(backend->get(ckpt_key).has_value()) << "nothing has ever been written for this namespace yet";
+
+    backend->conflict_substr = layout.refLogKey(NamespaceLifeId::stageATransition(ns), genesis);
+    backend->conflict_bytes = epochSealBytes(ns, genesis);
+    backend->conflict_count = 1;
+    /// Skip the resolve read that PROVES the conflict; fail only the adjudication read after it, so the
+    /// occupant's identity (seal vs. breach) cannot be determined.
+    backend->fail_get_substr = layout.refLogKey(NamespaceLifeId::stageATransition(ns), genesis);
+    backend->fail_get_skip = 1;
+    backend->fail_get_count = 1;
+
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { publishEmptyPart(store, ns, "x"); });
+
+    EXPECT_TRUE(backend->get(ckpt_key).has_value())
+        << "the birth's own _ckpt must survive an occupant-unreadable fault just as it survives every "
+           "other path -- nothing deletes it any more";
+}
+
+/// The other former call site: a genuine breach of write-exclusivity at the genesis id, mirroring
+/// `WellFormedNonSealOccupantIsStillForeign`'s occupant shape but with no prior publish.
+TEST(CasRefWedgeEveryAttempt, BirthCkptSurvivesOnGenuineForeignInterference)
+{
+    auto backend = std::make_shared<WedgeTestBackend>();
+    auto store = openPool(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/birth_ckpt_foreign_interference"};
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);
+
+    const RefTxnId genesis{store->liveWriterEpoch(), 1};
+    const String ckpt_key = layout.refCkptKey(NamespaceLifeId::stageATransition(ns));
+    ASSERT_FALSE(backend->get(ckpt_key).has_value()) << "nothing has ever been written for this namespace yet";
+
+    /// A perfectly decodable transaction for this exact namespace and id -- just not an epoch seal, and
+    /// not this attempt's own birth.
+    RefOp birth;
+    birth.kind = RefOpKind::NamespaceBirth;
+    const RefLogTxn foreign_txn{ns.string(), genesis, {birth}, std::nullopt};
+    backend->conflict_substr = layout.refLogKey(NamespaceLifeId::stageATransition(ns), genesis);
+    backend->conflict_bytes = sealObject(FormatId::RefLog, encodeRefLogTxn(foreign_txn));
+    backend->conflict_count = 1;
+
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { publishEmptyPart(store, ns, "x"); });
+
+    EXPECT_TRUE(backend->get(ckpt_key).has_value())
+        << "the birth's own _ckpt must survive a genuine foreign-interference fault just as it survives "
+           "every other path -- nothing deletes it any more";
 }
 
 /// The same conflict, but the read that would tell a seal from a breach fails. We must then decide
