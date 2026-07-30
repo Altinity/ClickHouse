@@ -155,6 +155,66 @@ TEST(CasGcShardIncarnation, IncarnationMismatchWithoutEntryAbsenceIsAnAnomaly)
            "must be refused, not read as a vacuously-complete frontier";
 }
 
+/// Final review F2: the sibling above only asserts an anomaly IS raised, which passes for any anomaly
+/// from any cause -- a future edit that widens the detector's trigger (dropping the `ref_tables` term,
+/// or reordering the check above `readCheckpointWitnesses`) could make EVERY ordinary rebirth raise an
+/// anomaly and this suite would stay green. This is the negative row: same swapped-incarnation setup,
+/// but the CURRENT incarnation genuinely contributes -- its own freshly published `_ckpt`, exactly what
+/// a successor's `completeCreation` durably leaves first -- and the round must raise NOTHING for it.
+///
+/// Deliberately the harder shape, not the easy one: the fresh `_ckpt` is published but withheld from
+/// LIST (`HintHoleBackend`), the exact "fresh-key omission" scenario review F3 fixed (a rebirth whose
+/// new `_ckpt` a store's LIST has not yet caught up to). With F3's fix this still raises nothing (the
+/// `backend.head` reads it by exact key, independent of the listing); without F3's fix this row would
+/// have failed the moment F1's own exemption logic did NOT apply (this is a `Live` swap, not a
+/// `Creating` one) -- which is what "this row would also have caught F3" means: a negative row using
+/// the EASY shape (a LISTED current-incarnation object, going through `ref_tables` alone) would never
+/// have exercised the `_ckpt`-independent-witness gap at all.
+TEST(CasGcShardIncarnation, IncarnationMismatchWhereCurrentIncarnationHasAFreshUnlistedCheckpointRaisesNoAnomaly)
+{
+    auto backend = std::make_shared<HintHoleBackend>();
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_shards = 1});
+    Gc gc(store, hexToU128("0000000000000000000000000000000a"));
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/tblOrdinaryRebirth"};
+
+    CasRefCatalog::casAdmitEntry(*backend, layout, CatalogEntry{.ns = ns, .state = NsState::Live,
+        .incarnation = UInt128(11), .creator = std::nullopt});
+    appendRefLogSeed(*backend, layout, ns, {});   // one real record, keyed at incarnation 11 (the dead one)
+
+    CatalogEntry after_rebirth{.ns = ns, .state = NsState::Live, .incarnation = UInt128(22), .creator = std::nullopt};
+    {
+        CasRefCatalog::Snapshot snap = CasRefCatalog::read(*backend, layout);
+        const auto it = std::find_if(snap.catalog.entries.begin(), snap.catalog.entries.end(),
+            [&](const CatalogEntry & e) { return e.ns.string() == ns.string(); });
+        ASSERT_NE(it, snap.catalog.entries.end());
+        *it = after_rebirth;   // "recreated" -- same name, new (current) incarnation 22
+        const HeadResult h = backend->head(layout.refCatalogKey());
+        ASSERT_TRUE(h.exists);
+        ASSERT_EQ(backend->putOverwrite(layout.refCatalogKey(), encodeRefCatalog(snap.catalog), h.token).outcome,
+                   PutOutcome::Done);
+    }
+
+    /// The successor's own genesis _ckpt, published at the NEW (current) incarnation -- durable, but
+    /// hidden from LIST, exactly as a store whose enumeration has not caught up to a just-written key.
+    const NamespaceLifeId current_life = NamespaceLifeId::fromCatalogEntry(ns, UInt128(22));
+    ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(current_life),
+        encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{1}, .checkpoint_snapshot_id = std::nullopt,
+                              .last_epoch_seal = std::nullopt})).outcome, PutOutcome::Done);
+    backend->hide(layout.refCkptKey(current_life));
+
+    const RoundReport report = gc.runRegularRound({}, /*allow_steal=*/true, UniversePolicy::AuthoritativeForTest);
+    EXPECT_GT(backend->holesServed(), 0u)
+        << "the hide must actually have been exercised, or this test passes vacuously";
+    bool saw_anomaly_for_ns = false;
+    for (const RoundAnomaly & a : report.anomalies)
+        if (a.ns.string() == ns.string())
+            saw_anomaly_for_ns = true;
+    EXPECT_FALSE(saw_anomaly_for_ns)
+        << "the current incarnation's own _ckpt is real (checked by exact key) even though LIST has not "
+           "caught up to it yet -- an ordinary rebirth in flight, not a contradiction";
+}
+
 /// C1/I1's ABSENT-ENTIRELY family, given its own direct positive test -- checked for, and not found,
 /// before writing this: the three protective `casAdmitEntry` pins C1/I1's own commit (`81ace46e089`)
 /// added to unrelated tests (`TheOrphanManifestSweepAndItsCursorAreInertUnderSuppression`,
