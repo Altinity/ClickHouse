@@ -2834,3 +2834,20 @@ message can be made harder to satisfy without visiting the surfaces at all.
 Also recorded: `05020_content_addressed_fsck.reference` pins the row via `TSVWithNames`, so it is a
 ONE-DIRECTIONAL fence — it fails on a column added without updating the reference, not on a `clean()`
 term added without a column. Only the `static_assert` covers that direction.
+
+## The fsck exit-code rule is restated in prose the fence cannot reach {#fsck-rule-restated-in-unfenceable-prose}
+
+Largest residue of Task 1c fix round 3, named by the implementer. The rule now EXECUTES in code
+(`FsckReport::clean` computed from `kFsckHardFindings`, `static_assert` tripping in three TUs), but
+the same rule is also RESTATED in prose that no build can check — `docs/superpowers/cas/08-testing-and-soak.md`
+and two harness files. **Three of those restatements were found wrong in one round**, one of them
+inside an operator-facing warning string, and one was wrong about three separate terms.
+
+Nothing mechanical will catch a fourth. The real fix is structural and is a documentation decision, not
+a code task: **the doc should point at the code rather than restate the exit set.** A reader who needs
+to know which findings exit nonzero should be sent to `kFsckHardFindings` and to
+`CommandFsck::executeImpl`, not handed a list that drifts. The same applies to the harness's comments.
+
+Related: `{#fsck-untestable-render-surfaces}` is the other half — the exit set and SQL row have no
+failable test. Together they bound what the fence does and does not reach; do not let a future round
+re-derive either from scratch.
