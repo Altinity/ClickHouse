@@ -2877,7 +2877,7 @@ makes it worth fixing is that a hard finding against a non-damaged key trains an
 disbelieve hard findings. Decide between enforcing the reservation in `mountpointObjectKey` and
 narrowing the classifier; the first is the one that makes the existing doc true.
 
-## The stateless drain tests' `PENDING` gauge double-counts {#stateless-pending-double-count}
+## RESOLVED — the stateless drain tests' `PENDING` gauge double-counted {#stateless-pending-double-count}
 
 Found by the review of `76ee70da4a7`, ruled out of scope there because the formula is carried over
 unchanged from before that commit — filed so it is not re-discovered as a new defect.
@@ -2893,8 +2893,9 @@ preserves both, so no assertion is wrong. What is wrong is every figure it print
 pipeline held 32. Those two numbers (64 and 152) were quoted in this session's `05008` diagnosis; the
 conclusion did not depend on their magnitude, but a future diagnosis might.
 
-**Fix:** use `pending_condemned` alone, which is already the total. Do it when either test is next
-touched — most likely at Task 7b, which must restore their deletion assertions anyway.
+**RESOLVED 2026-07-30**: both tests now read `pending_condemned` alone (`8e9b06c2a81`). Done ahead of Task 7b
+because it was free — neither file was touched by any in-flight work, and both tests are registered known-red,
+so the change could not mask or alter a verdict. Task 7b still owes their assertion restoration.
 
 ## The `!attempt_armed` arm's non-deletion is unpinned, by a judgement I endorsed {#attempt-armed-arm-unpinned}
 
@@ -3093,6 +3094,22 @@ wants the sentinel (raw test fixtures, where the sentinel IS the truth) it asks 
 compiler then performs the sweep** — all 24 call sites must state what they do when the answer is unknown,
 and R11c's class becomes a compile error instead of a silent proof. This is small, mechanical after the
 signature change, and it PREVENTS the class we have now found three times.
+
+**Mechanics, so whoever takes it does not re-derive them.** The signature change is one line; the work is the
+24 decisions behind it, and they fall into exactly three shapes:
+- **Raw test fixtures** — the sentinel IS the truth there, so they ask for it explicitly
+  (`stageATransition(ns)` at the call site). Mechanical.
+- **GC round paths** — must not fabricate: an unknown life means UNPROVEN plus an anomaly, never a probe at a
+  guessed key. This is where R11, R11b and R11c all lived, and the fold now has `FoldResult::live_incarnation`
+  to consult instead of re-resolving.
+- **Diagnostic and administrative paths** (fsck, decommission, probe A, the admin rebuild) — an unknown life is
+  a finding to REPORT, not a key to guess. fsck in particular must not emit a verdict computed at a guessed
+  key, which is exactly the shape of the `crossEpochFromSeal` defect found in the checkpoint review.
+
+**Do it as its own task, not folded into another.** It is not large, but it is 24 deliberate decisions, and a
+mechanical sweep would re-create the fallback under a new name. Attempted during Task 4-C and deliberately
+deferred: the same files were in flight, and racing an active implementer across 24 call sites would have cost
+more than the fix saves.
 
 **2. One life resolution per round, threaded — not re-derived.** Five mechanisms answer one question, across
 80 call sites: `resolveNamespaceLife` (10), `resolveLifeOrSentinel` (24), `discoverUniverse` (13),
