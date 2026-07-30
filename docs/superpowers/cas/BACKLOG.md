@@ -2917,3 +2917,30 @@ arm, nothing fails. If that is worth closing, the honest options are (a) build t
 reviewed change, with the arm's neighbours getting the same treatment since they share the posture, or
 (b) accept it as defensive code and leave this entry as the record. Do not close it by re-adding the
 call and calling the arm safe.
+
+## Every TLA runner shares a STATIC metadir, so two overlapping runs corrupt each other {#tla-runner-static-metadir}
+
+Observed 2026-07-30 during Task 10c, as a FALSE RED that cost a diagnosis. `CaB140DangleMerge`'s
+positive config `m_merged` came back `error` with TLC reporting a missing file inside its own state
+pool:
+
+```
+Error: when reading the disk (StatePoolReader.run):
+  ../../../tmp/tlc-meta-CaB140DangleMerge-m_merged/.../372 (No such file or directory)
+```
+
+Every runner in `docs/superpowers/models/` passes `-metadir` a path derived only from the model and
+config names — no run identity — so two invocations of the same config share one directory and the
+second one's cleanup deletes state the first is still reading. Re-run on a clean metadir, `m_merged`
+completes GREEN in 9s over 20692441 states / 5326000 distinct, so the model was never at fault.
+
+**Why this is worth fixing rather than remembering:** a red that is really an infrastructure collision
+is the most expensive kind of red, because the honest response to it is to stop and investigate the
+model — which is exactly what happened, and what the runner's own instruction to stop on
+`SOME EXPECTATIONS UNMET` correctly forced. It will recur whenever two runners, or a runner and a
+manual TLC invocation, touch one config concurrently.
+
+**Fix:** give the metadir a per-invocation component (the runner already computes a unique `LOG_ROOT`
+per run — derive the metadir from the same value). It is a one-line change per runner, but it is a
+sweep across all of them plus a convention note in `models/README.md`, so it wants its own task rather
+than riding along with a model change.
