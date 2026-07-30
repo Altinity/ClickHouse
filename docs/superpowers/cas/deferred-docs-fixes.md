@@ -9,6 +9,28 @@ comment and claim accuracy with **zero defects in the code or the tests**, and e
 the next round's finding, because fixing false prose is itself a prose-writing act with the same
 failure rate. Rounds are for defects that can break something. Prose is batched.
 
+## THE POLICY CHANGED (2026-07-31) — re-read every entry before executing it {#policy-change}
+
+A comment policy landed after most of the 22 entries below were written, and it changes what several of them
+should DO. Read it in the plan's Global Constraints before running the pass; the summary that matters here:
+
+- **Code must read without comments.** For each entry, the first question is no longer "how should this
+  sentence read" but **"should the code change so no sentence is needed"**. An entry saying "rewrite the
+  comment to state X" may now be answered by a name, a type, or an assertion instead.
+- **No comment may cite a plan, spec, BACKLOG entry, review round, finding ID or task number** — those are
+  branch-local and get deleted, so the citation becomes a pointer nobody can resolve. **Several entries below
+  are themselves phrased as "state the reason from finding N", which is now forbidden in the code.** Keep the
+  reason, drop the citation.
+- **Short beats complete.** An entry offering "state the necessary-not-sufficient scope, OR delete the clause"
+  now resolves toward the deletion unless a reader is misled without it.
+- **A rule that became an executing check deletes the rule's prose.** Where a check now enforces what a
+  comment described, the comment goes rather than being corrected.
+
+So the pass is no longer "apply 22 instructions". It is: **for each entry, decide between structure, a short
+self-contained reason, and deletion** — with deletion the default when the surrounding code already says it.
+Expect several entries to resolve as "no comment at all", which is a better outcome than a corrected one, and
+record that outcome rather than silently dropping the entry.
+
 ## What belongs here, and what does not
 
 **Here:** a comment that is false or over-claims; a doc statement that contradicts the code; a report
