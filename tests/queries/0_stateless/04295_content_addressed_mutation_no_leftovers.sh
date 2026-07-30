@@ -9,22 +9,18 @@
 # shell can inspect directly. Mirrors 04290 but adds heavy mutations and a patch-part lightweight
 # DELETE before the drop: a mutation supersedes the source part (its uniquely-owned blobs become
 # unreachable) and writes a new part; carried-forward columns stay referenced. We assert that after
-# DROP, settling the retire pipeline via `SYSTEM CONTENT ADDRESSED GC RUN` then running `FSCK` on the
-# running disk (T13) reads back zero `dangling` objects (no reachable object is ever lost to the
-# mutation/patch churn) and that `_pool_meta` survives. Teardown is fail-closed (spec rev.8 §5/§9):
-# FORGET the disk, verify `vanished(forgotten)`, then rm.
+# DROP, draining the retire pipeline via `SYSTEM CONTENT ADDRESSED GC RUN` then running `FSCK` on the
+# running disk (T13) reads back zero `unreachable`/`dangling` objects (no mutated-away or patch-part
+# blobs left behind), and that `_pool_meta` survives. Teardown is fail-closed (spec rev.8 §5/§9): FORGET
+# the disk, verify `vanished(forgotten)`, then rm.
 #
-# STAGE-A RETURN ITEM (`UniversePolicy::kDefault == StageA_Suppressed`, Stage B Task 7b): the settle loop
-# drives the PRODUCTION scheduler path (`SYSTEM CONTENT ADDRESSED GC RUN`), the one caller that can never
-# assert a closed universe. Marking still condemns every blob the mutations/DELETE/DROP made
-# unreferenced, but graduation and the physical delete never fire, so the pipeline SETTLES at a nonzero
-# total instead of draining to 0 -- convergence (two consecutive rounds reporting the same total), not
-# zero, is this stage's fixpoint. FSCK correctly RECOGNIZES that condemned garbage (mutated-away source
-# columns, superseded parts, patch-part debris) as `unreachable` (an EXPECTED pipeline label, not an
-# integrity failure) and, since nothing was reclaimed, must read it back nonzero rather than 0;
-# `dangling` is unaffected -- Stage A never loses a reachable object, it only defers reclaiming garbage.
-# When Task 7b flips `UniversePolicy::kDefault`, RESTORE: the pipeline draining to exactly 0, and
-# `fsck_unreachable` back to an exact-zero check.
+# STAGE-A RETURN ITEM (`UniversePolicy::kDefault == StageA_Suppressed`, Stage B Task 7b): this test is
+# KNOWN-RED under suppression — see the `04295_content_addressed_mutation_no_leftovers` entry in
+# `tests/broken_tests.yaml`. The drain loop below drives the production scheduler path
+# (`SYSTEM CONTENT ADDRESSED GC RUN`), the one caller that can never assert a closed universe, so
+# graduation and the physical delete never fire; the drain-to-0 loop never terminates (condemned
+# entries are re-emitted every round) and the test exhausts its bounded retries and fails. Remove that
+# `broken_tests.yaml` entry once Task 7b flips `UniversePolicy::kDefault`.
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
@@ -96,32 +92,29 @@ FROM t_cas_mut_leftovers"
 # Drop: every ref (original, mutated, and patch parts) is unlinked; all blobs/footers become GC fodder.
 $CLICKHOUSE_CLIENT --query "DROP TABLE t_cas_mut_leftovers SYNC"
 
-# Settle the retire pipeline deterministically: loop `SYSTEM CONTENT ADDRESSED GC RUN` rounds until the
-# `pending_*` gauges (Task 7) stop changing between two consecutive rounds -- convergence, not draining
-# to 0 (see the STAGE-A RETURN ITEM note above). Bounded (~10 rounds), not a fixed sleep; column values
-# are looked up BY HEADER NAME (not position) so the loop keeps working if the result set gains columns.
-PENDING=-1
-PREV_PENDING=-2
-CONDEMNED_TOTAL=0
-for _ in $(seq 1 10); do
-    ROUND=$($CLICKHOUSE_CLIENT --query "SYSTEM CONTENT ADDRESSED GC RUN '${DISK_NAME}'" --format TSVWithNames)
-    PENDING=$(echo "${ROUND}" | awk -F'\t' 'NR==1 { for (i = 1; i <= NF; i++) col[$i] = i; next }
+# Drain GC deterministically: loop `SYSTEM CONTENT ADDRESSED GC RUN` rounds until the retire
+# pipeline's `pending_*` gauges (Task 7) read back to empty. Bounded (~60 rounds, half-second
+# spacing), not a fixed sleep; column values are looked up BY HEADER NAME (not position) so the
+# loop keeps working if the result set gains columns.
+PENDING=1
+for _ in $(seq 1 60); do
+    PENDING=$($CLICKHOUSE_CLIENT --query "SYSTEM CONTENT ADDRESSED GC RUN '${DISK_NAME}'" --format TSVWithNames \
+        | awk -F'\t' 'NR==1 { for (i = 1; i <= NF; i++) col[$i] = i; next }
                       { print $col["pending_candidates"] + $col["pending_condemned"] + $col["pending_retired"] }')
-    CONDEMNED_TOTAL=$((CONDEMNED_TOTAL + $(echo "${ROUND}" | awk -F'\t' 'NR==1 { for (i = 1; i <= NF; i++) col[$i] = i; next } { print $col["entries_condemned"] }')))
-    [ "${PENDING}" = "${PREV_PENDING}" ] && break
-    PREV_PENDING="${PENDING}"
+    [ "${PENDING}" = "0" ] && break
+    sleep 0.5
 done
 
-echo "marked_something $([ "${CONDEMNED_TOTAL}" -gt 0 ] && echo 1 || echo 0)"
-echo "pipeline_retained_nonzero $([ "${PENDING}" -gt 0 ] && echo 1 || echo 0)"
+if [ "${PENDING}" != "0" ]; then
+    echo "FAIL: GC did not drain the retire pipeline within the bounded loop (pending=${PENDING})" >&2
+    exit 1
+fi
 
-# FSCK runs directly on the running disk (T13): a reachability audit. `dangling` must read back zero
-# regardless of stage (Stage A never loses a reachable object). `unreachable` -- see the STAGE-A RETURN
-# ITEM note above -- is where the condemned-but-not-reclaimed garbage is correctly RECOGNIZED this
-# stage, so it must read back nonzero rather than 0.
+# FSCK runs directly on the running disk (T13): a reachability audit that must read back zero
+# unreachable/dangling objects. This is a strictly stronger no-leftovers oracle than the old dir-poll.
 $CLICKHOUSE_CLIENT --query "SYSTEM CONTENT ADDRESSED FSCK '${DISK_NAME}'" --format TSVWithNames \
     | awk -F'\t' 'NR==1 { for (i = 1; i <= NF; i++) col[$i] = i; next }
-                  { print "fsck_unreachable_gt_0", ($col["unreachable"] > 0) ? 1 : 0; print "fsck_dangling", $col["dangling"] }'
+                  { print "fsck_unreachable", $col["unreachable"]; print "fsck_dangling", $col["dangling"] }'
 
 if [ -f "${POOL_DIR}/ca/_pool_meta" ]; then
     echo "pool_meta_present 1"

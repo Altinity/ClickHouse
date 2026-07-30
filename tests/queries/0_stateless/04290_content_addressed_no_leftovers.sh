@@ -14,25 +14,22 @@
 #   (2) CREATE a MergeTree on the CA disk and INSERT several distinct batches to make many blobs,
 #   (3) assert the count rose above baseline,
 #   (4) DROP TABLE ... SYNC so the refs are unlinked and the blobs/footers become GC fodder,
-#   (5) settle the retire pipeline deterministically via `SYSTEM CONTENT ADDRESSED GC RUN` (bounded
-#       loop on the `pending_*` gauges converging, NOT a fixed sleep), then run `FSCK` directly on the
-#       running disk (T13): a reachability audit is a strictly stronger no-leftovers oracle than polling
-#       the pool directory ever was.
+#   (5) drain the retire pipeline deterministically via `SYSTEM CONTENT ADDRESSED GC RUN` (bounded
+#       loop on the `pending_*` gauges, NOT a fixed sleep), then run `FSCK` directly on the running
+#       disk (T13): a clean reachability audit reading back zero `unreachable`/`dangling` is a
+#       strictly stronger no-leftovers oracle than polling the pool directory ever was.
 # `_pool_meta` (durable single-owner marker) and the `store/` metadata tree are expected to remain.
 # Teardown is fail-closed (spec rev.8 §5/§9): `SYSTEM CONTENT ADDRESSED FORGET` the disk (force-Vanish,
 # node-local), verify it reads `vanished(forgotten)` in system.content_addressed_mounts, and only then
 # `rm -rf` — FORGET stopped and joined every CAS background thread for this disk.
 #
-# STAGE-A RETURN ITEM (`UniversePolicy::kDefault == StageA_Suppressed`, Stage B Task 7b): step (5) drives
-# the PRODUCTION scheduler path (`SYSTEM CONTENT ADDRESSED GC RUN`), the one caller that can never assert
-# a closed universe. Marking still condemns every object the DROP made unreferenced, but graduation and
-# the physical delete never fire, so the pipeline SETTLES at a nonzero total instead of draining to 0 --
-# convergence (two consecutive rounds reporting the same total), not zero, is this stage's fixpoint. FSCK
-# in step (6) correctly RECOGNIZES that condemned garbage as `unreachable` (an EXPECTED pipeline label,
-# not an integrity failure) and, since nothing was reclaimed, must read it back nonzero rather than 0;
-# `dangling` is unaffected -- Stage A never loses a reachable object, it only defers reclaiming garbage.
-# When Task 7b flips `UniversePolicy::kDefault`, RESTORE: the pipeline draining to exactly 0, and
-# `fsck_unreachable` (see step (6) below) back to an exact-zero check.
+# STAGE-A RETURN ITEM (`UniversePolicy::kDefault == StageA_Suppressed`, Stage B Task 7b): this test is
+# KNOWN-RED under suppression — see the `04290_content_addressed_no_leftovers` entry in
+# `tests/broken_tests.yaml`. Step (5) drives the production scheduler path
+# (`SYSTEM CONTENT ADDRESSED GC RUN`), the one caller that can never assert a closed universe, so
+# graduation and the physical delete never fire; the drain-to-0 loop below never terminates (condemned
+# entries are re-emitted every round) and the test exhausts its bounded retries and fails. Remove that
+# `broken_tests.yaml` entry once Task 7b flips `UniversePolicy::kDefault`.
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
@@ -94,33 +91,30 @@ fi
 # (4) Drop: refs unlinked synchronously, blobs/footers become unreferenced GC fodder.
 $CLICKHOUSE_CLIENT --query "DROP TABLE t_cas_leftovers SYNC"
 
-# (5) Settle the retire pipeline deterministically: loop `SYSTEM CONTENT ADDRESSED GC RUN` rounds until
-#     the `pending_*` gauges (Task 7) stop changing between two consecutive rounds -- convergence, not
-#     draining to 0 (see the STAGE-A RETURN ITEM note above). Bounded (~10 rounds), not a fixed sleep;
-#     column values are looked up BY HEADER NAME (not position) so the loop keeps working if the result
-#     set gains columns.
-PENDING=-1
-PREV_PENDING=-2
-CONDEMNED_TOTAL=0
-for _ in $(seq 1 10); do
-    ROUND=$($CLICKHOUSE_CLIENT --query "SYSTEM CONTENT ADDRESSED GC RUN '${DISK_NAME}'" --format TSVWithNames)
-    PENDING=$(echo "${ROUND}" | awk -F'\t' 'NR==1 { for (i = 1; i <= NF; i++) col[$i] = i; next }
+# (5) Drain GC deterministically: loop `SYSTEM CONTENT ADDRESSED GC RUN` rounds until the retire
+#     pipeline's `pending_*` gauges (Task 7) read back to empty. Bounded (~60 rounds, half-second
+#     spacing), not a fixed sleep; column values are looked up BY HEADER NAME (not position) so the
+#     loop keeps working if the result set gains columns.
+PENDING=1
+for _ in $(seq 1 60); do
+    PENDING=$($CLICKHOUSE_CLIENT --query "SYSTEM CONTENT ADDRESSED GC RUN '${DISK_NAME}'" --format TSVWithNames \
+        | awk -F'\t' 'NR==1 { for (i = 1; i <= NF; i++) col[$i] = i; next }
                       { print $col["pending_candidates"] + $col["pending_condemned"] + $col["pending_retired"] }')
-    CONDEMNED_TOTAL=$((CONDEMNED_TOTAL + $(echo "${ROUND}" | awk -F'\t' 'NR==1 { for (i = 1; i <= NF; i++) col[$i] = i; next } { print $col["entries_condemned"] }')))
-    [ "${PENDING}" = "${PREV_PENDING}" ] && break
-    PREV_PENDING="${PENDING}"
+    [ "${PENDING}" = "0" ] && break
+    sleep 0.5
 done
 
-echo "marked_something $([ "${CONDEMNED_TOTAL}" -gt 0 ] && echo 1 || echo 0)"
-echo "pipeline_retained_nonzero $([ "${PENDING}" -gt 0 ] && echo 1 || echo 0)"
+if [ "${PENDING}" != "0" ]; then
+    echo "FAIL: GC did not drain the retire pipeline within the bounded loop (pending=${PENDING})" >&2
+    exit 1
+fi
 
-# (6) FSCK runs directly on the running disk (T13): a reachability audit. `dangling` must read back zero
-#     regardless of stage (Stage A never loses a reachable object). `unreachable` -- see the STAGE-A
-#     RETURN ITEM note above -- is where the condemned-but-not-reclaimed garbage from step (4)/(5) is
-#     correctly RECOGNIZED this stage, so it must read back nonzero rather than 0.
+# (6) FSCK runs directly on the running disk (T13): a reachability audit that must read back zero
+#     unreachable/dangling objects. This is a strictly stronger no-leftovers oracle than the old
+#     dir-poll.
 $CLICKHOUSE_CLIENT --query "SYSTEM CONTENT ADDRESSED FSCK '${DISK_NAME}'" --format TSVWithNames \
     | awk -F'\t' 'NR==1 { for (i = 1; i <= NF; i++) col[$i] = i; next }
-                  { print "fsck_unreachable_gt_0", ($col["unreachable"] > 0) ? 1 : 0; print "fsck_dangling", $col["dangling"] }'
+                  { print "fsck_unreachable", $col["unreachable"]; print "fsck_dangling", $col["dangling"] }'
 
 # _pool_meta must still be present (durable single-owner marker is never GC'd).
 if [ -f "${POOL_DIR}/ca/_pool_meta" ]; then

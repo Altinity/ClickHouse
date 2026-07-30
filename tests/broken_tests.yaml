@@ -316,6 +316,38 @@
   check_types:
   - asan
 
+# STAGE-A RETURN ITEM (`UniversePolicy::kDefault == StageA_Suppressed` in `CasGc.h`, Stage B Task 7b):
+# these three tests assert the real deletion contract and are known-red only because production GC
+# destruction is suppressed pre-Stage-B. Remove all three entries in the same change that flips
+# `UniversePolicy::kDefault`; `grep -n "STAGE-A RETURN ITEM"` across tests/queries must then return nothing.
+- name: 05008_ca_gc_snap_prune
+  reason: 'KNOWN-RED - `UniversePolicy::kDefault == StageA_Suppressed` in `CasGc.h` suppresses every
+    destructive GC site; production GC rounds driven through `SYSTEM CONTENT ADDRESSED GC RUN` never
+    physically delete while suppression holds, so the 40-round poll for `objects_deleted > 0` never
+    fires and the final `SELECT` reads back `0` instead of `1` for the deleted-count column. This test
+    fails via a plain result diff, not a distinctive stderr string, so the message below cannot
+    distinguish this cause from an unrelated regression in the same test -- do not read it as a
+    narrowly-targeted expectation.'
+  message: 'result differs with reference'
+- name: 04290_content_addressed_no_leftovers
+  reason: 'KNOWN-RED - `UniversePolicy::kDefault == StageA_Suppressed` in `CasGc.h` suppresses every
+    destructive GC site; condemned entries are re-emitted as `still_retired` every round while
+    suppression holds, so the `pending_*` drain-to-0 loop (bounded ~60 rounds) never converges to zero
+    and the test exits via the drain-loop-exhaustion error before the `FSCK` assertions run. The message
+    below is the specific drain-loop-exhaustion stderr line, narrower than a plain result diff, but any
+    other bug that stalls pipeline convergence (not only this intentional suppression) would print the
+    identical line, so it is not a guarantee that suppression is the only possible cause.'
+  message: 'FAIL: GC did not drain the retire pipeline within the bounded loop'
+- name: 04295_content_addressed_mutation_no_leftovers
+  reason: 'KNOWN-RED - `UniversePolicy::kDefault == StageA_Suppressed` in `CasGc.h` suppresses every
+    destructive GC site; condemned entries are re-emitted as `still_retired` every round while
+    suppression holds, so the `pending_*` drain-to-0 loop (bounded ~60 rounds) never converges to zero
+    and the test exits via the drain-loop-exhaustion error before the `FSCK` assertions run. The message
+    below is the specific drain-loop-exhaustion stderr line, narrower than a plain result diff, but any
+    other bug that stalls pipeline convergence (not only this intentional suppression) would print the
+    identical line, so it is not a guarantee that suppression is the only possible cause.'
+  message: 'FAIL: GC did not drain the retire pipeline within the bounded loop'
+
 
 # Regex rules should be ordered from most specific to least specific.
 # regex: true applies to name, message, and not_message fields, but not to reason or check_types fields.
