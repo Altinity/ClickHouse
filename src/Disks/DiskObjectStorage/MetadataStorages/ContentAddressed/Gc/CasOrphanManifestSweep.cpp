@@ -163,10 +163,10 @@ NamespaceProtection activeManifestKeys(Pool & store, const RootNamespace & ns,
     /// so this also protects a whole removed namespace's bodies until the fold catches up.
     const RefTxnId cursor = sealedRefCursor(coverage);
     std::vector<RefTxnId> logs;
-    forEachListedKey(backend, layout.refsNamespacePrefix(ns), [&](const ListedKey & lk)
+    forEachListedKey(backend, layout.refsNamespacePrefix(RefNamespaceId::stageATransition(ns)), [&](const ListedKey & lk)
     {
         if (const auto parsed = layout.parseRefObjectKey(lk.key);
-            parsed && parsed->ns == ns && parsed->kind == RefObjectKind::Log)
+            parsed && parsed->id.ns == ns && parsed->kind == RefObjectKind::Log)
             logs.push_back(parsed->txn_id);
     }, 1000, onGcEnumerationPage);
     std::sort(logs.begin(), logs.end());
@@ -175,7 +175,7 @@ NamespaceProtection activeManifestKeys(Pool & store, const RootNamespace & ns,
     {
         if (!(cursor < id))
             continue;   /// id <= cursor: its edges are already folded
-        const auto got = backend.get(layout.refLogKey(ns, id));
+        const auto got = backend.get(layout.refLogKey(RefNamespaceId::stageATransition(ns), id));
         if (!got)
             continue;   /// vanished (a concurrent cleanup published a covering snapshot) -- its -1 was folded
         const RefLogTxn txn = decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), id);

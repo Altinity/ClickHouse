@@ -149,11 +149,11 @@ RefTableState independentFullReplayForTest(Backend & backend, const Layout & lay
     String cursor;
     for (;;)
     {
-        const ListPage page = backend.list(layout.refsNamespacePrefix(ns), cursor, 1000);
+        const ListPage page = backend.list(layout.refsNamespacePrefix(RefNamespaceId::stageATransition(ns)), cursor, 1000);
         for (const ListedKey & lk : page.keys)
         {
             const auto parsed = layout.parseRefObjectKey(lk.key);
-            if (parsed && parsed->ns == ns && parsed->kind == RefObjectKind::Log
+            if (parsed && parsed->id.ns == ns && parsed->kind == RefObjectKind::Log
                 && (!up_to || !(*up_to < parsed->txn_id)))
                 ids.push_back(parsed->txn_id);
         }
@@ -166,7 +166,7 @@ RefTableState independentFullReplayForTest(Backend & backend, const Layout & lay
     RefTableState state;
     for (const RefTxnId & id : ids)
     {
-        const auto got = backend.get(layout.refLogKey(ns, id));
+        const auto got = backend.get(layout.refLogKey(RefNamespaceId::stageATransition(ns), id));
         applyRefLogTxn(state, decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), id));
     }
     return state;
@@ -180,11 +180,11 @@ std::optional<RefTxnId> listGreatestSnapshotIdForTest(Backend & backend, const L
     String cursor;
     for (;;)
     {
-        const ListPage page = backend.list(layout.refsNamespacePrefix(ns), cursor, 1000);
+        const ListPage page = backend.list(layout.refsNamespacePrefix(RefNamespaceId::stageATransition(ns)), cursor, 1000);
         for (const ListedKey & lk : page.keys)
         {
             const auto parsed = layout.parseRefObjectKey(lk.key);
-            if (parsed && parsed->ns == ns && parsed->kind == RefObjectKind::Snap
+            if (parsed && parsed->id.ns == ns && parsed->kind == RefObjectKind::Snap
                 && (!greatest || *greatest < parsed->txn_id))
                 greatest = parsed->txn_id;
         }
@@ -569,7 +569,7 @@ TEST(RefWriterRecovery, RestartOnVanishConvergesOnNewerSnapshot)
 
     const RefTxnId snap_x{1, 10};
     writeRefSnapshotRaw(*backend, layout, minimalLiveSnapshot(ns.string(), snap_x, {committedRow("a", ma)}));
-    backend->vanish_once_keys.insert(layout.refSnapshotKey(ns, snap_x));
+    backend->vanish_once_keys.insert(layout.refSnapshotKey(RefNamespaceId::stageATransition(ns), snap_x));
     backend->on_vanish_fire = [&]
     {
         const RefTxnId snap_y{1, 20};
@@ -601,7 +601,7 @@ TEST(RefWriterRecovery, DifferentBytesAtSelectedSnapshotIsCorruptionNotRestart)
     foreign.ns = other_ns.string();
     foreign.snapshot_id = snap_x;
     foreign.lifecycle = RefLifecycle::Live;
-    backend->putIfAbsent(layout.refSnapshotKey(ns, snap_x),
+    backend->putIfAbsent(layout.refSnapshotKey(RefNamespaceId::stageATransition(ns), snap_x),
                          DB::Cas::sealObject(DB::Cas::FormatId::RefSnapshot, DB::Cas::encodeRefTableSnapshot(foreign)));
 
     auto store = openPool(backend);
@@ -762,7 +762,7 @@ TEST(RefWriterAppendLane, WedgedLaneBlocksSameTableWhileOtherTableProceeds)
     publishEmptyPart(store, ns_a, "x_second");
     publishEmptyPart(store, ns_b, "y");
 
-    backend->fault_key_substr = layout.refsNamespacePrefix(ns_a) + "_log/";
+    backend->fault_key_substr = layout.refsNamespacePrefix(RefNamespaceId::stageATransition(ns_a)) + "_log/";
     backend->fault_count = 1;
 
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns_a, "x"); });
@@ -798,7 +798,7 @@ TEST(RefWriterAppendLane, WedgedAppendObservedDurableAppliesBeforeNextId)
     publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "y");
 
-    backend->fault_key_substr = layout.refsNamespacePrefix(ns) + "_log/";
+    backend->fault_key_substr = layout.refsNamespacePrefix(RefNamespaceId::stageATransition(ns)) + "_log/";
     backend->fault_count = 1;
 
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
@@ -841,7 +841,7 @@ TEST(RefWriterAppendLane, WedgeResolutionJoinsTailCountersAndFoldsOverlay)
     const size_t tail_after_setup = store->tailSinceSnapshotCountForTest(ns);
 
     /// Wedge the lane: the single-attempt budget turns the ambiguous log PUT into an Unresolved outcome.
-    backend->fault_key_substr = layout.refsNamespacePrefix(ns) + "_log/";
+    backend->fault_key_substr = layout.refsNamespacePrefix(RefNamespaceId::stageATransition(ns)) + "_log/";
     backend->fault_count = 1;
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
@@ -885,7 +885,7 @@ TEST(RefWriterAppendLane, WedgedRefLaneCountTracksExactlyTheWedgedTableThroughIt
     publishEmptyPart(store, ns_b, "p");
     ASSERT_EQ(store->wedgedRefLaneCount(), 0u) << "both tables cached and healthy before the fault";
 
-    backend->fault_key_substr = layout.refsNamespacePrefix(ns_a) + "_log/";
+    backend->fault_key_substr = layout.refsNamespacePrefix(RefNamespaceId::stageATransition(ns_a)) + "_log/";
     backend->fault_count = 1;
 
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns_a, "x"); });
@@ -937,7 +937,7 @@ TEST(RefWriterAppendLane, I1AppendCorruptionSurfacesAndFencesTheMountForRemount)
 
     /// The next `_log` PUT for `ns` has a foreign different object land at its key; resolve-before-reissue
     /// then observes the mismatch and raises CORRUPTED_DATA.
-    backend->corrupt_key_substr = layout.refsNamespacePrefix(ns) + "_log/";
+    backend->corrupt_key_substr = layout.refsNamespacePrefix(RefNamespaceId::stageATransition(ns)) + "_log/";
     backend->corrupt_count = 1;
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { store->dropRef(ns, "x"); });
@@ -997,7 +997,7 @@ TEST(RefWriterAppendLane, I1WedgeResolveCorruptionSurfacesAndFaultsLane)
     publishEmptyPart(store, ns, "y");
 
     /// Wedge the lane with an ambiguous PUT that never landed.
-    backend->fault_key_substr = layout.refsNamespacePrefix(ns) + "_log/";
+    backend->fault_key_substr = layout.refsNamespacePrefix(RefNamespaceId::stageATransition(ns)) + "_log/";
     backend->fault_count = 1;
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
@@ -1066,7 +1066,7 @@ TEST(CasAnomalyPolicy, ForeignBytesAtWedgeKeyTripFenceAndRemount)
     store->setEventSink([&](const CasEvent & e) { seen.push_back(e); });
 
     /// Wedge the lane with an ambiguous PUT that never landed.
-    backend->fault_key_substr = layout.refsNamespacePrefix(ns) + "_log/";
+    backend->fault_key_substr = layout.refsNamespacePrefix(RefNamespaceId::stageATransition(ns)) + "_log/";
     backend->fault_count = 1;
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
@@ -1128,11 +1128,11 @@ TEST(CasAnomalyPolicy, NonReadyAtNewIdAllocationFaultsAndFailsClosed)
         String cursor;
         for (;;)
         {
-            const ListPage page = backend->list(layout.refsNamespacePrefix(ns), cursor, 1000);
+            const ListPage page = backend->list(layout.refsNamespacePrefix(RefNamespaceId::stageATransition(ns)), cursor, 1000);
             for (const ListedKey & lk : page.keys)
             {
                 const auto parsed = layout.parseRefObjectKey(lk.key);
-                if (parsed && parsed->ns == ns && parsed->kind == RefObjectKind::Log)
+                if (parsed && parsed->id.ns == ns && parsed->kind == RefObjectKind::Log)
                     ++n;
             }
             if (page.next_cursor.empty())
@@ -1273,7 +1273,7 @@ TEST(RefTableCacheEviction, WedgedTableIsNeverEvicted)
     publishEmptyPart(store, ns_w, "x");
 
     /// Wedge ns_w's append lane with one ambiguous (Unresolved) PUT that exhausts the single-attempt budget.
-    backend->fault_key_substr = layout.refsNamespacePrefix(ns_w) + "_log/";
+    backend->fault_key_substr = layout.refsNamespacePrefix(RefNamespaceId::stageATransition(ns_w)) + "_log/";
     backend->fault_count = 1;
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns_w, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns_w));
@@ -1315,7 +1315,7 @@ TEST(RefWriterSnapshotPublish, ThresholdTriggerPublishesCacheReplayEquivalentByt
     EXPECT_TRUE(store->newestPublishedSnapshotIdForTest(ns) == snap_id);
     EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), 0u) << "a snapshot covering everything prunes the whole tail";
 
-    const auto got = backend->get(layout.refSnapshotKey(ns, *snap_id));
+    const auto got = backend->get(layout.refSnapshotKey(RefNamespaceId::stageATransition(ns), *snap_id));
     ASSERT_TRUE(got.has_value());
 
     /// The independent oracle: replay every `_log/` object directly, ignoring the snapshot entirely.
@@ -1383,7 +1383,7 @@ TEST(RefWriterSnapshotPublish, MountTimeTriggerPublishesAfterRecoveryReplaysLarg
     ASSERT_TRUE(snap_id.has_value()) << "the mount-time trigger must have published a snapshot";
     EXPECT_EQ(successor->tailSinceSnapshotCountForTest(ns), 0u);
 
-    const auto got = backend->get(layout.refSnapshotKey(ns, *snap_id));
+    const auto got = backend->get(layout.refSnapshotKey(RefNamespaceId::stageATransition(ns), *snap_id));
     ASSERT_TRUE(got.has_value());
     const RefTableState oracle = independentFullReplayForTest(*backend, layout, ns, snap_id);
     EXPECT_EQ(openObject(FormatId::RefSnapshot, got->bytes), encodeRefTableSnapshot(snapshotOf(oracle, ns.string())));
@@ -1419,7 +1419,7 @@ TEST(RefWriterPublishFromLive, YoungTxnIsCoveredImmediately)
         << "publish-from-live: a just-committed txn is immediately coverable, with no grace window";
     const auto snap_id = listGreatestSnapshotIdForTest(*backend, layout, ns);
     ASSERT_TRUE(snap_id.has_value());
-    const auto got = backend->get(layout.refSnapshotKey(ns, *snap_id));
+    const auto got = backend->get(layout.refSnapshotKey(RefNamespaceId::stageATransition(ns), *snap_id));
     ASSERT_TRUE(got.has_value());
     const RefTableSnapshot snap = decodeRefTableSnapshot(openObject(FormatId::RefSnapshot, got->bytes), ns.string(), *snap_id);
     ASSERT_EQ(snap.committed.size(), 1u);
@@ -1602,7 +1602,7 @@ TEST(RefWriterSnapshotPublish, ConcurrentOutOfOrderPublishDoesNotRegressBaseNorD
     ASSERT_TRUE(store->trySnapshotPublishOnce(ns));
     const auto snap_id = listGreatestSnapshotIdForTest(*backend, layout, ns);
     ASSERT_TRUE(snap_id.has_value());
-    const auto got = backend->get(layout.refSnapshotKey(ns, *snap_id));
+    const auto got = backend->get(layout.refSnapshotKey(RefNamespaceId::stageATransition(ns), *snap_id));
     ASSERT_TRUE(got.has_value());
     const RefTableState oracle = independentFullReplayForTest(*backend, layout, ns, snap_id);
     EXPECT_EQ(openObject(FormatId::RefSnapshot, got->bytes), encodeRefTableSnapshot(snapshotOf(oracle, ns.string())))
@@ -1965,7 +1965,7 @@ TEST(RefWriterStalePrecommitSweep, BoundedBatchesAndInterruptionResumeAcrossMoun
     config.cas_request_budget = budget;
     auto successor = openPoolWithConfig(backend, config);
 
-    backend->fault_key_substr = layout.refsNamespacePrefix(ns) + "_log/";
+    backend->fault_key_substr = layout.refsNamespacePrefix(RefNamespaceId::stageATransition(ns)) + "_log/";
     /// The successor's own recovery runs first and mints one in-band seal for the dead predecessor
     /// epoch `e1` (its durable ids are `{e1,1}` and `{e1,2}`, so the seal lands at `{e1,3}`) -- that PUT
     /// shares this same `_log/` prefix, so it would eat the fault before the sweep ever gets a chance.
@@ -2017,11 +2017,11 @@ TEST(RefWriterStalePrecommitSweep, BoundedBatchesAndInterruptionResumeAcrossMoun
         String cursor;
         for (;;)
         {
-            const ListPage page = backend->list(layout.refsNamespacePrefix(ns), cursor, 1000);
+            const ListPage page = backend->list(layout.refsNamespacePrefix(RefNamespaceId::stageATransition(ns)), cursor, 1000);
             for (const ListedKey & lk : page.keys)
             {
                 const auto parsed = layout.parseRefObjectKey(lk.key);
-                if (parsed && parsed->ns == ns && parsed->kind == RefObjectKind::Log && parsed->txn_id.writer_epoch != e1)
+                if (parsed && parsed->id.ns == ns && parsed->kind == RefObjectKind::Log && parsed->txn_id.writer_epoch != e1)
                     ++new_log_objects;
             }
             if (page.next_cursor.empty())
@@ -2082,7 +2082,7 @@ TEST(RefWriterStalePrecommitSweep, FailedSweepRearmsAndRetriesUntilClean)
 
     successor->setEventSink([&](const CasEvent & e) { seen.push_back(e); });
 
-    backend->fault_key_substr = layout.refsNamespacePrefix(ns) + "_log/";
+    backend->fault_key_substr = layout.refsNamespacePrefix(RefNamespaceId::stageATransition(ns)) + "_log/";
     /// The successor's own recovery runs first and mints one in-band seal for the predecessor's now-dead
     /// epoch (its three precommits are its only durable ids, so the seal takes the very next slot) --
     /// that PUT shares this same `_log/` prefix, so it would eat the fault before the sweep gets a turn.
@@ -2195,11 +2195,11 @@ std::optional<RefTxnId> listGreatestLogIdForTest(Backend & backend, const Layout
     String cursor;
     for (;;)
     {
-        const ListPage page = backend.list(layout.refsNamespacePrefix(ns), cursor, 1000);
+        const ListPage page = backend.list(layout.refsNamespacePrefix(RefNamespaceId::stageATransition(ns)), cursor, 1000);
         for (const ListedKey & lk : page.keys)
         {
             const auto parsed = layout.parseRefObjectKey(lk.key);
-            if (parsed && parsed->ns == ns && parsed->kind == RefObjectKind::Log
+            if (parsed && parsed->id.ns == ns && parsed->kind == RefObjectKind::Log
                 && (!greatest || *greatest < parsed->txn_id))
                 greatest = parsed->txn_id;
         }
@@ -2224,7 +2224,7 @@ uint64_t seedTwinDrop(Backend & backend, const Layout & layout, const RootNamesp
 {
     uint64_t greatest_in_previous_epoch = 0;
     uint64_t previous_epoch = 0;
-    forEachListedKey(backend, layout.refsNamespacePrefix(ns), [&](const ListedKey & lk)
+    forEachListedKey(backend, layout.refsNamespacePrefix(RefNamespaceId::stageATransition(ns)), [&](const ListedKey & lk)
     {
         const auto parsed = layout.parseRefObjectKey(lk.key);
         if (!parsed || parsed->kind != RefObjectKind::Log)
@@ -2340,7 +2340,7 @@ TEST(RefWriterRemount, DiscardsWedgeAndLaneRemainsUsable)
     publishEmptyPart(store, ns, "y");
 
     /// Wedge the lane with an ambiguous PUT that never landed server-side.
-    backend->fault_key_substr = layout.refsNamespacePrefix(ns) + "_log/";
+    backend->fault_key_substr = layout.refsNamespacePrefix(RefNamespaceId::stageATransition(ns)) + "_log/";
     backend->fault_count = 1;
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
@@ -2459,11 +2459,11 @@ TEST(RefWriterNamespaceRemoval, TxnNamesEveryOwnerThenRemoveNamespace)
         String cursor;
         for (;;)
         {
-            const ListPage page = backend->list(layout.refsNamespacePrefix(ns), cursor, 1000);
+            const ListPage page = backend->list(layout.refsNamespacePrefix(RefNamespaceId::stageATransition(ns)), cursor, 1000);
             for (const ListedKey & lk : page.keys)
             {
                 const auto parsed = layout.parseRefObjectKey(lk.key);
-                if (parsed && parsed->ns == ns && parsed->kind == RefObjectKind::Log
+                if (parsed && parsed->id.ns == ns && parsed->kind == RefObjectKind::Log
                     && (!newest_log || *newest_log < parsed->txn_id))
                     newest_log = parsed->txn_id;
             }
@@ -2473,7 +2473,7 @@ TEST(RefWriterNamespaceRemoval, TxnNamesEveryOwnerThenRemoveNamespace)
         }
     }
     ASSERT_TRUE(newest_log.has_value());
-    const auto got = backend->get(layout.refLogKey(ns, *newest_log));
+    const auto got = backend->get(layout.refLogKey(RefNamespaceId::stageATransition(ns), *newest_log));
     ASSERT_TRUE(got.has_value());
     const RefLogTxn removal_txn = decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), *newest_log);
 
@@ -2507,7 +2507,7 @@ TEST(RefWriterNamespaceRemoval, RemovedSnapshotPublished)
     ASSERT_TRUE(remove_id.has_value());
     EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), 0u);
 
-    const auto got = backend->get(layout.refSnapshotKey(ns, *remove_id));
+    const auto got = backend->get(layout.refSnapshotKey(RefNamespaceId::stageATransition(ns), *remove_id));
     ASSERT_TRUE(got.has_value());
     const RefTableSnapshot snap = decodeRefTableSnapshot(openObject(FormatId::RefSnapshot, got->bytes), ns.string(), *remove_id);
     EXPECT_EQ(snap.lifecycle, RefLifecycle::Removed);
@@ -2608,7 +2608,7 @@ TEST(RefWriterNamespaceRemoval, RemovalAppendFailureLeavesBuildAliveAndNamespace
     const ManifestId id = build->stageManifest({});
     build->precommitAdd(ns, "inflight", id);
 
-    backend->fault_key_substr = layout.refsNamespacePrefix(ns) + "_log/";
+    backend->fault_key_substr = layout.refsNamespacePrefix(RefNamespaceId::stageATransition(ns)) + "_log/";
     backend->fault_count = 1;
 
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropNamespace(ns); });
@@ -2679,7 +2679,7 @@ TEST(RefWriterNamespaceBirth, BirthFromRemovedRejectedWithoutMarkerAcceptedWithM
 
     /// GC's namespace-cleanup item (Task 12) publishes the exact completion marker -- simulated here
     /// directly via the raw fixture convention, since Task 12 has not landed yet.
-    backend->putIfAbsent(layout.refCleanupMarkerKey(ns, remove_id), "");
+    backend->putIfAbsent(layout.refCleanupMarkerKey(RefNamespaceId::stageATransition(ns), remove_id), "");
 
     /// A further fresh mount, marker now observed: birth succeeds.
     {
@@ -2882,7 +2882,7 @@ TEST(RefWriterRecoveryRetry, TransientSealFailureIsRetriedThenSucceeds)
     /// attempt lands. The seal is a LOG transaction at `{2,2}` -- the slot after the dead epoch's last
     /// durable id -- because INV-2 closes an epoch in-band, at the key a straggler would have taken.
     const RefTxnId seal_id{2, 2};
-    backend->fault_key_substr = layout.refLogKey(ns, seal_id);
+    backend->fault_key_substr = layout.refLogKey(RefNamespaceId::stageATransition(ns), seal_id);
     backend->fault_count = 2;
 
     using ProfileEvents::global_counters;
@@ -2968,7 +2968,7 @@ TEST(RefWriterRecoveryRetry, TransientFailureLongerThanBudgetPropagates)
     /// The seal is an in-band LOG transaction at the slot after the dead epoch's last durable id, not a
     /// snapshot at a synthetic id: epoch 1 closes at `{1,2}`, which is the FIRST write the walk attempts.
     const RefTxnId seal_id{1, 2};
-    backend->fault_key_substr = layout.refLogKey(ns, seal_id);
+    backend->fault_key_substr = layout.refLogKey(RefNamespaceId::stageATransition(ns), seal_id);
     backend->fault_count = 1000;   /// never stops failing within the budget
 
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->listRefs(ns); });
@@ -2997,7 +2997,7 @@ TEST(RefWriterRecoveryRetry, NonNetworkErrorIsNotRetried)
     /// A foreign writer lands DIFFERENT valid bytes at the seal key; resolve-before-reissue then throws
     /// CORRUPTED_DATA (a real cross-process seal conflict), which must NOT be retried.
     const RefTxnId seal_id{1, 2};
-    backend->corrupt_key_substr = layout.refLogKey(ns, seal_id);
+    backend->corrupt_key_substr = layout.refLogKey(RefNamespaceId::stageATransition(ns), seal_id);
     backend->corrupt_count = 1;
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { store->listRefs(ns); });
@@ -3021,7 +3021,7 @@ TEST(RefWriterRecoveryRetry, VanishBrakeStaysTerminalNotRetried)
 
     /// Re-arm the vanish so the SAME selected snapshot key keeps disappearing between LIST and GET,
     /// past the kRefRecoveryMaxRestarts (3) inner brake.
-    const String vkey = layout.refSnapshotKey(ns, snap_x);
+    const String vkey = layout.refSnapshotKey(RefNamespaceId::stageATransition(ns), snap_x);
     int fires = 0;
     std::function<void()> rearm = [&]()
     {
@@ -3074,7 +3074,7 @@ TEST(RefWriterRecoveryRetry, ThrowingBackoffSleepDoesNotWedgeRecovery)
             throw std::runtime_error("injected backoff-sleep failure");
     });
     const RefTxnId seal_id{1, 2};
-    backend->fault_key_substr = layout.refLogKey(ns, seal_id);
+    backend->fault_key_substr = layout.refLogKey(RefNamespaceId::stageATransition(ns), seal_id);
     backend->fault_count = 1;
 
     EXPECT_ANY_THROW(store->listRefs(ns));   /// the sleep failure propagates

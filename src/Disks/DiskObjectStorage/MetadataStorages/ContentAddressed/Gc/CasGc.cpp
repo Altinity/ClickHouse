@@ -1124,7 +1124,7 @@ Gc::CheckpointWitnesses Gc::readCheckpointWitnesses(const std::map<String, RefTa
     for (const String & ns_str : witness_namespaces)
     {
         const RootNamespace ns{ns_str};
-        const String ckpt_key = layout.refCkptKey(ns);
+        const String ckpt_key = layout.refCkptKey(RefNamespaceId::stageATransition(ns));
         /// THE GET AND THE DECODE ARE SPLIT HERE, rather than taken together through `readCkpt`, so the
         /// catch below can scope to the DECODE ALONE. Wrapping the read too would turn a transport
         /// failure -- which says nothing about this object and everything about the round's ability to
@@ -1970,7 +1970,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             ProfileEvents::increment(ProfileEvents::CasRefLogBodyGets, crossing.body_gets);
             if (crossing.outcome == EpochCrossOutcome::StartInvalid)
                 LOG_WARNING(logger, "CAS GC ref intake: epoch-start log {} invalid: {}",
-                            layout.refLogKey(ns, crossing.probed), crossing.detail);
+                            layout.refLogKey(RefNamespaceId::stageATransition(ns), crossing.probed), crossing.detail);
             return crossing.proved() ? std::optional<RefTxnId>(crossing.start) : std::nullopt;
         };
 
@@ -2052,7 +2052,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             /// GET + decode the expected record. Absence is the decision point of the whole walk, and
             /// an invalid body is a per-namespace hold: the key belongs to exactly one namespace, so it
             /// can never be grounds for discarding another namespace's fold.
-            const auto got = backend.get(layout.refLogKey(ns, *expected));
+            const auto got = backend.get(layout.refLogKey(RefNamespaceId::stageATransition(ns), *expected));
             if (!got)
             {
                 ++intake_absent_probes;
@@ -2134,7 +2134,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             catch (const Exception & e)
             {
                 LOG_WARNING(logger, "CAS GC ref intake: log {} invalid: {}",
-                            layout.refLogKey(ns, log_id), e.message());
+                            layout.refLogKey(RefNamespaceId::stageATransition(ns), log_id), e.message());
                 hold(log_id, HoldReason::BodyUndecodable, "ref log body invalid: namespace held below it");
                 break;
             }
@@ -3081,14 +3081,14 @@ void Gc::cleanupRefObjects(const FoldResult & folded, bool suppress_destructive)
         const RefCleanupPlan plan = planRefCleanup(listing, durable_cursor, removal_logs_blocked,
                                                    completed_removal_snapshot, checkpoint);
         for (const RefTxnId & log_id : plan.deletable_logs)
-            deleteRefObject(layout.refLogKey(ns, log_id));
+            deleteRefObject(layout.refLogKey(RefNamespaceId::stageATransition(ns), log_id));
         for (const RefTxnId & snap_id : plan.deletable_snapshots)
         {
             /// Task 5's rule, asserted where it is acted on rather than only where it is computed: the
             /// snapshot the checkpoint names is the one a recovering reader will sample, so it must
             /// survive every cleanup that the same checkpoint authorized.
             chassert(!checkpoint || snap_id < *checkpoint);
-            deleteRefObject(layout.refSnapshotKey(ns, snap_id));
+            deleteRefObject(layout.refSnapshotKey(RefNamespaceId::stageATransition(ns), snap_id));
         }
     }
 }
@@ -3128,7 +3128,7 @@ void Gc::runNamespaceCleanupPasses(const CasFoldSeal & seal, const std::map<Stri
             /// this namespace ("observing an empty physical prefix is not sufficient"). If a successor
             /// already Completed this item, the marker exists and the writer may have recreated live objects
             /// under these prefixes -- abort the pass on marker-present.
-            const String marker_key = layout.refCleanupMarkerKey(item.ns, item.remove_txn_id);
+            const String marker_key = layout.refCleanupMarkerKey(RefNamespaceId::stageATransition(item.ns), item.remove_txn_id);
 
             /// Bounded exact-key enumerate-and-delete over the removed namespace's physical `@cas@` prefixes
             /// (manifest bodies + verbatim files). NotFound/TokenMismatch tolerated.
@@ -3201,7 +3201,7 @@ void Gc::runNamespaceCleanupPasses(const CasFoldSeal & seal, const std::map<Stri
             /// GC-side backstop for the incarnation that never got one.
             if (!round_still_ours() || backend.head(marker_key).exists)
                 return;
-            const String ckpt_key = layout.refCkptKey(item.ns);
+            const String ckpt_key = layout.refCkptKey(RefNamespaceId::stageATransition(item.ns));
             if (const HeadResult ckpt_head = backend.head(ckpt_key); ckpt_head.exists)
                 backend.deleteExact(ckpt_key, ckpt_head.token);   /// NotFound/TokenMismatch tolerated
         }
@@ -3216,7 +3216,7 @@ void Gc::runNamespaceCleanupPasses(const CasFoldSeal & seal, const std::map<Stri
             /// snapshot (crash between the two publishes, no recreation) is repaired, but a snapshot a
             /// recreated namespace already superseded (and cleanup deleted) is NOT re-created -- otherwise
             /// each round re-creates it and the next deletes it, a permanent one-PUT-one-DELETE churn.
-            backend.putIfAbsent(layout.refCleanupMarkerKey(item.ns, item.remove_txn_id), String{});
+            backend.putIfAbsent(layout.refCleanupMarkerKey(RefNamespaceId::stageATransition(item.ns), item.remove_txn_id), String{});
             bool removed_snapshot_present = false;
             bool superseded_by_newer = false;
             if (const auto tit = ref_tables.find(item.ns.string()); tit != ref_tables.end())
@@ -3233,7 +3233,7 @@ void Gc::runNamespaceCleanupPasses(const CasFoldSeal & seal, const std::map<Stri
                 removed.snapshot_id = item.remove_txn_id;
                 removed.lifecycle = RefLifecycle::Removed;
                 removed.remove_txn_id = item.remove_txn_id;
-                backend.putIfAbsent(layout.refSnapshotKey(item.ns, item.remove_txn_id),
+                backend.putIfAbsent(layout.refSnapshotKey(RefNamespaceId::stageATransition(item.ns), item.remove_txn_id),
                                     sealObject(FormatId::RefSnapshot, encodeRefTableSnapshot(removed)));
             }
         }
@@ -3372,6 +3372,37 @@ std::optional<CasFoldSeal> Gc::readFoldSeal(uint64_t generation, uint64_t attemp
     return std::nullopt;
 }
 
+namespace
+{
+
+/// `Layout::parseRefObjectKey` for a key coming from a GLOBAL `cas/refs/` enumeration, with the one
+/// refusal it can raise absorbed into the ordinary "unrecognized" answer.
+///
+/// A ref object naming no life (the un-incarnated shape) is the single malformed key the parser
+/// REFUSES by name instead of classifying as debris, and both global enumerations run OUTSIDE the
+/// fold's catch. Letting the refusal escape one of them would not merely lose a round: GC is the only
+/// thing that could ever delete the key, so every future round would die on it too, with nothing able
+/// to clear it. Absorbed here, the key stays in the enumeration's raw key list, unindexed, exactly
+/// like every other malformed shape, and `groupRefKeys` raises it once inside the fold's catch --
+/// louder than before (an anomaly plus `suppress_destructive`), and without the wedge.
+///
+/// Only `CORRUPTED_DATA` is absorbed: any other exception is a real failure of the enumeration itself.
+std::optional<ParsedRefObjectKey> parseRefObjectKeyForEnumeration(const Layout & layout, const String & key)
+{
+    try
+    {
+        return layout.parseRefObjectKey(key);
+    }
+    catch (const Exception & e)
+    {
+        if (e.code() != ErrorCodes::CORRUPTED_DATA)
+            throw;
+        return std::nullopt;
+    }
+}
+
+}
+
 std::vector<std::pair<RootNamespace, uint64_t>> Gc::discoverUniverse()
 {
     /// LIST-based table discovery: the discovery authority rests on LIST(cas/refs/).
@@ -3383,8 +3414,8 @@ std::vector<std::pair<RootNamespace, uint64_t>> Gc::discoverUniverse()
     std::set<String> namespaces;
     forEachListedKey(backend, layout.casRefsPrefix(), [&](const ListedKey & lk)
     {
-        if (const auto parsed = layout.parseRefObjectKey(lk.key))
-            namespaces.insert(parsed->ns.string());
+        if (const auto parsed = parseRefObjectKeyForEnumeration(layout, lk.key))
+            namespaces.insert(parsed->id.ns.string());
     }, 1000, onGcEnumerationPage);
     std::vector<std::pair<RootNamespace, uint64_t>> universe;
     universe.reserve(namespaces.size());
@@ -3433,7 +3464,9 @@ RefScanSummary Gc::enumerateRefPrefix()
     /// ONE full enumeration of `cas/refs/`: the raw keys, plus a lenient per-namespace index of the
     /// Log-kind ids among them. Lenient is deliberate — a malformed key is kept in `keys` and left
     /// unindexed, so the STRICT validation (and the round-abort it can raise) happens exactly once, in
-    /// the fold's `groupRefKeys`. `parseRefObjectKey` never throws.
+    /// the fold's `groupRefKeys`. That holds for EVERY malformed shape: the one the parser refuses by
+    /// name is absorbed per key by `parseRefObjectKeyForEnumeration`, which is what keeps this
+    /// enumeration -- which runs before the fold, outside its catch -- unable to wedge the round.
     const Layout & layout = store->layout();
     Backend & backend = store->backend();
 
@@ -3443,10 +3476,10 @@ RefScanSummary Gc::enumerateRefPrefix()
     forEachListedKey(backend, layout.casRefsPrefix(), [&](const ListedKey & lk)
     {
         scan.keys.push_back(lk.key);
-        const auto parsed = layout.parseRefObjectKey(lk.key);
+        const auto parsed = parseRefObjectKeyForEnumeration(layout, lk.key);
         if (parsed && parsed->kind == RefObjectKind::Log)
         {
-            const String ns_str = parsed->ns.string();
+            const String ns_str = parsed->id.ns.string();
             scan.logs_by_ns[ns_str].insert(parsed->txn_id);
             RefTxnId & g = scan.max_log_by_ns[ns_str];
             if (g < parsed->txn_id)
@@ -3598,7 +3631,7 @@ void Gc::sampleRefListQuality(const RefScanSummary & round_scan, uint64_t curren
             {
                 try
                 {
-                    const bool present = backend.head(layout.refLogKey(RootNamespace{ns_str}, id)).exists;
+                    const bool present = backend.head(layout.refLogKey(RefNamespaceId::stageATransition(RootNamespace{ns_str}), id)).exists;
                     head_verdict = present ? "present" : "absent";
                     /// Also a counter, not only an audit row and a log line: the audit sink is
                     /// optional (`EventEmitter` no-ops without one) and the text log is rotated and
@@ -3723,7 +3756,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
                 for (const auto & [ns, root_shard] : discoverUniverse())
                 {
                     std::vector<String> table_keys;
-                    forEachListedKey(backend, layout.refsNamespacePrefix(ns),
+                    forEachListedKey(backend, layout.refsNamespacePrefix(RefNamespaceId::stageATransition(ns)),
                         [&](const ListedKey & lk) { table_keys.push_back(lk.key); }, 1000, onGcEnumerationPage);
                     const auto grouped = groupRefKeys(layout, table_keys);
                     const auto git = grouped.find(ns.string());

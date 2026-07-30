@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Common/Exception.h>
 
@@ -179,6 +180,17 @@ TEST(CasBootstrapOrdering, EmptyPrefixOpensAndListsBeforeAnyWrite)
     EXPECT_LT(*residual_list, *first_write) << "the residual LIST must precede every write";
 }
 
+/// The residue an incomplete erase would have left behind: a real ref-log object key, built through
+/// `Layout` so it carries the life segment every ref key has. The residual check is LIST-based and
+/// never parses it, but seeding a shape this build cannot write would make the comment below a lie.
+namespace
+{
+String residualRefLogKey()
+{
+    return Layout{"p"}.refLogKey(RefNamespaceId::stageATransition(RootNamespace{"test%2Fabcd"}), RefTxnId{1, 1});
+}
+}
+
 /// (b) A prefix holding `cas/refs/…`-style residue but NO `_pool_meta` → open fails typed (INVALID_STATE),
 /// and ZERO writes hit the backend (the mutating battery must NOT have run — the residual check throws
 /// first).
@@ -186,7 +198,7 @@ TEST(CasBootstrapOrdering, ResidualWithoutMetaFailsTypedWithZeroWrites)
 {
     auto backend = std::make_shared<RecordingBackend>();
     /// Seed residue an incomplete erase would have left behind (a ref-log object), with no `_pool_meta`.
-    ASSERT_EQ(backend->putIfAbsent("p/cas/refs/test%2Fabcd/_log/0000000000000001-0000000000000001.zst", "x").outcome,
+    ASSERT_EQ(backend->putIfAbsent(residualRefLogKey(), "x").outcome,
               PutOutcome::Done);
     backend->clearLog();
 
@@ -274,7 +286,7 @@ TEST(CasBootstrapOrdering, ProbeSiblingLookalikeIsResidualNotDebris)
 TEST(CasBootstrapOrdering, ReadOnlyOverResidualWithoutMetaFailsClosedNoMint)
 {
     auto backend = std::make_shared<RecordingBackend>();
-    ASSERT_EQ(backend->putIfAbsent("p/cas/refs/test%2Fabcd/_log/0000000000000001-0000000000000001.zst", "x").outcome,
+    ASSERT_EQ(backend->putIfAbsent(residualRefLogKey(), "x").outcome,
               PutOutcome::Done);
     backend->clearLog();
 

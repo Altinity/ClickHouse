@@ -19,9 +19,9 @@ trailer, followed by a banner-framed raw payload zone for inline file bytes.
 | Key (under the pool prefix) | Object | Codec | Writer |
 |---|---|---|---|
 | `_pool_meta` | pool identity + floors | `CasPoolMetaFormat` | pool create/admit |
-| `cas/refs/<ns>/…_log` | ref transaction log | `CasRefLogFormat` (`.zst`) | writer commit path |
-| `cas/refs/<ns>/…_snap` | complete ref table | `CasRefSnapshotFormat` (`.zst`) | writer/GC fold |
-| `cas/refs/<ns>/…` cleanup marker | key-only presence marker (empty body) | — | GC |
+| `cas/refs/<ns>/<inc>/…_log` | ref transaction log | `CasRefLogFormat` (`.zst`) | writer commit path |
+| `cas/refs/<ns>/<inc>/…_snap` | complete ref table | `CasRefSnapshotFormat` (`.zst`) | writer/GC fold |
+| `cas/refs/<ns>/<inc>/…` cleanup marker | key-only presence marker (empty body) | — | GC |
 | `cas/manifests/<ns>/<epoch-hex>-<seq-hex>/<ordinal>.zst` | part manifest | `CasPartManifestFormat` | part build |
 | blob keys (`CasLayout::blobKey`) | blob envelope + payload | `CasBlobEnvelopeFormat` | uploads |
 | blob-meta keys (`CasLayout::blobMetaKey`) | freshness sidecar | `CasBlobMetaFormat` | dedup/GC |

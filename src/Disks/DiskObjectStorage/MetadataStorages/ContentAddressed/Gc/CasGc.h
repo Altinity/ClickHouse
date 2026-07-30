@@ -642,7 +642,9 @@ private:
 
     /// One full enumeration of `cas/refs/`: the raw keys plus a lenient per-namespace index of the
     /// Log-kind ids among them. A malformed key lands in `keys` and is not indexed; `groupRefKeys` in
-    /// the fold does the strict validation and the round-abort. `parseRefObjectKey` never throws.
+    /// the fold does the strict validation and the round-abort. This never throws on a malformed key,
+    /// including the one shape `parseRefObjectKey` refuses by name -- see
+    /// `parseRefObjectKeyForEnumeration`.
     RefScanSummary enumerateRefPrefix();
 
     /// The round's ONE hint enumeration (`enumerateRefPrefix`) plus the DEFER signal computed from it

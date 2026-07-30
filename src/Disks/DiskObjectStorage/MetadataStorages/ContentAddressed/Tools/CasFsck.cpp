@@ -192,10 +192,10 @@ struct NsRefListing
 NsRefListing listNsRefObjects(Backend & backend, const Layout & layout, const RootNamespace & ns)
 {
     NsRefListing out;
-    forEachListedKey(backend, layout.refsNamespacePrefix(ns), [&](const ListedKey & lk)
+    forEachListedKey(backend, layout.refsNamespacePrefix(RefNamespaceId::stageATransition(ns)), [&](const ListedKey & lk)
     {
         const auto parsed = layout.parseRefObjectKey(lk.key);
-        if (!parsed || parsed->ns != ns)
+        if (!parsed || parsed->id.ns != ns)
             return;
         if (parsed->kind == RefObjectKind::Snap)
             out.snapshots.push_back(parsed->txn_id);
@@ -351,7 +351,7 @@ void checkRefStream(Backend & backend, const Layout & layout, const RootNamespac
     for (;;)
     {
         checkDeadline(deadline, "ref stream");
-        const auto got = backend.get(layout.refLogKey(ns, *expected));
+        const auto got = backend.get(layout.refLogKey(RefNamespaceId::stageATransition(ns), *expected));
         if (got)
         {
             bool is_seal = false;
@@ -362,7 +362,7 @@ void checkRefStream(Backend & backend, const Layout & layout, const RootNamespac
             }
             catch (const Exception & e)
             {
-                verdicts.recordUnchecked(report, ns, layout.refLogKey(ns, *expected),
+                verdicts.recordUnchecked(report, ns, layout.refLogKey(RefNamespaceId::stageATransition(ns), *expected),
                     "ref stream: the record at " + renderId(*expected) + " could not be decoded, so nothing "
                     "above it can be proved either: " + e.message());
                 return;
@@ -380,9 +380,9 @@ void checkRefStream(Backend & backend, const Layout & layout, const RootNamespac
         /// ---- Absent: hole, frontier, or an epoch boundary ----
         if (const auto witness = greatestSameEpochAbove(expected->writer_epoch, expected->ref_sequence))
         {
-            if (backend.get(layout.refLogKey(ns, *witness)))
+            if (backend.get(layout.refLogKey(RefNamespaceId::stageATransition(ns), *witness)))
             {
-                verdicts.recordChainBroken(report, ns, layout.refLogKey(ns, *expected),
+                verdicts.recordChainBroken(report, ns, layout.refLogKey(RefNamespaceId::stageATransition(ns), *expected),
                     "ref stream: id " + renderId(*expected) + " is absent while " + renderId(*witness)
                     + " in the same epoch is durable — the stream is dense by construction (INV-1), so this "
                       "is a HOLE, not the end of the stream, and every record above it is unreachable");
@@ -400,7 +400,7 @@ void checkRefStream(Backend & backend, const Layout & layout, const RootNamespac
             crossEpochFromSeal(backend, layout, ns, resolved_through, last_applied_is_seal, *later);
         if (!crossing.proved())
         {
-            verdicts.recordUnchecked(report, ns, layout.refLogKey(ns, *expected),
+            verdicts.recordUnchecked(report, ns, layout.refLogKey(RefNamespaceId::stageATransition(ns), *expected),
                 "ref stream: records of a later epoch are reachable but this epoch's closing seal was "
                 "never consumed (or the position they chain from is not one), so the crossing at "
                 + renderId(*expected) + " has no proof"
@@ -413,7 +413,7 @@ void checkRefStream(Backend & backend, const Layout & layout, const RootNamespac
         /// legitimately do. Unprovable, and reported as such rather than spun on.
         if (!(*expected < crossing.start))
         {
-            verdicts.recordUnchecked(report, ns, layout.refLogKey(ns, *expected),
+            verdicts.recordUnchecked(report, ns, layout.refLogKey(RefNamespaceId::stageATransition(ns), *expected),
                 "ref stream: the epoch crossing resolved back to " + renderId(crossing.start)
                 + ", the position that just read absent — the epoch-start record is not stably readable");
             return;
@@ -445,7 +445,7 @@ void checkSnapshotOracle(Backend & backend, const Layout & layout, const RootNam
         return;   /// no published snapshot: recovering from logs alone is valid, nothing to oracle
 
     const RefTxnId snapshot_x = snap_ids.back();
-    const auto got_x = backend.get(layout.refSnapshotKey(ns, snapshot_x));
+    const auto got_x = backend.get(layout.refSnapshotKey(RefNamespaceId::stageATransition(ns), snapshot_x));
     if (!got_x)
         return;   /// vanished (a covering newer snapshot superseded it): restart-on-vanish -> skip
 
@@ -462,7 +462,7 @@ void checkSnapshotOracle(Backend & backend, const Layout & layout, const RootNam
     {
         if (!(*it < snapshot_x))
             continue;   /// X itself or anything not strictly below it
-        const auto got_base = backend.get(layout.refSnapshotKey(ns, *it));
+        const auto got_base = backend.get(layout.refSnapshotKey(RefNamespaceId::stageATransition(ns), *it));
         if (!got_base)
             continue;   /// vanished; try the next older snapshot
         base = decodeRefTableSnapshot(openObject(FormatId::RefSnapshot, got_base->bytes), ns.string(), *it);
@@ -485,7 +485,7 @@ void checkSnapshotOracle(Backend & backend, const Layout & layout, const RootNam
         if (snapshot_x < id)
             continue;   /// > X: not part of the state AT X
         checkDeadline(deadline, "snapshot oracle");
-        const auto got_log = backend.get(layout.refLogKey(ns, id));
+        const auto got_log = backend.get(layout.refLogKey(RefNamespaceId::stageATransition(ns), id));
         if (!got_log)
             return;   /// a covered log was cleaned/vanished: oracle unavailable for X -> skip, not error
         RefLogTxn txn = decodeRefLogTxn(openObject(FormatId::RefLog, got_log->bytes), ns.string(), id);
@@ -506,7 +506,7 @@ void checkSnapshotOracle(Backend & backend, const Layout & layout, const RootNam
     {
         ++report.snapshot_oracle_mismatches;
         FsckObject o;
-        o.key = layout.refSnapshotKey(ns, snapshot_x);
+        o.key = layout.refSnapshotKey(RefNamespaceId::stageATransition(ns), snapshot_x);
         o.kind = ObjectKind::Blob;   /// snapshots have no ObjectKind; reuse Blob as the generic kind
         o.size = got_x->bytes.size();
         o.cls = FsckClass::SnapshotOracleMismatch;
@@ -646,7 +646,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
         {
             if (e.code() == ErrorCodes::TIMEOUT_EXCEEDED)
                 throw;
-            verdicts.recordUnchecked(report, ns, layout.refsNamespacePrefix(ns),
+            verdicts.recordUnchecked(report, ns, layout.refsNamespacePrefix(RefNamespaceId::stageATransition(ns)),
                 "fsck could not examine this namespace: " + e.message());
         }
     }

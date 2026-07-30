@@ -111,8 +111,8 @@ std::optional<ParsedRefObjectKey> Layout::parseRefObjectKey(std::string_view key
     if (kind_sep == std::string_view::npos)
         return std::nullopt;
     const std::string_view kind_seg = before_id.substr(kind_sep + 1);
-    const std::string_view ns_part = before_id.substr(0, kind_sep);
-    if (ns_part.empty())
+    const std::string_view before_kind = before_id.substr(0, kind_sep);
+    if (before_kind.empty())
         return std::nullopt;
 
     RefObjectKind kind{};
@@ -144,10 +144,13 @@ std::optional<ParsedRefObjectKey> Layout::parseRefObjectKey(std::string_view key
     if (!txn_id)
         return std::nullopt;
 
-    return ParsedRefObjectKey{RootNamespace{String(ns_part)}, kind, *txn_id};
+    /// Everything before the kind directory is `<ns>/<inc>`. Only now, with the key positively
+    /// identified as one of OUR ref objects, does a bad incarnation segment become corruption rather
+    /// than "not ours" -- see the refusal contract on the declaration.
+    return ParsedRefObjectKey{namespaceLifeOf(key, before_kind), kind, *txn_id};
 }
 
-std::optional<RootNamespace> Layout::parseRefCkptKey(std::string_view key) const
+std::optional<RefNamespaceId> Layout::parseRefCkptKey(std::string_view key) const
 {
     const String base = casRefsPrefix();
     if (!key.starts_with(base))
@@ -155,18 +158,41 @@ std::optional<RootNamespace> Layout::parseRefCkptKey(std::string_view key) const
     std::string_view rest = key;
     rest.remove_prefix(base.size());
 
-    /// `<ns>/_ckpt<suffix>` -- the leaf is the fixed name plus whatever the registry's compression
-    /// policy appends, and everything before it is the namespace. Built from the same pieces
-    /// `refCkptKey` uses, so the two cannot drift apart.
+    /// `<ns>/<inc>/_ckpt<suffix>` -- the leaf is the fixed name plus whatever the registry's
+    /// compression policy appends. Built from the same pieces `refCkptKey` uses, so the two cannot
+    /// drift apart.
     const String leaf = "_ckpt" + String(storedSuffix(FormatId::RefCkpt));
     const size_t leaf_sep = rest.rfind('/');
     if (leaf_sep == std::string_view::npos || rest.substr(leaf_sep + 1) != leaf)
         return std::nullopt;
-    const std::string_view ns_part = rest.substr(0, leaf_sep);
-    if (ns_part.empty())
+    const std::string_view before_leaf = rest.substr(0, leaf_sep);
+    if (before_leaf.empty())
         return std::nullopt;
 
-    return RootNamespace{String(ns_part)};
+    return namespaceLifeOf(key, before_leaf);
+}
+
+RefNamespaceId Layout::namespaceLifeOf(std::string_view key, std::string_view ns_and_incarnation) const
+{
+    const size_t inc_sep = ns_and_incarnation.rfind('/');
+    /// A single segment is the whole of `<ns>` with no room left for the incarnation -- i.e. exactly
+    /// the un-incarnated shape, which the refusal below reports.
+    const std::string_view inc_seg
+        = (inc_sep == std::string_view::npos) ? ns_and_incarnation : ns_and_incarnation.substr(inc_sep + 1);
+    const std::string_view ns_part
+        = (inc_sep == std::string_view::npos) ? std::string_view{} : ns_and_incarnation.substr(0, inc_sep);
+
+    const auto incarnation = parseRefIncarnation(inc_seg);
+    if (!incarnation)
+        throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
+            "CasLayout: ref object '{}' names no life: '{}' is not 32 lower-case hex digits of a nonzero "
+            "incarnation. The un-incarnated key shape is corruption, not a compatibility case",
+            key, inc_seg);
+    if (ns_part.empty())
+        throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
+            "CasLayout: ref object '{}' carries an incarnation but no namespace before it", key);
+
+    return RefNamespaceId{RootNamespace{String(ns_part)}, *incarnation};
 }
 
 std::optional<ManifestId> Layout::parseManifestKey(std::string_view key) const

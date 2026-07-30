@@ -324,7 +324,7 @@ void seedTxn(Backend & backend, const Layout & layout, const RootNamespace & ns,
 /// never run a birth through the append lane.
 void seedCkpt(Backend & backend, const Layout & layout, const RootNamespace & ns, const RefCkpt & ckpt)
 {
-    backend.putIfAbsent(layout.refCkptKey(ns), encodeRefCkpt(ckpt));
+    backend.putIfAbsent(layout.refCkptKey(RefNamespaceId::stageATransition(ns)), encodeRefCkpt(ckpt));
 }
 
 RefCkpt lifeEpochCkpt(uint64_t life_epoch)
@@ -338,7 +338,7 @@ RefCkpt lifeEpochCkpt(uint64_t life_epoch)
 /// disengaged optional: an aborted binary would take every later suite's result with it.
 std::optional<RefLogTxn> readLogTxn(Backend & backend, const Layout & layout, const RootNamespace & ns, RefTxnId id)
 {
-    const auto got = backend.get(layout.refLogKey(ns, id));
+    const auto got = backend.get(layout.refLogKey(RefNamespaceId::stageATransition(ns), id));
     if (!got)
         return std::nullopt;
     return decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), id);
@@ -370,7 +370,7 @@ TEST(CasRefRecoveryCasWalk, HintOmittingAMiddleLogIdChangesNothing)
     seedTxn(*backend, layout, ns, RefTxnId{1, 1}, "a", /*birth=*/true);
     seedTxn(*backend, layout, ns, RefTxnId{1, 2}, "b", /*birth=*/false);
     seedTxn(*backend, layout, ns, RefTxnId{1, 3}, "c", /*birth=*/false);
-    backend->hidden_keys.insert(layout.refLogKey(ns, RefTxnId{1, 2}));
+    backend->hidden_keys.insert(layout.refLogKey(RefNamespaceId::stageATransition(ns), RefTxnId{1, 2}));
 
     auto store = openWalkPool(backend);
     ASSERT_TRUE(store);
@@ -394,7 +394,7 @@ TEST(CasRefRecoveryCasWalk, HintOmittingTheTailLogIdChangesNothing)
     seedCkpt(*backend, layout, ns, lifeEpochCkpt(1));
     seedTxn(*backend, layout, ns, RefTxnId{1, 1}, "a", /*birth=*/true);
     seedTxn(*backend, layout, ns, RefTxnId{1, 2}, "b", /*birth=*/false);
-    backend->hidden_keys.insert(layout.refLogKey(ns, RefTxnId{1, 2}));
+    backend->hidden_keys.insert(layout.refLogKey(RefNamespaceId::stageATransition(ns), RefTxnId{1, 2}));
 
     auto store = openWalkPool(backend);
     ASSERT_TRUE(store);
@@ -422,7 +422,7 @@ TEST(CasRefRecoveryCasWalk, CkptNamesTheBaseSnapshotTheHintLost)
     seedCkpt(*backend, layout, ns, RefCkpt{.life_epoch = std::optional<uint64_t>{1},
                                            .checkpoint_snapshot_id = base,
                                            .last_epoch_seal = std::nullopt});
-    backend->hidden_keys.insert(layout.refSnapshotKey(ns, base));
+    backend->hidden_keys.insert(layout.refSnapshotKey(RefNamespaceId::stageATransition(ns), base));
 
     auto store = openWalkPool(backend);
     ASSERT_TRUE(store);
@@ -506,7 +506,7 @@ TEST(CasRefRecoveryCasWalk, ConcurrentRecoverersSealIsAdoptedNotContested)
     seedTxn(*backend, layout, ns, RefTxnId{1, 1}, "a", /*birth=*/true);
     /// The peer's seal lands between our read of {1,2} and our create of it, so we meet it as an
     /// OCCUPANT rather than as a tail entry.
-    backend->late_key = layout.refLogKey(ns, RefTxnId{1, 2});
+    backend->late_key = layout.refLogKey(RefNamespaceId::stageATransition(ns), RefTxnId{1, 2});
     backend->late_bytes = sealObject(FormatId::RefLog, encodeRefLogTxn(makeSealTxn(ns, RefTxnId{1, 2})));
 
     auto store = openWalkPool(backend);
@@ -534,7 +534,7 @@ TEST(CasRefRecoveryCasWalk, StragglerAtTPlusOneIsAdoptedAndResealedAtTheNewTPlus
     seedTxn(*backend, layout, ns, RefTxnId{1, 1}, "a", /*birth=*/true);
     /// The dying epoch's last append materializes between our read of {1,2} and our create of it -- the
     /// straggler, arriving exactly where the every-attempt rule says it can.
-    backend->late_key = layout.refLogKey(ns, RefTxnId{1, 2});
+    backend->late_key = layout.refLogKey(RefNamespaceId::stageATransition(ns), RefTxnId{1, 2});
     backend->late_bytes = sealObject(FormatId::RefLog,
         encodeRefLogTxn(makeOrdinaryTxn(ns, RefTxnId{1, 2}, "late", /*birth=*/false)));
 
@@ -927,7 +927,7 @@ TEST(CasRefRecoveryCasWalk, ALatePredecessorPutAtTheSealedSlotIsRefusedByTheStor
     const RefTxnId ghost_id{1, 2};
     const String ghost_bytes = sealObject(FormatId::RefLog,
         encodeRefLogTxn(makeOrdinaryTxn(ns, ghost_id, "ghost", /*birth=*/false)));
-    const PutResult put = backend->putIfAbsent(layout.refLogKey(ns, ghost_id), ghost_bytes);
+    const PutResult put = backend->putIfAbsent(layout.refLogKey(RefNamespaceId::stageATransition(ns), ghost_id), ghost_bytes);
     EXPECT_EQ(put.outcome, PutOutcome::PreconditionFailed)
         << "the seal occupies the ghost's own key, so the store itself is the fence";
 
@@ -951,7 +951,7 @@ TEST(CasRefRecoveryCasWalk, UndecodableOccupantAtTheSealSlotFailsClosedAndLeaves
     burnEpochsUpTo(*backend, layout, /*target_live_epoch=*/2);
     seedCkpt(*backend, layout, ns, lifeEpochCkpt(1));
     seedTxn(*backend, layout, ns, RefTxnId{1, 1}, "a", /*birth=*/true);
-    backend->late_key = layout.refLogKey(ns, RefTxnId{1, 2});
+    backend->late_key = layout.refLogKey(RefNamespaceId::stageATransition(ns), RefTxnId{1, 2});
     backend->late_bytes = "not a ref-log object at all";
 
     auto store = openWalkPool(backend);

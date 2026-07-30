@@ -583,7 +583,7 @@ String caInspectToJson(const Layout & layout, const String & key, std::string_vi
         /// the throw below would reject the one ref object an operator is most likely to inspect by
         /// hand -- it is what decides recovery's base and what cleanup may delete.
         if (const auto ckpt_ns = layout.parseRefCkptKey(key))
-            return renderRefCkpt(*ckpt_ns, decodeRefCkpt(bytes));
+            return renderRefCkpt(ckpt_ns->ns, decodeRefCkpt(bytes));
 
         const auto parsed = layout.parseRefObjectKey(key);
         if (!parsed)
@@ -591,14 +591,14 @@ String caInspectToJson(const Layout & layout, const String & key, std::string_vi
                 "ca-inspect: key under cas/refs is not a recognized ref-object key '{}'", key);
         if (parsed->kind == RefObjectKind::Snap)
             return renderRefTableSnapshot(decodeRefTableSnapshot(
-                openObject(FormatId::RefSnapshot, bytes), parsed->ns.string(), parsed->txn_id));
+                openObject(FormatId::RefSnapshot, bytes), parsed->id.ns.string(), parsed->txn_id));
         if (parsed->kind == RefObjectKind::Log)
             return renderRefLogTxn(decodeRefLogTxn(
-                openObject(FormatId::RefLog, bytes), parsed->ns.string(), parsed->txn_id));
+                openObject(FormatId::RefLog, bytes), parsed->id.ns.string(), parsed->txn_id));
         /// A `_cleanup` marker is a zero-byte object — nothing to decode, so render its key-derived facts.
         return JsonObj()
             .add("object", jsonEscape("ref_cleanup_marker"))
-            .add("ns", jsonEscape(parsed->ns.string()))
+            .add("ns", jsonEscape(parsed->id.ns.string()))
             .add("txn_id", renderRefTxnIdObj(parsed->txn_id))
             .str();
     }

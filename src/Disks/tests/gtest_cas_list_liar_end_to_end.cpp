@@ -146,7 +146,7 @@ std::map<String, String> refsOf(const PoolPtr & store, const RootNamespace & ns)
 /// rather than compare against a hand-written expectation.
 void seedFiveRecordStream(Backend & backend, const Layout & layout, const RootNamespace & ns)
 {
-    backend.putIfAbsent(layout.refCkptKey(ns),
+    backend.putIfAbsent(layout.refCkptKey(RefNamespaceId::stageATransition(ns)),
                         encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{1},
                                               .checkpoint_snapshot_id = std::nullopt,
                                               .last_epoch_seal = std::nullopt}));
@@ -158,7 +158,8 @@ void seedFiveRecordStream(Backend & backend, const Layout & layout, const RootNa
 /// The exact defect shape: ids 3 and 4 invisible while the LATER id 5 is visible.
 std::vector<String> hiddenMiddleOf(const Layout & layout, const RootNamespace & ns)
 {
-    return {layout.refLogKey(ns, RefTxnId{1, 3}), layout.refLogKey(ns, RefTxnId{1, 4})};
+    return {layout.refLogKey(RefNamespaceId::stageATransition(ns), RefTxnId{1, 3}),
+            layout.refLogKey(RefNamespaceId::stageATransition(ns), RefTxnId{1, 4})};
 }
 
 PoolConfig recoveryPoolConfig()
@@ -279,7 +280,7 @@ TEST(CasListLiarEndToEnd, AHiddenPlusOneKeepsItsBlobWhenAVisibleMinusOneLandsLat
     publishAt(*backend, layout, ns, RefTxnId{1, 2}, "ref_b", 2, shared);
     dropAt(*backend, layout, ns, RefTxnId{1, 3}, "ref_a", publishedManifest(RefTxnId{1, 1}, 1));
 
-    backend->setListOmissions({layout.refLogKey(ns, RefTxnId{1, 2})});
+    backend->setListOmissions({layout.refLogKey(RefNamespaceId::stageATransition(ns), RefTxnId{1, 2})});
 
     Gc gc(store, kGc);
     const RoundEvidence first = runRoundCapturing(gc, UniversePolicy::AuthoritativeForTest);
@@ -330,7 +331,7 @@ TEST(CasListLiarEndToEnd, AHiddenMinusOneIsStillFoldedSoTheBlobIsActuallyReclaim
     /// it, which is not the permanent damage this arm is about.
     publishAt(*backend, layout, ns, RefTxnId{1, 3}, "ref_c", 3, unrelated);
 
-    backend->setListOmissions({layout.refLogKey(ns, RefTxnId{1, 2})});
+    backend->setListOmissions({layout.refLogKey(RefNamespaceId::stageATransition(ns), RefTxnId{1, 2})});
 
     Gc gc(store, kGc);
     const RoundEvidence condemning = runRoundCapturing(gc, UniversePolicy::AuthoritativeForTest);
@@ -385,8 +386,8 @@ ManifestRef buildKillShot(const std::shared_ptr<LiarBackend> & backend, const La
 
     /// The whole of `hidden`'s ref stream goes invisible -- the namespace itself is what the listing
     /// stops mentioning, not a record inside it.
-    backend->setListOmissions({layout.refLogKey(hidden, RefTxnId{1, 1}),
-                               layout.refCkptKey(hidden)});
+    backend->setListOmissions({layout.refLogKey(RefNamespaceId::stageATransition(hidden), RefTxnId{1, 1}),
+                               layout.refCkptKey(RefNamespaceId::stageATransition(hidden))});
     return dropped;
 }
 }
@@ -536,7 +537,7 @@ TEST(CasListLiarEndToEnd, FsckReachabilityReplaySilentlyLosesAHiddenTailTransact
 
     auto lying_backend = std::make_shared<LiarBackend>();
     seedFiveRecordStream(*lying_backend, layout, ns);
-    lying_backend->setListOmissions({layout.refLogKey(ns, RefTxnId{1, 5})});
+    lying_backend->setListOmissions({layout.refLogKey(RefNamespaceId::stageATransition(ns), RefTxnId{1, 5})});
     auto lying = openRecoveryPool(lying_backend);
     const FsckReport under_lie = runFsck(*lying, /*detail=*/true);
 

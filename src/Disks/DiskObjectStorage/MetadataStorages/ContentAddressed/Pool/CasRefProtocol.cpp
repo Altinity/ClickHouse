@@ -739,8 +739,8 @@ std::map<String, RefTableListing> groupRefKeys(const Layout & layout, const std:
         /// legitimate `_ckpt` would abort ref folding for every round of every pool that has one.
         if (const auto ckpt_ns = layout.parseRefCkptKey(key))
         {
-            layout.validateNamespace(*ckpt_ns);
-            out[ckpt_ns->string()].has_ckpt = true;
+            layout.validateNamespace(ckpt_ns->ns);
+            out[ckpt_ns->ns.string()].has_ckpt = true;
             continue;
         }
 
@@ -752,9 +752,9 @@ std::map<String, RefTableListing> groupRefKeys(const Layout & layout, const std:
         /// `parseRefObjectKey` reconstructs the namespace from the key WITHOUT checking
         /// its shape. This is the first production consumer of that namespace, so re-validate it; a
         /// malformed namespace throws (BAD_ARGUMENTS), which the round treats as a malformed key.
-        layout.validateNamespace(parsed->ns);
+        layout.validateNamespace(parsed->id.ns);
 
-        RefTableListing & table = out[parsed->ns.string()];
+        RefTableListing & table = out[parsed->id.ns.string()];
         switch (parsed->kind)
         {
             case RefObjectKind::Log:
@@ -848,7 +848,7 @@ EpochCrossResult crossEpochFromSeal(Backend & backend, const Layout & layout, co
     {
         const RefTxnId start{target_epoch, 1};
         result.probed = start;
-        const auto body = backend.get(layout.refLogKey(ns, start));
+        const auto body = backend.get(layout.refLogKey(RefNamespaceId::stageATransition(ns), start));
         if (!body)
         {
             ++result.absent_probes;
@@ -895,13 +895,13 @@ RecoveredRefTable recoverRefTableDetailed(Backend & backend, const Layout & layo
         String cursor;
         for (;;)
         {
-            const ListPage page = backend.list(layout.refsNamespacePrefix(ns), cursor, 1000);
+            const ListPage page = backend.list(layout.refsNamespacePrefix(RefNamespaceId::stageATransition(ns)), cursor, 1000);
             if (on_page_fetched)
                 on_page_fetched();
             for (const ListedKey & lk : page.keys)
             {
                 const auto parsed = layout.parseRefObjectKey(lk.key);
-                if (parsed && parsed->ns == ns)
+                if (parsed && parsed->id.ns == ns)
                 {
                     if (parsed->kind == RefObjectKind::Log)
                         logs.push_back(parsed->txn_id);
@@ -924,7 +924,7 @@ RecoveredRefTable recoverRefTableDetailed(Backend & backend, const Layout & layo
         if (!snapshots.empty())
         {
             snapshot_id = snapshots.back();
-            const auto got = backend.get(layout.refSnapshotKey(ns, *snapshot_id));
+            const auto got = backend.get(layout.refSnapshotKey(RefNamespaceId::stageATransition(ns), *snapshot_id));
             if (!got)
                 vanished = true;
             else
@@ -940,7 +940,7 @@ RecoveredRefTable recoverRefTableDetailed(Backend & backend, const Layout & layo
             {
                 if (snapshot_id && !(*snapshot_id < id))
                     continue;   /// id <= snapshot: already included in the snapshot
-                const auto got = backend.get(layout.refLogKey(ns, id));
+                const auto got = backend.get(layout.refLogKey(RefNamespaceId::stageATransition(ns), id));
                 if (!got)
                 {
                     vanished = true;
