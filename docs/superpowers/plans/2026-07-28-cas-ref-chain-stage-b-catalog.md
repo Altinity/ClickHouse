@@ -1167,11 +1167,20 @@ ruled for could not be built there, so as shipped **the anomaly fires on ordinar
 this task's own design deletes the catalog entry LAST and leaves a window where ref objects exist with no
 entry.
 
-Today that costs nothing, since destruction is suppressed anyway. **At Task 7b it would cost everything:**
-`suppress_destructive = !report.anomalies.empty() || …`, so an anomaly suppresses the WHOLE round — meaning
-a pool with any removal in progress would stop reclaiming pool-wide, permanently, for as long as removals
-keep happening. 4-C left a comment saying so; a comment is not a mechanism, and this is exactly the class of
-rule that has failed us repeatedly in this campaign.
+Today that costs nothing, since destruction is suppressed anyway and `CasRefCatalog` has no entry-deletion
+API at all yet. **At Task 7b the cost is worse than "one anomaly per removal", which is what I originally
+authorised — corrected 2026-07-30 after the checkpoint measured it.** Nothing prunes a shard-0 cursor from
+the seal, and the `parent_cursors` loop re-adds every cursor-carrying namespace each round. So once an entry
+is gone: the anomaly recurs EVERY round and `suppress_destructive = !report.anomalies.empty() || …`
+suppresses the whole round, i.e. **reclamation stops pool-wide and stays stopped**; the cleanup item can
+never retire, because retirement needs `ref_tables.find(item.ns)` and the R10 filter dropped all its keys;
+the `_cleanup` marker is therefore never published, so **the name becomes permanently unrecreatable** and its
+physical prefixes are never reclaimed. Only `SYSTEM CONTENT ADDRESSED GC REBUILD` clears it.
+
+Also false and worth deleting while you are here: the comment claiming `per_ns_shard` "is written ONLY for
+namespaces in THIS round's listing … so a fully-deleted namespace leaves no cursor behind and a later
+recreation folds from `{0, 0}`". `walk_targets` includes every shard-0 parent cursor regardless of the
+listing, so the cursor never drops.
 
 - [ ] **Make the un-cataloged-namespace anomaly discriminate, using the removal evidence this task
   introduces.** Un-cataloged **with** evidence of a removal in progress (the terminal record / `_cleanup`
@@ -1179,6 +1188,10 @@ rule that has failed us repeatedly in this campaign.
   anomaly. Pin both directions: an ordinary removal must NOT raise it, and a fabricated missing entry with
   no removal evidence must. Without the negative half, the fix is one refactor away from silently going back
   to "never fires".
+- [ ] **Prune the cursor, and order the removal so the stall cannot happen at all:** delete the catalog entry
+  only after the `_cleanup` marker and the item's retirement are durable, and drop the namespace's shard-0
+  cursor from the seal when it goes. Discrimination alone is not enough — without pruning, a namespace that
+  legitimately finished removal still carries a cursor that re-adds it to `walk_targets` forever.
 - [ ] **Then remove the accepted-cost comment 4-C left at that site**, so no reader is told a cost is being
   accepted after it stopped being accepted.
 

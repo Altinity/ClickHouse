@@ -146,6 +146,35 @@ dropped before grouping. Note what this does NOT do, so nobody expects it: the P
 dead incarnation's key, deliberately — `Layout` is catalog-independent by design, so it is the wrong
 place to refuse.
 
+## R11c. The THIRD way to a vacuous frontier: incarnation MISMATCH, not entry absence — GATES TASK 7b {#r11c-incarnation-mismatch}
+
+Found 2026-07-30 by asking the fixed code the same question that found R11b: *is there another way to reach a
+vacuously-complete frontier?* There was, and it survived both earlier fixes.
+
+R11b's fix keys on the catalog not naming a namespace **at all**. It does nothing when the catalog names it
+at an incarnation whose key space is empty. Catalog says `N` is live at `Y`, while `N`'s objects and its
+shard-0 fold cursor belong to `X`. The walk GETs `refLogKey(Y, cursor+1)` → absent; `witnessAbove` finds
+nothing, because the R10 filter dropped every `X` key from `ref_tables` **and** `readCheckpointWitnesses`
+reads `_ckpt` at `Y` too; no carried hold, so the namespace is *proven*. And R10 drops `X`'s keys **silently
+by design** — that is the ordinary different-incarnation case, not damage — so nothing objects. Frontier
+complete, `X`'s live blobs read in-degree zero, destruction.
+
+**Not reachable today, which is precisely why it must GATE Task 7b rather than sit in a ledger.**
+Drop-and-recreate under the catalog arrives with Tasks 5/6, and the name-keyed fold cursor is documented in
+`Gc/CasGc.cpp` as the Stage-A residual whose only protection is `UniversePolicy` suppression — i.e. the thing
+7b removes. Two future tasks would independently make it live.
+
+**The detector needs nothing from Task 5.** A namespace whose CURRENT life contributed nothing — no entry in
+`checkpoints`, empty listing — while a NON-CURRENT life of the same name HAS listed objects is a
+contradiction, and the R10 loop already holds both facts.
+
+**And the process lesson is sharper than the bug.** The ruling on R11b asked for a predicate *about the
+authority rather than the union*. What shipped instead changed the numerator's SOURCE and left the predicate
+byte-identical — the guarantee is genuinely equivalent today, but it became an **implicit invariant spread
+over three sites** instead of one explicit statement, and the union-shaped predicate is exactly what still
+permits this case. **An invariant that holds implicitly across three sites has three places to stay silent;
+an explicit predicate has one place to refuse.**
+
 ## R11b. R11's first fix was insufficient, and the fix made the posture WORSE than before {#r11b-authority-vs-union}
 
 Found 2026-07-30 by the Task 4-C review, on the exact question the review was asked to answer: *is
