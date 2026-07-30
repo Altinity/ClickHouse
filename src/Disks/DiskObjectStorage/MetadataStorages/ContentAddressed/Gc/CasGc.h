@@ -6,6 +6,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Common/Logger.h>
@@ -412,6 +413,17 @@ private:
         /// ref-object cleanup (covered logs / superseded snapshots) so a second LIST is never issued.
         std::map<String, RefTableListing> ref_tables;
 
+        /// The round's ONE catalog read (review C3): namespace -> its `Live`/`Removing` incarnation, as
+        /// seen by the intake walk. Every later consumer in the SAME round (`cleanupRefObjects`,
+        /// `runNamespaceCleanupPasses`) must look a namespace up here rather than re-resolving via
+        /// `CasRefCatalog::resolveLifeOrSentinel`, which re-reads the catalog and can see a DIFFERENT
+        /// answer if the namespace was dropped and recreated between the fold's walk and the later call
+        /// -- the exact "delete plan computed under one life, applied under another" shape C3 named. A
+        /// namespace absent here (the catalog does not currently name it) has no entry; look it up with
+        /// `.find`, never assume the Stage-A sentinel applies -- that fallback is for the raw-fixture
+        /// read paths (`resolveLifeOrSentinel` itself), not for anything destructive.
+        std::map<String, UInt128> live_incarnation;
+
         /// The round's per-namespace `_ckpt.checkpoint`, read ONCE by the intake walk (its second,
         /// hint-independent witness) and reused post-CAS by `cleanupRefObjects` for its delete ranges --
         /// the same DRY reason `ref_tables` is carried here rather than re-listed. A namespace whose
@@ -542,7 +554,8 @@ private:
         std::map<String, String> undecodable;
     };
     CheckpointWitnesses readCheckpointWitnesses(const std::map<String, RefTableListing> & ref_tables,
-                                                const std::map<String, ShardCoverage> & parent_cursors);
+                                                const std::map<String, ShardCoverage> & parent_cursors,
+                                                const std::map<String, UInt128> & live_incarnation);
 
     /// What ONE generation's prefix says about itself: whether the generation exists at all, and the
     /// greatest attempt under it whose key is one `foldSealKey` would have produced.
@@ -617,6 +630,7 @@ private:
     /// `ref_tables` is this round's own global LIST: the `Removed`-snapshot republication is gated on it
     /// so a snapshot a recreated namespace already superseded is never re-created (the per-round churn).
     void runNamespaceCleanupPasses(const CasFoldSeal & seal, const std::map<String, RefTableListing> & ref_tables,
+                                   const std::map<String, UInt128> & live_incarnation,
                                    uint64_t new_round, bool suppress_destructive);
 
     /// Whether a namespace's physical `@cas@` metadata prefixes (manifest bodies + verbatim files) hold no
@@ -857,7 +871,16 @@ public:
                                           const std::map<String, RefTableListing> & ref_tables,
                                           uint64_t new_round, bool suppress_destructive)
     {
-        runNamespaceCleanupPasses(seal, ref_tables, new_round, suppress_destructive);
+        /// Test-only seam: no round-wide `FoldResult` to thread a `live_incarnation` map from (this
+        /// drives one pass in isolation, not a full round), so read the catalog fresh here. Safe outside
+        /// review C3's concern (a round re-resolving mid-round can disagree with itself) because this is
+        /// the pass's only catalog read, not one of several independent ones inside a single round.
+        const CasRefCatalog::Snapshot snap = CasRefCatalog::read(store->backend(), store->layout());
+        std::map<String, UInt128> live_incarnation;
+        for (const CatalogEntry & entry : snap.catalog.entries)
+            if (entry.state != NsState::Creating)
+                live_incarnation.emplace(entry.ns.string(), entry.incarnation);
+        runNamespaceCleanupPasses(seal, ref_tables, live_incarnation, new_round, suppress_destructive);
     }
 
 };

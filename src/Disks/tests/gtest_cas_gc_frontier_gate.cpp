@@ -524,6 +524,10 @@ TEST(CasGcFrontierGate, TheOrphanManifestSweepAndItsCursorAreInertUnderSuppressi
                    .gc_fold_max_defer_rounds = 0});
     const Layout & layout = store->layout();
     const RootNamespace ns{"test/aa@cas@"};
+    /// Review C1: pin `ns` into the catalog before its first touch -- the control arm below needs a
+    /// PROVABLE frontier under `AuthoritativeForTest`, and a namespace absent from the catalog is now
+    /// (correctly) unproven regardless of that policy, per the walk-loop fix.
+    DB::Cas::tests::casAdmitEntry(*backend, layout, ns);
 
     /// Two manifest bodies no ref ever named, under a build the durable floor has already passed.
     const ManifestRef r1{.writer_epoch = 5, .build_sequence = 0xCA01, .manifest_ordinal = 1};
@@ -1018,6 +1022,11 @@ TEST(CasGcFrontierGate, ThePendingCleanupPassDeletesTheRemovedNamespaceCheckpoin
     const Layout & layout = store->layout();
     const RootNamespace removed{"00/removed@cas@"};
     const RootNamespace live{"00/live@cas@"};
+    /// Review C2: pin both into the catalog before their first touch -- `runNamespaceCleanupPassesForTest`
+    /// now resolves the item's namespace from a fresh catalog read and skips it entirely if the catalog
+    /// does not name it (the same direction as C1's fix: never act at a fabricated key).
+    DB::Cas::tests::casAdmitEntry(*backend, layout, removed);
+    DB::Cas::tests::casAdmitEntry(*backend, layout, live);
 
     Gc gc(store, kGc);
     runRegularRoundReclaiming(gc);

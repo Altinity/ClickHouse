@@ -830,7 +830,7 @@ RefCleanupPlan planRefCleanup(const RefTableListing & listing, const RefTxnId & 
 
 EpochCrossResult crossEpochFromSeal(Backend & backend, const Layout & layout, const RootNamespace & ns,
                                     const RefTxnId & from_seal, std::optional<bool> seal_proven,
-                                    const RefTxnId & witness)
+                                    const RefTxnId & witness, std::optional<NamespaceLifeId> life_override)
 {
     EpochCrossResult result;
     if (from_seal == RefTxnId{})
@@ -846,10 +846,11 @@ EpochCrossResult crossEpochFromSeal(Backend & backend, const Layout & layout, co
 
     /// Stage B (Task 4-C): resolve `ns`'s real catalog life, falling back to the Stage-A sentinel for a
     /// namespace the catalog does not (yet, or ever) know about -- see `resolveLifeOrSentinel`'s own
-    /// doc for why the fallback is correct rather than a guess. Shared by both callers of this function
-    /// (`CasFsck.cpp`'s stream walk and `Gc::fold`'s own crossing probe), so both see whatever a real
-    /// production writer wrote.
-    const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(backend, layout, ns);
+    /// doc for why the fallback is correct rather than a guess. `CasFsck.cpp`'s stream walk has no
+    /// round-wide resolution to reuse, so it resolves here; `Gc::fold`'s crossing probe passes its own
+    /// already-resolved `life` (review C3) so the two never disagree about which key space this
+    /// namespace's records live in.
+    const NamespaceLifeId life = life_override.value_or(CasRefCatalog::resolveLifeOrSentinel(backend, layout, ns));
     uint64_t target_epoch = witness.writer_epoch;
     while (target_epoch > from_seal.writer_epoch)
     {

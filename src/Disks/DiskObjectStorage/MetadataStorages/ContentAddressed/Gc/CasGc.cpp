@@ -947,7 +947,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         uint64_t completed = 0;
         for (const auto & [key, item] : folded.fold_seal.ns_cleanup_items)
             (item.state == RefNsCleanupState::Completed ? completed : pending) += 1;
-        runNamespaceCleanupPasses(folded.fold_seal, folded.ref_tables, new_round, suppress_destructive);
+        runNamespaceCleanupPasses(folded.fold_seal, folded.ref_tables, folded.live_incarnation, new_round, suppress_destructive);
         t.metric("items", folded.fold_seal.ns_cleanup_items.size());
         t.metric("items_pending", pending);
         t.metric("items_completed", completed);
@@ -1089,7 +1089,8 @@ bool Gc::foldManifestEdges(const ManifestId & id, int sign, std::vector<BlobDelt
 }
 
 Gc::CheckpointWitnesses Gc::readCheckpointWitnesses(const std::map<String, RefTableListing> & ref_tables,
-                                                    const std::map<String, ShardCoverage> & parent_cursors)
+                                                    const std::map<String, ShardCoverage> & parent_cursors,
+                                                    const std::map<String, UInt128> & live_incarnation)
 {
     /// Read the checkpoint of every namespace `ref_tables` names, PLUS every namespace a HELD row in
     /// `parent_cursors` names. Both are parameters for that reason: the walk visits both sets, and the
@@ -1125,9 +1126,14 @@ Gc::CheckpointWitnesses Gc::readCheckpointWitnesses(const std::map<String, RefTa
     for (const String & ns_str : witness_namespaces)
     {
         const RootNamespace ns{ns_str};
-        /// Stage B (Task 4-C): see `CasRefCatalog::resolveLifeOrSentinel`'s doc for why the sentinel
-        /// fallback is correct, not a guess, for a namespace the catalog does not name.
-        const String ckpt_key = layout.refCkptKey(CasRefCatalog::resolveLifeOrSentinel(backend, layout, ns));
+        /// Review C3: use the SAME life the round's walk resolved (`live_incarnation`, the round's one
+        /// catalog read), never an independent `resolveLifeOrSentinel` re-read -- and, per C1, a
+        /// namespace the catalog does not currently name has no legitimate key space to read a witness
+        /// from at all, so it contributes none rather than one fabricated at the sentinel.
+        const auto life_it = live_incarnation.find(ns_str);
+        if (life_it == live_incarnation.end())
+            continue;
+        const String ckpt_key = layout.refCkptKey(NamespaceLifeId::fromCatalogEntry(ns, life_it->second));
         /// THE GET AND THE DECODE ARE SPLIT HERE, rather than taken together through `readCkpt`, so the
         /// catch below can scope to the DECODE ALONE. Wrapping the read too would turn a transport
         /// failure -- which says nothing about this object and everything about the round's ability to
@@ -1375,6 +1381,10 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     for (const CatalogEntry & entry : catalog_snapshot.catalog.entries)
         if (entry.state != NsState::Creating)
             live_incarnation.emplace(entry.ns.string(), entry.incarnation);
+    /// Carried on the result (review C3) so every later consumer this round -- `cleanupRefObjects`,
+    /// `runNamespaceCleanupPasses` -- looks a namespace's life up here instead of re-reading the catalog
+    /// independently and possibly disagreeing with the walk below about which incarnation is live.
+    result.live_incarnation = live_incarnation;
 
     /// R10 (`docs/superpowers/cas/2026-07-28-ref-rework-adjacent-findings.md {#r10-groupref-alias}`):
     /// `groupRefKeys` groups listed keys by namespace NAME alone and drops the parsed incarnation, so
@@ -1390,6 +1400,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// all (fails every parse) is left untouched for `groupRefKeys`' own strict check to classify.
     std::vector<String> live_ref_object_keys;
     live_ref_object_keys.reserve(ref_object_keys.size());
+    std::set<String> uncataloged_ns_already_recorded;   /// one anomaly per namespace, not per stray key
     for (const String & key : ref_object_keys)
     {
         std::optional<NamespaceLifeId> id;
@@ -1422,7 +1433,27 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         }
         const auto it = live_incarnation.find(id->ns.string());
         if (it != live_incarnation.end() && it->second == id->incarnation)
+        {
             live_ref_object_keys.push_back(key);
+            continue;
+        }
+        /// I1 (review): dropped for one of two reasons, and only one of them is silent by design.
+        /// `it != end()` (the catalog knows this namespace, just under a DIFFERENT incarnation) is dead-
+        /// incarnation debris -- the ordinary, expected shape R10 exists to filter, and the namespace's
+        /// CURRENT incarnation's own keys (if any) are covered separately in this same pass. `it == end()`
+        /// (the catalog names this namespace AT ALL) has no such cover: nothing else in this round
+        /// accounts for it, so dropping it silently is exactly the "un-cataloged namespace with ref
+        /// objects reads as harmless" gap C1 traced. Recorded as an anomaly for the same accepted-cost
+        /// reason as the walk-loop's C1 fix: an ordinary removal (Task 5 deletes the catalog entry LAST)
+        /// looks identical to damage until that task's removal-evidence check lands.
+        if (it == live_incarnation.end() && uncataloged_ns_already_recorded.insert(id->ns.string()).second)
+        {
+            const String reason = fmt::format(
+                "ref intake: key {} names a namespace with no catalog entry (Live/Removing) this round "
+                "-- dropped rather than folded (expected on an ordinary removal too, not only on damage, "
+                "until Task 5's removal-evidence check lands)", key);
+            report.recordAnomaly(id->ns, 0, ManifestId{id->ns, {}}, reason.c_str());
+        }
     }
 
     /// A malformed ref-object key or namespace aborts ref folding for the whole round: the
@@ -1708,7 +1739,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// The round's SECOND witness source, independent of the listing -- see `readCheckpointWitnesses`
     /// for what it decides and why a listing alone cannot decide it. Its `undecodable` half names the
     /// namespaces whose `_ckpt` is present and unreadable; each of those is HELD below, and only those.
-    const CheckpointWitnesses checkpoints = readCheckpointWitnesses(ref_tables, parent_cursors);
+    const CheckpointWitnesses checkpoints = readCheckpointWitnesses(ref_tables, parent_cursors, live_incarnation);
     const std::map<String, RefTxnId> & checkpoint_witness = checkpoints.witnesses;
 
     /// WHICH NAMESPACES THIS ROUND WALKS -- i.e. THE ROUND'S UNIVERSE, the set the destructive gate owes
@@ -1911,7 +1942,17 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         /// raw-fixture test that never touched the catalog) falls back to the Stage-A sentinel, which is
         /// the only other identity such a namespace could have keyed its objects at.
         const auto life_it = live_incarnation.find(ns_str);
-        const NamespaceLifeId life = life_it != live_incarnation.end()
+        const bool catalog_names_this_namespace = life_it != live_incarnation.end();
+        /// C1 fix (review `{#r11-empty-universe-vacuous}`): `resolveLifeOrSentinel`'s sentinel fallback
+        /// is for the raw-fixture READ paths, where the sentinel names a real (if pre-release-only)
+        /// identity. It must NOT gate a GET here: a namespace this round's catalog does not name has NO
+        /// real key space to probe, so falling back to the sentinel would manufacture a frontier proof
+        /// out of a key space nothing wrote into -- exactly the amplifier the review traced from an
+        /// absent/damaged catalog to "every namespace proven, nothing actually known live". `life` below
+        /// is still needed for logging/key-construction parity with the catalog-named case further down
+        /// this loop, but `catalog_names_this_namespace` is what gates whether this namespace is ever
+        /// actually walked at it (see the `expected` guard just below).
+        const NamespaceLifeId life = catalog_names_this_namespace
             ? NamespaceLifeId::fromCatalogEntry(ns, life_it->second)
             : NamespaceLifeId::stageATransition(ns);
         const String cursor_key = cursorKey(ns, /*shard*/0);
@@ -2060,7 +2101,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                                        const RefTxnId & witness) -> std::optional<RefTxnId>
         {
             const EpochCrossResult crossing =
-                crossEpochFromSeal(backend, layout, ns, from_seal, seal_proven, witness);
+                crossEpochFromSeal(backend, layout, ns, from_seal, seal_proven, witness, life);
             intake_absent_probes += crossing.absent_probes;   /// a failed crossing pays its reads too
             ProfileEvents::increment(ProfileEvents::CasRefLogBodyGets, crossing.body_gets);
             if (crossing.outcome == EpochCrossOutcome::StartInvalid)
@@ -2097,6 +2138,28 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         }
         else
             expected = RefTxnId{cursor.writer_epoch, cursor.ref_sequence + 1};
+
+        /// C1 fix, continued: a namespace absent from this round's catalog read is UNPROVEN, never
+        /// walked. No hold is minted (there is no legitimate position to name -- a fabricated one would
+        /// become a permanent false witness, the same reason the undecodable-`_ckpt`-no-position arm
+        /// just below mints none either), so the only way this can suppress destruction is the anomaly
+        /// and the frontier staying incomplete -- which is exactly what should suppress it.
+        ///
+        /// THIS FIRES ON ORDINARY REMOVAL TOO, not only on damage, and that is a known, accepted cost
+        /// until Task 5 lands the removal-evidence check (the terminal record / `_cleanup` marker) this
+        /// site would need to tell "namespace legitimately removed" apart from "catalog entry lost or
+        /// corrupted" -- that evidence is not reachable at this point in the fold today. Recording the
+        /// anomaly (and therefore suppressing) on every ordinary removal is the conservative direction;
+        /// silently treating an uncataloged namespace as harmless is the one this fix exists to close.
+        if (!catalog_names_this_namespace)
+        {
+            report.recordAnomaly(ns, 0, ManifestId{ns, {}},
+                "ref intake: this namespace has no catalog entry (Live/Removing) this round -- its "
+                "frontier cannot be proven from a real key space, so it is treated as unproven rather "
+                "than walked at a fabricated one (expected until Task 5's removal-evidence check lands, "
+                "on an ordinary removal too, not only on damage)");
+            expected.reset();
+        }
 
         /// AN UNDECODABLE `_ckpt` QUARANTINES ITS OWN NAMESPACE AND NOTHING ELSE (spec §5). The object
         /// belongs to exactly one namespace and both of its consumers are keyed by that namespace --
@@ -3180,9 +3243,15 @@ void Gc::cleanupRefObjects(const FoldResult & folded, bool suppress_destructive)
     for (const auto & [ns_str, listing] : folded.ref_tables)
     {
         const RootNamespace ns{ns_str};
-        /// Stage B (Task 4-C): see `CasRefCatalog::resolveLifeOrSentinel`'s doc for why the sentinel
-        /// fallback is correct, not a guess, for a namespace the catalog does not name.
-        const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(backend, layout, ns);
+        /// Review C3: look up the SAME life the round's walk resolved (`folded.live_incarnation`),
+        /// never re-resolve independently -- a fresh `resolveLifeOrSentinel` read here could see a
+        /// namespace dropped and recreated since the walk ran, and would then delete the NEW
+        /// incarnation's live objects using ids read under the OLD one. A namespace absent from the
+        /// map is skipped rather than deleted at a fabricated key (same reasoning as C1's walk fix).
+        const auto life_it = folded.live_incarnation.find(ns_str);
+        if (life_it == folded.live_incarnation.end())
+            continue;
+        const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(ns, life_it->second);
         RefTxnId durable_cursor{};
         if (const auto it = folded.fold_seal.per_ns_shard.find(cursorKey(ns, /*shard*/0));
             it != folded.fold_seal.per_ns_shard.end())
@@ -3221,6 +3290,7 @@ void Gc::cleanupRefObjects(const FoldResult & folded, bool suppress_destructive)
 }
 
 void Gc::runNamespaceCleanupPasses(const CasFoldSeal & seal, const std::map<String, RefTableListing> & ref_tables,
+                                   const std::map<String, UInt128> & live_incarnation,
                                    uint64_t new_round, bool suppress_destructive)
 {
     Backend & backend = store->backend();
@@ -3242,6 +3312,18 @@ void Gc::runNamespaceCleanupPasses(const CasFoldSeal & seal, const std::map<Stri
 
     for (const auto & [key, item] : seal.ns_cleanup_items)
     {
+        /// Review C2: the `_cleanup` marker, the `Removed`-snapshot republish, and the `_ckpt` backstop
+        /// delete are all incarnation-keyed now that every READER of them moved off the Stage-A
+        /// sentinel (`observedNamespaceCleanupMarker`, the retirement check's `listing.cleanup_markers`/
+        /// `snapshots`, `publishCkptContribution`). Writing/deleting them at the sentinel while readers
+        /// look at the real life makes namespace recreation permanently refuse, `Completed` items never
+        /// retire, and leaks the real `_ckpt` forever -- so resolve the SAME life the round's walk did
+        /// (`live_incarnation`), and skip the item entirely if the catalog does not (or no longer) name
+        /// it rather than act at a fabricated key (same direction as C1's fix).
+        const auto life_it = live_incarnation.find(item.ns.string());
+        if (life_it == live_incarnation.end())
+            continue;
+        const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(item.ns, life_it->second);
         if (item.state == RefNsCleanupState::Pending)
         {
             /// A clamp/abort round defers the physical reclaim (align with the round's destructive gate).
@@ -3255,7 +3337,7 @@ void Gc::runNamespaceCleanupPasses(const CasFoldSeal & seal, const std::map<Stri
             /// this namespace ("observing an empty physical prefix is not sufficient"). If a successor
             /// already Completed this item, the marker exists and the writer may have recreated live objects
             /// under these prefixes -- abort the pass on marker-present.
-            const String marker_key = layout.refCleanupMarkerKey(NamespaceLifeId::stageATransition(item.ns), item.remove_txn_id);
+            const String marker_key = layout.refCleanupMarkerKey(life, item.remove_txn_id);
 
             /// Bounded exact-key enumerate-and-delete over the removed namespace's physical `@cas@` prefixes
             /// (manifest bodies + verbatim files). NotFound/TokenMismatch tolerated.
@@ -3328,7 +3410,7 @@ void Gc::runNamespaceCleanupPasses(const CasFoldSeal & seal, const std::map<Stri
             /// GC-side backstop for the incarnation that never got one.
             if (!round_still_ours() || backend.head(marker_key).exists)
                 return;
-            const String ckpt_key = layout.refCkptKey(NamespaceLifeId::stageATransition(item.ns));
+            const String ckpt_key = layout.refCkptKey(life);
             if (const HeadResult ckpt_head = backend.head(ckpt_key); ckpt_head.exists)
                 backend.deleteExact(ckpt_key, ckpt_head.token);   /// NotFound/TokenMismatch tolerated
         }
@@ -3343,7 +3425,7 @@ void Gc::runNamespaceCleanupPasses(const CasFoldSeal & seal, const std::map<Stri
             /// snapshot (crash between the two publishes, no recreation) is repaired, but a snapshot a
             /// recreated namespace already superseded (and cleanup deleted) is NOT re-created -- otherwise
             /// each round re-creates it and the next deletes it, a permanent one-PUT-one-DELETE churn.
-            backend.putIfAbsent(layout.refCleanupMarkerKey(NamespaceLifeId::stageATransition(item.ns), item.remove_txn_id), String{});
+            backend.putIfAbsent(layout.refCleanupMarkerKey(life, item.remove_txn_id), String{});
             bool removed_snapshot_present = false;
             bool superseded_by_newer = false;
             if (const auto tit = ref_tables.find(item.ns.string()); tit != ref_tables.end())
@@ -3360,7 +3442,7 @@ void Gc::runNamespaceCleanupPasses(const CasFoldSeal & seal, const std::map<Stri
                 removed.snapshot_id = item.remove_txn_id;
                 removed.lifecycle = RefLifecycle::Removed;
                 removed.remove_txn_id = item.remove_txn_id;
-                backend.putIfAbsent(layout.refSnapshotKey(NamespaceLifeId::stageATransition(item.ns), item.remove_txn_id),
+                backend.putIfAbsent(layout.refSnapshotKey(life, item.remove_txn_id),
                                     sealObject(FormatId::RefSnapshot, encodeRefTableSnapshot(removed)));
             }
         }

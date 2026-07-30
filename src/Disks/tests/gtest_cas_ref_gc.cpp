@@ -861,6 +861,11 @@ TEST(CasRefGc, StaleLeaderPendingPassAbortsWhenRoundAdvanced)
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/aa@cas@"};
+    /// Review C2: pin `ns` into the catalog before its first touch. Without this the pass would skip
+    /// the item as uncataloged (also correct, but for the WRONG reason -- this test is specifically
+    /// about the round-freshness guard, and an uncataloged skip would let it pass without ever
+    /// reaching, let alone exercising, that guard.
+    DB::Cas::tests::casAdmitEntry(*backend, layout, ns);
 
     Gc gc(store, kGc);
     gc.runRegularRound();
@@ -900,6 +905,12 @@ TEST(CasRefGc, PendingPassEpochFiltersManifestDeletes)
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/aa@cas@"};
+    /// Review C2: pin `ns` into the catalog before its first touch -- `runNamespaceCleanupPassesForTest`
+    /// now skips an uncataloged item's WHOLE pass (not only its 3 life-keyed sites): the physical
+    /// manifest/verbatim-file passes guard themselves on the `_cleanup` marker's key, and that key needs
+    /// a resolved life too, so there is no legitimate way to run them without one either. This matches
+    /// Task 5's own design, where the catalog entry survives until the LAST step of a real removal.
+    DB::Cas::tests::casAdmitEntry(*backend, layout, ns);
 
     Gc gc(store, kGc);
     gc.runRegularRound();
