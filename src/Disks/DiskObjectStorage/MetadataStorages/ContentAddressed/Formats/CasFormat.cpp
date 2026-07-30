@@ -131,7 +131,10 @@ constexpr FormatTraits TRAITS[] =
     /// admission gate measures `encodeRefCatalog`'s own output directly, so a compressed size would
     /// answer the wrong question. The object cap is the fold-seal's own 256 MiB (predicate (2) of the
     /// additive admission check bounds it further via the entry count); the line cap is tight (4 KiB)
-    /// because one entry's record is small and bounded by `kMaxNamespaceBytes`.
+    /// because one entry's record is ordinarily small -- but not always small enough: a namespace or
+    /// `server_root_id` near their own byte bounds, worst-case escaped, can push a single line past
+    /// 4 KiB, and `encodeRefCatalog` REFUSES that entry (`LIMIT_EXCEEDED`, `CasRefCatalogFormat.cpp`'s
+    /// `checkLineBytes`) rather than writing an object no reader could later decode.
     {FormatId::RefCatalog,   "cas_ref_catalog",   TextFamily::Control,       KeyStrictness::Strict,   CompressionPolicy::Never,     256 * kMiB, 4 * kKiB},
     {FormatId::PartManifest, "cas_part_manifest", TextFamily::PayloadHybrid, KeyStrictness::Tolerant, CompressionPolicy::Always,    256 * kMiB, 64 * kKiB},
     {FormatId::RunFile,      "cas_run",           TextFamily::RecordStream,  KeyStrictness::Strict,   CompressionPolicy::PinnedRaw, 0,          4 * kKiB},
