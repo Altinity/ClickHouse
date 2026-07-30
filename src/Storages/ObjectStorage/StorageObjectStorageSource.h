@@ -145,12 +145,16 @@ protected:
     ThreadPoolCallbackRunnerUnsafe<ReaderHolder> create_reader_scheduler;
 
     /// Depth of the file-lookahead queue below (>= 1; from `object_storage_max_files_to_prefetch`).
-    /// `reader` plus these futures together keep up to this many files' readers alive/priming at once.
+    /// This bounds `reader_futures` only, so a stream holds up to this many queued readers *plus*
+    /// the one in `reader` it is currently being pulled from. Of the queued ones only those beyond
+    /// the first are primed (see refillReaderFutures), so at the default of 1 nothing is primed
+    /// ahead at all and the behaviour matches what it was before this setting existed.
     const size_t max_files_to_prefetch;
-    /// Upcoming files' readers, in the same order the file_iterator handed them out. Built on
-    /// create_reader_pool and primed (createReaderAsync -> prefetch()) so their background reads are
-    /// already in flight by the time generate() reaches them; consumed strictly front-to-back, so
-    /// per-stream row order is unaffected by however many are queued.
+    /// Upcoming files' readers. Built on create_reader_pool and primed (createReaderAsync ->
+    /// prefetch()) so their background reads are already in flight by the time generate() reaches
+    /// them. Queued in submission order, but *which* file a slot ends up holding is not: the queued
+    /// tasks race each other for file_iterator->next(), so a slot queued earlier can resolve to
+    /// nothing while a slot queued later already holds a file. Consumed via takeNextQueuedReader.
     std::deque<std::future<ReaderHolder>> reader_futures;
 
     /// Fills reader_futures back up to max_files_to_prefetch entries. Only futures beyond the first
@@ -159,6 +163,13 @@ protected:
     /// before this setting existed. No-op once file_iterator is exhausted (createReaderAsync's
     /// result will resolve to an empty/false ReaderHolder, which callers already handle).
     void refillReaderFutures();
+
+    /// Pops the oldest queued reader, skipping slots that resolved to no file. Returns an empty
+    /// holder only once every queued slot has been drained and none of them held a file.
+    /// An empty slot on its own does not mean the file list is exhausted - queued tasks race for
+    /// file_iterator->next(), so an earlier-queued slot can come up empty while later-queued slots
+    /// already hold files that have been fetched and must still be read.
+    ReaderHolder takeNextQueuedReader();
 
     /// Recreate ReadBuffer and Pipeline for each file.
     static ReaderHolder createReader(

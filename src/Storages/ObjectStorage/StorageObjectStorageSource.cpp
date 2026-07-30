@@ -79,11 +79,6 @@ namespace ProfileEvents
     extern const Event ObjectStorageWaitPrefetchedReaderMicroseconds;
 }
 
-namespace FailPoints
-{
-    extern const char object_storage_file_prefetch_failpoint[];
-}
-
 namespace CurrentMetrics
 {
     extern const Metric StorageObjectStorageThreads;
@@ -93,6 +88,13 @@ namespace CurrentMetrics
 
 namespace DB
 {
+/// The failpoints are defined in `DB::FailPoints`, so this has to be declared inside `namespace DB`
+/// - at global scope it declares a different symbol and the build fails to link.
+namespace FailPoints
+{
+    extern const char object_storage_file_prefetch_failpoint[];
+}
+
 namespace Setting
 {
     extern const SettingsUInt64 max_download_buffer_size;
@@ -434,6 +436,23 @@ void StorageObjectStorageSource::refillReaderFutures()
     }
 }
 
+StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::takeNextQueuedReader()
+{
+    /// Stopping at the first empty slot would silently drop files: the queued tasks race each other
+    /// for file_iterator->next(), so a slot queued earlier can resolve to nothing while later-queued
+    /// slots already hold files that have been fetched (and, when primed, read ahead) and still have
+    /// to be returned. Only when every queued slot has been drained and none held a file is this
+    /// stream really out of work.
+    while (!reader_futures.empty())
+    {
+        auto next_reader = reader_futures.front().get();
+        reader_futures.pop_front();
+        if (next_reader)
+            return next_reader;
+    }
+    return {};
+}
+
 Chunk StorageObjectStorageSource::generate()
 {
     lazyInitialize();
@@ -660,9 +679,8 @@ Chunk StorageObjectStorageSource::generate()
         chassert(!reader_futures.empty());
         {
             ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::ObjectStorageWaitPrefetchedReaderMicroseconds);
-            reader = reader_futures.front().get();
+            reader = takeNextQueuedReader();
         }
-        reader_futures.pop_front();
 
         if (!reader)
             break;
