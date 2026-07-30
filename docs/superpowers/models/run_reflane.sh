@@ -25,6 +25,7 @@ CONFIGS=(
   "witness_commit         violation W_Commit"
   "witness_unresolved     violation W_Unresolved"
   "witness_retrycreated   violation W_RetryCreated"
+  "witness_durableadoption violation W_DurableAdoption"
   "witness_recovery       violation W_Recovery"
   "witness_staleresult    violation W_StaleResult"
   "witness_closed         violation W_Closed"
