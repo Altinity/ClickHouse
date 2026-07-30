@@ -2795,3 +2795,21 @@ never gate a waiter on `until grep -q "^MARKER=" "$log"` — plain `grep -q` ret
 where `grep -aq` returns 0, so the waiter hangs forever. Write completion markers to a separate small
 text file, and count "did suite X run" DURING the run rather than from the finished file. The
 trailing gtest SUMMARY block always survives, so pass/fail totals stay trustworthy.
+
+## Numbered CAS doc set documents pre-Stage-A ref and namespace-file shapes {#numbered-docs-stale-ref-shapes}
+
+Found by the Task 1c review, explicitly as a NON-finding of that task — it was already stale before
+Task 1 and Task 1c neither worsened it nor was asked to fix it. Recorded so it is not re-discovered
+as a finding a third time.
+
+`docs/superpowers/cas/01-architecture.md`, `codecs.md`, `11-walkthrough.md`, `03-writer-protocol.md`
+and `09-read-protocol.md` still document namespace files at `roots/<ns>/_files/<name>` — the
+namespace-only shape that Task 1c deleted in favour of `roots/<ns>/<incarnation>/_files/<name>` — and
+still show the pre-Stage-A ref shape `cas/refs/<ns>/<shard>`. `Layout::rootsPrefix`'s own doc comment
+still says "root-shard manifest", vocabulary that predates the ref rework.
+
+Do not fix these piecemeal per task: the key shapes are still moving through Stage B, so a sweep now
+buys one round of accuracy and then rots again. The sweep belongs at the end of Stage B, where the
+final shapes are settled — and it is the same discipline as the plan's `{#restatement-impact}`
+do-not-cite list, for the same reason: a stale `refCkptKey` reference survived four tasks before
+anyone swept it.
