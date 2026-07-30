@@ -291,3 +291,68 @@ From the same review (P5, PROSE/Minor). Task 3 enforces "`Creating` forbids publ
 level ONLY, by explicit ruling — production-path wiring is Task 4's step. That is not a defect, but the
 committed header does not say so, so a reader takes the invariant as global. Add the one sentence naming
 what is NOT gated and where it is closed. This is the disclosure the ruling was conditional on.
+
+### D16 — `CasListLiarEndToEnd`'s inverted test calls a raw fixture "the real writer path" {#d16-liar-test-real-writer-path-overclaim}
+
+From the Task 4-C review (M1). `TheSameHiddenNamespacesBlobSurvivesEvenWhenTheUniverseIsDeclaredAuthoritative`'s
+comment (`gtest_cas_list_liar_end_to_end.cpp`, right above the `TEST` line) says: *"`hidden` was born
+through the real writer path (`publishAt`, `birth=true`)"*.
+
+**The false claim:** that `publishAt` IS the real (production) writer path.
+
+**The verified truth:** `publishAt` is a raw fixture that drains into `writeRefLogTxnRaw`
+(`cas_test_helpers.h`) — Task 4-B's map established that none of the ten raw-write helpers can route
+through real birth (`CasRefLedger::resolveNamespaceLife`'s fresh-random mint); they structurally cannot
+(INV-1 holes, out-of-order ids, tables with no `_ckpt`). What actually makes `hidden` catalog-`Live` here
+is `writeRefLogTxnRaw`'s own `casAdmitEntry` call — a test-only admission shim, not the production path.
+A reader who trusts the comment believes this test covers production birth; it does not.
+
+**Fix:** replace "born through the real writer path" with something like "admitted into the catalog by
+`writeRefLogTxnRaw`'s own `casAdmitEntry` call (a raw fixture, not the production birth path)".
+
+### D17 — `writeRefSnapshotRaw`'s docstring states its scope but not the fix {#d17-snapshot-raw-no-admit-pointer}
+
+From the Task 4-C review (M2). `cas_test_helpers.h`, `writeRefSnapshotRaw`'s doc (right above the
+function) already says honestly that it "does NOT itself admit an entry, so a namespace this helper is
+the ONLY writer for stays exactly as invisible to the catalog as it was before Task 4-C". `writeRefLogTxnRaw`,
+its sibling raw fixture two functions down, calls `casAdmitEntry` for exactly this reason and says so.
+The asymmetry is a trap for the next test author who writes a snapshot-only fixture, expects
+`discoverUniverse` to see it, and gets silence with no pointer to why or what to do about it.
+
+**Fix:** add one sentence at `writeRefSnapshotRaw`'s doc: "if the caller needs this namespace
+discoverable, call `casAdmitEntry` first (see `writeRefLogTxnRaw`, below)." Not a behaviour change —
+`writeRefSnapshotRaw` keeps its pre-existing scope; only the doc gains the pointer.
+
+### D18 — `CasGcShardIncarnation.ListNamespacesFromRefsNotRegistry`'s header misdates the semantics it describes {#d18-list-namespaces-stale-task-header}
+
+From the Task 4-C review (M4). `gtest_cas_gc_shard_incarnation.cpp:108-109`: *"Task 4: listNamespaces is
+LIST-based; no registry involved."* / *"Publishing into ns A makes it appear in `listNamespaces("")`; ns
+B absent."*
+
+**The problem, not quite falsity:** `Pool::listNamespaces` (`CasPool.cpp`) genuinely is still LIST-based
+today — unlike `Gc::discoverUniverse`, Task 4-C's catalog-authority switch never touched it, so the
+SECOND sentence remains true. But the header's bare "Task 4" (with no letter suffix, unlike every
+Stage-B header elsewhere in this file, which say "Task 4-C") now reads, after the sibling test above it
+was rewritten for Review I5 to talk explicitly about "the switch from LIST-based discovery" to
+catalog-authoritative `discoverUniverse`, as if THIS test's `listNamespaces` had undergone the same
+switch. It has not — it is a different API. Left as-is, the next reader conflates the two.
+
+**Fix:** either qualify which Task 4 (the original numbered task that added `listNamespaces`, distinct
+from Stage B's "Task 4-C"), or add a one-clause disclaimer that `listNamespaces` is unaffected by the
+catalog-authority change this file's OTHER test now documents, so the two are not read as the same
+mechanism.
+
+### D19 — non-defects noted so they are not re-litigated {#d19-task-4c-non-defects}
+
+From the Task 4-C review (M3, M5):
+
+- **M3** asked whether the `CasEmptyProof` attribution report showed the actual revert-and-rebuild
+  experiment (`git checkout <base> -- cas_test_helpers.h`, rebuild, re-run) rather than a mechanistic
+  trace. It did not, at review time. **Resolved separately, not as a doc fix**: the experiment was run
+  for real in this same round (see the I4/review-response status sent to team-lead) and reproduced the
+  identical failure against the pre-session header, closing the question with evidence rather than
+  argument. `task-4c-report.md` should carry that procedure and result when it is next synced to the
+  review-response commits — tracked as an open item, not a prose defect in itself.
+- **M5**: the R11 test's per-family assertions are subsumed by the `deleteTotal() == 0` it also asserts
+  ("an aggregate hides a family" only applies to a nonzero aggregate). No action — noted so a future pass
+  does not re-file it as a finding.
