@@ -2019,6 +2019,30 @@ Commit alone; final commit updates `models/README.md` + `cas/06-tla-models.md`.
 
 ### Task 11: Stage B gates {#task-11}
 
+- [ ] **Gate step: run clang-tidy over Stage B's own sources — startable EARLY, in any idle window.** The
+  profile exists: `BuildTypes.AMD_TIDY` (`ci/defs/defs.py:354`), whose cmake line in
+  `ci/jobs/build_clickhouse.py` is a **Debug, no-sanitizer, x86_64-toolchain** build with
+  `-DENABLE_CLANG_TIDY=1`. **Use the AMD profile, not `arm_tidy`** — CI runs tidy only in the ARM build
+  (`build_clickhouse.py`: "Run it only in the arm_tidy build to avoid adding overhead to every build"), and
+  cross-compiling for ARM locally buys nothing here and costs a toolchain. The repo's `.clang-tidy` (10 KB)
+  supplies the check set, so nothing needs configuring beyond the switch.
+
+  Practical shape, since it is a long build and must not disturb anything in flight:
+  - Configure it in **its own build directory** (`build_tidy`), never by adding the switch to an existing
+    one — turning `ENABLE_CLANG_TIDY` on in `build/` or `build_asan/` makes every later incremental build
+    pay for tidy and invalidates their caches.
+  - Redirect the build to a log inside that directory; no `-j`, no `nproc`.
+  - **Scope the reading, not the build**: the interesting output is diagnostics under
+    `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/` and `src/Disks/tests/gtest_ca*`,
+    `gtest_cas*`. Everything else is pre-existing and not this stage's business — report it, do not fix it.
+  - `clang-tidy-cache` is what makes this affordable on a second run; CI wires `CTCACHE_DIR`, so a local run
+    that sets it too will not pay full price twice.
+
+  **Why it is a gate step and not a nice-to-have:** this stage added ~7500 lines of C++ across 109 files,
+  including a lifecycle, a new format codec and several new lock-holding paths — and two of the defects found
+  this stage (a `chassert` over a handled branch, a `std::unique_lock` unlocked on a throw path) are exactly
+  the shapes a static analyser is good at. Start it during any wait; read it before the stage closes.
+
 - [ ] **Gate step: sweep Stage B's own comments for rules that only a reader can enforce.** Four rules failed
   this stage while living in prose ("every term of `clean()` appears here", the gate suite list, the `_ckpt`
   cleanup's ownership premise, the `per_ns_shard` pruning claim); the two that were converted to executing
