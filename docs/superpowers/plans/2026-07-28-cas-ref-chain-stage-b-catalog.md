@@ -1646,33 +1646,47 @@ in scope precisely because leaving it invites a revert.
   ONE commit for the flip alone — probe A left in Task 7a's commit, and no delete-side optimization
   rides along (Constraint 18).
 
-- [ ] **Step 4: RESTORE every test weakened for Stage-A suppression, and prove each one green with its
-  assertion restored — not merely still passing.** `grep -n "STAGE-A RETURN ITEM"` finds all five sites;
-  the comment at `UniversePolicy::kDefault` names them. A test that keeps passing with its WEAKENED
-  assertion proves nothing about the flip, so each row below must be strengthened first and then run:
+- [ ] **Step 4: close out every Stage-A return item, and prove each one green with its real assertion
+  intact — not merely no longer suppressed.** `grep -n "STAGE-A RETURN ITEM"` finds all five sites; the
+  comment at `UniversePolicy::kDefault` names them. Two different things need to happen here, because
+  the five sites are no longer in the same state:
 
-  | test | weakened to | restore to |
-  |---|---|---|
-  | `04290_content_addressed_no_leftovers.sh` | bounded convergence to a nonzero plateau; `fsck_unreachable_gt_0` | **drain to `PENDING = 0`**; `fsck_unreachable` exactly 0 |
-  | `04295_content_addressed_mutation_no_leftovers.sh` | same | same |
-  | `05008_ca_gc_snap_prune.sh` | `objects_deleted = 0` | poll for a round with `objects_deleted > 0`, and assert `entries_redeleted >= objects_deleted` on THAT round (the identity stops being trivial only once deletes are real) |
-  | `CasGcLog.EmitsStartFinishWithCounts` (`gtest_cas_gc_log.cpp`) | per its marker | per its marker |
-  | the displacement test in `gtest_ca_wiring.cpp` | `EXPECT_GT(after.unreachable, 0u)` | `EXPECT_EQ(after.unreachable, 0u)` |
+  - `05008_ca_gc_snap_prune.sh`, `04290_content_addressed_no_leftovers.sh` and
+    `04295_content_addressed_mutation_no_leftovers.sh` already assert the real Stage-B contract (the
+    weakening from c60911eecd7/76ee70da4a7 was reversed ahead of this task — the strict assertions,
+    the drain-to-`PENDING = 0` loop, and the exact-zero `fsck_unreachable` check are already back in
+    place) and are registered as known-red in `tests/broken_tests.yaml` (entries
+    `05008_ca_gc_snap_prune`, `04290_content_addressed_no_leftovers`,
+    `04295_content_addressed_mutation_no_leftovers`) purely because production destruction is still
+    suppressed. For these three: remove all three `broken_tests.yaml` entries and confirm the tests
+    pass with NO change to the test files themselves — a pass here is the flip doing real work, not an
+    assertion being loosened to fit it.
+  - `CasGcLog.EmitsStartFinishWithCounts` (`gtest_cas_gc_log.cpp`) and the displacement test in
+    `gtest_ca_wiring.cpp` (currently `EXPECT_GT(after.unreachable, 0u)`) are STILL weakened in the
+    source, per their own markers. For these two: restore each to its real assertion (per its marker;
+    the wiring test to `EXPECT_EQ(after.unreachable, 0u)`) and prove it green with the assertion
+    restored.
 
-  **`04290` and `04295` draining to zero is the end-to-end proof of this task** — they are the only
-  tests that watch the whole pipeline reclaim, so if they cannot drain, the flip did not deliver
-  destruction no matter what the delete-family metrics say. Paste each run's output. If any one of the
-  five cannot be restored, that is a FINDING about the flip, not a reason to leave the marker in place.
+  **`04290` and `04295` passing with their drain-to-`PENDING = 0` loop intact is the end-to-end proof of
+  this task** — they are the only tests that watch the whole pipeline reclaim, so if they cannot drain,
+  the flip did not deliver destruction no matter what the delete-family metrics say. Paste each run's
+  output. If any of the five cannot be closed out, that is a FINDING about the flip, not a reason to
+  leave the marker (or, for the first three, the `broken_tests.yaml` entry) in place.
+
+  Exit condition: `grep -n "STAGE-A RETURN ITEM"` returns NOTHING, and none of the three
+  `broken_tests.yaml` entries named above remain.
 
 - [ ] **Step 5: fix the `PENDING` gauge while you are in those two files** (BACKLOG
   `{#stateless-pending-double-count}`): `PENDING = pending_candidates + pending_condemned +
   pending_retired` double-counts, because `pending_condemned` is already `candidates + retired` per its
-  own doc in `Gc/CasGc.h`. Harmless while the assertion is only `> 0`, but Step 4 makes it a
-  drain-to-zero comparison and every figure it prints is twice the truth. Use `pending_condemned` alone.
+  own doc in `Gc/CasGc.h`. Harmless while the loop cannot reach zero under suppression, but Step 4's
+  flip makes the drain-to-zero comparison live and every figure it prints is twice the truth. Use
+  `pending_condemned` alone.
 
-- [ ] **Step 6: Commit** the restorations as their own commit, so the flip and the test restorations are
-  separately revertable. Then confirm `grep -n "STAGE-A RETURN ITEM"` returns NOTHING — a surviving
-  marker after this task means a weakened assertion was left behind.
+- [ ] **Step 6: Commit** the `broken_tests.yaml` removals and the two gtest restorations as their own
+  commit, so the flip and the test closeout are separately revertable. Then confirm `grep -n "STAGE-A
+  RETURN ITEM"` returns NOTHING — a surviving marker after this task means either a known-red
+  registration or a weakened assertion was left behind.
 
 ### Task 8: R2+R3 — writer duty queue + orphan nomination, one coherent change {#task-8}
 
