@@ -4192,7 +4192,29 @@ RebuildReport Gc::rebuildBaseline(bool force)
     };
 
     /// Universe scan: owner replay per ref shard, edges per owned manifest.
-    const auto universe = discoverUniverse();
+    auto universe = discoverUniverse();
+    {
+        /// I2 (review): `discoverUniverse` alone makes this disaster-recovery command depend solely on
+        /// the object most likely to be the casualty it exists to recover from -- a damaged/absent
+        /// catalog leaves it nothing to rebuild. Recovery is the one place a LIST may still ADD to the
+        /// universe (never subtract, matching `discoverUniverse`'s own pre-Stage-B doc): a pool-wide LIST
+        /// of `cas/refs/` that finds a life the catalog does not currently name is added here. Safe
+        /// specifically because `rebuildBaseline` never deletes -- a life added from stale/dead debris
+        /// costs one harmless rebuilt coverage row, never a wrongful reclaim.
+        std::set<std::pair<String, UInt128>> already_known;
+        for (const NamespaceLifeId & life : universe)
+            already_known.emplace(life.ns.string(), life.incarnation);
+        for (const String & key : enumerateRefPrefix().keys)
+        {
+            std::optional<NamespaceLifeId> id;
+            if (const auto ckpt_id = layout.parseRefCkptKey(key))
+                id = ckpt_id;
+            else if (const auto parsed = parseRefObjectKeyForEnumeration(layout, key))
+                id = parsed->id;
+            if (id && already_known.emplace(id->ns.string(), id->incarnation).second)
+                universe.push_back(*id);
+        }
+    }
     std::set<String> seen_ns;
     std::set<String> owned_manifest_keys;
     CasFoldSeal seal;
