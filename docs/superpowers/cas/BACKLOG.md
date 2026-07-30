@@ -3007,3 +3007,27 @@ pushed into a bare `std::vector<CasEvent>` while being called from background th
 sites; there are three, and **all three carry the same comment about outliving "the background syncer's
 emits"** — so every one of them knew the sink runs on other threads and none synchronised. When a hazard
 comment is copied along with the code, the copies inherit the hazard and not the fix.
+
+## RULE: changing a returned element type silently re-binds every `auto & [a, b]` at its call sites {#rule-structured-binding-silent-rebind}
+
+Found 2026-07-30 during Task 4-C, and it is the sharpest defect shape we have seen: introduced by a
+change, located in code the change did not touch, and invisible in the diff at the site where it went
+wrong.
+
+`gtest_cas_gc_shard_incarnation.cpp`'s `DiscoveryEqualsPresentShards` iterated
+`for (const auto & [ns, shard] : universe)`. Task 4-C changed `discoverUniverse`'s element type to
+`NamespaceLifeId` — a two-field struct, not a pair. **That still compiles**, because C++17 destructuring
+works on any aggregate whose public member count matches, so `shard` silently became `.incarnation` and
+the comparison `shard == 0` could never be true against a nonzero incarnation. No compile error, no
+warning, and nothing in the changed files to review.
+
+**The rule: when you change what a function RETURNS — element type, member count, member order — grep
+every call site for destructuring (`auto & [`, `auto [`) and read each one.** A rename or a signature
+change gets a compiler error; an aggregate reshape does not. Member ORDER matters too: swapping two
+same-typed members re-binds every destructuring silently and changes nothing else.
+
+**And the corollary for reviewers:** a diff that changes a return type is a diff whose blast radius is
+NOT in the diff. Ask what destructures it.
+
+Related in kind: `{#rule-no-chassert-over-handled-branch}` — both are cases where the compiler's silence
+is mistaken for the code's agreement.
