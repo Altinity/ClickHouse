@@ -34,6 +34,7 @@ namespace DB::ErrorCodes
 extern const int ABORTED;
 extern const int FILE_DOESNT_EXIST;
 extern const int CORRUPTED_DATA;
+extern const int INVALID_STATE;
 extern const int LOGICAL_ERROR;
 extern const int NETWORK_ERROR;
 extern const int S3_ERROR;
@@ -922,10 +923,8 @@ TEST(RefWriterAppendLane, WedgedRefLaneCountTracksExactlyTheWedgedTableThroughIt
 /// until somebody remounted by hand. So there are two separate scopes to keep straight, and this test
 /// pins both:
 ///   the FENCE is mount-wide -- while it is closed EVERY lane is refused, including untouched ones;
-///   the DAMAGE is per-namespace -- once the mount is live again the damaged table re-derives the very
-///   id the foreign object took and hits the same proven conflict (it never mints a higher id and
-///   appends past a hole in its own stream; that table recovers only under a fresh mount incarnation,
-///   whose new writer epoch starts a new key namespace), while the unrelated table commits normally.
+///   the DAMAGE is per-namespace -- re-arming the test fence does not replace the damaged runtime, so
+///   that lane remains `Faulted` until a real remount, while the unrelated table commits normally.
 TEST(RefWriterAppendLane, I1AppendCorruptionSurfacesAndFencesTheMountForRemount)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
@@ -943,6 +942,7 @@ TEST(RefWriterAppendLane, I1AppendCorruptionSurfacesAndFencesTheMountForRemount)
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { store->dropRef(ns, "x"); });
     EXPECT_FALSE(store->refLaneWedgedForTest(ns)) << "a proven different-object conflict must not wedge the lane";
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Faulted);
     EXPECT_FALSE(store->mayMutate()) << "the impossible-interference reaction must fence this mount closed";
     EXPECT_EQ(store->scheduleRemountCallCountForTest(), 1u)
         << "the append site must schedule the remount that re-derives this table from the durable log";
@@ -954,12 +954,12 @@ TEST(RefWriterAppendLane, I1AppendCorruptionSurfacesAndFencesTheMountForRemount)
         << "the independent-table append hung -- the queue's leader bookkeeping was not restored";
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { fenced.get(); });
 
-    /// Stand in for the scheduled remount, then re-check the per-namespace half.
+    /// Re-arm only the mount fence, then re-check that the fault stays local to this runtime.
     DB::Cas::tests::rearmMountFenceAfterAnomalyForTest(store);
     auto same = std::async(std::launch::async, [&] { store->dropRef(ns, "x"); });
     ASSERT_EQ(same.wait_for(std::chrono::seconds(10)), std::future_status::ready)
         << "the same-table append hung -- the queue's leader bookkeeping was not restored";
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { same.get(); });
+    expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&] { same.get(); });
     EXPECT_TRUE(store->resolveRef(ns, "x").has_value()) << "the refused drop must not have taken effect";
 
     DB::Cas::tests::rearmMountFenceAfterAnomalyForTest(store);
@@ -971,7 +971,7 @@ TEST(RefWriterAppendLane, I1AppendCorruptionSurfacesAndFencesTheMountForRemount)
 }
 
 /// Wedge-resolve-site foreign interference: a wedged lane whose key a foreign writer overwrote must
-/// surface the anomaly to the triggering caller AND KEEP the wedge (fail closed), without hanging.
+/// surface the anomaly to the triggering caller and fault the lane, without hanging.
 /// rev.6 Task 11 (spec §anomaly-policy): under the mount-lease exclusivity model this is no longer a
 /// possible protocol outcome (the wedged key is exclusively ours) -- it routes through
 /// `reportImpossibleInterference`, which fences the mount and schedules a remount.
@@ -981,7 +981,7 @@ TEST(RefWriterAppendLane, I1AppendCorruptionSurfacesAndFencesTheMountForRemount)
 /// builds, so the whole test had to be release-only with a death-test twin standing in elsewhere.
 /// Storage-controlled input must never be able to abort the server, so the arm now reports the
 /// occupant for what it is -- corruption -- and one test covers every build.
-TEST(RefWriterAppendLane, I1WedgeResolveCorruptionSurfacesAndKeepsWedge)
+TEST(RefWriterAppendLane, I1WedgeResolveCorruptionSurfacesAndFaultsLane)
 {
     CasRequestBudget budget;
     budget.max_attempts = 1;
@@ -1003,7 +1003,7 @@ TEST(RefWriterAppendLane, I1WedgeResolveCorruptionSurfacesAndKeepsWedge)
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
 
     /// A foreign writer lands a DIFFERENT object at the exact wedged key; the next append's wedge resolve
-    /// observes the mismatch and must raise CORRUPTED_DATA to that caller while keeping the wedge.
+    /// observes the mismatch and must raise `CORRUPTED_DATA` to that caller while faulting the lane.
     const String wedged_key = store->wedgedKeyForTest(ns);
     ASSERT_FALSE(wedged_key.empty());
     ASSERT_EQ(backend->putIfAbsent(wedged_key, "a-different-object").outcome, PutOutcome::Done);
@@ -1015,11 +1015,13 @@ TEST(RefWriterAppendLane, I1WedgeResolveCorruptionSurfacesAndKeepsWedge)
     ASSERT_EQ(fut.wait_for(std::chrono::seconds(10)), std::future_status::ready)
         << "the wedge-resolve anomaly hung the queue instead of surfacing to the caller";
     fut.get();
-    EXPECT_TRUE(store->refLaneWedgedForTest(ns)) << "foreign interference at the wedged key must keep the lane wedged (fail closed)";
+    EXPECT_FALSE(store->refLaneWedgedForTest(ns));
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Faulted)
+        << "foreign interference is a terminal lane verdict";
 
     /// The queue's leader bookkeeping was restored, so a SUBSEQUENT same-table caller does not hang: it
-    /// re-hits the kept wedge and again surfaces the anomaly, but promptly (a real cv hang would time
-    /// out this bounded wait). This is the leg the unfixed code left blocked forever.
+    /// observes the terminal state and returns promptly (a real cv hang would time out this bounded
+    /// wait). This is the leg the unfixed code left blocked forever.
     auto fut2 = std::async(std::launch::async, [&]
     {
         try
@@ -1040,7 +1042,7 @@ TEST(RefWriterAppendLane, I1WedgeResolveCorruptionSurfacesAndKeepsWedge)
 /// rev.6 Task 11: wedge hard contract + anomaly policy (spec §anomaly-policy)
 /// ===================================================================================
 
-/// Foreign bytes at a wedge key (see `I1WedgeResolveCorruptionSurfacesAndKeepsWedge` above for the
+/// Foreign bytes at a wedge key (see `I1WedgeResolveCorruptionSurfacesAndFaultsLane` above for the
 /// hang-freedom coverage) must ALSO trip the local write fence closed and audit a `ForeignInterference`
 /// event -- the full anomaly-policy reaction, not just the throw. It runs in every build now that the
 /// arm reports `CORRUPTED_DATA` instead of the process-aborting `LOGICAL_ERROR`; the death twin that
@@ -1080,7 +1082,9 @@ TEST(CasAnomalyPolicy, ForeignBytesAtWedgeKeyTripFenceAndRemount)
     /// and a ForeignInterference event is audited.
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { store->dropRef(ns, "y"); });
 
-    EXPECT_TRUE(store->refLaneWedgedForTest(ns)) << "foreign interference must keep the wedge (fail closed)";
+    EXPECT_FALSE(store->refLaneWedgedForTest(ns));
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Faulted)
+        << "foreign interference must fault the lane";
     EXPECT_FALSE(store->mayMutate()) << "the local write fence must trip closed on the anomaly";
     /// Positively pins that `reportImpossibleInterference` called `scheduleRemount` (not just
     /// `tripMountLost`, which alone already accounts for `mayMutate() == false` above). Counted at
@@ -1097,19 +1101,10 @@ TEST(CasAnomalyPolicy, ForeignBytesAtWedgeKeyTripFenceAndRemount)
     EXPECT_TRUE(has_event) << "a ForeignInterference CasEvent must be audited";
 }
 
-/// The wedge hard contract's release-mode guard: an internal state where `rt->wedge` is STILL set at
-/// the new-id-allocation point (provably unreachable via any legitimate control flow -- the
-/// top-of-flush wedge-resolution block either clears it or returns the whole batch closed) must refuse
-/// to allocate rather than mint an id against a lane that might still be uncertain. Simulated by forcing
-/// the wedge directly via `setRefPreCarveHookForTest`'s injection point (AFTER the top-of-flush
-/// wedge-resolution check has already run clean, BEFORE the batch is carved).
-#ifndef DEBUG_OR_SANITIZER_BUILD
-/// dropRef below throws LOGICAL_ERROR (the wedge hard contract's release-mode guard), which aborts
-/// the whole process in debug/sanitizer builds instead of behaving like a catchable exception --
-/// CasAnomalyPolicyDeathTest.WedgeContractReleaseFailClosedAborts below proves the abort positively
-/// in those builds instead (it cannot also re-check the post-abort state this test verifies, since
-/// there IS no post-abort state in a real debug/sanitizer build).
-TEST(CasAnomalyPolicy, WedgeContractReleaseFailClosed)
+/// An impossible non-`Ready` state at new-id allocation must refuse before minting an id, fault the
+/// lane, and trigger the anomaly policy. The synthetic wedge is injected after the top-of-flush
+/// resolver gate, so it represents an internal lifecycle contradiction rather than a normal wedge.
+TEST(CasAnomalyPolicy, NonReadyAtNewIdAllocationFaultsAndFailsClosed)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     std::vector<CasEvent> seen;   /// declared BEFORE the Pool so it outlives the background syncer's emits (ASan 2026-07-09)
@@ -1151,9 +1146,11 @@ TEST(CasAnomalyPolicy, WedgeContractReleaseFailClosed)
     ASSERT_TRUE(store->mayMutate()) << "the fence must be armed BEFORE the wedge-contract violation, or the guard would trivially pass for the wrong reason";
     ASSERT_EQ(store->scheduleRemountCallCountForTest(), 0u) << "no remount must have been scheduled yet";
 
-    expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&] { store->dropRef(ns, "x"); });
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
 
     EXPECT_EQ(countLogObjects(), log_objects_before) << "the release guard must refuse before allocating/PUTting a new _log object";
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Faulted)
+        << "the invariant violation must have one explicit terminal state";
     EXPECT_FALSE(store->mayMutate()) << "the local write fence must trip closed on the wedge-contract violation";
     /// See the sibling test's comment on why this checks the call-count seam (never `background_watermark`
     /// + a real thread -- that combination makes the store's self-remount race its own still-live keeper).
@@ -1164,22 +1161,6 @@ TEST(CasAnomalyPolicy, WedgeContractReleaseFailClosed)
         [](const CasEvent & e) { return e.type == CasEventType::ForeignInterference; });
     EXPECT_TRUE(has_event) << "a ForeignInterference CasEvent must be audited";
 }
-#endif
-
-#if defined(DEBUG_OR_SANITIZER_BUILD)
-TEST(CasAnomalyPolicyDeathTest, WedgeContractReleaseFailClosedAborts)
-{
-    auto backend = std::make_shared<RefWriterTestBackend>();
-    auto store = openPool(backend);
-    const RootNamespace ns{"srv1/wedge_contract"};
-    publishEmptyPart(store, ns, "x");
-    store->setRefPreCarveHookForTest([&]
-    {
-        store->forceWedgeForTest(ns, /*writer_epoch*/ 1, /*ref_sequence*/ 1, "bogus/_log/key", "bogus-bytes");
-    });
-    EXPECT_DEATH({ store->dropRef(ns, "x"); }, "");
-}
-#endif
 
 /// I3: a conditional write whose attempt classified Committed but whose FINAL post-write fence check
 /// failed (the mount fence was lost after the write may have landed) is counted separately, not folded

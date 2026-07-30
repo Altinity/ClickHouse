@@ -155,7 +155,6 @@ void RefTableState::swap(RefTableState & other) noexcept
     swap(lifecycle, other.lifecycle);
     swap(remove_txn_id, other.remove_txn_id);
     swap(greatest_applied, other.greatest_applied);
-    swap(durable_floor, other.durable_floor);
     committed.swap(other.committed);
     precommits.swap(other.precommits);
     owned_manifests.swap(other.owned_manifests);
@@ -470,10 +469,9 @@ void RefTableState::applyTxnInPlace(const RefLogTxn & txn)
     if (const RefTxnId expected = nextTxnId(txn.txn_id.writer_epoch); txn.txn_id != expected)
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "RefTableState: txn_id {}-{} does not continue the ref-log stream — the greatest applied id "
-            "is {}-{} (durable floor {}-{}), so the only contiguous successor is {}-{}",
+            "is {}-{}, so the only contiguous successor is {}-{}",
             txn.txn_id.writer_epoch, txn.txn_id.ref_sequence,
             greatest_applied.writer_epoch, greatest_applied.ref_sequence,
-            durable_floor.writer_epoch, durable_floor.ref_sequence,
             expected.writer_epoch, expected.ref_sequence);
 
     /// INV-2's CONTEXTUAL seal grammar, on the read side. `prev_epoch_seal` is required on exactly

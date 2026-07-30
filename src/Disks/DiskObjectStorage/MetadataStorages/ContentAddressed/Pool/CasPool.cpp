@@ -1634,9 +1634,9 @@ void Pool::setLastEpochSealForTest(const RootNamespace & ns, const std::optional
     ref_ledger.setLastEpochSealForTest(ns, seal);
 }
 
-RefApplyState Pool::applyStateForTest(const RootNamespace & ns)
+RefLaneState Pool::laneStateForTest(const RootNamespace & ns)
 {
-    return ref_ledger.applyStateForTest(ns);
+    return ref_ledger.laneStateForTest(ns);
 }
 
 bool Pool::needsStalePrecommitSweepForTest(const RootNamespace & ns)

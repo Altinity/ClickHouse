@@ -50,7 +50,6 @@
 
 namespace ProfileEvents
 {
-extern const Event CasRefWedgeFloorReconciled;
 extern const Event CasRefAppendSealRejected;
 extern const Event CasRefAppendOccupantUnreadable;
 extern const Event CasRefAppendWedged;
@@ -360,7 +359,7 @@ TEST(CasRefWedgeEveryAttempt, AmbiguousPutWedgesTheLaneAndTheNextFlushsCreateAdo
     EXPECT_TRUE(backend->get(wedged_key).has_value()) << "the wedged transaction is durable at its own key";
     EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), tail_before + 2)
         << "the adopted wedge and the ordinary commit must each join the tail exactly once";
-    EXPECT_EQ(store->applyStateForTest(ns), RefApplyState::Clean);
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Ready);
 }
 
 /// The other adoption input, and the one that proves the identity rule is about BYTES: our own
@@ -427,7 +426,7 @@ TEST(CasRefWedgeEveryAttempt, DefiniteRefusalOfARetryAttemptKeepsTheLaneWedged)
     EXPECT_EQ(store->wedgedKeyForTest(ns), wedged_key) << "the SAME wedge, not a fresh one";
     EXPECT_TRUE(store->resolveRef(ns, "x").has_value()) << "nothing was adopted";
     EXPECT_FALSE(backend->get(wedged_key).has_value()) << "and nothing became durable";
-    EXPECT_EQ(store->applyStateForTest(ns), RefApplyState::ApplyPending)
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Wedged)
         << "a wedged lane's steady state is 'may be durable, not applied'";
 
     /// Still the same id afterwards: the definite refusal consumed nothing.
@@ -489,7 +488,7 @@ TEST(CasRefWedgeEveryAttempt, ADefiniteRefusalCannotSpeakForAnEarlierAmbiguousAt
 }
 
 /// The ledger-side twin of the same call: what the append lane does with that verdict. On
-/// `DefiniteFailure` it clears the apply-pending marker and tells its callers the txn id was never used,
+/// `DefiniteFailure` it returns the lane to `Ready` and tells callers the txn id was never used,
 /// so the next append re-derives that id -- which, with an earlier attempt still possibly in flight, is
 /// how an acked-then-lost transaction gets written around. The lane must wedge instead and stay pending
 /// until the key itself resolves.
@@ -516,7 +515,7 @@ TEST(CasRefWedgeEveryAttempt, ADefiniteRefusalAfterAnAmbiguousAttemptOfTheSameCa
 
     EXPECT_TRUE(store->refLaneWedgedForTest(ns))
         << "one call whose first attempt is unresolved leaves an object that may become durable";
-    EXPECT_EQ(store->applyStateForTest(ns), RefApplyState::ApplyPending)
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Wedged)
         << "the id must NOT be declared never-used: the marker stands until the key itself resolves";
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasRefAppendDefiniteFailure].load(), definite_before)
         << "this append was never definitively rejected -- only one of its attempts was";
@@ -531,7 +530,7 @@ TEST(CasRefWedgeEveryAttempt, ADefiniteRefusalAfterAnAmbiguousAttemptOfTheSameCa
     EXPECT_FALSE(store->refLaneWedgedForTest(ns));
     EXPECT_FALSE(store->resolveRef(ns, "x").has_value()) << "the adopted wedge applied its drop";
     EXPECT_FALSE(store->resolveRef(ns, "y").has_value());
-    EXPECT_EQ(store->applyStateForTest(ns), RefApplyState::Clean);
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Ready);
 #endif
 }
 
@@ -574,8 +573,8 @@ TEST(CasRefWedgeEveryAttempt, SuccessorSealAtTheWedgedKeyRejectsConclusivelyAndS
     EXPECT_FALSE(store->refLaneWedgedForTest(ns)) << "a conclusive rejection clears the wedge";
     EXPECT_TRUE(store->resolveRef(ns, "x").has_value()) << "the rejected transaction was never applied";
     EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), tail_before) << "and never joined the tail";
-    EXPECT_EQ(store->applyStateForTest(ns), RefApplyState::Clean)
-        << "the seal PROVES our bytes never landed, so no apply is owed";
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Closed)
+        << "the successor seal closes this epoch's lane";
     ASSERT_EQ(store->lastEpochSealForTest(ns), std::make_optional(seal_id))
         << "the observed seal is this namespace's epoch-closing record";
 
@@ -595,16 +594,11 @@ TEST(CasRefWedgeEveryAttempt, SuccessorSealAtTheWedgedKeyRejectsConclusivelyAndS
     EXPECT_EQ(store->scheduleRemountCallCountForTest(), remounts_before)
         << "and must not schedule a remount";
 
-    /// The lane resumes in the successor epoch's terms: the next id is the seal's successor there,
-    /// i.e. sequence 1 of the new epoch -- and it carries the seal on the wire (the INV-2 chain).
+    /// Merely changing the epoch counters does not reopen a cached runtime. Production reaches a new
+    /// epoch through remount, which replaces the runtime and recovers its chain link.
     bumpFenceGeneration(store, epoch + 1);
-    EXPECT_NO_THROW(store->dropRef(ns, "y"));
-
-    const RefTxnId resumed{epoch + 1, 1};
-    const RefLogTxn written = readRefLogTxn(*backend, layout, ns, resumed);
-    EXPECT_EQ(written.prev_epoch_seal, std::make_optional(seal_id))
-        << "the first transaction of a non-genesis epoch must name the seal that closed the previous one";
-    EXPECT_FALSE(store->resolveRef(ns, "y").has_value());
+    expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&] { store->dropRef(ns, "y"); });
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Closed);
 }
 
 /// The wire round trip of the same rule, driven from the OTHER producer of `last_epoch_seal`:
@@ -686,7 +680,8 @@ TEST(CasRefWedgeEveryAttempt, ForeignNonSealOccupantIsCorruptedDataAndSchedulesA
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { store->dropRef(ns, "y"); });
 
-    EXPECT_TRUE(store->refLaneWedgedForTest(ns)) << "the wedge is kept for inspection on this arm";
+    EXPECT_FALSE(store->refLaneWedgedForTest(ns));
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Faulted);
     EXPECT_GT(store->scheduleRemountCallCountForTest(), remounts_before)
         << "the impossible-interference route must schedule a remount";
 }
@@ -846,17 +841,9 @@ TEST(CasRefWedgeEveryAttempt, ResultReleasedAfterTheWedgeIdentityChangedIsInert)
     EXPECT_TRUE(store->resolveRef(ns, "x").has_value());
 }
 
-/// ===================================================================================
-/// Durable-floor reconciliation
-/// ===================================================================================
-
-/// The one interleaving where a wedge outlives its own resolution: the adoption install itself threw,
-/// which raised the durable floor over the wedged id (the transaction IS durable and this cache will
-/// never contain it -- that is what `Poisoned` says) and left the wedge in place. The NEXT resolution
-/// must recognise that the transaction is already accounted for and clear the wedge WITHOUT
-/// re-applying it. Re-applying is not merely wasteful: the id now sits AT the floor, so the candidate
-/// apply would reject it and the lane would stay wedged for the runtime's life.
-TEST(CasRefWedgeEveryAttempt, WedgedIdAlreadyCoveredByTheDurableFloorIsFloorReconciled)
+/// A resolution that proves the exact attempt durable but cannot install it has one successor:
+/// `NeedsRecovery`. It drops the attempt and forbids another write until replay catches the cache up.
+TEST(CasRefWedgeEveryAttempt, KnownDurableInstallFailureMovesDirectlyToRecovery)
 {
     auto backend = std::make_shared<LandedButAckLostOnceBackend>();
     backend->fired = true;   /// disarmed while the fixture is built (see the adoption test above)
@@ -872,44 +859,23 @@ TEST(CasRefWedgeEveryAttempt, WedgedIdAlreadyCoveredByTheDurableFloorIsFloorReco
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
     const String wedged_key = store->wedgedKeyForTest(ns);
     ASSERT_TRUE(backend->get(wedged_key).has_value()) << "the wedged transaction is durable";
-    const size_t tail_before = store->tailSinceSnapshotCountForTest(ns);
-
-    /// The adoption reaches its install region and the install throws: floor raised, table poisoned,
-    /// wedge still there.
+    /// The adoption reaches its install region and the install throws.
     armOneShotInstallFailure(store);
     expectThrowsCode(DB::ErrorCodes::MEMORY_LIMIT_EXCEEDED, [&] { store->dropRef(ns, "y"); });
     store->setInstallRegionProbeForTest(nullptr);
-    ASSERT_EQ(store->applyStateForTest(ns), RefApplyState::Poisoned);
-    ASSERT_TRUE(store->refLaneWedgedForTest(ns)) << "the failed install left the wedge in place";
-    ASSERT_EQ(store->tailSinceSnapshotCountForTest(ns), tail_before) << "and installed nothing";
+    ASSERT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
+    ASSERT_FALSE(store->refLaneWedgedForTest(ns))
+        << "known durability transfers ownership to recovery; no uncertain attempt remains";
+    /// Do not call the tail-count seam here: it intentionally forces recovery, which is the transition
+    /// this assertion is proving has not happened yet.
 
-    /// The next flush reconciles against the floor instead of re-applying, and the lane runs again.
-    /// The OUTCOME itself is asserted, not just its side effects: `FloorReconciled` is a distinct
-    /// resolution from `Adopted` precisely because nothing is installed and no tail counter moves, so a
-    /// test that checked only "unwedged and not applied" would pass just as well if the arm had been
-    /// folded back into the adoption path.
-    const uint64_t reconciled_before = ProfileEvents::global_counters[ProfileEvents::CasRefWedgeFloorReconciled].load();
+    /// The next flush first replays the durable drop of `x`, then admits the drop of `y`.
     EXPECT_NO_THROW(store->dropRef(ns, "y"));
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasRefWedgeFloorReconciled].load(), reconciled_before + 1)
-        << "the wedge must be retired through the FloorReconciled outcome, not adopted";
-
-    EXPECT_FALSE(store->refLaneWedgedForTest(ns)) << "the wedge is retired: the floor already accounts for it";
-
-    /// Everything above still describes the POISONED table: `refLaneWedgedForTest` and the counter read
-    /// the runtime without recovering, and the flush that reconciled the floor did not re-recover either
-    /// -- a wedge blocks that, deliberately, because a wedge's durability is undecided and no amount of
-    /// reading settles it.
-    ///
-    /// The first ordinary READ after the wedge is gone is a different matter, and it is where the repair
-    /// happens: nothing blocks re-recovery any more, so the arithmetic walk re-derives the stranded
-    /// transaction from the durable log. The floor was only ever the bridge over an id this cache was
-    /// missing; the walk is what stops it being missing.
     EXPECT_FALSE(store->resolveRef(ns, "x").has_value())
-        << "the stranded drop of 'x' was durable all along -- the re-derivation is what finally applies it";
-    EXPECT_FALSE(store->resolveRef(ns, "y").has_value()) << "and the lane's own later drop stands";
-    EXPECT_EQ(store->applyStateForTest(ns), RefApplyState::Clean)
-        << "the poison clears ONLY through a completed install, and this one installed a state re-derived "
-           "from the durable log";
+        << "replay must install the already-durable drop of `x` before the next write";
+    EXPECT_FALSE(store->resolveRef(ns, "y").has_value());
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Ready)
+        << "only completed replay returns the lane to Ready";
 }
 
 /// ===================================================================================
@@ -957,7 +923,7 @@ TEST(CasRefWedgeEveryAttempt, AppendSiteMeetingASuccessorSealIsAConclusiveReject
 /// NEITHER: fencing the mount would be a guess, and reporting a conclusive rejection would acknowledge
 /// a deposition nobody observed. The id is not consumed, so the next attempt re-derives it and
 /// classifies again — deferring costs one round trip and decides nothing wrongly.
-TEST(CasRefWedgeEveryAttempt, AppendSiteDefersWhenTheOccupantCannotBeRead)
+TEST(CasRefWedgeEveryAttempt, AppendSiteFaultsWhenTheOccupantCannotBeRead)
 {
     auto backend = std::make_shared<WedgeTestBackend>();
     auto store = openPool(backend);
@@ -977,20 +943,17 @@ TEST(CasRefWedgeEveryAttempt, AppendSiteDefersWhenTheOccupantCannotBeRead)
     backend->fail_get_count = 1;
 
     const uint64_t deferred_before = ProfileEvents::global_counters[ProfileEvents::CasRefAppendOccupantUnreadable].load();
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { store->dropRef(ns, "x"); });
 
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasRefAppendOccupantUnreadable].load(), deferred_before + 1)
         << "the deferral is the one quiet arm here -- it must be counted or a starved loud path is invisible";
-    EXPECT_TRUE(store->mayMutate()) << "an unread occupant must not fence the mount on a guess";
+    EXPECT_TRUE(store->mayMutate()) << "the table faults without guessing that the whole mount is corrupt";
     EXPECT_EQ(store->scheduleRemountCallCountForTest(), remounts_before) << "nor schedule a remount";
     EXPECT_EQ(store->lastEpochSealForTest(ns), std::nullopt)
         << "nor record a deposition that was never actually observed";
     EXPECT_FALSE(store->refLaneWedgedForTest(ns)) << "nothing of ours became durable, so nothing is wedged";
-
-    /// The id was not consumed: the retry re-derives it, reads the occupant successfully this time, and
-    /// reaches the verdict the first attempt deferred.
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Faulted);
     expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&] { store->dropRef(ns, "x"); });
-    EXPECT_EQ(store->lastEpochSealForTest(ns), std::make_optional(next));
 }
 
 /// A WELL-FORMED ref-log transaction of this namespace at this id, which simply is not a seal, must be

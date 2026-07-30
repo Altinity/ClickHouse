@@ -35,6 +35,7 @@ namespace DB::ErrorCodes
 {
 extern const int BAD_ARGUMENTS;
 extern const int FILE_DOESNT_EXIST;
+extern const int INVALID_STATE;
 extern const int LOGICAL_ERROR;
 extern const int NOT_IMPLEMENTED;
 extern const int ABORTED;
@@ -1759,7 +1760,7 @@ namespace
 /// makes `putIfAbsentControlled`'s resolve-before-reissue observe a real conflict and throw
 /// CORRUPTED_DATA -- a CONCLUSIVE rejection ("do NOT wedge: the cache is unchanged and nothing of ours
 /// is durable", CasRefLedger.cpp's `commitRefChunk`), unlike a genuinely-ambiguous timeout, which would
-/// instead WEDGE the whole table's append lane (`rt->wedge`) until the SAME key resolves durable -- a
+/// instead WEDGE the whole table's append lane (`rt->append_attempt`) until the SAME key resolves durable -- a
 /// state a one-shot fault can never itself clear, since wedge resolution only re-GETs the intended key
 /// and never re-PUTs it (proven by
 /// `RefWriterAppendLane.WedgedLaneBlocksSameTableWhileOtherTableProceeds`). A conflict leaves the cached
@@ -1811,20 +1812,15 @@ TEST(CasPartWriteTxn, AbandonRetryableAfterAppendFailure)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { build->abandon(); });
 
     /// The proven conflict fences the mount closed and schedules a remount (the append site routes
-    /// through the anomaly policy exactly as the wedge-resolve site does), so stand in for that remount
-    /// -- a unit-test Pool runs none -- or the second abandon below would be refused at the fence gate
-    /// instead of reaching the append, and this test would stop exercising what it is about.
+    /// through the anomaly policy exactly as the wedge-resolve site does). Re-arming only the test
+    /// fence does not replace this runtime, so its terminal `Faulted` lane remains blocked.
     DB::Cas::tests::rearmMountFenceAfterAnomalyForTest(s);
 
     /// The retryability under test: the SAME object accepts a second abandon() -- `alive` was not
-    /// flipped by the failed append, so this is NOT the LOGICAL_ERROR "has been abandoned" the unfixed
-    /// code produced. It reaches the append and fails there, on the same proven conflict: under INV-1 the
-    /// ref-log id is derived from the table's own greatest applied id, so the retry addresses the very
-    /// key the foreign object took, rather than skipping to a fresh id and leaving a hole in this
-    /// table's stream. (A table whose next log key holds a foreign object is corrupt; it recovers under a
-    /// fresh mount incarnation's writer epoch, which starts a new key namespace -- not by writing past
-    /// the damage.)
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { build->abandon(); });
+    /// flipped by the failed append, so this is not the "has been abandoned" condition the unfixed code
+    /// produced. It reaches the lane and is refused by its terminal `Faulted` state; only a real remount
+    /// may replace that state.
+    expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&] { build->abandon(); });
 
     /// The removal never landed, and nothing was written around the occupant: the precommit binding this
     /// build owns is still live, exactly where the failed abandon left it. That is the honest end state

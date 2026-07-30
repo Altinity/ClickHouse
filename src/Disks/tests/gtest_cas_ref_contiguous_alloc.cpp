@@ -327,14 +327,9 @@ TEST(CasRefContiguousAlloc, OldPoolFormatIsRefusedNamingRecreation)
 }
 
 /// The one path where "an attempt that provably sent nothing consumes nothing" does not hold, and the
-/// reason `RefTableState` carries a durable floor at all: a post-durable install failure (spec §A2's
-/// `Poisoned`) SENT its transaction and left it DURABLE — only the install that would have recorded it
-/// threw. Deriving the next id from `greatest_applied` alone would re-derive the stranded id and collide
-/// with our own object, which the controller reports as foreign interference: a fence, exactly where
-/// §A2 promises an assert layer. The floor makes the next transaction land ABOVE the stranded one, so
-/// the DURABLE stream stays dense (…, 5, 6, …) even though this cache is missing 5 — which is precisely
-/// what `Poisoned` says about it.
-TEST(CasRefContiguousAlloc, PostDurableInstallFailureAllocatesPastTheStrandedId)
+/// A known-durable install failure must replay before the next id is derived. Replay installs the
+/// stranded transaction, so the next append derives its real contiguous successor.
+TEST(CasRefContiguousAlloc, NeedsRecoveryReplaysBeforeAllocatingTheNextId)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPool(backend);
@@ -345,7 +340,7 @@ TEST(CasRefContiguousAlloc, PostDurableInstallFailureAllocatesPastTheStrandedId)
 
     /// One-shot throw inside the post-durable install region: txn {epoch, 2} commits durably and is
     /// never installed. The exception is built OUTSIDE the region (building it inside would trip
-    /// `DENY_ALLOCATIONS_IN_SCOPE` and test the guard instead of the poison).
+    /// `DENY_ALLOCATIONS_IN_SCOPE` and test the guard instead of the recovery transition).
     auto planned = std::make_exception_ptr(DB::Exception(DB::ErrorCodes::MEMORY_LIMIT_EXCEEDED,
         "simulated allocation failure inside the post-durable install region"));
     auto fired = std::make_shared<std::atomic<bool>>(false);
@@ -359,40 +354,26 @@ TEST(CasRefContiguousAlloc, PostDurableInstallFailureAllocatesPastTheStrandedId)
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::MEMORY_LIMIT_EXCEEDED,
         [&] { publishRef(store, ns, "ref_2", 2); });
     store->setInstallRegionProbeForTest(nullptr);
-    ASSERT_EQ(store->applyStateForTest(ns), RefApplyState::Poisoned);
+    ASSERT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
 
-    /// The next append lands at {epoch, 3} -- PAST the stranded {epoch, 2}, not on it -- and really
-    /// commits. Without the floor it would re-derive {epoch, 2} and fail on its own durable object.
+    /// The next append first recovers `{epoch, 2}`, then lands at `{epoch, 3}`.
     EXPECT_EQ(publishRef(store, ns, "ref_3", 3), (RefTxnId{epoch, 3}))
         << "the stranded transaction is durable, so the next id must be its successor, not itself";
     EXPECT_TRUE(store->resolveRef(ns, "ref_3", /*allow_stale=*/false).has_value())
-        << "a poisoned table keeps ACCEPTING work (spec §A2: an assert layer, not a fence)";
+        << "the append may proceed only after recovery has repaired the cached state";
 
-    /// The id above is right for a STRONGER reason than the floor: that flush's own recovery re-derived
-    /// the stranded transaction from the durable log first, so `{epoch, 2}` is applied rather than merely
-    /// skipped over, and the poison is repaired by the install of that state.
-    ///
-    /// The FLOOR is still what makes the derivation honest, and it is still load-bearing -- just not
-    /// here. Its remaining consumer is the one place re-recovery is deliberately blocked: a table that is
-    /// poisoned AND wedged, where the wedge's durability is undecided. That is
-    /// `CasRefWedgeEveryAttempt.WedgedIdAlreadyCoveredByTheDurableFloorIsFloorReconciled`.
     EXPECT_TRUE(store->resolveRef(ns, "ref_2", /*allow_stale=*/false).has_value())
         << "the stranded transaction is back in this cache, which is what repairs the divergence";
-    EXPECT_EQ(store->applyStateForTest(ns), RefApplyState::Clean);
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Ready);
 
-    /// The durable stream itself is dense: 1, 2 (stranded), 3 all exist as objects. Only this cache is
-    /// missing 2, which is what the poison marks -- so a fresh reader replaying the log sees no hole.
+    /// The durable stream itself is dense: `1`, `2`, `3` all exist as objects.
     for (uint64_t seq = 1; seq <= 3; ++seq)
         EXPECT_TRUE(backend->head(store->layout().refLogKey(ns, RefTxnId{epoch, seq})).exists)
             << "log object " << epoch << "-" << seq << " must exist: the durable stream has no hole";
 }
 
-/// The other half of the poisoned contract: a poisoned table keeps ACCEPTING appends, but it must never
-/// PUBLISH. Its `greatest_applied` is now above the stranded transaction (the durable floor moved the
-/// next append past it), so a snapshot labelled with it would claim to cover a transaction its body does
-/// not contain -- and every future recovery selecting that snapshot would skip the stranded transaction
-/// forever. A divergence confined to one runtime's cache would become durable and permanent.
-TEST(CasRefContiguousAlloc, PoisonedTableRefusesToPublishASnapshot)
+/// Snapshot publication also recovers a `NeedsRecovery` lane before it captures state.
+TEST(CasRefContiguousAlloc, NeedsRecoveryReplaysBeforeSnapshotPublication)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPool(backend);
@@ -418,21 +399,17 @@ TEST(CasRefContiguousAlloc, PoisonedTableRefusesToPublishASnapshot)
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::MEMORY_LIMIT_EXCEEDED,
         [&] { publishRef(store, ns, "ref_2", 2); });
     store->setInstallRegionProbeForTest(nullptr);
-    ASSERT_EQ(store->applyStateForTest(ns), RefApplyState::Poisoned);
+    ASSERT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
 
-    /// The table still takes work (the §A2 contract), and its state advances past the stranded id --
-    /// which is exactly what would make a published snapshot a lie.
+    /// The append entry point replays before admitting this transaction.
     EXPECT_EQ(publishRef(store, ns, "ref_3", 3), (RefTxnId{epoch, 3}));
 
-    /// The refusal this test was written for is now unreachable through the publish entry point, because
-    /// that entry point RECOVERS first and a poisoned table with no wedge repairs itself there. The
-    /// property being protected is unchanged and is asserted in its stronger form: the snapshot that gets
-    /// published is not missing the stranded transaction, because the table is not missing it either.
+    /// Publication is safe because recovery installed the stranded transaction first.
     EXPECT_TRUE(store->trySnapshotPublishOnce(ns));
     EXPECT_TRUE(store->resolveRef(ns, "ref_2", /*allow_stale=*/false).has_value())
         << "the stranded transaction is durable and was re-derived -- publishing is safe precisely "
            "because there is nothing left to omit";
-    EXPECT_EQ(store->applyStateForTest(ns), RefApplyState::Clean);
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Ready);
     EXPECT_NE(store->newestPublishedSnapshotIdForTest(ns), published_before);
 }
 

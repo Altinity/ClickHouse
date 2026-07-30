@@ -147,7 +147,7 @@ struct RefLedgerConfig
 /// consume nothing (the next caller derives the same id from the same unchanged state).
 ///
 /// This is the rule itself, applied to an ANCHOR. Callers do not choose the anchor: they go through
-/// `RefTableState::nextTxnId`, which supplies `max(greatest_applied, durable_floor)` -- the writer to
+/// `RefTableState::nextTxnId`, which derives from `greatest_applied` -- the writer to
 /// mint an id, every trial preview to stamp its throwaway transaction, and `applyTxnInPlace` to decide
 /// whether a transaction's id is admissible. Sharing one rule is deliberate: an allocator and a checker
 /// that each spell it out separately can drift, and a drift here is either a durable hole or a table
@@ -193,29 +193,10 @@ public:
     /// an allocator and a checker that each spell it out separately can drift, and a drift here is
     /// either a durable hole or a table that refuses its own writes.
     ///
-    /// The anchor is `max(greatest_applied, durable_floor)`, not `greatest_applied` alone. See
-    /// `durable_floor` for the one situation where they differ.
     RefTxnId nextTxnId(uint64_t live_epoch) const
     {
-        return nextRefTxnId(std::max(greatest_applied, durable_floor), live_epoch);
+        return nextRefTxnId(greatest_applied, live_epoch);
     }
-
-    /// Records that `id` is DURABLE but is not (and will never be) applied to this state, raising the
-    /// floor monotonically. Allocation-free and non-throwing: the sole caller is a `catch` inside a
-    /// post-durable install region that is about to rethrow, where anything that could fail must not run.
-    void noteDurableIdNotApplied(const RefTxnId & id) noexcept { durable_floor = std::max(durable_floor, id); }
-
-    /// Whether `id` is already accounted for by the durable floor, i.e. whether a previous
-    /// `noteDurableIdNotApplied` already recorded it (or a later id) as durable-but-never-applied here.
-    ///
-    /// The one caller is the wedge resolution's floor reconciliation: a wedge-resolution install that
-    /// threw raised the floor over the wedged id AND left the wedge in place, so the NEXT resolution of
-    /// that same wedge must recognise that the transaction is already accounted for and clear the wedge
-    /// without re-applying it. Without that, the retry rebuilds a candidate whose id sits AT the floor,
-    /// which `applyTxnInPlace` (correctly) rejects -- and the lane stays wedged for the runtime's life.
-    /// A predicate rather than a getter on purpose: "is this id below the floor" is the only question
-    /// anyone outside this class may ask, and it cannot be misused to reconstruct an allocator.
-    bool durableFloorCovers(const RefTxnId & id) const noexcept { return !(durable_floor < id); }
 
     /// State-install point only (once per ref-log flush, never per batch item): folds the committed
     /// map's and the owned-manifest index's COW overlays into their bases -- in place when the base is
@@ -238,25 +219,6 @@ private:
     RefLifecycle lifecycle = RefLifecycle::Removed;   /// see representation note above
     std::optional<RefTxnId> remove_txn_id;
     RefTxnId greatest_applied{};                       /// {0, 0} = no transaction applied yet
-
-    /// The greatest id known DURABLE but not applied here — `{0, 0}` in every healthy state, and raised
-    /// only by a post-durable install failure (spec §A2's `Poisoned` transition), where the object is
-    /// proven durable and the install that would have recorded it threw.
-    ///
-    /// It exists because INV-1 is a property of the DURABLE STREAM, not of one cache's view of it. The
-    /// id derivation would otherwise re-derive the stranded id from `greatest_applied`, and the writer
-    /// would collide with its OWN durable object — reported as foreign interference, and unrecoverable
-    /// for the runtime's life, which is a fence rather than the assert layer §A2 is meant to be. With
-    /// the floor, the next transaction lands ABOVE the stranded one and the durable stream stays dense;
-    /// only this cache is missing a transaction, which is exactly what `Poisoned` says.
-    ///
-    /// It is NOT raised by the wedge install (spec §A2's other region): there the object's durability is
-    /// UNPROVEN, so skipping its id could leave a genuine hole in the durable stream.
-    ///
-    /// Deliberately not part of the table's logical content: `snapshotOf` ignores it, no codec carries
-    /// it, and a fresh recovery starts at `{0, 0}` — the divergence it records is a property of one
-    /// live runtime, and re-deriving the state from the durable log is what actually clears it.
-    RefTxnId durable_floor{};
 
     RefCowMap committed;                                              /// keyed by ref_name
     std::set<std::pair<String, ManifestRef>> precommits;             /// (ref_name, manifest_ref)
@@ -369,10 +331,8 @@ RefTableState stateFromSnapshot(const RefTableSnapshot & snapshot);
 /// Enforced preconditions:
 ///  - `txn.txn_id` must be strictly greater than `state.greatest_applied` AND must be exactly the
 ///    contiguous successor `RefTableState::nextTxnId` derives (INV-1): the next sequence number within
-///    the same writer epoch, or 1 under a greater one, counted from `max(greatest_applied,
-///    durable_floor)`. A hole in a table's DURABLE stream is corruption, not a tolerated allocation
-///    artefact; the floor is why a transaction already durable but never applied here does not read as
-///    one (see `durable_floor`).
+///    the same writer epoch, or 1 under a greater one. A hole in a table's DURABLE stream is corruption,
+///    not a tolerated allocation artefact.
 ///  - `remove_namespace`, if present, must be the transaction's FINAL operation, and every earlier
 ///    operation must be an exact owner-removal `owner_transition` (`old_binding` set, `new_binding`
 ///    empty). The codec does not check this shape; this is the one place

@@ -45,7 +45,7 @@ extern const int MEMORY_LIMIT_EXCEEDED;
 
 namespace ProfileEvents
 {
-extern const Event CasRefApplyPoisoned;
+extern const Event CasRefNeedsRecovery;
 }
 
 using namespace DB::Cas;
@@ -169,15 +169,15 @@ String retryLaterMessageOf(const std::function<void()> & f)
 
 /// Installs a ONE-SHOT throwing probe into the post-durable install regions (spec §A2): the next region
 /// entered throws, every later one runs normally -- which is what lets a terminality test drive a
-/// SUCCESSFUL flush after the poison.
+/// successful flush after the recovery transition.
 ///
 /// The exception is built HERE, outside the region, and the probe only rethrows it: constructing a
 /// `DB::Exception` inside the region would allocate and trip `DENY_ALLOCATIONS_IN_SCOPE`, so the test
-/// would be exercising the guard instead of the poison. `MEMORY_LIMIT_EXCEEDED` (what a real tracked
-/// allocation failure raises) and deliberately NOT `LOGICAL_ERROR`, which aborts at construction in
-/// debug/sanitizer builds.
+/// would be exercising the guard instead of the recovery transition. `MEMORY_LIMIT_EXCEEDED` (what a
+/// real tracked allocation failure raises) is used deliberately instead of `LOGICAL_ERROR`, which
+/// aborts at construction in debug/sanitizer builds.
 ///
-/// With §A1 landed this seam is the ONLY way to reach the `Poisoned` transition at all: all three
+/// With §A1 landed this seam is the only way to reach `NeedsRecovery` from an install region:
 /// install regions are allocation-free and therefore cannot throw on their own.
 void armOneShotInstallFailure(const PoolPtr & store)
 {
@@ -317,7 +317,7 @@ TEST(CasRefInstallSafety, PreAttemptRefusalDoesNotWedgeTheLane)
     EXPECT_TRUE(store->wedgedKeyForTest(ns).empty());
     EXPECT_EQ(backend->ioCountForKeysContaining(log_prefix), log_io_after_seed)
         << "the refusal must be PRE-attempt: not one ref-log object may have been touched";
-    EXPECT_EQ(store->applyStateForTest(ns), RefApplyState::Clean)
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Ready)
         << "no apply is owed for a transaction that was never sent -- leaving the marker pending would "
            "claim this table may be missing a durable transaction for the rest of its life";
     EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), tail_after_seed)
@@ -333,7 +333,7 @@ TEST(CasRefInstallSafety, PreAttemptRefusalDoesNotWedgeTheLane)
     EXPECT_FALSE(store->resolveRef(ns, "part_a", /*allow_stale=*/false).has_value())
         << "the retry on the same lane must commit";
     EXPECT_FALSE(store->refLaneWedgedForTest(ns));
-    EXPECT_EQ(store->applyStateForTest(ns), RefApplyState::Clean);
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Ready);
 }
 
 /// Task 18, the same pair on the WEDGE-RESOLUTION path -- the negative half.
@@ -385,7 +385,7 @@ TEST(CasRefInstallSafety, PreAttemptRefusalAfterAWedgeResolutionLeavesTheLaneCle
         << "the wedged drop was proven durable, so its removal must be visible";
     EXPECT_TRUE(store->resolveRef(ns, "y", /*allow_stale=*/false).has_value())
         << "the refused chunk must not have taken effect";
-    EXPECT_EQ(store->applyStateForTest(ns), RefApplyState::Clean);
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Ready);
 
     store->setMountDeadline(FENCE_DEADLINE_HEALTHY_MS);
     store->dropRef(ns, "y");
@@ -430,7 +430,7 @@ TEST(CasRefInstallSafety, AmbiguousChunkAfterAWedgeResolutionRewedgesTheLane)
         << "the new wedge must describe the NEW transaction, not the resolved one";
     EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), tail_after_seed + 1)
         << "only the resolved wedge is recorded; the in-doubt chunk is not";
-    EXPECT_EQ(store->applyStateForTest(ns), RefApplyState::ApplyPending)
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Wedged)
         << "a wedged lane may hold a durable transaction the runtime has not recorded";
 }
 
@@ -576,28 +576,17 @@ TEST(CasRefInstallSafety, InstallRegionProbeIsInvokedAndTheGuardIsArmed)
 }
 
 /// ===================================================================================
-/// Task 7 (spec §A2): the apply-pending poison state machine.
-///
-/// §A1 made all three post-durable install regions allocation-free, so "durable but unapplied" should
-/// be unreachable. `RefApplyState` is the cheap marker that makes it VISIBLE if it happens anyway, and
-/// it is the predicate the relink confirm will read as its rule 4. It is an ASSERT LAYER, not a fence:
-/// none of the tests below expect a poisoned table to refuse anything -- one of them positively pins
-/// the opposite (a later flush still commits), because that is the honest description of what this
-/// task ships and of why §A1 had to land first.
+/// The append lane state machine.
 /// ===================================================================================
 
-/// `Clean -> ApplyPending -> Clean` on the ordinary commit path. The mid-flight observation is what
-/// makes this more than a tautology: the marker is read from INSIDE the post-durable seam, i.e. after
-/// the object is durable and before the runtime records it -- exactly the window the marker names. The
-/// seam takes no lock the accessor needs (`ref_queue_mutex` is not held across a flush), so reading it
-/// there cannot deadlock.
-TEST(CasRefInstallSafety, ApplyStateArmsBeforeTheDurablePutAndClearsOnInstall)
+/// The exact attempt is visible as `Writing` after durability and before installation.
+TEST(CasRefInstallSafety, WritingOwnsTheAttemptUntilInstall)
 {
     auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
     auto store = openPool(backend);
     const RootNamespace ns{"srv1/apply_state_commit"};
 
-    EXPECT_EQ(store->applyStateForTest(ns), RefApplyState::Clean)
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Ready)
         << "a table that has never written anything owes no apply";
 
     /// Fired on the calling thread by the flush leader, which is this thread; `atomic` regardless, as in
@@ -609,7 +598,7 @@ TEST(CasRefInstallSafety, ApplyStateArmsBeforeTheDurablePutAndClearsOnInstall)
         if (phase != CasRefLedger::CarvePhaseForTest::PostDurableInstall)
             return;
         observations.fetch_add(1);
-        if (store->applyStateForTest(ns) == RefApplyState::ApplyPending)
+        if (store->laneStateForTest(ns) == RefLaneState::Writing)
             pending_observations.fetch_add(1);
     });
 
@@ -618,15 +607,13 @@ TEST(CasRefInstallSafety, ApplyStateArmsBeforeTheDurablePutAndClearsOnInstall)
 
     EXPECT_GT(observations.load(), 0u) << "the post-durable seam must be reached by an ordinary commit";
     EXPECT_EQ(pending_observations.load(), observations.load())
-        << "every durable-but-not-yet-installed transaction must be marked ApplyPending";
-    EXPECT_EQ(store->applyStateForTest(ns), RefApplyState::Clean)
+        << "every durable-but-not-yet-installed transaction remains Writing";
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Ready)
         << "a completed install owes no apply: the marker must be back to Clean";
 }
 
-/// `Clean -> ApplyPending`, and the deliberate NON-clear at install region 3. An `Unresolved` outcome is
-/// exactly "an object that may be durable and is not applied", so a wedged lane's steady state IS the
-/// pending state -- clearing it there would erase the very case the marker exists to name.
-TEST(CasRefInstallSafety, UnresolvedWedgeLeavesTheApplyMarkerPending)
+/// Ambiguity transfers the same exact attempt from `Writing` to `Wedged`.
+TEST(CasRefInstallSafety, UnresolvedTransfersWritingToWedged)
 {
     auto backend = std::make_shared<DB::Cas::tests::ChunkFaultBackend>();
     auto store = openPoolSingleAttempt(backend);
@@ -639,13 +626,12 @@ TEST(CasRefInstallSafety, UnresolvedWedgeLeavesTheApplyMarkerPending)
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { publishEmptyPart(store, ns, "part_a"); });
 
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
-    EXPECT_EQ(store->applyStateForTest(ns), RefApplyState::ApplyPending)
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Wedged)
         << "a wedged lane may hold a durable transaction the runtime has not recorded";
 }
 
-/// `ApplyPending -> Clean` at install region 2: the resolving GET proves the wedged object durable and
-/// the same allocation-free region that records the transaction clears the marker.
-TEST(CasRefInstallSafety, WedgeResolutionClearsTheApplyMarker)
+/// Durable resolution installs the attempt and returns the lane to `Ready`.
+TEST(CasRefInstallSafety, WedgeResolutionReturnsReady)
 {
     auto backend = std::make_shared<DB::Cas::tests::ChunkFaultBackend>();
     auto store = openPoolSingleAttempt(backend);
@@ -661,20 +647,18 @@ TEST(CasRefInstallSafety, WedgeResolutionClearsTheApplyMarker)
     backend->fault_count = 1;
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
-    ASSERT_EQ(store->applyStateForTest(ns), RefApplyState::ApplyPending);
+    ASSERT_EQ(store->laneStateForTest(ns), RefLaneState::Wedged);
 
     backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::None;
     store->dropRef(ns, "y");
 
     EXPECT_FALSE(store->refLaneWedgedForTest(ns));
-    EXPECT_EQ(store->applyStateForTest(ns), RefApplyState::Clean)
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Ready)
         << "the wedged transaction was proven durable AND installed, so nothing is owed any more";
 }
 
-/// `ApplyPending -> Clean` on the conclusive `putIfAbsentControlled` throw. The ref-log key is
-/// write-once, so a DIFFERENT object at it proves OUR bytes never landed: no apply is owed, and the
-/// lane stays usable rather than wedged.
-TEST(CasRefInstallSafety, ConclusivePutRejectionClearsTheApplyMarker)
+/// A foreign occupant is a terminal `Faulted` verdict.
+TEST(CasRefInstallSafety, ConclusiveForeignConflictFaultsTheLane)
 {
     auto backend = std::make_shared<DB::Cas::tests::ChunkFaultBackend>();
     auto store = openPoolSingleAttempt(backend);
@@ -687,14 +671,14 @@ TEST(CasRefInstallSafety, ConclusivePutRejectionClearsTheApplyMarker)
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { publishEmptyPart(store, ns, "part_a"); });
 
     EXPECT_FALSE(store->refLaneWedgedForTest(ns)) << "a proven conflict is conclusive and must not wedge";
-    EXPECT_EQ(store->applyStateForTest(ns), RefApplyState::Clean)
-        << "a conclusively rejected PUT put nothing durable in place, so no apply is owed";
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Faulted)
+        << "a foreign occupant is a terminal protocol verdict, not a retryable attempt";
 }
 
-/// `ApplyPending -> Clean` on `DefiniteFailure` -- the outcome whose whole meaning is "proven never
-/// applied". Needs S3 error classification: that is the only exception family
+/// `DefiniteFailure` proves nothing became durable and returns the lane to `Ready`. Needs S3 error
+/// classification: that is the only exception family
 /// `classifyConditionalWriteResult` will ever call definite (everything else is fail-safe Unresolved).
-TEST(CasRefInstallSafety, DefiniteFailureClearsTheApplyMarker)
+TEST(CasRefInstallSafety, DefiniteFailureReturnsReady)
 {
 #if !USE_AWS_S3
     GTEST_SKIP() << "DefiniteFailure classification requires S3 error types (USE_AWS_S3 off)";
@@ -710,12 +694,12 @@ TEST(CasRefInstallSafety, DefiniteFailureClearsTheApplyMarker)
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { publishEmptyPart(store, ns, "part_a"); });
 
     EXPECT_FALSE(store->refLaneWedgedForTest(ns)) << "a definite failure is proven non-durable and must not wedge";
-    EXPECT_EQ(store->applyStateForTest(ns), RefApplyState::Clean)
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Ready)
         << "a definitively rejected PUT is proven non-durable, so no apply is owed";
 #endif
 }
 
-/// `ApplyPending -> Clean` on the only wedge resolution that is CONCLUSIVELY NEGATIVE: foreign bytes at
+/// A foreign occupant is the conclusive negative wedge resolution:
 /// the wedged (write-once) key prove our body never landed there. `resolveByExactGet` never reports a
 /// plain "absent" verdict -- absent or unreadable is `Unresolved`, since another attempt may still be
 /// legal -- so this arm is the whole of "a resolution that proves the key is not ours".
@@ -725,7 +709,7 @@ TEST(CasRefInstallSafety, DefiniteFailureClearsTheApplyMarker)
 /// to be release-only with a death-test twin standing in. The marker is cleared BEFORE the anomaly
 /// reaction, which is what this test pins; the fence/audit half is
 /// `CasAnomalyPolicy.ForeignBytesAtWedgeKeyTripFenceAndRemount`'s.
-TEST(CasRefInstallSafety, WedgeResolutionProvenForeignClearsTheApplyMarker)
+TEST(CasRefInstallSafety, WedgeResolutionProvenForeignFaultsTheLane)
 {
     auto backend = std::make_shared<DB::Cas::tests::ChunkFaultBackend>();
     auto store = openPoolSingleAttempt(backend);
@@ -738,7 +722,7 @@ TEST(CasRefInstallSafety, WedgeResolutionProvenForeignClearsTheApplyMarker)
     backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::Unresolved;
     backend->fault_count = 1;
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
-    ASSERT_EQ(store->applyStateForTest(ns), RefApplyState::ApplyPending);
+    ASSERT_EQ(store->laneStateForTest(ns), RefLaneState::Wedged);
 
     /// Out of band, a foreign writer lands DIFFERENT bytes at the exact wedged key. The fault mode is
     /// off first so this write is not itself intercepted.
@@ -749,42 +733,40 @@ TEST(CasRefInstallSafety, WedgeResolutionProvenForeignClearsTheApplyMarker)
 
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { store->dropRef(ns, "y"); });
 
-    EXPECT_TRUE(store->refLaneWedgedForTest(ns))
-        << "foreign interference keeps the wedge for inspection (fail closed)";
-    EXPECT_EQ(store->applyStateForTest(ns), RefApplyState::Clean)
-        << "our transaction provably never landed at that write-once key, so no apply is owed -- this is "
-           "the one state where a wedged lane is legitimately not ApplyPending";
+    EXPECT_FALSE(store->refLaneWedgedForTest(ns));
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Faulted)
+        << "foreign interference is a terminal verdict, not an unresolved attempt";
 }
 
-/// `ApplyPending -> Poisoned` at install region 1 (`commitRefChunk`'s candidate install). Unreachable
-/// in production with §A1 landed -- the region allocates nothing -- so the probe seam is what simulates
-/// the OLD post-durable failure. The transaction IS durable at that point, and the runtime does not
-/// record it: exactly the state the marker exists to name.
-TEST(CasRefInstallSafety, PostDurableInstallFailurePoisonsTheTable)
+/// `Writing -> NeedsRecovery` at the ordinary candidate install. Unreachable
+/// in production with §A1 landed -- the region allocates nothing -- so the probe seam simulates the
+/// post-durable failure. The transaction is durable at that point, but the runtime has not installed it:
+/// exactly the condition that `NeedsRecovery` names.
+TEST(CasRefInstallSafety, PostDurableInstallFailureRequiresRecovery)
 {
     auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
     auto store = openPool(backend);
     const RootNamespace ns{"srv1/apply_state_poison"};
 
     publishEmptyPart(store, ns, "x");
-    ASSERT_EQ(store->applyStateForTest(ns), RefApplyState::Clean);
+    ASSERT_EQ(store->laneStateForTest(ns), RefLaneState::Ready);
 
-    const uint64_t poisoned_before = ProfileEvents::global_counters[ProfileEvents::CasRefApplyPoisoned].load();
+    const uint64_t needs_recovery_before = ProfileEvents::global_counters[ProfileEvents::CasRefNeedsRecovery].load();
     armOneShotInstallFailure(store);
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::MEMORY_LIMIT_EXCEEDED, [&] { store->dropRef(ns, "x"); });
     store->setInstallRegionProbeForTest(nullptr);
 
-    EXPECT_EQ(store->applyStateForTest(ns), RefApplyState::Poisoned)
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery)
         << "an install that failed AFTER its object was durable must be visible, not silent";
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasRefApplyPoisoned].load() - poisoned_before, 1u)
-        << "the transition to Poisoned must be exported exactly once";
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasRefNeedsRecovery].load() - needs_recovery_before, 1u)
+        << "the transition to NeedsRecovery must be exported exactly once";
 }
 
-/// `ApplyPending -> Poisoned` at install region 2 (the wedge-resolution install). Same class of failure
+/// `Wedged -> NeedsRecovery` at the wedge-resolution install. Same class of failure
 /// one region over: the resolving GET already PROVED the object durable, so an install that does not
 /// complete there leaves the same missing transaction -- and the wedge survives, because the swap that
 /// would have cleared it is in the same region that threw.
-TEST(CasRefInstallSafety, WedgeResolutionInstallFailurePoisonsTheTable)
+TEST(CasRefInstallSafety, WedgeResolutionInstallFailureRequiresRecovery)
 {
     auto backend = std::make_shared<DB::Cas::tests::ChunkFaultBackend>();
     auto store = openPoolSingleAttempt(backend);
@@ -804,50 +786,14 @@ TEST(CasRefInstallSafety, WedgeResolutionInstallFailurePoisonsTheTable)
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::MEMORY_LIMIT_EXCEEDED, [&] { store->dropRef(ns, "y"); });
     store->setInstallRegionProbeForTest(nullptr);
 
-    EXPECT_EQ(store->applyStateForTest(ns), RefApplyState::Poisoned);
-    EXPECT_TRUE(store->refLaneWedgedForTest(ns))
-        << "the install and the unwedge are one region: neither happened";
-}
-
-/// `ApplyPending -> Poisoned` at install region 3 (the wedge install on an `Unresolved` outcome). The
-/// object's durability is unproven here, but losing the wedge is strictly WORSE than being wedged --
-/// nothing records that a possibly-durable transaction exists, and the next append mints a fresh id
-/// against a state that may be missing it -- so this region poisons too.
-TEST(CasRefInstallSafety, WedgeInstallFailurePoisonsTheTable)
-{
-    auto backend = std::make_shared<DB::Cas::tests::ChunkFaultBackend>();
-    auto store = openPoolSingleAttempt(backend);
-    const RootNamespace ns{"srv1/apply_state_poison_wedge"};
-
-    publishEmptyPart(store, ns, "x");
-
-    backend->fault_substr = store->layout().refsNamespacePrefix(ns) + "_log/";
-    backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::Unresolved;
-    backend->fault_count = 1;
-    armOneShotInstallFailure(store);
-    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::MEMORY_LIMIT_EXCEEDED, [&] { store->dropRef(ns, "x"); });
-    store->setInstallRegionProbeForTest(nullptr);
-
-    EXPECT_EQ(store->applyStateForTest(ns), RefApplyState::Poisoned);
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
     EXPECT_FALSE(store->refLaneWedgedForTest(ns))
-        << "the wedge install threw, so the record that would have resolved the in-doubt object is gone "
-           "-- which is precisely why this region poisons despite durability being unproven";
+        << "known durability transfers ownership from the attempt to recovery";
 }
 
-/// The negative transition: `Poisoned` is TERMINAL for the runtime. A later flush that commits and
-/// installs perfectly must NOT clear it -- the earlier durable transaction is still missing from this
-/// cached state, and a marker that a successful flush could wash away would report health that does not
-/// exist. Enforced by construction: both clearing transitions are CASes whose expected value is
-/// `Clean`/`ApplyPending`, so no code path can store over a poison; only a fresh recovery, which means a
-/// REPLACED runtime, starts over at `Clean`.
-///
-/// It also pins the honest scope of §A2: a poisoned table keeps ACCEPTING work. That is intentional --
-/// this is an assert layer, not a fence (see `RefApplyState`), and safety comes from §A1 having made
-/// the poison unreachable in the first place. Under INV-1 that acceptance needs one extra thing to stay
-/// true, since ids are derived from the state and the stranded transaction is durable at the very id the
-/// unadvanced state would derive next: the failed install records it as `RefTableState`'s durable floor,
-/// so the append below lands ABOVE it instead of colliding with our own object.
-TEST(CasRefInstallSafety, PoisonedSurvivesALaterSuccessfulFlush)
+/// A later append may proceed only after the top-of-flush recovery has replayed the known-durable
+/// transaction and returned the lane to `Ready`.
+TEST(CasRefInstallSafety, NeedsRecoveryReplaysBeforeALaterFlush)
 {
     auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
     auto store = openPool(backend);
@@ -856,11 +802,11 @@ TEST(CasRefInstallSafety, PoisonedSurvivesALaterSuccessfulFlush)
     publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "y");
 
-    const uint64_t poisoned_before = ProfileEvents::global_counters[ProfileEvents::CasRefApplyPoisoned].load();
+    const uint64_t needs_recovery_before = ProfileEvents::global_counters[ProfileEvents::CasRefNeedsRecovery].load();
     armOneShotInstallFailure(store);
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::MEMORY_LIMIT_EXCEEDED, [&] { store->dropRef(ns, "x"); });
     store->setInstallRegionProbeForTest(nullptr);
-    ASSERT_EQ(store->applyStateForTest(ns), RefApplyState::Poisoned);
+    ASSERT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
 
     /// A perfectly ordinary, fully successful append afterwards.
     store->dropRef(ns, "y");
@@ -868,21 +814,20 @@ TEST(CasRefInstallSafety, PoisonedSurvivesALaterSuccessfulFlush)
         << "the later flush must really have committed AND installed -- otherwise the assertion below "
            "would pass for the wrong reason";
 
-    /// The distinction this test exists for SURVIVES, but the mechanism moved. A flush's own SUCCESS is
-    /// still not evidence that the stranded transaction arrived -- that would be exactly the wrong
-    /// inference. What clears the poison is the re-derivation that `ensureRefTableRecovered` performs at
-    /// the TOP of that same flush: the walk reads the stranded transaction back out of the durable log,
-    /// and the install of that state is what makes "this cache is missing a durable transaction" false.
+    /// A flush's own success is not evidence that the stranded transaction was installed. What returns
+    /// the lane to `Ready` is the re-derivation that `ensureRefTableRecovered` performs at the top of
+    /// that same flush: the walk reads the stranded transaction from the durable log, then installs the
+    /// recovered state.
     ///
     /// Both halves are asserted, because only together do they mean the repair happened rather than the
-    /// marker being dropped: 'x' really is gone (the stranded drop is applied at last), and the state is
-    /// Clean.
+    /// state being relabeled: `x` really is gone (the stranded drop is applied at last), and the lane is
+    /// `Ready`.
     EXPECT_FALSE(store->resolveRef(ns, "x", /*allow_stale=*/false).has_value())
-        << "the stranded drop of 'x' is durable, so the re-derivation must apply it -- a Clean marker "
-           "over a state that still lacked it would be the poison silently discarded";
-    EXPECT_EQ(store->applyStateForTest(ns), RefApplyState::Clean);
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasRefApplyPoisoned].load() - poisoned_before, 1u)
-        << "the event counts TRANSITIONS, so the successful flush must not have added another";
+        << "the stranded drop of 'x' is durable, so the re-derivation must install it before returning "
+           "the lane to Ready";
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Ready);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasRefNeedsRecovery].load() - needs_recovery_before, 1u)
+        << "the event counts transitions, so the successful flush must not have added another";
 }
 
 /// Part B review, BLOCKER 2: an UNCERTAIN `precommitAdd` must keep its cleanup owner and its body.

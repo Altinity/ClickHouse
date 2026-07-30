@@ -703,10 +703,8 @@ TEST(CasRefCkpt, TheCheckpointIsWrittenOncePerPublicationAndNotOnIdleAttempts)
     EXPECT_EQ(readCkptOrFail(*backend, store->layout(), ns), after_publish->ckpt);
 }
 
-/// The interplay guard for the refusal T3/T4 landed: a POISONED table must never publish, and that
-/// refusal sits AHEAD of any `_ckpt` write -- a checkpoint naming a snapshot that was never published
-/// would point recovery at a key that does not exist.
-TEST(CasRefCkpt, APoisonedTableAdvancesNoCheckpoint)
+/// Publication replays a `NeedsRecovery` lane before it captures a snapshot and advances `_ckpt`.
+TEST(CasRefCkpt, NeedsRecoveryReplaysBeforeCheckpointAdvance)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPool(backend);
@@ -719,7 +717,7 @@ TEST(CasRefCkpt, APoisonedTableAdvancesNoCheckpoint)
     ASSERT_FALSE(before->ckpt.checkpoint_snapshot_id.has_value());
     const uint64_t writes_before = backend->casPutCount(key);
 
-    /// Poison the lane the only way production can: an install that throws AFTER its transaction is
+    /// Enter `NeedsRecovery`: an install throws after its transaction is
     /// durable, leaving this cached table missing a transaction the log contains.
     auto planned = std::make_exception_ptr(DB::Exception(DB::ErrorCodes::MEMORY_LIMIT_EXCEEDED,
         "simulated allocation failure inside the post-durable install region"));
@@ -733,25 +731,17 @@ TEST(CasRefCkpt, APoisonedTableAdvancesNoCheckpoint)
     });
     expectThrowsCode(DB::ErrorCodes::MEMORY_LIMIT_EXCEEDED, [&] { publishRef(store, ns, "ref_2", 2); });
     store->setInstallRegionProbeForTest(nullptr);
-    ASSERT_EQ(store->applyStateForTest(ns), RefApplyState::Poisoned);
+    ASSERT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
 
-    /// The publish entry point RECOVERS before it publishes, and a poisoned table with no wedge
-    /// re-derives itself there -- so by the time the publisher looks, the divergence the poison marked is
-    /// gone and there is no lie left to refuse. That is a stronger guarantee than the refusal this test
-    /// used to pin, and it is asserted as such: the publish succeeds, and the snapshot it wrote really
-    /// does cover the transaction that was stranded.
+    /// The publish entry point recovers first, so the snapshot covers the stranded transaction.
     EXPECT_TRUE(store->trySnapshotPublishOnce(ns));
     EXPECT_TRUE(store->resolveRef(ns, "ref_2", /*allow_stale=*/false).has_value())
         << "the stranded transaction is durable; the re-derivation must have applied it";
-    EXPECT_EQ(store->applyStateForTest(ns), RefApplyState::Clean);
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Ready);
     EXPECT_GT(backend->casPutCount(key), writes_before)
         << "and the checkpoint advances -- truthfully, over a snapshot that is not missing anything";
     EXPECT_TRUE(readCkptOrFail(*backend, store->layout(), ns).checkpoint_snapshot_id.has_value());
 
-    /// The refusal itself is NOT retired in production: `trySnapshotPublishOnce` still refuses to publish
-    /// from a `Poisoned` state, and it is still reachable -- by a table that is poisoned AND wedged, where
-    /// the wedge blocks the re-derivation. It is unreachable through THIS entry point, which is why this
-    /// test can no longer be the thing that covers it.
 }
 
 /// A publish admitted under an incarnation that is replaced mid-attempt advances NOTHING, and does not

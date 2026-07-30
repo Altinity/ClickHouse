@@ -77,6 +77,16 @@
 > the 32-config accounting with every green's red preceding it; and `_sab_nowedge`'s only-route
 > argument. The gate's STRUCTURE is not what failed — the machine's describability is.
 
+> ## Restatement completed 2026-07-30 {#restatement-completed}
+>
+> The replacement was built from semantic obligations first and then implemented:
+> `docs/superpowers/specs/2026-07-30-cas-ref-lane-state-machine.md`,
+> `docs/superpowers/models/CaRefLaneCore.tla`, and
+> `docs/superpowers/models/CaRelinkLaneComposition.tla`. The old product/enumeration plan remains
+> stopped and historical; any resumed relink work should consume the new `Ready`-only certification
+> contract instead. TLC results are recorded in
+> `docs/superpowers/models/CaRefLaneCore_RESULTS.md`.
+
 **Goal:** Discharge §12 of `docs/superpowers/specs/2026-07-29-cas-relink-reoffer-redesign.md` — build the refined model the redesign requires, run it, and answer the one question that can still stop the design: **does `_sab_stalecache` flip from RED to GREEN once the apply-pending marker is represented?** If it does not, the design does not ship.
 
 **Architecture:** One new TLA+ module, `docs/superpowers/models/CaRelinkReofferCore.tla`, which REFINES `CaRelinkConfirmCore` rather than editing it (§12's disposition ruling: the v11 model is kept as the historical witness of the v11 protocol and is not touched, because its `_sab_*` reds are the evidence that v11's rules were each load-bearing). The refinement adds five things the v11 model cannot express: the apply-pending marker with a *separate reader-visible value* (`sApply` / `sApplySeen` — the model-level twin of seam §6, including every arm of `CasRefLedger::resolveWedgeOnce`, whose bounded retry is itself a durability-producing event), an equal-namespace/different-`disk_name` mount pair (§12.5 row i, test row 17's B1 shape), a leader tenure that commits several durable chunks of *different kinds* (§12.5 row ii), a receiver whose acceptance is the *conjunction* of a certified answer and a returned identity (§4.2, §4.4), and a committed-relink fact that covers the landed-`Unresolved` publication as well as `Committed`. Around them, a 2×2 necessity matrix decides the gate, a cross-mount battery decides the validator's qualification, and the re-derived rule set decides that every retained rule is still load-bearing under the fence-first ordering. Cfg names are deliberately carried over from the v11 model so that the flip is greppable side by side: `CaRelinkConfirmCore_sab_stalecache` RED next to `CaRelinkReofferCore_sab_stalecache` GREEN.

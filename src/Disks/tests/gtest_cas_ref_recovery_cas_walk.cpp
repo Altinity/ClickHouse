@@ -805,17 +805,8 @@ TEST(CasRefRecoveryCasWalk, RemountBarrierBlocksUntilAPausedRecoveryAcknowledges
     EXPECT_FALSE(store->refTableRecoveredForTest(ns)) << "and ZERO installs";
 }
 
-/// ---------------------------------------------------------------------------------------------
-/// Structural closure of the durable floor
-/// ---------------------------------------------------------------------------------------------
-
-/// Task 3 left the durable floor as a BRIDGE: a post-durable install failure strands an id that is
-/// durable but absent from this cache, and the floor keeps the allocator from colliding with it. The
-/// floor was never the answer -- re-deriving the table from the durable log is. A poisoned table's next
-/// recovery entry does exactly that: the arithmetic walk picks the stranded transaction up by exact key,
-/// the installed state contains it, the poison clears, and the floor is inert because a fresh state
-/// starts at `{0,0}`.
-TEST(CasRefRecoveryCasWalk, PoisonedTableReRecoversTheStrandedTxnAndClearsThePoison)
+/// A `NeedsRecovery` lane replays the known-durable transaction before returning to `Ready`.
+TEST(CasRefRecoveryCasWalk, NeedsRecoveryReplaysTheStrandedTxn)
 {
     auto backend = std::make_shared<CountingBackend>();
     const Layout layout("p");
@@ -824,7 +815,7 @@ TEST(CasRefRecoveryCasWalk, PoisonedTableReRecoversTheStrandedTxnAndClearsThePoi
     auto store = openWalkPool(backend);
     ASSERT_TRUE(store);
 
-    /// Publish one ref through the real lane, then poison the NEXT commit's install region: the
+    /// Publish one ref through the real lane, then fail the next commit's install region: the
     /// transaction is durable and the install that would have recorded it throws.
     ASSERT_NO_THROW(store->appendRefOps(ns, MutationScope::ref("a"),
         [](const RefTableState & state)
@@ -838,38 +829,37 @@ TEST(CasRefRecoveryCasWalk, PoisonedTableReRecoversTheStrandedTxnAndClearsThePoi
         },
         RootMutationOrigin::Writer, RootMutationKind::Publish));
 
-    /// Built OUTSIDE the region (building it inside would trip the allocation guard instead of testing
-    /// the poison) -- the documented way to reach `Poisoned`. One-shot, and re-allowing allocations for
+    /// Built outside the region. One-shot, and re-allowing allocations for
     /// the duration of the throw: `std::rethrow_exception` allocates through libc++'s
     /// `__cxa_rethrow_primary_exception`, which the debug build's `DENY_ALLOCATIONS_IN_SCOPE` aborts on.
     /// (Found by the debug gate -- the first cut of this probe took the whole binary down there.) Same
     /// shape as `gtest_cas_ref_install_safety.cpp`'s `armOneShotInstallFailure`.
-    auto poison = std::make_exception_ptr(DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "install probe"));
+    auto planned_failure = std::make_exception_ptr(DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "install probe"));
     auto fired = std::make_shared<std::atomic<bool>>(false);
-    store->setInstallRegionProbeForTest([poison, fired]
+    store->setInstallRegionProbeForTest([planned_failure, fired]
     {
         if (fired->exchange(true))
             return;
         ALLOW_ALLOCATIONS_IN_SCOPE;
-        std::rethrow_exception(poison);
+        std::rethrow_exception(planned_failure);
     });
     EXPECT_ANY_THROW(store->appendRefOps(ns, MutationScope::ref("b"),
         [](const RefTableState &) { return publishCommittedOps("b", manifestRef(1, 2, 1)); },
         RootMutationOrigin::Writer, RootMutationKind::Publish));
     store->setInstallRegionProbeForTest(nullptr);
 
-    ASSERT_EQ(store->applyStateForTest(ns), RefApplyState::Poisoned);
+    ASSERT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
     /// "Durable but not applied here", stated as the two facts it is made of: the object IS in the
     /// store, and this runtime's floor is what keeps the allocator off its id.
     ASSERT_TRUE(readLogTxn(*backend, layout, ns, RefTxnId{1, 2}).has_value())
-        << "the stranded transaction must be durable -- otherwise this test is not exercising Poisoned";
+        << "the stranded transaction must be durable -- otherwise recovery is not owed";
 
     /// The next touch drives recovery again -- this is the structural closure Task 3 deferred here.
     const auto refs = store->listRefs(ns);
     EXPECT_EQ(refs.size(), 2u);
     EXPECT_TRUE(refs.contains("b")) << "the walk re-derived the stranded transaction from the durable log";
-    EXPECT_EQ(store->applyStateForTest(ns), RefApplyState::Clean)
-        << "the poison clears ONLY through a successful install, and this install succeeded";
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Ready)
+        << "only a completed recovery install returns the lane to Ready";
 }
 
 /// ---------------------------------------------------------------------------------------------

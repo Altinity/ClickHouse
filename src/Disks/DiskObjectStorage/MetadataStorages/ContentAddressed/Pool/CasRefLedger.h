@@ -30,40 +30,31 @@ namespace DB::Cas
 /// re-validating anything.
 enum class ResolveAudit : uint8_t { Emit, Deferred };
 
-/// Per-table marker for the ref lane's three post-durable install regions (spec §A2).
+/// The complete state of one table's append lane. It is guarded by `RefTableRuntime::state_mutex`;
+/// there is no independent apply marker or durable-id floor whose combinations form a second,
+/// implicit state machine.
 ///
-/// §A1 made every one of those regions allocation-free, so "the ref-log object is durable but the
-/// runtime does not record it" is unreachable by construction. This marker exists so that if it ever
-/// happens ANYWAY it is VISIBLE instead of silent, and so the relink confirm has a cheap predicate to
-/// read (its rule 4). The states:
-///   `Clean`        -- no ref-log object of this table's is known to be, or may be, durable without
-///                     having been applied to the cached state;
-///   `ApplyPending` -- armed immediately BEFORE a durable `PUT` and cleared once that transaction is
-///                     installed (or once it is PROVEN that nothing became durable). It is also the
-///                     steady state of a wedged lane, which is exactly "may be durable, not applied";
-///   `Poisoned`     -- an install failed although its object may already be durable, i.e. the cached
-///                     state can be MISSING a durable transaction. Terminal for the STATE it describes:
-///                     no flush clears it, because no flush can supply a transaction this runtime never
-///                     saw. Exactly ONE thing clears it, and only by making the reading false --
-///                     `installRecoveryResult`, publishing a state RE-DERIVED from the durable log,
-///                     which is why a poisoned table re-recovers on its next touch
-///                     (`ensureRefTableRecovered`). Every other transition out of it would have to be a
-///                     `Clean`/`ApplyPending` CAS whose expected value is not `Poisoned`, and there is
-///                     no plain store anywhere else.
-///
-/// It is deliberately an ASSERT LAYER, NOT an operational fence: nothing refuses work because a table
-/// is `Poisoned`. Safety rests on §A1. Turning this into a fence (the spec's "ordering caveat") would
-/// require rejecting later `appendRefOps`, stale-precommit sweeps and snapshot admissions, exposing
-/// reads/confirm as unknown, and ACTIVELY driving runtime replacement -- none of which this does, and
-/// none of which should be inferred from the marker's existence.
-enum class RefApplyState : uint8_t { Clean, ApplyPending, Poisoned };
+/// `Ready` is the only state that admits a new append or certifies a cached row. `Writing` owns the
+/// exact attempt before its first possible send. `Wedged` owns that same attempt after an ambiguous
+/// result. `NeedsRecovery` means a transaction is known durable but cannot be installed in this cache;
+/// it is a hard write and certification fence until replay completes. `Closed` records a successor's
+/// epoch seal, and `Faulted` records foreign or internally inconsistent durable state.
+enum class RefLaneState : uint8_t
+{
+    Ready,
+    Writing,
+    Wedged,
+    NeedsRecovery,
+    Closed,
+    Faulted,
+};
 
 /// The answer of the relink confirm's gate 1 (`CasRefLedger::confirmExactRef`).
 ///
 /// `Yes` is the only answer that AUTHORIZES anything, so it is the only one that must be earned: it is
 /// returned exclusively when every rule of the lane snapshot holds. `Unknown` is the catch-all for
 /// every ambiguity, and it is the answer this primitive is biased towards: a cold, evicted, recovering,
-/// busy, wedged or poisoned table answers `Unknown` rather than doing any work to find out.
+/// busy or non-`Ready` table answers `Unknown` rather than doing any work to find out.
 ///
 /// `No` means "this runtime's committed row for that ref is not the manifest you asked about" -- and
 /// nothing more. It is NOT a proof of the negative about the durable table, because the mount fence is
@@ -146,10 +137,10 @@ public:
     /// contract, not an optimization -- the confirm is a read-only interserver query that a remote
     /// receiver drives, so it must never be able to make this writer do work.
     ///
-    /// The rules are evaluated as ONE snapshot spanning both lane mutexes, in this order: table warm
-    /// and resident; lane quiescent; apply-state `Clean`; exact committed-row equality; mount fence
-    /// live LAST. Every ambiguity answers `Unknown` -- see `ConfirmAnswer`, and the .cpp for why the
-    /// order and the two-mutex hold are what make a `Yes` a linearization point rather than a guess.
+    /// The rules are evaluated as one snapshot spanning both lane mutexes, in this order: table warm
+    /// and resident; lane state `Ready`; exact committed-row equality; mount fence live last. Every
+    /// ambiguity answers `Unknown` -- see `ConfirmAnswer`, and the .cpp for why the order and the
+    /// two-mutex hold are what make a `Yes` a linearization point rather than a guess.
     ConfirmAnswer confirmExactRef(const RootNamespace & ns, const String & ref_name,
                                   const ManifestRef & manifest_ref) const;
 
@@ -271,10 +262,8 @@ public:
     /// in production (Task 6). Lets a writer-side test drive the ordinary post-transition append without
     /// a whole recovery.
     void setLastEpochSealForTest(const RootNamespace & ns, const std::optional<RefTxnId> & seal);
-    /// Returns the post-durable install marker of `ns` (spec §A2; see `RefApplyState`). Reads the
-    /// runtime's atomic directly -- no lock, and no recovery is forced beyond the runtime materialization
-    /// every other seam here already performs.
-    RefApplyState applyStateForTest(const RootNamespace & ns);
+    /// Returns the append lane state of `ns` without forcing recovery.
+    RefLaneState laneStateForTest(const RootNamespace & ns);
     /// Reports whether recovery or a prior incomplete sweep requires stale-precommit cleanup.
     bool needsStalePrecommitSweepForTest(const RootNamespace & ns);
     /// Waits until all background snapshot publications for `ns` have completed.
@@ -434,7 +423,7 @@ private:
     /// same table can carry the same id under the same generation and describe DIFFERENT bytes, and
     /// installing one attempt's candidate because the other's key resolved is precisely the
     /// acked-then-lost class this every-attempt rule exists to close.
-    struct RefAppendWedge
+    struct RefAppendAttempt
     {
         RefTxnId txn_id;
         String key;
@@ -496,7 +485,9 @@ private:
         /// `_cleanup/<remove-txn-id>` markers observed at recovery, retained for namespace recreation
         /// checks.
         std::set<RefTxnId> cleanup_markers;
-        std::optional<RefAppendWedge> wedge;
+        /// Exact attempt owned by `Writing` or `Wedged`. Empty in every other lane state.
+        std::optional<RefAppendAttempt> append_attempt;
+        RefLaneState lane_state = RefLaneState::Ready;
         /// The `EpochSeal` transaction that closed this namespace's PREVIOUS writer epoch -- exactly the
         /// `prev_epoch_seal` that this table's next sequence-1 transaction must carry (INV-2's grammar:
         /// required on sequence 1 of every epoch above the namespace's genesis, forbidden everywhere
@@ -521,12 +512,6 @@ private:
         /// moment the live epoch advances past the seal's. Nothing else writes it: a seal is durable
         /// evidence, never a local guess.
         std::optional<RefTxnId> last_epoch_seal;
-        /// The post-durable install marker (spec §A2; see `RefApplyState` for the state machine and for
-        /// why it is an assert layer rather than a fence). Atomic and RELAXED because it is written
-        /// inside the install regions, which must not allocate and must not take another lock -- and
-        /// because it publishes no other state: every reader wants the marker itself, never a
-        /// happens-before edge to the table state (which `state_mutex` provides).
-        std::atomic<RefApplyState> apply_state{RefApplyState::Clean};
         uint64_t recovery_restarts = 0;           /// diagnostic: LIST/GET restarts forced by a vanished object
         /// Per-table admission budgets: raw configured limits minus the table's `4 + ns.size()` wire
         /// overhead and the fixed safety margin, computed once at recovery.
@@ -634,12 +619,8 @@ private:
     ///   - an attempt that provably sent nothing consumes nothing: the state it derived from is
     ///     unchanged, so the next caller derives the SAME id and no hole is left behind.
     ///
-    /// "Provably sent nothing" is the premise of the second property, and one path breaks it: a
-    /// post-durable install failure SENT the transaction and it IS durable -- only the install that
-    /// would have recorded it threw (spec §A2's `Poisoned`). Deriving from `greatest_applied` alone
-    /// would re-derive that id and collide with our own durable object. `RefTableState::durable_floor`
-    /// is what keeps the derivation honest there, which is why this goes through `nextTxnId` rather
-    /// than reading `getGreatestApplied` itself.
+    /// A post-durable install failure moves the lane to `NeedsRecovery`, so this function is not called
+    /// again until replay has installed that durable transaction and advanced `greatest_applied`.
     ///
     /// The epoch component is the live mount incarnation's writer epoch, not the open-time
     /// `process_epoch`: a self-remount allocates a strictly-greater durable writer_epoch, so every ref
@@ -679,14 +660,13 @@ private:
     /// production.
     std::function<void(CarvePhaseForTest)> carve_hook_for_test;
 
-    /// Test-only probe fired INSIDE each of the THREE post-durable install regions, i.e. under their
-    /// `DENY_ALLOCATIONS_IN_SCOPE`: `commitRefChunk`'s candidate install (`Committed`) and its wedge
-    /// install (`Unresolved`), and the wedge-resolution install in `flushRefBatch`. It is the negative
+    /// Test-only probe fired inside either post-durable state install, under
+    /// `DENY_ALLOCATIONS_IN_SCOPE`: the ordinary committed install and wedge-resolution adoption. The
+    /// exact attempt is installed before sending, so `Unresolved` needs no post-I/O object install. It is the negative
     /// control for the guard: a probe that allocates must abort a debug build, which is what proves the
     /// region is armed and actually entered -- so a future edit that adds an allocating statement there
-    /// cannot pass unnoticed. It is ALSO the only way left to reach the `Poisoned` transition (spec
-    /// §A2), by throwing an exception BUILT OUTSIDE the region (building it inside would trip the guard
-    /// instead of testing the poison). A test that installs a throwing probe must therefore disarm it
+    /// cannot pass unnoticed. It is also the only way left to reach `NeedsRecovery` from one of these
+    /// otherwise non-throwing regions. A test that installs a throwing probe must therefore disarm it
     /// after the region it targets, or every later install throws too. Null in production.
     std::function<void()> install_region_probe_for_test;
 
@@ -753,30 +733,18 @@ private:
     void flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt,
                        std::vector<std::shared_ptr<RefMutationItem>> & owned_items);
 
-    /// What one bounded wedge-resolution attempt decided. `Adopted` is the ONLY outcome that lets the
-    /// flush proceed to carve a new batch; every other one fails the whole carve with
-    /// `survivor_error` and returns, because the lane is either still uncertain or deliberately closed.
     enum class WedgeResolution : uint8_t
     {
-        NoWedge,          /// nothing was wedged -- the ordinary flush
-        Adopted,          /// the wedged transaction is durable; it is installed and the lane is clear
-        /// The wedged id was ALREADY accounted for by `RefTableState::durable_floor`, so the wedge is
-        /// retired without any I/O and WITHOUT an install: this table is `Poisoned` and its cached view
-        /// will never contain that transaction. Distinct from `Adopted` because nothing was applied and
-        /// no tail counter moved -- calling it an adoption would make the flush's follow-up work (the
-        /// snapshot-publish trigger) look justified when it has nothing to publish.
-        FloorReconciled,
-        Rejected,         /// a successor's `EpochSeal` occupies the key: the operation never landed and never will
-        StillWedged,      /// unresolved, refused pre-attempt, superseded, or uninstallable -- the wedge is intact
-        Corrupted,        /// a foreign non-seal object occupies the key -- impossible under mount exclusivity
+        NoWedge,
+        Adopted,
+        Rejected,
+        StillWedged,
+        Corrupted,
     };
 
     struct WedgeResolutionResult
     {
         WedgeResolution kind = WedgeResolution::NoWedge;
-        /// The error every queued caller of THIS flush receives, for every kind except `NoWedge` and
-        /// `Adopted`. Built by `resolveWedgeOnce`, which is the only place that knows which of the
-        /// several very different reasons applied.
         std::exception_ptr survivor_error;
     };
 
@@ -798,7 +766,8 @@ private:
     /// `admitted_fence_generation` back through `checkFenceOrThrow`, and compares the full wedge
     /// identity against what is still installed. A result that returns after a fence bump/re-arm, or
     /// after the wedge it belonged to was replaced, is INERT for this runtime.
-    WedgeResolutionResult resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt);
+    WedgeResolutionResult resolveWedgeOnce(
+        const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt);
 
     /// Commits ONE chunk of a `flushRefBatch` tenure as a complete ref-log transaction: allocates the
     /// real transaction id, applies `chunk_ops` to a CANDIDATE copy of `rt->state`, encodes and durably
@@ -806,7 +775,7 @@ private:
     /// counters, records the per-transaction metrics, completes exactly `chunk_survivors` with the real
     /// id (waking their waiters), and schedules snapshot publication. The apply comes BEFORE the `PUT`
     /// so that nothing between "durable" and "recorded" can throw (spec §A1); a failure of that apply is
-    /// an ordinary pre-durability rejection. For the same reason the `RefAppendWedge` is built COMPLETE
+    /// an ordinary pre-durability rejection. For the same reason the `RefAppendAttempt` is built COMPLETE
     /// before the `PUT` -- the request reads its key and body -- so the `Unresolved` arm only has to move
     /// it into the runtime: the OTHER thing that must be recorded once the object may be durable.
     /// Returns true when the chunk committed durably; false on any non-throwing failure (a rejected
@@ -819,24 +788,9 @@ private:
                         const std::vector<RefOp> & chunk_ops,
                         const std::vector<std::shared_ptr<RefMutationItem>> & chunk_survivors);
 
-    /// The three `RefApplyState` transitions (spec §A2), the ONLY writers of `RefTableRuntime::
-    /// apply_state`. All of them are allocation-free at the point where it matters, so they can be
-    /// called from inside a `DENY_ALLOCATIONS_IN_SCOPE` install region.
-    ///
-    /// `Clean -> ApplyPending`, armed immediately before a durable `PUT`. A CAS rather than a store, so
-    /// arming can never resurrect a `Poisoned` table; a lane that is somehow already `ApplyPending`
-    /// (impossible under the wedge hard contract, which forbids a new `PUT` while wedged) is left as it
-    /// is, which is the conservative value anyway.
-    static void armApplyPending(RefTableRuntime & rt) noexcept;
-    /// `ApplyPending -> Clean`, on a completed install AND on every path that PROVES nothing became
-    /// durable, so no apply is owed. Also a CAS: `Poisoned` is terminal, and a `Clean` table stays
-    /// `Clean`.
-    static void clearApplyPending(RefTableRuntime & rt) noexcept;
-    /// `* -> Poisoned` with the `CasRefApplyPoisoned` event, emitted once per TRANSITION (a
-    /// re-poisoned table is already accounted for). `noexcept`: it runs from a `catch` that is about to
-    /// rethrow the original post-durable exception, and a failure to REPORT the poison must never
-    /// replace it -- so the marker and the event are set first and only the logging is swallowed.
-    static void poisonApplyState(RefTableRuntime & rt, const RootNamespace & ns, std::string_view region) noexcept;
+    /// Enters the hard recovery fence after a transaction is known durable but cannot be installed.
+    /// The exact attempt is discarded because replay, not another write, is now the only legal owner.
+    static void requireRecovery(RefTableRuntime & rt, const RootNamespace & ns, std::string_view region) noexcept;
 
     /// Leadership-exit guard for `appendRefOps`: under `ref_queue_mutex`, completes every still-unfinished
     /// item this leader owned (with `flush_exception` when unwinding, or a fail-closed `LOGICAL_ERROR`

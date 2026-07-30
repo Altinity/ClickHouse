@@ -233,7 +233,7 @@ uint64_t backendRequests(const CountingBackend & b)
     return b.headTotal() + b.getTotal() + b.getStreamTotal() + b.putTotal() + b.listTotal();
 }
 
-/// One-shot throwing probe in the post-durable install region -- the ONLY way to reach the `Poisoned`
+/// One-shot throwing probe in the post-durable install region -- the only way to reach `NeedsRecovery`
 /// transition now that §A1 made every install region allocation-free. Copied in shape from
 /// `gtest_cas_ref_install_safety.cpp`: the exception is built OUTSIDE the region (constructing one
 /// inside would allocate and trip `DENY_ALLOCATIONS_IN_SCOPE`), and it is `MEMORY_LIMIT_EXCEEDED`
@@ -255,7 +255,7 @@ void armOneShotInstallFailure(const PoolPtr & store)
 }
 
 
-/// Rule 5, the affirmative case: a warm, quiescent, unpoisoned, fenced table whose committed row for
+/// Rule 5, the affirmative case: a warm, quiescent, `Ready`, fenced table whose committed row for
 /// the ref names EXACTLY the asked-about manifest answers `Yes`. Its two negatives share the test
 /// because they are the same rule read the other way: a different `ManifestRef` under the right name,
 /// and a name that has no committed row at all, are both `No` -- a PROOF of the negative, not an
@@ -458,7 +458,7 @@ TEST(CasConfirmExactRef, InFlightAppendIsUnknown)
     /// release, or the still-joinable `dropper` would terminate the whole suite instead of failing one
     /// test.
     const bool leader_active = store->refLeaderActiveForTest(ns);
-    const RefApplyState apply_state = store->applyStateForTest(ns);
+    const RefLaneState apply_state = store->laneStateForTest(ns);
     const ConfirmAnswer while_in_flight = store->confirmExactRef(ns, "x", id.ref);
 
     latch.release();
@@ -466,7 +466,7 @@ TEST(CasConfirmExactRef, InFlightAppendIsUnknown)
     store->setRefPreCarveHookForTest(nullptr);
 
     EXPECT_TRUE(leader_active);
-    EXPECT_EQ(apply_state, RefApplyState::Clean)
+    EXPECT_EQ(apply_state, RefLaneState::Ready)
         << "the pre-carve window is before any PUT, so rule 4 must not be what answers here";
     EXPECT_EQ(while_in_flight, ConfirmAnswer::Unknown)
         << "an admitted append makes the whole table's committed view provisional";
@@ -577,11 +577,8 @@ TEST(CasConfirmExactRef, WedgedLaneIsUnknown)
 }
 
 
-/// Rule 4, poison: an install failed although its object may already be durable, so this runtime's
-/// cached state can be MISSING a durable transaction -- for ANY ref, including one whose row still
-/// looks perfect. The poisoned append below targets a DIFFERENT ref, which is the point: the marker is
-/// table-scoped because the missing transaction's contents are, by definition, unknown.
-TEST(CasConfirmExactRef, PoisonedTableIsUnknown)
+/// `NeedsRecovery` is table-scoped, so confirmation refuses even a row that still looks perfect.
+TEST(CasConfirmExactRef, NeedsRecoveryIsUnknown)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPool(backend);
@@ -594,8 +591,8 @@ TEST(CasConfirmExactRef, PoisonedTableIsUnknown)
     EXPECT_THROW(publishEmptyPart(store, ns, "other"), DB::Exception);
     store->setInstallRegionProbeForTest(nullptr);
 
-    ASSERT_EQ(store->applyStateForTest(ns), RefApplyState::Poisoned);
-    ASSERT_FALSE(store->refLaneWedgedForTest(ns)) << "the poison, not a wedge, must be what refuses here";
+    ASSERT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
+    ASSERT_FALSE(store->refLaneWedgedForTest(ns));
     ASSERT_FALSE(store->refLeaderActiveForTest(ns));
 
     EXPECT_EQ(store->confirmExactRef(ns, "keep", keep.ref), ConfirmAnswer::Unknown)

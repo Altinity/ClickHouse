@@ -770,16 +770,14 @@ public:
                            const String & key, const String & bytes,
                            std::optional<uint64_t> admitted_generation = std::nullopt);
     /// test seam: the fence generation the current wedge was ADMITTED under (0 when not wedged) -- the
-    /// value every later retry of that wedge is gated on. See `CasRefLedger::RefAppendWedge`.
+    /// value every later retry of that wedge is gated on. See `CasRefLedger::RefAppendAttempt`.
     uint64_t wedgedAdmittedGenerationForTest(const RootNamespace & ns);
     /// test seams: this table's `prev_epoch_seal` source -- the seal that closed its previous writer
     /// epoch, `nullopt` at genesis. The setter stands in for the recovery CAS-walk that produces it.
     std::optional<RefTxnId> lastEpochSealForTest(const RootNamespace & ns);
     void setLastEpochSealForTest(const RootNamespace & ns, const std::optional<RefTxnId> & seal);
-    /// test seam: this table's post-durable install marker (spec §A2) -- `Clean`, `ApplyPending`
-    /// (a durable `PUT` is in flight, or the lane is wedged), or the terminal `Poisoned`. See
-    /// `RefApplyState` for why it is an assert layer and not a fence.
-    RefApplyState applyStateForTest(const RootNamespace & ns);
+    /// Test seam: this table's append lane state.
+    RefLaneState laneStateForTest(const RootNamespace & ns);
 
     /// Whether this table still owes a stale-precommit sweep (armed by recovery; re-armed by a
     /// failed attempt; cleared permanently only by a verified-clean sweep). Recovers the table (like any
