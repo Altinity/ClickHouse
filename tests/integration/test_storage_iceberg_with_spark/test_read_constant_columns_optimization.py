@@ -183,11 +183,13 @@ def test_read_constant_columns_optimization(started_cluster_iceberg_with_spark, 
             GROUP BY ALL
             FORMAT CSV
             """)
-        # Weird, but looks like ReadFileMetadata does not used local file cache in 26.1
-        # metadata.json always downloaded in 26.1, once per query or subquery
-        # In 25.8 count was equal to expected, in 26.1 it is expected * 2 + 1 for Local case
-        # expected * 2 + 4 for Cluster case, because each subquery loads metadata.json
-        assert int(res) == expected * 2 + (4 if is_cluster else 1)
+        # metadata.json is always downloaded, once per query or subquery,
+        # so the count is expected + 1 for the Local case and expected + 4 for
+        # the Cluster case (each subquery loads metadata.json).
+        # Note: in 26.1 data files were fetched twice (expected * 2), because
+        # ReadFileMetadata did not use the local file cache there. Since 26.6
+        # every data file is read exactly once again.
+        assert int(res) == expected + (4 if is_cluster else 1)
 
     event = "S3GetObject" if storage_type == "s3" else "AzureGetObject"
 
