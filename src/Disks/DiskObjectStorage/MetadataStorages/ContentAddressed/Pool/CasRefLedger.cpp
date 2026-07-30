@@ -2982,67 +2982,29 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
         }
     }
 
-    /// [CKPT-FAILED-BIRTH-DEBRIS] (BACKLOG `{#ckpt-failed-birth-debris}`): best-effort cleanup for a
-    /// birth chunk whose `_ckpt` published above but whose ref-log `PUT` below then fails on one of the
-    /// THREE branches that PROVE this attempt's bytes never landed and never can (occupant-unreadable,
-    /// `SuccessorSeal`, genuine foreign interference -- every use site below is one of those). NOT used
-    /// on the `!attempt_armed` arm above (review C1: that arm makes no lane transition, so a
-    /// concurrent successful birth cannot be ruled out -- see its own comment) or on the
-    /// ambiguous-exception branch (transfers `Writing` -> `Wedged`): an ambiguous outcome might still
-    /// have landed, and deleting there could erase the one genesis-epoch record nothing else will ever
-    /// recover (see the comment above this publish).
-    ///
-    /// RE-DERIVED at the Stage B (Task 4-C) key shape -- the object this deletes moved from the
-    /// Stage-A sentinel to `*rt->life`'s real catalog incarnation, and the argument does not carry
-    /// unexamined. Two things changed and one stayed:
-    ///   - the cross-incarnation sharing the old argument had to reason about is GONE: each life now
-    ///     has its own `_ckpt` key, so this delete can no longer touch a DIFFERENT life's object;
-    ///   - a NEW same-incarnation writer exists that did not before Task 4-C: `resolveNamespaceLife`'s
-    ///     `completeCreation` call already published THIS incarnation's genesis `_ckpt`
-    ///     (`life_epoch = creator.writer_epoch`) at table-open, strictly before this birth chunk's own
-    ///     redundant republish of the identical value (same runtime, same live epoch, no remount in
-    ///     between -- a remount would have discarded this very `RefTableRuntime`). Deleting the object
-    ///     therefore also deletes that genesis record, and this is still safe: the guard above
-    ///     (`!prepared->birth_contribution`) is set only by a `NamespaceBirth` op, which INV-1's
-    ///     contiguity rule lets `applyRefLogTxn` accept only against an EMPTY table -- so this whole
-    ///     lambda is reachable only while the namespace's ref-log has never durably held anything, and
-    ///     recovery's own base-selection already treats "no `_ckpt` and no listed log" as never-born
-    ///     (the identical verdict it would reach from a `_ckpt` that only ever named this same
-    ///     `life_epoch`, since that epoch's log is provably empty here too);
-    ///   - what STAYS true: every call site below still drives the lane to a TERMINAL state
-    ///     (`Closed`/`Faulted`) that only resumes under a FRESH writer epoch (a remount), and a fresh
-    ///     epoch's own `resolveNamespaceLife` re-reads the catalog, finds this SAME incarnation still
-    ///     `Live` (this delete touches no catalog entry), and its recovery walk reaches
-    ///     `readCkpt`'s absent-object branch rather than a merge onto this attempt's now-deleted body.
-    /// NEGATIVE CASE, confirmed rather than assumed: a `Live` namespace that has ever durably committed
-    /// so much as its own genesis transaction can never reach this lambda again -- a second
-    /// `NamespaceBirth` against non-empty state fails `applyRefLogTxn` during PREPARATION (before
-    /// `prepared->birth_contribution` is even considered here), so no call site below is reachable for
-    /// a namespace whose `_ckpt` anything else depends on. `_ckpt` has no repair path, so this
-    /// reachability bound -- not merely the terminal-lane argument -- is what makes the delete safe.
-    /// Mirrors the GC-side backstop for the REMOVED-namespace case (`Gc/CasGc.cpp`'s "THE `_ckpt`
-    /// BACKSTOP", which explicitly defers "the ordinary delete of this object by exact token" to Stage
-    /// B's lifecycle -- this is that delete, for the NEVER-BORN case the GC backstop cannot reach
-    /// (namespace cleanup runs only for `Removed` namespaces, and a birth that never lands never gets
-    /// there). Best-effort and NEVER THROWS: one stubborn HEAD/delete must never turn an already-failed
-    /// commit into a second, unrelated failure the caller has to untangle from the real one.
-    const auto cleanupOrphanedBirthCkptBestEffort = [&]
-    {
-        if (!prepared->birth_contribution)
-            return;
-        chassert(rt->life);
-        try
-        {
-            const String ckpt_key = layout.refCkptKey(*rt->life);
-            if (const HeadResult ckpt_head = backend.head(ckpt_key); ckpt_head.exists)
-                backend.deleteExact(ckpt_key, ckpt_head.token);   /// NotFound/TokenMismatch tolerated
-        }
-        catch (...)   // NOLINT(bugprone-empty-catch)
-        {
-            /// Best-effort: the ORIGINAL failure this attempt is about to report is what the caller
-            /// must see, never a secondary failure from tidying up debris.
-        }
-    };
+    /// [CKPT-FAILED-BIRTH-DEBRIS] REMOVED (increment review Critical B, BACKLOG `{#ckpt-failed-birth-debris}`
+    /// reopened, `{#ckpt-neverborn-gc-backstop}` filed): the best-effort cleanup that used to live here
+    /// deleted `_ckpt` by a FRESH `head()` read at cleanup time, never a token captured from this
+    /// attempt's own publish -- so it deleted WHATEVER was at the key when it ran, not proven still to
+    /// be this attempt's bytes. All three of its call sites sit inside the `CORRUPTED_DATA` path, below
+    /// `getCurrentExceptionCode() != ErrorCodes::CORRUPTED_DATA` -- i.e. every branch that called it had
+    /// just PROVEN a different object occupies the derived key, directly contradicting the safety
+    /// argument's premise ("reachable only while the namespace's ref-log has never durably held
+    /// anything"). A namespace's ref-log with a live occupant at the derived key is not empty by the
+    /// very fact that triggered the call. Concretely: a successor that legitimately owns the same live
+    /// incarnation (a remount, INV-2's ordinary epoch-seal handoff) may have already read `_ckpt` for
+    /// its own recovery before this cleanup ran, and the delete could destroy a genesis record
+    /// (`life_epoch`, recorded nowhere else, no repair path) that successor's own future recovery still
+    /// needs -- with no way to tell that case apart from ordinary debris at cleanup time. A captured
+    /// token does not close this either: a successor that only READ `_ckpt` (never re-wrote it) leaves
+    /// the token matching, so a token-gated delete would still succeed and destroy what that successor
+    /// leaned on. Removed rather than patched, per the project's own fail-close principle: never take a
+    /// destructive action on a fallback path when the safe alternative is to skip it and surface the
+    /// gap. The trade, named rather than left implicit: debris now SURVIVES (a drained server root
+    /// carrying it will refuse decommission, `claimOwnerOrThrow` -> `CORRUPTED_DATA`, until a backstop
+    /// exists) instead of risking an unrecoverable delete of a live successor's genesis record. The
+    /// backstop -- independently re-verifying emptiness with a real LIST, never inferring it from one
+    /// attempt's own conflict -- is `{#ckpt-neverborn-gc-backstop}`, not built here.
 
     /// Install the exact attempt before the first possible send. This is NOT preparation -- it mutates
     /// `RefTableRuntime` and takes `state_mutex` -- so it stays here, between preparation and the first
@@ -3062,17 +3024,17 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
     }
     if (!attempt_armed)
     {
-        /// NO cleanup call here (review C1): unlike the three call sites below, this arm makes NO lane
-        /// transition -- it is reached whenever the lane is not what THIS attempt expected, including
-        /// `getGreatestApplied() != candidate_base_id`, which means some OTHER append for this table
-        /// already advanced applied state. That other append can be the birth itself, whose `_ckpt` a
-        /// cleanup call here would then delete out from under it -- the same harm class the ambiguous
-        /// `Writing -> Wedged` branch is deliberately excluded to avoid, against an object with no
-        /// repair path (BACKLOG `{#ckpt-damage-no-repair-path}`). "`putIfAbsentControlled` was never
-        /// reached" is true of THIS attempt; it says nothing about whether a DIFFERENT attempt for this
-        /// same namespace already made the birth durable. The debris this arm would otherwise reclaim
-        /// is still reclaimed by the three call sites below and by the GC backstop; losing it here
-        /// costs nothing, and the safe direction on an unrecoverable delete is not deleting.
+        /// NO cleanup call here (review C1, and the whole class removed by increment review Critical B):
+        /// this arm makes NO lane transition -- it is reached whenever the lane is not what THIS attempt
+        /// expected, including `getGreatestApplied() != candidate_base_id`, which means some OTHER
+        /// append for this table already advanced applied state. That other append can be the birth
+        /// itself, whose `_ckpt` a cleanup call here would then delete out from under it -- the same harm
+        /// class the ambiguous `Writing -> Wedged` branch is deliberately excluded to avoid, against an
+        /// object with no repair path (BACKLOG `{#ckpt-damage-no-repair-path}`). "`putIfAbsentControlled`
+        /// was never reached" is true of THIS attempt; it says nothing about whether a DIFFERENT attempt
+        /// for this same namespace already made the birth durable. Now that Critical B removed the other
+        /// call sites too, `_ckpt` debris from a never-born namespace is reclaimed only by the future
+        /// GC-level backstop (`{#ckpt-neverborn-gc-backstop}`), never here.
         complete_error(chunk_survivors, std::make_exception_ptr(Exception(
             ErrorCodes::LOGICAL_ERROR,
             "CAS ref-log append for namespace '{}': lane changed before attempt {}-{} could be armed",
@@ -3154,10 +3116,6 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
                 rt->append_attempt.reset();
                 rt->lane_state = RefLaneState::Faulted;
             }
-            /// Conclusive negative for THIS attempt regardless of the unread occupant's identity --
-            /// `putIfAbsentControlled` already proved a different object occupies our derived key, so
-            /// our own bytes never landed. See the note above the lambda.
-            cleanupOrphanedBirthCkptBestEffort();
             complete_error(chunk_survivors, std::make_exception_ptr(Exception(
                 ErrorCodes::CORRUPTED_DATA,
                 "CAS ref-log append for namespace '{}': a DIFFERENT object occupies the id {}-{} this table "
@@ -3180,9 +3138,6 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
                 rt->append_attempt.reset();
                 rt->lane_state = RefLaneState::Closed;
             }
-            /// Our bytes provably never landed and never can (see the comment two lines up) -- safe to
-            /// reclaim the birth's `_ckpt`.
-            cleanupOrphanedBirthCkptBestEffort();
             complete_error(chunk_survivors, std::make_exception_ptr(Exception(ErrorCodes::INVALID_STATE,
                 "CAS ref-log append for namespace '{}': writer epoch {} was CLOSED by a successor's epoch "
                 "seal at {}-{}, which conclusively rejects this transaction (it was never acknowledged). "
@@ -3209,9 +3164,6 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
             rt->append_attempt.reset();
             rt->lane_state = RefLaneState::Faulted;
         }
-        /// Our bytes provably never landed here either -- a genuine breach is still a conclusive
-        /// negative for THIS attempt's own PUT.
-        cleanupOrphanedBirthCkptBestEffort();
         on_impossible_interference(attempt_key,
             fmt::format("ref-log append for namespace '{}' txn {}-{} observed a DIFFERENT object already at "
                 "the id it derived, and it is not an epoch seal of this namespace ({})",

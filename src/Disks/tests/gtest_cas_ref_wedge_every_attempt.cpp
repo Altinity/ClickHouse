@@ -956,15 +956,24 @@ TEST(CasRefWedgeEveryAttempt, AppendSiteMeetingASuccessorSealIsAConclusiveReject
            "that this mount has lost its lease and does not know it";
 }
 
-/// [CKPT-FAILED-BIRTH-DEBRIS] (BACKLOG `{#ckpt-failed-birth-debris}`, closed by Stage B Task 3): a
-/// GENESIS birth (never-born `ns`, so `precommitAdd` prepends `namespace_birth`) whose `_ckpt` publish
-/// lands but whose ref-log PUT is then conclusively rejected by a successor's epoch seal at the exact
-/// id it derived -- the identical scenario as the test above, but at sequence 1 of a namespace that has
-/// never had a `_ckpt` before, so `commitRefChunk` is its FIRST writer. Before this task, that `_ckpt`
-/// was permanent debris: namespace cleanup runs only for `Removed` namespaces, and this one never
-/// reaches `Live`, so nothing else ever reclaims it (`Gc/CasGc.cpp`'s own `_ckpt` backstop is the
-/// REMOVED-namespace case; this is the never-born one it explicitly cannot reach).
-TEST(CasRefWedgeEveryAttempt, BirthCkptIsReclaimedWhenTheGenesisTransactionIsConclusivelyRejected)
+/// [CKPT-FAILED-BIRTH-DEBRIS] REVERSED (increment review Critical B; BACKLOG `{#ckpt-failed-birth-debris}`
+/// reopened, `{#ckpt-neverborn-gc-backstop}` filed). This test used to pin the OPPOSITE of what it now
+/// asserts: Task 3's `cleanupOrphanedBirthCkptBestEffort` deleted `_ckpt` here by a FRESH `head()` read
+/// at cleanup time, not a token captured from this attempt's own publish, and every branch that called it
+/// -- this one included -- had just PROVEN a different object occupies the derived key, directly
+/// contradicting the "reachable only while the ref-log has never durably held anything" argument that
+/// made the delete look safe. A successor that legitimately owns the same live incarnation (an ordinary
+/// INV-2 epoch-seal handoff, e.g. after a remount) may already have read this SAME `_ckpt` for its own
+/// recovery before this cleanup could run, and the delete could destroy the one genesis record
+/// (`life_epoch`) that successor's own future recovery still needs, with no way to tell that case apart
+/// from ordinary debris at cleanup time. The cleanup was removed entirely rather than patched (see
+/// `CasRefLedger.cpp`'s comment at the removed call sites for why a captured token does not close the
+/// gap either). The trade, named rather than hidden: `_ckpt` debris from a never-born namespace now
+/// SURVIVES a conclusively-rejected genesis birth -- a drained server root carrying it will refuse
+/// decommission (`claimOwnerOrThrow` -> `CORRUPTED_DATA`) until `{#ckpt-neverborn-gc-backstop}` lands --
+/// which is the right side of the trade against an unrecoverable delete of a live successor's only
+/// genesis record.
+TEST(CasRefWedgeEveryAttempt, BirthCkptOfANeverBornNamespaceSurvivesAConclusiveRejection)
 {
     auto backend = std::make_shared<WedgeTestBackend>();
     auto store = openPool(backend);
@@ -983,26 +992,22 @@ TEST(CasRefWedgeEveryAttempt, BirthCkptIsReclaimedWhenTheGenesisTransactionIsCon
 
     expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&] { publishEmptyPart(store, ns, "x"); });
 
-    EXPECT_FALSE(backend->get(ckpt_key).has_value())
-        << "the birth's own _ckpt was published (step 2 of the ordering spec §3 requires), but this "
-           "attempt's ref-log PUT was conclusively rejected (step below it never sent) -- the orphaned "
-           "_ckpt must be reclaimed here, not left as permanent debris under a namespace that never "
-           "reached Live";
+    EXPECT_TRUE(backend->get(ckpt_key).has_value())
+        << "the birth's own _ckpt was published (step 2 of the ordering spec §3 requires), and this "
+           "attempt's ref-log PUT was conclusively rejected (step below it never sent) -- but nothing may "
+           "delete _ckpt on this path any more (increment review Critical B), so it survives as debris "
+           "rather than risk deleting a live successor's only genesis record";
 }
 
-/// THE NEGATIVE ROW the closure's own safety condition demands: a `_ckpt` belonging to a namespace
-/// that DID reach `Live` must NEVER be deleted by this cleanup, no matter how a LATER transaction on
-/// that same namespace fails. `cleanupOrphanedBirthCkptBestEffort` is gated on `prepared->birth_contribution`,
-/// which `prepareRefChunk` sets ONLY when the table's lifecycle is not yet `Live` -- so an already-Live
-/// table's later chunks never carry one, and the cleanup call is a guaranteed no-op for them. This test
-/// proves that guard holds in practice, not just by reading the code: one ordinary publish makes `ns`
-/// genuinely `Live` (it IS the birth, and it publishes the REAL `_ckpt`), then a THIRD chunk (the
-/// publish itself already spends two: precommit-add, then promote) meets the identical successor-seal
-/// conflict the test above exercises -- same conclusive rejection, same cleanup call site -- and the
-/// `_ckpt` this namespace's actual birth published must survive it byte-for-byte. `_ckpt` has no
-/// repair path (BACKLOG
-/// `{#ckpt-damage-no-repair-path}`), so this is the row that keeps the closure from being one refactor
-/// away from deleting a live namespace's only genesis record.
+/// A `_ckpt` belonging to a namespace that DID reach `Live` must survive no matter how a LATER
+/// transaction on that same namespace fails -- true unconditionally now that increment review Critical
+/// B removed the only code that ever deleted `_ckpt` on this path at all, but kept as its own pin: one
+/// ordinary publish makes `ns` genuinely `Live` (it IS the birth, and it publishes the REAL `_ckpt`),
+/// then a THIRD chunk (the publish itself already spends two: precommit-add, then promote) meets the
+/// identical successor-seal conflict the test above exercises -- same conclusive rejection -- and the
+/// `_ckpt` this namespace's actual birth published must survive it byte-for-byte. `_ckpt` has no repair
+/// path (BACKLOG `{#ckpt-damage-no-repair-path}`), so this is the row that would catch a future
+/// reintroduction of the removed cleanup landing back on an already-Live namespace's `_ckpt`.
 TEST(CasRefWedgeEveryAttempt, BirthCkptOfAnAlreadyLiveNamespaceSurvivesALaterConclusiveRejection)
 {
     auto backend = std::make_shared<WedgeTestBackend>();
