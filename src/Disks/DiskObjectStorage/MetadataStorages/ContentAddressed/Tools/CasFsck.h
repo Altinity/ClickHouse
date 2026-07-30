@@ -228,9 +228,10 @@ inline constexpr std::array kFsckHardFindings{
 /// without visiting them defeats it. Bump it only after all three are done.
 ///
 /// AND IT REACHES NO PROSE. The rule is also restated in `docs/superpowers/cas/08-testing-and-soak.md`
-/// and in the soak harness's docstrings; those restatements have gone stale before (two of them were
-/// wrong about the exit set on the day this assert was written) and nothing here can break a build over
-/// them. They are a fourth surface, unfenced by construction.
+/// and in the soak harness's comments and messages; those restatements have gone stale before -- more
+/// than once, about the exit set -- and nothing here can break a build over them. (No count is given,
+/// for the same reason the paragraph above gives none: nobody keeping a tally of restatements can
+/// promise its own count will not go stale next.) They are a fourth surface, unfenced by construction.
 static_assert(kFsckHardFindings.size() == 6,
     "A hard finding was added to or removed from `kFsckHardFindings`, which is `FsckReport::clean`. "
     "Before updating this count, render it in ALL THREE code surfaces: `formatFsckSummary`'s line, "
