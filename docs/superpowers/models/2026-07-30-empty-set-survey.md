@@ -103,3 +103,50 @@ Finished checking temporal properties in 00s at 2026-07-30 18:07:21
 9 states generated, 4 distinct states found, 0 states left on queue.
 Finished in 00s at (2026-07-30 18:07:21)
 ```
+
+## `CaRefWriterCleanupCore`: false temporal violation {#caref-writer-cleanup-core-false-temporal-violation}
+
+This is a TLC tool defect in the supplied `tmp/tla2tools.jar`, not a model
+defect and not an artefact of the liveness formula over an empty domain. The
+jar identifies itself as TLC 2.19 (2024-08-08, revision `5a47802`).
+
+The relevant configuration assigns `Builds = {}` and selects
+`StalePrecommitEventuallyGone`. The module defines that property as
+`StaleExists ~> NoStale`, where `StaleExists` is an existential quantification
+over `Builds` and `NoStale` is the corresponding universal quantification.
+By TLA+ semantics, the former is `FALSE`, the latter is `TRUE`, and `P ~> Q`
+means `[] (P => <> Q)`. Thus the property is true in every behavior. The two
+weak-fairness conjuncts in `Spec` do not change that result: weak fairness of
+an action that is never enabled holds vacuously.
+
+The reported trace is consistent with those state predicates: every
+build-indexed function is `<< >>`. Independent `INVARIANT NoStale` checking
+passes on exactly the same four-state graph. Replacing `~>` by its expansion
+`[] (StaleExists => <> NoStale)` does not change the bad result, which rules
+out an operator-precedence or shorthand-expansion error.
+
+### Prediction and confirmation {#caref-writer-cleanup-core-prediction-and-confirmation}
+
+Prediction: if the violation is caused by the supplied TLC's temporal checker,
+rather than this model, then a throwaway one-variable module whose only
+property is `EventuallyTrue == <> TRUE` will also report a violation with the
+supplied jar, while a current official TLC jar will accept both that module and
+the original empty-build configuration.
+
+This prediction held. The files `tmp/exp_tautology.tla` and
+`tmp/exp_tautology.cfg` define `Spec == Init /\ [][Next]_x` and
+`EventuallyTrue == <> TRUE`. TLC 2.19 reported the same initial-state plus
+stuttering counterexample. It also did so after removing the two fairness
+conjuncts from a throwaway copy of `CaRefWriterCleanupCore`, so fairness is
+not the mechanism. A current official jar (`tla2tools` 2026.07.18.145032,
+revision `30cc360`) completed the minimal property successfully, then
+completed the unmodified `CaRefWriterCleanupCore_empty_builds.cfg`
+configuration successfully: four distinct states, no temporal error.
+
+Therefore an empty `Builds` set is semantically valid for this model and this
+property. Do not add an `ASSUME Builds # {}` merely to hide this result; that
+would turn a checker defect into a model restriction. `CaBuildRootPrecommit`'s
+explicit `ASSUME` is the right pattern only when the model genuinely requires
+a non-empty domain. Empty-set conventions should run liveness properties with
+a TLC version that passes the `<> TRUE` smoke test, keeping each run's
+`-metadir` unique as usual.
