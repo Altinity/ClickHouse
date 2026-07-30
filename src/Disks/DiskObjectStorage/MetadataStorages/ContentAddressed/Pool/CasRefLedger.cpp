@@ -2827,6 +2827,42 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
         }
     }
 
+    /// [CKPT-FAILED-BIRTH-DEBRIS] (BACKLOG `{#ckpt-failed-birth-debris}`): best-effort cleanup for a
+    /// birth chunk whose `_ckpt` published above but whose ref-log `PUT` below then fails on one of the
+    /// THREE branches that PROVE this attempt's bytes never landed and never can (attempt-arm race,
+    /// occupant-unreadable, `SuccessorSeal`, genuine foreign interference -- every use site below is one
+    /// of those). Deliberately NOT used on the ambiguous-exception branch (transfers `Writing` ->
+    /// `Wedged`): an ambiguous outcome might still have landed, and deleting there could erase the one
+    /// genesis-epoch record nothing else will ever recover (see the comment above this publish).
+    ///
+    /// Safe under TODAY's sentinel keying (every incarnation of `ns` shares one `_ckpt` key, per
+    /// `NamespaceLifeId::stageATransition`) precisely because every call site below also drives the
+    /// lane to a TERMINAL state (`Closed`/`Faulted`) that only resumes under a FRESH writer epoch: the
+    /// next successful birth attempt for `ns` reaches `publishCkpt`'s absent-object create path, not a
+    /// merge onto this attempt's now-deleted body, so nothing is lost by removing it. Mirrors the
+    /// GC-side backstop for the REMOVED-namespace case (`Gc/CasGc.cpp`'s "THE `_ckpt` BACKSTOP", which
+    /// explicitly defers "the ordinary delete of this object by exact token" to Stage B's lifecycle --
+    /// this is that delete, for the NEVER-BORN case the GC backstop cannot reach (namespace cleanup
+    /// runs only for `Removed` namespaces, and a birth that never lands never gets there). Best-effort
+    /// and NEVER THROWS: one stubborn HEAD/delete must never turn an already-failed commit into a
+    /// second, unrelated failure the caller has to untangle from the real one.
+    const auto cleanupOrphanedBirthCkptBestEffort = [&]
+    {
+        if (!prepared->birth_contribution)
+            return;
+        try
+        {
+            const String ckpt_key = layout.refCkptKey(NamespaceLifeId::stageATransition(ns));
+            if (const HeadResult ckpt_head = backend.head(ckpt_key); ckpt_head.exists)
+                backend.deleteExact(ckpt_key, ckpt_head.token);   /// NotFound/TokenMismatch tolerated
+        }
+        catch (...)   // NOLINT(bugprone-empty-catch)
+        {
+            /// Best-effort: the ORIGINAL failure this attempt is about to report is what the caller
+            /// must see, never a secondary failure from tidying up debris.
+        }
+    };
+
     /// Install the exact attempt before the first possible send. This is NOT preparation -- it mutates
     /// `RefTableRuntime` and takes `state_mutex` -- so it stays here, between preparation and the first
     /// send. From this point every exit must make one explicit lane transition; there is no independent
@@ -2847,6 +2883,9 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
     }
     if (!attempt_armed)
     {
+        /// Proven pre-send: `putIfAbsentControlled` was never reached, so a birth chunk's ref-log bytes
+        /// definitely never landed under this attempt -- safe to reclaim its `_ckpt`, per the note above.
+        cleanupOrphanedBirthCkptBestEffort();
         complete_error(chunk_survivors, std::make_exception_ptr(Exception(
             ErrorCodes::LOGICAL_ERROR,
             "CAS ref-log append for namespace '{}': lane changed before attempt {}-{} could be armed",
@@ -2928,6 +2967,10 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
                 rt->append_attempt.reset();
                 rt->lane_state = RefLaneState::Faulted;
             }
+            /// Conclusive negative for THIS attempt regardless of the unread occupant's identity --
+            /// `putIfAbsentControlled` already proved a different object occupies our derived key, so
+            /// our own bytes never landed. See the note above the lambda.
+            cleanupOrphanedBirthCkptBestEffort();
             complete_error(chunk_survivors, std::make_exception_ptr(Exception(
                 ErrorCodes::CORRUPTED_DATA,
                 "CAS ref-log append for namespace '{}': a DIFFERENT object occupies the id {}-{} this table "
@@ -2950,6 +2993,9 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
                 rt->append_attempt.reset();
                 rt->lane_state = RefLaneState::Closed;
             }
+            /// Our bytes provably never landed and never can (see the comment two lines up) -- safe to
+            /// reclaim the birth's `_ckpt`.
+            cleanupOrphanedBirthCkptBestEffort();
             complete_error(chunk_survivors, std::make_exception_ptr(Exception(ErrorCodes::INVALID_STATE,
                 "CAS ref-log append for namespace '{}': writer epoch {} was CLOSED by a successor's epoch "
                 "seal at {}-{}, which conclusively rejects this transaction (it was never acknowledged). "
@@ -2976,6 +3022,9 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
             rt->append_attempt.reset();
             rt->lane_state = RefLaneState::Faulted;
         }
+        /// Our bytes provably never landed here either -- a genuine breach is still a conclusive
+        /// negative for THIS attempt's own PUT.
+        cleanupOrphanedBirthCkptBestEffort();
         on_impossible_interference(attempt_key,
             fmt::format("ref-log append for namespace '{}' txn {}-{} observed a DIFFERENT object already at "
                 "the id it derived, and it is not an epoch seal of this namespace ({})",

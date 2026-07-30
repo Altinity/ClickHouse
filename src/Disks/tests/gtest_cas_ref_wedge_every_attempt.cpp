@@ -921,6 +921,39 @@ TEST(CasRefWedgeEveryAttempt, AppendSiteMeetingASuccessorSealIsAConclusiveReject
            "that this mount has lost its lease and does not know it";
 }
 
+/// [CKPT-FAILED-BIRTH-DEBRIS] (BACKLOG `{#ckpt-failed-birth-debris}`, closed by Stage B Task 3): a
+/// GENESIS birth (never-born `ns`, so `precommitAdd` prepends `namespace_birth`) whose `_ckpt` publish
+/// lands but whose ref-log PUT is then conclusively rejected by a successor's epoch seal at the exact
+/// id it derived -- the identical scenario as the test above, but at sequence 1 of a namespace that has
+/// never had a `_ckpt` before, so `commitRefChunk` is its FIRST writer. Before this task, that `_ckpt`
+/// was permanent debris: namespace cleanup runs only for `Removed` namespaces, and this one never
+/// reaches `Live`, so nothing else ever reclaims it (`Gc/CasGc.cpp`'s own `_ckpt` backstop is the
+/// REMOVED-namespace case; this is the never-born one it explicitly cannot reach).
+TEST(CasRefWedgeEveryAttempt, BirthCkptIsReclaimedWhenTheGenesisTransactionIsConclusivelyRejected)
+{
+    auto backend = std::make_shared<WedgeTestBackend>();
+    auto store = openPool(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/birth_ckpt_debris"};
+
+    const RefTxnId genesis{store->liveWriterEpoch(), 1};
+    const String ckpt_key = layout.refCkptKey(NamespaceLifeId::stageATransition(ns));
+    ASSERT_FALSE(backend->get(ckpt_key).has_value()) << "nothing has ever been written for this namespace yet";
+
+    /// A successor's epoch seal lands at exactly the id this never-born table's genesis birth derives.
+    backend->conflict_substr = layout.refLogKey(NamespaceLifeId::stageATransition(ns), genesis);
+    backend->conflict_bytes = epochSealBytes(ns, genesis);
+    backend->conflict_count = 1;
+
+    expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&] { publishEmptyPart(store, ns, "x"); });
+
+    EXPECT_FALSE(backend->get(ckpt_key).has_value())
+        << "the birth's own _ckpt was published (step 2 of the ordering spec §3 requires), but this "
+           "attempt's ref-log PUT was conclusively rejected (step below it never sent) -- the orphaned "
+           "_ckpt must be reclaimed here, not left as permanent debris under a namespace that never "
+           "reached Live";
+}
+
 /// The same conflict, but the read that would tell a seal from a breach fails. We must then decide
 /// NEITHER: fencing the mount would be a guess, and reporting a conclusive rejection would acknowledge
 /// a deposition nobody observed. The id is not consumed, so the next attempt re-derives it and
