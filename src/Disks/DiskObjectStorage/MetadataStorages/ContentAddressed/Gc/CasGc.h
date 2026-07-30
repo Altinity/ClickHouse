@@ -58,7 +58,14 @@ enum class UniversePolicy : uint8_t
     /// proofs decide the gate on their own. Only gtests may assert this.
     AuthoritativeForTest = 1,
 
-    /// STAGE B'S TASK 7b EDITS EXACTLY THIS LINE.
+    /// STAGE B'S TASK 7b EDITS EXACTLY THIS LINE. Flipping it un-suppresses destruction, so every test
+    /// that carries a STAGE-A RETURN ITEM marker for a weakened deletion assertion must be restored in
+    /// the same change: `CasGcLog.EmitsStartFinishWithCounts` (gtest_cas_gc_log.cpp), the displacement
+    /// test in `gtest_ca_wiring.cpp` that currently asserts `EXPECT_GT(after.unreachable, 0u)`, and the
+    /// three stateless tests `05008_ca_gc_snap_prune.sh`, `04290_content_addressed_no_leftovers.sh` and
+    /// `04295_content_addressed_mutation_no_leftovers.sh`. Grep for "STAGE-A RETURN ITEM" to find them
+    /// all -- this line is where the flip happens, but the marker in a test file alone is not enough to
+    /// surface that the flip obligates a restoration there too.
     kDefault = StageA_Suppressed,
 };
 

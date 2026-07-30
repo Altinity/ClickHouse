@@ -1,5 +1,7 @@
 rows	600000
 grew_above_baseline 1
-fsck_unreachable 0
+marked_something 1
+pipeline_retained_nonzero 1
+fsck_unreachable_gt_0 1
 fsck_dangling 0
 pool_meta_present 1
