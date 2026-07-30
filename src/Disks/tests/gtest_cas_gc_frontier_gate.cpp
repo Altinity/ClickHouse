@@ -213,6 +213,52 @@ TEST(CasGcFrontierGate, TheSameHiddenPlusOneSurvivesEvenWhenTheUniverseIsDeclare
            "incomplete and nothing irreversible runs, even though the caller declared the universe closed";
 }
 
+/// Review I4: the two arms above assert "nothing was deleted" and "nothing was deleted" -- neither now
+/// distinguishes the gate correctly refusing from the round simply never deleting anything at all. This
+/// is the replacement positive control: `hidden` is genuinely folded through its OWN drop of the same
+/// blob (an honest exact-key read of a record the LIST still hides -- the arithmetic-intake mechanism
+/// this whole file is about), so its frontier is REALLY proven, not merely declared so, and the blob is
+/// REALLY unreferenced by both namespaces. The round drains it. Proves the machinery this task changed
+/// can still reclaim genuine garbage once every namespace is honestly proven -- the two zero-deletion
+/// arms above would pass identically if the round were simply incapable of ever deleting anything.
+TEST(CasGcFrontierGate, TheSameBlobDrainsOnceHiddenGenuinelyProvesItsOwnFrontier)
+{
+    auto backend = std::make_shared<CountingHintHoleBackend>();
+    const RootNamespace hidden{"00/hidden@cas@"};
+    const RootNamespace visible{"00/visible@cas@"};
+    const DB::UInt128 blob(0x5ade);
+
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    Gc gc(store, kGc);
+
+    /// `hidden`'s BIRTH is folded (and its cursor SEALED) with everything still listed -- a namespace
+    /// with no `_ckpt` (the raw-fixture admission this file's helper uses never publishes one) has no
+    /// genesis signal EXCEPT a sealed cursor or a visible LIST, so a real fold first is what makes an
+    /// arithmetic (cursor-relative) genesis available at all for what follows.
+    const ManifestRef kept = publish(*backend, layout, hidden, "kept_ref", 1, blob);
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+    store->renewWatermarkOnce();
+
+    /// NOW `hidden` drops its own reference (written while still fully listed, so the raw fixture's own
+    /// LIST -- finding the greatest existing log id, to derive the next one -- sees the truth), and
+    /// ONLY THEN does its whole prefix vanish from every subsequent LIST. With a sealed cursor already
+    /// in hand the walk's genesis is arithmetic (`cursor + 1`), so this drop is found and folded by
+    /// exact key alone -- the arithmetic-intake mechanism this whole file is about, exercised honestly
+    /// rather than declared past by fiat.
+    dropRefTransition(*backend, layout, hidden, "kept_ref", kept);
+    backend->hidePrefix(layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(hidden)));
+
+    const ManifestRef dropped = publish(*backend, layout, visible, "dropped_ref", 2, blob);
+    dropRefTransition(*backend, layout, visible, "dropped_ref", dropped);
+
+    drive(store, gc, /*rounds*/ 5, UniversePolicy::AuthoritativeForTest);
+
+    EXPECT_FALSE(backend->head(blobKeyOf(layout, blob)).exists)
+        << "both namespaces genuinely proved their frontier and the blob is genuinely unreferenced -- "
+           "the round must still be able to reclaim it";
+}
+
 /// AND THE PER-NAMESPACE LOGIC IS WHAT SAVES IT. Identical to the arm above except that the hidden
 /// namespace was folded once first, so it carries a sealed cursor and is therefore IN the universe even
 /// though the hint has gone silent about it. The round probes its expected-next by exact key, finds the

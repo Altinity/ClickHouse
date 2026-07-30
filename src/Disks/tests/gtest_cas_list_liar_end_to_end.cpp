@@ -454,6 +454,60 @@ TEST(CasListLiarEndToEnd, TheSameHiddenNamespacesBlobSurvivesEvenWhenTheUniverse
            "incomplete and nothing irreversible runs, even though the caller declared the universe closed";
 }
 
+/// Review I4: the two arms above both assert "nothing was deleted", which no longer distinguishes the
+/// gate correctly refusing from the round simply never deleting anything. Replacement positive control:
+/// `hidden` drops its OWN reference too (still by exact key, still hidden from every listing), so its
+/// frontier is REALLY proven by the arithmetic-intake exact-key probe -- never declared so by fiat --
+/// and the blob is REALLY unreferenced by both namespaces. The round drains it.
+TEST(CasListLiarEndToEnd, TheSameBlobDrainsOnceHiddenGenuinelyProvesItsOwnFrontier)
+{
+    auto backend = std::make_shared<LiarBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    const RootNamespace hidden{"00/hidden@cas@"};
+    const RootNamespace visible{"00/visible@cas@"};
+    const DB::UInt128 blob(0x5ade);
+
+    publishAt(*backend, layout, hidden, RefTxnId{1, 1}, "kept_ref", 1, blob, /*birth=*/true);
+    const ManifestRef kept = publishedManifest(RefTxnId{1, 1}, 1);
+
+    Gc gc(store, kGc);
+
+    /// `hidden`'s birth is folded (and its cursor SEALED) while everything is still listed -- a
+    /// namespace with no `_ckpt` (`publishAt`'s raw-fixture admission never publishes one) has no
+    /// genesis signal except a sealed cursor or a visible LIST, so a real fold first is what makes an
+    /// arithmetic (cursor-relative) genesis available for what follows.
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+    store->renewWatermarkOnce();
+
+    /// NOW `hidden` drops its own reference, and ONLY THEN does its whole prefix vanish from LIST. With
+    /// a sealed cursor already in hand, the walk's genesis for `hidden` is arithmetic (`cursor + 1`), so
+    /// this drop is found and folded by exact key alone -- the arithmetic-intake mechanism this whole
+    /// file is about, exercised honestly rather than declared past by fiat. (Hiding only the drop record
+    /// while the birth stays listed re-creates the very trap this control exists to avoid: LIST would
+    /// still report the birth as `hidden`'s tail, and the fold's frozen-tail rule -- correctly -- refuses
+    /// to read past a round's own listed tail even by exact key, so the drop would never fold no matter
+    /// how many rounds ran.)
+    dropAt(*backend, layout, hidden, RefTxnId{1, 2}, "kept_ref", kept);
+    backend->hidePrefix(layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(hidden)));
+
+    publishAt(*backend, layout, visible, RefTxnId{1, 1}, "dropped_ref", 2, blob, /*birth=*/true);
+    const ManifestRef dropped = publishedManifest(RefTxnId{1, 1}, 2);
+    dropAt(*backend, layout, visible, RefTxnId{1, 2}, "dropped_ref", dropped);
+
+    for (int i = 0; i < 5; ++i)
+    {
+        runRegularRoundReclaiming(gc);
+        store->renewWatermarkOnce();
+    }
+
+    ASSERT_GT(backend->holesServed(), 0u)
+        << "the omission was never actually served -- the test would pass vacuously";
+    EXPECT_FALSE(backend->head(blobKeyOf(layout, blob)).exists)
+        << "both namespaces genuinely proved their frontier and the blob is genuinely unreferenced -- "
+           "the round must still be able to reclaim it";
+}
+
 /// ===================== FSCK =====================
 ///
 /// fsck runs TWO passes over a namespace's ref stream and they do not agree about what a listing is.
