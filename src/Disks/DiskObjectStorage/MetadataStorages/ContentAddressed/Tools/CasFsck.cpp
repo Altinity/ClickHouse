@@ -406,7 +406,7 @@ void checkRefStream(Backend & backend, const Layout & layout, const RootNamespac
             return;   /// frontier: nothing above claims to exist, and the walk proved everything below it
 
         const EpochCrossResult crossing =
-            crossEpochFromSeal(backend, layout, ns, resolved_through, last_applied_is_seal, *later);
+            crossEpochFromSeal(backend, layout, ns, resolved_through, last_applied_is_seal, *later, life);
         if (!crossing.proved())
         {
             verdicts.recordUnchecked(report, ns, layout.refLogKey(life, *expected),

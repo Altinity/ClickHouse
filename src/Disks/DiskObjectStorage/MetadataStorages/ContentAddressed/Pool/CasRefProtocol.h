@@ -730,14 +730,15 @@ struct EpochCrossResult
 /// disagree about when an epoch boundary has been proved -- a rule that says which records a cut
 /// contains cannot have two implementations.
 ///
-/// `life`: the namespace's life, if the caller already resolved it this round (review C3 -- a fold that
-/// re-resolves independently per call site can disagree with the walk it is nested inside if the
-/// namespace is dropped and recreated between the two reads). `nullopt` resolves via
-/// `CasRefCatalog::resolveLifeOrSentinel` internally, for callers with no round-wide resolution to reuse
-/// (fsck's own independent walk).
+/// `life`: the namespace's life, REQUIRED (review NEW-3 -- a `nullopt`-resolves-internally default was
+/// tried once and reintroduced the exact divergence review C3 removed from `Gc::fold`, just relocated
+/// into `CasFsck.cpp`'s independent walk, which had its OWN already-resolved `life` in scope one call
+/// site above and simply did not pass it). Every caller must resolve `life` itself, ONCE, and pass the
+/// SAME value here that it uses for every other read in its own walk -- this function no longer
+/// resolves anything on its own, so there is no second resolution left to disagree with the first.
 EpochCrossResult crossEpochFromSeal(Backend & backend, const Layout & layout, const RootNamespace & ns,
                                     const RefTxnId & from_seal, std::optional<bool> seal_proven,
-                                    const RefTxnId & witness, std::optional<NamespaceLifeId> life = std::nullopt);
+                                    const RefTxnId & witness, const NamespaceLifeId & life);
 
 /// The result of `recoverRefTableDetailed`: the replayed table state plus the identity of the snapshot
 /// recovery actually selected as its base (`nullopt` when it found no snapshot at all).
