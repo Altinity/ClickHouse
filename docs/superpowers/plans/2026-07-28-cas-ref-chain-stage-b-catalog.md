@@ -1868,6 +1868,32 @@ model family, each with its runner output pasted.
 `CaGcShardIncarnationCore`, `CaB140DangleMerge` (4 `m_*.cfg` configs): each gets a runner or a
 RECORDED retirement decision. Commit alone.
 
+**Task 10g — the TLC jar itself is broken for temporal properties, and three expectations may be passing
+for the wrong reason.** Established 2026-07-30 with a stated-in-advance prediction that held: the supplied
+`tmp/tla2tools.jar` (TLC 2.19, 2024-08-08, rev `5a47802`) reports a temporal violation for a module whose
+only property is **`EventuallyTrue == <> TRUE`** — a tautology — with an initial-state-plus-stuttering
+counterexample. Removing the fairness conjuncts changes nothing, so fairness is not the mechanism. A current
+official jar (`tla2tools` 2026.07.18.145032, rev `30cc360`) accepts both that module and the
+`CaRefWriterCleanupCore_empty_builds.cfg` configuration that started the investigation.
+
+**The blast radius is bounded, and the bound is itself evidence.** 43 configs carry a `PROPERTY`/`PROPERTIES`
+line, and the green-expecting ones PASS — which they could not if the false violation were universal. So the
+defect needs a reachable stuttering-only suffix, i.e. a state with no enabled action, which is exactly what an
+empty entity set produces. What is genuinely at risk is the other direction:
+
+- [ ] **Re-validate the three `temporal` expectation rows under a jar that passes the `<> TRUE` smoke test**
+  (in `run_refwcleanup.sh`, `run_buildrootprecommit.sh`, `run_disklifecycle.sh`, `run_gcrounddefer.sh`,
+  `run_foldclamp.sh`). **A row that EXPECTS a violation passes under a checker that violates everything** —
+  so each of those three is a candidate for having been green for the wrong reason since it was written.
+- [ ] **Adopt the smoke test as a gate on the checker, not just as a note.** Before trusting any temporal
+  result, run `<> TRUE`; if it violates, the checker is lying and no temporal verdict from it means anything.
+  Two lines, and it would have replaced this entire investigation.
+- [ ] **Do NOT add `ASSUME Builds # {}` to hide the empty-set result** — that converts a checker defect into
+  a model restriction, and the empty set is semantically valid for that model and that property.
+  `CaBuildRootPrecommit`'s `ASSUME` is right only where the model genuinely requires a non-empty domain.
+- [ ] Decide whether to upgrade the pinned jar or keep the old one for safety checking and the new one for
+  temporal work; either way the choice must be recorded where the runners can see it.
+
 **Task 10f — the empty-set blind spot, and the unmodelled destructive gate.** Two findings from
 2026-07-30, both verified by inspection; this sub-task is worth more than the rest of Task 10.
 
