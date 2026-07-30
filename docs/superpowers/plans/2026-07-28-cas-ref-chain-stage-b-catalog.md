@@ -1161,6 +1161,27 @@ the KEY/prefix helpers that ADDRESS ONE LIFE, so it must not (and does not) forb
 - [ ] **Step 2:** → FAIL. **Step 3:** Implement. **Step 4:** CA gate + lanes green.
 - [ ] **Step 5: Commit** `ca: ref — removal lifecycle: fenced terminal, immediate entry delete, deposited-incarnation cleanup`.
 
+**OBLIGATION CARRIED FROM TASK 4-C (placed 2026-07-30, and it gates Task 7b).** 4-C closed R11b by making
+an un-cataloged namespace an ANOMALY. That was my ruling and it is right — but the discrimination I also
+ruled for could not be built there, so as shipped **the anomaly fires on ordinary removal too**, because
+this task's own design deletes the catalog entry LAST and leaves a window where ref objects exist with no
+entry.
+
+Today that costs nothing, since destruction is suppressed anyway. **At Task 7b it would cost everything:**
+`suppress_destructive = !report.anomalies.empty() || …`, so an anomaly suppresses the WHOLE round — meaning
+a pool with any removal in progress would stop reclaiming pool-wide, permanently, for as long as removals
+keep happening. 4-C left a comment saying so; a comment is not a mechanism, and this is exactly the class of
+rule that has failed us repeatedly in this campaign.
+
+- [ ] **Make the un-cataloged-namespace anomaly discriminate, using the removal evidence this task
+  introduces.** Un-cataloged **with** evidence of a removal in progress (the terminal record / `_cleanup`
+  marker) is EXPECTED and may be dropped quietly; un-cataloged **without** it is damage and stays an
+  anomaly. Pin both directions: an ordinary removal must NOT raise it, and a fabricated missing entry with
+  no removal evidence must. Without the negative half, the fix is one refactor away from silently going back
+  to "never fires".
+- [ ] **Then remove the accepted-cost comment 4-C left at that site**, so no reader is told a cost is being
+  accepted after it stopped being accepted.
+
 **Two rulings from the Task 2 review, settled here so Task 5 does not re-derive them.**
 
 - [ ] **CORRECTION — the admission bound does not free at `Live → Removing`.** The sentence above
