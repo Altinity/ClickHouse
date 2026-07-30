@@ -2876,3 +2876,22 @@ finding against a key that is not damage.
 makes it worth fixing is that a hard finding against a non-damaged key trains an operator to
 disbelieve hard findings. Decide between enforcing the reservation in `mountpointObjectKey` and
 narrowing the classifier; the first is the one that makes the existing doc true.
+
+## The stateless drain tests' `PENDING` gauge double-counts {#stateless-pending-double-count}
+
+Found by the review of `76ee70da4a7`, ruled out of scope there because the formula is carried over
+unchanged from before that commit — filed so it is not re-discovered as a new defect.
+
+`04290_content_addressed_no_leftovers.sh` and `04295_content_addressed_mutation_no_leftovers.sh`
+compute `PENDING = pending_candidates + pending_condemned + pending_retired`. But `pending_condemned`
+is documented in `Gc/CasGc.h` as "their total (candidates + retired), the overall pipeline gauge" — so
+the sum is exactly **twice** the true outstanding count.
+
+**Harmless as a signal, misleading as a number.** Both tests use it only as `> 0` / `= 0`, and doubling
+preserves both, so no assertion is wrong. What is wrong is every figure it prints: the failure message
+`GC did not drain the retire pipeline within the bounded loop (pending=64)` reports 64 where the
+pipeline held 32. Those two numbers (64 and 152) were quoted in this session's `05008` diagnosis; the
+conclusion did not depend on their magnitude, but a future diagnosis might.
+
+**Fix:** use `pending_condemned` alone, which is already the total. Do it when either test is next
+touched — most likely at Task 7b, which must restore their deletion assertions anyway.
