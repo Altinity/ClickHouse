@@ -20,6 +20,7 @@
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace DB
 {
@@ -585,7 +586,27 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
 
     const NamespaceListing ref_listing = store.listNamespaces(namespace_prefix);
     recordLifelessKeys(ref_listing);
-    for (const String & ns_str : ref_listing.namespaces)
+
+    /// Important C (increment review): `listNamespaces` is a LIST-based union, so a `Live` catalog
+    /// namespace whose objects LIST omits was never walked and fsck could return `clean()` over it --
+    /// the same diagnostic-oracle-standing-on-what-Stage-B-replaces gap review I2 already closed for
+    /// `rebuildBaseline`. Supplement ADDITIVELY: every catalog-authoritative namespace name joins the
+    /// walk set, never removing anything LIST found on its own (a namespace with ref objects but no
+    /// catalog entry -- the C1 shape -- must still be reachable to this loop's own findings, which is
+    /// exactly what LIST already gives it). `namespace_prefix`-filtered the same way `listNamespaces`
+    /// itself filters, so a scoped fsck run does not suddenly widen to the whole pool.
+    std::vector<String> walk_namespaces = ref_listing.namespaces;
+    {
+        std::set<String> already_walked(walk_namespaces.begin(), walk_namespaces.end());
+        for (const NamespaceLifeId & life : CasRefCatalog::liveUniverse(backend, layout))
+        {
+            const String & ns_str = life.ns.string();
+            if (ns_str.starts_with(namespace_prefix) && already_walked.insert(ns_str).second)
+                walk_namespaces.push_back(ns_str);
+        }
+    }
+
+    for (const String & ns_str : walk_namespaces)
     {
         const RootNamespace ns{ns_str};
         /// RECORD AND CONTINUE, NEVER WEDGE. Everything below is per-namespace, and every one of these

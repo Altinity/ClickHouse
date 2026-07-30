@@ -33,6 +33,20 @@ NamespaceLifeId CasRefCatalog::resolveLifeOrSentinel(Backend & backend, const La
     return NamespaceLifeId::stageATransition(ns);
 }
 
+std::vector<NamespaceLifeId> CasRefCatalog::liveUniverse(Backend & backend, const Layout & layout)
+{
+    const Snapshot snap = read(backend, layout);
+    std::vector<NamespaceLifeId> universe;
+    universe.reserve(snap.catalog.entries.size());
+    for (const CatalogEntry & entry : snap.catalog.entries)
+    {
+        if (entry.state == NsState::Creating)
+            continue;
+        universe.push_back(NamespaceLifeId::fromCatalogEntry(entry.ns, entry.incarnation));
+    }
+    return universe;
+}
+
 namespace
 {
 

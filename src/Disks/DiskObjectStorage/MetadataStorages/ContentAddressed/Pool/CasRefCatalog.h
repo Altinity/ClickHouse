@@ -5,6 +5,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCkpt.h>
 #include <functional>
 #include <optional>
+#include <vector>
 
 namespace DB::Cas
 {
@@ -45,6 +46,12 @@ public:
     /// MINTS a life when none exists rather than falling back to a shared sentinel (a production writer
     /// must never key a genuine first birth at a namespace-independent constant).
     static NamespaceLifeId resolveLifeOrSentinel(Backend & backend, const Layout & layout, const RootNamespace & ns);
+
+    /// Every `Live`/`Removing` life the catalog currently names, ONE catalog GET -- `Gc::discoverUniverse`'s
+    /// own body, factored out so a second caller (`CasFsck.cpp`'s reachability walk, review Important C)
+    /// does not re-derive the identical filter independently and risk disagreeing with it about which
+    /// namespaces exist. `Creating` is excluded: spec §3, no publication can exist yet.
+    static std::vector<NamespaceLifeId> liveUniverse(Backend & backend, const Layout & layout);
 
     /// The generic token-CAS retry loop shared by every catalog mutation, mirroring
     /// `PoolMeta::admitOrValidate`'s loop: read the current snapshot, apply `mutate` to obtain the

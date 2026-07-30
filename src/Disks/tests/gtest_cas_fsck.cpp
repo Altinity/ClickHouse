@@ -194,6 +194,56 @@ TEST(CasFsck, LifelessKeyIsRecordedAndTheHealthyNamespaceIsStillReported)
     EXPECT_EQ(rep.dangling, 0u);
 }
 
+/// Increment review Important C: fsck's namespace universe used to come from `listNamespaces` alone --
+/// a LIST-based union -- so a catalog-`Live` namespace whose ref objects LIST omits entirely was never
+/// walked at all. Admit `ns` into the catalog, publish one real ref-log record into it, then hide `ns`'s
+/// WHOLE ref-object prefix from LIST -- `listNamespaces` alone now finds nothing for `ns` at all, exactly
+/// the gap the review named. fsck must still reach it via the catalog-authoritative supplement
+/// (`CasRefCatalog::liveUniverse`, shared with `Gc::discoverUniverse`) and actually READ the record.
+///
+/// Proves `ref_records_walked`, not `dangling`/`clean()`: `checkRefStream` (which this proves runs) has
+/// its own `_ckpt`-anchored arithmetic walk and so is reachable here, but the SEPARATE dangling-manifest
+/// re-resolution (`manifestStillReferenced`, this file) rides `recoverRefTableDetailed`
+/// (`CasRefProtocol.cpp`), which has NO such anchor -- it enumerates a table's logs/snapshots from LIST
+/// alone with no `_ckpt` fallback, so a namespace hidden from LIST this thoroughly still recovers as
+/// EMPTY there, and a dangling manifest under it would be missed by that one check regardless of this
+/// fix. That is a further, broader gap in a function three consumers share (this file, `Gc::rebuildBaseline`'s
+/// disaster-recovery scan, `CasOrphanManifestSweep`'s active-key set) -- flagged separately, out of scope
+/// for what this test pins.
+TEST(CasFsck, CatalogLiveNamespaceHiddenFromListIsStillWalked)
+{
+    auto backend = std::make_shared<HintHoleBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/hidden_from_list@cas@"};
+
+    casAdmitEntry(*backend, layout, ns);
+    appendRefLogSeed(*backend, layout, ns, {});   // one real record: a birth-only ref-log transaction
+
+    /// `casAdmitEntry` never publishes a `_ckpt` (by its own design), and the write above used
+    /// `appendRefLogSeed`'s hardcoded writer_epoch 1. `checkRefStream`'s own walk needs SOME anchor -- a
+    /// `_ckpt.life_epoch`, a listed snapshot, or a listed log -- to know where to start reading, and this
+    /// test is about to hide every listed one. Without an anchor the walk sees nothing at all and
+    /// correctly treats the namespace as never-born, the same "nothing to probe" trap the I4 replacement
+    /// controls hit and were restructured around (fold-before-hide). fsck has no "fold" step to run
+    /// first, so the anchor is published directly, by exact key, before the hide -- the exact-key GET
+    /// this enables is unaffected by list-hiding either way.
+    const NamespaceLifeId life = NamespaceLifeId::stageATransition(ns);
+    ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(life),
+        encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{1}, .checkpoint_snapshot_id = std::nullopt,
+                              .last_epoch_seal = std::nullopt})).outcome, PutOutcome::Done);
+
+    backend->hidePrefix(layout.refsNamespacePrefix(life));
+
+    FsckReport rep;
+    ASSERT_NO_THROW(rep = runFsck(*store, /*detail*/true));
+    EXPECT_GT(backend->holesServed(), 0u)
+        << "the hide must actually have been exercised by listNamespaces, or this test passes vacuously";
+    EXPECT_GE(rep.ref_records_walked, 1u)
+        << "the namespace must be discovered and its stream actually read even when LIST omits every one "
+           "of its keys, or the catalog-authoritative universe supplement did not run";
+}
+
 /// A pre-precommit body in an eligible prefix (no owner) is INFO (Unreachable), not an error.
 TEST(CasFsck, ReclaimablePrePrecommitBodyIsInfo)
 {

@@ -3620,18 +3620,11 @@ std::vector<NamespaceLifeId> Gc::discoverUniverse()
     /// walk; `Live` and `Removing` entries are both returned. `fromCatalogEntry` mints each life directly
     /// from the row that is its own authority for both fields, never from a listed key (which could name
     /// a DEAD incarnation of the same namespace name).
-    const Layout & layout = store->layout();
-    Backend & backend = store->backend();
-    const CasRefCatalog::Snapshot snapshot = CasRefCatalog::read(backend, layout);
-    std::vector<NamespaceLifeId> universe;
-    universe.reserve(snapshot.catalog.entries.size());
-    for (const CatalogEntry & entry : snapshot.catalog.entries)
-    {
-        if (entry.state == NsState::Creating)
-            continue;
-        universe.push_back(NamespaceLifeId::fromCatalogEntry(entry.ns, entry.incarnation));
-    }
-    return universe;
+    ///
+    /// The filter itself lives in `CasRefCatalog::liveUniverse` (review Important C) -- fsck's own
+    /// reachability walk needed the identical catalog-authoritative set and is not this class, so the
+    /// filter moved to where both can share it rather than grow a second copy that could disagree.
+    return CasRefCatalog::liveUniverse(store->backend(), store->layout());
 }
 
 bool Gc::graduationDue(const GcState & state, uint64_t current_round)
