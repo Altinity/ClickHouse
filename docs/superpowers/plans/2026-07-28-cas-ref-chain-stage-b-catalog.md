@@ -185,6 +185,7 @@ while its body names a consequence — split those, and send the behaviour to `B
 | 10 | TLA debt: `listedTok` audit, unasserted drivers, runnerless models, classifier | phase follow-ups | — |
 | 11 | Stage B gates: battery + churn/rebirth/decommission soak + the sequential-baseline destructive soak + verdict | §9 + GC directive §3 | all |
 | 12 | GC performance research on the destructive baseline + the successor report | GC directive deliverable | 11 |
+| 13 | Post-Stage-B: split the two 4000-line files, goldens FIRST | refactor candidates | 12 |
 
 Task 10 is independent of the code chain and may be scheduled at any point (still one implementer
 at a time). Task 9 is doc-only but is no longer schedule-free: the re-key must exist before it can
@@ -1352,6 +1353,11 @@ whether or not the refactor is named. Do them with the mechanism rather than by 
   life prefix**, which would then be listed, be absent from the map, and raise the damage anomaly — suppressing
   the whole round. The reviews caught the removal side of this; nobody caught the birth side. Verify the
   reachability, then carry enough state to tell the three cases apart.
+- [ ] **Collapse the fixture/production divergence into ONE named seam.** Raw helpers write at the sentinel,
+  admit catalog entries as `Live` with no `_ckpt`, and bypass birth — a habit spread across files rather than a
+  decision made once. It produced the 164-test sweep, the test whose premise a uniform pin inverted, and two
+  tests that pinned data loss as correct. One helper, one documented list of divergences, one place to look. This
+  task is where it lands because removing the sentinel already rewrites those helpers.
 - [ ] **Consider giving the sentinel its OWN type** (or the life a provenance tag) rather than deleting it by
   grep. Its danger is that it is the same type as the truth, which is why it can be silently substituted; a
   distinct type makes "this function requires a catalog-derived life" a compile-time property, and makes this
@@ -1995,6 +2001,15 @@ Commit alone; final commit updates `models/README.md` + `cas/06-tla-models.md`.
 
 ### Task 11: Stage B gates {#task-11}
 
+- [ ] **Gate step: sweep Stage B's own comments for rules that only a reader can enforce.** Four rules failed
+  this stage while living in prose ("every term of `clean()` appears here", the gate suite list, the `_ckpt`
+  cleanup's ownership premise, the `per_ns_shard` pruning claim); the two that were converted to executing
+  checks — `clean()` computed from `kFsckHardFindings` with a `static_assert` in three TUs, and the suite-list
+  generator failing on any unclaimed suite — both held immediately. So grep this stage's diff for
+  "whenever/always/must also/in the same change" and, for each, either convert it to something that fails a
+  build or a test, or record in `BACKLOG.md` why it cannot be. A rule that only a reader can enforce is one
+  context loss from not holding, and this stage measured that four times.
+
 **Files:**
 - Create: `docs/superpowers/cas/2026-07-XX-stage-b-RESULTS.md`
 - **RESIDUAL-CLEANUP GATE ROW, placed by the placement sweep (2026-07-30).** Several review findings
@@ -2186,3 +2201,25 @@ document is what justifies them).]
    has TWO legitimate Stage-B editors after the amendment (T5b for the capstone sentinels it
    deliberately reds, T7b for the kill-shot) — Task 4's "only edit" line is amended in place;
    and Task 5's chartered all-lives LIST helper is ONE helper for both object families, not two.
+
+### Task 13 (post-Stage-B): split the two files that are 18% of the subsystem {#task-13}
+
+**Deliberately AFTER Task 12, and the reasons are not stylistic.** `Gc/CasGc.cpp` (4679 lines) and
+`Pool/CasRefLedger.cpp` (4249) are 18% of the ~50k-line CAS subsystem between them. Size here has a measured
+cost: this stage's `chassert`-over-a-handled-branch sat four lines from the branch it killed, the double-unlock
+that masked a real error class lived in the same file, and both survived several reviews.
+
+Why after 12 rather than sooner:
+- **Not while a Critical is open in that code.** A refactor landing beside an unfixed data-loss defect makes the
+  defect harder to see and its fix harder to review.
+- **Not between Task 11's gates and Task 12's measurements**, which would invalidate the performance baseline
+  the report is built on.
+- Both files were still changing throughout Stage B, so any earlier split would have been re-split.
+
+- [ ] **Write the equivalence goldens BEFORE moving anything.** This campaign's standing rule: a fence added
+  after an extraction tests the new shape rather than the preserved behaviour. Capture request-count and
+  request-order goldens for the paths being moved, prove them stable on the unmoved tree, and only then move.
+- [ ] Split along the seams the defects already revealed rather than by line count — the lane/append machinery,
+  the install regions, and the fold's phase pipeline are three separate concerns sharing one translation unit.
+- [ ] After the move, re-run the goldens unchanged. A golden that had to be edited to pass is evidence the
+  extraction changed behaviour, not evidence the extraction succeeded.
