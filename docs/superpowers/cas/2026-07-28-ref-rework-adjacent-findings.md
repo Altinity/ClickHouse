@@ -168,6 +168,23 @@ Drop-and-recreate under the catalog arrives with Tasks 5/6, and the name-keyed f
 `checkpoints`, empty listing — while a NON-CURRENT life of the same name HAS listed objects is a
 contradiction, and the R10 loop already holds both facts.
 
+**CORRECTION (2026-07-31): the predicate I ruled for would NOT have closed this, and neither the reviewer's
+framing nor mine noticed.** Both said R11c is "what the union-shaped predicate still permits". Work the case
+against the authority-shaped predicate instead: the catalog **does** name `N`, at incarnation `Y`. So the life
+IS catalog-derived, an "every walked life came from the catalog" conjunct is satisfied, and the walk proves it
+at `Y` where nothing exists. **Both predicate shapes are blind to this family**, because both ask *where did
+the life come from* and neither asks *does that life account for the objects that exist*.
+
+What closes it is a detector that asks the second question, built on knowledge the R10 loop already has: track
+every namespace name seen at a DIFFERENT (dead) incarnation, and raise an anomaly when such a namespace's
+CURRENT incarnation contributed neither a listed ref object nor a `_ckpt`. That is the contradiction, and it is
+observable without waiting for Task 5.
+
+The explicit predicate is still worth having, for the narrower thing it actually does: it moves the
+*absent-entirely* family's protection from three sites cooperating implicitly to one place refusing explicitly.
+It must say in its own comment that it does not cover the mismatch family — a conjunct named "every walked life
+came from the catalog" reads as covering precisely the case it misses.
+
 **And the process lesson is sharper than the bug.** The ruling on R11b asked for a predicate *about the
 authority rather than the union*. What shipped instead changed the numerator's SOURCE and left the predicate
 byte-identical — the guarantee is genuinely equivalent today, but it became an **implicit invariant spread
