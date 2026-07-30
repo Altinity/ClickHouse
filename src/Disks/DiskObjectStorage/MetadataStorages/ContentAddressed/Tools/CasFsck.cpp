@@ -563,6 +563,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
             ++report.lifeless_keys;
             FsckObject o;
             o.key = bad.key;
+            o.kind = ObjectKind::Blob;   /// a lifeless key has no ObjectKind; reuse Blob as the generic kind
             o.cls = FsckClass::LifelessKey;
             o.size = 0;
             o.reachable_from = {bad.reason};
