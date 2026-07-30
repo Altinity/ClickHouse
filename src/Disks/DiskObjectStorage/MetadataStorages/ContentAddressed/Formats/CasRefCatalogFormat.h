@@ -124,15 +124,20 @@ RefCatalog decodeRefCatalog(std::string_view data);
 /// (`LIMIT_EXCEEDED`, naming `ns`) one byte over.
 void checkCatalogObjectBytes(uint64_t encoded_bytes, const RootNamespace & ns);
 
-/// The fold seal's fixed frame cost (header + trailer, zero entries) -- everything a round's seal
-/// costs before a single namespace is added. Measured through `encodeFoldSeal` itself rather than a
-/// hand-kept formula, so a later change to the fold seal's wire shape is felt here automatically.
+/// A FLOOR on the fold seal's fixed frame cost (header + meta + trailer, zero entries), not a
+/// constant: measured at `generation = 0` and `n = 0`, so a real seal's larger decimal widths for
+/// `generation`/`parent_generation`/`n` add a few more bytes than this returns. Harmless for
+/// `checkFoldSealReservation`'s admission math -- the reservation is already an over-estimate --
+/// but a caller after the EXACT fixed-frame cost must not treat this as one. Measured through
+/// `encodeFoldSeal` itself rather than a hand-kept formula, so a later change to the fold seal's wire
+/// shape is felt here automatically.
 uint64_t foldSealFixedBytes();
 
 /// The worst-case bytes ONE admitted catalog entry could ever add to a fold seal: a `cov` row held at
 /// the widest shape (classification 4, every hold field at its widest rendering) PLUS an `nsc` row at
-/// the widest removal-cleanup shape -- the two rows one namespace can simultaneously occupy (a hold
-/// outstanding on its ref-log tail while its removal's terminal cleanup item is still carried).
+/// the widest removal-cleanup shape -- an OVER-ESTIMATE per entry, not a claim about how many `cov`/
+/// `nsc` rows one namespace can carry in total (`ns_cleanup_items` is keyed per removal, so a
+/// namespace removed more than once can carry more than one `nsc` row).
 /// Namespace bytes are charged at `kMaxNamespaceBytes` with worst-case JSON escaping, regardless of
 /// any real admitted name's actual length: admission reserves for the worst name this build will
 /// ever accept, not the one in hand. Measured through `encodeFoldSeal` itself, like `foldSealFixedBytes`.
