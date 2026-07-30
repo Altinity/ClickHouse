@@ -2534,6 +2534,77 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
     commitRefChunk(ns, rt, final_ops, survivors);
 }
 
+CasRefLedger::PreparedRefChunk CasRefLedger::prepareRefChunk(
+    const Layout & layout, const RootNamespace & ns, RefTableState state, const RefTxnId & id,
+    const std::optional<RefTxnId> & chain_link, std::span<const RefOp> ops, uint64_t admitted_generation)
+{
+    PreparedRefChunk prepared{
+        .candidate = std::move(state),
+        .candidate_base_id = {},
+        .chunk_txn = RefLogTxn{ns.string(), id, std::vector<RefOp>(ops.begin(), ops.end()), chain_link},
+        .prepared_attempt = {},
+        .birth_contribution = std::nullopt,
+    };
+    prepared.candidate_base_id = prepared.candidate.getGreatestApplied();
+
+    /// A throw here is a clean PRE-durability failure -- the same class as an ordinary validation
+    /// reject: no object exists yet, the cache is untouched, and the id is simply never used (the next
+    /// attempt re-derives it from this same unchanged state).
+    applyRefLogTxn(prepared.candidate, prepared.chunk_txn);
+
+    /// The COMPLETE attempt (spec §A1 site 3), so the request can read its key and body straight out of
+    /// it and the `Unresolved` arm only has to MOVE it into the runtime. Building it here rather than
+    /// after the `PUT` is what keeps an allocation failure from leaving a possibly-DURABLE object with
+    /// NEITHER the transaction nor the attempt recorded -- strictly worse than a wedge, because the next
+    /// append would then mint a fresh id against a state missing a landed transaction, which is the
+    /// divergence the candidate exists to prevent.
+    ///
+    /// A rename, not an extra copy: the seal writes its result directly into the attempt's body and the
+    /// key is computed directly into the attempt's key, so nothing is copied twice on the committed path
+    /// either.
+    ///
+    /// FAULT CLASS, stated because the extraction NARROWED it, and this is the whole of the change.
+    /// `RefLogTxn`'s construction above and the key computation below used to sit outside any local
+    /// `try` in `commitRefChunk`, so an allocation failure in either escaped `commitRefChunk` and
+    /// `flushRefBatch` entirely and was caught by `appendRefOps`' tenure catch, which completes every
+    /// still-INCOMPLETE owned item with that exception and releases leadership, ending the tenure (an
+    /// item already made durable by an earlier committed chunk keeps its success -- the guard leaves it
+    /// `done` with no error, deliberately). Inside this function both are covered by the caller's single
+    /// `catch`, so the same failure now completes `chunk_survivors` with that exception and returns
+    /// false, and the tenure continues. That is exactly what an apply failure at this same pre-durability
+    /// stage already did, which is the point: an allocation failure here is no longer the one fault whose
+    /// blast radius differs from its immediate neighbours'.
+    ///
+    /// Nothing is stranded either way, and there is no universal remainder handler to appeal to -- the
+    /// two call sites dispose of their own. On a chunk boundary `flushRefBatch` fails this item plus the
+    /// entire not-yet-attempted remainder retry-later and returns at once. On the FINAL chunk the tail
+    /// call ignores the return value because no remainder is left: every batch item is by then either
+    /// already completed (it failed its own validation, or it belonged to an earlier chunk that
+    /// `commitRefChunk` completed) or is in THIS chunk's `chunk_survivors`, which this path completes.
+    /// `chunk_survivors` is emphatically NOT the whole batch on that path -- `survivors.clear()` at each
+    /// chunk boundary leaves it holding only the last chunk's items.
+    ///
+    /// One reported error class does change on the boundary path: the not-yet-attempted remainder now
+    /// gets a retry-later refusal instead of the raw escaping exception. Those items were provably never
+    /// attempted, so retry-later is the truthful class, and it is the class they already got whenever the
+    /// preceding chunk failed for any other reason.
+    prepared.prepared_attempt.txn_id = id;
+    prepared.prepared_attempt.key = layout.refLogKey(RefNamespaceId::stageATransition(ns), id);
+    prepared.prepared_attempt.admitted_fence_generation = admitted_generation;
+    prepared.prepared_attempt.bytes = sealObject(FormatId::RefLog, encodeRefLogTxn(prepared.chunk_txn));
+
+    /// INV-4's `life_epoch`, which ONLY this transaction knows: the writer epoch of the `NamespaceBirth`
+    /// being appended. Prepared as a VALUE; `commitRefChunk` publishes it, because for a birth chunk that
+    /// publish is the FIRST durable effect and preparation is everything strictly before it.
+    if (std::any_of(ops.begin(), ops.end(),
+                    [](const RefOp & op) { return op.kind == RefOpKind::NamespaceBirth; }))
+        prepared.birth_contribution = RefCkpt{.life_epoch = std::optional<uint64_t>{id.writer_epoch},
+                                              .checkpoint_snapshot_id = std::nullopt,
+                                              .last_epoch_seal = std::nullopt};
+
+    return prepared;
+}
+
 bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt,
                                   const std::vector<RefOp> & chunk_ops,
                                   const std::vector<std::shared_ptr<RefMutationItem>> & chunk_survivors)
@@ -2604,47 +2675,53 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
         }
     }
 
-    /// Build the candidate state BEFORE the PUT (spec §A1), so that the region between "this chunk's
-    /// object is durable" and "the runtime records it" is allocation-free and therefore cannot throw.
-    /// It used to be the other way round -- PUT, then `applyRefLogTxn(rt->state, chunk_txn)` -- and that
-    /// apply CAN throw on an allocation failure (the COW containers allocate their overlays), which left
-    /// the transaction durable but invisible to the writer: the apply check of the day admitted any
+    /// ONE atomic reading of everything this transaction is derived from that the RUNTIME owns: the
+    /// state it will be applied to, the id, the mount incarnation that admitted it, and the seal that
+    /// qualifies the id's sequence number. `prepareRefChunk` below is a pure function of these four
+    /// readings plus its three immutable inputs -- the layout, the namespace and this chunk's ops.
+    ///
+    /// The candidate is built from this snapshot BEFORE the PUT (spec §A1), so that the region between
+    /// "this chunk's object is durable" and "the runtime records it" is allocation-free and therefore
+    /// cannot throw. It used to be the other way round -- PUT, then `applyRefLogTxn(rt->state, ...)` -- and
+    /// that apply CAN throw on an allocation failure (the COW containers allocate their overlays), which
+    /// left the transaction durable but invisible to the writer: the apply check of the day admitted any
     /// strictly greater id, so a later transaction sailed over the hole and a snapshot published
     /// afterwards was labelled with THAT id -- recovery then skips the stranded transaction forever
     /// while GC, which folds the ref LOGS, still applies it. That divergence is a data-loss class, not a
     /// stale cache. INV-1 now refuses the same hole from the read side too, so the accident this
     /// ordering prevents would also have to survive the density check to do any damage.
     ///
-    /// A throw HERE, by contrast, is a clean PRE-durability failure -- the same class as an ordinary
-    /// validation reject: no object exists yet, the cache is untouched, and the id is simply never used
-    /// (the next attempt re-derives it from this same unchanged state).
+    /// A throw during PREPARATION, by contrast, is a clean PRE-durability failure -- the same class as an
+    /// ordinary validation reject: no object exists yet, the cache is untouched, and the id is simply
+    /// never used (the next attempt re-derives it from this same unchanged state).
     ///
-    /// The copy is cheap because it SHARES the live state's COW bases; the apply allocates only the
-    /// overlay. The candidate is deliberately NOT materialized here: a state that shares its base cannot
-    /// fold in place, so folding now would rebuild the whole base (O(table) per chunk). The install
-    /// below restores unique base ownership before the existing post-install fold, which therefore stays
-    /// O(overlay), exactly as it is today.
+    /// The snapshot copy taken here is cheap because it SHARES the live state's COW bases; the apply
+    /// inside preparation allocates only the overlay. It is CONSUMED by preparation -- moved, not copied
+    /// again -- so this remains the single copy of `rt->state` the commit path makes, exactly as it was.
+    /// The candidate is deliberately NOT materialized: a state that shares its base cannot fold in place,
+    /// so folding now would rebuild the whole base (O(table) per chunk). The install below restores unique
+    /// base ownership before the existing post-install fold, which therefore stays O(overlay).
     ///
     /// The id is derived in the SAME critical section that snapshots the state (INV-1): it is a function
     /// of `greatest_applied`, so reading it at a different instant than the state the transaction is
     /// applied to would be deriving this chunk's id from a different stream. Only this leader mutates
     /// `rt->state`, so the two reads cannot disagree today -- taking them together is what keeps that
-    /// from being an invariant a future edit has to rediscover.
+    /// from being an invariant a future edit has to rediscover. This is also why the id, the generation
+    /// and the seal are INPUTS to `prepareRefChunk` rather than things it derives: it has no lock to read
+    /// them under.
     ///
     /// The fence GENERATION and `last_epoch_seal` are read in the same hold for the same reason. The
     /// generation is this transaction's ADMISSION token: one atomic reading of "which mount incarnation
-    /// allowed this attempt", which the wedge then carries and every later retry and install presents
+    /// allowed this attempt", which the attempt then carries and every later retry and install presents
     /// back. The seal is what qualifies the id's sequence number, so reading it at a different instant
     /// than the id would be describing a different transition.
-    std::optional<RefTableState> candidate;
-    RefTxnId candidate_base_id;
+    std::optional<RefTableState> state_snapshot;
     RefTxnId id;
     uint64_t admitted_fence_generation = 0;
     std::optional<RefTxnId> last_epoch_seal;
     {
         std::lock_guard lock(rt->state_mutex);
-        candidate.emplace(rt->state);
-        candidate_base_id = rt->state.getGreatestApplied();
+        state_snapshot.emplace(rt->state);
         id = allocateRefTxnId(*rt);
         admitted_fence_generation = fence_generation_fn();
         last_epoch_seal = rt->last_epoch_seal;
@@ -2653,18 +2730,42 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
     /// this namespace's genesis names the seal that closed the previous one, and nothing else carries it.
     /// `last_epoch_seal` is `nullopt` precisely at genesis (see `RefTableRuntime::last_epoch_seal`), so
     /// a genesis birth at sequence 1 finds nothing to name -- which is what makes "no seal" a fact about
-    /// the stream rather than a defaulted field.
+    /// the stream rather than a defaulted field. Derived outside the `try` below because `chainLinkFor`
+    /// neither allocates nor throws, so nothing is gained by covering it.
+    const std::optional<RefTxnId> chain_link = chainLinkFor(id, last_epoch_seal);
+
+    /// Preparation is ONE pure call, and it is everything decided before this chunk can have any durable
+    /// effect: the candidate, the transaction with its chain link, the complete attempt (key + sealed
+    /// bytes), and -- for a birth -- the `_ckpt` contribution as a VALUE.
     ///
-    const RefLogTxn chunk_txn{ns.string(), id, chunk_ops, chainLinkFor(id, last_epoch_seal)};
+    /// THE PLACEMENT IS THE CORRECTNESS ARGUMENT, and it has to hold for BOTH chunk shapes, because
+    /// `commitRefChunk` has two different first durable effects. An ordinary chunk's is the ref-log
+    /// `putIfAbsentControlled` far below; a `NamespaceBirth` chunk's is the `_ckpt` publish, which is
+    /// EARLIER. This call therefore sits above both, and every statement between here and the lock above
+    /// is in-memory only. A "pure" preparation that published the `_ckpt` itself would be a lie, and
+    /// moving that publish later would change fault semantics the directive says to preserve.
+    ///
+    /// It throws only on a rejected apply, a failed seal, or an allocation failure -- all pre-durability
+    /// rejections with the identical handler, which is why ONE catch replaces the two that used to sit
+    /// around those steps separately (see the FAULT CLASS note on `prepareRefChunk` for the two
+    /// statements whose catcher changed).
+    std::optional<PreparedRefChunk> prepared;
     try
     {
-        applyRefLogTxn(*candidate, chunk_txn);
+        prepared.emplace(prepareRefChunk(layout, ns, std::move(*state_snapshot), id, chain_link,
+                                         chunk_ops, admitted_fence_generation));
     }
     catch (...)
     {
         complete_error(chunk_survivors, std::current_exception());
         return false;
     }
+    const RefTxnId candidate_base_id = prepared->candidate_base_id;
+    /// The candidate moves back into its own optional so the post-durable install region below is
+    /// textually untouched by this extraction: it still swaps `*candidate` in and still `reset()`s it in
+    /// the same place, for the same reason (releasing bases whose `use_count()` the fold then reads). The
+    /// move is COW-pointer-only and happens here, while nothing is durable.
+    std::optional<RefTableState> candidate{std::move(prepared->candidate)};
 
     /// INV-4's FIRST `_ckpt` writer, and the ONLY writer anywhere that knows this namespace's
     /// `life_epoch`: it is the writer epoch of its `namespace_birth`, which is this transaction. No
@@ -2679,14 +2780,27 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
     /// `FencedOut` is a rejection here rather than a shrug: unlike the publisher's, this contribution
     /// carries the one fact nothing else can supply, so proceeding without it would put the namespace
     /// Live with its genesis epoch permanently unknown.
-    if (std::any_of(chunk_ops.begin(), chunk_ops.end(),
-                    [](const RefOp & op) { return op.kind == RefOpKind::NamespaceBirth; }))
+    ///
+    /// ORDERING, and it is the one deliberate reorder in this extraction: this publish is a birth chunk's
+    /// FIRST durable effect, so preparation -- INCLUDING the sealed bytes -- now completes ABOVE it,
+    /// where it used to run below. That matters more than "an allocation could fail earlier", because
+    /// sealing is not pure serialization -- it VALIDATES. `encodeRefLogTxn` runs `checkRefTxnIdNonzero`,
+    /// then `validateEpochSealGrammarStructural`, then `checkBudget` over the encoded text
+    /// (`CasRefLogFormat.cpp`), and throws `CORRUPTED_DATA`/`LIMIT_EXCEEDED`; the candidate apply above
+    /// runs, of INV-2's grammar, only `validateEpochSealGrammarContextual`, which returns early off
+    /// sequence 1 and owns nothing but the required-iff rule. The two grammar halves are DISJOINT BY
+    /// DESIGN -- each function's own comment says the other owns the half it does not -- and the budget
+    /// check belongs to neither. So a chunk can pass the apply and still be refused by the seal, on
+    /// grammar, on id shape, or on size; after the reorder that refusal lands BEFORE this `_ckpt` is
+    /// durable instead of after it, so it leaves no inert `_ckpt` behind where it used to leave one.
+    /// Caller-visible outcome is identical: both orders reach the same already-possible rejection,
+    /// complete the same survivors with the same error, return false, and consume no id. Strictly less
+    /// durable debris, nothing new that can throw.
+    if (prepared->birth_contribution)
     {
         try
         {
-            if (publishCkptContribution(ns, RefCkpt{.life_epoch = std::optional<uint64_t>{id.writer_epoch},
-                                                    .checkpoint_snapshot_id = std::nullopt,
-                                                    .last_epoch_seal = std::nullopt},
+            if (publishCkptContribution(ns, *prepared->birth_contribution,
                                         admitted_fence_generation) == CkptPublishOutcome::FencedOut)
             {
                 complete_error(chunk_survivors, makeCasWriteRetryLaterExceptionPtr(fmt::format(
@@ -2702,33 +2816,10 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
         }
     }
 
-    /// Preconstruct the COMPLETE wedge here, BEFORE the PUT (spec §A1 site 3), and let the request read
-    /// its key and body straight out of it. The `Unresolved` arm below used to build
-    /// `RefAppendAttempt{id, key, bytes}` AFTER the PUT, which copies two `String`s: an allocation failure
-    /// there would leave a possibly-DURABLE object with NEITHER the transaction nor the wedge recorded --
-    /// strictly worse than a wedge, because the next append then mints a fresh id and proceeds against a
-    /// state that is missing a landed transaction, exactly the divergence the candidate above exists to
-    /// prevent. With the wedge already built, that arm only has to MOVE it into the runtime.
-    /// This is a rename, not an extra copy: the seal writes its result directly into the wedge's body,
-    /// and the key is computed directly into the wedge's key, so nothing is copied twice on the ordinary
-    /// committed path either. The key is computed OUTSIDE the seal's catch on purpose -- that keeps its
-    /// (pre-durability) failure behaviour exactly as it was, propagating to `appendRefOps`' catch.
-    RefAppendAttempt prepared_attempt;
-    prepared_attempt.txn_id = id;
-    prepared_attempt.key = layout.refLogKey(RefNamespaceId::stageATransition(ns), id);
-    prepared_attempt.admitted_fence_generation = admitted_fence_generation;
-    try
-    {
-        prepared_attempt.bytes = sealObject(FormatId::RefLog, encodeRefLogTxn(chunk_txn));
-    }
-    catch (...)
-    {
-        complete_error(chunk_survivors, std::current_exception());
-        return false;
-    }
-
-    /// Install the exact attempt before the first possible send. From this point every exit must make
-    /// one explicit lane transition; there is no independent marker to update or reconstruct later.
+    /// Install the exact attempt before the first possible send. This is NOT preparation -- it mutates
+    /// `RefTableRuntime` and takes `state_mutex` -- so it stays here, between preparation and the first
+    /// send. From this point every exit must make one explicit lane transition; there is no independent
+    /// marker to update or reconstruct later.
     bool attempt_armed = false;
     {
         std::lock_guard lock(rt->state_mutex);
@@ -2738,7 +2829,7 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
         if (rt->lane_state == RefLaneState::Ready && !rt->append_attempt && same_base)
         {
             static_assert(std::is_nothrow_move_constructible_v<RefAppendAttempt>);
-            rt->append_attempt = std::move(prepared_attempt);
+            rt->append_attempt = std::move(prepared->prepared_attempt);
             rt->lane_state = RefLaneState::Writing;
             attempt_armed = true;
         }

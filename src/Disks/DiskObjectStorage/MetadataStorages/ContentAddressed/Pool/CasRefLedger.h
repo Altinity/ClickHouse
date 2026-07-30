@@ -16,6 +16,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <span>
 #include <string_view>
 #include <vector>
 
@@ -391,6 +392,76 @@ public:
         return rt->cleanup_markers;
     }
 
+    /// Describes the one conditional `PUT` whose outcome is still uncertain for a table. It is owned by
+    /// `Writing` or `Wedged` and by no other lane state; it stays installed until the object is confirmed
+    /// durable and applied to the cache, or definitely rejected.
+    ///
+    /// The four fields together are the attempt's IDENTITY, and all four are compared before any later
+    /// result is acted on (`resolveWedgeOnce`'s post-I/O recheck). Comparing the id alone -- or the
+    /// admission generation alone -- is the aliasing bug the phase-0 model found: two attempts of the
+    /// same table can carry the same id under the same generation and describe DIFFERENT bytes, and
+    /// installing one attempt's candidate because the other's key resolved is precisely the
+    /// acked-then-lost class this every-attempt rule exists to close.
+    ///
+    /// Public because it is a member of `PreparedRefChunk`, which `prepareRefChunk` returns.
+    struct RefAppendAttempt
+    {
+        RefTxnId txn_id;
+        String key;
+        String bytes;
+        /// `CasMountRuntime::fenceGeneration()` as read at this transaction's ADMISSION -- the same
+        /// critical section that snapshotted the state and derived the id, i.e. one atomic reading of
+        /// "what this attempt was allowed to do". Every later `slotOccupy` retry is gated on THIS value
+        /// (never the current one), and every install is preceded by presenting it back through
+        /// `checkFenceOrThrow`: a retry admitted under a dead incarnation must send nothing, and a
+        /// result that returns after a fence bump/re-arm must install nothing.
+        uint64_t admitted_fence_generation = 0;
+    };
+
+    /// Everything `commitRefChunk` DECIDES before this chunk can have any durable effect, as one value.
+    struct PreparedRefChunk
+    {
+        RefTableState candidate;         /// the snapshot with this chunk applied -- deliberately NOT materialized
+        RefTxnId candidate_base_id;      /// greatest-applied of the state prepared FROM
+        RefLogTxn chunk_txn;             /// includes INV-2's chain link
+        RefAppendAttempt prepared_attempt;  /// COMPLETE: txn id, canonical key, sealed bytes, admitted generation
+        /// Set iff this chunk births the namespace. The VALUE only: `commitRefChunk` still publishes it,
+        /// because for a birth chunk that publish IS the first durable effect and preparation is by
+        /// definition everything strictly before it.
+        std::optional<RefCkpt> birth_contribution;
+    };
+
+    /// The pure half of `commitRefChunk`: derive the candidate state, the transaction, the canonical key
+    /// and sealed bytes, the complete attempt, and a namespace birth's `_ckpt` contribution -- all of it
+    /// decided before anything can be durable.
+    ///
+    /// `static` on purpose, and it is load-bearing rather than stylistic: with no `this` there is no
+    /// backend, no `RefTableRuntime`, no clock and no lock reachable from here, so "backend-free" is
+    /// CHECKABLE instead of promised. That is what lets the protocol arithmetic be swept exhaustively
+    /// with no store at all: `gtest_cas_ref_chunk_preparation.cpp` names no backend and constructs none,
+    /// and no future edit inside this function can quietly reach for one and still compile there.
+    ///
+    /// `state` is CONSUMED: the caller snapshots `rt->state` under `state_mutex` and hands the snapshot
+    /// over, so the candidate IS that snapshot rather than a second copy of it (the pre-extraction code
+    /// made exactly one copy, under the lock, and this keeps it at one). The snapshot deliberately shares
+    /// the live state's COW bases and is NOT materialized here -- folding a base-sharing state would
+    /// rebuild the whole base, O(table) per chunk, which the install path exists to avoid.
+    ///
+    /// `id`, `chain_link` and `admitted_generation` are INPUTS, not derived here, because all three must
+    /// be read in the SAME critical section that snapshots the state (INV-1): deriving the id from a
+    /// different instant than the state it is applied to would be deriving it from a different stream.
+    /// The critical section therefore stays in `commitRefChunk`, and this is a pure function of what that
+    /// one atomic reading saw, together with `layout`, `ns` and `ops`.
+    ///
+    /// Throws on a rejected apply, a failed seal, or an allocation failure -- all ordinary PRE-durability
+    /// rejections: no object exists, the cache is untouched, and the id is simply never used (the next
+    /// attempt re-derives it from the same unchanged state). See the FAULT CLASS note on the definition
+    /// for what changed about WHO catches them.
+    static PreparedRefChunk prepareRefChunk(const Layout & layout, const RootNamespace & ns,
+                                            RefTableState state, const RefTxnId & id,
+                                            const std::optional<RefTxnId> & chain_link,
+                                            std::span<const RefOp> ops, uint64_t admitted_generation);
+
 private:
     /// Injected storage and mount environment. The member order is part of construction/destruction
     /// behavior because the callbacks and references are used by the runtime owned below.
@@ -413,29 +484,6 @@ private:
     /// interruptible slice-sleep (bails early if `fence_ok_fn` drops, e.g. on shutdown/lease loss);
     /// `setCasRetrySleepForTest` overrides it (a unit test injects a clock-advancing no-op).
     std::function<void(uint64_t)> recovery_retry_sleep_fn;
-
-    /// Describes the one conditional `PUT` whose outcome is still uncertain for a table. It remains in
-    /// the runtime until the object is confirmed durable and applied to the cache, or definitely rejected.
-    ///
-    /// The four fields together are the wedge's IDENTITY, and all four are compared before any later
-    /// result is acted on (`resolveWedgeOnce`'s post-I/O recheck). Comparing the id alone -- or the
-    /// admission generation alone -- is the aliasing bug the phase-0 model found: two attempts of the
-    /// same table can carry the same id under the same generation and describe DIFFERENT bytes, and
-    /// installing one attempt's candidate because the other's key resolved is precisely the
-    /// acked-then-lost class this every-attempt rule exists to close.
-    struct RefAppendAttempt
-    {
-        RefTxnId txn_id;
-        String key;
-        String bytes;
-        /// `CasMountRuntime::fenceGeneration()` as read at this transaction's ADMISSION -- the same
-        /// critical section that snapshotted the state and derived the id, i.e. one atomic reading of
-        /// "what this attempt was allowed to do". Every later `slotOccupy` retry is gated on THIS value
-        /// (never the current one), and every install is preceded by presenting it back through
-        /// `checkFenceOrThrow`: a retry admitted under a dead incarnation must send nothing, and a
-        /// result that returns after a fence bump/re-arm must install nothing.
-        uint64_t admitted_fence_generation = 0;
-    };
 
     /// One queued append caller. `build_ops` is invoked at most once by the flush leader and returns the
     /// caller's operations rather than mutating storage directly. Completion fields are synchronized by
@@ -770,14 +818,18 @@ private:
         const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt);
 
     /// Commits ONE chunk of a `flushRefBatch` tenure as a complete ref-log transaction: allocates the
-    /// real transaction id, applies `chunk_ops` to a CANDIDATE copy of `rt->state`, encodes and durably
-    /// `PUT`s them, installs the candidate under `state_mutex` by a no-throw swap, advances the tail
-    /// counters, records the per-transaction metrics, completes exactly `chunk_survivors` with the real
-    /// id (waking their waiters), and schedules snapshot publication. The apply comes BEFORE the `PUT`
-    /// so that nothing between "durable" and "recorded" can throw (spec §A1); a failure of that apply is
-    /// an ordinary pre-durability rejection. For the same reason the `RefAppendAttempt` is built COMPLETE
-    /// before the `PUT` -- the request reads its key and body -- so the `Unresolved` arm only has to move
-    /// it into the runtime: the OTHER thing that must be recorded once the object may be durable.
+    /// real transaction id, PREPARES the chunk (`prepareRefChunk` -- candidate, transaction, key, sealed
+    /// bytes, complete attempt, birth contribution), durably `PUT`s the sealed bytes, installs the
+    /// candidate under `state_mutex` by a no-throw swap, advances the tail counters, records the
+    /// per-transaction metrics, completes exactly `chunk_survivors` with the real id (waking their
+    /// waiters), and schedules snapshot publication. Preparation completes BEFORE the first durable
+    /// effect of EITHER chunk shape -- an ordinary chunk's ref-log `PUT`, and a `NamespaceBirth` chunk's
+    /// earlier `_ckpt` publish -- so that nothing between "durable" and "recorded" can throw (spec §A1);
+    /// a preparation failure is an ordinary pre-durability rejection. For the same reason the
+    /// `RefAppendAttempt` is built COMPLETE before the `PUT` -- the request reads its key and body -- so
+    /// the `Unresolved` arm only has to move it into the runtime: the OTHER thing that must be recorded
+    /// once the object may be durable. Arming that attempt into the runtime is NOT preparation (it
+    /// mutates `RefTableRuntime`) and stays here, between preparation and the first send.
     /// Returns true when the chunk committed durably; false on any non-throwing failure (a rejected
     /// apply / DefiniteFailure / unresolved wedge / a conclusive PUT rejection / an encode failure),
     /// after having already failed `chunk_survivors` with the appropriate error. Past the durable `PUT`
@@ -815,7 +867,11 @@ private:
     /// TWO call sites, the two writers INV-4 names, and they contribute DISJOINT fields:
     ///   - `commitRefChunk`'s namespace-birth transaction contributes `life_epoch` -- it is the only
     ///     writer that knows it (this transaction's own writer epoch), and spec §3 has the `_ckpt`
-    ///     created before the namespace becomes Live;
+    ///     created before the namespace becomes Live. The contribution is no longer built at the call
+    ///     site: `prepareRefChunk` returns it as `PreparedRefChunk::birth_contribution` and
+    ///     `commitRefChunk` passes that prepared value here. The split is deliberate -- DECIDING the
+    ///     contribution is pure preparation, while THIS call is a birth chunk's first durable effect, so
+    ///     the publish had to stay behind when preparation moved out;
     ///   - `trySnapshotPublishOnce` contributes `checkpoint_snapshot_id` once the snapshot body is
     ///     durable, and contributes NOTHING about `life_epoch` (an absence, which the semantic-max
     ///     merge leaves alone) because the publisher does not know it and must never guess.
