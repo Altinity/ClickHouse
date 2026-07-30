@@ -1193,6 +1193,22 @@ the KEY/prefix helpers that ADDRESS ONE LIFE, so it must not (and does not) forb
 - [ ] **Step 2:** → FAIL. **Step 3:** Implement. **Step 4:** CA gate + lanes green.
 - [ ] **Step 5: Commit** `ca: ref — removal lifecycle: fenced terminal, immediate entry delete, deposited-incarnation cleanup`.
 
+**A LEAK INTERVAL OPENED BY TASK 4b (placed 2026-07-31 — it is an implication of a deleted branch, which is
+why it is written down instead of left to be re-derived).** Once the emptiness predicate stopped probing
+`_files`, a removed namespace whose only debris is namespace files is promoted `Pending → Completed` by the
+**very first fold** — and the physical pass runs only for `Pending` items. So that pass never runs for such a
+namespace in any round, and **a dropped namespace with no manifest bodies has its namespace files reclaimed by
+nothing** until this task's janitor exists.
+
+It is safe in the sense the directive requires: after the re-key, a LIST omission or a non-reclamation can cost
+only storage, never visibility, rebirth or deletion safety, because a dead life's keys are unreachable. But it
+is a real leak interval with no current owner.
+
+- [ ] **The janitor must reclaim a removed namespace's `_files` even when it holds no manifest bodies** — i.e.
+  it cannot rely on the item still being `Pending`, because nothing will hold it there. Pin it with a removed
+  namespace whose ONLY residue is files: today's completion gate promotes it immediately, so a test that waits
+  for `Pending` would wait forever and a test that only checks `Completed` would pass while reclaiming nothing.
+
 **TWO MORE OBLIGATIONS, from the increment review's Critical A (placed 2026-07-30).** Task 4-C established
 that same-epoch rebirth is not merely unlikely but **impossible today**: `CasRefCatalog` has no
 entry-deletion primitive at all, and `createNamespace`'s own doc assigns recreating an existing name to this
