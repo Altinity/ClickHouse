@@ -2432,11 +2432,11 @@ ColumnsDescription contentAddressedFsckColumns()
         {"unaccounted", std::make_shared<DataTypeUInt64>()},
         /// EVERY TERM OF `FsckReport::clean` APPEARS HERE. This row is the only view of a report a SQL
         /// consumer ever gets, so a hard finding the row omits is a finding no query can see — the same
-        /// shape that hid `corrupted_runs` from the text summary for months, which is why
-        /// `formatFsckSummary` carries the identical rule in its doc comment. The row was a deliberate
+        /// shape that hid `corrupted_runs` from the text summary for months. The row was a deliberate
         /// subset until 2026-07-29 and `stale_edge`/`corrupted_runs`/`snapshot_oracle_mismatches` were
-        /// invisible from SQL while `clickhouse-disks ca-fsck` exited nonzero on all three; if a term is
-        /// ever added to `clean`, it is added here in the same change.
+        /// invisible from SQL while `clickhouse-disks ca-fsck` exited nonzero on all three; then
+        /// `lifeless_keys` was added to `clean` in 2026-07-30 and missed here too, which is the fourth
+        /// time this rule was written in prose and did not hold.
         ///
         /// `stale_edge` is nonzero only in `detail` mode and this row is built from a summary scan, so it
         /// reads 0 here always — present because "absent" and "zero" are different facts to a consumer,
@@ -2450,6 +2450,9 @@ ColumnsDescription contentAddressedFsckColumns()
         /// could not prove either way, so a zero here is what makes the other zeros mean something.
         {"chain_broken", std::make_shared<DataTypeUInt64>()},
         {"unchecked", std::make_shared<DataTypeUInt64>()},
+        /// A key naming no namespace LIFE — corruption behind the Stage B format bump, and the sixth
+        /// term of `clean`.
+        {"lifeless_keys", std::make_shared<DataTypeUInt64>()},
         {"ref_records_walked", std::make_shared<DataTypeUInt64>()},
         {"physical_bytes", std::make_shared<DataTypeUInt64>()},
         {"referenced_logical_bytes", std::make_shared<DataTypeUInt64>()},
@@ -2474,6 +2477,7 @@ void appendContentAddressedFsckRow(MutableColumns & res_columns, const String & 
     res_columns[i++]->insert(rep.snapshot_oracle_checked);
     res_columns[i++]->insert(rep.chain_broken);
     res_columns[i++]->insert(rep.unchecked);
+    res_columns[i++]->insert(rep.lifeless_keys);
     res_columns[i++]->insert(rep.ref_records_walked);
     res_columns[i++]->insert(rep.physical_bytes);
     res_columns[i++]->insert(rep.referenced_logical_bytes);
