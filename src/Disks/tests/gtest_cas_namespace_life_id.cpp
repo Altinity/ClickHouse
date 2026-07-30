@@ -419,10 +419,10 @@ TEST(CasNamespaceLifeId, NamespaceOnlyKeyHelpersDoNotExist)
 }
 
 /// Directive §1's remaining requirements on the type, fenced rather than fixed: the type declares no
-/// conversion operator and `RootNamespace`'s own constructor is `explicit`, so nothing interconverts in
-/// either direction today and only an explicit `.ns` crosses. Without these assertions a later
-/// convenience conversion would land unnoticed, and dropping the incarnation would become
-/// representable again -- which is the property the whole re-keying rests on.
+/// conversion operator and no `RootNamespace` constructor takes a `NamespaceLifeId`, so nothing
+/// interconverts in either direction today and only an explicit `.ns` crosses. Without these
+/// assertions a later convenience conversion would land unnoticed, and dropping the incarnation would
+/// become representable again -- which is the property the whole re-keying rests on.
 TEST(CasNamespaceLifeId, NamespaceLifeIdAndRootNamespaceDoNotInterconvert)
 {
     static_assert(!std::convertible_to<NamespaceLifeId, RootNamespace>);

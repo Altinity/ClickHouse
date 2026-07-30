@@ -591,8 +591,8 @@ struct NamespaceLifeId   /// was `RefNamespaceId`; renamed because it now qualif
 };
 ```
 - **Honest finding: the no-implicit-conversion requirement is ALREADY met structurally** — the type
-  declares no conversion operator, and `RootNamespace`'s own constructor is `explicit`
-  (`Primitives/CasTypes.h:52`), so nothing interconverts in either direction today; only explicit
+  declares no conversion operator, and no `RootNamespace` constructor takes a `NamespaceLifeId`
+  (`Primitives/CasTypes.h`), so nothing interconverts in either direction today; only explicit
   `.ns` crosses. This task therefore FENCES the property with compile-time assertions rather than
   changing behaviour, and the report says so instead of claiming a fix that was not needed. The
   fence is the point: without it, a later convenience conversion lands unnoticed.
