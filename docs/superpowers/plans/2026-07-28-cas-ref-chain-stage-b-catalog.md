@@ -99,6 +99,38 @@ task here. Additional Stage-B constraints:
     performance effect от возможной correctness-регрессии" — two effects in one commit are two
     effects nobody can separate afterwards.
 
+## What the lane restatement changed for the tasks below {#restatement-impact}
+
+Measured 2026-07-30, after `bb4dd513118` landed, by checking every symbol these tasks name against
+the tree rather than assuming: **no later task is stale in its target.** `trySnapshotPublishOnce`,
+`runRecoveryWalkOnce`, `recoverRefTable`, `recoverRefTableDetailed`, `hint_log_ids`,
+`publishCkptContribution`, `observedNamespaceCleanupMarker`, `sweepStalePrecommitsNow` and
+`resolveWedgeOnce` all still exist, and all four models Task 10's TLA debt names still exist (that
+debt is about the GC models, not the lane). The restatement rewrote the machinery INSIDE
+`CasRefLedger`; these tasks address the catalog, the lifecycles, the re-keying, recovery grounding,
+the read side, decommission, probe A, the destruction flip and the gates — none of which was written
+against the encodings that died. Four specifics do carry over:
+
+1. **These no longer exist. Do not cite them, and treat a citation of them anywhere as stale text:**
+   `RefApplyState` and its `applyStateForTest`, `armApplyPending`/`clearApplyPending`/
+   `poisonApplyState`, the durable floor (`durableFloorCovers`, `noteDurableIdNotApplied`), the type
+   `RefAppendWedge` (now `RefAppendAttempt`), and the THIRD post-durable install region (two remain).
+   A stale `refCkptKey` doc reference survived four tasks before Task 1c swept it — that is the
+   failure mode this list exists to prevent.
+2. **Recovery is now a hard fence, and Task 5b builds on that rather than around it.** `NeedsRecovery`
+   blocks writes AND certification until replay completes, `requireRecovery` is how a site enters it,
+   and its only exit is a COMPLETE recovery install — asserted, not assumed (the sabotage that makes
+   recovery incomplete turns the caught-up invariant red). Read
+   `docs/superpowers/specs/2026-07-30-cas-ref-lane-state-machine.md` before re-deriving any recovery
+   entry semantics. The LIST-independence work itself is unchanged: the genesis fallback and the
+   entirely-LIST-driven second entry point are both still there to remove.
+3. **Certification is `Ready`-only, and Task 6b must preserve that.** The confirm gate refuses on one
+   state-agnostic comparison evaluated BEFORE row equality, and snapshot publication carries the same
+   gate — so splitting or renaming the publish path must keep the gate on both halves.
+4. **Use the lane's own test observers rather than inventing new ones:** `laneStateForTest` and
+   `refLaneWedgedForTest` exist and are widely used; a later task's test that needs to see lane state
+   should read them.
+
 ## Task overview {#task-overview}
 
 | # | Task | Source | Depends on |
