@@ -3045,3 +3045,32 @@ one decision attached to it — raise the budget for that suite, split the suite
 Also note what it means for any tally taken from that harness: a suite killed at 60s contributes a
 failure that says nothing about the code, and a reader comparing tallies across runs will see it move with
 machine load rather than with the tree.
+
+## The gate suite list silently omits suites — THIRD recurrence, because both prior fixes fixed the data {#gate-suite-list-omits-third-recurrence}
+
+Found 2026-07-30 by Task 4-C's implementer, and found the right way: by asking *why did my gate not catch
+this* rather than only fixing the test that failed.
+
+`tmp/cas_suites.txt`'s generation matches `Cas*:CA*`, which **cannot** match `CaWiring` or `CaLifecycle`
+(`Ca` + lowercase matches neither `Cas` nor `CA`) and cannot match `RefWriterAppendLane`,
+`RefWriterNamespaceBirth`, `RefWriterChunkedFlush` or `RefTableCacheEviction` at all. **Twenty suites, 17
+of them CAS-relevant, were run by no gate pass in an entire session** — and one of the newly-included ones
+immediately produced a hard abort plus further failures.
+
+**Every gate figure reported during that session was therefore partial**: 1601, 1628, 1639, 1658, 1660 and
+1661 were all computed over an incomplete set, including the deltas checked as "exact match to the new test
+count". The arithmetic was self-consistent and still measured the wrong population.
+
+**This is the third recurrence, and the reason it recurs is the shape of the previous two fixes.** Both
+earlier rounds closed it by ADDING the missing suites to the list — a data fix. The list is regenerated per
+session, so each fix regenerated away. The second of those recurrences hid three real bugs.
+
+**So the fix is not a longer list.** Fix the generator or the pattern, and then add the check that makes
+omission loud: **diff the generated list against the binary's own `--gtest_list_tests` output and fail when
+any suite is unclaimed** — a suite must either be in the CAS set or be excluded by name with a stated
+reason. A list that silently omits is indistinguishable from a list that covers, which is precisely why the
+same gap has now cost three rounds and why "we added them" is not a closure.
+
+**The generalisable rule: a filter is a claim about coverage, and a claim about coverage needs a
+two-sided check.** One side is what the filter selects; the other is what exists. Nothing in this
+repository compared the two until a hidden abort forced someone to look.
