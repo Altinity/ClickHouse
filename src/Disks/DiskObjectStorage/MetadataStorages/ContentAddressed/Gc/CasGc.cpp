@@ -3759,7 +3759,25 @@ RebuildReport Gc::rebuildBaseline(bool force)
                     std::vector<String> table_keys;
                     forEachListedKey(backend, layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)),
                         [&](const ListedKey & lk) { table_keys.push_back(lk.key); }, 1000, onGcEnumerationPage);
-                    const auto grouped = groupRefKeys(layout, table_keys);
+                    /// `groupRefKeys` REFUSES a key that names no life, and this call is the rebuild's
+                    /// own -- outside the fold's catch. An escaping refusal would take out the recovery
+                    /// command on exactly the damaged pool it exists for, and nothing else would remove
+                    /// the key. The pool cannot be called healthy either: this guard reads the ref
+                    /// baseline, and a listing it could not group proves nothing about it. So the
+                    /// unprovable answer becomes NOT healthy, which is the direction that lets the
+                    /// rebuild run -- and the rebuild writes only the gc plane and deletes nothing.
+                    std::map<String, RefTableListing> grouped;
+                    try
+                    {
+                        grouped = groupRefKeys(layout, table_keys);
+                    }
+                    catch (const Exception & e)
+                    {
+                        if (e.code() != ErrorCodes::CORRUPTED_DATA)
+                            throw;
+                        healthy = false;
+                        break;
+                    }
                     const auto git = grouped.find(ns.string());
                     if (git != grouped.end() && !git->second.snapshots.empty()
                         && (git->second.logs.empty() || git->second.snapshots.back() < git->second.logs.front()))

@@ -266,6 +266,51 @@ TEST(CasRebuildCondemnNothing, UnIncarnatedRefKeyDoesNotAbortTheRebuild)
     EXPECT_EQ(rep.committed_refs, 1u) << "the un-incarnated key must not hide the live namespace";
 }
 
+/// The SECOND way the same damage can reach the rebuild, and it is a different code path from the one
+/// above: the gen-0 health check LISTs each namespace's own life prefix and groups those keys to decide
+/// whether any table proves cleaned logs. `groupRefKeys` refuses a key that names no life, so a NESTED
+/// shape under the life prefix (`<ns>/<inc>/x/_log/<id>.zst`) reaches the refusal there instead of at
+/// `discoverUniverse`, which absorbs it. Same rule, same reason: the recovery command must not be taken
+/// out by the damage it exists to recover from.
+///
+/// A decodable `gc/state` at generation 0 is what makes that branch run at all -- with no state object
+/// the health check never reaches it. The state here comes from one real round (so the lease belongs to
+/// this identity) with `snap_generation` written back to 0.
+TEST(CasRebuildCondemnNothing, NestedLifelessKeyUnderTheLifePrefixDoesNotAbortTheRebuild)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+
+    publishAt(*backend, layout, kNsA, RefTxnId{1, 1}, "ref_a", /*build_sequence=*/1, DB::UInt128(1), /*birth=*/true);
+
+    Gc gc(store, kGc);
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+    {
+        const auto got = backend->get(layout.gcStateKey());
+        ASSERT_TRUE(got.has_value());
+        GcState st = decodeGcState(got->bytes);
+        st.snap_generation = 0;
+        ASSERT_EQ(backend->putOverwrite(layout.gcStateKey(), encodeGcState(st), got->token).outcome,
+                  PutOutcome::Done);
+    }
+
+    /// Hand-built, and planted AFTER the round so the round itself is clean: one segment too deep under
+    /// the life prefix, so the segment where the incarnation belongs holds `x`. No helper mints this.
+    const String nested = layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(kNsA))
+        + "x/_log/" + renderRefTxnId(RefTxnId{1, 1}) + ".zst";
+    ASSERT_EQ(backend->putIfAbsent(nested, "garbage").outcome, PutOutcome::Done);
+
+    RebuildReport rep;
+    ASSERT_NO_THROW(rep = gc.rebuildBaseline(/*force=*/false))
+        << "the recovery command must not be taken out by the damage it exists to recover from";
+    /// FORCE is deliberately NOT passed: a listing the check could not group proves nothing about the ref
+    /// baseline, so the pool cannot be declared healthy, and the un-forced rebuild must therefore RUN
+    /// rather than refuse.
+    ASSERT_TRUE(rep.performed) << rep.refusal;
+    EXPECT_EQ(rep.committed_refs, 1u) << "the live namespace must still be folded";
+}
+
 /// Removing the condemnation must not disturb the other thing a rebuild owes: every hold in the prior
 /// seal rides through VERBATIM (Task 8). Asserted together with the condemn-nothing rule because the
 /// two used to be produced by the same pass, and a hold dropped here would hand back a baseline that

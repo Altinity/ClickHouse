@@ -900,7 +900,21 @@ RecoveredRefTable recoverRefTableDetailed(Backend & backend, const Layout & layo
                 on_page_fetched();
             for (const ListedKey & lk : page.keys)
             {
-                const auto parsed = layout.parseRefObjectKey(lk.key);
+                /// This listing is a HINT (the arithmetic walk below is the authority), and the very next
+                /// line discards any key that does not name THIS namespace. A key that names no LIFE
+                /// cannot name this namespace, so absorbing the parser's refusal here gives it exactly
+                /// the treatment the `id.ns == ns` test already gives it -- while letting the refusal
+                /// escape would take down every caller of this recovery, the rebuild command among them.
+                std::optional<ParsedRefObjectKey> parsed;
+                try
+                {
+                    parsed = layout.parseRefObjectKey(lk.key);
+                }
+                catch (const Exception & e)
+                {
+                    if (e.code() != ErrorCodes::CORRUPTED_DATA)
+                        throw;   /// not a key refusal: a real failure of the listing itself
+                }
                 if (parsed && parsed->id.ns == ns)
                 {
                     if (parsed->kind == RefObjectKind::Log)
