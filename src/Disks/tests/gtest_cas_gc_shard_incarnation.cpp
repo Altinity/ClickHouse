@@ -1,5 +1,8 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <vector>
+
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h>
@@ -35,8 +38,14 @@ ManifestRef testRef(uint64_t seq)
 
 }
 
-/// Task 4: LIST-based discovery. Publishing a ref into ns A shard 0 makes (A,0) discoverable;
-/// ns B with no shard object is NOT discovered.
+/// Review I5: `discoverUniverse` is catalog-authoritative (Task 4-C), and this test used to survive
+/// the switch from LIST-based discovery unchanged -- `publishCommittedTransition` admits a catalog
+/// entry as its own side effect, so LIST-based and catalog-based discovery were indistinguishable to
+/// it. Pins the three shapes that actually distinguish the two sources directly:
+///   (a) a `Live` catalog entry with ZERO ref objects IS in the universe -- the catalog alone decides;
+///   (b) a `Creating` entry is EXCLUDED -- spec §3, no publication can exist yet;
+///   (c) a namespace with ref OBJECTS but NO catalog entry is EXCLUDED -- the C1 shape: the catalog is
+///       the authority, so its absence is authoritative too, however much debris LIST would still find.
 TEST(CasGcShardIncarnation, DiscoveryEqualsPresentShards)
 {
     for (const uint64_t gc_shards : {1u, 4u})
@@ -44,29 +53,55 @@ TEST(CasGcShardIncarnation, DiscoveryEqualsPresentShards)
         std::shared_ptr<InMemoryBackend> backend;
         auto store = makePoolWithShards(backend, gc_shards);
         Gc gc(store, hexToU128("0000000000000000000000000000000a"));
+        const Layout & layout = store->layout();
 
-        const RootNamespace ns_a{"srv1/tblA"};
-        const RootNamespace ns_b{"srv1/tblB"};
+        const RootNamespace ns_live_empty{"srv1/tblLiveEmpty"};
+        const RootNamespace ns_creating{"srv1/tblCreating"};
+        const RootNamespace ns_uncataloged{"srv1/tblUncataloged"};
 
-        /// Write a ref shard for ns A shard 0 only.
-        writeManifestRaw(*backend, store->layout(), ns_a, testRef(1), {});
-        publishCommittedTransition(*backend, store->layout(), ns_a, "part_1", std::nullopt, testRef(1), /*shard=*/0);
+        /// (a) Admitted Live, nothing else ever written under it.
+        casAdmitEntry(*backend, layout, ns_live_empty);
 
-        /// ns B: no shard object written at all.
+        /// (b) A genuinely Creating entry, admitted directly (step 1 alone -- never completed to Live).
+        CasRefCatalog::casAdmitEntry(*backend, layout, CatalogEntry{.ns = ns_creating, .state = NsState::Creating,
+            .incarnation = UInt128(1), .creator = CreatorFence{.server_root_id = "test", .writer_epoch = 1, .fence_generation = 1}});
+
+        /// (c) Ref objects present, but the catalog was never told (or has since forgotten): write
+        /// through the real path, which self-admits, then strip the entry back out to simulate "the
+        /// catalog does not name it" without touching the ref objects it left behind.
+        writeManifestRaw(*backend, layout, ns_uncataloged, testRef(1), {});
+        publishCommittedTransition(*backend, layout, ns_uncataloged, "part_1", std::nullopt, testRef(1), /*shard=*/0);
+        {
+            CasRefCatalog::Snapshot snap = CasRefCatalog::read(*backend, layout);
+            std::erase_if(snap.catalog.entries, [&](const CatalogEntry & e) { return e.ns.string() == ns_uncataloged.string(); });
+            const HeadResult h = backend->head(layout.refCatalogKey());
+            ASSERT_TRUE(h.exists);
+            ASSERT_EQ(backend->putOverwrite(layout.refCatalogKey(), encodeRefCatalog(snap.catalog), h.token).outcome,
+                       PutOutcome::Done);
+        }
 
         const auto universe = gc.discoverUniverseForTest();
 
         /// Stage B (Task 4-C): the universe is catalog-authoritative now, so it is a life per namespace
         /// (there are no numeric shards to destructure -- see `NamespaceLifeId`), never a
         /// `(namespace, shard)` pair.
-        bool found_a = false;
+        bool found_live_empty = false;
         for (const NamespaceLifeId & life : universe)
         {
-            if (life.ns.string() == "srv1/tblA")
-                found_a = true;
-            EXPECT_NE(life.ns.string(), "srv1/tblB") << "ns B should not appear in universe (no shard written)";
+            if (life.ns.string() == ns_live_empty.string())
+                found_live_empty = true;
+            EXPECT_NE(life.ns.string(), ns_creating.string()) << "a Creating entry must never be discovered";
+            EXPECT_NE(life.ns.string(), ns_uncataloged.string())
+                << "ref objects with no catalog entry must not be discovered, however much debris LIST would find";
         }
-        EXPECT_TRUE(found_a) << "ns A shard 0 must be in the universe (shard object present)";
+        EXPECT_TRUE(found_live_empty) << "a Live catalog entry with zero ref objects must still be discovered";
+
+        /// Confirm (b) really is still Creating (not merely absent from a differently-shaped universe).
+        const CasRefCatalog::Snapshot final_snap = CasRefCatalog::read(*backend, layout);
+        const auto creating_it = std::find_if(final_snap.catalog.entries.begin(), final_snap.catalog.entries.end(),
+            [&](const CatalogEntry & e) { return e.ns.string() == ns_creating.string(); });
+        ASSERT_NE(creating_it, final_snap.catalog.entries.end());
+        EXPECT_EQ(creating_it->state, NsState::Creating);
     }
 }
 
