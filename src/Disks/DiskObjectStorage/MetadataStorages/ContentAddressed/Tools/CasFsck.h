@@ -187,9 +187,11 @@ struct FsckHardFinding
 ///
 /// The name is the one the text summary line and the SQL result column both use, which is what lets a
 /// test check a rendering surface by iterating this list instead of restating its contents.
-/// The SIZE IS DEDUCED, deliberately: a fixed `std::array<FsckHardFinding, N>` would reject an added row
-/// as "excess elements in array initializer", which stops the build but prints none of the guidance the
-/// assert below carries. Deduced, an added row compiles and the assert is what speaks.
+/// The SIZE IS DEDUCED, deliberately. A fixed `std::array<FsckHardFinding, N>` rejects an added row with
+/// an "excess elements in ..." diagnostic -- which stops the build, but its text carries none of the
+/// guidance the assert below does, so the author learns only that they miscounted. (Which noun that
+/// diagnostic uses depends on the brace form, so it is not quoted here.) Deduced, an added row compiles
+/// and the assert is what speaks.
 inline constexpr std::array kFsckHardFindings{
     FsckHardFinding{"dangling", &FsckReport::dangling},
     FsckHardFinding{"snapshot_oracle_mismatches", &FsckReport::snapshot_oracle_mismatches},
@@ -199,27 +201,43 @@ inline constexpr std::array kFsckHardFindings{
     FsckHardFinding{"lifeless_keys", &FsckReport::lifeless_keys},
 };
 
-/// TRIPWIRE. A hard finding has to reach THREE surfaces, and each one has been forgotten at least once:
+/// TRIPWIRE. A hard finding has to reach three CODE surfaces, and each has been forgotten at least once:
 /// the text summary line (`formatFsckSummary`), `CommandFsck::executeImpl`'s nonzero-exit set, and the
-/// SQL result row (`contentAddressedFsckColumns` + `appendContentAddressedFsckRow`). Four times now a
-/// term was added to `clean` and one of the three was missed, each time with the rule written down in
-/// prose and each time the prose not holding.
+/// SQL result row (`contentAddressedFsckColumns` + `appendContentAddressedFsckRow`). It has happened
+/// repeatedly, on more than one occasion and to more than one term, each time with the rule written down
+/// in prose and each time the prose not holding. (No count is given: the records that document those
+/// episodes do not support one number, and a tally nobody can reconstruct is the same defect as the rest.)
+///
+/// ONE ROW OF THIS LIST IS DELIBERATELY NOT IN THE EXIT SET, so the "three surfaces" rule has a named
+/// exception rather than a silent violation: `stale_edge` is nonzero only under `--detail`, and
+/// `CommandFsck::executeImpl` prints it as a `note:` and never throws. What licenses that is the pair --
+/// a documented reason AND a compensating gate elsewhere (`stale_edge_verdict` in
+/// `utils/ca-soak/soak/fsck.py`, asserted by the soak checkpoint in `soak/run.py`, which fails closed
+/// when the key is absent). A new finding may take the same exception only WITH both halves; without
+/// them it belongs in the exit set.
 ///
 /// WHAT THIS ASSERT CHECKS, precisely: that the number of hard findings still equals the number written
 /// here. Nothing more. It does NOT check that any surface renders them -- it cannot see the renderers,
-/// which is the whole reason it lives with the struct: this header is included by the summary
-/// formatter, by `programs/disks`, and by `InterpreterSystemQuery.cpp`, so changing the list breaks the
-/// build in every TU that owes an update, including the two no unit test can reach.
+/// which is the whole reason it lives with the struct: this header is included by the summary formatter,
+/// by `programs/disks/CommandFsck.cpp`, and by `src/Interpreters/InterpreterSystemQuery.cpp`, so changing
+/// the list breaks the build in every TU that owes an update, including the two no unit test can reach.
 ///
 /// The summary line is checked for real, by a test that iterates the list
 /// (`CasFsckSummary.EveryHardFindingAppearsOnTheSummaryLine`). The exit set and the SQL row are NOT --
 /// for those, this assert plus the list below it is the whole of the mechanism, so bumping the number
 /// without visiting them defeats it. Bump it only after all three are done.
+///
+/// AND IT REACHES NO PROSE. The rule is also restated in `docs/superpowers/cas/08-testing-and-soak.md`
+/// and in the soak harness's docstrings; those restatements have gone stale before (two of them were
+/// wrong about the exit set on the day this assert was written) and nothing here can break a build over
+/// them. They are a fourth surface, unfenced by construction.
 static_assert(kFsckHardFindings.size() == 6,
     "A hard finding was added to or removed from `kFsckHardFindings`, which is `FsckReport::clean`. "
-    "Before updating this count, render it in ALL THREE surfaces: `formatFsckSummary`'s line, "
+    "Before updating this count, render it in ALL THREE code surfaces: `formatFsckSummary`'s line, "
     "`CommandFsck::executeImpl`'s nonzero-exit set, and `contentAddressedFsckColumns` + "
-    "`appendContentAddressedFsckRow`. Two of the three have no test that can fail for you.");
+    "`appendContentAddressedFsckRow`. Two of the three have no test that can fail for you -- the "
+    "comment above this assert says which. A finding may be left out of the exit set only the way "
+    "`stale_edge` is: with a documented reason AND a compensating soak assert.");
 
 inline bool FsckReport::clean() const
 {
