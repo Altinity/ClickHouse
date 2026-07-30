@@ -1772,10 +1772,9 @@ def test_export_partition_same_partition_key_different_column_order(cluster):
 
     node.query(f"INSERT INTO {mt_table} VALUES (1, 1), (1, 2)")
 
-    node.query(f"ALTER TABLE {mt_table} EXPORT PARTITION ID '1' TO TABLE {s3_table}")
-    wait_for_export_status(node, mt_table, s3_table, "1", "COMPLETED")
+    error = node.query_and_get_error(f"ALTER TABLE {mt_table} EXPORT PARTITION ID '1' TO TABLE {s3_table}")
+    assert "BAD_ARGUMENTS" in error, f"Expected BAD_ARGUMENTS, got: {error}"
+    assert "partition key column" in error, f"Expected partition key column mismatch message, got: {error}"
 
-    dest_result = node.query(f"SELECT * FROM {s3_table} ORDER BY a, b")
-
-    expected = "1\t1\n2\t1\n"
-    assert dest_result == expected, f"Expected:\n{expected}\nGot:\n{dest_result}"
+    count = int(node.query(f"SELECT count() FROM {s3_table}").strip())
+    assert count == 0, f"Expected 0 rows in destination after rejected export, got {count}"

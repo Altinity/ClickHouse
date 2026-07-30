@@ -9,6 +9,7 @@
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <filesystem>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <Core/Block.h>
 #include <Core/Settings.h>
@@ -644,7 +645,8 @@ namespace ExportPartitionUtils
         };
 
         if (query_to_string(source_metadata->getPartitionKeyAST()) != query_to_string(destination_metadata->getPartitionKeyAST()))
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Tables have different partition key");
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                "Cannot export partition: source and destination tables have different `PARTITION BY` expressions");
     }
 
     void verifyExportSchemaCastable(
@@ -670,15 +672,34 @@ namespace ExportPartitionUtils
             ActionsDAG::MatchColumnsMode::Position,
             context);
 
-        /// Lossy casts may silently change values, so reject them unless the user opts in.
-        if (context->getSettingsRef()[Setting::export_merge_tree_part_allow_lossy_cast])
-            return;
+        auto partition_key_columns = source_metadata->getColumnsRequiredForPartitionKey();
+        const std::unordered_set<String> partition_key_column_set(
+            std::make_move_iterator(partition_key_columns.begin()),
+            std::make_move_iterator(partition_key_columns.end()));
+
+        const bool allow_lossy_cast = context->getSettingsRef()[Setting::export_merge_tree_part_allow_lossy_cast];
 
         const size_t num_columns = std::min(source_columns.size(), destination_columns.size());
         for (size_t i = 0; i < num_columns; ++i)
         {
             const auto & source_column = source_columns[i];
             const auto & destination_column = destination_columns[i];
+
+            if (partition_key_column_set.contains(source_column.name) && source_column.name != destination_column.name)
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "Cannot export to {}: partition key column '{}' is at position {} in the source "
+                    "table, but the destination's column at that position is named '{}'. EXPORT "
+                    "PART/PARTITION matches columns by position, so partition key columns must be "
+                    "declared at the same position in both tables.",
+                    destination_storage_id.getFullTableName(),
+                    source_column.name,
+                    i,
+                    destination_column.name);
+
+            /// Lossy casts may silently change values, so reject them unless the user opts in.
+            if (allow_lossy_cast)
+                continue;
+
             if (!canBeSafelyCast(source_column.type, destination_column.type))
                 throw Exception(ErrorCodes::INCOMPATIBLE_COLUMNS,
                     "Cannot export to {}: column '{}' requires a lossy cast from {} to {}, "

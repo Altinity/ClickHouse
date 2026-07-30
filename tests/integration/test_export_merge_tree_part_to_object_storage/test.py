@@ -343,21 +343,9 @@ def test_export_part_same_partition_key_different_column_order(cluster):
         f"AND table = '{mt_table}' AND active ORDER BY name LIMIT 1"
     ).strip()
 
-    node.query(f"ALTER TABLE {mt_table} EXPORT PART '{part_name}' TO TABLE {s3_table}")
+    error = node.query_and_get_error(f"ALTER TABLE {mt_table} EXPORT PART '{part_name}' TO TABLE {s3_table}")
+    assert "BAD_ARGUMENTS" in error, f"Expected BAD_ARGUMENTS, got: {error}"
+    assert "partition key column" in error, f"Expected partition key column mismatch message, got: {error}"
 
-    deadline = time.time() + 30
-    while True:
-        node.query("SYSTEM FLUSH LOGS")
-        count = node.query(
-            f"SELECT count() FROM system.part_log WHERE event_type = 'ExportPart' "
-            f"AND database = currentDatabase() AND table = '{mt_table}' AND part_name = '{part_name}'"
-        ).strip()
-        if count != "0":
-            break
-        if time.time() > deadline:
-            raise TimeoutError(f"ExportPart event for part {part_name!r} did not appear within 30s")
-        time.sleep(0.5)
-
-    dest_result = node.query(f"SELECT a, b FROM {s3_table} ORDER BY a, b")
-    expected = "1\t1\n1\t2\n"
-    assert dest_result == expected, f"Expected:\n{expected}\nGot:\n{dest_result}"
+    count = int(node.query(f"SELECT count() FROM {s3_table}").strip())
+    assert count == 0, f"Expected 0 rows in destination after rejected export, got {count}"

@@ -475,12 +475,17 @@ def test_export_part_same_partition_key_different_column_order(cluster):
     node.query(f"INSERT INTO {mt} VALUES (1, 1), (1, 2)")
 
     part_1 = get_part(node, mt, "1")
-    export_part(node, mt, part_1, iceberg)
-    wait_for_export_part(node, mt, part_1)
 
-    result = node.query(f"SELECT a, b FROM {iceberg} ORDER BY a, b").strip()
-    expected = "1\t1\n1\t2"
-    assert result == expected, f"Expected:\n{expected}\nGot:\n{result}"
+    error = node.query_and_get_error(
+        f"ALTER TABLE {mt} EXPORT PART '{part_1}' TO TABLE {iceberg} "
+        f"SETTINGS allow_experimental_export_merge_tree_part = 1, "
+        f"allow_experimental_insert_into_iceberg = 1"
+    )
+    assert "BAD_ARGUMENTS" in error, f"Expected BAD_ARGUMENTS, got: {error!r}"
+    assert "partition key column" in error, f"Expected partition key column mismatch message, got: {error!r}"
+
+    count = int(node.query(f"SELECT count() FROM {iceberg}").strip())
+    assert count == 0, f"Expected 0 rows in Iceberg table after rejected export, got {count}"
 
     node.query(f"DROP TABLE IF EXISTS {mt} SYNC")
     node.query(f"DROP TABLE IF EXISTS {iceberg}")

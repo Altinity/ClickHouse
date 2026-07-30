@@ -1336,15 +1336,15 @@ def test_export_partition_same_partition_key_different_column_order(cluster):
 
     node.query(f"INSERT INTO {mt_table} VALUES (1, 1), (1, 2)")
 
-    node.query(
+    error = node.query_and_get_error(
         f"ALTER TABLE {mt_table} EXPORT PARTITION ID '1' TO TABLE {iceberg_table}",
         settings={"allow_insert_into_iceberg": 1},
     )
-    wait_for_export_status(node, mt_table, iceberg_table, "1", "COMPLETED")
+    assert "BAD_ARGUMENTS" in error, f"Expected BAD_ARGUMENTS, got: {error}"
+    assert "partition key column" in error, f"Expected partition key column mismatch message, got: {error}"
 
-    result = node.query(f"SELECT a, b FROM {iceberg_table} ORDER BY a, b").strip()
-    expected = "1\t1\n1\t2"
-    assert result == expected, f"Expected:\n{expected}\nGot:\n{result}"
+    count = int(node.query(f"SELECT count() FROM {iceberg_table}").strip())
+    assert count == 0, f"Expected 0 rows in destination after rejected export, got {count}"
 
 
 def test_export_partition_with_castable_widening(cluster):
