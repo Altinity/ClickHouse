@@ -562,12 +562,12 @@ std::vector<MountInfo> listMounts(Backend & backend, const Layout & layout, uint
 /// consuming it lives in the caller) deliberately: a future certificate with no verdict assigned here
 /// must fail the BUILD (a missing `-Wswitch` case), never silently read as terminal.
 ///
-/// Deliberately conservative on the two cases that are NOT proof of death, mirroring
-/// `probeNonTerminalMountSlots`'s own stated discipline: an ABSENT mount slot (`Backend::get`
-/// returning `nullopt` answers nothing about liveness — it is not proof either way) and an
-/// UNDECODABLE body (an unreadable lease of some other format generation is precisely the case that
-/// must block, not the one to wave through) both return `false` — refuse reconciliation rather than
-/// guess. A merely `expired` lease (a wall-clock reading past `expires_at_ms`) is likewise NEVER
+/// Deliberately conservative on the two cases that are NOT proof of death: an ABSENT mount slot
+/// (`Backend::get` returning `nullopt` answers nothing about liveness — it is not proof either way)
+/// and an UNDECODABLE body (an unreadable lease of some other format generation is precisely the case
+/// that must block, not the one to wave through, mirroring `probeNonTerminalMountSlots`'s own stated
+/// discipline for that case) both return `false` — refuse reconciliation rather than guess.
+/// A merely `expired` lease (a wall-clock reading past `expires_at_ms`) is likewise NEVER
 /// treated as a certificate, for the same reason `claimMount` itself refuses to trust one: comparing
 /// another node's stamp against a clock is exactly the unsafe comparison the mount protocol exists to
 /// avoid, and there is not even a caller-supplied clock offered here to make that comparison with.
