@@ -146,6 +146,39 @@ dropped before grouping. Note what this does NOT do, so nobody expects it: the P
 dead incarnation's key, deliberately — `Layout` is catalog-independent by design, so it is the wrong
 place to refuse.
 
+## R13. `_ckpt.life_epoch` has TWO honest contributors, so "conflict is corruption" wedges ordinary operation {#r13-life-epoch-two-contributors}
+
+Found 2026-07-31 by Task 4c's implementer, before writing the behaviour it was asked for — the fourth time this
+stage that a directive's rule rested on a comment nobody had checked against the code.
+
+`life_epoch` is contributed by two writers of ONE life, deriving it from epochs that **legitimately differ**:
+`CasRefCatalog::completeCreation` contributes the creator's `writer_epoch`, and `commitRefChunk`'s birth chunk
+contributes the ref-log `NamespaceBirth`'s `id.writer_epoch`. Task 4's re-key closed the rebirth alias between
+two *lives*; it never touched two writers of one life.
+
+Two reachable sequences, the second of which is **ordinary operation**:
+- **Resumed creation.** Creator at E1 publishes `_ckpt{life_epoch=E1}` and dies before `Creating → Live`; a
+  later actor at E2 reconciles and resumes `completeCreation`, contributing E2. The suite ALREADY pins that the
+  later value is the correct one.
+- **Restart between create and first write.** `completeCreation` publishes E_create, the mount's writer epoch
+  advances, the first precommit emits the birth chunk at E_write. That is CREATE TABLE, restart, INSERT.
+
+So `max` is not laundering a contradiction — it is load-bearing: `life_epoch` must equal the writer epoch of the
+`NamespaceBirth` that actually landed, which is always the later, and writer epochs are monotone. Under "two
+different present values are corruption" both sequences raise `CORRUPTED_DATA`, and since `_ckpt` has no repair
+path and no writer may delete it outside namespace removal, **the namespace wedges permanently**: every retry
+re-reads E1, re-contributes E2, re-throws.
+
+**The false sentence that made the strict rule look free:** the field's own doc called `life_epoch` "a
+namespace-lifetime constant, so its semantic maximum is itself". It is not constant across a resumed or a
+restarted birth, and the rule was written on top of that claim.
+
+**Ruling (2026-07-31): refuse a DECREASE, let a higher value win — and this is a SHARPENING, not a concession.**
+By monotonicity a decrease is unreachable honestly, so ask what one *is* when it appears: a writer contributing
+an epoch older than one already durable, i.e. **a fenced-out writer whose contribution landed anyway**. `max`
+absorbs that silently today. So the narrowed rule detects the only case that indicates a real bug, while the
+directive's version fires on the two cases that indicate nothing.
+
 ## R12. A pure READ births a catalog entry, and the catalog has a capacity budget {#r12-read-births-namespace}
 
 Found 2026-07-31 by Task 4b's implementer while checking whether its own design added a request class — it
