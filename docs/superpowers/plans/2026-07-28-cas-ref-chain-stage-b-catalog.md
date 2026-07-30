@@ -131,6 +131,20 @@ against the encodings that died. Four specifics do carry over:
    `refLaneWedgedForTest` exist and are widely used; a later task's test that needs to see lane state
    should read them.
 
+## Review policy: non-code findings are batched, not looped {#prose-findings-batched}
+
+USER DIRECTIVE 2026-07-30. A finding whose entire content is non-executing — a comment, doc text, a
+report or commit-message claim — is appended to `docs/superpowers/cas/deferred-docs-fixes.md` and
+executed in ONE later pass. It does NOT enter a per-task fix round. Every review dispatch from here on
+says so, so reviewers still report prose findings and grade them, but nothing waits on them.
+
+The reason is in that file: Task 1c spent three consecutive rounds on comment accuracy with zero
+defects in code or tests, and each round wrote the next round's finding.
+
+**Classify before filing.** Of the six minors deferred from Task 1c's review, only three were prose;
+the rest were executing defects and are now steps of Task 7. A finding can also be filed as wording
+while its body names a consequence — split those, and send the behaviour to `BACKLOG.md`.
+
 ## Task overview {#task-overview}
 
 | # | Task | Source | Depends on |
