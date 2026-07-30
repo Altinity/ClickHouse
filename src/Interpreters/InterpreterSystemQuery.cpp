@@ -2438,6 +2438,12 @@ ColumnsDescription contentAddressedFsckColumns()
         /// `lifeless_keys` was added to `clean` in 2026-07-30 and missed here too, which is the fourth
         /// time this rule was written in prose and did not hold.
         ///
+        /// So the rule no longer lives only in prose: `kFsckHardFindings` (`CasFsck.h`) is the list
+        /// `clean` is computed from, and the `static_assert` beside it breaks the build in THIS
+        /// translation unit when a term is added. Read that assert's message before bumping its count --
+        /// it names this site as one of the three that owes an update, and says which of the three have
+        /// no test that can fail on their behalf. This is one of those.
+        ///
         /// `stale_edge` is nonzero only in `detail` mode and this row is built from a summary scan, so it
         /// reads 0 here always — present because "absent" and "zero" are different facts to a consumer,
         /// and a column that appears the day the scan gains detail is a schema change nobody asked for.

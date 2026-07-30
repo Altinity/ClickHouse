@@ -4,6 +4,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
 
+#include <array>
 #include <chrono>
 #include <functional>
 #include <optional>
@@ -169,12 +170,64 @@ struct FsckReport
     /// `chain_broken` is a hard finding in every mode. `unchecked` deliberately is NOT one: it says the
     /// walk proved nothing about those namespaces, which is a statement about COVERAGE, and folding it
     /// in here would make "cannot prove" indistinguishable from "found broken".
-    bool clean() const
-    {
-        return dangling == 0 && snapshot_oracle_mismatches == 0 && corrupted_runs == 0 && stale_edge == 0
-            && chain_broken == 0 && lifeless_keys == 0;
-    }
+    /// Defined out-of-line below, over `kFsckHardFindings`, so that "a term of `clean`" and "a row of
+    /// that list" are the same thing rather than two lists that can drift.
+    bool clean() const;
 };
+
+/// ONE hard finding: the name every surface renders it under, and the counter it reads.
+struct FsckHardFinding
+{
+    std::string_view name;
+    uint64_t FsckReport::* value;
+};
+
+/// THE HARD FINDINGS, and the single authority on what they are. `FsckReport::clean` is computed from
+/// this list, so adding a term means adding a row here.
+///
+/// The name is the one the text summary line and the SQL result column both use, which is what lets a
+/// test check a rendering surface by iterating this list instead of restating its contents.
+/// The SIZE IS DEDUCED, deliberately: a fixed `std::array<FsckHardFinding, N>` would reject an added row
+/// as "excess elements in array initializer", which stops the build but prints none of the guidance the
+/// assert below carries. Deduced, an added row compiles and the assert is what speaks.
+inline constexpr std::array kFsckHardFindings{
+    FsckHardFinding{"dangling", &FsckReport::dangling},
+    FsckHardFinding{"snapshot_oracle_mismatches", &FsckReport::snapshot_oracle_mismatches},
+    FsckHardFinding{"corrupted_runs", &FsckReport::corrupted_runs},
+    FsckHardFinding{"stale_edge", &FsckReport::stale_edge},
+    FsckHardFinding{"chain_broken", &FsckReport::chain_broken},
+    FsckHardFinding{"lifeless_keys", &FsckReport::lifeless_keys},
+};
+
+/// TRIPWIRE. A hard finding has to reach THREE surfaces, and each one has been forgotten at least once:
+/// the text summary line (`formatFsckSummary`), `CommandFsck::executeImpl`'s nonzero-exit set, and the
+/// SQL result row (`contentAddressedFsckColumns` + `appendContentAddressedFsckRow`). Four times now a
+/// term was added to `clean` and one of the three was missed, each time with the rule written down in
+/// prose and each time the prose not holding.
+///
+/// WHAT THIS ASSERT CHECKS, precisely: that the number of hard findings still equals the number written
+/// here. Nothing more. It does NOT check that any surface renders them -- it cannot see the renderers,
+/// which is the whole reason it lives with the struct: this header is included by the summary
+/// formatter, by `programs/disks`, and by `InterpreterSystemQuery.cpp`, so changing the list breaks the
+/// build in every TU that owes an update, including the two no unit test can reach.
+///
+/// The summary line is checked for real, by a test that iterates the list
+/// (`CasFsckSummary.EveryHardFindingAppearsOnTheSummaryLine`). The exit set and the SQL row are NOT --
+/// for those, this assert plus the list below it is the whole of the mechanism, so bumping the number
+/// without visiting them defeats it. Bump it only after all three are done.
+static_assert(kFsckHardFindings.size() == 6,
+    "A hard finding was added to or removed from `kFsckHardFindings`, which is `FsckReport::clean`. "
+    "Before updating this count, render it in ALL THREE surfaces: `formatFsckSummary`'s line, "
+    "`CommandFsck::executeImpl`'s nonzero-exit set, and `contentAddressedFsckColumns` + "
+    "`appendContentAddressedFsckRow`. Two of the three have no test that can fail for you.");
+
+inline bool FsckReport::clean() const
+{
+    for (const FsckHardFinding & finding : kFsckHardFindings)
+        if (this->*finding.value != 0)
+            return false;
+    return true;
+}
 
 /// Independently recompute reachability from authoritative refs (never from GC state or snapshots) and
 /// diff it against a raw object listing. The operation is read-only; `detail` populates per-object rows.
@@ -194,8 +247,11 @@ FsckReport runFsck(Pool & store, bool detail, FsckProgress on_progress = {},
 /// it lives here, next to the report and under test, rather than inline in the command where nothing
 /// could reach it. Every term of `FsckReport::clean` MUST appear: a hard finding the line omits is a
 /// finding no run will ever report, which is how `corrupted_runs` stayed invisible from the day it was
-/// first counted. Zeros are printed, never omitted: "absent" and "zero" are different facts, and
-/// consumers (e.g. the harness's `stale_edge_verdict`) fail closed on absence by design.
+/// first counted. That requirement is CHECKED for this surface, not merely stated:
+/// `CasFsckSummary.EveryHardFindingAppearsOnTheSummaryLine` iterates `kFsckHardFindings` and looks for
+/// each name in the line, so a term added to the list and not rendered here fails that test. Zeros are
+/// printed, never omitted: "absent" and "zero" are different facts, and consumers (e.g. the harness's
+/// `stale_edge_verdict`) fail closed on absence by design.
 String formatFsckSummary(const FsckReport & report);
 
 }

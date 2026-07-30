@@ -725,27 +725,36 @@ TEST(CasFsckRunning, FsckOnNotLiveDiskRefusesTransientRetryableAndIdentityLostTe
 /// happened to `corrupted_runs`: counted since the seal check landed, part of `clean()`, rendered in
 /// `--detail` rows, and absent from the summary, so no run has ever reported one.
 ///
-/// This test is deliberately written against `clean()`'s OWN field set rather than a hand-listed set of
-/// names, so that adding a hard finding to `clean()` without rendering it fails HERE instead of hiding for
-/// months. `formatFsckSummary` exists to be testable at all: the line used to be built inline in
+/// This test ITERATES `kFsckHardFindings` -- the list `clean()` is computed from -- and never names a
+/// finding itself, so a term added to that list and not rendered fails HERE. It used to claim exactly
+/// that while its body was a hand-listed set of five names, and the claim was false: `lifeless_keys` was
+/// added to `clean()` and nothing failed anywhere, which is how it reached the SQL row's absence too.
+/// `formatFsckSummary` exists to be testable at all: the line used to be built inline in
 /// `CommandFsck::executeImpl`, where nothing could reach it.
+///
+/// A per-finding DISTINCT value is what makes this more than a substring sweep: it catches a formatter
+/// that prints the right names against the wrong counters.
 TEST(CasFsckSummary, EveryHardFindingAppearsOnTheSummaryLine)
 {
     FsckReport rep;
-    rep.dangling = 11;
-    rep.snapshot_oracle_mismatches = 22;
-    rep.corrupted_runs = 33;
-    rep.stale_edge = 44;
-    rep.lifeless_keys = 55;
+    uint64_t value = 11;
+    for (const FsckHardFinding & finding : kFsckHardFindings)
+    {
+        rep.*finding.value = value;
+        value += 11;
+    }
 
     const String line = formatFsckSummary(rep);
 
-    /// One assertion per `clean()` term. If `clean()` grows a term, add it here in the same change.
-    EXPECT_NE(line.find("dangling=11"), String::npos) << line;
-    EXPECT_NE(line.find("snapshot_oracle_mismatches=22"), String::npos) << line;
-    EXPECT_NE(line.find("corrupted_runs=33"), String::npos) << line;
-    EXPECT_NE(line.find("stale_edge=44"), String::npos) << line;
-    EXPECT_NE(line.find("lifeless_keys=55"), String::npos) << line;
+    value = 11;
+    for (const FsckHardFinding & finding : kFsckHardFindings)
+    {
+        const String token = String(finding.name) + "=" + std::to_string(value);
+        EXPECT_NE(line.find(token), String::npos)
+            << "hard finding '" << finding.name << "' is missing from the summary line (expected `"
+            << token << "`); the line was: " << line;
+        value += 11;
+    }
 
     /// A report carrying these values is NOT clean; the line must not be mistakable for a clean one.
     EXPECT_FALSE(rep.clean());
@@ -757,9 +766,11 @@ TEST(CasFsckSummary, EveryHardFindingAppearsOnTheSummaryLine)
 TEST(CasFsckSummary, ZeroValuedHardFindingsAreStillPrinted)
 {
     const String line = formatFsckSummary(FsckReport{});
-    EXPECT_NE(line.find("corrupted_runs=0"), String::npos) << line;
-    EXPECT_NE(line.find("stale_edge=0"), String::npos) << line;
-    EXPECT_NE(line.find("lifeless_keys=0"), String::npos) << line;
+    /// Iterated for the same reason the test above is: a new hard finding printed only when nonzero is a
+    /// finding the harness's fail-closed-on-absence consumers would read as missing.
+    for (const FsckHardFinding & finding : kFsckHardFindings)
+        EXPECT_NE(line.find(String(finding.name) + "=0"), String::npos)
+            << "hard finding '" << finding.name << "' prints no zero; the line was: " << line;
     EXPECT_EQ(line.find("partial="), String::npos) << "a non-partial report must not claim partial: " << line;
 }
 
