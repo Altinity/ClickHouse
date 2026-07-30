@@ -230,7 +230,7 @@ TEST(CasNsCreationLifecycle, EntryStolenByAConcurrentReconcilerRefusesGoLiveAndL
     const std::function<void(uint64_t)> steal_before_the_go_live_cas = [&, calls](uint64_t)
     {
         if (++*calls == 2)
-            ASSERT_EQ(CasRefCatalog::reconcileStaleCreator(backend, layout, entry, thief, fixedTerminality(true)),
+            ASSERT_EQ(CasRefCatalog::reconcileStaleCreator(backend, layout, entry, thief, fixedTerminality(true), /*admitted_generation=*/1, ALWAYS_ADMITTED),
                        CasRefCatalog::ReconcileCreatorOutcome::Reconciled);
     };
 
@@ -276,7 +276,7 @@ TEST(CasNsCreationLifecycle, BothFenceAndEntryStaleRefusesGoLiveViaTheFenceCheck
     {
         if (++*calls == 2)
         {
-            ASSERT_EQ(CasRefCatalog::reconcileStaleCreator(backend, layout, entry, thief, fixedTerminality(true)),
+            ASSERT_EQ(CasRefCatalog::reconcileStaleCreator(backend, layout, entry, thief, fixedTerminality(true), /*admitted_generation=*/1, ALWAYS_ADMITTED),
                        CasRefCatalog::ReconcileCreatorOutcome::Reconciled);
             throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "fence generation moved since admission ({})", admitted);
         }
@@ -308,7 +308,7 @@ TEST(CasNsCreationLifecycle, ReconcileRefusedWhileTheOriginalCreatorFenceIsStill
     CasRefCatalog::casAdmitEntry(backend, layout, entry);
 
     const auto outcome = CasRefCatalog::reconcileStaleCreator(
-        backend, layout, entry, creatorFence("srv2", 9), fixedTerminality(false));
+        backend, layout, entry, creatorFence("srv2", 9), fixedTerminality(false), /*admitted_generation=*/1, ALWAYS_ADMITTED);
     EXPECT_EQ(outcome, CasRefCatalog::ReconcileCreatorOutcome::CreatorFenceStillLive);
 
     const CasRefCatalog::Snapshot snap_after = CasRefCatalog::read(backend, layout);
@@ -327,7 +327,7 @@ TEST(CasNsCreationLifecycle, ReconcileSucceedsTokenExactlyAfterTheOriginalCreato
     const CatalogEntry entry{.ns = ns, .state = NsState::Creating, .incarnation = UInt128(7), .creator = original_creator};
     CasRefCatalog::casAdmitEntry(backend, layout, entry);   /// "crash after write 1" -- no _ckpt yet
 
-    ASSERT_EQ(CasRefCatalog::reconcileStaleCreator(backend, layout, entry, new_creator, fixedTerminality(true)),
+    ASSERT_EQ(CasRefCatalog::reconcileStaleCreator(backend, layout, entry, new_creator, fixedTerminality(true), /*admitted_generation=*/1, ALWAYS_ADMITTED),
                CasRefCatalog::ReconcileCreatorOutcome::Reconciled);
 
     CatalogEntry taken_over = entry;
@@ -366,13 +366,13 @@ TEST(CasNsCreationLifecycle, ReconcileFailsClosedWhenTheEntryAlreadyChanged)
     const CreatorFence first_reconciler = creatorFence("srv2", 9);
     const CreatorFence second_reconciler = creatorFence("srv3", 11);
 
-    ASSERT_EQ(CasRefCatalog::reconcileStaleCreator(backend, layout, entry, first_reconciler, fixedTerminality(true)),
+    ASSERT_EQ(CasRefCatalog::reconcileStaleCreator(backend, layout, entry, first_reconciler, fixedTerminality(true), /*admitted_generation=*/1, ALWAYS_ADMITTED),
                CasRefCatalog::ReconcileCreatorOutcome::Reconciled);
 
     /// The second reconciler still holds the ORIGINAL `entry` it read before either of them wrote --
     /// token-exactness must refuse it even though the terminality predicate would still say yes.
     const auto outcome = CasRefCatalog::reconcileStaleCreator(
-        backend, layout, entry, second_reconciler, fixedTerminality(true));
+        backend, layout, entry, second_reconciler, fixedTerminality(true), /*admitted_generation=*/1, ALWAYS_ADMITTED);
     EXPECT_EQ(outcome, CasRefCatalog::ReconcileCreatorOutcome::EntryChanged);
 
     const CasRefCatalog::Snapshot snap_after = CasRefCatalog::read(backend, layout);
@@ -406,7 +406,7 @@ TEST(CasNsCreationLifecycle, ReconcileStaleCreatorRejectsANonCreatingEntry)
     const CatalogEntry live{.ns = RootNamespace{"a"}, .state = NsState::Live, .incarnation = UInt128(1)};
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&]
     {
-        CasRefCatalog::reconcileStaleCreator(backend, layout, live, creatorFence("srv2", 2), fixedTerminality(true));
+        CasRefCatalog::reconcileStaleCreator(backend, layout, live, creatorFence("srv2", 2), fixedTerminality(true), /*admitted_generation=*/1, ALWAYS_ADMITTED);
     });
 }
 #endif
@@ -429,7 +429,7 @@ TEST(CasNsCreationLifecycleDeathTest, ReconcileStaleCreatorRejectsANonCreatingEn
     const CatalogEntry live{.ns = RootNamespace{"a"}, .state = NsState::Live, .incarnation = UInt128(1)};
     EXPECT_DEATH(
         {
-            CasRefCatalog::reconcileStaleCreator(backend, layout, live, creatorFence("srv2", 2), fixedTerminality(true));
+            CasRefCatalog::reconcileStaleCreator(backend, layout, live, creatorFence("srv2", 2), fixedTerminality(true), /*admitted_generation=*/1, ALWAYS_ADMITTED);
         },
         "not a Creating entry");
 }

@@ -132,6 +132,13 @@ public:
         EntryChanged,         /// the catalog's current entry for `observed.ns` no longer equals
                               /// `observed` -- token-exactness failed. Not written; the caller must
                               /// re-read the catalog before trying again.
+        FencedOut,            /// review I6: this caller's OWN admitted generation moved before the CAS
+                              /// -- nothing was written, and the caller's own mount incarnation is gone,
+                              /// so it cannot be the one to retry. Mirrors `NamespaceCreationOutcome::
+                              /// FencedOut`; without this check a deposed mount could still steal a
+                              /// `Creating` entry onto its own dead fence before the following
+                              /// `completeCreation` refuses it -- the catalog would be mutated by an
+                              /// actor this subsystem otherwise never lets touch it.
     };
 
     /// The full, fresh §3 sequence for a namespace that carries NO catalog entry yet: mints a random
@@ -206,10 +213,18 @@ public:
     /// caller resumes with `completeCreation(backend, layout, {..., .creator = new_creator}, ...)` over
     /// the SAME incarnation, never a fresh one (rebirth under a fresh incarnation is Task 5/removal's
     /// business, not a live reconciliation's).
+    ///
+    /// `admitted_generation`/`check_fence_or_throw` (review I6): re-checked FIRST on every fresh read
+    /// this CAS retries, exactly like `completeCreation`'s own placement -- a caller whose OWN mount
+    /// fence has already moved must not be the one to steal a `Creating` entry onto its own (now dead)
+    /// fence, even though the following `completeCreation` would go on to refuse it as `FencedOut`
+    /// anyway: by then the catalog would already have been mutated by a deposed actor, the one posture
+    /// this subsystem otherwise refuses everywhere else.
     static ReconcileCreatorOutcome reconcileStaleCreator(
         Backend & backend, const Layout & layout, const CatalogEntry & observed,
         const CreatorFence & new_creator,
-        const std::function<bool(const CreatorFence &)> & is_creator_fence_terminal);
+        const std::function<bool(const CreatorFence &)> & is_creator_fence_terminal,
+        uint64_t admitted_generation, const std::function<void(uint64_t)> & check_fence_or_throw);
 
     /// Spec §3: "`Creating` forbids publication -- no ref writes admitted while the entry is
     /// Creating." Throws `throwCasWriteRetryLater`'s class (transient: `Creating` resolves once the

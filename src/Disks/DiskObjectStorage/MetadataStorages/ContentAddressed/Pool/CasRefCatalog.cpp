@@ -219,18 +219,24 @@ CasRefCatalog::NamespaceCreationOutcome CasRefCatalog::createNamespace(
 
 CasRefCatalog::ReconcileCreatorOutcome CasRefCatalog::reconcileStaleCreator(
     Backend & backend, const Layout & layout, const CatalogEntry & observed, const CreatorFence & new_creator,
-    const std::function<bool(const CreatorFence &)> & is_creator_fence_terminal)
+    const std::function<bool(const CreatorFence &)> & is_creator_fence_terminal,
+    uint64_t admitted_generation, const std::function<void(uint64_t)> & check_fence_or_throw)
 {
     if (observed.state != NsState::Creating || !observed.creator)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "CasRefCatalog::reconcileStaleCreator: namespace '{}' is not a Creating entry with a "
             "creator fence -- nothing to reconcile", observed.ns.string());
 
-    /// Token-exactness (the catalog's own entry, by full value) is checked BEFORE terminality: it is
-    /// the cheaper, purely local comparison, and a mismatch here means the question "is the OLD
-    /// creator's fence terminal" is moot -- `observed` no longer describes anything live to reconcile.
+    /// Review I6: the fence re-check is checked FIRST, on every fresh read this CAS retries -- the same
+    /// placement `completeCreation` uses for exactly the same reason (see that function's own doc).
+    /// Token-exactness (the catalog's own entry, by full value) comes next: it is the cheaper, purely
+    /// local comparison, and a mismatch here means the question "is the OLD creator's fence terminal" is
+    /// moot -- `observed` no longer describes anything live to reconcile.
     const auto mutate = [&](const RefCatalog & cur) -> RefCatalog
     {
+        try { check_fence_or_throw(admitted_generation); }
+        catch (...) { throw CatalogFenceMovedMarker{}; }   /// typed, not propagated -- completeCreation's own precedent
+
         const auto it = findEntry(cur, observed.ns);
         if (it == cur.entries.end() || *it != observed)
             throw CatalogEntryMismatchMarker{};
@@ -246,6 +252,7 @@ CasRefCatalog::ReconcileCreatorOutcome CasRefCatalog::reconcileStaleCreator(
     {
         casUpdate(backend, layout, mutate);
     }
+    catch (const CatalogFenceMovedMarker &) { return ReconcileCreatorOutcome::FencedOut; }
     catch (const CatalogEntryMismatchMarker &) { return ReconcileCreatorOutcome::EntryChanged; }
     catch (const CatalogCreatorStillLiveMarker &) { return ReconcileCreatorOutcome::CreatorFenceStillLive; }
     return ReconcileCreatorOutcome::Reconciled;

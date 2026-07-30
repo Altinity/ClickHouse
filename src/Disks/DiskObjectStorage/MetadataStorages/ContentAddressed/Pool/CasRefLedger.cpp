@@ -981,9 +981,17 @@ NamespaceLifeId CasRefLedger::resolveNamespaceLife(
         /// steals it onto our own fence and this open resumes `completeCreation` itself.
         const auto reconcile_outcome = CasRefCatalog::reconcileStaleCreator(
             backend, layout, *it, our_fence,
-            [this](const CreatorFence & f) { return isCreatorFenceTerminal(backend, layout, f.server_root_id, f.writer_epoch); });
+            [this](const CreatorFence & f) { return isCreatorFenceTerminal(backend, layout, f.server_root_id, f.writer_epoch); },
+            admitted_generation, check_fence_or_throw);
         switch (reconcile_outcome)
         {
+            case CasRefCatalog::ReconcileCreatorOutcome::FencedOut:
+                /// Review I6: our OWN mount fence moved before the steal CAS -- nothing was written, and
+                /// this mount is the wrong actor to retry (its incarnation is gone).
+                throwCasWriteRetryLater(fmt::format(
+                    "CAS ref-table recovery for namespace '{}': the mount incarnation moved while "
+                    "reconciling a stalled foreign creator; nothing was written and nothing installed",
+                    ns.string()));
             case CasRefCatalog::ReconcileCreatorOutcome::Reconciled:
             {
                 CatalogEntry resumed = *it;
