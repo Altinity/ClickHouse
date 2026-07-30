@@ -5,23 +5,31 @@
 #include <string>
 #include <vector>
 
-/// The namespace-file REQUEST PROFILE gate (directive §dedup-performance-constraint).
+/// The namespace-file REQUEST PROFILE gate (directive §dedup-performance-constraint) -- for the
+/// `Pool` namespace-file surface, which is the layer that must be read carefully below.
 ///
 /// `MergeTreeDeduplicationLog` rotates namespace files on the insert path because the CA disk cannot
-/// append, so every namespace-file operation's request profile is insert latency. The directive
-/// therefore fixes the profile rather than only the identity: no catalog request per file operation,
-/// no ref-log append, no blob upload, no folder-manifest rewrite, and unchanged direct-object backend
-/// request counts.
+/// append, so every namespace-file operation's request profile is insert latency. The directive's
+/// constraint has five clauses: no catalog request per file operation, no ref-log append, no blob
+/// upload, no folder-manifest rewrite, and unchanged direct-object backend request counts.
 ///
-/// The counts below were READ OFF this tree before any key change and pasted as literals. That
-/// ordering is the whole point of the file: expectations re-derived after a change measure the change
-/// against itself. Incarnation qualification changes the KEY a namespace file is stored under, so the
-/// keys here are derived from `Layout` rather than spelled out -- what must not move is the count per
-/// key and the SET of keys touched.
+/// WHAT THIS FILE PINS: the last clause, per key. The counts below were READ OFF this tree before any
+/// key change and pasted as literals, which is the whole point of the file -- expectations re-derived
+/// after a change measure the change against itself. Incarnation qualification changes the KEY a
+/// namespace file is stored under, so the keys are derived from `Layout` rather than spelled out; what
+/// must not move is the count per key and the set of keys touched.
 ///
-/// Each case asserts `touchedKeys()` as an exact set, and that is what carries the four "no ..."
-/// clauses: a catalog point-read, a ref-log append, a blob body PUT or a folder-manifest rewrite would
-/// each have to name a key outside the namespace's `_files/` subtree, and would appear in that set.
+/// WHAT IT DOES NOT PIN, stated so the next implementer of this constraint learns it here instead of
+/// rediscovering it: the four "no ..." clauses are NOT fenced by these cases. Every case drives
+/// `Pool::putNamespaceFile`/`getNamespaceFile`/`removeNamespaceFile`/`listNamespaceFiles`, which reach
+/// `CasPlainObjects` and have no catalog, ref-log, blob or manifest path to take -- so those four
+/// negatives hold by construction of the call, not by anything measured here. The layer where they can
+/// actually be violated is the DISK operation above: `ContentAddressedTransaction::writeFile` resolving
+/// its namespace through `ContentAddressedMetadataStorage::liveNamespace` is where a catalog GET would
+/// be introduced, and no fixture in this file can observe it (the metadata storage builds its own
+/// `Backend` from an `ObjectStoragePtr` and accepts no injected one, which is why the append case here
+/// is the two-call composition rather than the real write buffer). Fencing those four clauses needs a
+/// test at that layer.
 
 using namespace DB::Cas;
 using namespace DB::Cas::tests;
