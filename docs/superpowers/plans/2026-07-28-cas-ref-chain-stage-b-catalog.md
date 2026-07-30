@@ -1328,6 +1328,35 @@ RecoveryGrounding chooseRecoveryGrounding(const CatalogEntry & catalog_state,
 
 ### Task 6: Read-side contract — refs AND namespace files {#task-6}
 
+**AND THIS TASK IS WHERE THE LIFE-RESOLUTION REFACTOR BELONGS (placed 2026-07-30, correcting an earlier note
+of mine that said it should be its own task).** Deleting `stageATransition` already forces a decision at
+every one of its sites about what to do when no catalog life is known — so the decisions are this task's
+whether or not the refactor is named. Do them with the mechanism rather than by substituting a new default:
+
+- [ ] **Make absence expressible in the type.** `CasRefCatalog::resolveLifeOrSentinel` returns a
+  `NamespaceLifeId` and falls back to the sentinel, so a caller **cannot distinguish "here is the life" from
+  "I do not know"** — it gets a plausible, well-formed, wrong key. That property is the amplifier in all three
+  vacuous-frontier findings (`{#r11-empty-universe-vacuous}`, `{#r11b-authority-vs-union}`,
+  `{#r11c-incarnation-mismatch}`). Return `std::optional`, delete the fallback, and let the compiler enumerate
+  the sites. Fixtures then ask for the sentinel explicitly, where it IS the truth.
+- [ ] **Pass the snapshot, do not re-read it.** `resolveLifeOrSentinel` calls `CasRefCatalog::read` — a full
+  pool-wide GET and decode — on **every** call, at 24 sites, several inside per-namespace loops. `Gc::fold`
+  already does it correctly: one `CasRefCatalog::Snapshot` per round. Thread that snapshot through fsck and
+  decommission too, one read per run. Two defects disappear rather than get fixed: the O(namespaces²) read
+  volume, and "two resolutions inside one operation disagreed" (C3, and its relocation into fsck) becomes
+  **unrepresentable**, because there is only one resolution to disagree with.
+- [ ] **Carry the snapshot, not a lossy projection — and check the birth side while you are here.** `FoldResult`
+  currently carries `std::map<String, UInt128> live_incarnation`, built by skipping `Creating`. That map cannot
+  distinguish *absent from the catalog* from *present but `Creating`*, and the new un-cataloged anomaly keys on
+  exactly `it == end()`. **A stalled birth leaves a `Creating` entry plus a published genesis `_ckpt` under its
+  life prefix**, which would then be listed, be absent from the map, and raise the damage anomaly — suppressing
+  the whole round. The reviews caught the removal side of this; nobody caught the birth side. Verify the
+  reachability, then carry enough state to tell the three cases apart.
+- [ ] **Consider giving the sentinel its OWN type** (or the life a provenance tag) rather than deleting it by
+  grep. Its danger is that it is the same type as the truth, which is why it can be silently substituted; a
+  distinct type makes "this function requires a catalog-derived life" a compile-time property, and makes this
+  task's own zero-grep gate mechanical — delete the type, and every remaining use is a build error.
+
 **NEW CALL SITE, added after this task's brief was written (2026-07-30).** Task 4-C adds a
 `casAdmitEntry` inside `writeRefLogTxnRaw` (`src/Disks/tests/cas_test_helpers.h`) keyed at
 `NamespaceLifeId::stageATransition(ns)`'s sentinel, so the 164 raw-fixture tests keep matching the keys

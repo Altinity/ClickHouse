@@ -3106,8 +3106,13 @@ signature change, and it PREVENTS the class we have now found three times.
   a finding to REPORT, not a key to guess. fsck in particular must not emit a verdict computed at a guessed
   key, which is exactly the shape of the `crossEpochFromSeal` defect found in the checkpoint review.
 
-**Do it as its own task, not folded into another.** It is not large, but it is 24 deliberate decisions, and a
-mechanical sweep would re-create the fallback under a new name. Attempted during Task 4-C and deliberately
+**PLACED IN TASK 6 (2026-07-30), correcting the line that used to stand here.** I first wrote that this should
+be its own task, on the grounds that 24 deliberate decisions must not be swept. That was half right: the
+decisions must not be swept, but they are ALREADY Task 6's — deleting `stageATransition` forces every one of
+its sites to say what it does when no catalog life is known. Doing it separately would touch the same sites
+twice and create a merge surface against the task that has to touch them anyway. A mechanical sweep would
+still re-create the fallback under a new name, so the mechanism (an `optional` return) is what forces the
+decisions to be explicit. Attempted during Task 4-C and deliberately
 deferred: the same files were in flight, and racing an active implementer across 24 call sites would have cost
 more than the fix saves.
 
