@@ -399,7 +399,7 @@ public:
     /// The four fields together are the attempt's IDENTITY. THREE of them are compared before any later
     /// result is acted on -- `txn_id`, `bytes` and `admitted_fence_generation` (`resolveWedgeOnce`'s
     /// post-I/O recheck, which calls them "all three components of the identity"). The key is not
-    /// compared because it adds nothing: `Layout::refLogKey` is a function of exactly
+    /// compared because it adds nothing: `Layout::refLogKey` is a function of
     /// `(RefNamespaceId, RefTxnId)`, and the namespace life is fixed for the runtime that holds the
     /// attempt, so within one runtime an equal `txn_id` already implies an equal key. (Should a runtime
     /// ever span two incarnations of one namespace -- it does not today -- that implication is what
@@ -442,10 +442,8 @@ public:
     /// and sealed bytes, the complete attempt, and a namespace birth's `_ckpt` contribution -- all of it
     /// decided before anything can be durable.
     ///
-    /// `static` on purpose, and it is load-bearing rather than stylistic: with no `this` there is no
-    /// MEMBER backend, `RefTableRuntime`, clock or lock reachable from here (`CasBackend.h` itself is
-    /// transitively visible, so a CONSTRUCTED backend would compile -- what `static` removes is the
-    /// injected one), so "backend-free" is
+    /// `static` on purpose, and it is load-bearing rather than stylistic: with no `this` no MEMBER backend
+    /// is reachable, and `static` is what removes the injected one -- so "backend-free" is
     /// CHECKABLE instead of promised. That is what lets the protocol arithmetic be swept exhaustively
     /// with no store at all: `gtest_cas_ref_chunk_preparation.cpp` names no backend and constructs none,
     /// and no future edit inside this function can quietly reach for one and still compile there.

@@ -2679,7 +2679,7 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
     /// state it will be applied to, the id, the mount incarnation that admitted it, and the seal that
     /// qualifies the id's sequence number. `prepareRefChunk` below is a pure function of its arguments,
     /// and every argument is either one of those four readings, a value DERIVED from one of them outside
-    /// the lock (`chain_link`, from the seal -- see `chainLinkFor` below), or an immutable input the
+    /// the lock (`chain_link`, from `id` and the seal -- see `chainLinkFor` below), or an immutable input the
     /// runtime does not own at all (the layout, the namespace, this chunk's ops).
     ///
     /// The candidate is built from this snapshot BEFORE the PUT (spec §A1), so that the region between
@@ -2792,12 +2792,10 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
     /// sealing is not pure serialization -- it VALIDATES. `encodeRefLogTxn` runs `checkRefTxnIdNonzero`,
     /// then `validateEpochSealGrammarStructural`, then `checkBudget` over the encoded text
     /// (`CasRefLogFormat.cpp`), and throws `CORRUPTED_DATA` -- all three of `checkBudget`'s refusals use
-    /// that code too (`CasRefLogFormat.cpp:55`, `:61`, `:67`), so the whole seal speaks ONE class. NOT
-    /// `LIMIT_EXCEEDED`: that code belongs to the carve-time admission caps (`:2369`, `:2377`, `:2472`) --
-    /// a different check at a different stage -- and naming it here would invite exactly that conflation.
-    /// The candidate apply above runs, of INV-2's grammar, only `validateEpochSealGrammarContextual`,
-    /// which returns early off
-    /// sequence 1 and owns nothing but the required-iff rule. The two grammar halves are DISJOINT BY
+    /// that code too. NOT `LIMIT_EXCEEDED`: that code belongs to the carve-time admission caps in
+    /// `flushRefBatch`, a different check at a different stage. The candidate apply above runs, of INV-2's
+    /// grammar, only `validateEpochSealGrammarContextual`, which returns early off sequence 1 and owns
+    /// nothing but the required-iff rule. The two grammar halves are DISJOINT BY
     /// DESIGN -- each function's own comment says the other owns the half it does not -- and the budget
     /// check belongs to neither. So a chunk can pass the apply and still be refused by the seal, on
     /// grammar, on id shape, or on size; after the reorder that refusal lands BEFORE this `_ckpt` is

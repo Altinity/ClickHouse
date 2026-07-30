@@ -832,9 +832,9 @@ TEST(CasRefCkpt, CommitRefChunkDurableBytesUnchangedByExtraction)
 /// so lifting it out must not add or remove a single request. One birth chunk = exactly one write-once
 /// `PUT` at the ref-log key, no read-back, and exactly one `_ckpt` CAS.
 ///
-/// COUNTS per key, which is all `CountingBackend` records. Request ORDER is not checked here and cannot
-/// be with these counters; the ordering that matters for a birth -- `_ckpt` before the ref-log `PUT` --
-/// is argued at the call site and would need a sequence-recording backend to pin.
+/// COUNTS per key. Request ORDER is not checked here and cannot be with these counters; the ordering
+/// that matters for a birth -- `_ckpt` before the ref-log `PUT` -- is argued at the call site and would
+/// need a sequence-recording backend to pin.
 TEST(CasRefCkpt, AppendRequestCountUnchangedByExtraction)
 {
     auto backend = std::make_shared<CountingBackend>();
@@ -856,11 +856,10 @@ TEST(CasRefCkpt, AppendRequestCountUnchangedByExtraction)
 /// object may be durable", recording it must not fail. The extraction moves work EARLIER, never into that
 /// region.
 ///
-/// The guarded region is NOT the whole window, and the difference is worth being exact about: between the
-/// `Committed` outcome and the swap, `carve_hook_for_test(PostDurableInstall)`, the `state_mutex`
-/// acquisition and the `state_unchanged` evaluation all run OUTSIDE `DENY_ALLOCATIONS_IN_SCOPE`, which
-/// opens only at `CasRefLedger.cpp:3033`. That those three allocate nothing is argued in the comment
-/// directly above them (`:2998-3006`) rather than enforced by the guard.
+/// The guarded region is NOT the whole window: between the `Committed` outcome and the swap,
+/// `carve_hook_for_test(PostDurableInstall)`, the `state_mutex` acquisition and the `state_unchanged`
+/// evaluation all run OUTSIDE `DENY_ALLOCATIONS_IN_SCOPE`. This fence does not prove allocation-freedom
+/// for them or for anything else.
 ///
 /// WHAT THIS TEST PROVES, and what it does NOT -- stated precisely, because a fence trusted for more
 /// than it checks is worse than no fence.
