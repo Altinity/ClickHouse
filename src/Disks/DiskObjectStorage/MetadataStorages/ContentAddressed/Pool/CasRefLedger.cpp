@@ -2841,7 +2841,7 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
     /// `NamespaceLifeId::stageATransition`) precisely because every call site below also drives the
     /// lane to a TERMINAL state (`Closed`/`Faulted`) that only resumes under a FRESH writer epoch: the
     /// next successful birth attempt for `ns` reaches `publishCkpt`'s absent-object create path, not a
-    /// merge onto this attempt's now-deleted body, so nothing is lost by removing it. Mirrors the
+    /// merge onto this attempt's now-deleted body. Mirrors the
     /// GC-side backstop for the REMOVED-namespace case (`Gc/CasGc.cpp`'s "THE `_ckpt` BACKSTOP", which
     /// explicitly defers "the ordinary delete of this object by exact token" to Stage B's lifecycle --
     /// this is that delete, for the NEVER-BORN case the GC backstop cannot reach (namespace cleanup
