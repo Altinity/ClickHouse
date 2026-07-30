@@ -2,6 +2,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasServerRootFormats.h>
+/// `CreatorFence`, consumed by `isCreatorFenceTerminal` below.
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCatalogFormat.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Common/Exception.h>
 #include <Common/Logger.h>
@@ -526,6 +528,36 @@ struct MountInfo
 /// Enumerate every mount slot under `gc/server-roots/`, decoded and classified — the read-only sibling
 /// of `computeHeartbeatFloor`: ZERO writes (no fence-out), per-row fail-open. One LIST + one GET per slot.
 std::vector<MountInfo> listMounts(Backend & backend, const Layout & layout, uint64_t now_ms, uint64_t skew_margin_ms);
+
+/// Whether the mounted writer identified by `fence` (a `CatalogEntry::creator`, `ref_catalog`'s spec
+/// INV-3 §3) is PROVABLY unable to complete anything more — the gate `CasRefCatalog::reconcileStaleCreator`
+/// requires before a stalled `Creating` entry may be stolen by a NEW actor.
+///
+/// `fence.fence_generation` is deliberately NEVER read here: it is `CasMountRuntime::fence_generation`,
+/// an in-process atomic that never reaches the object store, so it means nothing to a DIFFERENT
+/// process — or to the SAME process after a restart — which is exactly the actor doing the
+/// reconciling. This reads the durable, cross-process proof instead: `fence.server_root_id`'s CURRENT
+/// mount slot (`Layout::mountKey`), classified by the SAME two clock-free certificates
+/// `probeNonTerminalMountSlots`/`computeHeartbeatFloor` already use for the identical question at
+/// pool-prefix and GC-heartbeat granularity —
+///   - `gc_fenced` (the GC leader already fenced this incarnation; a fence costs an epoch, so its
+///     keeper can never renew again),
+///   - the clean-farewell sentinel `min_active == UINT64_MAX`,
+/// PLUS one more certificate available here that neither of those needs: a DIFFERENT `writer_epoch`
+/// currently live at that slot proves `fence.writer_epoch`'s specific incarnation is superseded
+/// regardless of its OWN certificate — `allocateWriterEpoch`/`claimMount` are why an epoch, once
+/// superseded, is never reclaimed by its former holder.
+///
+/// Deliberately conservative on the two cases that are NOT proof of death, mirroring
+/// `probeNonTerminalMountSlots`'s own stated discipline: an ABSENT mount slot (`Backend::get`
+/// returning `nullopt` answers nothing about liveness — it is not proof either way) and an
+/// UNDECODABLE body (an unreadable lease of some other format generation is precisely the case that
+/// must block, not the one to wave through) both return `false` — refuse reconciliation rather than
+/// guess. A merely `expired` lease (a wall-clock reading past `expires_at_ms`) is likewise NEVER
+/// treated as a certificate, for the same reason `claimMount` itself refuses to trust one: comparing
+/// another node's stamp against a clock is exactly the unsafe comparison the mount protocol exists to
+/// avoid, and there is not even a caller-supplied clock offered here to make that comparison with.
+bool isCreatorFenceTerminal(Backend & backend, const Layout & layout, const CreatorFence & fence);
 
 /// Per-server MERGED heartbeat: one `SingleWriterSlot` over the per-server-root mount object carries
 /// the mount lease (liveness) AND the build-watermark floor (`min_active`). One renewal PUT stamps the

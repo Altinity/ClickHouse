@@ -1,6 +1,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h>
 #include <Common/Exception.h>
+#include <Common/thread_local_rng.h>
 #include <fmt/format.h>
 #include <algorithm>
 
@@ -72,6 +73,38 @@ RefCatalog casUpdateImpl(
         "CAS ref catalog '{}' did not converge after {} attempts", key, kMaxCatalogCasAttempts));
 }
 
+/// Thrown from inside a `casUpdate` `mutate` closure to signal a refusal that must STOP the attempt
+/// rather than be treated as a `Conflict` to retry: `casUpdateImpl` propagates whatever `mutate`
+/// throws straight out, uncaught, which is exactly the behavior these three need. Retrying any of them
+/// against a freshly re-read catalog would just re-decide against an entry that is, by definition, no
+/// longer `observed` -- token-exactness means the FIRST mismatch is final, not a reason to loop.
+struct CatalogFenceMovedMarker {};
+struct CatalogEntryMismatchMarker {};
+struct CatalogCreatorStillLiveMarker {};
+
+/// Two `thread_local_rng` draws composed into a `UInt128`, the same pattern already used throughout
+/// this tree to mint build ids and incarnation tags (`CasPartWriteTxn.cpp`'s `mintU128`,
+/// `ContentAddressedTransaction.cpp`'s `incarnation_tag`). Retried on the astronomically unlikely `0`
+/// draw: unlike those callers, this value must never be zero (`CatalogEntry::incarnation == 0` is
+/// always invalid -- "0 never names a life"), and this is the one mint site in that family with a
+/// grammar rule to uphold.
+UInt128 mintFreshIncarnation()
+{
+    UInt128 v = 0;
+    while (v == 0)
+        v = (static_cast<UInt128>(thread_local_rng()) << 64) | thread_local_rng();
+    return v;
+}
+
+/// Shared by every function below that needs "the current entry for this namespace, if any" --
+/// keeping ONE lookup rather than three independently-written `find_if`s that could drift apart on
+/// what counts as a match.
+std::vector<CatalogEntry>::const_iterator findEntry(const RefCatalog & catalog, const RootNamespace & ns)
+{
+    return std::find_if(catalog.entries.begin(), catalog.entries.end(),
+        [&](const CatalogEntry & e) { return e.ns.string() == ns.string(); });
+}
+
 }
 
 RefCatalog CasRefCatalog::casUpdate(
@@ -98,6 +131,123 @@ RefCatalog CasRefCatalog::casAdmitEntry(Backend & backend, const Layout & layout
     };
     return casUpdateImpl(backend, layout, mutate,
         [&entry](const RefCatalog & c) { return checkCatalogAdmission(c, entry.ns); });
+}
+
+CasRefCatalog::NamespaceCreationOutcome CasRefCatalog::completeCreation(
+    Backend & backend, const Layout & layout, const CatalogEntry & observed,
+    uint64_t admitted_generation, const std::function<void(uint64_t)> & check_fence_or_throw,
+    const CkptDeadline & deadline)
+{
+    if (observed.state != NsState::Creating || !observed.creator)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "CasRefCatalog::completeCreation: namespace '{}' is not a Creating entry with a creator "
+            "fence -- steps 2/3 only ever run over one of those", observed.ns.string());
+
+    /// Step 2 (spec §3): INV-4's first `_ckpt` writer for this incarnation, and the only writer that
+    /// will ever know its genesis epoch -- see `Pool/CasRefCkpt.h`'s `publishCkpt` doc for the merge
+    /// discipline this rides on unchanged. `FencedOut` here ends the attempt: nothing durable changed.
+    const RefCkpt contribution{.life_epoch = std::optional<uint64_t>{observed.creator->writer_epoch},
+                                .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
+    if (publishCkpt(backend, layout, observed.ns, contribution, admitted_generation, check_fence_or_throw,
+                     deadline) == CkptPublishOutcome::FencedOut)
+        return NamespaceCreationOutcome::FencedOut;
+
+    /// Step 3. `mutate` is the fence re-check point `casUpdate`'s header doc names -- checked FIRST,
+    /// mirroring `publishCkpt`'s own "after the read, before the CAS, on every attempt" placement, so a
+    /// caller stale on BOTH axes between step 2 and here is reported `FencedOut`, never `Superseded`
+    /// (both are truthful refusals of a CAS that was never sent; this is only which one speaks first).
+    const auto mutate = [&](const RefCatalog & cur) -> RefCatalog
+    {
+        try { check_fence_or_throw(admitted_generation); }
+        catch (...) { throw CatalogFenceMovedMarker{}; }   /// typed, not propagated -- publishCkpt's own precedent
+
+        const auto it = findEntry(cur, observed.ns);
+        if (it == cur.entries.end() || *it != observed)
+            throw CatalogEntryMismatchMarker{};
+
+        RefCatalog next = cur;
+        next.entries[static_cast<size_t>(it - cur.entries.begin())].state = NsState::Live;
+        next.entries[static_cast<size_t>(it - cur.entries.begin())].creator = std::nullopt;
+        return next;
+    };
+
+    try
+    {
+        casUpdate(backend, layout, mutate);
+    }
+    catch (const CatalogFenceMovedMarker &) { return NamespaceCreationOutcome::FencedOut; }
+    catch (const CatalogEntryMismatchMarker &) { return NamespaceCreationOutcome::Superseded; }
+    return NamespaceCreationOutcome::Live;
+}
+
+CasRefCatalog::NamespaceCreationOutcome CasRefCatalog::createNamespace(
+    Backend & backend, const Layout & layout, const RootNamespace & ns, const CreatorFence & creator,
+    uint64_t admitted_generation, const std::function<void(uint64_t)> & check_fence_or_throw,
+    const CkptDeadline & deadline)
+{
+    /// Read-first, per the Task 2 review's own note on `casAdmitEntry`: a namespace that already
+    /// carries an entry is THIS function's job to reject with a clear message, not `casAdmitEntry`'s
+    /// duplicate-namespace grammar refusal (which would report a `LOGICAL_ERROR` about canonical order
+    /// -- true, but useless to a caller trying to understand why its create failed). A concurrent
+    /// insert of the SAME namespace between this read and step 1 is still caught -- `casAdmitEntry`'s
+    /// own grammar check is the backstop, not the only check.
+    const Snapshot snap = read(backend, layout);
+    const auto existing = findEntry(snap.catalog, ns);
+    if (existing != snap.catalog.entries.end())
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "CasRefCatalog::createNamespace: namespace '{}' already carries a catalog entry (state "
+            "'{}') -- a stalled Creating entry is resumed through reconcileStaleCreator + "
+            "completeCreation, never a fresh createNamespace call, and recreating an existing "
+            "Live/Removing name is Task 5's (removal's) business, not creation's",
+            ns.string(), nsStateToWord(existing->state));
+
+    const CatalogEntry entry{.ns = ns, .state = NsState::Creating,
+                              .incarnation = mintFreshIncarnation(), .creator = creator};
+    casAdmitEntry(backend, layout, entry);   /// step 1
+    return completeCreation(backend, layout, entry, admitted_generation, check_fence_or_throw, deadline);
+}
+
+CasRefCatalog::ReconcileCreatorOutcome CasRefCatalog::reconcileStaleCreator(
+    Backend & backend, const Layout & layout, const CatalogEntry & observed, const CreatorFence & new_creator,
+    const std::function<bool(const CreatorFence &)> & is_creator_fence_terminal)
+{
+    if (observed.state != NsState::Creating || !observed.creator)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "CasRefCatalog::reconcileStaleCreator: namespace '{}' is not a Creating entry with a "
+            "creator fence -- nothing to reconcile", observed.ns.string());
+
+    /// Token-exactness (the catalog's own entry, by full value) is checked BEFORE terminality: it is
+    /// the cheaper, purely local comparison, and a mismatch here means the question "is the OLD
+    /// creator's fence terminal" is moot -- `observed` no longer describes anything live to reconcile.
+    const auto mutate = [&](const RefCatalog & cur) -> RefCatalog
+    {
+        const auto it = findEntry(cur, observed.ns);
+        if (it == cur.entries.end() || *it != observed)
+            throw CatalogEntryMismatchMarker{};
+        if (!is_creator_fence_terminal(*observed.creator))
+            throw CatalogCreatorStillLiveMarker{};
+
+        RefCatalog next = cur;
+        next.entries[static_cast<size_t>(it - cur.entries.begin())].creator = new_creator;
+        return next;
+    };
+
+    try
+    {
+        casUpdate(backend, layout, mutate);
+    }
+    catch (const CatalogEntryMismatchMarker &) { return ReconcileCreatorOutcome::EntryChanged; }
+    catch (const CatalogCreatorStillLiveMarker &) { return ReconcileCreatorOutcome::CreatorFenceStillLive; }
+    return ReconcileCreatorOutcome::Reconciled;
+}
+
+void CasRefCatalog::checkPublicationAdmittedOrThrow(const RefCatalog & catalog, const RootNamespace & ns)
+{
+    const auto it = findEntry(catalog, ns);
+    if (it != catalog.entries.end() && it->state == NsState::Creating)
+        throwCasWriteRetryLater(fmt::format(
+            "CAS ref catalog: namespace '{}' is still Creating -- no ref writes are admitted until "
+            "its creation completes or is reconciled away", ns.string()));
 }
 
 }

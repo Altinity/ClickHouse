@@ -767,6 +767,33 @@ std::vector<MountInfo> listMounts(Backend & backend, const Layout & layout, uint
     return out;
 }
 
+bool isCreatorFenceTerminal(Backend & backend, const Layout & layout, const CreatorFence & fence)
+{
+    const auto got = backend.get(layout.mountKey(fence.server_root_id));
+    if (!got)
+        return false;   /// absence proves nothing about liveness -- see the header doc
+
+    MountLease lease;
+    try
+    {
+        lease = decodeMountLease(got->bytes);
+    }
+    catch (...)
+    {
+        return false;   /// undecodable -- fail closed, never wave through
+    }
+
+    if (lease.gc_fenced)
+        return true;
+    if (lease.min_active == std::numeric_limits<uint64_t>::max())
+        return true;
+    /// A DIFFERENT writer_epoch currently live at this slot proves `fence.writer_epoch`'s own
+    /// incarnation is superseded, regardless of its own certificate -- see the header doc.
+    if (lease.writer_epoch != fence.writer_epoch)
+        return true;
+    return false;
+}
+
 MountLeaseKeeper::MountLeaseKeeper(
     BackendPtr backend_, const Layout & layout_, const String & srid_, UInt128 server_uuid_,
     uint64_t writer_epoch_, std::chrono::milliseconds ttl_, std::function<uint64_t()> now_ms_fn_,

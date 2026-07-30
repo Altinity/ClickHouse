@@ -1299,3 +1299,81 @@ TEST(CasMountObservation, GcFencedIsReclaimedInstantlyWithPriorFenced)
     EXPECT_EQ(r.prior, MountPriorState::Fenced);
     EXPECT_EQ(sleeps, 0);
 }
+
+/// ---- Stage B Task 3: `isCreatorFenceTerminal` -- the cross-process terminality predicate
+/// `CasRefCatalog::reconcileStaleCreator` gates on. Built from `writer_epoch` plus the SAME two
+/// clock-free certificates `probeNonTerminalMountSlots`/`computeHeartbeatFloor` already use, PLUS a
+/// third certificate available only here: a currently-live DIFFERENT `writer_epoch` at the slot. ----
+
+TEST(CasFenceTerminal, AbsentMountSlotIsNotTerminal)
+{
+    InMemoryBackend b;
+    Layout l{"p"};
+    EXPECT_FALSE(isCreatorFenceTerminal(b, l, CreatorFence{.server_root_id = "never-mounted", .writer_epoch = 1, .fence_generation = 1}))
+        << "absence proves nothing about liveness -- never waved through";
+}
+
+TEST(CasFenceTerminal, UndecodableMountBodyIsNotTerminal)
+{
+    InMemoryBackend b;
+    Layout l{"p"};
+    b.putIfAbsent(l.mountKey("r"), "garbage-not-a-lease", {});
+    EXPECT_FALSE(isCreatorFenceTerminal(b, l, CreatorFence{.server_root_id = "r", .writer_epoch = 1, .fence_generation = 1}))
+        << "an unreadable lease of some other format generation must block, never wave through";
+}
+
+TEST(CasFenceTerminal, GcFencedIsTerminal)
+{
+    InMemoryBackend b;
+    Layout l{"p"};
+    ASSERT_EQ(claimMount(b, l, "r", UInt128(1), /*our_epoch=*/7, 1000, 500).kind, MountClaimResult::Claimed);
+    auto got = b.get(l.mountKey("r"));
+    ASSERT_TRUE(got.has_value());
+    MountLease fenced = decodeMountLease(got->bytes);
+    fenced.gc_fenced = true;
+    ASSERT_EQ(b.putOverwrite(l.mountKey("r"), encodeMountLease(fenced), got->token).outcome, PutOutcome::Done);
+
+    EXPECT_TRUE(isCreatorFenceTerminal(b, l, CreatorFence{.server_root_id = "r", .writer_epoch = 7, .fence_generation = 1}));
+}
+
+TEST(CasFenceTerminal, CleanFarewellIsTerminal)
+{
+    InMemoryBackend b;
+    Layout l{"p"};
+    ASSERT_EQ(claimMount(b, l, "r", UInt128(1), /*our_epoch=*/7, 1000, 500).kind, MountClaimResult::Claimed);
+    auto got = b.get(l.mountKey("r"));
+    ASSERT_TRUE(got.has_value());
+    MountLease retired = decodeMountLease(got->bytes);
+    retired.min_active = std::numeric_limits<uint64_t>::max();
+    ASSERT_EQ(b.putOverwrite(l.mountKey("r"), encodeMountLease(retired), got->token).outcome, PutOutcome::Done);
+
+    EXPECT_TRUE(isCreatorFenceTerminal(b, l, CreatorFence{.server_root_id = "r", .writer_epoch = 7, .fence_generation = 1}));
+}
+
+TEST(CasFenceTerminal, ADifferentLiveWriterEpochIsTerminalForTheOldOne)
+{
+    InMemoryBackend b;
+    Layout l{"p"};
+    /// Slot now held at epoch 8 -- epoch 7's incarnation is superseded regardless of ITS OWN
+    /// certificate (neither fenced nor farewelled).
+    ASSERT_EQ(claimMount(b, l, "r", UInt128(1), /*our_epoch=*/8, 1000, 500).kind, MountClaimResult::Claimed);
+
+    EXPECT_TRUE(isCreatorFenceTerminal(b, l, CreatorFence{.server_root_id = "r", .writer_epoch = 7, .fence_generation = 1}))
+        << "a different epoch is currently live at this slot -- epoch 7 can never reclaim it";
+    EXPECT_FALSE(isCreatorFenceTerminal(b, l, CreatorFence{.server_root_id = "r", .writer_epoch = 8, .fence_generation = 1}))
+        << "epoch 8 IS the current live epoch -- not terminal";
+}
+
+/// A merely EXPIRED lease (wall-clock past `expires_at_ms`, same epoch, no certificate) must NOT be
+/// treated as terminal -- mirrors `claimMount`'s own refusal to trust a bare timestamp comparison.
+TEST(CasFenceTerminal, ExpiredButSameEpochAndUncertifiedIsNotTerminal)
+{
+    InMemoryBackend b;
+    Layout l{"p"};
+    /// A lease whose stamped expiry is already far in the past, same epoch throughout.
+    ASSERT_EQ(claimMount(b, l, "r", UInt128(1), /*our_epoch=*/7, /*now_ms=*/0, /*ttl_ms=*/1).kind,
+              MountClaimResult::Claimed);
+
+    EXPECT_FALSE(isCreatorFenceTerminal(b, l, CreatorFence{.server_root_id = "r", .writer_epoch = 7, .fence_generation = 1}))
+        << "expiry alone is never a certificate of death, exactly like claimMount's own discipline";
+}
