@@ -101,6 +101,13 @@ TEST(CasRefCatalogFormat, NamespaceAtExactByteBoundRoundTrips)
 
 /// ---------- strict rejections: encode side (LOGICAL_ERROR -- our own state, not yet durable) ----------
 
+/// Every `expectThrowsCode(LOGICAL_ERROR, ...)` in this block aborts the process in debug/sanitizer
+/// builds instead of behaving like a catchable exception (`Common/Exception.cpp`'s
+/// `handle_error_code`), so each test is split: the throw-and-catch form below runs only on a plain
+/// release build, and its `...DeathTest` counterpart (grouped after this block) proves the abort
+/// positively on debug/sanitizer builds instead.
+#ifndef DEBUG_OR_SANITIZER_BUILD
+
 TEST(CasRefCatalogFormat, EncodeRejectsDuplicateNamespace)
 {
     RefCatalog c;
@@ -152,6 +159,64 @@ TEST(CasRefCatalogFormat, EncodeRejectsEmptyNamespace)
     c.entries.push_back(liveEntry("", 1));
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&] { encodeRefCatalog(c); });
 }
+
+#endif
+
+#if defined(DEBUG_OR_SANITIZER_BUILD)
+
+TEST(CasRefCatalogFormatDeathTest, EncodeRejectsDuplicateNamespaceAborts)
+{
+    RefCatalog c;
+    c.entries.push_back(liveEntry("a", 1));
+    c.entries.push_back(liveEntry("a", 2));
+    EXPECT_DEATH({ (void)encodeRefCatalog(c); }, "not canonically ordered");
+}
+
+TEST(CasRefCatalogFormatDeathTest, EncodeRejectsNonCanonicalOrderAborts)
+{
+    RefCatalog c;
+    c.entries.push_back(liveEntry("b", 1));
+    c.entries.push_back(liveEntry("a", 2));
+    EXPECT_DEATH({ (void)encodeRefCatalog(c); }, "not canonically ordered");
+}
+
+TEST(CasRefCatalogFormatDeathTest, EncodeRejectsCreatorPresentOnLiveAborts)
+{
+    RefCatalog c;
+    c.entries.push_back(CatalogEntry{.ns = RootNamespace{"a"}, .state = NsState::Live, .incarnation = UInt128(1),
+        .creator = CreatorFence{.server_root_id = "srv", .writer_epoch = 1, .fence_generation = 1}});
+    EXPECT_DEATH({ (void)encodeRefCatalog(c); }, "carries a creator fence");
+}
+
+TEST(CasRefCatalogFormatDeathTest, EncodeRejectsCreatorAbsentOnCreatingAborts)
+{
+    RefCatalog c;
+    c.entries.push_back(CatalogEntry{.ns = RootNamespace{"a"}, .state = NsState::Creating, .incarnation = UInt128(1)});
+    EXPECT_DEATH({ (void)encodeRefCatalog(c); }, "lacks a creator fence");
+}
+
+TEST(CasRefCatalogFormatDeathTest, EncodeRejectsZeroIncarnationAborts)
+{
+    RefCatalog c;
+    c.entries.push_back(liveEntry("a", 0));
+    EXPECT_DEATH({ (void)encodeRefCatalog(c); }, "zero incarnation");
+}
+
+TEST(CasRefCatalogFormatDeathTest, EncodeRejectsNameOverByteBoundAborts)
+{
+    RefCatalog c;
+    c.entries.push_back(liveEntry(String(kMaxNamespaceBytes + 1, 'a'), 1));
+    EXPECT_DEATH({ (void)encodeRefCatalog(c); }, "admission bound");
+}
+
+TEST(CasRefCatalogFormatDeathTest, EncodeRejectsEmptyNamespaceAborts)
+{
+    RefCatalog c;
+    c.entries.push_back(liveEntry("", 1));
+    EXPECT_DEATH({ (void)encodeRefCatalog(c); }, "namespace must not be empty");
+}
+
+#endif
 
 /// A namespace + creator server_root_id that both max out at their respective byte bounds (512 +
 /// 255), escaped worst-case, land one "ent" line over the 4 KiB line cap (~4.7 KiB) -- reachable
@@ -233,12 +298,22 @@ TEST(CasRefCatalogFormat, DecodeRejectsMissingNamespaceKey)
 /// `nsStateToWord`'s only reachable input is either a live `NsState` or one `nsStateFromWord` already
 /// validated on decode, so an unrecognized value is a bug in THIS process -- `LOGICAL_ERROR`, matching
 /// this file's own stated taxonomy for the encode-side helper it (indirectly, via `creatorPairingOk`'s
-/// error message) serves.
+/// error message) serves. Aborts under debug/sanitizer builds -- split like the block above;
+/// `CasRefCatalogFormatDeathTest.NsStateToWordRaisesLogicalErrorOnImpossibleValueAborts` covers it there.
+#ifndef DEBUG_OR_SANITIZER_BUILD
 TEST(CasRefCatalogFormat, NsStateToWordRaisesLogicalErrorOnImpossibleValue)
 {
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR,
         [&] { nsStateToWord(static_cast<NsState>(99)); });
 }
+#endif
+
+#if defined(DEBUG_OR_SANITIZER_BUILD)
+TEST(CasRefCatalogFormatDeathTest, NsStateToWordRaisesLogicalErrorOnImpossibleValueAborts)
+{
+    EXPECT_DEATH({ (void)nsStateToWord(static_cast<NsState>(99)); }, "unknown ns state");
+}
+#endif
 
 /// ---------- registry row / raw-storage tripwire ----------
 
@@ -462,6 +537,10 @@ TEST(CasRefCatalog, CasUpdateRetriesOnConflictAgainstFreshState)
 /// seeded object using the token `casUpdate`'s own initial read observed, so the loop's own `casPut`
 /// against that now-stale token gets a genuine `Conflict`, and the follow-up re-read genuinely finds
 /// the key absent.
+/// The `LOGICAL_ERROR` this raises aborts the process in debug/sanitizer builds -- split like the
+/// `CasRefCatalogFormat` block above. The DeathTest variant cannot also re-check the post-throw
+/// backend state this test verifies (there is no post-abort state in a real debug/sanitizer build).
+#ifndef DEBUG_OR_SANITIZER_BUILD
 TEST(CasRefCatalog, CasUpdateThrowsOnVanishMidRetryInsteadOfReplacingTheCatalog)
 {
     InMemoryBackend backend;
@@ -491,6 +570,36 @@ TEST(CasRefCatalog, CasUpdateThrowsOnVanishMidRetryInsteadOfReplacingTheCatalog)
     /// (absent), never a fresh single-entry catalog.
     EXPECT_FALSE(CasRefCatalog::read(backend, layout).token.has_value());
 }
+#endif
+
+#if defined(DEBUG_OR_SANITIZER_BUILD)
+TEST(CasRefCatalogDeathTest, CasUpdateThrowsOnVanishMidRetryInsteadOfReplacingTheCatalogAborts)
+{
+    InMemoryBackend backend;
+    Layout layout("p");
+
+    CasRefCatalog::casUpdate(backend, layout, [](const RefCatalog &)
+    {
+        RefCatalog next;
+        next.entries.push_back(liveEntry("a", 1));
+        return next;
+    });
+    const CasRefCatalog::Snapshot seeded = CasRefCatalog::read(backend, layout);
+    ASSERT_TRUE(seeded.token.has_value());
+
+    EXPECT_DEATH(
+        {
+            CasRefCatalog::casUpdate(backend, layout, [&](const RefCatalog & cur)
+            {
+                backend.deleteExact(layout.refCatalogKey(), *seeded.token);
+                RefCatalog next = cur;
+                next.entries.push_back(liveEntry("b", 2));
+                return next;
+            });
+        },
+        "vanished mid-update");
+}
+#endif
 
 /// The retry loop is bounded (the same live-lock brake `publishCkpt`/`allocateWriterEpoch` use on
 /// their own contended token-CAS singletons) and ends in the typed retryable error, not an infinite
@@ -538,16 +647,29 @@ TEST(CasRefCatalog, CasAdmitEntryInsertsAtCanonicalPosition)
     EXPECT_EQ(after.entries[1].ns.string(), "b");
 }
 
+/// Caught by `encodeRefCatalog`'s own canonical-order/no-duplicate grammar check, inside
+/// `checkCatalogAdmission` -- no separate duplicate check needed here. That `LOGICAL_ERROR` aborts
+/// under debug/sanitizer builds -- split like the blocks above.
+#ifndef DEBUG_OR_SANITIZER_BUILD
 TEST(CasRefCatalog, CasAdmitEntryRejectsADuplicateNamespace)
 {
     InMemoryBackend backend;
     Layout layout("p");
     CasRefCatalog::casAdmitEntry(backend, layout, liveEntry("a", 1));
-    /// Caught by `encodeRefCatalog`'s own canonical-order/no-duplicate grammar check, inside
-    /// `checkCatalogAdmission` -- no separate duplicate check needed here.
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR,
         [&] { CasRefCatalog::casAdmitEntry(backend, layout, liveEntry("a", 2)); });
 }
+#endif
+
+#if defined(DEBUG_OR_SANITIZER_BUILD)
+TEST(CasRefCatalogDeathTest, CasAdmitEntryRejectsADuplicateNamespaceAborts)
+{
+    InMemoryBackend backend;
+    Layout layout("p");
+    CasRefCatalog::casAdmitEntry(backend, layout, liveEntry("a", 1));
+    EXPECT_DEATH({ CasRefCatalog::casAdmitEntry(backend, layout, liveEntry("a", 2)); }, "not canonically ordered");
+}
+#endif
 
 TEST(CasRefCatalog, CasAdmitEntryRefusesOverCapacity)
 {

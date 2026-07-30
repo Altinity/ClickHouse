@@ -191,12 +191,28 @@ TEST(CasNamespaceLifeId, TwoLivesOfOneNamespaceShareNoKeys)
 
 /// Zero is not a wildcard and not "the namespace itself": it can never be constructed, so it can
 /// never reach a key builder.
+///
+/// Both throws below raise `LOGICAL_ERROR`, which aborts the process in debug/sanitizer builds
+/// instead of behaving like a catchable exception (`Common/Exception.cpp`'s `handle_error_code`) --
+/// `CasNamespaceLifeIdDeathTest.ZeroIncarnationIsUnconstructibleAborts` below proves the abort
+/// positively in those builds instead.
+#ifndef DEBUG_OR_SANITIZER_BUILD
 TEST(CasNamespaceLifeId, ZeroIncarnationIsUnconstructible)
 {
     EXPECT_THROW(NamespaceLifeId::fromCatalogEntry(RootNamespace{kNs}, UInt128{0}), DB::Exception);
     EXPECT_THROW(renderIncarnation(UInt128{0}), DB::Exception);
     EXPECT_NO_THROW(NamespaceLifeId::fromCatalogEntry(RootNamespace{kNs}, incarnationA()));
 }
+#endif
+
+#if defined(DEBUG_OR_SANITIZER_BUILD)
+TEST(CasNamespaceLifeIdDeathTest, ZeroIncarnationIsUnconstructibleAborts)
+{
+    EXPECT_DEATH({ (void)NamespaceLifeId::fromCatalogEntry(RootNamespace{kNs}, UInt128{0}); }, "incarnation must be nonzero");
+    EXPECT_DEATH({ (void)renderIncarnation(UInt128{0}); }, "incarnation must be nonzero");
+    EXPECT_NO_THROW(NamespaceLifeId::fromCatalogEntry(RootNamespace{kNs}, incarnationA()));
+}
+#endif
 
 /// Behind Stage B's format bump every un-incarnated key is corruption, not a compatibility case: a
 /// parser that quietly classified one as foreign debris would let a Stage-A-shaped object survive
