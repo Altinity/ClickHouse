@@ -146,6 +146,36 @@ dropped before grouping. Note what this does NOT do, so nobody expects it: the P
 dead incarnation's key, deliberately — `Layout` is catalog-independent by design, so it is the wrong
 place to refuse.
 
+## R12. A pure READ births a catalog entry, and the catalog has a capacity budget {#r12-read-births-namespace}
+
+Found 2026-07-31 by Task 4b's implementer while checking whether its own design added a request class — it
+does not, but the path it sits on already does something worse.
+
+`ensureRefTableRecovered` → `resolveNamespaceLife` **mints** a catalog entry when none exists: a
+`createNamespace` CAS to `Live` plus a durable `_ckpt` publish. `namespaceIsRemoved` calls it, and every
+namespace-file reader calls that. So **`existsFile` on a never-born namespace performs durable writes** — a
+read with a write side effect, on a path whose whole contract is to answer a question.
+
+**The consequence that sets its priority is not the surprise, it is the budget.** The catalog is ONE pool-wide
+object under a capacity-admission predicate. Entries minted by reads are never reclaimed by anything (no
+removal lifecycle exists yet), so **reads against nonexistent tables grow the catalog without bound**, and a
+read storm can exhaust the admission budget and start refusing legitimate creations. A cluster does not need a
+bug to produce that traffic — a stale replica, a dropped-then-queried table, or any probe against a table this
+node has never had is enough.
+
+Not introduced by Task 4b, which merely sits on the same path. Not a data-loss shape: the minted entry is a
+`Live` namespace with no content, which the frontier proves legitimately empty.
+
+**The fix direction, though the decision is open:** a read must resolve a life **without creating one** —
+`resolveNamespaceLife` needs a read-only mode that answers "no such namespace" instead of minting, and the
+reader paths take that mode. The `optional<NamespaceLifeId>` collapse Task 4b is building on the reader side is
+the natural shape for it: *the life iff this namespace exists and its files are readable, else nothing*.
+
+**Whether it gates the destruction flip:** it does not create a deletion hazard, so it is not a 7b blocker on
+safety grounds. But it interacts with two things 7b depends on — the un-cataloged anomaly (entries that exist
+for no reason are entries whose absence later looks like damage) and the capacity predicate that Task 5's
+removal lifecycle must keep true. Decide before Task 5, with the removal ordering, rather than after.
+
 ## R11c. The THIRD way to a vacuous frontier: incarnation MISMATCH, not entry absence — GATES TASK 7b {#r11c-incarnation-mismatch}
 
 Found 2026-07-30 by asking the fixed code the same question that found R11b: *is there another way to reach a

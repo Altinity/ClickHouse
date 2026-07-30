@@ -924,6 +924,13 @@ here instead of as a pointer.
 
 ### Task 4 SPLIT (2026-07-30) — the task proved to be Tasks 2+3 combined in size {#task-4-split}
 
+**NAMING TRAP, read this before citing anything here.** This section's substeps are **4-A / 4-B / 4-C**, and
+they are NOT the tasks **4b / 4c** further down — those are separate tasks (namespace files under `_files/`,
+and `_ckpt` strengthening). The names differ only by a hyphen and a capital, which has already produced one
+report-file collision: a Task-4-substep report and a Task-4b report both wanted `task-4b-report.md`. When
+naming an artefact for a Task 4 substep, spell it out (`task-4-substep-B-…`); when naming one for task 4b or
+4c, qualify it by subject (`task-4b-nsfiles-…`).
+
 Task 4's implementer stopped and asked rather than pushing on, which was correct. Its first attempt at
 catalog-authoritative discovery produced **127 test failures**, every one the same mechanism: GC, rebuild
 and fsck tests write raw ref and manifest objects through low-level helpers without ever touching the
