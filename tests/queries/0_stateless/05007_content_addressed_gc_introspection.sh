@@ -70,11 +70,11 @@ WHERE disk_name LIKE '%05007_content_addressed_gc_introspection%'
   AND event_type = 'Finish'
   AND trigger = 'Manual';
 
--- Per-phase rows: a folding round emits one Phase row per phase it reached (18 of them), so a run
+-- Per-phase rows: a folding round emits one Phase row per phase it reached (19 of them), so a run
 -- that folded at least once must show most of the phase vocabulary, including the fold's own
 -- ref-prefix enumeration and the round-commit CAS.
 SELECT countDistinct(phase) >= 10,
-       countIf(phase = 'fold_ref_list') > 0,
+       countIf(phase = 'fold_ref_group') > 0,
        countIf(phase = 'round_commit') > 0
 FROM system.content_addressed_garbage_collection_log
 WHERE disk_name LIKE '%05007_content_addressed_gc_introspection%'
@@ -96,7 +96,7 @@ WHERE round_id = (
 SELECT max(length(ProfileEvents)) > 0
 FROM system.content_addressed_garbage_collection_log
 WHERE disk_name LIKE '%05007_content_addressed_gc_introspection%'
-  AND event_type = 'Phase' AND phase = 'fold_ref_list';
+  AND event_type = 'Phase' AND phase = 'fold_ref_group';
 
 -- The error path: a non-CA disk (the always-present local \`default\`) is rejected.
 SYSTEM CONTENT ADDRESSED GC RUN 'default'; -- { serverError BAD_ARGUMENTS }
