@@ -172,3 +172,40 @@ which coincides with byte equality only when `cap - fixed` divides by the reserv
 Design-decisions paragraph states it correctly, so the imprecision is in the summary line and the test
 NAME. No substantive gap — equality semantics live in the shared `fitsObjectCap`, which predicate (1)
 does test at exact equality.
+
+### D11 — the birth-`_ckpt` cleanup's call-site count is stated as three {#d11-ckpt-cleanup-site-count}
+
+From the Task 3 review (P1, PROSE/Important). There are FOUR call sites, not three. Both the code's own
+comment and — before it was corrected — plan Task 4's obligation stated three. The plan side is already
+fixed; the code comment is not.
+
+**Fix:** state the count you can derive at write time, or drop the number and describe the sites by
+what they have in common. A count nobody re-derives is how this one drifted. Note the count may change
+again: fix round 1 removes the `!attempt_armed` call site, so re-derive rather than writing "three".
+
+### D12 — "never reaches the object store" is false; the real reason is non-comparability {#d12-fence-generation-reason}
+
+From the same review (P2, PROSE/Important). A comment justifies not using `CreatorFence.fence_generation`
+for cross-process terminality on the ground that it "never reaches the object store". It DOES — Task 2
+serialises it into the catalog entry. The true reason, and the one that survives scrutiny, is that it is
+a `std::atomic<uint64_t>` local to `CasMountRuntime`, so another process's counter starts at zero and
+counts its own bumps: a persisted process-local counter is **not comparable** across processes. Say that
+instead.
+
+### D13 — `probeNonTerminalMountSlots` is the precedent for one of the two conservative cases, not both {#d13-precedent-scope}
+
+From the same review (P3, PROSE/Minor). The comment cites it for both; it supports one. Narrow the
+citation to the case it actually covers.
+
+### D14 — "nothing is lost by removing it" reasons about the wrong thing {#d14-nothing-lost-scope}
+
+From the same review (P4, PROSE/Minor). The sentence argues about the NEXT birth, while the obligation it
+needs to discharge is about the recovery that must still ground the namespace. Rewrite it to address the
+recovery, or delete it — the deletion loses nothing, since the surrounding argument does not depend on it.
+
+### D15 — the committed header never says the production path is ungated {#d15-production-gap-undisclosed}
+
+From the same review (P5, PROSE/Minor). Task 3 enforces "`Creating` forbids publication" at the catalog
+level ONLY, by explicit ruling — production-path wiring is Task 4's step. That is not a defect, but the
+committed header does not say so, so a reader takes the invariant as global. Add the one sentence naming
+what is NOT gated and where it is closed. This is the disclosure the ruling was conditional on.

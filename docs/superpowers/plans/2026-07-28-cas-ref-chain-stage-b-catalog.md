@@ -772,7 +772,9 @@ in `gtest_cas_ns_creation_lifecycle.cpp`.
   function with no caller rots silently; this campaign already found one test hook that no test set
   (`install_region_probe_for_test`). So wire it here, and pin the wiring with a test that drives
   reconciliation through the discovery path rather than by calling the primitive directly.
-- [ ] **Re-check the birth-`_ckpt` cleanup's three branches against the NEW key shape.** Task 3's
+- [ ] **Re-check the birth-`_ckpt` cleanup's call sites against the NEW key shape — there are FOUR, not
+  three.** (Corrected 2026-07-30: the Task 3 review counted them, and this step said three. Verify the
+  count yourself at the time rather than trusting either figure — `git grep -c cleanupOrphanedBirthCkptBestEffort`.) Task 3's
   `cleanupOrphanedBirthCkptBestEffort` deletes a never-born namespace's `_ckpt`, and its safety argument
   is explicitly scoped to today's sentinel `_ckpt` keying. This task re-keys `_ckpt` to
   `<ns>/<inc>/_ckpt`, which moves the object the argument is about. Re-derive the argument at the new
