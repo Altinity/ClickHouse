@@ -122,3 +122,47 @@ The eight rounds' findings files and the blinded consult's design live under `tm
 `tmp/codex_r{1..8}_findings.md` and `tmp/codex_simplify_design.md` into
 `docs/superpowers/reports/2026-07-28-ref-rework-reviews/` before the stand's `tmp` hygiene sweep, so
 the evidence trail survives (the `{#leak-repro-lost}` lesson).
+
+## R10. Ref-key grouping drops the incarnation — a sibling of R1 in a different object {#r10-groupref-alias}
+
+Found 2026-07-30 by Task 4's implementer while reading `groupRefKeys` (`Pool/CasRefProtocol.cpp`) before
+writing code. **Same shape as R1, different member, and R1 does not cover it.**
+
+`groupRefKeys` groups listed ref keys by `parsed->id.ns.string()` alone and silently drops
+`parsed->id.incarnation`. So if a namespace is dropped and recreated before GC has cleaned up the dead
+incarnation's ref objects, and both incarnations' keys appear in one round's listing, **both
+incarnations' log, snapshot and cleanup-marker ids merge into ONE `RefTableListing` under the shared
+namespace name.** Harmless while incarnations do not exist for real; a live aliasing bug the moment they
+do, which is exactly what Stage B introduces.
+
+R1 (`{#r1-verbatim-alias}`) is the same defect against verbatim/namespace files keyed
+`{namespace, file_name}`. Task 9 owns R1's closure note. **That note should close the FAMILY, not the
+member** — the register now has two instances of "an identity that forgot the incarnation", and the
+generalisation is what stops a third.
+
+Being fixed in Task 4 as a pre-filter ahead of `groupRefKeys` in `fold()` and in the `REBUILD` path:
+listed keys whose parsed incarnation does not match the catalog's current entry for that namespace are
+dropped before grouping. Note what this does NOT do, so nobody expects it: the PARSER still accepts a
+dead incarnation's key, deliberately — `Layout` is catalog-independent by design, so it is the wrong
+place to refuse.
+
+## R11. An authoritative universe with zero entries satisfies the frontier VACUOUSLY {#r11-empty-universe-vacuous}
+
+Found 2026-07-30 while adjudicating Task 4's scope, and verified on the code. `Gc::fold` computes
+`result.frontier_complete = universe_authoritative && result.frontier_proven == result.frontier_namespaces`.
+With an empty universe that comparison is `0 == 0` — **TRUE** — so the frontier reads complete,
+`suppress_destructive` clears, and a round destroys against a pool where nothing is known to be live.
+
+The hazard is not hypothetical once the universe becomes authoritative: a fresh pool, a damaged catalog,
+or a read that legitimately returns nothing all produce zero entries. Today it is masked only because
+`UniversePolicy::kDefault` is `StageA_Suppressed`, i.e. by the very thing Task 7b removes — so this must
+be closed BEFORE that flip, not with it.
+
+Task 4 closes it: zero entries must refuse to be a complete frontier, with the refusal reported in the
+existing suppression voice and pinned by a test asserting per-delete-family inertness rather than an
+aggregate zero, since an aggregate can hide one family that ran while another did not.
+
+**The lesson generalises past this site.** A comparison of two counts that are both derived from the same
+empty set is a vacuous truth wearing the clothes of a proof — the same class as this campaign's
+trivially-true `entries_redeleted >= objects_deleted` and its vacuously-passing test. When a gate rests on
+`a == b`, ask what happens when both are zero.
