@@ -421,12 +421,18 @@ public:
     /// unfreeze paths. A trailing slash is ignored.
     static Cas::RootNamespace shadowNamespace(const std::string & shadow_table_dir);
 
-    /// A dropped-and-not-recreated table (ref-table lifecycle durably `Removed`) is GONE for readers: its
-    /// table-level namespace files — `format_version.txt` and other verbatim files — must read as absent
-    /// even while GC has not yet physically reclaimed them (namespace removal is deferred to GC),
-    /// mirroring how its parts already vanish via the ref state. Gate every namespace-file read on this.
-    /// A never-born namespace is NOT hidden (fail-closed — only a KNOWN-removed table hides its files).
-    bool namespaceFilesReadable(const Cas::RootNamespace & ns) const;
+    /// The LIFE under which `ns`'s table-level namespace files — `format_version.txt` and the other
+    /// verbatim files — must be read, or `nullopt` when there are none to read.
+    ///
+    /// It answers two things at once because they are one question. A dropped-and-not-recreated table
+    /// (ref-table lifecycle durably `Removed`) is GONE for readers: its files must read as absent even
+    /// while GC has not yet physically reclaimed them (namespace removal is deferred to GC), mirroring
+    /// how its parts already vanish via the ref state. A never-born namespace is likewise empty. And a
+    /// readable namespace's files live under ITS OWN incarnation (Stage B Task 4b), never under a
+    /// previous life's — which is why the readable answer is a life rather than a `true`: a reader that
+    /// has no life cannot form a key at all, so a previous life's surviving objects are unreachable by
+    /// construction rather than by remembering to check something.
+    std::optional<Cas::NamespaceLifeId> readableNamespaceFilesLife(const Cas::RootNamespace & ns) const;
 
     /// Returns the root prefix for mirrored live-tree objects. The persistent layout identity is
     /// `server_root_id`; `ServerUUID` remains only the mount-owner token.
@@ -721,7 +727,7 @@ private:
     /// Classifies `path`'s directory shape by running the fixed dispatch order once (shadow ->
     /// atomic-shard -> table-uuid -> part -> subdir -> generic), including the part-branch
     /// fall-through when no sub-shape matches. Pure path classification — consults no lifecycle
-    /// state (e.g. `namespaceFilesReadable`); `existsDirectory`/`listDirectory` apply that gate
+    /// state (e.g. `readableNamespaceFilesLife`); `existsDirectory`/`listDirectory` apply that gate
     /// themselves in their per-shape arms, exactly as before this refactor.
     DirRoute classifyDirectory(const std::string & path) const;
 

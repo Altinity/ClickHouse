@@ -508,6 +508,18 @@ public:
     /// fresh namespace), and itself gated on this namespace's `_cleanup` marker.
     bool namespaceIsRemoved(const RootNamespace & ns);
 
+    /// The catalog life this namespace's objects are keyed under, for a WRITER: minted if the catalog
+    /// names none (a namespace's first namespace file births it exactly as its first ref op would).
+    /// Resolved once per table-open and cached, so this is not a per-operation catalog request.
+    NamespaceLifeId namespaceLife(const RootNamespace & ns);
+
+    /// The life a READER of this namespace's files must use, or `nullopt` when it has no readable files
+    /// -- a dropped table and a never-born namespace answer alike. Replaces the older
+    /// "is it removed?" predicate at every namespace-file read: the life and the readability come from
+    /// one observation, so a reader cannot pair one with the other's stale answer, and an unreadable
+    /// namespace yields no life to read with rather than a wrong one. See `CasRefLedger`'s declaration.
+    std::optional<NamespaceLifeId> namespaceFilesLifeIfReadable(const RootNamespace & ns);
+
     /// ==== writer ref-log append lane ====
     ///
     /// The ONE entry point every ref mutation funnels through -- Pool's own dropRef/updateRefPublishedAt

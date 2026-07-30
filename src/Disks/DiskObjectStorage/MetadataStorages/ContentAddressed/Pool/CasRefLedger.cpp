@@ -4100,6 +4100,36 @@ bool CasRefLedger::namespaceIsRemoved(const RootNamespace & ns)
 }
 
 
+NamespaceLifeId CasRefLedger::namespaceLife(const RootNamespace & ns)
+{
+    const auto rt = getRefTableRuntime(ns);
+    ensureRefTableRecovered(ns, *rt);
+    std::lock_guard<std::mutex> lock(rt->state_mutex);
+    /// `ensureRefTableRecovered` resolves `life` before it walks anything and never clears it, so a
+    /// runtime that returned from it without a life is a broken invariant, not a state to work around.
+    if (!rt->life)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "CAS namespace '{}': recovery completed without resolving a catalog life", ns.string());
+    return *rt->life;
+}
+
+std::optional<NamespaceLifeId> CasRefLedger::namespaceFilesLifeIfReadable(const RootNamespace & ns)
+{
+    const auto rt = getRefTableRuntime(ns);
+    ensureRefTableRecovered(ns, *rt);
+    std::lock_guard<std::mutex> lock(rt->state_mutex);
+    /// The removed discriminator is `namespaceIsRemoved`'s, unchanged and for its reasons: `Removed` WITH
+    /// a `remove_txn_id` is born-then-dropped, while the never-born default carries none. Read here
+    /// rather than by calling that method so both halves of the answer come from this one hold.
+    if (rt->state.getLifecycle() != RefLifecycle::Live && rt->state.getRemoveTxnId().has_value())
+        return std::nullopt;
+    if (!rt->life)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "CAS namespace '{}': recovery completed without resolving a catalog life", ns.string());
+    return *rt->life;
+}
+
+
 DropNamespaceStats CasRefLedger::dropNamespace(const RootNamespace & ns)
 {
     /// One body transaction naming an exact `owner_transition`

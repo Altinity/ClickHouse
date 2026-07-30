@@ -1486,8 +1486,9 @@ std::vector<String> Pool::listMirroredChildren(const String & prefix)
     /// it. GC uses LIST-based discovery (`cas/refs/` prefix) rather than a registry.
     ///
     /// A namespace's presence is split across two physical subtrees — its ref-log/snapshot
-    /// objects live under `cas/refs/<ns>/_log|_snap|_cleanup/…` while its verbatim files and PLAIN
-    /// mountpoint objects stay under `roots/<ns>/_files/…` / `roots/<key>`. The browse therefore
+    /// objects live under `cas/refs/<ns>/<incarnation>/_log|_snap|_cleanup/…` while its verbatim files
+    /// live under `roots/<ns>/<incarnation>/_files/…` and PLAIN mountpoint objects, which belong to no
+    /// namespace and are therefore unqualified, under `roots/<key>`. The browse therefore
     /// UNIONs the next-segment names from BOTH subtrees so a namespace discoverable only by its ref
     /// objects (the common case — a table's parts are described by manifests referenced from its ref
     /// bindings, so its data is reachable through the ref objects rather than as verbatim `_files`) is
@@ -1564,6 +1565,16 @@ DropNamespaceStats Pool::dropNamespace(const RootNamespace & ns)
 bool Pool::namespaceIsRemoved(const RootNamespace & ns)
 {
     return ref_ledger.namespaceIsRemoved(ns);
+}
+
+NamespaceLifeId Pool::namespaceLife(const RootNamespace & ns)
+{
+    return ref_ledger.namespaceLife(ns);
+}
+
+std::optional<NamespaceLifeId> Pool::namespaceFilesLifeIfReadable(const RootNamespace & ns)
+{
+    return ref_ledger.namespaceFilesLifeIfReadable(ns);
 }
 
 RefTxnId Pool::appendRefOps(const RootNamespace & ns, MutationScope scope,

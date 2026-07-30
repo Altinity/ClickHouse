@@ -368,10 +368,14 @@ DB::Cas::ManifestEntry wiringInlineEntry(const String & path, const String & byt
 }
 
 /// The one table identity these tests use, as a namespace LIFE: namespace files are life-keyed
-/// (directive §2), and `stageATransition` is the transitional mint Task 6 deletes.
+/// (directive §2), resolved from the CATALOG exactly as the disk's own write path resolves it. Naming
+/// the Stage-A sentinel here instead would put the fixture's files under a prefix the disk no longer
+/// reads (Task 4b), so `existsFile`/`listDirectory` below would report them absent -- the fixture and
+/// the code under test must agree on the life, and the only way to guarantee that is to ask the same
+/// resolver.
 DB::Cas::NamespaceLifeId wiringLife(DB::ContentAddressedMetadataStorage & storage)
 {
-    return DB::Cas::NamespaceLifeId::stageATransition(
+    return storage.store()->namespaceLife(
         storage.liveNamespace("a11a11a1-1111-4111-8111-111111111111"));
 }
 

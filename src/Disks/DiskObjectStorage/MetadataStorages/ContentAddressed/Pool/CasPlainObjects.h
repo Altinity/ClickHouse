@@ -12,8 +12,8 @@ namespace DB::Cas
 {
 
 /// Provides the pool's plain-object surface: loose, non-content-addressed objects whose key is
-/// chosen by the caller. This covers namespace files under `roots/<ns>/_files/` and mountpoint
-/// objects mirrored by path. The object bodies are raw passthrough bytes; this component does not
+/// chosen by the caller. This covers namespace files under `roots/<ns>/<incarnation>/_files/` -- keyed
+/// by the namespace LIFE, never by its bare name -- and mountpoint objects mirrored by path. The object bodies are raw passthrough bytes; this component does not
 /// decode them as CAS metadata.
 ///
 /// The component holds references to the shared `Backend` and `Layout` only. It owns no pool mutex

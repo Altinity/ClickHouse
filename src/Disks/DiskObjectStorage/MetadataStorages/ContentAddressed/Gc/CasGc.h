@@ -619,7 +619,8 @@ private:
 
     /// Namespace-cleanup item passes: for each item in the committed seal, a Pending item
     /// runs a bounded exact-key enumerate-and-delete pass over the removed namespace's physical `@cas@`
-    /// prefixes (manifest bodies + verbatim files); a Completed item publishes the `_cleanup` marker and
+    /// prefixes (manifest bodies, and -- leak-only since Task 4b -- the CURRENT life's verbatim files);
+    /// a Completed item publishes the `_cleanup` marker and
     /// republishes the constant-size `Removed` snapshot (both idempotent `putIfAbsent`). Runs post-CAS.
     /// A stale leader (deposed after its round CAS but still executing) must never delete a namespace a
     /// successor round Completed and the writer recreated: the Pending pass re-reads gc/state (aborting
@@ -633,9 +634,18 @@ private:
                                    const std::map<String, UInt128> & live_incarnation,
                                    uint64_t new_round, bool suppress_destructive);
 
-    /// Whether a namespace's physical `@cas@` metadata prefixes (manifest bodies + verbatim files) hold no
-    /// object -- the Pending->Completed condition for its namespace-cleanup item. LIST-only, no delete.
-    bool namespacePhysicallyEmpty(const RootNamespace & ns);
+    /// Whether a namespace's physical MANIFEST prefix holds no object -- the Pending->Completed condition
+    /// for its namespace-cleanup item. LIST-only, no delete.
+    ///
+    /// NAMESPACE FILES ARE DELIBERATELY NOT PROBED (Stage B Task 4b, directive design change 2). This
+    /// predicate used to require a physical-empty proof for `_files` too, which made a name's reuse wait
+    /// on an enumeration -- and an object store may omit a key from LIST indefinitely, so the wait could
+    /// be unbounded while the file that caused it was invisible to the very pass meant to delete it. Once
+    /// files are keyed by incarnation, a surviving file of a dead life is unreachable from any later life,
+    /// so it no longer bears on whether the name may be reused: it is a storage leak for the janitor, not
+    /// a correctness condition. Manifests keep their arm because Task 4b left manifest identity unchanged
+    /// (Constraint 12) -- they are name-keyed and a stale body IS still reachable.
+    bool namespaceManifestsPhysicallyEmpty(const RootNamespace & ns);
 
     /// Best-effort cursor-paced orphan part-manifest sweep. This is cleanup-only state: a lost CAS only
     /// discards cursor progress and must not fail the already-completed GC round. Returns the page's
@@ -849,6 +859,13 @@ public:
     std::vector<NamespaceLifeId> discoverUniverseForTest()
     {
         return discoverUniverse();
+    }
+
+    /// TEST SEAM: expose the Pending->Completed emptiness predicate so a test can assert WHICH physical
+    /// prefixes it consults without driving a whole round to observe the state transition indirectly.
+    bool namespaceManifestsPhysicallyEmptyForTest(const RootNamespace & ns)
+    {
+        return namespaceManifestsPhysicallyEmpty(ns);
     }
 
     /// TEST SEAM: expose the two cheap pre-fold GC round-defer signals so unit tests can

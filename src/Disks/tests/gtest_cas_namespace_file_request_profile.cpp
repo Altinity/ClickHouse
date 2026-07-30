@@ -1,7 +1,13 @@
 #include <gtest/gtest.h>
 #include "cas_test_helpers.h"
 
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
+#include <IO/WriteHelpers.h>
+#include <Core/Defines.h>
+
+#include <filesystem>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -19,17 +25,16 @@
 /// namespace file is stored under, so the keys are derived from `Layout` rather than spelled out; what
 /// must not move is the count per key and the set of keys touched.
 ///
-/// WHAT IT DOES NOT PIN, stated so the next implementer of this constraint learns it here instead of
-/// rediscovering it: the four "no ..." clauses are NOT fenced by these cases. Every case drives
-/// `Pool::putNamespaceFile`/`getNamespaceFile`/`removeNamespaceFile`/`listNamespaceFiles`, which reach
-/// `CasPlainObjects` and have no catalog, ref-log, blob or manifest path to take -- so those four
-/// negatives hold by construction of the call, not by anything measured here. The layer where they can
-/// actually be violated is the DISK operation above: `ContentAddressedTransaction::writeFile` resolving
-/// its namespace through `ContentAddressedMetadataStorage::liveNamespace` is where a catalog GET would
-/// be introduced, and no fixture in this file can observe it (the metadata storage builds its own
-/// `Backend` from an `ObjectStoragePtr` and accepts no injected one, which is why the append case here
-/// is the two-call composition rather than the real write buffer). Fencing those four clauses needs a
-/// test at that layer.
+/// WHERE THE OTHER FOUR CLAUSES ARE FENCED, and why they could not be fenced by the cases above. Every
+/// pool-layer case drives `Pool::putNamespaceFile`/`getNamespaceFile`/`removeNamespaceFile`/
+/// `listNamespaceFiles`, which reach `CasPlainObjects` and have no catalog, ref-log, blob or manifest
+/// path to take -- so at THAT layer the four negatives hold by construction of the call and measuring
+/// them proves nothing. The layer where they can be violated is the DISK operation above, where
+/// `ContentAddressedTransaction::writeFile` resolves the namespace's life; that is exactly where Task 4b
+/// put a life resolution, so that is where a per-operation catalog GET would appear. The two
+/// `CasNamespaceFileDiskProfile` cases at the bottom of this file fence it there, through a recording
+/// `IObjectStorage` (the metadata storage builds its own `Backend` from an `ObjectStoragePtr`, so the
+/// object storage is the injectable seam -- no production surface is widened for the test's benefit).
 
 using namespace DB::Cas;
 using namespace DB::Cas::tests;
@@ -202,4 +207,274 @@ TEST(CasNamespaceFileRequestProfile, DedupLogRotation)
     EXPECT_EQ(backend->touchedKeys(), (std::vector<String>{prefix, old_key, new_key}));
 
     EXPECT_EQ(store->listNamespaceFiles(life), std::vector<String>{kSegment2});
+}
+
+
+/// ===================== THE FOUR NEGATIVES, AT THE DISK LAYER =====================
+///
+/// Constraint 16's other four clauses: a namespace-file operation performs no catalog request, no
+/// ref-log append, no blob upload and no folder-manifest rewrite. They are asserted here rather than
+/// above because only here is there a life resolution to get wrong.
+///
+/// WHAT MAKES THE CLAIM NON-TRIVIAL. Task 4b's read and write paths resolve a catalog-minted life. That
+/// resolution is per TABLE-OPEN -- `CasRefLedger` caches it on the table's runtime -- so the steady-state
+/// operation pays nothing for it. If it ever became per-operation, `format_version.txt` and every
+/// dedup-log rotation on the insert path would carry a catalog round trip, and nothing else in the suite
+/// would notice. `SteadyStateFileOperationsTouchNoCatalogRefBlobOrManifestKey` is that alarm, and
+/// `TheLifeResolutionIsPaidOncePerTableOpen` is the other half: it shows the birth cost EXISTS and is
+/// paid exactly once, so the steady-state zeros are a real property rather than an artifact of a fixture
+/// that never triggered a resolution at all.
+
+namespace
+{
+
+/// A `LocalObjectStorage` that records every key it is asked about, per operation family. Used to ask
+/// "was any key under these four families touched at all", which is a question about WHICH keys an
+/// operation reaches -- not about counts -- so recording the key set is the whole instrument.
+///
+/// It overrides every method `CasObjectStorageBackend` reaches: a family left un-overridden would be an
+/// unrecorded path, and an assertion of "nothing touched it" would then be silently satisfied by the
+/// gap rather than by the behaviour.
+class RecordingObjectStorage : public DB::LocalObjectStorage
+{
+public:
+    using DB::LocalObjectStorage::LocalObjectStorage;
+
+    bool exists(const DB::StoredObject & object) const override
+    {
+        record(object.remote_path, /*is_write*/ false);
+        return DB::LocalObjectStorage::exists(object);
+    }
+
+    std::unique_ptr<DB::ReadBufferFromFileBase> readObject(
+        const DB::StoredObject & object, const DB::ReadSettings & read_settings,
+        std::optional<size_t> read_hint = {}, bool use_external_buffer = false,
+        bool restrict_seek = false) const override
+    {
+        record(object.remote_path, /*is_write*/ false);
+        return DB::LocalObjectStorage::readObject(object, read_settings, read_hint, use_external_buffer, restrict_seek);
+    }
+
+    std::unique_ptr<DB::WriteBufferFromFileBase> writeObject(
+        const DB::StoredObject & object, DB::WriteMode mode,
+        std::optional<DB::ObjectAttributes> attributes = {},
+        size_t buf_size = DB::DBMS_DEFAULT_BUFFER_SIZE,
+        const DB::WriteSettings & write_settings = {}) override
+    {
+        record(object.remote_path, /*is_write*/ true);
+        return DB::LocalObjectStorage::writeObject(object, mode, attributes, buf_size, write_settings);
+    }
+
+    void removeObjectIfExists(const DB::StoredObject & object) override
+    {
+        record(object.remote_path, /*is_write*/ true);
+        DB::LocalObjectStorage::removeObjectIfExists(object);
+    }
+
+    void removeObjectsIfExist(const DB::StoredObjects & objects) override
+    {
+        for (const DB::StoredObject & object : objects)
+            record(object.remote_path, /*is_write*/ true);
+        DB::LocalObjectStorage::removeObjectsIfExist(objects);
+    }
+
+    DB::ObjectMetadata getObjectMetadata(const std::string & path, bool with_tags) const override
+    {
+        record(path, /*is_write*/ false);
+        return DB::LocalObjectStorage::getObjectMetadata(path, with_tags);
+    }
+
+    std::optional<DB::ObjectMetadata> tryGetObjectMetadata(const std::string & path, bool with_tags) const override
+    {
+        record(path, /*is_write*/ false);
+        return DB::LocalObjectStorage::tryGetObjectMetadata(path, with_tags);
+    }
+
+    void listObjects(const std::string & path, DB::RelativePathsWithMetadata & children, size_t max_keys) const override
+    {
+        record(path, /*is_write*/ false);
+        DB::LocalObjectStorage::listObjects(path, children, max_keys);
+    }
+
+    bool existsOrHasAnyChild(const std::string & path) const override
+    {
+        record(path, /*is_write*/ false);
+        return DB::LocalObjectStorage::existsOrHasAnyChild(path);
+    }
+
+    void copyObject(
+        const DB::StoredObject & object_from, const DB::StoredObject & object_to,
+        const DB::ReadSettings & read_settings, const DB::WriteSettings & write_settings,
+        std::optional<DB::ObjectAttributes> object_to_attributes = {}) override
+    {
+        record(object_from.remote_path, /*is_write*/ false);
+        record(object_to.remote_path, /*is_write*/ true);
+        DB::LocalObjectStorage::copyObject(object_from, object_to, read_settings, write_settings, object_to_attributes);
+    }
+
+    /// Every recorded key containing `needle`, in first-touch order, so a failure names the offender.
+    std::vector<String> touchedContaining(std::string_view needle) const
+    {
+        std::lock_guard lock(mutex);
+        std::vector<String> out;
+        for (const String & key : touched)
+            if (key.find(needle) != String::npos)
+                out.push_back(key);
+        return out;
+    }
+
+    std::vector<String> writtenContaining(std::string_view needle) const
+    {
+        std::lock_guard lock(mutex);
+        std::vector<String> out;
+        for (const String & key : written)
+            if (key.find(needle) != String::npos)
+                out.push_back(key);
+        return out;
+    }
+
+    void resetRecords()
+    {
+        std::lock_guard lock(mutex);
+        touched.clear();
+        written.clear();
+    }
+
+private:
+    void record(const std::string & key, bool is_write) const
+    {
+        std::lock_guard lock(mutex);
+        touched.push_back(key);
+        if (is_write)
+            written.push_back(key);
+    }
+
+    mutable std::mutex mutex;
+    mutable std::vector<String> touched;
+    mutable std::vector<String> written;
+};
+
+const std::string kTableUuid = "a11a11a1-1111-4111-8111-111111111111";
+const std::string kTablePath = "a11/a11a11a1-1111-4111-8111-111111111111";
+
+/// The four families the constraint forbids a file operation from touching, as key substrings. Taken
+/// from `Layout` where a helper exists rather than spelled out, so a layout change breaks this by
+/// failing to compile or by moving the substring, not by silently matching nothing.
+struct ForbiddenFamily
+{
+    String needle;
+    String clause;
+};
+
+std::vector<ForbiddenFamily> forbiddenFamilies(const DB::Cas::Layout & layout)
+{
+    return {
+        {layout.refCatalogKey(), "no catalog request"},
+        {layout.casRefsPrefix(), "no ref-log append"},
+        {layout.blobsPrefix(), "no blob upload"},
+        {layout.casManifestsPrefix(), "no folder-manifest rewrite"},
+    };
+}
+
+std::shared_ptr<DB::ContentAddressedMetadataStorage> openRecordingStorage(
+    std::shared_ptr<RecordingObjectStorage> & out_object_storage)
+{
+    static std::atomic<uint64_t> counter{0};
+    const String unique = std::to_string(::getpid()) + "_" + std::to_string(counter.fetch_add(1));
+    const auto root = (std::filesystem::temp_directory_path() / ("cas_ns_file_profile_" + unique)).string();
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+    std::filesystem::create_directories(root, ec);
+
+    out_object_storage = std::make_shared<RecordingObjectStorage>(
+        DB::LocalObjectStorageSettings("test", root, /*read_only_=*/false));
+
+    auto settings = makeSettingsForTest(
+        "test", std::filesystem::temp_directory_path() / ("cas_ns_file_profile_scratch_" + unique));
+    auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
+        out_object_storage, "pool", "srv1", "", nullptr, settings);
+    storage->startup();
+    return storage;
+}
+
+/// One verbatim namespace file written through the REAL disk write path (the buffer whose finalize
+/// callback reaches `putNamespaceFile`), not through the pool surface.
+void writeVerbatimThroughDisk(   /// ASSERT_* inside -> must return void
+    DB::ContentAddressedMetadataStorage & storage, const std::string & path, const String & bytes,
+    DB::WriteMode mode = DB::WriteMode::Rewrite)
+{
+    /// `tryCreateWriteBuffer` is the interface entry the disk itself uses, so this drives the same
+    /// buffer construction (and the same autocommit-on-finalize contract for verbatim files) that a real
+    /// write does. `owner` is null here: only a part-blob buffer's deferred finalize needs the pin, and
+    /// a verbatim file finalizes inline, inside this call's scope.
+    auto tx = storage.createTransaction();
+    auto buf = tx->tryCreateWriteBuffer(
+        /*owner*/ nullptr, path, DB::DBMS_DEFAULT_BUFFER_SIZE, mode, {}, /*autocommit*/ true);
+    ASSERT_TRUE(buf != nullptr);
+    DB::writeString(bytes, *buf);
+    buf->finalize();
+}
+
+}
+
+/// The steady state: with the table open and its life already resolved, no namespace-file operation --
+/// rewrite, append, read, rotation, remove -- touches a catalog, ref, blob or manifest key.
+TEST(CasNamespaceFileDiskProfile, SteadyStateFileOperationsTouchNoCatalogRefBlobOrManifestKey)
+{
+    std::shared_ptr<RecordingObjectStorage> object_storage;
+    auto storage = openRecordingStorage(object_storage);
+    const DB::Cas::Layout & layout = storage->store()->layout();
+
+    /// Open the table by doing the first file operation, which is what resolves (and here mints) the
+    /// life. Everything measured below happens after it.
+    writeVerbatimThroughDisk(*storage, kTablePath + "/format_version.txt", "1\n");
+    ASSERT_TRUE(storage->existsFile(kTablePath + "/format_version.txt"));
+
+    object_storage->resetRecords();
+
+    /// A whole-file rewrite, the read-modify-rewrite append, a read, and a dedup-log rotation
+    /// (create the new segment, enumerate, drop the retired one) -- the four shapes the constraint names.
+    writeVerbatimThroughDisk(*storage, kTablePath + "/format_version.txt", "2\n");
+    writeVerbatimThroughDisk(*storage, kTablePath + "/deduplication_logs/deduplication_log_1.txt", "a");
+    writeVerbatimThroughDisk(
+        *storage, kTablePath + "/deduplication_logs/deduplication_log_1.txt", "b", DB::WriteMode::Append);
+    EXPECT_EQ(storage->tryGetInManifestBytes(kTablePath + "/deduplication_logs/deduplication_log_1.txt"),
+              std::optional<String>("ab"));
+    writeVerbatimThroughDisk(*storage, kTablePath + "/deduplication_logs/deduplication_log_2.txt", "c");
+    storage->createTransaction()->unlinkFile(
+        kTablePath + "/deduplication_logs/deduplication_log_1.txt", /*if_exists*/ false, /*remove_metadata_only*/ false);
+
+    for (const ForbiddenFamily & family : forbiddenFamilies(layout))
+        EXPECT_EQ(object_storage->touchedContaining(family.needle), std::vector<String>{})
+            << "Constraint 16, '" << family.clause << "': a namespace-file operation reached " << family.needle;
+
+    /// A positive control on the instrument itself: the operations above DID reach the store, so the
+    /// four empty answers are the absence of those families and not a recorder that recorded nothing.
+    EXPECT_FALSE(object_storage->writtenContaining("/_files/").empty())
+        << "the recorder must have seen the file writes themselves";
+}
+
+/// The other half: the life resolution is real and is paid ONCE per table-open. Without this, the zeros
+/// above could be produced by a fixture in which no resolution ever happened.
+TEST(CasNamespaceFileDiskProfile, TheLifeResolutionIsPaidOncePerTableOpen)
+{
+    std::shared_ptr<RecordingObjectStorage> object_storage;
+    auto storage = openRecordingStorage(object_storage);
+    const DB::Cas::Layout & layout = storage->store()->layout();
+
+    /// The FIRST namespace-file operation on a never-opened table resolves the life from the catalog,
+    /// minting the namespace when it names none -- so it DOES reach the catalog. That is the per-open
+    /// cost, and the reason the steady-state case above resets its records after this point.
+    writeVerbatimThroughDisk(*storage, kTablePath + "/format_version.txt", "1\n");
+    EXPECT_FALSE(object_storage->touchedContaining(layout.refCatalogKey()).empty())
+        << "the first file operation must resolve a life, which reaches the catalog";
+
+    object_storage->resetRecords();
+
+    /// The second operation on the SAME open table resolves nothing: the life is cached on the table's
+    /// runtime. This is the assertion that says "per table-open", and it is the one that would fail if a
+    /// future change moved the resolution onto the operation.
+    writeVerbatimThroughDisk(*storage, kTablePath + "/format_version.txt", "2\n");
+    EXPECT_EQ(object_storage->touchedContaining(layout.refCatalogKey()), std::vector<String>{})
+        << "a second file operation must not re-resolve the life";
 }

@@ -168,6 +168,25 @@ public:
     /// Reports whether recovery has established the namespace's durable lifecycle as `Removed`.
     bool namespaceIsRemoved(const RootNamespace & ns);
 
+    /// The catalog life every one of this namespace's objects -- ref-layer AND namespace-file -- is keyed
+    /// under, resolved ONCE per table-open (`ensureRefTableRecovered`'s step 0) and read from the cache
+    /// afterwards. This is the WRITE-side resolution: `resolveNamespaceLife` MINTS a life when the
+    /// catalog names none, so the first namespace file a table ever writes births the namespace exactly
+    /// as its first ref op would.
+    NamespaceLifeId namespaceLife(const RootNamespace & ns);
+
+    /// The life a READER of this namespace's files must use, or `nullopt` when the namespace has no
+    /// readable files at all -- which is the same answer for a namespace whose table was dropped
+    /// (durably `Removed`) as for one that was never born.
+    ///
+    /// ONE call, not a predicate plus a resolution, and that is deliberate: the two questions are
+    /// answered from the SAME `state_mutex` hold over the SAME recovered runtime, so a reader can never
+    /// pair "readable" from one observation with a life from another. Returning `optional` rather than a
+    /// life plus a bool also makes the unreadable case unusable by construction -- a caller that forgets
+    /// to check gets no life to read with, instead of a plausible-looking one that names the wrong
+    /// prefix. Absence is the fail-closed direction: only a KNOWN-readable namespace surfaces files.
+    std::optional<NamespaceLifeId> namespaceFilesLifeIfReadable(const RootNamespace & ns);
+
     /// Queues a mutation for flat-combining with compatible callers. `build_ops` runs at most once in
     /// the flush leader and must return operations without writing storage itself. The leader validates
     /// the complete batch, writes one ref-log object behind the append fence, and applies the batch to the

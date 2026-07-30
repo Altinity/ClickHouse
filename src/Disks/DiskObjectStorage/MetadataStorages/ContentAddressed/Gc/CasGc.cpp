@@ -2760,13 +2760,13 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
 
     /// Namespace-cleanup items: carry the parent generation's items forward, add a Pending
     /// item for each remove_namespace transaction folded this round (skipped on a ref-folding abort), and
-    /// promote a Pending item to Completed once its physical `@cas@` prefixes (manifest bodies + verbatim
-    /// files) are empty. The Pending->Completed transition depends only on physical emptiness, so a carried
-    /// item still advances even on an abort.
+    /// promote a Pending item to Completed once its physical MANIFEST prefix is empty (namespace files are
+    /// not probed -- see `namespaceManifestsPhysicallyEmpty`). The Pending->Completed transition depends
+    /// only on physical emptiness, so a carried item still advances even on an abort.
     ///
-    /// PHASE 9/19 `fold_ns_cleanup_scan`: TWO prefix LISTs per not-yet-Completed item
-    /// (`namespacePhysicallyEmpty`), which is the phase's whole cost and the reason it is separated from
-    /// the intake it sits next to.
+    /// PHASE 9/19 `fold_ns_cleanup_scan`: ONE prefix LIST per not-yet-Completed item
+    /// (`namespaceManifestsPhysicallyEmpty` -- it was two before Task 4b dropped the files probe), which
+    /// is the phase's whole cost and the reason it is separated from the intake it sits next to.
     std::optional<GcPhaseTimer> ns_scan_timer;
     ns_scan_timer.emplace(phase_sink, "fold_ns_cleanup_scan");
     result.fold_seal.ns_cleanup_items =
@@ -2785,7 +2785,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         if (item.state != RefNsCleanupState::Completed)
         {
             ++ns_items_scanned;
-            if (namespacePhysicallyEmpty(item.ns))
+            if (namespaceManifestsPhysicallyEmpty(item.ns))
             {
                 item.state = RefNsCleanupState::Completed;
                 ++ns_items_completed_now;
@@ -3247,19 +3247,14 @@ void Gc::reportSweepRetention(const ManifestSweepResult & result)
     retain_rollup_passes_since_report = 0;
 }
 
-bool Gc::namespacePhysicallyEmpty(const RootNamespace & ns)
+bool Gc::namespaceManifestsPhysicallyEmpty(const RootNamespace & ns)
 {
-    Backend & backend = store->backend();
-    const Layout & layout = store->layout();
-    for (const String & prefix : {layout.manifestNamespacePrefix(ns),
-                                  layout.namespaceFilesPrefix(NamespaceLifeId::stageATransition(ns))})
-    {
-        const ListPage page = backend.list(prefix, /*cursor*/String{}, /*limit*/1);
-        ProfileEvents::increment(ProfileEvents::CasGcEnumerationPages);
-        if (!page.keys.empty())
-            return false;
-    }
-    return true;
+    /// ONE prefix, and the reason the second one is absent is in this function's declaration: rebirth
+    /// waits for no file.
+    const ListPage page = store->backend().list(
+        store->layout().manifestNamespacePrefix(ns), /*cursor*/String{}, /*limit*/1);
+    ProfileEvents::increment(ProfileEvents::CasGcEnumerationPages);
+    return page.keys.empty();
 }
 
 void Gc::cleanupRefObjects(const FoldResult & folded, bool suppress_destructive)
@@ -3407,9 +3402,18 @@ void Gc::runNamespaceCleanupPasses(const CasFoldSeal & seal, const std::map<Stri
 
             /// Bounded exact-key enumerate-and-delete over the removed namespace's physical `@cas@` prefixes
             /// (manifest bodies + verbatim files). NotFound/TokenMismatch tolerated.
+            ///
+            /// THE FILES PASS IS NOW LEAK-ONLY, and its discipline is unchanged for that reason rather
+            /// than in spite of it. Since Task 4b nothing WAITS on it -- `namespaceManifestsPhysicallyEmpty`
+            /// no longer probes `_files`, so a file this pass fails to enumerate delays nothing and blocks
+            /// no recreation. What it still does is reclaim storage, and it may only reclaim the life the
+            /// catalog names right now: the per-page/per-key freshness + `_cleanup`-marker + `deleteExact`
+            /// discipline below is what makes that safe against a concurrent recreation, and exact-token
+            /// deletion is what makes leak-only cleanup safe at all. A DEAD life's files are outside this
+            /// pass entirely -- unreachable, so no longer urgent -- and are the janitor's (Task 5).
             struct { String prefix; bool is_manifest; } passes[] = {
                 {layout.manifestNamespacePrefix(item.ns), true},
-                {layout.namespaceFilesPrefix(NamespaceLifeId::stageATransition(item.ns)), false},
+                {layout.namespaceFilesPrefix(life), false},
             };
             for (const auto & pass : passes)
             {
@@ -3460,8 +3464,8 @@ void Gc::runNamespaceCleanupPasses(const CasFoldSeal & seal, const std::map<Stri
             /// THE `_ckpt` BACKSTOP. The removed namespace's checkpoint object is the one ref object
             /// nothing else reclaims: the covered-log cleanup deletes logs and snapshots, the two
             /// physical passes above cover `cas/manifests/<ns>/` and the verbatim files, and
-            /// `namespacePhysicallyEmpty` -- which decides Pending -> Completed -- does not look under
-            /// `cas/refs/` at all. A leaked `_ckpt` is therefore invisible to the completion condition
+            /// `namespaceManifestsPhysicallyEmpty` -- which decides Pending -> Completed -- does not look
+            /// under `cas/refs/` at all. A leaked `_ckpt` is therefore invisible to the completion condition
             /// while remaining visible to `serverRootSubtreeEmpty`, which leaves a fully drained server
             /// root permanently unreclaimable (`claimOwnerOrThrow` refuses it as CORRUPTED_DATA).
             ///

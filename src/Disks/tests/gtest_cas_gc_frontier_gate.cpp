@@ -1056,7 +1056,7 @@ TEST(CasGcFrontierGateCleanupRange, ASnapshotAtTheCheckpointSurvivesAndOnlyStric
 ///
 /// The removed namespace's checkpoint object is the one ref object nothing else reclaims: the covered-
 /// log cleanup handles logs and snapshots, the Pending pass's two physical passes handle
-/// `cas/manifests/<ns>/` and the verbatim files, and `namespacePhysicallyEmpty` -- which decides
+/// `cas/manifests/<ns>/` and the verbatim files, and `namespaceManifestsPhysicallyEmpty` -- which decides
 /// Pending -> Completed -- never looks under `cas/refs/` at all. A leaked `_ckpt` is therefore
 /// invisible to the completion condition while remaining visible to `serverRootSubtreeEmpty`, which
 /// leaves a fully drained server root permanently unreclaimable.

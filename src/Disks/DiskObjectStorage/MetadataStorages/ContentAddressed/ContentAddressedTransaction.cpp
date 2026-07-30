@@ -815,7 +815,7 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
             /// into whatever life the namespace name happens to denote when the callback fires
             /// (directive §namespace-file-requirements).
             const Cas::NamespaceLifeId life
-                = Cas::NamespaceLifeId::stageATransition(metadata_storage.liveNamespace(tf->table_uuid));
+                = metadata_storage.store()->namespaceLife(metadata_storage.liveNamespace(tf->table_uuid));
             const std::string name = tf->tail;
             std::string prefix_bytes;
             if (mode == WriteMode::Append)
@@ -1128,12 +1128,16 @@ void ContentAddressedTransaction::removeRecursive(const std::string & path, cons
     /// Table-level SUBDIRECTORY (deduplication_logs/): remove every verbatim file under it.
     if (auto tf = Cas::parseTableFilePath(path))
     {
-        const auto ns = metadata_storage.liveNamespace(tf->table_uuid);
+        /// The READABLE resolution, not the minting one: a removal must never birth the namespace it is
+        /// removing from. No readable life means there is nothing under this subdirectory to remove.
+        const auto life = metadata_storage.readableNamespaceFilesLife(
+            metadata_storage.liveNamespace(tf->table_uuid));
+        if (!life)
+            return;
         const std::string prefix = tf->tail + "/";
-        const Cas::NamespaceLifeId life = Cas::NamespaceLifeId::stageATransition(ns);
-        for (const auto & name : metadata_storage.store()->listNamespaceFiles(life))
+        for (const auto & name : metadata_storage.store()->listNamespaceFiles(*life))
             if (name.starts_with(prefix))
-                metadata_storage.store()->removeNamespaceFile(life, name);
+                metadata_storage.store()->removeNamespaceFile(*life, name);
         return;
     }
 }
@@ -1254,11 +1258,21 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
             {
                 for (const auto & [ref, _] : metadata_storage.store()->listRefs(from_ns))
                     metadata_storage.partAccess()->republishRef({from_ns, ref}, {to_ns, ref});
-                const Cas::NamespaceLifeId from_life = Cas::NamespaceLifeId::stageATransition(from_ns);
-                const Cas::NamespaceLifeId to_life = Cas::NamespaceLifeId::stageATransition(to_ns);
-                for (const auto & name : metadata_storage.store()->listNamespaceFiles(from_life))
-                    if (auto bytes = metadata_storage.store()->getNamespaceFile(from_life, name))
-                        metadata_storage.store()->putNamespaceFile(to_life, name, *bytes);
+                /// Asymmetric by necessity: the SOURCE is read, so it resolves readably and contributes
+                /// nothing when it has no life; the DESTINATION is written, so it resolves the minting way
+                /// and is born here if the rename is what first creates it. Resolved only once the source
+                /// actually has files to move, so a rename of a table with none does not mint a life for a
+                /// destination nothing is written to.
+                const auto from_life = metadata_storage.readableNamespaceFilesLife(from_ns);
+                const std::vector<String> file_names
+                    = from_life ? metadata_storage.store()->listNamespaceFiles(*from_life) : std::vector<String>{};
+                if (!file_names.empty())
+                {
+                    const Cas::NamespaceLifeId to_life = metadata_storage.store()->namespaceLife(to_ns);
+                    for (const auto & name : file_names)
+                        if (auto bytes = metadata_storage.store()->getNamespaceFile(*from_life, name))
+                            metadata_storage.store()->putNamespaceFile(to_life, name, *bytes);
+                }
                 metadata_storage.partAccess()->dropNamespace(from_ns);
             }
             catch (...)
@@ -1424,17 +1438,24 @@ void ContentAddressedTransaction::moveFile(const std::string & path_from, const 
             /// pre-existing destination can never reach this branch: destination names derive
             /// deterministically from source names, and the SINGLE-WRITER contract means only this
             /// move's own prior drive can have produced it.
-            const Cas::NamespaceLifeId src_life = Cas::NamespaceLifeId::stageATransition(src_ns);
-            const Cas::NamespaceLifeId dst_life = Cas::NamespaceLifeId::stageATransition(dst_ns);
-            auto bytes = metadata_storage.store()->getNamespaceFile(src_life, src_tf.tail);
-            if (!bytes)
+            /// The source resolves readably (a move reads it) and the destination the minting way (a move
+            /// writes it). A source namespace with no readable life has no file to move, which is the same
+            /// outcome as an absent object and takes the identical already-moved / genuinely-missing split
+            /// below -- so absence of a life is not a separate error path.
+            const auto src_life = metadata_storage.readableNamespaceFilesLife(src_ns);
+            const auto src_bytes = src_life
+                ? metadata_storage.store()->getNamespaceFile(*src_life, src_tf.tail)
+                : std::nullopt;
+            if (!src_bytes)
             {
-                if (metadata_storage.store()->getNamespaceFile(dst_life, dst_tf.tail))
+                const auto dst_probe = metadata_storage.readableNamespaceFilesLife(dst_ns);
+                if (dst_probe && metadata_storage.store()->getNamespaceFile(*dst_probe, dst_tf.tail))
                     return;
                 throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: moveFile source missing: {}", path_from);
             }
-            metadata_storage.store()->putNamespaceFile(dst_life, dst_tf.tail, *bytes);
-            metadata_storage.store()->removeNamespaceFile(src_life, src_tf.tail);
+            metadata_storage.store()->putNamespaceFile(
+                metadata_storage.store()->namespaceLife(dst_ns), dst_tf.tail, *src_bytes);
+            metadata_storage.store()->removeNamespaceFile(*src_life, src_tf.tail);
         };
         auto src_tf = Cas::parseTableFilePath(path_from);
         auto dst_tf = Cas::parseTableFilePath(path_to);
@@ -1599,9 +1620,11 @@ void ContentAddressedTransaction::unlinkFile(const std::string & path, bool if_e
     /// a pruned mutation entry would otherwise leak until DROP.
     if (auto tf = Cas::parseTableFilePath(path))
     {
-        const Cas::NamespaceLifeId life
-            = Cas::NamespaceLifeId::stageATransition(metadata_storage.liveNamespace(tf->table_uuid));
-        if (!metadata_storage.store()->getNamespaceFile(life, tf->tail))
+        /// Readable resolution: an unlink must not birth a namespace. No life means no such file, which
+        /// is exactly the absent case the branch below already handles.
+        const auto life = metadata_storage.readableNamespaceFilesLife(
+            metadata_storage.liveNamespace(tf->table_uuid));
+        if (!life || !metadata_storage.store()->getNamespaceFile(*life, tf->tail))
         {
             if (if_exists)
                 return;
@@ -1610,7 +1633,7 @@ void ContentAddressedTransaction::unlinkFile(const std::string & path, bool if_e
                 "ContentAddressed: unlinkFile target does not exist: {}",
                 path);
         }
-        metadata_storage.store()->removeNamespaceFile(life, tf->tail);
+        metadata_storage.store()->removeNamespaceFile(*life, tf->tail);
         return;
     }
     /// Loose mountpoint file: exact-token delete of the plain object.

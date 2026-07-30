@@ -838,8 +838,11 @@ TEST(CasRefGc, StaleLeaderPendingPassAbortsOnCompletionMarker)
     backend->putIfAbsent(layout.refCleanupMarkerKey(NamespaceLifeId::stageATransition(ns), remove_txn), String{});
     const ManifestRef recreated = ManifestRef{.writer_epoch = 2, .build_sequence = 1, .manifest_ordinal = 1};
     writeManifestRaw(*backend, layout, ns, recreated, {blobEntryFor("a", DB::UInt128(1))});
+    /// The catalog's life, not the sentinel: this is the key the pass would delete if the marker HEAD
+    /// did not stop it, so it must be the key the pass would actually enumerate.
     const String file_key
-        = layout.namespaceFilesPrefix(NamespaceLifeId::stageATransition(ns)) + "format_version.txt";
+        = layout.namespaceFilesPrefix(CasRefCatalog::resolveLifeOrSentinel(*backend, layout, ns))
+        + "format_version.txt";
     backend->putIfAbsent(file_key, "1");
 
     /// The stale leader runs its Pending pass at its (still-durable) round: the marker HEAD must abort it.

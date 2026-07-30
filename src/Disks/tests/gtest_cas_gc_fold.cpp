@@ -541,17 +541,33 @@ TEST(CasGcFold, RoundSideAnomalySuppressesNamespaceAndRefLogCleanupToo)
 
     /// Namespace 2: a namespace mid-removal -- a `Pending` cleanup item (a bare `remove_namespace` op, no
     /// committed refs at all, so there is no owner-removal edge and hence no `mf_cleanup` entry that would
-    /// confound this test with a DIFFERENT, unconditional delete path) with a physical `@cas@` verbatim
-    /// file still present -- exactly what a clamp-free round's enumerate-and-delete pass would reclaim.
+    /// confound this test with a DIFFERENT, unconditional delete path) with physical `@cas@` debris still
+    /// present -- exactly what a clamp-free round's enumerate-and-delete pass would reclaim.
+    ///
+    /// THE DEBRIS IS A MANIFEST BODY PLUS A VERBATIM FILE, and the manifest is what makes the fixture work
+    /// at all (Stage B Task 4b): since files stopped being probed by `namespaceManifestsPhysicallyEmpty`,
+    /// a namespace whose ONLY debris is files is promoted Pending -> Completed by the very first fold, so
+    /// its Pending pass never runs in any round and a file alone can no longer observe whether that pass
+    /// was suppressed. The manifest holds the item Pending; both objects are then reclaimed by the same
+    /// pass, so the file remains a genuine observable of it rather than a coincidence.
     const RootNamespace ns_removed{"00/cc@cas@"};
     {
         RefOp remove_op;
         remove_op.kind = RefOpKind::RemoveNamespace;
         appendRefLogSeed(*backend, layout, ns_removed, {remove_op});
     }
+    /// Keyed at the life the CATALOG names for this namespace (`appendRefLogSeed` admitted it above),
+    /// which is the life the cleanup pass resolves too. Spelling the sentinel here instead would make the
+    /// test agree with the pass only by coincidence, and stop agreeing the moment a fixture mints a real
+    /// incarnation -- at which point the planted debris would sit under a prefix nothing looks at and the
+    /// clamp assertion below would hold vacuously.
     const String debris_key
-        = layout.namespaceFilesPrefix(NamespaceLifeId::stageATransition(ns_removed)) + "leftover_verbatim_file";
+        = layout.namespaceFilesPrefix(CasRefCatalog::resolveLifeOrSentinel(*backend, layout, ns_removed))
+        + "leftover_verbatim_file";
     backend->putIfAbsent(debris_key, "debris");
+    const ManifestRef removed_body = ref("srv-r:1", 1, 0xEE);
+    writeManifestRaw(*backend, layout, ns_removed, removed_body, {blobEntryFor("r", DB::UInt128(9))});
+    const String debris_manifest_key = layout.manifestKey(ManifestId{ns_removed, removed_body});
 
     /// Namespace 3: a live table with a log covered by a durable snapshot -- exactly what a clamp-free
     /// round's `cleanupRefObjects` would delete (mirrors `CasRefGc.RefObjectCleanupHonorsAllThreeConditions`).
@@ -581,8 +597,10 @@ TEST(CasGcFold, RoundSideAnomalySuppressesNamespaceAndRefLogCleanupToo)
     EXPECT_EQ(rep.graduated, 0u);
 
     /// `runNamespaceCleanupPasses` must have skipped ns_removed's Pending item entirely this round.
-    EXPECT_TRUE(backend->head(debris_key).exists)
+    EXPECT_TRUE(backend->head(debris_manifest_key).exists)
         << "a clamp anywhere in the round must suppress the namespace-cleanup physical reclaim pass too";
+    EXPECT_TRUE(backend->head(debris_key).exists)
+        << "the same suppression covers the pass's leak-only verbatim-file arm";
 
     /// `cleanupRefObjects` must not have deleted anything anywhere this round.
     EXPECT_TRUE(backend->head(covered_log_key).exists)
@@ -593,6 +611,9 @@ TEST(CasGcFold, RoundSideAnomalySuppressesNamespaceAndRefLogCleanupToo)
     writeManifestRaw(*backend, layout, ns_clamp, b, {blobEntryFor("b", DB::UInt128(2))});
     const RoundReport clean_rep = runRegularRoundReclaiming(gc);
     EXPECT_FALSE(clean_rep.hasAnomaly(ns_clamp, /*shard*/0));
-    EXPECT_FALSE(backend->head(debris_key).exists) << "a clamp-free round reclaims the removed namespace's debris";
+    EXPECT_FALSE(backend->head(debris_manifest_key).exists)
+        << "a clamp-free round reclaims the removed namespace's manifest debris";
+    EXPECT_FALSE(backend->head(debris_key).exists)
+        << "and its verbatim file, which the same pass sweeps once the manifest keeps the item Pending";
     EXPECT_FALSE(backend->head(covered_log_key).exists) << "a clamp-free round cleans the covered ref-log";
 }
