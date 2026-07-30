@@ -32,9 +32,19 @@ that rewriting is where the next defect comes from.
 
 ---
 
-## Open entries
+## Entries
 
-### D1 — `parseNamespaceFileKey`'s refusal contract over-claims {#d1-parse-namespace-file-key-contract}
+All of D1-D15 are closed as of the 2026-07-30 batched pass (D11 was already resolved before the pass
+and was left untouched per its own note). See
+`.superpowers/sdd/2026-07-28-cas-ref-chain-stage-b-catalog/prose-pass-report.md` for the full pass
+report.
+
+### D1 — RESOLVED: `parseNamespaceFileKey`'s refusal contract over-claims {#d1-parse-namespace-file-key-contract}
+
+**RESOLVED 2026-07-30 (batched pass).** Deleted the "IS one of our namespace files" clause in both
+`CasLayout.h`'s declaration doc and the mirrored comment in `CasLayout.cpp`, leaving the trigger
+condition ("carries the reserved segment, but the incarnation segment is missing/non-canonical/zero")
+stated without the necessary-vs-sufficient overclaim.
 
 From the Task 1c review (MINOR-1), prose half. The behaviour half is a separate item — see
 `BACKLOG.md` `{#loose-mountpoint-object-as-corrupt-namespace-file}`.
@@ -53,7 +63,13 @@ governs *namespaces* and says nothing about mountpoint paths, so that premise do
 **Fix:** state the necessary-not-sufficient scope, or delete the "IS one of our namespace files"
 clause and let the code speak.
 
-### D2 — a cited test covers one of the two key families the citing code handles {#d2-cited-test-one-family}
+### D2 — RESOLVED: a cited test covers one of the two key families the citing code handles {#d2-cited-test-one-family}
+
+**RESOLVED 2026-07-30 (batched pass).** Confirmed against `task-1c-review.md` MINOR-3 and the cited
+test (`gtest_cas_ref_gc.cpp`) that the citation covers only the ref-`_log` family. Rewrote
+`ContentAddressedTransaction::removeRecursive`'s comment to scope the citation to that family and, for
+the `_files` family, state the actually-verified reason it never reaches a GC round at all: `Cas::Gc`'s
+fold only LISTs `casRefsPrefix()`, never `rootsPrefix()`.
 
 From the Task 1c review (MINOR-3). Retrieve the exact citation and both families from
 `.superpowers/sdd/2026-07-28-cas-ref-chain-stage-b-catalog/task-1c-review.md` MINOR-3 when the pass
@@ -62,7 +78,13 @@ only one of the two key families that code handles.
 
 **Fix:** either cite a test per family, or narrow the claim to the family actually covered.
 
-### D3 — the interconversion fence's rationale is a non-sequitur {#d3-interconversion-rationale}
+### D3 — RESOLVED: the interconversion fence's rationale is a non-sequitur {#d3-interconversion-rationale}
+
+**RESOLVED 2026-07-30 (batched pass).** Deleted the `explicit`-clause reasoning in
+`gtest_cas_namespace_life_id.cpp`'s `NamespaceLifeIdAndRootNamespaceDoNotInterconvert` comment;
+replaced with the true and shorter reason ("no `RootNamespace` constructor takes a
+`NamespaceLifeId`"). Also fixed the identical restatement in the Task 1c brief
+(`docs/superpowers/plans/2026-07-28-cas-ref-chain-stage-b-catalog.md`), the origin of the claim.
 
 From the Task 1c review (MINOR-6). **The assertions are correct and do fence what they claim** —
 adding `operator RootNamespace()` or `RootNamespace(const NamespaceLifeId &)` fails them. Only the
@@ -83,7 +105,12 @@ brief's own §Interfaces note, so not the implementer's invention.
 **Fix:** delete the `explicit` clause; the "no constructor takes it" reason is the true one and is
 shorter.
 
-### D4 — the fence's "AND IT REACHES NO PROSE" paragraph is stale by one commit of its own round {#d4-fence-prose-paragraph-stale}
+### D4 — RESOLVED: the fence's "AND IT REACHES NO PROSE" paragraph is stale by one commit of its own round {#d4-fence-prose-paragraph-stale}
+
+**RESOLVED 2026-07-30 (batched pass).** Dropped the count entirely (mirroring the paragraph just above
+it, which had already dropped its own) instead of trying to fix its unit, and replaced "docstrings"
+with "comments and messages" — `run.py`'s two restatements are an inline comment and `WARNING`
+f-strings, not docstrings.
 
 From the Task 1c round-3 re-review (Minor 1). **The judgement it documents is sound** — the fence
 deliberately does not enumerate prose sites, because a hand-maintained list at a fence that cannot read
@@ -102,7 +129,11 @@ WARNING string.
 **Fix:** make the paragraph say which unit it counts, or drop the count as MINOR-4's was dropped; and
 say "comments and messages", not "docstrings".
 
-### D5 — the report overstates MINOR-4's fix {#d5-report-overstates-minor4}
+### D5 — RESOLVED: the report overstates MINOR-4's fix {#d5-report-overstates-minor4}
+
+**RESOLVED 2026-07-30 (batched pass).** Narrowed `task-1c-report.md`'s sentence: it now attributes
+the "and why" to `CasFsck.h` specifically and states plainly that `InterpreterSystemQuery.cpp` drops
+the count without restating the reason, instead of claiming both comments do the same thing.
 
 From the same re-review (Minor 2). `task-1c-report.md` says "both comments now state the claim
 qualitatively … and say explicitly that no count is given **and why**". Only `CasFsck.h` says why;
@@ -111,7 +142,12 @@ the report checks the SQL site, finds no such statement, and reopens a fixed ite
 
 **Fix:** narrow the report sentence to the site that carries the reason.
 
-### D6 — the exit-code caveat is scoped to summary scans though the exclusion is unconditional {#d6-exit-caveat-scope}
+### D6 — RESOLVED: the exit-code caveat is scoped to summary scans though the exclusion is unconditional {#d6-exit-caveat-scope}
+
+**RESOLVED 2026-07-30 (batched pass).** Verified against `CommandFsck::executeImpl`
+(`programs/disks/CommandFsck.cpp`) that `stale_edge` never throws in either mode. Rewrote
+`08-testing-and-soak.md`'s caveat to cover both modes explicitly and name `stale_edge` as the reason a
+`--detail` run's nonzero `stale_edge` still exits 0.
 
 From the same re-review (Minor 3). **Not falsity — scope — but the consequence is operational, so the
 one-pass writer should not treat this as cosmetic.**
@@ -129,7 +165,12 @@ can never be reclaimed.
 
 **Fix:** drop "summary" so the caveat covers both modes, and name `stale_edge` as the reason.
 
-### D7 — `worstCaseEntryFoldReservationBytes`'s doc claims a coverage the sum does not have {#d7-reservation-doc-coverage}
+### D7 — RESOLVED: `worstCaseEntryFoldReservationBytes`'s doc claims a coverage the sum does not have {#d7-reservation-doc-coverage}
+
+**RESOLVED 2026-07-30 (batched pass).** Verified `ns_cleanup_items`'s keying (`CasFoldSealFormat.cpp`)
+supports more than one `nsc` row per namespace. Rewrote `CasRefCatalogFormat.h`'s doc to say the figure
+is an over-estimate per entry and stopped claiming it is the exhaustive set of rows a namespace can
+carry.
 
 From the Task 2 review (Important 6, PROSE/FALSE). **The arithmetic is brief-prescribed and Task 2 is
 conformant — only the sentence is wrong.** The substantive gap is a decision, placed as a step of plan
@@ -147,7 +188,12 @@ an `nsc` row is routinely carried for a namespace with no entry at all, outside 
 **Fix:** say the per-entry figure is an over-estimate PER ENTRY and stop quantifying over what the sum
 covers. The recurring shape here is a sentence claiming what something "is all of".
 
-### D8 — the registry row's line-cap justification invokes a worst case that exceeds the cap {#d8-line-cap-justification}
+### D8 — RESOLVED: the registry row's line-cap justification invokes a worst case that exceeds the cap {#d8-line-cap-justification}
+
+**RESOLVED 2026-07-30 (batched pass).** Verified against `CasRefCatalogFormat.cpp`'s `checkLineBytes`
+that what shipped is a byte-count refusal (`LIMIT_EXCEEDED`), not a change to the arithmetic — the
+worst case genuinely still exceeds 4 KiB. Rewrote `CasFormat.cpp`'s comment to describe that: an
+over-4-KiB entry is refused at encode time, not impossible.
 
 From the same review (Minor 11, PROSE/IMPRECISE). `CasFormat.cpp`: "the line cap is tight (4 KiB)
 because one entry's record is small and bounded by `kMaxNamespaceBytes`". The record is bounded by
@@ -156,7 +202,11 @@ because one entry's record is small and bounded by `kMaxNamespaceBytes`". The re
 EXCEEDS it. Fix once the code fix for that overflow has landed, so the sentence describes the shipped
 behaviour.
 
-### D9 — `foldSealFixedBytes`'s doc omits the meta line and calls a floor a constant {#d9-fold-seal-fixed-bytes-doc}
+### D9 — RESOLVED: `foldSealFixedBytes`'s doc omits the meta line and calls a floor a constant {#d9-fold-seal-fixed-bytes-doc}
+
+**RESOLVED 2026-07-30 (batched pass).** Verified `encodeFoldSeal` writes a meta line (`g`/`pg`) between
+header and trailer. Rewrote `CasRefCatalogFormat.h`'s doc for `foldSealFixedBytes` to name the meta
+line and to call the value a floor (measured at `generation = 0`/`n = 0`), not a constant.
 
 From the same review (Minor 12, PROSE/IMPRECISE). The doc says "header + trailer, zero entries", but
 `encodeFoldSeal` writes a **meta** line between them (`g`/`pg`) which the measured value correctly
@@ -164,7 +214,13 @@ includes. Also: the value is measured at `generation = 0` / `n = 0`, so it is a 
 a real seal's decimal widths add tens of bytes. Harmless (floor division leaves up to one whole
 reservation of slack), but "fixed" hides that it is a floor. Fix both in one clause.
 
-### D10 — "predicate (2) equality" overstates what the test asserts {#d10-predicate-2-equality-wording}
+### D10 — PARTIALLY RESOLVED: "predicate (2) equality" overstates what the test asserts {#d10-predicate-2-equality-wording}
+
+**PARTIALLY RESOLVED 2026-07-30 (batched pass).** Rewrote `task-2-report.md`'s Tests bullet to say
+"exact-entry-count boundary" instead of the ambiguous "equality/`+1-entry` boundary", and to spell out
+that this coincides with byte equality only when `cap - fixed` divides evenly — that part is report
+text, in scope. The test NAME `Predicate2AcceptsEqualityRefusesOneEntryOver` is still imprecise but
+renaming it is a code change, out of scope for this policy; left as-is and flagged in the pass report.
 
 From the same review (Minor 13, PROSE/IMPRECISE). `Predicate2AcceptsEqualityRefusesOneEntryOver` and
 the report's Tests bullet describe BYTE equality; the test asserts the last admissible ENTRY COUNT,
@@ -188,7 +244,14 @@ three, the review corrected it to four, the fix made it three again — and the 
 plan step written to prevent exactly that. The lesson is not "count more carefully", it is **do not carry
 a count that something else can change**; that step now states none and tells its reader to derive it.
 
-### D12 — "never reaches the object store" is false; the real reason is non-comparability {#d12-fence-generation-reason}
+### D12 — STALE, already fixed: "never reaches the object store" is false; the real reason is non-comparability {#d12-fence-generation-reason}
+
+**STALE-NO-OP 2026-07-30 (batched pass).** Grepped the tree for the exact phrase "never reaches the
+object store" — zero hits. All three sites this entry could refer to (`CasRefCatalog.h`,
+`CasServerRoot.h`, `CasServerRoot.cpp`) already state the non-comparability reason accurately (the
+persisted `fence_generation` is a process-local counter that restarts at zero, not incomparable
+because it never reaches the store). Fixed by an earlier round without this entry being closed; no
+further edit made.
 
 From the same review (P2, PROSE/Important). A comment justifies not using `CreatorFence.fence_generation`
 for cross-process terminality on the ground that it "never reaches the object store". It DOES — Task 2
@@ -197,18 +260,32 @@ a `std::atomic<uint64_t>` local to `CasMountRuntime`, so another process's count
 counts its own bumps: a persisted process-local counter is **not comparable** across processes. Say that
 instead.
 
-### D13 — `probeNonTerminalMountSlots` is the precedent for one of the two conservative cases, not both {#d13-precedent-scope}
+### D13 — RESOLVED: `probeNonTerminalMountSlots` is the precedent for one of the two conservative cases, not both {#d13-precedent-scope}
+
+**RESOLVED 2026-07-30 (batched pass).** Verified against `probeNonTerminalMountSlots`'s own body
+(`CasServerRoot.cpp`): an absent slot is treated as "nothing to hold" (not conservative), an
+undecodable body is pushed as held (conservative). Moved the `probeNonTerminalMountSlots` citation in
+`CasServerRoot.h`'s `isCreatorFenceTerminal` doc to sit only beside the undecodable-body case.
 
 From the same review (P3, PROSE/Minor). The comment cites it for both; it supports one. Narrow the
 citation to the case it actually covers.
 
-### D14 — "nothing is lost by removing it" reasons about the wrong thing {#d14-nothing-lost-scope}
+### D14 — RESOLVED: "nothing is lost by removing it" reasons about the wrong thing {#d14-nothing-lost-scope}
+
+**RESOLVED 2026-07-30 (batched pass).** Deleted the clause in `CasRefLedger.cpp`'s
+`cleanupOrphanedBirthCkptBestEffort` comment — the surrounding paragraph's safety argument does not
+depend on it, so nothing is lost by the deletion either.
 
 From the same review (P4, PROSE/Minor). The sentence argues about the NEXT birth, while the obligation it
 needs to discharge is about the recovery that must still ground the namespace. Rewrite it to address the
 recovery, or delete it — the deletion loses nothing, since the surrounding argument does not depend on it.
 
-### D15 — the committed header never says the production path is ungated {#d15-production-gap-undisclosed}
+### D15 — STALE, already fixed: the committed header never says the production path is ungated {#d15-production-gap-undisclosed}
+
+**STALE-NO-OP 2026-07-30 (batched pass).** `CasRefCatalog.h`'s `checkPublicationAdmittedOrThrow` doc
+already carries a "NOT YET ENFORCED ON THE PRODUCTION REF-WRITE PATH" paragraph naming exactly what is
+not gated and where the gap closes (Task 4). Fixed by an earlier round without this entry being closed;
+no further edit made.
 
 From the same review (P5, PROSE/Minor). Task 3 enforces "`Creating` forbids publication" at the catalog
 level ONLY, by explicit ruling — production-path wiring is Task 4's step. That is not a defect, but the
