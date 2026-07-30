@@ -1162,6 +1162,24 @@ the KEY/prefix helpers that ADDRESS ONE LIFE, so it must not (and does not) forb
 - [ ] **Step 2:** → FAIL. **Step 3:** Implement. **Step 4:** CA gate + lanes green.
 - [ ] **Step 5: Commit** `ca: ref — removal lifecycle: fenced terminal, immediate entry delete, deposited-incarnation cleanup`.
 
+**TWO MORE OBLIGATIONS, from the increment review's Critical A (placed 2026-07-30).** Task 4-C established
+that same-epoch rebirth is not merely unlikely but **impossible today**: `CasRefCatalog` has no
+entry-deletion primitive at all, and `createNamespace`'s own doc assigns recreating an existing name to this
+task. So A's precondition arrives WITH this task, and its two halves land here rather than being written
+against a state that cannot yet be constructed.
+
+- [ ] **Make the persisted fold cursor incarnation-scoped.** `cursorKey`/`parseCursorKey`
+  (`Gc/CasGcShardPlan.h`) key progress by namespace and shard only, and `CasFoldSeal::per_ns_shard`
+  documents the identity as `"ns/shard"`, while Stage B made catalog entries and ref keys life-scoped. The
+  moment this task can delete an entry, a recreated namespace inherits its predecessor's cursor and the fold
+  starts past its own logs, **permanently omitting the new life's first N owner edges** — whose live blobs are
+  then condemnable once destruction is enabled. Note what does NOT repair it: filtering discovered ref
+  objects by the current life is too late, because the skipped sequence boundary is inherited before those
+  objects are read.
+- [ ] **Add the same-epoch rebirth regression test** — a new incarnation reusing low sequence numbers within
+  one writer epoch, asserting it folds from its own beginning. This is the test the increment review asked
+  for and that could not be written before this task, because nothing could remove a namespace.
+
 **OBLIGATION CARRIED FROM TASK 4-C (placed 2026-07-30, and it gates Task 7b).** 4-C closed R11b by making
 an un-cataloged namespace an ANOMALY. That was my ruling and it is right — but the discrimination I also
 ruled for could not be built there, so as shipped **the anomaly fires on ordinary removal too**, because

@@ -3149,3 +3149,34 @@ failed today because they lived only in comments. The two that were converted �
 from `kFsckHardFindings` with a `static_assert` in three TUs, and the suite-list generator deriving from
 sources and failing on any unclaimed suite — both held immediately. Every remaining "whenever X, also do Y"
 comment in this subsystem is a candidate.
+
+## A GC-level backstop for never-born `_ckpt` debris — and Task 3's closure of it was unsound {#ckpt-neverborn-gc-backstop}
+
+Filed 2026-07-30 when Task 4-C removed all three `cleanupOrphanedBirthCkptBestEffort` call sites. **This
+reopens `{#ckpt-failed-birth-debris}`, whose CLOSED marker from Task 3 must not be trusted** — the closure
+shipped a delete whose safety argument contradicted its own trigger conditions.
+
+**Why the delete had to go, not be guarded.** All three call sites sit inside the `CORRUPTED_DATA` path,
+which by `putIfAbsentControlled`'s own doc means *a different object already occupies this transaction's
+derived key*. So every trigger condition **proves the ref-log is non-empty at that key**, while the comment
+justifying the delete rests on "reachable only while the namespace's ref-log has never durably held
+anything". Contradictory, and contradictory on every branch that calls it — not in a corner case. A
+successor that observed the seal and adopted the live incarnation could have its current `_ckpt` deleted, and
+`_ckpt` has no repair path.
+
+Binding the delete to a token captured at publish time does **not** fix it either: a successor that only
+READ `_ckpt` leaves the token matching, so the delete still succeeds against a record that successor's
+recovery already leaned on. And a partial guard standing beside a removed operation reads as a licence to
+reinstate it, which is the shape that has already cost this campaign a "fix" that made a correct change look
+like a regression.
+
+**The trade, stated as a trade.** We exchanged *may delete a live successor's `_ckpt`, unrecoverable* for
+*debris survives until a backstop exists, operator-visible*. The cost is real: permanent debris makes a
+drained server root REFUSE decommission (`claimOwnerOrThrow` → `CORRUPTED_DATA`), which is exactly what the
+original entry described. Accepted, because a fallback path must never take a destructive action — skip it
+and surface the problem.
+
+**What the backstop must do**, mirroring the existing REMOVED-namespace `_ckpt` backstop in `CasGc.cpp`:
+reclaim a never-born namespace's `_ckpt` only after **independently re-verifying emptiness with a real
+LIST**, never by inferring it from one attempt's own conflict. That independence is the entire difference
+between the backstop and the thing that was removed.
