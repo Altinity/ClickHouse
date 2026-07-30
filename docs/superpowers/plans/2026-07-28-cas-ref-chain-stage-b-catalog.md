@@ -287,6 +287,23 @@ empirically: 1567/243 + 8 (new `CasRefNamespaceId` suite) + 2 (fix-round tests) 
 on top of it (see below), and the redo then gets the `RefNamespaceId` key API for free instead of
 re-extracting against `refLogKey(ns, id)` and making Task 1c migrate the same keys twice.
 
+### ✅ Task 1b REDO COMPLETE 2026-07-30 {#task-1b-redo-done}
+
+Four commits on `cas-gc-rebuild`: `3e228272dd3` (equivalence fences, goldens authored BEFORE the
+extraction — verified structurally, not on the report's word), `8d536022eab` (the extraction, the
+birth-`_ckpt`/seal reorder, the pure TU), `ec3a73656ea` and `eeb194af24b` (prose). Gate **1585 tests /
+245 suites**, all passed; build and style clean. Reviewed twice with **zero defects found in the code
+or the tests** both times; the five rounds it did cost were entirely about comment prose, and the loop
+was ended by DELETING sentences rather than rewriting them — every false claim across those rounds was
+an attribution to a location the author was not reading at the time. Two behavioural deltas are
+disclosed in-source: the reorder (a seal refusal now lands before the birth `_ckpt` is durable) and the
+fault-class narrowing (an allocation failure in the moved statements now takes the same handler an
+apply failure already took, with the tenure continuing). The fault-class delta is deliberately NOT
+pinned by a test: both of its endpoints are already pinned, only the routing of a hypothetical OOM at
+two statements is not, and the cheap seam would have fired at the extraction BOUNDARY where the
+existing catch already covers the callee — so it could not have witnessed the delta at all. That trade
+holds only while the disclosure is true, which is why its factual errors were fixed as Important.
+
 ### DECISION 2026-07-30 — Task 1b is REDONE on top of the restatement, NOT merged {#task-1b-redo}
 
 The lane restatement (`bb4dd513118`) landed on `cas-gc-rebuild` after Task 1b was built in `lane-g`,
