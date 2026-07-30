@@ -141,6 +141,21 @@ says so, so reviewers still report prose findings and grade them, but nothing wa
 The reason is in that file: Task 1c spent three consecutive rounds on comment accuracy with zero
 defects in code or tests, and each round wrote the next round's finding.
 
+**MANDATORY REVIEW TRIGGER — the sanitizer-lane abort class.** A throw-expectation on a
+`LOGICAL_ERROR` site outside `#ifndef DEBUG_OR_SANITIZER_BUILD` is a **review defect**, not a style
+nit: constructing a `LOGICAL_ERROR` exception ABORTS under `DEBUG_OR_SANITIZER_BUILD`
+(`Exception.cpp`, `handle_error_code`), so the test cannot pass there — and the abort HIDES every
+test after it in the binary. Five recurrences in one week (`CasWiring`, `PartFolderAccess` twice,
+`DenyGuard`, then `CasRefNamespaceId.ZeroIncarnationIsUnconstructible` on sha `6fa8a0c9316`).
+
+Every review of a diff that adds or moves a test runs:
+`grep -nE "EXPECT_(ANY_)?THROW|expectThrowsCode\(.*LOGICAL_ERROR"` over the touched test files, and
+checks each hit against its throw site's ACTUAL error code — `CORRUPTED_DATA` expectations are fine.
+And when one test in a file is split, **the whole file gets swept**, because the abort means a second
+offender would have been invisible behind the first. The fix is a death-test split that keeps the
+`Cas` prefix (the gate filter is `Cas*:CA*`) and is verified on BOTH a sanitizer build and a release
+build — the `#else` arm is where a wrong `EXPECT_DEATH` matcher hides.
+
 **Classify before filing.** Of the six minors deferred from Task 1c's review, only three were prose;
 the rest were executing defects and are now steps of Task 7. A finding can also be filed as wording
 while its body names a consequence — split those, and send the behaviour to `BACKLOG.md`.
@@ -749,6 +764,17 @@ in `gtest_cas_ns_creation_lifecycle.cpp`.
 - [ ] **Step 2:** → FAIL. **Step 3:** Implement. **Step 4:** CA gate green.
 - [ ] **Step 5: Commit** `ca: ref — namespace creation lifecycle; token-exact reconciliation; three-site recheck`.
 
+**Carried from the Task 2 review — the fence seam is real but undocumented.** The brief listed
+"Stage A's `publishCkpt`/fence discipline" as consumed, and `publishCkpt` re-checks the fence after the
+read and before every CAS. `casUpdateImpl` has NO fence hook in its signature. The seam does exist — a
+caller can throw from inside `mutate`, which runs after each fresh read and before each `casPut` — but
+nothing obliges a caller to use it and nothing says it is there.
+
+- [ ] **State the fence obligation explicitly** where a catalog caller can see it: that `mutate` is the
+  fence re-check point, that it runs after every fresh read, and that a fenced caller MUST throw from
+  it rather than checking once before the call. A caller that fences before `casUpdate` and not inside
+  `mutate` is fenced against the read it never sees.
+
 ### Task 4: Re-key under `<ns>/<inc>/`; universe from catalog; format bump B {#task-4}
 
 **TWO ITEMS PLACED HERE BY THE PLACEMENT SWEEP (2026-07-30), both previously unplaced:**
@@ -988,8 +1014,8 @@ the KEY/prefix helpers that ADDRESS ONE LIFE, so it must not (and does not) forb
 **Interfaces:**
 - Consumes: Tasks 2-4b; Stage A holds (a `Removing` namespace can hold like any other).
 - Produces (§3 verbatim, plus the amendment's cleanup half):
-  - Removal = catalog `Live → Removing` CAS (the admission bound frees immediately;
-    `Removing` forbids NEW positive ownership), then the terminal record appended ONLY by the
+  - Removal = catalog `Live → Removing` CAS (the admission bound does NOT free here — see the
+    correction below; `Removing` forbids NEW positive ownership), then the terminal record appended ONLY by the
     owning mounted writer or a successor that claimed and fenced that server root; GC surfaces
     stuck removals (a durable counter + log per round observing a terminal-less `Removing`),
     NEVER appends.
@@ -1046,6 +1072,30 @@ the KEY/prefix helpers that ADDRESS ONE LIFE, so it must not (and does not) forb
   delete, remount the owning writer, the entry is removed and no `_ckpt` is re-created.
 - [ ] **Step 2:** → FAIL. **Step 3:** Implement. **Step 4:** CA gate + lanes green.
 - [ ] **Step 5: Commit** `ca: ref — removal lifecycle: fenced terminal, immediate entry delete, deposited-incarnation cleanup`.
+
+**Two rulings from the Task 2 review, settled here so Task 5 does not re-derive them.**
+
+- [ ] **CORRECTION — the admission bound does not free at `Live → Removing`.** The sentence above
+  originally said it frees immediately. As implemented, `checkFoldSealReservation` counts the
+  candidate's entries, so the bound frees only when the ENTRY IS DELETED — which this task does LAST.
+  Counting `Removing` entries is the SAFE choice, because a `Removing` namespace still occupies `cov`
+  and `nsc` rows, so the predicate is right and the sentence was wrong. **Do not write a test against
+  "frees immediately"** — it will fail, and it would be testing the retracted claim.
+- [ ] **DECIDE: what index set predicate (2)'s reservation is charged over.** Task 2's formula is the
+  brief's and Task 2 is conformant, but the review established that Σ over catalog entries does not
+  cover the fold seal's actual rows: `ns_cleanup_items` is keyed `{ns, remove_txn_id}` and retires
+  only once a later round observes its completion artifacts — with retirement skipped entirely on a
+  ref-folding abort — so a namespace removed, recreated and removed again carries TWO `nsc` rows; and
+  because this task deletes the entry last, an `nsc` row is routinely carried for a namespace with no
+  catalog entry at all, i.e. outside the sum's index set. `btr` (per run segment) and `cnd` (per
+  gc-shard) rows are charged neither in `fixed` (measured on a default-constructed seal, where both
+  maps are empty) nor per entry.
+  **The asymmetry that decides it:** over-charging costs admitted namespaces; under-charging wedges
+  the fold round, because `checkFoldSealObjectBytes` then refuses the seal on EVERY attempt. So
+  choose the over-covering formula, and pin it with a test that builds the worst case this task's own
+  lifecycle can actually produce — a namespace with two `nsc` rows and no entry. This is the task
+  where that worst case becomes constructible, which is why the decision sits here rather than in
+  Task 2.
 
 ### Task 5b: `chooseRecoveryGrounding` — recovery becomes LIST-independent {#task-5b}
 

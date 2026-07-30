@@ -128,3 +128,47 @@ the `exit_code != 0` gate AND `stale_edge_verdict`.
 can never be reclaimed.
 
 **Fix:** drop "summary" so the caveat covers both modes, and name `stale_edge` as the reason.
+
+### D7 — `worstCaseEntryFoldReservationBytes`'s doc claims a coverage the sum does not have {#d7-reservation-doc-coverage}
+
+From the Task 2 review (Important 6, PROSE/FALSE). **The arithmetic is brief-prescribed and Task 2 is
+conformant — only the sentence is wrong.** The substantive gap is a decision, placed as a step of plan
+Task 5, so do NOT try to fix the formula here.
+
+**The false claim:** the reservation covers "the two rows one namespace can simultaneously occupy".
+
+**The verified truth:** a namespace can occupy more, and rows outlive the entry that reserved them.
+`ns_cleanup_items` is keyed `{ns, remove_txn_id}` and retires only once a later round observes its
+completion artifacts — retirement skipped entirely on a ref-folding abort — so a namespace removed,
+recreated and removed again carries TWO `nsc` rows. And because removal deletes the catalog entry LAST,
+an `nsc` row is routinely carried for a namespace with no entry at all, outside the sum's index set.
+`btr` (per run segment) and `cnd` (per gc-shard) rows are charged neither in `fixed` nor per entry.
+
+**Fix:** say the per-entry figure is an over-estimate PER ENTRY and stop quantifying over what the sum
+covers. The recurring shape here is a sentence claiming what something "is all of".
+
+### D8 — the registry row's line-cap justification invokes a worst case that exceeds the cap {#d8-line-cap-justification}
+
+From the same review (Minor 11, PROSE/IMPRECISE). `CasFormat.cpp`: "the line cap is tight (4 KiB)
+because one entry's record is small and bounded by `kMaxNamespaceBytes`". The record is bounded by
+`kMaxNamespaceBytes` times the 6-byte worst-case escape (3072 bytes) plus the unmentioned 255-byte
+`server_root_id` (another 1530 escaped) — so the worst case the sentence invokes to justify the cap
+EXCEEDS it. Fix once the code fix for that overflow has landed, so the sentence describes the shipped
+behaviour.
+
+### D9 — `foldSealFixedBytes`'s doc omits the meta line and calls a floor a constant {#d9-fold-seal-fixed-bytes-doc}
+
+From the same review (Minor 12, PROSE/IMPRECISE). The doc says "header + trailer, zero entries", but
+`encodeFoldSeal` writes a **meta** line between them (`g`/`pg`) which the measured value correctly
+includes. Also: the value is measured at `generation = 0` / `n = 0`, so it is a FLOOR, not a constant —
+a real seal's decimal widths add tens of bytes. Harmless (floor division leaves up to one whole
+reservation of slack), but "fixed" hides that it is a floor. Fix both in one clause.
+
+### D10 — "predicate (2) equality" overstates what the test asserts {#d10-predicate-2-equality-wording}
+
+From the same review (Minor 13, PROSE/IMPRECISE). `Predicate2AcceptsEqualityRefusesOneEntryOver` and
+the report's Tests bullet describe BYTE equality; the test asserts the last admissible ENTRY COUNT,
+which coincides with byte equality only when `cap - fixed` divides by the reservation. The report's
+Design-decisions paragraph states it correctly, so the imprecision is in the summary line and the test
+NAME. No substantive gap — equality semantics live in the shared `fitsObjectCap`, which predicate (1)
+does test at exact equality.
