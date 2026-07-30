@@ -46,6 +46,30 @@ soak's purpose is the honest baseline those optimizations will later be measured
 
 ## Global Constraints {#global-constraints}
 
+**COMMENT POLICY (user, 2026-07-31) — binds every task below, and one measured baseline to beat.**
+
+The goal is code readable and understandable **without** comments: a comment never substitutes for a clear
+name, a tight interface, or a type that makes the wrong thing unrepresentable. When something needs a long
+explanation to be safe to touch, the code is what changes.
+
+- **No comment may cite a plan, spec, BACKLOG entry, review round, finding ID or task number.** Those
+  artefacts are branch-local and get deleted; a citation to one becomes a pointer no reader can resolve.
+  **The REASON is durable, the provenance is not — keep the reason, drop the citation.**
+- **Comments must** give the reason for a non-obvious decision, explain a complex algorithm or a non-local
+  invariant the code cannot state itself, and document modules and interfaces in **headers** so code
+  intelligence surfaces the contract at the call site.
+- **Keep them short.** Long prose desynchronises from code faster than short prose.
+- **A rule that becomes an executing check deletes the rule's prose.** Otherwise the mechanism is paid for
+  and the refund never collected — which is what happened when `FsckReport::clean` became a `static_assert`
+  and the paragraph explaining the old rule stayed.
+
+**Baseline measured 2026-07-31, so progress is checkable rather than asserted:** the CAS subsystem is 50169
+lines with **16919 comment lines (33%)**; the longest contiguous comment blocks are **83, 65, 63, 61, 57**;
+and there are roughly **850 branch-local references** in code comments (`Task N` ~490, `spec §` ~293, plus
+`R1x`, `docs/superpowers`, `BACKLOG`, `review C3`, `codex finding`). Every task that opens a file applies the
+policy to what it touches; the subsystem-wide sweep is Task 14.
+
+
 Constraints 1-11 of the Stage A plan
 (`2026-07-28-cas-ref-chain-stage-a-streams.md {#global-constraints}`) apply VERBATIM to every
 task here. Additional Stage-B constraints:
@@ -2265,3 +2289,22 @@ Why after 12 rather than sooner:
   the install regions, and the fold's phase pipeline are three separate concerns sharing one translation unit.
 - [ ] After the move, re-run the goldens unchanged. A golden that had to be edited to pass is evidence the
   extraction changed behaviour, not evidence the extraction succeeded.
+
+### Task 14 (before upstreaming): strip every branch-local reference from the code {#task-14}
+
+Nothing in this plan owned this, and it must happen before any of this work goes upstream: `docs/superpowers/**`
+— plans, BACKLOG, register, reports — is branch-local and gets deleted, so every comment citing it becomes a
+dangling pointer. Measured baseline: roughly **850** such references.
+
+- [ ] **Strip the provenance, keep the reason.** For each reference, the comment either already states the
+  reason it cites — delete the citation — or it does not, in which case write the reason and then delete the
+  citation. A comment reduced to "per review C3" with no reason is a comment with nothing to keep.
+- [ ] **Enumerate the coordination markers separately, because they are legitimate NOW and must go LAST.**
+  `STAGE-A RETURN ITEM`, "this task edits exactly this line" and their kin exist to couple branch work; they
+  are deliberate and greppable. List them, confirm each one's owning task has run, then remove them. A marker
+  outliving its task is worse than none.
+- [ ] **Triage the long blocks** (83, 65, 63, 61, 57 lines and down): each becomes structure, shrinks to the
+  reason alone, or goes. A header block is the one place length is sometimes right — it documents the interface
+  for code intelligence — but an essay is still not a contract.
+- [ ] **Re-measure and record: comment share, longest block, remaining references.** The policy is checkable;
+  leave the numbers where the next reader can compare.
