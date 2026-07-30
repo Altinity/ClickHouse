@@ -92,6 +92,32 @@ namespace
 /// `openPoolFenceControlled`), never by racing the wall clock.
 constexpr uint64_t kSingleAttemptDeadlineMs = 5000;
 
+/// A `CasEvent` sink safe to hand to `Pool::setEventSink`: the emit runs on whatever thread the pool's
+/// background syncer happens to be on, and the test reads the accumulated events afterward from the
+/// main test thread with no other ordering between the two -- a bare `std::vector` there is a real data
+/// race (the class this file's four `setEventSink` call sites all had, hidden because a debug/ASan build
+/// doesn't reliably catch an unsynchronized push_back/iterator-read pair on a small vector). `add` takes
+/// the lock only around the push; `snapshot` copies out under the lock and returns, so a caller iterating
+/// the result never holds the mutex across anything that could call back into the pool (which an
+/// event-sink callback legitimately can, on other seams in this file).
+class SynchronizedEventLog
+{
+public:
+    void add(const CasEvent & e)
+    {
+        std::lock_guard lock(mutex);
+        events.push_back(e);
+    }
+    std::vector<CasEvent> snapshot() const
+    {
+        std::lock_guard lock(mutex);
+        return events;
+    }
+private:
+    mutable std::mutex mutex;
+    std::vector<CasEvent> events;
+};
+
 PoolPtr openPool(const BackendPtr & backend, CasRequestBudget budget = {})
 {
     /// Recovery tests seed ref-log/snapshot residue before opening; a pool with such residue always has a
@@ -1072,14 +1098,14 @@ TEST(CasAnomalyPolicy, ForeignBytesAtWedgeKeyTripFenceAndRemount)
     budget.lease_safety_margin_ms = 100;
 
     auto backend = std::make_shared<RefWriterTestBackend>();
-    std::vector<CasEvent> seen;   /// declared BEFORE the Pool so it outlives the background syncer's emits (ASan 2026-07-09)
+    SynchronizedEventLog seen;   /// declared BEFORE the Pool so it outlives the background syncer's emits (ASan 2026-07-09)
     auto store = openPool(backend, budget);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/anomaly_wedge"};
     publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "y");
 
-    store->setEventSink([&](const CasEvent & e) { seen.push_back(e); });
+    store->setEventSink([&](const CasEvent & e) { seen.add(e); });
 
     /// Wedge the lane with an ambiguous PUT that never landed.
     backend->fault_key_substr = layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
@@ -1112,7 +1138,8 @@ TEST(CasAnomalyPolicy, ForeignBytesAtWedgeKeyTripFenceAndRemount)
     EXPECT_EQ(store->scheduleRemountCallCountForTest(), 1u)
         << "reportImpossibleInterference must have called scheduleRemount exactly once";
 
-    const auto has_event = std::any_of(seen.begin(), seen.end(),
+    const std::vector<CasEvent> observed = seen.snapshot();
+    const auto has_event = std::any_of(observed.begin(), observed.end(),
         [](const CasEvent & e) { return e.type == CasEventType::ForeignInterference; });
     EXPECT_TRUE(has_event) << "a ForeignInterference CasEvent must be audited";
 }
@@ -1123,13 +1150,13 @@ TEST(CasAnomalyPolicy, ForeignBytesAtWedgeKeyTripFenceAndRemount)
 TEST(CasAnomalyPolicy, NonReadyAtNewIdAllocationFaultsAndFailsClosed)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
-    std::vector<CasEvent> seen;   /// declared BEFORE the Pool so it outlives the background syncer's emits (ASan 2026-07-09)
+    SynchronizedEventLog seen;   /// declared BEFORE the Pool so it outlives the background syncer's emits (ASan 2026-07-09)
     auto store = openPool(backend);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/wedge_contract"};
     publishEmptyPart(store, ns, "x");
 
-    store->setEventSink([&](const CasEvent & e) { seen.push_back(e); });
+    store->setEventSink([&](const CasEvent & e) { seen.add(e); });
 
     store->setRefPreCarveHookForTest([&]
     {
@@ -1177,7 +1204,8 @@ TEST(CasAnomalyPolicy, NonReadyAtNewIdAllocationFaultsAndFailsClosed)
     EXPECT_EQ(store->scheduleRemountCallCountForTest(), 1u)
         << "reportImpossibleInterference must have called scheduleRemount exactly once";
 
-    const auto has_event = std::any_of(seen.begin(), seen.end(),
+    const std::vector<CasEvent> observed = seen.snapshot();
+    const auto has_event = std::any_of(observed.begin(), observed.end(),
         [](const CasEvent & e) { return e.type == CasEventType::ForeignInterference; });
     EXPECT_TRUE(has_event) << "a ForeignInterference CasEvent must be audited";
 }
@@ -2097,10 +2125,10 @@ TEST(RefWriterStalePrecommitSweep, FailedSweepRearmsAndRetriesUntilClean)
     config.cas_request_budget = budget;
     config.mount_lease_ttl_ms = std::chrono::milliseconds(10'000'000);
     config.boot_ms_fn = fake_clock;
-    std::vector<CasEvent> seen;   /// declared BEFORE the Pool so it outlives the background syncer's emits (ASan 2026-07-09)
+    SynchronizedEventLog seen;   /// declared BEFORE the Pool so it outlives the background syncer's emits (ASan 2026-07-09)
     auto successor = openPoolWithConfig(backend, config);
 
-    successor->setEventSink([&](const CasEvent & e) { seen.push_back(e); });
+    successor->setEventSink([&](const CasEvent & e) { seen.add(e); });
 
     backend->fault_key_substr = layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
     /// The successor's own recovery runs first and mints one in-band seal for the predecessor's now-dead
@@ -2149,7 +2177,7 @@ TEST(RefWriterStalePrecommitSweep, FailedSweepRearmsAndRetriesUntilClean)
     /// Audit (INTROSPECTION-1): exactly ONE `precommit_reclaim` event per reclaimed stale binding --
     /// this is what makes the S13 card's "abandoned precommits reclaimed" counter falsifiable.
     std::vector<String> reclaimed_refs;
-    for (const CasEvent & e : seen)
+    for (const CasEvent & e : seen.snapshot())
         if (e.type == CasEventType::PrecommitReclaim)
             reclaimed_refs.push_back(e.ref_name);
     std::sort(reclaimed_refs.begin(), reclaimed_refs.end());
@@ -2171,9 +2199,9 @@ TEST(RefWriterStalePrecommitSweep, VerifiedCleanSweepClearsFlagWithoutEvents)
         publishEmptyPart(predecessor, ns, "committed_x");   /// committed work only; nothing dangles
     }
 
-    std::vector<CasEvent> seen;   /// declared BEFORE the Pool so it outlives the background syncer's emits (ASan 2026-07-09)
+    SynchronizedEventLog seen;   /// declared BEFORE the Pool so it outlives the background syncer's emits (ASan 2026-07-09)
     auto successor = openPool(backend);
-    successor->setEventSink([&](const CasEvent & e) { seen.push_back(e); });
+    successor->setEventSink([&](const CasEvent & e) { seen.add(e); });
 
     const uint64_t deferred_before = ProfileEvents::global_counters[ProfileEvents::CasRefSweepDeferred].load();
     const uint64_t reclaimed_before = global_counters[ProfileEvents::CasRefStalePrecommitsReclaimed].load();
@@ -2182,7 +2210,8 @@ TEST(RefWriterStalePrecommitSweep, VerifiedCleanSweepClearsFlagWithoutEvents)
         << "a clean first pass IS the verified-clean sweep: the flag clears without any removal";
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasRefSweepDeferred].load(), deferred_before);
     EXPECT_EQ(global_counters[ProfileEvents::CasRefStalePrecommitsReclaimed].load(), reclaimed_before);
-    EXPECT_EQ(std::count_if(seen.begin(), seen.end(),
+    const std::vector<CasEvent> observed = seen.snapshot();
+    EXPECT_EQ(std::count_if(observed.begin(), observed.end(),
         [](const CasEvent & e) { return e.type == CasEventType::PrecommitReclaim; }), 0);
 }
 
