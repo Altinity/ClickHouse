@@ -2978,3 +2978,32 @@ cannot express "zero namespaces" because they cannot express "N namespaces" eith
 to "did we model this?" — for R11 the vacuous-empty class was not merely untested, it was **inexpressible**,
 and the gate model part 1 must build will need a namespace SET that none of the existing catalog or ref
 models has.
+
+## RULE: a reachable and handled state must not be `chassert`ed {#rule-no-chassert-over-handled-branch}
+
+From a sanitizer run on 2026-07-30 that failed `CasAnomalyPolicy.NonReadyAtNewIdAllocationFaultsAndFailsClosed`
+three times for two different reasons. Recorded as a rule rather than a bug because it is the second face of
+a confusion we have already been bitten by.
+
+`CasRefLedger.cpp` carried `chassert(lane_state == RefLaneState::Ready)` four lines above
+`if (lane_state != RefLaneState::Ready) { fault the lane; anomaly policy; CORRUPTED_DATA }`, whose own
+comment says that any other state "is an internal lifecycle violation … make that contradiction an explicit
+`Faulted` state and route it through the anomaly policy". So the handling IS the design — and the assert
+above it means that on debug and sanitizer builds **the entire fail-close path is dead code**, while the
+process aborts on precisely the contradiction the path exists to contain. On release the assert compiles out
+and the path works, so the two build families disagree about whether the code exists.
+
+**The rule: if the code below handles the state, do not assert it above. The handling is the assertion.**
+
+**This is the INVERSE of the rule we already had** — `{#review-blindspots}`'s "a `chassert` is not a
+release fail-close" — and both come from the same confusion about what a `chassert` is for. Together:
+- a `chassert` cannot be the fail-close, because release does not have it;
+- and a `chassert` must not sit over a fail-close, because sanitizers then do not have the fail-close.
+A state is either impossible (assert it, handle nothing) or possible (handle it, assert nothing). There is
+no third option, and picking both is how a branch comes to exist in only half the builds.
+
+**The same run also caught a real race, and its scope was wider than reported.** The test's event sink
+pushed into a bare `std::vector<CasEvent>` while being called from background threads. The report named two
+sites; there are three, and **all three carry the same comment about outliving "the background syncer's
+emits"** — so every one of them knew the sink runs on other threads and none synchronised. When a hazard
+comment is copied along with the code, the copies inherit the hazard and not the fix.
