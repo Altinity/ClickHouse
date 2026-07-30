@@ -2944,3 +2944,37 @@ manual TLC invocation, touch one config concurrently.
 per run — derive the metadir from the same value). It is a one-line change per runner, but it is a
 sweep across all of them plus a convention note in `models/README.md`, so it wants its own task rather
 than riding along with a model change.
+
+## Empty-set survey: one violation I reproduced but could not explain, and one clean refusal {#empty-set-survey-residues}
+
+From Task 10f part 2 (the empty-entity-set survey, `docs/superpowers/models/2026-07-30-empty-set-survey.md`
+on `cas-gc-rebuild-t10`). Of ~26 models: about twelve green, **eleven have no entity-set constant at all**,
+one TLC error, one violation.
+
+**The clean refusal — `CaBuildRootPrecommit` with `Trees = {}`:** `Error: Assumption line 108 ... is false`.
+The spec explicitly ASSUMES non-emptiness. That is the ideal outcome: the model says out loud that it does
+not model this case, instead of quietly answering as though it did.
+
+**The violation I could not explain — `CaRefWriterCleanupCore` with `Builds = {}`.** Temporal property
+`StalePrecommitEventuallyGone == StaleExists ~> NoStale` reported violated, counter-example
+`Init → Fence → RemoveNamespace → Stuttering`. **Reproduced independently by me**, twice, so it is not the
+static-metadir false red.
+
+But the analysis says it cannot be a genuine violation: the dumped counter-example shows every
+build-indexed variable empty (`<< >>`) in **every** state, so `StaleExists` (`\E b \in Builds`) is FALSE
+throughout and `NoStale` (`\A b \in Builds`) is TRUE throughout — and `FALSE ~> TRUE` is trivially true.
+**I did not identify the mechanism**, and I am recording that rather than guessing one; the likeliest place
+to look is how `Spec`'s fairness composes when every fair action is permanently disabled.
+
+**Why this matters more than the one model.** Whoever adds empty-set configs as a convention (Task 10f
+part 1) will meet artifacts of exactly this shape, and **an artifact indistinguishable from a bug is worse
+than an untested case** — it trains the reader to dismiss reds. So part 1 owes a rule for telling the two
+apart, and `CaBuildRootPrecommit`'s explicit `ASSUME` is the model to copy: a spec that does not cover the
+empty case should REFUSE it, not answer.
+
+**And the deeper result of the survey is not the reds at all: eleven models have no entity set**, including
+`CaRefCatalogCore`, `CaRefLaneCore` and `CaRefTableSnapshotLogCore`. They model a single instance, so they
+cannot express "zero namespaces" because they cannot express "N namespaces" either. That is the real answer
+to "did we model this?" — for R11 the vacuous-empty class was not merely untested, it was **inexpressible**,
+and the gate model part 1 must build will need a namespace SET that none of the existing catalog or ref
+models has.
