@@ -165,15 +165,10 @@ StorageObjectStorageSource::StorageObjectStorageSource(
     , parser_shared_resources(std::move(parser_shared_resources_))
     , format_filter_info(std::move(format_filter_info_))
     , read_from_format_info(info)
-    , create_reader_pool(
-          std::make_shared<ThreadPool>(
-              CurrentMetrics::StorageObjectStorageThreads,
-              CurrentMetrics::StorageObjectStorageThreadsActive,
-              CurrentMetrics::StorageObjectStorageThreadsScheduled,
-              std::max<size_t>(context_->getSettingsRef()[Setting::object_storage_max_files_to_prefetch], 1)))
+    , create_reader_pool(context_->getPrefetchThreadpool())
     , file_iterator(file_iterator_)
     , schema_cache(StorageObjectStorage::getSchemaCache(context_, configuration->getTypeName()))
-    , create_reader_scheduler(threadPoolCallbackRunnerUnsafe<ReaderHolder>(*create_reader_pool, ThreadName::READER_POOL))
+    , create_reader_scheduler(threadPoolCallbackRunnerUnsafe<ReaderHolder>(create_reader_pool, ThreadName::READER_POOL))
     , max_files_to_prefetch(std::max<size_t>(context_->getSettingsRef()[Setting::object_storage_max_files_to_prefetch], 1))
 {
 }
@@ -181,7 +176,14 @@ StorageObjectStorageSource::StorageObjectStorageSource(
 StorageObjectStorageSource::~StorageObjectStorageSource()
 {
     LOG_DEBUG(log, "Source finished: files_read={}", total_files_read);
-    create_reader_pool->wait();
+    /// The scheduled work captures `this`, and create_reader_pool is shared with the rest of the
+    /// server, so waiting for the whole pool is both wrong (it would wait for unrelated queries)
+    /// and insufficient to express what we need. Wait for exactly this source's own futures.
+    for (auto & reader_future : reader_futures)
+    {
+        if (reader_future.valid())
+            reader_future.wait();
+    }
 }
 
 std::string StorageObjectStorageSource::getUniqueStoragePathIdentifier(
@@ -687,15 +689,11 @@ Chunk StorageObjectStorageSource::generate()
 
         ++total_files_read;
 
-        if (max_files_to_prefetch <= 1)
-        {
-            /// Even if task is finished the thread may be not freed in pool.
-            /// So wait until it will be freed before scheduling a new task.
-            create_reader_pool->wait();
-        }
-        /// With max_files_to_prefetch > 1 the pool has multiple threads and multiple readers are
-        /// meant to be building/priming concurrently, so waiting for the whole pool here would
-        /// serialize exactly the concurrency this setting is meant to provide.
+        /// There used to be a `create_reader_pool->wait` here for the single-lookahead case, to let
+        /// the private one-thread pool free its thread before the next task was scheduled. The pool
+        /// is now the shared server-wide one, so there is no private thread to wait for, and waiting
+        /// on it would block on unrelated queries' prefetches. Taking a reader from the queue
+        /// already means its callback has finished, which is all that wait actually guaranteed.
         refillReaderFutures();
     }
 
