@@ -270,6 +270,32 @@ class Gc;
 class Pool;
 using PoolPtr = std::shared_ptr<Pool>;
 
+/// One listed key `Pool::listNamespaces` could not attribute to a namespace, with the refusal message
+/// that stopped it. Behind Stage B's format bump the only such key is a ref object or a namespace file
+/// that names no LIFE (the un-incarnated Stage A shape), which the `Layout` parsers refuse by name.
+struct UnattributableNamespaceKey
+{
+    String key;
+    String reason;
+
+    bool operator==(const UnattributableNamespaceKey &) const = default;
+};
+
+/// What one `Pool::listNamespaces` enumeration observed: the namespaces it attributed, and the keys it
+/// could not attribute to any namespace at all.
+///
+/// The two halves are separate because a short `namespaces` list is not the same fact as a clean one,
+/// and the enumeration is not the place to decide what the difference means. A namespace disappears
+/// from `namespaces` only if EVERY key that would have named it is in `skipped`, since attribution is
+/// per key -- but "only if" is not "never", and each consumer's stakes differ: a browse probe can
+/// answer conservatively, while a caller that RETIRES a slot on the strength of an empty list cannot
+/// treat an incomplete universe as a drained one.
+struct NamespaceListing
+{
+    std::vector<String> namespaces;
+    std::vector<UnattributableNamespaceKey> skipped;
+};
+
 /// The façade for one content-addressed pool. `open` first validates the backend's conditional-write
 /// capabilities and the durable pool metadata, and refuses to mount when either check fails. A
 /// writable instance owns the mount lease and write fence; the read path uses immutable manifests
@@ -449,7 +475,11 @@ public:
     bool hasAnyRefWithPrefix(const RootNamespace & ns, std::string_view prefix);
     /// Namespaces with the given prefix: a LIST of `cas/refs/` ∪ `roots/`, results are UNORDERED.
     /// A dropped namespace's ref-shard objects linger until GC reclaims them.
-    std::vector<String> listNamespaces(const String & prefix);
+    ///
+    /// The enumeration REPORTS the keys it could not attribute and DECIDES NOTHING about them: it
+    /// neither aborts nor silently drops them, because the right answer differs per consumer and only
+    /// the consumer knows its own stakes. See `NamespaceListing`.
+    NamespaceListing listNamespaces(const String & prefix);
 
     /// Scoped LIST of the mirrored subtree: the distinct next-path-segment names under
     /// `roots/<prefix>` (a loose LIST used by browse only; callers re-check `listRefs`/`getFileSize`

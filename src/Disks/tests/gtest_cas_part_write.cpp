@@ -1305,11 +1305,11 @@ TEST(CasPartWriteTxn, FirstPublishMakesNamespaceDiscoverable)
     auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     const RootNamespace ns{"srv9/fresh"};
 
-    EXPECT_TRUE(s->listNamespaces("").empty());
+    EXPECT_TRUE(s->listNamespaces("").namespaces.empty());
     publishOneBlobPart(s, ns, "part_1", "f", "reg-payload");
 
     /// The namespace is now discoverable via LIST — no registry write needed.
-    const auto all = s->listNamespaces("");
+    const auto all = s->listNamespaces("").namespaces;
     ASSERT_EQ(all.size(), 1u);
     EXPECT_EQ(all[0], "srv9/fresh");
 }

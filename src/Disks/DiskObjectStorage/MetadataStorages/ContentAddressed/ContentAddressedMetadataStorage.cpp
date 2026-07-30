@@ -1475,10 +1475,16 @@ bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) 
             /// existence is consistent with the ref-level signal and independent of GC timing.
             const std::string canonical = canonicalDiskPath(path);
             const std::string scope = canonical.empty() ? "shadow/" : canonical + "/";
-            for (const auto & ns : store()->listNamespaces(scope))
+            const Cas::NamespaceListing listing = store()->listNamespaces(scope);
+            for (const auto & ns : listing.namespaces)
                 if (store()->hasAnyRefWithPrefix(Cas::RootNamespace{ns}, ""))
                     return true;
-            return false;
+            /// A key this scope's enumeration could not attribute leaves emptiness UNPROVEN, and the
+            /// fail-close answer for an existence probe is "present": reporting absent is what would let
+            /// a caller treat the subtree as gone. Answering present is bounded -- an already-unfrozen
+            /// directory keeps showing up until the key is cleared -- and it never claims absence that
+            /// was not established.
+            return !listing.skipped.empty();
         }
         case DirShape::AtomicShard:
             return liveTreeDirHasChildren(path);

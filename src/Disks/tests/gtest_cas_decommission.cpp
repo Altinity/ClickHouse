@@ -654,6 +654,46 @@ TEST(CasDecommission, PerObjectFailureWarnsAndContinuesDrain)
         << "TokenMismatch means nothing was actually deleted -- the object survives";
 }
 
+/// Decommission REFUSES FAIL-CLOSE on a key that names no namespace life, and this is the one consumer
+/// of the namespace enumeration for which the tolerate-and-continue contract above is WRONG. It retires
+/// a pool slot on the strength of what the enumeration returned, so a list that silently omitted a
+/// namespace would let it release the slot with that namespace's data still under it. An incomplete
+/// universe cannot license retiring anything, so the command refuses to start.
+///
+/// This is a PIN, not a change of outcome: an escaping parse refusal already aborted this command. What
+/// the test holds is that making the enumeration tolerant did NOT make this consumer tolerant with it,
+/// and that the refusal now happens as a pre-flight check that names the key and counts the keys, before
+/// any drain phase runs.
+TEST(CasDecommission, LifelessKeyRefusesTheWholeCommandFailClose)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    String lifeless;
+    {
+        auto victim = openVictim(backend);
+        makeTableWithRefs(*victim, "victim/db/t1", 1, 0);
+        /// Hand-built: no helper can mint the un-incarnated shape any more.
+        lifeless = victim->layout().casRefsPrefix() + String("victim/db/t1/_log/")
+            + renderRefTxnId(RefTxnId{1, 1}) + ".zst";
+        ASSERT_EQ(backend->putIfAbsent(lifeless, "garbage").outcome, PutOutcome::Done);
+    }
+
+    try
+    {
+        decommissionPoolMember(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
+        FAIL() << "an incomplete namespace universe must not license retiring a slot";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), ErrorCodes::CORRUPTED_DATA);
+        EXPECT_NE(e.message().find(lifeless), String::npos)
+            << "the refusal must name the key an operator has to clear; message: " << e.message();
+    }
+
+    /// Nothing was retired: the healthy namespace's refs are untouched, so a re-run after the key is
+    /// cleared still has a slot to drain.
+    EXPECT_FALSE(backend->list(Layout("p").casRefsPrefix() + "victim/", "", 1).keys.empty());
+}
+
 /// Review finding (Task 3 fix): the manifest-debris drain (spec §core step 4) must honor the SAME
 /// tolerate-and-continue contract as `deleteListedPrefix` above -- it did not. Two failure classes,
 /// both inside `sweepNamespace` (`CasOrphanManifestSweep.cpp`): a per-key `deleteExact` that throws

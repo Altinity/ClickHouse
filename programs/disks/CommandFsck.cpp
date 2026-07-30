@@ -120,6 +120,7 @@ public:
                     case Cas::FsckClass::CorruptedRun: c = "corrupted-run"; break;
                     case Cas::FsckClass::ChainBroken: c = "chain-broken"; break;
                     case Cas::FsckClass::Unchecked:   c = "unchecked"; break;
+                    case Cas::FsckClass::LifelessKey: c = "lifeless-key"; break;
                 }
                 std::cout << c << "\t" << o.key << "\t" << o.size;
                 for (const auto & r : o.reachable_from)

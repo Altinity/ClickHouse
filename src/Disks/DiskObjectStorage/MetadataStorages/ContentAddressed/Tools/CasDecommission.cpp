@@ -11,6 +11,14 @@
 #include <set>
 #include <tuple>
 
+namespace DB
+{
+namespace ErrorCodes
+{
+    extern const int CORRUPTED_DATA;
+}
+}
+
 namespace DB::Cas
 {
 
@@ -113,10 +121,24 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
         e.detail = {{"srid", victim_srid}};
     });
 
+    /// REFUSE FAIL-CLOSE on an unattributable key. Decommission RETIRES A POOL SLOT, and it decides the
+    /// slot is drained from what this enumeration returned. A short list would therefore let it conclude
+    /// "drained" over a namespace the listing omitted, and the slot would be released with that
+    /// namespace's data still under it -- data loss, not a usability wrinkle. The universe must be
+    /// complete or the command must not run; unlike a read-only audit, there is no partial answer here
+    /// that is still safe to act on.
+    const NamespaceListing listing = admin->listNamespaces(victim_srid);
+    if (!listing.skipped.empty())
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "ca-decommission: {} key(s) under this pool name no namespace life, so the namespace universe "
+            "of '{}' cannot be enumerated completely and no slot may be retired against it. First such key: "
+            "'{}' ({}). Run `ca-fsck` to enumerate them all.",
+            listing.skipped.size(), victim_srid, listing.skipped.front().key, listing.skipped.front().reason);
+
     /// `listNamespaces` includes names discovered under both `cas/refs/` and `roots/`. A name is a
     /// droppable table only when its refs prefix is present; roots-only names are loose mountpoint debris
     /// and must be left for the roots sweep below.
-    for (const String & ns_str : admin->listNamespaces(victim_srid))
+    for (const String & ns_str : listing.namespaces)
     {
         const RootNamespace ns(ns_str);
         if (admin->namespaceIsRemoved(ns))

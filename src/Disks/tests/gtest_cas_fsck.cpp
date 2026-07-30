@@ -153,6 +153,47 @@ TEST(CasFsck, ReachableBlobMissingIsError)
     EXPECT_GE(rep.dangling, 1u);
 }
 
+/// fsck RECORDS AND CONTINUES over a key that names no namespace life. It is the forensic tool an
+/// operator reaches for after something has already gone wrong, so one bad key must not make it report
+/// NOTHING -- including about the healthy namespaces it would never reach. The finding is hard (an
+/// un-incarnated key is corruption behind the format bump) and counted once per key, not once per sweep.
+TEST(CasFsck, LifelessKeyIsRecordedAndTheHealthyNamespaceIsStillReported)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref(1, 0xA1);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+
+    /// Hand-built: no helper can mint the un-incarnated shape any more.
+    const String lifeless = store->layout().casRefsPrefix() + ns.string() + "/_log/"
+        + renderRefTxnId(RefTxnId{1, 1}) + ".zst";
+    ASSERT_EQ(backend->putIfAbsent(lifeless, "garbage").outcome, PutOutcome::Done);
+
+    FsckReport rep;
+    ASSERT_NO_THROW(rep = runFsck(*store, /*detail*/true))
+        << "the audit must not be taken out by the damage it exists to report";
+
+    /// The finding, named, and counted ONCE even though several sweeps enumerate namespaces.
+    EXPECT_EQ(rep.lifeless_keys, 1u);
+    EXPECT_FALSE(rep.clean());
+    bool saw = false;
+    for (const FsckObject & o : rep.objects)
+        if (o.cls == FsckClass::LifelessKey)
+        {
+            saw = true;
+            EXPECT_EQ(o.key, lifeless);
+        }
+    EXPECT_TRUE(saw) << "a counted finding with no row is a number nobody can act on";
+
+    /// And the healthy namespace was still reached: its committed ref resolved to a present manifest and
+    /// a present blob, which only a sweep that ran can report.
+    EXPECT_GE(rep.reachable, 1u);
+    EXPECT_EQ(rep.dangling, 0u);
+}
+
 /// A pre-precommit body in an eligible prefix (no owner) is INFO (Unreachable), not an error.
 TEST(CasFsck, ReclaimablePrePrecommitBodyIsInfo)
 {
@@ -695,6 +736,7 @@ TEST(CasFsckSummary, EveryHardFindingAppearsOnTheSummaryLine)
     rep.snapshot_oracle_mismatches = 22;
     rep.corrupted_runs = 33;
     rep.stale_edge = 44;
+    rep.lifeless_keys = 55;
 
     const String line = formatFsckSummary(rep);
 
@@ -703,6 +745,7 @@ TEST(CasFsckSummary, EveryHardFindingAppearsOnTheSummaryLine)
     EXPECT_NE(line.find("snapshot_oracle_mismatches=22"), String::npos) << line;
     EXPECT_NE(line.find("corrupted_runs=33"), String::npos) << line;
     EXPECT_NE(line.find("stale_edge=44"), String::npos) << line;
+    EXPECT_NE(line.find("lifeless_keys=55"), String::npos) << line;
 
     /// A report carrying these values is NOT clean; the line must not be mistakable for a clean one.
     EXPECT_FALSE(rep.clean());
@@ -716,6 +759,7 @@ TEST(CasFsckSummary, ZeroValuedHardFindingsAreStillPrinted)
     const String line = formatFsckSummary(FsckReport{});
     EXPECT_NE(line.find("corrupted_runs=0"), String::npos) << line;
     EXPECT_NE(line.find("stale_edge=0"), String::npos) << line;
+    EXPECT_NE(line.find("lifeless_keys=0"), String::npos) << line;
     EXPECT_EQ(line.find("partial="), String::npos) << "a non-partial report must not claim partial: " << line;
 }
 

@@ -56,6 +56,9 @@ enum class FsckClass : uint8_t
                    /// crossing, an undecodable body, an oracle that could not replay). Not a finding and
                    /// not a clean bill of health: the honest third answer, reported so nobody reads a
                    /// silence as a proof.
+    LifelessKey,   /// a key under `cas/refs/` or a namespace `_files/` subtree that names no namespace
+                   /// LIFE -- the un-incarnated (Stage A) shape the `Layout` parsers refuse. It belongs
+                   /// to no namespace, so no per-namespace verdict can carry it. ERROR
 };
 
 /// One object or integrity finding emitted in detailed mode, or emitted for every missing reachable
@@ -135,6 +138,13 @@ struct FsckReport
     uint64_t unchecked = 0;
     uint64_t ref_records_walked = 0;
 
+    /// Keys the namespace enumeration could not attribute to any namespace (see `FsckClass::LifelessKey`
+    /// and `Cas::NamespaceListing`). Counted DISTINCT by key: the scan enumerates namespaces several
+    /// times and every sweep sees the same offending key, so a per-sweep count would multiply one
+    /// defect. A hard finding -- behind Stage B's format bump such a key is corruption, and an audit is
+    /// where an operator finds out about it.
+    uint64_t lifeless_keys = 0;
+
     uint64_t physical_bytes = 0;
     uint64_t referenced_logical_bytes = 0;
     uint64_t total_blob_refs = 0;
@@ -162,7 +172,7 @@ struct FsckReport
     bool clean() const
     {
         return dangling == 0 && snapshot_oracle_mismatches == 0 && corrupted_runs == 0 && stale_edge == 0
-            && chain_broken == 0;
+            && chain_broken == 0 && lifeless_keys == 0;
     }
 };
 

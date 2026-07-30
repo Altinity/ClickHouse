@@ -1085,7 +1085,7 @@ TEST(CasPool, ListNamespacesFromRefsTree)
     auto b = std::make_shared<InMemoryBackend>();
     auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 
-    EXPECT_TRUE(s->listNamespaces("").empty());   /// fresh pool: no ref shards yet
+    EXPECT_TRUE(s->listNamespaces("").namespaces.empty());   /// fresh pool: no ref shards yet
 
     /// Write actual ref shards so LIST(cas/refs/) can discover them.
     DB::Cas::tests::publishCommittedTransition(*b, s->layout(), RootNamespace{"srv1/tbl"},
@@ -1095,16 +1095,80 @@ TEST(CasPool, ListNamespacesFromRefsTree)
     DB::Cas::tests::publishCommittedTransition(*b, s->layout(), RootNamespace{"shadow/bk2/tbl"},
         "ref1", std::nullopt, DB::Cas::ManifestRef{.writer_epoch = 1, .build_sequence = 1, .manifest_ordinal = 1});
 
-    const auto all = s->listNamespaces("");
+    const auto all = s->listNamespaces("").namespaces;
     EXPECT_EQ(all.size(), 3u);
-    const auto shadows = s->listNamespaces("shadow/");
+    const auto shadows = s->listNamespaces("shadow/").namespaces;
     ASSERT_EQ(shadows.size(), 2u);
     /// listNamespaces returns results from an unordered_set; sort for deterministic comparison.
     auto sorted_shadows = shadows;
     std::sort(sorted_shadows.begin(), sorted_shadows.end());
     EXPECT_EQ(sorted_shadows[0], "shadow/bk1/tbl");
     EXPECT_EQ(sorted_shadows[1], "shadow/bk2/tbl");
-    EXPECT_TRUE(s->listNamespaces("nope/").empty());
+    EXPECT_TRUE(s->listNamespaces("nope/").namespaces.empty());
+}
+
+/// The `_files` half of the enumeration must yield the NAMESPACE, not the life: once files are
+/// life-keyed, splitting the key on `/_files/` by hand would return `<ns>/<inc>` and invent one
+/// namespace per incarnation. Two lives of one name therefore collapse to ONE listed namespace.
+TEST(CasPool, ListNamespacesRecoversTheNamespaceNotTheLifeFromFileKeys)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    const RootNamespace ns{"test/tbl@cas@"};
+
+    s->putNamespaceFile(NamespaceLifeId::stageATransition(ns), "format_version.txt", "1\n");
+    /// A second life of the SAME name, written by exact key because no helper mints two lives yet.
+    const NamespaceLifeId other = NamespaceLifeId::fromCatalogEntry(ns, DB::UInt128(0x5eed));
+    ASSERT_EQ(b->putIfAbsent(s->layout().namespaceFileKey(other, "format_version.txt"), "1\n").outcome,
+              PutOutcome::Done);
+
+    const NamespaceListing listing = s->listNamespaces("");
+    EXPECT_TRUE(listing.skipped.empty());
+    ASSERT_EQ(listing.namespaces.size(), 1u) << "two lives of one name are ONE namespace";
+    EXPECT_EQ(listing.namespaces[0], ns.string());
+}
+
+/// The enumeration ABSORBS the key refusals its two parsers can raise and re-emits them as data, for
+/// both key families. Absorbing is what keeps every consumer reachable; re-emitting is what keeps a
+/// consumer that acts on completeness able to tell a short list from a clean one.
+TEST(CasPool, ListNamespacesSurfacesLifelessKeysInsteadOfAborting)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    const RootNamespace ns{"test/tbl@cas@"};
+
+    /// One well-formed key per family, so the namespace is attributable either way.
+    DB::Cas::tests::publishCommittedTransition(*b, s->layout(), ns,
+        "ref1", std::nullopt, DB::Cas::ManifestRef{.writer_epoch = 1, .build_sequence = 1, .manifest_ordinal = 1});
+    s->putNamespaceFile(NamespaceLifeId::stageATransition(ns), "format_version.txt", "1\n");
+
+    /// Hand-built un-incarnated keys: no helper can mint either shape any more.
+    const String lifeless_ref = s->layout().casRefsPrefix() + ns.string() + "/_log/"
+        + renderRefTxnId(RefTxnId{1, 1}) + ".zst";
+    const String lifeless_file = s->layout().rootsPrefix() + ns.string() + "/_files/format_version.txt";
+    ASSERT_EQ(b->putIfAbsent(lifeless_ref, "garbage").outcome, PutOutcome::Done);
+    ASSERT_EQ(b->putIfAbsent(lifeless_file, "garbage").outcome, PutOutcome::Done);
+
+    NamespaceListing listing;
+    ASSERT_NO_THROW(listing = s->listNamespaces(""))
+        << "one un-attributable key must not abort the enumeration for every consumer of it";
+
+    /// The healthy namespace is still listed -- attribution is per key, so a namespace disappears only
+    /// when every key that would name it is unattributable.
+    ASSERT_EQ(listing.namespaces.size(), 1u);
+    EXPECT_EQ(listing.namespaces[0], ns.string());
+
+    /// Both offending keys are reported, each naming itself, and no namespace was invented for either.
+    ASSERT_EQ(listing.skipped.size(), 2u);
+    std::vector<String> skipped_keys;
+    for (const UnattributableNamespaceKey & bad : listing.skipped)
+    {
+        skipped_keys.push_back(bad.key);
+        EXPECT_NE(bad.reason.find(bad.key), String::npos)
+            << "the surfaced reason must name its own key; got: " << bad.reason;
+    }
+    std::sort(skipped_keys.begin(), skipped_keys.end());
+    EXPECT_EQ(skipped_keys, (std::vector<String>{lifeless_ref, lifeless_file}));
 }
 
 TEST(CasPool, ListMirroredChildren)

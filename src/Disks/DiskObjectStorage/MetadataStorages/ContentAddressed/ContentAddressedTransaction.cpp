@@ -1065,7 +1065,20 @@ void ContentAddressedTransaction::removeRecursive(const std::string & path, cons
         std::string prefix = path;
         while (!prefix.empty() && prefix.back() == '/')
             prefix.pop_back();
-        for (const auto & ns : metadata_storage.store()->listNamespaces(prefix + "/"))
+        /// RECORD AND CONTINUE, and the reason is the shape of the alternative. A key that names no
+        /// namespace life is removed by nothing else: the ref-folding GC aborts its round on the same
+        /// key rather than deleting it, and a namespace DROP is what removes namespace objects -- so
+        /// refusing the DROP would make the obstacle permanent, blocked by the one operation that could
+        /// have cleared it. Continuing drops every namespace the enumeration DID name; the offending key
+        /// stays as reported debris. It cannot hide a namespace that has any well-formed key of its own,
+        /// because attribution is per key.
+        const Cas::NamespaceListing listing = metadata_storage.store()->listNamespaces(prefix + "/");
+        for (const Cas::UnattributableNamespaceKey & bad : listing.skipped)
+            LOG_ERROR(getLogger("ContentAddressedTransaction"),
+                "removeRecursive('{}'): key '{}' names no namespace life and was left in place ({}). "
+                "Every namespace this enumeration did name is still dropped; run `ca-fsck` to enumerate "
+                "such keys.", path, bad.key, bad.reason);
+        for (const auto & ns : listing.namespaces)
             metadata_storage.partAccess()->dropNamespace(Cas::RootNamespace{ns});
         return;
     }

@@ -545,7 +545,34 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
     uint64_t refs_walked = 0;
     NsVerdicts verdicts;
     SCOPE_EXIT({ verdicts.publish(report); });
-    for (const String & ns_str : store.listNamespaces(namespace_prefix))
+
+    /// RECORD AND CONTINUE for a key that belongs to no namespace at all. fsck is the forensic tool an
+    /// operator reaches for once something is already wrong, so a key it cannot attribute must become a
+    /// FINDING and not an abort: an audit that died on the first bad key would report nothing about the
+    /// healthy namespaces it never reached, which is the wrong failure order for a read-only diagnostic.
+    ///
+    /// `seen` is what makes the count a count of DEFECTS: each sweep below enumerates namespaces again
+    /// and sees the same offending key, and only the first sighting is recorded.
+    std::set<String> lifeless_seen;
+    auto recordLifelessKeys = [&](const NamespaceListing & listing)
+    {
+        for (const UnattributableNamespaceKey & bad : listing.skipped)
+        {
+            if (!lifeless_seen.insert(bad.key).second)
+                continue;
+            ++report.lifeless_keys;
+            FsckObject o;
+            o.key = bad.key;
+            o.cls = FsckClass::LifelessKey;
+            o.size = 0;
+            o.reachable_from = {bad.reason};
+            report.objects.push_back(std::move(o));
+        }
+    };
+
+    const NamespaceListing ref_listing = store.listNamespaces(namespace_prefix);
+    recordLifelessKeys(ref_listing);
+    for (const String & ns_str : ref_listing.namespaces)
     {
         const RootNamespace ns{ns_str};
         /// RECORD AND CONTINUE, NEVER WEDGE. Everything below is per-namespace, and every one of these
@@ -843,7 +870,9 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
     bool stale_edge_check_available = detail && !unref_edge_sources.empty();
     if (stale_edge_check_available)
     {
-        for (const String & ns_str : store.listNamespaces(namespace_prefix))
+        const NamespaceListing stale_edge_listing = store.listNamespaces(namespace_prefix);
+        recordLifelessKeys(stale_edge_listing);
+        for (const String & ns_str : stale_edge_listing.namespaces)
         {
             const RootNamespace ns{ns_str};
             std::unordered_map<String, uint64_t> manifest_bodies;
@@ -1024,7 +1053,9 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
     /// Pre-precommit manifest debris: a `cas/manifests/` body with no committed owner. An ELIGIBLE prefix's
     /// orphan is reclaimable debris => INFO (Unreachable); a non-eligible (in-flight) one is also info,
     /// never an error. The owner-visible missing-body case is the error above.
-    for (const String & ns_str : store.listNamespaces(namespace_prefix))
+    const NamespaceListing manifest_debris_listing = store.listNamespaces(namespace_prefix);
+    recordLifelessKeys(manifest_debris_listing);
+    for (const String & ns_str : manifest_debris_listing.namespaces)
     {
         const RootNamespace ns{ns_str};
         const String manifests_prefix = layout.manifestNamespacePrefix(ns);
@@ -1094,6 +1125,7 @@ String formatFsckSummary(const FsckReport & report)
         << " stale_edge=" << report.stale_edge
         << " corrupted_runs=" << report.corrupted_runs
         << " chain_broken=" << report.chain_broken
+        << " lifeless_keys=" << report.lifeless_keys
         << " unchecked=" << report.unchecked
         << " ref_records_walked=" << report.ref_records_walked
         << " snapshot_oracle_mismatches=" << report.snapshot_oracle_mismatches

@@ -1392,7 +1392,7 @@ void Pool::removeMountpointObject(const String & key)
     plain_objects.removeMountpointObject(key);
 }
 
-std::vector<String> Pool::listNamespaces(const String & prefix)
+NamespaceListing Pool::listNamespaces(const String & prefix)
 {
     /// LIST-based discovery authority: enumerate distinct full namespace strings
     /// from ref shards under `cas/refs/` UNION verbatim-file namespaces under `roots/`.
@@ -1401,12 +1401,34 @@ std::vector<String> Pool::listNamespaces(const String & prefix)
     /// InMemoryBackend: guaranteed (in-memory map). S3: strongly consistent since 2021.
     /// RustFS: to confirm in soak.
     std::unordered_set<String> found;
+    std::vector<UnattributableNamespaceKey> skipped;
+
+    /// Both key families are parsed by their `Layout` parser, and both parsers REFUSE, rather than
+    /// classify as debris, a key that is one of ours but names no life. That refusal is absorbed HERE,
+    /// per key, and re-emitted as data.
+    ///
+    /// Absorbing at the enumeration rather than at each consumer is what makes the fix reach all of
+    /// them: this function has four callers, and an escaping refusal would abort whichever one ran.
+    /// Absorbing WITHOUT reporting would be worse than the abort for a caller that acts on the list's
+    /// completeness, so the key and its refusal are returned and the disposition is the caller's.
+    auto attribute = [&](const String & key, auto && parse) -> std::optional<String>
+    {
+        try
+        {
+            if (const auto parsed = parse(key))
+                return parsed->id.ns.string();
+            return std::nullopt;   /// not one of ours: foreign debris, walked past as always
+        }
+        catch (const Exception & e)
+        {
+            if (e.code() != ErrorCodes::CORRUPTED_DATA)
+                throw;   /// not a key refusal: a real failure of the enumeration itself
+            skipped.push_back(UnattributableNamespaceKey{key, e.message()});
+            return std::nullopt;
+        }
+    };
 
     /// `cas/refs/`: ref-object keys are `<pool_prefix>/cas/refs/<ns>/<inc>/_log|_snap|_cleanup/<txn-id>`.
-    /// `parseRefObjectKey` recognizes them and yields the owning namespace; any key it does not
-    /// recognize is skipped (it is not one of this pool's ref objects). A key that IS a ref object but
-    /// names no life is refused instead of skipped, so an un-incarnated object cannot hide a namespace
-    /// from this enumeration.
     {
         const String base = pool_layout.casRefsPrefix() + prefix;
         String cursor;
@@ -1418,11 +1440,9 @@ std::vector<String> Pool::listNamespaces(const String & prefix)
                 const String & key = listed.key;
                 if (!key.starts_with(base))
                     continue;
-                if (const auto parsed = pool_layout.parseRefObjectKey(key))
-                {
-                    if (parsed->id.ns.string().starts_with(prefix))
-                        found.insert(parsed->id.ns.string());
-                }
+                const auto ns_str = attribute(key, [this](const String & k) { return pool_layout.parseRefObjectKey(k); });
+                if (ns_str && ns_str->starts_with(prefix))
+                    found.insert(*ns_str);
             }
             if (page.next_cursor.empty())
                 break;
@@ -1430,8 +1450,9 @@ std::vector<String> Pool::listNamespaces(const String & prefix)
         }
     }
 
-    /// `roots/`: verbatim-file keys are `<pool_prefix>/roots/<ns>/_files/<name>`.
-    /// Extract ns = everything before `/_files/`.
+    /// `roots/`: verbatim-file keys are `<pool_prefix>/roots/<ns>/<inc>/_files/<name>`. The namespace
+    /// comes from `parseNamespaceFileKey`, which knows where the incarnation segment sits -- splitting
+    /// the key on `/_files/` by hand would yield `<ns>/<inc>` and invent a namespace per life.
     {
         const String base = pool_layout.rootsPrefix() + prefix;
         String cursor;
@@ -1443,14 +1464,10 @@ std::vector<String> Pool::listNamespaces(const String & prefix)
                 const String & key = listed.key;
                 if (!key.starts_with(pool_layout.rootsPrefix()))
                     continue;
-                const std::string_view rest(key.data() + pool_layout.rootsPrefix().size(),
-                    key.size() - pool_layout.rootsPrefix().size());
-                const size_t files_pos = rest.find("/_files/");
-                if (files_pos == std::string_view::npos)
-                    continue;   /// plain mountpoint object (not a namespaced verbatim file); skip
-                const String ns_str(rest.substr(0, files_pos));
-                if (!ns_str.empty() && ns_str.starts_with(prefix))
-                    found.insert(ns_str);
+                const auto ns_str
+                    = attribute(key, [this](const String & k) { return pool_layout.parseNamespaceFileKey(k); });
+                if (ns_str && !ns_str->empty() && ns_str->starts_with(prefix))
+                    found.insert(*ns_str);
             }
             if (page.next_cursor.empty())
                 break;
@@ -1458,7 +1475,7 @@ std::vector<String> Pool::listNamespaces(const String & prefix)
         }
     }
 
-    return {found.begin(), found.end()};
+    return NamespaceListing{{found.begin(), found.end()}, std::move(skipped)};
 }
 
 std::vector<String> Pool::listMirroredChildren(const String & prefix)

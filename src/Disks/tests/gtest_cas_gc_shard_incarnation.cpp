@@ -79,20 +79,20 @@ TEST(CasGcShardIncarnation, ListNamespacesFromRefsNotRegistry)
 
         const RootNamespace ns_a{"srv1/tblA"};
 
-        EXPECT_TRUE(store->listNamespaces("").empty());
+        EXPECT_TRUE(store->listNamespaces("").namespaces.empty());
 
         /// Write a ref shard for ns A — no registry write.
         writeManifestRaw(*backend, store->layout(), ns_a, testRef(1), {});
         publishCommittedTransition(*backend, store->layout(), ns_a, "part_1", std::nullopt, testRef(1), /*shard=*/0);
 
-        const auto nss = store->listNamespaces("");
+        const auto nss = store->listNamespaces("").namespaces;
         ASSERT_EQ(nss.size(), 1u);
         EXPECT_EQ(nss[0], "srv1/tblA");
 
         /// Prefix filter: no match.
-        EXPECT_TRUE(store->listNamespaces("srv2/").empty());
+        EXPECT_TRUE(store->listNamespaces("srv2/").namespaces.empty());
         /// Prefix filter: match.
-        const auto filtered = store->listNamespaces("srv1/");
+        const auto filtered = store->listNamespaces("srv1/").namespaces;
         ASSERT_EQ(filtered.size(), 1u);
         EXPECT_EQ(filtered[0], "srv1/tblA");
     }
