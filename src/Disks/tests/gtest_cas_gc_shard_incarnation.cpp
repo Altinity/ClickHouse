@@ -117,6 +117,14 @@ TEST(CasGcShardIncarnation, DiscoveryEqualsPresentShards)
 /// Without the fix this reads as a vacuously-complete frontier (0 of 0 needed at incarnation B, and
 /// incarnation A's key was dropped as "ordinary dead-incarnation debris" by R10/I1); the fix must instead
 /// raise it as an anomaly and suppress the round.
+///
+/// PURPOSE, for whoever sees this go red after touching the fold: this pins the MISMATCH half of the
+/// safety property (its sibling below, `UncatalogedNamespaceWithRealObjectsLeavesTheRoundIncomplete`,
+/// pins the ABSENT-ENTIRELY half). Neither half is enforced by any single explicit check -- a
+/// catalog-derivation predicate was traced and found to add nothing a refactor could independently
+/// break (see the NEW-1 report) -- so a red result here means a REFACTOR DECOUPLED the pieces that
+/// jointly produce this outcome (the R10 dead-incarnation filter, `live_incarnation`'s own construction,
+/// and this detector), not that the test went stale.
 TEST(CasGcShardIncarnation, IncarnationMismatchWithoutEntryAbsenceIsAnAnomaly)
 {
     std::shared_ptr<InMemoryBackend> backend;
@@ -145,6 +153,50 @@ TEST(CasGcShardIncarnation, IncarnationMismatchWithoutEntryAbsenceIsAnAnomaly)
     EXPECT_FALSE(report.anomalies.empty())
         << "a current incarnation with zero footprint next to a different incarnation's real objects "
            "must be refused, not read as a vacuously-complete frontier";
+}
+
+/// C1/I1's ABSENT-ENTIRELY family, given its own direct positive test -- checked for, and not found,
+/// before writing this: the three protective `casAdmitEntry` pins C1/I1's own commit (`81ace46e089`)
+/// added to unrelated tests (`TheOrphanManifestSweepAndItsCursorAreInertUnderSuppression`,
+/// `PendingPassEpochFiltersManifestDeletes`, `StaleLeaderPendingPassAbortsWhenRoundAdvanced`) all ROUTE
+/// AROUND this outcome -- they admit the namespace specifically so the anomaly never fires, since firing
+/// would defeat what each of THOSE tests is actually about. None of them positively exercises "an
+/// uncataloged namespace with real ref objects leaves the round incomplete". Nor does any raw-fixture
+/// helper let one construct this directly any more: `writeRefLogTxnRaw` calls `casAdmitEntry` internally
+/// on every write, precisely to keep every OTHER test on the real-incarnation path. So this namespace is
+/// built through the REAL writer path (which self-admits) and then has its catalog entry stripped
+/// afterward -- the same technique `DiscoveryEqualsPresentShards`'s case (c) uses to simulate "the
+/// catalog forgot" without a removal API to do it for real.
+///
+/// PURPOSE, for whoever sees this go red after touching the fold: this pins the ABSENT-ENTIRELY half of
+/// the safety property (its sibling above, `IncarnationMismatchWithoutEntryAbsenceIsAnAnomaly`, pins the
+/// MISMATCH half). A red result here means a refactor decoupled the pieces that jointly produce this
+/// outcome (R10's silent drop for an unknown namespace name, the walk loop's `catalog_names_this_namespace`
+/// gate, and the anomaly each records), not that the test went stale.
+TEST(CasGcShardIncarnation, UncatalogedNamespaceWithRealObjectsLeavesTheRoundIncomplete)
+{
+    std::shared_ptr<InMemoryBackend> backend;
+    auto store = makePoolWithShards(backend, /*gc_shards=*/1);
+    Gc gc(store, hexToU128("0000000000000000000000000000000a"));
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/tblForgotten"};
+
+    writeManifestRaw(*backend, layout, ns, testRef(1), {});
+    publishCommittedTransition(*backend, layout, ns, "part_1", std::nullopt, testRef(1), /*shard=*/0);
+
+    {
+        CasRefCatalog::Snapshot snap = CasRefCatalog::read(*backend, layout);
+        std::erase_if(snap.catalog.entries, [&](const CatalogEntry & e) { return e.ns.string() == ns.string(); });
+        const HeadResult h = backend->head(layout.refCatalogKey());
+        ASSERT_TRUE(h.exists);
+        ASSERT_EQ(backend->putOverwrite(layout.refCatalogKey(), encodeRefCatalog(snap.catalog), h.token).outcome,
+                   PutOutcome::Done);
+    }
+
+    const RoundReport report = gc.runRegularRound({}, /*allow_steal=*/true, UniversePolicy::AuthoritativeForTest);
+    EXPECT_FALSE(report.anomalies.empty())
+        << "a namespace with real ref objects but no catalog entry at all must be refused, not silently "
+           "dropped as harmless debris";
 }
 
 /// Task 4: listNamespaces is LIST-based; no registry involved.
