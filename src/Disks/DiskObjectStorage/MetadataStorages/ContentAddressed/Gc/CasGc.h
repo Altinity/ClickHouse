@@ -522,6 +522,16 @@ private:
         /// namespace -> `_ckpt.checkpoint_snapshot_id`, for the namespaces that published one.
         std::map<String, RefTxnId> witnesses;
 
+        /// namespace -> `_ckpt.life_epoch`, for the namespaces that published one. Stage B (Task 4-C):
+        /// the walk's ONLY use is seeding `expected` for a namespace that has never folded a cursor AND
+        /// whose listing shows no log at all -- a `Live` catalog namespace the round has not yet touched.
+        /// Without this, such a namespace can never leave `expected == nullopt`, so its `while (expected)`
+        /// loop never runs and `frontier_proven` stays false forever, even though nothing above `{life_epoch,
+        /// 1}` can possibly exist yet. A namespace admitted without a `_ckpt` at all (the test-only
+        /// `casAdmitEntry` bridge, not `completeCreation`'s production path) has no entry here and stays
+        /// correctly unproven -- fail-closed on a genuinely unknown genesis, never a guessed one.
+        std::map<String, uint64_t> life_epochs;
+
         /// namespace -> the decode failure's message, for the namespaces whose `_ckpt` is PRESENT and
         /// UNREADABLE. Separate from an absent entry because the two mean opposite things: an absent
         /// entry says "this namespace published no checkpoint", which the walk may treat as no witness,
@@ -624,15 +634,20 @@ private:
     /// independently-derived views of the page.
     void reportSweepRetention(const ManifestSweepResult & result);
 
-    /// Discover the present (namespace, shard) pairs from LIST(cas/refs/); shared by the fold and the
-    /// resume re-fence. Returns only shards that have a backend object (absent shards not included).
-    /// Fresh pool (no shards yet) => empty result.
+    /// Stage B (spec INV-3): the round's universe -- every namespace life the destructive gate may one
+    /// day owe a frontier proof for -- is catalog-authoritative, ONE `cas/ref_catalog` `GET` replacing
+    /// the pool-wide `LIST(cas/refs/)` this used to run. `Creating` entries are excluded: no publication
+    /// can exist yet (spec §3), so there is nothing here for a discovery path to walk; `Live` and
+    /// `Removing` entries are both returned, each minted via `NamespaceLifeId::fromCatalogEntry` directly
+    /// from the row that is its own authority for both fields -- never from a listed key, which could
+    /// name a DEAD incarnation of the same namespace name. Fresh pool (no catalog entries yet) => empty
+    /// result.
     ///
-    /// This is a HINT and its mechanism is unchanged: a store that omits a namespace from the
-    /// enumeration still omits it here. What changed around it is that the fold UNIONS this result with
-    /// the namespaces the adopted seal already carries a cursor for, so a quiet hint can only ever ADD
-    /// to the frontier obligation, never shrink it.
-    std::vector<std::pair<RootNamespace, uint64_t>> discoverUniverse();
+    /// Used by the fold (as the R11-guarded frontier universe) and by `rebuildBaseline`'s
+    /// disaster-recovery scan. The pool-wide ref LIST (`enumerateRefPrefix`/`groupRefKeys`) remains the
+    /// INTRA-namespace hint -- what a namespace this call already named has listed -- never the
+    /// discovery source for WHICH namespaces exist.
+    std::vector<NamespaceLifeId> discoverUniverse();
 
     /// The two cheap pre-fold GC round-defer signals — both computed from
     /// state already reachable before the fold's snapshot merge (O(retired)/O(shards), no snapshot
@@ -815,9 +830,9 @@ private:
     uint64_t txns_unapplied_this_round = 0;
 
 public:
-    /// TEST SEAM: expose LIST-based namespace/shard discovery so unit tests can assert the
-    /// discovered universe equals the set of present ref shards without driving a full round.
-    std::vector<std::pair<RootNamespace, uint64_t>> discoverUniverseForTest()
+    /// TEST SEAM: expose catalog-based universe discovery so unit tests can assert it against a catalog
+    /// they construct, without driving a full round.
+    std::vector<NamespaceLifeId> discoverUniverseForTest()
     {
         return discoverUniverse();
     }

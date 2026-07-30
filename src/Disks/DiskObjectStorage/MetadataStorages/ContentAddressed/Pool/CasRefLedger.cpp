@@ -1,5 +1,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasCodecUtil.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <IO/ReadBufferFromMemory.h>
@@ -183,6 +185,7 @@ CasRefLedger::CasRefLedger(
     RefLedgerConfig config_,
     const CasEventSink & event_sink_,
     CasRequestBudget cas_request_budget_,
+    String server_root_id_,
     std::function<uint64_t()> controller_boot_ms_fn,
     std::function<uint64_t()> live_epoch_fn_,
     std::function<bool()> fence_ok_fn_,
@@ -198,6 +201,7 @@ CasRefLedger::CasRefLedger(
     , config(std::move(config_))
     , event_sink(event_sink_)
     , cas_request_budget(cas_request_budget_)
+    , server_root_id(std::move(server_root_id_))
     , live_epoch_fn(std::move(live_epoch_fn_))
     , fence_ok_fn(std::move(fence_ok_fn_))
     , fence_generation_fn(std::move(fence_generation_fn_))
@@ -526,12 +530,18 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
     /// conditional create at a key this namespace owns, and the replayed candidate is PRIVATE until the
     /// caller installs it. `recovery_in_progress` (not `state_mutex`) is what keeps a second caller for
     /// this same table from racing an independent walk -- see its doc comment.
+    ///
+    /// `life` (Stage B, Task 4-C): `ensureRefTableRecovered` resolves and caches `rt.life` before this
+    /// walk ever runs, so every key this function builds is under the namespace's REAL catalog
+    /// incarnation, never the Stage-A sentinel.
+    chassert(rt.life);
+    const NamespaceLifeId life = *rt.life;
 
     /// ---- Step 2: the checkpoint ----
     /// `nullopt` means the namespace has published nothing yet (a birth whose `_ckpt` create did not
     /// land, or a table seeded outside the append lane). It is not an error; it costs the walk its
     /// LIST-independent grounding, and the grounding rule below says exactly what it falls back to.
-    const std::optional<CkptSample> sampled_ckpt = readCkpt(backend, layout, ns);
+    const std::optional<CkptSample> sampled_ckpt = readCkpt(backend, layout, life);
     checkRecoveryStillAdmitted(ns, rt, cancelled);
 
     /// ---- Step 3: ONE hint LIST ----
@@ -543,7 +553,7 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
     std::vector<RefTxnId> hint_log_ids;
     std::set<RefTxnId> cleanup_markers;
     {
-        const String prefix = layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns));
+        const String prefix = layout.refsNamespacePrefix(life);
         String cursor;
         for (;;)
         {
@@ -594,7 +604,7 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
     uint64_t base_snapshot_bytes = 0;
     if (base_id)
     {
-        const auto got = backend.get(layout.refSnapshotKey(NamespaceLifeId::stageATransition(ns), *base_id));
+        const auto got = backend.get(layout.refSnapshotKey(life, *base_id));
         if (!got)
         {
             /// INV-4's three-way revalidation, consumed from `CasRefCkpt` rather than re-derived: the
@@ -602,7 +612,7 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
             if (!sampled_ckpt)
                 return std::nullopt;   /// no checkpoint to adjudicate against: the plain vanish restart
 
-            const std::optional<CkptSample> current = readCkpt(backend, layout, ns);
+            const std::optional<CkptSample> current = readCkpt(backend, layout, life);
             if (classifyMissingSampledBase(sampled_ckpt->token,
                                            current ? std::optional<Token>(current->token) : std::nullopt)
                 == MissingBaseVerdict::RestartRecovery)
@@ -698,7 +708,7 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
             checkRecoveryStillAdmitted(ns, rt, cancelled);
             const RefTxnId id{epoch, sequence};
 
-            if (const auto got = backend.get(layout.refLogKey(NamespaceLifeId::stageATransition(ns), id)))
+            if (const auto got = backend.get(layout.refLogKey(life, id)))
             {
                 RefLogTxn txn = decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), id);
                 const bool is_seal = refLogTxnIsEpochSeal(txn);
@@ -723,7 +733,7 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
             /// ---- Absent. Hole, end of the live stream, or a dead epoch to close ----
             if (const std::optional<RefTxnId> witness = witness_candidate(epoch, sequence))
             {
-                if (backend.get(layout.refLogKey(NamespaceLifeId::stageATransition(ns), *witness)))
+                if (backend.get(layout.refLogKey(life, *witness)))
                 {
                     /// A 404 BELOW a CONFIRMED durable same-epoch id. Ids are dense `1..T` within
                     /// `(namespace, epoch)` (INV-1), so this is not the end of anything -- it is a hole,
@@ -795,7 +805,7 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
 
             const SlotOccupyResult occupied =
                 ref_request_controller->slotOccupy(
-                    layout.refLogKey(NamespaceLifeId::stageATransition(ns), id), seal_bytes, admitted_fence_ok);
+                    layout.refLogKey(life, id), seal_bytes, admitted_fence_ok);
 
             switch (occupied.kind)
             {
@@ -897,7 +907,7 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
         const RefCkpt contribution{.life_epoch = std::nullopt,
                                    .checkpoint_snapshot_id = std::nullopt,
                                    .last_epoch_seal = last_epoch_seal};
-        if (publishCkptContribution(ns, contribution, admitted_generation) == CkptPublishOutcome::FencedOut)
+        if (publishCkptContribution(life, contribution, admitted_generation) == CkptPublishOutcome::FencedOut)
             throwCasWriteRetryLater(fmt::format(
                 "CAS ref-table recovery for namespace '{}': the mount incarnation moved before the "
                 "checkpoint could record the epoch seal {}-{}; nothing was written and nothing is installed",
@@ -905,6 +915,100 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
     }
 
     return result;
+}
+
+NamespaceLifeId CasRefLedger::resolveNamespaceLife(
+    const RootNamespace & ns, uint64_t admitted_generation, uint64_t live_epoch)
+{
+    /// Bounded exactly like `CasRefCatalog::casUpdateImpl`'s own live-lock brake, but against THIS
+    /// loop's re-read cycle only -- every primitive called below already bounds its OWN retry against
+    /// the catalog's single contended object. A duel between two openers (one creating, one
+    /// reconciling a stale creator) converges in a handful of rounds; this guards only against a
+    /// pathologically un-converging sequence of them.
+    static constexpr size_t kMaxResolveAttempts = 32;
+    const CkptDeadline deadline{boot_ms_now_fn, boot_ms_now_fn() + cas_request_budget.operation_deadline_ms};
+    const CreatorFence our_fence{server_root_id, live_epoch, admitted_generation};
+
+    for (size_t attempt = 0; attempt < kMaxResolveAttempts; ++attempt)
+    {
+        const CasRefCatalog::Snapshot snap = CasRefCatalog::read(backend, layout);
+        const auto it = std::find_if(snap.catalog.entries.begin(), snap.catalog.entries.end(),
+            [&](const CatalogEntry & e) { return e.ns.string() == ns.string(); });
+
+        if (it == snap.catalog.entries.end())
+        {
+            /// No entry at all: this open is the namespace's first-ever opener. `createNamespace`
+            /// mints a fresh incarnation and carries it all the way to `Live` (or reports why it could
+            /// not); either way it does not hand the incarnation back, so a `Live` outcome re-reads the
+            /// catalog on the next loop iteration to learn it -- one extra GET, paid once per birth,
+            /// never per write.
+            const auto outcome = CasRefCatalog::createNamespace(
+                backend, layout, ns, our_fence, admitted_generation, check_fence_or_throw, deadline);
+            if (outcome == CasRefCatalog::NamespaceCreationOutcome::FencedOut)
+                throwCasWriteRetryLater(fmt::format(
+                    "CAS ref-table recovery for namespace '{}': the mount incarnation moved while "
+                    "birthing its catalog entry; nothing was written and nothing installed", ns.string()));
+            continue;   /// Live or Superseded: re-read (Superseded means a DIFFERENT actor won birth)
+        }
+
+        if (it->state != NsState::Creating)
+            /// `Live` or `Removing`: both already carry a settled, nonzero incarnation, and this
+            /// resolution only needs A life to key ref-layer objects with -- refusing new ownership of
+            /// a `Removing` namespace is Task 6's read-side contract, not this call's job.
+            return NamespaceLifeId::fromCatalogEntry(it->ns, it->incarnation);
+
+        /// `Creating`, with a strict-grammar creator fence (`CatalogEntry`'s own invariant guarantees
+        /// `it->creator` is set whenever `state == Creating`). If it names THIS mount's own currently
+        /// live fence, an earlier attempt of this SAME open landed step 1 (`casAdmitEntry`) but not
+        /// steps 2/3 -- e.g. a transient failure inside `completeCreation`'s own `publishCkpt` retry --
+        /// and resuming is simply re-running steps 2/3 over the entry as observed just now. Reasoning
+        /// about fence terminality for our OWN live fence would never terminate (we are, by definition,
+        /// not dead), so this case is checked FIRST and unconditionally, before any terminality probe.
+        if (it->creator->server_root_id == server_root_id && it->creator->writer_epoch == live_epoch)
+        {
+            const auto outcome = CasRefCatalog::completeCreation(
+                backend, layout, *it, admitted_generation, check_fence_or_throw, deadline);
+            if (outcome == CasRefCatalog::NamespaceCreationOutcome::FencedOut)
+                throwCasWriteRetryLater(fmt::format(
+                    "CAS ref-table recovery for namespace '{}': the mount incarnation moved while "
+                    "resuming its own stalled creation; nothing was written and nothing installed",
+                    ns.string()));
+            continue;   /// Live or Superseded: re-read either way
+        }
+
+        /// A DIFFERENT actor's `Creating` entry. It may still be mid-flight (retry later, against a
+        /// fresh read -- never busy-loop this instant) or provably dead, in which case reconciliation
+        /// steals it onto our own fence and this open resumes `completeCreation` itself.
+        const auto reconcile_outcome = CasRefCatalog::reconcileStaleCreator(
+            backend, layout, *it, our_fence,
+            [this](const CreatorFence & f) { return isCreatorFenceTerminal(backend, layout, f.server_root_id, f.writer_epoch); });
+        switch (reconcile_outcome)
+        {
+            case CasRefCatalog::ReconcileCreatorOutcome::Reconciled:
+            {
+                CatalogEntry resumed = *it;
+                resumed.creator = our_fence;
+                const auto outcome = CasRefCatalog::completeCreation(
+                    backend, layout, resumed, admitted_generation, check_fence_or_throw, deadline);
+                if (outcome == CasRefCatalog::NamespaceCreationOutcome::FencedOut)
+                    throwCasWriteRetryLater(fmt::format(
+                        "CAS ref-table recovery for namespace '{}': the mount incarnation moved while "
+                        "completing a reconciled creation; nothing was written and nothing installed",
+                        ns.string()));
+                continue;   /// Live or Superseded: re-read either way
+            }
+            case CasRefCatalog::ReconcileCreatorOutcome::CreatorFenceStillLive:
+                throwCasWriteRetryLater(fmt::format(
+                    "CAS ref-table recovery for namespace '{}': its catalog entry is still Creating "
+                    "under a creator fence that is not yet provably dead; retry later", ns.string()));
+            case CasRefCatalog::ReconcileCreatorOutcome::EntryChanged:
+                continue;   /// token-exactness failed: someone else already moved this entry; re-read
+        }
+    }
+
+    throwCasWriteRetryLater(fmt::format(
+        "CAS ref-table recovery for namespace '{}': its catalog entry did not converge to a resolvable "
+        "incarnation after {} attempts", ns.string(), kMaxResolveAttempts));
 }
 
 void CasRefLedger::ensureRefTableRecovered(const RootNamespace & ns, RefTableRuntime & rt)
@@ -972,6 +1076,38 @@ void CasRefLedger::ensureRefTableRecovered(const RootNamespace & ns, RefTableRun
     {
         try
         {
+            /// ---- Step 0 (Stage B, spec INV-3): resolve this table's catalog life, ONCE per table-open ----
+            /// `rt.life` persists for this `RefTableRuntime`'s whole lifetime once set (a self-remount's
+            /// `quiesceRefTablesForRemount` is what ever produces a FRESH runtime, never this function),
+            /// so a `NeedsRecovery` re-recovery of the SAME runtime skips straight past this and re-walks
+            /// under the life it already resolved. Runs inside this try so a busy/stalled catalog reuses
+            /// the SAME transient-retry envelope as an object-store blip (`resolveNamespaceLife` throws
+            /// the retry-later class -- `NETWORK_ERROR` -- for exactly the cases worth backing off on:
+            /// a fenced-out attempt, or a `Creating` entry whose creator is not yet provably dead).
+            if (!rt.life)
+            {
+                lock.unlock();
+                /// Re-acquire before letting a `resolveNamespaceLife` failure unwind into the `catch`
+                /// below, which unconditionally re-locks (and, on the OUTER transient-retry path, calls
+                /// `lock.unlock()` again itself) -- same obligation, and the same shape, as the sleep's
+                /// try/catch further down this function.
+                std::optional<NamespaceLifeId> resolved;
+                try
+                {
+                    resolved = resolveNamespaceLife(ns, admitted_generation, live_epoch);
+                }
+                catch (...)
+                {
+                    lock.lock();
+                    throw;
+                }
+                lock.lock();
+                /// Re-validate after the unlocked catalog I/O, exactly as every other unlocked window in
+                /// this function does before trusting what it learned there.
+                checkRecoveryStillAdmitted(ns, rt, cancelled);
+                rt.life = *resolved;
+            }
+
             std::optional<String> hole_detail;
             for (uint64_t attempt = 0; ; ++attempt)
             {
@@ -1479,7 +1615,8 @@ bool CasRefLedger::observedNamespaceCleanupMarker(const RootNamespace & ns, cons
     /// answering; if it is durably present now, adopt it into the cached set. This preserves fail-close
     /// (a still-absent marker keeps recreation rejected -- evidence is refreshed, never assumed) and
     /// matches the recovery restart-on-vanish philosophy of consulting the durable object on a cache miss.
-    const HeadResult head = backend.head(layout.refCleanupMarkerKey(NamespaceLifeId::stageATransition(ns), remove_txn_id));
+    chassert(rt->life);
+    const HeadResult head = backend.head(layout.refCleanupMarkerKey(*rt->life, remove_txn_id));
     if (head.exists)
     {
         rt->cleanup_markers.insert(remove_txn_id);
@@ -2536,13 +2673,13 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
 }
 
 CasRefLedger::PreparedRefChunk CasRefLedger::prepareRefChunk(
-    const Layout & layout, const RootNamespace & ns, RefTableState state, const RefTxnId & id,
+    const Layout & layout, const NamespaceLifeId & life, RefTableState state, const RefTxnId & id,
     const std::optional<RefTxnId> & chain_link, std::span<const RefOp> ops, uint64_t admitted_generation)
 {
     PreparedRefChunk prepared{
         .candidate = std::move(state),
         .candidate_base_id = {},
-        .chunk_txn = RefLogTxn{ns.string(), id, std::vector<RefOp>(ops.begin(), ops.end()), chain_link},
+        .chunk_txn = RefLogTxn{life.ns.string(), id, std::vector<RefOp>(ops.begin(), ops.end()), chain_link},
         .prepared_attempt = {},
         .birth_contribution = std::nullopt,
     };
@@ -2590,7 +2727,7 @@ CasRefLedger::PreparedRefChunk CasRefLedger::prepareRefChunk(
     /// attempted, so retry-later is the truthful class, and it is the class they already got whenever the
     /// preceding chunk failed for any other reason.
     prepared.prepared_attempt.txn_id = id;
-    prepared.prepared_attempt.key = layout.refLogKey(NamespaceLifeId::stageATransition(ns), id);
+    prepared.prepared_attempt.key = layout.refLogKey(life, id);
     prepared.prepared_attempt.admitted_fence_generation = admitted_generation;
     prepared.prepared_attempt.bytes = sealObject(FormatId::RefLog, encodeRefLogTxn(prepared.chunk_txn));
 
@@ -2765,9 +2902,10 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
     /// for a malformed namespace -- unreachable here, since a mounted table's namespace already passed
     /// that check, but the list is not meant to read closed.
     std::optional<PreparedRefChunk> prepared;
+    chassert(rt->life);
     try
     {
-        prepared.emplace(prepareRefChunk(layout, ns, std::move(*state_snapshot), id, chain_link,
+        prepared.emplace(prepareRefChunk(layout, *rt->life, std::move(*state_snapshot), id, chain_link,
                                          chunk_ops, admitted_fence_generation));
     }
     catch (...)
@@ -2821,7 +2959,7 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
     {
         try
         {
-            if (publishCkptContribution(ns, *prepared->birth_contribution,
+            if (publishCkptContribution(*rt->life, *prepared->birth_contribution,
                                         admitted_fence_generation) == CkptPublishOutcome::FencedOut)
             {
                 complete_error(chunk_survivors, makeCasWriteRetryLaterExceptionPtr(fmt::format(
@@ -2847,24 +2985,48 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
     /// have landed, and deleting there could erase the one genesis-epoch record nothing else will ever
     /// recover (see the comment above this publish).
     ///
-    /// Safe under TODAY's sentinel keying (every incarnation of `ns` shares one `_ckpt` key, per
-    /// `NamespaceLifeId::stageATransition`) precisely because every call site below also drives the
-    /// lane to a TERMINAL state (`Closed`/`Faulted`) that only resumes under a FRESH writer epoch: the
-    /// next successful birth attempt for `ns` reaches `publishCkpt`'s absent-object create path, not a
-    /// merge onto this attempt's now-deleted body. Mirrors the
-    /// GC-side backstop for the REMOVED-namespace case (`Gc/CasGc.cpp`'s "THE `_ckpt` BACKSTOP", which
-    /// explicitly defers "the ordinary delete of this object by exact token" to Stage B's lifecycle --
-    /// this is that delete, for the NEVER-BORN case the GC backstop cannot reach (namespace cleanup
-    /// runs only for `Removed` namespaces, and a birth that never lands never gets there). Best-effort
-    /// and NEVER THROWS: one stubborn HEAD/delete must never turn an already-failed commit into a
-    /// second, unrelated failure the caller has to untangle from the real one.
+    /// RE-DERIVED at the Stage B (Task 4-C) key shape -- the object this deletes moved from the
+    /// Stage-A sentinel to `*rt->life`'s real catalog incarnation, and the argument does not carry
+    /// unexamined. Two things changed and one stayed:
+    ///   - the cross-incarnation sharing the old argument had to reason about is GONE: each life now
+    ///     has its own `_ckpt` key, so this delete can no longer touch a DIFFERENT life's object;
+    ///   - a NEW same-incarnation writer exists that did not before Task 4-C: `resolveNamespaceLife`'s
+    ///     `completeCreation` call already published THIS incarnation's genesis `_ckpt`
+    ///     (`life_epoch = creator.writer_epoch`) at table-open, strictly before this birth chunk's own
+    ///     redundant republish of the identical value (same runtime, same live epoch, no remount in
+    ///     between -- a remount would have discarded this very `RefTableRuntime`). Deleting the object
+    ///     therefore also deletes that genesis record, and this is still safe: the guard above
+    ///     (`!prepared->birth_contribution`) is set only by a `NamespaceBirth` op, which INV-1's
+    ///     contiguity rule lets `applyRefLogTxn` accept only against an EMPTY table -- so this whole
+    ///     lambda is reachable only while the namespace's ref-log has never durably held anything, and
+    ///     recovery's own base-selection already treats "no `_ckpt` and no listed log" as never-born
+    ///     (the identical verdict it would reach from a `_ckpt` that only ever named this same
+    ///     `life_epoch`, since that epoch's log is provably empty here too);
+    ///   - what STAYS true: every call site below still drives the lane to a TERMINAL state
+    ///     (`Closed`/`Faulted`) that only resumes under a FRESH writer epoch (a remount), and a fresh
+    ///     epoch's own `resolveNamespaceLife` re-reads the catalog, finds this SAME incarnation still
+    ///     `Live` (this delete touches no catalog entry), and its recovery walk reaches
+    ///     `readCkpt`'s absent-object branch rather than a merge onto this attempt's now-deleted body.
+    /// NEGATIVE CASE, confirmed rather than assumed: a `Live` namespace that has ever durably committed
+    /// so much as its own genesis transaction can never reach this lambda again -- a second
+    /// `NamespaceBirth` against non-empty state fails `applyRefLogTxn` during PREPARATION (before
+    /// `prepared->birth_contribution` is even considered here), so no call site below is reachable for
+    /// a namespace whose `_ckpt` anything else depends on. `_ckpt` has no repair path, so this
+    /// reachability bound -- not merely the terminal-lane argument -- is what makes the delete safe.
+    /// Mirrors the GC-side backstop for the REMOVED-namespace case (`Gc/CasGc.cpp`'s "THE `_ckpt`
+    /// BACKSTOP", which explicitly defers "the ordinary delete of this object by exact token" to Stage
+    /// B's lifecycle -- this is that delete, for the NEVER-BORN case the GC backstop cannot reach
+    /// (namespace cleanup runs only for `Removed` namespaces, and a birth that never lands never gets
+    /// there). Best-effort and NEVER THROWS: one stubborn HEAD/delete must never turn an already-failed
+    /// commit into a second, unrelated failure the caller has to untangle from the real one.
     const auto cleanupOrphanedBirthCkptBestEffort = [&]
     {
         if (!prepared->birth_contribution)
             return;
+        chassert(rt->life);
         try
         {
-            const String ckpt_key = layout.refCkptKey(NamespaceLifeId::stageATransition(ns));
+            const String ckpt_key = layout.refCkptKey(*rt->life);
             if (const HeadResult ckpt_head = backend.head(ckpt_key); ckpt_head.exists)
                 backend.deleteExact(ckpt_key, ckpt_head.token);   /// NotFound/TokenMismatch tolerated
         }
@@ -3487,14 +3649,14 @@ void clampedCounterSub(std::atomic<uint64_t> & counter, uint64_t amount)
 }
 
 
-CkptPublishOutcome CasRefLedger::publishCkptContribution(const RootNamespace & ns, const RefCkpt & contribution,
+CkptPublishOutcome CasRefLedger::publishCkptContribution(const NamespaceLifeId & life, const RefCkpt & contribution,
                                                          uint64_t admitted_generation)
 {
     /// The retry window is the SAME budget every other CAS operation of this ledger rides, measured on
     /// the ledger's own injectable boot clock -- so a test drives the exhaustion arm without sleeping,
     /// and a VM suspend cannot shorten it.
     const CkptDeadline deadline{boot_ms_now_fn, boot_ms_now_fn() + cas_request_budget.operation_deadline_ms};
-    const CkptPublishOutcome outcome = publishCkpt(backend, layout, ns, contribution, admitted_generation,
+    const CkptPublishOutcome outcome = publishCkpt(backend, layout, life, contribution, admitted_generation,
                                                    check_fence_or_throw, deadline);
     if (outcome == CkptPublishOutcome::Published)
         ProfileEvents::increment(ProfileEvents::CasRefCkptPublished);
@@ -3583,7 +3745,8 @@ bool CasRefLedger::trySnapshotPublishOnce(const RootNamespace & ns)
         advancePublishBackoff(*rt);
         return false;
     }
-    const String key = layout.refSnapshotKey(NamespaceLifeId::stageATransition(ns), candidate_x);
+    chassert(rt->life);
+    const String key = layout.refSnapshotKey(*rt->life, candidate_x);
     const auto fence_ok = [this] { return fence_ok_fn(); };
     const CasWriteOutcome outcome = ref_request_controller->putIfAbsentControlled(key, bytes, fence_ok);
     if (outcome != CasWriteOutcome::Committed)
@@ -3618,7 +3781,7 @@ bool CasRefLedger::trySnapshotPublishOnce(const RootNamespace & ns)
     bool ckpt_advanced = false;
     try
     {
-        ckpt_advanced = publishCkptContribution(ns, RefCkpt{.life_epoch = std::nullopt,
+        ckpt_advanced = publishCkptContribution(*rt->life, RefCkpt{.life_epoch = std::nullopt,
                                                             .checkpoint_snapshot_id = candidate_x,
                                                             .last_epoch_seal = std::nullopt},
                                                 admitted_generation) != CkptPublishOutcome::FencedOut;
@@ -3877,7 +4040,8 @@ void CasRefLedger::publishRemovedSnapshotNow(const RootNamespace & ns)
     removed_snap.lifecycle = RefLifecycle::Removed;
     removed_snap.remove_txn_id = remove_id;
     const String bytes = sealObject(FormatId::RefSnapshot, encodeRefTableSnapshot(removed_snap));
-    const String key = layout.refSnapshotKey(NamespaceLifeId::stageATransition(ns), remove_id);
+    chassert(rt->life);
+    const String key = layout.refSnapshotKey(*rt->life, remove_id);
     const auto fence_ok = [this] { return fence_ok_fn(); };
     const CasWriteOutcome outcome = ref_request_controller->putIfAbsentControlled(key, bytes, fence_ok);
     if (outcome != CasWriteOutcome::Committed)

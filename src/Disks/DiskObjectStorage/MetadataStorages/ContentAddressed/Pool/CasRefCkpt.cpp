@@ -41,9 +41,9 @@ RefCkpt mergeCkpt(const RefCkpt & a, const RefCkpt & b)
     return merged;
 }
 
-std::optional<CkptSample> readCkpt(Backend & backend, const Layout & layout, const RootNamespace & ns)
+std::optional<CkptSample> readCkpt(Backend & backend, const Layout & layout, const NamespaceLifeId & life)
 {
-    std::optional<GetResult> got = backend.get(layout.refCkptKey(NamespaceLifeId::stageATransition(ns)));
+    std::optional<GetResult> got = backend.get(layout.refCkptKey(life));
     if (!got)
         return std::nullopt;
     /// Materialized read, then decode: the object is MUTABLE, so the body must be fixed before it is
@@ -51,12 +51,12 @@ std::optional<CkptSample> readCkpt(Backend & backend, const Layout & layout, con
     return CkptSample{decodeRefCkpt(got->bytes), got->token};
 }
 
-CkptPublishOutcome publishCkpt(Backend & backend, const Layout & layout, const RootNamespace & ns,
+CkptPublishOutcome publishCkpt(Backend & backend, const Layout & layout, const NamespaceLifeId & life,
                                const RefCkpt & contribution, uint64_t admitted_generation,
                                const std::function<void(uint64_t)> & check_fence_or_throw,
                                const CkptDeadline & deadline)
 {
-    const String key = layout.refCkptKey(NamespaceLifeId::stageATransition(ns));
+    const String key = layout.refCkptKey(life);
 
     for (size_t attempt = 0; attempt < MAX_CKPT_CAS_ATTEMPTS; ++attempt)
     {
@@ -66,7 +66,7 @@ CkptPublishOutcome publishCkpt(Backend & backend, const Layout & layout, const R
         /// Read the WHOLE body every attempt. A retry after a conflict must merge against what is
         /// there NOW: reusing the previous attempt's reading is precisely the read-modify-write with
         /// the merge left out, one round later.
-        const std::optional<CkptSample> current = readCkpt(backend, layout, ns);
+        const std::optional<CkptSample> current = readCkpt(backend, layout, life);
         /// ANY writer may create the object; none of them may invent a field. An absent `_ckpt` is
         /// created from the contribution as it stands, so a publisher that knows only the checkpoint
         /// creates one that knows only the checkpoint, and the birth transaction's `life_epoch` merges
@@ -105,7 +105,7 @@ CkptPublishOutcome publishCkpt(Backend & backend, const Layout & layout, const R
 
     /// Fail closed. Every attempt was all-or-nothing, so there is no partial state -- only an
     /// unpublished contribution, which the caller must be told about rather than left to assume.
-    throwCasWriteRetryLater("CAS _ckpt for namespace '" + ns.string()
+    throwCasWriteRetryLater("CAS _ckpt for namespace '" + life.ns.string()
         + "': persistent CAS contention, the checkpoint contribution was not published");
 }
 

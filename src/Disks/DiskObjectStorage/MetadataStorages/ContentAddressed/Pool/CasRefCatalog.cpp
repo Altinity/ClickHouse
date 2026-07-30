@@ -24,6 +24,15 @@ CasRefCatalog::Snapshot CasRefCatalog::read(Backend & backend, const Layout & la
     return Snapshot{.catalog = decodeRefCatalog(got->bytes), .token = got->token};
 }
 
+NamespaceLifeId CasRefCatalog::resolveLifeOrSentinel(Backend & backend, const Layout & layout, const RootNamespace & ns)
+{
+    const Snapshot snap = read(backend, layout);
+    for (const CatalogEntry & entry : snap.catalog.entries)
+        if (entry.ns.string() == ns.string() && entry.state != NsState::Creating)
+            return NamespaceLifeId::fromCatalogEntry(entry.ns, entry.incarnation);
+    return NamespaceLifeId::stageATransition(ns);
+}
+
 namespace
 {
 
@@ -148,7 +157,8 @@ CasRefCatalog::NamespaceCreationOutcome CasRefCatalog::completeCreation(
     /// discipline this rides on unchanged. `FencedOut` here ends the attempt: nothing durable changed.
     const RefCkpt contribution{.life_epoch = std::optional<uint64_t>{observed.creator->writer_epoch},
                                 .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
-    if (publishCkpt(backend, layout, observed.ns, contribution, admitted_generation, check_fence_or_throw,
+    if (publishCkpt(backend, layout, NamespaceLifeId::fromCatalogEntry(observed.ns, observed.incarnation),
+                     contribution, admitted_generation, check_fence_or_throw,
                      deadline) == CkptPublishOutcome::FencedOut)
         return NamespaceCreationOutcome::FencedOut;
 

@@ -8,6 +8,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcShardPlan.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCkptFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.h>
@@ -1124,7 +1125,9 @@ Gc::CheckpointWitnesses Gc::readCheckpointWitnesses(const std::map<String, RefTa
     for (const String & ns_str : witness_namespaces)
     {
         const RootNamespace ns{ns_str};
-        const String ckpt_key = layout.refCkptKey(NamespaceLifeId::stageATransition(ns));
+        /// Stage B (Task 4-C): see `CasRefCatalog::resolveLifeOrSentinel`'s doc for why the sentinel
+        /// fallback is correct, not a guess, for a namespace the catalog does not name.
+        const String ckpt_key = layout.refCkptKey(CasRefCatalog::resolveLifeOrSentinel(backend, layout, ns));
         /// THE GET AND THE DECODE ARE SPLIT HERE, rather than taken together through `readCkpt`, so the
         /// catch below can scope to the DECODE ALONE. Wrapping the read too would turn a transport
         /// failure -- which says nothing about this object and everything about the round's ability to
@@ -1162,6 +1165,8 @@ Gc::CheckpointWitnesses Gc::readCheckpointWitnesses(const std::map<String, RefTa
         /// because some OTHER field (`life_epoch`, `last_epoch_seal`) was published into it first.
         if (ckpt.checkpoint_snapshot_id)
             out.witnesses.emplace(ns_str, *ckpt.checkpoint_snapshot_id);
+        if (ckpt.life_epoch)
+            out.life_epochs.emplace(ns_str, *ckpt.life_epoch);
     }
     return out;
 }
@@ -1358,6 +1363,68 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     ref_list_timer.emplace(phase_sink, "fold_ref_group");
     const std::vector<String> & ref_object_keys = ref_scan.keys;
 
+    /// Stage B (spec INV-3): the round's ONE catalog `GET`. `live_incarnation` names, for every
+    /// namespace the catalog admits as `Live`/`Removing`, the ONE incarnation the fold may act on --
+    /// `Creating` is excluded, matching `discoverUniverse` (no publication can exist yet). This is what
+    /// makes the fold catalog-authoritative rather than LIST-authoritative: the pool-wide ref LIST
+    /// remains the round's intra-namespace hint (what a namespace the catalog already named has
+    /// listed), never the source of WHICH namespaces exist. Reused below for the catalog-only walk
+    /// targets, so the round pays this GET once.
+    const CasRefCatalog::Snapshot catalog_snapshot = CasRefCatalog::read(backend, layout);
+    std::map<String, UInt128> live_incarnation;
+    for (const CatalogEntry & entry : catalog_snapshot.catalog.entries)
+        if (entry.state != NsState::Creating)
+            live_incarnation.emplace(entry.ns.string(), entry.incarnation);
+
+    /// R10 (`docs/superpowers/cas/2026-07-28-ref-rework-adjacent-findings.md {#r10-groupref-alias}`):
+    /// `groupRefKeys` groups listed keys by namespace NAME alone and drops the parsed incarnation, so
+    /// if a namespace was dropped and recreated before GC cleaned up the dead incarnation's ref objects,
+    /// and BOTH incarnations' keys appear in this round's listing, their log/snapshot/cleanup ids would
+    /// merge into ONE `RefTableListing` under the shared name. Filtered here, ahead of `groupRefKeys`:
+    /// a key of a life the catalog does not currently recognize as `Live`/`Removing` -- a DEAD
+    /// incarnation's surviving objects, or (pre-release, so not a persisted-data concern) a namespace
+    /// with no catalog entry at all -- is foreign-prefix-inert from the fold's own perspective and is
+    /// dropped, never merged into any `RefTableListing`, never an error. What this does NOT do, so
+    /// nobody expects it: the PARSER still accepts a dead incarnation's key, deliberately -- `Layout`
+    /// is catalog-independent by design, so it is the wrong place to refuse. A key that names no life at
+    /// all (fails every parse) is left untouched for `groupRefKeys`' own strict check to classify.
+    std::vector<String> live_ref_object_keys;
+    live_ref_object_keys.reserve(ref_object_keys.size());
+    for (const String & key : ref_object_keys)
+    {
+        std::optional<NamespaceLifeId> id;
+        if (const auto ckpt_id = layout.parseRefCkptKey(key))
+        {
+            id = ckpt_id;
+        }
+        else
+        {
+            /// Absorb ONLY `CORRUPTED_DATA` (the un-incarnated/malformed-life shape): the key stays in
+            /// the pass-through set, unindexed by this filter, so `groupRefKeys`' own strict check is
+            /// what raises on it -- mirroring the absorption `parseRefObjectKeyForEnumeration` already
+            /// applies at the pool-wide enumeration sites, which this filter cannot call directly (it
+            /// runs before that helper is defined in this TU).
+            try
+            {
+                if (const auto parsed = layout.parseRefObjectKey(key))
+                    id = parsed->id;
+            }
+            catch (const Exception & e)
+            {
+                if (e.code() != ErrorCodes::CORRUPTED_DATA)
+                    throw;
+            }
+        }
+        if (!id)
+        {
+            live_ref_object_keys.push_back(key);
+            continue;
+        }
+        const auto it = live_incarnation.find(id->ns.string());
+        if (it != live_incarnation.end() && it->second == id->incarnation)
+            live_ref_object_keys.push_back(key);
+    }
+
     /// A malformed ref-object key or namespace aborts ref folding for the whole round: the
     /// round produces no ref delta, advances no cursor, and authorizes no destructive work -- recorded as
     /// an anomaly (which drives `suppress_destructive`), never a throw that wedges the round.
@@ -1365,7 +1432,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     bool ref_folding_aborted = false;
     try
     {
-        ref_tables = groupRefKeys(layout, ref_object_keys);
+        ref_tables = groupRefKeys(layout, live_ref_object_keys);
     }
     catch (const Exception & e)
     {
@@ -1813,6 +1880,25 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         ++intake_unhinted_quiet;
     }
 
+    /// Stage B (spec §5, Task 9's frontier proof): EVERY `Live`/`Removing` catalog entry is walked,
+    /// full stop -- not merely the ones a LIST hint or a carried cursor happened to also know about.
+    /// This is additive over everything above (a namespace already walked via `ref_tables` or the
+    /// `parent_cursors` loop is skipped here), so it can only WIDEN the round's proof obligation, never
+    /// narrow it, matching this function's own "a quiet hint can only ever ADD" direction. Unlike the
+    /// merely-quiet loop above, this one is NOT budget-limited: the catalog is the universe authority
+    /// now, so a namespace it lists is not optional coverage.
+    uint64_t intake_catalog_only = 0;
+    for (const auto & [catalog_ns_str, catalog_incarnation] : live_incarnation)
+    {
+        if (ref_tables.contains(catalog_ns_str))
+            continue;
+        if (parent_cursors.contains(cursorKey(RootNamespace{catalog_ns_str}, /*shard*/0)))
+            continue;   /// already added above, held or quiet
+        (void)catalog_incarnation;   /// the walk below still reads by NAME; see the loop's own note
+        walk_targets.push_back({catalog_ns_str, &kNoListing, std::nullopt});
+        ++intake_catalog_only;
+    }
+
     for (const WalkTarget & target : walk_targets)
     {
         const String & ns_str = target.ns;
@@ -1820,6 +1906,14 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         if (ref_folding_aborted)
             break;
         const RootNamespace ns{ns_str};
+        /// Stage B (Task 4-C): this round's own catalog read (`live_incarnation`, built once above for
+        /// the R10 filter) names every namespace's REAL incarnation; a namespace it does not name (a
+        /// raw-fixture test that never touched the catalog) falls back to the Stage-A sentinel, which is
+        /// the only other identity such a namespace could have keyed its objects at.
+        const auto life_it = live_incarnation.find(ns_str);
+        const NamespaceLifeId life = life_it != live_incarnation.end()
+            ? NamespaceLifeId::fromCatalogEntry(ns, life_it->second)
+            : NamespaceLifeId::stageATransition(ns);
         const String cursor_key = cursorKey(ns, /*shard*/0);
 
         /// Parent cursor = the durable last_folded_ref_id this table folded to (absent => {0,0}).
@@ -1881,9 +1975,10 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         /// the walk read the expected-next position by exact key, found it ABSENT, and no witness put
         /// anything above it. That is the honest end of the record stream. Every other way out of the
         /// loop leaves the namespace unproven -- a hold (this round's or a carried one), and the walk
-        /// that never started because a never-folded namespace's hint offered no genesis position to
-        /// start from (the Stage B `_ckpt.life_epoch` gap documented at the `expected` initialization
-        /// below: no probe was taken, so nothing was proved, and fail-closed says unproven).
+        /// that never started because a never-folded namespace's hint offered no genesis position AND
+        /// no `_ckpt.life_epoch` was on record either (the `expected` initialization below reads
+        /// `checkpoints.life_epochs` for exactly this case; a namespace with neither has a genuinely
+        /// unknown genesis, so no probe is taken, nothing is proved, and fail-closed says unproven).
         bool frontier_proven = false;
         /// The hold THIS round detected, at the position it stopped. It IS the clamp signal: there is
         /// no separate boolean that could disagree with it about whether the namespace stopped.
@@ -1970,7 +2065,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             ProfileEvents::increment(ProfileEvents::CasRefLogBodyGets, crossing.body_gets);
             if (crossing.outcome == EpochCrossOutcome::StartInvalid)
                 LOG_WARNING(logger, "CAS GC ref intake: epoch-start log {} invalid: {}",
-                            layout.refLogKey(NamespaceLifeId::stageATransition(ns), crossing.probed), crossing.detail);
+                            layout.refLogKey(life, crossing.probed), crossing.detail);
             return crossing.proved() ? std::optional<RefTxnId>(crossing.start) : std::nullopt;
         };
 
@@ -1991,6 +2086,14 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         {
             if (!listing.logs.empty())
                 expected = listing.logs.front();
+            else if (const auto le = checkpoints.life_epochs.find(ns_str); le != checkpoints.life_epochs.end())
+                /// Stage B (Task 4-C): the gap this comment used to only describe. A `Live` namespace the
+                /// hint has never listed a log for still has a durable `_ckpt.life_epoch` once it went
+                /// through `completeCreation` -- production publishes that BEFORE any birth chunk -- so
+                /// its genesis position is arithmetic like every other step: `{life_epoch, 1}`. A namespace
+                /// admitted without a `_ckpt` (the test-only bridge) has no entry here and `expected` stays
+                /// `nullopt`, which is the correct fail-closed answer for a genuinely unknown genesis.
+                expected = RefTxnId{le->second, 1};
         }
         else
             expected = RefTxnId{cursor.writer_epoch, cursor.ref_sequence + 1};
@@ -2052,7 +2155,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             /// GET + decode the expected record. Absence is the decision point of the whole walk, and
             /// an invalid body is a per-namespace hold: the key belongs to exactly one namespace, so it
             /// can never be grounds for discarding another namespace's fold.
-            const auto got = backend.get(layout.refLogKey(NamespaceLifeId::stageATransition(ns), *expected));
+            const auto got = backend.get(layout.refLogKey(life, *expected));
             if (!got)
             {
                 ++intake_absent_probes;
@@ -2134,7 +2237,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             catch (const Exception & e)
             {
                 LOG_WARNING(logger, "CAS GC ref intake: log {} invalid: {}",
-                            layout.refLogKey(NamespaceLifeId::stageATransition(ns), log_id), e.message());
+                            layout.refLogKey(life, log_id), e.message());
                 hold(log_id, HoldReason::BodyUndecodable, "ref log body invalid: namespace held below it");
                 break;
             }
@@ -2488,14 +2591,17 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     intake_timer->metric("tails_unchanged", intake_tails_unchanged);
     intake_timer->metric("tails_below_cursor", intake_tails_below_cursor);
     /// THE FRONTIER OBLIGATION, on the row that explains a round which reclaimed nothing:
-    /// `frontier_namespaces` is the round's universe (hint ∪ sealed cursors), `frontier_proven` the part
-    /// of it that reached an honest end-of-stream, and the two remaining columns say where the rest
-    /// went -- walked because the hint had gone quiet about them, or not walked at all because the
-    /// probe budget ran out.
+    /// `frontier_namespaces` is the round's universe (hint ∪ sealed cursors ∪ catalog `Live`/`Removing`
+    /// entries), `frontier_proven` the part of it that reached an honest end-of-stream, and the
+    /// remaining columns say where the rest went -- walked because the hint had gone quiet about them,
+    /// not walked at all because the probe budget ran out, or walked ONLY because the catalog named a
+    /// namespace neither the hint nor a carried cursor did (`catalog_only_walked` -- always 0 until a
+    /// namespace is admitted with no listed objects and no sealed cursor yet).
     intake_timer->metric("frontier_namespaces", result.frontier_namespaces);
     intake_timer->metric("frontier_proven", result.frontier_proven);
     intake_timer->metric("unhinted_quiet_walked", intake_unhinted_quiet);
     intake_timer->metric("frontier_unprobed_budget", intake_unprobed_budget);
+    intake_timer->metric("catalog_only_walked", intake_catalog_only);
     intake_timer->metric("dead_precommits_skipped", intake_dead_precommits_skipped);
     /// The exact reads arithmetic intake pays that the listing-driven loop did not. `absent_probes`
     /// counts EVERY read that came back absent: the expected-next of each namespace walked (at least one
@@ -2701,7 +2807,16 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// production is the only possibility -- refuses, because Stage A cannot enumerate the namespaces
     /// the proofs would have to cover. See `UniversePolicy`.
     const bool universe_authoritative = policy == UniversePolicy::AuthoritativeForTest;
+    /// R11 (`docs/superpowers/cas/2026-07-28-ref-rework-adjacent-findings.md
+    /// {#r11-empty-universe-vacuous}`): `frontier_proven == frontier_namespaces` is `0 == 0` -- TRUE --
+    /// on an empty universe, which is not a proof of anything: a fresh pool, a damaged catalog, or a
+    /// read that legitimately returns nothing all produce zero entries. `frontier_namespaces > 0` is the
+    /// fail-closed floor that refuses to call that vacuous equality a complete frontier. It proves
+    /// nothing beyond that one refusal -- a nonzero count still needs every namespace PROVEN, which the
+    /// equality above still checks; this guard only closes the degenerate case the equality cannot tell
+    /// apart from a real proof.
     result.frontier_complete = universe_authoritative
+        && result.frontier_namespaces > 0
         && result.frontier_proven == result.frontier_namespaces;
     const bool frontier_incomplete = !result.frontier_complete;
 
@@ -2717,8 +2832,16 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         /// round of every pool -- so warning about it would emit one alarm per round forever and train
         /// operators to ignore the channel that carries the real ones. It is still reported, at Info,
         /// with the same numbers.
+        ///
+        /// An AUTHORITATIVE-but-EMPTY universe (R11's guard above, `frontier_namespaces == 0`) is a
+        /// per-round cause, not a static one: unlike Stage A's constant suppression, this is exactly the
+        /// "a fresh pool, a damaged catalog, or a read that legitimately returns nothing" case R11 names
+        /// -- something an operator can and should chase -- so it counts as a `per_round_cause` even
+        /// though the bare equality `frontier_proven != frontier_namespaces` reads `0 != 0` (false) and
+        /// would otherwise miss it.
         const bool per_round_cause = !report.anomalies.empty() || !carried_holds.empty()
-            || result.frontier_proven != result.frontier_namespaces;
+            || result.frontier_proven != result.frontier_namespaces
+            || (universe_authoritative && result.frontier_namespaces == 0);
         const char * const universe_note =
             universe_authoritative ? "" : "; the universe itself is not provable this stage";
         if (per_round_cause)
@@ -3057,6 +3180,9 @@ void Gc::cleanupRefObjects(const FoldResult & folded, bool suppress_destructive)
     for (const auto & [ns_str, listing] : folded.ref_tables)
     {
         const RootNamespace ns{ns_str};
+        /// Stage B (Task 4-C): see `CasRefCatalog::resolveLifeOrSentinel`'s doc for why the sentinel
+        /// fallback is correct, not a guess, for a namespace the catalog does not name.
+        const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(backend, layout, ns);
         RefTxnId durable_cursor{};
         if (const auto it = folded.fold_seal.per_ns_shard.find(cursorKey(ns, /*shard*/0));
             it != folded.fold_seal.per_ns_shard.end())
@@ -3082,14 +3208,14 @@ void Gc::cleanupRefObjects(const FoldResult & folded, bool suppress_destructive)
         const RefCleanupPlan plan = planRefCleanup(listing, durable_cursor, removal_logs_blocked,
                                                    completed_removal_snapshot, checkpoint);
         for (const RefTxnId & log_id : plan.deletable_logs)
-            deleteRefObject(layout.refLogKey(NamespaceLifeId::stageATransition(ns), log_id));
+            deleteRefObject(layout.refLogKey(life, log_id));
         for (const RefTxnId & snap_id : plan.deletable_snapshots)
         {
             /// Task 5's rule, asserted where it is acted on rather than only where it is computed: the
             /// snapshot the checkpoint names is the one a recovering reader will sample, so it must
             /// survive every cleanup that the same checkpoint authorized.
             chassert(!checkpoint || snap_id < *checkpoint);
-            deleteRefObject(layout.refSnapshotKey(NamespaceLifeId::stageATransition(ns), snap_id));
+            deleteRefObject(layout.refSnapshotKey(life, snap_id));
         }
     }
 }
@@ -3404,24 +3530,25 @@ std::optional<ParsedRefObjectKey> parseRefObjectKeyForEnumeration(const Layout &
 
 }
 
-std::vector<std::pair<RootNamespace, uint64_t>> Gc::discoverUniverse()
+std::vector<NamespaceLifeId> Gc::discoverUniverse()
 {
-    /// LIST-based table discovery: the discovery authority rests on LIST(cas/refs/).
-    /// Under the snapshot+log ref model there is one immutable-object stream per table (no numeric shards),
-    /// so each present table is reported once as `(ns, 0)`. Consistency requirement: the backend must give
-    /// read-your-writes LIST enumeration (S3 strongly consistent; InMemoryBackend by construction).
+    /// Stage B (spec INV-3): ONE catalog GET replaces the pool-wide LIST(cas/refs/) this used to run to
+    /// discover WHICH namespaces exist. `Creating` entries are excluded -- spec §3, "no publication can
+    /// exist" while a namespace is still being created, so there is nothing here for a discovery path to
+    /// walk; `Live` and `Removing` entries are both returned. `fromCatalogEntry` mints each life directly
+    /// from the row that is its own authority for both fields, never from a listed key (which could name
+    /// a DEAD incarnation of the same namespace name).
     const Layout & layout = store->layout();
     Backend & backend = store->backend();
-    std::set<String> namespaces;
-    forEachListedKey(backend, layout.casRefsPrefix(), [&](const ListedKey & lk)
+    const CasRefCatalog::Snapshot snapshot = CasRefCatalog::read(backend, layout);
+    std::vector<NamespaceLifeId> universe;
+    universe.reserve(snapshot.catalog.entries.size());
+    for (const CatalogEntry & entry : snapshot.catalog.entries)
     {
-        if (const auto parsed = parseRefObjectKeyForEnumeration(layout, lk.key))
-            namespaces.insert(parsed->id.ns.string());
-    }, 1000, onGcEnumerationPage);
-    std::vector<std::pair<RootNamespace, uint64_t>> universe;
-    universe.reserve(namespaces.size());
-    for (const String & ns : namespaces)
-        universe.emplace_back(RootNamespace{ns}, 0);
+        if (entry.state == NsState::Creating)
+            continue;
+        universe.push_back(NamespaceLifeId::fromCatalogEntry(entry.ns, entry.incarnation));
+    }
     return universe;
 }
 
@@ -3632,7 +3759,8 @@ void Gc::sampleRefListQuality(const RefScanSummary & round_scan, uint64_t curren
             {
                 try
                 {
-                    const bool present = backend.head(layout.refLogKey(NamespaceLifeId::stageATransition(RootNamespace{ns_str}), id)).exists;
+                    const bool present = backend.head(layout.refLogKey(
+                        CasRefCatalog::resolveLifeOrSentinel(backend, layout, RootNamespace{ns_str}), id)).exists;
                     head_verdict = present ? "present" : "absent";
                     /// Also a counter, not only an audit row and a log line: the audit sink is
                     /// optional (`EventEmitter` no-ops without one) and the text log is rotated and
@@ -3754,10 +3882,18 @@ RebuildReport Gc::rebuildBaseline(bool force)
                 /// state was lost) is healthy ONLY when no table proves cleaned logs -- the ref baseline
                 /// guard: a snapshot with no surviving log at or below it (its covered logs were cleaned
                 /// by a now-lost cursor).
-                for (const auto & [ns, root_shard] : discoverUniverse())
+                for (const NamespaceLifeId & life : discoverUniverse())
                 {
                     std::vector<String> table_keys;
-                    forEachListedKey(backend, layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)),
+                    /// The R10 pre-filter (`groupRefKeys` drops the incarnation when it groups by name,
+                    /// so two lives' keys can alias under one `RefTableListing`) is NOT needed here: this
+                    /// LIST is scoped to `refsNamespacePrefix(life)` -- ONE life's own exact `<ns>/<inc>/`
+                    /// prefix -- so a DIFFERENT incarnation's objects live under a DIFFERENT prefix and
+                    /// are never returned by it. The exclusion is structural, by the prefix itself, not
+                    /// by a filter this loop would have to apply. Contrast `fold()`'s pool-wide
+                    /// `casRefsPrefix()` LIST, which sees every life of every namespace in one listing and
+                    /// is where the filter actually earns its keep.
+                    forEachListedKey(backend, layout.refsNamespacePrefix(life),
                         [&](const ListedKey & lk) { table_keys.push_back(lk.key); }, 1000, onGcEnumerationPage);
                     /// `groupRefKeys` REFUSES a key that names no life, and this call is the rebuild's
                     /// own -- outside the fold's catch. An escaping refusal would take out the recovery
@@ -3778,7 +3914,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
                         healthy = false;
                         break;
                     }
-                    const auto git = grouped.find(ns.string());
+                    const auto git = grouped.find(life.ns.string());
                     if (git != grouped.end() && !git->second.snapshots.empty()
                         && (git->second.logs.empty() || git->second.snapshots.back() < git->second.logs.front()))
                     {
@@ -3986,14 +4122,22 @@ RebuildReport Gc::rebuildBaseline(bool force)
     uint64_t max_fence_round = 0;
     std::map<ManifestId, Token> mf_cleanup_unused;
 
-    for (const auto & [ns, root_shard] : universe)
+    for (const NamespaceLifeId & life : universe)
     {
+        const RootNamespace & ns = life.ns;
         seen_ns.insert(ns.string());
         ++rep.shards;
 
         /// Recover the table via the shared snapshot+tail equation: the current
         /// owner set is exactly the committed rows plus live precommits it yields. The rebuilt cursor is
         /// the greatest RefTxnId that verified view included.
+        ///
+        /// `recoverRefTable` (`CasRefProtocol.cpp`) still takes a bare `RootNamespace`, but it now
+        /// resolves `life`'s REAL incarnation itself, from the catalog (`CasRefCatalog::
+        /// resolveLifeOrSentinel`), falling back to the Stage-A sentinel only for a namespace the
+        /// catalog does not name at all (a raw-fixture test that never touched the catalog). So this
+        /// loop's own `life` and the one `recoverRefTable` resolves internally agree by construction --
+        /// both come from the SAME catalog entry -- without this call site having to thread it through.
         const RefTableState st = recoverRefTable(backend, layout, ns, onGcEnumerationPage);
 
         ShardCoverage cov;

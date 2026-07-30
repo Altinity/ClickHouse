@@ -81,7 +81,7 @@ struct CkptDeadline
 /// `admitted_generation` is the fence generation the CALLER captured when its work was admitted, and
 /// `check_fence_or_throw` is the callback the pool wires from `CasMountRuntime::checkFenceOrThrow`
 /// (the ledger never owns a `CasMountRuntime`; it receives the pair the way `CasPlainObjects` does).
-CkptPublishOutcome publishCkpt(Backend & backend, const Layout & layout, const RootNamespace & ns,
+CkptPublishOutcome publishCkpt(Backend & backend, const Layout & layout, const NamespaceLifeId & life,
                                const RefCkpt & contribution, uint64_t admitted_generation,
                                const std::function<void(uint64_t)> & check_fence_or_throw,
                                const CkptDeadline & deadline);
@@ -95,9 +95,9 @@ struct CkptSample
     Token token;
 };
 
-/// Point-read of `ns`'s `_ckpt`. `nullopt` means the object is absent (a namespace whose creation has
+/// Point-read of `life`'s `_ckpt`. `nullopt` means the object is absent (a namespace whose creation has
 /// not published one yet); a present-but-undecodable object throws `CORRUPTED_DATA`.
-std::optional<CkptSample> readCkpt(Backend & backend, const Layout & layout, const RootNamespace & ns);
+std::optional<CkptSample> readCkpt(Backend & backend, const Layout & layout, const NamespaceLifeId & life);
 
 /// The verdict of INV-4's three-way revalidation, for the one leg that is not simply "it is there".
 enum class MissingBaseVerdict : uint8_t

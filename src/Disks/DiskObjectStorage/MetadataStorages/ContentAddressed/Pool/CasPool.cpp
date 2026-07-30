@@ -184,6 +184,7 @@ Pool::Pool(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
     /// preserving the original member order verbatim (see the header note).
     , ref_ledger(
           pool_backend, pool_layout, config.refLedgerConfig(), event_sink_, config.cas_request_budget,
+          config.server_root_id,
           config.boot_ms_fn,
           [this] { return liveWriterEpoch(); },
           [this] { return refAppendFenceOk(); },

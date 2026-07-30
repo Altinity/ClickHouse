@@ -87,6 +87,12 @@ public:
         RefLedgerConfig config_,
         const CasEventSink & event_sink_,
         CasRequestBudget cas_request_budget_,
+        /// This mount's own `server_root_id` (spec §3's `CreatorFence`): the ledger mints its OWN
+        /// creator fence out of this plus the live writer epoch and admission fence generation when it
+        /// resolves a namespace's catalog life (`resolveNamespaceLife`) -- never injected as a callback,
+        /// unlike the mount-state functions below, because it is a fixed identity for this ledger's
+        /// whole lifetime (mirrors `CasMountRuntime`'s own by-value `server_root_id`).
+        String server_root_id_,
         /// Monotonic mount clock used by the retry controller; it may be empty when the controller's
         /// default clock is appropriate.
         std::function<uint64_t()> controller_boot_ms_fn,
@@ -459,8 +465,8 @@ public:
     /// read inside that hold, and `chain_link` is derived just outside it from the `last_epoch_seal` read
     /// inside it. Deriving the id from a different instant than the state it is applied to would be
     /// deriving it from a different stream. The critical section therefore stays in `commitRefChunk`, and
-    /// this is a pure function of its arguments -- what that one atomic reading saw, plus `layout`, `ns`
-    /// and `ops`.
+    /// this is a pure function of its arguments -- what that one atomic reading saw, plus `layout`,
+    /// `life` and `ops`.
     ///
     /// Every throw out of here is an ordinary PRE-durability rejection: no object exists, the cache is
     /// untouched, and the id is simply never used (the next attempt re-derives it from the same unchanged
@@ -468,7 +474,12 @@ public:
     /// inside is the same class, and so is `checkNamespace`'s `BAD_ARGUMENTS` on the key-building path
     /// (unreachable for a mounted table, listed so the enumeration does not read closed). See the FAULT
     /// CLASS note on the definition for what changed about WHO catches them.
-    static PreparedRefChunk prepareRefChunk(const Layout & layout, const RootNamespace & ns,
+    ///
+    /// `life` (Stage B, Task 4-C) is `RefTableRuntime::life` -- the caller's already-resolved catalog
+    /// life, read under the SAME critical section as `id`/`admitted_generation` (a caller with no
+    /// resolved life yet has no business preparing a chunk at all: `ensureRefTableRecovered` resolves
+    /// it before this table is exposed as recovered).
+    static PreparedRefChunk prepareRefChunk(const Layout & layout, const NamespaceLifeId & life,
                                             RefTableState state, const RefTxnId & id,
                                             const std::optional<RefTxnId> & chain_link,
                                             std::span<const RefOp> ops, uint64_t admitted_generation);
@@ -481,6 +492,9 @@ private:
     RefLedgerConfig config;
     const CasEventSink & event_sink;
     CasRequestBudget cas_request_budget;
+    /// This mount's `server_root_id`; see the constructor parameter's doc for why it is a plain
+    /// member rather than an injected callback.
+    String server_root_id;
     std::function<uint64_t()> live_epoch_fn;
     std::function<bool()> fence_ok_fn;
     std::function<uint64_t()> fence_generation_fn;
@@ -540,6 +554,16 @@ private:
         /// Test-only count of callers currently waiting for recovery; guarded by `state_mutex` so tests
         /// can observe that a concurrent caller reached the wait without depending on scheduling.
         uint64_t recovery_waiters_for_test = 0;
+        /// Stage B (spec INV-3): the catalog-resolved life this table's every ref-layer key is built
+        /// under -- `createNamespace`-minted, adopted from an existing `Live`/`Removing` entry, or
+        /// reconciled from a stale `Creating` one (`CasRefLedger::resolveNamespaceLife`). Resolved
+        /// ONCE per table-open, on the FIRST recovery attempt of this runtime's lifetime
+        /// (`ensureRefTableRecovered`), and never re-resolved by a later re-recovery of the SAME
+        /// runtime (`NeedsRecovery` walks again; the life it walks under does not change) -- a fresh
+        /// life is only ever seen by a FRESH `RefTableRuntime`, which a self-remount's
+        /// `quiesceRefTablesForRemount` is what produces. `nullopt` exactly until that first
+        /// resolution completes.
+        std::optional<NamespaceLifeId> life;
         RefTableState state;
         /// `_cleanup/<remove-txn-id>` markers observed at recovery, retained for namespace recreation
         /// checks.
@@ -732,11 +756,35 @@ private:
     /// Returns the cached runtime for `ns`, creating an empty unrecovered runtime when needed.
     std::shared_ptr<RefTableRuntime> getRefTableRuntime(const RootNamespace & ns);
 
-    /// Lazily recovers `ns` per spec §4: `_ckpt` -> exact-key base snapshot -> ARITHMETIC tail -> seal
-    /// CAS-walk -> `_ckpt` CAS -> install. It does not expose the table as recovered until every dead
-    /// epoch it discovered is durably closed; concurrent callers serialize across the whole unlocked I/O
-    /// window through `recovery_in_progress`.
+    /// Lazily recovers `ns` per spec §4: catalog life resolution (first table-open only) -> `_ckpt` ->
+    /// exact-key base snapshot -> ARITHMETIC tail -> seal CAS-walk -> `_ckpt` CAS -> install. It does not
+    /// expose the table as recovered until every dead epoch it discovered is durably closed; concurrent
+    /// callers serialize across the whole unlocked I/O window through `recovery_in_progress`.
     void ensureRefTableRecovered(const RootNamespace & ns, RefTableRuntime & rt);
+
+    /// Stage B (spec INV-3, §3): resolves `ns`'s catalog life -- ONCE per table-open, from inside
+    /// `ensureRefTableRecovered`'s transient-retry envelope, never from a per-write path (a per-write
+    /// catalog GET is a protocol-step addition and is vetoed). Three cases, closing over the catalog's
+    /// own three-state grammar:
+    ///   - no entry at all: this call is the namespace's first-ever opener. Mints one via
+    ///     `CasRefCatalog::createNamespace` under a `CreatorFence` built from `server_root_id`,
+    ///     `live_epoch` and `admitted_generation`;
+    ///   - an entry already `Live`/`Removing`: adopts its incarnation directly
+    ///     (`NamespaceLifeId::fromCatalogEntry`) -- `Removing` is adopted exactly like `Live` because
+    ///     this call only needs A life to key objects with; refusing WRITES to a `Removing` namespace
+    ///     is a different mechanism's job (Task 6's read-side contract), not this resolution's;
+    ///   - an entry `Creating`: if its `creator` fence is THIS mount's own (a previous attempt of this
+    ///     same open landed step 1 but not steps 2/3, e.g. after a transient error), resumes
+    ///     `completeCreation` directly over the observed entry; otherwise reconciles it via
+    ///     `CasRefCatalog::reconcileStaleCreator` + `isCreatorFenceTerminal`, refusing retry-later while
+    ///     the old creator's fence is not yet provably dead.
+    /// Every `createNamespace`/`completeCreation`/`reconcileStaleCreator` outcome that writes nothing
+    /// (`FencedOut`, `Superseded`, a reconciled entry, `EntryChanged`) re-reads the catalog and loops;
+    /// `CreatorFenceStillLive` throws the retry-later class, which this function's caller (the transient
+    /// retry loop) or a higher one re-drives. Bounded against a pathological duel between two openers;
+    /// each primitive this loop calls has its OWN bounded retry against the catalog's single object, so
+    /// this bound is only against THIS loop's re-read cycle.
+    NamespaceLifeId resolveNamespaceLife(const RootNamespace & ns, uint64_t admitted_generation, uint64_t live_epoch);
 
     /// ONE attempt of the recovery walk, run with NO lock held (the candidate is private; nothing
     /// touches `rt` until the install). `nullopt` REQUESTS A RESTART from a fresh listing -- the two
@@ -870,12 +918,13 @@ private:
     /// dispatch is fenced and the detached task retains the owner pin until it finishes.
     void maybeScheduleSnapshotPublish(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt);
 
-    /// Merges one contribution into `ns`'s `_ckpt` (spec INV-4), presenting `admitted_generation` back
+    /// Merges one contribution into `life`'s `_ckpt` (spec INV-4), presenting `admitted_generation` back
     /// through the pool's fence callback on every CAS attempt. The ledger owns no `CasMountRuntime`, so
     /// this is only the place that assembles the deadline from the ledger's own injectable boot clock
     /// and CAS budget; the algorithm itself is `publishCkpt`, shared verbatim with every other writer.
     ///
-    /// TWO call sites, the two writers INV-4 names, and they contribute DISJOINT fields:
+    /// THREE call sites (corrected here from "two": `runRecoveryWalkOnce`'s own sealer contribution
+    /// below is a third and was missing from this count), and they contribute DISJOINT fields:
     ///   - `commitRefChunk`'s namespace-birth transaction contributes `life_epoch` -- it is the only
     ///     writer that knows it (this transaction's own writer epoch), and spec §3 has the `_ckpt`
     ///     created before the namespace becomes Live. The contribution is no longer built at the call
@@ -885,8 +934,11 @@ private:
     ///     the publish had to stay behind when preparation moved out;
     ///   - `trySnapshotPublishOnce` contributes `checkpoint_snapshot_id` once the snapshot body is
     ///     durable, and contributes NOTHING about `life_epoch` (an absence, which the semantic-max
-    ///     merge leaves alone) because the publisher does not know it and must never guess.
-    CkptPublishOutcome publishCkptContribution(const RootNamespace & ns, const RefCkpt & contribution,
+    ///     merge leaves alone) because the publisher does not know it and must never guess;
+    ///   - `runRecoveryWalkOnce` contributes `last_epoch_seal` once its own CAS-walk minted or adopted
+    ///     one -- it is the only writer that mints seals, so it is the only writer that can record
+    ///     where the chain now ends.
+    CkptPublishOutcome publishCkptContribution(const NamespaceLifeId & life, const RefCkpt & contribution,
                                                uint64_t admitted_generation);
 
     /// The Live + single-in-flight-gate + backoff + tail-threshold admission decision, factored out so

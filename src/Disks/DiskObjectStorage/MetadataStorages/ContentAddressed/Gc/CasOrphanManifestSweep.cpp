@@ -2,6 +2,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
@@ -162,8 +163,11 @@ NamespaceProtection activeManifestKeys(Pool & store, const RootNamespace & ns,
     /// removed manifest (a `-1` edge). A namespace-removal transaction names every removed owner explicitly,
     /// so this also protects a whole removed namespace's bodies until the fold catches up.
     const RefTxnId cursor = sealedRefCursor(coverage);
+    /// Stage B (Task 4-C): see `CasRefCatalog::resolveLifeOrSentinel`'s doc for why the sentinel
+    /// fallback is correct, not a guess, for a namespace the catalog does not name.
+    const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(backend, layout, ns);
     std::vector<RefTxnId> logs;
-    forEachListedKey(backend, layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)), [&](const ListedKey & lk)
+    forEachListedKey(backend, layout.refsNamespacePrefix(life), [&](const ListedKey & lk)
     {
         if (const auto parsed = layout.parseRefObjectKey(lk.key);
             parsed && parsed->id.ns == ns && parsed->kind == RefObjectKind::Log)
@@ -175,7 +179,7 @@ NamespaceProtection activeManifestKeys(Pool & store, const RootNamespace & ns,
     {
         if (!(cursor < id))
             continue;   /// id <= cursor: its edges are already folded
-        const auto got = backend.get(layout.refLogKey(NamespaceLifeId::stageATransition(ns), id));
+        const auto got = backend.get(layout.refLogKey(life, id));
         if (!got)
             continue;   /// vanished (a concurrent cleanup published a covering snapshot) -- its -1 was folded
         const RefLogTxn txn = decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), id);

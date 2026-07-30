@@ -1,4 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Common/Exception.h>
 #include <Common/scope_guard_safe.h>
@@ -843,12 +844,18 @@ EpochCrossResult crossEpochFromSeal(Backend & backend, const Layout & layout, co
         return result;
     }
 
+    /// Stage B (Task 4-C): resolve `ns`'s real catalog life, falling back to the Stage-A sentinel for a
+    /// namespace the catalog does not (yet, or ever) know about -- see `resolveLifeOrSentinel`'s own
+    /// doc for why the fallback is correct rather than a guess. Shared by both callers of this function
+    /// (`CasFsck.cpp`'s stream walk and `Gc::fold`'s own crossing probe), so both see whatever a real
+    /// production writer wrote.
+    const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(backend, layout, ns);
     uint64_t target_epoch = witness.writer_epoch;
     while (target_epoch > from_seal.writer_epoch)
     {
         const RefTxnId start{target_epoch, 1};
         result.probed = start;
-        const auto body = backend.get(layout.refLogKey(NamespaceLifeId::stageATransition(ns), start));
+        const auto body = backend.get(layout.refLogKey(life, start));
         if (!body)
         {
             ++result.absent_probes;
@@ -887,6 +894,19 @@ EpochCrossResult crossEpochFromSeal(Backend & backend, const Layout & layout, co
 RecoveredRefTable recoverRefTableDetailed(Backend & backend, const Layout & layout, const RootNamespace & ns,
                                           const std::function<void()> & on_page_fetched, unsigned max_restarts)
 {
+    /// Stage B (spec INV-3): resolve `ns`'s REAL catalog life ONCE, before the walk. This function is
+    /// the SHARED non-production discovery-path recovery -- fsck, `Gc::rebuildBaseline`'s
+    /// disaster-recovery scan, and `CasOrphanManifestSweep`'s active-manifest-key set all ride it -- and
+    /// every one of them must see what the mounted writer actually wrote, which since Task 4-C's
+    /// production birth wiring is a real, catalog-minted incarnation, never the Stage-A sentinel. Falls
+    /// back to the sentinel when the catalog carries no entry for `ns` at all, which is what preserves
+    /// every raw-fixture test that seeds ref-log content directly without ever touching the catalog
+    /// (Task 4-B's ten helpers, admitted at the sentinel by `cas_test_helpers.h`'s `casAdmitEntry`) --
+    /// so this fallback is not a guess, it is the SAME namespace's only other possible identity.
+    /// `Creating` is excluded exactly as `Gc::discoverUniverse` excludes it: no publication can exist
+    /// yet under that entry, so a life-less fallback is the correct answer for it too.
+    const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(backend, layout, ns);
+
     for (unsigned attempt = 0;; ++attempt)
     {
         /// One LIST of the table prefix; classify keys into logs and snapshots.
@@ -895,7 +915,7 @@ RecoveredRefTable recoverRefTableDetailed(Backend & backend, const Layout & layo
         String cursor;
         for (;;)
         {
-            const ListPage page = backend.list(layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)), cursor, 1000);
+            const ListPage page = backend.list(layout.refsNamespacePrefix(life), cursor, 1000);
             if (on_page_fetched)
                 on_page_fetched();
             for (const ListedKey & lk : page.keys)
@@ -949,7 +969,7 @@ RecoveredRefTable recoverRefTableDetailed(Backend & backend, const Layout & layo
         if (!snapshots.empty())
         {
             snapshot_id = snapshots.back();
-            const auto got = backend.get(layout.refSnapshotKey(NamespaceLifeId::stageATransition(ns), *snapshot_id));
+            const auto got = backend.get(layout.refSnapshotKey(life, *snapshot_id));
             if (!got)
                 vanished = true;
             else
@@ -965,7 +985,7 @@ RecoveredRefTable recoverRefTableDetailed(Backend & backend, const Layout & layo
             {
                 if (snapshot_id && !(*snapshot_id < id))
                     continue;   /// id <= snapshot: already included in the snapshot
-                const auto got = backend.get(layout.refLogKey(NamespaceLifeId::stageATransition(ns), id));
+                const auto got = backend.get(layout.refLogKey(life, id));
                 if (!got)
                 {
                     vanished = true;

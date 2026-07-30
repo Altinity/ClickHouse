@@ -30,6 +30,22 @@ public:
     /// Reads and decodes the current catalog. Absent key -> an empty catalog with `token = nullopt`.
     static Snapshot read(Backend & backend, const Layout & layout);
 
+    /// Stage B (Task 4-C): the REAL catalog life for `ns` if a `Live`/`Removing` entry names it, else
+    /// the Stage-A sentinel (`NamespaceLifeId::stageATransition`). For non-production discovery-path
+    /// readers -- `recoverRefTableDetailed`, fsck's stream/oracle walk, `CasOrphanManifestSweep`'s
+    /// active-key set -- which must find whatever a mounted writer actually wrote (a catalog-minted
+    /// incarnation, since Task 4-C's production birth wiring) while staying correct for the raw-fixture
+    /// tests that seed ref-log content directly and never touch the catalog at all: for THOSE
+    /// namespaces the sentinel fallback is not a guess, it is the only other identity the fixture could
+    /// have keyed its objects at (`cas_test_helpers.h`'s `casAdmitEntry` pins the same constant when it
+    /// does admit one). `Creating` is excluded exactly as `Gc::discoverUniverse` excludes it: no
+    /// publication can exist under an entry still being created, so there is nothing to resolve to.
+    ///
+    /// NOT for the mounted writer's own open path -- that is `CasRefLedger::resolveNamespaceLife`, which
+    /// MINTS a life when none exists rather than falling back to a shared sentinel (a production writer
+    /// must never key a genuine first birth at a namespace-independent constant).
+    static NamespaceLifeId resolveLifeOrSentinel(Backend & backend, const Layout & layout, const RootNamespace & ns);
+
     /// The generic token-CAS retry loop shared by every catalog mutation, mirroring
     /// `PoolMeta::admitOrValidate`'s loop: read the current snapshot, apply `mutate` to obtain the
     /// CANDIDATE next catalog, `casPut` it against the observed token (`std::nullopt` create-if-absent

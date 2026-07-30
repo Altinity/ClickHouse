@@ -4,6 +4,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
 #include <chrono>
@@ -146,8 +147,11 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
             ++report.namespaces_already_removed;
             continue;
         }
+        /// Stage B (Task 4-C): see `CasRefCatalog::resolveLifeOrSentinel`'s doc for why the sentinel
+        /// fallback is correct, not a guess, for a namespace the catalog does not name.
         const auto ref_objects = admin->backend().list(
-            admin->layout().refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)), /*cursor=*/"", /*limit=*/1);
+            admin->layout().refsNamespacePrefix(CasRefCatalog::resolveLifeOrSentinel(admin->backend(), admin->layout(), ns)),
+            /*cursor=*/"", /*limit=*/1);
         if (ref_objects.keys.empty())
             continue;   /// A roots-only listing entry is not a table namespace.
 

@@ -8,6 +8,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
 
 #include <Common/Exception.h>
@@ -191,8 +192,11 @@ struct NsRefListing
 
 NsRefListing listNsRefObjects(Backend & backend, const Layout & layout, const RootNamespace & ns)
 {
+    /// Stage B (Task 4-C): see `CasRefCatalog::resolveLifeOrSentinel`'s doc for why the sentinel
+    /// fallback is correct, not a guess, for a namespace the catalog does not name.
+    const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(backend, layout, ns);
     NsRefListing out;
-    forEachListedKey(backend, layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)), [&](const ListedKey & lk)
+    forEachListedKey(backend, layout.refsNamespacePrefix(life), [&](const ListedKey & lk)
     {
         const auto parsed = layout.parseRefObjectKey(lk.key);
         if (!parsed || parsed->id.ns != ns)
@@ -283,7 +287,12 @@ void checkRefStream(Backend & backend, const Layout & layout, const RootNamespac
                     FsckReport & report, NsVerdicts & verdicts)
 {
     checkDeadline(deadline, "ref stream");
-    const std::optional<CkptSample> sampled_ckpt = readCkpt(backend, layout, ns);
+    /// Stage B (Task 4-C): resolve `ns`'s real catalog life -- production no longer keys a mounted
+    /// namespace's ref-layer objects at the Stage-A sentinel once it has been through a real birth, so
+    /// this walk must ask the catalog what incarnation to read, exactly like `recoverRefTableDetailed`
+    /// does (`resolveLifeOrSentinel`'s own doc covers the raw-fixture fallback).
+    const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(backend, layout, ns);
+    const std::optional<CkptSample> sampled_ckpt = readCkpt(backend, layout, life);
 
     /// The base: the greater of what the listing offered and what the checkpoint NAMES. The checkpoint
     /// is what makes this robust against a cleaned prefix — INV-4 forbids deleting the snapshot it
@@ -351,7 +360,7 @@ void checkRefStream(Backend & backend, const Layout & layout, const RootNamespac
     for (;;)
     {
         checkDeadline(deadline, "ref stream");
-        const auto got = backend.get(layout.refLogKey(NamespaceLifeId::stageATransition(ns), *expected));
+        const auto got = backend.get(layout.refLogKey(life, *expected));
         if (got)
         {
             bool is_seal = false;
@@ -362,7 +371,7 @@ void checkRefStream(Backend & backend, const Layout & layout, const RootNamespac
             }
             catch (const Exception & e)
             {
-                verdicts.recordUnchecked(report, ns, layout.refLogKey(NamespaceLifeId::stageATransition(ns), *expected),
+                verdicts.recordUnchecked(report, ns, layout.refLogKey(life, *expected),
                     "ref stream: the record at " + renderId(*expected) + " could not be decoded, so nothing "
                     "above it can be proved either: " + e.message());
                 return;
@@ -380,9 +389,9 @@ void checkRefStream(Backend & backend, const Layout & layout, const RootNamespac
         /// ---- Absent: hole, frontier, or an epoch boundary ----
         if (const auto witness = greatestSameEpochAbove(expected->writer_epoch, expected->ref_sequence))
         {
-            if (backend.get(layout.refLogKey(NamespaceLifeId::stageATransition(ns), *witness)))
+            if (backend.get(layout.refLogKey(life, *witness)))
             {
-                verdicts.recordChainBroken(report, ns, layout.refLogKey(NamespaceLifeId::stageATransition(ns), *expected),
+                verdicts.recordChainBroken(report, ns, layout.refLogKey(life, *expected),
                     "ref stream: id " + renderId(*expected) + " is absent while " + renderId(*witness)
                     + " in the same epoch is durable — the stream is dense by construction (INV-1), so this "
                       "is a HOLE, not the end of the stream, and every record above it is unreachable");
@@ -400,7 +409,7 @@ void checkRefStream(Backend & backend, const Layout & layout, const RootNamespac
             crossEpochFromSeal(backend, layout, ns, resolved_through, last_applied_is_seal, *later);
         if (!crossing.proved())
         {
-            verdicts.recordUnchecked(report, ns, layout.refLogKey(NamespaceLifeId::stageATransition(ns), *expected),
+            verdicts.recordUnchecked(report, ns, layout.refLogKey(life, *expected),
                 "ref stream: records of a later epoch are reachable but this epoch's closing seal was "
                 "never consumed (or the position they chain from is not one), so the crossing at "
                 + renderId(*expected) + " has no proof"
@@ -413,7 +422,7 @@ void checkRefStream(Backend & backend, const Layout & layout, const RootNamespac
         /// legitimately do. Unprovable, and reported as such rather than spun on.
         if (!(*expected < crossing.start))
         {
-            verdicts.recordUnchecked(report, ns, layout.refLogKey(NamespaceLifeId::stageATransition(ns), *expected),
+            verdicts.recordUnchecked(report, ns, layout.refLogKey(life, *expected),
                 "ref stream: the epoch crossing resolved back to " + renderId(crossing.start)
                 + ", the position that just read absent — the epoch-start record is not stably readable");
             return;
@@ -438,6 +447,9 @@ void checkSnapshotOracle(Backend & backend, const Layout & layout, const RootNam
                          const NsRefListing & listing, bool detail, const Deadline & deadline, FsckReport & report)
 {
     checkDeadline(deadline, "snapshot oracle");
+    /// Stage B (Task 4-C): see `CasRefCatalog::resolveLifeOrSentinel`'s doc for why the sentinel
+    /// fallback is correct, not a guess, for a namespace the catalog does not name.
+    const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(backend, layout, ns);
 
     const std::vector<RefTxnId> & snap_ids = listing.snapshots;
     const std::vector<RefTxnId> & log_ids = listing.logs;
@@ -445,7 +457,7 @@ void checkSnapshotOracle(Backend & backend, const Layout & layout, const RootNam
         return;   /// no published snapshot: recovering from logs alone is valid, nothing to oracle
 
     const RefTxnId snapshot_x = snap_ids.back();
-    const auto got_x = backend.get(layout.refSnapshotKey(NamespaceLifeId::stageATransition(ns), snapshot_x));
+    const auto got_x = backend.get(layout.refSnapshotKey(life, snapshot_x));
     if (!got_x)
         return;   /// vanished (a covering newer snapshot superseded it): restart-on-vanish -> skip
 
@@ -462,7 +474,7 @@ void checkSnapshotOracle(Backend & backend, const Layout & layout, const RootNam
     {
         if (!(*it < snapshot_x))
             continue;   /// X itself or anything not strictly below it
-        const auto got_base = backend.get(layout.refSnapshotKey(NamespaceLifeId::stageATransition(ns), *it));
+        const auto got_base = backend.get(layout.refSnapshotKey(life, *it));
         if (!got_base)
             continue;   /// vanished; try the next older snapshot
         base = decodeRefTableSnapshot(openObject(FormatId::RefSnapshot, got_base->bytes), ns.string(), *it);
@@ -485,7 +497,7 @@ void checkSnapshotOracle(Backend & backend, const Layout & layout, const RootNam
         if (snapshot_x < id)
             continue;   /// > X: not part of the state AT X
         checkDeadline(deadline, "snapshot oracle");
-        const auto got_log = backend.get(layout.refLogKey(NamespaceLifeId::stageATransition(ns), id));
+        const auto got_log = backend.get(layout.refLogKey(life, id));
         if (!got_log)
             return;   /// a covered log was cleaned/vanished: oracle unavailable for X -> skip, not error
         RefLogTxn txn = decodeRefLogTxn(openObject(FormatId::RefLog, got_log->bytes), ns.string(), id);
@@ -506,7 +518,7 @@ void checkSnapshotOracle(Backend & backend, const Layout & layout, const RootNam
     {
         ++report.snapshot_oracle_mismatches;
         FsckObject o;
-        o.key = layout.refSnapshotKey(NamespaceLifeId::stageATransition(ns), snapshot_x);
+        o.key = layout.refSnapshotKey(life, snapshot_x);
         o.kind = ObjectKind::Blob;   /// snapshots have no ObjectKind; reuse Blob as the generic kind
         o.size = got_x->bytes.size();
         o.cls = FsckClass::SnapshotOracleMismatch;
@@ -674,7 +686,8 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
         {
             if (e.code() == ErrorCodes::TIMEOUT_EXCEEDED)
                 throw;
-            verdicts.recordUnchecked(report, ns, layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)),
+            verdicts.recordUnchecked(report, ns,
+                layout.refsNamespacePrefix(CasRefCatalog::resolveLifeOrSentinel(backend, layout, ns)),
                 "fsck could not examine this namespace: " + e.message());
         }
     }
