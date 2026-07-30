@@ -2829,11 +2829,13 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
 
     /// [CKPT-FAILED-BIRTH-DEBRIS] (BACKLOG `{#ckpt-failed-birth-debris}`): best-effort cleanup for a
     /// birth chunk whose `_ckpt` published above but whose ref-log `PUT` below then fails on one of the
-    /// THREE branches that PROVE this attempt's bytes never landed and never can (attempt-arm race,
-    /// occupant-unreadable, `SuccessorSeal`, genuine foreign interference -- every use site below is one
-    /// of those). Deliberately NOT used on the ambiguous-exception branch (transfers `Writing` ->
-    /// `Wedged`): an ambiguous outcome might still have landed, and deleting there could erase the one
-    /// genesis-epoch record nothing else will ever recover (see the comment above this publish).
+    /// THREE branches that PROVE this attempt's bytes never landed and never can (occupant-unreadable,
+    /// `SuccessorSeal`, genuine foreign interference -- every use site below is one of those). NOT used
+    /// on the `!attempt_armed` arm above (review C1: that arm makes no lane transition, so a
+    /// concurrent successful birth cannot be ruled out -- see its own comment) or on the
+    /// ambiguous-exception branch (transfers `Writing` -> `Wedged`): an ambiguous outcome might still
+    /// have landed, and deleting there could erase the one genesis-epoch record nothing else will ever
+    /// recover (see the comment above this publish).
     ///
     /// Safe under TODAY's sentinel keying (every incarnation of `ns` shares one `_ckpt` key, per
     /// `NamespaceLifeId::stageATransition`) precisely because every call site below also drives the
@@ -2883,9 +2885,17 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
     }
     if (!attempt_armed)
     {
-        /// Proven pre-send: `putIfAbsentControlled` was never reached, so a birth chunk's ref-log bytes
-        /// definitely never landed under this attempt -- safe to reclaim its `_ckpt`, per the note above.
-        cleanupOrphanedBirthCkptBestEffort();
+        /// NO cleanup call here (review C1): unlike the three call sites below, this arm makes NO lane
+        /// transition -- it is reached whenever the lane is not what THIS attempt expected, including
+        /// `getGreatestApplied() != candidate_base_id`, which means some OTHER append for this table
+        /// already advanced applied state. That other append can be the birth itself, whose `_ckpt` a
+        /// cleanup call here would then delete out from under it -- the same harm class the ambiguous
+        /// `Writing -> Wedged` branch is deliberately excluded to avoid, against an object with no
+        /// repair path (BACKLOG `{#ckpt-damage-no-repair-path}`). "`putIfAbsentControlled` was never
+        /// reached" is true of THIS attempt; it says nothing about whether a DIFFERENT attempt for this
+        /// same namespace already made the birth durable. The debris this arm would otherwise reclaim
+        /// is still reclaimed by the three call sites below and by the GC backstop; losing it here
+        /// costs nothing, and the safe direction on an unrecoverable delete is not deleting.
         complete_error(chunk_survivors, std::make_exception_ptr(Exception(
             ErrorCodes::LOGICAL_ERROR,
             "CAS ref-log append for namespace '{}': lane changed before attempt {}-{} could be armed",

@@ -2,8 +2,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasServerRootFormats.h>
-/// `CreatorFence`, consumed by `isCreatorFenceTerminal` below.
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCatalogFormat.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Common/Exception.h>
 #include <Common/Logger.h>
@@ -529,24 +527,40 @@ struct MountInfo
 /// of `computeHeartbeatFloor`: ZERO writes (no fence-out), per-row fail-open. One LIST + one GET per slot.
 std::vector<MountInfo> listMounts(Backend & backend, const Layout & layout, uint64_t now_ms, uint64_t skew_margin_ms);
 
-/// Whether the mounted writer identified by `fence` (a `CatalogEntry::creator`, `ref_catalog`'s spec
-/// INV-3 §3) is PROVABLY unable to complete anything more — the gate `CasRefCatalog::reconcileStaleCreator`
-/// requires before a stalled `Creating` entry may be stolen by a NEW actor.
+/// Whether the mounted writer identified by `(server_root_id, writer_epoch)` (the two fields of a
+/// `CatalogEntry::creator` / `CreatorFence`, `ref_catalog`'s spec INV-3 §3, that this predicate actually
+/// needs) is PROVABLY unable to complete anything more — the gate
+/// `CasRefCatalog::reconcileStaleCreator` requires before a stalled `Creating` entry may be stolen by a
+/// NEW actor.
 ///
-/// `fence.fence_generation` is deliberately NEVER read here: it is `CasMountRuntime::fence_generation`,
-/// an in-process atomic that never reaches the object store, so it means nothing to a DIFFERENT
-/// process — or to the SAME process after a restart — which is exactly the actor doing the
-/// reconciling. This reads the durable, cross-process proof instead: `fence.server_root_id`'s CURRENT
-/// mount slot (`Layout::mountKey`), classified by the SAME two clock-free certificates
-/// `probeNonTerminalMountSlots`/`computeHeartbeatFloor` already use for the identical question at
-/// pool-prefix and GC-heartbeat granularity —
+/// Takes the two scalars rather than a whole `CreatorFence` (review C4): that type lives on the
+/// ref-catalog side (`Formats/CasRefCatalogFormat.h`), and this file is already widely included
+/// through `CasPool.h` (mount/server-root plumbing reaches nearly every CAS translation unit), so
+/// naming that type here would make the mount layer depend on the ref-catalog format instead of the
+/// other way round, for a struct this function reads only two fields of. A caller holding a
+/// `CreatorFence` passes `fence.server_root_id, fence.writer_epoch` directly.
+///
+/// `fence_generation` is deliberately NOT one of the two scalars this function takes, and not because
+/// it is unavailable -- the catalog persists it (`cfg` in `CasRefCatalogFormat.cpp`) -- but because it
+/// is not the property this predicate needs. It mirrors `CasMountRuntime::fence_generation`, an
+/// in-process atomic that every mount bumps from its OWN zero on every open, so a DIFFERENT actor's
+/// counter (or the SAME actor's after a restart) starts over at the same small values and cannot
+/// answer "is the incarnation that minted this entry still alive" -- comparing it across actors
+/// compares two unrelated counts that happen to share a name. This reads the durable, cross-process
+/// proof instead: `server_root_id`'s CURRENT mount slot (`Layout::mountKey`), classified by the SAME
+/// two clock-free certificates `probeNonTerminalMountSlots`/`computeHeartbeatFloor` already use for the
+/// identical question at pool-prefix and GC-heartbeat granularity —
 ///   - `gc_fenced` (the GC leader already fenced this incarnation; a fence costs an epoch, so its
 ///     keeper can never renew again),
 ///   - the clean-farewell sentinel `min_active == UINT64_MAX`,
 /// PLUS one more certificate available here that neither of those needs: a DIFFERENT `writer_epoch`
-/// currently live at that slot proves `fence.writer_epoch`'s specific incarnation is superseded
-/// regardless of its OWN certificate — `allocateWriterEpoch`/`claimMount` are why an epoch, once
-/// superseded, is never reclaimed by its former holder.
+/// currently live at that slot proves `writer_epoch`'s specific incarnation is superseded regardless of
+/// its OWN certificate — `allocateWriterEpoch`/`claimMount` are why an epoch, once superseded, is never
+/// reclaimed by its former holder. The classification is an EXHAUSTIVE switch over these three
+/// certificates, not a positive allowlist -- mirrors `CasPool.cpp`'s own exhaustive switch over
+/// `MountPriorState` (the classification `claimMount`, in THIS file, only PRODUCES; the switch
+/// consuming it lives in the caller) deliberately: a future certificate with no verdict assigned here
+/// must fail the BUILD (a missing `-Wswitch` case), never silently read as terminal.
 ///
 /// Deliberately conservative on the two cases that are NOT proof of death, mirroring
 /// `probeNonTerminalMountSlots`'s own stated discipline: an ABSENT mount slot (`Backend::get`
@@ -557,7 +571,18 @@ std::vector<MountInfo> listMounts(Backend & backend, const Layout & layout, uint
 /// treated as a certificate, for the same reason `claimMount` itself refuses to trust one: comparing
 /// another node's stamp against a clock is exactly the unsafe comparison the mount protocol exists to
 /// avoid, and there is not even a caller-supplied clock offered here to make that comparison with.
-bool isCreatorFenceTerminal(Backend & backend, const Layout & layout, const CreatorFence & fence);
+///
+/// WHAT THIS DOES NOT PROVE, stated rather than left implicit: `true` means the CURRENT mount-slot body
+/// carries a certificate against `writer_epoch` specifically -- it is not a claim about the server
+/// root's OTHER activity, about whether `server_root_id` will ever mount again, or about
+/// anything beyond this one slot's current body at the instant of this GET. A caller that needs a
+/// stronger, race-free guarantee (e.g. "and it will never come back") must build that from a WIDER
+/// observation, the way `claimMountAwaitingExpiry`'s token-stability window does for its own decision --
+/// this function performs no such window and answers from one point-in-time read alone. Answering
+/// "unknown" (`false`, refuse) is the fail-closed choice on every path already listed above; there is
+/// no path where this function answers `true` on evidence weaker than one of the three certificates.
+bool isCreatorFenceTerminal(Backend & backend, const Layout & layout, const String & server_root_id,
+                            uint64_t writer_epoch);
 
 /// Per-server MERGED heartbeat: one `SingleWriterSlot` over the per-server-root mount object carries
 /// the mount lease (liveness) AND the build-watermark floor (`min_active`). One renewal PUT stamps the

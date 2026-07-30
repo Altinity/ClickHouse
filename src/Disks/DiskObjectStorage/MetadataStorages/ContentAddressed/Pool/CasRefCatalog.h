@@ -172,11 +172,17 @@ public:
     ///   - `is_creator_fence_terminal(*observed.creator)` -- injected rather than reaching into
     ///     `CasServerRoot` directly, so this module (and its tests) stay independent of the mount-lease
     ///     machinery; the real predicate a production caller wires in is `isCreatorFenceTerminal`
-    ///     (`Pool/CasServerRoot.h`), built from `writer_epoch` plus the mount-terminality certificates
+    ///     (`Pool/CasServerRoot.h`, called as `isCreatorFenceTerminal(backend, layout,
+    ///     fence.server_root_id, fence.writer_epoch)` -- it takes those two scalars, not the whole
+    ///     `CreatorFence`, so the mount layer stays independent of the ref-catalog format), built from
+    ///     `writer_epoch` plus the mount-terminality certificates
     ///     `probeNonTerminalMountSlots`/`computeHeartbeatFloor` already use -- NEVER from
-    ///     `CreatorFence::fence_generation`, which is `CasMountRuntime`'s own in-process atomic and
-    ///     never reaches the object store, so it means nothing to the different actor doing the
-    ///     reconciling;
+    ///     `CreatorFence::fence_generation`. That field IS persisted (Task 2 serializes it into the
+    ///     catalog entry), so it reaches the object store fine; what it is NOT is comparable across
+    ///     actors: it mirrors `CasMountRuntime::fence_generation`, an in-process atomic that each mount
+    ///     bumps from its OWN zero on every open, so a different actor's counter (or the SAME actor's
+    ///     after a restart) starts over at the same values and answers a different question than "is
+    ///     the incarnation that minted this entry still alive";
     ///   - the catalog's CURRENT entry for `observed.ns` still equals `observed` exactly
     ///     (token-exactness: a concurrent reconciler, or the original creator finishing on its own,
     ///     invalidates this immediately).
@@ -197,6 +203,17 @@ public:
     /// moves onto the catalog in Task 4/Task 6). Takes an already-read `RefCatalog` rather than
     /// `Backend`/`Layout`, so a caller that is about to append anyway (and so already holds a fresh
     /// read for its OWN purposes) pays no second GET here.
+    ///
+    /// NOT YET ENFORCED ON THE PRODUCTION REF-WRITE PATH -- state this plainly rather than let the
+    /// spec sentence above read as a claim the tree already satisfies. `CasRefLedger::commitRefChunk`
+    /// (today's `RefOpKind::NamespaceBirth` writer) does not call this function and consults no catalog
+    /// state before a ref-log `PUT`: adding a per-write catalog GET to that path would add a protocol
+    /// step to ref writes, which the standing veto on protocol-step additions forbids regardless of
+    /// cost. The refusal therefore has to ride on wherever existence/discovery lives, which is Task 4's
+    /// catalog-backed universe (plan `0cf11354aa0`, "Task 4 owns closing the Creating-forbids-publication
+    /// gap on the production path" -- a task step, not a citation). Until that lands, a namespace sitting
+    /// in `Creating` does not actually block a concurrent production ref write to the same name; this
+    /// function is exercised today only by this module's own tests and by any FUTURE caller Task 4 adds.
     static void checkPublicationAdmittedOrThrow(const RefCatalog & catalog, const RootNamespace & ns);
 };
 

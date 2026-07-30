@@ -954,6 +954,80 @@ TEST(CasRefWedgeEveryAttempt, BirthCkptIsReclaimedWhenTheGenesisTransactionIsCon
            "reached Live";
 }
 
+/// THE NEGATIVE ROW the closure's own safety condition demands: a `_ckpt` belonging to a namespace
+/// that DID reach `Live` must NEVER be deleted by this cleanup, no matter how a LATER transaction on
+/// that same namespace fails. `cleanupOrphanedBirthCkptBestEffort` is gated on `prepared->birth_contribution`,
+/// which `prepareRefChunk` sets ONLY when the table's lifecycle is not yet `Live` -- so an already-Live
+/// table's later chunks never carry one, and the cleanup call is a guaranteed no-op for them. This test
+/// proves that guard holds in practice, not just by reading the code: one ordinary publish makes `ns`
+/// genuinely `Live` (it IS the birth, and it publishes the REAL `_ckpt`), then a THIRD chunk (the
+/// publish itself already spends two: precommit-add, then promote) meets the identical successor-seal
+/// conflict the test above exercises -- same conclusive rejection, same cleanup call site -- and the
+/// `_ckpt` this namespace's actual birth published must survive it byte-for-byte. `_ckpt` has no
+/// repair path (BACKLOG
+/// `{#ckpt-damage-no-repair-path}`), so this is the row that keeps the closure from being one refactor
+/// away from deleting a live namespace's only genesis record.
+TEST(CasRefWedgeEveryAttempt, BirthCkptOfAnAlreadyLiveNamespaceSurvivesALaterConclusiveRejection)
+{
+    auto backend = std::make_shared<WedgeTestBackend>();
+    auto store = openPool(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/birth_ckpt_survives_live"};
+    /// ONE `publishEmptyPart` -- this IS the birth, and it already reaches sequence 2 (the
+    /// precommit-add chunk at seq 1 carries the birth, the promote chunk lands at seq 2), so `next`
+    /// below is the SAME `{epoch, 3}` the sibling `AppendSiteMeetingASuccessorSealIsAConclusiveRejectionNotInterference`
+    /// test derives from the identical one-call setup -- copying THAT test's two-call variant here
+    /// (from a different test in this file) would derive a different id and never trigger the conflict.
+    publishEmptyPart(store, ns, "x");
+
+    const String ckpt_key = layout.refCkptKey(NamespaceLifeId::stageATransition(ns));
+    const auto ckpt_before = backend->get(ckpt_key);
+    ASSERT_TRUE(ckpt_before.has_value()) << "the birth above must have published a real _ckpt";
+
+    const RefTxnId next{store->liveWriterEpoch(), 3};
+    backend->conflict_substr = layout.refLogKey(NamespaceLifeId::stageATransition(ns), next);
+    backend->conflict_bytes = epochSealBytes(ns, next);
+    backend->conflict_count = 1;
+
+    expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&] { store->dropRef(ns, "x"); });
+
+    const auto ckpt_after = backend->get(ckpt_key);
+    ASSERT_TRUE(ckpt_after.has_value()) << "a Live namespace's _ckpt must never be deleted by this path";
+    EXPECT_EQ(ckpt_after->bytes, ckpt_before->bytes)
+        << "not merely present but UNCHANGED -- this transaction was never a birth, so the cleanup call "
+           "is gated to a no-op and must not have touched the object at all";
+}
+
+/// THE OTHER negative row (review C2): the AMBIGUOUS branch -- `Writing` -> `Wedged` -- is deliberately
+/// EXCLUDED from the cleanup call (see the lambda's own comment), and that exclusion is the
+/// load-bearing half of the whole safety story: it is the one branch where the ref-log bytes MIGHT
+/// still have landed. Nothing pinned that exclusion before this row; an edit that added the call here
+/// would be caught by no test. A one-shot ambiguous PUT on a GENESIS birth (never-born `ns`, so this
+/// IS a birth chunk, `prepared->birth_contribution` set) writes NOTHING (the response is lost, the key
+/// stays absent) and wedges the lane -- `AmbiguousPutWedgesTheLaneAndTheNextFlushsCreateAdoptsItExactlyOnce`
+/// is the precedent this mirrors, adapted to a namespace's FIRST-ever transaction instead of its third.
+TEST(CasRefWedgeEveryAttempt, BirthCkptSurvivesWhenTheGenesisTransactionIsAmbiguous)
+{
+    auto backend = std::make_shared<WedgeTestBackend>();
+    auto store = openPool(backend, singleAttemptBudget());
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/birth_ckpt_ambiguous"};
+    const String ckpt_key = layout.refCkptKey(NamespaceLifeId::stageATransition(ns));
+    ASSERT_FALSE(backend->get(ckpt_key).has_value()) << "nothing has ever been written for this namespace yet";
+
+    backend->ambiguous_substr = logPrefix(store, ns);
+    backend->ambiguous_count = 1;
+
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { publishEmptyPart(store, ns, "x"); });
+
+    ASSERT_TRUE(store->refLaneWedgedForTest(ns)) << "an ambiguous outcome must WEDGE the lane, not "
+                                                     "resolve into one of the conclusive branches";
+    EXPECT_TRUE(backend->get(ckpt_key).has_value())
+        << "the birth's own _ckpt must SURVIVE an ambiguous outcome -- the ref-log bytes might still "
+           "have landed, and this object is the only record of the genesis epoch nothing else could "
+           "ever recover if it were deleted here";
+}
+
 /// The same conflict, but the read that would tell a seal from a breach fails. We must then decide
 /// NEITHER: fencing the mount would be a guess, and reporting a conclusive rejection would acknowledge
 /// a deposition nobody observed. The id is not consumed, so the next attempt re-derives it and

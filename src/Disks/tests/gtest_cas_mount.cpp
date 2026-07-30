@@ -1309,7 +1309,7 @@ TEST(CasFenceTerminal, AbsentMountSlotIsNotTerminal)
 {
     InMemoryBackend b;
     Layout l{"p"};
-    EXPECT_FALSE(isCreatorFenceTerminal(b, l, CreatorFence{.server_root_id = "never-mounted", .writer_epoch = 1, .fence_generation = 1}))
+    EXPECT_FALSE(isCreatorFenceTerminal(b, l, "never-mounted", 1))
         << "absence proves nothing about liveness -- never waved through";
 }
 
@@ -1318,7 +1318,7 @@ TEST(CasFenceTerminal, UndecodableMountBodyIsNotTerminal)
     InMemoryBackend b;
     Layout l{"p"};
     b.putIfAbsent(l.mountKey("r"), "garbage-not-a-lease", {});
-    EXPECT_FALSE(isCreatorFenceTerminal(b, l, CreatorFence{.server_root_id = "r", .writer_epoch = 1, .fence_generation = 1}))
+    EXPECT_FALSE(isCreatorFenceTerminal(b, l, "r", 1))
         << "an unreadable lease of some other format generation must block, never wave through";
 }
 
@@ -1333,7 +1333,7 @@ TEST(CasFenceTerminal, GcFencedIsTerminal)
     fenced.gc_fenced = true;
     ASSERT_EQ(b.putOverwrite(l.mountKey("r"), encodeMountLease(fenced), got->token).outcome, PutOutcome::Done);
 
-    EXPECT_TRUE(isCreatorFenceTerminal(b, l, CreatorFence{.server_root_id = "r", .writer_epoch = 7, .fence_generation = 1}));
+    EXPECT_TRUE(isCreatorFenceTerminal(b, l, "r", 7));
 }
 
 TEST(CasFenceTerminal, CleanFarewellIsTerminal)
@@ -1347,7 +1347,7 @@ TEST(CasFenceTerminal, CleanFarewellIsTerminal)
     retired.min_active = std::numeric_limits<uint64_t>::max();
     ASSERT_EQ(b.putOverwrite(l.mountKey("r"), encodeMountLease(retired), got->token).outcome, PutOutcome::Done);
 
-    EXPECT_TRUE(isCreatorFenceTerminal(b, l, CreatorFence{.server_root_id = "r", .writer_epoch = 7, .fence_generation = 1}));
+    EXPECT_TRUE(isCreatorFenceTerminal(b, l, "r", 7));
 }
 
 TEST(CasFenceTerminal, ADifferentLiveWriterEpochIsTerminalForTheOldOne)
@@ -1358,9 +1358,9 @@ TEST(CasFenceTerminal, ADifferentLiveWriterEpochIsTerminalForTheOldOne)
     /// certificate (neither fenced nor farewelled).
     ASSERT_EQ(claimMount(b, l, "r", UInt128(1), /*our_epoch=*/8, 1000, 500).kind, MountClaimResult::Claimed);
 
-    EXPECT_TRUE(isCreatorFenceTerminal(b, l, CreatorFence{.server_root_id = "r", .writer_epoch = 7, .fence_generation = 1}))
+    EXPECT_TRUE(isCreatorFenceTerminal(b, l, "r", 7))
         << "a different epoch is currently live at this slot -- epoch 7 can never reclaim it";
-    EXPECT_FALSE(isCreatorFenceTerminal(b, l, CreatorFence{.server_root_id = "r", .writer_epoch = 8, .fence_generation = 1}))
+    EXPECT_FALSE(isCreatorFenceTerminal(b, l, "r", 8))
         << "epoch 8 IS the current live epoch -- not terminal";
 }
 
@@ -1374,6 +1374,6 @@ TEST(CasFenceTerminal, ExpiredButSameEpochAndUncertifiedIsNotTerminal)
     ASSERT_EQ(claimMount(b, l, "r", UInt128(1), /*our_epoch=*/7, /*now_ms=*/0, /*ttl_ms=*/1).kind,
               MountClaimResult::Claimed);
 
-    EXPECT_FALSE(isCreatorFenceTerminal(b, l, CreatorFence{.server_root_id = "r", .writer_epoch = 7, .fence_generation = 1}))
+    EXPECT_FALSE(isCreatorFenceTerminal(b, l, "r", 7))
         << "expiry alone is never a certificate of death, exactly like claimMount's own discipline";
 }

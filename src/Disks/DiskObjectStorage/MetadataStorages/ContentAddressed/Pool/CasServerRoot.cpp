@@ -767,9 +767,37 @@ std::vector<MountInfo> listMounts(Backend & backend, const Layout & layout, uint
     return out;
 }
 
-bool isCreatorFenceTerminal(Backend & backend, const Layout & layout, const CreatorFence & fence)
+namespace
 {
-    const auto got = backend.get(layout.mountKey(fence.server_root_id));
+
+/// The three clock-free certificates `isCreatorFenceTerminal` recognises, plus `None` for a live body
+/// that carries none of them -- see the function's header doc for what each one proves and why
+/// `fence_generation` is not among them.
+enum class FenceCertificate : uint8_t
+{
+    None,
+    GcFenced,
+    CleanFarewell,
+    SupersededEpoch,
+};
+
+FenceCertificate classifyFenceCertificate(const MountLease & lease, uint64_t fence_writer_epoch)
+{
+    if (lease.gc_fenced)
+        return FenceCertificate::GcFenced;
+    if (lease.min_active == std::numeric_limits<uint64_t>::max())
+        return FenceCertificate::CleanFarewell;
+    if (lease.writer_epoch != fence_writer_epoch)
+        return FenceCertificate::SupersededEpoch;
+    return FenceCertificate::None;
+}
+
+}
+
+bool isCreatorFenceTerminal(Backend & backend, const Layout & layout, const String & server_root_id,
+                            uint64_t writer_epoch)
+{
+    const auto got = backend.get(layout.mountKey(server_root_id));
     if (!got)
         return false;   /// absence proves nothing about liveness -- see the header doc
 
@@ -783,15 +811,26 @@ bool isCreatorFenceTerminal(Backend & backend, const Layout & layout, const Crea
         return false;   /// undecodable -- fail closed, never wave through
     }
 
-    if (lease.gc_fenced)
-        return true;
-    if (lease.min_active == std::numeric_limits<uint64_t>::max())
-        return true;
-    /// A DIFFERENT writer_epoch currently live at this slot proves `fence.writer_epoch`'s own
-    /// incarnation is superseded, regardless of its own certificate -- see the header doc.
-    if (lease.writer_epoch != fence.writer_epoch)
-        return true;
-    return false;
+    /// EXHAUSTIVE switch, not a positive allowlist -- mirrors `CasPool.cpp`'s own exhaustive switch over
+    /// `MountPriorState` (`claimMount`, in this file, only PRODUCES that classification; the switch
+    /// consuming it lives in the caller) deliberately: a future `FenceCertificate` enumerator with no
+    /// verdict assigned here must fail the BUILD (a missing `-Wswitch` case), never silently read as
+    /// terminal (which would let a reconciler steal a namespace out from under a writer that might
+    /// still be alive) or as live (which would block a reconciliation the certificate already proves
+    /// is safe).
+    bool terminal;
+    switch (classifyFenceCertificate(lease, writer_epoch))
+    {
+        case FenceCertificate::None:
+            terminal = false;
+            break;
+        case FenceCertificate::GcFenced:
+        case FenceCertificate::CleanFarewell:
+        case FenceCertificate::SupersededEpoch:
+            terminal = true;
+            break;
+    }
+    return terminal;
 }
 
 MountLeaseKeeper::MountLeaseKeeper(
