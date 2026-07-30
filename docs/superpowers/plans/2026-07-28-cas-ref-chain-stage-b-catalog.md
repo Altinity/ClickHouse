@@ -245,6 +245,51 @@ static_assert(!HasNamespaceOnlyRefLogKey<Layout>);
 - [ ] **Step 4:** Full CA gate green. **Step 5: Commit**
   `ca: ref — RefNamespaceId{ns, incarnation}; namespace-only key helpers deleted`.
 
+### DECISION 2026-07-30 — Task 1b is REDONE on top of the restatement, NOT merged {#task-1b-redo}
+
+The lane restatement (`bb4dd513118`) landed on `cas-gc-rebuild` after Task 1b was built in `lane-g`,
+and a read of both trees settles what happens next. **The restatement does NOT supersede the
+extraction**: master has no `prepareRefChunk`, no `PreparedRefChunk`, and no other pure preparation
+helper — `commitRefChunk` is still one ~550-line monolith mixing preparation, persistence and
+settlement. What the restatement rewrote is the half AFTER preparation (`RefAppendWedge` →
+`RefAppendAttempt`, a pre-send arming block that moves the prepared attempt into the runtime BEFORE
+the first send, `armApplyPending`/`clearApplyPending`/`poisonApplyState`/`RefApplyState` all replaced
+by `requireRecovery` + `lane_state`, and the third post-durable install region deleted). The
+preparation sequence the task targets survives almost textually — so the task is still worth doing,
+with a changed return type and a changed neighbour.
+
+**Why REDO and not merge, and it is the SILENT part of the merge that decides it.** `git merge-tree`
+reports only TWO conflicted files, which reads like comfort and is the trap: what AUTO-merges is
+broken. The merged header keeps `struct PreparedRefChunk { … RefAppendWedge prepared_wedge; … }`
+while the type above it is now `RefAppendAttempt` — a header that cannot compile. The merged `.cpp`
+keeps BOTH lane-g's `prepareRefChunk` producing a wedge AND master's inline attempt construction. And
+the surviving lane-g body calls `layout.refLogKey(RefNamespaceId::stageATransition(ns), id)` where
+master's calls `layout.refLogKey(ns, id)` — two incompatible key APIs in one file. A clean-looking
+merge would reintroduce the very apply-marker/wedge model the restatement deliberately deleted.
+
+**The redo, four steps, small and auditable** (the extracted body is 61 lines):
+1. Re-extract the pure preparation returning a `RefAppendAttempt` plus the birth `_ckpt`
+   contribution, leaving master's arming block in `commitRefChunk` BETWEEN preparation and the first
+   send.
+2. Re-land the birth-`_ckpt`/seal reorder and its rationale (master still publishes the `_ckpt`
+   before sealing).
+3. Rewrite the two round-2 comments against RESTATED facts — **two** probe regions, not three; fix
+   the tail-call premise (the true reason is "no remainder is left: every batch item is either
+   already completed or in this chunk's survivor set", NOT "`chunk_survivors` is the entire batch",
+   which `survivors.clear()` refutes); fix the check-enabled-lane claim (`!NDEBUG` only — CI
+   sanitizer lanes are `RelWithDebInfo` via `CMAKE_BUILD_TYPE=None`, so the guard is a no-op there
+   and only `Debug`/tidy lanes have it live); and fix the `EXPECT_GT` FAILURE MESSAGE, which still
+   states verbatim the causal claim the comment above it retracts.
+4. Re-derive the preparation-test goldens (the sealed-body size and digest asserted in
+   `gtest_cas_ref_chunk_preparation.cpp` are wedge-era and the attempt/key changes may invalidate
+   them).
+
+**Prerequisite decision, still open:** lane-g also holds Task 1 (`RefNamespaceId`, 287 call sites)
+and the GC ref-key refusal, and NEITHER is in master (`CasLayout.h:130` still takes
+`RootNamespace`). Sequence Task 1's landing FIRST if the redo wants the `RefNamespaceId` key API;
+otherwise the re-extraction uses master's `refLogKey(ns, id)` and Task 1 lands after. That call is
+the controller's and is not made here.
+
 ### Task 1b: pure `prepareRefChunk` out of `commitRefChunk` {#task-1b}
 
 [Directive implementation improvement 1 = amendment commit 2. FIRST of the amendment series and
