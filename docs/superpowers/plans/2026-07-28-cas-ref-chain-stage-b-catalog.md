@@ -922,6 +922,23 @@ reds in a shared worktree.
   better one is routing the shared helpers through the REAL birth path**, so the catalog populates the way
   production populates it. A test that fabricates a catalog entry by hand proves nothing about the path
   that creates entries — the same reason a driver-only invariant was rejected in Task 3.
+- **4-B — DONE. The map, and it collapses to ONE function.** All ten raw-write helpers
+  (`writeTxnAt`, `writeSealAt`, `publishAt`, `appendRefLogSeed`, `appendOwnerEvent`,
+  `publishCommittedTransition`, `dropRefTransition`, `addPrecommitTransition`, `promoteTransition`) are
+  defined in the shared `src/Disks/tests/cas_test_helpers.h` and all drain into `writeRefLogTxnRaw`.
+  Failure partition, by terminal reachability, closing exactly: **136 reach only `writeRefLogTxnRaw`,
+  21 reach only the real path (`beginPartWrite`/`dropNamespace` — fixed for free by 4-C's wiring), 7
+  reach both = 164.** An earlier file-level bucketing did NOT close (20 files split 17+9+2=28); the
+  test-level partition supersedes it, and the lesson stands: a classification whose parts exceed its
+  whole is not a partition, and the gap is where an unnamed fourth case hides.
+  **None of the ten can route through real birth**, and the reason is the same for each: they exist to
+  place ref-log bytes at a caller-chosen id and content — holes, out-of-order ids, a table with no
+  `_ckpt` — i.e. states `createNamespace`/`completeCreation`'s own invariants (INV-1 contiguity, INV-2's
+  seal grammar, the mandatory `_ckpt` publish) refuse to produce. So the fix is `casAdmitEntry` beside
+  `writeRefLogTxnRaw`, and **zero test files are edited**.
+  Also mapped: ~15 per-file wrapper names that a single-level grep misses; 133 of 164 classified at one
+  level, the other 31 needed a two-level trace and all landed in the same ten-helper table.
+
 - **4-C — the wiring and the discovery, with 4-B's map in hand.** Production birth resolves an incarnation
   from the catalog ONCE per table-open (not per write — a per-write catalog GET is a protocol step and is
   vetoed), cached on `RefTableRuntime`; then the saved discovery draft — **which must NOT be re-applied
