@@ -146,6 +146,47 @@ dropped before grouping. Note what this does NOT do, so nobody expects it: the P
 dead incarnation's key, deliberately — `Layout` is catalog-independent by design, so it is the wrong
 place to refuse.
 
+## R11b. R11's first fix was insufficient, and the fix made the posture WORSE than before {#r11b-authority-vs-union}
+
+Found 2026-07-30 by the Task 4-C review, on the exact question the review was asked to answer: *is
+`frontier_namespaces > 0` the right predicate, or is there a second way to reach a vacuously-complete
+frontier?* There is.
+
+**The guard was over the wrong set.** The frontier's denominator is the UNION — round hint ∪ sealed cursors
+∪ catalog `Live`/`Removing` — not the catalog. So `frontier_namespaces > 0` refuses only a pool where the
+whole union is empty, i.e. a fresh one. It does not refuse the case R11 named by name: a **damaged**
+catalog.
+
+The reachable chain: the catalog is absent, so `read` yields an empty catalog; the R10 filter drops every
+listed ref key (no entry, no match) and records no anomaly; each namespace the surviving seal still carries
+a cursor for is walked anyway, with the life falling back to `stageATransition(ns)` — a key space where a
+real-incarnation namespace has nothing; the expected-next GET is absent, there is no listing and no `_ckpt`
+witness, so the namespace is *proven*; every namespace is proven, the frontier reads complete, suppression
+clears, and the round destroys a pool in which every live blob has in-degree zero.
+
+**And this is strictly worse than before the change.** With LIST-sourced discovery, that same damaged pool
+would have been walked where its objects actually are, would have folded real records, and would have
+produced a real frontier. Moving the authority onto one object made **that object's absence
+indistinguishable from "everything is proven empty"**.
+
+**The generalisation, which is the reusable part.** R11's own lesson was *when a gate rests on `a == b`, ask
+what happens when both are zero*. Its sibling is: **ask where each side of the comparison CAME FROM.** Here
+both sides were derived from a set the authority never contributed to, so the comparison was structurally
+incapable of noticing that the authority was gone. A proof whose inputs can all come from a source other
+than the authority is not a proof about the authority.
+
+**Two fixes, both required** (ruled 2026-07-30): the sentinel fallback must not exist in the frontier walk —
+a namespace the catalog does not name is UNPROVEN, not walked at a fabricated key; and the predicate must be
+about the authority ("every walked namespace's life came from the catalog"), with an empty catalog under a
+nonzero prior seal recorded as an anomaly so it both suppresses and reaches an operator.
+
+**One ruling ON TOP of the review's proposal, because the review's own argument cuts both ways.** It argued
+the class is not pre-release-only because an entry disappears during ordinary removal — which is also why
+"ref objects exist, no entry" is a **legitimate transient state on every removal**, since the removal
+lifecycle deletes the entry LAST. So an un-cataloged namespace is an anomaly only WITHOUT evidence of a
+removal in progress. An anomaly that fires on normal operation trains operators to dismiss anomalies, which
+is the same harm as a hard fsck finding raised against undamaged data.
+
 ## R11. An authoritative universe with zero entries satisfies the frontier VACUOUSLY {#r11-empty-universe-vacuous}
 
 Found 2026-07-30 while adjudicating Task 4's scope, and verified on the code. `Gc::fold` computes
