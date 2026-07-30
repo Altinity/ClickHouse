@@ -12,6 +12,8 @@
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
 #include <Common/MemoryTracker.h>
+#include <Common/SipHash.h>
+#include <base/hex.h>
 
 #include <atomic>
 #include <cstdint>
@@ -778,4 +780,108 @@ TEST(CasRefCkpt, APublishFencedOutMidAttemptDoesNotAdvanceTheCheckpoint)
     EXPECT_FALSE(readCkptOrFail(*backend, store->layout(), ns).checkpoint_snapshot_id.has_value());
     EXPECT_FALSE(store->newestPublishedSnapshotIdForTest(ns).has_value())
         << "the snapshot must not be adopted as the newest while its checkpoint is unpublished";
+}
+
+/// ===================================================================================
+/// Equivalence fences for the `prepareRefChunk` extraction (Stage B `{#extract-prepare-ref-chunk}`)
+/// ===================================================================================
+///
+/// An extraction is only safe to review if something pins what crosses its boundary. These three
+/// fences are deliberately NOT red-first: they pass on the PRE-extraction tree and must keep passing
+/// after it, which is the whole point -- the literals below were captured from a real append on the
+/// pre-extraction tree and pasted in, so re-deriving them afterwards cannot silently measure the
+/// change against itself.
+///
+/// They live in this TU rather than beside the pure preparation tests because all three need a real
+/// backend and the real append lane, which this suite already drives through `publishRef` (including
+/// the namespace birth, the one chunk shape whose first durable effect is the `_ckpt` and not the
+/// ref-log `PUT`).
+TEST(CasRefCkpt, CommitRefChunkDurableBytesUnchangedByExtraction)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"test/golden@cas@"};
+
+    const RefTxnId id = publishRef(store, ns, "gold_ref", 7);
+    ASSERT_EQ(id.writer_epoch, 1u);
+    ASSERT_EQ(id.ref_sequence, 1u);
+
+    /// The KEY carries the namespace incarnation, so its life segment is rendered rather than pasted
+    /// (Task 1c re-keys it); every other segment is literal.
+    const String key = store->layout().refLogKey(RefNamespaceId::stageATransition(ns), id);
+    EXPECT_EQ(key, "p/cas/refs/test/golden@cas@/"
+                   + renderRefIncarnation(RefNamespaceId::stageATransition(ns).incarnation)
+                   + "/_log/0000000000000001-0000000000000001.zst")
+        << "the canonical ref-log key the append lane derives";
+
+    /// The BODY is pinned by exact length plus a 128-bit digest, which together pin it byte for byte
+    /// while staying readable. It is a function of `{ns, id, ops, chain_link}` only -- no incarnation
+    /// reaches it -- so these two literals survive Task 1c's re-keying as well.
+    const auto got = backend->get(key);
+    ASSERT_TRUE(got.has_value()) << "the birth chunk must be durable at its canonical key";
+    EXPECT_EQ(got->bytes.size(), 177u) << "the sealed ref-log body changed size";
+    SipHash body_hash;
+    body_hash.update(got->bytes.data(), got->bytes.size());
+    EXPECT_EQ(getHexUIntLowercase(body_hash.get128()), "447348741c9f402fb94767ae028a4e73")
+        << "the sealed ref-log body changed content -- preparation must seal the same bytes it sealed "
+           "before the extraction";
+}
+
+/// The directive's "preserve backend request counts", asserted rather than assumed: preparation is
+/// pure, so lifting it out must not add, remove or reorder a single request. One birth chunk = exactly
+/// one write-once `PUT` at the ref-log key, no read-back, and exactly one `_ckpt` CAS.
+TEST(CasRefCkpt, AppendRequestCountUnchangedByExtraction)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"test/req@cas@"};
+
+    const RefTxnId id = publishRef(store, ns, "req_ref", 1);
+    const String log_key = store->layout().refLogKey(RefNamespaceId::stageATransition(ns), id);
+    const String ckpt_key = store->layout().refCkptKey(RefNamespaceId::stageATransition(ns));
+
+    EXPECT_EQ(backend->putCount(log_key), 1u) << "exactly one write-once PUT per committed chunk";
+    EXPECT_EQ(backend->getCount(log_key), 0u) << "a Committed PUT owes no read-back";
+    EXPECT_EQ(backend->casPutCount(ckpt_key), 1u)
+        << "the birth contributes `life_epoch` in exactly one `_ckpt` CAS -- deciding that contribution "
+           "earlier must not publish it twice, nor move the publish off the birth path";
+}
+
+/// The post-durable install region is the reason preparation has to happen where it does: everything
+/// between "this object may be durable" and "the runtime records it" runs under
+/// `DENY_ALLOCATIONS_IN_SCOPE` and must not allocate. The extraction moves work EARLIER, never into
+/// that region.
+///
+/// WHAT THIS TEST PROVES, and what it does NOT -- stated precisely, because a fence trusted for more
+/// than it checks is worse than no fence.
+///
+/// `DENY_ALLOCATIONS_IN_SCOPE` is `static_assert(true)` unless `!defined(NDEBUG)` (`MemoryTracker.h`),
+/// so it is inert in every build that leaves `NDEBUG` defined -- which includes this gate and CI's
+/// sanitizer lanes, since those configure `CMAKE_BUILD_TYPE=None` and `CMakeLists.txt` maps that to
+/// `RelWithDebInfo`. Only a `Debug` build, or a tidy lane (which adds `-UNDEBUG`), has the
+/// no-allocation half live. Nothing here proves the region does not allocate.
+///
+/// What is left is weaker than "the install is still guarded": `install_region_probe_for_test` fires
+/// as the FIRST statement inside the guarded scope, BEFORE `rt->state.swap(*candidate)`, and the SAME
+/// probe is shared by BOTH probe-instrumented post-durable install regions (`CasRefLedger.cpp`: the
+/// wedge-resolution adoption and `commitRefChunk`'s `Committed` install). So `probe_hits > 0` proves
+/// only that SOME probe-instrumented region was entered on this path -- which on this path can only be
+/// the commit install, since nothing here wedges. It goes red if the region stops being entered at all
+/// (a lost commit path, a skipped install arm); a refactor that lifted the swap out of the scope while
+/// leaving the guard shell and the probe behind would keep it GREEN.
+TEST(CasRefCkpt, PostDurableInstallRegionStillEnteredAfterExtraction)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"test/region@cas@"};
+
+    unsigned probe_hits = 0;
+    store->setInstallRegionProbeForTest([&probe_hits] { ++probe_hits; });
+    const RefTxnId id = publishRef(store, ns, "region_ref", 1);
+    store->setInstallRegionProbeForTest(nullptr);
+
+    EXPECT_GT(probe_hits, 0u)
+        << "no probe-instrumented post-durable install region was entered on a committing append -- "
+           "the `Committed` install arm was not reached at all";
+    EXPECT_TRUE(backend->get(store->layout().refLogKey(RefNamespaceId::stageATransition(ns), id)).has_value());
 }
