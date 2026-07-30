@@ -2851,3 +2851,21 @@ to know which findings exit nonzero should be sent to `kFsckHardFindings` and to
 Related: `{#fsck-untestable-render-surfaces}` is the other half — the exit set and SQL row have no
 failable test. Together they bound what the fence does and does not reach; do not let a future round
 re-derive either from scratch.
+
+## A loose mountpoint object under `_files/` is classified as a corrupt namespace file {#loose-mountpoint-object-as-corrupt-namespace-file}
+
+Behaviour half of the Task 1c review's MINOR-1 (the wording half is
+`deferred-docs-fixes.md` `{#d1-parse-namespace-file-key-contract}`). Filed separately because a
+finding reported as a wording problem turned out to name a real consequence, and batching it with
+comment fixes would have buried it.
+
+`Layout::mountpointObjectKey` does not enforce the `_files` reservation — its doc asserts that those
+segments "never appear in a real ClickHouse loose-file path" and checks nothing. So a loose object at
+`roots/<srid>/_files/x` satisfies `parseNamespaceFileKey`'s necessary condition and is treated as one
+of ours. Consequence: `ca-decommission` refuses fail-close and `ca-fsck` posts a hard `lifeless_keys`
+finding against a key that is not damage.
+
+**The direction is safe** (refuse and report, never delete), which is why this is not urgent. What
+makes it worth fixing is that a hard finding against a non-damaged key trains an operator to
+disbelieve hard findings. Decide between enforcing the reservation in `mountpointObjectKey` and
+narrowing the classifier; the first is the one that makes the existing doc true.

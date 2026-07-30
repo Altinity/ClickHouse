@@ -1271,6 +1271,26 @@ change with a hard ordering obligation attached.]
 
 ### Task 7: R5 — decommission duties {#task-7}
 
+**Carried code residues from the Task 1c review** (prose findings from that review went to
+`docs/superpowers/cas/deferred-docs-fixes.md` instead; these three are executing defects, so they
+stay here and keep their review):
+
+- [ ] **The decommission test's assertion does not establish what its comment claims.**
+  `gtest_cas_decommission.cpp`, `CasDecommission.LifelessKeyRefusesTheWholeCommandFailClose` asserts
+  `!backend->list(Layout("p").casRefsPrefix() + "victim/", …).keys.empty()` under the comment "the
+  healthy namespace's refs are untouched" — but the planted lifeless key sits under that very prefix,
+  so the assertion passes even if the healthy namespace had been fully drained. Assert on the healthy
+  namespace's `refsNamespacePrefix(...)`, or on `report.namespaces_removed`.
+- [ ] **A vestigial guard implies a return the parser cannot produce.** `Pool::listNamespaces`'s roots
+  loop tests `!ns_str->empty()`, but `Layout::namespaceLifeOf` throws `CORRUPTED_DATA` on an empty
+  namespace part, so `parseNamespaceFileKey` can never yield one. Leftover of the hand-split it
+  replaced; delete it.
+- [ ] **The pre-flight LIST base is loose.** `CasDecommission.cpp`'s `decommissionPoolMember` passes
+  `victim_srid` with no trailing `/`, so the base `…/cas/refs/victim` also matches `victim2/…`. The
+  looseness predates Task 1c; the new fail-close gave it a new consequence — a lifeless key under a
+  SIBLING srid now refuses this srid's decommission. Not a free edit: adding the `/` also changes
+  which namespaces get drained, so pin that change with a test.
+
 **Files:**
 - Modify: `.../ContentAddressed/Tools/CasDecommission.cpp` (scoped-LIST discovery `~:116`
   replaced) [path per codex finding 18]
