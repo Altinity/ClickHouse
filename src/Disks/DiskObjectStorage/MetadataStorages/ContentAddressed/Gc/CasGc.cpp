@@ -2999,7 +2999,8 @@ bool Gc::namespacePhysicallyEmpty(const RootNamespace & ns)
 {
     Backend & backend = store->backend();
     const Layout & layout = store->layout();
-    for (const String & prefix : {layout.manifestNamespacePrefix(ns), layout.namespaceFilesPrefix(ns)})
+    for (const String & prefix : {layout.manifestNamespacePrefix(ns),
+                                  layout.namespaceFilesPrefix(NamespaceLifeId::stageATransition(ns))})
     {
         const ListPage page = backend.list(prefix, /*cursor*/String{}, /*limit*/1);
         ProfileEvents::increment(ProfileEvents::CasGcEnumerationPages);
@@ -3134,7 +3135,7 @@ void Gc::runNamespaceCleanupPasses(const CasFoldSeal & seal, const std::map<Stri
             /// (manifest bodies + verbatim files). NotFound/TokenMismatch tolerated.
             struct { String prefix; bool is_manifest; } passes[] = {
                 {layout.manifestNamespacePrefix(item.ns), true},
-                {layout.namespaceFilesPrefix(item.ns), false},
+                {layout.namespaceFilesPrefix(NamespaceLifeId::stageATransition(item.ns)), false},
             };
             for (const auto & pass : passes)
             {

@@ -810,16 +810,21 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
     {
         if (auto tf = Cas::parseTableFilePath(path))
         {
-            const Cas::RootNamespace ns = metadata_storage.liveNamespace(tf->table_uuid);
+            /// The LIFE is resolved once, here at buffer-open time, and captured by value below, so a
+            /// finalize that runs later writes to the incarnation this open was admitted under -- never
+            /// into whatever life the namespace name happens to denote when the callback fires
+            /// (directive §namespace-file-requirements).
+            const Cas::NamespaceLifeId life
+                = Cas::NamespaceLifeId::stageATransition(metadata_storage.liveNamespace(tf->table_uuid));
             const std::string name = tf->tail;
             std::string prefix_bytes;
             if (mode == WriteMode::Append)
-                if (auto existing = metadata_storage.store()->getNamespaceFile(ns, name))
+                if (auto existing = metadata_storage.store()->getNamespaceFile(life, name))
                     prefix_bytes = std::move(*existing);
             return std::make_unique<Cas::CaInlineWriteBuffer>(
-                [this, ns, name, carried = std::move(prefix_bytes)](std::string bytes)
+                [this, life, name, carried = std::move(prefix_bytes)](std::string bytes)
                 {
-                    metadata_storage.store()->putNamespaceFile(ns, name, carried + bytes);
+                    metadata_storage.store()->putNamespaceFile(life, name, carried + bytes);
                 });
         }
         /// A loose disk file, including the startup write probe, is a plain mountpoint object.
@@ -1109,9 +1114,10 @@ void ContentAddressedTransaction::removeRecursive(const std::string & path, cons
     {
         const auto ns = metadata_storage.liveNamespace(tf->table_uuid);
         const std::string prefix = tf->tail + "/";
-        for (const auto & name : metadata_storage.store()->listNamespaceFiles(ns))
+        const Cas::NamespaceLifeId life = Cas::NamespaceLifeId::stageATransition(ns);
+        for (const auto & name : metadata_storage.store()->listNamespaceFiles(life))
             if (name.starts_with(prefix))
-                metadata_storage.store()->removeNamespaceFile(ns, name);
+                metadata_storage.store()->removeNamespaceFile(life, name);
         return;
     }
 }
@@ -1232,9 +1238,11 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
             {
                 for (const auto & [ref, _] : metadata_storage.store()->listRefs(from_ns))
                     metadata_storage.partAccess()->republishRef({from_ns, ref}, {to_ns, ref});
-                for (const auto & name : metadata_storage.store()->listNamespaceFiles(from_ns))
-                    if (auto bytes = metadata_storage.store()->getNamespaceFile(from_ns, name))
-                        metadata_storage.store()->putNamespaceFile(to_ns, name, *bytes);
+                const Cas::NamespaceLifeId from_life = Cas::NamespaceLifeId::stageATransition(from_ns);
+                const Cas::NamespaceLifeId to_life = Cas::NamespaceLifeId::stageATransition(to_ns);
+                for (const auto & name : metadata_storage.store()->listNamespaceFiles(from_life))
+                    if (auto bytes = metadata_storage.store()->getNamespaceFile(from_life, name))
+                        metadata_storage.store()->putNamespaceFile(to_life, name, *bytes);
                 metadata_storage.partAccess()->dropNamespace(from_ns);
             }
             catch (...)
@@ -1400,15 +1408,17 @@ void ContentAddressedTransaction::moveFile(const std::string & path_from, const 
             /// pre-existing destination can never reach this branch: destination names derive
             /// deterministically from source names, and the SINGLE-WRITER contract means only this
             /// move's own prior drive can have produced it.
-            auto bytes = metadata_storage.store()->getNamespaceFile(src_ns, src_tf.tail);
+            const Cas::NamespaceLifeId src_life = Cas::NamespaceLifeId::stageATransition(src_ns);
+            const Cas::NamespaceLifeId dst_life = Cas::NamespaceLifeId::stageATransition(dst_ns);
+            auto bytes = metadata_storage.store()->getNamespaceFile(src_life, src_tf.tail);
             if (!bytes)
             {
-                if (metadata_storage.store()->getNamespaceFile(dst_ns, dst_tf.tail))
+                if (metadata_storage.store()->getNamespaceFile(dst_life, dst_tf.tail))
                     return;
                 throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: moveFile source missing: {}", path_from);
             }
-            metadata_storage.store()->putNamespaceFile(dst_ns, dst_tf.tail, *bytes);
-            metadata_storage.store()->removeNamespaceFile(src_ns, src_tf.tail);
+            metadata_storage.store()->putNamespaceFile(dst_life, dst_tf.tail, *bytes);
+            metadata_storage.store()->removeNamespaceFile(src_life, src_tf.tail);
         };
         auto src_tf = Cas::parseTableFilePath(path_from);
         auto dst_tf = Cas::parseTableFilePath(path_to);
@@ -1573,8 +1583,9 @@ void ContentAddressedTransaction::unlinkFile(const std::string & path, bool if_e
     /// a pruned mutation entry would otherwise leak until DROP.
     if (auto tf = Cas::parseTableFilePath(path))
     {
-        const auto ns = metadata_storage.liveNamespace(tf->table_uuid);
-        if (!metadata_storage.store()->getNamespaceFile(ns, tf->tail))
+        const Cas::NamespaceLifeId life
+            = Cas::NamespaceLifeId::stageATransition(metadata_storage.liveNamespace(tf->table_uuid));
+        if (!metadata_storage.store()->getNamespaceFile(life, tf->tail))
         {
             if (if_exists)
                 return;
@@ -1583,7 +1594,7 @@ void ContentAddressedTransaction::unlinkFile(const std::string & path, bool if_e
                 "ContentAddressed: unlinkFile target does not exist: {}",
                 path);
         }
-        metadata_storage.store()->removeNamespaceFile(ns, tf->tail);
+        metadata_storage.store()->removeNamespaceFile(life, tf->tail);
         return;
     }
     /// Loose mountpoint file: exact-token delete of the plain object.

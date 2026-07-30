@@ -9,8 +9,8 @@
 namespace DB::Cas
 {
 
-/// One namespace's checkpoint object (spec INV-4), persisted as the mutable, token-CAS
-/// `cas_ref_ckpt` control object at `Layout::refCkptKey(ns)`.
+/// One namespace LIFE's checkpoint object (spec INV-4), persisted as the mutable, token-CAS
+/// `cas_ref_ckpt` control object at `Layout::refCkptKey`, whose argument is a `NamespaceLifeId`.
 ///
 /// It exists because prefix cleaning made the ref stream unreadable from a LIST alone: a cleaned
 /// prefix plus a hidden snapshot is indistinguishable from an empty one, so recovery cannot decide

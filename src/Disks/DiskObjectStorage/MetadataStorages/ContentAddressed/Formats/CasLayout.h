@@ -45,6 +45,19 @@ struct ParsedRefObjectKey
     bool operator==(const ParsedRefObjectKey &) const = default;
 };
 
+/// The result of `Layout::parseNamespaceFileKey`: the namespace LIFE that owns a listed verbatim file
+/// and the file's name relative to that life's `_files/` prefix. `id` carries the incarnation the key
+/// spells, which may name a life the catalog no longer lists -- that is how debris of a dead life is
+/// recognized as such rather than mistaken for the current life's file. The namespace inside it is
+/// syntactically parsed; a caller that will USE it for an operation must `validateNamespace` first.
+struct ParsedNamespaceFileKey
+{
+    NamespaceLifeId id;
+    String relative_name;
+
+    bool operator==(const ParsedNamespaceFileKey &) const = default;
+};
+
 /// The result of `Layout::parseBlobTargetRunKey`: the (generation, attempt, shard, seq) coordinates
 /// recovered from a listed blob-target in-degree/delta run segment key.
 struct ParsedBlobTargetRunKey
@@ -70,7 +83,7 @@ struct ParsedBlobTargetRunKey
 ///   - part manifests:   POOL/cas/manifests/NAMESPACE/BUILD/ORDINAL.zst
 ///   - ref objects:      POOL/cas/refs/NAMESPACE/INCARNATION/_log|_snap|_cleanup/ID
 ///                       POOL/cas/refs/NAMESPACE/INCARNATION/_ckpt
-///   - verbatim files:   POOL/roots/NAMESPACE/_files/FILE_NAME
+///   - verbatim files:   POOL/roots/NAMESPACE/INCARNATION/_files/FILE_NAME
 ///   - GC state:         POOL/gc/...
 ///   - pool metadata:    POOL/_pool_meta
 ///
@@ -224,28 +237,51 @@ public:
         return prefix + "/cas/manifests/";
     }
 
-    /// Verbatim (non-content-addressed) file stored under a namespace. Names may be nested
+    /// Verbatim (non-content-addressed) file stored under ONE LIFE of a namespace. Names may be nested
     /// (relative sub-paths — the wiring stores table-level subdirectory files such as
     /// deduplication_logs/deduplication_log_1.txt verbatim); empty segments, leading or
-    /// trailing '/', and '..' segments are rejected (no escaping the namespace's files prefix).
-    String namespaceFileKey(const RootNamespace & ns, const String & file_name) const
+    /// trailing '/', and '..' segments are rejected (no escaping the life's files prefix).
+    ///
+    /// The incarnation segment is what makes a file of a previous life structurally unreachable from
+    /// the next one (directive §2): once the catalog entry is gone, nothing can name that life's files
+    /// again, so a LIST that omitted an old file can only leak storage — it can no longer let the file
+    /// become visible under a reborn namespace of the same name.
+    String namespaceFileKey(const NamespaceLifeId & life, const String & file_name) const
     {
-        checkNamespace(ns);
         const bool bad_shape = file_name.empty() || file_name.front() == '/' || file_name.back() == '/'
             || file_name.find("//") != String::npos || file_name == ".." || file_name.starts_with("../")
             || file_name.ends_with("/..") || file_name.find("/../") != String::npos;
         if (bad_shape)
             throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
                 "CasLayout: namespace file name must be a clean relative path, got '{}'", file_name);
-        return prefix + "/roots/" + ns.string() + "/_files/" + file_name;
+        return namespaceFilesPrefix(life) + file_name;
     }
 
-    /// Prefix that covers all verbatim files of a namespace (for list).
-    String namespaceFilesPrefix(const RootNamespace & ns) const
+    /// Prefix that covers all verbatim files of ONE LIFE of a namespace (for list). A LIST of it
+    /// enumerates that life's files and nothing of any earlier life of the same namespace name.
+    String namespaceFilesPrefix(const NamespaceLifeId & life) const
     {
-        checkNamespace(ns);
-        return prefix + "/roots/" + ns.string() + "/_files/";
+        checkNamespace(life.ns);
+        return prefix + "/roots/" + life.ns.string() + "/" + renderIncarnation(life.incarnation) + "/_files/";
     }
+
+    /// Inverse of `namespaceFileKey`: classifies a LISTED key under `rootsPrefix()` by the reserved
+    /// `_files` segment and returns the life it belongs to plus the name relative to that life's files
+    /// prefix. Returns `std::nullopt` for anything that is not one of OUR namespace files: a foreign
+    /// top-level prefix, a key with no `_files` segment at all (a loose mountpoint object is a
+    /// legitimate inhabitant of `roots/`, never damage), or nothing after the reserved segment.
+    ///
+    /// It THROWS `CORRUPTED_DATA` naming the key in the same one situation the ref parsers do: the key
+    /// IS one of our namespace files -- it carries the reserved segment -- but the segment where its
+    /// incarnation belongs is missing, non-canonical or zero. Behind Stage B's format bump that is the
+    /// un-incarnated (Stage A) shape, and classifying it as foreign debris would leave it sitting
+    /// unnoticed under a live namespace.
+    ///
+    /// The FIRST `_files` segment is the one that separates the life from the relative name. That is
+    /// unambiguous because `checkNamespace` rejects `_files` as a namespace segment, while a relative
+    /// NAME may contain it. Defined out-of-line in `CasLayout.cpp`, where the key construction and
+    /// parsing helpers remain together.
+    std::optional<ParsedNamespaceFileKey> parseNamespaceFileKey(std::string_view key) const;
 
     /// Part manifest body key, in canonical hex form:
     ///   <prefix>/cas/manifests/<ns>/<epoch-hex>-<build-seq-hex>/<000001>.zst
@@ -446,10 +482,10 @@ private:
     /// the key construction and parsing helpers remain together.
     void checkNamespace(const RootNamespace & ns) const;
 
-    /// Splits the `<ns>/<inc>` head shared by both ref-object parsers, once the rest of `key` has
-    /// already identified it as one of ours. Never returns a partial answer: an incarnation segment
-    /// that is missing, non-canonical or zero, or a missing namespace, is refused with
-    /// `CORRUPTED_DATA` naming `key`.
+    /// Splits the `<ns>/<inc>` head shared by the ref-object parsers and the namespace-file parser,
+    /// once the rest of `key` has already identified it as one of ours. Never returns a partial answer:
+    /// an incarnation segment that is missing, non-canonical or zero, or a missing namespace, is refused
+    /// with `CORRUPTED_DATA` naming `key`.
     NamespaceLifeId namespaceLifeOf(std::string_view key, std::string_view ns_and_incarnation) const;
 
     /// Build <prefix>/<namespace>/<first2chars>/<id>.

@@ -57,15 +57,22 @@ inline std::optional<UInt128> parseIncarnation(std::string_view s)
 
 class Layout;
 
-/// The identity of ONE LIFE of a namespace's ref layer: the opaque namespace name plus the
-/// incarnation minted for that life in the `ref_catalog` (spec INV-3). Every ref-layer key is built
-/// from the PAIR -- `<prefix>/cas/refs/<ns>/<inc>/{_log,_snap,_cleanup,_ckpt}` -- so dropping and
-/// recreating a namespace under the same name lands under a different prefix, and the previous life's
-/// surviving objects are structurally inert to the new life instead of being aliased by it.
+/// The identity of ONE LIFE of a namespace: the opaque namespace name plus the incarnation minted for
+/// that life in the `ref_catalog` (spec INV-3). Every ref-layer key AND every namespace-file key is
+/// built from the PAIR -- `<prefix>/cas/refs/<ns>/<inc>/{_log,_snap,_cleanup,_ckpt}` and
+/// `<prefix>/roots/<ns>/<inc>/_files/<relative-name>` -- so dropping and recreating a namespace under
+/// the same name lands under a different prefix, and the previous life's surviving objects are
+/// structurally inert to the new life instead of being aliased by it.
 ///
-/// There is deliberately NO conversion from a bare `RootNamespace` and no default construction: code
-/// holding only the name cannot name a ref object at all, so losing the incarnation is a compile
-/// error rather than a runtime aliasing bug (spec §2 r9-3).
+/// Part manifests and loose mountpoint objects are deliberately NOT qualified (Constraint 12,
+/// directive §2): manifests already carry globally unique build identities, and a loose mountpoint
+/// object is outside namespace ownership altogether.
+///
+/// There is deliberately NO conversion from a bare `RootNamespace`, none to one, and no default
+/// construction: code holding only the name cannot name a ref object or a namespace file at all, so
+/// losing the incarnation is a compile error rather than a runtime aliasing bug (spec §2 r9-3). The
+/// call sites that legitimately need the bare name -- manifest identities, loose mountpoint objects --
+/// say `.ns`, and are visible in review because they say it.
 ///
 /// Exactly three places may mint one, and each has a name that says where its incarnation came from:
 /// `fromCatalogEntry` (every discovery path -- recovery, fold, fsck, the sweeps), the reader-handle
@@ -91,12 +98,12 @@ struct NamespaceLifeId
     /// id its table was opened under and never re-derives it, so the read side pays no catalog
     /// request (spec §2). It is absent here because the handle type does not exist yet.
 
-    /// TRANSITIONAL -- Stage B Task 1 ONLY, and the ONLY way to reach a ref key from a bare
-    /// namespace. Task 1 migrates every ref-layer key helper to this type before the catalog that
-    /// mints real incarnations exists (Task 2) and before the reader paths carry handles (Task 6), so
-    /// until then the whole tree mints keys at this one fixed incarnation and the layer stays
-    /// self-consistent. Task 6 DELETES it, gated on a tree-wide grep for `stageATransition` finding
-    /// no build inputs. Do not call it from new code.
+    /// TRANSITIONAL -- Stage B Tasks 1 and 1c ONLY, and the ONLY way to reach a life-keyed object from
+    /// a bare namespace. Those tasks migrate the ref-layer AND namespace-file key helpers to this type
+    /// before the catalog that mints real incarnations exists (Task 2) and before the reader paths carry
+    /// handles (Task 6), so until then the whole tree mints keys at this one fixed incarnation and both
+    /// layers stay self-consistent. Task 6 DELETES it, gated on a tree-wide grep for `stageATransition`
+    /// finding no build inputs. Do not call it from new code.
     static NamespaceLifeId stageATransition(RootNamespace ns)
     {
         /// A fixed, obviously synthetic sentinel rather than a plausible-looking small number: its

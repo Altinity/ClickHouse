@@ -4,6 +4,9 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Common/Exception.h>
 
+#include <concepts>
+#include <type_traits>
+
 using namespace DB::Cas;
 
 namespace DB::ErrorCodes
@@ -88,6 +91,40 @@ concept HasNamespaceOnlyRefCkptKey =
 template <class L>
 concept HasIncarnationRefCkptKey =
     requires(const L & l, const NamespaceLifeId & id) { l.refCkptKey(id); };
+
+/// The namespace-FILE half of the same pattern (directive §1: "Delete all namespace-only ref and
+/// namespace-file key overloads"), paired the same way.
+template <class L>
+concept HasNamespaceOnlyNamespaceFileKey =
+    requires(const L & l, const RootNamespace & ns, const String & n) { l.namespaceFileKey(ns, n); };
+template <class L>
+concept HasIncarnationNamespaceFileKey =
+    requires(const L & l, const NamespaceLifeId & life, const String & n) { l.namespaceFileKey(life, n); };
+
+template <class L>
+concept HasNamespaceOnlyNamespaceFilesPrefix =
+    requires(const L & l, const RootNamespace & ns) { l.namespaceFilesPrefix(ns); };
+template <class L>
+concept HasIncarnationNamespaceFilesPrefix =
+    requires(const L & l, const NamespaceLifeId & life) { l.namespaceFilesPrefix(life); };
+
+/// The two OUT-OF-SCOPE families (Constraint 12, directive §2 "Keep these unchanged"): loose
+/// mountpoint objects and part manifests keep the identity they have today. Each is paired in the
+/// opposite direction from the migrated helpers -- the POSITIVE is the un-life-scoped overload that
+/// must survive, the NEGATIVE is the life-scoped overload that must never appear.
+template <class L>
+concept HasUnscopedMountpointObjectKey =
+    requires(const L & l, const String & key) { l.mountpointObjectKey(key); };
+template <class L>
+concept HasLifeScopedMountpointObjectKey =
+    requires(const L & l, const NamespaceLifeId & life, const String & key) { l.mountpointObjectKey(life, key); };
+
+template <class L>
+concept HasNamespaceOnlyManifestNamespacePrefix =
+    requires(const L & l, const RootNamespace & ns) { l.manifestNamespacePrefix(ns); };
+template <class L>
+concept HasLifeScopedManifestNamespacePrefix =
+    requires(const L & l, const NamespaceLifeId & life) { l.manifestNamespacePrefix(life); };
 
 }
 
@@ -241,6 +278,98 @@ TEST(CasNamespaceLifeId, ForeignAndUnrecognizedKeysStayInert)
     EXPECT_FALSE(l.parseRefCkptKey("p/cas/refs/_ckpt").has_value());
 }
 
+/// Namespace FILES are life-keyed too (directive §2): `roots/<ns>/<inc>/_files/<relative-name>`. The
+/// round trip covers a flat name and a NESTED one, because the dedup log's segments live in a
+/// table-level subdirectory and the nested shape is the one on the insert path.
+TEST(CasNamespaceLifeId, NamespaceFileKeysCarryTheIncarnationSegment)
+{
+    Layout l("p");
+    const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(RootNamespace{kNs}, incarnationA());
+    const String files = "p/roots/" + kNs + "/" + kHexA + "/_files/";
+
+    EXPECT_EQ(l.namespaceFilesPrefix(life), files);
+    EXPECT_EQ(l.namespaceFileKey(life, "format_version.txt"), files + "format_version.txt");
+    EXPECT_EQ(l.namespaceFileKey(life, "deduplication_logs/deduplication_log_1.txt"),
+              files + "deduplication_logs/deduplication_log_1.txt");
+
+    for (const String & name : {String("format_version.txt"), String("deduplication_logs/deduplication_log_1.txt")})
+    {
+        const auto parsed = l.parseNamespaceFileKey(l.namespaceFileKey(life, name));
+        ASSERT_TRUE(parsed.has_value()) << "for name '" << name << "'";
+        EXPECT_EQ(parsed->id, life);
+        EXPECT_EQ(parsed->relative_name, name);
+    }
+
+    /// Two lives of one namespace share no file key either, and neither files prefix covers the other.
+    const NamespaceLifeId second = NamespaceLifeId::fromCatalogEntry(RootNamespace{kNs}, incarnationB());
+    EXPECT_NE(l.namespaceFileKey(life, "format_version.txt"), l.namespaceFileKey(second, "format_version.txt"));
+    EXPECT_FALSE(l.namespaceFileKey(second, "format_version.txt").starts_with(l.namespaceFilesPrefix(life)));
+}
+
+/// The `_files` mirror of the ref-key refusal contract: behind Stage B's format bump the un-incarnated
+/// file key names no live object, so it is corruption rather than a compatibility case, and the refusal
+/// names the key.
+TEST(CasNamespaceLifeId, NamespaceFileParserRefusesLegacyAndMalformedIncarnations)
+{
+    Layout l("p");
+    const String zeros(32, '0');
+    const String legacy = "p/roots/" + kNs + "/_files/format_version.txt";
+    /// A single-segment namespace leaves nothing at all where the incarnation belongs.
+    const String legacy_single_segment = "p/roots/srv1/_files/format_version.txt";
+    const String zero_inc = "p/roots/" + kNs + "/" + zeros + "/_files/format_version.txt";
+
+    expectRefusalNaming([&] { l.parseNamespaceFileKey(legacy); }, legacy);
+    expectRefusalNaming([&] { l.parseNamespaceFileKey(legacy_single_segment); }, legacy_single_segment);
+    expectRefusalNaming([&] { l.parseNamespaceFileKey(zero_inc); }, zero_inc);
+
+    const String upper = "112233445566778899AABBCCDDEEFF01";
+    const String too_short = kHexA.substr(0, 31);
+    const String too_long = kHexA + "0";
+    const String non_hex = kHexA.substr(0, 31) + "z";
+    for (const String & bad : {upper, too_short, too_long, non_hex})
+    {
+        const String key = "p/roots/" + kNs + "/" + bad + "/_files/format_version.txt";
+        expectRefusalNaming([&] { l.parseNamespaceFileKey(key); }, key);
+    }
+}
+
+/// The corrupt/not-ours boundary for file keys, mirroring the ref parsers': refusal is reserved for
+/// keys already identified as OUR namespace files by their reserved `_files` segment. A loose
+/// mountpoint object has no such segment and is a legitimate inhabitant of `roots/`, so it must parse
+/// as `std::nullopt` and never as damage.
+TEST(CasNamespaceLifeId, ForeignAndMountpointKeysStayInertForTheFileParser)
+{
+    Layout l("p");
+    const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(RootNamespace{kNs}, incarnationA());
+
+    EXPECT_FALSE(l.parseNamespaceFileKey("q/roots/" + kNs + "/" + kHexA + "/_files/x").has_value());
+    EXPECT_FALSE(l.parseNamespaceFileKey(l.mountpointObjectKey("srv1/clickhouse_access_check_abc")).has_value());
+    EXPECT_FALSE(l.parseNamespaceFileKey("p/cas/refs/" + kNs + "/" + kHexA + "/_files/x").has_value());
+    /// The files prefix itself names no file: there is no relative name after the reserved segment.
+    EXPECT_FALSE(l.parseNamespaceFileKey(l.namespaceFilesPrefix(life)).has_value());
+    /// And the ref parsers do not claim a file key.
+    EXPECT_FALSE(l.parseRefObjectKey(l.namespaceFileKey(life, "x")).has_value());
+    EXPECT_FALSE(l.parseRefCkptKey(l.namespaceFileKey(life, "x")).has_value());
+}
+
+/// The parser takes the FIRST `/_files/` in the key, which is unambiguous only because a NAMESPACE can
+/// never contain that segment. That premise is asserted here rather than asserted in prose, since the
+/// parser's correctness rests on it: `_files` is rejected as a namespace segment, while a relative NAME
+/// may contain it, and such a name still round-trips.
+TEST(CasNamespaceLifeId, TheReservedFilesSegmentCannotComeFromTheNamespace)
+{
+    Layout l("p");
+    EXPECT_THROW(l.namespaceFilesPrefix(NamespaceLifeId::fromCatalogEntry(
+        RootNamespace{"srv1/_files/tbl"}, incarnationA())), DB::Exception);
+
+    const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(RootNamespace{kNs}, incarnationA());
+    const String nested_name = "deduplication_logs/_files/log_1.txt";
+    const auto parsed = l.parseNamespaceFileKey(l.namespaceFileKey(life, nested_name));
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_EQ(parsed->id, life);
+    EXPECT_EQ(parsed->relative_name, nested_name);
+}
+
 /// The "cannot compile" half of spec §9 r9-5 #3: after this task there is no way to reach a ref-layer
 /// key from a namespace alone, so dropping the incarnation is a compile error rather than an aliasing
 /// bug. Each helper is asserted twice -- the namespace-only form absent, the incarnation form present.
@@ -260,6 +389,41 @@ TEST(CasNamespaceLifeId, NamespaceOnlyKeyHelpersDoNotExist)
 
     static_assert(!HasNamespaceOnlyRefCkptKey<Layout>);
     static_assert(HasIncarnationRefCkptKey<Layout>);
+
+    static_assert(!HasNamespaceOnlyNamespaceFileKey<Layout>);
+    static_assert(HasIncarnationNamespaceFileKey<Layout>);
+
+    static_assert(!HasNamespaceOnlyNamespaceFilesPrefix<Layout>);
+    static_assert(HasIncarnationNamespaceFilesPrefix<Layout>);
+
+    SUCCEED();
+}
+
+/// Directive §1's remaining requirements on the type, fenced rather than fixed: the type declares no
+/// conversion operator and `RootNamespace`'s own constructor is `explicit`, so nothing interconverts in
+/// either direction today and only an explicit `.ns` crosses. Without these assertions a later
+/// convenience conversion would land unnoticed, and dropping the incarnation would become
+/// representable again -- which is the property the whole re-keying rests on.
+TEST(CasNamespaceLifeId, NamespaceLifeIdAndRootNamespaceDoNotInterconvert)
+{
+    static_assert(!std::convertible_to<NamespaceLifeId, RootNamespace>);
+    static_assert(!std::constructible_from<RootNamespace, NamespaceLifeId>);
+    static_assert(!std::is_default_constructible_v<NamespaceLifeId>);
+
+    SUCCEED();
+}
+
+/// The out-of-scope fences, and they are POSITIVE on purpose: Constraint 12 keeps loose mountpoint
+/// objects and part manifests on the identity they have today, so this task must NOT have qualified
+/// them. If a negative here fails, someone added a life-scoped overload to a family the amendment
+/// explicitly excluded; if a positive fails, someone removed the un-scoped one those callers use.
+TEST(CasNamespaceLifeId, MountpointObjectsAndManifestsStayUnqualified)
+{
+    static_assert(HasUnscopedMountpointObjectKey<Layout>);
+    static_assert(!HasLifeScopedMountpointObjectKey<Layout>);
+
+    static_assert(HasNamespaceOnlyManifestNamespacePrefix<Layout>);
+    static_assert(!HasLifeScopedManifestNamespacePrefix<Layout>);
 
     SUCCEED();
 }

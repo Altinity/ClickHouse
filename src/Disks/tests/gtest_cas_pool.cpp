@@ -532,14 +532,14 @@ TEST(CasPool, VerbatimFilesLifecycle)
     auto b = std::make_shared<InMemoryBackend>();
     auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     RootNamespace ns{"srv1/tbl"};
-    s->putNamespaceFile(ns, "format_version.txt", "1\n");
-    s->putNamespaceFile(ns, "uuid.txt", "abc");
-    EXPECT_EQ(s->getNamespaceFile(ns, "format_version.txt"), String("1\n"));
-    EXPECT_FALSE(s->getNamespaceFile(ns, "absent").has_value());
-    auto names = s->listNamespaceFiles(ns);
+    s->putNamespaceFile(NamespaceLifeId::stageATransition(ns), "format_version.txt", "1\n");
+    s->putNamespaceFile(NamespaceLifeId::stageATransition(ns), "uuid.txt", "abc");
+    EXPECT_EQ(s->getNamespaceFile(NamespaceLifeId::stageATransition(ns), "format_version.txt"), String("1\n"));
+    EXPECT_FALSE(s->getNamespaceFile(NamespaceLifeId::stageATransition(ns), "absent").has_value());
+    auto names = s->listNamespaceFiles(NamespaceLifeId::stageATransition(ns));
     EXPECT_EQ(names, (std::vector<String>{"format_version.txt", "uuid.txt"}));
-    s->putNamespaceFile(ns, "uuid.txt", "def");                     /// overwrite allowed (head + putOverwrite)
-    EXPECT_EQ(s->getNamespaceFile(ns, "uuid.txt"), String("def"));
+    s->putNamespaceFile(NamespaceLifeId::stageATransition(ns), "uuid.txt", "def");                     /// overwrite allowed (head + putOverwrite)
+    EXPECT_EQ(s->getNamespaceFile(NamespaceLifeId::stageATransition(ns), "uuid.txt"), String("def"));
 }
 
 TEST(CasPool, ListNamespaceFilesEmpty)
@@ -547,7 +547,7 @@ TEST(CasPool, ListNamespaceFilesEmpty)
     auto b = std::make_shared<InMemoryBackend>();
     auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     RootNamespace ns{"srv1/tbl"};
-    EXPECT_TRUE(s->listNamespaceFiles(ns).empty());
+    EXPECT_TRUE(s->listNamespaceFiles(NamespaceLifeId::stageATransition(ns)).empty());
 }
 
 /// ---------- read side (spec §6): resolveRef / readManifest / findEntry / entryRange / listRefs ----------
@@ -1056,8 +1056,8 @@ TEST(CasPool, DropNamespaceRemovesEveryOwnerButLeavesFilesForGc)
     for (const String & name : ref_names)
         ASSERT_TRUE(s->resolveRef(ns, name).has_value());
 
-    s->putNamespaceFile(ns, "format_version.txt", "1\n");
-    s->putNamespaceFile(ns, "uuid.txt", "abc");
+    s->putNamespaceFile(NamespaceLifeId::stageATransition(ns), "format_version.txt", "1\n");
+    s->putNamespaceFile(NamespaceLifeId::stageATransition(ns), "uuid.txt", "abc");
 
     s->dropNamespace(ns);
 
@@ -1067,8 +1067,8 @@ TEST(CasPool, DropNamespaceRemovesEveryOwnerButLeavesFilesForGc)
 
     /// Task 11: the writer performs NO physical deletion; verbatim files survive until Task 12's
     /// namespace-cleanup item reclaims the whole @cas@ namespace.
-    EXPECT_TRUE(s->getNamespaceFile(ns, "format_version.txt").has_value());
-    EXPECT_TRUE(s->getNamespaceFile(ns, "uuid.txt").has_value());
+    EXPECT_TRUE(s->getNamespaceFile(NamespaceLifeId::stageATransition(ns), "format_version.txt").has_value());
+    EXPECT_TRUE(s->getNamespaceFile(NamespaceLifeId::stageATransition(ns), "uuid.txt").has_value());
 
     /// Repeated drop is idempotent: no throw, no second transaction (nothing left to observe changing).
     EXPECT_NO_THROW(s->dropNamespace(ns));
@@ -1113,8 +1113,8 @@ TEST(CasPool, ListMirroredChildren)
     auto b = std::make_shared<InMemoryBackend>();
     auto store = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     /// Seed two shadow archives by writing a verbatim file into each (creates the prefix in S3).
-    store->putNamespaceFile(RootNamespace{"shadow/bk1/store/3f2/3f2a-uuid@cas@"}, "x", "1");
-    store->putNamespaceFile(RootNamespace{"shadow/bk2/store/3f2/3f2a-uuid@cas@"}, "x", "1");
+    store->putNamespaceFile(NamespaceLifeId::stageATransition(RootNamespace{"shadow/bk1/store/3f2/3f2a-uuid@cas@"}), "x", "1");
+    store->putNamespaceFile(NamespaceLifeId::stageATransition(RootNamespace{"shadow/bk2/store/3f2/3f2a-uuid@cas@"}), "x", "1");
     auto children = store->listMirroredChildren("shadow/");
     std::sort(children.begin(), children.end());
     ASSERT_EQ(children.size(), 2u);

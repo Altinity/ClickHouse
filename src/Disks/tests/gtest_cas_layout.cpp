@@ -65,9 +65,12 @@ TEST(CasLayout, RootNamespaceKeys)
     /// incarnation is one further segment (INV-3). Asserted against the render, never the constant.
     EXPECT_EQ(l.refsNamespacePrefix(ns_id),
         "p/cas/refs/srv1/3f2e-uuid/" + renderIncarnation(ns_id.incarnation) + "/");
-    /// Browse helpers (verbatim `_files` tree) stay under roots/.
-    EXPECT_EQ(l.namespaceFileKey(ns, "format_version.txt"), "p/roots/srv1/3f2e-uuid/_files/format_version.txt");
-    EXPECT_EQ(l.namespaceFilesPrefix(ns), "p/roots/srv1/3f2e-uuid/_files/");
+    /// Browse helpers (verbatim `_files` tree) stay under roots/, one segment deeper: the incarnation
+    /// now sits between the namespace and the reserved `_files` segment (directive §2).
+    EXPECT_EQ(l.namespaceFileKey(ns_id, "format_version.txt"),
+        "p/roots/srv1/3f2e-uuid/" + renderIncarnation(ns_id.incarnation) + "/_files/format_version.txt");
+    EXPECT_EQ(l.namespaceFilesPrefix(ns_id),
+        "p/roots/srv1/3f2e-uuid/" + renderIncarnation(ns_id.incarnation) + "/_files/");
 }
 
 TEST(CasLayout, RelocatedRefAndManifestKeys)
@@ -103,13 +106,14 @@ TEST(CasLayout, RootNamespaceValidation)
     EXPECT_THROW(l.refsNamespacePrefix(NamespaceLifeId::stageATransition(RootNamespace{"trail/"})), DB::Exception);
     /// File names may be NESTED relative paths (M-W T2: deduplication_logs/...); only unclean
     /// shapes are rejected (empty, leading/trailing '/', empty segments, '..' escapes).
-    EXPECT_NO_THROW(l.namespaceFileKey(RootNamespace{"ok"}, "a/b"));
-    EXPECT_THROW(l.namespaceFileKey(RootNamespace{"ok"}, ""), DB::Exception);
-    EXPECT_THROW(l.namespaceFileKey(RootNamespace{"ok"}, "/lead"), DB::Exception);
-    EXPECT_THROW(l.namespaceFileKey(RootNamespace{"ok"}, "trail/"), DB::Exception);
-    EXPECT_THROW(l.namespaceFileKey(RootNamespace{"ok"}, "a//b"), DB::Exception);
-    EXPECT_THROW(l.namespaceFileKey(RootNamespace{"ok"}, "../up"), DB::Exception);
-    EXPECT_THROW(l.namespaceFileKey(RootNamespace{"ok"}, "a/../b"), DB::Exception);
+    const NamespaceLifeId ok_id = NamespaceLifeId::stageATransition(RootNamespace{"ok"});
+    EXPECT_NO_THROW(l.namespaceFileKey(ok_id, "a/b"));
+    EXPECT_THROW(l.namespaceFileKey(ok_id, ""), DB::Exception);
+    EXPECT_THROW(l.namespaceFileKey(ok_id, "/lead"), DB::Exception);
+    EXPECT_THROW(l.namespaceFileKey(ok_id, "trail/"), DB::Exception);
+    EXPECT_THROW(l.namespaceFileKey(ok_id, "a//b"), DB::Exception);
+    EXPECT_THROW(l.namespaceFileKey(ok_id, "../up"), DB::Exception);
+    EXPECT_THROW(l.namespaceFileKey(ok_id, "a/../b"), DB::Exception);
 
     /// A middle empty segment ("a//b") is rejected (doubled '/').
     EXPECT_THROW(l.refsNamespacePrefix(NamespaceLifeId::stageATransition(RootNamespace{"a//b"})), DB::Exception);

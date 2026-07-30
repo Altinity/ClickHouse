@@ -367,6 +367,14 @@ DB::Cas::ManifestEntry wiringInlineEntry(const String & path, const String & byt
     return e;
 }
 
+/// The one table identity these tests use, as a namespace LIFE: namespace files are life-keyed
+/// (directive §2), and `stageATransition` is the transitional mint Task 6 deletes.
+DB::Cas::NamespaceLifeId wiringLife(DB::ContentAddressedMetadataStorage & storage)
+{
+    return DB::Cas::NamespaceLifeId::stageATransition(
+        storage.liveNamespace("a11a11a1-1111-4111-8111-111111111111"));
+}
+
 std::shared_ptr<DB::ContentAddressedMetadataStorage> openWiringStorage()
 {
     auto settings = DB::Cas::tests::makeSettingsForTest(
@@ -690,9 +698,9 @@ TEST(CasWiringRead, VerbatimNamespaceFiles)
         << storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111").string();
 
     publishWiredPart(*storage, storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111"), "all_1_1_0");
-    storage->store()->putNamespaceFile(storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111"), "format_version.txt", "1\n");
+    storage->store()->putNamespaceFile(wiringLife(*storage), "format_version.txt", "1\n");
     storage->store()->putNamespaceFile(
-        storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111"), "deduplication_logs/deduplication_log_1.txt", "log-bytes");
+        wiringLife(*storage), "deduplication_logs/deduplication_log_1.txt", "log-bytes");
     /// Loose disk-root files are plain mountpoint objects (design §5.2), not namespace files.
     storage->store()->putMountpointObject(storage->serverRootId() + "/" + "clickhouse_access_check_xyz", "ok");
 
@@ -977,7 +985,7 @@ TEST(CasWiringOps, RemovalsDropRefsAndNamespaces)
     writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin", "gone-soon");
     writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_2_2_0/data.bin", "stays");
     tx->commit(DB::NoCommitOptions{});
-    storage->store()->putNamespaceFile(storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111"), "format_version.txt", "1\n");
+    storage->store()->putNamespaceFile(wiringLife(*storage), "format_version.txt", "1\n");
 
     /// The fast-removal path (all-tree Task 8, B123 evolution): per-file unlinks stage removal marks
     /// (`content_removed`) but nothing durable changes until commit; removeDirectory(<part>) drops the
@@ -1061,7 +1069,7 @@ TEST(CasWiringOps, TableRenameMovesRefsFilesAndDetached)
     auto tx3 = storage->createTransaction();
     writeThroughTransaction(*tx3, "a11/a11a11a1-1111-4111-8111-111111111111/all_2_2_0/data.bin", "live2");
     tx3->commit(DB::NoCommitOptions{});
-    storage->store()->putNamespaceFile(storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111"), "format_version.txt", "1\n");
+    storage->store()->putNamespaceFile(wiringLife(*storage), "format_version.txt", "1\n");
 
     auto tx4 = storage->createTransaction();
     tx4->moveDirectory("a11/a11a11a1-1111-4111-8111-111111111111", "a22/a22a22a2-2222-4222-8222-222222222222");
@@ -1082,7 +1090,7 @@ TEST(CasWiringOps, TableRenameIsIdempotentOnRedrive)
     auto tx = storage->createTransaction();
     writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin", "live");
     tx->commit(DB::NoCommitOptions{});
-    storage->store()->putNamespaceFile(storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111"), "format_version.txt", "1\n");
+    storage->store()->putNamespaceFile(wiringLife(*storage), "format_version.txt", "1\n");
 
     auto tx2 = storage->createTransaction();
     tx2->moveDirectory("a11/a11a11a1-1111-4111-8111-111111111111", "a22/a22a22a2-2222-4222-8222-222222222222");

@@ -549,7 +549,8 @@ TEST(CasGcFold, RoundSideAnomalySuppressesNamespaceAndRefLogCleanupToo)
         remove_op.kind = RefOpKind::RemoveNamespace;
         appendRefLogSeed(*backend, layout, ns_removed, {remove_op});
     }
-    const String debris_key = layout.namespaceFilesPrefix(ns_removed) + "leftover_verbatim_file";
+    const String debris_key
+        = layout.namespaceFilesPrefix(NamespaceLifeId::stageATransition(ns_removed)) + "leftover_verbatim_file";
     backend->putIfAbsent(debris_key, "debris");
 
     /// Namespace 3: a live table with a log covered by a durable snapshot -- exactly what a clamp-free

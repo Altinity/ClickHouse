@@ -540,13 +540,15 @@ public:
     bool trySnapshotPublishOnce(const RootNamespace & ns);
 
     /// ---- verbatim namespace files (format_version.txt, ...) — plain keys, never content-addressed ----
-    void putNamespaceFile(const RootNamespace & ns, const String & name, const String & bytes);
-    std::optional<String> getNamespaceFile(const RootNamespace & ns, const String & name);
-    std::vector<String> listNamespaceFiles(const RootNamespace & ns);
+    /// Every one of them names ONE LIFE of the namespace (directive §2): the caller passes the life it
+    /// already holds, and none of these issues a catalog request to obtain one.
+    void putNamespaceFile(const NamespaceLifeId & life, const String & name, const String & bytes);
+    std::optional<String> getNamespaceFile(const NamespaceLifeId & life, const String & name);
+    std::vector<String> listNamespaceFiles(const NamespaceLifeId & life);
     /// Exact-token delete of one verbatim file (no-op when absent). Verbatim files are never
     /// content-addressed, so a mid-life delete (a pruned mutation entry, a stale tmp) must reclaim
     /// the object NOW - the reachability GC never scans them.
-    void removeNamespaceFile(const RootNamespace & ns, const String & name);
+    void removeNamespaceFile(const NamespaceLifeId & life, const String & name);
 
     /// ---- plain mountpoint objects ----
     /// A loose disk file (the startup write probe; anything written outside a `@cas@` archive) is a

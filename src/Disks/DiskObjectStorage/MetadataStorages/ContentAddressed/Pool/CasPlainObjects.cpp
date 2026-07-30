@@ -88,19 +88,19 @@ void CasPlainObjects::casRemoveObject(const String & full_key)
     throw Exception(ErrorCodes::ABORTED, "object CAS contention on '{}' (runaway live-lock brake)", full_key);
 }
 
-void CasPlainObjects::putNamespaceFile(const RootNamespace & ns, const String & name, const String & bytes)
+void CasPlainObjects::putNamespaceFile(const NamespaceLifeId & life, const String & name, const String & bytes)
 {
-    casPutObject(layout.namespaceFileKey(ns, name), bytes);
+    casPutObject(layout.namespaceFileKey(life, name), bytes);
 }
 
-std::optional<String> CasPlainObjects::getNamespaceFile(const RootNamespace & ns, const String & name)
+std::optional<String> CasPlainObjects::getNamespaceFile(const NamespaceLifeId & life, const String & name)
 {
-    return casGetObject(layout.namespaceFileKey(ns, name));
+    return casGetObject(layout.namespaceFileKey(life, name));
 }
 
-std::vector<String> CasPlainObjects::listNamespaceFiles(const RootNamespace & ns)
+std::vector<String> CasPlainObjects::listNamespaceFiles(const NamespaceLifeId & life)
 {
-    const String prefix = layout.namespaceFilesPrefix(ns);
+    const String prefix = layout.namespaceFilesPrefix(life);
     std::vector<String> names;
     String cursor;
     while (true)
@@ -122,9 +122,9 @@ std::vector<String> CasPlainObjects::listNamespaceFiles(const RootNamespace & ns
     return names;
 }
 
-void CasPlainObjects::removeNamespaceFile(const RootNamespace & ns, const String & name)
+void CasPlainObjects::removeNamespaceFile(const NamespaceLifeId & life, const String & name)
 {
-    casRemoveObject(layout.namespaceFileKey(ns, name));
+    casRemoveObject(layout.namespaceFileKey(life, name));
 }
 
 void CasPlainObjects::putMountpointObject(const String & key, const String & bytes)

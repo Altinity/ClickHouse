@@ -36,9 +36,12 @@ const String kFile = "format_version.txt";
 const String kSegment1 = "deduplication_logs/deduplication_log_1.txt";
 const String kSegment2 = "deduplication_logs/deduplication_log_2.txt";
 
-RootNamespace testNamespace()
+/// The identity every case below operates under. `stageATransition` is the transitional mint Task 6
+/// deletes; what matters to this file is only that ONE life is used throughout, so a count is not
+/// split across two prefixes.
+NamespaceLifeId testLife()
 {
-    return RootNamespace{kNsString};
+    return NamespaceLifeId::stageATransition(RootNamespace{kNsString});
 }
 
 /// A pool over `CountingBackend`, with the counts reset AFTER open: `Pool::open` runs its own
@@ -60,10 +63,10 @@ TEST(CasNamespaceFileRequestProfile, CreateThenRewrite)
 {
     std::shared_ptr<CountingBackend> backend;
     PoolPtr store = openCountedPool(backend);
-    const RootNamespace ns = testNamespace();
-    const String key = store->layout().namespaceFileKey(ns, kFile);
+    const NamespaceLifeId life = testLife();
+    const String key = store->layout().namespaceFileKey(life, kFile);
 
-    store->putNamespaceFile(ns, kFile, "1\n");
+    store->putNamespaceFile(life, kFile, "1\n");
 
     EXPECT_EQ(backend->headCount(key), 1u);
     EXPECT_EQ(backend->putCount(key), 1u);            /// putIfAbsent -- the key was absent
@@ -75,7 +78,7 @@ TEST(CasNamespaceFileRequestProfile, CreateThenRewrite)
     EXPECT_EQ(backend->touchedKeys(), std::vector<String>{key});
 
     backend->resetCounts();
-    store->putNamespaceFile(ns, kFile, "2\n");
+    store->putNamespaceFile(life, kFile, "2\n");
 
     EXPECT_EQ(backend->headCount(key), 1u);
     EXPECT_EQ(backend->putOverwriteCount(key), 1u);   /// token-conditioned replacement -- it existed
@@ -92,13 +95,13 @@ TEST(CasNamespaceFileRequestProfile, Read)
 {
     std::shared_ptr<CountingBackend> backend;
     PoolPtr store = openCountedPool(backend);
-    const RootNamespace ns = testNamespace();
-    const String key = store->layout().namespaceFileKey(ns, kFile);
+    const NamespaceLifeId life = testLife();
+    const String key = store->layout().namespaceFileKey(life, kFile);
 
-    store->putNamespaceFile(ns, kFile, "1\n");
+    store->putNamespaceFile(life, kFile, "1\n");
     backend->resetCounts();
 
-    EXPECT_EQ(store->getNamespaceFile(ns, kFile), String("1\n"));
+    EXPECT_EQ(store->getNamespaceFile(life, kFile), String("1\n"));
 
     EXPECT_EQ(backend->getCount(key), 1u);
     EXPECT_EQ(backend->wholeGetCount(key), 1u);
@@ -115,15 +118,15 @@ TEST(CasNamespaceFileRequestProfile, ReadModifyRewriteAppend)
 {
     std::shared_ptr<CountingBackend> backend;
     PoolPtr store = openCountedPool(backend);
-    const RootNamespace ns = testNamespace();
-    const String key = store->layout().namespaceFileKey(ns, kSegment1);
+    const NamespaceLifeId life = testLife();
+    const String key = store->layout().namespaceFileKey(life, kSegment1);
 
-    store->putNamespaceFile(ns, kSegment1, "base");
+    store->putNamespaceFile(life, kSegment1, "base");
     backend->resetCounts();
 
-    const std::optional<String> carried = store->getNamespaceFile(ns, kSegment1);
+    const std::optional<String> carried = store->getNamespaceFile(life, kSegment1);
     ASSERT_TRUE(carried.has_value());
-    store->putNamespaceFile(ns, kSegment1, *carried + "-delta");
+    store->putNamespaceFile(life, kSegment1, *carried + "-delta");
 
     EXPECT_EQ(backend->getCount(key), 1u);
     EXPECT_EQ(backend->headCount(key), 1u);
@@ -132,7 +135,7 @@ TEST(CasNamespaceFileRequestProfile, ReadModifyRewriteAppend)
     EXPECT_EQ(backend->deleteCount(key), 0u);
     EXPECT_EQ(backend->listTotal(), 0u);
     EXPECT_EQ(backend->touchedKeys(), std::vector<String>{key});
-    EXPECT_EQ(store->getNamespaceFile(ns, kSegment1), String("base-delta"));
+    EXPECT_EQ(store->getNamespaceFile(life, kSegment1), String("base-delta"));
 }
 
 /// REMOVE is exact-token deletion, so it is one HEAD for the token plus one delete against it.
@@ -140,13 +143,13 @@ TEST(CasNamespaceFileRequestProfile, Remove)
 {
     std::shared_ptr<CountingBackend> backend;
     PoolPtr store = openCountedPool(backend);
-    const RootNamespace ns = testNamespace();
-    const String key = store->layout().namespaceFileKey(ns, kFile);
+    const NamespaceLifeId life = testLife();
+    const String key = store->layout().namespaceFileKey(life, kFile);
 
-    store->putNamespaceFile(ns, kFile, "1\n");
+    store->putNamespaceFile(life, kFile, "1\n");
     backend->resetCounts();
 
-    store->removeNamespaceFile(ns, kFile);
+    store->removeNamespaceFile(life, kFile);
 
     EXPECT_EQ(backend->headCount(key), 1u);
     EXPECT_EQ(backend->deleteCount(key), 1u);
@@ -155,7 +158,7 @@ TEST(CasNamespaceFileRequestProfile, Remove)
     EXPECT_EQ(backend->putOverwriteCount(key), 0u);
     EXPECT_EQ(backend->listTotal(), 0u);
     EXPECT_EQ(backend->touchedKeys(), std::vector<String>{key});
-    EXPECT_FALSE(store->getNamespaceFile(ns, kFile).has_value());
+    EXPECT_FALSE(store->getNamespaceFile(life, kFile).has_value());
 }
 
 /// ROTATION is the sequence the constraint names: the retiring segment is enumerated, the new segment
@@ -165,18 +168,18 @@ TEST(CasNamespaceFileRequestProfile, DedupLogRotation)
 {
     std::shared_ptr<CountingBackend> backend;
     PoolPtr store = openCountedPool(backend);
-    const RootNamespace ns = testNamespace();
-    const String prefix = store->layout().namespaceFilesPrefix(ns);
-    const String old_key = store->layout().namespaceFileKey(ns, kSegment1);
-    const String new_key = store->layout().namespaceFileKey(ns, kSegment2);
+    const NamespaceLifeId life = testLife();
+    const String prefix = store->layout().namespaceFilesPrefix(life);
+    const String old_key = store->layout().namespaceFileKey(life, kSegment1);
+    const String new_key = store->layout().namespaceFileKey(life, kSegment2);
 
-    store->putNamespaceFile(ns, kSegment1, "segment-1-records");
+    store->putNamespaceFile(life, kSegment1, "segment-1-records");
     backend->resetCounts();
 
-    const std::vector<String> before = store->listNamespaceFiles(ns);
+    const std::vector<String> before = store->listNamespaceFiles(life);
     ASSERT_EQ(before, std::vector<String>{kSegment1});
-    store->putNamespaceFile(ns, kSegment2, "segment-2-records");
-    store->removeNamespaceFile(ns, kSegment1);
+    store->putNamespaceFile(life, kSegment2, "segment-2-records");
+    store->removeNamespaceFile(life, kSegment1);
 
     EXPECT_EQ(backend->listCount(prefix), 1u);
     EXPECT_EQ(backend->listTotal(), 1u);
@@ -190,5 +193,5 @@ TEST(CasNamespaceFileRequestProfile, DedupLogRotation)
     /// Sorted, and the files prefix is a proper prefix of both segment keys, so it comes first.
     EXPECT_EQ(backend->touchedKeys(), (std::vector<String>{prefix, old_key, new_key}));
 
-    EXPECT_EQ(store->listNamespaceFiles(ns), std::vector<String>{kSegment2});
+    EXPECT_EQ(store->listNamespaceFiles(life), std::vector<String>{kSegment2});
 }

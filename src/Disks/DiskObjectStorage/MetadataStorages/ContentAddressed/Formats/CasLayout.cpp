@@ -172,6 +172,34 @@ std::optional<NamespaceLifeId> Layout::parseRefCkptKey(std::string_view key) con
     return namespaceLifeOf(key, before_leaf);
 }
 
+std::optional<ParsedNamespaceFileKey> Layout::parseNamespaceFileKey(std::string_view key) const
+{
+    const String base = rootsPrefix();
+    if (!key.starts_with(base))
+        return std::nullopt;
+    std::string_view rest = key;
+    rest.remove_prefix(base.size());
+
+    /// The FIRST `/_files/` separates `<ns>/<inc>` from the relative name. `checkNamespace` rejects
+    /// `_files` as a namespace segment, so no namespace this build wrote can contribute an earlier
+    /// occurrence; a relative name MAY contain one, and taking the first occurrence leaves it in the
+    /// name where it belongs.
+    static constexpr std::string_view kFilesSegment = "/_files/";
+    const size_t files_pos = rest.find(kFilesSegment);
+    if (files_pos == std::string_view::npos)
+        return std::nullopt;   /// no reserved segment: a loose mountpoint object, not one of our files
+
+    const std::string_view ns_and_incarnation = rest.substr(0, files_pos);
+    const std::string_view relative_name = rest.substr(files_pos + kFilesSegment.size());
+    if (relative_name.empty())
+        return std::nullopt;   /// the files prefix itself names no file
+
+    /// Only now, with the key positively identified as one of OUR namespace files, does a bad
+    /// incarnation segment become corruption rather than "not ours" -- see the refusal contract on the
+    /// declaration.
+    return ParsedNamespaceFileKey{namespaceLifeOf(key, ns_and_incarnation), String(relative_name)};
+}
+
 NamespaceLifeId Layout::namespaceLifeOf(std::string_view key, std::string_view ns_and_incarnation) const
 {
     const size_t inc_sep = ns_and_incarnation.rfind('/');
@@ -185,12 +213,12 @@ NamespaceLifeId Layout::namespaceLifeOf(std::string_view key, std::string_view n
     const auto incarnation = parseIncarnation(inc_seg);
     if (!incarnation)
         throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
-            "CasLayout: ref object '{}' names no life: '{}' is not 32 lower-case hex digits of a nonzero "
+            "CasLayout: object '{}' names no life: '{}' is not 32 lower-case hex digits of a nonzero "
             "incarnation. The un-incarnated key shape is corruption, not a compatibility case",
             key, inc_seg);
     if (ns_part.empty())
         throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
-            "CasLayout: ref object '{}' carries an incarnation but no namespace before it", key);
+            "CasLayout: object '{}' carries an incarnation but no namespace before it", key);
 
     return NamespaceLifeId{RootNamespace{String(ns_part)}, *incarnation};
 }

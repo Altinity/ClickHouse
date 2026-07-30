@@ -42,23 +42,30 @@ public:
     {
     }
 
-    /// Stores the raw bytes under the namespace's `_files/` prefix. Existing files are replaced
-    /// conditionally using the incarnation observed by `Backend::head`; a storage failure or an
+    /// Stores the raw bytes under ONE LIFE's `_files/` prefix. Existing files are replaced
+    /// conditionally using the object incarnation observed by `Backend::head`; a storage failure or an
     /// exhausted conflict-retry bound is propagated as an exception.
-    void putNamespaceFile(const RootNamespace & ns, const String & name, const String & bytes);
+    ///
+    /// `life` is supplied by the caller and never re-derived here, so this surface issues no catalog
+    /// request of its own (directive §namespace-file-requirements: hot reads and writes use an
+    /// already-held life handle). A stale writer therefore targets its own old incarnation's key and
+    /// cannot write into a newer life's prefix.
+    void putNamespaceFile(const NamespaceLifeId & life, const String & name, const String & bytes);
 
-    /// Reads a namespace file without interpreting its body. Returns `nullopt` when the object is
-    /// absent and propagates backend read failures.
-    std::optional<String> getNamespaceFile(const RootNamespace & ns, const String & name);
+    /// Reads a namespace file of ONE LIFE without interpreting its body. Returns `nullopt` when the
+    /// object is absent and propagates backend read failures. A stale reader may see stale bytes or
+    /// `NotFound`, never a newer incarnation's data: its key names the life it was given.
+    std::optional<String> getNamespaceFile(const NamespaceLifeId & life, const String & name);
 
-    /// Enumerates the flat file names directly below the namespace's `_files/` prefix. Fetches all
-    /// paginated backend results, strips the prefix, and returns names in sorted order independent
-    /// of backend listing order.
-    std::vector<String> listNamespaceFiles(const RootNamespace & ns);
+    /// Enumerates the file names directly below ONE LIFE's `_files/` prefix. Fetches all paginated
+    /// backend results, strips the prefix, and returns names in sorted order independent of backend
+    /// listing order.
+    std::vector<String> listNamespaceFiles(const NamespaceLifeId & life);
 
-    /// Removes the current namespace-file incarnation, if any. A concurrent replacement is never
-    /// removed accidentally: the exact-delete helper re-reads and retries with the new token.
-    void removeNamespaceFile(const RootNamespace & ns, const String & name);
+    /// Removes the current OBJECT incarnation of one of a life's files, if any (the object token, not
+    /// the namespace incarnation, which `life` fixes). A concurrent replacement is never removed
+    /// accidentally: the exact-delete helper re-reads and retries with the new token.
+    void removeNamespaceFile(const NamespaceLifeId & life, const String & name);
 
     /// Stores raw bytes for a loose mountpoint file at the path-derived object key. The key is
     /// validated and constructed by `Layout`; this method applies the same conditional overwrite

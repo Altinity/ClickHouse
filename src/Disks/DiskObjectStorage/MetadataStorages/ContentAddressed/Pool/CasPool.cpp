@@ -937,19 +937,19 @@ void Pool::forgetDisk(const std::function<void()> & stop_and_join_gc, const Stri
 
 /// The plain-object surface (namespace files + mountpoint objects) is implemented by the stateless
 /// `plain_objects` component; these are thin delegates preserving the API.
-void Pool::putNamespaceFile(const RootNamespace & ns, const String & name, const String & bytes)
+void Pool::putNamespaceFile(const NamespaceLifeId & life, const String & name, const String & bytes)
 {
-    plain_objects.putNamespaceFile(ns, name, bytes);
+    plain_objects.putNamespaceFile(life, name, bytes);
 }
 
-std::optional<String> Pool::getNamespaceFile(const RootNamespace & ns, const String & name)
+std::optional<String> Pool::getNamespaceFile(const NamespaceLifeId & life, const String & name)
 {
-    return plain_objects.getNamespaceFile(ns, name);
+    return plain_objects.getNamespaceFile(life, name);
 }
 
-std::vector<String> Pool::listNamespaceFiles(const RootNamespace & ns)
+std::vector<String> Pool::listNamespaceFiles(const NamespaceLifeId & life)
 {
-    return plain_objects.listNamespaceFiles(ns);
+    return plain_objects.listNamespaceFiles(life);
 }
 
 uint64_t Pool::minActive()
@@ -1367,9 +1367,9 @@ uint64_t Pool::currentGcRound() const
     return decodeGcState(state_bytes->bytes).round;
 }
 
-void Pool::removeNamespaceFile(const RootNamespace & ns, const String & name)
+void Pool::removeNamespaceFile(const NamespaceLifeId & life, const String & name)
 {
-    plain_objects.removeNamespaceFile(ns, name);
+    plain_objects.removeNamespaceFile(life, name);
 }
 
 void Pool::putMountpointObject(const String & key, const String & bytes)

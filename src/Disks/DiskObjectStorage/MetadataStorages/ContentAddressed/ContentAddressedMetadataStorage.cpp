@@ -1330,7 +1330,8 @@ bool ContentAddressedMetadataStorage::existsFile(const std::string & path) const
         if (auto tf = Cas::parseTableFilePath(path))
         {
             const auto ns = liveNamespace(tf->table_uuid);
-            return namespaceFilesReadable(ns) && store()->getNamespaceFile(ns, tf->tail).has_value();
+            return namespaceFilesReadable(ns)
+                && store()->getNamespaceFile(Cas::NamespaceLifeId::stageATransition(ns), tf->tail).has_value();
         }
         /// A loose mountpoint object is a plain object at roots/<server_root_id>/<path>.
         /// Use a HEAD-based existence check (directory-safe), NOT a body read: the traversal in
@@ -1506,7 +1507,7 @@ bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) 
             if (!namespaceFilesReadable(ns))
                 return false;
             const std::string prefix = dr.tf->tail + "/";
-            for (const auto & name : store()->listNamespaceFiles(ns))
+            for (const auto & name : store()->listNamespaceFiles(Cas::NamespaceLifeId::stageATransition(ns)))
                 if (name.starts_with(prefix))
                     return true;
             return false;
@@ -1653,7 +1654,7 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
             /// A dropped table lists empty for its namespace files too (its refs are already gone
             /// via the ref state); only surface verbatim file names while the table is not removed.
             if (namespaceFilesReadable(ns))
-                for (const auto & name : store()->listNamespaceFiles(ns))
+                for (const auto & name : store()->listNamespaceFiles(Cas::NamespaceLifeId::stageATransition(ns)))
                     addFirstComponent(result, name);
             /// EMPTY-PROOF RULE (Task 9, spec §1 [B3]): an empty table root is exactly what a
             /// silently-erased backing looks like -- authorize the empty answer only against an
@@ -1701,7 +1702,7 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
             const auto ns = liveNamespace(dr.tf->table_uuid);
             std::unordered_set<std::string> result;
             if (namespaceFilesReadable(ns))
-                for (const auto & name : store()->listNamespaceFiles(ns))
+                for (const auto & name : store()->listNamespaceFiles(Cas::NamespaceLifeId::stageATransition(ns)))
                     if (name.starts_with(dr.tf->tail + "/"))
                         addFirstComponent(result, name.substr(dr.tf->tail.size() + 1));
             return toVector(std::move(result));
@@ -1851,7 +1852,9 @@ std::optional<String> ContentAddressedMetadataStorage::tryGetInManifestBytes(con
         if (auto tf = Cas::parseTableFilePath(path))
         {
             const auto ns = liveNamespace(tf->table_uuid);
-            return namespaceFilesReadable(ns) ? snap.pool->getNamespaceFile(ns, tf->tail) : std::nullopt;
+            return namespaceFilesReadable(ns)
+                ? snap.pool->getNamespaceFile(Cas::NamespaceLifeId::stageATransition(ns), tf->tail)
+                : std::nullopt;
         }
         return std::nullopt;   /// loose files are plain objects, not in-manifest bytes
     }
