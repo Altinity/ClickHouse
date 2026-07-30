@@ -1324,6 +1324,29 @@ def test_export_partition_with_renamed_destination_column(cluster):
     )
 
 
+def test_export_partition_same_partition_key_different_column_order(cluster):
+    node = cluster.instances["replica1"]
+
+    uid = unique_suffix()
+    mt_table = f"mt_reordered_{uid}"
+    iceberg_table = f"iceberg_reordered_{uid}"
+
+    make_rmt(node, mt_table, "a Int32, b Int32", "a", replica_name="replica1")
+    make_iceberg_s3(node, iceberg_table, "b Int32, a Int32", partition_by="a")
+
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 1), (1, 2)")
+
+    node.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '1' TO TABLE {iceberg_table}",
+        settings={"allow_insert_into_iceberg": 1},
+    )
+    wait_for_export_status(node, mt_table, iceberg_table, "1", "COMPLETED")
+
+    result = node.query(f"SELECT a, b FROM {iceberg_table} ORDER BY a, b").strip()
+    expected = "1\t1\n1\t2"
+    assert result == expected, f"Expected:\n{expected}\nGot:\n{result}"
+
+
 def test_export_partition_with_castable_widening(cluster):
     """A lossless widening of both a data column (id Int32 -> Int64) and the
     partition column (year Int32 -> Int64) round-trips."""

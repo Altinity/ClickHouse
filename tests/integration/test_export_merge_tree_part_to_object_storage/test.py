@@ -312,3 +312,52 @@ def test_pending_patch_parts_skip_before_export(cluster):
     assert "1\n2\n3" in result, "Export should contain original data before patch"
 
     node.query(f"DROP TABLE {mt_table}")
+
+
+def test_export_part_same_partition_key_different_column_order(cluster):
+    skip_if_remote_database_disk_enabled(cluster)
+    node = cluster.instances["node1"]
+
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"reordered_part_mt_table_{postfix}"
+    s3_table = f"reordered_part_s3_table_{postfix}"
+
+    node.query(f"""
+        CREATE TABLE {mt_table} (a Int32, b Int32)
+        ENGINE = MergeTree()
+        PARTITION BY a
+        ORDER BY tuple()
+        SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1
+    """)
+
+    node.query(f"""
+        CREATE TABLE {s3_table} (b Int32, a Int32)
+        ENGINE = S3(s3_conn, filename='{s3_table}', format=Parquet, partition_strategy='hive')
+        PARTITION BY a
+    """)
+
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 1), (1, 2)")
+
+    part_name = node.query(
+        f"SELECT name FROM system.parts WHERE database = currentDatabase() "
+        f"AND table = '{mt_table}' AND active ORDER BY name LIMIT 1"
+    ).strip()
+
+    node.query(f"ALTER TABLE {mt_table} EXPORT PART '{part_name}' TO TABLE {s3_table}")
+
+    deadline = time.time() + 30
+    while True:
+        node.query("SYSTEM FLUSH LOGS")
+        count = node.query(
+            f"SELECT count() FROM system.part_log WHERE event_type = 'ExportPart' "
+            f"AND database = currentDatabase() AND table = '{mt_table}' AND part_name = '{part_name}'"
+        ).strip()
+        if count != "0":
+            break
+        if time.time() > deadline:
+            raise TimeoutError(f"ExportPart event for part {part_name!r} did not appear within 30s")
+        time.sleep(0.5)
+
+    dest_result = node.query(f"SELECT a, b FROM {s3_table} ORDER BY a, b")
+    expected = "1\t1\n1\t2\n"
+    assert dest_result == expected, f"Expected:\n{expected}\nGot:\n{dest_result}"

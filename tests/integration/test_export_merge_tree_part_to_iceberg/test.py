@@ -13,6 +13,7 @@ Coverage:
     test_export_part_with_year_transform_partition        – toYearNumSinceEpoch() partition expression
     test_export_part_with_bucket_partition                – icebergBucket(N, col) partition expression
     test_export_part_partition_key_mismatch_is_rejected   – mismatched partition spec rejected synchronously
+    test_export_part_same_partition_key_different_column_order       – same partition key, different column order
 """
 
 import logging
@@ -457,6 +458,29 @@ def test_export_part_partition_key_mismatch_is_rejected(cluster):
     assert count == 0, (
         f"Expected 0 rows in Iceberg table after rejected export, got {count}"
     )
+
+    node.query(f"DROP TABLE IF EXISTS {mt} SYNC")
+    node.query(f"DROP TABLE IF EXISTS {iceberg}")
+
+
+def test_export_part_same_partition_key_different_column_order(cluster):
+    node = cluster.instances["node1"]
+    sfx = unique_suffix()
+    mt = f"mt_reordered_{sfx}"
+    iceberg = f"iceberg_reordered_{sfx}"
+
+    make_mt(node, mt, "a Int32, b Int32", "a")
+    make_iceberg_s3(node, iceberg, "b Int32, a Int32", "a")
+
+    node.query(f"INSERT INTO {mt} VALUES (1, 1), (1, 2)")
+
+    part_1 = get_part(node, mt, "1")
+    export_part(node, mt, part_1, iceberg)
+    wait_for_export_part(node, mt, part_1)
+
+    result = node.query(f"SELECT a, b FROM {iceberg} ORDER BY a, b").strip()
+    expected = "1\t1\n1\t2"
+    assert result == expected, f"Expected:\n{expected}\nGot:\n{result}"
 
     node.query(f"DROP TABLE IF EXISTS {mt} SYNC")
     node.query(f"DROP TABLE IF EXISTS {iceberg}")

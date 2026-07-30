@@ -1747,3 +1747,35 @@ def test_export_partition_all_failure_modes(cluster):
         f"ALTER TABLE {mt_table} EXPORT PARTITION ALL TO TABLE {s3_table}"
         f" SETTINGS export_merge_tree_partition_all_on_error = 'skip_conflicts'"
     )
+
+
+def test_export_partition_same_partition_key_different_column_order(cluster):
+    skip_if_remote_database_disk_enabled(cluster)
+    node = cluster.instances["replica1"]
+
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"reordered_mt_table_{postfix}"
+    s3_table = f"reordered_s3_table_{postfix}"
+
+    node.query(f"""
+        CREATE TABLE {mt_table} (a Int32, b Int32)
+        ENGINE = ReplicatedMergeTree('/clickhouse/tables/{mt_table}', 'replica1')
+        PARTITION BY a
+        ORDER BY tuple()
+    """)
+
+    node.query(f"""
+        CREATE TABLE {s3_table} (b Int32, a Int32)
+        ENGINE = S3(s3_conn, filename='{s3_table}', format=Parquet, partition_strategy='hive')
+        PARTITION BY a
+    """)
+
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 1), (1, 2)")
+
+    node.query(f"ALTER TABLE {mt_table} EXPORT PARTITION ID '1' TO TABLE {s3_table}")
+    wait_for_export_status(node, mt_table, s3_table, "1", "COMPLETED")
+
+    dest_result = node.query(f"SELECT * FROM {s3_table} ORDER BY a, b")
+
+    expected = "1\t1\n2\t1\n"
+    assert dest_result == expected, f"Expected:\n{expected}\nGot:\n{dest_result}"
