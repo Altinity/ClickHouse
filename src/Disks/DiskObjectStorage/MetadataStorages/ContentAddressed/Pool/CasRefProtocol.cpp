@@ -903,8 +903,19 @@ RecoveredRefTable recoverRefTableDetailed(Backend & backend, const Layout & layo
                 /// This listing is a HINT (the arithmetic walk below is the authority), and the very next
                 /// line discards any key that does not name THIS namespace. A key that names no LIFE
                 /// cannot name this namespace, so absorbing the parser's refusal here gives it exactly
-                /// the treatment the `id.ns == ns` test already gives it -- while letting the refusal
-                /// escape would take down every caller of this recovery, the rebuild command among them.
+                /// the treatment the `id.ns == ns` test already gives it. Letting the refusal escape
+                /// instead would abort this recovery.
+                ///
+                /// WHY SKIPPING IS SAFE EVEN FOR A CALLER THAT DELETES ON THIS LISTING
+                /// (`CasOrphanManifestSweep`'s `activeManifestKeys` calls this function directly and
+                /// builds its protection set from the result, so a log omitted here would leave that log's
+                /// manifests unprotected):
+                /// the LIST base is this life's own prefix, so every key here begins `<ns>/<inc>/`. The
+                /// segment the parser judges is the one just before the kind directory, so a key of the
+                /// shape `<ns>/<inc>/_log/<id>` has `<inc>` there and parses -- a refusal therefore
+                /// requires at least one EXTRA segment between the life prefix and the kind directory.
+                /// Such a key is not `refLogKey(life, id)` for any id, so it is not a log of this life at
+                /// all, and skipping it removes nothing from the protection set.
                 std::optional<ParsedRefObjectKey> parsed;
                 try
                 {
