@@ -356,3 +356,47 @@ From the Task 4-C review (M3, M5):
 - **M5**: the R11 test's per-family assertions are subsumed by the `deleteTotal() == 0` it also asserts
   ("an aggregate hides a family" only applies to a nonzero aggregate). No action — noted so a future pass
   does not re-file it as a finding.
+
+### D20 — `Gc/CasGc.cpp`'s C1-fix comment justifies keeping `life` with a use that never happens {#d20-life-dead-variable-justification}
+
+From the checkpoint re-review of `81ace46e089` (NEW-4). The comment above the `life` computation in
+`fold()`'s per-namespace walk loop says `life` "is still needed for logging/key-construction parity with
+the catalog-named case further down this loop". It is not, on the un-cataloged path: every use of `life`
+sits inside `while (expected)`, and the un-cataloged branch (`!catalog_names_this_namespace`) `reset()`s
+`expected` immediately, so that branch never enters the loop body and never reads `life` at all.
+
+**The false claim:** `life` is used for logging/key-construction parity on the un-cataloged path.
+
+**The verified truth:** on that path `life` is computed (a cheap, harmless `NamespaceLifeId::stageATransition`
+call) and then never read. Not a behavior bug — no request is issued, nothing is logged with the wrong
+key — purely a comment overclaiming a use that doesn't happen.
+
+**Fix:** narrow the sentence to the catalog-named case only, or state plainly that `life` is unused (but
+still computed, for uniform control flow) on the un-cataloged path.
+
+### D21 — anomaly/test comments describe removal as a mechanism the tree does not have yet {#d21-removal-mechanism-not-yet-present}
+
+From the checkpoint re-review (NEW-5). Two of this round's own comments describe an "ordinary removal" as
+a present, live code path, when `CasRefCatalog` has **no entry-deletion API at all** yet:
+
+- `Gc/CasGc.cpp`'s two recorded-anomaly messages ("dropped rather than folded (expected on an ordinary
+  removal too, not only on damage, until Task 5's removal-evidence check lands)" and "expected until
+  Task 5's removal-evidence check lands") — both mine, from C1/I1's fix.
+- `gtest_cas_part_folder_access.cpp:1141`: "the catalog entry survives until Task 5's last step, so it is
+  still readable here."
+
+**The problem:** today the catalog entry survives UNCONDITIONALLY — there is no removal step at all, not
+merely one that hasn't reached its last step yet — so neither anomaly can currently fire on a removal;
+both only anticipate a mechanism Task 5 has not built.
+
+**Fix:** reword all three as the future obligation they are ("once Task 5's removal exists, an ordinary
+removal will look like this and must not raise the anomaly") rather than describing a present cost or a
+present multi-step process.
+
+### D22 — unclosed parenthesis in a new test comment {#d22-unclosed-parenthesis}
+
+From the checkpoint re-review (NEW-6). `gtest_cas_ref_gc.cpp`'s new comment: *"(also correct, but for the
+WRONG reason -- … that guard."* — an opening `(` with no matching `)`.
+
+**Fix:** close the parenthesis (or remove it if the parenthetical was meant to run to the end of the
+sentence, matching the surrounding punctuation style).
