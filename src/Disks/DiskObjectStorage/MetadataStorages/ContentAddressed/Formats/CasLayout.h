@@ -463,6 +463,13 @@ public:
         return prefix + "/_pool_meta";
     }
 
+    /// The whole-pool namespace catalog (spec INV-3): one object, token-CAS like `gc/state`, read on
+    /// every fold round and every recovery.
+    String refCatalogKey() const
+    {
+        return prefix + "/cas/ref_catalog";
+    }
+
     /// Public validator for a namespace reconstructed from an untrusted listed key (GC ref intake):
     /// `parseRefObjectKey` returns the namespace without checking its shape, so a
     /// consumer that will act on it must re-validate. Throws BAD_ARGUMENTS on a malformed namespace,

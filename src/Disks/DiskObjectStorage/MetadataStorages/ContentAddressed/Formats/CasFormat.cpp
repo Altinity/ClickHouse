@@ -32,6 +32,13 @@ constexpr FormatChangePoint REF_STREAM[] = {{1, 1}, {kContiguousRefStreamsGenera
 /// read it. Its single change point is its birth, and the reader floor is that same generation.
 constexpr FormatChangePoint REF_CKPT[] = {{kContiguousRefStreamsGeneration, kContiguousRefStreamsGeneration}};
 
+/// `cas_ref_catalog` is also BORN at generation 4: Stage B's own recreate-only bump (the plan's
+/// "format bump B") lands in a later task, so the catalog is introduced while `G_BUILD` is still the
+/// value `kContiguousRefStreamsGeneration` names. It reuses that constant rather than a second one
+/// named after itself for the same reason `REF_CKPT` does — both classes were born at the SAME actual
+/// generation, and the constant names the generation, not the feature.
+constexpr FormatChangePoint REF_CATALOG[] = {{kContiguousRefStreamsGeneration, kContiguousRefStreamsGeneration}};
+
 }
 
 std::span<const FormatChangePoint> changePoints(FormatId id)
@@ -43,6 +50,8 @@ std::span<const FormatChangePoint> changePoints(FormatId id)
             return REF_STREAM;
         case FormatId::RefCkpt:
             return REF_CKPT;
+        case FormatId::RefCatalog:
+            return REF_CATALOG;
         case FormatId::Blob:
         case FormatId::GcState:
         case FormatId::PoolMeta:
@@ -116,6 +125,14 @@ constexpr FormatTraits TRAITS[] =
     /// reason its decoder is -- every field changes what cleanup may delete, so nothing in it may be
     /// skipped. Raw (`Never`): a small singleton, and `publishCkpt` re-encodes it on every attempt.
     {FormatId::RefCkpt,      "cas_ref_ckpt",      TextFamily::Control,       KeyStrictness::Strict,   CompressionPolicy::Never,     64 * kKiB,  4 * kKiB},
+    /// `cas_ref_catalog` (INV-3): one object for the whole pool, token-CAS like `gc/state`, read on
+    /// every fold round and every recovery. STRICT for the same reason `cas_ref_ckpt` is -- every
+    /// field decides a namespace's lifecycle, so nothing in it may be skipped. Raw (`Never`): the
+    /// admission gate measures `encodeRefCatalog`'s own output directly, so a compressed size would
+    /// answer the wrong question. The object cap is the fold-seal's own 256 MiB (predicate (2) of the
+    /// additive admission check bounds it further via the entry count); the line cap is tight (4 KiB)
+    /// because one entry's record is small and bounded by `kMaxNamespaceBytes`.
+    {FormatId::RefCatalog,   "cas_ref_catalog",   TextFamily::Control,       KeyStrictness::Strict,   CompressionPolicy::Never,     256 * kMiB, 4 * kKiB},
     {FormatId::PartManifest, "cas_part_manifest", TextFamily::PayloadHybrid, KeyStrictness::Tolerant, CompressionPolicy::Always,    256 * kMiB, 64 * kKiB},
     {FormatId::RunFile,      "cas_run",           TextFamily::RecordStream,  KeyStrictness::Strict,   CompressionPolicy::PinnedRaw, 0,          4 * kKiB},
     {FormatId::FoldSeal,     "cas_fold_seal",     TextFamily::Control,       KeyStrictness::Strict,   CompressionPolicy::PinnedRaw, 256 * kMiB, 64 * kKiB},
