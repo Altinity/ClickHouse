@@ -91,12 +91,15 @@ WHERE round_id = (
     WHERE disk_name LIKE '%05007_content_addressed_gc_introspection%' AND event_type = 'Finish'
     ORDER BY event_time_microseconds DESC LIMIT 1);
 
--- A Phase row's \`ProfileEvents\` is that phase's own delta, not the whole round's: the ref-prefix
--- enumeration must show fewer events than the round summary it is a part of.
+-- A Phase row's \`ProfileEvents\` is that phase's own delta, not the whole round's: the phase that
+-- enumerates the ref prefix must show fewer events than the round summary it is a part of. That
+-- enumeration lives in \`defer_decision\`, which owns the \`cas/refs/\` LIST. It is deliberately NOT
+-- \`fold_ref_group\`: that phase is I/O-free by construction ("the keys are already in hand"), so its
+-- own delta is empty and this assertion would answer 0 there no matter how healthy the round was.
 SELECT max(length(ProfileEvents)) > 0
 FROM system.content_addressed_garbage_collection_log
 WHERE disk_name LIKE '%05007_content_addressed_gc_introspection%'
-  AND event_type = 'Phase' AND phase = 'fold_ref_group';
+  AND event_type = 'Phase' AND phase = 'defer_decision';
 
 -- The error path: a non-CA disk (the always-present local \`default\`) is rejected.
 SYSTEM CONTENT ADDRESSED GC RUN 'default'; -- { serverError BAD_ARGUMENTS }
