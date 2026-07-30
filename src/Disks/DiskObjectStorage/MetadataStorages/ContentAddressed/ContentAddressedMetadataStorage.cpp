@@ -21,6 +21,7 @@
 #include <base/getThreadId.h>
 #include <Common/DateLUT.h>
 #include <Common/Exception.h>
+#include <Common/LoggingHelpers.h>
 #include <Common/logger_useful.h>
 #include <Common/thread_local_rng.h>
 #include <Poco/Util/AbstractConfiguration.h>
@@ -1484,7 +1485,24 @@ bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) 
             /// a caller treat the subtree as gone. Answering present is bounded -- an already-unfrozen
             /// directory keeps showing up until the key is cleared -- and it never claims absence that
             /// was not established.
-            return !listing.skipped.empty();
+            ///
+            /// The answer alone would leave an operator with a directory that will not go away and
+            /// nothing naming the key that holds it, so the key and the refusal are LOGGED here too --
+            /// the other three consumers of this enumeration each surface the skip to a human, and a
+            /// boolean is not that. Rate-limited because this is an existence probe on a browse path:
+            /// `LogSeriesLimiter` keys on the LOGGER NAME, so one message per window prints regardless of
+            /// which key it was about.
+            if (!listing.skipped.empty())
+            {
+                LogSeriesLimiter log(getLogger("CasShadowScopeLifelessKey"), /*allowed_count=*/1, /*interval_s=*/60);
+                LOG_WARNING(log,
+                    "existsDirectory('{}'): {} key(s) under this scope name no namespace life, so it "
+                    "cannot be proven empty and is reported as PRESENT. First such key: '{}' ({}). Run "
+                    "`ca-fsck` to enumerate them all.",
+                    path, listing.skipped.size(), listing.skipped.front().key, listing.skipped.front().reason);
+                return true;
+            }
+            return false;
         }
         case DirShape::AtomicShard:
             return liveTreeDirHasChildren(path);
