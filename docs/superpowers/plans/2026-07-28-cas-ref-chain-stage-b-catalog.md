@@ -897,6 +897,37 @@ here instead of as a pointer.
   local green. **Step 5: Commit**
   `ca: ref — incarnation-keyed layer; universe from catalog; format bump B`.
 
+### Task 4 SPLIT (2026-07-30) — the task proved to be Tasks 2+3 combined in size {#task-4-split}
+
+Task 4's implementer stopped and asked rather than pushing on, which was correct. Its first attempt at
+catalog-authoritative discovery produced **127 test failures**, every one the same mechanism: GC, rebuild
+and fsck tests write raw ref and manifest objects through low-level helpers without ever touching the
+catalog, so a catalog-sourced universe is EMPTY for them. That is the empirical form of the argument that
+settled the scope question — discovery without population is not incomplete, it is armed, because the
+frontier compares `proven == total` and an empty universe compares `0 == 0`. The working draft is saved at
+`.superpowers/sdd/.../task-4-universe-from-catalog-draft.diff`; it was reverted rather than left as 127
+reds in a shared worktree.
+
+- **4-A — LANDED.** Format bump B (`kNamespaceLifeKeyedGeneration = 5`, `G_BUILD` 4→5, change points on
+  `REF_STREAM`/`REF_CKPT`, the backward floor moved to the new constant) plus Steps 0a and 0b. Note for the
+  record what 0a actually was: not the "one-line fix" its BACKLOG entry claimed, because a PRE-EXISTING
+  test (`CasAnomalyPolicy.NonReadyAtNewIdAllocationFaultsAndFailsClosed`) asserted the WRONG behaviour as
+  correct — a terminal state reported as retryable. **A test pinning a defect is worse than an unpinned
+  defect**: it fails when the behaviour is corrected. And the bump needed ~27 golden `"v":4` literals across
+  15 files, found by running the gate, not by grep — the first grep missed the escaped-quote form.
+  **Method note: for a golden-literal sweep the gate is the search tool and grep is only the hypothesis.**
+- **4-B — map the choke points.** Enumerate every helper through which a test writes a namespace's first
+  ref object, which files use it, and how many of the 127 funnel through each. This decides the shape of
+  everything after it and is therefore its own step: **the obvious fix is 127 `casAdmitEntry` calls; the
+  better one is routing the shared helpers through the REAL birth path**, so the catalog populates the way
+  production populates it. A test that fabricates a catalog entry by hand proves nothing about the path
+  that creates entries — the same reason a driver-only invariant was rejected in Task 3.
+- **4-C — the wiring and the discovery, with 4-B's map in hand.** Production birth resolves an incarnation
+  from the catalog ONCE per table-open (not per write — a per-write catalog GET is a protocol step and is
+  vetoed), cached on `RefTableRuntime`; then the saved discovery draft, the R10 incarnation pre-filter ahead
+  of `groupRefKeys`, the **R11 empty-universe fail-closed guard**, obligation 3's production-path pin, and
+  the `_ckpt`-cleanup re-derivation at the new key shape.
+
 ### Task 4b: namespace files under `<ns>/<inc>/_files/` — rebirth waits for nothing {#task-4b}
 
 [Directive design change 2 = the file half of amendment commit 4. Closes the hole the original
