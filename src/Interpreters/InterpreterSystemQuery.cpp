@@ -23,6 +23,11 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/IMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.h>
+/// Direct, though `ContentAddressedMetadataStorage.h` above would also pull it in: this TU renders
+/// `FsckReport`'s hard findings into the SQL row, and `CasFsck.h`'s `kFsckHardFindings` tripwire is what
+/// breaks THIS build when a finding is added. Depending on another header's include list for that would
+/// make the coverage silently removable.
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h>
 #include <Disks/IDisk.h>
 #include <Formats/FormatSchemaInfo.h>
 #include <Functions/UserDefined/ExternalUserDefinedExecutableFunctionsLoader.h>
@@ -2435,14 +2440,15 @@ ColumnsDescription contentAddressedFsckColumns()
         /// shape that hid `corrupted_runs` from the text summary for months. The row was a deliberate
         /// subset until 2026-07-29 and `stale_edge`/`corrupted_runs`/`snapshot_oracle_mismatches` were
         /// invisible from SQL while `clickhouse-disks ca-fsck` exited nonzero on all three; then
-        /// `lifeless_keys` was added to `clean` in 2026-07-30 and missed here too, which is the fourth
-        /// time this rule was written in prose and did not hold.
+        /// `lifeless_keys` was added to `clean` in 2026-07-30 and missed here too. Every time, the rule
+        /// was written in prose, and every time the prose did not hold.
         ///
-        /// So the rule no longer lives only in prose: `kFsckHardFindings` (`CasFsck.h`) is the list
-        /// `clean` is computed from, and the `static_assert` beside it breaks the build in THIS
-        /// translation unit when a term is added. Read that assert's message before bumping its count --
-        /// it names this site as one of the three that owes an update, and says which of the three have
-        /// no test that can fail on their behalf. This is one of those.
+        /// So it no longer lives only in prose: `kFsckHardFindings` (`CasFsck.h`) is the list `clean` is
+        /// computed from, and the `static_assert` beside it breaks the build in THIS translation unit when
+        /// a term is added. Read that assert's message before bumping its count -- it names this site as
+        /// one of the three that owes an update, and says that two of the three have no test that can fail
+        /// on their behalf. WHICH two is in the comment above the assert, not in the message; this site is
+        /// one of them.
         ///
         /// `stale_edge` is nonzero only in `detail` mode and this row is built from a summary scan, so it
         /// reads 0 here always — present because "absent" and "zero" are different facts to a consumer,
