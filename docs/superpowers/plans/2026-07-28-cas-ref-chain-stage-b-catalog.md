@@ -924,7 +924,9 @@ reds in a shared worktree.
   that creates entries — the same reason a driver-only invariant was rejected in Task 3.
 - **4-C — the wiring and the discovery, with 4-B's map in hand.** Production birth resolves an incarnation
   from the catalog ONCE per table-open (not per write — a per-write catalog GET is a protocol step and is
-  vetoed), cached on `RefTableRuntime`; then the saved discovery draft, the R10 incarnation pre-filter ahead
+  vetoed), cached on `RefTableRuntime`; then the saved discovery draft — **which must NOT be re-applied
+  verbatim: it predates R11 and contains no fail-closed guard for the empty universe, so re-applying it
+  as-is ships catalog-authoritative discovery with the vacuous `0 == 0` frontier still armed** — the R10 incarnation pre-filter ahead
   of `groupRefKeys`, the **R11 empty-universe fail-closed guard**, obligation 3's production-path pin, and
   the `_ckpt`-cleanup re-derivation at the new key shape.
 
