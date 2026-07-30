@@ -3074,3 +3074,56 @@ same gap has now cost three rounds and why "we added them" is not a closure.
 **The generalisable rule: a filter is a claim about coverage, and a claim about coverage needs a
 two-sided check.** One side is what the filter selects; the other is what exists. Nothing in this
 repository compared the two until a hidden abort forced someone to look.
+
+## Refactoring candidates, derived from what actually broke today {#refactor-candidates-from-defects}
+
+Compiled 2026-07-30 at the user's prompt, from the session's defect list rather than from taste. Each entry
+names the defects that came out of it, so the case is evidence and not preference. Ranked by
+value-per-risk, not by size.
+
+**1. Absence must be expressible in the type. THE ONE TO DO NOW.** `CasRefCatalog::resolveLifeOrSentinel`
+returns a `NamespaceLifeId` and, when the catalog does not name the namespace, returns the Stage-A sentinel.
+So a caller **cannot distinguish "here is the life" from "I do not know"** — it receives a plausible,
+well-formed, wrong key. That single property is the amplifier in all three vacuous-frontier findings
+(`{#r11-empty-universe-vacuous}`, `{#r11b-authority-vs-union}`, `{#r11c-incarnation-mismatch}`): each one is
+a proof fabricated out of a key space that is empty by construction.
+
+Change the signature to `std::optional<NamespaceLifeId>` and delete the fallback; where a caller genuinely
+wants the sentinel (raw test fixtures, where the sentinel IS the truth) it asks for it explicitly. **The
+compiler then performs the sweep** — all 24 call sites must state what they do when the answer is unknown,
+and R11c's class becomes a compile error instead of a silent proof. This is small, mechanical after the
+signature change, and it PREVENTS the class we have now found three times.
+
+**2. One life resolution per round, threaded — not re-derived.** Five mechanisms answer one question, across
+80 call sites: `resolveNamespaceLife` (10), `resolveLifeOrSentinel` (24), `discoverUniverse` (13),
+`stageATransition` (19), `fromCatalogEntry` (14). Defects from this tangle alone: C2 (writers at the sentinel
+while readers had moved to the real life), C3 (delete plan computed under one life, applied under another),
+NEW-3 (an optional parameter defaulting to self-resolution at the one site its doc said it would not), and I3
+(a full pool-wide catalog GET and decode per call, several in per-namespace loops, i.e. O(namespaces²) bytes
+per round). Task 4-C started the fix inside the fold with `FoldResult::live_incarnation`; the same treatment
+belongs in fsck and decommission, each resolving once per run.
+
+**3. The destructive gate collapses per-namespace facts into a pool-wide boolean.**
+`suppress_destructive = !anomalies.empty() || !holds.empty() || frontier_incomplete`. One namespace's anomaly
+stops reclamation for the whole pool, which is how a single un-cataloged namespace becomes a **permanent**
+pool-wide stall (`{#r11c-incarnation-mismatch}`'s neighbour, NEW-2). Task 7b's own text already requires the
+flip to carry the hold set per namespace — so the gate wants to be per-namespace and is currently scalar, and
+that mismatch has already produced one Critical and one stall hazard.
+
+**4. `Gc/CasGc.cpp` (4679 lines) and `Pool/CasRefLedger.cpp` (4249) are 18% of the subsystem between them.**
+Size here is not an aesthetic complaint: today's `chassert`-over-a-handled-branch sat four lines from the
+branch it killed, the double-unlock that masked a real error class lived in the same file, and both survived
+multiple reviews. **But NOT during open Criticals** — and when it happens, goldens first: this campaign's rule
+is that an extraction needs its equivalence fences written BEFORE the move, because a fence added afterwards
+tests the new shape rather than the preserved behaviour.
+
+**5. The fixture/production divergence should be one named seam, not a habit.** Raw test helpers write at the
+sentinel, admit catalog entries as `Live` with no `_ckpt`, and bypass birth — which produced the 164-test
+sweep, the test whose premise was inverted by a uniform pin, and two tests that pinned data loss as correct.
+One helper, one documented list of divergences, one place to look.
+
+**6. And the one that is not a code refactor: keep converting prose rules into executing checks.** Four rules
+failed today because they lived only in comments. The two that were converted — `FsckReport::clean` computed
+from `kFsckHardFindings` with a `static_assert` in three TUs, and the suite-list generator deriving from
+sources and failing on any unclaimed suite — both held immediately. Every remaining "whenever X, also do Y"
+comment in this subsystem is a candidate.
