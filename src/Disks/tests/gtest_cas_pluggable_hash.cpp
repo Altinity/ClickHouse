@@ -675,31 +675,32 @@ TEST(CasPluggableHash, ForeignAlgoSegmentIsDebrisNotOurs)
 }
 
 /// ============================================================================================
-/// CAS reader-generation gate (`Core/Formats/CasFormat.h`'s `G_BUILD`) is raised to 4 for per-namespace
-/// contiguous ref-log ids (INV-1): a generation-3 pool's ref-log ids were drawn from a pool-wide counter
-/// and are full of legitimate holes, which a generation-4-aware reader reads as a truncated -- i.e.
-/// corrupt -- stream. `PoolMeta::createOrValidate`'s open-time CAS-raise now targets 4, and
-/// `decodePoolMeta` fail-closes BOTH on a FUTURE `min_reader_generation` AND on a BACKWARD pool whose
-/// header `compatibility_version` is below `kContiguousRefStreamsGeneration` (the pre-contiguous
-/// generation-3 ref format this build can no longer read).
+/// CAS reader-generation gate (`Core/Formats/CasFormat.h`'s `G_BUILD`) was raised to 4 for
+/// per-namespace contiguous ref-log ids (INV-1) and has since moved again, to 5, for Stage B's
+/// namespace-life-keyed ref layer ("format bump B", `kNamespaceLifeKeyedGeneration`) -- this test's
+/// assertions read `G_BUILD` itself rather than a hardcoded generation number for exactly that reason,
+/// so a THIRD bump does not silently make them false. `PoolMeta::createOrValidate`'s open-time
+/// CAS-raise targets `G_BUILD`, and `decodePoolMeta` fail-closes BOTH on a FUTURE
+/// `min_reader_generation` AND on a BACKWARD pool whose header `compatibility_version` is below
+/// `kNamespaceLifeKeyedGeneration` (which, being the LATER of the two historical breaking-change
+/// floors, subsumes `kContiguousRefStreamsGeneration` -- see `CasPoolMetaFormat.cpp`).
 /// ============================================================================================
 
-TEST(CasPluggableHash, ReaderGenerationIsRaisedToFour)
+TEST(CasPluggableHash, ReaderGenerationIsRaisedToGBuild)
 {
-    EXPECT_EQ(G_BUILD, 4u) << "generation 4 is per-namespace contiguous ref-log ids (INV-1) -- a "
-        "generation-3 pool's ids were drawn from a pool-wide counter and are full of legitimate holes a "
-        "generation-4 reader reads as corrupt, so the gate (G_BUILD) must be raised to 4";
+    EXPECT_GE(G_BUILD, kNamespaceLifeKeyedGeneration)
+        << "the reader-generation gate must be at least the namespace-life-keyed floor it enforces";
 
-    /// A freshly opened/created pool records `min_reader_generation == 4` (the open-time CAS-raise,
-    /// `PoolMeta::createOrValidate`, now targets `G_BUILD == 4`).
+    /// A freshly opened/created pool records `min_reader_generation == G_BUILD` (the open-time
+    /// CAS-raise, `PoolMeta::createOrValidate`, always targets this build's own floor).
     {
         auto backend = std::make_shared<InMemoryBackend>();
         auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
-        EXPECT_EQ(store->poolMeta().min_reader_generation, 4u);
+        EXPECT_EQ(store->poolMeta().min_reader_generation, G_BUILD);
 
         const auto meta_bytes = backend->get(store->layout().poolMetaKey());
         ASSERT_TRUE(meta_bytes.has_value());
-        EXPECT_EQ(decodePoolMeta(meta_bytes->bytes).min_reader_generation, 4u);
+        EXPECT_EQ(decodePoolMeta(meta_bytes->bytes).min_reader_generation, G_BUILD);
     }
 
     /// FORWARD gate: a pool-meta carrying `min_reader_generation == G_BUILD + 1` (one generation past
@@ -716,11 +717,11 @@ TEST(CasPluggableHash, ReaderGenerationIsRaisedToFour)
         { Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"}); });
     }
 
-    /// BACKWARD floor: a pool whose header `v` (compatibility_version) is BELOW
-    /// `kContiguousRefStreamsGeneration` was written by an older (generation-3) build whose ref-log ids
-    /// came from a pool-wide counter; it must fail closed at open rather than mis-read the holes in its
-    /// per-namespace streams as corruption everywhere. Craft it at the text layer: take a fresh
-    /// (generation-4) pool-meta and rewrite its line-1 version gate down to `G_BUILD - 1` (an older
+    /// BACKWARD floor: a pool whose header `v` (compatibility_version) is BELOW `G_BUILD` was written
+    /// by an older build this reader can no longer trust -- today that is one generation short of
+    /// `kNamespaceLifeKeyedGeneration`, a pool whose ref-object keys carry no incarnation segment,
+    /// which this build's parsers refuse as corruption rather than read. Craft it at the text layer:
+    /// take a fresh pool-meta and rewrite its line-1 version gate down to `G_BUILD - 1` (an older
     /// build would have stamped exactly that).
     {
         auto backend = std::make_shared<InMemoryBackend>();

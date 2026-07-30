@@ -102,16 +102,20 @@ PoolMeta decodePoolMeta(std::string_view data)
     ReadBufferFromMemory in(data.data(), data.size());
     const TextHeader header = expectHeaderLine(in, FormatId::PoolMeta);
 
-    /// An older pool's ref-log ids came from a pool-wide counter, so its per-namespace streams have
-    /// legitimate holes — which this build reads as a truncated (corrupt) stream, and its own writers
-    /// could not extend without producing one. There is no decoder that can reconcile the two, so reject
-    /// the pool before reading the metadata body. Writers always emit the current generation, while
+    /// An older pool predates one of two breaking ref-layer changes this build cannot reconcile, so
+    /// reject it before reading the metadata body. Writers always emit the current generation, while
     /// `expectHeaderLine` separately rejects a future generation that this build cannot understand.
-    if (header.v < kContiguousRefStreamsGeneration)
+    /// `kNamespaceLifeKeyedGeneration` (Stage B's "format bump B") is checked rather than
+    /// `kContiguousRefStreamsGeneration` because it is the LATER of the two floors and therefore
+    /// subsumes it: every pool below `kNamespaceLifeKeyedGeneration` is also below
+    /// `kContiguousRefStreamsGeneration`, so one check names the binding reason without stacking a
+    /// second, now-redundant one for the earlier change.
+    if (header.v < kNamespaceLifeKeyedGeneration)
         throw Exception(ErrorCodes::UNKNOWN_FORMAT_VERSION,
-            "CAS pool format {} predates contiguous ref streams; recreate the pool. This build reads "
-            "only per-namespace contiguous ref-log ids (generation {}+), and CAS is pre-release: there "
-            "is no in-place migration.", header.v, kContiguousRefStreamsGeneration);
+            "CAS pool format {} predates namespace-life-keyed ref objects (recreate-only Stage B format "
+            "bump); recreate the pool. This build reads only per-namespace contiguous, incarnation-scoped "
+            "ref-log ids (generation {}+), and CAS is pre-release: there is no in-place migration.",
+            header.v, kNamespaceLifeKeyedGeneration);
 
     const String body = readLine(in, traitsFor(FormatId::PoolMeta).line_cap, "pool meta");
     ReadBufferFromMemory body_in(body.data(), body.size());

@@ -823,7 +823,7 @@ TEST(CasRefCkpt, CommitRefChunkDurableBytesUnchangedByExtraction)
     EXPECT_EQ(got->bytes.size(), 177u) << "the sealed ref-log body changed size";
     SipHash body_hash;
     body_hash.update(got->bytes.data(), got->bytes.size());
-    EXPECT_EQ(getHexUIntLowercase(body_hash.get128()), "447348741c9f402fb94767ae028a4e73")
+    EXPECT_EQ(getHexUIntLowercase(body_hash.get128()), "7f52cf3cc0599d9bec645bed0e33f898")
         << "the sealed ref-log body changed content -- preparation must seal the same bytes it sealed "
            "before the extraction";
 }

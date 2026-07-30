@@ -21,22 +21,35 @@ namespace
 /// new generation as the floor. Existing entries are immutable history.
 constexpr FormatChangePoint BASELINE[] = {{1, 1}};
 
-/// The two ref classes changed at generation 4 (INV-1, per-namespace contiguous ids). The change is
-/// BREAKING even though not one byte of the encoding moved: a generation-3 stream's ids came from a
-/// pool-wide counter and legitimately skip, which a generation-4 reader reports as corruption. The
-/// floor is therefore the change generation itself.
-constexpr FormatChangePoint REF_STREAM[] = {{1, 1}, {kContiguousRefStreamsGeneration, kContiguousRefStreamsGeneration}};
+/// The two ref classes changed at generation 4 (INV-1, per-namespace contiguous ids) AND AGAIN at
+/// generation 5 (Stage B's recreate-only "format bump B": the ref layer re-keyed under
+/// `<ns>/<incarnation>/`). Both changes are BREAKING even though not one byte of the encoding moved
+/// either time -- a generation-3 stream's ids came from a pool-wide counter and legitimately skip,
+/// which a generation-4 reader reports as corruption, and a generation-4 key names no incarnation at
+/// all, which a generation-5 reader also reports as corruption (`Layout::parseRefObjectKey`). Each
+/// floor is the change generation itself.
+constexpr FormatChangePoint REF_STREAM[] = {
+    {1, 1},
+    {kContiguousRefStreamsGeneration, kContiguousRefStreamsGeneration},
+    {kNamespaceLifeKeyedGeneration, kNamespaceLifeKeyedGeneration},
+};
 
 /// `cas_ref_ckpt` is BORN at generation 4, so it has no generation-1 baseline to inherit: there is no
 /// such thing as a generation-1 `_ckpt` object, and claiming one would say a generation-1 reader could
-/// read it. Its single change point is its birth, and the reader floor is that same generation.
-constexpr FormatChangePoint REF_CKPT[] = {{kContiguousRefStreamsGeneration, kContiguousRefStreamsGeneration}};
+/// read it. Generation 5 re-keys it under `<ns>/<incarnation>/` exactly like `REF_STREAM` above, for
+/// the same reason and with the same floor.
+constexpr FormatChangePoint REF_CKPT[] = {
+    {kContiguousRefStreamsGeneration, kContiguousRefStreamsGeneration},
+    {kNamespaceLifeKeyedGeneration, kNamespaceLifeKeyedGeneration},
+};
 
-/// `cas_ref_catalog` is also BORN at generation 4: Stage B's own recreate-only bump (the plan's
-/// "format bump B") lands in a later task, so the catalog is introduced while `G_BUILD` is still the
-/// value `kContiguousRefStreamsGeneration` names. It reuses that constant rather than a second one
-/// named after itself for the same reason `REF_CKPT` does — both classes were born at the SAME actual
-/// generation, and the constant names the generation, not the feature.
+/// `cas_ref_catalog` is BORN at generation 4, one generation BEFORE the bump that makes namespace
+/// existence catalog-authoritative (Stage B's Task 4, "format bump B" -- `kNamespaceLifeKeyedGeneration`):
+/// Task 2 introduced the catalog OBJECT while `G_BUILD` was still the value
+/// `kContiguousRefStreamsGeneration` names, and Task 4 is the later change that actually wires
+/// discovery to read it and bumps the floor. The catalog's own encoding is unaffected by that bump (it
+/// reuses `kContiguousRefStreamsGeneration` as its birth generation, not a second constant named after
+/// itself, for the same reason `REF_CKPT` originally did), so it carries no second change point here.
 constexpr FormatChangePoint REF_CATALOG[] = {{kContiguousRefStreamsGeneration, kContiguousRefStreamsGeneration}};
 
 }

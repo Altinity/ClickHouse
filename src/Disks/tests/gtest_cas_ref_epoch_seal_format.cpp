@@ -452,7 +452,7 @@ TEST(CasRefEpochSealFormat, FormatBatteryEpochSeal)
     runFormatBattery({FormatId::RefLog,
         [txn] { return sealObject(FormatId::RefLog, encodeRefLogTxn(txn)); },
         [ns, id](std::string_view s) { decodeRefLogTxn(openObject(FormatId::RefLog, s), ns, id); },
-        "{\"type\":\"cas_ref_log\",\"v\":4}\n"
+        "{\"type\":\"cas_ref_log\",\"v\":5}\n"
         "{\"ns\":\"ns\",\"we\":\"3\",\"rs\":\"1\",\"!pse\":\"2\",\"!pss\":\"9\"}\n"
         "{\"op\":\"epoch_seal\"}\n"
         "{\"n\":1}\n"});

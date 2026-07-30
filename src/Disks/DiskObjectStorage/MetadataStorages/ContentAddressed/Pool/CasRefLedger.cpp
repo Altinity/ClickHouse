@@ -1901,7 +1901,8 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
             static_assert(std::is_nothrow_swappable_v<std::optional<RefAppendAttempt>>,
                 "the wedge hand-off below must be non-throwing: it runs after the wedged object is proven "
                 "durable, where a throw would re-apply the transaction on the next resolution");
-            /// Post-durable install region 2 of 3 (spec §A2). The `catch` cannot fire while §A1 holds --
+            /// One of the two post-durable install regions (spec §A2; the other is `commitRefChunk`'s
+            /// own, further below, sharing this same probe). The `catch` cannot fire while §A1 holds --
             /// the body below allocates nothing -- and is what makes a violation of §A1 VISIBLE rather
             /// than silent: the attempt proved the object durable, so an install that does not complete
             /// leaves this table's cached state missing it. It rethrows unchanged, so the lane's error
@@ -2667,7 +2668,16 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
             on_impossible_interference(attempt_key.value_or(""), fmt::format(
                 "ref-log append reached new-id allocation while the lane was in state {} instead of Ready",
                 static_cast<uint8_t>(lane_state)), ns.string());
-            complete_error(chunk_survivors, makeCasWriteRetryLaterExceptionPtr(fmt::format(
+            /// `Faulted` is a TERMINAL lane state (same as the two other `Faulted` arms further down this
+            /// function, which both report `CORRUPTED_DATA`) -- reporting it via
+            /// `makeCasWriteRetryLaterExceptionPtr` would tell the caller a state the lane can never leave
+            /// on its own is transient. The arm is self-limiting today (the next flush's
+            /// `resolveWedgeOnce` takes the `invalid_lane_state` `Reason` arm and re-reports it the same
+            /// way), but a terminal state must never be reported as retryable from ANY arm --
+            /// `gtest_cas_ref_writer.cpp`'s `CasAnomalyPolicy.NonReadyAtNewIdAllocationFaultsAndFailsClosed`
+            /// pins this arm specifically (it already drives this exact seam; only its expected error
+            /// class needed to change).
+            complete_error(chunk_survivors, std::make_exception_ptr(Exception(ErrorCodes::CORRUPTED_DATA,
                 "CAS ref-log append for namespace '{}': refusing to allocate a new ref-log id while the "
                 "lane is not Ready (state {}, attempt key '{}'); the lane is faulted until remount",
                 ns.string(), static_cast<uint8_t>(lane_state), attempt_key.value_or(""))));

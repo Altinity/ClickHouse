@@ -29,7 +29,19 @@ namespace DB::Cas
 /// pool (its version is not in the future), so pool-meta decoding applies
 /// `kContiguousRefStreamsGeneration` as a backward floor. Pools below the floor must be recreated;
 /// there is no migration path in the pre-release format.
-constexpr uint32_t G_BUILD = 4;
+///
+/// Generation 5 (Stage B's own recreate-only bump, the plan's "format bump B") re-keys the ref layer
+/// under `<ns>/<incarnation>/` (spec INV-3: the whole-pool namespace catalog mints the incarnation).
+/// Again the bytes of `_log`/`_snap`/`_ckpt` objects did not change, but the KEY SHAPE they live under
+/// did: a generation-4 key named a namespace directly (`cas/refs/<ns>/_log/<id>`), while this
+/// generation's reader recognizes only the incarnation-qualified shape
+/// (`cas/refs/<ns>/<incarnation>/_log/<id>`) -- `Layout::parseRefObjectKey`/`parseRefCkptKey` already
+/// refuse the un-incarnated shape with `CORRUPTED_DATA` (Stage B Tasks 1/1c landed that refusal ahead
+/// of this bump, deliberately: the pre-release format carries zero persisted data and zero compat
+/// obligation, so the key shapes and the bump that makes them the ONLY readable shape need not land in
+/// the same commit). `kNamespaceLifeKeyedGeneration` is the backward floor for this change, applied the
+/// same way `kContiguousRefStreamsGeneration` is.
+constexpr uint32_t G_BUILD = 5;
 
 /// The pool-format generation at which ref-log ids became per-namespace and contiguous. Pool metadata
 /// below this value cannot be opened, because its ref streams carry holes this build reports as
@@ -37,6 +49,16 @@ constexpr uint32_t G_BUILD = 4;
 /// so a later generation that CAN still read a generation-4 pool does not silently move the floor with
 /// it.
 constexpr uint32_t kContiguousRefStreamsGeneration = 4;
+
+/// The pool-format generation at which the ref layer (and, per Stage B's Task 4b, namespace files)
+/// became incarnation-scoped under `<ns>/<incarnation>/`. Pool metadata below this value cannot be
+/// opened: its ref-object keys carry no incarnation segment, which this build's parsers refuse as
+/// corruption rather than read as a compatibility case (see the `G_BUILD` doc above). The backward-
+/// floor check is applied by `decodePoolMeta`, exactly mirroring `kContiguousRefStreamsGeneration`;
+/// named separately for the same reason that one is -- so a later generation that can still read a
+/// generation-5 pool does not silently move this floor with it. Pools below the floor must be
+/// recreated; there is no migration path in the pre-release format.
+constexpr uint32_t kNamespaceLifeKeyedGeneration = 5;
 
 /// Stable identifiers for every self-describing persisted object class. The text registry uses the
 /// corresponding `type` string as the on-disk identity. Numeric values are part of the format history:

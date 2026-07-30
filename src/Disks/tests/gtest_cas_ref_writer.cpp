@@ -1146,7 +1146,11 @@ TEST(CasAnomalyPolicy, NonReadyAtNewIdAllocationFaultsAndFailsClosed)
     ASSERT_TRUE(store->mayMutate()) << "the fence must be armed BEFORE the wedge-contract violation, or the guard would trivially pass for the wrong reason";
     ASSERT_EQ(store->scheduleRemountCallCountForTest(), 0u) << "no remount must have been scheduled yet";
 
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
+    /// BACKLOG `{#lane-terminal-reported-as-retryable}`: `Faulted` is a TERMINAL lane state, the same
+    /// one every OTHER `Faulted` arm in `commitRefChunk` reports as `CORRUPTED_DATA` -- reporting it as
+    /// `NETWORK_ERROR`/retry-later would tell the caller a state the lane can never leave on its own is
+    /// transient.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { store->dropRef(ns, "x"); });
 
     EXPECT_EQ(countLogObjects(), log_objects_before) << "the release guard must refuse before allocating/PUTting a new _log object";
     EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Faulted)
