@@ -18,13 +18,25 @@ namespace DB::Cas
 /// Both predicates accept at EQUALITY: a cap is the largest permitted value, not the first forbidden
 /// one, and the readers enforce it the same way.
 ///
-/// Additions saturate. A modular sum that wrapped would answer "fits" for an object that does not,
-/// turning an overflow into a durable unreadable object — the one outcome the caps exist to prevent.
+/// Additions AND multiplications saturate. A modular sum or product that wrapped would answer "fits"
+/// for an object that does not, turning an overflow into a durable unreadable object — the one
+/// outcome the caps exist to prevent.
 
 /// `a + b`, clamped to `UINT64_MAX` instead of wrapping.
 constexpr uint64_t addByteBudget(uint64_t a, uint64_t b)
 {
     return a > UINT64_MAX - b ? UINT64_MAX : a + b;
+}
+
+/// `a * b`, clamped to `UINT64_MAX` instead of wrapping -- the same saturation discipline as
+/// `addByteBudget`, one step earlier: a per-entry byte cost multiplied by an entry count before the
+/// caller adds it to a fixed frame (`fitsObjectCap`'s second argument) can overflow first, and a
+/// wrapped product can land BELOW the true fixed-plus-reservation sum even though the real total is
+/// far over it -- the exact "answers fits for an object that does not" failure this file exists to
+/// prevent, one arithmetic step upstream of the sum itself.
+constexpr uint64_t mulByteBudget(uint64_t a, uint64_t b)
+{
+    return a != 0 && b > UINT64_MAX / a ? UINT64_MAX : a * b;
 }
 
 /// LINE predicate: `encoded_row_bytes <= line_cap`, measured EXCLUDING the '\n' terminator (the same

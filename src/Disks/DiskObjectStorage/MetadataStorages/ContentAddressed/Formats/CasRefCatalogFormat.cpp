@@ -27,7 +27,10 @@ std::string_view nsStateToWord(NsState s)
         case NsState::Live:     return "live";
         case NsState::Removing: return "removing";
     }
-    throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref catalog: unknown ns state {}", static_cast<int>(s));
+    /// Every value reaching here came from a live `NsState` or from `nsStateFromWord`, which already
+    /// validated it on decode -- so this is a bug in THIS process, not corruption arriving from a
+    /// store.
+    throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS ref catalog: unknown ns state {}", static_cast<int>(s));
 }
 
 NsState nsStateFromWord(std::string_view w)
@@ -67,13 +70,18 @@ String encodeRefCatalog(const RefCatalog & catalog)
     CasJsonWriter out(256);
 
     /// EVERY line this encoder emits is measured against the LINE cap, on the bytes actually emitted
-    /// -- escaping, framing and all -- mirroring `encodeFoldSeal`'s `checkLineBytes`. A line that does
-    /// not fit is not a large line, it is an UNREADABLE one: `readLine` refuses it, so the whole
-    /// object is lost. Refuse here, where nothing is durable yet.
+    /// -- escaping, framing and all -- mirroring `encodeFoldSeal`'s `checkLineBytes` EXACTLY,
+    /// including its error code: `LIMIT_EXCEEDED`, not `LOGICAL_ERROR`. A line that does not fit is
+    /// not a large line, it is an UNREADABLE one: `readLine` refuses it, so the whole object is lost.
+    /// This is a capacity refusal on otherwise well-formed input (an admitted namespace name or
+    /// server_root_id near their own byte bounds, worst-case escaped, can reach ~4.7 KiB on its own --
+    /// reachable, not theoretical), not a bug in this process, so a caller catching `LIMIT_EXCEEDED`
+    /// for a capacity refusal must not see it misreported as a `LOGICAL_ERROR`. Refuse here, where
+    /// nothing is durable yet.
     const auto checkLineBytes = [&](uint64_t bytes, std::string_view what)
     {
         if (!fitsLineCap(bytes, line_cap))
-            throw Exception(ErrorCodes::LOGICAL_ERROR,
+            throw Exception(ErrorCodes::LIMIT_EXCEEDED,
                 "CAS ref catalog: the {} line encodes to {} bytes, over the {}-byte line cap; a longer "
                 "line cannot be read back, so the catalog is refused before it is written",
                 what, bytes, line_cap);
@@ -99,6 +107,9 @@ String encodeRefCatalog(const RefCatalog & catalog)
 
     for (const CatalogEntry & e : catalog.entries)
     {
+        if (e.ns.string().empty())
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "CAS ref catalog: an entry's namespace must not be empty");
         if (e.ns.string().size() > kMaxNamespaceBytes)
             throw Exception(ErrorCodes::LOGICAL_ERROR,
                 "CAS ref catalog: namespace '{}' is {} bytes, over the {}-byte admission bound",
@@ -193,6 +204,13 @@ RefCatalog decodeRefCatalog(std::string_view data)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref catalog: entry '{}' missing st", ns_str);
         const NsState state = nsStateFromWord(*st_word);   /// throws CORRUPTED_DATA on an unknown word
 
+        /// A missing "ns" key reads as the same empty string a present-but-empty one would, and both
+        /// are refused identically here -- an empty namespace would sort first (every non-empty
+        /// namespace compares strictly greater than ""), passing the canonical-order check below, and
+        /// then wedge every later catalog-driven pass that tries to build a ref/namespace-file key
+        /// from it (`Layout::checkNamespace` refuses an empty namespace).
+        if (ns_str.empty())
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref catalog: an entry's namespace must not be empty");
         if (ns_str.size() > kMaxNamespaceBytes)
             throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "CAS ref catalog: namespace '{}' is {} bytes, over the {}-byte admission bound",
@@ -290,7 +308,10 @@ void checkFoldSealReservation(uint64_t entry_count, const RootNamespace & ns)
 {
     const uint64_t cap = foldSealCaps().object_cap;
     const uint64_t fixed = foldSealFixedBytes();
-    const uint64_t reservation = entry_count * worstCaseEntryFoldReservationBytes();
+    /// Saturating, like `fitsObjectCap`'s own addition one step later: an unsaturated product can
+    /// wrap to a remainder far smaller than the true reservation, which would answer "fits" for an
+    /// `entry_count` that plainly does not.
+    const uint64_t reservation = mulByteBudget(entry_count, worstCaseEntryFoldReservationBytes());
     if (!fitsObjectCap(fixed, reservation, cap))
         throw Exception(ErrorCodes::LIMIT_EXCEEDED,
             "CAS ref catalog: admitting '{}' would need a fold seal reserving {} bytes for {} entries "

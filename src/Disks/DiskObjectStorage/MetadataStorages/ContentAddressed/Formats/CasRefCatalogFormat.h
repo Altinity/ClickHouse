@@ -37,6 +37,9 @@ enum class NsState : uint8_t
 
 /// The wire word one `NsState` is persisted as. Exported so any other reader of a lifecycle state
 /// renders the SAME three words this codec does, rather than a second, independently drifting copy.
+/// Every value it is ever called with comes from either a live `NsState` (a compile-time-closed
+/// enumeration) or a value `nsStateFromWord` already validated on decode, so an unrecognized value
+/// reaching it is a bug in THIS process, not corruption arriving from a store -- `LOGICAL_ERROR`.
 std::string_view nsStateToWord(NsState s);
 /// Inverse of `nsStateToWord`; throws `CORRUPTED_DATA` for anything but the three registered words.
 NsState nsStateFromWord(std::string_view w);
@@ -90,18 +93,30 @@ struct RefCatalog
 /// Encodes `catalog` as the canonical `cas_ref_catalog` text object: a header line, one "ent" record
 /// per entry in canonical (ns-sorted) order, and a record-count trailer -- the same tagged-record
 /// container `encodeFoldSeal` uses. Enforces the FULL strict grammar on the way out: canonical order
-/// and no duplicate namespace, the `kMaxNamespaceBytes` bound, nonzero incarnation, and the
-/// `creator`/state pairing. This is our own state about to become durable, so a violation is
-/// `LOGICAL_ERROR`, not `CORRUPTED_DATA`. Also enforces the per-line `LIMIT_EXCEEDED` line-cap gate
-/// (mirroring `encodeFoldSeal`'s `checkLineBytes`) -- but deliberately does NOT enforce the
-/// whole-object cap itself: that predicate must name the namespace under admission, which only a
-/// caller of `checkCatalogAdmission` knows.
+/// and no duplicate namespace, a non-empty namespace within the `kMaxNamespaceBytes` bound, nonzero
+/// incarnation, and the `creator`/state pairing. This is our own state about to become durable, so a
+/// violation is `LOGICAL_ERROR`, not `CORRUPTED_DATA`. Also enforces the per-line `LIMIT_EXCEEDED`
+/// line-cap gate (mirroring `encodeFoldSeal`'s `checkLineBytes` exactly, including its error code --
+/// a caller catching `LIMIT_EXCEEDED` as a capacity refusal must not see a `LOGICAL_ERROR` bug report
+/// instead) -- but deliberately does NOT enforce the whole-object cap itself: that predicate must
+/// name the namespace under admission, which only a caller of `checkCatalogAdmission` knows.
+///
+/// These bytes go to and come from the backend DIRECTLY, exactly like `cas_ref_ckpt`: the Pool-side
+/// `CasRefCatalog::read`/`casUpdateImpl` (`Pool/CasRefCatalog.cpp`) bypass `sealObject`/`openObject`,
+/// which are the identity under this class's `CompressionPolicy::Never` and would add nothing. A
+/// policy flip to `Always` therefore breaks this silently -- and is caught, because `storedSuffix`
+/// would stop being empty and the registry test asserting `storedSuffix(FormatId::RefCatalog) == ""`
+/// fails. That assertion is the tripwire for this shortcut, not an incidental check of the key shape.
+/// One consequence of the bypass, stated rather than fixed here (pre-existing for `RefCkpt` too):
+/// `openObject`'s own object-cap enforcement is skipped on the read path, so nothing on either the
+/// plain write path or the read path enforces the 256 MiB object cap outside `checkCatalogAdmission`
+/// -- the cap is load-bearing only through THAT gate, never through the codec or the backend read.
 String encodeRefCatalog(const RefCatalog & catalog);
 
 /// Decodes and validates a `cas_ref_catalog` object, re-checking every grammar rule `encodeRefCatalog`
 /// enforces against bytes that may have come from anywhere: `CORRUPTED_DATA` on a duplicate namespace,
-/// non-canonical order, an over-bound namespace, a zero incarnation, an incomplete or forbidden
-/// creator fence, an unknown state word, or trailing bytes.
+/// non-canonical order, a missing, empty, or over-bound namespace, a zero incarnation, an incomplete or
+/// forbidden creator fence, an unknown state word, or trailing bytes.
 RefCatalog decodeRefCatalog(std::string_view data);
 
 /// PRE-PUT GATE, predicate (1) of INV-3's additive admission: `encoded_bytes <= catalog_object_cap`
@@ -126,7 +141,10 @@ uint64_t worstCaseEntryFoldReservationBytes();
 /// PRE-PUT GATE, predicate (2) of INV-3's additive admission:
 /// `foldSealFixedBytes() + entry_count * worstCaseEntryFoldReservationBytes() <= fold_seal_object_cap`.
 /// Equality is accepted; refuses (`LIMIT_EXCEEDED`, naming `ns`) one entry over. `entry_count` is the
-/// CANDIDATE catalog's entry count -- the count AFTER the admission under consideration.
+/// CANDIDATE catalog's entry count -- the count AFTER the admission under consideration. The
+/// multiplication saturates (`mulByteBudget`, `CasByteBudget.h`) before the addition does, same
+/// discipline, one step earlier: an unreachable-in-practice but unbounded `entry_count` must not wrap
+/// the product into something that reads as "fits".
 void checkFoldSealReservation(uint64_t entry_count, const RootNamespace & ns);
 
 /// Runs BOTH admission predicates against `candidate` -- the catalog state as it would read

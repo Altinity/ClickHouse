@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCatalogFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 #include <fmt/format.h>
+#include <limits>
 
 using namespace DB::Cas;
 
@@ -11,6 +12,7 @@ namespace DB::ErrorCodes
     extern const int CORRUPTED_DATA;
     extern const int LOGICAL_ERROR;
     extern const int LIMIT_EXCEEDED;
+    extern const int NETWORK_ERROR;
 }
 
 namespace
@@ -144,6 +146,29 @@ TEST(CasRefCatalogFormat, EncodeRejectsNameOverByteBound)
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&] { encodeRefCatalog(c); });
 }
 
+TEST(CasRefCatalogFormat, EncodeRejectsEmptyNamespace)
+{
+    RefCatalog c;
+    c.entries.push_back(liveEntry("", 1));
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&] { encodeRefCatalog(c); });
+}
+
+/// A namespace + creator server_root_id that both max out at their respective byte bounds (512 +
+/// 255), escaped worst-case, land one "ent" line over the 4 KiB line cap (~4.7 KiB) -- reachable
+/// because neither this codec nor `validateServerRootId` restricts the charset, only the length.
+/// The refusal must be `LIMIT_EXCEEDED` (a capacity refusal), not `LOGICAL_ERROR` (a bug report) --
+/// `encodeFoldSeal`'s own `checkLineBytes` raises `LIMIT_EXCEEDED` for the identical shape of gate.
+TEST(CasRefCatalogFormat, EncodeLineOverCapRaisesLimitExceeded)
+{
+    RefCatalog c;
+    c.entries.push_back(CatalogEntry{
+        .ns = RootNamespace{String(kMaxNamespaceBytes, '\x01')},
+        .state = NsState::Creating,
+        .incarnation = UInt128(1),
+        .creator = CreatorFence{.server_root_id = String(255, '\x01'), .writer_epoch = 1, .fence_generation = 1}});
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LIMIT_EXCEEDED, [&] { encodeRefCatalog(c); });
+}
+
 /// ---------- strict rejections: decode side (CORRUPTED_DATA -- bytes may have come from anywhere) ----------
 
 TEST(CasRefCatalogFormat, DecodeRejectsDuplicateNamespace)
@@ -192,6 +217,52 @@ TEST(CasRefCatalogFormat, DecodeRejectsUnknownState)
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCatalog(bad); });
 }
 
+TEST(CasRefCatalogFormat, DecodeRejectsEmptyNamespace)
+{
+    const String bad = rawCatalog({rawEntLine("", "live", u128ToHex(UInt128(1)))});
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCatalog(bad); });
+}
+
+TEST(CasRefCatalogFormat, DecodeRejectsMissingNamespaceKey)
+{
+    /// No "ns" key at all -- must be refused exactly like an explicit empty one, not read as "".
+    const String bad = rawCatalog({R"({"k":"ent","st":"live","inc":")" + u128ToHex(UInt128(1)) + "\"}"});
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCatalog(bad); });
+}
+
+/// `nsStateToWord`'s only reachable input is either a live `NsState` or one `nsStateFromWord` already
+/// validated on decode, so an unrecognized value is a bug in THIS process -- `LOGICAL_ERROR`, matching
+/// this file's own stated taxonomy for the encode-side helper it (indirectly, via `creatorPairingOk`'s
+/// error message) serves.
+TEST(CasRefCatalogFormat, NsStateToWordRaisesLogicalErrorOnImpossibleValue)
+{
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR,
+        [&] { nsStateToWord(static_cast<NsState>(99)); });
+}
+
+/// ---------- registry row / raw-storage tripwire ----------
+
+/// The registry row is part of the contract, mirroring `gtest_cas_ref_ckpt.cpp`'s
+/// `RegistryRowIsControlStrictWithTightCaps`: Control/Strict decides how the decoder treats unknown
+/// keys, and the caps are the first thing that fires if a foreign object ever lands at the key.
+TEST(CasRefCatalogFormat, RegistryRowIsControlStrictWithRawStorage)
+{
+    const FormatTraits & traits = traitsFor(FormatId::RefCatalog);
+    EXPECT_EQ(traits.type, "cas_ref_catalog");
+    EXPECT_EQ(traits.family, TextFamily::Control);
+    EXPECT_EQ(traits.strictness, KeyStrictness::Strict);
+    EXPECT_EQ(traits.object_cap, 256u * 1024u * 1024u);
+    EXPECT_EQ(traits.line_cap, 4u * 1024u);
+    EXPECT_EQ(traitsForType("cas_ref_catalog"), &traits);
+    /// Raw, so the key has no suffix: `Pool/CasRefCatalog.cpp` hands bytes to/from the backend
+    /// directly, bypassing `sealObject`/`openObject` because both are the identity under
+    /// `CompressionPolicy::Never`. This line is the TRIPWIRE for that shortcut -- a policy flip to
+    /// `Always` would silently write uncompressed bodies under a `.zst` key, which this assertion
+    /// catches first (see `CasRefCatalogFormat.h`'s comment on `encodeRefCatalog`).
+    EXPECT_EQ(storedSuffix(FormatId::RefCatalog), "");
+    EXPECT_EQ(traits.compression, CompressionPolicy::Never);
+}
+
 /// ---------- capacity admission: per-predicate boundary tests [codex r2/r3 finding 9] ----------
 
 TEST(CasRefCatalogAdmission, Predicate1AcceptsEqualityRefusesCapPlusOne)
@@ -235,6 +306,20 @@ TEST(CasRefCatalogAdmission, Predicate2AcceptsEqualityRefusesOneEntryOver)
         EXPECT_NE(e.message().find("predicate 2"), String::npos) << e.message();
         EXPECT_NE(e.message().find(ns.string()), String::npos) << e.message();
     }
+}
+
+/// `entry_count * worstCaseEntryFoldReservationBytes()` must saturate, not wrap: choosing
+/// `entry_count` as the SMALLEST value whose true (unbounded) product with `reservation` crosses
+/// 2^64, an unsaturated `uint64_t` multiplication wraps to a remainder SMALLER than `reservation`
+/// itself (a few KiB) -- which reads as trivially "fits" a 256 MiB cap even though the real
+/// reservation this many entries demands is astronomically larger. A saturating multiply refuses it
+/// regardless of the wraparound arithmetic underneath.
+TEST(CasRefCatalogAdmission, Predicate2SaturatesEntryCountReservationInsteadOfWrapping)
+{
+    const uint64_t reservation = worstCaseEntryFoldReservationBytes();
+    const uint64_t entry_count = std::numeric_limits<uint64_t>::max() / reservation + 1;
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LIMIT_EXCEEDED,
+        [&] { checkFoldSealReservation(entry_count, RootNamespace{"huge"}); });
 }
 
 TEST(CasRefCatalogAdmission, CombinedAdmissionPropagatesCandidateEntryCount)
@@ -370,25 +455,101 @@ TEST(CasRefCatalog, CasUpdateRetriesOnConflictAgainstFreshState)
     EXPECT_EQ(snap.catalog, result);
 }
 
-TEST(CasRefCatalog, CasUpdateAdmittingAcceptsAnOrdinaryCreation)
+/// A re-read that finds the catalog genuinely ABSENT after it was previously observed present is a
+/// real concurrent delete, not a bootstrap -- `casUpdate` must refuse rather than silently create a
+/// fresh catalog containing only this one mutation's entry (which would drop every other namespace).
+/// Reproduced with a REAL delete (no fault injection needed): `mutate`'s first invocation deletes the
+/// seeded object using the token `casUpdate`'s own initial read observed, so the loop's own `casPut`
+/// against that now-stale token gets a genuine `Conflict`, and the follow-up re-read genuinely finds
+/// the key absent.
+TEST(CasRefCatalog, CasUpdateThrowsOnVanishMidRetryInsteadOfReplacingTheCatalog)
 {
     InMemoryBackend backend;
     Layout layout("p");
 
-    const RefCatalog created = CasRefCatalog::casUpdateAdmitting(backend, layout, RootNamespace{"a"},
-        [](const RefCatalog & cur)
+    CasRefCatalog::casUpdate(backend, layout, [](const RefCatalog &)
+    {
+        RefCatalog next;
+        next.entries.push_back(liveEntry("a", 1));
+        return next;
+    });
+    const CasRefCatalog::Snapshot seeded = CasRefCatalog::read(backend, layout);
+    ASSERT_TRUE(seeded.token.has_value());
+
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&]
+    {
+        CasRefCatalog::casUpdate(backend, layout, [&](const RefCatalog & cur)
         {
+            backend.deleteExact(layout.refCatalogKey(), *seeded.token);
             RefCatalog next = cur;
-            next.entries.push_back(CatalogEntry{.ns = RootNamespace{"a"}, .state = NsState::Creating,
-                .incarnation = UInt128(1),
-                .creator = CreatorFence{.server_root_id = "srv", .writer_epoch = 1, .fence_generation = 1}});
+            next.entries.push_back(liveEntry("b", 2));
             return next;
         });
+    });
+
+    /// Nothing was written by the failed attempt: the object is exactly as the delete left it
+    /// (absent), never a fresh single-entry catalog.
+    EXPECT_FALSE(CasRefCatalog::read(backend, layout).token.has_value());
+}
+
+/// The retry loop is bounded (the same live-lock brake `publishCkpt`/`allocateWriterEpoch` use on
+/// their own contended token-CAS singletons) and ends in the typed retryable error, not an infinite
+/// spin. `mutate` re-arms the one-shot conflict injection on every call, so every attempt fails.
+TEST(CasRefCatalog, CasUpdateGivesUpAfterBoundedAttemptsWithRetryLaterError)
+{
+    InMemoryBackend backend;
+    Layout layout("p");
+
+    int mutate_calls = 0;
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
+    {
+        CasRefCatalog::casUpdate(backend, layout, [&](const RefCatalog & cur)
+        {
+            ++mutate_calls;
+            backend.failNextCasPut(layout.refCatalogKey());
+            RefCatalog next = cur;
+            return next;
+        });
+    });
+    EXPECT_GT(mutate_calls, 1);   /// genuinely retried, not a single-shot failure
+}
+
+TEST(CasRefCatalog, CasAdmitEntryAcceptsAnOrdinaryCreation)
+{
+    InMemoryBackend backend;
+    Layout layout("p");
+
+    const RefCatalog created = CasRefCatalog::casAdmitEntry(backend, layout,
+        CatalogEntry{.ns = RootNamespace{"a"}, .state = NsState::Creating, .incarnation = UInt128(1),
+            .creator = CreatorFence{.server_root_id = "srv", .writer_epoch = 1, .fence_generation = 1}});
     ASSERT_EQ(created.entries.size(), 1u);
     EXPECT_EQ(created.entries[0].state, NsState::Creating);
 }
 
-TEST(CasRefCatalog, CasUpdateAdmittingRefusesOverCapacity)
+TEST(CasRefCatalog, CasAdmitEntryInsertsAtCanonicalPosition)
+{
+    InMemoryBackend backend;
+    Layout layout("p");
+
+    CasRefCatalog::casAdmitEntry(backend, layout, liveEntry("b", 1));
+    const RefCatalog after = CasRefCatalog::casAdmitEntry(backend, layout, liveEntry("a", 2));
+    ASSERT_EQ(after.entries.size(), 2u);
+    EXPECT_EQ(after.entries[0].ns.string(), "a");   /// inserted BEFORE "b", not appended
+    EXPECT_EQ(after.entries[1].ns.string(), "b");
+}
+
+TEST(CasRefCatalog, CasAdmitEntryRejectsADuplicateNamespace)
+{
+    InMemoryBackend backend;
+    Layout layout("p");
+    CasRefCatalog::casAdmitEntry(backend, layout, liveEntry("a", 1));
+    /// Caught by `encodeRefCatalog`'s own canonical-order/no-duplicate grammar check, inside
+    /// `checkCatalogAdmission` -- no separate duplicate check needed here.
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR,
+        [&] { CasRefCatalog::casAdmitEntry(backend, layout, liveEntry("a", 2)); });
+}
+
+TEST(CasRefCatalog, CasAdmitEntryRefusesOverCapacity)
 {
     InMemoryBackend backend;
     Layout layout("p");
@@ -409,12 +570,7 @@ TEST(CasRefCatalog, CasUpdateAdmittingRefusesOverCapacity)
     /// so the backend object is untouched.
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LIMIT_EXCEEDED, [&]
     {
-        CasRefCatalog::casUpdateAdmitting(backend, layout, RootNamespace{"zzz"}, [](const RefCatalog & cur)
-        {
-            RefCatalog next = cur;
-            next.entries.push_back(liveEntry("zzz", 999999999));
-            return next;
-        });
+        CasRefCatalog::casAdmitEntry(backend, layout, liveEntry("zzz", 999999999));
     });
 
     const CasRefCatalog::Snapshot snap = CasRefCatalog::read(backend, layout);
