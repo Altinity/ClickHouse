@@ -1798,6 +1798,28 @@ model family, each with its runner output pasted.
 `CaGcShardIncarnationCore`, `CaB140DangleMerge` (4 `m_*.cfg` configs): each gets a runner or a
 RECORDED retirement decision. Commit alone.
 
+**Task 10f — the empty-set blind spot, and the unmodelled destructive gate.** Two findings from
+2026-07-30, both verified by inspection; this sub-task is worth more than the rest of Task 10.
+
+1. **The destructive gate is not modelled at all.** `Gc::fold` decides destruction on
+   `frontier_complete = universe_authoritative && frontier_proven == frontier_namespaces`. No model
+   encodes that comparison. The word "universe" appears once in `CaGcRootLocalPartManifestCore.tla`, in a
+   comment about the fence universe for `coordFence`; "proven" appears only in comments about a watermark
+   proving a build dead. `CaRefCatalogCore.tla` — the model of the object that becomes the universe — does
+   not mention the gate. Model it: the gate that authorises irreversible deletion is the last thing in this
+   design that should rest on code review alone.
+2. **And no config in this tree can reach an empty entity set, so no model can catch a vacuous-empty
+   defect.** Verified across every `.cfg`: zero of them make `Namespaces`, `Blobs`, `Builds`, `Leaders`,
+   `Shards`, `Tables`, `Roots`, `ManifestInstances` or `Entries` empty. The only empty sets are auxiliary
+   (`TreeHashes`, `UniqueToBuildTree`). Since `CONSTANTS` are fixed per config, the empty case is
+   unreachable BY CONSTRUCTION — an under-approximation, which is the defect direction, not the safe one.
+   Register finding R11 (`{#r11-empty-universe-vacuous}`) is that blind spot's first known member, and it
+   was found by reading code, not by the models that exist to find it.
+
+   Add an empty-set config to each model where an empty entity set is reachable in production, and where
+   it is NOT reachable, say why in the model rather than leaving the absence to look like coverage. Expect
+   this to turn up more than one red; each is a finding, not a config to adjust.
+
 **Task 10e — the lane battery's two witness debts** (carried from BACKLOG
 `{#lane-witness-names-more-than-it-proves}`, which had no executing task until now). Two fixes in
 `docs/superpowers/models/`: (1) `CaRefLaneCore_RESULTS.md` calls `saw_retry_created` a
