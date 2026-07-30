@@ -1378,9 +1378,23 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// targets, so the round pays this GET once.
     const CasRefCatalog::Snapshot catalog_snapshot = CasRefCatalog::read(backend, layout);
     std::map<String, UInt128> live_incarnation;
+    /// Final review F1: a `Creating` life IS named by the catalog -- `live_incarnation` excludes it
+    /// only because it is not yet WALKABLE (spec §3, no publication can exist), not because the
+    /// namespace is unaccounted. `completeCreation` publishes `_ckpt` (step 2) strictly BEFORE the
+    /// `Creating -> Live` CAS (step 3), so every ordinary namespace creation has a real window --
+    /// crash-stalled or merely mid-flight -- where a `Creating` entry's own `_ckpt` is durable and
+    /// listed while the entry itself is absent from `live_incarnation`. R10's un-cataloged anomaly
+    /// below must tell that apart from genuine "nothing in the catalog names this at all" debris, or
+    /// an ordinary or stalled creation suppresses the whole round's reclamation until someone
+    /// recreates the exact name and drives `reconcileStaleCreator` -- unbounded in the stalled case.
+    std::map<String, UInt128> creating_incarnation;
     for (const CatalogEntry & entry : catalog_snapshot.catalog.entries)
+    {
         if (entry.state != NsState::Creating)
             live_incarnation.emplace(entry.ns.string(), entry.incarnation);
+        else
+            creating_incarnation.emplace(entry.ns.string(), entry.incarnation);
+    }
     /// Carried on the result (review C3) so every later consumer this round -- `cleanupRefObjects`,
     /// `runNamespaceCleanupPasses` -- looks a namespace's life up here instead of re-reading the catalog
     /// independently and possibly disagreeing with the walk below about which incarnation is live.
@@ -1441,15 +1455,26 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             live_ref_object_keys.push_back(key);
             continue;
         }
-        /// I1 (review): dropped for one of two reasons, and only one of them is silent by design.
+        /// I1 (review): dropped for one of THREE reasons now, and only one of them is silent by design.
         /// `it != end()` (the catalog knows this namespace, just under a DIFFERENT incarnation) is dead-
         /// incarnation debris -- the ordinary, expected shape R10 exists to filter, and the namespace's
-        /// CURRENT incarnation's own keys (if any) are covered separately in this same pass. `it == end()`
-        /// (the catalog names this namespace AT ALL) has no such cover: nothing else in this round
-        /// accounts for it, so dropping it silently is exactly the "un-cataloged namespace with ref
-        /// objects reads as harmless" gap C1 traced. Recorded as an anomaly for the same accepted-cost
-        /// reason as the walk-loop's C1 fix: an ordinary removal (Task 5 deletes the catalog entry LAST)
-        /// looks identical to damage until that task's removal-evidence check lands.
+        /// CURRENT incarnation's own keys (if any) are covered separately in this same pass.
+        /// `creating_it != end() && creating_it->second == id->incarnation` (final review F1) is THIS
+        /// incarnation's OWN key, published while the catalog still names it `Creating` -- an ordinary
+        /// or stalled step-2/step-3 window, not damage, and also silent by design. Anything else (the
+        /// catalog names this namespace at NEITHER a Live/Removing nor a matching-incarnation Creating
+        /// entry) has no cover at all: nothing else in this round accounts for it, so dropping it
+        /// silently is exactly the "un-cataloged namespace with ref objects reads as harmless" gap C1
+        /// traced. Recorded as an anomaly for the same accepted-cost reason as the walk-loop's C1 fix:
+        /// an ordinary removal (Task 5 deletes the catalog entry LAST) looks identical to damage until
+        /// that task's removal-evidence check lands.
+        const auto creating_it = creating_incarnation.find(id->ns.string());
+        const bool is_this_creations_own_key = creating_it != creating_incarnation.end()
+            && creating_it->second == id->incarnation;
+        if (is_this_creations_own_key)
+        {
+            continue;
+        }
         if (it == live_incarnation.end() && uncataloged_ns_already_recorded.insert(id->ns.string()).second)
         {
             const String reason = fmt::format(

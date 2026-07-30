@@ -199,6 +199,71 @@ TEST(CasGcShardIncarnation, UncatalogedNamespaceWithRealObjectsLeavesTheRoundInc
            "dropped as harmless debris";
 }
 
+/// Final review F1: a namespace mid-birth (`Creating` + a published genesis `_ckpt`) must NOT raise
+/// the un-cataloged anomaly. `completeCreation` publishes `_ckpt` (step 2) strictly BEFORE the
+/// `Creating -> Live` CAS (step 3), so this is not a corner case -- it is a real window every ordinary
+/// creation passes through, and stalls in permanently if the creator crashes there. Before this fix,
+/// the un-cataloged anomaly fired on this shape (`_ckpt`'s key parses to the entry's name and
+/// incarnation, `live_incarnation` excludes `Creating`, so `it == end()`), suppressing the WHOLE
+/// pool's reclamation until someone recreated that exact name and drove `reconcileStaleCreator` --
+/// unbounded in the stalled case, and certain (if brief) on every ordinary birth otherwise.
+///
+/// Pinned in BOTH directions in one test, so a fix that broadens the exemption too far is caught
+/// alongside one that does not broaden it far enough: `creating_ns` (own `_ckpt`, `Creating`) must
+/// raise NOTHING; `unrelated_gone_ns` (a `_ckpt`-shaped key with no catalog entry of ANY state) must
+/// still raise the un-cataloged anomaly exactly as before.
+TEST(CasGcShardIncarnation, StalledCreationOwnCheckpointRaisesNoAnomalyButGenuineAbsenceStillDoes)
+{
+    std::shared_ptr<InMemoryBackend> backend;
+    auto store = makePoolWithShards(backend, /*gc_shards=*/1);
+    Gc gc(store, hexToU128("0000000000000000000000000000000a"));
+    const Layout & layout = store->layout();
+    const RootNamespace creating_ns{"srv1/tblStalledBirth"};
+    const RootNamespace unrelated_gone_ns{"srv1/tblGenuinelyGone"};
+
+    /// Step 1 of createNamespace: insert the Creating entry with a live creator fence.
+    CasRefCatalog::casAdmitEntry(*backend, layout, CatalogEntry{.ns = creating_ns, .state = NsState::Creating,
+        .incarnation = UInt128(33),
+        .creator = CreatorFence{.server_root_id = "test", .writer_epoch = 1, .fence_generation = 1}});
+    /// Step 2, without step 3: publish the genesis `_ckpt` directly, at the SAME incarnation the
+    /// Creating entry names -- exactly what `completeCreation` durably leaves behind if the creator
+    /// crashes between its own steps 2 and 3.
+    const NamespaceLifeId creating_life = NamespaceLifeId::fromCatalogEntry(creating_ns, UInt128(33));
+    ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(creating_life),
+        encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{1}, .checkpoint_snapshot_id = std::nullopt,
+                              .last_epoch_seal = std::nullopt})).outcome, PutOutcome::Done);
+
+    /// The negative control: a `_ckpt`-shaped key under a namespace the catalog names AT NO STATE AT
+    /// ALL -- genuine debris, not a birth window. Written at an arbitrary incarnation with no
+    /// corresponding catalog entry of any kind.
+    const NamespaceLifeId gone_life = NamespaceLifeId::fromCatalogEntry(unrelated_gone_ns, UInt128(44));
+    ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(gone_life),
+        encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{1}, .checkpoint_snapshot_id = std::nullopt,
+                              .last_epoch_seal = std::nullopt})).outcome, PutOutcome::Done);
+
+    /// A `_ckpt`-only round has NO listed `_log` content anywhere, so `changed_shards == 0` and the
+    /// round defers folding entirely (nothing looks different) -- never reaching R10 at all, which
+    /// would make this test vacuous regardless of the fix. One unrelated, ordinary namespace with a
+    /// real ref-log entry forces a full fold every time, exactly as ordinary pool traffic would in
+    /// production (this scenario is about a stalled birth ALONGSIDE a live pool, not an idle one).
+    appendRefLogSeed(*backend, layout, RootNamespace{"srv1/tblOrdinaryTraffic"}, {});
+
+    const RoundReport report = gc.runRegularRound({}, /*allow_steal=*/true, UniversePolicy::AuthoritativeForTest);
+    bool saw_stalled_birth_anomaly = false;
+    bool saw_genuinely_gone_anomaly = false;
+    for (const RoundAnomaly & a : report.anomalies)
+    {
+        if (a.ns.string() == creating_ns.string())
+            saw_stalled_birth_anomaly = true;
+        if (a.ns.string() == unrelated_gone_ns.string())
+            saw_genuinely_gone_anomaly = true;
+    }
+    EXPECT_FALSE(saw_stalled_birth_anomaly)
+        << "a namespace mid-birth's own genesis _ckpt must not read as un-cataloged debris";
+    EXPECT_TRUE(saw_genuinely_gone_anomaly)
+        << "a namespace the catalog names at no state at all must still be refused";
+}
+
 /// Task 4: listNamespaces is LIST-based; no registry involved.
 /// Publishing into ns A makes it appear in listNamespaces(""); ns B absent.
 TEST(CasGcShardIncarnation, ListNamespacesFromRefsNotRegistry)
