@@ -77,6 +77,44 @@
 > the 32-config accounting with every green's red preceding it; and `_sab_nowedge`'s only-route
 > argument. The gate's STRUCTURE is not what failed — the machine's describability is.
 
+> ## ✅ BLOCKER DISSOLVED — verified path by path 2026-07-30 {#blocker-dissolved}
+>
+> The four paths this plan stopped on were re-checked against the six-state contract, and none is a
+> gap. Verdicts, with the transition that now represents each:
+> - **(a) `classifyRefLogOccupant` rethrowing non-corruption exceptions** — ordinary `Wedged → Wedged`
+>   with the attempt RETAINED, self-loop by construction (no `lane_state` write on the path). It is
+>   also durability-safe for a reason the old model never had: `classify` runs only on `Occupied`, and
+>   `Occupied` with equal bytes returns `Ours` from the plain string compare BEFORE the throwing
+>   decode — so a throw implies foreign bytes at a write-once key, i.e. our attempt provably never
+>   landed. Nothing durable can be lost (`CasRefLedger.cpp:173-174`, call site `:1782`).
+> - **(b) `Created` (DURABLE) then a recheck reporting `FenceMoved`/`Superseded`** — the one that
+>   would have LOST a durable transaction. It is now `Wedged → NeedsRecovery`, and the
+>   durable-and-authority-moved case is the **FIRST-tested branch**, ahead of the generic inert arm,
+>   precisely so the durable fact is not dropped (`:1829-1834` vs `:1835-1838`; attempt cleared and
+>   state set at `:1646-1648`; model arm `CaRefLaneCore.tla:263-266`). The `WedgeReplaced` sub-case
+>   alone remains a no-transition — an EXPLICIT exclusion (spec bullet 7) that is also structurally
+>   unreachable, since `append_attempt` can only be replaced via `Ready → Writing`, which requires the
+>   wedge already resolved.
+> - **(c) the post-durable install catch** — path exists, handling replaced: `Wedged → NeedsRecovery`
+>   then rethrow. Floor-raise and poisoning are GONE (no `RefApplyState`, no durable floor) and the
+>   wedge is cleared rather than kept; modelled as `KnownDurableInstallFailure`
+>   (`CasRefLedger.cpp:1934-1937`, twin `:2938-2942`, model `:300-313`).
+> - **(d) pre-I/O candidate preparation throwing** — ordinary `Wedged → Wedged`, and now WIDER than
+>   the old row 3 (the copy and `emplace` are under the lock, ahead of decode); no mutation of `rt` on
+>   any of the four throwing statements, since decode and apply target the PRIVATE candidate
+>   (`:1702-1704`, `:1739-1741`, rationale `:1729-1734`).
+>
+> Cross-checks: **`Ready`-only certification HOLDS** — one state-agnostic comparison at
+> `CasRefLedger.cpp:443`, evaluated BEFORE row equality, so no non-`Ready` state reaches `Yes` or even
+> `No`; exercised for `Wedged`/`NeedsRecovery` in `gtest_cas_confirm_exact_ref.cpp:560`/`:581`, with
+> `SabotageCertifyBlocked` as the RED control, and snapshot publication carrying the same gate
+> (`:3358`). **The retryability split holds with one exception**, filed separately.
+>
+> STRONGEST SINGLE PIECE OF EVIDENCE that the loss cannot recur: `NeedsRecovery`'s only exit is a
+> COMPLETE recovery install, and that is asserted rather than assumed — `Recover` sets
+> `cache_id' = durable_id` and `SabotageIncompleteRecovery` turns `ReadyCaughtUp` RED
+> (`CaRefLaneCore.tla:315-321`).
+>
 > ## Restatement completed 2026-07-30 {#restatement-completed}
 >
 > The replacement was built from semantic obligations first and then implemented:
