@@ -158,6 +158,16 @@ public:
                 "ca-fsck: {} GC source-edge run(s) failed their whole-file seal checksum — the deletion-"
                 "deriving consumers fail closed on these, so GC cannot advance past them (run keys are "
                 "listed as `corrupted-run` rows under --detail)", report.corrupted_runs);
+        /// Behind the format bump a key that names no namespace life is corruption, and it is corruption
+        /// nothing clears on its own: the namespace enumeration now reports it instead of aborting, which
+        /// is what makes an exit code the only signal automation can act on.
+        if (report.lifeless_keys > 0)
+            throw Exception(
+                ErrorCodes::BAD_ARGUMENTS,
+                "ca-fsck: {} key(s) under this pool name no namespace LIFE — the un-incarnated key shape, "
+                "which is corruption rather than a compatibility case; `ca-decommission` refuses "
+                "fail-close while any of them exists (the keys are listed as `lifeless-key` rows under "
+                "--detail)", report.lifeless_keys);
     }
 };
 
