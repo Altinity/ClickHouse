@@ -186,11 +186,11 @@ TEST(CasRefIntake, GroupRefKeys)
     const RootNamespace ns{"db/t"};
 
     std::vector<String> keys{
-        layout.refSnapshotKey(RefNamespaceId::stageATransition(ns), rid(1, 4)),
-        layout.refLogKey(RefNamespaceId::stageATransition(ns), rid(1, 5)),
-        layout.refLogKey(RefNamespaceId::stageATransition(ns), rid(1, 3)),
-        layout.refCleanupMarkerKey(RefNamespaceId::stageATransition(ns), rid(1, 2)),
-        layout.refCkptKey(RefNamespaceId::stageATransition(ns)),        /// the checkpoint (spec INV-4): a ref object with no txn id
+        layout.refSnapshotKey(NamespaceLifeId::stageATransition(ns), rid(1, 4)),
+        layout.refLogKey(NamespaceLifeId::stageATransition(ns), rid(1, 5)),
+        layout.refLogKey(NamespaceLifeId::stageATransition(ns), rid(1, 3)),
+        layout.refCleanupMarkerKey(NamespaceLifeId::stageATransition(ns), rid(1, 2)),
+        layout.refCkptKey(NamespaceLifeId::stageATransition(ns)),        /// the checkpoint (spec INV-4): a ref object with no txn id
         "p/cas/manifests/db/t/foo",   /// outside the ref prefix -> ignored
     };
     const auto grouped = groupRefKeys(layout, keys);
@@ -205,7 +205,7 @@ TEST(CasRefIntake, GroupRefKeys)
     EXPECT_TRUE(t.has_ckpt);
 
     /// And a table with no checkpoint says so, rather than defaulting to the same answer.
-    const auto no_ckpt = groupRefKeys(layout, {layout.refLogKey(RefNamespaceId::stageATransition(ns), rid(1, 1))});
+    const auto no_ckpt = groupRefKeys(layout, {layout.refLogKey(NamespaceLifeId::stageATransition(ns), rid(1, 1))});
     ASSERT_EQ(no_ckpt.size(), 1u);
     EXPECT_FALSE(no_ckpt.at("db/t").has_ckpt);
 
@@ -271,9 +271,9 @@ TEST(CasRefIntake, AdversarialNamespaceNamedLikeKindDirectory)
     {
         const RootNamespace ns{weird};
         const std::vector<String> keys{
-            layout.refLogKey(RefNamespaceId::stageATransition(ns), rid(1, 1)),
-            layout.refSnapshotKey(RefNamespaceId::stageATransition(ns), rid(1, 2)),
-            layout.refCleanupMarkerKey(RefNamespaceId::stageATransition(ns), rid(1, 3))};
+            layout.refLogKey(NamespaceLifeId::stageATransition(ns), rid(1, 1)),
+            layout.refSnapshotKey(NamespaceLifeId::stageATransition(ns), rid(1, 2)),
+            layout.refCleanupMarkerKey(NamespaceLifeId::stageATransition(ns), rid(1, 3))};
         const auto grouped = groupRefKeys(layout, keys);
         ASSERT_EQ(grouped.size(), 1u) << "namespace '" << weird << "'";
         ASSERT_TRUE(grouped.contains(weird)) << "namespace '" << weird << "'";
@@ -289,9 +289,9 @@ TEST(CasRefIntake, AdversarialNamespaceNamedLikeKindDirectory)
     const RootNamespace outer{"db/t"};
     const RootNamespace nested{"db/t/_log"};
     const std::vector<String> keys{
-        layout.refLogKey(RefNamespaceId::stageATransition(outer), rid(7, 1)),
-        layout.refSnapshotKey(RefNamespaceId::stageATransition(outer), rid(7, 2)),
-        layout.refLogKey(RefNamespaceId::stageATransition(nested), rid(9, 1))};
+        layout.refLogKey(NamespaceLifeId::stageATransition(outer), rid(7, 1)),
+        layout.refSnapshotKey(NamespaceLifeId::stageATransition(outer), rid(7, 2)),
+        layout.refLogKey(NamespaceLifeId::stageATransition(nested), rid(9, 1))};
     const auto grouped = groupRefKeys(layout, keys);
     ASSERT_EQ(grouped.size(), 2u);
     EXPECT_EQ(grouped.at("db/t").logs, (std::vector<RefTxnId>{rid(7, 1)}));

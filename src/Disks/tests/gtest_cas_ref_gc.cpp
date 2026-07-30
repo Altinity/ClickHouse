@@ -291,10 +291,10 @@ TEST(CasRefGc, RefObjectCleanupHonorsAllThreeConditions)
     writeRefSnapshotRaw(*backend, layout, old_snap);
     writeRefSnapshotRaw(*backend, layout, new_snap);
 
-    const String log_v1_key = layout.refLogKey(RefNamespaceId::stageATransition(ns), RefTxnId{1, v1});
-    const String log_v2_key = layout.refLogKey(RefNamespaceId::stageATransition(ns), RefTxnId{1, v2});
-    const String old_snap_key = layout.refSnapshotKey(RefNamespaceId::stageATransition(ns), RefTxnId{1, v1});
-    const String new_snap_key = layout.refSnapshotKey(RefNamespaceId::stageATransition(ns), RefTxnId{1, v2});
+    const String log_v1_key = layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, v1});
+    const String log_v2_key = layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, v2});
+    const String old_snap_key = layout.refSnapshotKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, v1});
+    const String new_snap_key = layout.refSnapshotKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, v2});
     ASSERT_TRUE(backend->head(log_v1_key).exists);
     ASSERT_TRUE(backend->head(log_v2_key).exists);
     ASSERT_TRUE(backend->head(old_snap_key).exists);
@@ -393,9 +393,9 @@ TEST(CasRefGc, RefSnaplogLifecycleE2E)
 
     /// Snapshot lifecycle: the covering snapshot is retained; the covered logs (folded + snapshot-covered)
     /// are cleaned; the replaced manifest's blob is reclaimed while the live blobs survive.
-    EXPECT_TRUE(backend->head(layout.refSnapshotKey(RefNamespaceId::stageATransition(ns_a), RefTxnId{1, va2})).exists)
+    EXPECT_TRUE(backend->head(layout.refSnapshotKey(NamespaceLifeId::stageATransition(ns_a), RefTxnId{1, va2})).exists)
         << "covering snapshot retained";
-    EXPECT_FALSE(backend->head(layout.refLogKey(RefNamespaceId::stageATransition(ns_a), RefTxnId{1, va1})).exists) << "covered log cleaned";
+    EXPECT_FALSE(backend->head(layout.refLogKey(NamespaceLifeId::stageATransition(ns_a), RefTxnId{1, va1})).exists) << "covered log cleaned";
     EXPECT_FALSE(blobPresent(*backend, layout, DB::UInt128(1))) << "replaced blob reclaimed";
     EXPECT_TRUE(blobPresent(*backend, layout, DB::UInt128(2))) << "live blob survives";
     EXPECT_TRUE(blobPresent(*backend, layout, DB::UInt128(3))) << "other table's blob survives";
@@ -448,7 +448,7 @@ TEST(CasRefGc, RemoveNamespaceCompletesAndPublishesMarkerDeterministically)
         runRegularRoundReclaiming(gc);
         store->renewWatermarkOnce();
         /// The marker key is `_cleanup/<remove_txn_id>`; discover it by listing the cleanup subtree.
-        const ListPage page = backend->list(layout.refsNamespacePrefix(RefNamespaceId::stageATransition(ns)) + "_cleanup/", "", 100);
+        const ListPage page = backend->list(layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)) + "_cleanup/", "", 100);
         if (!page.keys.empty())
         {
             marker_key = page.keys.front().key;
@@ -460,7 +460,7 @@ TEST(CasRefGc, RemoveNamespaceCompletesAndPublishesMarkerDeterministically)
     /// Capture the marker + published `Removed` snapshot bytes.
     const auto marker_after_gc1 = backend->get(marker_key);
     ASSERT_TRUE(marker_after_gc1.has_value());
-    ListPage snaps = backend->list(layout.refsNamespacePrefix(RefNamespaceId::stageATransition(ns)) + "_snap/", "", 100);
+    ListPage snaps = backend->list(layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)) + "_snap/", "", 100);
     ASSERT_FALSE(snaps.keys.empty()) << "a Removed snapshot must be published for the removed namespace";
     const String removed_snap_key = snaps.keys.front().key;
     const auto snap_after_gc1 = backend->get(removed_snap_key);
@@ -543,7 +543,7 @@ TEST(CasRefGc, RemovedNamespaceCoveredLogsCleanedByCompletingRound)
     const auto countKind = [&](RefObjectKind want) -> size_t
     {
         size_t n = 0;
-        const ListPage page = backend->list(layout.refsNamespacePrefix(RefNamespaceId::stageATransition(ns)), "", 10000);
+        const ListPage page = backend->list(layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)), "", 10000);
         for (const ListedKey & lk : page.keys)
             if (const auto p = layout.parseRefObjectKey(lk.key); p && p->kind == want)
                 ++n;
@@ -556,7 +556,7 @@ TEST(CasRefGc, RemovedNamespaceCoveredLogsCleanedByCompletingRound)
     /// surfaces the ordering gap -- when the writer DOES publish, `cleanupRefObjects` already sees the
     /// covering snapshot from round one and the gap never bites.
     {
-        const ListPage snaps = backend->list(layout.refsNamespacePrefix(RefNamespaceId::stageATransition(ns)) + "_snap/", "", 10000);
+        const ListPage snaps = backend->list(layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)) + "_snap/", "", 10000);
         for (const ListedKey & lk : snaps.keys)
         {
             const auto h = backend->head(lk.key);
@@ -702,7 +702,7 @@ TEST(CasRefGc, InvalidRefLogBodyHoldsNamespaceNoPartialDelta)
 
     /// A canonical `_log` key (groupRefKeys accepts it) whose body cannot be decoded: the fold GETs it
     /// and `decodeRefLogTxn` throws.
-    const String garbage_key = layout.refLogKey(RefNamespaceId::stageATransition(ns), RefTxnId{1, dropped + 1});
+    const String garbage_key = layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, dropped + 1});
     backend->putIfAbsent(garbage_key, "garbage-not-a-valid-reflog-body");
 
     /// Eight rounds under the hold. Each one catches the hold internally and survives.
@@ -824,7 +824,7 @@ TEST(CasRefGc, StaleLeaderPendingPassAbortsOnCompletionMarker)
 
     /// A successor Completed the item + the writer recreated the namespace: the `_cleanup` marker is
     /// durable, and recreation wrote a successor-epoch (2 > 1) manifest and a verbatim file at a fixed key.
-    backend->putIfAbsent(layout.refCleanupMarkerKey(RefNamespaceId::stageATransition(ns), remove_txn), String{});
+    backend->putIfAbsent(layout.refCleanupMarkerKey(NamespaceLifeId::stageATransition(ns), remove_txn), String{});
     const ManifestRef recreated = ManifestRef{.writer_epoch = 2, .build_sequence = 1, .manifest_ordinal = 1};
     writeManifestRaw(*backend, layout, ns, recreated, {blobEntryFor("a", DB::UInt128(1))});
     const String file_key = layout.namespaceFilesPrefix(ns) + "format_version.txt";
@@ -946,7 +946,7 @@ TEST(CasRefGc, RecreatedNamespaceRetiresCleanupItemAndStopsChurn)
     {
         runRegularRoundReclaiming(gc);
         store->renewWatermarkOnce();
-        const ListPage m = backend->list(layout.refsNamespacePrefix(RefNamespaceId::stageATransition(ns)) + "_cleanup/", "", 10);
+        const ListPage m = backend->list(layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)) + "_cleanup/", "", 10);
         if (!m.keys.empty())
         {
             const auto p = layout.parseRefObjectKey(m.keys.front().key);
@@ -955,7 +955,7 @@ TEST(CasRefGc, RecreatedNamespaceRetiresCleanupItemAndStopsChurn)
         }
     }
     ASSERT_FALSE(remove_txn == RefTxnId{}) << "GC must complete the removal (publish the marker)";
-    const String removed_snap_key = layout.refSnapshotKey(RefNamespaceId::stageATransition(ns), remove_txn);
+    const String removed_snap_key = layout.refSnapshotKey(NamespaceLifeId::stageATransition(ns), remove_txn);
     ASSERT_TRUE(backend->head(removed_snap_key).exists) << "completion published the Removed snapshot";
 
     /// RECREATE: a fresh committed log with an id above the removal, plus a Live snapshot that supersedes
@@ -1017,7 +1017,7 @@ TEST(CasRefGc, CompletedItemRepublishesCrashLostRemovedSnapshotThenRetires)
     {
         runRegularRoundReclaiming(gc);
         store->renewWatermarkOnce();
-        const ListPage m = backend->list(layout.refsNamespacePrefix(RefNamespaceId::stageATransition(ns)) + "_cleanup/", "", 10);
+        const ListPage m = backend->list(layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)) + "_cleanup/", "", 10);
         if (!m.keys.empty())
         {
             const auto p = layout.parseRefObjectKey(m.keys.front().key);
@@ -1026,7 +1026,7 @@ TEST(CasRefGc, CompletedItemRepublishesCrashLostRemovedSnapshotThenRetires)
         }
     }
     ASSERT_FALSE(remove_txn == RefTxnId{});
-    const String removed_snap_key = layout.refSnapshotKey(RefNamespaceId::stageATransition(ns), remove_txn);
+    const String removed_snap_key = layout.refSnapshotKey(NamespaceLifeId::stageATransition(ns), remove_txn);
     ASSERT_TRUE(backend->head(removed_snap_key).exists);
 
     /// Model a crash between the marker PUT and the snapshot PUT: delete the Removed snapshot, keep the
@@ -1096,7 +1096,7 @@ TEST(CasRefGc, PendingPassPerKeyMarkerGuardSparesWarmSameEpochRecreation)
     writeManifestRaw(*backend, layout, ns, warm_recreated, {blobEntryFor("a", DB::UInt128(1))});
 
     /// Absent at the per-page HEAD (marker_heads == 1), present at the per-key HEAD (>= 2).
-    backend->marker_key = layout.refCleanupMarkerKey(RefNamespaceId::stageATransition(ns), remove_txn);
+    backend->marker_key = layout.refCleanupMarkerKey(NamespaceLifeId::stageATransition(ns), remove_txn);
 
     gc.runNamespaceCleanupPassesForTest(seal, /*ref_tables*/{}, st.round, /*suppress_destructive*/false);
 

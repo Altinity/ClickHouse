@@ -187,7 +187,7 @@ namespace
 {
 String residualRefLogKey()
 {
-    return Layout{"p"}.refLogKey(RefNamespaceId::stageATransition(RootNamespace{"test%2Fabcd"}), RefTxnId{1, 1});
+    return Layout{"p"}.refLogKey(NamespaceLifeId::stageATransition(RootNamespace{"test%2Fabcd"}), RefTxnId{1, 1});
 }
 }
 

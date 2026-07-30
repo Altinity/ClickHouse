@@ -543,7 +543,7 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
     std::vector<RefTxnId> hint_log_ids;
     std::set<RefTxnId> cleanup_markers;
     {
-        const String prefix = layout.refsNamespacePrefix(RefNamespaceId::stageATransition(ns));
+        const String prefix = layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns));
         String cursor;
         for (;;)
         {
@@ -594,7 +594,7 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
     uint64_t base_snapshot_bytes = 0;
     if (base_id)
     {
-        const auto got = backend.get(layout.refSnapshotKey(RefNamespaceId::stageATransition(ns), *base_id));
+        const auto got = backend.get(layout.refSnapshotKey(NamespaceLifeId::stageATransition(ns), *base_id));
         if (!got)
         {
             /// INV-4's three-way revalidation, consumed from `CasRefCkpt` rather than re-derived: the
@@ -698,7 +698,7 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
             checkRecoveryStillAdmitted(ns, rt, cancelled);
             const RefTxnId id{epoch, sequence};
 
-            if (const auto got = backend.get(layout.refLogKey(RefNamespaceId::stageATransition(ns), id)))
+            if (const auto got = backend.get(layout.refLogKey(NamespaceLifeId::stageATransition(ns), id)))
             {
                 RefLogTxn txn = decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), id);
                 const bool is_seal = refLogTxnIsEpochSeal(txn);
@@ -723,7 +723,7 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
             /// ---- Absent. Hole, end of the live stream, or a dead epoch to close ----
             if (const std::optional<RefTxnId> witness = witness_candidate(epoch, sequence))
             {
-                if (backend.get(layout.refLogKey(RefNamespaceId::stageATransition(ns), *witness)))
+                if (backend.get(layout.refLogKey(NamespaceLifeId::stageATransition(ns), *witness)))
                 {
                     /// A 404 BELOW a CONFIRMED durable same-epoch id. Ids are dense `1..T` within
                     /// `(namespace, epoch)` (INV-1), so this is not the end of anything -- it is a hole,
@@ -795,7 +795,7 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
 
             const SlotOccupyResult occupied =
                 ref_request_controller->slotOccupy(
-                    layout.refLogKey(RefNamespaceId::stageATransition(ns), id), seal_bytes, admitted_fence_ok);
+                    layout.refLogKey(NamespaceLifeId::stageATransition(ns), id), seal_bytes, admitted_fence_ok);
 
             switch (occupied.kind)
             {
@@ -1479,7 +1479,7 @@ bool CasRefLedger::observedNamespaceCleanupMarker(const RootNamespace & ns, cons
     /// answering; if it is durably present now, adopt it into the cached set. This preserves fail-close
     /// (a still-absent marker keeps recreation rejected -- evidence is refreshed, never assumed) and
     /// matches the recovery restart-on-vanish philosophy of consulting the durable object on a cache miss.
-    const HeadResult head = backend.head(layout.refCleanupMarkerKey(RefNamespaceId::stageATransition(ns), remove_txn_id));
+    const HeadResult head = backend.head(layout.refCleanupMarkerKey(NamespaceLifeId::stageATransition(ns), remove_txn_id));
     if (head.exists)
     {
         rt->cleanup_markers.insert(remove_txn_id);
@@ -2589,7 +2589,7 @@ CasRefLedger::PreparedRefChunk CasRefLedger::prepareRefChunk(
     /// attempted, so retry-later is the truthful class, and it is the class they already got whenever the
     /// preceding chunk failed for any other reason.
     prepared.prepared_attempt.txn_id = id;
-    prepared.prepared_attempt.key = layout.refLogKey(RefNamespaceId::stageATransition(ns), id);
+    prepared.prepared_attempt.key = layout.refLogKey(NamespaceLifeId::stageATransition(ns), id);
     prepared.prepared_attempt.admitted_fence_generation = admitted_generation;
     prepared.prepared_attempt.bytes = sealObject(FormatId::RefLog, encodeRefLogTxn(prepared.chunk_txn));
 
@@ -3514,7 +3514,7 @@ bool CasRefLedger::trySnapshotPublishOnce(const RootNamespace & ns)
         advancePublishBackoff(*rt);
         return false;
     }
-    const String key = layout.refSnapshotKey(RefNamespaceId::stageATransition(ns), candidate_x);
+    const String key = layout.refSnapshotKey(NamespaceLifeId::stageATransition(ns), candidate_x);
     const auto fence_ok = [this] { return fence_ok_fn(); };
     const CasWriteOutcome outcome = ref_request_controller->putIfAbsentControlled(key, bytes, fence_ok);
     if (outcome != CasWriteOutcome::Committed)
@@ -3808,7 +3808,7 @@ void CasRefLedger::publishRemovedSnapshotNow(const RootNamespace & ns)
     removed_snap.lifecycle = RefLifecycle::Removed;
     removed_snap.remove_txn_id = remove_id;
     const String bytes = sealObject(FormatId::RefSnapshot, encodeRefTableSnapshot(removed_snap));
-    const String key = layout.refSnapshotKey(RefNamespaceId::stageATransition(ns), remove_id);
+    const String key = layout.refSnapshotKey(NamespaceLifeId::stageATransition(ns), remove_id);
     const auto fence_ok = [this] { return fence_ok_fn(); };
     const CasWriteOutcome outcome = ref_request_controller->putIfAbsentControlled(key, bytes, fence_ok);
     if (outcome != CasWriteOutcome::Committed)

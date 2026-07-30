@@ -385,7 +385,7 @@ TEST(CasConfirmExactRef, UnrecoveredResidentTableIsUnknownWithZeroBackendRequest
     const RootNamespace ns{"srv1/confirm_unrecovered"};
 
     const size_t cached_before = store->refTablesCachedCountForTest();
-    backend->fail_list_once_prefix = store->layout().refsNamespacePrefix(RefNamespaceId::stageATransition(ns));
+    backend->fail_list_once_prefix = store->layout().refsNamespacePrefix(NamespaceLifeId::stageATransition(ns));
     EXPECT_THROW(store->resolveRef(ns, "x"), DB::Exception);
 
     ASSERT_EQ(store->refTablesCachedCountForTest(), cached_before + 1u)
@@ -410,7 +410,7 @@ TEST(CasConfirmExactRef, RecoveryInProgressIsUnknownWithZeroBackendRequests)
     auto store = openPool(backend);
     const RootNamespace ns{"srv1/confirm_recovering"};
 
-    backend->armBlockedList(store->layout().refsNamespacePrefix(RefNamespaceId::stageATransition(ns)));
+    backend->armBlockedList(store->layout().refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)));
     std::thread recoverer([&] { store->resolveRef(ns, "x"); });
     backend->awaitBlockedList();
 
@@ -567,7 +567,7 @@ TEST(CasConfirmExactRef, WedgedLaneIsUnknown)
     ASSERT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Yes);
 
     store->forceWedgeForTest(ns, /*writer_epoch=*/1, /*ref_sequence=*/9999,
-                             store->layout().refLogKey(RefNamespaceId::stageATransition(ns), RefTxnId{1, 9999}), "synthetic");
+                             store->layout().refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, 9999}), "synthetic");
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
 
     backend->resetCounts();

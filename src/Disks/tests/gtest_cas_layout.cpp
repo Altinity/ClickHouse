@@ -60,11 +60,11 @@ TEST(CasLayout, RootNamespaceKeys)
 {
     Layout l("p");
     RootNamespace ns{"srv1/3f2e-uuid"};
-    const RefNamespaceId ns_id = RefNamespaceId::stageATransition(ns);
+    const NamespaceLifeId ns_id = NamespaceLifeId::stageATransition(ns);
     /// Ref objects live under cas/refs/<ns>/<inc>/; the namespace fan-out is unchanged and the
     /// incarnation is one further segment (INV-3). Asserted against the render, never the constant.
     EXPECT_EQ(l.refsNamespacePrefix(ns_id),
-        "p/cas/refs/srv1/3f2e-uuid/" + renderRefIncarnation(ns_id.incarnation) + "/");
+        "p/cas/refs/srv1/3f2e-uuid/" + renderIncarnation(ns_id.incarnation) + "/");
     /// Browse helpers (verbatim `_files` tree) stay under roots/.
     EXPECT_EQ(l.namespaceFileKey(ns, "format_version.txt"), "p/roots/srv1/3f2e-uuid/_files/format_version.txt");
     EXPECT_EQ(l.namespaceFilesPrefix(ns), "p/roots/srv1/3f2e-uuid/_files/");
@@ -74,10 +74,10 @@ TEST(CasLayout, RelocatedRefAndManifestKeys)
 {
     Layout l("p");
     const RootNamespace ns{"srid/store/ab/uuid@cas@"};
-    const RefNamespaceId ns_id = RefNamespaceId::stageATransition(ns);
+    const NamespaceLifeId ns_id = NamespaceLifeId::stageATransition(ns);
     /// Ref objects: cas/refs/<ns>/<inc>/ (identity-preserving namespace fan-out, then the life).
     EXPECT_EQ(l.refsNamespacePrefix(ns_id),
-        "p/cas/refs/srid/store/ab/uuid@cas@/" + renderRefIncarnation(ns_id.incarnation) + "/");
+        "p/cas/refs/srid/store/ab/uuid@cas@/" + renderIncarnation(ns_id.incarnation) + "/");
     /// Pool-wide ref prefix (discovery LIST + strip base).
     EXPECT_EQ(l.casRefsPrefix(), "p/cas/refs/");
     /// All manifests of a namespace: cas/manifests/<ns>/ (replaces roots/<ns>/_manifests/).
@@ -98,9 +98,9 @@ TEST(CasLayout, RelocatedRefAndManifestKeys)
 TEST(CasLayout, RootNamespaceValidation)
 {
     Layout l("p");
-    EXPECT_THROW(l.refsNamespacePrefix(RefNamespaceId::stageATransition(RootNamespace{""})), DB::Exception);
-    EXPECT_THROW(l.refsNamespacePrefix(RefNamespaceId::stageATransition(RootNamespace{"/lead"})), DB::Exception);
-    EXPECT_THROW(l.refsNamespacePrefix(RefNamespaceId::stageATransition(RootNamespace{"trail/"})), DB::Exception);
+    EXPECT_THROW(l.refsNamespacePrefix(NamespaceLifeId::stageATransition(RootNamespace{""})), DB::Exception);
+    EXPECT_THROW(l.refsNamespacePrefix(NamespaceLifeId::stageATransition(RootNamespace{"/lead"})), DB::Exception);
+    EXPECT_THROW(l.refsNamespacePrefix(NamespaceLifeId::stageATransition(RootNamespace{"trail/"})), DB::Exception);
     /// File names may be NESTED relative paths (M-W T2: deduplication_logs/...); only unclean
     /// shapes are rejected (empty, leading/trailing '/', empty segments, '..' escapes).
     EXPECT_NO_THROW(l.namespaceFileKey(RootNamespace{"ok"}, "a/b"));
@@ -112,11 +112,11 @@ TEST(CasLayout, RootNamespaceValidation)
     EXPECT_THROW(l.namespaceFileKey(RootNamespace{"ok"}, "a/../b"), DB::Exception);
 
     /// A middle empty segment ("a//b") is rejected (doubled '/').
-    EXPECT_THROW(l.refsNamespacePrefix(RefNamespaceId::stageATransition(RootNamespace{"a//b"})), DB::Exception);
+    EXPECT_THROW(l.refsNamespacePrefix(NamespaceLifeId::stageATransition(RootNamespace{"a//b"})), DB::Exception);
     /// A segment exactly equal to the reserved "_files" is rejected.
-    EXPECT_THROW(l.refsNamespacePrefix(RefNamespaceId::stageATransition(RootNamespace{"srv1/_files/x"})), DB::Exception);
+    EXPECT_THROW(l.refsNamespacePrefix(NamespaceLifeId::stageATransition(RootNamespace{"srv1/_files/x"})), DB::Exception);
     /// But a segment that merely CONTAINS "_files" as a substring is legal (no false positive).
-    EXPECT_NO_THROW(l.refsNamespacePrefix(RefNamespaceId::stageATransition(RootNamespace{"my_files/tbl"})));
+    EXPECT_NO_THROW(l.refsNamespacePrefix(NamespaceLifeId::stageATransition(RootNamespace{"my_files/tbl"})));
 }
 
 TEST(CasLayout, GenerationAndRootsKeys)
@@ -145,9 +145,9 @@ TEST(CasLayout, RegistryDeletedGcDiscoveryViaList)
     /// The `_registry` namespace segment is not reserved (it was only reserved while the registry lived
     /// under `roots/_registry`, which was already relocated to `gc/registry` before being deleted).
     Layout l("p");
-    EXPECT_NO_THROW(l.refsNamespacePrefix(RefNamespaceId::stageATransition(RootNamespace{"a/_registry@cas@"})));
+    EXPECT_NO_THROW(l.refsNamespacePrefix(NamespaceLifeId::stageATransition(RootNamespace{"a/_registry@cas@"})));
     /// `_files` and `_pool_meta`-style reservations are unaffected.
-    EXPECT_THROW(l.refsNamespacePrefix(RefNamespaceId::stageATransition(RootNamespace{"a/_files"})), DB::Exception);
+    EXPECT_THROW(l.refsNamespacePrefix(NamespaceLifeId::stageATransition(RootNamespace{"a/_files"})), DB::Exception);
 }
 
 TEST(CasLayout, CasArchiveSuffixConstant)
@@ -187,9 +187,9 @@ TEST(CasLayout, ManifestsSegmentReserved)
     bad.root_namespace = RootNamespace("srv-a/_manifests/x");
     EXPECT_THROW(l.manifestKey(bad), DB::Exception);
     /// Also rejected as a generic namespace segment via refsNamespacePrefix (the shared checkNamespace).
-    EXPECT_THROW(l.refsNamespacePrefix(RefNamespaceId::stageATransition(RootNamespace{"srv-a/_manifests/tbl"})), DB::Exception);
+    EXPECT_THROW(l.refsNamespacePrefix(NamespaceLifeId::stageATransition(RootNamespace{"srv-a/_manifests/tbl"})), DB::Exception);
     /// A segment that merely CONTAINS "_manifests" as a substring is still legal (no false positive).
-    EXPECT_NO_THROW(l.refsNamespacePrefix(RefNamespaceId::stageATransition(RootNamespace{"my_manifests/tbl"})));
+    EXPECT_NO_THROW(l.refsNamespacePrefix(NamespaceLifeId::stageATransition(RootNamespace{"my_manifests/tbl"})));
 }
 
 TEST(CasLayout, ManifestKeyHexRoundTrip)
@@ -231,9 +231,9 @@ TEST(CasLayout, RefObjectKeyRoundTrips)
 {
     Layout l("p");
     const RootNamespace ns{"srv1/tbl@cas@"};
-    const RefNamespaceId ns_id = RefNamespaceId::stageATransition(ns);
+    const NamespaceLifeId ns_id = NamespaceLifeId::stageATransition(ns);
     const RefTxnId id{7, 0x8e};
-    const String life = "p/cas/refs/srv1/tbl@cas@/" + renderRefIncarnation(ns_id.incarnation) + "/";
+    const String life = "p/cas/refs/srv1/tbl@cas@/" + renderIncarnation(ns_id.incarnation) + "/";
 
     const String log_key = l.refLogKey(ns_id, id);
     EXPECT_EQ(log_key, life + "_log/0000000000000007-000000000000008e.zst");
@@ -263,7 +263,7 @@ TEST(CasLayout, RefObjectKeyRoundTrips)
 TEST(CasLayout, RefObjectKeyLexicalOrder)
 {
     Layout l("p");
-    const RefNamespaceId ns_id = RefNamespaceId::stageATransition(RootNamespace{"srv1/tbl@cas@"});
+    const NamespaceLifeId ns_id = NamespaceLifeId::stageATransition(RootNamespace{"srv1/tbl@cas@"});
     const RefTxnId id{7, 0x8e};
     /// spec §Object Layout: "`_cleanup` sorts before `_log` ... and takes no part in the `_log`-before-
     /// `_snap` recovery ordering". Asserted here on the actual generated keys, same life + id.
@@ -275,7 +275,7 @@ TEST(CasLayout, ParseRefObjectKeyRejections)
 {
     Layout l("p");
     const RootNamespace ns{"srv1/tbl@cas@"};
-    const RefNamespaceId ns_id = RefNamespaceId::stageATransition(ns);
+    const NamespaceLifeId ns_id = NamespaceLifeId::stageATransition(ns);
     const RefTxnId id{7, 0x8e};
     const String log_key = l.refLogKey(ns_id, id);
     const String snap_key = l.refSnapshotKey(ns_id, id);
@@ -319,7 +319,7 @@ TEST(CasLayout, RefCkptKeyRoundTripsAndRejectsEverythingElse)
 {
     Layout l("p");
     const RootNamespace ns{"srv1/tbl@cas@"};
-    const RefNamespaceId ns_id = RefNamespaceId::stageATransition(ns);
+    const NamespaceLifeId ns_id = NamespaceLifeId::stageATransition(ns);
     const RefTxnId id{7, 0x8e};
 
     /// The life prefix plus the bare leaf, with no compression suffix (the format is raw), so the key
@@ -328,7 +328,7 @@ TEST(CasLayout, RefCkptKeyRoundTripsAndRejectsEverythingElse)
     EXPECT_EQ(l.parseRefCkptKey(l.refCkptKey(ns_id)), ns_id);
     /// A namespace with slashes in it round-trips whole: everything before the LIFE segment is the
     /// namespace, however many segments that is.
-    const RefNamespaceId deep = RefNamespaceId::stageATransition(RootNamespace{"a/b/c"});
+    const NamespaceLifeId deep = NamespaceLifeId::stageATransition(RootNamespace{"a/b/c"});
     EXPECT_EQ(l.parseRefCkptKey(l.refCkptKey(deep)), deep);
 
     /// Foreign pool prefix.

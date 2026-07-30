@@ -249,7 +249,7 @@ TEST(CasRefInstallSafety, UnresolvedAlwaysRecordsTheWedge)
 
     /// Scoped to THIS namespace's ref log, so nothing else the part publish writes (the manifest, the
     /// pool's own metadata) can consume the single fault.
-    backend->fault_substr = store->layout().refsNamespacePrefix(RefNamespaceId::stageATransition(ns)) + "_log/";
+    backend->fault_substr = store->layout().refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
     backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::Unresolved;
     backend->fault_count = 1;
 
@@ -258,7 +258,7 @@ TEST(CasRefInstallSafety, UnresolvedAlwaysRecordsTheWedge)
     EXPECT_TRUE(store->refLaneWedgedForTest(ns)) << "an Unresolved PUT must always leave a wedge";
     const String wedged_key = store->wedgedKeyForTest(ns);
     EXPECT_FALSE(wedged_key.empty()) << "the wedge must retain the in-doubt object's key";
-    EXPECT_TRUE(wedged_key.starts_with(store->layout().refsNamespacePrefix(RefNamespaceId::stageATransition(ns)) + "_log/"))
+    EXPECT_TRUE(wedged_key.starts_with(store->layout().refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)) + "_log/"))
         << "the wedged key must be this namespace's ref-log object, not some other key: " << wedged_key;
     EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), 0u)
         << "an UNPROVEN transaction must not be recorded as applied";
@@ -295,7 +295,7 @@ TEST(CasRefInstallSafety, PreAttemptRefusalDoesNotWedgeTheLane)
 
     publishEmptyPart(store, ns, "part_a");
     const size_t tail_after_seed = store->tailSinceSnapshotCountForTest(ns);
-    const String log_prefix = store->layout().refsNamespacePrefix(RefNamespaceId::stageATransition(ns)) + "_log/";
+    const String log_prefix = store->layout().refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
     const uint64_t log_io_after_seed = backend->ioCountForKeysContaining(log_prefix);
 
     /// Shorten the lease to the window where the flush is admitted but no attempt may start.
@@ -358,7 +358,7 @@ TEST(CasRefInstallSafety, PreAttemptRefusalAfterAWedgeResolutionLeavesTheLaneCle
 
     /// Wedge over an object that IS durable: the write lands, its acknowledgement is lost, and the
     /// controller's own verifying read is lost too (the only mode that reaches the resolution install).
-    backend->fault_substr = store->layout().refsNamespacePrefix(RefNamespaceId::stageATransition(ns)) + "_log/";
+    backend->fault_substr = store->layout().refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
     backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::LandedThenLost;
     backend->fault_count = 1;
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
@@ -407,7 +407,7 @@ TEST(CasRefInstallSafety, AmbiguousChunkAfterAWedgeResolutionRewedgesTheLane)
     publishEmptyPart(store, ns, "y");
     const size_t tail_after_seed = store->tailSinceSnapshotCountForTest(ns);
 
-    backend->fault_substr = store->layout().refsNamespacePrefix(RefNamespaceId::stageATransition(ns)) + "_log/";
+    backend->fault_substr = store->layout().refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
     backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::LandedThenLost;
     backend->fault_count = 1;
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
@@ -496,7 +496,7 @@ TEST(CasRefInstallSafety, WedgeResolutionInstallsExactlyOnce)
     /// Drop "x" through a PUT that LANDS and then loses its response, plus the one-shot lost read that
     /// keeps the controller's own resolve-before-reissue from settling it inside the same attempt. One
     /// attempt, so the lane wedges over an object that is genuinely durable -- the only way in.
-    backend->fault_substr = store->layout().refsNamespacePrefix(RefNamespaceId::stageATransition(ns)) + "_log/";
+    backend->fault_substr = store->layout().refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
     backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::LandedThenLost;
     backend->fault_count = 1;
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
@@ -619,7 +619,7 @@ TEST(CasRefInstallSafety, UnresolvedTransfersWritingToWedged)
     auto store = openPoolSingleAttempt(backend);
     const RootNamespace ns{"srv1/apply_state_wedge"};
 
-    backend->fault_substr = store->layout().refsNamespacePrefix(RefNamespaceId::stageATransition(ns)) + "_log/";
+    backend->fault_substr = store->layout().refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
     backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::Unresolved;
     backend->fault_count = 1;
 
@@ -642,7 +642,7 @@ TEST(CasRefInstallSafety, WedgeResolutionReturnsReady)
 
     /// The one mode that wedges over a GENUINELY durable object (see `ChunkFaultBackend`): the write
     /// lands, its acknowledgement is lost, and the controller's own verifying read is lost too.
-    backend->fault_substr = store->layout().refsNamespacePrefix(RefNamespaceId::stageATransition(ns)) + "_log/";
+    backend->fault_substr = store->layout().refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
     backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::LandedThenLost;
     backend->fault_count = 1;
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
@@ -664,7 +664,7 @@ TEST(CasRefInstallSafety, ConclusiveForeignConflictFaultsTheLane)
     auto store = openPoolSingleAttempt(backend);
     const RootNamespace ns{"srv1/apply_state_conflict"};
 
-    backend->fault_substr = store->layout().refsNamespacePrefix(RefNamespaceId::stageATransition(ns)) + "_log/";
+    backend->fault_substr = store->layout().refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
     backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::ForeignConflict;
     backend->fault_count = 1;
 
@@ -687,7 +687,7 @@ TEST(CasRefInstallSafety, DefiniteFailureReturnsReady)
     auto store = openPoolSingleAttempt(backend);
     const RootNamespace ns{"srv1/apply_state_definite"};
 
-    backend->fault_substr = store->layout().refsNamespacePrefix(RefNamespaceId::stageATransition(ns)) + "_log/";
+    backend->fault_substr = store->layout().refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
     backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::Definite;
     backend->fault_count = 1;
 
@@ -718,7 +718,7 @@ TEST(CasRefInstallSafety, WedgeResolutionProvenForeignFaultsTheLane)
     publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "y");
 
-    backend->fault_substr = store->layout().refsNamespacePrefix(RefNamespaceId::stageATransition(ns)) + "_log/";
+    backend->fault_substr = store->layout().refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
     backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::Unresolved;
     backend->fault_count = 1;
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
@@ -775,7 +775,7 @@ TEST(CasRefInstallSafety, WedgeResolutionInstallFailureRequiresRecovery)
     publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "y");
 
-    backend->fault_substr = store->layout().refsNamespacePrefix(RefNamespaceId::stageATransition(ns)) + "_log/";
+    backend->fault_substr = store->layout().refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
     backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::LandedThenLost;
     backend->fault_count = 1;
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
@@ -861,7 +861,7 @@ TEST(CasRefInstallSafety, UncertainPrecommitKeepsItsCleanupOwnerAndItsBody)
     /// Scoped to THIS namespace's ref log so the manifest body's own PUT cannot consume the fault. The
     /// object LANDS and only its acknowledgement is lost, which with the single-attempt budget wedges
     /// the lane over a genuinely durable precommit -- the exact shape the old code mishandled.
-    backend->fault_substr = store->layout().refsNamespacePrefix(RefNamespaceId::stageATransition(ns)) + "_log/";
+    backend->fault_substr = store->layout().refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
     backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::LandedThenLost;
     backend->fault_count = 1;
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { build->precommitAdd(ns, "part_a", id); });

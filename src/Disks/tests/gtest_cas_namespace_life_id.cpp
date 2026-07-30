@@ -1,5 +1,5 @@
 #include <gtest/gtest.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasRefNamespaceId.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasNamespaceLifeId.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Common/Exception.h>
@@ -59,44 +59,44 @@ concept HasNamespaceOnlyRefsNamespacePrefix =
     requires(const L & l, const RootNamespace & ns) { l.refsNamespacePrefix(ns); };
 template <class L>
 concept HasIncarnationRefsNamespacePrefix =
-    requires(const L & l, const RefNamespaceId & id) { l.refsNamespacePrefix(id); };
+    requires(const L & l, const NamespaceLifeId & id) { l.refsNamespacePrefix(id); };
 
 template <class L>
 concept HasNamespaceOnlyRefLogKey =
     requires(const L & l, const RootNamespace & ns, const RefTxnId & id) { l.refLogKey(ns, id); };
 template <class L>
 concept HasIncarnationRefLogKey =
-    requires(const L & l, const RefNamespaceId & ns_id, const RefTxnId & id) { l.refLogKey(ns_id, id); };
+    requires(const L & l, const NamespaceLifeId & ns_id, const RefTxnId & id) { l.refLogKey(ns_id, id); };
 
 template <class L>
 concept HasNamespaceOnlyRefSnapshotKey =
     requires(const L & l, const RootNamespace & ns, const RefTxnId & id) { l.refSnapshotKey(ns, id); };
 template <class L>
 concept HasIncarnationRefSnapshotKey =
-    requires(const L & l, const RefNamespaceId & ns_id, const RefTxnId & id) { l.refSnapshotKey(ns_id, id); };
+    requires(const L & l, const NamespaceLifeId & ns_id, const RefTxnId & id) { l.refSnapshotKey(ns_id, id); };
 
 template <class L>
 concept HasNamespaceOnlyRefCleanupMarkerKey =
     requires(const L & l, const RootNamespace & ns, const RefTxnId & id) { l.refCleanupMarkerKey(ns, id); };
 template <class L>
 concept HasIncarnationRefCleanupMarkerKey =
-    requires(const L & l, const RefNamespaceId & ns_id, const RefTxnId & id) { l.refCleanupMarkerKey(ns_id, id); };
+    requires(const L & l, const NamespaceLifeId & ns_id, const RefTxnId & id) { l.refCleanupMarkerKey(ns_id, id); };
 
 template <class L>
 concept HasNamespaceOnlyRefCkptKey =
     requires(const L & l, const RootNamespace & ns) { l.refCkptKey(ns); };
 template <class L>
 concept HasIncarnationRefCkptKey =
-    requires(const L & l, const RefNamespaceId & id) { l.refCkptKey(id); };
+    requires(const L & l, const NamespaceLifeId & id) { l.refCkptKey(id); };
 
 }
 
 /// Every ref-layer key names one LIFE: `<prefix>/cas/refs/<ns>/<inc>/...`, with `<inc>` a fixed-width
 /// lower-case hex render of the incarnation (INV-3). Round-tripped through each migrated helper.
-TEST(CasRefNamespaceId, KeysCarryTheIncarnationSegment)
+TEST(CasNamespaceLifeId, KeysCarryTheIncarnationSegment)
 {
     Layout l("p");
-    const RefNamespaceId id = RefNamespaceId::fromCatalogEntry(RootNamespace{kNs}, incarnationA());
+    const NamespaceLifeId id = NamespaceLifeId::fromCatalogEntry(RootNamespace{kNs}, incarnationA());
     const RefTxnId txn{7, 0x8e};
     const String life = "p/cas/refs/" + kNs + "/" + kHexA + "/";
 
@@ -127,12 +127,12 @@ TEST(CasRefNamespaceId, KeysCarryTheIncarnationSegment)
 
 /// The property the type exists for: two lives of the SAME namespace name share no key at all, so a
 /// reborn namespace can neither read nor delete the previous life's objects by name.
-TEST(CasRefNamespaceId, TwoLivesOfOneNamespaceShareNoKeys)
+TEST(CasNamespaceLifeId, TwoLivesOfOneNamespaceShareNoKeys)
 {
     Layout l("p");
     const RefTxnId txn{7, 0x8e};
-    const RefNamespaceId first = RefNamespaceId::fromCatalogEntry(RootNamespace{kNs}, incarnationA());
-    const RefNamespaceId second = RefNamespaceId::fromCatalogEntry(RootNamespace{kNs}, incarnationB());
+    const NamespaceLifeId first = NamespaceLifeId::fromCatalogEntry(RootNamespace{kNs}, incarnationA());
+    const NamespaceLifeId second = NamespaceLifeId::fromCatalogEntry(RootNamespace{kNs}, incarnationB());
 
     EXPECT_EQ(first.ns, second.ns);
     EXPECT_NE(first, second);
@@ -154,17 +154,17 @@ TEST(CasRefNamespaceId, TwoLivesOfOneNamespaceShareNoKeys)
 
 /// Zero is not a wildcard and not "the namespace itself": it can never be constructed, so it can
 /// never reach a key builder.
-TEST(CasRefNamespaceId, ZeroIncarnationIsUnconstructible)
+TEST(CasNamespaceLifeId, ZeroIncarnationIsUnconstructible)
 {
-    EXPECT_THROW(RefNamespaceId::fromCatalogEntry(RootNamespace{kNs}, UInt128{0}), DB::Exception);
-    EXPECT_THROW(renderRefIncarnation(UInt128{0}), DB::Exception);
-    EXPECT_NO_THROW(RefNamespaceId::fromCatalogEntry(RootNamespace{kNs}, incarnationA()));
+    EXPECT_THROW(NamespaceLifeId::fromCatalogEntry(RootNamespace{kNs}, UInt128{0}), DB::Exception);
+    EXPECT_THROW(renderIncarnation(UInt128{0}), DB::Exception);
+    EXPECT_NO_THROW(NamespaceLifeId::fromCatalogEntry(RootNamespace{kNs}, incarnationA()));
 }
 
 /// Behind Stage B's format bump every un-incarnated key is corruption, not a compatibility case: a
 /// parser that quietly classified one as foreign debris would let a Stage-A-shaped object survive
 /// unnoticed under a live namespace. Both parsers refuse it by name.
-TEST(CasRefNamespaceId, ParsersRefuseTheUnIncarnatedKeyShape)
+TEST(CasNamespaceLifeId, ParsersRefuseTheUnIncarnatedKeyShape)
 {
     Layout l("p");
     const String legacy_log = "p/cas/refs/" + kNs + "/_log/" + kTxn + ".zst";
@@ -183,7 +183,7 @@ TEST(CasRefNamespaceId, ParsersRefuseTheUnIncarnatedKeyShape)
 
 /// An all-zero incarnation segment is well-formed hex naming no life, so it is corruption on the read
 /// side exactly as it is unconstructible on the write side.
-TEST(CasRefNamespaceId, ParsersRefuseAZeroIncarnation)
+TEST(CasNamespaceLifeId, ParsersRefuseAZeroIncarnation)
 {
     Layout l("p");
     const String zeros(32, '0');
@@ -197,7 +197,7 @@ TEST(CasRefNamespaceId, ParsersRefuseAZeroIncarnation)
 /// The incarnation segment has ONE canonical spelling. A key that is nearly right -- wrong width,
 /// upper case, a non-hex digit -- is refused rather than repaired, so two spellings of one life can
 /// never both exist.
-TEST(CasRefNamespaceId, ParsersRefuseAMalformedIncarnationSegment)
+TEST(CasNamespaceLifeId, ParsersRefuseAMalformedIncarnationSegment)
 {
     Layout l("p");
     const String upper = "112233445566778899AABBCCDDEEFF01";
@@ -218,10 +218,10 @@ TEST(CasRefNamespaceId, ParsersRefuseAMalformedIncarnationSegment)
 /// recognized as OUR ref objects; anything else keeps returning `std::nullopt`, because classifying an
 /// untrusted listed key remains an ordinary "is this ours" question and a sweep must be able to walk
 /// past foreign debris without an exception.
-TEST(CasRefNamespaceId, ForeignAndUnrecognizedKeysStayInert)
+TEST(CasNamespaceLifeId, ForeignAndUnrecognizedKeysStayInert)
 {
     Layout l("p");
-    const RefNamespaceId id = RefNamespaceId::fromCatalogEntry(RootNamespace{kNs}, incarnationA());
+    const NamespaceLifeId id = NamespaceLifeId::fromCatalogEntry(RootNamespace{kNs}, incarnationA());
     const RefTxnId txn{7, 0x8e};
 
     /// Foreign top-level prefix (another pool, another subtree).
@@ -244,7 +244,7 @@ TEST(CasRefNamespaceId, ForeignAndUnrecognizedKeysStayInert)
 /// The "cannot compile" half of spec §9 r9-5 #3: after this task there is no way to reach a ref-layer
 /// key from a namespace alone, so dropping the incarnation is a compile error rather than an aliasing
 /// bug. Each helper is asserted twice -- the namespace-only form absent, the incarnation form present.
-TEST(CasRefNamespaceId, NamespaceOnlyKeyHelpersDoNotExist)
+TEST(CasNamespaceLifeId, NamespaceOnlyKeyHelpersDoNotExist)
 {
     static_assert(!HasNamespaceOnlyRefsNamespacePrefix<Layout>);
     static_assert(HasIncarnationRefsNamespacePrefix<Layout>);

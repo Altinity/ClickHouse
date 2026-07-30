@@ -563,7 +563,7 @@ TEST(CasGcFold, RoundSideAnomalySuppressesNamespaceAndRefLogCleanupToo)
     const uint64_t cv2 = publishCommittedTransition(*backend, layout, ns_covered, "t2", std::nullopt, c2);
     writeRefSnapshotRaw(*backend, layout, minimalLiveSnapshot(ns_covered.string(), RefTxnId{1, cv2},
         {committedRow("t1", c1), committedRow("t2", c2)}));
-    const String covered_log_key = layout.refLogKey(RefNamespaceId::stageATransition(ns_covered), RefTxnId{1, cv1});
+    const String covered_log_key = layout.refLogKey(NamespaceLifeId::stageATransition(ns_covered), RefTxnId{1, cv1});
     ASSERT_TRUE(backend->head(covered_log_key).exists);
 
     /// Trigger the clamp in ns_clamp: drop committed A, add precommit B whose body is absent.

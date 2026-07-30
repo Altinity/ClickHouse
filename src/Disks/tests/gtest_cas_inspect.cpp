@@ -46,7 +46,7 @@ TEST(CasInspect, RendersSetPublishedAtOpWithNoPayloadSizeKey)
     op.published_at_ms = 42;
     txn.ops.push_back(op);
 
-    const String key = layout.refLogKey(RefNamespaceId::stageATransition(ns), id);
+    const String key = layout.refLogKey(NamespaceLifeId::stageATransition(ns), id);
     const String bytes = sealObject(FormatId::RefLog, encodeRefLogTxn(txn));
 
     const String json = caInspectToJson(layout, key, bytes);
@@ -70,7 +70,7 @@ TEST(CasInspect, RendersEpochSealTxnWithPrevEpochSeal)
     op.kind = RefOpKind::EpochSeal;
     txn.ops.push_back(op);
 
-    const String key = layout.refLogKey(RefNamespaceId::stageATransition(ns), id);
+    const String key = layout.refLogKey(NamespaceLifeId::stageATransition(ns), id);
     const String bytes = sealObject(FormatId::RefLog, encodeRefLogTxn(txn));
 
     const String json = caInspectToJson(layout, key, bytes);
@@ -94,7 +94,7 @@ TEST(CasInspect, RendersCommittedRowWithNoPayloadSizeKey)
     row.published_at_ms = 42;
     snap.committed.push_back(row);
 
-    const String key = layout.refSnapshotKey(RefNamespaceId::stageATransition(ns), id);
+    const String key = layout.refSnapshotKey(NamespaceLifeId::stageATransition(ns), id);
     const String bytes = sealObject(FormatId::RefSnapshot, encodeRefTableSnapshot(snap));
 
     const String json = caInspectToJson(layout, key, bytes);
@@ -165,7 +165,7 @@ TEST(CasInspect, RendersRefCkptWithEveryFieldPresent)
                        .checkpoint_snapshot_id = RefTxnId{7, 9},
                        .last_epoch_seal = RefTxnId{6, 4}};
 
-    const String json = caInspectToJson(layout, layout.refCkptKey(RefNamespaceId::stageATransition(ns)), encodeRefCkpt(ckpt));
+    const String json = caInspectToJson(layout, layout.refCkptKey(NamespaceLifeId::stageATransition(ns)), encodeRefCkpt(ckpt));
     EXPECT_NE(json.find(R"("object":"ref_ckpt")"), String::npos) << json;
     /// The namespace comes from the KEY: a `_ckpt` body does not name it.
     EXPECT_NE(json.find(R"("ns":"srv1/db/tbl")"), String::npos) << json;
@@ -182,7 +182,7 @@ TEST(CasInspect, RendersRefCkptAbsencesAsExplicitNulls)
     const Layout layout("p");
     const RootNamespace ns{"srv1/db/fresh"};
 
-    const String json = caInspectToJson(layout, layout.refCkptKey(RefNamespaceId::stageATransition(ns)), encodeRefCkpt(RefCkpt{}));
+    const String json = caInspectToJson(layout, layout.refCkptKey(NamespaceLifeId::stageATransition(ns)), encodeRefCkpt(RefCkpt{}));
     EXPECT_NE(json.find(R"("object":"ref_ckpt")"), String::npos) << json;
     EXPECT_NE(json.find(R"("life_epoch":null)"), String::npos) << json;
     EXPECT_NE(json.find(R"("checkpoint_snapshot_id":null)"), String::npos) << json;

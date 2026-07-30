@@ -28,7 +28,7 @@ mutable state with immutable, hash-addressed objects plus a small CAS
 - **Ref table** — the mutable naming layer, one namespace per table
   (`SERVER_ID/TABLE_UUID`), keyed under one LIFE of that namespace: an
   append-only transaction log plus periodic snapshots (`cas/refs/<ns>/<inc>/...`,
-  where `<inc>` is the namespace's incarnation — see `RefNamespaceId`), replayed
+  where `<inc>` is the namespace's incarnation — see `NamespaceLifeId`), replayed
   into an in-memory table mapping
   ref names (part directory names) to manifests. All mutations go through a
   precommit/promote two-step so a manifest always has an owner while visible.
@@ -79,7 +79,7 @@ Primitives → Formats → Backend → Pool → Gc → Tools ≈ Parts → facad
 - **`Primitives/`** — the vocabulary, zero outward dependencies: `CasBlobDigest`
   (`BlobHashAlgo` + `BlobDigest` + `DigestCodec` + `BlobRef` — blob identity),
   `CasTypes.h` (the other identity types: `RootNamespace`, `Token`,
-  `ManifestId`, `RefTxnId`), `CasRefNamespaceId` (`RefNamespaceId` — one LIFE of
+  `ManifestId`, `RefTxnId`), `CasNamespaceLifeId` (`NamespaceLifeId` — one LIFE of
   a namespace's ref layer, the pair every ref key is built from),
   `CasBlobHashingWriteBuffer` (streaming
   hash-and-passthrough machinery), `CasXxh3Streamer` (the isolated vendored

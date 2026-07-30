@@ -267,7 +267,7 @@ inline uint64_t appendRefLogSeed(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout,
     const DB::Cas::RootNamespace & ns, std::vector<DB::Cas::RefOp> ops)
 {
-    const String prefix = layout.refsNamespacePrefix(RefNamespaceId::stageATransition(ns));
+    const String prefix = layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns));
     uint64_t greatest_seq = 0;
     bool any_log_or_snap = false;
     String cursor;
@@ -939,7 +939,7 @@ inline void setWatermarkMinActive(
 inline void writeRefSnapshotRaw(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RefTableSnapshot & snapshot)
 {
-    const String key = layout.refSnapshotKey(RefNamespaceId::stageATransition(DB::Cas::RootNamespace{snapshot.ns}), snapshot.snapshot_id);
+    const String key = layout.refSnapshotKey(NamespaceLifeId::stageATransition(DB::Cas::RootNamespace{snapshot.ns}), snapshot.snapshot_id);
     backend.putIfAbsent(key, DB::Cas::sealObject(DB::Cas::FormatId::RefSnapshot, DB::Cas::encodeRefTableSnapshot(snapshot)));
 }
 
@@ -947,7 +947,7 @@ inline void writeRefSnapshotRaw(
 inline void writeRefLogTxnRaw(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RefLogTxn & txn)
 {
-    const String key = layout.refLogKey(RefNamespaceId::stageATransition(DB::Cas::RootNamespace{txn.ns}), txn.txn_id);
+    const String key = layout.refLogKey(NamespaceLifeId::stageATransition(DB::Cas::RootNamespace{txn.ns}), txn.txn_id);
     backend.putIfAbsent(key, DB::Cas::sealObject(DB::Cas::FormatId::RefLog, DB::Cas::encodeRefLogTxn(txn)));
 }
 

@@ -21,20 +21,20 @@ namespace DB::Cas
 /// one canonical spelling and `<ns>/<inc>/` sorts stably. Throws LOGICAL_ERROR on a zero incarnation
 /// for the same reason `renderRefTxnId` does: this render becomes an object key, and an invalid
 /// identity must never silently produce a well-formed-looking one.
-inline String renderRefIncarnation(const UInt128 & incarnation)
+inline String renderIncarnation(const UInt128 & incarnation)
 {
     if (incarnation == 0)
         throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR,
-            "RefNamespaceId: incarnation must be nonzero -- 0 never names a life");
+            "NamespaceLifeId: incarnation must be nonzero -- 0 never names a life");
     return u128ToHex(incarnation);
 }
 
-/// Inverse of `renderRefIncarnation` for ONE listed path segment. Accepts the canonical form only:
+/// Inverse of `renderIncarnation` for ONE listed path segment. Accepts the canonical form only:
 /// exactly 32 lower-case hex digits encoding a nonzero value. Upper case, a short or long segment,
 /// non-hex characters and an all-zero segment all return `std::nullopt`; the CALLER decides whether
 /// that is "not one of our keys" or corruption, because only the caller knows whether the rest of the
 /// key already identified the object as ours.
-inline std::optional<UInt128> parseRefIncarnation(std::string_view s)
+inline std::optional<UInt128> parseIncarnation(std::string_view s)
 {
     constexpr size_t kHexLen = 32;
     if (s.size() != kHexLen)
@@ -72,19 +72,19 @@ class Layout;
 /// factory Stage B Task 6 adds, and `Layout`'s key parsers (befriended below), which reconstruct the
 /// pair a listed key spells. A parsed id is UNTRUSTED: a key can name any incarnation, including one
 /// no longer in the catalog, which is precisely how a dead life is recognized and left alone.
-struct RefNamespaceId
+struct NamespaceLifeId
 {
     RootNamespace ns;
     UInt128 incarnation;   /// 0 is INVALID -- never a wildcard, never "any life"
 
-    bool operator==(const RefNamespaceId &) const = default;
+    bool operator==(const NamespaceLifeId &) const = default;
 
     /// The catalog is the universe authority (INV-3): a discovery path learns of a namespace ONLY
     /// from a catalog entry, and takes BOTH fields from that same entry. Pairing a namespace with an
     /// incarnation obtained from anywhere else re-opens the rebirth alias this type exists to close.
-    static RefNamespaceId fromCatalogEntry(RootNamespace ns, const UInt128 & incarnation)
+    static NamespaceLifeId fromCatalogEntry(RootNamespace ns, const UInt128 & incarnation)
     {
-        return RefNamespaceId{std::move(ns), incarnation};
+        return NamespaceLifeId{std::move(ns), incarnation};
     }
 
     /// Stage B Task 6 adds the second permanent factory, `fromLiveHandle`: a live reader carries the
@@ -97,14 +97,14 @@ struct RefNamespaceId
     /// until then the whole tree mints keys at this one fixed incarnation and the layer stays
     /// self-consistent. Task 6 DELETES it, gated on a tree-wide grep for `stageATransition` finding
     /// no build inputs. Do not call it from new code.
-    static RefNamespaceId stageATransition(RootNamespace ns)
+    static NamespaceLifeId stageATransition(RootNamespace ns)
     {
         /// A fixed, obviously synthetic sentinel rather than a plausible-looking small number: its
         /// hex render spells `__STAGE_A_TRANS`, so a key minted during the transition is recognizable
         /// on sight in a bucket listing and cannot be mistaken for a minted incarnation.
         static constexpr UInt128 kTransitionIncarnation
             = (static_cast<UInt128>(0x5f5f'5354'4147'455fULL) << 64) | static_cast<UInt128>(0x415f'5452'414e'5301ULL);
-        return RefNamespaceId{std::move(ns), kTransitionIncarnation};
+        return NamespaceLifeId{std::move(ns), kTransitionIncarnation};
     }
 
 private:
@@ -112,12 +112,12 @@ private:
     /// site and the reason this constructor is reachable at all from outside the factories above.
     friend class Layout;
 
-    RefNamespaceId(RootNamespace ns_, const UInt128 & incarnation_)
+    NamespaceLifeId(RootNamespace ns_, const UInt128 & incarnation_)
         : ns(std::move(ns_)), incarnation(incarnation_)
     {
         if (incarnation_ == 0)
             throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR,
-                "RefNamespaceId: incarnation must be nonzero for namespace '{}' -- 0 never names a life",
+                "NamespaceLifeId: incarnation must be nonzero for namespace '{}' -- 0 never names a life",
                 ns.string());
     }
 };

@@ -111,7 +111,7 @@ private:
 void writeCkptAt(
     Backend & backend, const Layout & layout, const RootNamespace & ns, const RefTxnId & checkpoint)
 {
-    backend.putIfAbsent(layout.refCkptKey(RefNamespaceId::stageATransition(ns)),
+    backend.putIfAbsent(layout.refCkptKey(NamespaceLifeId::stageATransition(ns)),
                         encodeRefCkpt(RefCkpt{.life_epoch = std::nullopt,
                                               .checkpoint_snapshot_id = checkpoint,
                                               .last_epoch_seal = std::nullopt}));
@@ -763,7 +763,7 @@ TEST(CasGcHoldGrammar, UndecodableBodyNamesTheRecordItCouldNotRead)
     const RootNamespace ns{"00/aa@cas@"};
 
     publishAt(*backend, layout, ns, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(1), /*birth=*/true);
-    backend->putIfAbsent(layout.refLogKey(RefNamespaceId::stageATransition(ns), RefTxnId{1, 2}), "this is not a cas_ref_log object");
+    backend->putIfAbsent(layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, 2}), "this is not a cas_ref_log object");
 
     Gc gc(store, kGc);
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
@@ -833,7 +833,7 @@ TEST(CasGcHoldGrammar, AWitnessThatStopsAnsweringIsWitnessDisappeared)
     /// A third epoch keeps the unstable position from reading as a frontier.
     publishAt(*backend, layout, ns, RefTxnId{3, 1}, "ref_3", 3, DB::UInt128(3),
               /*birth=*/false, /*prev_epoch_seal=*/RefTxnId{2, 1});
-    backend->flaky = layout.refLogKey(RefNamespaceId::stageATransition(ns), RefTxnId{2, 1});
+    backend->flaky = layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{2, 1});
 
     Gc gc(store, kGc);
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
@@ -861,7 +861,7 @@ TEST(CasGcHoldGrammar, CheckpointWitnessHoldsAGapTheHintIsSilentAbout)
         publishAt(backend, layout, ns, RefTxnId{1, 2}, "ref_2", 2, DB::UInt128(2));
         /// {1,3} is missing and {1,4}, though durable, is invisible to every LIST.
         publishAt(backend, layout, ns, RefTxnId{1, 4}, "ref_4", 4, DB::UInt128(4));
-        backend.hide(layout.refLogKey(RefNamespaceId::stageATransition(ns), RefTxnId{1, 4}));
+        backend.hide(layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, 4}));
     };
 
     /// Hint-only: nothing above {1,2} is visible, so the walk honestly reads a frontier and does not hold.
@@ -889,7 +889,7 @@ TEST(CasGcHoldGrammar, CheckpointWitnessHoldsAGapTheHintIsSilentAbout)
         const Layout & layout = store->layout();
         seed(*backend, layout);
         writeCkptAt(*backend, layout, ns, RefTxnId{1, 4});
-        backend->hide(layout.refCkptKey(RefNamespaceId::stageATransition(ns)));
+        backend->hide(layout.refCkptKey(NamespaceLifeId::stageATransition(ns)));
 
         Gc gc(store, kGc);
         ASSERT_TRUE(gc.runRegularRound().acquired_lease);
@@ -923,7 +923,7 @@ TEST(CasGcHoldGrammar, CheckpointWitnessReachesAHeldNamespaceTheHintNoLongerName
         publishAt(backend, layout, ns, RefTxnId{1, 6}, "ref_6", 6, DB::UInt128(6));
         for (const RefTxnId & id : {RefTxnId{1, 1}, RefTxnId{1, 2}, RefTxnId{1, 3}, RefTxnId{1, 4},
                                     RefTxnId{1, 6}})
-            backend.hide(layout.refLogKey(RefNamespaceId::stageATransition(ns), id));
+            backend.hide(layout.refLogKey(NamespaceLifeId::stageATransition(ns), id));
     };
 
     /// Hold-witness only: it witnesses {1,3}, which the walk has now passed, so the absent {1,5} above it
@@ -949,7 +949,7 @@ TEST(CasGcHoldGrammar, CheckpointWitnessReachesAHeldNamespaceTheHintNoLongerName
         Gc gc(store, kGc);
         seedPool(*backend, layout, gc);
         writeCkptAt(*backend, layout, ns, RefTxnId{1, 6});
-        backend->hide(layout.refCkptKey(RefNamespaceId::stageATransition(ns)));
+        backend->hide(layout.refCkptKey(NamespaceLifeId::stageATransition(ns)));
 
         ASSERT_TRUE(gc.runRegularRound().acquired_lease);
         const RefHold hold = holdOf(*backend, layout, ns);
@@ -993,7 +993,7 @@ TEST(CasGcHoldGrammar, AnUndecodableCheckpointHoldsOnlyItsOwnNamespace)
 
     /// Corrupt EXACTLY ONE OBJECT: the first namespace's `_ckpt` body. Nothing else in the pool changes,
     /// so everything the next round does differently is attributable to this one object.
-    const String bad_ckpt_key = layout.refCkptKey(RefNamespaceId::stageATransition(bad));
+    const String bad_ckpt_key = layout.refCkptKey(NamespaceLifeId::stageATransition(bad));
     const HeadResult ckpt_head = backend->head(bad_ckpt_key);
     ASSERT_TRUE(ckpt_head.exists);
     ASSERT_EQ(backend->putOverwrite(bad_ckpt_key, "this is not a cas_ref_ckpt", ckpt_head.token).outcome,
@@ -1023,7 +1023,7 @@ TEST(CasGcHoldGrammar, AnUndecodableCheckpointHoldsOnlyItsOwnNamespace)
     /// its ref objects — including the ones a cleanup range computed WITHOUT the unreadable checkpoint
     /// would have widened onto — are all still there.
     for (const RefTxnId & id : {RefTxnId{1, 1}, RefTxnId{1, 2}})
-        EXPECT_TRUE(backend->head(layout.refLogKey(RefNamespaceId::stageATransition(bad), id)).exists)
+        EXPECT_TRUE(backend->head(layout.refLogKey(NamespaceLifeId::stageATransition(bad), id)).exists)
             << "ref log " << renderRefTxnId(id) << " of the held namespace was deleted";
 }
 
@@ -1056,7 +1056,7 @@ TEST(CasGcHoldGrammar, AnUndecodableCheckpointWithNoWalkPositionRecordsAnAnomaly
     Gc gc(store, kGc);
 
     /// A lone `_ckpt` with an undecodable body, and NOTHING else under that namespace.
-    backend->putIfAbsent(layout.refCkptKey(RefNamespaceId::stageATransition(phantom)), "this is not a cas_ref_ckpt");
+    backend->putIfAbsent(layout.refCkptKey(NamespaceLifeId::stageATransition(phantom)), "this is not a cas_ref_ckpt");
     publishAt(*backend, layout, good, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(11), /*birth=*/true);
 
     const RoundReport report = gc.runRegularRound();
@@ -1091,7 +1091,7 @@ TEST(CasGcHoldGrammar, AnUndecodableCheckpointWithNoWalkPositionRecordsAnAnomaly
 
     /// The unreadable object itself is never deleted as debris — repairing it is the operator's move,
     /// and GC removing it would erase the only evidence of what stopped the namespace.
-    EXPECT_TRUE(backend->head(layout.refCkptKey(RefNamespaceId::stageATransition(phantom))).exists);
+    EXPECT_TRUE(backend->head(layout.refCkptKey(NamespaceLifeId::stageATransition(phantom))).exists);
 }
 
 /// ===================== THE HOLD IS DURABLE =====================
@@ -1116,7 +1116,7 @@ RefHold seedHeldThenUnhinted(
     /// Every one of the namespace's objects vanishes from every LIST while staying readable by key:
     /// the round that follows has no hint entry for this namespace at all.
     for (const RefTxnId & id : {RefTxnId{1, 1}, RefTxnId{1, 2}, RefTxnId{1, 4}})
-        backend->hide(layout.refLogKey(RefNamespaceId::stageATransition(ns), id));
+        backend->hide(layout.refLogKey(NamespaceLifeId::stageATransition(ns), id));
     return hold;
 }
 
@@ -1150,7 +1150,7 @@ TEST(CasGcHoldGrammar, HoldForcesAnExactRetryOfItsOffendingPositionWhenUnhinted)
     Gc gc(store, kGc);
     seedHeldThenUnhinted(backend, store, ns, gc);
 
-    const String offending = store->layout().refLogKey(RefNamespaceId::stageATransition(ns), RefTxnId{1, 3});
+    const String offending = store->layout().refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, 3});
     const uint64_t before = backend->getCount(offending);
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
 
@@ -1179,7 +1179,7 @@ TEST(CasGcHoldGrammar, HoldClearsOnlyByFoldingThroughTheOffendingPosition)
     /// The record appears at last (still invisible to every LIST — the hold is the only thing that
     /// knows to look there).
     publishAt(*backend, layout, ns, RefTxnId{1, 3}, "ref_3", 3, DB::UInt128(3));
-    backend->hide(layout.refLogKey(RefNamespaceId::stageATransition(ns), RefTxnId{1, 3}));
+    backend->hide(layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, 3}));
 
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
     const auto cov = coverageOf(*backend, layout, ns);

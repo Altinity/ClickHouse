@@ -43,7 +43,7 @@ RefCkpt mergeCkpt(const RefCkpt & a, const RefCkpt & b)
 
 std::optional<CkptSample> readCkpt(Backend & backend, const Layout & layout, const RootNamespace & ns)
 {
-    std::optional<GetResult> got = backend.get(layout.refCkptKey(RefNamespaceId::stageATransition(ns)));
+    std::optional<GetResult> got = backend.get(layout.refCkptKey(NamespaceLifeId::stageATransition(ns)));
     if (!got)
         return std::nullopt;
     /// Materialized read, then decode: the object is MUTABLE, so the body must be fixed before it is
@@ -56,7 +56,7 @@ CkptPublishOutcome publishCkpt(Backend & backend, const Layout & layout, const R
                                const std::function<void(uint64_t)> & check_fence_or_throw,
                                const CkptDeadline & deadline)
 {
-    const String key = layout.refCkptKey(RefNamespaceId::stageATransition(ns));
+    const String key = layout.refCkptKey(NamespaceLifeId::stageATransition(ns));
 
     for (size_t attempt = 0; attempt < MAX_CKPT_CAS_ATTEMPTS; ++attempt)
     {

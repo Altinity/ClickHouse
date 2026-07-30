@@ -1,7 +1,7 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBlobDigest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasRefNamespaceId.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasNamespaceLifeId.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.h>
 #include <Common/Exception.h>
@@ -38,7 +38,7 @@ enum class RefObjectKind : uint8_t
 /// an operation must call `validateNamespace` before doing so.
 struct ParsedRefObjectKey
 {
-    RefNamespaceId id;
+    NamespaceLifeId id;
     RefObjectKind kind;
     RefTxnId txn_id;
 
@@ -117,10 +117,10 @@ public:
     /// present ref objects (recovery, orphan-sweep tail read) and NOTHING of any earlier life of the
     /// same namespace name, which is what makes a surviving old-incarnation object structurally inert
     /// rather than aliased (INV-3).
-    String refsNamespacePrefix(const RefNamespaceId & id) const
+    String refsNamespacePrefix(const NamespaceLifeId & id) const
     {
         checkNamespace(id.ns);
-        return prefix + "/cas/refs/" + id.ns.string() + "/" + renderRefIncarnation(id.incarnation) + "/";
+        return prefix + "/cas/refs/" + id.ns.string() + "/" + renderIncarnation(id.incarnation) + "/";
     }
 
     /// Pool-wide ref-object prefix: `<prefix>/cas/refs/`. The base of every ref object, used
@@ -134,7 +134,7 @@ public:
     /// `<prefix>/cas/refs/<ns>/<inc>/_log/<render>.zst`. The log is the text `cas_ref_log` stored with
     /// the format's always-compressed `.zst` suffix; readers construct the one canonical key and do
     /// not try an uncompressed variant.
-    String refLogKey(const RefNamespaceId & ns_id, const RefTxnId & id) const
+    String refLogKey(const NamespaceLifeId & ns_id, const RefTxnId & id) const
     {
         return refsNamespacePrefix(ns_id) + "_log/" + renderRefTxnId(id) + String(storedSuffix(FormatId::RefLog));
     }
@@ -142,7 +142,7 @@ public:
     /// Writer-published table snapshot at `.../_snap/<render>.zst`. The snapshot
     /// is the text `cas_ref_snap` stored with the format's always-compressed `.zst` suffix. Snapshot
     /// `X` reuses the `RefTxnId` of the last log it covers.
-    String refSnapshotKey(const RefNamespaceId & ns_id, const RefTxnId & id) const
+    String refSnapshotKey(const NamespaceLifeId & ns_id, const RefTxnId & id) const
     {
         return refsNamespacePrefix(ns_id) + "_snap/" + renderRefTxnId(id) + String(storedSuffix(FormatId::RefSnapshot));
     }
@@ -151,7 +151,7 @@ public:
     /// other ref object it is MUTABLE (token-CAS), carries no transaction id, and therefore lives
     /// directly under the life prefix rather than in a `_log`/`_snap`/`_cleanup` kind directory --
     /// which is also why `parseRefObjectKey` does not recognize it and `parseRefCkptKey` exists.
-    String refCkptKey(const RefNamespaceId & ns_id) const
+    String refCkptKey(const NamespaceLifeId & ns_id) const
     {
         return refsNamespacePrefix(ns_id) + "_ckpt" + String(storedSuffix(FormatId::RefCkpt));
     }
@@ -179,13 +179,13 @@ public:
     /// so that key is refused instead. One residue is unavoidable and harmless: a namespace whose OWN
     /// last segment happened to be 32 lower-case hex digits would be read one segment short. Nothing
     /// in a key can resolve that, and no such key can exist in a pool this build wrote.
-    std::optional<RefNamespaceId> parseRefCkptKey(std::string_view key) const;
+    std::optional<NamespaceLifeId> parseRefCkptKey(std::string_view key) const;
 
     /// Namespace-removal completion marker: a zero-byte object at
     /// `.../_cleanup/<render>` that GC publishes once the exact removal durably reaches `Completed`.
     /// It is a ref-layer object under the life prefix like every other, so it carries the incarnation
     /// too -- a marker for one life must not be visible to the next.
-    String refCleanupMarkerKey(const RefNamespaceId & ns_id, const RefTxnId & id) const
+    String refCleanupMarkerKey(const NamespaceLifeId & ns_id, const RefTxnId & id) const
     {
         return refsNamespacePrefix(ns_id) + "_cleanup/" + renderRefTxnId(id);
     }
@@ -450,7 +450,7 @@ private:
     /// already identified it as one of ours. Never returns a partial answer: an incarnation segment
     /// that is missing, non-canonical or zero, or a missing namespace, is refused with
     /// `CORRUPTED_DATA` naming `key`.
-    RefNamespaceId namespaceLifeOf(std::string_view key, std::string_view ns_and_incarnation) const;
+    NamespaceLifeId namespaceLifeOf(std::string_view key, std::string_view ns_and_incarnation) const;
 
     /// Build <prefix>/<namespace>/<first2chars>/<id>.
     /// Throws BAD_ARGUMENTS if id is shorter than 2 characters.

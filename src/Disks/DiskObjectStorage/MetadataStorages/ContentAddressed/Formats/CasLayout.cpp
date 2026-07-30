@@ -150,7 +150,7 @@ std::optional<ParsedRefObjectKey> Layout::parseRefObjectKey(std::string_view key
     return ParsedRefObjectKey{namespaceLifeOf(key, before_kind), kind, *txn_id};
 }
 
-std::optional<RefNamespaceId> Layout::parseRefCkptKey(std::string_view key) const
+std::optional<NamespaceLifeId> Layout::parseRefCkptKey(std::string_view key) const
 {
     const String base = casRefsPrefix();
     if (!key.starts_with(base))
@@ -172,7 +172,7 @@ std::optional<RefNamespaceId> Layout::parseRefCkptKey(std::string_view key) cons
     return namespaceLifeOf(key, before_leaf);
 }
 
-RefNamespaceId Layout::namespaceLifeOf(std::string_view key, std::string_view ns_and_incarnation) const
+NamespaceLifeId Layout::namespaceLifeOf(std::string_view key, std::string_view ns_and_incarnation) const
 {
     const size_t inc_sep = ns_and_incarnation.rfind('/');
     /// A single segment is the whole of `<ns>` with no room left for the incarnation -- i.e. exactly
@@ -182,7 +182,7 @@ RefNamespaceId Layout::namespaceLifeOf(std::string_view key, std::string_view ns
     const std::string_view ns_part
         = (inc_sep == std::string_view::npos) ? std::string_view{} : ns_and_incarnation.substr(0, inc_sep);
 
-    const auto incarnation = parseRefIncarnation(inc_seg);
+    const auto incarnation = parseIncarnation(inc_seg);
     if (!incarnation)
         throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
             "CasLayout: ref object '{}' names no life: '{}' is not 32 lower-case hex digits of a nonzero "
@@ -192,7 +192,7 @@ RefNamespaceId Layout::namespaceLifeOf(std::string_view key, std::string_view ns
         throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
             "CasLayout: ref object '{}' carries an incarnation but no namespace before it", key);
 
-    return RefNamespaceId{RootNamespace{String(ns_part)}, *incarnation};
+    return NamespaceLifeId{RootNamespace{String(ns_part)}, *incarnation};
 }
 
 std::optional<ManifestId> Layout::parseManifestKey(std::string_view key) const

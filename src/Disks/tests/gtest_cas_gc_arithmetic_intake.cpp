@@ -119,8 +119,8 @@ TEST(CasGcArithmeticIntake, HintOmittingMiddleRecordsFoldsThroughUnnoticed)
         publishAt(*backend, layout, ns, RefTxnId{1, i}, "ref_" + std::to_string(i), i,
                   DB::UInt128(i), /*birth=*/i == 1);
 
-    backend->hide(layout.refLogKey(RefNamespaceId::stageATransition(ns), RefTxnId{1, 3}));
-    backend->hide(layout.refLogKey(RefNamespaceId::stageATransition(ns), RefTxnId{1, 4}));
+    backend->hide(layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, 3}));
+    backend->hide(layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, 4}));
 
     Gc gc(store, kGc);
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
@@ -182,8 +182,8 @@ TEST(CasGcArithmeticIntake, SealCrossesEpochAndIsAppliedAsNoOp)
 
     /// The hint hides the seal AND the new epoch's first record: neither the epoch boundary nor its
     /// start may depend on the listing.
-    backend->hide(layout.refLogKey(RefNamespaceId::stageATransition(ns), RefTxnId{1, 3}));
-    backend->hide(layout.refLogKey(RefNamespaceId::stageATransition(ns), RefTxnId{2, 1}));
+    backend->hide(layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, 3}));
+    backend->hide(layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{2, 1}));
 
     Gc gc(store, kGc);
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
@@ -211,7 +211,7 @@ TEST(CasGcArithmeticIntake, ChainedEmptyEpochSealsBothConsumedInOneRound)
     publishAt(*backend, layout, ns, RefTxnId{3, 1}, "ref_2", 2, DB::UInt128(2),
               /*birth=*/false, /*prev_epoch_seal=*/RefTxnId{2, 1});
 
-    backend->hide(layout.refLogKey(RefNamespaceId::stageATransition(ns), RefTxnId{2, 1}));
+    backend->hide(layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{2, 1}));
 
     const auto intake = runRoundAndReadIntakeMetrics(store);
     ASSERT_FALSE(intake.empty()) << "no fold_ref_intake row";
@@ -390,7 +390,7 @@ TEST(CasGcArithmeticIntake, EpochStartThatAnswersOnlyEveryOtherReadHoldsInsteadO
 
     /// Arm only after seeding, so the fixture's own writes are undisturbed and the read counter starts
     /// at the round's first read of this key (`crossFromSeal`'s, which must succeed).
-    backend->flaky = layout.refLogKey(RefNamespaceId::stageATransition(ns), RefTxnId{2, 1});
+    backend->flaky = layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{2, 1});
 
     Gc gc(store, kGc);
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);   /// must RETURN -- the spin is the failure mode
@@ -420,7 +420,7 @@ TEST(CasGcArithmeticIntake, CorruptBodyClampsOneNamespaceWhileAnotherFolds)
     const RootNamespace ns_b{"00/bb@cas@"};
 
     publishAt(*backend, layout, ns_a, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(1), /*birth=*/true);
-    backend->putIfAbsent(layout.refLogKey(RefNamespaceId::stageATransition(ns_a), RefTxnId{1, 2}), "this is not a cas_ref_log object");
+    backend->putIfAbsent(layout.refLogKey(NamespaceLifeId::stageATransition(ns_a), RefTxnId{1, 2}), "this is not a cas_ref_log object");
 
     publishAt(*backend, layout, ns_b, RefTxnId{1, 1}, "ref_1", 11, DB::UInt128(11), /*birth=*/true);
     publishAt(*backend, layout, ns_b, RefTxnId{1, 2}, "ref_2", 12, DB::UInt128(12));
@@ -461,7 +461,7 @@ TEST(CasGcArithmeticIntake, B1IdentityHoldsOverAHoleyCutThatCrossesASeal)
               /*birth=*/false, /*prev_epoch_seal=*/RefTxnId{1, 3});
     publishAt(*backend, layout, ns, RefTxnId{2, 2}, "ref_4", 4, DB::UInt128(4));
 
-    backend->hide(layout.refLogKey(RefNamespaceId::stageATransition(ns), RefTxnId{1, 2}));
+    backend->hide(layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, 2}));
 
     const auto intake = runRoundAndReadIntakeMetrics(store);
     ASSERT_FALSE(intake.empty()) << "no fold_ref_intake row";
@@ -489,7 +489,7 @@ TEST(CasGcArithmeticIntake, WhollyOmittedNamespaceFoldsCorrectlyOnceHintReturns)
         publishAt(*backend, layout, ns, RefTxnId{1, i}, "ref_" + std::to_string(i), i,
                   DB::UInt128(i), /*birth=*/i == 1);
     for (uint64_t i = 1; i <= 3; ++i)
-        backend->hide(layout.refLogKey(RefNamespaceId::stageATransition(ns), RefTxnId{1, i}));
+        backend->hide(layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, i}));
 
     Gc gc(store, kGc);
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);

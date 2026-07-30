@@ -400,7 +400,7 @@ public:
     /// result is acted on -- `txn_id`, `bytes` and `admitted_fence_generation` (`resolveWedgeOnce`'s
     /// post-I/O recheck, which calls them "all three components of the identity"). The key is not
     /// compared because it adds nothing: `Layout::refLogKey` is a function of
-    /// `(RefNamespaceId, RefTxnId)`, and the namespace life is fixed for the runtime that holds the
+    /// `(NamespaceLifeId, RefTxnId)`, and the namespace life is fixed for the runtime that holds the
     /// attempt, so within one runtime an equal `txn_id` already implies an equal key. (Should a runtime
     /// ever span two incarnations of one namespace -- it does not today -- that implication is what
     /// would need re-checking, not the comparison list.)

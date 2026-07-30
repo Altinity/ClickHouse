@@ -116,7 +116,7 @@ TEST(CasRefChunkPreparation, PreparedKeyAndSealedBytesAreCanonical)
     EXPECT_EQ(parsed->id.ns, kNs);
     EXPECT_EQ(parsed->kind, RefObjectKind::Log);
     EXPECT_EQ(parsed->txn_id, id);
-    EXPECT_EQ(prepared.prepared_attempt.key, kLayout.refLogKey(RefNamespaceId::stageATransition(kNs), id));
+    EXPECT_EQ(prepared.prepared_attempt.key, kLayout.refLogKey(NamespaceLifeId::stageATransition(kNs), id));
 
     const RefLogTxn decoded = decodeRefLogTxn(
         openObject(FormatId::RefLog, prepared.prepared_attempt.bytes), kNs.string(), id);
@@ -238,7 +238,7 @@ TEST(CasRefChunkPreparation, PreparedAttemptIsCompleteBeforeAnyDurableEffect)
 
     /// Nothing left to build: the key and body the request will read are already the canonical ones, so
     /// the arming block's only remaining work really is the move it declares itself to be.
-    EXPECT_EQ(prepared.prepared_attempt.key, kLayout.refLogKey(RefNamespaceId::stageATransition(kNs), id));
+    EXPECT_EQ(prepared.prepared_attempt.key, kLayout.refLogKey(NamespaceLifeId::stageATransition(kNs), id));
     EXPECT_EQ(prepared.prepared_attempt.bytes,
               sealObject(FormatId::RefLog, encodeRefLogTxn(prepared.chunk_txn)));
 }

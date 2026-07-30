@@ -275,9 +275,9 @@ TEST(CasRefCkpt, KeyIsTheLifeLeafAndParsesBack)
 {
     const Layout layout{"p"};
     const RootNamespace ns{"srv1/ckpt_key"};
-    const RefNamespaceId ns_id = RefNamespaceId::stageATransition(ns);
+    const NamespaceLifeId ns_id = NamespaceLifeId::stageATransition(ns);
     EXPECT_EQ(layout.refCkptKey(ns_id),
-        "p/cas/refs/srv1/ckpt_key/" + renderRefIncarnation(ns_id.incarnation) + "/_ckpt");
+        "p/cas/refs/srv1/ckpt_key/" + renderIncarnation(ns_id.incarnation) + "/_ckpt");
     EXPECT_EQ(layout.parseRefCkptKey(layout.refCkptKey(ns_id)), ns_id);
 
     /// `_ckpt` has no kind directory, so the id-bearing parser must NOT claim it -- and the `_ckpt`
@@ -298,9 +298,9 @@ TEST(CasRefCkpt, GroupRefKeysClassifiesTheCkptInsteadOfAbortingTheRound)
     const Layout layout{"p"};
     const RootNamespace ns{"srv1/ckpt_group"};
     const std::vector<String> keys = {
-        layout.refLogKey(RefNamespaceId::stageATransition(ns), ID_1_1),
-        layout.refSnapshotKey(RefNamespaceId::stageATransition(ns), ID_1_1),
-        layout.refCkptKey(RefNamespaceId::stageATransition(ns)),
+        layout.refLogKey(NamespaceLifeId::stageATransition(ns), ID_1_1),
+        layout.refSnapshotKey(NamespaceLifeId::stageATransition(ns), ID_1_1),
+        layout.refCkptKey(NamespaceLifeId::stageATransition(ns)),
     };
 
     const auto grouped = groupRefKeys(layout, keys);
@@ -418,7 +418,7 @@ TEST(CasRefCkpt, TokenConflictRereadsAndMergesOntoTheWinner)
 {
     const Layout layout{"p"};
     const RootNamespace ns{"srv1/ckpt_conflict"};
-    const String key = layout.refCkptKey(RefNamespaceId::stageATransition(ns));
+    const String key = layout.refCkptKey(NamespaceLifeId::stageATransition(ns));
     const RefCkpt base{.life_epoch = std::optional<uint64_t>{5}, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
 
     auto backend = std::make_shared<GetHookBackend>(key);
@@ -460,7 +460,7 @@ TEST(CasRefCkpt, AnIdenticalMergedBodyIssuesNoWrite)
     auto backend = std::make_shared<CountingBackend>();
     const Layout layout{"p"};
     const RootNamespace ns{"srv1/ckpt_noop"};
-    const String key = layout.refCkptKey(RefNamespaceId::stageATransition(ns));
+    const String key = layout.refCkptKey(NamespaceLifeId::stageATransition(ns));
     const RefCkpt full{.life_epoch = std::optional<uint64_t>{5}, .checkpoint_snapshot_id = ID_1_2, .last_epoch_seal = ID_2_1};
 
     ASSERT_EQ(publishCkpt(*backend, layout, ns, full, 1, ALWAYS_ADMITTED, generousDeadline()),
@@ -487,7 +487,7 @@ TEST(CasRefCkpt, AFenceBumpBetweenTheReadAndTheCasWritesNothing)
     auto backend = std::make_shared<CountingBackend>();
     const Layout layout{"p"};
     const RootNamespace ns{"srv1/ckpt_fenced"};
-    const String key = layout.refCkptKey(RefNamespaceId::stageATransition(ns));
+    const String key = layout.refCkptKey(NamespaceLifeId::stageATransition(ns));
     const RefCkpt base{.life_epoch = std::optional<uint64_t>{5}, .checkpoint_snapshot_id = ID_1_1, .last_epoch_seal = std::nullopt};
     ASSERT_EQ(publishCkpt(*backend, layout, ns, base, 1, ALWAYS_ADMITTED, generousDeadline()),
               CkptPublishOutcome::Published);
@@ -518,7 +518,7 @@ TEST(CasRefCkpt, AnExhaustedDeadlineUnderPersistentConflictThrowsRetryLater)
 {
     const Layout layout{"p"};
     const RootNamespace ns{"srv1/ckpt_exhausted"};
-    const String key = layout.refCkptKey(RefNamespaceId::stageATransition(ns));
+    const String key = layout.refCkptKey(NamespaceLifeId::stageATransition(ns));
     const RefCkpt base{.life_epoch = std::optional<uint64_t>{5}, .checkpoint_snapshot_id = ID_1_1, .last_epoch_seal = std::nullopt};
 
     auto backend = std::make_shared<GetHookBackend>(key);
@@ -552,7 +552,7 @@ TEST(CasRefCkpt, ACorruptCheckpointIsNeverOverwritten)
     auto backend = std::make_shared<CountingBackend>();
     const Layout layout{"p"};
     const RootNamespace ns{"srv1/ckpt_corrupt"};
-    const String key = layout.refCkptKey(RefNamespaceId::stageATransition(ns));
+    const String key = layout.refCkptKey(NamespaceLifeId::stageATransition(ns));
     ASSERT_EQ(publishCkpt(*backend, layout, ns,
                           RefCkpt{.life_epoch = std::optional<uint64_t>{5}, .checkpoint_snapshot_id = ID_1_2, .last_epoch_seal = std::nullopt},
                           1, ALWAYS_ADMITTED, generousDeadline()), CkptPublishOutcome::Published);
@@ -610,7 +610,7 @@ TEST(CasRefCkpt, NamespaceBirthCreatesTheCheckpointCarryingItsLifeEpoch)
     auto store = openPool(backend);
     const RootNamespace ns{"srv1/ckpt_birth"};
 
-    EXPECT_FALSE(backend->head(store->layout().refCkptKey(RefNamespaceId::stageATransition(ns))).exists)
+    EXPECT_FALSE(backend->head(store->layout().refCkptKey(NamespaceLifeId::stageATransition(ns))).exists)
         << "nothing exists before the birth";
     ASSERT_EQ(publishRef(store, ns, "ref_1", 1), (RefTxnId{store->writerEpoch(), 1}));
 
@@ -643,7 +643,7 @@ TEST(CasRefCkpt, ACommittedSnapshotPublishAdvancesTheCheckpoint)
                                                  "the merge must preserve what the birth wrote";
     /// And the snapshot body it names really is there -- the checkpoint may never point at a key that
     /// does not exist, which is the premise the missing-base rule reasons from.
-    EXPECT_TRUE(backend->head(store->layout().refSnapshotKey(RefNamespaceId::stageATransition(ns), *published)).exists);
+    EXPECT_TRUE(backend->head(store->layout().refSnapshotKey(NamespaceLifeId::stageATransition(ns), *published)).exists);
 }
 
 /// The body-PUT/cleanup/`_ckpt` race, decided by the ORDER of the two writes: cleanup planned in the
@@ -688,7 +688,7 @@ TEST(CasRefCkpt, TheCheckpointIsWrittenOncePerPublicationAndNotOnIdleAttempts)
     auto store = openPool(backend);
     const uint64_t epoch = store->writerEpoch();
     const RootNamespace ns{"srv1/ckpt_republish"};
-    const String key = store->layout().refCkptKey(RefNamespaceId::stageATransition(ns));
+    const String key = store->layout().refCkptKey(NamespaceLifeId::stageATransition(ns));
 
     ASSERT_EQ(publishRef(store, ns, "ref_1", 1), (RefTxnId{epoch, 1}));
     const uint64_t writes_after_birth = backend->casPutCount(key);
@@ -714,7 +714,7 @@ TEST(CasRefCkpt, NeedsRecoveryReplaysBeforeCheckpointAdvance)
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPool(backend);
     const RootNamespace ns{"srv1/ckpt_poisoned"};
-    const String key = store->layout().refCkptKey(RefNamespaceId::stageATransition(ns));
+    const String key = store->layout().refCkptKey(NamespaceLifeId::stageATransition(ns));
 
     ASSERT_EQ(publishRef(store, ns, "ref_1", 1), (RefTxnId{store->writerEpoch(), 1}));
     const auto before = readCkpt(*backend, store->layout(), ns);
@@ -756,7 +756,7 @@ TEST(CasRefCkpt, APublishFencedOutMidAttemptDoesNotAdvanceTheCheckpoint)
 {
     const Layout probe_layout{"p"};
     const RootNamespace ns{"srv1/ckpt_stale_gen"};
-    const String ckpt_key = probe_layout.refCkptKey(RefNamespaceId::stageATransition(ns));
+    const String ckpt_key = probe_layout.refCkptKey(NamespaceLifeId::stageATransition(ns));
 
     auto backend = std::make_shared<GetHookBackend>(ckpt_key);
     DB::Cas::tests::seedPoolMetaForRestart(*backend);
@@ -808,9 +808,9 @@ TEST(CasRefCkpt, CommitRefChunkDurableBytesUnchangedByExtraction)
 
     /// The KEY carries the namespace incarnation, so its life segment is rendered rather than pasted
     /// (Task 1c re-keys it); every other segment is literal.
-    const String key = store->layout().refLogKey(RefNamespaceId::stageATransition(ns), id);
+    const String key = store->layout().refLogKey(NamespaceLifeId::stageATransition(ns), id);
     EXPECT_EQ(key, "p/cas/refs/test/golden@cas@/"
-                   + renderRefIncarnation(RefNamespaceId::stageATransition(ns).incarnation)
+                   + renderIncarnation(NamespaceLifeId::stageATransition(ns).incarnation)
                    + "/_log/0000000000000001-0000000000000001.zst")
         << "the canonical ref-log key the append lane derives";
 
@@ -842,8 +842,8 @@ TEST(CasRefCkpt, AppendRequestCountUnchangedByExtraction)
     const RootNamespace ns{"test/req@cas@"};
 
     const RefTxnId id = publishRef(store, ns, "req_ref", 1);
-    const String log_key = store->layout().refLogKey(RefNamespaceId::stageATransition(ns), id);
-    const String ckpt_key = store->layout().refCkptKey(RefNamespaceId::stageATransition(ns));
+    const String log_key = store->layout().refLogKey(NamespaceLifeId::stageATransition(ns), id);
+    const String ckpt_key = store->layout().refCkptKey(NamespaceLifeId::stageATransition(ns));
 
     EXPECT_EQ(backend->putCount(log_key), 1u) << "exactly one write-once PUT per committed chunk";
     EXPECT_EQ(backend->getCount(log_key), 0u) << "a Committed PUT owes no read-back";
@@ -892,5 +892,5 @@ TEST(CasRefCkpt, PostDurableInstallRegionStillEnteredAfterExtraction)
     EXPECT_GT(probe_hits, 0u)
         << "no probe-instrumented post-durable install region was entered on a committing append -- "
            "the `Committed` install arm was not reached at all";
-    EXPECT_TRUE(backend->get(store->layout().refLogKey(RefNamespaceId::stageATransition(ns), id)).has_value());
+    EXPECT_TRUE(backend->get(store->layout().refLogKey(NamespaceLifeId::stageATransition(ns), id)).has_value());
 }

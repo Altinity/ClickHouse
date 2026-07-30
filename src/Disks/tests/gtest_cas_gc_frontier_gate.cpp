@@ -156,7 +156,7 @@ PoolPtr buildCrossNamespaceScenario(const std::shared_ptr<CountingHintHoleBacken
     }
 
     publish(*backend, layout, hidden, "kept_ref", 1, blob);
-    backend->hidePrefix(layout.refsNamespacePrefix(RefNamespaceId::stageATransition(hidden)));
+    backend->hidePrefix(layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(hidden)));
 
     const ManifestRef dropped = publish(*backend, layout, visible, "dropped_ref", 2, blob);
     dropRefTransition(*backend, layout, visible, "dropped_ref", dropped);
@@ -529,7 +529,7 @@ TEST(CasGcFrontierGate, APartialProbeBudgetPublishesATallyThatMatchesTheSealedSe
 
     /// All three go unhinted at once, so the budget of one cannot cover them.
     for (const RootNamespace & ns : {a, b, c})
-        backend->hidePrefix(layout.refsNamespacePrefix(RefNamespaceId::stageATransition(ns)));
+        backend->hidePrefix(layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)));
 
     std::map<String, UInt64> intake;
     gc.setPhaseSink([&](const GcPhaseRecord & rec)
@@ -577,12 +577,12 @@ TEST(CasGcFrontierGate, AQuietKnownNamespaceCostsExactlyOneExactGet)
     ASSERT_NE(sealed, (RefTxnId{})) << "the seeding round must have sealed a cursor to carry";
 
     /// Now the store stops listing the namespace entirely.
-    backend->hidePrefix(layout.refsNamespacePrefix(RefNamespaceId::stageATransition(quiet)));
+    backend->hidePrefix(layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(quiet)));
     backend->resetCounts();
     runRegularRoundReclaiming(gc);
 
     const String expected_next =
-        layout.refLogKey(RefNamespaceId::stageATransition(quiet), RefTxnId{sealed.writer_epoch, sealed.ref_sequence + 1});
+        layout.refLogKey(NamespaceLifeId::stageATransition(quiet), RefTxnId{sealed.writer_epoch, sealed.ref_sequence + 1});
     EXPECT_EQ(backend->getCount(expected_next), 1u)
         << "exactly one exact probe at the arithmetic successor of the sealed cursor";
 }
@@ -606,7 +606,7 @@ TEST(CasGcFrontierGate, AWronglyQuietNamespaceIsWalkedTheSameRound)
 
     /// A second publish lands, and the store hides the namespace from every LIST at the same moment.
     publish(*backend, layout, quiet, "ref_2", 2, late_blob);
-    backend->hidePrefix(layout.refsNamespacePrefix(RefNamespaceId::stageATransition(quiet)));
+    backend->hidePrefix(layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(quiet)));
 
     runRegularRoundReclaiming(gc);
 
@@ -640,7 +640,7 @@ TEST(CasGcFrontierGate, AnExhaustedProbeBudgetSealsCursorsAndDeletesNothing)
 
     /// The quiet namespace goes unhinted, and the budget is zero, so it is never probed. The busy
     /// namespace meanwhile drops its ref, which would otherwise condemn and delete the blob.
-    backend->hidePrefix(layout.refsNamespacePrefix(RefNamespaceId::stageATransition(quiet)));
+    backend->hidePrefix(layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(quiet)));
     dropRefTransition(*backend, layout, busy, "busy_ref", mref);
 
     backend->resetCounts();
@@ -697,7 +697,7 @@ TEST(CasGcFrontierGate, ACarriedHoldSuppressesOnARoundThatDetectedNothing)
         << "round 1 must stop below the gap and hold there";
 
     /// The witness goes quiet. From here the walk of `held` detects nothing whatsoever.
-    backend->hidePrefix(layout.refLogKey(RefNamespaceId::stageATransition(held), RefTxnId{1, 4}));
+    backend->hidePrefix(layout.refLogKey(NamespaceLifeId::stageATransition(held), RefTxnId{1, 4}));
 
     /// Meanwhile a blob elsewhere becomes condemnable, so the round has real destructive work to decline.
     const ManifestRef mref = publish(*backend, layout, busy, "busy_ref", 9, blob);
@@ -956,8 +956,8 @@ TEST(CasGcFrontierGate, ThePendingCleanupPassDeletesTheRemovedNamespaceCheckpoin
     const GcState st = decodeGcState(backend->get(layout.gcStateKey())->bytes);
 
     /// Both namespaces have a `_ckpt`; only one of them is being removed.
-    backend->putIfAbsent(layout.refCkptKey(RefNamespaceId::stageATransition(removed)), "checkpoint-body");
-    backend->putIfAbsent(layout.refCkptKey(RefNamespaceId::stageATransition(live)), "checkpoint-body");
+    backend->putIfAbsent(layout.refCkptKey(NamespaceLifeId::stageATransition(removed)), "checkpoint-body");
+    backend->putIfAbsent(layout.refCkptKey(NamespaceLifeId::stageATransition(live)), "checkpoint-body");
 
     const RefTxnId remove_txn{1, 5};
     CasFoldSeal seal;
@@ -966,9 +966,9 @@ TEST(CasGcFrontierGate, ThePendingCleanupPassDeletesTheRemovedNamespaceCheckpoin
 
     gc.runNamespaceCleanupPassesForTest(seal, /*ref_tables*/{}, st.round, /*suppress_destructive*/false);
 
-    EXPECT_FALSE(backend->head(layout.refCkptKey(RefNamespaceId::stageATransition(removed))).exists)
+    EXPECT_FALSE(backend->head(layout.refCkptKey(NamespaceLifeId::stageATransition(removed))).exists)
         << "the removed namespace's checkpoint is reclaimed by its Pending pass -- nothing else would";
-    EXPECT_TRUE(backend->head(layout.refCkptKey(RefNamespaceId::stageATransition(live))).exists)
+    EXPECT_TRUE(backend->head(layout.refCkptKey(NamespaceLifeId::stageATransition(live))).exists)
         << "a live namespace's checkpoint is untouched: the delete is a KNOWN KEY, not a prefix sweep";
 }
 
@@ -983,7 +983,7 @@ TEST(CasGcFrontierGate, TheCheckpointDeleteIsHeldBySuppressionLikeEveryOtherSite
     Gc gc(store, kGc);
     runRegularRoundReclaiming(gc);
     const GcState st = decodeGcState(backend->get(layout.gcStateKey())->bytes);
-    backend->putIfAbsent(layout.refCkptKey(RefNamespaceId::stageATransition(removed)), "checkpoint-body");
+    backend->putIfAbsent(layout.refCkptKey(NamespaceLifeId::stageATransition(removed)), "checkpoint-body");
 
     const RefTxnId remove_txn{1, 5};
     CasFoldSeal seal;
@@ -992,7 +992,7 @@ TEST(CasGcFrontierGate, TheCheckpointDeleteIsHeldBySuppressionLikeEveryOtherSite
 
     gc.runNamespaceCleanupPassesForTest(seal, /*ref_tables*/{}, st.round, /*suppress_destructive*/true);
 
-    EXPECT_TRUE(backend->head(layout.refCkptKey(RefNamespaceId::stageATransition(removed))).exists)
+    EXPECT_TRUE(backend->head(layout.refCkptKey(NamespaceLifeId::stageATransition(removed))).exists)
         << "a suppressed round leaves the checkpoint alone, exactly as it leaves every other object";
 }
 
@@ -1013,8 +1013,8 @@ TEST(CasGcFrontierGate, TheCheckpointDeleteAbortsOnTheRecreationMarker)
     const RefTxnId remove_txn{1, 5};
     /// A successor already Completed this item and the writer recreated the namespace, so the marker is
     /// durable and the `_ckpt` under this key belongs to the NEW incarnation.
-    backend->putIfAbsent(layout.refCleanupMarkerKey(RefNamespaceId::stageATransition(removed), remove_txn), String{});
-    backend->putIfAbsent(layout.refCkptKey(RefNamespaceId::stageATransition(removed)), "recreated-checkpoint");
+    backend->putIfAbsent(layout.refCleanupMarkerKey(NamespaceLifeId::stageATransition(removed), remove_txn), String{});
+    backend->putIfAbsent(layout.refCkptKey(NamespaceLifeId::stageATransition(removed)), "recreated-checkpoint");
 
     CasFoldSeal seal;
     seal.ns_cleanup_items[removed.string() + "\n" + renderRefTxnId(remove_txn)] =
@@ -1022,7 +1022,7 @@ TEST(CasGcFrontierGate, TheCheckpointDeleteAbortsOnTheRecreationMarker)
 
     gc.runNamespaceCleanupPassesForTest(seal, /*ref_tables*/{}, st.round, /*suppress_destructive*/false);
 
-    EXPECT_TRUE(backend->head(layout.refCkptKey(RefNamespaceId::stageATransition(removed))).exists)
+    EXPECT_TRUE(backend->head(layout.refCkptKey(NamespaceLifeId::stageATransition(removed))).exists)
         << "the marker is the recreation precondition; the checkpoint delete honours it like every "
            "other delete in the pass";
 }
