@@ -1067,11 +1067,14 @@ void ContentAddressedTransaction::removeRecursive(const std::string & path, cons
             prefix.pop_back();
         /// RECORD AND CONTINUE, and the reason is the shape of the alternative. Refusing the DROP would
         /// make the obstacle permanent, blocked by the one operation that could have cleared it. The GC
-        /// round does not clear it either, and that is a test's claim rather than this comment's:
-        /// `CasRefGc.UnIncarnatedRefKeyAbortsRefFoldingWithoutWedgingTheRound` runs a round over such a
-        /// key and holds that the round deletes nothing and the key survives it. Continuing drops every
-        /// namespace the enumeration DID name; the offending key stays as reported debris. It cannot hide
-        /// a namespace that has any well-formed key of its own, because attribution is per key.
+        /// round does not clear it either. For a ref-family key that is a test's claim rather than this
+        /// comment's: `CasRefGc.UnIncarnatedRefKeyAbortsRefFoldingWithoutWedgingTheRound` runs a round
+        /// over such a key and holds that the round deletes nothing and the key survives it. For a
+        /// `_files`-family key the round never gets the chance: `Cas::Gc`'s fold only LISTs
+        /// `casRefsPrefix()`, never `rootsPrefix()`, so such a key sits outside anything a round scans.
+        /// Continuing drops every namespace the enumeration DID name; the offending key stays as
+        /// reported debris. It cannot hide a namespace that has any well-formed key of its own, because
+        /// attribution is per key.
         const Cas::NamespaceListing listing = metadata_storage.store()->listNamespaces(prefix + "/");
         for (const Cas::UnattributableNamespaceKey & bad : listing.skipped)
             LOG_ERROR(getLogger("ContentAddressedTransaction"),
