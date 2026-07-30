@@ -786,6 +786,27 @@ in `gtest_cas_ns_creation_lifecycle.cpp`.
   persisted data and no compat obligation, so the two tasks need not each be
   independently loadable.
 
+**Carried residues — this task opens `CasRefLedger.cpp`, so it owns these two.** Both were filed
+in BACKLOG against "whichever task next touches the install regions"; that placement named no task
+and the task it meant closed without taking them, which is exactly why they are written as steps
+here instead of as a pointer.
+
+- [ ] **Step 0a: the terminal-state-reported-as-retryable arm** (BACKLOG
+  `{#lane-terminal-reported-as-retryable}`, re-verified live 2026-07-30). `commitRefChunk`'s "lane
+  not `Ready` at new-id allocation" arm sets `RefLaneState::Faulted` and then completes the
+  survivors with `makeCasWriteRetryLaterExceptionPtr` — a TERMINAL state reported with the class
+  upstream treats as retryable. It is self-limiting (the next flush's `resolveWedgeOnce` takes the
+  `invalid_lane_state` arm), so the cost is one spurious retry on a `chassert`-guarded path — but it
+  contradicts the contract's own split, where `Faulted` carries `CORRUPTED_DATA`. One-line fix: hand
+  that arm the same `CORRUPTED_DATA` class its sibling `Faulted` arms use. Add the assertion that
+  pins it; a terminal state must not be reported as retryable from ANY arm.
+- [ ] **Step 0b: the stale install-region count.** The comment `Post-durable install region 2 of 3`
+  in `CasRefLedger.cpp` still counts three; the restatement deleted the third and exactly TWO
+  probe-instrumented regions remain (verified 2026-07-30). `gtest_cas_ref_ckpt.cpp`'s fence comment
+  already says "BOTH", so the tree currently contradicts itself about how many places must stay
+  allocation-free. Fix the count. (The other half of that BACKLOG entry — the probe having no test —
+  is RESOLVED: that fence uses it, and discloses that the probe is SHARED by both regions.)
+
 - [ ] **Step 1: Failing tests**: a NEW test in `gtest_cas_universe_from_catalog.cpp` — fold
   discovers a namespace with ZERO listable objects (hint fully blind) via the catalog and
   probes its frontier (this does NOT touch the Stage-A liar test: after the amendment
@@ -1615,6 +1636,16 @@ model family, each with its runner output pasted.
 **Task 10c — runnerless models.** `CaGcLeaseCore`, `CaGcRoundDeferCore`,
 `CaGcShardIncarnationCore`, `CaB140DangleMerge` (4 `m_*.cfg` configs): each gets a runner or a
 RECORDED retirement decision. Commit alone.
+
+**Task 10e — the lane battery's two witness debts** (carried from BACKLOG
+`{#lane-witness-names-more-than-it-proves}`, which had no executing task until now). Two fixes in
+`docs/superpowers/models/`: (1) `CaRefLaneCore_RESULTS.md` calls `saw_retry_created` a
+"retry-created adoption" witness, but the flag is set in `ObserveDurable`, so it witnesses that the
+retry reached DURABILITY — not that the adoption install happened. Correct the wording; prefer
+deleting the over-claiming phrase over rewriting it. (2) No witness asserts the `Wedged → Ready`
+durable-adoption arm at all — add one that fires on the adoption install itself, and re-run
+`run_reflane.sh` (currently 15/15) pasting the tail. Neither touches the blocker-dissolved verdict,
+whose proof runs through `ReadyCaughtUp`. Commit alone.
 
 **Task 10d — phase-runner classifier.** Fix the five phase runners' inert `[A-Za-z_]+` →
 `[A-Za-z0-9_]+`; re-run all five end-to-end once (expect identical results; paste tails).
