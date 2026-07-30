@@ -1967,21 +1967,19 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         /// below this cursor. The walk below starts at `cursor + 1`, so those edges would never fold and
         /// the recreated refs' manifests would look unreferenced.
         ///
-        /// Two things keep that from biting today. The cursor is dropped when the namespace vanishes: the
-        /// new seal's `per_ns_shard` is written ONLY for namespaces in THIS round's listing (see the
-        /// single write site below, and the abort path's carry, which both iterate `walk_targets`), so a
-        /// fully-deleted namespace leaves no cursor behind and a later recreation folds from `{0, 0}`.
-        /// The ONE exception is a HELD namespace, whose cursor and hold ride forward even unlisted --
-        /// deliberately, because a store that stops listing a namespace must not thereby clear its
-        /// hold. It does not widen the recreation window: a held namespace suppresses all destruction
-        /// by definition, so nothing acts on its cursor either way.
-        /// The residual window is a recreation that lands before the round which would have dropped the
-        /// cursor -- and there Stage A is safe only because ALL destruction is suppressed
-        /// (`UniversePolicy`), i.e. nothing acts on the unfolded edges.
-        ///
-        /// The structural closure is Stage B's catalog incarnations: cursors keyed by
-        /// `(namespace, incarnation)` rather than by name, which makes a recreated namespace a different
-        /// key instead of the same key with re-derived ids. Do not "fix" it here by comparing ids.
+        /// Nothing today prunes the cursor when the namespace vanishes -- a prior version of this
+        /// comment claimed otherwise ("written ONLY for namespaces in THIS round's listing, so a
+        /// fully-deleted namespace leaves no cursor behind"), which is FALSE (increment review NEW-2):
+        /// `walk_targets` includes every namespace with a `parent_cursors` entry regardless of whether
+        /// this round's listing mentions it at all, so the new seal's `per_ns_shard` re-carries the SAME
+        /// cursor forward every round, forever, entry or no entry. This is Stage A residual behaviour --
+        /// no removal API exists yet to even trigger it (`CasRefCatalog` has no entry-deletion primitive
+        /// -- see `deferred-docs-fixes.md` D19/NEW-4-6) -- and is safe ONLY because ALL destruction stays
+        /// suppressed under `UniversePolicy::kDefault` until Task 5 lands. Task 5 owns BOTH halves this
+        /// comment used to gloss over concretely: pruning the cursor once the removal's marker and
+        /// retirement are durable, and only then. Do not "fix" the same-epoch-rebirth id-ordering gap
+        /// above by comparing ids -- the structural closure is Stage B's catalog incarnations (cursors
+        /// keyed by `(namespace, incarnation)`, not by name), which Task 5/6 own.
         const auto cursor_it = parent_cursors.find(cursor_key);
         const RefTxnId cursor = cursor_it != parent_cursors.end()
             ? cursor_it->second.last_folded_ref_id : RefTxnId{};
