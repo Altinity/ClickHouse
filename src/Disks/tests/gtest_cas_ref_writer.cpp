@@ -115,8 +115,15 @@ PoolPtr openPoolWithConfig(const BackendPtr & backend, PoolConfig config)
 
 /// Mirrors gtest_cas_part_write.cpp's startBuildFor/publishOneBlobPart, minus the blob (an empty-entry
 /// manifest is a legal, blob-free part -- the ref-writer tests only care about ref/manifest identity).
+///
+/// Stage B (Task 4-C): pin `ns` to the sentinel before the first real touch -- ONE choke point for
+/// every test in this file, since every real-path setup here funnels through `startBuildFor` (directly,
+/// or via `publishEmptyPart` below). Many of this file's tests separately compute an expected key via
+/// `NamespaceLifeId::stageATransition(ns)` for fault injection/verification; without this the real
+/// production birth mints a random incarnation and those computed keys land nowhere real.
 PartWriteTxnPtr startBuildFor(const PoolPtr & s, const RootNamespace & ns, const String & ref)
 {
+    DB::Cas::tests::casAdmitEntry(s->backend(), s->layout(), ns);
     PartWriteInfo info;
     info.intended_namespace = ns;
     info.intended_ref = ns.string() + "/" + ref;
@@ -567,6 +574,11 @@ TEST(RefWriterRecovery, RestartOnVanishConvergesOnNewerSnapshot)
     const ManifestRef ma = manifestRef(1, 1, 1);
     const ManifestRef mb = manifestRef(1, 2, 1);
 
+    /// Stage B (Task 4-C): pin `ns` to the sentinel before the raw snapshot below -- `store->resolveRef`
+    /// further down is a real production read that triggers `resolveNamespaceLife`, which for an
+    /// UNADMITTED namespace mints a fresh RANDOM incarnation rather than adopting the sentinel the raw
+    /// fixture writes at.
+    DB::Cas::tests::casAdmitEntry(*backend, layout, ns);
     const RefTxnId snap_x{1, 10};
     writeRefSnapshotRaw(*backend, layout, minimalLiveSnapshot(ns.string(), snap_x, {committedRow("a", ma)}));
     backend->vanish_once_keys.insert(layout.refSnapshotKey(NamespaceLifeId::stageATransition(ns), snap_x));
@@ -596,6 +608,10 @@ TEST(RefWriterRecovery, DifferentBytesAtSelectedSnapshotIsCorruptionNotRestart)
     /// A structurally-valid snapshot BODY, but for a DIFFERENT namespace, placed under `ns`'s own key
     /// (a copy-under-the-wrong-prefix scenario) -- decodeRefTableSnapshot's key/body cross-check must
     /// reject it, never treat it as a restart signal.
+    /// Stage B (Task 4-C): pin `ns` to the sentinel before the raw write below -- `store->resolveRef`
+    /// further down is a real production read that would otherwise mint a fresh RANDOM incarnation
+    /// for this unadmitted namespace instead of adopting the sentinel the raw fixture writes at.
+    DB::Cas::tests::casAdmitEntry(*backend, layout, ns);
     const RootNamespace other_ns{"srv1/other"};
     DB::Cas::RefTableSnapshot foreign;
     foreign.ns = other_ns.string();
@@ -3015,6 +3031,10 @@ TEST(RefWriterRecoveryRetry, VanishBrakeStaysTerminalNotRetried)
     const RootNamespace ns{"srv1/retry_vanish"};
     const ManifestRef ma = manifestRef(1, 1, 1);
 
+    /// Stage B (Task 4-C): pin `ns` to the sentinel before the raw snapshot below -- `store->listRefs`
+    /// further down is a real production read that would otherwise mint a fresh RANDOM incarnation for
+    /// this unadmitted namespace instead of adopting the sentinel the raw fixture writes at.
+    DB::Cas::tests::casAdmitEntry(*backend, layout, ns);
     const RefTxnId snap_x{1, 10};
     writeRefSnapshotRaw(*backend, layout, minimalLiveSnapshot(ns.string(), snap_x, {committedRow("a", ma)}));
 

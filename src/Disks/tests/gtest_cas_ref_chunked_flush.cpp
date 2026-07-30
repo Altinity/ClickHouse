@@ -89,8 +89,15 @@ PoolPtr openPool(const BackendPtr & backend)
 
 /// A legal blob-free part: stage an empty manifest, precommit, promote -- enough to leave one
 /// committed ref (and a `Live` table) that a later co-batched item can join.
+///
+/// Stage B (Task 4-C): pin `ns` to the sentinel before the first real touch -- the ONE choke point
+/// every test in this file uses to birth its namespace, before any `launchAppendOps`/`launchAppend`/
+/// `launchDrop` call. Several tests separately compute an expected key via
+/// `NamespaceLifeId::stageATransition(ns)` for verification/fault injection; without this the real
+/// production birth mints a random incarnation and those computed keys land nowhere real.
 void publishEmptyPart(const PoolPtr & s, const RootNamespace & ns, const String & ref)
 {
+    DB::Cas::tests::casAdmitEntry(s->backend(), s->layout(), ns);
     PartWriteInfo info;
     info.intended_namespace = ns;
     info.intended_ref = ns.string() + "/" + ref;
@@ -346,6 +353,11 @@ TEST(RefWriterChunkedFlush, DropNamespaceOverOpCapSucceeds)
     /// to writing it before open.
     auto store = openPool(backend);
     const uint64_t epoch = store->writerEpoch();
+    /// Stage B (Task 4-C): pin `ns` to the sentinel now, before the raw snapshot below -- `listRefs`/
+    /// `dropNamespace` further down are real production reads that trigger `resolveNamespaceLife`,
+    /// which for an UNADMITTED namespace mints a fresh RANDOM incarnation rather than adopting the
+    /// sentinel the raw fixture wrote at. Pinning first makes them adopt it instead.
+    DB::Cas::tests::casAdmitEntry(*backend, layout, ns);
 
     /// Ids are PER-NAMESPACE and derived from the table's own `greatest_applied` (INV-1), so seeding
     /// `ns` at `{epoch, 1}` is all this fixture has to do: the `dropNamespace` below derives `{epoch, 2}`

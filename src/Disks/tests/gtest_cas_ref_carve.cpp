@@ -59,8 +59,14 @@ PoolPtr openPool(const BackendPtr & backend)
 
 /// A legal blob-free part: stage an empty manifest, precommit, promote — enough to leave one committed
 /// ref in `ns` that a later `dropRef` can co-batch. Mirrors the ref-writer suite's `publishEmptyPart`.
+///
+/// Stage B (Task 4-C): pin `ns` to the sentinel before the first real touch, mirroring the same fix in
+/// `gtest_cas_ref_writer.cpp`'s `startBuildFor` and `gtest_cas_ref_chunked_flush.cpp`'s
+/// `publishEmptyPart` -- every test in this file births its namespace here before any fault
+/// injection/verification that separately computes a key via `NamespaceLifeId::stageATransition(ns)`.
 void publishEmptyPart(const PoolPtr & s, const RootNamespace & ns, const String & ref)
 {
+    DB::Cas::tests::casAdmitEntry(s->backend(), s->layout(), ns);
     PartWriteInfo info;
     info.intended_namespace = ns;
     info.intended_ref = ns.string() + "/" + ref;
