@@ -764,6 +764,21 @@ in `gtest_cas_ns_creation_lifecycle.cpp`.
 - [ ] **Step 2:** → FAIL. **Step 3:** Implement. **Step 4:** CA gate green.
 - [ ] **Step 5: Commit** `ca: ref — namespace creation lifecycle; token-exact reconciliation; three-site recheck`.
 
+**OBLIGATION CARRIED FROM TASK 3 (ruled 2026-07-30, so it has an executor rather than a citation).**
+Task 3 builds the creation lifecycle and enforces "`Creating` forbids publication" **at the catalog
+level only**. It is deliberately NOT enforced on the production ref-write path, and the reason is a
+constraint rather than a preference: consulting the catalog per ref write would add a protocol step to
+the write path, which the standing veto forbids and which the insert cost would not survive. So until
+this task moves existence and discovery onto the catalog, a namespace sitting in `Creating` does not
+actually block production ref writes.
+
+- [ ] **Close the gap here, and make the closure executable.** When the universe comes from the catalog,
+  a `Creating` entry must refuse publication on the real path, not only in the lifecycle driver's own
+  tests. Pin it with a test that publishes while `Creating` through the PRODUCTION path and is refused —
+  if that test cannot be written without a per-write catalog read, say so explicitly and record what the
+  refusal actually rests on instead. An invariant asserted only against a driver is an invariant the
+  production path does not have.
+
 **Carried from the Task 2 review — the fence seam is real but undocumented.** The brief listed
 "Stage A's `publishCkpt`/fence discipline" as consumed, and `publishCkpt` re-checks the fence after the
 read and before every CAS. `casUpdateImpl` has NO fence hook in its signature. The seam does exist — a
