@@ -2813,3 +2813,24 @@ buys one round of accuracy and then rots again. The sweep belongs at the end of 
 final shapes are settled — and it is the same discipline as the plan's `{#restatement-impact}`
 do-not-cite list, for the same reason: a stale `refCkptKey` reference survived four tasks before
 anyone swept it.
+
+## The fsck exit set and SQL row still have no test that can fail for them {#fsck-untestable-render-surfaces}
+
+Residue of Task 1c fix round 2, named by the implementer rather than found later. The hard-finding
+rule now EXECUTES — `FsckReport::clean` is computed from `kFsckHardFindings`, and a `static_assert`
+on that list's deduced size trips in all three surfaces' translation units — so the rule no longer
+depends on a reader remembering it. What remains is narrower and is the only route left to a fifth
+recurrence: **an author who reads the assert as an arithmetic complaint, bumps the count, and does not
+visit the three surfaces.** The summary line has a real test; the nonzero-exit set and the SQL row do
+not, because `contentAddressedFsckColumns` and `appendContentAddressedFsckRow` have internal linkage
+in an anonymous namespace, and `programs/disks` is not linked into `unit_tests_dbms`.
+
+Closing it means giving those functions external linkage plus a header — a structural change to
+`src/Interpreters/InterpreterSystemQuery.cpp`, a shared non-CAS file. **CONSULT ITEM, not a task:**
+per the standing rule that shared/upstream surfaces are not edited without consultation, this needs a
+decision before anyone implements it. The cheap alternative worth weighing first is whether the assert's
+message can be made harder to satisfy without visiting the surfaces at all.
+
+Also recorded: `05020_content_addressed_fsck.reference` pins the row via `TSVWithNames`, so it is a
+ONE-DIRECTIONAL fence — it fails on a column added without updating the reference, not on a `clean()`
+term added without a column. Only the `static_assert` covers that direction.
