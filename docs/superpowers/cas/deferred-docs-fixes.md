@@ -82,3 +82,49 @@ brief's own §Interfaces note, so not the implementer's invention.
 
 **Fix:** delete the `explicit` clause; the "no constructor takes it" reason is the true one and is
 shorter.
+
+### D4 — the fence's "AND IT REACHES NO PROSE" paragraph is stale by one commit of its own round {#d4-fence-prose-paragraph-stale}
+
+From the Task 1c round-3 re-review (Minor 1). **The judgement it documents is sound** — the fence
+deliberately does not enumerate prose sites, because a hand-maintained list at a fence that cannot read
+it is a fifth thing to forget. Only the incidentals are wrong.
+
+**Where:** `CasFsck.h`, the `AND IT REACHES NO PROSE` paragraph of the `kFsckHardFindings` tripwire.
+
+**Two defects:** (1) it says "two of them were wrong about the exit set on the day this assert was
+written", written before the same round found a third restatement in `utils/ca-soak/soak/run.py` — the
+report now says three. Under the reading where "them" means the two named LOCATIONS the sentence is
+defensible; under the reading where it means individual restatements it is false, and a later auditor
+finds two counts of one event with no way to tell which is current. (2) it says the restatements live in
+"the soak harness's docstrings", but two of the four were an inline comment and an operator-facing
+WARNING string.
+
+**Fix:** make the paragraph say which unit it counts, or drop the count as MINOR-4's was dropped; and
+say "comments and messages", not "docstrings".
+
+### D5 — the report overstates MINOR-4's fix {#d5-report-overstates-minor4}
+
+From the same re-review (Minor 2). `task-1c-report.md` says "both comments now state the claim
+qualitatively … and say explicitly that no count is given **and why**". Only `CasFsck.h` says why;
+`InterpreterSystemQuery.cpp` gives no count and no reason for giving none. Someone auditing MINOR-4 from
+the report checks the SQL site, finds no such statement, and reopens a fixed item.
+
+**Fix:** narrow the report sentence to the site that carries the reason.
+
+### D6 — the exit-code caveat is scoped to summary scans though the exclusion is unconditional {#d6-exit-caveat-scope}
+
+From the same re-review (Minor 3). **Not falsity — scope — but the consequence is operational, so the
+one-pass writer should not treat this as cosmetic.**
+
+**Where:** `docs/superpowers/cas/08-testing-and-soak.md`, the exit-code caveat.
+
+**The problem:** "a zero exit code from a **summary scan** is therefore not by itself proof of a clean
+pool" invites the contrast that a `--detail` scan's zero exit IS proof. It is not:
+`CommandFsck::executeImpl` never throws on `stale_edge` in ANY mode, so a `--detail` run with
+`stale_edge=5` prints a `note:` and exits 0. That is precisely why `utils/ca-soak/soak/run.py` needs both
+the `exit_code != 0` gate AND `stale_edge_verdict`.
+
+**Failure scenario:** automation gates on the exit code of a `--detail` fsck and passes over a class that
+can never be reclaimed.
+
+**Fix:** drop "summary" so the caveat covers both modes, and name `stale_edge` as the reason.

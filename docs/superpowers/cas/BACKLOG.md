@@ -80,8 +80,8 @@ appears, that is not a performance topic — it is INV-NO-LOSS and it stops ever
   inferred. The fix is NOT landed, and the obvious remedy — queue the exact removal — is WRONG:
   `RefTableState` throws `CORRUPTED_DATA` on an absent binding, which would convert a leak into a
   permanent wedge. A correct fix has to reconcile the in-degree, not re-issue the delete.
-- **`ca-fsck` never prints `corrupted_runs`** — {#fsck-corrupted-runs-invisible}. One-line product fix;
-  `clean()` requires the value zero and no operator can see it.
+- **RESOLVED 2026-07-30: `ca-fsck` never printed `corrupted_runs`** — {#fsck-corrupted-runs-invisible}. Now on
+  the summary line, in the nonzero-exit set, and a row of `kFsckHardFindings`.
 - **The fsck 180 s flat budget** — times out once the ref space is large, so the check that would find
   stuck blobs is the check that stops running exactly when the pool gets big enough to have them.
 
@@ -1771,7 +1771,7 @@ extending the same no-throw-after-commit discipline one frame outward.
 four remedies were wrong in ways that would have made things worse, and I forwarded one of them verbatim.
 Prescriptions from a reviewer deserve the same verification as claims from an implementer.
 
-## `ca-fsck` never prints `corrupted_runs`, though `clean()` requires it zero (found 2026-07-26) {#fsck-corrupted-runs-invisible}
+## RESOLVED — `ca-fsck` never printed `corrupted_runs` (found 2026-07-26, closed 2026-07-30) {#fsck-corrupted-runs-invisible}
 
 Found while wiring the soak's signal capture. `FsckReport::clean()` requires `corrupted_runs == 0`, but
 `programs/disks/CommandFsck.cpp` does not print the field on the summary line — it prints `stale_edge` and
@@ -1779,7 +1779,14 @@ its neighbours and omits this one. So a corrupt source-edge run is invisible to 
 applet: the summary says nothing, and the only observable form is a `corrupted-run` DETAIL row, which only
 a `--detail` scan produces.
 
-The harness now counts those detail rows and warns, but that is a workaround for a one-line product fix.
+The harness counted those detail rows and warned, which was a workaround for a one-line product fix.
+
+**RESOLVED.** `corrupted_runs` is on the summary line, is one of the five findings whose nonzero value makes
+`CommandFsck::executeImpl` exit nonzero, and is a row of `kFsckHardFindings` — from which `FsckReport::clean`
+is now computed, with a `static_assert` that trips in three translation units when the list grows. Closed by
+the Task 1c fix rounds. Kept rather than deleted because this entry is the origin of the recurrence the fence
+exists to end, and later text cites it. Note the ORIGINAL text above still describes the defect in the
+present tense; it is history, not state.
 Same family as everything else this week: the information exists, the reporting path drops it, and the
 result reads as absence rather than as an error.
 
