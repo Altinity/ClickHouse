@@ -3031,3 +3031,17 @@ NOT in the diff. Ask what destructures it.
 
 Related in kind: `{#rule-no-chassert-over-handled-branch}` — both are cases where the compiler's silence
 is mistaken for the code's agreement.
+
+## `CasGcStopStart` needs 69s under a 60s per-suite gate timeout {#casgcstopstart-exceeds-suite-timeout}
+
+Observed 2026-07-30 during Task 4-C's gate run. The suite fails in the per-suite gate script and **passes
+standalone in 69s**. The script's per-suite timeout is 60s, so this is not a flake — it is a suite that
+**cannot** pass in that harness, and will report red on every run until one of the two numbers moves.
+
+Worth separating from the flake bucket precisely because the failure is deterministic: a test excluded as
+"timing-related" gets re-triaged every few weeks, whereas a test that provably exceeds a fixed budget has
+one decision attached to it — raise the budget for that suite, split the suite, or make it faster.
+
+Also note what it means for any tally taken from that harness: a suite killed at 60s contributes a
+failure that says nothing about the code, and a reader comparing tallies across runs will see it move with
+machine load rather than with the tree.
