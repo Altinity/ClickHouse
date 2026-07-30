@@ -2,6 +2,9 @@
 #include "cas_test_helpers.h"
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCatalogFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
+/// Explicit rather than relying on a transitive path: `DEBUG_OR_SANITIZER_BUILD` (used below to gate
+/// the `*DeathTest` split) must resolve in THIS translation unit.
+#include <base/defines.h>
 #include <fmt/format.h>
 #include <limits>
 

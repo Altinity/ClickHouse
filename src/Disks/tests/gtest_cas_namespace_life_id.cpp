@@ -3,6 +3,9 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Common/Exception.h>
+/// Explicit rather than relying on a transitive path: `DEBUG_OR_SANITIZER_BUILD` (used below to gate
+/// the `*DeathTest` split) must resolve in THIS translation unit.
+#include <base/defines.h>
 
 #include <concepts>
 #include <type_traits>
