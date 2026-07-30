@@ -336,6 +336,10 @@ TEST(CasRefWedgeEveryAttempt, AmbiguousPutWedgesTheLaneAndTheNextFlushsCreateAdo
     auto backend = std::make_shared<WedgeTestBackend>();
     auto store = openPool(backend, singleAttemptBudget());
     const RootNamespace ns{"srv1/wedge_created"};
+    /// Stage B (Task 4-C): `logPrefix` below computes its fault-injection match at the sentinel;
+    /// pinning `ns` there BEFORE the first real touch keeps the real production birth landing on the
+    /// same key the fault targets.
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);
     publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "y");
 
@@ -374,6 +378,9 @@ TEST(CasRefWedgeEveryAttempt, OwnLandedAttemptIsAdoptedFromOccupiedWithoutDouble
     backend->fired = true;
     auto store = openPool(backend, singleAttemptBudget());
     const RootNamespace ns{"srv1/wedge_occupied_mine"};
+    /// Stage B (Task 4-C): pin to the sentinel before the first real touch -- `logPrefix` below matches
+    /// its fault at that key.
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);
     publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "y");
 
@@ -407,6 +414,7 @@ TEST(CasRefWedgeEveryAttempt, DefiniteRefusalOfARetryAttemptKeepsTheLaneWedged)
     auto backend = std::make_shared<WedgeTestBackend>();
     auto store = openPool(backend, singleAttemptBudget());
     const RootNamespace ns{"srv1/wedge_ambiguous_then_definite"};
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
     publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "y");
 
@@ -501,6 +509,9 @@ TEST(CasRefWedgeEveryAttempt, ADefiniteRefusalAfterAnAmbiguousAttemptOfTheSameCa
     auto backend = std::make_shared<WedgeTestBackend>();
     auto store = openPool(backend, twoAttemptBudget());
     const RootNamespace ns{"srv1/wedge_one_call_ambiguous_then_definite"};
+    /// Stage B (Task 4-C): pin to the sentinel before the first real touch -- `logPrefix` below matches
+    /// its fault at that key.
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);
     publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "y");
 
@@ -549,6 +560,7 @@ TEST(CasRefWedgeEveryAttempt, SuccessorSealAtTheWedgedKeyRejectsConclusivelyAndS
     auto store = openPool(backend, singleAttemptBudget());
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/wedge_sealed"};
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
     publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "y");
 
@@ -611,6 +623,9 @@ TEST(CasRefWedgeEveryAttempt, OrdinaryFirstAppendAfterASealedTransitionCarriesTh
     auto store = openPool(backend);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/prev_epoch_seal_roundtrip"};
+    /// Stage B (Task 4-C): pin to the sentinel before the first real touch -- `readRefLogTxn` above
+    /// reads that exact key.
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);
 
     const uint64_t epoch = store->liveWriterEpoch();
     publishEmptyPart(store, ns, "x");
@@ -641,6 +656,9 @@ TEST(CasRefWedgeEveryAttempt, GenesisBirthAtAHighEpochCarriesNoPrevEpochSeal)
     auto store = openPool(backend);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/genesis_at_five"};
+    /// Stage B (Task 4-C): pin to the sentinel before the first real touch -- `readRefLogTxn` above
+    /// reads that exact key.
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);
 
     bumpFenceGeneration(store, 5);
     ASSERT_EQ(store->liveWriterEpoch(), 5u);
@@ -666,6 +684,9 @@ TEST(CasRefWedgeEveryAttempt, ForeignNonSealOccupantIsCorruptedDataAndSchedulesA
     auto backend = std::make_shared<WedgeTestBackend>();
     auto store = openPool(backend, singleAttemptBudget());
     const RootNamespace ns{"srv1/wedge_foreign"};
+    /// Stage B (Task 4-C): pin to the sentinel before the first real touch -- `logPrefix` below matches
+    /// its fault at that key.
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);
     publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "y");
 
@@ -697,6 +718,7 @@ TEST(CasRefWedgeEveryAttempt, AppendSiteProvenDifferentObjectAlsoSchedulesARemou
     auto store = openPool(backend);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/append_site_foreign"};
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
     publishEmptyPart(store, ns, "x");
 
     /// Occupy the id the next append will derive with a foreign object, so its create conflicts and
@@ -725,6 +747,9 @@ TEST(CasRefWedgeEveryAttempt, RetryUnderAnOlderAdmissionGenerationSendsNothing)
     auto backend = std::make_shared<WedgeTestBackend>();
     auto store = openPool(backend, singleAttemptBudget());
     const RootNamespace ns{"srv1/wedge_old_generation"};
+    /// Stage B (Task 4-C): pin to the sentinel before the first real touch -- `logPrefix` below matches
+    /// its fault at that key.
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);
     publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "y");
 
@@ -761,6 +786,9 @@ TEST(CasRefWedgeEveryAttempt, ResultReleasedAfterAFenceBumpAndSuccessorSealIsIne
     auto store = openPool(backend, singleAttemptBudget());
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/wedge_blocked_io"};
+    /// Stage B (Task 4-C): pin to the sentinel before the first real touch -- `logPrefix` below matches
+    /// its fault at that key.
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);
     publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "y");
 
@@ -811,6 +839,9 @@ TEST(CasRefWedgeEveryAttempt, ResultReleasedAfterTheWedgeIdentityChangedIsInert)
     auto backend = std::make_shared<WedgeTestBackend>();
     auto store = openPool(backend, singleAttemptBudget());
     const RootNamespace ns{"srv1/wedge_identity_changed"};
+    /// Stage B (Task 4-C): pin to the sentinel before the first real touch -- `logPrefix` below matches
+    /// its fault at that key.
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);
     publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "y");
 
@@ -851,6 +882,9 @@ TEST(CasRefWedgeEveryAttempt, KnownDurableInstallFailureMovesDirectlyToRecovery)
     backend->fired = true;   /// disarmed while the fixture is built (see the adoption test above)
     auto store = openPool(backend, singleAttemptBudget());
     const RootNamespace ns{"srv1/wedge_floor"};
+    /// Stage B (Task 4-C): pin to the sentinel before the first real touch -- `logPrefix` below matches
+    /// its fault at that key.
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);
     publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "y");
 
@@ -895,6 +929,7 @@ TEST(CasRefWedgeEveryAttempt, AppendSiteMeetingASuccessorSealIsAConclusiveReject
     auto store = openPool(backend);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/append_site_seal"};
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
     publishEmptyPart(store, ns, "x");
 
     const uint64_t epoch = store->liveWriterEpoch();
@@ -935,6 +970,7 @@ TEST(CasRefWedgeEveryAttempt, BirthCkptIsReclaimedWhenTheGenesisTransactionIsCon
     auto store = openPool(backend);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/birth_ckpt_debris"};
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
 
     const RefTxnId genesis{store->liveWriterEpoch(), 1};
     const String ckpt_key = layout.refCkptKey(NamespaceLifeId::stageATransition(ns));
@@ -973,6 +1009,7 @@ TEST(CasRefWedgeEveryAttempt, BirthCkptOfAnAlreadyLiveNamespaceSurvivesALaterCon
     auto store = openPool(backend);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/birth_ckpt_survives_live"};
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
     /// ONE `publishEmptyPart` -- this IS the birth, and it already reaches sequence 2 (the
     /// precommit-add chunk at seq 1 carries the birth, the promote chunk lands at seq 2), so `next`
     /// below is the SAME `{epoch, 3}` the sibling `AppendSiteMeetingASuccessorSealIsAConclusiveRejectionNotInterference`
@@ -1012,6 +1049,7 @@ TEST(CasRefWedgeEveryAttempt, BirthCkptSurvivesWhenTheGenesisTransactionIsAmbigu
     auto store = openPool(backend, singleAttemptBudget());
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/birth_ckpt_ambiguous"};
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
     const String ckpt_key = layout.refCkptKey(NamespaceLifeId::stageATransition(ns));
     ASSERT_FALSE(backend->get(ckpt_key).has_value()) << "nothing has ever been written for this namespace yet";
 
@@ -1038,6 +1076,7 @@ TEST(CasRefWedgeEveryAttempt, AppendSiteFaultsWhenTheOccupantCannotBeRead)
     auto store = openPool(backend);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/append_site_unreadable"};
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
     publishEmptyPart(store, ns, "x");
 
     const RefTxnId next{store->liveWriterEpoch(), 3};
@@ -1075,6 +1114,7 @@ TEST(CasRefWedgeEveryAttempt, WellFormedNonSealOccupantIsStillForeign)
     auto store = openPool(backend);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/append_site_wellformed_foreign"};
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
     publishEmptyPart(store, ns, "x");
 
     const RefTxnId next{store->liveWriterEpoch(), 3};
@@ -1107,6 +1147,7 @@ TEST(CasRefWedgeEveryAttempt, ALiveEpochSealIsNeverStampedAsItsOwnPrevEpochSeal)
     auto store = openPool(backend);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/live_epoch_seal"};
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
     publishEmptyPart(store, ns, "x");
 
     const uint64_t epoch = store->liveWriterEpoch();

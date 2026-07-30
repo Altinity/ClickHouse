@@ -672,7 +672,7 @@ TEST(CasRefRecoveryCasWalk, FenceBumpedAfterSlotOccupyBeforeCkptCasAdvancesNoChe
     auto store = openWalkPool(backend);
     ASSERT_TRUE(store);
 
-    const auto ckpt_before = readCkpt(*backend, layout, ns);
+    const auto ckpt_before = readCkpt(*backend, layout, NamespaceLifeId::stageATransition(ns));
     ASSERT_TRUE(ckpt_before.has_value());
 
     backend->watched_substr = "_log/";
@@ -680,7 +680,7 @@ TEST(CasRefRecoveryCasWalk, FenceBumpedAfterSlotOccupyBeforeCkptCasAdvancesNoChe
 
     EXPECT_ANY_THROW(store->listRefs(ns));
 
-    const auto ckpt_after = readCkpt(*backend, layout, ns);
+    const auto ckpt_after = readCkpt(*backend, layout, NamespaceLifeId::stageATransition(ns));
     ASSERT_TRUE(ckpt_after.has_value());
     EXPECT_EQ(ckpt_after->ckpt.last_epoch_seal, std::nullopt)
         << "the seal is durable but the checkpoint must not record it under a generation that moved";
@@ -711,7 +711,7 @@ TEST(CasRefRecoveryCasWalk, FenceBumpedAfterCkptCasBeforeInstallPublishesNoState
 
     EXPECT_ANY_THROW(store->listRefs(ns)) << "the install recheck must refuse a result from a moved generation";
 
-    const auto ckpt_after = readCkpt(*backend, layout, ns);
+    const auto ckpt_after = readCkpt(*backend, layout, NamespaceLifeId::stageATransition(ns));
     ASSERT_TRUE(ckpt_after.has_value());
     EXPECT_EQ(ckpt_after->ckpt.last_epoch_seal, std::optional<RefTxnId>(RefTxnId{1, 2}))
         << "the checkpoint advance already landed and is harmless -- the merge is a semantic maximum";
@@ -850,9 +850,21 @@ TEST(CasRefRecoveryCasWalk, NeedsRecoveryReplaysTheStrandedTxn)
 
     ASSERT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
     /// "Durable but not applied here", stated as the two facts it is made of: the object IS in the
-    /// store, and this runtime's floor is what keeps the allocator off its id.
-    ASSERT_TRUE(readLogTxn(*backend, layout, ns, RefTxnId{1, 2}).has_value())
-        << "the stranded transaction must be durable -- otherwise recovery is not owed";
+    /// store, and this runtime's floor is what keeps the allocator off its id. `ns` was born through
+    /// the REAL production lane (`appendRefOps`), not the raw `seedTxn`/`casAdmitEntry` fixtures this
+    /// file's OTHER tests use -- so its ref-layer objects sit at a REAL, catalog-minted incarnation,
+    /// not the Stage-A sentinel `readLogTxn` assumes. Resolved here rather than through `readLogTxn`.
+    {
+        const CasRefCatalog::Snapshot snap = CasRefCatalog::read(*backend, layout);
+        const CatalogEntry * entry = nullptr;
+        for (const CatalogEntry & e : snap.catalog.entries)
+            if (e.ns.string() == ns.string())
+                entry = &e;
+        ASSERT_NE(entry, nullptr) << "the birth above must have minted a catalog entry for " << ns.string();
+        const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(entry->ns, entry->incarnation);
+        ASSERT_TRUE(backend->get(layout.refLogKey(life, RefTxnId{1, 2})).has_value())
+            << "the stranded transaction must be durable -- otherwise recovery is not owed";
+    }
 
     /// The next touch drives recovery again -- this is the structural closure Task 3 deferred here.
     const auto refs = store->listRefs(ns);

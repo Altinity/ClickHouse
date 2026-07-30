@@ -42,6 +42,11 @@ namespace
 
 const RootNamespace kNs{"srv1/prep@cas@"};
 const Layout kLayout{"p"};
+/// `prepareRefChunk` takes a resolved catalog life (Stage B, Task 4-C), not a bare namespace; this TU
+/// is deliberately backend-free (no catalog to resolve one from), so it threads the Stage-A sentinel
+/// through EXPLICITLY as its own test input -- the same value production minted internally before
+/// Task 4-C, so every golden byte/key assertion below is unchanged.
+const NamespaceLifeId kLife = NamespaceLifeId::stageATransition(kNs);
 
 RefOp birthOp()
 {
@@ -98,7 +103,7 @@ CasRefLedger::PreparedRefChunk prepare(const RefTableState & state, const RefTxn
                                        const std::optional<RefTxnId> & chain_link,
                                        const std::vector<RefOp> & ops, uint64_t admitted_generation = 7)
 {
-    return CasRefLedger::prepareRefChunk(kLayout, kNs, state, id, chain_link, ops, admitted_generation);
+    return CasRefLedger::prepareRefChunk(kLayout, kLife, state, id, chain_link, ops, admitted_generation);
 }
 
 }
@@ -116,7 +121,7 @@ TEST(CasRefChunkPreparation, PreparedKeyAndSealedBytesAreCanonical)
     EXPECT_EQ(parsed->id.ns, kNs);
     EXPECT_EQ(parsed->kind, RefObjectKind::Log);
     EXPECT_EQ(parsed->txn_id, id);
-    EXPECT_EQ(prepared.prepared_attempt.key, kLayout.refLogKey(NamespaceLifeId::stageATransition(kNs), id));
+    EXPECT_EQ(prepared.prepared_attempt.key, kLayout.refLogKey(kLife, id));
 
     const RefLogTxn decoded = decodeRefLogTxn(
         openObject(FormatId::RefLog, prepared.prepared_attempt.bytes), kNs.string(), id);
@@ -238,7 +243,7 @@ TEST(CasRefChunkPreparation, PreparedAttemptIsCompleteBeforeAnyDurableEffect)
 
     /// Nothing left to build: the key and body the request will read are already the canonical ones, so
     /// the arming block's only remaining work really is the move it declares itself to be.
-    EXPECT_EQ(prepared.prepared_attempt.key, kLayout.refLogKey(NamespaceLifeId::stageATransition(kNs), id));
+    EXPECT_EQ(prepared.prepared_attempt.key, kLayout.refLogKey(kLife, id));
     EXPECT_EQ(prepared.prepared_attempt.bytes,
               sealObject(FormatId::RefLog, encodeRefLogTxn(prepared.chunk_txn)));
 }

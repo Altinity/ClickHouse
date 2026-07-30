@@ -378,6 +378,7 @@ TEST(CasPartFolderAccess, PublishEntriesAbandonsBuildOnPromoteFailure)
     auto backend = std::make_shared<PromoteConflictOnceBackend>();
     auto store = Cas::Pool::open(backend, Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     const Cas::RootNamespace ns{"srv/t1"};
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
     Cas::CachedPartFolderAccess access(store);
 
     publishPart(store, ns, "src", {inlineEntry("f", "same")});
@@ -464,6 +465,7 @@ TEST(CasPartFolderAccess, PublishEntriesAbandonsBuildOnARetryablePromoteFailure)
     auto backend = std::make_shared<PromoteDefiniteFailureBackend>();
     auto store = Cas::Pool::open(backend, Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     const Cas::RootNamespace ns{"srv/t1"};
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
     Cas::CachedPartFolderAccess access(store);
 
     publishPart(store, ns, "src", {inlineEntry("f", "same")});
@@ -1097,6 +1099,10 @@ TEST(CasPartFolderAccess, DropNamespaceErasesAllViews)
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend);
     const Cas::RootNamespace ns{"srv/t1"};
+    /// Stage B (Task 4-C): pin to the sentinel before the first real touch -- several reads below
+    /// (the `_snap/` listing, the cleanup-marker key) compute their key directly at
+    /// `NamespaceLifeId::stageATransition(ns)`.
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);
     Cas::CachedPartFolderAccess access(store, cacheOn());
     publishPart(store, ns, "part_1", {inlineEntry("f", "x")});
     publishPart(store, ns, "part_2", {inlineEntry("f", "y")});
@@ -1207,6 +1213,7 @@ TEST(CasPartFolderAccess, AnUnresolvedPromoteIsNotReportedAsDefinitelyNotCommitt
     auto backend = std::make_shared<Cas::tests::ChunkFaultBackend>();
     auto store = openPoolSingleAttempt(backend);
     const Cas::RootNamespace ns{"srv/t1"};
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
     Cas::CachedPartFolderAccess access(store, cacheOn());
     const Cas::PartRefKey key{ns, "part_1"};
 

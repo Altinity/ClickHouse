@@ -56,13 +56,15 @@ TEST(CasGcShardIncarnation, DiscoveryEqualsPresentShards)
 
         const auto universe = gc.discoverUniverseForTest();
 
-        /// Must contain (A, 0).
+        /// Stage B (Task 4-C): the universe is catalog-authoritative now, so it is a life per namespace
+        /// (there are no numeric shards to destructure -- see `NamespaceLifeId`), never a
+        /// `(namespace, shard)` pair.
         bool found_a = false;
-        for (const auto & [ns, shard] : universe)
+        for (const NamespaceLifeId & life : universe)
         {
-            if (ns.string() == "srv1/tblA" && shard == 0)
+            if (life.ns.string() == "srv1/tblA")
                 found_a = true;
-            EXPECT_NE(ns.string(), "srv1/tblB") << "ns B should not appear in universe (no shard written)";
+            EXPECT_NE(life.ns.string(), "srv1/tblB") << "ns B should not appear in universe (no shard written)";
         }
         EXPECT_TRUE(found_a) << "ns A shard 0 must be in the universe (shard object present)";
     }

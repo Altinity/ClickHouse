@@ -383,6 +383,7 @@ TEST(CasConfirmExactRef, UnrecoveredResidentTableIsUnknownWithZeroBackendRequest
     auto backend = std::make_shared<RecoveryLatchBackend>();
     auto store = openPool(backend);
     const RootNamespace ns{"srv1/confirm_unrecovered"};
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
 
     const size_t cached_before = store->refTablesCachedCountForTest();
     backend->fail_list_once_prefix = store->layout().refsNamespacePrefix(NamespaceLifeId::stageATransition(ns));
@@ -409,6 +410,7 @@ TEST(CasConfirmExactRef, RecoveryInProgressIsUnknownWithZeroBackendRequests)
     auto backend = std::make_shared<RecoveryLatchBackend>();
     auto store = openPool(backend);
     const RootNamespace ns{"srv1/confirm_recovering"};
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
 
     backend->armBlockedList(store->layout().refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)));
     std::thread recoverer([&] { store->resolveRef(ns, "x"); });
@@ -562,6 +564,7 @@ TEST(CasConfirmExactRef, WedgedLaneIsUnknown)
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPool(backend);
     const RootNamespace ns{"srv1/confirm_wedge"};
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
 
     const ManifestId id = publishEmptyPart(store, ns, "x");
     ASSERT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Yes);

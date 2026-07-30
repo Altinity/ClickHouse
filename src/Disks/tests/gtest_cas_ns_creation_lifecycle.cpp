@@ -88,7 +88,7 @@ TEST(CasNsCreationLifecycle, HappyPathReachesLiveWithADurableCkptAndAStableIncar
     const UInt128 incarnation = entry->incarnation;
     EXPECT_NE(incarnation, UInt128(0));
 
-    const std::optional<CkptSample> ckpt = readCkpt(backend, layout, ns);
+    const std::optional<CkptSample> ckpt = readCkpt(backend, layout, NamespaceLifeId::fromCatalogEntry(entry->ns, incarnation));
     ASSERT_TRUE(ckpt.has_value()) << "step 2's _ckpt must be durable";
     EXPECT_EQ(ckpt->ckpt.life_epoch, 5u) << "INV-4's genesis epoch is the creator's writer_epoch";
 
@@ -200,7 +200,7 @@ TEST(CasNsCreationLifecycle, FencedOutBetweenTheCkptPublishAndGoLiveRefusesAndLe
     /// Step 2's _ckpt DID land (it is not what the fence check gates) -- CKPT-FAILED-BIRTH-DEBRIS is a
     /// different mechanism (the OLD `RefOpKind::NamespaceBirth` writer, `Pool/CasRefLedger.cpp`); this
     /// driver's own `_ckpt` is simply left in place for whichever actor next reconciles this entry.
-    EXPECT_TRUE(readCkpt(backend, layout, ns).has_value());
+    EXPECT_TRUE(readCkpt(backend, layout, NamespaceLifeId::fromCatalogEntry(entry->ns, entry->incarnation)).has_value());
 }
 
 /// ---------------------------------------------------------------------------------------------
@@ -346,7 +346,7 @@ TEST(CasNsCreationLifecycle, ReconcileSucceedsTokenExactlyAfterTheOriginalCreato
     ASSERT_NE(final_entry, nullptr);
     EXPECT_EQ(final_entry->state, NsState::Live);
     EXPECT_EQ(final_entry->incarnation, entry.incarnation) << "the SAME incarnation throughout -- resumption, not rebirth";
-    const std::optional<CkptSample> ckpt = readCkpt(backend, layout, ns);
+    const std::optional<CkptSample> ckpt = readCkpt(backend, layout, NamespaceLifeId::fromCatalogEntry(final_entry->ns, final_entry->incarnation));
     ASSERT_TRUE(ckpt.has_value());
     EXPECT_EQ(ckpt->ckpt.life_epoch, new_creator.writer_epoch)
         << "the RESUMING actor's writer_epoch is the genesis epoch that actually landed";

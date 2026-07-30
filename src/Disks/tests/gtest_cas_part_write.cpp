@@ -1798,6 +1798,11 @@ TEST(CasPartWriteTxn, AbandonRetryableAfterAppendFailure)
     auto b = std::make_shared<RefLogConflictOnceBackend>();
     auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     const RootNamespace ns{"srv1/tbl_abandon_retry"};
+    /// Stage B (Task 4-C): pin `ns`'s real incarnation to the Stage-A sentinel BEFORE the first real
+    /// append, so the corruption injected below (at a key computed from that sentinel) actually lands
+    /// on the path production writes to -- otherwise `precommitAdd` mints an unrelated random
+    /// incarnation and the corruption below misses it entirely.
+    DB::Cas::tests::casAdmitEntry(*b, s->layout(), ns);
     auto build = startBuildFor(s, ns, "part_1");
 
     build->putBlob(idOf("kept"), BlobSource::fromString("kept"));

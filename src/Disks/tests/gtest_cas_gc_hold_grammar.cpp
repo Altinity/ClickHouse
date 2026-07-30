@@ -761,6 +761,7 @@ TEST(CasGcHoldGrammar, UndecodableBodyNamesTheRecordItCouldNotRead)
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/aa@cas@"};
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
 
     publishAt(*backend, layout, ns, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(1), /*birth=*/true);
     backend->putIfAbsent(layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, 2}), "this is not a cas_ref_log object");
@@ -825,6 +826,7 @@ TEST(CasGcHoldGrammar, AWitnessThatStopsAnsweringIsWitnessDisappeared)
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/aa@cas@"};
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
 
     publishAt(*backend, layout, ns, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(1), /*birth=*/true);
     writeSealAt(*backend, layout, ns, RefTxnId{1, 2});
@@ -855,6 +857,8 @@ TEST(CasGcHoldGrammar, AWitnessThatStopsAnsweringIsWitnessDisappeared)
 TEST(CasGcHoldGrammar, CheckpointWitnessHoldsAGapTheHintIsSilentAbout)
 {
     const RootNamespace ns{"00/aa@cas@"};
+    /// Stage B (Task 4-C): no pin needed here -- `publishAt` below (draining into `writeRefLogTxnRaw`)
+    /// admits `ns` into the catalog itself, once per pool, inside each nested block's own `seed` call.
     const auto seed = [&](HintHoleCountingBackend & backend, const Layout & layout)
     {
         publishAt(backend, layout, ns, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(1), /*birth=*/true);
@@ -907,6 +911,8 @@ TEST(CasGcHoldGrammar, CheckpointWitnessHoldsAGapTheHintIsSilentAbout)
 TEST(CasGcHoldGrammar, CheckpointWitnessReachesAHeldNamespaceTheHintNoLongerNames)
 {
     const RootNamespace ns{"00/aa@cas@"};
+    /// Stage B (Task 4-C): no pin needed -- `publishAt` inside `seedPool` (draining into
+    /// `writeRefLogTxnRaw`) admits `ns` into each nested block's own pool.
 
     /// Round 1 in both pools: held at {1,3} by a gap below the listed witness {1,4}. Then the hint goes
     /// silent about every one of the namespace's objects, {1,3} becomes readable (so the hold resolves and
@@ -971,6 +977,9 @@ TEST(CasGcHoldGrammar, CheckpointWitnessReachesAHeldNamespaceTheHintNoLongerName
 TEST(CasGcHoldGrammar, AnUndecodableCheckpointHoldsOnlyItsOwnNamespace)
 {
     const RootNamespace bad{"00/aa@cas@"};
+    /// Stage B (Task 4-C): no pin needed -- `publishAt(..., birth=true)` below (draining into
+    /// `writeRefLogTxnRaw`) admits `bad` into the catalog itself, pinned to the same sentinel this
+    /// test's own `stageATransition(bad)` key computations already assume.
     const RootNamespace good{"00/bb@cas@"};
 
     auto backend = std::make_shared<HintHoleCountingBackend>();
@@ -1054,6 +1063,15 @@ TEST(CasGcHoldGrammar, AnUndecodableCheckpointWithNoWalkPositionRecordsAnAnomaly
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
     const Layout & layout = store->layout();
     Gc gc(store, kGc);
+
+    /// Stage B (Task 4-C): `phantom` gets no birth and no other production touch -- it is meant to
+    /// have no logs and no snapshots, ever. But `discoverUniverse` is now catalog-authoritative, so a
+    /// namespace absent from the catalog is invisible to the walk (R10 treats it as foreign-prefix-inert),
+    /// and this test's whole premise -- that GC still surfaces an anomaly for an uncataloged `_ckpt` --
+    /// would be silently defeated. Admitting it here (still with no `_ckpt` of its own) is what keeps
+    /// `phantom` reachable by `readCheckpointWitnesses` without giving it the birth this test deliberately
+    /// withholds.
+    DB::Cas::tests::casAdmitEntry(*backend, layout, phantom);
 
     /// A lone `_ckpt` with an undecodable body, and NOTHING else under that namespace.
     backend->putIfAbsent(layout.refCkptKey(NamespaceLifeId::stageATransition(phantom)), "this is not a cas_ref_ckpt");
@@ -1147,6 +1165,7 @@ TEST(CasGcHoldGrammar, HoldForcesAnExactRetryOfItsOffendingPositionWhenUnhinted)
     auto backend = std::make_shared<HintHoleCountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
     const RootNamespace ns{"00/aa@cas@"};
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
     Gc gc(store, kGc);
     seedHeldThenUnhinted(backend, store, ns, gc);
 
@@ -1169,6 +1188,7 @@ TEST(CasGcHoldGrammar, HoldClearsOnlyByFoldingThroughTheOffendingPosition)
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/aa@cas@"};
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
     Gc gc(store, kGc);
     seedHeldThenUnhinted(backend, store, ns, gc);
 

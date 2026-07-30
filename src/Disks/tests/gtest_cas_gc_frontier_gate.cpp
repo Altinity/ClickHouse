@@ -2,6 +2,7 @@
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCkptFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
@@ -185,11 +186,16 @@ TEST(CasGcFrontierGate, HiddenPlusOneInAnUnknownNamespaceIsRefusedByTheProductio
         << deletedKeysMessage(*backend);
 }
 
-/// THE CONSTANT IS LOAD-BEARING. Same pool, same hidden `+1`, and the ONLY difference is that the
-/// caller asserts its universe is closed -- which here is a lie the test tells deliberately. The blob
-/// is deleted. Without this arm the first test proves nothing: a gate that suppressed for some
-/// unrelated reason would pass it too.
-TEST(CasGcFrontierGate, TheSameHiddenPlusOneIsDeletedOnceTheUniverseIsDeclaredAuthoritative)
+/// THE CONSTANT USED TO BE LOAD-BEARING HERE, and no longer is -- Stage B (Task 4-C) closed the gap it
+/// demonstrated. Same pool, same hidden `+1`; the caller still asserts the universe is closed (a lie it
+/// tells deliberately), but discovery is now catalog-authoritative: `hidden` is `Live` in the catalog, so
+/// it stays a member of `frontier_namespaces` regardless of what the LIST hides, and it never sealed a
+/// cursor, so its OWN frontier is provably unproven. `frontier_proven == frontier_namespaces` therefore
+/// fails on member count alone, and destructive work stays suppressed even though the caller asserted the
+/// universe closed. The blob survives. This is a strict improvement: the old failure mode this test
+/// pinned was exactly the "list liar" vulnerability `CasListLiarEndToEnd`'s whole suite is about, and it
+/// is gone even under the deliberately-dangerous test override, not merely under the production default.
+TEST(CasGcFrontierGate, TheSameHiddenPlusOneSurvivesEvenWhenTheUniverseIsDeclaredAuthoritative)
 {
     auto backend = std::make_shared<CountingHintHoleBackend>();
     const RootNamespace hidden{"00/hidden@cas@"};
@@ -202,9 +208,9 @@ TEST(CasGcFrontierGate, TheSameHiddenPlusOneIsDeletedOnceTheUniverseIsDeclaredAu
     Gc gc(store, kGc);
     drive(store, gc, /*rounds*/ 5, UniversePolicy::AuthoritativeForTest);
 
-    EXPECT_FALSE(backend->head(blobKeyOf(layout, blob)).exists)
-        << "with the universe declared closed and the owner outside it, the blob IS deleted -- this is "
-           "the data loss `StageA_Suppressed` withholds";
+    EXPECT_TRUE(backend->head(blobKeyOf(layout, blob)).exists)
+        << "`hidden` is catalog-Live and never proved its own frontier, so the round-wide frontier stays "
+           "incomplete and nothing irreversible runs, even though the caller declared the universe closed";
 }
 
 /// AND THE PER-NAMESPACE LOGIC IS WHAT SAVES IT. Identical to the arm above except that the hidden
@@ -333,6 +339,68 @@ TEST(CasGcFrontierGate, EveryInventoriedDestructiveSiteIsInertUnderSuppression)
     EXPECT_GT(backend->deleteTotal(), 0u)
         << "the work queue was real -- an authoritative round drains it";
     EXPECT_FALSE(backend->head(blobKeyOf(layout, blob)).exists);
+}
+
+/// R11 (`docs/superpowers/cas/2026-07-28-ref-rework-adjacent-findings.md {#r11-empty-universe-vacuous}`):
+/// `Gc::fold` computes `frontier_complete = universe_authoritative && frontier_proven ==
+/// frontier_namespaces`. With an empty universe that equality is `0 == 0` -- vacuously TRUE unless
+/// guarded -- so this pool is built to make `frontier_namespaces` GENUINELY zero by every source that
+/// feeds it: no catalog entry (`injectRetire` touches only `gc/state`'s shard bookkeeping, never a
+/// namespace), no sealed cursor (no namespace has EVER folded, so the prior seal's coverage map --
+/// `parent_cursors` -- carries nothing), and no ref-log hint (none was ever written). A condemned blob
+/// with a real, present body and in-degree 0 is queued the way a real round would leave it
+/// (`injectRetire`), so if the guard is missing this round has every reason to delete it.
+TEST(CasGcFrontierGate, AGenuinelyEmptyUniverseRefusesTheFrontierDespiteZeroEqualsZero)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    const DB::UInt128 blob(0xbead);
+
+    writeBlobBody(*backend, layout, blob);
+    const BlobRef blob_ref = legacyMetaTestRef(blob);
+    const Token blob_token = backend->head(layout.blobKey(blob_ref)).token;
+    injectRetire(*backend, layout, /*round*/ 1, /*shard*/ 0,
+        {RetiredEntry{.kind = ObjectKind::Blob, .ref = blob_ref, .token = blob_token, .size = 0}});
+    store->renewWatermarkOnce();
+
+    Gc gc(store, kGc);
+    backend->resetCounts();
+    drive(store, gc, /*rounds*/ 8, UniversePolicy::AuthoritativeForTest);
+
+    /// Per-delete-family, not an aggregate: an aggregate zero can hide one family that ran while
+    /// another did not (the same lesson R11's own writeup draws from this campaign's
+    /// `entries_redeleted >= objects_deleted` vacuous-truth precedent).
+    EXPECT_EQ(backend->deleteTotal(), 0u)
+        << "an authoritative-but-EMPTY universe must refuse to be a complete frontier -- 0 == 0 is not "
+           "a proof. Deleted:" << deletedKeysMessage(*backend);
+    EXPECT_EQ(backend->deleteCountForKeysContaining("/blobs/"), 0u) << "pre-CAS blob delete";
+    EXPECT_EQ(backend->deleteCountForKeysContaining("/cas/manifests/"), 0u) << "manifest-body delete";
+    EXPECT_EQ(backend->deleteCountForKeysContaining("/gc/gen/"), 0u)
+        << "generation prune and hand-off reclaim";
+    EXPECT_EQ(backend->deleteCountForKeysContaining("/cas/refs/"), 0u)
+        << "covered-log / superseded-snapshot cleanup";
+    EXPECT_TRUE(backend->head(layout.blobKey(blob_ref)).exists);
+
+    /// The control: admitting ONE namespace with nothing durable in it (a catalog-only walk target,
+    /// proven by a single absent exact GET -- `AQuietKnownNamespaceCostsExactlyOneExactGet`'s own
+    /// shape) closes the universe non-vacuously (`frontier_namespaces = 1`, `frontier_proven = 1`), and
+    /// the SAME blob drains -- proving the zeros above were the guard, not an empty work queue.
+    ///
+    /// `casAdmitEntry` alone reaches `Live` with NO `_ckpt` (the acknowledged bridge divergence from
+    /// `completeCreation`'s production path, which always publishes `_ckpt.life_epoch` first); the walk
+    /// needs that `life_epoch` to seed its FIRST probe for a namespace with no log at all (the `expected`
+    /// initialization in `Gc::fold`, Stage B's `checkpoints.life_epochs` read). So this control writes a
+    /// `_ckpt` with `life_epoch` set directly, at the same sentinel key `casAdmitEntry` pinned the
+    /// namespace's incarnation to -- proving the namespace's own genesis, not guessing it.
+    const RootNamespace empty_ns{"00/empty@cas@"};
+    DB::Cas::tests::casAdmitEntry(*backend, layout, empty_ns);
+    backend->putIfAbsent(layout.refCkptKey(NamespaceLifeId::stageATransition(empty_ns)),
+        encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{1},
+                              .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt}));
+    drive(store, gc, /*rounds*/ 8, UniversePolicy::AuthoritativeForTest);
+    EXPECT_FALSE(backend->head(layout.blobKey(blob_ref)).exists)
+        << "the work WAS real -- once the universe is provably closed (even trivially), it drains";
 }
 
 /// The generation prune's cursor must not move on a suppressed round either. It is a monotone

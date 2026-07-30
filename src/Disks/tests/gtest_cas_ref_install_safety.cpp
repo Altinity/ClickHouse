@@ -246,6 +246,10 @@ TEST(CasRefInstallSafety, UnresolvedAlwaysRecordsTheWedge)
     auto backend = std::make_shared<DB::Cas::tests::ChunkFaultBackend>();
     auto store = openPoolSingleAttempt(backend);
     const RootNamespace ns{"srv1/unresolved_wedge"};
+    /// Stage B (Task 4-C): pin `ns` to the Stage-A sentinel BEFORE its first real touch, so
+    /// the fault injected below (computed from that same sentinel) lands on the key production
+    /// actually writes to.
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);
 
     /// Scoped to THIS namespace's ref log, so nothing else the part publish writes (the manifest, the
     /// pool's own metadata) can consume the single fault.
@@ -351,6 +355,10 @@ TEST(CasRefInstallSafety, PreAttemptRefusalAfterAWedgeResolutionLeavesTheLaneCle
     auto backend = std::make_shared<DB::Cas::tests::ChunkFaultBackend>();
     auto store = openPoolFenceControlled(backend);
     const RootNamespace ns{"srv1/pre_attempt_after_unwedge"};
+    /// Stage B (Task 4-C): pin `ns` to the Stage-A sentinel BEFORE its first real touch, so
+    /// the fault injected below (computed from that same sentinel) lands on the key production
+    /// actually writes to.
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);
 
     publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "y");
@@ -402,6 +410,10 @@ TEST(CasRefInstallSafety, AmbiguousChunkAfterAWedgeResolutionRewedgesTheLane)
     auto backend = std::make_shared<DB::Cas::tests::ChunkFaultBackend>();
     auto store = openPoolFenceControlled(backend);
     const RootNamespace ns{"srv1/ambiguous_after_unwedge"};
+    /// Stage B (Task 4-C): pin `ns` to the Stage-A sentinel BEFORE its first real touch, so
+    /// the fault injected below (computed from that same sentinel) lands on the key production
+    /// actually writes to.
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);
 
     publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "y");
@@ -486,6 +498,10 @@ TEST(CasRefInstallSafety, WedgeResolutionInstallsExactlyOnce)
     auto backend = std::make_shared<DB::Cas::tests::ChunkFaultBackend>();
     auto store = openPoolSingleAttempt(backend);
     const RootNamespace ns{"srv1/wedge_resolution"};
+    /// Stage B (Task 4-C): pin `ns` to the Stage-A sentinel BEFORE its first real touch, so
+    /// the fault injected below (computed from that same sentinel) lands on the key production
+    /// actually writes to.
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);
 
     publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "y");
@@ -618,6 +634,10 @@ TEST(CasRefInstallSafety, UnresolvedTransfersWritingToWedged)
     auto backend = std::make_shared<DB::Cas::tests::ChunkFaultBackend>();
     auto store = openPoolSingleAttempt(backend);
     const RootNamespace ns{"srv1/apply_state_wedge"};
+    /// Stage B (Task 4-C): pin `ns` to the Stage-A sentinel BEFORE its first real touch, so
+    /// the fault injected below (computed from that same sentinel) lands on the key production
+    /// actually writes to.
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);
 
     backend->fault_substr = store->layout().refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
     backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::Unresolved;
@@ -636,6 +656,10 @@ TEST(CasRefInstallSafety, WedgeResolutionReturnsReady)
     auto backend = std::make_shared<DB::Cas::tests::ChunkFaultBackend>();
     auto store = openPoolSingleAttempt(backend);
     const RootNamespace ns{"srv1/apply_state_unwedge"};
+    /// Stage B (Task 4-C): pin `ns` to the Stage-A sentinel BEFORE its first real touch, so
+    /// the fault injected below (computed from that same sentinel) lands on the key production
+    /// actually writes to.
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);
 
     publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "y");
@@ -663,6 +687,10 @@ TEST(CasRefInstallSafety, ConclusiveForeignConflictFaultsTheLane)
     auto backend = std::make_shared<DB::Cas::tests::ChunkFaultBackend>();
     auto store = openPoolSingleAttempt(backend);
     const RootNamespace ns{"srv1/apply_state_conflict"};
+    /// Stage B (Task 4-C): pin `ns` to the Stage-A sentinel BEFORE its first real touch, so
+    /// the fault injected below (computed from that same sentinel) lands on the key production
+    /// actually writes to.
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);
 
     backend->fault_substr = store->layout().refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
     backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::ForeignConflict;
@@ -686,6 +714,10 @@ TEST(CasRefInstallSafety, DefiniteFailureReturnsReady)
     auto backend = std::make_shared<DB::Cas::tests::ChunkFaultBackend>();
     auto store = openPoolSingleAttempt(backend);
     const RootNamespace ns{"srv1/apply_state_definite"};
+    /// Stage B (Task 4-C): pin `ns` to the Stage-A sentinel BEFORE its first real touch, so
+    /// the fault injected below (computed from that same sentinel) lands on the key production
+    /// actually writes to.
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);
 
     backend->fault_substr = store->layout().refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
     backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::Definite;
@@ -714,6 +746,10 @@ TEST(CasRefInstallSafety, WedgeResolutionProvenForeignFaultsTheLane)
     auto backend = std::make_shared<DB::Cas::tests::ChunkFaultBackend>();
     auto store = openPoolSingleAttempt(backend);
     const RootNamespace ns{"srv1/apply_state_foreign_wedge"};
+    /// Stage B (Task 4-C): pin `ns` to the Stage-A sentinel BEFORE its first real touch, so
+    /// the fault injected below (computed from that same sentinel) lands on the key production
+    /// actually writes to.
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);
 
     publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "y");
@@ -771,6 +807,10 @@ TEST(CasRefInstallSafety, WedgeResolutionInstallFailureRequiresRecovery)
     auto backend = std::make_shared<DB::Cas::tests::ChunkFaultBackend>();
     auto store = openPoolSingleAttempt(backend);
     const RootNamespace ns{"srv1/apply_state_poison_unwedge"};
+    /// Stage B (Task 4-C): pin `ns` to the Stage-A sentinel BEFORE its first real touch, so
+    /// the fault injected below (computed from that same sentinel) lands on the key production
+    /// actually writes to.
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);
 
     publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "y");
@@ -849,6 +889,10 @@ TEST(CasRefInstallSafety, UncertainPrecommitKeepsItsCleanupOwnerAndItsBody)
     auto backend = std::make_shared<DB::Cas::tests::ChunkFaultBackend>();
     auto store = openPoolSingleAttempt(backend);
     const RootNamespace ns{"srv1/uncertain_precommit"};
+    /// Stage B (Task 4-C): pin `ns` to the Stage-A sentinel BEFORE its first real touch, so
+    /// the fault injected below (computed from that same sentinel) lands on the key production
+    /// actually writes to.
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);
 
     PartWriteInfo info;
     info.intended_namespace = ns;

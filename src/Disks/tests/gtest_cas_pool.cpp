@@ -1567,6 +1567,10 @@ TEST(CasPoolShutdown, UnresolvedWedgeSkipsFarewell)
     /// By value: `layout` is used after `store.reset()` below, a reference would dangle.
     const Layout layout = store->layout();
     const RootNamespace ns{"srv/wedge_shutdown"};
+    /// Stage B (Task 4-C): pin `ns` to the Stage-A sentinel BEFORE its first real touch, so the fault
+    /// injected below (computed from that same sentinel) lands on the key production actually writes
+    /// to -- otherwise the real append mints an unrelated random incarnation and the fault misses.
+    DB::Cas::tests::casAdmitEntry(*backend, layout, ns);
     publishPart(store, ns.string(), "x", "payload");
 
     /// Force the ref-log append the drop below performs into the Unresolved/wedge outcome (as in the
@@ -1866,6 +1870,8 @@ TEST(CasRemountWaits, UnresolvedWedgeRemountPaysNoWaitEither)
 
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv/remount_wedge"};
+    /// Stage B (Task 4-C): see `CasPoolShutdown.UnresolvedWedgeSkipsFarewell`'s identical comment.
+    DB::Cas::tests::casAdmitEntry(*backend, layout, ns);
     publishPart(store, ns.string(), "x", "payload");
 
     /// Force the ref-log append `dropRef` below performs into the Unresolved/wedge outcome (as in
@@ -1925,6 +1931,11 @@ TEST(CasRemountWaits, ALateTouchedTableClosesEveryDeadEpochInBandHoweverItsPrede
     const Layout & layout = store->layout();
     const RootNamespace ns1{"srv/table_a"};
     const RootNamespace ns2{"srv/table_b"};
+    /// Stage B (Task 4-C): `ns1` is pinned because the fault below targets its key by exact sentinel
+    /// match. `ns2` must ALSO be pinned: the epoch-close assertions further down read its ref-log keys
+    /// directly at `NamespaceLifeId::stageATransition(ns2)`.
+    DB::Cas::tests::casAdmitEntry(*backend, layout, ns1);
+    DB::Cas::tests::casAdmitEntry(*backend, layout, ns2);
     publishPart(store, ns1.string(), "x", "payload-a");
     /// ns2's epoch-1 data: never touched again by this incarnation until the final check below, well
     /// after both remounts -- the "table recovered for the first time, late" the fix must not over-seal.

@@ -273,6 +273,7 @@ TEST(CasListLiarEndToEnd, AHiddenPlusOneKeepsItsBlobWhenAVisibleMinusOneLandsLat
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/dataloss@cas@"};
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
     const DB::UInt128 shared(0x5ade);
 
     /// `ref_a` and `ref_b` both pin `shared`; `ref_b`'s publish is the record the store will hide.
@@ -321,6 +322,7 @@ TEST(CasListLiarEndToEnd, AHiddenMinusOneIsStillFoldedSoTheBlobIsActuallyReclaim
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/leak@cas@"};
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
     const DB::UInt128 released(0xdea1);
     const DB::UInt128 unrelated(0xb00c);
 
@@ -420,13 +422,15 @@ TEST(CasListLiarEndToEnd, AnEntirelyHiddenNamespacesEdgeIsRefusedByTheProduction
         << deletedKeysMessage(*backend);
 }
 
-/// AND THE SUPPRESSION IS THE ONLY THING HOLDING IT. The same pool, the same hidden `+1`; the only
-/// difference is that the caller asserts its universe is closed -- which here is a lie the test tells
-/// deliberately, since the owning namespace is outside the constructed universe. The blob is deleted.
-///
-/// Without this arm the test above proves nothing: a round that suppressed for some unrelated reason,
-/// or a pool with nothing condemnable in it, would pass it just as well.
-TEST(CasListLiarEndToEnd, TheSameHiddenNamespacesBlobIsDeletedOnceTheUniverseIsDeclaredAuthoritative)
+/// USED TO SHOW THE SUPPRESSION AS THE ONLY THING HOLDING IT -- Stage B (Task 4-C) closed the gap this
+/// pinned. Same pool, same hidden `+1`; the caller still asserts the universe is closed (a lie it tells
+/// deliberately), but discovery is now catalog-authoritative: `hidden` was born through the real writer
+/// path (`publishAt`, `birth=true`), so it is `Live` in the catalog and stays a member of
+/// `frontier_namespaces` no matter what the listing omits, and it never sealed a cursor, so its OWN
+/// frontier is unproven. `frontier_proven == frontier_namespaces` fails on member count alone, and the
+/// blob survives even though the caller declared the universe closed -- the same strict improvement
+/// pinned in `CasGcFrontierGate.TheSameHiddenPlusOneSurvivesEvenWhenTheUniverseIsDeclaredAuthoritative`.
+TEST(CasListLiarEndToEnd, TheSameHiddenNamespacesBlobSurvivesEvenWhenTheUniverseIsDeclaredAuthoritative)
 {
     auto backend = std::make_shared<LiarBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -445,9 +449,9 @@ TEST(CasListLiarEndToEnd, TheSameHiddenNamespacesBlobIsDeletedOnceTheUniverseIsD
     }
 
     ASSERT_GT(backend->holesServed(), 0u);
-    EXPECT_FALSE(backend->head(blobKeyOf(layout, blob)).exists)
-        << "with the universe declared closed and the owner outside it, the blob IS deleted -- this is "
-           "the data loss `StageA_Suppressed` withholds, and the reason the constant is load-bearing";
+    EXPECT_TRUE(backend->head(blobKeyOf(layout, blob)).exists)
+        << "`hidden` is catalog-Live and never proved its own frontier, so the round-wide frontier stays "
+           "incomplete and nothing irreversible runs, even though the caller declared the universe closed";
 }
 
 /// ===================== FSCK =====================
@@ -529,6 +533,9 @@ TEST(CasListLiarEndToEnd, FsckReachabilityReplaySilentlyLosesAHiddenTailTransact
 {
     const Layout layout("p");
     const RootNamespace ns{"00/fsck_tail@cas@"};
+    /// Stage B (Task 4-C): no pin needed -- `seedFiveRecordStream` below calls `publishAt` (draining
+    /// into `writeRefLogTxnRaw`), which admits `ns` into each of the two independent backends' own
+    /// catalogs itself.
 
     auto honest_backend = std::make_shared<LiarBackend>();
     seedFiveRecordStream(*honest_backend, layout, ns);

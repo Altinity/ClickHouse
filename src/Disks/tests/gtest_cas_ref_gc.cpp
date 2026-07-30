@@ -273,6 +273,7 @@ TEST(CasRefGc, RefObjectCleanupHonorsAllThreeConditions)
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/aa@cas@"};
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
 
     /// Two committed publishes -> logs {1,1} and {1,2}.
     const ManifestRef r1 = mref(1);
@@ -366,6 +367,7 @@ TEST(CasRefGc, RefSnaplogLifecycleE2E)
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
     const Layout & layout = store->layout();
     const RootNamespace ns_a{"00/aa@cas@"};
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns_a);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
     const RootNamespace ns_b{"00/bb@cas@"};
 
     /// Two tables with committed refs naming present manifests + blobs (insert-like). ns_a's ref is then
@@ -425,6 +427,7 @@ TEST(CasRefGc, RemoveNamespaceCompletesAndPublishesMarkerDeterministically)
                                                  .gc_fold_max_defer_rounds = 0});
     const Layout & layout = store->layout();
     const RootNamespace ns{"test/tbl"};
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
 
     /// Real writer: publish a committed part, then DROP the whole namespace (remove_namespace).
     {
@@ -525,6 +528,7 @@ TEST(CasRefGc, RemovedNamespaceCoveredLogsCleanedByCompletingRound)
     auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     const Layout & layout = store->layout();
     const RootNamespace ns{"test/tbl"};
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
 
     /// Real writer: publish several committed parts (each is a `_log`), then DROP the whole namespace.
     for (int i = 1; i <= 4; ++i)
@@ -684,6 +688,7 @@ TEST(CasRefGc, InvalidRefLogBodyHoldsNamespaceNoPartialDelta)
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/aa@cas@"};
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
 
     const ManifestRef r = mref(1);
     writeBlobBody(*backend, layout, DB::UInt128(1));
@@ -782,6 +787,11 @@ TEST(CasRefGc, BaselineGuardRefusesWhenSnapshotSurvivesWithoutLogsOrCursor)
     /// Table B is poisoned: a durable snapshot survives, but its logs at/below it are GONE and B has no
     /// sealed cursor (first round -> no adopted parent cursors). This is the exact baseline-guard input.
     const RootNamespace ns_b{"00/bb@cas@"};
+    /// Stage B (Task 4-C): `writeRefSnapshotRaw` deliberately does NOT self-admit (several fixtures
+    /// build a table with no catalog entry on purpose), so without this `ns_b` would never enter the
+    /// catalog at all and would be invisible to the round -- the baseline guard below could then never
+    /// fire, since it never runs on a namespace outside the universe.
+    DB::Cas::tests::casAdmitEntry(*backend, layout, ns_b);
     const ManifestRef rb = mref(2);
     writeBlobBody(*backend, layout, DB::UInt128(2));
     writeManifestRaw(*backend, layout, ns_b, rb, {blobEntryFor("b", DB::UInt128(2))});
@@ -809,6 +819,7 @@ TEST(CasRefGc, StaleLeaderPendingPassAbortsOnCompletionMarker)
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/aa@cas@"};
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
 
     /// Establish gc/state under leader kGc (a real round commits round + lease.owner = kGc).
     Gc gc(store, kGc);
@@ -927,6 +938,7 @@ TEST(CasRefGc, RecreatedNamespaceRetiresCleanupItemAndStopsChurn)
                                                  .gc_fold_max_defer_rounds = 0});
     const Layout & layout = store->layout();
     const RootNamespace ns{"test/tbl"};
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
 
     /// Real writer: publish a committed part, then DROP the whole namespace.
     {
@@ -1000,6 +1012,7 @@ TEST(CasRefGc, CompletedItemRepublishesCrashLostRemovedSnapshotThenRetires)
                                                  .gc_fold_max_defer_rounds = 0});
     const Layout & layout = store->layout();
     const RootNamespace ns{"test/tbl"};
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
 
     {
         PartWriteInfo info;
@@ -1080,6 +1093,7 @@ TEST(CasRefGc, PendingPassPerKeyMarkerGuardSparesWarmSameEpochRecreation)
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/aa@cas@"};
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
 
     Gc gc(store, kGc);
     gc.runRegularRound();

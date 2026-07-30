@@ -114,6 +114,7 @@ TEST(CasGcArithmeticIntake, HintOmittingMiddleRecordsFoldsThroughUnnoticed)
     auto store = openPoolForTest(backend);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/aa@cas@"};
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
 
     for (uint64_t i = 1; i <= 5; ++i)
         publishAt(*backend, layout, ns, RefTxnId{1, i}, "ref_" + std::to_string(i), i,
@@ -172,6 +173,7 @@ TEST(CasGcArithmeticIntake, SealCrossesEpochAndIsAppliedAsNoOp)
     auto store = openPoolForTest(backend);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/aa@cas@"};
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
 
     publishAt(*backend, layout, ns, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(1), /*birth=*/true);
     publishAt(*backend, layout, ns, RefTxnId{1, 2}, "ref_2", 2, DB::UInt128(2));
@@ -204,6 +206,7 @@ TEST(CasGcArithmeticIntake, ChainedEmptyEpochSealsBothConsumedInOneRound)
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/aa@cas@"};
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
 
     publishAt(*backend, layout, ns, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(1), /*birth=*/true);
     writeSealAt(*backend, layout, ns, RefTxnId{1, 2});
@@ -376,6 +379,7 @@ TEST(CasGcArithmeticIntake, EpochStartThatAnswersOnlyEveryOtherReadHoldsInsteadO
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/aa@cas@"};
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
 
     publishAt(*backend, layout, ns, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(1), /*birth=*/true);
     writeSealAt(*backend, layout, ns, RefTxnId{1, 2});
@@ -417,6 +421,7 @@ TEST(CasGcArithmeticIntake, CorruptBodyClampsOneNamespaceWhileAnotherFolds)
     auto store = openPoolForTest(backend);
     const Layout & layout = store->layout();
     const RootNamespace ns_a{"00/aa@cas@"};
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns_a);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
     const RootNamespace ns_b{"00/bb@cas@"};
 
     publishAt(*backend, layout, ns_a, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(1), /*birth=*/true);
@@ -453,6 +458,7 @@ TEST(CasGcArithmeticIntake, B1IdentityHoldsOverAHoleyCutThatCrossesASeal)
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/aa@cas@"};
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
 
     publishAt(*backend, layout, ns, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(1), /*birth=*/true);
     publishAt(*backend, layout, ns, RefTxnId{1, 2}, "ref_2", 2, DB::UInt128(2));
@@ -473,11 +479,17 @@ TEST(CasGcArithmeticIntake, B1IdentityHoldsOverAHoleyCutThatCrossesASeal)
     EXPECT_EQ(cursorOf(*backend, layout, ns), (RefTxnId{2, 2}));
 }
 
-/// A namespace the hint omits ENTIRELY is not folded this round (it has no listing entry at all, so the
-/// round never visits it). What must hold is that nothing is damaged by the omission: when the hint
-/// shows it again, the fold resumes and every record's edge is accounted for exactly once.
+/// A namespace the hint omits ENTIRELY is not FOLDED this round (its whole log is hidden, so the walk
+/// reads nothing new). What must hold is that nothing is damaged by the omission: when the hint shows it
+/// again, the fold resumes and every record's edge is accounted for exactly once.
 /// (Carrying an unhinted namespace's cursor verbatim, and paying it an exact frontier probe, is the
 /// destructive-round frontier proof -- a later task.)
+///
+/// Stage B (Task 4-C): the round still VISITS the namespace and records an `unchanged` coverage row for
+/// it -- discovery is now catalog-authoritative, so a `Live` entry stays in the universe regardless of
+/// what the LIST hides. That is the point of the change: a namespace can no longer be omitted from the
+/// round just by a lying LIST (`CasListLiarEndToEnd`'s whole premise). This test used to pin the OLD,
+/// LIST-driven "not in the universe at all" behaviour; it now pins the coverage row's shape instead.
 TEST(CasGcArithmeticIntake, WhollyOmittedNamespaceFoldsCorrectlyOnceHintReturns)
 {
     auto backend = std::make_shared<HintHoleBackend>();
@@ -493,8 +505,11 @@ TEST(CasGcArithmeticIntake, WhollyOmittedNamespaceFoldsCorrectlyOnceHintReturns)
 
     Gc gc(store, kGc);
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
-    EXPECT_EQ(coverageOf(*backend, layout, ns), std::nullopt)
-        << "a namespace with no listed object is not in this round's universe at all";
+    const auto hidden_cov = coverageOf(*backend, layout, ns);
+    ASSERT_TRUE(hidden_cov.has_value())
+        << "the namespace is `Live` in the catalog, so it stays in the universe even fully hidden";
+    EXPECT_EQ(hidden_cov->classification, 1) << "nothing was folded, so the row is `unchanged`";
+    EXPECT_EQ(hidden_cov->last_folded_ref_id, (RefTxnId{}));
 
     /// The store stops lying: the namespace reappears and folds in full.
     backend->revealAll();
