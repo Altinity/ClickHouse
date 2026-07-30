@@ -3195,3 +3195,33 @@ and surface the problem.
 reclaim a never-born namespace's `_ckpt` only after **independently re-verifying emptiness with a real
 LIST**, never by inferring it from one attempt's own conflict. That independence is the entire difference
 between the backstop and the thing that was removed.
+
+## The uniform catalog-admission pin removed the suite's ability to test the un-admitted case {#uniform-pin-removed-testability}
+
+Third distinct consequence of one mechanical sweep, found 2026-07-31. Recorded because the first two were
+findings about individual tests and this one is a property of the sweep itself.
+
+Task 4-C fixed 164 failing tests by adding `casAdmitEntry` inside `writeRefLogTxnRaw` — the single choke
+point every raw-write fixture funnels through. Correct, and it collapsed 164 bespoke fixes into one. But it
+also means **no raw-fixture helper can construct an un-cataloged namespace with content any more**, which is
+exactly the shape the un-cataloged anomaly exists to detect. So the sweep quietly removed the suite's means
+of testing what it was protecting, and no test of that shape existed until one was written deliberately.
+
+The way back in: build the namespace through the **real writer path** and strip its catalog entry
+afterwards, rather than trying to write content without an entry. That is what
+`CasGcShardIncarnation.UncatalogedNamespaceWithRealObjectsLeavesTheRoundIncomplete` does.
+
+**The other two consequences of the same pin, for the pattern:** it inverted the premise of the one test
+whose subject was the ABSENCE of a catalog entry (a "never-born" birth-`_ckpt` test whose assertion then
+demanded deletion under a `Live` entry), and it made `DropNamespaceErasesAllViews` — the one end-to-end
+real-incarnation test — run entirely at the sentinel, which had to be undone by REMOVING its pin.
+
+**The rule: after a uniform pin, ask what the pin makes unconstructible.** A sweep that adds a precondition
+everywhere removes every test's ability to exercise its absence, and the tests that mattered most were the
+ones whose subject was that absence. Grep the swept files for premises of absence — "never", "no entry",
+"not yet", "un-cataloged" — before declaring the sweep complete.
+
+**And a companion note on my own error in the same thread:** I claimed the property was already enforced by
+existing regression tests because three tests sat next to the anomaly and mentioned it. They existed to
+ROUTE AROUND it. Asserting an enforcement mechanism from a test's neighbourhood rather than its assertions is
+the same class of mistake as every other false claim in this campaign — a statement about another location.
