@@ -381,7 +381,7 @@ void executeQuery(
     new_context->increaseDistributedDepth();
 
     const size_t shards = cluster->getShardCount();
-<<<<<<< HEAD
+    const bool has_additional_query_infos = !additional_query_infos.empty();
     ProfileEvents::increment(ProfileEvents::Shards, shards);
 
     /// Tracker is shared between local-missing-table skip path in SelectStreamFactory and
@@ -398,9 +398,6 @@ void executeQuery(
                 unavailable_shard_tracker = std::make_shared<UnavailableShardTracker>(shards, max_num, max_ratio);
         }
     }
-=======
-    const bool has_additional_query_infos = !additional_query_infos.empty();
->>>>>>> bdef614e1f2 (Merge pull request #1694 from Altinity/feature/antalya-26.3/pr-1442)
 
     if (context->getSettingsRef()[Setting::allow_experimental_analyzer])
     {
