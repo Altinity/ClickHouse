@@ -2791,7 +2791,6 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
         {
             std::lock_guard lock(rt->state_mutex);
             lane_state = rt->lane_state;
-            chassert(lane_state == RefLaneState::Ready);
             if (rt->append_attempt)
                 attempt_key = rt->append_attempt->key;
         }
@@ -3045,8 +3044,6 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
     {
         std::lock_guard lock(rt->state_mutex);
         const bool same_base = rt->state.getGreatestApplied() == candidate_base_id;
-        chassert(rt->lane_state == RefLaneState::Ready);
-        chassert(!rt->append_attempt);
         if (rt->lane_state == RefLaneState::Ready && !rt->append_attempt && same_base)
         {
             static_assert(std::is_nothrow_move_constructible_v<RefAppendAttempt>);
