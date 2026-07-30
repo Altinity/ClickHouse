@@ -275,6 +275,14 @@ BOTH sides edited (`gtest_cas_ref_install_safety.cpp` 191 restated lines,
 absorb helper in `CasGc.cpp` wants a re-read against the restated lane, since its premise was the
 old wedge model.
 
+**EXECUTED 2026-07-30: merged as `9f9514a90f1`, build clean (`NINJA_EXIT=0`), gate 1577/244 all
+passed.** Both hunks resolved as predicted — `CasRefLedger.cpp` took master's `RefAppendAttempt` with
+the key on `stageATransition`, and `gtest_cas_ref_install_safety.cpp` took master's `NeedsRecovery`
+assertion while NOT resurrecting lane-g's test for the install region the restatement deleted. The
+silent-survivor grep (`RefApplyState`, `applyStateForTest`, `armApplyPending`, `clearApplyPending`,
+`poisonApplyState`, `prepared_wedge`, the TYPE `RefAppendWedge`) returned ZERO. Arithmetic verified
+empirically: 1567/243 + 8 (new `CasRefNamespaceId` suite) + 2 (fix-round tests) = 1577/244.
+
 **Consequence for sequencing:** Task 1 lands by MERGE with two hand-resolved hunks; Task 1b is REDONE
 on top of it (see below), and the redo then gets the `RefNamespaceId` key API for free instead of
 re-extracting against `refLogKey(ns, id)` and making Task 1c migrate the same keys twice.
