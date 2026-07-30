@@ -1778,31 +1778,36 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// Increment review NEW-1: a dead-incarnation key alone (`stale_incarnation_ns_seen`, populated by
     /// R10 above) is NOT an anomaly by itself -- Task 5's removal-then-recreate ordinarily leaves exactly
     /// this debris behind, harmlessly, while GC has not yet swept it. It becomes a contradiction, not
-    /// ordinary debris, the moment the namespace's CURRENT incarnation contributed NOTHING this round --
-    /// no listed ref object (`ref_tables`, R10's own accepted set) and no `_ckpt` (`checkpoints.life_epochs`,
-    /// review C3's single catalog-consistent read) -- because the catalog names this incarnation `Live`
-    /// or `Removing` right now, so a genuinely current incarnation with zero footprint anywhere, sitting
-    /// next to a DIFFERENT incarnation's real objects under the SAME name, is exactly the shape C1's own
-    /// walk-loop fix cannot see (that fix gates on catalog absence, not incarnation mismatch) and would
-    /// wrongly let the walk below fabricate a vacuous frontier proof from a key space the CURRENT
-    /// incarnation never wrote into -- the amplifier this whole review round is about, with a present-
-    /// but-wrong entry substituted for a missing one. Unreachable today (no removal API exists yet to
-    /// produce it -- `CasRefCatalog` has no entry-deletion primitive), which is exactly why it must be
-    /// caught HERE, as a fail-closed anomaly, rather than left to whatever Task 5/6 eventually builds:
-    /// once removal exists this becomes reachable on day one of that landing, and an anomaly here already
-    /// suppresses the round the same way every other anomaly does.
+    /// ordinary debris, the moment the namespace's CURRENT incarnation contributed NOTHING this round.
+    ///
+    /// Final review F3: `checkpoints.life_epochs` is NOT an independent second witness for this check,
+    /// and the comment used to claim it was. `readCheckpointWitnesses` only performs the `_ckpt` GET for
+    /// names already in `ref_tables` or with a HELD parent cursor -- i.e. exactly the names this loop
+    /// never reaches (every `ns_str` here is, by construction, absent from `ref_tables`). So
+    /// `life_epochs.contains(ns_str)` is false by construction in the very case it was cited to cover,
+    /// and relying on it alone would raise an anomaly on entirely healthy data: a rebirth where LIST
+    /// returns the dead incarnation's surviving objects but not yet the new incarnation's freshly
+    /// published `_ckpt` (the fresh-key omission Stage B exists because of) has a real, current,
+    /// UNLISTED `_ckpt` this loop would otherwise never learn about. One exact-key HEAD closes it: read
+    /// the current incarnation's own `_ckpt` directly, independent of whatever this round's LIST found.
     for (const String & ns_str : stale_incarnation_ns_seen)
     {
-        if (ref_tables.contains(ns_str) || checkpoints.life_epochs.contains(ns_str))
-            continue;   /// the current incarnation DID contribute something -- ordinary dead-incarnation debris
+        if (ref_tables.contains(ns_str))
+            continue;   /// the current incarnation DID contribute a listed ref object -- ordinary debris
+        const auto current_it = live_incarnation.find(ns_str);
+        chassert(current_it != live_incarnation.end());   /// `stale_incarnation_ns_seen` only inserts names R10 found HERE
         const RootNamespace ns{ns_str};
+        const NamespaceLifeId current_life = NamespaceLifeId::fromCatalogEntry(ns, current_it->second);
+        if (backend.head(layout.refCkptKey(current_life)).exists)
+            continue;   /// the current incarnation has a real, if unlisted, _ckpt -- ordinary debris
         report.recordAnomaly(ns, 0, ManifestId{ns, {}},
             "ref intake: this namespace's CURRENT catalog incarnation contributed no listed ref object and "
-            "no _ckpt this round, while a DIFFERENT incarnation of the same name has listed ref objects -- "
-            "a namespace this round's own listing and catalog together prove was dropped and recreated, "
-            "which the walk below cannot safely fold (a stale cursor keyed by name, not incarnation, would "
-            "be read against the wrong key space) -- refusing rather than fabricating a vacuous frontier "
-            "proof for the current incarnation");
+            "has no _ckpt (checked by exact key, independent of this round's listing) this round, while a "
+            "DIFFERENT incarnation of the same name has listed ref objects -- a namespace this round's own "
+            "listing and catalog together prove was dropped and recreated, which the walk below cannot "
+            "safely fold (a stale cursor keyed by name, not incarnation, would be read against the wrong "
+            "key space) -- refusing rather than fabricating a vacuous frontier proof for the current "
+            "incarnation");
     }
 
     /// WHICH NAMESPACES THIS ROUND WALKS -- i.e. THE ROUND'S UNIVERSE, the set the destructive gate owes
