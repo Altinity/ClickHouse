@@ -150,3 +150,28 @@ explicit `ASSUME` is the right pattern only when the model genuinely requires
 a non-empty domain. Empty-set conventions should run liveness properties with
 a TLC version that passes the `<> TRUE` smoke test, keeping each run's
 `-metadir` unique as usual.
+
+## Temporal-sabotage audit {#temporal-sabotage-audit}
+
+The only three runner rows that expect a temporal violation were audited with
+the same model and configuration under both jars. Every invocation used a
+distinct metadir. TLC 2.19 reports only an unnamed temporal failure; official
+`tla2tools` 2026.07.18.145032 identifies the property explicitly.
+
+| Runner | Model / row | TLC 2.19 | Official 2026.07.18.145032 | Conclusion |
+| --- | --- | --- | --- | --- |
+| `run_buildrootprecommit.sh` | `CaBuildRootPrecommit` / `lazyleak` | violates (rc 13) | `INV_NO_LEAK` violates (rc 13) | sound sabotage |
+| `run_disklifecycle.sh` | `CaDiskLifecycle` / `sab_nogcselfexit` | violates (rc 13) | `GcExitsAfterVanished` violates (rc 13) | sound sabotage |
+| `run_gcrounddefer.sh` | `CaGcRoundDeferCore` / `sab_unbounded_defer` | violates (rc 13) | `EventuallyFolded` violates (rc 13) | sound sabotage |
+
+Thus none of these expectation rows was green solely because TLC 2.19
+violates temporal properties incorrectly. `TlcTemporalSmoke.tla` and the
+shared `tlc_temporal_gate.sh` make that fact a runner gate: each of these
+runners now refuses temporal verdicts when its selected jar violates `<> TRUE`.
+
+Recommendation: retain the pinned TLC 2.19 jar for now, because changing it
+wholesale is outside this audit. The official jar passes the smoke test and is
+the candidate replacement, but first re-run every configuration that declares
+`PROPERTY` or `PROPERTIES` (43 configurations in this survey's inventory),
+including their safety and temporal outcomes, then review and deliberately
+accept any changed result before changing the runner jar.

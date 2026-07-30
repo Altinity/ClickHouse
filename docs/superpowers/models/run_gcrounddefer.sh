@@ -7,6 +7,8 @@ cd "$(dirname "$0")"
 JAR=../../../tmp/tla2tools.jar
 MODULE=CaGcRoundDeferCore
 [[ -f "$JAR" ]] || { echo "jar not found: $JAR" >&2; exit 3; }
+source "$(dirname "$0")/tlc_temporal_gate.sh"
+check_tlc_temporal_gate "$JAR" || exit 4
 
 # `sab_unbounded_defer` is liveness: TLC does not name the violated temporal property.
 # name                     expectation  expected-invariant-or-property
