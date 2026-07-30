@@ -2677,8 +2677,10 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
 
     /// ONE atomic reading of everything this transaction is derived from that the RUNTIME owns: the
     /// state it will be applied to, the id, the mount incarnation that admitted it, and the seal that
-    /// qualifies the id's sequence number. `prepareRefChunk` below is a pure function of these four
-    /// readings plus its three immutable inputs -- the layout, the namespace and this chunk's ops.
+    /// qualifies the id's sequence number. `prepareRefChunk` below is a pure function of its arguments,
+    /// and every argument is either one of those four readings, a value DERIVED from one of them outside
+    /// the lock (`chain_link`, from the seal -- see `chainLinkFor` below), or an immutable input the
+    /// runtime does not own at all (the layout, the namespace, this chunk's ops).
     ///
     /// The candidate is built from this snapshot BEFORE the PUT (spec §A1), so that the region between
     /// "this chunk's object is durable" and "the runtime records it" is allocation-free and therefore
@@ -2745,10 +2747,13 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
     /// is in-memory only. A "pure" preparation that published the `_ckpt` itself would be a lie, and
     /// moving that publish later would change fault semantics the directive says to preserve.
     ///
-    /// It throws only on a rejected apply, a failed seal, or an allocation failure -- all pre-durability
-    /// rejections with the identical handler, which is why ONE catch replaces the two that used to sit
-    /// around those steps separately (see the FAULT CLASS note on `prepareRefChunk` for the two
-    /// statements whose catcher changed).
+    /// Everything it can throw is a pre-durability rejection with the identical handler, which is why ONE
+    /// catch replaces the two that used to sit around those steps separately (see the FAULT CLASS note on
+    /// `prepareRefChunk` for the two statements whose catcher changed). The reachable ones are a rejected
+    /// apply and a failed seal; an allocation failure anywhere inside is the same class, and so is the
+    /// `BAD_ARGUMENTS` that `layout.refLogKey` -> `refsNamespacePrefix` -> `checkNamespace` would raise
+    /// for a malformed namespace -- unreachable here, since a mounted table's namespace already passed
+    /// that check, but the list is not meant to read closed.
     std::optional<PreparedRefChunk> prepared;
     try
     {
@@ -2786,16 +2791,24 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
     /// where it used to run below. That matters more than "an allocation could fail earlier", because
     /// sealing is not pure serialization -- it VALIDATES. `encodeRefLogTxn` runs `checkRefTxnIdNonzero`,
     /// then `validateEpochSealGrammarStructural`, then `checkBudget` over the encoded text
-    /// (`CasRefLogFormat.cpp`), and throws `CORRUPTED_DATA`/`LIMIT_EXCEEDED`; the candidate apply above
-    /// runs, of INV-2's grammar, only `validateEpochSealGrammarContextual`, which returns early off
+    /// (`CasRefLogFormat.cpp`), and throws `CORRUPTED_DATA` -- all three of `checkBudget`'s refusals use
+    /// that code too (`CasRefLogFormat.cpp:55`, `:61`, `:67`), so the whole seal speaks ONE class. NOT
+    /// `LIMIT_EXCEEDED`: that code belongs to the carve-time admission caps (`:2369`, `:2377`, `:2472`) --
+    /// a different check at a different stage -- and naming it here would invite exactly that conflation.
+    /// The candidate apply above runs, of INV-2's grammar, only `validateEpochSealGrammarContextual`,
+    /// which returns early off
     /// sequence 1 and owns nothing but the required-iff rule. The two grammar halves are DISJOINT BY
     /// DESIGN -- each function's own comment says the other owns the half it does not -- and the budget
     /// check belongs to neither. So a chunk can pass the apply and still be refused by the seal, on
     /// grammar, on id shape, or on size; after the reorder that refusal lands BEFORE this `_ckpt` is
     /// durable instead of after it, so it leaves no inert `_ckpt` behind where it used to leave one.
-    /// Caller-visible outcome is identical: both orders reach the same already-possible rejection,
-    /// complete the same survivors with the same error, return false, and consume no id. Strictly less
-    /// durable debris, nothing new that can throw.
+    /// Caller-visible outcome is identical WHEN ONE of the two steps refuses: both orders reach the same
+    /// already-possible rejection, complete the same survivors with the same error, return false, and
+    /// consume no id. A birth chunk that would fail BOTH -- an unsealable transaction AND a moved mount
+    /// fence -- reports a different CLASS after the reorder, because whichever step now runs first is the
+    /// one that speaks: the seal's `CORRUPTED_DATA` instead of the `FencedOut` retry-later below. Both are
+    /// truthful about a chunk that was never sent and consumed no id, and neither order can report both.
+    /// Strictly less durable debris, nothing new that can throw.
     if (prepared->birth_contribution)
     {
         try

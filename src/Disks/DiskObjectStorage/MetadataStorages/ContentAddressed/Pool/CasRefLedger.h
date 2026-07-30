@@ -396,12 +396,19 @@ public:
     /// `Writing` or `Wedged` and by no other lane state; it stays installed until the object is confirmed
     /// durable and applied to the cache, or definitely rejected.
     ///
-    /// The four fields together are the attempt's IDENTITY, and all four are compared before any later
-    /// result is acted on (`resolveWedgeOnce`'s post-I/O recheck). Comparing the id alone -- or the
-    /// admission generation alone -- is the aliasing bug the phase-0 model found: two attempts of the
-    /// same table can carry the same id under the same generation and describe DIFFERENT bytes, and
-    /// installing one attempt's candidate because the other's key resolved is precisely the
-    /// acked-then-lost class this every-attempt rule exists to close.
+    /// The four fields together are the attempt's IDENTITY. THREE of them are compared before any later
+    /// result is acted on -- `txn_id`, `bytes` and `admitted_fence_generation` (`resolveWedgeOnce`'s
+    /// post-I/O recheck, which calls them "all three components of the identity"). The key is not
+    /// compared because it adds nothing: `Layout::refLogKey` is a function of exactly
+    /// `(RefNamespaceId, RefTxnId)`, and the namespace life is fixed for the runtime that holds the
+    /// attempt, so within one runtime an equal `txn_id` already implies an equal key. (Should a runtime
+    /// ever span two incarnations of one namespace -- it does not today -- that implication is what
+    /// would need re-checking, not the comparison list.)
+    ///
+    /// Comparing the id alone -- or the admission generation alone -- is the aliasing bug the phase-0
+    /// model found: two attempts of the same table can carry the same id under the same generation and
+    /// describe DIFFERENT bytes, and installing one attempt's candidate because the other's key resolved
+    /// is precisely the acked-then-lost class this every-attempt rule exists to close.
     ///
     /// Public because it is a member of `PreparedRefChunk`, which `prepareRefChunk` returns.
     struct RefAppendAttempt
@@ -436,7 +443,9 @@ public:
     /// decided before anything can be durable.
     ///
     /// `static` on purpose, and it is load-bearing rather than stylistic: with no `this` there is no
-    /// backend, no `RefTableRuntime`, no clock and no lock reachable from here, so "backend-free" is
+    /// MEMBER backend, `RefTableRuntime`, clock or lock reachable from here (`CasBackend.h` itself is
+    /// transitively visible, so a CONSTRUCTED backend would compile -- what `static` removes is the
+    /// injected one), so "backend-free" is
     /// CHECKABLE instead of promised. That is what lets the protocol arithmetic be swept exhaustively
     /// with no store at all: `gtest_cas_ref_chunk_preparation.cpp` names no backend and constructs none,
     /// and no future edit inside this function can quietly reach for one and still compile there.
@@ -447,16 +456,20 @@ public:
     /// the live state's COW bases and is NOT materialized here -- folding a base-sharing state would
     /// rebuild the whole base, O(table) per chunk, which the install path exists to avoid.
     ///
-    /// `id`, `chain_link` and `admitted_generation` are INPUTS, not derived here, because all three must
-    /// be read in the SAME critical section that snapshots the state (INV-1): deriving the id from a
-    /// different instant than the state it is applied to would be deriving it from a different stream.
-    /// The critical section therefore stays in `commitRefChunk`, and this is a pure function of what that
-    /// one atomic reading saw, together with `layout`, `ns` and `ops`.
+    /// `id`, `chain_link` and `admitted_generation` are INPUTS, not derived here, because each traces back
+    /// to the SAME critical section that snapshots the state (INV-1): `id` and `admitted_generation` are
+    /// read inside that hold, and `chain_link` is derived just outside it from the `last_epoch_seal` read
+    /// inside it. Deriving the id from a different instant than the state it is applied to would be
+    /// deriving it from a different stream. The critical section therefore stays in `commitRefChunk`, and
+    /// this is a pure function of its arguments -- what that one atomic reading saw, plus `layout`, `ns`
+    /// and `ops`.
     ///
-    /// Throws on a rejected apply, a failed seal, or an allocation failure -- all ordinary PRE-durability
-    /// rejections: no object exists, the cache is untouched, and the id is simply never used (the next
-    /// attempt re-derives it from the same unchanged state). See the FAULT CLASS note on the definition
-    /// for what changed about WHO catches them.
+    /// Every throw out of here is an ordinary PRE-durability rejection: no object exists, the cache is
+    /// untouched, and the id is simply never used (the next attempt re-derives it from the same unchanged
+    /// state). The reachable ones are a rejected apply and a failed seal; an allocation failure anywhere
+    /// inside is the same class, and so is `checkNamespace`'s `BAD_ARGUMENTS` on the key-building path
+    /// (unreachable for a mounted table, listed so the enumeration does not read closed). See the FAULT
+    /// CLASS note on the definition for what changed about WHO catches them.
     static PreparedRefChunk prepareRefChunk(const Layout & layout, const RootNamespace & ns,
                                             RefTableState state, const RefTxnId & id,
                                             const std::optional<RefTxnId> & chain_link,
