@@ -2895,3 +2895,25 @@ conclusion did not depend on their magnitude, but a future diagnosis might.
 
 **Fix:** use `pending_condemned` alone, which is already the total. Do it when either test is next
 touched — most likely at Task 7b, which must restore their deletion assertions anyway.
+
+## The `!attempt_armed` arm's non-deletion is unpinned, by a judgement I endorsed {#attempt-armed-arm-unpinned}
+
+Task 3 fix round 1 removed a `cleanupOrphanedBirthCkptBestEffort` call from `commitRefChunk`'s
+`!attempt_armed` arm, because that arm makes no lane transition and so is not covered by the delete's
+safety argument — and in one shape the append that advanced applied state can BE the birth whose `_ckpt`
+would be deleted, against an object with no repair path.
+
+**No test pins the non-deletion, and that is deliberate.** The implementer looked for a reachable path
+and found none: `leader_active` serialises each table to one flush leader, and nothing mutates
+`rt->state` between `commitRefChunk`'s snapshot and its arming check on that same thread. A test would
+therefore either not enter the branch — testing nothing — or need a new test-only hook poking
+`rt->lane_state` / `append_attempt` / `state` directly to force the mismatch, bypassing the machinery.
+It declined to add such a hook unreviewed inside a fix round, and I endorse that: a hook whose purpose is
+to construct states the real code cannot reach is a way to make impossible states testable, which is a
+design decision, not test hygiene.
+
+**So the residual risk is re-introduction, not present behaviour.** If someone adds the call back to that
+arm, nothing fails. If that is worth closing, the honest options are (a) build the hook as its own
+reviewed change, with the arm's neighbours getting the same treatment since they share the posture, or
+(b) accept it as defensive code and leave this entry as the record. Do not close it by re-adding the
+call and calling the arm safe.

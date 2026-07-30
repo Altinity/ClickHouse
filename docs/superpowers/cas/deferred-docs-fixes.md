@@ -173,15 +173,20 @@ Design-decisions paragraph states it correctly, so the imprecision is in the sum
 NAME. No substantive gap — equality semantics live in the shared `fitsObjectCap`, which predicate (1)
 does test at exact equality.
 
-### D11 — the birth-`_ckpt` cleanup's call-site count is stated as three {#d11-ckpt-cleanup-site-count}
+### D11 — RESOLVED, do not "fix" it {#d11-ckpt-cleanup-site-count}
 
 From the Task 3 review (P1, PROSE/Important). There are FOUR call sites, not three. Both the code's own
 comment and — before it was corrected — plan Task 4's obligation stated three. The plan side is already
 fixed; the code comment is not.
 
-**Fix:** state the count you can derive at write time, or drop the number and describe the sites by
-what they have in common. A count nobody re-derives is how this one drifted. Note the count may change
-again: fix round 1 removes the `!attempt_armed` call site, so re-derive rather than writing "three".
+**RESOLVED 2026-07-30 as a side effect, and the batched pass must NOT touch it.** Fix round 1 removed the
+`!attempt_armed` call site, so there are three again and the comment saying "THREE branches" is TRUE.
+Verified by re-deriving the count after the fix, not by assuming.
+
+Kept as a closed entry for one reason: this figure went stale TWICE in one afternoon — the comment said
+three, the review corrected it to four, the fix made it three again — and the second staleness was in a
+plan step written to prevent exactly that. The lesson is not "count more carefully", it is **do not carry
+a count that something else can change**; that step now states none and tells its reader to derive it.
 
 ### D12 — "never reaches the object store" is false; the real reason is non-comparability {#d12-fence-generation-reason}
 
