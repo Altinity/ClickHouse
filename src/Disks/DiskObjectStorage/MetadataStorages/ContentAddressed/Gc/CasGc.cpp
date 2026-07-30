@@ -1401,6 +1401,10 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     std::vector<String> live_ref_object_keys;
     live_ref_object_keys.reserve(ref_object_keys.size());
     std::set<String> uncataloged_ns_already_recorded;   /// one anomaly per namespace, not per stray key
+    /// Increment review NEW-1: every namespace name R10 saw a NON-current-incarnation key for. Feeds the
+    /// contradiction check below -- see its own comment for why a dead-incarnation key alone is not yet
+    /// an anomaly (it usually is not one), and what turns it into one.
+    std::set<String> stale_incarnation_ns_seen;
     for (const String & key : ref_object_keys)
     {
         std::optional<NamespaceLifeId> id;
@@ -1453,6 +1457,10 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                 "-- dropped rather than folded (expected on an ordinary removal too, not only on damage, "
                 "until Task 5's removal-evidence check lands)", key);
             report.recordAnomaly(id->ns, 0, ManifestId{id->ns, {}}, reason.c_str());
+        }
+        else if (it != live_incarnation.end())
+        {
+            stale_incarnation_ns_seen.insert(id->ns.string());
         }
     }
 
@@ -1741,6 +1749,36 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// namespaces whose `_ckpt` is present and unreadable; each of those is HELD below, and only those.
     const CheckpointWitnesses checkpoints = readCheckpointWitnesses(ref_tables, parent_cursors, live_incarnation);
     const std::map<String, RefTxnId> & checkpoint_witness = checkpoints.witnesses;
+
+    /// Increment review NEW-1: a dead-incarnation key alone (`stale_incarnation_ns_seen`, populated by
+    /// R10 above) is NOT an anomaly by itself -- Task 5's removal-then-recreate ordinarily leaves exactly
+    /// this debris behind, harmlessly, while GC has not yet swept it. It becomes a contradiction, not
+    /// ordinary debris, the moment the namespace's CURRENT incarnation contributed NOTHING this round --
+    /// no listed ref object (`ref_tables`, R10's own accepted set) and no `_ckpt` (`checkpoints.life_epochs`,
+    /// review C3's single catalog-consistent read) -- because the catalog names this incarnation `Live`
+    /// or `Removing` right now, so a genuinely current incarnation with zero footprint anywhere, sitting
+    /// next to a DIFFERENT incarnation's real objects under the SAME name, is exactly the shape C1's own
+    /// walk-loop fix cannot see (that fix gates on catalog absence, not incarnation mismatch) and would
+    /// wrongly let the walk below fabricate a vacuous frontier proof from a key space the CURRENT
+    /// incarnation never wrote into -- the amplifier this whole review round is about, with a present-
+    /// but-wrong entry substituted for a missing one. Unreachable today (no removal API exists yet to
+    /// produce it -- `CasRefCatalog` has no entry-deletion primitive), which is exactly why it must be
+    /// caught HERE, as a fail-closed anomaly, rather than left to whatever Task 5/6 eventually builds:
+    /// once removal exists this becomes reachable on day one of that landing, and an anomaly here already
+    /// suppresses the round the same way every other anomaly does.
+    for (const String & ns_str : stale_incarnation_ns_seen)
+    {
+        if (ref_tables.contains(ns_str) || checkpoints.life_epochs.contains(ns_str))
+            continue;   /// the current incarnation DID contribute something -- ordinary dead-incarnation debris
+        const RootNamespace ns{ns_str};
+        report.recordAnomaly(ns, 0, ManifestId{ns, {}},
+            "ref intake: this namespace's CURRENT catalog incarnation contributed no listed ref object and "
+            "no _ckpt this round, while a DIFFERENT incarnation of the same name has listed ref objects -- "
+            "a namespace this round's own listing and catalog together prove was dropped and recreated, "
+            "which the walk below cannot safely fold (a stale cursor keyed by name, not incarnation, would "
+            "be read against the wrong key space) -- refusing rather than fabricating a vacuous frontier "
+            "proof for the current incarnation");
+    }
 
     /// WHICH NAMESPACES THIS ROUND WALKS -- i.e. THE ROUND'S UNIVERSE, the set the destructive gate owes
     /// a frontier proof for (spec §5; `UniversePolicy` for why Stage A refuses to trust it):

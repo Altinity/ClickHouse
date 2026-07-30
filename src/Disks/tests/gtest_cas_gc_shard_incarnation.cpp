@@ -105,6 +105,48 @@ TEST(CasGcShardIncarnation, DiscoveryEqualsPresentShards)
     }
 }
 
+/// Increment review NEW-1: an incarnation MISMATCH, not entry absence. C1's fix (above) refuses to walk
+/// a namespace the catalog does not name AT ALL; it does nothing when the catalog names the namespace at
+/// an incarnation whose key space is empty while a DIFFERENT (dead) incarnation of the SAME name has
+/// listed ref objects. Simulated here the same way `DiscoveryEqualsPresentShards`'s case (c) simulates
+/// "the catalog forgot" -- raw catalog manipulation standing in for a removal API that does not exist
+/// yet (`CasRefCatalog` has no entry-deletion primitive): admit `ns` Live at incarnation A, publish one
+/// real ref-log record under it, then swap the SAME catalog entry to a DIFFERENT incarnation B with
+/// nothing written under it at all. `A`'s record is now exactly the shape NEW-1 names: a non-current
+/// incarnation with listed objects, sitting next to a current incarnation that contributed nothing.
+/// Without the fix this reads as a vacuously-complete frontier (0 of 0 needed at incarnation B, and
+/// incarnation A's key was dropped as "ordinary dead-incarnation debris" by R10/I1); the fix must instead
+/// raise it as an anomaly and suppress the round.
+TEST(CasGcShardIncarnation, IncarnationMismatchWithoutEntryAbsenceIsAnAnomaly)
+{
+    std::shared_ptr<InMemoryBackend> backend;
+    auto store = makePoolWithShards(backend, /*gc_shards=*/1);
+    Gc gc(store, hexToU128("0000000000000000000000000000000a"));
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/tblIncarnationSwap"};
+
+    CasRefCatalog::casAdmitEntry(*backend, layout, CatalogEntry{.ns = ns, .state = NsState::Live,
+        .incarnation = UInt128(11), .creator = std::nullopt});   // Live forbids a creator fence
+    appendRefLogSeed(*backend, layout, ns, {});   // one real record, keyed at incarnation 11
+
+    {
+        CasRefCatalog::Snapshot snap = CasRefCatalog::read(*backend, layout);
+        const auto it = std::find_if(snap.catalog.entries.begin(), snap.catalog.entries.end(),
+            [&](const CatalogEntry & e) { return e.ns.string() == ns.string(); });
+        ASSERT_NE(it, snap.catalog.entries.end());
+        it->incarnation = UInt128(22);   // "recreated" -- same name, different (empty) key space
+        const HeadResult h = backend->head(layout.refCatalogKey());
+        ASSERT_TRUE(h.exists);
+        ASSERT_EQ(backend->putOverwrite(layout.refCatalogKey(), encodeRefCatalog(snap.catalog), h.token).outcome,
+                   PutOutcome::Done);
+    }
+
+    const RoundReport report = gc.runRegularRound({}, /*allow_steal=*/true, UniversePolicy::AuthoritativeForTest);
+    EXPECT_FALSE(report.anomalies.empty())
+        << "a current incarnation with zero footprint next to a different incarnation's real objects "
+           "must be refused, not read as a vacuously-complete frontier";
+}
+
 /// Task 4: listNamespaces is LIST-based; no registry involved.
 /// Publishing into ns A makes it appear in listNamespaces(""); ns B absent.
 TEST(CasGcShardIncarnation, ListNamespacesFromRefsNotRegistry)
