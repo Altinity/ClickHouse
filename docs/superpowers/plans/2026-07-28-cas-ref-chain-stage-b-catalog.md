@@ -245,6 +245,40 @@ static_assert(!HasNamespaceOnlyRefLogKey<Layout>);
 - [ ] **Step 4:** Full CA gate green. **Step 5: Commit**
   `ca: ref — RefNamespaceId{ns, incarnation}; namespace-only key helpers deleted`.
 
+### MEASUREMENT 2026-07-30 — Task 1 CAN be merged; the silent surface is one line, inside a conflict {#task-1-merge-measured}
+
+Measured rather than assumed, by the same method that exposed Task 1b's trap. `git merge-tree
+--write-tree 67dd2666e75 cas-gc-rebuild` (lane-g as of Task 1 + its fix, against the restated master)
+yields tree `e04675baaea` with **two conflicted files**: `Pool/CasRefLedger.cpp` (ONE hunk, markers at
+2716/2721/2726) and `tests/gtest_cas_ref_install_safety.cpp`.
+
+**The decisive question was the key API**, since Task 1 DELETED the namespace-only overloads while
+master still has 317 call sites in that form. The answer: the restatement introduced exactly **ONE**
+namespace-only call site — `prepared_attempt.key = layout.refLogKey(ns, id);` — and it sits INSIDE the
+`CasRefLedger.cpp` conflict hunk (merged-tree line 2724, immediately below lane-g's migrated
+`prepared_wedge.key = layout.refLogKey(RefNamespaceId::stageATransition(ns), id);` at 2719). It also
+REMOVED two — the `prepared_wedge` key line it replaced, and one test's `refsNamespacePrefix(ns)`
+fault-substring. Everything else auto-merges because the two changes are DISJOINT: Task 1 migrated key
+builders, the restatement rewrote the lane's state machinery.
+
+**Verified per file in the merged tree**: every file that calls the five ref-key helpers also carries
+`RefNamespaceId`/`stageATransition`/`ns_id` at least as often as it calls them — with exactly one
+exception, `Formats/CasRefCkptFormat.h:13`, which is the STALE DOC COMMENT already queued for Task 1c,
+not code. So **no namespace-only key call silently lands** in a tree whose `Layout` no longer offers
+that overload. This is the opposite of Task 1b, where the auto-merged part could not compile.
+
+**What this measurement does NOT prove, stated so nobody over-reads it:** `merge-tree` is textual. It
+says no key-API breakage lands silently; it does not say the merged code is semantically right, and it
+is not a build. The real review surface after resolving is the two conflict hunks plus the three files
+BOTH sides edited (`gtest_cas_ref_install_safety.cpp` 191 restated lines,
+`gtest_cas_ref_wedge_every_attempt.cpp` 101, `gtest_cas_ref_ckpt.cpp` 22) — and Task 1's fix-round
+absorb helper in `CasGc.cpp` wants a re-read against the restated lane, since its premise was the
+old wedge model.
+
+**Consequence for sequencing:** Task 1 lands by MERGE with two hand-resolved hunks; Task 1b is REDONE
+on top of it (see below), and the redo then gets the `RefNamespaceId` key API for free instead of
+re-extracting against `refLogKey(ns, id)` and making Task 1c migrate the same keys twice.
+
 ### DECISION 2026-07-30 — Task 1b is REDONE on top of the restatement, NOT merged {#task-1b-redo}
 
 The lane restatement (`bb4dd513118`) landed on `cas-gc-rebuild` after Task 1b was built in `lane-g`,
