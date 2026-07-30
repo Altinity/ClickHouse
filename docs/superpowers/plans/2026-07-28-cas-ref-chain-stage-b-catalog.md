@@ -928,9 +928,12 @@ reds in a shared worktree.
   defined in the shared `src/Disks/tests/cas_test_helpers.h` and all drain into `writeRefLogTxnRaw`.
   Failure partition, by terminal reachability, closing exactly: **136 reach only `writeRefLogTxnRaw`,
   21 reach only the real path (`beginPartWrite`/`dropNamespace` — fixed for free by 4-C's wiring), 7
-  reach both = 164.** An earlier file-level bucketing did NOT close (20 files split 17+9+2=28); the
-  test-level partition supersedes it, and the lesson stands: a classification whose parts exceed its
-  whole is not a partition, and the gap is where an unnamed fourth case hides.
+  reach both = 164.** The file-level rollup was WRONG at first (a "20" that split 17+9+2) and was reconciled to
+  **28 files = 14 raw-only + 8 real-only + 6 mixed**, each named once, verified by script — the original
+  count had silently dropped five single-failing-test files. It was also checked that every one of the 28
+  files' failing tests really is in the 164, so nothing is claimed fixed "for free" that was not failing.
+  The lesson stands regardless: a classification whose parts exceed its whole is not a partition, and the
+  gap is where an unnamed case hides.
   **None of the ten can route through real birth**, and the reason is the same for each: they exist to
   place ref-log bytes at a caller-chosen id and content — holes, out-of-order ids, a table with no
   `_ckpt` — i.e. states `createNamespace`/`completeCreation`'s own invariants (INV-1 contiguity, INV-2's
@@ -1290,6 +1293,23 @@ RecoveryGrounding chooseRecoveryGrounding(const CatalogEntry & catalog_state,
   `ca: ref — LIST-independent recovery: chooseRecoveryGrounding, no hint-derived genesis`.
 
 ### Task 6: Read-side contract — refs AND namespace files {#task-6}
+
+**NEW CALL SITE, added after this task's brief was written (2026-07-30).** Task 4-C adds a
+`casAdmitEntry` inside `writeRefLogTxnRaw` (`src/Disks/tests/cas_test_helpers.h`) keyed at
+`NamespaceLifeId::stageATransition(ns)`'s sentinel, so the 164 raw-fixture tests keep matching the keys
+they already write. That is a deliberate bridge, and **this task owns its removal**: `stageATransition`
+remains for the reader paths until this task replumbs them, and its deletion plus the tree-wide zero-grep
+gate live here. Task 4-C does not close it and must not claim to. Count the sites yourself when you get
+here — do not trust any figure written earlier.
+
+**And know what the fixtures' catalog entries deliberately are NOT.** That admission writes `state = Live`
+with no `_ckpt`, whereas production reaches `Live` only through `completeCreation`, which publishes `_ckpt`
+first (INV-4). This is not an oversight to fix: several fixtures exist specifically to build **a table with
+no `_ckpt`**, so forcing one would destroy what they test. `Gc::readCheckpointWitnesses` tolerates an absent
+`_ckpt` (only a present-but-undecodable one is held), which is why it costs nothing today. If you ever add
+code that assumes `Live` implies a `_ckpt`, these fixtures are where it will break, and the assumption —
+not the fixtures — is what would be wrong for tests.
+
 
 [Amendment commit 7's read/write half; the cleanup half is Task 5. This task owns the LIFE HANDLE
 itself, which is why the namespace-file hot-path requirements land here and not in Task 4b: "hot
