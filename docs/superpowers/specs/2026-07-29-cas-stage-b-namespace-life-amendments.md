@@ -54,7 +54,11 @@ Delete all namespace-only ref and namespace-file key overloads. This makes accid
 
 Store namespace files as direct objects under:
 
-`roots/<namespace>/<incarnation>/_files/<relative-name>`
+`cas/ns/state/<life_id>/_files/<relative-name>`
+
+The `life_id` is the catalog incarnation. The key does not repeat the logical namespace; the typed
+`NamespaceLifeId` API remains the source, but the builder uses only its incarnation. `roots/` contains
+only loose mountpoint objects outside catalog ownership.
 
 Keep these unchanged:
 
@@ -72,8 +76,8 @@ After the catalog lifecycle lands:
 
 - `Creating` namespaces are never recovered or published;
 - `Live` namespaces require a readable `_ckpt` with `life_epoch`;
-- ordinary `Removing` namespaces also require `_ckpt`;
-- the special `Removing` + missing `_ckpt` finalization window is handled by removal/decommission logic, not recovery;
+- `Removing` namespaces also require readable `_ckpt` while their catalog row exists;
+- after GC deletes a proved complete `Removing` row, recovery has no namespace to resume and the janitor owns any surviving `_ckpt`;
 - missing required `_ckpt` is corruption.
 
 LIST may still:
@@ -86,12 +90,10 @@ LIST must not determine genesis or committed history. Remove the fallback that s
 
 For the same exact objects, full, empty, partial and reordered LIST results must reconstruct the same logical state. Only request count, diagnostics and discovered garbage may differ.
 
-**Lifecycle correction, 2026-07-31.** The later `RemovalReady` invariant in
-`2026-07-27-cas-ref-chain-complete-cut-design.md` supersedes the directive's special
-`Removing`-without-`_ckpt` window. `Live` and `Removing` both require readable `_ckpt`;
-`Removing` without it is corruption. `RemovalReady` is never recovered, with or without `_ckpt`, and
-is routed to the idempotent removal/decommission finalizer. This changes lifecycle routing only; LIST
-remains forbidden from determining recovery grounding.
+**Lifecycle correction, 2026-07-31.** The later opaque-id, single-plan invariant in
+`2026-07-27-cas-ref-chain-complete-cut-design.md` supersedes the short-lived `RemovalReady` amendment.
+The bullets above are the corrected routing: direct proved deletion, no recovery finalizer, and janitor
+ownership of opaque residue. LIST remains forbidden from determining recovery grounding.
 
 #### 4. Strengthen `_ckpt` {#strengthen-ckpt}
 

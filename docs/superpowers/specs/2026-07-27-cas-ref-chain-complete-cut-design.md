@@ -1,5 +1,5 @@
 ---
-description: 'v9 CORE design for the LIST-incompleteness release blocker: per-namespace contiguous ref ids, in-band epoch seals, a namespace catalog with ref-layer-scoped incarnations, a per-namespace checkpoint object, a mandatory destructive-round frontier proof and a REBUILD-surviving hold — LIST is a zero-trust hint; two new object kinds, both off the append hot path. Adjacent pre-existing defects surfaced by eight review rounds live in the companion register, not here.'
+description: 'v9 CORE design for the LIST-incompleteness release blocker: per-namespace contiguous ref ids, in-band epoch seals, a namespace catalog with opaque life identities, a per-namespace checkpoint object, a mandatory destructive-round frontier proof and a REBUILD-surviving hold — LIST is a zero-trust hint; two new object kinds, both off the append hot path. Adjacent pre-existing defects surfaced by eight review rounds live in the companion register, not here.'
 sidebar_label: 'CAS ref contiguous-chain'
 sidebar_position: 20260727
 slug: /superpowers/specs/cas-ref-chain-complete-cut-design
@@ -69,70 +69,86 @@ transaction contains exactly one seal operation; `prev_epoch_seal` is required o
 of every non-genesis epoch (including a sequence-1 seal closing an empty epoch) and forbidden
 elsewhere. A dying lane that observes the seal retries `T+1`, never mints `T+2` (state-derived ids).
 
-**INV-3 — the catalog, with ref-layer incarnations.** `cas/ref_catalog`, token-CAS like `gc/state`:
-`namespace → {state: Creating | Live | Removing | RemovalReady, incarnation}` (+ creator fence
-identity while `Creating`; immutable `removal_started_round` while `Removing`/`RemovalReady`). The
+**INV-3 — the catalog, with opaque life identities.** `cas/ref_catalog`, token-CAS like `gc/state`:
+`namespace → {state: Creating | Live | Removing, incarnation}` (+ creator fence identity while
+`Creating`; immutable `removal_started_round` while `Removing`). The
 removal actor samples the current adopted `gc/state.round` before `Live → Removing` and stores it in
 the same catalog CAS; it is diagnostic age, never a safety fence. The incarnation (random 128-bit,
-minted at `Creating`) qualifies **the ref layer only**:
+minted at `Creating`) qualifies every life-owned stream/state object:
 the physical key families below, with a canonical grammar and refusal of legacy-shaped keys. The
 same value is the opaque `life_id` those keys carry; the field is not renamed.
-Removal ends in a fourth, **transient** state. `Creating → Live → Removing → RemovalReady → absent`.
-A namespace enters `RemovalReady` only when its terminal record has folded into a life-scoped cleanup
-item in the adopted seal — positive evidence, never inferred from an item's absence — and
-the transition additionally requires that the namespace holds no durable hold. `Completed` means that
-the terminal fold is durable; it does **not** claim physical cleanup succeeded. After adopting that seal,
-GC performs one bounded, suppression-aware best-effort cleanup pass and only then attempts the fenced
-`Removing → RemovalReady` CAS. A stop before the CAS repeats the idempotent pass; LIST omissions,
-token mismatches and suppression remain leak-only and do not prevent the CAS. The old marker-driven
-`Pending → Completed` handshake is deleted with `_cleanup`: the fold that consumes the terminal emits
-the completed-form item directly. Because no second state remains, `RefNsCleanupState` and the item's
-wire `state` field are deleted too; the item's presence is the positive evidence.
+Removal has no fourth state and no pruning finalizer. `Creating → Live → Removing → absent`. The fold
+that consumes the terminal attaches optional cleanup evidence directly to that life's adopted
+fold-state row; presence is positive evidence that the terminal fold is durable, never a claim that
+physical cleanup succeeded. Deletion additionally requires that the same row carries no durable hold.
+In the same fenced round that adopts that seal, GC performs one bounded, suppression-aware best-effort
+cleanup pass and exact-CAS-deletes the complete observed `Removing` catalog row before releasing the
+round guard. No detached finalizer may reuse a historical seal. A stop before the CAS makes the next
+round repeat the idempotent pass. The bounded physical pass obeys the ordinary destructive-suppression
+gate and may therefore do zero work; LIST omissions, token mismatches and that skipped pass remain
+leak-only and do not prevent the lifecycle CAS. The CAS has its own narrower proof: exact unique catalog
+row, current adopted evidence row, no hold and current GC fence. Catalog ambiguity, an invalid adopted
+seal or a lost fence fail closed before it. The bounded pass never deletes `_ckpt` while its `Removing`
+row exists. `_ckpt` and
+every missed object become ordinary dead-life debris owned by the
+perpetual janitor; synchronous removal neither proves physical emptiness nor has a second physical
+deletion window.
 
-A catalog cut that says `RemovalReady` is **never a fold target**: no new walk, probe or cursor may be
-admitted from that cut. The seal which earned the transition may still carry its predecessor cursor;
-the first round cut after the transition removes that cursor and cleanup item together. Only
-after the adopted seal proves both absent may the removal driver exact-delete `_ckpt` and exact-CAS-delete
-the complete observed `RemovalReady` row. `RemovalReady` is not a tombstone — it exists only during an
-in-flight removal, is counted by the same admission reservation as the other states, and is deleted, so
-the catalog stays O(active + in-flight removals).
+The old marker-driven `Pending → Completed` handshake is deleted with `_cleanup`: `RefNsCleanupState`,
+the separate item collection and its wire `state` field all disappear. Cleanup evidence is just an
+optional field of the life row.
 
-**Why a state and not an ordering, stated because the ordering was tried and is unsound.** An earlier
-formulation required only that a seal with the cursor pruned be durable before entry deletion. That
-observation is **not stable**: while the entry still says `Removing`, the frontier proof force-adds
-every `Live`/`Removing` entry to the walked set and writes a cursor for each, so a later round
-re-creates the very cursor that was pruned, and the resumed driver has no safe-and-live choice —
-trusting the historical seal deletes an entry whose current seal carries a cursor, and revalidating can
-wait forever. `RemovalReady` replaces a temporal claim about past seals with a durable catalog fact,
-and cursor absence becomes monotone.
+**Why direct entry deletion is safe now, stated because it was unsound under the old shape.** The old
+name-keyed cursor could be inherited by a same-name rebirth, so deleting the catalog row before pruning
+was unsafe; while it remained `Removing`, every later round recreated the cursor. Neither premise
+survives the opaque-id, single-producer design. The old row is keyed by the predecessor's random
+`life_id`; a rebirth receives a different id; and the next catalog-built plan drops the absent old id.
+The deletion-owning seal may still contain its completed predecessor row, but no operation for the new
+life can address or inherit it. Waiting an extra round and representing that wait as `RemovalReady`
+would preserve an enum state, transition, finalizer and recovery windows that prove no remaining safety
+fact.
 
-**Monotone only if the predicate is enforced at every producer, so the producers are enumerated here
-rather than asserted away.** Five write a cursor or admit a walk target: the catalog-only frontier
-loop; the parent-cursor carry (which must consult the state per CARRIED cursor, not only per walked
-target); hint-named namespaces from the round's listing (surviving debris is still listed, so the hint
-names a `RemovalReady` namespace — like `Creating`, it is cataloged but not walkable, distinct from both
-`Live`/`Removing` and absent); REBUILD, which rebuilds cursors from catalog + `_ckpt` + arithmetic
-tails and would resurrect one, since `_ckpt` outlives the transition; and carried holds, which force an
-exact walk even when the hint omits the namespace — hence the no-hold precondition above, which is an
-enforcement and not a derivation. **A monotonicity claim IS a claim about all producers**; the list is
-the proof obligation, not a convenience.
+**There is one producer, not five predicates that must remain synchronized.** `CasFoldSeal` carries one
+`ref_lives` map keyed by opaque `life_id`; each value is one `RefLifeFoldState{coverage,
+optional cleanup evidence}`. The pure `buildRefWalkPlan(catalog_cut, inputs)` constructor creates rows
+only in its catalog loop, and only for `Live` or `Removing`. Its input bundle contains parent coverage,
+stream-LIST hints, carried holds and `_ckpt` observations; the corresponding internal adapters may
+enrich an existing row but have no insertion API. The returned plan freezes its key set and exposes
+only lookup/enrichment of an existing row, which lets folding attach newly earned cleanup evidence. REBUILD
+calls the same constructor rather than rebuilding a second lifecycle predicate. Therefore
+`Creating` and absent ids are structurally unable to acquire a walk, coverage or hold.
+The old independent `per_ns_shard` and `ns_cleanup_items` collections, the string `"<namespace>/0"`
+cursor grammar and `cursorKey`/`parseCursorKey` are deleted. Ref streams have one coverage value inside
+their life row, not a separately keyed cursor or a fictional shard 0; blob-target GC sharding remains
+separate and unchanged.
 
-One bounded residue remains: the transition-owning round necessarily took its catalog cut while the row
-was still `Removing`, so its adopted seal may carry the predecessor cursor. Because only the fenced GC
-leader performs the transition and rounds serialize through a single `gc/state` adoption, no second
-pre-transition cut can be adopted afterward. The first post-transition round prunes the cursor and item;
-convergence is one round, and the driver's revalidation before deletion waits for that adopted seal.
+This shape also makes the cardinality bound executable: every newly encoded seal has at most one
+ref-life row per `Live`/`Removing` catalog row in its cut, cleanup evidence belongs to that same row,
+and the seal encoder rejects duplicate life ids. An
+input row whose id the cut does not name is counted and dropped, never carried as an independent source
+of work. A hint id absent from the earlier round cut is post-cut/unknown and deferred; it cannot mint a
+row. A carried hold is legal only on the `Live`/`Removing` row that already owns it, and the no-hold
+deletion precondition above remains an enforcement rather than a derivation.
+
+One bounded residue remains: the deletion-owning seal contains the completed predecessor life row. The
+next round's constructor observes the id absent from the catalog and omits the whole row. This is
+bounded cleanup, not a deletion precondition: every consumer joins through the new cut before an input
+row can become work, and new life has a different key.
 
 No physical-empty proof is required anywhere: surviving old-incarnation objects are structurally inert
-(foreign prefix; the fold works only off catalog entries) and a **perpetual** janitor deletes
-foreign-incarnation debris whenever listed. **Discovery is a separately paced, leak-only enumeration of
+(an opaque life id absent from the authoritative catalog; the fold works only off catalog entries) and a
+**perpetual** janitor deletes dead-life debris whenever listed. **Discovery is a separately paced,
+leak-only enumeration of
 `cas/ns/`** — never the round's hot `stream/` LIST, which must stay scoped to scheduling. It nominates
 every family's debris: id-bearing stream objects, `_ckpt` (including the lone checkpoint left by a
 cancelled `Creating`) and `_files` alike. It takes **one fresh catalog GET per page, not per key**, and
-is paced by a single cleanup-only cursor. Before every exact-token delete the janitor revalidates that the catalog still either omits the life or names a
-different incarnation; unparseable keys are surfaced and skipped. This janitor is the only reclaimer of
-a dead life's objects; a LIST omission defers its work but can never affect visibility, rebirth or
-deletion safety.
+is paced by a single cleanup-only cursor. The mandatory order is `LIST page → fresh catalog GET/decode →
+classify the whole page → exact-token deletes under the GC fence`. The one post-page catalog cut is the
+life revalidation for every key on that page; there is NO catalog read per key. Before each delete the
+janitor rechecks the GC fence and uses the token captured for that exact object. A duplicate current
+`life_id`, an unreadable catalog or a lost fence suppresses the page's deletes. Unparseable keys are
+surfaced and skipped. This janitor is the only reclaimer of a dead life's objects; a LIST omission defers
+its work but can never affect visibility, rebirth or deletion safety.
 
 **Layout rule: object keys carry an OPAQUE life id, and the hot enumeration sees only the stream.**
 A life's physical identity is the catalog's `incarnation` used as a pool-wide opaque `life_id`; keys do
@@ -149,14 +165,32 @@ transaction id, already grouped with logs for recovery hints and covered-object 
 beside `_files`. Moving it to `state/` would force either a second hot LIST or a simultaneous
 recovery-and-cleanup redesign, which is a worse trade than the one it would buy.
 
-**What the opacity buys is not tidiness — it is that the catalog becomes the only authority
-structurally.** A listed key can no longer reconstruct a logical name, so no code path can invent one
-from debris, and the class of defect where a parser silently supplies missing catalog state stops being
-expressible. Every catalog consumer builds, once per immutable cut, an exact reverse index
-`life_id → {name, incarnation}`. Two current rows sharing a `life_id` are `CORRUPTED_DATA`, never
-"first row wins". A listed id absent from the fresh cut is inert debris. A `life_id` is never
-deliberately reused, so the existing random-128 uniqueness assumption now holds pool-wide rather than
-per logical name.
+**What the opacity buys is not tidiness — it is that the catalog becomes the only authority for mapping
+a life-owned stream/state key to a logical name.** Such a key can no longer reconstruct a name, so no
+stream/state parser can silently supply catalog state from debris. Manifests and loose `roots/` objects
+retain path identity, but neither is an authority for a namespace life.
+
+An **immutable catalog cut** is the decoded bytes and object token returned by ONE successful
+`GET cas/ref_catalog`, together with the reverse index built exactly once from those bytes. A consumer
+never patches that index from a later GET or mixes two cuts inside one decision: if it needs an id that
+appeared after its cut, it restarts the whole decision with a fresh cut or defers it. Every catalog row —
+`Creating`, `Live` and `Removing` — participates in the reverse index
+`life_id → {name, incarnation}`. A `life_id` is never deliberately reused, so the existing random-128
+uniqueness assumption now holds pool-wide rather than per logical name.
+
+Two current rows sharing a `life_id` are `CORRUPTED_DATA`, never "first row wins". Both rows are
+unresolvable. Catalog mutations, REBUILD, decommission, GC fold adoption and every destructive GC path
+fail closed on that cut; the janitor may continue enumeration and diagnostics but deletes nothing.
+Read-only fsck/inspect report both rows and continue over unrelated unique ids, and point I/O already
+holding — or freshly resolving — an unrelated unique life may continue. Thus physical aliasing stops
+pool-wide maintenance that depends on a complete ownership graph, not all unrelated data-plane I/O.
+
+Absence from a cut is not by itself proof of absence from the catalog's future. A listed id is inert
+debris only when the cut is known to have been read AFTER that object was observed. The janitor obtains
+exactly that order by reading the catalog after each LIST page; catalog-before-object publication then
+proves an id absent from the post-page cut is dead. The fold takes its round cut before the hot LIST, so
+an id absent there is merely post-cut/unknown: ignore it as a scheduling hint and defer it to a later
+round, never resolve it from key text and never delete on that observation.
 
 **The round's one hot LIST covers `cas/ns/stream/` only** — `_ckpt` and `_files` are never enumerated by
 it. That LIST stays what it always was: a scheduling and performance hint, never the correctness path,
@@ -179,57 +213,52 @@ path, with no namespace, no life id and no reserved wrapper.
 **Mount safety changes premise, not strength, and this is the one place the split could have opened a
 hole.** There is no `cas/ns/<srid>/` prefix to probe any more, because a physical key no longer names a
 server root. So a `server_root_id` has owned live namespace work **iff the mandatory catalog holds a
-`Creating`, `Live`, `Removing` or `RemovalReady` logical name under that root** — the catalog
+`Creating`, `Live` or `Removing` logical name under that root** — the catalog
 observation is threaded down from the pool layer rather than having the low-level module decode a
 catalog of its own. `cas/manifests/<srid>/` and `roots/<srid>/` are still probed physically, because
 those families kept path identity. Dead opaque stream or state debris alone must NOT block owner or
 epoch recreation, and an unreadable catalog must fail closed rather than fall back to a physical
-guess.
+guess. "Under that root" is a canonical path-component relation, never raw string `starts_with`. The
+successfully decoded mandatory catalog observation and both physical probes form one precondition bundle
+for the absent-owner and absent-epoch paths. If either conditional create conflicts, its retry recomputes
+the whole bundle rather than reusing a stale "no owned work" observation.
 
-**A same-name birth is refused while the predecessor is `Removing` or `RemovalReady`**, as a typed
-retry-later that names what it waits for — never an internal error. State the magnitude honestly: the
-window spans a terminal fold, a bounded cleanup pass, the transition, one pruning round and the deletion
-— several GC rounds. Under UUID-derived names that is an edge case; under a UUID-less table path a
-`DROP` + `CREATE` of the same table hits it every time. `CREATE` may therefore wake the existing GC
-scheduler and may invoke the idempotent finalizer for an **already** `RemovalReady` row once the adopted
-seal carries neither item nor cursor. It may not perform the GC-owned `Removing → RemovalReady`
-transition, fold a terminal, run cleanup or drive a GC round; without finalization evidence it returns
-retry-later. No wait loops, no second transition driver.
-**The catalog stays O(`Creating` + `Live` + `Removing` + `RemovalReady`) under any create/drop churn** (stalled
+**A same-name birth is refused while the predecessor is `Removing`**, as a typed retry-later that names
+what it waits for — never an internal error. The window spans the terminal fold, one bounded cleanup
+pass and the exact catalog deletion; it no longer includes a pruning round. `CREATE` may wake the
+existing GC scheduler, then returns retry-later. It does not fold a terminal, run cleanup, drive a GC
+round or mutate the predecessor. No wait loops, no assistance protocol and no second transition driver.
+**The catalog stays O(`Creating` + `Live` + `Removing`) under any create/drop churn** (stalled
 creators occupy entries until fence-terminal reconciliation — r9-6). Manifests keep their
 `(namespace, mount-epoch, build-sequence)` identity — mount-global build ids already prevent
-rebirth aliasing; verbatim FILES stay unqualified and keep today's `_cleanup` gate — their
-pre-existing rebirth-aliasing hazard is register item R1, not this spec. Capacity: namespace names
+rebirth aliasing; namespace files use the opaque life-owned state prefix above, while loose mountpoint
+objects remain outside catalog ownership. Capacity: namespace names
 get a byte bound; the creation CAS checks an additive predicate (encoded catalog + a per-entry
-cursor/cleanup/hold reservation vs both the catalog and fold-seal caps — the catalog is the
+worst-form ref-life-row reservation vs both the catalog and fold-seal caps — the catalog is the
 serialized admission ledger); `encodeFoldSeal(...).size()` is checked against the cap before every
 PUT. Admission refuses loudly; removal is never refused. **The reservation is deliberately
 over-covering, not exact.** The asymmetry decides it: over-charging costs admitted namespaces, while
 under-charging wedges the fold round, because the seal is then refused on every attempt. So the
 reservation is a conservative constant per counted catalog row plus fixed structural headroom for rows
 that are not one-for-one with catalog entries: `btr` rows per admitted run segment and `cnd` rows per GC
-shard. A namespace-cleanup item does **not** survive entry deletion under this lifecycle: the adopted
-seal must retire it before the row can be deleted. Exactness here buys a handful of extra admissions and
-costs a boundary-arithmetic proof obligation that has to be re-derived on every format change; do not
-restore it.
+shard. The per-entry constant covers one worst-form `RefLifeFoldState`, including its optional cleanup
+evidence and hold; separate cursor and `nsc` index-set arithmetic no longer exists. An already adopted
+seal may retain a row whose catalog entry was just deleted, but that seal was already cap-checked and
+the next encoder drops the id before admitting adapters. New catalog rows and old adopted rows are never
+combined in one encoded `ref_lives` map. Exactness here buys a handful of extra admissions and costs a boundary-arithmetic proof
+obligation that has to be re-derived on every format change; do not restore it.
 
-> **SUPERSEDED 2026-07-29 — the "verbatim FILES stay unqualified" clause above.** Per the
-> authoritative directive
-> `docs/superpowers/specs/2026-07-29-cas-stage-b-namespace-life-amendments.md`, namespace files ARE
-> incarnation-qualified, and one typed
-> `NamespaceLifeId{namespace, incarnation}` — replacing `RefNamespaceId` — is required by every ref
-> AND namespace-file key helper. Manifests and loose mountpoint objects keep exactly the boundary
-> this invariant states; they are explicitly unchanged. The `_cleanup` LIST-derived physical-empty
-> proof for `_files` is deleted: rebirth never waits for `_files` to be physically empty, and LIST
-> omission may only leak storage, never affect visibility, rebirth or deletion safety. Register item
-> R1's file half is therefore closed STRUCTURALLY instead of deferred. The rest of this invariant
-> stands as written.
+> **Amendment history, consolidated 2026-07-31.** The 2026-07-29 namespace-life amendment first made
+> namespace files incarnation-qualified and required one typed
+> `NamespaceLifeId{namespace, incarnation}` at every ref and namespace-file API. Its literal
+> `roots/<namespace>/<incarnation>/_files/` placement is superseded by this invariant's opaque
+> `cas/ns/state/<life_id>/_files/` grammar; its hot-path request-count, captured-life and stale-handle
+> requirements remain authoritative. Manifests and loose mountpoint objects are unchanged.
 >
-> **Extended 2026-07-31: the `_cleanup` OBJECT CLASS dies too, and so does the `Removed` snapshot.**
-> The clause above still reads "verbatim FILES stay unqualified and keep today's `_cleanup` gate";
-> both halves are now false. A marker that must outlive every possibly-stalled actor is unbounded,
+> The `_cleanup` object class and the `Removed` snapshot die together. A marker that must outlive every
+> possibly-stalled actor is unbounded,
 > and the recreate gate it fed is replaced by the catalog cut: a reader answers absence from
-> `Removing`, `RemovalReady` or an absent entry, so the `Removed` lifecycle snapshot loses its last
+> `Removing` or an absent entry, so the `Removed` lifecycle snapshot loses its last
 > consumer. Fresh name resolution enforces that cut; an already-held life handle keeps the explicit
 > stale-or-`NotFound` contract without a hot-path catalog read. `namespaceIsRemoved` is therefore
 > deleted with the snapshot. The two die together — leaving either one keeps a physical-empty vestige
@@ -242,19 +271,22 @@ both writers (snapshot publisher; sealer): read → validate → merge by semant
 token-CAS; identical merged body → return without a CAS; retries bound to the recovery deadline.
 Snapshots are deletable only STRICTLY BELOW `_ckpt.checkpoint` (a stale pointer can only
 under-clean). Missing sampled base → reread `_ckpt`: token advanced → restart; unchanged →
-corruption. Removal deletes `_ckpt` by exact token only after the entry is `RemovalReady` and the
-adopted seal has retired its item and cursor; the catalog entry is deleted last.
+corruption. Removal does not synchronously delete `_ckpt`: once the completed, unheld ref-life row is
+durable, the catalog row is the only lifecycle mutation. After its exact deletion, `_ckpt` is inert
+dead-life debris and the perpetual janitor exact-token-deletes it when listed.
 
 **Entry absence is authoritative, and the catalog is mandatory.** A canonical object whose incarnation
 no catalog entry names is **inert debris, never evidence of damage** — a legal removal and a fabricated
-entry loss leave byte-identical stores once the cleanup item is gone, so no classifier can separate them
+entry loss leave byte-identical stores once the ref-life row is gone, so no classifier can separate them
 and none may try. What protects an entry is therefore not detection but the mutation API: the only
 exported deletion transitions are (1) exact-CAS cancellation of a complete observed `Creating` row
-after its creator fence is terminal, and (2) exact-CAS finalization of a complete observed
-`RemovalReady` row after item/cursor pruning. No `Live` or `Removing` row is deletable, a live-fenced
-`Creating` is not deletable, and there is no generic remove-by-name mutation. A cursor naming no catalog
-entry is **counted and logged, never suppressed on** — the measured pool-wide reclamation stall must not
-return, but silent omission would mask a defect in the producer predicate. Correspondingly, after pool
+after its creator fence is terminal, and (2) exact-CAS deletion of a complete observed `Removing` row
+by fenced GC after the adopted matching ref-life row has cleanup evidence and no hold. No `Live` row is
+deletable, an unproved `Removing` row is not deletable, a live-fenced `Creating` is not deletable, and
+there is no generic remove-by-name mutation. An input ref-life row whose
+opaque id no catalog entry names is **counted and logged, then dropped, never suppressed on** — the
+measured pool-wide reclamation stall must not return, but silent omission would mask corruption or a
+defect at the sole plan-construction boundary. Correspondingly, after pool
 bootstrap an absent or undecodable `cas/ref_catalog` is `CORRUPTED_DATA` and stops creation, removal and
 GC: bootstrap creates the empty catalog and marks the pool ready, and nothing may ever bootstrap an
 empty catalog again. This removes the "vanished catalog reads as virgin" special case rather than
@@ -264,21 +296,24 @@ adding lifecycle design.
 **before** it folds is a loss of EVIDENCE: removal legitimately blocks in `Removing`, and the operator
 must see a terminal-corrupt stuck removal. Do not promise `REBUILD` as the escape — nothing establishes
 that it can reconstruct that exact terminal; the credible exits are restoring the object or recreating
-the pool. A `Removing` row without a matching cleanup item is reported once the current round reaches
+the pool. A `Removing` row whose matching fold-state row has no cleanup evidence is reported once the
+current round reaches
 an overflow-safe age of N rounds, on every round thereafter; the catalog field makes the threshold
 stable across restart. A recorded exact-read failure names the unreadable key; otherwise the diagnostic
 says only that the terminal has not folded, without inventing a terminal key the catalog does not store.
-Once the terminal HAS folded and the adopted seal carries the cleanup item derived from it, the
+Once the terminal HAS folded and the adopted life row carries the cleanup evidence derived from it, the
 object's later inaccessibility matters only for physically deleting manifests. That is a cleanup failure
-and stays **leak-only**: the transition fires, entry deletion lands, and the
+and stays **leak-only**: entry deletion lands, and the
 manifests remain orphan debris under a non-suppressing leak counter. Any other reading lets physical
 cleanup back into the lifecycle through a side door.
 
-**Read-side contract, stated honestly:** ref-layer readers hold `(namespace, incarnation)` and can
-never alias a new life (foreign prefix); a stale reader gets stale-or-`NotFound`, not rejection —
+**Read-side contract, stated honestly:** life-owned readers hold `NamespaceLifeId{namespace,
+incarnation}` and can never alias a new life (a foreign opaque-life prefix); a stale reader gets
+stale-or-`NotFound`, not rejection —
 rejection would need a fence/catalog read that hot paths do not pay. Destructive cleanup revalidates
-life and fence immediately before every delete. **Closed at the API boundary (r9-3):** one typed
-`RefNamespaceId{namespace, incarnation}` is required by every ref prefix/key/parser/cache helper and
+life and fence at the destructive protocol's required cut/fence boundary. **Closed at the API boundary
+(r9-3):** one typed `NamespaceLifeId{namespace, incarnation}` is required by every ref and
+namespace-file prefix/key/cache helper and
 the namespace-only overloads are DELETED — recovery/fold/fsck/sweep derive it from the catalog, live
 readers from their handle — so dropping the incarnation is unrepresentable, not merely forbidden.
 
@@ -293,24 +328,25 @@ life. A second gate on that path would be a fence over an already-fenced route, 
 decision — do not add one on the grounds that the invariant is unenforced. **But `DROP` is a lifecycle
 mutation and MAY cancel a stalled `Creating`, which an ordinary read may not**: if the creator's fence
 is still live, `DROP` returns the typed retry-later and changes nothing; if the fence is terminal, it
-exact-CAS-deletes the complete observed `Creating` row and only then best-effort exact-token deletes the
-old `_ckpt`. That order is load-bearing — reversed, a concurrent reconciler could publish a new `_ckpt`
-which the losing `DROP` then deletes. A stop between the two is safe: the surviving `_ckpt` belongs to an
-incarnation no entry names, so the new life gets a different one and the perpetual janitor reclaims it.
-No terminal record, no `Removing` and no `RemovalReady` are involved, because publication out of
+exact-CAS-deletes the complete observed `Creating` row and performs no physical delete. The surviving
+`_ckpt` belongs to an incarnation no entry names, so the new life gets a different one and the perpetual
+janitor reclaims it. This also removes the race in which a losing `DROP` could delete a checkpoint just
+published by a concurrent reconciler.
+No terminal record and no `Removing` are involved, because publication out of
 `Creating` is structurally impossible. **Removal:** catalog `Live → Removing` (the admission bound;
 `Removing` forbids new positive ownership), then the terminal record — appended ONLY by the owning
 mounted writer or a successor that has claimed and fenced that server root; GC surfaces stuck
-removals, never appends, and — see INV-3 — GC is also the actor that performs the
-`Removing → RemovalReady` CAS, threading its leader generation through the mutation like every other
-fenced caller. The decommission actor's exact duties (catalog-exact enumeration, the
-`Removing` recovery branch, both `RemovalReady` finalization branches, refusal of a
+removals, never appends, and — see INV-3 — GC exact-CAS-deletes the proved complete `Removing` row,
+threading its leader generation through the mutation like every other fenced caller. The decommission
+actor's exact duties (catalog-exact enumeration, the `Removing` recovery branch, refusal of a
 `Removing`-without-`_ckpt` corruption, and no slot retirement with owned entries) are register item R5
-— a same-rollout dependency on the decommission spec. **The namespace-cleanup item carries the
-incarnation captured at deposition, and a resumed pass NEVER re-derives it from the catalog** — a
-re-derivation resolves a reborn name to the NEW life's incarnation and deletes live data (phase-0
+— a same-rollout dependency on the decommission spec. **The cleanup work captures the ref-life row's
+opaque `life_id` at deposition, and a resumed pass NEVER re-derives it from a logical name in a later
+catalog cut** — a re-derivation resolves a reborn name to the NEW life's incarnation and deletes live data (phase-0
 model `CaRefNsCleanupStaleLeaderCore`); §2's "derive it from the catalog" applies to discovering
-current lives, never to a deposited cleanup scope. **Recovery ownership:** the mount-fence
+current lives, never to a deposited cleanup scope. The logical name may accompany an operation as a
+diagnostic or as part of the exact observed catalog row, but is not duplicated in cleanup evidence and
+cannot redirect physical cleanup. **Recovery ownership:** the mount-fence
 generation is captured at admission and required on every `slot-occupy`, `_ckpt` CAS and install;
 self-remount cancels or waits out recovery before rearming. **Migration: recreate-only.** The pool
 format bumps (writer generation AND backward floor); old-format startup fails closed naming pool
@@ -340,7 +376,10 @@ dense ⇒ found.
 
 ## 5. GC fold and deletion safety {#fold}
 
-Per round: one catalog `GET`; ONE strict hint enumeration (intake, cleanup planning, defer). Fold
+The fold takes one immutable catalog cut per round and performs ONE strict `cas/ns/stream/` hint
+enumeration (intake, covered-stream cleanup planning, defer). The separately paced dead-life janitor is
+not part of this hot enumeration; when scheduled, it takes one bounded `cas/ns/` page and its own
+post-page catalog cut as specified by INV-3. Fold
 work advances hinted namespaces by arithmetic (`cursor + 1`; the `GET` per record was always owed;
 hint holes — including the observed `0x1430c`/`0x1430d` shape — fold through unnoticed); epochs are
 crossed only by consuming seals; impossible shapes (a 404 below a same-epoch witness — including one
@@ -390,12 +429,16 @@ prior seal REBUILD REFUSES, naming pool recreation as the recovery path** (r9-1:
 baseline" alternative is not representable in the per-namespace shapes and would need an invented
 offending position that could never be folded through — the refusal branch is the already-safe one).
 
-Cursors are keyed by catalog entries; unhinted namespaces carry verbatim. B1:
+Ref coverage is keyed by opaque current `life_id`; a catalog-created unhinted plan row carries its
+matching parent coverage verbatim. An input life row absent from the cut is counted and dropped. B1:
 `logs_accounted == logs_applied` over the cut, `EpochSeal` an applied no-op (B2 `produced=false`).
 Probe A: sampled, deterministic cadence, durable due/performed/skipped observability; aborts
 nothing; the mount-time store gate (#23) is separate. Cleanup: covered logs are contiguous
 computable ranges under `_ckpt.checkpoint` + cursor; crossed dead epochs delete as closed ranges.
-Whole-round abort only for a key unattributable to any namespace.
+A malformed physical stream key, an ambiguous current `life_id` or a generation-5 current-name mismatch
+may abort ref folding and suppress destruction. A well-formed opaque id absent from the round's earlier
+catalog cut does not: it is post-cut/unknown and is deferred. A well-formed id absent from the janitor's
+later post-page cut is dead-life debris and is handled by that leak-only path.
 
 ## 6. Sweep deletion premise {#sweep}
 
@@ -409,10 +452,16 @@ R2/R3 and lands as one coherent change referencing them):
 
 ## 7. REBUILD and fsck {#rebuild-fsck}
 
-REBUILD rebuilds cursors and edges from catalog + `_ckpt` + arithmetic tails, **condemns nothing**,
-and preserves holds (§5). fsck: universe from the catalog, streams by arithmetic (`chain-broken`
-fatal in summary AND exit code), tails above `_ckpt.checkpoint`, `unchecked` reserved for the
-genuinely unproven; a healthy pool returns clean.
+REBUILD rebuilds ref-life coverage and edges from catalog + `_ckpt` + arithmetic tails, **condemns nothing**,
+and preserves holds (§5). REBUILD uses the same catalog-only walk-plan constructor as an ordinary fold;
+every listed physical id is joined through its one catalog cut, and no other input can create a
+`ref_lives` row. It therefore constructs coverage only for an id that cut names as `Live`/`Removing`,
+never creates a phantom logical namespace from an absent id, and refuses an ambiguous current id. fsck
+takes the same catalog-authoritative
+universe and reverse-index rule, but as a read-only diagnostic it reports duplicate rows, malformed
+keys and absent physical ids and continues over unrelated unique lives. It walks streams by arithmetic
+(`chain-broken` fatal in summary AND exit code), checks tails above `_ckpt.checkpoint`, reserves
+`unchecked` for the genuinely unproven, and returns clean for a healthy pool.
 
 ## 8. Costs, honestly {#costs}
 
@@ -421,12 +470,11 @@ namespace per epoch transition, and each adopted straggler costs a conditional P
 `GET` (`putIfAbsent` conflicts return no bytes — r9-6) + one `_ckpt` CAS. Snapshot publication:
 +1 `_ckpt` CAS (async). DDL: three conditional writes to create; removal = one `gc/state` GET for the
 diagnostic start round + `Live→Removing` CAS +
-terminal append + one bounded best-effort cleanup pass + `Removing→RemovalReady` CAS + one pruning
-round + exact `_ckpt` delete + catalog-entry CAS. Fold: +1
-catalog `GET` per round; destructive rounds add one exact `GET` per quiet namespace (the frontier
-proof); the perpetual janitor adds NO enumeration of its own, because a life's debris of every family
-rides the separately paced leak-only `cas/ns/` enumeration, one catalog GET per page, and never the
-round's hot `stream/` LIST. Deep arithmetic walks
+terminal append + one bounded best-effort cleanup pass + one exact catalog-entry CAS. Fold: +1
+catalog `GET` per fold round; destructive rounds add one exact `GET` per quiet namespace (the frontier
+proof). When scheduled, the perpetual janitor adds one bounded page of the separately paced leak-only
+`cas/ns/` enumeration plus one catalog GET after that page; it never widens or repeats the round's hot
+`stream/` LIST and never reads the catalog per key. Deep arithmetic walks
 dominate backlog cost and share one pool-level concurrency budget with cleanup. Performance interactions
 with the measured GC study (3.42 M serial trips/round, 256 logs/s, 39.6 % manifest re-reads): P1 prefetch
 becomes arithmetic (mispredictions impossible); ONE strict ref enumeration per round; range cleanup;
@@ -443,19 +491,21 @@ from counterexample to proof; `CaRefDeltaIntakeCore` rewritten with **pool-wide 
 blob, in-degree, condemnation phases, catalog sample, holds** — so the cross-namespace hidden-`+1`
 sabotage, the temporal lemma's variants and the hold-then-`FORCE REBUILD` scenario are expressible;
 `CaRelinkConfirmCore`'s `_sab_holeylist` becomes the fix's permanent regression witness;
-`CaRefNsCleanupStaleLeaderCore` rewritten around catalog states + incarnations and cleanup-item
-presence rather than a second item state; `CaRefCatalogCore` NEW (the four-state lifecycle, no-hold
-transition, the ENTRY-COUNT half of capacity — the byte-arithmetic half is
-the plan's boundary tests; `_ckpt` ordering, incarnation inertness; under-clean-only is gated in the
+`CaRefNsCleanupStaleLeaderCore` rewritten around catalog states + incarnations and per-life cleanup
+evidence rather than a second item state; `CaRefCatalogCore` NEW (the three-state lifecycle, positive
+cleanup-evidence/no-hold deletion precondition, the ENTRY-COUNT half of capacity — the byte-arithmetic
+half is the plan's boundary tests; direct deletion and incarnation inertness; under-clean-only is gated in the
 Task-1 module's `ckpt` rules, not here); `CaCasMountCore` extended (recovery generations; wedge-retry
 vs successor-seal);
 `CaRefWriterCleanupCore`/`CaRefFoldClampRecoveryCore` extended per register items when those land.
+`CaRefDeltaIntakeCore` additionally asserts that the ref walk-plan key set is exactly the set of catalog
+`Live`/`Removing` ids; sabotage lets a parent, hint, hold or checkpoint adapter mint one forbidden row.
 
 RED-first fault-injected controls, the load-bearing set: the cross-namespace hidden-`+1` vs visible
 `-1` (dies without the frontier proof); held namespace → `FORCE REBUILD` → hint hides the witness →
 `B:-1` (dies without hold carry); carried hold with the namespace omitted from the hint; late `+1`
 after the probe during condemnation/graduation/deletion rounds;
-`Creating`/`Removing`/`RemovalReady` catalog races and both checkpoint finalization windows;
+`Creating`/`Removing` catalog races and deletion with a stale or held ref-life row;
 ambiguous-then-definite id reuse; CAS-walk both directions incl. clean transitions and `T+1` retry;
 `_ckpt` races (cleanup between PUT and CAS; stale base three-way; merge; no-op skip); recovery
 across self-remount; incarnation inertness at rebirth under churn (create/drop per second: catalog
@@ -472,10 +522,10 @@ publication). The full enumerated list from rounds 5–9 rides in the implementa
 | alternative | disposition |
 |---|---|
 | v1–v4 certificate stack (prev links, seal intervals, pointers, authorities, generations, `R*`, tombstones) | Rejected by the user as accretion; deleted. |
-| Full head-CAS commit chain (blinded consult) | North star: revisit when the wedge is worth deleting or namespace counts make the frontier sweep expensive. v9 carries its catalog, checkpoint and (ref-layer-scoped) incarnations. |
+| Full head-CAS commit chain (blinded consult) | North star: revisit when the wedge is worth deleting or namespace counts make the frontier sweep expensive. v9 carries its catalog, checkpoint and opaque life identities. |
 | `seq_floor` in the catalog instead of incarnations | Rejected by the user's churn scenario: floors for dead names never retire → unbounded catalog. Incarnations make debris inert WITHOUT a physical-empty proof, so an entry deletes as soon as its removal completes rather than waiting on one. |
 | Delete the incarnation entirely; forbid exact `RootNamespace` reuse forever | **Proposed and withdrawn, 2026-07-31**, after two independent reviews of the whole phase. It is coherent, and it needs somewhere to remember every retired name — which is the same shape as the `seq_floor` row above, so it fails for the same reason, one level up. A never-deleted `Retired` catalog state grows by one row per historical namespace and eventually refuses admission at the object cap; **normal UUID churn does not bound it**, since every fresh UUID also leaves a permanent row. No bounded exact compaction exists for opaque names, because compacting a retirement record and certifying physical emptiness are the same problem. A marker object outside the catalog bounds nothing either and reintroduces the marker class this design removes. Independently, permanent non-reuse is a regression against supported workflows (§3). |
-| Retirement as a `Retired` catalog state, or as a marker object | Rejected with the row above; both are only needed if the incarnation is deleted. Keeping it means **nothing has to remember a dead namespace at all** — the entry is deleted, debris is inert by foreign prefix, and the catalog stays O(active). |
+| Retirement as a `Retired` catalog state, or as a marker object | Rejected with the row above; both are only needed if the incarnation is deleted. Keeping it means **nothing has to remember a dead namespace at all** — the entry is deleted, debris is inert under its unreferenced opaque life id, and the catalog stays O(active). |
 | Fresh-epoch rebirth | Failed round 6's audit (server-root-wide allocator; unqualified families). |
 | Checkpoint inside the catalog; never cleaning covered logs; in-place migration; RefSnapLog combined state; local floors; enforced timing; widened probe A | Each rejected with its reason recorded in rounds 1–8 (`tmp/codex_r*_findings.md`) and the alternatives tables of v5–v8 (git history of this file). |
 
