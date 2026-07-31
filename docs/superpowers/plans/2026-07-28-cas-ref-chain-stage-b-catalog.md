@@ -2366,6 +2366,18 @@ Nothing in this plan owned this, and it must happen before any of this work goes
 — plans, BACKLOG, register, reports — is branch-local and gets deleted, so every comment citing it becomes a
 dangling pointer. Measured baseline: roughly **850** such references.
 
+- [ ] **FIRST, separate the operator-visible ones — they are a different and worse class, and they must
+  not wait for upstreaming.** A comment citing a task number dies with the branch; a **string literal**
+  citing one is shipped to an operator in a log line or an exception message, where the reader has no
+  possible way to resolve it and no reason to suspect it is internal. A sweep of the CA sources found
+  **250** branch-local references, of which **4 are inside string literals**: two `recordAnomaly`
+  payloads in `Gc/CasGc.cpp` ("expected until Task 5's removal-evidence check lands"), one in
+  `Pool/CasRefCatalog.cpp` ("Live/Removing name is Task 5's (removal's) business"), and a format-version
+  message in `Formats/CasPoolMetaFormat.cpp` naming "Stage B". The three that name Task 5 describe a
+  check Task 5 itself writes, so **Task 5 rewrites them as part of building it** rather than leaving them
+  for this task; the format message says "Stage B" where it means a format generation and should name the
+  format instead. Re-run the sweep here rather than trusting this count: the sweep is one command and the
+  number is a measurement, not a fact about the tree.
 - [ ] **Strip the provenance, keep the reason.** For each reference, the comment either already states the
   reason it cites — delete the citation — or it does not, in which case write the reason and then delete the
   citation. A comment reduced to "per review C3" with no reason is a comment with nothing to keep.
