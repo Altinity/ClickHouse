@@ -3261,3 +3261,37 @@ The question worth deciding rather than drifting on: **what belongs in `cas_test
 deliberately per-file?** A fence policy or a deadline is arguably scenario-specific and should differ
 between files on purpose; if so, three identical copies mean the opposite is happening. Deferred out of the
 Task 4c fix round as a convention question, not a defect.
+
+## The pool-wide catalog is a write hot spot, measured on the CA-s3 lane {#ref-catalog-write-hotspot}
+
+**Measured 2026-07-31, first full CA-s3 stateless lane since the catalog landed.** 62 test failures, of
+which **52 fail on stderr alone** — the assertions pass — because writers log transient object-store
+errors. The errors concentrate on one key:
+
+- **137 of 250** S3 timeout lines name `content_addressed_s3/cas/ref_catalog`.
+- **125** `hit a transient object-store error` lines, all code 499 (timeout), across **66 distinct
+  namespaces**.
+
+The failing tests are ordinary MergeTree ones — `00612_pk_in_tuple`, `00806_alter_update`,
+`02265_column_ttl` — with no CAS content. They fail because every table creation in the pool writes the
+**same** object, so a lane that creates thousands of tables serialises them all through one CAS loop.
+
+**Why this is a design finding and not lane noise.** The catalog was adopted as the GC's authoritative
+universe precisely because a pool `LIST` is unreliable. That argument is untouched. What the lane shows is
+the cost side, which no test before it could expose: the object is pool-wide, every creation contends for
+it, and the retry loop turns contention into timeouts rather than into waiting. A single hot object is also
+exactly the shape the surrounding design avoids everywhere else — refs are per-namespace and `_ckpt` is
+per-namespace, both so that unrelated tables never share a CAS target.
+
+**What this does NOT say.** It is not evidence that the catalog is wrong, and the fix is not to go back to
+`LIST`. The measurement is from a stateless lane, which creates tables at a rate no real deployment
+approaches, and rustfs is not a production object store. Both push the same direction, so treat the
+numbers as an upper bound on severity and a lower bound on the existence of the problem.
+
+**Questions the next round must answer, in order:**
+1. Does the write rate come from creation only, or does anything else write the catalog per operation? A
+   pure read that births an entry would multiply it — the read-mints paths are already a known residual.
+2. Is the retry loop's deadline shorter than the contention it now has to survive? A timeout under
+   contention is a tuning answer; a timeout under no contention is a different bug.
+3. Can the object be sharded, or entries batched, without giving up the single-object atomicity the GC
+   universe argument depends on? The universe needs a consistent snapshot, not necessarily one key.
