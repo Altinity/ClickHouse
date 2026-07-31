@@ -3247,3 +3247,17 @@ roots is exactly the shape. Whoever owns that work must either keep a namespace'
 one root for its whole life, or replace the monotonicity argument with something that survives two counters —
 and must not discover this by hitting the refusal. The limit is stated at `joinLifeEpoch` in the code as well,
 so the constraint is visible where it is relied upon rather than only here.
+
+## Test helpers: a third verbatim copy, while a shared home is already included {#test-helper-third-copy}
+
+Six helpers — `ALWAYS_ADMITTED`, `generousDeadline`, `creatorFence`, `fixedTerminality`,
+`findEntryForTest`, `admittedOnceThenFenced` — are duplicated verbatim from
+`gtest_cas_ns_creation_lifecycle.cpp` into `gtest_cas_ref_ckpt_join.cpp`, which **already includes**
+`cas_test_helpers.h` for `CountingBackend`, `namespaceBirthOp`, `publishCommittedOps` and
+`seedPoolMetaForRestart`. The copy is honest about itself — the source file says the precedent exists — but
+this is the third instance, and the shared header is one line away in the same translation unit.
+
+The question worth deciding rather than drifting on: **what belongs in `cas_test_helpers.h` and what is
+deliberately per-file?** A fence policy or a deadline is arguably scenario-specific and should differ
+between files on purpose; if so, three identical copies mean the opposite is happening. Deferred out of the
+Task 4c fix round as a convention question, not a defect.

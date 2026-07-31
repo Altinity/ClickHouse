@@ -477,3 +477,26 @@ runtime's lifetime (`ensureRefTableRecovered`)". There is now a **second** write
 
 **Fix:** name both writers. This one is load-bearing beyond prose: the planned "invalidate the cached life
 when the entry is removed" step must invalidate against both, including the one that runs on a pure read.
+
+### D27 — the `what` parameter's parity claim is loose {#d27-what-parity-claim}
+
+From the Task 4c review (M4). `CasRefCkpt.h` says `what` plays "the same role it plays in
+`checkRefCkptInvariants`". There, `what` is a fixed descriptor (`"cas_ref_ckpt encode"`); here production
+passes the object **key** and the tests pass `"cas_ref_ckpt"`. Both name the thing, but the two message
+families now read differently and the parity claim invites a reader to expect one shape.
+
+**Fix:** say what `what` is for here (identifying the object in the message) instead of claiming parity
+with a site that uses it differently.
+
+### D28 — "Both halves are fenced" overstates the runtime fences' reach {#d28-both-halves-fenced-overstated}
+
+From the same review (M2). The two runtime size fences drive only the birth-time `_ckpt` writer. A
+fixed-capacity, non-heap field populated solely by the sealer or the snapshot publisher escapes all three
+fences.
+
+**Fix:** state which writer the runtime fences drive, so the gap is visible rather than implied closed.
+
+### D29 — ragged reflow after an insertion {#d29-ragged-reflow-ckpt-format}
+
+`CasRefCkptFormat.h`: the reflow leaves a short ragged line ("...Writing the whole body is what makes a /
+stale field dangerous, and") that does not match the file's wrapping.
