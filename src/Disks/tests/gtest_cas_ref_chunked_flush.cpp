@@ -470,11 +470,12 @@ std::vector<RefLogTxn> listLogTxns(DB::Cas::Backend & backend, const DB::Cas::La
     String cursor;
     for (;;)
     {
-        const ListPage page = backend.list(layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)), cursor, 1000);
+        const ListPage page = backend.list(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)), cursor, 1000);
         for (const ListedKey & lk : page.keys)
         {
             const auto parsed = layout.parseRefObjectKey(lk.key);
-            if (parsed && parsed->id.ns == ns && parsed->kind == RefObjectKind::Log)
+            if (parsed && parsed->life_id == NamespaceLifeId::stageATransition(ns).incarnation
+                && parsed->kind == RefObjectKind::Log)
                 ids.push_back(parsed->txn_id);
         }
         if (page.next_cursor.empty())
@@ -673,7 +674,7 @@ ChunkFailureOutcome runChunkFailureCase(const String & ns_suffix, ChunkFaultBack
 
     /// Fault ONLY chunk 2's `_log/` PUT: skip chunk 1's (the first match), fault the second. Armed AFTER
     /// the seed so only the flush's two log PUTs are counted.
-    backend->fault_substr = layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
+    backend->fault_substr = layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
     backend->mode = mode;
     backend->fault_skip = 1;
     backend->fault_count = 1;
@@ -856,7 +857,7 @@ TEST(RefWriterChunkedFlush, SnapshotPublisherLatchedAcrossChunks)
 
     /// Latch the FIRST `_snap/` PUT (chunk 1's publisher) at its conditional PUT -- i.e. AFTER it has
     /// captured chunk 1's prefix under state_mutex.
-    backend->armBlock(layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)) + "_snap/");
+    backend->armBlock(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)) + "_snap/");
     /// Gate the leader at the chunk boundary until that publisher has parked on its PUT, so its captured
     /// candidate is EXACTLY chunk 1's prefix (not chunk 1 + chunk 2).
     store->setCarveHookForTest([backend](CasRefLedger::CarvePhaseForTest ph)

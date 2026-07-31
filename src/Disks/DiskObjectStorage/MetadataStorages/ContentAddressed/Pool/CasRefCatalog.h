@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCkpt.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
 #include <functional>
 #include <optional>
 #include <vector>
@@ -26,25 +27,27 @@ public:
     {
         RefCatalog catalog;
         std::optional<Token> token;
+        CatalogLifeIndex life_index;
     };
 
     /// Reads and decodes the current catalog. Absent key -> an empty catalog with `token = nullopt`.
     static Snapshot read(Backend & backend, const Layout & layout);
 
     /// Stage B (Task 4-C): the REAL catalog life for `ns` if a `Live`/`Removing` entry names it, else
-    /// the Stage-A sentinel (`NamespaceLifeId::stageATransition`). For non-production discovery-path
+    /// the deterministic Stage-A fixture identity (`NamespaceLifeId::stageATransition`). For
+    /// non-production discovery-path
     /// readers -- `recoverRefTableDetailed`, fsck's stream/oracle walk, `CasOrphanManifestSweep`'s
     /// active-key set -- which must find whatever a mounted writer actually wrote (a catalog-minted
     /// incarnation, since Task 4-C's production birth wiring) while staying correct for the raw-fixture
     /// tests that seed ref-log content directly and never touch the catalog at all: for THOSE
-    /// namespaces the sentinel fallback is not a guess, it is the only other identity the fixture could
-    /// have keyed its objects at (`cas_test_helpers.h`'s `casAdmitEntry` pins the same constant when it
-    /// does admit one). `Creating` is excluded exactly as `Gc::discoverUniverse` excludes it: no
+    /// namespaces the transitional fallback is not a guess, it is the only other identity the fixture
+    /// could have keyed its objects at (`cas_test_helpers.h`'s `casAdmitEntry` derives the same value
+    /// from the namespace when it does admit one). `Creating` is excluded exactly as
+    /// `Gc::discoverUniverse` excludes it: no
     /// publication can exist under an entry still being created, so there is nothing to resolve to.
     ///
     /// NOT for the mounted writer's own open path -- that is `CasRefLedger::resolveNamespaceLife`, which
-    /// MINTS a life when none exists rather than falling back to a shared sentinel (a production writer
-    /// must never key a genuine first birth at a namespace-independent constant).
+    /// MINTS a fresh random life when none exists rather than using a fixture-derived identity.
     static NamespaceLifeId resolveLifeOrSentinel(Backend & backend, const Layout & layout, const RootNamespace & ns);
 
     /// The catalog's life for `ns` if a `Live`/`Removing` entry names it, else `nullopt` -- ONE catalog

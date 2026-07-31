@@ -191,16 +191,13 @@ struct NsRefListing
     std::vector<RefTxnId> snapshots;
 };
 
-NsRefListing listNsRefObjects(Backend & backend, const Layout & layout, const RootNamespace & ns)
+NsRefListing listNsRefObjects(Backend & backend, const Layout & layout, const NamespaceLifeId & life)
 {
-    /// Stage B (Task 4-C): see `CasRefCatalog::resolveLifeOrSentinel`'s doc for why the sentinel
-    /// fallback is correct, not a guess, for a namespace the catalog does not name.
-    const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(backend, layout, ns);
     NsRefListing out;
-    forEachListedKey(backend, layout.refsNamespacePrefix(life), [&](const ListedKey & lk)
+    forEachListedKey(backend, layout.namespaceStreamPrefix(life), [&](const ListedKey & lk)
     {
         const auto parsed = layout.parseRefObjectKey(lk.key);
-        if (!parsed || parsed->id.ns != ns)
+        if (!parsed || parsed->life_id != life.incarnation)
             return;
         if (parsed->kind == RefObjectKind::Snap)
             out.snapshots.push_back(parsed->txn_id);
@@ -283,16 +280,12 @@ struct NsVerdicts
 /// It writes nothing and mints nothing. The writer's recovery closes a dead epoch by putting a seal in
 /// the slot it walked to; an auditor has no business doing that, so a stream whose epoch was never
 /// closed reads as unprovable rather than being repaired into provable.
-void checkRefStream(Backend & backend, const Layout & layout, const RootNamespace & ns,
+void checkRefStream(Backend & backend, const Layout & layout, const NamespaceLifeId & life,
                     const NsRefListing & listing, const Deadline & deadline,
                     FsckReport & report, NsVerdicts & verdicts)
 {
     checkDeadline(deadline, "ref stream");
-    /// Stage B (Task 4-C): resolve `ns`'s real catalog life -- production no longer keys a mounted
-    /// namespace's ref-layer objects at the Stage-A sentinel once it has been through a real birth, so
-    /// this walk must ask the catalog what incarnation to read, exactly like `recoverRefTableDetailed`
-    /// does (`resolveLifeOrSentinel`'s own doc covers the raw-fixture fallback).
-    const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(backend, layout, ns);
+    const RootNamespace & ns = life.ns;
     const std::optional<CkptSample> sampled_ckpt = readCkpt(backend, layout, life);
 
     /// The base: the greater of what the listing offered and what the checkpoint NAMES. The checkpoint
@@ -444,13 +437,11 @@ void checkRefStream(Backend & backend, const Layout & layout, const RootNamespac
 /// snapshot) is likewise a skip, exactly like recovery's restart-on-vanish -- never corruption. This
 /// oracle therefore validates freshly-published snapshots and any table whose `GC` cleanup is still
 /// behind; it uses only the shared `replay`/`snapshotOf` state machine, never a second copy.
-void checkSnapshotOracle(Backend & backend, const Layout & layout, const RootNamespace & ns,
+void checkSnapshotOracle(Backend & backend, const Layout & layout, const NamespaceLifeId & life,
                          const NsRefListing & listing, bool detail, const Deadline & deadline, FsckReport & report)
 {
     checkDeadline(deadline, "snapshot oracle");
-    /// Stage B (Task 4-C): see `CasRefCatalog::resolveLifeOrSentinel`'s doc for why the sentinel
-    /// fallback is correct, not a guess, for a namespace the catalog does not name.
-    const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(backend, layout, ns);
+    const RootNamespace & ns = life.ns;
 
     const std::vector<RefTxnId> & snap_ids = listing.snapshots;
     const std::vector<RefTxnId> & log_ids = listing.logs;
@@ -584,31 +575,72 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
         }
     };
 
-    const NamespaceListing ref_listing = store.listNamespaces(namespace_prefix);
-    recordLifelessKeys(ref_listing);
-
-    /// Important C (increment review): `listNamespaces` is a LIST-based union, so a `Live` catalog
-    /// namespace whose objects LIST omits was never walked and fsck could return `clean()` over it --
-    /// the same diagnostic-oracle-standing-on-what-Stage-B-replaces gap review I2 already closed for
-    /// `rebuildBaseline`. Supplement ADDITIVELY: every catalog-authoritative namespace name joins the
-    /// walk set, never removing anything LIST found on its own (a namespace with ref objects but no
-    /// catalog entry -- the C1 shape -- must still be reachable to this loop's own findings, which is
-    /// exactly what LIST already gives it). `namespace_prefix`-filtered the same way `listNamespaces`
-    /// itself filters, so a scoped fsck run does not suddenly widen to the whole pool.
-    std::vector<String> walk_namespaces = ref_listing.namespaces;
+    /// One immutable cut owns every physical-id join in this walk. All catalog states participate:
+    /// `Creating` can already have its genesis checkpoint, while duplicate ids make both rows
+    /// unresolvable. A diagnostic records that corruption and keeps walking unrelated unique lives.
+    const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(backend, layout);
+    std::vector<NamespaceLifeId> walk_lives;
+    walk_lives.reserve(catalog_cut.catalog.entries.size());
+    for (const CatalogEntry & entry : catalog_cut.catalog.entries)
     {
-        std::set<String> already_walked(walk_namespaces.begin(), walk_namespaces.end());
-        for (const NamespaceLifeId & life : CasRefCatalog::liveUniverse(backend, layout))
+        if (!entry.ns.string().starts_with(namespace_prefix))
+            continue;
+        try
         {
-            const String & ns_str = life.ns.string();
-            if (ns_str.starts_with(namespace_prefix) && already_walked.insert(ns_str).second)
-                walk_namespaces.push_back(ns_str);
+            if (const auto life = catalog_cut.life_index.resolve(entry.incarnation))
+                walk_lives.push_back(*life);
+        }
+        catch (const Exception & e)
+        {
+            if (e.code() != ErrorCodes::CORRUPTED_DATA)
+                throw;
+            recordLifelessKeys(NamespaceListing{{}, {{
+                layout.refCatalogKey() + "#" + renderIncarnation(entry.incarnation), e.message()}}});
         }
     }
 
-    for (const String & ns_str : walk_namespaces)
+    /// Physical life-owned keys carry no logical name. On an unscoped audit, classify each key with
+    /// the same catalog cut that preceded the listing. An id absent from this older cut is reported
+    /// and deferred; it may have been published after the cut and must not mint a phantom namespace.
+    if (namespace_prefix.empty())
     {
-        const RootNamespace ns{ns_str};
+        forEachListedKey(backend, layout.namespaceRootPrefix(), [&](const ListedKey & listed)
+        {
+            std::optional<NamespaceLifePhysicalId> physical_id;
+            try
+            {
+                if (const auto ref_object = layout.parseRefObjectKey(listed.key))
+                    physical_id = ref_object->life_id;
+                else if (const auto checkpoint = layout.parseRefCkptKey(listed.key))
+                    physical_id = *checkpoint;
+                else if (const auto namespace_file = layout.parseNamespaceFileKey(listed.key))
+                    physical_id = namespace_file->life_id;
+                else
+                {
+                    recordLifelessKeys(NamespaceListing{{}, {{listed.key, "unrecognized key under the namespace ownership tree"}}});
+                    return;
+                }
+
+                const auto resolved = catalog_cut.life_index.resolve(*physical_id);
+                if (!resolved)
+                {
+                    recordLifelessKeys(NamespaceListing{{}, {{
+                        listed.key, "physical life id is absent from the pre-list catalog cut; deferred"}}});
+                }
+            }
+            catch (const Exception & e)
+            {
+                if (e.code() != ErrorCodes::CORRUPTED_DATA)
+                    throw;
+                recordLifelessKeys(NamespaceListing{{}, {{listed.key, e.message()}}});
+            }
+        });
+    }
+
+    for (const NamespaceLifeId & life : walk_lives)
+    {
+        const RootNamespace & ns = life.ns;
+        const String & ns_str = ns.string();
         /// RECORD AND CONTINUE, NEVER WEDGE. Everything below is per-namespace, and every one of these
         /// steps can raise `CORRUPTED_DATA` on a namespace whose stream is damaged — the replay refuses a
         /// non-contiguous tail, the codecs refuse an invalid body. For RECOVERY that throw is the correct
@@ -620,22 +652,22 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
         /// and `runFsck`'s `partial` handling owns it.
         try
         {
-            /// One listing of the namespace's ref prefix, shared by the stream walk and the oracle.
-            const NsRefListing listing = listNsRefObjects(backend, layout, ns);
+            /// One listing of the life's stream prefix, shared by the stream walk and the oracle.
+            const NsRefListing listing = listNsRefObjects(backend, layout, life);
 
             /// The arithmetic stream audit runs FIRST, so a holed stream gets the verdict that EXPLAINS
             /// it (`chain-broken`) rather than the downstream `CORRUPTED_DATA` the replay below would
             /// raise about the same hole.
-            checkRefStream(backend, layout, ns, listing, deadline, report, verdicts);
+            checkRefStream(backend, layout, life, listing, deadline, report, verdicts);
 
             /// Fresh recovery (LIST + replay), not the mounted Pool's cached `listRefs`: fsck is a read-only
             /// audit that must see the authoritative durable ref state, including any external write.
-            const RefTableState table = recoverRefTable(backend, layout, ns);
+            const RefTableState table = recoverRefTable(backend, layout, life);
             /// Snapshot integrity oracle: verify this table's newest published
             /// snapshot is byte-identical to an independent replay of its own logs. Fails closed (records a
             /// mismatch, making the report not `clean()`) on a genuine divergence; skips silently when the
             /// covered logs were already cleaned or an object vanished mid-check.
-            checkSnapshotOracle(backend, layout, ns, listing, detail, deadline, report);
+            checkSnapshotOracle(backend, layout, life, listing, detail, deadline, report);
             for (const auto [ref_name, row] : table.getCommitted())
             {
                 const ManifestId id{ns, row.manifest_ref};
@@ -708,7 +740,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
             if (e.code() == ErrorCodes::TIMEOUT_EXCEEDED)
                 throw;
             verdicts.recordUnchecked(report, ns,
-                layout.refsNamespacePrefix(CasRefCatalog::resolveLifeOrSentinel(backend, layout, ns)),
+                layout.namespaceStreamPrefix(life),
                 "fsck could not examine this namespace: " + e.message());
         }
     }

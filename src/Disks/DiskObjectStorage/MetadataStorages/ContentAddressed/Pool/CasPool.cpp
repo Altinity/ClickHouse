@@ -1,5 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasCodecUtil.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
@@ -527,9 +528,16 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
     ///    re-check here so a Pool opened directly in tests is held to the same contract).
     validateServerRootId(srid);
 
+    const ObserveRefCatalog observe_catalog = [s = store.get()]()
+    {
+        CasRefCatalog::Snapshot snapshot = CasRefCatalog::read(*s->pool_backend, s->pool_layout);
+        snapshot.life_index.throwIfAmbiguous("CAS server-root mount safety");
+        return snapshot.catalog;
+    };
+
     /// 2. Owner anchor — IDENTITY (clock-free). A foreign uuid fails closed; an absent owner over a
     ///    non-empty subtree is CORRUPTED_DATA; a fresh empty root is claimed.
-    claimOwnerOrThrow(*store->pool_backend, store->pool_layout, srid, our_uuid);
+    claimOwnerOrThrow(*store->pool_backend, store->pool_layout, srid, our_uuid, observe_catalog);
 
     /// Wall-clock `now_ms`, hoisted above the writer_epoch allocation below: the absent-epoch
     /// branch's `DecommissionRecovery` policy needs it to judge a surviving mount's liveness before
@@ -554,7 +562,8 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
     const EpochMintPolicy epoch_policy = (policy == MountClaimPolicy::NoWait)
         ? EpochMintPolicy::DecommissionRecovery
         : EpochMintPolicy::NormalMount;
-    uint64_t writer_epoch = allocateWriterEpoch(*store->pool_backend, store->pool_layout, srid, epoch_policy, now_ms());
+    uint64_t writer_epoch = allocateWriterEpoch(
+        *store->pool_backend, store->pool_layout, srid, epoch_policy, now_ms(), observe_catalog);
     store->mount_runtime.setProcessEpoch(writer_epoch, std::memory_order_relaxed);
 
     /// 4. Mount lease — LIVENESS. Decide over the current mount object using the wall-clock `now_ms`
@@ -651,7 +660,8 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
                     "({} recoveries exhausted) — a fresh writer_epoch kept being fenced before we "
                     "could adopt it. This should not persist; investigate GC fence-out timing.",
                     srid, max_fence_recoveries);
-            writer_epoch = allocateWriterEpoch(*store->pool_backend, store->pool_layout, srid, epoch_policy, now_ms());
+            writer_epoch = allocateWriterEpoch(
+                *store->pool_backend, store->pool_layout, srid, epoch_policy, now_ms(), observe_catalog);
             store->mount_runtime.setProcessEpoch(writer_epoch, std::memory_order_relaxed);
             continue;
         }
@@ -692,7 +702,8 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
             if (fence_recovery >= max_fence_recoveries)
                 throw;
             store->mount_runtime.keeperReset();
-            writer_epoch = allocateWriterEpoch(*store->pool_backend, store->pool_layout, srid, epoch_policy, now_ms());
+            writer_epoch = allocateWriterEpoch(
+                *store->pool_backend, store->pool_layout, srid, epoch_policy, now_ms(), observe_catalog);
             store->mount_runtime.setProcessEpoch(writer_epoch, std::memory_order_relaxed);
             continue;
         }
@@ -1054,8 +1065,15 @@ bool Pool::tryRemountOnce()
     /// (startup is fail-closed); the remount RETURNS false instead — the recovery loop retries.
     try
     {
-        claimOwnerOrThrow(*pool_backend, pool_layout, srid, our_uuid);
-        const uint64_t writer_epoch = allocateWriterEpoch(*pool_backend, pool_layout, srid);
+        const ObserveRefCatalog observe_catalog = [this]()
+        {
+            CasRefCatalog::Snapshot snapshot = CasRefCatalog::read(*pool_backend, pool_layout);
+            snapshot.life_index.throwIfAmbiguous("CAS server-root remount safety");
+            return snapshot.catalog;
+        };
+        claimOwnerOrThrow(*pool_backend, pool_layout, srid, our_uuid, observe_catalog);
+        const uint64_t writer_epoch = allocateWriterEpoch(
+            *pool_backend, pool_layout, srid, EpochMintPolicy::NormalMount, 0, observe_catalog);
 
         /// Mount-slot writer audit: `this` is already fully open (setEventSink ran long ago), so
         /// unlike the initial `open`, every event fired below reaches the real sink immediately.
@@ -1395,84 +1413,25 @@ void Pool::removeMountpointObject(const String & key)
 
 NamespaceListing Pool::listNamespaces(const String & prefix)
 {
-    /// LIST-based discovery authority: enumerate distinct full namespace strings
-    /// from ref shards under `cas/refs/` UNION verbatim-file namespaces under `roots/`.
-    ///
-    /// Consistency requirement: the backend must give read-your-writes LIST enumeration.
-    /// InMemoryBackend: guaranteed (in-memory map). S3: strongly consistent since 2021.
-    /// RustFS: to confirm in soak.
+    /// The catalog is the logical namespace authority. Physical stream/state keys expose only an
+    /// opaque life id and therefore cannot mint a namespace during discovery.
     std::unordered_set<String> found;
     std::vector<UnattributableNamespaceKey> skipped;
-
-    /// Both key families are parsed by their `Layout` parser, and both parsers REFUSE, rather than
-    /// classify as debris, a key that is one of ours but names no life. That refusal is absorbed HERE,
-    /// per key, and re-emitted as data.
-    ///
-    /// Absorbing at the enumeration rather than at each consumer is what makes the fix reach all of
-    /// them: this function has four callers, and an escaping refusal would abort whichever one ran.
-    /// Absorbing WITHOUT reporting would be worse than the abort for a caller that acts on the list's
-    /// completeness, so the key and its refusal are returned and the disposition is the caller's.
-    auto attribute = [&](const String & key, auto && parse) -> std::optional<String>
+    const CasRefCatalog::Snapshot cut = CasRefCatalog::read(*pool_backend, pool_layout);
+    for (const CatalogEntry & entry : cut.catalog.entries)
     {
         try
         {
-            if (const auto parsed = parse(key))
-                return parsed->id.ns.string();
-            return std::nullopt;   /// not one of ours: foreign debris, walked past as always
+            if (const auto life = cut.life_index.resolve(entry.incarnation);
+                life && life->ns.string().starts_with(prefix))
+                found.insert(life->ns.string());
         }
         catch (const Exception & e)
         {
             if (e.code() != ErrorCodes::CORRUPTED_DATA)
-                throw;   /// not a key refusal: a real failure of the enumeration itself
-            skipped.push_back(UnattributableNamespaceKey{key, e.message()});
-            return std::nullopt;
-        }
-    };
-
-    /// `cas/refs/`: ref-object keys are `<pool_prefix>/cas/refs/<ns>/<inc>/_log|_snap|_cleanup/<txn-id>`.
-    {
-        const String base = pool_layout.casRefsPrefix() + prefix;
-        String cursor;
-        for (;;)
-        {
-            ListPage page = pool_backend->list(base, cursor, /*limit*/ 1000);
-            for (const ListedKey & listed : page.keys)
-            {
-                const String & key = listed.key;
-                if (!key.starts_with(base))
-                    continue;
-                const auto ns_str = attribute(key, [this](const String & k) { return pool_layout.parseRefObjectKey(k); });
-                if (ns_str && ns_str->starts_with(prefix))
-                    found.insert(*ns_str);
-            }
-            if (page.next_cursor.empty())
-                break;
-            cursor = page.next_cursor;
-        }
-    }
-
-    /// `roots/`: verbatim-file keys are `<pool_prefix>/roots/<ns>/<inc>/_files/<name>`. The namespace
-    /// comes from `parseNamespaceFileKey`, which knows where the incarnation segment sits -- splitting
-    /// the key on `/_files/` by hand would yield `<ns>/<inc>` and invent a namespace per life.
-    {
-        const String base = pool_layout.rootsPrefix() + prefix;
-        String cursor;
-        for (;;)
-        {
-            ListPage page = pool_backend->list(base, cursor, /*limit*/ 1000);
-            for (const ListedKey & listed : page.keys)
-            {
-                const String & key = listed.key;
-                if (!key.starts_with(pool_layout.rootsPrefix()))
-                    continue;
-                const auto ns_str
-                    = attribute(key, [this](const String & k) { return pool_layout.parseNamespaceFileKey(k); });
-                if (ns_str && !ns_str->empty() && ns_str->starts_with(prefix))
-                    found.insert(*ns_str);
-            }
-            if (page.next_cursor.empty())
-                break;
-            cursor = page.next_cursor;
+                throw;
+            skipped.push_back(UnattributableNamespaceKey{
+                pool_layout.refCatalogKey() + "#" + renderIncarnation(entry.incarnation), e.message()});
         }
     }
 
@@ -1481,33 +1440,33 @@ NamespaceListing Pool::listNamespaces(const String & prefix)
 
 std::vector<String> Pool::listMirroredChildren(const String & prefix)
 {
-    /// Loose LIST of the mirrored subtree. Returns the distinct next-path-segment
-    /// names. NOT authoritative — callers must re-check `listRefs` per candidate before surfacing
-    /// it. GC uses LIST-based discovery (`cas/refs/` prefix) rather than a registry.
-    ///
-    /// A namespace's presence is split across two physical subtrees — its ref-log/snapshot
-    /// objects live under `cas/refs/<ns>/<incarnation>/_log|_snap|_cleanup/…` while its verbatim files
-    /// live under `roots/<ns>/<incarnation>/_files/…` and PLAIN mountpoint objects, which belong to no
-    /// namespace and are therefore unqualified, under `roots/<key>`. The browse therefore
-    /// UNIONs the next-segment names from BOTH subtrees so a namespace discoverable only by its ref
-    /// objects (the common case — a table's parts are described by manifests referenced from its ref
-    /// bindings, so its data is reachable through the ref objects rather than as verbatim `_files`) is
-    /// still surfaced.
+    /// Namespace children come from the catalog. `roots/` is still listed for loose mountpoint files,
+    /// whose logical paths retain path identity.
     std::unordered_set<String> children;
-    const String roots_full = pool_layout.rootsPrefix() + prefix;       /// e.g. <pool>/roots/shadow/
-    const String refs_full = pool_layout.casRefsPrefix() + prefix;      /// e.g. <pool>/cas/refs/shadow/
-    for (const String & full : {roots_full, refs_full})
+    const CasRefCatalog::Snapshot cut = CasRefCatalog::read(*pool_backend, pool_layout);
+    for (const CatalogEntry & entry : cut.catalog.entries)
+    {
+        if (!entry.ns.string().starts_with(prefix))
+            continue;
+        const std::string_view rest(entry.ns.string().data() + prefix.size(), entry.ns.string().size() - prefix.size());
+        const size_t slash = rest.find('/');
+        const std::string_view segment = slash == std::string_view::npos ? rest : rest.substr(0, slash);
+        if (!segment.empty())
+            children.emplace(segment);
+    }
+
+    const String roots_full = pool_layout.rootsPrefix() + prefix;
     {
         String cursor;
         while (true)
         {
-            ListPage page = pool_backend->list(full, cursor, /*limit*/ 1000);
+            ListPage page = pool_backend->list(roots_full, cursor, /*limit*/ 1000);
             for (const ListedKey & listed : page.keys)
             {
                 const String & key = listed.key;
-                if (!key.starts_with(full))
+                if (!key.starts_with(roots_full))
                     continue;
-                const std::string_view rest(key.data() + full.size(), key.size() - full.size());
+                const std::string_view rest(key.data() + roots_full.size(), key.size() - roots_full.size());
                 const size_t slash = rest.find('/');
                 const std::string_view seg = slash == std::string_view::npos ? rest : rest.substr(0, slash);
                 if (!seg.empty())

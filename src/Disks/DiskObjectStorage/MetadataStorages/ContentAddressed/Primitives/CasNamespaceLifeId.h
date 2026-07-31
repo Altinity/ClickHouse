@@ -1,6 +1,7 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Common/Exception.h>
+#include <Common/SipHash.h>
 #include <base/types.h>
 #include <optional>
 #include <string_view>
@@ -17,8 +18,12 @@ namespace ErrorCodes
 namespace DB::Cas
 {
 
+/// Opaque pool-wide physical identity of one namespace life. The catalog's existing `incarnation`
+/// field is this value; the alias makes listed-key APIs explicit without renaming catalog wire data.
+using NamespaceLifePhysicalId = UInt128;
+
 /// Builds the key segment for `incarnation`: 32 fixed-width lower-case hex digits, so the segment has
-/// one canonical spelling and `<ns>/<inc>/` sorts stably. Throws LOGICAL_ERROR on a zero incarnation
+/// one canonical spelling and `<life_id>/` sorts stably. Throws `LOGICAL_ERROR` on a zero incarnation
 /// for the same reason `renderRefTxnId` does: this render becomes an object key, and an invalid
 /// identity must never silently produce a well-formed-looking one.
 inline String renderIncarnation(const UInt128 & incarnation)
@@ -57,12 +62,9 @@ inline std::optional<UInt128> parseIncarnation(std::string_view s)
 
 class Layout;
 
-/// The identity of ONE LIFE of a namespace: the opaque namespace name plus the incarnation minted for
-/// that life in the `ref_catalog` (spec INV-3). Every ref-layer key AND every namespace-file key is
-/// built from the PAIR -- `<prefix>/cas/refs/<ns>/<inc>/{_log,_snap,_cleanup,_ckpt}` and
-/// `<prefix>/roots/<ns>/<inc>/_files/<relative-name>` -- so dropping and recreating a namespace under
-/// the same name lands under a different prefix, and the previous life's surviving objects are
-/// structurally inert to the new life instead of being aliased by it.
+/// The logical and physical identity of ONE LIFE of a namespace: the catalog name plus its opaque,
+/// pool-wide incarnation. Physical life-owned keys use only `incarnation`; the name remains the
+/// catalog authority used after a listed physical id is joined through one immutable catalog cut.
 ///
 /// Part manifests and loose mountpoint objects are deliberately NOT qualified (Constraint 12,
 /// directive §2): manifests already carry globally unique build identities, and a loose mountpoint
@@ -74,15 +76,14 @@ class Layout;
 /// call sites that legitimately need the bare name -- manifest identities, loose mountpoint objects --
 /// say `.ns`, and are visible in review because they say it.
 ///
-/// Exactly three places may mint one, and each has a name that says where its incarnation came from:
-/// `fromCatalogEntry` (every discovery path -- recovery, fold, fsck, the sweeps), the reader-handle
-/// factory Stage B Task 6 adds, and `Layout`'s key parsers (befriended below), which reconstruct the
-/// pair a listed key spells. A parsed id is UNTRUSTED: a key can name any incarnation, including one
-/// no longer in the catalog, which is precisely how a dead life is recognized and left alone.
+/// Permanent logical/physical pairs come only from `fromCatalogEntry` (recovery, fold, fsck and the
+/// sweeps) or the reader-handle factory Stage B Task 6 adds. `Layout` parsers deliberately return only
+/// an untrusted `NamespaceLifePhysicalId`; a listed key can name any physical id, including one no
+/// longer in the catalog, and only one immutable catalog cut may attach a logical name to it.
 struct NamespaceLifeId
 {
     RootNamespace ns;
-    UInt128 incarnation;   /// 0 is INVALID -- never a wildcard, never "any life"
+    NamespaceLifePhysicalId incarnation;   /// 0 is INVALID -- never a wildcard, never "any life"
 
     bool operator==(const NamespaceLifeId &) const = default;
 
@@ -101,22 +102,20 @@ struct NamespaceLifeId
     /// TRANSITIONAL -- Stage B Tasks 1 and 1c ONLY, and the ONLY way to reach a life-keyed object from
     /// a bare namespace. Those tasks migrate the ref-layer AND namespace-file key helpers to this type
     /// before the catalog that mints real incarnations exists (Task 2) and before the reader paths carry
-    /// handles (Task 6), so until then the whole tree mints keys at this one fixed incarnation and both
-    /// layers stay self-consistent. Task 6 DELETES it, gated on a tree-wide grep for `stageATransition`
+    /// handles (Task 6). The transitional identity is a stable opaque hash of the namespace so raw
+    /// fixtures cannot violate Task 4d's pool-wide uniqueness rule merely by naming two namespaces.
+    /// Task 6 DELETES it, gated on a tree-wide grep for `stageATransition`
     /// finding no build inputs. Do not call it from new code.
     static NamespaceLifeId stageATransition(RootNamespace ns)
     {
-        /// A fixed, obviously synthetic sentinel rather than a plausible-looking small number: its
-        /// hex render spells `__STAGE_A_TRANS`, so a key minted during the transition is recognizable
-        /// on sight in a bucket listing and cannot be mistaken for a minted incarnation.
-        static constexpr UInt128 kTransitionIncarnation
-            = (static_cast<UInt128>(0x5f5f'5354'4147'455fULL) << 64) | static_cast<UInt128>(0x415f'5452'414e'5301ULL);
-        return NamespaceLifeId{std::move(ns), kTransitionIncarnation};
+        UInt128 transition_incarnation = sipHash128(ns.string().data(), ns.string().size());
+        if (transition_incarnation == 0)
+            transition_incarnation = 1;
+        return NamespaceLifeId{std::move(ns), transition_incarnation};
     }
 
 private:
-    /// `Layout`'s key parsers reconstruct the pair a listed key spells; they are the third minting
-    /// site and the reason this constructor is reachable at all from outside the factories above.
+    /// Kept private so only the explicit factories above can construct a logical/physical pair.
     friend class Layout;
 
     NamespaceLifeId(RootNamespace ns_, const UInt128 & incarnation_)

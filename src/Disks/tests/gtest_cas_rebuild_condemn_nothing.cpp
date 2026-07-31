@@ -239,12 +239,10 @@ TEST(CasRebuildCondemnNothing, OrphanBlobIsRetainedNotCondemned)
 }
 
 /// The rebuild is the `gc/state` disaster-recovery command, so it is the LAST thing that may refuse to
-/// run over a pool holding one bad key. Its universe comes from `discoverUniverse`, which parses every
-/// key under `cas/refs/`; a ref object at the un-incarnated (Stage A) shape is REFUSED by name there,
-/// and an unabsorbed refusal would make the recovery command unusable on exactly the damaged pool it
-/// exists for. The key must be skipped from the universe -- it names no life, so no catalog entry can
-/// ever claim it -- and the rebuild must complete.
-TEST(CasRebuildCondemnNothing, UnIncarnatedRefKeyDoesNotAbortTheRebuild)
+/// run over a pool holding one bad key. A name-bearing segment under the opaque stream root is not a
+/// canonical physical life id. The key must be skipped -- no catalog entry can claim it -- and the
+/// rebuild must continue over unrelated cataloged lives.
+TEST(CasRebuildCondemnNothing, NonCanonicalLifeKeyDoesNotAbortTheRebuild)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -253,9 +251,9 @@ TEST(CasRebuildCondemnNothing, UnIncarnatedRefKeyDoesNotAbortTheRebuild)
     publishAt(*backend, layout, kNsA, RefTxnId{1, 1}, "ref_a", /*build_sequence=*/1, DB::UInt128(1), /*birth=*/true);
 
     /// Hand-built: no helper can mint this shape any more.
-    const String un_incarnated =
+    const String noncanonical_life =
         layout.casRefsPrefix() + kNsA.string() + "/_log/" + renderRefTxnId(RefTxnId{1, 1}) + ".zst";
-    ASSERT_EQ(backend->putIfAbsent(un_incarnated, "garbage").outcome, PutOutcome::Done);
+    ASSERT_EQ(backend->putIfAbsent(noncanonical_life, "garbage").outcome, PutOutcome::Done);
 
     Gc gc(store, kGc);
     RebuildReport rep;
@@ -264,13 +262,13 @@ TEST(CasRebuildCondemnNothing, UnIncarnatedRefKeyDoesNotAbortTheRebuild)
     ASSERT_TRUE(rep.performed) << rep.refusal;
 
     /// The live namespace was still discovered and folded -- the bad key was skipped, not the pool.
-    EXPECT_EQ(rep.committed_refs, 1u) << "the un-incarnated key must not hide the live namespace";
+    EXPECT_EQ(rep.committed_refs, 1u) << "the malformed key must not hide the live namespace";
 }
 
 /// The SECOND way the same damage can reach the rebuild, and it is a different code path from the one
 /// above: the gen-0 health check LISTs each namespace's own life prefix and groups those keys to decide
 /// whether any table proves cleaned logs. `groupRefKeys` refuses a key that names no life, so a NESTED
-/// shape under the life prefix (`<ns>/<inc>/x/_log/<id>.zst`) reaches the refusal there instead of at
+/// shape under the life prefix (`<life_id>/x/_log/<id>.zst`) reaches the refusal there instead of at
 /// `discoverUniverse`, which absorbs it. Same rule, same reason: the recovery command must not be taken
 /// out by the damage it exists to recover from.
 ///
@@ -298,7 +296,7 @@ TEST(CasRebuildCondemnNothing, NestedLifelessKeyUnderTheLifePrefixDoesNotAbortTh
 
     /// Hand-built, and planted AFTER the round so the round itself is clean: one segment too deep under
     /// the life prefix, so the segment where the incarnation belongs holds `x`. No helper mints this.
-    const String nested = layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(kNsA))
+    const String nested = layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(kNsA))
         + "x/_log/" + renderRefTxnId(RefTxnId{1, 1}) + ".zst";
     ASSERT_EQ(backend->putIfAbsent(nested, "garbage").outcome, PutOutcome::Done);
 

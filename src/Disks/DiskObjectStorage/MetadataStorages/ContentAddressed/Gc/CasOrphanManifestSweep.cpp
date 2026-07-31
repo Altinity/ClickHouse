@@ -167,10 +167,10 @@ NamespaceProtection activeManifestKeys(Pool & store, const RootNamespace & ns,
     /// fallback is correct, not a guess, for a namespace the catalog does not name.
     const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(backend, layout, ns);
     std::vector<RefTxnId> logs;
-    forEachListedKey(backend, layout.refsNamespacePrefix(life), [&](const ListedKey & lk)
+    forEachListedKey(backend, layout.namespaceStreamPrefix(life), [&](const ListedKey & lk)
     {
         if (const auto parsed = layout.parseRefObjectKey(lk.key);
-            parsed && parsed->id.ns == ns && parsed->kind == RefObjectKind::Log)
+            parsed && parsed->life_id == life.incarnation && parsed->kind == RefObjectKind::Log)
             logs.push_back(parsed->txn_id);
     }, 1000, onGcEnumerationPage);
     std::sort(logs.begin(), logs.end());

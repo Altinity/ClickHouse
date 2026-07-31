@@ -19,9 +19,9 @@ namespace DB::Cas
 /// unreachable through this classifier — the per-server control subtree lives under
 /// `/gc/server-roots/<server_root_id>/...` and classifies as Gc).
 ///   <prefix>/blobs/..        → Blob
-///   <prefix>/cas/refs/..      → Root  (immutable ref logs, snapshots, and cleanup markers)
+///   <prefix>/cas/ns/..        → Root  (immutable streams and point/path-addressed namespace state)
 ///   <prefix>/cas/manifests/.. → Manifest
-///   <prefix>/roots/..        → Root  (incl. /roots/<ns>/_files/ and mountpoint objects)
+///   <prefix>/roots/..        → Root  (loose mountpoint objects)
 ///   <prefix>/gc/..           → Gc
 ///   else (e.g. _pool_meta, _probe) → Other
 enum class CasNs : uint8_t
@@ -61,7 +61,7 @@ enum class CasOp : uint8_t
 static constexpr size_t CAS_OP_COUNT = 11;
 
 /// Classify a key into its namespace by substring. The order is significant where a more specific
-/// layout such as `cas/refs/` must be recognized before a generic fallback; unknown key families
+/// layout such as `cas/ns/` must be recognized before a generic fallback; unknown key families
 /// are intentionally counted as `Other`.
 CasNs classifyCasNs(const String & key);
 

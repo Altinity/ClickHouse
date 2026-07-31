@@ -32,6 +32,7 @@ constexpr FormatChangePoint REF_STREAM[] = {
     {1, 1},
     {kContiguousRefStreamsGeneration, kContiguousRefStreamsGeneration},
     {kNamespaceLifeKeyedGeneration, kNamespaceLifeKeyedGeneration},
+    {kOpaqueNamespaceLifeLayoutGeneration, kOpaqueNamespaceLifeLayoutGeneration},
 };
 
 /// `cas_ref_ckpt` is BORN at generation 4, so it has no generation-1 baseline to inherit: there is no
@@ -41,6 +42,7 @@ constexpr FormatChangePoint REF_STREAM[] = {
 constexpr FormatChangePoint REF_CKPT[] = {
     {kContiguousRefStreamsGeneration, kContiguousRefStreamsGeneration},
     {kNamespaceLifeKeyedGeneration, kNamespaceLifeKeyedGeneration},
+    {kOpaqueNamespaceLifeLayoutGeneration, kOpaqueNamespaceLifeLayoutGeneration},
 };
 
 /// `cas_ref_catalog` is BORN at generation 4, one generation BEFORE the bump that makes namespace

@@ -25,6 +25,65 @@ namespace ProfileEvents
 
 using namespace DB::Cas;
 
+namespace
+{
+
+const ObserveRefCatalog & emptyCatalogObservation()
+{
+    static const ObserveRefCatalog observe = [] { return RefCatalog{}; };
+    return observe;
+}
+
+RefCatalog catalogOwning(const String & ns, NsState state)
+{
+    CatalogEntry entry{.ns = RootNamespace{ns}, .state = state, .incarnation = UInt128{42}};
+    if (state == NsState::Creating)
+        entry.creator = CreatorFence{.server_root_id = "root/x", .writer_epoch = 1, .fence_generation = 1};
+    return RefCatalog{.entries = {std::move(entry)}};
+}
+
+class OwnerConflictRevealsManifestBackend : public InMemoryBackend
+{
+public:
+    using InMemoryBackend::putIfAbsent;
+
+    PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta) override
+    {
+        if (!fired && key == "p/gc/server-roots/root/x/owner")
+        {
+            fired = true;
+            InMemoryBackend::putIfAbsent("p/cas/manifests/root/x/table/debris", "x");
+            return {PutOutcome::PreconditionFailed, {}};
+        }
+        return InMemoryBackend::putIfAbsent(key, bytes, meta);
+    }
+
+    bool fired = false;
+};
+
+class EpochConflictRevealsManifestBackend : public InMemoryBackend
+{
+public:
+    using InMemoryBackend::casPut;
+
+    CasResult casPut(
+        const String & key, const String & bytes, const std::optional<Token> & expected,
+        const ObjectMeta & meta) override
+    {
+        if (!fired && key == "p/gc/server-roots/root/x/epoch")
+        {
+            fired = true;
+            InMemoryBackend::putIfAbsent("p/cas/manifests/root/x/table/debris", "x");
+            return {CasOutcome::Conflict, {}};
+        }
+        return InMemoryBackend::casPut(key, bytes, expected, meta);
+    }
+
+    bool fired = false;
+};
+
+}
+
 TEST(CasServerRootId, ValidationAcceptsCleanPathsRejectsBad)
 {
     EXPECT_NO_THROW(validateServerRootId("replica-a"));
@@ -93,9 +152,9 @@ TEST(CasServerRootClaim, OwnerStickyAndForeignFailsClosed)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout l("p");
-    EXPECT_NO_THROW(claimOwnerOrThrow(*b, l, "r", UInt128(1)));     // fresh empty root → claim
-    EXPECT_NO_THROW(claimOwnerOrThrow(*b, l, "r", UInt128(1)));     // same uuid → ok
-    EXPECT_THROW(claimOwnerOrThrow(*b, l, "r", UInt128(2)), DB::Exception);  // foreign → fail closed
+    EXPECT_NO_THROW(claimOwnerOrThrow(*b, l, "r", UInt128(1), emptyCatalogObservation()));     // fresh empty root → claim
+    EXPECT_NO_THROW(claimOwnerOrThrow(*b, l, "r", UInt128(1), emptyCatalogObservation()));     // same uuid → ok
+    EXPECT_THROW(claimOwnerOrThrow(*b, l, "r", UInt128(2), emptyCatalogObservation()), DB::Exception);  // foreign → fail closed
 }
 
 TEST(CasServerRootClaim, TombstonedSameOwnerFailsClosed)
@@ -109,7 +168,7 @@ TEST(CasServerRootClaim, TombstonedSameOwnerFailsClosed)
 
     try
     {
-        claimOwnerOrThrow(*b, l, "r", UInt128(1));
+        claimOwnerOrThrow(*b, l, "r", UInt128(1), emptyCatalogObservation());
         FAIL() << "expected a tombstoned owner claim to fail closed";
     }
     catch (const DB::Exception & e)
@@ -124,9 +183,9 @@ TEST(CasServerRootEpoch, AllocatorIsMonotoneAndSurvivesMountConcept)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout l("r");
-    claimOwnerOrThrow(*b, l, "r", UInt128(1));
-    const uint64_t e1 = allocateWriterEpoch(*b, l, "r");
-    const uint64_t e2 = allocateWriterEpoch(*b, l, "r");
+    claimOwnerOrThrow(*b, l, "r", UInt128(1), emptyCatalogObservation());
+    const uint64_t e1 = allocateWriterEpoch(*b, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation());
+    const uint64_t e2 = allocateWriterEpoch(*b, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation());
     EXPECT_GE(e1, 1u);                                             // 0 is a reserved sentinel
     EXPECT_GT(e2, e1);                                             // strictly increasing
 
@@ -134,7 +193,7 @@ TEST(CasServerRootEpoch, AllocatorIsMonotoneAndSurvivesMountConcept)
     /// Task 4, so deleteExact of a non-existent mount is a NotFound no-op that touches nothing.
     const auto del = b->deleteExact(l.mountKey("r"), b->head(l.mountKey("r")).token);
     EXPECT_EQ(del.kind, DeleteOutcome::Kind::NotFound);
-    EXPECT_GT(allocateWriterEpoch(*b, l, "r"), e2);
+    EXPECT_GT(allocateWriterEpoch(*b, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation()), e2);
 }
 
 /// Phase C (spec rev.4): an ABSENT epoch object over a PRESENT mount object means durable epoch
@@ -144,20 +203,20 @@ TEST(CasMount, EpochRemintOverExistingMountRefuses)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout l("p");
-    claimOwnerOrThrow(*b, l, "r", UInt128(1));
+    claimOwnerOrThrow(*b, l, "r", UInt128(1), emptyCatalogObservation());
     ASSERT_EQ(claimMount(*b, l, "r", UInt128(1), /*epoch=*/1, /*now_ms=*/1000, /*ttl_ms=*/30000).kind,
               MountClaimResult::Claimed);
     /// The epoch object is ABSENT (never created in this sequence) while the mount exists:
-    EXPECT_THROW(allocateWriterEpoch(*b, l, "r"), DB::Exception);   /// CORRUPTED_DATA
+    EXPECT_THROW(allocateWriterEpoch(*b, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation()), DB::Exception);   /// CORRUPTED_DATA
 }
 
 TEST(CasMount, EpochRemintAuthoritativeAbsenceMints)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout l("p");
-    claimOwnerOrThrow(*b, l, "r", UInt128(1));
-    EXPECT_EQ(allocateWriterEpoch(*b, l, "r"), 1u);   /// fresh root: both control objects absent
-    EXPECT_EQ(allocateWriterEpoch(*b, l, "r"), 2u);   /// epoch present now: normal CAS bump, no probe
+    claimOwnerOrThrow(*b, l, "r", UInt128(1), emptyCatalogObservation());
+    EXPECT_EQ(allocateWriterEpoch(*b, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation()), 1u);   /// fresh root: both control objects absent
+    EXPECT_EQ(allocateWriterEpoch(*b, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation()), 2u);   /// epoch present now: normal CAS bump, no probe
 }
 
 /// The probe outcome gates the mint: anything short of authoritative KeyAbsent fails closed.
@@ -173,8 +232,8 @@ TEST(CasMount, EpochRemintIndeterminateProbeFailsClosed)
     };
     auto b = std::make_shared<IndeterminateProbeBackend>();
     Layout l("p");
-    claimOwnerOrThrow(*b, l, "r", UInt128(1));
-    EXPECT_THROW(allocateWriterEpoch(*b, l, "r"), DB::Exception);
+    claimOwnerOrThrow(*b, l, "r", UInt128(1), emptyCatalogObservation());
+    EXPECT_THROW(allocateWriterEpoch(*b, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation()), DB::Exception);
 }
 
 /// Decommission over a TERMINAL (expired/fenced) mount with a lost epoch object proceeds and mints
@@ -183,11 +242,11 @@ TEST(CasMount, DecommissionRemintOverTerminalMountMintsDistinctEpoch)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout l("p");
-    claimOwnerOrThrow(*b, l, "r", UInt128(1));
+    claimOwnerOrThrow(*b, l, "r", UInt128(1), emptyCatalogObservation());
     ASSERT_EQ(claimMount(*b, l, "r", UInt128(1), /*epoch=*/3, /*now_ms=*/1000, /*ttl_ms=*/100).kind,
               MountClaimResult::Claimed);
     /// now_ms=5000: the ttl_ms=100 lease above is long expired -> terminal.
-    EXPECT_EQ(allocateWriterEpoch(*b, l, "r", EpochMintPolicy::DecommissionRecovery, /*now_ms=*/5000), 4u);
+    EXPECT_EQ(allocateWriterEpoch(*b, l, "r", EpochMintPolicy::DecommissionRecovery, /*now_ms=*/5000, emptyCatalogObservation()), 4u);
 }
 
 /// Decommission over a LIVE mount with a lost epoch refuses — the blind bypass would recreate the
@@ -196,10 +255,10 @@ TEST(CasMount, DecommissionRemintOverLiveMountRefuses)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout l("p");
-    claimOwnerOrThrow(*b, l, "r", UInt128(1));
+    claimOwnerOrThrow(*b, l, "r", UInt128(1), emptyCatalogObservation());
     ASSERT_EQ(claimMount(*b, l, "r", UInt128(1), /*epoch=*/1, /*now_ms=*/1000, /*ttl_ms=*/30000).kind,
               MountClaimResult::Claimed);
-    EXPECT_THROW(allocateWriterEpoch(*b, l, "r", EpochMintPolicy::DecommissionRecovery, /*now_ms=*/2000),
+    EXPECT_THROW(allocateWriterEpoch(*b, l, "r", EpochMintPolicy::DecommissionRecovery, /*now_ms=*/2000, emptyCatalogObservation()),
                  DB::Exception);   /// ABORTED: live member
 }
 
@@ -219,10 +278,10 @@ TEST(CasMount, EpochBumpWithPresentEpochIssuesNoProbe)
     };
     auto b = std::make_shared<ProbeCountingBackend>();
     Layout l("p");
-    claimOwnerOrThrow(*b, l, "r", UInt128(1));
-    EXPECT_EQ(allocateWriterEpoch(*b, l, "r"), 1u);   /// bootstrap: ONE probe (absent-epoch branch)
+    claimOwnerOrThrow(*b, l, "r", UInt128(1), emptyCatalogObservation());
+    EXPECT_EQ(allocateWriterEpoch(*b, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation()), 1u);   /// bootstrap: ONE probe (absent-epoch branch)
     const int probes_after_bootstrap = b->probes;
-    EXPECT_EQ(allocateWriterEpoch(*b, l, "r"), 2u);   /// epoch present: normal CAS bump...
+    EXPECT_EQ(allocateWriterEpoch(*b, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation()), 2u);   /// epoch present: normal CAS bump...
     EXPECT_EQ(b->probes, probes_after_bootstrap) << "...must not probe the mount key";
 }
 
@@ -232,7 +291,101 @@ TEST(CasServerRootClaim, MissingOwnerOverNonEmptyRootIsCorrupted)
     Layout l("p");
     /// Simulate existing data without an owner (identity lost): plant a key under roots/<srid>/.
     b->putIfAbsent(l.serverRootDataPrefix("r") + "some-data", "x");
-    EXPECT_THROW(claimOwnerOrThrow(*b, l, "r", UInt128(1)), DB::Exception);
+    EXPECT_THROW(claimOwnerOrThrow(*b, l, "r", UInt128(1), emptyCatalogObservation()), DB::Exception);
+}
+
+TEST(CasServerRootSafety, EveryCatalogLifecycleStateBlocksOwnerAndEpochRecreation)
+{
+    const Layout layout("p");
+    for (const NsState state : {NsState::Creating, NsState::Live, NsState::Removing})
+    {
+        const RefCatalog catalog = catalogOwning("root/x/table", state);
+        const ObserveRefCatalog observe = [catalog] { return catalog; };
+
+        InMemoryBackend owner_backend;
+        EXPECT_THROW(claimOwnerOrThrow(owner_backend, layout, "root/x", UInt128{1}, observe), DB::Exception);
+        EXPECT_FALSE(owner_backend.head(layout.ownerKey("root/x")).exists);
+
+        InMemoryBackend epoch_backend;
+        EXPECT_THROW(allocateWriterEpoch(
+            epoch_backend, layout, "root/x", EpochMintPolicy::NormalMount, 0, observe), DB::Exception);
+        EXPECT_FALSE(epoch_backend.head(layout.epochKey("root/x")).exists);
+    }
+}
+
+TEST(CasServerRootSafety, OwnershipUsesAPathComponentBoundary)
+{
+    InMemoryBackend backend;
+    const Layout layout("p");
+    EXPECT_TRUE(serverRootSubtreeEmpty(
+        backend, layout, "root/x", catalogOwning("root/xy/table", NsState::Live)));
+    EXPECT_FALSE(serverRootSubtreeEmpty(
+        backend, layout, "root/x", catalogOwning("root/x/table", NsState::Live)));
+}
+
+TEST(CasServerRootSafety, OpaqueStreamAndStateDebrisAloneDoesNotBlockRecreation)
+{
+    InMemoryBackend backend;
+    const Layout layout("p");
+    const NamespaceLifeId dead = NamespaceLifeId::fromCatalogEntry(RootNamespace{"unowned"}, UInt128{99});
+    ASSERT_EQ(backend.putIfAbsent(layout.refLogKey(dead, RefTxnId{1, 1}), "debris").outcome, PutOutcome::Done);
+    ASSERT_EQ(backend.putIfAbsent(layout.refCkptKey(dead), "debris").outcome, PutOutcome::Done);
+    ASSERT_EQ(backend.putIfAbsent(layout.namespaceFileKey(dead, "f"), "debris").outcome, PutOutcome::Done);
+
+    EXPECT_NO_THROW(claimOwnerOrThrow(backend, layout, "root/x", UInt128{1}, emptyCatalogObservation()));
+    EXPECT_EQ(allocateWriterEpoch(
+        backend, layout, "root/x", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation()), 1u);
+}
+
+TEST(CasServerRootSafety, ManifestAndLooseRootDebrisStillBlockRecreation)
+{
+    const Layout layout("p");
+    for (const String & key : {
+             layout.casManifestsServerPrefix("root/x") + "table/debris",
+             layout.serverRootDataPrefix("root/x") + "loose"})
+    {
+        InMemoryBackend backend;
+        ASSERT_EQ(backend.putIfAbsent(key, "x").outcome, PutOutcome::Done);
+        EXPECT_THROW(claimOwnerOrThrow(
+            backend, layout, "root/x", UInt128{1}, emptyCatalogObservation()), DB::Exception);
+        EXPECT_THROW(allocateWriterEpoch(
+            backend, layout, "root/x", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation()), DB::Exception);
+    }
+}
+
+TEST(CasServerRootSafety, UnreadableCatalogNeverFallsBackToPhysicalGuesses)
+{
+    InMemoryBackend backend;
+    const Layout layout("p");
+    const ObserveRefCatalog unreadable = []() -> RefCatalog
+    {
+        throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "injected unreadable catalog");
+    };
+    EXPECT_THROW(claimOwnerOrThrow(backend, layout, "root/x", UInt128{1}, unreadable), DB::Exception);
+    EXPECT_THROW(allocateWriterEpoch(
+        backend, layout, "root/x", EpochMintPolicy::NormalMount, 0, unreadable), DB::Exception);
+    EXPECT_FALSE(backend.head(layout.ownerKey("root/x")).exists);
+    EXPECT_FALSE(backend.head(layout.epochKey("root/x")).exists);
+}
+
+TEST(CasServerRootSafety, OwnerConflictRecomputesTheWholeEmptinessBundle)
+{
+    OwnerConflictRevealsManifestBackend backend;
+    const Layout layout("p");
+    EXPECT_THROW(claimOwnerOrThrow(
+        backend, layout, "root/x", UInt128{1}, emptyCatalogObservation()), DB::Exception);
+    EXPECT_TRUE(backend.fired);
+    EXPECT_FALSE(backend.head(layout.ownerKey("root/x")).exists);
+}
+
+TEST(CasServerRootSafety, EpochConflictRecomputesTheWholeEmptinessBundle)
+{
+    EpochConflictRevealsManifestBackend backend;
+    const Layout layout("p");
+    EXPECT_THROW(allocateWriterEpoch(
+        backend, layout, "root/x", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation()), DB::Exception);
+    EXPECT_TRUE(backend.fired);
+    EXPECT_FALSE(backend.head(layout.epochKey("root/x")).exists);
 }
 
 TEST(CasMountLease, AbsentClaimThenRenewBumpsSeq)

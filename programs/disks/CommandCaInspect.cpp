@@ -2,6 +2,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasInspect.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 #include <Common/Exception.h>
 #include <ICommand.h>
 
@@ -51,7 +52,20 @@ public:
         if (!got)
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "ca-inspect: key '{}' does not exist", key);
 
-        std::cout << Cas::caInspectToJson(ca->store()->layout(), key, got->bytes) << "\n";
+        const Cas::Layout & layout = ca->store()->layout();
+        std::optional<Cas::NamespaceLifeId> resolved_life;
+        std::optional<Cas::NamespaceLifePhysicalId> life_id;
+        if (const auto parsed = layout.parseRefObjectKey(key))
+            life_id = parsed->life_id;
+        else if (const auto parsed_ckpt = layout.parseRefCkptKey(key))
+            life_id = *parsed_ckpt;
+        if (life_id)
+        {
+            const Cas::CasRefCatalog::Snapshot cut = Cas::CasRefCatalog::read(ca->store()->backend(), layout);
+            resolved_life = cut.life_index.resolve(*life_id);
+        }
+
+        std::cout << Cas::caInspectToJson(layout, key, got->bytes, resolved_life) << "\n";
     }
 };
 

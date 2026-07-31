@@ -122,38 +122,34 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
         e.detail = {{"srid", victim_srid}};
     });
 
-    /// REFUSE FAIL-CLOSE on an unattributable key. Decommission RETIRES A POOL SLOT, and it decides the
-    /// slot is drained from what this enumeration returned. A short list would therefore let it conclude
-    /// "drained" over a namespace the listing omitted, and the slot would be released with that
-    /// namespace's data still under it -- data loss, not a usability wrinkle. The universe must be
-    /// complete or the command must not run; unlike a read-only audit, there is no partial answer here
-    /// that is still safe to act on.
-    const NamespaceListing listing = admin->listNamespaces(victim_srid);
-    if (!listing.skipped.empty())
-        throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "ca-decommission: {} key(s) under this pool name no namespace life, so the namespace universe "
-            "of '{}' cannot be enumerated completely and no slot may be retired against it. First such key: "
-            "'{}' ({}). Run `ca-fsck` to enumerate them all.",
-            listing.skipped.size(), victim_srid, listing.skipped.front().key, listing.skipped.front().reason);
-
-    /// `listNamespaces` includes names discovered under both `cas/refs/` and `roots/`. A name is a
-    /// droppable table only when its refs prefix is present; roots-only names are loose mountpoint debris
-    /// and must be left for the roots sweep below.
-    for (const String & ns_str : listing.namespaces)
+    /// One immutable catalog cut is the complete ownership universe. Physical life keys carry no
+    /// logical path, and raw string prefixes such as `victim` must not select the distinct owner
+    /// `victim2`; the slash makes `victim` one canonical path component. Any duplicated physical id
+    /// refuses the destructive command before namespace or slot mutation.
+    const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(admin->backend(), admin->layout());
+    catalog_cut.life_index.throwIfAmbiguous("CAS decommission");
+    const String victim_namespace_prefix = victim_srid + "/";
+    std::vector<NamespaceLifeId> owned_lives;
+    for (const CatalogEntry & entry : catalog_cut.catalog.entries)
     {
-        const RootNamespace ns(ns_str);
+        if (entry.ns.string() != victim_srid && !entry.ns.string().starts_with(victim_namespace_prefix))
+            continue;
+        const auto life = catalog_cut.life_index.resolve(entry.incarnation);
+        if (!life)
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "ca-decommission: catalog entry '{}' has no physical life resolution", entry.ns.string());
+        owned_lives.push_back(*life);
+    }
+
+    for (const NamespaceLifeId & life : owned_lives)
+    {
+        const RootNamespace & ns = life.ns;
+        const String & ns_str = ns.string();
         if (admin->namespaceIsRemoved(ns))
         {
             ++report.namespaces_already_removed;
             continue;
         }
-        /// Stage B (Task 4-C): see `CasRefCatalog::resolveLifeOrSentinel`'s doc for why the sentinel
-        /// fallback is correct, not a guess, for a namespace the catalog does not name.
-        const auto ref_objects = admin->backend().list(
-            admin->layout().refsNamespacePrefix(CasRefCatalog::resolveLifeOrSentinel(admin->backend(), admin->layout(), ns)),
-            /*cursor=*/"", /*limit=*/1);
-        if (ref_objects.keys.empty())
-            continue;   /// A roots-only listing entry is not a table namespace.
 
         const auto stats = admin->dropNamespace(ns);
         ++report.namespaces_removed;
@@ -179,7 +175,7 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
     /// Group the listed keys by namespace and build prefix so each group can use the exact-token orphan
     /// sweep while the mount body still supplies its authority.
     {
-        const String debris_prefix = admin->layout().casManifestsPrefix() + victim_srid;
+        const String debris_prefix = admin->layout().casManifestsServerPrefix(victim_srid);
         std::set<std::tuple<String, uint64_t, uint64_t>> groups;   /// (namespace, writer epoch, build sequence)
         forEachListedKey(admin->backend(), debris_prefix, [&](const ListedKey & listed)
         {

@@ -331,7 +331,7 @@ TEST(CasRecoveryStreaming, MidTailVanishedObjectReLists)
     ASSERT_LT(seq2, seq3);
 
     auto store = openPoolForTest(backend);
-    backend->refs_prefix = layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns));
+    backend->refs_prefix = layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns));
     backend->target_log_key = layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, seq2});   /// vanish a mid-tail object
     backend->armed = true;
 
@@ -367,7 +367,7 @@ TEST(CasRecoveryStreaming, CorruptObjectFailsFast)
     backend->corrupt_bytes = sealObject(FormatId::RefLog, encodeRefLogTxn(foreign));
 
     auto store = openPoolForTest(backend);
-    backend->refs_prefix = layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns));
+    backend->refs_prefix = layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns));
     backend->target_log_key = layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, seq2});
     backend->armed = true;
 
@@ -394,7 +394,7 @@ TEST(CasRecoveryStreaming, ConcurrentWaiterUnblockedOnce)
     publishCommittedTransition(*backend, layout, ns, "y", std::nullopt, mref(2));
 
     auto store = openPoolForTest(backend);
-    backend->refs_prefix = layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns));
+    backend->refs_prefix = layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns));
 
     /// Gate the retry-backoff sleep: the first recovering caller parks HERE (state_mutex released),
     /// which is the only window in which a second caller can reach `recovery_cv`.

@@ -407,7 +407,7 @@ std::shared_ptr<DB::ContentAddressedMetadataStorage> openRecordingStorage(
 
     auto settings = makeSettingsForTest(
         "test", std::filesystem::temp_directory_path() / ("cas_ns_file_profile_scratch_" + unique));
-    /// A GC round touches all three of `cas/ref_catalog`, `cas/refs/` and `cas/manifests/`, so with the
+    /// A GC round touches `cas/ref_catalog`, `cas/ns/stream/` and `cas/manifests/`, so with the
     /// background scheduler enabled these zeros would hold only because the first tick (60s) outlives the
     /// test. A timer is not a fence.
     settings[DB::ContentAddressedSetting::gc_enabled] = false;

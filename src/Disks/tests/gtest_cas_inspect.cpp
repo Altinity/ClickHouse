@@ -49,7 +49,7 @@ TEST(CasInspect, RendersSetPublishedAtOpWithNoPayloadSizeKey)
     const String key = layout.refLogKey(NamespaceLifeId::stageATransition(ns), id);
     const String bytes = sealObject(FormatId::RefLog, encodeRefLogTxn(txn));
 
-    const String json = caInspectToJson(layout, key, bytes);
+    const String json = caInspectToJson(layout, key, bytes, NamespaceLifeId::stageATransition(ns));
     EXPECT_NE(json.find(R"("kind":"SetPublishedAt")"), String::npos) << json;
     EXPECT_EQ(json.find("payload"), String::npos) << json;
 }
@@ -73,7 +73,7 @@ TEST(CasInspect, RendersEpochSealTxnWithPrevEpochSeal)
     const String key = layout.refLogKey(NamespaceLifeId::stageATransition(ns), id);
     const String bytes = sealObject(FormatId::RefLog, encodeRefLogTxn(txn));
 
-    const String json = caInspectToJson(layout, key, bytes);
+    const String json = caInspectToJson(layout, key, bytes, NamespaceLifeId::stageATransition(ns));
     EXPECT_NE(json.find(R"("kind":"EpochSeal")"), String::npos) << json;
     EXPECT_NE(json.find(R"("prev_epoch_seal":{"writer_epoch":2,"ref_sequence":9})"), String::npos) << json;
 }
@@ -97,7 +97,7 @@ TEST(CasInspect, RendersCommittedRowWithNoPayloadSizeKey)
     const String key = layout.refSnapshotKey(NamespaceLifeId::stageATransition(ns), id);
     const String bytes = sealObject(FormatId::RefSnapshot, encodeRefTableSnapshot(snap));
 
-    const String json = caInspectToJson(layout, key, bytes);
+    const String json = caInspectToJson(layout, key, bytes, NamespaceLifeId::stageATransition(ns));
     EXPECT_EQ(json.find("payload"), String::npos) << json;
     EXPECT_NE(json.find(R"("published_at_ms":42)"), String::npos) << json;
 }
@@ -152,8 +152,9 @@ TEST(CasInspect, RendersBlobTargetRunEdgeAndCondemnedRows)
     EXPECT_NE(json.find(R"("zero_markers":0)"), String::npos) << json;
 }
 
-/// Stage A task 5 (spec INV-4): the `_ckpt` renders as its own object kind. It is the one ref object
-/// with no transaction id in its key, so before this branch existed the `cas/refs/` dispatch threw
+/// Stage A task 5 (spec INV-4): the `_ckpt` renders as its own object kind. It is point-addressed in
+/// `cas/ns/state/` with no transaction id, so it has a separate dispatch from stream objects and once
+/// fell through to
 /// `BAD_ARGUMENTS` for it -- and it is precisely the object an operator reaches for when asking "what
 /// is recovery's base" or "why is cleanup not reclaiming anything".
 TEST(CasInspect, RendersRefCkptWithEveryFieldPresent)
@@ -165,7 +166,9 @@ TEST(CasInspect, RendersRefCkptWithEveryFieldPresent)
                        .checkpoint_snapshot_id = RefTxnId{7, 9},
                        .last_epoch_seal = RefTxnId{6, 4}};
 
-    const String json = caInspectToJson(layout, layout.refCkptKey(NamespaceLifeId::stageATransition(ns)), encodeRefCkpt(ckpt));
+    const String json = caInspectToJson(
+        layout, layout.refCkptKey(NamespaceLifeId::stageATransition(ns)), encodeRefCkpt(ckpt),
+        NamespaceLifeId::stageATransition(ns));
     EXPECT_NE(json.find(R"("object":"ref_ckpt")"), String::npos) << json;
     /// The namespace comes from the KEY: a `_ckpt` body does not name it.
     EXPECT_NE(json.find(R"("ns":"srv1/db/tbl")"), String::npos) << json;
@@ -182,9 +185,34 @@ TEST(CasInspect, RendersRefCkptAbsencesAsExplicitNulls)
     const Layout layout("p");
     const RootNamespace ns{"srv1/db/fresh"};
 
-    const String json = caInspectToJson(layout, layout.refCkptKey(NamespaceLifeId::stageATransition(ns)), encodeRefCkpt(RefCkpt{}));
+    const String json = caInspectToJson(
+        layout, layout.refCkptKey(NamespaceLifeId::stageATransition(ns)), encodeRefCkpt(RefCkpt{}),
+        NamespaceLifeId::stageATransition(ns));
     EXPECT_NE(json.find(R"("object":"ref_ckpt")"), String::npos) << json;
     EXPECT_NE(json.find(R"("life_epoch":null)"), String::npos) << json;
     EXPECT_NE(json.find(R"("checkpoint_snapshot_id":null)"), String::npos) << json;
     EXPECT_NE(json.find(R"("last_epoch_seal":null)"), String::npos) << json;
+}
+
+/// A listed physical id cannot supply a namespace. Inspect must receive the unique catalog join, and
+/// a different logical spelling at the same id is rejected by the decoded object's own namespace.
+TEST(CasInspect, RefObjectRequiresTheExactCatalogResolution)
+{
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/db/tbl"};
+    const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(ns, UInt128{91});
+    RefLogTxn txn;
+    txn.ns = ns.string();
+    txn.txn_id = RefTxnId{1, 1};
+    RefOp birth;
+    birth.kind = RefOpKind::NamespaceBirth;
+    txn.ops = {birth};
+    const String key = layout.refLogKey(life, txn.txn_id);
+    const String bytes = sealObject(FormatId::RefLog, encodeRefLogTxn(txn));
+
+    EXPECT_THROW(caInspectToJson(layout, key, bytes), DB::Exception);
+    EXPECT_THROW(caInspectToJson(
+        layout, key, bytes, NamespaceLifeId::fromCatalogEntry(RootNamespace{"redirected"}, life.incarnation)),
+        DB::Exception);
+    EXPECT_NO_THROW(caInspectToJson(layout, key, bytes, life));
 }

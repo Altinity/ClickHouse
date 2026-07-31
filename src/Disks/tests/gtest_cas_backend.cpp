@@ -308,9 +308,12 @@ TEST(CasInstrumentedBackend, ClassifierAndPerNamespaceOpEvents)
     EXPECT_EQ(classifyCasNs("pool/roots/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/_watermark"), CasNs::Root);
     EXPECT_EQ(classifyCasNs("pool/roots/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/_precommits/3"), CasNs::Root);
     EXPECT_EQ(classifyCasNs("pool/_pool_meta"), CasNs::Other);
-    /// Post-relocation layout: ref shards and part manifests must NOT fall into Other (the
+    /// Final opaque-life layout: both immutable streams and point/path-addressed state remain Root
+    /// instrumentation, while part manifests remain Manifest. None may fall into Other (the
     /// 2026-07-03 operator-stand CREATE storm misread as CasOtherHeadMiss=102 because of this).
-    EXPECT_EQ(classifyCasNs("pool/cas/refs/0/srv/store/d18/uuid@cas@/17"), CasNs::Root);
+    EXPECT_EQ(classifyCasNs("pool/cas/ns/stream/00000000000000000000000000000017/_log/1-1.zst"), CasNs::Root);
+    EXPECT_EQ(classifyCasNs("pool/cas/ns/state/00000000000000000000000000000017/_ckpt.zst"), CasNs::Root);
+    EXPECT_EQ(classifyCasNs("pool/cas/ns/state/00000000000000000000000000000017/_files/format_version.txt"), CasNs::Root);
     EXPECT_EQ(classifyCasNs("pool/cas/manifests/0/srv/store/d18/uuid@cas@/24/1/000001.proto"), CasNs::Manifest);
 
     auto inner = std::make_shared<InMemoryBackend>();

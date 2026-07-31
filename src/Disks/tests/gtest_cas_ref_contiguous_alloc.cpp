@@ -320,20 +320,16 @@ TEST(CasRefContiguousAlloc, OldPoolFormatIsRefusedNamingRecreation)
     catch (const DB::Exception & e)
     {
         EXPECT_EQ(e.code(), DB::ErrorCodes::UNKNOWN_FORMAT_VERSION);
-        EXPECT_NE(e.message().find(fmt::format("CAS pool format {} predates namespace-life-keyed ref objects",
+        EXPECT_NE(e.message().find(fmt::format("CAS pool format {} predates opaque namespace-life stream/state keys",
                                                kContiguousRefStreamsGeneration - 1)), String::npos)
             << "the message must name the migration: " << e.message();
     }
 }
 
-/// The LATER format floor (Stage B's "format bump B", `kNamespaceLifeKeyedGeneration`). A generation-4
-/// pool -- valid and openable before this bump, since it already has contiguous ref streams -- must
-/// now ALSO be refused: its ref-object keys carry no incarnation segment, which this build's parsers
-/// refuse as corruption (`Layout::parseRefObjectKey`/`parseRefCkptKey`) rather than read. This is the
-/// test the bump itself is about: `OldPoolFormatIsRefusedNamingRecreation` above already refused a
-/// pre-generation-4 pool before this bump landed, so it alone would not catch a floor that failed to
-/// move.
-TEST(CasRefContiguousAlloc, PoolPredatingNamespaceLifeKeyedRefsIsRefusedNamingRecreation)
+/// Generation 6 is a recreate-only physical-layout cut. A generation-5 pool has contiguous,
+/// incarnation-qualified streams but still repeats the logical namespace in every key; accepting it
+/// would silently run the generation-6 parsers over a different grammar.
+TEST(CasRefContiguousAlloc, GenerationFiveNamespaceBearingPoolIsRefusedNamingRecreation)
 {
     PoolMeta pm;
     pm.pool_id = UInt128{1, 2};
@@ -344,28 +340,27 @@ TEST(CasRefContiguousAlloc, PoolPredatingNamespaceLifeKeyedRefsIsRefusedNamingRe
     const String current = encodePoolMeta(pm);
     EXPECT_NO_THROW(decodePoolMeta(current));
 
-    /// Rewrite the header-line generation to the last pre-bump-B one -- exactly what a build between
-    /// Stage A and this bump would have stamped, and a generation this build DID accept before this
-    /// task's floor moved.
+    /// Rewrite the header to the immediately preceding generation, which used
+    /// `cas/refs/<namespace>/<incarnation>/...`.
     const String from = "\"v\":" + std::to_string(G_BUILD);
-    const String to = "\"v\":" + std::to_string(kNamespaceLifeKeyedGeneration - 1);
+    const String to = "\"v\":" + std::to_string(kNamespaceLifeKeyedGeneration);
     const size_t at = current.find(from);
     ASSERT_NE(at, String::npos);
     String old_format = current;
     old_format.replace(at, from.size(), to);
-    ASSERT_EQ(kNamespaceLifeKeyedGeneration - 1, kContiguousRefStreamsGeneration)
-        << "this test's whole point is the generation-4 boundary; if the constants ever diverge, retarget it";
+    ASSERT_EQ(kNamespaceLifeKeyedGeneration + 1, kOpaqueNamespaceLifeLayoutGeneration)
+        << "this test pins the immediately preceding namespace-bearing generation";
 
     try
     {
         decodePoolMeta(old_format);
-        FAIL() << "a pre-bump-B pool must not open";
+        FAIL() << "a generation-5 namespace-bearing pool must not open";
     }
     catch (const DB::Exception & e)
     {
         EXPECT_EQ(e.code(), DB::ErrorCodes::UNKNOWN_FORMAT_VERSION);
-        EXPECT_NE(e.message().find(fmt::format("CAS pool format {} predates namespace-life-keyed ref objects",
-                                               kNamespaceLifeKeyedGeneration - 1)), String::npos)
+        EXPECT_NE(e.message().find(fmt::format("CAS pool format {} predates opaque namespace-life stream/state keys",
+                                               kNamespaceLifeKeyedGeneration)), String::npos)
             << "the message must name the migration: " << e.message();
     }
 }

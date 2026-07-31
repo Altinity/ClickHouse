@@ -300,8 +300,8 @@ TEST(CasRefCkpt, KeyIsTheLifeLeafAndParsesBack)
     const RootNamespace ns{"srv1/ckpt_key"};
     const NamespaceLifeId ns_id = NamespaceLifeId::stageATransition(ns);
     EXPECT_EQ(layout.refCkptKey(ns_id),
-        "p/cas/refs/srv1/ckpt_key/" + renderIncarnation(ns_id.incarnation) + "/_ckpt");
-    EXPECT_EQ(layout.parseRefCkptKey(layout.refCkptKey(ns_id)), ns_id);
+        "p/cas/ns/state/" + renderIncarnation(ns_id.incarnation) + "/_ckpt");
+    EXPECT_EQ(layout.parseRefCkptKey(layout.refCkptKey(ns_id)), ns_id.incarnation);
 
     /// `_ckpt` has no kind directory, so the id-bearing parser must NOT claim it -- and the `_ckpt`
     /// parser must not claim the id-bearing keys either. Each key has exactly one classifier.
@@ -309,14 +309,13 @@ TEST(CasRefCkpt, KeyIsTheLifeLeafAndParsesBack)
     EXPECT_FALSE(layout.parseRefCkptKey(layout.refLogKey(ns_id, ID_1_1)).has_value());
     EXPECT_FALSE(layout.parseRefCkptKey(layout.refSnapshotKey(ns_id, ID_1_1)).has_value());
     EXPECT_FALSE(layout.parseRefCkptKey(layout.refCkptKey(ns_id) + ".zst").has_value());
-    EXPECT_FALSE(layout.parseRefCkptKey("p/cas/refs/_ckpt").has_value());
+    EXPECT_FALSE(layout.parseRefCkptKey("p/cas/ns/state/_ckpt").has_value());
     EXPECT_FALSE(layout.parseRefCkptKey("q" + layout.refCkptKey(ns_id).substr(1)).has_value());
 }
 
-/// A `_ckpt` is a LEGITIMATE ref object, and `groupRefKeys` aborts ref folding for the whole GC round
-/// on any key under the ref prefix it cannot classify. Without this the first namespace to get a
-/// checkpoint would stop ref folding in every subsequent round, pool-wide.
-TEST(CasRefCkpt, GroupRefKeysClassifiesTheCkptInsteadOfAbortingTheRound)
+/// The hot stream grouping accepts logs and snapshots while ignoring a checkpoint from the separate
+/// state tree. An unrecognized key inside the stream tree still aborts the round.
+TEST(CasRefCkpt, GroupRefKeysScopesHotIntakeToTheStreamTree)
 {
     const Layout layout{"p"};
     const RootNamespace ns{"srv1/ckpt_group"};
@@ -328,16 +327,13 @@ TEST(CasRefCkpt, GroupRefKeysClassifiesTheCkptInsteadOfAbortingTheRound)
 
     const auto grouped = groupRefKeys(layout, keys);
     ASSERT_EQ(grouped.size(), 1u);
-    const RefTableListing & listing = grouped.at(ns.string());
+    const RefTableListing & listing = grouped.at(NamespaceLifeId::stageATransition(ns).incarnation);
     EXPECT_EQ(listing.logs, std::vector<RefTxnId>{ID_1_1});
     EXPECT_EQ(listing.snapshots, std::vector<RefTxnId>{ID_1_1});
-    EXPECT_TRUE(listing.has_ckpt) << "the checkpoint carries no txn id, so the listing must record it "
-                                     "separately or a table with one looks identical to a table without";
 
-    /// A genuinely unrecognizable key is still corruption -- the `_ckpt` arm must not have widened the
-    /// gate into "ignore anything odd".
+    /// A genuinely unrecognizable key inside this life stream is still corruption.
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-        [&] { groupRefKeys(layout, {"p/cas/refs/srv1/ckpt_group/_bogus"}); });
+        [&] { groupRefKeys(layout, {layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)) + "_bogus"}); });
 }
 
 /// ---------------------------------------------------------------------------------------------
@@ -861,8 +857,7 @@ TEST(CasRefCkpt, CommitRefChunkDurableBytesUnchangedByExtraction)
     /// is unaffected, since it names every OTHER segment literally and renders this one dynamically.
     const NamespaceLifeId life = liveLifeOrFail(*backend, store->layout(), ns);
     const String key = store->layout().refLogKey(life, id);
-    EXPECT_EQ(key, "p/cas/refs/test/golden@cas@/"
-                   + renderIncarnation(life.incarnation)
+    EXPECT_EQ(key, "p/cas/ns/stream/" + renderIncarnation(life.incarnation)
                    + "/_log/0000000000000001-0000000000000001.zst")
         << "the canonical ref-log key the append lane derives";
 
@@ -875,7 +870,7 @@ TEST(CasRefCkpt, CommitRefChunkDurableBytesUnchangedByExtraction)
     EXPECT_EQ(got->bytes.size(), 177u) << "the sealed ref-log body changed size";
     SipHash body_hash;
     body_hash.update(got->bytes.data(), got->bytes.size());
-    EXPECT_EQ(getHexUIntLowercase(body_hash.get128()), "7f52cf3cc0599d9bec645bed0e33f898")
+    EXPECT_EQ(getHexUIntLowercase(body_hash.get128()), "d9c0a90e125f382a9d932314f3751468")
         << "the sealed ref-log body changed content -- preparation must seal the same bytes it sealed "
            "before the extraction";
 }

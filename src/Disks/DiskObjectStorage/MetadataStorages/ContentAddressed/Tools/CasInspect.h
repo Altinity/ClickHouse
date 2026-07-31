@@ -14,7 +14,7 @@ namespace DB::Cas
 /// involved.
 ///
 /// Dispatch is by KEY SHAPE, most-specific first (`cas/manifests/.../NNNNNN.zst` before the
-/// `cas/refs/` root-shard prefix, `/mount` and `/fold_seal` suffixes, the
+/// `cas/ns/stream/` and `cas/ns/state/` roots, `/mount` and `/fold_seal` suffixes, the
 /// `gc/gen/*/attempt/*/blob_target/*/*` source-edge run segments, then the pool-wide `gc/state`
 /// and `blobs/` prefix). u128 and hash fields render as lowercase hex strings (matching
 /// `u128ToHex`), while backend-native `Token` values render as escaped strings. Neither is exposed
@@ -24,6 +24,7 @@ namespace DB::Cas
 /// decode failure of a matched key (invalid header, corrupted bytes, future format version, ...)
 /// propagates as-is from the underlying `decode*` function (typically `CORRUPTED_DATA` or
 /// `UNKNOWN_FORMAT_VERSION`) — this function performs no fallback decode and swallows nothing.
-String caInspectToJson(const Layout & layout, const String & key, std::string_view bytes);
+String caInspectToJson(const Layout & layout, const String & key, std::string_view bytes,
+                       const std::optional<NamespaceLifeId> & resolved_life = std::nullopt);
 
 }

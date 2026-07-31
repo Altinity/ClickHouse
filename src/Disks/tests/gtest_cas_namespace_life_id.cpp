@@ -62,10 +62,10 @@ void expectRefusalNaming(F && body, const String & key)
 /// genuinely templated on `L`, so a missing member is a substitution failure rather than a hard error.
 template <class L>
 concept HasNamespaceOnlyRefsNamespacePrefix =
-    requires(const L & l, const RootNamespace & ns) { l.refsNamespacePrefix(ns); };
+    requires(const L & l, const RootNamespace & ns) { l.namespaceStreamPrefix(ns); };
 template <class L>
 concept HasIncarnationRefsNamespacePrefix =
-    requires(const L & l, const NamespaceLifeId & id) { l.refsNamespacePrefix(id); };
+    requires(const L & l, const NamespaceLifeId & id) { l.namespaceStreamPrefix(id); };
 
 template <class L>
 concept HasNamespaceOnlyRefLogKey =
@@ -131,38 +131,39 @@ concept HasLifeScopedManifestNamespacePrefix =
 
 }
 
-/// Every ref-layer key names one LIFE: `<prefix>/cas/refs/<ns>/<inc>/...`, with `<inc>` a fixed-width
-/// lower-case hex render of the incarnation (INV-3). Round-tripped through each migrated helper.
+/// Every ref-layer key names one life by an opaque fixed-width physical id. The logical namespace is
+/// intentionally absent and must be supplied by a catalog join.
 TEST(CasNamespaceLifeId, KeysCarryTheIncarnationSegment)
 {
     Layout l("p");
     const NamespaceLifeId id = NamespaceLifeId::fromCatalogEntry(RootNamespace{kNs}, incarnationA());
     const RefTxnId txn{7, 0x8e};
-    const String life = "p/cas/refs/" + kNs + "/" + kHexA + "/";
+    const String life = "p/cas/ns/stream/" + kHexA + "/";
+    const String state = "p/cas/ns/state/" + kHexA + "/";
 
-    EXPECT_EQ(l.refsNamespacePrefix(id), life);
+    EXPECT_EQ(l.namespaceStreamPrefix(id), life);
     EXPECT_EQ(l.refLogKey(id, txn), life + "_log/" + kTxn + ".zst");
     EXPECT_EQ(l.refSnapshotKey(id, txn), life + "_snap/" + kTxn + ".zst");
     EXPECT_EQ(l.refCleanupMarkerKey(id, txn), life + "_cleanup/" + kTxn);
-    EXPECT_EQ(l.refCkptKey(id), life + "_ckpt");
+    EXPECT_EQ(l.refCkptKey(id), state + "_ckpt");
 
     const auto parsed_log = l.parseRefObjectKey(l.refLogKey(id, txn));
     ASSERT_TRUE(parsed_log.has_value());
-    EXPECT_EQ(parsed_log->id, id);
+    EXPECT_EQ(parsed_log->life_id, id.incarnation);
     EXPECT_EQ(parsed_log->kind, RefObjectKind::Log);
     EXPECT_EQ(parsed_log->txn_id, txn);
 
     const auto parsed_snap = l.parseRefObjectKey(l.refSnapshotKey(id, txn));
     ASSERT_TRUE(parsed_snap.has_value());
-    EXPECT_EQ(parsed_snap->id, id);
+    EXPECT_EQ(parsed_snap->life_id, id.incarnation);
     EXPECT_EQ(parsed_snap->kind, RefObjectKind::Snap);
 
     const auto parsed_cleanup = l.parseRefObjectKey(l.refCleanupMarkerKey(id, txn));
     ASSERT_TRUE(parsed_cleanup.has_value());
-    EXPECT_EQ(parsed_cleanup->id, id);
+    EXPECT_EQ(parsed_cleanup->life_id, id.incarnation);
     EXPECT_EQ(parsed_cleanup->kind, RefObjectKind::Cleanup);
 
-    EXPECT_EQ(l.parseRefCkptKey(l.refCkptKey(id)), id);
+    EXPECT_EQ(l.parseRefCkptKey(l.refCkptKey(id)), id.incarnation);
 }
 
 /// The property the type exists for: two lives of the SAME namespace name share no key at all, so a
@@ -176,20 +177,20 @@ TEST(CasNamespaceLifeId, TwoLivesOfOneNamespaceShareNoKeys)
 
     EXPECT_EQ(first.ns, second.ns);
     EXPECT_NE(first, second);
-    EXPECT_NE(l.refsNamespacePrefix(first), l.refsNamespacePrefix(second));
+    EXPECT_NE(l.namespaceStreamPrefix(first), l.namespaceStreamPrefix(second));
     EXPECT_NE(l.refLogKey(first, txn), l.refLogKey(second, txn));
     EXPECT_NE(l.refCkptKey(first), l.refCkptKey(second));
 
     /// Neither life's prefix covers the other: a LIST of one enumerates only its own objects.
-    EXPECT_FALSE(l.refLogKey(second, txn).starts_with(l.refsNamespacePrefix(first)));
-    EXPECT_FALSE(l.refLogKey(first, txn).starts_with(l.refsNamespacePrefix(second)));
+    EXPECT_FALSE(l.refLogKey(second, txn).starts_with(l.namespaceStreamPrefix(first)));
+    EXPECT_FALSE(l.refLogKey(first, txn).starts_with(l.namespaceStreamPrefix(second)));
 
     /// A key spelling the other life parses back to the OTHER id -- the parser reports what the key
     /// says; it is the catalog, not the parser, that decides which lives are current.
     const auto parsed = l.parseRefObjectKey(l.refLogKey(second, txn));
     ASSERT_TRUE(parsed.has_value());
-    EXPECT_EQ(parsed->id, second);
-    EXPECT_NE(parsed->id, first);
+    EXPECT_EQ(parsed->life_id, second.incarnation);
+    EXPECT_NE(parsed->life_id, first.incarnation);
 }
 
 /// Zero is not a wildcard and not "the namespace itself": it can never be constructed, so it can
@@ -217,10 +218,9 @@ TEST(CasNamespaceLifeIdDeathTest, ZeroIncarnationIsUnconstructibleAborts)
 }
 #endif
 
-/// Behind Stage B's format bump every un-incarnated key is corruption, not a compatibility case: a
-/// parser that quietly classified one as foreign debris would let a Stage-A-shaped object survive
-/// unnoticed under a live namespace. Both parsers refuse it by name.
-TEST(CasNamespaceLifeId, ParsersRefuseTheUnIncarnatedKeyShape)
+/// Generation-5 namespace-bearing keys are outside the generation-6 parser roots altogether. Pool
+/// admission rejects their generation before any listed-key parser is involved.
+TEST(CasNamespaceLifeId, GenerationFiveNamespaceBearingKeysAreOutsideTheFinalGrammar)
 {
     Layout l("p");
     const String legacy_log = "p/cas/refs/" + kNs + "/_log/" + kTxn + ".zst";
@@ -230,11 +230,11 @@ TEST(CasNamespaceLifeId, ParsersRefuseTheUnIncarnatedKeyShape)
     /// A single-segment namespace leaves nothing at all where the incarnation belongs.
     const String legacy_single_segment = "p/cas/refs/srv1/_log/" + kTxn + ".zst";
 
-    expectRefusalNaming([&] { l.parseRefObjectKey(legacy_log); }, legacy_log);
-    expectRefusalNaming([&] { l.parseRefObjectKey(legacy_snap); }, legacy_snap);
-    expectRefusalNaming([&] { l.parseRefObjectKey(legacy_cleanup); }, legacy_cleanup);
-    expectRefusalNaming([&] { l.parseRefObjectKey(legacy_single_segment); }, legacy_single_segment);
-    expectRefusalNaming([&] { l.parseRefCkptKey(legacy_ckpt); }, legacy_ckpt);
+    EXPECT_FALSE(l.parseRefObjectKey(legacy_log));
+    EXPECT_FALSE(l.parseRefObjectKey(legacy_snap));
+    EXPECT_FALSE(l.parseRefObjectKey(legacy_cleanup));
+    EXPECT_FALSE(l.parseRefObjectKey(legacy_single_segment));
+    EXPECT_FALSE(l.parseRefCkptKey(legacy_ckpt));
 }
 
 /// An all-zero incarnation segment is well-formed hex naming no life, so it is corruption on the read
@@ -243,8 +243,8 @@ TEST(CasNamespaceLifeId, ParsersRefuseAZeroIncarnation)
 {
     Layout l("p");
     const String zeros(32, '0');
-    const String zero_log = "p/cas/refs/" + kNs + "/" + zeros + "/_log/" + kTxn + ".zst";
-    const String zero_ckpt = "p/cas/refs/" + kNs + "/" + zeros + "/_ckpt";
+    const String zero_log = "p/cas/ns/stream/" + zeros + "/_log/" + kTxn + ".zst";
+    const String zero_ckpt = "p/cas/ns/state/" + zeros + "/_ckpt";
 
     expectRefusalNaming([&] { l.parseRefObjectKey(zero_log); }, zero_log);
     expectRefusalNaming([&] { l.parseRefCkptKey(zero_ckpt); }, zero_ckpt);
@@ -263,8 +263,8 @@ TEST(CasNamespaceLifeId, ParsersRefuseAMalformedIncarnationSegment)
 
     for (const String & bad : {upper, too_short, too_long, non_hex})
     {
-        const String log_key = "p/cas/refs/" + kNs + "/" + bad + "/_log/" + kTxn + ".zst";
-        const String ckpt_key = "p/cas/refs/" + kNs + "/" + bad + "/_ckpt";
+        const String log_key = "p/cas/ns/stream/" + bad + "/_log/" + kTxn + ".zst";
+        const String ckpt_key = "p/cas/ns/state/" + bad + "/_ckpt";
         expectRefusalNaming([&] { l.parseRefObjectKey(log_key); }, log_key);
         expectRefusalNaming([&] { l.parseRefCkptKey(ckpt_key); }, ckpt_key);
     }
@@ -288,7 +288,7 @@ TEST(CasNamespaceLifeId, ForeignAndUnrecognizedKeysStayInert)
     /// never even reached.
     EXPECT_FALSE(l.parseRefObjectKey("p/cas/refs/" + kNs + "/_bogus/" + kTxn).has_value());
     /// A non-canonical transaction id likewise loses the key before the incarnation is judged.
-    EXPECT_FALSE(l.parseRefObjectKey(l.refsNamespacePrefix(id) + "_log/7-8e").has_value());
+    EXPECT_FALSE(l.parseRefObjectKey(l.namespaceStreamPrefix(id) + "_log/7-8e").has_value());
     /// The two parsers stay disjoint: neither claims the other's objects.
     EXPECT_FALSE(l.parseRefObjectKey(l.refCkptKey(id)).has_value());
     EXPECT_FALSE(l.parseRefCkptKey(l.refLogKey(id, txn)).has_value());
@@ -297,14 +297,14 @@ TEST(CasNamespaceLifeId, ForeignAndUnrecognizedKeysStayInert)
     EXPECT_FALSE(l.parseRefCkptKey("p/cas/refs/_ckpt").has_value());
 }
 
-/// Namespace FILES are life-keyed too (directive §2): `roots/<ns>/<inc>/_files/<relative-name>`. The
+/// Namespace files are life-keyed too: `cas/ns/state/<life_id>/_files/<relative-name>`. The
 /// round trip covers a flat name and a NESTED one, because the dedup log's segments live in a
 /// table-level subdirectory and the nested shape is the one on the insert path.
 TEST(CasNamespaceLifeId, NamespaceFileKeysCarryTheIncarnationSegment)
 {
     Layout l("p");
     const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(RootNamespace{kNs}, incarnationA());
-    const String files = "p/roots/" + kNs + "/" + kHexA + "/_files/";
+    const String files = "p/cas/ns/state/" + kHexA + "/_files/";
 
     EXPECT_EQ(l.namespaceFilesPrefix(life), files);
     EXPECT_EQ(l.namespaceFileKey(life, "format_version.txt"), files + "format_version.txt");
@@ -315,7 +315,7 @@ TEST(CasNamespaceLifeId, NamespaceFileKeysCarryTheIncarnationSegment)
     {
         const auto parsed = l.parseNamespaceFileKey(l.namespaceFileKey(life, name));
         ASSERT_TRUE(parsed.has_value()) << "for name '" << name << "'";
-        EXPECT_EQ(parsed->id, life);
+        EXPECT_EQ(parsed->life_id, life.incarnation);
         EXPECT_EQ(parsed->relative_name, name);
     }
 
@@ -325,9 +325,8 @@ TEST(CasNamespaceLifeId, NamespaceFileKeysCarryTheIncarnationSegment)
     EXPECT_FALSE(l.namespaceFileKey(second, "format_version.txt").starts_with(l.namespaceFilesPrefix(life)));
 }
 
-/// The `_files` mirror of the ref-key refusal contract: behind Stage B's format bump the un-incarnated
-/// file key names no live object, so it is corruption rather than a compatibility case, and the refusal
-/// names the key.
+/// Generation-5 namespace-bearing file keys are outside the final parser root. Malformed ids under the
+/// final state root are corruption and name the offending key.
 TEST(CasNamespaceLifeId, NamespaceFileParserRefusesLegacyAndMalformedIncarnations)
 {
     Layout l("p");
@@ -335,10 +334,10 @@ TEST(CasNamespaceLifeId, NamespaceFileParserRefusesLegacyAndMalformedIncarnation
     const String legacy = "p/roots/" + kNs + "/_files/format_version.txt";
     /// A single-segment namespace leaves nothing at all where the incarnation belongs.
     const String legacy_single_segment = "p/roots/srv1/_files/format_version.txt";
-    const String zero_inc = "p/roots/" + kNs + "/" + zeros + "/_files/format_version.txt";
+    const String zero_inc = "p/cas/ns/state/" + zeros + "/_files/format_version.txt";
 
-    expectRefusalNaming([&] { l.parseNamespaceFileKey(legacy); }, legacy);
-    expectRefusalNaming([&] { l.parseNamespaceFileKey(legacy_single_segment); }, legacy_single_segment);
+    EXPECT_FALSE(l.parseNamespaceFileKey(legacy));
+    EXPECT_FALSE(l.parseNamespaceFileKey(legacy_single_segment));
     expectRefusalNaming([&] { l.parseNamespaceFileKey(zero_inc); }, zero_inc);
 
     const String upper = "112233445566778899AABBCCDDEEFF01";
@@ -347,7 +346,7 @@ TEST(CasNamespaceLifeId, NamespaceFileParserRefusesLegacyAndMalformedIncarnation
     const String non_hex = kHexA.substr(0, 31) + "z";
     for (const String & bad : {upper, too_short, too_long, non_hex})
     {
-        const String key = "p/roots/" + kNs + "/" + bad + "/_files/format_version.txt";
+        const String key = "p/cas/ns/state/" + bad + "/_files/format_version.txt";
         expectRefusalNaming([&] { l.parseNamespaceFileKey(key); }, key);
     }
 }
@@ -371,21 +370,19 @@ TEST(CasNamespaceLifeId, ForeignAndMountpointKeysStayInertForTheFileParser)
     EXPECT_FALSE(l.parseRefCkptKey(l.namespaceFileKey(life, "x")).has_value());
 }
 
-/// The parser takes the FIRST `/_files/` in the key, which is unambiguous only because a NAMESPACE can
-/// never contain that segment. That premise is asserted here rather than asserted in prose, since the
-/// parser's correctness rests on it: `_files` is rejected as a namespace segment, while a relative NAME
-/// may contain it, and such a name still round-trips.
-TEST(CasNamespaceLifeId, TheReservedFilesSegmentCannotComeFromTheNamespace)
+/// Physical file keys use only `life_id`, so changing the logical spelling cannot redirect a key. A
+/// relative name may still contain `_files` and round-trips after the fixed delimiter.
+TEST(CasNamespaceLifeId, PhysicalFileKeysIgnoreLogicalNamespaceSpelling)
 {
     Layout l("p");
-    EXPECT_THROW(l.namespaceFilesPrefix(NamespaceLifeId::fromCatalogEntry(
-        RootNamespace{"srv1/_files/tbl"}, incarnationA())), DB::Exception);
-
     const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(RootNamespace{kNs}, incarnationA());
+    const NamespaceLifeId differently_named = NamespaceLifeId::fromCatalogEntry(
+        RootNamespace{"different/_files/spelling"}, incarnationA());
+    EXPECT_EQ(l.namespaceFilesPrefix(life), l.namespaceFilesPrefix(differently_named));
     const String nested_name = "deduplication_logs/_files/log_1.txt";
     const auto parsed = l.parseNamespaceFileKey(l.namespaceFileKey(life, nested_name));
     ASSERT_TRUE(parsed.has_value());
-    EXPECT_EQ(parsed->id, life);
+    EXPECT_EQ(parsed->life_id, life.incarnation);
     EXPECT_EQ(parsed->relative_name, nested_name);
 }
 

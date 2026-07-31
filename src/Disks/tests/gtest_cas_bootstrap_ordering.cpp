@@ -191,7 +191,7 @@ String residualRefLogKey()
 }
 }
 
-/// (b) A prefix holding `cas/refs/…`-style residue but NO `_pool_meta` → open fails typed (INVALID_STATE),
+/// (b) A prefix holding `cas/ns/stream/…` residue but NO `_pool_meta` → open fails typed (INVALID_STATE),
 /// and ZERO writes hit the backend (the mutating battery must NOT have run — the residual check throws
 /// first).
 TEST(CasBootstrapOrdering, ResidualWithoutMetaFailsTypedWithZeroWrites)

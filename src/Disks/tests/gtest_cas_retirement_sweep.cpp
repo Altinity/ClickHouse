@@ -25,7 +25,7 @@
 /// contiguous, arithmetically-walkable chain, and this file is where each retirement is proved rather
 /// than asserted in a comment:
 ///
-///   1. PROBE A's ABORT. The detector compared the round's two enumerations of `cas/refs/` and, on any
+///   1. PROBE A's ABORT. The detector compared the round's two enumerations of `cas/ns/stream/` and, on any
 ///      disagreement, aborted ref folding for the whole round -- because the fold ITERATED the listing,
 ///      so a hole in it meant a record was about to be skipped forever. The intake reads by exact key
 ///      now, so a hole folds through; a detector that still aborted would be halting a round that is
@@ -118,7 +118,7 @@ private:
 };
 
 /// Counts full enumerations of the ref prefix -- one increment per `list` call whose prefix is
-/// `cas/refs/`, which is how "the round lists this prefix once" becomes an assertion instead of a claim.
+/// `cas/ns/stream/`, which is how "the round lists this prefix once" becomes an assertion instead of a claim.
 class RefPrefixListCountingBackend : public InMemoryBackend
 {
 public:
@@ -198,7 +198,7 @@ std::set<String> listRefLogKeys(Backend & b, const Layout & l, const RootNamespa
     String cursor;
     while (true)
     {
-        const ListPage page = b.list(l.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)), cursor, 1000);
+        const ListPage page = b.list(l.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)), cursor, 1000);
         for (const ListedKey & k : page.keys)
             if (const auto parsed = l.parseRefObjectKey(k.key); parsed && parsed->kind == RefObjectKind::Log)
                 out.insert(k.key);
@@ -383,7 +383,7 @@ TEST(CasRetirementSweep, AHiddenRemovalStillReclaimsItsBlob)
            "skipped-transaction class, which arithmetic intake is supposed to close";
 }
 
-/// THE COST OF THE DEMOTION, made observable. A folding round enumerates `cas/refs/` exactly ONCE; the
+/// THE COST OF THE DEMOTION, made observable. A folding round enumerates `cas/ns/stream/` exactly ONCE; the
 /// second enumeration exists only on the rounds the detector's cadence makes due. Without this
 /// assertion the sampling would be free to quietly become "every round" again -- which is precisely the
 /// shape the retirement removed.
@@ -496,7 +496,7 @@ TEST(CasRetirementSweep, AStragglerFromTheDyingEpochLosesItsCreateToTheRecoveryS
     /// Drive the next ref-log append into the Unresolved/wedge outcome: the single attempt the budget
     /// allows fails ambiguously, so this process can never learn whether its conditional PUT landed.
     /// That undecidability is the whole reason the resolution is a conditional CREATE and not a GET.
-    backend->fault_key_substr = layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
+    backend->fault_key_substr = layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
     backend->fault_count = 1;
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));

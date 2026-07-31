@@ -12,7 +12,7 @@ namespace DB::ErrorCodes
     extern const int UNKNOWN_FORMAT_VERSION;
 }
 
-/// Namespace files are keyed by the namespace's LIFE, not by its name: `roots/<ns>/<inc>/_files/<name>`
+/// Namespace files are keyed by an opaque LIFE, not by its name: `cas/ns/state/<life_id>/_files/<name>`
 /// (Stage B Task 4b, directive design change 2). This file pins the three properties that re-key exists
 /// to produce, and the one it must NOT produce.
 ///
@@ -45,9 +45,8 @@ const String kNsString = "00/aa@cas@";
 const String kFile = "format_version.txt";
 
 /// Two DELIBERATELY DISTINGUISHABLE incarnations. Hand-picked rather than random so a failure message
-/// names which life a key belongs to, and so neither can coincide with `stageATransition`'s sentinel
-/// (whose render spells `__STAGE_A_TRANS`) -- a test that accidentally ran at the sentinel would agree
-/// with the pre-re-key tree and prove nothing.
+/// names which life a key belongs to, and both differ from the deterministic fixture id returned by
+/// `stageATransition`; the parser must return the id encoded in the key.
 const UInt128 kInc1 = hexToU128("11111111111111111111111111111111");
 const UInt128 kInc2 = hexToU128("22222222222222222222222222222222");
 
@@ -240,7 +239,7 @@ TEST(CasNsFileIncarnation, LegacyUnqualifiedFileKeyIsRefusedAtOpen)
     auto backend = std::make_shared<InMemoryBackend>();
     const Layout layout("p");
 
-    /// A generation-4 `_pool_meta`: the current encoder's output with its header generation moved back
+    /// A generation-5 `_pool_meta`: the current encoder's output with its header generation moved back
     /// one, so every other byte is exactly what that generation really wrote.
     PoolMeta meta;
     meta.pool_id = hexToU128("0123456789abcdef0123456789abcdef");
@@ -248,8 +247,8 @@ TEST(CasNsFileIncarnation, LegacyUnqualifiedFileKeyIsRefusedAtOpen)
     meta.min_reader_generation = kNamespaceLifeKeyedGeneration - 1;
     meta.algos_used = {static_cast<uint8_t>(BlobHashAlgo::CityHash128)};
     String encoded = encodePoolMeta(meta);
-    const String current_v = "\"v\":" + std::to_string(kNamespaceLifeKeyedGeneration);
-    const String legacy_v = "\"v\":" + std::to_string(kNamespaceLifeKeyedGeneration - 1);
+    const String current_v = "\"v\":" + std::to_string(kOpaqueNamespaceLifeLayoutGeneration);
+    const String legacy_v = "\"v\":" + std::to_string(kNamespaceLifeKeyedGeneration);
     const size_t at = encoded.find(current_v);
     /// Guard the substitution itself: a silent no-op here would leave a CURRENT-generation pool and the
     /// test would pass by opening a pool it believes it downgraded.

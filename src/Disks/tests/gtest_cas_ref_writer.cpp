@@ -182,11 +182,11 @@ RefTableState independentFullReplayForTest(Backend & backend, const Layout & lay
     String cursor;
     for (;;)
     {
-        const ListPage page = backend.list(layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)), cursor, 1000);
+        const ListPage page = backend.list(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)), cursor, 1000);
         for (const ListedKey & lk : page.keys)
         {
             const auto parsed = layout.parseRefObjectKey(lk.key);
-            if (parsed && parsed->id.ns == ns && parsed->kind == RefObjectKind::Log
+            if (parsed && parsed->life_id == NamespaceLifeId::stageATransition(ns).incarnation && parsed->kind == RefObjectKind::Log
                 && (!up_to || !(*up_to < parsed->txn_id)))
                 ids.push_back(parsed->txn_id);
         }
@@ -213,11 +213,11 @@ std::optional<RefTxnId> listGreatestSnapshotIdForTest(Backend & backend, const L
     String cursor;
     for (;;)
     {
-        const ListPage page = backend.list(layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)), cursor, 1000);
+        const ListPage page = backend.list(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)), cursor, 1000);
         for (const ListedKey & lk : page.keys)
         {
             const auto parsed = layout.parseRefObjectKey(lk.key);
-            if (parsed && parsed->id.ns == ns && parsed->kind == RefObjectKind::Snap
+            if (parsed && parsed->life_id == NamespaceLifeId::stageATransition(ns).incarnation && parsed->kind == RefObjectKind::Snap
                 && (!greatest || *greatest < parsed->txn_id))
                 greatest = parsed->txn_id;
         }
@@ -804,7 +804,7 @@ TEST(RefWriterAppendLane, WedgedLaneBlocksSameTableWhileOtherTableProceeds)
     publishEmptyPart(store, ns_a, "x_second");
     publishEmptyPart(store, ns_b, "y");
 
-    backend->fault_key_substr = layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns_a)) + "_log/";
+    backend->fault_key_substr = layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns_a)) + "_log/";
     backend->fault_count = 1;
 
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns_a, "x"); });
@@ -840,7 +840,7 @@ TEST(RefWriterAppendLane, WedgedAppendObservedDurableAppliesBeforeNextId)
     publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "y");
 
-    backend->fault_key_substr = layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
+    backend->fault_key_substr = layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
     backend->fault_count = 1;
 
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
@@ -883,7 +883,7 @@ TEST(RefWriterAppendLane, WedgeResolutionJoinsTailCountersAndFoldsOverlay)
     const size_t tail_after_setup = store->tailSinceSnapshotCountForTest(ns);
 
     /// Wedge the lane: the single-attempt budget turns the ambiguous log PUT into an Unresolved outcome.
-    backend->fault_key_substr = layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
+    backend->fault_key_substr = layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
     backend->fault_count = 1;
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
@@ -927,7 +927,7 @@ TEST(RefWriterAppendLane, WedgedRefLaneCountTracksExactlyTheWedgedTableThroughIt
     publishEmptyPart(store, ns_b, "p");
     ASSERT_EQ(store->wedgedRefLaneCount(), 0u) << "both tables cached and healthy before the fault";
 
-    backend->fault_key_substr = layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns_a)) + "_log/";
+    backend->fault_key_substr = layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns_a)) + "_log/";
     backend->fault_count = 1;
 
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns_a, "x"); });
@@ -979,7 +979,7 @@ TEST(RefWriterAppendLane, I1AppendCorruptionSurfacesAndFencesTheMountForRemount)
 
     /// The next `_log` PUT for `ns` has a foreign different object land at its key; resolve-before-reissue
     /// then observes the mismatch and raises CORRUPTED_DATA.
-    backend->corrupt_key_substr = layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
+    backend->corrupt_key_substr = layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
     backend->corrupt_count = 1;
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { store->dropRef(ns, "x"); });
@@ -1039,7 +1039,7 @@ TEST(RefWriterAppendLane, I1WedgeResolveCorruptionSurfacesAndFaultsLane)
     publishEmptyPart(store, ns, "y");
 
     /// Wedge the lane with an ambiguous PUT that never landed.
-    backend->fault_key_substr = layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
+    backend->fault_key_substr = layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
     backend->fault_count = 1;
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
@@ -1108,7 +1108,7 @@ TEST(CasAnomalyPolicy, ForeignBytesAtWedgeKeyTripFenceAndRemount)
     store->setEventSink([&](const CasEvent & e) { seen.add(e); });
 
     /// Wedge the lane with an ambiguous PUT that never landed.
-    backend->fault_key_substr = layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
+    backend->fault_key_substr = layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
     backend->fault_count = 1;
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
@@ -1171,11 +1171,11 @@ TEST(CasAnomalyPolicy, NonReadyAtNewIdAllocationFaultsAndFailsClosed)
         String cursor;
         for (;;)
         {
-            const ListPage page = backend->list(layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)), cursor, 1000);
+            const ListPage page = backend->list(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)), cursor, 1000);
             for (const ListedKey & lk : page.keys)
             {
                 const auto parsed = layout.parseRefObjectKey(lk.key);
-                if (parsed && parsed->id.ns == ns && parsed->kind == RefObjectKind::Log)
+                if (parsed && parsed->life_id == NamespaceLifeId::stageATransition(ns).incarnation && parsed->kind == RefObjectKind::Log)
                     ++n;
             }
             if (page.next_cursor.empty())
@@ -1321,7 +1321,7 @@ TEST(RefTableCacheEviction, WedgedTableIsNeverEvicted)
     publishEmptyPart(store, ns_w, "x");
 
     /// Wedge ns_w's append lane with one ambiguous (Unresolved) PUT that exhausts the single-attempt budget.
-    backend->fault_key_substr = layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns_w)) + "_log/";
+    backend->fault_key_substr = layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns_w)) + "_log/";
     backend->fault_count = 1;
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns_w, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns_w));
@@ -2013,7 +2013,7 @@ TEST(RefWriterStalePrecommitSweep, BoundedBatchesAndInterruptionResumeAcrossMoun
     config.cas_request_budget = budget;
     auto successor = openPoolWithConfig(backend, config);
 
-    backend->fault_key_substr = layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
+    backend->fault_key_substr = layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
     /// The successor's own recovery runs first and mints one in-band seal for the dead predecessor
     /// epoch `e1` (its durable ids are `{e1,1}` and `{e1,2}`, so the seal lands at `{e1,3}`) -- that PUT
     /// shares this same `_log/` prefix, so it would eat the fault before the sweep ever gets a chance.
@@ -2065,11 +2065,12 @@ TEST(RefWriterStalePrecommitSweep, BoundedBatchesAndInterruptionResumeAcrossMoun
         String cursor;
         for (;;)
         {
-            const ListPage page = backend->list(layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)), cursor, 1000);
+            const ListPage page = backend->list(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)), cursor, 1000);
             for (const ListedKey & lk : page.keys)
             {
                 const auto parsed = layout.parseRefObjectKey(lk.key);
-                if (parsed && parsed->id.ns == ns && parsed->kind == RefObjectKind::Log && parsed->txn_id.writer_epoch != e1)
+                if (parsed && parsed->life_id == NamespaceLifeId::stageATransition(ns).incarnation
+                    && parsed->kind == RefObjectKind::Log && parsed->txn_id.writer_epoch != e1)
                     ++new_log_objects;
             }
             if (page.next_cursor.empty())
@@ -2130,7 +2131,7 @@ TEST(RefWriterStalePrecommitSweep, FailedSweepRearmsAndRetriesUntilClean)
 
     successor->setEventSink([&](const CasEvent & e) { seen.add(e); });
 
-    backend->fault_key_substr = layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
+    backend->fault_key_substr = layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
     /// The successor's own recovery runs first and mints one in-band seal for the predecessor's now-dead
     /// epoch (its three precommits are its only durable ids, so the seal takes the very next slot) --
     /// that PUT shares this same `_log/` prefix, so it would eat the fault before the sweep gets a turn.
@@ -2244,11 +2245,11 @@ std::optional<RefTxnId> listGreatestLogIdForTest(Backend & backend, const Layout
     String cursor;
     for (;;)
     {
-        const ListPage page = backend.list(layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)), cursor, 1000);
+        const ListPage page = backend.list(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)), cursor, 1000);
         for (const ListedKey & lk : page.keys)
         {
             const auto parsed = layout.parseRefObjectKey(lk.key);
-            if (parsed && parsed->id.ns == ns && parsed->kind == RefObjectKind::Log
+            if (parsed && parsed->life_id == NamespaceLifeId::stageATransition(ns).incarnation && parsed->kind == RefObjectKind::Log
                 && (!greatest || *greatest < parsed->txn_id))
                 greatest = parsed->txn_id;
         }
@@ -2273,7 +2274,7 @@ uint64_t seedTwinDrop(Backend & backend, const Layout & layout, const RootNamesp
 {
     uint64_t greatest_in_previous_epoch = 0;
     uint64_t previous_epoch = 0;
-    forEachListedKey(backend, layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)), [&](const ListedKey & lk)
+    forEachListedKey(backend, layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)), [&](const ListedKey & lk)
     {
         const auto parsed = layout.parseRefObjectKey(lk.key);
         if (!parsed || parsed->kind != RefObjectKind::Log)
@@ -2286,7 +2287,7 @@ uint64_t seedTwinDrop(Backend & backend, const Layout & layout, const RootNamesp
         }
     }, 1000);
 
-    const uint64_t twin_epoch = allocateWriterEpoch(backend, layout, "test");
+    const uint64_t twin_epoch = allocateWriterEpoch(backend, layout, "test", EpochMintPolicy::NormalMount, 0, [] { return RefCatalog{}; });
     RefLogTxn twin;
     twin.ns = ns.string();
     twin.txn_id = RefTxnId{twin_epoch, 1};
@@ -2389,7 +2390,7 @@ TEST(RefWriterRemount, DiscardsWedgeAndLaneRemainsUsable)
     publishEmptyPart(store, ns, "y");
 
     /// Wedge the lane with an ambiguous PUT that never landed server-side.
-    backend->fault_key_substr = layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
+    backend->fault_key_substr = layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
     backend->fault_count = 1;
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
@@ -2508,11 +2509,11 @@ TEST(RefWriterNamespaceRemoval, TxnNamesEveryOwnerThenRemoveNamespace)
         String cursor;
         for (;;)
         {
-            const ListPage page = backend->list(layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)), cursor, 1000);
+            const ListPage page = backend->list(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)), cursor, 1000);
             for (const ListedKey & lk : page.keys)
             {
                 const auto parsed = layout.parseRefObjectKey(lk.key);
-                if (parsed && parsed->id.ns == ns && parsed->kind == RefObjectKind::Log
+                if (parsed && parsed->life_id == NamespaceLifeId::stageATransition(ns).incarnation && parsed->kind == RefObjectKind::Log
                     && (!newest_log || *newest_log < parsed->txn_id))
                     newest_log = parsed->txn_id;
             }
@@ -2657,7 +2658,7 @@ TEST(RefWriterNamespaceRemoval, RemovalAppendFailureLeavesBuildAliveAndNamespace
     const ManifestId id = build->stageManifest({});
     build->precommitAdd(ns, "inflight", id);
 
-    backend->fault_key_substr = layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
+    backend->fault_key_substr = layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
     backend->fault_count = 1;
 
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropNamespace(ns); });
@@ -2826,8 +2827,8 @@ namespace
 /// epochs land strictly below the fresh writer's own, as `dead_region_nonempty` requires).
 void seedSealFixtureDeadEpochs(Backend & backend, const Layout & layout, const RootNamespace & ns)
 {
-    allocateWriterEpoch(backend, layout, "test");   /// burns epoch 1
-    allocateWriterEpoch(backend, layout, "test");   /// burns epoch 2
+    allocateWriterEpoch(backend, layout, "test", EpochMintPolicy::NormalMount, 0, [] { return RefCatalog{}; });   /// burns epoch 1
+    allocateWriterEpoch(backend, layout, "test", EpochMintPolicy::NormalMount, 0, [] { return RefCatalog{}; });   /// burns epoch 2
 
     RefLogTxn birth;
     birth.ns = ns.string();

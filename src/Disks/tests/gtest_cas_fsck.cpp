@@ -194,12 +194,42 @@ TEST(CasFsck, LifelessKeyIsRecordedAndTheHealthyNamespaceIsStillReported)
     EXPECT_EQ(rep.dangling, 0u);
 }
 
-/// Increment review Important C: fsck's namespace universe used to come from `listNamespaces` alone --
-/// a LIST-based union -- so a catalog-`Live` namespace whose ref objects LIST omits entirely was never
-/// walked at all. Admit `ns` into the catalog, publish one real ref-log record into it, then hide `ns`'s
-/// WHOLE ref-object prefix from LIST -- `listNamespaces` alone now finds nothing for `ns` at all, exactly
-/// the gap the review named. fsck must still reach it via the catalog-authoritative supplement
-/// (`CasRefCatalog::liveUniverse`, shared with `Gc::discoverUniverse`) and actually READ the record.
+/// Mutation caught: calling the destructive consumer's global `throwIfAmbiguous` from fsck aborts
+/// before the unique row is audited. The read-only tool reports the ambiguous physical id and
+/// continues through an unrelated unique namespace.
+TEST(CasFsck, DuplicateLifeIdIsReportedWhileAnUnrelatedUniqueNamespaceStillProgresses)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace unique_ns{"00/unique@cas@"};
+    const ManifestRef r = ref(1, 0xA1);
+    writeBlobBody(*backend, layout, DB::UInt128(1));
+    writeManifestRaw(*backend, layout, unique_ns, r, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, layout, unique_ns, "tbl", std::nullopt, r);
+
+    CasRefCatalog::Snapshot snapshot = CasRefCatalog::read(*backend, layout);
+    snapshot.catalog.entries.push_back(CatalogEntry{
+        .ns = RootNamespace{"bad/a"}, .state = NsState::Live, .incarnation = UInt128{777}});
+    snapshot.catalog.entries.push_back(CatalogEntry{
+        .ns = RootNamespace{"bad/b"}, .state = NsState::Removing, .incarnation = UInt128{777}});
+    std::sort(snapshot.catalog.entries.begin(), snapshot.catalog.entries.end(),
+        [](const CatalogEntry & lhs, const CatalogEntry & rhs) { return lhs.ns.string() < rhs.ns.string(); });
+    const auto catalog_head = backend->head(layout.refCatalogKey());
+    ASSERT_TRUE(catalog_head.exists);
+    ASSERT_EQ(backend->putOverwrite(layout.refCatalogKey(), encodeRefCatalog(snapshot.catalog), catalog_head.token).outcome,
+        PutOutcome::Done);
+
+    FsckReport report;
+    ASSERT_NO_THROW(report = runFsck(*store, /*detail=*/true));
+    EXPECT_GE(report.lifeless_keys, 1u);
+    EXPECT_GE(report.reachable, 1u) << "the unrelated unique namespace must still be audited";
+    EXPECT_EQ(report.dangling, 0u);
+}
+
+/// Fsck's namespace universe is catalog-authoritative. Admit `ns`, publish one real ref-log record,
+/// then hide its whole stream prefix from LIST. Fsck must still retain the namespace from the catalog
+/// cut and use the checkpoint-anchored arithmetic walk to read the record.
 ///
 /// Proves `ref_records_walked`, not `dangling`/`clean()`: `checkRefStream` (which this proves runs) has
 /// its own `_ckpt`-anchored arithmetic walk and so is reachable here, but the SEPARATE dangling-manifest
@@ -233,12 +263,12 @@ TEST(CasFsck, CatalogLiveNamespaceHiddenFromListIsStillWalked)
         encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{1}, .checkpoint_snapshot_id = std::nullopt,
                               .last_epoch_seal = std::nullopt})).outcome, PutOutcome::Done);
 
-    backend->hidePrefix(layout.refsNamespacePrefix(life));
+    backend->hidePrefix(layout.namespaceStreamPrefix(life));
 
     FsckReport rep;
     ASSERT_NO_THROW(rep = runFsck(*store, /*detail*/true));
     EXPECT_GT(backend->holesServed(), 0u)
-        << "the hide must actually have been exercised by listNamespaces, or this test passes vacuously";
+        << "the hide must actually have been exercised by the stream LIST, or this test passes vacuously";
     EXPECT_GE(rep.ref_records_walked, 1u)
         << "the namespace must be discovered and its stream actually read even when LIST omits every one "
            "of its keys, or the catalog-authoritative universe supplement did not run";
@@ -250,8 +280,8 @@ TEST(CasFsck, ReclaimablePrePrecommitBodyIsInfo)
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
-    /// Discovery is LIST-based (`listNamespaces` scans `cas/refs/`); seed a birth-only ref log so the
-    /// namespace is discoverable but holds NO committed owner -- the manifest body below is orphan debris.
+    /// Seed a birth-only ref log through the fixture helper, which also admits the catalog row, while
+    /// leaving NO committed owner; the manifest body below is orphan debris.
     appendRefLogSeed(*backend, store->layout(), ns, {});
     const ManifestRef r = ref(5, 0xAB);
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});   // body, no owner

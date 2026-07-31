@@ -567,7 +567,7 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
     std::vector<RefTxnId> hint_log_ids;
     std::set<RefTxnId> cleanup_markers;
     {
-        const String prefix = layout.refsNamespacePrefix(life);
+        const String prefix = layout.namespaceStreamPrefix(life);
         String cursor;
         for (;;)
         {
@@ -577,11 +577,9 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
                 const auto parsed = layout.parseRefObjectKey(lk.key);
                 if (!parsed)
                     continue;   /// not a ref-object key (the namespace's own `_ckpt`, for one)
-                /// Trust the parsed `ns` only when it names EXACTLY this namespace -- the same
-                /// checkNamespace-level guarantee the key builders enforce, not position math (the scoped
-                /// LIST prefix already implies this in practice, but a listed key is untrusted input and
-                /// is treated as such).
-                if (parsed->id.ns != ns)
+                /// The scoped LIST names one physical life. A returned key is accepted only when its
+                /// parsed id is exactly that captured life; logical authority remains the catalog row.
+                if (parsed->life_id != life.incarnation)
                     continue;
                 switch (parsed->kind)
                 {
@@ -2956,7 +2954,7 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
     /// catch replaces the two that used to sit around those steps separately (see the FAULT CLASS note on
     /// `prepareRefChunk` for the two statements whose catcher changed). The reachable ones are a rejected
     /// apply and a failed seal; an allocation failure anywhere inside is the same class, and so is the
-    /// `BAD_ARGUMENTS` that `layout.refLogKey` -> `refsNamespacePrefix` -> `checkNamespace` would raise
+    /// `BAD_ARGUMENTS` that `layout.refLogKey` -> `namespaceStreamPrefix` -> `checkNamespace` would raise
     /// for a malformed namespace -- unreachable here, since a mounted table's namespace already passed
     /// that check, but the list is not meant to read closed.
     std::optional<PreparedRefChunk> prepared;

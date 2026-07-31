@@ -27,7 +27,7 @@ TEST(CasBlobEnvelopeFormat, FixedLengthAndPadZone)
     const String head = encodeEnvelopeHeader(h, L);
     ASSERT_EQ(head.size(), L);                       /// exactly blob_header_len
     EXPECT_EQ(head[L - 1], '\n');                     /// terminator at byte 255
-    const String json = "{\"type\":\"cas_blob\",\"v\":5,\"tag\":\"0102030405060708090a0b0c0d0e0f10\","
+    const String json = "{\"type\":\"cas_blob\",\"v\":6,\"tag\":\"0102030405060708090a0b0c0d0e0f10\","
                         "\"bld\":\"1112131415161718191a1b1c1d1e1f20\",\"ts\":1752537600123,"
                         "\"by\":\"2122232425262728292a2b2c2d2e2f30\",\"op\":\"merge\",\"ch\":26006001,"
                         "\"ref\":\"t-abc/all_1_2_0\"}";
@@ -93,10 +93,10 @@ TEST(CasBlobEnvelopeFormat, GatesAndCriticalKey)
     wrong_type.replace(wrong_type.find("cas_blob"), 8, "cas_xxxx");
     EXPECT_THROW(decodeEnvelopeHeader(wrong_type, wrong_type.size(), ObjectKind::Blob), DB::Exception);
     String future = head;
-    future.replace(future.find("\"v\":5"), 5, "\"v\":6");
+    future.replace(future.find("\"v\":6"), 5, "\"v\":7");
     EXPECT_THROW(decodeEnvelopeHeader(future, future.size(), ObjectKind::Blob), DB::Exception);
     String out_of_range = head;
-    out_of_range.replace(out_of_range.find("\"v\":5"), 5, "\"v\":4294967299");
+    out_of_range.replace(out_of_range.find("\"v\":6"), 5, "\"v\":4294967299");
     try
     {
         decodeEnvelopeHeader(out_of_range, out_of_range.size(), ObjectKind::Blob);
@@ -130,7 +130,7 @@ TEST(CasFormatBattery, BlobEnvelope)
     /// The golden is CONSTRUCTED from the hand-pinned json literal (same one FixedLengthAndPadZone
     /// asserts) + the derived pad — NOT self-computed via encodeEnvelopeHeader, which would compare
     /// the encoder to itself and pin nothing.
-    const String json = "{\"type\":\"cas_blob\",\"v\":5,\"tag\":\"0102030405060708090a0b0c0d0e0f10\","
+    const String json = "{\"type\":\"cas_blob\",\"v\":6,\"tag\":\"0102030405060708090a0b0c0d0e0f10\","
                         "\"bld\":\"1112131415161718191a1b1c1d1e1f20\",\"ts\":1752537600123,"
                         "\"by\":\"2122232425262728292a2b2c2d2e2f30\",\"op\":\"merge\",\"ch\":26006001,"
                         "\"ref\":\"t-abc/all_1_2_0\"}";

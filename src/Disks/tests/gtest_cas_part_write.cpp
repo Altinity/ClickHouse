@@ -1299,8 +1299,8 @@ TEST(CasPartWriteTxn, TwoBuildsPublishToSameNamespaceBothLand)
 
 TEST(CasPartWriteTxn, FirstPublishMakesNamespaceDiscoverable)
 {
-    /// After Task 4 the registry is deleted; a namespace becomes discoverable via LIST(cas/refs/)
-    /// once its first ref shard exists (created by precommitAdd/promote).
+    /// After Task 4 the registry is deleted; the first publication admits the namespace to the
+    /// authoritative catalog before appending its stream record.
     auto b = std::make_shared<InMemoryBackend>();
     auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     const RootNamespace ns{"srv9/fresh"};
@@ -1308,7 +1308,7 @@ TEST(CasPartWriteTxn, FirstPublishMakesNamespaceDiscoverable)
     EXPECT_TRUE(s->listNamespaces("").namespaces.empty());
     publishOneBlobPart(s, ns, "part_1", "f", "reg-payload");
 
-    /// The namespace is now discoverable via LIST — no registry write needed.
+    /// The namespace is now discoverable from the catalog -- no registry write needed.
     const auto all = s->listNamespaces("").namespaces;
     ASSERT_EQ(all.size(), 1u);
     EXPECT_EQ(all[0], "srv9/fresh");
@@ -1809,7 +1809,7 @@ TEST(CasPartWriteTxn, AbandonRetryableAfterAppendFailure)
     const ManifestId mid = build->stageManifest({blobManifestEntry("data.bin", "kept")});
     build->precommitAdd(ns, "part_1", mid);
 
-    b->corrupt_key_substr = s->layout().refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
+    b->corrupt_key_substr = s->layout().namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
     b->corrupt_count = 1;
 
     /// First abandon(): the precommit-removal appendRefOps' single PUT observes a foreign object at its

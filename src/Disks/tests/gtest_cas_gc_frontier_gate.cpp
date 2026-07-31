@@ -157,7 +157,7 @@ PoolPtr buildCrossNamespaceScenario(const std::shared_ptr<CountingHintHoleBacken
     }
 
     publish(*backend, layout, hidden, "kept_ref", 1, blob);
-    backend->hidePrefix(layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(hidden)));
+    backend->hidePrefix(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(hidden)));
 
     const ManifestRef dropped = publish(*backend, layout, visible, "dropped_ref", 2, blob);
     dropRefTransition(*backend, layout, visible, "dropped_ref", dropped);
@@ -247,7 +247,7 @@ TEST(CasGcFrontierGate, TheSameBlobDrainsOnceHiddenGenuinelyProvesItsOwnFrontier
     /// exact key alone -- the arithmetic-intake mechanism this whole file is about, exercised honestly
     /// rather than declared past by fiat.
     dropRefTransition(*backend, layout, hidden, "kept_ref", kept);
-    backend->hidePrefix(layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(hidden)));
+    backend->hidePrefix(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(hidden)));
 
     const ManifestRef dropped = publish(*backend, layout, visible, "dropped_ref", 2, blob);
     dropRefTransition(*backend, layout, visible, "dropped_ref", dropped);
@@ -374,7 +374,7 @@ TEST(CasGcFrontierGate, EveryInventoriedDestructiveSiteIsInertUnderSuppression)
     EXPECT_EQ(backend->deleteCountForKeysContaining("/cas/manifests/"), 0u) << "manifest-body delete";
     EXPECT_EQ(backend->deleteCountForKeysContaining("/gc/gen/"), 0u)
         << "generation prune and hand-off reclaim";
-    EXPECT_EQ(backend->deleteCountForKeysContaining("/cas/refs/"), 0u)
+    EXPECT_EQ(backend->deleteCountForKeysContaining("/cas/ns/stream/"), 0u)
         << "covered-log / superseded-snapshot cleanup";
 
     EXPECT_TRUE(backend->head(blobKeyOf(layout, blob)).exists);
@@ -424,7 +424,7 @@ TEST(CasGcFrontierGate, AGenuinelyEmptyUniverseRefusesTheFrontierDespiteZeroEqua
     EXPECT_EQ(backend->deleteCountForKeysContaining("/cas/manifests/"), 0u) << "manifest-body delete";
     EXPECT_EQ(backend->deleteCountForKeysContaining("/gc/gen/"), 0u)
         << "generation prune and hand-off reclaim";
-    EXPECT_EQ(backend->deleteCountForKeysContaining("/cas/refs/"), 0u)
+    EXPECT_EQ(backend->deleteCountForKeysContaining("/cas/ns/stream/"), 0u)
         << "covered-log / superseded-snapshot cleanup";
     EXPECT_TRUE(backend->head(layout.blobKey(blob_ref)).exists);
 
@@ -647,7 +647,7 @@ TEST(CasGcFrontierGate, APartialProbeBudgetPublishesATallyThatMatchesTheSealedSe
 
     /// All three go unhinted at once, so the budget of one cannot cover them.
     for (const RootNamespace & ns : {a, b, c})
-        backend->hidePrefix(layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)));
+        backend->hidePrefix(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)));
 
     std::map<String, UInt64> intake;
     gc.setPhaseSink([&](const GcPhaseRecord & rec)
@@ -695,7 +695,7 @@ TEST(CasGcFrontierGate, AQuietKnownNamespaceCostsExactlyOneExactGet)
     ASSERT_NE(sealed, (RefTxnId{})) << "the seeding round must have sealed a cursor to carry";
 
     /// Now the store stops listing the namespace entirely.
-    backend->hidePrefix(layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(quiet)));
+    backend->hidePrefix(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(quiet)));
     backend->resetCounts();
     runRegularRoundReclaiming(gc);
 
@@ -724,7 +724,7 @@ TEST(CasGcFrontierGate, AWronglyQuietNamespaceIsWalkedTheSameRound)
 
     /// A second publish lands, and the store hides the namespace from every LIST at the same moment.
     publish(*backend, layout, quiet, "ref_2", 2, late_blob);
-    backend->hidePrefix(layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(quiet)));
+    backend->hidePrefix(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(quiet)));
 
     runRegularRoundReclaiming(gc);
 
@@ -758,7 +758,7 @@ TEST(CasGcFrontierGate, AnExhaustedProbeBudgetSealsCursorsAndDeletesNothing)
 
     /// The quiet namespace goes unhinted, and the budget is zero, so it is never probed. The busy
     /// namespace meanwhile drops its ref, which would otherwise condemn and delete the blob.
-    backend->hidePrefix(layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(quiet)));
+    backend->hidePrefix(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(quiet)));
     dropRefTransition(*backend, layout, busy, "busy_ref", mref);
 
     backend->resetCounts();
@@ -1057,9 +1057,8 @@ TEST(CasGcFrontierGateCleanupRange, ASnapshotAtTheCheckpointSurvivesAndOnlyStric
 /// The removed namespace's checkpoint object is the one ref object nothing else reclaims: the covered-
 /// log cleanup handles logs and snapshots, the Pending pass's two physical passes handle
 /// `cas/manifests/<ns>/` and the verbatim files, and `namespaceManifestsPhysicallyEmpty` -- which decides
-/// Pending -> Completed -- never looks under `cas/refs/` at all. A leaked `_ckpt` is therefore
-/// invisible to the completion condition while remaining visible to `serverRootSubtreeEmpty`, which
-/// leaves a fully drained server root permanently unreclaimable.
+/// Pending -> Completed -- never treats the state tree as stream input. A leaked `_ckpt` is therefore
+/// invisible to stream cleanup and must be removed through the namespace-lifecycle path.
 
 TEST(CasGcFrontierGate, ThePendingCleanupPassDeletesTheRemovedNamespaceCheckpoint)
 {

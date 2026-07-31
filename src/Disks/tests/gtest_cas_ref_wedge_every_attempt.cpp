@@ -267,7 +267,7 @@ private:
 /// The `_log/` key prefix of one namespace -- what every fault seam here matches on.
 String logPrefix(const PoolPtr & store, const RootNamespace & ns)
 {
-    return store->layout().refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
+    return store->layout().namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
 }
 
 /// Decode the ref-log object at `id`, through the SAME codec the writer's recovery uses (never a

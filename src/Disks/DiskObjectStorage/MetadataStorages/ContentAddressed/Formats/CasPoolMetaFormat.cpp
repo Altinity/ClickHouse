@@ -102,20 +102,16 @@ PoolMeta decodePoolMeta(std::string_view data)
     ReadBufferFromMemory in(data.data(), data.size());
     const TextHeader header = expectHeaderLine(in, FormatId::PoolMeta);
 
-    /// An older pool predates one of two breaking ref-layer changes this build cannot reconcile, so
+    /// An older pool predates a breaking ref-layer change this build cannot reconcile, so
     /// reject it before reading the metadata body. Writers always emit the current generation, while
     /// `expectHeaderLine` separately rejects a future generation that this build cannot understand.
-    /// `kNamespaceLifeKeyedGeneration` (Stage B's "format bump B") is checked rather than
-    /// `kContiguousRefStreamsGeneration` because it is the LATER of the two floors and therefore
-    /// subsumes it: every pool below `kNamespaceLifeKeyedGeneration` is also below
-    /// `kContiguousRefStreamsGeneration`, so one check names the binding reason without stacking a
-    /// second, now-redundant one for the earlier change.
-    if (header.v < kNamespaceLifeKeyedGeneration)
+    /// Generation 6 is the latest recreate-only grammar floor and subsumes the earlier stream floors.
+    if (header.v < kOpaqueNamespaceLifeLayoutGeneration)
         throw Exception(ErrorCodes::UNKNOWN_FORMAT_VERSION,
-            "CAS pool format {} predates namespace-life-keyed ref objects (recreate-only Stage B format "
-            "bump); recreate the pool. This build reads only per-namespace contiguous, incarnation-scoped "
-            "ref-log ids (generation {}+), and CAS is pre-release: there is no in-place migration.",
-            header.v, kNamespaceLifeKeyedGeneration);
+            "CAS pool format {} predates opaque namespace-life stream/state keys; recreate the pool. "
+            "This build reads only `cas/ns/stream/<life_id>` and `cas/ns/state/<life_id>` keys "
+            "(generation {}+), and CAS is pre-release: there is no in-place migration.",
+            header.v, kOpaqueNamespaceLifeLayoutGeneration);
 
     const String body = readLine(in, traitsFor(FormatId::PoolMeta).line_cap, "pool meta");
     ReadBufferFromMemory body_in(body.data(), body.size());

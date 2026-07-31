@@ -290,7 +290,7 @@ inline uint64_t appendRefLogSeed(
     /// incarnation's existing log/snap objects, wrongly conclude the table has none, and prepend a second
     /// `namespaceBirthOp` on top of a namespace that already has one.
     const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(backend, layout, ns);
-    const String prefix = layout.refsNamespacePrefix(life);
+    const String prefix = layout.namespaceStreamPrefix(life);
     uint64_t greatest_seq = 0;
     bool any_log_or_snap = false;
     String cursor;
@@ -403,12 +403,12 @@ inline void deleteManifestBody(
         backend.deleteExact(key, h.token);
 }
 
-/// Formerly wrote the namespace into `gc/registry` for GC discovery; after Task 4 discovery
-/// is LIST-based and a namespace is visible once any ref shard exists — no explicit registration.
+/// Formerly wrote the namespace into `gc/registry`. Real write helpers now admit the authoritative
+/// catalog row themselves, so this legacy fixture hook has no independent registration work.
 inline void registerNamespaceRaw(
     DB::Cas::Backend & /*backend*/, const DB::Cas::Layout & /*layout*/, const DB::Cas::RootNamespace & /*ns*/)
 {
-    /// No-op: Task 4 deleted the registry; LIST(cas/refs/) is now the discovery authority.
+    /// No-op: Task 4 deleted the registry; `cas/ref_catalog` is now the discovery authority.
 }
 
 /// Encode a CAGS document carrying only {round} — everything else defaulted. Callers that only care
@@ -974,9 +974,9 @@ inline void writeRefSnapshotRaw(
 
 /// Stage B (Task 4-C): admits `ns` into the catalog as a `Live` entry, IDEMPOTENTLY (a no-op once `ns`
 /// already carries any entry, of any state -- a test that drove one there itself through the real
-/// catalog API is left alone). Pinned to the Stage-A sentinel incarnation
+/// catalog API is left alone). Pinned to the deterministic Stage-A fixture incarnation
 /// (`NamespaceLifeId::stageATransition`), NOT `CasRefCatalog::createNamespace`'s fresh-random mint:
-/// every raw fixture below keys its ref-log/snapshot objects at that SAME sentinel, so a randomly
+/// every raw fixture below keys its ref-log/snapshot objects at that SAME derived id, so a randomly
 /// minted incarnation would not match them and the fold's own R10 incarnation filter
 /// (`{#r10-groupref-alias}`) would drop every one of their keys as belonging to a dead life --
 /// reproducing the exact 164-test failure this function exists to close, through a different door.
@@ -990,7 +990,7 @@ inline void writeRefSnapshotRaw(
 ///
 /// TWO DIVERGENCES from what `createNamespace`/`completeCreation` would produce, both deliberate and
 /// both left as-is rather than "fixed":
-///   1. the incarnation is the fixed sentinel, not a fresh random mint (the reason above);
+///   1. the incarnation is a deterministic namespace-derived fixture id, not a fresh random mint;
 ///   2. this entry reaches `Live` with NO `_ckpt` at all, whereas production only ever reaches `Live`
 ///      through `completeCreation`, which publishes `_ckpt` FIRST (INV-4). Several fixtures exist
 ///      SPECIFICALLY to build a table with no `_ckpt` (recovery grounding independent of the

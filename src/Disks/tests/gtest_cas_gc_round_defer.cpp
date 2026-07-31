@@ -1,4 +1,6 @@
 #include <gtest/gtest.h>
+
+#include <set>
 #include <limits>
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h>
@@ -145,6 +147,74 @@ TEST(CasGcRoundDefer, ChangedShardCountIsZeroWhenQuiescent)
 
     EXPECT_EQ(gc.listRefPrefixForTest(quiescent_state).changed_shards, 1u)
         << "one shard whose token advanced since the sealed generation must count as changed";
+}
+
+/// Mutation caught: widening the hot LIST from `cas/ns/stream/` to `cas/ns/` would offer `_ckpt` and
+/// `_files` state objects to the fold. The backend-observed result set must contain both immutable
+/// stream kinds and neither state kind.
+TEST(CasGcRoundDefer, HotEnumerationOffersLogsAndSnapshotsButNeverCheckpointOrFiles)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(RootNamespace{"name-must-not-appear"}, UInt128{0x123});
+    const RefTxnId id{1, 1};
+    const String log_key = layout.refLogKey(life, id);
+    const String snap_key = layout.refSnapshotKey(life, id);
+    const String ckpt_key = layout.refCkptKey(life);
+    const String file_key = layout.namespaceFileKey(life, "f");
+    ASSERT_EQ(backend->putIfAbsent(log_key, "log").outcome, PutOutcome::Done);
+    ASSERT_EQ(backend->putIfAbsent(snap_key, "snap").outcome, PutOutcome::Done);
+    ASSERT_EQ(backend->putIfAbsent(ckpt_key, "ckpt").outcome, PutOutcome::Done);
+    ASSERT_EQ(backend->putIfAbsent(file_key, "file").outcome, PutOutcome::Done);
+    backend->resetCounts();
+
+    Gc gc(store, kGc);
+    const RefScanSummary scan = gc.listRefPrefixForTest(GcState{});
+    const std::set<String> offered(scan.keys.begin(), scan.keys.end());
+    EXPECT_EQ(offered, (std::set<String>{log_key, snap_key}));
+    EXPECT_EQ(backend->listCount(layout.namespaceStreamRootPrefix()), 1u);
+    EXPECT_EQ(backend->listCount(layout.namespaceRootPrefix()), 0u);
+    EXPECT_EQ(backend->listCount(layout.namespaceStateRootPrefix()), 0u);
+}
+
+/// The cut precedes LIST. A life first observed by that LIST but absent from the earlier cut is
+/// post-cut/unknown, never inert debris, and forces the round to defer without reading its body.
+TEST(CasGcRoundDefer, LifeAbsentFromThePreListCatalogCutDefersTheRound)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    const NamespaceLifeId unknown = NamespaceLifeId::fromCatalogEntry(RootNamespace{"cannot-authorize"}, UInt128{0x456});
+    const String log_key = layout.refLogKey(unknown, RefTxnId{1, 1});
+    ASSERT_EQ(backend->putIfAbsent(log_key, "not-read-on-defer").outcome, PutOutcome::Done);
+    backend->resetCounts();
+
+    Gc gc(store, kGc);
+    const RoundReport report = gc.runRegularRound({}, /*allow_steal=*/true, UniversePolicy::AuthoritativeForTest);
+    EXPECT_TRUE(report.deferred);
+    EXPECT_EQ(backend->getCount(log_key), 0u);
+    EXPECT_EQ(backend->deleteTotal(), 0u);
+}
+
+/// The unknown-life gate covers every immutable stream kind, not only logs. A snapshot-only life does
+/// not contribute `changed_shards`, so forcing fold-every-round makes this test distinguish the safety
+/// defer from the ordinary idle-round optimization.
+TEST(CasGcRoundDefer, SnapshotLifeAbsentFromThePreListCatalogCutDefersTheRound)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    const NamespaceLifeId unknown = NamespaceLifeId::fromCatalogEntry(RootNamespace{"cannot-authorize"}, UInt128{0x457});
+    const String snapshot_key = layout.refSnapshotKey(unknown, RefTxnId{1, 1});
+    ASSERT_EQ(backend->putIfAbsent(snapshot_key, "not-read-on-defer").outcome, PutOutcome::Done);
+    backend->resetCounts();
+
+    Gc gc(store, kGc);
+    const RoundReport report = gc.runRegularRound({}, /*allow_steal=*/true, UniversePolicy::AuthoritativeForTest);
+    EXPECT_TRUE(report.deferred);
+    EXPECT_EQ(backend->getCount(snapshot_key), 0u);
+    EXPECT_EQ(backend->deleteTotal(), 0u);
 }
 
 /// ---- Task 4: the DEFER short-circuit wired into runRegularRound ----

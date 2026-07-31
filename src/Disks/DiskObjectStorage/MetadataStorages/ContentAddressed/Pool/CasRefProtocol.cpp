@@ -19,6 +19,56 @@ namespace ErrorCodes
 namespace DB::Cas
 {
 
+CatalogLifeIndex::CatalogLifeIndex(const RefCatalog & catalog)
+{
+    for (const CatalogEntry & entry : catalog.entries)
+    {
+        const NamespaceLifePhysicalId life_id = entry.incarnation;
+        if (auto ambiguous_it = ambiguous_names.find(life_id); ambiguous_it != ambiguous_names.end())
+        {
+            ambiguous_it->second.push_back(entry.ns.string());
+            continue;
+        }
+
+        const auto [it, inserted] = unique_lives.emplace(
+            life_id, NamespaceLifeId::fromCatalogEntry(entry.ns, life_id));
+        if (inserted)
+            continue;
+
+        std::vector<String> names;
+        names.push_back(it->second.ns.string());
+        names.push_back(entry.ns.string());
+        unique_lives.erase(it);
+        ambiguous_names.emplace(life_id, std::move(names));
+    }
+}
+
+bool CatalogLifeIndex::isAmbiguous(NamespaceLifePhysicalId life_id) const
+{
+    return ambiguous_names.contains(life_id);
+}
+
+std::optional<NamespaceLifeId> CatalogLifeIndex::resolve(NamespaceLifePhysicalId life_id) const
+{
+    if (const auto ambiguous_it = ambiguous_names.find(life_id); ambiguous_it != ambiguous_names.end())
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS ref catalog: life_id {} is shared by current namespaces '{}' and '{}' -- both rows are unresolvable",
+            renderIncarnation(life_id), ambiguous_it->second[0], ambiguous_it->second[1]);
+    if (const auto it = unique_lives.find(life_id); it != unique_lives.end())
+        return it->second;
+    return std::nullopt;
+}
+
+void CatalogLifeIndex::throwIfAmbiguous(std::string_view consumer) const
+{
+    if (ambiguous_names.empty())
+        return;
+    const auto & [life_id, names] = *ambiguous_names.begin();
+    throw Exception(ErrorCodes::CORRUPTED_DATA,
+        "{}: catalog life_id {} is shared by current namespaces '{}' and '{}' -- refusing a decision from an ambiguous cut",
+        consumer, renderIncarnation(life_id), names[0], names[1]);
+}
+
 namespace
 {
 
@@ -724,38 +774,23 @@ std::optional<RefTxnId> removalTxnId(const RefLogTxn & txn)
     return std::nullopt;
 }
 
-std::map<String, RefTableListing> groupRefKeys(const Layout & layout, const std::vector<String> & listed_keys)
+std::map<NamespaceLifePhysicalId, RefTableListing> groupRefKeys(
+    const Layout & layout, const std::vector<String> & listed_keys)
 {
     const String base = layout.casRefsPrefix();
-    std::map<String, RefTableListing> out;
+    std::map<NamespaceLifePhysicalId, RefTableListing> out;
 
     for (const String & key : listed_keys)
     {
         if (!key.starts_with(base))
             continue;
 
-        /// The `_ckpt` (spec INV-4) is a ref object with no transaction id, so it is classified FIRST
-        /// and separately: `parseRefObjectKey` cannot recognize it (it lives directly under the
-        /// namespace prefix, not in a kind directory), and reaching the throw below with a perfectly
-        /// legitimate `_ckpt` would abort ref folding for every round of every pool that has one.
-        if (const auto ckpt_ns = layout.parseRefCkptKey(key))
-        {
-            layout.validateNamespace(ckpt_ns->ns);
-            out[ckpt_ns->ns.string()].has_ckpt = true;
-            continue;
-        }
-
         const auto parsed = layout.parseRefObjectKey(key);
         if (!parsed)
             throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "groupRefKeys: key '{}' under the ref prefix is not a valid ref object -- aborting ref folding", key);
 
-        /// `parseRefObjectKey` reconstructs the namespace from the key WITHOUT checking
-        /// its shape. This is the first production consumer of that namespace, so re-validate it; a
-        /// malformed namespace throws (BAD_ARGUMENTS), which the round treats as a malformed key.
-        layout.validateNamespace(parsed->id.ns);
-
-        RefTableListing & table = out[parsed->id.ns.string()];
+        RefTableListing & table = out[parsed->life_id];
         switch (parsed->kind)
         {
             case RefObjectKind::Log:
@@ -770,7 +805,7 @@ std::map<String, RefTableListing> groupRefKeys(const Layout & layout, const std:
         }
     }
 
-    for (auto & [ns, table] : out)
+    for (auto & [life_id, table] : out)
     {
         std::sort(table.logs.begin(), table.logs.end());
         std::sort(table.snapshots.begin(), table.snapshots.end());
@@ -907,6 +942,13 @@ RecoveredRefTable recoverRefTableDetailed(Backend & backend, const Layout & layo
     /// `Creating` is excluded exactly as `Gc::discoverUniverse` excludes it: no publication can exist
     /// yet under that entry, so a life-less fallback is the correct answer for it too.
     const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(backend, layout, ns);
+    return recoverRefTableDetailed(backend, layout, life, on_page_fetched, max_restarts);
+}
+
+RecoveredRefTable recoverRefTableDetailed(Backend & backend, const Layout & layout, const NamespaceLifeId & life,
+                                          const std::function<void()> & on_page_fetched, unsigned max_restarts)
+{
+    const RootNamespace & ns = life.ns;
 
     for (unsigned attempt = 0;; ++attempt)
     {
@@ -916,7 +958,7 @@ RecoveredRefTable recoverRefTableDetailed(Backend & backend, const Layout & layo
         String cursor;
         for (;;)
         {
-            const ListPage page = backend.list(layout.refsNamespacePrefix(life), cursor, 1000);
+            const ListPage page = backend.list(layout.namespaceStreamPrefix(life), cursor, 1000);
             if (on_page_fetched)
                 on_page_fetched();
             for (const ListedKey & lk : page.keys)
@@ -931,10 +973,9 @@ RecoveredRefTable recoverRefTableDetailed(Backend & backend, const Layout & layo
                 /// (`CasOrphanManifestSweep`'s `activeManifestKeys` calls this function directly and
                 /// builds its protection set from the result, so a log omitted here would leave that log's
                 /// manifests unprotected):
-                /// the LIST base is this life's own prefix, so every key here begins `<ns>/<inc>/`. The
-                /// segment the parser judges is the one just before the kind directory, so a key of the
-                /// shape `<ns>/<inc>/_log/<id>` has `<inc>` there and parses -- a refusal therefore
-                /// requires at least one EXTRA segment between the life prefix and the kind directory.
+                /// The LIST base is this life's own stream prefix, so every canonical key begins at
+                /// `<life_id>/`. A parser refusal therefore requires an extra or malformed segment
+                /// between the life prefix and the kind directory.
                 /// Such a key is not `refLogKey(life, id)` for any id, so it is not a log of this life at
                 /// all, and skipping it removes nothing from the protection set.
                 std::optional<ParsedRefObjectKey> parsed;
@@ -947,7 +988,7 @@ RecoveredRefTable recoverRefTableDetailed(Backend & backend, const Layout & layo
                     if (e.code() != ErrorCodes::CORRUPTED_DATA)
                         throw;   /// not a key refusal: a real failure of the listing itself
                 }
-                if (parsed && parsed->id.ns == ns)
+                if (parsed && parsed->life_id == life.incarnation)
                 {
                     if (parsed->kind == RefObjectKind::Log)
                         logs.push_back(parsed->txn_id);
@@ -1021,6 +1062,12 @@ RefTableState recoverRefTable(Backend & backend, const Layout & layout, const Ro
                               const std::function<void()> & on_page_fetched, unsigned max_restarts)
 {
     return recoverRefTableDetailed(backend, layout, ns, on_page_fetched, max_restarts).state;
+}
+
+RefTableState recoverRefTable(Backend & backend, const Layout & layout, const NamespaceLifeId & life,
+                              const std::function<void()> & on_page_fetched, unsigned max_restarts)
+{
+    return recoverRefTableDetailed(backend, layout, life, on_page_fetched, max_restarts).state;
 }
 
 }

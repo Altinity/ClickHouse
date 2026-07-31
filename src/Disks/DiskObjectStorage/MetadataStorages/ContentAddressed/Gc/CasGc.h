@@ -202,7 +202,7 @@ struct GcPhaseRecord
 /// elsewhere (a unit test driving `Gc` directly emits nothing).
 using GcPhaseSink = std::function<void(const GcPhaseRecord &)>;
 
-/// THE ROUND'S ONE HINT ENUMERATION of `cas/refs/`, taken before the defer decision and consumed by
+/// The round's one hint enumeration of `cas/ns/stream/`, taken before the defer decision and consumed by
 /// everything downstream: the DEFER signal (`changed_shards`), and — on a folding round — the strict
 /// grouping the fold works from (`keys`, regrouped by `groupRefKeys`).
 ///
@@ -217,8 +217,13 @@ struct RefScanSummary
 {
     size_t changed_shards = 0;                          /// tables with a log above their sealed cursor
     std::vector<String> keys;                           /// every listed key, verbatim, for the fold's strict grouping
-    std::map<String, std::set<RefTxnId>> logs_by_ns;    /// Log-kind ids only, per namespace
-    std::map<String, RefTxnId> max_log_by_ns;           /// greatest Log-kind id per namespace
+    std::set<NamespaceLifePhysicalId> listed_lives;     /// every parsed stream kind, for the catalog-cut gate
+    std::map<NamespaceLifePhysicalId, std::set<RefTxnId>> logs_by_life;
+    std::map<NamespaceLifePhysicalId, RefTxnId> max_log_by_life;
+    /// The immutable catalog cut read before the hot LIST. Absent on diagnostic-only enumerations.
+    std::optional<CasRefCatalog::Snapshot> catalog_cut;
+    /// A listed id absent from the earlier cut is post-cut/unknown, never debris proof.
+    bool has_post_cut_unknown_life = false;
 };
 
 /// PROBE B2 — end-to-end transaction accounting for ONE round. Round-local, never persisted.
@@ -511,7 +516,7 @@ private:
     /// graduates once `condemn_round < current_round`, i.e. it survived at least one full round after
     /// being condemned. The fold no longer CASes gc/state — it sets (snap_generation, snap_attempt)
     /// in-memory; the SINGLE round CAS commits them.
-    /// `ref_scan` is the round's ONE enumeration of `cas/refs/` (see `RefScanSummary`); the fold regroups
+    /// `ref_scan` is the round's one enumeration of `cas/ns/stream/` (see `RefScanSummary`); the fold regroups
     /// its keys strictly rather than listing the prefix again.
     FoldResult fold(GcState & state, Token & state_token, RoundReport & report, uint64_t current_round,
                     const RefScanSummary & ref_scan, UniversePolicy policy);
@@ -660,7 +665,7 @@ private:
 
     /// Stage B (spec INV-3): the round's universe -- every namespace life the destructive gate may one
     /// day owe a frontier proof for -- is catalog-authoritative, ONE `cas/ref_catalog` `GET` replacing
-    /// the pool-wide `LIST(cas/refs/)` this used to run. `Creating` entries are excluded: no publication
+    /// the pool-wide `LIST(cas/ns/stream/)` this used to run. `Creating` entries are excluded: no publication
     /// can exist yet (spec §3), so there is nothing here for a discovery path to walk; `Live` and
     /// `Removing` entries are both returned, each minted via `NamespaceLifeId::fromCatalogEntry` directly
     /// from the row that is its own authority for both fields -- never from a listed key, which could
@@ -686,7 +691,7 @@ private:
     /// path surfaces it); a round must never silently defer on corrupt bookkeeping.
     bool graduationDue(const GcState & state, uint64_t current_round);
 
-    /// One full enumeration of `cas/refs/`: the raw keys plus a lenient per-namespace index of the
+    /// One full enumeration of `cas/ns/stream/`: the raw keys plus a lenient per-life index of the
     /// Log-kind ids among them. A malformed key lands in `keys` and is not indexed; `groupRefKeys` in
     /// the fold does the strict validation and the round-abort. This never throws on a malformed key,
     /// including the one shape `parseRefObjectKey` refuses by name -- see
@@ -701,7 +706,7 @@ private:
 
     /// THE STORE-QUALITY DETECTOR (historically "probe A"). SAMPLED on a deterministic cadence
     /// (`PoolConfig::gc_probe_a_period`): on a due round it performs ONE extra full enumeration of
-    /// `cas/refs/` and compares it against the round's own (`round_scan`).
+    /// `cas/ns/stream/` and compares it against the round's own (`round_scan`).
     ///
     ///   an id present in one enumeration, absent from the other, and STRICTLY BELOW the other
     ///   enumeration's maximum id for that same namespace CANNOT be a concurrent append.

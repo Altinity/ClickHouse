@@ -31,28 +31,23 @@ enum class RefObjectKind : uint8_t
     Snap,
 };
 
-/// The result of `Layout::parseRefObjectKey`: the namespace LIFE, ref-object kind, and canonical
-/// transaction identifier recovered from a listed key. `id` carries the incarnation the key spells,
-/// which may name a life the catalog no longer lists -- that is how a dead life is recognized rather
-/// than aliased. The namespace inside it is syntactically parsed here; callers that will use it for
-/// an operation must call `validateNamespace` before doing so.
+/// The result of `Layout::parseRefObjectKey`: the opaque physical life id, ref-object kind, and
+/// canonical transaction identifier recovered from a listed stream key. Logical resolution belongs
+/// to the immutable catalog cut held by the consumer, never to the key parser.
 struct ParsedRefObjectKey
 {
-    NamespaceLifeId id;
+    NamespaceLifePhysicalId life_id;
     RefObjectKind kind;
     RefTxnId txn_id;
 
     bool operator==(const ParsedRefObjectKey &) const = default;
 };
 
-/// The result of `Layout::parseNamespaceFileKey`: the namespace LIFE that owns a listed verbatim file
-/// and the file's name relative to that life's `_files/` prefix. `id` carries the incarnation the key
-/// spells, which may name a life the catalog no longer lists -- that is how debris of a dead life is
-/// recognized as such rather than mistaken for the current life's file. The namespace inside it is
-/// syntactically parsed; a caller that will USE it for an operation must `validateNamespace` first.
+/// The result of `Layout::parseNamespaceFileKey`: the opaque physical life id that owns a listed
+/// verbatim file and the file name relative to that life's `_files/` prefix.
 struct ParsedNamespaceFileKey
 {
-    NamespaceLifeId id;
+    NamespaceLifePhysicalId life_id;
     String relative_name;
 
     bool operator==(const ParsedNamespaceFileKey &) const = default;
@@ -74,16 +69,16 @@ struct ParsedBlobTargetRunKey
 ///
 /// `Layout` owns only the pool prefix; it does not own storage, cache state, or a pool-wide blob hash
 /// algorithm. Callers use its pure methods to derive keys for blobs, manifests, refs, verbatim files,
-/// and GC control data, and to classify listed keys before acting on them. Namespace-bearing key
-/// builders validate namespaces, while parsers deliberately return `std::nullopt` for foreign or
+/// and GC control data, and to classify listed keys before acting on them. Logical-name key builders
+/// validate namespaces, while parsers deliberately return `std::nullopt` for foreign or
 /// malformed listed keys so sweeps can treat those keys as debris without exceptions.
 ///
 /// Every key is built from a pool prefix and a stable path subtree. The main families are:
 ///   - content objects:  POOL/blobs/ALGO/S/HEX
 ///   - part manifests:   POOL/cas/manifests/NAMESPACE/BUILD/ORDINAL.zst
-///   - ref objects:      POOL/cas/refs/NAMESPACE/INCARNATION/_log|_snap|_cleanup/ID
-///                       POOL/cas/refs/NAMESPACE/INCARNATION/_ckpt
-///   - verbatim files:   POOL/roots/NAMESPACE/INCARNATION/_files/FILE_NAME
+///   - ref stream:       POOL/cas/ns/stream/LIFE_ID/_log|_snap|_cleanup/ID
+///   - namespace state:  POOL/cas/ns/state/LIFE_ID/_ckpt
+///                       POOL/cas/ns/state/LIFE_ID/_files/FILE_NAME
 ///   - GC state:         POOL/gc/...
 ///   - pool metadata:    POOL/_pool_meta
 ///
@@ -125,31 +120,35 @@ public:
     /// contract). Defined out-of-line in `CasLayout.cpp` alongside `blobKey` and `blobMetaKey`.
     std::optional<BlobRef> parseBlobKey(std::string_view key) const;
 
-    /// Life-scoped ref-object prefix: `<prefix>/cas/refs/<ns>/<inc>/` — the parent of ONE LIFE of a
-    /// table's `_log`/`_snap`/`_cleanup`/`_ckpt` objects. One LIST of it enumerates that life's
-    /// present ref objects (recovery, orphan-sweep tail read) and NOTHING of any earlier life of the
-    /// same namespace name, which is what makes a surviving old-incarnation object structurally inert
-    /// rather than aliased (INV-3).
-    String refsNamespacePrefix(const NamespaceLifeId & id) const
+    /// Immutable stream prefix for one physical life.
+    String namespaceStreamPrefix(const NamespaceLifeId & life) const
     {
-        checkNamespace(id.ns);
-        return prefix + "/cas/refs/" + id.ns.string() + "/" + renderIncarnation(id.incarnation) + "/";
+        return namespaceStreamRootPrefix() + renderIncarnation(life.incarnation) + "/";
     }
 
-    /// Pool-wide ref-object prefix: `<prefix>/cas/refs/`. The base of every ref object, used
-    /// by GC's one global discovery LIST and the strip-to-namespace step.
+    /// Point/path-addressed state prefix for one physical life.
+    String namespaceStatePrefix(const NamespaceLifeId & life) const
+    {
+        return namespaceStateRootPrefix() + renderIncarnation(life.incarnation) + "/";
+    }
+
+    /// Pool-wide immutable stream prefix. GC's one hot namespace enumeration is scoped here.
     String casRefsPrefix() const
     {
-        return prefix + "/cas/refs/";
+        return namespaceStreamRootPrefix();
     }
 
+    String namespaceStreamRootPrefix() const { return prefix + "/cas/ns/stream/"; }
+    String namespaceStateRootPrefix() const { return prefix + "/cas/ns/state/"; }
+    String namespaceRootPrefix() const { return prefix + "/cas/ns/"; }
+
     /// Immutable transaction log object at
-    /// `<prefix>/cas/refs/<ns>/<inc>/_log/<render>.zst`. The log is the text `cas_ref_log` stored with
+    /// `<prefix>/cas/ns/stream/<life_id>/_log/<render>.zst`. The log is the text `cas_ref_log` stored with
     /// the format's always-compressed `.zst` suffix; readers construct the one canonical key and do
     /// not try an uncompressed variant.
     String refLogKey(const NamespaceLifeId & ns_id, const RefTxnId & id) const
     {
-        return refsNamespacePrefix(ns_id) + "_log/" + renderRefTxnId(id) + String(storedSuffix(FormatId::RefLog));
+        return namespaceStreamPrefix(ns_id) + "_log/" + renderRefTxnId(id) + String(storedSuffix(FormatId::RefLog));
     }
 
     /// Writer-published table snapshot at `.../_snap/<render>.zst`. The snapshot
@@ -157,42 +156,31 @@ public:
     /// `X` reuses the `RefTxnId` of the last log it covers.
     String refSnapshotKey(const NamespaceLifeId & ns_id, const RefTxnId & id) const
     {
-        return refsNamespacePrefix(ns_id) + "_snap/" + renderRefTxnId(id) + String(storedSuffix(FormatId::RefSnapshot));
+        return namespaceStreamPrefix(ns_id) + "_snap/" + renderRefTxnId(id) + String(storedSuffix(FormatId::RefSnapshot));
     }
 
-    /// The life's checkpoint object (spec INV-4) at `<prefix>/cas/refs/<ns>/<inc>/_ckpt`. UNLIKE every
-    /// other ref object it is MUTABLE (token-CAS), carries no transaction id, and therefore lives
-    /// directly under the life prefix rather than in a `_log`/`_snap`/`_cleanup` kind directory --
+    /// The life's checkpoint object (spec INV-4) at `<prefix>/cas/ns/state/<life_id>/_ckpt`. Unlike
+    /// immutable stream objects it is mutable (token-CAS), carries no transaction id, and therefore lives
+    /// in the point/path-addressed state tree rather than a `_log`/`_snap`/`_cleanup` directory --
     /// which is also why `parseRefObjectKey` does not recognize it and `parseRefCkptKey` exists.
     String refCkptKey(const NamespaceLifeId & ns_id) const
     {
-        return refsNamespacePrefix(ns_id) + "_ckpt" + String(storedSuffix(FormatId::RefCkpt));
+        return namespaceStatePrefix(ns_id) + "_ckpt" + String(storedSuffix(FormatId::RefCkpt));
     }
 
-    /// Inverse of `refCkptKey`: returns the namespace LIFE when `key` is exactly one of OUR `_ckpt`
+    /// Inverse of `refCkptKey`: returns the opaque physical life id when `key` is exactly one of our `_ckpt`
     /// keys, and `std::nullopt` when the key is not one at all (a foreign pool prefix, a different
     /// leaf name, an id-bearing ref object) -- classifying an untrusted listed key stays an ordinary
-    /// "is this ours" question. The namespace inside the returned id is syntactically parsed here; a
-    /// caller that will USE it must `validateNamespace` first.
+    /// "is this ours" question. Logical resolution is a separate join against one catalog cut.
     ///
     /// It REFUSES, with `CORRUPTED_DATA` naming the key, a key whose leaf IS `_ckpt` but whose
     /// incarnation segment is missing, non-canonical or zero: behind Stage B's format bump the
     /// un-incarnated (Stage A) shape names no live object, and treating it as foreign debris would let
     /// it sit unnoticed under a live namespace.
     ///
-    /// Every sweep over `casRefsPrefix()` must consult BOTH this and `parseRefObjectKey` before calling
-    /// a key unrecognized: a `_ckpt` is a legitimate ref object, and `groupRefKeys` treats an
-    /// unrecognized one as corruption that aborts ref folding for the whole round.
-    ///
-    /// The incarnation segment is also what closes the ambiguity a bare `<something>/_ckpt` grammar
-    /// had. A namespace is an OPAQUE multi-segment string (the wiring composes `srv1/<uuid>`,
-    /// `shadow/<backup>/<uuid>`), so nothing used to distinguish a deeper real namespace from a
-    /// shallower one with a stray segment, and `<ns>/_log/_ckpt` parsed as the checkpoint of a phantom
-    /// namespace named `<ns>/_log`. Now the segment before the leaf must be a canonical incarnation,
-    /// so that key is refused instead. One residue is unavoidable and harmless: a namespace whose OWN
-    /// last segment happened to be 32 lower-case hex digits would be read one segment short. Nothing
-    /// in a key can resolve that, and no such key can exist in a pool this build wrote.
-    std::optional<NamespaceLifeId> parseRefCkptKey(std::string_view key) const;
+    /// Stream sweeps never consult this parser: checkpoints are deliberately outside the hot
+    /// `casRefsPrefix` enumeration.
+    std::optional<NamespaceLifePhysicalId> parseRefCkptKey(std::string_view key) const;
 
     /// Namespace-removal completion marker: a zero-byte object at
     /// `.../_cleanup/<render>` that GC publishes once the exact removal durably reaches `Completed`.
@@ -200,26 +188,20 @@ public:
     /// too -- a marker for one life must not be visible to the next.
     String refCleanupMarkerKey(const NamespaceLifeId & ns_id, const RefTxnId & id) const
     {
-        return refsNamespacePrefix(ns_id) + "_cleanup/" + renderRefTxnId(id);
+        return namespaceStreamPrefix(ns_id) + "_cleanup/" + renderRefTxnId(id);
     }
 
     /// Inverse of `refLogKey`/`refSnapshotKey`/`refCleanupMarkerKey`: classifies a LISTED key under
     /// `casRefsPrefix()` by its kind directory (`_cleanup`, `_log`, `_snap`) and parses the trailing
     /// `RefTxnId` and the life it belongs to. Strict: returns `std::nullopt` for anything that is not
-    /// one of OUR ref-object keys: a foreign top-level prefix, a missing namespace/kind/id segment, an
-    /// unrecognized kind directory (this also excludes a bare numeric-shard ref-key shape,
-    /// `cas/refs/<ns>/<shard>`, which has no kind directory at all), a `_log`/`_snap` id missing its
+    /// one of our ref-object keys: a foreign top-level prefix, a missing life/kind/id segment, an
+    /// unrecognized kind directory, a `_log`/`_snap` id missing its
     /// `.zst` suffix (both are always-compressed text), a `_cleanup` id carrying any
     /// extension, trailing garbage after the id, or a non-canonical `RefTxnId` render (delegates to
     /// `parseRefTxnId`).
     ///
-    /// It THROWS `CORRUPTED_DATA` naming the key in exactly one situation: the key IS one of our ref
-    /// objects -- known kind directory, canonical transaction id -- but the segment where its
-    /// incarnation belongs is missing, non-canonical or zero. That is the un-incarnated (Stage A)
-    /// shape, and behind Stage B's format bump it is corruption rather than a compatibility case:
-    /// classifying it as foreign debris would leave a Stage-A-shaped object sitting unnoticed under a
-    /// live namespace. The distinction matters to sweeps -- foreign debris must still be walked past
-    /// without an exception, which is why the refusal is reserved for keys already identified as ours.
+    /// It throws `CORRUPTED_DATA` when the key otherwise has a recognized stream-object shape but its
+    /// physical life-id segment is missing, non-canonical or zero. Logical names never come from keys.
     /// Defined out-of-line in `CasLayout.cpp`, where the key construction and parsing helpers remain
     /// together.
     std::optional<ParsedRefObjectKey> parseRefObjectKey(std::string_view key) const;
@@ -261,24 +243,21 @@ public:
     /// enumerates that life's files and nothing of any earlier life of the same namespace name.
     String namespaceFilesPrefix(const NamespaceLifeId & life) const
     {
-        checkNamespace(life.ns);
-        return prefix + "/roots/" + life.ns.string() + "/" + renderIncarnation(life.incarnation) + "/_files/";
+        return namespaceStatePrefix(life) + "_files/";
     }
 
-    /// Inverse of `namespaceFileKey`: classifies a LISTED key under `rootsPrefix()` by the reserved
+    /// Inverse of `namespaceFileKey`: classifies a listed key under `namespaceStateRootPrefix` by the reserved
     /// `_files` segment and returns the life it belongs to plus the name relative to that life's files
     /// prefix. Returns `std::nullopt` for anything that is not one of OUR namespace files: a foreign
-    /// top-level prefix, a key with no `_files` segment at all (a loose mountpoint object is a
-    /// legitimate inhabitant of `roots/`, never damage), or nothing after the reserved segment.
+    /// top-level prefix, a key with no `_files` segment at all, or nothing after the reserved segment.
     ///
     /// It THROWS `CORRUPTED_DATA` naming the key in the same one situation the ref parsers do: the key
     /// carries the reserved segment, but the segment where its incarnation belongs is missing,
     /// non-canonical or zero. Behind Stage B's format bump that is the un-incarnated (Stage A) shape,
     /// and classifying it as foreign debris would leave it sitting unnoticed under a live namespace.
     ///
-    /// The FIRST `_files` segment is the one that separates the life from the relative name. That is
-    /// unambiguous because `checkNamespace` rejects `_files` as a namespace segment, while a relative
-    /// NAME may contain it. Defined out-of-line in `CasLayout.cpp`, where the key construction and
+    /// The first `_files` segment separates the single life-id segment from the relative name; a
+    /// relative name may itself contain `_files`. Defined out-of-line in `CasLayout.cpp`, where the key construction and
     /// parsing helpers remain together.
     std::optional<ParsedNamespaceFileKey> parseNamespaceFileKey(std::string_view key) const;
 
@@ -310,7 +289,7 @@ public:
     /// A plain mountpoint object is a loose, non-content-addressed file mirrored at its
     /// ClickHouse path under `roots/`, with NO namespace and NO `_files` wrapper. `key` is the
     /// server-prefixed mirrored path (e.g. `srv1/clickhouse_access_check_abc`). It must NOT end in a
-    /// reserved area. Shard discovery is via `LIST(cas/refs/)` — not by key classification or a registry.
+    /// reserved area. Namespace discovery is catalog-authoritative, not derived from loose roots.
     /// The `_files`/`_pool_meta` reservations still apply to its segments via the path itself
     /// (these never appear in a real ClickHouse loose-file path).
     String mountpointObjectKey(const String & key) const
@@ -394,7 +373,7 @@ public:
     /// `CasFsck.cpp` already do this via `rfind('/')`).
     ///
     /// The S3-staging area lives under `<prefix>/staging/<mount_id>/` — a distinct top-level sibling of
-    /// `blobs/`, `cas/refs/`, and
+    /// `blobs/`, `cas/ns/`, and
     /// `cas/manifests/`, never a sub-path of any of them. Every GC blob-discovery LIST (`CasGc.cpp`,
     /// `CasFsck.cpp`) enumerates ONLY this `blobsPrefix()`, so a `staging/` object can never be listed,
     /// HEAD'd, or condemned as an orphan blob — `Cas::sweepOwnMountStaging` (`CasStagingSweeper.h`) is
@@ -442,13 +421,6 @@ public:
         return prefix + "/roots/" + server_root_id + "/";
     }
 
-    /// Per-server-root content-addressed ref subtree: `<prefix>/cas/refs/<srid>/`. It is included in
-    /// the mount-safety empty-root check even before the first ref is written.
-    String casRefsServerPrefix(const String & server_root_id) const
-    {
-        return prefix + "/cas/refs/" + server_root_id + "/";
-    }
-
     /// Per-server-root content-addressed manifest subtree: `<prefix>/cas/manifests/<srid>/`. It is
     /// included in the mount-safety empty-root check even before the first manifest is written.
     String casManifestsServerPrefix(const String & server_root_id) const
@@ -488,11 +460,8 @@ private:
     /// the key construction and parsing helpers remain together.
     void checkNamespace(const RootNamespace & ns) const;
 
-    /// Splits the `<ns>/<inc>` head shared by the ref-object parsers and the namespace-file parser,
-    /// once the rest of `key` has already identified it as one of ours. Never returns a partial answer:
-    /// an incarnation segment that is missing, non-canonical or zero, or a missing namespace, is refused
-    /// with `CORRUPTED_DATA` naming `key`.
-    NamespaceLifeId namespaceLifeOf(std::string_view key, std::string_view ns_and_incarnation) const;
+    /// Parses the one physical-id segment after the rest of a life-owned key identified its family.
+    NamespaceLifePhysicalId namespaceLifePhysicalIdOf(std::string_view key, std::string_view segment) const;
 
     /// Build <prefix>/<namespace>/<first2chars>/<id>.
     /// Throws BAD_ARGUMENTS if id is shorter than 2 characters.

@@ -1918,7 +1918,7 @@ public:
 /// (budgeted attempts + resolve-before-reissue), so an injected fault must be PERSISTENT to fail the
 /// publish — the controller exhausts its budget and `stageManifest` throws ABORTED out of `publishStaging`.
 /// Exactly one body per part (retries re-PUT the same per-part key), so counting FIRST attempts isolates
-/// part publishes one-for-one. Ref-log txns (`cas/refs/.../_log/...`), tree blobs (`blobs/`), GC state
+/// part publishes one-for-one. Ref-log txns (`cas/ns/stream/.../_log/...`), tree blobs (`blobs/`), GC state
 /// (`gc/`) and verbatim files are excluded.
 ///
 /// The suffix is taken from `storedSuffix(FormatId::PartManifest)` (the registered v3 stored suffix, now
@@ -2065,8 +2065,8 @@ TEST(CasWiringRead, UnsetPublishedAtMsReturnsEpoch)
 /// A RecordingLocalObjectStorage records the four IObjectStorage methods the CA emulated-mode backend
 /// uses on the commit path — writeObject (PUT), exists + getObjectMetadata (the HEAD), and readObject
 /// (the GET) — as (op_name, logical_key). "Logical" means the bare pool key (without the emu_root
-/// prefix) — the same string the Layout functions produce, so the `/blobs/`, `/trees/`, and
-/// root-shard ref (`/cas/refs/<ns>/<shard_number>`) substring tests are unambiguous.
+/// prefix) — the same string the Layout functions produce, so the `/blobs/`, `/trees/`, and opaque
+/// ref-stream (`/cas/ns/stream/<life_id>/`) substring tests are unambiguous.
 ///
 /// After commit the test asserts: the FIRST write that appends the create-precommit owner event (the
 /// first durable CAS to the target ROOT SHARD's key — owner_kind == Precommit; the converged rev. 15
@@ -2165,15 +2165,15 @@ std::shared_ptr<RecordingLocalObjectStorage> makeRecordingStorageForTest(const s
         DB::LocalObjectStorageSettings("test", root, /*read_only_=*/false));
 }
 
-/// True for a durable ref-object write key under `/cas/refs/`. In the snapshot+log ref model the
+/// True for a durable ref-object write key under `/cas/ns/stream/`. In the snapshot+log ref model the
 /// writer's first durable ref write on the precommit path is an immutable transaction-log object
-/// (`<...>/cas/refs/<namespace...>/_log/<txn-id>`); a published table snapshot is
-/// `<...>/_snap/<id>.proto`. The predicate anchors on whichever durable ref write comes first. It
+/// (`<...>/cas/ns/stream/<life_id>/_log/<txn-id>.zst`); a published table snapshot is
+/// `<...>/_snap/<txn-id>.zst`. The predicate anchors on whichever durable ref write comes first. It
 /// excludes blobs (`/blobs/`), part-manifests (`/cas/manifests/...`), GC state (`/gc/`), and verbatim
 /// files (`/_files/...`).
 bool isRefWriteKey(const std::string & key)
 {
-    if (key.find("/cas/refs/") == std::string::npos)
+    if (key.find("/cas/ns/stream/") == std::string::npos)
         return false;
     return key.find("/_log/") != std::string::npos || key.find("/_snap/") != std::string::npos;
 }

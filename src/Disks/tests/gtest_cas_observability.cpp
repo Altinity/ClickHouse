@@ -264,7 +264,8 @@ TEST(CasObservability, CaInspectDecodesRefSnapshotToJson)
     const RefTableSnapshot snap = minimalLiveSnapshot(ns.string(), snap_id,
         {committedRow("all_0_0_0", ManifestRef{.writer_epoch = 1, .build_sequence = 2, .manifest_ordinal = 1})});
     const String key = layout.refSnapshotKey(NamespaceLifeId::stageATransition(ns), snap_id);
-    const String json = caInspectToJson(layout, key, encodeRefTableSnapshot(snap));
+    const String json = caInspectToJson(
+        layout, key, encodeRefTableSnapshot(snap), NamespaceLifeId::stageATransition(ns));
     EXPECT_NE(json.find("ref_snapshot"), String::npos);
     EXPECT_NE(json.find("\"lifecycle\""), String::npos);
     EXPECT_NE(json.find("Live"), String::npos);
@@ -286,7 +287,8 @@ TEST(CasObservability, CaInspectDecodesRefLogToJson)
         ManifestRef{.writer_epoch = 1, .build_sequence = 2, .manifest_ordinal = 1}};
     txn.ops = {add};
     const String key = layout.refLogKey(NamespaceLifeId::stageATransition(ns), txn_id);
-    const String json = caInspectToJson(layout, key, encodeRefLogTxn(txn));
+    const String json = caInspectToJson(
+        layout, key, encodeRefLogTxn(txn), NamespaceLifeId::stageATransition(ns));
     EXPECT_NE(json.find("ref_log"), String::npos);
     EXPECT_NE(json.find("OwnerTransition"), String::npos);
     EXPECT_NE(json.find("all_0_0_0"), String::npos);

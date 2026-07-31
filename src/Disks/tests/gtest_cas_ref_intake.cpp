@@ -184,38 +184,28 @@ TEST(CasRefIntake, GroupRefKeys)
 {
     const Layout layout{"p"};
     const RootNamespace ns{"db/t"};
+    const NamespaceLifeId life = NamespaceLifeId::stageATransition(ns);
 
     std::vector<String> keys{
-        layout.refSnapshotKey(NamespaceLifeId::stageATransition(ns), rid(1, 4)),
-        layout.refLogKey(NamespaceLifeId::stageATransition(ns), rid(1, 5)),
-        layout.refLogKey(NamespaceLifeId::stageATransition(ns), rid(1, 3)),
-        layout.refCleanupMarkerKey(NamespaceLifeId::stageATransition(ns), rid(1, 2)),
-        layout.refCkptKey(NamespaceLifeId::stageATransition(ns)),        /// the checkpoint (spec INV-4): a ref object with no txn id
+        layout.refSnapshotKey(life, rid(1, 4)),
+        layout.refLogKey(life, rid(1, 5)),
+        layout.refLogKey(life, rid(1, 3)),
+        layout.refCleanupMarkerKey(life, rid(1, 2)),
+        layout.refCkptKey(life),        /// state-family keys are outside the hot stream LIST
         "p/cas/manifests/db/t/foo",   /// outside the ref prefix -> ignored
     };
     const auto grouped = groupRefKeys(layout, keys);
     ASSERT_EQ(grouped.size(), 1u);
-    const RefTableListing & t = grouped.at("db/t");
+    const RefTableListing & t = grouped.at(life.incarnation);
     EXPECT_EQ(t.logs, (std::vector<RefTxnId>{rid(1, 3), rid(1, 5)}));
     EXPECT_EQ(t.snapshots, (std::vector<RefTxnId>{rid(1, 4)}));
     EXPECT_EQ(t.cleanup_markers, (std::vector<RefTxnId>{rid(1, 2)}));
-    /// The checkpoint carries no transaction id, so it cannot join the three id vectors -- but it IS
-    /// one of the table's ref objects, and a listing that dropped it would report a table with a
-    /// checkpoint as indistinguishable from one without.
-    EXPECT_TRUE(t.has_ckpt);
-
-    /// And a table with no checkpoint says so, rather than defaulting to the same answer.
-    const auto no_ckpt = groupRefKeys(layout, {layout.refLogKey(NamespaceLifeId::stageATransition(ns), rid(1, 1))});
-    ASSERT_EQ(no_ckpt.size(), 1u);
-    EXPECT_FALSE(no_ckpt.at("db/t").has_ckpt);
+    /// Checkpoints live under `cas/ns/state/` and are deliberately absent from the hot stream listing.
 
     /// A key under the ref prefix that is not a valid ref object aborts (a leftover old-format shard key).
-    /// This is what makes the `_ckpt` arm above load-bearing rather than cosmetic: without it the
-    /// checkpoint would land HERE, and the first namespace to get one would abort ref folding for the
-    /// whole round, in every round, pool-wide.
-    EXPECT_THROW(groupRefKeys(layout, {"p/cas/refs/db/t/0"}), DB::Exception);
-    /// A malformed namespace (empty segment) under a valid kind directory aborts.
-    EXPECT_THROW(groupRefKeys(layout, {"p/cas/refs/db//_log/" + renderRefTxnId(rid(1, 1))}), DB::Exception);
+    EXPECT_THROW(groupRefKeys(layout, {"p/cas/ns/stream/0"}), DB::Exception);
+    /// A malformed physical id under a valid stream prefix aborts.
+    EXPECT_THROW(groupRefKeys(layout, {"p/cas/ns/stream/not-an-id/_log/" + renderRefTxnId(rid(1, 1))}), DB::Exception);
 }
 
 /// spec §Step 6: a log is deletable only under all three conditions; older snapshots may go too.
@@ -270,14 +260,15 @@ TEST(CasRefIntake, AdversarialNamespaceNamedLikeKindDirectory)
     for (const String & weird : {String("_log"), String("_snap"), String("_cleanup")})
     {
         const RootNamespace ns{weird};
+        const NamespaceLifeId life = NamespaceLifeId::stageATransition(ns);
         const std::vector<String> keys{
-            layout.refLogKey(NamespaceLifeId::stageATransition(ns), rid(1, 1)),
-            layout.refSnapshotKey(NamespaceLifeId::stageATransition(ns), rid(1, 2)),
-            layout.refCleanupMarkerKey(NamespaceLifeId::stageATransition(ns), rid(1, 3))};
+            layout.refLogKey(life, rid(1, 1)),
+            layout.refSnapshotKey(life, rid(1, 2)),
+            layout.refCleanupMarkerKey(life, rid(1, 3))};
         const auto grouped = groupRefKeys(layout, keys);
         ASSERT_EQ(grouped.size(), 1u) << "namespace '" << weird << "'";
-        ASSERT_TRUE(grouped.contains(weird)) << "namespace '" << weird << "'";
-        const RefTableListing & t = grouped.at(weird);
+        ASSERT_TRUE(grouped.contains(life.incarnation)) << "namespace '" << weird << "'";
+        const RefTableListing & t = grouped.at(life.incarnation);
         EXPECT_EQ(t.logs, (std::vector<RefTxnId>{rid(1, 1)})) << weird;
         EXPECT_EQ(t.snapshots, (std::vector<RefTxnId>{rid(1, 2)})) << weird;
         EXPECT_EQ(t.cleanup_markers, (std::vector<RefTxnId>{rid(1, 3)})) << weird;
@@ -288,13 +279,15 @@ TEST(CasRefIntake, AdversarialNamespaceNamedLikeKindDirectory)
     /// log to the outer table.
     const RootNamespace outer{"db/t"};
     const RootNamespace nested{"db/t/_log"};
+    const NamespaceLifeId outer_life = NamespaceLifeId::stageATransition(outer);
+    const NamespaceLifeId nested_life = NamespaceLifeId::stageATransition(nested);
     const std::vector<String> keys{
-        layout.refLogKey(NamespaceLifeId::stageATransition(outer), rid(7, 1)),
-        layout.refSnapshotKey(NamespaceLifeId::stageATransition(outer), rid(7, 2)),
-        layout.refLogKey(NamespaceLifeId::stageATransition(nested), rid(9, 1))};
+        layout.refLogKey(outer_life, rid(7, 1)),
+        layout.refSnapshotKey(outer_life, rid(7, 2)),
+        layout.refLogKey(nested_life, rid(9, 1))};
     const auto grouped = groupRefKeys(layout, keys);
     ASSERT_EQ(grouped.size(), 2u);
-    EXPECT_EQ(grouped.at("db/t").logs, (std::vector<RefTxnId>{rid(7, 1)}));
-    EXPECT_EQ(grouped.at("db/t").snapshots, (std::vector<RefTxnId>{rid(7, 2)}));
-    EXPECT_EQ(grouped.at("db/t/_log").logs, (std::vector<RefTxnId>{rid(9, 1)}));
+    EXPECT_EQ(grouped.at(outer_life.incarnation).logs, (std::vector<RefTxnId>{rid(7, 1)}));
+    EXPECT_EQ(grouped.at(outer_life.incarnation).snapshots, (std::vector<RefTxnId>{rid(7, 2)}));
+    EXPECT_EQ(grouped.at(nested_life.incarnation).logs, (std::vector<RefTxnId>{rid(9, 1)}));
 }

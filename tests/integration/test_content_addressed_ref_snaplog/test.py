@@ -12,10 +12,10 @@ RO_DISK = "disk_ca_ro"
 
 # Endpoint is http://rustfs1:11121/test/cas_snaplog_data/, so the pool lives under bucket `test`,
 # prefix `cas_snaplog_data/`. The snapshot+log ref protocol keeps a table's immutable transaction logs
-# and snapshots under cas/refs/, part manifests under cas/manifests/, and content blobs under blobs/.
+# and snapshots under cas/ns/stream/, part manifests under cas/manifests/, and content blobs under blobs/.
 POOL = "cas_snaplog_data"
 BLOBS_PREFIX = POOL + "/blobs/"
-REFS_PREFIX = POOL + "/cas/refs/"
+REFS_PREFIX = POOL + "/cas/ns/stream/"
 MANIFESTS_PREFIX = POOL + "/cas/manifests/"
 
 NUM_ROWS = 20000
@@ -97,8 +97,8 @@ def test_ref_snaplog_lifecycle_reclaims_and_fsck_clean():
     assert int(node.query("SELECT count() FROM ref_t1")) == NUM_INSERTS * NUM_ROWS
     assert int(node.query("SELECT count() FROM ref_t2")) == NUM_INSERTS * NUM_ROWS
 
-    # The snapshot+log ref format is actually in use: immutable ref objects exist under cas/refs/.
-    assert _count(REFS_PREFIX) > 0, "expected ref log/snapshot objects under cas/refs/"
+    # The snapshot+log ref format is actually in use: immutable ref objects exist under cas/ns/stream/.
+    assert _count(REFS_PREFIX) > 0, "expected ref log/snapshot objects under cas/ns/stream/"
     assert (
         _content_objects() > content_baseline
     ), "expected content objects to rise above baseline after inserts"

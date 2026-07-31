@@ -41,7 +41,12 @@ namespace DB::Cas
 /// obligation, so the key shapes and the bump that makes them the ONLY readable shape need not land in
 /// the same commit). `kNamespaceLifeKeyedGeneration` is the backward floor for this change, applied the
 /// same way `kContiguousRefStreamsGeneration` is.
-constexpr uint32_t G_BUILD = 5;
+///
+/// Generation 6 replaces that namespace-bearing grammar with opaque pool-wide life identifiers and
+/// splits hot ref streams from point-read state: `cas/ns/stream/<life_id>/...` contains `_log`, `_snap`
+/// and `_cleanup`, while `cas/ns/state/<life_id>/...` contains `_ckpt` and `_files`. A generation-5
+/// pool must be recreated; no dual parser or copy-forward path exists.
+constexpr uint32_t G_BUILD = 6;
 
 /// The pool-format generation at which ref-log ids became per-namespace and contiguous. Pool metadata
 /// below this value cannot be opened, because its ref streams carry holes this build reports as
@@ -59,6 +64,10 @@ constexpr uint32_t kContiguousRefStreamsGeneration = 4;
 /// generation-5 pool does not silently move this floor with it. Pools below the floor must be
 /// recreated; there is no migration path in the pre-release format.
 constexpr uint32_t kNamespaceLifeKeyedGeneration = 5;
+
+/// The recreate-only generation at which namespace text disappeared from physical life keys and hot
+/// ref streams were separated from point-read namespace state.
+constexpr uint32_t kOpaqueNamespaceLifeLayoutGeneration = 6;
 
 /// Stable identifiers for every self-describing persisted object class. The text registry uses the
 /// corresponding `type` string as the on-disk identity. Numeric values are part of the format history:

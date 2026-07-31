@@ -12,7 +12,7 @@ namespace DB::Cas
 {
 
 /// Provides the pool's plain-object surface: loose, non-content-addressed objects whose key is
-/// chosen by the caller. This covers namespace files under `roots/<ns>/<incarnation>/_files/` -- keyed
+/// chosen by the caller. This covers namespace files under `cas/ns/state/<life_id>/_files/` -- keyed
 /// by the namespace LIFE, never by its bare name -- and mountpoint objects mirrored by path. The object
 /// bodies are raw passthrough bytes; this component does not decode them as CAS metadata.
 ///

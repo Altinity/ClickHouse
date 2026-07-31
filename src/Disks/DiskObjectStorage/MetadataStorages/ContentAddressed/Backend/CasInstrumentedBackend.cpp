@@ -114,11 +114,11 @@ CasNs classifyCasNs(const String & key)
 {
     if (key.find("/blobs/") != String::npos)
         return CasNs::Blob;
-    /// Ref logs, snapshots, and cleanup markers are immutable objects under `cas/refs/<namespace>/`;
-    /// part manifests are under `cas/manifests/<namespace>/`. These paths must be classified before
+    /// Ref streams and namespace-owned state live under `cas/ns/`; part manifests are under
+    /// `cas/manifests/<namespace>/`. These paths must be classified before
     /// the generic `roots/` and `Other` cases, otherwise the ref and manifest operation counters
     /// silently accumulate in the wrong namespace.
-    if (key.find("/cas/refs/") != String::npos)
+    if (key.find("/cas/ns/") != String::npos)
         return CasNs::Root;
     if (key.find("/cas/manifests/") != String::npos)
         return CasNs::Manifest;

@@ -272,7 +272,7 @@ PoolPtr openWalkPool(const BackendPtr & backend, PoolConfig config = walkTestCon
 void burnEpochsUpTo(Backend & backend, const Layout & layout, uint64_t target_live_epoch)
 {
     for (uint64_t e = 1; e < target_live_epoch; ++e)
-        allocateWriterEpoch(backend, layout, "test");
+        allocateWriterEpoch(backend, layout, "test", EpochMintPolicy::NormalMount, 0, [] { return RefCatalog{}; });
 }
 
 /// One ordinary transaction at `id`, publishing `ref` (prepending the birth op when `birth`).

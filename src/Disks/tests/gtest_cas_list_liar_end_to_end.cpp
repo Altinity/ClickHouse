@@ -489,7 +489,7 @@ TEST(CasListLiarEndToEnd, TheSameBlobDrainsOnceHiddenGenuinelyProvesItsOwnFronti
     /// to read past a round's own listed tail even by exact key, so the drop would never fold no matter
     /// how many rounds ran.)
     dropAt(*backend, layout, hidden, RefTxnId{1, 2}, "kept_ref", kept);
-    backend->hidePrefix(layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(hidden)));
+    backend->hidePrefix(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(hidden)));
 
     publishAt(*backend, layout, visible, RefTxnId{1, 1}, "dropped_ref", 2, blob, /*birth=*/true);
     const ManifestRef dropped = publishedManifest(RefTxnId{1, 1}, 2);

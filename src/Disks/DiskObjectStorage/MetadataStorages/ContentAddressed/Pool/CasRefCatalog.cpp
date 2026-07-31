@@ -20,8 +20,12 @@ CasRefCatalog::Snapshot CasRefCatalog::read(Backend & backend, const Layout & la
 {
     const auto got = backend.get(layout.refCatalogKey());
     if (!got)
-        return Snapshot{.catalog = RefCatalog{}, .token = std::nullopt};
-    return Snapshot{.catalog = decodeRefCatalog(got->bytes), .token = got->token};
+    {
+        RefCatalog empty;
+        return Snapshot{.catalog = empty, .token = std::nullopt, .life_index = CatalogLifeIndex(empty)};
+    }
+    RefCatalog catalog = decodeRefCatalog(got->bytes);
+    return Snapshot{.catalog = catalog, .token = got->token, .life_index = CatalogLifeIndex(catalog)};
 }
 
 std::optional<NamespaceLifeId> CasRefCatalog::lifeIfCataloged(
@@ -30,7 +34,7 @@ std::optional<NamespaceLifeId> CasRefCatalog::lifeIfCataloged(
     const Snapshot snap = read(backend, layout);
     for (const CatalogEntry & entry : snap.catalog.entries)
         if (entry.ns.string() == ns.string() && entry.state != NsState::Creating)
-            return NamespaceLifeId::fromCatalogEntry(entry.ns, entry.incarnation);
+            return snap.life_index.resolve(entry.incarnation);
     return std::nullopt;
 }
 
@@ -47,6 +51,7 @@ NamespaceLifeId CasRefCatalog::resolveLifeOrSentinel(Backend & backend, const La
 std::vector<NamespaceLifeId> CasRefCatalog::liveUniverse(Backend & backend, const Layout & layout)
 {
     const Snapshot snap = read(backend, layout);
+    snap.life_index.throwIfAmbiguous("CAS live namespace discovery");
     std::vector<NamespaceLifeId> universe;
     universe.reserve(snap.catalog.entries.size());
     for (const CatalogEntry & entry : snap.catalog.entries)
@@ -81,6 +86,7 @@ RefCatalog casUpdateImpl(
 
     for (size_t attempt = 0; attempt < kMaxCatalogCasAttempts; ++attempt)
     {
+        snap.life_index.throwIfAmbiguous("CAS ref catalog mutation");
         const bool existed_before = snap.token.has_value();
         RefCatalog candidate = mutate(snap.catalog);
         const String bytes = encode(candidate);

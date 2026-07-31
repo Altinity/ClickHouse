@@ -1,13 +1,14 @@
 #include "cas_test_helpers.h"
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
+#include <algorithm>
+#include <atomic>
 #include <limits>
 #include <stdexcept>
 
 namespace DB::ErrorCodes
 {
     extern const int CORRUPTED_DATA;
-    extern const int S3_ERROR;
 }
 
 using namespace DB;
@@ -30,22 +31,13 @@ PoolPtr openVictim(std::shared_ptr<InMemoryBackend> backend)
 /// `CasOrphanManifestSweep.cpp`): a failure on one listed object must record a warning and let the rest
 /// of the sweep proceed, never abort the whole phase.
 ///
-/// Also fails any `get`/`list` whose key/prefix CONTAINS a designated namespace substring -- models a
-/// fully unreadable protection view (a corrupt snapshot / unavailable ref range) for exactly one
-/// namespace, without touching anything else. `victim/db2` in `ManifestDebrisPhaseFailuresWarnAndContinue`
-/// below carries NO ref objects of its own, so this cannot also break Task 2's namespace-erasure loop
-/// (`listNamespaces` never discovers it) -- it is reachable only from `sweepNamespace`'s
-/// `activeManifestKeys` call in the manifest-debris drain.
 class FailingDeleteBackend : public InMemoryBackend
 {
 public:
-    using InMemoryBackend::get;
-
     void failWithThrow(const String & key) { throw_key = key; }
     void failWithTokenMismatch(const String & key) { mismatch_key = key; }
-    void failNamespaceReads(const String & ns_substring) { unreadable_ns_substring = ns_substring; }
     /// Clears every injected failure -- the resume half of a fail-then-retry test (Task 4).
-    void disarm() { throw_key.clear(); mismatch_key.clear(); unreadable_ns_substring.clear(); }
+    void disarm() { throw_key.clear(); mismatch_key.clear(); }
 
     DeleteOutcome deleteExact(const String & key, const Token & token) override
     {
@@ -56,28 +48,9 @@ public:
         return InMemoryBackend::deleteExact(key, token);
     }
 
-    std::optional<GetResult> get(const String & key, Range range) override
-    {
-        maybeFailUnreadable(key);
-        return InMemoryBackend::get(key, range);
-    }
-
-    ListPage list(const String & prefix, const String & cursor, size_t limit) override
-    {
-        maybeFailUnreadable(prefix);
-        return InMemoryBackend::list(prefix, cursor, limit);
-    }
-
 private:
-    void maybeFailUnreadable(const String & key) const
-    {
-        if (!unreadable_ns_substring.empty() && key.find(unreadable_ns_substring) != String::npos)
-            throw Exception(ErrorCodes::S3_ERROR, "injected unreadable protection view for {}", key);
-    }
-
     String throw_key;
     String mismatch_key;
-    String unreadable_ns_substring;
 };
 
 /// Installs a same-UUID successor deterministically in the retirement tail's read/delete window.
@@ -335,6 +308,22 @@ void makeTableWithRefs(Pool & victim, const String & ns_str, uint64_t committed,
     Backend & backend = victim.backend();
     const Layout & layout = victim.layout();
 
+    /// Final physical ids are pool-wide. The generic raw-write helper intentionally uses one shared
+    /// transition sentinel, so this multi-namespace fixture admits a distinct deterministic test life
+    /// before invoking it; the helper then resolves and preserves that existing catalog identity.
+    const CasRefCatalog::Snapshot catalog = CasRefCatalog::read(backend, layout);
+    const auto existing = std::find_if(catalog.catalog.entries.begin(), catalog.catalog.entries.end(),
+        [&](const CatalogEntry & entry) { return entry.ns.string() == ns.string(); });
+    if (existing == catalog.catalog.entries.end())
+    {
+        static std::atomic<uint64_t> next_test_life{1000};
+        CatalogEntry entry;
+        entry.ns = ns;
+        entry.state = NsState::Live;
+        entry.incarnation = UInt128{next_test_life.fetch_add(1)};
+        CasRefCatalog::casAdmitEntry(backend, layout, entry);
+    }
+
     for (uint64_t i = 0; i < committed; ++i)
     {
         const ManifestRef ref{.writer_epoch = 1, .build_sequence = i + 1, .manifest_ordinal = 1};
@@ -444,6 +433,47 @@ TEST(CasDecommission, SecondConcurrentDecommissionRefused)
     {
         Pool::openForDecommission(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin2"}, "victim");
     });
+}
+
+TEST(CasDecommission, DuplicateLifeIdRefusesBeforeAnyNamespaceOrSlotMutation)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    { auto victim = openVictim(backend); }
+    const Layout layout("p");
+    RefCatalog catalog;
+    catalog.entries = {
+        CatalogEntry{.ns = RootNamespace{"victim/a"}, .state = NsState::Live, .incarnation = UInt128{77}},
+        CatalogEntry{.ns = RootNamespace{"victim/b"}, .state = NsState::Removing, .incarnation = UInt128{77}},
+    };
+    ASSERT_EQ(backend->putIfAbsent(layout.refCatalogKey(), encodeRefCatalog(catalog)).outcome, PutOutcome::Done);
+    const auto owner_before = backend->get(layout.ownerKey("victim"));
+    ASSERT_TRUE(owner_before);
+
+    EXPECT_THROW(decommissionPoolMember(
+        backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim"), DB::Exception);
+    const auto owner_after = backend->get(layout.ownerKey("victim"));
+    ASSERT_TRUE(owner_after);
+    EXPECT_EQ(owner_after->token, owner_before->token);
+}
+
+TEST(CasDecommission, VictimNameMatchesOneCanonicalPathComponent)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    { auto victim = openVictim(backend); }
+
+    const RootNamespace neighbor_ns{"victim2/db/t1"};
+    {
+        auto neighbor = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "victim2"});
+        makeTableWithRefs(*neighbor, neighbor_ns.string(), /*committed=*/1, /*precommits=*/0);
+    }
+
+    const auto report = decommissionPoolMember(
+        backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
+    EXPECT_EQ(report.namespaces_removed, 0u);
+
+    auto neighbor = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "victim2"});
+    EXPECT_EQ(neighbor->listRefs(neighbor_ns).size(), 1u)
+        << "decommissioning victim must not select victim2 by raw string prefix";
 }
 
 TEST(CasDecommission, ErasesAllVictimNamespaces)
@@ -654,17 +684,9 @@ TEST(CasDecommission, PerObjectFailureWarnsAndContinuesDrain)
         << "TokenMismatch means nothing was actually deleted -- the object survives";
 }
 
-/// Decommission REFUSES FAIL-CLOSE on a key that names no namespace life, and this is the one consumer
-/// of the namespace enumeration for which the tolerate-and-continue contract above is WRONG. It retires
-/// a pool slot on the strength of what the enumeration returned, so a list that silently omitted a
-/// namespace would let it release the slot with that namespace's data still under it. An incomplete
-/// universe cannot license retiring anything, so the command refuses to start.
-///
-/// This is a PIN, not a change of outcome: an escaping parse refusal already aborted this command. What
-/// the test holds is that making the enumeration tolerant did NOT make this consumer tolerant with it,
-/// and that the refusal now happens as a pre-flight check that names the key and counts the keys, before
-/// any drain phase runs.
-TEST(CasDecommission, LifelessKeyRefusesTheWholeCommandFailClose)
+/// Opaque physical debris carries no logical owner and therefore cannot widen or redirect
+/// decommission's catalog-derived victim set. Task 5's ownership-tree janitor owns that debris.
+TEST(CasDecommission, LifelessPhysicalKeyCannotRedirectCatalogOwnedDecommission)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     String lifeless;
@@ -677,33 +699,18 @@ TEST(CasDecommission, LifelessKeyRefusesTheWholeCommandFailClose)
         ASSERT_EQ(backend->putIfAbsent(lifeless, "garbage").outcome, PutOutcome::Done);
     }
 
-    try
-    {
-        decommissionPoolMember(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
-        FAIL() << "an incomplete namespace universe must not license retiring a slot";
-    }
-    catch (const DB::Exception & e)
-    {
-        EXPECT_EQ(e.code(), ErrorCodes::CORRUPTED_DATA);
-        EXPECT_NE(e.message().find(lifeless), String::npos)
-            << "the refusal must name the key an operator has to clear; message: " << e.message();
-    }
-
-    /// Nothing was retired: the healthy namespace's refs are untouched, so a re-run after the key is
-    /// cleared still has a slot to drain.
-    EXPECT_FALSE(backend->list(Layout("p").casRefsPrefix() + "victim/", "", 1).keys.empty());
+    const auto report = decommissionPoolMember(
+        backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
+    EXPECT_EQ(report.namespaces_removed, 1u);
+    EXPECT_TRUE(backend->head(lifeless).exists)
+        << "decommission must neither adopt nor delete an unowned physical life key";
 }
 
-/// Review finding (Task 3 fix): the manifest-debris drain (spec §core step 4) must honor the SAME
-/// tolerate-and-continue contract as `deleteListedPrefix` above -- it did not. Two failure classes,
-/// both inside `sweepNamespace` (`CasOrphanManifestSweep.cpp`): a per-key `deleteExact` that throws
-/// (`victim/db/t1`'s orphan body), and a namespace whose protection view is unreadable
-/// (`activeManifestKeys` throws for `victim/db2`, which carries NO ref objects of its own so Task 2's
-/// `listNamespaces` never touches it -- isolating this failure to the manifest-debris phase alone).
-/// Both must land in `report.warnings` (so `warnings.empty() == false`, the signal the future
-/// slot-deletion phase gates on) and neither may abort the run: the healthy `victim/db/t1` namespace
-/// erasure and the staging drain must still complete normally.
-TEST(CasDecommission, ManifestDebrisPhaseFailuresWarnAndContinue)
+/// The manifest-debris drain honors the same tolerate-and-continue contract as
+/// `deleteListedPrefix`: a per-key `deleteExact` failure becomes a warning, while the namespace
+/// erasure and subsequent staging drain continue. Protection reads now use opaque physical life
+/// prefixes, so a logical-name substring can no longer target an otherwise unlisted namespace.
+TEST(CasDecommission, ManifestDebrisDeleteFailureWarnsAndContinues)
 {
     auto backend = std::make_shared<FailingDeleteBackend>();
     String debris_key;
@@ -712,12 +719,8 @@ TEST(CasDecommission, ManifestDebrisPhaseFailuresWarnAndContinue)
         makeTableWithRefs(*victim, "victim/db/t1", 1, 0);
         const ManifestId debris_id = seedOrphanManifestBody(*victim, "victim/db/t1");
         debris_key = victim->layout().manifestKey(debris_id);
-        /// No makeTableWithRefs for "victim/db2" -- it has manifest debris but no ref objects, so
-        /// `listNamespaces` (Task 2) never lists it.
-        seedOrphanManifestBody(*victim, "victim/db2");
     }
     backend->failWithThrow(debris_key);
-    backend->failNamespaceReads("victim/db2");
     backend->putIfAbsent("p/staging/victim/upload_ok.tmp", "x");
 
     const auto report = decommissionPoolMember(
@@ -725,11 +728,9 @@ TEST(CasDecommission, ManifestDebrisPhaseFailuresWarnAndContinue)
 
     EXPECT_EQ(report.namespaces_removed, 1u)
         << "victim/db/t1's namespace erasure (Task 2) is untouched by either injected failure";
-    EXPECT_EQ(report.manifest_debris_removed, 0u)
-        << "neither group's body was actually deleted: t1's throws, db2's protection view never even "
-           "reaches the delete loop";
-    EXPECT_EQ(report.warnings.size(), 2u)
-        << "one warning for the thrown per-key delete, one for the unreadable protection view";
+    EXPECT_EQ(report.manifest_debris_removed, 0u);
+    EXPECT_EQ(report.warnings.size(), 1u)
+        << "the thrown per-key delete must keep the retirement tail fail-closed";
     EXPECT_EQ(report.staging_objects_removed, 1u)
         << "the staging phase still ran to completion after the manifest-debris phase's failures -- "
            "the whole command did not abort";
@@ -1056,13 +1057,11 @@ TEST(CasDecommission, ManifestDebrisFailureKeepsSlotThenResumes)
 /// mount-lease-present fallback ("partial hand-cleanup: adopt from the lease", `CasPool.cpp`) remains
 /// compatibility-critical for slots left by older binaries or manual repair.
 ///
-/// `claimOwnerOrThrow` (`CasServerRoot.cpp`) gates the owner-absent path a SECOND, stricter way: it
-/// only re-claims over a PROVABLY EMPTY data subtree (`serverRootSubtreeEmpty`: `cas/refs/<srid>/`,
-/// `cas/manifests/<srid>/`, `roots/<srid>/` all empty) -- an absent owner over EXISTING data means the
-/// identity was lost and must never be silently re-claimed. A victim with a real table trips this (its
-/// `cas/refs/victim/...` ref-log/snapshot debris is NEVER physically deleted by decommission itself --
-/// only GC's own later namespace-cleanup reclaims it -- so the subtree stays non-empty right after a
-/// real drain). This test therefore uses a victim with NO namespaces at all: identity persisted
+/// `claimOwnerOrThrow` (`CasServerRoot.cpp`) gates the owner-absent path a SECOND, stricter way: the
+/// same catalog cut must name no `Creating`, `Live` or `Removing` namespace under this canonical root,
+/// and the name-bearing `cas/manifests/<srid>/` and `roots/<srid>/` families must be empty. Opaque
+/// stream/state debris cannot be attributed to a server root and is deliberately inert. This test
+/// therefore uses a victim with NO namespaces at all: identity persisted
 /// (mount/owner/epoch exist from a real graceful close), data subtree genuinely empty -- the exact
 /// precondition the fallback is designed for. Simulate the crash directly: claim the slot once (exactly
 /// `decommissionPoolMember`'s own first step), let it close gracefully (the mount-lease keeper's

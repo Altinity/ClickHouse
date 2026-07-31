@@ -50,6 +50,14 @@ CatalogEntry liveEntry(const String & ns, uint64_t inc)
     return CatalogEntry{.ns = RootNamespace{ns}, .state = NsState::Live, .incarnation = UInt128(inc)};
 }
 
+CatalogEntry entryInState(const String & ns, NsState state, uint64_t inc)
+{
+    CatalogEntry entry{.ns = RootNamespace{ns}, .state = state, .incarnation = UInt128(inc)};
+    if (state == NsState::Creating)
+        entry.creator = CreatorFence{.server_root_id = "srv", .writer_epoch = 1, .fence_generation = 1};
+    return entry;
+}
+
 }
 
 /// ---------- format-battery registration ----------
@@ -64,7 +72,7 @@ TEST(CasFormatBattery, RefCatalog)
     runFormatBattery({FormatId::RefCatalog,
         [&] { return sealObject(FormatId::RefCatalog, encodeRefCatalog(c)); },
         [](std::string_view s) { decodeRefCatalog(std::string(openObject(FormatId::RefCatalog, s))); },
-        "{\"type\":\"cas_ref_catalog\",\"v\":5}\n"
+        "{\"type\":\"cas_ref_catalog\",\"v\":6}\n"
         "{\"k\":\"ent\",\"ns\":\"a\",\"st\":\"creating\",\"inc\":\"00000000000000000000000000000001\","
         "\"csr\":\"srv1\",\"cwe\":\"5\",\"cfg\":\"2\"}\n"
         "{\"k\":\"ent\",\"ns\":\"b\",\"st\":\"live\",\"inc\":\"00000000000000000000000000000002\"}\n"
@@ -92,6 +100,57 @@ TEST(CasRefCatalogFormat, RoundTripsAllThreeStates)
 TEST(CasRefCatalogFormat, EmptyCatalogRoundTrips)
 {
     EXPECT_EQ(decodeRefCatalog(encodeRefCatalog(RefCatalog{})), RefCatalog{});
+}
+
+/// Mutation caught: replacing the reverse index with `emplace`-and-ignore would make the first row
+/// win. Every lifecycle state participates, both duplicate ids are unresolvable, and an unrelated
+/// unique row remains usable by point resolution.
+TEST(CasRefCatalogLifeIndex, DuplicatePhysicalIdsAreAmbiguousWithoutPoisoningUniquePointResolution)
+{
+    RefCatalog catalog;
+    catalog.entries = {
+        entryInState("a-creating", NsState::Creating, 7),
+        entryInState("b-live", NsState::Live, 7),
+        entryInState("c-removing", NsState::Removing, 8),
+        entryInState("d-live", NsState::Live, 8),
+        entryInState("e-unique", NsState::Live, 9),
+    };
+
+    const CatalogLifeIndex index(catalog);
+    EXPECT_TRUE(index.isAmbiguous(UInt128{7}));
+    EXPECT_TRUE(index.isAmbiguous(UInt128{8}));
+    EXPECT_THROW(index.resolve(UInt128{7}), DB::Exception);
+    EXPECT_THROW(index.resolve(UInt128{8}), DB::Exception);
+    const auto unique = index.resolve(UInt128{9});
+    ASSERT_TRUE(unique);
+    EXPECT_EQ(unique->ns.string(), "e-unique");
+}
+
+/// Catalog mutation is destructive authority: any ambiguous current id stops the mutation before a
+/// candidate can be written. An unrelated unique point lookup remains available from the same cut.
+TEST(CasRefCatalogLifeIndex, AmbiguityStopsCatalogMutationButNotUnrelatedPointLookup)
+{
+    InMemoryBackend backend;
+    const Layout layout("p");
+    RefCatalog catalog;
+    catalog.entries = {
+        entryInState("a", NsState::Live, 7),
+        entryInState("b", NsState::Removing, 7),
+        entryInState("c", NsState::Live, 9),
+    };
+    ASSERT_EQ(backend.putIfAbsent(layout.refCatalogKey(), encodeRefCatalog(catalog)).outcome, PutOutcome::Done);
+    const auto before = backend.get(layout.refCatalogKey());
+    ASSERT_TRUE(before);
+
+    EXPECT_THROW(CasRefCatalog::casUpdate(backend, layout, [](const RefCatalog & current) { return current; }), DB::Exception);
+    const auto after = backend.get(layout.refCatalogKey());
+    ASSERT_TRUE(after);
+    EXPECT_EQ(after->token, before->token);
+    EXPECT_EQ(after->bytes, before->bytes);
+
+    const auto unique = CasRefCatalog::lifeIfCataloged(backend, layout, RootNamespace{"c"});
+    ASSERT_TRUE(unique);
+    EXPECT_EQ(unique->incarnation, UInt128{9});
 }
 
 TEST(CasRefCatalogFormat, NamespaceAtExactByteBoundRoundTrips)

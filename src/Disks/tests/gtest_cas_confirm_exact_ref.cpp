@@ -386,7 +386,7 @@ TEST(CasConfirmExactRef, UnrecoveredResidentTableIsUnknownWithZeroBackendRequest
     DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
 
     const size_t cached_before = store->refTablesCachedCountForTest();
-    backend->fail_list_once_prefix = store->layout().refsNamespacePrefix(NamespaceLifeId::stageATransition(ns));
+    backend->fail_list_once_prefix = store->layout().namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns));
     EXPECT_THROW(store->resolveRef(ns, "x"), DB::Exception);
 
     ASSERT_EQ(store->refTablesCachedCountForTest(), cached_before + 1u)
@@ -412,7 +412,7 @@ TEST(CasConfirmExactRef, RecoveryInProgressIsUnknownWithZeroBackendRequests)
     const RootNamespace ns{"srv1/confirm_recovering"};
     DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
 
-    backend->armBlockedList(store->layout().refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)));
+    backend->armBlockedList(store->layout().namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)));
     std::thread recoverer([&] { store->resolveRef(ns, "x"); });
     backend->awaitBlockedList();
 

@@ -451,7 +451,7 @@ TEST(CasRefGc, RemoveNamespaceCompletesAndPublishesMarkerDeterministically)
         runRegularRoundReclaiming(gc);
         store->renewWatermarkOnce();
         /// The marker key is `_cleanup/<remove_txn_id>`; discover it by listing the cleanup subtree.
-        const ListPage page = backend->list(layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)) + "_cleanup/", "", 100);
+        const ListPage page = backend->list(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)) + "_cleanup/", "", 100);
         if (!page.keys.empty())
         {
             marker_key = page.keys.front().key;
@@ -463,7 +463,7 @@ TEST(CasRefGc, RemoveNamespaceCompletesAndPublishesMarkerDeterministically)
     /// Capture the marker + published `Removed` snapshot bytes.
     const auto marker_after_gc1 = backend->get(marker_key);
     ASSERT_TRUE(marker_after_gc1.has_value());
-    ListPage snaps = backend->list(layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)) + "_snap/", "", 100);
+    ListPage snaps = backend->list(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)) + "_snap/", "", 100);
     ASSERT_FALSE(snaps.keys.empty()) << "a Removed snapshot must be published for the removed namespace";
     const String removed_snap_key = snaps.keys.front().key;
     const auto snap_after_gc1 = backend->get(removed_snap_key);
@@ -516,7 +516,7 @@ TEST(CasRefGc, RemoveNamespaceCompletesAndPublishesMarkerDeterministically)
 /// also clean the namespace's now-covered `_log` debris. The defect: `cleanupRefObjects` ran BEFORE
 /// `runNamespaceCleanupPasses` republished the `Removed` snapshot, so the completing round never saw its
 /// own covering snapshot; on a quiesced pool no later fold reruns cleanup with the snapshot visible, so
-/// the covered logs persist as `cas/refs/` debris indefinitely. Drive GC only until the removal completes
+/// the covered logs persist as `cas/ns/stream/` debris indefinitely. Drive GC only until the removal completes
 /// (the `_cleanup` marker appears) -- the natural quiescence point for a removed namespace, mirroring
 /// what a real GC scheduler reaches -- then assert the covered logs are gone, leaving only the
 /// constant-size `Removed` snapshot + `_cleanup` marker tombstone (spec §Object Layout: "Phase 1 never
@@ -547,7 +547,7 @@ TEST(CasRefGc, RemovedNamespaceCoveredLogsCleanedByCompletingRound)
     const auto countKind = [&](RefObjectKind want) -> size_t
     {
         size_t n = 0;
-        const ListPage page = backend->list(layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)), "", 10000);
+        const ListPage page = backend->list(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)), "", 10000);
         for (const ListedKey & lk : page.keys)
             if (const auto p = layout.parseRefObjectKey(lk.key); p && p->kind == want)
                 ++n;
@@ -560,7 +560,7 @@ TEST(CasRefGc, RemovedNamespaceCoveredLogsCleanedByCompletingRound)
     /// surfaces the ordering gap -- when the writer DOES publish, `cleanupRefObjects` already sees the
     /// covering snapshot from round one and the gap never bites.
     {
-        const ListPage snaps = backend->list(layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)) + "_snap/", "", 10000);
+        const ListPage snaps = backend->list(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)) + "_snap/", "", 10000);
         for (const ListedKey & lk : snaps.keys)
         {
             const auto h = backend->head(lk.key);
@@ -594,7 +594,7 @@ TEST(CasRefGc, RemovedNamespaceCoveredLogsCleanedByCompletingRound)
 }
 
 /// (8) A malformed/adversarial ref key aborts ref folding for the round: no partial delta, no cursor
-/// advance. The malformed key is a real object under `cas/refs/` whose `RefTxnId` render is invalid.
+/// advance. The malformed key is a real object under `cas/ns/stream/` whose `RefTxnId` render is invalid.
 TEST(CasRefGc, MalformedRefKeyAbortsRefFoldingNoPartialDelta)
 {
     auto backend = std::make_shared<InMemoryBackend>();
@@ -607,7 +607,8 @@ TEST(CasRefGc, MalformedRefKeyAbortsRefFoldingNoPartialDelta)
     publishCommittedTransition(*backend, layout, ns, "tbl", std::nullopt, r);
 
     /// Plant a malformed ref key under the ref prefix (a `_log` with a non-canonical id render).
-    backend->putIfAbsent(layout.casRefsPrefix() + ns.string() + "/_log/not-a-valid-txn-id", "garbage");
+    const NamespaceLifeId life = store->namespaceLife(ns);
+    backend->putIfAbsent(layout.namespaceStreamPrefix(life) + "_log/not-a-valid-txn-id", "garbage");
 
     Gc gc(store, kGc);
     /// The fold's `groupRefKeys` rejects the unrecognized key and ABORTS ref folding for the round (spec
@@ -622,18 +623,18 @@ TEST(CasRefGc, MalformedRefKeyAbortsRefFoldingNoPartialDelta)
         << "the durable cursor must not advance on an aborted round";
 }
 
-/// (8b) The un-incarnated (Stage A) key shape is the OTHER way a ref key can be malformed, and it must
+/// (8b) A non-canonical physical life segment is the OTHER way a ref key can be malformed, and it must
 /// land on exactly the path (8) pins -- abort ref folding, record the anomaly, COMPLETE the round.
 ///
 /// It gets its own test because the failure mode is worse than a lost round. The parser REFUSES this
 /// shape by name rather than returning `std::nullopt`, so it is the one malformed key that can throw
-/// from the round's global `cas/refs/` enumeration, which runs in `defer_decision` -- before the fold,
+/// from the round's global `cas/ns/stream/` enumeration, which runs in `defer_decision` -- before the fold,
 /// and outside the fold's catch. Escaping there does not merely fail one round: GC is the only thing
 /// that could ever delete the key, so a round that dies on it dies on it again every time, forever.
 /// The enumeration must therefore absorb the refusal per key and leave the key unindexed in
 /// `scan.keys`, exactly as it already does for every other malformed shape, and let `groupRefKeys`
 /// raise it once where the round is ready to catch it.
-TEST(CasRefGc, UnIncarnatedRefKeyAbortsRefFoldingWithoutWedgingTheRound)
+TEST(CasRefGc, NonCanonicalLifeKeyAbortsRefFoldingWithoutWedgingTheRound)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
@@ -644,12 +645,11 @@ TEST(CasRefGc, UnIncarnatedRefKeyAbortsRefFoldingWithoutWedgingTheRound)
     writeManifestRaw(*backend, layout, ns, r, {blobEntryFor("a", DB::UInt128(1))});
     publishCommittedTransition(*backend, layout, ns, "tbl", std::nullopt, r);
 
-    /// A ref log at the un-incarnated Stage A shape `<ns>/_log/<id>.zst`. Built by hand because no
-    /// helper can mint one any more -- which is the point: only a foreign or corrupt writer can put
-    /// this key here, and the pool must survive finding it.
-    const String un_incarnated =
+    /// A ref log whose supposed life segment contains logical namespace text rather than one canonical
+    /// opaque id. Only a foreign or corrupt writer can put this key here, and the pool must survive it.
+    const String noncanonical_life =
         layout.casRefsPrefix() + ns.string() + "/_log/" + renderRefTxnId(RefTxnId{1, 1}) + ".zst";
-    ASSERT_EQ(backend->putIfAbsent(un_incarnated, "garbage").outcome, PutOutcome::Done);
+    ASSERT_EQ(backend->putIfAbsent(noncanonical_life, "garbage").outcome, PutOutcome::Done);
 
     Gc gc(store, kGc);
     RoundReport rep;
@@ -668,7 +668,7 @@ TEST(CasRefGc, UnIncarnatedRefKeyAbortsRefFoldingWithoutWedgingTheRound)
 
     /// The wedge is only visible over time: the key is still there (nothing deletes it), so a second
     /// round meets it again. It must survive that one too.
-    ASSERT_TRUE(backend->head(un_incarnated).exists) << "precondition: nothing removed the key";
+    ASSERT_TRUE(backend->head(noncanonical_life).exists) << "precondition: nothing removed the key";
     ASSERT_NO_THROW(gc.runRegularRound()) << "a round that dies on this key would die on it forever";
 }
 
@@ -973,7 +973,7 @@ TEST(CasRefGc, RecreatedNamespaceRetiresCleanupItemAndStopsChurn)
     {
         runRegularRoundReclaiming(gc);
         store->renewWatermarkOnce();
-        const ListPage m = backend->list(layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)) + "_cleanup/", "", 10);
+        const ListPage m = backend->list(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)) + "_cleanup/", "", 10);
         if (!m.keys.empty())
         {
             const auto p = layout.parseRefObjectKey(m.keys.front().key);
@@ -1045,7 +1045,7 @@ TEST(CasRefGc, CompletedItemRepublishesCrashLostRemovedSnapshotThenRetires)
     {
         runRegularRoundReclaiming(gc);
         store->renewWatermarkOnce();
-        const ListPage m = backend->list(layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)) + "_cleanup/", "", 10);
+        const ListPage m = backend->list(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)) + "_cleanup/", "", 10);
         if (!m.keys.empty())
         {
             const auto p = layout.parseRefObjectKey(m.keys.front().key);

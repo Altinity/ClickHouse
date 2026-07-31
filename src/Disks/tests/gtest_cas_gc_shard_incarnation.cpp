@@ -105,27 +105,31 @@ TEST(CasGcShardIncarnation, DiscoveryEqualsPresentShards)
     }
 }
 
-/// Increment review NEW-1: an incarnation MISMATCH, not entry absence. C1's fix (above) refuses to walk
-/// a namespace the catalog does not name AT ALL; it does nothing when the catalog names the namespace at
-/// an incarnation whose key space is empty while a DIFFERENT (dead) incarnation of the SAME name has
-/// listed ref objects. Simulated here the same way `DiscoveryEqualsPresentShards`'s case (c) simulates
-/// "the catalog forgot" -- raw catalog manipulation standing in for a removal API that does not exist
-/// yet (`CasRefCatalog` has no entry-deletion primitive): admit `ns` Live at incarnation A, publish one
-/// real ref-log record under it, then swap the SAME catalog entry to a DIFFERENT incarnation B with
-/// nothing written under it at all. `A`'s record is now exactly the shape NEW-1 names: a non-current
-/// incarnation with listed objects, sitting next to a current incarnation that contributed nothing.
-/// Without the fix this reads as a vacuously-complete frontier (0 of 0 needed at incarnation B, and
-/// incarnation A's key was dropped as "ordinary dead-incarnation debris" by R10/I1); the fix must instead
-/// raise it as an anomaly and suppress the round.
-///
-/// PURPOSE, for whoever sees this go red after touching the fold: this pins the MISMATCH half of the
-/// safety property (its sibling below, `UncatalogedNamespaceWithRealObjectsLeavesTheRoundIncomplete`,
-/// pins the ABSENT-ENTIRELY half). Neither half is enforced by any single explicit check -- a
-/// catalog-derivation predicate was traced and found to add nothing a refactor could independently
-/// break (see the NEW-1 report) -- so a red result here means a REFACTOR DECOUPLED the pieces that
-/// jointly produce this outcome (the R10 dead-incarnation filter, `live_incarnation`'s own construction,
-/// and this detector), not that the test went stale.
-TEST(CasGcShardIncarnation, IncarnationMismatchWithoutEntryAbsenceIsAnAnomaly)
+/// Catalog ambiguity stops destructive GC and REBUILD before either can derive authority from a
+/// first row. No attempted delete is allowed on the rejected regular round.
+TEST(CasGcShardIncarnation, DuplicateLifeIdStopsDestructiveRoundAndRebuild)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_shards = 1});
+    const Layout & layout = store->layout();
+    RefCatalog catalog;
+    catalog.entries = {
+        CatalogEntry{.ns = RootNamespace{"a"}, .state = NsState::Live, .incarnation = UInt128{77}},
+        CatalogEntry{.ns = RootNamespace{"b"}, .state = NsState::Removing, .incarnation = UInt128{77}},
+    };
+    ASSERT_EQ(backend->putIfAbsent(layout.refCatalogKey(), encodeRefCatalog(catalog)).outcome, PutOutcome::Done);
+    backend->resetCounts();
+
+    Gc gc(store, hexToU128("0000000000000000000000000000000a"));
+    EXPECT_THROW(gc.runRegularRound({}, /*allow_steal=*/true, UniversePolicy::AuthoritativeForTest), DB::Exception);
+    EXPECT_EQ(backend->deleteTotal(), 0u);
+    EXPECT_THROW(gc.rebuildBaseline(/*force=*/true), DB::Exception);
+}
+
+/// A physical life id carries no reversible logical namespace component. Once the catalog moves a
+/// logical name to a new life, the former stream is opaque debris: it cannot redirect GC to that name,
+/// cannot suppress the round, and is left intact for a separately-authorized cleanup path.
+TEST(CasGcShardIncarnation, DeadLifeStreamIsOpaqueInertDebris)
 {
     std::shared_ptr<InMemoryBackend> backend;
     auto store = makePoolWithShards(backend, /*gc_shards=*/1);
@@ -136,6 +140,7 @@ TEST(CasGcShardIncarnation, IncarnationMismatchWithoutEntryAbsenceIsAnAnomaly)
     CasRefCatalog::casAdmitEntry(*backend, layout, CatalogEntry{.ns = ns, .state = NsState::Live,
         .incarnation = UInt128(11), .creator = std::nullopt});   // Live forbids a creator fence
     appendRefLogSeed(*backend, layout, ns, {});   // one real record, keyed at incarnation 11
+    const NamespaceLifeId dead_life = NamespaceLifeId::fromCatalogEntry(ns, UInt128(11));
 
     {
         CasRefCatalog::Snapshot snap = CasRefCatalog::read(*backend, layout);
@@ -150,36 +155,13 @@ TEST(CasGcShardIncarnation, IncarnationMismatchWithoutEntryAbsenceIsAnAnomaly)
     }
 
     const RoundReport report = gc.runRegularRound({}, /*allow_steal=*/true, UniversePolicy::AuthoritativeForTest);
-    /// Final review F4: `!anomalies.empty()` alone passes for any anomaly from any cause -- a future
-    /// change that raises a DIFFERENT anomaly for this same fixture (or moves the un-cataloged branch
-    /// to cover this shape instead of the detector) leaves this green while the detector itself is
-    /// dead. Assert the namespace AND a substring of the detector's own reason text.
-    const auto anomaly = std::find_if(report.anomalies.begin(), report.anomalies.end(),
-        [&](const RoundAnomaly & a) { return a.ns.string() == ns.string(); });
-    ASSERT_NE(anomaly, report.anomalies.end())
-        << "a current incarnation with zero footprint next to a different incarnation's real objects "
-           "must be refused, not read as a vacuously-complete frontier";
-    EXPECT_NE(anomaly->reason.find("DIFFERENT incarnation of the same name has listed ref objects"), String::npos)
-        << "the anomaly for this namespace must be the NEW-1 detector's own, not some other anomaly "
-           "that happens to also fire for this fixture: " << anomaly->reason;
+    EXPECT_TRUE(report.anomalies.empty());
+    EXPECT_FALSE(backend->list(layout.namespaceStreamPrefix(dead_life), "", 100).keys.empty());
 }
 
-/// Final review F2: the sibling above only asserts an anomaly IS raised, which passes for any anomaly
-/// from any cause -- a future edit that widens the detector's trigger (dropping the `ref_tables` term,
-/// or reordering the check above `readCheckpointWitnesses`) could make EVERY ordinary rebirth raise an
-/// anomaly and this suite would stay green. This is the negative row: same swapped-incarnation setup,
-/// but the CURRENT incarnation genuinely contributes -- its own freshly published `_ckpt`, exactly what
-/// a successor's `completeCreation` durably leaves first -- and the round must raise NOTHING for it.
-///
-/// Deliberately the harder shape, not the easy one: the fresh `_ckpt` is published but withheld from
-/// LIST (`HintHoleBackend`), the exact "fresh-key omission" scenario review F3 fixed (a rebirth whose
-/// new `_ckpt` a store's LIST has not yet caught up to). With F3's fix this still raises nothing (the
-/// `backend.head` reads it by exact key, independent of the listing); without F3's fix this row would
-/// have failed the moment F1's own exemption logic did NOT apply (this is a `Live` swap, not a
-/// `Creating` one) -- which is what "this row would also have caught F3" means: a negative row using
-/// the EASY shape (a LISTED current-incarnation object, going through `ref_tables` alone) would never
-/// have exercised the `_ckpt`-independent-witness gap at all.
-TEST(CasGcShardIncarnation, IncarnationMismatchWhereCurrentIncarnationHasAFreshUnlistedCheckpointRaisesNoAnomaly)
+/// Checkpoints live in the state tree and are read by exact key from the catalog cut. They are never
+/// discovered through the hot stream LIST, so hiding one from LIST must not affect the round.
+TEST(CasGcShardIncarnation, CurrentLifeCheckpointIsReadByExactKeyOutsideHotList)
 {
     auto backend = std::make_shared<HintHoleBackend>();
     auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_shards = 1});
@@ -204,8 +186,8 @@ TEST(CasGcShardIncarnation, IncarnationMismatchWhereCurrentIncarnationHasAFreshU
                    PutOutcome::Done);
     }
 
-    /// The successor's own genesis _ckpt, published at the NEW (current) incarnation -- durable, but
-    /// hidden from LIST, exactly as a store whose enumeration has not caught up to a just-written key.
+    /// The successor's own genesis `_ckpt`, published for the current physical life. Hiding it from
+    /// LIST must be irrelevant because the walk obtains state only through exact GETs.
     const NamespaceLifeId current_life = NamespaceLifeId::fromCatalogEntry(ns, UInt128(22));
     ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(current_life),
         encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{1}, .checkpoint_snapshot_id = std::nullopt,
@@ -213,36 +195,18 @@ TEST(CasGcShardIncarnation, IncarnationMismatchWhereCurrentIncarnationHasAFreshU
     backend->hide(layout.refCkptKey(current_life));
 
     const RoundReport report = gc.runRegularRound({}, /*allow_steal=*/true, UniversePolicy::AuthoritativeForTest);
-    EXPECT_GT(backend->holesServed(), 0u)
-        << "the hide must actually have been exercised, or this test passes vacuously";
+    EXPECT_EQ(backend->holesServed(), 0u) << "the hot LIST must stay scoped to the stream tree";
     bool saw_anomaly_for_ns = false;
     for (const RoundAnomaly & a : report.anomalies)
         if (a.ns.string() == ns.string())
             saw_anomaly_for_ns = true;
     EXPECT_FALSE(saw_anomaly_for_ns)
-        << "the current incarnation's own _ckpt is real (checked by exact key) even though LIST has not "
-           "caught up to it yet -- an ordinary rebirth in flight, not a contradiction";
+        << "the current life's `_ckpt` is real and readable by its exact catalog-derived key";
 }
 
-/// C1/I1's ABSENT-ENTIRELY family, given its own direct positive test -- checked for, and not found,
-/// before writing this: the three protective `casAdmitEntry` pins C1/I1's own commit (`81ace46e089`)
-/// added to unrelated tests (`TheOrphanManifestSweepAndItsCursorAreInertUnderSuppression`,
-/// `PendingPassEpochFiltersManifestDeletes`, `StaleLeaderPendingPassAbortsWhenRoundAdvanced`) all ROUTE
-/// AROUND this outcome -- they admit the namespace specifically so the anomaly never fires, since firing
-/// would defeat what each of THOSE tests is actually about. None of them positively exercises "an
-/// uncataloged namespace with real ref objects leaves the round incomplete". Nor does any raw-fixture
-/// helper let one construct this directly any more: `writeRefLogTxnRaw` calls `casAdmitEntry` internally
-/// on every write, precisely to keep every OTHER test on the real-incarnation path. So this namespace is
-/// built through the REAL writer path (which self-admits) and then has its catalog entry stripped
-/// afterward -- the same technique `DiscoveryEqualsPresentShards`'s case (c) uses to simulate "the
-/// catalog forgot" without a removal API to do it for real.
-///
-/// PURPOSE, for whoever sees this go red after touching the fold: this pins the ABSENT-ENTIRELY half of
-/// the safety property (its sibling above, `IncarnationMismatchWithoutEntryAbsenceIsAnAnomaly`, pins the
-/// MISMATCH half). A red result here means a refactor decoupled the pieces that jointly produce this
-/// outcome (R10's silent drop for an unknown namespace name, the walk loop's `catalog_names_this_namespace`
-/// gate, and the anomaly each records), not that the test went stale.
-TEST(CasGcShardIncarnation, UncatalogedNamespaceWithRealObjectsLeavesTheRoundIncomplete)
+/// A stream life absent from the immutable catalog cut cannot be attributed to any logical namespace.
+/// It defers the fold conservatively but remains inert debris rather than producing a made-up name.
+TEST(CasGcShardIncarnation, UncatalogedStreamLifeDefersWithoutInventingNamespace)
 {
     std::shared_ptr<InMemoryBackend> backend;
     auto store = makePoolWithShards(backend, /*gc_shards=*/1);
@@ -252,6 +216,7 @@ TEST(CasGcShardIncarnation, UncatalogedNamespaceWithRealObjectsLeavesTheRoundInc
 
     writeManifestRaw(*backend, layout, ns, testRef(1), {});
     publishCommittedTransition(*backend, layout, ns, "part_1", std::nullopt, testRef(1), /*shard=*/0);
+    const NamespaceLifeId forgotten_life = store->namespaceLife(ns);
 
     {
         CasRefCatalog::Snapshot snap = CasRefCatalog::read(*backend, layout);
@@ -263,25 +228,13 @@ TEST(CasGcShardIncarnation, UncatalogedNamespaceWithRealObjectsLeavesTheRoundInc
     }
 
     const RoundReport report = gc.runRegularRound({}, /*allow_steal=*/true, UniversePolicy::AuthoritativeForTest);
-    EXPECT_FALSE(report.anomalies.empty())
-        << "a namespace with real ref objects but no catalog entry at all must be refused, not silently "
-           "dropped as harmless debris";
+    EXPECT_TRUE(report.anomalies.empty());
+    EXPECT_FALSE(backend->list(layout.namespaceStreamPrefix(forgotten_life), "", 100).keys.empty());
 }
 
-/// Final review F1: a namespace mid-birth (`Creating` + a published genesis `_ckpt`) must NOT raise
-/// the un-cataloged anomaly. `completeCreation` publishes `_ckpt` (step 2) strictly BEFORE the
-/// `Creating -> Live` CAS (step 3), so this is not a corner case -- it is a real window every ordinary
-/// creation passes through, and stalls in permanently if the creator crashes there. Before this fix,
-/// the un-cataloged anomaly fired on this shape (`_ckpt`'s key parses to the entry's name and
-/// incarnation, `live_incarnation` excludes `Creating`, so `it == end()`), suppressing the WHOLE
-/// pool's reclamation until someone recreated that exact name and drove `reconcileStaleCreator` --
-/// unbounded in the stalled case, and certain (if brief) on every ordinary birth otherwise.
-///
-/// Pinned in BOTH directions in one test, so a fix that broadens the exemption too far is caught
-/// alongside one that does not broaden it far enough: `creating_ns` (own `_ckpt`, `Creating`) must
-/// raise NOTHING; `unrelated_gone_ns` (a `_ckpt`-shaped key with no catalog entry of ANY state) must
-/// still raise the un-cataloged anomaly exactly as before.
-TEST(CasGcShardIncarnation, StalledCreationOwnCheckpointRaisesNoAnomalyButGenuineAbsenceStillDoes)
+/// State-tree objects are point-addressed only. A stalled creator's checkpoint and an unowned opaque
+/// checkpoint are both outside the hot stream scan and cannot manufacture logical namespace anomalies.
+TEST(CasGcShardIncarnation, StateCheckpointsOutsideCatalogAreInertToHotWalk)
 {
     std::shared_ptr<InMemoryBackend> backend;
     auto store = makePoolWithShards(backend, /*gc_shards=*/1);
@@ -302,19 +255,13 @@ TEST(CasGcShardIncarnation, StalledCreationOwnCheckpointRaisesNoAnomalyButGenuin
         encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{1}, .checkpoint_snapshot_id = std::nullopt,
                               .last_epoch_seal = std::nullopt})).outcome, PutOutcome::Done);
 
-    /// The negative control: a `_ckpt`-shaped key under a namespace the catalog names AT NO STATE AT
-    /// ALL -- genuine debris, not a birth window. Written at an arbitrary incarnation with no
-    /// corresponding catalog entry of any kind.
+    /// Opaque state debris with no corresponding catalog entry.
     const NamespaceLifeId gone_life = NamespaceLifeId::fromCatalogEntry(unrelated_gone_ns, UInt128(44));
     ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(gone_life),
         encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{1}, .checkpoint_snapshot_id = std::nullopt,
                               .last_epoch_seal = std::nullopt})).outcome, PutOutcome::Done);
 
-    /// A `_ckpt`-only round has NO listed `_log` content anywhere, so `changed_shards == 0` and the
-    /// round defers folding entirely (nothing looks different) -- never reaching R10 at all, which
-    /// would make this test vacuous regardless of the fix. One unrelated, ordinary namespace with a
-    /// real ref-log entry forces a full fold every time, exactly as ordinary pool traffic would in
-    /// production (this scenario is about a stalled birth ALONGSIDE a live pool, not an idle one).
+    /// Add ordinary stream traffic so the round performs a fold rather than stopping at an empty walk.
     appendRefLogSeed(*backend, layout, RootNamespace{"srv1/tblOrdinaryTraffic"}, {});
 
     const RoundReport report = gc.runRegularRound({}, /*allow_steal=*/true, UniversePolicy::AuthoritativeForTest);
@@ -327,15 +274,14 @@ TEST(CasGcShardIncarnation, StalledCreationOwnCheckpointRaisesNoAnomalyButGenuin
         if (a.ns.string() == unrelated_gone_ns.string())
             saw_genuinely_gone_anomaly = true;
     }
-    EXPECT_FALSE(saw_stalled_birth_anomaly)
-        << "a namespace mid-birth's own genesis _ckpt must not read as un-cataloged debris";
-    EXPECT_TRUE(saw_genuinely_gone_anomaly)
-        << "a namespace the catalog names at no state at all must still be refused";
+    EXPECT_FALSE(saw_stalled_birth_anomaly);
+    EXPECT_FALSE(saw_genuinely_gone_anomaly);
+    EXPECT_TRUE(backend->head(layout.refCkptKey(creating_life)).exists);
+    EXPECT_TRUE(backend->head(layout.refCkptKey(gone_life)).exists);
 }
 
-/// Task 4: listNamespaces is LIST-based; no registry involved.
-/// Publishing into ns A makes it appear in listNamespaces(""); ns B absent.
-TEST(CasGcShardIncarnation, ListNamespacesFromRefsNotRegistry)
+/// `listNamespaces` projects the authoritative catalog; physical streams never contribute names.
+TEST(CasGcShardIncarnation, ListNamespacesFromCatalog)
 {
     for (const uint64_t gc_shards : {1u, 4u})
     {
@@ -346,7 +292,7 @@ TEST(CasGcShardIncarnation, ListNamespacesFromRefsNotRegistry)
 
         EXPECT_TRUE(store->listNamespaces("").namespaces.empty());
 
-        /// Write a ref shard for ns A — no registry write.
+        /// The real writer path admits the catalog row for namespace A.
         writeManifestRaw(*backend, store->layout(), ns_a, testRef(1), {});
         publishCommittedTransition(*backend, store->layout(), ns_a, "part_1", std::nullopt, testRef(1), /*shard=*/0);
 

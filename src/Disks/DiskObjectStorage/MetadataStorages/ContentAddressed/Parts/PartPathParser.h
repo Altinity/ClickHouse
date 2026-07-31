@@ -59,7 +59,7 @@ inline constexpr std::string_view kMovingRefPrefix = "moving/";
 /// path segment. It marks where the mirrored ClickHouse path ends and the content-addressed archive
 /// begins — like a `.zip` extension (`foo.zip/inner/file`). `@` is S3-safe and never occurs in
 /// ClickHouse uuids, part names, detached prefixes, projection names, or column files, so it cannot
-/// collide with real path data. Shard discovery is via `LIST(cas/refs/)` — not key classification.
+/// collide with real path data. Namespace discovery comes from the catalog, not path classification.
 inline constexpr std::string_view kCasArchiveSuffix = "@cas@";
 
 /// Compose the mirrored content-addressed archive path for a table identifier as the parser reports

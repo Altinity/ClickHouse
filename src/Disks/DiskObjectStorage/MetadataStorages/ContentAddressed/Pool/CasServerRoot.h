@@ -2,6 +2,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasServerRootFormats.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCatalogFormat.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Common/Exception.h>
 #include <Common/Logger.h>
@@ -239,11 +240,15 @@ class Layout;
 /// runs at startup over its `server_root_id` subtree, BEFORE any ordinary data write. They fail
 /// closed (`ErrorCodes::CORRUPTED_DATA`); there is no re-mint or silent-recreate fallback.
 
-/// TRUE iff the whole `server_root_id` subtree is provably empty — `list(prefix, "", 1)` (limit 1)
-/// over EACH of the three subtrees that can hold this server root's data
-/// (`cas/refs/<srid>/`, `cas/manifests/<srid>/`, `roots/<srid>/`) returns no keys. All three are
-/// listed so the precondition holds regardless of which subtree a prior incarnation wrote into.
-bool serverRootSubtreeEmpty(Backend & b, const Layout & l, const String & srid);
+/// True iff the successfully decoded catalog names no current life owned by `server_root_id`, and
+/// exact-component probes find neither `cas/manifests/<srid>/` nor `roots/<srid>/` work. Opaque
+/// `cas/ns/` debris alone does not identify a logical owner.
+bool serverRootSubtreeEmpty(
+    Backend & b, const Layout & l, const String & srid, const RefCatalog & catalog_observation);
+
+/// Supplied by the pool layer so the low-level server-root protocol never silently interprets an
+/// optional catalog. Every absent-control retry obtains a fresh, successfully decoded observation.
+using ObserveRefCatalog = std::function<RefCatalog()>;
 
 /// Read the owner anchor (`gc/server-roots/<srid>/owner`) WITHOUT claiming or validating identity —
 /// a plain GET+decode. nullopt = anchor absent. Pool-member decommission uses this to read the
@@ -259,7 +264,9 @@ std::optional<UInt128> readOwnerUuid(Backend & b, const Layout & l, const String
 ///   - owner absent BUT the subtree is non-empty → throw `CORRUPTED_DATA` (identity lost over
 ///     existing data — never silently re-claim).
 /// The owner object is never deleted and never reassigned to a different UUID.
-void claimOwnerOrThrow(Backend & b, const Layout & l, const String & srid, UInt128 our_uuid);
+void claimOwnerOrThrow(
+    Backend & b, const Layout & l, const String & srid, UInt128 our_uuid,
+    const ObserveRefCatalog & observe_catalog);
 
 /// Which mint policy governs `allocateWriterEpoch`'s absent-epoch branch (see below).
 enum class EpochMintPolicy : uint8_t
@@ -288,8 +295,8 @@ enum class EpochMintPolicy : uint8_t
 ///   - otherwise read `next = current.next_writer_epoch`, `casPut` `{next + 1}` against the
 ///     observed token, retry on `Conflict` (bounded), and return `next`.
 uint64_t allocateWriterEpoch(Backend & b, const Layout & l, const String & srid,
-                             EpochMintPolicy policy = EpochMintPolicy::NormalMount,
-                             uint64_t now_ms = 0);   /// now_ms: required (nonzero) for DecommissionRecovery
+                             EpochMintPolicy policy, uint64_t now_ms,
+                             const ObserveRefCatalog & observe_catalog);
 
 /// Which certificate of death justified a same-uuid, different-epoch mount reclaim. `None` when no
 /// reclaim of that kind happened (a fresh claim, a
@@ -759,7 +766,7 @@ private:
 /// reclaim of debris).
 ///
 /// GC excludes `staging/` entirely: GC blob discovery LISTs `Layout::blobsPrefix()`
-/// (`<pool_prefix>/blobs/`) — a distinct top-level prefix from `staging/`, `cas/refs/`, and
+/// (`<pool_prefix>/blobs/`) — a distinct top-level prefix from `staging/`, `cas/ns/`, and
 /// `cas/manifests/` (see `CasLayout.h`) — so a `staging/` object is never listed, HEAD'd, or condemned by
 /// GC's fold. This sweeper is the ONLY reclaimer of `staging/` debris.
 void sweepOwnMountStaging(IObjectStorage & object_storage, const String & mount_staging_prefix) noexcept;

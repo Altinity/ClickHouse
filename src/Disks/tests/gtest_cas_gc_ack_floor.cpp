@@ -467,7 +467,7 @@ TEST(CasGcAckFloor, NoOpRoundDoesNotMutateRefShards)
         String cursor;
         for (;;)
         {
-            const ListPage page = backend->list(store->layout().refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)), cursor, 1000);
+            const ListPage page = backend->list(store->layout().namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)), cursor, 1000);
             for (const ListedKey & lk : page.keys)
                 keys.insert(lk.key);
             if (page.next_cursor.empty())

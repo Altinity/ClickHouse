@@ -99,11 +99,12 @@ std::optional<RefLogTxn> newestLogTxn(DB::Cas::Backend & backend, const DB::Cas:
     String cursor;
     for (;;)
     {
-        const ListPage page = backend.list(layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)), cursor, 1000);
+        const ListPage page = backend.list(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)), cursor, 1000);
         for (const ListedKey & lk : page.keys)
         {
             const auto parsed = layout.parseRefObjectKey(lk.key);
-            if (parsed && parsed->id.ns == ns && parsed->kind == RefObjectKind::Log
+            if (parsed && parsed->life_id == NamespaceLifeId::stageATransition(ns).incarnation
+                && parsed->kind == RefObjectKind::Log
                 && (!newest || *newest < parsed->txn_id))
                 newest = parsed->txn_id;
         }
@@ -128,11 +129,12 @@ size_t committedRemovalCountForRef(DB::Cas::Backend & backend, const DB::Cas::La
     String cursor;
     for (;;)
     {
-        const ListPage page = backend.list(layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)), cursor, 1000);
+        const ListPage page = backend.list(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)), cursor, 1000);
         for (const ListedKey & lk : page.keys)
         {
             const auto parsed = layout.parseRefObjectKey(lk.key);
-            if (!parsed || parsed->id.ns != ns || parsed->kind != RefObjectKind::Log)
+            if (!parsed || parsed->life_id != NamespaceLifeId::stageATransition(ns).incarnation
+                || parsed->kind != RefObjectKind::Log)
                 continue;
             const auto got = backend.get(layout.refLogKey(NamespaceLifeId::stageATransition(ns), parsed->txn_id));
             if (!got)

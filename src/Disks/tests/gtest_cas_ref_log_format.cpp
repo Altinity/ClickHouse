@@ -783,7 +783,7 @@ TEST(CasFormatBattery, RefLog)
     runFormatBattery({FormatId::RefLog,
         [txn] { return sealObject(FormatId::RefLog, encodeRefLogTxn(txn)); },
         [ns, id](std::string_view s) { decodeRefLogTxn(openObject(FormatId::RefLog, s), ns, id); },
-        "{\"type\":\"cas_ref_log\",\"v\":5}\n"
+        "{\"type\":\"cas_ref_log\",\"v\":6}\n"
         "{\"ns\":\"ns\",\"we\":\"1\",\"rs\":\"1\"}\n"
         "{\"op\":\"set_published_at\",\"rn\":\"all_1_1_0\",\"me\":\"1\",\"mb\":\"1\",\"mo\":1,\"ts\":42}\n"
         "{\"n\":1}\n"});

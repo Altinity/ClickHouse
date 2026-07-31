@@ -383,7 +383,7 @@ TEST(CasPartFolderAccess, PublishEntriesAbandonsBuildOnPromoteFailure)
 
     publishPart(store, ns, "src", {inlineEntry("f", "same")});
 
-    backend->fault_key_substr = store->layout().refsNamespacePrefix(DB::Cas::NamespaceLifeId::stageATransition(ns)) + "_log/";
+    backend->fault_key_substr = store->layout().namespaceStreamPrefix(DB::Cas::NamespaceLifeId::stageATransition(ns)) + "_log/";
     backend->skip = 1;         /// let precommitAdd's own ref-log append land normally
     backend->fault_count = 1;  /// fault exactly promote's ref-log append
     const int attempts_before = backend->matching_put_attempts;
@@ -470,7 +470,7 @@ TEST(CasPartFolderAccess, PublishEntriesAbandonsBuildOnARetryablePromoteFailure)
 
     publishPart(store, ns, "src", {inlineEntry("f", "same")});
 
-    backend->fault_key_substr = store->layout().refsNamespacePrefix(DB::Cas::NamespaceLifeId::stageATransition(ns)) + "_log/";
+    backend->fault_key_substr = store->layout().namespaceStreamPrefix(DB::Cas::NamespaceLifeId::stageATransition(ns)) + "_log/";
     backend->skip = 1;         /// let precommitAdd's own ref-log append land normally
     backend->fault_count = 2;  /// fault promote's append AND the cleanup append that follows it
     const int attempts_before = backend->matching_put_attempts;
@@ -1140,7 +1140,7 @@ TEST(CasPartFolderAccess, DropNamespaceErasesAllViews)
     /// The real life dropNamespace's own real-incarnation write landed at (review C2's whole point):
     /// the catalog entry survives until Task 5's last step, so it is still readable here.
     const DB::Cas::NamespaceLifeId life = DB::Cas::CasRefCatalog::resolveLifeOrSentinel(*backend, layout, ns);
-    const Cas::ListPage removed_snaps = backend->list(layout.refsNamespacePrefix(life) + "_snap/", "", 100);
+    const Cas::ListPage removed_snaps = backend->list(layout.namespaceStreamPrefix(life) + "_snap/", "", 100);
     ASSERT_FALSE(removed_snaps.keys.empty()) << "dropNamespace must publish a Removed snapshot at remove_txn_id";
     const auto parsed = layout.parseRefObjectKey(removed_snaps.keys.front().key);
     ASSERT_TRUE(parsed.has_value());
@@ -1225,7 +1225,7 @@ TEST(CasPartFolderAccess, AnUnresolvedPromoteIsNotReportedAsDefinitelyNotCommitt
 
     /// The promotion's own ref-log object lands; only the acknowledgement, and the controller's
     /// verifying read, are lost. Scoped to this namespace's ref log so nothing else consumes the fault.
-    backend->fault_substr = store->layout().refsNamespacePrefix(DB::Cas::NamespaceLifeId::stageATransition(ns)) + "_log/";
+    backend->fault_substr = store->layout().namespaceStreamPrefix(DB::Cas::NamespaceLifeId::stageATransition(ns)) + "_log/";
     backend->mode = Cas::tests::ChunkFaultBackend::Mode::LandedThenLost;
     backend->fault_count = 1;
     expectThrowsCode(ErrorCodes::NETWORK_ERROR, [&] { prepared.promote(); });

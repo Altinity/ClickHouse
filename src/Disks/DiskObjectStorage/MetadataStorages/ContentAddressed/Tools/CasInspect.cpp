@@ -568,37 +568,48 @@ String renderBlobTargetRun(const ParsedBlobTargetRunKey & parsed, std::string_vi
 
 }
 
-String caInspectToJson(const Layout & layout, const String & key, std::string_view bytes)
+String caInspectToJson(const Layout & layout, const String & key, std::string_view bytes,
+                       const std::optional<NamespaceLifeId> & resolved_life)
 {
-    /// Most-specific first: `cas/manifests/.../NNNNNN.zst` before the pool-wide `cas/refs/`
+    /// Most-specific first: `cas/manifests/.../NNNNNN.zst` before the pool-wide `cas/ns/stream/`
     /// prefix, the `/mount` and `/fold_seal` suffixes before the pool-wide `gc/state` exact match,
     /// and the `.meta` sibling suffix before the bare `blobs/` prefix it also matches.
     if (key.starts_with(layout.casManifestsPrefix()) && key.ends_with(storedSuffix(FormatId::PartManifest)))
         return renderPartManifest(decodePartManifest(openObject(FormatId::PartManifest, bytes)));
 
+    const auto requireResolvedLife = [&](NamespaceLifePhysicalId life_id) -> const NamespaceLifeId &
+    {
+        if (!resolved_life || resolved_life->incarnation != life_id)
+            throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
+                "ca-inspect: life_id {} has no unique resolution in the supplied catalog cut",
+                renderIncarnation(life_id));
+        return *resolved_life;
+    };
+
+    if (key.starts_with(layout.namespaceStateRootPrefix()))
+    {
+        if (const auto life_id = layout.parseRefCkptKey(key))
+            return renderRefCkpt(requireResolvedLife(*life_id).ns, decodeRefCkpt(bytes));
+    }
+
     if (key.starts_with(layout.casRefsPrefix()))
     {
-        /// The `_ckpt` carries no transaction id and lives directly under the namespace prefix rather
-        /// than in a kind directory, so `parseRefObjectKey` cannot recognize it. Classify it FIRST or
-        /// the throw below would reject the one ref object an operator is most likely to inspect by
-        /// hand -- it is what decides recovery's base and what cleanup may delete.
-        if (const auto ckpt_ns = layout.parseRefCkptKey(key))
-            return renderRefCkpt(ckpt_ns->ns, decodeRefCkpt(bytes));
 
         const auto parsed = layout.parseRefObjectKey(key);
         if (!parsed)
             throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
-                "ca-inspect: key under cas/refs is not a recognized ref-object key '{}'", key);
+                "ca-inspect: key under cas/ns/stream is not a recognized ref-object key '{}'", key);
+        const NamespaceLifeId & life = requireResolvedLife(parsed->life_id);
         if (parsed->kind == RefObjectKind::Snap)
             return renderRefTableSnapshot(decodeRefTableSnapshot(
-                openObject(FormatId::RefSnapshot, bytes), parsed->id.ns.string(), parsed->txn_id));
+                openObject(FormatId::RefSnapshot, bytes), life.ns.string(), parsed->txn_id));
         if (parsed->kind == RefObjectKind::Log)
             return renderRefLogTxn(decodeRefLogTxn(
-                openObject(FormatId::RefLog, bytes), parsed->id.ns.string(), parsed->txn_id));
+                openObject(FormatId::RefLog, bytes), life.ns.string(), parsed->txn_id));
         /// A `_cleanup` marker is a zero-byte object — nothing to decode, so render its key-derived facts.
         return JsonObj()
             .add("object", jsonEscape("ref_cleanup_marker"))
-            .add("ns", jsonEscape(parsed->id.ns.string()))
+            .add("ns", jsonEscape(life.ns.string()))
             .add("txn_id", renderRefTxnIdObj(parsed->txn_id))
             .str();
     }
@@ -629,7 +640,7 @@ String caInspectToJson(const Layout & layout, const String & key, std::string_vi
         return renderEnvelopeHeader(decodeEnvelopeHeader(bytes, bytes.size(), ObjectKind::Blob));
 
     throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
-        "ca-inspect: unrecognized key layout '{}' (recognized: cas/refs, cas/manifests, "
+        "ca-inspect: unrecognized key layout '{}' (recognized: cas/ns/stream, cas/ns/state, cas/manifests, "
         "gc/server-roots/*/mount, gc/state, gc/gen/*/fold_seal, gc/gen/*/attempt/*/blob_target/*/*, "
         "retired, blobs, blobs/*.meta)", key);
 }

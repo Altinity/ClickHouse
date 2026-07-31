@@ -157,7 +157,7 @@ std::set<String> listRefKeys(Backend & b, const Layout & layout, const RootNames
     /// real catalog-minted incarnation, not the Stage-A sentinel.
     const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(b, layout, ns);
     std::set<String> keys;
-    forEachListedKey(b, layout.refsNamespacePrefix(life), [&](const ListedKey & k) { keys.insert(k.key); });
+    forEachListedKey(b, layout.namespaceStreamPrefix(life), [&](const ListedKey & k) { keys.insert(k.key); });
     return keys;
 }
 

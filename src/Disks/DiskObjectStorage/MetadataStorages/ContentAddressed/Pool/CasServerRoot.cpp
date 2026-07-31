@@ -85,13 +85,16 @@ void throwIfOwnerRetired(const OwnerObject & owner, const String & srid)
 }
 }
 
-bool serverRootSubtreeEmpty(Backend & b, const Layout & l, const String & srid)
+bool serverRootSubtreeEmpty(
+    Backend & b, const Layout & l, const String & srid, const RefCatalog & catalog_observation)
 {
-    /// All three subtrees that can ever hold this server root's data: `roots/<srid>/` (verbatim
-    /// files), `cas/refs/<srid>/` (ref objects), and `cas/manifests/<srid>/` (part manifests). List
-    /// all three so an owner or epoch can never be re-created over data in any part of the subtree.
-    if (prefixHasAnyKey(b, l.casRefsServerPrefix(srid)))
-        return false;
+    const String owned_prefix = srid + "/";
+    for (const CatalogEntry & entry : catalog_observation.entries)
+        if (entry.ns.string() == srid || entry.ns.string().starts_with(owned_prefix))
+            return false;
+
+    /// Manifests and loose roots retain logical path identity. Opaque namespace stream/state debris
+    /// alone is not evidence that this server root owns live work.
     if (prefixHasAnyKey(b, l.casManifestsServerPrefix(srid)))
         return false;
     if (prefixHasAnyKey(b, l.serverRootDataPrefix(srid)))
@@ -107,8 +110,12 @@ std::optional<UInt128> readOwnerUuid(Backend & b, const Layout & l, const String
     return owner->server_uuid;
 }
 
-void claimOwnerOrThrow(Backend & b, const Layout & l, const String & srid, UInt128 our_uuid)
+void claimOwnerOrThrow(
+    Backend & b, const Layout & l, const String & srid, UInt128 our_uuid,
+    const ObserveRefCatalog & observe_catalog)
 {
+    if (!observe_catalog)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS server-root '{}': catalog observer is required", srid);
     const String key = l.ownerKey(srid);
 
     /// Owner present → it is identity: equal UUID is ok, a different UUID fails closed regardless
@@ -135,7 +142,7 @@ void claimOwnerOrThrow(Backend & b, const Layout & l, const String & srid, UInt1
 
     /// Owner absent. Claiming is allowed ONLY over a provably-empty subtree; an absent owner over
     /// existing data means the identity was lost and must never be silently re-claimed.
-    if (!serverRootSubtreeEmpty(b, l, srid))
+    if (!serverRootSubtreeEmpty(b, l, srid, observe_catalog()))
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "CAS server-root '{}' has no owner anchor but its data subtree is non-empty "
             "(identity lost over existing data) — refusing to re-claim",
@@ -147,6 +154,12 @@ void claimOwnerOrThrow(Backend & b, const Layout & l, const String & srid, UInt1
     }));
     if (put.outcome == PutOutcome::Done)
         return;
+
+    /// The conditional create conflicted. Recompute the whole catalog + manifest + roots bundle;
+    /// no stale emptiness result is carried across the conflict.
+    if (!serverRootSubtreeEmpty(b, l, srid, observe_catalog()))
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS server-root '{}' owner claim conflicted and newly visible owned work blocks recreation", srid);
 
     /// Race: another process claimed between our get and our putIfAbsent. Re-read and compare.
     const std::optional<OwnerObject> reread = readOwnerObject(b, l, srid);
@@ -164,8 +177,12 @@ void claimOwnerOrThrow(Backend & b, const Layout & l, const String & srid, UInt1
         srid);
 }
 
-uint64_t allocateWriterEpoch(Backend & b, const Layout & l, const String & srid, EpochMintPolicy policy, uint64_t now_ms)
+uint64_t allocateWriterEpoch(
+    Backend & b, const Layout & l, const String & srid, EpochMintPolicy policy, uint64_t now_ms,
+    const ObserveRefCatalog & observe_catalog)
 {
+    if (!observe_catalog)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS server-root '{}': catalog observer is required", srid);
     const String key = l.epochKey(srid);
 
     static constexpr int max_attempts = 100;
@@ -184,7 +201,7 @@ uint64_t allocateWriterEpoch(Backend & b, const Layout & l, const String & srid,
         {
             /// A missing `epoch` over a non-empty subtree is a reset hazard (durable monotone
             /// counter cannot be reconstructed) — fail closed.
-            if (!serverRootSubtreeEmpty(b, l, srid))
+            if (!serverRootSubtreeEmpty(b, l, srid, observe_catalog()))
                 throw Exception(ErrorCodes::CORRUPTED_DATA,
                     "CAS server-root '{}' has no durable epoch object but its data subtree is "
                     "non-empty (writer_epoch reset hazard) — refusing to proceed",

@@ -27,8 +27,9 @@ mutable state with immutable, hash-addressed objects plus a small CAS
   `cas/manifests/<ns>/<epoch-hex>-<seq-hex>/<ordinal>.zst`.
 - **Ref table** — the mutable naming layer, one namespace per table
   (`SERVER_ID/TABLE_UUID`), keyed under one LIFE of that namespace: an
-  append-only transaction log plus periodic snapshots (`cas/refs/<ns>/<inc>/...`,
-  where `<inc>` is the namespace's incarnation — see `NamespaceLifeId`), replayed
+  append-only transaction log plus periodic snapshots (`cas/ns/stream/<life_id>/...`), with mutable
+  checkpoints and namespace files under `cas/ns/state/<life_id>/...`. The catalog resolves each opaque
+  physical ID to its logical namespace life (see `NamespaceLifeId`); stream objects are replayed
   into an in-memory table mapping
   ref names (part directory names) to manifests. All mutations go through a
   precommit/promote two-step so a manifest always has an owner while visible.

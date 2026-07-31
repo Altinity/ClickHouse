@@ -111,7 +111,7 @@ struct PoolConfig
     /// 0 disables the detector entirely.
     ///
     /// SAMPLED because the comparison is no longer free. The detector's whole method is to enumerate
-    /// `cas/refs/` a SECOND time and compare, and since the round now enumerates that prefix exactly
+    /// `cas/ns/stream/` a second time and compare, and since the round now enumerates that prefix exactly
     /// once for its own purposes, that second LIST is a cost the detector alone owes. It buys a reading
     /// about the STORE, never about this round's correctness — the ref intake reads by exact key and is
     /// immune to what any listing omits — so paying it every round would be paying a full prefix LIST
@@ -473,8 +473,7 @@ public:
     /// Pure existence probe: whether any committed ref name starts with `prefix`, without
     /// materializing `listRefs`'s full map. Empty `prefix` means "any ref at all".
     bool hasAnyRefWithPrefix(const RootNamespace & ns, std::string_view prefix);
-    /// Namespaces with the given prefix: a LIST of `cas/refs/` ∪ `roots/`, results are UNORDERED.
-    /// A dropped namespace's ref-shard objects linger until GC reclaims them.
+    /// Catalog-authoritative namespaces with the given logical prefix, returned unordered.
     ///
     /// The enumeration REPORTS the keys it could not attribute and DECIDES NOTHING about them: it
     /// neither aborts nor silently drops them, because the right answer differs per consumer and only
@@ -483,7 +482,7 @@ public:
 
     /// Scoped LIST of the mirrored subtree: the distinct next-path-segment names under
     /// `roots/<prefix>` (a loose LIST used by browse only; callers re-check `listRefs`/`getFileSize`
-    /// before showing an entry). NOT authoritative — GC uses LIST-based discovery (`cas/refs/`). `prefix`
+    /// before showing an entry). Not authoritative — logical discovery uses the ref catalog. `prefix`
     /// is a server-relative or shadow-relative path ending in '/'.
     std::vector<String> listMirroredChildren(const String & prefix);
 

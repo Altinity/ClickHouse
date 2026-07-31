@@ -2,6 +2,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCatalogFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCowMap.h>
@@ -20,6 +21,28 @@
 
 namespace DB::Cas
 {
+
+/// Reverse catalog index built from one decoded catalog cut. Every lifecycle state participates.
+/// A duplicated physical id remains represented as ambiguous so reporting tools can continue over
+/// unrelated unique ids; no caller can accidentally obtain a first-row-wins resolution.
+class CatalogLifeIndex
+{
+public:
+    explicit CatalogLifeIndex(const RefCatalog & catalog);
+
+    /// Unique logical life for `life_id`, absence for an id not present in the cut, and
+    /// `CORRUPTED_DATA` when multiple current rows share the id.
+    std::optional<NamespaceLifeId> resolve(NamespaceLifePhysicalId life_id) const;
+    bool isAmbiguous(NamespaceLifePhysicalId life_id) const;
+    bool hasAmbiguity() const { return !ambiguous_names.empty(); }
+
+    /// Destructive and catalog-mutating consumers require the whole cut to be unambiguous.
+    void throwIfAmbiguous(std::string_view consumer) const;
+
+private:
+    std::map<NamespaceLifePhysicalId, NamespaceLifeId> unique_lives;
+    std::map<NamespaceLifePhysicalId, std::vector<String>> ambiguous_names;
+};
 
 // Shared value types for the ref-ledger writer and the pure ref-log protocol helpers below. They live
 // in this protocol header so the ledger can depend on the carriers without making the pool and ledger
@@ -547,7 +570,7 @@ uint64_t encodedRemovalBudgetSize(const RefTableState & state);
 bool admits(const RefTableState & state, const RefOp & op, uint64_t snapshot_budget, uint64_t removal_budget);
 
 /// Pure ref-log intake primitives for a GC round. None of these read a
-/// manifest body, a snapshot body, or `gc/state`: they turn a global `LIST cas/refs/` result and the
+/// manifest body, a snapshot body, or `gc/state`: they turn a global `LIST cas/ns/stream/` result and the
 /// decoded bodies of new transactions into (a) the per-table log/snapshot/marker listing, (b) the
 /// deterministic manifest-edge delta, and (c) the exact ref-object cleanup plan. The GC round
 /// (`CasGc.cpp`) drives the manifest-body reads (`foldManifestEdges`), the fold barrier, the durable
@@ -620,27 +643,18 @@ struct RefTableListing
     std::vector<RefTxnId> logs;
     std::vector<RefTxnId> snapshots;
     std::vector<RefTxnId> cleanup_markers;
-    /// Whether this table's `_ckpt` (spec INV-4) was present in the same listing. It carries no
-    /// transaction id, so it cannot join the three id vectors -- but it IS one of the table's ref
-    /// objects, and a listing that did not record it would report a table with a checkpoint as
-    /// indistinguishable from one without.
-    bool has_ckpt = false;
-
     bool operator==(const RefTableListing &) const = default;
 };
 
-/// Parse and group a global `LIST` of keys under `layout.casRefsPrefix()` by table. Every
-/// key is expected to be one of the three id-bearing ref-object kinds or the table's `_ckpt`; a key
-/// under the ref prefix that neither `Layout::parseRefObjectKey` nor `Layout::parseRefCkptKey`
-/// recognizes, or whose reconstructed namespace is malformed
-/// (`parseRefObjectKey` does not re-validate the namespace, so this does), is a malformed
-/// ref key and throws `CORRUPTED_DATA` -- the round catches it and aborts ref folding for the round
-/// (a malformed key cannot produce a partial ref delta or authorize destructive work). One case
-/// reaches that same outcome from one level down: a key that IS a ref object but names no life (the
-/// un-incarnated shape) is refused by the parser itself, with the same code.
-/// A key OUTSIDE `casRefsPrefix()` is ignored: the caller lists only the ref prefix, and a foreign key
+/// Parse and group a global `LIST` of keys under `layout.casRefsPrefix` by physical life id. Every
+/// key is expected to be one of the three immutable stream-object kinds; checkpoints and namespace
+/// files live in the separate state tree and are never offered by this hot enumeration. An
+/// unrecognized stream key throws `CORRUPTED_DATA`, so the round cannot derive a partial delta or
+/// authorize destructive work from an incomplete classification.
+/// A key outside `casRefsPrefix` is ignored: the caller lists only the stream prefix, and a foreign key
 /// is not this format's concern.
-std::map<String, RefTableListing> groupRefKeys(const Layout & layout, const std::vector<String> & listed_keys);
+std::map<NamespaceLifePhysicalId, RefTableListing> groupRefKeys(
+    const Layout & layout, const std::vector<String> & listed_keys);
 
 /// The exact ref objects one round may delete for one table.
 /// Pure; acts only on keys THIS round's scan returned, so a covering snapshot is always
@@ -765,9 +779,18 @@ RecoveredRefTable recoverRefTableDetailed(Backend & backend, const Layout & layo
                                           const std::function<void()> & on_page_fetched = {},
                                           unsigned max_restarts = 3);
 
+/// Same recovery walk with a life already resolved from the caller's immutable catalog cut. Recovery,
+/// REBUILD and listed-key tools use this overload to avoid a second catalog GET changing the join.
+RecoveredRefTable recoverRefTableDetailed(Backend & backend, const Layout & layout, const NamespaceLifeId & life,
+                                          const std::function<void()> & on_page_fetched = {},
+                                          unsigned max_restarts = 3);
+
 /// Thin wrapper over `recoverRefTableDetailed` for the consumers that only need the replayed state
 /// (fsck, offline repair, the writer's own recovery-on-open, and the GC fold's owner-set builder).
 RefTableState recoverRefTable(Backend & backend, const Layout & layout, const RootNamespace & ns,
+                              const std::function<void()> & on_page_fetched = {},
+                              unsigned max_restarts = 3);
+RefTableState recoverRefTable(Backend & backend, const Layout & layout, const NamespaceLifeId & life,
                               const std::function<void()> & on_page_fetched = {},
                               unsigned max_restarts = 3);
 

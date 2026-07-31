@@ -985,7 +985,7 @@ TEST(CasPool, ListRefsSkipsForeignKeys)
 
     /// A stray key directly under the namespace's ref-object prefix that is not `_cleanup`/`_log`/
     /// `_snap` shaped (also covers the legacy shard-number layout GC/dropNamespace still write).
-    b->putIfAbsent(layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)) + "garbage", "not-a-ref-object");
+    b->putIfAbsent(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)) + "garbage", "not-a-ref-object");
 
     std::map<String, Resolved> refs;
     EXPECT_NO_THROW(refs = s->listRefs(ns));
@@ -1106,17 +1106,16 @@ TEST(CasPool, DropNamespaceRemovesEveryOwnerButLeavesFilesForGc)
     expectThrowsCode(DB::ErrorCodes::FILE_DOESNT_EXIST, [&] { s->dropRef(ns, "alpha"); });
 }
 
-TEST(CasPool, ListNamespacesFromRefsTree)
+TEST(CasPool, ListNamespacesFromCatalog)
 {
-    /// listNamespaces = LIST-based discovery (Task 4): enumerates distinct full namespace strings
-    /// from ref shards under `cas/refs/`. The wiring uses it for directory-style enumeration of
-    /// opaque namespace strings (M-W).
+    /// `listNamespaces` projects logical names from the authoritative catalog. Physical life keys
+    /// contain no namespace spelling and therefore cannot participate in this enumeration.
     auto b = std::make_shared<InMemoryBackend>();
     auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 
-    EXPECT_TRUE(s->listNamespaces("").namespaces.empty());   /// fresh pool: no ref shards yet
+    EXPECT_TRUE(s->listNamespaces("").namespaces.empty());   /// fresh pool: empty catalog
 
-    /// Write actual ref shards so LIST(cas/refs/) can discover them.
+    /// The real publication path admits each namespace before writing its stream.
     DB::Cas::tests::publishCommittedTransition(*b, s->layout(), RootNamespace{"srv1/tbl"},
         "ref1", std::nullopt, DB::Cas::ManifestRef{.writer_epoch = 1, .build_sequence = 1, .manifest_ordinal = 1});
     DB::Cas::tests::publishCommittedTransition(*b, s->layout(), RootNamespace{"shadow/bk1/tbl"},
@@ -1136,10 +1135,8 @@ TEST(CasPool, ListNamespacesFromRefsTree)
     EXPECT_TRUE(s->listNamespaces("nope/").namespaces.empty());
 }
 
-/// The `_files` half of the enumeration must yield the NAMESPACE, not the life: once files are
-/// life-keyed, splitting the key on `/_files/` by hand would return `<ns>/<inc>` and invent one
-/// namespace per incarnation. Two lives of one name therefore collapse to ONE listed namespace.
-TEST(CasPool, ListNamespacesRecoversTheNamespaceNotTheLifeFromFileKeys)
+/// Physical namespace files carry only an opaque life id and cannot mint a logical catalog row.
+TEST(CasPool, ListNamespacesDoesNotMintLogicalNamesFromFileKeys)
 {
     auto b = std::make_shared<InMemoryBackend>();
     auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
@@ -1153,14 +1150,12 @@ TEST(CasPool, ListNamespacesRecoversTheNamespaceNotTheLifeFromFileKeys)
 
     const NamespaceListing listing = s->listNamespaces("");
     EXPECT_TRUE(listing.skipped.empty());
-    ASSERT_EQ(listing.namespaces.size(), 1u) << "two lives of one name are ONE namespace";
-    EXPECT_EQ(listing.namespaces[0], ns.string());
+    EXPECT_TRUE(listing.namespaces.empty());
 }
 
-/// The enumeration ABSORBS the key refusals its two parsers can raise and re-emits them as data, for
-/// both key families. Absorbing is what keeps every consumer reachable; re-emitting is what keeps a
-/// consumer that acts on completeness able to tell a short list from a clean one.
-TEST(CasPool, ListNamespacesSurfacesLifelessKeysInsteadOfAborting)
+/// Catalog discovery neither adopts nor reports malformed physical debris. Diagnostic ownership-tree
+/// scans, not ordinary logical enumeration, classify those keys.
+TEST(CasPool, ListNamespacesDoesNotTreatPhysicalDebrisAsCatalogAuthority)
 {
     auto b = std::make_shared<InMemoryBackend>();
     auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
@@ -1187,17 +1182,9 @@ TEST(CasPool, ListNamespacesSurfacesLifelessKeysInsteadOfAborting)
     ASSERT_EQ(listing.namespaces.size(), 1u);
     EXPECT_EQ(listing.namespaces[0], ns.string());
 
-    /// Both offending keys are reported, each naming itself, and no namespace was invented for either.
-    ASSERT_EQ(listing.skipped.size(), 2u);
-    std::vector<String> skipped_keys;
-    for (const UnattributableNamespaceKey & bad : listing.skipped)
-    {
-        skipped_keys.push_back(bad.key);
-        EXPECT_NE(bad.reason.find(bad.key), String::npos)
-            << "the surfaced reason must name its own key; got: " << bad.reason;
-    }
-    std::sort(skipped_keys.begin(), skipped_keys.end());
-    EXPECT_EQ(skipped_keys, (std::vector<String>{lifeless_ref, lifeless_file}));
+    EXPECT_TRUE(listing.skipped.empty());
+    EXPECT_TRUE(b->head(lifeless_ref).exists);
+    EXPECT_TRUE(b->head(lifeless_file).exists);
 }
 
 TEST(CasPool, ListMirroredChildren)
@@ -1205,9 +1192,9 @@ TEST(CasPool, ListMirroredChildren)
     using namespace DB::Cas;
     auto b = std::make_shared<InMemoryBackend>();
     auto store = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
-    /// Seed two shadow archives by writing a verbatim file into each (creates the prefix in S3).
-    store->putNamespaceFile(NamespaceLifeId::stageATransition(RootNamespace{"shadow/bk1/store/3f2/3f2a-uuid@cas@"}), "x", "1");
-    store->putNamespaceFile(NamespaceLifeId::stageATransition(RootNamespace{"shadow/bk2/store/3f2/3f2a-uuid@cas@"}), "x", "1");
+    /// Seed two catalog-authoritative shadow archives; physical files alone carry no logical path.
+    DB::Cas::tests::casAdmitEntry(*b, store->layout(), RootNamespace{"shadow/bk1/store/3f2/3f2a-uuid@cas@"});
+    DB::Cas::tests::casAdmitEntry(*b, store->layout(), RootNamespace{"shadow/bk2/store/3f2/3f2a-uuid@cas@"});
     auto children = store->listMirroredChildren("shadow/");
     std::sort(children.begin(), children.end());
     ASSERT_EQ(children.size(), 2u);
@@ -1604,7 +1591,7 @@ TEST(CasPoolShutdown, UnresolvedWedgeSkipsFarewell)
 
     /// Force the ref-log append the drop below performs into the Unresolved/wedge outcome (as in the
     /// wedge tests in gtest_cas_ref_writer.cpp): the single attempt the budget allows fails ambiguously.
-    backend->fault_key_substr = layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
+    backend->fault_key_substr = layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
     backend->fault_count = 1;
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
@@ -1906,7 +1893,7 @@ TEST(CasRemountWaits, UnresolvedWedgeRemountPaysNoWaitEither)
     /// Force the ref-log append `dropRef` below performs into the Unresolved/wedge outcome (as in
     /// `CasPoolShutdown.UnresolvedWedgeSkipsFarewell`): the single attempt the budget allows fails
     /// ambiguously.
-    backend->fault_key_substr = layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
+    backend->fault_key_substr = layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
     backend->fault_count = 1;
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
@@ -1974,7 +1961,7 @@ TEST(CasRemountWaits, ALateTouchedTableClosesEveryDeadEpochInBandHoweverItsPrede
 
     /// Force ns1's ref-log append into the Unresolved/wedge outcome (mirrors
     /// `UnresolvedWedgeRemountPaysNoWaitEither` above).
-    backend->fault_key_substr = layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns1)) + "_log/";
+    backend->fault_key_substr = layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns1)) + "_log/";
     backend->fault_count = 1;
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns1, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns1));

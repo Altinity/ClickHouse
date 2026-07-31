@@ -118,7 +118,7 @@ TEST(CasRefChunkPreparation, PreparedKeyAndSealedBytesAreCanonical)
 
     const auto parsed = kLayout.parseRefObjectKey(prepared.prepared_attempt.key);
     ASSERT_TRUE(parsed.has_value()) << "the prepared key must be one of OUR ref-object keys";
-    EXPECT_EQ(parsed->id.ns, kNs);
+    EXPECT_EQ(parsed->life_id, kLife.incarnation);
     EXPECT_EQ(parsed->kind, RefObjectKind::Log);
     EXPECT_EQ(parsed->txn_id, id);
     EXPECT_EQ(prepared.prepared_attempt.key, kLayout.refLogKey(kLife, id));

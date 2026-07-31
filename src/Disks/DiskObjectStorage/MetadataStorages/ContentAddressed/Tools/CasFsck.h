@@ -57,7 +57,7 @@ enum class FsckClass : uint8_t
                    /// crossing, an undecodable body, an oracle that could not replay). Not a finding and
                    /// not a clean bill of health: the honest third answer, reported so nobody reads a
                    /// silence as a proof.
-    LifelessKey,   /// a key under `cas/refs/` or a namespace `_files/` subtree that names no namespace
+    LifelessKey,   /// an opaque id under `cas/ns/stream/` or `cas/ns/state/` that the catalog does not name
                    /// LIFE -- the un-incarnated (Stage A) shape the `Layout` parsers refuse. It belongs
                    /// to no namespace, so no per-namespace verdict can carry it. ERROR
 };

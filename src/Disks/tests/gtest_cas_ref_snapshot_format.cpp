@@ -436,7 +436,7 @@ TEST(CasFormatBattery, RefSnapshot)
     runFormatBattery({FormatId::RefSnapshot,
         [s] { return sealObject(FormatId::RefSnapshot, encodeRefTableSnapshot(s)); },
         [ns, id](std::string_view d) { decodeRefTableSnapshot(openObject(FormatId::RefSnapshot, d), ns, id); },
-        "{\"type\":\"cas_ref_snap\",\"v\":5}\n"
+        "{\"type\":\"cas_ref_snap\",\"v\":6}\n"
         "{\"ns\":\"srv1/db/table@cas@\",\"we\":\"5\",\"rs\":\"200\",\"lc\":\"live\"}\n"
         "{\"k\":\"c\",\"rn\":\"all_1_1_0\",\"me\":\"5\",\"mb\":\"10\",\"mo\":1,\"ts\":1717000000000}\n"
         "{\"k\":\"c\",\"rn\":\"all_2_2_0\",\"me\":\"5\",\"mb\":\"11\",\"mo\":1,\"ts\":1717000000001}\n"

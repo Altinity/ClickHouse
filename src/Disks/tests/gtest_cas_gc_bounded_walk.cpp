@@ -393,7 +393,7 @@ TEST(CasGcBoundedWalk, AListHiddenTailIsCaughtAndFoldedByTheQuietProbePath)
     /// A third record lands and the store stops listing the namespace at the same moment: its listed
     /// tail is now nothing at all, while `{1, 3}` is durable and readable by exact key.
     publishAt(*backend, layout, ns, RefTxnId{1, 3}, "ref_3", 3, DB::UInt128(0x1a3));
-    backend->hidePrefix(layout.refsNamespacePrefix(NamespaceLifeId::stageATransition(ns)));
+    backend->hidePrefix(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)));
 
     const std::map<String, UInt64> intake = runRoundCapturingIntake(gc);
     EXPECT_EQ(cursorOf(*backend, layout, ns), (RefTxnId{1, 3}))
