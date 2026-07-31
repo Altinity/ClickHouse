@@ -754,6 +754,7 @@ def test_partition_transform_compatibility_accepted(cluster):
             f"ALTER TABLE {mt} EXPORT PARTITION ID '{pid}' TO TABLE {iceberg}",
             settings={"allow_insert_into_iceberg": 1},
         )
+        return pid
 
     # 1. Compound identity: (year, region)
     cols = "id Int64, year Int32, region String"
@@ -761,7 +762,12 @@ def test_partition_transform_compatibility_accepted(cluster):
     make_rmt(node, t, cols, "(year, region)")
     node.query(f"INSERT INTO {t} VALUES (1, 2023, 'EU')")
     make_iceberg_s3(node, i, cols, "(year, region)")
-    check_accepted(t, i, "compound identity (year, region)")
+    pid = check_accepted(t, i, "compound identity (year, region)")
+    wait_for_export_status(node, t, i, pid, "COMPLETED")
+    count = int(node.query(f"SELECT count() FROM {i}").strip())
+    assert count == 1, f"[compound identity (year, region)] Expected 1 row in Iceberg table, got {count}"
+    result = node.query(f"SELECT id, year, region FROM {i}").strip()
+    assert result == "1\t2023\tEU", f"[compound identity (year, region)] Unexpected exported data:\n{result}"
 
     # 2. Year transform
     cols = "id Int64, event_date Date"
@@ -837,6 +843,8 @@ def test_partition_transform_compatibility_rejected(cluster):
     node.query(f"INSERT INTO {t} VALUES (1, 2020, 'EU')")
     make_iceberg_s3(node, i, cols, "(region, year)")
     assert_rejected(t, i, "compound field order reversed")
+    count = int(node.query(f"SELECT count() FROM {i}").strip())
+    assert count == 0, f"[compound field order reversed] Expected 0 rows in destination, got {count}"
 
     # 2. Transform mismatch: MergeTree year-transform, Iceberg identity on same Date col
     cols = "id Int64, event_date Date"
@@ -869,6 +877,8 @@ def test_partition_transform_compatibility_rejected(cluster):
     node.query(f"INSERT INTO {t} VALUES (1, 2020, 'EU')")
     make_iceberg_s3(node, i, cols, "year")
     assert_rejected(t, i, "2-field MergeTree vs 1-field Iceberg")
+    count = int(node.query(f"SELECT count() FROM {i}").strip())
+    assert count == 0, f"[2-field MergeTree vs 1-field Iceberg] Expected 0 rows in destination, got {count}"
 
     # 6. Unsupported MergeTree expression: intDiv(year, 100) is not an Iceberg transform
     cols = "id Int64, year Int32"
@@ -1324,7 +1334,7 @@ def test_export_partition_with_renamed_destination_column(cluster):
     )
 
 
-def test_export_partition_same_partition_key_different_column_order(cluster):
+def test_export_partition_same_partition_key_different_column_order_single_column(cluster):
     node = cluster.instances["replica1"]
 
     uid = unique_suffix()
@@ -1342,6 +1352,136 @@ def test_export_partition_same_partition_key_different_column_order(cluster):
     )
     assert "BAD_ARGUMENTS" in error, f"Expected BAD_ARGUMENTS, got: {error}"
     assert "partition key column" in error, f"Expected partition key column mismatch message, got: {error}"
+
+    error_all = node.query_and_get_error(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ALL TO TABLE {iceberg_table}",
+        settings={"allow_insert_into_iceberg": 1},
+    )
+    assert "BAD_ARGUMENTS" in error_all, f"Expected BAD_ARGUMENTS, got: {error_all}"
+
+    count = int(node.query(f"SELECT count() FROM {iceberg_table}").strip())
+    assert count == 0, f"Expected 0 rows in destination after rejected export, got {count}"
+
+
+def test_export_partition_same_partition_key_different_column_order_multi_column(cluster):
+    node = cluster.instances["replica1"]
+
+    uid = unique_suffix()
+    mt_table = f"mt_multi_reordered_{uid}"
+    iceberg_table = f"iceberg_multi_reordered_{uid}"
+
+    cols = "a Int32, b Int32, c Int32, val String"
+    make_rmt(node, mt_table, cols, "(a, b, c)", replica_name="replica1")
+    make_iceberg_s3(node, iceberg_table, "c Int32, b Int32, a Int32, val String", partition_by="(a, b, c)")
+
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 1, 1, 'x'), (1, 1, 1, 'y')")
+
+    pid = first_partition_id(node, mt_table)
+    error = node.query_and_get_error(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {iceberg_table}",
+        settings={"allow_insert_into_iceberg": 1},
+    )
+    assert "BAD_ARGUMENTS" in error, f"Expected BAD_ARGUMENTS, got: {error}"
+    assert "partition key column" in error, f"Expected partition key column mismatch message, got: {error}"
+
+    error_all = node.query_and_get_error(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ALL TO TABLE {iceberg_table}",
+        settings={"allow_insert_into_iceberg": 1},
+    )
+    assert "BAD_ARGUMENTS" in error_all, f"Expected BAD_ARGUMENTS, got: {error_all}"
+
+    count = int(node.query(f"SELECT count() FROM {iceberg_table}").strip())
+    assert count == 0, f"Expected 0 rows in destination after rejected export, got {count}"
+
+
+def test_export_partition_multi_column_partition_key_more_in_destination_is_rejected(cluster):
+    node = cluster.instances["replica1"]
+
+    uid = unique_suffix()
+    mt_table = f"mt_multi_more_{uid}"
+    iceberg_table = f"iceberg_multi_more_{uid}"
+
+    cols = "a Int32, b Int32, c Int32, val String"
+    make_rmt(node, mt_table, cols, "(a, b)", replica_name="replica1")
+    make_iceberg_s3(node, iceberg_table, cols, partition_by="(a, b, c)")
+
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 2, 3, 'x')")
+
+    pid = first_partition_id(node, mt_table)
+    error = node.query_and_get_error(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {iceberg_table}",
+        settings={"allow_insert_into_iceberg": 1},
+    )
+    assert "BAD_ARGUMENTS" in error, f"Expected BAD_ARGUMENTS, got: {error}"
+
+    error_all = node.query_and_get_error(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ALL TO TABLE {iceberg_table}",
+        settings={"allow_insert_into_iceberg": 1},
+    )
+    assert "BAD_ARGUMENTS" in error_all, f"Expected BAD_ARGUMENTS, got: {error_all}"
+
+    count = int(node.query(f"SELECT count() FROM {iceberg_table}").strip())
+    assert count == 0, f"Expected 0 rows in destination after rejected export, got {count}"
+
+
+def test_export_partition_multi_column_partition_key_success_all(cluster):
+    node = cluster.instances["replica1"]
+
+    uid = unique_suffix()
+    mt_table = f"mt_multi_pkey_ok_all_{uid}"
+    iceberg_table = f"iceberg_multi_pkey_ok_all_{uid}"
+
+    cols = "a Int32, b Int32, c Int32, val String"
+    make_rmt(node, mt_table, cols, "(a, b, c)", replica_name="replica1")
+    make_iceberg_s3(node, iceberg_table, cols, partition_by="(a, b, c)")
+
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 1, 1, 'x'), (2, 2, 2, 'y')")
+
+    partition_ids = node.query(
+        f"SELECT DISTINCT partition_id FROM system.parts WHERE database = currentDatabase() "
+        f"AND table = '{mt_table}' AND active ORDER BY partition_id"
+    ).strip().split("\n")
+
+    node.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ALL TO TABLE {iceberg_table}",
+        settings={"allow_insert_into_iceberg": 1},
+    )
+
+    for pid in partition_ids:
+        wait_for_export_status(node, mt_table, iceberg_table, pid, "COMPLETED")
+
+    count = int(node.query(f"SELECT count() FROM {iceberg_table}").strip())
+    assert count == 2, f"Expected 2 rows in destination after export, got {count}"
+
+    result = node.query(f"SELECT a, b, c, val FROM {iceberg_table} ORDER BY val").strip()
+    assert result == "1\t1\t1\tx\n2\t2\t2\ty", f"Unexpected exported data:\n{result}"
+
+
+def test_export_partition_transform_partition_key_different_column_order_is_rejected(cluster):
+    node = cluster.instances["replica1"]
+
+    uid = unique_suffix()
+    mt_table = f"mt_transform_reordered_{uid}"
+    iceberg_table = f"iceberg_transform_reordered_{uid}"
+
+    make_rmt(node, mt_table, "other_id Int64, user_id Int64", "icebergBucket(8, user_id)", replica_name="replica1")
+    make_iceberg_s3(node, iceberg_table, "user_id Int64, other_id Int64", partition_by="icebergBucket(8, user_id)")
+
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 42)")
+
+    pid = first_partition_id(node, mt_table)
+    error = node.query_and_get_error(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {iceberg_table}",
+        settings={"allow_insert_into_iceberg": 1},
+    )
+    assert "BAD_ARGUMENTS" in error, f"Expected BAD_ARGUMENTS, got: {error}"
+    assert "partition key column" in error, f"Expected partition key column mismatch message, got: {error}"
+
+    error_all = node.query_and_get_error(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ALL TO TABLE {iceberg_table}",
+        settings={"allow_insert_into_iceberg": 1},
+    )
+    assert "BAD_ARGUMENTS" in error_all, f"Expected BAD_ARGUMENTS, got: {error_all}"
 
     count = int(node.query(f"SELECT count() FROM {iceberg_table}").strip())
     assert count == 0, f"Expected 0 rows in destination after rejected export, got {count}"

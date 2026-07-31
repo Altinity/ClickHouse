@@ -1749,7 +1749,7 @@ def test_export_partition_all_failure_modes(cluster):
     )
 
 
-def test_export_partition_same_partition_key_different_column_order(cluster):
+def test_export_partition_same_partition_key_different_column_order_single_column(cluster):
     skip_if_remote_database_disk_enabled(cluster)
     node = cluster.instances["replica1"]
 
@@ -1776,5 +1776,239 @@ def test_export_partition_same_partition_key_different_column_order(cluster):
     assert "BAD_ARGUMENTS" in error, f"Expected BAD_ARGUMENTS, got: {error}"
     assert "partition key column" in error, f"Expected partition key column mismatch message, got: {error}"
 
+    error_all = node.query_and_get_error(f"ALTER TABLE {mt_table} EXPORT PARTITION ALL TO TABLE {s3_table}")
+    assert "BAD_ARGUMENTS" in error_all, f"Expected BAD_ARGUMENTS, got: {error_all}"
+
     count = int(node.query(f"SELECT count() FROM {s3_table}").strip())
     assert count == 0, f"Expected 0 rows in destination after rejected export, got {count}"
+
+
+def test_export_partition_same_partition_key_different_column_order_multi_column(cluster):
+    skip_if_remote_database_disk_enabled(cluster)
+    node = cluster.instances["replica1"]
+
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"multi_reordered_mt_table_{postfix}"
+    s3_table = f"multi_reordered_s3_table_{postfix}"
+
+    node.query(f"""
+        CREATE TABLE {mt_table} (a Int32, b Int32, c Int32, val String)
+        ENGINE = ReplicatedMergeTree('/clickhouse/tables/{mt_table}', 'replica1')
+        PARTITION BY (a, b, c)
+        ORDER BY tuple()
+    """)
+
+    node.query(f"""
+        CREATE TABLE {s3_table} (c Int32, b Int32, a Int32, val String)
+        ENGINE = S3(s3_conn, filename='{s3_table}', format=Parquet, partition_strategy='hive')
+        PARTITION BY (a, b, c)
+    """)
+
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 1, 1, 'x'), (1, 1, 1, 'y')")
+
+    partition_id = node.query(
+        f"SELECT partition_id FROM system.parts WHERE database = currentDatabase() "
+        f"AND table = '{mt_table}' AND active ORDER BY name LIMIT 1"
+    ).strip()
+
+    error = node.query_and_get_error(f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{partition_id}' TO TABLE {s3_table}")
+    assert "BAD_ARGUMENTS" in error, f"Expected BAD_ARGUMENTS, got: {error}"
+    assert "partition key column" in error, f"Expected partition key column mismatch message, got: {error}"
+
+    error_all = node.query_and_get_error(f"ALTER TABLE {mt_table} EXPORT PARTITION ALL TO TABLE {s3_table}")
+    assert "BAD_ARGUMENTS" in error_all, f"Expected BAD_ARGUMENTS, got: {error_all}"
+
+    count = int(node.query(f"SELECT count() FROM {s3_table}").strip())
+    assert count == 0, f"Expected 0 rows in destination after rejected export, got {count}"
+
+
+def test_export_partition_multi_column_partition_key_success(cluster):
+    skip_if_remote_database_disk_enabled(cluster)
+    node = cluster.instances["replica1"]
+
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"multi_pkey_ok_mt_table_{postfix}"
+    s3_table = f"multi_pkey_ok_s3_table_{postfix}"
+
+    node.query(f"""
+        CREATE TABLE {mt_table} (a Int32, b Int32, c Int32, val String)
+        ENGINE = ReplicatedMergeTree('/clickhouse/tables/{mt_table}', 'replica1')
+        PARTITION BY (a, b, c)
+        ORDER BY tuple()
+    """)
+
+    node.query(f"""
+        CREATE TABLE {s3_table} (a Int32, b Int32, c Int32, val String)
+        ENGINE = S3(s3_conn, filename='{s3_table}', format=Parquet, partition_strategy='hive')
+        PARTITION BY (a, b, c)
+    """)
+
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 1, 1, 'x'), (1, 1, 1, 'y')")
+
+    partition_id = node.query(
+        f"SELECT partition_id FROM system.parts WHERE database = currentDatabase() "
+        f"AND table = '{mt_table}' AND active ORDER BY name LIMIT 1"
+    ).strip()
+
+    node.query(f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{partition_id}' TO TABLE {s3_table}")
+    wait_for_export_status(node, mt_table, s3_table, partition_id, "COMPLETED")
+
+    count = int(node.query(f"SELECT count() FROM {s3_table}").strip())
+    assert count == 2, f"Expected 2 rows in destination after export, got {count}"
+
+    result = node.query(f"SELECT a, b, c, val FROM {s3_table} ORDER BY val").strip()
+    assert result == "1\t1\t1\tx\n1\t1\t1\ty", f"Unexpected exported data:\n{result}"
+
+
+def test_export_partition_multi_column_partition_key_order_mismatch_is_rejected(cluster):
+    skip_if_remote_database_disk_enabled(cluster)
+    node = cluster.instances["replica1"]
+
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"multi_order_mt_table_{postfix}"
+    s3_table = f"multi_order_s3_table_{postfix}"
+
+    node.query(f"""
+        CREATE TABLE {mt_table} (a Int32, b Int32, c Int32, val String)
+        ENGINE = ReplicatedMergeTree('/clickhouse/tables/{mt_table}', 'replica1')
+        PARTITION BY (a, b, c)
+        ORDER BY tuple()
+    """)
+
+    node.query(f"""
+        CREATE TABLE {s3_table} (a Int32, b Int32, c Int32, val String)
+        ENGINE = S3(s3_conn, filename='{s3_table}', format=Parquet, partition_strategy='hive')
+        PARTITION BY (c, b, a)
+    """)
+
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 2, 3, 'x')")
+
+    partition_id = node.query(
+        f"SELECT partition_id FROM system.parts WHERE database = currentDatabase() "
+        f"AND table = '{mt_table}' AND active ORDER BY name LIMIT 1"
+    ).strip()
+
+    error = node.query_and_get_error(f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{partition_id}' TO TABLE {s3_table}")
+    assert "BAD_ARGUMENTS" in error, f"Expected BAD_ARGUMENTS, got: {error}"
+
+    error_all = node.query_and_get_error(f"ALTER TABLE {mt_table} EXPORT PARTITION ALL TO TABLE {s3_table}")
+    assert "BAD_ARGUMENTS" in error_all, f"Expected BAD_ARGUMENTS, got: {error_all}"
+
+    count = int(node.query(f"SELECT count() FROM {s3_table}").strip())
+    assert count == 0, f"Expected 0 rows in destination after rejected export, got {count}"
+
+
+def test_export_partition_multi_column_partition_key_fewer_in_destination_is_rejected(cluster):
+    skip_if_remote_database_disk_enabled(cluster)
+    node = cluster.instances["replica1"]
+
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"multi_fewer_mt_table_{postfix}"
+    s3_table = f"multi_fewer_s3_table_{postfix}"
+
+    node.query(f"""
+        CREATE TABLE {mt_table} (a Int32, b Int32, c Int32, val String)
+        ENGINE = ReplicatedMergeTree('/clickhouse/tables/{mt_table}', 'replica1')
+        PARTITION BY (a, b, c)
+        ORDER BY tuple()
+    """)
+
+    node.query(f"""
+        CREATE TABLE {s3_table} (a Int32, b Int32, c Int32, val String)
+        ENGINE = S3(s3_conn, filename='{s3_table}', format=Parquet, partition_strategy='hive')
+        PARTITION BY (a, b)
+    """)
+
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 2, 3, 'x')")
+
+    partition_id = node.query(
+        f"SELECT partition_id FROM system.parts WHERE database = currentDatabase() "
+        f"AND table = '{mt_table}' AND active ORDER BY name LIMIT 1"
+    ).strip()
+
+    error = node.query_and_get_error(f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{partition_id}' TO TABLE {s3_table}")
+    assert "BAD_ARGUMENTS" in error, f"Expected BAD_ARGUMENTS, got: {error}"
+
+    error_all = node.query_and_get_error(f"ALTER TABLE {mt_table} EXPORT PARTITION ALL TO TABLE {s3_table}")
+    assert "BAD_ARGUMENTS" in error_all, f"Expected BAD_ARGUMENTS, got: {error_all}"
+
+    count = int(node.query(f"SELECT count() FROM {s3_table}").strip())
+    assert count == 0, f"Expected 0 rows in destination after rejected export, got {count}"
+
+
+def test_export_partition_multi_column_partition_key_more_in_destination_is_rejected(cluster):
+    skip_if_remote_database_disk_enabled(cluster)
+    node = cluster.instances["replica1"]
+
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"multi_more_mt_table_{postfix}"
+    s3_table = f"multi_more_s3_table_{postfix}"
+
+    node.query(f"""
+        CREATE TABLE {mt_table} (a Int32, b Int32, c Int32, val String)
+        ENGINE = ReplicatedMergeTree('/clickhouse/tables/{mt_table}', 'replica1')
+        PARTITION BY (a, b)
+        ORDER BY tuple()
+    """)
+
+    node.query(f"""
+        CREATE TABLE {s3_table} (a Int32, b Int32, c Int32, val String)
+        ENGINE = S3(s3_conn, filename='{s3_table}', format=Parquet, partition_strategy='hive')
+        PARTITION BY (a, b, c)
+    """)
+
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 2, 3, 'x')")
+
+    partition_id = node.query(
+        f"SELECT partition_id FROM system.parts WHERE database = currentDatabase() "
+        f"AND table = '{mt_table}' AND active ORDER BY name LIMIT 1"
+    ).strip()
+
+    error = node.query_and_get_error(f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{partition_id}' TO TABLE {s3_table}")
+    assert "BAD_ARGUMENTS" in error, f"Expected BAD_ARGUMENTS, got: {error}"
+
+    error_all = node.query_and_get_error(f"ALTER TABLE {mt_table} EXPORT PARTITION ALL TO TABLE {s3_table}")
+    assert "BAD_ARGUMENTS" in error_all, f"Expected BAD_ARGUMENTS, got: {error_all}"
+
+    count = int(node.query(f"SELECT count() FROM {s3_table}").strip())
+    assert count == 0, f"Expected 0 rows in destination after rejected export, got {count}"
+
+
+def test_export_partition_multi_column_partition_key_success_all(cluster):
+    skip_if_remote_database_disk_enabled(cluster)
+    node = cluster.instances["replica1"]
+
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"multi_pkey_ok_all_mt_table_{postfix}"
+    s3_table = f"multi_pkey_ok_all_s3_table_{postfix}"
+
+    node.query(f"""
+        CREATE TABLE {mt_table} (a Int32, b Int32, c Int32, val String)
+        ENGINE = ReplicatedMergeTree('/clickhouse/tables/{mt_table}', 'replica1')
+        PARTITION BY (a, b, c)
+        ORDER BY tuple()
+    """)
+
+    node.query(f"""
+        CREATE TABLE {s3_table} (a Int32, b Int32, c Int32, val String)
+        ENGINE = S3(s3_conn, filename='{s3_table}', format=Parquet, partition_strategy='hive')
+        PARTITION BY (a, b, c)
+    """)
+
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 1, 1, 'x'), (2, 2, 2, 'y')")
+
+    partition_ids = node.query(
+        f"SELECT DISTINCT partition_id FROM system.parts WHERE database = currentDatabase() "
+        f"AND table = '{mt_table}' AND active ORDER BY partition_id"
+    ).strip().split("\n")
+
+    node.query(f"ALTER TABLE {mt_table} EXPORT PARTITION ALL TO TABLE {s3_table}")
+
+    for pid in partition_ids:
+        wait_for_export_status(node, mt_table, s3_table, pid, "COMPLETED")
+
+    count = int(node.query(f"SELECT count() FROM {s3_table}").strip())
+    assert count == 2, f"Expected 2 rows in destination after export, got {count}"
+
+    result = node.query(f"SELECT a, b, c, val FROM {s3_table} ORDER BY val").strip()
+    assert result == "1\t1\t1\tx\n2\t2\t2\ty", f"Unexpected exported data:\n{result}"
