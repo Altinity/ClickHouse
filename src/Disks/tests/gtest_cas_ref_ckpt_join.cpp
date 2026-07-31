@@ -210,28 +210,28 @@ TEST(CasRefCkptJoin, JoinUnknownLifeEpochWithPresentYieldsPresent)
     const RefCkpt unknown{.life_epoch = std::nullopt, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
     const RefCkpt present{.life_epoch = 7, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
 
-    EXPECT_EQ(mergeCkpt(unknown, present, "cas_ref_ckpt").life_epoch, std::optional<uint64_t>{7});
-    EXPECT_EQ(mergeCkpt(present, unknown, "cas_ref_ckpt").life_epoch, std::optional<uint64_t>{7})
-        << "an absence is order-independent -- a writer that knows nothing must not be able to erase the "
+    EXPECT_EQ(mergeCkpt(unknown, present).life_epoch, std::optional<uint64_t>{7});
+    EXPECT_EQ(mergeCkpt(present, unknown).life_epoch, std::optional<uint64_t>{7})
+        << "the merge is commutative -- a writer that knows nothing must not be able to erase the "
            "genesis epoch, whichever side it is on";
 
     /// The other half of "absent loses": two absences stay absent. `life_epoch` has no floor to fall
-    /// back to, and a fabricated one is permanent -- the join can never lower it again.
-    EXPECT_EQ(mergeCkpt(unknown, unknown, "cas_ref_ckpt").life_epoch, std::nullopt);
+    /// back to, and a fabricated one is permanent -- the semantic-max merge can never lower it again.
+    EXPECT_EQ(mergeCkpt(unknown, unknown).life_epoch, std::nullopt);
 }
 
-/// The ordinary steady state: both writers agree. Asserted for its own sake because it is what the
-/// stricter rule must keep admitting -- an equal republish is not a conflict, and it is also what
-/// `publishCkpt` turns into "no write at all".
+/// The ordinary steady state: both writers agree. Asserted for its own sake because it is what
+/// `publishCkpt`'s may-not-decrease rule must keep admitting -- an equal republish is not a decrease --
+/// and it is also what `publishCkpt` turns into "no write at all".
 TEST(CasRefCkptJoin, JoinEqualLifeEpochsYieldsSame)
 {
     const RefCkpt a{.life_epoch = 9, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
     const RefCkpt b{.life_epoch = 9, .checkpoint_snapshot_id = RefTxnId{9, 4}, .last_epoch_seal = std::nullopt};
 
-    EXPECT_EQ(mergeCkpt(a, b, "cas_ref_ckpt").life_epoch, std::optional<uint64_t>{9});
-    EXPECT_EQ(mergeCkpt(b, a, "cas_ref_ckpt").life_epoch, std::optional<uint64_t>{9});
+    EXPECT_EQ(mergeCkpt(a, b).life_epoch, std::optional<uint64_t>{9});
+    EXPECT_EQ(mergeCkpt(b, a).life_epoch, std::optional<uint64_t>{9});
     const std::optional<RefTxnId> b_checkpoint = RefTxnId{9, 4};
-    EXPECT_EQ(mergeCkpt(a, b, "cas_ref_ckpt").checkpoint_snapshot_id, b_checkpoint)
+    EXPECT_EQ(mergeCkpt(a, b).checkpoint_snapshot_id, b_checkpoint)
         << "an equal life_epoch must not disturb the other fields' own join";
 }
 
@@ -313,10 +313,15 @@ TEST(CasRefCkptJoin, RestartBetweenCreationAndFirstWriteRaisesLifeEpochWithoutRe
 /// contribution to have landed anyway.
 ///
 /// So this test does not model an operating condition; it asserts what happens if the guarantee above
-/// is ever violated -- the join refuses and names both values, rather than absorbing the violation into
-/// a maximum and leaving no trace. The state is built by publishing the two contributions in the order
-/// the fence discipline is supposed to prevent, which needs no seam that manufactures impossible states:
-/// `publishCkpt` is a public entry point and the order of two calls is the test's to choose.
+/// is ever violated -- `publishCkpt` refuses and names both values, rather than absorbing the violation
+/// into a maximum and leaving no trace. The state is built by publishing the two contributions in the
+/// order the fence discipline is supposed to prevent, which needs no seam that manufactures impossible
+/// states: `publishCkpt` is a public entry point and the order of two calls is the test's to choose.
+///
+/// It is driven through `publishCkpt` for a second reason, not just convenience: that IS where the rule
+/// lives and the only place it CAN live. `mergeCkpt` is commutative -- the stated reason the two writers
+/// need no ordering between them -- so it cannot tell a decrease from an increase, having no idea which
+/// of its arguments is durable. There is deliberately no merge-level counterpart to this test.
 TEST(CasRefCkptJoin, JoinDecreasingLifeEpochIsCorruptionAndPublishesNothing)
 {
     CountingBackend backend;
@@ -371,19 +376,19 @@ TEST(CasRefCkptJoin, CheckpointAndSealStillMergeBySemanticMaximum)
 
     /// Ordered by writer_epoch FIRST: `{4,1}` beats `{3,5}` even though its sequence is smaller, which
     /// is the intended timeline across an epoch restart that resets the sequence.
-    EXPECT_EQ(mergeCkpt(lower, higher, "cas_ref_ckpt").checkpoint_snapshot_id, higher_checkpoint);
-    EXPECT_EQ(mergeCkpt(higher, lower, "cas_ref_ckpt").checkpoint_snapshot_id, higher_checkpoint);
-    EXPECT_EQ(mergeCkpt(lower, higher, "cas_ref_ckpt").last_epoch_seal, higher_seal);
-    EXPECT_EQ(mergeCkpt(higher, lower, "cas_ref_ckpt").last_epoch_seal, higher_seal);
+    EXPECT_EQ(mergeCkpt(lower, higher).checkpoint_snapshot_id, higher_checkpoint);
+    EXPECT_EQ(mergeCkpt(higher, lower).checkpoint_snapshot_id, higher_checkpoint);
+    EXPECT_EQ(mergeCkpt(lower, higher).last_epoch_seal, higher_seal);
+    EXPECT_EQ(mergeCkpt(higher, lower).last_epoch_seal, higher_seal);
 
     /// Present beats absent, both directions and both fields.
     const RefCkpt nothing;
-    EXPECT_EQ(mergeCkpt(nothing, lower, "cas_ref_ckpt").checkpoint_snapshot_id, lower_checkpoint);
-    EXPECT_EQ(mergeCkpt(lower, nothing, "cas_ref_ckpt").checkpoint_snapshot_id, lower_checkpoint);
-    EXPECT_EQ(mergeCkpt(nothing, lower, "cas_ref_ckpt").last_epoch_seal, lower_seal);
-    EXPECT_EQ(mergeCkpt(lower, nothing, "cas_ref_ckpt").last_epoch_seal, lower_seal);
-    EXPECT_EQ(mergeCkpt(nothing, nothing, "cas_ref_ckpt").checkpoint_snapshot_id, std::nullopt);
-    EXPECT_EQ(mergeCkpt(nothing, nothing, "cas_ref_ckpt").last_epoch_seal, std::nullopt);
+    EXPECT_EQ(mergeCkpt(nothing, lower).checkpoint_snapshot_id, lower_checkpoint);
+    EXPECT_EQ(mergeCkpt(lower, nothing).checkpoint_snapshot_id, lower_checkpoint);
+    EXPECT_EQ(mergeCkpt(nothing, lower).last_epoch_seal, lower_seal);
+    EXPECT_EQ(mergeCkpt(lower, nothing).last_epoch_seal, lower_seal);
+    EXPECT_EQ(mergeCkpt(nothing, nothing).checkpoint_snapshot_id, std::nullopt);
+    EXPECT_EQ(mergeCkpt(nothing, nothing).last_epoch_seal, std::nullopt);
 }
 
 /// ---------------------------------------------------------------------------------------------

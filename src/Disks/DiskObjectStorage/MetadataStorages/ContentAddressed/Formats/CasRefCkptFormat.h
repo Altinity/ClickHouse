@@ -24,10 +24,10 @@ namespace DB::Cas
 ///     the base was deleted under a live checkpoint, which is corruption.
 ///
 /// TWO writers update it -- the snapshot publisher and the sealer -- and both run the SAME algorithm
-/// (`mergeCkpt` + `publishCkpt` in `Pool/CasRefCkpt.h`): read the whole body, JOIN it per field (the
-/// semantic maximum on the two ids; for `life_epoch` the same, except that a contribution BELOW the
-/// durable value is refused instead of absorbed), token-CAS. Writing the whole body is what makes a
-/// stale field dangerous, and
+/// (`mergeCkpt` + `publishCkpt` in `Pool/CasRefCkpt.h`): read the whole body, merge by SEMANTIC
+/// MAXIMUM per field, token-CAS. (`publishCkpt` adds one refusal the merge itself cannot express -- a
+/// `life_epoch` BELOW the durable one -- because only the publish site knows which side is durable.)
+/// Writing the whole body is what makes a stale field dangerous, and
 /// the merge is what contains it: a writer that skipped it and wrote back the value it sampled
 /// earlier would silently regress the OTHER writer's progress (TLC counterexample
 /// `_sab_sealclobbersbase`, which loses an acked transaction).
@@ -65,8 +65,9 @@ struct RefCkpt
     /// same incarnation, and whenever the mount's writer epoch advances between the creation and the
     /// first write -- CREATE TABLE, restart, INSERT. The value that must survive is the LATER one (the
     /// grammar needs the epoch the birth record actually landed at), and it is always the later
-    /// contribution, because writer epochs are durable-monotone per server root. What the join refuses is
-    /// therefore a DECREASE, not a disagreement; see `mergeCkpt`/`joinLifeEpoch` in `Pool/CasRefCkpt.h`.
+    /// contribution, because writer epochs are durable-monotone per server root. So the semantic maximum
+    /// is right, and what is refused is a DECREASE rather than a disagreement -- by `publishCkpt`, not by
+    /// `mergeCkpt`, since only the publish site can tell which of the two values is the durable one.
     ///
     /// OPTIONAL, and the option is load-bearing rather than a convenience. Exactly ONE writer knows
     /// this value -- the transaction that births the namespace -- and a table recovered from durable

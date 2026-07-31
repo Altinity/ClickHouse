@@ -15,20 +15,10 @@ namespace DB::Cas
 /// and its codec live in `Formats/CasRefCkptFormat.h`; this header is what WRITES it and what a reader
 /// consults when the base it sampled turns out to be gone.
 
-/// The one join, shared by BOTH `_ckpt` writers (the snapshot publisher and the sealer). An absent
-/// optional loses to a present one on every field, and two absents stay absent. Per field:
-///   - `checkpoint_snapshot_id`, `last_epoch_seal`: the SEMANTIC MAXIMUM. These genuinely advance over a
-///     namespace's life, and the max is what stops a writer that sampled an older body from regressing
-///     the other writer's progress.
-///   - `life_epoch`: the contribution wins when it is at or ABOVE the durable value, and a contribution
-///     BELOW it is `CORRUPTED_DATA` -- see `joinLifeEpoch` in the `.cpp` for why that specific case, and
-///     only that case, is the one worth refusing. Two present-and-different values are ordinary and must
-///     stay admitted; a decrease is a fence violation the old per-field max absorbed silently.
-///
-/// The ARGUMENTS ARE ORDERED, which is what the `life_epoch` rule needs and what the two id fields do
-/// not care about: `stored` is the body just read from the object, `contribution` is what this writer
-/// wants to add. `what` names the object in the exception message (the same role it plays in
-/// `checkRefCkptInvariants`); `publishCkpt` passes the `_ckpt` key.
+/// The one semantic-maximum merge, shared by BOTH `_ckpt` writers (the snapshot publisher and the
+/// sealer). Per field: the greater `life_epoch`, the greater present `checkpoint_snapshot_id`, the
+/// greater present `last_epoch_seal`; an absent optional loses to a present one, and two absents stay
+/// absent.
 ///
 /// There is deliberately ONE of these rather than a surgical per-writer update. A `_ckpt` write is a
 /// whole-body read-modify-write, so a writer that wrote back only the field it knows about would carry
@@ -37,14 +27,14 @@ namespace DB::Cas
 /// where a sealer writing its sampled body back verbatim drops a concurrently published base and the
 /// next recovery loses an ACKED transaction.
 ///
-/// The two writers still need NO ORDERING between them, which is what the old "the merge is commutative"
-/// sentence was really claiming, but the reason is now narrower and worth stating exactly. On the two id
-/// fields the join is a commutative, associative max, so their outcome is order-independent outright. On
-/// `life_epoch` the outcome is order-independent because the ORDER ITSELF is constrained: contributions
-/// only ever rise (writer epochs are durable-monotone per server root, and a namespace has one), so the
-/// reversed sequence that would be refused is the one that cannot occur. The token-CAS is what makes
-/// each read-modify-write atomic; that part is unchanged.
-RefCkpt mergeCkpt(const RefCkpt & stored, const RefCkpt & contribution, std::string_view what);
+/// The merge is commutative and associative (it is a per-field max), which is why the two writers need
+/// no ordering between them -- only the token-CAS, which makes each read-modify-write atomic.
+///
+/// It is therefore NOT where `life_epoch`'s may-not-decrease rule lives, and that is a placement
+/// decision rather than an omission: a commutative function does not know which of its arguments is the
+/// durable one, so it cannot tell a decrease from an increase. That rule belongs to `publishCkpt`, which
+/// does know (see `checkLifeEpochDoesNotDecrease` in the `.cpp`).
+RefCkpt mergeCkpt(const RefCkpt & a, const RefCkpt & b);
 
 /// What one `publishCkpt` call did.
 enum class CkptPublishOutcome : uint8_t
@@ -90,9 +80,10 @@ struct CkptDeadline
 ///     It is the only record of recovery's base and of what cleanup may delete; replacing it with a
 ///     body derived from `contribution` alone would erase the base while leaving a well-formed object
 ///     behind -- corruption laundered into something a reader would trust.
-///   - a contribution whose `life_epoch` is BELOW the durable one PROPAGATES `CORRUPTED_DATA` from
-///     `mergeCkpt`, before the CAS is built, so nothing is written. That refusal is raised where the
-///     merge is, not here, so it cannot be reached by any other path into this object.
+///   - a contribution whose `life_epoch` is BELOW the durable one raises `CORRUPTED_DATA` on every
+///     attempt, checked after that attempt's read and before its merge, so no body is built and no CAS
+///     is sent. This is the one refusal that HAS to live here rather than in `mergeCkpt`: only this
+///     function knows which side is durable.
 ///   - exhausting the deadline (or the live-lock brake) under persistent conflict throws the
 ///     retry-later class. No partial state exists to clean up: every attempt either committed the
 ///     complete merged body or changed nothing.
