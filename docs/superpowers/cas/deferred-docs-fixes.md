@@ -422,3 +422,58 @@ WRONG reason -- … that guard."* — an opening `(` with no matching `)`.
 
 **Fix:** close the parenthesis (or remove it if the parenthetical was meant to run to the end of the
 sentence, matching the surrounding punctuation style).
+
+### D23 — a public header generalizes the no-mint guarantee from the resolver to the operation {#d23-nomint-generalized-to-operation}
+
+From the Task 4b fix-round review (finding 1). `CasPool.h` says the readable resolver "NEVER creates a
+namespace ... so a **probe** or an `if_exists` unlink against a table that was never opened **cannot admit
+an entry into the pool-wide catalog**." The first clause is true of the resolver. The second is a claim
+about whole operations, and it is false: `listDirectory` of that same never-opened table dir admits an
+entry one line before it consults the resolver, and so do a table-dir `removeRecursive` and DROP DETACHED.
+
+Graded important rather than minor because it is **the same defect class the round existed to fix** — a
+load-bearing sentence in a public header asserting a property the code does not have — one level up from
+where it was fixed.
+
+**Fix:** narrow the two generalized sentences to the namespace-file surface they actually cover. The
+commit message's "unbounded growth driven by removals of tables that never existed" has the same overreach
+and cannot be edited; the header is what a future reader will consult.
+
+The code residual behind this sentence is NOT deferred here — it is placed in the plan, see
+{#d23-code-half-is-placed} below.
+
+#### The code half is placed, not filed {#d23-code-half-is-placed}
+
+Three ref-layer entry points still recover-and-mint on a read or a removal: `CasRefLedger::dropNamespace`
+(minting **before** its own "a never-touched namespace's drop is a harmless no-op" guard),
+`CasRefLedger::listRefs`, and `CasRefLedger::resolveRef` via `dropRefIfPresent`. All three are
+pre-existing. They now live in the Stage B plan as an executing step with a red-first detector, because a
+residual that lives only in a ledger is one context loss from forgotten.
+
+### D24 — the `gc_enabled = false` rationale names a hazard that was not live {#d24-gc-enabled-rationale}
+
+From the same review (finding 2). The recording fixture constructs storage with a **null context**, and
+the background scheduler starts only under `if (context && gc_enabled && !read_only)`. No scheduler ever
+ran, so the four zeros were never "holding only because the first 60s tick outlived the test" — they were
+fenced by the null context. The original review's minor 5 carried an unverified premise and the
+implementer inherited it; the commit message then repeats it as fact.
+
+**Fix:** keep the setting — it makes the fence explicit and survives a fixture that later passes a real
+context, which is exactly the silent arming worth pre-empting — but say that, not the timer story.
+
+### D25 — stale count in a test file header {#d25-stale-count-nsfile-profile}
+
+`gtest_cas_namespace_file_request_profile.cpp`: "The **two** `CasNamespaceFileDiskProfile` cases at the
+bottom of this file fence it there" — the same commit added a third.
+
+**Fix:** drop the number rather than correct it. A count in prose goes stale on the next addition; this is
+the third counted-in-prose defect of the stage.
+
+### D26 — `RefTableRuntime::life` documents recovery as its only resolver {#d26-reftableruntime-life-second-writer}
+
+`CasRefLedger.h` still says `life` is "resolved ONCE per table-open, on the FIRST recovery attempt of this
+runtime's lifetime (`ensureRefTableRecovered`)". There is now a **second** writer —
+`namespaceFilesLifeIfReadable`'s step 1 — which resolves it without recovering at all.
+
+**Fix:** name both writers. This one is load-bearing beyond prose: the planned "invalidate the cached life
+when the entry is removed" step must invalidate against both, including the one that runs on a pure read.

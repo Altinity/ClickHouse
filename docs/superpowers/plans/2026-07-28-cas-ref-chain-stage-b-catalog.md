@@ -1298,6 +1298,21 @@ listing, so the cursor never drops.
   lifecycle can actually produce — a namespace with two `nsc` rows and no entry. This is the task
   where that worst case becomes constructible, which is why the decision sits here rather than in
   Task 2.
+- [ ] **A removal must not birth the namespace it is removing — at the OPERATION level, not just the
+  resolver's.** Task 4b closed this for the namespace-file surface only. Three ref-layer entry points
+  still recover-and-mint, and two of them are reached by a removal and a read of a table that was
+  never opened: `CasRefLedger::dropNamespace` (which mints in `ensureRefTableRecovered` **before** its
+  own "a never-touched namespace's drop is a harmless no-op" guard — so the guard can never see the
+  case it was written for), `CasRefLedger::listRefs`, and `CasRefLedger::resolveRef` via
+  `CachedPartFolderAccess::dropRefIfPresent`, which is the DROP DETACHED arm. Pre-existing, and
+  practically small because a CREATE normally births the namespace legitimately first — but this task
+  is where a removal's catalog effects become load-bearing, so it is where the residual is paid.
+  **Red-first detector, exact and already checked:** add
+  `storage->createTransaction()->removeRecursive(kTablePath, {})` to
+  `RemovalOnANeverOpenedTableLeavesTheCatalogUntouched` and it fails today on
+  `EXPECT_FALSE(exists(catalog_object))` — the existing pin covers the `_files` subdir arm, not the
+  table-dir arm. Fix by making recovery non-minting on these paths, not by moving the no-op guard
+  earlier: an earlier guard would answer the drop correctly and still leave the read paths minting.
 
 ### Task 5b: `chooseRecoveryGrounding` — recovery becomes LIST-independent {#task-5b}
 
