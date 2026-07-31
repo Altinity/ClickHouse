@@ -1193,6 +1193,20 @@ the KEY/prefix helpers that ADDRESS ONE LIFE, so it must not (and does not) forb
 - [ ] **Step 2:** → FAIL. **Step 3:** Implement. **Step 4:** CA gate + lanes green.
 - [ ] **Step 5: Commit** `ca: ref — removal lifecycle: fenced terminal, immediate entry delete, deposited-incarnation cleanup`.
 
+**A FORWARD HOLE THIS TASK ARMS — `rt->life` is never invalidated (placed 2026-07-31).** `RefTableRuntime::life`
+is resolved once and never reset — no `life.reset()` exists anywhere — while `ref_tables` has an LRU eviction
+path and a remount clear. Today that is harmless, because `dropNamespace` leaves the catalog entry and a
+same-name rebirth therefore reuses the same incarnation.
+
+**This task is what arms it.** Once the entry is deleted and a rebirth mints a fresh incarnation, a server whose
+runtime stayed warm across the drop keeps the **dead** life and will read *and write* namespace files at it —
+which is precisely the hole Task 4b closed, reopened. And it reopens **nondeterministically**, depending on
+whether the LRU happened to evict that runtime.
+
+- [ ] **Invalidate the cached life when the namespace's catalog entry is removed**, and pin it with a warm
+  runtime: drop and rebirth without an eviction in between, then assert the writer uses the NEW life. A test
+  that evicts first passes for the wrong reason — eviction is the case that already works.
+
 **A LEAK INTERVAL OPENED BY TASK 4b (placed 2026-07-31 — it is an implication of a deleted branch, which is
 why it is written down instead of left to be re-derived).** Once the emptiness predicate stopped probing
 `_files`, a removed namespace whose only debris is namespace files is promoted `Pending → Completed` by the
