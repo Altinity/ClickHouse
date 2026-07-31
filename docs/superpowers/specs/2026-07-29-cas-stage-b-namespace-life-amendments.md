@@ -86,6 +86,13 @@ LIST must not determine genesis or committed history. Remove the fallback that s
 
 For the same exact objects, full, empty, partial and reordered LIST results must reconstruct the same logical state. Only request count, diagnostics and discovered garbage may differ.
 
+**Lifecycle correction, 2026-07-31.** The later `RemovalReady` invariant in
+`2026-07-27-cas-ref-chain-complete-cut-design.md` supersedes the directive's special
+`Removing`-without-`_ckpt` window. `Live` and `Removing` both require readable `_ckpt`;
+`Removing` without it is corruption. `RemovalReady` is never recovered, with or without `_ckpt`, and
+is routed to the idempotent removal/decommission finalizer. This changes lifecycle routing only; LIST
+remains forbidden from determining recovery grounding.
+
 #### 4. Strengthen `_ckpt` {#strengthen-ckpt}
 
 `_ckpt` must remain a fixed-size product of scalar monotone facts. Its encoded size must be `O(1)` in the number of refs, files, transactions and writer epochs.
