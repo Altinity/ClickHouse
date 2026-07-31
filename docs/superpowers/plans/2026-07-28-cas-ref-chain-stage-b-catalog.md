@@ -1800,6 +1800,24 @@ correctness-регрессии" (Constraint 18).]
   updated to cite THIS task
 - Test: the Stage-A cross-namespace kill-shot test in `gtest_cas_list_liar_end_to_end.cpp`
 
+**MEASURED WARNING — flipping `kDefault` is necessary but almost certainly NOT sufficient, and this is
+evidence, not a worry.** `suppress_destructive` is a disjunction; the flip clears only the
+`universe_authoritative` half. A CA-local stateless lane on 2026-07-31 shows the OTHER half live in an
+ordinary healthy pool with no anomalies and no holds:
+
+- `05007`'s pool: `frontier INCOMPLETE (3155 of 3157 namespace(s) proven)` — 2 unproven.
+- `05010`'s pool: `frontier INCOMPLETE (11358 of 11369 namespace(s) proven)` — 11 unproven.
+
+Both rounds report `0 anomaly(ies), 0 held namespace(s)`, so `frontier_proven != frontier_namespaces` is
+carrying the suppression on its own. Flip the policy in a pool that still leaves a handful of namespaces
+unproven and destruction stays off — the four `broken_tests.yaml` entries would stay red and the task
+would look like it had failed for a reason nobody had measured.
+
+- [ ] **Before flipping, find out WHY those namespaces are unproven** — a walk target with no
+  `_ckpt` entry, a probe-budget exhaustion, or a genuine gap are three different causes with three
+  different fixes, and the round already holds the facts to tell them apart. This is a prerequisite
+  step, not a risk note.
+
 **PLACED HERE BY THE PLACEMENT SWEEP (2026-07-30), previously an unplaced deferral:**
 `[CKPT-DAMAGE-NO-REPAIR-PATH]` residual (a) — a single unrepaired `_ckpt` HOLDS its namespace and
 therefore shuts the ROUND-WIDE destructive gate, so one damaged 4 KiB object stops ALL reclamation
