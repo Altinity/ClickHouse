@@ -57,6 +57,8 @@
      SabotageDeleteWithoutEvidence   positive matching cleanup evidence          -> INV_REMOVAL_DELETE_PROVED
      SabotageDeleteWithForeignEvidence matching life id on cleanup evidence       -> INV_REMOVAL_DELETE_PROVED
      SabotageDeleteUnderHold          the no-durable-hold precondition            -> INV_REMOVAL_DELETE_PROVED
+     SabotageDeleteWithoutExactObservation the exact observed `Removing` row       -> INV_REMOVAL_DELETE_PROVED
+     SabotageDeleteWithoutCleanupAttempt the bounded cleanup-attempt check          -> INV_REMOVAL_DELETE_PROVED
      SabotageSameIncarnationRebirth  incarnation freshness (INV-3)               -> INV_NO_ALIAS
      SabotageFloorRetainsDeadName    the rejected `seq_floor` catalog (§10)      -> INV_BOUNDED_CATALOG
 
@@ -86,7 +88,9 @@ CONSTANTS
     SabotageFloorRetainsDeadName,   \* §10's rejected `seq_floor`: removal keeps a dead-name record
     SabotageDeleteWithoutEvidence,  \* direct removal CAS does not require cleanup evidence
     SabotageDeleteWithForeignEvidence, \* accepts evidence belonging to an older life
-    SabotageDeleteUnderHold          \* direct removal CAS accepts a durable hold
+    SabotageDeleteUnderHold,         \* direct removal CAS accepts a durable hold
+    SabotageDeleteWithoutExactObservation, \* omits the exact observed-`Removing` check
+    SabotageDeleteWithoutCleanupAttempt \* omits the bounded cleanup-attempt check
 
 ASSUME MaxInc \in Nat /\ MaxInc >= 2
 
@@ -437,14 +441,6 @@ TerminalFoldAndCleanup ==
                     lastDeleteEvidence, lastDeleteNoHold, lastDeleteCleanupAttempt,
                     lastDeleteExact, ghostVars >>
 
-(* INV-4: `_ckpt` is deleted BY EXACT TOKEN WHILE THE ENTRY IS `Removing`. The entry is what names
-   the incarnation and authorizes the delete, which is precisely why it must outlive the object. *)
-RemovalCkptDelete ==
-    /\ entry.state = "removing"
-    /\ entry.inc \in ckptOf
-    /\ ckptOf' = ckptOf \ {entry.inc}
-    /\ UNCHANGED << entryVars, creatorVars, objects, recVars, ghostVars >>
-
 (* The ordinary bounded cleanup pass is deliberately not a physical-empty proof. It records that GC
    attempted cleanup after adopting durable evidence, but it may leave every object — including
    `_ckpt` — behind. That residue becomes inert janitor work after the catalog CAS. *)
@@ -508,10 +504,7 @@ PlantForeignEvidence ==
 (* Direct `Removing -> absent` CAS. It has no `RemovalReady`, no name-keyed cursor pruning, and no
    physical-empty predicate. The four fields recorded here are the mutation's coherent evidence,
    rather than a post-hoc inference from debris. *)
-EntryDelete ==
-    /\ entry.state = "removing"
-    /\ observedRemoving = entry.inc
-    /\ entry.inc \in cleanupAttempted
+EntryDeleteMutation ==
     /\ EvidenceGuard
     /\ HoldGuard
     /\ lastDeleted' = entry.inc
@@ -529,6 +522,28 @@ EntryDelete ==
                     observedRemoving, creatorInc, creatorAlive, ckptDone, installed, objVars,
                     obsArmed, orphanInc, orphanAlive, aliased, aliasedOnRemnant, reconcileHarm,
                     orphanDataEaten >>
+
+EntryDelete ==
+    /\ entry.state = "removing"
+    /\ observedRemoving = entry.inc
+    /\ entry.inc \in cleanupAttempted
+    /\ EntryDeleteMutation
+
+(* Each isolated omission action deliberately selects a state where its missing check is false.
+   The resulting mutation must make the corresponding audit conjunct fail. *)
+EntryDeleteWithoutExactObservation ==
+    /\ SabotageDeleteWithoutExactObservation
+    /\ entry.state = "removing"
+    /\ observedRemoving # entry.inc
+    /\ entry.inc \in cleanupAttempted
+    /\ EntryDeleteMutation
+
+EntryDeleteWithoutCleanupAttempt ==
+    /\ SabotageDeleteWithoutCleanupAttempt
+    /\ entry.state = "removing"
+    /\ observedRemoving = entry.inc
+    /\ entry.inc \notin cleanupAttempted
+    /\ EntryDeleteMutation
 
 (* ---- the lazy janitor (INV-3) ---- *)
 
@@ -558,7 +573,7 @@ NoOp == UNCHANGED vars
 LegacyNext ==
     \/ Create \/ ReadOwn \/ CkptCreate \/ GoLive \/ ZombieGoLive \/ WriteObject \/ CreatorDies
     \/ ReconcileObserve \/ ReconcileCreating \/ OrphanDies \/ OrphanWrite
-    \/ Drop \/ RemovalCkptDelete
+    \/ Drop
     \/ \E i \in Incs : Janitor(i)
     \/ NoOp
 
@@ -567,6 +582,7 @@ Next ==
        /\ UNCHANGED removalProofVars
     \/ TerminalFoldAndCleanup \/ CleanupPass \/ ObserveRemoving
     \/ PlantRemovalHold \/ ReleaseRemovalHold \/ PlantForeignEvidence \/ EntryDelete
+    \/ EntryDeleteWithoutExactObservation \/ EntryDeleteWithoutCleanupAttempt
 
 Spec == Init /\ [][Next]_vars
 
@@ -657,9 +673,10 @@ INV_REMOVAL_DELETE_PROVED ==
     (lastDeleted # 0) =>
         (lastDeleteEvidence /\ lastDeleteNoHold /\ lastDeleteCleanupAttempt /\ lastDeleteExact)
 
-(* Negated witness: a legal deletion can leave ref objects behind. This is evidence that cleanup is
-   leak-only and not accidentally a physical-empty prerequisite. *)
-WITNESS_REMOVAL_LEAVES_DEBRIS == ~(lastDeleted # 0 /\ objects # {})
+(* Negated witness: a legal deletion leaves that exact life's `_ckpt` behind for the janitor. This
+   proves that bounded pre-CAS cleanup neither deletes `_ckpt` nor makes physical emptiness a
+   lifecycle prerequisite. *)
+WITNESS_REMOVAL_LEAVES_DEBRIS == ~(lastDeleted # 0 /\ lastDeleted \in ckptOf)
 
 (* The task brief's proposed reconciliation invariant, kept verbatim as a FINDING, not as a
    property: `_finding_briefreconcileinv` is its counterexample in the fully honest model, where
