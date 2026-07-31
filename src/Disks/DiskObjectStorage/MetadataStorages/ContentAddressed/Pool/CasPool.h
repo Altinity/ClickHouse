@@ -508,16 +508,20 @@ public:
     /// fresh namespace), and itself gated on this namespace's `_cleanup` marker.
     bool namespaceIsRemoved(const RootNamespace & ns);
 
-    /// The catalog life this namespace's objects are keyed under, for a WRITER: minted if the catalog
-    /// names none (a namespace's first namespace file births it exactly as its first ref op would).
-    /// Resolved once per table-open and cached, so this is not a per-operation catalog request.
+    /// The catalog life this namespace's objects are keyed under, for a WRITER, and the only resolution
+    /// that CREATES one: minted if the catalog names none (a namespace's first namespace file births it
+    /// exactly as its first ref op would). Resolved once per table-open and cached, so this is not a
+    /// per-operation catalog request.
     NamespaceLifeId namespaceLife(const RootNamespace & ns);
 
-    /// The life a READER of this namespace's files must use, or `nullopt` when it has no readable files
-    /// -- a dropped table and a never-born namespace answer alike. Replaces the older
-    /// "is it removed?" predicate at every namespace-file read: the life and the readability come from
-    /// one observation, so a reader cannot pair one with the other's stale answer, and an unreadable
-    /// namespace yields no life to read with rather than a wrong one. See `CasRefLedger`'s declaration.
+    /// The life a READER or a REMOVER of this namespace's files must use, or `nullopt` when it has no
+    /// readable files -- a never-created namespace, one mid-creation and a dropped table all answer
+    /// alike. NEVER creates a namespace: an uncataloged one is answered from a catalog-only lookup that
+    /// writes nothing, so a probe or an `if_exists` unlink against a table that was never opened cannot
+    /// admit an entry into the pool-wide catalog. Replaces the older "is it removed?" predicate at every
+    /// namespace-file read: the life and the readability come from one observation, so a reader cannot
+    /// pair one with the other's stale answer, and an unreadable namespace yields no life to read with
+    /// rather than a wrong one. See `CasRefLedger`'s declaration.
     std::optional<NamespaceLifeId> namespaceFilesLifeIfReadable(const RootNamespace & ns);
 
     /// ==== writer ref-log append lane ====

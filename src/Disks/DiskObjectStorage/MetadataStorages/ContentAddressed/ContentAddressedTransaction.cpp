@@ -1128,8 +1128,9 @@ void ContentAddressedTransaction::removeRecursive(const std::string & path, cons
     /// Table-level SUBDIRECTORY (deduplication_logs/): remove every verbatim file under it.
     if (auto tf = Cas::parseTableFilePath(path))
     {
-        /// The READABLE resolution, not the minting one: a removal must never birth the namespace it is
-        /// removing from. No readable life means there is nothing under this subdirectory to remove.
+        /// The READABLE resolution, which is the non-creating one (`namespaceFilesLifeIfReadable` answers
+        /// an uncataloged namespace from a catalog-only lookup and writes nothing): a removal must never
+        /// birth the namespace it is removing from. No life means there is nothing here to remove.
         const auto life = metadata_storage.readableNamespaceFilesLife(
             metadata_storage.liveNamespace(tf->table_uuid));
         if (!life)
@@ -1620,8 +1621,9 @@ void ContentAddressedTransaction::unlinkFile(const std::string & path, bool if_e
     /// a pruned mutation entry would otherwise leak until DROP.
     if (auto tf = Cas::parseTableFilePath(path))
     {
-        /// Readable resolution: an unlink must not birth a namespace. No life means no such file, which
-        /// is exactly the absent case the branch below already handles.
+        /// Readable resolution, i.e. the non-creating one: an unlink must not birth a namespace -- and
+        /// `unlinkFile(..., if_exists = true)` is called from cleanup paths whose whole contract is to be
+        /// a no-op. No life means no such file, exactly the absent case the branch below already handles.
         const auto life = metadata_storage.readableNamespaceFilesLife(
             metadata_storage.liveNamespace(tf->table_uuid));
         if (!life || !metadata_storage.store()->getNamespaceFile(*life, tf->tail))

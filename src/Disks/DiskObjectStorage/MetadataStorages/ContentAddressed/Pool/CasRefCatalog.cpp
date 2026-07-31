@@ -24,12 +24,23 @@ CasRefCatalog::Snapshot CasRefCatalog::read(Backend & backend, const Layout & la
     return Snapshot{.catalog = decodeRefCatalog(got->bytes), .token = got->token};
 }
 
-NamespaceLifeId CasRefCatalog::resolveLifeOrSentinel(Backend & backend, const Layout & layout, const RootNamespace & ns)
+std::optional<NamespaceLifeId> CasRefCatalog::lifeIfCataloged(
+    Backend & backend, const Layout & layout, const RootNamespace & ns)
 {
     const Snapshot snap = read(backend, layout);
     for (const CatalogEntry & entry : snap.catalog.entries)
         if (entry.ns.string() == ns.string() && entry.state != NsState::Creating)
             return NamespaceLifeId::fromCatalogEntry(entry.ns, entry.incarnation);
+    return std::nullopt;
+}
+
+NamespaceLifeId CasRefCatalog::resolveLifeOrSentinel(Backend & backend, const Layout & layout, const RootNamespace & ns)
+{
+    /// Expressed in terms of `lifeIfCataloged` rather than repeating its filter: two copies of "which
+    /// entry states name a usable life" is exactly the kind of pair that drifts apart, and the two
+    /// callers differ ONLY in what they do about absence.
+    if (auto cataloged = lifeIfCataloged(backend, layout, ns))
+        return *cataloged;
     return NamespaceLifeId::stageATransition(ns);
 }
 

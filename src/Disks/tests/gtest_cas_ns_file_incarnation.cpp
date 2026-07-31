@@ -210,6 +210,10 @@ TEST(CasNsFileIncarnation, PhysicalEmptyProofIgnoresFiles)
 
     /// Not merely "answers empty" but "never looked": the deleted arm was a LIST, and a HEAD of a file
     /// key would be the same proof by another request, so the whole `_files` key space is checked.
+    ///
+    /// THE LINE BELOW IS THE SENSITIVE ONE, and the `listCount` after it is not: the deleted arm listed
+    /// the SENTINEL's files prefix, so a check naming this life's prefix would have passed before this
+    /// change too. Do not lean on it as the regression detector.
     EXPECT_EQ(filesKeysTouched(*backend), std::vector<String>{})
         << "the predicate must not probe ANY files key";
     EXPECT_EQ(backend->listCount(layout.namespaceFilesPrefix(life)), 0u);

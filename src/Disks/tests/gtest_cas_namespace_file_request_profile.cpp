@@ -5,6 +5,14 @@
 #include <IO/WriteHelpers.h>
 #include <Core/Defines.h>
 
+/// Per-TU declaration of the one setting this file overrides, following the pattern `cas_test_helpers.h`
+/// documents for `server_root_id`/`scratch_path`: defined once in `ContentAddressedSettings.cpp`, declared
+/// by each consumer for what it actually references.
+namespace DB::ContentAddressedSetting
+{
+    extern const ContentAddressedSettingsBool gc_enabled;
+}
+
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -24,6 +32,14 @@
 /// after a change measure the change against itself. Incarnation qualification changes the KEY a
 /// namespace file is stored under, so the keys are derived from `Layout` rather than spelled out; what
 /// must not move is the count per key and the set of keys touched.
+///
+/// TWO KINDS OF GATE LIVE IN THIS FILE, and mistaking one for the other would misread what it proves.
+/// The per-operation COUNTS above are baseline-anchored: they were read off the tree BEFORE the key change
+/// and pasted as literals, so they detect DRIFT from a measured past. The four negatives below are a
+/// FORWARD ALARM: a zero has no baseline to drift from, and the disk-layer cases could not have existed
+/// before the life resolution they measure was put on that path. They are no weaker for it -- they fail
+/// the moment a catalog, ref-log, blob or manifest request appears where none belongs -- but they are not
+/// evidence that anything was "unchanged".
 ///
 /// WHERE THE OTHER FOUR CLAUSES ARE FENCED, and why they could not be fenced by the cases above. Every
 /// pool-layer case drives `Pool::putNamespaceFile`/`getNamespaceFile`/`removeNamespaceFile`/
@@ -391,6 +407,10 @@ std::shared_ptr<DB::ContentAddressedMetadataStorage> openRecordingStorage(
 
     auto settings = makeSettingsForTest(
         "test", std::filesystem::temp_directory_path() / ("cas_ns_file_profile_scratch_" + unique));
+    /// A GC round touches all three of `cas/ref_catalog`, `cas/refs/` and `cas/manifests/`, so with the
+    /// background scheduler enabled these zeros would hold only because the first tick (60s) outlives the
+    /// test. A timer is not a fence.
+    settings[DB::ContentAddressedSetting::gc_enabled] = false;
     auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
         out_object_storage, "pool", "srv1", "", nullptr, settings);
     storage->startup();
@@ -477,4 +497,46 @@ TEST(CasNamespaceFileDiskProfile, TheLifeResolutionIsPaidOncePerTableOpen)
     writeVerbatimThroughDisk(*storage, kTablePath + "/format_version.txt", "2\n");
     EXPECT_EQ(object_storage->touchedContaining(layout.refCatalogKey()), std::vector<String>{})
         << "a second file operation must not re-resolve the life";
+}
+
+
+/// THE REMOVAL PATHS MUST NOT CREATE A NAMESPACE — the case that regressed silently in this task's first
+/// round, so it is pinned on the catalog rather than on the file outcome.
+///
+/// Why the file outcome cannot pin it: `unlinkFile`/`removeRecursive` against a never-opened table
+/// answer "absent" both before and after the defect, because a freshly minted namespace has no files
+/// either. The only observable difference is the catalog write, so that is what is asserted. And it
+/// matters twice over: `unlinkFile(..., if_exists = true)` is called from cleanup paths whose contract is
+/// to be a no-op, and the catalog is ONE pool-wide object under a capacity-admission predicate — a
+/// removal that admits an entry per never-created table grows it without bound.
+TEST(CasNamespaceFileDiskProfile, RemovalOnANeverOpenedTableLeavesTheCatalogUntouched)
+{
+    std::shared_ptr<RecordingObjectStorage> object_storage;
+    auto storage = openRecordingStorage(object_storage);
+    const DB::Cas::Layout & layout = storage->store()->layout();
+    const DB::StoredObject catalog_object{layout.refCatalogKey()};
+
+    /// Nothing has opened this table: no namespace file written, no part published, no ref op.
+    ASSERT_FALSE(object_storage->exists(catalog_object)) << "precondition: the pool has no catalog yet";
+    object_storage->resetRecords();
+
+    /// Three removal shapes, all against paths under a table that does not exist.
+    storage->createTransaction()->unlinkFile(
+        kTablePath + "/format_version.txt", /*if_exists*/ true, /*remove_metadata_only*/ false);
+    storage->createTransaction()->removeRecursive(
+        kTablePath + "/deduplication_logs", DB::IMetadataTransaction::ShouldRemoveObjectsPredicate{});
+    EXPECT_FALSE(storage->existsFile(kTablePath + "/format_version.txt"));
+
+    EXPECT_EQ(object_storage->writtenContaining(layout.refCatalogKey()), std::vector<String>{})
+        << "a removal must not write the catalog: it must not birth the namespace it is removing from";
+    EXPECT_FALSE(object_storage->exists(catalog_object))
+        << "and the catalog object must still not exist at all";
+
+    /// Not vacuous: the SAME operations on the same table after a write do reach the file, so the zeros
+    /// above are the absence of a birth and not the absence of any work.
+    writeVerbatimThroughDisk(*storage, kTablePath + "/format_version.txt", "1\n");
+    ASSERT_TRUE(storage->existsFile(kTablePath + "/format_version.txt"));
+    storage->createTransaction()->unlinkFile(
+        kTablePath + "/format_version.txt", /*if_exists*/ false, /*remove_metadata_only*/ false);
+    EXPECT_FALSE(storage->existsFile(kTablePath + "/format_version.txt"));
 }

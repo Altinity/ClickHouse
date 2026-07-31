@@ -4100,33 +4100,81 @@ bool CasRefLedger::namespaceIsRemoved(const RootNamespace & ns)
 }
 
 
+NamespaceLifeId CasRefLedger::lifeUnderLock(const RootNamespace & ns, const RefTableRuntime & rt) const
+{
+    /// `ensureRefTableRecovered` resolves `life` before it walks anything and never clears it, so a
+    /// runtime that returned from it without a life is a broken invariant, not a state to work around.
+    /// A real throw rather than a `chassert`: it must fail closed in release too, because the
+    /// alternative is naming a key under an unresolved identity.
+    if (!rt.life)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "CAS namespace '{}': recovery completed without resolving a catalog life", ns.string());
+    return *rt.life;
+}
+
 NamespaceLifeId CasRefLedger::namespaceLife(const RootNamespace & ns)
 {
     const auto rt = getRefTableRuntime(ns);
+    /// MINTS when the catalog names no entry, via recovery's step 0 -- deliberately, and only here: a
+    /// write may legitimately be a namespace's birth.
     ensureRefTableRecovered(ns, *rt);
     std::lock_guard<std::mutex> lock(rt->state_mutex);
-    /// `ensureRefTableRecovered` resolves `life` before it walks anything and never clears it, so a
-    /// runtime that returned from it without a life is a broken invariant, not a state to work around.
-    if (!rt->life)
-        throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "CAS namespace '{}': recovery completed without resolving a catalog life", ns.string());
-    return *rt->life;
+    return lifeUnderLock(ns, *rt);
 }
 
 std::optional<NamespaceLifeId> CasRefLedger::namespaceFilesLifeIfReadable(const RootNamespace & ns)
 {
     const auto rt = getRefTableRuntime(ns);
+
+    /// ---- Step 1: resolve the life WITHOUT ever creating one ----
+    ///
+    /// This is the whole difference from `namespaceLife`, and it is structural rather than a matter of
+    /// ordering: recovery's step 0 mints for an absent catalog entry, so a reader must not be the one to
+    /// reach it. It cannot: either `rt->life` is already resolved (the warm steady state -- no catalog
+    /// read at all, which is what keeps a namespace-file operation free of a catalog request), or a
+    /// catalog-only lookup answers first. An absent entry returns here, having written NOTHING and
+    /// without recovering: a namespace the catalog does not name has no files to read, and a read or an
+    /// unlink is the wrong event to bring one into existence on.
+    ///
+    /// Setting `rt->life` from that lookup is also what makes the guarantee airtight rather than
+    /// probe-then-hope: with the field set, step 0's `if (!rt.life)` is false, so `resolveNamespaceLife`
+    /// is unreachable below even if the entry is concurrently removed between the lookup and the
+    /// recovery. The value is the one step 0 would have computed for that entry -- both take BOTH fields
+    /// from the same catalog entry (INV-3) -- so this is the same once-per-table-open resolution,
+    /// performed by whichever caller got there first.
+    {
+        std::unique_lock<std::mutex> lock(rt->state_mutex);
+        if (!rt->life)
+        {
+            /// Released for the catalog read, like every other I/O boundary in this file, and re-taken to
+            /// re-check `rt->life` -- a concurrent caller may have resolved it in the meantime, and the
+            /// first resolution wins rather than being overwritten.
+            lock.unlock();
+            const std::optional<NamespaceLifeId> cataloged = CasRefCatalog::lifeIfCataloged(backend, layout, ns);
+            lock.lock();
+            if (!rt->life)
+            {
+                if (!cataloged)
+                    return std::nullopt;
+                rt->life = *cataloged;
+            }
+        }
+    }
+
+    /// ---- Step 2: the recovered ref state decides whether the files are READABLE ----
+    ///
+    /// A catalog entry alone cannot answer this: `dropNamespace` records removal in the ref state and
+    /// leaves the catalog entry `Live`, so the born-then-dropped fact lives in the recovered state and
+    /// nowhere else. Recovery here cannot mint -- step 1 saw to that.
     ensureRefTableRecovered(ns, *rt);
+
     std::lock_guard<std::mutex> lock(rt->state_mutex);
     /// The removed discriminator is `namespaceIsRemoved`'s, unchanged and for its reasons: `Removed` WITH
     /// a `remove_txn_id` is born-then-dropped, while the never-born default carries none. Read here
     /// rather than by calling that method so both halves of the answer come from this one hold.
     if (rt->state.getLifecycle() != RefLifecycle::Live && rt->state.getRemoveTxnId().has_value())
         return std::nullopt;
-    if (!rt->life)
-        throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "CAS namespace '{}': recovery completed without resolving a catalog life", ns.string());
-    return *rt->life;
+    return lifeUnderLock(ns, *rt);
 }
 
 

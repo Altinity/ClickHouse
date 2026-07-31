@@ -169,22 +169,32 @@ public:
     bool namespaceIsRemoved(const RootNamespace & ns);
 
     /// The catalog life every one of this namespace's objects -- ref-layer AND namespace-file -- is keyed
-    /// under, resolved ONCE per table-open (`ensureRefTableRecovered`'s step 0) and read from the cache
-    /// afterwards. This is the WRITE-side resolution: `resolveNamespaceLife` MINTS a life when the
-    /// catalog names none, so the first namespace file a table ever writes births the namespace exactly
-    /// as its first ref op would.
+    /// under, resolved ONCE per table-open and read from the cache afterwards. This is the WRITE-side
+    /// resolution, and the ONLY one that CREATES: recovery's step 0 (`resolveNamespaceLife`) mints a
+    /// life when the catalog names none, so the first namespace file a table ever writes births the
+    /// namespace exactly as its first ref op would. A read or a removal must not use this -- see the
+    /// sibling below for why that is a correctness matter and not a preference.
     NamespaceLifeId namespaceLife(const RootNamespace & ns);
 
-    /// The life a READER of this namespace's files must use, or `nullopt` when the namespace has no
-    /// readable files at all -- which is the same answer for a namespace whose table was dropped
-    /// (durably `Removed`) as for one that was never born.
+    /// The life a READER (or a REMOVER) of this namespace's files must use, or `nullopt` when there are
+    /// no readable files at all -- which is the same answer for a namespace that never existed, one
+    /// still being created, and one whose table was dropped (durably `Removed`).
     ///
-    /// ONE call, not a predicate plus a resolution, and that is deliberate: the two questions are
+    /// IT NEVER CREATES A NAMESPACE, and that is the property the callers depend on rather than a
+    /// side-effect of how it happens to be written: for an uncataloged namespace it answers from a
+    /// catalog-only lookup and returns without recovering, so an `existsFile` or an
+    /// `unlinkFile(..., if_exists = true)` against a never-opened table cannot admit an entry into the
+    /// single pool-wide catalog object. See the implementation for how the guarantee survives a
+    /// concurrent removal.
+    ///
+    /// ONE call, not a predicate plus a resolution, and that is deliberate: readability and the life are
     /// answered from the SAME `state_mutex` hold over the SAME recovered runtime, so a reader can never
     /// pair "readable" from one observation with a life from another. Returning `optional` rather than a
     /// life plus a bool also makes the unreadable case unusable by construction -- a caller that forgets
     /// to check gets no life to read with, instead of a plausible-looking one that names the wrong
-    /// prefix. Absence is the fail-closed direction: only a KNOWN-readable namespace surfaces files.
+    /// prefix. Absence is the fail-closed direction: only a KNOWN-readable namespace surfaces files, and
+    /// every failure mode of the underlying reads throws rather than degrading to `nullopt`, so "no life"
+    /// is only ever reached for a namespace whose absence is durable knowledge.
     std::optional<NamespaceLifeId> namespaceFilesLifeIfReadable(const RootNamespace & ns);
 
     /// Queues a mutation for flat-combining with compatible callers. `build_ops` runs at most once in
@@ -804,6 +814,11 @@ private:
     /// each primitive this loop calls has its OWN bounded retry against the catalog's single object, so
     /// this bound is only against THIS loop's re-read cycle.
     NamespaceLifeId resolveNamespaceLife(const RootNamespace & ns, uint64_t admitted_generation, uint64_t live_epoch);
+
+    /// `*rt.life`, or `LOGICAL_ERROR` naming `ns` if a runtime reached this point without one. Callers
+    /// must already hold `rt.state_mutex`; it exists so the two public resolvers share ONE statement of
+    /// that invariant instead of two copies that can drift.
+    NamespaceLifeId lifeUnderLock(const RootNamespace & ns, const RefTableRuntime & rt) const;
 
     /// ONE attempt of the recovery walk, run with NO lock held (the candidate is private; nothing
     /// touches `rt` until the install). `nullopt` REQUESTS A RESTART from a fresh listing -- the two

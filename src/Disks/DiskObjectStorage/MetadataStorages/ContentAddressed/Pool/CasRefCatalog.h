@@ -47,6 +47,20 @@ public:
     /// must never key a genuine first birth at a namespace-independent constant).
     static NamespaceLifeId resolveLifeOrSentinel(Backend & backend, const Layout & layout, const RootNamespace & ns);
 
+    /// The catalog's life for `ns` if a `Live`/`Removing` entry names it, else `nullopt` -- ONE catalog
+    /// read and, crucially, NO WRITE OF ANY KIND. This is the resolution a READ or a REMOVAL uses: it
+    /// answers "this namespace does not exist" instead of making it exist, which is what
+    /// `CasRefLedger::resolveNamespaceLife` would do (it mints for an absent entry, correctly, on behalf
+    /// of a writer). A caller must not substitute that one here: a read or an unlink against a
+    /// never-opened table would then perform a catalog CAS and a `_ckpt` publish, growing the single
+    /// pool-wide catalog object -- which is under a capacity-admission predicate -- for a namespace
+    /// nobody ever created.
+    ///
+    /// `Creating` is excluded for the same reason `liveUniverse` excludes it: no publication can exist
+    /// under an entry still being created, so there is nothing to resolve to and nothing to read.
+    static std::optional<NamespaceLifeId> lifeIfCataloged(
+        Backend & backend, const Layout & layout, const RootNamespace & ns);
+
     /// Every `Live`/`Removing` life the catalog currently names, ONE catalog GET -- `Gc::discoverUniverse`'s
     /// own body, factored out so a second caller (`CasFsck.cpp`'s reachability walk, review Important C)
     /// does not re-derive the identical filter independently and risk disagreeing with it about which
