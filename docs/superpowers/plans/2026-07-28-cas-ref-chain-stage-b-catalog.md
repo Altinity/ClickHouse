@@ -90,12 +90,14 @@ task here. Additional Stage-B constraints:
     changes object identity, never file persistence.
 13. Catalog admission refuses loudly; removal is NEVER refused (spec INV-3).
 14. Format bump B (`generation=5`, Task 4) and Task 4b are already-landed development
-    intermediates. Task 4d owns ONE final recreate-only layout bump (`generation=6`) that removes
-    the logical name from physical life keys and introduces `stream/` + `state/`; Task 5's codec
-    changes ride generation 6 and do NOT bump again. There is no migration or dual reader: every
-    older life-key grammar, including generation-5 `<ns>/<inc>/` keys, is rejected with the pool and
-    the pool is recreated. Goldens are regenerated once for Task 4d's layout cut and then adjusted
-    only for Task 5's wire-field deletion, not for another generation.
+    intermediates. Task 4d owns the recreate-only layout cut at `generation=6`: it removes the
+    logical name from physical life keys and introduces `stream/` + `state/`. Task 5 owns the
+    distinct recreate-only wire cut at `generation=7`: it replaces the fold seal with `ref_lives`
+    and deletes `_cleanup` plus its cleanup-item state. There is no migration or dual reader: an
+    older generation fails when the pool opens and the pool is recreated. Thus Task 5 refuses a
+    generation-6 pool rather than discovering its obsolete same-generation grammar later. Regenerate
+    goldens at each honest format cut: layout/generation goldens for Task 4d, then the fold-seal and
+    cleanup goldens for Task 5.
 15. **`_ckpt` stays `O(1)` [directive §4, verbatim]:** "`_ckpt` must remain a fixed-size product
     of scalar monotone facts. Its encoded size must be `O(1)` in the number of refs, files,
     transactions and writer epochs. Do not add maps, collections or cardinality-growing fields.
@@ -207,16 +209,17 @@ while its body names a consequence — split those, and send the behaviour to `B
 | 6b | `trySnapshotPublishOnce` → `tryPublishSnapshotAndAdvanceCheckpointOnce` | directive impl-3 | 4c,6 |
 | 7 | R5 decommission duties | register R5 | 4d,5 |
 | 7a | DELETE probe A — the second full stream LIST and everything that serves it | GC directive §1 | 4d,5b |
-| 7b | Destruction enablement: `UniversePolicy::kDefault` → authoritative | staging contract + GC directive §2 | 4d,5,6,7,7a |
-| 8 | R2+R3: writer duty queue + orphan-blob nomination (one coherent change) + model extensions | register R2/R3, §9 | 4d |
+| 7b | Destruction enablement: `UniversePolicy::kDefault` → authoritative | staging contract + GC directive §2 | 4d,5,6,7,7a,10f |
+| 8 | R2+R3: writer duty queue + orphan-blob nomination (one coherent change) + model extensions | register R2/R3, §9 | 5 |
 | 9 | R1 closure note (verbatim-file rebirth aliasing) — doc only, RE-SCOPED | register R1 | 4d,6 |
-| 10 | TLA debt: `listedTok` audit, unasserted drivers, runnerless models, classifier | phase follow-ups | — |
+| 10 | TLA debt: seven independent review units | phase follow-ups | mixed: 10a after 5b; 10f after 5; remaining units independent |
 | 11 | Stage B gates: battery + churn/rebirth/decommission soak + the sequential-baseline destructive soak + verdict | §9 + GC directive §3 | all |
 | 12 | GC performance research on the destructive baseline + the successor report | GC directive deliverable | 11 |
 | 13 | Post-Stage-B: split the two 4000-line files, goldens FIRST | refactor candidates | 12 |
 
-Task 10 is independent of the code chain and may be scheduled at any point; its sub-tasks obey the
-file-ownership split in `{#parallel-execution-lanes}`. Task 9 is doc-only but is no longer
+Task 10 has seven independently scheduled units: Task 10a follows Task 5b, Task 10f follows Task 5
+and is a hard predecessor of Task 7b, while the other five units are independent of the code chain;
+its sub-tasks obey the file-ownership split in `{#parallel-execution-lanes}`. Task 9 is doc-only but is no longer
 schedule-free: the re-key must exist before it can record where each R1 sub-hazard went. Task 11's
 soak REQUIRES Task 7b (destruction enabled) — a
 soak with destruction still suppressed does not exercise Stage B's claims. Task 12 requires Task 11's
@@ -225,8 +228,9 @@ soak ARTIFACTS, not merely its verdict.
 **Recommended execution order** (a topological order of the column above; the directive's
 §Execution commit list is honored in its own relative order):
 
-`1b → 1c → 2 → 3 → 4 → 4b → 4c → 4d → 5 → 7 → 5b → 6 → 6b → 7a → 7b`, with Task 8 anywhere after Task 4d,
-Task 9 after Task 6, Task 10 anywhere, then Task 11 and finally Task 12.
+`1b → 1c → 2 → 3 → 4 → 4b → 4c → 4d → 5 → 7 → 5b → 6 → 6b → 10f → 7a → 7b`, with
+Task 8 after Task 5, Task 9 after Task 6, Task 10a after Task 5b and the other Task-10 units in
+their stated lanes, then Task 11 and finally Task 12.
 
 **The GC tail (Tasks 7a → 7b → 11's destructive soak → 12) is a SEQUENCE, not a set**, and the
 2026-07-30 directive's rationale is why: probe-A removal is a performance change, destruction
@@ -252,7 +256,7 @@ Two scheduling notes, both deliberate:
 ## Parallel execution lanes {#parallel-execution-lanes}
 
 Time pressure does not make two writers in `CasGc.cpp` or `CasRefLedger.cpp` independent. The critical
-path remains `4d → 5 → (7 ∥ 5b) → 7a → 7b → 11`; commits enter the
+path remains `4d → 5 → (7 ∥ 5b) → 10f → 7a → 7b → 11`; commits enter the
 integration branch in dependency order. Work may run concurrently only from the same committed base,
 with explicit file ownership and sequential integration. A shared dirty worktree is not a parallelism
 mechanism.
@@ -264,9 +268,10 @@ mechanism.
   update layout goldens, test literals, integration prefix constants, soak classifiers and prose. It
   owns no production `.cpp` file and rebases nothing; its commit is applied after the core layout
   commit and any failures are fixed in the owning layer rather than hidden with compatibility aliases.
-- Task 10d/10e/10g and the runner/report portions of Task 10a-c are model-tree work and may proceed in
-  a separate worktree. Task 10f and edits to `CaRefCatalogCore`, `CaRefDeltaIntakeCore` or
-  `CaRefNsCleanupStaleLeaderCore` wait for Task 5's model commit because Task 5 owns those exact files.
+- Task 10b/10c/10d/10e/10g are model-tree work and may proceed in a separate worktree. Task 10a waits
+  for Task 5b's recovery shape. Task 10f and edits to `CaRefCatalogCore`, `CaRefDeltaIntakeCore` or
+  `CaRefNsCleanupStaleLeaderCore` wait for Task 5's model commit because Task 5 owns those exact files;
+  Task 10f integrates before Task 7b.
 - Task 11's report skeleton, suite inventory, artifact directories and an exploratory tidy build may
   start now. Final gates and the authoritative tidy verdict still rerun after Task 7b.
 
@@ -277,7 +282,7 @@ mechanism.
   lifecycle code and the removal integration test. The codec commit lands before the core commit, while
   the model commit remains the code gate. No two lanes edit one production file.
 - Task 4d-specific tool/test cleanup that was not needed for its gate may continue only in files Task 5
-  does not name. Task 8 is logically enabled but is a poor parallel candidate: it overlaps both
+  does not name. Task 8 begins only after Task 5 and is a poor parallel candidate: it overlaps both
   `CasGc.cpp` and `CasRefLedger.cpp`, so defer it unless it has a dedicated worktree and an owner willing
   to integrate after the critical path rather than merge speculative conflicts into it.
 
@@ -1307,7 +1312,8 @@ be invented as replacement authority.
 - [ ] **Step 6: format cut and generation pins.** Advance pool generation 5→6 once; generation-5
   `<ns>/<inc>/` pools refuse with a recreate message. There is no dual parser, copy-forward or fallback.
   Regenerate the layout/generation goldens and assert literal `RootNamespace` text is absent from every
-  new stream/state key. Task 5's subsequent catalog/fold-seal codec edits ride generation 6.
+  new stream/state key. Task 5 later makes its own generation-7 wire cut; it must refuse this
+  generation-6 pool at open rather than accept a second grammar under one generation.
 - [ ] **Step 7: gate and commit.** Full CA battery, both object-storage lanes and the namespace-file
   request-profile test remain green. Commit
   `ca: layout — opaque life ids split namespace streams from state`.
@@ -1351,9 +1357,10 @@ one consumer and no authority over lifecycle or deletion safety.
 **Keep the rewrite mechanical.** Define the new row from the existing coverage fields plus the existing
 cleanup-evidence payload, pin its codec, then delete the two old collections and their string-key helpers
 in one compile-breaking change. The compiler enumerates access sites; most edits are member/key
-substitutions and regenerated format goldens. Only `buildRefWalkPlan` and the exact deletion API contain
-new policy. Format, fsck and inspection code are read-only consumers of the row, not additional
-producers; do not preserve compatibility aliases after the generation-6 cut.
+substitutions and regenerated format goldens. The serialized removal-admission transition,
+`buildRefWalkPlan` and the exact deletion API contain the new policy. Format, fsck and inspection code
+are read-only consumers of the row, not additional producers; do not preserve compatibility aliases
+after the generation-7 cut.
 
 **Files:**
 - Modify: `.../Formats/CasRefCatalogFormat.{h,cpp}` (`removal_started_round` on `Removing`),
@@ -1391,6 +1398,18 @@ belong to this task.
 
 #### Step 2 — one narrow deletion transition {#t5-step2}
 
+- [ ] **Close positive append admission before publishing `Removing`.** Under the local append lane,
+  serialize `Live → Removing` with the catalog CAS: once `Removing` is observed, no already-held
+  runtime/handle may reopen a positive append lane. Keep admission closed while a catalog CAS retries.
+  If the operation fails before a durable transition, it may reopen only after a fresh exact catalog
+  observation still proves `Live` under the same life and fence; otherwise it fails closed. The terminal
+  append follows under that same admitted removal ownership. This is the lifecycle admission bound, not
+  a fresh-name-resolution check.
+- [ ] **Red-first admission tests.** Deterministically pause a cached writer holding its life across
+  the catalog transition and prove it cannot append positive ownership after `Removing` is visible.
+  Separately force a catalog CAS retry and a fence change: admission remains closed during the retry,
+  and a failed pre-durable attempt reopens only after the fresh exact `Live` observation under the same
+  life/fence. Preserve the separate unauthorized-terminal test in Step 5.
 - [ ] Add immutable `removal_started_round` to `Removing`: sample the adopted `gc/state.round` before
   `Live → Removing`, store both changes in that catalog CAS, and reject the field on `Creating`/`Live`.
   It is diagnostic age, not a fence; a stale sample can only surface an already-`Removing` row
@@ -1430,7 +1449,7 @@ making each adapter attempt to mint a row; they do not duplicate a lifecycle pre
   `map<life_id, RefLifeFoldState{RefCoverage, optional<RefCleanupEvidence>}> ref_lives`. Delete
   `cursorKey`, `parseCursorKey`, the `"<namespace>/0"` grammar and every ref-shard-zero branch. The
   strict codec accepts each canonical fixed-width `life_id` once, rejects duplicates and rejects the
-  old split grammar behind the recreate-only format bump. `RefCleanupEvidence` carries only terminal
+  generation-6 split grammar at the generation-7 pool-open cut. `RefCleanupEvidence` carries only terminal
   and removal transaction evidence; its owning `life_id` is the map key. It carries neither a duplicate
   logical name/incarnation pair nor a redundant `Pending`/`Completed` state.
 - [ ] Implement one pure `buildRefWalkPlan(catalog_cut, inputs)` entry point. `inputs` contains parent
@@ -1468,8 +1487,8 @@ making each adapter attempt to mint a row; they do not duplicate a lifecycle pre
   `attempted`/`deleted`/`leaked`/`suppressed`, so a leak-only pass remains observable without implying
   it gates the lifecycle. Delete `RefNsCleanupState`, the separate item's wire record and its `state` field:
   only one value would remain. Re-pin the unified life-row grammar and recalculate its per-entry
-  reservation constant;
-  behind the recreate-only format bump, the old `pending`/`completed` field shape is rejected.
+  reservation constant; the generation-7 recreate-only cut rejects the old `pending`/`completed`
+  field shape when the pool opens.
 - [ ] **A terminal record unreadable BEFORE it folds is lost evidence.** Removal legitimately blocks in
   `Removing`; surface it as a terminal-corrupt stuck removal. **Do not promise `REBUILD` as the escape**
   — nothing establishes it can reconstruct that exact terminal. The credible exits are restoring the
@@ -1532,8 +1551,10 @@ making each adapter attempt to mint a row; they do not duplicate a lifecycle pre
   round's correctness/performance enumeration `LIST(cas/ns/stream/)`; it deliberately does not pay for
   `_files` or `_ckpt`. The janitor alone walks `LIST(cas/ns/)`, at a fixed page/key budget per round,
   storing ONE cleanup-only backend cursor in `gc/state`. The cursor is opaque, size-bounded and reset at
-  end-of-tree so a later cycle can see an object omitted from an earlier one. Invalid/oversized cursors
-  surface and restart from the beginning; losing progress repeats work and cannot authorize deletion.
+  end-of-tree so a later cycle can see an object omitted from an earlier one. A malformed, oversized or
+  backend-rejected cursor fails closed for that page/round: surface the error, perform zero janitor
+  deletes from a substituted cursor, reset only the durable cleanup progress safely, and let a later
+  normally scheduled round begin at the start.
   Keep the work in `namespace_cleanup`; publish `janitor_pages`, `janitor_keys` and
   `janitor_deleted` for Task 11's inventory.
 - [ ] **One physical classifier, joined to the catalog authority.** Parse the fixed family and
@@ -1558,7 +1579,8 @@ making each adapter attempt to mint a row; they do not duplicate a lifecycle pre
   retained only under the existing safe publication order, and a later cycle retries the key.
 - [ ] **Tests:** a suppressed round deletes nothing; a token mismatch retains; an unparseable stream or
   state key records and continues; restart mid-scan resumes from the durable cursor; end-of-tree resets
-  it; invalid and oversized backend cursors restart safely; cursor-update CAS failure does not fail
+  it; invalid, oversized and backend-rejected cursors surface, delete zero janitor objects and reset only
+  durable cleanup progress for a later round; cursor-update CAS failure does not fail
   removal; and a removed namespace whose ONLY residue is `_files`, omitted for one complete cycle and
   returned in the next, is eventually reclaimed. Assert **bytes were actually deleted**, not merely
   that cleanup evidence exists. Add the symmetric `_ckpt`-only case produced by a stop after stalled
@@ -1806,7 +1828,9 @@ first (INV-4). This is not an oversight to fix: several fixtures exist specifica
 no `_ckpt`**, so forcing one would destroy what they test. `Gc::readCheckpointWitnesses` tolerates an absent
 `_ckpt` (only a present-but-undecodable one is held), which is why it costs nothing today. If you ever add
 code that assumes `Live` implies a `_ckpt`, these fixtures are where it will break, and the assumption —
-not the fixtures — is what would be wrong for tests.
+not the fixtures — is what would be wrong for tests. These `Live`-without-`_ckpt` fixtures are
+test-only seams and must never enter production recovery, where `Live` and `Removing` require a
+readable `_ckpt`.
 
 
 [Amendment commit 7's read/write half; the cleanup half is Task 5. This task owns the LIFE HANDLE
@@ -2151,16 +2175,11 @@ would look like it had failed for a reason nobody had measured.
   different fixes, and the round already holds the facts to tell them apart. This is a prerequisite
   step, not a risk note.
 
-**PLACED HERE BY THE PLACEMENT SWEEP (2026-07-30), previously an unplaced deferral:**
-`[CKPT-DAMAGE-NO-REPAIR-PATH]` residual (a) — a single unrepaired `_ckpt` HOLDS its namespace and
-therefore shuts the ROUND-WIDE destructive gate, so one damaged 4 KiB object stops ALL reclamation
-pool-wide. The BACKLOG entry names the code comment that "names the set the flip must carry"
-(`CasGc.cpp:2515`), and this is the task that narrows that gate — so the narrowing must CARRY the
-hold set, or this flip ships the very stall it was meant to relieve. Concretely: when `kDefault`
-becomes authoritative, a held namespace must suppress destruction FOR ITSELF and not for the round,
-and the anomaly-arm term (the undecodable-`_ckpt` namespace with no walk position, which mints no
-hold by design) must be carried too — those are the TWO things the `CasGc.h` "MUST CARRY TWO THINGS"
-paragraph enumerates. Assert both: a pool with one held namespace still reclaims in the others.
+**Deferred design work — no namespace-local narrowing in this task.** Every carried hold remains
+pool-wide suppression. Blob in-degree is pool-wide, and no ownership-partition proof establishes that
+a held namespace cannot own a blob nominated from another namespace. The authoritative gate remains
+`anomalies || carried_holds || !frontier_complete`; delete the contrary one-held-namespace reclamation
+requirement and its test. A future proposal may narrow this only after it supplies that partition proof.
 
 [Codex r2 finding 1: this flip is deliberately AFTER the removal lifecycle (Task 5), the
 read-side/pre-delete contracts (Task 6), and the same-rollout decommission duties (Task 7).]
@@ -2356,7 +2375,8 @@ the note records what landed and not what was intended.
   `namespacePhysicallyEmpty`) → its `_files` arm deleted by Task 4b (rebirth-does-not-wait), `_files`
   out of every lifecycle-gating pass; Task 5 retains one bounded best-effort attempt and the perpetual
   janitor, with omission leak-only;
-  (d) migration → final generation-6 recreate-only cut in Task 4d, Constraint 14.
+  (d) migration → Task 4d's generation-6 layout cut followed by Task 5's generation-7 wire cut,
+  both recreate-only, Constraint 14.
 - [ ] **Step 2 (the one open question):** Determine whether LOOSE MOUNTPOINT OBJECTS carry a
   rebirth-aliasing hazard of their own. They are outside namespace ownership and the directive
   keeps them unqualified, so the answer is expected to be no — but ANSWER it from the code, do not
@@ -2365,13 +2385,13 @@ the note records what landed and not what was intended.
   + a `BACKLOG.md` entry naming the exposure (and only then a small spec, as its own unit of work).
 - [ ] **Step 3:** Commit `ca: docs — R1 verbatim-file aliasing closed by the namespace-life re-key`.
 
-### Task 10: TLA debt from the phase — FOUR sub-tasks, each its own review unit {#task-10}
+### Task 10: TLA debt from the phase — seven review units {#task-10}
 
 [Codex finding 17: the original single-unit framing could hide an evidence-sensitive model
 retirement inside a mechanically enormous diff. Each sub-task below is dispatched, reviewed and
 committed INDEPENDENTLY, with its own before/after results artifact.]
 
-**Task 10a — `listedTok` semantic audit.** Audit `CaGcRootLocalPartManifestCore`'s `listedTok`
+**Task 10a — `listedTok` semantic audit (after Task 5b).** Audit `CaGcRootLocalPartManifestCore`'s `listedTok`
 (`:79`) + the skip gate (`:866`) against v9: does the model's "discovery observes from LIST"
 premise survive universe-from-catalog (Stage B Task 4) AND LIST-independent recovery (Task 5b —
 after the amendment, LIST may only offer a newer candidate, diagnostics or garbage nominations, so
@@ -2414,8 +2434,10 @@ empty entity set produces. What is genuinely at risk is the other direction:
 - [ ] Decide whether to upgrade the pinned jar or keep the old one for safety checking and the new one for
   temporal work; either way the choice must be recorded where the runners can see it.
 
-**Task 10f — the empty-set blind spot, and the unmodelled destructive gate.** Two findings from
-2026-07-30, both verified by inspection; this sub-task is worth more than the rest of Task 10.
+**Task 10f — the empty-set blind spot, and the unmodelled destructive gate (after Task 5; before
+Task 7b).** Two findings from 2026-07-30, both verified by inspection; this sub-task is worth more
+than the rest of Task 10. Its destructive-gate model and every applicable empty-universe configuration
+are a hard predecessor of Task 7b: `Task 5 → Task 10f → Task 7b`.
 
 1. **The destructive gate is not modelled at all.** `Gc::fold` decides destruction on
    `frontier_complete = universe_authoritative && frontier_proven == frontier_namespaces`. No model
@@ -2508,7 +2530,8 @@ Commit alone; final commit updates `models/README.md` + `cas/06-tla-models.md`.
 
 - [ ] **Step 1:** Full CA gtest gate vs Task 0 baseline.
 - [ ] **Step 2:** All CA integration lanes local (Stage A Task 14's list) green.
-- [ ] **Step 3:** Soak battery, all three REQUIRED green:
+- [ ] **Step 3:** Four REQUIRED soak runs are green: (a)–(c) below and the separate 90-minute
+  general soak (d). The fourth run is not folded into any of (a)–(c):
   (a) churn soak — create/drop namespaces at ≥1/s for ≥30 min under load: catalog entry count
   returns to baseline (O(Creating+Live+Removing) — the r9-6 flatness claim), zero alias reads,
   fsck clean; (b) rebirth adversarial scenario — drop/recreate under concurrent readers +
@@ -2517,10 +2540,11 @@ Commit alone; final commit updates `models/README.md` + `cas/06-tla-models.md`.
   incarnation across the whole run, `_files` debris from dead incarnations trending to zero via the
   janitor without ever blocking a rebirth; (c) decommission scenario — victim with hidden `Removing`
   entries recovered under the claimed fence, completed rows deleted only by GC and leftover opaque
-  checkpoints reclaimed by the janitor (Task 7 at soak scale); plus phase 3
-  `--duration 90m` general soak, same PASS criteria as Stage A.
-- [ ] **Step 3c (2026-07-30 GC directive): THE SEQUENTIAL-BASELINE DESTRUCTIVE SOAK.** This is a
-  distinct, REQUIRED soak, not a variant of (a)-(c): run the destructive round on **the current
+  checkpoints reclaimed by the janitor (Task 7 at soak scale); (d) a phase-3 `--duration 90m` general
+  soak, same PASS criteria as Stage A, is the fourth required run and is separate from (a)–(c).
+- [ ] **Step 3c (2026-07-30 GC directive): THE SEQUENTIAL-BASELINE DESTRUCTIVE SOAK.** Run this
+  required destructive workload during the fourth, 90-minute general soak, not as an uncounted fifth
+  specimen and not as a variant of (a)–(c): run the destructive round on **the current
   sequential implementation** — no `MultiDelete`, no parallel deletes, no delete-side concurrency
   (Constraint 18). Its purpose is an honest cost baseline; "faster" is explicitly not a goal here.
   **Cost inventory — every line MEASURED, and a line that cannot be measured is named as un-timed
@@ -2638,8 +2662,8 @@ document is what justifies them).]
    COMPLETED IN STAGE A Task 6 with its deterministic bump tests — Stage B Task 3 adds the
    SEPARATE two-credential catalog site, not a trio member [codex r2 finding 7]; deposited
    incarnation + capture-time correctness → T5 (refs AND `_files` debris after the amendment);
-   `listedTok` audit + drivers + runnerless + classifier → T10a-d; destruction enablement
-   ordering → T7b.
+   `listedTok` audit + drivers + runnerless + classifier → T10a-d; destructive-gate/empty-universe
+   model → T10f → T7b; destruction enablement ordering → T7b.
 3. Every task name-checks its TLA counterpart where one exists; model edits follow phase
    conventions and are grouped in T8 (register models) and T10 (debt) — the five PHASE models
    stay sealed except T10's classifier-only runner fix.

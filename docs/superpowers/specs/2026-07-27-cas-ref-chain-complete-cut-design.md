@@ -143,7 +143,10 @@ leak-only enumeration of
 every family's debris: id-bearing stream objects, `_ckpt` (including the lone checkpoint left by a
 cancelled `Creating`) and `_files` alike. It takes **one fresh catalog GET per page, not per key**, and
 is paced by a single cleanup-only cursor. The mandatory order is `LIST page → fresh catalog GET/decode →
-classify the whole page → exact-token deletes under the GC fence`. The one post-page catalog cut is the
+classify the whole page → exact-token deletes under the GC fence`. A malformed, oversized or backend-rejected
+cursor fails closed for its current round/page: surface the error, perform zero janitor deletes, reset
+only durable cleanup progress safely, and let a later normally scheduled round
+begin at the start. The one post-page catalog cut is the
 life revalidation for every key on that page; there is NO catalog read per key. Before each delete the
 janitor rechecks the GC fence and uses the token captured for that exact object. A duplicate current
 `life_id`, an unreadable catalog or a lost fence suppresses the page's deletes. Unparseable keys are
@@ -333,9 +336,13 @@ exact-CAS-deletes the complete observed `Creating` row and performs no physical 
 janitor reclaims it. This also removes the race in which a losing `DROP` could delete a checkpoint just
 published by a concurrent reconciler.
 No terminal record and no `Removing` are involved, because publication out of
-`Creating` is structurally impossible. **Removal:** catalog `Live → Removing` (the admission bound;
-`Removing` forbids new positive ownership), then the terminal record — appended ONLY by the owning
-mounted writer or a successor that has claimed and fenced that server root; GC surfaces stuck
+`Creating` is structurally impossible. **Removal:** under the local append lane, serialize catalog
+`Live → Removing` as the admission bound: once `Removing` is observed, an already-held runtime or
+handle cannot reopen positive append admission. A catalog CAS retry keeps admission closed. A failure
+before the transition becomes durable may reopen only after a fresh exact catalog observation still
+proves `Live` under the same life and fence; otherwise it fails closed. The terminal record follows
+under that same admitted removal ownership and is appended ONLY by the owning mounted writer or a
+successor that has claimed and fenced that server root; GC surfaces stuck
 removals, never appends, and — see INV-3 — GC exact-CAS-deletes the proved complete `Removing` row,
 threading its leader generation through the mutation like every other fenced caller. The decommission
 actor's exact duties (catalog-exact enumeration, the `Removing` recovery branch, refusal of a
@@ -348,9 +355,11 @@ current lives, never to a deposited cleanup scope. The logical name may accompan
 diagnostic or as part of the exact observed catalog row, but is not duplicated in cleanup evidence and
 cannot redirect physical cleanup. **Recovery ownership:** the mount-fence
 generation is captured at admission and required on every `slot-occupy`, `_ckpt` CAS and install;
-self-remount cancels or waits out recovery before rearming. **Migration: recreate-only.** The pool
-format bumps (writer generation AND backward floor); old-format startup fails closed naming pool
-recreation; recreation must be quiesced so no old writer touches the reused prefix.
+self-remount cancels or waits out recovery before rearming. **Migration: recreate-only.** Task 4d's
+layout is generation 6 and Task 5's incompatible `ref_lives`/`_cleanup` wire removal is generation 7;
+each pool format bump advances writer generation AND backward floor. Older-format startup fails closed
+at pool open naming recreation; there is no dual reader or migration, and recreation must be quiesced
+so no old writer touches the reused prefix.
 
 **Same-name reuse is supported, and no database engine is forbidden.** A namespace derived from a
 table UUID effectively never recurs, because a recreated table mints a fresh UUID — but three routes
@@ -420,8 +429,10 @@ head-CAS alternative (§10 north star).
 `{reason, offending position, retry/backoff}` per `(namespace, incarnation)` — a strict grammar:
 these fields required for classification 4, forbidden otherwise; the wire definition (a bounded
 reason ENUM, numeric maxima, duplicate rules) and a byte-exact reservation including escaping,
-framing and trailer growth are plan obligations with boundary and boundary-plus-one tests (r9-4). `suppress_destructive` = current
-anomalies OR every carried hold, computed before EVERY destructive site. A carried hold forces an
+framing and trailer growth are plan obligations with boundary and boundary-plus-one tests (r9-4).
+`suppress_destructive = anomalies || carried_holds || !frontier_complete`, computed before EVERY
+destructive site. Every carried hold is pool-wide suppression: blob in-degree is pool-wide and no
+ownership-partition proof permits namespace-local reclamation. A carried hold forces an
 exact retry of its offending position even when the hint omits the namespace, and clears ONLY by
 folding through that position and adopting the result in `gc/state` — never by observing another
 absent. **REBUILD carries every hold verbatim into the rebuilt baseline; with a missing or undecodable
@@ -469,7 +480,7 @@ Append path: +0 requests (the allocator gets simpler). Recovery: +1 conditional 
 namespace per epoch transition, and each adopted straggler costs a conditional PUT PLUS an exact
 `GET` (`putIfAbsent` conflicts return no bytes — r9-6) + one `_ckpt` CAS. Snapshot publication:
 +1 `_ckpt` CAS (async). DDL: three conditional writes to create; removal = one `gc/state` GET for the
-diagnostic start round + `Live→Removing` CAS +
+diagnostic start round + append-lane-admitted `Live→Removing` CAS +
 terminal append + one bounded best-effort cleanup pass + one exact catalog-entry CAS. Fold: +1
 catalog `GET` per fold round; destructive rounds add one exact `GET` per quiet namespace (the frontier
 proof). When scheduled, the perpetual janitor adds one bounded page of the separately paced leak-only
@@ -505,7 +516,9 @@ RED-first fault-injected controls, the load-bearing set: the cross-namespace hid
 `-1` (dies without the frontier proof); held namespace → `FORCE REBUILD` → hint hides the witness →
 `B:-1` (dies without hold carry); carried hold with the namespace omitted from the hint; late `+1`
 after the probe during condemnation/graduation/deletion rounds;
-`Creating`/`Removing` catalog races and deletion with a stale or held ref-life row;
+`Creating`/`Removing` catalog races and deletion with a stale or held ref-life row; a cached writer
+paused across `Live→Removing` cannot append positive ownership, including CAS-retry and fence-change
+admission cases;
 ambiguous-then-definite id reuse; CAS-walk both directions incl. clean transitions and `T+1` retry;
 `_ckpt` races (cleanup between PUT and CAS; stale base three-way; merge; no-op skip); recovery
 across self-remount; incarnation inertness at rebirth under churn (create/drop per second: catalog
@@ -526,6 +539,7 @@ publication). The full enumerated list from rounds 5–9 rides in the implementa
 | `seq_floor` in the catalog instead of incarnations | Rejected by the user's churn scenario: floors for dead names never retire → unbounded catalog. Incarnations make debris inert WITHOUT a physical-empty proof, so an entry deletes as soon as its removal completes rather than waiting on one. |
 | Delete the incarnation entirely; forbid exact `RootNamespace` reuse forever | **Proposed and withdrawn, 2026-07-31**, after two independent reviews of the whole phase. It is coherent, and it needs somewhere to remember every retired name — which is the same shape as the `seq_floor` row above, so it fails for the same reason, one level up. A never-deleted `Retired` catalog state grows by one row per historical namespace and eventually refuses admission at the object cap; **normal UUID churn does not bound it**, since every fresh UUID also leaves a permanent row. No bounded exact compaction exists for opaque names, because compacting a retirement record and certifying physical emptiness are the same problem. A marker object outside the catalog bounds nothing either and reintroduces the marker class this design removes. Independently, permanent non-reuse is a regression against supported workflows (§3). |
 | Retirement as a `Retired` catalog state, or as a marker object | Rejected with the row above; both are only needed if the incarnation is deleted. Keeping it means **nothing has to remember a dead namespace at all** — the entry is deleted, debris is inert under its unreferenced opaque life id, and the catalog stays O(active). |
+| Namespace-local hold suppression | Deferred: blob in-degree is pool-wide, and no ownership-partition proof shows a held namespace cannot own a blob nominated by another namespace. The global destructive gate remains authoritative. |
 | Fresh-epoch rebirth | Failed round 6's audit (server-root-wide allocator; unqualified families). |
 | Checkpoint inside the catalog; never cleaning covered logs; in-place migration; RefSnapLog combined state; local floors; enforced timing; widened probe A | Each rejected with its reason recorded in rounds 1–8 (`tmp/codex_r*_findings.md`) and the alternatives tables of v5–v8 (git history of this file). |
 
