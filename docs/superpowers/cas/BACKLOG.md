@@ -3295,3 +3295,29 @@ numbers as an upper bound on severity and a lower bound on the existence of the 
    contention is a tuning answer; a timeout under no contention is a different bug.
 3. Can the object be sharded, or entries batched, without giving up the single-object atomicity the GC
    universe argument depends on? The universe needs a consistent snapshot, not necessarily one key.
+
+## `Mode::Native` tests write into the process working directory {#native-mode-cwd-litter}
+
+**Found 2026-07-31 by a sweep for vacuous absence assertions; reported rather than fixed, because it is
+hygiene beyond that sweep's mandate.**
+
+`Mode::Native` ignores the storage root that `makeLocalObjectStorageForTest` makes unique per test, so
+every Native-mode test that touches a key writes it into the **test process's working directory**.
+Confirmed on disk: `build_debug/p/gen/tok`, `build_debug/p/rc/one`, `build_debug/k/dialect`,
+`build_debug/pool/blobs/ab/abcdef…`, all re-stamped by a gate run, plus an older `p/gen/tok` at the
+repository root from a run in a different directory.
+
+Nothing collides today — `p/gen`, `p/rc`, `k/` and `pool/` are distinct — so this is not a live flake.
+Two consequences that are worth naming:
+
+- **One assertion cannot fail.** `NativeConditionalPutCountsOneAttemptAndCommitted` asserts
+  `putIfAbsent("p/rc/one", …).outcome == PutOutcome::Done` against a file that survives from the previous
+  run. It passes only because `LocalObjectStorage` does not enforce the conditional, so that `EXPECT_EQ`
+  could not observe `PreconditionFailed` either way. The assertion is not the test's subject — the
+  subject is the `ProfileEvents` delta — but a check that cannot fail should not read like one that can.
+- **The litter is a shared namespace across every Native test in the binary**, so the absence of a
+  collision today is luck, not design.
+
+**Fix, when someone takes it:** anchor Native keys through `DB::Cas::tests::nativeKeyUnder`, which now
+exists in `cas_test_helpers.h` for exactly this and states the hazard where a new Native-mode test will
+look. Mechanical, one line per site.
