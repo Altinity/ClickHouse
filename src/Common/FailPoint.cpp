@@ -61,6 +61,7 @@ static struct InitFiu
     ONCE(smt_merge_task_sleep_in_prepare) \
     ONCE(rmt_lightweight_update_sleep_after_block_allocation) \
     ONCE(rmt_merge_task_sleep_in_prepare) \
+    ONCE(merge_tree_refresh_parts_throw_once) \
     ONCE(s3_read_buffer_throw_expired_token) \
     ONCE(s3_send_request_throw_expired_token) \
     ONCE(distributed_cache_fail_request_in_the_middle_of_request) \
@@ -82,6 +83,7 @@ static struct InitFiu
     REGULAR(check_table_query_delay_for_part) \
     REGULAR(dummy_failpoint) \
     REGULAR(prefetched_reader_pool_failpoint) \
+    REGULAR(taskstats_counters_reset_throw) \
     REGULAR(shared_set_sleep_during_update) \
     REGULAR(smt_outdated_parts_exception_response) \
     REGULAR(object_storage_queue_fail_in_the_middle_of_file) \
@@ -98,8 +100,12 @@ static struct InitFiu
     ONCE(libcxx_hardening_out_of_bounds_assertion) \
     ONCE(receive_timeout_on_table_status_response) \
     ONCE(delta_kernel_fail_literal_visitor) \
+    REGULAR(delta_kernel_force_credentials_fingerprint_drift) \
+    ONCE(delta_kernel_force_stale_token_error) \
+    REGULAR(object_storage_force_refresh_callback_success) \
     ONCE(column_aggregate_function_ensureOwnership_exception) \
     REGULAR(keepermap_fail_drop_data) \
+    REGULAR(keeper_fault_on_watch_request) \
     REGULAR(lazy_pipe_fds_fail_close) \
     PAUSEABLE(infinite_sleep) \
     PAUSEABLE(stop_moving_part_before_swap_with_active) \
@@ -135,6 +141,7 @@ static struct InitFiu
     ONCE(iceberg_export_after_commit_before_zk_completed) \
     REGULAR(export_partition_commit_always_throw) \
     ONCE(export_partition_status_change_throw) \
+    REGULAR(export_partition_processed_paths_sync_fail) \
     REGULAR(export_part_non_retryable_throw) \
     REGULAR(export_part_retryable_throw) \
     ONCE(backup_add_empty_memory_table) \
@@ -152,6 +159,10 @@ static struct InitFiu
     PAUSEABLE(mt_merge_selecting_task_pause_when_scheduled) \
     REGULAR(mt_select_parts_to_mutate_no_free_threads) \
     REGULAR(mt_select_parts_to_mutate_max_part_size) \
+    ONCE(mt_alter_throw_in_start_mutation) \
+    ONCE(mt_alter_throw_after_mutation_registered) \
+    ONCE(mt_throw_after_mutation_commit) \
+    ONCE(mt_alter_throw_in_durable_rollback) \
     REGULAR(rmt_merge_selecting_task_no_free_threads) \
     REGULAR(rmt_merge_selecting_task_max_part_size) \
     PAUSEABLE(smt_mutate_task_pause_in_prepare) \
