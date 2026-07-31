@@ -3225,3 +3225,25 @@ ones whose subject was that absence. Grep the swept files for premises of absenc
 existing regression tests because three tests sat next to the anomaly and mentioned it. They existed to
 ROUTE AROUND it. Asserting an enforcement mechanism from a test's neighbourhood rather than its assertions is
 the same class of mistake as every other false claim in this campaign — a statement about another location.
+
+## `life_epoch` monotonicity holds PER SERVER ROOT — decommission must not break it {#life-epoch-monotone-per-server-root}
+
+Recorded 2026-07-31 from Task 4c, which made a decreasing `_ckpt.life_epoch` contribution `CORRUPTED_DATA`
+instead of letting `max` absorb it. That refusal rests on an argument with a stated limit, and the limit is
+what this entry exists for.
+
+`writer_epoch` is durable-monotone **per server root** — `allocateWriterEpoch` CAS-bumps
+`<prefix>/gc/server-roots/<srid>/epoch` — and every live namespace is rooted at its own member's
+`server_root_id`, so a creator and any actor that later reconciles it draw from **one** counter. That is what
+makes "contributions only ever rise" true, and therefore what makes a decrease a fenced-out writer rather than
+an ordinary race.
+
+**If a namespace could ever be created by one server root and later have its `_ckpt` contributed to by
+another, the argument fails**: the two counters are independent and unordered, so an honest contribution from
+the second root could be numerically lower and would be refused as corruption. Nothing does that today.
+
+**Pool-member decommission is where this would be introduced**, since moving or adopting a namespace across
+roots is exactly the shape. Whoever owns that work must either keep a namespace's `_ckpt` contributions within
+one root for its whole life, or replace the monotonicity argument with something that survives two counters —
+and must not discover this by hitting the refusal. The limit is stated at `joinLifeEpoch` in the code as well,
+so the constraint is visible where it is relied upon rather than only here.
