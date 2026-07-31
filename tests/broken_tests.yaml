@@ -317,9 +317,10 @@
   - asan
 
 # STAGE-A RETURN ITEM (`UniversePolicy::kDefault == StageA_Suppressed` in `CasGc.h`, Stage B Task 7b):
-# these three tests assert the real deletion contract and are known-red only because production GC
-# destruction is suppressed pre-Stage-B. Remove all three entries in the same change that flips
-# `UniversePolicy::kDefault`; `grep -n "STAGE-A RETURN ITEM"` across tests/queries must then return nothing.
+# the tests below are known-red only because production GC destruction is suppressed pre-Stage-B, either
+# because they assert the real deletion contract or because they see the suppression warning itself.
+# Remove every one of them in the same change that flips `UniversePolicy::kDefault`;
+# `grep -n "STAGE-A RETURN ITEM"` across tests/queries must then return nothing.
 - name: 05008_ca_gc_snap_prune
   reason: 'KNOWN-RED - `UniversePolicy::kDefault == StageA_Suppressed` in `CasGc.h` suppresses every
     destructive GC site; production GC rounds driven through `SYSTEM CONTENT ADDRESSED GC RUN` never
@@ -338,6 +339,14 @@
     other bug that stalls pipeline convergence (not only this intentional suppression) would print the
     identical line, so it is not a guarantee that suppression is the only possible cause.'
   message: 'FAIL: GC did not drain the retire pipeline within the bounded loop'
+- name: 05010_content_addressed_mounts_gc_health
+  reason: 'KNOWN-RED - `UniversePolicy::kDefault == StageA_Suppressed` in `CasGc.h` makes the fold emit
+    its `destructive work SUPPRESSED this pass` warning on every round, and the harness fails any test
+    that writes to stderr. Unlike the other entries here NOTHING THIS TEST ASSERTS IS WRONG - stdout
+    matches the reference and the run reaches `ok`; only the warning fails it. The message below is the
+    warning text itself, which no code path other than suppression emits, so this entry is narrower than
+    the others - but it will also stop matching the moment the warning is reworded.'
+  message: 'destructive work SUPPRESSED this pass'
 - name: 04295_content_addressed_mutation_no_leftovers
   reason: 'KNOWN-RED - `UniversePolicy::kDefault == StageA_Suppressed` in `CasGc.h` suppresses every
     destructive GC site; condemned entries are re-emitted as `still_retired` every round while

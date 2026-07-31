@@ -11,6 +11,13 @@
 # This is a .sh test (not .sql) because `SYSTEM CONTENT ADDRESSED GC RUN` now returns a
 # one-row-per-disk result set (UX pass); the round below only cares about its side effect (leading
 # once), so its own output is redirected to /dev/null.
+#
+# STAGE-A RETURN ITEM (`UniversePolicy::kDefault == StageA_Suppressed`, Stage B Task 7b): this test is
+# KNOWN-RED under suppression — see the `05010_content_addressed_mounts_gc_health` entry in
+# `tests/broken_tests.yaml`. The synchronous round below emits the fold's `destructive work SUPPRESSED`
+# warning, and the harness fails a test that writes anything to stderr. The assertions themselves pass;
+# only the warning fails it. Remove that `broken_tests.yaml` entry once Task 7b flips
+# `UniversePolicy::kDefault` and the warning stops being emitted.
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
