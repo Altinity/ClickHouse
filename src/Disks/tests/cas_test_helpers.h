@@ -146,6 +146,23 @@ inline DB::ObjectStoragePtr makeLocalObjectStorageForTest()
     return std::make_shared<DB::LocalObjectStorage>(std::move(settings));
 }
 
+/// Anchor a key under an object storage's own root, for the `Mode::Native` tests.
+///
+/// `Mode::Native` uses a key VERBATIM as the physical `LocalObjectStorage` path — no root-prefix
+/// mapping the way `EmulatedSingleProcess`'s `emuPath` does (`LocalObjectStorage::writeObject`/
+/// `readObject` pass `object.remote_path` straight through). A bare relative key like `"some/key"`
+/// would therefore resolve relative to the TEST PROCESS's working directory rather than the
+/// backend's own unique temp root, leaking a real file on disk that outlives the run and that a
+/// later run then observes as pre-existing state. Worse for an assertion of ABSENCE: it answers
+/// "absent" for a reason that has nothing to do with the property under test.
+inline String nativeKeyUnder(const DB::ObjectStoragePtr & storage, const String & suffix)
+{
+    String root = storage->getCommonKeyPrefix();
+    while (!root.empty() && root.back() == '/')
+        root.pop_back();
+    return root + "/" + suffix;
+}
+
 /// ---- on-storage write fixtures (shared by the Pool read/lifecycle/build tests, Tasks 9-13) ----
 ///
 /// These produce objects through the SAME codecs the Pool reads — the documented on-storage

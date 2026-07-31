@@ -30,20 +30,7 @@ using namespace DB::Cas;
 namespace
 {
 
-/// `Mode::Native` uses a key VERBATIM as the physical `LocalObjectStorage` path — no root-prefix
-/// mapping the way `EmulatedSingleProcess`'s `emuPath` does (`LocalObjectStorage::writeObject`/
-/// `readObject` pass `object.remote_path` straight through). A bare relative key like `"some/key"`
-/// would therefore resolve relative to the TEST PROCESS's cwd rather than the backend's own unique
-/// temp root, leaking a real file on disk and risking cross-test contamination if another test
-/// happens to probe the same literal key against a real (non-faked) filesystem check. Every
-/// Native-mode test below anchors its key under the backend's own root instead.
-String nativeKeyUnder(const DB::ObjectStoragePtr & storage, const String & suffix)
-{
-    String root = storage->getCommonKeyPrefix();
-    while (!root.empty() && root.back() == '/')
-        root.pop_back();
-    return root + "/" + suffix;
-}
+using DB::Cas::tests::nativeKeyUnder;
 
 /// A Backend decorator whose head/get/list all throw an untyped runtime error when armed — modelling
 /// a backend with no sharper evidence than "something went wrong" (a network timeout, a 5xx, an

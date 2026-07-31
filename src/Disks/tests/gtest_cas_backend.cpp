@@ -554,7 +554,15 @@ private:
     std::string throw_on_read_path;
 };
 
-DB::ObjectStoragePtr makeThrowOnReadStorageForTest(const std::string & physical_key)
+struct ThrowOnReadFixture
+{
+    DB::ObjectStoragePtr storage;
+    /// Anchored under `storage`'s own root, because `Mode::Native` hands the key to the object storage
+    /// verbatim and this one is a real filesystem.
+    std::string key;
+};
+
+ThrowOnReadFixture makeThrowOnReadStorageForTest(const std::string & key_suffix)
 {
     static std::atomic<uint64_t> counter{0};
     const auto unique = std::to_string(::getpid()) + "_" + std::to_string(counter.fetch_add(1));
@@ -566,17 +574,18 @@ DB::ObjectStoragePtr makeThrowOnReadStorageForTest(const std::string & physical_
 
     DB::LocalObjectStorageSettings settings("test", root, /*read_only_=*/false);
     auto storage = std::make_shared<NativeReadThrowsNoSuchKeyObjectStorage>(std::move(settings));
+    const std::string key = DB::Cas::tests::nativeKeyUnder(storage, key_suffix);
 
     /// Write the object so tryGetObjectMetadata reports it present (HEAD succeeds).
     {
-        auto buf = storage->writeObject(DB::StoredObject(physical_key), DB::WriteMode::Rewrite, std::nullopt);
+        auto buf = storage->writeObject(DB::StoredObject(key), DB::WriteMode::Rewrite, std::nullopt);
         buf->write("content", 7);
         buf->finalize();
     }
 
     /// Now configure: future readObject calls for this key will throw NO_SUCH_KEY.
-    storage->setThrowOnRead(physical_key);
-    return storage;
+    storage->setThrowOnRead(key);
+    return {std::move(storage), key};
 }
 
 }
@@ -586,18 +595,22 @@ DB::ObjectStoragePtr makeThrowOnReadStorageForTest(const std::string & physical_
 /// HEAD→GET window — `get` MUST return `std::nullopt` rather than letting the raw exception escape.
 TEST(CasObjectStorageBackend, NativeModeGetReturnsNulloptOnMidGetNoSuchKey)
 {
-    /// The Native mode backend uses the key verbatim as the physical path (no emu_root prefix), so we
-    /// use the same string for both the physical key and the logical key.
-    const std::string key = "pool/blobs/ab/abcdef0123456789abcdef0123456789";
-    auto storage = makeThrowOnReadStorageForTest(key);
+    /// The Native mode backend uses the key verbatim as the physical path (no emu_root prefix), so the
+    /// logical key IS the physical one the fixture wrote and armed.
+    const auto fixture = makeThrowOnReadStorageForTest("pool/blobs/ab/abcdef0123456789abcdef0123456789");
 
-    ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
+    ObjectStorageBackend backend(fixture.storage, ObjectStorageBackend::Mode::Native);
+
+    /// `get` HEADs before it reads and answers nullopt for an absent key, so without this the nullopt
+    /// below would be satisfied by an object the fixture failed to place — the mid-GET race would go
+    /// untested and the case would still pass.
+    Backend & iface = backend;
+    ASSERT_TRUE(iface.head(fixture.key).exists);
 
     /// HEAD reports the key present; readObject then throws NO_SUCH_KEY.
     /// Contract: get must return std::nullopt, not propagate the S3Exception.
     /// Call through the base-class interface so the default `Range{}` arg is available.
-    Backend & iface = backend;
-    const auto result = iface.get(key);
+    const auto result = iface.get(fixture.key);
     EXPECT_FALSE(result.has_value());
 }
 

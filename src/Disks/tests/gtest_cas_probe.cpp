@@ -150,21 +150,31 @@ TEST(CasProbe, FailsClosedOnUnsupportedSingleAttemptProfile)
 /// writable Pool::open goes through, not just the hook in isolation above.
 TEST(CasProbe, MissingSingleAttemptClientFailsCapabilityProbe)
 {
-    auto b = std::make_shared<ObjectStorageBackend>(
-        DB::Cas::tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::Native);
-    EXPECT_THROW(runCapabilityProbe(*b, "p/.cas_probe"), DB::Exception);
+    auto storage = DB::Cas::tests::makeLocalObjectStorageForTest();
+    /// Native mode passes the key to the object storage verbatim, so the probe prefix must be anchored
+    /// under this storage's own root: a bare prefix lands beside the test process, where an object left
+    /// by another run answers the LIST below and an unrooted LIST answers "no keys" for free.
+    const String probe_prefix = DB::Cas::tests::nativeKeyUnder(storage, "p/.cas_probe");
+
+    auto b = std::make_shared<ObjectStorageBackend>(storage, ObjectStorageBackend::Mode::Native);
+    EXPECT_THROW(runCapabilityProbe(*b, probe_prefix), DB::Exception);
     /// The hook fires before the op battery: no probe keys may have been written.
-    EXPECT_TRUE(b->list("p/.cas_probe", "", 10).keys.empty());
+    EXPECT_TRUE(b->list(probe_prefix, "", 10).keys.empty());
+
+    /// The same LIST can see a key that IS under the prefix — otherwise the emptiness above would be
+    /// indistinguishable from a prefix this backend can never enumerate.
+    ASSERT_EQ(b->putIfAbsent(probe_prefix + "/token", "probe-v1").outcome, PutOutcome::Done);
+    EXPECT_FALSE(b->list(probe_prefix, "", 10).keys.empty());
 }
 
 /// Mirrors PoolPreconditionsFireThroughInstrumentedWrapper: the real mount path wraps the backend in
 /// InstrumentedBackend BEFORE calling runCapabilityProbe, so this check must fire through it too.
 TEST(CasProbe, MissingSingleAttemptClientFiresThroughInstrumentedWrapper)
 {
-    auto inner = std::make_shared<ObjectStorageBackend>(
-        DB::Cas::tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::Native);
+    auto storage = DB::Cas::tests::makeLocalObjectStorageForTest();
+    auto inner = std::make_shared<ObjectStorageBackend>(storage, ObjectStorageBackend::Mode::Native);
     InstrumentedBackend wrapped(inner);
-    EXPECT_THROW(runCapabilityProbe(wrapped, "p/.cas_probe"), DB::Exception);
+    EXPECT_THROW(runCapabilityProbe(wrapped, DB::Cas::tests::nativeKeyUnder(storage, "p/.cas_probe")), DB::Exception);
 }
 
 namespace
