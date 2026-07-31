@@ -32,6 +32,22 @@ frontier proof for EVERY catalog namespace — one exact 404 `GET` per quiet nam
 round is the honest price (fold-only rounds are free; at extreme namespace counts this is the knob
 where the head-CAS alternative re-enters, §8).
 
+**Why the namespace universe is an object and not a listing — stated precisely, because the loose
+version invites a correct rebuttal.** The claim is NOT "LIST is unreliable". It is that a paginated
+LIST and a single-object read answer different questions. A catalog read is one object version: every
+member as of one instant, a **cut**. A multi-page walk stitches separately fetched pages, so the set
+it returns need not have existed at any instant, and it may omit a member that exists throughout.
+Both observations are equally stale by the time anything acts on them — TOCTOU is present in both,
+and pointing that out is true but does not distinguish them. The distinction is that **staleness after
+a cut and a scan that never was a cut are different proof obligations**: staleness is closed
+downstream by protocol (`Creating` forbids publication, the frontier proof, delayed condemnation, the
+delete-site in-degree re-read), whereas nothing downstream can recover a namespace the universe never
+named — the frontier iterates the members it was given, so an omitted namespace is simply not probed
+and its unfolded work never holds destruction. Anyone re-reading this spec and objecting "but LIST
+returns everything that was created" is answering the wrong claim: the requirement is atomic
+completeness, not freshness, and a bounded re-LIST or retry-on-out-of-order buys nothing here because
+a wholesale-absent namespace produces no observation to retry on.
+
 ## 2. Invariants {#invariants}
 
 **INV-1 — per-namespace contiguous ids.** Next id = `greatest_applied.ref_sequence + 1` (already the
@@ -57,19 +73,37 @@ elsewhere. A dying lane that observes the seal retries `T+1`, never mints `T+2` 
 `namespace → {state: Creating | Live | Removing, incarnation}` (+ creator fence identity while
 `Creating`). The incarnation (random 128-bit, minted at `Creating`) qualifies **the ref layer only**:
 `<ns>/<inc>/{_log, _snap, _ckpt}`, with a canonical grammar and refusal of legacy-shaped keys.
-Removal deletes the catalog entry IMMEDIATELY after the terminal record folds and best-effort
-cleanup runs — no physical-empty proof: surviving old-incarnation objects are structurally inert
-(foreign prefix; the fold works only off catalog entries) and a lazy janitor deletes
+Removal deletes the catalog entry **LAST**, and that ordering is an invariant rather than an
+implementation detail: the entry may be deleted only once the terminal record has folded, the
+namespace's cleanup item has retired, and a seal with that namespace's shard-0 cursor **pruned** is
+durable. No physical-empty proof is required — surviving old-incarnation objects are structurally
+inert (foreign prefix; the fold works only off catalog entries) and a lazy janitor deletes
 foreign-incarnation debris whenever listed (omission = deferred cleanup, leak-only direction).
+
+**What the ordering buys, and why it is stated here rather than left to the removal implementation.**
+It makes coexisting lives of one name unrepresentable in GC-held state, which is what allows the fold
+cursor to stay name-keyed: a rebirth cannot inherit a cursor that was pruned before its predecessor's
+entry disappeared. Violating it is not a lost round but a permanent one — an entry deleted while its
+cursor survives leaves a cursor no catalog entry names, which recurs as an anomaly every round and
+suppresses reclamation pool-wide until an administrative rebuild. So the ordering, not a key format,
+is the thing tests must pin. **A same-name birth is refused while the predecessor's removal is
+incomplete**; the refusal is temporary and self-clearing — the retry mints a fresh incarnation once
+the entry is gone — and must be reported as retry-later, never as an internal error.
 **The catalog stays O(`Creating` + `Live` + `Removing`) under any create/drop churn** (stalled
 creators occupy entries until fence-terminal reconciliation — r9-6). Manifests keep their
 `(namespace, mount-epoch, build-sequence)` identity — mount-global build ids already prevent
 rebirth aliasing; verbatim FILES stay unqualified and keep today's `_cleanup` gate — their
 pre-existing rebirth-aliasing hazard is register item R1, not this spec. Capacity: namespace names
-get a byte bound; the creation CAS checks the additive predicate (encoded catalog + every entry's
-worst-case cursor/cleanup/hold reservation vs both the catalog and fold-seal caps — the catalog is
-the serialized admission ledger); `encodeFoldSeal(...).size()` is checked against the cap before
-every PUT. Admission refuses loudly; removal is never refused.
+get a byte bound; the creation CAS checks an additive predicate (encoded catalog + a per-entry
+cursor/cleanup/hold reservation vs both the catalog and fold-seal caps — the catalog is the
+serialized admission ledger); `encodeFoldSeal(...).size()` is checked against the cap before every
+PUT. Admission refuses loudly; removal is never refused. **The reservation is deliberately
+over-covering, not exact.** The asymmetry decides it: over-charging costs admitted namespaces, while
+under-charging wedges the fold round, because the seal is then refused on every attempt. So the
+reservation is a conservative constant per counted row and the index set is chosen to cover rows the
+catalog does not name — a namespace carries cleanup rows after its entry is gone. Exactness here buys
+a handful of extra admissions and costs a boundary-arithmetic proof obligation that has to be
+re-derived on every format change; do not restore it.
 
 > **SUPERSEDED 2026-07-29 — the "verbatim FILES stay unqualified" clause above.** Per the
 > authoritative directive
@@ -104,7 +138,11 @@ readers from their handle — so dropping the incarnation is unrepresentable, no
 
 **Creation** (three conditional writes, DDL-rate): catalog `Creating` → `_ckpt` create → catalog
 `Live`; `Creating` forbids publication, and a stale `Creating` is reconciled by token-exact CAS only
-after its creator's fence is terminal. **Removal:** catalog `Live → Removing` (the admission bound;
+after its creator's fence is terminal. **`Creating` forbids publication STRUCTURALLY, and no separate
+write-path check enforces it:** a production writer cannot obtain a life while the entry is
+`Creating`, because the only life-minting resolution loops until `Live` and is the sole source of a
+life. A second gate on that path would be a fence over an already-fenced route, and its absence is a
+decision — do not add one on the grounds that the invariant is unenforced. **Removal:** catalog `Live → Removing` (the admission bound;
 `Removing` forbids new positive ownership), then the terminal record — appended ONLY by the owning
 mounted writer or a successor that has claimed and fenced that server root; GC surfaces stuck
 removals, never appends. The decommission actor's exact duties (catalog-exact enumeration, the
@@ -118,6 +156,21 @@ generation is captured at admission and required on every `slot-occupy`, `_ckpt`
 self-remount cancels or waits out recovery before rearming. **Migration: recreate-only.** The pool
 format bumps (writer generation AND backward floor); old-format startup fails closed naming pool
 recreation; recreation must be quiesced so no old writer touches the reused prefix.
+
+**Same-name reuse is supported, and no database engine is forbidden.** A namespace derived from a
+table UUID effectively never recurs, because a recreated table mints a fresh UUID — but three routes
+do reach the same `RootNamespace`, and all three are supported syntax rather than misuse: a second
+`FREEZE ... WITH NAME` under a previously used name (a shadow namespace IS the literal backup
+directory, so reuse there is routine by construction), explicit-UUID `ATTACH`/`CREATE` including
+replicated DDL replay that carries the UUID it stored, and any database engine whose table path omits
+the UUID. The incarnation is what makes all three safe uniformly, which is why **banning an engine was
+considered and rejected**: it closes one route of three, and replicated-database recovery deliberately
+creates an `Ordinary` database precisely in order to discard and recreate a table's UUID — so the ban
+would break a supported recovery path and buy nothing. Under a UUID-less layout same-name rebirth
+stops being rare and becomes ordinary; that is an argument for exercising the rebirth path in tests,
+not for prohibiting the layout. Confining a generation token to the shadow path alone was also
+rejected: two key grammars and two lifecycle variants cost more than one uniform incarnation, and
+still leave the explicit-UUID route unguarded.
 
 ## 4. Recovery {#recovery}
 
@@ -255,6 +308,8 @@ publication). The full enumerated list from rounds 5–9 rides in the implementa
 | v1–v4 certificate stack (prev links, seal intervals, pointers, authorities, generations, `R*`, tombstones) | Rejected by the user as accretion; deleted. |
 | Full head-CAS commit chain (blinded consult) | North star: revisit when the wedge is worth deleting or namespace counts make the frontier sweep expensive. v9 carries its catalog, checkpoint and (ref-layer-scoped) incarnations. |
 | `seq_floor` in the catalog instead of incarnations | Rejected by the user's churn scenario: floors for dead names never retire → unbounded catalog. Incarnations make debris inert WITHOUT a physical-empty proof, so entries delete immediately. |
+| Delete the incarnation entirely; forbid exact `RootNamespace` reuse forever | **Proposed and withdrawn, 2026-07-31**, after two independent reviews of the whole phase. It is coherent, and it needs somewhere to remember every retired name — which is the same shape as the `seq_floor` row above, so it fails for the same reason, one level up. A never-deleted `Retired` catalog state grows by one row per historical namespace and eventually refuses admission at the object cap; **normal UUID churn does not bound it**, since every fresh UUID also leaves a permanent row. No bounded exact compaction exists for opaque names, because compacting a retirement record and certifying physical emptiness are the same problem. A marker object outside the catalog bounds nothing either and reintroduces the marker class this design removes. Independently, permanent non-reuse is a regression against supported workflows (§3). |
+| Retirement as a `Retired` catalog state, or as a marker object | Rejected with the row above; both are only needed if the incarnation is deleted. Keeping it means **nothing has to remember a dead namespace at all** — the entry is deleted, debris is inert by foreign prefix, and the catalog stays O(active). |
 | Fresh-epoch rebirth | Failed round 6's audit (server-root-wide allocator; unqualified families). |
 | Checkpoint inside the catalog; never cleaning covered logs; in-place migration; RefSnapLog combined state; local floors; enforced timing; widened probe A | Each rejected with its reason recorded in rounds 1–8 (`tmp/codex_r*_findings.md`) and the alternatives tables of v5–v8 (git history of this file). |
 
