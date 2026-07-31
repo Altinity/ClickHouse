@@ -1103,169 +1103,231 @@ exception. Hence: depends on Task 4, and its behaviour half MAY NOT be cherry-pi
 - [ ] **Step 2:** → FAIL. **Step 3:** Implement. **Step 4:** Full CA gate green. **Step 5: Commit**
   `ca: ref — _ckpt: O(1) invariant stated, conflicting life_epoch is corruption`.
 
-### Task 5: Removal lifecycle — one ordered sequence, entry deleted last {#task-5}
+### Task 5: Removal lifecycle — the transient `RemovalReady` state {#task-5}
 
-**This task was rewritten from scratch on 2026-07-31, not edited.** The previous text had accumulated
-eight interlocking obligations placed on four different dates, including corrections of its own
-corrections; two independent strategic reviews of the whole phase identified that accretion as the
-symptom rather than the content. What follows is derived from the spec's removal ordering, which is now
-an invariant (§3, INV-3), not from the old text. The old obligations were traced individually — the ones
-that died are listed at the end so they are not re-added.
+**Second rewrite, 2026-07-31.** The first rewrite derived everything from "the catalog entry is deleted
+last". That invariant is unsound: while the entry says `Removing`, the frontier proof force-adds it to
+the walked set (`Gc/CasGc.cpp:1990-1998`) and writes a cursor for it (`:2557`), so a pruned-seal
+observation is not stable and a resumed driver has no safe-and-live choice. The spec now carries the
+replacement (INV-3, §3) and this task follows from it.
 
-**The invariant this task exists to establish:** the catalog entry is deleted **LAST** — after the
-terminal record folds, the namespace's cleanup item retires, and a seal with that namespace's shard-0
-cursor **pruned** is durable. Everything else here follows from it. It is what makes coexisting lives
-unrepresentable in GC-held state, which is why the fold cursor needs no incarnation in its key, and why
-most of the old task's content is unnecessary rather than deferred.
+**The invariant.** `Creating → Live → Removing → RemovalReady → absent`. A namespace enters
+`RemovalReady` only when its terminal record has folded AND its life-scoped cleanup item is durably
+`Completed` in the adopted seal AND it holds no durable hold. A `RemovalReady` namespace is **never a
+fold target**. Only then may `_ckpt` be exact-deleted and the complete observed `RemovalReady` row
+exact-CAS-deleted. The state is transient, counted by the same admission reservation as the others, and
+deleted — the catalog stays O(active + in-flight removals).
 
-**Violating the order is permanent, not a lost round.** An entry deleted while its cursor survives leaves
-a cursor no catalog entry names; that recurs as an anomaly every round and suppresses reclamation
-pool-wide until an administrative rebuild. So the tests here pin **the order**, never a key format.
-
-**INTERFACE NOTE from Task 1 (2026-07-29, controller-ledgered).** Task 1 deleted
-`refsNamespacePrefix(RootNamespace)` — the only all-lives LIST prefix — and it STAYS deleted. The janitor
-needs a NEW, differently-named helper, `namespaceAllLivesPrefix(const RootNamespace &)`: ONE helper for
-both object families, because ref objects and `_files` now share the `<ns>/<inc>/` prefix, so one LIST at
-`<ns>/` finds every family's debris. Do not "restore" the old overload — the deleted-overload concept
-checks in `gtest_cas_namespace_life_id.cpp` will correctly fail the build. This is not a smuggled re-add:
-it returns a prefix for LIST only, addresses no single life's object, has no key-building sibling, and is
-unusable for a read or a write because every read/write path demands a `NamespaceLifeId`.
+**Monotonicity is a claim about ALL cursor producers, so the enumeration is part of the proof, not a
+convenience that can be dropped.** Five producers; each needs the predicate, and each needs its own
+test. This list failed to exist twice today, which is why it is here rather than in a report.
 
 **Files:**
-- Modify: `.../Pool/CasRefCatalog.{h,cpp}`, `.../Pool/CasRefLedger.{h,cpp}`, `.../Pool/CasPool.{h,cpp}`,
-  `.../Gc/CasGc.cpp` (cleanup passes and the anomaly classification), the `RefOpKind::RemoveNamespace`
-  call path
+- Modify: `.../Formats/CasRefCatalogFormat.{h,cpp}` (the fourth state and its codec),
+  `.../Pool/CasRefCatalog.{h,cpp}`, `.../Pool/CasRefLedger.{h,cpp}`, `.../Pool/CasPool.{h,cpp}`,
+  `.../Gc/CasGc.cpp`, `.../Gc/CasGcShardPlan.h`, `.../Tools/CasFsck.cpp` (REBUILD's universe)
 - Create: `src/Disks/tests/gtest_cas_ns_removal_lifecycle.cpp`
+- Models: `docs/superpowers/models/CaRefCatalogCore.tla`, `CaRefDeltaIntakeCore.tla`,
+  `CaRefNsCleanupStaleLeaderCore.tla`
 
 **Interfaces:**
-- Consumes: Tasks 2–4c. A `Removing` namespace can carry holds like any other.
-- Produces: the removal sequence below; the typed retryable refusal; `namespaceAllLivesPrefix`; the
-  reader-absence predicate re-answered from catalog state.
+- Consumes: Tasks 2–4c, and step 1 below, which is already landed as `a600c2e433c`.
+- Produces: the fourth state; the five-site predicate; the typed retryable refusal; `CREATE`-side
+  completion of already-earned transitions; `namespaceAllLivesPrefix` and the perpetual janitor; the
+  reader-absence predicate answered from the catalog cut.
 
-#### Order the steps this way, and why {#step-order}
+#### Step 1 — reads and removals stop minting (LANDED, `a600c2e433c`) {#t5-step1}
 
-Steps 1 and 8's rewiring half come first deliberately: both change **what the rest of the task observes**
-— catalog writes and the reader-absence predicate — so every later test runs against final semantics
-instead of being written twice.
+Kept here for the record: the three ref-layer entry points no longer mint. Two follow-ups it left open
+belong to this task.
 
-- [ ] **Step 1 — reads and removals stop minting, at the OPERATION level.** Task 4b closed this for the
-  namespace-file resolver only. Three ref-layer entry points still recover-and-mint and are reached by a
-  removal and a read of a never-opened table: `CasRefLedger::dropNamespace` (minting **before** its own
-  "a never-touched namespace's drop is a harmless no-op" guard, so the guard can never see the case it
-  was written for), `CasRefLedger::listRefs`, and `CasRefLedger::resolveRef` via
-  `CachedPartFolderAccess::dropRefIfPresent` (the DROP DETACHED arm).
-  **Red first, exact:** add `storage->createTransaction()->removeRecursive(kTablePath, {})` to
-  `RemovalOnANeverOpenedTableLeavesTheCatalogUntouched` — it fails today on
-  `EXPECT_FALSE(exists(catalog_object))`, because the existing pin covers the `_files` subdir arm only.
-  Fix by making recovery non-minting on these paths, **not** by moving the no-op guard earlier: an
-  earlier guard answers the drop and leaves the read paths minting.
-  **Test pins:** a read or removal of a never-opened table leaves the catalog byte-identical.
+- [ ] **Split the zero-mutation pin per entry point.** One test each for `listRefs`, `resolveRef` via
+  DROP DETACHED, and table-dir removal, and each must pin **zero catalog mutation in the operation
+  journal** — final byte-equality permits mint-then-delete.
+- [ ] **`DROP` may cancel a stalled `Creating`; an ordinary read may not.** Step 1 made a `Creating`
+  entry read as absent everywhere, which turned `DROP` into a no-op and left a dead creator's entry
+  blocking recreation. Restore the asymmetry as a **lifecycle** capability: live creator fence → typed
+  retry-later, zero mutations; terminal fence → exact-CAS-delete the complete observed `Creating` row,
+  **then** best-effort exact-token delete the old `_ckpt`. The order is load-bearing — reversed, a
+  concurrent reconciler can publish a new `_ckpt` that the losing `DROP` then deletes. A stop between
+  the two leaves a `_ckpt` under an incarnation no entry names: the new life gets a different one and
+  the janitor reclaims it. **Three tests:** live fence → zero mutations; terminal fence → exact
+  deletion of both, in that order; concurrent reconciliation → the losing `DROP` does not delete the
+  winner's `_ckpt`.
 
-- [ ] **Step 2 — the removal sequence.** `Live → Removing` CAS → terminal record appended ONLY by the
-  owning mounted writer or a successor that has claimed and fenced that server root → fold → one bounded,
-  suppression-aware cleanup pass → cleanup item retirement **and** the shard-0 cursor pruned, in a durable
-  seal → `_ckpt` deleted by exact token → catalog entry deleted.
-  **Test pins:** the ORDER, asserted from the backend operation journal rather than from end state; a kill
-  between any two steps resumes idempotently; no step ever re-creates `_ckpt`. GC never appends the
-  terminal record — it only surfaces its absence (step 9).
+#### Step 2 — the fourth state and its transitions {#t5-step2}
 
-- [ ] **Step 3 — recreate-during-removal is a typed retryable refusal.** `createNamespace` today throws
-  `LOGICAL_ERROR` on any existing entry, which is wrong for the one case that is now ordinary. The refusal
-  must name what it is waiting for, and it must be retryable — the spec forbids reporting it as an
-  internal error.
-  **Decide here and record the decision:** the wait spans a terminal fold, a cleanup pass, a retirement
-  observation in a LATER round, and the entry delete — **several GC rounds**. Under a UUID-derived name
-  that is an edge case; under a UUID-less table path a `DROP` + `CREATE` of the same table hits it every
-  time. Either drive an eager targeted fold of the `Removing` namespace's tail from the DROP path, or
-  accept the latency and say so in the message. Do not leave it implied.
-  **Test pins:** `CREATE` of a name under removal gets the typed retryable error, never `LOGICAL_ERROR`;
-  after the entry is gone the same `CREATE` succeeds with a fresh incarnation.
+- [ ] Add `RemovalReady` to the catalog state enum and codec. Round-trip and unknown-state-rejection
+  tests as for the existing three.
+- [ ] **`Removing → RemovalReady` is performed by GC**, using the durably `Completed` matching item as
+  **positive evidence** — never inferring completion from an item's absence — and threading the GC
+  leader's fence generation through the mutation like every other fenced caller.
+- [ ] **No-hold precondition, enforced rather than derived.** Refuse the transition while the namespace
+  has a durable hold. **Sabotage test:** plant a hold, attempt the transition, require refusal. Without
+  this, a hold carried into `RemovalReady` walks a namespace the state promises is never walked, and the
+  two rules either deadlock or destroy the hold.
+- [ ] **Entry deletion is exported for exactly one shape.** The only exported mutation that deletes a
+  row is the exact CAS of a complete observed `RemovalReady` row. **Negative test:** no
+  `Creating`/`Live`/`Removing` row is deletable through any exported mutation, and the admission-only
+  path still cannot carry a removal. This test is the relocated form of the deleted
+  fabricated-missing-entry anomaly test — name it so, because that requirement's ghost will otherwise
+  come back: entry loss is *prevented at the mutation API*, not *detected from debris*.
 
-- [ ] **Step 4 — a rebirth folds from its own beginning.** Keep the same-epoch rebirth regression test, but
-  it now pins the ordering rather than a key format.
-  **Test pins:** a fresh incarnation reusing low sequence numbers within one writer epoch folds from
-  `{0, 0}` — i.e. the cursor was pruned before the entry was deleted, whatever the key format. Add an
-  end-to-end same-name rebirth through a UUID-less or shadow-shaped name: `Atomic`-based suites never
-  exercise it, because a recreated table mints a fresh UUID.
+#### Step 3 — the predicate at all five producers {#t5-step3}
 
-- [ ] **Step 5 — invalidate the cached life when the entry is removed.** `RefTableRuntime::life` has **two**
-  writers, not one: recovery, and the read-path resolution added by Task 4b. Invalidate against both.
-  **Test pins:** drop and rebirth **without** an LRU eviction in between — the warm-runtime case. A test
-  that evicts first passes for the wrong reason.
+One test per site. A missed site voids the monotonicity claim, so a passing subset is not evidence.
 
-- [ ] **Step 6 — the janitor.** Foreign-incarnation debris under a known namespace, discovered by one LIST
-  at `namespaceAllLivesPrefix`, deleted by exact token under the destructive-suppression rules; a token
-  mismatch retains and surfaces rather than deleting. An unparseable key is anomaly-and-continue, never a
-  throw.
-  **Test pins:** the exact-token delete and the mismatch-retains path; **and** a removed namespace whose
-  ONLY residue is `_files`, which promotes its item to `Completed` on the first fold — so the janitor
-  cannot key off a `Pending` item. That sub-case is the whole leak interval Task 4b opened.
+- [ ] **Catalog-only frontier targets** — exclude `RemovalReady` from the walked set.
+- [ ] **Parent-cursor carry** — consult the state per **carried cursor**, not only per walked target.
+  These are different loops; conflating them was how the ordering-only design failed.
+- [ ] **Hint-named namespaces** — surviving debris is still listed, so the round's hint names a
+  `RemovalReady` namespace. It is a **third bucket**: cataloged but not walkable, distinct from both
+  `Live`/`Removing` and absent. The un-cataloged classification must not treat it as either.
+- [ ] **REBUILD** — it rebuilds cursors from catalog + `_ckpt` + arithmetic tails, and `_ckpt` outlives
+  the transition, so an unfiltered REBUILD resurrects the cursor. Untouched by key format; it must gain
+  the predicate.
+- [ ] **Carried holds** — covered by step 2's precondition; the test here is that no hold path admits a
+  `RemovalReady` walk.
+- [ ] **The one benign stale-cut round.** A round whose catalog cut predates the transition may write
+  the cursor once more; rounds serialize through one `gc/state` adoption, so exactly one such round
+  exists. **Test:** start a round, land the CAS mid-round, finish the round — the cursor reappears once,
+  the next round prunes it, and the driver's revalidation waits it out. Pin convergence at **one**
+  round, not "eventually".
 
-- [ ] **Step 7 — re-derive the anomaly discrimination from the new ordering.** Do not port the old
-  two-evidence rule: half its evidence (`_cleanup`) is being deleted, and under the new ordering an
-  ordinary removal produces no un-cataloged transient at all, because the cursor is pruned and the item
-  retired before the entry goes. Entry-less ref-layer debris is old-incarnation-shaped — the janitor's,
-  not the anomaly's.
-  **Before designing it, enumerate every carrier that can re-add a namespace to `walk_targets`**; the
-  claim "an ordinary removal raises no anomaly" rests on that enumeration and only the `parent_cursors`
-  path has been checked.
-  **Test pins both directions:** an ordinary removal through the full sequence raises NO un-cataloged
-  anomaly in any round; a fabricated entry-less, current-shaped key with no terminal record raises one.
-  Also: an entry-less cleanup row is now an anomaly, not a budget case.
+#### Step 4 — cleanup, and the two failures that look alike {#t5-step4}
 
-- [ ] **Step 8 — delete the `_cleanup` marker class.** It is a Stage-A physical-empty vestige that the
-  incarnation makes unnecessary, and deleting it is this task's concrete "fewer markers" deliverable.
-  It has consumers, not just a key: `Pool::namespaceIsRemoved` gates its recreate-flip on the marker, and
-  `dropNamespace` publishes the constant-size `Removed` snapshot. **Rewire the reader-absence predicate
-  onto catalog state FIRST** — `Removing`, then entry-absent — then remove the marker and its publication.
-  **Test pins:** a dropped table's files read absent both during `Removing` and after entry deletion, with
-  no `_cleanup` object ever written, asserted from the operation journal. Amend the spec in the same
-  change: INV-3 still says verbatim files keep the `_cleanup` gate, and that sentence licenses a future
-  reader to re-wire it.
+- [ ] One bounded, suppression-aware cleanup pass; the item reaches `Completed`.
+- [ ] **A terminal record unreadable BEFORE it folds is lost evidence.** Removal legitimately blocks in
+  `Removing`; surface it as a terminal-corrupt stuck removal. **Do not promise `REBUILD` as the escape**
+  — nothing establishes it can reconstruct that exact terminal. The credible exits are restoring the
+  object or recreating the pool, and the message must say so rather than naming a verb that may not
+  work.
+- [ ] **A terminal unreadable AFTER it folded is a cleanup failure and stays leak-only.** The evidence
+  has already moved into the `Completed` item; the object matters only for physically deleting
+  manifests. So the item completes, the transition fires, entry deletion lands, and the manifests remain
+  orphan debris under a **non-suppressing leak counter** — not an anomaly, which would stop the
+  transition and let physical cleanup back into the lifecycle through a side door.
+- [ ] **The no-gating proof, reshaped.** The old `NamespaceRemovalDoesNotListOrDeleteFiles` asserted *no*
+  `_files` LIST, which is wrong now that step 4 deliberately performs a best-effort one. Its point must
+  survive as an operation-journal test: plant `_files`, force their cleanup to fail, and require that
+  the item still reaches `Completed`, the transition still fires, and entry deletion still lands. Named
+  explicitly, or the physical-empty dependency creeps back through failure handling.
 
-- [ ] **Step 9 — surface a stuck removal.** A terminal-less `Removing` observed for N rounds increments a
-  durable counter and logs; GC appends nothing. This is the only observability for a wedged removal.
-  **Test pins:** the counter and the log fire; no terminal record appears.
+#### Step 5 — retirement, `_ckpt`, entry {#t5-step5}
 
-- [ ] **Step 10 — hygiene riders, no tests.** Delete the false `per_ns_shard` comment claiming cursors are
-  written only for namespaces in this round's listing; delete the accepted-cost comment describing a
-  removal path that did not exist when it was written; keep the note that the admission bound does **not**
-  free at `Live → Removing`, so nobody writes a test against the retracted claim.
+- [ ] A round whose cut contains `RemovalReady` removes the matching `Completed` item and omits the
+  shard-0 cursor from the next seal; both absences become durable together.
+- [ ] The driver continues only if the exact `RemovalReady` row is still there, the item is absent and
+  the cursor is absent; then exact-delete `_ckpt`, then exact-CAS-delete the row.
+- [ ] **Test pins the ORDER from the operation journal, and pins the DURABLE state** — a journal can show
+  a seal PUT before the entry CAS even if `gc/state` never adopted that seal. Assert the adopted state
+  points at the pruned seal. Kill between any two steps and resume idempotently; no step re-creates
+  `_ckpt`.
+- [ ] **Unauthorized terminal append is refused.** A non-owner without a claimed fence cannot append the
+  terminal record. A happy-path owner test cannot catch this check's removal.
 
-#### Ownership of the `Removing`-without-`_ckpt` window {#removing-window}
+#### Step 6 — the refusal, and `CREATE`-side completion of earned transitions {#t5-step6}
 
-The removal driver resumes entry deletion on the owning writer's next mount, idempotently, and never
-re-creates `_ckpt`. The dead-root branch belongs to Task 7, not here. **Task 5b's refuse-to-ground is only
-safe because this window has an owner** — dropping it orphans 5b.
+- [ ] Typed retry-later for both `Removing` and `RemovalReady`, naming what it waits for. Never
+  `LOGICAL_ERROR`. **Test:** the eventual success is driven by the real removal sequence, not by a
+  fixture erasing the entry.
+- [ ] **`CREATE` may complete a transition that is already earned, and nothing more.** The
+  `Removing → RemovalReady` CAS when the adopted seal already carries a matching `Completed` item and no
+  hold; the `_ckpt`/entry deletion when the seal already carries neither item nor cursor. It may **not**
+  fold a terminal, run a cleanup pass, or drive a GC round; absent durable evidence it wakes any
+  existing scheduler and returns retry-later. **No wait loops and no new worker** — a full bounded
+  `CREATE`-side fold is a later question to be settled by measurement, not now.
+- [ ] **Test:** with the evidence present, `CREATE` succeeds in-band; with it absent, `CREATE` returns
+  retry-later and has performed **zero** durable mutations beyond the wake.
 
-#### Two derivations that need adversarial treatment inside this task {#open-derivations}
+#### Step 7 — rebirth {#t5-step7}
 
-Both are cheap to resolve here and neither blocks starting.
+- [ ] **Test that actually tests same-name rebirth.** Pre-install a nonzero predecessor cursor, reuse the
+  same writer epoch, run the real removal, and **prove the same `RootNamespace` was reused** — an
+  `Atomic` fixture silently mints a fresh UUID and therefore never exercises this. Include an
+  intervening post-transition GC round. Assert the new life folds from `{0, 0}`.
+- [ ] **Invalidate the cached life when the entry is removed**, against **both** writers of
+  `RefTableRuntime::life` — recovery, and the read-path resolution. **Test:** drop and rebirth with the
+  same runtime object provably still resident and no LRU eviction; a test that evicts first passes for
+  the wrong reason.
 
-- [ ] **The unconstructibility claims rest on prose, not a model.** Under entry-delete-last, an unretired
-  cleanup item implies its entry still exists, so a resumed pass re-deriving from the catalog would get the
-  same old incarnation — which is what makes the reborn-life race and the "two cleanup rows, no entry"
-  worst case unconstructible. The old worst case was found by a review round, not by design, so its
-  replacement deserves the same adversarial treatment: extend `CaRefNsCleanupStaleLeaderCore` with the new
-  ordering rather than trusting the argument. **Until that model exists, keep capture-at-deposition** — it
-  is cheap and already proven, and it is the belt for the case the derivation missed.
-- [ ] **Enumerate the `walk_targets` carriers** (step 7). The same discipline: a claim of the form "this can
-  no longer happen" needs the enumeration that makes it checkable.
+#### Step 8 — the perpetual janitor {#t5-step8}
 
-#### What died with the old task, and why — do not re-add {#died}
+- [ ] `namespaceAllLivesPrefix(const RootNamespace &)` — ONE helper for both object families, since ref
+  objects and `_files` share the `<ns>/<inc>/` prefix, so one LIST finds every family's debris. Do not
+  restore the deleted `refsNamespacePrefix` overload; the concept-negative checks will fail the build,
+  correctly. Direct tests for the helper including its concept-negative and malformed-key boundaries.
+- [ ] The janitor is **perpetual**, not the single bounded attempt of step 4: it is the only reclaimer of
+  a dead life's `_files`, and folding it into one pass would make a LIST omission a permanent leak by
+  design. Exact-token deletes; a token mismatch retains and surfaces; an unparseable key is
+  anomaly-and-continue, never a throw.
+- [ ] **Tests:** a suppressed round deletes nothing; a token mismatch retains; an unparseable key records
+  and continues; and a removed namespace whose ONLY residue is `_files` is reclaimed — its item promotes
+  to `Completed` on the first fold, so the janitor cannot key off `Pending`, and the test must assert
+  **bytes were actually deleted**, not merely that the item is `Completed`.
 
-- **Incarnation-scoped fold cursors.** Unnecessary once the ordering is pinned: a rebirth cannot inherit a
-  cursor pruned before its predecessor's entry disappeared. Re-keying `cursorKey`, `parseCursorKey`, the
-  seal's per-namespace map and every consumer is exactly the pervasive identity change this phase is trying
-  to stop, duplicated for a second object family.
-- **The stale-resume-versus-reborn-life test family.** Collapses to one test asserting the ordering makes
-  the race unconstructible.
-- **The Σ-index-set decision and its worst-case test.** Both of its cases — two cleanup rows for one
-  namespace, and a cleanup row with no catalog entry — require a rebirth before the first removal retired,
-  which the ordering forbids. The spec's over-covering reservation supersedes the exact decision.
-- **Refusing a birth over surviving objects as a permanent rule.** Rejected in the spec's alternatives
-  table: it needs somewhere to remember every retired name, which is unbounded for opaque names, and it
-  breaks supported reuse.
+#### Step 9 — the `_cleanup` class and the `Removed` snapshot die together {#t5-step9}
+
+- [ ] Rewire reader absence onto the catalog cut first — `Removing`, `RemovalReady`, or absent — then
+  delete the `_cleanup` marker, its publication, and the `Removed` lifecycle snapshot.
+  `namespaceIsRemoved` is rewired or deleted; leaving either artefact keeps a physical-empty vestige
+  alive with no reader.
+- [ ] **Test:** plant an old-life file and prevent its cleanup, then assert the backend still holds the
+  bytes while logical reads answer absent — otherwise absence may hold merely because the object
+  vanished, which would pass while the predicate was wrong. Assert from the operation journal that no
+  `_cleanup` object is ever written.
+
+#### Step 10 — diagnostics that do not suppress {#t5-step10}
+
+- [ ] A cursor naming no catalog entry is **counted and logged** — ProfileEvent plus one line naming the
+  cursor — and **does not set `suppress_destructive`**. Under the new invariants that shape has three
+  producers: the benign one-round window, a defect in the five-site predicate, or corruption that passed
+  the mandatory-catalog gate. Suppressing would bring back the measured pool-wide stall; silence would
+  mask the second. Alert-only.
+- [ ] Stuck-removal surfacing fires for a terminal-less `Removing` **and** for an item wedged `Pending`
+  by a pre-fold corrupt terminal. **Test:** no signal through round N−1, transition at N, per-round
+  behaviour after, persistence across restart, and GC appends nothing.
+
+#### Step 11 — capacity, models, hygiene {#t5-step11}
+
+- [ ] **Capacity: the reservation is over-covering, and its index set must cover the non-`nsc` terms.**
+  `btr` rows are per run segment and `cnd` rows are per gc-shard; neither is charged per entry, and
+  ordering said nothing about them, so they did not die with the Σ decision. Charge conservatively and
+  refuse admission loudly; removal is never refused.
+- [ ] **TLA phase 0, gated before code:** `CaRefCatalogCore` gains the fourth state and its transition
+  table; `CaRefDeltaIntakeCore`'s catalog sample gains `RemovalReady` so the frontier-proof sabotages can
+  express it; `CaRefNsCleanupStaleLeaderCore` keeps its existing violation and gains a sabotage for the
+  no-hold precondition. **Capture-at-deposition stays, with its capture-time test and at least one
+  stale-leader-after-rebirth data-loss test** — that model already constructs the interleaving an earlier
+  rewrite declared unconstructible, and ordering does not revoke a running actor's local copy of an older
+  seal.
+- [ ] **Task 7 gains two resumption rows:** `RemovalReady`-without-`_ckpt` (a stop after the `_ckpt`
+  delete) and `RemovalReady`-with-`_ckpt` on a dead root. Its branches were specified against
+  `Removing`-without-`_ckpt` only; without these the window is unowned again.
+- [ ] Hygiene, one line each: delete the false `per_ns_shard` comment claiming cursors are written only
+  for namespaces in this round's listing; delete the accepted-cost comment describing a removal path that
+  did not exist when written; keep the note that the admission bound does **not** free at
+  `Live → Removing`.
+- [ ] **Gates and commit:** the CA battery under one `flock` hold covering build and gate, both
+  object-storage lanes, and commits by explicit path.
+
+#### What died, and why — do not re-add {#t5-died}
+
+- **"Entry deleted last" as the load-bearing invariant.** Unsound: not stable while the entry says
+  `Removing`. Replaced by the state, not weakened.
+- **Incarnation-scoped fold cursors.** Cursor identity surfaces in eight files spanning the wire grammar,
+  every builder and parser, REBUILD, fsck and the sweep's coverage lookup — against one enum value, one
+  codec branch, one transition and five predicate sites. And life-keying creates a new class it does not
+  solve: a dead life's cursor sits in the seal with no entry to retire it, which is the unbounded-history
+  argument relocated into `gc/state`.
+- **Permanent refusal of rebirth, and a permanent `Retired` row.** Both need somewhere to remember every
+  retired name, which is unbounded for opaque names; and permanent refusal breaks supported reuse —
+  shadow backup names, explicit UUIDs in replicated DDL replay, UUID-less table paths.
+- **The fabricated-missing-entry anomaly requirement.** Relocated, not removed: a legal removal and a
+  fabricated entry loss are byte-identical, so it is pinned at the mutation API instead (step 2).
+- **The Σ-index-set exactness decision.** Superseded by the over-covering reservation. Its two cases
+  needed a rebirth before the first removal retired, which the state forbids — but note the `btr`/`cnd`
+  terms did NOT die with it (step 11).
 
 ### Task 5b: `chooseRecoveryGrounding` — recovery becomes LIST-independent {#task-5b}
 
