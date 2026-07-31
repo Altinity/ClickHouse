@@ -357,11 +357,11 @@ TEST(CasRefCkpt, MergeTakesThePerFieldSemanticMaximum)
     /// Each field newer on the RIGHT, then the same case mirrored to the LEFT: the merge is symmetric,
     /// which is exactly why the two writers need no ordering between them.
     ///
-    /// The `life_epoch` rows stay mirrored, and after Task 4c that is a deliberate statement rather than
-    /// an oversight: a `life_epoch` that FALLS is refused, but the refusal lives in `publishCkpt`, which
-    /// knows which side is durable, and NOT here. This function stays commutative, so both directions
-    /// must keep yielding the maximum. See `CasRefCkptJoin` (`gtest_cas_ref_ckpt_join.cpp`) for the
-    /// refusal itself and for why it cannot be expressed at this level.
+    /// The `life_epoch` rows stay mirrored, and that is a deliberate statement rather than an oversight:
+    /// a `life_epoch` that FALLS is refused, but the refusal lives in `publishCkpt`, which knows which
+    /// side is durable, and NOT here. This function stays commutative, so both directions must keep
+    /// yielding the maximum. See `CasRefCkptJoin` (`gtest_cas_ref_ckpt_join.cpp`) for the refusal itself
+    /// and for why it cannot be expressed at this level.
     EXPECT_EQ(mergeCkpt(low, high_ckpt), high_ckpt);
     EXPECT_EQ(mergeCkpt(high_ckpt, low), high_ckpt);
     EXPECT_EQ(mergeCkpt(low, high_seal), high_seal);

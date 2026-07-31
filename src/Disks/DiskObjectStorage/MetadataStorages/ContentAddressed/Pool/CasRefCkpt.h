@@ -80,10 +80,11 @@ struct CkptDeadline
 ///     It is the only record of recovery's base and of what cleanup may delete; replacing it with a
 ///     body derived from `contribution` alone would erase the base while leaving a well-formed object
 ///     behind -- corruption laundered into something a reader would trust.
-///   - a contribution whose `life_epoch` is BELOW the durable one raises `CORRUPTED_DATA` on every
-///     attempt, checked after that attempt's read and before its merge, so no body is built and no CAS
-///     is sent. This is the one refusal that HAS to live here rather than in `mergeCkpt`: only this
-///     function knows which side is durable.
+///   - a contribution whose `life_epoch` is BELOW the durable one raises `CORRUPTED_DATA`, checked after
+///     that attempt's read and before its merge, so no body is built and no CAS is sent. This is the one
+///     refusal that HAS to live here rather than in `mergeCkpt`: only this function knows which side is
+///     durable. It is reported as corruption ONLY for a writer the fence still admits -- one the fence
+///     is about to refuse gets `FencedOut` like every other refusal here, since it landed nothing.
 ///   - exhausting the deadline (or the live-lock brake) under persistent conflict throws the
 ///     retry-later class. No partial state exists to clean up: every attempt either committed the
 ///     complete merged body or changed nothing.

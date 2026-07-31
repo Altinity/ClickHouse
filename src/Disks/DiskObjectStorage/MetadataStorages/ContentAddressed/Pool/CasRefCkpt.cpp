@@ -64,17 +64,35 @@ std::optional<T> maxKnown(const std::optional<T> & a, const std::optional<T> & b
 /// (That argument is per-server-root. It would need revisiting if one namespace could ever be created
 /// by two DIFFERENT server roots, whose epoch counters are independent and so unordered.)
 ///
-/// Called BEFORE the merge, so a refused attempt has neither built a body nor sent a CAS.
-void checkLifeEpochDoesNotDecrease(const RefCkpt & durable, const RefCkpt & contribution, const String & key)
+/// It is a PREDICATE rather than a check that throws, because the caller has to consult the mount fence
+/// between detecting this and classifying it: a writer the fence is about to refuse has landed nothing
+/// anywhere, and reporting corruption for it would turn an expected transient control signal into a
+/// permanent verdict. Only a STILL-ADMITTED writer contributing a superseded epoch is the violation this
+/// detects.
+bool lifeEpochWouldDecrease(const RefCkpt & durable, const RefCkpt & contribution)
 {
-    if (!durable.life_epoch || !contribution.life_epoch)
-        return;
-    if (*contribution.life_epoch < *durable.life_epoch)
-        throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "CAS {}: life_epoch may not decrease -- {} is durable and a writer contributed {}. Writer "
-            "epochs are monotone per server root, so a lower contribution means a superseded writer's "
-            "work reached this object; refusing rather than taking the maximum",
-            key, *durable.life_epoch, *contribution.life_epoch);
+    return durable.life_epoch && contribution.life_epoch && *contribution.life_epoch < *durable.life_epoch;
+}
+
+/// The verdict for a decrease by a writer that IS still admitted.
+///
+/// The message says the object cannot be repaired in place, because that is the part an operator cannot
+/// work out from the numbers and cannot afford to guess: nothing rewrites `_ckpt` downwards, and no
+/// writer deletes it outside namespace removal, so if the durable value is the wrong one then every
+/// honest writer from here on contributes something lower and hits this same refusal forever. The
+/// refusal is still right -- silently adopting a suspect genesis epoch would corrupt the epoch-seal
+/// grammar for the life of the namespace -- but a fail-closed state with no in-place exit has to say so
+/// where it fires, not leave the operator to discover it by retrying.
+[[noreturn]] void throwLifeEpochDecrease(const RefCkpt & durable, const RefCkpt & contribution, const String & key)
+{
+    throw Exception(ErrorCodes::CORRUPTED_DATA,
+        "CAS {}: life_epoch may not decrease -- {} is durable and a still-admitted writer contributed {}. "
+        "Writer epochs are monotone per server root, so a lower contribution means a superseded writer's "
+        "work reached this object; refusing rather than taking the maximum. This object has NO in-place "
+        "repair: it is never rewritten downwards and is deleted only by namespace removal, so if {} is "
+        "itself the wrong value then every later writer will hit this same refusal and the namespace "
+        "cannot be written again until it is recreated",
+        key, *durable.life_epoch, *contribution.life_epoch, *durable.life_epoch);
 }
 
 }
@@ -120,10 +138,30 @@ CkptPublishOutcome publishCkpt(Backend & backend, const Layout & layout, const N
         /// there NOW: reusing the previous attempt's reading is precisely the read-modify-write with
         /// the merge left out, one round later.
         const std::optional<CkptSample> current = readCkpt(backend, layout, life);
-        /// The one rule the commutative merge cannot state, checked where the durable side is known and
-        /// BEFORE the merge, so a refusal builds no body and sends no CAS.
-        if (current)
-            checkLifeEpochDoesNotDecrease(current->ckpt, contribution, key);
+
+        /// The one rule the commutative merge cannot state, and it has to be decided HERE, before the
+        /// merge: the semantic maximum turns a decrease into a body identical to the stored one, which
+        /// the identical-skip below would return as a successful no-op. Detecting it after the merge
+        /// would therefore detect nothing.
+        ///
+        /// The FENCE decides which of the two verdicts it gets, so it is consulted first. A writer the
+        /// fence is about to refuse has landed nothing anywhere and gets `FencedOut` -- the same
+        /// transient control signal every other refusal in this function returns rather than throws. A
+        /// writer that is still admitted and yet contributing a superseded epoch is the fence violation
+        /// this detects, and that one is corruption.
+        if (current && lifeEpochWouldDecrease(current->ckpt, contribution))
+        {
+            try
+            {
+                check_fence_or_throw(admitted_generation);
+            }
+            catch (...)
+            {
+                return CkptPublishOutcome::FencedOut;
+            }
+            throwLifeEpochDecrease(current->ckpt, contribution, key);
+        }
+
         /// ANY writer may create the object; none of them may invent a field. An absent `_ckpt` is
         /// created from the contribution as it stands, so a publisher that knows only the checkpoint
         /// creates one that knows only the checkpoint, and the birth transaction's `life_epoch` merges

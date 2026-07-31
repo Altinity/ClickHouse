@@ -101,8 +101,9 @@ String publishAtReturningManifestKey(
                                                          .manifest_ordinal = 1}});
 }
 
-/// Write `ns`'s `_ckpt` directly. The real writers merge by semantic maximum through `publishCkpt`;
-/// a fixture that owns the whole namespace states the checkpoint outright.
+/// Write `ns`'s `_ckpt` directly. The real writers go through `publishCkpt`, which merges by semantic
+/// maximum and additionally refuses a `life_epoch` below the durable one; a fixture that owns the whole
+/// namespace states the checkpoint outright.
 void writeCkptRaw(Backend & backend, const Layout & layout, const RootNamespace & ns, const RefCkpt & ckpt)
 {
     backend.putIfAbsent(layout.refCkptKey(NamespaceLifeId::stageATransition(ns)), encodeRefCkpt(ckpt));

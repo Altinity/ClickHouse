@@ -20,7 +20,7 @@
 #include <type_traits>
 #include <vector>
 
-/// Stage B task 4c: the `_ckpt` JOIN and the `O(1)` SIZE invariant (Constraint 15).
+/// The `_ckpt` JOIN law and its `O(1)` SIZE invariant.
 ///
 /// `mergeCkpt` already has a suite (`CasRefCkpt` in `gtest_cas_ref_ckpt.cpp`) covering it as one step of
 /// the publish algorithm. This suite's subject is narrower and different: the JOIN LAW itself, per
@@ -76,10 +76,20 @@ constexpr uint64_t U64_MAX = std::numeric_limits<uint64_t>::max();
 /// adding a field, or widening one, fails a test rather than quietly moving the bound.
 constexpr size_t CKPT_WORST_CASE_ENCODED_BYTES = 176;
 
-/// Refs published per transaction by the helper below. The append lane caps a normal-class item at 5000
-/// operations and `publishCommittedOps` emits two per ref, so a namespace holding ten thousand refs is
-/// necessarily built over several transactions -- the cardinality under test cannot be reached in one.
-constexpr size_t REFS_PER_TXN = 2000;
+/// The high-cardinality side of the size fence, in ONE transaction. Bounded above by the append lane's
+/// 5000-operation cap on a normal-class item (`publishCommittedOps` emits two ops per ref), and kept at
+/// one transaction on purpose: spreading a larger namespace over several of them costs tens of seconds
+/// in a debug build, and a size fence that cannot finish inside the harness budget fences nothing. Any
+/// per-ref term in `_ckpt` is as visible at this count as at any larger one.
+constexpr size_t MANY_REFS = 2000;
+
+/// Fixed-width, so the refs themselves cannot be what differs between the two namespaces: the claim
+/// under test is that ref cardinality does not reach `_ckpt`, and a name that grew with `i` would
+/// confound a size comparison if it ever did.
+String refName(size_t i)
+{
+    return fmt::format("r{:08}", i);
+}
 
 /// A fence that never refuses, and a deadline far enough out that only the test's own contention
 /// decides the outcome -- each `_ckpt`/catalog test file defines its own copy, matching the precedent
@@ -157,33 +167,27 @@ NamespaceLifeId liveLifeOrFail(Backend & backend, const Layout & layout, const R
     return NamespaceLifeId::stageATransition(ns);
 }
 
-/// Births `ns`, publishes `ref_count` committed refs through the REAL append lane in transactions of
-/// `REFS_PER_TXN`, and returns that namespace's durable `_ckpt` as encoded bytes.
+/// Births `ns` and publishes `ref_count` committed refs through the REAL append lane, in ONE
+/// transaction, and returns that namespace's durable `_ckpt` as encoded bytes.
+///
+/// One transaction also holds every OTHER dimension fixed while `ref_count` varies: two namespaces
+/// built this way end at the same transaction id, so a difference in their `_ckpt` bodies can only be
+/// the refs. `ref_count` must therefore stay within the append lane's per-item operation cap.
 String encodedCkptOfNamespaceWithRefs(const PoolPtr & store, Backend & backend, const Layout & layout,
                                       const RootNamespace & ns, size_t ref_count)
 {
-    for (size_t base = 0; base < ref_count; base += REFS_PER_TXN)
-    {
-        const size_t end = std::min(base + REFS_PER_TXN, ref_count);
-        store->appendRefOps(ns, MutationScope::wholeShard(),
-            [base, end](const RefTableState & state)
-            {
-                std::vector<RefOp> ops;
-                if (state.getLifecycle() != RefLifecycle::Live)
-                    ops.push_back(namespaceBirthOp());
-                for (size_t i = base; i < end; ++i)
-                {
-                    /// Fixed-width names so the refs themselves cannot be the thing that differs: this
-                    /// helper's whole claim is that ref cardinality does not reach `_ckpt`, and a ref
-                    /// whose NAME grew with `i` would confound a size comparison if it ever did.
-                    const String ref = fmt::format("r{:08}", i);
-                    for (const RefOp & op : publishCommittedOps(ref, ManifestRef{1, i + 1, 1}))
-                        ops.push_back(op);
-                }
-                return ops;
-            },
-            RootMutationOrigin::Writer, RootMutationKind::Publish);
-    }
+    store->appendRefOps(ns, MutationScope::wholeShard(),
+        [ref_count](const RefTableState & state)
+        {
+            std::vector<RefOp> ops;
+            if (state.getLifecycle() != RefLifecycle::Live)
+                ops.push_back(namespaceBirthOp());
+            for (size_t i = 0; i < ref_count; ++i)
+                for (const RefOp & op : publishCommittedOps(refName(i), ManifestRef{1, i + 1, 1}))
+                    ops.push_back(op);
+            return ops;
+        },
+        RootMutationOrigin::Writer, RootMutationKind::Publish);
 
     const NamespaceLifeId life = liveLifeOrFail(backend, layout, ns);
     const std::optional<CkptSample> sample = readCkpt(backend, layout, life);
@@ -348,15 +352,51 @@ TEST(CasRefCkptJoin, JoinDecreasingLifeEpochIsCorruptionAndPublishesNothing)
     }
 
     /// BOTH values, not just the offending one: an operator reading this has to be able to tell which
-    /// writer is the superseded one without going to the object.
-    EXPECT_NE(message.find('9'), String::npos) << "the durable value must be named: " << message;
-    EXPECT_NE(message.find('3'), String::npos) << "the contributed value must be named: " << message;
+    /// writer is the superseded one without going to the object. Matched as RENDERED substrings rather
+    /// than as bare digits -- a lone "9" would also be satisfied by a key or a byte count that happened
+    /// to contain it, so a bare-digit match would keep passing after the message stopped saying this.
+    EXPECT_NE(message.find("9 is durable"), String::npos) << "the durable value must be named: " << message;
+    EXPECT_NE(message.find("contributed 3"), String::npos) << "the contributed value must be named: " << message;
     EXPECT_NE(message.find(key), String::npos) << "the key must be named: " << message;
+    /// And that the object cannot be repaired in place, which is the part an operator cannot derive
+    /// from the two numbers.
+    EXPECT_NE(message.find("NO in-place repair"), String::npos)
+        << "the message must say the object has no in-place repair: " << message;
 
-    /// And nothing was written. The refusal happens inside the merge, which runs before the CAS is
-    /// built, so the durable body is untouched and no write was even attempted.
-    EXPECT_EQ(backend.casPutCount(key), cas_puts_before) << "the publisher must not CAS on a refused merge";
+    /// And nothing was written. The refusal is decided before the body is built, so the durable object
+    /// is untouched and no write was even attempted.
+    EXPECT_EQ(backend.casPutCount(key), cas_puts_before) << "the publisher must not CAS on a refused publish";
     EXPECT_EQ(lifeEpochOrFail(backend, layout, life), 9u) << "the durable value is unchanged";
+}
+
+/// The other half of the refusal, and the reason it consults the fence before classifying: the SAME
+/// decrease from a writer the fence is about to refuse is not corruption. That writer landed nothing
+/// anywhere, so what it gets is the transient control signal every other refusal in `publishCkpt`
+/// returns rather than throws. Reporting corruption for it would turn "your incarnation moved, retry"
+/// into a permanent verdict on the namespace, which is the opposite of what the detector means: the
+/// violation is a STILL-ADMITTED writer contributing a superseded epoch.
+TEST(CasRefCkptJoin, ADecreasingLifeEpochFromAFencedOutWriterIsReportedFencedOutNotCorruption)
+{
+    CountingBackend backend;
+    Layout layout("p");
+    const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(RootNamespace{"a"}, UInt128(42));
+    const String key = layout.refCkptKey(life);
+
+    const RefCkpt durable{.life_epoch = 9, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
+    ASSERT_EQ(publishCkpt(backend, layout, life, durable, 1, ALWAYS_ADMITTED, generousDeadline()),
+              CkptPublishOutcome::Published);
+    const uint64_t cas_puts_before = backend.casPutCount(key);
+
+    const std::function<void(uint64_t)> always_fenced = [](uint64_t admitted)
+    {
+        throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "fence generation moved since admission ({})", admitted);
+    };
+    const RefCkpt superseded{.life_epoch = 3, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
+    EXPECT_EQ(publishCkpt(backend, layout, life, superseded, 1, always_fenced, generousDeadline()),
+              CkptPublishOutcome::FencedOut);
+
+    EXPECT_EQ(backend.casPutCount(key), cas_puts_before);
+    EXPECT_EQ(lifeEpochOrFail(backend, layout, life), 9u);
 }
 
 /// `checkpoint_snapshot_id` and `last_epoch_seal` continue to merge by SEMANTIC MAXIMUM. Unlike
@@ -404,7 +444,7 @@ TEST(CasRefCkptJoin, EncodedCkptSizeIsIndependentOfCardinality)
     Layout layout("p");
 
     const String one = encodedCkptOfNamespaceWithRefs(store, *backend, layout, RootNamespace{"srv1/one"}, 1);
-    const String many = encodedCkptOfNamespaceWithRefs(store, *backend, layout, RootNamespace{"srv1/many"}, 2000);
+    const String many = encodedCkptOfNamespaceWithRefs(store, *backend, layout, RootNamespace{"srv1/many"}, MANY_REFS);
 
     ASSERT_FALSE(one.empty());
     ASSERT_FALSE(many.empty());
@@ -414,15 +454,16 @@ TEST(CasRefCkptJoin, EncodedCkptSizeIsIndependentOfCardinality)
     /// The same claim stated so that it does not depend on the chosen cardinality at all: no ref
     /// PUBLISHED into the namespace appears anywhere in its `_ckpt`. A count-based comparison can only
     /// catch a term that grows; this catches one that is merely there.
-    EXPECT_EQ(many.find("r00000000"), String::npos)
+    EXPECT_EQ(many.find(refName(0)), String::npos)
         << "a published ref's NAME appears in `_ckpt`: " << many;
-    EXPECT_EQ(many.find("r00001999"), String::npos)
+    EXPECT_EQ(many.find(refName(MANY_REFS - 1)), String::npos)
         << "a published ref's NAME appears in `_ckpt`: " << many;
     EXPECT_EQ(one.size(), many.size())
         << "Constraint 15: `_ckpt`'s encoded size must not grow with the number of refs or files in the "
            "namespace. A collection or per-ref term was added to an object that has NO repair path and "
            "gates destructive cleanup; it belongs in a separate immutable object or ledger instead.\n"
-           "  1 ref:     " << one << "  10000 refs: " << many;
+           "  1 ref:            " << one
+        << "  " << MANY_REFS << " refs: " << many;
 }
 
 /// TRANSACTIONS and WRITER EPOCHS: not equality -- they enter as the decimal width of the id pairs --
