@@ -1287,20 +1287,24 @@ One test per site. A missed site voids the monotonicity claim, so a passing subs
 
 #### Step 8 — the perpetual janitor {#t5-step8}
 
-- [ ] **Two physical discovery sources, explicitly.** There is no single
-  `namespaceAllLivesPrefix`: ref objects live below `cas/refs/<ns>/<inc>/`, while `_files` live below
-  `roots/<ns>/<inc>/_files/`. Reuse the round's existing pool-wide `casRefsPrefix` enumeration to
-  nominate ref debris, consulting both `parseRefObjectKey` and `parseRefCkptKey` so a never-born life's
-  lone `_ckpt` is not misclassified as foreign. Add one bounded pool-wide `rootsPrefix` scan for
-  `_files`, paced by a dedicated cleanup-only `namespace_file_janitor_cursor` in `gc/state`;
-  end-of-scan resets the cursor so every
-  full cycle retries objects omitted by an earlier LIST. A lost cursor CAS repeats work and affects no
-  reachability decision. Its update runs best-effort after the round's safety state is durable; an
-  oversized/undecodable backend cursor is logged and reset rather than failing the completed round.
-  Round-trip, size-bound and lost-CAS tests mirror `manifest_sweep_cursor`. Do not add a third
-  per-namespace LIST or restore a namespace-only key helper. Keep the work in the existing
-  `namespace_cleanup` phase and add `janitor_pages`/`janitor_keys`/`janitor_deleted` metrics, so the
-  new `roots/` request is visible in Task 11's cost inventory rather than hidden in round overhead.
+- [ ] **ONE discovery source, because the layout change makes a life one subtree.** Every family of a
+  life — `_log`, `_snap`, `_ckpt`, `_files` — now lives below `cas/ns/<ns>/<inc>/`, so the round's
+  existing pool-wide enumeration of that tree nominates all of it. Consult both `parseRefObjectKey` and
+  `parseRefCkptKey` so a never-born life's lone `_ckpt` is not misclassified as foreign, and the
+  namespace-file parser for the `_files` arm. **No second scan, no janitor cursor, no pacing** — the
+  earlier two-source design existed only because `_files` sat in a tree the round does not own, and it
+  is deleted rather than tuned. Keep the work in the existing `namespace_cleanup` phase and add
+  `janitor_keys`/`janitor_deleted` metrics so it is visible in Task 11's cost inventory.
+- [ ] **The layout move itself** (prerequisite, and it touches Task 4b's landed keys): the life's
+  subtree is renamed `cas/refs/` → `cas/ns/` and `namespaceFilesPrefix` becomes
+  `cas/ns/<ns>/<inc>/_files/`. The inverse parser that classified listed `roots/` keys by a reserved
+  `_files` segment is DELETED — nothing under `roots/` carries a life. Format generation bumps; the
+  branch is recreate-only pre-release, so no migration, and the goldens are regenerated once.
+  **Verify, do not assume:** the mount-safety empty-root precondition lists three subtrees
+  (`cas/ns/<srid>/`, `cas/manifests/<srid>/`, `roots/<srid>/`) and a life's files must stay inside a
+  checked one — pin that with a test, because the whole point of the check is that an owner cannot be
+  re-created over surviving data. Also re-point `CasPool`'s `roots/`-based mirrored-children and
+  `shadow/` traversals, and the layout doc block in `CasLayout.h`, which enumerates the families.
 - [ ] **One pure classifier and the per-key destructive fence.** Given the round's catalog snapshot and
   a parsed `NamespaceLifeId`, delete only when the row is absent or names a different incarnation;
   `Creating`, `Live`, `Removing` and `RemovalReady` of that exact life are all retained. Immediately
@@ -1308,9 +1312,8 @@ One test per site. A missed site voids the monotonicity claim, so a passing subs
   token mismatch retains and surfaces. An unparseable key is anomaly-and-continue; a legitimate loose
   mountpoint object under `roots/` is simply outside the `_files` grammar and is skipped.
 - [ ] The janitor is **perpetual**, not the single bounded attempt of step 4: it is the only reclaimer of
-  a dead life's `_files`, and folding it into one pass would make a LIST omission a permanent leak by
-  design. Suppression performs no delete but may advance the cleanup cursor; the next completed scan
-  cycle revisits the key.
+  a dead life's objects, and folding it into one pass would make a LIST omission a permanent leak by
+  design. Suppression performs no delete; the next round revisits the key.
 - [ ] **Tests:** a suppressed round deletes nothing; a token mismatch retains; an unparseable canonical
   ref or `_files` key records and continues while a loose root object does not; restart mid-scan resumes
   from the durable cleanup cursor; a cursor-update CAS failure does not fail removal; and a removed
@@ -2425,9 +2428,11 @@ document is what justifies them).]
    (T6 Step 1b) now covers the FILE call sites T1c/T4b introduce; `gtest_cas_list_liar_end_to_end.cpp`
    has TWO legitimate Stage-B editors after the amendment (T5b for the capstone sentinels it
    deliberately reds, T7b for the kill-shot) — Task 4's "only edit" line is amended in place;
-   and Task 5's janitor has TWO physical discovery sources by construction: the existing pool-wide
-   `cas/refs/` enumeration plus one bounded cursor-paced `roots/` scan. There is no all-lives prefix
-   spanning both object families.
+   and Task 5's janitor has ONE discovery source, because the layout change gives a life a single
+   subtree: `cas/ns/<ns>/<inc>/` owns `_log`, `_snap`, `_ckpt` and `_files` alike, so the round's
+   existing enumeration of that tree nominates every family. The earlier two-source, cursor-paced
+   design is deleted, not tuned — it existed only while `_files` lived in a tree the round does not
+   own.
 
 ### Task 13 (post-Stage-B): split the two files that are 18% of the subsystem {#task-13}
 
