@@ -94,7 +94,7 @@ WHERE round_id = (
 -- A Phase row's \`ProfileEvents\` is that phase's own delta, not the whole round's: the phase that
 -- enumerates the ref prefix must show fewer events than the round summary it is a part of. That
 -- enumeration lives in \`defer_decision\`, which owns the \`cas/refs/\` LIST. It is deliberately NOT
--- \`fold_ref_group\`: that phase is I/O-free by construction ("the keys are already in hand"), so its
+-- \`fold_ref_group\`: that phase is I/O-free by construction -- the keys are already in hand -- so its
 -- own delta is empty and this assertion would answer 0 there no matter how healthy the round was.
 SELECT max(length(ProfileEvents)) > 0
 FROM system.content_addressed_garbage_collection_log
