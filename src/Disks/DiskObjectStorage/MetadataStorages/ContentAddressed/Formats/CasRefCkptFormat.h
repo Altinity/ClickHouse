@@ -29,6 +29,26 @@ namespace DB::Cas
 /// the merge is what contains it: a writer that skipped it and wrote back the value it sampled
 /// earlier would silently regress the OTHER writer's progress (TLC counterexample
 /// `_sab_sealclobbersbase`, which loses an acked transaction).
+///
+/// INVARIANT (Constraint 15), and it constrains what may ever be ADDED here, not merely what is here
+/// today: `_ckpt` is a fixed-size product of SCALAR MONOTONE FACTS. Its encoded size is `O(1)` in refs,
+/// files, transactions and writer epochs. Maps, collections and cardinality-growing fields belong in a
+/// separate immutable object or ledger -- never in this one, because this one is MUTABLE, is rewritten
+/// whole on every publish by two concurrent writers, and has NO REPAIR PATH: a `_ckpt` that grows with
+/// the table is a body that eventually cannot be rewritten atomically, on the single object that names
+/// recovery's base and gates destructive cleanup.
+///
+/// The four dimensions do not all hold the same way, and the difference is worth stating so the
+/// invariant is checkable rather than merely believed:
+///   - refs and files enter in NO form. Two namespaces differing only in how many refs they hold encode
+///     BYTE-IDENTICAL `_ckpt` bodies.
+///   - transactions and writer epochs enter as the DECIMAL WIDTH of the two id pairs -- four orders of
+///     magnitude of `ref_sequence` cost four bytes. That is `O(1)` because the components are
+///     `uint64_t`, so the width is ceilinged at twenty digits and the whole object at a constant far
+///     below `traitsFor(FormatId::RefCkpt).object_cap` (which stays what it is documented to be: a
+///     corruption brake this object cannot approach, never the thing that bounds its size).
+/// Both halves are fenced by `gtest_cas_ref_ckpt_join.cpp`, which also carries the compile-time
+/// `std::is_trivially_copyable_v<RefCkpt>` assertion that a heap-owning field would break.
 struct RefCkpt
 {
     /// The namespace's birth epoch -- the `writer_epoch` of its `NamespaceBirth` record. It is what
