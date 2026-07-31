@@ -129,33 +129,41 @@ def build_pr_body(
 def find_open_backport_pr(repo: str, base_branch: str):
     """Return (number, head_branch) of an open flaky-fix backport PR for this base
     branch, or (None, None). Lets a weekly run amend last week's PR instead of
-    opening a fresh one each time."""
+    opening a fresh one each time. If several match, reuses the newest."""
     prefix = f"flaky-fix-backport/{base_branch}/"
     result = subprocess.run(
         ["gh", "pr", "list", "--repo", repo, "--state", "open", "--base", base_branch,
-         "--json", "number,headRefName", "--limit", "100"],
+         "--json", "number,headRefName,createdAt", "--limit", "100"],
         text=True, capture_output=True,
     )
     if result.returncode != 0:
         print(f"Warning: gh pr list failed, will open a new PR:\n{result.stderr}", file=sys.stderr)
         return None, None
-    for pr in json.loads(result.stdout):
-        if pr["headRefName"].startswith(prefix):
-            return pr["number"], pr["headRefName"]
-    return None, None
+    matches = [pr for pr in json.loads(result.stdout) if pr["headRefName"].startswith(prefix)]
+    if not matches:
+        return None, None
+    matches.sort(key=lambda pr: pr["createdAt"], reverse=True)
+    if len(matches) > 1:
+        others = ", ".join(f"#{pr['number']}" for pr in matches[1:])
+        print(
+            f"Warning: {len(matches)} open flaky-fix backport PRs for {base_branch}; "
+            f"reusing newest #{matches[0]['number']}, leaving {others} untouched.",
+            file=sys.stderr,
+        )
+    return matches[0]["number"], matches[0]["headRefName"]
 
 
-def pr_backport_commits(repo: str, number: int) -> list:
+def pr_backport_commits(repo: str, number: int):
     """Return [(upstream_sha_or_None, subject)] for commits already on the PR,
     oldest-first, by reading the `(cherry picked from commit <sha>)` trailer that
-    `cherry-pick -x` records."""
+    `cherry-pick -x` records. Returns None if the PR commits could not be read."""
     result = subprocess.run(
         ["gh", "pr", "view", str(number), "--repo", repo, "--json", "commits"],
         text=True, capture_output=True,
     )
     if result.returncode != 0:
-        print(f"Warning: could not read commits of PR #{number}:\n{result.stderr}", file=sys.stderr)
-        return []
+        print(f"Error: could not read commits of PR #{number}:\n{result.stderr}", file=sys.stderr)
+        return None
     out = []
     for c in json.loads(result.stdout).get("commits", []):
         body = c.get("messageBody", "") or ""
@@ -266,6 +274,13 @@ def main() -> None:
     if reuse_branch:
         print(f"Reusing open PR #{reuse_number} ({reuse_branch}).", file=sys.stderr)
         prior_commits = pr_backport_commits(args.repo, reuse_number)
+        if prior_commits is None:
+            print(
+                f"Refusing to reuse PR #{reuse_number} without its commit list "
+                f"(would risk re-applying or rewriting the PR body).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         prior_shas = {sha for sha, _ in prior_commits if sha}
         prior_applied = [(sha, subject, None) for sha, subject in prior_commits]
         missing = [c for c in missing if c["sha"] not in prior_shas]

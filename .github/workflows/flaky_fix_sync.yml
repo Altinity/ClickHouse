@@ -30,7 +30,7 @@ on:
 
 jobs:
   setup:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker]
     outputs:
       branches: ${{ steps.set_branches.outputs.branches }}
     steps:
