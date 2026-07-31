@@ -791,6 +791,15 @@ private:
     /// callers serialize across the whole unlocked I/O window through `recovery_in_progress`.
     void ensureRefTableRecovered(const RootNamespace & ns, RefTableRuntime & rt);
 
+    /// The same recovery, for a caller that must not bring `ns` into existence: `false` means the catalog
+    /// names no such namespace, and NOTHING was written, recovered or installed. `true` means the table is
+    /// recovered exactly as `ensureRefTableRecovered` leaves it.
+    ///
+    /// Two entry points rather than one with a flag, because the two answer different questions and the
+    /// wrong one is invisible at a call site: only a WRITE may be a namespace's birth, so a read or a
+    /// removal must reach this one and a mutation must reach the other.
+    bool recoverRefTableIfNamespaceExists(const RootNamespace & ns, RefTableRuntime & rt);
+
     /// Stage B (spec INV-3, §3): resolves `ns`'s catalog life -- ONCE per table-open, from inside
     /// `ensureRefTableRecovered`'s transient-retry envelope, never from a per-write path (a per-write
     /// catalog GET is a protocol-step addition and is vetoed). Three cases, closing over the catalog's

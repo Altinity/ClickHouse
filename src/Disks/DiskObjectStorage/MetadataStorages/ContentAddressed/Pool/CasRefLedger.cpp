@@ -279,7 +279,12 @@ std::optional<Resolved> CasRefLedger::resolveRef(const RootNamespace & ns, const
     /// per-shard decode cache), so the recovered-and-cached `RefTableState` is always this process's
     /// authoritative view. Kept as a parameter so existing callers compile unchanged.
     const auto rt = getRefTableRuntime(ns);
-    ensureRefTableRecovered(ns, *rt);
+    /// A namespace the catalog does not name resolves nothing and is not born by being asked: a ref that
+    /// could exist would have needed a write to put it there, and that write would have birthed the
+    /// namespace first. The two maintenance calls below are skipped with it, and provably lose nothing --
+    /// see the note in `listRefs`.
+    if (!recoverRefTableIfNamespaceExists(ns, *rt))
+        return std::nullopt;
     /// A table this mount only ever READS (never mutates) would otherwise
     /// never have its just-replayed tail/precommits checked -- `appendRefOps`'s own hoisted checks only
     /// fire for a table this mount WRITES to. Both are cheap (lock + comparison) on the warm path (the
@@ -337,12 +342,20 @@ std::optional<Resolved> CasRefLedger::resolveRef(const RootNamespace & ns, const
 std::map<String, Resolved> CasRefLedger::listRefs(const RootNamespace & ns)
 {
     /// The whole ref set is a map iteration over this namespace's recovered-and-cached `RefTableState`:
-    /// an empty or
-    /// never-touched namespace still costs exactly one `LIST` (recovery) and zero further requests;
-    /// a warm namespace costs nothing at all (replacing the old per-shard LIST-then-HEAD-present-shards
-    /// dance, since there is no longer a shard fan-out to rediscover on every call).
+    /// an empty but existing namespace still costs exactly one `LIST` (recovery) and zero further
+    /// requests; a warm namespace costs nothing at all (replacing the old per-shard LIST-then-HEAD-present-shards
+    /// dance, since there is no longer a shard fan-out to rediscover on every call). A namespace that was
+    /// never born costs one catalog GET and stops there.
     const auto rt = getRefTableRuntime(ns);
-    ensureRefTableRecovered(ns, *rt);
+    /// A namespace the catalog does not name has no refs to list, and listing them is the wrong event to
+    /// bring one into existence on.
+    ///
+    /// Returning here also skips the two maintenance calls below, and that is not a lost obligation:
+    /// neither would do anything. The stale-precommit sweep runs only when `needs_stale_precommit_sweep`
+    /// is armed, which recovery and commit are the only things that arm; the snapshot publish is admitted
+    /// only for a `Live` lifecycle over a non-empty tail, and an unrecovered runtime is neither.
+    if (!recoverRefTableIfNamespaceExists(ns, *rt))
+        return {};
     /// Apply the same read-side maintenance policy as `resolveRef`; see `sweepStalePrecommitsForRead`.
     sweepStalePrecommitsForRead(ns, rt);
     maybeScheduleSnapshotPublish(ns, rt);
@@ -360,10 +373,11 @@ std::map<String, Resolved> CasRefLedger::listRefs(const RootNamespace & ns)
 
 bool CasRefLedger::hasAnyRefWithPrefix(const RootNamespace & ns, std::string_view prefix)
 {
-    /// Same recovery/maintenance preamble as `listRefs`; see there for why an empty or never-touched
-    /// namespace still costs exactly one `LIST` (recovery) and a warm namespace costs nothing at all.
+    /// Same non-minting recovery/maintenance preamble as `listRefs`; see there for what each shape of
+    /// namespace -- never born, empty, warm -- costs.
     const auto rt = getRefTableRuntime(ns);
-    ensureRefTableRecovered(ns, *rt);
+    if (!recoverRefTableIfNamespaceExists(ns, *rt))
+        return false;
     sweepStalePrecommitsForRead(ns, rt);
     maybeScheduleSnapshotPublish(ns, rt);
 
@@ -1268,6 +1282,43 @@ void CasRefLedger::ensureRefTableRecovered(const RootNamespace & ns, RefTableRun
     /// the pass -- which acquires `ref_queue_mutex` and try-locks other tables' `state_mutex` -- never
     /// nests this table's `state_mutex` under `ref_queue_mutex`.
     enforceRefTableCacheBudget(ns);
+}
+
+bool CasRefLedger::recoverRefTableIfNamespaceExists(const RootNamespace & ns, RefTableRuntime & rt)
+{
+    /// The non-minting difference is structural rather than a matter of ordering: recovery's step 0 mints
+    /// for an absent catalog entry, so a caller that must not mint cannot be allowed to reach it. It
+    /// cannot: either `rt.life` is already resolved (the warm steady state -- no catalog read at all), or
+    /// a catalog-only lookup answers first. An absent entry returns here, having written nothing and
+    /// without recovering.
+    ///
+    /// Setting `rt.life` from that lookup is also what makes the guarantee airtight rather than
+    /// probe-then-hope: with the field set, step 0's `if (!rt.life)` is false, so `resolveNamespaceLife`
+    /// is unreachable below even if the entry is concurrently removed between the lookup and the
+    /// recovery. The value is the one step 0 would have computed for that entry -- both take BOTH fields
+    /// from the same catalog entry (INV-3) -- so this is the same once-per-table-open resolution,
+    /// performed by whichever caller got there first.
+    {
+        std::unique_lock<std::mutex> lock(rt.state_mutex);
+        if (!rt.life)
+        {
+            /// Released for the catalog read, like every other I/O boundary in this file, and re-taken to
+            /// re-check `rt.life` -- a concurrent caller may have resolved it in the meantime, and the
+            /// first resolution wins rather than being overwritten.
+            lock.unlock();
+            const std::optional<NamespaceLifeId> cataloged = CasRefCatalog::lifeIfCataloged(backend, layout, ns);
+            lock.lock();
+            if (!rt.life)
+            {
+                if (!cataloged)
+                    return false;
+                rt.life = *cataloged;
+            }
+        }
+    }
+
+    ensureRefTableRecovered(ns, rt);
+    return true;
 }
 
 void CasRefLedger::installRecoveryResult(RefTableRuntime & rt, RecoveryResult && result)
@@ -4126,47 +4177,13 @@ std::optional<NamespaceLifeId> CasRefLedger::namespaceFilesLifeIfReadable(const 
 {
     const auto rt = getRefTableRuntime(ns);
 
-    /// ---- Step 1: resolve the life WITHOUT ever creating one ----
-    ///
-    /// This is the whole difference from `namespaceLife`, and it is structural rather than a matter of
-    /// ordering: recovery's step 0 mints for an absent catalog entry, so a reader must not be the one to
-    /// reach it. It cannot: either `rt->life` is already resolved (the warm steady state -- no catalog
-    /// read at all, which is what keeps a namespace-file operation free of a catalog request), or a
-    /// catalog-only lookup answers first. An absent entry returns here, having written NOTHING and
-    /// without recovering: a namespace the catalog does not name has no files to read, and a read or an
-    /// unlink is the wrong event to bring one into existence on.
-    ///
-    /// Setting `rt->life` from that lookup is also what makes the guarantee airtight rather than
-    /// probe-then-hope: with the field set, step 0's `if (!rt.life)` is false, so `resolveNamespaceLife`
-    /// is unreachable below even if the entry is concurrently removed between the lookup and the
-    /// recovery. The value is the one step 0 would have computed for that entry -- both take BOTH fields
-    /// from the same catalog entry (INV-3) -- so this is the same once-per-table-open resolution,
-    /// performed by whichever caller got there first.
-    {
-        std::unique_lock<std::mutex> lock(rt->state_mutex);
-        if (!rt->life)
-        {
-            /// Released for the catalog read, like every other I/O boundary in this file, and re-taken to
-            /// re-check `rt->life` -- a concurrent caller may have resolved it in the meantime, and the
-            /// first resolution wins rather than being overwritten.
-            lock.unlock();
-            const std::optional<NamespaceLifeId> cataloged = CasRefCatalog::lifeIfCataloged(backend, layout, ns);
-            lock.lock();
-            if (!rt->life)
-            {
-                if (!cataloged)
-                    return std::nullopt;
-                rt->life = *cataloged;
-            }
-        }
-    }
-
-    /// ---- Step 2: the recovered ref state decides whether the files are READABLE ----
-    ///
-    /// A catalog entry alone cannot answer this: `dropNamespace` records removal in the ref state and
-    /// leaves the catalog entry `Live`, so the born-then-dropped fact lives in the recovered state and
-    /// nowhere else. Recovery here cannot mint -- step 1 saw to that.
-    ensureRefTableRecovered(ns, *rt);
+    /// A namespace the catalog does not name has no files to read, and a read or an unlink is the wrong
+    /// event to bring one into existence on. What the catalog cannot answer is whether the files are
+    /// still READABLE: `dropNamespace` records removal in the ref state and leaves the catalog entry
+    /// `Live`, so the born-then-dropped fact lives in the recovered state and nowhere else -- hence a
+    /// recovery, and hence a non-minting one.
+    if (!recoverRefTableIfNamespaceExists(ns, *rt))
+        return std::nullopt;
 
     std::lock_guard<std::mutex> lock(rt->state_mutex);
     /// The removed discriminator is `namespaceIsRemoved`'s, unchanged and for its reasons: `Removed` WITH
@@ -4186,13 +4203,17 @@ DropNamespaceStats CasRefLedger::dropNamespace(const RootNamespace & ns)
     /// off the presence of a `RemoveNamespace` op) and is exempt from the ordinary per-op admission
     /// check (it only ever shrinks state; see `flushRefBatch`'s `state_growing` filter).
     const auto rt = getRefTableRuntime(ns);
-    ensureRefTableRecovered(ns, *rt);
+    /// A namespace the catalog does not name has nothing to remove, and removing from it must not be what
+    /// creates it -- which is why the answer is here and not in the lifecycle check below: that check runs
+    /// on recovered state, and reaching recovered state is itself the birth.
+    if (!recoverRefTableIfNamespaceExists(ns, *rt))
+        return {};
     {
         /// "Repeated API removal observes the cached Removed state and returns success without
-        /// appending a second transaction." `RefTableState::lifecycle` cannot distinguish "genuinely
-        /// removed" from "never born" (both default to `Removed` -- see the representation note on
-        /// `RefTableState`), so a never-touched namespace's drop is ALSO a harmless no-op here, which
-        /// is the correct behavior either way (nothing to remove).
+        /// appending a second transaction." A namespace that exists in the catalog but whose ref state
+        /// has no `Live` lifecycle -- nothing was ever committed into it -- takes the same exit: both are
+        /// `Removed` in the representation (see the note on `RefTableState`), and both have nothing to
+        /// remove.
         std::lock_guard lock(rt->state_mutex);
         if (rt->state.getLifecycle() != RefLifecycle::Live)
             return {};

@@ -514,7 +514,12 @@ TEST(CasNamespaceFileDiskProfile, RemovalOnANeverOpenedTableLeavesTheCatalogUnto
     std::shared_ptr<RecordingObjectStorage> object_storage;
     auto storage = openRecordingStorage(object_storage);
     const DB::Cas::Layout & layout = storage->store()->layout();
-    const DB::StoredObject catalog_object{layout.refCatalogKey()};
+    /// The pool KEY, joined onto the object storage's own root: a `StoredObject` carries a remote path,
+    /// and the local object storage resolves it as a filesystem path -- so a bare key would be resolved
+    /// against the process working directory and could never be found, making both existence checks below
+    /// answer "absent" no matter what the pool contains.
+    const DB::StoredObject catalog_object{
+        (std::filesystem::path(object_storage->getCommonKeyPrefix()) / layout.refCatalogKey()).string()};
 
     /// Nothing has opened this table: no namespace file written, no part published, no ref op.
     ASSERT_FALSE(object_storage->exists(catalog_object)) << "precondition: the pool has no catalog yet";
@@ -525,6 +530,11 @@ TEST(CasNamespaceFileDiskProfile, RemovalOnANeverOpenedTableLeavesTheCatalogUnto
         kTablePath + "/format_version.txt", /*if_exists*/ true, /*remove_metadata_only*/ false);
     storage->createTransaction()->removeRecursive(
         kTablePath + "/deduplication_logs", DB::IMetadataTransaction::ShouldRemoveObjectsPredicate{});
+    /// The table directory ITSELF, which is a different arm from the subdirectory above: it is the one
+    /// that reaches the ref layer's namespace drop and its ref enumeration, rather than only the
+    /// namespace-file resolver.
+    storage->createTransaction()->removeRecursive(
+        kTablePath, DB::IMetadataTransaction::ShouldRemoveObjectsPredicate{});
     EXPECT_FALSE(storage->existsFile(kTablePath + "/format_version.txt"));
 
     EXPECT_EQ(object_storage->writtenContaining(layout.refCatalogKey()), std::vector<String>{})
@@ -539,4 +549,8 @@ TEST(CasNamespaceFileDiskProfile, RemovalOnANeverOpenedTableLeavesTheCatalogUnto
     storage->createTransaction()->unlinkFile(
         kTablePath + "/format_version.txt", /*if_exists*/ false, /*remove_metadata_only*/ false);
     EXPECT_FALSE(storage->existsFile(kTablePath + "/format_version.txt"));
+    /// And the existence check itself can see a catalog that IS there -- without this, an absent answer
+    /// caused by a mis-built path would read exactly like the birth this case is about.
+    EXPECT_TRUE(object_storage->exists(catalog_object))
+        << "the write above birthed the namespace, so the catalog object must now exist";
 }

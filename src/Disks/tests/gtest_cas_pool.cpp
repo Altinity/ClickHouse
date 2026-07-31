@@ -893,6 +893,10 @@ TEST(CasPool, ListRefsEmptyNamespaceCostsOneListZeroHeads)
     auto b = std::make_shared<DB::Cas::tests::CountingBackend>();
     auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     RootNamespace ns{"srv1/tbl"};
+    /// EMPTY, but EXISTING -- otherwise this measures the wrong thing entirely: a namespace the catalog
+    /// does not name is answered from the catalog and never recovers, so it never reaches the LIST whose
+    /// absence of a HEAD fan-out is the point here. That shape is measured by the case below.
+    DB::Cas::tests::casAdmitEntry(*b, Layout("p"), ns);
 
     const uint64_t heads_before = b->headTotal();
     const uint64_t lists_before = b->listTotal();
@@ -904,6 +908,31 @@ TEST(CasPool, ListRefsEmptyNamespaceCostsOneListZeroHeads)
         << "empty-namespace listRefs must not HEAD any shard (the CREATE/load storm)";
     EXPECT_EQ(b->listTotal() - lists_before, 1u)
         << "empty-namespace listRefs must cost exactly one LIST of the namespace's ref-shard prefix";
+}
+
+/// The other shape: a namespace that was never born. A read must not be what brings one into existence,
+/// so the answer comes from the catalog alone -- no recovery, and therefore not even the one LIST the
+/// case above pins.
+TEST(CasPool, ListRefsOnANeverBornNamespaceCostsNoListAndNoHead)
+{
+    auto b = std::make_shared<DB::Cas::tests::CountingBackend>();
+    auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    RootNamespace ns{"srv1/tbl"};
+
+    const uint64_t heads_before = b->headTotal();
+    const uint64_t lists_before = b->listTotal();
+    const uint64_t gets_before = b->getTotal();
+
+    auto refs = s->listRefs(ns);
+
+    EXPECT_TRUE(refs.empty());
+    EXPECT_EQ(b->listTotal() - lists_before, 0u)
+        << "a never-born namespace has no ref stream to LIST";
+    EXPECT_EQ(b->headTotal() - heads_before, 0u);
+    /// Positive control: the zeros above are the answer coming from the catalog, not from a call that
+    /// did nothing at all.
+    EXPECT_GT(b->getTotal() - gets_before, 0u)
+        << "the answer must come from a catalog read";
 }
 
 /// listRefs must return every committed ref of a table, correctly, regardless of how many refs the
