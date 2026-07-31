@@ -35,8 +35,8 @@ The retained run summary is `build/test_CaRefLaneCore_20260730_r7.log`; detailed
 
 The sabotage controls cover arming before send, retaining uncertain attempts, blocking later
 appends, complete recovery, exact attempt identity, mount fencing, and `Ready`-only certification.
-The witnesses reach ordinary commit, unresolved write, retry-created adoption, recovery, inert
-unrelated result, `Closed`, and `Faulted`.
+The witnesses reach ordinary commit, unresolved write, recovery, inert unrelated result, `Closed`,
+and `Faulted`.
 
 ## Relink composition {#relink-composition}
 

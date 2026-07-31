@@ -52,6 +52,8 @@ set -uo pipefail
 cd "$(dirname "$0")"
 JAR=../../../tmp/tla2tools.jar
 [[ -f "$JAR" ]] || { echo "jar not found: $JAR" >&2; exit 3; }
+source "$(dirname "$0")/tlc_temporal_gate.sh"
+check_tlc_temporal_gate "$JAR" || exit 4
 MODULE=CaBuildRootPrecommit
 
 # name  expectation(green|violation|temporal)  expected-invariant/property(asserted, not just logged)

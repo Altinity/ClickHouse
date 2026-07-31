@@ -175,7 +175,7 @@ for row in "${CONFIGS[@]}"; do
   if grep -q "No error has been found" "$log"; then
     result="green"
   elif grep -q "is violated" "$log"; then
-    result="violation:$(grep -oE '(Invariant|Property) [A-Za-z_]+ is violated' "$log" | head -1 | awk '{print $2}')"
+    result="violation:$(grep -oE '(Invariant|Property) [A-Za-z0-9_]+ is violated' "$log" | head -1 | awk '{print $2}')"
   elif [[ $rc -eq 124 ]]; then
     result="incomplete"
   else
