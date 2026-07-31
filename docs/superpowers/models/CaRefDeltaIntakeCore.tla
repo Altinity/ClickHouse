@@ -62,7 +62,9 @@ CONSTANTS
     SabotageDestroyUnderHold,     \* destruction ignores a carried hold
     SabotageDeleteIgnoresIndeg,   \* the pending delete skips its liveness re-check
     SabotageAdoptBeforeCommit,    \* cursor becomes visible to cleanup before the commit's win/lose
-    SabotageCleanupIgnoresCursor  \* cleanup requires only snapshot coverage, not cursor coverage
+    SabotageCleanupIgnoresCursor, \* cleanup requires only snapshot coverage, not cursor coverage
+    PlanOnly,                     \* isolate the Task 5 catalog-built-plan proof from the fold gate
+    SabotageAdapterMints          \* an input adapter inserts a ref-life row outside the catalog loop
 
 ASSUME T1 # T2
 ASSUME MaxSeq \in Nat /\ MaxSeq >= 3
@@ -128,7 +130,13 @@ VARIABLES
     condemned,     \* the shared blob is condemned (in-degree reached zero)
     deleted,       \* the shared blob's bytes are gone
     rsc,           \* 0..1: rounds since condemnation (the two-phase pacing floor)
-    destroyedUnderHold  \* sticky ghost: a destructive step ran while a hold was live or in debt
+    destroyedUnderHold, \* sticky ghost: a destructive step ran while a hold was live or in debt
+    (* ---- Task 5: catalog-cut-only ref-life plan ---- *)
+    planCut,            \* [Ids -> {"creating", "live", "removing", "absent"}]
+    gcRefLives,         \* SUBSET Ids: ordinary fold's `ref_lives` keys
+    rebuildRefLives,    \* SUBSET Ids: REBUILD's `ref_lives` keys from the same constructor
+    planBuilt,          \* BOOLEAN: both constructors have consumed the immutable cut
+    enriched            \* [adapter -> SUBSET Ids]: metadata attached to existing rows only
 
 storeVars == << durable, everDurable, hidden, sealed >>
 laneVars  == << pendingId, snap >>
@@ -136,8 +144,11 @@ roundVars == << cand, csnap, maxSeen, frontier, delta, gcPhase, roundOutcome >>
 foldVars  == << cursor, folded, dupFlag >>
 holdVars  == << hold, holdPos, holdDebt >>
 blobVars  == << condemned, deleted, rsc, destroyedUnderHold >>
+Adapters == {"parent", "list_hint", "hold", "checkpoint_tail"}
+planVars == << planCut, gcRefLives, rebuildRefLives, planBuilt, enriched >>
+legacyVars == << storeVars, laneVars, roundVars, foldVars, holdVars, blobVars >>
 
-vars == << storeVars, laneVars, roundVars, foldVars, holdVars, blobVars >>
+vars == << legacyVars, planVars >>
 
 MaxOf(S) == CHOOSE x \in S : \A y \in S : x >= y
 MaxOr0(S) == IF S = {} THEN 0 ELSE MaxOf(S)
@@ -221,6 +232,13 @@ Init ==
     /\ deleted = FALSE
     /\ rsc = 0
     /\ destroyedUnderHold = FALSE
+    /\ planCut = [i \in Ids |-> IF i = 1 THEN "live"
+                              ELSE IF i = 2 THEN "removing"
+                              ELSE "creating"]
+    /\ gcRefLives = {}
+    /\ rebuildRefLives = {}
+    /\ planBuilt = FALSE
+    /\ enriched = [a \in Adapters |-> {}]
 
 (* ---- writer actions (INV-1: never sabotaged here; the ambiguity split is Task 1's subject) ---- *)
 
@@ -493,7 +511,37 @@ Rebuild ==
 (* Self-loop so bounded counters exhausting is not a TLC deadlock (house pattern). *)
 NoOp == UNCHANGED vars
 
-Next ==
+(* Task 5's sole ref-life row producer. Both ordinary GC and REBUILD first materialize exactly the
+   `Live`/`Removing` ids of one immutable catalog cut. The four input adapters can attach coverage,
+   hints, holds, or checkpoint/tail observations only after this set is frozen. *)
+WalkablePlanIds == {i \in Ids : planCut[i] \in {"live", "removing"}}
+
+BuildRefWalkPlans ==
+    /\ PlanOnly
+    /\ ~planBuilt
+    /\ gcRefLives' = WalkablePlanIds
+    /\ rebuildRefLives' = WalkablePlanIds
+    /\ planBuilt' = TRUE
+    /\ UNCHANGED << planCut, enriched >>
+    /\ UNCHANGED legacyVars
+
+AdapterEnrich(a, i) ==
+    /\ PlanOnly
+    /\ planBuilt
+    /\ IF SabotageAdapterMints /\ i \notin gcRefLives
+       THEN /\ gcRefLives' = gcRefLives \cup {i}
+            /\ rebuildRefLives' = rebuildRefLives \cup {i}
+       ELSE /\ i \in (gcRefLives \cap rebuildRefLives)
+            /\ UNCHANGED << gcRefLives, rebuildRefLives >>
+    /\ enriched' = [enriched EXCEPT ![a] = @ \cup {i}]
+    /\ UNCHANGED << planCut, planBuilt >>
+    /\ UNCHANGED legacyVars
+
+PlanNoOp ==
+    /\ PlanOnly
+    /\ UNCHANGED vars
+
+LegacyNext ==
     \/ \E t \in Tables :
          \/ WAppendStart(t) \/ WAppendDurable(t) \/ WAppendAbandon(t)
          \/ EpochSeal(t) \/ WRaiseSnap(t)
@@ -503,6 +551,14 @@ Next ==
     \/ BeginRound \/ ScanComplete \/ FoldCommitWin \/ FoldCommitLose
     \/ Condemn \/ Delete \/ Rebuild
     \/ NoOp
+
+Next ==
+    \/ /\ ~PlanOnly
+       /\ LegacyNext
+       /\ UNCHANGED planVars
+    \/ BuildRefWalkPlans
+    \/ \E a \in Adapters, i \in Ids : AdapterEnrich(a, i)
+    \/ PlanNoOp
 
 Spec == Init /\ [][Next]_vars
 
@@ -535,6 +591,11 @@ TypeOK ==
     /\ deleted \in BOOLEAN
     /\ rsc \in 0..1
     /\ destroyedUnderHold \in BOOLEAN
+    /\ planCut \in [Ids -> {"creating", "live", "removing", "absent"}]
+    /\ gcRefLives \subseteq Ids
+    /\ rebuildRefLives \subseteq Ids
+    /\ planBuilt \in BOOLEAN
+    /\ enriched \in [Adapters -> SUBSET Ids]
     /\ Indeg >= 0                    \* the cfg's EdgeOf keeps honest in-degree non-negative
 
 (* (I1) The adopted cursor never passes a durable-but-unfolded log, even if that log was later
@@ -572,5 +633,19 @@ ExactlyOnce == ~dupFlag
 (* (I3) A losing commit's round adopts nothing: if this round's outcome is "lost", the cursor
    still equals the value captured at BeginRound. *)
 LosingCommitAdoptsNothing == (roundOutcome = "lost") => (cursor = csnap)
+
+(* Exactness is the Task 5 proof boundary, stated over the cut rather than the later mutable catalog.
+   It excludes `Creating` and absent ids even if every adapter names them. REBUILD's equality proves
+   it calls the same constructor rather than growing a second admission predicate. *)
+PlanKeySetExact ==
+    planBuilt => (gcRefLives = WalkablePlanIds)
+
+RebuildPlanKeySetExact ==
+    planBuilt => (rebuildRefLives = WalkablePlanIds)
+
+AdaptersEnrichOnly ==
+    \A a \in Adapters : enriched[a] \subseteq (gcRefLives \cap rebuildRefLives)
+
+WITNESS_PLAN_BUILT == ~planBuilt
 
 =============================================================================

@@ -3,8 +3,8 @@
    2026-07-27-cas-ref-chain-complete-cut-design.md §2 INV-3 (ref-layer-scoped incarnations,
    structural inertness) and §3 Lifecycles (removal, recreation). TLA+ phase (gate), Task 4.
 
-   SUPERSEDES the 2026-07-11 design's `_cleanup`-marker / `Completed` recreation gate, which this
-   module used to model directly (git history: the removal -> Completed -> marker -> recreation ->
+   SUPERSEDES the 2026-07-11 design's `_cleanup`-marker / marker-state recreation gate, which this
+   module used to model directly (git history: the removal -> marker -> recreation ->
    straggler-delete interleaving, guarded by a live round re-read + a marker check + an epoch filter).
    v9 DELETES that gate for the ref layer outright — no marker, no round to re-read, no epoch to
    filter — and this module now proves what carries the same safety property in its place.
@@ -33,8 +33,9 @@
    CaRefNsCleanupStaleLeaderCore_RESULTS.md for the exact simplifications and why each is safe to make
    here.
 
-   MODELED INTERLEAVING. A GC leader A deposits a Pending namespace-cleanup item for a namespace being
-   removed, capturing its incarnation `staleInc` — and STALLS before running its physical-delete pass
+   MODELED INTERLEAVING. A GC leader A folds the terminal, attaches optional cleanup evidence to the
+   existing life row, then deposits a cleanup scope capturing its opaque `life_id` in `staleInc` — and
+   STALLS before running its physical-delete pass
    (a VM pause; the P3.1 fence-out class). Meanwhile the removal completes (`EntryDelete`: the catalog
    entry goes `absent`, with NO physical-empty proof owed — INV-3's whole point) and the SAME name is
    reborn (`Recreate`: a fresh incarnation is minted; `Creating` + `_ckpt` create + the `Live` CAS are
@@ -94,36 +95,52 @@ VARIABLES
                       \* name's catalog record, thinned to what this module's interleaving needs
                       \* (Scoping: no `Creating` phase, no `_ckpt`/terminal-record bookkeeping — that
                       \* is CaRefCatalogCore's proof)
-    staleInc,         \* 1..MaxInc: the incarnation leader A's Pending item captured BEFORE
-                      \* deposition — fixed for the run, exactly like the old model's `staleRound`
+    staleInc,         \* 0..MaxInc: the opaque life id captured at cleanup-scope deposition
     nextInc,          \* 1..MaxInc+1: fresh-incarnation allocator (as CaRefCatalogCore's `nextInc`) —
                       \* a counter here because the only property ever used is freshness, not order
     objects,          \* SUBSET Incs: incarnations whose ref-layer object(s) are physically present
-    passDone,         \* BOOLEAN: leader A's stale Pending pass has executed (once)
+    cleanupEvidence,  \* SUBSET Incs: optional terminal-fold evidence attached to a life row
+    passDone,         \* BOOLEAN: leader A's stale deposited pass has executed (once)
     deletedLiveData   \* ghost, sticky: the stale pass deleted an object belonging to the namespace's
                       \* CURRENT ("live") incarnation — the hazard under test
 
-vars == << entry, staleInc, nextInc, objects, passDone, deletedLiveData >>
+vars == << entry, staleInc, nextInc, objects, cleanupEvidence, passDone, deletedLiveData >>
 
 Init ==
-    /\ entry = [state |-> "removing", inc |-> 1]  \* A's item was deposited while this life was being
-                                                    \* removed; the story starts right there
-    /\ staleInc = 1
+    /\ entry = [state |-> "removing", inc |-> 1]  \* terminal folding and scope deposition begin here
+    /\ staleInc = 0
     /\ nextInc = 2                                 \* 1 is already spoken for by the dying life
     /\ objects = {1}                               \* the dying life's own leftover data — the pass's
                                                     \* legitimate cleanup target
+    /\ cleanupEvidence = {}
     /\ passDone = FALSE
     /\ deletedLiveData = FALSE
 
-(* The removal's terminal record folds, best-effort cleanup runs, and the catalog entry is deleted —
-   collapsed into one step because none of that ordering (INV-4's `_ckpt`-before-entry rule, the
-   terminal record's actor identity) is this module's concern; CaRefCatalogCore is where that
-   machinery is modelled and proved. What this module needs from it is only the GATE `Recreate` reads
-   below: `entry.state = "absent"`, reached with NO physical-empty proof (INV-3). *)
+(* Folding the terminal attaches positive evidence to the same life row. It is optional until this
+   point and carries no marker-driven cleanup-state enumeration. *)
+FoldTerminal ==
+    /\ entry.state = "removing"
+    /\ entry.inc \notin cleanupEvidence
+    /\ cleanupEvidence' = cleanupEvidence \cup {entry.inc}
+    /\ UNCHANGED << entry, staleInc, nextInc, objects, passDone, deletedLiveData >>
+
+(* The cleanup scope captures the opaque id while the old row is still current. A resumed pass uses
+   this value; it never resolves a logical name to choose a fresh target. *)
+DepositCleanupScope ==
+    /\ entry.state = "removing"
+    /\ entry.inc \in cleanupEvidence
+    /\ staleInc = 0
+    /\ staleInc' = entry.inc
+    /\ UNCHANGED << entry, nextInc, objects, cleanupEvidence, passDone, deletedLiveData >>
+
+(* The direct catalog deletion needs terminal evidence but no physical-empty predicate. This module
+   abstracts the no-hold check, which is modeled in detail by `CaRefCatalogCore`. *)
 EntryDelete ==
     /\ entry.state = "removing"
+    /\ staleInc = entry.inc
+    /\ entry.inc \in cleanupEvidence
     /\ entry' = [state |-> "absent", inc |-> 0]
-    /\ UNCHANGED << staleInc, nextInc, objects, passDone, deletedLiveData >>
+    /\ UNCHANGED << staleInc, nextInc, objects, cleanupEvidence, passDone, deletedLiveData >>
 
 (* THE REBIRTH. Spec §3: recreation begins only once the old entry is `absent` — no marker, no
    physical-empty proof, just a fresh incarnation (spec §2 INV-3: "random 128-bit, minted at
@@ -143,7 +160,7 @@ Recreate ==
     /\ nextInc <= MaxInc
     /\ entry' = [state |-> "live", inc |-> NewInc]
     /\ nextInc' = nextInc + 1
-    /\ UNCHANGED << staleInc, objects, passDone, deletedLiveData >>
+    /\ UNCHANGED << staleInc, objects, cleanupEvidence, passDone, deletedLiveData >>
 
 (* Ordinary ref-layer work under the reborn life: an appended `_log`, an installed `_snap`, a `_ckpt`
    write — all at `<ns>/<inc>/...`, so all indistinguishable at this model's granularity. Idempotent
@@ -152,7 +169,7 @@ Recreate ==
 WriteObject ==
     /\ entry.state = "live"
     /\ objects' = objects \cup {entry.inc}
-    /\ UNCHANGED << entry, staleInc, nextInc, passDone, deletedLiveData >>
+    /\ UNCHANGED << entry, staleInc, nextInc, cleanupEvidence, passDone, deletedLiveData >>
 
 (* Spec §3's normative rule, added by this task's review (commit `d1eae033122`): "the
    namespace-cleanup item carries the incarnation captured at deposition, and a resumed pass NEVER
@@ -164,7 +181,7 @@ WriteObject ==
    cleanup scope at all. *)
 PassTarget == IF SabotageRederive THEN entry.inc ELSE staleInc
 
-(* Leader A resumes its stale Pending pass (once), at ANY point after depositing it — `Next`'s
+(* Leader A resumes its stale deposited pass (once), at ANY point after deposition — `Next`'s
    interleaving explores every placement relative to `EntryDelete`, `Recreate` and `WriteObject`.
    The `_cleanup`-marker / round-recheck gate spec §3 deletes for the ref layer has no replacement
    live check IN THIS ACTION — spec §2's mandated destructive-cleanup revalidation (life + fence) is
@@ -176,17 +193,18 @@ PassTarget == IF SabotageRederive THEN entry.inc ELSE staleInc
    `PassTarget` cannot coincide with the live incarnation unless something upstream — an incarnation
    reuse, or a re-derivation — made it so. *)
 StaleLeaderPass ==
+    /\ staleInc # 0
     /\ ~passDone
     /\ passDone' = TRUE
     /\ deletedLiveData' = (deletedLiveData \/
                             (entry.state = "live" /\ entry.inc = PassTarget /\ PassTarget \in objects))
     /\ objects' = objects \ {PassTarget}
-    /\ UNCHANGED << entry, staleInc, nextInc >>
+    /\ UNCHANGED << entry, staleInc, nextInc, cleanupEvidence >>
 
 NoOp == UNCHANGED vars
 
 Next ==
-    \/ EntryDelete
+    \/ FoldTerminal \/ DepositCleanupScope \/ EntryDelete
     \/ Recreate
     \/ WriteObject
     \/ StaleLeaderPass
@@ -200,14 +218,15 @@ Spec == Init /\ [][Next]_vars
 TypeOK ==
     /\ entry \in [state : {"removing", "absent", "live"}, inc : 0..MaxInc]
     /\ (entry.state = "absent" <=> entry.inc = 0)
-    /\ staleInc \in Incs
+    /\ staleInc \in 0..MaxInc
     /\ nextInc \in 1..(MaxInc + 1)
     /\ objects \subseteq Incs
+    /\ cleanupEvidence \subseteq Incs
     /\ passDone \in BOOLEAN
     /\ deletedLiveData \in BOOLEAN
 
 (* (SAFETY, spec §2 INV-3: "surviving old-incarnation objects are structurally inert"; spec §3: a
-   cleanup item's incarnation is fixed at deposition, never re-derived.) The stale Pending pass —
+   cleanup scope's incarnation is fixed at deposition, never re-derived.) The stale deposited pass —
    entirely unguarded, unconditional, running at any point in the interleaving — never deletes the
    reborn life's own data, PROVIDED both of its inputs are honest: `Recreate` mints a fresh
    incarnation (`~SabotageNoIncarnation`) and the pass targets what it captured at deposition, not a
@@ -215,5 +234,12 @@ TypeOK ==
    make `PassTarget = entry.inc` while `entry.state = "live"`, by a different route, and either alone
    is therefore enough to violate this. *)
 NoLiveDataDeleted == ~deletedLiveData
+
+CaptureHasEvidence == (staleInc # 0) => (staleInc \in cleanupEvidence)
+
+(* Negated witness: a scope was captured while the predecessor was `Removing` and remains distinct
+   after same-name rebirth. This keeps the capture-at-deposition path executable in a green model. *)
+WITNESS_CAPTURED_BEFORE_REBIRTH ==
+    ~(entry.state = "live" /\ staleInc # 0 /\ staleInc # entry.inc)
 
 =============================================================================
