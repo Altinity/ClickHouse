@@ -317,8 +317,13 @@
   - asan
 
 # STAGE-A RETURN ITEM (`UniversePolicy::kDefault == StageA_Suppressed` in `CasGc.h`, Stage B Task 7b):
-# the tests below are known-red only because production GC destruction is suppressed pre-Stage-B, either
-# because they assert the real deletion contract or because they see the suppression warning itself.
+# the tests below are known-red only because production GC destruction is suppressed pre-Stage-B. Two
+# distinct kinds are listed here and they are not the same object when you triage them:
+#   - the test asserts the real deletion contract, which suppression makes unreachable, so its result
+#     genuinely differs from the reference;
+#   - every assertion in the test PASSES and the harness fails it on stderr, because the fold announces
+#     the suppression. Nothing in such a test is wrong and there is no defect in it to find.
+# The `reason` on each entry says which kind it is; read it before looking for a bug.
 # Remove every one of them in the same change that flips `UniversePolicy::kDefault`;
 # `grep -n "STAGE-A RETURN ITEM"` across tests/queries must then return nothing.
 - name: 05008_ca_gc_snap_prune
