@@ -24,8 +24,10 @@ namespace DB::Cas
 ///     the base was deleted under a live checkpoint, which is corruption.
 ///
 /// TWO writers update it -- the snapshot publisher and the sealer -- and both run the SAME algorithm
-/// (`mergeCkpt` + `publishCkpt` in `Pool/CasRefCkpt.h`): read the whole body, merge by SEMANTIC
-/// MAXIMUM per field, token-CAS. Writing the whole body is what makes a stale field dangerous, and
+/// (`mergeCkpt` + `publishCkpt` in `Pool/CasRefCkpt.h`): read the whole body, JOIN it per field (the
+/// semantic maximum on the two ids; for `life_epoch` the same, except that a contribution BELOW the
+/// durable value is refused instead of absorbed), token-CAS. Writing the whole body is what makes a
+/// stale field dangerous, and
 /// the merge is what contains it: a writer that skipped it and wrote back the value it sampled
 /// earlier would silently regress the OTHER writer's progress (TLC counterexample
 /// `_sab_sealclobbersbase`, which loses an acked transaction).
@@ -53,8 +55,18 @@ struct RefCkpt
 {
     /// The namespace's birth epoch -- the `writer_epoch` of its `NamespaceBirth` record. It is what
     /// makes the epoch-seal grammar checkable without walking to the beginning of the stream
-    /// (`validateEpochSealGrammarContextual` takes exactly this value), and it is a namespace-lifetime
-    /// constant, so its semantic maximum is itself.
+    /// (`validateEpochSealGrammarContextual` takes exactly this value).
+    ///
+    /// It is NOT a namespace-lifetime constant, and the previous version of this comment said it was --
+    /// which is how the merge rule below came to be described as "its semantic maximum is itself". TWO
+    /// writers know a `life_epoch` and they derive it from different epochs: `completeCreation` from the
+    /// catalog creator's `writer_epoch`, and `commitRefChunk`'s birth chunk from the `NamespaceBirth`
+    /// record's. Those differ whenever a stalled `Creating` entry is resumed by a later actor over the
+    /// same incarnation, and whenever the mount's writer epoch advances between the creation and the
+    /// first write -- CREATE TABLE, restart, INSERT. The value that must survive is the LATER one (the
+    /// grammar needs the epoch the birth record actually landed at), and it is always the later
+    /// contribution, because writer epochs are durable-monotone per server root. What the join refuses is
+    /// therefore a DECREASE, not a disagreement; see `mergeCkpt`/`joinLifeEpoch` in `Pool/CasRefCkpt.h`.
     ///
     /// OPTIONAL, and the option is load-bearing rather than a convenience. Exactly ONE writer knows
     /// this value -- the transaction that births the namespace -- and a table recovered from durable

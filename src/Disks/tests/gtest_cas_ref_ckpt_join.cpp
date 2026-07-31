@@ -5,6 +5,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCatalogFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCkptFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
@@ -47,9 +48,11 @@
 namespace DB::ErrorCodes
 {
 extern const int CORRUPTED_DATA;
+extern const int NETWORK_ERROR;
 }
 
 using namespace DB::Cas;
+using DB::Cas::tests::CountingBackend;
 using DB::Cas::tests::namespaceBirthOp;
 using DB::Cas::tests::publishCommittedOps;
 
@@ -77,6 +80,63 @@ constexpr size_t CKPT_WORST_CASE_ENCODED_BYTES = 176;
 /// operations and `publishCommittedOps` emits two per ref, so a namespace holding ten thousand refs is
 /// necessarily built over several transactions -- the cardinality under test cannot be reached in one.
 constexpr size_t REFS_PER_TXN = 2000;
+
+/// A fence that never refuses, and a deadline far enough out that only the test's own contention
+/// decides the outcome -- each `_ckpt`/catalog test file defines its own copy, matching the precedent
+/// `gtest_cas_ns_creation_lifecycle.cpp` states explicitly.
+const std::function<void(uint64_t)> ALWAYS_ADMITTED = [](uint64_t) {};
+
+CkptDeadline generousDeadline()
+{
+    return CkptDeadline{[] { return uint64_t{1000}; }, 60000};
+}
+
+/// Admits the FIRST call (spent by `completeCreation`'s step-2 `publishCkpt`) and refuses every call
+/// after (step 3's own `mutate`): "fenced out between the `_ckpt` create and the `Creating -> Live`
+/// CAS", deterministically and without a second thread. That is the durable shape a stalled creator
+/// leaves behind, and the starting state the resumption test needs.
+std::function<void(uint64_t)> admittedOnceThenFenced()
+{
+    auto calls = std::make_shared<int>(0);
+    return [calls](uint64_t admitted)
+    {
+        if (++*calls > 1)
+            throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "fence generation moved since admission ({})", admitted);
+    };
+}
+
+CreatorFence creatorFence(const String & srid, uint64_t writer_epoch, uint64_t fence_generation = 1)
+{
+    return CreatorFence{.server_root_id = srid, .writer_epoch = writer_epoch, .fence_generation = fence_generation};
+}
+
+/// A `is_creator_fence_terminal` stub answering one fixed verdict: terminality itself is not this
+/// suite's subject (its tests live next to the real predicate in `gtest_cas_mount.cpp`).
+std::function<bool(const CreatorFence &)> fixedTerminality(bool terminal)
+{
+    return [terminal](const CreatorFence &) { return terminal; };
+}
+
+const CatalogEntry * findEntryForTest(const RefCatalog & catalog, const RootNamespace & ns)
+{
+    for (const CatalogEntry & e : catalog.entries)
+        if (e.ns.string() == ns.string())
+            return &e;
+    return nullptr;
+}
+
+/// `life`'s durable `life_epoch`, failing the current test rather than dereferencing a disengaged
+/// optional -- a bare `->` on one aborts the whole binary and takes every later suite's result with it.
+uint64_t lifeEpochOrFail(Backend & backend, const Layout & layout, const NamespaceLifeId & life)
+{
+    const std::optional<CkptSample> sample = readCkpt(backend, layout, life);
+    if (!sample || !sample->ckpt.life_epoch)
+    {
+        ADD_FAILURE() << "expected a _ckpt carrying a life_epoch for namespace '" << life.ns.string() << "'";
+        return 0;
+    }
+    return *sample->ckpt.life_epoch;
+}
 
 PoolPtr openPool(const BackendPtr & backend)
 {
@@ -150,28 +210,148 @@ TEST(CasRefCkptJoin, JoinUnknownLifeEpochWithPresentYieldsPresent)
     const RefCkpt unknown{.life_epoch = std::nullopt, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
     const RefCkpt present{.life_epoch = 7, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
 
-    EXPECT_EQ(mergeCkpt(unknown, present).life_epoch, std::optional<uint64_t>{7});
-    EXPECT_EQ(mergeCkpt(present, unknown).life_epoch, std::optional<uint64_t>{7})
-        << "the merge is commutative -- a writer that knows nothing must not be able to erase the genesis epoch";
+    EXPECT_EQ(mergeCkpt(unknown, present, "cas_ref_ckpt").life_epoch, std::optional<uint64_t>{7});
+    EXPECT_EQ(mergeCkpt(present, unknown, "cas_ref_ckpt").life_epoch, std::optional<uint64_t>{7})
+        << "an absence is order-independent -- a writer that knows nothing must not be able to erase the "
+           "genesis epoch, whichever side it is on";
 
     /// The other half of "absent loses": two absences stay absent. `life_epoch` has no floor to fall
-    /// back to, and a fabricated one is permanent -- the semantic-max merge can never lower it again.
-    EXPECT_EQ(mergeCkpt(unknown, unknown).life_epoch, std::nullopt);
+    /// back to, and a fabricated one is permanent -- the join can never lower it again.
+    EXPECT_EQ(mergeCkpt(unknown, unknown, "cas_ref_ckpt").life_epoch, std::nullopt);
 }
 
-/// The ordinary steady state, and the case the re-key made the only present-vs-present one a namespace
-/// life should ever see: both writers agree. Asserted for its own sake because it is what a stricter
-/// conflict rule must keep admitting -- an equal republish is not a conflict.
+/// The ordinary steady state: both writers agree. Asserted for its own sake because it is what the
+/// stricter rule must keep admitting -- an equal republish is not a conflict, and it is also what
+/// `publishCkpt` turns into "no write at all".
 TEST(CasRefCkptJoin, JoinEqualLifeEpochsYieldsSame)
 {
     const RefCkpt a{.life_epoch = 9, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
     const RefCkpt b{.life_epoch = 9, .checkpoint_snapshot_id = RefTxnId{9, 4}, .last_epoch_seal = std::nullopt};
 
-    EXPECT_EQ(mergeCkpt(a, b).life_epoch, std::optional<uint64_t>{9});
-    EXPECT_EQ(mergeCkpt(b, a).life_epoch, std::optional<uint64_t>{9});
+    EXPECT_EQ(mergeCkpt(a, b, "cas_ref_ckpt").life_epoch, std::optional<uint64_t>{9});
+    EXPECT_EQ(mergeCkpt(b, a, "cas_ref_ckpt").life_epoch, std::optional<uint64_t>{9});
     const std::optional<RefTxnId> b_checkpoint = RefTxnId{9, 4};
-    EXPECT_EQ(mergeCkpt(a, b).checkpoint_snapshot_id, b_checkpoint)
+    EXPECT_EQ(mergeCkpt(a, b, "cas_ref_ckpt").checkpoint_snapshot_id, b_checkpoint)
         << "an equal life_epoch must not disturb the other fields' own join";
+}
+
+/// THE FIRST OF THE TWO SEQUENCES THAT RAISE `life_epoch` HONESTLY, end to end through the production
+/// primitives rather than at the merge: a creator publishes `_ckpt` at E1 (`completeCreation` step 2)
+/// and dies before its `Creating -> Live` CAS (step 3), and a later actor reconciles the stalled entry
+/// and resumes over the SAME incarnation, contributing E2. Two different present values in one
+/// incarnation, and NOT a conflict -- the stored value must simply become E2, which is also what
+/// `CasNsCreationLifecycle.ReconcileSucceedsTokenExactlyAfterTheOriginalCreatorFenceIsTerminalThenResumesToLive`
+/// already pins from the catalog side ("the RESUMING actor's writer_epoch is the genesis epoch that
+/// actually landed"). Had the directive's literal rule landed, this sequence would raise
+/// `CORRUPTED_DATA` and, since `_ckpt` has no repair path, wedge the namespace forever.
+///
+/// Both fences share ONE `server_root_id` on purpose: every live namespace is rooted at its own pool
+/// member's `server_root_id`, so a creator and its reconciler are always actors of the same server root
+/// and draw from the same durable-monotone epoch counter. That is the whole basis for "contributions
+/// only ever rise", so the fixture must not quietly model two roots.
+TEST(CasRefCkptJoin, ResumedCreationRaisesLifeEpochWithoutRefusal)
+{
+    InMemoryBackend backend;
+    Layout layout("p");
+    const RootNamespace ns{"a"};
+
+    ASSERT_EQ(CasRefCatalog::createNamespace(backend, layout, ns, creatorFence("srv1", 5),
+                                             /*admitted_generation=*/1, admittedOnceThenFenced(), generousDeadline()),
+              CasRefCatalog::NamespaceCreationOutcome::FencedOut);
+
+    /// Bound to a name, never chained through a temporary: a `const CatalogEntry *` taken from an
+    /// unbound `Snapshot` dangles the instant the full expression ends.
+    const CasRefCatalog::Snapshot stalled = CasRefCatalog::read(backend, layout);
+    const CatalogEntry * entry = findEntryForTest(stalled.catalog, ns);
+    ASSERT_NE(entry, nullptr);
+    ASSERT_EQ(entry->state, NsState::Creating);
+    const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(entry->ns, entry->incarnation);
+    EXPECT_EQ(lifeEpochOrFail(backend, layout, life), 5u) << "step 2 landed before the creator stalled";
+
+    const CreatorFence resumer = creatorFence("srv1", 9);
+    ASSERT_EQ(CasRefCatalog::reconcileStaleCreator(backend, layout, *entry, resumer, fixedTerminality(true),
+                                                   /*admitted_generation=*/1, ALWAYS_ADMITTED),
+              CasRefCatalog::ReconcileCreatorOutcome::Reconciled);
+
+    CatalogEntry resumed = *entry;
+    resumed.creator = resumer;
+    EXPECT_EQ(CasRefCatalog::completeCreation(backend, layout, resumed, /*admitted_generation=*/1,
+                                              ALWAYS_ADMITTED, generousDeadline()),
+              CasRefCatalog::NamespaceCreationOutcome::Live)
+        << "the resumption must not be refused by the join";
+    EXPECT_EQ(lifeEpochOrFail(backend, layout, life), 9u)
+        << "the genesis epoch that actually landed is the resuming actor's, and the join must let it rise";
+}
+
+/// THE SECOND SEQUENCE, at the seam where the two `life_epoch`-knowing writers actually meet -- both of
+/// them reach this object only through `publishCkpt`, so driving that twice over one key IS the
+/// production interleaving, not a stand-in for it. `completeCreation` contributes the catalog creator's
+/// epoch; the mount's writer epoch then advances (a restart, a remount); the first precommit's birth
+/// chunk contributes the `NamespaceBirth` record's epoch. CREATE TABLE, restart, INSERT.
+TEST(CasRefCkptJoin, RestartBetweenCreationAndFirstWriteRaisesLifeEpochWithoutRefusal)
+{
+    InMemoryBackend backend;
+    Layout layout("p");
+    const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(RootNamespace{"a"}, UInt128(42));
+
+    const RefCkpt from_creation{.life_epoch = 4, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
+    ASSERT_EQ(publishCkpt(backend, layout, life, from_creation, 1, ALWAYS_ADMITTED, generousDeadline()),
+              CkptPublishOutcome::Published);
+
+    const RefCkpt from_birth_chunk{.life_epoch = 7, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
+    EXPECT_EQ(publishCkpt(backend, layout, life, from_birth_chunk, 1, ALWAYS_ADMITTED, generousDeadline()),
+              CkptPublishOutcome::Published)
+        << "the birth chunk's later epoch must be publishable, not refused as a conflict";
+    EXPECT_EQ(lifeEpochOrFail(backend, layout, life), 7u);
+}
+
+/// THE REFUSAL, and the state it constructs IS UNREACHABLE ON ANY HONEST PATH -- that is the point of
+/// the test, not a caveat on it. `writer_epoch` is durable-monotone per server root
+/// (`allocateWriterEpoch` CAS-bumps `<prefix>/gc/server-roots/<srid>/epoch`) and a namespace belongs to
+/// exactly one server root, so no live writer can contribute an epoch below one already durable. The
+/// only way to reach this is for the fence discipline itself to have failed and a SUPERSEDED writer's
+/// contribution to have landed anyway.
+///
+/// So this test does not model an operating condition; it asserts what happens if the guarantee above
+/// is ever violated -- the join refuses and names both values, rather than absorbing the violation into
+/// a maximum and leaving no trace. The state is built by publishing the two contributions in the order
+/// the fence discipline is supposed to prevent, which needs no seam that manufactures impossible states:
+/// `publishCkpt` is a public entry point and the order of two calls is the test's to choose.
+TEST(CasRefCkptJoin, JoinDecreasingLifeEpochIsCorruptionAndPublishesNothing)
+{
+    CountingBackend backend;
+    Layout layout("p");
+    const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(RootNamespace{"a"}, UInt128(42));
+    const String key = layout.refCkptKey(life);
+
+    const RefCkpt durable{.life_epoch = 9, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
+    ASSERT_EQ(publishCkpt(backend, layout, life, durable, 1, ALWAYS_ADMITTED, generousDeadline()),
+              CkptPublishOutcome::Published);
+    const uint64_t cas_puts_before = backend.casPutCount(key);
+
+    const RefCkpt superseded{.life_epoch = 3, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
+    String message;
+    try
+    {
+        publishCkpt(backend, layout, life, superseded, 1, ALWAYS_ADMITTED, generousDeadline());
+        ADD_FAILURE() << "a contribution below the durable life_epoch must not be published";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
+        message = e.message();
+    }
+
+    /// BOTH values, not just the offending one: an operator reading this has to be able to tell which
+    /// writer is the superseded one without going to the object.
+    EXPECT_NE(message.find('9'), String::npos) << "the durable value must be named: " << message;
+    EXPECT_NE(message.find('3'), String::npos) << "the contributed value must be named: " << message;
+    EXPECT_NE(message.find(key), String::npos) << "the key must be named: " << message;
+
+    /// And nothing was written. The refusal happens inside the merge, which runs before the CAS is
+    /// built, so the durable body is untouched and no write was even attempted.
+    EXPECT_EQ(backend.casPutCount(key), cas_puts_before) << "the publisher must not CAS on a refused merge";
+    EXPECT_EQ(lifeEpochOrFail(backend, layout, life), 9u) << "the durable value is unchanged";
 }
 
 /// `checkpoint_snapshot_id` and `last_epoch_seal` continue to merge by SEMANTIC MAXIMUM. Unlike
@@ -191,19 +371,19 @@ TEST(CasRefCkptJoin, CheckpointAndSealStillMergeBySemanticMaximum)
 
     /// Ordered by writer_epoch FIRST: `{4,1}` beats `{3,5}` even though its sequence is smaller, which
     /// is the intended timeline across an epoch restart that resets the sequence.
-    EXPECT_EQ(mergeCkpt(lower, higher).checkpoint_snapshot_id, higher_checkpoint);
-    EXPECT_EQ(mergeCkpt(higher, lower).checkpoint_snapshot_id, higher_checkpoint);
-    EXPECT_EQ(mergeCkpt(lower, higher).last_epoch_seal, higher_seal);
-    EXPECT_EQ(mergeCkpt(higher, lower).last_epoch_seal, higher_seal);
+    EXPECT_EQ(mergeCkpt(lower, higher, "cas_ref_ckpt").checkpoint_snapshot_id, higher_checkpoint);
+    EXPECT_EQ(mergeCkpt(higher, lower, "cas_ref_ckpt").checkpoint_snapshot_id, higher_checkpoint);
+    EXPECT_EQ(mergeCkpt(lower, higher, "cas_ref_ckpt").last_epoch_seal, higher_seal);
+    EXPECT_EQ(mergeCkpt(higher, lower, "cas_ref_ckpt").last_epoch_seal, higher_seal);
 
     /// Present beats absent, both directions and both fields.
     const RefCkpt nothing;
-    EXPECT_EQ(mergeCkpt(nothing, lower).checkpoint_snapshot_id, lower_checkpoint);
-    EXPECT_EQ(mergeCkpt(lower, nothing).checkpoint_snapshot_id, lower_checkpoint);
-    EXPECT_EQ(mergeCkpt(nothing, lower).last_epoch_seal, lower_seal);
-    EXPECT_EQ(mergeCkpt(lower, nothing).last_epoch_seal, lower_seal);
-    EXPECT_EQ(mergeCkpt(nothing, nothing).checkpoint_snapshot_id, std::nullopt);
-    EXPECT_EQ(mergeCkpt(nothing, nothing).last_epoch_seal, std::nullopt);
+    EXPECT_EQ(mergeCkpt(nothing, lower, "cas_ref_ckpt").checkpoint_snapshot_id, lower_checkpoint);
+    EXPECT_EQ(mergeCkpt(lower, nothing, "cas_ref_ckpt").checkpoint_snapshot_id, lower_checkpoint);
+    EXPECT_EQ(mergeCkpt(nothing, lower, "cas_ref_ckpt").last_epoch_seal, lower_seal);
+    EXPECT_EQ(mergeCkpt(lower, nothing, "cas_ref_ckpt").last_epoch_seal, lower_seal);
+    EXPECT_EQ(mergeCkpt(nothing, nothing, "cas_ref_ckpt").checkpoint_snapshot_id, std::nullopt);
+    EXPECT_EQ(mergeCkpt(nothing, nothing, "cas_ref_ckpt").last_epoch_seal, std::nullopt);
 }
 
 /// ---------------------------------------------------------------------------------------------

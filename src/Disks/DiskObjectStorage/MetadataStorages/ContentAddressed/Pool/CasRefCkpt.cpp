@@ -3,6 +3,14 @@
 #include <Common/Exception.h>
 #include <algorithm>
 
+namespace DB
+{
+namespace ErrorCodes
+{
+    extern const int CORRUPTED_DATA;
+}
+}
+
 namespace DB::Cas
 {
 
@@ -27,17 +35,58 @@ std::optional<T> maxKnown(const std::optional<T> & a, const std::optional<T> & b
     return std::max(*a, *b);
 }
 
+/// `life_epoch`'s join, and it is deliberately NOT `maxKnown`. Absences behave the same way (a writer
+/// that knows nothing leaves what is there alone, in either position), and a value at or above the
+/// durable one wins the same way. What differs is the remaining case: a contribution BELOW the durable
+/// value is refused as `CORRUPTED_DATA` rather than absorbed by the max.
+///
+/// The refusal is narrow ON PURPOSE, and the narrowness is what makes it stronger rather than weaker
+/// than a rule against any disagreement. Two present-and-different values are ORDINARY here: the two
+/// writers that know a `life_epoch` derive it from different epochs that legitimately differ --
+/// `completeCreation` from the catalog creator's `writer_epoch`, `commitRefChunk`'s birth chunk from the
+/// `NamespaceBirth` record's -- so a resumed creation (`reconcileStaleCreator` handing a stalled
+/// `Creating` entry to a later actor, same incarnation) and a plain restart between CREATE TABLE and the
+/// first INSERT both raise the value honestly. Refusing THAT would wedge the namespace permanently:
+/// `_ckpt` has no repair path and no writer may delete it outside namespace removal, so every retry
+/// would re-read the old value, re-contribute the new one and re-throw.
+///
+/// A DECREASE is the case that cannot happen honestly, which is precisely why it is worth detecting.
+/// `writer_epoch` is durable-monotone per server root (`allocateWriterEpoch` CAS-bumps
+/// `<prefix>/gc/server-roots/<srid>/epoch`), and every live namespace is rooted at its own member's
+/// `server_root_id`, so a namespace's creator and any actor that later reconciles it share ONE monotone
+/// counter and a live actor's epoch always exceeds a terminal one's. A contribution below what is
+/// durable therefore means a writer whose epoch is already superseded got its contribution through --
+/// a fence violation, the class this subsystem cares most about. `maxKnown` absorbed it silently.
+///
+/// (That argument is per-server-root. It would need revisiting if one namespace could ever be created
+/// by two DIFFERENT server roots, whose epoch counters are independent and so unordered.)
+std::optional<uint64_t> joinLifeEpoch(const std::optional<uint64_t> & stored,
+                                      const std::optional<uint64_t> & contribution,
+                                      std::string_view what)
+{
+    if (!contribution)
+        return stored;
+    if (!stored)
+        return contribution;
+    if (*contribution < *stored)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS {}: life_epoch may not decrease -- {} is durable and a writer contributed {}. Writer "
+            "epochs are monotone per server root, so a lower contribution means a superseded writer's "
+            "work reached this object; refusing rather than taking the maximum",
+            what, *stored, *contribution);
+    return contribution;
 }
 
-RefCkpt mergeCkpt(const RefCkpt & a, const RefCkpt & b)
+}
+
+RefCkpt mergeCkpt(const RefCkpt & stored, const RefCkpt & contribution, std::string_view what)
 {
     RefCkpt merged;
-    /// `life_epoch` is a namespace-lifetime constant, so in the steady state one side knows it and the
-    /// other does not, and the max keeps the one that does. It is still merged like every other field:
-    /// taking it from either side by name is how a writer that knows nothing about it would erase it.
-    merged.life_epoch = maxKnown(a.life_epoch, b.life_epoch);
-    merged.checkpoint_snapshot_id = maxKnown(a.checkpoint_snapshot_id, b.checkpoint_snapshot_id);
-    merged.last_epoch_seal = maxKnown(a.last_epoch_seal, b.last_epoch_seal);
+    /// Every field is JOINED, never taken from one side by name: a writer that knows nothing about a
+    /// field must not be able to erase it, and that is the whole reason this function exists.
+    merged.life_epoch = joinLifeEpoch(stored.life_epoch, contribution.life_epoch, what);
+    merged.checkpoint_snapshot_id = maxKnown(stored.checkpoint_snapshot_id, contribution.checkpoint_snapshot_id);
+    merged.last_epoch_seal = maxKnown(stored.last_epoch_seal, contribution.last_epoch_seal);
     return merged;
 }
 
@@ -71,7 +120,7 @@ CkptPublishOutcome publishCkpt(Backend & backend, const Layout & layout, const N
         /// created from the contribution as it stands, so a publisher that knows only the checkpoint
         /// creates one that knows only the checkpoint, and the birth transaction's `life_epoch` merges
         /// into it whenever it arrives -- in either order, because the merge is a per-field maximum.
-        const RefCkpt merged = current ? mergeCkpt(current->ckpt, contribution) : contribution;
+        const RefCkpt merged = current ? mergeCkpt(current->ckpt, contribution, key) : contribution;
 
         /// Nothing new: return WITHOUT a CAS. This is not an optimization -- both writers publish on
         /// every snapshot and every seal, and most of those carry a checkpoint the object already has,

@@ -346,41 +346,49 @@ TEST(CasRefCkpt, GroupRefKeysClassifiesTheCkptInsteadOfAbortingTheRound)
 
 /// The per-field table the ledger obligation from the TLA phase asks for: each field independently
 /// newer on either side, plus both-absent and equal bodies. A merge that is not per-field would pass
-/// some rows and fail others, which is the point of enumerating them.
-TEST(CasRefCkpt, MergeTakesThePerFieldSemanticMaximum)
+/// some rows and fail others, which is the point of enumerating them. The two ids take the semantic
+/// maximum; `life_epoch`'s join differs in one direction only (see the row below).
+TEST(CasRefCkpt, MergeJoinsEachFieldIndependently)
 {
     const RefCkpt low{.life_epoch = std::optional<uint64_t>{3}, .checkpoint_snapshot_id = ID_1_1, .last_epoch_seal = ID_1_1};
     const RefCkpt high_ckpt{.life_epoch = std::optional<uint64_t>{3}, .checkpoint_snapshot_id = ID_1_2, .last_epoch_seal = ID_1_1};
     const RefCkpt high_seal{.life_epoch = std::optional<uint64_t>{3}, .checkpoint_snapshot_id = ID_1_1, .last_epoch_seal = ID_2_1};
     const RefCkpt high_life{.life_epoch = std::optional<uint64_t>{9}, .checkpoint_snapshot_id = ID_1_1, .last_epoch_seal = ID_1_1};
 
-    /// Each field newer on the RIGHT, then the same case mirrored to the LEFT: the merge is symmetric,
-    /// which is exactly why the two writers need no ordering between them.
-    EXPECT_EQ(mergeCkpt(low, high_ckpt), high_ckpt);
-    EXPECT_EQ(mergeCkpt(high_ckpt, low), high_ckpt);
-    EXPECT_EQ(mergeCkpt(low, high_seal), high_seal);
-    EXPECT_EQ(mergeCkpt(high_seal, low), high_seal);
-    EXPECT_EQ(mergeCkpt(low, high_life), high_life);
-    EXPECT_EQ(mergeCkpt(high_life, low), high_life);
+    /// The two ID fields, newer on the RIGHT and then the same case mirrored to the LEFT: on these the
+    /// join is a commutative max, so their outcome is order-independent outright.
+    EXPECT_EQ(mergeCkpt(low, high_ckpt, "cas_ref_ckpt"), high_ckpt);
+    EXPECT_EQ(mergeCkpt(high_ckpt, low, "cas_ref_ckpt"), high_ckpt);
+    EXPECT_EQ(mergeCkpt(low, high_seal, "cas_ref_ckpt"), high_seal);
+    EXPECT_EQ(mergeCkpt(high_seal, low, "cas_ref_ckpt"), high_seal);
+
+    /// `life_epoch` rises the same way -- but ONLY in that direction, and this row is deliberately not
+    /// mirrored. Task 4c: the arguments are `(stored, contribution)`, and a contribution BELOW the
+    /// durable value is `CORRUPTED_DATA` rather than absorbed by a max, because it can only mean a
+    /// superseded writer's work reached the object. The mirrored call this row used to make asserted the
+    /// opposite, on the strength of a comment (`life_epoch` "is a namespace-lifetime constant") that the
+    /// code refutes. That case and its reachability argument now live in the `CasRefCkptJoin` suite
+    /// (`gtest_cas_ref_ckpt_join.cpp`), which owns the join law per field.
+    EXPECT_EQ(mergeCkpt(low, high_life, "cas_ref_ckpt"), high_life);
 
     /// Fields advance INDEPENDENTLY: a merge of two bodies each newer in a different field keeps both.
-    const RefCkpt both = mergeCkpt(high_ckpt, high_seal);
+    const RefCkpt both = mergeCkpt(high_ckpt, high_seal, "cas_ref_ckpt");
     EXPECT_EQ(both.checkpoint_snapshot_id, ID_1_2);
     EXPECT_EQ(both.last_epoch_seal, ID_2_1);
 
     /// An absent optional loses to a present one, whichever side it is on, and two absents stay absent.
     const RefCkpt none{.life_epoch = std::optional<uint64_t>{3}, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
-    EXPECT_EQ(mergeCkpt(none, low), low);
-    EXPECT_EQ(mergeCkpt(low, none), low);
-    EXPECT_EQ(mergeCkpt(none, none), none);
+    EXPECT_EQ(mergeCkpt(none, low, "cas_ref_ckpt"), low);
+    EXPECT_EQ(mergeCkpt(low, none, "cas_ref_ckpt"), low);
+    EXPECT_EQ(mergeCkpt(none, none, "cas_ref_ckpt"), none);
 
     /// Identical bodies merge to themselves -- the property `publishCkpt` turns into "no write".
-    EXPECT_EQ(mergeCkpt(low, low), low);
+    EXPECT_EQ(mergeCkpt(low, low, "cas_ref_ckpt"), low);
 
     /// A contribution that knows NOTHING about `life_epoch` (the snapshot publisher's shape) must not
     /// erase it. This is the case a plain assignment would get wrong.
     const RefCkpt publisher_only{.life_epoch = std::nullopt, .checkpoint_snapshot_id = ID_1_2, .last_epoch_seal = std::nullopt};
-    const RefCkpt advanced = mergeCkpt(low, publisher_only);
+    const RefCkpt advanced = mergeCkpt(low, publisher_only, "cas_ref_ckpt");
     EXPECT_EQ(advanced.life_epoch, 3u);
     EXPECT_EQ(advanced.checkpoint_snapshot_id, ID_1_2);
     EXPECT_EQ(advanced.last_epoch_seal, ID_1_1) << "the publisher knows nothing about the seal and must "
@@ -460,7 +468,7 @@ TEST(CasRefCkpt, TokenConflictRereadsAndMergesOntoTheWinner)
         interfered = true;
         const RefCkpt sealer{.life_epoch = std::optional<uint64_t>{5}, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = ID_2_1};
         const HeadResult h = backend->head(key);
-        ASSERT_EQ(backend->putOverwrite(key, encodeRefCkpt(mergeCkpt(base, sealer)), h.token).outcome,
+        ASSERT_EQ(backend->putOverwrite(key, encodeRefCkpt(mergeCkpt(base, sealer, "cas_ref_ckpt")), h.token).outcome,
                   PutOutcome::Done);
     };
 
