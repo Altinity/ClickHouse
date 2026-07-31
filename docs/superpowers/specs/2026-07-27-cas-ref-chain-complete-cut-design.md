@@ -89,6 +89,15 @@ suppresses reclamation pool-wide until an administrative rebuild. So the orderin
 is the thing tests must pin. **A same-name birth is refused while the predecessor's removal is
 incomplete**; the refusal is temporary and self-clearing — the retry mints a fresh incarnation once
 the entry is gone — and must be reported as retry-later, never as an internal error.
+
+**State the magnitude, because "temporary" understates it.** The window spans a terminal fold, a
+bounded cleanup pass, the retirement observation (which lands in a LATER round) and the entry delete
+— **several GC rounds, not seconds**. That is tolerable while same-name rebirth is an edge case, and
+under UUID-derived names it is one. It is NOT an edge case under a UUID-less table path, where
+`DROP` + `CREATE` of the same table reaches the same namespace every time and therefore waits out
+this window every time. Whoever implements removal owns that decision explicitly: either an eager
+targeted fold of a `Removing` namespace's tail, driven by the DROP path, or accept the latency and
+document it in the refusal message. Do not leave it implied.
 **The catalog stays O(`Creating` + `Live` + `Removing`) under any create/drop churn** (stalled
 creators occupy entries until fence-terminal reconciliation — r9-6). Manifests keep their
 `(namespace, mount-epoch, build-sequence)` identity — mount-global build ids already prevent
@@ -307,7 +316,7 @@ publication). The full enumerated list from rounds 5–9 rides in the implementa
 |---|---|
 | v1–v4 certificate stack (prev links, seal intervals, pointers, authorities, generations, `R*`, tombstones) | Rejected by the user as accretion; deleted. |
 | Full head-CAS commit chain (blinded consult) | North star: revisit when the wedge is worth deleting or namespace counts make the frontier sweep expensive. v9 carries its catalog, checkpoint and (ref-layer-scoped) incarnations. |
-| `seq_floor` in the catalog instead of incarnations | Rejected by the user's churn scenario: floors for dead names never retire → unbounded catalog. Incarnations make debris inert WITHOUT a physical-empty proof, so entries delete immediately. |
+| `seq_floor` in the catalog instead of incarnations | Rejected by the user's churn scenario: floors for dead names never retire → unbounded catalog. Incarnations make debris inert WITHOUT a physical-empty proof, so an entry deletes as soon as its removal completes rather than waiting on one. |
 | Delete the incarnation entirely; forbid exact `RootNamespace` reuse forever | **Proposed and withdrawn, 2026-07-31**, after two independent reviews of the whole phase. It is coherent, and it needs somewhere to remember every retired name — which is the same shape as the `seq_floor` row above, so it fails for the same reason, one level up. A never-deleted `Retired` catalog state grows by one row per historical namespace and eventually refuses admission at the object cap; **normal UUID churn does not bound it**, since every fresh UUID also leaves a permanent row. No bounded exact compaction exists for opaque names, because compacting a retirement record and certifying physical emptiness are the same problem. A marker object outside the catalog bounds nothing either and reintroduces the marker class this design removes. Independently, permanent non-reuse is a regression against supported workflows (§3). |
 | Retirement as a `Retired` catalog state, or as a marker object | Rejected with the row above; both are only needed if the incarnation is deleted. Keeping it means **nothing has to remember a dead namespace at all** — the entry is deleted, debris is inert by foreign prefix, and the catalog stays O(active). |
 | Fresh-epoch rebirth | Failed round 6's audit (server-root-wide allocator; unqualified families). |

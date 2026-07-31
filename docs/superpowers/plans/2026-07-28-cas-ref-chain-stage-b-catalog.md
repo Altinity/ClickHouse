@@ -1103,216 +1103,169 @@ exception. Hence: depends on Task 4, and its behaviour half MAY NOT be cherry-pi
 - [ ] **Step 2:** → FAIL. **Step 3:** Implement. **Step 4:** Full CA gate green. **Step 5: Commit**
   `ca: ref — _ckpt: O(1) invariant stated, conflicting life_epoch is corruption`.
 
-### Task 5: Removal lifecycle — terminal record, janitor, deposited incarnation {#task-5}
+### Task 5: Removal lifecycle — one ordered sequence, entry deleted last {#task-5}
 
-**INTERFACE NOTE from Task 1 (2026-07-29, controller-ledgered; RECONCILED with the amendment):**
-Task 1 deleted `refsNamespacePrefix(RootNamespace)` — the only all-lives LIST prefix — per
-Constraint 4, and it STAYS deleted. The lazy janitor here needs a NEW, differently-named helper to
-enumerate foreign-incarnation debris under a known namespace. Do NOT "restore" the old overload —
-the deleted-overload concept checks in `gtest_cas_namespace_life_id.cpp` will (correctly) fail the
-build if you do; add the new name with its own tests instead.
+**This task was rewritten from scratch on 2026-07-31, not edited.** The previous text had accumulated
+eight interlocking obligations placed on four different dates, including corrections of its own
+corrections; two independent strategic reviews of the whole phase identified that accretion as the
+symptom rather than the content. What follows is derived from the spec's removal ordering, which is now
+an invariant (§3, INV-3), not from the old text. The old obligations were traced individually — the ones
+that died are listed at the end so they are not re-added.
 
-**The amendment settles its shape: ONE helper for BOTH object families, named
-`namespaceAllLivesPrefix(const RootNamespace &)`** — not the earlier suggestion
-`refsAllLivesPrefix`, and not a sibling per family. Reason: once Task 4b re-keys files, ref objects
-and `_files` objects live under the SAME `<ns>/<inc>/` prefix, so one LIST at `<ns>/` discovers
-every family's debris in one request; two helpers would mean two LISTs for one job and a second
-chance to forget one. The janitor classifies what the LIST returns by the parsers (a life-less or
-otherwise unparseable key is anomaly-and-continue, never a throw — the standing rule the Task-1 fix
-commit `67dd2666e75` restored). **Why this is not a smuggled re-add of the deleted overload, stated
-for the reviewer:** it returns a PREFIX FOR LIST ONLY and addresses no single life's object; it has
-no `Key` suffix and no key-building sibling; and it is unusable for a read or a write because every
-read/write path demands a `NamespaceLifeId`. Task 1c's concept-negative battery is written against
-the KEY/prefix helpers that ADDRESS ONE LIFE, so it must not (and does not) forbid this one.
+**The invariant this task exists to establish:** the catalog entry is deleted **LAST** — after the
+terminal record folds, the namespace's cleanup item retires, and a seal with that namespace's shard-0
+cursor **pruned** is durable. Everything else here follows from it. It is what makes coexisting lives
+unrepresentable in GC-held state, which is why the fold cursor needs no incarnation in its key, and why
+most of the old task's content is unnecessary rather than deferred.
+
+**Violating the order is permanent, not a lost round.** An entry deleted while its cursor survives leaves
+a cursor no catalog entry names; that recurs as an anomaly every round and suppresses reclamation
+pool-wide until an administrative rebuild. So the tests here pin **the order**, never a key format.
+
+**INTERFACE NOTE from Task 1 (2026-07-29, controller-ledgered).** Task 1 deleted
+`refsNamespacePrefix(RootNamespace)` — the only all-lives LIST prefix — and it STAYS deleted. The janitor
+needs a NEW, differently-named helper, `namespaceAllLivesPrefix(const RootNamespace &)`: ONE helper for
+both object families, because ref objects and `_files` now share the `<ns>/<inc>/` prefix, so one LIST at
+`<ns>/` finds every family's debris. Do not "restore" the old overload — the deleted-overload concept
+checks in `gtest_cas_namespace_life_id.cpp` will correctly fail the build. This is not a smuggled re-add:
+it returns a prefix for LIST only, addresses no single life's object, has no key-building sibling, and is
+unusable for a read or a write because every read/write path demands a `NamespaceLifeId`.
 
 **Files:**
-- Modify: `.../Pool/CasRefCatalog.cpp`, `.../Pool/CasRefLedger.cpp` (terminal append path),
-  `.../Gc/CasGc.cpp` (`runNamespaceCleanupPasses` `:2145` — the cleanup item shape), the
-  namespace-removal call path (`RefOpKind::RemoveNamespace` usages)
+- Modify: `.../Pool/CasRefCatalog.{h,cpp}`, `.../Pool/CasRefLedger.{h,cpp}`, `.../Pool/CasPool.{h,cpp}`,
+  `.../Gc/CasGc.cpp` (cleanup passes and the anomaly classification), the `RefOpKind::RemoveNamespace`
+  call path
 - Create: `src/Disks/tests/gtest_cas_ns_removal_lifecycle.cpp`
 
 **Interfaces:**
-- Consumes: Tasks 2-4b; Stage A holds (a `Removing` namespace can hold like any other).
-- Produces (§3 verbatim, plus the amendment's cleanup half):
-  - Removal = catalog `Live → Removing` CAS (the admission bound does NOT free here — see the
-    correction below; `Removing` forbids NEW positive ownership), then the terminal record appended ONLY by the
-    owning mounted writer or a successor that claimed and fenced that server root; GC surfaces
-    stuck removals (a durable counter + log per round observing a terminal-less `Removing`),
-    NEVER appends.
-  - After the terminal record FOLDS: ONE explicitly BOUNDED, suppression-aware best-effort
-    cleanup attempt (spec INV-3's "best-effort cleanup runs" — codex finding 13: it sits
-    BETWEEN the terminal fold and the deletions; its failures defer to the janitor as leak-only
-    work), then `_ckpt` deleted by exact token while `Removing`, then the catalog entry deleted
-    (entry LAST) — the ordering asserted via the backend op journal; the entry vanishes without
-    a physical-empty proof (surviving old-incarnation objects are structurally inert — foreign
-    prefix) **and after the amendment that explicitly covers `_files`: `_files` is REMOVED from
-    mandatory namespace-removal LIST deletion (directive), and namespace rebirth must NOT wait for
-    `_files` to become physically empty.**
-  - **The `Removing`-without-`_ckpt` window is owned HERE, not by recovery** (directive §3):
-    between the `_ckpt` delete and the entry delete the entry is `Removing` with no `_ckpt`, and
-    Task 5b makes recovery REFUSE to ground exactly that shape. So the removal driver RESUMES it on
-    the owning writer's next mount — idempotent, because the `_ckpt` is already gone and the resume
-    is the exact-CAS entry removal alone. For a root that never returns it is Task 7's
-    `_ckpt`-absent branch. Neither path may RE-CREATE `_ckpt` (that would resurrect a life the
-    terminal record already closed).
-  - Lazy janitor: whenever cleanup LISTING happens to return foreign-incarnation debris under a
-    known namespace, delete it (omission = deferred cleanup, leak-only direction) — implemented
-    inside `runNamespaceCleanupPasses`, gated by `suppress_destructive` like every destructive
-    site. **After the amendment the janitor is the ONLY reclaimer of dead-incarnation `_files`
-    objects, and it treats them exactly like ref debris: enumerated through
-    `namespaceAllLivesPrefix`, deleted BY EXACT TOKEN, under the DEPOSITED incarnation.** LIST
-    omission may only leak storage — never visibility, rebirth or deletion safety (directive §2). A
-    `_files` object whose token changed under the janitor is RETAINED and surfaced, not deleted.
-  - **The cleanup item carries the incarnation CAPTURED AT DEPOSITION; a resumed pass NEVER
-    re-derives it from the catalog** (spec §3 bold text; `CaRefNsCleanupStaleLeaderCore`'s
-    proven rule). Deposition writes the captured incarnation (capture-time correctness — the
-    TLA Task 4 obligation), and the resumed-pass path has a test proving a reborn same-name
-    namespace's data survives a stale cleanup resume.
+- Consumes: Tasks 2–4c. A `Removing` namespace can carry holds like any other.
+- Produces: the removal sequence below; the typed retryable refusal; `namespaceAllLivesPrefix`; the
+  reader-absence predicate re-answered from catalog state.
 
-- [ ] **Step 1: Failing tests**: full removal (Removing → terminal → fold → `_ckpt` exact-token
-  delete → entry delete, in that order — assert order via backend op journal); terminal append
-  refused for a non-owner without a claimed fence; GC observing terminal-less `Removing` for
-  N rounds surfaces it and appends NOTHING; janitor deletes planted foreign-incarnation debris
-  under suppression rules; the stale-cleanup-resume rebirth test (deposit cleanup for inc₁,
-  drop + recreate ns as inc₂, resume the pass → inc₂'s objects untouched, inc₁ debris deleted);
-  deposition-writes-captured-incarnation unit test (white-box: the deposited item's field
-  equals the incarnation at deposit time even if the catalog changed before the write landed).
-- [ ] **Step 1b (amendment): the `_files` half of the same guarantees**, in
-  `gtest_cas_ns_removal_lifecycle.cpp`:
-  `StaleCleanupResumeSparesRebornNamespaceFiles` — the directive's "stale cleanup resuming after a
-  new incarnation exists" test, `_files` edition: plant `_files` objects under inc₁ AND inc₂,
-  deposit the cleanup item for inc₁, resume the pass, assert inc₂'s files are byte-identical and
-  inc₁'s are gone (this is the data-loss test — a re-derivation from the current catalog entry
-  would delete inc₂'s live files);
-  `NamespaceRemovalDoesNotListOrDeleteFiles` — removal's mandatory path issues NO `_files` LIST and
-  NO `_files` delete (assert via the backend op journal), and the entry delete lands with `_files`
-  objects still present;
-  `JanitorRetainsFilesObjectWhoseTokenChanged` — token mismatch at the delete → retained + surfaced;
-  `RemovalDriverResumesEntryDeleteAfterCkptGone` — the window bullet above: kill after the `_ckpt`
-  delete, remount the owning writer, the entry is removed and no `_ckpt` is re-created.
-- [ ] **Step 2:** → FAIL. **Step 3:** Implement. **Step 4:** CA gate + lanes green.
-- [ ] **Step 5: Commit** `ca: ref — removal lifecycle: fenced terminal, immediate entry delete, deposited-incarnation cleanup`.
+#### Order the steps this way, and why {#step-order}
 
-**A FORWARD HOLE THIS TASK ARMS — `rt->life` is never invalidated (placed 2026-07-31).** `RefTableRuntime::life`
-is resolved once and never reset — no `life.reset()` exists anywhere — while `ref_tables` has an LRU eviction
-path and a remount clear. Today that is harmless, because `dropNamespace` leaves the catalog entry and a
-same-name rebirth therefore reuses the same incarnation.
+Steps 1 and 8's rewiring half come first deliberately: both change **what the rest of the task observes**
+— catalog writes and the reader-absence predicate — so every later test runs against final semantics
+instead of being written twice.
 
-**This task is what arms it.** Once the entry is deleted and a rebirth mints a fresh incarnation, a server whose
-runtime stayed warm across the drop keeps the **dead** life and will read *and write* namespace files at it —
-which is precisely the hole Task 4b closed, reopened. And it reopens **nondeterministically**, depending on
-whether the LRU happened to evict that runtime.
+- [ ] **Step 1 — reads and removals stop minting, at the OPERATION level.** Task 4b closed this for the
+  namespace-file resolver only. Three ref-layer entry points still recover-and-mint and are reached by a
+  removal and a read of a never-opened table: `CasRefLedger::dropNamespace` (minting **before** its own
+  "a never-touched namespace's drop is a harmless no-op" guard, so the guard can never see the case it
+  was written for), `CasRefLedger::listRefs`, and `CasRefLedger::resolveRef` via
+  `CachedPartFolderAccess::dropRefIfPresent` (the DROP DETACHED arm).
+  **Red first, exact:** add `storage->createTransaction()->removeRecursive(kTablePath, {})` to
+  `RemovalOnANeverOpenedTableLeavesTheCatalogUntouched` — it fails today on
+  `EXPECT_FALSE(exists(catalog_object))`, because the existing pin covers the `_files` subdir arm only.
+  Fix by making recovery non-minting on these paths, **not** by moving the no-op guard earlier: an
+  earlier guard answers the drop and leaves the read paths minting.
+  **Test pins:** a read or removal of a never-opened table leaves the catalog byte-identical.
 
-- [ ] **Invalidate the cached life when the namespace's catalog entry is removed**, and pin it with a warm
-  runtime: drop and rebirth without an eviction in between, then assert the writer uses the NEW life. A test
-  that evicts first passes for the wrong reason — eviction is the case that already works.
+- [ ] **Step 2 — the removal sequence.** `Live → Removing` CAS → terminal record appended ONLY by the
+  owning mounted writer or a successor that has claimed and fenced that server root → fold → one bounded,
+  suppression-aware cleanup pass → cleanup item retirement **and** the shard-0 cursor pruned, in a durable
+  seal → `_ckpt` deleted by exact token → catalog entry deleted.
+  **Test pins:** the ORDER, asserted from the backend operation journal rather than from end state; a kill
+  between any two steps resumes idempotently; no step ever re-creates `_ckpt`. GC never appends the
+  terminal record — it only surfaces its absence (step 9).
 
-**A LEAK INTERVAL OPENED BY TASK 4b (placed 2026-07-31 — it is an implication of a deleted branch, which is
-why it is written down instead of left to be re-derived).** Once the emptiness predicate stopped probing
-`_files`, a removed namespace whose only debris is namespace files is promoted `Pending → Completed` by the
-**very first fold** — and the physical pass runs only for `Pending` items. So that pass never runs for such a
-namespace in any round, and **a dropped namespace with no manifest bodies has its namespace files reclaimed by
-nothing** until this task's janitor exists.
+- [ ] **Step 3 — recreate-during-removal is a typed retryable refusal.** `createNamespace` today throws
+  `LOGICAL_ERROR` on any existing entry, which is wrong for the one case that is now ordinary. The refusal
+  must name what it is waiting for, and it must be retryable — the spec forbids reporting it as an
+  internal error.
+  **Decide here and record the decision:** the wait spans a terminal fold, a cleanup pass, a retirement
+  observation in a LATER round, and the entry delete — **several GC rounds**. Under a UUID-derived name
+  that is an edge case; under a UUID-less table path a `DROP` + `CREATE` of the same table hits it every
+  time. Either drive an eager targeted fold of the `Removing` namespace's tail from the DROP path, or
+  accept the latency and say so in the message. Do not leave it implied.
+  **Test pins:** `CREATE` of a name under removal gets the typed retryable error, never `LOGICAL_ERROR`;
+  after the entry is gone the same `CREATE` succeeds with a fresh incarnation.
 
-It is safe in the sense the directive requires: after the re-key, a LIST omission or a non-reclamation can cost
-only storage, never visibility, rebirth or deletion safety, because a dead life's keys are unreachable. But it
-is a real leak interval with no current owner.
+- [ ] **Step 4 — a rebirth folds from its own beginning.** Keep the same-epoch rebirth regression test, but
+  it now pins the ordering rather than a key format.
+  **Test pins:** a fresh incarnation reusing low sequence numbers within one writer epoch folds from
+  `{0, 0}` — i.e. the cursor was pruned before the entry was deleted, whatever the key format. Add an
+  end-to-end same-name rebirth through a UUID-less or shadow-shaped name: `Atomic`-based suites never
+  exercise it, because a recreated table mints a fresh UUID.
 
-- [ ] **The janitor must reclaim a removed namespace's `_files` even when it holds no manifest bodies** — i.e.
-  it cannot rely on the item still being `Pending`, because nothing will hold it there. Pin it with a removed
-  namespace whose ONLY residue is files: today's completion gate promotes it immediately, so a test that waits
-  for `Pending` would wait forever and a test that only checks `Completed` would pass while reclaiming nothing.
+- [ ] **Step 5 — invalidate the cached life when the entry is removed.** `RefTableRuntime::life` has **two**
+  writers, not one: recovery, and the read-path resolution added by Task 4b. Invalidate against both.
+  **Test pins:** drop and rebirth **without** an LRU eviction in between — the warm-runtime case. A test
+  that evicts first passes for the wrong reason.
 
-**TWO MORE OBLIGATIONS, from the increment review's Critical A (placed 2026-07-30).** Task 4-C established
-that same-epoch rebirth is not merely unlikely but **impossible today**: `CasRefCatalog` has no
-entry-deletion primitive at all, and `createNamespace`'s own doc assigns recreating an existing name to this
-task. So A's precondition arrives WITH this task, and its two halves land here rather than being written
-against a state that cannot yet be constructed.
+- [ ] **Step 6 — the janitor.** Foreign-incarnation debris under a known namespace, discovered by one LIST
+  at `namespaceAllLivesPrefix`, deleted by exact token under the destructive-suppression rules; a token
+  mismatch retains and surfaces rather than deleting. An unparseable key is anomaly-and-continue, never a
+  throw.
+  **Test pins:** the exact-token delete and the mismatch-retains path; **and** a removed namespace whose
+  ONLY residue is `_files`, which promotes its item to `Completed` on the first fold — so the janitor
+  cannot key off a `Pending` item. That sub-case is the whole leak interval Task 4b opened.
 
-- [ ] **Make the persisted fold cursor incarnation-scoped.** `cursorKey`/`parseCursorKey`
-  (`Gc/CasGcShardPlan.h`) key progress by namespace and shard only, and `CasFoldSeal::per_ns_shard`
-  documents the identity as `"ns/shard"`, while Stage B made catalog entries and ref keys life-scoped. The
-  moment this task can delete an entry, a recreated namespace inherits its predecessor's cursor and the fold
-  starts past its own logs, **permanently omitting the new life's first N owner edges** — whose live blobs are
-  then condemnable once destruction is enabled. Note what does NOT repair it: filtering discovered ref
-  objects by the current life is too late, because the skipped sequence boundary is inherited before those
-  objects are read.
-- [ ] **Add the same-epoch rebirth regression test** — a new incarnation reusing low sequence numbers within
-  one writer epoch, asserting it folds from its own beginning. This is the test the increment review asked
-  for and that could not be written before this task, because nothing could remove a namespace.
+- [ ] **Step 7 — re-derive the anomaly discrimination from the new ordering.** Do not port the old
+  two-evidence rule: half its evidence (`_cleanup`) is being deleted, and under the new ordering an
+  ordinary removal produces no un-cataloged transient at all, because the cursor is pruned and the item
+  retired before the entry goes. Entry-less ref-layer debris is old-incarnation-shaped — the janitor's,
+  not the anomaly's.
+  **Before designing it, enumerate every carrier that can re-add a namespace to `walk_targets`**; the
+  claim "an ordinary removal raises no anomaly" rests on that enumeration and only the `parent_cursors`
+  path has been checked.
+  **Test pins both directions:** an ordinary removal through the full sequence raises NO un-cataloged
+  anomaly in any round; a fabricated entry-less, current-shaped key with no terminal record raises one.
+  Also: an entry-less cleanup row is now an anomaly, not a budget case.
 
-**OBLIGATION CARRIED FROM TASK 4-C (placed 2026-07-30, and it gates Task 7b).** 4-C closed R11b by making
-an un-cataloged namespace an ANOMALY. That was my ruling and it is right — but the discrimination I also
-ruled for could not be built there, so as shipped **the anomaly fires on ordinary removal too**, because
-this task's own design deletes the catalog entry LAST and leaves a window where ref objects exist with no
-entry.
+- [ ] **Step 8 — delete the `_cleanup` marker class.** It is a Stage-A physical-empty vestige that the
+  incarnation makes unnecessary, and deleting it is this task's concrete "fewer markers" deliverable.
+  It has consumers, not just a key: `Pool::namespaceIsRemoved` gates its recreate-flip on the marker, and
+  `dropNamespace` publishes the constant-size `Removed` snapshot. **Rewire the reader-absence predicate
+  onto catalog state FIRST** — `Removing`, then entry-absent — then remove the marker and its publication.
+  **Test pins:** a dropped table's files read absent both during `Removing` and after entry deletion, with
+  no `_cleanup` object ever written, asserted from the operation journal. Amend the spec in the same
+  change: INV-3 still says verbatim files keep the `_cleanup` gate, and that sentence licenses a future
+  reader to re-wire it.
 
-Today that costs nothing, since destruction is suppressed anyway and `CasRefCatalog` has no entry-deletion
-API at all yet. **At Task 7b the cost is worse than "one anomaly per removal", which is what I originally
-authorised — corrected 2026-07-30 after the checkpoint measured it.** Nothing prunes a shard-0 cursor from
-the seal, and the `parent_cursors` loop re-adds every cursor-carrying namespace each round. So once an entry
-is gone: the anomaly recurs EVERY round and `suppress_destructive = !report.anomalies.empty() || …`
-suppresses the whole round, i.e. **reclamation stops pool-wide and stays stopped**; the cleanup item can
-never retire, because retirement needs `ref_tables.find(item.ns)` and the R10 filter dropped all its keys;
-the `_cleanup` marker is therefore never published, so **the name becomes permanently unrecreatable** and its
-physical prefixes are never reclaimed. Only `SYSTEM CONTENT ADDRESSED GC REBUILD` clears it.
+- [ ] **Step 9 — surface a stuck removal.** A terminal-less `Removing` observed for N rounds increments a
+  durable counter and logs; GC appends nothing. This is the only observability for a wedged removal.
+  **Test pins:** the counter and the log fire; no terminal record appears.
 
-Also false and worth deleting while you are here: the comment claiming `per_ns_shard` "is written ONLY for
-namespaces in THIS round's listing … so a fully-deleted namespace leaves no cursor behind and a later
-recreation folds from `{0, 0}`". `walk_targets` includes every shard-0 parent cursor regardless of the
-listing, so the cursor never drops.
+- [ ] **Step 10 — hygiene riders, no tests.** Delete the false `per_ns_shard` comment claiming cursors are
+  written only for namespaces in this round's listing; delete the accepted-cost comment describing a
+  removal path that did not exist when it was written; keep the note that the admission bound does **not**
+  free at `Live → Removing`, so nobody writes a test against the retracted claim.
 
-- [ ] **Make the un-cataloged-namespace anomaly discriminate, using the removal evidence this task
-  introduces.** Un-cataloged **with** evidence of a removal in progress (the terminal record / `_cleanup`
-  marker) is EXPECTED and may be dropped quietly; un-cataloged **without** it is damage and stays an
-  anomaly. Pin both directions: an ordinary removal must NOT raise it, and a fabricated missing entry with
-  no removal evidence must. Without the negative half, the fix is one refactor away from silently going back
-  to "never fires".
-- [ ] **Prune the cursor, and order the removal so the stall cannot happen at all:** delete the catalog entry
-  only after the `_cleanup` marker and the item's retirement are durable, and drop the namespace's shard-0
-  cursor from the seal when it goes. Discrimination alone is not enough — without pruning, a namespace that
-  legitimately finished removal still carries a cursor that re-adds it to `walk_targets` forever.
-- [ ] **Then remove the accepted-cost comment 4-C left at that site**, so no reader is told a cost is being
-  accepted after it stopped being accepted.
+#### Ownership of the `Removing`-without-`_ckpt` window {#removing-window}
 
-**Two rulings from the Task 2 review, settled here so Task 5 does not re-derive them.**
+The removal driver resumes entry deletion on the owning writer's next mount, idempotently, and never
+re-creates `_ckpt`. The dead-root branch belongs to Task 7, not here. **Task 5b's refuse-to-ground is only
+safe because this window has an owner** — dropping it orphans 5b.
 
-- [ ] **CORRECTION — the admission bound does not free at `Live → Removing`.** The sentence above
-  originally said it frees immediately. As implemented, `checkFoldSealReservation` counts the
-  candidate's entries, so the bound frees only when the ENTRY IS DELETED — which this task does LAST.
-  Counting `Removing` entries is the SAFE choice, because a `Removing` namespace still occupies `cov`
-  and `nsc` rows, so the predicate is right and the sentence was wrong. **Do not write a test against
-  "frees immediately"** — it will fail, and it would be testing the retracted claim.
-- [ ] **DECIDE: what index set predicate (2)'s reservation is charged over.** Task 2's formula is the
-  brief's and Task 2 is conformant, but the review established that Σ over catalog entries does not
-  cover the fold seal's actual rows: `ns_cleanup_items` is keyed `{ns, remove_txn_id}` and retires
-  only once a later round observes its completion artifacts — with retirement skipped entirely on a
-  ref-folding abort — so a namespace removed, recreated and removed again carries TWO `nsc` rows; and
-  because this task deletes the entry last, an `nsc` row is routinely carried for a namespace with no
-  catalog entry at all, i.e. outside the sum's index set. `btr` (per run segment) and `cnd` (per
-  gc-shard) rows are charged neither in `fixed` (measured on a default-constructed seal, where both
-  maps are empty) nor per entry.
-  **The asymmetry that decides it:** over-charging costs admitted namespaces; under-charging wedges
-  the fold round, because `checkFoldSealObjectBytes` then refuses the seal on EVERY attempt. So
-  choose the over-covering formula, and pin it with a test that builds the worst case this task's own
-  lifecycle can actually produce — a namespace with two `nsc` rows and no entry. This is the task
-  where that worst case becomes constructible, which is why the decision sits here rather than in
-  Task 2.
-- [ ] **A removal must not birth the namespace it is removing — at the OPERATION level, not just the
-  resolver's.** Task 4b closed this for the namespace-file surface only. Three ref-layer entry points
-  still recover-and-mint, and two of them are reached by a removal and a read of a table that was
-  never opened: `CasRefLedger::dropNamespace` (which mints in `ensureRefTableRecovered` **before** its
-  own "a never-touched namespace's drop is a harmless no-op" guard — so the guard can never see the
-  case it was written for), `CasRefLedger::listRefs`, and `CasRefLedger::resolveRef` via
-  `CachedPartFolderAccess::dropRefIfPresent`, which is the DROP DETACHED arm. Pre-existing, and
-  practically small because a CREATE normally births the namespace legitimately first — but this task
-  is where a removal's catalog effects become load-bearing, so it is where the residual is paid.
-  **Red-first detector, exact and already checked:** add
-  `storage->createTransaction()->removeRecursive(kTablePath, {})` to
-  `RemovalOnANeverOpenedTableLeavesTheCatalogUntouched` and it fails today on
-  `EXPECT_FALSE(exists(catalog_object))` — the existing pin covers the `_files` subdir arm, not the
-  table-dir arm. Fix by making recovery non-minting on these paths, not by moving the no-op guard
-  earlier: an earlier guard would answer the drop correctly and still leave the read paths minting.
+#### Two derivations that need adversarial treatment inside this task {#open-derivations}
+
+Both are cheap to resolve here and neither blocks starting.
+
+- [ ] **The unconstructibility claims rest on prose, not a model.** Under entry-delete-last, an unretired
+  cleanup item implies its entry still exists, so a resumed pass re-deriving from the catalog would get the
+  same old incarnation — which is what makes the reborn-life race and the "two cleanup rows, no entry"
+  worst case unconstructible. The old worst case was found by a review round, not by design, so its
+  replacement deserves the same adversarial treatment: extend `CaRefNsCleanupStaleLeaderCore` with the new
+  ordering rather than trusting the argument. **Until that model exists, keep capture-at-deposition** — it
+  is cheap and already proven, and it is the belt for the case the derivation missed.
+- [ ] **Enumerate the `walk_targets` carriers** (step 7). The same discipline: a claim of the form "this can
+  no longer happen" needs the enumeration that makes it checkable.
+
+#### What died with the old task, and why — do not re-add {#died}
+
+- **Incarnation-scoped fold cursors.** Unnecessary once the ordering is pinned: a rebirth cannot inherit a
+  cursor pruned before its predecessor's entry disappeared. Re-keying `cursorKey`, `parseCursorKey`, the
+  seal's per-namespace map and every consumer is exactly the pervasive identity change this phase is trying
+  to stop, duplicated for a second object family.
+- **The stale-resume-versus-reborn-life test family.** Collapses to one test asserting the ordering makes
+  the race unconstructible.
+- **The Σ-index-set decision and its worst-case test.** Both of its cases — two cleanup rows for one
+  namespace, and a cleanup row with no catalog entry — require a rebirth before the first removal retired,
+  which the ordering forbids. The spec's over-covering reservation supersedes the exact decision.
+- **Refusing a birth over surviving objects as a permanent rule.** Rejected in the spec's alternatives
+  table: it needs somewhere to remember every retired name, which is unbounded for opaque names, and it
+  breaks supported reuse.
 
 ### Task 5b: `chooseRecoveryGrounding` — recovery becomes LIST-independent {#task-5b}
 
