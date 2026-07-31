@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       since_days:
-        description: 'How many days back to scan upstream master (default: 7)'
+        description: 'How many days back to scan upstream (default: 7)'
         required: false
         type: string
         default: '7'
@@ -12,7 +12,7 @@ on:
         description: 'Commit subject pattern to match (case-insensitive)'
         required: false
         type: string
-        default: 'fix flaky test'
+        default: 'fix flaky'
       upstream_ref:
         description: 'Upstream branch/ref to scan'
         required: false
@@ -25,17 +25,38 @@ on:
         default: false
 
   schedule:
-    - cron: '0 12 * * 1'  # Every Monday at 08:00 EDT (12:00 UTC)
+    - cron: '0 10 * * 1'  # Every Monday at 06:00 EDT (10:00 UTC)
+
 
 jobs:
-  check:
+  setup:
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker]
+    outputs:
+      branches: ${{ steps.set_branches.outputs.branches }}
+    steps:
+      - id: set_branches
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "branches=[\"${{ github.ref_name }}\"]" >> $GITHUB_OUTPUT
+          else
+            echo "branches=[\"antalya-26.3\", \"stable-26.3\", \"antalya-26.6\"]" >> $GITHUB_OUTPUT
+          fi
+
+  check:
+    needs: setup
+    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker]
+    strategy:
+      matrix:
+        branch: ${{ fromJSON(needs.setup.outputs.branches) }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           filter: blob:none
+
+      - name: Checkout target branch
+        run: git checkout ${{ matrix.branch }}
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -47,27 +68,30 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python3 tests/ci/check_for_flaky_fixes.py \
-            --since-days "${{ inputs.since_days || '7' }}" \
-            --pattern "${{ inputs.pattern || 'fix flaky test' }}" \
-            --upstream-ref "${{ inputs.upstream_ref || 'master' }}" \
-            --md-output flaky_fix_report.md \
-            --json-output flaky_fix.json
+            --since-days "${{ github.event.inputs.since_days || '7' }}" \
+            --pattern "${{ github.event.inputs.pattern || 'fix flaky' }}" \
+            --upstream-ref "${{ github.event.inputs.upstream_ref || 'master' }}" \
+            --md-output flaky_fix_report_${{ matrix.branch }}.md \
+            --json-output flaky_fix_${{ matrix.branch }}.json
 
       - name: Write summary
         if: always()
-        run: cat flaky_fix_report.md >> "$GITHUB_STEP_SUMMARY"
+        run: cat flaky_fix_report_${{ matrix.branch }}.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload check results
         uses: actions/upload-artifact@v4
         with:
-          name: flaky-fix-check
+          name: flaky-fix-check-${{ matrix.branch }}
           path: |
-            flaky_fix_report.md
-            flaky_fix.json
+            flaky_fix_report_${{ matrix.branch }}.md
+            flaky_fix_${{ matrix.branch }}.json
 
   backport:
-    needs: check
-    if: ${{ github.event_name == 'schedule' || inputs.create_pr == true }}
+    needs: [check, setup]
+    if: ${{ github.event_name == 'schedule' || github.event.inputs.create_pr == true }}
+    strategy:
+      matrix:
+        branch: ${{ fromJSON(needs.setup.outputs.branches) }}
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker]
     steps:
       - name: Check out repository
@@ -75,6 +99,9 @@ jobs:
         with:
           fetch-depth: 1
           filter: blob:none
+
+      - name: Checkout target branch
+        run: git checkout ${{ matrix.branch }}
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -84,7 +111,7 @@ jobs:
       - name: Download check results
         uses: actions/download-artifact@v4
         with:
-          name: flaky-fix-check
+          name: flaky-fix-check-${{ matrix.branch }}
 
       - name: Configure git identity
         run: |
@@ -102,5 +129,5 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python3 tests/ci/backport_flaky_fixes.py \
-            --json-file flaky_fix.json \
+            --json-file flaky_fix_${{ matrix.branch }}.json \
             --repo "${{ github.repository }}"
