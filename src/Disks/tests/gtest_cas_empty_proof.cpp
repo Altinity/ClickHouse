@@ -23,6 +23,7 @@
 
 namespace DB::ErrorCodes
 {
+extern const int CORRUPTED_DATA;
 extern const int INVALID_STATE;
 extern const int NETWORK_ERROR;
 }
@@ -137,9 +138,10 @@ ReadOnlyMount openReadOnlyOverBootstrappedBacking()
 
 }
 
-/// (a) THE RO-ATTACH silent-empty killer: a read-only pool whose backing was erased (delete `_pool_meta`
-/// + everything) must THROW the typed 668 on a table-root enumeration, never answer empty. This is RED
-/// before the rule exists (the enumeration would answer an empty listing).
+/// (a) THE RO-ATTACH silent-empty killer: a read-only pool whose whole backing was erased must throw,
+/// never answer empty. Both mandatory authorities disappear; table enumeration observes the missing
+/// `cas/ref_catalog` first, so `CORRUPTED_DATA` takes precedence over the later `_pool_meta` empty-proof
+/// check. The pool-meta-only companion below keeps the typed 668 contract pinned separately.
 TEST(CasEmptyProof, ReadOnlyOverErasedBackingThrowsInsteadOfEmpty)
 {
     auto mount = openReadOnlyOverBootstrappedBacking();
@@ -153,10 +155,10 @@ TEST(CasEmptyProof, ReadOnlyOverErasedBackingThrowsInsteadOfEmpty)
     /// Erase the backing out from under the (still Live) read-only mount: `_pool_meta` and everything.
     std::filesystem::remove_all(mount.root);
 
-    /// Now the SAME empty listing must refuse: both enumeration entry points throw the typed 668.
-    Cas::tests::expectThrowsCode(ErrorCodes::INVALID_STATE, [&] { mount.ro->listDirectory(kEmptyTableDir); });
-    Cas::tests::expectThrowsCode(ErrorCodes::INVALID_STATE, [&] { mount.ro->iterateDirectory(kEmptyTableDir); });
-    Cas::tests::expectThrowsCode(ErrorCodes::INVALID_STATE, [&] { mount.ro->isDirectoryEmpty(kEmptyTableDir); });
+    /// Now the SAME empty listing must refuse on the first missing mandatory control it observes.
+    Cas::tests::expectThrowsCode(ErrorCodes::CORRUPTED_DATA, [&] { mount.ro->listDirectory(kEmptyTableDir); });
+    Cas::tests::expectThrowsCode(ErrorCodes::CORRUPTED_DATA, [&] { mount.ro->iterateDirectory(kEmptyTableDir); });
+    Cas::tests::expectThrowsCode(ErrorCodes::CORRUPTED_DATA, [&] { mount.ro->isDirectoryEmpty(kEmptyTableDir); });
 }
 
 /// (a2, acceptance matrix — T9 review's KeyAbsent-specific real-backend follow-up) Test (a) erases the

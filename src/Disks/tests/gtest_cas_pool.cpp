@@ -766,6 +766,7 @@ TEST(CasPool, ManifestDecodeCacheIsByteBounded)
 {
     auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
     const DB::Cas::Layout layout("p");
+    DB::Cas::tests::seedPoolMetaForRestart(*backend);
     const DB::Cas::RootNamespace ns{"srv/t1"};
 
     /// 8 manifests x ~1 MiB of inline bytes; a 2 MiB decode-cache bound must hold while every
@@ -794,8 +795,6 @@ TEST(CasPool, ManifestDecodeCacheIsByteBounded)
 
     DB::Cas::PoolConfig config{.pool_prefix = "p", .server_root_id = "test"};
     config.manifest_decode_cache_bytes = 2ULL << 20;
-    /// Restart over pre-seeded pool content: establish `_pool_meta` first (Task 7 zero-write bootstrap).
-    DB::Cas::tests::seedPoolMetaForRestart(*backend);
     auto store = DB::Cas::Pool::open(backend, std::move(config));
 
     uint64_t total_gets = 0;
@@ -1628,6 +1627,7 @@ TEST(CasMountOpenWaits, UncleanOpenPaysOnlyTheObservationWindow)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout l{"p"};
+    DB::Cas::tests::seedPoolMetaForRestart(*b);
     /// Predecessor: claim epoch 7, no farewell (simulate crash: just drop the keeper) -- a bare
     /// `claimMount` plants the lease directly, with no clean-farewell `min_active` marker and no
     /// `gc_fenced`, so the successor below has no certificate of death until it observes one itself.
@@ -1646,8 +1646,6 @@ TEST(CasMountOpenWaits, UncleanOpenPaysOnlyTheObservationWindow)
 
     uint64_t fake_boot = 0;
     std::vector<uint64_t> waits;
-    /// Restart over a pre-planted mount lease: establish `_pool_meta` first (Task 7 zero-write bootstrap).
-    DB::Cas::tests::seedPoolMetaForRestart(*b);
     PoolPtr store;
     ASSERT_NO_THROW(
         store = Pool::open(b, PoolConfig{
@@ -1700,6 +1698,7 @@ TEST(CasMountOpenWaits, FencedPriorReclaimsWithoutAnyWait)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout l{"p"};
+    DB::Cas::tests::seedPoolMetaForRestart(*b);
     ASSERT_EQ(claimMount(*b, l, "test", UInt128(1), /*epoch*/ 7, /*now_ms*/ 1000, /*ttl_ms*/ 500).kind,
               MountClaimResult::Claimed);
     /// A real predecessor at epoch 7 durably minted it first (`allocateWriterEpoch` always runs
@@ -1714,8 +1713,6 @@ TEST(CasMountOpenWaits, FencedPriorReclaimsWithoutAnyWait)
     const CasRequestBudget tiny_budget{
         .attempt_timeout_ms = 50, .operation_deadline_ms = 500, .max_attempts = 1, .lease_safety_margin_ms = 50};
 
-    /// Restart over a pre-planted mount lease: establish `_pool_meta` first (Task 7 zero-write bootstrap).
-    DB::Cas::tests::seedPoolMetaForRestart(*b);
     std::vector<uint64_t> waits;
     PoolPtr store;
     ASSERT_NO_THROW(
@@ -1775,6 +1772,7 @@ TEST(CasPool, StartupArmRedoesLeaseWriteWhenTheClaimConsumesTtl)
 {
     auto backend = std::make_shared<StalledMountClaimBackend>();
     DB::Cas::Layout layout("pool");
+    DB::Cas::tests::seedPoolMetaForRestart(*backend, "pool");
     const String srid = "s";
     const DB::UInt128 uuid(0x42);
     backend->mount_key = layout.mountKey(srid);
@@ -1799,11 +1797,6 @@ TEST(CasPool, StartupArmRedoesLeaseWriteWhenTheClaimConsumesTtl)
     /// before the mount claim); seed that durable epoch object here too, or `Pool::open`'s own
     /// `allocateWriterEpoch` trips the Phase C guard (epoch absent, mount present -> fail closed).
     backend->putIfAbsent(layout.epochKey(srid), DB::Cas::encodeServerEpoch(DB::Cas::ServerEpoch{.next_writer_epoch = 8}));
-    /// The mount-lease seed above makes the pool prefix non-empty before `Pool::open` runs its own
-    /// bootstrap check; establish `_pool_meta` first (Task 7 zero-write bootstrap), exactly as the
-    /// other pre-seeded-mount tests in this file do (e.g. `FencedPriorReclaimsWithoutAnyWait`).
-    DB::Cas::tests::seedPoolMetaForRestart(*backend, "pool");
-
     uint64_t fake_boot_ms = 10'000;
     DB::Cas::PoolConfig cfg;
     cfg.pool_prefix = "pool";
@@ -2002,6 +1995,7 @@ TEST(CasPool, ReadManifestSharedReturnsSharedDecodeWithoutCopy)
 {
     auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
     const DB::Cas::Layout layout("p");
+    DB::Cas::tests::seedPoolMetaForRestart(*backend);
     const DB::Cas::RootNamespace ns{"srv/t1"};
     const DB::Cas::ManifestRef ref{.writer_epoch = 1, .build_sequence = 1, .manifest_ordinal = 1};
     const auto id = DB::Cas::tests::writeManifestRaw(*backend, layout, ns, ref,
@@ -2010,8 +2004,6 @@ TEST(CasPool, ReadManifestSharedReturnsSharedDecodeWithoutCopy)
         {DB::Cas::tests::namespaceBirthOp(), DB::Cas::tests::publishCommittedOps("part_1", ref)[0],
          DB::Cas::tests::publishCommittedOps("part_1", ref)[1]}, std::nullopt});
 
-    /// Restart over pre-seeded pool content: establish `_pool_meta` first (Task 7 zero-write bootstrap).
-    DB::Cas::tests::seedPoolMetaForRestart(*backend);
     auto store = DB::Cas::Pool::open(backend,
         DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     const auto resolved = store->resolveRef(ns, "part_1");

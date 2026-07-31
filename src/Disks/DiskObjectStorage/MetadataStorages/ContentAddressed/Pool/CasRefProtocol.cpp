@@ -934,11 +934,10 @@ RecoveredRefTable recoverRefTableDetailed(Backend & backend, const Layout & layo
     /// the SHARED non-production discovery-path recovery -- fsck, `Gc::rebuildBaseline`'s
     /// disaster-recovery scan, and `CasOrphanManifestSweep`'s active-manifest-key set all ride it -- and
     /// every one of them must see what the mounted writer actually wrote, which since Task 4-C's
-    /// production birth wiring is a real, catalog-minted incarnation, never the Stage-A sentinel. Falls
-    /// back to the sentinel when the catalog carries no entry for `ns` at all, which is what preserves
-    /// every raw-fixture test that seeds ref-log content directly without ever touching the catalog
-    /// (Task 4-B's ten helpers, admitted at the sentinel by `cas_test_helpers.h`'s `casAdmitEntry`) --
-    /// so this fallback is not a guess, it is the SAME namespace's only other possible identity.
+    /// production birth wiring is a real, catalog-minted incarnation, never the Stage-A sentinel. The
+    /// mandatory catalog may legitimately carry no ENTRY for a namespace that was never born; the
+    /// sentinel is that namespace's read-only, never-born identity, not a substitute for an absent
+    /// catalog. Raw recovery fixtures that need visible content explicitly admit this sentinel life.
     /// `Creating` is excluded exactly as `Gc::discoverUniverse` excludes it: no publication can exist
     /// yet under that entry, so a life-less fallback is the correct answer for it too.
     const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(backend, layout, ns);

@@ -90,6 +90,11 @@ ManifestRef manifestRef(uint64_t epoch, uint64_t build_sequence, uint32_t ordina
 class HidingListBackend : public CountingBackend
 {
 public:
+    HidingListBackend()
+    {
+        DB::Cas::tests::seedPoolMetaForRestart(*this);
+    }
+
     using CountingBackend::get;
     using CountingBackend::list;
     using CountingBackend::putIfAbsent;

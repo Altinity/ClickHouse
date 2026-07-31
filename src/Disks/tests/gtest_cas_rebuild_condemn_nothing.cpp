@@ -49,6 +49,47 @@ const UInt128 kGc = hexToU128("00000000000000000000000000000001");
 const RootNamespace kNsA{"00/aa@cas@"};
 const RootNamespace kNsB{"00/zz@cas@"};
 
+/// Makes a second REBUILD catalog GET observe a different authority set. The command must take one
+/// immutable cut at entry, so a correct implementation never triggers the mutation.
+class CatalogChangesOnSecondReadBackend : public CountingBackend
+{
+public:
+    using Backend::get;
+
+    void armCatalogMutation(const String & key)
+    {
+        catalog_key = key;
+        catalog_reads = 0;
+        armed = true;
+    }
+
+    size_t catalogReads() const { return catalog_reads; }
+
+    std::optional<GetResult> get(const String & key, Range range) override
+    {
+        auto got = CountingBackend::get(key, range);
+        if (!armed || key != catalog_key)
+            return got;
+
+        ++catalog_reads;
+        if (catalog_reads != 2)
+            return got;
+        if (!got)
+            throw std::runtime_error("catalog mutation fixture: second catalog read found absence");
+
+        const PutResult put = InMemoryBackend::putOverwrite(
+            key, encodeRefCatalog(RefCatalog{}), got->token, {});
+        if (put.outcome != PutOutcome::Done)
+            throw std::runtime_error("catalog mutation fixture: catalog rewrite conflicted");
+        return InMemoryBackend::get(key, range);
+    }
+
+private:
+    String catalog_key;
+    size_t catalog_reads = 0;
+    bool armed = false;
+};
+
 BlobRef blobRefOf(const DB::UInt128 & hash)
 {
     return BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hash)};
@@ -308,6 +349,36 @@ TEST(CasRebuildCondemnNothing, NestedLifelessKeyUnderTheLifePrefixDoesNotAbortTh
     /// rather than refuse.
     ASSERT_TRUE(rep.performed) << rep.refusal;
     EXPECT_EQ(rep.committed_refs, 1u) << "the live namespace must still be folded";
+}
+
+TEST(CasRebuildCondemnNothing, OneCatalogCutDrivesHealthCheckAndRebuild)
+{
+    auto backend = std::make_shared<CatalogChangesOnSecondReadBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+
+    publishAt(*backend, layout, kNsA, RefTxnId{1, 1}, "ref_a", /*build_sequence=*/1,
+              DB::UInt128(1), /*birth=*/true);
+
+    /// A decoded generation-0 state exercises the health check's namespace walk before the rebuild
+    /// universe is consumed. The backend would erase the authority set on a second catalog GET.
+    Gc gc(store, kGc);
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+    {
+        const auto got = backend->get(layout.gcStateKey());
+        ASSERT_TRUE(got);
+        GcState state = decodeGcState(got->bytes);
+        state.snap_generation = 0;
+        ASSERT_EQ(backend->putOverwrite(
+            layout.gcStateKey(), encodeGcState(state), got->token).outcome, PutOutcome::Done);
+    }
+
+    backend->armCatalogMutation(layout.refCatalogKey());
+    const RebuildReport rep = gc.rebuildBaseline(/*force=*/true);
+    EXPECT_EQ(backend->catalogReads(), 1u)
+        << "REBUILD must use its entry cut for both the generation-0 health check and the rebuild";
+    ASSERT_TRUE(rep.performed) << rep.refusal;
+    EXPECT_EQ(rep.committed_refs, 1u);
 }
 
 /// Removing the condemnation must not disturb the other thing a rebuild owes: every hold in the prior

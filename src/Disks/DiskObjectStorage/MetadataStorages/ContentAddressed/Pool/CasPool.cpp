@@ -374,6 +374,7 @@ PoolPtr Pool::open(BackendPtr backend, PoolConfig config)
     /// FAIL-CLOSED: the capability probe throws NOT_IMPLEMENTED on any failed check, and
     /// PoolMeta::createOrValidate is pool-authoritative — the config constants apply only at creation.
     Layout layout(config.pool_prefix);
+    bool initialize_empty_catalog = false;
     /// The probe writes and deletes throwaway keys to verify conditional-op enforcement. A read-only
     /// open must never mutate the pool it inspects; fsck only reads, so skip it. (Pool meta below is
     /// read-only when the pool already exists; a missing pool meta on a read-only backend fails closed.)
@@ -390,8 +391,10 @@ PoolPtr Pool::open(BackendPtr backend, PoolConfig config)
         switch (probePoolBootstrapResidual(*backend, layout))
         {
             case BootstrapResidual::PoolMetaPresent:
+                break;   /// authoritative existing pool; its catalog is mandatory below.
             case BootstrapResidual::EmptyOrProbeOnly:
-                break;   /// authoritative pool present, or a provably empty prefix — safe to proceed.
+                initialize_empty_catalog = true;
+                break;   /// a provably empty prefix; safe to materialize the mandatory catalog.
             case BootstrapResidual::ResidualWithoutMeta:
             {
                 /// RECREATION QUIESCE. Reaching here means the prefix holds objects but no authoritative
@@ -483,6 +486,8 @@ PoolPtr Pool::open(BackendPtr backend, PoolConfig config)
     PoolMeta meta = PoolMeta::createOrValidate(
         *backend, layout, config.blob_header_len, config.blob_hash_algo, config.blob_hash_allow_new,
         /*allow_mint=*/!config.read_only);
+    if (initialize_empty_catalog)
+        CasRefCatalog::initializeEmptyForNewPool(*backend, layout);
     const BlobHashAlgo write_algo = config.blob_hash_algo;   /// `config` is moved-from just below
 
     /// Private ctor: make_shared cannot reach it.
@@ -534,6 +539,10 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
         snapshot.life_index.throwIfAmbiguous("CAS server-root mount safety");
         return snapshot.catalog;
     };
+    /// Existing matching owner and epoch objects take fast paths that do not need an emptiness
+    /// observation. Validate the mandatory authority object unconditionally before either fast path
+    /// can reach a slot mutation; the callback remains available for fresh conflict rechecks below.
+    (void)observe_catalog();
 
     /// 2. Owner anchor — IDENTITY (clock-free). A foreign uuid fails closed; an absent owner over a
     ///    non-empty subtree is CORRUPTED_DATA; a fresh empty root is claimed.
@@ -1071,6 +1080,9 @@ bool Pool::tryRemountOnce()
             snapshot.life_index.throwIfAmbiguous("CAS server-root remount safety");
             return snapshot.catalog;
         };
+        /// The present-owner/present-epoch fast path would otherwise skip the observer entirely.
+        /// Require the catalog before allocating a new epoch or replacing the mount slot.
+        (void)observe_catalog();
         claimOwnerOrThrow(*pool_backend, pool_layout, srid, our_uuid, observe_catalog);
         const uint64_t writer_epoch = allocateWriterEpoch(
             *pool_backend, pool_layout, srid, EpochMintPolicy::NormalMount, 0, observe_catalog);
@@ -1521,9 +1533,19 @@ DropNamespaceStats Pool::dropNamespace(const RootNamespace & ns)
     return ref_ledger.dropNamespace(ns);
 }
 
+DropNamespaceStats Pool::dropNamespace(const NamespaceLifeId & life)
+{
+    return ref_ledger.dropNamespace(life);
+}
+
 bool Pool::namespaceIsRemoved(const RootNamespace & ns)
 {
     return ref_ledger.namespaceIsRemoved(ns);
+}
+
+bool Pool::namespaceIsRemoved(const NamespaceLifeId & life)
+{
+    return ref_ledger.namespaceIsRemoved(life);
 }
 
 NamespaceLifeId Pool::namespaceLife(const RootNamespace & ns)

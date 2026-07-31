@@ -117,7 +117,10 @@ TEST(CasGcShardIncarnation, DuplicateLifeIdStopsDestructiveRoundAndRebuild)
         CatalogEntry{.ns = RootNamespace{"a"}, .state = NsState::Live, .incarnation = UInt128{77}},
         CatalogEntry{.ns = RootNamespace{"b"}, .state = NsState::Removing, .incarnation = UInt128{77}},
     };
-    ASSERT_EQ(backend->putIfAbsent(layout.refCatalogKey(), encodeRefCatalog(catalog)).outcome, PutOutcome::Done);
+    const auto empty_catalog = backend->get(layout.refCatalogKey());
+    ASSERT_TRUE(empty_catalog);
+    ASSERT_EQ(backend->putOverwrite(
+        layout.refCatalogKey(), encodeRefCatalog(catalog), empty_catalog->token).outcome, PutOutcome::Done);
     backend->resetCounts();
 
     Gc gc(store, hexToU128("0000000000000000000000000000000a"));
@@ -163,15 +166,16 @@ TEST(CasGcShardIncarnation, DeadLifeStreamIsOpaqueInertDebris)
 /// discovered through the hot stream LIST, so hiding one from LIST must not affect the round.
 TEST(CasGcShardIncarnation, CurrentLifeCheckpointIsReadByExactKeyOutsideHotList)
 {
-    auto backend = std::make_shared<HintHoleBackend>();
-    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_shards = 1});
+    auto backend = std::make_shared<HintHoleBackendOn<CountingBackend>>();
+    auto store = Pool::open(backend, PoolConfig{
+        .pool_prefix = "p", .server_root_id = "test", .gc_shards = 1,
+        .gc_fold_max_defer_rounds = 0});
     Gc gc(store, hexToU128("0000000000000000000000000000000a"));
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/tblOrdinaryRebirth"};
 
     CasRefCatalog::casAdmitEntry(*backend, layout, CatalogEntry{.ns = ns, .state = NsState::Live,
         .incarnation = UInt128(11), .creator = std::nullopt});
-    appendRefLogSeed(*backend, layout, ns, {});   // one real record, keyed at incarnation 11 (the dead one)
 
     CatalogEntry after_rebirth{.ns = ns, .state = NsState::Live, .incarnation = UInt128(22), .creator = std::nullopt};
     {
@@ -193,8 +197,15 @@ TEST(CasGcShardIncarnation, CurrentLifeCheckpointIsReadByExactKeyOutsideHotList)
         encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{1}, .checkpoint_snapshot_id = std::nullopt,
                               .last_epoch_seal = std::nullopt})).outcome, PutOutcome::Done);
     backend->hide(layout.refCkptKey(current_life));
+    backend->resetCounts();
 
     const RoundReport report = gc.runRegularRound({}, /*allow_steal=*/true, UniversePolicy::AuthoritativeForTest);
+    EXPECT_FALSE(report.deferred) << "the forced catalog-only fold must reach checkpoint intake";
+    EXPECT_GT(backend->getCount(layout.refCkptKey(current_life)), 0u)
+        << "the catalog-derived current life must drive an exact checkpoint GET";
+    EXPECT_GT(backend->listCount(layout.namespaceStreamRootPrefix()), 0u);
+    EXPECT_EQ(backend->listCount(layout.namespaceStateRootPrefix()), 0u)
+        << "checkpoint state must never be discovered by LIST";
     EXPECT_EQ(backend->holesServed(), 0u) << "the hot LIST must stay scoped to the stream tree";
     bool saw_anomaly_for_ns = false;
     for (const RoundAnomaly & a : report.anomalies)

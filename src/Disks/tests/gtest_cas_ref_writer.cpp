@@ -238,6 +238,11 @@ std::optional<RefTxnId> listGreatestSnapshotIdForTest(Backend & backend, const L
 class RefWriterTestBackend : public CountingBackend
 {
 public:
+    RefWriterTestBackend()
+    {
+        DB::Cas::tests::seedPoolMetaForRestart(*this);
+    }
+
     using CountingBackend::get;
     using CountingBackend::getStream;
     using CountingBackend::putIfAbsent;

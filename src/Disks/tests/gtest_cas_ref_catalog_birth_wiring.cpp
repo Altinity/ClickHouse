@@ -99,6 +99,28 @@ TEST(CasRefCatalogBirthWiring, FirstOpenMintsALiveCatalogEntryAndKeysTheBirthAtI
         << "and must NOT be keyed at the sentinel any more";
 }
 
+TEST(CasRefCatalogBirthWiring, CatalogLossAfterMountCannotRecreateAOneRowAuthority)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForBirthTest(backend);
+    const Layout & layout = store->layout();
+
+    publishBirth(store, RootNamespace{"srv1/existing"}, "old");
+    const auto catalog = backend->get(layout.refCatalogKey());
+    ASSERT_TRUE(catalog);
+    ASSERT_EQ(backend->deleteExact(layout.refCatalogKey(), catalog->token).kind,
+              DeleteOutcome::Kind::Deleted);
+    backend->resetCounts();
+
+    EXPECT_THROW(publishBirth(store, RootNamespace{"srv1/new"}, "new"), DB::Exception);
+    EXPECT_FALSE(backend->head(layout.refCatalogKey()).exists)
+        << "runtime loss must not be repaired with a one-row replacement authority";
+    EXPECT_EQ(backend->casPutTotal(), 0u);
+    EXPECT_EQ(backend->putTotal(), 0u)
+        << "the failed birth must not publish a checkpoint or ref-log body";
+    EXPECT_EQ(backend->putOverwriteTotal(), 0u);
+}
+
 /// A namespace whose catalog entry is ALREADY `Live` (e.g. admitted by an earlier mount that this
 /// runtime never cached) must be ADOPTED, never re-minted: `CasRefCatalog::createNamespace` refuses
 /// outright once any entry exists, so `resolveNamespaceLife` has no create branch left to take here --

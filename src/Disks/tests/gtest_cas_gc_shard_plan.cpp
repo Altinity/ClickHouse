@@ -373,6 +373,9 @@ TEST(CasGcShardEquivalence, SingleShardMatchesPhase1dInDegree)
     {
         auto backend = std::make_shared<InMemoryBackend>();
         const Layout layout("p");
+        /// Raw journal fixtures model an already-created pool and therefore establish both mandatory
+        /// controls before writing residual data.
+        seedPoolMetaForRestart(*backend);
 
         /// Write blob bodies so HEAD returns a token (GC retires zero-in-degree blobs only if present).
         writeBlobBody(*backend, layout, hA);
@@ -394,9 +397,7 @@ TEST(CasGcShardEquivalence, SingleShardMatchesPhase1dInDegree)
         /// Drop tbl4 (hC net = 0): rC removed from the live set.
         dropRefTransition(*backend, layout, ns, "tbl4", rC);
 
-        /// Open a store with the given gc_shards. Restart over pre-seeded pool content: establish
-        /// `_pool_meta` first (Task 7 zero-write bootstrap check refuses to mint over residual data).
-        seedPoolMetaForRestart(*backend);
+        /// Open a store with the given `gc_shards` over the pre-seeded restart state.
         auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_shards = gc_shards});
         const UInt128 gc_id = UInt128(0xDEADBEEF42ULL);
         Gc gc(store, gc_id);

@@ -225,6 +225,7 @@ TEST(CasRecoveryStreaming, LongTailReplaysUnderMemoryBound)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     const Layout layout("p");
+    seedPoolMetaForRestart(*backend);
     const RootNamespace ns{"00/aa@cas@"};
 
     constexpr size_t kTxns = 24;
@@ -268,6 +269,7 @@ TEST(CasRecoveryStreaming, MaterializingControlExceedsMemoryBound)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     const Layout layout("p");
+    seedPoolMetaForRestart(*backend);
     const RootNamespace ns{"00/aa@cas@"};
 
     constexpr size_t kTxns = 24;

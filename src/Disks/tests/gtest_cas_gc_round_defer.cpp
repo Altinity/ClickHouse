@@ -217,6 +217,25 @@ TEST(CasGcRoundDefer, SnapshotLifeAbsentFromThePreListCatalogCutDefersTheRound)
     EXPECT_EQ(backend->deleteTotal(), 0u);
 }
 
+TEST(CasGcRoundDefer, CleanupLifeAbsentFromThePreListCatalogCutDefersTheRound)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    const NamespaceLifeId unknown = NamespaceLifeId::fromCatalogEntry(
+        RootNamespace{"cannot-authorize"}, UInt128{0x458});
+    const String cleanup_key = layout.refCleanupMarkerKey(unknown, RefTxnId{1, 1});
+    ASSERT_EQ(backend->putIfAbsent(cleanup_key, "not-read-on-defer").outcome, PutOutcome::Done);
+    backend->resetCounts();
+
+    Gc gc(store, kGc);
+    const RoundReport report = gc.runRegularRound(
+        {}, /*allow_steal=*/true, UniversePolicy::AuthoritativeForTest);
+    EXPECT_TRUE(report.deferred);
+    EXPECT_EQ(backend->getCount(cleanup_key), 0u);
+    EXPECT_EQ(backend->deleteTotal(), 0u);
+}
+
 /// ---- Task 4: the DEFER short-circuit wired into runRegularRound ----
 
 /// Idle round re-adopts: after a settled round, a subsequent round with zero changed shards and no

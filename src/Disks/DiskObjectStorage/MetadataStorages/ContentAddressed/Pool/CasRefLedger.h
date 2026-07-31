@@ -165,8 +165,15 @@ public:
     /// state; a failed append leaves the namespace live and propagates the exception.
     DropNamespaceStats dropNamespace(const RootNamespace & ns);
 
+    /// Decommission-only exact-life form. Pins recovery to the immutable catalog cut selected by the
+    /// admin command, so a same-name replacement can never redirect destructive work.
+    DropNamespaceStats dropNamespace(const NamespaceLifeId & life);
+
     /// Reports whether recovery has established the namespace's durable lifecycle as `Removed`.
     bool namespaceIsRemoved(const RootNamespace & ns);
+
+    /// Exact-life companion to `dropNamespace` for decommission's preflight check.
+    bool namespaceIsRemoved(const NamespaceLifeId & life);
 
     /// The catalog life every one of this namespace's objects -- ref-layer AND namespace-file -- is keyed
     /// under, resolved ONCE per table-open and read from the cache afterwards. This is the WRITE-side
@@ -784,6 +791,10 @@ private:
 
     /// Returns the cached runtime for `ns`, creating an empty unrecovered runtime when needed.
     std::shared_ptr<RefTableRuntime> getRefTableRuntime(const RootNamespace & ns);
+
+    /// Installs an externally validated exact life before recovery. Once pinned, the ordinary
+    /// namespace entry points reuse this runtime and cannot re-resolve a later same-name incarnation.
+    std::shared_ptr<RefTableRuntime> pinRefTableRuntimeToLife(const NamespaceLifeId & life);
 
     /// Lazily recovers `ns` per spec §4: catalog life resolution (first table-open only) -> `_ckpt` ->
     /// exact-key base snapshot -> ARITHMETIC tail -> seal CAS-walk -> `_ckpt` CAS -> install. It does not

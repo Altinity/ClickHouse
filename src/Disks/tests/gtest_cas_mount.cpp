@@ -73,6 +73,12 @@ public:
         if (!fired && key == "p/gc/server-roots/root/x/epoch")
         {
             fired = true;
+            /// Install the competing allocator's winning epoch before revealing owned work. The
+            /// retry must not accept that now-present epoch without rechecking the entire emptiness
+            /// bundle that authorized the original absent-epoch attempt.
+            const CasResult winner = InMemoryBackend::casPut(
+                key, encodeServerEpoch(ServerEpoch{.next_writer_epoch = 2}), expected, meta);
+            winner_installed = winner.outcome == CasOutcome::Committed;
             InMemoryBackend::putIfAbsent("p/cas/manifests/root/x/table/debris", "x");
             return {CasOutcome::Conflict, {}};
         }
@@ -80,6 +86,7 @@ public:
     }
 
     bool fired = false;
+    bool winner_installed = false;
 };
 
 }
@@ -385,7 +392,11 @@ TEST(CasServerRootSafety, EpochConflictRecomputesTheWholeEmptinessBundle)
     EXPECT_THROW(allocateWriterEpoch(
         backend, layout, "root/x", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation()), DB::Exception);
     EXPECT_TRUE(backend.fired);
-    EXPECT_FALSE(backend.head(layout.epochKey("root/x")).exists);
+    ASSERT_TRUE(backend.winner_installed);
+    const auto epoch = backend.get(layout.epochKey("root/x"));
+    ASSERT_TRUE(epoch.has_value());
+    EXPECT_EQ(decodeServerEpoch(epoch->bytes).next_writer_epoch, 2u)
+        << "the rejected allocator must not consume an epoch from the conflict winner";
 }
 
 TEST(CasMountLease, AbsentClaimThenRenewBumpsSeq)
@@ -773,6 +784,65 @@ TEST(CasMountStartup, WriterEpochStrictlyIncreasesAcrossReopen)
         .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r"});
     const uint64_t e2 = s2->writerEpoch();
     EXPECT_GT(e2, e1);
+}
+
+TEST(CasMountStartup, FreshWritablePoolBootstrapsAnExplicitEmptyCatalog)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    const Layout layout("p");
+
+    auto store = Pool::open(backend, PoolConfig{
+        .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r",
+        .skip_access_check = true});
+
+    const auto catalog = backend->get(layout.refCatalogKey());
+    ASSERT_TRUE(catalog.has_value());
+    EXPECT_TRUE(decodeRefCatalog(catalog->bytes).entries.empty());
+}
+
+TEST(CasMountStartup, ExistingPoolWithoutCatalogFailsBeforeSlotMutation)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    const Layout layout("p");
+    {
+        auto store = Pool::open(backend, PoolConfig{
+            .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r",
+            .skip_access_check = true});
+    }
+
+    /// Old raw fixtures did not persist an empty catalog. Make this an explicit existing-pool
+    /// fixture before removing the mandatory object whose loss the mount must reject.
+    if (!backend->head(layout.refCatalogKey()).exists)
+        ASSERT_EQ(backend->putIfAbsent(layout.refCatalogKey(), encodeRefCatalog(RefCatalog{})).outcome,
+                  PutOutcome::Done);
+    const HeadResult catalog_head = backend->head(layout.refCatalogKey());
+    ASSERT_TRUE(catalog_head.exists);
+    ASSERT_EQ(backend->deleteExact(layout.refCatalogKey(), catalog_head.token).kind,
+              DeleteOutcome::Kind::Deleted);
+
+    const auto owner_before = backend->get(layout.ownerKey("r"));
+    const auto epoch_before = backend->get(layout.epochKey("r"));
+    const auto mount_before = backend->get(layout.mountKey("r"));
+    ASSERT_TRUE(owner_before.has_value());
+    ASSERT_TRUE(epoch_before.has_value());
+    ASSERT_TRUE(mount_before.has_value());
+
+    EXPECT_THROW(Pool::open(backend, PoolConfig{
+        .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r",
+        .skip_access_check = true}), DB::Exception);
+
+    const auto owner_after = backend->get(layout.ownerKey("r"));
+    const auto epoch_after = backend->get(layout.epochKey("r"));
+    const auto mount_after = backend->get(layout.mountKey("r"));
+    ASSERT_TRUE(owner_after.has_value());
+    ASSERT_TRUE(epoch_after.has_value());
+    ASSERT_TRUE(mount_after.has_value());
+    EXPECT_EQ(owner_after->bytes, owner_before->bytes);
+    EXPECT_EQ(owner_after->token, owner_before->token);
+    EXPECT_EQ(epoch_after->bytes, epoch_before->bytes);
+    EXPECT_EQ(epoch_after->token, epoch_before->token);
+    EXPECT_EQ(mount_after->bytes, mount_before->bytes);
+    EXPECT_EQ(mount_after->token, mount_before->token);
 }
 
 TEST(CasMountReadOnly, ForeignOwnedPoolOpensWithoutMutation)

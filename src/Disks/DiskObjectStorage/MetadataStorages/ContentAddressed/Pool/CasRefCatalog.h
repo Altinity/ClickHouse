@@ -20,9 +20,8 @@ class CasRefCatalog
 {
 public:
     /// The catalog snapshot as read from the backend: the decoded object plus the token an update
-    /// must present to `casPut`. `token == std::nullopt` means the object is ABSENT -- a pool that
-    /// has never admitted a namespace has never had a durable `cas/ref_catalog`, mirroring the
-    /// bootstrap contract of every other token-CAS singleton (`_pool_meta`, `gc/state`).
+    /// must present to `casPut`. Operational reads always return a token because the catalog is a
+    /// mandatory control object after pool bootstrap.
     struct Snapshot
     {
         RefCatalog catalog;
@@ -30,19 +29,25 @@ public:
         CatalogLifeIndex life_index;
     };
 
-    /// Reads and decodes the current catalog. Absent key -> an empty catalog with `token = nullopt`.
+    /// Reads and decodes the mandatory current catalog. Absence is corruption, never an empty
+    /// authority set: without the catalog, opaque life keys cannot prove ownership.
     static Snapshot read(Backend & backend, const Layout & layout);
+
+    /// Materializes the explicit empty catalog for a prefix already proven new by
+    /// `probePoolBootstrapResidual`. This is the only absence-tolerant catalog operation: no
+    /// existing-pool caller can accidentally turn authoritative absence into an empty catalog. A
+    /// concurrent bootstrap winner is accepted only after its object is read and decoded.
+    static Snapshot initializeEmptyForNewPool(Backend & backend, const Layout & layout);
 
     /// Stage B (Task 4-C): the REAL catalog life for `ns` if a `Live`/`Removing` entry names it, else
     /// the deterministic Stage-A fixture identity (`NamespaceLifeId::stageATransition`). For
     /// non-production discovery-path
     /// readers -- `recoverRefTableDetailed`, fsck's stream/oracle walk, `CasOrphanManifestSweep`'s
     /// active-key set -- which must find whatever a mounted writer actually wrote (a catalog-minted
-    /// incarnation, since Task 4-C's production birth wiring) while staying correct for the raw-fixture
-    /// tests that seed ref-log content directly and never touch the catalog at all: for THOSE
-    /// namespaces the transitional fallback is not a guess, it is the only other identity the fixture
-    /// could have keyed its objects at (`cas_test_helpers.h`'s `casAdmitEntry` derives the same value
-    /// from the namespace when it does admit one). `Creating` is excluded exactly as
+    /// incarnation, since Task 4-C's production birth wiring) while staying correct for raw fixtures
+    /// that explicitly seed an empty catalog and then admit a deterministic transition life. For
+    /// namespaces absent from that present catalog, the transitional identity is the only other one
+    /// such fixtures can use. `Creating` is excluded exactly as
     /// `Gc::discoverUniverse` excludes it: no
     /// publication can exist under an entry still being created, so there is nothing to resolve to.
     ///
@@ -72,8 +77,8 @@ public:
 
     /// The generic token-CAS retry loop shared by every catalog mutation, mirroring
     /// `PoolMeta::admitOrValidate`'s loop: read the current snapshot, apply `mutate` to obtain the
-    /// CANDIDATE next catalog, `casPut` it against the observed token (`std::nullopt` create-if-absent
-    /// when the object does not exist yet), and on `Conflict` re-read and re-apply `mutate` to the
+    /// CANDIDATE next catalog, `casPut` it against the mandatory object's observed token, and on
+    /// `Conflict` re-read and re-apply `mutate` to the
     /// FRESH snapshot -- never re-encoding the stale candidate. `mutate` must return a canonically
     /// ordered, grammar-valid candidate; `encodeRefCatalog` (called internally) enforces that.
     ///
@@ -83,12 +88,8 @@ public:
     /// than spinning forever against a pathologically busy catalog.
     ///
     /// A re-read that finds the object genuinely ABSENT after it was previously observed present is
-    /// NOT treated as a fresh bootstrap: `Backend::get` returns `nullopt` only for authoritative
-    /// absence, so an existing-then-vanished catalog is a real concurrent delete (or a lying store),
-    /// and silently falling back to an empty catalog would let the next attempt's create-if-absent
-    /// `casPut` replace EVERY other namespace's entry with whatever this one mutation produced. This
-    /// raises `LOGICAL_ERROR` instead, mirroring `PoolMeta::admitOrValidate`'s identical fail-closed
-    /// reaction to the same observation.
+    /// corruption, not a fresh bootstrap. The required `read` throws before another CAS attempt, so
+    /// no mutation can replace every other namespace with a one-update catalog.
     ///
     /// This primitive runs NO admission check: Constraint 13 (removal is never refused) means
     /// whether a candidate must clear the additive predicate is the CALLER's decision, not this

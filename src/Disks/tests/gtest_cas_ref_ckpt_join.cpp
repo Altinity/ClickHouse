@@ -257,6 +257,7 @@ TEST(CasRefCkptJoin, ResumedCreationRaisesLifeEpochWithoutRefusal)
 {
     InMemoryBackend backend;
     Layout layout("p");
+    DB::Cas::tests::seedPoolMetaForRestart(backend);
     const RootNamespace ns{"a"};
 
     ASSERT_EQ(CasRefCatalog::createNamespace(backend, layout, ns, creatorFence("srv1", 5),

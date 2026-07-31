@@ -272,7 +272,19 @@ uint64_t allocateWriterEpoch(
         const CasResult res = b.casPut(key, encodeServerEpoch(new_state), expected);
         if (res.outcome == CasOutcome::Committed)
             return next;
-        /// Conflict: someone else allocated concurrently — retry against the fresh state.
+        if (!got)
+        {
+            /// The absent-epoch create conflicted. A winner may have installed an epoch while owned
+            /// work became visible, so recompute the complete catalog + manifest + roots bundle
+            /// before the next iteration is allowed to accept either a present or absent epoch.
+            if (!serverRootSubtreeEmpty(b, l, srid, observe_catalog()))
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "CAS server-root '{}' writer_epoch allocation conflicted and newly visible owned "
+                    "work blocks recreation",
+                    srid);
+        }
+        /// Conflict: someone else allocated concurrently — retry against fresh state only after the
+        /// absent-epoch safety bundle above has been recomputed when required.
     }
 
     throw Exception(ErrorCodes::CORRUPTED_DATA,

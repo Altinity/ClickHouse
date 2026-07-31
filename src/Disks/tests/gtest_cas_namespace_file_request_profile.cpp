@@ -514,15 +514,12 @@ TEST(CasNamespaceFileDiskProfile, RemovalOnANeverOpenedTableLeavesTheCatalogUnto
     std::shared_ptr<RecordingObjectStorage> object_storage;
     auto storage = openRecordingStorage(object_storage);
     const DB::Cas::Layout & layout = storage->store()->layout();
-    /// The pool KEY, joined onto the object storage's own root: a `StoredObject` carries a remote path,
-    /// and the local object storage resolves it as a filesystem path -- so a bare key would be resolved
-    /// against the process working directory and could never be found, making both existence checks below
-    /// answer "absent" no matter what the pool contains.
-    const DB::StoredObject catalog_object{
-        (std::filesystem::path(object_storage->getCommonKeyPrefix()) / layout.refCatalogKey()).string()};
 
-    /// Nothing has opened this table: no namespace file written, no part published, no ref op.
-    ASSERT_FALSE(object_storage->exists(catalog_object)) << "precondition: the pool has no catalog yet";
+    /// A valid pool already owns its explicit empty mandatory catalog. Nothing has opened this table:
+    /// no namespace file written, no part published, and no ref operation has changed that object.
+    const auto catalog_before = storage->store()->backend().get(layout.refCatalogKey());
+    ASSERT_TRUE(catalog_before);
+    EXPECT_TRUE(decodeRefCatalog(catalog_before->bytes).entries.empty());
     object_storage->resetRecords();
 
     /// Three removal shapes, all against paths under a table that does not exist.
@@ -539,8 +536,11 @@ TEST(CasNamespaceFileDiskProfile, RemovalOnANeverOpenedTableLeavesTheCatalogUnto
 
     EXPECT_EQ(object_storage->writtenContaining(layout.refCatalogKey()), std::vector<String>{})
         << "a removal must not write the catalog: it must not birth the namespace it is removing from";
-    EXPECT_FALSE(object_storage->exists(catalog_object))
-        << "and the catalog object must still not exist at all";
+    const auto catalog_after_removal = storage->store()->backend().get(layout.refCatalogKey());
+    ASSERT_TRUE(catalog_after_removal);
+    EXPECT_EQ(catalog_after_removal->bytes, catalog_before->bytes);
+    EXPECT_EQ(catalog_after_removal->token, catalog_before->token)
+        << "the mandatory catalog must remain byte-for-byte and token-for-token unchanged";
 
     /// Not vacuous: the SAME operations on the same table after a write do reach the file, so the zeros
     /// above are the absence of a birth and not the absence of any work.
@@ -549,8 +549,10 @@ TEST(CasNamespaceFileDiskProfile, RemovalOnANeverOpenedTableLeavesTheCatalogUnto
     storage->createTransaction()->unlinkFile(
         kTablePath + "/format_version.txt", /*if_exists*/ false, /*remove_metadata_only*/ false);
     EXPECT_FALSE(storage->existsFile(kTablePath + "/format_version.txt"));
-    /// And the existence check itself can see a catalog that IS there -- without this, an absent answer
-    /// caused by a mis-built path would read exactly like the birth this case is about.
-    EXPECT_TRUE(object_storage->exists(catalog_object))
-        << "the write above birthed the namespace, so the catalog object must now exist";
+    /// Positive control: the write really did birth the namespace and mutate the same catalog object
+    /// whose stability the removal assertions pin above.
+    const auto catalog_after_birth = storage->store()->backend().get(layout.refCatalogKey());
+    ASSERT_TRUE(catalog_after_birth);
+    EXPECT_NE(catalog_after_birth->bytes, catalog_after_removal->bytes);
+    EXPECT_NE(catalog_after_birth->token, catalog_after_removal->token);
 }

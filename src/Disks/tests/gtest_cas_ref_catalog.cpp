@@ -510,38 +510,31 @@ TEST(CasRefCatalogAdmission, RemovalNeverRefusedEvenAtCapacity)
 
 /// ---------- Pool/CasRefCatalog: token-CAS read / create / update / conflict-retry ----------
 
-TEST(CasRefCatalog, ReadAbsentReturnsEmptyCatalogWithNoToken)
+TEST(CasRefCatalog, ReadAbsentFailsClosed)
 {
     InMemoryBackend backend;
     Layout layout("p");
-    const CasRefCatalog::Snapshot snap = CasRefCatalog::read(backend, layout);
-    EXPECT_TRUE(snap.catalog.entries.empty());
-    EXPECT_FALSE(snap.token.has_value());
+    DB::Cas::tests::expectThrowsCode(
+        DB::ErrorCodes::CORRUPTED_DATA, [&] { (void)CasRefCatalog::read(backend, layout); });
 }
 
-TEST(CasRefCatalog, CasUpdateCreatesWhenAbsent)
+TEST(CasRefCatalog, CasUpdateRefusesWhenAbsent)
 {
     InMemoryBackend backend;
     Layout layout("p");
 
-    const RefCatalog created = CasRefCatalog::casUpdate(backend, layout, [](const RefCatalog & cur)
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
     {
-        EXPECT_TRUE(cur.entries.empty());
-        RefCatalog next;
-        next.entries.push_back(liveEntry("a", 7));
-        return next;
+        CasRefCatalog::casUpdate(backend, layout, [](const RefCatalog & cur) { return cur; });
     });
-    ASSERT_EQ(created.entries.size(), 1u);
-
-    const CasRefCatalog::Snapshot snap = CasRefCatalog::read(backend, layout);
-    EXPECT_EQ(snap.catalog, created);
-    EXPECT_TRUE(snap.token.has_value());
+    EXPECT_FALSE(backend.head(layout.refCatalogKey()).exists);
 }
 
 TEST(CasRefCatalog, CasUpdateAppliesOnTopOfExistingState)
 {
     InMemoryBackend backend;
     Layout layout("p");
+    CasRefCatalog::initializeEmptyForNewPool(backend, layout);
 
     CasRefCatalog::casUpdate(backend, layout, [](const RefCatalog &)
     {
@@ -565,6 +558,7 @@ TEST(CasRefCatalog, CasUpdateRetriesOnConflictAgainstFreshState)
 {
     InMemoryBackend backend;
     Layout layout("p");
+    CasRefCatalog::initializeEmptyForNewPool(backend, layout);
 
     CasRefCatalog::casUpdate(backend, layout, [](const RefCatalog &)
     {
@@ -599,14 +593,14 @@ TEST(CasRefCatalog, CasUpdateRetriesOnConflictAgainstFreshState)
 /// seeded object using the token `casUpdate`'s own initial read observed, so the loop's own `casPut`
 /// against that now-stale token gets a genuine `Conflict`, and the follow-up re-read genuinely finds
 /// the key absent.
-/// The `LOGICAL_ERROR` this raises aborts the process in debug/sanitizer builds -- split like the
-/// `CasRefCatalogFormat` block above. The DeathTest variant cannot also re-check the post-throw
-/// backend state this test verifies (there is no post-abort state in a real debug/sanitizer build).
+/// Missing mandatory authority raises `CORRUPTED_DATA`; the split remains only because the debug
+/// variant historically lived in the death-test suite.
 #ifndef DEBUG_OR_SANITIZER_BUILD
 TEST(CasRefCatalog, CasUpdateThrowsOnVanishMidRetryInsteadOfReplacingTheCatalog)
 {
     InMemoryBackend backend;
     Layout layout("p");
+    CasRefCatalog::initializeEmptyForNewPool(backend, layout);
 
     CasRefCatalog::casUpdate(backend, layout, [](const RefCatalog &)
     {
@@ -617,7 +611,7 @@ TEST(CasRefCatalog, CasUpdateThrowsOnVanishMidRetryInsteadOfReplacingTheCatalog)
     const CasRefCatalog::Snapshot seeded = CasRefCatalog::read(backend, layout);
     ASSERT_TRUE(seeded.token.has_value());
 
-    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&]
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
     {
         CasRefCatalog::casUpdate(backend, layout, [&](const RefCatalog & cur)
         {
@@ -630,7 +624,7 @@ TEST(CasRefCatalog, CasUpdateThrowsOnVanishMidRetryInsteadOfReplacingTheCatalog)
 
     /// Nothing was written by the failed attempt: the object is exactly as the delete left it
     /// (absent), never a fresh single-entry catalog.
-    EXPECT_FALSE(CasRefCatalog::read(backend, layout).token.has_value());
+    EXPECT_FALSE(backend.head(layout.refCatalogKey()).exists);
 }
 #endif
 
@@ -639,6 +633,7 @@ TEST(CasRefCatalogDeathTest, CasUpdateThrowsOnVanishMidRetryInsteadOfReplacingTh
 {
     InMemoryBackend backend;
     Layout layout("p");
+    CasRefCatalog::initializeEmptyForNewPool(backend, layout);
 
     CasRefCatalog::casUpdate(backend, layout, [](const RefCatalog &)
     {
@@ -649,8 +644,8 @@ TEST(CasRefCatalogDeathTest, CasUpdateThrowsOnVanishMidRetryInsteadOfReplacingTh
     const CasRefCatalog::Snapshot seeded = CasRefCatalog::read(backend, layout);
     ASSERT_TRUE(seeded.token.has_value());
 
-    EXPECT_DEATH(
-        {
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
+    {
             CasRefCatalog::casUpdate(backend, layout, [&](const RefCatalog & cur)
             {
                 backend.deleteExact(layout.refCatalogKey(), *seeded.token);
@@ -658,8 +653,7 @@ TEST(CasRefCatalogDeathTest, CasUpdateThrowsOnVanishMidRetryInsteadOfReplacingTh
                 next.entries.push_back(liveEntry("b", 2));
                 return next;
             });
-        },
-        "vanished mid-update");
+    });
 }
 #endif
 
@@ -670,6 +664,7 @@ TEST(CasRefCatalog, CasUpdateGivesUpAfterBoundedAttemptsWithRetryLaterError)
 {
     InMemoryBackend backend;
     Layout layout("p");
+    CasRefCatalog::initializeEmptyForNewPool(backend, layout);
 
     int mutate_calls = 0;
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
@@ -689,6 +684,7 @@ TEST(CasRefCatalog, CasAdmitEntryAcceptsAnOrdinaryCreation)
 {
     InMemoryBackend backend;
     Layout layout("p");
+    CasRefCatalog::initializeEmptyForNewPool(backend, layout);
 
     const RefCatalog created = CasRefCatalog::casAdmitEntry(backend, layout,
         CatalogEntry{.ns = RootNamespace{"a"}, .state = NsState::Creating, .incarnation = UInt128(1),
@@ -701,6 +697,7 @@ TEST(CasRefCatalog, CasAdmitEntryInsertsAtCanonicalPosition)
 {
     InMemoryBackend backend;
     Layout layout("p");
+    CasRefCatalog::initializeEmptyForNewPool(backend, layout);
 
     CasRefCatalog::casAdmitEntry(backend, layout, liveEntry("b", 1));
     const RefCatalog after = CasRefCatalog::casAdmitEntry(backend, layout, liveEntry("a", 2));
@@ -717,6 +714,7 @@ TEST(CasRefCatalog, CasAdmitEntryRejectsADuplicateNamespace)
 {
     InMemoryBackend backend;
     Layout layout("p");
+    CasRefCatalog::initializeEmptyForNewPool(backend, layout);
     CasRefCatalog::casAdmitEntry(backend, layout, liveEntry("a", 1));
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR,
         [&] { CasRefCatalog::casAdmitEntry(backend, layout, liveEntry("a", 2)); });
@@ -728,6 +726,7 @@ TEST(CasRefCatalogDeathTest, CasAdmitEntryRejectsADuplicateNamespaceAborts)
 {
     InMemoryBackend backend;
     Layout layout("p");
+    CasRefCatalog::initializeEmptyForNewPool(backend, layout);
     CasRefCatalog::casAdmitEntry(backend, layout, liveEntry("a", 1));
     EXPECT_DEATH({ CasRefCatalog::casAdmitEntry(backend, layout, liveEntry("a", 2)); }, "not canonically ordered");
 }

@@ -84,8 +84,8 @@ enum class FormatId : uint16_t
     /// carried by the `MountLease` beat rather than a standalone object.
     PoolMeta = 8,
     Roster = 9,
-    /// Value 10 is retired: discovery authority is the `cas/refs/` listing rather than a roots
-    /// registry object.
+    /// Value 10 is retired: discovery authority is the pool-wide `cas/ref_catalog` object rather
+    /// than a roots registry object or a physical stream listing.
     GcOutcomes = 11,
     PartManifest = 12,    /// Immutable root-local `cas_part_manifest` payload-hybrid text object.
     RunFile = 13,         /// Deterministic, uncompressed `cas_run` GC source-edge NDJSON stream.

@@ -495,6 +495,8 @@ public:
     /// snapshot. Performs NO physical deletion (no verbatim-file deletes, no tombstones) -- that is
     /// GC's namespace-cleanup item.
     DropNamespaceStats dropNamespace(const RootNamespace & ns);
+    /// Decommission-only exact-life overload; never re-resolves by namespace name.
+    DropNamespaceStats dropNamespace(const NamespaceLifeId & life);
 
     /// True iff this namespace's ref-table lifecycle is durably `Removed` — a table that `dropNamespace`
     /// removed and that has NOT been recreated (distinguished from a never-born namespace, whose default
@@ -506,6 +508,8 @@ public:
     /// — unreachable under normal `Atomic` DDL (a recreated table always mints a fresh UUID, hence a
     /// fresh namespace), and itself gated on this namespace's `_cleanup` marker.
     bool namespaceIsRemoved(const RootNamespace & ns);
+    /// Decommission-only exact-life overload; never re-resolves by namespace name.
+    bool namespaceIsRemoved(const NamespaceLifeId & life);
 
     /// The catalog life this namespace's objects are keyed under, for a WRITER, and the only resolution
     /// that CREATES one: minted if the catalog names none (a namespace's first namespace file births it

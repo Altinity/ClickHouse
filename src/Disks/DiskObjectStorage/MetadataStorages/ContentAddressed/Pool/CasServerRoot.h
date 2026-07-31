@@ -246,8 +246,8 @@ class Layout;
 bool serverRootSubtreeEmpty(
     Backend & b, const Layout & l, const String & srid, const RefCatalog & catalog_observation);
 
-/// Supplied by the pool layer so the low-level server-root protocol never silently interprets an
-/// optional catalog. Every absent-control retry obtains a fresh, successfully decoded observation.
+/// Supplied by the pool layer so the low-level server-root protocol always observes the mandatory
+/// catalog. Every absent-control retry obtains a fresh, successfully decoded observation.
 using ObserveRefCatalog = std::function<RefCatalog()>;
 
 /// Read the owner anchor (`gc/server-roots/<srid>/owner`) WITHOUT claiming or validating identity —

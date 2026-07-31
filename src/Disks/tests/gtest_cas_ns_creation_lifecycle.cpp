@@ -63,6 +63,16 @@ const CatalogEntry * findEntryForTest(const RefCatalog & catalog, const RootName
     return nullptr;
 }
 
+/// Raw lifecycle tests operate below `Pool::open`, so model an already-bootstrapped pool explicitly.
+class InitializedCatalogBackend : public InMemoryBackend
+{
+public:
+    InitializedCatalogBackend()
+    {
+        CasRefCatalog::initializeEmptyForNewPool(*this, Layout("p"));
+    }
+};
+
 }
 
 /// ---------------------------------------------------------------------------------------------
@@ -71,7 +81,7 @@ const CatalogEntry * findEntryForTest(const RefCatalog & catalog, const RootName
 
 TEST(CasNsCreationLifecycle, HappyPathReachesLiveWithADurableCkptAndAStableIncarnation)
 {
-    InMemoryBackend backend;
+    InitializedCatalogBackend backend;
     Layout layout("p");
     const RootNamespace ns{"a"};
     const CreatorFence creator = creatorFence("srv1", /*writer_epoch=*/5);
@@ -104,7 +114,7 @@ TEST(CasNsCreationLifecycle, HappyPathReachesLiveWithADurableCkptAndAStableIncar
 #ifndef DEBUG_OR_SANITIZER_BUILD
 TEST(CasNsCreationLifecycle, CreateNamespaceRejectsAnAlreadyExistingEntry)
 {
-    InMemoryBackend backend;
+    InitializedCatalogBackend backend;
     Layout layout("p");
     const RootNamespace ns{"a"};
     const CreatorFence creator = creatorFence("srv1", 1);
@@ -121,7 +131,7 @@ TEST(CasNsCreationLifecycle, CreateNamespaceRejectsAnAlreadyExistingEntry)
 #if defined(DEBUG_OR_SANITIZER_BUILD)
 TEST(CasNsCreationLifecycleDeathTest, CreateNamespaceRejectsAnAlreadyExistingEntryAborts)
 {
-    InMemoryBackend backend;
+    InitializedCatalogBackend backend;
     Layout layout("p");
     const RootNamespace ns{"a"};
     const CreatorFence creator = creatorFence("srv1", 1);
@@ -181,7 +191,7 @@ std::function<void(uint64_t)> admittedOnceThenFenced()
 
 TEST(CasNsCreationLifecycle, FencedOutBetweenTheCkptPublishAndGoLiveRefusesAndLeavesEntryCreating)
 {
-    InMemoryBackend backend;
+    InitializedCatalogBackend backend;
     Layout layout("p");
     const RootNamespace ns{"a"};
     const CreatorFence creator = creatorFence("srv1", 5);
@@ -209,7 +219,7 @@ TEST(CasNsCreationLifecycle, FencedOutBetweenTheCkptPublishAndGoLiveRefusesAndLe
 
 TEST(CasNsCreationLifecycle, EntryStolenByAConcurrentReconcilerRefusesGoLiveAndLeavesTheStolenEntryAlone)
 {
-    InMemoryBackend backend;
+    InitializedCatalogBackend backend;
     Layout layout("p");
     const RootNamespace ns{"a"};
     const CreatorFence original_creator = creatorFence("srv1", 5);
@@ -257,7 +267,7 @@ TEST(CasNsCreationLifecycle, EntryStolenByAConcurrentReconcilerRefusesGoLiveAndL
 
 TEST(CasNsCreationLifecycle, BothFenceAndEntryStaleRefusesGoLiveViaTheFenceCheckWhichRunsFirst)
 {
-    InMemoryBackend backend;
+    InitializedCatalogBackend backend;
     Layout layout("p");
     const RootNamespace ns{"a"};
     const CreatorFence original_creator = creatorFence("srv1", 5);
@@ -300,7 +310,7 @@ TEST(CasNsCreationLifecycle, BothFenceAndEntryStaleRefusesGoLiveViaTheFenceCheck
 
 TEST(CasNsCreationLifecycle, ReconcileRefusedWhileTheOriginalCreatorFenceIsStillLive)
 {
-    InMemoryBackend backend;
+    InitializedCatalogBackend backend;
     Layout layout("p");
     const RootNamespace ns{"a"};
     const CatalogEntry entry{.ns = ns, .state = NsState::Creating, .incarnation = UInt128(7),
@@ -319,7 +329,7 @@ TEST(CasNsCreationLifecycle, ReconcileRefusedWhileTheOriginalCreatorFenceIsStill
 
 TEST(CasNsCreationLifecycle, ReconcileSucceedsTokenExactlyAfterTheOriginalCreatorFenceIsTerminalThenResumesToLive)
 {
-    InMemoryBackend backend;
+    InitializedCatalogBackend backend;
     Layout layout("p");
     const RootNamespace ns{"a"};
     const CreatorFence original_creator = creatorFence("srv1", 5);
@@ -356,7 +366,7 @@ TEST(CasNsCreationLifecycle, ReconcileSucceedsTokenExactlyAfterTheOriginalCreato
 /// the SAME stale `observed` before either writes.
 TEST(CasNsCreationLifecycle, ReconcileFailsClosedWhenTheEntryAlreadyChanged)
 {
-    InMemoryBackend backend;
+    InitializedCatalogBackend backend;
     Layout layout("p");
     const RootNamespace ns{"a"};
     const CatalogEntry entry{.ns = ns, .state = NsState::Creating, .incarnation = UInt128(7),
@@ -390,7 +400,7 @@ TEST(CasNsCreationLifecycle, ReconcileFailsClosedWhenTheEntryAlreadyChanged)
 #ifndef DEBUG_OR_SANITIZER_BUILD
 TEST(CasNsCreationLifecycle, CompleteCreationRejectsANonCreatingEntry)
 {
-    InMemoryBackend backend;
+    InitializedCatalogBackend backend;
     Layout layout("p");
     const CatalogEntry live{.ns = RootNamespace{"a"}, .state = NsState::Live, .incarnation = UInt128(1)};
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&]
@@ -401,7 +411,7 @@ TEST(CasNsCreationLifecycle, CompleteCreationRejectsANonCreatingEntry)
 
 TEST(CasNsCreationLifecycle, ReconcileStaleCreatorRejectsANonCreatingEntry)
 {
-    InMemoryBackend backend;
+    InitializedCatalogBackend backend;
     Layout layout("p");
     const CatalogEntry live{.ns = RootNamespace{"a"}, .state = NsState::Live, .incarnation = UInt128(1)};
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&]
@@ -414,7 +424,7 @@ TEST(CasNsCreationLifecycle, ReconcileStaleCreatorRejectsANonCreatingEntry)
 #if defined(DEBUG_OR_SANITIZER_BUILD)
 TEST(CasNsCreationLifecycleDeathTest, CompleteCreationRejectsANonCreatingEntryAborts)
 {
-    InMemoryBackend backend;
+    InitializedCatalogBackend backend;
     Layout layout("p");
     const CatalogEntry live{.ns = RootNamespace{"a"}, .state = NsState::Live, .incarnation = UInt128(1)};
     EXPECT_DEATH(
@@ -424,7 +434,7 @@ TEST(CasNsCreationLifecycleDeathTest, CompleteCreationRejectsANonCreatingEntryAb
 
 TEST(CasNsCreationLifecycleDeathTest, ReconcileStaleCreatorRejectsANonCreatingEntryAborts)
 {
-    InMemoryBackend backend;
+    InitializedCatalogBackend backend;
     Layout layout("p");
     const CatalogEntry live{.ns = RootNamespace{"a"}, .state = NsState::Live, .incarnation = UInt128(1)};
     EXPECT_DEATH(

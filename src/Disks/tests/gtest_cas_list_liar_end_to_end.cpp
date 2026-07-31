@@ -146,6 +146,7 @@ std::map<String, String> refsOf(const PoolPtr & store, const RootNamespace & ns)
 /// rather than compare against a hand-written expectation.
 void seedFiveRecordStream(Backend & backend, const Layout & layout, const RootNamespace & ns)
 {
+    seedPoolMetaForRestart(backend, layout.poolPrefix());
     backend.putIfAbsent(layout.refCkptKey(NamespaceLifeId::stageATransition(ns)),
                         encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{1},
                                               .checkpoint_snapshot_id = std::nullopt,

@@ -7,6 +7,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
+#include <algorithm>
 #include <chrono>
 #include <limits>
 #include <set>
@@ -111,6 +112,13 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
     DecommissionReport report;
     report.srid = victim_srid;
 
+    /// Validate one required immutable ownership cut before impersonating the victim. The admin open
+    /// performs its own fresh catalog observation for mount safety, but namespace selection below
+    /// must reuse this exact pre-mutation decision rather than read a later authority set.
+    const Layout catalog_layout(config.pool_prefix);
+    const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(*backend, catalog_layout);
+    catalog_cut.life_index.throwIfAmbiguous("CAS decommission");
+
     config.event_sink = sink;
     PoolPtr admin = Pool::openForDecommission(std::move(backend), std::move(config), victim_srid);
 
@@ -122,14 +130,11 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
         e.detail = {{"srid", victim_srid}};
     });
 
-    /// One immutable catalog cut is the complete ownership universe. Physical life keys carry no
-    /// logical path, and raw string prefixes such as `victim` must not select the distinct owner
-    /// `victim2`; the slash makes `victim` one canonical path component. Any duplicated physical id
-    /// refuses the destructive command before namespace or slot mutation.
-    const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(admin->backend(), admin->layout());
-    catalog_cut.life_index.throwIfAmbiguous("CAS decommission");
+    /// The pre-impersonation catalog cut is the complete ownership universe. Physical life keys carry
+    /// no logical path, and raw string prefixes such as `victim` must not select the distinct owner
+    /// `victim2`; the slash makes `victim` one canonical path component.
     const String victim_namespace_prefix = victim_srid + "/";
-    std::vector<NamespaceLifeId> owned_lives;
+    std::vector<std::pair<CatalogEntry, NamespaceLifeId>> owned_lives;
     for (const CatalogEntry & entry : catalog_cut.catalog.entries)
     {
         if (entry.ns.string() != victim_srid && !entry.ns.string().starts_with(victim_namespace_prefix))
@@ -138,20 +143,34 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
         if (!life)
             throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "ca-decommission: catalog entry '{}' has no physical life resolution", entry.ns.string());
-        owned_lives.push_back(*life);
+        owned_lives.emplace_back(entry, *life);
     }
 
-    for (const NamespaceLifeId & life : owned_lives)
+    for (const auto & [selected_entry, life] : owned_lives)
     {
         const RootNamespace & ns = life.ns;
         const String & ns_str = ns.string();
-        if (admin->namespaceIsRemoved(ns))
+
+        /// Refuse a same-name lifecycle move that landed after the immutable selection cut. The
+        /// exact-life overloads below also pin recovery to `life`, closing the race after this check:
+        /// a later replacement can never redirect a removal to its new incarnation.
+        const CasRefCatalog::Snapshot current_catalog = CasRefCatalog::read(admin->backend(), admin->layout());
+        const auto current_entry = std::find_if(
+            current_catalog.catalog.entries.begin(), current_catalog.catalog.entries.end(),
+            [&](const CatalogEntry & entry) { return entry.ns.string() == ns_str; });
+        if (current_entry == current_catalog.catalog.entries.end() || *current_entry != selected_entry)
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "ca-decommission: namespace '{}' changed incarnation after the validated catalog cut; "
+                "refusing destructive work",
+                ns_str);
+
+        if (admin->namespaceIsRemoved(life))
         {
             ++report.namespaces_already_removed;
             continue;
         }
 
-        const auto stats = admin->dropNamespace(ns);
+        const auto stats = admin->dropNamespace(life);
         ++report.namespaces_removed;
         report.committed_refs_removed += stats.committed_refs;
         report.precommits_removed += stats.precommits;

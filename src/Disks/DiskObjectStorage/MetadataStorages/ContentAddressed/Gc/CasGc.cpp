@@ -3891,13 +3891,23 @@ void Gc::sampleRefListQuality(const RefScanSummary & round_scan, uint64_t curren
 RebuildReport Gc::rebuildBaseline(bool force)
 {
     /// The `gc/state` disaster-recovery command.
-    /// DRY: the engine is the round's own bricks — discoverUniverse for the universe,
+    /// DRY: the engine is the round's own bricks — one catalog cut for the universe,
     /// foldManifestEdges(+1) for edge emission, foldDeltasIntoGeneration with EMPTY priors
     /// (attempt-iterated for O(budget) memory), computeHeartbeatFloor for the round mint.
     /// Writes ONLY the gc plane; never touches ref shards, manifests, or blobs; never deletes.
     RebuildReport rep;
     Backend & backend = store->backend();
     const Layout & layout = store->layout();
+
+    /// One immutable authority cut drives both the generation-0 health check and the rebuild's
+    /// universe/reverse join. A second catalog read could make the decision and the work disagree.
+    const CasRefCatalog::Snapshot rebuild_catalog_cut = CasRefCatalog::read(backend, layout);
+    rebuild_catalog_cut.life_index.throwIfAmbiguous("CAS GC rebuild");
+    std::vector<NamespaceLifeId> rebuild_universe;
+    rebuild_universe.reserve(rebuild_catalog_cut.catalog.entries.size());
+    for (const CatalogEntry & entry : rebuild_catalog_cut.catalog.entries)
+        if (entry.state != NsState::Creating)
+            rebuild_universe.push_back(NamespaceLifeId::fromCatalogEntry(entry.ns, entry.incarnation));
 
     /// Health check BEFORE the lease (the lease acquire on an absent state CREATES a bootstrap
     /// body, which must not make scenario (а) look healthy). Healthy = decodes AND, when a baseline
@@ -3933,7 +3943,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
                 /// state was lost) is healthy ONLY when no table proves cleaned logs -- the ref baseline
                 /// guard: a snapshot with no surviving log at or below it (its covered logs were cleaned
                 /// by a now-lost cursor).
-                for (const NamespaceLifeId & life : discoverUniverse())
+                for (const NamespaceLifeId & life : rebuild_universe)
                 {
                     std::vector<String> table_keys;
                     /// This LIST is scoped to `namespaceStreamPrefix(life)`, so another physical life's
@@ -4157,13 +4167,6 @@ RebuildReport Gc::rebuildBaseline(bool force)
     /// Universe scan: one immutable catalog cut is both the logical universe and the reverse join for
     /// the following stream observation. A listed id absent from this earlier cut is unknown and
     /// defers REBUILD; a key can never mint a phantom catalog row.
-    const CasRefCatalog::Snapshot rebuild_catalog_cut = CasRefCatalog::read(backend, layout);
-    rebuild_catalog_cut.life_index.throwIfAmbiguous("CAS GC rebuild");
-    std::vector<NamespaceLifeId> universe;
-    universe.reserve(rebuild_catalog_cut.catalog.entries.size());
-    for (const CatalogEntry & entry : rebuild_catalog_cut.catalog.entries)
-        if (entry.state != NsState::Creating)
-            universe.push_back(NamespaceLifeId::fromCatalogEntry(entry.ns, entry.incarnation));
     {
         for (const String & key : enumerateRefPrefix().keys)
         {
@@ -4188,7 +4191,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
     uint64_t max_fence_round = 0;
     std::map<ManifestId, Token> mf_cleanup_unused;
 
-    for (const NamespaceLifeId & life : universe)
+    for (const NamespaceLifeId & life : rebuild_universe)
     {
         const RootNamespace & ns = life.ns;
         seen_ns.insert(ns.string());
@@ -4198,12 +4201,9 @@ RebuildReport Gc::rebuildBaseline(bool force)
         /// owner set is exactly the committed rows plus live precommits it yields. The rebuilt cursor is
         /// the greatest RefTxnId that verified view included.
         ///
-        /// `recoverRefTable` (`CasRefProtocol.cpp`) still takes a bare `RootNamespace`, but it now
-        /// resolves `life`'s REAL incarnation itself, from the catalog (`CasRefCatalog::
-        /// resolveLifeOrSentinel`), falling back to the Stage-A sentinel only for a namespace the
-        /// catalog does not name at all (a raw-fixture test that never touched the catalog). So this
-        /// loop's own `life` and the one `recoverRefTable` resolves internally agree by construction --
-        /// both come from the SAME catalog entry -- without this call site having to thread it through.
+        /// The exact-life overload is deliberate: `rebuild_universe` and recovery consume the same
+        /// physical identity from the immutable catalog cut above. No bare-name resolution or
+        /// transitional sentinel fallback can redirect this walk to a different life.
         const RefTableState st = recoverRefTable(backend, layout, life, onGcEnumerationPage);
 
         ShardCoverage cov;

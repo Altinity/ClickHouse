@@ -5,6 +5,7 @@
 #include <atomic>
 #include <limits>
 #include <stdexcept>
+#include <tuple>
 
 namespace DB::ErrorCodes
 {
@@ -52,6 +53,75 @@ private:
     String throw_key;
     String mismatch_key;
 };
+
+/// Replaces the durable catalog immediately after returning the first armed catalog read. This
+/// distinguishes the immutable cut validated before decommission impersonation from a later mount
+/// safety observation without assuming those two decisions share one GET.
+class CatalogChangesAfterFirstReadBackend : public InMemoryBackend
+{
+public:
+    using Backend::get;
+
+    void armCatalogReplacement(
+        const String & key, RefCatalog replacement_, size_t completed_reads_before_replacement = 0)
+    {
+        catalog_key = key;
+        replacement = std::move(replacement_);
+        reads_to_skip = completed_reads_before_replacement;
+        armed = true;
+    }
+
+    bool fired() const { return replacement_fired; }
+
+    std::optional<GetResult> get(const String & key, Range range) override
+    {
+        auto got = InMemoryBackend::get(key, range);
+        if (!armed || replacement_fired || key != catalog_key)
+            return got;
+        if (reads_to_skip > 0)
+        {
+            --reads_to_skip;
+            return got;
+        }
+        if (!got)
+            throw std::runtime_error("catalog replacement fixture: catalog is absent");
+
+        replacement_fired = true;
+        const PutResult put = InMemoryBackend::putOverwrite(
+            key, encodeRefCatalog(replacement), got->token, {});
+        if (put.outcome != PutOutcome::Done)
+            throw std::runtime_error("catalog replacement fixture: rewrite conflicted");
+        return got;
+    }
+
+private:
+    String catalog_key;
+    RefCatalog replacement;
+    size_t reads_to_skip = 0;
+    bool armed = false;
+    bool replacement_fired = false;
+};
+
+std::vector<std::tuple<String, String, Token>> snapshotPrefixObjects(
+    InMemoryBackend & backend, const String & prefix)
+{
+    std::vector<std::tuple<String, String, Token>> objects;
+    String cursor;
+    while (true)
+    {
+        const ListPage page = backend.list(prefix, cursor, 1000);
+        for (const ListedKey & listed : page.keys)
+        {
+            const auto got = backend.get(listed.key);
+            if (!got)
+                throw std::runtime_error("prefix snapshot fixture: listed object disappeared");
+            objects.emplace_back(listed.key, got->bytes, got->token);
+        }
+        if (page.next_cursor.empty())
+            return objects;
+        cursor = page.next_cursor;
+    }
+}
 
 /// Installs a same-UUID successor deterministically in the retirement tail's read/delete window.
 /// Once armed, the backend recognizes the admin's clean farewell `putOverwrite`. On the next read of
@@ -445,15 +515,153 @@ TEST(CasDecommission, DuplicateLifeIdRefusesBeforeAnyNamespaceOrSlotMutation)
         CatalogEntry{.ns = RootNamespace{"victim/a"}, .state = NsState::Live, .incarnation = UInt128{77}},
         CatalogEntry{.ns = RootNamespace{"victim/b"}, .state = NsState::Removing, .incarnation = UInt128{77}},
     };
-    ASSERT_EQ(backend->putIfAbsent(layout.refCatalogKey(), encodeRefCatalog(catalog)).outcome, PutOutcome::Done);
+    const auto empty_catalog = backend->get(layout.refCatalogKey());
+    ASSERT_TRUE(empty_catalog);
+    ASSERT_EQ(backend->putOverwrite(
+        layout.refCatalogKey(), encodeRefCatalog(catalog), empty_catalog->token).outcome, PutOutcome::Done);
     const auto owner_before = backend->get(layout.ownerKey("victim"));
+    const auto epoch_before = backend->get(layout.epochKey("victim"));
+    const auto mount_before = backend->get(layout.mountKey("victim"));
     ASSERT_TRUE(owner_before);
+    ASSERT_TRUE(epoch_before);
+    ASSERT_TRUE(mount_before);
 
     EXPECT_THROW(decommissionPoolMember(
         backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim"), DB::Exception);
     const auto owner_after = backend->get(layout.ownerKey("victim"));
+    const auto epoch_after = backend->get(layout.epochKey("victim"));
+    const auto mount_after = backend->get(layout.mountKey("victim"));
     ASSERT_TRUE(owner_after);
+    ASSERT_TRUE(epoch_after);
+    ASSERT_TRUE(mount_after);
+    EXPECT_EQ(owner_after->bytes, owner_before->bytes);
     EXPECT_EQ(owner_after->token, owner_before->token);
+    EXPECT_EQ(epoch_after->bytes, epoch_before->bytes);
+    EXPECT_EQ(epoch_after->token, epoch_before->token);
+    EXPECT_EQ(mount_after->bytes, mount_before->bytes);
+    EXPECT_EQ(mount_after->token, mount_before->token);
+}
+
+TEST(CasDecommission, CatalogCutIsValidatedBeforeImpersonationAndReusedForSelection)
+{
+    auto backend = std::make_shared<CatalogChangesAfterFirstReadBackend>();
+    { auto victim = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "victim"}); }
+    const Layout layout("p");
+
+    RefCatalog ambiguous;
+    ambiguous.entries = {
+        CatalogEntry{.ns = RootNamespace{"other/a"}, .state = NsState::Live, .incarnation = UInt128{77}},
+        CatalogEntry{.ns = RootNamespace{"other/b"}, .state = NsState::Removing, .incarnation = UInt128{77}},
+    };
+
+    const auto owner_before = backend->get(layout.ownerKey("victim"));
+    const auto epoch_before = backend->get(layout.epochKey("victim"));
+    const auto mount_before = backend->get(layout.mountKey("victim"));
+    ASSERT_TRUE(owner_before);
+    ASSERT_TRUE(epoch_before);
+    ASSERT_TRUE(mount_before);
+    backend->armCatalogReplacement(layout.refCatalogKey(), std::move(ambiguous));
+
+    EXPECT_THROW(decommissionPoolMember(
+        backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim"), DB::Exception);
+    ASSERT_TRUE(backend->fired());
+
+    const auto owner_after = backend->get(layout.ownerKey("victim"));
+    const auto epoch_after = backend->get(layout.epochKey("victim"));
+    const auto mount_after = backend->get(layout.mountKey("victim"));
+    ASSERT_TRUE(owner_after);
+    ASSERT_TRUE(epoch_after);
+    ASSERT_TRUE(mount_after);
+    EXPECT_EQ(owner_after->bytes, owner_before->bytes);
+    EXPECT_EQ(owner_after->token, owner_before->token);
+    EXPECT_EQ(epoch_after->bytes, epoch_before->bytes);
+    EXPECT_EQ(epoch_after->token, epoch_before->token);
+    EXPECT_EQ(mount_after->bytes, mount_before->bytes);
+    EXPECT_EQ(mount_after->token, mount_before->token);
+}
+
+TEST(CasDecommission, NamespaceSelectionUsesThePreImpersonationCut)
+{
+    auto backend = std::make_shared<CatalogChangesAfterFirstReadBackend>();
+    { auto victim = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "victim"}); }
+    const Layout layout("p");
+
+    RefCatalog later;
+    later.entries = {
+        CatalogEntry{.ns = RootNamespace{"victim/late"}, .state = NsState::Live, .incarnation = UInt128{88}},
+    };
+    backend->armCatalogReplacement(layout.refCatalogKey(), std::move(later));
+
+    const DecommissionReport report = decommissionPoolMember(
+        backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
+    ASSERT_TRUE(backend->fired());
+    EXPECT_EQ(report.namespaces_removed, 0u)
+        << "a namespace visible only to mount safety's later observation is outside the validated cut";
+    EXPECT_EQ(report.namespaces_already_removed, 0u);
+}
+
+TEST(CasDecommission, SameNameRebirthAfterTheCutIsRefusedWithoutTouchingTheNewLife)
+{
+    auto backend = std::make_shared<CatalogChangesAfterFirstReadBackend>();
+    { auto victim = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "victim"}); }
+    const Layout layout("p");
+    const RootNamespace ns{"victim/same"};
+    const NamespaceLifeId old_life = NamespaceLifeId::fromCatalogEntry(ns, UInt128{70});
+    const NamespaceLifeId new_life = NamespaceLifeId::fromCatalogEntry(ns, UInt128{71});
+
+    RefCatalog old_catalog;
+    old_catalog.entries = {
+        CatalogEntry{.ns = ns, .state = NsState::Live, .incarnation = old_life.incarnation},
+    };
+    const auto empty_catalog = backend->get(layout.refCatalogKey());
+    ASSERT_TRUE(empty_catalog);
+    ASSERT_EQ(backend->putOverwrite(
+        layout.refCatalogKey(), encodeRefCatalog(old_catalog), empty_catalog->token).outcome,
+        PutOutcome::Done);
+
+    RefLogTxn new_birth;
+    new_birth.ns = ns.string();
+    new_birth.txn_id = RefTxnId{1, 1};
+    new_birth.ops = {namespaceBirthOp()};
+    ASSERT_EQ(backend->putIfAbsent(
+        layout.refLogKey(new_life, new_birth.txn_id),
+        sealObject(FormatId::RefLog, encodeRefLogTxn(new_birth))).outcome,
+        PutOutcome::Done);
+    RefLogTxn new_seal;
+    new_seal.ns = ns.string();
+    new_seal.txn_id = RefTxnId{1, 2};
+    new_seal.ops = {epochSealOp()};
+    ASSERT_EQ(backend->putIfAbsent(
+        layout.refLogKey(new_life, new_seal.txn_id),
+        sealObject(FormatId::RefLog, encodeRefLogTxn(new_seal))).outcome,
+        PutOutcome::Done);
+    const auto new_life_before = snapshotPrefixObjects(*backend, layout.namespaceStreamPrefix(new_life));
+
+    RefCatalog replacement;
+    replacement.entries = {
+        CatalogEntry{.ns = ns, .state = NsState::Live, .incarnation = new_life.incarnation},
+    };
+    /// Read 1 captures the immutable selection cut. Read 2 is mount safety; replace immediately
+    /// after returning that old observation, so the name-only call is the first consumer of the
+    /// same-name new incarnation.
+    backend->armCatalogReplacement(
+        layout.refCatalogKey(), std::move(replacement), /*completed_reads_before_replacement=*/1);
+
+    String refusal;
+    try
+    {
+        (void)decommissionPoolMember(
+            backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
+    }
+    catch (const DB::Exception & e)
+    {
+        refusal = e.message();
+    }
+    EXPECT_NE(refusal.find("changed incarnation after the validated catalog cut"), String::npos)
+        << refusal;
+    ASSERT_TRUE(backend->fired());
+    EXPECT_EQ(snapshotPrefixObjects(*backend, layout.namespaceStreamPrefix(new_life)), new_life_before)
+        << "decommission must not append a removal transaction to the post-cut incarnation";
 }
 
 TEST(CasDecommission, VictimNameMatchesOneCanonicalPathComponent)

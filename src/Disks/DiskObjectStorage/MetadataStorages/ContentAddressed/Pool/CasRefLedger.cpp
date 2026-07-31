@@ -496,6 +496,20 @@ std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::getRefTableRuntime(
     return slot;
 }
 
+std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::pinRefTableRuntimeToLife(
+    const NamespaceLifeId & life)
+{
+    auto rt = getRefTableRuntime(life.ns);
+    std::lock_guard lock(rt->state_mutex);
+    if (rt->life && *rt->life != life)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS namespace '{}': runtime is already pinned to incarnation {}, refusing exact-life "
+            "operation for incarnation {}",
+            life.ns.string(), renderIncarnation(rt->life->incarnation), renderIncarnation(life.incarnation));
+    rt->life = life;
+    return rt;
+}
+
 void CasRefLedger::checkRecoveryStillAdmitted(const RootNamespace & ns, RefTableRuntime & rt,
                                               bool & cancelled) const
 {
@@ -4148,6 +4162,12 @@ bool CasRefLedger::namespaceIsRemoved(const RootNamespace & ns)
     return rt->state.getLifecycle() != RefLifecycle::Live && rt->state.getRemoveTxnId().has_value();
 }
 
+bool CasRefLedger::namespaceIsRemoved(const NamespaceLifeId & life)
+{
+    (void)pinRefTableRuntimeToLife(life);
+    return namespaceIsRemoved(life.ns);
+}
+
 
 NamespaceLifeId CasRefLedger::lifeUnderLock(const RootNamespace & ns, const RefTableRuntime & rt) const
 {
@@ -4293,6 +4313,11 @@ DropNamespaceStats CasRefLedger::dropNamespace(const RootNamespace & ns)
     return stats;
 }
 
+DropNamespaceStats CasRefLedger::dropNamespace(const NamespaceLifeId & life)
+{
+    (void)pinRefTableRuntimeToLife(life);
+    return dropNamespace(life.ns);
+}
 
 
 }
