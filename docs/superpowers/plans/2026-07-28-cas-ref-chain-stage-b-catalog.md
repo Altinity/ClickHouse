@@ -74,25 +74,28 @@ Constraints 1-11 of the Stage A plan
 (`2026-07-28-cas-ref-chain-stage-a-streams.md {#global-constraints}`) apply VERBATIM to every
 task here. Additional Stage-B constraints:
 
-12. **[AMENDED 2026-07-29]** The incarnation qualifies THE REF LAYER AND NAMESPACE FILES:
-    `<ns>/<inc>/{_log,_snap,_cleanup,_ckpt}` (`_cleanup` added by Task-1 review Important-2: the
-    cleanup marker builds through the same life-scoped prefix and is one of
-    `parseRefObjectKey`'s three kinds; a marker surviving into the next life would fake a
-    completed removal, the exact rebirth alias INV-3 closes) AND
-    `<ns>/<inc>/_files/<relative-name>` (directive §2 — the original ref-layer-only boundary left
-    the hole that an old file omitted by LIST survives namespace removal and becomes visible
-    after the same logical namespace is created again). Explicitly UNCHANGED, both directions:
+12. **[AMENDED 2026-07-31]** The catalog entry's incarnation is the opaque physical `life_id` for
+    THE REF LAYER AND NAMESPACE FILES. The logical `RootNamespace` remains in the catalog and in the
+    in-memory `NamespaceLifeId`, but it is absent from life-owned object keys. Immutable stream
+    objects live at `cas/ns/stream/<life_id>/{_log,_snap,_cleanup}` (`_cleanup` exists only until
+    Task 5 deletes the class); point/path-addressed state lives at
+    `cas/ns/state/<life_id>/{_ckpt,_files}`. The split is by access pattern, not by ownership: both
+    prefixes are under the one logical `cas/ns/` ownership tree, while only `stream/` is enumerated
+    on every fold round. A new birth of the same logical name gets a new `life_id`, so a LIST-hidden
+    old file remains structurally unreachable. Explicitly UNCHANGED, both directions:
     manifests keep `(namespace, mount-epoch, build-sequence)` identity and their existing
     globally unique build identities; LOOSE MOUNTPOINT OBJECTS stay outside namespace ownership
     and unqualified (they are why the plain-object component survives — Constraint 17); and the
     current DIRECT-OBJECT implementation of namespace files stays as it is — this amendment
     changes object identity, never file persistence.
 13. Catalog admission refuses loudly; removal is NEVER refused (spec INV-3).
-14. Format bump B (Task 4) is Stage B's single recreate-only bump — one bump, all re-keying
-    behind it, ref keys and `_files` keys alike (Task 4b rides Task 4's bump; it does NOT add a
-    second one). Legacy unqualified ref AND `_files` keys are rejected as corruption, not
-    migrated (directive: "Keep the existing format-bump-B recreate-only migration; reject legacy
-    unqualified keys").
+14. Format bump B (`generation=5`, Task 4) and Task 4b are already-landed development
+    intermediates. Task 4d owns ONE final recreate-only layout bump (`generation=6`) that removes
+    the logical name from physical life keys and introduces `stream/` + `state/`; Task 5's codec
+    changes ride generation 6 and do NOT bump again. There is no migration or dual reader: every
+    older life-key grammar, including generation-5 `<ns>/<inc>/` keys, is rejected with the pool and
+    the pool is recreated. Goldens are regenerated once for Task 4d's layout cut and then adjusted
+    only for Task 5's wire-field deletion, not for another generation.
 15. **`_ckpt` stays `O(1)` [directive §4, verbatim]:** "`_ckpt` must remain a fixed-size product
     of scalar monotone facts. Its encoded size must be `O(1)` in the number of refs, files,
     transactions and writer epochs. Do not add maps, collections or cardinality-growing fields.
@@ -197,30 +200,32 @@ while its body names a consequence — split those, and send the behaviour to `B
 | 4 | Re-key ref layer under `<ns>/<inc>/`; universe from catalog; format bump B | INV-3/§5 | 1c,2,3 |
 | 4b | Re-key namespace files under `<ns>/<inc>/_files/`; rebirth waits for nothing | directive §2 | 4 |
 | 4c | `_ckpt` strengthened: `O(1)` invariant + corruption-on-conflict join | directive §4 | 4 |
-| 5 | Removal lifecycle: terminal record, janitor, deposited-incarnation cleanup | §3 + directive §2 | 3,4,4b |
+| 4d | Opaque physical `life_id`; split `cas/ns/stream` from `cas/ns/state` | layout amendment | 4b,4c |
+| 5 | Removal lifecycle: terminal record, janitor, deposited-incarnation cleanup | §3 + directive §2 | 3,4d |
 | 5b | `chooseRecoveryGrounding` + LIST-independent recovery + the LIST audit | directive §3/impl-2 | 4c,5 |
-| 6 | Read-side contract: handles, pre-delete revalidation, namespace-file read/write closure | §2 + directive | 4,4b |
+| 6 | Read-side contract: handles, pre-delete revalidation, namespace-file read/write closure | §2 + directive | 4d |
 | 6b | `trySnapshotPublishOnce` → `tryPublishSnapshotAndAdvanceCheckpointOnce` | directive impl-3 | 4c,6 |
-| 7 | R5 decommission duties | register R5 | 4,5 |
-| 7a | DELETE probe A — the second full ref LIST and everything that serves it | GC directive §1 | 4,5b |
-| 7b | Destruction enablement: `UniversePolicy::kDefault` → authoritative | staging contract + GC directive §2 | 4,5,6,7,7a |
-| 8 | R2+R3: writer duty queue + orphan-blob nomination (one coherent change) + model extensions | register R2/R3, §9 | 4 |
-| 9 | R1 closure note (verbatim-file rebirth aliasing) — doc only, RE-SCOPED | register R1 | 4b,6 |
+| 7 | R5 decommission duties | register R5 | 4d,5 |
+| 7a | DELETE probe A — the second full stream LIST and everything that serves it | GC directive §1 | 4d,5b |
+| 7b | Destruction enablement: `UniversePolicy::kDefault` → authoritative | staging contract + GC directive §2 | 4d,5,6,7,7a |
+| 8 | R2+R3: writer duty queue + orphan-blob nomination (one coherent change) + model extensions | register R2/R3, §9 | 4d |
+| 9 | R1 closure note (verbatim-file rebirth aliasing) — doc only, RE-SCOPED | register R1 | 4d,6 |
 | 10 | TLA debt: `listedTok` audit, unasserted drivers, runnerless models, classifier | phase follow-ups | — |
 | 11 | Stage B gates: battery + churn/rebirth/decommission soak + the sequential-baseline destructive soak + verdict | §9 + GC directive §3 | all |
 | 12 | GC performance research on the destructive baseline + the successor report | GC directive deliverable | 11 |
 | 13 | Post-Stage-B: split the two 4000-line files, goldens FIRST | refactor candidates | 12 |
 
-Task 10 is independent of the code chain and may be scheduled at any point (still one implementer
-at a time). Task 9 is doc-only but is no longer schedule-free: the re-key must exist before it can
-record where each R1 sub-hazard went. Task 11's soak REQUIRES Task 7b (destruction enabled) — a
+Task 10 is independent of the code chain and may be scheduled at any point; its sub-tasks obey the
+file-ownership split in `{#parallel-execution-lanes}`. Task 9 is doc-only but is no longer
+schedule-free: the re-key must exist before it can record where each R1 sub-hazard went. Task 11's
+soak REQUIRES Task 7b (destruction enabled) — a
 soak with destruction still suppressed does not exercise Stage B's claims. Task 12 requires Task 11's
 soak ARTIFACTS, not merely its verdict.
 
 **Recommended execution order** (a topological order of the column above; the directive's
 §Execution commit list is honored in its own relative order):
 
-`1b → 1c → 2 → 3 → 4 → 4b → 4c → 5 → 7 → 5b → 6 → 6b → 7a → 7b`, with Task 8 anywhere after Task 4,
+`1b → 1c → 2 → 3 → 4 → 4b → 4c → 4d → 5 → 7 → 5b → 6 → 6b → 7a → 7b`, with Task 8 anywhere after Task 4d,
 Task 9 after Task 6, Task 10 anywhere, then Task 11 and finally Task 12.
 
 **The GC tail (Tasks 7a → 7b → 11's destructive soak → 12) is a SEQUENCE, not a set**, and the
@@ -230,7 +235,8 @@ either. Constraint 18 keeps the implementation sequential so the soak produces a
 round's `MultiDelete`/concurrency work can be measured against.
 
 Directive commit → task: (2) pure preparation → **1b**; (3) general namespace-life identity →
-**1c**; (4) ref and file re-keying → **4** (refs, already planned) + **4b** (files); (5)
+**1c**; (4) ref and file re-keying → **4** (refs, already planned) + **4b** (files), with their
+physical generation-5 placement superseded by **4d** while their life-aware APIs survive; (5)
 strengthened `_ckpt` → **4c**; (6) recovery grounding → **5b**; (7) cleanup/read-side closure →
 **5** (cleanup half) + **6** (read/write half); (8) snapshot naming or split → **6b**.
 
@@ -242,6 +248,59 @@ Two scheduling notes, both deliberate:
   forces Task 6 before Task 7, so this costs nothing.
 - The directive's items (6) recovery grounding and (7) cleanup/read-side closure are mutually
   independent; the order above keeps the directive's relative order anyway.
+
+## Parallel execution lanes {#parallel-execution-lanes}
+
+Time pressure does not make two writers in `CasGc.cpp` or `CasRefLedger.cpp` independent. The critical
+path remains `4d → 5 → (7 ∥ 5b, with 7 integrated before 5b closes) → 7a → 7b → 11`; commits enter the
+integration branch in dependency order. Work may run concurrently only from the same committed base,
+with explicit file ownership and sequential integration. A shared dirty worktree is not a parallelism
+mechanism.
+
+**Wave P0 — start beside Task 4d:**
+- One owner implements Task 4d's core (`CasLayout`, physical parsers, catalog reverse index and mount
+  safety). Do not split those interfaces across workers.
+- After that owner freezes the two prefix helpers and expected literal grammar, a mechanical lane may
+  update layout goldens, test literals, integration prefix constants, soak classifiers and prose. It
+  owns no production `.cpp` file and rebases nothing; its commit is applied after the core layout
+  commit and any failures are fixed in the owning layer rather than hidden with compatibility aliases.
+- Task 10d/10e/10g and the runner/report portions of Task 10a-c are model-tree work and may proceed in
+  a separate worktree. Task 10f and edits to `CaRefCatalogCore`, `CaRefDeltaIntakeCore` or
+  `CaRefNsCleanupStaleLeaderCore` wait for Task 5's model commit because Task 5 owns those exact files.
+- Task 11's report skeleton, suite inventory, artifact directories and an exploratory tidy build may
+  start now. Final gates and the authoritative tidy verdict still rerun after Task 7b.
+
+**Wave P1 — after Task 4d is integrated:**
+- Task 5 is the sole owner of `CasGc.cpp`, catalog lifecycle code, fold-seal cleanup grammar and the
+  three removal models. No other production task edits those files concurrently.
+- Task 4d-specific tool/test cleanup that was not needed for its gate may continue only in files Task 5
+  does not name. Task 8 is logically enabled but is a poor parallel candidate: it overlaps both
+  `CasGc.cpp` and `CasRefLedger.cpp`, so defer it unless it has a dedicated worktree and an owner willing
+  to integrate after the critical path rather than merge speculative conflicts into it.
+
+**Wave P2 — after Task 5 is integrated:**
+- Task 7 (decommission) and Task 5b (recovery grounding) may run concurrently from the same Task-5
+  commit. Task 7 owns `CasDecommission` plus its new tests; Task 5b owns `CasRefLedger`,
+  `CasRefProtocol`, recovery tests and the LIST residual. Shared catalog/finalizer interfaces are frozen
+  by Task 5; neither lane changes them. Integrate Task 7 first only because its dead-root owner is a
+  prerequisite for declaring Task 5b complete.
+- Task 6 may replace Task 5b as Task 7's parallel partner, but it may not be a third production lane:
+  both Task 6 and Task 5b rewrite `CasRefLedger`/`CasRefProtocol` recovery and handle seams. The critical
+  schedule chooses Task 5b. If elapsed time matters, give Task 6's namespace-file tests and
+  request-profile audit to a test-only lane while Task 5b owns production code.
+
+**Wave P3 — after Task 5b is integrated:**
+- Task 7a is primarily `CasGc`/settings/soak cleanup and may run beside Task 6's reader/namespace-file
+  implementation. `CasPool.h` is the one expected collision; assign it to Task 6 and let Task 7a delete
+  its obsolete setting in a small follow-up after Task 6 lands.
+- Task 9's documentation-only closure may run as soon as Task 6's final diff is known. Task 6b waits for
+  Task 6 and remains single-owner in `CasRefLedger`.
+- Gate harness preparation and long non-authoritative baseline captures may run continuously; no result
+  taken before Task 7b substitutes for Task 11's final battery or destructive soak.
+
+This schedule gives useful parallelism without stacked PRs: every externally reviewed change still
+targets `master`; local worktrees produce ordinary commits that are integrated onto this one feature
+branch in dependency order.
 
 ---
 
@@ -586,7 +645,9 @@ surface, plus the one requirement Task 1 did not have (no implicit conversion to
   without it. Flagged by the implementer against their own earlier under-rating of the fsck half.
 - Create (in `CasLayout.h`/`.cpp`): `parseNamespaceFileKey` — the `_files` mirror of
   `parseRefObjectKey`, returning `(NamespaceLifeId, relative-name)`; the janitor (Task 5) needs it to
-  classify keys from its bounded pool-wide `rootsPrefix` scan
+  classify keys from its bounded pool-wide `rootsPrefix` scan. **Historical generation-5 shape:**
+  Task 4d later changes the returned identity to physical `life_id` and moves the scan to `cas/ns/`;
+  do not copy this executed Task-1c signature into new code.
 - Modify: `.../Pool/CasPlainObjects.h`/`.cpp` — `putNamespaceFile` (`.h:48`/`.cpp:93`),
   `getNamespaceFile` (`.cpp:98`), `listNamespaceFiles` (`.h:57`/`.cpp:103`), `removeNamespaceFile`
   (`.h:61`/`.cpp:127`) all take `NamespaceLifeId`; `.../Pool/CasPool.h` forwarders (`:543-549`)
@@ -1103,6 +1164,136 @@ exception. Hence: depends on Task 4, and its behaviour half MAY NOT be cherry-pi
 - [ ] **Step 2:** → FAIL. **Step 3:** Implement. **Step 4:** Full CA gate green. **Step 5: Commit**
   `ca: ref — _ckpt: O(1) invariant stated, conflicting life_epoch is corruption`.
 
+### Task 4d: opaque physical `life_id`; split stream from state {#task-4d}
+
+**Why this is a task and not another bullet in removal.** Tasks 4/4b correctly made every operation
+life-aware, but their generation-5 physical grammar repeats the opaque logical namespace in every key
+and forces the fold's one global LIST to enumerate namespace files too. Removal is only one consumer of
+that grammar: recovery, fsck, REBUILD, mount safety and decommission all parse or derive it. This task
+therefore establishes the final physical identity before Task 5 consumes it; Task 5 owns lifecycle and
+cleanup policy, not another layout transition.
+
+**The final grammar.** The current catalog field `incarnation` IS the physical `life_id`; this task does
+not rename the field, change the catalog wire shape, replace `NamespaceLifeId`, or mass-edit ordinary
+reader/writer signatures. The logical pair remains useful in memory. Only object keys drop `.ns`:
+
+```text
+cas/ns/stream/<life_id>/_log/<txn>.zst
+cas/ns/stream/<life_id>/_snap/<txn>.zst
+cas/ns/stream/<life_id>/_cleanup/<txn>       # transitional; Task 5 deletes the class
+cas/ns/state/<life_id>/_ckpt.zst
+cas/ns/state/<life_id>/_files/<relative-name>
+```
+
+`_snap` is deliberately in `stream/`: it is immutable, sequence-addressed by `RefTxnId`, is already
+grouped with logs for recovery hints and covered-object cleanup, and is cheap beside `_files`. Moving it
+to `state/` would require either a second hot LIST or a simultaneous recovery/cleanup redesign. The
+split is therefore immutable stream objects versus point/path-addressed state, not "logs versus all
+other objects".
+
+**Files:**
+- Modify first: `docs/superpowers/specs/2026-07-27-cas-ref-chain-complete-cut-design.md` — INV-3
+  physical grammar, mount-safety premise, one hot stream LIST, one paced ownership-tree janitor and
+  the cost table. The current "one life, one physical subtree" derivation is superseded, not left
+  beside the new one.
+- Modify: `.../Formats/CasLayout.h`/`.cpp`, `.../Primitives/CasNamespaceLifeId.h`,
+  `.../Formats/CasPoolMetaFormat.cpp`, `.../Formats/README.md`
+- Modify: `.../Gc/CasGc.h`/`.cpp` (the round scan and reverse catalog index),
+  `.../Pool/CasRefProtocol.h`/`.cpp`, `.../Tools/CasFsck.cpp`, `.../Tools/CasInspect.cpp`,
+  `.../Tools/CasDecommission.cpp` (listed-key consumers only)
+- Modify: `.../Pool/CasServerRoot.h`/`.cpp` and its pool-open callers (the mount-safety seam)
+- Modify mechanically: layout goldens, key-shape tests, integration prefix expectations and soak
+  classifiers. Do not rename `incarnation` or `NamespaceLifeId` in this task; that creates broad churn
+  without changing an invariant.
+
+**Interfaces:**
+```cpp
+using NamespaceLifePhysicalId = UInt128;
+
+struct ParsedRefObjectKey
+{
+    NamespaceLifePhysicalId life_id;
+    RefObjectKind kind;
+    RefTxnId txn_id;
+};
+
+struct ParsedNamespaceFileKey
+{
+    NamespaceLifePhysicalId life_id;
+    String relative_name;
+};
+
+String namespaceStreamPrefix(const NamespaceLifeId & life) const;
+String namespaceStatePrefix(const NamespaceLifeId & life) const;
+```
+
+`parseRefCkptKey` analogously returns the physical id. Keep these three existing family parsers rather
+than inventing a tagged union: their payloads and error contracts differ, and retaining their names is
+what makes the call-site rewrite mechanical.
+
+The existing point-key API remains source-compatible: `refLogKey`, `refSnapshotKey`, `refCkptKey`,
+`namespaceFileKey` and `namespaceFilesPrefix` still take a `NamespaceLifeId`; their implementations use
+only `.incarnation`. A listed key can no longer reconstruct a logical name. Every catalog consumer
+builds once per immutable cut an exact reverse index
+`life_id → NamespaceLifeId{name, incarnation}`. A duplicate current `life_id` is `CORRUPTED_DATA`, not
+"first row wins". A `life_id` is never deliberately reused; the existing random-128 incarnation
+uniqueness assumption now applies pool-wide rather than per logical name. A listed id absent from the
+fresh authority cut is inert debris; `_path` must never be invented as a replacement authority.
+
+- [ ] **Step 0: amend the authority before code.** Land the spec change and its explicit rejected
+  alternative: removing the full LIST in favour of an unbounded serial `GET N+1` chase has no bounded
+  frontier under a continuously writing namespace and loses the listing's scheduling witness; adding
+  an authoritative head would put a CAS on the append path. The adopted hybrid is catalog universe +
+  one `LIST(cas/ns/stream/)` scheduling hint + exact arithmetic reads/frontier probe + a separately
+  paced leak-only `LIST(cas/ns/)`. No code starts while the authority still requires the old subtree.
+- [ ] **Step 1: separate parsing from logical resolution while generation 5 still runs.** Change the
+  listed-key parsers to return physical id + kind + id, build the reverse catalog index, and resolve
+  current objects through it. During this preparatory step the old key still contains a logical name;
+  parse it only to assert that a current catalog resolution names the same row, never to supply missing
+  catalog state. **Tests:** two catalog rows with one current id fail closed; an id absent from the cut
+  classifies as debris; changing only the namespace spelling in an old-format key cannot redirect an
+  operation; all point readers/writers retain identical request counts.
+- [ ] **Step 2: introduce the two prefixes behind existing builders.** Add
+  `namespaceStreamPrefix`/`namespaceStatePrefix`; route `_log`, `_snap` and transitional `_cleanup` to
+  the first, `_ckpt` and `_files` to the second. Delete `refsNamespacePrefix`, `casRefsServerPrefix`
+  and every parser branch that tries to recover an opaque, multi-segment namespace from a physical
+  life key. This is the deliberately mechanical step: callers of the five point builders do not
+  change, while comments/goldens/prefix literals are bulk-rewritten then reviewed by family.
+- [ ] **Step 3: make the round's one hot enumeration exact in scope.** `enumerateRefPrefix`, defer
+  accounting, fold grouping and probe A (until Task 7a deletes it) LIST only `cas/ns/stream/`.
+  Plant `_files` and `_ckpt` objects and assert from the backend journal that neither is enumerated;
+  plant `_log` plus `_snap` and assert both are offered. LIST remains a scheduling/performance hint;
+  catalog + arithmetic exact reads remain the correctness path.
+- [ ] **Step 4: replace the server-root physical-prefix premise.** A `server_root_id` has owned live
+  namespace work iff the mandatory catalog contains a `Creating`, `Live`, `Removing` or
+  `RemovalReady` logical name under that root. `serverRootSubtreeEmpty` still probes
+  `cas/manifests/<srid>/` and `roots/<srid>/`, because those families retain path identity, but no
+  `cas/ns/<srid>/` prefix exists. Thread the catalog observation from the pool layer rather than making
+  the low-level server-root module silently decode an optional catalog. Missing/unreadable catalog after
+  pool creation is fail-closed; only the existing proven-new-pool bootstrap may initialize it.
+  **Tests:** every catalog state blocks owner/epoch recreation; dead opaque stream/state debris alone
+  does not; manifest-only and loose-root-only debris still block; unreadable catalog does not fall back
+  to physical guesses.
+- [ ] **Step 5: rewire recovery tools, not authority.** fsck, REBUILD, inspect and decommission group a
+  listed object by physical id and join it to the catalog cut. REBUILD constructs cursors only for ids
+  named by that cut; an absent id is reported/nominated as debris, not converted into a phantom logical
+  namespace merely because REBUILD condemns nothing. Neither a listed key nor any future `_path` may
+  mint a catalog row or authorize a read/delete. Decommission enumerates owned logical names exactly
+  from the catalog; it never tries to recover `server_root_id` from a life key.
+- [ ] **Step 6: format cut and generation pins.** Advance pool generation 5→6 once; generation-5
+  `<ns>/<inc>/` pools refuse with a recreate message. There is no dual parser, copy-forward or fallback.
+  Regenerate the layout/generation goldens and assert literal `RootNamespace` text is absent from every
+  new stream/state key. Task 5's subsequent catalog/fold-seal codec edits ride generation 6.
+- [ ] **Step 7: gate and commit.** Full CA battery, both object-storage lanes and the namespace-file
+  request-profile test remain green. Commit
+  `ca: layout — opaque life ids split namespace streams from state`.
+
+**Deliberately deferred.** Do not create `roots/<path>` pointer objects in this task: no production
+reader consumes them, and a backup that can be mistaken for authority is worse than no backup. Likewise
+do not add `_path` merely because the leaf is available. A later `CasInspect` change may add an immutable,
+diagnostic-only `_path` together with its reader and explicit stale/missing behaviour; the catalog
+already provides complete introspection for active lives.
+
 ### Task 5: Removal lifecycle — the transient `RemovalReady` state {#task-5}
 
 **Second rewrite, 2026-07-31.** The first rewrite derived everything from "the catalog entry is deleted
@@ -1127,7 +1318,7 @@ test. This list failed to exist twice today, which is why it is here rather than
 **Files:**
 - Modify: `.../Formats/CasRefCatalogFormat.{h,cpp}` (the fourth state and its codec),
   `.../Formats/CasFoldSealFormat.{h,cpp}` (the now-single-state cleanup-item grammar),
-  `.../Formats/CasGcStateFormat.{h,cpp}` (the cleanup-only `_files` scan cursor),
+  `.../Formats/CasGcStateFormat.{h,cpp}` (the one cleanup-only `cas/ns/` scan cursor),
   `.../Pool/CasRefCatalog.{h,cpp}`, `.../Pool/CasRefLedger.{h,cpp}`, `.../Pool/CasPool.{h,cpp}`,
   `.../Gc/CasGc.cpp`, `.../Gc/CasGcShardPlan.h`, `.../Tools/CasFsck.cpp` (REBUILD's universe)
 - Create: `src/Disks/tests/gtest_cas_ns_removal_lifecycle.cpp`
@@ -1135,9 +1326,9 @@ test. This list failed to exist twice today, which is why it is here rather than
   `CaRefNsCleanupStaleLeaderCore.tla`
 
 **Interfaces:**
-- Consumes: Tasks 2–4c, and step 1 below, which is already landed as `a600c2e433c`.
+- Consumes: Tasks 2–4d, and step 1 below, which is already landed as `a600c2e433c`.
 - Produces: the fourth state; the five-site predicate; the typed retryable refusal; `CREATE`-side
-  finalization of already-`RemovalReady` rows; the two-source perpetual janitor; the reader-absence
+  finalization of already-`RemovalReady` rows; the paced perpetual janitor; the reader-absence
   predicate answered from the catalog cut.
 
 #### Step 1 — reads and removals stop minting (LANDED, `a600c2e433c`) {#t5-step1}
@@ -1199,12 +1390,13 @@ One test per site. A missed site voids the monotonicity claim, so a passing subs
 - [ ] **Parent-cursor carry** — consult the state per **carried cursor**, not only per walked target.
   These are different loops; conflating them was how the ordering-only design failed.
 - [ ] **Hint-named namespaces** — surviving debris is still listed, so the round's hint names a
-  `RemovalReady` namespace. Like `Creating`, it is cataloged but not walkable, distinct from both
-  `Live`/`Removing` and absent. The intake classification must preserve that state rather than treating
-  it as walkable or as entry-less debris.
+  physical `life_id` whose reverse catalog row is `RemovalReady`. Like `Creating`, it is cataloged but
+  not walkable, distinct from both `Live`/`Removing` and an id absent from the reverse index. The intake
+  classification must preserve that state rather than treating it as walkable or as dead-life debris;
+  no key supplies a logical namespace after Task 4d.
 - [ ] **REBUILD** — it rebuilds cursors from catalog + `_ckpt` + arithmetic tails, and `_ckpt` outlives
-  the transition, so an unfiltered REBUILD resurrects the cursor. Untouched by key format; it must gain
-  the predicate.
+  the transition, so an unfiltered REBUILD resurrects the cursor. Task 4d already moved its physical
+  lookup to catalog `life_id`; this task adds the lifecycle predicate without changing that lookup.
 - [ ] **Carried holds** — covered by step 2's precondition; the test here is that no hold path admits a
   `RemovalReady` walk.
 - [ ] **The one transition-owning seal.** The round that earns and performs the transition took its
@@ -1287,40 +1479,41 @@ One test per site. A missed site voids the monotonicity claim, so a passing subs
 
 #### Step 8 — the perpetual janitor {#t5-step8}
 
-- [ ] **ONE discovery source, because the layout change makes a life one subtree.** Every family of a
-  life — `_log`, `_snap`, `_ckpt`, `_files` — now lives below `cas/ns/<ns>/<inc>/`, so the round's
-  existing pool-wide enumeration of that tree nominates all of it. Consult both `parseRefObjectKey` and
-  `parseRefCkptKey` so a never-born life's lone `_ckpt` is not misclassified as foreign, and the
-  namespace-file parser for the `_files` arm. **No second scan, no janitor cursor, no pacing** — the
-  earlier two-source design existed only because `_files` sat in a tree the round does not own, and it
-  is deleted rather than tuned. Keep the work in the existing `namespace_cleanup` phase and add
-  `janitor_keys`/`janitor_deleted` metrics so it is visible in Task 11's cost inventory.
-- [ ] **The layout move itself** (prerequisite, and it touches Task 4b's landed keys): the life's
-  subtree is renamed `cas/refs/` → `cas/ns/` and `namespaceFilesPrefix` becomes
-  `cas/ns/<ns>/<inc>/_files/`. The inverse parser that classified listed `roots/` keys by a reserved
-  `_files` segment is DELETED — nothing under `roots/` carries a life. Format generation bumps; the
-  branch is recreate-only pre-release, so no migration, and the goldens are regenerated once.
-  **Verify, do not assume:** the mount-safety empty-root precondition lists three subtrees
-  (`cas/ns/<srid>/`, `cas/manifests/<srid>/`, `roots/<srid>/`) and a life's files must stay inside a
-  checked one — pin that with a test, because the whole point of the check is that an owner cannot be
-  re-created over surviving data. Also re-point `CasPool`'s `roots/`-based mirrored-children and
-  `shadow/` traversals, and the layout doc block in `CasLayout.h`, which enumerates the families.
-- [ ] **One pure classifier and the per-key destructive fence.** Given the round's catalog snapshot and
-  a parsed `NamespaceLifeId`, delete only when the row is absent or names a different incarnation;
-  `Creating`, `Live`, `Removing` and `RemovalReady` of that exact life are all retained. Immediately
-  before every `deleteExact`, re-read the catalog and revalidate the same fact plus the GC fence. A
-  token mismatch retains and surfaces. An unparseable key is anomaly-and-continue; a legitimate loose
-  mountpoint object under `roots/` is simply outside the `_files` grammar and is skipped.
+- [ ] **One bounded scan over the ownership tree, separate from the hot stream LIST.** Task 4d makes the
+  round's correctness/performance enumeration `LIST(cas/ns/stream/)`; it deliberately does not pay for
+  `_files` or `_ckpt`. The janitor alone walks `LIST(cas/ns/)`, at a fixed page/key budget per round,
+  storing ONE cleanup-only backend cursor in `gc/state`. The cursor is opaque, size-bounded and reset at
+  end-of-tree so a later cycle can see an object omitted from an earlier one. Invalid/oversized cursors
+  surface and restart from the beginning; losing progress repeats work and cannot authorize deletion.
+  Keep the work in `namespace_cleanup`; publish `janitor_pages`, `janitor_keys` and
+  `janitor_deleted` for Task 11's inventory.
+- [ ] **One physical classifier, joined to the catalog authority.** Parse the fixed family and
+  `life_id`; do not reconstruct a `RootNamespace` from the key and do not consult `_path`. The immutable
+  round cut's reverse index classifies an id currently named by any `Creating`, `Live`, `Removing` or
+  `RemovalReady` row as retained. An absent id is a dead-life candidate. A malformed key under either
+  namespace family is anomaly-and-continue; a loose object under `roots/` is outside this scan entirely.
+- [ ] **Creation-before-object ordering closes the new-life race.** Catalog `Creating{name→life_id}` is
+  durable before any stream/state object of that id. The janitor orders each page as
+  `LIST page → fresh catalog GET/decode → classify page → exact-token deletes under the GC fence`.
+  One catalog read PER PAGE is sufficient and is the required shape: an object already returned by the
+  LIST but absent from the later cut cannot belong to a concurrent creation, because that creation's row
+  would have preceded the object; a creation after the cut cannot have placed an object into the earlier
+  page. Do not reintroduce one catalog GET per key. A duplicate current id is the Task-4d catalog
+  corruption path and suppresses the page's deletes; exact-token mismatch retains a stale-writer rewrite.
 - [ ] The janitor is **perpetual**, not the single bounded attempt of step 4: it is the only reclaimer of
-  a dead life's objects, and folding it into one pass would make a LIST omission a permanent leak by
-  design. Suppression performs no delete; the next round revisits the key.
-- [ ] **Tests:** a suppressed round deletes nothing; a token mismatch retains; an unparseable canonical
-  ref or `_files` key records and continues while a loose root object does not; restart mid-scan resumes
-  from the durable cleanup cursor; a cursor-update CAS failure does not fail removal; and a removed
-  namespace whose ONLY residue is `_files`, omitted for one complete scan cycle and returned in the
-  next, is eventually reclaimed. Assert **bytes were actually deleted**, not merely that its cleanup
-  item exists. Add the symmetric `_ckpt`-only case produced by a stop after stalled-`Creating`
-  cancellation; it must be reclaimed without a namespace cleanup item.
+  a dead life's objects after the catalog row that named the id has gone. Folding it into removal would
+  make a LIST omission a permanent leak; retaining the row until physical emptiness would put storage
+  liveness back on the lifecycle path. Suppression performs no delete, cursor progress may still be
+  retained only under the existing safe publication order, and a later cycle retries the key.
+- [ ] **Tests:** a suppressed round deletes nothing; a token mismatch retains; an unparseable stream or
+  state key records and continues; restart mid-scan resumes from the durable cursor; end-of-tree resets
+  it; invalid and oversized backend cursors restart safely; cursor-update CAS failure does not fail
+  removal; and a removed namespace whose ONLY residue is `_files`, omitted for one complete cycle and
+  returned in the next, is eventually reclaimed. Assert **bytes were actually deleted**, not merely
+  that its cleanup item exists. Add the symmetric `_ckpt`-only case produced by a stop after stalled
+  `Creating` cancellation, plus a catalog-first concurrent creation whose new object is never deleted.
+  The concurrent-creation test records exactly one janitor catalog GET for a multi-key page, so the
+  page-cut proof cannot regress into O(keys) point revalidation.
 
 #### Step 9 — the `_cleanup` class and the `Removed` snapshot die together {#t5-step9}
 
@@ -1461,7 +1654,9 @@ RecoveryGrounding chooseRecoveryGrounding(const CatalogEntry & catalog_state,
   with or without `_ckpt`, and is routed to the removal/decommission finalizer; a missing required
   `_ckpt` in `Live` or `Removing` is corruption."
 - What LIST may STILL do, verbatim: "offer a newer snapshot candidate; provide additional diagnostic
-  witnesses; nominate garbage for cleanup." What it may not: "determine genesis or committed history."
+  witnesses; nominate garbage for cleanup." The hot hint is Task 4d's one
+  `LIST(cas/ns/stream/)`, which deliberately includes immutable `_log` and `_snap` but excludes
+  `_ckpt` and `_files`. What it may not: "determine genesis or committed history."
 - **Honest finding, already true at Stage A:** the directive's "Never fabricate `life_epoch` with
   `value_or`" is ALREADY satisfied on the writer path — `CasRefLedger.cpp:646` and `:788` carry
   explicit comments saying the omission is deliberate. This task therefore VERIFIES and FENCES it (a
@@ -1585,14 +1780,13 @@ reads and writes use an already-held life handle" needs the handle to exist.]
 - Live readers hold `NamespaceLifeId` handles and can never alias a new life (foreign prefix);
   a stale reader gets stale-or-`NotFound`, NEVER rejection (no fence/catalog read on hot
   paths — the read side pays zero new requests).
-- Destructive cleanup revalidates life and fence IMMEDIATELY before every delete — and since
-  the backend exposes only PER-KEY `deleteExact` (no atomic batch delete), "before every
-  delete" means per key, not per planning batch [codex finding 14]: the janitor and
-  `cleanupRefObjects` re-read the catalog entry token and re-check the fence before EACH
-  `deleteExact`; the token/fence read may be cached only within a span where the check itself
-  proves nothing destructive-relevant can have changed (in practice: re-read per key; if a
-  measured hot spot ever demands batching, that is a protocol change needing its own review,
-  not an optimization).
+- Destructive cleanup of a CURRENT catalog life revalidates life and fence immediately before every
+  per-key `deleteExact`; a catalog transition can change what that key means between two deletes.
+  Task 5's dead-life janitor is the explicit exception proved by stronger ordering: it takes a fresh
+  catalog cut AFTER each LIST page, and catalog-before-object publication plus non-reused `life_id`
+  protects every candidate already present in that page. It still checks the GC fence and uses
+  exact-token delete per key, but it does not perform O(keys) catalog GETs. Do not generalize that
+  page-cut optimization to `cleanupRefObjects`, whose target is still a current life.
 
 **Interfaces (amendment — namespace-file implementation requirements, directive verbatim except the
 annotations):**
@@ -1693,19 +1887,16 @@ stay here and keep their review):
 
 - [ ] **The decommission test's assertion does not establish what its comment claims.**
   `gtest_cas_decommission.cpp`, `CasDecommission.LifelessKeyRefusesTheWholeCommandFailClose` asserts
-  `!backend->list(Layout("p").casRefsPrefix() + "victim/", …).keys.empty()` under the comment "the
-  healthy namespace's refs are untouched" — but the planted lifeless key sits under that very prefix,
-  so the assertion passes even if the healthy namespace had been fully drained. Assert on the healthy
-  namespace's `refsNamespacePrefix(...)`, or on `report.namespaces_removed`.
-- [ ] **A vestigial guard implies a return the parser cannot produce.** `Pool::listNamespaces`'s roots
-  loop tests `!ns_str->empty()`, but `Layout::namespaceLifeOf` throws `CORRUPTED_DATA` on an empty
-  namespace part, so `parseNamespaceFileKey` can never yield one. Leftover of the hand-split it
-  replaced; delete it.
-- [ ] **The pre-flight LIST base is loose.** `CasDecommission.cpp`'s `decommissionPoolMember` passes
-  `victim_srid` with no trailing `/`, so the base `…/cas/refs/victim` also matches `victim2/…`. The
-  looseness predates Task 1c; the new fail-close gave it a new consequence — a lifeless key under a
-  SIBLING srid now refuses this srid's decommission. Not a free edit: adding the `/` also changes
-  which namespaces get drained, so pin that change with a test.
+  a broad listed prefix under the comment "the healthy namespace's refs are untouched" — but the
+  planted lifeless key itself satisfies that assertion. After Task 4d no victim-name physical prefix
+  exists at all. Assert the healthy row remains in the exact catalog cut and its known stream/state
+  keys retain their exact tokens, or assert `report.namespaces_removed`; never replace the old check
+  with a scan for `victim` text inside opaque-id paths.
+- [ ] **The two path-parser residues die in Task 4d, and Task 7 verifies their absence.** The vestigial
+  empty-namespace guard in `Pool::listNamespaces` and the loose pre-flight LIST base that matched
+  `victim2` both depended on deriving ownership from path-shaped life keys. Task 4d deletes that
+  discovery route. Gate this task with a source/test inventory showing decommission selects the victim
+  exclusively by exact catalog-name ownership and has no life-key prefix fallback.
 
 **Files:**
 - Modify: `.../ContentAddressed/Tools/CasDecommission.cpp` (scoped-LIST discovery `~:116`
@@ -1739,7 +1930,7 @@ re-create `_ckpt` nor perform the GC-owned `Removing → RemovalReady` transitio
   `test_content_addressed_drop_pool_member` lane green.
 - [ ] **Step 5: Commit** `ca: decommission — catalog-exact duties; retirement fenced on owned entries`.
 
-### Task 7a: delete probe A — the second full ref LIST goes {#task-7a}
+### Task 7a: delete probe A — the second full stream LIST goes {#task-7a}
 
 [2026-07-30 GC directive step 1: "Удалить probe A. Удалить дополнительный LIST, setting, counters,
 phase, tests и устаревшие комментарии. Сохранить B1/B2 и mount-time capability probe."
@@ -1747,7 +1938,7 @@ phase, tests и устаревшие комментарии. Сохранить 
 entire signal is "a LIST can be a liar". Under a catalog-authoritative universe (Task 4) and
 LIST-independent recovery (Task 5b), no correctness decision rests on LIST fidelity any more — the
 detector measures a property nothing depends on, and it pays one extra FULL enumeration of
-`cas/refs/` per sampled round to do it. Register R7 ("Probe A gating policy — DECIDED and EXECUTED")
+`cas/ns/stream/` per sampled round to do it. Register R7 ("Probe A gating policy — DECIDED and EXECUTED")
 is superseded by this task, and its supersession note lands in the same commit. **This is its own
 commit, deliberately separate from Task 7b:** probe-A removal is a PERFORMANCE change and destruction
 enablement is a CORRECTNESS change — "так легче отличить performance effect от возможной
@@ -1855,7 +2046,7 @@ correctness-регрессии" (Constraint 18).]
   inspect `RefScanSummary` for fields the detector was the sole consumer of, and delete those with it.
   A struct that still carries a field nobody reads is the residue this step exists to prevent.
   **And the enumeration split itself:** today `Gc::enumerateRefPrefix` (`CasGc.cpp:3462`) has exactly
-  two callers — `Gc::listRefPrefix` (`:3501`, "the round's ONE full enumeration of `cas/refs/`",
+  two callers — `Gc::listRefPrefix` (`:3501`, "the round's ONE full enumeration of `cas/ns/stream/`",
   comment at `:390`) and the detector's `probe_scan = enumerateRefPrefix()` (`:3570`). Task 4 already
   replaced `discoverUniverse`'s enumeration with one catalog `GET`, so after this deletion the helper
   has a single caller. Decide and record: collapse it into `listRefPrefix` if the split existed only
@@ -1863,13 +2054,14 @@ correctness-регрессии" (Constraint 18).]
   justifies it. Do not leave the question unasked.
 - [ ] **Step 3: the result criterion, asserted** (directive: "после удаления probe A нет второго
   полного ref LIST"): the CONVERTED test (iii) above asserts a folding round performs EXACTLY ONE full
-  enumeration of `cas/refs/` — and, critically, on EVERY round including the ones that used to be
+  enumeration of `cas/ns/stream/` — and, critically, on EVERY round including the ones that used to be
   sampled (with the old cadence, round 16 would have been the one to catch this; a test that only
-  checks round 1 proves nothing). Assert by LIST count attributed to the ref prefix, not by wall time.
+  checks round 1 proves nothing). Assert by LIST count attributed to the stream prefix, not by wall time.
   The claim is verifiable rather than merely plausible because `Gc::enumerateRefPrefix`
   (`CasGc.cpp:3462`) has exactly two callers tree-wide — `listRefPrefix` (`:3505`, the round's own
   scan) and the detector (`:3570`) — and the round's other `backend.list` calls (`:3004`, `:3147`,
-  `:3263`) target manifest and generation prefixes, not `cas/refs/`. Re-verify that call-site count in
+  `:3263`) target manifest, generation or the separately paced `cas/ns/` janitor scan, not the hot
+  stream prefix. Re-verify that call-site count in
   Step 1's inventory: if a third caller has appeared, the criterion needs re-derivation, not a pass.
 - [ ] **Step 4: Full CA gate — EXPECT THE COUNT TO GO DOWN**, and record the exact expected delta in
   the report before running: 3 tests + 1 suite from the deleted detector file, plus the tests removed
@@ -2095,8 +2287,8 @@ the note records what landed and not what was intended.
 
 - [ ] **Step 1:** Per R1 sub-hazard, record WHERE it went, with the commit and the test that
   proves it — no prose-only claims:
-  (a) unqualified file keys aliasing a reborn namespace → closed by Task 4b's re-key (name its
-  test);
+  (a) unqualified file keys aliasing a reborn namespace → closed first by Task 4b's re-key and finally
+  by Task 4d's opaque-id state prefix (name both tests);
   (b) the `namespaceFilesReadable` TOCTOU (`ContentAddressedMetadataStorage.cpp:1231`) → record Task
   6's final verdict: the rebirth arm of its premise is dead (a life-keyed read cannot resolve into
   another life), fresh name resolution rejects `Removing`/`RemovalReady`/absent at the catalog cut,
@@ -2106,7 +2298,7 @@ the note records what landed and not what was intended.
   `namespacePhysicallyEmpty`) → its `_files` arm deleted by Task 4b (rebirth-does-not-wait), `_files`
   out of every lifecycle-gating pass; Task 5 retains one bounded best-effort attempt and the perpetual
   janitor, with omission leak-only;
-  (d) migration → format bump B, Constraint 14.
+  (d) migration → final generation-6 recreate-only cut in Task 4d, Constraint 14.
 - [ ] **Step 2 (the one open question):** Determine whether LOOSE MOUNTPOINT OBJECTS carry a
   rebirth-aliasing hazard of their own. They are outside namespace ownership and the directive
   keeps them unqualified, so the answer is expected to be no — but ANSWER it from the code, do not
@@ -2303,7 +2495,7 @@ Commit alone; final commit updates `models/README.md` + `cas/06-tla-models.md`.
   | 2 | `ca-fsck --detail` finds no dangling / stale-edge | `ca-fsck --detail` at soak end AND at a mid-soak checkpoint | zero dangling, zero stale-edge, both runs |
   | 3 | Backlog reaches zero STABLY | `pending_deletes` + cleanup backlog sampled per round to fixpoint | reaches zero and STAYS zero across ≥3 further rounds (a single zero sample is not stability) |
   | 4 | Holds/anomalies still suppress every irreversible path | inject one hold and one anomaly during the soak | all delete families inert for those rounds, per family, and the round still completes |
-  | 5 | After probe-A removal there is no second full ref LIST | LIST counts per round attributed by prefix | exactly ONE full `cas/refs/` enumeration per round, on EVERY round including those probe A used to sample |
+  | 5 | After probe-A removal there is no second full stream LIST | LIST counts per round attributed by prefix and phase | exactly ONE full `cas/ns/stream/` enumeration per round, on EVERY round including those probe A used to sample; the bounded `cas/ns/` janitor page is reported separately and is never mistaken for a second hot scan |
   | 6 | Phase timings + S3 operation counts give the baseline | the Step-3c inventory | recorded as the explicit `MultiDelete`/concurrency baseline, with the un-timed spans named |
 
 - [ ] **Step 3e (namespace-life amendment, insert-path guard):** the dedup-log-bearing workload's namespace-file
@@ -2428,11 +2620,11 @@ document is what justifies them).]
    (T6 Step 1b) now covers the FILE call sites T1c/T4b introduce; `gtest_cas_list_liar_end_to_end.cpp`
    has TWO legitimate Stage-B editors after the amendment (T5b for the capstone sentinels it
    deliberately reds, T7b for the kill-shot) — Task 4's "only edit" line is amended in place;
-   and Task 5's janitor has ONE discovery source, because the layout change gives a life a single
-   subtree: `cas/ns/<ns>/<inc>/` owns `_log`, `_snap`, `_ckpt` and `_files` alike, so the round's
-   existing enumeration of that tree nominates every family. The earlier two-source, cursor-paced
-   design is deleted, not tuned — it existed only while `_files` lived in a tree the round does not
-   own.
+   Task 4d makes physical identity opaque and splits immutable `cas/ns/stream/<life_id>/` from
+   point/path-addressed `cas/ns/state/<life_id>/`; the fold's one hot stream enumeration and Task 5's
+   one cursor-paced ownership-tree janitor are intentionally different consumers. A review that
+   collapses them either reintroduces `_files` into every fold LIST or makes LIST omission a permanent
+   leak, so both prefix and phase assertions are load-bearing.
 
 ### Task 13 (post-Stage-B): split the two files that are 18% of the subsystem {#task-13}
 
