@@ -124,18 +124,32 @@ convergence is one round, and the driver's revalidation before deletion waits fo
 
 No physical-empty proof is required anywhere: surviving old-incarnation objects are structurally inert
 (foreign prefix; the fold works only off catalog entries) and a **perpetual** janitor deletes
-foreign-incarnation debris whenever listed. Discovery has two physical sources, not one fictional
-shared prefix: the round's existing pool-wide `cas/refs/` enumeration nominates ref debris, while a
-bounded `roots/` scan with its own cleanup-only cursor in `gc/state` nominates `_files`. Ref nomination
-recognizes both id-bearing ref objects and `_ckpt`, including the lone checkpoint left by a cancelled
-`Creating`. Finishing a
-`roots/` cycle resets that cursor, so an object omitted in one cycle is eligible in the next; losing
-cursor progress can only repeat work. Cursor publication is best-effort after the round's safety state
-is durable; an invalid or oversized backend cursor is logged and reset rather than failing that round.
-Before every exact-token delete the janitor revalidates that the catalog still either omits the life or
-names a different incarnation. Unparseable keys are surfaced and skipped. This janitor is the only
-reclaimer of a dead life's `_files`; a LIST omission defers its work but can never affect visibility,
-rebirth or deletion safety.
+foreign-incarnation debris whenever listed. **Discovery has ONE source, because a namespace owns one
+subtree** (see the layout rule below): the round's existing pool-wide `cas/ns/` enumeration nominates
+every family's debris — id-bearing ref objects, `_ckpt` (including the lone checkpoint left by a
+cancelled `Creating`) and `_files` alike. No second scan and no second cursor exist. Before every
+exact-token delete the janitor revalidates that the catalog still either omits the life or names a
+different incarnation; unparseable keys are surfaced and skipped. This janitor is the only reclaimer of
+a dead life's objects; a LIST omission defers its work but can never affect visibility, rebirth or
+deletion safety.
+
+**Layout rule: one namespace, one subtree, and `roots/` knows nothing about lifecycles.**
+`cas/ns/<namespace>/<incarnation>/` owns everything that belongs to a life —
+`_log`, `_snap`, `_ckpt` and `_files/<relative-name>`. `roots/` holds only objects that are NOT owned by
+a CAS catalog: loose mountpoint objects mirrored at their ClickHouse path, with no namespace, no
+incarnation and no reserved wrapper. Two consequences are the point of the rule rather than side
+effects: a dead life's debris is reachable by exactly one prefix, so the janitor needs one LIST rather
+than a paced scan of a tree it does not own; and the inverse parser that classified listed `roots/` keys
+by a reserved `_files` segment and extracted a life disappears — nothing under `roots/` carries a life
+to extract. The tree is named `cas/ns/`, not `cas/refs/`, because it stopped being the ref stream when
+it took ownership of the life; a name that has to be explained is a name that will be misread. Nothing
+is added to `roots/` to help traversal: path-shaped browsing is a **user** concern, served by the disk's
+own logical `listDirectory` through `clickhouse-disks` and by the inspection tool, so a pointer object
+would be a new object kind with no reader in the system.
+
+The mount-safety empty-root precondition is unaffected in shape and still lists three subtrees —
+`cas/ns/<srid>/`, `cas/manifests/<srid>/` and `roots/<srid>/` — so a life's files remain inside a checked
+subtree and an owner or epoch can never be re-created over surviving data.
 
 **A same-name birth is refused while the predecessor is `Removing` or `RemovalReady`**, as a typed
 retry-later that names what it waits for — never an internal error. State the magnitude honestly: the
@@ -167,7 +181,7 @@ restore it.
 > **SUPERSEDED 2026-07-29 — the "verbatim FILES stay unqualified" clause above.** Per the
 > authoritative directive
 > `docs/superpowers/specs/2026-07-29-cas-stage-b-namespace-life-amendments.md`, namespace files ARE
-> incarnation-qualified: `roots/<ns>/<inc>/_files/<relative-name>`, and one typed
+> incarnation-qualified, and one typed
 > `NamespaceLifeId{namespace, incarnation}` — replacing `RefNamespaceId` — is required by every ref
 > AND namespace-file key helper. Manifests and loose mountpoint objects keep exactly the boundary
 > this invariant states; they are explicitly unchanged. The `_cleanup` LIST-derived physical-empty
@@ -375,8 +389,8 @@ diagnostic start round + `Live→Removing` CAS +
 terminal append + one bounded best-effort cleanup pass + `Removing→RemovalReady` CAS + one pruning
 round + exact `_ckpt` delete + catalog-entry CAS. Fold: +1
 catalog `GET` per round; destructive rounds add one exact `GET` per quiet namespace (the frontier
-proof); the perpetual file janitor adds one bounded cursor-paced `roots/` LIST page per configured
-cleanup budget, while ref debris reuses the existing strict ref enumeration. Deep arithmetic walks
+proof); the perpetual janitor adds NO enumeration of its own, because a life's debris of every family
+lies under the one `cas/ns/` subtree the round already enumerates. Deep arithmetic walks
 dominate backlog cost and share one pool-level concurrency budget with cleanup. Performance interactions
 with the measured GC study (3.42 M serial trips/round, 256 logs/s, 39.6 % manifest re-reads): P1 prefetch
 becomes arithmetic (mispredictions impossible); ONE strict ref enumeration per round; range cleanup;
