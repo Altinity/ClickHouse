@@ -75,7 +75,8 @@ identity while `Creating`; immutable `removal_started_round` while `Removing`/`R
 removal actor samples the current adopted `gc/state.round` before `Live → Removing` and stores it in
 the same catalog CAS; it is diagnostic age, never a safety fence. The incarnation (random 128-bit,
 minted at `Creating`) qualifies **the ref layer only**:
-`<ns>/<inc>/{_log, _snap, _ckpt}`, with a canonical grammar and refusal of legacy-shaped keys.
+the physical key families below, with a canonical grammar and refusal of legacy-shaped keys. The
+same value is the opaque `life_id` those keys carry; the field is not renamed.
 Removal ends in a fourth, **transient** state. `Creating → Live → Removing → RemovalReady → absent`.
 A namespace enters `RemovalReady` only when its terminal record has folded into a life-scoped cleanup
 item in the adopted seal — positive evidence, never inferred from an item's absence — and
@@ -124,32 +125,66 @@ convergence is one round, and the driver's revalidation before deletion waits fo
 
 No physical-empty proof is required anywhere: surviving old-incarnation objects are structurally inert
 (foreign prefix; the fold works only off catalog entries) and a **perpetual** janitor deletes
-foreign-incarnation debris whenever listed. **Discovery has ONE source, because a namespace owns one
-subtree** (see the layout rule below): the round's existing pool-wide `cas/ns/` enumeration nominates
-every family's debris — id-bearing ref objects, `_ckpt` (including the lone checkpoint left by a
-cancelled `Creating`) and `_files` alike. No second scan and no second cursor exist. Before every
-exact-token delete the janitor revalidates that the catalog still either omits the life or names a
+foreign-incarnation debris whenever listed. **Discovery is a separately paced, leak-only enumeration of
+`cas/ns/`** — never the round's hot `stream/` LIST, which must stay scoped to scheduling. It nominates
+every family's debris: id-bearing stream objects, `_ckpt` (including the lone checkpoint left by a
+cancelled `Creating`) and `_files` alike. It takes **one fresh catalog GET per page, not per key**, and
+is paced by a single cleanup-only cursor. Before every exact-token delete the janitor revalidates that the catalog still either omits the life or names a
 different incarnation; unparseable keys are surfaced and skipped. This janitor is the only reclaimer of
 a dead life's objects; a LIST omission defers its work but can never affect visibility, rebirth or
 deletion safety.
 
-**Layout rule: one namespace, one subtree, and `roots/` knows nothing about lifecycles.**
-`cas/ns/<namespace>/<incarnation>/` owns everything that belongs to a life —
-`_log`, `_snap`, `_ckpt` and `_files/<relative-name>`. `roots/` holds only objects that are NOT owned by
-a CAS catalog: loose mountpoint objects mirrored at their ClickHouse path, with no namespace, no
-incarnation and no reserved wrapper. Two consequences are the point of the rule rather than side
-effects: a dead life's debris is reachable by exactly one prefix, so the janitor needs one LIST rather
-than a paced scan of a tree it does not own; and the inverse parser that classified listed `roots/` keys
-by a reserved `_files` segment and extracted a life disappears — nothing under `roots/` carries a life
-to extract. The tree is named `cas/ns/`, not `cas/refs/`, because it stopped being the ref stream when
-it took ownership of the life; a name that has to be explained is a name that will be misread. Nothing
-is added to `roots/` to help traversal: path-shaped browsing is a **user** concern, served by the disk's
-own logical `listDirectory` through `clickhouse-disks` and by the inspection tool, so a pointer object
-would be a new object kind with no reader in the system.
+**Layout rule: object keys carry an OPAQUE life id, and the hot enumeration sees only the stream.**
+A life's physical identity is the catalog's `incarnation` used as a pool-wide opaque `life_id`; keys do
+not repeat the logical namespace at all:
 
-The mount-safety empty-root precondition is unaffected in shape and still lists three subtrees —
-`cas/ns/<srid>/`, `cas/manifests/<srid>/` and `roots/<srid>/` — so a life's files remain inside a checked
-subtree and an owner or epoch can never be re-created over surviving data.
+```text
+cas/ns/stream/<life_id>/_log/<txn>       cas/ns/state/<life_id>/_ckpt
+cas/ns/stream/<life_id>/_snap/<txn>      cas/ns/state/<life_id>/_files/<relative-name>
+```
+
+**The split is immutable sequence-addressed stream versus point- and path-addressed state, not "logs
+versus everything else".** `_snap` therefore belongs to `stream/`: it is immutable, addressed by
+transaction id, already grouped with logs for recovery hints and covered-object cleanup, and small
+beside `_files`. Moving it to `state/` would force either a second hot LIST or a simultaneous
+recovery-and-cleanup redesign, which is a worse trade than the one it would buy.
+
+**What the opacity buys is not tidiness — it is that the catalog becomes the only authority
+structurally.** A listed key can no longer reconstruct a logical name, so no code path can invent one
+from debris, and the class of defect where a parser silently supplies missing catalog state stops being
+expressible. Every catalog consumer builds, once per immutable cut, an exact reverse index
+`life_id → {name, incarnation}`. Two current rows sharing a `life_id` are `CORRUPTED_DATA`, never
+"first row wins". A listed id absent from the fresh cut is inert debris. A `life_id` is never
+deliberately reused, so the existing random-128 uniqueness assumption now holds pool-wide rather than
+per logical name.
+
+**The round's one hot LIST covers `cas/ns/stream/` only** — `_ckpt` and `_files` are never enumerated by
+it. That LIST stays what it always was: a scheduling and performance hint, never the correctness path,
+which remains catalog membership plus exact arithmetic reads and the frontier probe. Dead-life debris of
+every family is reclaimed by a separately paced, leak-only enumeration of `cas/ns/`, which takes one
+fresh catalog GET per page rather than per key.
+
+**Rejected, and recorded so the cheaper-looking options are not re-proposed.** Deleting the full LIST in
+favour of an unbounded serial `GET N+1` chase has no bounded frontier while a namespace is being written
+and throws away the listing's scheduling witness. Adding an authoritative head object would put a CAS on
+the append path, which this design exists to avoid. Storing the logical path in the key — as `_path` or
+as a `roots/<path>` pointer — would create a second thing that looks like authority with no reader that
+needs it; a backup that can be mistaken for authority is worse than none, and the catalog already
+answers introspection for every active life. Path-shaped browsing is a **user** concern, served by the
+disk's logical `listDirectory` through `clickhouse-disks` and by the inspection tool.
+
+`roots/` keeps only objects no CAS catalog owns: loose mountpoint objects mirrored at their ClickHouse
+path, with no namespace, no life id and no reserved wrapper.
+
+**Mount safety changes premise, not strength, and this is the one place the split could have opened a
+hole.** There is no `cas/ns/<srid>/` prefix to probe any more, because a physical key no longer names a
+server root. So a `server_root_id` has owned live namespace work **iff the mandatory catalog holds a
+`Creating`, `Live`, `Removing` or `RemovalReady` logical name under that root** — the catalog
+observation is threaded down from the pool layer rather than having the low-level module decode a
+catalog of its own. `cas/manifests/<srid>/` and `roots/<srid>/` are still probed physically, because
+those families kept path identity. Dead opaque stream or state debris alone must NOT block owner or
+epoch recreation, and an unreadable catalog must fail closed rather than fall back to a physical
+guess.
 
 **A same-name birth is refused while the predecessor is `Removing` or `RemovalReady`**, as a typed
 retry-later that names what it waits for — never an internal error. State the magnitude honestly: the
@@ -200,7 +235,7 @@ restore it.
 > deleted with the snapshot. The two die together — leaving either one keeps a physical-empty vestige
 > alive with no reader.
 
-**INV-4 — `_ckpt`.** `<ns>/<inc>/_ckpt`, token-CAS,
+**INV-4 — `_ckpt`.** `cas/ns/state/<life_id>/_ckpt`, token-CAS,
 `{life_epoch, checkpoint_snapshot_id | none, last_epoch_seal | none}` — forced by prefix cleaning
 (a cleaned prefix plus a hidden snapshot is indistinguishable from empty). One update algorithm for
 both writers (snapshot publisher; sealer): read → validate → merge by semantic maximum per field →
@@ -390,7 +425,8 @@ terminal append + one bounded best-effort cleanup pass + `Removing→RemovalRead
 round + exact `_ckpt` delete + catalog-entry CAS. Fold: +1
 catalog `GET` per round; destructive rounds add one exact `GET` per quiet namespace (the frontier
 proof); the perpetual janitor adds NO enumeration of its own, because a life's debris of every family
-lies under the one `cas/ns/` subtree the round already enumerates. Deep arithmetic walks
+rides the separately paced leak-only `cas/ns/` enumeration, one catalog GET per page, and never the
+round's hot `stream/` LIST. Deep arithmetic walks
 dominate backlog cost and share one pool-level concurrency budget with cleanup. Performance interactions
 with the measured GC study (3.42 M serial trips/round, 256 logs/s, 39.6 % manifest re-reads): P1 prefetch
 becomes arithmetic (mispredictions impossible); ONE strict ref enumeration per round; range cleanup;
