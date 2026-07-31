@@ -30,6 +30,11 @@ enum class BootstrapResidual : uint8_t
     /// No `_pool_meta`, and every listed object is structurally-valid `_probe/` debris (or the prefix is
     /// empty) → safe to bootstrap a fresh pool.
     EmptyOrProbeOnly,
+    /// No `_pool_meta`, and the only durable object is a byte-for-byte canonical empty
+    /// `cas/ref_catalog` (plus structurally-valid `_probe/` debris). This is the sole retryable
+    /// pre-meta bootstrap residue: a prior opener made the mandatory catalog durable but did not
+    /// publish `_pool_meta`.
+    CanonicalEmptyCatalogOnly,
     /// No `_pool_meta`, but at least one non-`_probe` object exists → refuse to bootstrap (typed startup
     /// failure, zero writes performed).
     ResidualWithoutMeta,

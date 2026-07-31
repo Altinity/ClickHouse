@@ -393,8 +393,9 @@ PoolPtr Pool::open(BackendPtr backend, PoolConfig config)
             case BootstrapResidual::PoolMetaPresent:
                 break;   /// authoritative existing pool; its catalog is mandatory below.
             case BootstrapResidual::EmptyOrProbeOnly:
+            case BootstrapResidual::CanonicalEmptyCatalogOnly:
                 initialize_empty_catalog = true;
-                break;   /// a provably empty prefix; safe to materialize the mandatory catalog.
+                break;   /// proven-new or canonical catalog-only pre-meta bootstrap state.
             case BootstrapResidual::ResidualWithoutMeta:
             {
                 /// RECREATION QUIESCE. Reaching here means the prefix holds objects but no authoritative
@@ -478,6 +479,13 @@ PoolPtr Pool::open(BackendPtr backend, PoolConfig config)
             backend->checkConditionalWriteSingleAttemptSupport();
         }
     }
+    /// The catalog is mandatory for every minted pool. Make it durable before `_pool_meta`: otherwise
+    /// an acknowledgement-loss or definite catalog-write failure could strand an authoritative meta
+    /// that makes every later open refuse the absent catalog. The catalog-only residual proof above is
+    /// the narrowly-defined retry path when this opener (or a concurrent opener) completed this step
+    /// but did not reach the pool-meta create.
+    if (initialize_empty_catalog)
+        CasRefCatalog::initializeEmptyForNewPool(*backend, layout);
     /// `allow_mint` = writable open only: a writable `Pool::open` reaches here having just passed the
     /// zero-write residual proof above, so minting a missing `_pool_meta` is safe. A read-only/observe
     /// open never ran that proof (and there is no truly-read-only backend — `openPoolView` opens the same
@@ -486,8 +494,6 @@ PoolPtr Pool::open(BackendPtr backend, PoolConfig config)
     PoolMeta meta = PoolMeta::createOrValidate(
         *backend, layout, config.blob_header_len, config.blob_hash_algo, config.blob_hash_allow_new,
         /*allow_mint=*/!config.read_only);
-    if (initialize_empty_catalog)
-        CasRefCatalog::initializeEmptyForNewPool(*backend, layout);
     const BlobHashAlgo write_algo = config.blob_hash_algo;   /// `config` is moved-from just below
 
     /// Private ctor: make_shared cannot reach it.

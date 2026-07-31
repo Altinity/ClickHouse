@@ -691,17 +691,21 @@ inline DB::Cas::PoolPtr openPoolForTest(
 /// `probePoolBootstrapResidual`) REFUSES to bootstrap over residual data, so a raw restart fixture must
 /// establish both mandatory objects itself rather than rely on a production fallback.
 ///
-/// Idempotent: `createOrValidate` validates an existing `_pool_meta`, while
-/// `initializeEmptyForNewPool` accepts an existing catalog only after decoding it. The default
-/// `blob_header_len`/`blob_hash_algo` match `PoolConfig`'s defaults, so a later `Pool::open` with a
-/// default config validates cleanly.
+/// Idempotent: `createOrValidate` validates an existing `_pool_meta`. The catalog initializer is
+/// deliberately narrower: it accepts only a canonical EMPTY conflict, so raw recovery fixtures that
+/// have already populated their catalog must mandatory-read and validate it instead of re-running a
+/// new-pool initializer. The default `blob_header_len`/`blob_hash_algo` match `PoolConfig`'s defaults,
+/// so a later `Pool::open` with a default config validates cleanly.
 inline void seedPoolMetaForRestart(DB::Cas::Backend & backend, const String & pool_prefix = "p")
 {
     const DB::Cas::Layout layout(pool_prefix);
     DB::Cas::PoolMeta::createOrValidate(
         backend, layout, /*blob_header_len=*/256,
         DB::Cas::BlobHashAlgo::CityHash128, /*allow_new=*/false, /*allow_mint=*/true);
-    DB::Cas::CasRefCatalog::initializeEmptyForNewPool(backend, layout);
+    if (!backend.get(layout.refCatalogKey()))
+        DB::Cas::CasRefCatalog::initializeEmptyForNewPool(backend, layout);
+    else
+        (void)DB::Cas::CasRefCatalog::read(backend, layout);
 }
 
 /// Write a blob object (envelope + payload) addressed by `hash`, so a HEAD returns a token. The bytes

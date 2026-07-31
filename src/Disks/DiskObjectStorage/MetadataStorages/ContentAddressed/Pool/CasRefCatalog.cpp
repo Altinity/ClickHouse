@@ -51,13 +51,25 @@ CasRefCatalog::Snapshot CasRefCatalog::read(Backend & backend, const Layout & la
 CasRefCatalog::Snapshot CasRefCatalog::initializeEmptyForNewPool(Backend & backend, const Layout & layout)
 {
     RefCatalog empty;
-    const PutResult put = backend.putIfAbsent(layout.refCatalogKey(), encodeRefCatalog(empty));
+    const String canonical_empty = encodeRefCatalog(empty);
+    const PutResult put = backend.putIfAbsent(layout.refCatalogKey(), canonical_empty);
     if (put.outcome == PutOutcome::Done)
         return Snapshot{.catalog = empty, .token = put.token, .life_index = CatalogLifeIndex(empty)};
 
     /// A second opener can win after both proved the prefix empty. Decode its exact object before
-    /// accepting the race; conflict is never a license to continue with an assumed empty catalog.
-    return read(backend, layout);
+    /// accepting the race; conflict is never a license to continue with an assumed empty catalog or
+    /// arbitrary decoded body.
+    const auto got = backend.get(layout.refCatalogKey());
+    if (!got)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS ref catalog '{}' disappeared after bootstrap create conflict",
+            layout.refCatalogKey());
+    RefCatalog catalog = decodeRefCatalog(got->bytes);
+    if (!catalog.entries.empty() || got->bytes != canonical_empty)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS ref catalog '{}' conflicts with bootstrap's required canonical empty catalog",
+            layout.refCatalogKey());
+    return Snapshot{.catalog = std::move(catalog), .token = got->token, .life_index = CatalogLifeIndex(empty)};
 }
 
 std::optional<NamespaceLifeId> CasRefCatalog::lifeIfCataloged(

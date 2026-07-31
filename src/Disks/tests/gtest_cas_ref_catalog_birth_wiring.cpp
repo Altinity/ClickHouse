@@ -13,6 +13,7 @@
 
 namespace DB::ErrorCodes
 {
+extern const int CORRUPTED_DATA;
 extern const int NETWORK_ERROR;
 }
 
@@ -40,6 +41,29 @@ using namespace DB::Cas::tests;
 
 namespace
 {
+
+/// Fault the mandatory catalog's very first bootstrap write before it reaches durable storage. This
+/// models a definite write failure, distinct from the acknowledgement-loss shape below: a retry must
+/// still be allowed to prove a new pool, and the failed first attempt must not have published
+/// `_pool_meta` without the catalog it makes mandatory.
+class CatalogBootstrapPutFailsOnceBackend final : public CountingBackend
+{
+public:
+    using CountingBackend::putIfAbsent;
+
+    PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta) override
+    {
+        if (fail_once && key == Layout{"p"}.refCatalogKey())
+        {
+            fail_once = false;
+            throw Poco::TimeoutException("CatalogBootstrapPutFailsOnceBackend: catalog PUT did not land");
+        }
+        return CountingBackend::putIfAbsent(key, bytes, meta);
+    }
+
+private:
+    bool fail_once = true;
+};
 
 PoolPtr openPoolForBirthTest(const BackendPtr & backend, const String & server_root_id = "test")
 {
@@ -119,6 +143,102 @@ TEST(CasRefCatalogBirthWiring, CatalogLossAfterMountCannotRecreateAOneRowAuthori
     EXPECT_EQ(backend->putTotal(), 0u)
         << "the failed birth must not publish a checkpoint or ref-log body";
     EXPECT_EQ(backend->putOverwriteTotal(), 0u);
+}
+
+TEST(CasRefCatalogBirthWiring, FailedCatalogBootstrapDoesNotPublishPoolMetaAndRetryConverges)
+{
+    auto backend = std::make_shared<CatalogBootstrapPutFailsOnceBackend>();
+    const Layout layout{"p"};
+
+    EXPECT_ANY_THROW(Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"}));
+    EXPECT_FALSE(backend->head(layout.poolMetaKey()).exists)
+        << "a failed mandatory catalog bootstrap must leave no authoritative pool meta behind";
+    EXPECT_FALSE(backend->head(layout.refCatalogKey()).exists);
+
+    PoolPtr retry;
+    ASSERT_NO_THROW(retry = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"}));
+    EXPECT_TRUE(backend->head(layout.poolMetaKey()).exists);
+    EXPECT_TRUE(backend->head(layout.refCatalogKey()).exists);
+}
+
+TEST(CasRefCatalogBirthWiring, LostCatalogBootstrapAcknowledgementLeavesOnlyRetryableCatalogResidue)
+{
+    auto backend = std::make_shared<LandedButAckLostOnceBackend>();
+    const Layout layout{"p"};
+    backend->key_substr = layout.refCatalogKey();
+
+    EXPECT_ANY_THROW(Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"}));
+    EXPECT_FALSE(backend->head(layout.poolMetaKey()).exists);
+    EXPECT_TRUE(backend->head(layout.refCatalogKey()).exists)
+        << "the injected write must land before its acknowledgement is lost";
+
+    PoolPtr retry;
+    ASSERT_NO_THROW(retry = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"}));
+    EXPECT_TRUE(backend->head(layout.poolMetaKey()).exists);
+}
+
+TEST(CasRefCatalogBirthWiring, BootstrapConflictExactReadsTheCanonicalEmptyCatalog)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    const Layout layout{"p"};
+    const String canonical_empty = encodeRefCatalog(RefCatalog{});
+    ASSERT_EQ(backend->putIfAbsent(layout.refCatalogKey(), canonical_empty).outcome, PutOutcome::Done);
+    backend->resetCounts();
+
+    const CasRefCatalog::Snapshot snap = CasRefCatalog::initializeEmptyForNewPool(*backend, layout);
+    EXPECT_TRUE(snap.catalog.entries.empty());
+    EXPECT_EQ(backend->putCount(layout.refCatalogKey()), 1u);
+    EXPECT_EQ(backend->getCount(layout.refCatalogKey()), 1u)
+        << "a concurrent bootstrap winner must be exact-read before acceptance";
+}
+
+TEST(CasRefCatalogBirthWiring, BootstrapConflictRefusesANonemptyCatalog)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    const Layout layout{"p"};
+    const RefCatalog nonempty{.entries = {CatalogEntry{
+        .ns = RootNamespace{"test/nonempty"}, .state = NsState::Live, .incarnation = UInt128{1}, .creator = std::nullopt}}};
+    ASSERT_EQ(backend->putIfAbsent(layout.refCatalogKey(), encodeRefCatalog(nonempty)).outcome, PutOutcome::Done);
+    backend->resetCounts();
+
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { CasRefCatalog::initializeEmptyForNewPool(*backend, layout); });
+    EXPECT_EQ(backend->getCount(layout.refCatalogKey()), 1u);
+}
+
+TEST(CasRefCatalogBirthWiring, ExistingPoolMetaWithMissingCatalogStillFailsClosed)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    PoolPtr first = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    const auto catalog = backend->get(first->layout().refCatalogKey());
+    ASSERT_TRUE(catalog);
+    ASSERT_EQ(backend->deleteExact(first->layout().refCatalogKey(), catalog->token).kind,
+              DeleteOutcome::Kind::Deleted);
+
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"}); });
+}
+
+TEST(CasRefCatalogBirthWiring, RestartFixturePreservesItsExistingNonemptyCatalog)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    const Layout layout{"p"};
+    seedPoolMetaForRestart(*backend);
+    const auto empty = backend->get(layout.refCatalogKey());
+    ASSERT_TRUE(empty);
+
+    const RefCatalog nonempty{.entries = {CatalogEntry{
+        .ns = RootNamespace{"test/preserved"}, .state = NsState::Live, .incarnation = UInt128{1}, .creator = std::nullopt}}};
+    const String bytes = encodeRefCatalog(nonempty);
+    ASSERT_EQ(backend->putOverwrite(layout.refCatalogKey(), bytes, empty->token).outcome, PutOutcome::Done);
+    const auto before = backend->get(layout.refCatalogKey());
+    ASSERT_TRUE(before);
+
+    seedPoolMetaForRestart(*backend);
+    const auto after = backend->get(layout.refCatalogKey());
+    ASSERT_TRUE(after);
+    EXPECT_EQ(after->bytes, before->bytes);
+    EXPECT_EQ(after->token, before->token);
 }
 
 /// A namespace whose catalog entry is ALREADY `Live` (e.g. admitted by an earlier mount that this

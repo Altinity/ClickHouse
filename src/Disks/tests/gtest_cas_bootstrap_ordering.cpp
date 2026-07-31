@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCatalogFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Common/Exception.h>
@@ -119,6 +120,21 @@ private:
     std::vector<Entry> log_;
 };
 
+/// Models a stale LIST result for `cas/ref_catalog`: the object was listed, then disappeared before
+/// the exact validation GET. The bootstrap must treat this as residual, never as a new-pool proof.
+class CatalogMissingAfterListBackend final : public InMemoryBackend
+{
+public:
+    using Backend::get;
+
+    std::optional<GetResult> get(const String & key, Range range) override
+    {
+        if (key == Layout{kPrefix}.refCatalogKey())
+            return std::nullopt;
+        return InMemoryBackend::get(key, range);
+    }
+};
+
 PoolConfig makeConfig()
 {
     PoolConfig cfg;
@@ -126,6 +142,31 @@ PoolConfig makeConfig()
     cfg.server_root_id = kSrid;
     cfg.wait_sleep_fn = [](uint64_t) {};   /// never block a synchronous test on an open/teardown wait
     return cfg;
+}
+
+template <typename F>
+void expectThrowsCodeContaining(int expected_code, const String & needle, F && fn);
+
+void expectCatalogResidueRefusesWithoutPoolMeta(const String & bytes, const String & extra_key = {})
+{
+    auto backend = std::make_shared<RecordingBackend>();
+    const Layout layout{kPrefix};
+    ASSERT_EQ(backend->putIfAbsent(layout.refCatalogKey(), bytes).outcome, PutOutcome::Done);
+    if (!extra_key.empty())
+        ASSERT_EQ(backend->putIfAbsent(extra_key, "residual").outcome, PutOutcome::Done);
+    backend->clearLog();
+
+    try
+    {
+        Pool::open(backend, makeConfig());
+        FAIL() << "expected residual catalog bootstrap refusal";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::INVALID_STATE);
+    }
+    EXPECT_EQ(backend->writeCount(), 0u);
+    EXPECT_FALSE(backend->head(layout.poolMetaKey()).exists);
 }
 
 /// Index of the first op matching `pred`, if any.
@@ -223,6 +264,63 @@ TEST(CasBootstrapOrdering, StaleProbeDebrisOnlyIsTreatedAsEmpty)
     ASSERT_NO_THROW(store = Pool::open(backend, makeConfig()));
     EXPECT_EQ(store->lifecycle(), PoolLifecycle::Live);
     EXPECT_TRUE(backend->get(kPoolMetaKey).has_value()) << "_pool_meta must be created over a probe-only prefix";
+}
+
+TEST(CasBootstrapOrdering, CanonicalEmptyCatalogOnlyIsTheSoleRetryablePreMetaResidue)
+{
+    auto backend = std::make_shared<RecordingBackend>();
+    const Layout layout{kPrefix};
+    ASSERT_EQ(backend->putIfAbsent(layout.refCatalogKey(), encodeRefCatalog(RefCatalog{})).outcome, PutOutcome::Done);
+    ASSERT_EQ(backend->putIfAbsent(kPrefix + "/_probe/" + kProbeUid + "/token", "probe-v1").outcome, PutOutcome::Done);
+    backend->clearLog();
+
+    PoolPtr store;
+    ASSERT_NO_THROW(store = Pool::open(backend, makeConfig()));
+    EXPECT_TRUE(backend->head(layout.poolMetaKey()).exists);
+}
+
+TEST(CasBootstrapOrdering, MalformedCatalogOnlyResidueRefusesWithoutPoolMeta)
+{
+    expectCatalogResidueRefusesWithoutPoolMeta("not a catalog");
+}
+
+TEST(CasBootstrapOrdering, NoncanonicalCatalogOnlyResidueRefusesWithoutPoolMeta)
+{
+    String noncanonical = encodeRefCatalog(RefCatalog{});
+    noncanonical.insert(noncanonical.find('\n') - 1, ",\"noncanonical\":0");
+    ASSERT_TRUE(decodeRefCatalog(noncanonical).entries.empty()) << "fixture must be decodable but noncanonical";
+    expectCatalogResidueRefusesWithoutPoolMeta(noncanonical);
+}
+
+TEST(CasBootstrapOrdering, NonemptyCatalogOnlyResidueRefusesWithoutPoolMeta)
+{
+    const RefCatalog nonempty{.entries = {CatalogEntry{
+        .ns = RootNamespace{"test/nonempty"}, .state = NsState::Live, .incarnation = UInt128{1}, .creator = std::nullopt}}};
+    expectCatalogResidueRefusesWithoutPoolMeta(encodeRefCatalog(nonempty));
+}
+
+TEST(CasBootstrapOrdering, CatalogWithAnyOtherCasResidueRefusesWithoutPoolMeta)
+{
+    const String canonical_empty = encodeRefCatalog(RefCatalog{});
+    const Layout layout{kPrefix};
+    const std::vector<String> residuals{
+        layout.ownerKey("test"), layout.epochKey("test"), layout.mountKey("test"),
+        layout.refLogKey(NamespaceLifeId::stageATransition(RootNamespace{"test/ns"}), RefTxnId{1, 1}),
+        layout.manifestKey(ManifestId{RootNamespace{"test/ns"}, ManifestRef{1, 1, 1}}),
+        layout.serverRootDataPrefix("test") + "residual", kPrefix + "/unknown"};
+    for (const String & residual : residuals)
+        expectCatalogResidueRefusesWithoutPoolMeta(canonical_empty, residual);
+}
+
+TEST(CasBootstrapOrdering, ListedCatalogMissingAtExactGetRefusesWithoutPoolMeta)
+{
+    auto backend = std::make_shared<CatalogMissingAfterListBackend>();
+    const Layout layout{kPrefix};
+    ASSERT_EQ(backend->putIfAbsent(layout.refCatalogKey(), encodeRefCatalog(RefCatalog{})).outcome, PutOutcome::Done);
+
+    expectThrowsCodeContaining(DB::ErrorCodes::INVALID_STATE, "refusing to bootstrap over residual data",
+                               [&] { Pool::open(backend, makeConfig()); });
+    EXPECT_FALSE(backend->head(layout.poolMetaKey()).exists);
 }
 
 /// (d) An existing healthy pool (meta present + data) → reopen is unchanged: the pool identity is

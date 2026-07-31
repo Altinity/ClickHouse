@@ -1,4 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasSentinelProbe.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCatalogFormat.h>
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
 
@@ -31,6 +32,7 @@ bool isProbeSubtreeDebris(const String & probe_root, const String & key)
 BootstrapResidual probePoolBootstrapResidual(Backend & backend, const Layout & layout)
 {
     const String pool_meta_key = layout.poolMetaKey();
+    const String catalog_key = layout.refCatalogKey();
     const String prefix = layout.poolPrefix() + "/";
     const String probe_root = layout.poolPrefix() + "/_probe/";
 
@@ -39,6 +41,7 @@ BootstrapResidual probePoolBootstrapResidual(Backend & backend, const Layout & l
     /// sorts first under `<prefix>/`, so a healthy pool short-circuits on the first page rather than
     /// enumerating its whole content on every open.
     bool has_residual = false;
+    bool has_catalog = false;
     try
     {
         String cursor;
@@ -51,6 +54,11 @@ BootstrapResidual probePoolBootstrapResidual(Backend & backend, const Layout & l
                     return BootstrapResidual::PoolMetaPresent;   /// decisive — the pool is authoritative
                 if (isProbeSubtreeDebris(probe_root, listed.key))
                     continue;   /// crash leftover / concurrent opener's battery — ignore ([D2])
+                if (listed.key == catalog_key)
+                {
+                    has_catalog = true;
+                    continue;
+                }
                 has_residual = true;   /// a non-`_probe` object, and no `_pool_meta` seen (so far)
             }
             if (page.next_cursor.empty())
@@ -69,7 +77,34 @@ BootstrapResidual probePoolBootstrapResidual(Backend & backend, const Layout & l
             prefix, getCurrentExceptionMessage(/*with_stacktrace=*/false));
         return BootstrapResidual::Indeterminate;
     }
-    return has_residual ? BootstrapResidual::ResidualWithoutMeta : BootstrapResidual::EmptyOrProbeOnly;
+    if (has_residual)
+        return BootstrapResidual::ResidualWithoutMeta;
+    if (!has_catalog)
+        return BootstrapResidual::EmptyOrProbeOnly;
+
+    /// LIST is only a discovery hint. Before treating catalog-only residue as retryable, exact-read
+    /// the listed key and prove it is precisely the sole canonical empty authority. A missing object,
+    /// malformed body, alternate encoding, or nonempty catalog is ordinary residual data, never a
+    /// license to mint `_pool_meta`.
+    try
+    {
+        const auto got = backend.get(catalog_key);
+        if (!got)
+            return BootstrapResidual::ResidualWithoutMeta;
+
+        RefCatalog catalog = decodeRefCatalog(got->bytes);
+        const String canonical_empty = encodeRefCatalog(RefCatalog{});
+        if (catalog.entries.empty() && got->bytes == canonical_empty)
+            return BootstrapResidual::CanonicalEmptyCatalogOnly;
+        return BootstrapResidual::ResidualWithoutMeta;
+    }
+    catch (...)
+    {
+        LOG_WARNING(getLogger("CasBootstrap"),
+            "Pool prefix '{}': could not prove listed catalog '{}' is canonical empty; refusing bootstrap: {}",
+            prefix, catalog_key, getCurrentExceptionMessage(/*with_stacktrace=*/false));
+        return BootstrapResidual::ResidualWithoutMeta;
+    }
 }
 
 }
