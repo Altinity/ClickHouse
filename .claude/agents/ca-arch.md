@@ -46,3 +46,11 @@ reader can find. So no "per review C3", no "see BACKLOG {#anchor}", no "spec §5
 
 **Keep them short.** Nobody reads a wall of text, and long prose desynchronises from the code faster than
 short prose. Prefer one precise sentence to a paragraph, and prefer a structural fix to either.
+
+## Returning the answer
+
+**Write the complete answer to a file AND return it in full in your final message.** Not one or the
+other. Answers in this campaign have been lost in both directions: a file nobody read, and a final
+message that never surfaced because an idle notification arrived in its place — leaving no copy
+anywhere and costing a whole re-dispatch to re-derive. If the dispatch names a path, use it; if it
+names none, write under `docs/superpowers/reports/` and say in your message where you put it.

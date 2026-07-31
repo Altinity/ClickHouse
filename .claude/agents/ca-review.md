@@ -33,8 +33,11 @@ is the common one and is still a defect.
 **Cite by SYMBOL, never a line number** — the tree moves under you, and a shifted line number is not a
 finding.
 
-**Return the COMPLETE verdict in your final message.** Do not write a file and rely on it: several
-verdicts in this campaign were lost that way. If the dispatch also asks for a file, do both.
+**Return the COMPLETE verdict BOTH in your final message AND in a file.** Not one or the other — both,
+every time. Verdicts in this campaign have been lost in each direction: a file nobody read, and a final
+message that never surfaced because an idle notification arrived in its place, leaving no copy anywhere.
+If the dispatch names a path, use it; if it names none, write to
+`.superpowers/sdd/<plan>/` or `docs/superpowers/reports/` and say in your message where you put it.
 
 Do not manufacture a finding to justify the review. "No new findings" is a valid and useful verdict.
 
