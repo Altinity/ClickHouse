@@ -249,7 +249,7 @@ changes (which are classification-only: both came back with the same colours, na
 === DONE  run_deltaintake.sh            rc=0 seconds=833   ALL EXPECTATIONS MET   (13/13)
 === DONE  run_refcatalog.sh             rc=0 seconds=10    ALL EXPECTATIONS MET   (16/16)  <- 2026-08-01 focused re-run
 === DONE  run_nscleanup_staleleader.sh  rc=0 seconds=4     ALL EXPECTATIONS MET   (4/4)
-=== DONE  run_prefold_drain.sh           rc=0 seconds=8    ALL EXPECTATIONS MET   (14/14) <- 2026-08-01 fix round 1
+=== DONE  run_prefold_drain.sh          rc=0 seconds=12    ALL EXPECTATIONS MET   (18/18) <- 2026-08-01 review fix
 === DONE  run_mount.sh                  rc=0 seconds=583   ALL EXPECTATIONS MET   (22/22)
 --- the original phase runners ran in one chain; the two annotated rows are later focused runs ---
 === DONE  run_buildrootprecommit.sh     rc=0 seconds=90    ALL EXPECTATIONS MET   (8/8)
@@ -516,11 +516,11 @@ the same 47 configs — so whoever picks up either should pick up both.
 - **`-workers 1`** in the phase runners that report numbers: parallel BFS visits states in a
   nondeterministic order, so depth, state counts and *which* shortest counterexample TLC prints all
   vary run to run, while the traces narrated in the RESULTS files are specific action sequences.
-- **Findings are not sabotages.** **Four** of the 111 battery configs are reds that report a defect
+- **Findings are not sabotages.** **Four** of the 115 battery configs are reds that report a defect
   rather than validate a guard — `CaRefDeltaIntakeCore_witness_corruptgap`,
   `CaErasureProof_gc_asbuilt`, `CaErasureProof_gc_promptliteral` and
   `CaRefCatalogCore_finding_briefreconcileinv` — matching the count in [the gate](#gate).
   A fifth red of the same kind, `CaRelinkConfirmCore_sab_holeylist`, is the
   historical witness and is **not** in any battery, so it is not in that arithmetic. Each is
-  labelled where it appears. The current arithmetic is 62 sabotage-class + 19 witnesses + 4
-  findings = 85 reds.
+  labelled where it appears. The current arithmetic is 65 sabotage-class + 20 witnesses + 4
+  findings = 89 reds.
