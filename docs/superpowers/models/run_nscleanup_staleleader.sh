@@ -1,23 +1,17 @@
 #!/usr/bin/env bash
 # Run every CaRefNsCleanupStaleLeaderCore config and print a one-line PASS/FAIL verdict per config.
-# Model: v9's stale-leader straggler safety after the `_cleanup`-marker/round-recheck gate is deleted
-# for the ref layer (spec 2026-07-27-cas-ref-chain-complete-cut-design.md, §2 INV-3 ref-layer-scoped
-# incarnations + structural inertness, §3 the deposit-time-capture rule). Results and traces:
+# Model: the perpetual `cas/ns/` janitor's stale-page safety after Task 5 removes every synchronous
+# namespace-removal cleanup pass (spec 2026-07-27-cas-ref-chain-complete-cut-design.md, §2 INV-3).
+# A LIST page deposits a physical life id; a resumed delete never re-derives the logical name. Results:
 # CaRefNsCleanupStaleLeaderCore_RESULTS.md.
 #
 # Sabotages run FIRST: a green is only evidence once the property it rests on has been seen red.
 #
-#   sab_noincarnation -> NoLiveDataDeleted   recreation reuses the incarnation instead of minting
-#                                            fresh: the SAME unconditional, unguarded stale-pass
-#                                            delete then reaches the reborn life's own data
-#   sab_rederive       -> NoLiveDataDeleted   the resumed pass resolves its target from the CURRENT
-#                                            catalog entry instead of the incarnation captured at
-#                                            deposition (spec §3's deposit-time-capture rule): once
-#                                            reborn, "current" simply IS the live incarnation
-#   safe               -> GREEN               honest rebirth AND honest deposit-time capture: the
-#                                            straggler's delete -- scoped only to what it captured
-#                                            before deposition, never re-checked or re-derived --
-#                                            structurally cannot reach live data
+#   sab_noincarnation -> NoLiveDataDeleted   recreation reuses the listed physical id
+#   sab_rederive       -> NoLiveDataDeleted   resumed cleanup resolves the current logical name
+#   safe               -> GREEN               fresh rebirth + captured physical-id deletion
+#   witness_captureatdeposition -> WITNESS_CAPTURED_BEFORE_REBIRTH
+#                                            a listed and nominated old id precedes fresh-id rebirth
 #
 # Both sabotages hit the same invariant by independent, isolated routes (see the cfg headers) --
 # together they are the model-level proof that incarnation freshness AND deposit-time capture are
@@ -44,6 +38,7 @@ CONFIGS=(
   "sab_noincarnation  violation  NoLiveDataDeleted"
   "sab_rederive       violation  NoLiveDataDeleted"
   "safe               green      -"
+  "witness_captureatdeposition violation WITNESS_CAPTURED_BEFORE_REBIRTH"
 )
 
 overall=0

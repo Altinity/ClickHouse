@@ -6,6 +6,13 @@ Model: `CaRefDeltaIntakeCore.tla`. Gates the GC fold and deletion safety of spec
 preserves holds). Task 2 of the plan `2026-07-28-cas-ref-chain-tla-phase.md`; this is a phase-0
 gate — it blocks the C++ work.
 
+**2026-08-01 scope amendment.** This model starts at `BeginRound` with the catalog cut already
+chosen. Under the catalog-only pre-fold drain protocol, that input is specifically the **fresh
+post-drain catalog cut**: the actor has resolved every eligible exact-row deletion justified by the
+authoritative adopted parent before it takes the cut. `CaRefPreFoldDrainCore` owns and sabotage-gates
+that cross-object ordering for ordinary fold, `DEFER`, and `REBUILD`; this model deliberately does
+not duplicate it. Its fold/frontier/hold verdicts and state counts are unchanged.
+
 Runner: `./run_deltaintake.sh` (runs every config and checks its expected verdict, including *which*
 invariant a sabotage is required to break; sabotages run FIRST, because a green is only evidence
 once the property it rests on has been seen red). TLC 2.19 (tla2tools, Java 21),
@@ -386,7 +393,9 @@ object, never an enumeration.** Both mitigations above satisfy it; no listing di
 ## Scoping — what this model deliberately does not cover
 
 - **Two namespaces, one blob, one incarnation.** The catalog, `Creating`/`Removing` races and
-  incarnations are `CaRefCatalogCore`'s subject (task 3). Namespaces here are always foldable.
+  incarnations are `CaRefCatalogCore`'s subject (task 3), while the required pre-fold drain and
+  fresh-cut ordering are `CaRefPreFoldDrainCore`'s subject. Namespaces here are always foldable and
+  the model consumes an already-fresh post-drain cut.
 - **The seal is an opaque slot occupant.** Task 1's hand-off note (`CaRefTableSnapshotLogCore.tla`
   lines 86-96) assigns `ckpt.seal`'s fold-side obligation to this module; what is discharged here is
   the *consumption* rule — a seal occupies a slot, the walk reads it and continues, and it applies as
@@ -407,9 +416,10 @@ object, never an enumeration.** Both mitigations above satisfy it; no listing di
   needs per-actor round state this module does not have.
 - **`TypeOK` has no sabotage** (house standard: it is a structural well-formedness check, including
   `Indeg >= 0` and `hold[t] <=> holdPos[t] # 0`).
-- **Honest REBUILD is the identity on this state**, so it is modelled only through its sabotaged
-  form. What REBUILD is required to preserve here — cursors and holds — is exactly what the sabotage
-  drops.
+- **Honest REBUILD is the identity on this model's state**, so it is modelled only through its
+  sabotaged form. What REBUILD is required to preserve here — cursors and holds — is exactly what
+  the sabotage drops. Acquiring the lease, draining against the authoritative adopted parent, and
+  taking the later fresh rebuild cut are separate obligations of `CaRefPreFoldDrainCore`.
 - **Bounds: `MaxSeq = 3` uniformly.** `MaxSeq = 4` was tried first and the greens did not fit the
   plan's ~10 min ceiling — `_v9_safe` reached 205 M distinct states with a still-GROWING queue at
   the 4-minute mark, and `_ctl_holdsuppresses` took 363 s. The plan's rule is to shrink bounds

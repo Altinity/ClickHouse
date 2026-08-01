@@ -15,17 +15,18 @@ Phase: `2026-07-28-cas-ref-chain-tla-phase.md` (tasks 1–6), gating spec
 before any C++ lands, and every property must carry a `_sab_*` config proving it can go red.
 
 This file is the phase's single verdict. Per-model narrative, traces and state counts live in the
-five per-model RESULTS files; what is recorded here is the *whole battery*, run end to end from a
-clean `tmp/tlc-meta-*` state on 2026-07-28, plus a LIST-trust audit of six of the models the phase
-did not rewrite (scope stated exactly in [that section](#list-trust-audit)).
+six per-model RESULTS files; what is recorded here is the original battery, run end to end from a
+clean `tmp/tlc-meta-*` state on 2026-07-28, plus the focused catalog-only pre-fold drain amendment
+run on 2026-08-01 and a LIST-trust audit of six models the phase did not rewrite (scope stated
+exactly in [that section](#list-trust-audit)).
 
 ## Gate {#gate}
 
 > **`TLA PHASE: PASS`**
 
-Every green is green and every `_sab_` is red, across **93 configs in 10 asserted batteries** — the
-five models this phase wrote or rewrote (66 configs) plus the five older models whose runners this
-task upgraded to name assertions (27 configs). No config was skipped, none was left without a
+Every green is green and every `_sab_` is red, across **107 configs in 11 asserted batteries** — the
+six current phase model families (80 configs) plus the five older models whose runners this task upgraded
+to name assertions (27 configs). No config was skipped, none was left without a
 verdict, and no expectation is satisfied by a bare exit code: every red is matched against the NAME
 of the invariant or property it had to break.
 
@@ -33,27 +34,28 @@ of the invariant or property it had to break.
 |---|---|---|---|---|---|---|
 | `CaRefTableSnapshotLogCore` | `run_refsnaplog.sh` | 15 | 5 | 10 | 130 s | 15/15 |
 | `CaRefDeltaIntakeCore` | `run_deltaintake.sh` | 13 | 5 | 8 | 833 s | 13/13 |
-| `CaRefCatalogCore` | `run_refcatalog.sh` | 13 | 2 | 11 | 7 s | 13/13 |
-| `CaRefNsCleanupStaleLeaderCore` | `run_nscleanup_staleleader.sh` | 3 | 1 | 2 | 2 s | 3/3 |
+| `CaRefCatalogCore` | `run_refcatalog.sh` | 16 | 2 | 14 | 10 s | 16/16 |
+| `CaRefNsCleanupStaleLeaderCore` | `run_nscleanup_staleleader.sh` | 4 | 1 | 3 | 4 s | 4/4 |
+| `CaRefPreFoldDrainCore` (+ all-row companion) | `run_prefold_drain.sh` | 10 | 2 | 8 | 8 s | 10/10 |
 | `CaCasMountCore` | `run_mount.sh` | 22 | 2 | 20 | 583 s | 22/22 |
 | `CaBuildRootPrecommit` | `run_buildrootprecommit.sh` (NEW) | 8 | 4 | 4 | 90 s | 8/8 |
 | `CaDiskLifecycle` | `run_disklifecycle.sh` (upgraded) | 7 | 1 | 6 | 5 s | 7/7 |
 | `CaErasureProof` | `run_erasureproof.sh` (upgraded) | 6 | 2 | 4 | 9 s | 6/6 |
 | `CaRefFoldClampRecoveryCore` | `run_foldclamp.sh` (upgraded) | 2 | 1 | 1 | 1 s | 2/2 |
 | `CaRefWriterCleanupCore` | `run_refwcleanup.sh` (upgraded) | 4 | 1 | 3 | 2 s | 4/4 |
-| **total** | | **93** | **24** | **69** | **~28 min** | **93/93** |
+| **total** | | **107** | **26** | **81** | **~28 min + focused reruns** | **107/107** |
 
 `CaCasMountCore` also carries a 23rd config on disk, `_rev6_observe`, which is `SLOW=1`-gated: it does
 not complete in an interactive budget and that is pre-existing (confirmed against the pre-2026-07-24
 committed model). It is excluded from the default battery *with a verdict of its own* (`incomplete`),
 not silently.
 
-Reds are not all sabotages, and the distinction matters. The 69 break down as:
+Reds are not all sabotages, and the distinction matters. The 81 break down as:
 
-- **49 sabotage-class** — a load-bearing rule removed, one per config. 46 are named `_sab_*`; the
+- **59 sabotage-class** — a load-bearing rule removed, one per config. 56 are named `_sab_*`; the
   other three are `CaBuildRootPrecommit`'s necessity matrix (`_buggy`, `_buildrootonly`, `_lazyleak`),
   which remove a half of the fix rather than a rule, and are the same kind of evidence.
-- **16 reachability witnesses** — negated reachability, where the violation IS the evidence that a
+- **18 reachability witnesses** — negated reachability, where the violation IS the evidence that a
   branch is live (`_witness_*` plus `_b2_witness`).
 - **4 FINDINGS** — a red that reports a real defect rather than validating a guard:
   `CaRefDeltaIntakeCore_witness_corruptgap` (spec §5's named residual),
@@ -61,7 +63,7 @@ Reds are not all sabotages, and the distinction matters. The 69 break down as:
   lifecycle v1 excised natural erasure promotion), and
   `CaRefCatalogCore_finding_briefreconcileinv` (the task brief's proposed invariant, refuted).
 
-Each is labelled where it appears; none is a phase failure. Two of the 69 are liveness reds
+Each is labelled where it appears; none is a phase failure. Two of the 81 are liveness reds
 (`CaBuildRootPrecommit_lazyleak`, `CaDiskLifecycle_sab_nogcselfexit`), which TLC reports without a
 property name — see [the `temporal` expectation kind](#fix-runners) for how those are still asserted.
 
@@ -71,14 +73,15 @@ property name — see [the `temporal` expectation kind](#fix-runners) for how th
 |---|---|---|
 | §2 **INV-1** per-namespace contiguous ids, the every-attempt rule | `CaRefTableSnapshotLogCore` | `_sab_reuseafterambiguous` (`INV_NO_PHANTOM`), `_sab_gaponfail` (`INV_DENSE`) |
 | §2 **INV-2** every epoch transition closed in-band by a `slot-occupy` seal | `CaRefTableSnapshotLogCore` | `_sab_noseal`, `_sab_sealclobbersbase` (`INV_RECOVERY`), `_sab_blindput` (`INV_NO_GHOST`), and **the flip**: `_v9_flip_latepred` GREEN — rev.4's `Late Predecessor PUT` counterexample is now a proof |
-| §2 **INV-3** the catalog with ref-layer incarnations | `CaRefCatalogCore` (NEW) | `_sab_janitoreatsnewborn`, `_sab_zombiegolive` (`INV_NEWBORN_SAFE`), `_sab_reconcile*` (`INV_RECONCILE_SAFE`), `_sab_sameincarnationrebirth` (`INV_NO_ALIAS`), `_sab_floorretainsdeadname` (`INV_BOUNDED_CATALOG`) |
-| §2 **INV-4** `_ckpt` gating of deletion and of the recovery base | `CaRefTableSnapshotLogCore`, `CaRefCatalogCore` | `_sab_cleanupaboveckpt`, `_sab_staleckptcorruption`, `_sab_entrybeforeckptdelete` (`INV_CKPT_ORDER`) |
+| §2 **INV-3** the catalog with ref-layer incarnations | `CaRefCatalogCore`, `CaRefPreFoldDrainCore` | local exact-row deletion proof: `_sab_deletewithoutevidence`, `_sab_deletewithforeignevidence`, `_sab_deleteunderhold`, `_sab_deletewithoutexactobservation` (`INV_REMOVAL_DELETE_PROVED`); cross-object barrier: `_sab_*_bypasses_drain`, `_sab_continue_after_unknown`, `_sab_stale_delete_after_successor_hold`, `_sab_rebuild_from_unadopted_seal` |
+| §2 **INV-4** `_ckpt` gating of the recovery base | `CaRefTableSnapshotLogCore` | `_sab_cleanupaboveckpt`, `_sab_staleckptcorruption` |
 | §3 **Lifecycles**, removal/recreation under a stale leader | `CaRefNsCleanupStaleLeaderCore` | `_sab_noincarnation`, `_sab_rederive` (`NoLiveDataDeleted`) |
 | §4 **Recovery** (arithmetic tail, CAS-walk, seal, install) | `CaRefTableSnapshotLogCore`, `CaCasMountCore` | `_v9_safe`/`_v9_safe_deep`; `_witness_genrefused`, `_witness_sealrejected` |
 | §5 **fold**, the destructive-round **frontier proof**, the durable **hold** | `CaRefDeltaIntakeCore` | `_sab_skipquietprobe`, `_sab_cleanupignorescursor`, `_sab_deleteignoresindeg` (`NoAckedLoss`), `_sab_destroyunderhold`/`_sab_rebuilddropshold`/`_sab_clearholdonabsent` (`HoldSuppresses`), `_ctl_holdsuppresses` GREEN as their control |
 | §5 the **named residual** (corruption above an unwitnessed gap) | `CaRefDeltaIntakeCore` | `_witness_corruptgap` — committed RED, *evidence not failure* |
 | §5 **LIST is a zero-trust hint** — the headline flip | `CaRefDeltaIntakeCore` + `CaRefTableSnapshotLogCore` | **the regression pair**: `_v9_hintomission` GREEN (the hint omits everything, forever) beside `_sab_scanistruth` RED (`INV_RECOVERY`) |
 | §7 REBUILD preserves holds | `CaRefDeltaIntakeCore` | `_sab_rebuilddropshold`, `_v9_hold` |
+| §7 REBUILD drains before its fresh catalog cut | `CaRefPreFoldDrainCore` | `_sab_rebuild_bypasses_drain`, `_sab_rebuild_from_unadopted_seal` |
 | §9 r9-5 recovery generations (old-generation install / wedge retry / slot byte-compare) | `CaCasMountCore` | `_sab_staleinstall`, `_sab_wedgeretryoldgen` (`GlobalSupersededWriterMakesNoMutation`), `_sab_slotnocompare` (`AckedOpsAreDurable`) + their three `_strictorder` twins, gated GREEN by `_v9_recoverygen` |
 
 **Deliberate scope note — the temporal lemma's writer-side arms are NOT modelled here.** Spec §5's
@@ -91,16 +94,21 @@ a stated choice, not a gap nobody noticed.
 
 ## Harness output {#harness}
 
-Every runner below was executed **sequentially** on 2026-07-28 from a cleared `tmp/tlc-meta-*` state
-(215 stale metadirs removed first), each into `tmp/task6_<runner>.log`, with `timeout 3600` per
-runner. `SECONDS` is wall time per config on a 32-core host — wall time, not CPU time, and the two
-runners that use `-workers auto` (`run_refsnaplog.sh`, `run_deltaintake.sh`) are therefore not
-comparable with the `-workers 1` ones.
+The original battery was executed **sequentially** on 2026-07-28 from a cleared
+`tmp/tlc-meta-*` state (215 stale metadirs removed first), each into `tmp/task6_<runner>.log`, with
+`timeout 3600` per runner. The amended `CaRefCatalogCore`, `CaRefNsCleanupStaleLeaderCore`, and new
+`CaRefPreFoldDrainCore` batteries were run separately on 2026-08-01. `SECONDS` is wall time per
+config on a 32-core host — wall time, not CPU time, and the two runners that use `-workers auto`
+(`run_refsnaplog.sh`, `run_deltaintake.sh`) are therefore not comparable with the `-workers 1` ones.
 
 ### Every config, expected vs observed {#master-table}
 
-Rows are the runners' own output lines, concatenated by a throwaway script rather than retyped — so
-a row here cannot disagree with the log it came from.
+The 2026-07-28 rows are the original runners' output lines. The amended-model rows below are
+transcribed from `build/test_task5_prefold_refcatalog_20260801.log`,
+`build/test_task5_prefold_nscleanup_staleleader_witness_20260801.log`, and the generated/state/depth table in
+[`CaRefPreFoldDrainCore_RESULTS.md`](CaRefPreFoldDrainCore_RESULTS.md). The latter table is the
+authority for focused-model counts; this aggregate does not invent a per-config wall time that its
+runner did not record.
 
 | model | config | expected | observed | s | verdict |
 |---|---|---|---|---|---|
@@ -136,7 +144,10 @@ a row here cannot disagree with the log it came from.
 | `CaRefCatalogCore` | `_sab_zombiegolive` | violation | violation:INV_NEWBORN_SAFE | 1 | PASS |
 | `CaRefCatalogCore` | `_sab_reconcilelivecreator` | violation | violation:INV_RECONCILE_SAFE | 1 | PASS |
 | `CaRefCatalogCore` | `_sab_reconcilestaletoken` | violation | violation:INV_RECONCILE_SAFE | 0 | PASS |
-| `CaRefCatalogCore` | `_sab_entrybeforeckptdelete` | violation | violation:INV_CKPT_ORDER | 1 | PASS |
+| `CaRefCatalogCore` | `_sab_deletewithoutevidence` | violation | violation:INV_REMOVAL_DELETE_PROVED | 1 | PASS |
+| `CaRefCatalogCore` | `_sab_deletewithforeignevidence` | violation | violation:INV_REMOVAL_DELETE_PROVED | 1 | PASS |
+| `CaRefCatalogCore` | `_sab_deleteunderhold` | violation | violation:INV_REMOVAL_DELETE_PROVED | 0 | PASS |
+| `CaRefCatalogCore` | `_sab_deletewithoutexactobservation` | violation | violation:INV_REMOVAL_DELETE_PROVED | 1 | PASS |
 | `CaRefCatalogCore` | `_sab_sameincarnationrebirth` | violation | violation:INV_NO_ALIAS | 0 | PASS |
 | `CaRefCatalogCore` | `_sab_floorretainsdeadname` | violation | violation:INV_BOUNDED_CATALOG | 1 | PASS |
 | `CaRefCatalogCore` | `_finding_briefreconcileinv` | violation | violation:INV_RECONCILE_SAFE_BRIEF | 0 | PASS |
@@ -144,10 +155,21 @@ a row here cannot disagree with the log it came from.
 | `CaRefCatalogCore` | `_churn` | green | green | 1 | PASS |
 | `CaRefCatalogCore` | `_witness_churn3` | violation | violation:WITNESS_CHURN | 0 | PASS |
 | `CaRefCatalogCore` | `_witness_aliasremnant` | violation | violation:WITNESS_ALIAS_REMNANT | 1 | PASS |
-| `CaRefCatalogCore` | `_witness_orphaneaten` | violation | violation:WITNESS_ORPHAN_EATEN | 0 | PASS |
-| `CaRefNsCleanupStaleLeaderCore` | `_sab_noincarnation` | violation | violation:NoLiveDataDeleted | 1 | PASS |
+| `CaRefCatalogCore` | `_witness_orphaneaten` | violation | violation:WITNESS_ORPHAN_EATEN | 1 | PASS |
+| `CaRefNsCleanupStaleLeaderCore` | `_sab_noincarnation` | violation | violation:NoLiveDataDeleted | 0 | PASS |
 | `CaRefNsCleanupStaleLeaderCore` | `_sab_rederive` | violation | violation:NoLiveDataDeleted | 1 | PASS |
 | `CaRefNsCleanupStaleLeaderCore` | `_safe` | green | green | 0 | PASS |
+| `CaRefNsCleanupStaleLeaderCore` | `_witness_captureatdeposition` | violation | violation:WITNESS_CAPTURED_BEFORE_REBIRTH | 0 | PASS |
+| `CaRefPreFoldDrainCore` | `_sab_fold_bypasses_drain` | violation | violation:DrainBeforeDecision | see per-model results | PASS |
+| `CaRefPreFoldDrainCore` | `_sab_rebuild_bypasses_drain` | violation | violation:DrainBeforeDecision | see per-model results | PASS |
+| `CaRefPreFoldDrainCore` | `_sab_defer_bypasses_drain` | violation | violation:DrainBeforeDecision | see per-model results | PASS |
+| `CaRefPreFoldDrainCore` | `_sab_continue_after_unknown` | violation | violation:DrainBeforeDecision | see per-model results | PASS |
+| `CaRefPreFoldDrainCore` | `_sab_stale_delete_after_successor_hold` | violation | violation:DeleteUsesCurrentAdoptedProof | see per-model results | PASS |
+| `CaRefPreFoldDrainCore` | `_sab_rebuild_from_unadopted_seal` | violation | violation:DeleteUsesCurrentAdoptedProof | see per-model results | PASS |
+| `CaRefPreFoldDrainCore` | `_safe` | green | green | see per-model results | PASS |
+| `CaRefPreFoldDrainCore` | `_witness_takeover_converges` | violation | violation:WITNESS_TAKEOVER_CONVERGES | see per-model results | PASS |
+| `CaRefPreFoldDrainAllRowsCore` | `_sab_skiprescan` | violation | violation:AllEligibleRowsResolvedBeforeDecision | see per-model results | PASS |
+| `CaRefPreFoldDrainAllRowsCore` | `_safe` | green | green | see per-model results | PASS |
 | `CaCasMountCore` | `_sab_epochreset` | violation | violation:WriterEpochMonotoneUnique | 1 | PASS |
 | `CaCasMountCore` | `_sab_foreigntakeover` | violation | violation:ForeignUuidNeverAutoTakesOver | 0 | PASS |
 | `CaCasMountCore` | `_sab_adoptwedge` | violation | violation:NoPermanentWedge | 1 | PASS |
@@ -200,25 +222,26 @@ a row here cannot disagree with the log it came from.
 
 ### Runner verdicts and wall times {#runner-verdicts}
 
-**This block is a normalized transcript, not a paste.** It joins two sources per row — the chain
-driver's `=== DONE … rc=… seconds=…` line (`tmp/task6_phase_chain.log`, `tmp/task6_old_chain.log`)
-and the runner's own final tally (`tmp/task6_<runner>.log`). The raw logs are the authority; the
-per-config table above is the load-bearing evidence and *is* byte-for-byte its generator's output.
+**This block is a normalized transcript, not a paste.** Original rows join the chain driver's
+`=== DONE … rc=… seconds=…` line (`tmp/task6_phase_chain.log`, `tmp/task6_old_chain.log`) and the
+runner's own final tally (`tmp/task6_<runner>.log`). The two amended rows are labelled explicitly;
+their focused logs and per-model RESULTS file are the authority.
 
 Provenance, per row, because "which version of the script produced this" is the whole point of
-recording it: the five **phase** runners ran exactly once, in one chain, and were never touched. The
-five **older** runners each report a re-run rather than the chain's first pass — all five after the
-classifier fix described below, and `run_foldclamp.sh` / `run_refwcleanup.sh` once more after the
-review's Minor-6/7 changes (which are classification-only: both came back with the same colours, the
-same names and the same totals).
+recording it: the original five **phase** runners ran once in one chain. The catalog runner shown
+below is the amended 2026-08-01 re-run, and the pre-fold drain runner is new. The five **older**
+runners each report a re-run rather than the chain's first pass — all five after the classifier fix
+described below, and `run_foldclamp.sh` / `run_refwcleanup.sh` once more after the review's Minor-6/7
+changes (which are classification-only: both came back with the same colours, names and totals).
 
 ```
 === DONE  run_refsnaplog.sh             rc=0 seconds=130   ALL EXPECTATIONS MET   (15/15)
 === DONE  run_deltaintake.sh            rc=0 seconds=833   ALL EXPECTATIONS MET   (13/13)
-=== DONE  run_refcatalog.sh             rc=0 seconds=7     ALL EXPECTATIONS MET   (13/13)
-=== DONE  run_nscleanup_staleleader.sh  rc=0 seconds=2     ALL EXPECTATIONS MET   (3/3)
+=== DONE  run_refcatalog.sh             rc=0 seconds=10    ALL EXPECTATIONS MET   (16/16)  <- 2026-08-01 focused re-run
+=== DONE  run_nscleanup_staleleader.sh  rc=0 seconds=4     ALL EXPECTATIONS MET   (4/4)
+=== DONE  run_prefold_drain.sh           rc=0 seconds=8    ALL EXPECTATIONS MET   (10/10) <- 2026-08-01 amendment
 === DONE  run_mount.sh                  rc=0 seconds=583   ALL EXPECTATIONS MET   (22/22)
---- the five phase runners above ran once, in one chain; nothing was re-run ---
+--- the original phase runners ran in one chain; the two annotated rows are later focused runs ---
 === DONE  run_buildrootprecommit.sh     rc=0 seconds=90    ALL EXPECTATIONS MET   (8/8)
 === DONE  run_disklifecycle.sh          rc=0 seconds=5     ALL EXPECTATIONS MET   (7/7)   <- RE-RUN (rc=1 first pass)
 === DONE  run_erasureproof.sh           rc=0 seconds=9     ALL EXPECTATIONS MET   (6/6)
@@ -371,11 +394,11 @@ reproduces its own pre-fix search exactly — `_buggy` 394 states / 117 distinct
 A whole-directory scan for the pattern (`' =` followed by an unparenthesised ` \/ ` on the same line,
 plus the multi-line continuation shape) found **exactly one** live instance — this one. Every other
 ghost latch in the model set, in all 23 modules, already wraps its disjunction. That includes all
-five models this phase wrote or rewrote, which adopted the convention from the start.
+the phase models, which adopted the convention from the start.
 
 ### (B) Runner discipline: name assertions instead of bare exit codes {#fix-runners}
 
-The five phase runners assert *which* invariant a sabotage broke (`violation:${want}`). Auditing the
+The phase runners assert *which* invariant a sabotage broke (`violation:${want}`). Auditing the
 other runners found four that gate an expectation without that assertion — and two of them were worse
 than weak, they were **permanently failing**:
 
@@ -431,13 +454,11 @@ was its entire test. The strengthened runner is what made the model's real behav
 failed **closed**: an unrecognised outcome matches no expectation, so the mistake could only cost a
 spurious FAIL, never a spurious PASS.
 
-**Follow-up, deliberately not taken here:** the five phase runners carry the same `[A-Za-z_]+`
-pattern. It is inert today — no config in any of the five phase models declares an invariant or
-property whose name contains a digit (checked mechanically across all 66 configs) — and it fails
-closed if one ever does. It was left alone so that every line of harness output in this file comes
-from a byte-identical copy of the script in the tree; changing five reviewed runners for an inert nit
-would have cost the gate that property, or another full re-run to restore it. The one-line fix, when
-someone next touches those files: widen the character class.
+**Historical follow-up, now closed:** the original five phase runners carried the same
+`[A-Za-z_]+` pattern. It was inert in that battery — no config in those 66 runs declared an
+invariant or property whose name contains a digit — but it still represented future false-negative
+risk. The current phase runners use `[A-Za-z0-9_]+`; the amended catalog and stale-janitor batteries
+and the new pre-fold battery were run after that correction.
 
 **Not changed, and why.** Nine runners are single-config drivers (`./run_X.sh <cfg>`) that assert
 nothing by construction — `run_ackfloor`, `run_ackfloor_zombie`, `run_condemnmarker`, `run_ebo`,
@@ -485,10 +506,11 @@ the same 47 configs — so whoever picks up either should pick up both.
 - **`-workers 1`** in the phase runners that report numbers: parallel BFS visits states in a
   nondeterministic order, so depth, state counts and *which* shortest counterexample TLC prints all
   vary run to run, while the traces narrated in the RESULTS files are specific action sequences.
-- **Findings are not sabotages.** **Four** of the 93 battery configs are reds that report a defect
+- **Findings are not sabotages.** **Four** of the 107 battery configs are reds that report a defect
   rather than validate a guard — `CaRefDeltaIntakeCore_witness_corruptgap`,
   `CaErasureProof_gc_asbuilt`, `CaErasureProof_gc_promptliteral` and
-  `CaRefCatalogCore_finding_briefreconcileinv` — matching the count in [the gate](#gate)
-  (49 + 16 + 4 = 69). A fifth red of the same kind, `CaRelinkConfirmCore_sab_holeylist`, is the
+  `CaRefCatalogCore_finding_briefreconcileinv` — matching the count in [the gate](#gate).
+  A fifth red of the same kind, `CaRelinkConfirmCore_sab_holeylist`, is the
   historical witness and is **not** in any battery, so it is not in that arithmetic. Each is
-  labelled where it appears.
+  labelled where it appears. The current arithmetic is 59 sabotage-class + 18 witnesses + 4
+  findings = 81 reds.

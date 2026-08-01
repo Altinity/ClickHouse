@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Run every CaRefCatalogCore config and print a one-line PASS/FAIL verdict per config.
 # Model: the v9 namespace catalog (spec 2026-07-27-cas-ref-chain-complete-cut-design.md,
-# §2 INV-3 catalog + ref-layer incarnations + the churn bound, §2 INV-4 `_ckpt` and its removal
-# ordering, §3 Lifecycles). Results and traces: CaRefCatalogCore_RESULTS.md.
+# §2 INV-3 catalog + opaque life identities + the churn bound, and the `_ckpt` creation readiness
+# required by §2 INV-4, §3 Lifecycles). Results and traces: CaRefCatalogCore_RESULTS.md.
 #
 # Sabotages run FIRST: a green is only evidence once the property it rests on has been seen red.
 #
@@ -18,8 +18,10 @@
 #   sab_reconcilestaletoken    -> INV_RECONCILE_SAFE   reconcile only by TOKEN-EXACT CAS: on a stale
 #                                                      sample the victim is whatever the catalog
 #                                                      holds now, up to a `Live` successor
-#   sab_entrybeforeckptdelete  -> INV_CKPT_ORDER       INV-4: exact-token `_ckpt` delete while
-#                                                      `Removing`, catalog entry LAST
+#   sab_deletewithoutevidence  -> INV_REMOVAL_DELETE_PROVED  adopted matching evidence required
+#   sab_deletewithforeignevidence -> INV_REMOVAL_DELETE_PROVED evidence must name this life
+#   sab_deleteunderhold        -> INV_REMOVAL_DELETE_PROVED  a held life is not drainable
+#   sab_deletewithoutexactobservation -> INV_REMOVAL_DELETE_PROVED exact catalog row required
 #   sab_sameincarnationrebirth -> INV_NO_ALIAS         THE inertness proof: reuse the incarnation and
 #                                                      removal's missing physical-empty proof turns
 #                                                      into a new life reading a dead one's bytes
@@ -71,7 +73,10 @@ CONFIGS=(
   "sab_zombiegolive           violation  INV_NEWBORN_SAFE"
   "sab_reconcilelivecreator   violation  INV_RECONCILE_SAFE"
   "sab_reconcilestaletoken    violation  INV_RECONCILE_SAFE"
-  "sab_entrybeforeckptdelete  violation  INV_CKPT_ORDER"
+  "sab_deletewithoutevidence  violation  INV_REMOVAL_DELETE_PROVED"
+  "sab_deletewithforeignevidence violation INV_REMOVAL_DELETE_PROVED"
+  "sab_deleteunderhold        violation  INV_REMOVAL_DELETE_PROVED"
+  "sab_deletewithoutexactobservation violation INV_REMOVAL_DELETE_PROVED"
   "sab_sameincarnationrebirth violation  INV_NO_ALIAS"
   "sab_floorretainsdeadname   violation  INV_BOUNDED_CATALOG"
   "finding_briefreconcileinv  violation  INV_RECONCILE_SAFE_BRIEF"

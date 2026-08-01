@@ -1,245 +1,135 @@
 -------------------- MODULE CaRefNsCleanupStaleLeaderCore --------------------
-(* GC namespace-cleanup stale-leader core, rewritten for v9 — spec
-   2026-07-27-cas-ref-chain-complete-cut-design.md §2 INV-3 (ref-layer-scoped incarnations,
-   structural inertness) and §3 Lifecycles (removal, recreation). TLA+ phase (gate), Task 4.
+(* Perpetual namespace-janitor stale-leader core — spec
+   2026-07-27-cas-ref-chain-complete-cut-design.md §2 INV-3.
 
-   SUPERSEDES the 2026-07-11 design's `_cleanup`-marker / marker-state recreation gate, which this
-   module used to model directly (git history: the removal -> marker -> recreation ->
-   straggler-delete interleaving, guarded by a live round re-read + a marker check + an epoch filter).
-   v9 DELETES that gate for the ref layer outright — no marker, no round to re-read, no epoch to
-   filter — and this module now proves what carries the same safety property in its place.
+   Task 5 has no synchronous namespace-removal cleanup pass. The next GC invocation performs only a
+   catalog pre-fold drain; physical `cas/ns/<life_id>/...` residue is later listed by the perpetual
+   janitor. This module keeps the stale-actor obligation that survives that simplification:
 
-   SCOPE — REF LAYER ONLY. §2 INV-3: "the incarnation ... qualifies the ref layer only:
-   `<ns>/<inc>/{_log, _snap, _ckpt}` ... verbatim FILES stay unqualified and keep today's `_cleanup`
-   gate — their pre-existing rebirth-aliasing hazard is register item R1, not this spec." This module
-   therefore models ref-layer objects only, generalised (no `_log`/`_snap`/`_ckpt` distinction — none
-   of the three is reachable except through the incarnation-qualified prefix all three share, so
-   nothing is lost by treating them as one kind) and does NOT model files at all: the FILE layer's
-   `_cleanup` marker gate is untouched by v9 and stays exactly as load-bearing as before — that is
-   register R1's open problem, not this module's.
+   1. the catalog-only drain deletes life 1's `Removing` row;
+   2. a janitor LIST page captures an exact physical `life_id` from a returned key;
+   3. the post-page catalog cut proves that id is no longer named and nominates it;
+   4. the janitor stalls, the logical name is reborn with a fresh id, and the new life writes;
+   5. the stale janitor resumes its exact physical delete.
 
-   WHY A DEDICATED MODULE, STILL. CaRefCatalogCore (Task 3) is the deep model of catalog lifecycles —
-   creation's three conditional writes, reconciliation of a stale `Creating`, the lazy janitor's
-   per-object incarnation scope, the churn bound — and its `Janitor` action already proves
-   foreign-incarnation debris is safe to delete IN GENERAL. What it does not construct is the ONE
-   interleaving this module exists for: a GC leader that captured an incarnation BEFORE deposition,
-   stalled, and resumes its physical-delete pass only after that SAME NAME has been reborn. That is a
-   straggling actor racing its own stale, already-captured state against catalog transitions it never
-   observed — exactly the shape `CaRefWriterCleanupCore` explicitly declines to model ("no recreation
-   in this small model") and `CaRefDeltaIntakeCore` abstracts past (its `Cleanup` is covered-LOG
-   cleanup, not this physical `@cas@`-prefix pass). The catalog machinery below is deliberately thin —
-   just enough state to make "recreation only starts once the old entry is gone" true — because the
-   full lifecycle is Task 3's proof, not this one's; see the Scoping section of
-   CaRefNsCleanupStaleLeaderCore_RESULTS.md for the exact simplifications and why each is safe to make
-   here.
-
-   MODELED INTERLEAVING. A GC leader A folds the terminal, attaches optional cleanup evidence to the
-   existing life row, then deposits a cleanup scope capturing its opaque `life_id` in `staleInc` — and
-   STALLS before running its physical-delete pass
-   (a VM pause; the P3.1 fence-out class). Meanwhile the removal completes (`EntryDelete`: the catalog
-   entry goes `absent`, with NO physical-empty proof owed — INV-3's whole point) and the SAME name is
-   reborn (`Recreate`: a fresh incarnation is minted; `Creating` + `_ckpt` create + the `Live` CAS are
-   collapsed into one step, see Scoping) which then does ordinary ref-layer work (`WriteObject`).
-   Leader A resumes and runs its stale pass exactly once, at whatever point in this sequence TLC's
-   interleaving happens to schedule it — before the entry-delete, after it, before or after rebirth,
-   before or after the new life's own write. `Next` explores all of them.
-
-   THE RULE UNDER TEST used to be Step 6 straggler safety: a live re-read of the round, an abort on the
-   `_cleanup` marker's presence, and an epoch filter on manifest deletes — three independent guards,
-   each re-checked against fresh state at delete time. v9 deletes all three from the ref layer's
-   recreation gate, and nothing replaces THEM as a live check. That is not the same claim as
-   "destructive cleanup has no live precondition at all" — spec §2's read-side contract still mandates
-   that "destructive cleanup revalidates life and fence immediately before every delete", and a real
-   implementation keeps doing exactly that. This model does not need that revalidation to prove
-   `NoLiveDataDeleted` and deliberately does not model it: `StaleLeaderPass` below is UNCONDITIONAL, an
-   adversarial OVER-approximation of what the spec actually allows a delete to attempt, and the
-   property survives anyway. That is a STRONGER result than "the revalidation catches it" would be —
-   not a claim that the revalidation is unnecessary, absent, or this model's business.
-
-   What IS gone, structurally, is any need for a live re-check of the DELETED incarnation's identity —
-   and that only holds if the pass's target is itself trustworthy. A namespace-cleanup item names
-   exactly one incarnation, `staleInc`, captured at deposition; spec §3 now states as a normative rule
-   what this model exists to prove as an obligation: "the namespace-cleanup item carries the
-   incarnation captured at deposition, and a resumed pass NEVER re-derives it from the catalog" (§3,
-   added by this task's review — commit `d1eae033122`). `PassTarget` below is the switch between
-   "capture" and "re-derive"; `SabotageRederive` is what an implementation that gets this backwards
-   looks like: it resolves its target from the CURRENT `entry.inc` at resume time instead of the value
-   deposited with the item, and the moment the namespace has been reborn that current value simply IS
-   the live incarnation — no aliasing needed, the pass just targets the right thing for the wrong
-   reason.
-
-   Safety is therefore a structural consequence of TWO independent facts, each with its own lever:
-   (1) `Recreate` never reusing `staleInc` (`SabotageNoIncarnation` breaks this — the same hazard as
-   `SabotageSameIncarnationRebirth` in CaRefCatalogCore, replayed here in the stale-leader shape), and
-   (2) the pass always using the incarnation captured at deposition, never one re-read at resume
-   (`SabotageRederive` breaks this). Either alone reaches live data, by a different route: the first
-   makes the CAPTURED value alias onto a live one; the second makes the pass stop using the captured
-   value at all. That is the model-level proof the main plan cites: incarnation freshness AND
-   deposit-time capture — not physical-empty polling, not a marker, and not the spec's separate
-   revalidation requirement — are what carry rebirth safety for this specific hazard. *)
+   Honest cleanup always targets the captured physical id. It never re-resolves the logical name at
+   resume time. `SabotageRederive` models that forbidden re-resolution; `SabotageNoIncarnation`
+   independently models same-id rebirth. Either makes the stale delete reach live data. The focused
+   cross-object order between the pre-fold catalog CAS and successor-seal adoption is proved by
+   `CaRefPreFoldDrainCore`; duplicating it here would create a second protocol owner. *)
 EXTENDS Integers
 
 CONSTANTS
-    MaxInc,                \* incarnations mintable in one run (TLC bound, as CaRefCatalogCore)
-    SabotageNoIncarnation, \* recreation reuses `staleInc` instead of minting fresh (INV-3)
-    SabotageRederive \* the resumed pass resolves its target from `entry.inc` (the CURRENT
-                            \* catalog entry) instead of the incarnation captured at deposition
-                            \* (spec §3: "a resumed pass NEVER re-derives it from the catalog")
+    MaxInc,
+    SabotageNoIncarnation,
+    SabotageRederive
 
 ASSUME MaxInc \in Nat /\ MaxInc >= 2
 
 Incs == 1..MaxInc
 
 VARIABLES
-    entry,           \* [state: {"removing","absent","live"}, inc: 0..MaxInc] — THE one namespace
-                      \* name's catalog record, thinned to what this module's interleaving needs
-                      \* (Scoping: no `Creating` phase, no `_ckpt`/terminal-record bookkeeping — that
-                      \* is CaRefCatalogCore's proof)
-    staleInc,         \* 0..MaxInc: the opaque life id captured at cleanup-scope deposition
-    nextInc,          \* 1..MaxInc+1: fresh-incarnation allocator (as CaRefCatalogCore's `nextInc`) —
-                      \* a counter here because the only property ever used is freshness, not order
-    objects,          \* SUBSET Incs: incarnations whose ref-layer object(s) are physically present
-    cleanupEvidence,  \* SUBSET Incs: optional terminal-fold evidence attached to a life row
-    passDone,         \* BOOLEAN: leader A's stale deposited pass has executed (once)
-    deletedLiveData   \* ghost, sticky: the stale pass deleted an object belonging to the namespace's
-                      \* CURRENT ("live") incarnation — the hazard under test
+    entry,             \* [state: {"removing","absent","live"}, inc: 0..MaxInc]
+    listedInc,         \* physical life id captured from one janitor LIST page
+    nominated,         \* a later catalog cut proved `listedInc` foreign
+    nextInc,           \* fresh-life allocator; ordering is irrelevant, freshness is not
+    objects,           \* physical `cas/ns/<life_id>/...` objects
+    passDone,          \* the deposited janitor delete executes at most once
+    deletedLiveData    \* sticky ghost: stale cleanup deleted the current live life's bytes
 
-vars == << entry, staleInc, nextInc, objects, cleanupEvidence, passDone, deletedLiveData >>
+vars == << entry, listedInc, nominated, nextInc, objects, passDone, deletedLiveData >>
 
 Init ==
-    /\ entry = [state |-> "removing", inc |-> 1]  \* terminal folding and scope deposition begin here
-    /\ staleInc = 0
-    /\ nextInc = 2                                 \* 1 is already spoken for by the dying life
-    /\ objects = {1}                               \* the dying life's own leftover data — the pass's
-                                                    \* legitimate cleanup target
-    /\ cleanupEvidence = {}
+    /\ entry = [state |-> "removing", inc |-> 1]
+    /\ listedInc = 0
+    /\ nominated = FALSE
+    /\ nextInc = 2
+    /\ objects = {1}
     /\ passDone = FALSE
     /\ deletedLiveData = FALSE
 
-(* Folding the terminal attaches positive evidence to the same life row. It is optional until this
-   point and carries no marker-driven cleanup-state enumeration. *)
-FoldTerminal ==
+(* Abstracts the proved catalog-only pre-fold deletion. Evidence, no-hold and exact-row checks are
+   local properties of `CaRefCatalogCore`; A/B helping and successor ordering are
+   `CaRefPreFoldDrainCore`'s property. No physical object changes here. *)
+PreFoldDelete ==
     /\ entry.state = "removing"
-    /\ entry.inc \notin cleanupEvidence
-    /\ cleanupEvidence' = cleanupEvidence \cup {entry.inc}
-    /\ UNCHANGED << entry, staleInc, nextInc, objects, passDone, deletedLiveData >>
-
-(* The cleanup scope captures the opaque id while the old row is still current. A resumed pass uses
-   this value; it never resolves a logical name to choose a fresh target. *)
-DepositCleanupScope ==
-    /\ entry.state = "removing"
-    /\ entry.inc \in cleanupEvidence
-    /\ staleInc = 0
-    /\ staleInc' = entry.inc
-    /\ UNCHANGED << entry, nextInc, objects, cleanupEvidence, passDone, deletedLiveData >>
-
-(* The direct catalog deletion needs terminal evidence but no physical-empty predicate. This module
-   abstracts the no-hold check, which is modeled in detail by `CaRefCatalogCore`. *)
-EntryDelete ==
-    /\ entry.state = "removing"
-    /\ staleInc = entry.inc
-    /\ entry.inc \in cleanupEvidence
     /\ entry' = [state |-> "absent", inc |-> 0]
-    /\ UNCHANGED << staleInc, nextInc, objects, cleanupEvidence, passDone, deletedLiveData >>
+    /\ UNCHANGED << listedInc, nominated, nextInc, objects, passDone, deletedLiveData >>
 
-(* THE REBIRTH. Spec §3: recreation begins only once the old entry is `absent` — no marker, no
-   physical-empty proof, just a fresh incarnation (spec §2 INV-3: "random 128-bit, minted at
-   `Creating`"; modelled, as in CaRefCatalogCore, as a monotonic allocator because the only property
-   ever used is freshness, never ordering). Collapsed straight to `live` — the `Creating` phase's two
-   extra conditional writes (the `_ckpt` create, the `Live` CAS) are Task 3's proof, not this one's;
-   nothing about the leader-straggler hazard depends on the intermediate state.
+(* One zero-trust LIST page returns a physical key and deposits the id encoded in that key. *)
+ListCandidate ==
+    /\ listedInc = 0
+    /\ \E i \in objects : listedInc' = i
+    /\ UNCHANGED << entry, nominated, nextInc, objects, passDone, deletedLiveData >>
 
-   `SabotageNoIncarnation` is the one and only lever: it reuses `staleInc` instead of minting, which
-   is precisely the alternative INV-3's inertness argument depends on NOT happening ("surviving
-   old-incarnation objects are structurally inert" is true only because the incarnation is not
-   reused). *)
-NewInc == IF SabotageNoIncarnation THEN staleInc ELSE nextInc
+(* Required order: LIST page, then a fresh complete catalog cut. Only an id that cut does not name is
+   nominated. The cut may be absent or may already name a different reborn life. *)
+PostPageCutAndNominate ==
+    /\ listedInc # 0
+    /\ ~nominated
+    /\ (entry.state = "absent" \/ entry.inc # listedInc)
+    /\ nominated' = TRUE
+    /\ UNCHANGED << entry, listedInc, nextInc, objects, passDone, deletedLiveData >>
+
+NewInc == IF SabotageNoIncarnation THEN listedInc ELSE nextInc
 
 Recreate ==
     /\ entry.state = "absent"
+    /\ listedInc # 0
     /\ nextInc <= MaxInc
     /\ entry' = [state |-> "live", inc |-> NewInc]
     /\ nextInc' = nextInc + 1
-    /\ UNCHANGED << staleInc, objects, cleanupEvidence, passDone, deletedLiveData >>
+    /\ UNCHANGED << listedInc, nominated, objects, passDone, deletedLiveData >>
 
-(* Ordinary ref-layer work under the reborn life: an appended `_log`, an installed `_snap`, a `_ckpt`
-   write — all at `<ns>/<inc>/...`, so all indistinguishable at this model's granularity. Idempotent
-   on purpose (a union, not a guarded first-write): this module does not care how many times the new
-   life writes, only whether ITS incarnation's objects survive the straggler. *)
 WriteObject ==
     /\ entry.state = "live"
     /\ objects' = objects \cup {entry.inc}
-    /\ UNCHANGED << entry, staleInc, nextInc, cleanupEvidence, passDone, deletedLiveData >>
+    /\ UNCHANGED << entry, listedInc, nominated, nextInc, passDone, deletedLiveData >>
 
-(* Spec §3's normative rule, added by this task's review (commit `d1eae033122`): "the
-   namespace-cleanup item carries the incarnation captured at deposition, and a resumed pass NEVER
-   re-derives it from the catalog". Honestly, always `staleInc` — the value fixed at `Init`, never
-   `entry.inc` as it stands right now. `SabotageRederive` is the one way to break the rule: the pass
-   resolves its OWN target from whatever the catalog currently says, which is indistinguishable from
-   "discovering current lives" (spec §2's ordinary, legitimate use of `entry.inc`) right up to the
-   moment the name has been reborn — at which point it is simply the live incarnation, not a captured
-   cleanup scope at all. *)
-PassTarget == IF SabotageRederive THEN entry.inc ELSE staleInc
+DeleteTarget == IF SabotageRederive THEN entry.inc ELSE listedInc
 
-(* Leader A resumes its stale deposited pass (once), at ANY point after deposition — `Next`'s
-   interleaving explores every placement relative to `EntryDelete`, `Recreate` and `WriteObject`.
-   The `_cleanup`-marker / round-recheck gate spec §3 deletes for the ref layer has no replacement
-   live check IN THIS ACTION — spec §2's mandated destructive-cleanup revalidation (life + fence) is
-   a real, separate precondition a real implementation still owes on every delete; this model
-   deliberately omits it to prove the STRONGER claim that `NoLiveDataDeleted` does not depend on it.
-   What the action does still have to get right is `PassTarget`: there is no marker check, no round
-   CAS, and (honestly) no re-derivation — the action is unconditional on the catalog's current state
-   on purpose. The honest config's green is not "a guard held", it is "there was nothing to reach":
-   `PassTarget` cannot coincide with the live incarnation unless something upstream — an incarnation
-   reuse, or a re-derivation — made it so. *)
-StaleLeaderPass ==
-    /\ staleInc # 0
+(* A stale janitor may resume after arbitrary delay. Exact physical identity, not continued lease
+   ownership, makes the old-life target structurally unable to name the fresh life. *)
+StaleJanitorDelete ==
+    /\ nominated
     /\ ~passDone
     /\ passDone' = TRUE
-    /\ deletedLiveData' = (deletedLiveData \/
-                            (entry.state = "live" /\ entry.inc = PassTarget /\ PassTarget \in objects))
-    /\ objects' = objects \ {PassTarget}
-    /\ UNCHANGED << entry, staleInc, nextInc, cleanupEvidence >>
+    /\ deletedLiveData' =
+        (deletedLiveData \/
+            (entry.state = "live" /\ entry.inc = DeleteTarget /\ DeleteTarget \in objects))
+    /\ objects' = objects \ {DeleteTarget}
+    /\ UNCHANGED << entry, listedInc, nominated, nextInc >>
 
 NoOp == UNCHANGED vars
 
 Next ==
-    \/ FoldTerminal \/ DepositCleanupScope \/ EntryDelete
+    \/ PreFoldDelete
+    \/ ListCandidate
+    \/ PostPageCutAndNominate
     \/ Recreate
     \/ WriteObject
-    \/ StaleLeaderPass
+    \/ StaleJanitorDelete
     \/ NoOp
 
 Spec == Init /\ [][Next]_vars
 
-----------------------------------------------------------------------------
-(* ---- invariants ---- *)
-
 TypeOK ==
     /\ entry \in [state : {"removing", "absent", "live"}, inc : 0..MaxInc]
-    /\ (entry.state = "absent" <=> entry.inc = 0)
-    /\ staleInc \in 0..MaxInc
+    /\ ((entry.state = "absent") <=> (entry.inc = 0))
+    /\ listedInc \in 0..MaxInc
+    /\ nominated \in BOOLEAN
     /\ nextInc \in 1..(MaxInc + 1)
     /\ objects \subseteq Incs
-    /\ cleanupEvidence \subseteq Incs
     /\ passDone \in BOOLEAN
     /\ deletedLiveData \in BOOLEAN
 
-(* (SAFETY, spec §2 INV-3: "surviving old-incarnation objects are structurally inert"; spec §3: a
-   cleanup scope's incarnation is fixed at deposition, never re-derived.) The stale deposited pass —
-   entirely unguarded, unconditional, running at any point in the interleaving — never deletes the
-   reborn life's own data, PROVIDED both of its inputs are honest: `Recreate` mints a fresh
-   incarnation (`~SabotageNoIncarnation`) and the pass targets what it captured at deposition, not a
-   value re-read from the current catalog (`~SabotageRederive`). Either sabotage alone is enough to
-   make `PassTarget = entry.inc` while `entry.state = "live"`, by a different route, and either alone
-   is therefore enough to violate this. *)
 NoLiveDataDeleted == ~deletedLiveData
 
-CaptureHasEvidence == (staleInc # 0) => (staleInc \in cleanupEvidence)
+NominationCapturedPhysicalId == nominated => listedInc # 0
 
-(* Negated witness: a scope was captured while the predecessor was `Removing` and remains distinct
-   after same-name rebirth. This keeps the capture-at-deposition path executable in a green model. *)
+(* Negated witness: a physical id was captured and nominated before/through same-name rebirth, and
+   remains distinct from the live successor id. A violation is the reachability evidence. *)
 WITNESS_CAPTURED_BEFORE_REBIRTH ==
-    ~(entry.state = "live" /\ staleInc # 0 /\ staleInc # entry.inc)
+    ~(entry.state = "live" /\ nominated /\ listedInc # 0 /\ listedInc # entry.inc)
 
 =============================================================================

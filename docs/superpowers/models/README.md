@@ -97,9 +97,10 @@ of `CaGcRootLocalPartManifestCore`.
 | `CaRetiredInRunFoldAbortWitness.tla` | GC freshness meta is add-only: a spare never clears a condemned marker | CURRENT | `run_foldabort_witness.sh` |
 | `CaRefTableSnapshotLogCore.tla` | v9 contiguous ref stream: state-derived dense ids, every-attempt reuse rule, `_ckpt`-based recovery base + arithmetic walk, in-band `slot-occupy` epoch seal — `LatePredecessorPut` FLIPPED from rev.4 expected-fail to green, with `_sab_noseal` as the control | CURRENT (v9 rewrite 2026-07-28; gates the ref-chain implementation) | `run_refsnaplog.sh` |
 | `CaRefDeltaIntakeCore.tla` | pool-wide GC fold: arithmetic walk, destructive-round frontier proof, durable hold | CURRENT | `run_deltaintake.sh` |
-| `CaRefCatalogCore.tla` | v9 namespace catalog: create/reconcile/remove lifecycles, ref-layer incarnations (debris is inert, so `EntryDelete` needs no physical-empty proof), the admission fence + catalog token-CAS that refuse a fenced-out creator's late install, `_ckpt`-before-entry removal ordering, and the O(`Creating`+`Live`+`Removing`) bound under create/drop churn | CURRENT (new 2026-07-28; gates the ref-chain implementation) | `run_refcatalog.sh` |
+| `CaRefCatalogCore.tla` | local namespace lifecycle: create/reconcile safety, fresh opaque life ids, bounded catalog churn, and evidence + no-hold + exact-row authorization for `Removing -> absent` | CURRENT (re-scoped 2026-08-01; gates the ref-chain implementation) | `run_refcatalog.sh` |
+| `CaRefPreFoldDrainCore.tla` | two-GC-actor ordering plus its two-row serial-rescan companion: adopted-parent proof, conclusive exact catalog drain, fresh post-drain cut, then fold/`REBUILD`/`DEFER`; damaged-state `REBUILD` restores authority without deleting catalog rows | CURRENT (new 2026-08-01; owns the cross-object removal order) | `run_prefold_drain.sh` |
 | `CaRefFoldClampRecoveryCore.tla` | fold clamp always recoverable: per-log cleanup staging | CURRENT | `run_foldclamp.sh` |
-| `CaRefNsCleanupStaleLeaderCore.tla` | v9 rewrite: a stale GC leader's physical-delete pass targets only the incarnation captured at deposition, never re-derived, so recreation's fresh incarnation makes rebirth safety structural (no marker, no round re-check) | CURRENT (v9 rewrite 2026-07-28; gates the ref-chain implementation) | `run_nscleanup_staleleader.sh` |
+| `CaRefNsCleanupStaleLeaderCore.tla` | perpetual janitor: a LIST page captures an exact physical life id, and a delayed delete never re-derives its target from a reborn logical name | CURRENT (re-scoped 2026-08-01; gates the ref-chain implementation) | `run_nscleanup_staleleader.sh` |
 | `CaRefWriterCleanupCore.tla` | ref-table writer ownership lifecycle: precommit, promote, fence, successor cleanup | CURRENT | `run_refwcleanup.sh` |
 | `CaRelinkConfirmCore.tla` | publish-then-confirm relink: gate 1 (exact-`ManifestRef` equality, lane quiescence, poison, mount fence) and the publish-before-confirm order, each proven load-bearing — **plus the finding that the theorem is violable independently of the protocol under an honest fold cursor** | CURRENT (gates unlanded Part B; `_main` is CONDITIONAL on `LIST` completeness) | `run_relinkconfirm.sh` |
 | `CaErasureProof.tla` | rev.7 natural `Vanished(erased)` proof soundness: writer paths closed by op-gate + guard counter + LIST-reset + grace ([D1] grace proven load-bearing); two GC-side windows found — evidence in the decision to excise the natural-erasure stack from v1 | HISTORICAL (design excised before activation) | `run_erasureproof.sh` |
@@ -228,37 +229,37 @@ ordered scan and cleanup deletes only what it observed durable. The migration is
   durably, and REBUILD must carry the hold. Reproduces the r7-1 (cross-namespace hidden `+1`) and
   r8 (REBUILD forgets the hold) blockers as counterexamples, and records one residual exposure of
   v9 as a runnable witness. Full verdicts and traces: `CaRefDeltaIntakeCore_RESULTS.md`.
-- **`CaRefCatalogCore.tla`** — the namespace catalog (v9): ONE name lived over and over, everything
-  keyed by incarnation, so the question is not what one life does but what SURVIVES a life and what
-  the next life makes of it. Removal deletes the catalog entry with NO physical-empty proof —
-  surviving debris is inert because no future life can name it — which is what keeps the catalog
-  O(`Creating` + `Live` + `Removing`) under create/drop churn; reuse the incarnation and the new
-  life's first read lands in a dead life's footprint. Also gates creation's three-write order, the
-  `_ckpt`-before-entry removal ordering, and BOTH of reconciliation's preconditions (token-exact CAS
-  and a terminal creator fence) — the token-exact half being the one that, when dropped, lets a
-  stale reconciler delete a `Live` entry and hand the janitor a running namespace to collect. A
-  creator is FENCED by losing its entry, not erased: it keeps its incarnation, fence and `_ckpt` ack
-  and will finish creation blind, so the model carries the admission fence generation and the
-  catalog token-CAS as explicit conjuncts of the install and proves both load-bearing — that route
-  aliases a `Live` name onto a swept prefix with no incarnation reuse at all. The `seq_floor`
-  alternative the user rejected is committed as a runnable counterexample. Full verdicts and traces:
+- **`CaRefCatalogCore.tla`** — the local namespace lifecycle: one logical name lived repeatedly
+  through `Creating`, `Live`, `Removing`, and absence. Fresh opaque life ids make surviving physical
+  residue inert and keep the catalog bounded under churn. Creation and reconciliation retain their
+  fence and exact-token gates. Removal's local authorization is factored into one invariant: the
+  adopted row has matching positive terminal evidence, carries no hold, and the mutation deletes the
+  complete exact `Removing` row it observed. Four isolated sabotages prove each part load-bearing.
+  This model deliberately does not own the temporal relation between that proof and a later adopted
+  seal; that cross-object order belongs only to `CaRefPreFoldDrainCore`. Full verdicts and traces:
   `CaRefCatalogCore_RESULTS.md`.
+- **`CaRefPreFoldDrainCore.tla`** — the focused two-GC-actor proof for catalog-only pre-fold drain.
+  After acquiring the lease, an invocation reads the authoritative adopted parent, resolves every
+  eligible exact catalog CAS conclusively, and takes a fresh catalog cut before ordinary fold,
+  `REBUILD`, or `DEFER`. An ambiguous result cannot be treated as completion while the same exact row
+  may remain. A stale actor's late request cannot delete against a successor hold, and a missing or
+  undecodable `gc/state` authorizes only authority-restoring `REBUILD`, never a catalog delete based
+  on a seal found by LIST. The takeover witness shows a successor helping an ambiguous predecessor
+  to convergence. Its `CaRefPreFoldDrainAllRowsCore` companion independently proves that a
+  full-catalog token invalidated by one exact delete forces a complete serial rescan before the next
+  candidate or successor decision. Full verdicts and traces: `CaRefPreFoldDrainCore_RESULTS.md`.
 - **`CaRefFoldClampRecoveryCore.tla`** — a clamped fold (a log held back at an unreadable body)
   must stay recoverable: body tokens named by a log's removal records may join the round's cleanup
   set only once the WHOLE log folds, and a clamp discards the log's staged tokens. Committing at
   edge granularity instead deletes a body the clamped log still needs, and every later re-fold
   then clamps on the missing body — a permanent, pool-wide destructive freeze.
-- **`CaRefNsCleanupStaleLeaderCore.tla`** — rewritten for v9: a GC leader that stalls while owing a
-  namespace-cleanup physical-delete pass must not reclaim a namespace reborn while it slept. The old
-  design's guard (re-read the GC round, abort on a `_cleanup` marker, epoch-filter the deletes) has
-  no v9 analogue — it is deleted outright, not hardened — because the ref layer is now
-  incarnation-qualified (`<ns>/<inc>/...`) and the pass is UNCONDITIONAL: safety is structural,
-  resting on two independent facts instead. (1) Recreation always mints a fresh incarnation, so a
-  pass scoped to the incarnation it captured before deposition can never reach a reborn life's data
-  (`_sab_noincarnation` reuses the incarnation and breaks it). (2) The pass always uses that captured
-  incarnation, never one re-read from the current catalog entry at resume time — spec §3's rule that
-  a cleanup item's scope is fixed at deposition (`_sab_rederive` re-derives it and breaks it). Files
-  are out of scope here and keep today's `_cleanup`-marker gate unchanged (register R1, pre-existing).
+- **`CaRefNsCleanupStaleLeaderCore.tla`** — the perpetual `cas/ns/` janitor's delayed-delete proof.
+  A LIST page captures the physical life id from a returned key, and a later catalog cut nominates
+  that id as foreign. The deletion may resume after same-name rebirth, but it still targets the
+  captured physical id rather than resolving the logical name again. Fresh life ids and physical-id
+  capture are independently load-bearing: `_sab_noincarnation` and `_sab_rederive` each delete live
+  successor data. Pre-fold catalog ordering is out of scope here and belongs to
+  `CaRefPreFoldDrainCore`; local catalog deletion proof belongs to `CaRefCatalogCore`.
 - **`CaRefWriterCleanupCore.tla`** — the writer-side ownership lifecycle for one table: a build
   precommits (owns its precommit record), promote atomically removes the precommit and installs
   the committed owner, gated on the current epoch; failed builds are cleaned in the order
