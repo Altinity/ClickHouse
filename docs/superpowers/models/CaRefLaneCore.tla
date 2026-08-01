@@ -41,7 +41,9 @@ Two runtime ids and two durable life ids are sufficient for every identity
 interleaving in scope: one predecessor, one successor, removal/rebirth, and a
 self-remount that reuses the durable life with a later accepted fence. The
 six-state lane remains single-copy and belongs to the captured predecessor;
-the cache submodel below does not multiply that state-space product.
+`lane_runtime`, `attempt_runtime`, and `resolver_runtime` bind its real actions
+to that predecessor. The per-runtime cache/durable maps project the real lane
+scalars without multiplying that state-space product.
 *)
 RuntimeIds == {"r1", "r2"}
 NoRuntime == "none"
@@ -50,7 +52,7 @@ NoIdentity == [life |-> 0, admitted |-> 0]
 RuntimeIdentityValues ==
     [life : 0..2, admitted : 0..3]
 ArmPhases == {"Armed", "Fenced", "ArmPending"}
-OldOperations == {"append", "read", "publish", "resolve"}
+OldOperations == {"read", "publish"}
 
 VARIABLES
     lane,
@@ -77,6 +79,10 @@ VARIABLES
     saw_faulted,
     slot_runtime,
     old_handle_runtime,
+    lane_runtime,
+    attempt_runtime,
+    resolver_runtime,
+    lane_effect_target,
     live_runtimes,
     runtime_identity,
     identity_ledger,
@@ -91,6 +97,7 @@ VARIABLES
     old_action_kind,
     bad_late_detach,
     bad_missing_allocation,
+    bad_lane_retarget,
     saw_rebirth_old_action,
     saw_self_remount,
     saw_late_invalidation_preserved,
@@ -104,18 +111,32 @@ laneVars ==
        saw_durable_adoption, saw_recovery, saw_stale_result, saw_closed, saw_faulted >>
 
 runtimeVars ==
-    << slot_runtime, old_handle_runtime, live_runtimes, runtime_identity,
+    << slot_runtime, old_handle_runtime, lane_runtime, attempt_runtime,
+       resolver_runtime, lane_effect_target, live_runtimes, runtime_identity,
        identity_ledger, runtime_cache_marker, runtime_durable_marker,
        catalog_life, observed_lives, accepted_generations, arm_phase,
        pending_invalidation, old_action_target, old_action_kind,
-       bad_late_detach, bad_missing_allocation, saw_rebirth_old_action,
+       bad_late_detach, bad_missing_allocation, bad_lane_retarget,
+       saw_rebirth_old_action,
        saw_self_remount, saw_late_invalidation_preserved,
        saw_missing_confirmation >>
+
+runtimeObjectVars ==
+    << slot_runtime, old_handle_runtime, lane_runtime, live_runtimes,
+       runtime_identity, identity_ledger, catalog_life, observed_lives,
+       accepted_generations, arm_phase, pending_invalidation >>
+
+runtimeAuxVars ==
+    << old_action_target, old_action_kind, bad_late_detach,
+       bad_missing_allocation, saw_self_remount,
+       saw_late_invalidation_preserved, saw_missing_confirmation >>
 
 vars == << laneVars, runtimeVars >>
 
 CurrentRuntime == runtime_generation = authority_generation
 Outstanding == lane \in {"Writing", "Wedged"}
+LaneTarget(captured) ==
+    IF SabotageOldHandleRetarget THEN slot_runtime ELSE captured
 
 Init ==
     /\ lane = "Ready"
@@ -142,6 +163,10 @@ Init ==
     /\ saw_faulted = FALSE
     /\ slot_runtime = "r1"
     /\ old_handle_runtime = "r1"
+    /\ lane_runtime = "r1"
+    /\ attempt_runtime = NoRuntime
+    /\ resolver_runtime = NoRuntime
+    /\ lane_effect_target = NoRuntime
     /\ live_runtimes = {"r1"}
     /\ runtime_identity =
         [r \in RuntimeIds |-> IF r = "r1" THEN [life |-> 1, admitted |-> 1] ELSE NoIdentity]
@@ -158,6 +183,7 @@ Init ==
     /\ old_action_kind = "none"
     /\ bad_late_detach = FALSE
     /\ bad_missing_allocation = FALSE
+    /\ bad_lane_retarget = FALSE
     /\ saw_rebirth_old_action = FALSE
     /\ saw_self_remount = FALSE
     /\ saw_late_invalidation_preserved = FALSE
@@ -476,11 +502,13 @@ FenceMove ==
                     bad_append, bad_install, bad_certification, saw_commit,
                     saw_unresolved, saw_retry_created, saw_durable_adoption,
                     saw_recovery, saw_stale_result, saw_closed, saw_faulted,
-                    old_handle_runtime, runtime_cache_marker,
+                    old_handle_runtime, lane_runtime, attempt_runtime,
+                    resolver_runtime, lane_effect_target, runtime_cache_marker,
                     runtime_durable_marker, catalog_life, observed_lives,
                     accepted_generations, pending_invalidation,
                     old_action_target, old_action_kind, bad_late_detach,
-                    bad_missing_allocation, saw_rebirth_old_action,
+                    bad_missing_allocation, bad_lane_retarget,
+                    saw_rebirth_old_action,
                     saw_self_remount, saw_late_invalidation_preserved,
                     saw_missing_confirmation >>
 
@@ -499,24 +527,28 @@ ForeignWrite ==
 BeginRearm ==
     /\ arm_phase = "Fenced"
     /\ arm_phase' = "ArmPending"
-    /\ UNCHANGED << laneVars, slot_runtime, old_handle_runtime,
+    /\ UNCHANGED << laneVars, slot_runtime, old_handle_runtime, lane_runtime,
+                    attempt_runtime, resolver_runtime, lane_effect_target,
                     live_runtimes, runtime_identity, identity_ledger,
                     runtime_cache_marker, runtime_durable_marker, catalog_life,
                     observed_lives, accepted_generations, pending_invalidation,
                     old_action_target, old_action_kind, bad_late_detach,
-                    bad_missing_allocation, saw_rebirth_old_action,
+                    bad_missing_allocation, bad_lane_retarget,
+                    saw_rebirth_old_action,
                     saw_self_remount, saw_late_invalidation_preserved,
                     saw_missing_confirmation >>
 
 FailRearm ==
     /\ arm_phase = "ArmPending"
     /\ arm_phase' = "Fenced"
-    /\ UNCHANGED << laneVars, slot_runtime, old_handle_runtime,
+    /\ UNCHANGED << laneVars, slot_runtime, old_handle_runtime, lane_runtime,
+                    attempt_runtime, resolver_runtime, lane_effect_target,
                     live_runtimes, runtime_identity, identity_ledger,
                     runtime_cache_marker, runtime_durable_marker, catalog_life,
                     observed_lives, accepted_generations, pending_invalidation,
                     old_action_target, old_action_kind, bad_late_detach,
-                    bad_missing_allocation, saw_rebirth_old_action,
+                    bad_missing_allocation, bad_lane_retarget,
+                    saw_rebirth_old_action,
                     saw_self_remount, saw_late_invalidation_preserved,
                     saw_missing_confirmation >>
 
@@ -542,10 +574,12 @@ AcceptRearm ==
                     bad_append, bad_install, bad_certification, saw_commit,
                     saw_unresolved, saw_retry_created, saw_durable_adoption,
                     saw_recovery, saw_stale_result, saw_closed, saw_faulted,
-                    old_handle_runtime, runtime_cache_marker,
+                    old_handle_runtime, lane_runtime, attempt_runtime,
+                    resolver_runtime, lane_effect_target, runtime_cache_marker,
                     runtime_durable_marker, catalog_life, observed_lives,
                     pending_invalidation, old_action_target, old_action_kind,
                     bad_late_detach, bad_missing_allocation,
+                    bad_lane_retarget,
                     saw_rebirth_old_action, saw_late_invalidation_preserved,
                     saw_missing_confirmation >>
 
@@ -554,12 +588,14 @@ RemoveCatalogLife ==
     /\ pending_invalidation = NoRuntime
     /\ catalog_life' = 0
     /\ pending_invalidation' = slot_runtime
-    /\ UNCHANGED << laneVars, slot_runtime, old_handle_runtime,
+    /\ UNCHANGED << laneVars, slot_runtime, old_handle_runtime, lane_runtime,
+                    attempt_runtime, resolver_runtime, lane_effect_target,
                     live_runtimes, runtime_identity, identity_ledger,
                     runtime_cache_marker, runtime_durable_marker,
                     observed_lives, accepted_generations, arm_phase,
                     old_action_target, old_action_kind, bad_late_detach,
-                    bad_missing_allocation, saw_rebirth_old_action,
+                    bad_missing_allocation, bad_lane_retarget,
+                    saw_rebirth_old_action,
                     saw_self_remount, saw_late_invalidation_preserved,
                     saw_missing_confirmation >>
 
@@ -567,12 +603,14 @@ RebirthCatalogLife ==
     /\ catalog_life = 0
     /\ catalog_life' = 2
     /\ observed_lives' = observed_lives \cup {2}
-    /\ UNCHANGED << laneVars, slot_runtime, old_handle_runtime,
+    /\ UNCHANGED << laneVars, slot_runtime, old_handle_runtime, lane_runtime,
+                    attempt_runtime, resolver_runtime, lane_effect_target,
                     live_runtimes, runtime_identity, identity_ledger,
                     runtime_cache_marker, runtime_durable_marker,
                     accepted_generations, arm_phase, pending_invalidation,
                     old_action_target, old_action_kind, bad_late_detach,
-                    bad_missing_allocation, saw_rebirth_old_action,
+                    bad_missing_allocation, bad_lane_retarget,
+                    saw_rebirth_old_action,
                     saw_self_remount, saw_late_invalidation_preserved,
                     saw_missing_confirmation >>
 
@@ -589,38 +627,32 @@ FreshCatalogLookup ==
     /\ identity_ledger' =
         [identity_ledger EXCEPT
             !["r2"] = [life |-> catalog_life, admitted |-> authority_generation]]
-    /\ UNCHANGED << laneVars, old_handle_runtime, runtime_cache_marker,
+    /\ UNCHANGED << laneVars, old_handle_runtime, lane_runtime,
+                    attempt_runtime, resolver_runtime, lane_effect_target,
+                    runtime_cache_marker,
                     runtime_durable_marker, catalog_life, observed_lives,
                     accepted_generations, arm_phase, pending_invalidation,
                     old_action_target, old_action_kind, bad_late_detach,
-                    bad_missing_allocation, saw_rebirth_old_action,
+                    bad_missing_allocation, bad_lane_retarget,
+                    saw_rebirth_old_action,
                     saw_self_remount, saw_late_invalidation_preserved,
                     saw_missing_confirmation >>
 
+(* Reader/publisher abstractions have no lane scalar effect; both use the captured handle. *)
 OldHandleOperation(kind) ==
     /\ live_runtimes = RuntimeIds
     /\ runtime_identity["r2"].life = 2
     /\ old_action_target = NoRuntime
-    /\ LET target == IF SabotageOldHandleRetarget THEN slot_runtime ELSE old_handle_runtime
-       IN /\ target \in RuntimeIds
-          /\ runtime_cache_marker[target] = 0
-          /\ runtime_durable_marker[target] = 0
-          /\ old_action_target' = target
-          /\ old_action_kind' = kind
-          /\ runtime_cache_marker' =
-                IF kind = "append"
-                  THEN runtime_cache_marker
-                  ELSE [runtime_cache_marker EXCEPT ![target] = 1]
-          /\ runtime_durable_marker' =
-                IF kind = "append"
-                  THEN [runtime_durable_marker EXCEPT ![target] = 1]
-                  ELSE runtime_durable_marker
-          /\ saw_rebirth_old_action' = (target = old_handle_runtime)
-    /\ UNCHANGED << laneVars, slot_runtime, old_handle_runtime,
+    /\ old_action_target' = old_handle_runtime
+    /\ old_action_kind' = kind
+    /\ UNCHANGED << laneVars, slot_runtime, old_handle_runtime, lane_runtime,
+                    attempt_runtime, resolver_runtime, lane_effect_target,
                     live_runtimes, runtime_identity, identity_ledger,
+                    runtime_cache_marker, runtime_durable_marker,
                     catalog_life, observed_lives, accepted_generations,
                     arm_phase, pending_invalidation, bad_late_detach,
-                    bad_missing_allocation, saw_self_remount,
+                    bad_missing_allocation, bad_lane_retarget,
+                    saw_rebirth_old_action, saw_self_remount,
                     saw_late_invalidation_preserved,
                     saw_missing_confirmation >>
 
@@ -637,35 +669,35 @@ LateExactInvalidation ==
     /\ saw_late_invalidation_preserved' =
         (slot_runtime = "r2" /\ pending_invalidation = "r1" /\ slot_runtime' = "r2")
     /\ pending_invalidation' = NoRuntime
-    /\ UNCHANGED << laneVars, old_handle_runtime, live_runtimes,
+    /\ UNCHANGED << laneVars, old_handle_runtime, lane_runtime,
+                    attempt_runtime, resolver_runtime, lane_effect_target,
+                    live_runtimes,
                     runtime_identity, identity_ledger, runtime_cache_marker,
                     runtime_durable_marker, catalog_life, observed_lives,
                     accepted_generations, arm_phase, old_action_target,
                     old_action_kind, bad_missing_allocation,
+                    bad_lane_retarget,
                     saw_rebirth_old_action, saw_self_remount,
                     saw_missing_confirmation >>
 
 ConfirmMissingName ==
     /\ catalog_life = 0
-    /\ "r2" \notin live_runtimes
-    /\ identity_ledger["r2"] = NoIdentity
+    /\ slot_runtime = NoRuntime
+    /\ arm_phase = "Armed"
     /\ IF SabotageMissingConfirmationAllocation
-          THEN /\ slot_runtime' = "r2"
-               /\ live_runtimes' = live_runtimes \cup {"r2"}
-               /\ runtime_identity' =
-                    [runtime_identity EXCEPT !["r2"] = [life |-> 0, admitted |-> 1]]
-               /\ identity_ledger' =
-                    [identity_ledger EXCEPT !["r2"] = [life |-> 0, admitted |-> 1]]
+          THEN /\ slot_runtime' = old_handle_runtime
                /\ bad_missing_allocation' = TRUE
-          ELSE /\ UNCHANGED << slot_runtime, live_runtimes,
-                                runtime_identity, identity_ledger,
-                                bad_missing_allocation >>
+          ELSE /\ UNCHANGED << slot_runtime, bad_missing_allocation >>
     /\ saw_missing_confirmation' = TRUE
-    /\ UNCHANGED << laneVars, old_handle_runtime, runtime_cache_marker,
-                    runtime_durable_marker, catalog_life, observed_lives,
+    /\ UNCHANGED << laneVars, old_handle_runtime, lane_runtime,
+                    attempt_runtime, resolver_runtime, lane_effect_target,
+                    live_runtimes, runtime_identity, identity_ledger,
+                    runtime_cache_marker, runtime_durable_marker, catalog_life,
+                    observed_lives,
                     accepted_generations, arm_phase, pending_invalidation,
                     old_action_target, old_action_kind, bad_late_detach,
-                    saw_rebirth_old_action, saw_self_remount,
+                    bad_lane_retarget, saw_rebirth_old_action,
+                    saw_self_remount,
                     saw_late_invalidation_preserved >>
 
 Certify ==
@@ -684,29 +716,175 @@ Certify ==
                     saw_commit, saw_unresolved, saw_retry_created, saw_durable_adoption,
                     saw_recovery, saw_stale_result, saw_closed, saw_faulted >>
 
+StartWriteScoped(new_binding, token) ==
+    /\ StartWrite(new_binding, token)
+    /\ attempt_runtime' = lane_runtime
+    /\ UNCHANGED << runtimeObjectVars, runtimeAuxVars, resolver_runtime,
+                    lane_effect_target, runtime_cache_marker,
+                    runtime_durable_marker, bad_lane_retarget,
+                    saw_rebirth_old_action >>
+
+UnarmedWriteScoped(new_binding) ==
+    /\ UnarmedWrite(new_binding)
+    /\ runtime_durable_marker' =
+        [runtime_durable_marker EXCEPT ![lane_runtime] = durable_id']
+    /\ lane_effect_target' = lane_runtime
+    /\ UNCHANGED << runtimeObjectVars, runtimeAuxVars, attempt_runtime,
+                    resolver_runtime, runtime_cache_marker,
+                    bad_lane_retarget, saw_rebirth_old_action >>
+
+WriteLandsScoped ==
+    /\ WriteLands
+    /\ LET target == LaneTarget(attempt_runtime)
+       IN /\ target \in RuntimeIds
+          /\ runtime_durable_marker' =
+                [runtime_durable_marker EXCEPT ![target] = durable_id']
+          /\ lane_effect_target' = target
+          /\ bad_lane_retarget' =
+                (bad_lane_retarget \/ target # attempt_runtime)
+          /\ saw_rebirth_old_action' =
+                (saw_rebirth_old_action
+                 \/ (/\ live_runtimes = RuntimeIds
+                     /\ runtime_identity["r2"].life = 2
+                     /\ target = attempt_runtime
+                     /\ runtime_durable_marker'["r2"] = runtime_durable_marker["r2"]))
+    /\ UNCHANGED << runtimeObjectVars, runtimeAuxVars, attempt_runtime,
+                    resolver_runtime, runtime_cache_marker >>
+
+InstallCommittedScoped ==
+    /\ InstallCommitted
+    /\ LET target == LaneTarget(attempt_runtime)
+       IN /\ target \in RuntimeIds
+          /\ runtime_cache_marker' =
+                [runtime_cache_marker EXCEPT ![target] = cache_id']
+          /\ lane_effect_target' = target
+          /\ bad_lane_retarget' =
+                (bad_lane_retarget \/ target # attempt_runtime)
+    /\ attempt_runtime' = NoRuntime
+    /\ UNCHANGED << runtimeObjectVars, runtimeAuxVars, resolver_runtime,
+                    runtime_durable_marker, saw_rebirth_old_action >>
+
+WriteDefinitelyRejectedScoped ==
+    /\ WriteDefinitelyRejected
+    /\ attempt_runtime' = NoRuntime
+    /\ UNCHANGED << runtimeObjectVars, runtimeAuxVars, resolver_runtime,
+                    lane_effect_target, runtime_cache_marker,
+                    runtime_durable_marker, bad_lane_retarget,
+                    saw_rebirth_old_action >>
+
+WriteUnresolvedScoped ==
+    /\ WriteUnresolved
+    /\ UNCHANGED runtimeVars
+
+DropUncertainScoped ==
+    /\ DropUncertain
+    /\ attempt_runtime' = NoRuntime
+    /\ UNCHANGED << runtimeObjectVars, runtimeAuxVars, resolver_runtime,
+                    lane_effect_target, runtime_cache_marker,
+                    runtime_durable_marker, bad_lane_retarget,
+                    saw_rebirth_old_action >>
+
+BeginResolveScoped ==
+    /\ BeginResolve
+    /\ resolver_runtime' = attempt_runtime
+    /\ UNCHANGED << runtimeObjectVars, runtimeAuxVars, attempt_runtime,
+                    lane_effect_target, runtime_cache_marker,
+                    runtime_durable_marker, bad_lane_retarget,
+                    saw_rebirth_old_action >>
+
+ObserveDurableScoped ==
+    /\ ObserveDurable
+    /\ LET target == LaneTarget(resolver_runtime)
+       IN /\ target \in RuntimeIds
+          /\ runtime_durable_marker' =
+                [runtime_durable_marker EXCEPT ![target] = durable_id']
+          /\ lane_effect_target' = target
+          /\ bad_lane_retarget' =
+                (bad_lane_retarget \/ target # resolver_runtime)
+    /\ UNCHANGED << runtimeObjectVars, runtimeAuxVars, attempt_runtime,
+                    resolver_runtime, runtime_cache_marker,
+                    saw_rebirth_old_action >>
+
+ApplyResolutionScoped ==
+    /\ ApplyResolution
+    /\ LET target == LaneTarget(resolver_runtime)
+       IN /\ target \in RuntimeIds
+          /\ runtime_cache_marker' =
+                IF cache_id' # cache_id
+                  THEN [runtime_cache_marker EXCEPT ![target] = cache_id']
+                  ELSE runtime_cache_marker
+          /\ lane_effect_target' = IF SameResolution THEN target ELSE lane_effect_target
+          /\ bad_lane_retarget' =
+                (bad_lane_retarget \/ (SameResolution /\ target # resolver_runtime))
+    /\ attempt_runtime' = IF attempt' = NoAttempt THEN NoRuntime ELSE attempt_runtime
+    /\ resolver_runtime' = NoRuntime
+    /\ UNCHANGED << runtimeObjectVars, runtimeAuxVars,
+                    runtime_durable_marker, saw_rebirth_old_action >>
+
+KnownDurableInstallFailureScoped ==
+    /\ KnownDurableInstallFailure
+    /\ attempt_runtime' = NoRuntime
+    /\ resolver_runtime' = NoRuntime
+    /\ UNCHANGED << runtimeObjectVars, runtimeAuxVars, lane_effect_target,
+                    runtime_cache_marker, runtime_durable_marker,
+                    bad_lane_retarget, saw_rebirth_old_action >>
+
+RecoverScoped ==
+    /\ Recover
+    /\ runtime_cache_marker' =
+        [runtime_cache_marker EXCEPT ![lane_runtime] = cache_id']
+    /\ lane_effect_target' = lane_runtime
+    /\ UNCHANGED << runtimeObjectVars, runtimeAuxVars, attempt_runtime,
+                    resolver_runtime, runtime_durable_marker,
+                    bad_lane_retarget, saw_rebirth_old_action >>
+
+AppendWhileBlockedScoped ==
+    /\ AppendWhileBlocked
+    /\ runtime_durable_marker' =
+        [runtime_durable_marker EXCEPT ![lane_runtime] = durable_id']
+    /\ lane_effect_target' = lane_runtime
+    /\ UNCHANGED << runtimeObjectVars, runtimeAuxVars, attempt_runtime,
+                    resolver_runtime, runtime_cache_marker,
+                    bad_lane_retarget, saw_rebirth_old_action >>
+
+ReplaceAttemptScoped ==
+    /\ ReplaceAttempt
+    /\ UNCHANGED runtimeVars
+
+ApplyWithoutIdentityScoped ==
+    /\ ApplyWithoutIdentity
+    /\ runtime_cache_marker' =
+        [runtime_cache_marker EXCEPT ![resolver_runtime] = cache_id']
+    /\ lane_effect_target' = resolver_runtime
+    /\ attempt_runtime' = NoRuntime
+    /\ resolver_runtime' = NoRuntime
+    /\ UNCHANGED << runtimeObjectVars, runtimeAuxVars,
+                    runtime_durable_marker, bad_lane_retarget,
+                    saw_rebirth_old_action >>
+
 LaneNext ==
-    \/ \E b \in Bindings, t \in Tokens : StartWrite(b, t)
-    \/ \E b \in Bindings : UnarmedWrite(b)
-    \/ WriteLands
-    \/ InstallCommitted
-    \/ WriteDefinitelyRejected
-    \/ WriteUnresolved
-    \/ DropUncertain
-    \/ BeginResolve
-    \/ ObserveDurable
     \/ ObserveUnknown
     \/ ObserveSuccessorSeal
     \/ ObserveForeign
-    \/ ApplyResolution
-    \/ KnownDurableInstallFailure
-    \/ Recover
-    \/ AppendWhileBlocked
-    \/ ReplaceAttempt
-    \/ ApplyWithoutIdentity
     \/ Certify
 
 Next ==
     \/ (LaneNext /\ UNCHANGED runtimeVars)
+    \/ \E b \in Bindings, t \in Tokens : StartWriteScoped(b, t)
+    \/ \E b \in Bindings : UnarmedWriteScoped(b)
+    \/ WriteLandsScoped
+    \/ InstallCommittedScoped
+    \/ WriteDefinitelyRejectedScoped
+    \/ WriteUnresolvedScoped
+    \/ DropUncertainScoped
+    \/ BeginResolveScoped
+    \/ ObserveDurableScoped
+    \/ ApplyResolutionScoped
+    \/ KnownDurableInstallFailureScoped
+    \/ RecoverScoped
+    \/ AppendWhileBlockedScoped
+    \/ ReplaceAttemptScoped
+    \/ ApplyWithoutIdentityScoped
     \/ FenceMove
     \/ BeginRearm
     \/ FailRearm
@@ -746,13 +924,17 @@ TypeOK ==
     /\ cache_id <= durable_id
     /\ slot_runtime \in RuntimeIds \cup {NoRuntime}
     /\ old_handle_runtime \in RuntimeIds
+    /\ lane_runtime \in RuntimeIds
+    /\ attempt_runtime \in RuntimeIds \cup {NoRuntime}
+    /\ resolver_runtime \in RuntimeIds \cup {NoRuntime}
+    /\ lane_effect_target \in RuntimeIds \cup {NoRuntime}
     /\ live_runtimes \subseteq RuntimeIds
     /\ slot_runtime # NoRuntime => slot_runtime \in live_runtimes
     /\ old_handle_runtime \in live_runtimes
     /\ runtime_identity \in [RuntimeIds -> RuntimeIdentityValues]
     /\ identity_ledger \in [RuntimeIds -> RuntimeIdentityValues]
-    /\ runtime_cache_marker \in [RuntimeIds -> 0..1]
-    /\ runtime_durable_marker \in [RuntimeIds -> 0..1]
+    /\ runtime_cache_marker \in [RuntimeIds -> 0..MaxTxn]
+    /\ runtime_durable_marker \in [RuntimeIds -> 0..MaxTxn]
     /\ catalog_life \in 0..2
     /\ observed_lives \subseteq Lives
     /\ accepted_generations \subseteq {1, 3}
@@ -762,6 +944,7 @@ TypeOK ==
     /\ old_action_kind \in OldOperations \cup {"none"}
     /\ bad_late_detach \in BOOLEAN
     /\ bad_missing_allocation \in BOOLEAN
+    /\ bad_lane_retarget \in BOOLEAN
     /\ saw_rebirth_old_action \in BOOLEAN
     /\ saw_self_remount \in BOOLEAN
     /\ saw_late_invalidation_preserved \in BOOLEAN
@@ -780,12 +963,28 @@ OutstandingRetainsExactAttempt ==
 NoAttemptOutsideOutstanding ==
     lane \notin {"Writing", "Wedged"} => attempt = NoAttempt
 
+CapturedRuntimeMatchesOwnership ==
+    /\ lane_runtime = old_handle_runtime
+    /\ runtime_identity[lane_runtime].admitted = runtime_generation
+    /\ (attempt = NoAttempt) = (attempt_runtime = NoRuntime)
+    /\ (resolver_attempt = NoAttempt) = (resolver_runtime = NoRuntime)
+    /\ attempt_runtime \in {NoRuntime, lane_runtime}
+    /\ resolver_runtime \in {NoRuntime, lane_runtime}
+
+RuntimeProjectionMatchesLane ==
+    ~SabotageOldHandleRetarget
+        => /\ runtime_cache_marker[lane_runtime] = cache_id
+           /\ runtime_durable_marker[lane_runtime] = durable_id
+
+RebirthOnly == authority_generation = 1
+
 NoAppendWhileBlocked == ~bad_append
 InstallMatchesAttempt == ~bad_install
 CertifiedViewIsCurrent == ~bad_certification
 
 NoOldHandleRetarget ==
-    old_action_target \in {NoRuntime, old_handle_runtime}
+    /\ ~bad_lane_retarget
+    /\ old_action_target \in {NoRuntime, old_handle_runtime}
 
 ExactPredecessorInvalidationPreservesSuccessor == ~bad_late_detach
 

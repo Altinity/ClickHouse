@@ -17,7 +17,9 @@ doc_type: 'reference'
 `NeedsRecovery`, `Closed`, and `Faulted`. It composes that single lane with a bounded cache model
 containing two concrete runtime ids and two durable life ids. The predecessor runtime remains owned
 by its captured handle while the non-authoritative logical-name slot may publish a distinct
-successor after removal/rebirth or same-life self-remount.
+successor after removal/rebirth or same-life self-remount. `StartWrite` captures `lane_runtime` in
+`attempt_runtime`; `BeginResolve` carries it into `resolver_runtime`; and the real write, install,
+resolution, and recovery transitions update per-runtime projections of `cache_id` and `durable_id`.
 
 The battery ran with:
 
@@ -31,19 +33,22 @@ All 24 expectations passed:
 - eleven single-rule sabotages violated their named invariant;
 - twelve reachability witnesses violated their negated witness invariant.
 
-The honest run generated 1,017,625 states, found 278,718 distinct states, reached depth 25, and
+The honest run generated 721,919 states, found 216,072 distinct states, reached depth 25, and
 exhausted the queue. The retained run summary is
-`build/test_CaRefLaneCore_checkpoint75c_final2.log`; detailed TLC output is under
-`build/tlc-runs/reflane/20260801-checkpoint75c-final2`.
+`build/test_CaRefLaneCore_checkpoint75c_r1_final.log`; detailed TLC output is under
+`build/tlc-runs/reflane/20260801-checkpoint75c-r1-final`.
 
 The sabotage controls cover arming before send, retaining uncertain attempts, blocking later
 appends, complete recovery, exact attempt identity, mount fencing, and `Ready`-only certification.
 The new controls independently violate `NoOldHandleRetarget`,
 `ExactPredecessorInvalidationPreservesSuccessor`, `PublishedRuntimeHasAcceptedIdentity`, and
-`MissingNameConfirmationAllocatesNothing`. The new witnesses reach predecessor/successor
-coexistence with a predecessor-scoped old operation, same-life self-remount at accepted generation
+`MissingNameConfirmationAllocatesNothing`. Every focused sabotage config checks all non-target
+safety invariants before its expected RED. The new witnesses reach predecessor/successor
+coexistence with a real predecessor-scoped `WriteLands`, same-life self-remount at accepted generation
 3 after fence-loss generation 2, exact delayed invalidation that preserves the successor, and an
-allocation-free missing-name confirmation. The earlier witnesses continue to reach ordinary commit,
+allocation-free missing-name confirmation. The old-handle sabotage drives that same real transition
+to `r2`, while the honest trace updates only `r1`. Missing-confirm sabotage only reattaches already
+valid live `r1` to an armed empty slot, so published identity remains valid. The earlier witnesses continue to reach ordinary commit,
 unresolved write, recovery, inert unrelated result, `Closed`, and `Faulted`.
 
 ## Relink composition {#relink-composition}

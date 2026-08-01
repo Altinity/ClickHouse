@@ -133,3 +133,110 @@ without changing allocation state.
 
 None. The model deliberately retains at most two bounded runtime records; it does not create an
 unbounded retired-history set or forbid same-name reuse.
+
+## Fix round 1 — real lane composition and isolated missing confirmation
+
+Round base: `fef37240a8ca8f7daa4aabec85b3227a994e013b`.
+
+Independent review found that the original runtime layer did not compose with the actual lane
+scalars and that missing-confirm sabotage also violated published-identity validity. Both findings
+were reproduced before correction.
+
+### Pre-fix evidence
+
+A deterministic six-state extension retained under `tmp/CaRefLaneCoreBlindSpot.tla` drove the exact
+review path:
+
+`StartWrite` → `RemoveCatalogLife` → `RebirthCatalogLife` → `FreshCatalogLookup` → `WriteLands`.
+
+`build/test_CaRefLaneCore_r1_blindspot_property_v2.log` was GREEN for
+`NoOldHandleRetarget` (6 generated / 6 distinct / empty queue / depth 6), while the paired
+`build/test_CaRefLaneCore_r1_blindspot_witness_v2.log` reached the same final state by violating
+`W_PreFixReviewTrace`. At completion `slot_runtime = r2`, but `old_action_target = none`; the real
+durable scalar changed without any runtime-scoped effect, proving the blind spot.
+
+Strengthening missing-confirm config to check `PublishedRuntimeHasAcceptedIdentity` before its target
+reproduced the collateral failure in
+`build/test_CaRefLaneCore_r1_missing_collateral_red.log`: missing confirmation invented
+`(life = 0, admitted = 1)`, so TLC reported the non-target published-identity invariant first.
+
+### Correction
+
+The real lane remains single-copy but now carries explicit identity:
+
+- `lane_runtime` binds the lane to the captured old handle and admitted fence generation;
+- `StartWriteScoped` writes `attempt_runtime = lane_runtime`;
+- `BeginResolveScoped` writes `resolver_runtime = attempt_runtime`;
+- rejection, unresolved, retry, application, install failure, and recovery wrappers preserve or
+  consume those captures with the corresponding real attempt/resolver transition;
+- per-runtime cache and durable projections use the existing bounded marker maps, now ranged over
+  `0..MaxTxn`; honest `runtime_cache_marker[lane_runtime] = cache_id` and
+  `runtime_durable_marker[lane_runtime] = durable_id` are exhaustive safe invariants;
+- `WriteLandsScoped`, `InstallCommittedScoped`, `ObserveDurableScoped`, and
+  `ApplyResolutionScoped` derive their target from the captured runtime. Only
+  `SabotageOldHandleRetarget` substitutes the current slot, recording a sticky real-lane retarget;
+- the standalone abstraction now covers only reader/publisher actions. It records the captured old
+  handle and changes no cache/durable projection.
+
+The focused old-handle config uses `RebirthOnly`, so its counterexample is exactly
+`StartWriteScoped` → removal → rebirth → successor lookup → `WriteLandsScoped`. The sabotage writes
+projection `[r1 |-> 0, r2 |-> 1]`, records `lane_effect_target = r2`, and violates only
+`NoOldHandleRetarget`. The honest `witness_rebirtholdaction` drives the same real lane trace, retains
+`attempt_runtime = r1`, writes `[r1 |-> 1, r2 |-> 0]`, and records no retarget.
+
+`ConfirmMissingName` now requires an armed empty name slot. Its sabotage reattaches already-observed,
+live, identity-valid `r1` without creating or rewriting a runtime. The isolated trace is removal →
+exact invalidation → missing confirmation; all non-target invariants hold and only
+`MissingNameConfirmationAllocatesNothing` is RED.
+
+All four new sabotage configs enumerate the complete non-target safety set before their expected
+target invariant, so another same-state violation would change the reported verdict.
+
+### Fix-round final matrix
+
+| Config | Result | Generated | Distinct | Queued | Depth |
+|---|---|---:|---:|---:|---:|
+| `sab_noarm` | `ReadyCaughtUp` RED | 3 | 2 | 0 | 2 |
+| `sab_dropuncertain` | `ReadyCaughtUp` RED | 68 | 41 | 30 | 4 |
+| `sab_appendblocked` | `NoAppendWhileBlocked` RED | 66 | 44 | 32 | 4 |
+| `sab_incompleterecovery` | `ReadyCaughtUp` RED | 1,862 | 876 | 505 | 7 |
+| `sab_skipidentity` | `InstallMatchesAttempt` RED | 2,974 | 1,377 | 780 | 7 |
+| `sab_nofence` | `CertifiedViewIsCurrent` RED | 49 | 34 | 25 | 3 |
+| `sab_certifyblocked` | `CertifiedViewIsCurrent` RED | 12 | 10 | 7 | 3 |
+| `sab_oldhandleretarget` | `NoOldHandleRetarget` RED | 522 | 225 | 135 | 6 |
+| `sab_lateinvalidation` | `ExactPredecessorInvalidationPreservesSuccessor` RED | 594 | 308 | 194 | 5 |
+| `sab_fencelosspublication` | `PublishedRuntimeHasAcceptedIdentity` RED | 9 | 8 | 6 | 2 |
+| `sab_missingconfirmation` | `MissingNameConfirmationAllocatesNothing` RED | 208 | 115 | 76 | 4 |
+| `safe` | GREEN | 721,919 | 216,072 | 0 | 25 |
+| `witness_commit` | `W_Commit` reached | 60 | 39 | 28 | 4 |
+| `witness_unresolved` | `W_Unresolved` reached | 14 | 11 | 8 | 3 |
+| `witness_retrycreated` | `W_RetryCreated` reached | 234 | 135 | 91 | 5 |
+| `witness_durableadoption` | `W_DurableAdoption` reached | 711 | 369 | 233 | 6 |
+| `witness_recovery` | `W_Recovery` reached | 1,862 | 876 | 505 | 7 |
+| `witness_staleresult` | `W_StaleResult` reached | 1,825 | 848 | 486 | 7 |
+| `witness_closed` | `W_Closed` reached | 703 | 363 | 229 | 6 |
+| `witness_faulted` | `W_Faulted` reached | 707 | 366 | 231 | 6 |
+| `witness_rebirtholdaction` | real `W_RebirthOldAction` reached | 773 | 389 | 240 | 6 |
+| `witness_selfremount` | `W_SelfRemount` reached | 181 | 108 | 73 | 4 |
+| `witness_lateinvalidation` | `W_LateInvalidationPreserved` reached | 594 | 308 | 194 | 5 |
+| `witness_missingconfirmation` | `W_MissingConfirmation` reached | 208 | 115 | 76 | 4 |
+
+Final commands and retained logs:
+
+```bash
+RUN_ID=20260801-checkpoint75c-r1-final TLC_WORKERS=1 \
+  docs/superpowers/models/run_reflane.sh \
+  > build/test_CaRefLaneCore_checkpoint75c_r1_final.log 2>&1
+
+TLC_WORKERS=1 docs/superpowers/models/run_prefold_drain.sh \
+  > build/test_CaRefPreFoldDrain_checkpoint75c_r1_final.log 2>&1
+```
+
+The runtime family reported 24/24 exact verdicts. The honest graph exhausted 216,072 distinct states
+at depth 25. The unchanged broader pre-fold gate reported 18/18 exact verdicts. Detailed final
+runtime logs are under `build/tlc-runs/reflane/20260801-checkpoint75c-r1-final`.
+
+### Fix-round concerns
+
+None. The fix adds bounded capture/projection state and scoped composition; it does not duplicate the
+lane state machine, add runtime history, or change C++.
