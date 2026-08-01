@@ -150,12 +150,13 @@ runtime's recovery-install counter. Restoring the gates makes every one of those
 | Full pre-fold TLA+ runner | PASS, 18/18 expected verdicts; `build/task5_checkpoint75c_fix_round1_prefold_tla.log` |
 | `git diff --check` | PASS |
 
-The base-checkpoint source inventory contained seventeen conditional death-test suites absent from the
-release binary. The fix round adds `CasRefCatalogRemovalDeathTest`, bringing the current complement to
-eighteen suites. The authoritative CA gate therefore runs the full release-visible suite intersection,
-while a second debug invocation runs the regenerated debug-only complement. This preserves both build
-modes without silently excluding either side of the conditional tests. The current regenerated
-inventory partitions exactly and disjointly as 278 total suites = 260 release-visible + 18 debug-only.
+The base-checkpoint **CA-scoped** source inventory contained seventeen conditional death-test suites
+absent from the release binary. The fix round adds `CasRefCatalogRemovalDeathTest`, bringing that
+CA-scoped complement to eighteen suites. The authoritative CA gate therefore runs the full
+release-visible CA suite intersection, while a second debug invocation runs the regenerated
+`Cas*DeathTest` complement. This preserves both build modes for the CA gate. The later full-binary
+inventory in fix round 2 corrects this historical scope: two non-CA debug-only death suites were not
+part of the 18-suite CA list, and the actual whole-binary complement is 20 suites / 36 tests.
 
 The first diagnostic debug per-suite wrapper exposed six suites whose old tests treated a raw
 `armMountFence` call as a usable remount, or used observational accessors to materialize state. The
@@ -172,9 +173,10 @@ production admission checks were not weakened. The tests now:
   required to refuse.
 
 All six affected suites pass independently in the `build_debug/test_task5_checkpoint75c_runtime_*_green2.log`
-logs. The authoritative complete gate is the release-visible 260-suite intersection in one invocation,
-without the per-suite wrapper's artificial 60-second timeout; debug-only death suites are the separate
-supplemental gate above. Nothing was excluded from either inventory.
+logs. The authoritative complete CA gate is the release-visible 260-suite intersection in one
+invocation, without the per-suite wrapper's artificial 60-second timeout; CA debug-only death suites
+are the separate supplemental gate above. Nothing was excluded from either **CA-scoped** inventory;
+the fix-round-2 whole-binary inventory and 20-suite run below cover the two additional non-CA suites.
 
 ## Self-review
 
