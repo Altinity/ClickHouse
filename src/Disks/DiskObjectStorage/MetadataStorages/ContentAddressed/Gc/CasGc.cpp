@@ -5,6 +5,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobMeta.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcPhaseTimer.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasNamespaceJanitor.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcShardPlan.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCkptFormat.h>
@@ -1089,6 +1090,29 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         for (const auto & [life_id, ref_life_state] : folded.fold_seal.ref_lives)
             evidence_rows += ref_life_state.cleanup_evidence ? 1 : 0;
         t.metric("evidence_rows", evidence_rows);
+        NamespaceJanitorResult janitor_result;
+        try
+        {
+            NamespaceJanitor janitor(backend, layout, 1000);
+            const uint64_t admitted_generation = state.lease.seq;
+            janitor_result = janitor.runOnePage(suppress_destructive, [&]
+            {
+                const auto got = backend.get(layout.gcStateKey());
+                if (!got)
+                    return false;
+                const GcState current = decodeGcState(got->bytes);
+                return current.lease.owner == gc_id && current.lease.seq == admitted_generation;
+            });
+            for (const String & anomaly : janitor_result.anomalies)
+                LOG_WARNING(logger, "CAS namespace janitor: {}", anomaly);
+        }
+        catch (const std::exception & e)
+        {
+            LOG_WARNING(logger, "CAS namespace janitor skipped this round: {}", e.what());
+        }
+        t.metric("janitor_pages", janitor_result.pages);
+        t.metric("janitor_keys", janitor_result.keys);
+        t.metric("janitor_deleted", janitor_result.deleted);
     }
     /// PHASE 18/19 `ref_object_cleanup`. Emitted even when the whole pass is skipped (`trim_enabled` is
     /// a test seam, `suppressed` gates the deletes), because "this phase did nothing and why" is exactly
