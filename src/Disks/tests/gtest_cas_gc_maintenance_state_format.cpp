@@ -75,8 +75,12 @@ TEST(CasGcMaintenanceStateFormat, RejectsMalformedAndBoundsCursor)
     const String raw = "{\"type\":\"cas_gc_maintenance_state\",\"v\":7}\n{\"cur\":\"" + over_limit.janitor_cursor + "\"}\n";
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
         [&] { (void)decodeGcMaintenanceState(raw); });
-    String oversized = encodeGcMaintenanceState({});
-    oversized.append(512 * 1024, 'x');
+    String oversized = "{\"type\":\"cas_gc_maintenance_state\",\"v\":7,\"pad\":\"";
+    oversized.append(448 * 1024, 'x');
+    oversized += "\"}\n{\"cur\":\"";
+    oversized.append(kMaxGcMaintenanceCursorBytes, 'y');
+    oversized += "\"}\n";
+    ASSERT_GT(oversized.size(), traitsFor(FormatId::GcMaintenanceState).object_cap);
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
         [&] { (void)decodeGcMaintenanceState(oversized); });
 }
