@@ -521,7 +521,6 @@ public:
     /// GC callback after a proved exact catalog deletion; see `CasRefLedger` for the in-place cached
     /// runtime invalidation contract.
     void invalidateRemovedCatalogLife(const NamespaceLifeId & life);
-    void noteRefCatalogMutation() { ref_ledger.noteCatalogMutation(); }
 
     /// Reconciles cached removal-closed ref runtimes against a complete catalog cut.
     void reconcileRefCatalogCut(const CasRefCatalog::Snapshot & catalog_cut);
@@ -887,14 +886,6 @@ public:
     void setReadableCatalogAfterObservationHookForTest(std::function<void()> hook)
     {
         ref_ledger.setReadableCatalogAfterObservationHookForTest(std::move(hook));
-    }
-    void setCatalogMutationHookForTest(std::function<void(CasRefLedger::CatalogMutationPhaseForTest)> hook)
-    {
-        ref_ledger.setCatalogMutationHookForTest(std::move(hook));
-    }
-    void setRuntimePublicationAfterCatalogEpochCheckHookForTest(std::function<void()> hook)
-    {
-        ref_ledger.setRuntimePublicationAfterCatalogEpochCheckHookForTest(std::move(hook));
     }
     void setWedgeBeforeSlotOccupyHookForTest(std::function<void()> hook)
     {

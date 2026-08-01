@@ -506,36 +506,18 @@ std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::lookupRefTableRunti
     return it == ref_name_slots.end() ? nullptr : it->second.current;
 }
 
-void CasRefLedger::noteCatalogMutation()
-{
-    if (catalog_mutation_hook_for_test)
-        catalog_mutation_hook_for_test(CatalogMutationPhaseForTest::BeforeRefQueueLock);
-
-    std::lock_guard lock(ref_queue_mutex);
-
-    if (catalog_mutation_hook_for_test)
-        catalog_mutation_hook_for_test(CatalogMutationPhaseForTest::AfterRefQueueLock);
-    catalog_lifecycle_epoch.fetch_add(1, std::memory_order_acq_rel);
-}
-
 std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireRefTableRuntime(
-    const NamespaceLifeId & life, uint64_t admitted_generation,
-    std::optional<uint64_t> observed_catalog_epoch)
+    const NamespaceLifeId & life, uint64_t admitted_generation)
 {
     check_fence_or_throw(admitted_generation);
 
     std::shared_ptr<RefTableRuntime> result;
     bool generation_moved = false;
-    bool catalog_observation_moved = false;
     bool identity_conflict = false;
     {
         std::lock_guard lock(ref_queue_mutex);
         generation_moved = fence_generation_fn() != admitted_generation;
-        catalog_observation_moved = observed_catalog_epoch
-            && catalog_lifecycle_epoch.load(std::memory_order_acquire) != *observed_catalog_epoch;
-        if (observed_catalog_epoch && runtime_publication_after_catalog_epoch_check_hook_for_test)
-            runtime_publication_after_catalog_epoch_check_hook_for_test();
-        if (!generation_moved && !catalog_observation_moved)
+        if (!generation_moved)
         {
             const auto it = ref_name_slots.find(life.ns.string());
             if (it != ref_name_slots.end() && it->second.current)
@@ -562,11 +544,6 @@ std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireRefTableRunt
 
     if (generation_moved)
         check_fence_or_throw(admitted_generation);
-    if (catalog_observation_moved)
-        throwCasWriteRetryLater(fmt::format(
-            "CAS namespace '{}': its catalog changed while a cold reader observed life {}; "
-            "retry from a fresh catalog observation",
-            life.ns.string(), renderIncarnation(life.incarnation)));
     if (identity_conflict)
         throwCasWriteRetryLater(fmt::format(
             "CAS namespace '{}': the cached runtime identity changed while publishing catalog life {}; "
@@ -591,18 +568,34 @@ std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireReadableRefT
 
     const uint64_t admitted_generation = fence_generation_fn();
     check_fence_or_throw(admitted_generation);
-    const uint64_t observed_catalog_epoch = catalog_lifecycle_epoch.load(std::memory_order_acquire);
-    const CasRefCatalog::Snapshot catalog = CasRefCatalog::read(backend, layout);
+    const CasRefCatalog::Snapshot first_catalog = CasRefCatalog::read(backend, layout);
     check_fence_or_throw(admitted_generation);
+    first_catalog.life_index.throwIfAmbiguous("CAS cold readable runtime admission");
+    const auto it = std::find_if(first_catalog.catalog.entries.begin(), first_catalog.catalog.entries.end(),
+        [&](const CatalogEntry & entry) { return entry.ns == ns; });
+    if (it == first_catalog.catalog.entries.end() || it->state != NsState::Live)
+        return nullptr;
+    const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(it->ns, it->incarnation);
+
     if (readable_catalog_after_observation_hook_for_test)
         readable_catalog_after_observation_hook_for_test();
-    const auto it = std::find_if(catalog.catalog.entries.begin(), catalog.catalog.entries.end(),
-        [&](const CatalogEntry & entry) { return entry.ns == ns; });
-    if (it == catalog.catalog.entries.end() || it->state != NsState::Live)
-        return nullptr;
-    return acquireRefTableRuntime(
-        NamespaceLifeId::fromCatalogEntry(it->ns, it->incarnation), admitted_generation,
-        observed_catalog_epoch);
+
+    /// The backend token, unlike a process-local invalidation counter, observes catalog mutations by
+    /// every actor that shares this pool. Validate both the token and the decoded canonical value:
+    /// neither a token-reuse defect nor an unrelated catalog write may let a life derived from the
+    /// first cut become the first resident runtime. This second GET is deliberately immediately before
+    /// the queue-locked fence/slot recheck in `acquireRefTableRuntime`; the warm path above pays none.
+    const CasRefCatalog::Snapshot second_catalog = CasRefCatalog::read(backend, layout);
+    check_fence_or_throw(admitted_generation);
+    const bool catalog_changed
+        = second_catalog.token != first_catalog.token || second_catalog.catalog != first_catalog.catalog;
+    if (catalog_changed)
+        throwCasWriteRetryLater(fmt::format(
+            "CAS namespace '{}': its catalog changed while a cold reader observed life {}; "
+            "retry from a fresh catalog observation",
+            ns.string(), renderIncarnation(life.incarnation)));
+
+    return acquireRefTableRuntime(life, admitted_generation);
 }
 
 std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireMutableRefTableRuntime(
@@ -620,9 +613,6 @@ std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireMutableRefTa
 
 void CasRefLedger::invalidateRemovedCatalogLife(const NamespaceLifeId & life)
 {
-    /// Advance even when no slot exists. A cold reader may already hold the predecessor catalog bytes
-    /// and be about to publish the first slot; the token is what makes that publication fail closed.
-    noteCatalogMutation();
     std::shared_ptr<RefTableRuntime> rt;
     {
         std::lock_guard lock(ref_queue_mutex);
@@ -1149,7 +1139,6 @@ NamespaceLifeId CasRefLedger::resolveNamespaceLife(
             /// not); either way it does not hand the incarnation back, so a `Live` outcome re-reads the
             /// catalog on the next loop iteration to learn it -- one extra GET, paid once per birth,
             /// never per write.
-            noteCatalogMutation();
             const auto outcome = CasRefCatalog::createNamespace(
                 backend, layout, ns, our_fence, admitted_generation, check_fence_or_throw, deadline);
             if (outcome == CasRefCatalog::NamespaceCreationOutcome::FencedOut)
@@ -1180,7 +1169,6 @@ NamespaceLifeId CasRefLedger::resolveNamespaceLife(
         /// not dead), so this case is checked FIRST and unconditionally, before any terminality probe.
         if (it->creator->server_root_id == server_root_id && it->creator->writer_epoch == live_epoch)
         {
-            noteCatalogMutation();
             const auto outcome = CasRefCatalog::completeCreation(
                 backend, layout, *it, admitted_generation, check_fence_or_throw, deadline);
             if (outcome == CasRefCatalog::NamespaceCreationOutcome::FencedOut)
@@ -1194,7 +1182,6 @@ NamespaceLifeId CasRefLedger::resolveNamespaceLife(
         /// A DIFFERENT actor's `Creating` entry. It may still be mid-flight (retry later, against a
         /// fresh read -- never busy-loop this instant) or provably dead, in which case reconciliation
         /// steals it onto our own fence and this open resumes `completeCreation` itself.
-        noteCatalogMutation();
         const auto reconcile_outcome = CasRefCatalog::reconcileStaleCreator(
             backend, layout, *it, our_fence,
             [this](const CreatorFence & f) { return isCreatorFenceTerminal(backend, layout, f.server_root_id, f.writer_epoch); },
@@ -1212,7 +1199,6 @@ NamespaceLifeId CasRefLedger::resolveNamespaceLife(
             {
                 CatalogEntry resumed = *it;
                 resumed.creator = our_fence;
-                noteCatalogMutation();
                 const auto outcome = CasRefCatalog::completeCreation(
                     backend, layout, resumed, admitted_generation, check_fence_or_throw, deadline);
                 if (outcome == CasRefCatalog::NamespaceCreationOutcome::FencedOut)
@@ -4486,7 +4472,6 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
     {
         const CatalogEntry observed = *initial_it;
         const uint64_t admitted_generation = fence_generation_fn();
-        noteCatalogMutation();
         switch (CasRefCatalog::cancelStalledCreating(
             backend, layout, observed,
             [this](const CreatorFence & creator)
@@ -4573,7 +4558,6 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
             if (const auto got = backend.get(layout.gcStateKey()))
                 removal_started_round = decodeGcState(got->bytes).round;
 
-            noteCatalogMutation();
             switch (CasRefCatalog::beginRemoving(
                 backend, layout, *observed_live, removal_started_round,
                 admitted_generation, check_fence_or_throw))

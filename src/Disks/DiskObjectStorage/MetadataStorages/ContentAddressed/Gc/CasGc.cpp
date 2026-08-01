@@ -4497,10 +4497,6 @@ CatalogLifecycleReconcileResult Gc::drainCompletedRemoving(const GcState & lease
         return CasRefCatalog::LeaderFenceStatus::Held;
     };
 
-    /// Advance the local cold-observation epoch BEFORE the reconciler can mutate the shared catalog.
-    /// A stale reader that already returned from its catalog `GET` must not publish the predecessor
-    /// life after this process begins the exact retirement CAS.
-    store->noteRefCatalogMutation();
     return CatalogLifecycleReconciler(
         backend, layout, *parent, admitted_generation, check_fence).reconcile();
 }

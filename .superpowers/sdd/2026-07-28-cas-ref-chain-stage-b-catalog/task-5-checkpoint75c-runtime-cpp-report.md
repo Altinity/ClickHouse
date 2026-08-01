@@ -211,3 +211,48 @@ attaches the successor life.
 | Controlled lock-removal mutation | RED, expected `mutation_after_lock` assertion; `build_asan/test_stageb_runtime_fix2_batched_red.log` |
 | Byte-exact source restoration | PASS; SHA-256 check against `tmp/stageb_runtime_fix2_green_cpp.sha256` |
 | Focused final cold-reader pair | PASS, 2/2; `build_asan/test_stageb_runtime_fix2_final.log` |
+
+## Important fix round 2: backend-authoritative cold runtime admission
+
+The process-local `catalog_lifecycle_epoch` and its producer inventory were insufficient authority:
+another `Pool` sharing the backend can replace catalog life `L1` with `L2` without advancing state in
+the reader's process. The local epoch, `noteCatalogMutation`, its `Pool` forwarder, every producer
+call, and the serialization-only test seams are deleted.
+
+A cold readable empty slot now captures mount-fence generation `G`, reads catalog cut `C1`, requires
+an unambiguous exact `Live` life `L`, and immediately before publication reads `C2`. Publication is
+allowed only when both the backend token and the decoded canonical catalog value are unchanged. The
+existing queue-locked acquire then rechecks `G` and the exact name slot before publishing immutable
+`(L, G)`. The warm resident path returns before either catalog read and therefore remains zero-GET.
+
+### Fix-round-2 TDD evidence
+
+- `ColdReadRejectsCatalogLifeReplacedWithoutLocalInvalidation` was genuine RED: after a paused `C1`,
+  exact durable `L1 -> L2` replacement and an `L2` checkpoint, the old code returned normally,
+  installed runtime id 1 for `L1`, and prevented a fresh read from attaching `L2`.
+- `ColdReadRejectsReplacementByExternalPoolActor` and
+  `ColdReadRejectsUnrelatedCatalogMutationBetweenObservations` were independently genuine RED: the
+  old local epoch observed neither an external actor's replacement nor an unrelated shared-catalog
+  mutation, and published a runtime from stale `C1` in both cases.
+- `WarmReadableRuntimeDoesNotReadCatalog` was a non-vacuous green performance guard before and after
+  the fix: it primes a resident runtime, resets backend counters, repeats the read, and observes zero
+  `ref_catalog` GETs.
+- The exact mutation control retained `C2` and `catalog_changed` but omitted only the retry branch.
+  It compiled without warnings; all three safety tests went RED while the warm zero-GET guard stayed
+  green. Restoring only that branch returned the focused set to 4/4 green.
+
+### Fix-round-2 validation
+
+| Gate | Result |
+| --- | --- |
+| Final release `unit_tests_dbms` build | PASS; `build/task5_runtime_cold_catalog_final_build.log` |
+| Focused catalog-admission obligations | PASS, 4/4; `build/task5_runtime_cold_catalog_final_tests.log` |
+| Full runtime-identity suite | PASS, 7/7; `build/task5_runtime_cold_catalog_runtime_identity_suite.log` |
+| Full `RefWriter*` suite | PASS, 91/91; `build/task5_runtime_cold_catalog_ref_writer_suite.log` |
+| Warning-free exact retry-branch mutation | expected RED for all 3 safety tests, warm guard PASS; `build/task5_runtime_cold_catalog_mutation_red_build_exact.log`, `build/task5_runtime_cold_catalog_mutation_red_tests.log` |
+| Reviewed `CaRefLaneCore` matrix | PASS, 26/26 expected verdicts; `build/task5_runtime_cold_catalog_reflane_tla.log` |
+| Full pre-fold TLA+ runner | PASS, 18/18 expected verdicts; `build/task5_runtime_cold_catalog_prefold_tla.log` |
+| CA debug-only death complement | PASS, 31/31 from 18 suites; `build_debug/task5_runtime_cold_catalog_death_suites.log` |
+| Full current debug-only death complement | PASS, 36/36 from 20 suites; `build_debug/task5_runtime_cold_catalog_full_debug_only_death_suites.log` |
+| Complete release-visible CA gate | BLOCKED by the concurrent Step 8 janitor integration: 1,782/1,786 pass and the 4 failures are its extra catalog GET, broadened hole accounting, and intended dead-life checkpoint deletion; `build/task5_runtime_cold_catalog_complete_ca_release.log` |
+| `git diff --check` and removed-local-epoch static audit | PASS |
