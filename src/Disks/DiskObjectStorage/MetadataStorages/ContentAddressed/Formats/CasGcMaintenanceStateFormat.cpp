@@ -31,6 +31,10 @@ String encodeGcMaintenanceState(const GcMaintenanceState & state)
 
 GcMaintenanceState decodeGcMaintenanceState(std::string_view data)
 {
+    const uint64_t object_cap = traitsFor(FormatId::GcMaintenanceState).object_cap;
+    if (data.size() > object_cap)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS gc maintenance state: object has {} bytes, limit {}", data.size(), object_cap);
     ReadBufferFromMemory in(data.data(), data.size());
     expectHeaderLine(in, FormatId::GcMaintenanceState);
     const String body = readLine(in, traitsFor(FormatId::GcMaintenanceState).line_cap, "cas_gc_maintenance_state");
