@@ -565,20 +565,26 @@ complete-token rescans, external resolution and the non-exact-CAS sabotage contr
 extended (recovery generations; wedge-retry vs successor-seal);
 `CaRefWriterCleanupCore`/`CaRefFoldClampRecoveryCore` extended per register items when those land.
 `CaRefDeltaIntakeCore` additionally asserts that the ref walk-plan key set is exactly the set of catalog
-`Live`/`Removing` ids. `CaRefPreFoldDrainCore` owns the compositional interface to that consumer: after
-the conclusive drain, `CompleteHotList` precedes `TakeFreshCut`, which exports the ONE immutable
-catalog token/value pair; ref-plan intake records the same pair, and
-`IntakeConsumesFreshPostDrainCut` requires equality. `_sab_cut_before_list` violates
-`FreshCutFollowsCompletedHotList`; `_sab_absent_listed_defers` restores the rejected unknown/defer
-classifier and violates `DeadListedPredecessorIsInert`. `_sab_intake_uses_predrain_cut` waits
+`Live`/`Removing` ids. `CaRefPreFoldDrainCore` owns the compositional interface to that consumer. Every
+catalog observation and cut carries opaque life id separately from `Creating`/`Live`/`Removing`; plan
+membership is a set of life ids. After the conclusive drain, `CompleteHotList` precedes `TakeFreshCut`,
+which exports the ONE immutable catalog `{token, life_id, state}` tuple; ref-plan intake records that
+same tuple, and `IntakeConsumesFreshPostDrainCut` requires equality. `_sab_cut_before_list` executes
+the full rejected trace — absent cut, concurrent same-name `Creating`, `Live`, stream PUT, completed
+LIST, stale-cut plan — and violates semantic `ListedCurrentLifeIsAdmitted`; explicit
+`FreshCutFollowsCompletedHotList` remains an additional assertion at intake.
+`_sab_absent_listed_defers` restores the rejected unknown/defer classifier and violates
+`DeadListedPredecessorIsInert`. `_sab_predecessor_deletes_successor` removes identity from exact-match
+deletion and violates `PredecessorProofCannotDeleteSuccessorRemoving`. `_sab_intake_uses_predrain_cut` waits
 until the honest fresh cut exists, then feeds intake the earlier drain observation and makes that
 invariant red; `_sab_intake_uses_stale_token` independently preserves the fresh row value while
 substituting the earlier full-catalog token at the plan/adoption seam, proving both components of the
 pair are load-bearing. `WITNESS_DRAINED_ROW_ABSENT_FROM_INTAKE` reaches a real `Removing` deletion
 whose consumed cut is absent and whose plan omits the drained life.
-`WITNESS_REBIRTH_WITH_RETAINED_DEBRIS_ADOPTS` reaches `Creating`, `Live`, stream PUT, a LIST that
-returns predecessor and successor, the later successor-only cut, zero debris DEFER and real adoption.
-Thus cut provenance and convergence are executable
+`WITNESS_REBIRTH_WITH_RETAINED_DEBRIS_ADOPTS` reaches a real old-request token/identity conflict,
+`Creating`, `Live`, stream PUT, successor `Removing`, a LIST that returns predecessor and successor,
+the later `{successor_life, Removing}` cut, zero debris DEFER and real successor adoption. Thus cut
+provenance, identity exactness and convergence are executable
 without copying adopted-parent, CAS-resolution or drain ordering into `CaRefDeltaIntakeCore`. That
 model still owns only fold/key-set semantics; its parent, hint, hold and checkpoint adapter-mint
 sabotage remains the control for forbidden row admission.

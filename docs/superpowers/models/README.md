@@ -98,7 +98,7 @@ of `CaGcRootLocalPartManifestCore`.
 | `CaRefTableSnapshotLogCore.tla` | v9 contiguous ref stream: state-derived dense ids, every-attempt reuse rule, `_ckpt`-based recovery base + arithmetic walk, in-band `slot-occupy` epoch seal — `LatePredecessorPut` FLIPPED from rev.4 expected-fail to green, with `_sab_noseal` as the control | CURRENT (v9 rewrite 2026-07-28; gates the ref-chain implementation) | `run_refsnaplog.sh` |
 | `CaRefDeltaIntakeCore.tla` | pool-wide GC fold: arithmetic walk, destructive-round frontier proof, durable hold, and catalog-cut key-set semantics; consumes the pre-fold cut interface without owning its lifecycle | CURRENT | `run_deltaintake.sh` |
 | `CaRefCatalogCore.tla` | local namespace lifecycle: create/reconcile safety, fresh opaque life ids, bounded catalog churn, and evidence + no-hold + exact-row authorization for `Removing -> absent` | CURRENT (re-scoped 2026-08-01; gates the ref-chain implementation) | `run_refcatalog.sh` |
-| `CaRefPreFoldDrainCore.tla` | two-GC-actor ordering plus its two-row serial-rescan companion: adopted-parent proof, conclusive exact catalog drain, completed hot LIST, ONE fresh authoritative cut, ref-plan intake, then fold/`REBUILD`/`DEFER`; red-controls cut-before-LIST, absent-listed debris deferral, stale row and stale token independently; witnesses same-name rebirth adopting the successor while predecessor bytes remain LIST-visible; damaged-state `REBUILD` restores authority without deleting catalog rows | CURRENT (amended 2026-08-01; sole owner of cross-object removal order, post-LIST cut provenance and inert-debris classification) | `run_prefold_drain.sh` |
+| `CaRefPreFoldDrainCore.tla` | two-GC-actor ordering plus its two-row serial-rescan companion: opaque life id separate from lifecycle state, adopted-parent proof, conclusive identity-exact catalog drain, completed hot LIST, ONE fresh authoritative cut, life-id ref-plan intake, then fold/`REBUILD`/`DEFER`; red-controls consequential stale-cut omission, absent-listed debris deferral, predecessor-proof deletion of successor `Removing`, stale row and stale token independently; witness adopts successor `Removing` while an old request conflicts and predecessor bytes remain LIST-visible; damaged-state `REBUILD` restores authority without deleting catalog rows | CURRENT (amended 2026-08-01; sole owner of cross-object removal order, post-LIST cut provenance, identity-exact admission/deletion and inert-debris classification) | `run_prefold_drain.sh` |
 | `CaRefFoldClampRecoveryCore.tla` | fold clamp always recoverable: per-log cleanup staging | CURRENT | `run_foldclamp.sh` |
 | `CaRefNsCleanupStaleLeaderCore.tla` | perpetual janitor: a LIST page captures an exact physical life id, and a delayed delete never re-derives its target from a reborn logical name | CURRENT (re-scoped 2026-08-01; gates the ref-chain implementation) | `run_nscleanup_staleleader.sh` |
 | `CaRefWriterCleanupCore.tla` | ref-table writer ownership lifecycle: precommit, promote, fence, successor cleanup | CURRENT | `run_refwcleanup.sh` |
@@ -249,15 +249,19 @@ ordered scan and cleanup deletes only what it observed durable. The migration is
   to convergence. Its `CaRefPreFoldDrainAllRowsCore` companion independently proves that a
   full-catalog token invalidated by one exact delete or external resolution forces a complete serial
   rescan before the next candidate or successor decision. The same pre-fold owner records the exact
-  full-catalog token/value at `TakeFreshCut` and at ref-plan intake. Feeding the earlier drain
+  full-catalog token/value at `TakeFreshCut` and at ref-plan intake. Every observation carries opaque
+  life id separately from lifecycle state, and plan membership is keyed only by that life id. Feeding the earlier drain
   observation to intake violates `IntakeConsumesFreshPostDrainCut`; a second control holds the fresh
   row value constant while feeding the earlier full-catalog token at the plan/adoption seam. The
   honest witness consumes the absent cut and omits the drained life from the plan. The amended owner
-  also records catalog `Creating`, `Live`, then stream `PUT` for same-name rebirth. A cut-before-LIST
-  sabotage violates `FreshCutFollowsCompletedHotList`; an absent-listed-means-unknown sabotage violates
-  `DeadListedPredecessorIsInert`; and the rebirth witness reaches real successor adoption while the
-  predecessor key remains LIST-visible, counted and non-deferring. No parent evidence, tombstone,
-  history or second catalog GET participates.
+  also records catalog `Creating`, `Live`, stream `PUT`, then legal successor `Removing` for same-name
+  rebirth. The cut-before-LIST sabotage executes through rebirth, completed LIST and stale-cut plan use,
+  then violates semantic `ListedCurrentLifeIsAdmitted`; an absent-listed-means-unknown sabotage violates
+  `DeadListedPredecessorIsInert`; and an identity-blind old-proof deletion violates
+  `PredecessorProofCannotDeleteSuccessorRemoving`. The rebirth witness reaches real successor
+  `Removing` admission/adoption while an old issued request conflicts and the predecessor key remains
+  LIST-visible, counted and non-deferring. No parent evidence, tombstone, history or second catalog GET
+  participates.
   `CaRefDeltaIntakeCore` remains the downstream fold/key-set consumer and owns no duplicate lifecycle
   protocol. Full verdicts and traces:
   `CaRefPreFoldDrainCore_RESULTS.md`.
