@@ -30,7 +30,7 @@ docs/superpowers/models/run_prefold_drain.sh
 ```
 
 The committed runner uses one TLC worker for reproducible breadth-first counterexamples. On
-2026-08-01, `build/test_task5_prefold_cut_provenance_final_20260801.log` recorded all thirteen
+2026-08-01, `build/test_task5_prefold_cut_provenance_fix1_full_20260801.log` recorded all fourteen
 expectations passed:
 
 | Configuration | Expected | Actual | Generated / distinct states | Depth |
@@ -42,6 +42,7 @@ expectations passed:
 | `_sab_stale_delete_after_successor_hold` | violation: `DeleteUsesCurrentAdoptedProof` | violation: `DeleteUsesCurrentAdoptedProof` | 240 / 127 | 7 |
 | `_sab_rebuild_from_unadopted_seal` | violation: `DeleteUsesCurrentAdoptedProof` | violation: `DeleteUsesCurrentAdoptedProof` | 24 / 17 | 4 |
 | `_sab_intake_uses_predrain_cut` | violation: `IntakeConsumesFreshPostDrainCut` | violation: `IntakeConsumesFreshPostDrainCut` | 209 / 111 | 7 |
+| `_sab_intake_uses_stale_token` | violation: `IntakeConsumesFreshPostDrainCut` | violation: `IntakeConsumesFreshPostDrainCut` | 209 / 111 | 7 |
 | `_safe` | green | green | 2272 / 874 | 14 |
 | `_witness_takeover_converges` | violation: `WITNESS_TAKEOVER_CONVERGES` | violation: `WITNESS_TAKEOVER_CONVERGES` | 1733 / 737 | 12 |
 | `_witness_drained_row_absent_from_intake` | violation: `WITNESS_DRAINED_ROW_ABSENT_FROM_INTAKE` | violation: `WITNESS_DRAINED_ROW_ABSENT_FROM_INTAKE` | 208 / 110 | 7 |
@@ -96,6 +97,12 @@ correct. A observes `Removing` at catalog token 1, exact deletion advances the c
 `CaRefDeltaIntakeCore_sab_adoptbeforecommit`, whose `NoMissedFold` failure says nothing about catalog
 cut provenance.
 
+`_sab_intake_uses_stale_token` independently pins the token half of that provenance contract at the
+actual `AdoptFromCut` plan/adoption seam. Adoption and the plan consume the honest fresh `absent` row,
+so `adoptedRow = "none"` and `plan_has_life = FALSE`, but intake carries the earlier token 1 instead
+of the fresh token 2. Row equality therefore remains true and only the token-equality conjunct of
+`IntakeConsumesFreshPostDrainCut` can make the run red.
+
 `_witness_drained_row_absent_from_intake` reaches the honest dual: the exact deletion advances token
 1 to 2, the consumed cut is `absent` at token 2, and `plan_has_life = FALSE`. The witness makes the
 composition control non-vacuous and proves the drained row is absent from both the consumed cut and
@@ -118,8 +125,9 @@ decision precisely: `phase = "done" => remaining = {}`.
   full-catalog token. Its falsifiable red control is `_allrows_sab_nonexactdelete`, which makes the
   stale-token consequence sticky rather than deriving it from the honest action's own guard.
 - `IntakeConsumesFreshPostDrainCut` requires the ref-plan boundary to consume the exact token/value
-  pair exported by `TakeFreshCut`; deriving the plan row from an earlier drain observation is red even
-  when the drain and fresh-cut ordering themselves are honest.
+  pair exported by `TakeFreshCut`. `_sab_intake_uses_predrain_cut` makes the value and token stale,
+  while `_sab_intake_uses_stale_token` holds the fresh row value constant and changes only the token;
+  both are red even though the drain and fresh-cut ordering themselves are honest.
 - `CompletionDrained` requires that the all-row companion can decide only after its remaining eligible
   set is empty.
 - `TypeOK` bounds the two leases, one optional catalog-noise write, one catalog deletion, and the
@@ -128,5 +136,7 @@ decision precisely: `phase = "done" => remaining = {}`.
 The provenance TDD evidence is preserved in
 `build/test_task5_prefold_cut_provenance_red_20260801.log`,
 `build/test_task5_prefold_cut_provenance_safe_20260801.log`, and
-`build/test_task5_prefold_cut_provenance_witness_clean_20260801.log`. The runner also writes per-config TLC
-logs under `tmp/tlc_CaRefPreFoldDrainCore_<config>.log`.
+`build/test_task5_prefold_cut_provenance_witness_clean_20260801.log`. The independent token-only RED
+is in `build/test_task5_prefold_cut_provenance_fix1_stale_token_red_20260801.log`; the clean fourteen-
+case gate is in `build/test_task5_prefold_cut_provenance_fix1_full_20260801.log`. The runner also
+writes per-config TLC logs under `tmp/tlc_CaRefPreFoldDrainCore_<config>.log`.

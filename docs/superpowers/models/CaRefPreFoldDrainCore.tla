@@ -21,7 +21,8 @@ CONSTANTS
     SabotageContinueAfterUnknown,
     SabotageStaleDeleteAfterSuccessorHold,
     SabotageRebuildFromUnadoptedSeal,
-    SabotageIntakeUsesPreDrainCut
+    SabotageIntakeUsesPreDrainCut,
+    SabotageIntakeUsesStaleToken
 
 Actors == {"A", "B"}
 Phases == {"idle", "parent", "observed", "issued", "uncertain", "resolved", "cut", "done"}
@@ -403,6 +404,29 @@ IntakeUsesPreDrainCut(a) ==
                     observedToken, observedEntry, cutEntry, cutToken,
                     advancedWithDebt, deletedWithoutCurrentProof, nonExactDelete >>
 
+(* Token-only composition sabotage at the real plan/adoption seam. Adoption and the plan consume the
+   fresh row value, but intake carries the earlier full-catalog token for that same value. *)
+AdoptFromCutWithStaleToken(a) ==
+    /\ SabotageIntakeUsesStaleToken
+    /\ Current(a)
+    /\ phase[a] = "cut"
+    /\ observedToken[a] # 0
+    /\ observedToken[a] # cutToken[a]
+    /\ \E nextRow \in IF cutEntry[a] = "absent" THEN {"none"}
+                     ELSE {"unproved", "ready", "held"} :
+         /\ adoptedRow' = nextRow
+         /\ adoptedGeneration' = adoptedGeneration + 1
+    /\ adoptedValid' = TRUE
+    /\ intakeCut' = [intakeCut EXCEPT ![a] =
+                        [catalog_token |-> observedToken[a],
+                         entry |-> cutEntry[a],
+                         plan_has_life |-> cutEntry[a] = "removing"]]
+    /\ phase' = [phase EXCEPT ![a] = "done"]
+    /\ UNCHANGED << entry, catalogToken, noiseDone, authorityLossDone,
+                    leaseOwner, leaseSeq, parentGeneration, parentRow,
+                    observedToken, observedEntry, cutEntry, cutToken,
+                    advancedWithDebt, deletedWithoutCurrentProof, nonExactDelete >>
+
 NoOp == UNCHANGED vars
 
 Next ==
@@ -414,7 +438,7 @@ Next ==
          \/ FoldBypassDrain(a) \/ RebuildBypassDrain(a) \/ DeferBypassDrain(a)
          \/ ContinueAfterUnknown(a) \/ AdoptHeldOverDeposedRequest(a)
          \/ LoseAuthority(a) \/ RebuildAuthorityOnly(a) \/ RebuildFromUnadoptedSealDeletes(a)
-         \/ IntakeUsesPreDrainCut(a)
+         \/ IntakeUsesPreDrainCut(a) \/ AdoptFromCutWithStaleToken(a)
     \/ CatalogNoise
     \/ NoOp
 

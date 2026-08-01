@@ -15,6 +15,7 @@ CONFIGS=(
   "sab_stale_delete_after_successor_hold violation DeleteUsesCurrentAdoptedProof"
   "sab_rebuild_from_unadopted_seal      violation DeleteUsesCurrentAdoptedProof"
   "sab_intake_uses_predrain_cut          violation IntakeConsumesFreshPostDrainCut"
+  "sab_intake_uses_stale_token           violation IntakeConsumesFreshPostDrainCut"
   "safe                                green     -"
   "witness_takeover_converges          violation WITNESS_TAKEOVER_CONVERGES"
   "witness_drained_row_absent_from_intake violation WITNESS_DRAINED_ROW_ABSENT_FROM_INTAKE"

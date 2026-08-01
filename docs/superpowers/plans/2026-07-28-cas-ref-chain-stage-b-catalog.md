@@ -1676,10 +1676,13 @@ making each adapter attempt to mint a row; they do not duplicate a lifecycle pre
   makes a stale/non-exact delete go red. The pre-fold model also owns the single cut-to-consumer
   interface: it carries the immutable full-catalog token/value from `TakeFreshCut` into ref-plan intake;
   `_sab_intake_uses_predrain_cut` substitutes the earlier drain observation and violates
-  `IntakeConsumesFreshPostDrainCut`, while `WITNESS_DRAINED_ROW_ABSENT_FROM_INTAKE` proves a drained
-  `Removing` row is absent from the consumed cut and plan. `CaRefDeltaIntakeCore` remains only the
-  walk-plan key-set/fold proof; do not duplicate adopted-parent or drain ordering there, and do not cite
-  its unrelated `_sab_adoptbeforecommit`/`NoMissedFold` pair as provenance evidence.
+  `IntakeConsumesFreshPostDrainCut`; `_sab_intake_uses_stale_token` holds the fresh row value constant
+  while substituting only the earlier full-catalog token at the plan/adoption seam, so both halves of
+  the provenance pair are independently load-bearing. `WITNESS_DRAINED_ROW_ABSENT_FROM_INTAKE`
+  proves a drained `Removing` row is absent from the consumed cut and plan. `CaRefDeltaIntakeCore`
+  remains only the walk-plan key-set/fold proof; do not duplicate adopted-parent or drain ordering
+  there, and do not cite its unrelated `_sab_adoptbeforecommit`/`NoMissedFold` pair as provenance
+  evidence.
   `CaRefNsCleanupStaleLeaderCore` is retargeted to the perpetual janitor's captured physical-id
   nomination after the special removal pass dies.
   **Capture of physical identity by perpetual cleanup stays, with its capture-time test and at least one

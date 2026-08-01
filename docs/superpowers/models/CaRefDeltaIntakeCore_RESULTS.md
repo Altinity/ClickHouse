@@ -12,7 +12,8 @@ the actor resolves every eligible exact-row deletion justified by the authoritat
 before taking it. `CaRefPreFoldDrainCore` owns and sabotage-gates both the cross-object ordering and
 the consumer handoff: `TakeFreshCut` records the immutable full-catalog token/value, the ref-plan
 boundary consumes that same pair, `_sab_intake_uses_predrain_cut` makes a stale wiring red on
-`IntakeConsumesFreshPostDrainCut`, and the absent-row witness proves a drained life does not enter the
+`IntakeConsumesFreshPostDrainCut`, `_sab_intake_uses_stale_token` preserves the fresh row while making
+only its full-catalog token stale, and the absent-row witness proves a drained life does not enter the
 consumed cut/plan. `CaRefDeltaIntakeCore` still does not own or repeat that lifecycle. Its own
 fold/frontier/hold verdicts, including `_sab_adoptbeforecommit`/`NoMissedFold`, must not be cited as the
 fresh-cut provenance control.
