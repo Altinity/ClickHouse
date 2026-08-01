@@ -4447,10 +4447,10 @@ uint64_t Gc::drainCompletedRemoving(const GcState & leased_state)
     };
 
     uint64_t deleted = 0;
+    CasRefCatalog::Snapshot catalog = CasRefCatalog::read(backend, layout);
     for (;;)
     {
-        const CasRefCatalog::Snapshot catalog = CasRefCatalog::read(backend, layout);
-        const CatalogEntry * eligible = nullptr;
+        std::optional<CatalogEntry> eligible;
         for (const CatalogEntry & entry : catalog.catalog.entries)
         {
             if (entry.state != NsState::Removing)
@@ -4460,17 +4460,22 @@ uint64_t Gc::drainCompletedRemoving(const GcState & leased_state)
                 || !row->second.cleanup_evidence
                 || row->second.coverage.hold)
                 continue;
-            eligible = &entry;
+            eligible = entry;
             break;
         }
         if (!eligible)
             return deleted;
 
-        const CasRefCatalog::CompletedRemovingDeleteResult delete_result
-            = CasRefCatalog::deleteCompletedRemoving(
-                backend, layout, *eligible, *parent, admitted_generation, check_fence_or_throw);
+        CasRefCatalog::CompletedRemovingDeleteResult delete_result
+            = CasRefCatalog::deleteCompletedRemovingAtSnapshot(
+                backend, layout, std::move(catalog), *eligible, *parent,
+                admitted_generation, check_fence_or_throw);
         if (delete_result.invalidated_life)
             store->invalidateRemovedCatalogLife(*delete_result.invalidated_life);
+        if (!delete_result.catalog_snapshot)
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "CAS GC pre-fold drain deletion returned no catalog resolution snapshot");
+        catalog = std::move(*delete_result.catalog_snapshot);
 
         switch (delete_result.outcome)
         {

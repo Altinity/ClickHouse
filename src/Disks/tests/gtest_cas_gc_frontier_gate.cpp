@@ -8,6 +8,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
+#include <Common/ProfileEvents.h>
 #include "cas_test_helpers.h"
 
 #include <algorithm>
@@ -49,6 +50,11 @@
 
 using namespace DB::Cas;
 using namespace DB::Cas::tests;
+
+namespace ProfileEvents
+{
+extern const Event CasGcRefWalkPlansBuilt;
+}
 
 namespace
 {
@@ -224,6 +230,62 @@ CompletedRemovingFixture seedCompletedRemoving(
     backend.putIfAbsent(fixture.checkpoint_key, "old-life checkpoint bytes");
     return fixture;
 }
+
+void seedCompletedRemovingBatch(
+    DrainRaceBackend & backend, const PoolPtr & store, const UInt128 & lease_owner, size_t count)
+{
+    const Layout & layout = store->layout();
+    std::vector<CatalogEntry> entries;
+    entries.reserve(count);
+    for (size_t i = 0; i < count; ++i)
+    {
+        CatalogEntry entry{
+            .ns = RootNamespace{fmt::format("00/drain-batch-{}@cas@", i)},
+            .state = NsState::Live,
+            .incarnation = UInt128{200 + i}};
+        CasRefCatalog::casAdmitEntry(backend, layout, entry);
+        entries.push_back(std::move(entry));
+    }
+    CasRefCatalog::casUpdate(backend, layout, [](const RefCatalog & current)
+    {
+        RefCatalog next = current;
+        for (CatalogEntry & entry : next.entries)
+        {
+            entry.state = NsState::Removing;
+            entry.removal_started_round = 1;
+        }
+        return next;
+    });
+
+    CasFoldSeal parent;
+    parent.generation = 1;
+    for (const CatalogEntry & entry : entries)
+        parent.ref_lives.emplace(entry.incarnation, RefLifeFoldState{
+            .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{1, 1}},
+            .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 1}}});
+    for (uint64_t shard = 0; shard < store->poolConfig().gc_shards; ++shard)
+        parent.condemned_summary.emplace(shard, CondemnedSummary{});
+    ASSERT_EQ(backend.putIfAbsent(layout.foldSealKey(1, 1), encodeFoldSeal(parent)).outcome,
+        PutOutcome::Done);
+
+    GcState state;
+    state.round = 1;
+    state.gc_shards = store->poolConfig().gc_shards;
+    state.snap_generation = 1;
+    state.snap_attempt = 1;
+    state.lease = GcLease{.owner = lease_owner, .seq = 1};
+    ASSERT_EQ(backend.putIfAbsent(layout.gcStateKey(), encodeGcState(state)).outcome, PutOutcome::Done);
+}
+
+enum class CompetingCatalogOutcome : uint8_t
+{
+    Absent,
+    Replacement,
+};
+
+class CasGcCompletedRemovalFenceRace : public testing::TestWithParam<CompetingCatalogOutcome>
+{
+};
 
 void transferGcLease(DrainRaceBackend & backend, const Layout & layout, const UInt128 & new_owner)
 {
@@ -1449,4 +1511,98 @@ TEST(CasGcFrontierGate, LostCatalogCasResponseIsResolvedBeforeListing)
     EXPECT_FALSE(CasRefCatalog::lifeIfCataloged(*backend, layout, fixture.ns));
     EXPECT_EQ(backend->get(fixture.checkpoint_key)->bytes, "old-life checkpoint bytes");
     EXPECT_EQ(backend->deleteCount(fixture.checkpoint_key), 0);
+}
+
+/// A stale leader may learn from its mandatory resolution read that the old life is gone, and must
+/// invalidate that exact runtime, but loss of the leader fence remains the control outcome. It must
+/// abort before the hot LIST and cannot build or publish any successor generation.
+TEST_P(CasGcCompletedRemovalFenceRace, FencedLeaderStopsAfterWinnerRemovesOrReplacesLife)
+{
+    auto backend = std::make_shared<DrainRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    const UInt128 leader_b = hexToU128("00000000000000000000000000000002");
+    const CompletedRemovingFixture fixture = seedCompletedRemoving(*backend, store, kGc);
+    backend->clearJournal();
+    backend->blockNextCatalogCas(layout.refCatalogKey());
+
+    std::exception_ptr leader_a_failure;
+    std::thread leader_a([&]
+    {
+        try
+        {
+            Gc gc_a(store, kGc);
+            (void)runRegularRoundReclaiming(gc_a);
+        }
+        catch (...)
+        {
+            leader_a_failure = std::current_exception();
+        }
+    });
+    backend->waitForBlockedCatalogCas();
+
+    transferGcLease(*backend, layout, leader_b);
+    const CasRefCatalog::Snapshot observed = CasRefCatalog::read(*backend, layout);
+    RefCatalog winner_catalog;
+    if (GetParam() == CompetingCatalogOutcome::Replacement)
+        winner_catalog.entries.push_back(CatalogEntry{
+            .ns = fixture.ns,
+            .state = NsState::Live,
+            .incarnation = UInt128{178}});
+    ASSERT_EQ(backend->casPut(
+        layout.refCatalogKey(), encodeRefCatalog(winner_catalog), observed.token).outcome,
+        CasOutcome::Committed);
+
+    backend->clearJournal();
+    const uint64_t plans_before
+        = ProfileEvents::global_counters[ProfileEvents::CasGcRefWalkPlansBuilt].load();
+    backend->releaseBlockedCatalogCas();
+    leader_a.join();
+
+    const std::vector<String> journal = backend->journalSnapshot();
+    ASSERT_TRUE(leader_a_failure);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasGcRefWalkPlansBuilt].load() - plans_before, 0u);
+    EXPECT_EQ(findJournalAfter(journal, "list " + layout.casRefsPrefix(), 0), journal.size());
+    EXPECT_EQ(findJournalAfter(journal, "cas_begin " + layout.gcStateKey(), 0), journal.size());
+    EXPECT_FALSE(std::any_of(journal.begin(), journal.end(), [](const String & entry)
+    {
+        return entry.starts_with("put_begin ") && entry.ends_with("/fold_seal");
+    }));
+    EXPECT_LT(findJournalAfter(journal, "get " + layout.refCatalogKey(), 0), journal.size())
+        << "the stale leader must still complete mandatory erase resolution";
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    WinnerShape,
+    CasGcCompletedRemovalFenceRace,
+    testing::Values(CompetingCatalogOutcome::Absent, CompetingCatalogOutcome::Replacement),
+    [](const testing::TestParamInfo<CompetingCatalogOutcome> & parameter)
+    {
+        return parameter.param == CompetingCatalogOutcome::Absent ? "Absent" : "Replacement";
+    });
+
+/// One initial full catalog read selects the first row; each successful erase's mandatory resolution
+/// read becomes the next selection snapshot. Therefore N uncontended deletes cost N+1 reads before
+/// the hot LIST, plus the ordinary round's one post-LIST catalog cut.
+TEST(CasGcFrontierGate, CompletedRemovalDrainUsesNPlusOneCatalogReads)
+{
+    auto backend = std::make_shared<DrainRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    constexpr size_t deletes = 3;
+    seedCompletedRemovingBatch(*backend, store, kGc, deletes);
+    backend->clearJournal();
+    backend->resetCounts();
+
+    Gc gc(store, kGc);
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+
+    const std::vector<String> journal = backend->journalSnapshot();
+    const size_t stream_list = findJournalAfter(journal, "list " + layout.casRefsPrefix(), 0);
+    ASSERT_LT(stream_list, journal.size());
+    const String catalog_get = "get " + layout.refCatalogKey();
+    EXPECT_EQ(std::count(journal.begin(), journal.begin() + static_cast<ptrdiff_t>(stream_list), catalog_get),
+        deletes + 1);
+    EXPECT_EQ(backend->getCount(layout.refCatalogKey()), deletes + 2)
+        << "the only read after the N+1 drain is the post-LIST catalog cut";
 }

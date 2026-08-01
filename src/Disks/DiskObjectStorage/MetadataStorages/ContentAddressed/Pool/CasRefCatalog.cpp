@@ -286,7 +286,8 @@ CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemov
     if (observed.state != NsState::Removing || !observed.removal_started_round)
         return {
             .outcome = CompletedRemovingDeleteOutcome::ProofRefused,
-            .invalidated_life = std::nullopt};
+            .invalidated_life = std::nullopt,
+            .catalog_snapshot = std::nullopt};
 
     const auto parent_it = authoritative_parent.ref_lives.find(observed.incarnation);
     if (parent_it == authoritative_parent.ref_lives.end()
@@ -294,66 +295,125 @@ CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemov
         || parent_it->second.coverage.hold)
         return {
             .outcome = CompletedRemovingDeleteOutcome::ProofRefused,
-            .invalidated_life = std::nullopt};
+            .invalidated_life = std::nullopt,
+            .catalog_snapshot = std::nullopt};
 
-    const auto mutate = [&](const RefCatalog & cur) -> RefCatalog
+    return deleteCompletedRemovingAtSnapshot(
+        backend, layout, read(backend, layout), observed, authoritative_parent,
+        admitted_generation, check_fence_or_throw);
+}
+
+CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemovingAtSnapshot(
+    Backend & backend, const Layout & layout, Snapshot catalog_snapshot,
+    const CatalogEntry & observed, const CasFoldSeal & authoritative_parent,
+    uint64_t admitted_generation,
+    const std::function<void(uint64_t)> & check_fence_or_throw)
+{
+    if (observed.state != NsState::Removing || !observed.removal_started_round)
+        return {
+            .outcome = CompletedRemovingDeleteOutcome::ProofRefused,
+            .invalidated_life = std::nullopt,
+            .catalog_snapshot = std::nullopt};
+
+    const auto parent_it = authoritative_parent.ref_lives.find(observed.incarnation);
+    if (parent_it == authoritative_parent.ref_lives.end()
+        || !parent_it->second.cleanup_evidence
+        || parent_it->second.coverage.hold)
+        return {
+            .outcome = CompletedRemovingDeleteOutcome::ProofRefused,
+            .invalidated_life = std::nullopt,
+            .catalog_snapshot = std::nullopt};
+
+    const NamespaceLifeId old_life
+        = NamespaceLifeId::fromCatalogEntry(observed.ns, observed.incarnation);
+    const auto resolved_result = [&](CompletedRemovingDeleteOutcome outcome)
     {
-        try { check_fence_or_throw(admitted_generation); }
-        catch (...) { throw CatalogFenceMovedMarker{}; }
-
-        const auto it = findEntry(cur, observed.ns);
-        if (it == cur.entries.end() || *it != observed)
-            throw CatalogEntryMismatchMarker{};
-
-        RefCatalog next = cur;
-        next.entries.erase(next.entries.begin() + (it - cur.entries.begin()));
-        return next;
+        const auto current_it = findEntry(catalog_snapshot.catalog, observed.ns);
+        const bool old_life_still_cataloged = current_it != catalog_snapshot.catalog.entries.end()
+            && current_it->incarnation == observed.incarnation;
+        return CompletedRemovingDeleteResult{
+            .outcome = outcome,
+            .invalidated_life = old_life_still_cataloged
+                ? std::nullopt
+                : std::optional<NamespaceLifeId>{old_life},
+            .catalog_snapshot = std::move(catalog_snapshot)};
     };
 
-    CompletedRemovingDeleteOutcome attempted_outcome = CompletedRemovingDeleteOutcome::Deleted;
-    std::exception_ptr attempt_failure;
-    try
+    for (size_t attempt = 0; attempt < kMaxCatalogCasAttempts; ++attempt)
     {
-        casUpdateImpl(backend, layout, mutate, [](const RefCatalog & c) { return encodeRefCatalog(c); });
-    }
-    catch (const CatalogFenceMovedMarker &)
-    {
-        attempted_outcome = CompletedRemovingDeleteOutcome::FencedOut;
-    }
-    catch (const CatalogEntryMismatchMarker &)
-    {
-        attempted_outcome = CompletedRemovingDeleteOutcome::EntryChanged;
-    }
-    catch (...)
-    {
-        attempt_failure = std::current_exception();
-    }
+        catalog_snapshot.life_index.throwIfAmbiguous("CAS completed-removal deletion");
+        const auto observed_it = findEntry(catalog_snapshot.catalog, observed.ns);
+        if (observed_it == catalog_snapshot.catalog.entries.end() || *observed_it != observed)
+            return resolved_result(CompletedRemovingDeleteOutcome::EntryChanged);
 
-    /// A conditional erase response is not authority for what became durable. Resolve every attempted
-    /// erase through one complete, mandatory catalog read, including an exception whose request may
-    /// have committed and an `EntryChanged` raised after another actor won. If this read fails, the
-    /// failure propagates: unresolved is never success and local runtime admission stays closed.
-    const Snapshot current = read(backend, layout);
-    const auto current_it = findEntry(current.catalog, observed.ns);
-    const bool old_life_still_cataloged = current_it != current.catalog.entries.end()
-        && current_it->incarnation == observed.incarnation;
-    if (!old_life_still_cataloged)
-    {
-        return {
-            .outcome = current_it == current.catalog.entries.end()
+        bool fence_lost = false;
+        try
+        {
+            check_fence_or_throw(admitted_generation);
+        }
+        catch (...)
+        {
+            fence_lost = true;
+        }
+
+        std::optional<CasResult> cas_result;
+        std::exception_ptr attempt_failure;
+        if (!fence_lost)
+        {
+            RefCatalog candidate = catalog_snapshot.catalog;
+            candidate.entries.erase(candidate.entries.begin() + (observed_it - catalog_snapshot.catalog.entries.begin()));
+            try
+            {
+                cas_result = backend.casPut(
+                    layout.refCatalogKey(), encodeRefCatalog(candidate), catalog_snapshot.token);
+            }
+            catch (...)
+            {
+                attempt_failure = std::current_exception();
+            }
+        }
+
+        /// The response to a conditional erase is not authority for what became durable. Resolve
+        /// every attempted erase, and a pre-CAS fence refusal, through one complete catalog read.
+        /// This snapshot is also the next retry/selection cut, so no second read separates them.
+        catalog_snapshot = read(backend, layout);
+
+        if (!fence_lost)
+        {
+            try
+            {
+                check_fence_or_throw(admitted_generation);
+            }
+            catch (...)
+            {
+                fence_lost = true;
+            }
+        }
+        if (fence_lost)
+            return resolved_result(CompletedRemovingDeleteOutcome::FencedOut);
+
+        const auto current_it = findEntry(catalog_snapshot.catalog, observed.ns);
+        const bool old_life_still_cataloged = current_it != catalog_snapshot.catalog.entries.end()
+            && current_it->incarnation == observed.incarnation;
+        if (!old_life_still_cataloged)
+            return resolved_result(current_it == catalog_snapshot.catalog.entries.end()
                 ? CompletedRemovingDeleteOutcome::Deleted
-                : CompletedRemovingDeleteOutcome::EntryChanged,
-            .invalidated_life = NamespaceLifeId::fromCatalogEntry(observed.ns, observed.incarnation)};
+                : CompletedRemovingDeleteOutcome::EntryChanged);
+
+        if (attempt_failure)
+            std::rethrow_exception(attempt_failure);
+        if (cas_result && cas_result->outcome == CasOutcome::Committed)
+            throwCasWriteRetryLater(fmt::format(
+                "CAS ref catalog erase for namespace '{}' reported committed, but a complete resolution read "
+                "still observed incarnation {}",
+                observed.ns.string(), u128ToHex(observed.incarnation)));
+        /// A token conflict that leaves the exact old row present retries from this mandatory
+        /// resolution snapshot. The fence is checked again immediately before the next CAS.
     }
 
-    if (attempt_failure)
-        std::rethrow_exception(attempt_failure);
-    if (attempted_outcome == CompletedRemovingDeleteOutcome::Deleted)
-        throwCasWriteRetryLater(fmt::format(
-            "CAS ref catalog erase for namespace '{}' reported committed, but a complete resolution read "
-            "still observed incarnation {}",
-            observed.ns.string(), u128ToHex(observed.incarnation)));
-    return {.outcome = attempted_outcome, .invalidated_life = std::nullopt};
+    throwCasWriteRetryLater(fmt::format(
+        "CAS ref catalog erase for namespace '{}' did not converge after {} attempts",
+        observed.ns.string(), kMaxCatalogCasAttempts));
 }
 
 CasRefCatalog::StalledCreatingCancelOutcome CasRefCatalog::cancelStalledCreating(

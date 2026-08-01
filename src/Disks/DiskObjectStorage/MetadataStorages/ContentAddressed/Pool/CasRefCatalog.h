@@ -157,6 +157,10 @@ public:
         /// Present only when a mandatory fresh catalog read proves that the exact observed life is no
         /// longer cataloged, whether this actor's erase committed or another actor removed/replaced it.
         std::optional<NamespaceLifeId> invalidated_life;
+        /// The complete mandatory resolution snapshot after an attempted erase. The GC drain feeds
+        /// this directly into its next deterministic selection; proof refusal performs no read and
+        /// leaves it absent.
+        std::optional<Snapshot> catalog_snapshot;
 
         bool operator==(CompletedRemovingDeleteOutcome expected) const { return outcome == expected; }
     };
@@ -169,6 +173,15 @@ public:
     static CompletedRemovingDeleteResult deleteCompletedRemoving(
         Backend & backend, const Layout & layout, const CatalogEntry & observed,
         const CasFoldSeal & authoritative_parent, uint64_t admitted_generation,
+        const std::function<void(uint64_t)> & check_fence_or_throw);
+
+    /// Same exact deletion, using the caller's complete selected catalog snapshot and token for the
+    /// one CAS attempt. Its mandatory resolution snapshot is returned in the result so a catalog-only
+    /// drain can select the next row without an intervening read.
+    static CompletedRemovingDeleteResult deleteCompletedRemovingAtSnapshot(
+        Backend & backend, const Layout & layout, Snapshot catalog_snapshot,
+        const CatalogEntry & observed, const CasFoldSeal & authoritative_parent,
+        uint64_t admitted_generation,
         const std::function<void(uint64_t)> & check_fence_or_throw);
 
     /// Outcome of exact stalled-creation cancellation, the only other exported deletion shape.

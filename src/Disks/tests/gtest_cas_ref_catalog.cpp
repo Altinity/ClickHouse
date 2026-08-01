@@ -7,6 +7,7 @@
 #include <base/defines.h>
 #include <fmt/format.h>
 #include <limits>
+#include <utility>
 
 using namespace DB::Cas;
 
@@ -67,6 +68,50 @@ CatalogEntry entryInState(const String & ns, NsState state, uint64_t inc)
         entry.removal_started_round = 1;
     return entry;
 }
+
+class EraseWinnerBackend final : public DB::Cas::tests::CountingBackend
+{
+public:
+    using CountingBackend::casPut;
+    using CountingBackend::get;
+
+    void replaceOnNextCatalogCas(const String & key, std::optional<CatalogEntry> replacement_)
+    {
+        catalog_key = key;
+        replacement = std::move(replacement_);
+        armed = true;
+    }
+
+    bool fenceMoved() const { return fence_moved; }
+
+    CasResult casPut(
+        const String & key, const String & bytes, const std::optional<Token> & expected,
+        const ObjectMeta & meta) override
+    {
+        if (armed && key == catalog_key)
+        {
+            armed = false;
+            const auto current = CountingBackend::get(key);
+            if (!current)
+                throw std::runtime_error("test fixture lost mandatory catalog");
+            RefCatalog winner_catalog;
+            if (replacement)
+                winner_catalog.entries.push_back(*replacement);
+            const CasResult winner = CountingBackend::casPut(
+                key, encodeRefCatalog(winner_catalog), current->token, meta);
+            if (winner.outcome != CasOutcome::Committed)
+                throw std::runtime_error("test fixture winner failed to replace catalog");
+            fence_moved = true;
+        }
+        return CountingBackend::casPut(key, bytes, expected, meta);
+    }
+
+private:
+    String catalog_key;
+    std::optional<CatalogEntry> replacement;
+    bool armed = false;
+    bool fence_moved = false;
+};
 
 }
 
@@ -937,6 +982,56 @@ TEST(CasRefCatalogRemoval, ExactDeletionRefusesChangedEntryAndAdmissionCannotCar
         backend, layout, removing, ready_parent, 5, [](uint64_t) {}),
         CasRefCatalog::CompletedRemovingDeleteOutcome::EntryChanged);
     EXPECT_EQ(CasRefCatalog::read(backend, layout).catalog.entries, std::vector<CatalogEntry>{current});
+}
+
+/// Mutation caught: deriving the control outcome from the resolution snapshot would turn a stale
+/// leader's `FencedOut` into `Deleted` or `EntryChanged`. Resolution may prove the old life dead and
+/// carry its invalidation, but it cannot restore the caller's authority to continue the GC round.
+TEST(CasRefCatalogRemoval, FenceLossRemainsControlOutcomeWhenWinnerRemovesOrReplacesLife)
+{
+    for (const bool replace : {false, true})
+    {
+        EraseWinnerBackend backend;
+        const Layout layout(replace ? "replacement" : "absence");
+        const CatalogEntry removing{
+            .ns = RootNamespace{"a"},
+            .state = NsState::Removing,
+            .incarnation = UInt128{7},
+            .removal_started_round = 13};
+        ASSERT_EQ(backend.putIfAbsent(
+            layout.refCatalogKey(), encodeRefCatalog(RefCatalog{.entries = {removing}})).outcome,
+            PutOutcome::Done);
+
+        CasFoldSeal ready_parent;
+        ready_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
+            .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{1, 2}},
+            .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
+        std::optional<CatalogEntry> replacement;
+        if (replace)
+            replacement = CatalogEntry{
+                .ns = removing.ns,
+                .state = NsState::Live,
+                .incarnation = UInt128{8}};
+        backend.replaceOnNextCatalogCas(layout.refCatalogKey(), replacement);
+
+        const CasRefCatalog::CompletedRemovingDeleteResult result
+            = CasRefCatalog::deleteCompletedRemoving(
+                backend, layout, removing, ready_parent, 5, [&](uint64_t)
+                {
+                    if (backend.fenceMoved())
+                        throw std::runtime_error("fenced");
+                });
+
+        EXPECT_EQ(result.outcome, CasRefCatalog::CompletedRemovingDeleteOutcome::FencedOut);
+        ASSERT_TRUE(result.invalidated_life);
+        EXPECT_EQ(*result.invalidated_life,
+            NamespaceLifeId::fromCatalogEntry(removing.ns, removing.incarnation));
+        const RefCatalog current = CasRefCatalog::read(backend, layout).catalog;
+        if (replace)
+            EXPECT_EQ(current.entries, std::vector<CatalogEntry>{*replacement});
+        else
+            EXPECT_TRUE(current.entries.empty());
+    }
 }
 
 TEST(CasRefCatalogRemoval, CancelStalledCreatingRequiresExactRowAndTerminalCreatorFence)
