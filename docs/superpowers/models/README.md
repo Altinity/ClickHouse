@@ -16,7 +16,9 @@ terms, its status against the shipped code, its config files, and its runner scr
 Baseline audit date for the pre-existing statuses below: **2026-07-21**, verified against branch
 `cas-gc-rebuild` (CAS code under
 `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/`).
-`CaGcDestructiveGateCore` was audited against the same code on **2026-08-02**.
+`CaGcDestructiveGateCore` was audited on **2026-08-02** against the authoritative integration
+implementation: the later physical gate in `Gc::fold` and the earlier catalog-only pre-fold drain
+owned by `CatalogLifecycleReconciler`.
 
 A note on names: some module names carry historical bug numbers from the development era (e.g.
 `CaB140DangleMerge`). The names are kept — renaming a verified model buys nothing — and the story
@@ -164,14 +166,18 @@ of `CaGcRootLocalPartManifestCore`.
   first (no physical delete while an unfolded delta could still touch the blob), and deferral is
   bounded so an unfolded delta is never skipped forever. Raw TLC evidence:
   `CaGcRoundDeferCore_RESULTS.md`.
-- **`CaGcDestructiveGateCore.tla`** — separates whole-round physical authorization from exact
-  lifecycle erasure. Positive configs cover a healthy frontier, an explicitly empty universe, an
-  unrelated anomaly, an unrelated carried hold, and an exhausted frontier budget. The four
-  physical sabotages omit the anomaly, hold, frontier-equality, and non-empty-universe conjuncts,
-  respectively, and must violate `PhysicalDeleteOnlyWhenGateOpen`; the lifecycle sabotage must
-  violate `ProvedRemovalEraseIsNotPhysicalSuppression`. Three negated witnesses reach both honest
-  physical actions, exact erasure while physical work is suppressed, and the `{}`/`{}` equality
-  that still closes the gate. Raw TLC evidence: `CaGcDestructiveGateCore_RESULTS.md`.
+- **`CaGcDestructiveGateCore.tla`** — separates later whole-round physical authorization from the
+  earlier exact catalog-only lifecycle reconciliation. The lifecycle proof represents a matching
+  no-hold row from the authoritative adopted parent plus the current leader fence; it is consumed by
+  the pre-fold `CatalogLifecycleReconciler` before the current round can derive anomalies, carried
+  holds, or frontier completeness. Positive configs cover a healthy frontier, an explicitly empty
+  universe, an unrelated anomaly, an unrelated carried hold, and an exhausted frontier budget. The
+  four physical sabotages omit the anomaly, hold, frontier-equality, and non-empty-universe
+  conjuncts, respectively, and must violate `PhysicalDeleteOnlyWhenGateOpen`; the lifecycle
+  sabotage must violate `ProvedRemovalEraseIsNotPhysicalSuppression`. Three negated witnesses reach
+  both honest physical actions, exact erasure independent of a later closed physical gate, and the
+  `{}`/`{}` equality that still closes that gate. Raw TLC evidence:
+  `CaGcDestructiveGateCore_RESULTS.md`.
 - **`CaGcCondemnMarkerGate.tla`** — found by an external code review (2026-07-17): the GC swallows
   failures of the asynchronous condemn-marker write, while the round commits the retired entry
   regardless. The per-hash marker is the writer's adopt gate, so a lost marker lets a writer adopt

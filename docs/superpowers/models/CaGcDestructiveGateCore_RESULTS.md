@@ -9,11 +9,12 @@ doc_type: reference
 
 # `CaGcDestructiveGateCore` — TLA+ gate results {#ca-gc-destructive-gate-core-results}
 
-The model separates whole-round physical condemnation/deletion from exact
-fenced erasure of one proved `Removing` lifecycle row. The former requires an
-authoritative, non-empty and fully proven frontier with no anomalies or carried
-holds. The latter depends only on matching cleanup evidence, no hold on the
-target life, and a current GC fence.
+The model separates later whole-round physical condemnation/deletion from the
+earlier catalog-only pre-fold erasure of one proved `Removing` lifecycle row.
+The former requires an authoritative, non-empty and fully proven frontier with
+no anomalies or carried holds. The latter consumes matching cleanup evidence
+and absence of a hold from the authoritative adopted-parent row, plus the
+current GC leader fence, before the current round derives its physical gate.
 
 ## Checker identity and temporal smoke {#checker-identity-and-temporal-smoke}
 
@@ -95,11 +96,12 @@ measurement shown above.
   `FrontierProven = {}` make equality true. Omitting only the non-empty floor
   sets both `emptyEqualityObserved = TRUE` and `gateOpen = TRUE`, after which
   condemnation violates the property.
-- `sab_lifecycle_uses_global_suppression`: an unrelated anomaly closes the
-  physical gate while the target has exact evidence, no target hold, and a
-  current fence. The sabotage records
-  `lifecycleBlockedBySuppression = TRUE` instead of erasing the row, violating
-  `ProvedRemovalEraseIsNotPhysicalSuppression`.
+- `sab_lifecycle_uses_global_suppression`: the target has exact adopted-parent
+  evidence, no target hold, and a current leader fence. The harness also
+  constructs a later physical gate closed by an unrelated anomaly. The
+  sabotage incorrectly delays or predicates the pre-fold erasure on that later
+  gate, recording `lifecycleBlockedBySuppression = TRUE` instead of erasing the
+  row and violating `ProvedRemovalEraseIsNotPhysicalSuppression`.
 
 The four physical traces stop at condemnation because it is the earliest
 irreversible physical arm. The healthy witness below separately reaches the
@@ -128,8 +130,9 @@ ComputeGate:          gateOpen=FALSE removalErased=FALSE
 EraseProvedRemoval:   gateOpen=FALSE removalErased=TRUE
 ```
 
-`CarriedHolds = {Other}` is the unrelated suppressor and `TargetHeld = FALSE`,
-so the trace cannot be explained by weakening the target's local proof.
+`TargetHeld = FALSE` records the authoritative parent's no-hold proof for the
+target. `CarriedHolds = {Other}` is a later-round physical suppressor, so the
+trace cannot be explained by weakening the target's pre-fold proof.
 
 ### Empty equality remains suppressed {#empty-equality-remains-suppressed}
 
@@ -145,8 +148,24 @@ not destructive authority.
 
 ## Code correspondence {#code-correspondence}
 
-At the recorded revision, `Gc::fold` computes the production gate in
-`Gc/CasGc.cpp`:
+The authoritative implementation establishes lifecycle authority first.
+Immediately after lease acquisition, `Gc::runRegularRound` invokes
+`Gc::drainCompletedRemoving` before heartbeat work, DEFER, the hot stream LIST,
+the authoritative catalog cut, plan construction, or fold. The drain validates
+the adopted parent seal and delegates to `CatalogLifecycleReconciler` with the
+current leader generation and fence callback.
+
+`CatalogLifecycleReconciler::selectEligible` selects only an exact catalog row
+in `Removing` whose same-life row in the authoritative adopted parent contains
+cleanup evidence and no durable hold. The reconciler then uses
+`CasRefCatalog::deleteCompletedRemovingAtSnapshot` for the exact catalog CAS,
+resolves its outcome, and rescans until no eligible row remains. Only the
+orthogonal result `{AuthorityStatus::Authoritative,
+CatalogResolution::DrainComplete}` permits the invocation to continue. This
+path performs no physical cleanup and cannot consume anomalies, carried holds,
+or frontier completeness that the current fold has not produced yet.
+
+Later, `Gc::fold` computes the physical gate in `Gc/CasGc.cpp`:
 
 ```text
 frontier_complete = universe_authoritative
@@ -158,19 +177,22 @@ suppress_destructive = anomalies
                     || !frontier_complete
 ```
 
-`FrontierComplete` and `PhysicalGateOpen` mirror those formulas using finite
-sets, so `CatalogUniverse # {}` is the model counterpart of
+`FrontierComplete` and `PhysicalGateOpen` mirror these later-fold formulas using
+finite sets, so `CatalogUniverse # {}` is the model counterpart of
 `frontier_namespaces > 0`, and `FrontierProven = CatalogUniverse` is the
-counterpart of equal proven and universe counts.
+counterpart of equal proven and universe counts. Condemnation and physical
+deletion consume this gate separately.
 
-The production namespace-cleanup path also has the modeled level split. In
-`Gc::runNamespaceCleanupPasses`, `suppress_destructive` encloses the bounded
-physical LIST and exact object deletes. The subsequent call to
-`CasRefCatalog::deleteCompletedRemoving` is outside that block. That function
-requires the exact observed `Removing` row, matching cleanup evidence, no hold
-on the adopted target life, and a current admitted fence before its catalog
-CAS. Thus a physical suppressor prevents physical cleanup but does not become
-a lifecycle-erasure prerequisite.
+`TargetHasEvidence`, `TargetHeld`, and `GcFenceCurrent` abstract the earlier
+adopted-parent/fence inputs owned by `CatalogLifecycleReconciler`; they are not
+inferred from `PhysicalGateOpen`. Conversely, the later frontier and
+suppressor inputs cannot authorize the pre-fold catalog mutation. The small
+state machine co-locates both authorization facts so the forbidden coupling can
+be sabotaged, but its `ComputeGate` harness step is not a claim that production
+computes the fold gate before lifecycle reconciliation. The concrete pre-fold
+ordering, stale-leader race, conclusive resolution, and all-row rescan are
+consumed from `CaRefPreFoldDrainCore` and
+`CaRefPreFoldDrainAllRowsCore`, rather than duplicated here.
 
 ## Verdict {#verdict}
 

@@ -37,7 +37,7 @@ empty an entity set. No config was added for those models.
 | `CaGcAckFloorCore` | `Writers`, `Blobs` | `CaGcAckFloorCore_empty_blobs.cfg` / `CaGcAckFloorCore_stage1.cfg`; `Blobs` | green |
 | `CaGcAckFloorZombie` | `Writers`, `Leaders`, `Blobs` | `CaGcAckFloorZombie_empty_blobs.cfg` / `CaGcAckFloorZombie_stage1.cfg`; `Blobs` | green |
 | `CaGcCondemnMarkerGate` | none; one hash and one writer are fixed in-module | no config | not applicable |
-| `CaGcDestructiveGateCore` | `CatalogUniverse`; `FrontierProven` is its proof subset | `CaGcDestructiveGateCore_empty_universe.cfg` / `CaGcDestructiveGateCore_healthy.cfg`; both sets are `{}` | green; physical actions suppressed despite `{}` equality |
+| `CaGcDestructiveGateCore` | `CatalogUniverse`; `FrontierProven` is its proof subset | `CaGcDestructiveGateCore_empty_universe.cfg` / `CaGcDestructiveGateCore_healthy.cfg`; `CatalogUniverse = FrontierProven = {}` in the empty config | green; physical actions suppressed despite `{}` equality |
 | `CaGcLeaseCore` | `Actors` | `CaGcLeaseCore_empty_actors.cfg` / `CaGcLeaseCore_heartbeat.cfg`; `Actors` | green |
 | `CaGcRootLocalPartManifestCore` | `Namespaces`, `Writers`, `Leaders`, `Blobs`, `ManifestInstances`, `Refs`, `Builds`, `Paths`, `BuildPrefixes`, `Shards` | `CaGcRootLocalPartManifestCore_empty_namespaces.cfg` / `CaGcRootLocalPartManifestCore_stage6_attemptscoping.cfg`; `Namespaces` | green |
 | `CaGcRoundDeferCore` | `Writers`, `Blobs` | `CaGcRoundDeferCore_empty_blobs.cfg` / `CaGcRoundDeferCore_stage1.cfg`; `Blobs` | green |
@@ -48,6 +48,8 @@ empty an entity set. No config was added for those models.
 | `CaRefFoldClampRecoveryCore` | none; the two bodies and log are fixed in-module | no config | not applicable |
 | `CaRefLaneCore` | none; the lane is a single fixed in-module scenario | no config | not applicable |
 | `CaRefNsCleanupStaleLeaderCore` | none; the model has one fixed namespace | no config | not applicable |
+| `CaRefPreFoldDrainAllRowsCore` | none configurable; `Rows = {"r1", "r2"}` is fixed in-module and the constants are sabotage booleans | no config | not applicable — the serial-rescan proof intentionally fixes two eligible rows |
+| `CaRefPreFoldDrainCore` | none configurable; `Actors` and `LifeIds` are fixed two-element in-module sets and the constants are sabotage booleans | no config | not applicable — the stale-leader/helping proof requires its fixed actors and predecessor/successor lives |
 | `CaRefTableSnapshotLogCore` | none; the table/log scenario is fixed in-module | no config | not applicable |
 | `CaRefWriterCleanupCore` | `Builds` | `CaRefWriterCleanupCore_empty_builds.cfg` / `CaRefWriterCleanupCore_safe.cfg`; `Builds` | violation — temporal property `StalePrecommitEventuallyGone` |
 | `CaRelinkConfirmCore` | `Receivers`; `Namespaces` and sources are constructed from it | `CaRelinkConfirmCore_empty_receivers.cfg` / `CaRelinkConfirmCore_main.cfg`; `Receivers` | green |
@@ -57,13 +59,15 @@ empty an entity set. No config was added for those models.
 
 ## Incremental audit — 2026-08-02 {#incremental-audit-2026-08-02}
 
-The tracked module inventory was compared with the table before adding
-`CaGcDestructiveGateCore`. No other tracked model family had appeared since the
-survey. Three untracked `*_TTrace_*.tla` files were TLC-generated traces of
-already-listed modules, not new model families. The new model's explicit empty
-configuration is recorded above; its companion sabotage and negated witness
-show that the non-empty condition is both load-bearing and non-vacuously
-evaluated.
+The authoritative integration base's tracked module inventory was compared
+with this table after adding `CaGcDestructiveGateCore` and excluding generated
+`*_TTrace_*.tla` artifacts. The two other post-survey families are exactly
+`CaRefPreFoldDrainCore` and `CaRefPreFoldDrainAllRowsCore`; both use fixed
+in-module entity universes and expose only Boolean sabotage constants, so an
+empty entity-set configuration is not applicable to either. Their explicit
+decisions are recorded above. The new destructive-gate model's empty config,
+companion sabotage, and negated witness show that its configurable non-empty
+condition is both load-bearing and non-vacuously evaluated.
 
 ## Non-green TLC tails {#non-green-tlc-tails}
 
