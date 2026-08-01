@@ -108,8 +108,9 @@ Implementation commit: `7fcca3341f2` (`ca: strengthen pre-fold drain model contr
   `CaRefPreFoldDrainCore`, full-token rescan/external resolution/exactness to
   `CaRefPreFoldDrainAllRowsCore`, captured physical identity to
   `CaRefNsCleanupStaleLeaderCore`, and only the fold/key-set boundary to `CaRefDeltaIntakeCore`.
-  Delta's fresh-cut provenance is explicitly **UNVERIFIED**: its existing
-  `_sab_adoptbeforecommit` checks `NoMissedFold`, not pre-fold-cut composition.
+  This review round deliberately did not claim fresh-cut provenance from Delta's existing
+  `_sab_adoptbeforecommit`, which checks `NoMissedFold`, not pre-fold-cut composition. Fix round 3
+  below closes the then-open seam with a separate cut-to-consumer control in the pre-fold owner.
 - Costs now state one adopted-seal GET, at least N+1 complete catalog GETs and N exact catalog CASes
   for N eligible rows, with additional GET/CAS retries for conflict or ambiguity.
 
@@ -131,10 +132,11 @@ Verification (all outer output has a unique build log and each log was independe
   check.
 - `bash -n docs/superpowers/models/run_prefold_drain.sh` and `git diff --check` passed without output.
 
-Self-review: each of the five review findings is addressed. The remaining Delta provenance boundary
-is deliberately documented as unverified rather than represented by an unrelated red control. An
-independent review additionally required rejected and non-landing ambiguous all-row outcomes; both
-now have only the complete-scan continuation and the final 11/11 rerun covers the amended model.
+Self-review: each of the five review findings is addressed. At this point the Delta provenance
+boundary was deliberately left open rather than represented by an unrelated red control; fix round 3
+below discharges it. An independent review additionally required rejected and non-landing ambiguous
+all-row outcomes; both now have only the complete-scan continuation and the final 11/11 rerun covers
+the amended model.
 
 ## Fix round 2/5
 
@@ -150,6 +152,40 @@ Verification: `rg -n -C 2 'CaRefNsCleanupStaleLeaderCore|per-life cleanup eviden
 confirmed the model captures and later deletes by physical id while the spec assigns the local proof to
 `CaRefCatalogCore`. `git diff --check` passed without output. No TLC run was needed because this round
 changes prose only.
+
+## Fix round 3/5
+
+Implementation commit: `7fec7a009b7` (`ca: prove pre-fold cut provenance at intake boundary`).
+
+The pre-fold owner now exports the fresh catalog cut as one immutable full-catalog token/value pair
+and records the exact pair consumed by the ref-plan boundary. `_sab_intake_uses_predrain_cut` waits
+until the honest fresh cut exists, then substitutes the earlier drain observation; it violates only
+`IntakeConsumesFreshPostDrainCut`. The honest witness requires a real exact `Removing` deletion to
+advance the token and then observes `absent` in both the consumed cut and its one-row plan projection.
+`CaRefDeltaIntakeCore` remains unchanged and owns only key-set/fold semantics.
+
+TDD and final evidence:
+
+- RED: `build/test_task5_prefold_cut_provenance_red_20260801.log` violates
+  `IntakeConsumesFreshPostDrainCut` at 209 generated / 111 distinct / depth 7. The trace has an honest
+  fresh cut `{token 2, absent}` and sabotaged intake `{token 1, Removing, plan_has_life = TRUE}`.
+- Final pre-fold runner: `build/test_task5_prefold_cut_provenance_final_20260801.log` passes all 13
+  expectations, including the safe gate and the drained-row witness.
+- Clean direct controls: `build/test_task5_prefold_cut_provenance_safe_clean_final_20260801.log` is
+  GREEN at 2,272 / 874 / depth 14 with an exhausted queue;
+  `build/test_task5_prefold_cut_provenance_witness_clean_20260801.log` reaches the intended witness at
+  208 / 110 / depth 7.
+- Unchanged Delta boundary regressions are clean in
+  `build/test_task5_prefold_cut_provenance_delta_plan_safe_clean_20260801.log`,
+  `build/test_task5_prefold_cut_provenance_delta_adapter_red_clean_20260801.log`, and
+  `build/test_task5_prefold_cut_provenance_delta_plan_witness_clean_20260801.log`: respectively GREEN
+  2,307 / 257 / depth 10, RED `PlanKeySetExact` 12 / 11 / depth 3, and RED
+  `WITNESS_PLAN_BUILT` 2 / 2 / depth 2.
+- `bash -n`, staged `git diff --check`, and the all-config constant audit are silent. A first parallel
+  direct-control launch produced JVM `hsperfdata` lock warnings; those logs are not evidence and were
+  replaced by the serial warning-free `*_clean_20260801.log` runs above.
+
+No C++ file or Task 5 production checklist item changed.
 
 ## Preserved unrelated dirt
 
