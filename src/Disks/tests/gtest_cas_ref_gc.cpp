@@ -629,3 +629,27 @@ TEST(CasRefGc, BaselineGuardRefusesWhenSnapshotSurvivesWithoutLogsOrCursor)
     EXPECT_TRUE(blobPresent(*backend, layout, DB::UInt128(2)))
         << "table B's blob must NOT be condemned -- the guard fires before any delete";
 }
+
+/// A catalog-admitted life without a parent cursor is a valid fresh fold target when it has no
+/// snapshot or logs. The fold must seed its successor seal from every plan row, not only the
+/// parent-cursor subset used by the baseline guard.
+TEST(CasRefGc, CatalogAdmittedFreshLifeWithoutParentSeedsSuccessorSeal)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/aa@cas@"};
+    DB::Cas::tests::casAdmitEntry(*backend, layout, ns);
+
+    const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(*backend, layout);
+    ASSERT_EQ(catalog_cut.catalog.entries.size(), 1u);
+    const UInt128 life_id = catalog_cut.catalog.entries.front().incarnation;
+
+    Gc gc(store, kGc);
+    ASSERT_NO_THROW(gc.runRegularRound());
+
+    const GcState state = decodeGcState(backend->get(layout.gcStateKey())->bytes);
+    const CasFoldSeal seal = decodeFoldSeal(
+        backend->get(layout.foldSealKey(state.snap_generation, state.snap_attempt))->bytes);
+    EXPECT_TRUE(seal.ref_lives.contains(life_id));
+}

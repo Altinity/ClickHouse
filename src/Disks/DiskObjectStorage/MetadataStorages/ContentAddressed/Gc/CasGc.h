@@ -224,28 +224,46 @@ struct RefScanSummary
     /// The validated adopted parent's rows read for this scan. They enrich the one walk plan built
     /// after the catalog cut; the fold consumes that plan instead of reading them into a second one.
     std::map<UInt128, RefLifeFoldState> parent_ref_lives;
-    /// The immutable catalog cut read after the completed hot LIST. Absent on diagnostic-only enumerations.
-    std::optional<CasRefCatalog::Snapshot> catalog_cut;
-    /// Listed ids absent from the later cut are inert dead-life debris.
+    std::map<UInt128, RefHold> holds;
+    std::map<UInt128, RefTxnId> checkpoint_observations;
+    /// Listed ids absent from the `RoundInput` catalog cut are inert dead-life debris.
     size_t dead_life_debris = 0;
 };
 
-/// All observations that may enrich a ref walk. None of these maps is an admission source: a life is
-/// present in the result only when the supplied catalog cut contains that exact id in `Live` or
-/// `Removing` state.
-struct RefWalkPlanInputs
+class RefPlan;
+
+/// The one owned observation boundary between the reconciled hot LIST and every ref-plan consumer.
+/// Construction copies the completed hot LIST and its later catalog cut, so callers can reuse their
+/// scan and catalog temporaries without changing the round that was already admitted for DEFER, fold,
+/// or publication. The scan is never separately pairable with a `RefPlan` downstream.
+class RoundInput
 {
-    std::map<UInt128, RefLifeFoldState> parent_ref_lives;
-    std::set<UInt128> listed_lives;
-    std::map<UInt128, RefHold> holds;
-    std::map<UInt128, RefTxnId> checkpoint_observations;
-    std::map<UInt128, RefTxnId> tail_observations;
+public:
+    RoundInput(RefScanSummary ref_scan_, CasRefCatalog::Snapshot catalog_cut_)
+        : ref_scan(std::move(ref_scan_)), catalog_cut(std::move(catalog_cut_))
+    {
+    }
+
+    RoundInput(const RoundInput &) = default;
+    RoundInput(RoundInput &&) = default;
+    RoundInput & operator=(const RoundInput &) = delete;
+    RoundInput & operator=(RoundInput &&) = delete;
+
+    const RefScanSummary & refScan() const { return ref_scan; }
+    const CasRefCatalog::Snapshot & catalogCut() const { return catalog_cut; }
+
+private:
+    friend RefPlan buildRefWalkPlan(const RoundInput & round_input);
+
+    RefScanSummary ref_scan;
+    CasRefCatalog::Snapshot catalog_cut;
 };
 
 struct RefWalkPlanRow
 {
     NamespaceLifeId life;
     RefLifeFoldState fold_state;
+    bool has_parent_fold_state = false;
     bool listed_hint = false;
     std::optional<RefTxnId> checkpoint_observation;
     std::optional<RefTxnId> tail_observation;
@@ -254,35 +272,44 @@ struct RefWalkPlanRow
 /// A frozen catalog-built row set. Enrichment is exposed only through exact lookup; there is no
 /// `operator[]`, insertion method, or mutable row map through which a hint, parent, hold, or checkpoint
 /// can mint a logical life.
-class RefWalkPlan
+class RefPlan
 {
 public:
+    RefPlan(const RefPlan &) = delete;
+    RefPlan(RefPlan &&) = default;
+    RefPlan & operator=(const RefPlan &) = delete;
+    RefPlan & operator=(RefPlan &&) = delete;
+
     bool contains(const UInt128 & life_id) const { return rows.contains(life_id); }
     const RefWalkPlanRow & row(const UInt128 & life_id) const { return rows.at(life_id); }
-    RefLifeFoldState & foldState(const UInt128 & life_id) { return rows.at(life_id).fold_state; }
     std::set<UInt128> lifeIds() const;
     std::vector<NamespaceLifeId> lives() const;
-    std::map<UInt128, RefLifeFoldState> releaseFoldStates();
+    std::map<UInt128, RefLifeFoldState> parentFoldStates() const;
+    std::map<UInt128, RefLifeFoldState> successorFoldStates() const;
     size_t size() const { return rows.size(); }
     size_t changedRows() const;
+    uint64_t droppedParentRows() const { return dropped_parent_rows; }
+    uint64_t droppedListedLives() const { return dropped_listed_lives; }
+    uint64_t droppedHolds() const { return dropped_holds; }
+    uint64_t droppedCheckpoints() const { return dropped_checkpoints; }
+    uint64_t droppedTails() const { return dropped_tails; }
 
+private:
+    friend RefPlan buildRefWalkPlan(const RoundInput & round_input);
+
+    RefPlan() = default;
+    std::map<UInt128, RefWalkPlanRow> rows;
     uint64_t dropped_parent_rows = 0;
     uint64_t dropped_listed_lives = 0;
     uint64_t dropped_holds = 0;
     uint64_t dropped_checkpoints = 0;
     uint64_t dropped_tails = 0;
-
-private:
-    friend RefWalkPlan buildRefWalkPlan(
-        const CasRefCatalog::Snapshot & catalog_cut, const RefWalkPlanInputs & inputs);
-    std::map<UInt128, RefWalkPlanRow> rows;
 };
 
 /// Builds the one authoritative ref-life key set used by ordinary GC and healthy `REBUILD`.
 /// Adapters run only after the catalog loop has frozen that set and attach observations by `at`-style
 /// lookup; unknown, absent, or `Creating` ids are counted and dropped.
-RefWalkPlan buildRefWalkPlan(
-    const CasRefCatalog::Snapshot & catalog_cut, const RefWalkPlanInputs & inputs);
+RefPlan buildRefWalkPlan(const RoundInput & round_input);
 
 /// PROBE B2 — end-to-end transaction accounting for ONE round. Round-local, never persisted.
 ///
@@ -579,10 +606,10 @@ private:
     /// graduates once `condemn_round < current_round`, i.e. it survived at least one full round after
     /// being condemned. The fold no longer CASes gc/state — it sets (snap_generation, snap_attempt)
     /// in-memory; the SINGLE round CAS commits them.
-    /// `ref_scan` is the round's one enumeration of `cas/ns/stream/` (see `RefScanSummary`); the fold regroups
-    /// its keys strictly rather than listing the prefix again.
+    /// `round_input` owns the round's one enumeration of `cas/ns/stream/` (see `RefScanSummary`) and
+    /// its catalog cut; the fold regroups those keys strictly rather than listing the prefix again.
     FoldResult fold(GcState & state, Token & state_token, RoundReport & report, uint64_t current_round,
-                    const RefScanSummary & ref_scan, RefWalkPlan walk_plan, UniversePolicy policy);
+                    const RoundInput & round_input, const RefPlan & walk_plan, UniversePolicy policy);
 
     /// The round's `_ckpt.checkpoint` witness per namespace — the SECOND, hint-independent witness the
     /// walk decides its absents against. ONE call site, in the fold, right where the hint is grouped.
@@ -726,9 +753,9 @@ private:
     RefScanSummary enumerateRefPrefix();
 
     /// The round's ONE hint enumeration (`enumerateRefPrefix`), followed by its one fresh catalog cut
-    /// and the validated adopted-parent rows. `runRegularRound` supplies all three to the authoritative
-    /// plan builder, then computes `RefScanSummary::changed_shards` from that frozen plan.
-    RefScanSummary listRefPrefix(const GcState & state);
+    /// and the validated adopted-parent rows. The returned `RoundInput` owns all three and is the only
+    /// value that may reach the authoritative plan builder and fold.
+    RoundInput listRefPrefix(const GcState & state);
 
     /// THE STORE-QUALITY DETECTOR (historically "probe A"). SAMPLED on a deterministic cadence
     /// (`PoolConfig::gc_probe_a_period`): on a due round it performs ONE extra full enumeration of
@@ -742,7 +769,7 @@ private:
     /// about the STORE, and the fold is immune to it by construction — the intake reads by exact key.
     /// Its whole output is a report: the `ref_list_probe` phase row (`due`/`performed`/`skipped`/
     /// `holes`), `gc_anomaly` audit rows, `CasGcProbeA*` ProfileEvents, and the text log.
-    void sampleRefListQuality(const RefScanSummary & round_scan, uint64_t current_round);
+    void sampleRefListQuality(const RoundInput & round_input, uint64_t current_round);
 
     /// (reclaimDroppedShards was removed with the snapshot+log ref model: there is no mutable per-namespace
     /// shard object to tombstone+reclaim; physical namespace reclamation is the namespace-cleanup item.)
@@ -902,12 +929,9 @@ public:
     /// Test-only access to the round's ref-prefix enumeration (its `changed_shards` is the defer signal).
     RefScanSummary listRefPrefixForTest(const GcState & state)
     {
-        RefScanSummary scan = listRefPrefix(state);
-        RefWalkPlanInputs inputs;
-        inputs.parent_ref_lives = scan.parent_ref_lives;
-        inputs.listed_lives = scan.listed_lives;
-        inputs.tail_observations = scan.max_log_by_life;
-        const RefWalkPlan plan = buildRefWalkPlan(*scan.catalog_cut, inputs);
+        const RoundInput round_input = listRefPrefix(state);
+        const RefPlan plan = buildRefWalkPlan(round_input);
+        RefScanSummary scan = round_input.refScan();
         scan.changed_shards = plan.changedRows();
         return scan;
     }

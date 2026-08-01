@@ -7,6 +7,7 @@
 #include <base/defines.h>
 #include <fmt/format.h>
 #include <limits>
+#include <type_traits>
 #include <utility>
 
 using namespace DB::Cas;
@@ -1164,36 +1165,50 @@ TEST(CasGcRefWalkPlan, CatalogIsSoleRowAdmissionAuthorityAcrossOrdinaryAndRebuil
     const CasRefCatalog::Snapshot cut{
         .catalog = catalog, .token = std::nullopt, .life_index = CatalogLifeIndex(catalog)};
 
-    RefWalkPlanInputs ordinary_inputs;
-    ordinary_inputs.parent_ref_lives.emplace(UInt128{1}, RefLifeFoldState{
+    RefScanSummary ordinary_scan;
+    ordinary_scan.parent_ref_lives.emplace(UInt128{1}, RefLifeFoldState{
         .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{1, 1}}});
-    ordinary_inputs.parent_ref_lives.emplace(UInt128{3}, RefLifeFoldState{
+    ordinary_scan.parent_ref_lives.emplace(UInt128{3}, RefLifeFoldState{
         .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{3, 3}},
         .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{3, 3}}});
-    ordinary_inputs.parent_ref_lives.emplace(UInt128{4}, RefLifeFoldState{
+    ordinary_scan.parent_ref_lives.emplace(UInt128{4}, RefLifeFoldState{
         .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{4, 4}}});
-    ordinary_inputs.listed_lives = {UInt128{1}, UInt128{2}, UInt128{4}};
-    ordinary_inputs.holds.emplace(UInt128{1}, RefHold{.offending_position = RefTxnId{1, 2}});
-    ordinary_inputs.holds.emplace(UInt128{2}, RefHold{.offending_position = RefTxnId{2, 2}});
-    ordinary_inputs.checkpoint_observations.emplace(UInt128{1}, RefTxnId{1, 9});
-    ordinary_inputs.checkpoint_observations.emplace(UInt128{2}, RefTxnId{2, 9});
-    ordinary_inputs.tail_observations.emplace(UInt128{1}, RefTxnId{1, 10});
-    ordinary_inputs.tail_observations.emplace(UInt128{2}, RefTxnId{2, 10});
+    ordinary_scan.listed_lives = {UInt128{1}, UInt128{2}, UInt128{4}};
+    ordinary_scan.holds.emplace(UInt128{1}, RefHold{.offending_position = RefTxnId{1, 2}});
+    ordinary_scan.holds.emplace(UInt128{2}, RefHold{.offending_position = RefTxnId{2, 2}});
+    ordinary_scan.checkpoint_observations.emplace(UInt128{1}, RefTxnId{1, 9});
+    ordinary_scan.checkpoint_observations.emplace(UInt128{2}, RefTxnId{2, 9});
+    ordinary_scan.max_log_by_life.emplace(UInt128{1}, RefTxnId{1, 10});
+    ordinary_scan.max_log_by_life.emplace(UInt128{2}, RefTxnId{2, 10});
 
-    RefWalkPlanInputs rebuild_inputs;
-    rebuild_inputs.parent_ref_lives.emplace(UInt128{1}, ordinary_inputs.parent_ref_lives.at(UInt128{1}));
-    rebuild_inputs.parent_ref_lives.emplace(UInt128{5}, RefLifeFoldState{
+    RefScanSummary rebuild_scan;
+    rebuild_scan.parent_ref_lives.emplace(UInt128{1}, ordinary_scan.parent_ref_lives.at(UInt128{1}));
+    rebuild_scan.parent_ref_lives.emplace(UInt128{5}, RefLifeFoldState{
         .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{5, 5}}});
-    rebuild_inputs.listed_lives = {UInt128{1}, UInt128{3}, UInt128{5}};
-    rebuild_inputs.holds.emplace(UInt128{1}, RefHold{.offending_position = RefTxnId{1, 3}});
-    rebuild_inputs.holds.emplace(UInt128{3}, RefHold{.offending_position = RefTxnId{3, 4}});
-    rebuild_inputs.checkpoint_observations.emplace(UInt128{1}, RefTxnId{1, 11});
-    rebuild_inputs.checkpoint_observations.emplace(UInt128{3}, RefTxnId{3, 11});
-    rebuild_inputs.tail_observations.emplace(UInt128{1}, RefTxnId{1, 12});
-    rebuild_inputs.tail_observations.emplace(UInt128{3}, RefTxnId{3, 12});
+    rebuild_scan.listed_lives = {UInt128{1}, UInt128{3}, UInt128{5}};
+    rebuild_scan.holds.emplace(UInt128{1}, RefHold{.offending_position = RefTxnId{1, 3}});
+    rebuild_scan.holds.emplace(UInt128{3}, RefHold{.offending_position = RefTxnId{3, 4}});
+    rebuild_scan.checkpoint_observations.emplace(UInt128{1}, RefTxnId{1, 11});
+    rebuild_scan.checkpoint_observations.emplace(UInt128{3}, RefTxnId{3, 11});
+    rebuild_scan.max_log_by_life.emplace(UInt128{1}, RefTxnId{1, 12});
+    rebuild_scan.max_log_by_life.emplace(UInt128{3}, RefTxnId{3, 12});
 
-    const RefWalkPlan ordinary = buildRefWalkPlan(cut, ordinary_inputs);
-    const RefWalkPlan rebuild = buildRefWalkPlan(cut, rebuild_inputs);
+    const RoundInput ordinary_round_input{ordinary_scan, cut};
+    const RoundInput rebuild_round_input{rebuild_scan, cut};
+    const RefPlan ordinary = buildRefWalkPlan(ordinary_round_input);
+    const RefPlan rebuild = buildRefWalkPlan(rebuild_round_input);
+    const auto ordinary_parent_states = ordinary.parentFoldStates();
+    const auto rebuild_parent_states = rebuild.parentFoldStates();
+    const auto ordinary_successor_states = ordinary.successorFoldStates();
+    const auto rebuild_successor_states = rebuild.successorFoldStates();
+    EXPECT_EQ(ordinary_parent_states.size(), 1u);
+    EXPECT_TRUE(ordinary_parent_states.contains(UInt128{3}));
+    EXPECT_FALSE(ordinary_parent_states.contains(UInt128{2}));
+    EXPECT_TRUE(ordinary_successor_states.contains(UInt128{2}));
+    EXPECT_TRUE(ordinary_successor_states.contains(UInt128{3}));
+    EXPECT_TRUE(rebuild_parent_states.empty());
+    EXPECT_TRUE(rebuild_successor_states.contains(UInt128{2}));
+    EXPECT_TRUE(rebuild_successor_states.contains(UInt128{3}));
     const std::set<UInt128> expected{UInt128{2}, UInt128{3}};
     EXPECT_EQ(ordinary.lifeIds(), expected);
     EXPECT_EQ(rebuild.lifeIds(), expected);
@@ -1214,4 +1229,45 @@ TEST(CasGcRefWalkPlan, CatalogIsSoleRowAdmissionAuthorityAcrossOrdinaryAndRebuil
     EXPECT_EQ(rebuild.row(UInt128{3}).tail_observation, (RefTxnId{3, 12}));
     EXPECT_FALSE(rebuild.contains(UInt128{1}));
     EXPECT_FALSE(rebuild.contains(UInt128{5}));
+}
+
+TEST(CasGcRefPlan, RoundInputOwnsObservationsAndSuccessorStateCannotChangePlan)
+{
+    /// This catches a plan that borrows the post-LIST observations or lets its successor state alias a
+    /// row. Replacing the owning `RoundInput`/`RefPlan` boundary with the former loose inputs, or
+    /// returning plan storage for the successor, must make this fail.
+    static_assert(!std::is_default_constructible_v<RefPlan>);
+    static_assert(!std::is_assignable_v<RefPlan &, RefPlan>);
+    static_assert(!std::is_assignable_v<RoundInput &, RoundInput>);
+
+    RefCatalog catalog;
+    catalog.entries = {liveEntry("live", 2)};
+    CasRefCatalog::Snapshot cut{
+        .catalog = catalog, .token = std::nullopt, .life_index = CatalogLifeIndex(catalog)};
+
+    RefScanSummary observations;
+    observations.max_log_by_life.emplace(UInt128{2}, RefTxnId{2, 7});
+    observations.parent_ref_lives.emplace(UInt128{2}, RefLifeFoldState{
+        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{2, 3}}});
+
+    const RoundInput round_input{observations, cut};
+    const RefPlan plan = buildRefWalkPlan(round_input);
+
+    /// The caller may reuse and mutate the sources after its one post-LIST/catalog observation and
+    /// plan construction. Those mutations cannot retarget the plan DEFER, fold, and publication use.
+    observations.max_log_by_life.at(UInt128{2}) = RefTxnId{2, 99};
+    observations.parent_ref_lives.at(UInt128{2}).coverage.last_folded_ref_id = RefTxnId{2, 88};
+    cut.catalog.entries.clear();
+
+    ASSERT_TRUE(plan.contains(UInt128{2}));
+    EXPECT_EQ(plan.row(UInt128{2}).tail_observation, (RefTxnId{2, 7}));
+    EXPECT_EQ(plan.row(UInt128{2}).fold_state.coverage.last_folded_ref_id, (RefTxnId{2, 3}));
+
+    /// A fold/rebuild successor starts as a copy. It can earn a new cleanup state without changing the
+    /// immutable input that DEFER, the fold, and publication all consume.
+    auto successor_lives = plan.successorFoldStates();
+    successor_lives.at(UInt128{2}).coverage.last_folded_ref_id = RefTxnId{2, 9};
+    successor_lives.emplace(UInt128{9}, RefLifeFoldState{});
+    EXPECT_EQ(plan.row(UInt128{2}).fold_state.coverage.last_folded_ref_id, (RefTxnId{2, 3}));
+    EXPECT_FALSE(plan.contains(UInt128{9}));
 }
