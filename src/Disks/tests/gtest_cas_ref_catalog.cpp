@@ -995,8 +995,10 @@ TEST(CasRefCatalogRemoval, ExactDeletionRefusesChangedEntryAndAdmissionCannotCar
         .state = NsState::Removing,
         .incarnation = UInt128{7},
         .removal_started_round = 13};
+#ifndef DEBUG_OR_SANITIZER_BUILD
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR,
         [&] { (void)CasRefCatalog::casAdmitEntry(backend, layout, removing); });
+#endif
 
     const CatalogEntry current{
         .ns = RootNamespace{"a"},
@@ -1017,6 +1019,24 @@ TEST(CasRefCatalogRemoval, ExactDeletionRefusesChangedEntryAndAdmissionCannotCar
         CasRefCatalog::CompletedRemovingDeleteOutcome::EntryChanged);
     EXPECT_EQ(CasRefCatalog::read(backend, layout).catalog.entries, std::vector<CatalogEntry>{current});
 }
+
+#if defined(DEBUG_OR_SANITIZER_BUILD)
+TEST(CasRefCatalogRemovalDeathTest, AdmissionCannotCarryRemovalAborts)
+{
+    DB::Cas::tests::CountingBackend backend;
+    const Layout layout("p");
+    CasRefCatalog::initializeEmptyForNewPool(backend, layout);
+    const CatalogEntry removing{
+        .ns = RootNamespace{"a"},
+        .state = NsState::Removing,
+        .incarnation = UInt128{7},
+        .removal_started_round = 13};
+
+    EXPECT_DEATH(
+        { (void)CasRefCatalog::casAdmitEntry(backend, layout, removing); },
+        "cannot admit namespace.*directly as Removing");
+}
+#endif
 
 /// Mutation caught: deriving the control outcome from the resolution snapshot would turn a stale
 /// leader's `FencedOut` into `Deleted` or `EntryChanged`. Resolution may prove the old life dead and

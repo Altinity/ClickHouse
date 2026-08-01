@@ -193,6 +193,33 @@ CatalogEntry catalogEntryOrThrow(Backend & backend, const Layout & layout, const
     return *it;
 }
 
+CatalogEntry replaceCatalogLifeForRuntimeRace(
+    Backend & backend, const Layout & layout, const CatalogEntry & predecessor, UInt128 successor_incarnation)
+{
+    const CasRefCatalog::Snapshot before_delete = CasRefCatalog::read(backend, layout);
+    RefCatalog without_predecessor = before_delete.catalog;
+    std::erase_if(without_predecessor.entries, [&](const CatalogEntry & entry)
+    {
+        return entry.ns == predecessor.ns && entry.incarnation == predecessor.incarnation;
+    });
+    if (backend.casPut(layout.refCatalogKey(), encodeRefCatalog(without_predecessor), before_delete.token).outcome
+        != CasOutcome::Committed)
+        throw std::runtime_error("test failed to retire exact predecessor catalog life");
+
+    CatalogEntry successor{
+        .ns = predecessor.ns,
+        .state = NsState::Live,
+        .incarnation = successor_incarnation,
+        .creator = std::nullopt};
+    const CasRefCatalog::Snapshot after_delete = CasRefCatalog::read(backend, layout);
+    RefCatalog reborn = after_delete.catalog;
+    reborn.entries.push_back(successor);
+    if (backend.casPut(layout.refCatalogKey(), encodeRefCatalog(reborn), after_delete.token).outcome
+        != CasOutcome::Committed)
+        throw std::runtime_error("test failed to publish successor catalog life");
+    return successor;
+}
+
 std::optional<RefTxnId> listGreatestLogIdForTest(
     Backend & backend, const Layout & layout, const RootNamespace & ns);
 
@@ -669,6 +696,72 @@ TEST(RefWriterNonMinting, ListRefsOnAbsentNamespaceDoesNotMutateCatalog)
     ASSERT_TRUE(catalog_after);
     EXPECT_EQ(catalog_after->bytes, catalog_before->bytes);
     EXPECT_EQ(catalog_after->token, catalog_before->token);
+}
+
+TEST(RefWriterRuntimeIdentity, ColdReadRejectsCatalogLifeReplacedAfterItsObservation)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/cold-read-catalog-aba"};
+    DB::Cas::tests::casAdmitEntry(*backend, layout, ns);
+    const CatalogEntry predecessor = catalogEntryOrThrow(*backend, layout, ns);
+    const NamespaceLifeId predecessor_life
+        = NamespaceLifeId::fromCatalogEntry(predecessor.ns, predecessor.incarnation);
+    ASSERT_EQ(store->refTableRuntimeIdentityForTest(ns), 0u);
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool paused = false;
+    bool resume = false;
+    store->setReadableCatalogAfterObservationHookForTest([&]
+    {
+        std::unique_lock lock(mutex);
+        paused = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return resume; });
+    });
+
+    std::exception_ptr stale_error;
+    std::thread stale_reader([&]
+    {
+        try
+        {
+            (void)store->listRefs(ns);
+        }
+        catch (...)
+        {
+            stale_error = std::current_exception();
+        }
+    });
+    {
+        std::unique_lock lock(mutex);
+        cv.wait(lock, [&] { return paused; });
+    }
+
+    const CatalogEntry successor
+        = replaceCatalogLifeForRuntimeRace(*backend, layout, predecessor, UInt128{0xabc002});
+    const NamespaceLifeId successor_life
+        = NamespaceLifeId::fromCatalogEntry(successor.ns, successor.incarnation);
+    ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(successor_life), encodeRefCkpt(RefCkpt{
+        .life_epoch = store->liveWriterEpoch(),
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt})).outcome, PutOutcome::Done);
+    store->invalidateRemovedCatalogLife(predecessor_life);
+
+    {
+        std::lock_guard lock(mutex);
+        resume = true;
+    }
+    cv.notify_all();
+    stale_reader.join();
+    store->setReadableCatalogAfterObservationHookForTest(nullptr);
+
+    EXPECT_TRUE(stale_error) << "the stale catalog life was published instead of refused";
+    EXPECT_EQ(store->refTableRuntimeIdentityForTest(ns), 0u);
+    EXPECT_NO_THROW((void)store->listRefs(ns));
+    ASSERT_TRUE(store->refTableLifeForTest(ns));
+    EXPECT_EQ(*store->refTableLifeForTest(ns), successor_life);
 }
 
 /// `DROP DETACHED PART` reaches this point lookup for a part that may already be absent. Its probe

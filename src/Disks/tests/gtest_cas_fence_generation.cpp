@@ -177,6 +177,43 @@ BlobSource serverSideCopySource(const std::string & staging_key, uint64_t size)
     return source;
 }
 
+TEST(CasFenceGeneration, RearmPublishesTheNewGenerationBeforeOpeningTheFence)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openTestPool(backend);
+    const RootNamespace ns{"srv1/rearm-publication-order"};
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);
+    ASSERT_EQ(store->refTableRuntimeIdentityForTest(ns), 0u);
+
+    store->tripMountLost();
+    const uint64_t dead_generation = store->fenceGeneration();
+    bool admitted_in_interposition = false;
+    store->setArmMountFenceInterpositionHookForTest([&]
+    {
+        EXPECT_EQ(store->fenceGeneration(), dead_generation + 1)
+            << "the fresh generation must be visible before the fence can become live";
+        try
+        {
+            (void)store->namespaceLife(ns);
+            admitted_in_interposition = true;
+        }
+        catch (const DB::Exception & e)
+        {
+            EXPECT_EQ(e.code(), DB::ErrorCodes::NETWORK_ERROR);
+        }
+        EXPECT_EQ(store->refTableRuntimeIdentityForTest(ns), 0u)
+            << "no runtime may be published in the re-arm interposition";
+    });
+
+    store->armMountFence(DB::UInt128{0, 1}, store->writerEpoch(), store->bootMsNow() + 600000);
+    store->setArmMountFenceInterpositionHookForTest(nullptr);
+
+    EXPECT_FALSE(admitted_in_interposition);
+    EXPECT_EQ(store->refTableRuntimeIdentityForTest(ns), 0u);
+    EXPECT_NO_THROW((void)store->namespaceLife(ns));
+    EXPECT_EQ(store->refTableRuntimeAdmittedFenceGenerationForTest(ns), store->fenceGeneration());
+}
+
 }
 
 /// (a) `casPutObject` (reached via `Pool::putNamespaceFile`) with the fence tripped BETWEEN admission

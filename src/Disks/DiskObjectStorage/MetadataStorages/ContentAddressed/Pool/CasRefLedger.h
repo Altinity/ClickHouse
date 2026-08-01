@@ -205,6 +205,10 @@ public:
     /// later name-based touch may publish a distinct successor runtime.
     void invalidateRemovedCatalogLife(const NamespaceLifeId & life);
 
+    /// Invalidates cold catalog observations before an in-process actor attempts a catalog mutation.
+    /// Spurious advances are harmless; a late advance would leave a stale publication window.
+    void noteCatalogMutation() { catalog_lifecycle_epoch.fetch_add(1, std::memory_order_acq_rel); }
+
     /// Reconciles resident removal-closed runtimes against one complete catalog observation. An exact
     /// life absent from or replaced in the cut is invalidated and exactly detached; a matching current
     /// life stays closed. No runtime is reset or rebound.
@@ -376,6 +380,26 @@ public:
     void setReadBeforeStateLockHookForTest(std::function<void()> hook)
     {
         read_before_state_lock_hook_for_test = std::move(hook);
+    }
+
+    /// Pauses a cold read after its catalog `GET` returned but before the observed life can be
+    /// published into the local name slot.
+    void setReadableCatalogAfterObservationHookForTest(std::function<void()> hook)
+    {
+        readable_catalog_after_observation_hook_for_test = std::move(hook);
+    }
+
+    /// Pauses a wedge retry after it captured the exact predecessor attempt but before the request
+    /// controller is allowed to send a retry.
+    void setWedgeBeforeSlotOccupyHookForTest(std::function<void()> hook)
+    {
+        wedge_before_slot_occupy_hook_for_test = std::move(hook);
+    }
+
+    /// Counts exact recovery-result publications.
+    uint64_t recoveryInstallCountForTest() const
+    {
+        return recovery_install_count_for_test.load(std::memory_order_relaxed);
     }
 
     /// Pauses a direct snapshot publisher after it captured the runtime state but before its first
@@ -825,6 +849,10 @@ private:
     /// recorded in `RefTableRuntime::last_touch_tick`.
     std::atomic<uint64_t> ref_table_access_tick{0};
     std::atomic<uint64_t> next_ref_runtime_id{0};
+    /// Monotone, process-local invalidation token for catalog observations that cross an object-store
+    /// `GET`. Every local catalog transition advances it BEFORE attempting durable mutation.
+    std::atomic<uint64_t> catalog_lifecycle_epoch{0};
+    std::atomic<uint64_t> recovery_install_count_for_test{0};
     /// Latched by `drainRefLanesForShutdown` before it
     /// snapshots `ref_name_slots`/waits on each table's queue -- every ordinary ref mutation (`appendRefOps`)
     /// checks this under the SAME `ref_queue_mutex` critical section it uses to enqueue its item, so the
@@ -895,6 +923,8 @@ private:
     std::function<void()> install_region_probe_for_test;
     std::function<void()> append_after_runtime_capture_hook_for_test;
     std::function<void()> read_before_state_lock_hook_for_test;
+    std::function<void()> readable_catalog_after_observation_hook_for_test;
+    std::function<void()> wedge_before_slot_occupy_hook_for_test;
     std::function<void()> snapshot_after_capture_hook_for_test;
     std::function<void()> snapshot_before_ckpt_cas_hook_for_test;
 
@@ -906,7 +936,8 @@ private:
     /// generation. A conflicting attached identity is a stale observation and fails closed rather than
     /// retargeting either runtime.
     std::shared_ptr<RefTableRuntime> acquireRefTableRuntime(
-        const NamespaceLifeId & life, uint64_t admitted_generation);
+        const NamespaceLifeId & life, uint64_t admitted_generation,
+        std::optional<uint64_t> observed_catalog_epoch = std::nullopt);
 
     /// Lookup-first non-minting read acquisition. A cold name consults the catalog and materializes only
     /// an exact `Live` life; absence/`Creating`/`Removing` returns no runtime.

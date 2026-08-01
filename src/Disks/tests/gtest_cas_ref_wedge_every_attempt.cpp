@@ -16,11 +16,13 @@
 
 #include <Poco/Exception.h>
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <functional>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <thread>
 
 /// ================================================================================================
@@ -270,6 +272,45 @@ String logPrefix(const PoolPtr & store, const RootNamespace & ns)
     return store->layout().namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
 }
 
+CatalogEntry catalogEntryOrThrow(Backend & backend, const Layout & layout, const RootNamespace & ns)
+{
+    const RefCatalog catalog = CasRefCatalog::read(backend, layout).catalog;
+    const auto it = std::find_if(catalog.entries.begin(), catalog.entries.end(), [&](const CatalogEntry & entry)
+    {
+        return entry.ns == ns;
+    });
+    if (it == catalog.entries.end())
+        throw std::runtime_error("catalog entry missing from wedge fixture");
+    return *it;
+}
+
+CatalogEntry replaceCatalogLifeForWedgeRace(
+    Backend & backend, const Layout & layout, const CatalogEntry & predecessor, UInt128 successor_incarnation)
+{
+    const CasRefCatalog::Snapshot before_delete = CasRefCatalog::read(backend, layout);
+    RefCatalog without_predecessor = before_delete.catalog;
+    std::erase_if(without_predecessor.entries, [&](const CatalogEntry & entry)
+    {
+        return entry.ns == predecessor.ns && entry.incarnation == predecessor.incarnation;
+    });
+    if (backend.casPut(layout.refCatalogKey(), encodeRefCatalog(without_predecessor), before_delete.token).outcome
+        != CasOutcome::Committed)
+        throw std::runtime_error("test failed to retire exact predecessor catalog life");
+
+    CatalogEntry successor{
+        .ns = predecessor.ns,
+        .state = NsState::Live,
+        .incarnation = successor_incarnation,
+        .creator = std::nullopt};
+    const CasRefCatalog::Snapshot after_delete = CasRefCatalog::read(backend, layout);
+    RefCatalog reborn = after_delete.catalog;
+    reborn.entries.push_back(successor);
+    if (backend.casPut(layout.refCatalogKey(), encodeRefCatalog(reborn), after_delete.token).outcome
+        != CasOutcome::Committed)
+        throw std::runtime_error("test failed to publish successor catalog life");
+    return successor;
+}
+
 /// Decode the ref-log object at `id`, through the SAME codec the writer's recovery uses (never a
 /// hand-rolled parse), so an assertion about `prev_epoch_seal` is an assertion about the WIRE.
 RefLogTxn readRefLogTxn(Backend & backend, const Layout & layout, const RootNamespace & ns, const RefTxnId & id)
@@ -364,6 +405,82 @@ TEST(CasRefWedgeEveryAttempt, AmbiguousPutWedgesTheLaneAndTheNextFlushsCreateAdo
     EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), tail_before + 2)
         << "the adopted wedge and the ordinary commit must each join the tail exactly once";
     EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Ready);
+}
+
+TEST(CasRefWedgeEveryAttempt, RetiredLifeRefusesWedgeRetryBeforeAnyRequestOrAdoption)
+{
+    auto backend = std::make_shared<WedgeTestBackend>();
+    auto store = openPool(backend, singleAttemptBudget());
+    const RootNamespace ns{"srv1/wedge-retired-before-retry"};
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);
+    publishEmptyPart(store, ns, "x");
+    publishEmptyPart(store, ns, "y");
+    const CatalogEntry predecessor = catalogEntryOrThrow(*backend, store->layout(), ns);
+    const NamespaceLifeId predecessor_life
+        = NamespaceLifeId::fromCatalogEntry(predecessor.ns, predecessor.incarnation);
+
+    backend->ambiguous_substr = logPrefix(store, ns);
+    backend->ambiguous_count = 1;
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
+    ASSERT_TRUE(store->refLaneWedgedForTest(ns));
+    const String wedged_key = store->wedgedKeyForTest(ns);
+    ASSERT_FALSE(backend->get(wedged_key));
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool paused = false;
+    bool resume = false;
+    store->setWedgeBeforeSlotOccupyHookForTest([&]
+    {
+        std::unique_lock lock(mutex);
+        paused = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return resume; });
+    });
+
+    std::exception_ptr retry_error;
+    std::thread retry([&]
+    {
+        try
+        {
+            store->dropRef(ns, "y");
+        }
+        catch (...)
+        {
+            retry_error = std::current_exception();
+        }
+    });
+    {
+        std::unique_lock lock(mutex);
+        cv.wait(lock, [&] { return paused; });
+    }
+
+    const CatalogEntry successor
+        = replaceCatalogLifeForWedgeRace(*backend, store->layout(), predecessor, UInt128{0x71f2});
+    const NamespaceLifeId successor_life
+        = NamespaceLifeId::fromCatalogEntry(successor.ns, successor.incarnation);
+    ASSERT_EQ(backend->putIfAbsent(store->layout().refCkptKey(successor_life), encodeRefCkpt(RefCkpt{
+        .life_epoch = store->liveWriterEpoch(),
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt})).outcome, PutOutcome::Done);
+    store->invalidateRemovedCatalogLife(predecessor_life);
+    backend->resetCounts();
+
+    {
+        std::lock_guard lock(mutex);
+        resume = true;
+    }
+    cv.notify_all();
+    retry.join();
+    store->setWedgeBeforeSlotOccupyHookForTest(nullptr);
+
+    EXPECT_TRUE(retry_error);
+    EXPECT_EQ(backend->putCount(wedged_key), 0u) << "retirement must refuse before the retry send";
+    EXPECT_EQ(backend->getCount(wedged_key), 0u) << "a refused retry needs no occupant resolution read";
+    EXPECT_FALSE(backend->get(wedged_key)) << "the predecessor wedge was adopted or made durable";
+    EXPECT_NO_THROW((void)store->listRefs(ns));
+    ASSERT_TRUE(store->refTableLifeForTest(ns));
+    EXPECT_EQ(*store->refTableLifeForTest(ns), successor_life);
 }
 
 /// The other adoption input, and the one that proves the identity rule is about BYTES: our own

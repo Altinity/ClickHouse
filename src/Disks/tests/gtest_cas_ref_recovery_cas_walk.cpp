@@ -367,6 +367,33 @@ uint64_t counterOf(ProfileEvents::Event event)
     return ProfileEvents::global_counters[event].load();
 }
 
+CatalogEntry replaceCatalogLifeForTest(
+    Backend & backend, const Layout & layout, const CatalogEntry & predecessor, UInt128 successor_incarnation)
+{
+    const CasRefCatalog::Snapshot before_delete = CasRefCatalog::read(backend, layout);
+    RefCatalog without_predecessor = before_delete.catalog;
+    std::erase_if(without_predecessor.entries, [&](const CatalogEntry & entry)
+    {
+        return entry.ns == predecessor.ns && entry.incarnation == predecessor.incarnation;
+    });
+    if (backend.casPut(layout.refCatalogKey(), encodeRefCatalog(without_predecessor), before_delete.token).outcome
+        != CasOutcome::Committed)
+        throw std::runtime_error("test failed to retire exact predecessor catalog life");
+
+    CatalogEntry successor{
+        .ns = predecessor.ns,
+        .state = NsState::Live,
+        .incarnation = successor_incarnation,
+        .creator = std::nullopt};
+    const CasRefCatalog::Snapshot after_delete = CasRefCatalog::read(backend, layout);
+    RefCatalog reborn = after_delete.catalog;
+    reborn.entries.push_back(successor);
+    if (backend.casPut(layout.refCatalogKey(), encodeRefCatalog(reborn), after_delete.token).outcome
+        != CasOutcome::Committed)
+        throw std::runtime_error("test failed to publish successor catalog life");
+    return successor;
+}
+
 }
 
 /// ---------------------------------------------------------------------------------------------
@@ -675,6 +702,93 @@ TEST(CasRefRecoveryCasWalk, FenceBumpedMidWalkRefusesTheInstallAndTheRetrySuccee
         << "a generation bump cannot rebind the captured runtime; the production remount must publish "
            "a distinct runtime at the accepted generation";
     EXPECT_EQ(store->listRefs(ns).size(), 1u) << "the retry through the remounted runtime succeeds";
+}
+
+TEST(CasRefRecoveryCasWalk, RetiredLifePausedInRealRecoveryIoWritesAndInstallsNothing)
+{
+    auto backend = std::make_shared<GetSeamBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/recovery-retired-mid-io"};
+
+    burnEpochsUpTo(*backend, layout, /*target_live_epoch=*/2);
+    seedCkpt(*backend, layout, ns, lifeEpochCkpt(1));
+    seedTxn(*backend, layout, ns, RefTxnId{1, 1}, "predecessor", /*birth=*/true);
+    const CatalogEntry predecessor = CasRefCatalog::read(*backend, layout).catalog.entries.front();
+    const NamespaceLifeId predecessor_life
+        = NamespaceLifeId::fromCatalogEntry(predecessor.ns, predecessor.incarnation);
+    const auto predecessor_ckpt_before = backend->get(layout.refCkptKey(predecessor_life));
+    ASSERT_TRUE(predecessor_ckpt_before);
+
+    auto store = openWalkPool(backend);
+    ASSERT_EQ(store->liveWriterEpoch(), 2u);
+    const uint64_t recovery_installs_before = store->recoveryInstallCountForTest();
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool paused = false;
+    bool resume = false;
+    backend->watched_substr = "_log/";
+    backend->on_key = [&](const String &)
+    {
+        std::unique_lock lock(mutex);
+        paused = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return resume; });
+    };
+
+    std::exception_ptr recovery_error;
+    std::thread recovery([&]
+    {
+        try
+        {
+            (void)store->listRefs(ns);
+        }
+        catch (...)
+        {
+            recovery_error = std::current_exception();
+        }
+    });
+    {
+        std::unique_lock lock(mutex);
+        cv.wait(lock, [&] { return paused; });
+    }
+
+    const CatalogEntry successor = replaceCatalogLifeForTest(*backend, layout, predecessor, UInt128{0x5152});
+    const NamespaceLifeId successor_life
+        = NamespaceLifeId::fromCatalogEntry(successor.ns, successor.incarnation);
+    ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(successor_life), encodeRefCkpt(lifeEpochCkpt(2))).outcome,
+        PutOutcome::Done);
+    const auto successor_ckpt_before = backend->get(layout.refCkptKey(successor_life));
+    ASSERT_TRUE(successor_ckpt_before);
+    store->invalidateRemovedCatalogLife(predecessor_life);
+    backend->resetCounts();
+
+    {
+        std::lock_guard lock(mutex);
+        resume = true;
+    }
+    cv.notify_all();
+    recovery.join();
+
+    EXPECT_TRUE(recovery_error) << "the predecessor recovery must be refused, not exposed";
+    EXPECT_EQ(backend->putCount(layout.refLogKey(predecessor_life, RefTxnId{1, 2})), 0u)
+        << "no predecessor seal retry may be sent after exact retirement";
+    EXPECT_EQ(backend->casPutCount(layout.refCkptKey(predecessor_life)), 0u)
+        << "no predecessor checkpoint CAS may be sent after exact retirement";
+    const auto predecessor_ckpt_after = backend->get(layout.refCkptKey(predecessor_life));
+    ASSERT_TRUE(predecessor_ckpt_after);
+    EXPECT_EQ(predecessor_ckpt_after->token, predecessor_ckpt_before->token);
+    EXPECT_FALSE(store->refTableRecoveredForTest(ns)) << "the detached predecessor result was installed";
+    EXPECT_EQ(store->recoveryInstallCountForTest(), recovery_installs_before)
+        << "the detached predecessor reached the recovery publication point";
+    const String successor_prefix = layout.namespaceStreamPrefix(successor_life);
+    for (const String & key : backend->touchedKeys())
+        EXPECT_EQ(key.find(successor_prefix), String::npos)
+            << "predecessor recovery retargeted storage I/O into successor key " << key;
+    const auto successor_ckpt_after = backend->get(layout.refCkptKey(successor_life));
+    ASSERT_TRUE(successor_ckpt_after);
+    EXPECT_EQ(successor_ckpt_after->token, successor_ckpt_before->token);
+    EXPECT_EQ(successor_ckpt_after->bytes, successor_ckpt_before->bytes);
 }
 
 /// Bump point 1 of the trio's two interior seams: AFTER the slot-occupy landed, BEFORE the `_ckpt` CAS.

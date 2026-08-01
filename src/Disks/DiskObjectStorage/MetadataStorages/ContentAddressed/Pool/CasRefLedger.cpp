@@ -507,17 +507,21 @@ std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::lookupRefTableRunti
 }
 
 std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireRefTableRuntime(
-    const NamespaceLifeId & life, uint64_t admitted_generation)
+    const NamespaceLifeId & life, uint64_t admitted_generation,
+    std::optional<uint64_t> observed_catalog_epoch)
 {
     check_fence_or_throw(admitted_generation);
 
     std::shared_ptr<RefTableRuntime> result;
     bool generation_moved = false;
+    bool catalog_observation_moved = false;
     bool identity_conflict = false;
     {
         std::lock_guard lock(ref_queue_mutex);
         generation_moved = fence_generation_fn() != admitted_generation;
-        if (!generation_moved)
+        catalog_observation_moved = observed_catalog_epoch
+            && catalog_lifecycle_epoch.load(std::memory_order_acquire) != *observed_catalog_epoch;
+        if (!generation_moved && !catalog_observation_moved)
         {
             const auto it = ref_name_slots.find(life.ns.string());
             if (it != ref_name_slots.end() && it->second.current)
@@ -544,6 +548,11 @@ std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireRefTableRunt
 
     if (generation_moved)
         check_fence_or_throw(admitted_generation);
+    if (catalog_observation_moved)
+        throwCasWriteRetryLater(fmt::format(
+            "CAS namespace '{}': its catalog changed while a cold reader observed life {}; "
+            "retry from a fresh catalog observation",
+            life.ns.string(), renderIncarnation(life.incarnation)));
     if (identity_conflict)
         throwCasWriteRetryLater(fmt::format(
             "CAS namespace '{}': the cached runtime identity changed while publishing catalog life {}; "
@@ -568,14 +577,18 @@ std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireReadableRefT
 
     const uint64_t admitted_generation = fence_generation_fn();
     check_fence_or_throw(admitted_generation);
+    const uint64_t observed_catalog_epoch = catalog_lifecycle_epoch.load(std::memory_order_acquire);
     const CasRefCatalog::Snapshot catalog = CasRefCatalog::read(backend, layout);
     check_fence_or_throw(admitted_generation);
+    if (readable_catalog_after_observation_hook_for_test)
+        readable_catalog_after_observation_hook_for_test();
     const auto it = std::find_if(catalog.catalog.entries.begin(), catalog.catalog.entries.end(),
         [&](const CatalogEntry & entry) { return entry.ns == ns; });
     if (it == catalog.catalog.entries.end() || it->state != NsState::Live)
         return nullptr;
     return acquireRefTableRuntime(
-        NamespaceLifeId::fromCatalogEntry(it->ns, it->incarnation), admitted_generation);
+        NamespaceLifeId::fromCatalogEntry(it->ns, it->incarnation), admitted_generation,
+        observed_catalog_epoch);
 }
 
 std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireMutableRefTableRuntime(
@@ -593,6 +606,9 @@ std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireMutableRefTa
 
 void CasRefLedger::invalidateRemovedCatalogLife(const NamespaceLifeId & life)
 {
+    /// Advance even when no slot exists. A cold reader may already hold the predecessor catalog bytes
+    /// and be about to publish the first slot; the token is what makes that publication fail closed.
+    noteCatalogMutation();
     std::shared_ptr<RefTableRuntime> rt;
     {
         std::lock_guard lock(ref_queue_mutex);
@@ -669,6 +685,12 @@ void CasRefLedger::checkRecoveryStillAdmitted(const RootNamespace & ns, RefTable
             "fence was re-armed; nothing was written and nothing installed — the next touch recovers under "
             "the fresh incarnation", ns.string()));
     }
+
+    if (rt.catalog_life_invalidated.load(std::memory_order_acquire))
+        throwCasWriteRetryLater(fmt::format(
+            "CAS ref-table recovery for namespace '{}': catalog retirement invalidated life {} "
+            "while recovery I/O was in flight — nothing further is written and nothing is installed",
+            ns.string(), renderIncarnation(rt.life.incarnation)));
 
     /// The remount's OTHER publication, ordered before the fence re-arm: this runtime is detached, so
     /// whatever it recovers belongs to a dead incarnation's cache. Checked separately from the
@@ -959,6 +981,7 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
             const auto admitted_fence_ok = [this, &rt, admitted_generation]
             {
                 return fence_ok_fn()
+                    && !rt.catalog_life_invalidated.load(std::memory_order_acquire)
                     && !rt.superseded_by_remount.load(std::memory_order_acquire)
                     && fence_generation_fn() == admitted_generation;
             };
@@ -1066,7 +1089,16 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
         const RefCkpt contribution{.life_epoch = std::nullopt,
                                    .checkpoint_snapshot_id = std::nullopt,
                                    .last_epoch_seal = last_epoch_seal};
-        if (publishCkptContribution(life, contribution, admitted_generation, check_fence_or_throw)
+        const auto check_recovery_write_admitted = [this, &rt](uint64_t expected_generation)
+        {
+            check_fence_or_throw(expected_generation);
+            if (rt.catalog_life_invalidated.load(std::memory_order_acquire))
+                throwCasWriteRetryLater(fmt::format(
+                    "CAS ref-table recovery for namespace '{}': catalog retirement invalidated life {} "
+                    "before its checkpoint contribution",
+                    rt.life.ns.string(), renderIncarnation(rt.life.incarnation)));
+        };
+        if (publishCkptContribution(life, contribution, admitted_generation, check_recovery_write_admitted)
             == CkptPublishOutcome::FencedOut)
             throwCasWriteRetryLater(fmt::format(
                 "CAS ref-table recovery for namespace '{}': the mount incarnation moved before the "
@@ -1103,6 +1135,7 @@ NamespaceLifeId CasRefLedger::resolveNamespaceLife(
             /// not); either way it does not hand the incarnation back, so a `Live` outcome re-reads the
             /// catalog on the next loop iteration to learn it -- one extra GET, paid once per birth,
             /// never per write.
+            noteCatalogMutation();
             const auto outcome = CasRefCatalog::createNamespace(
                 backend, layout, ns, our_fence, admitted_generation, check_fence_or_throw, deadline);
             if (outcome == CasRefCatalog::NamespaceCreationOutcome::FencedOut)
@@ -1133,6 +1166,7 @@ NamespaceLifeId CasRefLedger::resolveNamespaceLife(
         /// not dead), so this case is checked FIRST and unconditionally, before any terminality probe.
         if (it->creator->server_root_id == server_root_id && it->creator->writer_epoch == live_epoch)
         {
+            noteCatalogMutation();
             const auto outcome = CasRefCatalog::completeCreation(
                 backend, layout, *it, admitted_generation, check_fence_or_throw, deadline);
             if (outcome == CasRefCatalog::NamespaceCreationOutcome::FencedOut)
@@ -1146,6 +1180,7 @@ NamespaceLifeId CasRefLedger::resolveNamespaceLife(
         /// A DIFFERENT actor's `Creating` entry. It may still be mid-flight (retry later, against a
         /// fresh read -- never busy-loop this instant) or provably dead, in which case reconciliation
         /// steals it onto our own fence and this open resumes `completeCreation` itself.
+        noteCatalogMutation();
         const auto reconcile_outcome = CasRefCatalog::reconcileStaleCreator(
             backend, layout, *it, our_fence,
             [this](const CreatorFence & f) { return isCreatorFenceTerminal(backend, layout, f.server_root_id, f.writer_epoch); },
@@ -1163,6 +1198,7 @@ NamespaceLifeId CasRefLedger::resolveNamespaceLife(
             {
                 CatalogEntry resumed = *it;
                 resumed.creator = our_fence;
+                noteCatalogMutation();
                 const auto outcome = CasRefCatalog::completeCreation(
                     backend, layout, resumed, admitted_generation, check_fence_or_throw, deadline);
                 if (outcome == CasRefCatalog::NamespaceCreationOutcome::FencedOut)
@@ -1318,6 +1354,11 @@ void CasRefLedger::ensureRefTableRecovered(const RootNamespace & ns, RefTableRun
                 /// mount incarnation that no longer owns this namespace. It must publish NOTHING: the
                 /// table stays unrecovered and the next touch recovers it properly.
                 check_fence_or_throw(admitted_generation);
+                if (rt.catalog_life_invalidated.load(std::memory_order_acquire))
+                    throwCasWriteRetryLater(fmt::format(
+                        "CAS ref-table recovery for namespace '{}': catalog retirement invalidated life {} "
+                        "before recovery install — nothing is installed",
+                        ns.string(), renderIncarnation(rt.life.incarnation)));
                 if (rt.superseded_by_remount.load(std::memory_order_acquire))
                     throwCasWriteRetryLater(fmt::format(
                         "CAS ref-table recovery for namespace '{}': this cached table was superseded by a "
@@ -1329,6 +1370,7 @@ void CasRefLedger::ensureRefTableRecovered(const RootNamespace & ns, RefTableRun
                 /// function-scope SCOPE_EXIT's `recovery_cv` notify, which runs after this returns) ever
                 /// observes a partially-installed table.
                 installRecoveryResult(rt, std::move(*walked));
+                recovery_install_count_for_test.fetch_add(1, std::memory_order_relaxed);
                 break;
             }
             break;   /// recovery succeeded -> exit the outer retry loop
@@ -1353,6 +1395,7 @@ void CasRefLedger::ensureRefTableRecovered(const RootNamespace & ns, RefTableRun
             /// generation that is already stale can only ever be refused at the install).
             if (elapsed_ms >= cas_request_budget.recovery_retry_budget_ms
                 || !fence_ok_fn()
+                || rt.catalog_life_invalidated.load(std::memory_order_acquire)
                 || rt.superseded_by_remount.load(std::memory_order_acquire)
                 || fence_generation_fn() != admitted_generation)
                 throw;
@@ -1393,6 +1436,7 @@ void CasRefLedger::ensureRefTableRecovered(const RootNamespace & ns, RefTableRun
             /// loss).
             if (boot_ms_now_fn() - recovery_start_ms >= cas_request_budget.recovery_retry_budget_ms
                 || !fence_ok_fn()
+                || rt.catalog_life_invalidated.load(std::memory_order_acquire)
                 || rt.superseded_by_remount.load(std::memory_order_acquire)
                 || fence_generation_fn() != admitted_generation)
                 throw;
@@ -1985,6 +2029,7 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
     {
         None,
         FenceMoved,             /// the mount incarnation moved since this attempt was admitted
+        CatalogLifeRetired,     /// exact catalog retirement detached this immutable life
         Superseded,             /// a self-remount detached this runtime
         WedgeReplaced,          /// the result belongs to a wedge that is no longer installed
         RefusedPreAttempt,      /// `slotOccupy` sent nothing
@@ -2057,6 +2102,7 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
     const auto admitted_fence_ok = [this, &rt, admitted = wedge.admitted_fence_generation]
     {
         return fence_ok_fn()
+            && !rt->catalog_life_invalidated.load(std::memory_order_acquire)
             && !rt->superseded_by_remount.load(std::memory_order_acquire)
             && fence_generation_fn() == admitted;
     };
@@ -2064,6 +2110,8 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
     SlotOccupyResult occupied;
     try
     {
+        if (wedge_before_slot_occupy_hook_for_test)
+            wedge_before_slot_occupy_hook_for_test();
         occupied = ref_request_controller->slotOccupy(wedge.key, wedge.bytes, admitted_fence_ok);
     }
     catch (...)
@@ -2123,6 +2171,7 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
         /// generation and the check above would already have caught it. Relying on that ordering
         /// silently is how a future edit to the remount sequence turns into a stale install.
         const bool superseded = rt->superseded_by_remount.load(std::memory_order_acquire);
+        const bool catalog_life_retired = rt->catalog_life_invalidated.load(std::memory_order_acquire);
 
         /// All three components of the identity, because none of them alone identifies the attempt: two
         /// attempts of one table can share an id and a generation and describe DIFFERENT bytes, and
@@ -2141,9 +2190,11 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
             reason = Reason::StaleState;
             result.kind = WedgeResolution::StillWedged;
         }
-        else if (fence_moved || superseded || !same_wedge)
+        else if (fence_moved || catalog_life_retired || superseded || !same_wedge)
         {
-            reason = fence_moved ? Reason::FenceMoved : (superseded ? Reason::Superseded : Reason::WedgeReplaced);
+            reason = fence_moved ? Reason::FenceMoved
+                : (catalog_life_retired ? Reason::CatalogLifeRetired
+                : (superseded ? Reason::Superseded : Reason::WedgeReplaced));
             result.kind = WedgeResolution::StillWedged;
         }
         else if (occupied.kind == SlotOccupyResult::Kind::Unresolved)
@@ -2314,6 +2365,13 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
                         "DIFFERENT mount incarnation than the one that admitted it — the result is inert "
                         "and the lane keeps its wedge for whoever recovers it under the live incarnation",
                         ns.string(), txn);
+                    break;
+                case Reason::CatalogLifeRetired:
+                    why = fmt::format(
+                        "CAS ref-log append for namespace '{}': catalog retirement detached life {} "
+                        "before the bounded retry could be adopted — the result is inert and the "
+                        "successor life is untouched",
+                        ns.string(), renderIncarnation(rt->life.incarnation));
                     break;
                 case Reason::Superseded:
                     why = fmt::format(
@@ -4414,6 +4472,7 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
     {
         const CatalogEntry observed = *initial_it;
         const uint64_t admitted_generation = fence_generation_fn();
+        noteCatalogMutation();
         switch (CasRefCatalog::cancelStalledCreating(
             backend, layout, observed,
             [this](const CreatorFence & creator)
@@ -4500,6 +4559,7 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
             if (const auto got = backend.get(layout.gcStateKey()))
                 removal_started_round = decodeGcState(got->bytes).round;
 
+            noteCatalogMutation();
             switch (CasRefCatalog::beginRemoving(
                 backend, layout, *observed_live, removal_started_round,
                 admitted_generation, check_fence_or_throw))

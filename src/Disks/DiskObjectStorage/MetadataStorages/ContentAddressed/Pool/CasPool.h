@@ -360,6 +360,10 @@ public:
     void setMountDeadline(uint64_t deadline_boot_ms);
     /// Arm the fence at startup: set (uuid, epoch, deadline), clear `lost`.
     void armMountFence(UInt128 server_uuid, uint64_t writer_epoch, uint64_t deadline_boot_ms);
+    void setArmMountFenceInterpositionHookForTest(std::function<void()> hook)
+    {
+        mount_runtime.setArmMountFenceInterpositionHookForTest(std::move(hook));
+    }
     /// The fence clock: CLOCK_BOOTTIME in milliseconds (includes VM-suspend time, unlike
     /// CLOCK_MONOTONIC — see `MountFence`). Consults the injected `config.boot_ms_fn` if set (tests),
     /// otherwise `bootMs`.
@@ -517,6 +521,7 @@ public:
     /// GC callback after a proved exact catalog deletion; see `CasRefLedger` for the in-place cached
     /// runtime invalidation contract.
     void invalidateRemovedCatalogLife(const NamespaceLifeId & life);
+    void noteRefCatalogMutation() { ref_ledger.noteCatalogMutation(); }
 
     /// Reconciles cached removal-closed ref runtimes against a complete catalog cut.
     void reconcileRefCatalogCut(const CasRefCatalog::Snapshot & catalog_cut);
@@ -879,6 +884,15 @@ public:
     {
         ref_ledger.setReadBeforeStateLockHookForTest(std::move(hook));
     }
+    void setReadableCatalogAfterObservationHookForTest(std::function<void()> hook)
+    {
+        ref_ledger.setReadableCatalogAfterObservationHookForTest(std::move(hook));
+    }
+    void setWedgeBeforeSlotOccupyHookForTest(std::function<void()> hook)
+    {
+        ref_ledger.setWedgeBeforeSlotOccupyHookForTest(std::move(hook));
+    }
+    uint64_t recoveryInstallCountForTest() const { return ref_ledger.recoveryInstallCountForTest(); }
 
     /// Test-only: fault seam for the ref-flush two-phase carve/validation protocol; forwards to
     /// `CasRefLedger::setCarveHookForTest` (see it for the phase-point contract).

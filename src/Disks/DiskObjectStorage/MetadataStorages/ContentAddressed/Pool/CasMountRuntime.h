@@ -125,6 +125,13 @@ public:
     void setMountDeadline(uint64_t deadline_boot_ms);
     /// Arm a new lease incarnation and clear any loss latched for the prior incarnation.
     void armMountFence(UInt128 server_uuid, uint64_t writer_epoch, uint64_t deadline_boot_ms);
+    /// Test-only interposition at the publication boundary between the re-armed generation and the
+    /// live fence. A caller admitted from this hook must be refused: the old generation is already
+    /// dead, while the new generation is not live until `lost` is cleared.
+    void setArmMountFenceInterpositionHookForTest(std::function<void()> hook)
+    {
+        arm_mount_fence_interposition_hook_for_test = std::move(hook);
+    }
     /// The fence clock: `CLOCK_BOOTTIME` in milliseconds (includes VM-suspend time, unlike
     /// CLOCK_MONOTONIC — see `MountFence`). Consults the injected `config.boot_ms_fn` if set (tests),
     /// otherwise `bootMs`.
@@ -390,6 +397,7 @@ private:
     /// Fence-generation token (rev.7 [C2]): bumped by `tripMountLost` and `armMountFence`. See
     /// `fenceGeneration`/`checkFenceOrThrow`.
     std::atomic<uint64_t> fence_generation{0};
+    std::function<void()> arm_mount_fence_interposition_hook_for_test;
 
     /// The pool lifecycle condition (rev.7 §1). Starts `Live`. Non-terminal transitions
     /// (`noteLeaseLost`/`noteRemounted`) are lock-free compare-exchanges guarded by their exact
