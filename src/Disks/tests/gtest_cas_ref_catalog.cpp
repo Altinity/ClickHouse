@@ -909,7 +909,8 @@ TEST(CasRefCatalogRemoval, DeleteCompletedRemovingRequiresExactAdoptedProofAndLe
             .hold = RefHold{.offending_position = RefTxnId{1, 3}}},
         .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
     EXPECT_EQ(CasRefCatalog::deleteCompletedRemoving(
-        backend, layout, removing, held_parent, 5, [](uint64_t) {}),
+        backend, layout, removing, held_parent, 5,
+        [](uint64_t) { return CasRefCatalog::LeaderFenceStatus::Held; }),
         CasRefCatalog::CompletedRemovingDeleteOutcome::ProofRefused);
 
     CasFoldSeal mismatched_parent;
@@ -917,7 +918,8 @@ TEST(CasRefCatalogRemoval, DeleteCompletedRemovingRequiresExactAdoptedProofAndLe
         .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{1, 2}},
         .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
     EXPECT_EQ(CasRefCatalog::deleteCompletedRemoving(
-        backend, layout, removing, mismatched_parent, 5, [](uint64_t) {}),
+        backend, layout, removing, mismatched_parent, 5,
+        [](uint64_t) { return CasRefCatalog::LeaderFenceStatus::Held; }),
         CasRefCatalog::CompletedRemovingDeleteOutcome::ProofRefused);
 
     CasFoldSeal ready_parent;
@@ -929,22 +931,29 @@ TEST(CasRefCatalogRemoval, DeleteCompletedRemovingRequiresExactAdoptedProofAndLe
     live.state = NsState::Live;
     live.removal_started_round.reset();
     EXPECT_EQ(CasRefCatalog::deleteCompletedRemoving(
-        backend, layout, live, ready_parent, 5, [](uint64_t) {}),
+        backend, layout, live, ready_parent, 5,
+        [](uint64_t) { return CasRefCatalog::LeaderFenceStatus::Held; }),
         CasRefCatalog::CompletedRemovingDeleteOutcome::ProofRefused);
     CatalogEntry creating = live;
     creating.state = NsState::Creating;
     creating.creator = CreatorFence{.server_root_id = "server", .writer_epoch = 3, .fence_generation = 4};
     EXPECT_EQ(CasRefCatalog::deleteCompletedRemoving(
-        backend, layout, creating, ready_parent, 5, [](uint64_t) {}),
+        backend, layout, creating, ready_parent, 5,
+        [](uint64_t) { return CasRefCatalog::LeaderFenceStatus::Held; }),
         CasRefCatalog::CompletedRemovingDeleteOutcome::ProofRefused);
 
     EXPECT_EQ(CasRefCatalog::deleteCompletedRemoving(
-        backend, layout, removing, ready_parent, 5, [](uint64_t) { throw std::runtime_error("fenced"); }),
+        backend, layout, removing, ready_parent, 5,
+        [](uint64_t) { return CasRefCatalog::LeaderFenceStatus::Moved; }),
         CasRefCatalog::CompletedRemovingDeleteOutcome::FencedOut);
     EXPECT_EQ(backend.casPutCount(layout.refCatalogKey()), 0);
 
     EXPECT_EQ(CasRefCatalog::deleteCompletedRemoving(
-        backend, layout, removing, ready_parent, 5, [](uint64_t generation) { EXPECT_EQ(generation, 5); }),
+        backend, layout, removing, ready_parent, 5, [](uint64_t generation)
+        {
+            EXPECT_EQ(generation, 5);
+            return CasRefCatalog::LeaderFenceStatus::Held;
+        }),
         CasRefCatalog::CompletedRemovingDeleteOutcome::Deleted);
     EXPECT_TRUE(CasRefCatalog::read(backend, layout).catalog.entries.empty());
     EXPECT_EQ(backend.casPutCount(layout.refCatalogKey()), 1);
@@ -979,7 +988,8 @@ TEST(CasRefCatalogRemoval, ExactDeletionRefusesChangedEntryAndAdmissionCannotCar
         .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{1, 2}},
         .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
     EXPECT_EQ(CasRefCatalog::deleteCompletedRemoving(
-        backend, layout, removing, ready_parent, 5, [](uint64_t) {}),
+        backend, layout, removing, ready_parent, 5,
+        [](uint64_t) { return CasRefCatalog::LeaderFenceStatus::Held; }),
         CasRefCatalog::CompletedRemovingDeleteOutcome::EntryChanged);
     EXPECT_EQ(CasRefCatalog::read(backend, layout).catalog.entries, std::vector<CatalogEntry>{current});
 }
@@ -1019,7 +1029,8 @@ TEST(CasRefCatalogRemoval, FenceLossRemainsControlOutcomeWhenWinnerRemovesOrRepl
                 backend, layout, removing, ready_parent, 5, [&](uint64_t)
                 {
                     if (backend.fenceMoved())
-                        throw std::runtime_error("fenced");
+                        return CasRefCatalog::LeaderFenceStatus::Moved;
+                    return CasRefCatalog::LeaderFenceStatus::Held;
                 });
 
         EXPECT_EQ(result.outcome, CasRefCatalog::CompletedRemovingDeleteOutcome::FencedOut);
@@ -1032,6 +1043,73 @@ TEST(CasRefCatalogRemoval, FenceLossRemainsControlOutcomeWhenWinnerRemovesOrRepl
         else
             EXPECT_TRUE(current.entries.empty());
     }
+}
+
+/// Mutation caught: treating every authority-check exception as a moved fence hides corruption and
+/// backend/decode failures. Before any CAS, inability to evaluate authority must propagate unchanged.
+TEST(CasRefCatalogRemoval, NonFenceAuthorityExceptionPropagatesBeforeEraseCas)
+{
+    DB::Cas::tests::CountingBackend backend;
+    const Layout layout("pre-cas-authority-error");
+    const CatalogEntry removing{
+        .ns = RootNamespace{"a"},
+        .state = NsState::Removing,
+        .incarnation = UInt128{7},
+        .removal_started_round = 13};
+    ASSERT_EQ(backend.putIfAbsent(
+        layout.refCatalogKey(), encodeRefCatalog(RefCatalog{.entries = {removing}})).outcome,
+        PutOutcome::Done);
+    CasFoldSeal ready_parent;
+    ready_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
+        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{1, 2}},
+        .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
+
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
+    {
+        (void)CasRefCatalog::deleteCompletedRemoving(
+            backend, layout, removing, ready_parent, 5, [](uint64_t) -> CasRefCatalog::LeaderFenceStatus
+            {
+                throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
+                    "injected authority read failure before erase CAS");
+            });
+    });
+    EXPECT_EQ(backend.casPutCount(layout.refCatalogKey()), 0u);
+}
+
+/// The post-CAS authority check is distinct: the erase may already be durable and its mandatory
+/// resolution complete, but inability to evaluate authority is still the original error, not
+/// `FencedOut`.
+TEST(CasRefCatalogRemoval, NonFenceAuthorityExceptionPropagatesAfterEraseResolution)
+{
+    DB::Cas::tests::CountingBackend backend;
+    const Layout layout("post-cas-authority-error");
+    const CatalogEntry removing{
+        .ns = RootNamespace{"a"},
+        .state = NsState::Removing,
+        .incarnation = UInt128{7},
+        .removal_started_round = 13};
+    ASSERT_EQ(backend.putIfAbsent(
+        layout.refCatalogKey(), encodeRefCatalog(RefCatalog{.entries = {removing}})).outcome,
+        PutOutcome::Done);
+    CasFoldSeal ready_parent;
+    ready_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
+        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{1, 2}},
+        .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
+
+    size_t authority_checks = 0;
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
+    {
+        (void)CasRefCatalog::deleteCompletedRemoving(
+            backend, layout, removing, ready_parent, 5, [&](uint64_t)
+            {
+                if (++authority_checks == 2)
+                    throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
+                        "injected authority read failure after erase resolution");
+                return CasRefCatalog::LeaderFenceStatus::Held;
+            });
+    });
+    EXPECT_EQ(authority_checks, 2u);
+    EXPECT_TRUE(CasRefCatalog::read(backend, layout).catalog.entries.empty());
 }
 
 TEST(CasRefCatalogRemoval, CancelStalledCreatingRequiresExactRowAndTerminalCreatorFence)

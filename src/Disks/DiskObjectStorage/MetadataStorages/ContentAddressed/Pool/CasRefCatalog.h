@@ -151,6 +151,14 @@ public:
         FencedOut,
     };
 
+    /// Authority result for completed-removal erases. Only an explicit `Moved` is a fence outcome;
+    /// exceptions mean authority could not be evaluated and propagate to the caller.
+    enum class LeaderFenceStatus : uint8_t
+    {
+        Held,
+        Moved,
+    };
+
     struct CompletedRemovingDeleteResult
     {
         CompletedRemovingDeleteOutcome outcome;
@@ -173,7 +181,7 @@ public:
     static CompletedRemovingDeleteResult deleteCompletedRemoving(
         Backend & backend, const Layout & layout, const CatalogEntry & observed,
         const CasFoldSeal & authoritative_parent, uint64_t admitted_generation,
-        const std::function<void(uint64_t)> & check_fence_or_throw);
+        const std::function<LeaderFenceStatus(uint64_t)> & check_fence);
 
     /// Same exact deletion, using the caller's complete selected catalog snapshot and token for the
     /// one CAS attempt. Its mandatory resolution snapshot is returned in the result so a catalog-only
@@ -182,7 +190,7 @@ public:
         Backend & backend, const Layout & layout, Snapshot catalog_snapshot,
         const CatalogEntry & observed, const CasFoldSeal & authoritative_parent,
         uint64_t admitted_generation,
-        const std::function<void(uint64_t)> & check_fence_or_throw);
+        const std::function<LeaderFenceStatus(uint64_t)> & check_fence);
 
     /// Outcome of exact stalled-creation cancellation, the only other exported deletion shape.
     enum class StalledCreatingCancelOutcome : uint8_t

@@ -281,7 +281,7 @@ CasRefCatalog::BeginRemovingOutcome CasRefCatalog::beginRemoving(
 CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemoving(
     Backend & backend, const Layout & layout, const CatalogEntry & observed,
     const CasFoldSeal & authoritative_parent, uint64_t admitted_generation,
-    const std::function<void(uint64_t)> & check_fence_or_throw)
+    const std::function<LeaderFenceStatus(uint64_t)> & check_fence)
 {
     if (observed.state != NsState::Removing || !observed.removal_started_round)
         return {
@@ -300,14 +300,14 @@ CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemov
 
     return deleteCompletedRemovingAtSnapshot(
         backend, layout, read(backend, layout), observed, authoritative_parent,
-        admitted_generation, check_fence_or_throw);
+        admitted_generation, check_fence);
 }
 
 CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemovingAtSnapshot(
     Backend & backend, const Layout & layout, Snapshot catalog_snapshot,
     const CatalogEntry & observed, const CasFoldSeal & authoritative_parent,
     uint64_t admitted_generation,
-    const std::function<void(uint64_t)> & check_fence_or_throw)
+    const std::function<LeaderFenceStatus(uint64_t)> & check_fence)
 {
     if (observed.state != NsState::Removing || !observed.removal_started_round)
         return {
@@ -346,15 +346,7 @@ CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemov
         if (observed_it == catalog_snapshot.catalog.entries.end() || *observed_it != observed)
             return resolved_result(CompletedRemovingDeleteOutcome::EntryChanged);
 
-        bool fence_lost = false;
-        try
-        {
-            check_fence_or_throw(admitted_generation);
-        }
-        catch (...)
-        {
-            fence_lost = true;
-        }
+        bool fence_lost = check_fence(admitted_generation) == LeaderFenceStatus::Moved;
 
         std::optional<CasResult> cas_result;
         std::exception_ptr attempt_failure;
@@ -379,16 +371,7 @@ CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemov
         catalog_snapshot = read(backend, layout);
 
         if (!fence_lost)
-        {
-            try
-            {
-                check_fence_or_throw(admitted_generation);
-            }
-            catch (...)
-            {
-                fence_lost = true;
-            }
-        }
+            fence_lost = check_fence(admitted_generation) == LeaderFenceStatus::Moved;
         if (fence_lost)
             return resolved_result(CompletedRemovingDeleteOutcome::FencedOut);
 

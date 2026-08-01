@@ -4427,7 +4427,7 @@ uint64_t Gc::drainCompletedRemoving(const GcState & leased_state)
     Backend & backend = store->backend();
     const Layout & layout = store->layout();
     const uint64_t admitted_generation = leased_state.lease.seq;
-    const auto check_fence_or_throw = [&](uint64_t expected_generation)
+    const auto check_fence = [&](uint64_t expected_generation)
     {
         if (expected_generation != admitted_generation)
             throw Exception(ErrorCodes::LOGICAL_ERROR,
@@ -4440,10 +4440,8 @@ uint64_t Gc::drainCompletedRemoving(const GcState & leased_state)
                 admitted_generation);
         const GcState current = decodeGcState(got->bytes);
         if (current.lease.owner != gc_id || current.lease.seq != admitted_generation)
-            throw Exception(ErrorCodes::ABORTED,
-                "CAS GC pre-fold drain: leader fence moved from owner {} generation {} to owner {} generation {}",
-                u128ToHex(gc_id), admitted_generation,
-                u128ToHex(current.lease.owner), current.lease.seq);
+            return CasRefCatalog::LeaderFenceStatus::Moved;
+        return CasRefCatalog::LeaderFenceStatus::Held;
     };
 
     uint64_t deleted = 0;
@@ -4469,7 +4467,7 @@ uint64_t Gc::drainCompletedRemoving(const GcState & leased_state)
         CasRefCatalog::CompletedRemovingDeleteResult delete_result
             = CasRefCatalog::deleteCompletedRemovingAtSnapshot(
                 backend, layout, std::move(catalog), *eligible, *parent,
-                admitted_generation, check_fence_or_throw);
+                admitted_generation, check_fence);
         if (delete_result.invalidated_life)
             store->invalidateRemovedCatalogLife(*delete_result.invalidated_life);
         if (!delete_result.catalog_snapshot)

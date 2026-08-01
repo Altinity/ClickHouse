@@ -93,7 +93,8 @@ void retireCatalogEntry(Backend & backend, const Layout & layout, const RootName
         .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{1, 1}},
         .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 1}}});
     ASSERT_EQ(CasRefCatalog::deleteCompletedRemoving(
-        backend, layout, *it, parent, 1, [](uint64_t) {}),
+        backend, layout, *it, parent, 1,
+        [](uint64_t) { return CasRefCatalog::LeaderFenceStatus::Held; }),
         CasRefCatalog::CompletedRemovingDeleteOutcome::Deleted);
 }
 
