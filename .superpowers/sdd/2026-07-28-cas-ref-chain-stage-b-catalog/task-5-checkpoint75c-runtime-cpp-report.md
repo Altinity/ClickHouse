@@ -89,10 +89,73 @@ Additional pins cover:
 | Supplemental debug death-test gate | PASS, 30/30 tests from all 17 generated `*DeathTest` suites; 0 failed/skipped/disabled; `build_debug/test_task5_checkpoint75c_runtime_death_suites.log` |
 | `git diff --check` and removed-API static audit | PASS |
 
-The source inventory contains seventeen conditional death-test suites that are absent from the
-release binary. The authoritative CA gate therefore runs the full release-visible suite intersection,
-while a second debug invocation runs all seventeen generated death suites. This preserves both build
-modes without silently excluding either side of the conditional tests.
+## Important fix round: stale admission after retirement
+
+Independent re-review found four remaining admission windows in the immutable-life boundary. Commit
+`107eb04464c` closes all four without weakening the immutable-runtime shape:
+
+- Recovery now treats exact catalog-life invalidation as a monotone cancellation at every unlocked
+  I/O boundary, every seal attempt, the `_ckpt` contribution, final install, and both transient-retry
+  gates. A real `_log` `GET` pause followed by exact predecessor deletion and same-name rebirth proves
+  zero predecessor seal `PUT`, zero predecessor `_ckpt` CAS, zero recovery-result publication, and
+  unchanged successor keys/checkpoint.
+- Wedge retry checks exact-life invalidation both in the request controller's pre-send predicate and
+  after I/O before adoption. Its deterministic pause is immediately before `slotOccupy`; retirement
+  and rebirth in that pause produce zero retry send, zero resolution read, zero adoption, and no
+  successor mutation.
+- A cold readable catalog observation carries a process-local monotone catalog epoch through its
+  object-store `GET` to slot publication. Every in-process catalog mutation advances the epoch before
+  attempting durable mutation, including the GC lifecycle reconciler. A stale `Live` L1 observation
+  therefore cannot occupy an empty name slot after exact L1 deletion and L2 rebirth; the stale caller
+  receives retry-later and a fresh caller attaches L2. This closes the no-prior-slot ABA without a
+  second catalog `GET` on every cold read.
+- `CasMountRuntime::armMountFence` now publishes the new generation before clearing `lost`. The final
+  release store of `lost = false` opens the fence only after the new generation is visible, eliminating
+  the loss-only-generation admission interval.
+
+The catalog-epoch producer inventory is explicit in code: `createNamespace`, every
+`completeCreation` arm, `reconcileStaleCreator`, `cancelStalledCreating`, `beginRemoving`, exact-life
+invalidation, and `CatalogLifecycleReconciler` all advance it before mutation. Spurious advances are
+safe retry costs; late advances would be unsafe.
+
+### Fix-round TDD evidence
+
+Each test was mutation-checked against only its new safety condition. The invalid initial wedge
+fixture was discarded after review found its fault substring named a sentinel life that production
+had not admitted; the retained `red2` run explicitly admits that incarnation and reaches the real
+wedge pause.
+
+| Obligation | Genuine RED evidence | Final GREEN evidence |
+| --- | --- | --- |
+| Fence re-arm opens no loss-only generation | `build/task5_checkpoint75c_fix_round1_arm_red_test2.log` | `build/task5_checkpoint75c_fix_round1_final_focused_green.log` |
+| Cold L1 observation cannot publish after L2 rebirth | `build/task5_checkpoint75c_fix_round1_stale_red_build2.log`, `build/task5_checkpoint75c_fix_round1_stale_red_test.log` | `build/task5_checkpoint75c_fix_round1_final_focused_green.log` |
+| Retired wedge retries send/adopt nothing | `build/task5_checkpoint75c_fix_round1_wedge_red2_build.log`, `build/task5_checkpoint75c_fix_round1_wedge_red2_test.log` | `build/task5_checkpoint75c_fix_round1_wedge_fixture_green_test.log`, `build/task5_checkpoint75c_fix_round1_final_focused_green.log` |
+| Retired recovery writes/installs nothing | `build/task5_checkpoint75c_fix_round1_recovery_red4_build.log`, `build/task5_checkpoint75c_fix_round1_recovery_red4_test.log` | `build/task5_checkpoint75c_fix_round1_counter_green_test.log`, `build/task5_checkpoint75c_fix_round1_final_focused_green.log` |
+
+The strengthened recovery mutation run is deliberately multi-boundary: removing all six retirement
+gates makes the paused predecessor issue one seal `PUT`, advance `_ckpt`, and increment the detached
+runtime's recovery-install counter. Restoring the gates makes every one of those oracles stay unchanged.
+
+### Fix-round validation
+
+| Gate | Result |
+| --- | --- |
+| Final release `unit_tests_dbms` build | PASS; `build/task5_checkpoint75c_fix_round1_postred_final_build.log` |
+| Four deterministic race tests | PASS, 4/4; `build/task5_checkpoint75c_fix_round1_final_focused_green.log` |
+| Relevant full suites | PASS, 57/57; `build/task5_checkpoint75c_fix_round1_relevant_suites.log` |
+| Complete release-visible CA gate | PASS, 1,765/1,765 from the exact 260-suite intersection; 0 failed/skipped, 2 pre-existing disabled; `build/task5_checkpoint75c_fix_round1_complete_ca_release.log` |
+| Final debug `unit_tests_dbms` build | PASS; `build_debug/task5_checkpoint75c_fix_round1_debug_build.log` |
+| Regenerated debug-only death-test complement | PASS, 31/31 from all 18 suites; 0 failed/skipped/disabled; only the standard GoogleTest fork/thread warnings; `build_debug/task5_checkpoint75c_fix_round1_death_suites_v2.log` |
+| Reviewed `CaRefLaneCore` matrix | PASS, 26/26 expected verdicts; `build/task5_checkpoint75c_fix_round1_reflane_tla.log` |
+| Full pre-fold TLA+ runner | PASS, 18/18 expected verdicts; `build/task5_checkpoint75c_fix_round1_prefold_tla.log` |
+| `git diff --check` | PASS |
+
+The base-checkpoint source inventory contained seventeen conditional death-test suites absent from the
+release binary. The fix round adds `CasRefCatalogRemovalDeathTest`, bringing the current complement to
+eighteen suites. The authoritative CA gate therefore runs the full release-visible suite intersection,
+while a second debug invocation runs the regenerated debug-only complement. This preserves both build
+modes without silently excluding either side of the conditional tests. The current regenerated
+inventory partitions exactly and disjointly as 278 total suites = 260 release-visible + 18 debug-only.
 
 The first diagnostic debug per-suite wrapper exposed six suites whose old tests treated a raw
 `armMountFence` call as a usable remount, or used observational accessors to materialize state. The
