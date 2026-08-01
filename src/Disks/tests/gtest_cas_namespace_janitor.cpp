@@ -63,6 +63,36 @@ private:
     bool replaced = false;
 };
 
+class TokenlessListBackend : public CountingBackend
+{
+public:
+    ListPage list(const String & prefix, const String & cursor, size_t limit) override
+    {
+        ListPage page = CountingBackend::list(prefix, cursor, limit);
+        for (ListedKey & key : page.keys)
+            key.token.reset();
+        return page;
+    }
+
+    bool supportsListTokens() const override { return false; }
+
+    HeadResult head(const String & key) override
+    {
+        HeadResult result = CountingBackend::head(key);
+        if (!replaced && result.exists && key == replace_on_head)
+        {
+            replaced = true;
+            (void)InMemoryBackend::casPut(key, "winner", result.token);
+        }
+        return result;
+    }
+
+    String replace_on_head;
+
+private:
+    bool replaced = false;
+};
+
 class CatalogAfterListBackend : public CountingBackend
 {
 public:
@@ -282,6 +312,37 @@ TEST(CasNamespaceJanitor, ExactTokenMismatchRetainsConcurrentReplacement)
     EXPECT_EQ(result.deleted, 0u);
     ASSERT_TRUE(backend.get(dead));
     EXPECT_EQ(backend.get(dead)->bytes, "winner");
+}
+
+TEST(CasNamespaceJanitor, TokenlessListHeadsDeadKeysAndRetainsConcurrentReplacement)
+{
+    TokenlessListBackend backend;
+    const Layout layout("p");
+    const CatalogEntry current{
+        .ns = RootNamespace{"current"}, .state = NsState::Live, .incarnation = UInt128{161}};
+    seedCatalog(backend, layout, RefCatalog{.entries = {current}});
+    const String live_key = layout.refCkptKey(NamespaceLifeId::fromCatalogEntry(current.ns, current.incarnation));
+    const String dead_key = layout.refCkptKey(life("dead", 162));
+    const String raced_key = layout.namespaceFilesPrefix(life("raced", 163)) + "data";
+    ASSERT_EQ(backend.putIfAbsent(live_key, "live").outcome, PutOutcome::Done);
+    ASSERT_EQ(backend.putIfAbsent(dead_key, "dead").outcome, PutOutcome::Done);
+    ASSERT_EQ(backend.putIfAbsent(raced_key, "old").outcome, PutOutcome::Done);
+    backend.replace_on_head = raced_key;
+    backend.resetCounts();
+
+    const auto result = NamespaceJanitor(backend, layout, 100).runOnePage(false, [] { return true; });
+
+    EXPECT_EQ(result.deleted, 1u);
+    EXPECT_TRUE(result.anomalies.empty());
+    EXPECT_TRUE(backend.get(live_key));
+    EXPECT_FALSE(backend.get(dead_key));
+    ASSERT_TRUE(backend.get(raced_key));
+    EXPECT_EQ(backend.get(raced_key)->bytes, "winner");
+    EXPECT_EQ(backend.headCount(live_key), 0u);
+    EXPECT_EQ(backend.headCount(dead_key), 1u);
+    EXPECT_EQ(backend.headCount(raced_key), 1u);
+    EXPECT_EQ(backend.deleteCount(dead_key), 1u);
+    EXPECT_EQ(backend.deleteCount(raced_key), 1u);
 }
 
 TEST(CasNamespaceJanitor, PostListCatalogCutProtectsConcurrentCreationWithOneGet)

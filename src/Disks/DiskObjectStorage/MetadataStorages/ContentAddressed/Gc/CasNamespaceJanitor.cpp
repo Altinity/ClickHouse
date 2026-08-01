@@ -75,14 +75,20 @@ NamespaceJanitorResult NamespaceJanitor::runOnePage(
         }
         if (ambiguous || suppress_deletes || catalog_cut.life_index.resolve(*life_id))
             continue;
-        if (!listed.token)
-        {
-            result.anomalies.push_back(listed.key + ": LIST returned no exact token");
-            continue;
-        }
         if (!fence_held())
             break;
-        if (backend.deleteExact(listed.key, *listed.token).kind == DeleteOutcome::Kind::Deleted)
+
+        Token token;
+        if (listed.token)
+            token = *listed.token;
+        else
+        {
+            const HeadResult current = backend.head(listed.key);
+            if (!current.exists)
+                continue;
+            token = current.token;
+        }
+        if (backend.deleteExact(listed.key, token).kind == DeleteOutcome::Kind::Deleted)
             ++result.deleted;
     }
 
