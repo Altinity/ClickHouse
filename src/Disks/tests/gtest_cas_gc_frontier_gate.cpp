@@ -221,6 +221,7 @@ CompletedRemovingFixture seedCompletedRemoving(
         .checkpoint_key = {}};
     CasRefCatalog::casAdmitEntry(backend, layout, CatalogEntry{
         .ns = fixture.ns, .state = NsState::Live, .incarnation = fixture.life_id});
+    (void)store->newestPublishedSnapshotIdForTest(fixture.ns);
     CasRefCatalog::casUpdate(backend, layout, [](const RefCatalog & current)
     {
         RefCatalog next = current;
@@ -1449,7 +1450,7 @@ TEST(CatalogLifecycleReconciler, ReturnsRetiredLifeWhenAuthorityMovesAfterResolu
         [&fence_checks](uint64_t)
         {
             ++fence_checks;
-            return fence_checks == 3
+            return fence_checks == 2
                 ? CasRefCatalog::LeaderFenceStatus::Moved
                 : CasRefCatalog::LeaderFenceStatus::Held;
         });
@@ -1462,6 +1463,40 @@ TEST(CatalogLifecycleReconciler, ReturnsRetiredLifeWhenAuthorityMovesAfterResolu
         NamespaceLifeId::fromCatalogEntry(fixture.ns, fixture.life_id));
     EXPECT_EQ(result.deleted, 0);
     EXPECT_FALSE(result.final_catalog_cut);
+}
+
+TEST(CatalogLifecycleReconciler, InitialFenceLossReportsEligibleRowStillPresent)
+{
+    auto backend = std::make_shared<DrainRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    const CompletedRemovingFixture fixture = seedCompletedRemoving(*backend, store, kGc);
+    const auto parent_object = backend->get(layout.foldSealKey(1, 1));
+    ASSERT_TRUE(parent_object);
+    const CasFoldSeal parent = decodeFoldSeal(parent_object->bytes);
+    backend->resetCounts();
+
+    CatalogLifecycleReconciler reconciler(
+        *backend,
+        layout,
+        parent,
+        /*admitted_generation=*/1,
+        [](uint64_t)
+        {
+            return CasRefCatalog::LeaderFenceStatus::Moved;
+        });
+    const CatalogLifecycleReconcileResult result = reconciler.reconcile();
+
+    EXPECT_EQ(result.authority_status, AuthorityStatus::FencedOut);
+    EXPECT_EQ(result.catalog_resolution, CatalogResolution::ExactRowStillPresent);
+    EXPECT_TRUE(result.retired_lives.empty());
+    EXPECT_EQ(result.deleted, 0);
+    EXPECT_FALSE(result.final_catalog_cut);
+    EXPECT_EQ(backend->getCount(layout.refCatalogKey()), 2)
+        << "the initial selection and mandatory erase-resolution cuts are the only catalog reads";
+    EXPECT_EQ(backend->casPutCount(layout.refCatalogKey()), 0);
+    EXPECT_EQ(CasRefCatalog::lifeIfCataloged(*backend, layout, fixture.ns),
+        NamespaceLifeId::fromCatalogEntry(fixture.ns, fixture.life_id));
 }
 
 TEST(CatalogLifecycleReconciler, RetriesFromTheMandatoryConflictResolutionCut)
@@ -1781,6 +1816,13 @@ TEST_P(CasGcCompletedRemovalFenceRace, FencedLeaderStopsAfterWinnerRemovesOrRepl
     const Layout & layout = store->layout();
     const UInt128 leader_b = hexToU128("00000000000000000000000000000002");
     const CompletedRemovingFixture fixture = seedCompletedRemoving(*backend, store, kGc);
+    const NamespaceLifeId predecessor_life
+        = NamespaceLifeId::fromCatalogEntry(fixture.ns, fixture.life_id);
+    ASSERT_TRUE(store->refTableRecoveredForTest(fixture.ns))
+        << "the fixture must retain a resident predecessor runtime before removal";
+    ASSERT_EQ(store->refTableLifeForTest(fixture.ns), predecessor_life);
+    const void * const predecessor_runtime = store->refTableRuntimeIdentityForTest(fixture.ns);
+    ASSERT_NE(predecessor_runtime, nullptr);
     backend->clearJournal();
     backend->blockNextCatalogCas(layout.refCatalogKey());
 
@@ -1828,6 +1870,12 @@ TEST_P(CasGcCompletedRemovalFenceRace, FencedLeaderStopsAfterWinnerRemovesOrRepl
     }));
     EXPECT_LT(findJournalAfter(journal, "get " + layout.refCatalogKey(), 0), journal.size())
         << "the stale leader must still complete mandatory erase resolution";
+
+    (void)store->newestPublishedSnapshotIdForTest(fixture.ns);
+    EXPECT_NE(store->refTableRuntimeIdentityForTest(fixture.ns), nullptr);
+    ASSERT_TRUE(store->refTableLifeForTest(fixture.ns));
+    EXPECT_NE(store->refTableLifeForTest(fixture.ns), predecessor_life)
+        << "the next name-based resolution must not retain the retired predecessor life";
 }
 
 INSTANTIATE_TEST_SUITE_P(

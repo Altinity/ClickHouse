@@ -74,15 +74,14 @@ CatalogLifecycleReconcileResult CatalogLifecycleReconciler::reconcile()
 
     for (;;)
     {
-        if (check_fence(admitted_generation) == CasRefCatalog::LeaderFenceStatus::Moved)
-        {
-            result.authority_status = AuthorityStatus::FencedOut;
-            return result;
-        }
-
         const std::optional<CatalogEntry> eligible = selectEligible(catalog);
         if (!eligible)
         {
+            if (check_fence(admitted_generation) == CasRefCatalog::LeaderFenceStatus::Moved)
+            {
+                result.authority_status = AuthorityStatus::FencedOut;
+                return result;
+            }
             result.catalog_resolution = CatalogResolution::DrainComplete;
             result.final_catalog_cut = std::move(catalog);
             return result;
