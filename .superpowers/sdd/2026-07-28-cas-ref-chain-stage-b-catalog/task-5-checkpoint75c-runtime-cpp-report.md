@@ -190,3 +190,24 @@ No Step 8 janitor, maintenance cursor, `GcMaintenanceState`, or mechanical Task 
 
 None in the implemented boundary. Independent concurrency/design review follows before checkpoint
 7.5d and before Step 8.
+
+## Important fix: catalog epoch publication serialization
+
+The scoped review of `107eb04464c` found that `noteCatalogMutation` advanced
+`catalog_lifecycle_epoch` without participating in the same `ref_queue_mutex` critical section as
+`acquireRefTableRuntime`'s epoch comparison and empty-slot publication. `noteCatalogMutation` now
+signals the test-only `BeforeRefQueueLock` phase, takes `ref_queue_mutex`, signals
+`AfterRefQueueLock`, and advances the epoch. The critical section contains no catalog or backend I/O.
+
+`CatalogMutationSerializesWithColdRuntimePublication` pauses a cold reader after its epoch comparison
+while it holds `ref_queue_mutex`. The mutator reaches `BeforeRefQueueLock`, cannot reach
+`AfterRefQueueLock` until the reader releases the mutex, then advances the epoch and exact invalidation
+detaches the predecessor. The test confirms no predecessor runtime remains resident and a fresh read
+attaches the successor life.
+
+| Gate | Result |
+| --- | --- |
+| ASan incremental `unit_tests_dbms` build | PASS; `build_asan/build_stageb_runtime_fix2_green.log` |
+| Controlled lock-removal mutation | RED, expected `mutation_after_lock` assertion; `build_asan/test_stageb_runtime_fix2_batched_red.log` |
+| Byte-exact source restoration | PASS; SHA-256 check against `tmp/stageb_runtime_fix2_green_cpp.sha256` |
+| Focused final cold-reader pair | PASS, 2/2; `build_asan/test_stageb_runtime_fix2_final.log` |
