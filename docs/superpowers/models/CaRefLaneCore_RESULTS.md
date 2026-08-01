@@ -18,8 +18,9 @@ doc_type: 'reference'
 containing two concrete runtime ids and two durable life ids. The predecessor runtime remains owned
 by its captured handle while the non-authoritative logical-name slot may publish a distinct
 successor after removal/rebirth or same-life self-remount. `StartWrite` captures `lane_runtime` in
-`attempt_runtime`; `BeginResolve` carries it into `resolver_runtime`; and the real write, install,
-resolution, and recovery transitions update per-runtime projections of `cache_id` and `durable_id`.
+`attempt_runtime`; `BeginResolve` carries it into `resolver_runtime`; every resolver observation
+records `observation_runtime`; and the real write, install, observation, resolution, and recovery
+transitions update or validate per-runtime projections of `cache_id` and `durable_id`.
 
 The battery ran with:
 
@@ -27,16 +28,16 @@ The battery ran with:
 docs/superpowers/models/run_reflane.sh
 ```
 
-All 24 expectations passed:
+All 26 expectations passed:
 
 - one honest exhaustive configuration was green;
-- eleven single-rule sabotages violated their named invariant;
-- twelve reachability witnesses violated their negated witness invariant.
+- twelve single-rule sabotages violated their named invariant;
+- thirteen reachability witnesses violated their negated witness invariant.
 
-The honest run generated 721,919 states, found 216,072 distinct states, reached depth 25, and
+The honest run generated 952,403 states, found 296,280 distinct states, reached depth 25, and
 exhausted the queue. The retained run summary is
-`build/test_CaRefLaneCore_checkpoint75c_r1_final.log`; detailed TLC output is under
-`build/tlc-runs/reflane/20260801-checkpoint75c-r1-final`.
+`build/test_CaRefLaneCore_r2_final2.log`; detailed TLC output is under
+`build/tlc-runs/reflane/r2-final2`.
 
 The sabotage controls cover arming before send, retaining uncertain attempts, blocking later
 appends, complete recovery, exact attempt identity, mount fencing, and `Ready`-only certification.
@@ -50,6 +51,17 @@ allocation-free missing-name confirmation. The old-handle sabotage drives that s
 to `r2`, while the honest trace updates only `r1`. Missing-confirm sabotage only reattaches already
 valid live `r1` to an armed empty slot, so published identity remains valid. The earlier witnesses continue to reach ordinary commit,
 unresolved write, recovery, inert unrelated result, `Closed`, and `Faulted`.
+
+Resolver provenance is checked independently of application targeting. In the focused sabotage,
+`resolver_runtime = r1` survives successor publication, but `ObserveSuccessorSealScoped` records
+`observation_runtime = r2` from the current slot and violates only `NoOldHandleRetarget` after 2,689
+generated / 1,003 distinct states at depth 8. The paired honest witness follows the same unresolved,
+removal, rebirth, lookup, and successor-seal sequence, records the observation against `r1`, applies
+it to `r1`, reaches `Closed`, and violates `W_RebirthResolverScope` after 9,071 generated / 3,941
+distinct states at depth 9.
+
+With only `NoOldHandleRetarget` omitted, the observation-retarget sabotage exhaustively preserves
+every non-target invariant: 223,716 generated / 62,061 distinct states, empty queue, depth 21.
 
 ## Relink composition {#relink-composition}
 

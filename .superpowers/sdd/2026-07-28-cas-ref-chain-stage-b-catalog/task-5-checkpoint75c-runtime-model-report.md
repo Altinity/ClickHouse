@@ -240,3 +240,93 @@ runtime logs are under `build/tlc-runs/reflane/20260801-checkpoint75c-r1-final`.
 
 None. The fix adds bounded capture/projection state and scoped composition; it does not duplicate the
 lane state machine, add runtime history, or change C++.
+
+## Fix round 2 — resolver observation provenance
+
+Round base: `b1e022310a381defa890df398688a833e1cea76b`.
+
+Independent review found that only `ObserveDurable` was composed with runtime identity. The raw
+`ObserveUnknown`, `ObserveSuccessorSeal`, and `ObserveForeign` transitions retained the captured
+resolver but did not record which runtime supplied the observation. This allowed successor evidence
+to govern a predecessor resolution without violating `NoOldHandleRetarget`.
+
+### Pre-fix evidence
+
+The deterministic extension retained in `tmp/CaRefLaneCoreResolverBlindSpot.tla` executes:
+
+`StartWriteScoped(r1)` → `WriteUnresolvedScoped` → `BeginResolveScoped(r1)` →
+`RemoveCatalogLife` → `RebirthCatalogLife` → `FreshCatalogLookup(r2)` →
+`ObserveSuccessorSeal` → `ApplyResolutionScoped`.
+
+`build/test_CaRefLaneCore_r2_blindspot_property.log` was GREEN for
+`NoOldHandleRetarget`, while `build/test_CaRefLaneCore_r2_blindspot_witness.log` violated
+`W_PreFixResolverBlindSpot` on the same nine-state trace. Both runs generated nine distinct states,
+emptied the queue, and reached depth 9. The final state published `slot_runtime = r2` but applied the
+unattributed observation through resolver `r1`, proving the property blind spot.
+
+### Correction
+
+- `observation_runtime` records the source runtime for all four real resolver observations:
+  `Durable`, `Unknown`, `SuccessorSeal`, and `Foreign`. None of their raw actions remains reachable
+  through `Next`.
+- Honest observation source selection uses the captured `resolver_runtime`.
+  `SabotageObservationRetarget` substitutes the current `slot_runtime` for the reviewed
+  `SuccessorSeal` case; the other observation kinds remain captured so the sabotage has no
+  collateral projection failure.
+- `ApplyResolutionScoped` requires recorded provenance and makes `bad_lane_retarget` sticky if
+  either the observation source or the same-resolution application target differs from the
+  captured resolver.
+- `resolver_scope_phase` is bounded witness-only state. It reaches `observed` only when an honest
+  predecessor observation occurs after successor publication, and reaches `applied` only after the
+  matching application. It does not duplicate or alter lane semantics.
+- `CapturedRuntimeMatchesOwnership`, `TypeOK`, `Init`, and every action frame cover the new state.
+  The round-1 missing-confirm action and isolation remain unchanged apart from framing the added
+  provenance variables.
+
+The focused sabotage log
+`build/test_CaRefLaneCore_r2_observation_sabotage_final.log` violates only
+`NoOldHandleRetarget` after the exact eight-state prefix above ending at
+`ObserveSuccessorSealScoped`: resolver `r1` remains captured, successor `r2` is current, the
+sabotaged observation records source `r2`, and `bad_lane_retarget` becomes true. TLC generated
+2,689 states, found 1,003 distinct states, left 511 queued, and reached depth 8.
+
+The paired exhaustive non-target run in
+`build/test_CaRefLaneCore_r2_observation_nontarget_green.log` omits only
+`NoOldHandleRetarget` and is GREEN: 223,716 generated / 62,061 distinct states, empty queue, depth
+21. This confirms the isolated successor-seal sabotage does not violate a projection or any other
+safety invariant.
+
+The focused honest log `build/test_CaRefLaneCore_r2_rebirth_resolver_witness.log` follows the same
+prefix and then `ApplyResolutionScoped`. The observation records source `r1`, application targets
+`r1`, the lane reaches `Closed`, `resolver_scope_phase` reaches `applied`, and no retarget is
+recorded. It violates the negated witness `W_RebirthResolverScope` after 9,082 generated / 3,952
+distinct states at depth 9.
+
+### Fix-round final matrix
+
+The final runtime runner reported 26/26 exact verdicts: twelve isolated sabotages, one exhaustive
+safe configuration, and thirteen reachability witnesses. The new
+`sab_observationretarget` configuration violated only `NoOldHandleRetarget`; the new
+`witness_rebirthresolver` configuration reached `W_RebirthResolverScope`. The safe graph generated
+952,403 states, found 296,280 distinct states, exhausted the queue, and reached depth 25.
+
+The unchanged broader pre-fold gate reported 18/18 exact verdicts: thirteen sabotages, two safe
+configurations, and three witnesses.
+
+Final commands and retained logs:
+
+```bash
+RUN_ID=r2-final2 TLC_WORKERS=1 docs/superpowers/models/run_reflane.sh \
+  > build/test_CaRefLaneCore_r2_final2.log 2>&1
+
+RUN_ID=r2-final-prefold-verify TLC_WORKERS=1 docs/superpowers/models/run_prefold_drain.sh \
+  > build/test_CaRefLaneCore_r2_final_prefold_verify.log 2>&1
+```
+
+Detailed runtime logs are under `build/tlc-runs/reflane/r2-final2`.
+
+### Fix-round concerns
+
+None. The proof remains deliberately bounded to two runtime identities and a single lane; it proves
+the provenance obligation compositionally without adding unbounded retired-runtime history or
+changing C++.

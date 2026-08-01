@@ -243,12 +243,14 @@ ordered scan and cleanup deletes only what it observed durable. The migration is
   identity/cache layer: two runtime ids and two durable life ids. A captured predecessor handle and
   a non-authoritative name slot may simultaneously own different runtimes for one logical name.
   The actual lane captures runtime identity at `StartWrite` and `BeginResolve`; scoped wrappers for
-  write, install, resolution, and recovery maintain per-runtime projections of the real lane's
-  cache/durable scalars. Removal/rebirth, exact delayed invalidation, four predecessor-scoped operation kinds, fence loss,
+  write, install, every resolver observation, resolution application, and recovery maintain
+  per-runtime projections and explicit observation provenance for the real lane's cache/durable
+  scalars. Removal/rebirth, exact delayed invalidation, four predecessor-scoped operation kinds, fence loss,
   failed and successful re-arm, same-life self-remount, catalog-backed lookup, and read-only
-  missing-name confirmation are all explicit transitions. Four single-defect controls cover
+  missing-name confirmation are all explicit transitions. Five single-defect controls cover
   in-place old-handle retarget, successor-clearing late invalidation, fence-loss publication, and
-  missing-confirmation allocation. Every new sabotage checks all non-target safety invariants first;
+  missing-confirmation allocation, plus resolver observation retarget from a captured predecessor
+  to the current successor slot. Every new sabotage checks all non-target safety invariants first;
   missing confirmation materializes only an armed slot pointing to an already-valid runtime.
   Full verdicts and traces: `CaRefLaneCore_RESULTS.md`.
 - **`CaRefPreFoldDrainCore.tla`** — the focused two-GC-actor proof for catalog-only pre-fold drain.

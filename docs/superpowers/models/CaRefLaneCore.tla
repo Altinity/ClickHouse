@@ -27,7 +27,8 @@ CONSTANTS
     SabotageOldHandleRetarget,
     SabotageLateInvalidation,
     SabotageFenceLossPublication,
-    SabotageMissingConfirmationAllocation
+    SabotageMissingConfirmationAllocation,
+    SabotageObservationRetarget
 
 Bindings == {"token", "other", "none"}
 Tokens == {"a", "b"}
@@ -53,6 +54,7 @@ RuntimeIdentityValues ==
     [life : 0..2, admitted : 0..3]
 ArmPhases == {"Armed", "Fenced", "ArmPending"}
 OldOperations == {"read", "publish"}
+ResolverScopePhases == {"none", "observed", "applied"}
 
 VARIABLES
     lane,
@@ -82,6 +84,8 @@ VARIABLES
     lane_runtime,
     attempt_runtime,
     resolver_runtime,
+    observation_runtime,
+    resolver_scope_phase,
     lane_effect_target,
     live_runtimes,
     runtime_identity,
@@ -112,7 +116,8 @@ laneVars ==
 
 runtimeVars ==
     << slot_runtime, old_handle_runtime, lane_runtime, attempt_runtime,
-       resolver_runtime, lane_effect_target, live_runtimes, runtime_identity,
+       resolver_runtime, observation_runtime, resolver_scope_phase,
+       lane_effect_target, live_runtimes, runtime_identity,
        identity_ledger, runtime_cache_marker, runtime_durable_marker,
        catalog_life, observed_lives, accepted_generations, arm_phase,
        pending_invalidation, old_action_target, old_action_kind,
@@ -131,12 +136,16 @@ runtimeAuxVars ==
        bad_missing_allocation, saw_self_remount,
        saw_late_invalidation_preserved, saw_missing_confirmation >>
 
+resolverProvenanceVars == << observation_runtime, resolver_scope_phase >>
+
 vars == << laneVars, runtimeVars >>
 
 CurrentRuntime == runtime_generation = authority_generation
 Outstanding == lane \in {"Writing", "Wedged"}
 LaneTarget(captured) ==
     IF SabotageOldHandleRetarget THEN slot_runtime ELSE captured
+ObservationTarget(captured) ==
+    IF SabotageObservationRetarget THEN slot_runtime ELSE captured
 
 Init ==
     /\ lane = "Ready"
@@ -166,6 +175,8 @@ Init ==
     /\ lane_runtime = "r1"
     /\ attempt_runtime = NoRuntime
     /\ resolver_runtime = NoRuntime
+    /\ observation_runtime = NoRuntime
+    /\ resolver_scope_phase = "none"
     /\ lane_effect_target = NoRuntime
     /\ live_runtimes = {"r1"}
     /\ runtime_identity =
@@ -503,7 +514,7 @@ FenceMove ==
                     saw_unresolved, saw_retry_created, saw_durable_adoption,
                     saw_recovery, saw_stale_result, saw_closed, saw_faulted,
                     old_handle_runtime, lane_runtime, attempt_runtime,
-                    resolver_runtime, lane_effect_target, runtime_cache_marker,
+                    resolver_runtime, resolverProvenanceVars, lane_effect_target, runtime_cache_marker,
                     runtime_durable_marker, catalog_life, observed_lives,
                     accepted_generations, pending_invalidation,
                     old_action_target, old_action_kind, bad_late_detach,
@@ -528,7 +539,7 @@ BeginRearm ==
     /\ arm_phase = "Fenced"
     /\ arm_phase' = "ArmPending"
     /\ UNCHANGED << laneVars, slot_runtime, old_handle_runtime, lane_runtime,
-                    attempt_runtime, resolver_runtime, lane_effect_target,
+                    attempt_runtime, resolver_runtime, resolverProvenanceVars, lane_effect_target,
                     live_runtimes, runtime_identity, identity_ledger,
                     runtime_cache_marker, runtime_durable_marker, catalog_life,
                     observed_lives, accepted_generations, pending_invalidation,
@@ -542,7 +553,7 @@ FailRearm ==
     /\ arm_phase = "ArmPending"
     /\ arm_phase' = "Fenced"
     /\ UNCHANGED << laneVars, slot_runtime, old_handle_runtime, lane_runtime,
-                    attempt_runtime, resolver_runtime, lane_effect_target,
+                    attempt_runtime, resolver_runtime, resolverProvenanceVars, lane_effect_target,
                     live_runtimes, runtime_identity, identity_ledger,
                     runtime_cache_marker, runtime_durable_marker, catalog_life,
                     observed_lives, accepted_generations, pending_invalidation,
@@ -575,7 +586,7 @@ AcceptRearm ==
                     saw_unresolved, saw_retry_created, saw_durable_adoption,
                     saw_recovery, saw_stale_result, saw_closed, saw_faulted,
                     old_handle_runtime, lane_runtime, attempt_runtime,
-                    resolver_runtime, lane_effect_target, runtime_cache_marker,
+                    resolver_runtime, resolverProvenanceVars, lane_effect_target, runtime_cache_marker,
                     runtime_durable_marker, catalog_life, observed_lives,
                     pending_invalidation, old_action_target, old_action_kind,
                     bad_late_detach, bad_missing_allocation,
@@ -589,7 +600,7 @@ RemoveCatalogLife ==
     /\ catalog_life' = 0
     /\ pending_invalidation' = slot_runtime
     /\ UNCHANGED << laneVars, slot_runtime, old_handle_runtime, lane_runtime,
-                    attempt_runtime, resolver_runtime, lane_effect_target,
+                    attempt_runtime, resolver_runtime, resolverProvenanceVars, lane_effect_target,
                     live_runtimes, runtime_identity, identity_ledger,
                     runtime_cache_marker, runtime_durable_marker,
                     observed_lives, accepted_generations, arm_phase,
@@ -604,7 +615,7 @@ RebirthCatalogLife ==
     /\ catalog_life' = 2
     /\ observed_lives' = observed_lives \cup {2}
     /\ UNCHANGED << laneVars, slot_runtime, old_handle_runtime, lane_runtime,
-                    attempt_runtime, resolver_runtime, lane_effect_target,
+                    attempt_runtime, resolver_runtime, resolverProvenanceVars, lane_effect_target,
                     live_runtimes, runtime_identity, identity_ledger,
                     runtime_cache_marker, runtime_durable_marker,
                     accepted_generations, arm_phase, pending_invalidation,
@@ -628,7 +639,7 @@ FreshCatalogLookup ==
         [identity_ledger EXCEPT
             !["r2"] = [life |-> catalog_life, admitted |-> authority_generation]]
     /\ UNCHANGED << laneVars, old_handle_runtime, lane_runtime,
-                    attempt_runtime, resolver_runtime, lane_effect_target,
+                    attempt_runtime, resolver_runtime, resolverProvenanceVars, lane_effect_target,
                     runtime_cache_marker,
                     runtime_durable_marker, catalog_life, observed_lives,
                     accepted_generations, arm_phase, pending_invalidation,
@@ -646,7 +657,7 @@ OldHandleOperation(kind) ==
     /\ old_action_target' = old_handle_runtime
     /\ old_action_kind' = kind
     /\ UNCHANGED << laneVars, slot_runtime, old_handle_runtime, lane_runtime,
-                    attempt_runtime, resolver_runtime, lane_effect_target,
+                    attempt_runtime, resolver_runtime, resolverProvenanceVars, lane_effect_target,
                     live_runtimes, runtime_identity, identity_ledger,
                     runtime_cache_marker, runtime_durable_marker,
                     catalog_life, observed_lives, accepted_generations,
@@ -670,7 +681,7 @@ LateExactInvalidation ==
         (slot_runtime = "r2" /\ pending_invalidation = "r1" /\ slot_runtime' = "r2")
     /\ pending_invalidation' = NoRuntime
     /\ UNCHANGED << laneVars, old_handle_runtime, lane_runtime,
-                    attempt_runtime, resolver_runtime, lane_effect_target,
+                    attempt_runtime, resolver_runtime, resolverProvenanceVars, lane_effect_target,
                     live_runtimes,
                     runtime_identity, identity_ledger, runtime_cache_marker,
                     runtime_durable_marker, catalog_life, observed_lives,
@@ -690,7 +701,7 @@ ConfirmMissingName ==
           ELSE /\ UNCHANGED << slot_runtime, bad_missing_allocation >>
     /\ saw_missing_confirmation' = TRUE
     /\ UNCHANGED << laneVars, old_handle_runtime, lane_runtime,
-                    attempt_runtime, resolver_runtime, lane_effect_target,
+                    attempt_runtime, resolver_runtime, resolverProvenanceVars, lane_effect_target,
                     live_runtimes, runtime_identity, identity_ledger,
                     runtime_cache_marker, runtime_durable_marker, catalog_life,
                     observed_lives,
@@ -720,6 +731,7 @@ StartWriteScoped(new_binding, token) ==
     /\ StartWrite(new_binding, token)
     /\ attempt_runtime' = lane_runtime
     /\ UNCHANGED << runtimeObjectVars, runtimeAuxVars, resolver_runtime,
+                    resolverProvenanceVars,
                     lane_effect_target, runtime_cache_marker,
                     runtime_durable_marker, bad_lane_retarget,
                     saw_rebirth_old_action >>
@@ -730,7 +742,7 @@ UnarmedWriteScoped(new_binding) ==
         [runtime_durable_marker EXCEPT ![lane_runtime] = durable_id']
     /\ lane_effect_target' = lane_runtime
     /\ UNCHANGED << runtimeObjectVars, runtimeAuxVars, attempt_runtime,
-                    resolver_runtime, runtime_cache_marker,
+                    resolver_runtime, resolverProvenanceVars, runtime_cache_marker,
                     bad_lane_retarget, saw_rebirth_old_action >>
 
 WriteLandsScoped ==
@@ -749,7 +761,7 @@ WriteLandsScoped ==
                      /\ target = attempt_runtime
                      /\ runtime_durable_marker'["r2"] = runtime_durable_marker["r2"]))
     /\ UNCHANGED << runtimeObjectVars, runtimeAuxVars, attempt_runtime,
-                    resolver_runtime, runtime_cache_marker >>
+                    resolver_runtime, resolverProvenanceVars, runtime_cache_marker >>
 
 InstallCommittedScoped ==
     /\ InstallCommitted
@@ -762,12 +774,14 @@ InstallCommittedScoped ==
                 (bad_lane_retarget \/ target # attempt_runtime)
     /\ attempt_runtime' = NoRuntime
     /\ UNCHANGED << runtimeObjectVars, runtimeAuxVars, resolver_runtime,
+                    resolverProvenanceVars,
                     runtime_durable_marker, saw_rebirth_old_action >>
 
 WriteDefinitelyRejectedScoped ==
     /\ WriteDefinitelyRejected
     /\ attempt_runtime' = NoRuntime
     /\ UNCHANGED << runtimeObjectVars, runtimeAuxVars, resolver_runtime,
+                    resolverProvenanceVars,
                     lane_effect_target, runtime_cache_marker,
                     runtime_durable_marker, bad_lane_retarget,
                     saw_rebirth_old_action >>
@@ -780,6 +794,7 @@ DropUncertainScoped ==
     /\ DropUncertain
     /\ attempt_runtime' = NoRuntime
     /\ UNCHANGED << runtimeObjectVars, runtimeAuxVars, resolver_runtime,
+                    resolverProvenanceVars,
                     lane_effect_target, runtime_cache_marker,
                     runtime_durable_marker, bad_lane_retarget,
                     saw_rebirth_old_action >>
@@ -787,6 +802,8 @@ DropUncertainScoped ==
 BeginResolveScoped ==
     /\ BeginResolve
     /\ resolver_runtime' = attempt_runtime
+    /\ observation_runtime' = NoRuntime
+    /\ resolver_scope_phase' = "none"
     /\ UNCHANGED << runtimeObjectVars, runtimeAuxVars, attempt_runtime,
                     lane_effect_target, runtime_cache_marker,
                     runtime_durable_marker, bad_lane_retarget,
@@ -794,19 +811,85 @@ BeginResolveScoped ==
 
 ObserveDurableScoped ==
     /\ ObserveDurable
-    /\ LET target == LaneTarget(resolver_runtime)
+    /\ LET target == resolver_runtime
        IN /\ target \in RuntimeIds
+          /\ observation_runtime' = target
           /\ runtime_durable_marker' =
                 [runtime_durable_marker EXCEPT ![target] = durable_id']
           /\ lane_effect_target' = target
           /\ bad_lane_retarget' =
                 (bad_lane_retarget \/ target # resolver_runtime)
+          /\ resolver_scope_phase' =
+                IF /\ live_runtimes = RuntimeIds
+                   /\ runtime_identity["r2"].life = 2
+                   /\ slot_runtime = "r2"
+                   /\ target = resolver_runtime
+                  THEN "observed"
+                  ELSE resolver_scope_phase
     /\ UNCHANGED << runtimeObjectVars, runtimeAuxVars, attempt_runtime,
                     resolver_runtime, runtime_cache_marker,
                     saw_rebirth_old_action >>
 
+ObserveUnknownScoped ==
+    /\ ObserveUnknown
+    /\ LET source == resolver_runtime
+       IN /\ source \in RuntimeIds
+          /\ observation_runtime' = source
+          /\ bad_lane_retarget' =
+                (bad_lane_retarget \/ source # resolver_runtime)
+          /\ resolver_scope_phase' =
+                IF /\ live_runtimes = RuntimeIds
+                   /\ runtime_identity["r2"].life = 2
+                   /\ slot_runtime = "r2"
+                   /\ source = resolver_runtime
+                  THEN "observed"
+                  ELSE resolver_scope_phase
+    /\ UNCHANGED << runtimeObjectVars, runtimeAuxVars, attempt_runtime,
+                    resolver_runtime, lane_effect_target,
+                    runtime_cache_marker, runtime_durable_marker,
+                    saw_rebirth_old_action >>
+
+ObserveSuccessorSealScoped ==
+    /\ ObserveSuccessorSeal
+    /\ LET source == ObservationTarget(resolver_runtime)
+       IN /\ source \in RuntimeIds
+          /\ observation_runtime' = source
+          /\ bad_lane_retarget' =
+                (bad_lane_retarget \/ source # resolver_runtime)
+          /\ resolver_scope_phase' =
+                IF /\ live_runtimes = RuntimeIds
+                   /\ runtime_identity["r2"].life = 2
+                   /\ slot_runtime = "r2"
+                   /\ source = resolver_runtime
+                  THEN "observed"
+                  ELSE resolver_scope_phase
+    /\ UNCHANGED << runtimeObjectVars, runtimeAuxVars, attempt_runtime,
+                    resolver_runtime, lane_effect_target,
+                    runtime_cache_marker, runtime_durable_marker,
+                    saw_rebirth_old_action >>
+
+ObserveForeignScoped ==
+    /\ ObserveForeign
+    /\ LET source == resolver_runtime
+       IN /\ source \in RuntimeIds
+          /\ observation_runtime' = source
+          /\ bad_lane_retarget' =
+                (bad_lane_retarget \/ source # resolver_runtime)
+          /\ resolver_scope_phase' =
+                IF /\ live_runtimes = RuntimeIds
+                   /\ runtime_identity["r2"].life = 2
+                   /\ slot_runtime = "r2"
+                   /\ source = resolver_runtime
+                  THEN "observed"
+                  ELSE resolver_scope_phase
+    /\ UNCHANGED << runtimeObjectVars, runtimeAuxVars, attempt_runtime,
+                    resolver_runtime, lane_effect_target,
+                    runtime_cache_marker, runtime_durable_marker,
+                    saw_rebirth_old_action >>
+
 ApplyResolutionScoped ==
     /\ ApplyResolution
+    /\ observation_runtime \in RuntimeIds
     /\ LET target == LaneTarget(resolver_runtime)
        IN /\ target \in RuntimeIds
           /\ runtime_cache_marker' =
@@ -815,9 +898,18 @@ ApplyResolutionScoped ==
                   ELSE runtime_cache_marker
           /\ lane_effect_target' = IF SameResolution THEN target ELSE lane_effect_target
           /\ bad_lane_retarget' =
-                (bad_lane_retarget \/ (SameResolution /\ target # resolver_runtime))
+                (bad_lane_retarget
+                 \/ observation_runtime # resolver_runtime
+                 \/ (SameResolution /\ target # resolver_runtime))
+          /\ resolver_scope_phase' =
+                IF /\ resolver_scope_phase = "observed"
+                   /\ observation_runtime = resolver_runtime
+                   /\ target = resolver_runtime
+                  THEN "applied"
+                  ELSE resolver_scope_phase
     /\ attempt_runtime' = IF attempt' = NoAttempt THEN NoRuntime ELSE attempt_runtime
     /\ resolver_runtime' = NoRuntime
+    /\ observation_runtime' = NoRuntime
     /\ UNCHANGED << runtimeObjectVars, runtimeAuxVars,
                     runtime_durable_marker, saw_rebirth_old_action >>
 
@@ -825,9 +917,11 @@ KnownDurableInstallFailureScoped ==
     /\ KnownDurableInstallFailure
     /\ attempt_runtime' = NoRuntime
     /\ resolver_runtime' = NoRuntime
+    /\ observation_runtime' = NoRuntime
     /\ UNCHANGED << runtimeObjectVars, runtimeAuxVars, lane_effect_target,
                     runtime_cache_marker, runtime_durable_marker,
-                    bad_lane_retarget, saw_rebirth_old_action >>
+                    bad_lane_retarget, resolver_scope_phase,
+                    saw_rebirth_old_action >>
 
 RecoverScoped ==
     /\ Recover
@@ -835,7 +929,7 @@ RecoverScoped ==
         [runtime_cache_marker EXCEPT ![lane_runtime] = cache_id']
     /\ lane_effect_target' = lane_runtime
     /\ UNCHANGED << runtimeObjectVars, runtimeAuxVars, attempt_runtime,
-                    resolver_runtime, runtime_durable_marker,
+                    resolver_runtime, resolverProvenanceVars, runtime_durable_marker,
                     bad_lane_retarget, saw_rebirth_old_action >>
 
 AppendWhileBlockedScoped ==
@@ -844,7 +938,7 @@ AppendWhileBlockedScoped ==
         [runtime_durable_marker EXCEPT ![lane_runtime] = durable_id']
     /\ lane_effect_target' = lane_runtime
     /\ UNCHANGED << runtimeObjectVars, runtimeAuxVars, attempt_runtime,
-                    resolver_runtime, runtime_cache_marker,
+                    resolver_runtime, resolverProvenanceVars, runtime_cache_marker,
                     bad_lane_retarget, saw_rebirth_old_action >>
 
 ReplaceAttemptScoped ==
@@ -858,15 +952,14 @@ ApplyWithoutIdentityScoped ==
     /\ lane_effect_target' = resolver_runtime
     /\ attempt_runtime' = NoRuntime
     /\ resolver_runtime' = NoRuntime
+    /\ observation_runtime' = NoRuntime
     /\ UNCHANGED << runtimeObjectVars, runtimeAuxVars,
                     runtime_durable_marker, bad_lane_retarget,
+                    resolver_scope_phase,
                     saw_rebirth_old_action >>
 
 LaneNext ==
-    \/ ObserveUnknown
-    \/ ObserveSuccessorSeal
-    \/ ObserveForeign
-    \/ Certify
+    Certify
 
 Next ==
     \/ (LaneNext /\ UNCHANGED runtimeVars)
@@ -878,7 +971,10 @@ Next ==
     \/ WriteUnresolvedScoped
     \/ DropUncertainScoped
     \/ BeginResolveScoped
+    \/ ObserveSuccessorSealScoped
     \/ ObserveDurableScoped
+    \/ ObserveUnknownScoped
+    \/ ObserveForeignScoped
     \/ ApplyResolutionScoped
     \/ KnownDurableInstallFailureScoped
     \/ RecoverScoped
@@ -927,6 +1023,8 @@ TypeOK ==
     /\ lane_runtime \in RuntimeIds
     /\ attempt_runtime \in RuntimeIds \cup {NoRuntime}
     /\ resolver_runtime \in RuntimeIds \cup {NoRuntime}
+    /\ observation_runtime \in RuntimeIds \cup {NoRuntime}
+    /\ resolver_scope_phase \in ResolverScopePhases
     /\ lane_effect_target \in RuntimeIds \cup {NoRuntime}
     /\ live_runtimes \subseteq RuntimeIds
     /\ slot_runtime # NoRuntime => slot_runtime \in live_runtimes
@@ -968,6 +1066,8 @@ CapturedRuntimeMatchesOwnership ==
     /\ runtime_identity[lane_runtime].admitted = runtime_generation
     /\ (attempt = NoAttempt) = (attempt_runtime = NoRuntime)
     /\ (resolver_attempt = NoAttempt) = (resolver_runtime = NoRuntime)
+    /\ (observation \in {"Durable", "Unknown", "SuccessorSeal", "Foreign"})
+        = (observation_runtime # NoRuntime)
     /\ attempt_runtime \in {NoRuntime, lane_runtime}
     /\ resolver_runtime \in {NoRuntime, lane_runtime}
 
@@ -1015,5 +1115,10 @@ W_RebirthOldAction == ~saw_rebirth_old_action
 W_SelfRemount == ~saw_self_remount
 W_LateInvalidationPreserved == ~saw_late_invalidation_preserved
 W_MissingConfirmation == ~saw_missing_confirmation
+W_RebirthResolverScope ==
+    ~(resolver_scope_phase = "applied"
+      /\ saw_closed
+      /\ lane_effect_target = lane_runtime
+      /\ ~bad_lane_retarget)
 
 =============================================================================

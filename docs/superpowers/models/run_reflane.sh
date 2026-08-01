@@ -22,6 +22,7 @@ CONFIGS=(
   "sab_nofence            violation CertifiedViewIsCurrent"
   "sab_certifyblocked     violation CertifiedViewIsCurrent"
   "sab_oldhandleretarget  violation NoOldHandleRetarget"
+  "sab_observationretarget violation NoOldHandleRetarget"
   "sab_lateinvalidation   violation ExactPredecessorInvalidationPreservesSuccessor"
   "sab_fencelosspublication violation PublishedRuntimeHasAcceptedIdentity"
   "sab_missingconfirmation violation MissingNameConfirmationAllocatesNothing"
@@ -38,6 +39,7 @@ CONFIGS=(
   "witness_selfremount    violation W_SelfRemount"
   "witness_lateinvalidation violation W_LateInvalidationPreserved"
   "witness_missingconfirmation violation W_MissingConfirmation"
+  "witness_rebirthresolver violation W_RebirthResolverScope"
 )
 
 overall=0
