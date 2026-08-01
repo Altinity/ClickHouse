@@ -220,6 +220,9 @@ struct RefScanSummary
     std::set<NamespaceLifePhysicalId> listed_lives;     /// every parsed stream kind, classified by the later catalog cut
     std::map<NamespaceLifePhysicalId, std::set<RefTxnId>> logs_by_life;
     std::map<NamespaceLifePhysicalId, RefTxnId> max_log_by_life;
+    /// The validated adopted parent's rows read for this scan. They enrich the one walk plan built
+    /// after the catalog cut; the fold consumes that plan instead of reading them into a second one.
+    std::map<UInt128, RefLifeFoldState> parent_ref_lives;
     /// The immutable catalog cut read after the completed hot LIST. Absent on diagnostic-only enumerations.
     std::optional<CasRefCatalog::Snapshot> catalog_cut;
     /// Listed ids absent from the later cut are inert dead-life debris.
@@ -259,6 +262,8 @@ public:
     std::set<UInt128> lifeIds() const;
     std::vector<NamespaceLifeId> lives() const;
     std::map<UInt128, RefLifeFoldState> releaseFoldStates();
+    size_t size() const { return rows.size(); }
+    size_t changedRows() const;
 
     uint64_t dropped_parent_rows = 0;
     uint64_t dropped_listed_lives = 0;
@@ -576,7 +581,7 @@ private:
     /// `ref_scan` is the round's one enumeration of `cas/ns/stream/` (see `RefScanSummary`); the fold regroups
     /// its keys strictly rather than listing the prefix again.
     FoldResult fold(GcState & state, Token & state_token, RoundReport & report, uint64_t current_round,
-                    const RefScanSummary & ref_scan, UniversePolicy policy);
+                    const RefScanSummary & ref_scan, RefWalkPlan walk_plan, UniversePolicy policy);
 
     /// The round's `_ckpt.checkpoint` witness per namespace — the SECOND, hint-independent witness the
     /// walk decides its absents against. ONE call site, in the fold, right where the hint is grouped.
@@ -719,10 +724,9 @@ private:
     /// `parseRefObjectKeyForEnumeration`.
     RefScanSummary enumerateRefPrefix();
 
-    /// The round's ONE hint enumeration (`enumerateRefPrefix`) plus the DEFER signal computed from it
-    /// (`RefScanSummary::changed_shards` -- the number of tables with at least one ref log above their
-    /// sealed durable cursor, compared against the per-table cursors in the adopted fold seal at
-    /// `state.snap_generation`/`snap_attempt`).
+    /// The round's ONE hint enumeration (`enumerateRefPrefix`), followed by its one fresh catalog cut
+    /// and the validated adopted-parent rows. `runRegularRound` supplies all three to the authoritative
+    /// plan builder, then computes `RefScanSummary::changed_shards` from that frozen plan.
     RefScanSummary listRefPrefix(const GcState & state);
 
     /// THE STORE-QUALITY DETECTOR (historically "probe A"). SAMPLED on a deterministic cadence
@@ -897,7 +901,14 @@ public:
     /// Test-only access to the round's ref-prefix enumeration (its `changed_shards` is the defer signal).
     RefScanSummary listRefPrefixForTest(const GcState & state)
     {
-        return listRefPrefix(state);
+        RefScanSummary scan = listRefPrefix(state);
+        RefWalkPlanInputs inputs;
+        inputs.parent_ref_lives = scan.parent_ref_lives;
+        inputs.listed_lives = scan.listed_lives;
+        inputs.tail_observations = scan.max_log_by_life;
+        const RefWalkPlan plan = buildRefWalkPlan(*scan.catalog_cut, inputs);
+        scan.changed_shards = plan.changedRows();
+        return scan;
     }
 
 };

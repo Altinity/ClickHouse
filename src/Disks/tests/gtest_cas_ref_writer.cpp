@@ -7,6 +7,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCkptFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
@@ -22,6 +23,7 @@
 #include <future>
 #include <mutex>
 #include <thread>
+#include <utility>
 
 /// Task 10: the writer's ref persistence on the snapshot+log protocol. Covers the plan's Task 10
 /// failing-test list: empty+birth recovery; snapshot+tail recovery; recovery restart on a vanished
@@ -167,6 +169,62 @@ ManifestId publishEmptyPart(const PoolPtr & s, const RootNamespace & ns, const S
     return id;
 }
 
+void publishWithProductionBirth(const PoolPtr & store, const RootNamespace & ns, const String & ref)
+{
+    PartWriteInfo info;
+    info.intended_namespace = ns;
+    info.intended_ref = ns.string() + "/" + ref;
+    auto build = store->beginPartWrite(info);
+    const ManifestId id = build->stageManifest({});
+    build->precommitAdd(ns, ref, id);
+    build->promote(ns, ref, build->buildId(), id);
+}
+
+CatalogEntry catalogEntryOrThrow(Backend & backend, const Layout & layout, const RootNamespace & ns)
+{
+    const RefCatalog catalog = CasRefCatalog::read(backend, layout).catalog;
+    const auto it = std::find_if(catalog.entries.begin(), catalog.entries.end(), [&](const CatalogEntry & entry)
+    {
+        return entry.ns == ns;
+    });
+    if (it == catalog.entries.end())
+        throw std::runtime_error("catalog entry missing from test fixture");
+    return *it;
+}
+
+struct RemovalReadyFixture
+{
+    CatalogEntry predecessor;
+    uint64_t writer_epoch = 0;
+    const void * runtime_identity = nullptr;
+};
+
+RemovalReadyFixture prepareResidentRemovalForDrain(
+    const PoolPtr & store, Backend & backend, const RootNamespace & ns, Gc & gc)
+{
+    publishWithProductionBirth(store, ns, "predecessor");
+    const CatalogEntry predecessor = catalogEntryOrThrow(backend, store->layout(), ns);
+    const uint64_t writer_epoch = store->liveWriterEpoch();
+    const void * const runtime_identity = store->refTableRuntimeIdentityForTest(ns);
+
+    if (runRegularRoundReclaiming(gc).deferred)
+        throw std::runtime_error("fixture publish unexpectedly deferred");
+    store->dropNamespace(ns);
+    const CatalogEntry removing = catalogEntryOrThrow(backend, store->layout(), ns);
+    if (removing.state != NsState::Removing || removing.incarnation != predecessor.incarnation)
+        throw std::runtime_error("fixture removal did not publish the expected exact Removing row");
+    if (runRegularRoundReclaiming(gc).deferred)
+        throw std::runtime_error("fixture terminal fold unexpectedly deferred");
+
+    const GcState state = decodeGcState(backend.get(store->layout().gcStateKey())->bytes);
+    const CasFoldSeal seal = decodeFoldSeal(
+        backend.get(store->layout().foldSealKey(state.snap_generation, state.snap_attempt))->bytes);
+    const auto row = seal.ref_lives.find(predecessor.incarnation);
+    if (row == seal.ref_lives.end() || !row->second.cleanup_evidence)
+        throw std::runtime_error("fixture terminal fold produced no cleanup evidence");
+    return {predecessor, writer_epoch, runtime_identity};
+}
+
 ManifestRef manifestRef(uint64_t epoch, uint64_t seq, uint32_t ordinal)
 {
     return ManifestRef{epoch, seq, ordinal};
@@ -255,6 +313,18 @@ public:
     std::set<String> vanish_once_keys;
     std::function<void()> on_vanish_fire;
 
+    enum class CatalogCasFault : uint8_t
+    {
+        None,
+        CommitThenThrow,
+        OtherWriterReplacement,
+    };
+    CatalogCasFault catalog_cas_fault = CatalogCasFault::None;
+    String catalog_fault_key;
+    String catalog_replacement_bytes;
+    int catalog_resolution_get_fault_count = 0;
+    bool catalog_cas_fault_fired = false;
+
     String fault_key_substr;
     int fault_count = 0;
     /// Let the first `fault_skip` matching PUTs through untouched before `fault_count` starts faulting.
@@ -293,6 +363,11 @@ public:
 
     std::optional<GetResult> get(const String & key, Range range) override
     {
+        if (catalog_cas_fault_fired && key == catalog_fault_key && catalog_resolution_get_fault_count > 0)
+        {
+            --catalog_resolution_get_fault_count;
+            throw std::runtime_error("RefWriterTestBackend: simulated catalog resolution read failure");
+        }
         const auto it = vanish_once_keys.find(key);
         if (it != vanish_once_keys.end())
         {
@@ -306,6 +381,32 @@ public:
             return std::nullopt;
         }
         return CountingBackend::get(key, range);
+    }
+
+    CasResult casPut(
+        const String & key, const String & bytes, const std::optional<Token> & expected,
+        const ObjectMeta & meta) override
+    {
+        if (key == catalog_fault_key && catalog_cas_fault != CatalogCasFault::None)
+        {
+            const CatalogCasFault fault = std::exchange(catalog_cas_fault, CatalogCasFault::None);
+            catalog_cas_fault_fired = true;
+            if (fault == CatalogCasFault::CommitThenThrow)
+            {
+                const CasResult result = CountingBackend::casPut(key, bytes, expected, meta);
+                if (result.outcome != CasOutcome::Committed)
+                    return result;
+                throw Poco::TimeoutException(
+                    "RefWriterTestBackend: catalog CAS committed but its response was lost");
+            }
+
+            const CasResult replacement = CountingBackend::casPut(
+                key, catalog_replacement_bytes, expected, meta);
+            if (replacement.outcome != CasOutcome::Committed)
+                return replacement;
+            return {CasOutcome::Conflict, {}};
+        }
+        return CountingBackend::casPut(key, bytes, expected, meta);
     }
 
     PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta) override
@@ -3007,6 +3108,135 @@ TEST(RefWriterNamespaceRemoval, SameNameSameWriterEpochRebirthInvalidatesResiden
         << "the successor starts at its own birth+publish stream, not the predecessor's cursor";
     for (const String & key : backend->touchedKeys())
         EXPECT_EQ(key.find("/_cleanup/"), String::npos) << key;
+}
+
+/// Losing the response to an erase that committed must not strand the same resident writer runtime
+/// behind its old removal-admission gate. A complete resolution read proves the exact old row absent,
+/// so the same name can be born immediately under a fresh incarnation without inheriting coverage.
+TEST(RefWriterNamespaceRemoval, CommitThenThrowEraseResolvesAndRebindsResidentRuntimeImmediately)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    PoolConfig config;
+    config.gc_fold_threshold = 1;
+    config.ref_table_cache_bytes = 0;
+    auto store = openPoolWithConfig(backend, config);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/removal-erase-lost-response"};
+    Gc gc(store, UInt128{101});
+    const RemovalReadyFixture ready = prepareResidentRemovalForDrain(store, *backend, ns, gc);
+
+    backend->catalog_fault_key = layout.refCatalogKey();
+    backend->catalog_cas_fault = RefWriterTestBackend::CatalogCasFault::CommitThenThrow;
+    EXPECT_NO_THROW((void)runRegularRoundReclaiming(gc));
+
+    const RefCatalog after_erase = CasRefCatalog::read(*backend, layout).catalog;
+    EXPECT_TRUE(std::none_of(after_erase.entries.begin(), after_erase.entries.end(), [&](const CatalogEntry & entry)
+    {
+        return entry.ns == ns && entry.incarnation == ready.predecessor.incarnation;
+    }));
+    EXPECT_EQ(store->refTableRuntimeIdentityForTest(ns), ready.runtime_identity);
+
+    EXPECT_NO_THROW(publishWithProductionBirth(store, ns, "successor"));
+    const CatalogEntry successor = catalogEntryOrThrow(*backend, layout, ns);
+    EXPECT_NE(successor.incarnation, ready.predecessor.incarnation);
+    EXPECT_EQ(store->liveWriterEpoch(), ready.writer_epoch);
+    EXPECT_EQ(store->refTableRuntimeIdentityForTest(ns), ready.runtime_identity);
+
+    ASSERT_FALSE(runRegularRoundReclaiming(gc).deferred);
+    const GcState state = decodeGcState(backend->get(layout.gcStateKey())->bytes);
+    const CasFoldSeal seal = decodeFoldSeal(
+        backend->get(layout.foldSealKey(state.snap_generation, state.snap_attempt))->bytes);
+    EXPECT_FALSE(seal.ref_lives.contains(ready.predecessor.incarnation));
+    ASSERT_TRUE(seal.ref_lives.contains(successor.incarnation));
+    EXPECT_EQ(seal.ref_lives.at(successor.incarnation).coverage.last_folded_ref_id,
+        (RefTxnId{ready.writer_epoch, 2}));
+}
+
+/// If another actor wins the erase race by replacing the exact old row, `EntryChanged` still proves
+/// the predecessor life dead and must invalidate its resident runtime.
+TEST(RefWriterNamespaceRemoval, OtherWinnerReplacementInvalidatesExactPredecessorLife)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    PoolConfig config;
+    config.gc_fold_threshold = 1;
+    config.ref_table_cache_bytes = 0;
+    auto store = openPoolWithConfig(backend, config);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/removal-other-winner-replacement"};
+    Gc gc(store, UInt128{102});
+    const RemovalReadyFixture ready = prepareResidentRemovalForDrain(store, *backend, ns, gc);
+
+    const CatalogEntry replacement{
+        .ns = ns,
+        .state = NsState::Live,
+        .incarnation = UInt128{0xfeed},
+        .creator = std::nullopt};
+    ASSERT_NE(replacement.incarnation, ready.predecessor.incarnation);
+    const NamespaceLifeId replacement_life = NamespaceLifeId::fromCatalogEntry(ns, replacement.incarnation);
+    ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(replacement_life), encodeRefCkpt(RefCkpt{
+        .life_epoch = ready.writer_epoch,
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt})).outcome, PutOutcome::Done);
+    backend->catalog_fault_key = layout.refCatalogKey();
+    backend->catalog_replacement_bytes = encodeRefCatalog(RefCatalog{.entries = {replacement}});
+    backend->catalog_cas_fault = RefWriterTestBackend::CatalogCasFault::OtherWriterReplacement;
+
+    EXPECT_NO_THROW((void)runRegularRoundReclaiming(gc));
+    EXPECT_EQ(store->namespaceLife(ns), replacement_life);
+    EXPECT_EQ(store->refTableRuntimeIdentityForTest(ns), ready.runtime_identity);
+}
+
+/// Failure to read the catalog while resolving a lost erase response is not success. A later fresh
+/// name lookup nevertheless observes the old exact row absent and reconciles the resident runtime.
+TEST(RefWriterNamespaceRemoval, LaterNameLookupReconcilesAfterEraseResolutionReadFailure)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    PoolConfig config;
+    config.gc_fold_threshold = 1;
+    config.ref_table_cache_bytes = 0;
+    auto store = openPoolWithConfig(backend, config);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/removal-resolution-read-failure-lookup"};
+    Gc gc(store, UInt128{103});
+    const RemovalReadyFixture ready = prepareResidentRemovalForDrain(store, *backend, ns, gc);
+
+    backend->catalog_fault_key = layout.refCatalogKey();
+    backend->catalog_cas_fault = RefWriterTestBackend::CatalogCasFault::CommitThenThrow;
+    backend->catalog_resolution_get_fault_count = 1;
+    EXPECT_THROW((void)runRegularRoundReclaiming(gc), std::runtime_error);
+    EXPECT_TRUE(CasRefCatalog::read(*backend, layout).catalog.entries.empty());
+
+    std::optional<NamespaceLifeId> successor;
+    EXPECT_NO_THROW(successor = store->namespaceLife(ns));
+    ASSERT_TRUE(successor.has_value());
+    EXPECT_NE(successor->incarnation, ready.predecessor.incarnation);
+    EXPECT_EQ(store->refTableRuntimeIdentityForTest(ns), ready.runtime_identity);
+}
+
+/// The normal post-LIST catalog cut is also a reconciliation point. It repairs a missed local
+/// invalidation before any later writer touches the name.
+TEST(RefWriterNamespaceRemoval, PostListCatalogCutReconcilesMissedEraseInvalidation)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    PoolConfig config;
+    config.gc_fold_threshold = 1;
+    config.ref_table_cache_bytes = 0;
+    auto store = openPoolWithConfig(backend, config);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/removal-resolution-read-failure-post-list"};
+    Gc gc(store, UInt128{104});
+    const RemovalReadyFixture ready = prepareResidentRemovalForDrain(store, *backend, ns, gc);
+
+    backend->catalog_fault_key = layout.refCatalogKey();
+    backend->catalog_cas_fault = RefWriterTestBackend::CatalogCasFault::CommitThenThrow;
+    backend->catalog_resolution_get_fault_count = 1;
+    EXPECT_THROW((void)runRegularRoundReclaiming(gc), std::runtime_error);
+    EXPECT_TRUE(CasRefCatalog::read(*backend, layout).catalog.entries.empty());
+
+    EXPECT_NO_THROW((void)runRegularRoundReclaiming(gc));
+    EXPECT_NO_THROW(publishWithProductionBirth(store, ns, "successor"));
+    EXPECT_NE(catalogEntryOrThrow(*backend, layout, ns).incarnation, ready.predecessor.incarnation);
+    EXPECT_EQ(store->refTableRuntimeIdentityForTest(ns), ready.runtime_identity);
 }
 
 /// ===================================================================================

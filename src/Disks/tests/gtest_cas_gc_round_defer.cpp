@@ -8,10 +8,16 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
+#include <Common/ProfileEvents.h>
 #include "cas_test_helpers.h"
 
 using namespace DB::Cas;
 using namespace DB::Cas::tests;
+
+namespace ProfileEvents
+{
+extern const Event CasGcRefWalkPlansBuilt;
+}
 
 namespace
 {
@@ -272,6 +278,58 @@ TEST(CasGcRoundDefer, IdleRoundDefersAndReadsNoGeneration)
         << "a deferred round must never GET/getStream/PUT any blob_target run object";
     EXPECT_LT(defer_round_gets, fold_round_gets)
         << "a deferred round's read volume must sit far below a real fold round's";
+}
+
+/// Every ordinary round constructs one complete catalog-authoritative walk plan after the hot LIST,
+/// before deciding DEFER. A fold consumes that exact frozen plan; it must not build another one.
+TEST(CasGcRoundDefer, FoldAndDeferEachBuildExactlyOneCompletePostListWalkPlan)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/one-walk-plan@cas@"};
+    const ManifestRef ref{.writer_epoch = 1, .build_sequence = 1, .manifest_ordinal = 1};
+    writeBlobBody(*backend, layout, UInt128{1});
+    writeManifestRaw(*backend, layout, ns, ref, {blobEntryFor("a", UInt128{1})});
+    publishCommittedTransition(*backend, layout, ns, "tbl", std::nullopt, ref);
+
+    Gc gc(store, kGc);
+    std::vector<GcPhaseRecord> phases;
+    gc.setPhaseSink([&](const GcPhaseRecord & phase) { phases.push_back(phase); });
+
+    backend->resetCounts();
+    const uint64_t fold_builds_before
+        = ProfileEvents::global_counters[ProfileEvents::CasGcRefWalkPlansBuilt].load();
+    ASSERT_FALSE(gc.runRegularRound().deferred);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasGcRefWalkPlansBuilt].load() - fold_builds_before, 1u);
+    EXPECT_EQ(backend->getCount(layout.refCatalogKey()), 1u)
+        << "generation zero has no drain read: the sole catalog GET must be the post-LIST cut";
+    const auto fold_decision = std::find_if(phases.begin(), phases.end(), [](const GcPhaseRecord & phase)
+    {
+        return phase.phase == "defer_decision";
+    });
+    ASSERT_NE(fold_decision, phases.end());
+    EXPECT_EQ(fold_decision->metrics.at("walk_plan_builds"), 1u);
+    EXPECT_EQ(fold_decision->metrics.at("walk_plan_rows"), 1u);
+
+    phases.clear();
+    backend->resetCounts();
+    const uint64_t defer_builds_before
+        = ProfileEvents::global_counters[ProfileEvents::CasGcRefWalkPlansBuilt].load();
+    ASSERT_TRUE(gc.runRegularRound().deferred);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasGcRefWalkPlansBuilt].load() - defer_builds_before, 1u);
+    EXPECT_EQ(backend->getCount(layout.refCatalogKey()), 2u)
+        << "the adopted-parent drain and the post-LIST cut are the deferred round's only catalog GETs";
+    const auto defer_decision = std::find_if(phases.begin(), phases.end(), [](const GcPhaseRecord & phase)
+    {
+        return phase.phase == "defer_decision";
+    });
+    ASSERT_NE(defer_decision, phases.end());
+    EXPECT_EQ(defer_decision->metrics.at("walk_plan_builds"), 1u);
+    EXPECT_EQ(defer_decision->metrics.at("walk_plan_rows"), 1u);
+    EXPECT_EQ(defer_decision->metrics.at("walk_plan_dropped_parent_rows"), 0u);
+    EXPECT_EQ(defer_decision->metrics.at("walk_plan_dropped_listed_lives"), 0u);
+    EXPECT_EQ(defer_decision->metrics.at("walk_plan_dropped_tails"), 0u);
 }
 
 /// The same idle-defer property under a sharded blob-target GC (gc_shards=2): graduationDue's loop

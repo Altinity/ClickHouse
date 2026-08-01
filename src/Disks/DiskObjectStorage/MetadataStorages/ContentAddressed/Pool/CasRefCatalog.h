@@ -151,12 +151,22 @@ public:
         FencedOut,
     };
 
+    struct CompletedRemovingDeleteResult
+    {
+        CompletedRemovingDeleteOutcome outcome;
+        /// Present only when a mandatory fresh catalog read proves that the exact observed life is no
+        /// longer cataloged, whether this actor's erase committed or another actor removed/replaced it.
+        std::optional<NamespaceLifeId> invalidated_life;
+
+        bool operator==(CompletedRemovingDeleteOutcome expected) const { return outcome == expected; }
+    };
+
     /// Exact-CAS-deletes `observed` only when it is a complete `Removing` row and the authoritative
     /// adopted parent carries cleanup evidence, but no hold, in the row keyed by the same opaque life
     /// id. The whole parent seal is consumed so a caller cannot separate the life id from its proof or
     /// reduce the proof to a caller-computed boolean. The leader fence is checked after every fresh
     /// catalog read and before every attempted CAS.
-    static CompletedRemovingDeleteOutcome deleteCompletedRemoving(
+    static CompletedRemovingDeleteResult deleteCompletedRemoving(
         Backend & backend, const Layout & layout, const CatalogEntry & observed,
         const CasFoldSeal & authoritative_parent, uint64_t admitted_generation,
         const std::function<void(uint64_t)> & check_fence_or_throw);

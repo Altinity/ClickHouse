@@ -39,6 +39,7 @@ namespace ProfileEvents
     extern const Event CasGcMetaWriteAnomaly;
     extern const Event CasGcMetaOps;
     extern const Event CasGcEnumerationPages;
+    extern const Event CasGcRefWalkPlansBuilt;
     extern const Event CasGcRebuildVirginByEnumeration;
     extern const Event CasGcRefScanDisagreements;
     extern const Event CasGcUnappliedFoldedTxns;
@@ -175,9 +176,20 @@ std::map<UInt128, RefLifeFoldState> RefWalkPlan::releaseFoldStates()
     return out;
 }
 
+size_t RefWalkPlan::changedRows() const
+{
+    return std::count_if(rows.begin(), rows.end(), [](const auto & item)
+    {
+        const RefWalkPlanRow & row = item.second;
+        return row.tail_observation
+            && row.fold_state.coverage.last_folded_ref_id < *row.tail_observation;
+    });
+}
+
 RefWalkPlan buildRefWalkPlan(
     const CasRefCatalog::Snapshot & catalog_cut, const RefWalkPlanInputs & inputs)
 {
+    ProfileEvents::increment(ProfileEvents::CasGcRefWalkPlansBuilt);
     catalog_cut.life_index.throwIfAmbiguous("CAS ref walk plan");
     RefWalkPlan plan;
 
@@ -505,10 +517,17 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// the round's reads of the adopted fold seal (`graduationDue` and `listRefPrefix` each read the
     /// same key) -- see `fold_seal_reads` below.
     RefScanSummary ref_scan;
+    RefWalkPlan walk_plan;
     {
         GcPhaseTimer t(phase_sink, "defer_decision");
         const bool graduation_due = graduationDue(state, new_round);
         ref_scan = listRefPrefix(state);
+        RefWalkPlanInputs walk_inputs;
+        walk_inputs.parent_ref_lives = ref_scan.parent_ref_lives;
+        walk_inputs.listed_lives = ref_scan.listed_lives;
+        walk_inputs.tail_observations = ref_scan.max_log_by_life;
+        walk_plan = buildRefWalkPlan(*ref_scan.catalog_cut, walk_inputs);
+        ref_scan.changed_shards = walk_plan.changedRows();
         const size_t changed = ref_scan.changed_shards;
         const bool defer = shouldDeferRound(changed, graduation_due, rounds_since_last_fold_,
                                             store->poolConfig().gc_fold_threshold,
@@ -522,6 +541,11 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         t.metric("ref_keys_listed", ref_scan.keys.size());
         t.metric("graduation_due", graduation_due ? 1 : 0);
         t.metric("dead_life_debris", ref_scan.dead_life_debris);
+        t.metric("walk_plan_builds", 1);
+        t.metric("walk_plan_rows", walk_plan.size());
+        t.metric("walk_plan_dropped_parent_rows", walk_plan.dropped_parent_rows);
+        t.metric("walk_plan_dropped_listed_lives", walk_plan.dropped_listed_lives);
+        t.metric("walk_plan_dropped_tails", walk_plan.dropped_tails);
         t.metric("deferred", defer ? 1 : 0);
         /// The number of consecutive rounds already deferred BEFORE this one (this round's own verdict is
         /// `deferred` above), so the pair reads unambiguously against `gc_fold_max_defer_rounds`.
@@ -598,7 +622,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
 
     /// The pass performs discovery, windowing, and the three-cursor merge (spare / graduate / condemn).
     /// It emits phases 5..10 of its own.
-    FoldResult folded = fold(state, state_token, report, new_round, ref_scan, policy);
+    FoldResult folded = fold(state, state_token, report, new_round, ref_scan, std::move(walk_plan), policy);
 
     /// THE ROUND'S DESTRUCTIVE GATE, read once, here, and consulted at EVERY destructive site below.
     /// It is available this early because `fold` computes it (see `FoldResult::suppress_destructive`),
@@ -1429,7 +1453,8 @@ Gc::GenerationSealProbe Gc::probeGenerationForSeal(uint64_t generation)
 }
 
 Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & report,
-                        uint64_t current_round, const RefScanSummary & ref_scan, UniversePolicy policy)
+                        uint64_t current_round, const RefScanSummary & ref_scan,
+                        RefWalkPlan walk_plan, UniversePolicy policy)
 {
     Backend & backend = store->backend();
     const Layout & layout = store->layout();
@@ -1461,10 +1486,6 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     if (!ref_scan.catalog_cut)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS GC fold: hot ref scan carries no catalog cut");
     const CasRefCatalog::Snapshot & catalog_snapshot = *ref_scan.catalog_cut;
-    RefWalkPlanInputs catalog_key_inputs;
-    catalog_key_inputs.listed_lives = ref_scan.listed_lives;
-    catalog_key_inputs.tail_observations = ref_scan.max_log_by_life;
-    const RefWalkPlan catalog_key_plan = buildRefWalkPlan(catalog_snapshot, catalog_key_inputs);
     std::map<String, UInt128> live_incarnation;
     /// Final review F1: a `Creating` life IS named by the catalog -- `live_incarnation` excludes it
     /// only because it is not yet WALKABLE (spec §3, no publication can exist), not because the
@@ -1475,7 +1496,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// below must tell that apart from genuine "nothing in the catalog names this at all" debris, or
     /// an ordinary or stalled creation suppresses the whole round's reclamation until someone
     /// recreates the exact name and drives `reconcileStaleCreator` -- unbounded in the stalled case.
-    for (const NamespaceLifeId & life : catalog_key_plan.lives())
+    for (const NamespaceLifeId & life : walk_plan.lives())
         live_incarnation.emplace(life.ns.string(), life.incarnation);
     /// Carry the complete cut on the result (review C3) so every later consumer this round --
     /// `cleanupRefObjects` and terminal-evidence attribution -- retains both the chosen incarnation and
@@ -1519,8 +1540,9 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     ref_list_timer->metric("ref_folding_aborted", ref_folding_aborted ? 1 : 0);
     ref_list_timer.reset();   /// emits the `fold_ref_group` row
 
-    /// Parent cursors — the per-(ns,shard) cursors a prior round sealed. One-pass round: read them from
-    /// the fold seal at the adopted (snap_generation, snap_attempt) (the fold seal IS the coverage record).
+    /// Parent cursors — the per-(ns,shard) cursors a prior round sealed. `listRefPrefix` read them from
+    /// the fold seal at the adopted (snap_generation, snap_attempt) before it built this round's one
+    /// walk plan (the fold seal IS the coverage record).
     /// Absent => fresh pool (cursor 0). A folded event must never be re-folded from 0 (that double-counts
     /// blob in-degree => silent over-pin/leak).
     /// A live `gc/state` whose adopted
@@ -1544,14 +1566,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             "gc/state — GC bookkeeping is corrupt. GC refuses to run; recover with "
             "SYSTEM CONTENT ADDRESSED GC REBUILD.",
             state.snap_generation, state.snap_attempt);
-    const std::map<UInt128, RefLifeFoldState> parent_ref_lives =
-        adopted_seal ? adopted_seal->ref_lives : std::map<UInt128, RefLifeFoldState>{};
-
-    RefWalkPlanInputs walk_inputs;
-    walk_inputs.parent_ref_lives = parent_ref_lives;
-    walk_inputs.listed_lives = ref_scan.listed_lives;
-    walk_inputs.tail_observations = ref_scan.max_log_by_life;
-    RefWalkPlan walk_plan = buildRefWalkPlan(catalog_snapshot, walk_inputs);
+    const std::map<UInt128, RefLifeFoldState> & parent_ref_lives = ref_scan.parent_ref_lives;
     const uint64_t dropped_parent_ref_lives = walk_plan.dropped_parent_rows;
     result.fold_seal.ref_lives = walk_plan.releaseFoldStates();
 
@@ -3435,34 +3450,28 @@ RefScanSummary Gc::enumerateRefPrefix()
 
 RefScanSummary Gc::listRefPrefix(const GcState & state)
 {
-    /// The round's ONE hint enumeration, plus the DEFER signal computed from it (the number of tables
-    /// with at least one ref log above their sealed cursor).
-    /// The authoritative catalog cut follows the completed LIST. A listed id absent from this later
-    /// cut is dead, inert debris: it contributes no work and cannot force DEFER.
+    /// The round's ONE hint enumeration, followed by the parent coverage and authoritative catalog cut
+    /// needed to build the DEFER/FOLD walk plan. The caller computes the DEFER signal from that frozen
+    /// plan. A listed id absent from the later cut is dead, inert debris: it contributes no work and
+    /// cannot force DEFER.
     RefScanSummary scan = enumerateRefPrefix();
     const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(store->backend(), store->layout());
     catalog_cut.life_index.throwIfAmbiguous("CAS GC hot scan");
+    store->reconcileRefCatalogCut(catalog_cut);
     scan.catalog_cut = catalog_cut;
 
-    std::map<UInt128, RefLifeFoldState> ref_lives;
-    if (const auto seal = readFoldSeal(state.snap_generation, state.snap_attempt))
-        ref_lives = seal->ref_lives;
+    const std::optional<CasFoldSeal> seal = readFoldSeal(state.snap_generation, state.snap_attempt);
+    if (!seal && state.snap_generation > 0)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS GC hot scan: adopted fold seal (generation {}, attempt {}) is missing",
+            state.snap_generation, state.snap_attempt);
+    if (seal)
+        scan.parent_ref_lives = seal->ref_lives;
 
     for (const NamespaceLifePhysicalId life_id : scan.listed_lives)
         if (!catalog_cut.life_index.resolve(life_id))
             ++scan.dead_life_debris;
 
-    for (const auto & [life_id, greatest] : scan.max_log_by_life)
-    {
-        const auto life = catalog_cut.life_index.resolve(life_id);
-        if (!life)
-            continue;
-        RefTxnId folded{};
-        if (const auto it = ref_lives.find(life_id); it != ref_lives.end())
-            folded = it->second.coverage.last_folded_ref_id;
-        if (folded < greatest)
-            ++scan.changed_shards;
-    }
     return scan;
 }
 
@@ -4457,13 +4466,16 @@ uint64_t Gc::drainCompletedRemoving(const GcState & leased_state)
         if (!eligible)
             return deleted;
 
-        switch (CasRefCatalog::deleteCompletedRemoving(
-            backend, layout, *eligible, *parent, admitted_generation, check_fence_or_throw))
+        const CasRefCatalog::CompletedRemovingDeleteResult delete_result
+            = CasRefCatalog::deleteCompletedRemoving(
+                backend, layout, *eligible, *parent, admitted_generation, check_fence_or_throw);
+        if (delete_result.invalidated_life)
+            store->invalidateRemovedCatalogLife(*delete_result.invalidated_life);
+
+        switch (delete_result.outcome)
         {
             case CasRefCatalog::CompletedRemovingDeleteOutcome::Deleted:
                 ++deleted;
-                store->invalidateRemovedCatalogLife(
-                    NamespaceLifeId::fromCatalogEntry(eligible->ns, eligible->incarnation));
                 break;
             case CasRefCatalog::CompletedRemovingDeleteOutcome::EntryChanged:
                 break;   /// resolved by the mandatory fresh rescan

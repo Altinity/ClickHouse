@@ -560,12 +560,47 @@ void CasRefLedger::invalidateRemovedCatalogLife(const NamespaceLifeId & life)
     }
 
     /// Do not call `getRefTableRuntime`: invalidation must neither materialize a cache entry nor run
-    /// the reset on GC's thread. Publishing this bit is sufficient; the next name-based caller joins
-    /// every old user and resets the SAME object before it can resolve through the catalog again.
-    rt->catalog_life_invalidated.store(true, std::memory_order_release);
+    /// the reset on GC's thread. Re-check the exact resident life while holding its state lock: a
+    /// delayed reconciliation for a predecessor must not invalidate a runtime already rebound to a
+    /// successor. Publishing this bit is sufficient; the next name-based caller joins every old user
+    /// and resets the SAME object before it can resolve through the catalog again.
+    {
+        std::lock_guard state_lock(rt->state_mutex);
+        if (!rt->life || *rt->life != life)
+            return;
+        rt->catalog_life_invalidated.store(true, std::memory_order_release);
+    }
     rt->cv.notify_all();
     rt->recovery_cv.notify_all();
     rt->publish_settle_cv.notify_all();
+}
+
+void CasRefLedger::reconcileCatalogCut(const CasRefCatalog::Snapshot & catalog_cut)
+{
+    catalog_cut.life_index.throwIfAmbiguous("CAS resident ref-runtime reconciliation");
+
+    std::vector<std::shared_ptr<RefTableRuntime>> closed_runtimes;
+    {
+        std::lock_guard queue_lock(ref_queue_mutex);
+        for (const auto & [_, rt] : ref_tables)
+            if (rt->removal_admission_closed)
+                closed_runtimes.push_back(rt);
+    }
+
+    for (const auto & rt : closed_runtimes)
+    {
+        std::optional<NamespaceLifeId> resident_life;
+        {
+            std::lock_guard state_lock(rt->state_mutex);
+            resident_life = rt->life;
+        }
+        if (!resident_life)
+            continue;
+        const std::optional<NamespaceLifeId> catalog_life
+            = catalog_cut.life_index.resolve(resident_life->incarnation);
+        if (!catalog_life || *catalog_life != *resident_life)
+            invalidateRemovedCatalogLife(*resident_life);
+    }
 }
 
 std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::pinRefTableRuntimeToLife(
@@ -4245,6 +4280,20 @@ NamespaceLifeId CasRefLedger::lifeUnderLock(const RootNamespace & ns, const RefT
 NamespaceLifeId CasRefLedger::namespaceLife(const RootNamespace & ns)
 {
     const auto rt = getRefTableRuntime(ns);
+    bool removal_closed = false;
+    {
+        std::lock_guard queue_lock(ref_queue_mutex);
+        removal_closed = rt->removal_admission_closed;
+    }
+    if (removal_closed)
+    {
+        /// A prior GC may have committed the exact erase but lost its response or failed its
+        /// resolution read. Reconcile this name through a complete fresh catalog before honoring the
+        /// cached close bit; absence/replacement invalidates and resets in place, while the same exact
+        /// `Removing` life remains closed.
+        reconcileCatalogCut(CasRefCatalog::read(backend, layout));
+        prepareInvalidatedRuntimeForReuse(rt);
+    }
     const auto refuse_if_removing = [&]
     {
         std::lock_guard<std::mutex> queue_lock(ref_queue_mutex);

@@ -85,7 +85,8 @@ struct RefHold
     bool operator==(const RefHold &) const = default;
 };
 
-/// Records what the current round did for one namespace and shard. `classification` is a persisted byte:
+/// Records what the current round did for one life-keyed `CasFoldSeal::ref_lives` row.
+/// `classification` is a persisted byte:
 /// 0 means absent, 1 means unchanged, 2 means all records through the observed cursor were folded, and 4
 /// means folding was clamped below the ref-log cursor. A clamped entry must be read again in the next
 /// round, because an unfolded event may become foldable by then.
@@ -101,7 +102,7 @@ struct RefCoverage
     uint8_t classification = 0;
 
     /// The greatest `RefTxnId` whose owner changes have contributed their manifest-edge deltas. There is
-    /// one ref-log stream per namespace, so this cursor is stored in the namespace's shard-0 entry.
+    /// one ref-log stream per namespace life, so this cursor is stored in that life-keyed row.
     /// `{0, 0}` means that no transaction has been folded yet. A clamp leaves the cursor below the
     /// offending transaction so the complete transaction is retried rather than partially applied.
     RefTxnId last_folded_ref_id{};

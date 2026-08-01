@@ -1559,6 +1559,11 @@ void Pool::invalidateRemovedCatalogLife(const NamespaceLifeId & life)
     ref_ledger.invalidateRemovedCatalogLife(life);
 }
 
+void Pool::reconcileRefCatalogCut(const CasRefCatalog::Snapshot & catalog_cut)
+{
+    ref_ledger.reconcileCatalogCut(catalog_cut);
+}
+
 RefTxnId Pool::appendRefOps(const RootNamespace & ns, MutationScope scope,
                              std::function<std::vector<RefOp>(const RefTableState &)> build_ops,
                              RootMutationOrigin origin, RootMutationKind kind,

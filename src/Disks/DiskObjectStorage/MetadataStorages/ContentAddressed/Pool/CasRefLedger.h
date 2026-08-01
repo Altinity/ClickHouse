@@ -5,6 +5,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCkpt.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
 #include <atomic>
 #include <condition_variable>
@@ -197,11 +198,17 @@ public:
     /// is only ever reached for a namespace whose absence is durable knowledge.
     std::optional<NamespaceLifeId> namespaceFilesLifeIfReadable(const RootNamespace & ns);
 
-    /// Called only after the catalog's exact proved `Removing -> absent` CAS commits. It does not
+    /// Called after a complete catalog observation proves an exact resident life absent or replaced.
+    /// It does not
     /// destroy the runtime: existing callers that already captured the old physical life may finish
     /// with their stale-or-not-found contract. The next name-based touch resets this same runtime in
     /// place and resolves a fresh catalog life.
     void invalidateRemovedCatalogLife(const NamespaceLifeId & life);
+
+    /// Reconciles resident removal-closed runtimes against one complete catalog observation. An exact
+    /// life absent from or replaced in the cut is invalidated in place; a matching current life stays
+    /// closed. The next name-based touch performs the existing quiescent reset/rebind.
+    void reconcileCatalogCut(const CasRefCatalog::Snapshot & catalog_cut);
 
     /// Queues a mutation for flat-combining with compatible callers. `build_ops` runs at most once in
     /// the flush leader and must return operations without writing storage itself. The leader validates
@@ -604,12 +611,13 @@ private:
         /// Stage B (spec INV-3): the catalog-resolved life this table's every ref-layer key is built
         /// under -- `createNamespace`-minted, adopted from an existing `Live`/`Removing` entry, or
         /// reconciled from a stale `Creating` one (`CasRefLedger::resolveNamespaceLife`). Resolved
-        /// ONCE per table-open, on the FIRST recovery attempt of this runtime's lifetime
-        /// (`ensureRefTableRecovered`), and never re-resolved by a later re-recovery of the SAME
-        /// runtime (`NeedsRecovery` walks again; the life it walks under does not change) -- a fresh
-        /// life is only ever seen by a FRESH `RefTableRuntime`, which a self-remount's
-        /// `quiesceRefTablesForRemount` is what produces. `nullopt` exactly until that first
-        /// resolution completes.
+        /// ONCE for one catalog life, on the first recovery attempt under that life
+        /// (`ensureRefTableRecovered`), and retained by a later `NeedsRecovery` replay. Exact catalog
+        /// deletion or replacement invalidates the binding; the next name-based touch drains old work,
+        /// resets this SAME `RefTableRuntime` in place, and resolves/rebinds it to the successor life.
+        /// Self-remount still replaces the whole runtime through `quiesceRefTablesForRemount`.
+        /// `nullopt` means no catalog life has yet been resolved, or the runtime has just been reset for
+        /// rebinding.
         std::optional<NamespaceLifeId> life;
         RefTableState state;
         /// Exact attempt owned by `Writing` or `Wedged`. Empty in every other lane state.

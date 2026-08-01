@@ -518,6 +518,9 @@ public:
     /// runtime invalidation contract.
     void invalidateRemovedCatalogLife(const NamespaceLifeId & life);
 
+    /// Reconciles cached removal-closed ref runtimes against a complete catalog cut.
+    void reconcileRefCatalogCut(const CasRefCatalog::Snapshot & catalog_cut);
+
     /// ==== writer ref-log append lane ====
     ///
     /// The ONE entry point every ref mutation funnels through -- Pool's own dropRef/updateRefPublishedAt

@@ -1415,24 +1415,19 @@ TEST(CasGcFrontierGate, StaleIssuedCatalogCasLosesAfterNewLeaderHelpsBeforeListi
     EXPECT_EQ(backend->deleteCount(fixture.checkpoint_key), 0);
 }
 
-TEST(CasGcFrontierGate, LostCatalogCasResponseIsResolvedByNextLeaderBeforeListing)
+TEST(CasGcFrontierGate, LostCatalogCasResponseIsResolvedBeforeListing)
 {
     auto backend = std::make_shared<DrainRaceBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
     const Layout & layout = store->layout();
-    const UInt128 leader_b = hexToU128("00000000000000000000000000000002");
     const CompletedRemovingFixture fixture = seedCompletedRemoving(*backend, store, kGc);
     backend->clearJournal();
     backend->loseNextCatalogCasResponse(layout.refCatalogKey());
 
-    Gc gc_a(store, kGc);
-    EXPECT_THROW((void)runRegularRoundReclaiming(gc_a), std::runtime_error);
-
-    transferGcLease(*backend, layout, leader_b);
-    Gc gc_b(store, leader_b);
-    const RoundReport report_b = runRegularRoundReclaiming(gc_b);
-    ASSERT_TRUE(report_b.acquired_lease);
-    ASSERT_FALSE(report_b.deferred);
+    Gc gc(store, kGc);
+    const RoundReport report = runRegularRoundReclaiming(gc);
+    ASSERT_TRUE(report.acquired_lease);
+    ASSERT_FALSE(report.deferred);
 
     const std::vector<String> journal = backend->journalSnapshot();
     const size_t response_lost = findJournalAfter(
