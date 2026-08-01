@@ -9,9 +9,12 @@ gate — it blocks the C++ work.
 **2026-08-01 scope amendment.** This model starts at `BeginRound` with the catalog cut already
 chosen. The catalog-only pre-fold drain specifies that input as the **fresh post-drain catalog cut**:
 the actor resolves every eligible exact-row deletion justified by the authoritative adopted parent
-before taking it. `CaRefPreFoldDrainCore` owns and sabotage-gates that cross-object ordering for
-ordinary fold, `DEFER`, and `REBUILD`; `CaRefDeltaIntakeCore` assumes rather than independently proves
-this provenance. Its fold/frontier/hold verdicts and state counts therefore must not be cited as a
+before taking it. `CaRefPreFoldDrainCore` owns and sabotage-gates both the cross-object ordering and
+the consumer handoff: `TakeFreshCut` records the immutable full-catalog token/value, the ref-plan
+boundary consumes that same pair, `_sab_intake_uses_predrain_cut` makes a stale wiring red on
+`IntakeConsumesFreshPostDrainCut`, and the absent-row witness proves a drained life does not enter the
+consumed cut/plan. `CaRefDeltaIntakeCore` still does not own or repeat that lifecycle. Its own
+fold/frontier/hold verdicts, including `_sab_adoptbeforecommit`/`NoMissedFold`, must not be cited as the
 fresh-cut provenance control.
 
 Runner: `./run_deltaintake.sh` (runs every config and checks its expected verdict, including *which*
@@ -394,9 +397,10 @@ object, never an enumeration.** Both mitigations above satisfy it; no listing di
 ## Scoping — what this model deliberately does not cover
 
 - **Two namespaces, one blob, one incarnation.** The catalog, `Creating`/`Removing` races and
-  incarnations are `CaRefCatalogCore`'s subject (task 3), while the required pre-fold drain and
-  fresh-cut ordering are `CaRefPreFoldDrainCore`'s subject. Namespaces here are always foldable and
-  the model consumes an already-fresh post-drain cut.
+  incarnations are `CaRefCatalogCore`'s subject (task 3), while the required pre-fold drain,
+  fresh-cut ordering and exact cut-to-intake handoff are `CaRefPreFoldDrainCore`'s subject.
+  Namespaces here are always foldable; this model consumes the interface and owns only its key-set
+  and fold consequences.
 - **The seal is an opaque slot occupant.** Task 1's hand-off note (`CaRefTableSnapshotLogCore.tla`
   lines 86-96) assigns `ckpt.seal`'s fold-side obligation to this module; what is discharged here is
   the *consumption* rule — a seal occupies a slot, the walk reads it and continues, and it applies as

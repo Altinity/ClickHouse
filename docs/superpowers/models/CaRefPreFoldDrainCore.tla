@@ -9,7 +9,9 @@
    A's proof before A's request either lands or loses its exact catalog token.
 
    Physical objects deliberately do not occur here. The pre-fold drain mutates only the catalog;
-   the perpetual janitor and orphan sweeps own all byte reclamation. *)
+   the perpetual janitor and orphan sweeps own all byte reclamation. The same owner exports the
+   fresh cut as a token/value pair to a tiny ref-plan consumer boundary; the Delta-intake lifecycle
+   is not copied here. *)
 EXTENDS Integers, FiniteSets
 
 CONSTANTS
@@ -18,7 +20,8 @@ CONSTANTS
     SabotageDeferBypassesDrain,
     SabotageContinueAfterUnknown,
     SabotageStaleDeleteAfterSuccessorHold,
-    SabotageRebuildFromUnadoptedSeal
+    SabotageRebuildFromUnadoptedSeal,
+    SabotageIntakeUsesPreDrainCut
 
 Actors == {"A", "B"}
 Phases == {"idle", "parent", "observed", "issued", "uncertain", "resolved", "cut", "done"}
@@ -41,6 +44,8 @@ VARIABLES
     observedToken,
     observedEntry,
     cutEntry,
+    cutToken,              \* full-catalog token paired with the fresh post-drain cut
+    intakeCut,             \* the exact cut/token consumed by the ref-plan boundary
     advancedWithDebt,      \* sticky audit: DEFER/fold/REBUILD crossed an unresolved ready parent
     deletedWithoutCurrentProof, \* sticky audit: catalog CAS landed after authority/proof changed
     nonExactDelete         \* sticky audit: a catalog delete did not consume its exact observation
@@ -48,7 +53,7 @@ VARIABLES
 vars == << entry, catalogToken, noiseDone,
            adoptedValid, adoptedGeneration, adoptedRow, authorityLossDone,
            leaseOwner, leaseSeq, phase, parentGeneration, parentRow,
-           observedToken, observedEntry, cutEntry,
+           observedToken, observedEntry, cutEntry, cutToken, intakeCut,
            advancedWithDebt, deletedWithoutCurrentProof, nonExactDelete >>
 
 Init ==
@@ -67,6 +72,9 @@ Init ==
     /\ observedToken = [a \in Actors |-> 0]
     /\ observedEntry = [a \in Actors |-> "none"]
     /\ cutEntry = [a \in Actors |-> "none"]
+    /\ cutToken = [a \in Actors |-> 0]
+    /\ intakeCut = [a \in Actors |->
+                       [catalog_token |-> 0, entry |-> "none", plan_has_life |-> FALSE]]
     /\ advancedWithDebt = FALSE
     /\ deletedWithoutCurrentProof = FALSE
     /\ nonExactDelete = FALSE
@@ -86,6 +94,7 @@ Acquire(a) ==
     /\ UNCHANGED << entry, catalogToken, noiseDone,
                     adoptedValid, adoptedGeneration, adoptedRow, authorityLossDone,
                     parentGeneration, parentRow, observedToken, observedEntry, cutEntry,
+                    cutToken, intakeCut,
                     advancedWithDebt, deletedWithoutCurrentProof, nonExactDelete >>
 
 (* The parent is read only after lease acquisition. A missing/undecodable authority is not replaced
@@ -100,6 +109,7 @@ ReadAdoptedParent(a) ==
     /\ UNCHANGED << entry, catalogToken, noiseDone,
                     adoptedValid, adoptedGeneration, adoptedRow, authorityLossDone,
                     leaseOwner, leaseSeq, observedToken, observedEntry, cutEntry,
+                    cutToken, intakeCut,
                     advancedWithDebt, deletedWithoutCurrentProof, nonExactDelete >>
 
 (* The exact catalog observation is taken after the authoritative parent. *)
@@ -113,6 +123,7 @@ ReadDrainCatalog(a) ==
     /\ UNCHANGED << entry, catalogToken, noiseDone,
                     adoptedValid, adoptedGeneration, adoptedRow, authorityLossDone,
                     leaseOwner, leaseSeq, parentGeneration, parentRow, cutEntry,
+                    cutToken, intakeCut,
                     advancedWithDebt, deletedWithoutCurrentProof, nonExactDelete >>
 
 (* A mutation elsewhere in the shared catalog invalidates the full-object token without changing
@@ -124,7 +135,7 @@ CatalogNoise ==
     /\ noiseDone' = TRUE
     /\ UNCHANGED << entry, adoptedValid, adoptedGeneration, adoptedRow, authorityLossDone,
                     leaseOwner, leaseSeq, phase, parentGeneration, parentRow,
-                    observedToken, observedEntry, cutEntry,
+                    observedToken, observedEntry, cutEntry, cutToken, intakeCut,
                     advancedWithDebt, deletedWithoutCurrentProof, nonExactDelete >>
 
 (* A successful exact CAS may return after its actor was deposed. Whether the CURRENT adopted seal
@@ -142,7 +153,7 @@ DeleteSuccess(a) ==
                            ~(entry = observedEntry[a] /\ catalogToken = observedToken[a]))
     /\ UNCHANGED << noiseDone, adoptedValid, adoptedGeneration, adoptedRow, authorityLossDone,
                     leaseOwner, leaseSeq, parentGeneration, parentRow,
-                    observedToken, observedEntry, cutEntry, advancedWithDebt >>
+                    observedToken, observedEntry, cutEntry, cutToken, intakeCut, advancedWithDebt >>
 
 (* An ambiguous response has two store outcomes. Neither permits progress until an exact re-read
    resolves it. *)
@@ -159,7 +170,7 @@ DeleteUnknownLanded(a) ==
                            ~(entry = observedEntry[a] /\ catalogToken = observedToken[a]))
     /\ UNCHANGED << noiseDone, adoptedValid, adoptedGeneration, adoptedRow, authorityLossDone,
                     leaseOwner, leaseSeq, parentGeneration, parentRow,
-                    observedToken, observedEntry, cutEntry, advancedWithDebt >>
+                    observedToken, observedEntry, cutEntry, cutToken, intakeCut, advancedWithDebt >>
 
 DeleteUnknownNotLanded(a) ==
     /\ phase[a] = "issued"
@@ -167,7 +178,7 @@ DeleteUnknownNotLanded(a) ==
     /\ UNCHANGED << entry, catalogToken, noiseDone,
                     adoptedValid, adoptedGeneration, adoptedRow, authorityLossDone,
                     leaseOwner, leaseSeq, parentGeneration, parentRow,
-                    observedToken, observedEntry, cutEntry,
+                    observedToken, observedEntry, cutEntry, cutToken, intakeCut,
                     advancedWithDebt, deletedWithoutCurrentProof, nonExactDelete >>
 
 (* A definite token conflict is still followed by the same exact resolution path. *)
@@ -179,7 +190,7 @@ DeleteConflict(a) ==
     /\ UNCHANGED << entry, catalogToken, noiseDone,
                     adoptedValid, adoptedGeneration, adoptedRow, authorityLossDone,
                     leaseOwner, leaseSeq, parentGeneration, parentRow,
-                    observedToken, observedEntry, cutEntry,
+                    observedToken, observedEntry, cutEntry, cutToken, intakeCut,
                     advancedWithDebt, deletedWithoutCurrentProof, nonExactDelete >>
 
 ResolveAbsent(a) ==
@@ -194,6 +205,7 @@ ResolveAbsent(a) ==
     /\ UNCHANGED << entry, catalogToken, noiseDone,
                     adoptedValid, adoptedGeneration, adoptedRow, authorityLossDone,
                     leaseOwner, leaseSeq, parentGeneration, parentRow, cutEntry,
+                    cutToken, intakeCut,
                     advancedWithDebt, deletedWithoutCurrentProof, nonExactDelete >>
 
 (* The same complete `Removing` row under a new full-catalog token remains eligible. Return through
@@ -207,6 +219,7 @@ ResolveSameRemoving(a) ==
     /\ UNCHANGED << entry, catalogToken, noiseDone,
                     adoptedValid, adoptedGeneration, adoptedRow, authorityLossDone,
                     leaseOwner, leaseSeq, parentGeneration, parentRow, cutEntry,
+                    cutToken, intakeCut,
                     advancedWithDebt, deletedWithoutCurrentProof, nonExactDelete >>
 
 (* This is the barrier: no fresh cut exists before resolution. *)
@@ -214,11 +227,12 @@ TakeFreshCut(a) ==
     /\ Current(a)
     /\ phase[a] = "resolved"
     /\ cutEntry' = [cutEntry EXCEPT ![a] = entry]
+    /\ cutToken' = [cutToken EXCEPT ![a] = catalogToken]
     /\ phase' = [phase EXCEPT ![a] = "cut"]
     /\ UNCHANGED << entry, catalogToken, noiseDone,
                     adoptedValid, adoptedGeneration, adoptedRow, authorityLossDone,
                     leaseOwner, leaseSeq, parentGeneration, parentRow,
-                    observedToken, observedEntry,
+                    observedToken, observedEntry, intakeCut,
                     advancedWithDebt, deletedWithoutCurrentProof, nonExactDelete >>
 
 Defer(a) ==
@@ -228,7 +242,7 @@ Defer(a) ==
     /\ UNCHANGED << entry, catalogToken, noiseDone,
                     adoptedValid, adoptedGeneration, adoptedRow, authorityLossDone,
                     leaseOwner, leaseSeq, parentGeneration, parentRow,
-                    observedToken, observedEntry, cutEntry,
+                    observedToken, observedEntry, cutEntry, cutToken, intakeCut,
                     advancedWithDebt, deletedWithoutCurrentProof, nonExactDelete >>
 
 AdoptFromCut(a) ==
@@ -239,10 +253,14 @@ AdoptFromCut(a) ==
          /\ adoptedRow' = nextRow
          /\ adoptedGeneration' = adoptedGeneration + 1
     /\ adoptedValid' = TRUE
+    /\ intakeCut' = [intakeCut EXCEPT ![a] =
+                        [catalog_token |-> cutToken[a],
+                         entry |-> cutEntry[a],
+                         plan_has_life |-> cutEntry[a] = "removing"]]
     /\ phase' = [phase EXCEPT ![a] = "done"]
     /\ UNCHANGED << entry, catalogToken, noiseDone, authorityLossDone,
                     leaseOwner, leaseSeq, parentGeneration, parentRow,
-                    observedToken, observedEntry, cutEntry,
+                    observedToken, observedEntry, cutEntry, cutToken,
                     advancedWithDebt, deletedWithoutCurrentProof, nonExactDelete >>
 
 (* Three isolated omissions. Their sticky ghost makes the ordering claim executable even for
@@ -260,7 +278,7 @@ FoldBypassDrain(a) ==
     /\ advancedWithDebt' = TRUE
     /\ UNCHANGED << entry, catalogToken, noiseDone, authorityLossDone,
                     leaseOwner, leaseSeq, parentGeneration, parentRow,
-                    observedToken, observedEntry, cutEntry,
+                    observedToken, observedEntry, cutEntry, cutToken, intakeCut,
                     deletedWithoutCurrentProof, nonExactDelete >>
 
 RebuildBypassDrain(a) ==
@@ -276,7 +294,7 @@ RebuildBypassDrain(a) ==
     /\ advancedWithDebt' = TRUE
     /\ UNCHANGED << entry, catalogToken, noiseDone, authorityLossDone,
                     leaseOwner, leaseSeq, parentGeneration, parentRow,
-                    observedToken, observedEntry, cutEntry,
+                    observedToken, observedEntry, cutEntry, cutToken, intakeCut,
                     deletedWithoutCurrentProof, nonExactDelete >>
 
 DeferBypassDrain(a) ==
@@ -290,7 +308,7 @@ DeferBypassDrain(a) ==
     /\ UNCHANGED << entry, catalogToken, noiseDone,
                     adoptedValid, adoptedGeneration, adoptedRow, authorityLossDone,
                     leaseOwner, leaseSeq, parentGeneration, parentRow,
-                    observedToken, observedEntry, cutEntry,
+                    observedToken, observedEntry, cutEntry, cutToken, intakeCut,
                     deletedWithoutCurrentProof, nonExactDelete >>
 
 ContinueAfterUnknown(a) ==
@@ -300,12 +318,13 @@ ContinueAfterUnknown(a) ==
     /\ parentRow[a] = "ready"
     /\ entry = "removing"
     /\ cutEntry' = [cutEntry EXCEPT ![a] = entry]
+    /\ cutToken' = [cutToken EXCEPT ![a] = catalogToken]
     /\ phase' = [phase EXCEPT ![a] = "cut"]
     /\ advancedWithDebt' = TRUE
     /\ UNCHANGED << entry, catalogToken, noiseDone,
                     adoptedValid, adoptedGeneration, adoptedRow, authorityLossDone,
                     leaseOwner, leaseSeq, parentGeneration, parentRow,
-                    observedToken, observedEntry,
+                    observedToken, observedEntry, intakeCut,
                     deletedWithoutCurrentProof, nonExactDelete >>
 
 (* Exact reproduction of the rejected post-adoption finalizer: A has an issued request from ready
@@ -321,7 +340,7 @@ AdoptHeldOverDeposedRequest(a) ==
     /\ phase' = [phase EXCEPT ![a] = "done"]
     /\ UNCHANGED << entry, catalogToken, noiseDone, authorityLossDone,
                     leaseOwner, leaseSeq, parentGeneration, parentRow,
-                    observedToken, observedEntry, cutEntry,
+                    observedToken, observedEntry, cutEntry, cutToken, intakeCut,
                     advancedWithDebt, deletedWithoutCurrentProof, nonExactDelete >>
 
 (* Missing authority may be rebuilt, but that invocation returns after restoring authority. It does
@@ -335,7 +354,7 @@ LoseAuthority(a) ==
     /\ authorityLossDone' = TRUE
     /\ UNCHANGED << entry, catalogToken, noiseDone, adoptedGeneration, adoptedRow,
                     leaseOwner, leaseSeq, phase, parentGeneration, parentRow,
-                    observedToken, observedEntry, cutEntry,
+                    observedToken, observedEntry, cutEntry, cutToken, intakeCut,
                     advancedWithDebt, deletedWithoutCurrentProof, nonExactDelete >>
 
 RebuildAuthorityOnly(a) ==
@@ -348,7 +367,7 @@ RebuildAuthorityOnly(a) ==
     /\ phase' = [phase EXCEPT ![a] = "done"]
     /\ UNCHANGED << entry, catalogToken, noiseDone, authorityLossDone,
                     leaseOwner, leaseSeq, parentGeneration, parentRow,
-                    observedToken, observedEntry, cutEntry,
+                    observedToken, observedEntry, cutEntry, cutToken, intakeCut,
                     advancedWithDebt, deletedWithoutCurrentProof, nonExactDelete >>
 
 RebuildFromUnadoptedSealDeletes(a) ==
@@ -363,8 +382,26 @@ RebuildFromUnadoptedSealDeletes(a) ==
     /\ deletedWithoutCurrentProof' = TRUE
     /\ UNCHANGED << noiseDone, adoptedValid, adoptedGeneration, adoptedRow, authorityLossDone,
                     leaseOwner, leaseSeq, parentGeneration, parentRow,
-                    observedToken, observedEntry, cutEntry,
+                    observedToken, observedEntry, cutEntry, cutToken, intakeCut,
                     advancedWithDebt, nonExactDelete >>
+
+(* Composition sabotage: the drain and fresh-cut transition are honest, but the ref-plan consumer
+   is wired to the earlier drain observation. This isolates cut provenance from lifecycle ordering. *)
+IntakeUsesPreDrainCut(a) ==
+    /\ SabotageIntakeUsesPreDrainCut
+    /\ Current(a)
+    /\ phase[a] = "cut"
+    /\ observedToken[a] # 0
+    /\ intakeCut' = [intakeCut EXCEPT ![a] =
+                        [catalog_token |-> observedToken[a],
+                         entry |-> observedEntry[a],
+                         plan_has_life |-> observedEntry[a] = "removing"]]
+    /\ phase' = [phase EXCEPT ![a] = "done"]
+    /\ UNCHANGED << entry, catalogToken, noiseDone,
+                    adoptedValid, adoptedGeneration, adoptedRow, authorityLossDone,
+                    leaseOwner, leaseSeq, parentGeneration, parentRow,
+                    observedToken, observedEntry, cutEntry, cutToken,
+                    advancedWithDebt, deletedWithoutCurrentProof, nonExactDelete >>
 
 NoOp == UNCHANGED vars
 
@@ -377,6 +414,7 @@ Next ==
          \/ FoldBypassDrain(a) \/ RebuildBypassDrain(a) \/ DeferBypassDrain(a)
          \/ ContinueAfterUnknown(a) \/ AdoptHeldOverDeposedRequest(a)
          \/ LoseAuthority(a) \/ RebuildAuthorityOnly(a) \/ RebuildFromUnadoptedSealDeletes(a)
+         \/ IntakeUsesPreDrainCut(a)
     \/ CatalogNoise
     \/ NoOp
 
@@ -398,6 +436,9 @@ TypeOK ==
     /\ observedToken \in [Actors -> 0..3]
     /\ observedEntry \in [Actors -> EntryKinds]
     /\ cutEntry \in [Actors -> EntryKinds]
+    /\ cutToken \in [Actors -> 0..3]
+    /\ intakeCut \in [Actors ->
+                        [catalog_token : 0..3, entry : EntryKinds, plan_has_life : BOOLEAN]]
     /\ advancedWithDebt \in BOOLEAN
     /\ deletedWithoutCurrentProof \in BOOLEAN
     /\ nonExactDelete \in BOOLEAN
@@ -405,6 +446,15 @@ TypeOK ==
 DrainBeforeDecision == ~advancedWithDebt
 DeleteUsesCurrentAdoptedProof == ~deletedWithoutCurrentProof
 ExactCatalogCAS == ~nonExactDelete
+
+(* The consumer must receive the same immutable full-catalog observation produced after the drain.
+   Equality includes the token, so an earlier cut with the same row value is still stale. *)
+IntakeConsumesFreshPostDrainCut ==
+    \A a \in Actors :
+        intakeCut[a].catalog_token # 0 =>
+            /\ intakeCut[a].catalog_token = cutToken[a]
+            /\ intakeCut[a].entry = cutEntry[a]
+            /\ intakeCut[a].plan_has_life = (intakeCut[a].entry = "removing")
 
 (* Negated non-vacuity witness: A's exact request loses to B's completed drain, B adopts the
    catalog-absent successor, and A conclusively observes its conflict. *)
@@ -416,5 +466,17 @@ WITNESS_TAKEOVER_CONVERGES ==
       /\ phase["A"] = "resolved"
       /\ observedEntry["A"] = "absent"    \* A resolved its stale request by re-read
       /\ observedEntry["B"] = "removing") \* B, not A, consumed the exact row
+
+(* Negated non-vacuity witness for the composition boundary: a real exact deletion advances the
+   catalog token, and the cut consumed by the plan omits the drained row. *)
+WITNESS_DRAINED_ROW_ABSENT_FROM_INTAKE ==
+    ~(\E a \in Actors :
+        /\ phase[a] = "done"
+        /\ entry = "absent"
+        /\ observedEntry[a] = "removing"
+        /\ cutToken[a] > observedToken[a]
+        /\ intakeCut[a].catalog_token = cutToken[a]
+        /\ intakeCut[a].entry = "absent"
+        /\ ~intakeCut[a].plan_has_life)
 
 =============================================================================

@@ -17,7 +17,9 @@ The model has two GC actors. Actor A can retain an issued or ambiguous catalog r
 steals the lease. Actor B must read the authoritative parent, resolve its eligible exact catalog CAS,
 and take a fresh catalog cut before `DEFER`, ordinary fold adoption, or `REBUILD` adoption. An old
 request may still return afterward, but either B consumed the token first or no successor invalidated
-the proof under which the old request lands.
+the proof under which the old request lands. The model now carries that fresh cut's full-catalog
+token/value into the ref-plan boundary, without importing any fold lifecycle from
+`CaRefDeltaIntakeCore`.
 
 ## Gate {#gate}
 
@@ -28,8 +30,8 @@ docs/superpowers/models/run_prefold_drain.sh
 ```
 
 The committed runner uses one TLC worker for reproducible breadth-first counterexamples. On
-2026-08-01, `build/test_task5_prefold_drain_round1_reviewfix_20260801.log` recorded all eleven expectations
-passed:
+2026-08-01, `build/test_task5_prefold_cut_provenance_final_20260801.log` recorded all thirteen
+expectations passed:
 
 | Configuration | Expected | Actual | Generated / distinct states | Depth |
 |---|---|---|---:|---:|
@@ -39,8 +41,10 @@ passed:
 | `_sab_continue_after_unknown` | violation: `DrainBeforeDecision` | violation: `DrainBeforeDecision` | 114 / 64 | 6 |
 | `_sab_stale_delete_after_successor_hold` | violation: `DeleteUsesCurrentAdoptedProof` | violation: `DeleteUsesCurrentAdoptedProof` | 240 / 127 | 7 |
 | `_sab_rebuild_from_unadopted_seal` | violation: `DeleteUsesCurrentAdoptedProof` | violation: `DeleteUsesCurrentAdoptedProof` | 24 / 17 | 4 |
+| `_sab_intake_uses_predrain_cut` | violation: `IntakeConsumesFreshPostDrainCut` | violation: `IntakeConsumesFreshPostDrainCut` | 209 / 111 | 7 |
 | `_safe` | green | green | 2272 / 874 | 14 |
 | `_witness_takeover_converges` | violation: `WITNESS_TAKEOVER_CONVERGES` | violation: `WITNESS_TAKEOVER_CONVERGES` | 1733 / 737 | 12 |
+| `_witness_drained_row_absent_from_intake` | violation: `WITNESS_DRAINED_ROW_ABSENT_FROM_INTAKE` | violation: `WITNESS_DRAINED_ROW_ABSENT_FROM_INTAKE` | 208 / 110 | 7 |
 
 The runner also checks the two-row serial-rescan companion, which owns the full-catalog-token
 consequence that a first exact delete invalidates the snapshot for the next candidate:
@@ -84,6 +88,19 @@ A receives an ambiguous non-landing result, B steals the lease, reads and delete
 `Removing` row, A resolves absence, and B adopts a successor whose cut omits the row. Both actors
 converge without a successor being published over unresolved debt.
 
+`_sab_intake_uses_predrain_cut` isolates the composition seam after the lifecycle work is already
+correct. A observes `Removing` at catalog token 1, exact deletion advances the catalog, and
+`TakeFreshCut` records `absent` at token 2. The sabotage then gives ref-plan intake the earlier
+`Removing`/token-1 observation, which would admit the drained life; only
+`IntakeConsumesFreshPostDrainCut` fails. This is independent of
+`CaRefDeltaIntakeCore_sab_adoptbeforecommit`, whose `NoMissedFold` failure says nothing about catalog
+cut provenance.
+
+`_witness_drained_row_absent_from_intake` reaches the honest dual: the exact deletion advances token
+1 to 2, the consumed cut is `absent` at token 2, and `plan_has_life = FALSE`. The witness makes the
+composition control non-vacuous and proves the drained row is absent from both the consumed cut and
+the one-row plan projection.
+
 `CaRefPreFoldDrainAllRowsCore` is the narrow all-row companion. It starts with two independently
 eligible catalog rows; a rejected or non-landing ambiguous response, and every local or external
 resolution, return to a complete scan before selecting the next row. `_allrows_sab_skiprescan` reaches a decision with one row left;
@@ -100,9 +117,16 @@ decision precisely: `phase = "done" => remaining = {}`.
 - `ExactCatalogCAS` records that every ordinary deletion consumed its complete observed row and
   full-catalog token. Its falsifiable red control is `_allrows_sab_nonexactdelete`, which makes the
   stale-token consequence sticky rather than deriving it from the honest action's own guard.
+- `IntakeConsumesFreshPostDrainCut` requires the ref-plan boundary to consume the exact token/value
+  pair exported by `TakeFreshCut`; deriving the plan row from an earlier drain observation is red even
+  when the drain and fresh-cut ordering themselves are honest.
 - `CompletionDrained` requires that the all-row companion can decide only after its remaining eligible
   set is empty.
 - `TypeOK` bounds the two leases, one optional catalog-noise write, one catalog deletion, and the
   corresponding seal generations.
 
-TLC logs are written under `tmp/tlc_CaRefPreFoldDrainCore_<config>.log`.
+The provenance TDD evidence is preserved in
+`build/test_task5_prefold_cut_provenance_red_20260801.log`,
+`build/test_task5_prefold_cut_provenance_safe_20260801.log`, and
+`build/test_task5_prefold_cut_provenance_witness_clean_20260801.log`. The runner also writes per-config TLC
+logs under `tmp/tlc_CaRefPreFoldDrainCore_<config>.log`.

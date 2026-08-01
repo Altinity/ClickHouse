@@ -542,9 +542,15 @@ complete-token rescans, external resolution and the non-exact-CAS sabotage contr
 extended (recovery generations; wedge-retry vs successor-seal);
 `CaRefWriterCleanupCore`/`CaRefFoldClampRecoveryCore` extended per register items when those land.
 `CaRefDeltaIntakeCore` additionally asserts that the ref walk-plan key set is exactly the set of catalog
-`Live`/`Removing` ids; it consumes the pre-fold model's fresh-cut interface but does not independently
-model its provenance, so that composition remains explicitly unverified. Sabotage lets a parent, hint,
-hold or checkpoint adapter mint one forbidden row.
+`Live`/`Removing` ids. `CaRefPreFoldDrainCore` owns the compositional interface to that consumer: the
+post-drain transition exports one immutable catalog token/value pair, ref-plan intake records the same
+pair, and `IntakeConsumesFreshPostDrainCut` requires equality. `_sab_intake_uses_predrain_cut` waits
+until the honest fresh cut exists, then feeds intake the earlier drain observation and makes that
+invariant red; `WITNESS_DRAINED_ROW_ABSENT_FROM_INTAKE` reaches a real `Removing` deletion whose
+consumed cut is absent and whose plan omits the drained life. Thus cut provenance is executable without
+copying adopted-parent, CAS-resolution or drain ordering into `CaRefDeltaIntakeCore`. That model still
+owns only fold/key-set semantics; its parent, hint, hold and checkpoint adapter-mint sabotage remains
+the control for forbidden row admission.
 
 RED-first fault-injected controls, the load-bearing set: the cross-namespace hidden-`+1` vs visible
 `-1` (dies without the frontier proof); held namespace → `FORCE REBUILD` → hint hides the witness →

@@ -14,8 +14,10 @@ CONFIGS=(
   "sab_continue_after_unknown          violation DrainBeforeDecision"
   "sab_stale_delete_after_successor_hold violation DeleteUsesCurrentAdoptedProof"
   "sab_rebuild_from_unadopted_seal      violation DeleteUsesCurrentAdoptedProof"
+  "sab_intake_uses_predrain_cut          violation IntakeConsumesFreshPostDrainCut"
   "safe                                green     -"
   "witness_takeover_converges          violation WITNESS_TAKEOVER_CONVERGES"
+  "witness_drained_row_absent_from_intake violation WITNESS_DRAINED_ROW_ABSENT_FROM_INTAKE"
 )
 
 # The same drain also has a two-row serial-rescan core: a full-catalog token changed by the first

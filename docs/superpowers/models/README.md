@@ -96,9 +96,9 @@ of `CaGcRootLocalPartManifestCore`.
 | `CaRetiredInRun.tla` | retired list folded into the snapshot run (two-cursor merge, coverage coherence) | CURRENT | `run_retiredinrun.sh` |
 | `CaRetiredInRunFoldAbortWitness.tla` | GC freshness meta is add-only: a spare never clears a condemned marker | CURRENT | `run_foldabort_witness.sh` |
 | `CaRefTableSnapshotLogCore.tla` | v9 contiguous ref stream: state-derived dense ids, every-attempt reuse rule, `_ckpt`-based recovery base + arithmetic walk, in-band `slot-occupy` epoch seal — `LatePredecessorPut` FLIPPED from rev.4 expected-fail to green, with `_sab_noseal` as the control | CURRENT (v9 rewrite 2026-07-28; gates the ref-chain implementation) | `run_refsnaplog.sh` |
-| `CaRefDeltaIntakeCore.tla` | pool-wide GC fold: arithmetic walk, destructive-round frontier proof, durable hold; assumes its fresh pre-fold catalog cut | CURRENT | `run_deltaintake.sh` |
+| `CaRefDeltaIntakeCore.tla` | pool-wide GC fold: arithmetic walk, destructive-round frontier proof, durable hold, and catalog-cut key-set semantics; consumes the pre-fold cut interface without owning its lifecycle | CURRENT | `run_deltaintake.sh` |
 | `CaRefCatalogCore.tla` | local namespace lifecycle: create/reconcile safety, fresh opaque life ids, bounded catalog churn, and evidence + no-hold + exact-row authorization for `Removing -> absent` | CURRENT (re-scoped 2026-08-01; gates the ref-chain implementation) | `run_refcatalog.sh` |
-| `CaRefPreFoldDrainCore.tla` | two-GC-actor ordering plus its two-row serial-rescan companion: adopted-parent proof, conclusive exact catalog drain, fresh post-drain cut, then fold/`REBUILD`/`DEFER`; the companion returns external resolution to a complete rescan and red-controls a non-exact CAS; damaged-state `REBUILD` restores authority without deleting catalog rows | CURRENT (new 2026-08-01; owns the cross-object removal order) | `run_prefold_drain.sh` |
+| `CaRefPreFoldDrainCore.tla` | two-GC-actor ordering plus its two-row serial-rescan companion: adopted-parent proof, conclusive exact catalog drain, fresh post-drain cut, then fold/`REBUILD`/`DEFER`; exports that exact cut token/value to ref-plan intake, red-controls stale/pre-drain consumption, and witnesses the drained row absent from the consumed cut/plan; damaged-state `REBUILD` restores authority without deleting catalog rows | CURRENT (new 2026-08-01; owns the cross-object removal order and cut provenance interface) | `run_prefold_drain.sh` |
 | `CaRefFoldClampRecoveryCore.tla` | fold clamp always recoverable: per-log cleanup staging | CURRENT | `run_foldclamp.sh` |
 | `CaRefNsCleanupStaleLeaderCore.tla` | perpetual janitor: a LIST page captures an exact physical life id, and a delayed delete never re-derives its target from a reborn logical name | CURRENT (re-scoped 2026-08-01; gates the ref-chain implementation) | `run_nscleanup_staleleader.sh` |
 | `CaRefWriterCleanupCore.tla` | ref-table writer ownership lifecycle: precommit, promote, fence, successor cleanup | CURRENT | `run_refwcleanup.sh` |
@@ -246,9 +246,13 @@ ordered scan and cleanup deletes only what it observed durable. The migration is
   undecodable `gc/state` authorizes only authority-restoring `REBUILD`, never a catalog delete based
   on a seal found by LIST. The takeover witness shows a successor helping an ambiguous predecessor
   to convergence. Its `CaRefPreFoldDrainAllRowsCore` companion independently proves that a
-full-catalog token invalidated by one exact delete or external resolution forces a complete serial
-rescan before the next candidate or successor decision. `CaRefDeltaIntakeCore` assumes this cut at
-its boundary; it is not the provenance proof. Full verdicts and traces: `CaRefPreFoldDrainCore_RESULTS.md`.
+  full-catalog token invalidated by one exact delete or external resolution forces a complete serial
+  rescan before the next candidate or successor decision. The same pre-fold owner records the exact
+  full-catalog token/value at `TakeFreshCut` and at ref-plan intake. Feeding the earlier drain
+  observation to intake violates `IntakeConsumesFreshPostDrainCut`; the honest witness consumes the
+  absent cut and omits the drained life from the plan. `CaRefDeltaIntakeCore` remains the downstream
+  fold/key-set consumer and owns no duplicate lifecycle protocol. Full verdicts and traces:
+  `CaRefPreFoldDrainCore_RESULTS.md`.
 - **`CaRefFoldClampRecoveryCore.tla`** — a clamped fold (a log held back at an unreadable body)
   must stay recoverable: body tokens named by a log's removal records may join the round's cleanup
   set only once the WHOLE log folds, and a clamp discards the log's staged tokens. Committing at
