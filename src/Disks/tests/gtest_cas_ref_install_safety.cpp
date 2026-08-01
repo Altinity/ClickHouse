@@ -602,8 +602,8 @@ TEST(CasRefInstallSafety, WritingOwnsTheAttemptUntilInstall)
     auto store = openPool(backend);
     const RootNamespace ns{"srv1/apply_state_commit"};
 
-    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Ready)
-        << "a table that has never written anything owes no apply";
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Closed)
+        << "a resident-only observer must not materialize a runtime for an untouched name";
 
     /// Fired on the calling thread by the flush leader, which is this thread; `atomic` regardless, as in
     /// `PostDurableInstallIsAllocationFree` above, so no assertion here reads as depending on that.

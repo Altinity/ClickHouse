@@ -279,13 +279,14 @@ std::optional<Resolved> CasRefLedger::resolveRef(const RootNamespace & ns, const
     /// ONLY writer of `ns`'s ref state (no external CAS token to go stale against, unlike the old
     /// per-shard decode cache), so the recovered-and-cached `RefTableState` is always this process's
     /// authoritative view. Kept as a parameter so existing callers compile unchanged.
-    const auto rt = getRefTableRuntime(ns);
+    const auto rt = acquireReadableRefTableRuntime(ns);
     /// A namespace the catalog does not name resolves nothing and is not born by being asked: a ref that
     /// could exist would have needed a write to put it there, and that write would have birthed the
     /// namespace first. The two maintenance calls below are skipped with it, and provably lose nothing --
     /// see the note in `listRefs`.
-    if (!recoverRefTableIfNamespaceExists(ns, *rt))
+    if (!rt)
         return std::nullopt;
+    ensureRefTableRecovered(ns, *rt);
     /// A table this mount only ever READS (never mutates) would otherwise
     /// never have its just-replayed tail/precommits checked -- `appendRefOps`'s own hoisted checks only
     /// fire for a table this mount WRITES to. Both are cheap (lock + comparison) on the warm path (the
@@ -295,6 +296,9 @@ std::optional<Resolved> CasRefLedger::resolveRef(const RootNamespace & ns, const
     /// maintenance action hit an uncertain PUT -- see `sweepStalePrecommitsForRead`.
     sweepStalePrecommitsForRead(ns, rt);
     maybeScheduleSnapshotPublish(ns, rt);
+
+    if (read_before_state_lock_hook_for_test)
+        read_before_state_lock_hook_for_test();
 
     /// Capture the resolved edge under `state_mutex`, but emit AFTER releasing it (Task 2): the audit
     /// sink may re-enter a ledger read that itself takes `state_mutex` (e.g. `resolveRef`), so emitting
@@ -347,7 +351,7 @@ std::map<String, Resolved> CasRefLedger::listRefs(const RootNamespace & ns)
     /// requests; a warm namespace costs nothing at all (replacing the old per-shard LIST-then-HEAD-present-shards
     /// dance, since there is no longer a shard fan-out to rediscover on every call). A namespace that was
     /// never born costs one catalog GET and stops there.
-    const auto rt = getRefTableRuntime(ns);
+    const auto rt = acquireReadableRefTableRuntime(ns);
     /// A namespace the catalog does not name has no refs to list, and listing them is the wrong event to
     /// bring one into existence on.
     ///
@@ -355,8 +359,9 @@ std::map<String, Resolved> CasRefLedger::listRefs(const RootNamespace & ns)
     /// neither would do anything. The stale-precommit sweep runs only when `needs_stale_precommit_sweep`
     /// is armed, which recovery and commit are the only things that arm; the snapshot publish is admitted
     /// only for a `Live` lifecycle over a non-empty tail, and an unrecovered runtime is neither.
-    if (!recoverRefTableIfNamespaceExists(ns, *rt))
+    if (!rt)
         return {};
+    ensureRefTableRecovered(ns, *rt);
     /// Apply the same read-side maintenance policy as `resolveRef`; see `sweepStalePrecommitsForRead`.
     sweepStalePrecommitsForRead(ns, rt);
     maybeScheduleSnapshotPublish(ns, rt);
@@ -376,9 +381,10 @@ bool CasRefLedger::hasAnyRefWithPrefix(const RootNamespace & ns, std::string_vie
 {
     /// Same non-minting recovery/maintenance preamble as `listRefs`; see there for what each shape of
     /// namespace -- never born, empty, warm -- costs.
-    const auto rt = getRefTableRuntime(ns);
-    if (!recoverRefTableIfNamespaceExists(ns, *rt))
+    const auto rt = acquireReadableRefTableRuntime(ns);
+    if (!rt)
         return false;
+    ensureRefTableRecovered(ns, *rt);
     sweepStalePrecommitsForRead(ns, rt);
     maybeScheduleSnapshotPublish(ns, rt);
 
@@ -425,14 +431,15 @@ ConfirmAnswer CasRefLedger::confirmExactRef(const RootNamespace & ns, const Stri
     /// than it should have is a different defect, in a different component.
     std::lock_guard<std::mutex> qlock(ref_queue_mutex);
 
-    /// Rule 2 (residency). `find`, NOT `getRefTableRuntime`: the latter INSERTS an empty, unrecovered
-    /// runtime for any namespace named, so a read-only query would let a peer grow this writer's table
-    /// cache -- and the very next reader would then pay a recovery this query invented. A cold or
-    /// evicted table is simply unknown here.
-    const auto it = ref_tables.find(ns.string());
-    if (it == ref_tables.end())
+    /// Rule 2 (residency). Direct slot lookup, never a catalog observation or exact-runtime acquisition:
+    /// a read-only query must not let a peer grow this writer's cache or make the next reader pay for a
+    /// recovery it invented. A cold or evicted table is simply unknown here.
+    const auto it = ref_name_slots.find(ns.string());
+    if (it == ref_name_slots.end())
         return ConfirmAnswer::Unknown;
-    RefTableRuntime & rt = *it->second;
+    if (!it->second.current)
+        return ConfirmAnswer::Unknown;
+    RefTableRuntime & rt = *it->second.current;
 
     /// `try_to_lock`, not a blocking acquire: `ensureRefTableRecovered` holds `state_mutex` across its
     /// whole LIST + replay, so blocking here would make a confirm WAIT on someone else's recovery --
@@ -450,7 +457,9 @@ ConfirmAnswer CasRefLedger::confirmExactRef(const RootNamespace & ns, const Stri
     /// class: this runtime was detached by a self-remount and its view belongs to a dead incarnation.
     /// Recovery publishes atomically (`installRecoveryResult` sets `recovered` LAST under this mutex),
     /// so there is no half-recovered view to catch in between.
-    if (!rt.recovered || rt.recovery_in_progress || rt.superseded_by_remount.load(std::memory_order_acquire))
+    if (!rt.recovered || rt.recovery_in_progress
+        || rt.catalog_life_invalidated.load(std::memory_order_acquire)
+        || rt.superseded_by_remount.load(std::memory_order_acquire))
         return ConfirmAnswer::Unknown;
 
     /// Rule 3 (lane quiescent). A wedge is "an object that may be durable and is not applied" -- it may
@@ -480,72 +489,106 @@ ConfirmAnswer CasRefLedger::confirmExactRef(const RootNamespace & ns, const Stri
     /// already have repointed the ref. Being last means a token that does not match is reported as `No`
     /// even under a lost fence: `No` and `Unknown` are the same outcome for the caller (both are
     /// `SourceProofFailed`, spec §failure-taxonomy), and only `Yes` is gated on the fence.
-    /// `superseded_by_remount` is folded in exactly as `commitRefChunk`'s own `fence_ok` folds it: the
-    /// flag is published BEFORE the remount re-arms the fence, so a stale runtime can never pass both.
-    if (!fence_ok_fn() || rt.superseded_by_remount.load(std::memory_order_acquire))
+    /// Both monotone runtime-invalidations are folded in exactly as the mutation gates fold them: a
+    /// retired or remount-superseded runtime can never authorize a remote promotion.
+    if (!fence_ok_fn()
+        || rt.catalog_life_invalidated.load(std::memory_order_acquire)
+        || rt.superseded_by_remount.load(std::memory_order_acquire))
         return ConfirmAnswer::Unknown;
 
     return ConfirmAnswer::Yes;
 }
 
-std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::getRefTableRuntime(const RootNamespace & ns)
+std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::lookupRefTableRuntime(const RootNamespace & ns) const
 {
-    std::shared_ptr<RefTableRuntime> rt;
-    {
-        std::lock_guard lock(ref_queue_mutex);
-        auto & slot = ref_tables[ns.string()];
-        if (!slot)
-            slot = std::make_shared<RefTableRuntime>();
-        rt = slot;
-    }
-    prepareInvalidatedRuntimeForReuse(rt);
-    return rt;
+    std::lock_guard lock(ref_queue_mutex);
+    const auto it = ref_name_slots.find(ns.string());
+    return it == ref_name_slots.end() ? nullptr : it->second.current;
 }
 
-void CasRefLedger::prepareInvalidatedRuntimeForReuse(const std::shared_ptr<RefTableRuntime> & rt)
+std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireRefTableRuntime(
+    const NamespaceLifeId & life, uint64_t admitted_generation)
 {
-    if (!rt->catalog_life_invalidated.load(std::memory_order_acquire))
-        return;
+    check_fence_or_throw(admitted_generation);
 
-    /// No newly admitted positive item can appear here: the removal admission gate stays closed until
-    /// this reset clears it. Old admitted work and the terminal owner drain before the catalog delete;
-    /// the wait also makes the invariant explicit and protects against a caller that already held `rt`.
-    std::unique_lock queue_lock(ref_queue_mutex);
-    rt->cv.wait(queue_lock, [&]
+    std::shared_ptr<RefTableRuntime> result;
+    bool generation_moved = false;
+    bool identity_conflict = false;
     {
-        return !rt->leader_active && rt->pending.empty();
-    });
+        std::lock_guard lock(ref_queue_mutex);
+        generation_moved = fence_generation_fn() != admitted_generation;
+        if (!generation_moved)
+        {
+            const auto it = ref_name_slots.find(life.ns.string());
+            if (it != ref_name_slots.end() && it->second.current)
+            {
+                const auto & current = it->second.current;
+                if (current->life == life
+                    && current->admitted_fence_generation == admitted_generation
+                    && !current->catalog_life_invalidated.load(std::memory_order_acquire)
+                    && !current->superseded_by_remount.load(std::memory_order_acquire))
+                    result = current;
+                else
+                    identity_conflict = true;
+            }
+            else
+            {
+                result = std::make_shared<RefTableRuntime>(
+                    next_ref_runtime_id.fetch_add(1, std::memory_order_relaxed) + 1,
+                    life,
+                    admitted_generation);
+                ref_name_slots.emplace(life.ns.string(), RefNameSlot{.current = result});
+            }
+        }
+    }
 
-    std::unique_lock state_lock(rt->state_mutex);
-    rt->recovery_cv.wait(state_lock, [&] { return !rt->recovery_in_progress; });
-    rt->publish_settle_cv.wait(state_lock, [&]
+    if (generation_moved)
+        check_fence_or_throw(admitted_generation);
+    if (identity_conflict)
+        throwCasWriteRetryLater(fmt::format(
+            "CAS namespace '{}': the cached runtime identity changed while publishing catalog life {}; "
+            "retry from a fresh catalog observation",
+            life.ns.string(), renderIncarnation(life.incarnation)));
+    return result;
+}
+
+std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireReadableRefTableRuntime(
+    const RootNamespace & ns)
+{
+    if (const auto current = lookupRefTableRuntime(ns))
     {
-        return rt->pending_snapshot_publishes.load(std::memory_order_acquire) == 0;
-    });
+        check_fence_or_throw(current->admitted_fence_generation);
+        if (current->catalog_life_invalidated.load(std::memory_order_acquire)
+            || current->superseded_by_remount.load(std::memory_order_acquire))
+            throwCasWriteRetryLater(fmt::format(
+                "CAS namespace '{}': its cached life was detached; retry against a fresh observation",
+                ns.string()));
+        return current;
+    }
 
-    if (!rt->catalog_life_invalidated.load(std::memory_order_acquire))
-        return;   /// another waiter already reset this same runtime
+    const uint64_t admitted_generation = fence_generation_fn();
+    check_fence_or_throw(admitted_generation);
+    const CasRefCatalog::Snapshot catalog = CasRefCatalog::read(backend, layout);
+    check_fence_or_throw(admitted_generation);
+    const auto it = std::find_if(catalog.catalog.entries.begin(), catalog.catalog.entries.end(),
+        [&](const CatalogEntry & entry) { return entry.ns == ns; });
+    if (it == catalog.catalog.entries.end() || it->state != NsState::Live)
+        return nullptr;
+    return acquireRefTableRuntime(
+        NamespaceLifeId::fromCatalogEntry(it->ns, it->incarnation), admitted_generation);
+}
 
-    rt->recovered = false;
-    rt->life.reset();
-    rt->state = RefTableState{};
-    rt->append_attempt.reset();
-    rt->lane_state = RefLaneState::Ready;
-    rt->last_epoch_seal.reset();
-    rt->recovery_restarts = 0;
-    rt->snapshot_budget = 0;
-    rt->removal_budget = 0;
-    rt->tail_count_since_snapshot.store(0, std::memory_order_relaxed);
-    rt->tail_bytes_since_snapshot.store(0, std::memory_order_relaxed);
-    rt->newest_snapshot_id.reset();
-    rt->base_snapshot_bytes.store(0, std::memory_order_relaxed);
-    rt->needs_stale_precommit_sweep = false;
-    rt->precommit_sweep_backoff_until_ms = 0;
-    rt->precommit_sweep_backoff_ms = 0;
-    rt->publish_backoff_until_ms = 0;
-    rt->publish_backoff_ms = 0;
-    rt->removal_admission_closed = false;
-    rt->catalog_life_invalidated.store(false, std::memory_order_release);
+std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireMutableRefTableRuntime(
+    const RootNamespace & ns)
+{
+    const NamespaceLifeId life = namespaceLife(ns);
+    if (const auto current = lookupRefTableRuntime(ns))
+    {
+        if (current->life == life)
+            return current;
+    }
+    const uint64_t admitted_generation = fence_generation_fn();
+    return acquireRefTableRuntime(life, admitted_generation);
 }
 
 void CasRefLedger::invalidateRemovedCatalogLife(const NamespaceLifeId & life)
@@ -553,22 +596,32 @@ void CasRefLedger::invalidateRemovedCatalogLife(const NamespaceLifeId & life)
     std::shared_ptr<RefTableRuntime> rt;
     {
         std::lock_guard lock(ref_queue_mutex);
-        const auto it = ref_tables.find(life.ns.string());
-        if (it == ref_tables.end())
+        const auto it = ref_name_slots.find(life.ns.string());
+        if (it == ref_name_slots.end())
             return;
-        rt = it->second;
+        rt = it->second.current;
+        if (!rt)
+            return;
     }
 
-    /// Do not call `getRefTableRuntime`: invalidation must neither materialize a cache entry nor run
-    /// the reset on GC's thread. Re-check the exact resident life while holding its state lock: a
-    /// delayed reconciliation for a predecessor must not invalidate a runtime already rebound to a
-    /// successor. Publishing this bit is sufficient; the next name-based caller joins every old user
-    /// and resets the SAME object before it can resolve through the catalog again.
+    /// Invalidation must neither materialize a cache entry nor perform catalog I/O on GC's thread.
+    /// Re-check the exact resident life while holding its state lock: a delayed reconciliation for a
+    /// predecessor must not invalidate a successor. Publishing this bit makes existing holders inert;
+    /// the slot is then detached and a later name-based caller may publish a distinct runtime.
     {
         std::lock_guard state_lock(rt->state_mutex);
-        if (!rt->life || *rt->life != life)
+        if (rt->life != life)
             return;
         rt->catalog_life_invalidated.store(true, std::memory_order_release);
+    }
+    {
+        /// Detach by POINTER identity, not by logical name. A concurrent fresh lookup may already
+        /// have installed a successor for the same name; a delayed predecessor invalidation must never
+        /// erase that successor's cache slot.
+        std::lock_guard queue_lock(ref_queue_mutex);
+        const auto it = ref_name_slots.find(life.ns.string());
+        if (it != ref_name_slots.end() && it->second.current == rt)
+            ref_name_slots.erase(it);
     }
     rt->cv.notify_all();
     rt->recovery_cv.notify_all();
@@ -582,39 +635,19 @@ void CasRefLedger::reconcileCatalogCut(const CasRefCatalog::Snapshot & catalog_c
     std::vector<std::shared_ptr<RefTableRuntime>> closed_runtimes;
     {
         std::lock_guard queue_lock(ref_queue_mutex);
-        for (const auto & [_, rt] : ref_tables)
-            if (rt->removal_admission_closed)
-                closed_runtimes.push_back(rt);
+        for (const auto & [_, slot] : ref_name_slots)
+            if (slot.current && slot.current->removal_admission_closed)
+                closed_runtimes.push_back(slot.current);
     }
 
     for (const auto & rt : closed_runtimes)
     {
-        std::optional<NamespaceLifeId> resident_life;
-        {
-            std::lock_guard state_lock(rt->state_mutex);
-            resident_life = rt->life;
-        }
-        if (!resident_life)
-            continue;
+        const NamespaceLifeId & resident_life = rt->life;
         const std::optional<NamespaceLifeId> catalog_life
-            = catalog_cut.life_index.resolve(resident_life->incarnation);
-        if (!catalog_life || *catalog_life != *resident_life)
-            invalidateRemovedCatalogLife(*resident_life);
+            = catalog_cut.life_index.resolve(resident_life.incarnation);
+        if (!catalog_life || *catalog_life != resident_life)
+            invalidateRemovedCatalogLife(resident_life);
     }
-}
-
-std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::pinRefTableRuntimeToLife(
-    const NamespaceLifeId & life)
-{
-    auto rt = getRefTableRuntime(life.ns);
-    std::lock_guard lock(rt->state_mutex);
-    if (rt->life && *rt->life != life)
-        throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "CAS namespace '{}': runtime is already pinned to incarnation {}, refusing exact-life "
-            "operation for incarnation {}",
-            life.ns.string(), renderIncarnation(rt->life->incarnation), renderIncarnation(life.incarnation));
-    rt->life = life;
-    return rt;
 }
 
 void CasRefLedger::checkRecoveryStillAdmitted(const RootNamespace & ns, RefTableRuntime & rt,
@@ -666,11 +699,9 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
     /// caller installs it. `recovery_in_progress` (not `state_mutex`) is what keeps a second caller for
     /// this same table from racing an independent walk -- see its doc comment.
     ///
-    /// `life` (Stage B, Task 4-C): `ensureRefTableRecovered` resolves and caches `rt.life` before this
-    /// walk ever runs, so every key this function builds is under the namespace's REAL catalog
-    /// incarnation, never the Stage-A sentinel.
-    chassert(rt.life);
-    const NamespaceLifeId life = *rt.life;
+    /// Runtime construction already fixed the exact catalog life, so every key this walk builds remains
+    /// under the predecessor even if the same logical name is concurrently rebound.
+    const NamespaceLifeId life = rt.life;
 
     /// ---- Step 2: the checkpoint ----
     /// `nullopt` means the namespace has published nothing yet (a birth whose `_ckpt` create did not
@@ -1035,7 +1066,8 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
         const RefCkpt contribution{.life_epoch = std::nullopt,
                                    .checkpoint_snapshot_id = std::nullopt,
                                    .last_epoch_seal = last_epoch_seal};
-        if (publishCkptContribution(life, contribution, admitted_generation) == CkptPublishOutcome::FencedOut)
+        if (publishCkptContribution(life, contribution, admitted_generation, check_fence_or_throw)
+            == CkptPublishOutcome::FencedOut)
             throwCasWriteRetryLater(fmt::format(
                 "CAS ref-table recovery for namespace '{}': the mount incarnation moved before the "
                 "checkpoint could record the epoch seal {}-{}; nothing was written and nothing is installed",
@@ -1202,7 +1234,8 @@ void CasRefLedger::ensureRefTableRecovered(const RootNamespace & ns, RefTableRun
     /// Captured for the WHOLE call, not per attempt, for the same reason: the transient-retry loop below
     /// exists for object-store blips, and a generation that moved is not one. The loop refuses to
     /// re-drive under a moved generation (below), so the budget is never burned on a doomed retry.
-    const uint64_t admitted_generation = fence_generation_fn();
+    const uint64_t admitted_generation = rt.admitted_fence_generation;
+    check_fence_or_throw(admitted_generation);
     /// The live writer epoch, likewise captured once: it decides WHICH epochs are dead and therefore what
     /// the walk may seal. Re-reading it mid-walk would let the boundary move under the decision.
     const uint64_t live_epoch = live_epoch_fn();
@@ -1217,43 +1250,10 @@ void CasRefLedger::ensureRefTableRecovered(const RootNamespace & ns, RefTableRun
     uint64_t recovery_retry_num = 0;
     bool vanish_brake_tripped = false;
     bool cancelled = false;
-    bool lifecycle_refusal = false;
     for (;;)
     {
         try
         {
-            /// ---- Step 0 (Stage B, spec INV-3): resolve this table's catalog life, ONCE per table-open ----
-            /// `rt.life` persists for this `RefTableRuntime`'s whole lifetime once set (a self-remount's
-            /// `quiesceRefTablesForRemount` is what ever produces a FRESH runtime, never this function),
-            /// so a `NeedsRecovery` re-recovery of the SAME runtime skips straight past this and re-walks
-            /// under the life it already resolved. Runs inside this try so a busy/stalled catalog reuses
-            /// the SAME transient-retry envelope as an object-store blip (`resolveNamespaceLife` throws
-            /// the retry-later class -- `NETWORK_ERROR` -- for exactly the cases worth backing off on:
-            /// a fenced-out attempt, or a `Creating` entry whose creator is not yet provably dead).
-            if (!rt.life)
-            {
-                lock.unlock();
-                /// Re-acquire before letting a `resolveNamespaceLife` failure unwind into the `catch`
-                /// below, which unconditionally re-locks (and, on the OUTER transient-retry path, calls
-                /// `lock.unlock()` again itself) -- same obligation, and the same shape, as the sleep's
-                /// try/catch further down this function.
-                std::optional<NamespaceLifeId> resolved;
-                try
-                {
-                    resolved = resolveNamespaceLife(ns, admitted_generation, live_epoch, &lifecycle_refusal);
-                }
-                catch (...)
-                {
-                    lock.lock();
-                    throw;
-                }
-                lock.lock();
-                /// Re-validate after the unlocked catalog I/O, exactly as every other unlocked window in
-                /// this function does before trusting what it learned there.
-                checkRecoveryStillAdmitted(ns, rt, cancelled);
-                rt.life = *resolved;
-            }
-
             std::optional<String> hole_detail;
             for (uint64_t attempt = 0; ; ++attempt)
             {
@@ -1344,7 +1344,7 @@ void CasRefLedger::ensureRefTableRecovered(const RootNamespace & ns, RefTableRun
             /// retry-later class (the caller should retry, against the FRESH incarnation), so without the
             /// latch this loop would read it as a transient blip and re-drive the very work the remount
             /// just stopped.
-            if (vanish_brake_tripped || cancelled || lifecycle_refusal || !isTransientRecoveryError(code))
+            if (vanish_brake_tripped || cancelled || !isTransientRecoveryError(code))
                 throw;   /// a latched terminal case, or a non-transient failure -- fail fast
 
             const uint64_t elapsed_ms = boot_ms_now_fn() - recovery_start_ms;
@@ -1408,49 +1408,6 @@ void CasRefLedger::ensureRefTableRecovered(const RootNamespace & ns, RefTableRun
     enforceRefTableCacheBudget(ns);
 }
 
-bool CasRefLedger::recoverRefTableIfNamespaceExists(const RootNamespace & ns, RefTableRuntime & rt)
-{
-    /// The non-minting difference is structural rather than a matter of ordering: recovery's step 0 mints
-    /// for an absent catalog entry, so a caller that must not mint cannot be allowed to reach it. It
-    /// cannot: either `rt.life` is already resolved (the warm steady state -- no catalog read at all), or
-    /// a catalog-only lookup answers first. An absent entry returns here, having written nothing and
-    /// without recovering.
-    ///
-    /// Setting `rt.life` from that lookup is also what makes the guarantee airtight rather than
-    /// probe-then-hope: with the field set, step 0's `if (!rt.life)` is false, so `resolveNamespaceLife`
-    /// is unreachable below even if the entry is concurrently removed between the lookup and the
-    /// recovery. The value is the one step 0 would have computed for that entry -- both take BOTH fields
-    /// from the same catalog entry (INV-3) -- so this is the same once-per-table-open resolution,
-    /// performed by whichever caller got there first.
-    {
-        std::unique_lock<std::mutex> lock(rt.state_mutex);
-        if (!rt.life)
-        {
-            /// Released for the catalog read, like every other I/O boundary in this file, and re-taken to
-            /// re-check `rt.life` -- a concurrent caller may have resolved it in the meantime, and the
-            /// first resolution wins rather than being overwritten.
-            lock.unlock();
-            const CasRefCatalog::Snapshot catalog = CasRefCatalog::read(backend, layout);
-            const auto entry_it = std::find_if(catalog.catalog.entries.begin(), catalog.catalog.entries.end(),
-                [&](const CatalogEntry & entry) { return entry.ns == ns; });
-            const std::optional<NamespaceLifeId> cataloged
-                = entry_it != catalog.catalog.entries.end() && entry_it->state == NsState::Live
-                ? std::optional<NamespaceLifeId>{NamespaceLifeId::fromCatalogEntry(entry_it->ns, entry_it->incarnation)}
-                : std::nullopt;
-            lock.lock();
-            if (!rt.life)
-            {
-                if (!cataloged)
-                    return false;
-                rt.life = *cataloged;
-            }
-        }
-    }
-
-    ensureRefTableRecovered(ns, rt);
-    return true;
-}
-
 void CasRefLedger::installRecoveryResult(RefTableRuntime & rt, RecoveryResult && result)
 {
     /// One place that seeds a recovered table's runtime, copying EVERY `RecoveryResult` field so the
@@ -1482,9 +1439,10 @@ void CasRefLedger::cancelRecoveriesAndAwaitQuiescence()
     std::vector<std::shared_ptr<RefTableRuntime>> tables;
     {
         std::lock_guard<std::mutex> qlock(ref_queue_mutex);
-        tables.reserve(ref_tables.size());
-        for (auto & [name, rt] : ref_tables)
-            tables.push_back(rt);
+        tables.reserve(ref_name_slots.size());
+        for (auto & [name, slot] : ref_name_slots)
+            if (slot.current)
+                tables.push_back(slot.current);
     }
 
     /// Publish the request to EVERY table first, then wait -- never table-by-table. Requesting and
@@ -1530,8 +1488,9 @@ void CasRefLedger::enforceRefTableCacheBudget(const RootNamespace & keep_ns)
         };
 
         uint64_t total = 0;
-        for (const auto & [name, rt] : ref_tables)
-            total += weightOf(*rt);
+        for (const auto & [name, slot] : ref_name_slots)
+            if (slot.current)
+                total += weightOf(*slot.current);
         if (total <= config.ref_table_cache_bytes)
             return;
 
@@ -1542,9 +1501,12 @@ void CasRefLedger::enforceRefTableCacheBudget(const RootNamespace & keep_ns)
         /// fetched this runtime keeps it non-evictable for as long as it holds the copy.
         struct Cand { String name; uint64_t tick; uint64_t weight; };
         std::vector<Cand> cands;
-        for (const auto & [name, rt] : ref_tables)
+        for (const auto & [name, slot] : ref_name_slots)
         {
             if (name == keep_ns.string())
+                continue;
+            const auto & rt = slot.current;
+            if (!rt)
                 continue;
             if (rt.use_count() != 1 || rt->leader_active || !rt->pending.empty())
                 continue;
@@ -1557,10 +1519,12 @@ void CasRefLedger::enforceRefTableCacheBudget(const RootNamespace & keep_ns)
         {
             if (total <= config.ref_table_cache_bytes)
                 break;
-            auto it = ref_tables.find(c.name);
-            if (it == ref_tables.end())
+            auto it = ref_name_slots.find(c.name);
+            if (it == ref_name_slots.end())
                 continue;
-            std::shared_ptr<RefTableRuntime> & rt = it->second;
+            std::shared_ptr<RefTableRuntime> & rt = it->second.current;
+            if (!rt)
+                continue;
             {
                 /// `use_count() == 1` guarantees no other thread holds the runtime, so this try_lock
                 /// cannot fail; the RAII scope releases `state_mutex` before `rt` is moved out. A wedged
@@ -1575,7 +1539,7 @@ void CasRefLedger::enforceRefTableCacheBudget(const RootNamespace & keep_ns)
                 continue;   /// re-check under the still-held ref_queue_mutex
             total -= c.weight;
             evicted.push_back(std::move(rt));   /// keep alive past the erase and lock release
-            ref_tables.erase(it);
+            ref_name_slots.erase(it);
             ProfileEvents::increment(ProfileEvents::CasRefTableEvictions);
         }
     }
@@ -1591,9 +1555,10 @@ void CasRefLedger::quiesceRefTablesForRemount()
     std::vector<std::shared_ptr<RefTableRuntime>> tables;
     {
         std::lock_guard<std::mutex> qlock(ref_queue_mutex);
-        tables.reserve(ref_tables.size());
-        for (auto & [name, rt] : ref_tables)
-            tables.push_back(rt);
+        tables.reserve(ref_name_slots.size());
+        for (auto & [name, slot] : ref_name_slots)
+            if (slot.current)
+                tables.push_back(slot.current);
     }
 
     /// Wait for every in-flight background publisher to finish so none is mid-PUT when its runtime is
@@ -1620,14 +1585,17 @@ void CasRefLedger::quiesceRefTablesForRemount()
     std::vector<std::shared_ptr<RefTableRuntime>> detached;
     {
         std::lock_guard<std::mutex> qlock(ref_queue_mutex);
-        detached.reserve(ref_tables.size());
-        for (auto & [name, rt] : ref_tables)
+        detached.reserve(ref_name_slots.size());
+        for (auto & [name, slot] : ref_name_slots)
         {
+            auto & rt = slot.current;
+            if (!rt)
+                continue;
             rt->superseded_by_remount.store(true, std::memory_order_release);
             rt->cv.notify_all();   /// wake any waiter so it re-leads and fails closed against the flag
             detached.push_back(rt);
         }
-        ref_tables.clear();
+        ref_name_slots.clear();
     }
     /// `detached` releases the map's references here (with no lock held); each runtime lives on only as
     /// long as an in-flight leader/caller still holds it.
@@ -1636,43 +1604,52 @@ void CasRefLedger::quiesceRefTablesForRemount()
 
 uint64_t CasRefLedger::refRecoveryRestartsForTest(const RootNamespace & ns)
 {
-    const auto rt = getRefTableRuntime(ns);
-    ensureRefTableRecovered(ns, *rt);
+    const auto rt = lookupRefTableRuntime(ns);
+    if (!rt)
+        return 0;
     std::lock_guard lock(rt->state_mutex);
     return rt->recovery_restarts;
 }
 
 bool CasRefLedger::refLaneWedgedForTest(const RootNamespace & ns)
 {
-    const auto rt = getRefTableRuntime(ns);
+    const auto rt = lookupRefTableRuntime(ns);
+    if (!rt)
+        return false;
     std::lock_guard lock(rt->state_mutex);
     return rt->lane_state == RefLaneState::Wedged;
 }
 
 String CasRefLedger::wedgedKeyForTest(const RootNamespace & ns)
 {
-    const auto rt = getRefTableRuntime(ns);
+    const auto rt = lookupRefTableRuntime(ns);
+    if (!rt)
+        return {};
     std::lock_guard lock(rt->state_mutex);
     return rt->append_attempt ? rt->append_attempt->key : String{};
 }
 
 uint64_t CasRefLedger::wedgedAdmittedGenerationForTest(const RootNamespace & ns)
 {
-    const auto rt = getRefTableRuntime(ns);
+    const auto rt = lookupRefTableRuntime(ns);
+    if (!rt)
+        return 0;
     std::lock_guard lock(rt->state_mutex);
     return rt->append_attempt ? rt->append_attempt->admitted_fence_generation : 0;
 }
 
 std::optional<RefTxnId> CasRefLedger::lastEpochSealForTest(const RootNamespace & ns)
 {
-    const auto rt = getRefTableRuntime(ns);
+    const auto rt = lookupRefTableRuntime(ns);
+    if (!rt)
+        return std::nullopt;
     std::lock_guard lock(rt->state_mutex);
     return rt->last_epoch_seal;
 }
 
 void CasRefLedger::setLastEpochSealForTest(const RootNamespace & ns, const std::optional<RefTxnId> & seal)
 {
-    const auto rt = getRefTableRuntime(ns);
+    const auto rt = acquireMutableRefTableRuntime(ns);
     ensureRefTableRecovered(ns, *rt);
     std::lock_guard lock(rt->state_mutex);
     rt->last_epoch_seal = seal;
@@ -1682,7 +1659,7 @@ void CasRefLedger::forceWedgeForTest(const RootNamespace & ns, uint64_t writer_e
                               const String & key, const String & bytes,
                               std::optional<uint64_t> admitted_generation)
 {
-    const auto rt = getRefTableRuntime(ns);
+    const auto rt = acquireMutableRefTableRuntime(ns);
     ensureRefTableRecovered(ns, *rt);
     /// Read outside `state_mutex`: it is an atomic load on the mount runtime, and taking it here keeps
     /// the seam's default identical to what a wedge born at this instant would carry.
@@ -1694,15 +1671,18 @@ void CasRefLedger::forceWedgeForTest(const RootNamespace & ns, uint64_t writer_e
 
 RefLaneState CasRefLedger::laneStateForTest(const RootNamespace & ns)
 {
-    const auto rt = getRefTableRuntime(ns);
+    const auto rt = lookupRefTableRuntime(ns);
+    if (!rt)
+        return RefLaneState::Closed;
     std::lock_guard lock(rt->state_mutex);
     return rt->lane_state;
 }
 
 bool CasRefLedger::needsStalePrecommitSweepForTest(const RootNamespace & ns)
 {
-    const auto rt = getRefTableRuntime(ns);
-    ensureRefTableRecovered(ns, *rt);
+    const auto rt = lookupRefTableRuntime(ns);
+    if (!rt)
+        return false;
     std::lock_guard lock(rt->state_mutex);
     return rt->needs_stale_precommit_sweep;
 }
@@ -1713,9 +1693,10 @@ size_t CasRefLedger::wedgedRefLaneCount()
     std::vector<std::shared_ptr<RefTableRuntime>> runtimes;
     {
         std::lock_guard<std::mutex> g(ref_queue_mutex);
-        runtimes.reserve(ref_tables.size());
-        for (const auto & [_, rt] : ref_tables)
-            runtimes.push_back(rt);
+        runtimes.reserve(ref_name_slots.size());
+        for (const auto & [_, slot] : ref_name_slots)
+            if (slot.current)
+                runtimes.push_back(slot.current);
     }
     size_t wedged = 0;
     for (const auto & rt : runtimes)
@@ -1739,9 +1720,10 @@ bool CasRefLedger::drainRefLanesForShutdown(uint64_t wait_budget_ms)
     std::vector<std::shared_ptr<RefTableRuntime>> runtimes;
     {
         std::lock_guard<std::mutex> g(ref_queue_mutex);
-        runtimes.reserve(ref_tables.size());
-        for (const auto & [_, rt] : ref_tables)
-            runtimes.push_back(rt);
+        runtimes.reserve(ref_name_slots.size());
+        for (const auto & [_, slot] : ref_name_slots)
+            if (slot.current)
+                runtimes.push_back(slot.current);
     }
 
     /// Wait for every table's queue to go idle (no pending item, no active leader), bounded overall by
@@ -1793,7 +1775,19 @@ RefTxnId CasRefLedger::appendRefOps(const RootNamespace & ns, MutationScope scop
                              RootMutationOrigin origin, RootMutationKind kind,
                              bool skip_stale_precommit_sweep)
 {
-    const auto rt = getRefTableRuntime(ns);
+    const auto rt = acquireMutableRefTableRuntime(ns);
+    if (append_after_runtime_capture_hook_for_test)
+        append_after_runtime_capture_hook_for_test();
+    return appendRefOpsOnRuntime(
+        ns, rt, std::move(scope), std::move(build_ops), origin, kind, skip_stale_precommit_sweep);
+}
+
+
+RefTxnId CasRefLedger::appendRefOpsOnRuntime(
+    const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt, MutationScope scope,
+    std::function<std::vector<RefOp>(const RefTableState &)> build_ops,
+    RootMutationOrigin origin, RootMutationKind kind, bool skip_stale_precommit_sweep)
+{
     const auto refuse_if_removing = [&]
     {
         std::lock_guard<std::mutex> lock(ref_queue_mutex);
@@ -2939,7 +2933,12 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
         }
         rt->cv.notify_all();
     };
-    const auto fence_ok = [this, &rt] { return fence_ok_fn() && !rt->superseded_by_remount.load(std::memory_order_acquire); };
+    const auto fence_ok = [this, &rt]
+    {
+        return fence_ok_fn()
+            && !rt->catalog_life_invalidated.load(std::memory_order_acquire)
+            && !rt->superseded_by_remount.load(std::memory_order_acquire);
+    };
 
     const bool positive_append = std::any_of(chunk_ops.begin(), chunk_ops.end(), [](const RefOp & op)
     {
@@ -2955,14 +2954,10 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
     {
         try
         {
-            const uint64_t admitted_generation = fence_generation_fn();
+            const uint64_t admitted_generation = rt->admitted_fence_generation;
             const CasRefCatalog::Snapshot catalog = CasRefCatalog::read(backend, layout);
             check_fence_or_throw(admitted_generation);
-            const NamespaceLifeId life = [&]
-            {
-                std::lock_guard state_lock(rt->state_mutex);
-                return lifeUnderLock(ns, *rt);
-            }();
+            const NamespaceLifeId & life = rt->life;
             const auto entry_it = std::find_if(catalog.catalog.entries.begin(), catalog.catalog.entries.end(),
                 [&](const CatalogEntry & entry)
                 {
@@ -3093,7 +3088,7 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
         std::lock_guard lock(rt->state_mutex);
         state_snapshot.emplace(rt->state);
         id = allocateRefTxnId(*rt);
-        admitted_fence_generation = fence_generation_fn();
+        admitted_fence_generation = rt->admitted_fence_generation;
         last_epoch_seal = rt->last_epoch_seal;
     }
     /// INV-2's chain link, stamped exactly where the grammar requires it: sequence 1 of an epoch above
@@ -3123,10 +3118,9 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
     /// for a malformed namespace -- unreachable here, since a mounted table's namespace already passed
     /// that check, but the list is not meant to read closed.
     std::optional<PreparedRefChunk> prepared;
-    chassert(rt->life);
     try
     {
-        prepared.emplace(prepareRefChunk(layout, *rt->life, std::move(*state_snapshot), id, chain_link,
+        prepared.emplace(prepareRefChunk(layout, rt->life, std::move(*state_snapshot), id, chain_link,
                                          chunk_ops, admitted_fence_generation));
     }
     catch (...)
@@ -3180,8 +3174,9 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
     {
         try
         {
-            if (publishCkptContribution(*rt->life, *prepared->birth_contribution,
-                                        admitted_fence_generation) == CkptPublishOutcome::FencedOut)
+            if (publishCkptContribution(rt->life, *prepared->birth_contribution,
+                                        admitted_fence_generation, check_fence_or_throw)
+                == CkptPublishOutcome::FencedOut)
             {
                 complete_error(chunk_survivors, makeCasWriteRetryLaterExceptionPtr(fmt::format(
                     "CAS ref-log append for namespace '{}': the mount fence moved while creating the "
@@ -3597,7 +3592,9 @@ bool CasRefLedger::admitSnapshotPublishUnderStateLock(RefTableRuntime & rt)
     /// table, and the settlement re-evaluation can decrement-and-re-admit without the count transiently
     /// reaching zero.
     const uint64_t now = boot_ms_now_fn();
-    if (rt.state.getLifecycle() == RefLifecycle::Live
+    if (!rt.catalog_life_invalidated.load(std::memory_order_acquire)
+        && !rt.superseded_by_remount.load(std::memory_order_acquire)
+        && rt.state.getLifecycle() == RefLifecycle::Live
         /// Single-in-flight gate: at most one background publish per table.
         && rt.pending_snapshot_publishes.load(std::memory_order_relaxed) == 0
         /// Backoff deadline: after a non-Committed publish, a saturated backend is not re-dispatched
@@ -3638,7 +3635,7 @@ void CasRefLedger::dispatchSnapshotPublisher(const RootNamespace & ns, const std
             setThreadName(ThreadName::CAS_REF_SNAPSHOT_PUBLISH);
             try
             {
-                trySnapshotPublishOnce(ns);
+                trySnapshotPublishOnceOnRuntime(ns, rt);
             }
             catch (...)
             {
@@ -3731,22 +3728,27 @@ void CasRefLedger::resetPublishBackoff(RefTableRuntime & rt)
 
 void CasRefLedger::waitForSnapshotPublishSettleForTest(const RootNamespace & ns)
 {
-    const auto rt = getRefTableRuntime(ns);
+    const auto rt = lookupRefTableRuntime(ns);
+    if (!rt)
+        return;
     std::unique_lock lock(rt->state_mutex);
     rt->publish_settle_cv.wait(lock, [&] { return rt->pending_snapshot_publishes.load(std::memory_order_relaxed) == 0; });
 }
 
 int CasRefLedger::pendingSnapshotPublishesForTest(const RootNamespace & ns)
 {
-    const auto rt = getRefTableRuntime(ns);
+    const auto rt = lookupRefTableRuntime(ns);
+    if (!rt)
+        return 0;
     std::lock_guard lock(rt->state_mutex);
     return rt->pending_snapshot_publishes.load(std::memory_order_relaxed);
 }
 
 std::optional<RefTxnId> CasRefLedger::newestPublishedSnapshotIdForTest(const RootNamespace & ns)
 {
-    const auto rt = getRefTableRuntime(ns);
-    ensureRefTableRecovered(ns, *rt);
+    const auto rt = lookupRefTableRuntime(ns);
+    if (!rt)
+        return std::nullopt;
     std::lock_guard lock(rt->state_mutex);
     return rt->newest_snapshot_id;
 }
@@ -3754,43 +3756,47 @@ std::optional<RefTxnId> CasRefLedger::newestPublishedSnapshotIdForTest(const Roo
 bool CasRefLedger::refRecoveryCancelRequestedForTest(const RootNamespace & ns)
 {
     std::lock_guard<std::mutex> qlock(ref_queue_mutex);
-    const auto it = ref_tables.find(ns.string());
-    return it != ref_tables.end() && it->second->recovery_cancel_requested.load(std::memory_order_acquire);
+    const auto it = ref_name_slots.find(ns.string());
+    return it != ref_name_slots.end() && it->second.current
+        && it->second.current->recovery_cancel_requested.load(std::memory_order_acquire);
 }
 
 bool CasRefLedger::refTableRecoveredForTest(const RootNamespace & ns)
 {
-    /// Deliberately does NOT call `ensureRefTableRecovered`, unlike every sibling seam: the fail-closed
-    /// tests ask "did that refused recovery install anything", and a seam that recovered on demand would
-    /// answer its own question with a yes.
+    /// Like every observational seam, deliberately does not recover: the fail-closed tests ask "did that
+    /// refused recovery install anything", and an observer that recovered on demand would answer its own
+    /// question with a yes.
     std::lock_guard<std::mutex> qlock(ref_queue_mutex);
-    const auto it = ref_tables.find(ns.string());
-    if (it == ref_tables.end())
+    const auto it = ref_name_slots.find(ns.string());
+    if (it == ref_name_slots.end() || !it->second.current)
         return false;
-    std::lock_guard lock(it->second->state_mutex);
-    return it->second->recovered;
+    std::lock_guard lock(it->second.current->state_mutex);
+    return it->second.current->recovered;
 }
 
 size_t CasRefLedger::tailSinceSnapshotCountForTest(const RootNamespace & ns)
 {
-    const auto rt = getRefTableRuntime(ns);
-    ensureRefTableRecovered(ns, *rt);
+    const auto rt = lookupRefTableRuntime(ns);
+    if (!rt)
+        return 0;
     std::lock_guard lock(rt->state_mutex);
     return rt->tail_count_since_snapshot.load(std::memory_order_relaxed);
 }
 
 size_t CasRefLedger::committedOverlayEntriesForTest(const RootNamespace & ns)
 {
-    const auto rt = getRefTableRuntime(ns);
-    ensureRefTableRecovered(ns, *rt);
+    const auto rt = lookupRefTableRuntime(ns);
+    if (!rt)
+        return 0;
     std::lock_guard lock(rt->state_mutex);
     return rt->state.getCommitted().overlayEntriesForTest();
 }
 
 std::set<std::pair<String, ManifestRef>> CasRefLedger::livePrecommitsForTest(const RootNamespace & ns)
 {
-    const auto rt = getRefTableRuntime(ns);
-    ensureRefTableRecovered(ns, *rt);
+    const auto rt = lookupRefTableRuntime(ns);
+    if (!rt)
+        return {};
     std::lock_guard lock(rt->state_mutex);
     return rt->state.getPrecommits();
 }
@@ -3821,14 +3827,15 @@ void clampedCounterSub(std::atomic<uint64_t> & counter, uint64_t amount)
 
 
 CkptPublishOutcome CasRefLedger::publishCkptContribution(const NamespaceLifeId & life, const RefCkpt & contribution,
-                                                         uint64_t admitted_generation)
+                                                         uint64_t admitted_generation,
+                                                         const std::function<void(uint64_t)> & check_admission)
 {
     /// The retry window is the SAME budget every other CAS operation of this ledger rides, measured on
     /// the ledger's own injectable boot clock -- so a test drives the exhaustion arm without sleeping,
     /// and a VM suspend cannot shorten it.
     const CkptDeadline deadline{boot_ms_now_fn, boot_ms_now_fn() + cas_request_budget.operation_deadline_ms};
-    const CkptPublishOutcome outcome = publishCkpt(backend, layout, life, contribution, admitted_generation,
-                                                   check_fence_or_throw, deadline);
+    const CkptPublishOutcome outcome = publishCkpt(
+        backend, layout, life, contribution, admitted_generation, check_admission, deadline);
     if (outcome == CkptPublishOutcome::Published)
         ProfileEvents::increment(ProfileEvents::CasRefCkptPublished);
     else if (outcome == CkptPublishOutcome::IdenticalSkip)
@@ -3838,14 +3845,28 @@ CkptPublishOutcome CasRefLedger::publishCkptContribution(const NamespaceLifeId &
 
 bool CasRefLedger::trySnapshotPublishOnce(const RootNamespace & ns)
 {
-    const auto rt = getRefTableRuntime(ns);
+    const auto rt = acquireMutableRefTableRuntime(ns);
+    return trySnapshotPublishOnceOnRuntime(ns, rt);
+}
+
+
+bool CasRefLedger::trySnapshotPublishOnceOnRuntime(
+    const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt)
+{
     ensureRefTableRecovered(ns, *rt);
 
     /// This attempt's ADMISSION token, captured once, before any of its I/O: which mount incarnation
     /// allowed this publish. It is presented back on every `_ckpt` CAS attempt below (spec §3's
     /// recheck discipline -- the same value at every site), so a publish admitted under an incarnation
     /// that has since been replaced can advance nothing.
-    const uint64_t admitted_generation = fence_generation_fn();
+    const uint64_t admitted_generation = rt->admitted_fence_generation;
+    const auto runtime_still_admitted = [this, &rt, admitted_generation]
+    {
+        return !rt->catalog_life_invalidated.load(std::memory_order_acquire)
+            && !rt->superseded_by_remount.load(std::memory_order_acquire)
+            && fence_ok_fn()
+            && fence_generation_fn() == admitted_generation;
+    };
 
     /// ONE copy of the live state, at a transaction boundary -- no
     /// replay, no per-entry retention. The tail counters are captured in the SAME critical section so
@@ -3884,6 +3905,20 @@ bool CasRefLedger::trySnapshotPublishOnce(const RootNamespace & ns)
         return false;
     }
 
+    if (snapshot_after_capture_hook_for_test)
+        snapshot_after_capture_hook_for_test();
+
+    /// The candidate holds shared COW bases, so even this stale-runtime exit must release it under the
+    /// same mutex that protects materialization. More importantly, this is the last test-only pause
+    /// before the first durable effect: retirement/remount can invalidate the captured runtime while it
+    /// is paused, and the old holder then becomes inert instead of resolving the name to a successor.
+    if (!runtime_still_admitted())
+    {
+        std::lock_guard lock(rt->state_mutex);
+        candidate_state = RefTableState{};
+        return false;
+    }
+
     const RefTableSnapshot snap = snapshotOf(candidate_state, ns.string());
 
     /// `candidate_state` is a COW copy that SHARES `rt->state`'s committed/owned-manifest bases. It is
@@ -3916,10 +3951,9 @@ bool CasRefLedger::trySnapshotPublishOnce(const RootNamespace & ns)
         advancePublishBackoff(*rt);
         return false;
     }
-    chassert(rt->life);
-    const String key = layout.refSnapshotKey(*rt->life, candidate_x);
-    const auto fence_ok = [this] { return fence_ok_fn(); };
-    const CasWriteOutcome outcome = ref_request_controller->putIfAbsentControlled(key, bytes, fence_ok);
+    const String key = layout.refSnapshotKey(rt->life, candidate_x);
+    const CasWriteOutcome outcome
+        = ref_request_controller->putIfAbsentControlled(key, bytes, runtime_still_admitted);
     if (outcome != CasWriteOutcome::Committed)
     {
         /// DefiniteFailure/Unresolved: DO NOT prune (no durable covering snapshot -- pruning the tail
@@ -3950,12 +3984,26 @@ bool CasRefLedger::trySnapshotPublishOnce(const RootNamespace & ns)
     /// later publish for it -- while the checkpoint still pointed below it, leaving recovery replaying
     /// from an older base with nothing scheduled to fix it.
     bool ckpt_advanced = false;
+    if (!runtime_still_admitted())
+        return false;
+    const auto check_runtime_admission = [this, &rt](uint64_t generation)
+    {
+        if (snapshot_before_ckpt_cas_hook_for_test)
+            snapshot_before_ckpt_cas_hook_for_test();
+        check_fence_or_throw(generation);
+        if (rt->catalog_life_invalidated.load(std::memory_order_acquire)
+            || rt->superseded_by_remount.load(std::memory_order_acquire))
+            throwCasWriteRetryLater(fmt::format(
+                "CAS namespace '{}': its captured runtime was retired before checkpoint publication",
+                rt->life.ns.string()));
+    };
     try
     {
-        ckpt_advanced = publishCkptContribution(*rt->life, RefCkpt{.life_epoch = std::nullopt,
+        ckpt_advanced = publishCkptContribution(rt->life, RefCkpt{.life_epoch = std::nullopt,
                                                             .checkpoint_snapshot_id = candidate_x,
                                                             .last_epoch_seal = std::nullopt},
-                                                admitted_generation) != CkptPublishOutcome::FencedOut;
+                                                admitted_generation,
+                                                check_runtime_admission) != CkptPublishOutcome::FencedOut;
     }
     catch (...)
     {
@@ -3978,6 +4026,8 @@ bool CasRefLedger::trySnapshotPublishOnce(const RootNamespace & ns)
 
     {
         std::lock_guard lock(rt->state_mutex);
+        if (!runtime_still_admitted())
+            return false;
         /// A durable publish clears any backoff: progress was made this attempt (even if the
         /// monotonic guard below skips the in-memory adoption because a newer snapshot already won).
         resetPublishBackoff(*rt);
@@ -4265,102 +4315,75 @@ void CasRefLedger::updateRefPublishedAt(const RootNamespace & ns, const String &
 }
 
 
-NamespaceLifeId CasRefLedger::lifeUnderLock(const RootNamespace & ns, const RefTableRuntime & rt) const
-{
-    /// `ensureRefTableRecovered` resolves `life` before it walks anything and never clears it, so a
-    /// runtime that returned from it without a life is a broken invariant, not a state to work around.
-    /// A real throw rather than a `chassert`: it must fail closed in release too, because the
-    /// alternative is naming a key under an unresolved identity.
-    if (!rt.life)
-        throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "CAS namespace '{}': recovery completed without resolving a catalog life", ns.string());
-    return *rt.life;
-}
-
 NamespaceLifeId CasRefLedger::namespaceLife(const RootNamespace & ns)
 {
-    const auto rt = getRefTableRuntime(ns);
-    bool removal_closed = false;
+    auto rt = lookupRefTableRuntime(ns);
+    if (rt)
     {
-        std::lock_guard queue_lock(ref_queue_mutex);
-        removal_closed = rt->removal_admission_closed;
-    }
-    if (removal_closed)
-    {
-        /// A prior GC may have committed the exact erase but lost its response or failed its
-        /// resolution read. Reconcile this name through a complete fresh catalog before honoring the
-        /// cached close bit; absence/replacement invalidates and resets in place, while the same exact
-        /// `Removing` life remains closed.
-        reconcileCatalogCut(CasRefCatalog::read(backend, layout));
-        prepareInvalidatedRuntimeForReuse(rt);
-    }
-    const auto refuse_if_removing = [&]
-    {
-        std::lock_guard<std::mutex> queue_lock(ref_queue_mutex);
-        if (rt->removal_admission_closed)
-            throwCasWriteRetryLater(fmt::format(
-                "CAS namespace '{}' is Removing: creation waits for its terminal fold and catalog "
-                "removal to complete; retry later", ns.string()));
-    };
-    refuse_if_removing();
-
-    /// Classify an unresolved catalog row before entering recovery. A recovery failure is normally
-    /// retried inside its bounded transient-I/O loop; lifecycle refusal is not an object-store outage
-    /// and must return immediately. A `Live` observation can pin the same physical handle recovery
-    /// would resolve. A `Creating` observation gets exactly one resolution attempt here: a terminal
-    /// foreign creator is reconciled normally, while a still-live creator returns retry-later once
-    /// instead of spending the recovery retry budget repeating the same fence decision. Only an absent
-    /// row reaches recovery unresolved, where the ordinary catalog-first birth path owns it.
-    {
-        std::unique_lock state_lock(rt->state_mutex);
-        if (!rt->life)
+        check_fence_or_throw(rt->admitted_fence_generation);
+        bool removal_closed = false;
         {
-            state_lock.unlock();
-            const CasRefCatalog::Snapshot catalog = CasRefCatalog::read(backend, layout);
-            const auto entry_it = std::find_if(catalog.catalog.entries.begin(), catalog.catalog.entries.end(),
-                [&](const CatalogEntry & entry) { return entry.ns == ns; });
-            if (entry_it != catalog.catalog.entries.end() && entry_it->state == NsState::Removing)
+            std::lock_guard queue_lock(ref_queue_mutex);
+            removal_closed = rt->removal_admission_closed;
+        }
+        if (removal_closed)
+        {
+            /// A lost erase response can leave only the detached predecessor's close bit. Reconcile
+            /// before refusing so an absent/replaced row frees the logical name without rebinding it.
+            reconcileCatalogCut(CasRefCatalog::read(backend, layout));
+            const auto refreshed = lookupRefTableRuntime(ns);
+            if (refreshed == rt)
                 throwCasWriteRetryLater(fmt::format(
                     "CAS namespace '{}' is Removing: creation waits for its terminal fold and catalog "
                     "removal to complete; retry later", ns.string()));
-            std::optional<NamespaceLifeId> resolved_creating;
-            if (entry_it != catalog.catalog.entries.end() && entry_it->state == NsState::Creating)
-            {
-                const uint64_t admitted_generation = fence_generation_fn();
-                resolved_creating = resolveNamespaceLife(ns, admitted_generation, live_epoch_fn());
-                check_fence_or_throw(admitted_generation);
-            }
-            state_lock.lock();
-            if (!rt->life && entry_it != catalog.catalog.entries.end() && entry_it->state == NsState::Live)
-                rt->life = NamespaceLifeId::fromCatalogEntry(entry_it->ns, entry_it->incarnation);
-            if (!rt->life && resolved_creating)
-                rt->life = *resolved_creating;
+            rt = refreshed;
+        }
+        if (rt)
+        {
+            ensureRefTableRecovered(ns, *rt);
+            return rt->life;
         }
     }
-    /// MINTS when the catalog names no entry, via recovery's step 0 -- deliberately, and only here: a
-    /// write may legitimately be a namespace's birth.
+
+    /// A cold mutation observes or births the durable identity before allocating any local state.
+    const uint64_t admitted_generation = fence_generation_fn();
+    check_fence_or_throw(admitted_generation);
+    const CasRefCatalog::Snapshot catalog = CasRefCatalog::read(backend, layout);
+    check_fence_or_throw(admitted_generation);
+    const auto entry_it = std::find_if(catalog.catalog.entries.begin(), catalog.catalog.entries.end(),
+        [&](const CatalogEntry & entry) { return entry.ns == ns; });
+    if (entry_it != catalog.catalog.entries.end() && entry_it->state == NsState::Removing)
+        throwCasWriteRetryLater(fmt::format(
+            "CAS namespace '{}' is Removing: creation waits for its terminal fold and catalog "
+            "removal to complete; retry later", ns.string()));
+
+    const NamespaceLifeId life
+        = entry_it != catalog.catalog.entries.end() && entry_it->state == NsState::Live
+        ? NamespaceLifeId::fromCatalogEntry(entry_it->ns, entry_it->incarnation)
+        : resolveNamespaceLife(ns, admitted_generation, live_epoch_fn());
+    check_fence_or_throw(admitted_generation);
+    rt = acquireRefTableRuntime(life, admitted_generation);
     ensureRefTableRecovered(ns, *rt);
-    refuse_if_removing();
-    std::lock_guard<std::mutex> lock(rt->state_mutex);
-    return lifeUnderLock(ns, *rt);
+    return rt->life;
 }
 
 std::optional<NamespaceLifeId> CasRefLedger::namespaceFilesLifeIfReadable(const RootNamespace & ns)
 {
-    const auto rt = getRefTableRuntime(ns);
+    const auto rt = acquireReadableRefTableRuntime(ns);
 
     /// A namespace the catalog does not name has no files to read, and a read or an unlink is the wrong
     /// event to bring one into existence on. Fresh resolution admits only a catalog `Live` row;
     /// `Creating`, `Removing` and absent all answer absent without recovery or mutation.
-    if (!recoverRefTableIfNamespaceExists(ns, *rt))
+    if (!rt)
         return std::nullopt;
+    ensureRefTableRecovered(ns, *rt);
 
     std::lock_guard<std::mutex> lock(rt->state_mutex);
     /// A stale already-held runtime may have applied the terminal before catalog invalidation reaches
     /// it. Preserve the stated stale-or-not-found contract by hiding that terminal view.
     if (rt->state.getLifecycle() != RefLifecycle::Live && rt->state.getRemoveTxnId().has_value())
         return std::nullopt;
-    return lifeUnderLock(ns, *rt);
+    return rt->life;
 }
 
 
@@ -4418,14 +4441,11 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
         }
     }
 
-    const auto rt = expected_incarnation
-        ? pinRefTableRuntimeToLife(NamespaceLifeId::fromCatalogEntry(ns, *expected_incarnation))
-        : getRefTableRuntime(ns);
-    /// A namespace the catalog does not name has nothing to remove, and removing from it must not be what
-    /// creates it -- which is why the answer is here and not in the lifecycle check below: that check runs
-    /// on recovered state, and reaching recovered state is itself the birth.
-    if (!recoverRefTableIfNamespaceExists(ns, *rt))
-        return {};
+    const NamespaceLifeId observed_life
+        = NamespaceLifeId::fromCatalogEntry(initial_it->ns, initial_it->incarnation);
+    const uint64_t runtime_generation = fence_generation_fn();
+    const auto rt = acquireRefTableRuntime(observed_life, runtime_generation);
+    ensureRefTableRecovered(ns, *rt);
     {
         /// "Repeated API removal observes the cached Removed state and returns success without
         /// appending a second transaction." A namespace that exists in the catalog but whose ref state
@@ -4463,11 +4483,7 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
                 "CAS namespace '{}': its catalog row disappeared before removal admission closed",
                 ns.string()));
 
-        const NamespaceLifeId life = [&]
-        {
-            std::lock_guard state_lock(rt->state_mutex);
-            return lifeUnderLock(ns, *rt);
-        }();
+        const NamespaceLifeId & life = rt->life;
         if (entry_it->incarnation != life.incarnation)
             throwCasWriteRetryLater(fmt::format(
                 "CAS namespace '{}': cached life {} differs from catalog life {} while beginning removal",
@@ -4551,7 +4567,7 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
     /// `build_ops` (a wedge resolving under a resumed leader) simply overwrites it with the final
     /// durable transaction's true counts.
     DropNamespaceStats stats;
-    appendRefOps(ns, MutationScope::wholeShard(),
+    appendRefOpsOnRuntime(ns, rt, MutationScope::wholeShard(),
         [&](const RefTableState & state) -> std::vector<RefOp>
         {
             if (state.getLifecycle() != RefLifecycle::Live)

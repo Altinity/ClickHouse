@@ -209,7 +209,7 @@ struct PoolConfig
     uint64_t precommit_sweep_backoff_max_ms = 30000;
 
     /// resident-memory ceiling for the writer's
-    /// whole-table ref cache (`Pool::ref_tables`). This implementation has no row overlay, so eviction is
+    /// whole-table ref cache (`CasRefLedger::ref_name_slots`). This implementation has no row overlay, so eviction is
     /// WHOLE-TABLE: when the summed estimated weight of cached tables exceeds this, whole tables are
     /// dropped (never rows) and the next touch re-recovers them from the durable snapshot+log objects
     /// Evicting the table drops the entire object; the next access repeats
@@ -793,8 +793,8 @@ private:
 
 
 public:
-    /// Test seams: observe recovery-restart counting and wedge state without a private-member
-    /// friend hack. Recovers the table (like any real read) if not already cached.
+    /// Test seams: observe resident recovery/wedge state without a private-member friend hack. These
+    /// observers never resolve a name, recover a table, or materialize a runtime.
     uint64_t refRecoveryRestartsForTest(const RootNamespace & ns);
     bool refLaneWedgedForTest(const RootNamespace & ns);
     /// (I1) The object key of the current wedge for `ns`, or empty when the lane is not wedged -- lets a
@@ -818,9 +818,8 @@ public:
     /// Test seam: this table's append lane state.
     RefLaneState laneStateForTest(const RootNamespace & ns);
 
-    /// Whether this table still owes a stale-precommit sweep (armed by recovery; re-armed by a
-    /// failed attempt; cleared permanently only by a verified-clean sweep). Recovers the table (like any
-    /// real read) if not already cached.
+    /// Whether this resident table still owes a stale-precommit sweep (armed by recovery; re-armed by a
+    /// failed attempt; cleared permanently only by a verified-clean sweep).
     bool needsStalePrecommitSweepForTest(const RootNamespace & ns);
 
     /// Number of ref-append lanes currently wedged (an uncertain PUT exhausted its retry budget and
@@ -834,12 +833,12 @@ public:
     /// `trySnapshotPublishOnce` directly instead.
     void waitForSnapshotPublishSettleForTest(const RootNamespace & ns);
 
-    /// test seam: the count of in-flight background snapshot-publish attempts for `ns` (the
-    /// single-in-flight gate holds this at <= 1). Recovers the table (idempotent) if not already cached.
+    /// test seam: the count of in-flight background snapshot-publish attempts for resident `ns` (the
+    /// single-in-flight gate holds this at <= 1).
     int pendingSnapshotPublishesForTest(const RootNamespace & ns);
 
-    /// test seam: the id of the newest snapshot this runtime has confirmed durable (recovered
-    /// or published), or `nullopt` if none. Recovers the table (idempotent) if not already cached.
+    /// test seam: the id of the newest snapshot this resident runtime has confirmed durable (recovered
+    /// or published), or `nullopt` if none.
     std::optional<RefTxnId> newestPublishedSnapshotIdForTest(const RootNamespace & ns);
 
     /// test seam: whether `ns` has a RECOVERED cached runtime, WITHOUT forcing a recovery to find out.
@@ -872,6 +871,14 @@ public:
     /// Test-only: pre-tenure fault seam for the append-lane leadership acquisition; forwards to
     /// `CasRefLedger::setRefPreTenureHookForTest` (see it for the baton-safety contract).
     void setRefPreTenureHookForTest(std::function<void()> hook) { ref_ledger.setRefPreTenureHookForTest(std::move(hook)); }
+    void setAppendAfterRuntimeCaptureHookForTest(std::function<void()> hook)
+    {
+        ref_ledger.setAppendAfterRuntimeCaptureHookForTest(std::move(hook));
+    }
+    void setReadBeforeStateLockHookForTest(std::function<void()> hook)
+    {
+        ref_ledger.setReadBeforeStateLockHookForTest(std::move(hook));
+    }
 
     /// Test-only: fault seam for the ref-flush two-phase carve/validation protocol; forwards to
     /// `CasRefLedger::setCarveHookForTest` (see it for the phase-point contract).
@@ -885,6 +892,14 @@ public:
     void setInstallRegionProbeForTest(std::function<void()> probe)
     {
         ref_ledger.setInstallRegionProbeForTest(std::move(probe));
+    }
+    void setSnapshotAfterCaptureHookForTest(std::function<void()> hook)
+    {
+        ref_ledger.setSnapshotAfterCaptureHookForTest(std::move(hook));
+    }
+    void setSnapshotBeforeCkptCasHookForTest(std::function<void()> hook)
+    {
+        ref_ledger.setSnapshotBeforeCkptCasHookForTest(std::move(hook));
     }
 
     /// Test-only: replace the request controller's inter-attempt backoff sleep (e.g. with a no-op) —
@@ -913,9 +928,13 @@ public:
     /// evicted reports false until its next touch re-recovers it.
     size_t refTablesCachedCountForTest() { return ref_ledger.refTablesCachedCountForTest(); }
     bool refTableCachedForTest(const RootNamespace & ns) { return ref_ledger.refTableCachedForTest(ns); }
-    const void * refTableRuntimeIdentityForTest(const RootNamespace & ns)
+    uint64_t refTableRuntimeIdentityForTest(const RootNamespace & ns)
     {
         return ref_ledger.refTableRuntimeIdentityForTest(ns);
+    }
+    uint64_t refTableRuntimeAdmittedFenceGenerationForTest(const RootNamespace & ns)
+    {
+        return ref_ledger.refTableRuntimeAdmittedFenceGenerationForTest(ns);
     }
     std::optional<NamespaceLifeId> refTableLifeForTest(const RootNamespace & ns)
     {

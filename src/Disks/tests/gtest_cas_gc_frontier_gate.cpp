@@ -221,7 +221,7 @@ CompletedRemovingFixture seedCompletedRemoving(
         .checkpoint_key = {}};
     CasRefCatalog::casAdmitEntry(backend, layout, CatalogEntry{
         .ns = fixture.ns, .state = NsState::Live, .incarnation = fixture.life_id});
-    (void)store->newestPublishedSnapshotIdForTest(fixture.ns);
+    EXPECT_TRUE(store->namespaceFilesLifeIfReadable(fixture.ns));
     CasRefCatalog::casUpdate(backend, layout, [](const RefCatalog & current)
     {
         RefCatalog next = current;
@@ -1821,8 +1821,8 @@ TEST_P(CasGcCompletedRemovalFenceRace, FencedLeaderStopsAfterWinnerRemovesOrRepl
     ASSERT_TRUE(store->refTableRecoveredForTest(fixture.ns))
         << "the fixture must retain a resident predecessor runtime before removal";
     ASSERT_EQ(store->refTableLifeForTest(fixture.ns), predecessor_life);
-    const void * const predecessor_runtime = store->refTableRuntimeIdentityForTest(fixture.ns);
-    ASSERT_NE(predecessor_runtime, nullptr);
+    const uint64_t predecessor_runtime = store->refTableRuntimeIdentityForTest(fixture.ns);
+    ASSERT_NE(predecessor_runtime, 0u);
     backend->clearJournal();
     backend->blockNextCatalogCas(layout.refCatalogKey());
 
@@ -1871,8 +1871,8 @@ TEST_P(CasGcCompletedRemovalFenceRace, FencedLeaderStopsAfterWinnerRemovesOrRepl
     EXPECT_LT(findJournalAfter(journal, "get " + layout.refCatalogKey(), 0), journal.size())
         << "the stale leader must still complete mandatory erase resolution";
 
-    (void)store->newestPublishedSnapshotIdForTest(fixture.ns);
-    EXPECT_NE(store->refTableRuntimeIdentityForTest(fixture.ns), nullptr);
+    (void)store->namespaceLife(fixture.ns);
+    EXPECT_NE(store->refTableRuntimeIdentityForTest(fixture.ns), 0u);
     ASSERT_TRUE(store->refTableLifeForTest(fixture.ns));
     EXPECT_NE(store->refTableLifeForTest(fixture.ns), predecessor_life)
         << "the next name-based resolution must not retain the retired predecessor life";

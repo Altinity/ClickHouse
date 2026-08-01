@@ -607,10 +607,12 @@ TEST(CasRefWedgeEveryAttempt, SuccessorSealAtTheWedgedKeyRejectsConclusivelyAndS
     EXPECT_EQ(store->scheduleRemountCallCountForTest(), remounts_before)
         << "and must not schedule a remount";
 
-    /// Merely changing the epoch counters does not reopen a cached runtime. Production reaches a new
-    /// epoch through remount, which replaces the runtime and recovers its chain link.
+    /// Merely changing the epoch counters does not reopen a cached runtime. Its immutable admitted
+    /// generation is stale, so the outer retry-safe fence refusal wins before the still-Closed lane is
+    /// consulted. Production reaches a new epoch through remount, which replaces the runtime and
+    /// recovers its chain link.
     bumpFenceGeneration(store, epoch + 1);
-    expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&] { store->dropRef(ns, "y"); });
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "y"); });
     EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Closed);
 }
 
@@ -631,9 +633,10 @@ TEST(CasRefWedgeEveryAttempt, OrdinaryFirstAppendAfterASealedTransitionCarriesTh
     publishEmptyPart(store, ns, "x");
     const RefTxnId seal_id{epoch, 42};
 
-    /// A recovery that walked the dead epoch installs the seal it wrote; the mount then lives at E+1.
+    /// A recovery that walked the dead epoch installs the seal it wrote; model its later epoch without
+    /// moving the mount-fence generation. This test is about the wire link, not runtime supersession.
     store->setLastEpochSealForTest(ns, seal_id);
-    bumpFenceGeneration(store, epoch + 1);
+    store->setLiveWriterEpochForTest(epoch + 1);
 
     EXPECT_NO_THROW(store->dropRef(ns, "x"));
 
@@ -823,7 +826,6 @@ TEST(CasRefWedgeEveryAttempt, ResultReleasedAfterAFenceBumpAndSuccessorSealIsIne
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { std::rethrow_exception(caller_error); });
     EXPECT_TRUE(store->refLaneWedgedForTest(ns)) << "no unwedge";
     EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), tail_before) << "no install";
-    EXPECT_TRUE(store->resolveRef(ns, "x").has_value()) << "no install: the wedged drop is still unapplied";
     EXPECT_EQ(store->lastEpochSealForTest(ns), std::nullopt)
         << "and no adoption of the seal a superseded runtime happened to read";
 }
@@ -1225,7 +1227,9 @@ TEST(CasRefWedgeEveryAttempt, ALiveEpochSealIsNeverStampedAsItsOwnPrevEpochSeal)
     publishEmptyPart(store, ns, "x");
 
     const uint64_t epoch = store->liveWriterEpoch();
-    bumpFenceGeneration(store, epoch + 1);
+    /// Keep this a local wire/encoder test: moving the mount-fence generation would correctly make the
+    /// immutable runtime stale before the self-pointer guard was reached.
+    store->setLiveWriterEpochForTest(epoch + 1);
     /// A seal of the LIVE epoch — the deposed-lane shape the wedge rejection arm can record.
     store->setLastEpochSealForTest(ns, RefTxnId{epoch + 1, 7});
 

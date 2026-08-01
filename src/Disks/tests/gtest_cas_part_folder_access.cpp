@@ -392,7 +392,11 @@ TEST(CasPartFolderAccess, PublishEntriesAbandonsBuildOnPromoteFailure)
     /// appendRefOps observes a proven conflict and throws CORRUPTED_DATA -- publishEntries's catch must
     /// abandon() the build before rethrowing.
     expectThrowsCode(ErrorCodes::CORRUPTED_DATA, [&] { access.republishRef({ns, "src"}, {ns, "dst"}); });
-    EXPECT_FALSE(access.existsRef({ns, "dst"}, Cas::Freshness::ForceFresh)) << "the failed promote never committed dst";
+    /// The anomaly fenced this runtime, so a post-fence `ForceFresh` read must refuse rather than
+    /// authorizing its stale generation. The backend assertions below prove directly that `dst` never
+    /// committed and that no append skipped around the damaged slot.
+    expectThrowsCode(ErrorCodes::NETWORK_ERROR,
+        [&] { (void)access.existsRef({ns, "dst"}, Cas::Freshness::ForceFresh); });
 
     /// EXACTLY two ref-log create attempts reach the store: precommitAdd's own append and the promote's
     /// faulted one. Both of the cleanup appends that follow -- `promote`'s catch-abandon and the handle

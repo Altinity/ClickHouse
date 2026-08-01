@@ -325,8 +325,8 @@ TEST(CasConfirmExactRef, DroppedAndRecreatedRefIsNo)
 
 /// Rule 2, the cold case: a namespace this mount has never touched has no resident runtime, so the
 /// answer is `Unknown` -- and producing it must cost ZERO object-store requests AND must not create a
-/// runtime. Creating one (which `getRefTableRuntime` would do) would let a remote caller populate this
-/// writer's table cache with unrecovered entries by asking about namespaces that do not exist.
+/// runtime. Materializing one here would let a remote caller populate this writer's table cache with
+/// unrecovered entries by asking about namespaces that do not exist.
 TEST(CasConfirmExactRef, ColdTableIsUnknownWithZeroBackendRequests)
 {
     auto backend = std::make_shared<CountingBackend>();

@@ -81,6 +81,19 @@ ManifestRef manifestRef(uint64_t epoch, uint64_t build_sequence, uint32_t ordina
     return ManifestRef{epoch, build_sequence, ordinal};
 }
 
+/// Make the durable mount immediately reclaimable so a test that deliberately moved the local fence
+/// generation can drive the production remount boundary without paying a live-lease expiry wait.
+void fenceOutMountForRemount(Backend & backend, const String & mount_key)
+{
+    const auto got = backend.get(mount_key);
+    ASSERT_TRUE(got.has_value());
+    MountLease mount = decodeMountLease(got->bytes);
+    mount.gc_fenced = true;
+    mount.seq += 1;
+    ASSERT_EQ(backend.putOverwrite(mount_key, encodeMountLease(mount), got->token).outcome,
+        PutOutcome::Done);
+}
+
 /// A backend whose LIST can be made to LIE by omission -- the whole point of this suite. `hidden_keys`
 /// are still readable by exact key (that is what a real listing inconsistency looks like: the object is
 /// there, the enumeration simply did not mention it), and `list` filters them out of every page.
@@ -657,7 +670,11 @@ TEST(CasRefRecoveryCasWalk, FenceBumpedMidWalkRefusesTheInstallAndTheRetrySuccee
     EXPECT_ANY_THROW(store->listRefs(ns)) << "a recovery whose I/O window straddled a fence bump must install nothing";
 
     backend->on_key = nullptr;
-    EXPECT_EQ(store->listRefs(ns).size(), 1u) << "the retry runs under the current generation and succeeds";
+    fenceOutMountForRemount(*backend, layout.mountKey("test"));
+    ASSERT_TRUE(store->tryRemountOnce())
+        << "a generation bump cannot rebind the captured runtime; the production remount must publish "
+           "a distinct runtime at the accepted generation";
+    EXPECT_EQ(store->listRefs(ns).size(), 1u) << "the retry through the remounted runtime succeeds";
 }
 
 /// Bump point 1 of the trio's two interior seams: AFTER the slot-occupy landed, BEFORE the `_ckpt` CAS.
@@ -722,7 +739,11 @@ TEST(CasRefRecoveryCasWalk, FenceBumpedAfterCkptCasBeforeInstallPublishesNoState
         << "the checkpoint advance already landed and is harmless -- the merge is a semantic maximum";
 
     backend->on_key = nullptr;
-    EXPECT_EQ(store->listRefs(ns).size(), 1u) << "the retry under the current generation installs normally";
+    fenceOutMountForRemount(*backend, layout.mountKey("test"));
+    ASSERT_TRUE(store->tryRemountOnce())
+        << "a generation bump cannot rebind the captured runtime; the production remount must publish "
+           "a distinct runtime at the accepted generation";
+    EXPECT_EQ(store->listRefs(ns).size(), 1u) << "the retry through the remounted runtime installs normally";
 }
 
 /// ---------------------------------------------------------------------------------------------

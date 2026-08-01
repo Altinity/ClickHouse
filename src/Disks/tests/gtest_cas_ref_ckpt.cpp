@@ -808,18 +808,28 @@ TEST(CasRefCkpt, APublishFencedOutMidAttemptDoesNotAdvanceTheCheckpoint)
     const String ckpt_key = store->layout().refCkptKey(life);
     backend->setWatchedKey(ckpt_key);
 
-    /// Armed only NOW, so the birth's own checkpoint creation is untouched: from here the mount is
-    /// re-armed on the `_ckpt` READ, i.e. inside the read-then-CAS window of exactly the call under
-    /// test. A re-arm bumps the fence GENERATION, which is what an admitted publish presents back.
-    backend->on_get = [&] { DB::Cas::tests::rearmMountFenceAfterAnomalyForTest(store); };
-
     const auto before = readCkpt(*backend, store->layout(), life);
     ASSERT_TRUE(before.has_value());
     ASSERT_FALSE(before->ckpt.checkpoint_snapshot_id.has_value());
     const uint64_t writes_before = backend->casPutCount(ckpt_key);
 
+    /// Arm only after the precondition read above. The next watched `_ckpt` read is therefore the one
+    /// inside this publish's read-then-CAS window, after the attempt captured its immutable runtime
+    /// generation. Arming before `readCkpt` would stale the runtime before the operation began and test
+    /// entry admission instead of the intended mid-attempt recheck.
+    bool hook_fired = false;
+    backend->on_get = [&]
+    {
+        if (hook_fired)
+            return;
+        hook_fired = true;
+        DB::Cas::tests::rearmMountFenceAfterAnomalyForTest(store);
+    };
+
     EXPECT_FALSE(store->trySnapshotPublishOnce(ns))
         << "a publish whose checkpoint could not be advanced must not report success";
+    EXPECT_TRUE(hook_fired) << "the checkpoint read-then-CAS seam was never exercised";
+    backend->on_get = nullptr;
     EXPECT_EQ(backend->casPutCount(ckpt_key), writes_before) << "nothing may be sent after the fence moved";
     EXPECT_FALSE(readCkptOrFail(*backend, store->layout(), life).checkpoint_snapshot_id.has_value());
     EXPECT_FALSE(store->newestPublishedSnapshotIdForTest(ns).has_value())

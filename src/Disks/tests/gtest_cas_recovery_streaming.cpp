@@ -493,8 +493,8 @@ TEST(CasRecoveryStreaming, OrphanSweepAndFsckSameBound)
 /// the SAME per-transaction bound the free recovery does. This is the exact production path the original
 /// memory finding named; `LongTailReplaysUnderMemoryBound` above exercises the free `recoverRefTable`,
 /// NOT the ledger loop, so the ledger could regress to whole-tail materialisation while every other
-/// bound stayed green. Recovery is driven through `tailSinceSnapshotCountForTest` -- a recovery-only
-/// accessor that does NOT dispatch the read-side stale-precommit sweep `listRefs` would (that sweep
+/// bound stayed green. Recovery is driven through the production non-minting namespace-file read path,
+/// which does NOT dispatch the stale-precommit sweep `listRefs` would (that sweep
 /// would append removals over the seeded epoch-1 precommit bindings and perturb both the count and the
 /// probe). The whole tail sits above a never-born base, so the retained tail count equals the whole tail.
 TEST(CasRecoveryStreaming, LedgerRecoveryReplaysUnderMemoryBound)
@@ -520,8 +520,9 @@ TEST(CasRecoveryStreaming, LedgerRecoveryReplaysUnderMemoryBound)
     setRecoveryReplayMemoryProbeForTest(tracker.probe());
     SCOPE_EXIT({ setRecoveryReplayMemoryProbeForTest({}); });
 
-    /// A recovery-only accessor drives `CasRefLedger::ensureRefTableRecovered` (the ledger's streaming
-    /// replay loop) and returns the retained tail count -- the whole tail, above a never-born base.
+    /// The production Task 4b reader drives `CasRefLedger::ensureRefTableRecovered` without the
+    /// stale-precommit sweep; the resident-only observer then reads the retained tail count.
+    ASSERT_TRUE(store->namespaceFilesLifeIfReadable(ns));
     EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), kTxns)
         << "the whole tail must have replayed through the ledger's own recovery loop";
     EXPECT_LE(tracker.peak(), static_cast<int64_t>(bound))
@@ -577,11 +578,13 @@ TEST(CasRecoveryStreaming, RecoveryResultInventoryComplete)
 
     auto store = openPoolForTest(backend);
 
-    /// Drive recovery via a recovery-only accessor: `newestPublishedSnapshotIdForTest` recovers the
-    /// table WITHOUT the read-side stale-precommit sweep that `resolveRef`/`listRefs` dispatch (that
+    /// Drive recovery via the production namespace-file reader WITHOUT the stale-precommit sweep that
+    /// `resolveRef`/`listRefs` dispatch (that
     /// sweep would clear `needs_stale_precommit_sweep` before it could be observed). Every inventory
     /// field below is then read straight off the seeded runtime, and the read-path state assertion is
     /// left for LAST (after `needs_stale_precommit_sweep` has been observed).
+
+    ASSERT_TRUE(store->namespaceFilesLifeIfReadable(ns));
 
     /// newest snapshot identity: the recovered base id, no seal on this clean mount.
     EXPECT_EQ(store->newestPublishedSnapshotIdForTest(ns), std::optional<RefTxnId>(base.snapshot_id));

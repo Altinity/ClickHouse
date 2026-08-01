@@ -14,6 +14,7 @@
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
 #include <Common/ProfileEvents.h>
+#include <base/scope_guard.h>
 
 #include <Poco/Exception.h>
 
@@ -192,11 +193,35 @@ CatalogEntry catalogEntryOrThrow(Backend & backend, const Layout & layout, const
     return *it;
 }
 
+std::optional<RefTxnId> listGreatestLogIdForTest(
+    Backend & backend, const Layout & layout, const RootNamespace & ns);
+
+std::optional<RefTxnId> listGreatestLogIdForLifeForTest(
+    Backend & backend, const Layout & layout, const NamespaceLifeId & life)
+{
+    std::optional<RefTxnId> greatest;
+    String cursor;
+    for (;;)
+    {
+        const ListPage page = backend.list(layout.namespaceStreamPrefix(life), cursor, 1000);
+        for (const ListedKey & listed : page.keys)
+        {
+            const auto parsed = layout.parseRefObjectKey(listed.key);
+            if (parsed && parsed->life_id == life.incarnation && parsed->kind == RefObjectKind::Log
+                && (!greatest || *greatest < parsed->txn_id))
+                greatest = parsed->txn_id;
+        }
+        if (page.next_cursor.empty())
+            return greatest;
+        cursor = page.next_cursor;
+    }
+}
+
 struct RemovalReadyFixture
 {
     CatalogEntry predecessor;
     uint64_t writer_epoch = 0;
-    const void * runtime_identity = nullptr;
+    uint64_t runtime_identity = 0;
 };
 
 RemovalReadyFixture prepareResidentRemovalForDrain(
@@ -205,7 +230,7 @@ RemovalReadyFixture prepareResidentRemovalForDrain(
     publishWithProductionBirth(store, ns, "predecessor");
     const CatalogEntry predecessor = catalogEntryOrThrow(backend, store->layout(), ns);
     const uint64_t writer_epoch = store->liveWriterEpoch();
-    const void * const runtime_identity = store->refTableRuntimeIdentityForTest(ns);
+    const uint64_t runtime_identity = store->refTableRuntimeIdentityForTest(ns);
 
     if (runRegularRoundReclaiming(gc).deferred)
         throw std::runtime_error("fixture publish unexpectedly deferred");
@@ -1141,8 +1166,8 @@ TEST(RefWriterAppendLane, WedgedRefLaneCountTracksExactlyTheWedgedTableThroughIt
 /// until somebody remounted by hand. So there are two separate scopes to keep straight, and this test
 /// pins both:
 ///   the FENCE is mount-wide -- while it is closed EVERY lane is refused, including untouched ones;
-///   the DAMAGE is per-namespace -- re-arming the test fence does not replace the damaged runtime, so
-///   that lane remains `Faulted` until a real remount, while the unrelated table commits normally.
+///   the DAMAGE is per-namespace -- a real remount replaces both immutable runtimes, then recovery of
+///   the damaged stream still refuses while the unrelated table commits normally.
 TEST(RefWriterAppendLane, I1AppendCorruptionSurfacesAndFencesTheMountForRemount)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
@@ -1172,15 +1197,24 @@ TEST(RefWriterAppendLane, I1AppendCorruptionSurfacesAndFencesTheMountForRemount)
         << "the independent-table append hung -- the queue's leader bookkeeping was not restored";
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { fenced.get(); });
 
-    /// Re-arm only the mount fence, then re-check that the fault stays local to this runtime.
-    DB::Cas::tests::rearmMountFenceAfterAnomalyForTest(store);
+    /// Drive the scheduled production recovery boundary. A direct fence re-arm is intentionally NOT a
+    /// substitute anymore: immutable runtimes retain the generation that admitted them and cannot be
+    /// rebound to the new one.
+    const String mount_key = layout.mountKey("test");
+    const auto mount = backend->get(mount_key);
+    ASSERT_TRUE(mount);
+    MountLease fenced_mount = decodeMountLease(mount->bytes);
+    fenced_mount.gc_fenced = true;
+    fenced_mount.seq += 1;
+    ASSERT_EQ(backend->putOverwrite(mount_key, encodeMountLease(fenced_mount), mount->token).outcome,
+        PutOutcome::Done);
+    ASSERT_TRUE(store->tryRemountOnce());
+
     auto same = std::async(std::launch::async, [&] { store->dropRef(ns, "x"); });
     ASSERT_EQ(same.wait_for(std::chrono::seconds(10)), std::future_status::ready)
         << "the same-table append hung -- the queue's leader bookkeeping was not restored";
-    expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&] { same.get(); });
-    EXPECT_TRUE(store->resolveRef(ns, "x").has_value()) << "the refused drop must not have taken effect";
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { same.get(); });
 
-    DB::Cas::tests::rearmMountFenceAfterAnomalyForTest(store);
     auto indep = std::async(std::launch::async, [&] { store->dropRef(other, "z"); });
     ASSERT_EQ(indep.wait_for(std::chrono::seconds(10)), std::future_status::ready);
     indep.get();
@@ -1547,6 +1581,371 @@ TEST(RefWriterSnapshotPublish, ThresholdTriggerPublishesCacheReplayEquivalentByt
     const String expected_bytes = encodeRefTableSnapshot(snapshotOf(oracle, ns.string()));
     EXPECT_EQ(openObject(FormatId::RefSnapshot, got->bytes), expected_bytes)
         << "published snapshot bytes must equal replay(logs through X)";
+}
+
+/// A publisher owns the runtime it captured, not the logical name. If that exact life is deleted and
+/// the name is reborn while snapshot bytes are still only local, the old attempt must become inert: in
+/// particular it must not recreate the predecessor's `_snap` or `_ckpt` after the GC retired them.
+TEST(RefWriterSnapshotPublish, CapturedPredecessorCannotPublishAfterSameNameRebirth)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    PoolConfig config;
+    config.gc_fold_threshold = 1;
+    config.ref_table_cache_bytes = 0;
+    config.snapshot_log_count_threshold = 1ULL << 40;
+    config.snapshot_log_bytes_threshold = 1ULL << 40;
+    auto store = openPoolWithConfig(backend, config);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/publisher-predecessor-rebirth"};
+
+    publishWithProductionBirth(store, ns, "predecessor");
+    const CatalogEntry predecessor = catalogEntryOrThrow(*backend, layout, ns);
+    const NamespaceLifeId predecessor_life
+        = NamespaceLifeId::fromCatalogEntry(ns, predecessor.incarnation);
+    const auto predecessor_snapshot
+        = listGreatestLogIdForLifeForTest(*backend, layout, predecessor_life);
+    ASSERT_TRUE(predecessor_snapshot);
+
+    Gc gc(store, UInt128{105});
+    ASSERT_FALSE(runRegularRoundReclaiming(gc).deferred);
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool captured = false;
+    bool release = false;
+    store->setSnapshotAfterCaptureHookForTest([&]
+    {
+        std::unique_lock lock(mutex);
+        captured = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return release; });
+    });
+
+    auto publisher = std::async(std::launch::async, [&]() -> bool
+    {
+        return store->trySnapshotPublishOnce(ns);
+    });
+    SCOPE_EXIT({
+        {
+            std::lock_guard lock(mutex);
+            release = true;
+        }
+        cv.notify_all();
+    });
+    {
+        std::unique_lock lock(mutex);
+        ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(10), [&] { return captured; }));
+    }
+
+    EXPECT_NO_THROW(store->dropNamespace(ns));
+    EXPECT_FALSE(runRegularRoundReclaiming(gc).deferred);
+    EXPECT_TRUE(runRegularRoundReclaiming(gc).deferred);
+    const RefCatalog after_removal = CasRefCatalog::read(*backend, layout).catalog;
+    EXPECT_TRUE(std::none_of(after_removal.entries.begin(), after_removal.entries.end(),
+        [&](const CatalogEntry & entry) { return entry.ns == ns; }));
+
+    publishWithProductionBirth(store, ns, "successor");
+    const uint64_t successor_runtime = store->refTableRuntimeIdentityForTest(ns);
+    const CatalogEntry successor = catalogEntryOrThrow(*backend, layout, ns);
+    EXPECT_NE(successor.incarnation, predecessor.incarnation);
+    const auto predecessor_ckpt_before_resume = backend->get(layout.refCkptKey(predecessor_life));
+    ASSERT_TRUE(predecessor_ckpt_before_resume)
+        << "the removal protocol leaves this checkpoint as janitor-owned predecessor debris";
+
+    {
+        std::lock_guard lock(mutex);
+        release = true;
+    }
+    cv.notify_all();
+    ASSERT_EQ(publisher.wait_for(std::chrono::seconds(10)), std::future_status::ready);
+    EXPECT_FALSE(publisher.get());
+    store->setSnapshotAfterCaptureHookForTest(nullptr);
+
+    EXPECT_FALSE(backend->get(layout.refSnapshotKey(predecessor_life, *predecessor_snapshot)))
+        << "a stale publisher recreated the retired predecessor snapshot";
+    const auto predecessor_ckpt_after_resume = backend->get(layout.refCkptKey(predecessor_life));
+    ASSERT_TRUE(predecessor_ckpt_after_resume);
+    EXPECT_EQ(predecessor_ckpt_after_resume->token, predecessor_ckpt_before_resume->token)
+        << "a stale publisher replaced the retired predecessor checkpoint";
+    EXPECT_EQ(predecessor_ckpt_after_resume->bytes, predecessor_ckpt_before_resume->bytes)
+        << "a stale publisher changed the retired predecessor checkpoint";
+    EXPECT_EQ(store->refTableRuntimeIdentityForTest(ns), successor_runtime);
+    EXPECT_TRUE(store->resolveRef(ns, "successor"));
+}
+
+/// The runtime admission check belongs inside every retrying `_ckpt` CAS attempt, not merely before
+/// calling the checkpoint helper. Retirement in the body-PUT/checkpoint gap leaves the already-written
+/// snapshot as harmless debris but must not advance or recreate the predecessor checkpoint.
+TEST(RefWriterSnapshotPublish, RetiredPredecessorCannotAdvanceCkptAfterSnapshotPut)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    PoolConfig config;
+    config.gc_fold_threshold = 1;
+    config.ref_table_cache_bytes = 0;
+    config.snapshot_log_count_threshold = 1ULL << 40;
+    config.snapshot_log_bytes_threshold = 1ULL << 40;
+    auto store = openPoolWithConfig(backend, config);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/publisher-predecessor-ckpt-race"};
+
+    publishWithProductionBirth(store, ns, "predecessor");
+    const CatalogEntry predecessor = catalogEntryOrThrow(*backend, layout, ns);
+    const NamespaceLifeId predecessor_life
+        = NamespaceLifeId::fromCatalogEntry(ns, predecessor.incarnation);
+    const auto candidate_id = listGreatestLogIdForLifeForTest(*backend, layout, predecessor_life);
+    ASSERT_TRUE(candidate_id);
+
+    Gc gc(store, UInt128{106});
+    ASSERT_FALSE(runRegularRoundReclaiming(gc).deferred);
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool before_ckpt_cas = false;
+    bool release = false;
+    store->setSnapshotBeforeCkptCasHookForTest([&]
+    {
+        std::unique_lock lock(mutex);
+        before_ckpt_cas = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return release; });
+    });
+
+    auto publisher = std::async(std::launch::async, [&]() -> bool
+    {
+        return store->trySnapshotPublishOnce(ns);
+    });
+    SCOPE_EXIT({
+        {
+            std::lock_guard lock(mutex);
+            release = true;
+        }
+        cv.notify_all();
+    });
+    {
+        std::unique_lock lock(mutex);
+        ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(10), [&] { return before_ckpt_cas; }));
+    }
+    EXPECT_TRUE(backend->get(layout.refSnapshotKey(predecessor_life, *candidate_id)))
+        << "the hook must run after the snapshot body PUT and immediately before `_ckpt` admission";
+
+    EXPECT_NO_THROW(store->dropNamespace(ns));
+    EXPECT_FALSE(runRegularRoundReclaiming(gc).deferred);
+    EXPECT_TRUE(runRegularRoundReclaiming(gc).deferred);
+    const RefCatalog after_removal = CasRefCatalog::read(*backend, layout).catalog;
+    EXPECT_TRUE(std::none_of(after_removal.entries.begin(), after_removal.entries.end(),
+        [&](const CatalogEntry & entry) { return entry.ns == ns; }));
+
+    publishWithProductionBirth(store, ns, "successor");
+    const uint64_t successor_runtime = store->refTableRuntimeIdentityForTest(ns);
+    const CatalogEntry successor = catalogEntryOrThrow(*backend, layout, ns);
+    EXPECT_NE(successor.incarnation, predecessor.incarnation);
+    const auto predecessor_ckpt_before_resume = backend->get(layout.refCkptKey(predecessor_life));
+    ASSERT_TRUE(predecessor_ckpt_before_resume);
+
+    {
+        std::lock_guard lock(mutex);
+        release = true;
+    }
+    cv.notify_all();
+    ASSERT_EQ(publisher.wait_for(std::chrono::seconds(10)), std::future_status::ready);
+    EXPECT_FALSE(publisher.get());
+    store->setSnapshotBeforeCkptCasHookForTest(nullptr);
+
+    const auto predecessor_ckpt_after_resume = backend->get(layout.refCkptKey(predecessor_life));
+    ASSERT_TRUE(predecessor_ckpt_after_resume);
+    EXPECT_EQ(predecessor_ckpt_after_resume->token, predecessor_ckpt_before_resume->token);
+    EXPECT_EQ(predecessor_ckpt_after_resume->bytes, predecessor_ckpt_before_resume->bytes);
+    EXPECT_EQ(store->refTableRuntimeIdentityForTest(ns), successor_runtime);
+    EXPECT_TRUE(store->resolveRef(ns, "successor"));
+}
+
+/// A read that already owns the predecessor runtime does not consult the name slot again after a
+/// same-name successor is published. Because removal applies the terminal state before retirement, a
+/// reader paused immediately before its state lock resumes with `NotFound`, never successor data.
+TEST(RefWriterRuntimeIdentity, CapturedReaderCannotRetargetSameNameSuccessor)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    PoolConfig config;
+    config.gc_fold_threshold = 1;
+    config.ref_table_cache_bytes = 0;
+    config.snapshot_log_count_threshold = 1ULL << 40;
+    config.snapshot_log_bytes_threshold = 1ULL << 40;
+    auto store = openPoolWithConfig(backend, config);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/captured-reader-rebirth"};
+
+    publishWithProductionBirth(store, ns, "shared");
+    ASSERT_TRUE(store->resolveRef(ns, "shared"));
+    const CatalogEntry predecessor = catalogEntryOrThrow(*backend, layout, ns);
+    Gc gc(store, UInt128{107});
+    ASSERT_FALSE(runRegularRoundReclaiming(gc).deferred);
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool captured = false;
+    bool release = false;
+    store->setReadBeforeStateLockHookForTest([&]
+    {
+        std::unique_lock lock(mutex);
+        if (captured)
+            return;
+        captured = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return release; });
+    });
+    auto reader = std::async(std::launch::async, [&]
+    {
+        return store->resolveRef(ns, "shared");
+    });
+    SCOPE_EXIT({
+        {
+            std::lock_guard lock(mutex);
+            release = true;
+        }
+        cv.notify_all();
+    });
+    {
+        std::unique_lock lock(mutex);
+        ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(10), [&] { return captured; }));
+    }
+
+    EXPECT_NO_THROW(store->dropNamespace(ns));
+    EXPECT_FALSE(runRegularRoundReclaiming(gc).deferred);
+    EXPECT_TRUE(runRegularRoundReclaiming(gc).deferred);
+    publishWithProductionBirth(store, ns, "shared");
+    const CatalogEntry successor = catalogEntryOrThrow(*backend, layout, ns);
+    EXPECT_NE(successor.incarnation, predecessor.incarnation);
+    const uint64_t successor_runtime = store->refTableRuntimeIdentityForTest(ns);
+    const auto successor_ref = store->resolveRef(ns, "shared");
+    ASSERT_TRUE(successor_ref);
+
+    {
+        std::lock_guard lock(mutex);
+        release = true;
+    }
+    cv.notify_all();
+    ASSERT_EQ(reader.wait_for(std::chrono::seconds(10)), std::future_status::ready);
+    EXPECT_FALSE(reader.get()) << "the captured predecessor reader retargeted through the name slot";
+    store->setReadBeforeStateLockHookForTest(nullptr);
+
+    EXPECT_EQ(store->refTableRuntimeIdentityForTest(ns), successor_runtime);
+    const auto successor_after = store->resolveRef(ns, "shared");
+    ASSERT_TRUE(successor_after);
+    EXPECT_EQ(successor_after->manifest_id.ref, successor_ref->manifest_id.ref);
+}
+
+/// Ordinary append admission also owns the runtime it captured. If removal and rebirth complete before
+/// enqueue, the predecessor's closed lane returns retry-later; it cannot enqueue into or mutate the
+/// successor even when the successor deliberately reuses the same logical ref name.
+TEST(RefWriterRuntimeIdentity, CapturedAppendCannotEnqueueIntoSameNameSuccessor)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    PoolConfig config;
+    config.gc_fold_threshold = 1;
+    config.ref_table_cache_bytes = 0;
+    config.snapshot_log_count_threshold = 1ULL << 40;
+    config.snapshot_log_bytes_threshold = 1ULL << 40;
+    auto store = openPoolWithConfig(backend, config);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/captured-append-rebirth"};
+
+    publishWithProductionBirth(store, ns, "shared");
+    const CatalogEntry predecessor = catalogEntryOrThrow(*backend, layout, ns);
+    Gc gc(store, UInt128{108});
+    ASSERT_FALSE(runRegularRoundReclaiming(gc).deferred);
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool captured = false;
+    bool release = false;
+    store->setAppendAfterRuntimeCaptureHookForTest([&]
+    {
+        std::unique_lock lock(mutex);
+        if (captured)
+            return;
+        captured = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return release; });
+    });
+    auto append = std::async(std::launch::async, [&]
+    {
+        store->dropRef(ns, "shared");
+    });
+    SCOPE_EXIT({
+        {
+            std::lock_guard lock(mutex);
+            release = true;
+        }
+        cv.notify_all();
+    });
+    {
+        std::unique_lock lock(mutex);
+        ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(10), [&] { return captured; }));
+    }
+
+    EXPECT_NO_THROW(store->dropNamespace(ns));
+    EXPECT_FALSE(runRegularRoundReclaiming(gc).deferred);
+    EXPECT_TRUE(runRegularRoundReclaiming(gc).deferred);
+    publishWithProductionBirth(store, ns, "shared");
+    const CatalogEntry successor = catalogEntryOrThrow(*backend, layout, ns);
+    EXPECT_NE(successor.incarnation, predecessor.incarnation);
+    const uint64_t successor_runtime = store->refTableRuntimeIdentityForTest(ns);
+    const auto successor_ref = store->resolveRef(ns, "shared");
+    ASSERT_TRUE(successor_ref);
+
+    {
+        std::lock_guard lock(mutex);
+        release = true;
+    }
+    cv.notify_all();
+    ASSERT_EQ(append.wait_for(std::chrono::seconds(10)), std::future_status::ready);
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { append.get(); });
+    store->setAppendAfterRuntimeCaptureHookForTest(nullptr);
+
+    EXPECT_EQ(store->refTableRuntimeIdentityForTest(ns), successor_runtime);
+    const auto successor_after = store->resolveRef(ns, "shared");
+    ASSERT_TRUE(successor_after);
+    EXPECT_EQ(successor_after->manifest_id.ref, successor_ref->manifest_id.ref);
+}
+
+/// Exact retirement is pointer/key scoped. A delayed notification for the predecessor may arrive after
+/// its same-name successor is already attached; it must not erase or poison that successor slot.
+TEST(RefWriterRuntimeIdentity, LatePredecessorInvalidationLeavesSuccessorAttached)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    PoolConfig config;
+    config.gc_fold_threshold = 1;
+    config.ref_table_cache_bytes = 0;
+    auto store = openPoolWithConfig(backend, config);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/late-predecessor-invalidation"};
+
+    publishWithProductionBirth(store, ns, "predecessor");
+    const CatalogEntry predecessor = catalogEntryOrThrow(*backend, layout, ns);
+    const NamespaceLifeId predecessor_life
+        = NamespaceLifeId::fromCatalogEntry(ns, predecessor.incarnation);
+    Gc gc(store, UInt128{109});
+    ASSERT_FALSE(runRegularRoundReclaiming(gc).deferred);
+    store->dropNamespace(ns);
+    ASSERT_FALSE(runRegularRoundReclaiming(gc).deferred);
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).deferred);
+
+    publishWithProductionBirth(store, ns, "successor");
+    const CatalogEntry successor = catalogEntryOrThrow(*backend, layout, ns);
+    ASSERT_NE(successor.incarnation, predecessor.incarnation);
+    const NamespaceLifeId successor_life
+        = NamespaceLifeId::fromCatalogEntry(ns, successor.incarnation);
+    const uint64_t successor_runtime = store->refTableRuntimeIdentityForTest(ns);
+    const auto successor_ref = store->resolveRef(ns, "successor");
+    ASSERT_TRUE(successor_ref);
+
+    store->invalidateRemovedCatalogLife(predecessor_life);
+
+    EXPECT_EQ(store->refTableRuntimeIdentityForTest(ns), successor_runtime);
+    EXPECT_EQ(store->refTableLifeForTest(ns), successor_life);
+    const auto successor_after = store->resolveRef(ns, "successor");
+    ASSERT_TRUE(successor_after);
+    EXPECT_EQ(successor_after->manifest_id.ref, successor_ref->manifest_id.ref);
 }
 
 /// Task 13 (spec §implementation-impact): a threshold snapshot publish increments the writer-side
@@ -2478,6 +2877,52 @@ uint64_t seedTwinDrop(Backend & backend, const Layout & layout, const RootNamesp
 
 }
 
+/// A fence-loss generation is a rejection marker, not a runtime admission token. If remount then loses
+/// to a foreign owner, neither a warm name nor a never-seen name may select/materialize a runtime under
+/// that intermediate generation; the predecessor remains only as a detached diagnostic object.
+TEST(RefWriterRemount, FailedRemountPublishesNoRuntimeUnderFenceLossGeneration)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace existing{"srv1/failed-remount-existing"};
+    const RootNamespace never_seen{"srv1/failed-remount-never-seen"};
+
+    publishWithProductionBirth(store, existing, "a");
+    const uint64_t predecessor_runtime = store->refTableRuntimeIdentityForTest(existing);
+    const uint64_t predecessor_generation
+        = store->refTableRuntimeAdmittedFenceGenerationForTest(existing);
+    const size_t cached_before = store->refTablesCachedCountForTest();
+    ASSERT_NE(predecessor_runtime, 0u);
+    ASSERT_EQ(predecessor_generation, store->fenceGeneration());
+
+    const String mount_key = layout.mountKey("test");
+    const auto got = backend->get(mount_key);
+    ASSERT_TRUE(got);
+    MountLease foreign = decodeMountLease(got->bytes);
+    foreign.server_uuid = foreign.server_uuid + UInt128{1};
+    foreign.seq += 1;
+    ASSERT_EQ(backend->putOverwrite(mount_key, encodeMountLease(foreign), got->token).outcome,
+        PutOutcome::Done);
+
+    store->tripMountLost();
+    const uint64_t rejected_generation = store->fenceGeneration();
+    ASSERT_NE(rejected_generation, predecessor_generation);
+    EXPECT_FALSE(store->tryRemountOnce());
+    EXPECT_FALSE(store->mayMutate());
+
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { (void)store->resolveRef(existing, "a"); });
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { (void)store->resolveRef(never_seen, "a"); });
+    EXPECT_EQ(store->refTablesCachedCountForTest(), cached_before);
+    EXPECT_EQ(store->refTableRuntimeIdentityForTest(existing), predecessor_runtime);
+    EXPECT_EQ(store->refTableRuntimeAdmittedFenceGenerationForTest(existing), predecessor_generation);
+    EXPECT_EQ(store->refTableRuntimeIdentityForTest(never_seen), 0u);
+    EXPECT_NE(store->refTableRuntimeAdmittedFenceGenerationForTest(existing), rejected_generation);
+
+    /// Make the foreign occupant terminal before teardown; it remains foreign and is never taken over.
+    fenceOutRefMount(*backend, mount_key);
+}
+
 /// C1/N1 (stale cache): a warm table whose committed ref a twin durably dropped must re-recover to the
 /// twin's view after a self-remount. The unfixed code kept the stale cache and still resolved the ref.
 TEST(RefWriterRemount, ReRecoversStaleCacheToTwinDrop)
@@ -2490,6 +2935,9 @@ TEST(RefWriterRemount, ReRecoversStaleCacheToTwinDrop)
     const ManifestId a_id = publishEmptyPart(store, ns, "a");
     ASSERT_TRUE(store->resolveRef(ns, "a").has_value());
     const uint64_t e1 = store->liveWriterEpoch();
+    const uint64_t predecessor_runtime = store->refTableRuntimeIdentityForTest(ns);
+    const NamespaceLifeId predecessor_life = *store->refTableLifeForTest(ns);
+    const uint64_t predecessor_generation = store->refTableRuntimeAdmittedFenceGenerationForTest(ns);
 
     /// A same-uuid twin bumped the durable epoch and durably dropped "a"; this Pool's warm cache never
     /// observed it.
@@ -2505,6 +2953,10 @@ TEST(RefWriterRemount, ReRecoversStaleCacheToTwinDrop)
     /// adopts the twin's drop -- "a" is gone.
     EXPECT_FALSE(store->resolveRef(ns, "a").has_value())
         << "a self-remount must re-recover the table under the new epoch, adopting the twin's drop";
+    EXPECT_NE(store->refTableRuntimeIdentityForTest(ns), predecessor_runtime);
+    EXPECT_EQ(store->refTableLifeForTest(ns), predecessor_life);
+    EXPECT_NE(store->refTableRuntimeAdmittedFenceGenerationForTest(ns), predecessor_generation);
+    EXPECT_EQ(store->refTableRuntimeAdmittedFenceGenerationForTest(ns), store->fenceGeneration());
 }
 
 /// C1/N2 (epoch routing + ordering): a post-remount append must stamp its log with the fresh
@@ -3022,8 +3474,8 @@ TEST(RefWriterNamespaceRemoval, SameNameSameWriterEpochRebirthInvalidatesResiden
     const CatalogEntry predecessor = *catalog_entry();
     const uint64_t writer_epoch = store->liveWriterEpoch();
     ASSERT_EQ(store->refTableLifeForTest(ns)->incarnation, predecessor.incarnation);
-    const void * const runtime_identity = store->refTableRuntimeIdentityForTest(ns);
-    ASSERT_NE(runtime_identity, nullptr);
+    const uint64_t runtime_identity = store->refTableRuntimeIdentityForTest(ns);
+    ASSERT_NE(runtime_identity, 0u);
 
     Gc gc(store, gc_id);
     ASSERT_FALSE(runRegularRoundReclaiming(gc).deferred);
@@ -3072,15 +3524,16 @@ TEST(RefWriterNamespaceRemoval, SameNameSameWriterEpochRebirthInvalidatesResiden
     const RoundReport drain = runRegularRoundReclaiming(gc);
     ASSERT_TRUE(drain.deferred) << "the drain-only idle invocation must leave the evidence seal adopted";
     ASSERT_FALSE(catalog_entry().has_value());
-    ASSERT_EQ(store->refTableRuntimeIdentityForTest(ns), runtime_identity);
+    ASSERT_EQ(store->refTableRuntimeIdentityForTest(ns), 0u)
+        << "catalog deletion must detach the predecessor from the name slot";
 
     publish_without_fixture_admission("successor");
     const CatalogEntry successor = *catalog_entry();
     ASSERT_EQ(successor.ns, predecessor.ns) << "the exact same logical namespace must be reused";
     ASSERT_NE(successor.incarnation, predecessor.incarnation);
     ASSERT_EQ(store->liveWriterEpoch(), writer_epoch) << "rebirth must use the same mounted writer epoch";
-    ASSERT_EQ(store->refTableRuntimeIdentityForTest(ns), runtime_identity)
-        << "rebirth must re-resolve inside the still-resident runtime";
+    ASSERT_NE(store->refTableRuntimeIdentityForTest(ns), runtime_identity)
+        << "rebirth must publish a distinct successor runtime, not reset the predecessor";
     ASSERT_EQ(store->refTableLifeForTest(ns)->incarnation, successor.incarnation);
 
     const NamespaceLifeId successor_life = NamespaceLifeId::fromCatalogEntry(ns, successor.incarnation);
@@ -3134,13 +3587,13 @@ TEST(RefWriterNamespaceRemoval, CommitThenThrowEraseResolvesAndRebindsResidentRu
     {
         return entry.ns == ns && entry.incarnation == ready.predecessor.incarnation;
     }));
-    EXPECT_EQ(store->refTableRuntimeIdentityForTest(ns), ready.runtime_identity);
+    EXPECT_EQ(store->refTableRuntimeIdentityForTest(ns), 0u);
 
     EXPECT_NO_THROW(publishWithProductionBirth(store, ns, "successor"));
     const CatalogEntry successor = catalogEntryOrThrow(*backend, layout, ns);
     EXPECT_NE(successor.incarnation, ready.predecessor.incarnation);
     EXPECT_EQ(store->liveWriterEpoch(), ready.writer_epoch);
-    EXPECT_EQ(store->refTableRuntimeIdentityForTest(ns), ready.runtime_identity);
+    EXPECT_NE(store->refTableRuntimeIdentityForTest(ns), ready.runtime_identity);
 
     ASSERT_FALSE(runRegularRoundReclaiming(gc).deferred);
     const GcState state = decodeGcState(backend->get(layout.gcStateKey())->bytes);
@@ -3183,7 +3636,7 @@ TEST(RefWriterNamespaceRemoval, OtherWinnerReplacementInvalidatesExactPredecesso
 
     EXPECT_NO_THROW((void)runRegularRoundReclaiming(gc));
     EXPECT_EQ(store->namespaceLife(ns), replacement_life);
-    EXPECT_EQ(store->refTableRuntimeIdentityForTest(ns), ready.runtime_identity);
+    EXPECT_NE(store->refTableRuntimeIdentityForTest(ns), ready.runtime_identity);
 }
 
 /// Failure to read the catalog while resolving a lost erase response is not success. A later fresh
@@ -3210,7 +3663,7 @@ TEST(RefWriterNamespaceRemoval, LaterNameLookupReconcilesAfterEraseResolutionRea
     EXPECT_NO_THROW(successor = store->namespaceLife(ns));
     ASSERT_TRUE(successor.has_value());
     EXPECT_NE(successor->incarnation, ready.predecessor.incarnation);
-    EXPECT_EQ(store->refTableRuntimeIdentityForTest(ns), ready.runtime_identity);
+    EXPECT_NE(store->refTableRuntimeIdentityForTest(ns), ready.runtime_identity);
 }
 
 /// The normal post-LIST catalog cut is also a reconciliation point. It repairs a missed local
@@ -3236,7 +3689,7 @@ TEST(RefWriterNamespaceRemoval, PostListCatalogCutReconcilesMissedEraseInvalidat
     EXPECT_NO_THROW((void)runRegularRoundReclaiming(gc));
     EXPECT_NO_THROW(publishWithProductionBirth(store, ns, "successor"));
     EXPECT_NE(catalogEntryOrThrow(*backend, layout, ns).incarnation, ready.predecessor.incarnation);
-    EXPECT_EQ(store->refTableRuntimeIdentityForTest(ns), ready.runtime_identity);
+    EXPECT_NE(store->refTableRuntimeIdentityForTest(ns), ready.runtime_identity);
 }
 
 /// ===================================================================================
@@ -3261,6 +3714,22 @@ TEST(RefWriterNamespaceBirth, ExistingLiveCatalogRowPinsExactLifeWithoutMutation
     EXPECT_EQ(backend->putTotal(), 0u);
     EXPECT_EQ(backend->putOverwriteTotal(), 0u);
     EXPECT_EQ(backend->casPutTotal(), 0u);
+}
+
+/// A read of a never-born name may observe the catalog, but it must not allocate the local name slot
+/// or a life runtime. Otherwise arbitrary read traffic can fill the cache with identity-less runtimes,
+/// and a later birth has to mutate one of those objects into a different identity.
+TEST(RefWriterNamespaceBirth, NeverBornReadAllocatesNoRuntime)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/never-born-read-no-runtime"};
+
+    ASSERT_EQ(store->refTablesCachedCountForTest(), 0u);
+    EXPECT_FALSE(store->resolveRef(ns, "missing").has_value());
+    EXPECT_EQ(store->refTablesCachedCountForTest(), 0u)
+        << "catalog absence must be decided before a runtime is constructed";
+    EXPECT_EQ(store->refTableRuntimeIdentityForTest(ns), 0u);
 }
 
 /// A never-born namespace follows the ordinary catalog-first birth path.

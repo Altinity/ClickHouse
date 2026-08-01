@@ -1818,14 +1818,15 @@ TEST(CasPartWriteTxn, AbandonRetryableAfterAppendFailure)
 
     /// The proven conflict fences the mount closed and schedules a remount (the append site routes
     /// through the anomaly policy exactly as the wedge-resolve site does). Re-arming only the test
-    /// fence does not replace this runtime, so its terminal `Faulted` lane remains blocked.
+    /// fence does not replace this runtime, so its immutable admitted generation remains stale and its
+    /// terminal `Faulted` lane remains blocked behind that outer refusal.
     DB::Cas::tests::rearmMountFenceAfterAnomalyForTest(s);
 
     /// The retryability under test: the SAME object accepts a second abandon() -- `alive` was not
     /// flipped by the failed append, so this is not the "has been abandoned" condition the unfixed code
-    /// produced. It reaches the lane and is refused by its terminal `Faulted` state; only a real remount
-    /// may replace that state.
-    expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&] { build->abandon(); });
+    /// produced. It reaches immutable-runtime admission and is refused by the stale generation; only a
+    /// real remount may replace that runtime and reach a fresh lane.
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { build->abandon(); });
 
     /// The removal never landed, and nothing was written around the occupant: the precommit binding this
     /// build owns is still live, exactly where the failed abandon left it. That is the honest end state

@@ -201,13 +201,13 @@ public:
     /// Called after a complete catalog observation proves an exact resident life absent or replaced.
     /// It does not
     /// destroy the runtime: existing callers that already captured the old physical life may finish
-    /// with their stale-or-not-found contract. The next name-based touch resets this same runtime in
-    /// place and resolves a fresh catalog life.
+    /// with their stale-or-not-found contract. The name slot is detached by exact pointer identity; a
+    /// later name-based touch may publish a distinct successor runtime.
     void invalidateRemovedCatalogLife(const NamespaceLifeId & life);
 
     /// Reconciles resident removal-closed runtimes against one complete catalog observation. An exact
-    /// life absent from or replaced in the cut is invalidated in place; a matching current life stays
-    /// closed. The next name-based touch performs the existing quiescent reset/rebind.
+    /// life absent from or replaced in the cut is invalidated and exactly detached; a matching current
+    /// life stays closed. No runtime is reset or rebound.
     void reconcileCatalogCut(const CasRefCatalog::Snapshot & catalog_cut);
 
     /// Queues a mutation for flat-combining with compatible callers. `build_ops` runs at most once in
@@ -285,7 +285,8 @@ public:
     /// Test-only observability and fault-injection seams for recovery, wedges, cleanup, and publication.
     /// The counters expose recovery and publication progress; wedge methods create and inspect the
     /// unresolved-`PUT` state; cleanup methods expose sweep eligibility; publication methods expose
-    /// settling, snapshot identity, and tail accounting.
+    /// settling, snapshot identity, and tail accounting. Every observer below is resident-only: it
+    /// performs no catalog/backend I/O and never materializes or recovers a runtime.
     /// Returns the number of LIST/GET recovery restarts recorded for `ns`.
     uint64_t refRecoveryRestartsForTest(const RootNamespace & ns);
     /// Reports whether `ns` currently has an unresolved append `PUT`.
@@ -317,8 +318,8 @@ public:
     int pendingSnapshotPublishesForTest(const RootNamespace & ns);
     /// Returns the newest snapshot id adopted by the cached runtime, if any.
     std::optional<RefTxnId> newestPublishedSnapshotIdForTest(const RootNamespace & ns);
-    /// Whether `ns` currently has a RECOVERED cached runtime -- WITHOUT forcing a recovery, unlike every
-    /// other seam here. That is the whole point: the fail-closed tests assert that a refused recovery
+    /// Whether `ns` currently has a RECOVERED cached runtime -- WITHOUT forcing a recovery. That is the
+    /// whole point: the fail-closed tests assert that a refused recovery
     /// installed nothing, and a seam that recovered on demand would answer its own question.
     bool refTableRecoveredForTest(const RootNamespace & ns);
     /// Whether the self-remount barrier has PUBLISHED its cancellation request for `ns` (also without
@@ -365,26 +366,54 @@ public:
     /// Installs the pre-tenure fault seam (see `ref_pre_tenure_hook_for_test`).
     void setRefPreTenureHookForTest(std::function<void()> hook) { ref_pre_tenure_hook_for_test = std::move(hook); }
 
+    /// Pauses an ordinary append after it captured an exact runtime but before recovery or enqueue.
+    void setAppendAfterRuntimeCaptureHookForTest(std::function<void()> hook)
+    {
+        append_after_runtime_capture_hook_for_test = std::move(hook);
+    }
+
+    /// Pauses `resolveRef` after it captured/recovered an exact runtime but before the result state lock.
+    void setReadBeforeStateLockHookForTest(std::function<void()> hook)
+    {
+        read_before_state_lock_hook_for_test = std::move(hook);
+    }
+
+    /// Pauses a direct snapshot publisher after it captured the runtime state but before its first
+    /// durable effect. Used only to exercise predecessor deletion/rebirth races deterministically.
+    void setSnapshotAfterCaptureHookForTest(std::function<void()> hook)
+    {
+        snapshot_after_capture_hook_for_test = std::move(hook);
+    }
+
+    /// Pauses a snapshot publisher after its body PUT and at the admission check immediately before
+    /// each `_ckpt` CAS attempt. This is intentionally inside the retrying checkpoint primitive.
+    void setSnapshotBeforeCkptCasHookForTest(std::function<void()> hook)
+    {
+        snapshot_before_ckpt_cas_hook_for_test = std::move(hook);
+    }
+
     /// Returns the number of queued mutations for `ns` under the queue mutex.
     size_t refQueuePendingForTest(const RootNamespace & ns)
     {
         std::lock_guard<std::mutex> g(ref_queue_mutex);
-        const auto it = ref_tables.find(ns.string());
-        return it == ref_tables.end() ? 0 : it->second->pending.size();
+        const auto it = ref_name_slots.find(ns.string());
+        return it == ref_name_slots.end() ? 0 : it->second.current->pending.size();
     }
 
     /// Reports whether `ns` currently has an active append-lane leader (the baton). Under the queue mutex.
     bool refLeaderActiveForTest(const RootNamespace & ns)
     {
         std::lock_guard<std::mutex> g(ref_queue_mutex);
-        const auto it = ref_tables.find(ns.string());
-        return it != ref_tables.end() && it->second->leader_active;
+        const auto it = ref_name_slots.find(ns.string());
+        return it != ref_name_slots.end() && it->second.current->leader_active;
     }
 
     /// Returns the number of callers currently waiting for `ns` recovery under its state mutex.
     uint64_t refRecoveryWaitersForTest(const RootNamespace & ns)
     {
-        const auto rt = getRefTableRuntime(ns);
+        const auto rt = lookupRefTableRuntime(ns);
+        if (!rt)
+            return 0;
         std::lock_guard<std::mutex> g(rt->state_mutex);
         return rt->recovery_waiters_for_test;
     }
@@ -393,23 +422,34 @@ public:
     size_t refTablesCachedCountForTest()
     {
         std::lock_guard<std::mutex> g(ref_queue_mutex);
-        return ref_tables.size();
+        return std::count_if(ref_name_slots.begin(), ref_name_slots.end(), [](const auto & entry)
+        {
+            return static_cast<bool>(entry.second.current);
+        });
     }
     /// Reports whether `ns` has a cached runtime whose recovery completed.
     bool refTableCachedForTest(const RootNamespace & ns)
     {
-        std::lock_guard<std::mutex> g(ref_queue_mutex);
-        const auto it = ref_tables.find(ns.string());
-        return it != ref_tables.end() && it->second->recovered;
+        const auto rt = lookupRefTableRuntime(ns);
+        if (!rt)
+            return false;
+        std::lock_guard<std::mutex> g(rt->state_mutex);
+        return rt->recovered;
     }
-    /// Stable identity of the cached runtime object, or null when no slot exists. This distinguishes
+    /// Stable identity of the cached runtime object, or zero when no slot exists. This distinguishes
     /// explicit life invalidation from an eviction/remount that would make a rebirth test pass by
     /// constructing a different cache object.
-    const void * refTableRuntimeIdentityForTest(const RootNamespace & ns)
+    uint64_t refTableRuntimeIdentityForTest(const RootNamespace & ns)
     {
         std::lock_guard<std::mutex> g(ref_queue_mutex);
-        const auto it = ref_tables.find(ns.string());
-        return it == ref_tables.end() ? nullptr : it->second.get();
+        const auto it = ref_name_slots.find(ns.string());
+        return it == ref_name_slots.end() || !it->second.current ? 0 : it->second.current->runtime_id;
+    }
+    uint64_t refTableRuntimeAdmittedFenceGenerationForTest(const RootNamespace & ns)
+    {
+        std::lock_guard<std::mutex> g(ref_queue_mutex);
+        const auto it = ref_name_slots.find(ns.string());
+        return it == ref_name_slots.end() || !it->second.current ? 0 : it->second.current->admitted_fence_generation;
     }
     /// The physical life currently pinned in the cached runtime, without resolving or recovering it.
     std::optional<NamespaceLifeId> refTableLifeForTest(const RootNamespace & ns)
@@ -417,12 +457,13 @@ public:
         std::shared_ptr<RefTableRuntime> rt;
         {
             std::lock_guard<std::mutex> g(ref_queue_mutex);
-            const auto it = ref_tables.find(ns.string());
-            if (it == ref_tables.end())
+            const auto it = ref_name_slots.find(ns.string());
+            if (it == ref_name_slots.end())
                 return std::nullopt;
-            rt = it->second;
+            rt = it->second.current;
+            if (!rt)
+                return std::nullopt;
         }
-        std::lock_guard<std::mutex> g(rt->state_mutex);
         return rt->life;
     }
     /// Recovery-publication inventory accessors: the seeded per-table admission budgets, the recovered
@@ -432,24 +473,32 @@ public:
     /// let a test assert EVERY `RecoveryResult` field the install seeds.
     uint64_t refSnapshotBudgetForTest(const RootNamespace & ns)
     {
-        const auto rt = getRefTableRuntime(ns);
+        const auto rt = lookupRefTableRuntime(ns);
+        if (!rt)
+            return 0;
         std::lock_guard<std::mutex> g(rt->state_mutex);
         return rt->snapshot_budget;
     }
     uint64_t refRemovalBudgetForTest(const RootNamespace & ns)
     {
-        const auto rt = getRefTableRuntime(ns);
+        const auto rt = lookupRefTableRuntime(ns);
+        if (!rt)
+            return 0;
         std::lock_guard<std::mutex> g(rt->state_mutex);
         return rt->removal_budget;
     }
     uint64_t refBaseSnapshotBytesForTest(const RootNamespace & ns)
     {
-        const auto rt = getRefTableRuntime(ns);
+        const auto rt = lookupRefTableRuntime(ns);
+        if (!rt)
+            return 0;
         return rt->base_snapshot_bytes.load(std::memory_order_relaxed);
     }
     uint64_t refTailBytesSinceSnapshotForTest(const RootNamespace & ns)
     {
-        const auto rt = getRefTableRuntime(ns);
+        const auto rt = lookupRefTableRuntime(ns);
+        if (!rt)
+            return 0;
         return rt->tail_bytes_since_snapshot.load(std::memory_order_relaxed);
     }
     /// Describes the one conditional `PUT` whose outcome is still uncertain for a table. It is owned by
@@ -586,6 +635,24 @@ private:
     /// apply-after-commit steps, never for the `putIfAbsentControlled` call itself.
     struct RefTableRuntime
     {
+        /// An allocator can reuse an evicted predecessor's address for its successor. This monotone id
+        /// is therefore the only diagnostic identity used to test exact detach/rebirth.
+        const uint64_t runtime_id;
+
+        /// Exact catalog identity accepted before publication. It is part of the runtime key and can
+        /// never be rebound; a same-name successor is a different runtime object.
+        const NamespaceLifeId life;
+
+        RefTableRuntime(uint64_t runtime_id_, NamespaceLifeId life_, uint64_t admitted_fence_generation_)
+            : runtime_id(runtime_id_)
+            , life(std::move(life_))
+            , admitted_fence_generation(admitted_fence_generation_)
+        {
+        }
+
+        /// A later re-arm cannot retarget this runtime; it creates a distinct object instead.
+        const uint64_t admitted_fence_generation;
+
         std::mutex state_mutex;
         bool recovered = false;
         /// Gates the recovery-seal I/O that runs outside `state_mutex`. A second caller waits on
@@ -608,17 +675,6 @@ private:
         /// Test-only count of callers currently waiting for recovery; guarded by `state_mutex` so tests
         /// can observe that a concurrent caller reached the wait without depending on scheduling.
         uint64_t recovery_waiters_for_test = 0;
-        /// Stage B (spec INV-3): the catalog-resolved life this table's every ref-layer key is built
-        /// under -- `createNamespace`-minted, adopted from an existing `Live`/`Removing` entry, or
-        /// reconciled from a stale `Creating` one (`CasRefLedger::resolveNamespaceLife`). Resolved
-        /// ONCE for one catalog life, on the first recovery attempt under that life
-        /// (`ensureRefTableRecovered`), and retained by a later `NeedsRecovery` replay. Exact catalog
-        /// deletion or replacement invalidates the binding; the next name-based touch drains old work,
-        /// resets this SAME `RefTableRuntime` in place, and resolves/rebinds it to the successor life.
-        /// Self-remount still replaces the whole runtime through `quiesceRefTablesForRemount`.
-        /// `nullopt` means no catalog life has yet been resolved, or the runtime has just been reset for
-        /// rebinding.
-        std::optional<NamespaceLifeId> life;
         RefTableState state;
         /// Exact attempt owned by `Writing` or `Wedged`. Empty in every other lane state.
         std::optional<RefAppendAttempt> append_attempt;
@@ -708,8 +764,8 @@ private:
         bool removal_admission_closed = false;
         std::condition_variable cv;
 
-        /// Published after GC commits the exact catalog deletion. The next name-based cache touch
-        /// drains old users and resets the runtime in place before resolving a successor life.
+        /// Published after GC commits the exact catalog deletion. The exact cache pointer is detached;
+        /// old holders observe the flag and remain a predecessor, never a rebindable name handle.
         std::atomic<bool> catalog_life_invalidated{false};
 
         /// Set true when a self-remount detaches this runtime from the cache (`quiesceRefTablesForRemount`):
@@ -720,6 +776,30 @@ private:
         /// (release/acquire through the fence) -- there is no interleaving where a stale runtime both passes
         /// the fence and reads this flag false.
         std::atomic<bool> superseded_by_remount{false};
+    };
+
+    /// Appends against an exact runtime already captured by a lifecycle operation. This is the sole
+    /// path used by namespace removal after its exact `Live -> Removing` catalog transition: resolving
+    /// the logical name again there would either refuse the required terminal append or, after a
+    /// replacement, retarget destructive work to the successor. Ordinary mutations enter through the
+    /// public name-based `appendRefOps` wrapper and can never select this path.
+    RefTxnId appendRefOpsOnRuntime(
+        const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt, MutationScope scope,
+        std::function<std::vector<RefOp>(const RefTableState &)> build_ops,
+        RootMutationOrigin origin, RootMutationKind kind, bool skip_stale_precommit_sweep);
+
+    /// Publishes only from the exact runtime captured by the caller. Background dispatch carries this
+    /// pointer across the thread hand-off; it must never resolve the logical name again and accidentally
+    /// publish a same-name successor while settling the predecessor's in-flight accounting.
+    bool trySnapshotPublishOnceOnRuntime(
+        const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt);
+
+    /// The logical-name cache owns no lifecycle identity. It merely points at the runtime currently
+    /// admitted for that name; exact retirement/remount clears this pointer while external holders may
+    /// continue using the detached predecessor and fail closed against its immutable identity.
+    struct RefNameSlot
+    {
+        std::shared_ptr<RefTableRuntime> current;
     };
     static constexpr size_t kMaxRefBatch = 1000;
     /// Recovery retries at most this many times when an object selected by LIST vanishes before GET.
@@ -740,12 +820,13 @@ private:
     /// `mutable` for `confirmExactRef`, the one CONST member function that needs the lane snapshot:
     /// taking a mutex to read consistently does not make the read a mutation.
     mutable std::mutex ref_queue_mutex;
-    std::map<String, std::shared_ptr<RefTableRuntime>> ref_tables;
+    std::map<String, RefNameSlot> ref_name_slots;
     /// Monotonic access stamp for whole-table cache LRU eviction, bumped on every table touch and
     /// recorded in `RefTableRuntime::last_touch_tick`.
     std::atomic<uint64_t> ref_table_access_tick{0};
+    std::atomic<uint64_t> next_ref_runtime_id{0};
     /// Latched by `drainRefLanesForShutdown` before it
-    /// snapshots `ref_tables`/waits on each table's queue -- every ordinary ref mutation (`appendRefOps`)
+    /// snapshots `ref_name_slots`/waits on each table's queue -- every ordinary ref mutation (`appendRefOps`)
     /// checks this under the SAME `ref_queue_mutex` critical section it uses to enqueue its item, so the
     /// check-and-enqueue is atomic with the drain's snapshot-and-wait: a caller either enqueues strictly
     /// before the drain observes this table (and the drain then waits for it), or observes this flag
@@ -812,17 +893,28 @@ private:
     /// otherwise non-throwing regions. A test that installs a throwing probe must therefore disarm it
     /// after the region it targets, or every later install throws too. Null in production.
     std::function<void()> install_region_probe_for_test;
+    std::function<void()> append_after_runtime_capture_hook_for_test;
+    std::function<void()> read_before_state_lock_hook_for_test;
+    std::function<void()> snapshot_after_capture_hook_for_test;
+    std::function<void()> snapshot_before_ckpt_cas_hook_for_test;
 
-    /// Returns the cached runtime for `ns`, creating an empty unrecovered runtime when needed.
-    std::shared_ptr<RefTableRuntime> getRefTableRuntime(const RootNamespace & ns);
+    /// Non-materializing diagnostic/cache lookup. It never observes the catalog and never creates a
+    /// name slot or runtime.
+    std::shared_ptr<RefTableRuntime> lookupRefTableRuntime(const RootNamespace & ns) const;
 
-    /// If GC invalidated this runtime's catalog life, wait for its old recovery/append/publication
-    /// users to settle and reset every life-scoped field before returning it to a name-based caller.
-    void prepareInvalidatedRuntimeForReuse(const std::shared_ptr<RefTableRuntime> & rt);
+    /// Publishes or returns one runtime for an exact catalog-observed life and admitted mount-fence
+    /// generation. A conflicting attached identity is a stale observation and fails closed rather than
+    /// retargeting either runtime.
+    std::shared_ptr<RefTableRuntime> acquireRefTableRuntime(
+        const NamespaceLifeId & life, uint64_t admitted_generation);
 
-    /// Installs an externally validated exact life before recovery. Once pinned, the ordinary
-    /// namespace entry points reuse this runtime and cannot re-resolve a later same-name incarnation.
-    std::shared_ptr<RefTableRuntime> pinRefTableRuntimeToLife(const NamespaceLifeId & life);
+    /// Lookup-first non-minting read acquisition. A cold name consults the catalog and materializes only
+    /// an exact `Live` life; absence/`Creating`/`Removing` returns no runtime.
+    std::shared_ptr<RefTableRuntime> acquireReadableRefTableRuntime(const RootNamespace & ns);
+
+    /// Lookup-first mutation acquisition. A cold name resolves or births the catalog life before
+    /// constructing its runtime.
+    std::shared_ptr<RefTableRuntime> acquireMutableRefTableRuntime(const RootNamespace & ns);
 
     /// Common removal implementation. `expected_incarnation` is present for the decommission-only
     /// exact-life overload and is checked before every lifecycle branch, including stalled creation.
@@ -834,15 +926,6 @@ private:
     /// expose the table as recovered until every dead epoch it discovered is durably closed; concurrent
     /// callers serialize across the whole unlocked I/O window through `recovery_in_progress`.
     void ensureRefTableRecovered(const RootNamespace & ns, RefTableRuntime & rt);
-
-    /// The same recovery, for a caller that must not bring `ns` into existence: `false` means the catalog
-    /// names no such namespace, and NOTHING was written, recovered or installed. `true` means the table is
-    /// recovered exactly as `ensureRefTableRecovered` leaves it.
-    ///
-    /// Two entry points rather than one with a flag, because the two answer different questions and the
-    /// wrong one is invisible at a call site: only a WRITE may be a namespace's birth, so a read or a
-    /// removal must reach this one and a mutation must reach the other.
-    bool recoverRefTableIfNamespaceExists(const RootNamespace & ns, RefTableRuntime & rt);
 
     /// Stage B (spec INV-3, §3): resolves `ns`'s catalog life -- ONCE per table-open, from inside
     /// `ensureRefTableRecovered`'s transient-retry envelope, never from a per-write path (a per-write
@@ -869,11 +952,6 @@ private:
     NamespaceLifeId resolveNamespaceLife(
         const RootNamespace & ns, uint64_t admitted_generation, uint64_t live_epoch,
         bool * lifecycle_refusal = nullptr);
-
-    /// `*rt.life`, or `LOGICAL_ERROR` naming `ns` if a runtime reached this point without one. Callers
-    /// must already hold `rt.state_mutex`; it exists so the two public resolvers share ONE statement of
-    /// that invariant instead of two copies that can drift.
-    NamespaceLifeId lifeUnderLock(const RootNamespace & ns, const RefTableRuntime & rt) const;
 
     /// ONE attempt of the recovery walk, run with NO lock held (the candidate is private; nothing
     /// touches `rt` until the install). `nullopt` REQUESTS A RESTART from a fresh listing -- the two
@@ -1028,7 +1106,8 @@ private:
     ///     one -- it is the only writer that mints seals, so it is the only writer that can record
     ///     where the chain now ends.
     CkptPublishOutcome publishCkptContribution(const NamespaceLifeId & life, const RefCkpt & contribution,
-                                               uint64_t admitted_generation);
+                                               uint64_t admitted_generation,
+                                               const std::function<void(uint64_t)> & check_admission);
 
     /// The Live + single-in-flight-gate + backoff + tail-threshold admission decision, factored out so
     /// both the trigger (`maybeScheduleSnapshotPublish`) and the settlement re-evaluation share ONE
