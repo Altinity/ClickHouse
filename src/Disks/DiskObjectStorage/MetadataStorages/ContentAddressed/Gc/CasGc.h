@@ -231,29 +231,35 @@ struct RefScanSummary
 };
 
 class RefPlan;
+class RoundInput;
+RefPlan buildRefWalkPlan(RoundInput && round_input);
+
+namespace tests
+{
+RefPlan buildRefWalkPlanForTest(RefScanSummary ref_scan, CasRefCatalog::Snapshot catalog_cut);
+}
 
 /// The one owned observation boundary between the reconciled hot LIST and every ref-plan consumer.
-/// Construction copies the completed hot LIST and its later catalog cut, so callers can reuse their
-/// scan and catalog temporaries without changing the round that was already admitted for DEFER, fold,
-/// or publication. The scan is never separately pairable with a `RefPlan` downstream.
+/// `Gc` constructs it from the completed hot LIST and its later catalog cut, then the sole builder
+/// moves those observations into a `RefPlan`. The scan is never separately pairable with a plan
+/// downstream.
 class RoundInput
 {
 public:
-    RoundInput(RefScanSummary ref_scan_, CasRefCatalog::Snapshot catalog_cut_)
-        : ref_scan(std::move(ref_scan_)), catalog_cut(std::move(catalog_cut_))
-    {
-    }
-
-    RoundInput(const RoundInput &) = default;
+    RoundInput(const RoundInput &) = delete;
     RoundInput(RoundInput &&) = default;
     RoundInput & operator=(const RoundInput &) = delete;
     RoundInput & operator=(RoundInput &&) = delete;
 
-    const RefScanSummary & refScan() const { return ref_scan; }
-    const CasRefCatalog::Snapshot & catalogCut() const { return catalog_cut; }
-
 private:
-    friend RefPlan buildRefWalkPlan(const RoundInput & round_input);
+    friend class Gc;
+    friend RefPlan buildRefWalkPlan(RoundInput && round_input);
+    friend RefPlan tests::buildRefWalkPlanForTest(RefScanSummary ref_scan, CasRefCatalog::Snapshot catalog_cut);
+
+    RoundInput(RefScanSummary ref_scan_, CasRefCatalog::Snapshot catalog_cut_)
+        : ref_scan(std::move(ref_scan_)), catalog_cut(std::move(catalog_cut_))
+    {
+    }
 
     RefScanSummary ref_scan;
     CasRefCatalog::Snapshot catalog_cut;
@@ -284,6 +290,8 @@ public:
     const RefWalkPlanRow & row(const UInt128 & life_id) const { return rows.at(life_id); }
     std::set<UInt128> lifeIds() const;
     std::vector<NamespaceLifeId> lives() const;
+    const RefScanSummary & refScan() const { return ref_scan; }
+    const CasRefCatalog::Snapshot & catalogCut() const { return catalog_cut; }
     std::map<UInt128, RefLifeFoldState> parentFoldStates() const;
     std::map<UInt128, RefLifeFoldState> successorFoldStates() const;
     size_t size() const { return rows.size(); }
@@ -295,9 +303,14 @@ public:
     uint64_t droppedTails() const { return dropped_tails; }
 
 private:
-    friend RefPlan buildRefWalkPlan(const RoundInput & round_input);
+    friend RefPlan buildRefWalkPlan(RoundInput && round_input);
 
-    RefPlan() = default;
+    RefPlan(RefScanSummary ref_scan_, CasRefCatalog::Snapshot catalog_cut_)
+        : ref_scan(std::move(ref_scan_)), catalog_cut(std::move(catalog_cut_))
+    {
+    }
+    RefScanSummary ref_scan;
+    CasRefCatalog::Snapshot catalog_cut;
     std::map<UInt128, RefWalkPlanRow> rows;
     uint64_t dropped_parent_rows = 0;
     uint64_t dropped_listed_lives = 0;
@@ -309,8 +322,6 @@ private:
 /// Builds the one authoritative ref-life key set used by ordinary GC and healthy `REBUILD`.
 /// Adapters run only after the catalog loop has frozen that set and attach observations by `at`-style
 /// lookup; unknown, absent, or `Creating` ids are counted and dropped.
-RefPlan buildRefWalkPlan(const RoundInput & round_input);
-
 /// PROBE B2 — end-to-end transaction accounting for ONE round. Round-local, never persisted.
 ///
 /// The naive "intended vs applied" counter pair is VACUOUS: in the intake both counts increment in the
@@ -606,10 +617,10 @@ private:
     /// graduates once `condemn_round < current_round`, i.e. it survived at least one full round after
     /// being condemned. The fold no longer CASes gc/state — it sets (snap_generation, snap_attempt)
     /// in-memory; the SINGLE round CAS commits them.
-    /// `round_input` owns the round's one enumeration of `cas/ns/stream/` (see `RefScanSummary`) and
+    /// `walk_plan` owns the round's one enumeration of `cas/ns/stream/` (see `RefScanSummary`) and
     /// its catalog cut; the fold regroups those keys strictly rather than listing the prefix again.
     FoldResult fold(GcState & state, Token & state_token, RoundReport & report, uint64_t current_round,
-                    const RoundInput & round_input, const RefPlan & walk_plan, UniversePolicy policy);
+                    const RefPlan & walk_plan, UniversePolicy policy);
 
     /// The round's `_ckpt.checkpoint` witness per namespace — the SECOND, hint-independent witness the
     /// walk decides its absents against. ONE call site, in the fold, right where the hint is grouped.
@@ -753,8 +764,8 @@ private:
     RefScanSummary enumerateRefPrefix();
 
     /// The round's ONE hint enumeration (`enumerateRefPrefix`), followed by its one fresh catalog cut
-    /// and the validated adopted-parent rows. The returned `RoundInput` owns all three and is the only
-    /// value that may reach the authoritative plan builder and fold.
+    /// and the validated adopted-parent rows. Its `RoundInput` can only be moved into the authoritative
+    /// plan builder; the resulting `RefPlan` owns all three and is the only value that reaches consumers.
     RoundInput listRefPrefix(const GcState & state);
 
     /// THE STORE-QUALITY DETECTOR (historically "probe A"). SAMPLED on a deterministic cadence
@@ -769,7 +780,7 @@ private:
     /// about the STORE, and the fold is immune to it by construction — the intake reads by exact key.
     /// Its whole output is a report: the `ref_list_probe` phase row (`due`/`performed`/`skipped`/
     /// `holes`), `gc_anomaly` audit rows, `CasGcProbeA*` ProfileEvents, and the text log.
-    void sampleRefListQuality(const RoundInput & round_input, uint64_t current_round);
+    void sampleRefListQuality(const RefPlan & walk_plan, uint64_t current_round);
 
     /// (reclaimDroppedShards was removed with the snapshot+log ref model: there is no mutable per-namespace
     /// shard object to tombstone+reclaim; physical namespace reclamation is the namespace-cleanup item.)
@@ -929,9 +940,8 @@ public:
     /// Test-only access to the round's ref-prefix enumeration (its `changed_shards` is the defer signal).
     RefScanSummary listRefPrefixForTest(const GcState & state)
     {
-        const RoundInput round_input = listRefPrefix(state);
-        const RefPlan plan = buildRefWalkPlan(round_input);
-        RefScanSummary scan = round_input.refScan();
+        const RefPlan plan = buildRefWalkPlan(listRefPrefix(state));
+        RefScanSummary scan = plan.refScan();
         scan.changed_shards = plan.changedRows();
         return scan;
     }

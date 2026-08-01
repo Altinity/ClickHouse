@@ -1193,10 +1193,8 @@ TEST(CasGcRefWalkPlan, CatalogIsSoleRowAdmissionAuthorityAcrossOrdinaryAndRebuil
     rebuild_scan.max_log_by_life.emplace(UInt128{1}, RefTxnId{1, 12});
     rebuild_scan.max_log_by_life.emplace(UInt128{3}, RefTxnId{3, 12});
 
-    const RoundInput ordinary_round_input{ordinary_scan, cut};
-    const RoundInput rebuild_round_input{rebuild_scan, cut};
-    const RefPlan ordinary = buildRefWalkPlan(ordinary_round_input);
-    const RefPlan rebuild = buildRefWalkPlan(rebuild_round_input);
+    const RefPlan ordinary = tests::buildRefWalkPlanForTest(ordinary_scan, cut);
+    const RefPlan rebuild = tests::buildRefWalkPlanForTest(rebuild_scan, cut);
     const auto ordinary_parent_states = ordinary.parentFoldStates();
     const auto rebuild_parent_states = rebuild.parentFoldStates();
     const auto ordinary_successor_states = ordinary.successorFoldStates();
@@ -1236,6 +1234,8 @@ TEST(CasGcRefPlan, RoundInputOwnsObservationsAndSuccessorStateCannotChangePlan)
     /// This catches a plan that borrows the post-LIST observations or lets its successor state alias a
     /// row. Replacing the owning `RoundInput`/`RefPlan` boundary with the former loose inputs, or
     /// returning plan storage for the successor, must make this fail.
+    static_assert(!std::is_constructible_v<RoundInput, RefScanSummary, CasRefCatalog::Snapshot>);
+    static_assert(!std::is_default_constructible_v<RoundInput>);
     static_assert(!std::is_default_constructible_v<RefPlan>);
     static_assert(!std::is_assignable_v<RefPlan &, RefPlan>);
     static_assert(!std::is_assignable_v<RoundInput &, RoundInput>);
@@ -1250,8 +1250,7 @@ TEST(CasGcRefPlan, RoundInputOwnsObservationsAndSuccessorStateCannotChangePlan)
     observations.parent_ref_lives.emplace(UInt128{2}, RefLifeFoldState{
         .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{2, 3}}});
 
-    const RoundInput round_input{observations, cut};
-    const RefPlan plan = buildRefWalkPlan(round_input);
+    const RefPlan plan = tests::buildRefWalkPlanForTest(observations, cut);
 
     /// The caller may reuse and mutate the sources after its one post-LIST/catalog observation and
     /// plan construction. Those mutations cannot retarget the plan DEFER, fold, and publication use.

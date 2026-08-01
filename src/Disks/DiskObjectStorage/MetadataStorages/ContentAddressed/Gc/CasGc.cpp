@@ -194,13 +194,13 @@ size_t RefPlan::changedRows() const
     });
 }
 
-RefPlan buildRefWalkPlan(const RoundInput & round_input)
+RefPlan buildRefWalkPlan(RoundInput && round_input)
 {
     ProfileEvents::increment(ProfileEvents::CasGcRefWalkPlansBuilt);
-    const CasRefCatalog::Snapshot & catalog_cut = round_input.catalogCut();
-    const RefScanSummary & ref_scan = round_input.refScan();
+    RefPlan plan{std::move(round_input.ref_scan), std::move(round_input.catalog_cut)};
+    const CasRefCatalog::Snapshot & catalog_cut = plan.catalog_cut;
+    const RefScanSummary & ref_scan = plan.ref_scan;
     catalog_cut.life_index.throwIfAmbiguous("CAS ref walk plan");
-    RefPlan plan;
 
     /// The sole admission loop. Everything below can only find one of these rows.
     for (const CatalogEntry & entry : catalog_cut.catalog.entries)
@@ -269,6 +269,16 @@ RefPlan buildRefWalkPlan(const RoundInput & round_input)
         it->second.tail_observation = tail;
     }
     return plan;
+}
+
+namespace tests
+{
+
+RefPlan buildRefWalkPlanForTest(RefScanSummary ref_scan, CasRefCatalog::Snapshot catalog_cut)
+{
+    return buildRefWalkPlan(RoundInput{std::move(ref_scan), std::move(catalog_cut)});
+}
+
 }
 
 uint64_t retiredLogicalSize(ObjectKind kind, uint64_t object_size, uint64_t blob_header_len)
@@ -533,14 +543,12 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// timer's destructor fires on the deferred round's early return. This phase also performs TWO of
     /// the round's reads of the adopted fold seal (`graduationDue` and `listRefPrefix` each read the
     /// same key) -- see `fold_seal_reads` below.
-    std::optional<RoundInput> round_input;
     std::optional<RefPlan> walk_plan;
     {
         GcPhaseTimer t(phase_sink, "defer_decision");
         const bool graduation_due = graduationDue(state, new_round);
-        round_input.emplace(listRefPrefix(state));
-        walk_plan.emplace(buildRefWalkPlan(*round_input));
-        const RefScanSummary & ref_scan = round_input->refScan();
+        walk_plan.emplace(buildRefWalkPlan(listRefPrefix(state)));
+        const RefScanSummary & ref_scan = walk_plan->refScan();
         const size_t changed = walk_plan->changedRows();
         const bool defer = shouldDeferRound(changed, graduation_due, rounds_since_last_fold_,
                                             store->poolConfig().gc_fold_threshold,
@@ -603,7 +611,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// that ever enumerates `cas/ns/stream/` a second time. Its placement here — outside `fold`, with a `void`
     /// return — is the structural statement that it gates nothing: there is no value for a fold decision
     /// to read even by accident.
-    sampleRefListQuality(*round_input, new_round);
+    sampleRefListQuality(*walk_plan, new_round);
 
     /// Emit that the round's single pass begins.
     EventEmitter{*store}.emit([&](CasEvent & e)
@@ -635,7 +643,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
 
     /// The pass performs discovery, windowing, and the three-cursor merge (spare / graduate / condemn).
     /// It emits phases 5..10 of its own.
-    FoldResult folded = fold(state, state_token, report, new_round, *round_input, *walk_plan, policy);
+    FoldResult folded = fold(state, state_token, report, new_round, *walk_plan, policy);
 
     /// THE ROUND'S DESTRUCTIVE GATE, read once, here, and consulted at EVERY destructive site below.
     /// It is available this early because `fold` computes it (see `FoldResult::suppress_destructive`),
@@ -1466,8 +1474,7 @@ Gc::GenerationSealProbe Gc::probeGenerationForSeal(uint64_t generation)
 }
 
 Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & report,
-                        uint64_t current_round, const RoundInput & round_input,
-                        const RefPlan & walk_plan, UniversePolicy policy)
+                        uint64_t current_round, const RefPlan & walk_plan, UniversePolicy policy)
 {
     Backend & backend = store->backend();
     const Layout & layout = store->layout();
@@ -1487,7 +1494,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// reads a single body. No I/O: the keys are already in hand.
     std::optional<GcPhaseTimer> ref_list_timer;
     ref_list_timer.emplace(phase_sink, "fold_ref_group");
-    const RefScanSummary & ref_scan = round_input.refScan();
+    const RefScanSummary & ref_scan = walk_plan.refScan();
     const std::vector<String> & ref_object_keys = ref_scan.keys;
 
     /// Stage B (spec INV-3): the round's ONE catalog `GET`. `live_incarnation` names, for every
@@ -1497,7 +1504,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// remains the round's intra-namespace hint (what a namespace the catalog already named has
     /// listed), never the source of WHICH namespaces exist. Reused below for the catalog-only walk
     /// targets, so the round pays this GET once.
-    const CasRefCatalog::Snapshot & catalog_snapshot = round_input.catalogCut();
+    const CasRefCatalog::Snapshot & catalog_snapshot = walk_plan.catalogCut();
     std::map<String, UInt128> live_incarnation;
     /// Final review F1: a `Creating` life IS named by the catalog -- `live_incarnation` excludes it
     /// only because it is not yet WALKABLE (spec §3, no publication can exist), not because the
@@ -3489,9 +3496,9 @@ RoundInput Gc::listRefPrefix(const GcState & state)
     return RoundInput{std::move(scan), catalog_cut};
 }
 
-void Gc::sampleRefListQuality(const RoundInput & round_input, uint64_t current_round)
+void Gc::sampleRefListQuality(const RefPlan & walk_plan, uint64_t current_round)
 {
-    const RefScanSummary & round_scan = round_input.refScan();
+    const RefScanSummary & round_scan = walk_plan.refScan();
     /// THE STORE-QUALITY DETECTOR — "the store lied". Compare two independent full enumerations of
     /// `cas/ns/stream/`: the round's own (`round_scan`) and one taken here. The ref log per namespace is
     /// append-only with strictly increasing ids, so:
@@ -3586,7 +3593,7 @@ void Gc::sampleRefListQuality(const RoundInput & round_input, uint64_t current_r
         if (const auto mit = probe_scan.max_log_by_life.find(life_id); mit != probe_scan.max_log_by_life.end())
             probe_max = mit->second;
 
-        const std::optional<NamespaceLifeId> life = round_input.catalogCut().life_index.resolve(life_id);
+        const std::optional<NamespaceLifeId> life = walk_plan.catalogCut().life_index.resolve(life_id);
         const String life_label = life ? life->ns.string() : renderIncarnation(life_id);
 
         const auto reportHole = [&](const RefTxnId & id, const char * which)
@@ -3864,8 +3871,8 @@ RebuildReport Gc::rebuildBaseline(bool force)
     RefScanSummary rebuild_round_scan = rebuild_ref_scan;
     if (prior_seal)
         rebuild_round_scan.parent_ref_lives = prior_seal->ref_lives;
-    const RoundInput rebuild_round_input{std::move(rebuild_round_scan), rebuild_work_catalog_cut};
-    const RefPlan rebuild_walk_plan = buildRefWalkPlan(rebuild_round_input);
+    const RefPlan rebuild_walk_plan = buildRefWalkPlan(
+        RoundInput{std::move(rebuild_round_scan), rebuild_work_catalog_cut});
     const std::vector<NamespaceLifeId> rebuild_walk_universe = rebuild_walk_plan.lives();
 
     if (validate_generation_zero_ref_baseline)

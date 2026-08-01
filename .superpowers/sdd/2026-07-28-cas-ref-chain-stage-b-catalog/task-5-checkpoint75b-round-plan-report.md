@@ -3,16 +3,15 @@
 ## Implemented boundary
 
 `listRefPrefix` completes the one hot `LIST(cas/ns/stream/)`, reads the later catalog cut, and
-constructs an owning `RoundInput`. `RoundInput` owns both the completed `RefScanSummary` and the
-catalog snapshot, so its callers may reuse or change their temporary input containers without
-changing the reconciled round. `runRegularRound` retains one `RoundInput` and builds exactly one
-`RefPlan`; its DEFER and fold paths use const views. A healthy rebuild follows the same ordering and
-uses the same sole `buildRefWalkPlan`; damaged-state rebuild preserves its no-catalog-mutation route.
+constructs a capability-restricted `RoundInput`, then moves it immediately into the one owning
+`RefPlan`. `runRegularRound` retains only that plan; its DEFER, store-quality probe, fold, frontier,
+and publication paths use its const views. A healthy rebuild follows the same ordering and uses the
+same sole `buildRefWalkPlan`; damaged-state rebuild preserves its no-catalog-mutation route.
 
 `buildRefWalkPlan` is the only row-admission loop. It adds only `Live` and `Removing` catalog
 incarnations, then enriches those existing rows by exact id from parent state, listing hints, holds,
-checkpoint observations, and tail observations. `RefPlan` has a private default constructor, is
-non-assignable, exposes const rows only, and has no mutable `foldState` or destructive
+checkpoint observations, and tail observations. `RefPlan` has a private mandatory constructor, is
+non-assignable, exposes const views only, and has no mutable `foldState` or destructive
 `releaseFoldStates` operation.
 
 Fold state has two deliberately distinct immutable plan-derived views:
@@ -71,3 +70,31 @@ construction sites. `foldState` and `releaseFoldStates` are absent. Fold no long
 parent state: it derives both the baseline parent view and the mutable successor seed from the
 immutable plan. No additional catalog `GET`, hot `LIST`, runtime-cache, maintenance, janitor, or
 Task 13 change was introduced.
+
+## Fix round 1 — bind observations into `RefPlan`
+
+Independent review identified that the original public raw `RoundInput` constructor and the
+separate `(RoundInput, RefPlan)` fold arguments permitted plan A to be combined with scan/catalog
+observations B. The fix makes raw `RoundInput` construction private to `Gc` and the narrow named
+`tests::buildRefWalkPlanForTest` fixture wrapper. The sole builder consumes an rvalue `RoundInput`
+and moves its scan plus catalog cut into `RefPlan`. `fold`, the store-quality probe, DEFER accounting,
+frontier/publication, and healthy rebuild now receive the bound plan only; no downstream raw round
+carrier remains.
+
+The pure-builder tests use the named wrapper, which invokes the same production builder. They pin
+that arbitrary raw `RoundInput` construction and default/assignment bypasses are unavailable, while
+retaining source-copy and parent/successor isolation checks. The existing real-round successor and
+baseline-guard tests remain in the focused gate.
+
+### Fix round 1 TDD and mutation evidence
+
+1. Before the production change, the revised fixture tests failed to compile with seven expected
+   errors: the named test wrapper was absent and the raw constructor capability assertion failed.
+2. After the binding change, the full build and focused production-path suite passed.
+3. As a deliberate regression, the raw constructor was made public again. The focused catalog test
+   object then failed with exactly the expected `RoundInput` constructibility static assertion. This
+   mutation reopens the capability required to create arbitrary scan/catalog pairs; the production
+   fold no longer accepts such a carrier separately. The private constructor was restored before all
+   final gates.
+
+Fix-round logs use the `build/task5_checkpoint75b_fix_r1_*` prefix.
