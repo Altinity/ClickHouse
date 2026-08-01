@@ -83,33 +83,36 @@ fold-state row; presence is positive evidence that the terminal fold is durable,
 physical cleanup succeeded. Deletion additionally requires that the same row carries no durable hold.
 The seal-producing invocation performs **no namespace-removal cleanup and no catalog deletion after
 adoption**. Instead, every later GC invocation runs one catalog-only **pre-fold drain** immediately
-after acquiring the lease and before defer, stream enumeration, a catalog cut used for folding, fold,
+after acquiring the lease and before defer, stream enumeration, the fold's catalog cut, fold,
 or successor-seal adoption. It reads the authoritative currently adopted seal plus a fresh complete
 catalog observation, and exact-CAS-deletes every complete observed `Removing` row whose matching
 adopted life row has cleanup evidence and no hold. Each CAS outcome is resolved conclusively: if the
 same exact row may remain after a conflict or ambiguous outcome, the invocation aborts before it can
 defer or publish a successor. Because the catalog token covers every row, the drain selects one
-eligible row from a complete snapshot and restarts its complete scan after every CAS outcome; only a
-scan with no eligible row may proceed to the fresh successor cut. The deletion is a lifecycle
-mutation, not object reclamation; it has no `suppress_destructive` input and performs no physical
-delete.
+eligible row from a complete snapshot and restarts its complete scan after every CAS outcome. Only a
+scan with no eligible row may proceed. The invocation then completes its ONE hot
+`LIST(cas/ns/stream/)`, takes ONE fresh authoritative full-catalog `{token, value}` cut, passes that
+cut plus the completed LIST observations to `buildRefWalkPlan`, and only then decides `DEFER` or
+publishes fold/seal/adoption state. The deletion is a lifecycle mutation, not object reclamation; it
+has no `suppress_destructive` input and performs no physical delete.
 
 This is a helping barrier rather than a promise that a deposed actor stops. If leader A stalls with a
 drainable row, leader B independently drains that same row before B may adopt anything. A's later exact
 catalog CAS then conflicts with B's deletion or observes the row already absent. Inductively, a seal
 that adds a hold for a row an older adopted seal made drainable is unpublishable: the successor's
-mandatory drain deletes the catalog row before the successor takes its catalog cut, so the row cannot
-enter the successor plan. A deferred invocation still drains first and then returns with the old
+mandatory drain deletes the catalog row before the successor completes its hot LIST and takes its sole
+catalog cut, so the row cannot enter the successor plan. A deferred invocation still drains first,
+completes the LIST, consumes the later cut and then returns with the old
 no-hold seal adopted; that bounded residue is inert because every consumer joins it through a fresh
 catalog cut. A stop before deletion makes the next invocation repeat the idempotent catalog-only
 drain. Catalog ambiguity, an invalid adopted seal, a missing proof row, a hold, or an unresolved exact
 CAS fails closed before successor publication.
 
 `REBUILD` is an adoption path and cannot bypass the same barrier. With healthy authoritative
-`gc/state`, it acquires the lease, drains from the adopted parent, and only then takes the catalog cut
-used to build its successor. With absent or undecodable `gc/state`, no seal found by LIST is authority
-for catalog deletion: recovery performs zero catalog deletes, adopts a reconstructed baseline, and a
-later ordinary invocation drains from that newly authoritative seal.
+`gc/state`, it acquires the lease, drains from the adopted parent, completes the hot LIST, and only then
+takes the catalog cut used to build its successor. With absent or undecodable `gc/state`, no seal found
+by LIST is authority for catalog deletion: recovery performs zero catalog deletes, adopts a
+reconstructed baseline, and a later ordinary invocation drains from that newly authoritative seal.
 
 There is deliberately no special bounded physical cleanup attempt in removal. `_ckpt`, stream,
 `_files` and every other life-owned object become ordinary dead-life debris for the perpetual
@@ -153,8 +156,9 @@ This shape also makes the cardinality bound executable: every newly encoded seal
 ref-life row per `Live`/`Removing` catalog row in its cut, cleanup evidence belongs to that same row,
 and the seal encoder rejects duplicate life ids. An
 input row whose id the cut does not name is counted and dropped, never carried as an independent source
-of work. A hint id absent from the earlier round cut is post-cut/unknown and deferred; it cannot mint a
-row. A carried hold is legal only on the `Live`/`Removing` row that already owns it, and the no-hold
+of work. Because the hot LIST completes before this sole cut, a listed id absent from the later cut is
+dead, inert debris: count and drop it, never admit it and never `DEFER` solely because it is absent. A
+carried hold is legal only on the `Live`/`Removing` row that already owns it, and the no-hold
 deletion precondition above remains an enforcement rather than a derivation.
 
 One bounded residue remains: the adopted parent seal can contain the completed predecessor life row
@@ -203,8 +207,10 @@ retain path identity, but neither is an authority for a namespace life.
 
 An **immutable catalog cut** is the decoded bytes and object token returned by ONE successful
 `GET cas/ref_catalog`, together with the reverse index built exactly once from those bytes. A consumer
-never patches that index from a later GET or mixes two cuts inside one decision: if it needs an id that
-appeared after its cut, it restarts the whole decision with a fresh cut or defers it. Every catalog row —
+never patches that index from a later GET or mixes two cuts inside one decision. For the fold, that ONE
+cut is taken after the completed hot LIST and is the sole `buildRefWalkPlan` authority. A catalog
+admission after the cut could not have appeared in the already-completed LIST and is next-round work;
+LIST omission may delay observations but cannot change the catalog-built row set. Every catalog row —
 `Creating`, `Live` and `Removing` — participates in the reverse index
 `life_id → {name, incarnation}`. A `life_id` is never deliberately reused, so the existing random-128
 uniqueness assumption now holds pool-wide rather than per logical name.
@@ -217,11 +223,13 @@ holding — or freshly resolving — an unrelated unique life may continue. Thus
 pool-wide maintenance that depends on a complete ownership graph, not all unrelated data-plane I/O.
 
 Absence from a cut is not by itself proof of absence from the catalog's future. A listed id is inert
-debris only when the cut is known to have been read AFTER that object was observed. The janitor obtains
-exactly that order by reading the catalog after each LIST page; catalog-before-object publication then
-proves an id absent from the post-page cut is dead. The fold takes its round cut before the hot LIST, so
-an id absent there is merely post-cut/unknown: ignore it as a scheduling hint and defer it to a later
-round, never resolve it from key text and never delete on that observation.
+debris when the cut is known to have been read AFTER that object was observed. Both classifiers have
+that order, at different scopes: the fold completes its ONE hot stream LIST and then takes its ONE
+round cut; the janitor reads a separate catalog cut after each bounded ownership-tree LIST page.
+Catalog `Creating` is durable before any life object, and the first stream PUT occurs only after
+`Live` publication and recovery. Therefore an id returned by either completed LIST observation but
+absent from its corresponding later cut is dead. The fold counts and drops it without admission or
+DEFER; only the janitor may use its post-page cut to nominate physical deletion.
 
 **The round's one hot LIST covers `cas/ns/stream/` only** — `_ckpt` and `_files` are never enumerated by
 it. That LIST stays what it always was: a scheduling and performance hint, never the correctness path,
@@ -229,7 +237,12 @@ which remains catalog membership plus exact arithmetic reads and the frontier pr
 every family is reclaimed by a separately paced, leak-only enumeration of `cas/ns/`, which takes one
 fresh catalog GET per page rather than per key.
 
-**Rejected, and recorded so the cheaper-looking options are not re-proposed.** Deleting the full LIST in
+**Rejected, and recorded so the cheaper-looking options are not re-proposed.** A parent-evidence
+exception for an id absent from a pre-LIST cut is non-convergent: after the successor seal omits the
+predecessor row, retained predecessor bytes lose that evidence and can force every later round to
+defer. Taking two catalog cuts — one before LIST for the plan and one after LIST for debris — is safe
+but strictly unnecessary: the single post-LIST cut supplies both plan authority and classification,
+while a second full GET and token/value pair add cost and mixed-cut failure modes. Deleting the full LIST in
 favour of an unbounded serial `GET N+1` chase has no bounded frontier while a namespace is being written
 and throws away the listing's scheduling witness. Adding an authoritative head object would put a CAS on
 the append path, which this design exists to avoid. Storing the logical path in the key — as `_path` or
@@ -413,10 +426,18 @@ dense ⇒ found.
 
 ## 5. GC fold and deletion safety {#fold}
 
-The fold takes one immutable catalog cut per round and performs ONE strict `cas/ns/stream/` hint
-enumeration (intake, covered-stream cleanup planning, defer). The separately paced dead-life janitor is
-not part of this hot enumeration; when scheduled, it takes one bounded `cas/ns/` page and its own
-post-page catalog cut as specified by INV-3. Fold
+After lease/adopted-parent validation and the conclusive catalog-only pre-fold drain, the fold performs
+ONE strict `LIST(cas/ns/stream/)` hint enumeration (intake, covered-stream cleanup planning, defer).
+Only after that LIST completes does it take ONE fresh immutable full-catalog `{token, value}` cut and
+pass the cut plus LIST observations to the sole `buildRefWalkPlan` intake. `Live`/`Removing` rows in
+that cut are admitted even if LIST omitted their objects. A listed id absent from the later cut is
+counted and dropped as inert dead debris; it is never admitted and its absence alone never causes
+`DEFER` or destructive suppression. A birth after the cut could not have appeared in the completed
+LIST and is next-round work. A LIST operation failure, unreadable/undecodable catalog, duplicate
+current `life_id`, or inability to obtain the one coherent token/value pair aborts before plan use,
+DEFER, fold or successor publication; there is no parent-evidence fallback or second fold catalog GET.
+The separately paced dead-life janitor is not part of this hot enumeration; when scheduled, it takes
+one bounded `LIST(cas/ns/)` page and its own later post-page catalog cut as specified by INV-3. Fold
 work advances hinted namespaces by arithmetic (`cursor + 1`; the `GET` per record was always owed;
 hint holes — including the observed `0x1430c`/`0x1430d` shape — fold through unnoticed); epochs are
 crossed only by consuming seals; impossible shapes (a 404 below a same-epoch witness — including one
@@ -476,9 +497,11 @@ Probe A: sampled, deterministic cadence, durable due/performed/skipped observabi
 nothing; the mount-time store gate (#23) is separate. Cleanup: covered logs are contiguous
 computable ranges under `_ckpt.checkpoint` + cursor; crossed dead epochs delete as closed ranges.
 A malformed physical stream key, an ambiguous current `life_id` or a generation-5 current-name mismatch
-may abort ref folding and suppress destruction. A well-formed opaque id absent from the round's earlier
-catalog cut does not: it is post-cut/unknown and is deferred. A well-formed id absent from the janitor's
-later post-page cut is dead-life debris and is handled by that leak-only path.
+may abort ref folding and suppress destruction. A well-formed opaque id returned by the completed hot
+LIST but absent from the fold's sole later catalog cut does not: it is counted and dropped as inert
+dead-life debris and never causes DEFER solely for absence. A well-formed id absent from the janitor's
+separate later post-page cut is likewise dead-life debris, but only that leak-only path may nominate
+its physical deletion.
 
 ## 6. Sweep deletion premise {#sweep}
 
@@ -512,10 +535,10 @@ namespace per epoch transition, and each adopted straggler costs a conditional P
 diagnostic start round + append-lane-admitted `Live→Removing` CAS + terminal append; the next GC
 invocation adds one adopted-seal GET and, for N eligible drain rows, at least N+1 complete catalog GETs
 (the initial scan plus a rescan after every resolved outcome) and N exact catalog-entry CASes in its
-pre-fold drain. Conflicts and ambiguity can add complete retry GETs and CASes before the successor cut.
-Fold: +1
-catalog `GET` per fold round; destructive rounds add one exact `GET` per quiet namespace (the frontier
-proof). When scheduled, the perpetual janitor adds one bounded page of the separately paced leak-only
+pre-fold drain. Conflicts and ambiguity can add complete retry GETs and CASes before the hot LIST.
+Fold: +1 catalog `GET` per fold round, after its ONE hot LIST and before plan construction; destructive
+rounds add one exact `GET` per quiet namespace (the frontier proof). When scheduled, the perpetual
+janitor adds one bounded page of the separately paced leak-only
 `cas/ns/` enumeration plus one catalog GET after that page; it never widens or repeats the round's hot
 `stream/` LIST and never reads the catalog per key. Deep arithmetic walks
 dominate backlog cost and share one pool-level concurrency budget with cleanup. Performance interactions
@@ -542,14 +565,20 @@ complete-token rescans, external resolution and the non-exact-CAS sabotage contr
 extended (recovery generations; wedge-retry vs successor-seal);
 `CaRefWriterCleanupCore`/`CaRefFoldClampRecoveryCore` extended per register items when those land.
 `CaRefDeltaIntakeCore` additionally asserts that the ref walk-plan key set is exactly the set of catalog
-`Live`/`Removing` ids. `CaRefPreFoldDrainCore` owns the compositional interface to that consumer: the
-post-drain transition exports one immutable catalog token/value pair, ref-plan intake records the same
-pair, and `IntakeConsumesFreshPostDrainCut` requires equality. `_sab_intake_uses_predrain_cut` waits
+`Live`/`Removing` ids. `CaRefPreFoldDrainCore` owns the compositional interface to that consumer: after
+the conclusive drain, `CompleteHotList` precedes `TakeFreshCut`, which exports the ONE immutable
+catalog token/value pair; ref-plan intake records the same pair, and
+`IntakeConsumesFreshPostDrainCut` requires equality. `_sab_cut_before_list` violates
+`FreshCutFollowsCompletedHotList`; `_sab_absent_listed_defers` restores the rejected unknown/defer
+classifier and violates `DeadListedPredecessorIsInert`. `_sab_intake_uses_predrain_cut` waits
 until the honest fresh cut exists, then feeds intake the earlier drain observation and makes that
 invariant red; `_sab_intake_uses_stale_token` independently preserves the fresh row value while
 substituting the earlier full-catalog token at the plan/adoption seam, proving both components of the
 pair are load-bearing. `WITNESS_DRAINED_ROW_ABSENT_FROM_INTAKE` reaches a real `Removing` deletion
-whose consumed cut is absent and whose plan omits the drained life. Thus cut provenance is executable
+whose consumed cut is absent and whose plan omits the drained life.
+`WITNESS_REBIRTH_WITH_RETAINED_DEBRIS_ADOPTS` reaches `Creating`, `Live`, stream PUT, a LIST that
+returns predecessor and successor, the later successor-only cut, zero debris DEFER and real adoption.
+Thus cut provenance and convergence are executable
 without copying adopted-parent, CAS-resolution or drain ordering into `CaRefDeltaIntakeCore`. That
 model still owns only fold/key-set semantics; its parent, hint, hold and checkpoint adapter-mint
 sabotage remains the control for forbidden row admission.
@@ -583,6 +612,8 @@ publication). The full enumerated list from rounds 5–9 rides in the implementa
 | Delete the incarnation entirely; forbid exact `RootNamespace` reuse forever | **Proposed and withdrawn, 2026-07-31**, after two independent reviews of the whole phase. It is coherent, and it needs somewhere to remember every retired name — which is the same shape as the `seq_floor` row above, so it fails for the same reason, one level up. A never-deleted `Retired` catalog state grows by one row per historical namespace and eventually refuses admission at the object cap; **normal UUID churn does not bound it**, since every fresh UUID also leaves a permanent row. No bounded exact compaction exists for opaque names, because compacting a retirement record and certifying physical emptiness are the same problem. A marker object outside the catalog bounds nothing either and reintroduces the marker class this design removes. Independently, permanent non-reuse is a regression against supported workflows (§3). |
 | Retirement as a `Retired` catalog state, or as a marker object | Rejected with the row above; both are only needed if the incarnation is deleted. Keeping it means **nothing has to remember a dead namespace at all** — the entry is deleted, debris is inert under its unreferenced opaque life id, and the catalog stays O(active). |
 | Namespace-local hold suppression | Deferred: blob in-degree is pool-wide, and no ownership-partition proof shows a held namespace cannot own a blob nominated by another namespace. The global destructive gate remains authoritative. |
+| Parent evidence as an exception for a listed id absent from a pre-LIST cut | Rejected as non-convergent: once the successor seal omits the predecessor row, retained predecessor debris has no parent evidence and can force every later round to defer. |
+| Two catalog cuts per fold, one before LIST and one after | Rejected as redundant: the sole post-LIST cut safely supplies plan authority and debris classification; a second full GET/token pair adds cost and mixed-cut state without proving another fact. |
 | Fresh-epoch rebirth | Failed round 6's audit (server-root-wide allocator; unqualified families). |
 | Checkpoint inside the catalog; never cleaning covered logs; in-place migration; RefSnapLog combined state; local floors; enforced timing; widened probe A | Each rejected with its reason recorded in rounds 1–8 (`tmp/codex_r*_findings.md`) and the alternatives tables of v5–v8 (git history of this file). |
 

@@ -1306,10 +1306,10 @@ GET to classify the listed ids.
   owned work re-runs the whole precondition for both owner and epoch instead of reusing the old answer.
 - [x] **Step 5: rewire recovery tools, not authority.** fsck, REBUILD, inspect and decommission group a
   listed object by physical id and join it to the catalog cut. Before Task 5's codec consolidation,
-  REBUILD carries coverage only for ids named by that cut; an id absent from REBUILD's earlier cut is
-  reported and deferred, not converted into
-  a phantom logical namespace merely because REBUILD condemns nothing and not deleted as debris. The
-  janitor alone gets the later post-page cut that can nominate an absent id for deletion. Neither a
+  REBUILD carries coverage only for ids named by the sole cut taken after its completed hot LIST; a
+  listed id absent from that later cut is counted and dropped as inert debris, not converted into a
+  phantom logical namespace, and never causes DEFER solely for absence. The janitor gets its separate
+  later post-page cut, which alone may nominate an absent id for physical deletion. Neither a
   listed key nor any future `_path` may
   mint a catalog row or authorize a read/delete. Decommission enumerates owned logical names exactly
   from the catalog; it never tries to recover `server_root_id` from a life key.
@@ -1374,9 +1374,9 @@ This is helping, not mutual exclusion. If A stalls after observing a drainable r
 lease, B independently completes that deletion before B may publish anything. A's later exact catalog
 CAS loses or observes absence. Inductively, no successor can add a hold to a row an older adopted seal
 made drainable: the mandatory drain removes the catalog row before the successor's fresh cut can admit
-it. A deferred invocation still drains before its early return. Healthy `REBUILD` uses the same
-barrier; damaged-state `REBUILD` has no authoritative parent and performs zero catalog deletes before
-adopting a reconstructed baseline.
+it. A deferred invocation still completes the drain, hot LIST, fresh cut and plan construction before
+its early return. Healthy `REBUILD` uses the same barrier; damaged-state `REBUILD` has no authoritative
+parent and performs zero catalog deletes before adopting a reconstructed baseline.
 
 This deliberately removes the design seam that kept producing omissions. There are no independent
 ref cursors and cleanup-item collections, no string `"<namespace>/0"`, no fictitious ref shard zero,
@@ -1567,9 +1567,10 @@ making each adapter attempt to mint a row; they do not duplicate a lifecycle pre
   A delete, and require the invariant to fail. The operation journal pins `B lease CAS -> exact catalog
   CAS resolved -> completed hot LIST -> ONE fresh catalog cut -> buildRefWalkPlan -> successor seal
   PUT/adoption`.
-- [ ] **DEFER and `REBUILD` cannot bypass the barrier.** A deferred invocation deletes eligible rows
-  before its early return. Healthy `FORCE REBUILD` acquires the lease, drains from the authoritative
-  parent, completes the hot LIST and only then takes its rebuild cut. With absent/undecodable
+- [ ] **DEFER and `REBUILD` cannot bypass the barrier.** A deferred invocation deletes eligible rows,
+  completes the hot LIST, consumes the later cut and builds the plan before its early return. Healthy
+  `FORCE REBUILD` acquires the lease, drains from the authoritative parent, completes the hot LIST and
+  only then takes its rebuild cut. With absent/undecodable
   `gc/state`, `REBUILD` performs zero
   catalog mutations based on a seal discovered by LIST; it may adopt a reconstructed baseline, whose
   eligible rows are drained by the next authoritative invocation. A stale pre-lease rebuild cut is
@@ -1641,7 +1642,8 @@ making each adapter attempt to mint a row; they do not duplicate a lifecycle pre
   `life_id`; do not reconstruct a `RootNamespace` from the key and do not consult `_path`. The immutable
   post-page cut's reverse index classifies an id currently named by any `Creating`, `Live` or `Removing`
   row as retained. An id absent from this cut is a dead-life candidate because the LIST
-  page preceded the cut; absence from the round's older cut has no such meaning. A malformed key under
+  page preceded the cut. The fold uses the same observation-before-cut proof at whole-hot-LIST scope,
+  but only this janitor path may turn absence into a physical deletion candidate. A malformed key under
   either namespace family is anomaly-and-continue; a loose object under `roots/` is outside this scan
   entirely.
 - [ ] **Creation-before-object ordering closes the new-life race.** Catalog `Creating{name→life_id}` is
