@@ -136,6 +136,21 @@ is deliberately documented as unverified rather than represented by an unrelated
 independent review additionally required rejected and non-landing ambiguous all-row outcomes; both
 now have only the complete-scan continuation and the final 11/11 rerun covers the amended model.
 
+## Fix round 2/5
+
+Review clarification: `CaRefNsCleanupStaleLeaderCore` has no cleanup-evidence state. The spec now
+states its actual, narrow scope — a perpetual janitor captures a physical id from a LIST page and uses
+that captured id for a delayed delete after same-name rebirth. The local evidence/no-hold/exact-row
+deletion proof remains solely owned by `CaRefCatalogCore`; the duplicate later janitor-ownership clause
+was removed to keep the ownership paragraph non-redundant.
+
+Implementation commit: `06d9937c19e` (`docs: correct janitor model ownership`).
+
+Verification: `rg -n -C 2 'CaRefNsCleanupStaleLeaderCore|per-life cleanup evidence|captured physical id|captured-physical-id|CaRefCatalogCore.*(evidence|exact-row)' docs/superpowers/specs/2026-07-27-cas-ref-chain-complete-cut-design.md docs/superpowers/models/CaRefNsCleanupStaleLeaderCore.tla`
+confirmed the model captures and later deletes by physical id while the spec assigns the local proof to
+`CaRefCatalogCore`. `git diff --check` passed without output. No TLC run was needed because this round
+changes prose only.
+
 ## Preserved unrelated dirt
 
 Left untouched: user-owned `.superpowers/sdd/task-5-report.md`; the five untracked obsolete
