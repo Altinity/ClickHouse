@@ -888,6 +888,14 @@ public:
     {
         ref_ledger.setReadableCatalogAfterObservationHookForTest(std::move(hook));
     }
+    void setCatalogMutationHookForTest(std::function<void(CasRefLedger::CatalogMutationPhaseForTest)> hook)
+    {
+        ref_ledger.setCatalogMutationHookForTest(std::move(hook));
+    }
+    void setRuntimePublicationAfterCatalogEpochCheckHookForTest(std::function<void()> hook)
+    {
+        ref_ledger.setRuntimePublicationAfterCatalogEpochCheckHookForTest(std::move(hook));
+    }
     void setWedgeBeforeSlotOccupyHookForTest(std::function<void()> hook)
     {
         ref_ledger.setWedgeBeforeSlotOccupyHookForTest(std::move(hook));

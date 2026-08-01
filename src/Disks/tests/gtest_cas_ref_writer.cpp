@@ -764,6 +764,92 @@ TEST(RefWriterRuntimeIdentity, ColdReadRejectsCatalogLifeReplacedAfterItsObserva
     EXPECT_EQ(*store->refTableLifeForTest(ns), successor_life);
 }
 
+/// Mutation caught: advancing the catalog observation epoch without `ref_queue_mutex` lets a cold
+/// reader publish its predecessor life after the epoch comparison. The phased mutation seam proves
+/// the advance cannot pass that comparison/publication critical section; exact invalidation then
+/// detaches the publication that linearized before the mutation.
+TEST(RefWriterRuntimeIdentity, CatalogMutationSerializesWithColdRuntimePublication)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/catalog-mutation-runtime-publication"};
+    DB::Cas::tests::casAdmitEntry(*backend, layout, ns);
+    const CatalogEntry predecessor = catalogEntryOrThrow(*backend, layout, ns);
+    const NamespaceLifeId predecessor_life
+        = NamespaceLifeId::fromCatalogEntry(predecessor.ns, predecessor.incarnation);
+    ASSERT_EQ(store->refTableRuntimeIdentityForTest(ns), 0u);
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool comparison_reached = false;
+    bool mutation_before_lock = false;
+    bool mutation_after_lock = false;
+    store->setCatalogMutationHookForTest([&](CasRefLedger::CatalogMutationPhaseForTest phase)
+    {
+        std::lock_guard lock(mutex);
+        if (phase == CasRefLedger::CatalogMutationPhaseForTest::BeforeRefQueueLock)
+            mutation_before_lock = true;
+        else
+            mutation_after_lock = true;
+        cv.notify_all();
+    });
+    store->setRuntimePublicationAfterCatalogEpochCheckHookForTest([&]
+    {
+        std::unique_lock lock(mutex);
+        comparison_reached = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return mutation_before_lock; });
+        EXPECT_FALSE(mutation_after_lock)
+            << "catalog mutation passed the runtime publication critical section";
+    });
+
+    std::exception_ptr reader_error;
+    std::thread reader([&]
+    {
+        try
+        {
+            (void)store->listRefs(ns);
+        }
+        catch (...)
+        {
+            reader_error = std::current_exception();
+        }
+    });
+    {
+        std::unique_lock lock(mutex);
+        cv.wait(lock, [&] { return comparison_reached; });
+    }
+
+    CatalogEntry successor;
+    std::thread mutator([&]
+    {
+        store->noteRefCatalogMutation();
+        successor = replaceCatalogLifeForRuntimeRace(*backend, layout, predecessor, UInt128{0xabc003});
+        const NamespaceLifeId successor_life
+            = NamespaceLifeId::fromCatalogEntry(successor.ns, successor.incarnation);
+        if (backend->putIfAbsent(layout.refCkptKey(successor_life), encodeRefCkpt(RefCkpt{
+            .life_epoch = store->liveWriterEpoch(),
+            .checkpoint_snapshot_id = std::nullopt,
+            .last_epoch_seal = std::nullopt})).outcome != PutOutcome::Done)
+            throw std::runtime_error("test failed to publish successor checkpoint");
+        store->invalidateRemovedCatalogLife(predecessor_life);
+    });
+
+    reader.join();
+    mutator.join();
+    store->setRuntimePublicationAfterCatalogEpochCheckHookForTest(nullptr);
+    store->setCatalogMutationHookForTest(nullptr);
+
+    EXPECT_TRUE(mutation_after_lock);
+    EXPECT_EQ(store->refTableRuntimeIdentityForTest(ns), 0u);
+    EXPECT_NO_THROW((void)store->listRefs(ns));
+    ASSERT_TRUE(store->refTableLifeForTest(ns));
+    EXPECT_EQ(*store->refTableLifeForTest(ns),
+        NamespaceLifeId::fromCatalogEntry(successor.ns, successor.incarnation));
+    (void)reader_error;
+}
+
 /// `DROP DETACHED PART` reaches this point lookup for a part that may already be absent. Its probe
 /// must not turn a missing table namespace into a new catalog life.
 TEST(RefWriterNonMinting, ResolveRefOnAbsentNamespaceDoesNotMutateCatalog)

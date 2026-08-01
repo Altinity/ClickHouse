@@ -207,7 +207,7 @@ public:
 
     /// Invalidates cold catalog observations before an in-process actor attempts a catalog mutation.
     /// Spurious advances are harmless; a late advance would leave a stale publication window.
-    void noteCatalogMutation() { catalog_lifecycle_epoch.fetch_add(1, std::memory_order_acq_rel); }
+    void noteCatalogMutation();
 
     /// Reconciles resident removal-closed runtimes against one complete catalog observation. An exact
     /// life absent from or replaced in the cut is invalidated and exactly detached; a matching current
@@ -387,6 +387,20 @@ public:
     void setReadableCatalogAfterObservationHookForTest(std::function<void()> hook)
     {
         readable_catalog_after_observation_hook_for_test = std::move(hook);
+    }
+
+    enum class CatalogMutationPhaseForTest
+    {
+        BeforeRefQueueLock,
+        AfterRefQueueLock,
+    };
+    void setCatalogMutationHookForTest(std::function<void(CatalogMutationPhaseForTest)> hook)
+    {
+        catalog_mutation_hook_for_test = std::move(hook);
+    }
+    void setRuntimePublicationAfterCatalogEpochCheckHookForTest(std::function<void()> hook)
+    {
+        runtime_publication_after_catalog_epoch_check_hook_for_test = std::move(hook);
     }
 
     /// Pauses a wedge retry after it captured the exact predecessor attempt but before the request
@@ -924,6 +938,8 @@ private:
     std::function<void()> append_after_runtime_capture_hook_for_test;
     std::function<void()> read_before_state_lock_hook_for_test;
     std::function<void()> readable_catalog_after_observation_hook_for_test;
+    std::function<void(CatalogMutationPhaseForTest)> catalog_mutation_hook_for_test;
+    std::function<void()> runtime_publication_after_catalog_epoch_check_hook_for_test;
     std::function<void()> wedge_before_slot_occupy_hook_for_test;
     std::function<void()> snapshot_after_capture_hook_for_test;
     std::function<void()> snapshot_before_ckpt_cas_hook_for_test;

@@ -506,6 +506,18 @@ std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::lookupRefTableRunti
     return it == ref_name_slots.end() ? nullptr : it->second.current;
 }
 
+void CasRefLedger::noteCatalogMutation()
+{
+    if (catalog_mutation_hook_for_test)
+        catalog_mutation_hook_for_test(CatalogMutationPhaseForTest::BeforeRefQueueLock);
+
+    std::lock_guard lock(ref_queue_mutex);
+
+    if (catalog_mutation_hook_for_test)
+        catalog_mutation_hook_for_test(CatalogMutationPhaseForTest::AfterRefQueueLock);
+    catalog_lifecycle_epoch.fetch_add(1, std::memory_order_acq_rel);
+}
+
 std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireRefTableRuntime(
     const NamespaceLifeId & life, uint64_t admitted_generation,
     std::optional<uint64_t> observed_catalog_epoch)
@@ -521,6 +533,8 @@ std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireRefTableRunt
         generation_moved = fence_generation_fn() != admitted_generation;
         catalog_observation_moved = observed_catalog_epoch
             && catalog_lifecycle_epoch.load(std::memory_order_acquire) != *observed_catalog_epoch;
+        if (observed_catalog_epoch && runtime_publication_after_catalog_epoch_check_hook_for_test)
+            runtime_publication_after_catalog_epoch_check_hook_for_test();
         if (!generation_moved && !catalog_observation_moved)
         {
             const auto it = ref_name_slots.find(life.ns.string());
