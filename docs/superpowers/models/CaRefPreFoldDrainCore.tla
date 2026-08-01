@@ -185,6 +185,9 @@ DeleteConflict(a) ==
 ResolveAbsent(a) ==
     /\ phase[a] = "uncertain"
     /\ entry = "absent"
+    (* The resolution itself performs a complete catalog GET. An actor that has lost the lease cannot
+       issue another read, so this one-row core records that completed observation and resolves; the
+       all-row companion proves that a globally continuing drain returns to `scan` before deciding. *)
     /\ phase' = [phase EXCEPT ![a] = "resolved"]
     /\ observedToken' = [observedToken EXCEPT ![a] = catalogToken]
     /\ observedEntry' = [observedEntry EXCEPT ![a] = entry]
@@ -193,13 +196,14 @@ ResolveAbsent(a) ==
                     leaseOwner, leaseSeq, parentGeneration, parentRow, cutEntry,
                     advancedWithDebt, deletedWithoutCurrentProof, nonExactDelete >>
 
-(* The same complete `Removing` row under a new full-catalog token remains eligible: retry it. *)
+(* The same complete `Removing` row under a new full-catalog token remains eligible. Return through
+   the observation phase, rather than treating this row-local retry as a completed whole drain. *)
 ResolveSameRemoving(a) ==
     /\ phase[a] = "uncertain"
     /\ entry = "removing"
     /\ observedToken' = [observedToken EXCEPT ![a] = catalogToken]
     /\ observedEntry' = [observedEntry EXCEPT ![a] = entry]
-    /\ phase' = [phase EXCEPT ![a] = "issued"]
+    /\ phase' = [phase EXCEPT ![a] = "observed"]
     /\ UNCHANGED << entry, catalogToken, noiseDone,
                     adoptedValid, adoptedGeneration, adoptedRow, authorityLossDone,
                     leaseOwner, leaseSeq, parentGeneration, parentRow, cutEntry,

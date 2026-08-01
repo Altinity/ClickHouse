@@ -510,8 +510,10 @@ namespace per epoch transition, and each adopted straggler costs a conditional P
 `GET` (`putIfAbsent` conflicts return no bytes — r9-6) + one `_ckpt` CAS. Snapshot publication:
 +1 `_ckpt` CAS (async). DDL: three conditional writes to create; removal = one `gc/state` GET for the
 diagnostic start round + append-lane-admitted `Live→Removing` CAS + terminal append; the next GC
-invocation adds one adopted-seal GET, one catalog GET and one exact catalog-entry CAS in its pre-fold
-drain. Fold: +1
+invocation adds one adopted-seal GET and, for N eligible drain rows, at least N+1 complete catalog GETs
+(the initial scan plus a rescan after every resolved outcome) and N exact catalog-entry CASes in its
+pre-fold drain. Conflicts and ambiguity can add complete retry GETs and CASes before the successor cut.
+Fold: +1
 catalog `GET` per fold round; destructive rounds add one exact `GET` per quiet namespace (the frontier
 proof). When scheduled, the perpetual janitor adds one bounded page of the separately paced leak-only
 `cas/ns/` enumeration plus one catalog GET after that page; it never widens or repeats the round's hot
@@ -533,14 +535,17 @@ blob, in-degree, condemnation phases, catalog sample, holds** — so the cross-n
 sabotage, the temporal lemma's variants and the hold-then-`FORCE REBUILD` scenario are expressible;
 `CaRelinkConfirmCore`'s `_sab_holeylist` becomes the fix's permanent regression witness;
 `CaRefNsCleanupStaleLeaderCore` rewritten around catalog states + incarnations and per-life cleanup
-evidence rather than a second item state; `CaRefCatalogCore` NEW (the three-state lifecycle, positive
-cleanup-evidence/no-hold deletion precondition, the ENTRY-COUNT half of capacity — the byte-arithmetic
-half is the plan's boundary tests; direct deletion and incarnation inertness; under-clean-only is gated in the
-Task-1 module's `ckpt` rules, not here); `CaCasMountCore` extended (recovery generations; wedge-retry
-vs successor-seal);
+evidence rather than a second item state; `CaRefCatalogCore` owns the three-state lifecycle and local
+positive-evidence/no-hold/exact-row deletion proof; `CaRefPreFoldDrainCore` owns the two-actor
+adopted-parent barrier and ambiguous outcomes, while `CaRefPreFoldDrainAllRowsCore` owns serial
+complete-token rescans, external resolution and the non-exact-CAS sabotage control; `CaCasMountCore`
+extended (recovery generations; wedge-retry vs successor-seal);
 `CaRefWriterCleanupCore`/`CaRefFoldClampRecoveryCore` extended per register items when those land.
 `CaRefDeltaIntakeCore` additionally asserts that the ref walk-plan key set is exactly the set of catalog
-`Live`/`Removing` ids; sabotage lets a parent, hint, hold or checkpoint adapter mint one forbidden row.
+`Live`/`Removing` ids; it consumes the pre-fold model's fresh-cut interface but does not independently
+model its provenance, so that composition remains explicitly unverified. Sabotage lets a parent, hint,
+hold or checkpoint adapter mint one forbidden row. `CaRefNsCleanupStaleLeaderCore` owns the independent
+captured-physical-id janitor proof.
 
 RED-first fault-injected controls, the load-bearing set: the cross-namespace hidden-`+1` vs visible
 `-1` (dies without the frontier proof); held namespace → `FORCE REBUILD` → hint hides the witness →

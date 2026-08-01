@@ -1672,8 +1672,10 @@ making each adapter attempt to mint a row; they do not duplicate a lifecycle pre
   exact and ambiguous catalog CAS outcomes, helping after takeover, and the mandatory barrier before
   DEFER, ordinary successor or `REBUILD` adoption. Its primary sabotages let those three decisions
   bypass unresolved drain debt; a separate sabotage reproduces stale A deleting after B has adopted a
-  held successor. `CaRefDeltaIntakeCore` remains only the walk-plan key-set proof and consumes the fresh
-  post-drain cut; do not duplicate lifecycle ordering there. `CaRefNsCleanupStaleLeaderCore` is
+  held successor. Its two-row companion returns every external resolution to a complete rescan and
+  makes a stale/non-exact delete go red. `CaRefDeltaIntakeCore` remains only the walk-plan key-set proof:
+  it assumes, rather than independently proves, the fresh post-drain cut, so do not cite it as
+  provenance evidence or duplicate lifecycle ordering there. `CaRefNsCleanupStaleLeaderCore` is
   retargeted to the perpetual janitor's captured physical-id nomination after the special removal pass
   dies.
   **Capture of physical identity by perpetual cleanup stays, with its capture-time test and at least one

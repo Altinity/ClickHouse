@@ -7,11 +7,12 @@ preserves holds). Task 2 of the plan `2026-07-28-cas-ref-chain-tla-phase.md`; th
 gate — it blocks the C++ work.
 
 **2026-08-01 scope amendment.** This model starts at `BeginRound` with the catalog cut already
-chosen. Under the catalog-only pre-fold drain protocol, that input is specifically the **fresh
-post-drain catalog cut**: the actor has resolved every eligible exact-row deletion justified by the
-authoritative adopted parent before it takes the cut. `CaRefPreFoldDrainCore` owns and sabotage-gates
-that cross-object ordering for ordinary fold, `DEFER`, and `REBUILD`; this model deliberately does
-not duplicate it. Its fold/frontier/hold verdicts and state counts are unchanged.
+chosen. The catalog-only pre-fold drain specifies that input as the **fresh post-drain catalog cut**:
+the actor resolves every eligible exact-row deletion justified by the authoritative adopted parent
+before taking it. `CaRefPreFoldDrainCore` owns and sabotage-gates that cross-object ordering for
+ordinary fold, `DEFER`, and `REBUILD`; `CaRefDeltaIntakeCore` assumes rather than independently proves
+this provenance. Its fold/frontier/hold verdicts and state counts therefore must not be cited as a
+fresh-cut provenance control.
 
 Runner: `./run_deltaintake.sh` (runs every config and checks its expected verdict, including *which*
 invariant a sabotage is required to break; sabotages run FIRST, because a green is only evidence

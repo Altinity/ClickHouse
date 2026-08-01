@@ -22,8 +22,9 @@ CONFIGS=(
 # deletion must not let the decision skip the second eligible row.
 ALL_ROWS_MODULE=CaRefPreFoldDrainAllRowsCore
 ALL_ROWS_CONFIGS=(
-  "sab_skiprescan violation AllEligibleRowsResolvedBeforeDecision"
-  "safe           green     -"
+  "sab_skiprescan     violation AllEligibleRowsResolvedBeforeDecision"
+  "sab_nonexactdelete violation ExactCatalogCAS"
+  "safe               green     -"
 )
 
 overall=0

@@ -24,8 +24,8 @@ exactly in [that section](#list-trust-audit)).
 
 > **`TLA PHASE: PASS`**
 
-Every green is green and every `_sab_` is red, across **107 configs in 11 asserted batteries** — the
-six current phase model families (80 configs) plus the five older models whose runners this task upgraded
+Every green is green and every `_sab_` is red, across **108 configs in 11 asserted batteries** — the
+six current phase model families (81 configs) plus the five older models whose runners this task upgraded
 to name assertions (27 configs). No config was skipped, none was left without a
 verdict, and no expectation is satisfied by a bare exit code: every red is matched against the NAME
 of the invariant or property it had to break.
@@ -36,23 +36,23 @@ of the invariant or property it had to break.
 | `CaRefDeltaIntakeCore` | `run_deltaintake.sh` | 13 | 5 | 8 | 833 s | 13/13 |
 | `CaRefCatalogCore` | `run_refcatalog.sh` | 16 | 2 | 14 | 10 s | 16/16 |
 | `CaRefNsCleanupStaleLeaderCore` | `run_nscleanup_staleleader.sh` | 4 | 1 | 3 | 4 s | 4/4 |
-| `CaRefPreFoldDrainCore` (+ all-row companion) | `run_prefold_drain.sh` | 10 | 2 | 8 | 8 s | 10/10 |
+| `CaRefPreFoldDrainCore` (+ all-row companion) | `run_prefold_drain.sh` | 11 | 2 | 9 | 7 s | 11/11 |
 | `CaCasMountCore` | `run_mount.sh` | 22 | 2 | 20 | 583 s | 22/22 |
 | `CaBuildRootPrecommit` | `run_buildrootprecommit.sh` (NEW) | 8 | 4 | 4 | 90 s | 8/8 |
 | `CaDiskLifecycle` | `run_disklifecycle.sh` (upgraded) | 7 | 1 | 6 | 5 s | 7/7 |
 | `CaErasureProof` | `run_erasureproof.sh` (upgraded) | 6 | 2 | 4 | 9 s | 6/6 |
 | `CaRefFoldClampRecoveryCore` | `run_foldclamp.sh` (upgraded) | 2 | 1 | 1 | 1 s | 2/2 |
 | `CaRefWriterCleanupCore` | `run_refwcleanup.sh` (upgraded) | 4 | 1 | 3 | 2 s | 4/4 |
-| **total** | | **107** | **26** | **81** | **~28 min + focused reruns** | **107/107** |
+| **total** | | **108** | **26** | **82** | **~28 min + focused reruns** | **108/108** |
 
 `CaCasMountCore` also carries a 23rd config on disk, `_rev6_observe`, which is `SLOW=1`-gated: it does
 not complete in an interactive budget and that is pre-existing (confirmed against the pre-2026-07-24
 committed model). It is excluded from the default battery *with a verdict of its own* (`incomplete`),
 not silently.
 
-Reds are not all sabotages, and the distinction matters. The 81 break down as:
+Reds are not all sabotages, and the distinction matters. The 82 break down as:
 
-- **59 sabotage-class** — a load-bearing rule removed, one per config. 56 are named `_sab_*`; the
+- **60 sabotage-class** — a load-bearing rule removed, one per config. 57 are named `_sab_*`; the
   other three are `CaBuildRootPrecommit`'s necessity matrix (`_buggy`, `_buildrootonly`, `_lazyleak`),
   which remove a half of the fix rather than a rule, and are the same kind of evidence.
 - **18 reachability witnesses** — negated reachability, where the violation IS the evidence that a
@@ -63,7 +63,7 @@ Reds are not all sabotages, and the distinction matters. The 81 break down as:
   lifecycle v1 excised natural erasure promotion), and
   `CaRefCatalogCore_finding_briefreconcileinv` (the task brief's proposed invariant, refuted).
 
-Each is labelled where it appears; none is a phase failure. Two of the 81 are liveness reds
+Each is labelled where it appears; none is a phase failure. Two of the 82 are liveness reds
 (`CaBuildRootPrecommit_lazyleak`, `CaDiskLifecycle_sab_nogcselfexit`), which TLC reports without a
 property name — see [the `temporal` expectation kind](#fix-runners) for how those are still asserted.
 
@@ -73,7 +73,7 @@ property name — see [the `temporal` expectation kind](#fix-runners) for how th
 |---|---|---|
 | §2 **INV-1** per-namespace contiguous ids, the every-attempt rule | `CaRefTableSnapshotLogCore` | `_sab_reuseafterambiguous` (`INV_NO_PHANTOM`), `_sab_gaponfail` (`INV_DENSE`) |
 | §2 **INV-2** every epoch transition closed in-band by a `slot-occupy` seal | `CaRefTableSnapshotLogCore` | `_sab_noseal`, `_sab_sealclobbersbase` (`INV_RECOVERY`), `_sab_blindput` (`INV_NO_GHOST`), and **the flip**: `_v9_flip_latepred` GREEN — rev.4's `Late Predecessor PUT` counterexample is now a proof |
-| §2 **INV-3** the catalog with ref-layer incarnations | `CaRefCatalogCore`, `CaRefPreFoldDrainCore` | local exact-row deletion proof: `_sab_deletewithoutevidence`, `_sab_deletewithforeignevidence`, `_sab_deleteunderhold`, `_sab_deletewithoutexactobservation` (`INV_REMOVAL_DELETE_PROVED`); cross-object barrier: `_sab_*_bypasses_drain`, `_sab_continue_after_unknown`, `_sab_stale_delete_after_successor_hold`, `_sab_rebuild_from_unadopted_seal` |
+| §2 **INV-3** the catalog with ref-layer incarnations | `CaRefCatalogCore`, `CaRefPreFoldDrainCore`, `CaRefPreFoldDrainAllRowsCore` | local exact-row deletion proof: `_sab_deletewithoutevidence`, `_sab_deletewithforeignevidence`, `_sab_deleteunderhold`, `_sab_deletewithoutexactobservation` (`INV_REMOVAL_DELETE_PROVED`); cross-object barrier: `_sab_*_bypasses_drain`, `_sab_continue_after_unknown`, `_sab_stale_delete_after_successor_hold`, `_sab_rebuild_from_unadopted_seal`; all-row rescan and exactness: `_sab_skiprescan`, `_sab_nonexactdelete` |
 | §2 **INV-4** `_ckpt` gating of the recovery base | `CaRefTableSnapshotLogCore` | `_sab_cleanupaboveckpt`, `_sab_staleckptcorruption` |
 | §3 **Lifecycles**, removal/recreation under a stale leader | `CaRefNsCleanupStaleLeaderCore` | `_sab_noincarnation`, `_sab_rederive` (`NoLiveDataDeleted`) |
 | §4 **Recovery** (arithmetic tail, CAS-walk, seal, install) | `CaRefTableSnapshotLogCore`, `CaCasMountCore` | `_v9_safe`/`_v9_safe_deep`; `_witness_genrefused`, `_witness_sealrejected` |
@@ -97,15 +97,16 @@ a stated choice, not a gap nobody noticed.
 The original battery was executed **sequentially** on 2026-07-28 from a cleared
 `tmp/tlc-meta-*` state (215 stale metadirs removed first), each into `tmp/task6_<runner>.log`, with
 `timeout 3600` per runner. The amended `CaRefCatalogCore`, `CaRefNsCleanupStaleLeaderCore`, and new
-`CaRefPreFoldDrainCore` batteries were run separately on 2026-08-01. `SECONDS` is wall time per
+`CaRefPreFoldDrainCore` batteries were run separately on 2026-08-01. The pre-fold battery was rerun
+in its review fix round on 2026-08-01. `SECONDS` is wall time per
 config on a 32-core host — wall time, not CPU time, and the two runners that use `-workers auto`
 (`run_refsnaplog.sh`, `run_deltaintake.sh`) are therefore not comparable with the `-workers 1` ones.
 
 ### Every config, expected vs observed {#master-table}
 
 The 2026-07-28 rows are the original runners' output lines. The amended-model rows below are
-transcribed from `build/test_task5_prefold_refcatalog_20260801.log`,
-`build/test_task5_prefold_nscleanup_staleleader_witness_20260801.log`, and the generated/state/depth table in
+transcribed from `build/test_task5_prefold_refcatalog_round1_20260801.log`,
+`build/test_task5_prefold_nscleanup_round1_20260801.log`, and the generated/state/depth table in
 [`CaRefPreFoldDrainCore_RESULTS.md`](CaRefPreFoldDrainCore_RESULTS.md). The latter table is the
 authority for focused-model counts; this aggregate does not invent a per-config wall time that its
 runner did not record.
@@ -169,6 +170,7 @@ runner did not record.
 | `CaRefPreFoldDrainCore` | `_safe` | green | green | see per-model results | PASS |
 | `CaRefPreFoldDrainCore` | `_witness_takeover_converges` | violation | violation:WITNESS_TAKEOVER_CONVERGES | see per-model results | PASS |
 | `CaRefPreFoldDrainAllRowsCore` | `_sab_skiprescan` | violation | violation:AllEligibleRowsResolvedBeforeDecision | see per-model results | PASS |
+| `CaRefPreFoldDrainAllRowsCore` | `_sab_nonexactdelete` | violation | violation:ExactCatalogCAS | see per-model results | PASS |
 | `CaRefPreFoldDrainAllRowsCore` | `_safe` | green | green | see per-model results | PASS |
 | `CaCasMountCore` | `_sab_epochreset` | violation | violation:WriterEpochMonotoneUnique | 1 | PASS |
 | `CaCasMountCore` | `_sab_foreigntakeover` | violation | violation:ForeignUuidNeverAutoTakesOver | 0 | PASS |
@@ -239,7 +241,7 @@ changes (which are classification-only: both came back with the same colours, na
 === DONE  run_deltaintake.sh            rc=0 seconds=833   ALL EXPECTATIONS MET   (13/13)
 === DONE  run_refcatalog.sh             rc=0 seconds=10    ALL EXPECTATIONS MET   (16/16)  <- 2026-08-01 focused re-run
 === DONE  run_nscleanup_staleleader.sh  rc=0 seconds=4     ALL EXPECTATIONS MET   (4/4)
-=== DONE  run_prefold_drain.sh           rc=0 seconds=8    ALL EXPECTATIONS MET   (10/10) <- 2026-08-01 amendment
+=== DONE  run_prefold_drain.sh           rc=0 seconds=7    ALL EXPECTATIONS MET   (11/11) <- 2026-08-01 review fix round
 === DONE  run_mount.sh                  rc=0 seconds=583   ALL EXPECTATIONS MET   (22/22)
 --- the original phase runners ran in one chain; the two annotated rows are later focused runs ---
 === DONE  run_buildrootprecommit.sh     rc=0 seconds=90    ALL EXPECTATIONS MET   (8/8)
@@ -506,11 +508,11 @@ the same 47 configs — so whoever picks up either should pick up both.
 - **`-workers 1`** in the phase runners that report numbers: parallel BFS visits states in a
   nondeterministic order, so depth, state counts and *which* shortest counterexample TLC prints all
   vary run to run, while the traces narrated in the RESULTS files are specific action sequences.
-- **Findings are not sabotages.** **Four** of the 107 battery configs are reds that report a defect
+- **Findings are not sabotages.** **Four** of the 108 battery configs are reds that report a defect
   rather than validate a guard — `CaRefDeltaIntakeCore_witness_corruptgap`,
   `CaErasureProof_gc_asbuilt`, `CaErasureProof_gc_promptliteral` and
   `CaRefCatalogCore_finding_briefreconcileinv` — matching the count in [the gate](#gate).
   A fifth red of the same kind, `CaRelinkConfirmCore_sab_holeylist`, is the
   historical witness and is **not** in any battery, so it is not in that arithmetic. Each is
-  labelled where it appears. The current arithmetic is 59 sabotage-class + 18 witnesses + 4
-  findings = 81 reds.
+  labelled where it appears. The current arithmetic is 60 sabotage-class + 18 witnesses + 4
+  findings = 82 reds.

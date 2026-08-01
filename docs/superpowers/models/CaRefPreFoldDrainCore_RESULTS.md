@@ -28,7 +28,7 @@ docs/superpowers/models/run_prefold_drain.sh
 ```
 
 The committed runner uses one TLC worker for reproducible breadth-first counterexamples. On
-2026-08-01, `build/test_task5_prefold_drain_allrows_final_20260801.log` recorded all ten expectations
+2026-08-01, `build/test_task5_prefold_drain_round1_reviewfix_20260801.log` recorded all eleven expectations
 passed:
 
 | Configuration | Expected | Actual | Generated / distinct states | Depth |
@@ -36,19 +36,20 @@ passed:
 | `_sab_fold_bypasses_drain` | violation: `DrainBeforeDecision` | violation: `DrainBeforeDecision` | 54 / 32 | 5 |
 | `_sab_rebuild_bypasses_drain` | violation: `DrainBeforeDecision` | violation: `DrainBeforeDecision` | 54 / 32 | 5 |
 | `_sab_defer_bypasses_drain` | violation: `DrainBeforeDecision` | violation: `DrainBeforeDecision` | 54 / 32 | 5 |
-| `_sab_continue_after_unknown` | violation: `DrainBeforeDecision` | violation: `DrainBeforeDecision` | 114 / 63 | 6 |
-| `_sab_stale_delete_after_successor_hold` | violation: `DeleteUsesCurrentAdoptedProof` | violation: `DeleteUsesCurrentAdoptedProof` | 236 / 122 | 7 |
+| `_sab_continue_after_unknown` | violation: `DrainBeforeDecision` | violation: `DrainBeforeDecision` | 114 / 64 | 6 |
+| `_sab_stale_delete_after_successor_hold` | violation: `DeleteUsesCurrentAdoptedProof` | violation: `DeleteUsesCurrentAdoptedProof` | 240 / 127 | 7 |
 | `_sab_rebuild_from_unadopted_seal` | violation: `DeleteUsesCurrentAdoptedProof` | violation: `DeleteUsesCurrentAdoptedProof` | 24 / 17 | 4 |
-| `_safe` | green | green | 1960 / 734 | 14 |
-| `_witness_takeover_converges` | violation: `WITNESS_TAKEOVER_CONVERGES` | violation: `WITNESS_TAKEOVER_CONVERGES` | 1503 / 628 | 12 |
+| `_safe` | green | green | 2272 / 874 | 14 |
+| `_witness_takeover_converges` | violation: `WITNESS_TAKEOVER_CONVERGES` | violation: `WITNESS_TAKEOVER_CONVERGES` | 1733 / 737 | 12 |
 
 The runner also checks the two-row serial-rescan companion, which owns the full-catalog-token
 consequence that a first exact delete invalidates the snapshot for the next candidate:
 
 | Configuration | Expected | Actual | Generated / distinct states | Depth |
 |---|---|---|---:|---:|
-| `_allrows_sab_skiprescan` | violation: `AllEligibleRowsResolvedBeforeDecision` | violation: `AllEligibleRowsResolvedBeforeDecision` | 6 / 5 | 3 |
-| `_allrows_safe` | green | green | 22 / 11 | 6 |
+| `_allrows_sab_skiprescan` | violation: `AllEligibleRowsResolvedBeforeDecision` | violation: `AllEligibleRowsResolvedBeforeDecision` | 10 / 8 | 3 |
+| `_allrows_sab_nonexactdelete` | violation: `ExactCatalogCAS` | violation: `ExactCatalogCAS` | 21 / 13 | 4 |
+| `_allrows_safe` | green | green | 80 / 29 | 6 |
 
 Violation runs stop at their intended shortest counterexample, so their queues are not exhausted.
 The honest gate exhausts its queue.
@@ -84,9 +85,11 @@ A receives an ambiguous non-landing result, B steals the lease, reads and delete
 converge without a successor being published over unresolved debt.
 
 `CaRefPreFoldDrainAllRowsCore` is the narrow all-row companion. It starts with two independently
-eligible catalog rows; after each exact CAS the actor returns to a complete scan before selecting the
-next row. `_allrows_sab_skiprescan` reaches a decision with one row left, while `_allrows_safe`
-exhaustively drains both rows before deciding.
+eligible catalog rows; a rejected or non-landing ambiguous response, and every local or external
+resolution, return to a complete scan before selecting the next row. `_allrows_sab_skiprescan` reaches a decision with one row left;
+`_allrows_sab_nonexactdelete` accepts a stale token and turns the sticky exactness consequence red;
+and `_allrows_safe` exhaustively drains both rows before deciding. `CompletionDrained` defines that
+decision precisely: `phase = "done" => remaining = {}`.
 
 ## Invariants {#invariants}
 
@@ -95,7 +98,10 @@ exhaustively drains both rows before deciding.
 - `DeleteUsesCurrentAdoptedProof` requires a catalog deletion that lands to remain justified by the
   current authoritative matching evidence/no-hold row.
 - `ExactCatalogCAS` records that every ordinary deletion consumed its complete observed row and
-  full-catalog token.
+  full-catalog token. Its falsifiable red control is `_allrows_sab_nonexactdelete`, which makes the
+  stale-token consequence sticky rather than deriving it from the honest action's own guard.
+- `CompletionDrained` requires that the all-row companion can decide only after its remaining eligible
+  set is empty.
 - `TypeOK` bounds the two leases, one optional catalog-noise write, one catalog deletion, and the
   corresponding seal generations.
 
