@@ -93,6 +93,19 @@ private:
     bool replaced = false;
 };
 
+class FenceLossDuringHeadBackend : public TokenlessListBackend
+{
+public:
+    HeadResult head(const String & key) override
+    {
+        HeadResult result = TokenlessListBackend::head(key);
+        fence_held = false;
+        return result;
+    }
+
+    bool fence_held = true;
+};
+
 class CatalogAfterListBackend : public CountingBackend
 {
 public:
@@ -343,6 +356,24 @@ TEST(CasNamespaceJanitor, TokenlessListHeadsDeadKeysAndRetainsConcurrentReplacem
     EXPECT_EQ(backend.headCount(raced_key), 1u);
     EXPECT_EQ(backend.deleteCount(dead_key), 1u);
     EXPECT_EQ(backend.deleteCount(raced_key), 1u);
+}
+
+TEST(CasNamespaceJanitor, TokenlessListRechecksFenceAfterHeadBeforeDelete)
+{
+    FenceLossDuringHeadBackend backend;
+    const Layout layout("p");
+    seedCatalog(backend, layout);
+    const String dead_key = layout.refCkptKey(life("dead", 164));
+    ASSERT_EQ(backend.putIfAbsent(dead_key, "dead").outcome, PutOutcome::Done);
+    backend.resetCounts();
+
+    const auto result = NamespaceJanitor(backend, layout, 100).runOnePage(
+        false, [&] { return backend.fence_held; });
+
+    EXPECT_EQ(result.deleted, 0u);
+    EXPECT_EQ(backend.headCount(dead_key), 1u);
+    EXPECT_EQ(backend.deleteCount(dead_key), 0u);
+    EXPECT_TRUE(backend.get(dead_key));
 }
 
 TEST(CasNamespaceJanitor, PostListCatalogCutProtectsConcurrentCreationWithOneGet)

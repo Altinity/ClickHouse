@@ -75,8 +75,6 @@ NamespaceJanitorResult NamespaceJanitor::runOnePage(
         }
         if (ambiguous || suppress_deletes || catalog_cut.life_index.resolve(*life_id))
             continue;
-        if (!fence_held())
-            break;
 
         Token token;
         if (listed.token)
@@ -88,6 +86,8 @@ NamespaceJanitorResult NamespaceJanitor::runOnePage(
                 continue;
             token = current.token;
         }
+        if (!fence_held())
+            break;
         if (backend.deleteExact(listed.key, token).kind == DeleteOutcome::Kind::Deleted)
             ++result.deleted;
     }
