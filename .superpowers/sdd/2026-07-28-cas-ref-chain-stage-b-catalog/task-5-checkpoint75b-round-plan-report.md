@@ -98,3 +98,17 @@ baseline-guard tests remain in the focused gate.
    final gates.
 
 Fix-round logs use the `build/task5_checkpoint75b_fix_r1_*` prefix.
+
+## Fix round 2 — production signature pin
+
+The first fix-round mutation proved constructor capability only. This follow-up adds the narrow
+friend-only `tests::GcRoundPlanSignatureAccess` in the catalog test translation unit. Its assertions
+compare `decltype` of the actual private `Gc::fold` and `Gc::sampleRefListQuality` member pointers,
+plus `buildRefWalkPlan`, against their exact expected types. The pin therefore proves that fold and
+the probe consume `const RefPlan &` only, and that the builder consumes `RoundInput &&`; it contains
+no runtime access to fold and no hand-maintained boolean.
+
+For mutation evidence, the production `Gc::fold` declaration, definition, and ordinary-round caller
+were temporarily restored to carry a separate `const RoundInput &` beside the plan. The focused test
+object failed with exactly one error: the `FoldSignature`/`ExpectedFoldSignature` static assertion.
+Restoring the plan-only production signature made the pin compile again before all final gates.

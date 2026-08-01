@@ -237,6 +237,7 @@ RefPlan buildRefWalkPlan(RoundInput && round_input);
 namespace tests
 {
 RefPlan buildRefWalkPlanForTest(RefScanSummary ref_scan, CasRefCatalog::Snapshot catalog_cut);
+class GcRoundPlanSignatureAccess;
 }
 
 /// The one owned observation boundary between the reconciled hot LIST and every ref-plan consumer.
@@ -393,6 +394,8 @@ struct TxnApplyLedger
 /// (a random u128) is a CALLER obligation — duplicate ids make two leaders indistinguishable.
 class Gc
 {
+    friend class tests::GcRoundPlanSignatureAccess;
+
 public:
     /// `now_ms_fn` is the WALL clock (injected for tests): audit/diagnostic stamps only (e.g. the
     /// heartbeat floor's `now_ms` argument) — it never gates a fence decision. `mono_ms_fn` is the
