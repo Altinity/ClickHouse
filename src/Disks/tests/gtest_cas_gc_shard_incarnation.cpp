@@ -115,7 +115,11 @@ TEST(CasGcShardIncarnation, DuplicateLifeIdStopsDestructiveRoundAndRebuild)
     RefCatalog catalog;
     catalog.entries = {
         CatalogEntry{.ns = RootNamespace{"a"}, .state = NsState::Live, .incarnation = UInt128{77}},
-        CatalogEntry{.ns = RootNamespace{"b"}, .state = NsState::Removing, .incarnation = UInt128{77}},
+        CatalogEntry{
+            .ns = RootNamespace{"b"},
+            .state = NsState::Removing,
+            .incarnation = UInt128{77},
+            .removal_started_round = 1},
     };
     const auto empty_catalog = backend->get(layout.refCatalogKey());
     ASSERT_TRUE(empty_catalog);

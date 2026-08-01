@@ -538,7 +538,7 @@ TEST(CasRecoveryStreaming, LedgerRecoveryReplaysUnderMemoryBound)
 }
 
 /// Test 15 (publication inventory): after streaming recovery of a table with a non-trivial snapshot
-/// base, precommit bindings, a tail of committed transactions, and a `_cleanup` marker, EVERY field the
+/// base, precommit bindings, and a tail of committed transactions, EVERY field the
 /// recovery publication seeds is asserted -- not just the two a prose inventory would keep. This is a
 /// regression guard: streaming recovery must install exactly what the whole-tail recovery installed.
 TEST(CasRecoveryStreaming, RecoveryResultInventoryComplete)
@@ -575,10 +575,6 @@ TEST(CasRecoveryStreaming, RecoveryResultInventoryComplete)
     const uint64_t tail6 = backend->get(layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, 6}))->bytes.size();
     const uint64_t tail7 = backend->get(layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, 7}))->bytes.size();
 
-    /// A completed-removal `_cleanup` marker recovery must retain for namespace-recreation checks.
-    const RefTxnId cleanup_id{1, 3};
-    backend->putIfAbsent(layout.refCleanupMarkerKey(NamespaceLifeId::stageATransition(ns), cleanup_id), "");
-
     auto store = openPoolForTest(backend);
 
     /// Drive recovery via a recovery-only accessor: `newestPublishedSnapshotIdForTest` recovers the
@@ -611,11 +607,6 @@ TEST(CasRecoveryStreaming, RecoveryResultInventoryComplete)
     const uint64_t expected_budget = 64ULL * 1024 * 1024 - overhead;
     EXPECT_EQ(store->refSnapshotBudgetForTest(ns), expected_budget);
     EXPECT_EQ(store->refRemovalBudgetForTest(ns), expected_budget);
-
-    /// cleanup markers: exactly the one seeded marker.
-    const std::set<RefTxnId> markers = store->refCleanupMarkersForTest(ns);
-    EXPECT_EQ(markers.size(), 1u);
-    EXPECT_TRUE(markers.count(cleanup_id) == 1);
 
     /// state: four committed rows (two from the base, two from the tail). This read dispatches the
     /// read-side sweep, hence it comes last -- after the sweep flag has been observed above.

@@ -36,23 +36,6 @@ std::string_view holdReasonToWord(HoldReason r)
 namespace
 {
 
-std::string_view nsCleanupStateToWord(RefNsCleanupState s)
-{
-    switch (s)
-    {
-        case RefNsCleanupState::Pending:   return "pending";
-        case RefNsCleanupState::Completed: return "completed";
-    }
-    throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: unknown ns-cleanup state {}", static_cast<int>(s));
-}
-
-RefNsCleanupState nsCleanupStateFromWord(std::string_view w)
-{
-    if (w == "pending")   return RefNsCleanupState::Pending;
-    if (w == "completed") return RefNsCleanupState::Completed;
-    throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: unknown ns-cleanup state '{}'", w);
-}
-
 HoldReason holdReasonFromWord(std::string_view w)
 {
     if (w == "gap_below_witness")        return HoldReason::GapBelowWitness;
@@ -173,9 +156,15 @@ String encodeFoldSeal(const CasFoldSeal & seal)
 
     uint64_t n = 0;
 
-    /// coverage (std::map => key-sorted)
-    for (const auto & [key, cov] : seal.per_ns_shard)
+    /// Ref-life rows (`std::map<UInt128, ...>` => opaque-id-sorted). This is the sole serialized
+    /// producer of ref coverage and removal evidence.
+    for (const auto & [life_id, life_state] : seal.ref_lives)
     {
+        const RefCoverage & cov = life_state.coverage;
+        const String life_hex = u128ToHex(life_id);
+        if (life_id == 0)
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "CAS fold seal: a ref-life row has a zero life id -- 0 never names a life");
         /// THE STRICT GRAMMAR, enforced where the bytes are produced. Every refusal below is
         /// `LOGICAL_ERROR`: this row came from our own fold, so an ill-formed one is a bug in this
         /// process, not corruption arriving from a store — and none of these shapes is repairable once
@@ -188,7 +177,7 @@ String encodeFoldSeal(const CasFoldSeal & seal)
                 "CAS fold seal: coverage '{}' has classification {}, which is not one of the four the "
                 "fold grammar defines (0 absent, 1 unchanged, 2 folded, 4 clamped) — every consumer "
                 "branches on those exact values, so this row would pass refusals meant to stop it",
-                key, cov.classification);
+                life_hex, cov.classification);
         /// A classification-4 row whose hold was dropped is indistinguishable, once durable, from a
         /// namespace that stopped for no reason — and a hold on any other classification claims a stop
         /// that did not happen.
@@ -196,7 +185,7 @@ String encodeFoldSeal(const CasFoldSeal & seal)
             throw Exception(ErrorCodes::LOGICAL_ERROR,
                 "CAS fold seal: coverage '{}' has classification {} and {} hold — the hold fields are "
                 "required for classification 4 and forbidden otherwise",
-                key, cov.classification, cov.hold ? "a" : "no");
+                life_hex, cov.classification, cov.hold ? "a" : "no");
         /// A hold that names no position resolves itself on the next round (nothing sorts below
         /// `{0, 0}`) and cannot be rendered where the sweep reports why it retained a manifest.
         if (cov.hold && !isCanonicalHoldPosition(cov.hold->offending_position))
@@ -204,11 +193,21 @@ String encodeFoldSeal(const CasFoldSeal & seal)
                 "CAS fold seal: coverage '{}' is held at {}-{} — a hold's offending position has both "
                 "components nonzero; a zero one would be cleared by the first record the next round "
                 "folds, erasing the only durable evidence that the namespace stopped",
-                key, cov.hold->offending_position.writer_epoch, cov.hold->offending_position.ref_sequence);
+                life_hex, cov.hold->offending_position.writer_epoch, cov.hold->offending_position.ref_sequence);
+
+        if (life_state.cleanup_evidence
+            && (life_state.cleanup_evidence->remove_txn_id.writer_epoch == 0
+                || life_state.cleanup_evidence->remove_txn_id.ref_sequence == 0))
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "CAS fold seal: ref life '{}' carries cleanup evidence with non-canonical removal "
+                "transaction {}-{} -- both components are required and nonzero",
+                life_hex,
+                life_state.cleanup_evidence->remove_txn_id.writer_epoch,
+                life_state.cleanup_evidence->remove_txn_id.ref_sequence);
 
         bool first = true;
-        writeKey(out, "k", first);    writeStringValue(out, "cov");
-        writeKey(out, "key", first);  writeStringValue(out, key);
+        writeKey(out, "k", first);    writeStringValue(out, "rfl");
+        writeKey(out, "life", first); writeHex128Value(out, life_id);
         writeKey(out, "cls", first);  writeIntText(static_cast<uint32_t>(cov.classification), out);
         writeKey(out, "lfe", first);  writeU64StringValue(out, cov.last_folded_ref_id.writer_epoch);
         writeKey(out, "lfs", first);  writeU64StringValue(out, cov.last_folded_ref_id.ref_sequence);
@@ -220,8 +219,15 @@ String encodeFoldSeal(const CasFoldSeal & seal)
             writeKey(out, "hrc", first); writeIntText(cov.hold->retry_count, out);
             writeKey(out, "hnr", first); writeU64StringValue(out, cov.hold->next_retry_round);
         }
+        if (life_state.cleanup_evidence)
+        {
+            writeKey(out, "rte", first);
+            writeU64StringValue(out, life_state.cleanup_evidence->remove_txn_id.writer_epoch);
+            writeKey(out, "rts", first);
+            writeU64StringValue(out, life_state.cleanup_evidence->remove_txn_id.ref_sequence);
+        }
         closeObject(out, first);
-        closeLine("cov");
+        closeLine("rfl");
         ++n;
     }
 
@@ -247,20 +253,6 @@ String encodeFoldSeal(const CasFoldSeal & seal)
         writeKey(out, "ocr", first);   writeU64StringValue(out, s.oldest_nonpending_condemn_round);
         closeObject(out, first);
         closeLine("cnd");
-        ++n;
-    }
-
-    /// ns-cleanup items (std::map<String> => key-sorted)
-    for (const auto & [key, item] : seal.ns_cleanup_items)
-    {
-        bool first = true;
-        writeKey(out, "k", first);   writeStringValue(out, "nsc");
-        writeKey(out, "ns", first);  writeStringValue(out, item.ns.string());
-        writeKey(out, "rte", first); writeU64StringValue(out, item.remove_txn_id.writer_epoch);
-        writeKey(out, "rts", first); writeU64StringValue(out, item.remove_txn_id.ref_sequence);
-        writeKey(out, "st", first);  writeStringValue(out, nsCleanupStateToWord(item.state));
-        closeObject(out, first);
-        closeLine("nsc");
         ++n;
     }
 
@@ -325,10 +317,10 @@ CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expect
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: record must start with \"k\"");
         const String kind = r.readString();
 
-        if (kind == "cov")
+        if (kind == "rfl")
         {
-            String map_key;
-            ShardCoverage cov;
+            std::optional<UInt128> life_id;
+            RefCoverage cov;
             /// Read WIDE and validated before it is narrowed to the persisted byte. `cls` is the field
             /// every consumer branches on, and a plain `static_cast<uint8_t>` maps 258 onto 2 ("all
             /// records through the cursor were folded") and 256 onto 0 — a forged or damaged seal would
@@ -342,9 +334,11 @@ CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expect
             std::optional<uint64_t> hold_sequence;
             std::optional<uint32_t> hold_retry_count;
             std::optional<uint64_t> hold_next_retry_round;
+            std::optional<uint64_t> remove_txn_epoch;
+            std::optional<uint64_t> remove_txn_sequence;
             while (r.nextKey(key))
             {
-                if (key == "key") map_key = r.readString();
+                if (key == "life") life_id = r.readHex128();
                 else if (key == "cls") classification = r.readU64Number();
                 else if (key == "lfe") cov.last_folded_ref_id.writer_epoch = r.readU64String();
                 else if (key == "lfs") cov.last_folded_ref_id.ref_sequence = r.readU64String();
@@ -353,18 +347,25 @@ CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expect
                 else if (key == "hps") hold_sequence = r.readU64String();
                 else if (key == "hrc") hold_retry_count = r.readU32Number();
                 else if (key == "hnr") hold_next_retry_round = r.readU64String();
-                else throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: unknown cov key '{}'", key);
+                else if (key == "rte") remove_txn_epoch = r.readU64String();
+                else if (key == "rts") remove_txn_sequence = r.readU64String();
+                else throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: unknown rfl key '{}'", key);
             }
+
+            if (!life_id || *life_id == 0)
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "CAS fold seal: a ref-life row is missing a nonzero opaque life id");
+            const String life_hex = u128ToHex(*life_id);
 
             /// `cls` is required, not defaulted: an absent one would read as 0 ("no round folded this
             /// namespace"), which is a claim about a fold, not the absence of one.
             if (!classification)
-                throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: cov '{}' missing cls", map_key);
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: rfl '{}' missing cls", life_hex);
             if (!isKnownClassification(*classification))
                 throw Exception(ErrorCodes::CORRUPTED_DATA,
                     "CAS fold seal: coverage '{}' has classification {}, which is not one of the four "
                     "the fold grammar defines (0 absent, 1 unchanged, 2 folded, 4 clamped)",
-                    map_key, *classification);
+                    life_hex, *classification);
             cov.classification = static_cast<uint8_t>(*classification);   /// in range, so narrowing is exact
 
             /// The same strict grammar the encoder enforces, applied to bytes we did not write. A
@@ -380,7 +381,7 @@ CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expect
                     throw Exception(ErrorCodes::CORRUPTED_DATA,
                         "CAS fold seal: coverage '{}' is held (classification 4) but its hold is "
                         "incomplete — reason, offending position, retry count and next retry round are "
-                        "all required", map_key);
+                        "all required", life_hex);
                 /// PRESENT is not enough: the position must be one a fold can actually retry. `{0, 0}`
                 /// (or either component zero) is the shape that quietly deletes the hold — the carry
                 /// rule keeps a hold only while the walk stops BELOW it, and nothing is below zero — and
@@ -389,7 +390,7 @@ CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expect
                     throw Exception(ErrorCodes::CORRUPTED_DATA,
                         "CAS fold seal: coverage '{}' is held at {}-{} — a hold's offending position has "
                         "both components nonzero; a zero one clears itself on the next round",
-                        map_key, *hold_epoch, *hold_sequence);
+                        life_hex, *hold_epoch, *hold_sequence);
                 cov.hold = RefHold{.reason = *hold_reason,
                                    .offending_position = RefTxnId{*hold_epoch, *hold_sequence},
                                    .retry_count = *hold_retry_count,
@@ -399,8 +400,26 @@ CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expect
                 throw Exception(ErrorCodes::CORRUPTED_DATA,
                     "CAS fold seal: coverage '{}' carries hold fields at classification {} — they are "
                     "forbidden on anything but a held (classification 4) row",
-                    map_key, cov.classification);
-            insertRecordOnce(seal.per_ns_shard, map_key, cov, "coverage");
+                    life_hex, cov.classification);
+
+            const bool any_cleanup_field = remove_txn_epoch || remove_txn_sequence;
+            const bool every_cleanup_field = remove_txn_epoch && remove_txn_sequence;
+            std::optional<RefCleanupEvidence> cleanup_evidence;
+            if (any_cleanup_field)
+            {
+                if (!every_cleanup_field || *remove_txn_epoch == 0 || *remove_txn_sequence == 0)
+                    throw Exception(ErrorCodes::CORRUPTED_DATA,
+                        "CAS fold seal: ref life '{}' carries incomplete or zero cleanup evidence -- "
+                        "both removal transaction components are required and nonzero",
+                        life_hex);
+                cleanup_evidence = RefCleanupEvidence{
+                    .remove_txn_id = RefTxnId{*remove_txn_epoch, *remove_txn_sequence}};
+            }
+            if (!seal.ref_lives.emplace(
+                    *life_id, RefLifeFoldState{.coverage = cov, .cleanup_evidence = cleanup_evidence}).second)
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "CAS fold seal: a second ref-life record for '{}' -- a life id appears at most once",
+                    life_hex);
         }
         else if (kind == "btr")
         {
@@ -428,35 +447,6 @@ CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expect
                 else throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: unknown cnd key '{}'", key);
             }
             insertRecordOnce(seal.condemned_summary, shard, s, "condemned-summary");
-        }
-        else if (kind == "nsc")
-        {
-            String ns;
-            RefTxnId txn;
-            RefNsCleanupState st = RefNsCleanupState::Pending;
-            bool have_st = false;
-            while (r.nextKey(key))
-            {
-                if (key == "ns") ns = r.readString();
-                else if (key == "rte") txn.writer_epoch = r.readU64String();
-                else if (key == "rts") txn.ref_sequence = r.readU64String();
-                else if (key == "st") { st = nsCleanupStateFromWord(r.readString()); have_st = true; }
-                else throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: unknown nsc key '{}'", key);
-            }
-            if (!have_st)
-                throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: nsc missing st");
-            /// Checked before it is rendered, and reported as corruption: `renderRefTxnId` refuses a zero
-            /// component with `LOGICAL_ERROR`, which is an ABORT under a debug or sanitizer build — so an
-            /// omitted or zeroed `rte`/`rts` on the wire would take the process down inside a decode of
-            /// foreign bytes instead of failing this read closed.
-            if (txn.writer_epoch == 0 || txn.ref_sequence == 0)
-                throw Exception(ErrorCodes::CORRUPTED_DATA,
-                    "CAS fold seal: ns-cleanup item for '{}' names removal transaction {}-{} — both "
-                    "components of the id are required and nonzero",
-                    ns, txn.writer_epoch, txn.ref_sequence);
-            const String map_key = ns + "\n" + renderRefTxnId(txn);   /// mirrors the prior decoder's key
-            insertRecordOnce(seal.ns_cleanup_items, map_key,
-                             RefNsCleanupItem{RootNamespace{ns}, txn, st}, "ns-cleanup");
         }
         else
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: unknown record kind '{}'", kind);

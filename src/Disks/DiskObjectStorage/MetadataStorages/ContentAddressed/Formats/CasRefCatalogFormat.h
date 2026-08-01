@@ -65,15 +65,17 @@ struct CreatorFence
 /// that is what makes rebirth structurally inert instead of an alias. `incarnation == 0` is always
 /// invalid, at every state -- "0 never names a life", the same rule `NamespaceLifeId` enforces.
 ///
-/// `creator` is a STRICT GRAMMAR pairing: REQUIRED iff `state == Creating`, FORBIDDEN otherwise. Both
-/// directions of the codec enforce it, so a `Live`/`Removing` row can never carry a stale creator
-/// fence, and a `Creating` row can never lose the identity a reconciler needs to judge it.
+/// `creator` is a STRICT GRAMMAR pairing: REQUIRED iff `state == Creating`, FORBIDDEN otherwise.
+/// `removal_started_round` is similarly REQUIRED iff `state == Removing`: it is sampled once by the
+/// `Live -> Removing` catalog CAS and never changes, so diagnostics can measure removal age without
+/// inventing a caller-local epoch. Both pairings are enforced in both codec directions.
 struct CatalogEntry
 {
     RootNamespace ns;
     NsState state = NsState::Creating;
     UInt128 incarnation = 0;
     std::optional<CreatorFence> creator = std::nullopt;
+    std::optional<uint64_t> removal_started_round = std::nullopt;
 
     bool operator==(const CatalogEntry &) const = default;
 };
@@ -133,14 +135,9 @@ void checkCatalogObjectBytes(uint64_t encoded_bytes, const RootNamespace & ns);
 /// shape is felt here automatically.
 uint64_t foldSealFixedBytes();
 
-/// The worst-case bytes ONE admitted catalog entry could ever add to a fold seal: a `cov` row held at
-/// the widest shape (classification 4, every hold field at its widest rendering) PLUS an `nsc` row at
-/// the widest removal-cleanup shape -- an OVER-ESTIMATE per entry, not a claim about how many `cov`/
-/// `nsc` rows one namespace can carry in total (`ns_cleanup_items` is keyed per removal, so a
-/// namespace removed more than once can carry more than one `nsc` row).
-/// Namespace bytes are charged at `kMaxNamespaceBytes` with worst-case JSON escaping, regardless of
-/// any real admitted name's actual length: admission reserves for the worst name this build will
-/// ever accept, not the one in hand. Measured through `encodeFoldSeal` itself, like `foldSealFixedBytes`.
+/// The worst-case bytes ONE admitted catalog entry could ever add to a fold seal: one ref-life row
+/// containing held coverage and terminal cleanup evidence at their widest legal shapes. Measured
+/// through `encodeFoldSeal` itself, like `foldSealFixedBytes`.
 uint64_t worstCaseEntryFoldReservationBytes();
 
 /// PRE-PUT GATE, predicate (2) of INV-3's additive admission:

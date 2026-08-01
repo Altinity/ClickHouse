@@ -21,7 +21,6 @@ trailer, followed by a banner-framed raw payload zone for inline file bytes.
 | `_pool_meta` | pool identity + floors | `CasPoolMetaFormat` | pool create/admit |
 | `cas/ns/stream/<life_id>/_log/…​.zst` | ref transaction log | `CasRefLogFormat` (`.zst`) | writer commit path |
 | `cas/ns/stream/<life_id>/_snap/…​.zst` | complete ref table | `CasRefSnapshotFormat` (`.zst`) | writer/GC fold |
-| `cas/ns/stream/<life_id>/_cleanup/…​` | key-only presence marker (empty body) | — | GC |
 | `cas/ns/state/<life_id>/_ckpt` | mutable life checkpoint | `CasRefCkptFormat` | writer/GC fold |
 | `cas/ns/state/<life_id>/_files/…​` | namespace-owned raw files | — | upper layers |
 | `cas/manifests/<ns>/<epoch-hex>-<seq-hex>/<ordinal>.zst` | part manifest | `CasPartManifestFormat` | part build |

@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.h>
@@ -61,6 +62,7 @@ using DB::Cas::tests::expectThrowsCode;
 using DB::Cas::tests::minimalLiveSnapshot;
 using DB::Cas::tests::namespaceBirthOp;
 using DB::Cas::tests::publishCommittedOps;
+using DB::Cas::tests::runRegularRoundReclaiming;
 using DB::Cas::tests::writeRefLogTxnRaw;
 using DB::Cas::tests::writeRefSnapshotRaw;
 
@@ -519,6 +521,74 @@ TEST(RefWriterRecovery, EmptyNamespaceRecoversToEmptyState)
     EXPECT_TRUE(store->listRefs(ns).empty());
     EXPECT_FALSE(store->resolveRef(ns, "anything").has_value());
     EXPECT_EQ(store->refRecoveryRestartsForTest(ns), 0u);
+}
+
+TEST(RefWriterNonMinting, ListRefsOnAbsentNamespaceDoesNotMutateCatalog)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/list_absent_non_minting"};
+    const auto catalog_before = backend->get(layout.refCatalogKey());
+    ASSERT_TRUE(catalog_before);
+    backend->resetCounts();
+
+    EXPECT_TRUE(store->listRefs(ns).empty());
+
+    EXPECT_EQ(backend->putCount(layout.refCatalogKey()), 0u);
+    EXPECT_EQ(backend->putOverwriteCount(layout.refCatalogKey()), 0u);
+    EXPECT_EQ(backend->casPutCount(layout.refCatalogKey()), 0u);
+    EXPECT_EQ(backend->deleteCount(layout.refCatalogKey()), 0u);
+    const auto catalog_after = backend->get(layout.refCatalogKey());
+    ASSERT_TRUE(catalog_after);
+    EXPECT_EQ(catalog_after->bytes, catalog_before->bytes);
+    EXPECT_EQ(catalog_after->token, catalog_before->token);
+}
+
+/// `DROP DETACHED PART` reaches this point lookup for a part that may already be absent. Its probe
+/// must not turn a missing table namespace into a new catalog life.
+TEST(RefWriterNonMinting, ResolveRefOnAbsentNamespaceDoesNotMutateCatalog)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/resolve_absent_non_minting"};
+    const auto catalog_before = backend->get(layout.refCatalogKey());
+    ASSERT_TRUE(catalog_before);
+    backend->resetCounts();
+
+    EXPECT_FALSE(store->resolveRef(ns, "detached_part").has_value());
+
+    EXPECT_EQ(backend->putCount(layout.refCatalogKey()), 0u);
+    EXPECT_EQ(backend->putOverwriteCount(layout.refCatalogKey()), 0u);
+    EXPECT_EQ(backend->casPutCount(layout.refCatalogKey()), 0u);
+    EXPECT_EQ(backend->deleteCount(layout.refCatalogKey()), 0u);
+    const auto catalog_after = backend->get(layout.refCatalogKey());
+    ASSERT_TRUE(catalog_after);
+    EXPECT_EQ(catalog_after->bytes, catalog_before->bytes);
+    EXPECT_EQ(catalog_after->token, catalog_before->token);
+}
+
+TEST(RefWriterNonMinting, DropNamespaceOnAbsentNamespaceDoesNotMutateCatalog)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/drop_absent_non_minting"};
+    const auto catalog_before = backend->get(layout.refCatalogKey());
+    ASSERT_TRUE(catalog_before);
+    backend->resetCounts();
+
+    store->dropNamespace(ns);
+
+    EXPECT_EQ(backend->putCount(layout.refCatalogKey()), 0u);
+    EXPECT_EQ(backend->putOverwriteCount(layout.refCatalogKey()), 0u);
+    EXPECT_EQ(backend->casPutCount(layout.refCatalogKey()), 0u);
+    EXPECT_EQ(backend->deleteCount(layout.refCatalogKey()), 0u);
+    const auto catalog_after = backend->get(layout.refCatalogKey());
+    ASSERT_TRUE(catalog_after);
+    EXPECT_EQ(catalog_after->bytes, catalog_before->bytes);
+    EXPECT_EQ(catalog_after->token, catalog_before->token);
 }
 
 /// A table born by a log tail alone (no snapshot yet): `namespace_birth` with nothing else is a legal
@@ -2490,6 +2560,87 @@ TEST(RefWriterRemount, SupersededLeaderMidFlushFailsClosedCreatesNoObject)
 /// Task 11: namespace removal (spec §Namespace Removal)
 /// ===================================================================================
 
+/// A cached writer paused after its ordinary gates must re-check the exact catalog life immediately
+/// before id allocation. A concurrent `Live -> Removing` transition therefore admits no late owner.
+TEST(RefWriterNamespaceRemoval, CachedPositiveWriterCannotAppendAfterRemovingIsPublished)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/removing_blocks_cached_writer"};
+    publishEmptyPart(store, ns, "existing");
+
+    const CasRefCatalog::Snapshot before = CasRefCatalog::read(*backend, layout);
+    const auto observed = std::find_if(before.catalog.entries.begin(), before.catalog.entries.end(),
+        [&](const CatalogEntry & entry) { return entry.ns == ns; });
+    ASSERT_NE(observed, before.catalog.entries.end());
+    ASSERT_EQ(observed->state, NsState::Live);
+    const CatalogEntry exact_live = *observed;
+    const auto greatest_before = listGreatestLogIdForTest(*backend, layout, ns);
+    ASSERT_TRUE(greatest_before);
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool entered = false;
+    bool release = false;
+    std::atomic<bool> hook_fired{false};
+    store->setRefPreCarveHookForTest([&]
+    {
+        if (hook_fired.exchange(true))
+            return;
+        std::unique_lock lock(mutex);
+        entered = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return release; });
+    });
+
+    auto writer = std::async(std::launch::async, [&]() -> String
+    {
+        try
+        {
+            publishEmptyPart(store, ns, "late");
+            return "committed";
+        }
+        catch (const DB::Exception & e)
+        {
+            return e.message();
+        }
+    });
+
+    bool writer_parked = false;
+    {
+        std::unique_lock lock(mutex);
+        writer_parked = cv.wait_for(lock, std::chrono::seconds(10), [&] { return entered; });
+    }
+    if (writer_parked)
+    {
+        CasRefCatalog::casUpdate(*backend, layout, [&](const RefCatalog & current)
+        {
+            RefCatalog next = current;
+            const auto it = std::find(next.entries.begin(), next.entries.end(), exact_live);
+            if (it == next.entries.end())
+                throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "exact Live row changed during test transition");
+            it->state = NsState::Removing;
+            it->removal_started_round = 0;
+            return next;
+        });
+    }
+    {
+        std::lock_guard lock(mutex);
+        release = true;
+    }
+    cv.notify_all();
+
+    EXPECT_TRUE(writer_parked) << "cached writer did not reach the deterministic pre-carve seam";
+    ASSERT_EQ(writer.wait_for(std::chrono::seconds(10)), std::future_status::ready);
+    const String result = writer.get();
+    store->setRefPreCarveHookForTest(nullptr);
+
+    EXPECT_NE(result, "committed") << "cached positive ownership appended after `Removing` became visible";
+    EXPECT_FALSE(store->resolveRef(ns, "late"));
+    EXPECT_EQ(listGreatestLogIdForTest(*backend, layout, ns), greatest_before);
+}
+
 /// dropNamespace's ONE body transaction names an exact removal for every committed ref AND every
 /// dangling precommit, with `remove_namespace` as the FINAL op -- never any other shape.
 TEST(RefWriterNamespaceRemoval, TxnNamesEveryOwnerThenRemoveNamespace)
@@ -2546,9 +2697,9 @@ TEST(RefWriterNamespaceRemoval, TxnNamesEveryOwnerThenRemoveNamespace)
     EXPECT_EQ(owner_removals, 3u) << "2 committed + 1 dangling precommit";
 }
 
-/// After the removal transaction is durable, dropNamespace publishes the constant-size `Removed`
-/// snapshot; the retained tail is fully pruned by it (constant-size going forward).
-TEST(RefWriterNamespaceRemoval, RemovedSnapshotPublished)
+/// The terminal transaction is the only durable removal record. Generation 7 never publishes a
+/// terminal `Removed` snapshot; the ordinary cleanup/janitor paths own old immutable stream debris.
+TEST(RefWriterNamespaceRemoval, RemovalPublishesTerminalLogWithoutTerminalSnapshot)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend);
@@ -2556,20 +2707,27 @@ TEST(RefWriterNamespaceRemoval, RemovedSnapshotPublished)
     const RootNamespace ns{"srv1/remove_snapshot"};
 
     publishEmptyPart(store, ns, "a");
+    const auto snapshot_before = store->newestPublishedSnapshotIdForTest(ns);
     store->dropNamespace(ns);
 
-    const auto remove_id = store->newestPublishedSnapshotIdForTest(ns);
-    ASSERT_TRUE(remove_id.has_value());
-    EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), 0u);
+    EXPECT_EQ(store->newestPublishedSnapshotIdForTest(ns), snapshot_before)
+        << "removal must not publish a terminal snapshot";
+    EXPECT_GT(store->tailSinceSnapshotCountForTest(ns), 0u)
+        << "the terminal transaction remains ordinary immutable stream work until GC folds it";
 
-    const auto got = backend->get(layout.refSnapshotKey(NamespaceLifeId::stageATransition(ns), *remove_id));
-    ASSERT_TRUE(got.has_value());
-    const RefTableSnapshot snap = decodeRefTableSnapshot(openObject(FormatId::RefSnapshot, got->bytes), ns.string(), *remove_id);
-    EXPECT_EQ(snap.lifecycle, RefLifecycle::Removed);
-    ASSERT_TRUE(snap.remove_txn_id.has_value());
-    EXPECT_EQ(*snap.remove_txn_id, *remove_id);
-    EXPECT_TRUE(snap.committed.empty());
-    EXPECT_TRUE(snap.precommits.empty());
+    size_t terminal_logs = 0;
+    for (const ListedKey & listed : backend->list(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)), "", 1000).keys)
+    {
+        const auto parsed = layout.parseRefObjectKey(listed.key);
+        if (!parsed || parsed->kind != RefObjectKind::Log)
+            continue;
+        const auto got = backend->get(listed.key);
+        ASSERT_TRUE(got.has_value());
+        const RefLogTxn txn = decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), parsed->txn_id);
+        if (!txn.ops.empty() && txn.ops.back().kind == RefOpKind::RemoveNamespace)
+            ++terminal_logs;
+    }
+    EXPECT_EQ(terminal_logs, 1u);
 }
 
 /// Review fix (prerequisite to this task's dropNamespace rewiring): `flushRefBatch`'s per-item
@@ -2698,71 +2856,190 @@ TEST(RefWriterNamespaceRemoval, DropNamespaceDoesNotCancelBuildsInOtherNamespace
     EXPECT_TRUE(store->resolveRef(ns_other, "y").has_value());
 }
 
+/// A writer-side create/resolution cannot reuse the predecessor while its catalog row is `Removing`.
+/// Both the resident-runtime and fresh-runtime paths return typed retry-later without a durable write.
+TEST(RefWriterNamespaceRemoval, CreateAgainstRemovingRetriesWithoutMutation)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const RootNamespace ns{"srv1/create-while-removing"};
+
+    {
+        auto store = openPool(backend);
+        publishEmptyPart(store, ns, "predecessor");
+        store->dropNamespace(ns);
+
+        backend->resetCounts();
+        expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { (void)store->namespaceLife(ns); });
+        EXPECT_EQ(backend->putTotal(), 0u);
+        EXPECT_EQ(backend->putOverwriteTotal(), 0u);
+        EXPECT_EQ(backend->casPutTotal(), 0u);
+    }
+
+    auto fresh_store = openPool(backend);
+    backend->resetCounts();
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { (void)fresh_store->namespaceLife(ns); });
+    EXPECT_EQ(backend->putTotal(), 0u);
+    EXPECT_EQ(backend->putOverwriteTotal(), 0u);
+    EXPECT_EQ(backend->casPutTotal(), 0u);
+}
+
+/// Same-name rebirth must not inherit the predecessor's physical life or folded cursor even when the
+/// writer mount and its per-name runtime stay resident throughout the complete real removal sequence.
+TEST(RefWriterNamespaceRemoval, SameNameSameWriterEpochRebirthInvalidatesResidentLifeAndStartsAtZeroCoverage)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    PoolConfig config;
+    config.gc_fold_threshold = 1;
+    config.gc_fold_max_defer_rounds = 8;
+    config.ref_table_cache_bytes = 0;   /// unbounded: no eviction can explain a fresh resolution
+    auto store = openPoolWithConfig(backend, config);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/same-name-rebirth"};
+    const UInt128 gc_id = hexToU128("00000000000000000000000000000001");
+
+    const auto publish_without_fixture_admission = [&](const String & ref)
+    {
+        PartWriteInfo info;
+        info.intended_namespace = ns;
+        info.intended_ref = ns.string() + "/" + ref;
+        auto build = store->beginPartWrite(info);
+        const ManifestId id = build->stageManifest({});
+        build->precommitAdd(ns, ref, id);
+        build->promote(ns, ref, build->buildId(), id);
+    };
+    const auto catalog_entry = [&]() -> std::optional<CatalogEntry>
+    {
+        const RefCatalog catalog = CasRefCatalog::read(*backend, layout).catalog;
+        const auto it = std::find_if(catalog.entries.begin(), catalog.entries.end(), [&](const CatalogEntry & entry)
+        {
+            return entry.ns == ns;
+        });
+        return it == catalog.entries.end() ? std::nullopt : std::optional<CatalogEntry>{*it};
+    };
+
+    publish_without_fixture_admission("predecessor");
+    const CatalogEntry predecessor = *catalog_entry();
+    const uint64_t writer_epoch = store->liveWriterEpoch();
+    ASSERT_EQ(store->refTableLifeForTest(ns)->incarnation, predecessor.incarnation);
+    const void * const runtime_identity = store->refTableRuntimeIdentityForTest(ns);
+    ASSERT_NE(runtime_identity, nullptr);
+
+    Gc gc(store, gc_id);
+    ASSERT_FALSE(runRegularRoundReclaiming(gc).deferred);
+    GcState state = decodeGcState(backend->get(layout.gcStateKey())->bytes);
+    CasFoldSeal seal = decodeFoldSeal(backend->get(layout.foldSealKey(state.snap_generation, state.snap_attempt))->bytes);
+    const auto predecessor_row = seal.ref_lives.find(predecessor.incarnation);
+    ASSERT_NE(predecessor_row, seal.ref_lives.end());
+    ASSERT_NE(predecessor_row->second.coverage.last_folded_ref_id, RefTxnId{});
+
+    const uint64_t puts_before_drop = backend->putTotal();
+    store->dropNamespace(ns);
+    ASSERT_GT(backend->putTotal(), puts_before_drop)
+        << "control: the real removal call returned after durably writing its terminal artifacts";
+    std::optional<RefTxnId> terminal_id;
+    for (const ListedKey & listed : backend->list(
+        layout.namespaceStreamPrefix(NamespaceLifeId::fromCatalogEntry(ns, predecessor.incarnation)),
+        "", 1000).keys)
+    {
+        const auto parsed = layout.parseRefObjectKey(listed.key);
+        if (parsed && parsed->kind == RefObjectKind::Log
+            && (!terminal_id || *terminal_id < parsed->txn_id))
+            terminal_id = parsed->txn_id;
+    }
+    ASSERT_TRUE(terminal_id.has_value());
+    const auto terminal_body = backend->get(layout.refLogKey(
+        NamespaceLifeId::fromCatalogEntry(ns, predecessor.incarnation), *terminal_id));
+    ASSERT_TRUE(terminal_body.has_value());
+    const RefLogTxn terminal = decodeRefLogTxn(
+        openObject(FormatId::RefLog, terminal_body->bytes), ns.string(), *terminal_id);
+    ASSERT_FALSE(terminal.ops.empty());
+    ASSERT_EQ(terminal.ops.back().kind, RefOpKind::RemoveNamespace)
+        << "control: the newest old-life log is the production terminal record";
+    const std::optional<CatalogEntry> removing = catalog_entry();
+    ASSERT_TRUE(removing.has_value());
+    ASSERT_EQ(removing->state, NsState::Removing)
+        << "the real terminal returned durable, but its catalog row stayed Live";
+    ASSERT_EQ(removing->incarnation, predecessor.incarnation);
+    ASSERT_EQ(store->refTableRuntimeIdentityForTest(ns), runtime_identity)
+        << "the removal path must invalidate the resident runtime's life, not pass through eviction";
+
+    ASSERT_FALSE(runRegularRoundReclaiming(gc).deferred) << "the terminal delta must fold";
+    state = decodeGcState(backend->get(layout.gcStateKey())->bytes);
+    seal = decodeFoldSeal(backend->get(layout.foldSealKey(state.snap_generation, state.snap_attempt))->bytes);
+    ASSERT_TRUE(seal.ref_lives.at(predecessor.incarnation).cleanup_evidence.has_value());
+
+    const RoundReport drain = runRegularRoundReclaiming(gc);
+    ASSERT_TRUE(drain.deferred) << "the drain-only idle invocation must leave the evidence seal adopted";
+    ASSERT_FALSE(catalog_entry().has_value());
+    ASSERT_EQ(store->refTableRuntimeIdentityForTest(ns), runtime_identity);
+
+    publish_without_fixture_admission("successor");
+    const CatalogEntry successor = *catalog_entry();
+    ASSERT_EQ(successor.ns, predecessor.ns) << "the exact same logical namespace must be reused";
+    ASSERT_NE(successor.incarnation, predecessor.incarnation);
+    ASSERT_EQ(store->liveWriterEpoch(), writer_epoch) << "rebirth must use the same mounted writer epoch";
+    ASSERT_EQ(store->refTableRuntimeIdentityForTest(ns), runtime_identity)
+        << "rebirth must re-resolve inside the still-resident runtime";
+    ASSERT_EQ(store->refTableLifeForTest(ns)->incarnation, successor.incarnation);
+
+    const NamespaceLifeId successor_life = NamespaceLifeId::fromCatalogEntry(ns, successor.incarnation);
+    const ListPage successor_stream = backend->list(layout.namespaceStreamPrefix(successor_life), "", 1000);
+    ASSERT_FALSE(successor_stream.keys.empty()) << "the real successor writer produced foldable stream work";
+    std::vector<GcPhaseRecord> successor_phases;
+    gc.setPhaseSink([&](const GcPhaseRecord & phase) { successor_phases.push_back(phase); });
+    const RoundReport successor_round = runRegularRoundReclaiming(gc);
+    const auto decision = std::find_if(successor_phases.begin(), successor_phases.end(), [](const GcPhaseRecord & phase)
+    {
+        return phase.phase == "defer_decision";
+    });
+    ASSERT_NE(decision, successor_phases.end());
+    ASSERT_FALSE(successor_round.deferred)
+        << "successor stream keys=" << successor_stream.keys.size()
+        << ", changed_shards=" << decision->metrics.at("changed_shards")
+        << ", dead_life_debris=" << decision->metrics.at("dead_life_debris");
+    state = decodeGcState(backend->get(layout.gcStateKey())->bytes);
+    seal = decodeFoldSeal(backend->get(layout.foldSealKey(state.snap_generation, state.snap_attempt))->bytes);
+    EXPECT_FALSE(seal.ref_lives.contains(predecessor.incarnation));
+    const auto successor_row = seal.ref_lives.find(successor.incarnation);
+    ASSERT_NE(successor_row, seal.ref_lives.end());
+    EXPECT_EQ(successor_row->second.coverage.last_folded_ref_id.writer_epoch, writer_epoch);
+    EXPECT_EQ(successor_row->second.coverage.last_folded_ref_id.ref_sequence, 2u)
+        << "the successor starts at its own birth+publish stream, not the predecessor's cursor";
+    for (const String & key : backend->touchedKeys())
+        EXPECT_EQ(key.find("/_cleanup/"), String::npos) << key;
+}
+
 /// ===================================================================================
 /// Task 11: namespace birth / the recreation gate (spec §Namespace Birth)
 /// ===================================================================================
 
-/// Recreating a `Removed` namespace is rejected absent the exact `_cleanup/<remove_txn_id>` marker --
-/// even though a FRESH mount's own recovery sees the table as functionally "empty" (the pre-removal
-/// logs are all at/below the small Removed snapshot and are ignored by the recovery rule), an
-/// empty-looking prefix is never sufficient on its own. Once the marker is observed, birth succeeds and
-/// the table's id timeline continues strictly above the old remove_txn_id.
-TEST(RefWriterNamespaceBirth, BirthFromRemovedRejectedWithoutMarkerAcceptedWithMarker)
+/// The writer assignment site may pin an already-`Live` catalog life, but recovering that empty life
+/// performs no catalog or stream mutation. It must install the exact incarnation from the observed row.
+TEST(RefWriterNamespaceBirth, ExistingLiveCatalogRowPinsExactLifeWithoutMutation)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
-    const Layout layout("p");
-    const RootNamespace ns{"srv1/recreate"};
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/existing-live-assignment"};
+    CasRefCatalog::casAdmitEntry(*backend, store->layout(), CatalogEntry{
+        .ns = ns, .state = NsState::Live, .incarnation = UInt128{41}});
 
-    RefTxnId remove_id;
-    {
-        auto store = openPool(backend);
-        publishEmptyPart(store, ns, "a");
-        store->dropNamespace(ns);
-        const auto id = store->newestPublishedSnapshotIdForTest(ns);
-        ASSERT_TRUE(id.has_value());
-        remove_id = *id;
-    }   /// mount released
-
-    /// A fresh mount, no marker observed: rejected (NETWORK_ERROR, fix #37 phase 2 -- a namespace-
-    /// rebirth race that resolves once GC's cleanup marker is observed, not a terminal rejection).
-    {
-        auto store2 = openPool(backend);
-        auto build = startBuildFor(store2, ns, "reborn");
-        const ManifestId id = build->stageManifest({});
-        expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { build->precommitAdd(ns, "reborn", id); });
-    }
-
-    /// GC's namespace-cleanup item (Task 12) publishes the exact completion marker -- simulated here
-    /// directly via the raw fixture convention, since Task 12 has not landed yet.
-    backend->putIfAbsent(layout.refCleanupMarkerKey(NamespaceLifeId::stageATransition(ns), remove_id), "");
-
-    /// A further fresh mount, marker now observed: birth succeeds.
-    {
-        auto store3 = openPool(backend);
-        auto build = startBuildFor(store3, ns, "reborn");
-        const ManifestId id = build->stageManifest({});
-        EXPECT_NO_THROW(build->precommitAdd(ns, "reborn", id));
-        build->promote(ns, "reborn", build->buildId(), id);
-
-        const auto resolved = store3->resolveRef(ns, "reborn");
-        ASSERT_TRUE(resolved.has_value());
-        EXPECT_EQ(resolved->manifest_id.ref, id.ref);
-
-        const RefTableState replayed = independentFullReplayForTest(*backend, layout, ns);
-        EXPECT_EQ(replayed.getLifecycle(), RefLifecycle::Live);
-        EXPECT_GT(replayed.getGreatestApplied(), remove_id) << "the reborn timeline continues strictly above the old removal";
-    }
+    backend->resetCounts();
+    const NamespaceLifeId life = store->namespaceLife(ns);
+    EXPECT_EQ(life.incarnation, UInt128{41});
+    ASSERT_TRUE(store->refTableLifeForTest(ns));
+    EXPECT_EQ(store->refTableLifeForTest(ns)->incarnation, UInt128{41});
+    EXPECT_EQ(backend->putTotal(), 0u);
+    EXPECT_EQ(backend->putOverwriteTotal(), 0u);
+    EXPECT_EQ(backend->casPutTotal(), 0u);
 }
 
-/// A never-born namespace needs no marker at all (spec: "A never-born table (remove_txn_id absent)
-/// needs no marker.").
-TEST(RefWriterNamespaceBirth, BirthFromNeverBornNeedsNoMarker)
+/// A never-born namespace follows the ordinary catalog-first birth path.
+TEST(RefWriterNamespaceBirth, BirthFromNeverBornUsesOrdinaryPath)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend);
     const RootNamespace ns{"srv1/virgin"};
 
-    EXPECT_FALSE(store->observedNamespaceCleanupMarker(ns, RefTxnId{1, 1}));
     EXPECT_NO_THROW(publishEmptyPart(store, ns, "first"));
     EXPECT_TRUE(store->resolveRef(ns, "first").has_value());
 }

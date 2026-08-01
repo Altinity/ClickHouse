@@ -18,6 +18,6 @@ TEST(CasFormatBattery, PoolMeta)
         .id = FormatId::PoolMeta,
         .encode = [&] { return sealObject(FormatId::PoolMeta, encodePoolMeta(pm)); },
         .decode = [](std::string_view s) { decodePoolMeta(std::string(openObject(FormatId::PoolMeta, s))); },
-        .golden = "{\"type\":\"cas_pool_meta\",\"v\":6}\n"
+        .golden = "{\"type\":\"cas_pool_meta\",\"v\":7}\n"
                   "{\"pid\":\"00112233445566778899aabbccddeeff\",\"hln\":256,\"mrg\":3,\"alg\":\"ch128\"}\n"});
 }

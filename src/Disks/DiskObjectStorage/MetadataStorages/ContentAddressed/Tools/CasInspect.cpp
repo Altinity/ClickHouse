@@ -364,7 +364,7 @@ String renderRunRef(const RunRef & r)
         .str();
 }
 
-String renderShardCoverage(const ShardCoverage & c)
+String renderRefCoverage(const RefCoverage & c)
 {
     return JsonObj()
         .add("classification", jsonUInt(c.classification))
@@ -374,9 +374,14 @@ String renderShardCoverage(const ShardCoverage & c)
 
 String renderFoldSeal(const CasFoldSeal & seal)
 {
-    JsonObj per_ns_shard;
-    for (const auto & [k, v] : seal.per_ns_shard)
-        per_ns_shard.add(k, renderShardCoverage(v));
+    JsonObj ref_lives;
+    for (const auto & [life_id, state] : seal.ref_lives)
+        ref_lives.add(renderIncarnation(life_id), JsonObj()
+            .add("coverage", renderRefCoverage(state.coverage))
+            .add("cleanup_evidence", state.cleanup_evidence
+                ? JsonObj().add("remove_txn_id", renderRefTxnIdObj(state.cleanup_evidence->remove_txn_id)).str()
+                : "null")
+            .str());
 
     std::vector<String> blob_target_runs;
     blob_target_runs.reserve(seal.blob_target_runs.size());
@@ -397,7 +402,7 @@ String renderFoldSeal(const CasFoldSeal & seal)
     return JsonObj()
         .add("generation", jsonUInt(seal.generation))
         .add("parent_generation", jsonUInt(seal.parent_generation))
-        .add("per_ns_shard", per_ns_shard.str())
+        .add("ref_lives", ref_lives.str())
         .add("blob_target_runs", jsonArray(blob_target_runs))
         .add("condemned_summary", condemned_summary.str())
         .str();
@@ -606,12 +611,7 @@ String caInspectToJson(const Layout & layout, const String & key, std::string_vi
         if (parsed->kind == RefObjectKind::Log)
             return renderRefLogTxn(decodeRefLogTxn(
                 openObject(FormatId::RefLog, bytes), life.ns.string(), parsed->txn_id));
-        /// A `_cleanup` marker is a zero-byte object — nothing to decode, so render its key-derived facts.
-        return JsonObj()
-            .add("object", jsonEscape("ref_cleanup_marker"))
-            .add("ns", jsonEscape(life.ns.string()))
-            .add("txn_id", renderRefTxnIdObj(parsed->txn_id))
-            .str();
+        throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "ca-inspect: unhandled ref-object kind for key '{}'", key);
     }
 
     if (key == layout.gcStateKey())

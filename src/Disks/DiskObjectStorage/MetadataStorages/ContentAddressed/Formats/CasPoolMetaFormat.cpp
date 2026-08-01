@@ -105,13 +105,13 @@ PoolMeta decodePoolMeta(std::string_view data)
     /// An older pool predates a breaking ref-layer change this build cannot reconcile, so
     /// reject it before reading the metadata body. Writers always emit the current generation, while
     /// `expectHeaderLine` separately rejects a future generation that this build cannot understand.
-    /// Generation 6 is the latest recreate-only grammar floor and subsumes the earlier stream floors.
-    if (header.v < kOpaqueNamespaceLifeLayoutGeneration)
+    /// Generation 7 is the latest recreate-only grammar floor and subsumes the earlier stream floors.
+    if (header.v < kUnifiedRefLifeFoldGeneration)
         throw Exception(ErrorCodes::UNKNOWN_FORMAT_VERSION,
-            "CAS pool format {} predates opaque namespace-life stream/state keys; recreate the pool. "
-            "This build reads only `cas/ns/stream/<life_id>` and `cas/ns/state/<life_id>` keys "
+            "CAS pool format {} predates generation-7 unified ref-life fold state; recreate the pool. "
+            "This build reads one opaque-life-keyed fold row and no separate terminal-marker object "
             "(generation {}+), and CAS is pre-release: there is no in-place migration.",
-            header.v, kOpaqueNamespaceLifeLayoutGeneration);
+            header.v, kUnifiedRefLifeFoldGeneration);
 
     const String body = readLine(in, traitsFor(FormatId::PoolMeta).line_cap, "pool meta");
     ReadBufferFromMemory body_in(body.data(), body.size());

@@ -84,7 +84,6 @@ TEST(CasLayout, OpaqueLifeIdSeparatesStreamFromState)
     EXPECT_EQ(l.namespaceStatePrefix(first), "p/cas/ns/state/00000000000000000000000000001234/");
     EXPECT_EQ(l.refLogKey(first, txn), "p/cas/ns/stream/00000000000000000000000000001234/_log/0000000000000007-0000000000000009.zst");
     EXPECT_EQ(l.refSnapshotKey(first, txn), "p/cas/ns/stream/00000000000000000000000000001234/_snap/0000000000000007-0000000000000009.zst");
-    EXPECT_EQ(l.refCleanupMarkerKey(first, txn), "p/cas/ns/stream/00000000000000000000000000001234/_cleanup/0000000000000007-0000000000000009");
     EXPECT_EQ(l.refCkptKey(first), "p/cas/ns/state/00000000000000000000000000001234/_ckpt");
     EXPECT_EQ(l.namespaceFileKey(first, "nested/file"), "p/cas/ns/state/00000000000000000000000000001234/_files/nested/file");
 
@@ -270,13 +269,6 @@ TEST(CasLayout, RefObjectKeyRoundTrips)
     EXPECT_EQ(parsed_snap->kind, RefObjectKind::Snap);
     EXPECT_EQ(parsed_snap->txn_id, id);
 
-    const String cleanup_key = l.refCleanupMarkerKey(ns_id, id);
-    EXPECT_EQ(cleanup_key, life + "_cleanup/0000000000000007-000000000000008e");
-    const auto parsed_cleanup = l.parseRefObjectKey(cleanup_key);
-    ASSERT_TRUE(parsed_cleanup.has_value());
-    EXPECT_EQ(parsed_cleanup->life_id, ns_id.incarnation);
-    EXPECT_EQ(parsed_cleanup->kind, RefObjectKind::Cleanup);
-    EXPECT_EQ(parsed_cleanup->txn_id, id);
 }
 
 TEST(CasLayout, RefObjectKeyLexicalOrder)
@@ -284,9 +276,6 @@ TEST(CasLayout, RefObjectKeyLexicalOrder)
     Layout l("p");
     const NamespaceLifeId ns_id = NamespaceLifeId::stageATransition(RootNamespace{"srv1/tbl@cas@"});
     const RefTxnId id{7, 0x8e};
-    /// spec §Object Layout: "`_cleanup` sorts before `_log` ... and takes no part in the `_log`-before-
-    /// `_snap` recovery ordering". Asserted here on the actual generated keys, same life + id.
-    EXPECT_LT(l.refCleanupMarkerKey(ns_id, id), l.refLogKey(ns_id, id));
     EXPECT_LT(l.refLogKey(ns_id, id), l.refSnapshotKey(ns_id, id));
 }
 
@@ -315,8 +304,6 @@ TEST(CasLayout, ParseRefObjectKeyRejections)
     const String snap_suffix{storedSuffix(FormatId::RefSnapshot)};
     EXPECT_FALSE(l.parseRefObjectKey(snap_key.substr(0, snap_key.size() - snap_suffix.size())).has_value());
     EXPECT_FALSE(l.parseRefObjectKey(log_key + ".proto").has_value());
-    /// `_cleanup`/`_log` ids never carry an extension.
-    EXPECT_FALSE(l.parseRefObjectKey(l.refCleanupMarkerKey(ns_id, id) + ".bin").has_value());
     /// Trailing garbage after the id.
     EXPECT_FALSE(l.parseRefObjectKey(log_key + "/extra").has_value());
     EXPECT_FALSE(l.parseRefObjectKey(snap_key + "/extra").has_value());
@@ -350,10 +337,9 @@ TEST(CasLayout, RefCkptKeyRoundTripsAndRejectsEverythingElse)
 
     /// Foreign pool prefix.
     EXPECT_FALSE(l.parseRefCkptKey("q/cas/ns/state/00000000000000000000000000000001/_ckpt").has_value());
-    /// The three id-bearing kinds are not checkpoints.
+    /// The two id-bearing kinds are not checkpoints.
     EXPECT_FALSE(l.parseRefCkptKey(l.refLogKey(ns_id, id)).has_value());
     EXPECT_FALSE(l.parseRefCkptKey(l.refSnapshotKey(ns_id, id)).has_value());
-    EXPECT_FALSE(l.parseRefCkptKey(l.refCleanupMarkerKey(ns_id, id)).has_value());
     /// A suffix the registry does not put there, and trailing garbage.
     EXPECT_FALSE(l.parseRefCkptKey(l.refCkptKey(ns_id) + ".zst").has_value());
     EXPECT_FALSE(l.parseRefCkptKey(l.refCkptKey(ns_id) + "/extra").has_value());

@@ -82,13 +82,6 @@ concept HasIncarnationRefSnapshotKey =
     requires(const L & l, const NamespaceLifeId & ns_id, const RefTxnId & id) { l.refSnapshotKey(ns_id, id); };
 
 template <class L>
-concept HasNamespaceOnlyRefCleanupMarkerKey =
-    requires(const L & l, const RootNamespace & ns, const RefTxnId & id) { l.refCleanupMarkerKey(ns, id); };
-template <class L>
-concept HasIncarnationRefCleanupMarkerKey =
-    requires(const L & l, const NamespaceLifeId & ns_id, const RefTxnId & id) { l.refCleanupMarkerKey(ns_id, id); };
-
-template <class L>
 concept HasNamespaceOnlyRefCkptKey =
     requires(const L & l, const RootNamespace & ns) { l.refCkptKey(ns); };
 template <class L>
@@ -144,7 +137,6 @@ TEST(CasNamespaceLifeId, KeysCarryTheIncarnationSegment)
     EXPECT_EQ(l.namespaceStreamPrefix(id), life);
     EXPECT_EQ(l.refLogKey(id, txn), life + "_log/" + kTxn + ".zst");
     EXPECT_EQ(l.refSnapshotKey(id, txn), life + "_snap/" + kTxn + ".zst");
-    EXPECT_EQ(l.refCleanupMarkerKey(id, txn), life + "_cleanup/" + kTxn);
     EXPECT_EQ(l.refCkptKey(id), state + "_ckpt");
 
     const auto parsed_log = l.parseRefObjectKey(l.refLogKey(id, txn));
@@ -157,11 +149,6 @@ TEST(CasNamespaceLifeId, KeysCarryTheIncarnationSegment)
     ASSERT_TRUE(parsed_snap.has_value());
     EXPECT_EQ(parsed_snap->life_id, id.incarnation);
     EXPECT_EQ(parsed_snap->kind, RefObjectKind::Snap);
-
-    const auto parsed_cleanup = l.parseRefObjectKey(l.refCleanupMarkerKey(id, txn));
-    ASSERT_TRUE(parsed_cleanup.has_value());
-    EXPECT_EQ(parsed_cleanup->life_id, id.incarnation);
-    EXPECT_EQ(parsed_cleanup->kind, RefObjectKind::Cleanup);
 
     EXPECT_EQ(l.parseRefCkptKey(l.refCkptKey(id)), id.incarnation);
 }
@@ -399,9 +386,6 @@ TEST(CasNamespaceLifeId, NamespaceOnlyKeyHelpersDoNotExist)
 
     static_assert(!HasNamespaceOnlyRefSnapshotKey<Layout>);
     static_assert(HasIncarnationRefSnapshotKey<Layout>);
-
-    static_assert(!HasNamespaceOnlyRefCleanupMarkerKey<Layout>);
-    static_assert(HasIncarnationRefCleanupMarkerKey<Layout>);
 
     static_assert(!HasNamespaceOnlyRefCkptKey<Layout>);
     static_assert(HasIncarnationRefCkptKey<Layout>);

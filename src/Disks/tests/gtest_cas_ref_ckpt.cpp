@@ -863,14 +863,15 @@ TEST(CasRefCkpt, CommitRefChunkDurableBytesUnchangedByExtraction)
 
     /// The BODY is checked as exact length plus a 128-bit SipHash of it -- not literally byte for byte,
     /// but any change that survives both is a 128-bit collision at a fixed length, which is the trade for
-    /// keeping the assertion readable. It is a function of `{ns, id, ops, chain_link}` only -- no
-    /// incarnation reaches it -- so these two literals survive Task 1c's re-keying as well.
+    /// keeping the assertion readable. It is a function of `{format generation, ns, id, ops,
+    /// chain_link}` only -- no incarnation reaches it. The generation-7 wire cut therefore updates
+    /// the hash while leaving the payload shape and exact length unchanged.
     const auto got = backend->get(key);
     ASSERT_TRUE(got.has_value()) << "the birth chunk must be durable at its canonical key";
     EXPECT_EQ(got->bytes.size(), 177u) << "the sealed ref-log body changed size";
     SipHash body_hash;
     body_hash.update(got->bytes.data(), got->bytes.size());
-    EXPECT_EQ(getHexUIntLowercase(body_hash.get128()), "d9c0a90e125f382a9d932314f3751468")
+    EXPECT_EQ(getHexUIntLowercase(body_hash.get128()), "e86dddfa09c364152fb893d776cd6863")
         << "the sealed ref-log body changed content -- preparation must seal the same bytes it sealed "
            "before the extraction";
 }

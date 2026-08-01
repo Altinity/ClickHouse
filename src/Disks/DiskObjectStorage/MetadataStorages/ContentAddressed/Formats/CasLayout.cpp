@@ -116,9 +116,7 @@ std::optional<ParsedRefObjectKey> Layout::parseRefObjectKey(std::string_view key
         return std::nullopt;
 
     RefObjectKind kind{};
-    if (kind_seg == "_cleanup")
-        kind = RefObjectKind::Cleanup;
-    else if (kind_seg == "_log")
+    if (kind_seg == "_log")
         kind = RefObjectKind::Log;
     else if (kind_seg == "_snap")
         kind = RefObjectKind::Snap;
@@ -126,19 +124,11 @@ std::optional<ParsedRefObjectKey> Layout::parseRefObjectKey(std::string_view key
         return std::nullopt;
 
     std::string_view render = id_part;
-    if (kind == RefObjectKind::Snap || kind == RefObjectKind::Log)
-    {
-        /// `_log` and `_snap` are always-compressed text stored under a `.zst` suffix. `_cleanup`
-        /// stays a bare zero-byte marker and is intentionally not part of that compression family.
-        constexpr std::string_view kZstSuffix = ".zst";
-        if (!render.ends_with(kZstSuffix))
-            return std::nullopt;
-        render.remove_suffix(kZstSuffix.size());
-    }
-    else if (render.find('.') != std::string_view::npos)
-    {
-        return std::nullopt;   /// `_cleanup` ids never carry an extension
-    }
+    /// `_log` and `_snap` are always-compressed text stored under a `.zst` suffix.
+    constexpr std::string_view kZstSuffix = ".zst";
+    if (!render.ends_with(kZstSuffix))
+        return std::nullopt;
+    render.remove_suffix(kZstSuffix.size());
 
     const auto txn_id = parseRefTxnId(render);
     if (!txn_id)

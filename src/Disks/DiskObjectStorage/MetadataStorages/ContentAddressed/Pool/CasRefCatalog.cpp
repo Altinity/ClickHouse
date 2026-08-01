@@ -183,11 +183,36 @@ std::vector<CatalogEntry>::const_iterator findEntry(const RefCatalog & catalog, 
 RefCatalog CasRefCatalog::casUpdate(
     Backend & backend, const Layout & layout, const std::function<RefCatalog(const RefCatalog &)> & mutate)
 {
-    return casUpdateImpl(backend, layout, mutate, [](const RefCatalog & c) { return encodeRefCatalog(c); });
+    const auto identity_preserving_mutate = [&](const RefCatalog & current) -> RefCatalog
+    {
+        RefCatalog candidate = mutate(current);
+        if (candidate.entries.size() != current.entries.size())
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "CasRefCatalog::casUpdate cannot add or delete catalog entries -- use casAdmitEntry, "
+                "deleteCompletedRemoving, or cancelStalledCreating");
+        for (size_t i = 0; i < current.entries.size(); ++i)
+        {
+            if (candidate.entries[i].ns != current.entries[i].ns
+                || candidate.entries[i].incarnation != current.entries[i].incarnation)
+                throw Exception(ErrorCodes::LOGICAL_ERROR,
+                    "CasRefCatalog::casUpdate cannot replace catalog identity at row {} -- namespace "
+                    "and incarnation are immutable outside the narrow admission/deletion APIs",
+                    i);
+        }
+        return candidate;
+    };
+    return casUpdateImpl(
+        backend, layout, identity_preserving_mutate, [](const RefCatalog & c) { return encodeRefCatalog(c); });
 }
 
 RefCatalog CasRefCatalog::casAdmitEntry(Backend & backend, const Layout & layout, const CatalogEntry & entry)
 {
+    if (entry.state == NsState::Removing)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "CasRefCatalog::casAdmitEntry cannot admit namespace '{}' directly as Removing -- "
+            "removal is an exact transition of an existing Live row",
+            entry.ns.string());
+
     /// The mutation shape is FIXED (insert `entry` at its canonical position) rather than a
     /// caller-supplied lambda -- see the header comment on why that is the point, not an
     /// inconvenience. A namespace that already has an entry is not de-duplicated here: the insert
@@ -204,6 +229,127 @@ RefCatalog CasRefCatalog::casAdmitEntry(Backend & backend, const Layout & layout
     };
     return casUpdateImpl(backend, layout, mutate,
         [&entry](const RefCatalog & c) { return checkCatalogAdmission(c, entry.ns); });
+}
+
+CasRefCatalog::BeginRemovingOutcome CasRefCatalog::beginRemoving(
+    Backend & backend, const Layout & layout, const CatalogEntry & observed,
+    uint64_t removal_started_round, uint64_t admitted_generation,
+    const std::function<void(uint64_t)> & check_fence_or_throw)
+{
+    if (observed.state != NsState::Live || observed.creator || observed.removal_started_round)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "CasRefCatalog::beginRemoving: namespace '{}' is not an exact Live entry",
+            observed.ns.string());
+
+    const auto mutate = [&](const RefCatalog & cur) -> RefCatalog
+    {
+        try { check_fence_or_throw(admitted_generation); }
+        catch (...) { throw CatalogFenceMovedMarker{}; }
+
+        const auto it = findEntry(cur, observed.ns);
+        if (it == cur.entries.end() || *it != observed)
+            throw CatalogEntryMismatchMarker{};
+
+        RefCatalog next = cur;
+        CatalogEntry & entry = next.entries[it - cur.entries.begin()];
+        entry.state = NsState::Removing;
+        entry.removal_started_round = removal_started_round;
+        return next;
+    };
+
+    try
+    {
+        casUpdateImpl(backend, layout, mutate, [](const RefCatalog & c) { return encodeRefCatalog(c); });
+    }
+    catch (const CatalogFenceMovedMarker &)
+    {
+        return BeginRemovingOutcome::FencedOut;
+    }
+    catch (const CatalogEntryMismatchMarker &)
+    {
+        const Snapshot current = read(backend, layout);
+        const auto it = findEntry(current.catalog, observed.ns);
+        if (it != current.catalog.entries.end()
+            && it->incarnation == observed.incarnation
+            && it->state == NsState::Removing)
+            return BeginRemovingOutcome::AlreadyRemoving;
+        return BeginRemovingOutcome::EntryChanged;
+    }
+    return BeginRemovingOutcome::Transitioned;
+}
+
+CasRefCatalog::CompletedRemovingDeleteOutcome CasRefCatalog::deleteCompletedRemoving(
+    Backend & backend, const Layout & layout, const CatalogEntry & observed,
+    const CasFoldSeal & authoritative_parent, uint64_t admitted_generation,
+    const std::function<void(uint64_t)> & check_fence_or_throw)
+{
+    if (observed.state != NsState::Removing || !observed.removal_started_round)
+        return CompletedRemovingDeleteOutcome::ProofRefused;
+
+    const auto parent_it = authoritative_parent.ref_lives.find(observed.incarnation);
+    if (parent_it == authoritative_parent.ref_lives.end()
+        || !parent_it->second.cleanup_evidence
+        || parent_it->second.coverage.hold)
+        return CompletedRemovingDeleteOutcome::ProofRefused;
+
+    const auto mutate = [&](const RefCatalog & cur) -> RefCatalog
+    {
+        try { check_fence_or_throw(admitted_generation); }
+        catch (...) { throw CatalogFenceMovedMarker{}; }
+
+        const auto it = findEntry(cur, observed.ns);
+        if (it == cur.entries.end() || *it != observed)
+            throw CatalogEntryMismatchMarker{};
+
+        RefCatalog next = cur;
+        next.entries.erase(next.entries.begin() + (it - cur.entries.begin()));
+        return next;
+    };
+
+    try
+    {
+        casUpdateImpl(backend, layout, mutate, [](const RefCatalog & c) { return encodeRefCatalog(c); });
+    }
+    catch (const CatalogFenceMovedMarker &) { return CompletedRemovingDeleteOutcome::FencedOut; }
+    catch (const CatalogEntryMismatchMarker &) { return CompletedRemovingDeleteOutcome::EntryChanged; }
+    return CompletedRemovingDeleteOutcome::Deleted;
+}
+
+CasRefCatalog::StalledCreatingCancelOutcome CasRefCatalog::cancelStalledCreating(
+    Backend & backend, const Layout & layout, const CatalogEntry & observed,
+    const std::function<bool(const CreatorFence &)> & is_creator_fence_terminal,
+    uint64_t admitted_generation, const std::function<void(uint64_t)> & check_fence_or_throw)
+{
+    if (observed.state != NsState::Creating || !observed.creator)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "CasRefCatalog::cancelStalledCreating: namespace '{}' is not a Creating entry with a "
+            "creator fence",
+            observed.ns.string());
+
+    const auto mutate = [&](const RefCatalog & cur) -> RefCatalog
+    {
+        try { check_fence_or_throw(admitted_generation); }
+        catch (...) { throw CatalogFenceMovedMarker{}; }
+
+        const auto it = findEntry(cur, observed.ns);
+        if (it == cur.entries.end() || *it != observed)
+            throw CatalogEntryMismatchMarker{};
+        if (!is_creator_fence_terminal(*observed.creator))
+            throw CatalogCreatorStillLiveMarker{};
+
+        RefCatalog next = cur;
+        next.entries.erase(next.entries.begin() + (it - cur.entries.begin()));
+        return next;
+    };
+
+    try
+    {
+        casUpdateImpl(backend, layout, mutate, [](const RefCatalog & c) { return encodeRefCatalog(c); });
+    }
+    catch (const CatalogFenceMovedMarker &) { return StalledCreatingCancelOutcome::FencedOut; }
+    catch (const CatalogEntryMismatchMarker &) { return StalledCreatingCancelOutcome::EntryChanged; }
+    catch (const CatalogCreatorStillLiveMarker &) { return StalledCreatingCancelOutcome::CreatorFenceStillLive; }
+    return StalledCreatingCancelOutcome::Cancelled;
 }
 
 CasRefCatalog::NamespaceCreationOutcome CasRefCatalog::completeCreation(
@@ -271,8 +417,8 @@ CasRefCatalog::NamespaceCreationOutcome CasRefCatalog::createNamespace(
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "CasRefCatalog::createNamespace: namespace '{}' already carries a catalog entry (state "
             "'{}') -- a stalled Creating entry is resumed through reconcileStaleCreator + "
-            "completeCreation, never a fresh createNamespace call, and recreating an existing "
-            "Live/Removing name is Task 5's (removal's) business, not creation's",
+            "completeCreation, never a fresh createNamespace call; an existing Live or Removing "
+            "namespace must complete its current lifecycle before a fresh creation can be admitted",
             ns.string(), nsStateToWord(existing->state));
 
     const CatalogEntry entry{.ns = ns, .state = NsState::Creating,

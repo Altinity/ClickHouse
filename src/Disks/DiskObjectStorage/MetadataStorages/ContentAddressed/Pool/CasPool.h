@@ -93,8 +93,8 @@ struct PoolConfig
     /// frontier. A namespace this round's LIST hint still mentions is walked regardless (the round owes
     /// its edges anyway), and a HELD one is always walked (its hold must be retried by exact key, spec
     /// §5), so this bounds only the extra exact `GET`s the universe union introduced -- normally zero,
-    /// because a namespace that legitimately went away leaves its `_cleanup` marker behind and therefore
-    /// stays hinted. Running out is NOT an error: the unprobed namespaces are simply unproven, which
+    /// because ordinary active namespaces normally remain hinted. Running out is NOT an error: the
+    /// unprobed namespaces are simply unproven, which
     /// suppresses all destruction for the round. 0 => probe none (the exhaustion path, which tests
     /// drive directly).
     uint64_t gc_frontier_probe_budget = 1024;
@@ -306,7 +306,7 @@ class Pool : public std::enable_shared_from_this<Pool>
     /// PartWriteTxn/Gc reach the ref-log lane only through Pool's PUBLIC surface now (the ref subsystem moved
     /// to the `ref_ledger` member): PartWriteTxn's staging PUTs go through `stagingPutIfAbsent`/
     /// `stagingConditionalCreate` (which encapsulate the controller call + fence), its ref mutations
-    /// through the public `appendRefOps`/`observedNamespaceCleanupMarker` delegates; Gc uses the public
+    /// through the public `appendRefOps` delegate; Gc uses the public
     /// `wedgedRefLaneCount`. No `friend` needed -- both prior friendships were removed when the
     /// ref-ledger became a member component.
 
@@ -498,19 +498,6 @@ public:
     /// Decommission-only exact-life overload; never re-resolves by namespace name.
     DropNamespaceStats dropNamespace(const NamespaceLifeId & life);
 
-    /// True iff this namespace's ref-table lifecycle is durably `Removed` — a table that `dropNamespace`
-    /// removed and that has NOT been recreated (distinguished from a never-born namespace, whose default
-    /// `Removed` lifecycle carries no `remove_txn_id`). Recovers a cold runtime; the warm path is a
-    /// cached-state read. Readers consult this to treat a dropped table's namespace files as absent while
-    /// GC has not yet physically reclaimed them (deferred-GC removal); a never-born namespace is
-    /// NOT reported removed (fail-closed — only a KNOWN-removed table hides its files). A SAME-namespace
-    /// recreation flips this back to `false` only once its first ref op forces a fresh `namespace_birth`
-    /// — unreachable under normal `Atomic` DDL (a recreated table always mints a fresh UUID, hence a
-    /// fresh namespace), and itself gated on this namespace's `_cleanup` marker.
-    bool namespaceIsRemoved(const RootNamespace & ns);
-    /// Decommission-only exact-life overload; never re-resolves by namespace name.
-    bool namespaceIsRemoved(const NamespaceLifeId & life);
-
     /// The catalog life this namespace's objects are keyed under, for a WRITER, and the only resolution
     /// that CREATES one: minted if the catalog names none (a namespace's first namespace file births it
     /// exactly as its first ref op would). Resolved once per table-open and cached, so this is not a
@@ -526,6 +513,10 @@ public:
     /// pair one with the other's stale answer, and an unreadable namespace yields no life to read with
     /// rather than a wrong one. See `CasRefLedger`'s declaration.
     std::optional<NamespaceLifeId> namespaceFilesLifeIfReadable(const RootNamespace & ns);
+
+    /// GC callback after a proved exact catalog deletion; see `CasRefLedger` for the in-place cached
+    /// runtime invalidation contract.
+    void invalidateRemovedCatalogLife(const NamespaceLifeId & life);
 
     /// ==== writer ref-log append lane ====
     ///
@@ -571,12 +562,6 @@ public:
                          std::function<std::vector<RefOp>(const RefTableState &)> build_ops,
                          RootMutationOrigin origin, RootMutationKind kind,
                          bool skip_stale_precommit_sweep = false);
-
-    /// whether namespace `ns`'s recovery observed the exact
-    /// `_cleanup/<remove_txn_id>` completion marker for `remove_txn_id` -- the SOLE gate on recreating
-    /// a `Removed` namespace (an empty physical prefix is never sufficient). Recovers the table
-    /// (idempotent) if not already cached. Used by `PartWriteTxn::precommitAdd`'s auto-birth guard.
-    bool observedNamespaceCleanupMarker(const RootNamespace & ns, const RefTxnId & remove_txn_id);
 
     /// the synchronous core of one publish attempt -- copies
     /// the live `RefTableState` ONCE under `state_mutex` (candidate `X` = the state's `greatest_applied`
@@ -925,16 +910,21 @@ public:
     /// evicted reports false until its next touch re-recovers it.
     size_t refTablesCachedCountForTest() { return ref_ledger.refTablesCachedCountForTest(); }
     bool refTableCachedForTest(const RootNamespace & ns) { return ref_ledger.refTableCachedForTest(ns); }
+    const void * refTableRuntimeIdentityForTest(const RootNamespace & ns)
+    {
+        return ref_ledger.refTableRuntimeIdentityForTest(ns);
+    }
+    std::optional<NamespaceLifeId> refTableLifeForTest(const RootNamespace & ns)
+    {
+        return ref_ledger.refTableLifeForTest(ns);
+    }
 
     /// Recovery-publication inventory seams (forward to `CasRefLedger`): the seeded admission budgets,
-    /// the recovered base snapshot's encoded body size, the tail-since-snapshot byte sum, and the
-    /// `_cleanup` markers observed at recovery -- so a test can assert every `RecoveryResult` field.
+    /// the recovered base snapshot's encoded body size and the tail-since-snapshot byte sum.
     uint64_t refSnapshotBudgetForTest(const RootNamespace & ns) { return ref_ledger.refSnapshotBudgetForTest(ns); }
     uint64_t refRemovalBudgetForTest(const RootNamespace & ns) { return ref_ledger.refRemovalBudgetForTest(ns); }
     uint64_t refBaseSnapshotBytesForTest(const RootNamespace & ns) { return ref_ledger.refBaseSnapshotBytesForTest(ns); }
     uint64_t refTailBytesSinceSnapshotForTest(const RootNamespace & ns) { return ref_ledger.refTailBytesSinceSnapshotForTest(ns); }
-    std::set<RefTxnId> refCleanupMarkersForTest(const RootNamespace & ns) { return ref_ledger.refCleanupMarkersForTest(ns); }
-
 private:
     BackendPtr pool_backend;
     PoolConfig config;

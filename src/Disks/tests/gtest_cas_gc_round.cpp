@@ -181,36 +181,6 @@ std::map<String, String> snapshotKeyTokens(InMemoryBackend & b)
 
 }
 
-/// ---- cursor-key codec (not snap-specific: cursorKey/parseCursorKey survive the redesign) ----
-
-/// `cursorKey`/`parseCursorKey` must round-trip and match the legacy inline expressions in CasGc.cpp.
-/// The namespace "srv1/tbl" deliberately contains a '/' to exercise the rfind-based last-slash split.
-TEST(CasGcCursorKey, RoundTripsAndMatchesLegacyFormat)
-{
-    const RootNamespace ns{"srv1/tbl"};
-
-    EXPECT_EQ(cursorKey(ns, 7), "srv1/tbl/7");
-    EXPECT_EQ(cursorKey(ns, 0), "srv1/tbl/0");
-    EXPECT_EQ(cursorKey(RootNamespace{"simple"}, 42), "simple/42");
-
-    {
-        const auto [pns, pshard] = parseCursorKey("srv1/tbl/7");
-        EXPECT_EQ(pns.string(), "srv1/tbl");
-        EXPECT_EQ(pshard, 7u);
-    }
-    {
-        const auto [pns, pshard] = parseCursorKey("simple/42");
-        EXPECT_EQ(pns.string(), "simple");
-        EXPECT_EQ(pshard, 42u);
-    }
-    {
-        const auto key = cursorKey(ns, 7);
-        const auto [pns, pshard] = parseCursorKey(key);
-        EXPECT_EQ(pns.string(), ns.string());
-        EXPECT_EQ(pshard, 7u);
-    }
-}
-
 /// ---- LEASE / leadership protocol (the round's only stateful concurrency) ----
 ///
 /// The lease steal window is observation-based and deterministic (see CasGc.h): a contender becomes
@@ -1572,10 +1542,10 @@ TEST(CasGcRound, OrphanManifestCursorSweepDeletesAndPersistsCursor)
         const GcState st = readState(*backend, *store);
         const CasFoldSeal seal = decodeFoldSeal(
             backend->get(store->layout().foldSealKey(st.snap_generation, st.snap_attempt))->bytes);
-        const auto it = seal.per_ns_shard.find(cursorKeyForTest(ns, /*shard*/0));
-        ASSERT_NE(it, seal.per_ns_shard.end()) << "the round must have sealed a coverage row";
-        EXPECT_FALSE(it->second.hold.has_value()) << "a held namespace can never reach the premise";
-        EXPECT_EQ(it->second.last_folded_ref_id, (RefTxnId{2, 1}))
+        const auto it = seal.ref_lives.find(catalogLifeIdForTest(*backend, store->layout(), ns));
+        ASSERT_NE(it, seal.ref_lives.end()) << "the round must have sealed a coverage row";
+        EXPECT_FALSE(it->second.coverage.hold.has_value()) << "a held namespace can never reach the premise";
+        EXPECT_EQ(it->second.coverage.last_folded_ref_id, (RefTxnId{2, 1}))
             << "the cursor must sit in the epoch ABOVE the debris, reached by folding the seal at {1,2}";
     }
 

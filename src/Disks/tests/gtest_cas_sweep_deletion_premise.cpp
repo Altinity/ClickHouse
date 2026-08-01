@@ -154,7 +154,7 @@ TEST(CasSweepDeletionPremise, AnUnconsumedTailRemovalRetainsItsTarget)
     const String key = f.orphanKey();
 
     NamespaceFoldView view;
-    ShardCoverage cov;
+    RefCoverage cov;
     cov.classification = 2;
     cov.last_folded_ref_id = RefTxnId{kBuildEpoch + 1, 1};   /// rule (1) satisfied
     view.coverage = cov;

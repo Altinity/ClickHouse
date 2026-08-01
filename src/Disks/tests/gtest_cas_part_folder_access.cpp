@@ -1101,7 +1101,7 @@ TEST(CasPartFolderAccess, DropNamespaceErasesAllViews)
     const Cas::RootNamespace ns{"srv/t1"};
     /// Review C2: deliberately NOT pinned -- `ns` gets a REAL, random catalog incarnation from
     /// `publishPart` below, which is what this test drives production's namespace-drop/recreate
-    /// mechanism (the `_cleanup` marker, the `Removed` snapshot, the retirement checkpoint) at. Pinning
+    /// terminal snapshot or retirement checkpoint at. Pinning
     /// it to the sentinel would make production's real-incarnation path untested by the one test that
     /// exercises it end-to-end (the exact gap C2 named).
     Cas::CachedPartFolderAccess access(store, cacheOn());
@@ -1129,27 +1129,6 @@ TEST(CasPartFolderAccess, DropNamespaceErasesAllViews)
     EXPECT_EQ(access.getView(key1, Cas::Freshness::CachedForLoad), nullptr);
     EXPECT_EQ(access.getView(key2, Cas::Freshness::CachedForLoad), nullptr);
 
-    /// Recreation end-to-end (Task 12, snapshot+log §Namespace Birth): recreating the namespace requires
-    /// GC's `_cleanup/<remove_txn_id>` completion marker; a warm writer re-observes it via one exact-key
-    /// re-check (`Pool::observedNamespaceCleanupMarker`). This file has no GC harness, so we publish the
-    /// marker directly -- the removal already published a `Removed` snapshot at `remove_txn_id`, so read
-    /// that id and write the marker, exactly as GC's namespace-cleanup item would. Republishing part_1
-    /// under the SAME name must then be admitted and serve a fresh RECREATED view via validate-on-hit,
-    /// never a stale hit on the dropped manifest.
-    const Cas::Layout & layout = store->layout();
-    /// The real life dropNamespace's own real-incarnation write landed at (review C2's whole point):
-    /// the catalog entry survives until Task 5's last step, so it is still readable here.
-    const DB::Cas::NamespaceLifeId life = DB::Cas::CasRefCatalog::resolveLifeOrSentinel(*backend, layout, ns);
-    const Cas::ListPage removed_snaps = backend->list(layout.namespaceStreamPrefix(life) + "_snap/", "", 100);
-    ASSERT_FALSE(removed_snaps.keys.empty()) << "dropNamespace must publish a Removed snapshot at remove_txn_id";
-    const auto parsed = layout.parseRefObjectKey(removed_snaps.keys.front().key);
-    ASSERT_TRUE(parsed.has_value());
-    backend->putIfAbsent(layout.refCleanupMarkerKey(life, parsed->txn_id), "");
-
-    publishPart(store, ns, "part_1", {inlineEntry("f", "recreated")});
-    const auto recreated_view = access.getView(key1, Cas::Freshness::CachedForLoad);
-    ASSERT_NE(recreated_view, nullptr) << "the recreated namespace must serve a fresh view after the marker is durable";
-    EXPECT_TRUE(access.explain(key1).retained);
 }
 
 TEST(CasPartFolderAccess, BestEffortRollbackDropCountsAndSurvivesABackendOutage)

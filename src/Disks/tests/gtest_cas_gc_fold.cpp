@@ -523,7 +523,7 @@ TEST(CasGcFold, SingleAnomalySuppressesEveryDestructiveActionInTheRound)
 /// namespace-cleanup item with un-reclaimed physical debris) must not be swept, and an unrelated live
 /// table's snapshot-covered ref-log must not be deleted, in the SAME clamped round. A clean round
 /// afterward proves the setup really was cleanup-eligible, not vacuously untouched.
-TEST(CasGcFold, RoundSideAnomalySuppressesNamespaceAndRefLogCleanupToo)
+TEST(CasGcFold, RoundSideAnomalySuppressesRefLogCleanupWhileRemovalDebrisStaysJanitorWork)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
@@ -539,17 +539,9 @@ TEST(CasGcFold, RoundSideAnomalySuppressesNamespaceAndRefLogCleanupToo)
     publishCommittedTransition(*backend, layout, ns_clamp, "r1", std::nullopt, a);
     runRegularRoundReclaiming(gc);   /// folds A cleanly; establishes the baseline before the clamp
 
-    /// Namespace 2: a namespace mid-removal -- a `Pending` cleanup item (a bare `remove_namespace` op, no
-    /// committed refs at all, so there is no owner-removal edge and hence no `mf_cleanup` entry that would
-    /// confound this test with a DIFFERENT, unconditional delete path) with physical `@cas@` debris still
-    /// present -- exactly what a clamp-free round's enumerate-and-delete pass would reclaim.
-    ///
-    /// THE DEBRIS IS A MANIFEST BODY PLUS A VERBATIM FILE, and the manifest is what makes the fixture work
-    /// at all (Stage B Task 4b): since files stopped being probed by `namespaceManifestsPhysicallyEmpty`,
-    /// a namespace whose ONLY debris is files is promoted Pending -> Completed by the very first fold, so
-    /// its Pending pass never runs in any round and a file alone can no longer observe whether that pass
-    /// was suppressed. The manifest holds the item Pending; both objects are then reclaimed by the same
-    /// pass, so the file remains a genuine observable of it rather than a coincidence.
+    /// Namespace 2: a namespace mid-removal with physical manifest and verbatim-file debris. Generation
+    /// 7 has no lifecycle-specific cleanup pass: terminal folding records evidence, while these bytes
+    /// remain inert work for the perpetual janitor and orphan-manifest sweep.
     const RootNamespace ns_removed{"00/cc@cas@"};
     {
         RefOp remove_op;
@@ -557,10 +549,8 @@ TEST(CasGcFold, RoundSideAnomalySuppressesNamespaceAndRefLogCleanupToo)
         appendRefLogSeed(*backend, layout, ns_removed, {remove_op});
     }
     /// Keyed at the life the CATALOG names for this namespace (`appendRefLogSeed` admitted it above),
-    /// which is the life the cleanup pass resolves too. Spelling the sentinel here instead would make the
-    /// test agree with the pass only by coincidence, and stop agreeing the moment a fixture mints a real
-    /// incarnation -- at which point the planted debris would sit under a prefix nothing looks at and the
-    /// clamp assertion below would hold vacuously.
+    /// which is the physical life that owns the eventual janitor work. Spelling the sentinel here instead
+    /// would plant debris under the wrong life and make the retention assertion vacuous.
     const String debris_key
         = layout.namespaceFilesPrefix(CasRefCatalog::resolveLifeOrSentinel(*backend, layout, ns_removed))
         + "leftover_verbatim_file";
@@ -596,24 +586,24 @@ TEST(CasGcFold, RoundSideAnomalySuppressesNamespaceAndRefLogCleanupToo)
     EXPECT_EQ(rep.redeleted, 0u);
     EXPECT_EQ(rep.graduated, 0u);
 
-    /// `runNamespaceCleanupPasses` must have skipped ns_removed's Pending item entirely this round.
+    /// Removal folding never performs lifecycle-specific physical cleanup, with or without a clamp.
     EXPECT_TRUE(backend->head(debris_manifest_key).exists)
-        << "a clamp anywhere in the round must suppress the namespace-cleanup physical reclaim pass too";
+        << "removed manifest debris remains ordinary orphan-sweep work";
     EXPECT_TRUE(backend->head(debris_key).exists)
-        << "the same suppression covers the pass's leak-only verbatim-file arm";
+        << "removed verbatim-file debris remains ordinary janitor work";
 
     /// `cleanupRefObjects` must not have deleted anything anywhere this round.
     EXPECT_TRUE(backend->head(covered_log_key).exists)
         << "a clamp anywhere in the round must suppress ref-log cleanup pool-wide, even for an unrelated live table";
 
-    /// Heal the clamp and run a clean round: NOW both passes reclaim their targets, proving the setup was
-    /// genuinely cleanup-eligible and not vacuously untouched.
+    /// Heal the clamp and run a clean round. Ordinary ref-log cleanup resumes, while removal debris
+    /// remains physically untouched by the lifecycle path.
     writeManifestRaw(*backend, layout, ns_clamp, b, {blobEntryFor("b", DB::UInt128(2))});
     const RoundReport clean_rep = runRegularRoundReclaiming(gc);
     EXPECT_FALSE(clean_rep.hasAnomaly(ns_clamp, /*shard*/0));
-    EXPECT_FALSE(backend->head(debris_manifest_key).exists)
-        << "a clamp-free round reclaims the removed namespace's manifest debris";
-    EXPECT_FALSE(backend->head(debris_key).exists)
-        << "and its verbatim file, which the same pass sweeps once the manifest keeps the item Pending";
+    EXPECT_TRUE(backend->head(debris_manifest_key).exists)
+        << "a clamp-free fold still performs no lifecycle-specific manifest deletion";
+    EXPECT_TRUE(backend->head(debris_key).exists)
+        << "a clamp-free fold still performs no lifecycle-specific verbatim-file deletion";
     EXPECT_FALSE(backend->head(covered_log_key).exists) << "a clamp-free round cleans the covered ref-log";
 }

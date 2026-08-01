@@ -360,9 +360,8 @@ RefTableState stateFromSnapshot(const RefTableSnapshot & snapshot);
 ///    operation must be an exact owner-removal `owner_transition` (`old_binding` set, `new_binding`
 ///    empty). The codec does not check this shape; this is the one place
 ///    that does.
-///  - `namespace_birth`: legal only while `lifecycle != Live` (never-born or `Removed`). (Gating
-///    recreation on the `_cleanup` marker for a completed removal is the writer's recovery-time
-///    responsibility since the marker is not part of `RefTableState`.)
+///  - `namespace_birth`: legal only while `lifecycle != Live`. Catalog admission guarantees this is
+///    either a never-born runtime or a fresh physical life after predecessor deletion.
 ///  - `owner_transition` add (no `old_binding`, `new_binding.kind == Precommit`): namespace must be
 ///    `Live`; the exact `(ref_name, manifest_ref)` pair must be absent from `precommits`; AND no
 ///    existing committed row or precommit binding, under ANY ref_name, may already name the same
@@ -435,7 +434,7 @@ RefTableState replay(const std::optional<RefTableSnapshot> & snapshot, std::span
 /// `finish` populates the fields that are a pure function of `(base snapshot, replayed tail)`: `state`,
 /// `newest_snapshot_id`, `tail_count`, `tail_bytes`, and `base_snapshot_bytes`. The
 /// remaining fields are recovery-context the streaming builder cannot know -- the writer's own recovery
-/// (`CasRefLedger::ensureRefTableRecovered`) fills `cleanup_markers`, the admission budgets,
+/// (`CasRefLedger::ensureRefTableRecovered`) fills the admission budgets,
 /// `needs_stale_precommit_sweep` and `last_epoch_seal`, before installing the whole struct under
 /// `state_mutex` with `recovered` set last. The read-only consumers (`recoverRefTableDetailed` for the
 /// orphan sweep, fsck's snapshot oracle) read only `state` (plus `newest_snapshot_id` for the sweep) and
@@ -453,7 +452,6 @@ struct RecoveryResult
     uint64_t base_snapshot_bytes = 0;
 
     /// Recovery-context fields (filled by `ensureRefTableRecovered`, default for other consumers):
-    std::set<RefTxnId> cleanup_markers;
     uint64_t snapshot_budget = 0;
     uint64_t removal_budget = 0;
     bool needs_stale_precommit_sweep = false;
@@ -636,13 +634,11 @@ std::vector<RefManifestEdge> manifestEdgesOfTxn(const RefLogTxn & txn);
 std::optional<RefTxnId> removalTxnId(const RefLogTxn & txn);
 
 /// One table's surviving ref-object keys from this round's global `LIST`, split by kind and sorted
-/// ascending. `_cleanup` markers are consulted only by the writer's recreation gate;
-/// GC groups them so a later step can decide marker republication without a second scan.
+/// ascending.
 struct RefTableListing
 {
     std::vector<RefTxnId> logs;
     std::vector<RefTxnId> snapshots;
-    std::vector<RefTxnId> cleanup_markers;
     bool operator==(const RefTableListing &) const = default;
 };
 
@@ -689,8 +685,6 @@ struct RefCleanupPlan
     bool operator==(const RefCleanupPlan &) const = default;
 };
 RefCleanupPlan planRefCleanup(const RefTableListing & listing, const RefTxnId & durable_cursor,
-                              const std::set<RefTxnId> & removal_logs_blocked,
-                              std::optional<RefTxnId> completed_removal_snapshot = std::nullopt,
                               std::optional<RefTxnId> checkpoint = std::nullopt);
 
 /// Why an epoch crossing failed, or that it was PROVED. See `crossEpochFromSeal`.

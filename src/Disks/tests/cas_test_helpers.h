@@ -847,12 +847,16 @@ inline int64_t inDegreeOf(DB::Cas::Backend & backend, const DB::Cas::Layout & la
 }
 
 /// The cursor key "ns/shard" — matches CasGcCursorKey::cursorKey.
-inline String cursorKeyForTest(const DB::Cas::RootNamespace & ns, uint64_t shard)
+inline UInt128 catalogLifeIdForTest(
+    DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RootNamespace & ns)
 {
-    return ns.string() + "/" + std::to_string(shard);
+    const std::optional<DB::Cas::NamespaceLifeId> life =
+        DB::Cas::CasRefCatalog::lifeIfCataloged(backend, layout, ns);
+    chassert(life.has_value());
+    return life->incarnation;
 }
 
-/// Seed the ADOPTED fold seal's shard-0 coverage row for `ns` and point `gc/state` at it, bypassing a
+/// Seed the ADOPTED fold seal's catalog-life coverage row for `ns` and point `gc/state` at it, bypassing a
 /// real round. This is the durable fact the sweep's §6 deletion premise reads
 /// (`CasOrphanManifestSweep.cpp`): `cursor` is the namespace's `last_folded_ref_id`, and a manifest of
 /// an epoch-`E` build is deletable only once that cursor sits in an epoch STRICTLY above `E`.
@@ -877,6 +881,25 @@ inline void seedFoldCursorForTest(
     DB::Cas::RefTxnId cursor, std::optional<DB::Cas::RefHold> hold = std::nullopt,
     uint64_t generation = 1, uint64_t attempt = 1)
 {
+    DB::Cas::NamespaceLifeId life = DB::Cas::NamespaceLifeId::stageATransition(ns);
+    const DB::Cas::CasRefCatalog::Snapshot catalog_cut = DB::Cas::CasRefCatalog::read(backend, layout);
+    const auto catalog_it = std::find_if(
+        catalog_cut.catalog.entries.begin(), catalog_cut.catalog.entries.end(),
+        [&](const DB::Cas::CatalogEntry & entry) { return entry.ns.string() == ns.string(); });
+    if (catalog_it == catalog_cut.catalog.entries.end())
+    {
+        DB::Cas::CatalogEntry entry;
+        entry.ns = ns;
+        entry.state = DB::Cas::NsState::Live;
+        entry.incarnation = DB::Cas::NamespaceLifeId::stageATransition(ns).incarnation;
+        DB::Cas::CasRefCatalog::casAdmitEntry(backend, layout, entry);
+        life = DB::Cas::NamespaceLifeId::fromCatalogEntry(ns, entry.incarnation);
+    }
+    else
+    {
+        life = DB::Cas::NamespaceLifeId::fromCatalogEntry(ns, catalog_it->incarnation);
+    }
+
     const String seal_key = layout.foldSealKey(generation, attempt);
     DB::Cas::CasFoldSeal seal;
     const auto existing = backend.get(seal_key);
@@ -884,11 +907,11 @@ inline void seedFoldCursorForTest(
         seal = DB::Cas::decodeFoldSeal(existing->bytes);
     seal.generation = generation;
 
-    DB::Cas::ShardCoverage cov;
+    DB::Cas::RefCoverage cov;
     cov.classification = hold ? 4 : 2;
     cov.last_folded_ref_id = cursor;
     cov.hold = hold;
-    seal.per_ns_shard[cursorKeyForTest(ns, /*shard*/0)] = cov;
+    seal.ref_lives[life.incarnation].coverage = cov;
 
     DB::Cas::GcState gc_state;
     const DB::Cas::HeadResult head = backend.head(layout.gcStateKey());
@@ -922,6 +945,11 @@ inline void seedFoldCursorForTest(
 inline uint64_t foldCursorOf(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RootNamespace & ns, uint64_t shard)
 {
+    chassert(shard == 0);
+    const std::optional<DB::Cas::NamespaceLifeId> life =
+        DB::Cas::CasRefCatalog::lifeIfCataloged(backend, layout, ns);
+    if (!life)
+        return 0;
     const uint64_t gen = currentGenerationOf(backend, layout);
     const uint64_t attempt = currentAttemptOf(backend, layout);
     for (uint64_t g = gen; ; --g)
@@ -929,11 +957,11 @@ inline uint64_t foldCursorOf(
         if (const auto got = backend.get(layout.foldSealKey(g, attempt)))
         {
             const DB::Cas::CasFoldSeal seal = DB::Cas::decodeFoldSeal(got->bytes);
-            const auto it = seal.per_ns_shard.find(cursorKeyForTest(ns, shard));
+            const auto it = seal.ref_lives.find(life->incarnation);
             /// Snapshot+log ref model: the per-table durable cursor is `last_folded_ref_id` (a RefTxnId).
             /// Seeds allocate `writer_epoch = 1`, so the `ref_sequence` is the monotone cursor the seeding
             /// wrappers return and tests compare against.
-            return it != seal.per_ns_shard.end() ? it->second.last_folded_ref_id.ref_sequence : 0;
+            return it != seal.ref_lives.end() ? it->second.coverage.last_folded_ref_id.ref_sequence : 0;
         }
         if (g == 0)
             return 0;

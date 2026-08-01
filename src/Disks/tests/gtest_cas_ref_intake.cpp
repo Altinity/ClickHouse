@@ -190,7 +190,6 @@ TEST(CasRefIntake, GroupRefKeys)
         layout.refSnapshotKey(life, rid(1, 4)),
         layout.refLogKey(life, rid(1, 5)),
         layout.refLogKey(life, rid(1, 3)),
-        layout.refCleanupMarkerKey(life, rid(1, 2)),
         layout.refCkptKey(life),        /// state-family keys are outside the hot stream LIST
         "p/cas/manifests/db/t/foo",   /// outside the ref prefix -> ignored
     };
@@ -199,7 +198,6 @@ TEST(CasRefIntake, GroupRefKeys)
     const RefTableListing & t = grouped.at(life.incarnation);
     EXPECT_EQ(t.logs, (std::vector<RefTxnId>{rid(1, 3), rid(1, 5)}));
     EXPECT_EQ(t.snapshots, (std::vector<RefTxnId>{rid(1, 4)}));
-    EXPECT_EQ(t.cleanup_markers, (std::vector<RefTxnId>{rid(1, 2)}));
     /// Checkpoints live under `cas/ns/state/` and are deliberately absent from the hot stream listing.
 
     /// A key under the ref prefix that is not a valid ref object aborts (a leftover old-format shard key).
@@ -226,11 +224,6 @@ TEST(CasRefIntake, PlanRefCleanupThreeConditions)
         const auto plan = planRefCleanup(listing, rid(1, 1), {});
         EXPECT_EQ(plan.deletable_logs, (std::vector<RefTxnId>{rid(1, 1)}));
     }
-    /// A blocked removal log (its namespace-cleanup item not yet Completed) is retained (condition 3).
-    {
-        const auto plan = planRefCleanup(listing, rid(1, 3), {rid(1, 1)});
-        EXPECT_EQ(plan.deletable_logs, (std::vector<RefTxnId>{rid(1, 2)}));
-    }
     /// Older snapshots (< X) are deletable; X itself is retained.
     {
         RefTableListing two_snaps = listing;
@@ -248,7 +241,7 @@ TEST(CasRefIntake, PlanRefCleanupThreeConditions)
     }
 }
 
-/// T8 carry: a namespace literally named -- or ending in -- a kind directory (`_log`/`_snap`/`_cleanup`)
+/// T8 carry: a namespace literally named -- or ending in -- a kind directory (`_log`/`_snap`)
 /// must not confuse `parseRefObjectKey` or the global-LIST grouping. The kind is always the SECOND-TO-LAST
 /// path segment, so it is positionally unambiguous; a nested table whose keys physically sit under another
 /// table's `_log/` directory is still attributed to its own namespace.
@@ -263,15 +256,13 @@ TEST(CasRefIntake, AdversarialNamespaceNamedLikeKindDirectory)
         const NamespaceLifeId life = NamespaceLifeId::stageATransition(ns);
         const std::vector<String> keys{
             layout.refLogKey(life, rid(1, 1)),
-            layout.refSnapshotKey(life, rid(1, 2)),
-            layout.refCleanupMarkerKey(life, rid(1, 3))};
+            layout.refSnapshotKey(life, rid(1, 2))};
         const auto grouped = groupRefKeys(layout, keys);
         ASSERT_EQ(grouped.size(), 1u) << "namespace '" << weird << "'";
         ASSERT_TRUE(grouped.contains(life.incarnation)) << "namespace '" << weird << "'";
         const RefTableListing & t = grouped.at(life.incarnation);
         EXPECT_EQ(t.logs, (std::vector<RefTxnId>{rid(1, 1)})) << weird;
         EXPECT_EQ(t.snapshots, (std::vector<RefTxnId>{rid(1, 2)})) << weird;
-        EXPECT_EQ(t.cleanup_markers, (std::vector<RefTxnId>{rid(1, 3)})) << weird;
     }
 
     /// A table "db/t" and a NESTED table "db/t/_log" coexist: the nested table's log objects live UNDER

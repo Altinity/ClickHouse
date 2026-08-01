@@ -102,22 +102,32 @@ std::optional<CasFoldSeal> readAdoptedFoldSeal(Pool & store)
 }
 
 
-/// One namespace's shard-0 coverage row out of an adopted seal. Absent means no round has sealed a
-/// cursor for the namespace, which the premise treats as "nothing about its ref stream is proven".
-std::optional<ShardCoverage> coverageOf(const std::optional<CasFoldSeal> & seal, const RootNamespace & ns)
+/// One catalog-named life row out of an adopted seal. The catalog cut supplies the name-to-id join;
+/// neither an absent name nor a `Creating` row may recover coverage from a historical life.
+std::optional<RefCoverage> coverageOf(
+    const std::optional<CasFoldSeal> & seal,
+    const CasRefCatalog::Snapshot & catalog_cut,
+    const RootNamespace & ns)
 {
     if (!seal)
         return std::nullopt;
-    const auto it = seal->per_ns_shard.find(cursorKey(ns, /*shard*/0));
-    if (it == seal->per_ns_shard.end())
+
+    const auto catalog_it = std::find_if(
+        catalog_cut.catalog.entries.begin(), catalog_cut.catalog.entries.end(),
+        [&](const CatalogEntry & entry) { return entry.ns == ns; });
+    if (catalog_it == catalog_cut.catalog.entries.end() || catalog_it->state == NsState::Creating)
         return std::nullopt;
-    return it->second;
+
+    const auto row_it = seal->ref_lives.find(catalog_it->incarnation);
+    if (row_it == seal->ref_lives.end())
+        return std::nullopt;
+    return row_it->second.coverage;
 }
 
 /// The durable `last_folded_ref_id` of a coverage row, `{0, 0}` when there is none — as for a fresh
 /// pool. A manifest removed by a log above this cursor has not had its `-1` decrement folded, so its
 /// body remains load-bearing until the fold catches up.
-RefTxnId sealedRefCursor(const std::optional<ShardCoverage> & coverage)
+RefTxnId sealedRefCursor(const std::optional<RefCoverage> & coverage)
 {
     return coverage ? coverage->last_folded_ref_id : RefTxnId{};
 }
@@ -142,7 +152,7 @@ struct NamespaceProtection
 /// invalid transaction (via `recoverRefTable` / `decodeRefLogTxn`); the caller SKIPS the namespace's
 /// deletions on such a throw rather than substituting an empty owner set.
 NamespaceProtection activeManifestKeys(Pool & store, const RootNamespace & ns,
-                                       const std::optional<ShardCoverage> & coverage)
+                                       const std::optional<RefCoverage> & coverage)
 
 {
     NamespaceProtection protection;
@@ -199,7 +209,8 @@ NamespaceProtection activeManifestKeys(Pool & store, const RootNamespace & ns,
 NamespaceFoldView namespaceFoldView(Pool & store, const RootNamespace & ns)
 {
     NamespaceFoldView view;
-    view.coverage = coverageOf(readAdoptedFoldSeal(store), ns);
+    const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(store.backend(), store.layout());
+    view.coverage = coverageOf(readAdoptedFoldSeal(store), catalog_cut, ns);
     return view;
 }
 
@@ -257,7 +268,7 @@ bool manifestDeletionPremise(const NamespaceFoldView & view, const ManifestKey &
                       "no sealed fold coverage for the namespace: no round has folded a ref cursor for "
                       "it, so epoch " + build_epoch + "'s closing seal cannot be shown consumed");
 
-    const ShardCoverage & cov = *view.coverage;
+    const RefCoverage & cov = *view.coverage;
 
     /// UNCERTAINTY, hold arm. A hold names the exact position the fold could not resolve, and everything
     /// at or above it is unaccounted -- including, for all this predicate can tell, the record that
@@ -353,7 +364,8 @@ uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefi
     /// the same way the periodic sweep always has: skip and retry next round.
     /// The §6 premise's durable half, read before the protection view so both share one seal read.
     NamespaceFoldView view;
-    view.coverage = coverageOf(readAdoptedFoldSeal(store), ns);
+    const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(store.backend(), store.layout());
+    view.coverage = coverageOf(readAdoptedFoldSeal(store), catalog_cut, ns);
 
     NamespaceProtection protection;
     try
@@ -441,8 +453,10 @@ ManifestSweepResult sweepManifestCursorPage(
     /// call), so the metric increments once per call, not once per listed key.
     ProfileEvents::increment(ProfileEvents::CasGcEnumerationPages);
 
-    /// One seal read for the whole page; every namespace on it takes its coverage row from this object.
+    /// One seal and one later catalog cut for the whole page; every namespace joins through those same
+    /// immutable observations.
     const std::optional<CasFoldSeal> adopted_seal = readAdoptedFoldSeal(store);
+    const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(backend, layout);
 
     std::map<String, bool> eligible_by_prefix;
     std::map<String, NamespaceFoldView> view_by_ns;
@@ -507,7 +521,7 @@ ManifestSweepResult sweepManifestCursorPage(
         auto [active_it, inserted] = active_by_ns.emplace(parsed->ns.string(), std::set<String>{});
         if (inserted)
         {
-            view_it->second.coverage = coverageOf(adopted_seal, parsed->ns);
+            view_it->second.coverage = coverageOf(adopted_seal, catalog_cut, parsed->ns);
             /// A corrupt snapshot or invalid transaction means the protection view is unavailable. Skip
             /// this namespace's deletions and surface the error; never substitute an empty owner set.
             try

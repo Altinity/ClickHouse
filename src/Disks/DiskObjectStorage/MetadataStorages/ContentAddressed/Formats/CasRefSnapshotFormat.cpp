@@ -25,7 +25,9 @@ std::string_view lifecycleToWord(RefLifecycle l)
     switch (l)
     {
         case RefLifecycle::Live:    return "live";
-        case RefLifecycle::Removed: return "removed";
+        case RefLifecycle::Removed:
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "RefTableSnapshot: terminal lifecycle is not serializable in generation 7");
     }
     throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableSnapshot: unknown lifecycle {}", static_cast<int>(l));
 }
@@ -33,7 +35,6 @@ std::string_view lifecycleToWord(RefLifecycle l)
 RefLifecycle lifecycleFromWord(std::string_view w)
 {
     if (w == "live")    return RefLifecycle::Live;
-    if (w == "removed") return RefLifecycle::Removed;
     throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableSnapshot: unknown lifecycle '{}'", w);
 }
 
@@ -59,25 +60,18 @@ void checkPrecommitsSorted(const std::vector<RefOwnerBinding> & rows)
     }
 }
 
-/// Whole-object validation: transaction IDs must be nonzero, lifecycle determines whether removal
-/// metadata and rows are allowed, and both row vectors must be strictly sorted. Applying the same
+/// Whole-object validation: transaction IDs must be nonzero, only `Live` is serializable, and both row
+/// vectors must be strictly sorted. Applying the same
 /// checks before encoding and after decoding keeps malformed caller state and malformed stored data
 /// subject to the same contract.
 void checkSnapshotInvariants(const RefTableSnapshot & snapshot)
 {
     checkRefTxnIdNonzero(snapshot.snapshot_id, "RefTableSnapshot", "snapshot_id");
 
-    if (snapshot.lifecycle == RefLifecycle::Removed)
-    {
-        if (!snapshot.remove_txn_id)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableSnapshot: Removed snapshot is missing remove_txn_id");
-        checkRefTxnIdNonzero(*snapshot.remove_txn_id, "RefTableSnapshot", "remove_txn_id");
-        if (!snapshot.committed.empty() || !snapshot.precommits.empty())
-            throw Exception(ErrorCodes::CORRUPTED_DATA,
-                "RefTableSnapshot: Removed snapshot must have zero committed/precommit rows, got {}/{}",
-                snapshot.committed.size(), snapshot.precommits.size());
-    }
-    else if (snapshot.remove_txn_id)
+    if (snapshot.lifecycle != RefLifecycle::Live)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "RefTableSnapshot: terminal lifecycle is not serializable in generation 7");
+    if (snapshot.remove_txn_id)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableSnapshot: Live snapshot must not carry remove_txn_id");
 
     checkCommittedSorted(snapshot.committed);
@@ -118,8 +112,8 @@ void writePrecommitRow(CasJsonWriter & out, const RefOwnerBinding & row)
     writeChar('\n', out);
 }
 
-/// The snapshot's header-object meta line (ns, snapshot_id, lifecycle, and the optional remove/sealed
-/// ids). Shared by `encodeRefTableSnapshot` and `snapshotFramingSize` so the two never disagree by a
+/// The snapshot's header-object meta line (`ns`, `snapshot_id`, and lifecycle). Shared by
+/// `encodeRefTableSnapshot` and `snapshotFramingSize` so the two never disagree by a
 /// byte. Assumes the caller has already validated the snapshot (or is measuring framing only).
 void writeSnapshotMeta(CasJsonWriter & out, const RefTableSnapshot & snapshot)
 {
@@ -129,8 +123,6 @@ void writeSnapshotMeta(CasJsonWriter & out, const RefTableSnapshot & snapshot)
     writeRefTxnIdFields(out, first, "we", "rs", snapshot.snapshot_id);
     writeKey(out, "lc", first);
     writeStringValue(out, lifecycleToWord(snapshot.lifecycle));
-    if (snapshot.lifecycle == RefLifecycle::Removed)
-        writeRefTxnIdFields(out, first, "rte", "rts", *snapshot.remove_txn_id);
     closeObject(out, first);
     writeChar('\n', out);
 }

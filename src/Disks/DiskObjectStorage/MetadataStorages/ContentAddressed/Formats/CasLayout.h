@@ -22,11 +22,9 @@ namespace ErrorCodes
 namespace DB::Cas
 {
 
-/// Which immutable ref-object kind a `_cleanup`, `_log`, or `_snap` key names. The declaration order
-/// follows the lexical order of the directory segments, which is useful when listed keys are grouped.
+/// Which immutable ref-object kind a `_log` or `_snap` key names.
 enum class RefObjectKind : uint8_t
 {
-    Cleanup,
     Log,
     Snap,
 };
@@ -76,7 +74,7 @@ struct ParsedBlobTargetRunKey
 /// Every key is built from a pool prefix and a stable path subtree. The main families are:
 ///   - content objects:  POOL/blobs/ALGO/S/HEX
 ///   - part manifests:   POOL/cas/manifests/NAMESPACE/BUILD/ORDINAL.zst
-///   - ref stream:       POOL/cas/ns/stream/LIFE_ID/_log|_snap|_cleanup/ID
+///   - ref stream:       POOL/cas/ns/stream/LIFE_ID/_log|_snap/ID
 ///   - namespace state:  POOL/cas/ns/state/LIFE_ID/_ckpt
 ///                       POOL/cas/ns/state/LIFE_ID/_files/FILE_NAME
 ///   - GC state:         POOL/gc/...
@@ -161,7 +159,7 @@ public:
 
     /// The life's checkpoint object (spec INV-4) at `<prefix>/cas/ns/state/<life_id>/_ckpt`. Unlike
     /// immutable stream objects it is mutable (token-CAS), carries no transaction id, and therefore lives
-    /// in the point/path-addressed state tree rather than a `_log`/`_snap`/`_cleanup` directory --
+    /// in the point/path-addressed state tree rather than a `_log`/`_snap` directory --
     /// which is also why `parseRefObjectKey` does not recognize it and `parseRefCkptKey` exists.
     String refCkptKey(const NamespaceLifeId & ns_id) const
     {
@@ -182,22 +180,13 @@ public:
     /// `casRefsPrefix` enumeration.
     std::optional<NamespaceLifePhysicalId> parseRefCkptKey(std::string_view key) const;
 
-    /// Namespace-removal completion marker: a zero-byte object at
-    /// `.../_cleanup/<render>` that GC publishes once the exact removal durably reaches `Completed`.
-    /// It is a ref-layer object under the life prefix like every other, so it carries the incarnation
-    /// too -- a marker for one life must not be visible to the next.
-    String refCleanupMarkerKey(const NamespaceLifeId & ns_id, const RefTxnId & id) const
-    {
-        return namespaceStreamPrefix(ns_id) + "_cleanup/" + renderRefTxnId(id);
-    }
-
-    /// Inverse of `refLogKey`/`refSnapshotKey`/`refCleanupMarkerKey`: classifies a LISTED key under
-    /// `casRefsPrefix()` by its kind directory (`_cleanup`, `_log`, `_snap`) and parses the trailing
+    /// Inverse of `refLogKey`/`refSnapshotKey`: classifies a LISTED key under `casRefsPrefix()` by its
+    /// kind directory (`_log` or `_snap`) and parses the trailing
     /// `RefTxnId` and the life it belongs to. Strict: returns `std::nullopt` for anything that is not
     /// one of our ref-object keys: a foreign top-level prefix, a missing life/kind/id segment, an
     /// unrecognized kind directory, a `_log`/`_snap` id missing its
-    /// `.zst` suffix (both are always-compressed text), a `_cleanup` id carrying any
-    /// extension, trailing garbage after the id, or a non-canonical `RefTxnId` render (delegates to
+    /// `.zst` suffix (both are always-compressed text), trailing garbage after the id, or a
+    /// non-canonical `RefTxnId` render (delegates to
     /// `parseRefTxnId`).
     ///
     /// It throws `CORRUPTED_DATA` when the key otherwise has a recognized stream-object shape but its

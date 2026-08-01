@@ -10,8 +10,11 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
 #include "cas_test_helpers.h"
 
+#include <algorithm>
+#include <condition_variable>
 #include <mutex>
 #include <set>
+#include <thread>
 
 /// THE DESTRUCTIVE-ROUND FRONTIER PROOF (spec 2026-07-27 "ref chain complete cut" §5).
 ///
@@ -58,6 +61,186 @@ const UInt128 kGc = hexToU128("00000000000000000000000000000001");
 /// look for them finds them, while a round that only enumerates never learns they exist. Composed
 /// over `CountingBackend` because these tests also assert request counts.
 using CountingHintHoleBackend = DB::Cas::tests::HintHoleBackendOn<DB::Cas::tests::CountingBackend>;
+
+class DrainRaceBackend final : public CountingBackend
+{
+public:
+    using CountingBackend::casPut;
+    using CountingBackend::get;
+    using CountingBackend::putIfAbsent;
+
+    void blockNextCatalogCas(const String & key)
+    {
+        std::lock_guard lock(control_mutex);
+        catalog_key = key;
+        block_next_catalog_cas = true;
+    }
+
+    void loseNextCatalogCasResponse(const String & key)
+    {
+        std::lock_guard lock(control_mutex);
+        catalog_key = key;
+        lose_next_catalog_cas_response = true;
+    }
+
+    void waitForBlockedCatalogCas()
+    {
+        std::unique_lock lock(control_mutex);
+        control_cv.wait(lock, [&] { return catalog_cas_blocked; });
+    }
+
+    void releaseBlockedCatalogCas()
+    {
+        std::lock_guard lock(control_mutex);
+        release_catalog_cas = true;
+        control_cv.notify_all();
+    }
+
+    void clearJournal()
+    {
+        std::lock_guard lock(journal_mutex);
+        journal.clear();
+    }
+
+    std::vector<String> journalSnapshot() const
+    {
+        std::lock_guard lock(journal_mutex);
+        return journal;
+    }
+
+    std::optional<GetResult> get(const String & key, Range range) override
+    {
+        record("get " + key);
+        return CountingBackend::get(key, range);
+    }
+
+    ListPage list(const String & prefix, const String & cursor, size_t limit) override
+    {
+        record("list " + prefix);
+        return CountingBackend::list(prefix, cursor, limit);
+    }
+
+    PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta) override
+    {
+        record("put_begin " + key);
+        const PutResult result = CountingBackend::putIfAbsent(key, bytes, meta);
+        record("put_end " + key);
+        return result;
+    }
+
+    CasResult casPut(
+        const String & key, const String & bytes, const std::optional<Token> & expected,
+        const ObjectMeta & meta) override
+    {
+        record("cas_begin " + key);
+        bool lose_response = false;
+        {
+            std::unique_lock lock(control_mutex);
+            if (key == catalog_key && block_next_catalog_cas)
+            {
+                block_next_catalog_cas = false;
+                catalog_cas_blocked = true;
+                control_cv.notify_all();
+                control_cv.wait(lock, [&] { return release_catalog_cas; });
+            }
+            if (key == catalog_key && lose_next_catalog_cas_response)
+            {
+                lose_next_catalog_cas_response = false;
+                lose_response = true;
+            }
+        }
+        const CasResult result = CountingBackend::casPut(key, bytes, expected, meta);
+        record("cas_end " + key);
+        if (lose_response && result.outcome == CasOutcome::Committed)
+        {
+            record("cas_response_lost " + key);
+            throw std::runtime_error("injected lost catalog CAS response");
+        }
+        return result;
+    }
+
+private:
+    void record(String entry) const
+    {
+        std::lock_guard lock(journal_mutex);
+        journal.push_back(std::move(entry));
+    }
+
+    mutable std::mutex journal_mutex;
+    mutable std::vector<String> journal;
+    std::mutex control_mutex;
+    std::condition_variable control_cv;
+    String catalog_key;
+    bool block_next_catalog_cas = false;
+    bool catalog_cas_blocked = false;
+    bool release_catalog_cas = false;
+    bool lose_next_catalog_cas_response = false;
+};
+
+struct CompletedRemovingFixture
+{
+    RootNamespace ns;
+    UInt128 life_id{};
+    String checkpoint_key;
+};
+
+CompletedRemovingFixture seedCompletedRemoving(
+    DrainRaceBackend & backend, const PoolPtr & store, const UInt128 & lease_owner)
+{
+    const Layout & layout = store->layout();
+    CompletedRemovingFixture fixture{
+        .ns = RootNamespace{"00/drain-race@cas@"},
+        .life_id = UInt128{177},
+        .checkpoint_key = {}};
+    CasRefCatalog::casAdmitEntry(backend, layout, CatalogEntry{
+        .ns = fixture.ns, .state = NsState::Live, .incarnation = fixture.life_id});
+    CasRefCatalog::casUpdate(backend, layout, [](const RefCatalog & current)
+    {
+        RefCatalog next = current;
+        next.entries[0].state = NsState::Removing;
+        next.entries[0].removal_started_round = 1;
+        return next;
+    });
+
+    CasFoldSeal parent;
+    parent.generation = 1;
+    parent.ref_lives.emplace(fixture.life_id, RefLifeFoldState{
+        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{1, 1}},
+        .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 1}}});
+    for (uint64_t shard = 0; shard < store->poolConfig().gc_shards; ++shard)
+        parent.condemned_summary.emplace(shard, CondemnedSummary{});
+    backend.putIfAbsent(layout.foldSealKey(1, 1), encodeFoldSeal(parent));
+
+    GcState state;
+    state.round = 1;
+    state.gc_shards = store->poolConfig().gc_shards;
+    state.snap_generation = 1;
+    state.snap_attempt = 1;
+    state.lease = GcLease{.owner = lease_owner, .seq = 1};
+    backend.putIfAbsent(layout.gcStateKey(), encodeGcState(state));
+
+    fixture.checkpoint_key = layout.refCkptKey(
+        NamespaceLifeId::fromCatalogEntry(fixture.ns, fixture.life_id));
+    backend.putIfAbsent(fixture.checkpoint_key, "old-life checkpoint bytes");
+    return fixture;
+}
+
+void transferGcLease(DrainRaceBackend & backend, const Layout & layout, const UInt128 & new_owner)
+{
+    const auto got = backend.get(layout.gcStateKey());
+    ASSERT_TRUE(got);
+    GcState state = decodeGcState(got->bytes);
+    state.lease.owner = new_owner;
+    ++state.lease.seq;
+    ASSERT_EQ(backend.casPut(layout.gcStateKey(), encodeGcState(state), got->token).outcome,
+        CasOutcome::Committed);
+}
+
+size_t findJournalAfter(const std::vector<String> & journal, const String & entry, size_t after)
+{
+    const auto it = std::find(journal.begin() + static_cast<ptrdiff_t>(after), journal.end(), entry);
+    return it == journal.end() ? journal.size() : static_cast<size_t>(it - journal.begin());
+}
 
 /// A pool whose GC frontier-probe budget is set explicitly. Everything else matches `openPoolForTest`.
 PoolPtr openPoolWithProbeBudget(std::shared_ptr<InMemoryBackend> backend, uint64_t budget)
@@ -1018,16 +1201,16 @@ TEST(CasGcFrontierGateCleanupRange, CoveredLogsStopAtTheMinimumOfCheckpointAndCu
     listing.snapshots = {{1, 5}};
 
     /// No checkpoint: the boundary is min(newest snapshot, cursor) = {1,4}.
-    const RefCleanupPlan without = planRefCleanup(listing, RefTxnId{1, 4}, {});
+    const RefCleanupPlan without = planRefCleanup(listing, RefTxnId{1, 4});
     EXPECT_EQ(without.deletable_logs, (std::vector<RefTxnId>{{1, 1}, {1, 2}, {1, 3}, {1, 4}}));
 
     /// A checkpoint BELOW the cursor tightens it to {1,2}.
-    const RefCleanupPlan with = planRefCleanup(listing, RefTxnId{1, 4}, {}, std::nullopt, RefTxnId{1, 2});
+    const RefCleanupPlan with = planRefCleanup(listing, RefTxnId{1, 4}, RefTxnId{1, 2});
     EXPECT_EQ(with.deletable_logs, (std::vector<RefTxnId>{{1, 1}, {1, 2}}))
         << "nothing above min(checkpoint, cursor) may be deleted";
 
     /// A checkpoint ABOVE both changes nothing: it can only tighten.
-    const RefCleanupPlan ahead = planRefCleanup(listing, RefTxnId{1, 4}, {}, std::nullopt, RefTxnId{1, 9});
+    const RefCleanupPlan ahead = planRefCleanup(listing, RefTxnId{1, 4}, RefTxnId{1, 9});
     EXPECT_EQ(ahead.deletable_logs, without.deletable_logs)
         << "a checkpoint ahead of the round's own observations never widens the range";
 }
@@ -1039,112 +1222,236 @@ TEST(CasGcFrontierGateCleanupRange, ASnapshotAtTheCheckpointSurvivesAndOnlyStric
     listing.snapshots = {{1, 1}, {1, 2}, {1, 3}};
 
     /// Without a checkpoint the newest snapshot is the boundary and the two older ones go.
-    const RefCleanupPlan without = planRefCleanup(listing, RefTxnId{1, 3}, {});
+    const RefCleanupPlan without = planRefCleanup(listing, RefTxnId{1, 3});
     EXPECT_EQ(without.deletable_snapshots, (std::vector<RefTxnId>{{1, 1}, {1, 2}}));
 
     /// With the checkpoint AT {1,2}, only {1,1} is strictly below it. The snapshot the checkpoint names
     /// is the one a recovering reader samples, so it must survive its own cleanup.
-    const RefCleanupPlan with = planRefCleanup(listing, RefTxnId{1, 3}, {}, std::nullopt, RefTxnId{1, 2});
+    const RefCleanupPlan with = planRefCleanup(listing, RefTxnId{1, 3}, RefTxnId{1, 2});
     EXPECT_EQ(with.deletable_snapshots, (std::vector<RefTxnId>{{1, 1}}));
 
     /// The oldest checkpoint deletes nothing at all.
-    const RefCleanupPlan oldest = planRefCleanup(listing, RefTxnId{1, 3}, {}, std::nullopt, RefTxnId{1, 1});
+    const RefCleanupPlan oldest = planRefCleanup(listing, RefTxnId{1, 3}, RefTxnId{1, 1});
     EXPECT_TRUE(oldest.deletable_snapshots.empty());
 }
 
-/// ===================== THE `_ckpt` LEAK BACKSTOP =====================
-///
-/// The removed namespace's checkpoint object is the one ref object nothing else reclaims: the covered-
-/// log cleanup handles logs and snapshots, the Pending pass's two physical passes handle
-/// `cas/manifests/<ns>/` and the verbatim files, and `namespaceManifestsPhysicallyEmpty` -- which decides
-/// Pending -> Completed -- never treats the state tree as stream input. A leaked `_ckpt` is therefore
-/// invisible to stream cleanup and must be removed through the namespace-lifecycle path.
-
-TEST(CasGcFrontierGate, ThePendingCleanupPassDeletesTheRemovedNamespaceCheckpoint)
+/// Folding a namespace terminal records evidence but performs no lifecycle-specific physical cleanup.
+/// The checkpoint is inert debris for the perpetual janitor, and no `_cleanup` marker is published.
+TEST(CasGcFrontierGate, CleanupEvidenceLeavesRemovedNamespaceCheckpointForJanitor)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
     const Layout & layout = store->layout();
     const RootNamespace removed{"00/removed@cas@"};
-    const RootNamespace live{"00/live@cas@"};
-    /// Review C2: pin both into the catalog before their first touch -- `runNamespaceCleanupPassesForTest`
-    /// now resolves the item's namespace from a fresh catalog read and skips it entirely if the catalog
-    /// does not name it (the same direction as C1's fix: never act at a fabricated key).
-    DB::Cas::tests::casAdmitEntry(*backend, layout, removed);
-    DB::Cas::tests::casAdmitEntry(*backend, layout, live);
+    RefOp remove_op;
+    remove_op.kind = RefOpKind::RemoveNamespace;
+    writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+        .ns = removed.string(), .txn_id = RefTxnId{1, 1}, .ops = {remove_op}, .prev_epoch_seal = std::nullopt});
+    const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(*backend, layout, removed);
+    CasRefCatalog::casUpdate(*backend, layout, [&](const RefCatalog & current)
+    {
+        RefCatalog next = current;
+        const auto it = std::find_if(next.entries.begin(), next.entries.end(), [&](const CatalogEntry & entry)
+        {
+            return entry.ns == removed;
+        });
+        EXPECT_NE(it, next.entries.end());
+        it->state = NsState::Removing;
+        it->removal_started_round = 1;
+        return next;
+    });
+    const String ckpt_key = layout.refCkptKey(life);
+    backend->putIfAbsent(ckpt_key, encodeRefCkpt(RefCkpt{
+        .life_epoch = 1, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt}));
 
     Gc gc(store, kGc);
-    runRegularRoundReclaiming(gc);
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+
     const GcState st = decodeGcState(backend->get(layout.gcStateKey())->bytes);
+    const CasFoldSeal seal = decodeFoldSeal(
+        backend->get(layout.foldSealKey(st.snap_generation, st.snap_attempt))->bytes);
+    const auto row_it = seal.ref_lives.find(life.incarnation);
+    ASSERT_NE(row_it, seal.ref_lives.end());
+    ASSERT_TRUE(row_it->second.cleanup_evidence.has_value());
+    EXPECT_EQ(row_it->second.cleanup_evidence->remove_txn_id, (RefTxnId{1, 1}));
+    EXPECT_TRUE(backend->head(ckpt_key).exists);
+    for (const String & key : backend->touchedKeys())
+        EXPECT_EQ(key.find("/_cleanup/"), String::npos) << key;
 
-    /// Both namespaces have a `_ckpt`; only one of them is being removed.
-    backend->putIfAbsent(layout.refCkptKey(NamespaceLifeId::stageATransition(removed)), "checkpoint-body");
-    backend->putIfAbsent(layout.refCkptKey(NamespaceLifeId::stageATransition(live)), "checkpoint-body");
-
-    const RefTxnId remove_txn{1, 5};
-    CasFoldSeal seal;
-    seal.ns_cleanup_items[removed.string() + "\n" + renderRefTxnId(remove_txn)] =
-        RefNsCleanupItem{.ns = removed, .remove_txn_id = remove_txn, .state = RefNsCleanupState::Pending};
-
-    gc.runNamespaceCleanupPassesForTest(seal, /*ref_tables*/{}, st.round, /*suppress_destructive*/false);
-
-    EXPECT_FALSE(backend->head(layout.refCkptKey(NamespaceLifeId::stageATransition(removed))).exists)
-        << "the removed namespace's checkpoint is reclaimed by its Pending pass -- nothing else would";
-    EXPECT_TRUE(backend->head(layout.refCkptKey(NamespaceLifeId::stageATransition(live))).exists)
-        << "a live namespace's checkpoint is untouched: the delete is a KNOWN KEY, not a prefix sweep";
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+    EXPECT_TRUE(CasRefCatalog::read(*backend, layout).catalog.entries.empty());
+    EXPECT_FALSE(CasRefCatalog::lifeIfCataloged(*backend, layout, removed));
+    EXPECT_TRUE(backend->head(ckpt_key).exists);
+    EXPECT_EQ(backend->deleteCount(ckpt_key), 0);
 }
 
-/// The `_ckpt` delete is a destructive site like every other, and the gate holds it like every other.
-TEST(CasGcFrontierGate, TheCheckpointDeleteIsHeldBySuppressionLikeEveryOtherSite)
+TEST(CasGcFrontierGate, DeferredRoundDrainsCompletedRemovingBeforeReturning)
 {
     auto backend = std::make_shared<CountingBackend>();
-    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/100);
     const Layout & layout = store->layout();
-    const RootNamespace removed{"00/removed@cas@"};
+    const RootNamespace removed{"00/deferred-removed@cas@"};
+    const UInt128 life_id{77};
+    CasRefCatalog::casAdmitEntry(*backend, layout, CatalogEntry{
+        .ns = removed, .state = NsState::Live, .incarnation = life_id});
+    CasRefCatalog::casUpdate(*backend, layout, [&](const RefCatalog & current)
+    {
+        RefCatalog next = current;
+        next.entries[0].state = NsState::Removing;
+        next.entries[0].removal_started_round = 1;
+        return next;
+    });
+
+    CasFoldSeal parent;
+    parent.generation = 1;
+    parent.ref_lives.emplace(life_id, RefLifeFoldState{
+        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{1, 1}},
+        .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 1}}});
+    for (uint64_t shard = 0; shard < store->poolConfig().gc_shards; ++shard)
+        parent.condemned_summary.emplace(shard, CondemnedSummary{});
+    ASSERT_EQ(backend->putIfAbsent(layout.foldSealKey(1, 1), encodeFoldSeal(parent)).outcome, PutOutcome::Done);
+    GcState state;
+    state.round = 1;
+    state.gc_shards = store->poolConfig().gc_shards;
+    state.snap_generation = 1;
+    state.snap_attempt = 1;
+    state.lease = GcLease{.owner = kGc, .seq = 1};
+    ASSERT_EQ(backend->putIfAbsent(layout.gcStateKey(), encodeGcState(state)).outcome, PutOutcome::Done);
+
+    const String ckpt_key = layout.refCkptKey(NamespaceLifeId::fromCatalogEntry(removed, life_id));
+    ASSERT_EQ(backend->putIfAbsent(ckpt_key, "inert checkpoint debris").outcome, PutOutcome::Done);
+    const uint64_t catalog_cas_before = backend->casPutCount(layout.refCatalogKey());
 
     Gc gc(store, kGc);
-    runRegularRoundReclaiming(gc);
-    const GcState st = decodeGcState(backend->get(layout.gcStateKey())->bytes);
-    backend->putIfAbsent(layout.refCkptKey(NamespaceLifeId::stageATransition(removed)), "checkpoint-body");
-
-    const RefTxnId remove_txn{1, 5};
-    CasFoldSeal seal;
-    seal.ns_cleanup_items[removed.string() + "\n" + renderRefTxnId(remove_txn)] =
-        RefNsCleanupItem{.ns = removed, .remove_txn_id = remove_txn, .state = RefNsCleanupState::Pending};
-
-    gc.runNamespaceCleanupPassesForTest(seal, /*ref_tables*/{}, st.round, /*suppress_destructive*/true);
-
-    EXPECT_TRUE(backend->head(layout.refCkptKey(NamespaceLifeId::stageATransition(removed))).exists)
-        << "a suppressed round leaves the checkpoint alone, exactly as it leaves every other object";
+    const RoundReport report = runRegularRoundReclaiming(gc);
+    ASSERT_TRUE(report.acquired_lease);
+    EXPECT_TRUE(report.deferred);
+    EXPECT_TRUE(CasRefCatalog::read(*backend, layout).catalog.entries.empty());
+    EXPECT_FALSE(CasRefCatalog::lifeIfCataloged(*backend, layout, removed));
+    EXPECT_EQ(backend->casPutCount(layout.refCatalogKey()), catalog_cas_before + 1);
+    EXPECT_TRUE(backend->head(ckpt_key).exists);
+    EXPECT_EQ(backend->deleteCount(ckpt_key), 0);
 }
 
-/// A recreation that landed while the pass was running publishes the `_cleanup` marker's precondition,
-/// and the per-key marker guard must stop the checkpoint delete too -- otherwise the backstop would
-/// delete the RECREATED incarnation's live checkpoint.
-TEST(CasGcFrontierGate, TheCheckpointDeleteAbortsOnTheRecreationMarker)
+TEST(CasGcFrontierGate, StaleIssuedCatalogCasLosesAfterNewLeaderHelpsBeforeListing)
 {
-    auto backend = std::make_shared<CountingBackend>();
+    auto backend = std::make_shared<DrainRaceBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
     const Layout & layout = store->layout();
-    const RootNamespace removed{"00/removed@cas@"};
+    const UInt128 leader_b = hexToU128("00000000000000000000000000000002");
+    const CompletedRemovingFixture fixture = seedCompletedRemoving(*backend, store, kGc);
+    backend->clearJournal();
+    backend->blockNextCatalogCas(layout.refCatalogKey());
 
-    Gc gc(store, kGc);
-    runRegularRoundReclaiming(gc);
-    const GcState st = decodeGcState(backend->get(layout.gcStateKey())->bytes);
+    std::exception_ptr leader_a_failure;
+    std::thread leader_a([&]
+    {
+        try
+        {
+            Gc gc_a(store, kGc);
+            (void)runRegularRoundReclaiming(gc_a);
+        }
+        catch (...)
+        {
+            leader_a_failure = std::current_exception();
+        }
+    });
+    backend->waitForBlockedCatalogCas();
 
-    const RefTxnId remove_txn{1, 5};
-    /// A successor already Completed this item and the writer recreated the namespace, so the marker is
-    /// durable and the `_ckpt` under this key belongs to the NEW incarnation.
-    backend->putIfAbsent(layout.refCleanupMarkerKey(NamespaceLifeId::stageATransition(removed), remove_txn), String{});
-    backend->putIfAbsent(layout.refCkptKey(NamespaceLifeId::stageATransition(removed)), "recreated-checkpoint");
+    transferGcLease(*backend, layout, leader_b);
+    RoundReport report_b;
+    std::exception_ptr leader_b_failure;
+    try
+    {
+        Gc gc_b(store, leader_b);
+        report_b = runRegularRoundReclaiming(gc_b);
+    }
+    catch (...)
+    {
+        leader_b_failure = std::current_exception();
+    }
 
-    CasFoldSeal seal;
-    seal.ns_cleanup_items[removed.string() + "\n" + renderRefTxnId(remove_txn)] =
-        RefNsCleanupItem{.ns = removed, .remove_txn_id = remove_txn, .state = RefNsCleanupState::Pending};
+    const std::vector<String> before_a_release = backend->journalSnapshot();
+    backend->releaseBlockedCatalogCas();
+    leader_a.join();
 
-    gc.runNamespaceCleanupPassesForTest(seal, /*ref_tables*/{}, st.round, /*suppress_destructive*/false);
+    ASSERT_FALSE(leader_b_failure);
+    ASSERT_TRUE(report_b.acquired_lease);
+    ASSERT_FALSE(report_b.deferred);
+    ASSERT_TRUE(CasRefCatalog::read(*backend, layout).catalog.entries.empty());
 
-    EXPECT_TRUE(backend->head(layout.refCkptKey(NamespaceLifeId::stageATransition(removed))).exists)
-        << "the marker is the recreation precondition; the checkpoint delete honours it like every "
-           "other delete in the pass";
+    const size_t catalog_cas_end = findJournalAfter(before_a_release, "cas_end " + layout.refCatalogKey(), 0);
+    ASSERT_LT(catalog_cas_end, before_a_release.size());
+    const size_t conclusive_rescan = findJournalAfter(
+        before_a_release, "get " + layout.refCatalogKey(), catalog_cas_end + 1);
+    ASSERT_LT(conclusive_rescan, before_a_release.size());
+    const size_t stream_list = findJournalAfter(
+        before_a_release, "list " + layout.casRefsPrefix(), conclusive_rescan + 1);
+    ASSERT_LT(stream_list, before_a_release.size());
+    const size_t fresh_catalog_cut = findJournalAfter(
+        before_a_release, "get " + layout.refCatalogKey(), stream_list + 1);
+    ASSERT_LT(fresh_catalog_cut, before_a_release.size());
+    const GcState adopted = decodeGcState(backend->get(layout.gcStateKey())->bytes);
+    const String successor_seal_key = layout.foldSealKey(adopted.snap_generation, adopted.snap_attempt);
+    const size_t successor_seal_put = findJournalAfter(
+        before_a_release, "put_end " + successor_seal_key, fresh_catalog_cut + 1);
+    ASSERT_LT(successor_seal_put, before_a_release.size());
+    const size_t redundant_plan_cut = findJournalAfter(
+        before_a_release, "get " + layout.refCatalogKey(), fresh_catalog_cut + 1);
+    const size_t successor_adoption = findJournalAfter(
+        before_a_release, "cas_end " + layout.gcStateKey(), successor_seal_put + 1);
+    ASSERT_LT(successor_adoption, before_a_release.size());
+    EXPECT_LT(catalog_cas_end, conclusive_rescan);
+    EXPECT_LT(conclusive_rescan, stream_list);
+    EXPECT_LT(stream_list, fresh_catalog_cut);
+    EXPECT_LT(fresh_catalog_cut, successor_seal_put);
+    EXPECT_TRUE(redundant_plan_cut == before_a_release.size() || successor_seal_put < redundant_plan_cut)
+        << "the fold must consume the one post-LIST catalog cut instead of reading a second plan cut";
+    EXPECT_LT(successor_seal_put, successor_adoption);
+
+    ASSERT_TRUE(leader_a_failure);
+    EXPECT_FALSE(CasRefCatalog::lifeIfCataloged(*backend, layout, fixture.ns));
+    EXPECT_EQ(backend->get(fixture.checkpoint_key)->bytes, "old-life checkpoint bytes");
+    EXPECT_EQ(backend->deleteCount(fixture.checkpoint_key), 0);
+}
+
+TEST(CasGcFrontierGate, LostCatalogCasResponseIsResolvedByNextLeaderBeforeListing)
+{
+    auto backend = std::make_shared<DrainRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    const UInt128 leader_b = hexToU128("00000000000000000000000000000002");
+    const CompletedRemovingFixture fixture = seedCompletedRemoving(*backend, store, kGc);
+    backend->clearJournal();
+    backend->loseNextCatalogCasResponse(layout.refCatalogKey());
+
+    Gc gc_a(store, kGc);
+    EXPECT_THROW((void)runRegularRoundReclaiming(gc_a), std::runtime_error);
+
+    transferGcLease(*backend, layout, leader_b);
+    Gc gc_b(store, leader_b);
+    const RoundReport report_b = runRegularRoundReclaiming(gc_b);
+    ASSERT_TRUE(report_b.acquired_lease);
+    ASSERT_FALSE(report_b.deferred);
+
+    const std::vector<String> journal = backend->journalSnapshot();
+    const size_t response_lost = findJournalAfter(
+        journal, "cas_response_lost " + layout.refCatalogKey(), 0);
+    ASSERT_LT(response_lost, journal.size());
+    const size_t conclusive_rescan = findJournalAfter(
+        journal, "get " + layout.refCatalogKey(), response_lost + 1);
+    ASSERT_LT(conclusive_rescan, journal.size());
+    const size_t stream_list = findJournalAfter(
+        journal, "list " + layout.casRefsPrefix(), conclusive_rescan + 1);
+    ASSERT_LT(stream_list, journal.size());
+    const size_t fresh_catalog_cut = findJournalAfter(
+        journal, "get " + layout.refCatalogKey(), stream_list + 1);
+    ASSERT_LT(fresh_catalog_cut, journal.size());
+    EXPECT_LT(response_lost, conclusive_rescan);
+    EXPECT_LT(conclusive_rescan, stream_list);
+    EXPECT_LT(stream_list, fresh_catalog_cut);
+
+    EXPECT_FALSE(CasRefCatalog::lifeIfCataloged(*backend, layout, fixture.ns));
+    EXPECT_EQ(backend->get(fixture.checkpoint_key)->bytes, "old-life checkpoint bytes");
+    EXPECT_EQ(backend->deleteCount(fixture.checkpoint_key), 0);
 }

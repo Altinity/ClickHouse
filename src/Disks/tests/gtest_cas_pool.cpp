@@ -967,7 +967,7 @@ TEST(CasPool, ListRefsReturnsSameContentAsBefore)
 }
 
 /// A stray key under the namespace's ref-object prefix that does not parse as one of Task 10's
-/// `_cleanup`/`_log`/`_snap` kinds (a foreign/corrupt object) must not break listRefs — it is skipped
+/// `_log`/`_snap` kinds (a foreign/corrupt object) must not break listRefs — it is skipped
 /// defensively, listRefs still returns the legit refs and never throws.
 TEST(CasPool, ListRefsSkipsForeignKeys)
 {
@@ -982,7 +982,7 @@ TEST(CasPool, ListRefsSkipsForeignKeys)
         {DB::Cas::tests::namespaceBirthOp(), DB::Cas::tests::publishCommittedOps(ref, mref)[0],
          DB::Cas::tests::publishCommittedOps(ref, mref)[1]}, std::nullopt});
 
-    /// A stray key directly under the namespace's ref-object prefix that is not `_cleanup`/`_log`/
+    /// A stray key directly under the namespace's ref-object prefix that is not `_log`/
     /// `_snap` shaped (also covers the legacy shard-number layout GC/dropNamespace still write).
     b->putIfAbsent(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)) + "garbage", "not-a-ref-object");
 
@@ -1101,8 +1101,9 @@ TEST(CasPool, DropNamespaceRemovesEveryOwnerButLeavesFilesForGc)
     /// Repeated drop is idempotent: no throw, no second transaction (nothing left to observe changing).
     EXPECT_NO_THROW(s->dropNamespace(ns));
 
-    /// Ordinary mutations on a Removed namespace are rejected.
-    expectThrowsCode(DB::ErrorCodes::FILE_DOESNT_EXIST, [&] { s->dropRef(ns, "alpha"); });
+    /// Ordinary mutations on a cataloged `Removing` life are rejected with typed retry-later until
+    /// the terminal fold and catalog-only drain complete.
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { s->dropRef(ns, "alpha"); });
 }
 
 TEST(CasPool, ListNamespacesFromCatalog)

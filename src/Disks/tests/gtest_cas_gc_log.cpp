@@ -380,8 +380,8 @@ TEST(CasGcLog, FoldingRoundEmitsEveryPhaseInOrder)
     ASSERT_TRUE(sched.runOneRoundNow(Rec::Trigger::Manual).acquired_lease);
 
     const std::vector<String> expected = {
-        "lease", "heartbeat_floor", "defer_decision", "ref_list_probe", "parent_seal_read",
-        "fold_ref_group", "fold_seal_read", "fold_ref_intake", "fold_ns_cleanup_scan",
+        "lease", "pre_fold_ref_drain", "heartbeat_floor", "defer_decision", "ref_list_probe", "parent_seal_read",
+        "fold_ref_group", "fold_seal_read", "fold_ref_intake",
         "fold_reduce", "fold_seal_write",
         "pending_deletes", "meta_pool_wait", "round_commit", "handoff_reclaim",
         "manifest_deletes", "namespace_cleanup", "ref_object_cleanup", "orphan_sweep"};

@@ -65,6 +65,27 @@ private:
     bool fail_once = true;
 };
 
+class CatalogCancellationRaceBackend final : public CountingBackend
+{
+public:
+    using CountingBackend::casPut;
+
+    CasResult casPut(
+        const String & key, const String & bytes, const std::optional<Token> & expected,
+        const ObjectMeta & meta) override
+    {
+        if (race_armed && key == Layout{"p"}.refCatalogKey())
+        {
+            race_armed = false;
+            on_catalog_cas();
+        }
+        return CountingBackend::casPut(key, bytes, expected, meta);
+    }
+
+    bool race_armed = false;
+    std::function<void()> on_catalog_cas;
+};
+
 PoolPtr openPoolForBirthTest(const BackendPtr & backend, const String & server_root_id = "test")
 {
     seedPoolMetaForRestart(*backend);
@@ -273,7 +294,7 @@ TEST(CasRefCatalogBirthWiring, AnExistingLiveEntryIsAdoptedRatherThanReminted)
 /// `resolveNamespaceLife`/`reconcileStaleCreator`, just an ordinary `appendRefOps`.
 TEST(CasRefCatalogBirthWiring, ANamespaceStuckCreatingUnderALiveForeignFenceRefusesProductionPublicationByConstruction)
 {
-    auto backend = std::make_shared<InMemoryBackend>();
+    auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForBirthTest(backend);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/stuck_creating"};
@@ -285,6 +306,7 @@ TEST(CasRefCatalogBirthWiring, ANamespaceStuckCreatingUnderALiveForeignFenceRefu
     const CatalogEntry entry{.ns = ns, .state = NsState::Creating, .incarnation = UInt128(0xdead),
                              .creator = foreign_creator};
     CasRefCatalog::casAdmitEntry(*backend, layout, entry);
+    backend->resetCounts();
 
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { publishBirth(store, ns, "a"); });
 
@@ -292,6 +314,9 @@ TEST(CasRefCatalogBirthWiring, ANamespaceStuckCreatingUnderALiveForeignFenceRefu
     const CatalogEntry * still = findEntry(CasRefCatalog::read(*backend, layout).catalog, ns);
     ASSERT_NE(still, nullptr);
     EXPECT_EQ(*still, entry) << "a refused resolution must write nothing";
+    EXPECT_EQ(backend->putTotal(), 0u);
+    EXPECT_EQ(backend->putOverwriteTotal(), 0u);
+    EXPECT_EQ(backend->casPutTotal(), 0u);
 }
 
 /// The mirror image, and Task 3's own deferred obligation ("wire `reconcileStaleCreator` and pin it
@@ -327,4 +352,149 @@ TEST(CasRefCatalogBirthWiring, AStaleCreatingEntryFromATerminatedForeignFenceIsR
 
     const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(ns, UInt128(0xbeef));
     EXPECT_TRUE(backend->head(layout.refLogKey(life, id)).exists);
+}
+
+TEST(CasRefCatalogBirthWiring, DropRefusesLiveCreatingFenceWithZeroCatalogMutation)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForBirthTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"drop_live_creator"};
+    const CatalogEntry creating{
+        .ns = ns,
+        .state = NsState::Creating,
+        .incarnation = UInt128{0xd001},
+        .creator = CreatorFence{.server_root_id = "unproven-live", .writer_epoch = 7, .fence_generation = 1}};
+    CasRefCatalog::casAdmitEntry(*backend, layout, creating);
+    backend->resetCounts();
+
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropNamespace(ns); });
+    EXPECT_EQ(backend->putTotal(), 0u);
+    EXPECT_EQ(backend->putOverwriteTotal(), 0u);
+    EXPECT_EQ(backend->casPutTotal(), 0u);
+    EXPECT_EQ(backend->deleteTotal(), 0u);
+    EXPECT_EQ(CasRefCatalog::read(*backend, layout).catalog.entries, std::vector<CatalogEntry>{creating});
+}
+
+TEST(CasRefCatalogBirthWiring, DropDeletesTerminalCreatingExactlyAndLeavesCkptForJanitor)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForBirthTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"drop_terminal_creator"};
+    const CatalogEntry creating{
+        .ns = ns,
+        .state = NsState::Creating,
+        .incarnation = UInt128{0xd002},
+        .creator = CreatorFence{.server_root_id = "dead-creator", .writer_epoch = 8, .fence_generation = 1}};
+    CasRefCatalog::casAdmitEntry(*backend, layout, creating);
+    setWatermarkMinActive(*backend, layout, "dead-creator", 8, std::numeric_limits<uint64_t>::max());
+    const NamespaceLifeId old_life = NamespaceLifeId::fromCatalogEntry(ns, creating.incarnation);
+    const String ckpt_key = layout.refCkptKey(old_life);
+    ASSERT_EQ(backend->putIfAbsent(ckpt_key, "stalled-ckpt").outcome, PutOutcome::Done);
+    backend->resetCounts();
+
+    store->dropNamespace(ns);
+    EXPECT_EQ(backend->casPutCount(layout.refCatalogKey()), 1u);
+    EXPECT_EQ(backend->deleteTotal(), 0u);
+    EXPECT_EQ(backend->deleteCount(ckpt_key), 0u);
+    EXPECT_TRUE(backend->head(ckpt_key).exists);
+    EXPECT_TRUE(CasRefCatalog::read(*backend, layout).catalog.entries.empty());
+
+    const NamespaceLifeId reborn = store->namespaceLife(ns);
+    EXPECT_NE(reborn.incarnation, old_life.incarnation);
+}
+
+TEST(CasRefCatalogBirthWiring, DropLosesExactCreatingRaceToReconciliationWithoutDeletingCkpt)
+{
+    auto backend = std::make_shared<CatalogCancellationRaceBackend>();
+    auto store = openPoolForBirthTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"drop_reconcile_race"};
+    const CreatorFence old_creator{
+        .server_root_id = "dead-racing-creator", .writer_epoch = 9, .fence_generation = 1};
+    const CatalogEntry creating{
+        .ns = ns, .state = NsState::Creating, .incarnation = UInt128{0xd003}, .creator = old_creator};
+    CasRefCatalog::casAdmitEntry(*backend, layout, creating);
+    setWatermarkMinActive(
+        *backend, layout, old_creator.server_root_id, old_creator.writer_epoch,
+        std::numeric_limits<uint64_t>::max());
+    const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(ns, creating.incarnation);
+    const String ckpt_key = layout.refCkptKey(life);
+    ASSERT_EQ(backend->putIfAbsent(ckpt_key, "stalled-ckpt").outcome, PutOutcome::Done);
+    backend->on_catalog_cas = [&]
+    {
+        EXPECT_EQ(CasRefCatalog::reconcileStaleCreator(
+            *backend, layout, creating,
+            CreatorFence{.server_root_id = "replacement", .writer_epoch = 10, .fence_generation = 1},
+            [](const CreatorFence &) { return true; }, store->fenceGeneration(),
+            [](uint64_t) {}), CasRefCatalog::ReconcileCreatorOutcome::Reconciled);
+    };
+    backend->race_armed = true;
+    backend->resetCounts();
+
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropNamespace(ns); });
+    EXPECT_EQ(backend->deleteTotal(), 0u);
+    EXPECT_EQ(backend->deleteCount(ckpt_key), 0u);
+    EXPECT_TRUE(backend->head(ckpt_key).exists);
+    const CasRefCatalog::Snapshot after = CasRefCatalog::read(*backend, layout);
+    ASSERT_EQ(after.catalog.entries.size(), 1u);
+    ASSERT_TRUE(after.catalog.entries.front().creator);
+    EXPECT_EQ(after.catalog.entries.front().creator->server_root_id, "replacement");
+}
+
+TEST(CasRefCatalogBirthWiring, FencedDropCannotCancelTerminalCreating)
+{
+    auto backend = std::make_shared<CatalogCancellationRaceBackend>();
+    auto store = openPoolForBirthTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"fenced_drop_terminal_creator"};
+    const CatalogEntry creating{
+        .ns = ns,
+        .state = NsState::Creating,
+        .incarnation = UInt128{0xd004},
+        .creator = CreatorFence{.server_root_id = "dead-fenced-creator", .writer_epoch = 11, .fence_generation = 1}};
+    CasRefCatalog::casAdmitEntry(*backend, layout, creating);
+    setWatermarkMinActive(*backend, layout, "dead-fenced-creator", 11, std::numeric_limits<uint64_t>::max());
+    backend->resetCounts();
+
+    /// The first cancellation attempt passes its fence check, then loses its catalog CAS while the
+    /// local mount is re-armed at a new fence generation. The retry must re-check the caller fence and
+    /// refuse before another catalog mutation attempt.
+    backend->on_catalog_cas = [&]
+    {
+        rearmMountFenceAfterAnomalyForTest(store);
+        backend->failNextCasPut(layout.refCatalogKey());
+    };
+    backend->race_armed = true;
+
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropNamespace(ns); });
+    EXPECT_EQ(backend->casPutCount(layout.refCatalogKey()), 1u);
+    EXPECT_EQ(backend->deleteTotal(), 0u);
+    EXPECT_EQ(CasRefCatalog::read(*backend, layout).catalog.entries, std::vector<CatalogEntry>{creating});
+}
+
+TEST(CasRefCatalogBirthWiring, ExactOldLifeCannotCancelReplacementTerminalCreating)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForBirthTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"exact_old_life_terminal_creator"};
+    const NamespaceLifeId predecessor = NamespaceLifeId::fromCatalogEntry(ns, UInt128{0xd005});
+    const CatalogEntry successor{
+        .ns = ns,
+        .state = NsState::Creating,
+        .incarnation = UInt128{0xd006},
+        .creator = CreatorFence{.server_root_id = "dead-successor-creator", .writer_epoch = 12, .fence_generation = 1}};
+    CasRefCatalog::casAdmitEntry(*backend, layout, successor);
+    setWatermarkMinActive(*backend, layout, "dead-successor-creator", 12, std::numeric_limits<uint64_t>::max());
+    const String ckpt_key = layout.refCkptKey(NamespaceLifeId::fromCatalogEntry(ns, successor.incarnation));
+    ASSERT_EQ(backend->putIfAbsent(ckpt_key, "successor-ckpt").outcome, PutOutcome::Done);
+    backend->resetCounts();
+
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropNamespace(predecessor); });
+    EXPECT_EQ(backend->casPutTotal(), 0u);
+    EXPECT_EQ(backend->deleteTotal(), 0u);
+    EXPECT_EQ(backend->deleteCount(ckpt_key), 0u);
+    EXPECT_EQ(CasRefCatalog::read(*backend, layout).catalog.entries, std::vector<CatalogEntry>{successor});
 }

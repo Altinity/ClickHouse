@@ -132,15 +132,15 @@ std::optional<CasFoldSeal> newestSeal(Backend & backend, const Layout & layout)
     }
 }
 
-std::optional<ShardCoverage> coverageOf(Backend & backend, const Layout & layout, const RootNamespace & ns)
+std::optional<RefCoverage> coverageOf(Backend & backend, const Layout & layout, const RootNamespace & ns)
 {
     const auto seal = newestSeal(backend, layout);
     if (!seal)
         return std::nullopt;
-    const auto it = seal->per_ns_shard.find(cursorKeyForTest(ns, /*shard*/0));
-    if (it == seal->per_ns_shard.end())
+    const auto it = seal->ref_lives.find(catalogLifeIdForTest(backend, layout, ns));
+    if (it == seal->ref_lives.end())
         return std::nullopt;
-    return it->second;
+    return it->second.coverage;
 }
 
 /// The cursor `ns` was sealed at, or `{0, 0}` when the round sealed NO row for it at all. It never
@@ -167,14 +167,20 @@ RefHold holdOf(Backend & backend, const Layout & layout, const RootNamespace & n
     return cov->hold ? *cov->hold : RefHold{};
 }
 
-/// A coverage key whose namespace part needs JSON escaping. Reachable, not contrived: a coverage key is
-/// `<namespace>/<shard>`, and `Layout::checkNamespace` constrains only the SEGMENT shape (non-empty, no
-/// empty segments, no reserved `_files`) — never the bytes; `checkCanonicalRefName` is equally permissive
-/// on the ref side. A RAW newline in such a key would split the record line in two, which is exactly what
-/// the escaper prevents. This is the fixture's escaping payload, and it belongs on the key: the line
-/// budget is measured on the bytes actually EMITTED (where one of these becomes two or six), never on
-/// the bytes of the value.
-const String kEscapingCoverageKey = "ns\"\\\n/0";
+UInt128 fixtureLifeId(std::string_view key)
+{
+    return key.ends_with("/1") ? UInt128{2} : UInt128{1};
+}
+
+RefCoverage & fixtureCoverage(CasFoldSeal & seal, std::string_view key)
+{
+    return seal.ref_lives[fixtureLifeId(key)].coverage;
+}
+
+const RefCoverage & fixtureCoverage(const CasFoldSeal & seal, std::string_view key)
+{
+    return seal.ref_lives.at(fixtureLifeId(key)).coverage;
+}
 
 /// A seal carrying exactly one held coverage row with every numeric at its maximum and a coverage key
 /// that needs escaping — the widest row the per-row line budget has to survive. The caller supplies the
@@ -184,7 +190,7 @@ CasFoldSeal maximalHoldSeal(const String & map_key)
     CasFoldSeal seal;
     seal.generation = std::numeric_limits<uint64_t>::max();
     seal.parent_generation = std::numeric_limits<uint64_t>::max();
-    ShardCoverage cov;
+    RefCoverage cov;
     cov.classification = 4;
     cov.last_folded_ref_id = RefTxnId{std::numeric_limits<uint64_t>::max(),
                                       std::numeric_limits<uint64_t>::max()};
@@ -193,7 +199,7 @@ CasFoldSeal maximalHoldSeal(const String & map_key)
                                                       std::numeric_limits<uint64_t>::max()},
                        .retry_count = std::numeric_limits<uint32_t>::max(),
                        .next_retry_round = std::numeric_limits<uint64_t>::max()};
-    seal.per_ns_shard[map_key] = cov;
+    fixtureCoverage(seal, map_key) = cov;
     return seal;
 }
 
@@ -205,27 +211,16 @@ String covLineOf(const String & encoded)
     return encoded.substr(begin, encoded.find('\n', begin) - begin);
 }
 
-/// A one-row seal whose `cov` line is EXACTLY `target_bytes` long, built by padding the escaping
-/// coverage key with plain ASCII (one padding byte == one encoded byte, whatever the base key costs —
-/// the base is MEASURED by a real encode, so the escaped bytes are counted rather than assumed).
-CasFoldSeal holdSealWithCovLineOfExactly(uint64_t target_bytes)
-{
-    const String probe_key = kEscapingCoverageKey;
-    const uint64_t base = covLineOf(encodeFoldSeal(maximalHoldSeal(probe_key))).size();
-    EXPECT_LE(base, target_bytes) << "the unpadded maximal hold row already exceeds the target";
-    return maximalHoldSeal(probe_key + String(target_bytes - base, 'a'));
-}
-
 /// A one-row seal whose coverage is ordinary and CLEAN: folded through its cursor, nothing held.
 CasFoldSeal cleanSeal(const String & map_key)
 {
     CasFoldSeal seal;
     seal.generation = 3;
     seal.parent_generation = 2;
-    ShardCoverage cov;
+    RefCoverage cov;
     cov.classification = 2;
     cov.last_folded_ref_id = RefTxnId{4, 5};
-    seal.per_ns_shard[map_key] = cov;
+    fixtureCoverage(seal, map_key) = cov;
     return seal;
 }
 
@@ -234,7 +229,7 @@ CasFoldSeal cleanSeal(const String & map_key)
 CasFoldSeal heldSeal(const String & map_key)
 {
     CasFoldSeal seal = cleanSeal(map_key);
-    ShardCoverage & cov = seal.per_ns_shard[map_key];
+    RefCoverage & cov = fixtureCoverage(seal, map_key);
     cov.classification = 4;
     cov.hold = RefHold{.reason = HoldReason::GapBelowWitness, .offending_position = RefTxnId{4, 6},
                        .retry_count = 7, .next_retry_round = 99};
@@ -262,7 +257,7 @@ String sealTextWith(const String & prototype, const std::vector<String> & record
 }
 
 /// Replace the coverage row's `cls` value with `raw`, VERBATIM. The point is to write integers no
-/// `ShardCoverage` can hold: the field is a byte in the struct, so a wide value exists only on the wire,
+/// `RefCoverage` can hold: the field is a byte in the struct, so a wide value exists only on the wire,
 /// which is exactly where a reader has to catch it. `cls` is never the last field of a `cov` record, so
 /// the value always ends at a comma.
 String withRawClassification(const String & encoded, std::string_view raw)
@@ -293,32 +288,32 @@ std::vector<std::pair<const char *, CasFoldSeal>> illFormedSealsTheEncoderMustRe
 
     /// The pairing, both ways round.
     CasFoldSeal hold_on_folded = heldSeal("ns/0");
-    hold_on_folded.per_ns_shard["ns/0"].classification = 2;
+    fixtureCoverage(hold_on_folded, "ns/0").classification = 2;
     out.emplace_back("a hold on a folded (2) row claims a stop that did not happen", hold_on_folded);
 
     CasFoldSeal clamped_without_hold = heldSeal("ns/0");
-    clamped_without_hold.per_ns_shard["ns/0"].hold.reset();
+    fixtureCoverage(clamped_without_hold, "ns/0").hold.reset();
     out.emplace_back("a clamped (4) row with no hold is indistinguishable from a clean cursor once "
                      "durable", clamped_without_hold);
 
     /// The closed set. 3 is the dangerous one: it passes the sweep's `== 4` and `== 0` refusals and
     /// reaches the deletion premise, which is a refusal written in terms of the set.
     CasFoldSeal classification_three = cleanSeal("ns/0");
-    classification_three.per_ns_shard["ns/0"].classification = 3;
+    fixtureCoverage(classification_three, "ns/0").classification = 3;
     out.emplace_back("classification 3 is not one of {0,1,2,4} and passes every refusal stated in terms "
                      "of them", classification_three);
 
     CasFoldSeal classification_max = cleanSeal("ns/0");
-    classification_max.per_ns_shard["ns/0"].classification = 255;
+    fixtureCoverage(classification_max, "ns/0").classification = 255;
     out.emplace_back("classification 255 is not one of {0,1,2,4}", classification_max);
 
     /// The self-erasing hold, and its half-zero sibling.
     CasFoldSeal hold_at_zero = heldSeal("ns/0");
-    hold_at_zero.per_ns_shard["ns/0"].hold->offending_position = RefTxnId{};
+    fixtureCoverage(hold_at_zero, "ns/0").hold->offending_position = RefTxnId{};
     out.emplace_back("a hold at {0,0} is cleared by the first record the next round folds", hold_at_zero);
 
     CasFoldSeal hold_zero_sequence = heldSeal("ns/0");
-    hold_zero_sequence.per_ns_shard["ns/0"].hold->offending_position = RefTxnId{7, 0};
+    fixtureCoverage(hold_zero_sequence, "ns/0").hold->offending_position = RefTxnId{7, 0};
     out.emplace_back("a hold position with a zero component is not a renderable id", hold_zero_sequence);
 
     return out;
@@ -372,17 +367,17 @@ TEST(CasGcHoldGrammar, EveryHoldReasonRoundTrips)
         CasFoldSeal seal;
         seal.generation = 3;
         seal.parent_generation = 2;
-        ShardCoverage cov;
+        RefCoverage cov;
         cov.classification = 4;
         cov.last_folded_ref_id = RefTxnId{4, 5};
         cov.hold = RefHold{.reason = reason, .offending_position = RefTxnId{4, 6},
                            .retry_count = 7, .next_retry_round = 99};
-        seal.per_ns_shard["ns/0"] = cov;
+        fixtureCoverage(seal, "ns/0") = cov;
 
         const CasFoldSeal back = decodeFoldSeal(encodeFoldSeal(seal));
         EXPECT_EQ(back, seal) << "hold reason " << static_cast<int>(reason);
-        ASSERT_TRUE(back.per_ns_shard.at("ns/0").hold.has_value());
-        EXPECT_EQ(back.per_ns_shard.at("ns/0").hold->reason, reason);
+        ASSERT_TRUE(fixtureCoverage(back, "ns/0").hold.has_value());
+        EXPECT_EQ(fixtureCoverage(back, "ns/0").hold->reason, reason);
     }
 }
 
@@ -418,14 +413,14 @@ TEST(CasGcHoldGrammar, AHoldOnAnyOtherClassificationIsRefusedByTheDecoder)
 {
     CasFoldSeal seal;
     seal.generation = 1;
-    ShardCoverage cov;
+    RefCoverage cov;
 
     /// Bytes some other producer wrote. Built by demoting a legitimate held row's classification, so the
     /// hold fields are exactly the ones the encoder emits.
     cov.classification = 4;
     cov.hold = RefHold{.reason = HoldReason::GapBelowWitness, .offending_position = RefTxnId{1, 2},
                        .retry_count = 0, .next_retry_round = 1};
-    seal.per_ns_shard["ns/0"] = cov;
+    fixtureCoverage(seal, "ns/0") = cov;
     String text = encodeFoldSeal(seal);
     const size_t at = text.find("\"cls\":4");
     ASSERT_NE(at, String::npos);
@@ -437,14 +432,14 @@ TEST(CasGcHoldGrammar, ClassificationFourWithoutAHoldIsRefusedByTheDecoder)
 {
     CasFoldSeal seal;
     seal.generation = 1;
-    ShardCoverage cov;
+    RefCoverage cov;
     cov.classification = 4;
     cov.last_folded_ref_id = RefTxnId{1, 1};
 
     /// Every single hold field is REQUIRED: dropping any one of them is corruption, not a default.
     cov.hold = RefHold{.reason = HoldReason::BodyUndecodable, .offending_position = RefTxnId{1, 2},
                        .retry_count = 3, .next_retry_round = 4};
-    seal.per_ns_shard["ns/0"] = cov;
+    fixtureCoverage(seal, "ns/0") = cov;
     const String whole = encodeFoldSeal(seal);
     for (const String & field : {String("\"hr\":\"body_undecodable\""), String("\"hpe\":\"1\""),
                                  String("\"hps\":\"2\""), String("\"hrc\":3"), String("\"hnr\":\"4\"")})
@@ -462,11 +457,11 @@ TEST(CasGcHoldGrammar, DuplicateHoldKeyIsCorruptedData)
 {
     CasFoldSeal seal;
     seal.generation = 1;
-    ShardCoverage cov;
+    RefCoverage cov;
     cov.classification = 4;
     cov.hold = RefHold{.reason = HoldReason::GapBelowWitness, .offending_position = RefTxnId{1, 2},
                        .retry_count = 0, .next_retry_round = 5};
-    seal.per_ns_shard["ns/0"] = cov;
+    fixtureCoverage(seal, "ns/0") = cov;
 
     const String whole = encodeFoldSeal(seal);
     const String field = "\"hr\":\"gap_below_witness\"";
@@ -482,11 +477,11 @@ TEST(CasGcHoldGrammar, UnknownHoldReasonWordIsCorruptedData)
 {
     CasFoldSeal seal;
     seal.generation = 1;
-    ShardCoverage cov;
+    RefCoverage cov;
     cov.classification = 4;
     cov.hold = RefHold{.reason = HoldReason::GapBelowWitness, .offending_position = RefTxnId{1, 2},
                        .retry_count = 0, .next_retry_round = 5};
-    seal.per_ns_shard["ns/0"] = cov;
+    fixtureCoverage(seal, "ns/0") = cov;
 
     String text = encodeFoldSeal(seal);
     const size_t at = text.find("gap_below_witness");
@@ -512,7 +507,7 @@ TEST(CasGcHoldGrammar, UnknownHoldReasonWordIsCorruptedData)
 TEST(CasGcHoldGrammar, AClassificationOutsideTheGrammarIsCorruptedData)
 {
     const String clean = encodeFoldSeal(cleanSeal("ns/0"));
-    ASSERT_EQ(decodeFoldSeal(clean).per_ns_shard.at("ns/0").classification, 2)
+    ASSERT_EQ(fixtureCoverage(decodeFoldSeal(clean), "ns/0").classification, 2)
         << "the unmodified row is the one every case below deviates from";
 
     /// In-range bytes that are simply not classifications. 3 is the one the sweep's refusals miss.
@@ -553,7 +548,7 @@ TEST(CasGcHoldGrammar, ACoverageRowWithoutAClassificationIsCorruptedData)
 TEST(CasGcHoldGrammar, AHoldWhoseOffendingPositionHasAZeroComponentIsCorruptedData)
 {
     const String held = encodeFoldSeal(heldSeal("ns/0"));
-    ASSERT_TRUE(decodeFoldSeal(held).per_ns_shard.at("ns/0").hold.has_value());
+    ASSERT_TRUE(fixtureCoverage(decodeFoldSeal(held), "ns/0").hold.has_value());
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
     {
@@ -579,8 +574,8 @@ TEST(CasGcHoldGrammar, ASecondCoverageRowForTheSameKeyIsCorruptedData)
     /// The CONTROL first: the same two-record assembly with DIFFERENT keys decodes, so the refusal below
     /// is about the repeated key and not about the way these bytes are forged.
     const CasFoldSeal two_keys = decodeFoldSeal(sealTextWith(prototype, {held_line, other_clean_line}));
-    ASSERT_EQ(two_keys.per_ns_shard.size(), 2u);
-    ASSERT_TRUE(two_keys.per_ns_shard.at("ns/0").hold.has_value());
+    ASSERT_EQ(two_keys.ref_lives.size(), 2u);
+    ASSERT_TRUE(fixtureCoverage(two_keys, "ns/0").hold.has_value());
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
                      [&] { decodeFoldSeal(sealTextWith(prototype, {held_line, clean_line})); });
@@ -594,24 +589,20 @@ TEST(CasGcHoldGrammar, ASecondCoverageRowForTheSameKeyIsCorruptedData)
     /// The ENCODER needs no matching check, and this is why: the seal stores keyed maps, so a second row
     /// for a key is not a value any producer can construct — assigning it replaces the first.
     CasFoldSeal seal = heldSeal("ns/0");
-    seal.per_ns_shard["ns/0"] = cleanSeal("ns/0").per_ns_shard.at("ns/0");
-    EXPECT_EQ(seal.per_ns_shard.size(), 1u);
+    fixtureCoverage(seal, "ns/0") = fixtureCoverage(cleanSeal("ns/0"), "ns/0");
+    EXPECT_EQ(seal.ref_lives.size(), 1u);
 }
 
-/// The same one-record-per-key rule for the other two keyed record kinds. A repeated `cnd` row rewrites
-/// a shard's condemned totals (what graduation paces on) and a repeated `nsc` row rewrites a namespace
-/// cleanup's state — including `pending` -> `completed`, which retires the cleanup while objects may
-/// still be there.
-TEST(CasGcHoldGrammar, ASecondCondemnedSummaryOrNsCleanupRecordIsCorruptedData)
+/// The same one-record-per-key rule applies to `cnd`: a repeated row rewrites a shard's condemned
+/// totals, which graduation paces on.
+TEST(CasGcHoldGrammar, ASecondCondemnedSummaryRecordIsCorruptedData)
 {
     CasFoldSeal seal = cleanSeal("ns/0");
     seal.condemned_summary[0] = CondemnedSummary{.condemned_total = 5, .pending_total = 1,
                                                  .oldest_nonpending_condemn_round = 3};
-    seal.ns_cleanup_items["ns\n" + renderRefTxnId(RefTxnId{2, 3})] =
-        RefNsCleanupItem{RootNamespace{"ns"}, RefTxnId{2, 3}, RefNsCleanupState::Pending};
     const String encoded = encodeFoldSeal(seal);
 
-    /// Lines 3..5 are cov, cnd, nsc in the encoder's fixed order.
+    /// Lines 3..4 are `rfl`, `cnd` in the encoder's fixed order.
     std::vector<String> lines;
     for (size_t begin = headerAndMetaOf(encoded).size(); begin < encoded.size();)
     {
@@ -620,29 +611,24 @@ TEST(CasGcHoldGrammar, ASecondCondemnedSummaryOrNsCleanupRecordIsCorruptedData)
         lines.push_back(encoded.substr(begin, end - begin));
         begin = end + 1;
     }
-    ASSERT_EQ(lines.size(), 4u) << "cov, cnd, nsc and the trailer";
-    const String cov_line = lines[0];
+    ASSERT_EQ(lines.size(), 3u) << "rfl, cnd and the trailer";
+    const String ref_life_line = lines[0];
     const String cnd_line = lines[1];
-    const String nsc_line = lines[2];
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-                     [&] { decodeFoldSeal(sealTextWith(encoded, {cov_line, cnd_line, cnd_line})); });
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-                     [&] { decodeFoldSeal(sealTextWith(encoded, {cov_line, nsc_line, nsc_line})); });
+                     [&] { decodeFoldSeal(sealTextWith(encoded, {ref_life_line, cnd_line, cnd_line})); });
     /// The unduplicated assembly is the control.
-    const std::vector<String> one_of_each{cov_line, cnd_line, nsc_line};
+    const std::vector<String> one_of_each{ref_life_line, cnd_line};
     EXPECT_NO_THROW(decodeFoldSeal(sealTextWith(encoded, one_of_each)));
 }
 
-/// An `nsc` record names a removal transaction, and that id becomes part of the item's key. A zero
-/// component there is corruption on the wire — but it used to reach `renderRefTxnId`, whose refusal is
-/// `LOGICAL_ERROR`: an ABORT under a debug or sanitizer build, taking the process down inside the decode
-/// of bytes that came from a store. Decoding foreign bytes must fail this read, never the process.
-TEST(CasGcHoldGrammar, AnNsCleanupItemWithAZeroRemovalIdIsCorruptedData)
+/// Unified cleanup evidence still requires a canonical nonzero removal transaction id. Decoding
+/// foreign bytes must fail this read, never the process.
+TEST(CasGcHoldGrammar, CleanupEvidenceWithAZeroRemovalIdIsCorruptedData)
 {
     CasFoldSeal seal = cleanSeal("ns/0");
-    seal.ns_cleanup_items["ns\n" + renderRefTxnId(RefTxnId{2, 3})] =
-        RefNsCleanupItem{RootNamespace{"ns"}, RefTxnId{2, 3}, RefNsCleanupState::Pending};
+    seal.ref_lives.at(fixtureLifeId("ns/0")).cleanup_evidence =
+        RefCleanupEvidence{.remove_txn_id = RefTxnId{2, 3}};
     const String encoded = encodeFoldSeal(seal);
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
@@ -654,41 +640,7 @@ TEST(CasGcHoldGrammar, AnNsCleanupItemWithAZeroRemovalIdIsCorruptedData)
                      [&] { decodeFoldSeal(withField(encoded, "\"rte\":\"2\",", "")); });
 }
 
-/// ===================== THE TWO CAPS, KEPT DISTINCT =====================
-///
-/// (a) The LINE cap bounds ONE record. A `cov` row that exceeds it produces an object that can never be
-/// decoded again, so the writer refuses it rather than persisting it — and the reader refuses it too,
-/// for bytes that reached the store some other way.
-TEST(CasGcHoldGrammar, MaximalHoldRowFitsTheLineCapAndOneMoreByteDoesNot)
-{
-    const uint64_t line_cap = foldSealCaps().line_cap;
-    ASSERT_GT(line_cap, 0u);
-
-    /// AT the cap: accepted, and it round-trips — equality is inside the budget, on both sides. The
-    /// round-trip is over an ESCAPED coverage key, so it also proves the escaper and the unescaper agree
-    /// on a key carrying a quote, a backslash and a newline.
-    const CasFoldSeal at_cap = holdSealWithCovLineOfExactly(line_cap);
-    const String encoded = encodeFoldSeal(at_cap);
-    ASSERT_EQ(covLineOf(encoded).size(), line_cap);
-    EXPECT_EQ(decodeFoldSeal(encoded), at_cap);
-    EXPECT_EQ(std::count(encoded.begin(), encoded.end(), '\n'), 4)
-        << "header, meta, cov and trailer — the newline inside the coverage key must be ESCAPED, not "
-           "emitted raw, or the record would be split across two lines";
-
-    /// ONE byte of payload growth and the reader refuses the line... The byte is inserted at the START
-    /// of the key value (one plain byte in, one emitted byte out) so the growth is independent of what
-    /// the key itself escapes to.
-    String over = encoded;
-    over.insert(over.find("\"key\":\"") + strlen("\"key\":\""), "a");
-    ASSERT_EQ(covLineOf(over).size(), line_cap + 1);
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeFoldSeal(over); });
-
-    /// ...and the WRITER refuses to produce it, so the unreadable object is never created.
-    expectThrowsCode(DB::ErrorCodes::LIMIT_EXCEEDED,
-        [&] { encodeFoldSeal(holdSealWithCovLineOfExactly(line_cap + 1)); });
-}
-
-/// (b) The OBJECT cap bounds the whole seal. Nothing on the fold-seal READ path enforces it (the seal
+/// The OBJECT cap bounds the whole seal. Nothing on the fold-seal READ path enforces it (the seal
 /// is read raw, never through `openObject`), so an oversized PUT would leave a durable seal that no
 /// later round can decode — unrecoverable. The gate therefore sits before the bytes are handed out, and
 /// equality is still accepted: the cap is the largest permitted size, not the first forbidden one.
@@ -1248,11 +1200,9 @@ RefHold plantedHold()
 
 }
 
-/// A rebuild derives coverage from owner state, so without this it would overwrite every held row with
-/// a clean one and hand back a baseline that LOOKS proven. Every hold rides through verbatim —
-/// including `retry_count`, because a rebuild retried nothing and must not reset the count that tells
-/// an operator how long the namespace has been stuck.
-TEST(CasGcHoldGrammar, RebuildCarriesEveryHoldVerbatim)
+/// A rebuild carries a hold only for the matching catalog life. A historical row whose id is absent
+/// from the rebuild cut is dropped and cannot mint output work.
+TEST(CasGcHoldGrammar, RebuildCarriesMatchingHoldAndDropsAbsentLife)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -1263,18 +1213,19 @@ TEST(CasGcHoldGrammar, RebuildCarriesEveryHoldVerbatim)
     Gc gc(store, kGc);
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
 
-    /// One hold on a namespace the rebuild WILL rediscover, one on a namespace it will not.
+    const UInt128 life_id = catalogLifeIdForTest(*backend, layout, ns);
+    constexpr UInt128 absent_life_id{0xfeed};
     mutateAdoptedSeal(*backend, layout, [&](CasFoldSeal & seal)
     {
-        ShardCoverage & cov = seal.per_ns_shard[cursorKeyForTest(ns, 0)];
+        RefCoverage & cov = seal.ref_lives.at(life_id).coverage;
         cov.classification = 4;
         cov.hold = plantedHold();
-        ShardCoverage gone;
+        RefCoverage gone;
         gone.classification = 4;
         gone.last_folded_ref_id = RefTxnId{2, 2};
         gone.hold = RefHold{.reason = HoldReason::GapBelowWitness, .offending_position = RefTxnId{2, 3},
                             .retry_count = 1, .next_retry_round = 2};
-        seal.per_ns_shard[cursorKeyForTest(RootNamespace{"00/zz@cas@"}, 0)] = gone;
+        seal.ref_lives[absent_life_id].coverage = gone;
     });
 
     const RebuildReport rep = gc.rebuildBaseline(/*force=*/true);
@@ -1282,18 +1233,12 @@ TEST(CasGcHoldGrammar, RebuildCarriesEveryHoldVerbatim)
 
     const auto rebuilt = newestSeal(*backend, layout);
     ASSERT_TRUE(rebuilt.has_value());
-    const auto rediscovered = rebuilt->per_ns_shard.find(cursorKeyForTest(ns, 0));
-    ASSERT_NE(rediscovered, rebuilt->per_ns_shard.end());
-    EXPECT_EQ(rediscovered->second.classification, 4);
-    ASSERT_TRUE(rediscovered->second.hold.has_value());
-    EXPECT_EQ(*rediscovered->second.hold, plantedHold());
-
-    const auto vanished = rebuilt->per_ns_shard.find(cursorKeyForTest(RootNamespace{"00/zz@cas@"}, 0));
-    ASSERT_NE(vanished, rebuilt->per_ns_shard.end())
-        << "a hold on a namespace the rebuild cannot see is exactly the one that must not be dropped";
-    ASSERT_TRUE(vanished->second.hold.has_value());
-    EXPECT_EQ(vanished->second.hold->offending_position, (RefTxnId{2, 3}));
-    EXPECT_EQ(vanished->second.last_folded_ref_id, (RefTxnId{2, 2})) << "its cursor rides with it";
+    const auto rediscovered = rebuilt->ref_lives.find(life_id);
+    ASSERT_NE(rediscovered, rebuilt->ref_lives.end());
+    EXPECT_EQ(rediscovered->second.coverage.classification, 4);
+    ASSERT_TRUE(rediscovered->second.coverage.hold.has_value());
+    EXPECT_EQ(*rediscovered->second.coverage.hold, plantedHold());
+    EXPECT_FALSE(rebuilt->ref_lives.contains(absent_life_id));
 }
 
 /// AN ORDINARY CRASH IS NOT A CORRUPT POOL. A round writes its runs during the reduce phase and its
@@ -1319,6 +1264,7 @@ TEST(CasGcHoldGrammar, RebuildStepsDownPastACrashedNewestGenerationToTheSealBelo
     const GcState after_first = decodeGcState(backend->get(layout.gcStateKey())->bytes);
     const uint64_t older_generation = after_first.snap_generation;
     const uint64_t older_attempt = after_first.snap_attempt;
+    const UInt128 life_id = catalogLifeIdForTest(*backend, layout, ns);
 
     publishAt(*backend, layout, ns, RefTxnId{1, 2}, "ref_2", 2, DB::UInt128(2));
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
@@ -1328,7 +1274,7 @@ TEST(CasGcHoldGrammar, RebuildStepsDownPastACrashedNewestGenerationToTheSealBelo
     /// The older generation is the one holding the pool's durable hold.
     mutateSealAt(*backend, layout, older_generation, older_attempt, [&](CasFoldSeal & seal)
     {
-        ShardCoverage & cov = seal.per_ns_shard[cursorKeyForTest(ns, 0)];
+        RefCoverage & cov = seal.ref_lives.at(life_id).coverage;
         cov.classification = 4;
         cov.hold = plantedHold();
     });
@@ -1353,12 +1299,12 @@ TEST(CasGcHoldGrammar, RebuildStepsDownPastACrashedNewestGenerationToTheSealBelo
 
     const auto rebuilt = newestSeal(*backend, layout);
     ASSERT_TRUE(rebuilt.has_value());
-    const auto it = rebuilt->per_ns_shard.find(cursorKeyForTest(ns, 0));
-    ASSERT_NE(it, rebuilt->per_ns_shard.end());
-    ASSERT_TRUE(it->second.hold.has_value())
+    const auto it = rebuilt->ref_lives.find(life_id);
+    ASSERT_NE(it, rebuilt->ref_lives.end());
+    ASSERT_TRUE(it->second.coverage.hold.has_value())
         << "a crash between the run writes and the seal write turned into 'recreate the pool', and the "
            "hold readable one generation down was thrown away with it";
-    EXPECT_EQ(*it->second.hold, plantedHold());
+    EXPECT_EQ(*it->second.coverage.hold, plantedHold());
 }
 
 /// With no readable prior seal there is nothing to carry, and the holds it may have contained are
@@ -1437,9 +1383,10 @@ TEST(CasGcHoldGrammar, RebuildWithLostStateStillCarriesHoldsFromTheNewestSeal)
     publishAt(*backend, layout, ns, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(1), /*birth=*/true);
     Gc gc(store, kGc);
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+    const UInt128 life_id = catalogLifeIdForTest(*backend, layout, ns);
     mutateAdoptedSeal(*backend, layout, [&](CasFoldSeal & seal)
     {
-        ShardCoverage & cov = seal.per_ns_shard[cursorKeyForTest(ns, 0)];
+        RefCoverage & cov = seal.ref_lives.at(life_id).coverage;
         cov.classification = 4;
         cov.hold = plantedHold();
     });
@@ -1455,11 +1402,11 @@ TEST(CasGcHoldGrammar, RebuildWithLostStateStillCarriesHoldsFromTheNewestSeal)
 
     const auto rebuilt = newestSeal(*backend, layout);
     ASSERT_TRUE(rebuilt.has_value());
-    const auto it = rebuilt->per_ns_shard.find(cursorKeyForTest(ns, 0));
-    ASSERT_NE(it, rebuilt->per_ns_shard.end());
-    ASSERT_TRUE(it->second.hold.has_value())
+    const auto it = rebuilt->ref_lives.find(life_id);
+    ASSERT_NE(it, rebuilt->ref_lives.end());
+    ASSERT_TRUE(it->second.coverage.hold.has_value())
         << "the rebuild blessed a baseline with no hold in it, having read no seal at all";
-    EXPECT_EQ(*it->second.hold, plantedHold());
+    EXPECT_EQ(*it->second.coverage.hold, plantedHold());
 }
 
 /// ...and when that newest seal cannot be read either, there is nothing left to carry and no way to
@@ -1540,9 +1487,10 @@ TEST(CasGcHoldGrammar, RebuildRefusesWhenANarrowProbeFindsASealAboveTheListingMa
 
     const GcState st = decodeGcState(backend->get(layout.gcStateKey())->bytes);
     ASSERT_GT(st.snap_generation, 1u) << "the fixture needs a newer generation to hide";
+    const UInt128 life_id = catalogLifeIdForTest(*backend, layout, ns);
     mutateAdoptedSeal(*backend, layout, [&](CasFoldSeal & seal)
     {
-        ShardCoverage & cov = seal.per_ns_shard[cursorKeyForTest(ns, 0)];
+        RefCoverage & cov = seal.ref_lives.at(life_id).coverage;
         cov.classification = 4;
         cov.hold = plantedHold();
     });

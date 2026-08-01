@@ -51,6 +51,11 @@ bool creatorPairingOk(const CatalogEntry & e)
     return (e.state == NsState::Creating) == e.creator.has_value();
 }
 
+bool removalRoundPairingOk(const CatalogEntry & e)
+{
+    return (e.state == NsState::Removing) == e.removal_started_round.has_value();
+}
+
 /// Whether `entries` is already in the catalog's canonical shape: strictly ascending by namespace
 /// bytes, no duplicate namespace. A duplicate namespace fails the SAME check as an out-of-order pair
 /// (equal keys never compare strictly less), which is exactly right -- both are "not canonical".
@@ -123,12 +128,21 @@ String encodeRefCatalog(const RefCatalog & catalog)
                 "CAS ref catalog: namespace '{}' is {} and {} a creator fence -- creator is required "
                 "iff state == Creating and forbidden otherwise",
                 e.ns.string(), nsStateToWord(e.state), e.creator ? "carries" : "lacks");
+        if (!removalRoundPairingOk(e))
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "CAS ref catalog: namespace '{}' is {} and {} removal_started_round -- the field is "
+                "required iff state == Removing",
+                e.ns.string(), nsStateToWord(e.state), e.removal_started_round ? "carries" : "lacks");
 
         bool first = true;
         writeKey(out, "k", first);   writeStringValue(out, "ent");
         writeKey(out, "ns", first);  writeStringValue(out, e.ns.string());
         writeKey(out, "st", first);  writeStringValue(out, nsStateToWord(e.state));
         writeKey(out, "inc", first); writeHex128Value(out, e.incarnation);
+        if (e.removal_started_round)
+        {
+            writeKey(out, "rsr", first); writeU64StringValue(out, *e.removal_started_round);
+        }
         if (e.creator)
         {
             writeKey(out, "csr", first); writeStringValue(out, e.creator->server_root_id);
@@ -187,6 +201,7 @@ RefCatalog decodeRefCatalog(std::string_view data)
         std::optional<String> csr;
         std::optional<uint64_t> cwe;
         std::optional<uint64_t> cfg;
+        std::optional<uint64_t> removal_started_round;
         while (r.nextKey(key))
         {
             if (key == "ns") ns_str = r.readString();
@@ -195,6 +210,7 @@ RefCatalog decodeRefCatalog(std::string_view data)
             else if (key == "csr") csr = r.readString();
             else if (key == "cwe") cwe = r.readU64String();
             else if (key == "cfg") cfg = r.readU64String();
+            else if (key == "rsr") removal_started_round = r.readU64String();
             else throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref catalog: unknown ent key '{}'", key);
         }
         if (!l.eof())
@@ -238,6 +254,12 @@ RefCatalog decodeRefCatalog(std::string_view data)
                 "CAS ref catalog: namespace '{}' carries a creator fence at state '{}' -- creator is "
                 "forbidden on anything but Creating", ns_str, *st_word);
 
+        if ((state == NsState::Removing) != removal_started_round.has_value())
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS ref catalog: namespace '{}' is {} and {} removal_started_round -- the field is "
+                "required iff state == Removing",
+                ns_str, *st_word, removal_started_round ? "carries" : "lacks");
+
         /// Canonical order, checked incrementally as records stream in: a namespace that does not
         /// compare strictly greater than the previous one is either a duplicate or out of order --
         /// both are "not canonical", and this one check rejects either shape.
@@ -248,7 +270,8 @@ RefCatalog decodeRefCatalog(std::string_view data)
                 ns_str, catalog.entries.back().ns.string());
 
         catalog.entries.push_back(CatalogEntry{.ns = RootNamespace{ns_str}, .state = state,
-                                                .incarnation = *inc, .creator = creator});
+                                                .incarnation = *inc, .creator = creator,
+                                                .removal_started_round = removal_started_round});
         ++seen;
     }
 }
@@ -275,29 +298,21 @@ uint64_t worstCaseEntryFoldReservationBytes()
     /// the fold seal's wire shape is felt here automatically instead of silently drifting.
     static const uint64_t bytes = []() -> uint64_t
     {
-        /// Worst-case namespace content: `kMaxNamespaceBytes` control bytes, each expanding under
-        /// `CasJsonWriter::stringValue` to its widest escape (`\u00XX`, 6 bytes -- wider than any
-        /// named escape like `\n`/`\t`). This is the byte content admission reserves for EVERY entry,
-        /// independent of any real admitted name's actual bytes.
-        const String worst_ns(kMaxNamespaceBytes, '\x01');
         constexpr uint64_t kU64Max = std::numeric_limits<uint64_t>::max();
         constexpr uint32_t kU32Max = std::numeric_limits<uint32_t>::max();
 
         CasFoldSeal seal;
-        /// The widest `cov` row: classification 4 (held), every numeric hold field at its widest
-        /// decimal rendering, and the longest registered `HoldReason` word.
-        seal.per_ns_shard[worst_ns + "/0"] = ShardCoverage{
-            .classification = 4,
-            .last_folded_ref_id = RefTxnId{kU64Max, kU64Max},
-            .hold = RefHold{.reason = HoldReason::UnconsumedSealCrossing,
-                             .offending_position = RefTxnId{kU64Max, kU64Max},
-                             .retry_count = kU32Max,
-                             .next_retry_round = kU64Max}};
-        /// The widest `nsc` row: the longer of the two registered `RefNsCleanupState` words.
-        const String nsc_key = worst_ns + "\n" + renderRefTxnId(RefTxnId{kU64Max, kU64Max});
-        seal.ns_cleanup_items[nsc_key] = RefNsCleanupItem{
-            .ns = RootNamespace{worst_ns}, .remove_txn_id = RefTxnId{kU64Max, kU64Max},
-            .state = RefNsCleanupState::Completed};
+        /// One catalog entry admits exactly one ref-life row. Charge its widest legal form: a held
+        /// coverage record plus terminal cleanup evidence, all numeric fields at maximum width.
+        seal.ref_lives[std::numeric_limits<UInt128>::max()] = RefLifeFoldState{
+            .coverage = RefCoverage{
+                .classification = 4,
+                .last_folded_ref_id = RefTxnId{kU64Max, kU64Max},
+                .hold = RefHold{.reason = HoldReason::UnconsumedSealCrossing,
+                                 .offending_position = RefTxnId{kU64Max, kU64Max},
+                                 .retry_count = kU32Max,
+                                 .next_retry_round = kU64Max}},
+            .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{kU64Max, kU64Max}}};
 
         return encodeFoldSeal(seal).size() - foldSealFixedBytes();
     }();

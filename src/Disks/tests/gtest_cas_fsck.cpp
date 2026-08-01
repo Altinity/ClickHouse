@@ -212,7 +212,10 @@ TEST(CasFsck, DuplicateLifeIdIsReportedWhileAnUnrelatedUniqueNamespaceStillProgr
     snapshot.catalog.entries.push_back(CatalogEntry{
         .ns = RootNamespace{"bad/a"}, .state = NsState::Live, .incarnation = UInt128{777}});
     snapshot.catalog.entries.push_back(CatalogEntry{
-        .ns = RootNamespace{"bad/b"}, .state = NsState::Removing, .incarnation = UInt128{777}});
+        .ns = RootNamespace{"bad/b"},
+        .state = NsState::Removing,
+        .incarnation = UInt128{777},
+        .removal_started_round = 1});
     std::sort(snapshot.catalog.entries.begin(), snapshot.catalog.entries.end(),
         [](const CatalogEntry & lhs, const CatalogEntry & rhs) { return lhs.ns.string() < rhs.ns.string(); });
     const auto catalog_head = backend->head(layout.refCatalogKey());

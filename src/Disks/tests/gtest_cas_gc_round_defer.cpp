@@ -178,9 +178,9 @@ TEST(CasGcRoundDefer, HotEnumerationOffersLogsAndSnapshotsButNeverCheckpointOrFi
     EXPECT_EQ(backend->listCount(layout.namespaceStateRootPrefix()), 0u);
 }
 
-/// The cut precedes LIST. A life first observed by that LIST but absent from the earlier cut is
-/// post-cut/unknown, never inert debris, and forces the round to defer without reading its body.
-TEST(CasGcRoundDefer, LifeAbsentFromThePreListCatalogCutDefersTheRound)
+/// The authoritative cut follows the completed hot LIST. A listed life absent from that later cut is
+/// inert dead-life debris: it is not admitted and does not defer the round or read the body.
+TEST(CasGcRoundDefer, ListedLifeAbsentFromThePostListCatalogCutIsInertDebris)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -192,15 +192,14 @@ TEST(CasGcRoundDefer, LifeAbsentFromThePreListCatalogCutDefersTheRound)
 
     Gc gc(store, kGc);
     const RoundReport report = gc.runRegularRound({}, /*allow_steal=*/true, UniversePolicy::AuthoritativeForTest);
-    EXPECT_TRUE(report.deferred);
+    EXPECT_FALSE(report.deferred);
     EXPECT_EQ(backend->getCount(log_key), 0u);
     EXPECT_EQ(backend->deleteTotal(), 0u);
 }
 
-/// The unknown-life gate covers every immutable stream kind, not only logs. A snapshot-only life does
-/// not contribute `changed_shards`, so forcing fold-every-round makes this test distinguish the safety
-/// defer from the ordinary idle-round optimization.
-TEST(CasGcRoundDefer, SnapshotLifeAbsentFromThePreListCatalogCutDefersTheRound)
+/// The post-LIST cut classifies every immutable stream kind, not only logs. A snapshot belonging to a
+/// life absent from that later cut is inert debris and its body is not read.
+TEST(CasGcRoundDefer, SnapshotLifeAbsentFromThePostListCatalogCutIsInertDebris)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -212,27 +211,8 @@ TEST(CasGcRoundDefer, SnapshotLifeAbsentFromThePreListCatalogCutDefersTheRound)
 
     Gc gc(store, kGc);
     const RoundReport report = gc.runRegularRound({}, /*allow_steal=*/true, UniversePolicy::AuthoritativeForTest);
-    EXPECT_TRUE(report.deferred);
+    EXPECT_FALSE(report.deferred);
     EXPECT_EQ(backend->getCount(snapshot_key), 0u);
-    EXPECT_EQ(backend->deleteTotal(), 0u);
-}
-
-TEST(CasGcRoundDefer, CleanupLifeAbsentFromThePreListCatalogCutDefersTheRound)
-{
-    auto backend = std::make_shared<CountingBackend>();
-    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
-    const Layout & layout = store->layout();
-    const NamespaceLifeId unknown = NamespaceLifeId::fromCatalogEntry(
-        RootNamespace{"cannot-authorize"}, UInt128{0x458});
-    const String cleanup_key = layout.refCleanupMarkerKey(unknown, RefTxnId{1, 1});
-    ASSERT_EQ(backend->putIfAbsent(cleanup_key, "not-read-on-defer").outcome, PutOutcome::Done);
-    backend->resetCounts();
-
-    Gc gc(store, kGc);
-    const RoundReport report = gc.runRegularRound(
-        {}, /*allow_steal=*/true, UniversePolicy::AuthoritativeForTest);
-    EXPECT_TRUE(report.deferred);
-    EXPECT_EQ(backend->getCount(cleanup_key), 0u);
     EXPECT_EQ(backend->deleteTotal(), 0u);
 }
 

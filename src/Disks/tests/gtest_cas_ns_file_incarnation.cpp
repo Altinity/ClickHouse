@@ -6,9 +6,11 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 #include "cas_test_helpers.h"
+#include <algorithm>
 
 namespace DB::ErrorCodes
 {
+    extern const int LOGICAL_ERROR;
     extern const int UNKNOWN_FORMAT_VERSION;
 }
 
@@ -62,39 +64,37 @@ void admitLifeAt(Backend & backend, const Layout & layout, const RootNamespace &
     CasRefCatalog::casAdmitEntry(backend, layout, entry);
 }
 
-/// Delete `ns`'s catalog entry, which is what makes the name available again.
-///
-/// THE SEAM, STATED: this models the entry-delete half of the removal lifecycle that Task 5 owns. It
-/// goes through the PUBLIC `casUpdate` primitive -- the same token-CAS loop every production transition
-/// rides -- rather than rewriting the catalog object's bytes, so the catalog's grammar and ordering
-/// checks run exactly as they will for the production caller. What is NOT yet drivable end-to-end is
-/// `dropNamespace` reaching this point by itself: today it leaves the entry in place, so a same-name
-/// rebirth reuses the SAME incarnation and no second life exists to test. That arrives with Task 5;
-/// until it does, this function is the only way to construct the two-lives shape at all.
+/// Complete the catalog-only half of removal through the production exact-deletion authority. This
+/// fixture supplies the adopted-parent evidence that a real prior fold would have made durable.
 void retireCatalogEntry(Backend & backend, const Layout & layout, const RootNamespace & ns)
 {
     CasRefCatalog::casUpdate(backend, layout, [&](const RefCatalog & current)
     {
-        RefCatalog next;
-        for (const CatalogEntry & entry : current.entries)
-            if (entry.ns.string() != ns.string())
-                next.entries.push_back(entry);
+        RefCatalog next = current;
+        const auto it = std::find_if(next.entries.begin(), next.entries.end(), [&](const CatalogEntry & entry)
+        {
+            return entry.ns == ns;
+        });
+        if (it == next.entries.end())
+            throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "Missing fixture catalog entry '{}'", ns.string());
+        it->state = NsState::Removing;
+        it->removal_started_round = 1;
         return next;
     });
-}
 
-/// Every key the backend was asked about that sits under ANY life's files prefix. The assertion this
-/// serves is "the operation never looked", so it spans every recorded operation family (head, get,
-/// put, overwrite, CAS, delete, list) rather than LIST alone: a HEAD of a file key would be just as
-/// much a physical-emptiness probe as a LIST of the prefix, and reporting the offending keys by name
-/// is what makes a failure diagnosable.
-std::vector<String> filesKeysTouched(const CountingBackend & backend)
-{
-    std::vector<String> touched;
-    for (const String & key : backend.touchedKeys())
-        if (key.find("/_files/") != String::npos)
-            touched.push_back(key);
-    return touched;
+    const CasRefCatalog::Snapshot snapshot = CasRefCatalog::read(backend, layout);
+    const auto it = std::find_if(snapshot.catalog.entries.begin(), snapshot.catalog.entries.end(), [&](const CatalogEntry & entry)
+    {
+        return entry.ns == ns;
+    });
+    ASSERT_NE(it, snapshot.catalog.entries.end());
+    CasFoldSeal parent;
+    parent.ref_lives.emplace(it->incarnation, RefLifeFoldState{
+        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{1, 1}},
+        .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 1}}});
+    ASSERT_EQ(CasRefCatalog::deleteCompletedRemoving(
+        backend, layout, *it, parent, 1, [](uint64_t) {}),
+        CasRefCatalog::CompletedRemovingDeleteOutcome::Deleted);
 }
 
 }
@@ -144,6 +144,58 @@ TEST(CasNsFileIncarnation, OldFileHiddenByListIsInvisibleAfterRebirth)
     EXPECT_EQ(still_there->bytes, "1\n") << "the leak is a storage leak: the bytes are intact and inert";
 }
 
+/// The non-minting reader assignment site accepts exactly a catalog `Live` row. `Creating`,
+/// `Removing`, and absence neither install a runtime life nor mutate durable catalog/stream state.
+TEST(CasNsFileIncarnation, FreshReaderAssignsOnlyLiveCatalogLifeWithoutMutation)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    PoolPtr store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace creating{"00/creating@cas@"};
+    const RootNamespace live{"00/live@cas@"};
+    const RootNamespace removing{"00/removing@cas@"};
+    const RootNamespace absent{"00/absent@cas@"};
+
+    CasRefCatalog::casAdmitEntry(*backend, layout, CatalogEntry{
+        .ns = creating,
+        .state = NsState::Creating,
+        .incarnation = UInt128{31},
+        .creator = CreatorFence{.server_root_id = "foreign", .writer_epoch = 7, .fence_generation = 1}});
+    CasRefCatalog::casAdmitEntry(*backend, layout, CatalogEntry{
+        .ns = live, .state = NsState::Live, .incarnation = UInt128{32}});
+    CasRefCatalog::casAdmitEntry(*backend, layout, CatalogEntry{
+        .ns = removing, .state = NsState::Live, .incarnation = UInt128{33}});
+    CasRefCatalog::casUpdate(*backend, layout, [&](const RefCatalog & current)
+    {
+        RefCatalog next = current;
+        const auto it = std::find_if(next.entries.begin(), next.entries.end(), [&](const CatalogEntry & entry)
+        {
+            return entry.ns == removing;
+        });
+        chassert(it != next.entries.end());
+        it->state = NsState::Removing;
+        it->removal_started_round = 1;
+        return next;
+    });
+
+    backend->resetCounts();
+    EXPECT_FALSE(store->namespaceFilesLifeIfReadable(creating));
+    EXPECT_FALSE(store->namespaceFilesLifeIfReadable(removing));
+    EXPECT_FALSE(store->namespaceFilesLifeIfReadable(absent));
+    const std::optional<NamespaceLifeId> readable = store->namespaceFilesLifeIfReadable(live);
+    ASSERT_TRUE(readable);
+    EXPECT_EQ(readable->incarnation, UInt128{32});
+
+    EXPECT_FALSE(store->refTableLifeForTest(creating));
+    EXPECT_FALSE(store->refTableLifeForTest(removing));
+    EXPECT_FALSE(store->refTableLifeForTest(absent));
+    ASSERT_TRUE(store->refTableLifeForTest(live));
+    EXPECT_EQ(store->refTableLifeForTest(live)->incarnation, UInt128{32});
+    EXPECT_EQ(backend->putTotal(), 0u);
+    EXPECT_EQ(backend->putOverwriteTotal(), 0u);
+    EXPECT_EQ(backend->casPutTotal(), 0u);
+}
+
 /// Rebirth does not wait for the previous life's files to be physically gone. Driven through the thing
 /// that actually made it wait -- the `Pending -> Completed` promotion in a real GC round, which is the
 /// precondition a name's reuse is gated on -- with `_files` debris present throughout.
@@ -175,55 +227,16 @@ TEST(CasNsFileIncarnation, RebirthDoesNotWaitForFilesToBeEmpty)
     Gc gc(store, kGcId);
     gc.runRegularRound();
 
-    /// The item must be COMPLETED -- the name is reusable -- even though files are still on the store.
+    /// Folding the terminal records positive evidence on the same life row even though files remain.
     const GcState state = decodeGcState(backend->get(layout.gcStateKey())->bytes);
     ASSERT_GT(state.snap_generation, 0u);
     const CasFoldSeal seal = decodeFoldSeal(
         backend->get(layout.foldSealKey(state.snap_generation, state.snap_attempt))->bytes);
-    ASSERT_EQ(seal.ns_cleanup_items.size(), 1u) << "the removal must have produced exactly one item";
-    EXPECT_EQ(seal.ns_cleanup_items.begin()->second.state, RefNsCleanupState::Completed)
-        << "a namespace's cleanup must complete with files still present -- rebirth waits for no file";
-}
-
-/// White-box on the `Pending -> Completed` emptiness predicate itself: with files under the namespace
-/// and no manifests it answers EMPTY, and it does not so much as LIST the files prefix to decide. The
-/// files arm of this probe WAS the physical-empty proof the directive forbids rebirth from waiting on,
-/// so it is deleted rather than weakened; the manifest arm, unchanged by this task, still answers
-/// truthfully.
-TEST(CasNsFileIncarnation, PhysicalEmptyProofIgnoresFiles)
-{
-    auto backend = std::make_shared<CountingBackend>();
-    PoolPtr store = openPoolForTest(backend);
-    const Layout & layout = store->layout();
-    const RootNamespace ns{kNsString};
-
-    admitLifeAt(*backend, layout, ns, kInc1);
-    const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(ns, kInc1);
-    store->putNamespaceFile(life, kFile, "1\n");
-    ASSERT_FALSE(store->listNamespaceFiles(life).empty()) << "precondition: the debris is really there";
-
-    Gc gc(store, kGcId);
-    backend->resetCounts();
-    EXPECT_TRUE(gc.namespaceManifestsPhysicallyEmptyForTest(ns))
-        << "files must not hold the completion gate open";
-
-    /// Not merely "answers empty" but "never looked": the deleted arm was a LIST, and a HEAD of a file
-    /// key would be the same proof by another request, so the whole `_files` key space is checked.
-    ///
-    /// THE LINE BELOW IS THE SENSITIVE ONE, and the `listCount` after it is not: the deleted arm listed
-    /// the SENTINEL's files prefix, so a check naming this life's prefix would have passed before this
-    /// change too. Do not lean on it as the regression detector.
-    EXPECT_EQ(filesKeysTouched(*backend), std::vector<String>{})
-        << "the predicate must not probe ANY files key";
-    EXPECT_EQ(backend->listCount(layout.namespaceFilesPrefix(life)), 0u);
-
-    /// The positive control, and the reason this is not a test that the predicate always says yes: a
-    /// manifest body under the same namespace still holds it closed.
-    writeManifestRaw(*backend, layout, ns,
-        ManifestRef{.writer_epoch = 1, .build_sequence = 1, .manifest_ordinal = 1},
-        {blobEntryFor("a", DB::UInt128(1))});
-    EXPECT_FALSE(gc.namespaceManifestsPhysicallyEmptyForTest(ns))
-        << "the manifest arm is unchanged by this task and must still answer truthfully";
+    const auto row_it = seal.ref_lives.find(life.incarnation);
+    ASSERT_NE(row_it, seal.ref_lives.end());
+    ASSERT_TRUE(row_it->second.cleanup_evidence.has_value());
+    EXPECT_EQ(row_it->second.cleanup_evidence->remove_txn_id, (RefTxnId{1, 1}));
+    EXPECT_TRUE(backend->head(debris_key).exists) << "cleanup evidence does not gate on physical deletion";
 }
 
 /// An old-format pool carrying unqualified `roots/<ns>/_files/x` keys is REFUSED AT OPEN. It is not
@@ -247,7 +260,7 @@ TEST(CasNsFileIncarnation, LegacyUnqualifiedFileKeyIsRefusedAtOpen)
     meta.min_reader_generation = kNamespaceLifeKeyedGeneration - 1;
     meta.algos_used = {static_cast<uint8_t>(BlobHashAlgo::CityHash128)};
     String encoded = encodePoolMeta(meta);
-    const String current_v = "\"v\":" + std::to_string(kOpaqueNamespaceLifeLayoutGeneration);
+    const String current_v = "\"v\":" + std::to_string(G_BUILD);
     const String legacy_v = "\"v\":" + std::to_string(kNamespaceLifeKeyedGeneration);
     const size_t at = encoded.find(current_v);
     /// Guard the substitution itself: a silent no-op here would leave a CURRENT-generation pool and the

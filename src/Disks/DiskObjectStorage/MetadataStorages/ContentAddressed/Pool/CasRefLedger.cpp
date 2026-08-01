@@ -1,4 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
@@ -489,11 +490,82 @@ ConfirmAnswer CasRefLedger::confirmExactRef(const RootNamespace & ns, const Stri
 
 std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::getRefTableRuntime(const RootNamespace & ns)
 {
-    std::lock_guard lock(ref_queue_mutex);
-    auto & slot = ref_tables[ns.string()];
-    if (!slot)
-        slot = std::make_shared<RefTableRuntime>();
-    return slot;
+    std::shared_ptr<RefTableRuntime> rt;
+    {
+        std::lock_guard lock(ref_queue_mutex);
+        auto & slot = ref_tables[ns.string()];
+        if (!slot)
+            slot = std::make_shared<RefTableRuntime>();
+        rt = slot;
+    }
+    prepareInvalidatedRuntimeForReuse(rt);
+    return rt;
+}
+
+void CasRefLedger::prepareInvalidatedRuntimeForReuse(const std::shared_ptr<RefTableRuntime> & rt)
+{
+    if (!rt->catalog_life_invalidated.load(std::memory_order_acquire))
+        return;
+
+    /// No newly admitted positive item can appear here: the removal admission gate stays closed until
+    /// this reset clears it. Old admitted work and the terminal owner drain before the catalog delete;
+    /// the wait also makes the invariant explicit and protects against a caller that already held `rt`.
+    std::unique_lock queue_lock(ref_queue_mutex);
+    rt->cv.wait(queue_lock, [&]
+    {
+        return !rt->leader_active && rt->pending.empty();
+    });
+
+    std::unique_lock state_lock(rt->state_mutex);
+    rt->recovery_cv.wait(state_lock, [&] { return !rt->recovery_in_progress; });
+    rt->publish_settle_cv.wait(state_lock, [&]
+    {
+        return rt->pending_snapshot_publishes.load(std::memory_order_acquire) == 0;
+    });
+
+    if (!rt->catalog_life_invalidated.load(std::memory_order_acquire))
+        return;   /// another waiter already reset this same runtime
+
+    rt->recovered = false;
+    rt->life.reset();
+    rt->state = RefTableState{};
+    rt->append_attempt.reset();
+    rt->lane_state = RefLaneState::Ready;
+    rt->last_epoch_seal.reset();
+    rt->recovery_restarts = 0;
+    rt->snapshot_budget = 0;
+    rt->removal_budget = 0;
+    rt->tail_count_since_snapshot.store(0, std::memory_order_relaxed);
+    rt->tail_bytes_since_snapshot.store(0, std::memory_order_relaxed);
+    rt->newest_snapshot_id.reset();
+    rt->base_snapshot_bytes.store(0, std::memory_order_relaxed);
+    rt->needs_stale_precommit_sweep = false;
+    rt->precommit_sweep_backoff_until_ms = 0;
+    rt->precommit_sweep_backoff_ms = 0;
+    rt->publish_backoff_until_ms = 0;
+    rt->publish_backoff_ms = 0;
+    rt->removal_admission_closed = false;
+    rt->catalog_life_invalidated.store(false, std::memory_order_release);
+}
+
+void CasRefLedger::invalidateRemovedCatalogLife(const NamespaceLifeId & life)
+{
+    std::shared_ptr<RefTableRuntime> rt;
+    {
+        std::lock_guard lock(ref_queue_mutex);
+        const auto it = ref_tables.find(life.ns.string());
+        if (it == ref_tables.end())
+            return;
+        rt = it->second;
+    }
+
+    /// Do not call `getRefTableRuntime`: invalidation must neither materialize a cache entry nor run
+    /// the reset on GC's thread. Publishing this bit is sufficient; the next name-based caller joins
+    /// every old user and resets the SAME object before it can resolve through the catalog again.
+    rt->catalog_life_invalidated.store(true, std::memory_order_release);
+    rt->cv.notify_all();
+    rt->recovery_cv.notify_all();
+    rt->publish_settle_cv.notify_all();
 }
 
 std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::pinRefTableRuntimeToLife(
@@ -573,13 +645,12 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
     checkRecoveryStillAdmitted(ns, rt, cancelled);
 
     /// ---- Step 3: ONE hint LIST ----
-    /// A HINT, and nothing more. It seeds the base-snapshot candidate, supplies the `_cleanup` markers
-    /// (which have no arithmetic derivation at all), and offers witnesses for the hole check below. Its
+    /// A HINT, and nothing more. It seeds the base-snapshot candidate and offers witnesses for the hole
+    /// check below. Its
     /// COMPLETENESS is never assumed: every id the walk cares about is fetched by exact key, so an
     /// omission costs one `GET` and changes no outcome.
     std::optional<RefTxnId> greatest_listed_snapshot;
     std::vector<RefTxnId> hint_log_ids;
-    std::set<RefTxnId> cleanup_markers;
     {
         const String prefix = layout.namespaceStreamPrefix(life);
         String cursor;
@@ -597,9 +668,6 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
                     continue;
                 switch (parsed->kind)
                 {
-                    case RefObjectKind::Cleanup:
-                        cleanup_markers.insert(parsed->txn_id);
-                        break;
                     case RefObjectKind::Log:
                         hint_log_ids.push_back(parsed->txn_id);
                         break;
@@ -909,7 +977,6 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
     /// per-item/shape-check copy on it) deep-copy an N-row overlay. The O(N) fold rides inside recovery,
     /// which is already O(N).
     result.state.materializeCommitted();
-    result.cleanup_markers = std::move(cleanup_markers);
     /// Stale-precommit cleanup is dispatched once, from `appendRefOps`'s top level (never from here --
     /// this call may itself be nested inside a queue leader's flush stack).
     result.needs_stale_precommit_sweep = true;
@@ -944,7 +1011,8 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
 }
 
 NamespaceLifeId CasRefLedger::resolveNamespaceLife(
-    const RootNamespace & ns, uint64_t admitted_generation, uint64_t live_epoch)
+    const RootNamespace & ns, uint64_t admitted_generation, uint64_t live_epoch,
+    bool * lifecycle_refusal)
 {
     /// Bounded exactly like `CasRefCatalog::casUpdateImpl`'s own live-lock brake, but against THIS
     /// loop's re-read cycle only -- every primitive called below already bounds its OWN retry against
@@ -977,11 +1045,17 @@ NamespaceLifeId CasRefLedger::resolveNamespaceLife(
             continue;   /// Live or Superseded: re-read (Superseded means a DIFFERENT actor won birth)
         }
 
-        if (it->state != NsState::Creating)
-            /// `Live` or `Removing`: both already carry a settled, nonzero incarnation, and this
-            /// resolution only needs A life to key ref-layer objects with -- refusing new ownership of
-            /// a `Removing` namespace is Task 6's read-side contract, not this call's job.
+        if (it->state == NsState::Live)
             return NamespaceLifeId::fromCatalogEntry(it->ns, it->incarnation);
+
+        if (it->state == NsState::Removing)
+        {
+            if (lifecycle_refusal)
+                *lifecycle_refusal = true;
+            throwCasWriteRetryLater(fmt::format(
+                "CAS namespace '{}' is Removing: creation waits for its terminal fold and catalog "
+                "removal to complete; retry later", ns.string()));
+        }
 
         /// `Creating`, with a strict-grammar creator fence (`CatalogEntry`'s own invariant guarantees
         /// `it->creator` is set whenever `state == Creating`). If it names THIS mount's own currently
@@ -1032,6 +1106,8 @@ NamespaceLifeId CasRefLedger::resolveNamespaceLife(
                 continue;   /// Live or Superseded: re-read either way
             }
             case CasRefCatalog::ReconcileCreatorOutcome::CreatorFenceStillLive:
+                if (lifecycle_refusal)
+                    *lifecycle_refusal = true;
                 throwCasWriteRetryLater(fmt::format(
                     "CAS ref-table recovery for namespace '{}': its catalog entry is still Creating "
                     "under a creator fence that is not yet provably dead; retry later", ns.string()));
@@ -1106,6 +1182,7 @@ void CasRefLedger::ensureRefTableRecovered(const RootNamespace & ns, RefTableRun
     uint64_t recovery_retry_num = 0;
     bool vanish_brake_tripped = false;
     bool cancelled = false;
+    bool lifecycle_refusal = false;
     for (;;)
     {
         try
@@ -1128,7 +1205,7 @@ void CasRefLedger::ensureRefTableRecovered(const RootNamespace & ns, RefTableRun
                 std::optional<NamespaceLifeId> resolved;
                 try
                 {
-                    resolved = resolveNamespaceLife(ns, admitted_generation, live_epoch);
+                    resolved = resolveNamespaceLife(ns, admitted_generation, live_epoch, &lifecycle_refusal);
                 }
                 catch (...)
                 {
@@ -1232,7 +1309,7 @@ void CasRefLedger::ensureRefTableRecovered(const RootNamespace & ns, RefTableRun
             /// retry-later class (the caller should retry, against the FRESH incarnation), so without the
             /// latch this loop would read it as a transient blip and re-drive the very work the remount
             /// just stopped.
-            if (vanish_brake_tripped || cancelled || !isTransientRecoveryError(code))
+            if (vanish_brake_tripped || cancelled || lifecycle_refusal || !isTransientRecoveryError(code))
                 throw;   /// a latched terminal case, or a non-transient failure -- fail fast
 
             const uint64_t elapsed_ms = boot_ms_now_fn() - recovery_start_ms;
@@ -1318,7 +1395,13 @@ bool CasRefLedger::recoverRefTableIfNamespaceExists(const RootNamespace & ns, Re
             /// re-check `rt.life` -- a concurrent caller may have resolved it in the meantime, and the
             /// first resolution wins rather than being overwritten.
             lock.unlock();
-            const std::optional<NamespaceLifeId> cataloged = CasRefCatalog::lifeIfCataloged(backend, layout, ns);
+            const CasRefCatalog::Snapshot catalog = CasRefCatalog::read(backend, layout);
+            const auto entry_it = std::find_if(catalog.catalog.entries.begin(), catalog.catalog.entries.end(),
+                [&](const CatalogEntry & entry) { return entry.ns == ns; });
+            const std::optional<NamespaceLifeId> cataloged
+                = entry_it != catalog.catalog.entries.end() && entry_it->state == NsState::Live
+                ? std::optional<NamespaceLifeId>{NamespaceLifeId::fromCatalogEntry(entry_it->ns, entry_it->incarnation)}
+                : std::nullopt;
             lock.lock();
             if (!rt.life)
             {
@@ -1340,7 +1423,6 @@ void CasRefLedger::installRecoveryResult(RefTableRuntime & rt, RecoveryResult &&
     /// throughout and the function-scope SCOPE_EXIT notifies `recovery_cv` only after this returns, so a
     /// parked waiter re-checking `recovered` under the same lock sees a fully-installed table or none.
     rt.state = std::move(result.state);
-    rt.cleanup_markers = std::move(result.cleanup_markers);
     rt.newest_snapshot_id = result.newest_snapshot_id;
     /// The chain link the CAS-walk ended on -- the `prev_epoch_seal` this table's next sequence-1 append
     /// must name. This is the PRODUCTION producer of `last_epoch_seal` (the two writer-side arms record
@@ -1671,38 +1753,23 @@ bool CasRefLedger::drainRefLanesForShutdown(uint64_t wait_budget_ms)
 }
 
 
-bool CasRefLedger::observedNamespaceCleanupMarker(const RootNamespace & ns, const RefTxnId & remove_txn_id)
-{
-    const auto rt = getRefTableRuntime(ns);
-    ensureRefTableRecovered(ns, *rt);
-    std::lock_guard lock(rt->state_mutex);
-    if (rt->cleanup_markers.contains(remove_txn_id))
-        return true;
-
-    /// Warm-mount re-observation: the recovery `LIST` that populated `cleanup_markers` may have
-    /// run BEFORE GC's namespace-cleanup item published the `_cleanup/<remove_txn_id>` marker, so a
-    /// warm-mounted writer that dropped a namespace and recreates it within the same mount lifetime would
-    /// otherwise be rejected until it remounts. Do ONE exact-key backend check of the marker before
-    /// answering; if it is durably present now, adopt it into the cached set. This preserves fail-close
-    /// (a still-absent marker keeps recreation rejected -- evidence is refreshed, never assumed) and
-    /// matches the recovery restart-on-vanish philosophy of consulting the durable object on a cache miss.
-    chassert(rt->life);
-    const HeadResult head = backend.head(layout.refCleanupMarkerKey(*rt->life, remove_txn_id));
-    if (head.exists)
-    {
-        rt->cleanup_markers.insert(remove_txn_id);
-        return true;
-    }
-    return false;
-}
-
-
 RefTxnId CasRefLedger::appendRefOps(const RootNamespace & ns, MutationScope scope,
                              std::function<std::vector<RefOp>(const RefTableState &)> build_ops,
                              RootMutationOrigin origin, RootMutationKind kind,
                              bool skip_stale_precommit_sweep)
 {
     const auto rt = getRefTableRuntime(ns);
+    const auto refuse_if_removing = [&]
+    {
+        std::lock_guard<std::mutex> lock(ref_queue_mutex);
+        if (rt->removal_admission_closed && kind != RootMutationKind::DropNamespace)
+            throwCasWriteRetryLater(fmt::format(
+                "CAS namespace '{}' is Removing: positive ref mutation admission is closed while "
+                "its terminal fold and catalog removal complete; retry later", ns.string()));
+    };
+    /// Check before recovery/maintenance so a known-Removing runtime cannot spend an object-store
+    /// mutation on behalf of an operation it is already required to refuse.
+    refuse_if_removing();
     /// Hoisted here (rather than left to `flushRefBatch`'s own idempotent call) so both
     /// triggers below run on the CALLING thread, strictly BEFORE this call enqueues its own item or
     /// becomes a queue leader -- `maybeSweepStalePrecommits`'s own nested `appendRefOps` calls are
@@ -1728,6 +1795,10 @@ RefTxnId CasRefLedger::appendRefOps(const RootNamespace & ns, MutationScope scop
         throwCasWriteRetryLater(fmt::format(
             "CAS store is shutting down — refusing to append ref-log transactions for server_root '{}'",
             config.server_root_id));
+    if (rt->removal_admission_closed && kind != RootMutationKind::DropNamespace)
+        throwCasWriteRetryLater(fmt::format(
+            "CAS namespace '{}' is Removing: positive ref mutation admission is closed while its "
+            "terminal fold and catalog removal complete; retry later", ns.string()));
     rt->pending.push_back(item);
 
     while (!item->done)
@@ -2835,6 +2906,51 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
     };
     const auto fence_ok = [this, &rt] { return fence_ok_fn() && !rt->superseded_by_remount.load(std::memory_order_acquire); };
 
+    const bool positive_append = std::any_of(chunk_ops.begin(), chunk_ops.end(), [](const RefOp & op)
+    {
+        return (op.kind == RefOpKind::OwnerTransition && op.new_binding.has_value())
+            || op.kind == RefOpKind::SetPublishedAt;
+    });
+
+    /// The pre-carve seam is above this call, so this is the final catalog admission observation before
+    /// id allocation. It closes the cached-runtime window in which another actor publishes `Removing`
+    /// after this writer's ordinary entry gates. A non-`Live` exact row permanently closes this local
+    /// positive lane; the terminal owner-removal transaction remains the one deliberate exception.
+    if (positive_append)
+    {
+        try
+        {
+            const uint64_t admitted_generation = fence_generation_fn();
+            const CasRefCatalog::Snapshot catalog = CasRefCatalog::read(backend, layout);
+            check_fence_or_throw(admitted_generation);
+            const NamespaceLifeId life = [&]
+            {
+                std::lock_guard state_lock(rt->state_mutex);
+                return lifeUnderLock(ns, *rt);
+            }();
+            const auto entry_it = std::find_if(catalog.catalog.entries.begin(), catalog.catalog.entries.end(),
+                [&](const CatalogEntry & entry)
+                {
+                    return entry.ns == ns && entry.incarnation == life.incarnation;
+                });
+            if (entry_it == catalog.catalog.entries.end() || entry_it->state != NsState::Live)
+            {
+                {
+                    std::lock_guard queue_lock(ref_queue_mutex);
+                    rt->removal_admission_closed = true;
+                }
+                throwCasWriteRetryLater(fmt::format(
+                    "CAS ref-log append for namespace '{}': exact catalog life is no longer Live",
+                    ns.string()));
+            }
+        }
+        catch (...)
+        {
+            complete_error(chunk_survivors, std::current_exception());
+            return false;
+        }
+    }
+
     /// Self-remount re-check BEFORE allocating an id: the top-of-flush gate
     /// is passed once, but a leader can stall between it and here -- in `build_ops`' caller I/O -- across
     /// the whole fence-loss + remount window, then resume after `armMountFence`. Allocating {new_epoch,
@@ -3712,7 +3828,7 @@ bool CasRefLedger::trySnapshotPublishOnce(const RootNamespace & ns)
         if (rt->lane_state != RefLaneState::Ready)
             blocked_lane = rt->lane_state;
         else if (rt->state.getLifecycle() != RefLifecycle::Live)
-            return false;   /// nothing to (re)publish here; dropNamespace publishes its own Removed snapshot
+            return false;   /// terminal state is never snapshotted; dead-life cleanup is janitor work
         else if (rt->newest_snapshot_id && !(*rt->newest_snapshot_id < rt->state.getGreatestApplied()))
             return false;   /// nothing above the newest snapshot
         else
@@ -3837,10 +3953,7 @@ bool CasRefLedger::trySnapshotPublishOnce(const RootNamespace & ns)
         /// snapshot would then omit committed transactions and recovery would lose refs. Skip the
         /// in-memory adoption (and the counter subtraction below) whenever a newer-or-equal snapshot is
         /// already adopted; the already-durable `_snap/<candidate_x>` object is harmless (readers pick
-        /// the greatest snapshot, GC reclaims covered ones). This also keeps the Removed path monotonic:
-        /// a stale Live attempt can never drag `newest_snapshot_id` back below a `remove_txn_id` that
-        /// `publishRemovedSnapshotNow` already adopted (`remove_txn_id` is allocated after every Live
-        /// txn, so it is always the greatest and this guard trips).
+        /// the greatest snapshot, GC reclaims covered ones).
         if (rt->newest_snapshot_id && !(*rt->newest_snapshot_id < candidate_x))
             return true;
         /// Subtract exactly the counters captured at copy time
@@ -4041,39 +4154,6 @@ void CasRefLedger::sweepStalePrecommitsNow(const RootNamespace & ns, const std::
 }
 
 
-void CasRefLedger::publishRemovedSnapshotNow(const RootNamespace & ns)
-{
-    const auto rt = getRefTableRuntime(ns);
-    RefTxnId remove_id;
-    {
-        std::lock_guard lock(rt->state_mutex);
-        if (rt->state.getLifecycle() != RefLifecycle::Removed || !rt->state.getRemoveTxnId())
-            return;
-        remove_id = *rt->state.getRemoveTxnId();
-        if (rt->newest_snapshot_id && *rt->newest_snapshot_id == remove_id)
-            return;   /// already published this exact Removed snapshot
-    }
-
-    RefTableSnapshot removed_snap;
-    removed_snap.ns = ns.string();
-    removed_snap.snapshot_id = remove_id;
-    removed_snap.lifecycle = RefLifecycle::Removed;
-    removed_snap.remove_txn_id = remove_id;
-    const String bytes = sealObject(FormatId::RefSnapshot, encodeRefTableSnapshot(removed_snap));
-    chassert(rt->life);
-    const String key = layout.refSnapshotKey(*rt->life, remove_id);
-    const auto fence_ok = [this] { return fence_ok_fn(); };
-    const CasWriteOutcome outcome = ref_request_controller->putIfAbsentControlled(key, bytes, fence_ok);
-    if (outcome != CasWriteOutcome::Committed)
-        return;   /// best-effort; namespace cleanup republishes it idempotently later
-
-    std::lock_guard lock(rt->state_mutex);
-    rt->newest_snapshot_id = remove_id;
-    rt->tail_count_since_snapshot.store(0, std::memory_order_relaxed);
-    rt->tail_bytes_since_snapshot.store(0, std::memory_order_relaxed);
-}
-
-
 void CasRefLedger::dropRef(const RootNamespace & ns, const String & ref_name)
 {
     /// One `owner_transition` removal ref-log transaction. The
@@ -4150,25 +4230,6 @@ void CasRefLedger::updateRefPublishedAt(const RootNamespace & ns, const String &
 }
 
 
-bool CasRefLedger::namespaceIsRemoved(const RootNamespace & ns)
-{
-    const auto rt = getRefTableRuntime(ns);
-    ensureRefTableRecovered(ns, *rt);
-    std::lock_guard<std::mutex> lock(rt->state_mutex);
-    /// A genuinely-removed namespace is `Removed` WITH a `remove_txn_id` (RemoveNamespace sets both). The
-    /// never-born default is also `Removed` but carries no `remove_txn_id`, and a recreated one is `Live`
-    /// (NamespaceBirth resets the marker) — so `remove_txn_id.has_value()` is the exact born-then-removed
-    /// discriminator, matching promote's own `state.getRemoveTxnId()` recreation guard.
-    return rt->state.getLifecycle() != RefLifecycle::Live && rt->state.getRemoveTxnId().has_value();
-}
-
-bool CasRefLedger::namespaceIsRemoved(const NamespaceLifeId & life)
-{
-    (void)pinRefTableRuntimeToLife(life);
-    return namespaceIsRemoved(life.ns);
-}
-
-
 NamespaceLifeId CasRefLedger::lifeUnderLock(const RootNamespace & ns, const RefTableRuntime & rt) const
 {
     /// `ensureRefTableRecovered` resolves `life` before it walks anything and never clears it, so a
@@ -4184,9 +4245,53 @@ NamespaceLifeId CasRefLedger::lifeUnderLock(const RootNamespace & ns, const RefT
 NamespaceLifeId CasRefLedger::namespaceLife(const RootNamespace & ns)
 {
     const auto rt = getRefTableRuntime(ns);
+    const auto refuse_if_removing = [&]
+    {
+        std::lock_guard<std::mutex> queue_lock(ref_queue_mutex);
+        if (rt->removal_admission_closed)
+            throwCasWriteRetryLater(fmt::format(
+                "CAS namespace '{}' is Removing: creation waits for its terminal fold and catalog "
+                "removal to complete; retry later", ns.string()));
+    };
+    refuse_if_removing();
+
+    /// Classify an unresolved catalog row before entering recovery. A recovery failure is normally
+    /// retried inside its bounded transient-I/O loop; lifecycle refusal is not an object-store outage
+    /// and must return immediately. A `Live` observation can pin the same physical handle recovery
+    /// would resolve. A `Creating` observation gets exactly one resolution attempt here: a terminal
+    /// foreign creator is reconciled normally, while a still-live creator returns retry-later once
+    /// instead of spending the recovery retry budget repeating the same fence decision. Only an absent
+    /// row reaches recovery unresolved, where the ordinary catalog-first birth path owns it.
+    {
+        std::unique_lock state_lock(rt->state_mutex);
+        if (!rt->life)
+        {
+            state_lock.unlock();
+            const CasRefCatalog::Snapshot catalog = CasRefCatalog::read(backend, layout);
+            const auto entry_it = std::find_if(catalog.catalog.entries.begin(), catalog.catalog.entries.end(),
+                [&](const CatalogEntry & entry) { return entry.ns == ns; });
+            if (entry_it != catalog.catalog.entries.end() && entry_it->state == NsState::Removing)
+                throwCasWriteRetryLater(fmt::format(
+                    "CAS namespace '{}' is Removing: creation waits for its terminal fold and catalog "
+                    "removal to complete; retry later", ns.string()));
+            std::optional<NamespaceLifeId> resolved_creating;
+            if (entry_it != catalog.catalog.entries.end() && entry_it->state == NsState::Creating)
+            {
+                const uint64_t admitted_generation = fence_generation_fn();
+                resolved_creating = resolveNamespaceLife(ns, admitted_generation, live_epoch_fn());
+                check_fence_or_throw(admitted_generation);
+            }
+            state_lock.lock();
+            if (!rt->life && entry_it != catalog.catalog.entries.end() && entry_it->state == NsState::Live)
+                rt->life = NamespaceLifeId::fromCatalogEntry(entry_it->ns, entry_it->incarnation);
+            if (!rt->life && resolved_creating)
+                rt->life = *resolved_creating;
+        }
+    }
     /// MINTS when the catalog names no entry, via recovery's step 0 -- deliberately, and only here: a
     /// write may legitimately be a namespace's birth.
     ensureRefTableRecovered(ns, *rt);
+    refuse_if_removing();
     std::lock_guard<std::mutex> lock(rt->state_mutex);
     return lifeUnderLock(ns, *rt);
 }
@@ -4196,17 +4301,14 @@ std::optional<NamespaceLifeId> CasRefLedger::namespaceFilesLifeIfReadable(const 
     const auto rt = getRefTableRuntime(ns);
 
     /// A namespace the catalog does not name has no files to read, and a read or an unlink is the wrong
-    /// event to bring one into existence on. What the catalog cannot answer is whether the files are
-    /// still READABLE: `dropNamespace` records removal in the ref state and leaves the catalog entry
-    /// `Live`, so the born-then-dropped fact lives in the recovered state and nowhere else -- hence a
-    /// recovery, and hence a non-minting one.
+    /// event to bring one into existence on. Fresh resolution admits only a catalog `Live` row;
+    /// `Creating`, `Removing` and absent all answer absent without recovery or mutation.
     if (!recoverRefTableIfNamespaceExists(ns, *rt))
         return std::nullopt;
 
     std::lock_guard<std::mutex> lock(rt->state_mutex);
-    /// The removed discriminator is `namespaceIsRemoved`'s, unchanged and for its reasons: `Removed` WITH
-    /// a `remove_txn_id` is born-then-dropped, while the never-born default carries none. Read here
-    /// rather than by calling that method so both halves of the answer come from this one hold.
+    /// A stale already-held runtime may have applied the terminal before catalog invalidation reaches
+    /// it. Preserve the stated stale-or-not-found contract by hiding that terminal view.
     if (rt->state.getLifecycle() != RefLifecycle::Live && rt->state.getRemoveTxnId().has_value())
         return std::nullopt;
     return lifeUnderLock(ns, *rt);
@@ -4215,12 +4317,61 @@ std::optional<NamespaceLifeId> CasRefLedger::namespaceFilesLifeIfReadable(const 
 
 DropNamespaceStats CasRefLedger::dropNamespace(const RootNamespace & ns)
 {
+    return dropNamespaceImpl(ns, std::nullopt);
+}
+
+DropNamespaceStats CasRefLedger::dropNamespaceImpl(
+    const RootNamespace & ns, const std::optional<UInt128> & expected_incarnation)
+{
     /// One body transaction naming an exact `owner_transition`
     /// removal for every committed ref and precommit, followed by `remove_namespace` -- the removal
     /// class shares the bigger complete-table byte budget (encodeRefLogTxn's own `checkBudget`, keyed
     /// off the presence of a `RemoveNamespace` op) and is exempt from the ordinary per-op admission
     /// check (it only ever shrinks state; see `flushRefBatch`'s `state_growing` filter).
-    const auto rt = getRefTableRuntime(ns);
+    const CasRefCatalog::Snapshot initial_catalog = CasRefCatalog::read(backend, layout);
+    const auto initial_it = std::find_if(initial_catalog.catalog.entries.begin(), initial_catalog.catalog.entries.end(),
+        [&](const CatalogEntry & entry) { return entry.ns == ns; });
+    if (initial_it == initial_catalog.catalog.entries.end())
+        return {};
+    if (expected_incarnation && initial_it->incarnation != *expected_incarnation)
+        throwCasWriteRetryLater(fmt::format(
+            "CAS namespace '{}': exact removal life {} differs from current catalog life {}",
+            ns.string(), renderIncarnation(*expected_incarnation), renderIncarnation(initial_it->incarnation)));
+
+    if (initial_it->state == NsState::Creating)
+    {
+        const CatalogEntry observed = *initial_it;
+        const uint64_t admitted_generation = fence_generation_fn();
+        switch (CasRefCatalog::cancelStalledCreating(
+            backend, layout, observed,
+            [this](const CreatorFence & creator)
+            {
+                return isCreatorFenceTerminal(
+                    backend, layout, creator.server_root_id, creator.writer_epoch);
+            },
+            admitted_generation, check_fence_or_throw))
+        {
+            case CasRefCatalog::StalledCreatingCancelOutcome::Cancelled:
+                invalidateRemovedCatalogLife(NamespaceLifeId::fromCatalogEntry(observed.ns, observed.incarnation));
+                return {};
+            case CasRefCatalog::StalledCreatingCancelOutcome::CreatorFenceStillLive:
+                throwCasWriteRetryLater(fmt::format(
+                    "CAS namespace removal '{}': its catalog entry is still Creating under a creator "
+                    "fence that is not yet provably terminal; retry later", ns.string()));
+            case CasRefCatalog::StalledCreatingCancelOutcome::EntryChanged:
+                throwCasWriteRetryLater(fmt::format(
+                    "CAS namespace removal '{}': exact Creating row changed before cancellation; retry later",
+                    ns.string()));
+            case CasRefCatalog::StalledCreatingCancelOutcome::FencedOut:
+                throwCasWriteRetryLater(fmt::format(
+                    "CAS namespace removal '{}': mount fence moved before stalled creation cancellation",
+                    ns.string()));
+        }
+    }
+
+    const auto rt = expected_incarnation
+        ? pinRefTableRuntimeToLife(NamespaceLifeId::fromCatalogEntry(ns, *expected_incarnation))
+        : getRefTableRuntime(ns);
     /// A namespace the catalog does not name has nothing to remove, and removing from it must not be what
     /// creates it -- which is why the answer is here and not in the lifecycle check below: that check runs
     /// on recovered state, and reaching recovered state is itself the birth.
@@ -4236,6 +4387,115 @@ DropNamespaceStats CasRefLedger::dropNamespace(const RootNamespace & ns)
         if (rt->state.getLifecycle() != RefLifecycle::Live)
             return {};
     }
+
+    /// Close the local positive lane BEFORE publishing `Removing`. Calls already admitted ahead of
+    /// this point drain first; later positive callers observe the flag in the same queue critical
+    /// section as enqueue and receive the typed retry-later refusal. The terminal item below is the one
+    /// deliberate exception.
+    {
+        std::unique_lock<std::mutex> queue_lock(ref_queue_mutex);
+        rt->removal_admission_closed = true;
+        rt->cv.wait(queue_lock, [&]
+        {
+            return !rt->leader_active && rt->pending.empty();
+        });
+    }
+
+    const uint64_t admitted_generation = fence_generation_fn();
+    std::optional<CatalogEntry> observed_live;
+    bool removing_durable = false;
+    try
+    {
+        const CasRefCatalog::Snapshot snapshot = CasRefCatalog::read(backend, layout);
+        const auto entry_it = std::find_if(snapshot.catalog.entries.begin(), snapshot.catalog.entries.end(),
+            [&](const CatalogEntry & entry) { return entry.ns == ns; });
+        if (entry_it == snapshot.catalog.entries.end())
+            throwCasWriteRetryLater(fmt::format(
+                "CAS namespace '{}': its catalog row disappeared before removal admission closed",
+                ns.string()));
+
+        const NamespaceLifeId life = [&]
+        {
+            std::lock_guard state_lock(rt->state_mutex);
+            return lifeUnderLock(ns, *rt);
+        }();
+        if (entry_it->incarnation != life.incarnation)
+            throwCasWriteRetryLater(fmt::format(
+                "CAS namespace '{}': cached life {} differs from catalog life {} while beginning removal",
+                ns.string(), renderIncarnation(life.incarnation), renderIncarnation(entry_it->incarnation)));
+
+        if (entry_it->state == NsState::Removing)
+        {
+            removing_durable = true;   /// retry after an earlier terminal append failure/ambiguous CAS
+        }
+        else if (entry_it->state == NsState::Live)
+        {
+            observed_live = *entry_it;
+            uint64_t removal_started_round = 0;
+            if (const auto got = backend.get(layout.gcStateKey()))
+                removal_started_round = decodeGcState(got->bytes).round;
+
+            switch (CasRefCatalog::beginRemoving(
+                backend, layout, *observed_live, removal_started_round,
+                admitted_generation, check_fence_or_throw))
+            {
+                case CasRefCatalog::BeginRemovingOutcome::Transitioned:
+                case CasRefCatalog::BeginRemovingOutcome::AlreadyRemoving:
+                    removing_durable = true;
+                    break;
+                case CasRefCatalog::BeginRemovingOutcome::EntryChanged:
+                    throwCasWriteRetryLater(fmt::format(
+                        "CAS namespace '{}': its exact catalog row changed while beginning removal",
+                        ns.string()));
+                case CasRefCatalog::BeginRemovingOutcome::FencedOut:
+                    throwCasWriteRetryLater(fmt::format(
+                        "CAS namespace '{}': the mount fence moved while beginning removal",
+                        ns.string()));
+            }
+        }
+        else
+        {
+            throwCasWriteRetryLater(fmt::format(
+                "CAS namespace '{}': its catalog row is Creating while removal owns a recovered life",
+                ns.string()));
+        }
+    }
+    catch (...)
+    {
+        /// Resolve an ambiguous transition before deciding whether this lane may reopen. `Removing`
+        /// under the same life is conclusive success. Reopening is permitted only after a fresh exact
+        /// observation still proves the original `Live` row and the same mount fence; every unreadable,
+        /// changed or fenced case remains closed (fail-close) and propagates the original error.
+        try
+        {
+            const CasRefCatalog::Snapshot fresh = CasRefCatalog::read(backend, layout);
+            const auto fresh_it = std::find_if(fresh.catalog.entries.begin(), fresh.catalog.entries.end(),
+                [&](const CatalogEntry & entry) { return entry.ns == ns; });
+            if (observed_live
+                && fresh_it != fresh.catalog.entries.end()
+                && fresh_it->incarnation == observed_live->incarnation
+                && fresh_it->state == NsState::Removing)
+            {
+                removing_durable = true;
+            }
+            else if (observed_live && fresh_it != fresh.catalog.entries.end() && *fresh_it == *observed_live)
+            {
+                check_fence_or_throw(admitted_generation);
+                std::lock_guard<std::mutex> queue_lock(ref_queue_mutex);
+                rt->removal_admission_closed = false;
+                rt->cv.notify_all();
+            }
+        }
+        catch (...)
+        {
+            /// The original failure remains the caller-visible one. Failure to prove an exact fresh
+            /// `Live` row deliberately leaves admission closed.
+        }
+        if (!removing_durable)
+            throw;
+    }
+
+    chassert(removing_durable);
 
     /// This call's own removal
     /// transaction named, filled from the SAME `state` the ops below are built from -- a retried
@@ -4294,29 +4554,25 @@ DropNamespaceStats CasRefLedger::dropNamespace(const RootNamespace & ns)
     /// cancels OUTSIDE it -- see `Pool::cancelInflightBuildsForNamespace`).
     cancel_inflight_builds(ns);
 
-    /// "After the removal transaction is durable, the writer also publishes
-    /// the constant-size Removed snapshot"; best-effort here (the removal itself already succeeded) --
-    /// namespace cleanup republishes it idempotently if this writer stops first.
-    try
+    /// No background publisher may carry the old runtime across the later catalog deletion and its
+    /// in-place reset. A removal has already succeeded here, so the cached lifecycle is no longer Live
+    /// and settlement cannot re-dispatch another publisher.
     {
-        publishRemovedSnapshotNow(ns);
-    }
-    catch (...)
-    {
-        tryLogCurrentException(getLogger("CasPool"), "CAS dropNamespace: publishing the Removed snapshot failed (best-effort)");
+        std::unique_lock state_lock(rt->state_mutex);
+        rt->publish_settle_cv.wait(state_lock, [&]
+        {
+            return rt->pending_snapshot_publishes.load(std::memory_order_acquire) == 0;
+        });
     }
 
-    /// The writer performs NO physical deletion of ref-log/snapshot objects or verbatim namespace files
-    /// -- GC's namespace-cleanup item ({namespace, remove_txn_id}, Pending->Completed) owns that reclaim,
-    /// keyed off the durable `remove_namespace` this call just appended.
-    /// Until GC reclaims it, a dropped namespace's ref-log objects and verbatim files remain as debris.
+    /// The writer performs no physical deletion of ref-log/snapshot objects or namespace files. Once
+    /// the catalog row is drained, those objects are dead-life debris for the perpetual janitor.
     return stats;
 }
 
 DropNamespaceStats CasRefLedger::dropNamespace(const NamespaceLifeId & life)
 {
-    (void)pinRefTableRuntimeToLife(life);
-    return dropNamespace(life.ns);
+    return dropNamespaceImpl(life.ns, life.incarnation);
 }
 
 

@@ -1,6 +1,7 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCatalogFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCkpt.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
@@ -69,10 +70,10 @@ public:
     static std::optional<NamespaceLifeId> lifeIfCataloged(
         Backend & backend, const Layout & layout, const RootNamespace & ns);
 
-    /// Every `Live`/`Removing` life the catalog currently names, ONE catalog GET -- `Gc::discoverUniverse`'s
-    /// own body, factored out so a second caller (`CasFsck.cpp`'s reachability walk, review Important C)
-    /// does not re-derive the identical filter independently and risk disagreeing with it about which
-    /// namespaces exist. `Creating` is excluded: spec §3, no publication can exist yet.
+    /// Every `Live`/`Removing` life the catalog currently names, from this call's own catalog `GET`.
+    /// This helper is for independent readers such as `CasFsck`; a GC fold instead keeps the immutable
+    /// post-LIST snapshot attached to its scan and reuses that exact cut throughout the round.
+    /// `Creating` is excluded: spec §3, no publication can exist yet.
     static std::vector<NamespaceLifeId> liveUniverse(Backend & backend, const Layout & layout);
 
     /// The generic token-CAS retry loop shared by every catalog mutation, mirroring
@@ -123,6 +124,58 @@ public:
     /// `encodeRefCatalog`'s own canonical-order/no-duplicate grammar check, inside
     /// `checkCatalogAdmission`.
     static RefCatalog casAdmitEntry(Backend & backend, const Layout & layout, const CatalogEntry & entry);
+
+    enum class BeginRemovingOutcome : uint8_t
+    {
+        Transitioned,
+        AlreadyRemoving,
+        EntryChanged,
+        FencedOut,
+    };
+
+    /// Exact `Live -> Removing` transition. The immutable observed row is compared by full value on
+    /// every catalog retry, and the mount fence is checked after every fresh read and before its CAS.
+    /// A row already `Removing` under the same namespace/life resolves an ambiguous or concurrent
+    /// transition positively; no caller may change its recorded start round afterward.
+    static BeginRemovingOutcome beginRemoving(
+        Backend & backend, const Layout & layout, const CatalogEntry & observed,
+        uint64_t removal_started_round, uint64_t admitted_generation,
+        const std::function<void(uint64_t)> & check_fence_or_throw);
+
+    /// Outcome of the only fold-authorized catalog deletion. A refusal never writes the catalog.
+    enum class CompletedRemovingDeleteOutcome : uint8_t
+    {
+        Deleted,
+        ProofRefused,
+        EntryChanged,
+        FencedOut,
+    };
+
+    /// Exact-CAS-deletes `observed` only when it is a complete `Removing` row and the authoritative
+    /// adopted parent carries cleanup evidence, but no hold, in the row keyed by the same opaque life
+    /// id. The whole parent seal is consumed so a caller cannot separate the life id from its proof or
+    /// reduce the proof to a caller-computed boolean. The leader fence is checked after every fresh
+    /// catalog read and before every attempted CAS.
+    static CompletedRemovingDeleteOutcome deleteCompletedRemoving(
+        Backend & backend, const Layout & layout, const CatalogEntry & observed,
+        const CasFoldSeal & authoritative_parent, uint64_t admitted_generation,
+        const std::function<void(uint64_t)> & check_fence_or_throw);
+
+    /// Outcome of exact stalled-creation cancellation, the only other exported deletion shape.
+    enum class StalledCreatingCancelOutcome : uint8_t
+    {
+        Cancelled,
+        CreatorFenceStillLive,
+        EntryChanged,
+        FencedOut,
+    };
+
+    /// Exact-CAS-deletes one observed `Creating` row only after its complete creator fence is proven
+    /// terminal. This performs no `_ckpt` or other physical cleanup; debris belongs to the janitor.
+    static StalledCreatingCancelOutcome cancelStalledCreating(
+        Backend & backend, const Layout & layout, const CatalogEntry & observed,
+        const std::function<bool(const CreatorFence &)> & is_creator_fence_terminal,
+        uint64_t admitted_generation, const std::function<void(uint64_t)> & check_fence_or_throw);
 
     /// === Task 3: the §3 creation lifecycle, built on the two primitives above ===
 

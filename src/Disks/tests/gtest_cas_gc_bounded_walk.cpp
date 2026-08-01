@@ -49,22 +49,23 @@ const UInt128 kGc = hexToU128("00000000000000000000000000000001");
 /// once" is the claim, and only a counting backend can check it.
 using CountingHintHoleBackend = DB::Cas::tests::HintHoleBackendOn<DB::Cas::tests::CountingBackend>;
 
-/// The `ShardCoverage` the newest fold seal recorded for `ns` (shard 0). Scans downward from the adopted
+/// The `RefCoverage` the newest fold seal recorded for `ns` (shard 0). Scans downward from the adopted
 /// generation for the most recent fold seal, mirroring `foldCursorOf`'s reasoning (a completed round's
 /// `gc/state` points at the recheck generation, which writes a completion seal rather than a fold seal).
-std::optional<ShardCoverage> coverageOf(Backend & backend, const Layout & layout, const RootNamespace & ns)
+std::optional<RefCoverage> coverageOf(Backend & backend, const Layout & layout, const RootNamespace & ns)
 {
     const uint64_t gen = currentGenerationOf(backend, layout);
     const uint64_t attempt = currentAttemptOf(backend, layout);
+    const UInt128 life_id = catalogLifeIdForTest(backend, layout, ns);
     for (uint64_t g = gen; ; --g)
     {
         if (const auto got = backend.get(layout.foldSealKey(g, attempt)))
         {
             const CasFoldSeal seal = decodeFoldSeal(got->bytes);
-            const auto it = seal.per_ns_shard.find(cursorKeyForTest(ns, /*shard*/0));
-            if (it == seal.per_ns_shard.end())
+            const auto it = seal.ref_lives.find(life_id);
+            if (it == seal.ref_lives.end())
                 return std::nullopt;
-            return it->second;
+            return it->second.coverage;
         }
         if (g == 0)
             return std::nullopt;

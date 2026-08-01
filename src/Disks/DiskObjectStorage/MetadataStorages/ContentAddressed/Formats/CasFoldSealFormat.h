@@ -53,7 +53,7 @@ enum class HoldReason : uint8_t
 /// namespace — and a second rendering of these words elsewhere would be a second place for them to drift.
 std::string_view holdReasonToWord(HoldReason r);
 
-/// The durable hold on one namespace. It rides `ShardCoverage` across rounds and across `REBUILD`, and
+/// The durable hold on one namespace. It rides `RefCoverage` across rounds and across `REBUILD`, and
 /// clears ONLY by folding through `offending_position` and adopting the result in `gc/state` — never by
 /// observing another absent, because an absent is exactly the observation a lying store produces.
 struct RefHold
@@ -96,7 +96,7 @@ struct RefHold
 /// every refusal stated in terms of the set and reaches the delete. The decoder also validates BEFORE
 /// narrowing to the byte, because a wide integer on the wire (258, say) truncates into the set and would
 /// otherwise claim a coverage the fold never proved.
-struct ShardCoverage
+struct RefCoverage
 {
     uint8_t classification = 0;
 
@@ -114,7 +114,27 @@ struct ShardCoverage
     /// combination by forgetting a field.
     std::optional<RefHold> hold = std::nullopt;
 
-    bool operator==(const ShardCoverage &) const = default;
+    bool operator==(const RefCoverage &) const = default;
+};
+
+/// Positive evidence that the terminal `remove_namespace` transaction for one life was folded into
+/// the adopted seal. The owning opaque life id is the `CasFoldSeal::ref_lives` map key; the evidence
+/// therefore carries no duplicate namespace or incarnation and has no pending/completed state.
+struct RefCleanupEvidence
+{
+    RefTxnId remove_txn_id{};
+
+    bool operator==(const RefCleanupEvidence &) const = default;
+};
+
+/// The complete durable fold state for one cataloged ref life. Coverage and optional terminal
+/// evidence live in the same row so neither can be admitted by an independent producer.
+struct RefLifeFoldState
+{
+    RefCoverage coverage;
+    std::optional<RefCleanupEvidence> cleanup_evidence = std::nullopt;
+
+    bool operator==(const RefLifeFoldState &) const = default;
 };
 
 /// Per-shard summary of condemned rows carried in the sealed source-edge run. It lets graduation and
@@ -130,43 +150,21 @@ struct CondemnedSummary
     bool operator==(const CondemnedSummary &) const = default;
 };
 
-/// Durable state of the physical cleanup for a removed namespace's `@cas@` metadata. `Pending` remains
-/// in the seal while enumerate-and-delete passes may still find objects. `Completed` is terminal for the
-/// physical pass: the namespace was observed empty, after which the cleanup marker and `Removed` snapshot
-/// can be published idempotently before a later `namespace_birth` recreates the namespace.
-enum class RefNsCleanupState : uint8_t
-{
-    Pending = 1,
-    Completed = 2,
-};
-
-/// One namespace-cleanup item keyed by `{ns, remove_txn_id}`. It is carried forward in each fold seal
-/// until the `Completed` state has been durably observed and its completion artifacts are present.
-struct RefNsCleanupItem
-{
-    RootNamespace ns;
-    RefTxnId remove_txn_id;
-    RefNsCleanupState state = RefNsCleanupState::Pending;
-    bool operator==(const RefNsCleanupItem &) const = default;
-};
-
 /// The write-once fold seal for one GC generation at
 /// `<prefix>/gc/gen/<generation>/attempt/<attempt>/fold_seal`. It is the generation's durable coverage
 /// record: it stores cursors and run references, not one record per edge, manifest, or candidate. A retry
 /// and the next round use the adopted seal to determine what was folded and which parent runs can be
-/// carried forward. Its run references and cleanup items are also the durable inputs to retention and
-/// namespace cleanup. Manifest cleanup is intentionally not represented here: those cleanups execute
+/// carried forward. Its run references and ref-life rows are also the durable inputs to retention.
+/// Manifest cleanup is intentionally not represented here: those cleanups execute
 /// inline from the in-memory cleanup map, and no durable cleanup-run reader exists.
 struct CasFoldSeal
 {
     uint64_t generation = 0;
     uint64_t parent_generation = 0;
-    std::map<String, ShardCoverage> per_ns_shard;   /// "ns/shard" -> coverage
+    /// Exactly one row per `Live` or `Removing` catalog life admitted by `buildRefWalkPlan`.
+    std::map<UInt128, RefLifeFoldState> ref_lives;
     std::vector<RunRef> blob_target_runs;           /// the blob in-degree run segments this gen sealed
     std::map<uint64_t, CondemnedSummary> condemned_summary;   /// gc-shard -> summary; TOTAL over gc_shards
-    /// Namespace-cleanup items, keyed by "<ns>\n<remove-txn-render>". Carried forward until their
-    /// completion artifacts are observed. Empty on a pool that has never removed a namespace.
-    std::map<String, RefNsCleanupItem> ns_cleanup_items;
     bool operator==(const CasFoldSeal &) const = default;
 };
 
@@ -188,7 +186,7 @@ FoldSealCaps foldSealCaps();
 void checkFoldSealObjectBytes(uint64_t encoded_bytes);
 
 /// Encodes a fold seal as a strict, raw text control object. The header and meta lines are followed by
-/// tagged records in the fixed `cov`/`btr`/`cnd`/`nsc` order and a record-count trailer. Map iteration and
+/// tagged records in the fixed `rfl`/`btr`/`cnd` order and a record-count trailer. Map iteration and
 /// run references are sorted so retries produce byte-identical output for write-once adoption.
 ///
 /// Enforces the whole coverage grammar — the closed classification set, the classification-4 hold

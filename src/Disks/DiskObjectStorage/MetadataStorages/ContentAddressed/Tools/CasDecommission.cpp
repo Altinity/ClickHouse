@@ -164,7 +164,7 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
                 "refusing destructive work",
                 ns_str);
 
-        if (admin->namespaceIsRemoved(life))
+        if (selected_entry.state == NsState::Removing)
         {
             ++report.namespaces_already_removed;
             continue;

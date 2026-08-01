@@ -149,6 +149,105 @@ void deleteConfirmedMeta(Backend & backend, const Layout & layout, const BlobRef
 
 }
 
+std::set<UInt128> RefWalkPlan::lifeIds() const
+{
+    std::set<UInt128> out;
+    for (const auto & [life_id, row] : rows)
+        out.insert(life_id);
+    return out;
+}
+
+std::vector<NamespaceLifeId> RefWalkPlan::lives() const
+{
+    std::vector<NamespaceLifeId> out;
+    out.reserve(rows.size());
+    for (const auto & [life_id, row] : rows)
+        out.push_back(row.life);
+    return out;
+}
+
+std::map<UInt128, RefLifeFoldState> RefWalkPlan::releaseFoldStates()
+{
+    std::map<UInt128, RefLifeFoldState> out;
+    for (auto & [life_id, row] : rows)
+        out.emplace(life_id, std::move(row.fold_state));
+    rows.clear();
+    return out;
+}
+
+RefWalkPlan buildRefWalkPlan(
+    const CasRefCatalog::Snapshot & catalog_cut, const RefWalkPlanInputs & inputs)
+{
+    catalog_cut.life_index.throwIfAmbiguous("CAS ref walk plan");
+    RefWalkPlan plan;
+
+    /// The sole admission loop. Everything below can only find one of these rows.
+    for (const CatalogEntry & entry : catalog_cut.catalog.entries)
+    {
+        if (entry.state == NsState::Creating)
+            continue;
+        plan.rows.emplace(entry.incarnation, RefWalkPlanRow{
+            .life = NamespaceLifeId::fromCatalogEntry(entry.ns, entry.incarnation),
+            .fold_state = {},
+            .listed_hint = false,
+            .checkpoint_observation = std::nullopt,
+            .tail_observation = std::nullopt});
+    }
+
+    for (const auto & [life_id, state] : inputs.parent_ref_lives)
+    {
+        const auto it = plan.rows.find(life_id);
+        if (it == plan.rows.end())
+        {
+            ++plan.dropped_parent_rows;
+            continue;
+        }
+        it->second.fold_state = state;
+    }
+    for (const UInt128 & life_id : inputs.listed_lives)
+    {
+        const auto it = plan.rows.find(life_id);
+        if (it == plan.rows.end())
+        {
+            ++plan.dropped_listed_lives;
+            continue;
+        }
+        it->second.listed_hint = true;
+    }
+    for (const auto & [life_id, hold] : inputs.holds)
+    {
+        const auto it = plan.rows.find(life_id);
+        if (it == plan.rows.end())
+        {
+            ++plan.dropped_holds;
+            continue;
+        }
+        it->second.fold_state.coverage.classification = 4;
+        it->second.fold_state.coverage.hold = hold;
+    }
+    for (const auto & [life_id, checkpoint] : inputs.checkpoint_observations)
+    {
+        const auto it = plan.rows.find(life_id);
+        if (it == plan.rows.end())
+        {
+            ++plan.dropped_checkpoints;
+            continue;
+        }
+        it->second.checkpoint_observation = checkpoint;
+    }
+    for (const auto & [life_id, tail] : inputs.tail_observations)
+    {
+        const auto it = plan.rows.find(life_id);
+        if (it == plan.rows.end())
+        {
+            ++plan.dropped_tails;
+            continue;
+        }
+        it->second.tail_observation = tail;
+    }
+    return plan;
+}
+
 uint64_t retiredLogicalSize(ObjectKind kind, uint64_t object_size, uint64_t blob_header_len)
 {
     if (kind != ObjectKind::Blob)
@@ -324,6 +423,14 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     Backend & backend = store->backend();
     const uint64_t new_round = state.round + 1;
 
+    /// The helping barrier precedes heartbeat work, DEFER, the hot stream LIST, and every successor
+    /// artifact. A deferred invocation therefore cannot leave a row the adopted parent already proved
+    /// complete, and a folding invocation takes its catalog cut only after the deletion settles.
+    {
+        GcPhaseTimer t(phase_sink, "pre_fold_ref_drain");
+        t.metric("deleted", drainCompletedRemoving(state));
+    }
+
     /// Token-guarded fence-out of dead mounts (liveness only — graduation itself paces on GC
     /// rounds via `new_round`, not on heartbeat acks). Fencing no longer trusts a predecessor's stamped
     /// `expires_at_ms` against our wall clock — it
@@ -403,7 +510,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         const bool graduation_due = graduationDue(state, new_round);
         ref_scan = listRefPrefix(state);
         const size_t changed = ref_scan.changed_shards;
-        const bool defer = ref_scan.has_post_cut_unknown_life || shouldDeferRound(changed, graduation_due, rounds_since_last_fold_,
+        const bool defer = shouldDeferRound(changed, graduation_due, rounds_since_last_fold_,
                                             store->poolConfig().gc_fold_threshold,
                                             store->poolConfig().gc_fold_max_defer_rounds);
         uint64_t ref_log_keys = 0;
@@ -414,6 +521,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         t.metric("ref_log_keys_listed", ref_log_keys);
         t.metric("ref_keys_listed", ref_scan.keys.size());
         t.metric("graduation_due", graduation_due ? 1 : 0);
+        t.metric("dead_life_debris", ref_scan.dead_life_debris);
         t.metric("deferred", defer ? 1 : 0);
         /// The number of consecutive rounds already deferred BEFORE this one (this round's own verdict is
         /// `deferred` above), so the pair reads unambiguously against `gc_fold_max_defer_rounds`.
@@ -927,31 +1035,15 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         t.metric("suppressed", suppress_destructive ? 1 : 0);
     }
 
-    /// Ref-object cleanup + namespace-cleanup item passes, post-CAS so the durable fold
-    /// cursor is committed. `suppress_destructive` (any clamp or ref-folding abort this round) gates the
-    /// deletes; the idempotent marker / `Removed`-snapshot republication for a Completed item still runs.
-    ///
-    /// ORDER IS LOAD-BEARING: `runNamespaceCleanupPasses` runs FIRST because it republishes the `Removed`
-    /// snapshot for a Completed item (via idempotent putIfAbsent) -- and only after that snapshot is
-    /// durable may `cleanupRefObjects` delete the logs it covers: a covering snapshot is
-    /// always durable before any deletion it authorizes"). A concurrent recovering reader that misses this
-    /// republication and later GETs a now-deleted log restarts with a fresh LIST and observes the durable
-    /// `Removed` snapshot -- a complete constant-size state with no tail to replay. Running cleanup first
-    /// (the previous order) left the completing round unable to see its own just-published snapshot, so a
-    /// removed namespace's covered logs persisted as debris until some later fold -- which never comes on
-    /// a quiesced pool.
-    /// PHASE 17/19 `namespace_cleanup`.
+    /// Removal completion has no physical pass. The terminal fold placed positive evidence in the
+    /// life row; a later invocation's catalog-only pre-fold drain owns lifecycle deletion, while the
+    /// perpetual janitor owns dead-life bytes.
     {
         GcPhaseTimer t(phase_sink, "namespace_cleanup");
-        uint64_t pending = 0;
-        uint64_t completed = 0;
-        for (const auto & [key, item] : folded.fold_seal.ns_cleanup_items)
-            (item.state == RefNsCleanupState::Completed ? completed : pending) += 1;
-        runNamespaceCleanupPasses(folded.fold_seal, folded.ref_tables, folded.live_incarnation, new_round, suppress_destructive);
-        t.metric("items", folded.fold_seal.ns_cleanup_items.size());
-        t.metric("items_pending", pending);
-        t.metric("items_completed", completed);
-        t.metric("suppressed", suppress_destructive ? 1 : 0);
+        uint64_t evidence_rows = 0;
+        for (const auto & [life_id, ref_life_state] : folded.fold_seal.ref_lives)
+            evidence_rows += ref_life_state.cleanup_evidence ? 1 : 0;
+        t.metric("evidence_rows", evidence_rows);
     }
     /// PHASE 18/19 `ref_object_cleanup`. Emitted even when the whole pass is skipped (`trim_enabled` is
     /// a test seam, `suppressed` gates the deletes), because "this phase did nothing and why" is exactly
@@ -1089,8 +1181,7 @@ bool Gc::foldManifestEdges(const ManifestId & id, int sign, std::vector<BlobDelt
 }
 
 Gc::CheckpointWitnesses Gc::readCheckpointWitnesses(const std::map<String, RefTableListing> & ref_tables,
-                                                    const std::map<String, ShardCoverage> & parent_cursors,
-                                                    const std::map<String, UInt128> & live_incarnation)
+                                                    const CasRefCatalog::Snapshot & catalog_cut)
 {
     /// Read the checkpoint of every namespace in the round's catalog cut, every namespace `ref_tables`
     /// names, PLUS every namespace a HELD row in `parent_cursors` names. A catalog-only namespace is the
@@ -1105,37 +1196,26 @@ Gc::CheckpointWitnesses Gc::readCheckpointWitnesses(const std::map<String, RefTa
     const Layout & layout = store->layout();
 
     std::set<String> witness_namespaces;
-    for (const auto & entry : live_incarnation)
-        witness_namespaces.insert(entry.first);
+    for (const CatalogEntry & entry : catalog_cut.catalog.entries)
+        if (entry.state == NsState::Live || entry.state == NsState::Removing)
+            witness_namespaces.insert(entry.ns.string());
     for (const auto & [ns_str, listing] : ref_tables)
         witness_namespaces.insert(ns_str);
-    for (const auto & [known_key, known_cov] : parent_cursors)
-    {
-        if (!known_cov.hold)
-            continue;
-        /// Parse loosely, then PROVE by rebuilding the key -- the same round trip, for the same reason,
-        /// as the walk's own pass over these keys: a coverage key in a decoded seal is an arbitrary
-        /// string, and `parseCursorKey` is undefined on anything `cursorKey` did not produce.
-        if (known_key.find('/') == String::npos)
-            continue;
-        const auto [known_ns, known_shard] = parseCursorKey(known_key);
-        if (known_shard != 0 || cursorKey(known_ns, known_shard) != known_key)
-            continue;
-        witness_namespaces.insert(known_ns.string());
-    }
 
     CheckpointWitnesses out;
     for (const String & ns_str : witness_namespaces)
     {
         const RootNamespace ns{ns_str};
-        /// Review C3: use the SAME life the round's walk resolved (`live_incarnation`, the round's one
-        /// catalog read), never an independent `resolveLifeOrSentinel` re-read -- and, per C1, a
-        /// namespace the catalog does not currently name has no legitimate key space to read a witness
-        /// from at all, so it contributes none rather than one fabricated at the sentinel.
-        const auto life_it = live_incarnation.find(ns_str);
-        if (life_it == live_incarnation.end())
+        /// Review C3: use the SAME complete catalog cut the round's walk resolved, never an independent
+        /// `resolveLifeOrSentinel` re-read. A namespace absent from the cut, or present only as a
+        /// non-walkable `Creating` row, has no admitted witness key to read this round.
+        const auto entry_it = std::lower_bound(
+            catalog_cut.catalog.entries.begin(), catalog_cut.catalog.entries.end(), ns,
+            [](const CatalogEntry & entry, const RootNamespace & needle) { return entry.ns < needle; });
+        if (entry_it == catalog_cut.catalog.entries.end() || entry_it->ns != ns
+            || (entry_it->state != NsState::Live && entry_it->state != NsState::Removing))
             continue;
-        const String ckpt_key = layout.refCkptKey(NamespaceLifeId::fromCatalogEntry(ns, life_it->second));
+        const String ckpt_key = layout.refCkptKey(NamespaceLifeId::fromCatalogEntry(entry_it->ns, entry_it->incarnation));
         /// THE GET AND THE DECODE ARE SPLIT HERE, rather than taken together through `readCkpt`, so the
         /// catch below can scope to the DECODE ALONE. Wrapping the read too would turn a transport
         /// failure -- which says nothing about this object and everything about the round's ability to
@@ -1356,8 +1436,8 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     FoldResult result;
 
     /// 1. Group the round's one enumeration of `cas/ns/stream/` (taken before the defer decision) into
-    /// per-table (log / snapshot / cleanup-marker) listings. That single enumeration serves the defer
-    /// signal, the ref-log intake, and ref-object cleanup planning alike.
+    /// per-table immutable-object listings. That single enumeration serves the defer signal, the
+    /// ref-log intake, and ref-object cleanup planning alike.
     ///
     /// THE ROUND LISTS THIS PREFIX ONCE. It used to list it twice, so the two walks could be compared;
     /// that comparison is now the sampled store-quality detector's own extra LIST, paid on the rounds it
@@ -1381,7 +1461,10 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     if (!ref_scan.catalog_cut)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS GC fold: hot ref scan carries no catalog cut");
     const CasRefCatalog::Snapshot & catalog_snapshot = *ref_scan.catalog_cut;
-    catalog_snapshot.life_index.throwIfAmbiguous("CAS GC fold");
+    RefWalkPlanInputs catalog_key_inputs;
+    catalog_key_inputs.listed_lives = ref_scan.listed_lives;
+    catalog_key_inputs.tail_observations = ref_scan.max_log_by_life;
+    const RefWalkPlan catalog_key_plan = buildRefWalkPlan(catalog_snapshot, catalog_key_inputs);
     std::map<String, UInt128> live_incarnation;
     /// Final review F1: a `Creating` life IS named by the catalog -- `live_incarnation` excludes it
     /// only because it is not yet WALKABLE (spec §3, no publication can exist), not because the
@@ -1392,15 +1475,12 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// below must tell that apart from genuine "nothing in the catalog names this at all" debris, or
     /// an ordinary or stalled creation suppresses the whole round's reclamation until someone
     /// recreates the exact name and drives `reconcileStaleCreator` -- unbounded in the stalled case.
-    for (const CatalogEntry & entry : catalog_snapshot.catalog.entries)
-    {
-        if (entry.state != NsState::Creating)
-            live_incarnation.emplace(entry.ns.string(), entry.incarnation);
-    }
-    /// Carried on the result (review C3) so every later consumer this round -- `cleanupRefObjects`,
-    /// `runNamespaceCleanupPasses` -- looks a namespace's life up here instead of re-reading the catalog
-    /// independently and possibly disagreeing with the walk below about which incarnation is live.
-    result.live_incarnation = live_incarnation;
+    for (const NamespaceLifeId & life : catalog_key_plan.lives())
+        live_incarnation.emplace(life.ns.string(), life.incarnation);
+    /// Carry the complete cut on the result (review C3) so every later consumer this round --
+    /// `cleanupRefObjects` and terminal-evidence attribution -- retains both the chosen incarnation and
+    /// the lifecycle/absence distinction instead of re-reading or reducing the catalog independently.
+    result.catalog_cut = catalog_snapshot;
 
     /// A malformed ref-object key or namespace aborts ref folding for the whole round: the
     /// round produces no ref delta, advances no cursor, and authorizes no destructive work -- recorded as
@@ -1414,7 +1494,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         {
             const auto life = catalog_snapshot.life_index.resolve(life_id);
             if (!life)
-                continue;   /// post-cut/unknown was already forced into a deferred round
+                continue;   /// absent from the post-LIST cut: inert dead-life debris
             const auto live_it = live_incarnation.find(life->ns.string());
             if (live_it != live_incarnation.end() && live_it->second == life_id)
                 ref_tables.emplace(life->ns.string(), listing);
@@ -1446,7 +1526,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// A live `gc/state` whose adopted
     /// fold seal OBJECT is MISSING is corrupt bookkeeping, never an empty baseline — treating it as
     /// empty would re-fold only journal tails and mass-condemn everything the lost snapshot
-    /// protected. NOTE the distinction from a PRESENT seal with an empty per_ns_shard (a legitimate
+    /// protected. NOTE the distinction from a PRESENT seal with empty `ref_lives` (a legitimate
     /// empty-universe generation) — the audit keys on object absence, not coverage emptiness.
     ///
     /// PHASE 7/19 `fold_seal_read`. The scope reaches down to `discover_ref_seal` below, because that is
@@ -1464,8 +1544,16 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             "gc/state — GC bookkeeping is corrupt. GC refuses to run; recover with "
             "SYSTEM CONTENT ADDRESSED GC REBUILD.",
             state.snap_generation, state.snap_attempt);
-    const std::map<String, ShardCoverage> parent_cursors =
-        adopted_seal ? adopted_seal->per_ns_shard : std::map<String, ShardCoverage>{};
+    const std::map<UInt128, RefLifeFoldState> parent_ref_lives =
+        adopted_seal ? adopted_seal->ref_lives : std::map<UInt128, RefLifeFoldState>{};
+
+    RefWalkPlanInputs walk_inputs;
+    walk_inputs.parent_ref_lives = parent_ref_lives;
+    walk_inputs.listed_lives = ref_scan.listed_lives;
+    walk_inputs.tail_observations = ref_scan.max_log_by_life;
+    RefWalkPlan walk_plan = buildRefWalkPlan(catalog_snapshot, walk_inputs);
+    const uint64_t dropped_parent_ref_lives = walk_plan.dropped_parent_rows;
+    result.fold_seal.ref_lives = walk_plan.releaseFoldStates();
 
     /// Retired-in-snapshot: the prior generation's condemned entries RIDE the source-edge run as
     /// `kCondemned` sentinel rows, so the round no longer reads any separate retired-list object —
@@ -1628,12 +1716,15 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         discover_ref_seal = *fold_seal;
     seal_read_timer->metric("seal_reads", 2);
     seal_read_timer->metric("redundant_reads", 1);
-    seal_read_timer->metric("parent_cursors", parent_cursors.size());
+    seal_read_timer->metric("parent_ref_lives", parent_ref_lives.size());
+    seal_read_timer->metric("dropped_parent_ref_lives", dropped_parent_ref_lives);
     seal_read_timer->metric("parent_runs", discover_ref_seal.blob_target_runs.size());
-    seal_read_timer->metric("ns_cleanup_items", discover_ref_seal.ns_cleanup_items.size());
+    seal_read_timer->metric("parent_cleanup_evidence", std::count_if(
+        discover_ref_seal.ref_lives.begin(), discover_ref_seal.ref_lives.end(),
+        [](const auto & row) { return row.second.cleanup_evidence.has_value(); }));
     seal_read_timer.reset();   /// emits the `fold_seal_read` row
 
-    /// Each fully-folded remove_namespace transaction seeds a namespace-cleanup item.
+    /// Each fully-folded `remove_namespace` transaction earns terminal cleanup evidence.
     std::vector<std::pair<RootNamespace, RefTxnId>> new_removals;
 
     /// 2-3. Ref-log intake, by ARITHMETIC (spec §5). For each table the walk steps
@@ -1694,7 +1785,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// The round's SECOND witness source, independent of the listing -- see `readCheckpointWitnesses`
     /// for what it decides and why a listing alone cannot decide it. Its `undecodable` half names the
     /// namespaces whose `_ckpt` is present and unreadable; each of those is HELD below, and only those.
-    const CheckpointWitnesses checkpoints = readCheckpointWitnesses(ref_tables, parent_cursors, live_incarnation);
+    const CheckpointWitnesses checkpoints = readCheckpointWitnesses(ref_tables, catalog_snapshot);
     const std::map<String, RefTxnId> & checkpoint_witness = checkpoints.witnesses;
 
     /// WHICH NAMESPACES THIS ROUND WALKS -- i.e. THE ROUND'S UNIVERSE, the set the destructive gate owes
@@ -1720,8 +1811,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// COST: held namespaces are always walked (their retry is a liveness obligation, not a budgeted
     /// nicety); the merely-QUIET ones are bounded by `gc_frontier_probe_budget`, and the ones the budget
     /// does not reach are simply unproven, which suppresses the round's destruction. In a healthy pool
-    /// that budget is never touched -- a namespace that legitimately went away leaves its `_cleanup`
-    /// marker behind, so it stays in the hint and is walked as a hinted target anyway.
+    /// that budget is rarely touched; dead physical lives are excluded by the catalog-built plan.
 
     /// THE ROUND'S WORK-SET IS FROZEN AT THE ROUND-START LISTING, AND THAT IS WHAT MAKES A ROUND END.
     ///
@@ -1787,6 +1877,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     struct WalkTarget
     {
         String ns;
+        UInt128 life_id{};
         const RefTableListing * listing;
         /// The greatest id this namespace may FOLD this round, or `nullopt` for an unbounded walk
         /// (unhinted targets, and hinted ones whose listing carries no log at all). Reading is not
@@ -1803,86 +1894,58 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     uint64_t intake_tails_advanced = 0;
     uint64_t intake_tails_unchanged = 0;
     uint64_t intake_tails_below_cursor = 0;
-    for (const auto & [ns_str, listing] : ref_tables)
+    uint64_t intake_unhinted_held = 0;
+    uint64_t intake_unhinted_quiet = 0;
+    uint64_t frontier_probe_budget = store->poolConfig().gc_frontier_probe_budget;
+    uint64_t intake_unprobed_budget = 0;
+    uint64_t intake_catalog_only = 0;
+    for (const auto & [catalog_ns_str, catalog_incarnation] : live_incarnation)
     {
-        if (listing.logs.empty())
+        const auto listing_it = ref_tables.find(catalog_ns_str);
+        const RefTableListing * listing = listing_it != ref_tables.end() ? &listing_it->second : &kNoListing;
+        const auto parent_it = parent_ref_lives.find(catalog_incarnation);
+        const RefCoverage * parent_cov = parent_it != parent_ref_lives.end() ? &parent_it->second.coverage : nullptr;
+
+        if (listing_it == ref_tables.end() && parent_cov)
         {
-            walk_targets.push_back({ns_str, &listing, std::nullopt});
+            if (parent_cov->hold)
+                ++intake_unhinted_held;
+            else if (frontier_probe_budget == 0)
+            {
+                ++intake_unprobed_budget;
+                continue;
+            }
+            else
+            {
+                --frontier_probe_budget;
+                ++intake_unhinted_quiet;
+            }
+        }
+        else if (listing_it == ref_tables.end())
+            ++intake_catalog_only;
+
+        if (listing->logs.empty())
+        {
+            walk_targets.push_back({catalog_ns_str, catalog_incarnation, listing, std::nullopt});
             continue;
         }
 
-        const RefTxnId tail = listing.logs.back();   /// `groupRefKeys` sorts; the tail is the greatest id
-        const auto cursor_it = parent_cursors.find(cursorKey(RootNamespace{ns_str}, /*shard*/0));
-        if (cursor_it != parent_cursors.end() && cursor_it->second.hold)
+        const RefTxnId tail = listing->logs.back();
+        if (parent_cov && parent_cov->hold)
         {
-            walk_targets.push_back({ns_str, &listing, std::max(tail, cursor_it->second.hold->offending_position)});
+            walk_targets.push_back({catalog_ns_str, catalog_incarnation, listing,
+                                    std::max(tail, parent_cov->hold->offending_position)});
             continue;
         }
 
-        /// A never-folded namespace's cursor is below every real id, so it folds its whole listing.
-        const RefTxnId cursor =
-            cursor_it != parent_cursors.end() ? cursor_it->second.last_folded_ref_id : RefTxnId{};
+        const RefTxnId cursor = parent_cov ? parent_cov->last_folded_ref_id : RefTxnId{};
         if (cursor < tail)
             ++intake_tails_advanced;
         else if (cursor == tail)
             ++intake_tails_unchanged;
         else
             ++intake_tails_below_cursor;
-        walk_targets.push_back({ns_str, &listing, tail});
-    }
-    uint64_t intake_unhinted_held = 0;
-    uint64_t intake_unhinted_quiet = 0;
-    uint64_t frontier_probe_budget = store->poolConfig().gc_frontier_probe_budget;
-    uint64_t intake_unprobed_budget = 0;
-    for (const auto & [known_key, known_cov] : parent_cursors)
-    {
-        /// These keys come out of a DECODED seal, where a coverage map key is an arbitrary string, and
-        /// `parseCursorKey` is documented as undefined on anything `cursorKey` did not produce. So
-        /// parse loosely and then PROVE it by rebuilding the key. The round trip is what a separator
-        /// check alone would miss: `parseCursorKey` resolves "ns/xyz" to shard 0 (its `from_chars`
-        /// simply fails and leaves the value), and this walk would then fold a namespace under a shard
-        /// the key never named.
-        if (known_key.find('/') == String::npos)
-            continue;
-        const auto [known_ns, known_shard] = parseCursorKey(known_key);
-        if (cursorKey(known_ns, known_shard) != known_key)
-            continue;
-        if (known_shard != 0 || ref_tables.contains(known_ns.string()))
-            continue;
-        if (known_cov.hold)
-        {
-            walk_targets.push_back({known_ns.string(), &kNoListing, std::nullopt});
-            ++intake_unhinted_held;
-            continue;
-        }
-        /// Merely quiet: known, unhinted, unheld. One exact probe, budget permitting.
-        if (frontier_probe_budget == 0)
-        {
-            ++intake_unprobed_budget;
-            continue;
-        }
-        --frontier_probe_budget;
-        walk_targets.push_back({known_ns.string(), &kNoListing, std::nullopt});
-        ++intake_unhinted_quiet;
-    }
-
-    /// Stage B (spec §5, Task 9's frontier proof): EVERY `Live`/`Removing` catalog entry is walked,
-    /// full stop -- not merely the ones a LIST hint or a carried cursor happened to also know about.
-    /// This is additive over everything above (a namespace already walked via `ref_tables` or the
-    /// `parent_cursors` loop is skipped here), so it can only WIDEN the round's proof obligation, never
-    /// narrow it, matching this function's own "a quiet hint can only ever ADD" direction. Unlike the
-    /// merely-quiet loop above, this one is NOT budget-limited: the catalog is the universe authority
-    /// now, so a namespace it lists is not optional coverage.
-    uint64_t intake_catalog_only = 0;
-    for (const auto & [catalog_ns_str, catalog_incarnation] : live_incarnation)
-    {
-        if (ref_tables.contains(catalog_ns_str))
-            continue;
-        if (parent_cursors.contains(cursorKey(RootNamespace{catalog_ns_str}, /*shard*/0)))
-            continue;   /// already added above, held or quiet
-        (void)catalog_incarnation;   /// the walk below still reads by NAME; see the loop's own note
-        walk_targets.push_back({catalog_ns_str, &kNoListing, std::nullopt});
-        ++intake_catalog_only;
+        walk_targets.push_back({catalog_ns_str, catalog_incarnation, listing, tail});
     }
 
     for (const WalkTarget & target : walk_targets)
@@ -1896,21 +1959,8 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         /// the R10 filter) names every namespace's REAL incarnation; a namespace it does not name (a
         /// raw-fixture test that never touched the catalog) uses its deterministic Stage-A fixture id,
         /// which is the only other identity such a namespace could have keyed its objects at.
-        const auto life_it = live_incarnation.find(ns_str);
-        const bool catalog_names_this_namespace = life_it != live_incarnation.end();
-        /// C1 fix (review `{#r11-empty-universe-vacuous}`): `resolveLifeOrSentinel`'s transitional
-        /// fallback is for raw-fixture READ paths, where that id names a real (if pre-release-only)
-        /// identity. It must NOT gate a GET here: a namespace this round's catalog does not name has NO
-        /// real key space to probe, so falling back to the fixture id would manufacture a frontier proof
-        /// out of a key space nothing wrote into -- exactly the amplifier the review traced from an
-        /// absent/damaged catalog to "every namespace proven, nothing actually known live". `life` below
-        /// is still needed for logging/key-construction parity with the catalog-named case further down
-        /// this loop, but `catalog_names_this_namespace` is what gates whether this namespace is ever
-        /// actually walked at it (see the `expected` guard just below).
-        const NamespaceLifeId life = catalog_names_this_namespace
-            ? NamespaceLifeId::fromCatalogEntry(ns, life_it->second)
-            : NamespaceLifeId::stageATransition(ns);
-        const String cursor_key = cursorKey(ns, /*shard*/0);
+        const bool catalog_names_this_namespace = true;
+        const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(ns, target.life_id);
 
         /// Parent cursor = the durable last_folded_ref_id this table folded to (absent => {0,0}).
         ///
@@ -1926,7 +1976,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         /// comment claimed otherwise ("written ONLY for namespaces in THIS round's listing, so a
         /// fully-deleted namespace leaves no cursor behind"), which is FALSE (increment review NEW-2):
         /// `walk_targets` includes every namespace with a `parent_cursors` entry regardless of whether
-        /// this round's listing mentions it at all, so the new seal's `per_ns_shard` re-carries the SAME
+        /// this round's listing mentions it at all, so the new seal's ref-life row re-carries the SAME
         /// cursor forward every round, forever, entry or no entry. This is Stage A residual behaviour --
         /// no removal API exists yet to even trigger it (`CasRefCatalog` has no entry-deletion primitive
         /// -- see `deferred-docs-fixes.md` D19/NEW-4-6) -- and is safe ONLY because ALL destruction stays
@@ -1935,16 +1985,16 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         /// retirement are durable, and only then. Do not "fix" the same-epoch-rebirth id-ordering gap
         /// above by comparing ids -- the structural closure is Stage B's catalog incarnations (cursors
         /// keyed by `(namespace, incarnation)`, not by name), which Task 5/6 own.
-        const auto cursor_it = parent_cursors.find(cursor_key);
-        const RefTxnId cursor = cursor_it != parent_cursors.end()
-            ? cursor_it->second.last_folded_ref_id : RefTxnId{};
+        const auto cursor_it = parent_ref_lives.find(target.life_id);
+        const RefTxnId cursor = cursor_it != parent_ref_lives.end()
+            ? cursor_it->second.coverage.last_folded_ref_id : RefTxnId{};
 
         /// Baseline guard: a table with NO sealed cursor whose logs at/below its
         /// newest snapshot have all been cleaned means a prior fold advanced+cleaned them and then gc/state
         /// was lost -- folding from {0,0} would miss those edges and mass-condemn their blobs. Fail closed;
         /// recover with the explicit rebuild. A fresh table (writer already snapshotted, logs still present)
         /// passes because its logs at or below the snapshot survive.
-        if (cursor_it == parent_cursors.end() && !listing.snapshots.empty())
+        if (cursor_it == parent_ref_lives.end() && !listing.snapshots.empty())
         {
             const RefTxnId newest_snapshot = listing.snapshots.back();
             const bool logs_below_snapshot_gone = listing.logs.empty() || newest_snapshot < listing.logs.front();
@@ -1960,9 +2010,9 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         /// position this round must retry by exact key, a durable witness (see `witnessAbove`), and the
         /// hold that rides forward unless this round resolves that position.
         const std::optional<RefHold> carried_hold =
-            cursor_it != parent_cursors.end() ? cursor_it->second.hold : std::nullopt;
+            cursor_it != parent_ref_lives.end() ? cursor_it->second.coverage.hold : std::nullopt;
 
-        ShardCoverage cov;
+        RefCoverage cov;
         cov.classification = 0;
         bool table_changed = false;
         /// THE FRONTIER PROOF for this namespace, and there is exactly one thing that establishes it:
@@ -2098,19 +2148,14 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         /// just below mints none either), so the only way this can suppress destruction is the anomaly
         /// and the frontier staying incomplete -- which is exactly what should suppress it.
         ///
-        /// THIS FIRES ON ORDINARY REMOVAL TOO, not only on damage, and that is a known, accepted cost
-        /// until Task 5 lands the removal-evidence check (the terminal record / `_cleanup` marker) this
-        /// site would need to tell "namespace legitimately removed" apart from "catalog entry lost or
-        /// corrupted" -- that evidence is not reachable at this point in the fold today. Recording the
-        /// anomaly (and therefore suppressing) on every ordinary removal is the conservative direction;
-        /// silently treating an uncataloged namespace as harmless is the one this fix exists to close.
+        /// This branch is a fail-closed invariant check for a logical walk target. Physical ids absent
+        /// from the post-LIST cut were already discarded as inert debris before `ref_tables` was built.
         if (!catalog_names_this_namespace)
         {
             report.recordAnomaly(ns, 0, ManifestId{ns, {}},
                 "ref intake: this namespace has no catalog entry (Live/Removing) this round -- its "
                 "frontier cannot be proven from a real key space, so it is treated as unproven rather "
-                "than walked at a fabricated one (expected until Task 5's removal-evidence check lands, "
-                "on an ordinary removal too, not only on damage)");
+                "than walked at a fabricated one");
             expected.reset();
         }
 
@@ -2441,7 +2486,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         else
             cov.classification = table_changed ? 2 : 1;
 
-        result.fold_seal.per_ns_shard[cursor_key] = cov;
+        result.fold_seal.ref_lives.at(target.life_id).coverage = cov;
         ++result.frontier_namespaces;
         if (frontier_proven)
             ++result.frontier_proven;
@@ -2471,27 +2516,11 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// gate, because both paths suppress the round either way.
     if (intake_unprobed_budget > 0)
     {
-        uint64_t carried = 0;
-        for (const auto & [known_key, known_cov] : parent_cursors)
-        {
-            if (result.fold_seal.per_ns_shard.contains(known_key))
-                continue;
-            if (known_key.find('/') == String::npos)
-                continue;
-            const auto [known_ns, known_shard] = parseCursorKey(known_key);
-            if (cursorKey(known_ns, known_shard) != known_key || known_shard != 0)
-                continue;
-            if (ref_tables.contains(known_ns.string()))
-                continue;
-            result.fold_seal.per_ns_shard[known_key] = known_cov;
-            ++carried;
-        }
-        chassert(carried == intake_unprobed_budget);
-        result.frontier_namespaces += carried;
+        result.frontier_namespaces += intake_unprobed_budget;
         LOG_WARNING(logger,
             "CAS GC ref intake: the frontier-probe budget ({}) ran out with {} known namespace(s) "
             "unprobed; their cursors ride unchanged and ALL destructive work is suppressed this round",
-            store->poolConfig().gc_frontier_probe_budget, carried);
+            store->poolConfig().gc_frontier_probe_budget, intake_unprobed_budget);
     }
 
     /// All-or-nothing: a malformed key/body anywhere aborts the round's ref folding. Discard
@@ -2503,33 +2532,32 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         ledger = TxnApplyLedger{};   /// the deltas are gone, so nothing can be unapplied
         result.mf_cleanup.clear();
         folded_any = false;
-        result.fold_seal.per_ns_shard.clear();
         /// An abort discards this round's walk, so it discards its proofs with it: nothing this round
         /// observed may be offered as a frontier proof to the destructive gate.
         result.frontier_proven = 0;
         for (const WalkTarget & target : walk_targets)
         {
-            const String cursor_key = cursorKey(RootNamespace{target.ns}, /*shard*/0);
-            ShardCoverage cov;
+            RefCoverage cov;
             cov.classification = 1;
-            if (const auto pit = parent_cursors.find(cursor_key); pit != parent_cursors.end())
+            if (const auto pit = parent_ref_lives.find(target.life_id); pit != parent_ref_lives.end())
             {
-                cov.last_folded_ref_id = pit->second.last_folded_ref_id;
+                cov.last_folded_ref_id = pit->second.coverage.last_folded_ref_id;
                 /// An abort discards this round's work; it does not resolve anything, so a hold it
                 /// found in the parent seal rides forward untouched -- not even the retry count moves,
                 /// because nothing was retried.
-                if (pit->second.hold)
+                if (pit->second.coverage.hold)
                 {
-                    cov.hold = pit->second.hold;
+                    cov.hold = pit->second.coverage.hold;
                     cov.classification = 4;
                 }
             }
-            result.fold_seal.per_ns_shard[cursor_key] = cov;
+            RefLifeFoldState & ref_life_state = result.fold_seal.ref_lives.at(target.life_id);
+            ref_life_state.coverage = cov;
         }
     }
 
     /// PROBE B1's recomputation, taken HERE rather than at the seal write: every input it reads
-    /// (`walked_segments`, the sealed `per_ns_shard`) is final as of this line, and nothing
+    /// (`walked_segments`, the sealed ref-life coverage) is final as of this line, and nothing
     /// between here and the seal write touches any of them. Computing it inside the intake phase is what
     /// lets the `fold_ref_intake` row carry both numbers; the comparison and its fail-closed throw stay
     /// where they were, just before the seal write. Both stay 0 on a ref-folding abort -- that path
@@ -2545,7 +2573,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// single advance site produced, so for the current code shape it is close to tautological, and B1's
     /// discriminating power went DOWN with this change rather than up. What it still asserts is worth
     /// keeping and is not free: THE SEALED CURSOR IS THE WALK'S CURSOR. The last run of each namespace is
-    /// measured against the DURABLE `per_ns_shard` value the next round will trust, not against the
+    /// measured against the DURABLE ref-life coverage the next round will trust, not against the
     /// walk's own end, so a cursor sealed from anywhere other than this walk -- a stale carry, a mutated
     /// coverage row, a future edit that advances the cursor away from the advance site -- either fails
     /// the epoch/order check below or lands as a count that no longer matches `logs_applied`.
@@ -2556,11 +2584,11 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         uint64_t logs_accounted = 0;
         for (const auto & [ns_str, segments] : walked_segments)
         {
-            const String cursor_key = cursorKey(RootNamespace{ns_str}, /*shard*/0);
+            const UInt128 life_id = live_incarnation.at(ns_str);
             RefTxnId sealed{};
-            if (const auto sit = result.fold_seal.per_ns_shard.find(cursor_key);
-                sit != result.fold_seal.per_ns_shard.end())
-                sealed = sit->second.last_folded_ref_id;
+            if (const auto sit = result.fold_seal.ref_lives.find(life_id);
+                sit != result.fold_seal.ref_lives.end())
+                sealed = sit->second.coverage.last_folded_ref_id;
 
             for (size_t i = 0; i < segments.size(); ++i)
             {
@@ -2645,78 +2673,25 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// change that narrows the gate from round-wide to per-namespace must carry this set with it.
     result.checkpoints = checkpoint_witness;
 
-    /// Namespace-cleanup items: carry the parent generation's items forward, add a Pending
-    /// item for each remove_namespace transaction folded this round (skipped on a ref-folding abort), and
-    /// promote a Pending item to Completed once its physical MANIFEST prefix is empty (namespace files are
-    /// not probed -- see `namespaceManifestsPhysicallyEmpty`). The Pending->Completed transition depends
-    /// only on physical emptiness, so a carried item still advances even on an abort.
-    ///
-    /// PHASE 9/19 `fold_ns_cleanup_scan`: ONE prefix LIST per not-yet-Completed item
-    /// (`namespaceManifestsPhysicallyEmpty` -- it was two before Task 4b dropped the files probe), which
-    /// is the phase's whole cost and the reason it is separated from the intake it sits next to.
-    std::optional<GcPhaseTimer> ns_scan_timer;
-    ns_scan_timer.emplace(phase_sink, "fold_ns_cleanup_scan");
-    result.fold_seal.ns_cleanup_items =
-        adopted_seal ? adopted_seal->ns_cleanup_items : std::map<String, RefNsCleanupItem>{};
-    const uint64_t ns_items_carried = result.fold_seal.ns_cleanup_items.size();
-    uint64_t ns_items_scanned = 0;
-    uint64_t ns_items_completed_now = 0;
+    /// Folding the terminal record earns positive cleanup evidence directly on the catalog-admitted
+    /// life row. It does not claim that any physical debris was removed: `_ckpt`, stream and `_files`
+    /// residue belongs to the perpetual janitor, while orphan manifests belong to the manifest sweep.
+    /// Consequently namespace removal performs no physical LIST and has no Pending/Completed handshake.
     if (!ref_folding_aborted)
         for (const auto & [rns, remove_txn_id] : new_removals)
         {
-            const String key = rns.string() + "\n" + renderRefTxnId(remove_txn_id);
-            result.fold_seal.ns_cleanup_items[key] = RefNsCleanupItem{
-                .ns = rns, .remove_txn_id = remove_txn_id, .state = RefNsCleanupState::Pending};
+            const auto life_it = live_incarnation.find(rns.string());
+            if (life_it == live_incarnation.end())
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "CAS GC fold: terminal removal for namespace '{}' has no row in the round catalog cut",
+                    rns.string());
+            auto row_it = result.fold_seal.ref_lives.find(life_it->second);
+            if (row_it == result.fold_seal.ref_lives.end())
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "CAS GC fold: terminal removal for namespace '{}' has no admitted ref-life row",
+                    rns.string());
+            row_it->second.cleanup_evidence = RefCleanupEvidence{.remove_txn_id = remove_txn_id};
         }
-    for (auto & [key, item] : result.fold_seal.ns_cleanup_items)
-        if (item.state != RefNsCleanupState::Completed)
-        {
-            ++ns_items_scanned;
-            if (namespaceManifestsPhysicallyEmpty(item.ns))
-            {
-                item.state = RefNsCleanupState::Completed;
-                ++ns_items_completed_now;
-            }
-        }
-
-    /// Retire a Completed item once its completion artifacts are DURABLY OBSERVED in this round's own
-    /// global LIST -- the `_cleanup` marker present AND (the `Removed` snapshot present OR superseded by a
-    /// newer Live snapshot). Carrying Completed items forever grows the seal unboundedly and, once a
-    /// removed namespace is recreated (whose Live snapshot supersedes the `Removed` one, which cleanup
-    /// then deletes), drives a per-round republish/delete churn. Gate retirement on ARTIFACT presence,
-    /// not marker-only: a `Removed` snapshot lost to a crash between the two publishes (no recreation)
-    /// must still be repaired by the Completed branch before the item retires. Skipped on a ref-folding
-    /// abort (the LIST may be incomplete); a later clean round retires it.
-    if (!ref_folding_aborted)
-        for (auto it = result.fold_seal.ns_cleanup_items.begin(); it != result.fold_seal.ns_cleanup_items.end();)
-        {
-            const RefNsCleanupItem & item = it->second;
-            bool retire = false;
-            if (item.state == RefNsCleanupState::Completed)
-                if (const auto tit = ref_tables.find(item.ns.string()); tit != ref_tables.end())
-                {
-                    const RefTableListing & listing = tit->second;
-                    const bool marker_present =
-                        std::find(listing.cleanup_markers.begin(), listing.cleanup_markers.end(),
-                                  item.remove_txn_id) != listing.cleanup_markers.end();
-                    const bool removed_snapshot_present =
-                        std::find(listing.snapshots.begin(), listing.snapshots.end(),
-                                  item.remove_txn_id) != listing.snapshots.end();
-                    const bool superseded_by_newer =
-                        !listing.snapshots.empty() && item.remove_txn_id < listing.snapshots.back();
-                    retire = marker_present && (removed_snapshot_present || superseded_by_newer);
-                }
-            if (retire)
-                it = result.fold_seal.ns_cleanup_items.erase(it);
-            else
-                ++it;
-        }
-    ns_scan_timer->metric("items_carried", ns_items_carried);
-    ns_scan_timer->metric("items_added", new_removals.size());
-    ns_scan_timer->metric("items_scanned", ns_items_scanned);
-    ns_scan_timer->metric("items_completed_now", ns_items_completed_now);
-    ns_scan_timer->metric("items_final", result.fold_seal.ns_cleanup_items.size());
-    ns_scan_timer.reset();   /// emits the `fold_ns_cleanup_scan` row
 
     /// The parent generation's per-shard run segments, resolved from
     /// the parent fold seal's `blob_target_runs` and grouped by the ref's explicit `shard`. The same seal
@@ -2816,7 +2791,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// but that is a property of the current code, not the invariant, and a gate that relies on a
     /// coincidence opens the day the coincidence stops holding. The hold SET is the invariant, so the
     /// gate reads the seal it is about to make durable.
-    const std::vector<std::pair<String, RefHold>> carried_holds = result.carriedHolds();
+    const std::vector<std::pair<UInt128, RefHold>> carried_holds = result.carriedHolds();
 
     /// Term 3, the universe seam. `AuthoritativeForTest` means the CALLER has constructed a closed
     /// universe and the per-namespace proofs may decide on their own; anything else -- which in
@@ -3050,8 +3025,10 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         const String seal_body = encodeFoldSeal(result.fold_seal);
         t.metric("seal_bytes", seal_body.size());
         t.metric("seal_runs", result.fold_seal.blob_target_runs.size());
-        t.metric("seal_namespaces", result.fold_seal.per_ns_shard.size());
-        t.metric("ns_cleanup_items", result.fold_seal.ns_cleanup_items.size());
+        t.metric("seal_ref_lives", result.fold_seal.ref_lives.size());
+        t.metric("seal_cleanup_evidence", std::count_if(
+            result.fold_seal.ref_lives.begin(), result.fold_seal.ref_lives.end(),
+            [](const auto & item) { return item.second.cleanup_evidence.has_value(); }));
         putDeterministicArtifact(backend, layout.foldSealKey(new_generation, attempt), seal_body);
     }
 
@@ -3134,16 +3111,6 @@ void Gc::reportSweepRetention(const ManifestSweepResult & result)
     retain_rollup_passes_since_report = 0;
 }
 
-bool Gc::namespaceManifestsPhysicallyEmpty(const RootNamespace & ns)
-{
-    /// ONE prefix, and the reason the second one is absent is in this function's declaration: rebirth
-    /// waits for no file.
-    const ListPage page = store->backend().list(
-        store->layout().manifestNamespacePrefix(ns), /*cursor*/String{}, /*limit*/1);
-    ProfileEvents::increment(ProfileEvents::CasGcEnumerationPages);
-    return page.keys.empty();
-}
-
 void Gc::cleanupRefObjects(const FoldResult & folded, bool suppress_destructive)
 {
     /// A clamp / ref-folding abort this round may leave landed-before-cut edges unfolded behind the clamp,
@@ -3153,26 +3120,8 @@ void Gc::cleanupRefObjects(const FoldResult & folded, bool suppress_destructive)
 
     Backend & backend = store->backend();
     const Layout & layout = store->layout();
-
-    /// A remove_namespace log is retained until its namespace-cleanup item is durably Completed:
-    /// its owner-removal edges must stay foldable until the physical reclaim is done.
-    /// Once Completed, the item's `remove_txn_id` also names the constant-size `Removed` snapshot -- the
-    /// covering snapshot of the WHOLE tail (every log id <= remove_txn_id). `runNamespaceCleanupPasses`
-    /// ran first this round and made that snapshot durable (idempotent putIfAbsent), so we hand its id to
-    /// `planRefCleanup` as a covering snapshot even when the writer never published it and this round's
-    /// scan therefore did not return it -- closing the liveness gap where a removed namespace's covered
-    /// logs would otherwise persist forever (the completing round is the only fold on a quiesced pool).
-    std::set<std::pair<String, RefTxnId>> blocked_removals;
-    std::map<String, RefTxnId> completed_removals;   /// ns -> greatest Completed remove_txn_id (the tail cover)
-    for (const auto & [key, item] : folded.fold_seal.ns_cleanup_items)
-        if (item.state != RefNsCleanupState::Completed)
-            blocked_removals.insert({item.ns.string(), item.remove_txn_id});
-        else
-        {
-            RefTxnId & slot = completed_removals[item.ns.string()];
-            if (slot < item.remove_txn_id)
-                slot = item.remove_txn_id;
-        }
+    if (!folded.catalog_cut)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS GC ref cleanup: fold result carries no catalog cut");
 
     /// Backend exposes only token-conditional `deleteExact` (no batch-delete primitive), so cleanup is a
     /// per-key HEAD + exact-token delete (like the orphan sweep). Ref objects are immutable and their keys
@@ -3191,28 +3140,21 @@ void Gc::cleanupRefObjects(const FoldResult & folded, bool suppress_destructive)
     for (const auto & [ns_str, listing] : folded.ref_tables)
     {
         const RootNamespace ns{ns_str};
-        /// Review C3: look up the SAME life the round's walk resolved (`folded.live_incarnation`),
-        /// never re-resolve independently -- a fresh `resolveLifeOrSentinel` read here could see a
-        /// namespace dropped and recreated since the walk ran, and would then delete the NEW
-        /// incarnation's live objects using ids read under the OLD one. A namespace absent from the
-        /// map is skipped rather than deleted at a fabricated key (same reasoning as C1's walk fix).
-        const auto life_it = folded.live_incarnation.find(ns_str);
-        if (life_it == folded.live_incarnation.end())
+        /// Review C3: look up the SAME complete cut the round's walk resolved, never re-resolve
+        /// independently. A fresh read here could see a namespace dropped and recreated since the
+        /// walk and delete the successor's objects using predecessor bounds. An absent or `Creating`
+        /// row is skipped rather than mapped to a fabricated key.
+        const auto entry_it = std::lower_bound(
+            folded.catalog_cut->catalog.entries.begin(), folded.catalog_cut->catalog.entries.end(), ns,
+            [](const CatalogEntry & entry, const RootNamespace & needle) { return entry.ns < needle; });
+        if (entry_it == folded.catalog_cut->catalog.entries.end() || entry_it->ns != ns
+            || (entry_it->state != NsState::Live && entry_it->state != NsState::Removing))
             continue;
-        const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(ns, life_it->second);
-        RefTxnId durable_cursor{};
-        if (const auto it = folded.fold_seal.per_ns_shard.find(cursorKey(ns, /*shard*/0));
-            it != folded.fold_seal.per_ns_shard.end())
-            durable_cursor = it->second.last_folded_ref_id;
-
-        std::set<RefTxnId> removal_logs_blocked;
-        for (const RefTxnId & log_id : listing.logs)
-            if (blocked_removals.contains({ns_str, log_id}))
-                removal_logs_blocked.insert(log_id);
-
-        std::optional<RefTxnId> completed_removal_snapshot;
-        if (const auto cit = completed_removals.find(ns_str); cit != completed_removals.end())
-            completed_removal_snapshot = cit->second;
+        const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(entry_it->ns, entry_it->incarnation);
+        const auto row_it = folded.fold_seal.ref_lives.find(entry_it->incarnation);
+        const RefTxnId durable_cursor = row_it != folded.fold_seal.ref_lives.end()
+            ? row_it->second.coverage.last_folded_ref_id
+            : RefTxnId{};
 
         /// The namespace's own durable tail, which TIGHTENS both delete boundaries and can never widen
         /// either -- see `planRefCleanup`. Absent for a namespace whose `_ckpt` does not exist yet or has
@@ -3222,8 +3164,7 @@ void Gc::cleanupRefObjects(const FoldResult & folded, bool suppress_destructive)
         if (const auto ckit = folded.checkpoints.find(ns_str); ckit != folded.checkpoints.end())
             checkpoint = ckit->second;
 
-        const RefCleanupPlan plan = planRefCleanup(listing, durable_cursor, removal_logs_blocked,
-                                                   completed_removal_snapshot, checkpoint);
+        const RefCleanupPlan plan = planRefCleanup(listing, durable_cursor, checkpoint);
         for (const RefTxnId & log_id : plan.deletable_logs)
             deleteRefObject(layout.refLogKey(life, log_id));
         for (const RefTxnId & snap_id : plan.deletable_snapshots)
@@ -3233,175 +3174,6 @@ void Gc::cleanupRefObjects(const FoldResult & folded, bool suppress_destructive)
             /// survive every cleanup that the same checkpoint authorized.
             chassert(!checkpoint || snap_id < *checkpoint);
             deleteRefObject(layout.refSnapshotKey(life, snap_id));
-        }
-    }
-}
-
-void Gc::runNamespaceCleanupPasses(const CasFoldSeal & seal, const std::map<String, RefTableListing> & ref_tables,
-                                   const std::map<String, UInt128> & live_incarnation,
-                                   uint64_t new_round, bool suppress_destructive)
-{
-    Backend & backend = store->backend();
-    const Layout & layout = store->layout();
-
-    /// Re-read gc/state and confirm this round is still the durable round under our lease. Compare the
-    /// ROUND (strictly incremented on every commit), never `lease.seq` -- a
-    /// deposed-then-re-elected owner can present the same seq. A false here means a successor advanced past
-    /// us; the destructive Pending pass below must not run against a namespace that successor may have
-    /// Completed and the writer recreated.
-    const auto round_still_ours = [&]() -> bool
-    {
-        const auto got = backend.get(layout.gcStateKey());
-        if (!got)
-            return false;
-        const GcState durable = decodeGcState(got->bytes);
-        return durable.round == new_round && durable.lease.owner == gc_id;
-    };
-
-    for (const auto & [key, item] : seal.ns_cleanup_items)
-    {
-        /// Review C2: the `_cleanup` marker, the `Removed`-snapshot republish, and the `_ckpt` backstop
-        /// delete are all incarnation-keyed now that every READER of them moved off the Stage-A
-        /// sentinel (`observedNamespaceCleanupMarker`, the retirement check's `listing.cleanup_markers`/
-        /// `snapshots`, `publishCkptContribution`). Writing/deleting them at the sentinel while readers
-        /// look at the real life makes namespace recreation permanently refuse, `Completed` items never
-        /// retire, and leaks the real `_ckpt` forever -- so resolve the SAME life the round's walk did
-        /// (`live_incarnation`), and skip the item entirely if the catalog does not (or no longer) name
-        /// it rather than act at a fabricated key (same direction as C1's fix).
-        const auto life_it = live_incarnation.find(item.ns.string());
-        if (life_it == live_incarnation.end())
-            continue;
-        const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(item.ns, life_it->second);
-        if (item.state == RefNsCleanupState::Pending)
-        {
-            /// A clamp/abort round defers the physical reclaim (align with the round's destructive gate).
-            if (suppress_destructive)
-                continue;
-            /// Freshness fence at pass start: a deposed leader stops here rather than deleting recreated data.
-            if (!round_still_ours())
-                return;
-
-            /// The completion marker's PRESENCE is the exact precondition a successor uses before recreating
-            /// this namespace ("observing an empty physical prefix is not sufficient"). If a successor
-            /// already Completed this item, the marker exists and the writer may have recreated live objects
-            /// under these prefixes -- abort the pass on marker-present.
-            const String marker_key = layout.refCleanupMarkerKey(life, item.remove_txn_id);
-
-            /// Bounded exact-key enumerate-and-delete over the removed namespace's physical `@cas@` prefixes
-            /// (manifest bodies + verbatim files). NotFound/TokenMismatch tolerated.
-            ///
-            /// THE FILES PASS IS NOW LEAK-ONLY, and its discipline is unchanged for that reason rather
-            /// than in spite of it. Since Task 4b nothing WAITS on it -- `namespaceManifestsPhysicallyEmpty`
-            /// no longer probes `_files`, so a file this pass fails to enumerate delays nothing and blocks
-            /// no recreation. What it still does is reclaim storage, and it may only reclaim the life the
-            /// catalog names right now: the per-page/per-key freshness + `_cleanup`-marker + `deleteExact`
-            /// discipline below is what makes that safe against a concurrent recreation, and exact-token
-            /// deletion is what makes leak-only cleanup safe at all. A DEAD life's files are outside this
-            /// pass entirely -- unreachable, so no longer urgent -- and are the janitor's (Task 5).
-            struct { String prefix; bool is_manifest; } passes[] = {
-                {layout.manifestNamespacePrefix(item.ns), true},
-                {layout.namespaceFilesPrefix(life), false},
-            };
-            for (const auto & pass : passes)
-            {
-                String cursor;
-                for (;;)
-                {
-                    /// Per-page freshness + recreation re-check bounds the delete window to one page.
-                    if (!round_still_ours() || backend.head(marker_key).exists)
-                        return;
-                    const ListPage page = backend.list(pass.prefix, cursor, 1000);
-                    /// One page fetched, not one increment per listed key below.
-                    ProfileEvents::increment(ProfileEvents::CasGcEnumerationPages);
-                    for (const ListedKey & lk : page.keys)
-                    {
-                        /// PER-KEY recreation guard (airtight, applied to every key of both prefixes). The
-                        /// `_cleanup` marker's presence is the exact precondition for ANY recreation.
-                        /// Checking it per key -- not just per page -- closes the window
-                        /// where a recreation lands mid-page: a manifest body is deleted only if the marker
-                        /// was still absent immediately before its delete. This covers a WARM recreation too
-                        /// (`observedNamespaceCleanupMarker` reuses the same `live_writer_epoch` -- bumped only
-                        /// at open/remount, never on warm recreation -- so its manifest carries `writer_epoch`
-                        /// EQUAL to the removed incarnation's and would slip past the epoch skip below).
-                        if (backend.head(marker_key).exists)
-                            return;
-
-                        /// Cheap defense-in-depth skip for manifests: a strictly-greater-epoch body is a
-                        /// cold recreation's and is never removed-incarnation debris (an unparseable key is
-                        /// skipped fail-closed; the orphan sweep is the backstop). The per-key marker HEAD
-                        /// above is the load-bearing guard; verbatim files carry no epoch and rely on it alone.
-                        if (pass.is_manifest)
-                        {
-                            const auto parsed = layout.parseManifestKey(lk.key);
-                            if (!parsed || parsed->ref.writer_epoch > item.remove_txn_id.writer_epoch)
-                                continue;
-                        }
-
-                        if (lk.token)
-                            backend.deleteExact(lk.key, *lk.token);
-                        else if (const HeadResult h = backend.head(lk.key); h.exists)
-                            backend.deleteExact(lk.key, h.token);
-                    }
-                    if (page.next_cursor.empty())
-                        break;
-                    cursor = page.next_cursor;
-                }
-            }
-
-            /// THE `_ckpt` BACKSTOP. The removed namespace's checkpoint object is the one ref object
-            /// nothing else reclaims: the covered-log cleanup deletes logs and snapshots, the two
-            /// physical passes above cover `cas/manifests/<ns>/` and the verbatim files, and
-            /// `namespaceManifestsPhysicallyEmpty` -- which decides Pending -> Completed -- does not look
-            /// under `cas/ns/state/` at all. Delete the known checkpoint while this life is still resolved;
-            /// after catalog removal its opaque id is intentionally inert and no logical cleanup path may
-            /// rediscover it from the key.
-            ///
-            /// KNOWN KEY, not a prefix pass: the key is derived from the namespace alone, so this is one
-            /// HEAD and one exact-token delete -- no enumeration under `cas/ns/stream/`, which is deliberate
-            /// (an enumerate-and-delete there could reach a recreated incarnation's live objects). It
-            /// sits under the SAME per-key marker guard as every delete above, for the same reason: the
-            /// marker's presence is the exact precondition for any recreation, and a recreated namespace
-            /// publishes a fresh `_ckpt` at this very key.
-            ///
-            /// Stage B's lifecycle owns the ordinary delete of this object by exact token; this is the
-            /// GC-side backstop for the incarnation that never got one.
-            if (!round_still_ours() || backend.head(marker_key).exists)
-                return;
-            const String ckpt_key = layout.refCkptKey(life);
-            if (const HeadResult ckpt_head = backend.head(ckpt_key); ckpt_head.exists)
-                backend.deleteExact(ckpt_key, ckpt_head.token);   /// NotFound/TokenMismatch tolerated
-        }
-        else
-        {
-            /// Completed: publish the completion marker and (conditionally) republish the constant-size
-            /// Removed snapshot, both derived from {namespace, remove_txn_id} alone. Winning this round's
-            /// gc/state CAS (moments earlier) is the GC leadership fence gating publication -- a deposed
-            /// leader's round CAS ABORTs before reaching here, so no stale publication occurs. The marker
-            /// putIfAbsent is a no-op when present ("republish only if absent"). The `Removed` snapshot is
-            /// republished ONLY when it is absent AND not superseded by a newer Live snapshot: a lost
-            /// snapshot (crash between the two publishes, no recreation) is repaired, but a snapshot a
-            /// recreated namespace already superseded (and cleanup deleted) is NOT re-created -- otherwise
-            /// each round re-creates it and the next deletes it, a permanent one-PUT-one-DELETE churn.
-            backend.putIfAbsent(layout.refCleanupMarkerKey(life, item.remove_txn_id), String{});
-            bool removed_snapshot_present = false;
-            bool superseded_by_newer = false;
-            if (const auto tit = ref_tables.find(item.ns.string()); tit != ref_tables.end())
-            {
-                const RefTableListing & listing = tit->second;
-                removed_snapshot_present = std::find(listing.snapshots.begin(), listing.snapshots.end(),
-                                                     item.remove_txn_id) != listing.snapshots.end();
-                superseded_by_newer = !listing.snapshots.empty() && item.remove_txn_id < listing.snapshots.back();
-            }
-            if (!removed_snapshot_present && !superseded_by_newer)
-            {
-                RefTableSnapshot removed;
-                removed.ns = item.ns.string();
-                removed.snapshot_id = item.remove_txn_id;
-                removed.lifecycle = RefLifecycle::Removed;
-                removed.remove_txn_id = item.remove_txn_id;
-                backend.putIfAbsent(layout.refSnapshotKey(life, item.remove_txn_id),
-                                    sealObject(FormatId::RefSnapshot, encodeRefTableSnapshot(removed)));
-            }
         }
     }
 }
@@ -3665,20 +3437,20 @@ RefScanSummary Gc::listRefPrefix(const GcState & state)
 {
     /// The round's ONE hint enumeration, plus the DEFER signal computed from it (the number of tables
     /// with at least one ref log above their sealed cursor).
-    /// The catalog cut is deliberately read first: an id absent from this earlier cut is post-cut or
-    /// unknown and forces deferral; it is not inert-debris proof.
+    /// The authoritative catalog cut follows the completed LIST. A listed id absent from this later
+    /// cut is dead, inert debris: it contributes no work and cannot force DEFER.
+    RefScanSummary scan = enumerateRefPrefix();
     const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(store->backend(), store->layout());
     catalog_cut.life_index.throwIfAmbiguous("CAS GC hot scan");
-    RefScanSummary scan = enumerateRefPrefix();
     scan.catalog_cut = catalog_cut;
 
-    std::map<String, ShardCoverage> cursors;
+    std::map<UInt128, RefLifeFoldState> ref_lives;
     if (const auto seal = readFoldSeal(state.snap_generation, state.snap_attempt))
-        cursors = seal->per_ns_shard;
+        ref_lives = seal->ref_lives;
 
     for (const NamespaceLifePhysicalId life_id : scan.listed_lives)
         if (!catalog_cut.life_index.resolve(life_id))
-            scan.has_post_cut_unknown_life = true;
+            ++scan.dead_life_debris;
 
     for (const auto & [life_id, greatest] : scan.max_log_by_life)
     {
@@ -3686,8 +3458,8 @@ RefScanSummary Gc::listRefPrefix(const GcState & state)
         if (!life)
             continue;
         RefTxnId folded{};
-        if (const auto it = cursors.find(cursorKey(life->ns, /*shard*/0)); it != cursors.end())
-            folded = it->second.last_folded_ref_id;
+        if (const auto it = ref_lives.find(life_id); it != ref_lives.end())
+            folded = it->second.coverage.last_folded_ref_id;
         if (folded < greatest)
             ++scan.changed_shards;
     }
@@ -3899,23 +3671,14 @@ RebuildReport Gc::rebuildBaseline(bool force)
     Backend & backend = store->backend();
     const Layout & layout = store->layout();
 
-    /// One immutable authority cut drives both the generation-0 health check and the rebuild's
-    /// universe/reverse join. A second catalog read could make the decision and the work disagree.
-    const CasRefCatalog::Snapshot rebuild_catalog_cut = CasRefCatalog::read(backend, layout);
-    rebuild_catalog_cut.life_index.throwIfAmbiguous("CAS GC rebuild");
-    std::vector<NamespaceLifeId> rebuild_universe;
-    rebuild_universe.reserve(rebuild_catalog_cut.catalog.entries.size());
-    for (const CatalogEntry & entry : rebuild_catalog_cut.catalog.entries)
-        if (entry.state != NsState::Creating)
-            rebuild_universe.push_back(NamespaceLifeId::fromCatalogEntry(entry.ns, entry.incarnation));
-
-    /// Health check BEFORE the lease (the lease acquire on an absent state CREATES a bootstrap
-    /// body, which must not make scenario (а) look healthy). Healthy = decodes AND, when a baseline
-    /// is claimed, the seal + every referenced run + every retired list are HEAD-present.
+    /// Read bookkeeping health before the lease (the lease acquire on an absent state CREATES a
+    /// bootstrap body, which must not make scenario (а) look healthy). A generation-0 ref-baseline
+    /// check is deliberately postponed to the sole post-LIST work cut below.
     /// The prior seal, when `gc/state` claims one. It is the ONLY place holds live, so the rebuild
     /// either reads it and carries every hold forward, or refuses (see the refusal below).
     std::optional<CasFoldSeal> prior_seal;
     bool healthy = false;
+    bool validate_generation_zero_ref_baseline = false;
     {
         const auto got = backend.get(layout.gcStateKey());
         /// The state's own decode stays inside its own try: an undecodable `gc/state` IS scenario (а),
@@ -3939,44 +3702,10 @@ RebuildReport Gc::rebuildBaseline(bool force)
             healthy = true;
             if (st.snap_generation == 0)
             {
-                /// A gen-0 state (possibly a bootstrap body minted by a lease acquire AFTER the real
-                /// state was lost) is healthy ONLY when no table proves cleaned logs -- the ref baseline
-                /// guard: a snapshot with no surviving log at or below it (its covered logs were cleaned
-                /// by a now-lost cursor).
-                for (const NamespaceLifeId & life : rebuild_universe)
-                {
-                    std::vector<String> table_keys;
-                    /// This LIST is scoped to `namespaceStreamPrefix(life)`, so another physical life's
-                    /// objects are structurally excluded before grouping.
-                    forEachListedKey(backend, layout.namespaceStreamPrefix(life),
-                        [&](const ListedKey & lk) { table_keys.push_back(lk.key); }, 1000, onGcEnumerationPage);
-                    /// `groupRefKeys` REFUSES a key that names no life, and this call is the rebuild's
-                    /// own -- outside the fold's catch. An escaping refusal would take out the recovery
-                    /// command on the damaged pool it exists for. The pool cannot be called healthy
-                    /// either: this guard reads the ref baseline, and a listing it could not group proves
-                    /// nothing about it. So the unprovable answer becomes NOT healthy, which is the
-                    /// direction that lets the rebuild run -- and the rebuild writes only the gc plane
-                    /// and deletes nothing.
-                    std::map<NamespaceLifePhysicalId, RefTableListing> grouped;
-                    try
-                    {
-                        grouped = groupRefKeys(layout, table_keys);
-                    }
-                    catch (const Exception & e)
-                    {
-                        if (e.code() != ErrorCodes::CORRUPTED_DATA)
-                            throw;
-                        healthy = false;
-                        break;
-                    }
-                    const auto git = grouped.find(life.incarnation);
-                    if (git != grouped.end() && !git->second.snapshots.empty()
-                        && (git->second.logs.empty() || git->second.snapshots.back() < git->second.logs.front()))
-                    {
-                        healthy = false;
-                        break;
-                    }
-                }
+                /// This check needs the rebuild universe. Delay it until after lease acquisition, the
+                /// zero-mutation generation-0 drain, the completed hot LIST and the sole fresh work cut.
+                /// No pre-lease catalog snapshot may become authority for successor construction.
+                validate_generation_zero_ref_baseline = true;
             }
             if (st.snap_generation > 0)
             {
@@ -4076,7 +3805,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
             /// -- a pool that never sealed a baseline has no hold to lose.
         }
     }
-    if (healthy && !force)
+    if (healthy && !force && !validate_generation_zero_ref_baseline)
     {
         rep.refusal = "gc/state and every referenced artifact are healthy — a rebuild would discard "
                       "live bookkeeping; re-run with FORCE to rebuild deliberately";
@@ -4095,6 +3824,61 @@ RebuildReport Gc::rebuildBaseline(bool force)
     {
         rep.refusal = "another GC leader holds the lease";
         return rep;
+    }
+
+    /// Healthy `FORCE REBUILD` shares the same parent-authorized barrier as an ordinary round. A
+    /// damaged-state rebuild has no adopted parent (`snap_generation == 0`) and the barrier performs
+    /// zero catalog mutations. Only after that distinction is resolved do we complete the hot LIST and
+    /// take the sole fresh work cut.
+    drainCompletedRemoving(state);
+    const RefScanSummary rebuild_ref_scan = enumerateRefPrefix();
+    const CasRefCatalog::Snapshot rebuild_work_catalog_cut = CasRefCatalog::read(backend, layout);
+
+    RefWalkPlanInputs rebuild_walk_inputs;
+    if (prior_seal)
+        rebuild_walk_inputs.parent_ref_lives = prior_seal->ref_lives;
+    rebuild_walk_inputs.listed_lives = rebuild_ref_scan.listed_lives;
+    rebuild_walk_inputs.tail_observations = rebuild_ref_scan.max_log_by_life;
+    RefWalkPlan rebuild_walk_plan = buildRefWalkPlan(rebuild_work_catalog_cut, rebuild_walk_inputs);
+    const std::vector<NamespaceLifeId> rebuild_walk_universe = rebuild_walk_plan.lives();
+
+    if (validate_generation_zero_ref_baseline)
+    {
+        /// A generation-0 state is healthy only when no table proves that a now-lost cursor cleaned
+        /// covered logs. The check consumes the same catalog-built universe as reconstruction; it does
+        /// not own an earlier catalog cut or a second admission rule.
+        for (const NamespaceLifeId & life : rebuild_walk_universe)
+        {
+            std::vector<String> table_keys;
+            forEachListedKey(backend, layout.namespaceStreamPrefix(life),
+                [&](const ListedKey & lk) { table_keys.push_back(lk.key); }, 1000, onGcEnumerationPage);
+            std::map<NamespaceLifePhysicalId, RefTableListing> grouped;
+            try
+            {
+                grouped = groupRefKeys(layout, table_keys);
+            }
+            catch (const Exception & e)
+            {
+                if (e.code() != ErrorCodes::CORRUPTED_DATA)
+                    throw;
+                healthy = false;
+                break;
+            }
+            const auto grouped_it = grouped.find(life.incarnation);
+            if (grouped_it != grouped.end() && !grouped_it->second.snapshots.empty()
+                && (grouped_it->second.logs.empty()
+                    || grouped_it->second.snapshots.back() < grouped_it->second.logs.front()))
+            {
+                healthy = false;
+                break;
+            }
+        }
+        if (healthy && !force)
+        {
+            rep.refusal = "gc/state and every referenced artifact are healthy — a rebuild would discard "
+                          "live bookkeeping; re-run with FORCE to rebuild deliberately";
+            return rep;
+        }
     }
 
     /// Numbering, part 1: generation above ANY surviving gc/gen prefix (putDeterministicArtifact
@@ -4164,34 +3948,22 @@ RebuildReport Gc::rebuildBaseline(bool force)
         deltas.clear();
     };
 
-    /// Universe scan: one immutable catalog cut is both the logical universe and the reverse join for
-    /// the following stream observation. A listed id absent from this earlier cut is unknown and
-    /// defers REBUILD; a key can never mint a phantom catalog row.
-    {
-        for (const String & key : enumerateRefPrefix().keys)
-        {
-            const auto parsed = parseRefObjectKeyForEnumeration(layout, key);
-            if (parsed && !rebuild_catalog_cut.life_index.resolve(parsed->life_id))
-            {
-                rep.refusal = "stream life_id " + renderIncarnation(parsed->life_id)
-                    + " is absent from REBUILD's earlier catalog cut — reported and deferred; "
-                      "a listed key cannot create a logical namespace";
-                return rep;
-            }
-        }
-    }
+    /// `rebuild_walk_plan` was frozen immediately after the completed hot LIST and sole fresh catalog
+    /// cut. Listed ids absent from that later cut are inert dead-life debris and cannot mint work or
+    /// refuse reconstruction.
     std::set<String> seen_ns;
     std::set<String> owned_manifest_keys;
     CasFoldSeal seal;
     seal.generation = generation;
     seal.parent_generation = state.snap_generation;
-    /// Cursor keys whose hold this rebuild MINTED (see `minted_here`); they are stamped with the retry
+    seal.ref_lives = rebuild_walk_plan.releaseFoldStates();
+    /// Life ids whose hold this rebuild MINTED (see `minted_here`); they are stamped with the retry
     /// round once it is known, and nothing else is touched.
-    std::set<String> minted_hold_keys;
+    std::set<UInt128> minted_hold_lives;
     uint64_t max_fence_round = 0;
     std::map<ManifestId, Token> mf_cleanup_unused;
 
-    for (const NamespaceLifeId & life : rebuild_universe)
+    for (const NamespaceLifeId & life : rebuild_walk_universe)
     {
         const RootNamespace & ns = life.ns;
         seen_ns.insert(ns.string());
@@ -4206,7 +3978,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
         /// transitional sentinel fallback can redirect this walk to a different life.
         const RefTableState st = recoverRefTable(backend, layout, life, onGcEnumerationPage);
 
-        ShardCoverage cov;
+        RefCoverage cov;
         cov.classification = 2;   /// Folded (full coverage) unless a bodiless precommit clamps
         cov.last_folded_ref_id = st.getGreatestApplied();
         /// Whether the hold on this row was minted BY THIS REBUILD (and so still owes a retry round)
@@ -4273,29 +4045,21 @@ RebuildReport Gc::rebuildBaseline(bool force)
         /// has been stuck. The ordinary clearing rule then applies from the next round on.
         if (prior_seal)
         {
-            const auto pit = prior_seal->per_ns_shard.find(cursorKey(ns, /*shard*/0));
-            if (pit != prior_seal->per_ns_shard.end() && pit->second.hold)
+            const auto pit = prior_seal->ref_lives.find(life.incarnation);
+            if (pit != prior_seal->ref_lives.end() && pit->second.coverage.hold)
             {
                 cov.classification = 4;
-                cov.hold = pit->second.hold;
+                cov.hold = pit->second.coverage.hold;
                 minted_here = false;   /// a carried hold rides VERBATIM; its retry fields are not ours
             }
         }
-        const String rebuilt_cursor_key = cursorKey(ns, /*shard*/0);
         if (minted_here)
-            minted_hold_keys.insert(rebuilt_cursor_key);
-        seal.per_ns_shard[rebuilt_cursor_key] = cov;
+            minted_hold_lives.insert(life.incarnation);
+
+        RefLifeFoldState & row = seal.ref_lives.at(life.incarnation);
+        row.coverage = cov;
     }
     rep.namespaces = seen_ns.size();
-
-    /// A hold on a namespace the universe scan did NOT rediscover is the one that must not be dropped:
-    /// a held namespace can be exactly the one whose ref objects the store has stopped listing. Its
-    /// whole coverage row rides forward -- hold AND cursor -- so the next round walks it from where the
-    /// hold left it rather than from `{0, 0}`.
-    if (prior_seal)
-        for (const auto & [key, prior_cov] : prior_seal->per_ns_shard)
-            if (prior_cov.hold && !seal.per_ns_shard.contains(key))
-                seal.per_ns_shard[key] = prior_cov;
 
     /// Trimmed-but-live precommits: a build alive across trim has NO journal
     /// evidence; its manifests look unowned. Include edges of every manifest that is unowned AND
@@ -4354,9 +4118,10 @@ RebuildReport Gc::rebuildBaseline(bool force)
     /// because the round was not minted yet). Carried holds are named by no key here and are not
     /// touched: their `next_retry_round` and `retry_count` ride verbatim, since a rebuild retries
     /// nothing.
-    for (const String & key : minted_hold_keys)
-        if (const auto it = seal.per_ns_shard.find(key); it != seal.per_ns_shard.end() && it->second.hold)
-            it->second.hold->next_retry_round = round + 1;
+    for (const UInt128 life_id : minted_hold_lives)
+        if (const auto it = seal.ref_lives.find(life_id);
+            it != seal.ref_lives.end() && it->second.coverage.hold)
+            it->second.coverage.hold->next_retry_round = round + 1;
 
     for (uint64_t shard = 0; shard < gc_shards; ++shard)
         flush_shard(shard);   /// real-edge rows only: a rebuild condemns nothing, so it seeds nothing
@@ -4636,6 +4401,82 @@ bool Gc::acquireOrRenewLease(GcState & state, Token & state_token, bool allow_st
     }
 
     return false;
+}
+
+uint64_t Gc::drainCompletedRemoving(const GcState & leased_state)
+{
+    if (leased_state.snap_generation == 0)
+        return 0;
+
+    const std::optional<CasFoldSeal> parent = readFoldSeal(
+        leased_state.snap_generation, leased_state.snap_attempt);
+    if (!parent)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS GC pre-fold drain: adopted parent seal (generation {}, attempt {}) is missing",
+            leased_state.snap_generation, leased_state.snap_attempt);
+
+    Backend & backend = store->backend();
+    const Layout & layout = store->layout();
+    const uint64_t admitted_generation = leased_state.lease.seq;
+    const auto check_fence_or_throw = [&](uint64_t expected_generation)
+    {
+        if (expected_generation != admitted_generation)
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "CAS GC pre-fold drain: internal leader generation mismatch (expected {}, admitted {})",
+                expected_generation, admitted_generation);
+        const auto got = backend.get(layout.gcStateKey());
+        if (!got)
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS GC pre-fold drain: gc/state vanished while checking leader generation {}",
+                admitted_generation);
+        const GcState current = decodeGcState(got->bytes);
+        if (current.lease.owner != gc_id || current.lease.seq != admitted_generation)
+            throw Exception(ErrorCodes::ABORTED,
+                "CAS GC pre-fold drain: leader fence moved from owner {} generation {} to owner {} generation {}",
+                u128ToHex(gc_id), admitted_generation,
+                u128ToHex(current.lease.owner), current.lease.seq);
+    };
+
+    uint64_t deleted = 0;
+    for (;;)
+    {
+        const CasRefCatalog::Snapshot catalog = CasRefCatalog::read(backend, layout);
+        const CatalogEntry * eligible = nullptr;
+        for (const CatalogEntry & entry : catalog.catalog.entries)
+        {
+            if (entry.state != NsState::Removing)
+                continue;
+            const auto row = parent->ref_lives.find(entry.incarnation);
+            if (row == parent->ref_lives.end()
+                || !row->second.cleanup_evidence
+                || row->second.coverage.hold)
+                continue;
+            eligible = &entry;
+            break;
+        }
+        if (!eligible)
+            return deleted;
+
+        switch (CasRefCatalog::deleteCompletedRemoving(
+            backend, layout, *eligible, *parent, admitted_generation, check_fence_or_throw))
+        {
+            case CasRefCatalog::CompletedRemovingDeleteOutcome::Deleted:
+                ++deleted;
+                store->invalidateRemovedCatalogLife(
+                    NamespaceLifeId::fromCatalogEntry(eligible->ns, eligible->incarnation));
+                break;
+            case CasRefCatalog::CompletedRemovingDeleteOutcome::EntryChanged:
+                break;   /// resolved by the mandatory fresh rescan
+            case CasRefCatalog::CompletedRemovingDeleteOutcome::FencedOut:
+                throwCasWriteRetryLater(fmt::format(
+                    "CAS GC pre-fold drain lost leader generation {} before resolving namespace '{}'",
+                    admitted_generation, eligible->ns.string()));
+            case CasRefCatalog::CompletedRemovingDeleteOutcome::ProofRefused:
+                throw Exception(ErrorCodes::LOGICAL_ERROR,
+                    "CAS GC pre-fold drain selected namespace '{}' without matching no-hold cleanup evidence",
+                    eligible->ns.string());
+        }
+    }
 }
 
 }

@@ -161,19 +161,12 @@ public:
                           std::function<void(RefPublishedAtUpdate &)> mutator);
 
     /// Durably removes the complete namespace, including its current ref/precommit state, then performs
-    /// the associated cleanup and cancellation work. Repeated removal observes the cached `Removed`
-    /// state; a failed append leaves the namespace live and propagates the exception.
+    /// the associated cancellation work. A failed append leaves the namespace live and propagates.
     DropNamespaceStats dropNamespace(const RootNamespace & ns);
 
     /// Decommission-only exact-life form. Pins recovery to the immutable catalog cut selected by the
     /// admin command, so a same-name replacement can never redirect destructive work.
     DropNamespaceStats dropNamespace(const NamespaceLifeId & life);
-
-    /// Reports whether recovery has established the namespace's durable lifecycle as `Removed`.
-    bool namespaceIsRemoved(const RootNamespace & ns);
-
-    /// Exact-life companion to `dropNamespace` for decommission's preflight check.
-    bool namespaceIsRemoved(const NamespaceLifeId & life);
 
     /// The catalog life every one of this namespace's objects -- ref-layer AND namespace-file -- is keyed
     /// under, resolved ONCE per table-open and read from the cache afterwards. This is the WRITE-side
@@ -185,7 +178,7 @@ public:
 
     /// The life a READER (or a REMOVER) of this namespace's files must use, or `nullopt` when there are
     /// no readable files at all -- which is the same answer for a namespace that never existed, one
-    /// still being created, and one whose table was dropped (durably `Removed`).
+    /// still being created, and one whose catalog row is `Removing` or absent.
     ///
     /// IT NEVER CREATES A NAMESPACE, and that is the property the callers depend on rather than a
     /// side-effect of how it happens to be written: for an uncataloged namespace it answers from a
@@ -204,6 +197,12 @@ public:
     /// is only ever reached for a namespace whose absence is durable knowledge.
     std::optional<NamespaceLifeId> namespaceFilesLifeIfReadable(const RootNamespace & ns);
 
+    /// Called only after the catalog's exact proved `Removing -> absent` CAS commits. It does not
+    /// destroy the runtime: existing callers that already captured the old physical life may finish
+    /// with their stale-or-not-found contract. The next name-based touch resets this same runtime in
+    /// place and resolves a fresh catalog life.
+    void invalidateRemovedCatalogLife(const NamespaceLifeId & life);
+
     /// Queues a mutation for flat-combining with compatible callers. `build_ops` runs at most once in
     /// the flush leader and must return operations without writing storage itself. The leader validates
     /// the complete batch, writes one ref-log object behind the append fence, and applies the batch to the
@@ -213,10 +212,6 @@ public:
                          std::function<std::vector<RefOp>(const RefTableState &)> build_ops,
                          RootMutationOrigin origin, RootMutationKind kind,
                          bool skip_stale_precommit_sweep = false);
-
-    /// Records that recovery observed the cleanup marker for `remove_txn_id`; returns whether the marker
-    /// was present. The observation is retained with the recovered table for namespace recreation gates.
-    bool observedNamespaceCleanupMarker(const RootNamespace & ns, const RefTxnId & remove_txn_id);
 
     /// Attempts one snapshot publication from a copy of the live state. The copy is made under
     /// `state_mutex`, the conditional `PUT` is performed without that mutex, and counters are adopted
@@ -400,9 +395,32 @@ public:
         const auto it = ref_tables.find(ns.string());
         return it != ref_tables.end() && it->second->recovered;
     }
+    /// Stable identity of the cached runtime object, or null when no slot exists. This distinguishes
+    /// explicit life invalidation from an eviction/remount that would make a rebirth test pass by
+    /// constructing a different cache object.
+    const void * refTableRuntimeIdentityForTest(const RootNamespace & ns)
+    {
+        std::lock_guard<std::mutex> g(ref_queue_mutex);
+        const auto it = ref_tables.find(ns.string());
+        return it == ref_tables.end() ? nullptr : it->second.get();
+    }
+    /// The physical life currently pinned in the cached runtime, without resolving or recovering it.
+    std::optional<NamespaceLifeId> refTableLifeForTest(const RootNamespace & ns)
+    {
+        std::shared_ptr<RefTableRuntime> rt;
+        {
+            std::lock_guard<std::mutex> g(ref_queue_mutex);
+            const auto it = ref_tables.find(ns.string());
+            if (it == ref_tables.end())
+                return std::nullopt;
+            rt = it->second;
+        }
+        std::lock_guard<std::mutex> g(rt->state_mutex);
+        return rt->life;
+    }
     /// Recovery-publication inventory accessors: the seeded per-table admission budgets, the recovered
-    /// base snapshot's encoded body size, the tail-since-snapshot byte sum, and the `_cleanup` markers
-    /// observed at recovery. Together with `newestPublishedSnapshotIdForTest`,
+    /// base snapshot's encoded body size and the tail-since-snapshot byte sum. Together with
+    /// `newestPublishedSnapshotIdForTest`,
     /// `tailSinceSnapshotCountForTest`, `needsStalePrecommitSweepForTest` and the resolved state, they
     /// let a test assert EVERY `RecoveryResult` field the install seeds.
     uint64_t refSnapshotBudgetForTest(const RootNamespace & ns)
@@ -427,13 +445,6 @@ public:
         const auto rt = getRefTableRuntime(ns);
         return rt->tail_bytes_since_snapshot.load(std::memory_order_relaxed);
     }
-    std::set<RefTxnId> refCleanupMarkersForTest(const RootNamespace & ns)
-    {
-        const auto rt = getRefTableRuntime(ns);
-        std::lock_guard<std::mutex> g(rt->state_mutex);
-        return rt->cleanup_markers;
-    }
-
     /// Describes the one conditional `PUT` whose outcome is still uncertain for a table. It is owned by
     /// `Writing` or `Wedged` and by no other lane state; it stays installed until the object is confirmed
     /// durable and applied to the cache, or definitely rejected.
@@ -601,9 +612,6 @@ private:
         /// resolution completes.
         std::optional<NamespaceLifeId> life;
         RefTableState state;
-        /// `_cleanup/<remove-txn-id>` markers observed at recovery, retained for namespace recreation
-        /// checks.
-        std::set<RefTxnId> cleanup_markers;
         /// Exact attempt owned by `Writing` or `Wedged`. Empty in every other lane state.
         std::optional<RefAppendAttempt> append_attempt;
         RefLaneState lane_state = RefLaneState::Ready;
@@ -686,7 +694,15 @@ private:
 
         std::deque<std::shared_ptr<RefMutationItem>> pending;    /// guarded by ref_queue_mutex
         bool leader_active = false;                               /// guarded by ref_queue_mutex
+        /// Set before the exact `Live -> Removing` catalog CAS and retained until that life is deleted.
+        /// New positive mutations check it in the same queue critical section as admission; the one
+        /// terminal `DropNamespace` item is the sole exception.
+        bool removal_admission_closed = false;
         std::condition_variable cv;
+
+        /// Published after GC commits the exact catalog deletion. The next name-based cache touch
+        /// drains old users and resets the runtime in place before resolving a successor life.
+        std::atomic<bool> catalog_life_invalidated{false};
 
         /// Set true when a self-remount detaches this runtime from the cache (`quiesceRefTablesForRemount`):
         /// the fresh incarnation re-recovers each table under the new epoch on next touch, so any leader
@@ -792,9 +808,18 @@ private:
     /// Returns the cached runtime for `ns`, creating an empty unrecovered runtime when needed.
     std::shared_ptr<RefTableRuntime> getRefTableRuntime(const RootNamespace & ns);
 
+    /// If GC invalidated this runtime's catalog life, wait for its old recovery/append/publication
+    /// users to settle and reset every life-scoped field before returning it to a name-based caller.
+    void prepareInvalidatedRuntimeForReuse(const std::shared_ptr<RefTableRuntime> & rt);
+
     /// Installs an externally validated exact life before recovery. Once pinned, the ordinary
     /// namespace entry points reuse this runtime and cannot re-resolve a later same-name incarnation.
     std::shared_ptr<RefTableRuntime> pinRefTableRuntimeToLife(const NamespaceLifeId & life);
+
+    /// Common removal implementation. `expected_incarnation` is present for the decommission-only
+    /// exact-life overload and is checked before every lifecycle branch, including stalled creation.
+    DropNamespaceStats dropNamespaceImpl(
+        const RootNamespace & ns, const std::optional<UInt128> & expected_incarnation);
 
     /// Lazily recovers `ns` per spec §4: catalog life resolution (first table-open only) -> `_ckpt` ->
     /// exact-key base snapshot -> ARITHMETIC tail -> seal CAS-walk -> `_ckpt` CAS -> install. It does not
@@ -833,7 +858,9 @@ private:
     /// retry loop) or a higher one re-drives. Bounded against a pathological duel between two openers;
     /// each primitive this loop calls has its OWN bounded retry against the catalog's single object, so
     /// this bound is only against THIS loop's re-read cycle.
-    NamespaceLifeId resolveNamespaceLife(const RootNamespace & ns, uint64_t admitted_generation, uint64_t live_epoch);
+    NamespaceLifeId resolveNamespaceLife(
+        const RootNamespace & ns, uint64_t admitted_generation, uint64_t live_epoch,
+        bool * lifecycle_refusal = nullptr);
 
     /// `*rt.life`, or `LOGICAL_ERROR` naming `ns` if a runtime reached this point without one. Callers
     /// must already hold `rt.state_mutex`; it exists so the two public resolvers share ONE statement of
@@ -1037,9 +1064,6 @@ private:
     /// Clears the stale-precommit sweep cooldown after a verified-clean pass.
     void resetPrecommitSweepBackoff(RefTableRuntime & rt);
 
-    /// Publishes the terminal `Removed` snapshot after the namespace-removal transaction is durable;
-    /// repeated cleanup is idempotent at the object-storage boundary.
-    void publishRemovedSnapshotNow(const RootNamespace & ns);
 };
 
 }

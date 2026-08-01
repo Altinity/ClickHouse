@@ -513,7 +513,11 @@ TEST(CasDecommission, DuplicateLifeIdRefusesBeforeAnyNamespaceOrSlotMutation)
     RefCatalog catalog;
     catalog.entries = {
         CatalogEntry{.ns = RootNamespace{"victim/a"}, .state = NsState::Live, .incarnation = UInt128{77}},
-        CatalogEntry{.ns = RootNamespace{"victim/b"}, .state = NsState::Removing, .incarnation = UInt128{77}},
+        CatalogEntry{
+            .ns = RootNamespace{"victim/b"},
+            .state = NsState::Removing,
+            .incarnation = UInt128{77},
+            .removal_started_round = 1},
     };
     const auto empty_catalog = backend->get(layout.refCatalogKey());
     ASSERT_TRUE(empty_catalog);
@@ -551,7 +555,11 @@ TEST(CasDecommission, CatalogCutIsValidatedBeforeImpersonationAndReusedForSelect
     RefCatalog ambiguous;
     ambiguous.entries = {
         CatalogEntry{.ns = RootNamespace{"other/a"}, .state = NsState::Live, .incarnation = UInt128{77}},
-        CatalogEntry{.ns = RootNamespace{"other/b"}, .state = NsState::Removing, .incarnation = UInt128{77}},
+        CatalogEntry{
+            .ns = RootNamespace{"other/b"},
+            .state = NsState::Removing,
+            .incarnation = UInt128{77},
+            .removal_started_round = 1},
     };
 
     const auto owner_before = backend->get(layout.ownerKey("victim"));

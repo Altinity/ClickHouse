@@ -45,6 +45,14 @@ String rawCatalog(const std::vector<String> & ent_lines)
     return out;
 }
 
+String withRemovalStartedRound(String line, uint64_t round)
+{
+    const size_t close = line.rfind('}');
+    EXPECT_NE(close, String::npos);
+    line.insert(close, fmt::format(",\"rsr\":\"{}\"", round));
+    return line;
+}
+
 CatalogEntry liveEntry(const String & ns, uint64_t inc)
 {
     return CatalogEntry{.ns = RootNamespace{ns}, .state = NsState::Live, .incarnation = UInt128(inc)};
@@ -55,6 +63,8 @@ CatalogEntry entryInState(const String & ns, NsState state, uint64_t inc)
     CatalogEntry entry{.ns = RootNamespace{ns}, .state = state, .incarnation = UInt128(inc)};
     if (state == NsState::Creating)
         entry.creator = CreatorFence{.server_root_id = "srv", .writer_epoch = 1, .fence_generation = 1};
+    if (state == NsState::Removing)
+        entry.removal_started_round = 1;
     return entry;
 }
 
@@ -72,7 +82,7 @@ TEST(CasFormatBattery, RefCatalog)
     runFormatBattery({FormatId::RefCatalog,
         [&] { return sealObject(FormatId::RefCatalog, encodeRefCatalog(c)); },
         [](std::string_view s) { decodeRefCatalog(std::string(openObject(FormatId::RefCatalog, s))); },
-        "{\"type\":\"cas_ref_catalog\",\"v\":6}\n"
+        "{\"type\":\"cas_ref_catalog\",\"v\":7}\n"
         "{\"k\":\"ent\",\"ns\":\"a\",\"st\":\"creating\",\"inc\":\"00000000000000000000000000000001\","
         "\"csr\":\"srv1\",\"cwe\":\"5\",\"cfg\":\"2\"}\n"
         "{\"k\":\"ent\",\"ns\":\"b\",\"st\":\"live\",\"inc\":\"00000000000000000000000000000002\"}\n"
@@ -88,13 +98,45 @@ TEST(CasRefCatalogFormat, RoundTripsAllThreeStates)
         .incarnation = UInt128(1),
         .creator = CreatorFence{.server_root_id = "srv1", .writer_epoch = 5, .fence_generation = 2}});
     in.entries.push_back(liveEntry("b", 2));
-    in.entries.push_back(CatalogEntry{.ns = RootNamespace{"c"}, .state = NsState::Removing, .incarnation = UInt128(3)});
+    in.entries.push_back(CatalogEntry{
+        .ns = RootNamespace{"c"},
+        .state = NsState::Removing,
+        .incarnation = UInt128(3),
+        .removal_started_round = 11});
 
     const RefCatalog out = decodeRefCatalog(encodeRefCatalog(in));
     EXPECT_EQ(out, in);
     EXPECT_EQ(out.entries[0].state, NsState::Creating);
     EXPECT_EQ(out.entries[1].state, NsState::Live);
     EXPECT_EQ(out.entries[2].state, NsState::Removing);
+}
+
+/// Mutation caught: making removal age caller-local or optional would let an adopted `Removing` row
+/// lose the immutable round from which stuck-removal diagnostics measure.
+TEST(CasRefCatalogFormat, RemovalStartedRoundIsRequiredExactlyForRemoving)
+{
+    CatalogEntry removing{
+        .ns = RootNamespace{"removing"},
+        .state = NsState::Removing,
+        .incarnation = UInt128{7},
+        .removal_started_round = 19};
+    const RefCatalog catalog{.entries = {removing}};
+    const String encoded = encodeRefCatalog(catalog);
+    EXPECT_NE(encoded.find("\"rsr\":\"19\""), String::npos);
+    EXPECT_EQ(decodeRefCatalog(encoded), catalog);
+
+    CatalogEntry live_with_round = liveEntry("live", 8);
+    live_with_round.removal_started_round = 20;
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR,
+        [&] { (void)encodeRefCatalog(RefCatalog{.entries = {live_with_round}}); });
+
+    const String inc = "00000000000000000000000000000009";
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { (void)decodeRefCatalog(rawCatalog({rawEntLine("missing", "removing", inc)})); });
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
+    {
+        (void)decodeRefCatalog(rawCatalog({withRemovalStartedRound(rawEntLine("forbidden", "live", inc), 21)}));
+    });
 }
 
 TEST(CasRefCatalogFormat, EmptyCatalogRoundTrips)
@@ -502,6 +544,7 @@ TEST(CasRefCatalogAdmission, RemovalNeverRefusedEvenAtCapacity)
     {
         RefCatalog next = cur;
         next.entries[0].state = NsState::Removing;
+        next.entries[0].removal_started_round = 1;
         return next;
     });
     EXPECT_EQ(after.entries.size(), max_entries);
@@ -535,23 +578,47 @@ TEST(CasRefCatalog, CasUpdateAppliesOnTopOfExistingState)
     InMemoryBackend backend;
     Layout layout("p");
     CasRefCatalog::initializeEmptyForNewPool(backend, layout);
-
-    CasRefCatalog::casUpdate(backend, layout, [](const RefCatalog &)
-    {
-        RefCatalog next;
-        next.entries.push_back(liveEntry("a", 1));
-        return next;
-    });
+    CasRefCatalog::casAdmitEntry(backend, layout, liveEntry("a", 1));
 
     const RefCatalog updated = CasRefCatalog::casUpdate(backend, layout, [](const RefCatalog & cur)
     {
         RefCatalog next = cur;
-        next.entries.push_back(liveEntry("b", 2));
+        next.entries[0].state = NsState::Removing;
+        next.entries[0].removal_started_round = 1;
         return next;
     });
-    ASSERT_EQ(updated.entries.size(), 2u);
+    ASSERT_EQ(updated.entries.size(), 1u);
     EXPECT_EQ(updated.entries[0].ns.string(), "a");
-    EXPECT_EQ(updated.entries[1].ns.string(), "b");
+    EXPECT_EQ(updated.entries[0].state, NsState::Removing);
+}
+
+TEST(CasRefCatalog, GenericCasUpdateCannotDeleteOrReplaceCatalogIdentity)
+{
+    const Layout layout("p");
+    {
+        InMemoryBackend backend;
+        CasRefCatalog::initializeEmptyForNewPool(backend, layout);
+        CasRefCatalog::casAdmitEntry(backend, layout, liveEntry("a", 1));
+        DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&]
+        {
+            (void)CasRefCatalog::casUpdate(backend, layout, [](const RefCatalog &) { return RefCatalog{}; });
+        });
+    }
+
+    {
+        InMemoryBackend backend;
+        CasRefCatalog::initializeEmptyForNewPool(backend, layout);
+        CasRefCatalog::casAdmitEntry(backend, layout, liveEntry("a", 1));
+        DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&]
+        {
+            (void)CasRefCatalog::casUpdate(backend, layout, [](const RefCatalog & current)
+            {
+                RefCatalog next = current;
+                next.entries[0] = liveEntry("b", 2);
+                return next;
+            });
+        });
+    }
 }
 
 TEST(CasRefCatalog, CasUpdateRetriesOnConflictAgainstFreshState)
@@ -559,13 +626,7 @@ TEST(CasRefCatalog, CasUpdateRetriesOnConflictAgainstFreshState)
     InMemoryBackend backend;
     Layout layout("p");
     CasRefCatalog::initializeEmptyForNewPool(backend, layout);
-
-    CasRefCatalog::casUpdate(backend, layout, [](const RefCatalog &)
-    {
-        RefCatalog next;
-        next.entries.push_back(liveEntry("a", 1));
-        return next;
-    });
+    CasRefCatalog::casAdmitEntry(backend, layout, liveEntry("a", 1));
 
     backend.failNextCasPut(layout.refCatalogKey());   /// one-shot artificial Conflict on the next write
 
@@ -575,6 +636,7 @@ TEST(CasRefCatalog, CasUpdateRetriesOnConflictAgainstFreshState)
         ++mutate_calls;
         RefCatalog next = cur;
         next.entries[0].state = NsState::Removing;
+        next.entries[0].removal_started_round = 1;
         return next;
     });
 
@@ -584,6 +646,38 @@ TEST(CasRefCatalog, CasUpdateRetriesOnConflictAgainstFreshState)
 
     const CasRefCatalog::Snapshot snap = CasRefCatalog::read(backend, layout);
     EXPECT_EQ(snap.catalog, result);
+}
+
+TEST(CasRefCatalog, BeginRemovingRechecksFenceAfterCatalogCasConflict)
+{
+    InMemoryBackend backend;
+    const Layout layout("p");
+    const CatalogEntry observed = liveEntry("a", 1);
+    CasRefCatalog::initializeEmptyForNewPool(backend, layout);
+    CasRefCatalog::casAdmitEntry(backend, layout, observed);
+
+    uint64_t current_fence_generation = 7;
+    size_t fence_checks = 0;
+    const auto outcome = CasRefCatalog::beginRemoving(
+        backend, layout, observed, /*removal_started_round*/ 13, /*admitted_generation*/ 7,
+        [&](uint64_t admitted_generation)
+        {
+            ++fence_checks;
+            if (admitted_generation != current_fence_generation)
+                throw std::runtime_error("stale catalog mutation fence");
+            if (fence_checks == 1)
+            {
+                /// Move the caller fence after the first admission check and force that attempt's
+                /// catalog CAS to conflict. The next attempt must check the fence again before writing.
+                current_fence_generation = 8;
+                backend.failNextCasPut(layout.refCatalogKey());
+            }
+        });
+
+    EXPECT_EQ(outcome, CasRefCatalog::BeginRemovingOutcome::FencedOut);
+    EXPECT_EQ(fence_checks, 2u);
+    const CasRefCatalog::Snapshot after = CasRefCatalog::read(backend, layout);
+    EXPECT_EQ(after.catalog.entries, std::vector<CatalogEntry>{observed});
 }
 
 /// A re-read that finds the catalog genuinely ABSENT after it was previously observed present is a
@@ -601,13 +695,7 @@ TEST(CasRefCatalog, CasUpdateThrowsOnVanishMidRetryInsteadOfReplacingTheCatalog)
     InMemoryBackend backend;
     Layout layout("p");
     CasRefCatalog::initializeEmptyForNewPool(backend, layout);
-
-    CasRefCatalog::casUpdate(backend, layout, [](const RefCatalog &)
-    {
-        RefCatalog next;
-        next.entries.push_back(liveEntry("a", 1));
-        return next;
-    });
+    CasRefCatalog::casAdmitEntry(backend, layout, liveEntry("a", 1));
     const CasRefCatalog::Snapshot seeded = CasRefCatalog::read(backend, layout);
     ASSERT_TRUE(seeded.token.has_value());
 
@@ -617,7 +705,8 @@ TEST(CasRefCatalog, CasUpdateThrowsOnVanishMidRetryInsteadOfReplacingTheCatalog)
         {
             backend.deleteExact(layout.refCatalogKey(), *seeded.token);
             RefCatalog next = cur;
-            next.entries.push_back(liveEntry("b", 2));
+            next.entries[0].state = NsState::Removing;
+            next.entries[0].removal_started_round = 1;
             return next;
         });
     });
@@ -634,13 +723,7 @@ TEST(CasRefCatalogDeathTest, CasUpdateThrowsOnVanishMidRetryInsteadOfReplacingTh
     InMemoryBackend backend;
     Layout layout("p");
     CasRefCatalog::initializeEmptyForNewPool(backend, layout);
-
-    CasRefCatalog::casUpdate(backend, layout, [](const RefCatalog &)
-    {
-        RefCatalog next;
-        next.entries.push_back(liveEntry("a", 1));
-        return next;
-    });
+    CasRefCatalog::casAdmitEntry(backend, layout, liveEntry("a", 1));
     const CasRefCatalog::Snapshot seeded = CasRefCatalog::read(backend, layout);
     ASSERT_TRUE(seeded.token.has_value());
 
@@ -650,7 +733,8 @@ TEST(CasRefCatalogDeathTest, CasUpdateThrowsOnVanishMidRetryInsteadOfReplacingTh
             {
                 backend.deleteExact(layout.refCatalogKey(), *seeded.token);
                 RefCatalog next = cur;
-                next.entries.push_back(liveEntry("b", 2));
+                next.entries[0].state = NsState::Removing;
+                next.entries[0].removal_started_round = 1;
                 return next;
             });
     });
@@ -758,4 +842,203 @@ TEST(CasRefCatalog, CasAdmitEntryRefusesOverCapacity)
 
     const CasRefCatalog::Snapshot snap = CasRefCatalog::read(backend, layout);
     EXPECT_EQ(snap.catalog.entries.size(), max_entries);
+}
+
+TEST(CasRefCatalogRemoval, DeleteCompletedRemovingRequiresExactAdoptedProofAndLeaderFence)
+{
+    DB::Cas::tests::CountingBackend backend;
+    const Layout layout("p");
+    const CatalogEntry removing{
+        .ns = RootNamespace{"a"},
+        .state = NsState::Removing,
+        .incarnation = UInt128{7},
+        .removal_started_round = 13};
+    ASSERT_EQ(backend.putIfAbsent(layout.refCatalogKey(), encodeRefCatalog(RefCatalog{.entries = {removing}})).outcome,
+        PutOutcome::Done);
+
+    CasFoldSeal held_parent;
+    held_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
+        .coverage = RefCoverage{
+            .classification = 4,
+            .last_folded_ref_id = RefTxnId{1, 2},
+            .hold = RefHold{.offending_position = RefTxnId{1, 3}}},
+        .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
+    EXPECT_EQ(CasRefCatalog::deleteCompletedRemoving(
+        backend, layout, removing, held_parent, 5, [](uint64_t) {}),
+        CasRefCatalog::CompletedRemovingDeleteOutcome::ProofRefused);
+
+    CasFoldSeal mismatched_parent;
+    mismatched_parent.ref_lives.emplace(UInt128{8}, RefLifeFoldState{
+        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{1, 2}},
+        .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
+    EXPECT_EQ(CasRefCatalog::deleteCompletedRemoving(
+        backend, layout, removing, mismatched_parent, 5, [](uint64_t) {}),
+        CasRefCatalog::CompletedRemovingDeleteOutcome::ProofRefused);
+
+    CasFoldSeal ready_parent;
+    ready_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
+        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{1, 2}},
+        .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
+
+    CatalogEntry live = removing;
+    live.state = NsState::Live;
+    live.removal_started_round.reset();
+    EXPECT_EQ(CasRefCatalog::deleteCompletedRemoving(
+        backend, layout, live, ready_parent, 5, [](uint64_t) {}),
+        CasRefCatalog::CompletedRemovingDeleteOutcome::ProofRefused);
+    CatalogEntry creating = live;
+    creating.state = NsState::Creating;
+    creating.creator = CreatorFence{.server_root_id = "server", .writer_epoch = 3, .fence_generation = 4};
+    EXPECT_EQ(CasRefCatalog::deleteCompletedRemoving(
+        backend, layout, creating, ready_parent, 5, [](uint64_t) {}),
+        CasRefCatalog::CompletedRemovingDeleteOutcome::ProofRefused);
+
+    EXPECT_EQ(CasRefCatalog::deleteCompletedRemoving(
+        backend, layout, removing, ready_parent, 5, [](uint64_t) { throw std::runtime_error("fenced"); }),
+        CasRefCatalog::CompletedRemovingDeleteOutcome::FencedOut);
+    EXPECT_EQ(backend.casPutCount(layout.refCatalogKey()), 0);
+
+    EXPECT_EQ(CasRefCatalog::deleteCompletedRemoving(
+        backend, layout, removing, ready_parent, 5, [](uint64_t generation) { EXPECT_EQ(generation, 5); }),
+        CasRefCatalog::CompletedRemovingDeleteOutcome::Deleted);
+    EXPECT_TRUE(CasRefCatalog::read(backend, layout).catalog.entries.empty());
+    EXPECT_EQ(backend.casPutCount(layout.refCatalogKey()), 1);
+    EXPECT_EQ(backend.listTotal(), 0);
+    EXPECT_EQ(backend.deleteTotal(), 0);
+}
+
+TEST(CasRefCatalogRemoval, ExactDeletionRefusesChangedEntryAndAdmissionCannotCarryRemoval)
+{
+    DB::Cas::tests::CountingBackend backend;
+    const Layout layout("p");
+    CasRefCatalog::initializeEmptyForNewPool(backend, layout);
+    const CatalogEntry removing{
+        .ns = RootNamespace{"a"},
+        .state = NsState::Removing,
+        .incarnation = UInt128{7},
+        .removal_started_round = 13};
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR,
+        [&] { (void)CasRefCatalog::casAdmitEntry(backend, layout, removing); });
+
+    const CatalogEntry current{
+        .ns = RootNamespace{"a"},
+        .state = NsState::Removing,
+        .incarnation = UInt128{7},
+        .removal_started_round = 14};
+    ASSERT_EQ(backend.putIfAbsent("unrelated", "sentinel").outcome, PutOutcome::Done);
+    ASSERT_EQ(backend.casPut(layout.refCatalogKey(), encodeRefCatalog(RefCatalog{.entries = {current}}),
+        CasRefCatalog::read(backend, layout).token).outcome, CasOutcome::Committed);
+
+    CasFoldSeal ready_parent;
+    ready_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
+        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{1, 2}},
+        .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
+    EXPECT_EQ(CasRefCatalog::deleteCompletedRemoving(
+        backend, layout, removing, ready_parent, 5, [](uint64_t) {}),
+        CasRefCatalog::CompletedRemovingDeleteOutcome::EntryChanged);
+    EXPECT_EQ(CasRefCatalog::read(backend, layout).catalog.entries, std::vector<CatalogEntry>{current});
+}
+
+TEST(CasRefCatalogRemoval, CancelStalledCreatingRequiresExactRowAndTerminalCreatorFence)
+{
+    DB::Cas::tests::CountingBackend backend;
+    const Layout layout("p");
+    const CatalogEntry creating{
+        .ns = RootNamespace{"a"},
+        .state = NsState::Creating,
+        .incarnation = UInt128{7},
+        .creator = CreatorFence{.server_root_id = "server", .writer_epoch = 3, .fence_generation = 4}};
+    ASSERT_EQ(backend.putIfAbsent(layout.refCatalogKey(), encodeRefCatalog(RefCatalog{.entries = {creating}})).outcome,
+        PutOutcome::Done);
+
+    EXPECT_EQ(CasRefCatalog::cancelStalledCreating(
+        backend, layout, creating, [](const CreatorFence &) { return false; }, 5, [](uint64_t) {}),
+        CasRefCatalog::StalledCreatingCancelOutcome::CreatorFenceStillLive);
+    EXPECT_EQ(backend.casPutCount(layout.refCatalogKey()), 0);
+
+    CatalogEntry stale = creating;
+    stale.creator->writer_epoch = 2;
+    EXPECT_EQ(CasRefCatalog::cancelStalledCreating(
+        backend, layout, stale, [](const CreatorFence &) { return true; }, 5, [](uint64_t) {}),
+        CasRefCatalog::StalledCreatingCancelOutcome::EntryChanged);
+    EXPECT_EQ(backend.casPutCount(layout.refCatalogKey()), 0);
+
+    EXPECT_EQ(CasRefCatalog::cancelStalledCreating(
+        backend, layout, creating, [](const CreatorFence &) { return true; }, 5, [](uint64_t) {}),
+        CasRefCatalog::StalledCreatingCancelOutcome::Cancelled);
+    EXPECT_TRUE(CasRefCatalog::read(backend, layout).catalog.entries.empty());
+    EXPECT_EQ(backend.casPutCount(layout.refCatalogKey()), 1);
+    EXPECT_EQ(backend.listTotal(), 0);
+    EXPECT_EQ(backend.deleteTotal(), 0);
+}
+
+TEST(CasGcRefWalkPlan, CatalogIsSoleRowAdmissionAuthorityAcrossOrdinaryAndRebuildInputs)
+{
+    RefCatalog catalog;
+    catalog.entries = {
+        CatalogEntry{
+            .ns = RootNamespace{"creating"},
+            .state = NsState::Creating,
+            .incarnation = UInt128{1},
+            .creator = CreatorFence{.server_root_id = "server", .writer_epoch = 1, .fence_generation = 1}},
+        liveEntry("live", 2),
+        CatalogEntry{
+            .ns = RootNamespace{"removing"},
+            .state = NsState::Removing,
+            .incarnation = UInt128{3},
+            .removal_started_round = 8},
+    };
+    const CasRefCatalog::Snapshot cut{
+        .catalog = catalog, .token = std::nullopt, .life_index = CatalogLifeIndex(catalog)};
+
+    RefWalkPlanInputs ordinary_inputs;
+    ordinary_inputs.parent_ref_lives.emplace(UInt128{1}, RefLifeFoldState{
+        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{1, 1}}});
+    ordinary_inputs.parent_ref_lives.emplace(UInt128{3}, RefLifeFoldState{
+        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{3, 3}},
+        .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{3, 3}}});
+    ordinary_inputs.parent_ref_lives.emplace(UInt128{4}, RefLifeFoldState{
+        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{4, 4}}});
+    ordinary_inputs.listed_lives = {UInt128{1}, UInt128{2}, UInt128{4}};
+    ordinary_inputs.holds.emplace(UInt128{1}, RefHold{.offending_position = RefTxnId{1, 2}});
+    ordinary_inputs.holds.emplace(UInt128{2}, RefHold{.offending_position = RefTxnId{2, 2}});
+    ordinary_inputs.checkpoint_observations.emplace(UInt128{1}, RefTxnId{1, 9});
+    ordinary_inputs.checkpoint_observations.emplace(UInt128{2}, RefTxnId{2, 9});
+    ordinary_inputs.tail_observations.emplace(UInt128{1}, RefTxnId{1, 10});
+    ordinary_inputs.tail_observations.emplace(UInt128{2}, RefTxnId{2, 10});
+
+    RefWalkPlanInputs rebuild_inputs;
+    rebuild_inputs.parent_ref_lives.emplace(UInt128{1}, ordinary_inputs.parent_ref_lives.at(UInt128{1}));
+    rebuild_inputs.parent_ref_lives.emplace(UInt128{5}, RefLifeFoldState{
+        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{5, 5}}});
+    rebuild_inputs.listed_lives = {UInt128{1}, UInt128{3}, UInt128{5}};
+    rebuild_inputs.holds.emplace(UInt128{1}, RefHold{.offending_position = RefTxnId{1, 3}});
+    rebuild_inputs.holds.emplace(UInt128{3}, RefHold{.offending_position = RefTxnId{3, 4}});
+    rebuild_inputs.checkpoint_observations.emplace(UInt128{1}, RefTxnId{1, 11});
+    rebuild_inputs.checkpoint_observations.emplace(UInt128{3}, RefTxnId{3, 11});
+    rebuild_inputs.tail_observations.emplace(UInt128{1}, RefTxnId{1, 12});
+    rebuild_inputs.tail_observations.emplace(UInt128{3}, RefTxnId{3, 12});
+
+    const RefWalkPlan ordinary = buildRefWalkPlan(cut, ordinary_inputs);
+    const RefWalkPlan rebuild = buildRefWalkPlan(cut, rebuild_inputs);
+    const std::set<UInt128> expected{UInt128{2}, UInt128{3}};
+    EXPECT_EQ(ordinary.lifeIds(), expected);
+    EXPECT_EQ(rebuild.lifeIds(), expected);
+
+    EXPECT_TRUE(ordinary.row(UInt128{2}).listed_hint);
+    ASSERT_TRUE(ordinary.row(UInt128{2}).fold_state.coverage.hold);
+    EXPECT_EQ(ordinary.row(UInt128{2}).checkpoint_observation, (RefTxnId{2, 9}));
+    EXPECT_EQ(ordinary.row(UInt128{2}).tail_observation, (RefTxnId{2, 10}));
+    const std::optional<RefCleanupEvidence> cleanup_evidence{
+        RefCleanupEvidence{.remove_txn_id = RefTxnId{3, 3}}};
+    EXPECT_EQ(ordinary.row(UInt128{3}).fold_state.cleanup_evidence, cleanup_evidence);
+    EXPECT_FALSE(ordinary.contains(UInt128{1}));
+    EXPECT_FALSE(ordinary.contains(UInt128{4}));
+
+    EXPECT_TRUE(rebuild.row(UInt128{3}).listed_hint);
+    ASSERT_TRUE(rebuild.row(UInt128{3}).fold_state.coverage.hold);
+    EXPECT_EQ(rebuild.row(UInt128{3}).checkpoint_observation, (RefTxnId{3, 11}));
+    EXPECT_EQ(rebuild.row(UInt128{3}).tail_observation, (RefTxnId{3, 12}));
+    EXPECT_FALSE(rebuild.contains(UInt128{1}));
+    EXPECT_FALSE(rebuild.contains(UInt128{5}));
 }

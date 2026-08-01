@@ -27,7 +27,8 @@ namespace DB::Cas
 /// published through the ordinary single-owner `putIfAbsentControlled` path, not a
 /// `putDeterministicArtifact` byte-adoption gate.
 
-/// Whether a table is currently populated or has been removed.
+/// In-memory ref-table lifecycle. Only `Live` is serializable as a generation-7 snapshot; terminal
+/// state lives in the removal log and fold evidence.
 enum class RefLifecycle : uint8_t
 {
     Live = 1,
@@ -47,15 +48,15 @@ struct RefCommittedRow
 
 /// The complete state of one namespace's ref table in one canonical snapshot object. `precommits`
 /// reuses `RefOwnerBinding` from `CasRefWireVocab.h`; every entry's `kind` must be `Precommit`.
-/// A Removed snapshot carries its nonzero `remove_txn_id` and no rows; a Live snapshot has no
-/// `remove_txn_id`. Both row vectors must already be strictly sorted by their documented keys, because the codec
+/// Generation 7 serializes only `Live` snapshots and forbids `remove_txn_id`. Both row vectors must
+/// already be strictly sorted by their documented keys, because the codec
 /// validates and emits the caller-provided order rather than sorting it.
 struct RefTableSnapshot
 {
     String ns;
     RefTxnId snapshot_id;
     RefLifecycle lifecycle = RefLifecycle::Live;
-    std::optional<RefTxnId> remove_txn_id;      /// present iff lifecycle == Removed
+    std::optional<RefTxnId> remove_txn_id;      /// in-memory terminal state only; forbidden on wire
     std::vector<RefCommittedRow> committed;     /// sorted by canonical bytewise ref_name, no duplicates
     std::vector<RefOwnerBinding> precommits;    /// sorted by (ref_name, manifest_ref), no duplicates
 
@@ -69,8 +70,8 @@ inline constexpr size_t ref_snapshot_max_bytes = ref_removal_max_bytes;
 /// Encode to the canonical text (not sealed): the caller compresses via
 /// `sealObject(FormatId::RefSnapshot, …)` on the persist path (Always/`.zst`), and the in-memory
 /// validation / `admits` size-estimate / `fsck` oracle callers use the uncompressed text. Throws
-/// CORRUPTED_DATA on: a zero `snapshot_id`/`remove_txn_id` field; the Live/Removed coupling broken
-/// (Live with `remove_txn_id`, or Removed without it / with rows); a non-canonical `ref_name`; an
+/// CORRUPTED_DATA on: a zero `snapshot_id`; a non-`Live` lifecycle or `remove_txn_id`; a
+/// non-canonical `ref_name`; an
 /// out-of-range `manifest_ref`; non-strictly-ascending
 /// `committed` / `precommits`; a `precommits` entry not `Precommit`; or an over-budget object.
 String encodeRefTableSnapshot(const RefTableSnapshot & snapshot);

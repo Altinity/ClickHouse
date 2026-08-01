@@ -1544,16 +1544,6 @@ DropNamespaceStats Pool::dropNamespace(const NamespaceLifeId & life)
     return ref_ledger.dropNamespace(life);
 }
 
-bool Pool::namespaceIsRemoved(const RootNamespace & ns)
-{
-    return ref_ledger.namespaceIsRemoved(ns);
-}
-
-bool Pool::namespaceIsRemoved(const NamespaceLifeId & life)
-{
-    return ref_ledger.namespaceIsRemoved(life);
-}
-
 NamespaceLifeId Pool::namespaceLife(const RootNamespace & ns)
 {
     return ref_ledger.namespaceLife(ns);
@@ -1564,17 +1554,17 @@ std::optional<NamespaceLifeId> Pool::namespaceFilesLifeIfReadable(const RootName
     return ref_ledger.namespaceFilesLifeIfReadable(ns);
 }
 
+void Pool::invalidateRemovedCatalogLife(const NamespaceLifeId & life)
+{
+    ref_ledger.invalidateRemovedCatalogLife(life);
+}
+
 RefTxnId Pool::appendRefOps(const RootNamespace & ns, MutationScope scope,
                              std::function<std::vector<RefOp>(const RefTableState &)> build_ops,
                              RootMutationOrigin origin, RootMutationKind kind,
                              bool skip_stale_precommit_sweep)
 {
     return ref_ledger.appendRefOps(ns, std::move(scope), std::move(build_ops), origin, kind, skip_stale_precommit_sweep);
-}
-
-bool Pool::observedNamespaceCleanupMarker(const RootNamespace & ns, const RefTxnId & remove_txn_id)
-{
-    return ref_ledger.observedNamespaceCleanupMarker(ns, remove_txn_id);
 }
 
 bool Pool::trySnapshotPublishOnce(const RootNamespace & ns)

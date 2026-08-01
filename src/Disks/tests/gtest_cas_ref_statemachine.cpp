@@ -1104,8 +1104,8 @@ TEST(CasRefStateMachine, E3TrustedReplayInPlaceMatchesLiveAppendAcrossAllArms)
     const RefTableState replayed = replay(std::nullopt, tail);   // TrustedReplay in-place
 
     expectStatesEqual(full_state, replayed);
-    EXPECT_EQ(encodeRefTableSnapshot(snapshotOf(full_state, kNs)),
-              encodeRefTableSnapshot(snapshotOf(replayed, kNs)));
+    EXPECT_THROW(encodeRefTableSnapshot(snapshotOf(full_state, kNs)), DB::Exception);
+    EXPECT_THROW(encodeRefTableSnapshot(snapshotOf(replayed, kNs)), DB::Exception);
     EXPECT_EQ(replayed.getLifecycle(), RefLifecycle::Removed);
     EXPECT_EQ(replayed.getRemoveTxnId(), std::make_optional(RefTxnId{1, 5}));
 }

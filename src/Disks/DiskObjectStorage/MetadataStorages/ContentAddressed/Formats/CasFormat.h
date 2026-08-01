@@ -44,9 +44,13 @@ namespace DB::Cas
 ///
 /// Generation 6 replaces that namespace-bearing grammar with opaque pool-wide life identifiers and
 /// splits hot ref streams from point-read state: `cas/ns/stream/<life_id>/...` contains `_log`, `_snap`
-/// and `_cleanup`, while `cas/ns/state/<life_id>/...` contains `_ckpt` and `_files`. A generation-5
+/// while `cas/ns/state/<life_id>/...` contains `_ckpt` and `_files`. A generation-5
 /// pool must be recreated; no dual parser or copy-forward path exists.
-constexpr uint32_t G_BUILD = 6;
+///
+/// Generation 7 replaces the fold seal's independent namespace-keyed coverage and cleanup
+/// collections with one opaque-life-keyed row and removes the retired terminal-marker object class. A generation-6
+/// pool must be recreated; there is no dual reader for the split grammar.
+constexpr uint32_t G_BUILD = 7;
 
 /// The pool-format generation at which ref-log ids became per-namespace and contiguous. Pool metadata
 /// below this value cannot be opened, because its ref streams carry holes this build reports as
@@ -68,6 +72,10 @@ constexpr uint32_t kNamespaceLifeKeyedGeneration = 5;
 /// The recreate-only generation at which namespace text disappeared from physical life keys and hot
 /// ref streams were separated from point-read namespace state.
 constexpr uint32_t kOpaqueNamespaceLifeLayoutGeneration = 6;
+
+/// The recreate-only generation at which one unified ref-life row replaced the split coverage and
+/// namespace-cleanup grammar.
+constexpr uint32_t kUnifiedRefLifeFoldGeneration = 7;
 
 /// Stable identifiers for every self-describing persisted object class. The text registry uses the
 /// corresponding `type` string as the on-disk identity. Numeric values are part of the format history:

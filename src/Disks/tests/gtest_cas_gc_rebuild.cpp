@@ -192,7 +192,7 @@ TEST(CasGcRebuild, RecoversLostGenerationArtifact)
 /// FORCE: a healthy state refuses the plain rebuild; FORCE rebuilds; rounds run clean after.
 TEST(CasGcRebuild, HealthyStateRequiresForce)
 {
-    auto backend = std::make_shared<InMemoryBackend>();
+    auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xA1);
@@ -206,9 +206,41 @@ TEST(CasGcRebuild, HealthyStateRequiresForce)
     EXPECT_FALSE(refused.performed);
     EXPECT_NE(refused.refusal.find("FORCE"), String::npos);
 
+    backend->resetCounts();
     const RebuildReport forced = gc.rebuildBaseline(/*force*/ true);
     ASSERT_TRUE(forced.performed) << forced.refusal;
+    EXPECT_EQ(backend->getCount(store->layout().refCatalogKey()), 2u)
+        << "healthy FORCE REBUILD may read the catalog for the conclusive drain and the one post-LIST cut only";
+    EXPECT_EQ(backend->listCount(store->layout().namespaceStreamRootPrefix()), 1u);
     EXPECT_NO_THROW(gc.runRegularRound());
+}
+
+TEST(CasGcRebuild, DamagedGenerationZeroStatePerformsNoCatalogDrainMutation)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/removing-without-parent@cas@"};
+    const UInt128 life_id{91};
+    CasRefCatalog::casAdmitEntry(*backend, layout, CatalogEntry{
+        .ns = ns, .state = NsState::Live, .incarnation = life_id});
+    CasRefCatalog::casUpdate(*backend, layout, [](const RefCatalog & current)
+    {
+        RefCatalog next = current;
+        next.entries[0].state = NsState::Removing;
+        next.entries[0].removal_started_round = 1;
+        return next;
+    });
+    const uint64_t catalog_cas_before = backend->casPutCount(layout.refCatalogKey());
+
+    Gc gc(store, kGc);
+    const RebuildReport report = gc.rebuildBaseline(/*force*/ false);
+    ASSERT_TRUE(report.performed) << report.refusal;
+    EXPECT_EQ(backend->casPutCount(layout.refCatalogKey()), catalog_cas_before);
+    const CasRefCatalog::Snapshot catalog = CasRefCatalog::read(*backend, layout);
+    ASSERT_EQ(catalog.catalog.entries.size(), 1u);
+    EXPECT_EQ(catalog.catalog.entries[0].state, NsState::Removing);
+    EXPECT_EQ(catalog.catalog.entries[0].incarnation, life_id);
 }
 
 /// Refusal: a committed owner with a MISSING manifest body is data loss — the rebuild refuses,
@@ -460,4 +492,3 @@ TEST(CasGcClampSuppression, LandedEdgeBehindClampNeverDeleted)
     dropRefTransition(*backend, store->layout(), ns, "tbl_c", m3, /*shard*/1);
     EXPECT_TRUE(runRoundsUntilAbsent(store, gc, *backend, store->layout(), DB::UInt128(5)));
 }
-

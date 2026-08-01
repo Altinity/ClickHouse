@@ -374,7 +374,7 @@ TEST(RefWriterChunkedFlush, DropNamespaceOverOpCapSucceeds)
     DropNamespaceStats stats;
     EXPECT_NO_THROW(stats = store->dropNamespace(ns));
     EXPECT_EQ(stats.committed_refs, kTotalRefs);
-    EXPECT_TRUE(store->namespaceIsRemoved(ns));
+    EXPECT_EQ(CasRefCatalog::read(*backend, layout).catalog.entries.front().state, NsState::Removing);
 }
 
 /// Test 11, second leg: `WholeShard` scope ALONE is not the removal-class discriminator -- the

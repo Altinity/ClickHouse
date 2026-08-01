@@ -230,7 +230,7 @@ TEST(CasTruncateReclaim, TruncateThenKeepInsertingStillReclaims)
 
 /// The DROP TABLE path: removeRecursive of a table dir calls dropNamespace, which journals one
 /// Remove per former ref. Same reclamation invariant.
-TEST(CasTruncateReclaim, DropNamespaceOfSharedBlobsReclaimsToZero)
+TEST(CasTruncateReclaim, DropNamespaceLeavesSharedBlobDebrisForPerpetualSweep)
 {
     std::shared_ptr<InMemoryBackend> b;
     auto s = openTestPool(b);
@@ -267,8 +267,11 @@ TEST(CasTruncateReclaim, DropNamespaceOfSharedBlobsReclaimsToZero)
         const size_t rounds = runGcToFixpoint(s, gc);
         const FsckReport after = runFsck(*s, /*detail=*/false);
         EXPECT_EQ(after.dangling, 0u);
-        EXPECT_EQ(after.unreachable, 0u)
-            << "B140: orphaned blobs survived DROP (dropNamespace) after " << rounds << " GC rounds";
+        EXPECT_GT(after.unreachable, 0u)
+            << "generation-7 removal performs no lifecycle-specific physical cleanup; the perpetual "
+               "sweep owns orphaned blobs after " << rounds << " GC rounds";
         EXPECT_EQ(after.reachable, 0u);
+        EXPECT_FALSE(CasRefCatalog::lifeIfCataloged(s->backend(), s->layout(), ns))
+            << "physical debris must not keep the logical namespace life cataloged";
     }
 }

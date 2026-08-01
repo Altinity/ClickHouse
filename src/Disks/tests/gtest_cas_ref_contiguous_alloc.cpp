@@ -320,7 +320,7 @@ TEST(CasRefContiguousAlloc, OldPoolFormatIsRefusedNamingRecreation)
     catch (const DB::Exception & e)
     {
         EXPECT_EQ(e.code(), DB::ErrorCodes::UNKNOWN_FORMAT_VERSION);
-        EXPECT_NE(e.message().find(fmt::format("CAS pool format {} predates opaque namespace-life stream/state keys",
+        EXPECT_NE(e.message().find(fmt::format("CAS pool format {} predates generation-7 unified ref-life fold state",
                                                kContiguousRefStreamsGeneration - 1)), String::npos)
             << "the message must name the migration: " << e.message();
     }
@@ -359,9 +359,41 @@ TEST(CasRefContiguousAlloc, GenerationFiveNamespaceBearingPoolIsRefusedNamingRec
     catch (const DB::Exception & e)
     {
         EXPECT_EQ(e.code(), DB::ErrorCodes::UNKNOWN_FORMAT_VERSION);
-        EXPECT_NE(e.message().find(fmt::format("CAS pool format {} predates opaque namespace-life stream/state keys",
+        EXPECT_NE(e.message().find(fmt::format("CAS pool format {} predates generation-7 unified ref-life fold state",
                                                kNamespaceLifeKeyedGeneration)), String::npos)
             << "the message must name the migration: " << e.message();
+    }
+}
+
+/// Mutation caught: leaving the pool floor at generation 6 would admit a seal whose independent
+/// name-keyed coverage and cleanup collections this build no longer has. Generation 7 is a
+/// recreate-only grammar cut, so the immediately preceding generation must fail at pool open.
+TEST(CasRefContiguousAlloc, GenerationSixSplitFoldSealPoolIsRefusedNamingRecreation)
+{
+    PoolMeta pm;
+    pm.pool_id = UInt128{1, 2};
+    pm.blob_header_len = 256;
+    pm.min_reader_generation = G_BUILD;
+    pm.algos_used = {static_cast<uint8_t>(BlobHashAlgo::CityHash128)};
+
+    const String current = encodePoolMeta(pm);
+    const String from = "\"v\":" + std::to_string(G_BUILD);
+    const String to = "\"v\":6";
+    const size_t at = current.find(from);
+    ASSERT_NE(at, String::npos);
+    String old_format = current;
+    old_format.replace(at, from.size(), to);
+
+    try
+    {
+        decodePoolMeta(old_format);
+        FAIL() << "a generation-6 split ref-life fold seal pool must not open";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::UNKNOWN_FORMAT_VERSION);
+        EXPECT_NE(e.message().find("CAS pool format 6 predates generation-7 unified ref-life fold state"), String::npos)
+            << "the message must name the recreate-only grammar cut: " << e.message();
     }
 }
 

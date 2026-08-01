@@ -217,14 +217,66 @@ struct RefScanSummary
 {
     size_t changed_shards = 0;                          /// tables with a log above their sealed cursor
     std::vector<String> keys;                           /// every listed key, verbatim, for the fold's strict grouping
-    std::set<NamespaceLifePhysicalId> listed_lives;     /// every parsed stream kind, for the catalog-cut gate
+    std::set<NamespaceLifePhysicalId> listed_lives;     /// every parsed stream kind, classified by the later catalog cut
     std::map<NamespaceLifePhysicalId, std::set<RefTxnId>> logs_by_life;
     std::map<NamespaceLifePhysicalId, RefTxnId> max_log_by_life;
-    /// The immutable catalog cut read before the hot LIST. Absent on diagnostic-only enumerations.
+    /// The immutable catalog cut read after the completed hot LIST. Absent on diagnostic-only enumerations.
     std::optional<CasRefCatalog::Snapshot> catalog_cut;
-    /// A listed id absent from the earlier cut is post-cut/unknown, never debris proof.
-    bool has_post_cut_unknown_life = false;
+    /// Listed ids absent from the later cut are inert dead-life debris.
+    size_t dead_life_debris = 0;
 };
+
+/// All observations that may enrich a ref walk. None of these maps is an admission source: a life is
+/// present in the result only when the supplied catalog cut contains that exact id in `Live` or
+/// `Removing` state.
+struct RefWalkPlanInputs
+{
+    std::map<UInt128, RefLifeFoldState> parent_ref_lives;
+    std::set<UInt128> listed_lives;
+    std::map<UInt128, RefHold> holds;
+    std::map<UInt128, RefTxnId> checkpoint_observations;
+    std::map<UInt128, RefTxnId> tail_observations;
+};
+
+struct RefWalkPlanRow
+{
+    NamespaceLifeId life;
+    RefLifeFoldState fold_state;
+    bool listed_hint = false;
+    std::optional<RefTxnId> checkpoint_observation;
+    std::optional<RefTxnId> tail_observation;
+};
+
+/// A frozen catalog-built row set. Enrichment is exposed only through exact lookup; there is no
+/// `operator[]`, insertion method, or mutable row map through which a hint, parent, hold, or checkpoint
+/// can mint a logical life.
+class RefWalkPlan
+{
+public:
+    bool contains(const UInt128 & life_id) const { return rows.contains(life_id); }
+    const RefWalkPlanRow & row(const UInt128 & life_id) const { return rows.at(life_id); }
+    RefLifeFoldState & foldState(const UInt128 & life_id) { return rows.at(life_id).fold_state; }
+    std::set<UInt128> lifeIds() const;
+    std::vector<NamespaceLifeId> lives() const;
+    std::map<UInt128, RefLifeFoldState> releaseFoldStates();
+
+    uint64_t dropped_parent_rows = 0;
+    uint64_t dropped_listed_lives = 0;
+    uint64_t dropped_holds = 0;
+    uint64_t dropped_checkpoints = 0;
+    uint64_t dropped_tails = 0;
+
+private:
+    friend RefWalkPlan buildRefWalkPlan(
+        const CasRefCatalog::Snapshot & catalog_cut, const RefWalkPlanInputs & inputs);
+    std::map<UInt128, RefWalkPlanRow> rows;
+};
+
+/// Builds the one authoritative ref-life key set used by ordinary GC and healthy `REBUILD`.
+/// Adapters run only after the catalog loop has frozen that set and attach observations by `at`-style
+/// lookup; unknown, absent, or `Creating` ids are counted and dropped.
+RefWalkPlan buildRefWalkPlan(
+    const CasRefCatalog::Snapshot & catalog_cut, const RefWalkPlanInputs & inputs);
 
 /// PROBE B2 — end-to-end transaction accounting for ONE round. Round-local, never persisted.
 ///
@@ -401,6 +453,11 @@ private:
     /// renewing our own are unaffected.
     bool acquireOrRenewLease(GcState & state, Token & state_token, bool allow_steal);
 
+    /// Catalog-only helping barrier run immediately after lease acquisition. It repeatedly exact-CAS
+    /// deletes parent-proved `Removing` rows and returns only after a complete fresh catalog rescan
+    /// finds none. It performs no physical LIST or delete.
+    uint64_t drainCompletedRemoving(const GcState & leased_state);
+
     /// What one fold produced. The blob deltas are sealed
     /// into a write-once generation; `fold_seal` is the durable index of WHAT WAS FOLDED (a CasFoldSeal),
     /// `root_shards` the discovered universe, `mf_cleanup` the part-manifest cleanup work keyed by
@@ -418,16 +475,16 @@ private:
         /// ref-object cleanup (covered logs / superseded snapshots) so a second LIST is never issued.
         std::map<String, RefTableListing> ref_tables;
 
-        /// The round's ONE catalog read (review C3): namespace -> its `Live`/`Removing` incarnation, as
-        /// seen by the intake walk. Every later consumer in the SAME round (`cleanupRefObjects`,
-        /// `runNamespaceCleanupPasses`) must look a namespace up here rather than re-resolving via
+        /// The round's complete immutable post-LIST catalog cut (review C3). Every later consumer in
+        /// the SAME round (`cleanupRefObjects`) must look a namespace up here rather than re-resolving via
         /// `CasRefCatalog::resolveLifeOrSentinel`, which re-reads the catalog and can see a DIFFERENT
         /// answer if the namespace was dropped and recreated between the fold's walk and the later call
-        /// -- the exact "delete plan computed under one life, applied under another" shape C3 named. A
-        /// namespace absent here (the catalog does not currently name it) has no entry; look it up with
-        /// `.find`, never assume the Stage-A sentinel applies -- that fallback is for the raw-fixture
-        /// read paths (`resolveLifeOrSentinel` itself), not for anything destructive.
-        std::map<String, UInt128> live_incarnation;
+        /// -- the exact "delete plan computed under one life, applied under another" shape C3 named.
+        /// Keeping the full cut also preserves the distinction between an absent namespace and a
+        /// cataloged but non-walkable `Creating` row; reducing it to a `Live`/`Removing` map loses that
+        /// lifecycle fact. A namespace absent from this cut has no legitimate destructive key space;
+        /// never assume the Stage-A sentinel applies.
+        std::optional<CasRefCatalog::Snapshot> catalog_cut;
 
         /// The round's per-namespace `_ckpt.checkpoint`, read ONCE by the intake walk (its second,
         /// hint-independent witness) and reused post-CAS by `cleanupRefObjects` for its delete ranges --
@@ -473,7 +530,7 @@ private:
         /// because the round's frontier-probe budget ran out first. Each one is an unproven frontier.
         uint64_t frontier_unprobed_budget = 0;
 
-        /// Every hold this round SEALED, as `(cursor key, hold)` — both the ones it detected and the
+        /// Every hold this round SEALED, as `(life id, hold)` — both the ones it detected and the
         /// ones it carried from the parent seal because their offending position is still unresolved.
         /// It reads the seal that is about to become durable, so it is the round's final answer rather
         /// than an intermediate one.
@@ -483,12 +540,12 @@ private:
         /// unproven, and no frontier proof taken this round can license destruction while one stands.
         /// Every hold the fold seals also records an anomaly today, so the two agree; the accessor
         /// exists because that coincidence is not the invariant — the hold set is.
-        std::vector<std::pair<String, RefHold>> carriedHolds() const
+        std::vector<std::pair<UInt128, RefHold>> carriedHolds() const
         {
-            std::vector<std::pair<String, RefHold>> out;
-            for (const auto & [key, cov] : fold_seal.per_ns_shard)
-                if (cov.hold)
-                    out.emplace_back(key, *cov.hold);
+            std::vector<std::pair<UInt128, RefHold>> out;
+            for (const auto & [life_id, state] : fold_seal.ref_lives)
+                if (state.coverage.hold)
+                    out.emplace_back(life_id, *state.coverage.hold);
             return out;
         }
     };
@@ -559,8 +616,7 @@ private:
         std::map<String, String> undecodable;
     };
     CheckpointWitnesses readCheckpointWitnesses(const std::map<String, RefTableListing> & ref_tables,
-                                                const std::map<String, ShardCoverage> & parent_cursors,
-                                                const std::map<String, UInt128> & live_incarnation);
+                                                const CasRefCatalog::Snapshot & catalog_cut);
 
     /// What ONE generation's prefix says about itself: whether the generation exists at all, and the
     /// greatest attempt under it whose key is one `foldSealKey` would have produced.
@@ -605,15 +661,10 @@ private:
 
 
 
-    /// Ref-object cleanup: delete each table's ref logs
-    /// covered by BOTH the durable fold cursor AND a durable snapshot, and snapshots older than the newest
-    /// observed one, in batches of <=1000 exact keys. A remove_namespace log is retained until its
-    /// namespace-cleanup item is durably Completed; ONCE Completed, that item's `remove_txn_id` is the
-    /// covering snapshot of the whole tail and its logs are cleaned in the same round. Runs post-CAS
-    /// (durable cursor), after `runNamespaceCleanupPasses` has
-    /// made the `Removed` snapshot durable, and only on a clamp-free round (`suppress_destructive == false`).
-    /// Acts only on keys THIS round's scan returned (reused via `folded.ref_tables`), so a covering snapshot
-    /// -- observed or just-republished -- is always durable before any deletion it authorizes.
+    /// Ref-object cleanup: delete each table's ref logs covered by BOTH the durable fold cursor and a
+    /// durable snapshot, and snapshots older than the newest observed one, in batches of <=1000 exact
+    /// keys. A folded terminal's cleanup evidence carries its tail-covering snapshot id directly on the
+    /// same ref-life row. Runs post-CAS and only on a clamp-free round.
     ///
     /// The round's `folded.checkpoints` TIGHTENS both boundaries and can never widen either: a log is
     /// deletable only at or below `min(newest covering snapshot, checkpoint, cursor)`, and a snapshot
@@ -621,36 +672,6 @@ private:
     /// itself names always survives. A namespace with no entry (no `_ckpt` yet, or one that has never
     /// carried a `checkpoint_snapshot_id`) degrades to the cursor/snapshot boundaries alone.
     void cleanupRefObjects(const FoldResult & folded, bool suppress_destructive);
-
-    /// Namespace-cleanup item passes: for each item in the committed seal, a Pending item
-    /// runs a bounded exact-key enumerate-and-delete pass over the removed namespace's physical `@cas@`
-    /// prefixes (manifest bodies, and -- leak-only since Task 4b -- the CURRENT life's verbatim files);
-    /// a Completed item publishes the `_cleanup` marker and
-    /// republishes the constant-size `Removed` snapshot (both idempotent `putIfAbsent`). Runs post-CAS.
-    /// A stale leader (deposed after its round CAS but still executing) must never delete a namespace a
-    /// successor round Completed and the writer recreated: the Pending pass re-reads gc/state (aborting
-    /// unless `durable.round == new_round` under our lease) and aborts on the `_cleanup` marker's presence
-    /// HEAD'd PER KEY -- the exact recreation precondition for both a cold (successor-epoch) and a warm
-    /// (same-epoch) recreation. A cheap greater-epoch skip on manifest keys is kept
-    /// as defense-in-depth.
-    /// `ref_tables` is this round's own global LIST: the `Removed`-snapshot republication is gated on it
-    /// so a snapshot a recreated namespace already superseded is never re-created (the per-round churn).
-    void runNamespaceCleanupPasses(const CasFoldSeal & seal, const std::map<String, RefTableListing> & ref_tables,
-                                   const std::map<String, UInt128> & live_incarnation,
-                                   uint64_t new_round, bool suppress_destructive);
-
-    /// Whether a namespace's physical MANIFEST prefix holds no object -- the Pending->Completed condition
-    /// for its namespace-cleanup item. LIST-only, no delete.
-    ///
-    /// NAMESPACE FILES ARE DELIBERATELY NOT PROBED (Stage B Task 4b, directive design change 2). This
-    /// predicate used to require a physical-empty proof for `_files` too, which made a name's reuse wait
-    /// on an enumeration -- and an object store may omit a key from LIST indefinitely, so the wait could
-    /// be unbounded while the file that caused it was invisible to the very pass meant to delete it. Once
-    /// files are keyed by incarnation, a surviving file of a dead life is unreachable from any later life,
-    /// so it no longer bears on whether the name may be reused: it is a storage leak for the janitor, not
-    /// a correctness condition. Manifests keep their arm because Task 4b left manifest identity unchanged
-    /// (Constraint 12) -- they are name-keyed and a stale body IS still reachable.
-    bool namespaceManifestsPhysicallyEmpty(const RootNamespace & ns);
 
     /// Best-effort cursor-paced orphan part-manifest sweep. This is cleanup-only state: a lost CAS only
     /// discards cursor progress and must not fail the already-completed GC round. Returns the page's
@@ -866,13 +887,6 @@ public:
         return discoverUniverse();
     }
 
-    /// TEST SEAM: expose the Pending->Completed emptiness predicate so a test can assert WHICH physical
-    /// prefixes it consults without driving a whole round to observe the state transition indirectly.
-    bool namespaceManifestsPhysicallyEmptyForTest(const RootNamespace & ns)
-    {
-        return namespaceManifestsPhysicallyEmpty(ns);
-    }
-
     /// TEST SEAM: expose the two cheap pre-fold GC round-defer signals so unit tests can
     /// assert them directly without driving a full round.
     bool graduationDueForTest(const GcState & state, uint64_t current_round)
@@ -884,25 +898,6 @@ public:
     RefScanSummary listRefPrefixForTest(const GcState & state)
     {
         return listRefPrefix(state);
-    }
-
-    /// TEST SEAM: drive one namespace-cleanup pass directly so a test can
-    /// stage the exact stale-leader interleaving (a Pending item whose namespace a successor Completed +
-    /// recreated) without racing a live round. Production drives this only through `runRegularRound`.
-    void runNamespaceCleanupPassesForTest(const CasFoldSeal & seal,
-                                          const std::map<String, RefTableListing> & ref_tables,
-                                          uint64_t new_round, bool suppress_destructive)
-    {
-        /// Test-only seam: no round-wide `FoldResult` to thread a `live_incarnation` map from (this
-        /// drives one pass in isolation, not a full round), so read the catalog fresh here. Safe outside
-        /// review C3's concern (a round re-resolving mid-round can disagree with itself) because this is
-        /// the pass's only catalog read, not one of several independent ones inside a single round.
-        const CasRefCatalog::Snapshot snap = CasRefCatalog::read(store->backend(), store->layout());
-        std::map<String, UInt128> live_incarnation;
-        for (const CatalogEntry & entry : snap.catalog.entries)
-            if (entry.state != NsState::Creating)
-                live_incarnation.emplace(entry.ns.string(), entry.incarnation);
-        runNamespaceCleanupPasses(seal, ref_tables, live_incarnation, new_round, suppress_destructive);
     }
 
 };

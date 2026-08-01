@@ -60,7 +60,7 @@ struct NamespaceFoldView
     /// The namespace's shard-0 coverage row. `nullopt` means the adopted seal carries no row for this
     /// namespace at all: no round has ever sealed a ref cursor for it, so no epoch's closing seal is
     /// proven consumed and every manifest under it is retained.
-    std::optional<ShardCoverage> coverage;
+    std::optional<RefCoverage> coverage;
 
     /// Manifest object keys the tail ABOVE the cursor names as REMOVAL targets, as the namespace's
     /// protection view collected them. Rule (2) is a POSITIVE test against this set: a key found here

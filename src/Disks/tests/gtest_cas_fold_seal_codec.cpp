@@ -14,26 +14,28 @@ using namespace DB::Cas;
 /// assert, so these tests are obsolete rather than adaptable.
 ///
 /// The live-precommit watermark fields (`has_live_precommit`/`min_live_precommit_*`) that fed that
-/// removed reclaim were deleted from `ShardCoverage` with it (T13). The still-meaningful fold-seal
+/// removed reclaim were deleted from `RefCoverage` with it (T13). The still-meaningful fold-seal
 /// assertion is the round-trip of `last_folded_ref_id` -- the per-table durable ref cursor that replaced
 /// them in the same struct under the snapshot+log ref model.
-TEST(CasFoldSealCodec, ShardCoverageRoundTripsLastFoldedRefId)
+TEST(CasFoldSealCodec, RefLifeCoverageRoundTripsLastFoldedRefId)
 {
     CasFoldSeal seal;
     seal.generation = 3;
     seal.parent_generation = 2;
-    ShardCoverage cov;
+    RefCoverage cov;
     cov.classification = 1;
     cov.last_folded_ref_id = RefTxnId{4, 11};
-    seal.per_ns_shard["srv/tbl@cas@/0"] = cov;
+    constexpr UInt128 life_id{1};
+    seal.ref_lives[life_id].coverage = cov;
 
     const CasFoldSeal back = decodeFoldSeal(encodeFoldSeal(seal));
-    const ShardCoverage & r = back.per_ns_shard.at("srv/tbl@cas@/0");
+    const RefCoverage & r = back.ref_lives.at(life_id).coverage;
     EXPECT_EQ(r.last_folded_ref_id, (RefTxnId{4, 11}));
 
     /// Default (nothing folded) round-trips as {0,0}.
     CasFoldSeal empty_seal;
-    empty_seal.per_ns_shard["srv/tbl@cas@/1"] = ShardCoverage{};
+    constexpr UInt128 empty_life_id{2};
+    empty_seal.ref_lives[empty_life_id].coverage = RefCoverage{};
     const CasFoldSeal e_back = decodeFoldSeal(encodeFoldSeal(empty_seal));
-    EXPECT_EQ(e_back.per_ns_shard.at("srv/tbl@cas@/1").last_folded_ref_id, (RefTxnId{}));
+    EXPECT_EQ(e_back.ref_lives.at(empty_life_id).coverage.last_folded_ref_id, (RefTxnId{}));
 }

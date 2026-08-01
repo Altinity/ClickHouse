@@ -625,7 +625,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
                 if (!resolved)
                 {
                     recordLifelessKeys(NamespaceListing{{}, {{
-                        listed.key, "physical life id is absent from the pre-list catalog cut; deferred"}}});
+                        listed.key, "physical life id is absent from the catalog cut; deferred"}}});
                 }
             }
             catch (const Exception & e)

@@ -364,9 +364,8 @@ void RefTableState::applyOp(const RefOp & op, const RefTxnId & txn_id)
     {
         case RefOpKind::NamespaceBirth:
         {
-            /// Namespace birth: legal from never-born or Removed, never from Live. Gating
-            /// recreation on the `_cleanup` marker is the writer's recovery-time responsibility;
-            /// the marker is not part of `RefTableState`.
+            /// Namespace birth is legal from an empty runtime admitted under a fresh catalog life,
+            /// never from `Live`. A predecessor still `Removing` is refused before recovery.
             if (lifecycle == RefLifecycle::Live)
                 throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableState: namespace_birth while already Live");
             lifecycle = RefLifecycle::Live;
@@ -799,9 +798,6 @@ std::map<NamespaceLifePhysicalId, RefTableListing> groupRefKeys(
             case RefObjectKind::Snap:
                 table.snapshots.push_back(parsed->txn_id);
                 break;
-            case RefObjectKind::Cleanup:
-                table.cleanup_markers.push_back(parsed->txn_id);
-                break;
         }
     }
 
@@ -809,28 +805,22 @@ std::map<NamespaceLifePhysicalId, RefTableListing> groupRefKeys(
     {
         std::sort(table.logs.begin(), table.logs.end());
         std::sort(table.snapshots.begin(), table.snapshots.end());
-        std::sort(table.cleanup_markers.begin(), table.cleanup_markers.end());
     }
 
     return out;
 }
 
 RefCleanupPlan planRefCleanup(const RefTableListing & listing, const RefTxnId & durable_cursor,
-                              const std::set<RefTxnId> & removal_logs_blocked,
-                              std::optional<RefTxnId> completed_removal_snapshot,
                               std::optional<RefTxnId> checkpoint)
 {
     RefCleanupPlan plan;
 
     /// The coverage boundary `X` is the newest snapshot known to be durable: the newest observed in this
-    /// round's scan, and -- for a namespace-cleanup item that reached `Completed` this round -- the
-    /// `Removed` snapshot the caller just made durable. With
-    /// neither there is no boundary, so no log is coverage-deletable and no older snapshot exists to delete.
+    /// round's scan. With none there is no boundary, so no log is coverage-deletable and no older
+    /// snapshot exists to delete.
     std::optional<RefTxnId> newest_snapshot;
     if (!listing.snapshots.empty())
         newest_snapshot = listing.snapshots.back();
-    if (completed_removal_snapshot && (!newest_snapshot || *newest_snapshot < *completed_removal_snapshot))
-        newest_snapshot = completed_removal_snapshot;
     if (!newest_snapshot)
         return plan;
 
@@ -848,14 +838,10 @@ RefCleanupPlan planRefCleanup(const RefTableListing & listing, const RefTxnId & 
             continue;
         if (checkpoint && *checkpoint < log_id)   /// L > checkpoint: above the namespace's own durable tail
             continue;
-        if (removal_logs_blocked.contains(log_id))   /// remove_namespace log whose item is not Completed
-            continue;
         plan.deletable_logs.push_back(log_id);
     }
 
-    /// Only snapshots the scan actually returned are deletion candidates; a `completed_removal_snapshot`
-    /// first published this round is not in `listing.snapshots`, so it is never scheduled for deletion,
-    /// and once it later appears in the scan it is the newest and is retained here.
+    /// Only snapshots the scan actually returned are deletion candidates.
     for (const RefTxnId & snapshot_id : listing.snapshots)
         if (snapshot_id < snapshot_boundary)
             plan.deletable_snapshots.push_back(snapshot_id);

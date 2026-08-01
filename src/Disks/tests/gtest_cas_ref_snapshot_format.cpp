@@ -104,7 +104,7 @@ TEST(CasRefSnapshotCodec, RoundTripLiveEmpty)
     EXPECT_FALSE(decoded.remove_txn_id.has_value());
 }
 
-TEST(CasRefSnapshotCodec, RoundTripRemoved)
+TEST(CasRefSnapshotCodec, EncodeRejectsTerminalLifecycle)
 {
     RefTableSnapshot s;
     s.ns = "ns";
@@ -112,11 +112,7 @@ TEST(CasRefSnapshotCodec, RoundTripRemoved)
     s.lifecycle = RefLifecycle::Removed;
     s.remove_txn_id = RefTxnId{7, 500};
 
-    const String bytes = encodeRefTableSnapshot(s);
-    const RefTableSnapshot decoded = decodeRefTableSnapshot(bytes, s.ns, s.snapshot_id);
-    EXPECT_EQ(decoded, s);
-    ASSERT_TRUE(decoded.remove_txn_id.has_value());
-    EXPECT_EQ(*decoded.remove_txn_id, (RefTxnId{7, 500}));
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefTableSnapshot(s); });
 }
 
 TEST(CasRefSnapshotCodec, ByteIdenticalReencode)
@@ -436,7 +432,7 @@ TEST(CasFormatBattery, RefSnapshot)
     runFormatBattery({FormatId::RefSnapshot,
         [s] { return sealObject(FormatId::RefSnapshot, encodeRefTableSnapshot(s)); },
         [ns, id](std::string_view d) { decodeRefTableSnapshot(openObject(FormatId::RefSnapshot, d), ns, id); },
-        "{\"type\":\"cas_ref_snap\",\"v\":6}\n"
+        "{\"type\":\"cas_ref_snap\",\"v\":7}\n"
         "{\"ns\":\"srv1/db/table@cas@\",\"we\":\"5\",\"rs\":\"200\",\"lc\":\"live\"}\n"
         "{\"k\":\"c\",\"rn\":\"all_1_1_0\",\"me\":\"5\",\"mb\":\"10\",\"mo\":1,\"ts\":1717000000000}\n"
         "{\"k\":\"c\",\"rn\":\"all_2_2_0\",\"me\":\"5\",\"mb\":\"11\",\"mo\":1,\"ts\":1717000000001}\n"
