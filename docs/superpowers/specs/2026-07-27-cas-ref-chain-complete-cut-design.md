@@ -534,8 +534,8 @@ from counterexample to proof; `CaRefDeltaIntakeCore` rewritten with **pool-wide 
 blob, in-degree, condemnation phases, catalog sample, holds** — so the cross-namespace hidden-`+1`
 sabotage, the temporal lemma's variants and the hold-then-`FORCE REBUILD` scenario are expressible;
 `CaRelinkConfirmCore`'s `_sab_holeylist` becomes the fix's permanent regression witness;
-`CaRefNsCleanupStaleLeaderCore` rewritten around catalog states + incarnations and per-life cleanup
-evidence rather than a second item state; `CaRefCatalogCore` owns the three-state lifecycle and local
+`CaRefNsCleanupStaleLeaderCore` models the perpetual janitor's captured physical id from a LIST page
+and its delayed delete after same-name rebirth; `CaRefCatalogCore` owns the three-state lifecycle and local
 positive-evidence/no-hold/exact-row deletion proof; `CaRefPreFoldDrainCore` owns the two-actor
 adopted-parent barrier and ambiguous outcomes, while `CaRefPreFoldDrainAllRowsCore` owns serial
 complete-token rescans, external resolution and the non-exact-CAS sabotage control; `CaCasMountCore`
@@ -544,8 +544,7 @@ extended (recovery generations; wedge-retry vs successor-seal);
 `CaRefDeltaIntakeCore` additionally asserts that the ref walk-plan key set is exactly the set of catalog
 `Live`/`Removing` ids; it consumes the pre-fold model's fresh-cut interface but does not independently
 model its provenance, so that composition remains explicitly unverified. Sabotage lets a parent, hint,
-hold or checkpoint adapter mint one forbidden row. `CaRefNsCleanupStaleLeaderCore` owns the independent
-captured-physical-id janitor proof.
+hold or checkpoint adapter mint one forbidden row.
 
 RED-first fault-injected controls, the load-bearing set: the cross-namespace hidden-`+1` vs visible
 `-1` (dies without the frontier proof); held namespace → `FORCE REBUILD` → hint hides the witness →
