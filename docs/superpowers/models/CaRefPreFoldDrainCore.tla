@@ -5,13 +5,17 @@
    race. Actor A may issue the catalog CAS and then lose the GC lease. Actor B may take over while
    A's storage request is still in flight. The protocol makes B drain the proof carried by the
    authoritative parent seal, and conclusively resolve every eligible catalog CAS, before B may
-   take a fresh catalog cut, DEFER, fold, or REBUILD. Therefore no successor seal can invalidate
-   A's proof before A's request either lands or loses its exact catalog token.
+   complete the hot stream LIST, take one fresh catalog cut, build the ref-walk plan, DEFER, fold,
+   or REBUILD. Therefore no successor seal can invalidate A's proof before A's request either lands
+   or loses its exact catalog token.
 
-   Physical objects deliberately do not occur here. The pre-fold drain mutates only the catalog;
-   the perpetual janitor and orphan sweeps own all byte reclamation. The same owner exports the
-   fresh cut as a token/value pair to a tiny ref-plan consumer boundary; the Delta-intake lifecycle
-   is not copied here. *)
+   No physical delete occurs here. The pre-fold drain mutates only the catalog; the model records
+   only whether the old/new stream keys are LIST-visible, while the perpetual janitor and orphan
+   sweeps own all byte reclamation. The same owner exports the fresh post-LIST cut as a token/value
+   pair to a tiny ref-plan consumer boundary; the Delta-intake
+   lifecycle is not copied here. The same-name rebirth abstraction records catalog `Creating`, `Live`
+   publication, then the first stream `PUT`; retained predecessor bytes remain visible to every hot
+   LIST but are not catalog authority. *)
 EXTENDS Integers, FiniteSets
 
 CONSTANTS
@@ -22,15 +26,21 @@ CONSTANTS
     SabotageStaleDeleteAfterSuccessorHold,
     SabotageRebuildFromUnadoptedSeal,
     SabotageIntakeUsesPreDrainCut,
-    SabotageIntakeUsesStaleToken
+    SabotageIntakeUsesStaleToken,
+    SabotageCutBeforeList,
+    SabotageAbsentListedDefers
 
 Actors == {"A", "B"}
-Phases == {"idle", "parent", "observed", "issued", "uncertain", "resolved", "cut", "done"}
+Phases == {"idle", "parent", "observed", "issued", "uncertain", "resolved", "listed", "cut", "planned", "done"}
 RowKinds == {"none", "unproved", "ready", "held"}
-EntryKinds == {"none", "removing", "absent"}
+CatalogEntryKinds == {"none", "removing", "absent", "creating", "live"}
+PhysicalEntryKinds == CatalogEntryKinds \cup {"live_stream"}
+
+CatalogEntry(e) == IF e = "live_stream" THEN "live" ELSE e
+Walkable(e) == e \in {"removing", "live"}
 
 VARIABLES
-    entry,                 \* `cas/ref_catalog`: the one exact row, or absence
+    entry,                 \* catalog state; `live_stream` also records the successor's first stream PUT
     catalogToken,          \* full-object token; noise models an unrelated catalog-row mutation
     noiseDone,
     adoptedValid,          \* FALSE models missing/undecodable authoritative `gc/state`
@@ -45,8 +55,8 @@ VARIABLES
     observedToken,
     observedEntry,
     cutEntry,
-    cutToken,              \* full-catalog token paired with the fresh post-drain cut
-    intakeCut,             \* the exact cut/token consumed by the ref-plan boundary
+    cutToken,              \* full-catalog token paired with the sole fresh post-LIST cut
+    intakeCut,             \* completed LIST plus the exact cut/token consumed by ref-plan
     advancedWithDebt,      \* sticky audit: DEFER/fold/REBUILD crossed an unresolved ready parent
     deletedWithoutCurrentProof, \* sticky audit: catalog CAS landed after authority/proof changed
     nonExactDelete         \* sticky audit: a catalog delete did not consume its exact observation
@@ -75,7 +85,16 @@ Init ==
     /\ cutEntry = [a \in Actors |-> "none"]
     /\ cutToken = [a \in Actors |-> 0]
     /\ intakeCut = [a \in Actors |->
-                       [catalog_token |-> 0, entry |-> "none", plan_has_life |-> FALSE]]
+                       [catalog_token |-> 0,
+                        entry |-> "none",
+                        list_complete |-> FALSE,
+                        listed_predecessor |-> FALSE,
+                        listed_successor |-> FALSE,
+                        plan_has_life |-> FALSE,
+                        plan_has_predecessor |-> FALSE,
+                        plan_has_successor |-> FALSE,
+                        dead_debris_count |-> 0,
+                        defer_for_dead_debris |-> FALSE]]
     /\ advancedWithDebt = FALSE
     /\ deletedWithoutCurrentProof = FALSE
     /\ nonExactDelete = FALSE
@@ -118,7 +137,7 @@ ReadDrainCatalog(a) ==
     /\ Current(a)
     /\ phase[a] = "observed"
     /\ observedToken' = [observedToken EXCEPT ![a] = catalogToken]
-    /\ observedEntry' = [observedEntry EXCEPT ![a] = entry]
+    /\ observedEntry' = [observedEntry EXCEPT ![a] = CatalogEntry(entry)]
     /\ phase' = [phase EXCEPT ![a] = IF parentRow[a] = "ready" /\ entry = "removing"
                                          THEN "issued" ELSE "resolved"]
     /\ UNCHANGED << entry, catalogToken, noiseDone,
@@ -223,11 +242,74 @@ ResolveSameRemoving(a) ==
                     cutToken, intakeCut,
                     advancedWithDebt, deletedWithoutCurrentProof, nonExactDelete >>
 
-(* This is the barrier: no fresh cut exists before resolution. *)
-TakeFreshCut(a) ==
+(* A same-name successor is a different exact catalog row. `Creating` precedes every life object;
+   `Live` publication precedes the first stream PUT. The physical state is folded into `entry` only
+   to keep this focused owner small; `CatalogEntry` removes that physical bit from catalog cuts. *)
+BeginSameNameRebirth ==
+    /\ entry = "absent"
+    /\ entry' = "creating"
+    /\ catalogToken' = catalogToken + 1
+    /\ UNCHANGED << noiseDone,
+                    adoptedValid, adoptedGeneration, adoptedRow, authorityLossDone,
+                    leaseOwner, leaseSeq, phase, parentGeneration, parentRow,
+                    observedToken, observedEntry, cutEntry, cutToken, intakeCut,
+                    advancedWithDebt, deletedWithoutCurrentProof, nonExactDelete >>
+
+PublishRebornLive ==
+    /\ entry = "creating"
+    /\ entry' = "live"
+    /\ catalogToken' = catalogToken + 1
+    /\ UNCHANGED << noiseDone,
+                    adoptedValid, adoptedGeneration, adoptedRow, authorityLossDone,
+                    leaseOwner, leaseSeq, phase, parentGeneration, parentRow,
+                    observedToken, observedEntry, cutEntry, cutToken, intakeCut,
+                    advancedWithDebt, deletedWithoutCurrentProof, nonExactDelete >>
+
+PutRebornStream ==
+    /\ entry = "live"
+    /\ entry' = "live_stream"
+    /\ UNCHANGED << catalogToken, noiseDone,
+                    adoptedValid, adoptedGeneration, adoptedRow, authorityLossDone,
+                    leaseOwner, leaseSeq, phase, parentGeneration, parentRow,
+                    observedToken, observedEntry, cutEntry, cutToken, intakeCut,
+                    advancedWithDebt, deletedWithoutCurrentProof, nonExactDelete >>
+
+(* A stale request that now sees a different same-name life resolves; it cannot act on that row. *)
+ResolveDifferentLife(a) ==
+    /\ phase[a] = "uncertain"
+    /\ CatalogEntry(entry) \in {"creating", "live"}
+    /\ observedToken' = [observedToken EXCEPT ![a] = catalogToken]
+    /\ observedEntry' = [observedEntry EXCEPT ![a] = CatalogEntry(entry)]
+    /\ phase' = [phase EXCEPT ![a] = "resolved"]
+    /\ UNCHANGED << entry, catalogToken, noiseDone,
+                    adoptedValid, adoptedGeneration, adoptedRow, authorityLossDone,
+                    leaseOwner, leaseSeq, parentGeneration, parentRow, cutEntry,
+                    cutToken, intakeCut,
+                    advancedWithDebt, deletedWithoutCurrentProof, nonExactDelete >>
+
+(* The old predecessor stream is deliberately retained and always returned. The successor key may
+   be omitted by a weak LIST, but can be returned only after its post-Live stream PUT. *)
+CompleteHotList(a) ==
     /\ Current(a)
     /\ phase[a] = "resolved"
-    /\ cutEntry' = [cutEntry EXCEPT ![a] = entry]
+    /\ \E includeSuccessor \in BOOLEAN :
+         /\ includeSuccessor => entry = "live_stream"
+         /\ intakeCut' = [intakeCut EXCEPT
+                              ![a].list_complete = TRUE,
+                              ![a].listed_predecessor = TRUE,
+                              ![a].listed_successor = includeSuccessor]
+    /\ phase' = [phase EXCEPT ![a] = "listed"]
+    /\ UNCHANGED << entry, catalogToken, noiseDone,
+                    adoptedValid, adoptedGeneration, adoptedRow, authorityLossDone,
+                    leaseOwner, leaseSeq, parentGeneration, parentRow,
+                    observedToken, observedEntry, cutEntry, cutToken,
+                    advancedWithDebt, deletedWithoutCurrentProof, nonExactDelete >>
+
+(* This is the barrier: the one fresh cut exists only after drain resolution and completed LIST. *)
+TakeFreshCut(a) ==
+    /\ Current(a)
+    /\ phase[a] = "listed"
+    /\ cutEntry' = [cutEntry EXCEPT ![a] = CatalogEntry(entry)]
     /\ cutToken' = [cutToken EXCEPT ![a] = catalogToken]
     /\ phase' = [phase EXCEPT ![a] = "cut"]
     /\ UNCHANGED << entry, catalogToken, noiseDone,
@@ -236,9 +318,64 @@ TakeFreshCut(a) ==
                     observedToken, observedEntry, intakeCut,
                     advancedWithDebt, deletedWithoutCurrentProof, nonExactDelete >>
 
-Defer(a) ==
+(* Load-bearing ordering sabotage: the old pre-amendment cut is taken before the hot LIST. *)
+TakeFreshCutBeforeList(a) ==
+    /\ SabotageCutBeforeList
+    /\ Current(a)
+    /\ phase[a] = "resolved"
+    /\ cutEntry' = [cutEntry EXCEPT ![a] = CatalogEntry(entry)]
+    /\ cutToken' = [cutToken EXCEPT ![a] = catalogToken]
+    /\ phase' = [phase EXCEPT ![a] = "cut"]
+    /\ UNCHANGED << entry, catalogToken, noiseDone,
+                    adoptedValid, adoptedGeneration, adoptedRow, authorityLossDone,
+                    leaseOwner, leaseSeq, parentGeneration, parentRow,
+                    observedToken, observedEntry, intakeCut,
+                    advancedWithDebt, deletedWithoutCurrentProof, nonExactDelete >>
+
+BuildRefWalkPlan(a) ==
     /\ Current(a)
     /\ phase[a] = "cut"
+    /\ intakeCut' = [intakeCut EXCEPT
+                         ![a].catalog_token = cutToken[a],
+                         ![a].entry = cutEntry[a],
+                         ![a].plan_has_life = Walkable(cutEntry[a]),
+                         ![a].plan_has_predecessor = (cutEntry[a] = "removing"),
+                         ![a].plan_has_successor = (cutEntry[a] = "live"),
+                         ![a].dead_debris_count =
+                             IF intakeCut[a].listed_predecessor /\ cutEntry[a] # "removing" THEN 1 ELSE 0,
+                         ![a].defer_for_dead_debris = FALSE]
+    /\ phase' = [phase EXCEPT ![a] = "planned"]
+    /\ UNCHANGED << entry, catalogToken, noiseDone,
+                    adoptedValid, adoptedGeneration, adoptedRow, authorityLossDone,
+                    leaseOwner, leaseSeq, parentGeneration, parentRow,
+                    observedToken, observedEntry, cutEntry, cutToken,
+                    advancedWithDebt, deletedWithoutCurrentProof, nonExactDelete >>
+
+(* Rejected classifier: a listed id absent from the later cut is called unknown and forces DEFER. *)
+BuildRefWalkPlanDeferringDeadDebris(a) ==
+    /\ SabotageAbsentListedDefers
+    /\ Current(a)
+    /\ phase[a] = "cut"
+    /\ intakeCut[a].listed_predecessor
+    /\ cutEntry[a] # "removing"
+    /\ intakeCut' = [intakeCut EXCEPT
+                         ![a].catalog_token = cutToken[a],
+                         ![a].entry = cutEntry[a],
+                         ![a].plan_has_life = Walkable(cutEntry[a]),
+                         ![a].plan_has_predecessor = FALSE,
+                         ![a].plan_has_successor = (cutEntry[a] = "live"),
+                         ![a].dead_debris_count = 1,
+                         ![a].defer_for_dead_debris = TRUE]
+    /\ phase' = [phase EXCEPT ![a] = "planned"]
+    /\ UNCHANGED << entry, catalogToken, noiseDone,
+                    adoptedValid, adoptedGeneration, adoptedRow, authorityLossDone,
+                    leaseOwner, leaseSeq, parentGeneration, parentRow,
+                    observedToken, observedEntry, cutEntry, cutToken,
+                    advancedWithDebt, deletedWithoutCurrentProof, nonExactDelete >>
+
+Defer(a) ==
+    /\ Current(a)
+    /\ phase[a] = "planned"
     /\ phase' = [phase EXCEPT ![a] = "done"]
     /\ UNCHANGED << entry, catalogToken, noiseDone,
                     adoptedValid, adoptedGeneration, adoptedRow, authorityLossDone,
@@ -248,20 +385,17 @@ Defer(a) ==
 
 AdoptFromCut(a) ==
     /\ Current(a)
-    /\ phase[a] = "cut"
-    /\ \E nextRow \in IF cutEntry[a] = "absent" THEN {"none"}
-                     ELSE {"unproved", "ready", "held"} :
+    /\ phase[a] = "planned"
+    /\ ~intakeCut[a].defer_for_dead_debris
+    /\ \E nextRow \in IF Walkable(cutEntry[a]) THEN {"unproved", "ready", "held"}
+                     ELSE {"none"} :
          /\ adoptedRow' = nextRow
          /\ adoptedGeneration' = adoptedGeneration + 1
     /\ adoptedValid' = TRUE
-    /\ intakeCut' = [intakeCut EXCEPT ![a] =
-                        [catalog_token |-> cutToken[a],
-                         entry |-> cutEntry[a],
-                         plan_has_life |-> cutEntry[a] = "removing"]]
     /\ phase' = [phase EXCEPT ![a] = "done"]
     /\ UNCHANGED << entry, catalogToken, noiseDone, authorityLossDone,
                     leaseOwner, leaseSeq, parentGeneration, parentRow,
-                    observedToken, observedEntry, cutEntry, cutToken,
+                    observedToken, observedEntry, cutEntry, cutToken, intakeCut,
                     advancedWithDebt, deletedWithoutCurrentProof, nonExactDelete >>
 
 (* Three isolated omissions. Their sticky ghost makes the ordering claim executable even for
@@ -393,11 +527,15 @@ IntakeUsesPreDrainCut(a) ==
     /\ Current(a)
     /\ phase[a] = "cut"
     /\ observedToken[a] # 0
-    /\ intakeCut' = [intakeCut EXCEPT ![a] =
-                        [catalog_token |-> observedToken[a],
-                         entry |-> observedEntry[a],
-                         plan_has_life |-> observedEntry[a] = "removing"]]
-    /\ phase' = [phase EXCEPT ![a] = "done"]
+    /\ intakeCut' = [intakeCut EXCEPT
+                         ![a].catalog_token = observedToken[a],
+                         ![a].entry = observedEntry[a],
+                         ![a].plan_has_life = Walkable(observedEntry[a]),
+                         ![a].plan_has_predecessor = (observedEntry[a] = "removing"),
+                         ![a].plan_has_successor = FALSE,
+                         ![a].dead_debris_count = 0,
+                         ![a].defer_for_dead_debris = FALSE]
+    /\ phase' = [phase EXCEPT ![a] = "planned"]
     /\ UNCHANGED << entry, catalogToken, noiseDone,
                     adoptedValid, adoptedGeneration, adoptedRow, authorityLossDone,
                     leaseOwner, leaseSeq, parentGeneration, parentRow,
@@ -412,17 +550,18 @@ AdoptFromCutWithStaleToken(a) ==
     /\ phase[a] = "cut"
     /\ observedToken[a] # 0
     /\ observedToken[a] # cutToken[a]
-    /\ \E nextRow \in IF cutEntry[a] = "absent" THEN {"none"}
-                     ELSE {"unproved", "ready", "held"} :
-         /\ adoptedRow' = nextRow
-         /\ adoptedGeneration' = adoptedGeneration + 1
-    /\ adoptedValid' = TRUE
-    /\ intakeCut' = [intakeCut EXCEPT ![a] =
-                        [catalog_token |-> observedToken[a],
-                         entry |-> cutEntry[a],
-                         plan_has_life |-> cutEntry[a] = "removing"]]
-    /\ phase' = [phase EXCEPT ![a] = "done"]
-    /\ UNCHANGED << entry, catalogToken, noiseDone, authorityLossDone,
+    /\ intakeCut' = [intakeCut EXCEPT
+                         ![a].catalog_token = observedToken[a],
+                         ![a].entry = cutEntry[a],
+                         ![a].plan_has_life = Walkable(cutEntry[a]),
+                         ![a].plan_has_predecessor = (cutEntry[a] = "removing"),
+                         ![a].plan_has_successor = (cutEntry[a] = "live"),
+                         ![a].dead_debris_count =
+                             IF intakeCut[a].listed_predecessor /\ cutEntry[a] # "removing" THEN 1 ELSE 0,
+                         ![a].defer_for_dead_debris = FALSE]
+    /\ phase' = [phase EXCEPT ![a] = "planned"]
+    /\ UNCHANGED << entry, catalogToken, noiseDone,
+                    adoptedValid, adoptedGeneration, adoptedRow, authorityLossDone,
                     leaseOwner, leaseSeq, parentGeneration, parentRow,
                     observedToken, observedEntry, cutEntry, cutToken,
                     advancedWithDebt, deletedWithoutCurrentProof, nonExactDelete >>
@@ -433,20 +572,22 @@ Next ==
     \/ \E a \in Actors :
          \/ Acquire(a) \/ ReadAdoptedParent(a) \/ ReadDrainCatalog(a)
          \/ DeleteSuccess(a) \/ DeleteUnknownLanded(a) \/ DeleteUnknownNotLanded(a)
-         \/ DeleteConflict(a) \/ ResolveAbsent(a) \/ ResolveSameRemoving(a)
-         \/ TakeFreshCut(a) \/ Defer(a) \/ AdoptFromCut(a)
+         \/ DeleteConflict(a) \/ ResolveAbsent(a) \/ ResolveSameRemoving(a) \/ ResolveDifferentLife(a)
+         \/ CompleteHotList(a) \/ TakeFreshCut(a) \/ TakeFreshCutBeforeList(a)
+         \/ BuildRefWalkPlan(a) \/ BuildRefWalkPlanDeferringDeadDebris(a)
+         \/ Defer(a) \/ AdoptFromCut(a)
          \/ FoldBypassDrain(a) \/ RebuildBypassDrain(a) \/ DeferBypassDrain(a)
          \/ ContinueAfterUnknown(a) \/ AdoptHeldOverDeposedRequest(a)
          \/ LoseAuthority(a) \/ RebuildAuthorityOnly(a) \/ RebuildFromUnadoptedSealDeletes(a)
          \/ IntakeUsesPreDrainCut(a) \/ AdoptFromCutWithStaleToken(a)
-    \/ CatalogNoise
+    \/ CatalogNoise \/ BeginSameNameRebirth \/ PublishRebornLive \/ PutRebornStream
     \/ NoOp
 
 Spec == Init /\ [][Next]_vars
 
 TypeOK ==
-    /\ entry \in {"removing", "absent"}
-    /\ catalogToken \in 1..3
+    /\ entry \in PhysicalEntryKinds
+    /\ catalogToken \in 1..5
     /\ noiseDone \in BOOLEAN
     /\ adoptedValid \in BOOLEAN
     /\ adoptedGeneration \in 1..3
@@ -457,12 +598,21 @@ TypeOK ==
     /\ phase \in [Actors -> Phases]
     /\ parentGeneration \in [Actors -> 0..3]
     /\ parentRow \in [Actors -> RowKinds]
-    /\ observedToken \in [Actors -> 0..3]
-    /\ observedEntry \in [Actors -> EntryKinds]
-    /\ cutEntry \in [Actors -> EntryKinds]
-    /\ cutToken \in [Actors -> 0..3]
+    /\ observedToken \in [Actors -> 0..5]
+    /\ observedEntry \in [Actors -> CatalogEntryKinds]
+    /\ cutEntry \in [Actors -> CatalogEntryKinds]
+    /\ cutToken \in [Actors -> 0..5]
     /\ intakeCut \in [Actors ->
-                        [catalog_token : 0..3, entry : EntryKinds, plan_has_life : BOOLEAN]]
+                        [catalog_token : 0..5,
+                         entry : CatalogEntryKinds,
+                         list_complete : BOOLEAN,
+                         listed_predecessor : BOOLEAN,
+                         listed_successor : BOOLEAN,
+                         plan_has_life : BOOLEAN,
+                         plan_has_predecessor : BOOLEAN,
+                         plan_has_successor : BOOLEAN,
+                         dead_debris_count : 0..1,
+                         defer_for_dead_debris : BOOLEAN]]
     /\ advancedWithDebt \in BOOLEAN
     /\ deletedWithoutCurrentProof \in BOOLEAN
     /\ nonExactDelete \in BOOLEAN
@@ -471,6 +621,21 @@ DrainBeforeDecision == ~advancedWithDebt
 DeleteUsesCurrentAdoptedProof == ~deletedWithoutCurrentProof
 ExactCatalogCAS == ~nonExactDelete
 
+(* The one authoritative round cut is post-LIST. A pre-LIST cut is not safe classification input. *)
+FreshCutFollowsCompletedHotList ==
+    \A a \in Actors : cutToken[a] # 0 => intakeCut[a].list_complete
+
+(* A retained predecessor returned by LIST but absent from the later cut is counted and dropped. It
+   neither enters the plan nor sets a dead-debris DEFER reason; a reborn `live` row is independent. *)
+DeadListedPredecessorIsInert ==
+    \A a \in Actors :
+        phase[a] \in {"planned", "done"}
+        /\ intakeCut[a].listed_predecessor
+        /\ cutEntry[a] # "removing"
+        => /\ intakeCut[a].dead_debris_count = 1
+           /\ ~intakeCut[a].plan_has_predecessor
+           /\ ~intakeCut[a].defer_for_dead_debris
+
 (* The consumer must receive the same immutable full-catalog observation produced after the drain.
    Equality includes the token, so an earlier cut with the same row value is still stale. *)
 IntakeConsumesFreshPostDrainCut ==
@@ -478,7 +643,9 @@ IntakeConsumesFreshPostDrainCut ==
         intakeCut[a].catalog_token # 0 =>
             /\ intakeCut[a].catalog_token = cutToken[a]
             /\ intakeCut[a].entry = cutEntry[a]
-            /\ intakeCut[a].plan_has_life = (intakeCut[a].entry = "removing")
+            /\ intakeCut[a].plan_has_life = Walkable(intakeCut[a].entry)
+            /\ intakeCut[a].plan_has_predecessor = (intakeCut[a].entry = "removing")
+            /\ intakeCut[a].plan_has_successor = (intakeCut[a].entry = "live")
 
 (* Negated non-vacuity witness: A's exact request loses to B's completed drain, B adopts the
    catalog-absent successor, and A conclusively observes its conflict. *)
@@ -502,5 +669,23 @@ WITNESS_DRAINED_ROW_ABSENT_FROM_INTAKE ==
         /\ intakeCut[a].catalog_token = cutToken[a]
         /\ intakeCut[a].entry = "absent"
         /\ ~intakeCut[a].plan_has_life)
+
+(* Negated convergence witness: the catalog row is deleted, the same name is reborn through
+   Creating/Live/stream PUT, the completed LIST still returns predecessor debris, and the later cut
+   admits only the successor. The actor adopts instead of perpetually deferring on the old bytes. *)
+WITNESS_REBIRTH_WITH_RETAINED_DEBRIS_ADOPTS ==
+    ~(\E a \in Actors :
+        /\ phase[a] = "done"
+        /\ entry = "live_stream"
+        /\ intakeCut[a].list_complete
+        /\ intakeCut[a].listed_predecessor
+        /\ intakeCut[a].listed_successor
+        /\ cutEntry[a] = "live"
+        /\ intakeCut[a].dead_debris_count = 1
+        /\ ~intakeCut[a].plan_has_predecessor
+        /\ intakeCut[a].plan_has_successor
+        /\ ~intakeCut[a].defer_for_dead_debris
+        /\ adoptedGeneration > parentGeneration[a]
+        /\ adoptedRow \in {"unproved", "ready", "held"})
 
 =============================================================================

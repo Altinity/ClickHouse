@@ -1251,10 +1251,13 @@ continue over unrelated unique ids and unrelated point I/O remains available. A 
 deliberately reused; the existing random-128 incarnation uniqueness assumption now applies pool-wide.
 
 Absence from a cut is inert-debris proof only when that cut follows observation of the object. The hot
-round reads its cut before LIST, so an absent listed id there is post-cut/unknown and is deferred; a
-consumer that needs it restarts with a fresh cut. Task 5's janitor reads its cut AFTER each LIST page, so
-catalog-before-object publication makes an absent id from that page dead-life debris. `_path` must never
-be invented as replacement authority.
+round completes its one stream LIST and then takes ONE authoritative catalog `{token, value}` cut. A
+listed id absent from that later cut is dead, inert debris: it is counted for eventual janitor work,
+but is neither admitted nor a reason to defer. `Live`/`Removing` ids present in the cut are admitted;
+a new admission after the cut could not have appeared in the completed LIST and is next-round work.
+Task 5's janitor likewise reads its cut AFTER each LIST page. `_path` must never be invented as
+replacement authority, and no consumer adds parent evidence, history, a tombstone or a second catalog
+GET to classify the listed ids.
 
 - [x] **Step 0: amend the authority before code.** Land the spec change and its explicit rejected
   alternative: removing the full LIST in favour of an unbounded serial `GET N+1` chase has no bounded
@@ -1271,8 +1274,9 @@ be invented as replacement authority.
   the check disappears with the generation-5 parser in Step 2, not into a `chassert`.
   **Tests:** two catalog rows in any lifecycle states with one current id make both rows unresolvable,
   stop catalog mutation/REBUILD/decommission/destructive GC, and still let fsck plus an unrelated unique
-  point read progress; an id absent from an older round cut is deferred, while an id absent from a
-  post-observation cut is debris; changing only the namespace spelling in an old-format key produces
+  point read progress; under Task 5's amended final order, a hot-LIST id absent from the sole later
+  cut is inert debris and does not defer; changing only the namespace spelling in an old-format key
+  produces
   the mismatch disposition and cannot redirect an operation; all point readers/writers retain identical
   request counts.
 - [x] **Step 2: introduce the two prefixes behind existing builders.** Add
@@ -1344,9 +1348,11 @@ coverage, LIST hints, holds and `_ckpt` observations can enrich an existing row 
 REBUILD calls the same constructor. Thus the set of ref-life rows is a function of one catalog cut,
 instead of an agreement among five independently guarded producers.
 
-Every GC invocation, after acquiring its lease and before defer, stream LIST, fold catalog cut, fold or
-successor adoption, runs one catalog-only pre-fold drain against the authoritative adopted parent
-seal. It may exact-CAS-delete a complete observed `Removing` row only when the matching parent life row
+Every GC invocation follows one exact order: acquire the lease and validate the adopted seal; run the
+catalog-only pre-fold drain to conclusive completion; complete the hot `LIST(cas/ns/stream/)`; take
+ONE fresh authoritative full-catalog `{token, value}` cut; pass that sole cut and the completed LIST
+observations to `buildRefWalkPlan`; then decide `DEFER` or perform fold, seal and adoption. The drain
+may exact-CAS-delete a complete observed `Removing` row only when the matching parent life row
 contains cleanup evidence and no durable hold. Every ambiguous/conflicting CAS is conclusively
 resolved; if the same exact row may remain, the invocation aborts before successor publication. There
 is no special physical cleanup pass: `_ckpt`, stream and `_files` are inert debris for the perpetual
@@ -1354,6 +1360,15 @@ janitor, while orphan manifests remain the perpetual manifest sweep's work. The 
 temporarily retain the deleted predecessor row; this is safe because a rebirth gets another `life_id`
 and every consumer joins through a fresh catalog cut. There is no pruning wait, physical-empty proof
 or second deletion window; the catalog stays O(active + in-flight removals).
+
+The post-LIST cut is load-bearing. Catalog `Creating{name->life_id}` is durable before any object for
+that life, and the first stream `PUT` is permitted only after `Live` publication and recovery. An id
+returned by the completed hot LIST but absent from the later cut is therefore dead, inert debris: it
+is counted and remains eligible for the perpetual janitor, but is neither admitted to the walk plan
+nor a reason to `DEFER`. `Live` and `Removing` rows present in the cut are admitted. A new admission
+after the cut could not have appeared in the already-completed LIST and is next-round work. A LIST
+omission can delay observations only; it cannot manufacture or delete catalog authority. This proof
+uses no parent-evidence exception, tombstone/history, second catalog GET or fallback classifier.
 
 This is helping, not mutual exclusion. If A stalls after observing a drainable row and B steals the
 lease, B independently completes that deletion before B may publish anything. A's later exact catalog
@@ -1481,8 +1496,9 @@ making each adapter attempt to mint a row; they do not duplicate a lifecycle pre
   set from `Live`/`Removing` catalog rows, then its internal adapters may only attach data to those rows:
   matching parent coverage, a listed hint resolved through the cut's reverse index, a matching hold,
   and `_ckpt`/arithmetic-tail evidence. A parent row whose id is absent or non-walkable is counted,
-  logged and dropped; a hint id absent from the older round cut is post-cut unknown and deferred to a
-  later round. None sets pool-wide suppression merely because an old ref-life row exists. Freeze the
+  logged and dropped. The hot LIST completes before the sole authoritative cut; a listed id absent
+  from that later cut is counted as inert dead-life debris, is not admitted and does not cause
+  `DEFER`. None sets pool-wide suppression merely because an old ref-life row exists. Freeze the
   returned plan's key set and expose only lookup/enrichment of existing rows; the sole `emplace` remains
   inside the catalog loop, while folding can still attach newly earned cleanup evidence.
 - [ ] **REBUILD calls the same constructor.** It may provide different coverage observations, but it
@@ -1536,21 +1552,25 @@ making each adapter attempt to mint a row; they do not duplicate a lifecycle pre
   selection. An absent or different exact row resolves the observed candidate; the same exact row
   requires a bounded retry or aborts the invocation. A restarted scan includes every newly observed
   row whose parent life row supplies the same ready/no-hold proof; a deadline or unreadable catalog
-  aborts rather than publishing around perpetual churn. **No defer decision, hot stream LIST, fold
-  catalog cut, fold, seal PUT or successor `gc/state` CAS may occur while an eligible row is
-  unresolved.** Only a complete rescan with no eligible row permits the fresh catalog cut for
-  successor work. The drain performs zero physical LISTs/deletes and does not consult
-  `suppress_destructive`.
+  aborts rather than publishing around perpetual churn. **No defer decision, hot stream LIST, catalog
+  cut, plan construction, fold, seal PUT or successor `gc/state` CAS may occur while an eligible row
+  is unresolved.** Only a complete rescan with no eligible row permits the completed hot stream LIST;
+  after that LIST, take ONE fresh authoritative full-catalog `{token, value}` cut, construct the sole
+  `buildRefWalkPlan` intake from that cut plus the completed LIST observations, and only then decide or
+  publish. The drain performs zero physical LISTs/deletes and does not consult `suppress_destructive`.
 - [ ] **The stale-leader/helping test is the cross-object proof.** A observes an eligible row and stalls
-  before its catalog CAS. B steals the lease, independently drains that row, takes the fresh cut and
+  before its catalog CAS. B steals the lease, independently drains that row, completes the hot LIST,
+  takes the fresh cut and
   adopts the successor; in that trace A's old exact CAS loses. An already-issued A CAS may instead
   land before B's drain only while the adopted proof remains current; B then observes absence and
   continues the same serial drain. Sabotage B to skip the drain, add a hold in its successor seal, let
-  A delete, and require the invariant to fail. The operation journal pins `B lease CAS → exact catalog
-  CAS resolved → fresh catalog cut → successor seal PUT/adoption`.
+  A delete, and require the invariant to fail. The operation journal pins `B lease CAS -> exact catalog
+  CAS resolved -> completed hot LIST -> ONE fresh catalog cut -> buildRefWalkPlan -> successor seal
+  PUT/adoption`.
 - [ ] **DEFER and `REBUILD` cannot bypass the barrier.** A deferred invocation deletes eligible rows
   before its early return. Healthy `FORCE REBUILD` acquires the lease, drains from the authoritative
-  parent and only then takes its rebuild cut. With absent/undecodable `gc/state`, `REBUILD` performs zero
+  parent, completes the hot LIST and only then takes its rebuild cut. With absent/undecodable
+  `gc/state`, `REBUILD` performs zero
   catalog mutations based on a seal discovered by LIST; it may adopt a reconstructed baseline, whose
   eligible rows are drained by the next authoritative invocation. A stale pre-lease rebuild cut is
   never used for successor construction.
@@ -1561,6 +1581,25 @@ making each adapter attempt to mint a row; they do not duplicate a lifecycle pre
   physical delete is a precondition for the catalog CAS.
 - [ ] **Unauthorized terminal append is refused.** A non-owner without a claimed fence cannot append the
   terminal record. A happy-path owner test cannot catch this check's removal.
+
+#### Checkpoint 5.5 — TDD/TLA gate for the post-LIST cut {#t5-checkpoint-5-5}
+
+- [x] **Gate before any Step-6 C++ resumes.** Amend the existing single owner
+  `CaRefPreFoldDrainCore`; do not create a second protocol owner. Model the exact sequence
+  `adopted seal -> conclusive catalog-only drain -> completed hot LIST -> ONE fresh catalog
+  {token,value} cut -> buildRefWalkPlan intake -> decision/adoption`, together with catalog
+  `Creating` before life objects and stream `PUT` only after `Live`/recovery.
+- [x] **RED controls and GREEN witness are mandatory.** A cut-before-LIST sabotage must violate the
+  post-LIST provenance/order invariant. An absent-listed-means-unknown sabotage must violate the
+  inert-debris/no-DEFER invariant. The honest model must stay GREEN and reach a witness where the old
+  predecessor stream survives catalog deletion, the same name is reborn, the later cut admits only
+  the successor, and the retained predecessor debris does not force perpetual `DEFER`. Update runner,
+  aggregate accounting and results if the configuration count changes. Preserve redirected logs and
+  child analysis as the TDD evidence.
+- [x] **Focused command:** run `docs/superpowers/models/run_prefold_drain.sh >
+  build/task5_cp5_cp6_postlist_full_gate_attempt1.log 2>&1` from the repository root. The committed
+  runner asserts all named RED/GREEN/witness outcomes; the report records the direct RED and GREEN
+  TLC commands and independent child log analysis.
 
 #### Step 6 — the refusal has no assistance protocol {#t5-step6}
 
@@ -1678,7 +1717,10 @@ making each adapter attempt to mint a row; they do not duplicate a lifecycle pre
   `_sab_intake_uses_predrain_cut` substitutes the earlier drain observation and violates
   `IntakeConsumesFreshPostDrainCut`; `_sab_intake_uses_stale_token` holds the fresh row value constant
   while substituting only the earlier full-catalog token at the plan/adoption seam, so both halves of
-  the provenance pair are independently load-bearing. `WITNESS_DRAINED_ROW_ABSENT_FROM_INTAKE`
+  the provenance pair are independently load-bearing. The same owner models a completed hot LIST
+  before `TakeFreshCut`: a cut-before-LIST sabotage and an absent-listed-means-unknown sabotage pin
+  the order and inert-debris classification, while a rebirth witness retains predecessor bytes and
+  still reaches successor adoption without perpetual `DEFER`. `WITNESS_DRAINED_ROW_ABSENT_FROM_INTAKE`
   proves a drained `Removing` row is absent from the consumed cut and plan. `CaRefDeltaIntakeCore`
   remains only the walk-plan key-set/fold proof; do not duplicate adopted-parent or drain ordering
   there, and do not cite its unrelated `_sab_adoptbeforecommit`/`NoMissedFold` pair as provenance

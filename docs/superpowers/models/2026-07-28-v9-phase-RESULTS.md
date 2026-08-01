@@ -24,8 +24,8 @@ exactly in [that section](#list-trust-audit)).
 
 > **`TLA PHASE: PASS`**
 
-Every green is green and every `_sab_` is red, across **111 configs in 11 asserted batteries** — the
-six current phase model families (84 configs) plus the five older models whose runners this task upgraded
+Every green is green and every `_sab_` is red, across **114 configs in 11 asserted batteries** — the
+six current phase model families (87 configs) plus the five older models whose runners this task upgraded
 to name assertions (27 configs). No config was skipped, none was left without a
 verdict, and no expectation is satisfied by a bare exit code: every red is matched against the NAME
 of the invariant or property it had to break.
@@ -36,26 +36,26 @@ of the invariant or property it had to break.
 | `CaRefDeltaIntakeCore` | `run_deltaintake.sh` | 13 | 5 | 8 | 833 s | 13/13 |
 | `CaRefCatalogCore` | `run_refcatalog.sh` | 16 | 2 | 14 | 10 s | 16/16 |
 | `CaRefNsCleanupStaleLeaderCore` | `run_nscleanup_staleleader.sh` | 4 | 1 | 3 | 4 s | 4/4 |
-| `CaRefPreFoldDrainCore` (+ all-row companion) | `run_prefold_drain.sh` | 14 | 2 | 12 | 8 s | 14/14 |
+| `CaRefPreFoldDrainCore` (+ all-row companion) | `run_prefold_drain.sh` | 17 | 2 | 15 | 11 s | 17/17 |
 | `CaCasMountCore` | `run_mount.sh` | 22 | 2 | 20 | 583 s | 22/22 |
 | `CaBuildRootPrecommit` | `run_buildrootprecommit.sh` (NEW) | 8 | 4 | 4 | 90 s | 8/8 |
 | `CaDiskLifecycle` | `run_disklifecycle.sh` (upgraded) | 7 | 1 | 6 | 5 s | 7/7 |
 | `CaErasureProof` | `run_erasureproof.sh` (upgraded) | 6 | 2 | 4 | 9 s | 6/6 |
 | `CaRefFoldClampRecoveryCore` | `run_foldclamp.sh` (upgraded) | 2 | 1 | 1 | 1 s | 2/2 |
 | `CaRefWriterCleanupCore` | `run_refwcleanup.sh` (upgraded) | 4 | 1 | 3 | 2 s | 4/4 |
-| **total** | | **111** | **26** | **85** | **~28 min + focused reruns** | **111/111** |
+| **total** | | **114** | **26** | **88** | **~28 min + focused reruns** | **114/114** |
 
 `CaCasMountCore` also carries a 23rd config on disk, `_rev6_observe`, which is `SLOW=1`-gated: it does
 not complete in an interactive budget and that is pre-existing (confirmed against the pre-2026-07-24
 committed model). It is excluded from the default battery *with a verdict of its own* (`incomplete`),
 not silently.
 
-Reds are not all sabotages, and the distinction matters. The 85 break down as:
+Reds are not all sabotages, and the distinction matters. The 88 break down as:
 
-- **62 sabotage-class** — a load-bearing rule removed, one per config. 59 are named `_sab_*`; the
+- **64 sabotage-class** — a load-bearing rule removed, one per config. 61 are named `_sab_*`; the
   other three are `CaBuildRootPrecommit`'s necessity matrix (`_buggy`, `_buildrootonly`, `_lazyleak`),
   which remove a half of the fix rather than a rule, and are the same kind of evidence.
-- **19 reachability witnesses** — negated reachability, where the violation IS the evidence that a
+- **20 reachability witnesses** — negated reachability, where the violation IS the evidence that a
   branch is live (`_witness_*` plus `_b2_witness`).
 - **4 FINDINGS** — a red that reports a real defect rather than validating a guard:
   `CaRefDeltaIntakeCore_witness_corruptgap` (spec §5's named residual),
@@ -73,7 +73,7 @@ property name — see [the `temporal` expectation kind](#fix-runners) for how th
 |---|---|---|
 | §2 **INV-1** per-namespace contiguous ids, the every-attempt rule | `CaRefTableSnapshotLogCore` | `_sab_reuseafterambiguous` (`INV_NO_PHANTOM`), `_sab_gaponfail` (`INV_DENSE`) |
 | §2 **INV-2** every epoch transition closed in-band by a `slot-occupy` seal | `CaRefTableSnapshotLogCore` | `_sab_noseal`, `_sab_sealclobbersbase` (`INV_RECOVERY`), `_sab_blindput` (`INV_NO_GHOST`), and **the flip**: `_v9_flip_latepred` GREEN — rev.4's `Late Predecessor PUT` counterexample is now a proof |
-| §2 **INV-3** the catalog with ref-layer incarnations | `CaRefCatalogCore`, `CaRefPreFoldDrainCore`, `CaRefPreFoldDrainAllRowsCore` | local exact-row deletion proof: `_sab_deletewithoutevidence`, `_sab_deletewithforeignevidence`, `_sab_deleteunderhold`, `_sab_deletewithoutexactobservation` (`INV_REMOVAL_DELETE_PROVED`); cross-object barrier: `_sab_*_bypasses_drain`, `_sab_continue_after_unknown`, `_sab_stale_delete_after_successor_hold`, `_sab_rebuild_from_unadopted_seal`; cut-to-intake composition: `_sab_intake_uses_predrain_cut` and `_sab_intake_uses_stale_token` independently falsify row/token provenance (`IntakeConsumesFreshPostDrainCut`), plus `_witness_drained_row_absent_from_intake`; all-row rescan and exactness: `_sab_skiprescan`, `_sab_nonexactdelete` |
+| §2 **INV-3** the catalog with ref-layer incarnations | `CaRefCatalogCore`, `CaRefPreFoldDrainCore`, `CaRefPreFoldDrainAllRowsCore` | local exact-row deletion proof: `_sab_deletewithoutevidence`, `_sab_deletewithforeignevidence`, `_sab_deleteunderhold`, `_sab_deletewithoutexactobservation` (`INV_REMOVAL_DELETE_PROVED`); cross-object barrier: `_sab_*_bypasses_drain`, `_sab_continue_after_unknown`, `_sab_stale_delete_after_successor_hold`, `_sab_rebuild_from_unadopted_seal`; completed-LIST then one-cut order: `_sab_cut_before_list` (`FreshCutFollowsCompletedHotList`); inert predecessor debris: `_sab_absent_listed_defers` (`DeadListedPredecessorIsInert`) plus `_witness_rebirth_with_retained_debris_adopts`; cut-to-intake composition: `_sab_intake_uses_predrain_cut` and `_sab_intake_uses_stale_token` independently falsify row/token provenance (`IntakeConsumesFreshPostDrainCut`), plus `_witness_drained_row_absent_from_intake`; all-row rescan and exactness: `_sab_skiprescan`, `_sab_nonexactdelete` |
 | §2 **INV-4** `_ckpt` gating of the recovery base | `CaRefTableSnapshotLogCore` | `_sab_cleanupaboveckpt`, `_sab_staleckptcorruption` |
 | §3 **Lifecycles**, removal/recreation under a stale leader | `CaRefNsCleanupStaleLeaderCore` | `_sab_noincarnation`, `_sab_rederive` (`NoLiveDataDeleted`) |
 | §4 **Recovery** (arithmetic tail, CAS-walk, seal, install) | `CaRefTableSnapshotLogCore`, `CaCasMountCore` | `_v9_safe`/`_v9_safe_deep`; `_witness_genrefused`, `_witness_sealrejected` |
@@ -108,7 +108,7 @@ The 2026-07-28 rows are the original runners' output lines. The amended-model ro
 transcribed from `build/test_task5_prefold_refcatalog_round1_20260801.log`,
 `build/test_task5_prefold_nscleanup_round1_20260801.log`, and the generated/state/depth table in
 [`CaRefPreFoldDrainCore_RESULTS.md`](CaRefPreFoldDrainCore_RESULTS.md), backed by the clean
-`build/test_task5_prefold_cut_provenance_fix1_full_20260801.log` run. The latter table is the
+`build/task5_cp5_cp6_postlist_full_gate_attempt1.log` run. The latter table is the
 authority for focused-model counts; this aggregate does not invent a per-config wall time that its
 runner did not record.
 
@@ -170,9 +170,12 @@ runner did not record.
 | `CaRefPreFoldDrainCore` | `_sab_rebuild_from_unadopted_seal` | violation | violation:DeleteUsesCurrentAdoptedProof | see per-model results | PASS |
 | `CaRefPreFoldDrainCore` | `_sab_intake_uses_predrain_cut` | violation | violation:IntakeConsumesFreshPostDrainCut | see per-model results | PASS |
 | `CaRefPreFoldDrainCore` | `_sab_intake_uses_stale_token` | violation | violation:IntakeConsumesFreshPostDrainCut | see per-model results | PASS |
+| `CaRefPreFoldDrainCore` | `_sab_cut_before_list` | violation | violation:FreshCutFollowsCompletedHotList | see per-model results | PASS |
+| `CaRefPreFoldDrainCore` | `_sab_absent_listed_defers` | violation | violation:DeadListedPredecessorIsInert | see per-model results | PASS |
 | `CaRefPreFoldDrainCore` | `_safe` | green | green | see per-model results | PASS |
 | `CaRefPreFoldDrainCore` | `_witness_takeover_converges` | violation | violation:WITNESS_TAKEOVER_CONVERGES | see per-model results | PASS |
 | `CaRefPreFoldDrainCore` | `_witness_drained_row_absent_from_intake` | violation | violation:WITNESS_DRAINED_ROW_ABSENT_FROM_INTAKE | see per-model results | PASS |
+| `CaRefPreFoldDrainCore` | `_witness_rebirth_with_retained_debris_adopts` | violation | violation:WITNESS_REBIRTH_WITH_RETAINED_DEBRIS_ADOPTS | see per-model results | PASS |
 | `CaRefPreFoldDrainAllRowsCore` | `_sab_skiprescan` | violation | violation:AllEligibleRowsResolvedBeforeDecision | see per-model results | PASS |
 | `CaRefPreFoldDrainAllRowsCore` | `_sab_nonexactdelete` | violation | violation:ExactCatalogCAS | see per-model results | PASS |
 | `CaRefPreFoldDrainAllRowsCore` | `_safe` | green | green | see per-model results | PASS |

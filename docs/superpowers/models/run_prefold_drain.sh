@@ -16,9 +16,12 @@ CONFIGS=(
   "sab_rebuild_from_unadopted_seal      violation DeleteUsesCurrentAdoptedProof"
   "sab_intake_uses_predrain_cut          violation IntakeConsumesFreshPostDrainCut"
   "sab_intake_uses_stale_token           violation IntakeConsumesFreshPostDrainCut"
+  "sab_cut_before_list                    violation FreshCutFollowsCompletedHotList"
+  "sab_absent_listed_defers               violation DeadListedPredecessorIsInert"
   "safe                                green     -"
   "witness_takeover_converges          violation WITNESS_TAKEOVER_CONVERGES"
   "witness_drained_row_absent_from_intake violation WITNESS_DRAINED_ROW_ABSENT_FROM_INTAKE"
+  "witness_rebirth_with_retained_debris_adopts violation WITNESS_REBIRTH_WITH_RETAINED_DEBRIS_ADOPTS"
 )
 
 # The same drain also has a two-row serial-rescan core: a full-catalog token changed by the first
