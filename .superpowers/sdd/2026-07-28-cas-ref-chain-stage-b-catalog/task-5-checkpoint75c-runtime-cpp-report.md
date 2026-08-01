@@ -255,6 +255,6 @@ existing queue-locked acquire then rechecks `G` and the exact name slot before p
 | Reviewed `CaRefLaneCore` matrix | PASS, 26/26 expected verdicts; `build/task5_runtime_cold_catalog_reflane_tla.log` |
 | Full pre-fold TLA+ runner | PASS, 18/18 expected verdicts; `build/task5_runtime_cold_catalog_prefold_tla.log` |
 | CA debug-only death complement | PASS, 31/31 from 18 suites; `build_debug/task5_runtime_cold_catalog_death_suites.log` |
-| Full current debug-only death complement | PASS, 36/36 from 20 suites; `build_debug/task5_runtime_cold_catalog_full_debug_only_death_suites.log` |
+| Full current debug-only death complement | PASS, 36/36 from 20 suites; 47 standard GoogleTest fork-with-threads warnings and no other warnings/failures; `build_debug/task5_runtime_cold_catalog_full_debug_only_death_suites.log` |
 | Complete release-visible CA gate | BLOCKED by the concurrent Step 8 janitor integration: 1,782/1,786 pass and the 4 failures are its extra catalog GET, broadened hole accounting, and intended dead-life checkpoint deletion; `build/task5_runtime_cold_catalog_complete_ca_release.log` |
 | `git diff --check` and removed-local-epoch static audit | PASS |
