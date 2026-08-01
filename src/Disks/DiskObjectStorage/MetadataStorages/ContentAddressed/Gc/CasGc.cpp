@@ -440,7 +440,13 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// complete, and a folding invocation takes its catalog cut only after the deletion settles.
     {
         GcPhaseTimer t(phase_sink, "pre_fold_ref_drain");
-        t.metric("deleted", drainCompletedRemoving(state));
+        const CatalogLifecycleReconcileResult drain_result = drainCompletedRemoving(state);
+        for (const NamespaceLifeId & retired_life : drain_result.retired_lives)
+            store->invalidateRemovedCatalogLife(retired_life);
+        if (drain_result.authority_status != AuthorityStatus::Authoritative
+            || drain_result.catalog_resolution != CatalogResolution::DrainComplete)
+            throwCasWriteRetryLater("CAS GC pre-fold drain lost authority before the catalog settled");
+        t.metric("deleted", drain_result.deleted);
     }
 
     /// Token-guarded fence-out of dead mounts (liveness only — graduation itself paces on GC
@@ -3839,7 +3845,12 @@ RebuildReport Gc::rebuildBaseline(bool force)
     /// damaged-state rebuild has no adopted parent (`snap_generation == 0`) and the barrier performs
     /// zero catalog mutations. Only after that distinction is resolved do we complete the hot LIST and
     /// take the sole fresh work cut.
-    drainCompletedRemoving(state);
+    const CatalogLifecycleReconcileResult drain_result = drainCompletedRemoving(state);
+    for (const NamespaceLifeId & retired_life : drain_result.retired_lives)
+        store->invalidateRemovedCatalogLife(retired_life);
+    if (drain_result.authority_status != AuthorityStatus::Authoritative
+        || drain_result.catalog_resolution != CatalogResolution::DrainComplete)
+        throwCasWriteRetryLater("CAS GC rebuild lost authority before the catalog settled");
     const RefScanSummary rebuild_ref_scan = enumerateRefPrefix();
     const CasRefCatalog::Snapshot rebuild_work_catalog_cut = CasRefCatalog::read(backend, layout);
 
@@ -4412,10 +4423,15 @@ bool Gc::acquireOrRenewLease(GcState & state, Token & state_token, bool allow_st
     return false;
 }
 
-uint64_t Gc::drainCompletedRemoving(const GcState & leased_state)
+CatalogLifecycleReconcileResult Gc::drainCompletedRemoving(const GcState & leased_state)
 {
     if (leased_state.snap_generation == 0)
-        return 0;
+        return {
+            .authority_status = AuthorityStatus::Authoritative,
+            .catalog_resolution = CatalogResolution::DrainComplete,
+            .retired_lives = {},
+            .final_catalog_cut = std::nullopt,
+            .deleted = 0};
 
     const std::optional<CasFoldSeal> parent = readFoldSeal(
         leased_state.snap_generation, leased_state.snap_attempt);
@@ -4444,54 +4460,8 @@ uint64_t Gc::drainCompletedRemoving(const GcState & leased_state)
         return CasRefCatalog::LeaderFenceStatus::Held;
     };
 
-    uint64_t deleted = 0;
-    CasRefCatalog::Snapshot catalog = CasRefCatalog::read(backend, layout);
-    for (;;)
-    {
-        std::optional<CatalogEntry> eligible;
-        for (const CatalogEntry & entry : catalog.catalog.entries)
-        {
-            if (entry.state != NsState::Removing)
-                continue;
-            const auto row = parent->ref_lives.find(entry.incarnation);
-            if (row == parent->ref_lives.end()
-                || !row->second.cleanup_evidence
-                || row->second.coverage.hold)
-                continue;
-            eligible = entry;
-            break;
-        }
-        if (!eligible)
-            return deleted;
-
-        CasRefCatalog::CompletedRemovingDeleteResult delete_result
-            = CasRefCatalog::deleteCompletedRemovingAtSnapshot(
-                backend, layout, std::move(catalog), *eligible, *parent,
-                admitted_generation, check_fence);
-        if (delete_result.invalidated_life)
-            store->invalidateRemovedCatalogLife(*delete_result.invalidated_life);
-        if (!delete_result.catalog_snapshot)
-            throw Exception(ErrorCodes::LOGICAL_ERROR,
-                "CAS GC pre-fold drain deletion returned no catalog resolution snapshot");
-        catalog = std::move(*delete_result.catalog_snapshot);
-
-        switch (delete_result.outcome)
-        {
-            case CasRefCatalog::CompletedRemovingDeleteOutcome::Deleted:
-                ++deleted;
-                break;
-            case CasRefCatalog::CompletedRemovingDeleteOutcome::EntryChanged:
-                break;   /// resolved by the mandatory fresh rescan
-            case CasRefCatalog::CompletedRemovingDeleteOutcome::FencedOut:
-                throwCasWriteRetryLater(fmt::format(
-                    "CAS GC pre-fold drain lost leader generation {} before resolving namespace '{}'",
-                    admitted_generation, eligible->ns.string()));
-            case CasRefCatalog::CompletedRemovingDeleteOutcome::ProofRefused:
-                throw Exception(ErrorCodes::LOGICAL_ERROR,
-                    "CAS GC pre-fold drain selected namespace '{}' without matching no-hold cleanup evidence",
-                    eligible->ns.string());
-        }
-    }
+    return CatalogLifecycleReconciler(
+        backend, layout, *parent, admitted_generation, check_fence).reconcile();
 }
 
 }

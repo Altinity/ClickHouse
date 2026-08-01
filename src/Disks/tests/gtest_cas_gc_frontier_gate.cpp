@@ -5,6 +5,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCkptFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CatalogLifecycleReconciler.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
@@ -15,6 +16,7 @@
 #include <condition_variable>
 #include <mutex>
 #include <set>
+#include <stdexcept>
 #include <thread>
 
 /// THE DESTRUCTIVE-ROUND FRONTIER PROOF (spec 2026-07-27 "ref chain complete cut" §5).
@@ -89,6 +91,13 @@ public:
         lose_next_catalog_cas_response = true;
     }
 
+    void conflictNextCatalogCas(const String & key)
+    {
+        std::lock_guard lock(control_mutex);
+        catalog_key = key;
+        conflict_next_catalog_cas = true;
+    }
+
     void waitForBlockedCatalogCas()
     {
         std::unique_lock lock(control_mutex);
@@ -140,6 +149,7 @@ public:
     {
         record("cas_begin " + key);
         bool lose_response = false;
+        bool force_conflict = false;
         {
             std::unique_lock lock(control_mutex);
             if (key == catalog_key && block_next_catalog_cas)
@@ -154,6 +164,16 @@ public:
                 lose_next_catalog_cas_response = false;
                 lose_response = true;
             }
+            if (key == catalog_key && conflict_next_catalog_cas)
+            {
+                conflict_next_catalog_cas = false;
+                force_conflict = true;
+            }
+        }
+        if (force_conflict)
+        {
+            record("cas_forced_conflict " + key);
+            return {.outcome = CasOutcome::Conflict, .token = {}};
         }
         const CasResult result = CountingBackend::casPut(key, bytes, expected, meta);
         record("cas_end " + key);
@@ -181,6 +201,7 @@ private:
     bool catalog_cas_blocked = false;
     bool release_catalog_cas = false;
     bool lose_next_catalog_cas_response = false;
+    bool conflict_next_catalog_cas = false;
 };
 
 struct CompletedRemovingFixture
@@ -1345,6 +1366,243 @@ TEST(CasGcFrontierGate, CleanupEvidenceLeavesRemovedNamespaceCheckpointForJanito
     EXPECT_FALSE(CasRefCatalog::lifeIfCataloged(*backend, layout, removed));
     EXPECT_TRUE(backend->head(ckpt_key).exists);
     EXPECT_EQ(backend->deleteCount(ckpt_key), 0);
+}
+
+TEST(CatalogLifecycleReconciler, EmptyCatalogReturnsAuthoritativeCompleteCut)
+{
+    auto backend = std::make_shared<DrainRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    ASSERT_TRUE(CasRefCatalog::initializeEmptyForNewPool(*backend, layout).catalog.entries.empty());
+
+    CasFoldSeal parent;
+    CatalogLifecycleReconciler reconciler(
+        *backend,
+        layout,
+        parent,
+        /*admitted_generation=*/1,
+        [](uint64_t)
+        {
+            return CasRefCatalog::LeaderFenceStatus::Held;
+        });
+    const CatalogLifecycleReconcileResult result = reconciler.reconcile();
+
+    EXPECT_EQ(result.authority_status, AuthorityStatus::Authoritative);
+    EXPECT_EQ(result.catalog_resolution, CatalogResolution::DrainComplete);
+    ASSERT_TRUE(result.final_catalog_cut);
+    EXPECT_TRUE(result.final_catalog_cut->catalog.entries.empty());
+    EXPECT_TRUE(result.retired_lives.empty());
+    EXPECT_EQ(result.deleted, 0);
+}
+
+TEST(CatalogLifecycleReconciler, DeletesEligibleRowsFromReturnedResolutionCuts)
+{
+    auto backend = std::make_shared<DrainRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    constexpr size_t deletes = 3;
+    seedCompletedRemovingBatch(*backend, store, kGc, deletes);
+    const auto parent_object = backend->get(layout.foldSealKey(1, 1));
+    ASSERT_TRUE(parent_object);
+    const CasFoldSeal parent = decodeFoldSeal(parent_object->bytes);
+    backend->clearJournal();
+    backend->resetCounts();
+
+    CatalogLifecycleReconciler reconciler(
+        *backend,
+        layout,
+        parent,
+        /*admitted_generation=*/1,
+        [](uint64_t)
+        {
+            return CasRefCatalog::LeaderFenceStatus::Held;
+        });
+    const CatalogLifecycleReconcileResult result = reconciler.reconcile();
+
+    EXPECT_EQ(result.authority_status, AuthorityStatus::Authoritative);
+    EXPECT_EQ(result.catalog_resolution, CatalogResolution::DrainComplete);
+    EXPECT_EQ(result.deleted, deletes);
+    ASSERT_EQ(result.retired_lives.size(), deletes);
+    ASSERT_TRUE(result.final_catalog_cut);
+    EXPECT_TRUE(result.final_catalog_cut->catalog.entries.empty());
+    const std::vector<String> journal = backend->journalSnapshot();
+    const String catalog_get = "get " + layout.refCatalogKey();
+    EXPECT_EQ(std::count(journal.begin(), journal.end(), catalog_get), deletes + 1);
+}
+
+TEST(CatalogLifecycleReconciler, ReturnsRetiredLifeWhenAuthorityMovesAfterResolution)
+{
+    auto backend = std::make_shared<DrainRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    const CompletedRemovingFixture fixture = seedCompletedRemoving(*backend, store, kGc);
+    const auto parent_object = backend->get(layout.foldSealKey(1, 1));
+    ASSERT_TRUE(parent_object);
+    const CasFoldSeal parent = decodeFoldSeal(parent_object->bytes);
+    size_t fence_checks = 0;
+
+    CatalogLifecycleReconciler reconciler(
+        *backend,
+        layout,
+        parent,
+        /*admitted_generation=*/1,
+        [&fence_checks](uint64_t)
+        {
+            ++fence_checks;
+            return fence_checks == 3
+                ? CasRefCatalog::LeaderFenceStatus::Moved
+                : CasRefCatalog::LeaderFenceStatus::Held;
+        });
+    const CatalogLifecycleReconcileResult result = reconciler.reconcile();
+
+    EXPECT_EQ(result.authority_status, AuthorityStatus::FencedOut);
+    EXPECT_EQ(result.catalog_resolution, CatalogResolution::ExactRowAbsent);
+    ASSERT_EQ(result.retired_lives.size(), 1);
+    EXPECT_EQ(result.retired_lives.front(),
+        NamespaceLifeId::fromCatalogEntry(fixture.ns, fixture.life_id));
+    EXPECT_EQ(result.deleted, 0);
+    EXPECT_FALSE(result.final_catalog_cut);
+}
+
+TEST(CatalogLifecycleReconciler, RetriesFromTheMandatoryConflictResolutionCut)
+{
+    auto backend = std::make_shared<DrainRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    seedCompletedRemoving(*backend, store, kGc);
+    const auto parent_object = backend->get(layout.foldSealKey(1, 1));
+    ASSERT_TRUE(parent_object);
+    const CasFoldSeal parent = decodeFoldSeal(parent_object->bytes);
+    backend->clearJournal();
+    backend->resetCounts();
+    backend->conflictNextCatalogCas(layout.refCatalogKey());
+
+    CatalogLifecycleReconciler reconciler(
+        *backend,
+        layout,
+        parent,
+        /*admitted_generation=*/1,
+        [](uint64_t)
+        {
+            return CasRefCatalog::LeaderFenceStatus::Held;
+        });
+    const CatalogLifecycleReconcileResult result = reconciler.reconcile();
+
+    EXPECT_EQ(result.authority_status, AuthorityStatus::Authoritative);
+    EXPECT_EQ(result.catalog_resolution, CatalogResolution::DrainComplete);
+    EXPECT_EQ(result.deleted, 1);
+    const std::vector<String> journal = backend->journalSnapshot();
+    const String catalog_get = "get " + layout.refCatalogKey();
+    EXPECT_EQ(std::count(journal.begin(), journal.end(), catalog_get), 3)
+        << "the token-conflict retry must reuse its mandatory resolution cut";
+}
+
+TEST(CatalogLifecycleReconciler, PropagatesAuthorityFailureBeforeEraseCas)
+{
+    auto backend = std::make_shared<DrainRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    seedCompletedRemoving(*backend, store, kGc);
+    const auto parent_object = backend->get(layout.foldSealKey(1, 1));
+    ASSERT_TRUE(parent_object);
+    const CasFoldSeal parent = decodeFoldSeal(parent_object->bytes);
+    size_t fence_checks = 0;
+
+    CatalogLifecycleReconciler reconciler(
+        *backend,
+        layout,
+        parent,
+        /*admitted_generation=*/1,
+        [&fence_checks](uint64_t)
+        {
+            if (++fence_checks == 2)
+                throw std::runtime_error("injected reconciler authority failure before CAS");
+            return CasRefCatalog::LeaderFenceStatus::Held;
+        });
+    try
+    {
+        (void)reconciler.reconcile();
+        FAIL() << "the authority exception must propagate";
+    }
+    catch (const std::runtime_error & e)
+    {
+        EXPECT_STREQ(e.what(), "injected reconciler authority failure before CAS");
+    }
+}
+
+TEST(CatalogLifecycleReconciler, PropagatesAuthorityFailureAfterMandatoryResolution)
+{
+    auto backend = std::make_shared<DrainRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    const CompletedRemovingFixture fixture = seedCompletedRemoving(*backend, store, kGc);
+    const auto parent_object = backend->get(layout.foldSealKey(1, 1));
+    ASSERT_TRUE(parent_object);
+    const CasFoldSeal parent = decodeFoldSeal(parent_object->bytes);
+    size_t fence_checks = 0;
+
+    CatalogLifecycleReconciler reconciler(
+        *backend,
+        layout,
+        parent,
+        /*admitted_generation=*/1,
+        [&fence_checks](uint64_t)
+        {
+            if (++fence_checks == 3)
+                throw std::runtime_error("injected reconciler authority failure after resolution");
+            return CasRefCatalog::LeaderFenceStatus::Held;
+        });
+    try
+    {
+        (void)reconciler.reconcile();
+        FAIL() << "the authority exception must propagate";
+    }
+    catch (const std::runtime_error & e)
+    {
+        EXPECT_STREQ(e.what(), "injected reconciler authority failure after resolution");
+        EXPECT_FALSE(CasRefCatalog::lifeIfCataloged(*backend, layout, fixture.ns));
+    }
+}
+
+TEST(CasGcFrontierGate, HealthyRebuildUsesTheCatalogLifecycleReconciler)
+{
+    auto backend = std::make_shared<DrainRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    const CompletedRemovingFixture fixture = seedCompletedRemoving(*backend, store, kGc);
+    const uint64_t catalog_cas_before = backend->casPutCount(layout.refCatalogKey());
+
+    Gc gc(store, kGc);
+    const RebuildReport result = gc.rebuildBaseline(/*force=*/true);
+
+    EXPECT_TRUE(result.performed);
+    EXPECT_FALSE(CasRefCatalog::lifeIfCataloged(*backend, layout, fixture.ns));
+    EXPECT_EQ(backend->casPutCount(layout.refCatalogKey()), catalog_cas_before + 1);
+}
+
+TEST(CasGcFrontierGate, DamagedStateRebuildDoesNotDeleteCompletedRemovingRows)
+{
+    auto backend = std::make_shared<DrainRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/damaged-rebuild-removing@cas@"};
+    CasRefCatalog::casAdmitEntry(*backend, layout, CatalogEntry{
+        .ns = ns, .state = NsState::Live, .incarnation = UInt128{901}});
+    CasRefCatalog::casUpdate(*backend, layout, [](const RefCatalog & current)
+    {
+        RefCatalog next = current;
+        next.entries.front().state = NsState::Removing;
+        next.entries.front().removal_started_round = 1;
+        return next;
+    });
+    const uint64_t catalog_cas_before = backend->casPutCount(layout.refCatalogKey());
+
+    Gc gc(store, kGc);
+    const RebuildReport result = gc.rebuildBaseline(/*force=*/false);
+
+    EXPECT_TRUE(result.performed);
+    EXPECT_TRUE(CasRefCatalog::lifeIfCataloged(*backend, layout, ns));
+    EXPECT_EQ(backend->casPutCount(layout.refCatalogKey()), catalog_cas_before);
 }
 
 TEST(CasGcFrontierGate, DeferredRoundDrainsCompletedRemovingBeforeReturning)

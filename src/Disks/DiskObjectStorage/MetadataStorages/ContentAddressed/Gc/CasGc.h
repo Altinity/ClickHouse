@@ -1,5 +1,6 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CatalogLifecycleReconciler.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcOutcomesFormat.h>
@@ -458,10 +459,10 @@ private:
     /// renewing our own are unaffected.
     bool acquireOrRenewLease(GcState & state, Token & state_token, bool allow_steal);
 
-    /// Catalog-only helping barrier run immediately after lease acquisition. It repeatedly exact-CAS
-    /// deletes parent-proved `Removing` rows and returns only after a complete fresh catalog rescan
-    /// finds none. It performs no physical LIST or delete.
-    uint64_t drainCompletedRemoving(const GcState & leased_state);
+    /// Catalog-only helping barrier run immediately after lease acquisition. It validates the adopted
+    /// parent and delegates deterministic `Removing`-row settlement to `CatalogLifecycleReconciler`.
+    /// It performs no physical LIST or delete.
+    CatalogLifecycleReconcileResult drainCompletedRemoving(const GcState & leased_state);
 
     /// What one fold produced. The blob deltas are sealed
     /// into a write-once generation; `fold_seal` is the durable index of WHAT WAS FOLDED (a CasFoldSeal),
