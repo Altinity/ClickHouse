@@ -21,6 +21,10 @@ CONFIGS=(
   "sab_skipidentity       violation InstallMatchesAttempt"
   "sab_nofence            violation CertifiedViewIsCurrent"
   "sab_certifyblocked     violation CertifiedViewIsCurrent"
+  "sab_oldhandleretarget  violation NoOldHandleRetarget"
+  "sab_lateinvalidation   violation ExactPredecessorInvalidationPreservesSuccessor"
+  "sab_fencelosspublication violation PublishedRuntimeHasAcceptedIdentity"
+  "sab_missingconfirmation violation MissingNameConfirmationAllocatesNothing"
   "safe                   green     -"
   "witness_commit         violation W_Commit"
   "witness_unresolved     violation W_Unresolved"
@@ -30,6 +34,10 @@ CONFIGS=(
   "witness_staleresult    violation W_StaleResult"
   "witness_closed         violation W_Closed"
   "witness_faulted        violation W_Faulted"
+  "witness_rebirtholdaction violation W_RebirthOldAction"
+  "witness_selfremount    violation W_SelfRemount"
+  "witness_lateinvalidation violation W_LateInvalidationPreserved"
+  "witness_missingconfirmation violation W_MissingConfirmation"
 )
 
 overall=0

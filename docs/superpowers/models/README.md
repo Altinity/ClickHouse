@@ -98,6 +98,7 @@ of `CaGcRootLocalPartManifestCore`.
 | `CaRefTableSnapshotLogCore.tla` | v9 contiguous ref stream: state-derived dense ids, every-attempt reuse rule, `_ckpt`-based recovery base + arithmetic walk, in-band `slot-occupy` epoch seal — `LatePredecessorPut` FLIPPED from rev.4 expected-fail to green, with `_sab_noseal` as the control | CURRENT (v9 rewrite 2026-07-28; gates the ref-chain implementation) | `run_refsnaplog.sh` |
 | `CaRefDeltaIntakeCore.tla` | pool-wide GC fold: arithmetic walk, destructive-round frontier proof, durable hold, and catalog-cut key-set semantics; consumes the pre-fold cut interface without owning its lifecycle | CURRENT | `run_deltaintake.sh` |
 | `CaRefCatalogCore.tla` | local namespace lifecycle: create/reconcile safety, fresh opaque life ids, bounded catalog churn, and evidence + no-hold + exact-row authorization for `Removing -> absent` | CURRENT (re-scoped 2026-08-01; gates the ref-chain implementation) | `run_refcatalog.sh` |
+| `CaRefLaneCore.tla` | append-lane ownership plus a bounded two-runtime name-cache composition: immutable `(life_id, admitted_fence_generation)` identity, old-handle scoping, exact invalidation, accepted post-arm publication, and allocation-free missing-name confirmation | CURRENT (extended 2026-08-01; gates checkpoint 7.5c runtime identity) | `run_reflane.sh` |
 | `CaRefPreFoldDrainCore.tla` | two-GC-actor ordering plus its two-row serial-rescan companion: opaque life id separate from lifecycle state, adopted-parent proof, conclusive identity-exact catalog drain, completed hot LIST, ONE fresh authoritative cut, life-id ref-plan intake, then fold/`REBUILD`/`DEFER`; red-controls consequential stale-cut omission, absent-listed debris deferral, predecessor-proof deletion of successor `Removing`, stale row and stale token independently; witness adopts successor `Removing` while an old request conflicts and predecessor bytes remain LIST-visible; damaged-state `REBUILD` restores authority without deleting catalog rows | CURRENT (amended 2026-08-01; sole owner of cross-object removal order, post-LIST cut provenance, identity-exact admission/deletion and inert-debris classification) | `run_prefold_drain.sh` |
 | `CaRefFoldClampRecoveryCore.tla` | fold clamp always recoverable: per-log cleanup staging | CURRENT | `run_foldclamp.sh` |
 | `CaRefNsCleanupStaleLeaderCore.tla` | perpetual janitor: a LIST page captures an exact physical life id, and a delayed delete never re-derives its target from a reborn logical name | CURRENT (re-scoped 2026-08-01; gates the ref-chain implementation) | `run_nscleanup_staleleader.sh` |
@@ -238,6 +239,14 @@ ordered scan and cleanup deletes only what it observed durable. The migration is
   This model deliberately does not own the temporal relation between that proof and a later adopted
   seal; that cross-object order belongs only to `CaRefPreFoldDrainCore`. Full verdicts and traces:
   `CaRefCatalogCore_RESULTS.md`.
+- **`CaRefLaneCore.tla`** — the six-state append lane composed with the smallest concrete runtime
+  identity/cache layer: two runtime ids and two durable life ids. A captured predecessor handle and
+  a non-authoritative name slot may simultaneously own different runtimes for one logical name.
+  Removal/rebirth, exact delayed invalidation, four predecessor-scoped operation kinds, fence loss,
+  failed and successful re-arm, same-life self-remount, catalog-backed lookup, and read-only
+  missing-name confirmation are all explicit transitions. Four single-defect controls cover
+  in-place old-handle retarget, successor-clearing late invalidation, fence-loss publication, and
+  missing-confirmation allocation. Full verdicts and traces: `CaRefLaneCore_RESULTS.md`.
 - **`CaRefPreFoldDrainCore.tla`** — the focused two-GC-actor proof for catalog-only pre-fold drain.
   After acquiring the lease, an invocation reads the authoritative adopted parent, resolves every
   eligible exact catalog CAS conclusively, completes the hot stream LIST, takes ONE fresh authoritative

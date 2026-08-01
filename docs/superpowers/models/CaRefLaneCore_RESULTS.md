@@ -9,13 +9,15 @@ doc_type: 'reference'
 
 # CAS reference lane TLA+ results {#cas-reference-lane-tla-results}
 
-**Date:** 2026-07-30. **Verdict:** pass.
+**Date:** 2026-08-01. **Verdict:** pass.
 
 ## Lane model {#lane-model}
 
 `CaRefLaneCore.tla` models the six ownership states `Ready`, `Writing`, `Wedged`,
-`NeedsRecovery`, `Closed`, and `Faulted`. It deliberately omits the nested implementation enums
-that made the superseded model unmanageable.
+`NeedsRecovery`, `Closed`, and `Faulted`. It composes that single lane with a bounded cache model
+containing two concrete runtime ids and two durable life ids. The predecessor runtime remains owned
+by its captured handle while the non-authoritative logical-name slot may publish a distinct
+successor after removal/rebirth or same-life self-remount.
 
 The battery ran with:
 
@@ -23,20 +25,26 @@ The battery ran with:
 docs/superpowers/models/run_reflane.sh
 ```
 
-All 15 expectations passed:
+All 24 expectations passed:
 
 - one honest exhaustive configuration was green;
-- seven single-rule sabotages violated their named invariant;
-- seven reachability witnesses violated their negated witness invariant.
+- eleven single-rule sabotages violated their named invariant;
+- twelve reachability witnesses violated their negated witness invariant.
 
-The honest run generated 16,768 states, found 7,952 distinct states, and exhausted the queue.
-The retained run summary is `build/test_CaRefLaneCore_20260730_r7.log`; detailed TLC output is under
-`build/tlc-runs/reflane/20260730T084000-3`.
+The honest run generated 1,017,625 states, found 278,718 distinct states, reached depth 25, and
+exhausted the queue. The retained run summary is
+`build/test_CaRefLaneCore_checkpoint75c_final2.log`; detailed TLC output is under
+`build/tlc-runs/reflane/20260801-checkpoint75c-final2`.
 
 The sabotage controls cover arming before send, retaining uncertain attempts, blocking later
 appends, complete recovery, exact attempt identity, mount fencing, and `Ready`-only certification.
-The witnesses reach ordinary commit, unresolved write, recovery, inert unrelated result, `Closed`,
-and `Faulted`.
+The new controls independently violate `NoOldHandleRetarget`,
+`ExactPredecessorInvalidationPreservesSuccessor`, `PublishedRuntimeHasAcceptedIdentity`, and
+`MissingNameConfirmationAllocatesNothing`. The new witnesses reach predecessor/successor
+coexistence with a predecessor-scoped old operation, same-life self-remount at accepted generation
+3 after fence-loss generation 2, exact delayed invalidation that preserves the successor, and an
+allocation-free missing-name confirmation. The earlier witnesses continue to reach ordinary commit,
+unresolved write, recovery, inert unrelated result, `Closed`, and `Faulted`.
 
 ## Relink composition {#relink-composition}
 

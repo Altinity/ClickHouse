@@ -23,7 +23,11 @@ CONSTANTS
     SabotageIncompleteRecovery,
     SabotageSkipIdentity,
     SabotageNoFence,
-    SabotageCertifyBlocked
+    SabotageCertifyBlocked,
+    SabotageOldHandleRetarget,
+    SabotageLateInvalidation,
+    SabotageFenceLossPublication,
+    SabotageMissingConfirmationAllocation
 
 Bindings == {"token", "other", "none"}
 Tokens == {"a", "b"}
@@ -31,6 +35,22 @@ LaneStates == {"Ready", "Writing", "Wedged", "NeedsRecovery", "Closed", "Faulted
 Observations == {"none", "pending", "Durable", "Unknown", "SuccessorSeal", "Foreign"}
 AttemptValues == [id : 1..MaxTxn, token : Tokens, binding : Bindings]
 NoAttempt == [id |-> 0, token |-> "none", binding |-> "none"]
+
+(*
+Two runtime ids and two durable life ids are sufficient for every identity
+interleaving in scope: one predecessor, one successor, removal/rebirth, and a
+self-remount that reuses the durable life with a later accepted fence. The
+six-state lane remains single-copy and belongs to the captured predecessor;
+the cache submodel below does not multiply that state-space product.
+*)
+RuntimeIds == {"r1", "r2"}
+NoRuntime == "none"
+Lives == {1, 2}
+NoIdentity == [life |-> 0, admitted |-> 0]
+RuntimeIdentityValues ==
+    [life : 0..2, admitted : 0..3]
+ArmPhases == {"Armed", "Fenced", "ArmPending"}
+OldOperations == {"append", "read", "publish", "resolve"}
 
 VARIABLES
     lane,
@@ -54,14 +74,45 @@ VARIABLES
     saw_recovery,
     saw_stale_result,
     saw_closed,
-    saw_faulted
+    saw_faulted,
+    slot_runtime,
+    old_handle_runtime,
+    live_runtimes,
+    runtime_identity,
+    identity_ledger,
+    runtime_cache_marker,
+    runtime_durable_marker,
+    catalog_life,
+    observed_lives,
+    accepted_generations,
+    arm_phase,
+    pending_invalidation,
+    old_action_target,
+    old_action_kind,
+    bad_late_detach,
+    bad_missing_allocation,
+    saw_rebirth_old_action,
+    saw_self_remount,
+    saw_late_invalidation_preserved,
+    saw_missing_confirmation
 
-vars ==
+laneVars ==
     << lane, cache_id, durable_id, cache_binding, durable_binding, attempt,
        runtime_generation, authority_generation, resolver_attempt,
        resolver_generation, observation, bad_append, bad_install,
        bad_certification, saw_commit, saw_unresolved, saw_retry_created,
        saw_durable_adoption, saw_recovery, saw_stale_result, saw_closed, saw_faulted >>
+
+runtimeVars ==
+    << slot_runtime, old_handle_runtime, live_runtimes, runtime_identity,
+       identity_ledger, runtime_cache_marker, runtime_durable_marker,
+       catalog_life, observed_lives, accepted_generations, arm_phase,
+       pending_invalidation, old_action_target, old_action_kind,
+       bad_late_detach, bad_missing_allocation, saw_rebirth_old_action,
+       saw_self_remount, saw_late_invalidation_preserved,
+       saw_missing_confirmation >>
+
+vars == << laneVars, runtimeVars >>
 
 CurrentRuntime == runtime_generation = authority_generation
 Outstanding == lane \in {"Writing", "Wedged"}
@@ -89,6 +140,28 @@ Init ==
     /\ saw_stale_result = FALSE
     /\ saw_closed = FALSE
     /\ saw_faulted = FALSE
+    /\ slot_runtime = "r1"
+    /\ old_handle_runtime = "r1"
+    /\ live_runtimes = {"r1"}
+    /\ runtime_identity =
+        [r \in RuntimeIds |-> IF r = "r1" THEN [life |-> 1, admitted |-> 1] ELSE NoIdentity]
+    /\ identity_ledger =
+        [r \in RuntimeIds |-> IF r = "r1" THEN [life |-> 1, admitted |-> 1] ELSE NoIdentity]
+    /\ runtime_cache_marker = [r \in RuntimeIds |-> 0]
+    /\ runtime_durable_marker = [r \in RuntimeIds |-> 0]
+    /\ catalog_life = 1
+    /\ observed_lives = {1}
+    /\ accepted_generations = {1}
+    /\ arm_phase = "Armed"
+    /\ pending_invalidation = NoRuntime
+    /\ old_action_target = NoRuntime
+    /\ old_action_kind = "none"
+    /\ bad_late_detach = FALSE
+    /\ bad_missing_allocation = FALSE
+    /\ saw_rebirth_old_action = FALSE
+    /\ saw_self_remount = FALSE
+    /\ saw_late_invalidation_preserved = FALSE
+    /\ saw_missing_confirmation = FALSE
 
 StartWrite(new_binding, token) ==
     /\ ~SabotageNoArm
@@ -381,13 +454,35 @@ ApplyWithoutIdentity ==
 
 FenceMove ==
     /\ authority_generation = 1
+    /\ arm_phase = "Armed"
+    /\ (~SabotageFenceLossPublication
+        \/ (catalog_life \in Lives
+            /\ "r2" \notin live_runtimes
+            /\ identity_ledger["r2"] = NoIdentity))
     /\ authority_generation' = 2
+    /\ arm_phase' = "Fenced"
+    /\ IF SabotageFenceLossPublication
+          THEN /\ slot_runtime' = "r2"
+               /\ live_runtimes' = live_runtimes \cup {"r2"}
+               /\ runtime_identity' =
+                    [runtime_identity EXCEPT !["r2"] = [life |-> catalog_life, admitted |-> 2]]
+               /\ identity_ledger' =
+                    [identity_ledger EXCEPT !["r2"] = [life |-> catalog_life, admitted |-> 2]]
+          ELSE /\ slot_runtime' = NoRuntime
+               /\ UNCHANGED << live_runtimes, runtime_identity, identity_ledger >>
     /\ UNCHANGED << lane, cache_id, durable_id, cache_binding,
                     durable_binding, attempt, runtime_generation,
                     resolver_attempt, resolver_generation, observation,
                     bad_append, bad_install, bad_certification, saw_commit,
                     saw_unresolved, saw_retry_created, saw_durable_adoption,
-                    saw_recovery, saw_stale_result, saw_closed, saw_faulted >>
+                    saw_recovery, saw_stale_result, saw_closed, saw_faulted,
+                    old_handle_runtime, runtime_cache_marker,
+                    runtime_durable_marker, catalog_life, observed_lives,
+                    accepted_generations, pending_invalidation,
+                    old_action_target, old_action_kind, bad_late_detach,
+                    bad_missing_allocation, saw_rebirth_old_action,
+                    saw_self_remount, saw_late_invalidation_preserved,
+                    saw_missing_confirmation >>
 
 ForeignWrite ==
     /\ authority_generation # runtime_generation
@@ -401,21 +496,177 @@ ForeignWrite ==
                     saw_retry_created, saw_durable_adoption, saw_recovery,
                     saw_stale_result, saw_closed, saw_faulted >>
 
-Remount ==
-    /\ authority_generation # runtime_generation
-    /\ lane' = "Ready"
-    /\ cache_id' = durable_id
-    /\ cache_binding' = durable_binding
-    /\ attempt' = NoAttempt
-    /\ runtime_generation' = authority_generation
-    /\ resolver_attempt' = NoAttempt
-    /\ resolver_generation' = 0
-    /\ observation' = "none"
-    /\ saw_recovery' = TRUE
-    /\ UNCHANGED << durable_id, durable_binding, authority_generation,
+BeginRearm ==
+    /\ arm_phase = "Fenced"
+    /\ arm_phase' = "ArmPending"
+    /\ UNCHANGED << laneVars, slot_runtime, old_handle_runtime,
+                    live_runtimes, runtime_identity, identity_ledger,
+                    runtime_cache_marker, runtime_durable_marker, catalog_life,
+                    observed_lives, accepted_generations, pending_invalidation,
+                    old_action_target, old_action_kind, bad_late_detach,
+                    bad_missing_allocation, saw_rebirth_old_action,
+                    saw_self_remount, saw_late_invalidation_preserved,
+                    saw_missing_confirmation >>
+
+FailRearm ==
+    /\ arm_phase = "ArmPending"
+    /\ arm_phase' = "Fenced"
+    /\ UNCHANGED << laneVars, slot_runtime, old_handle_runtime,
+                    live_runtimes, runtime_identity, identity_ledger,
+                    runtime_cache_marker, runtime_durable_marker, catalog_life,
+                    observed_lives, accepted_generations, pending_invalidation,
+                    old_action_target, old_action_kind, bad_late_detach,
+                    bad_missing_allocation, saw_rebirth_old_action,
+                    saw_self_remount, saw_late_invalidation_preserved,
+                    saw_missing_confirmation >>
+
+AcceptRearm ==
+    /\ arm_phase = "ArmPending"
+    /\ authority_generation = 2
+    /\ "r2" \notin live_runtimes
+    /\ identity_ledger["r2"] = NoIdentity
+    /\ catalog_life = 1
+    /\ authority_generation' = 3
+    /\ accepted_generations' = accepted_generations \cup {3}
+    /\ arm_phase' = "Armed"
+    /\ slot_runtime' = "r2"
+    /\ live_runtimes' = live_runtimes \cup {"r2"}
+    /\ runtime_identity' =
+        [runtime_identity EXCEPT !["r2"] = [life |-> catalog_life, admitted |-> 3]]
+    /\ identity_ledger' =
+        [identity_ledger EXCEPT !["r2"] = [life |-> catalog_life, admitted |-> 3]]
+    /\ saw_self_remount' = TRUE
+    /\ UNCHANGED << lane, cache_id, durable_id, cache_binding,
+                    durable_binding, attempt, runtime_generation,
+                    resolver_attempt, resolver_generation, observation,
                     bad_append, bad_install, bad_certification, saw_commit,
-                    saw_unresolved, saw_retry_created, saw_durable_adoption, saw_stale_result,
-                    saw_closed, saw_faulted >>
+                    saw_unresolved, saw_retry_created, saw_durable_adoption,
+                    saw_recovery, saw_stale_result, saw_closed, saw_faulted,
+                    old_handle_runtime, runtime_cache_marker,
+                    runtime_durable_marker, catalog_life, observed_lives,
+                    pending_invalidation, old_action_target, old_action_kind,
+                    bad_late_detach, bad_missing_allocation,
+                    saw_rebirth_old_action, saw_late_invalidation_preserved,
+                    saw_missing_confirmation >>
+
+RemoveCatalogLife ==
+    /\ catalog_life = 1
+    /\ pending_invalidation = NoRuntime
+    /\ catalog_life' = 0
+    /\ pending_invalidation' = slot_runtime
+    /\ UNCHANGED << laneVars, slot_runtime, old_handle_runtime,
+                    live_runtimes, runtime_identity, identity_ledger,
+                    runtime_cache_marker, runtime_durable_marker,
+                    observed_lives, accepted_generations, arm_phase,
+                    old_action_target, old_action_kind, bad_late_detach,
+                    bad_missing_allocation, saw_rebirth_old_action,
+                    saw_self_remount, saw_late_invalidation_preserved,
+                    saw_missing_confirmation >>
+
+RebirthCatalogLife ==
+    /\ catalog_life = 0
+    /\ catalog_life' = 2
+    /\ observed_lives' = observed_lives \cup {2}
+    /\ UNCHANGED << laneVars, slot_runtime, old_handle_runtime,
+                    live_runtimes, runtime_identity, identity_ledger,
+                    runtime_cache_marker, runtime_durable_marker,
+                    accepted_generations, arm_phase, pending_invalidation,
+                    old_action_target, old_action_kind, bad_late_detach,
+                    bad_missing_allocation, saw_rebirth_old_action,
+                    saw_self_remount, saw_late_invalidation_preserved,
+                    saw_missing_confirmation >>
+
+FreshCatalogLookup ==
+    /\ catalog_life = 2
+    /\ arm_phase = "Armed"
+    /\ "r2" \notin live_runtimes
+    /\ identity_ledger["r2"] = NoIdentity
+    /\ slot_runtime' = "r2"
+    /\ live_runtimes' = live_runtimes \cup {"r2"}
+    /\ runtime_identity' =
+        [runtime_identity EXCEPT
+            !["r2"] = [life |-> catalog_life, admitted |-> authority_generation]]
+    /\ identity_ledger' =
+        [identity_ledger EXCEPT
+            !["r2"] = [life |-> catalog_life, admitted |-> authority_generation]]
+    /\ UNCHANGED << laneVars, old_handle_runtime, runtime_cache_marker,
+                    runtime_durable_marker, catalog_life, observed_lives,
+                    accepted_generations, arm_phase, pending_invalidation,
+                    old_action_target, old_action_kind, bad_late_detach,
+                    bad_missing_allocation, saw_rebirth_old_action,
+                    saw_self_remount, saw_late_invalidation_preserved,
+                    saw_missing_confirmation >>
+
+OldHandleOperation(kind) ==
+    /\ live_runtimes = RuntimeIds
+    /\ runtime_identity["r2"].life = 2
+    /\ old_action_target = NoRuntime
+    /\ LET target == IF SabotageOldHandleRetarget THEN slot_runtime ELSE old_handle_runtime
+       IN /\ target \in RuntimeIds
+          /\ runtime_cache_marker[target] = 0
+          /\ runtime_durable_marker[target] = 0
+          /\ old_action_target' = target
+          /\ old_action_kind' = kind
+          /\ runtime_cache_marker' =
+                IF kind = "append"
+                  THEN runtime_cache_marker
+                  ELSE [runtime_cache_marker EXCEPT ![target] = 1]
+          /\ runtime_durable_marker' =
+                IF kind = "append"
+                  THEN [runtime_durable_marker EXCEPT ![target] = 1]
+                  ELSE runtime_durable_marker
+          /\ saw_rebirth_old_action' = (target = old_handle_runtime)
+    /\ UNCHANGED << laneVars, slot_runtime, old_handle_runtime,
+                    live_runtimes, runtime_identity, identity_ledger,
+                    catalog_life, observed_lives, accepted_generations,
+                    arm_phase, pending_invalidation, bad_late_detach,
+                    bad_missing_allocation, saw_self_remount,
+                    saw_late_invalidation_preserved,
+                    saw_missing_confirmation >>
+
+LateExactInvalidation ==
+    /\ pending_invalidation \in RuntimeIds
+    /\ IF SabotageLateInvalidation
+          THEN /\ slot_runtime' = NoRuntime
+               /\ bad_late_detach' =
+                    (bad_late_detach
+                     \/ (slot_runtime \in RuntimeIds /\ slot_runtime # pending_invalidation))
+          ELSE /\ slot_runtime' =
+                    IF slot_runtime = pending_invalidation THEN NoRuntime ELSE slot_runtime
+               /\ UNCHANGED bad_late_detach
+    /\ saw_late_invalidation_preserved' =
+        (slot_runtime = "r2" /\ pending_invalidation = "r1" /\ slot_runtime' = "r2")
+    /\ pending_invalidation' = NoRuntime
+    /\ UNCHANGED << laneVars, old_handle_runtime, live_runtimes,
+                    runtime_identity, identity_ledger, runtime_cache_marker,
+                    runtime_durable_marker, catalog_life, observed_lives,
+                    accepted_generations, arm_phase, old_action_target,
+                    old_action_kind, bad_missing_allocation,
+                    saw_rebirth_old_action, saw_self_remount,
+                    saw_missing_confirmation >>
+
+ConfirmMissingName ==
+    /\ catalog_life = 0
+    /\ "r2" \notin live_runtimes
+    /\ identity_ledger["r2"] = NoIdentity
+    /\ IF SabotageMissingConfirmationAllocation
+          THEN /\ slot_runtime' = "r2"
+               /\ live_runtimes' = live_runtimes \cup {"r2"}
+               /\ runtime_identity' =
+                    [runtime_identity EXCEPT !["r2"] = [life |-> 0, admitted |-> 1]]
+               /\ identity_ledger' =
+                    [identity_ledger EXCEPT !["r2"] = [life |-> 0, admitted |-> 1]]
+               /\ bad_missing_allocation' = TRUE
+          ELSE /\ UNCHANGED << slot_runtime, live_runtimes,
+                                runtime_identity, identity_ledger,
+                                bad_missing_allocation >>
+    /\ saw_missing_confirmation' = TRUE
+    /\ UNCHANGED << laneVars, old_handle_runtime, runtime_cache_marker,
+                    runtime_durable_marker, catalog_life, observed_lives,
+                    accepted_generations, arm_phase, pending_invalidation,
+                    old_action_target, old_action_kind, bad_late_detach,
+                    saw_rebirth_old_action, saw_self_remount,
+                    saw_late_invalidation_preserved >>
 
 Certify ==
     /\ \/ (lane = "Ready" /\ (CurrentRuntime \/ SabotageNoFence))
@@ -433,7 +684,7 @@ Certify ==
                     saw_commit, saw_unresolved, saw_retry_created, saw_durable_adoption,
                     saw_recovery, saw_stale_result, saw_closed, saw_faulted >>
 
-Next ==
+LaneNext ==
     \/ \E b \in Bindings, t \in Tokens : StartWrite(b, t)
     \/ \E b \in Bindings : UnarmedWrite(b)
     \/ WriteLands
@@ -452,9 +703,20 @@ Next ==
     \/ AppendWhileBlocked
     \/ ReplaceAttempt
     \/ ApplyWithoutIdentity
-    \/ FenceMove
-    \/ Remount
     \/ Certify
+
+Next ==
+    \/ (LaneNext /\ UNCHANGED runtimeVars)
+    \/ FenceMove
+    \/ BeginRearm
+    \/ FailRearm
+    \/ AcceptRearm
+    \/ RemoveCatalogLife
+    \/ RebirthCatalogLife
+    \/ FreshCatalogLookup
+    \/ \E kind \in OldOperations : OldHandleOperation(kind)
+    \/ LateExactInvalidation
+    \/ ConfirmMissingName
 
 Spec == Init /\ [][Next]_vars
 
@@ -465,8 +727,8 @@ TypeOK ==
     /\ cache_binding \in Bindings
     /\ durable_binding \in Bindings
     /\ attempt \in AttemptValues \cup {NoAttempt}
-    /\ runtime_generation \in {1, 2}
-    /\ authority_generation \in {1, 2}
+    /\ runtime_generation \in {1, 2, 3}
+    /\ authority_generation \in {1, 2, 3}
     /\ resolver_attempt \in AttemptValues \cup {NoAttempt}
     /\ resolver_generation \in {0, 1, 2}
     /\ observation \in Observations
@@ -482,6 +744,28 @@ TypeOK ==
     /\ saw_closed \in BOOLEAN
     /\ saw_faulted \in BOOLEAN
     /\ cache_id <= durable_id
+    /\ slot_runtime \in RuntimeIds \cup {NoRuntime}
+    /\ old_handle_runtime \in RuntimeIds
+    /\ live_runtimes \subseteq RuntimeIds
+    /\ slot_runtime # NoRuntime => slot_runtime \in live_runtimes
+    /\ old_handle_runtime \in live_runtimes
+    /\ runtime_identity \in [RuntimeIds -> RuntimeIdentityValues]
+    /\ identity_ledger \in [RuntimeIds -> RuntimeIdentityValues]
+    /\ runtime_cache_marker \in [RuntimeIds -> 0..1]
+    /\ runtime_durable_marker \in [RuntimeIds -> 0..1]
+    /\ catalog_life \in 0..2
+    /\ observed_lives \subseteq Lives
+    /\ accepted_generations \subseteq {1, 3}
+    /\ arm_phase \in ArmPhases
+    /\ pending_invalidation \in RuntimeIds \cup {NoRuntime}
+    /\ old_action_target \in RuntimeIds \cup {NoRuntime}
+    /\ old_action_kind \in OldOperations \cup {"none"}
+    /\ bad_late_detach \in BOOLEAN
+    /\ bad_missing_allocation \in BOOLEAN
+    /\ saw_rebirth_old_action \in BOOLEAN
+    /\ saw_self_remount \in BOOLEAN
+    /\ saw_late_invalidation_preserved \in BOOLEAN
+    /\ saw_missing_confirmation \in BOOLEAN
 
 ReadyCaughtUp ==
     (lane = "Ready" /\ CurrentRuntime)
@@ -500,6 +784,26 @@ NoAppendWhileBlocked == ~bad_append
 InstallMatchesAttempt == ~bad_install
 CertifiedViewIsCurrent == ~bad_certification
 
+NoOldHandleRetarget ==
+    old_action_target \in {NoRuntime, old_handle_runtime}
+
+ExactPredecessorInvalidationPreservesSuccessor == ~bad_late_detach
+
+PublishedRuntimeHasAcceptedIdentity ==
+    /\ (slot_runtime # NoRuntime => arm_phase = "Armed")
+    /\ \A r \in live_runtimes :
+        /\ runtime_identity[r].life \in observed_lives
+        /\ runtime_identity[r].admitted \in accepted_generations
+
+RuntimeIdentityImmutable ==
+    /\ old_handle_runtime = "r1"
+    /\ runtime_identity["r1"] = [life |-> 1, admitted |-> 1]
+    /\ \A r \in live_runtimes :
+        /\ runtime_identity[r] = identity_ledger[r]
+        /\ runtime_identity[r] # NoIdentity
+
+MissingNameConfirmationAllocatesNothing == ~bad_missing_allocation
+
 W_Commit == ~saw_commit
 W_Unresolved == ~saw_unresolved
 W_RetryCreated == ~saw_retry_created
@@ -508,5 +812,9 @@ W_Recovery == ~saw_recovery
 W_StaleResult == ~saw_stale_result
 W_Closed == ~saw_closed
 W_Faulted == ~saw_faulted
+W_RebirthOldAction == ~saw_rebirth_old_action
+W_SelfRemount == ~saw_self_remount
+W_LateInvalidationPreserved == ~saw_late_invalidation_preserved
+W_MissingConfirmation == ~saw_missing_confirmation
 
 =============================================================================
