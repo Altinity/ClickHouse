@@ -219,3 +219,123 @@ Preserved unchanged:
 ## Concerns
 
 None.
+
+## Fix round 1/5
+
+Review head: `67cd262da16`.
+
+Implementation commit: `72a977e9337` (`tla: isolate stale-token cut provenance`). No rebase or
+amend was used.
+
+### Important finding 1 — authoritative aggregate
+
+The reviewer correctly found that the focused result had reached 13 expectations while the phase
+aggregate still described the earlier 108-config, 82-RED inventory and omitted the two provenance
+rows added by the preceding task. Immediately before this fix, the master inventory was therefore
+110 configs: 26 GREEN, 84 RED, with pre-fold at 13/13 (2 GREEN, 11 RED), and the REDs classified as
+61 sabotage-class, 19 witnesses and 4 findings.
+
+This fix adds one further token-only sabotage config, so the final aggregate is intentionally not the
+reviewer's pre-fix 110 total. The master table now contains all three formerly missing/current rows:
+
+- `_sab_intake_uses_predrain_cut`;
+- `_sab_intake_uses_stale_token`;
+- `_witness_drained_row_absent_from_intake`.
+
+The summary, model subtotal, master table, normalized runner transcript and footer arithmetic now all
+record 111 configs: 26 GREEN and 85 RED. The pre-fold battery is 14/14: 2 GREEN and 12 RED. The RED
+classification is 62 sabotage-class + 19 witnesses + 4 findings = 85.
+
+The arithmetic was derived from the master rows rather than copied from those summaries:
+
+```text
+build/test_task5_prefold_cut_provenance_fix1_aggregate_audit_20260801.log
+master total=111 green=26 red=85
+red classes sabotage=62 witnesses=19 findings=4
+prefold total=14 green=2 red=12
+AGGREGATE_ROW_INVENTORY_OK
+```
+
+A child analyzer independently confirmed those exact values and found no warning or unexpected
+content.
+
+### Important finding 2 — token equality is independently load-bearing
+
+The original `_sab_intake_uses_predrain_cut` remains as the stale-row-and-token composition control.
+The new `_sab_intake_uses_stale_token` separately drives `AdoptFromCutWithStaleToken` at the actual
+`AdoptFromCut` plan/adoption seam. It consumes the fresh row value for adoption and plan projection
+but carries the earlier full-catalog token into `intakeCut`.
+
+The isolated TDD RED was run before the new config was added to the focused runner:
+
+```bash
+/usr/bin/java -XX:+UseParallelGC -XX:-UsePerfData -cp tmp/tla2tools.jar tlc2.TLC \
+  -metadir build/test_task5_prefold_cut_provenance_fix1_stale_token_red_meta_20260801 \
+  -workers 1 \
+  -config docs/superpowers/models/CaRefPreFoldDrainCore_sab_intake_uses_stale_token.cfg \
+  docs/superpowers/models/CaRefPreFoldDrainCore.tla \
+  > build/test_task5_prefold_cut_provenance_fix1_stale_token_red_20260801.log 2>&1
+```
+
+TLC exited 12 and violated only `IntakeConsumesFreshPostDrainCut`: 209 generated / 111 distinct /
+depth 7, with 51 states queued at the intended early stop. The counterexample holds row and plan
+semantics constant:
+
+| State component | Fresh cut | Consumed/adopted result |
+|---|---|---|
+| catalog row | `absent` | `intakeCut.entry = "absent"` |
+| full-catalog token | 2 | `intakeCut.catalog_token = 1` |
+| plan/adoption | absent row | `plan_has_life = FALSE`, `adoptedRow = "none"` |
+
+Thus the value-equality and plan-projection conjuncts remain true; removing the token-equality
+conjunct would change this config from its required RED verdict. A child analyzer independently
+confirmed the trace values, the single named invariant, and the absence of JVM/TLC warnings or
+unexpected errors.
+
+### Focused regression gate
+
+After every existing `CaRefPreFoldDrainCore_*.cfg` bound
+`SabotageIntakeUsesStaleToken = FALSE` and the runner expected the new named RED, the full focused
+gate was rerun:
+
+```bash
+TLC_JAVA_OPTS=-XX:-UsePerfData \
+  bash docs/superpowers/models/run_prefold_drain.sh \
+  > build/test_task5_prefold_cut_provenance_fix1_full_20260801.log 2>&1
+```
+
+Result: 14/14 expectations met, split into 2 GREEN and 12 intended RED/witness runs. Both provenance
+sabotages violate only `IntakeConsumesFreshPostDrainCut`; the drained-row witness remains RED on
+`WITNESS_DRAINED_ROW_ABSENT_FROM_INTAKE`; both safe configurations are GREEN with exhausted queues.
+The child analyzer checked the aggregate and all 14 per-config logs and found no JVM/TLC warnings or
+unexpected errors.
+
+### Updated proof records
+
+The implementation commit updates:
+
+- `CaRefPreFoldDrainCore.tla`, the new sabotage config, all ten existing focused configs and
+  `run_prefold_drain.sh`;
+- `CaRefPreFoldDrainCore_RESULTS.md`, the phase aggregate and the Delta scope amendment;
+- the model README, authoritative complete-cut spec §9 and Task 5 plan Step 11.
+
+The focused results now state why the old control pins stale row/value wiring and why the new control
+pins token equality independently. The spec and plan retain lifecycle ownership in
+`CaRefPreFoldDrainCore`; `CaRefDeltaIntakeCore` remains a downstream key-set/fold consumer.
+
+### Final hygiene and self-review
+
+Final redirected audits:
+
+- `build/test_task5_prefold_cut_provenance_fix1_bash_n_20260801.log`: runner syntax GREEN and silent;
+- `build/test_task5_prefold_cut_provenance_fix1_cfg_constant_audit_20260801.log`: 11 configs,
+  `invalid_bindings=0`, `CONFIG_CONSTANT_AUDIT_OK`;
+- `build/test_task5_prefold_cut_provenance_fix1_cached_diff_check_final_20260801.log`: GREEN and
+  silent.
+
+A child analyzer independently checked all three. The commit contains exactly 19 scoped paths. It
+does not contain C++, production checklist changes, `.superpowers/sdd/task-5-report.md`, or any
+pre-existing untracked workspace content. The previously documented preserved dirt remains
+untouched.
+
+Concerns: none.
