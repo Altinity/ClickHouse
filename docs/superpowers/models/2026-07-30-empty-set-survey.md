@@ -11,9 +11,9 @@ doc_type: reference
 
 ## Method {#method}
 
-The existing `*.cfg` files were rechecked before this survey. None assigns an
-empty value to an entity collection. The only empty assignments are the
-auxiliary `TreeHashes = {}` and `UniqueToBuildTree = {}` sets.
+The `*.cfg` files that existed when the survey began were rechecked. None
+assigned an empty value to an entity collection. The only empty assignments
+were the auxiliary `TreeHashes = {}` and `UniqueToBuildTree = {}` sets.
 
 For each model with an entity collection supplied as a config `CONSTANT`, this
 survey adds one config based on the indicated positive config, changing only
@@ -37,6 +37,7 @@ empty an entity set. No config was added for those models.
 | `CaGcAckFloorCore` | `Writers`, `Blobs` | `CaGcAckFloorCore_empty_blobs.cfg` / `CaGcAckFloorCore_stage1.cfg`; `Blobs` | green |
 | `CaGcAckFloorZombie` | `Writers`, `Leaders`, `Blobs` | `CaGcAckFloorZombie_empty_blobs.cfg` / `CaGcAckFloorZombie_stage1.cfg`; `Blobs` | green |
 | `CaGcCondemnMarkerGate` | none; one hash and one writer are fixed in-module | no config | not applicable |
+| `CaGcDestructiveGateCore` | `CatalogUniverse`; `FrontierProven` is its proof subset | `CaGcDestructiveGateCore_empty_universe.cfg` / `CaGcDestructiveGateCore_healthy.cfg`; both sets are `{}` | green; physical actions suppressed despite `{}` equality |
 | `CaGcLeaseCore` | `Actors` | `CaGcLeaseCore_empty_actors.cfg` / `CaGcLeaseCore_heartbeat.cfg`; `Actors` | green |
 | `CaGcRootLocalPartManifestCore` | `Namespaces`, `Writers`, `Leaders`, `Blobs`, `ManifestInstances`, `Refs`, `Builds`, `Paths`, `BuildPrefixes`, `Shards` | `CaGcRootLocalPartManifestCore_empty_namespaces.cfg` / `CaGcRootLocalPartManifestCore_stage6_attemptscoping.cfg`; `Namespaces` | green |
 | `CaGcRoundDeferCore` | `Writers`, `Blobs` | `CaGcRoundDeferCore_empty_blobs.cfg` / `CaGcRoundDeferCore_stage1.cfg`; `Blobs` | green |
@@ -53,6 +54,16 @@ empty an entity set. No config was added for those models.
 | `CaRelinkLaneComposition` | none; source/receiver bindings are fixed in-module | no config | not applicable |
 | `CaRetiredInRun` | `Blobs` | `CaRetiredInRun_empty_blobs.cfg` / `CaRetiredInRun.cfg`; `Blobs` | green |
 | `CaRetiredInRunFoldAbortWitness` | `Blobs`; `Leaders` is fixed in-module | `CaRetiredInRunFoldAbortWitness_empty_blobs.cfg` / `CaRetiredInRunFoldAbortWitness.cfg`; `Blobs` | green |
+
+## Incremental audit — 2026-08-02 {#incremental-audit-2026-08-02}
+
+The tracked module inventory was compared with the table before adding
+`CaGcDestructiveGateCore`. No other tracked model family had appeared since the
+survey. Three untracked `*_TTrace_*.tla` files were TLC-generated traces of
+already-listed modules, not new model families. The new model's explicit empty
+configuration is recorded above; its companion sabotage and negated witness
+show that the non-empty condition is both load-bearing and non-vacuously
+evaluated.
 
 ## Non-green TLC tails {#non-green-tlc-tails}
 

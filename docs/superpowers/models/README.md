@@ -13,8 +13,10 @@ This directory holds the TLA+ formal models for the content-addressed (CAS) Merg
 This README is the complete, self-contained index: one entry per model, what it proves in plain
 terms, its status against the shipped code, its config files, and its runner script.
 
-Audit date for every status below: **2026-07-21**, verified against branch `cas-gc-rebuild`
-(CAS code under `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/`).
+Baseline audit date for the pre-existing statuses below: **2026-07-21**, verified against branch
+`cas-gc-rebuild` (CAS code under
+`src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/`).
+`CaGcDestructiveGateCore` was audited against the same code on **2026-08-02**.
 
 A note on names: some module names carry historical bug numbers from the development era (e.g.
 `CaB140DangleMerge`). The names are kept — renaming a verified model buys nothing — and the story
@@ -91,6 +93,7 @@ of `CaGcRootLocalPartManifestCore`.
 | `CaGcAckFloorZombie.tla` | two-leader `delete_pending` two-phase graduation | CURRENT (partial: same caveat) | `run_ackfloor_zombie.sh` |
 | `CaGcShardIncarnationCore.tla` | namespace-registry removal: per-shard incarnation + newborn round self-floor | CURRENT | (inline TLC) |
 | `CaGcRoundDeferCore.tla` | GC round may skip an unchanged snapshot only if no destructive decision is due; deferral bounded | CURRENT | (inline TLC) |
+| `CaGcDestructiveGateCore.tla` | authoritative non-empty frontier plus anomaly/hold physical gate; proved lifecycle erasure remains independent | CURRENT | `run_destructive_gate.sh` |
 | `CaGcCondemnMarkerGate.tla` | graduation gated on confirmed durable condemn marker | CURRENT | `run_condemnmarker.sh` |
 | `CaEdgeBeforeObserve.tla` | with edge-before-observe write order, promote-time revalidation of tokened leaves is redundant | CURRENT for order + K1; K3Head/K3AdoptCheck drifted (tokenless leaf now manifest-trusted) | `run_ebo.sh` |
 | `CaRetiredInRun.tla` | retired list folded into the snapshot run (two-cursor merge, coverage coherence) | CURRENT | `run_retiredinrun.sh` |
@@ -161,6 +164,14 @@ of `CaGcRootLocalPartManifestCore`.
   first (no physical delete while an unfolded delta could still touch the blob), and deferral is
   bounded so an unfolded delta is never skipped forever. Raw TLC evidence:
   `CaGcRoundDeferCore_RESULTS.md`.
+- **`CaGcDestructiveGateCore.tla`** — separates whole-round physical authorization from exact
+  lifecycle erasure. Positive configs cover a healthy frontier, an explicitly empty universe, an
+  unrelated anomaly, an unrelated carried hold, and an exhausted frontier budget. The four
+  physical sabotages omit the anomaly, hold, frontier-equality, and non-empty-universe conjuncts,
+  respectively, and must violate `PhysicalDeleteOnlyWhenGateOpen`; the lifecycle sabotage must
+  violate `ProvedRemovalEraseIsNotPhysicalSuppression`. Three negated witnesses reach both honest
+  physical actions, exact erasure while physical work is suppressed, and the `{}`/`{}` equality
+  that still closes the gate. Raw TLC evidence: `CaGcDestructiveGateCore_RESULTS.md`.
 - **`CaGcCondemnMarkerGate.tla`** — found by an external code review (2026-07-17): the GC swallows
   failures of the asynchronous condemn-marker write, while the round commits the retired entry
   regardless. The per-hash marker is the writer's adopt gate, so a lost marker lets a writer adopt
