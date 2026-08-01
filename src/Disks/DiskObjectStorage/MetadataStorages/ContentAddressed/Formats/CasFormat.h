@@ -112,6 +112,7 @@ enum class FormatId : uint16_t
     GcHeartbeat = 22,     /// cas_gc_hb       — GC leader heartbeat
     RefCkpt = 23,         /// cas_ref_ckpt    — per-namespace checkpoint (INV-4)
     RefCatalog = 24,      /// cas_ref_catalog — the whole-pool namespace catalog (INV-3)
+    GcMaintenanceState = 25, /// cas_gc_maintenance_state — leak-only namespace-janitor cursor
 };
 
 /// Returns the writer generation stamped on newly written objects. The current pre-roster writer

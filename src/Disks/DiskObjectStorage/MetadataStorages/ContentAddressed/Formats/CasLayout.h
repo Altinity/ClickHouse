@@ -295,6 +295,12 @@ public:
         return prefix + "/gc/state";
     }
 
+    /// Leak-only namespace-janitor cursor. It is deliberately separate from GC authority state.
+    String gcMaintenanceStateKey() const
+    {
+        return prefix + "/gc/maintenance_state";
+    }
+
     /// GC heartbeat (advisory liveness pulse): `<prefix>/gc/hb`.
     String gcHbKey() const
     {

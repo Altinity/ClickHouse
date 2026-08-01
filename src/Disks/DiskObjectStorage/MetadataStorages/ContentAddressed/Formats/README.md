@@ -27,6 +27,7 @@ trailer, followed by a banner-framed raw payload zone for inline file bytes.
 | blob keys (`CasLayout::blobKey`) | blob envelope + payload | `CasBlobEnvelopeFormat` | uploads |
 | blob-meta keys (`CasLayout::blobMetaKey`) | freshness sidecar | `CasBlobMetaFormat` | dedup/GC |
 | `gc/state`, `gc/hb` | GC state / leader heartbeat | `CasGcStateFormat` | GC |
+| `gc/maintenance_state` | leak-only namespace-janitor cursor | `CasGcMaintenanceStateFormat` | future janitor |
 | `gc/gen/<g>/attempt/<a>/outcomes/…​.zst` | outcome log | `CasGcOutcomesFormat` (`.zst`) | GC |
 | `gc/gen/<g>/attempt/<a>/fold_seal` | fold seal (deterministic) | `CasFoldSealFormat` | GC |
 | `gc/gen/<g>/…​/runs` | GC source-edge record-stream runs | `CasRecordStreamFormat` | GC |

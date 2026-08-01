@@ -54,7 +54,8 @@ TEST(CasFormatTraits, CompleteUniqueAndGated)
     const FormatId all[] = {FormatId::Blob, FormatId::GcState, FormatId::PoolMeta,
                             FormatId::GcOutcomes, FormatId::PartManifest, FormatId::RunFile,
                             FormatId::FoldSeal, FormatId::Owner, FormatId::ServerEpoch, FormatId::MountLease,
-                            FormatId::RefLog, FormatId::RefSnapshot, FormatId::BlobMeta, FormatId::GcHeartbeat};
+                            FormatId::RefLog, FormatId::RefSnapshot, FormatId::BlobMeta, FormatId::GcHeartbeat,
+                            FormatId::RefCkpt, FormatId::RefCatalog, FormatId::GcMaintenanceState};
     std::set<std::string_view> types;
     for (FormatId id : all)
     {

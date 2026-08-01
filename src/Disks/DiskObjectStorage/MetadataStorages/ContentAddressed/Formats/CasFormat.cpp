@@ -53,6 +53,7 @@ constexpr FormatChangePoint REF_CKPT[] = {
 /// reuses `kContiguousRefStreamsGeneration` as its birth generation, not a second constant named after
 /// itself, for the same reason `REF_CKPT` originally did), so it carries no second change point here.
 constexpr FormatChangePoint REF_CATALOG[] = {{kContiguousRefStreamsGeneration, kContiguousRefStreamsGeneration}};
+constexpr FormatChangePoint GC_MAINTENANCE_STATE[] = {{kUnifiedRefLifeFoldGeneration, kUnifiedRefLifeFoldGeneration}};
 
 }
 
@@ -67,6 +68,8 @@ std::span<const FormatChangePoint> changePoints(FormatId id)
             return REF_CKPT;
         case FormatId::RefCatalog:
             return REF_CATALOG;
+        case FormatId::GcMaintenanceState:
+            return GC_MAINTENANCE_STATE;
         case FormatId::Blob:
         case FormatId::GcState:
         case FormatId::PoolMeta:
@@ -151,6 +154,7 @@ constexpr FormatTraits TRAITS[] =
     /// 4 KiB, and `encodeRefCatalog` REFUSES that entry (`LIMIT_EXCEEDED`, `CasRefCatalogFormat.cpp`'s
     /// `checkLineBytes`) rather than writing an object no reader could later decode.
     {FormatId::RefCatalog,   "cas_ref_catalog",   TextFamily::Control,       KeyStrictness::Strict,   CompressionPolicy::Never,     256 * kMiB, 4 * kKiB},
+    {FormatId::GcMaintenanceState, "cas_gc_maintenance_state", TextFamily::Control, KeyStrictness::Strict, CompressionPolicy::Never, 512 * kKiB, 512 * kKiB},
     {FormatId::PartManifest, "cas_part_manifest", TextFamily::PayloadHybrid, KeyStrictness::Tolerant, CompressionPolicy::Always,    256 * kMiB, 64 * kKiB},
     {FormatId::RunFile,      "cas_run",           TextFamily::RecordStream,  KeyStrictness::Strict,   CompressionPolicy::PinnedRaw, 0,          4 * kKiB},
     {FormatId::FoldSeal,     "cas_fold_seal",     TextFamily::Control,       KeyStrictness::Strict,   CompressionPolicy::PinnedRaw, 256 * kMiB, 64 * kKiB},
